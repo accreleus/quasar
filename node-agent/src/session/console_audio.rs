@@ -21,8 +21,8 @@
 //! [`choose_route`] is the whole decision and does no I/O of its own: what it reads of the
 //! host comes through [`HostAudio`], whose live implementation ([`LiveHostAudio`]) takes
 //! its paths as fields so tests can point it at a temporary `/proc/asound` and a real
-//! socket. `capacity::detect_audio_sinks`, `pipeline::build_local_audio_pipeline` and the
-//! `console_audio` readiness check all go through it, so they cannot disagree.
+//! socket. `capacity::detect_audio_sinks` and `pipeline::build_local_audio_pipeline` go
+//! through it, so they cannot disagree.
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
@@ -40,7 +40,9 @@ pub const PIPEWIRE_SOCKET: &str = "/run/quasar-console-audio/native";
 pub const PIPEWIRE_SERVER: &str = "unix:/run/quasar-console-audio/native";
 /// Sink ids naming the host's PipeWire: `pipewire:default` or `pipewire:<sink name>`.
 pub const PIPEWIRE_PREFIX: &str = "pipewire:";
+#[allow(dead_code)]
 pub const PIPEWIRE_DEFAULT: &str = "pipewire:default";
+#[allow(dead_code)]
 const LABEL_PREFIX: &str = "Host PipeWire · ";
 
 /// What an ALSA PCM's `sub0/status` says.
@@ -57,6 +59,7 @@ pub enum PcmStatus {
 }
 
 /// A sink the host's PipeWire listed over the pulse protocol.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipeWireSink {
     pub name: String,
@@ -69,6 +72,7 @@ pub trait HostAudio {
     fn pipewire_answers(&self) -> bool;
     /// The PipeWire sinks, when they can be listed; empty when they cannot (restricted
     /// access may hide them), which leaves `pipewire:default` alone.
+    #[allow(dead_code)]
     fn pipewire_sinks(&self) -> Vec<PipeWireSink>;
     /// The ALSA playback sinks this agent can open (`hw:CARD=<id>,DEV=<device>`, or
     /// `hw:CARD=<id>` when the host lists no PCMs).
@@ -78,6 +82,7 @@ pub trait HostAudio {
     fn pcm_status(&self, card: u32, device: u32) -> PcmStatus;
     /// Host preparation made the socket's directory, but no socket is in it: the desktop
     /// user's `pipewire-pulse` has not restarted since its drop-in was written (#433).
+    #[allow(dead_code)]
     fn socket_missing(&self) -> bool {
         false
     }
@@ -86,6 +91,7 @@ pub trait HostAudio {
 /// What to run, as root on the host, so the console-audio user's `pipewire-pulse` reads
 /// the drop-in and opens [`PIPEWIRE_SOCKET`] (#433). Through `runuser`: the `-M USER@`
 /// form needs machined's transient units, which fail on Fedora CoreOS (uCore).
+#[allow(dead_code)]
 pub const RESTART_PIPEWIRE_PULSE: &str =
     "runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service";
 
@@ -137,6 +143,7 @@ impl Refusal {
         }
     }
 
+    #[allow(dead_code)]
     pub fn remediation(&self) -> &'static str {
         match self {
             Refusal::PipeWireSilent { .. } => {
@@ -326,6 +333,7 @@ pub fn choose_route(output: &str, host: &dyn HostAudio) -> Result<Route, Refusal
 
 /// The console sinks to offer: the host's PipeWire's while it answers (`hw:*` hidden, so
 /// the operator is never offered a device PipeWire owns), its ALSA ones otherwise.
+#[allow(dead_code)]
 pub fn sinks(host: &dyn HostAudio) -> Vec<AudioSink> {
     if !host.pipewire_answers() {
         return host.alsa_sinks();
@@ -459,12 +467,17 @@ pub fn read_card_ids(asound: &Path) -> std::collections::BTreeMap<u32, String> {
 
 /// Sink discovery runs on the console hotplug poll; the listing forks `pactl`, so it is
 /// reused for a while.
+#[allow(dead_code)]
 const LIST_TTL: Duration = Duration::from_secs(15);
+#[allow(dead_code)]
 const LIST_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[allow(dead_code)]
 type SinkCache = Option<(PathBuf, Instant, Vec<PipeWireSink>)>;
+#[allow(dead_code)]
 static LIST_CACHE: Mutex<SinkCache> = Mutex::new(None);
 
+#[allow(dead_code)]
 fn cached_pipewire_sinks(socket: &Path) -> Vec<PipeWireSink> {
     if let Some((path, at, sinks)) = LIST_CACHE.lock().unwrap().as_ref() {
         if path == socket && at.elapsed() < LIST_TTL {
@@ -478,6 +491,7 @@ fn cached_pipewire_sinks(socket: &Path) -> Vec<PipeWireSink> {
 
 /// `pactl --server=unix:<socket> -f json list sinks`, bounded. Any failure (no `pactl`,
 /// access restricted, a slow server) lists nothing, which leaves `pipewire:default`.
+#[allow(dead_code)]
 fn list_pipewire_sinks(socket: &Path) -> Vec<PipeWireSink> {
     let mut child = match std::process::Command::new("pactl")
         .arg(format!("--server=unix:{}", socket.display()))
@@ -527,6 +541,7 @@ fn list_pipewire_sinks(socket: &Path) -> Vec<PipeWireSink> {
 }
 
 /// `pactl -f json list sinks`: an array of objects carrying `name` and `description`.
+#[allow(dead_code)]
 pub fn parse_pactl_sinks(json: &str) -> Vec<PipeWireSink> {
     let Ok(serde_json::Value::Array(items)) = serde_json::from_str(json) else {
         return Vec::new();
@@ -572,6 +587,7 @@ impl Drop for AlsaLeg {
     }
 }
 
+#[allow(dead_code)]
 pub fn alsa_leg_live() -> bool {
     ALSA_LEGS.load(Ordering::Relaxed) > 0
 }
@@ -585,6 +601,7 @@ pub fn set_configured_output(output: Option<&str>) {
     *CONFIGURED_OUTPUT.lock().unwrap() = output.map(str::to_string);
 }
 
+#[allow(dead_code)]
 pub fn configured_output() -> String {
     CONFIGURED_OUTPUT
         .lock()

@@ -446,3 +446,41 @@ fn podman_read_only_binds_must_be_non_recursive() {
     assert!(Dialect::Podman.read_only_binds_non_recursive());
     assert!(!Dialect::Docker.read_only_binds_non_recursive());
 }
+
+/// #460: Docker echoes `HostConfig.DeviceCgroupRules` exactly. Podman reports none (its
+/// inspect has no such field), which proves nothing; a rule it does report must be the
+/// request's.
+#[test]
+fn device_cgroup_rules_are_exact_on_docker_and_never_wider_on_podman() {
+    let rule = vec!["c 13:* rwm".to_string()];
+    let other = vec!["c 13:* rwm".to_string(), "c 226:* rwm".to_string()];
+    assert!(Dialect::Docker.device_cgroup_rules_ok(&rule, &rule));
+    assert!(Dialect::Docker.device_cgroup_rules_ok(&[], &[]));
+    assert!(
+        !Dialect::Docker.device_cgroup_rules_ok(&[], &rule),
+        "dropped"
+    );
+    assert!(
+        !Dialect::Docker.device_cgroup_rules_ok(&other, &rule),
+        "widened"
+    );
+    assert!(
+        !Dialect::Docker.device_cgroup_rules_ok(&rule, &[]),
+        "unrequested"
+    );
+
+    assert!(
+        Dialect::Podman.device_cgroup_rules_ok(&[], &rule),
+        "not reported"
+    );
+    assert!(Dialect::Podman.device_cgroup_rules_ok(&rule, &rule));
+    assert!(Dialect::Podman.device_cgroup_rules_ok(&[], &[]));
+    assert!(
+        !Dialect::Podman.device_cgroup_rules_ok(&other, &rule),
+        "widened"
+    );
+    assert!(
+        !Dialect::Podman.device_cgroup_rules_ok(&rule, &[]),
+        "unrequested"
+    );
+}

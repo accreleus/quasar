@@ -124,10 +124,9 @@ out3="$(prep "$r3" "$tmp/podman-only" --mode rootless --engine podman --console 
 grep -q 'KERNEL=="card\[0-9\]\*"' "$r3/etc/udev/rules.d/71-quasar-console.rules" && grep -q 'i2c-dev' "$r3/etc/modules-load.d/quasar.conf" \
   && pass "--console adds display, sound and i2c, and loads i2c-dev" || fail "--console" ""
 r3rules="$r3/etc/udev/rules.d/71-quasar-console.rules"
-grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_KEYBOARD}=="1"' "$r3rules" \
-  && grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_MOUSE}=="1"' "$r3rules" \
-  && grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_JOYSTICK}=="1"' "$r3rules" \
-  && pass "--console grants the host's physical keyboards, mice and joysticks by udev property" || fail "physical input rules" "$(cat "$r3rules")"
+grep -q '^SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT}=="1", ACTION!="remove", ENV{DEVNAME}=="?\*", RUN+="/usr/bin/setfacl -m g:quasar:rw \$devnode"$' "$r3rules" \
+  && [ "$(grep -c 'SUBSYSTEM=="input"' "$r3rules")" = 1 ] \
+  && pass "--console grants the host's input devices, every one udev classifies as input (#460)" || fail "physical input rules" "$(cat "$r3rules")"
 printf '%s' "$out3" | grep -q "the quasar group can read what is typed on this machine's keyboard" \
   && pass "--console states plainly that the quasar group can read this machine's keyboard" || fail "plain keyboard warning" "$out3"
 grep -q '^SUBSYSTEM=="tty", KERNEL=="tty8", ACTION!="remove", ENV{DEVNAME}=="?\*", RUN+="/usr/bin/setfacl -m g:quasar:rw \$devnode"$' "$r3rules" \

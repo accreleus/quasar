@@ -1,196 +1,613 @@
-//! `console_display`, `console_audio`, `console_ddc` (agent-api.md amendment 17, RH-07
-//! #407). Reported on every host, `skip` while console mode is off, never `blocks` —
-//! console mode is an operator convenience, not a scheduling gate.
+//! Console mode's grants for direct display (agent-api.md amendment 19, "Console checks";
+//! #460): `console_card`, `console_input`, `console_sound`, `console_terminal`,
+//! `console_udev` and `console_ddc`. Reported on every host, `skip` while console mode is
+//! off, never `blocks`: a console session's container is given the console GPU's card
+//! node, the input devices, the sound device and the host's udev data, and the agent holds
+//! the console terminal. What the agent cannot grant fails here, naming the grant and the
+//! fix, so a half-configured host explains itself instead of failing a launch.
 //!
-//! `console_display` reads the startup preflight's cached finding
-//! (`session::console_preflight::last`) rather than probing the DRM card node again
-//! here: a readiness probe runs far more often than a fresh master-acquire attempt is
-//! safe to make, and re-opening the card for master outside of startup would race a live
-//! `spawn_weston_console` for exactly the reason `session::console::drm_open_lock` exists.
+//! Each check judges facts gathered once per readiness probe ([`ConsoleView::live`]); the
+//! judging is pure. Nothing here takes the display: the card is read the way the DRM
+//! inventory reads it (read-only, mastership given back at once, never while a console
+//! session holds the card), and the terminal is judged from what startup found taking it.
 
-use crate::messages::ReadinessCheck;
+use std::path::{Path, PathBuf};
 
-pub const CHECK_DISPLAY: &str = "console_display";
-pub const CHECK_AUDIO: &str = "console_audio";
+use crate::capacity::CardAccess;
+use crate::messages::{DrmOutputCapability, ReadinessCheck};
+use crate::session::console_plan::InputGrant;
+
+pub const CHECK_CARD: &str = "console_card";
+pub const CHECK_INPUT: &str = "console_input";
+pub const CHECK_SOUND: &str = "console_sound";
+pub const CHECK_TERMINAL: &str = "console_terminal";
+pub const CHECK_UDEV: &str = "console_udev";
 pub const CHECK_DDC: &str = "console_ddc";
 
 const OFF_SUMMARY: &str = "Console mode is off for this host.";
+
+/// How the agent is re-created with its console grants, said once for every check.
+const RECREATE: &str = "then turn console mode off and on again from the host's Local \
+                        console page, so the recovery actor re-creates the node agent with \
+                        the host's devices (a Compose install: \
+                        deploy/overlays/docker-compose.console.yml)";
+
+/// The console settings the checks read, latched from `config_update` (the agent keeps
+/// the full config for the session build; readiness only needs these two).
+#[derive(Debug, Clone, Default)]
+struct LatchedConfig {
+    output_id: Option<String>,
+    input_devices: serde_json::Value,
+}
+
+static CONFIG: std::sync::RwLock<Option<LatchedConfig>> = std::sync::RwLock::new(None);
+
+/// Called from the agent's `config_update` handler with the host's console config.
+pub(crate) fn set_config(output_id: Option<String>, input_devices: serde_json::Value) {
+    if let Ok(mut slot) = CONFIG.write() {
+        *slot = Some(LatchedConfig {
+            output_id,
+            input_devices,
+        });
+    }
+}
+
+fn config() -> LatchedConfig {
+    CONFIG
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default()
+}
 
 /// What each check reads, gathered once per readiness probe.
 #[derive(Debug, Clone, Default)]
 pub struct ConsoleView {
     pub enabled: bool,
-    /// This agent was created with the console additions (`QUASAR_CONSOLE_ACCESS=1`).
-    /// Without it no preflight ever ran, and console mode cannot be turned on here.
-    pub has_access: bool,
-    /// The startup preflight's own finding; `None` before it has run (or when
-    /// `has_access` is false, which never runs one).
-    pub preflight: Option<crate::session::console_preflight::Preflight>,
-    pub audio: AudioView,
+    /// The engine is rootless: host preparation runs with `--mode rootless`.
+    pub rootless: bool,
+    pub card: CardView,
+    pub input: InputView,
+    pub sound: SoundView,
+    pub terminal: TerminalView,
+    pub udev: UdevView,
     pub ddc: crate::ddc::DdcSummary,
+    /// Any `/dev/i2c-N` is in the agent's container.
+    pub i2c_nodes: bool,
 }
 
-/// What `console_audio` judges: the sinks discovery offers, and the route a console
-/// session would take for the configured output (`session::console_audio::choose_route`,
-/// RH-07 #407 D13) — the host's PipeWire while it answers, ALSA only on a free device.
-#[derive(Debug, Clone)]
-pub struct AudioView {
-    pub sinks: Vec<crate::messages::AudioSink>,
-    pub route: Result<crate::session::console_audio::Route, crate::session::console_audio::Refusal>,
-    /// A console ALSA leg of this agent is playing: an open PCM is then ours.
-    pub playing: bool,
-    /// Host preparation made the console-audio socket's directory, but the desktop user's
-    /// pipewire-pulse has not opened the socket in it yet (#433).
-    pub socket_missing: bool,
+/// The console card(s) judged and what reading each found.
+#[derive(Debug, Clone, Default)]
+pub struct CardView {
+    /// `(node, access)`. Empty: no card node is visible to the agent at all.
+    pub cards: Vec<(String, CardAccess)>,
+    /// Who holds the display, from logind's state, when a card is held.
+    pub holder: Option<String>,
 }
 
-impl Default for AudioView {
-    fn default() -> Self {
-        AudioView {
-            sinks: Vec::new(),
-            route: Ok(crate::session::console_audio::Route::Alsa { device: None }),
-            playing: false,
-            socket_missing: false,
+/// The input devices a console session would be given.
+#[derive(Debug, Clone, Default)]
+pub struct InputView {
+    /// The `input_devices` setting read as a grant.
+    pub grant: Option<Result<InputGrant, String>>,
+    /// `/dev/input` lists for the agent.
+    pub dir: Option<Result<(), String>>,
+    /// The nodes the grant passes in: an allowlist's nodes, or every physical input
+    /// device on the host for `auto`.
+    pub nodes: Vec<InputNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputNode {
+    pub path: String,
+    pub present: bool,
+    /// The Quasar account can open it read-write (`access(2)`, which honours the host's
+    /// ACLs): what the desktop does with it.
+    pub openable: bool,
+}
+
+/// The sound device a console session would be given.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SoundView {
+    #[default]
+    Missing,
+    /// `/dev/snd` is there; the nodes in it the Quasar account cannot open read-write.
+    Present { denied: Vec<String> },
+}
+
+/// The console terminal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TerminalView {
+    /// A console session holds it now.
+    Held,
+    /// The host has no virtual terminals; there is nothing to hold.
+    NoVts,
+    /// The host has VTs and the agent cannot use the console one (the reason).
+    Unusable(String),
+    /// Not read yet.
+    #[default]
+    Unknown,
+    /// The node is in the agent's container.
+    Present {
+        /// The agent can open it read-write.
+        openable: bool,
+        /// What startup found taking it; `None` when startup did not try.
+        startup: Option<Result<(), String>>,
+    },
+}
+
+/// Whether the host has udev's device database, `/run/udev/data`. The agent never sees
+/// the host's `/run`: the recovery actor tells it (`QUASAR_HOST_UDEV_DATA`), reading it
+/// each time console mode is turned on, and the Compose console overlay sets it too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UdevView {
+    /// Not told: an agent created before the actor read it.
+    #[default]
+    Unknown,
+    Missing,
+    Present,
+}
+
+/// The actor's answer, as the agent reads it.
+pub const HOST_UDEV_DATA_ENV: &str = "QUASAR_HOST_UDEV_DATA";
+
+/// The cards a console session would use: the one the output pick names, or for `auto`
+/// the card of the first connected output. With `auto` and no monitor, every card the
+/// agent can see, since any of them may be the one.
+pub fn console_cards(
+    output_id: Option<&str>,
+    outputs: &[DrmOutputCapability],
+    visible_cards: &[String],
+) -> Vec<String> {
+    if let Some(card) = output_id
+        .filter(|id| *id != "auto")
+        .and_then(|id| id.split_once(':'))
+        .map(|(card, _)| card)
+    {
+        return vec![card.to_string()];
+    }
+    match outputs.iter().find(|o| o.connected) {
+        Some(output) => vec![output.card.clone()],
+        None => visible_cards.to_vec(),
+    }
+}
+
+/// The host's `/dev` as the agent sees it: `/host/dev` where a Compose install binds it,
+/// otherwise its own.
+fn host_dev() -> PathBuf {
+    let host_dev = Path::new("/host/dev");
+    if host_dev.is_dir() {
+        host_dev.to_path_buf()
+    } else {
+        PathBuf::from("/dev")
+    }
+}
+
+fn openable_rw(path: &Path) -> bool {
+    crate::capacity::access_read_write(path).is_ok()
+}
+
+/// Whether any `/dev/i2c-N` is in the agent's container: what host preparation (and, on a
+/// rootless engine, the recovery actor) gives console mode for DDC.
+fn has_i2c_nodes(dev: &Path) -> bool {
+    std::fs::read_dir(dev)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix("i2c-"))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
+fn card_names(dri: &Path) -> Vec<String> {
+    let mut cards: Vec<String> = std::fs::read_dir(dri)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let digits = name.strip_prefix("card")?;
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(name)
+        })
+        .collect();
+    cards.sort();
+    cards
+}
+
+impl CardView {
+    fn observe(output_id: Option<&str>) -> Self {
+        let outputs = crate::capacity::detect_drm_outputs();
+        let cards: Vec<(String, CardAccess)> =
+            console_cards(output_id, &outputs, &card_names(Path::new("/dev/dri")))
+                .into_iter()
+                .map(|card| {
+                    let access = crate::capacity::console_card_access(&card);
+                    (format!("/dev/dri/{card}"), access)
+                })
+                .collect();
+        let holder = cards
+            .iter()
+            .any(|(_, a)| *a == CardAccess::Held)
+            .then(|| crate::session::console_preflight::name_holder(Path::new("/host/run")))
+            .flatten();
+        CardView { cards, holder }
+    }
+}
+
+impl InputView {
+    fn observe(input_devices: &serde_json::Value) -> Self {
+        let grant = crate::session::console_plan::input_grant(input_devices);
+        let dir = std::fs::read_dir("/dev/input")
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let paths: Vec<String> = match &grant {
+            Ok(InputGrant::Nodes(nodes)) => nodes.clone(),
+            Ok(InputGrant::All) => crate::capacity::detect_input_devices()
+                .into_iter()
+                .filter(|d| !d.label.starts_with("Quasar Virtual"))
+                .map(|d| d.path)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let nodes = paths
+            .into_iter()
+            .map(|path| {
+                let p = Path::new(&path);
+                InputNode {
+                    present: p.exists(),
+                    openable: openable_rw(p),
+                    path,
+                }
+            })
+            .collect();
+        InputView {
+            grant: Some(grant),
+            dir: Some(dir),
+            nodes,
         }
     }
 }
 
-impl AudioView {
-    /// The live host, judged for `output` (the configured console `audio_output`).
-    pub fn observe(host: &dyn crate::session::console_audio::HostAudio, output: &str) -> Self {
-        let playing = crate::session::console_audio::alsa_leg_live();
-        AudioView {
-            sinks: crate::session::console_audio::sinks(host),
-            route: crate::session::console_audio::choose_route(output, host),
-            playing,
-            socket_missing: host.socket_missing(),
+impl SoundView {
+    fn observe(snd: &Path) -> Self {
+        if !snd.is_dir() {
+            return SoundView::Missing;
+        }
+        let mut denied: Vec<String> = std::fs::read_dir(snd)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with("controlC") || name.starts_with("pcmC")
+            })
+            .filter(|e| !openable_rw(&e.path()))
+            .map(|e| format!("/dev/snd/{}", e.file_name().to_string_lossy()))
+            .collect();
+        denied.sort();
+        SoundView::Present { denied }
+    }
+}
+
+impl TerminalView {
+    fn observe() -> Self {
+        use crate::session::console_vt::{self, Presence};
+        if console_vt::held() {
+            return TerminalView::Held;
+        }
+        let node = console_vt::console_node();
+        match console_vt::presence(Path::new("/sys/class/tty"), &node) {
+            Presence::NoVts => TerminalView::NoVts,
+            Presence::Unusable(why) => TerminalView::Unusable(why),
+            Presence::Present => TerminalView::Present {
+                openable: openable_rw(&node),
+                startup: crate::session::console_preflight::last_terminal(),
+            },
         }
     }
 }
 
-pub fn check_display(v: &ConsoleView) -> ReadinessCheck {
+impl UdevView {
+    fn from_env(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("1") => UdevView::Present,
+            Some("0") => UdevView::Missing,
+            _ => UdevView::Unknown,
+        }
+    }
+}
+
+impl ConsoleView {
+    /// The live host. Gathers nothing while console mode is off: every check skips.
+    pub fn live() -> Self {
+        let enabled = crate::ddc::is_console_enabled();
+        let ddc = crate::ddc::summary();
+        if !enabled {
+            return ConsoleView {
+                ddc,
+                ..Default::default()
+            };
+        }
+        let config = config();
+        ConsoleView {
+            enabled,
+            rootless: crate::buildinfo::install_facts()
+                .engine
+                .engine_mode
+                .as_deref()
+                == Some("rootless"),
+            card: CardView::observe(config.output_id.as_deref()),
+            input: InputView::observe(&config.input_devices),
+            sound: SoundView::observe(&host_dev().join("snd")),
+            terminal: TerminalView::observe(),
+            udev: UdevView::from_env(std::env::var(HOST_UDEV_DATA_ENV).ok().as_deref()),
+            i2c_nodes: has_i2c_nodes(Path::new("/dev")),
+            ddc,
+        }
+    }
+
+    /// Host preparation's command for this engine mode.
+    fn prepare_host(&self) -> String {
+        format!(
+            "run host preparation with console mode as root on the host (sudo sh \
+             prepare-host.sh --mode {} --console)",
+            if self.rootless { "rootless" } else { "rootful" }
+        )
+    }
+}
+
+pub fn check_card(v: &ConsoleView) -> ReadinessCheck {
     if !v.enabled {
-        return super::skip(CHECK_DISPLAY, OFF_SUMMARY);
+        return super::skip(CHECK_CARD, OFF_SUMMARY);
     }
-    if !v.has_access {
+    if v.card.cards.is_empty() {
         return super::fail(
-            CHECK_DISPLAY,
-            "this node agent was not created with console access".into(),
-            "Turn console mode on for this host from Fleet; the recovery actor replaces \
-             the node agent with one that has display, sound and monitor-control access."
-                .into(),
+            CHECK_CARD,
+            "no display card node (/dev/dri/card*) is visible to this agent".into(),
+            format!("Check the host has a GPU driving a display, {RECREATE}."),
         );
     }
-    match &v.preflight {
-        None => super::unknown(
-            CHECK_DISPLAY,
-            "no console preflight has run on this agent yet",
-        ),
-        Some(p) if p.ok => super::pass(
-            CHECK_DISPLAY,
-            "this agent's startup preflight found the console display free".into(),
-        ),
-        Some(p) => super::fail(
-            CHECK_DISPLAY,
-            p.detail
-                .clone()
-                .unwrap_or_else(|| "the console display is not available".into()),
-            "Free the display, or install the console device rules (docs: Install, Device \
-             rules), then turn console mode off and back on to try again."
-                .into(),
-        ),
+    for (node, access) in &v.card.cards {
+        match access {
+            CardAccess::Missing => {
+                return super::fail(
+                    CHECK_CARD,
+                    format!("the console card node {node} is not in this agent's container"),
+                    format!("Check the console output names a card this host has, {RECREATE}."),
+                )
+            }
+            CardAccess::Unopenable(err) => {
+                return super::fail(
+                    CHECK_CARD,
+                    format!("the console card node {node} cannot be opened ({err})"),
+                    format!(
+                        "Grant the Quasar account the display cards: {}, {RECREATE}.",
+                        v.prepare_host()
+                    ),
+                )
+            }
+            CardAccess::Held => {
+                let who = v
+                    .card
+                    .holder
+                    .clone()
+                    .unwrap_or_else(|| "another program".into());
+                return super::fail(
+                    CHECK_CARD,
+                    format!("{who} holds DRM master on {node}, so a console desktop cannot take the display"),
+                    "Stop the desktop or login screen driving that card (for example its \
+                     display manager), or pick an output on another card. Streamed sessions \
+                     are given the card node too, so a streamed app may hold it: end that \
+                     session."
+                        .into(),
+                );
+            }
+            CardAccess::Free | CardAccess::Claimed => {}
+        }
     }
+    let nodes: Vec<&str> = v.card.cards.iter().map(|(n, _)| n.as_str()).collect();
+    if v.card.cards.iter().any(|(_, a)| *a == CardAccess::Claimed) {
+        return super::pass(
+            CHECK_CARD,
+            format!(
+                "the console session's desktop holds the display on {}",
+                nodes.join(", ")
+            ),
+        );
+    }
+    super::pass(
+        CHECK_CARD,
+        format!(
+            "{} can be passed to the console desktop, and no other program holds the display",
+            nodes.join(", ")
+        ),
+    )
 }
 
-pub fn check_audio(v: &ConsoleView) -> ReadinessCheck {
-    use crate::session::console_audio::Route;
+pub fn check_input(v: &ConsoleView) -> ReadinessCheck {
     if !v.enabled {
-        return super::skip(CHECK_AUDIO, OFF_SUMMARY);
+        return super::skip(CHECK_INPUT, OFF_SUMMARY);
     }
-    let a = &v.audio;
-    if a.playing {
-        return super::pass(
-            CHECK_AUDIO,
-            "console audio is playing on the host's sound device".into(),
-        );
-    }
-    if a.socket_missing {
-        return socket_missing(&a.route);
-    }
-    match &a.route {
-        Ok(route @ Route::PipeWire { .. }) => super::pass(
-            CHECK_AUDIO,
-            format!(
-                "the host's PipeWire answers on the console-audio socket; console audio \
-                 plays through {}",
-                route.describe()
-            ),
-        ),
-        // The configured device itself, by the id the operator chose (a card id, or a
-        // stored legacy index), not merely the first sink discovery found.
-        Ok(Route::Alsa { device: Some(d) }) => {
-            let label = a
-                .sinks
-                .iter()
-                .find(|s| &s.id == d)
-                .map(|s| s.label.as_str());
-            super::pass(
-                CHECK_AUDIO,
-                match label {
-                    Some(label) => format!("{label} ({d}) is usable for console audio"),
-                    None => format!("the sound device {d} is usable for console audio"),
-                },
+    let input = &v.input;
+    let grant = match &input.grant {
+        None => return super::unknown(CHECK_INPUT, "the input devices have not been read yet"),
+        Some(Err(why)) => {
+            return super::fail(
+                CHECK_INPUT,
+                format!("the console's input devices setting cannot be used: {why}"),
+                "Set Input devices on the host's Local console page to Auto or to a list of \
+                 /dev/input/event devices."
+                    .into(),
             )
         }
-        Ok(Route::Alsa { device: None }) => match a.sinks.first() {
-            Some(sink) => super::pass(
-                CHECK_AUDIO,
-                format!("{} ({}) is usable for console audio", sink.label, sink.id),
+        Some(Ok(grant)) => grant,
+    };
+    if let Some(Err(why)) = &input.dir {
+        return super::fail(
+            CHECK_INPUT,
+            format!("/dev/input cannot be read by this agent ({why})"),
+            format!("Check the host has /dev/input, {RECREATE}."),
+        );
+    }
+    if let Some(gone) = input.nodes.iter().find(|n| !n.present) {
+        return super::fail(
+            CHECK_INPUT,
+            format!("the listed input device {} is not on this host", gone.path),
+            "Plug it in, or change Input devices on the host's Local console page \
+             (device numbers can change when devices are replugged)."
+                .into(),
+        );
+    }
+    let denied: Vec<&str> = input
+        .nodes
+        .iter()
+        .filter(|n| !n.openable)
+        .map(|n| n.path.as_str())
+        .collect();
+    if let Some(first) = denied.first() {
+        return super::fail(
+            CHECK_INPUT,
+            format!(
+                "the Quasar account cannot open {} of the input devices the console desktop \
+                 would get (first: {first})",
+                denied.len()
             ),
-            None => super::warn_check(
-                CHECK_AUDIO,
-                "no local audio sink was found for console mode".into(),
-                "Check the host has a sound device passed to the agent (/dev/snd) and that \
-                 /proc/asound lists a card, or run host preparation with \
-                 --console-audio-user so console audio plays through the desktop user's \
-                 PipeWire."
-                    .into(),
+            format!(
+                "Grant the Quasar account the host's input devices: {}. The rule applies to \
+                 devices as they appear, so replug a device it missed.",
+                v.prepare_host()
             ),
+        );
+    }
+    let later = if v.rootless {
+        "a device plugged in later opens through host preparation's access rule"
+    } else {
+        "a device plugged in later opens through the input device-cgroup rule"
+    };
+    super::pass(
+        CHECK_INPUT,
+        match grant {
+            InputGrant::All => format!(
+                "{} input devices can be passed in with the whole /dev/input; {later}",
+                input.nodes.len()
+            ),
+            InputGrant::Nodes(nodes) => {
+                format!("the {} listed input devices can be passed in", nodes.len())
+            }
         },
-        Err(refusal) => super::fail(
-            CHECK_AUDIO,
-            refusal.to_string(),
-            refusal.remediation().into(),
+    )
+}
+
+pub fn check_sound(v: &ConsoleView) -> ReadinessCheck {
+    if !v.enabled {
+        return super::skip(CHECK_SOUND, OFF_SUMMARY);
+    }
+    match &v.sound {
+        SoundView::Missing => super::fail(
+            CHECK_SOUND,
+            "no sound device (/dev/snd) is visible to this agent, so the console desktop \
+             would have no sound"
+                .into(),
+            format!(
+                "If the host has a sound card, check its driver is loaded, {RECREATE} (the \
+                 sound device is read again each time)."
+            ),
+        ),
+        SoundView::Present { denied } if !denied.is_empty() => super::fail(
+            CHECK_SOUND,
+            format!(
+                "the Quasar account cannot open {} of the host's sound devices (first: {})",
+                denied.len(),
+                denied[0]
+            ),
+            format!(
+                "Grant the Quasar account the sound devices: {}, {RECREATE}.",
+                v.prepare_host()
+            ),
+        ),
+        SoundView::Present { .. } => super::pass(
+            CHECK_SOUND,
+            "the host's sound device (/dev/snd) can be passed in".into(),
         ),
     }
 }
 
-/// The host was prepared with `--console-audio-user`, but its socket is not there (#433):
-/// say so and why, whatever console audio does meanwhile.
-fn socket_missing(
-    route: &Result<crate::session::console_audio::Route, crate::session::console_audio::Refusal>,
-) -> ReadinessCheck {
-    use crate::session::console_audio::{PIPEWIRE_SOCKET, RESTART_PIPEWIRE_PULSE};
-    let missing = format!(
-        "the console-audio socket ({PIPEWIRE_SOCKET}) is missing: the desktop user's \
-         pipewire-pulse has not picked up host preparation's drop-in"
-    );
-    let remediation = format!(
-        "Run host preparation again (it starts the desktop user's pipewire-pulse), or \
-         restart it as root on the host: {RESTART_PIPEWIRE_PULSE} (USER is the account \
-         given to --console-audio-user), or have that user log in again. The next console \
-         session plays through it."
-    );
-    match route {
-        Ok(route) => super::warn_check(
-            CHECK_AUDIO,
-            format!(
-                "{missing}; console audio plays through {} meanwhile",
-                route.describe()
-            ),
-            remediation,
+pub fn check_terminal(v: &ConsoleView) -> ReadinessCheck {
+    use crate::session::console_vt::CONSOLE_VT;
+    if !v.enabled {
+        return super::skip(CHECK_TERMINAL, OFF_SUMMARY);
+    }
+    let fix = |what: &str| {
+        format!(
+            "{what}: {} (it grants tty{CONSOLE_VT} and keeps login prompts off it), {RECREATE}.",
+            v.prepare_host()
+        )
+    };
+    match &v.terminal {
+        TerminalView::Held => super::pass(
+            CHECK_TERMINAL,
+            format!("a console session holds tty{CONSOLE_VT}"),
         ),
-        Err(refusal) => super::fail(CHECK_AUDIO, format!("{refusal}; {missing}"), remediation),
+        TerminalView::NoVts => super::pass(
+            CHECK_TERMINAL,
+            "this host has no virtual terminals, so there is none to hold".into(),
+        ),
+        TerminalView::Unknown => {
+            super::unknown(CHECK_TERMINAL, "the console terminal has not been read yet")
+        }
+        TerminalView::Unusable(why) => super::fail(
+            CHECK_TERMINAL,
+            why.clone(),
+            fix("Give the agent the terminal"),
+        ),
+        TerminalView::Present {
+            openable: false, ..
+        } => super::fail(
+            CHECK_TERMINAL,
+            format!("tty{CONSOLE_VT} cannot be opened read-write by this agent"),
+            fix("Grant the Quasar account the console terminal"),
+        ),
+        TerminalView::Present {
+            startup: Some(Err(why)),
+            ..
+        } => super::fail(
+            CHECK_TERMINAL,
+            format!("console terminal: {why}"),
+            fix("Stop any login prompt on the console terminal"),
+        ),
+        TerminalView::Present { .. } => super::pass(
+            CHECK_TERMINAL,
+            format!("tty{CONSOLE_VT} can be held in graphics mode for a console session"),
+        ),
+    }
+}
+
+pub fn check_udev(v: &ConsoleView) -> ReadinessCheck {
+    if !v.enabled {
+        return super::skip(CHECK_UDEV, OFF_SUMMARY);
+    }
+    match &v.udev {
+        UdevView::Present => super::pass(
+            CHECK_UDEV,
+            "the host's udev data (/run/udev/data) can be passed in, so devices plugged in \
+             later reach the desktop"
+                .into(),
+        ),
+        UdevView::Missing => super::fail(
+            CHECK_UDEV,
+            "the host has no udev data (/run/udev/data), so the console desktop would not \
+             know its input devices"
+                .into(),
+            format!("Check the host runs systemd-udevd, {RECREATE}."),
+        ),
+        UdevView::Unknown => super::unknown(
+            CHECK_UDEV,
+            "this agent was not told whether the host has udev data (/run/udev/data): turn \
+             console mode off and on again so the recovery actor reads it",
+        ),
     }
 }
 
@@ -199,15 +616,19 @@ pub fn check_ddc(v: &ConsoleView) -> ReadinessCheck {
         return super::skip(CHECK_DDC, OFF_SUMMARY);
     }
     let d = &v.ddc;
+    // Optional (amendment 19): a host not prepared for it reads skip, not a fault.
     if !d.available {
-        return super::warn_check(
+        return super::skip(
             CHECK_DDC,
-            "ddcutil is not present in this agent image; monitor-power detection is off \
-             (every connected display is treated as powered on)"
-                .into(),
-            "Rebuild the node agent image with ddcutil, or ignore it: display detection \
-             and hotplug still work without it."
-                .into(),
+            "ddcutil is not in this agent image, so monitor power is not read (every \
+             connected display counts as on)",
+        );
+    }
+    if !v.i2c_nodes {
+        return super::skip(
+            CHECK_DDC,
+            "the host was not prepared for monitor control (no /dev/i2c-* in this agent), so \
+             monitor power is not read; host preparation with --console grants it",
         );
     }
     if !d.bus_mapped {
@@ -241,258 +662,397 @@ pub fn check_ddc(v: &ConsoleView) -> ReadinessCheck {
     )
 }
 
+/// Every console check, in report order.
+pub fn checks(v: &ConsoleView) -> [ReadinessCheck; 6] {
+    [
+        check_card(v),
+        check_input(v),
+        check_sound(v),
+        check_terminal(v),
+        check_udev(v),
+        check_ddc(v),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::console_preflight::Preflight;
+    use crate::readiness::{FAIL, PASS, SKIP, UNKNOWN, WARN};
 
-    fn view(enabled: bool) -> ConsoleView {
+    fn on() -> ConsoleView {
         ConsoleView {
-            enabled,
-            ..Default::default()
+            enabled: true,
+            rootless: true,
+            card: CardView {
+                cards: vec![("/dev/dri/card1".into(), CardAccess::Free)],
+                holder: None,
+            },
+            input: InputView {
+                grant: Some(Ok(InputGrant::All)),
+                dir: Some(Ok(())),
+                nodes: vec![node("/dev/input/event3", true, true)],
+            },
+            sound: SoundView::Present { denied: Vec::new() },
+            terminal: TerminalView::Present {
+                openable: true,
+                startup: Some(Ok(())),
+            },
+            udev: UdevView::Present,
+            ddc: crate::ddc::DdcSummary {
+                available: true,
+                bus_mapped: true,
+                any_read: true,
+                all_off: false,
+            },
+            i2c_nodes: true,
         }
     }
 
+    fn node(path: &str, present: bool, openable: bool) -> InputNode {
+        InputNode {
+            path: path.into(),
+            present,
+            openable,
+        }
+    }
+
+    fn output(id: &str, connected: bool) -> DrmOutputCapability {
+        let (card, connector) = id.split_once(':').unwrap();
+        DrmOutputCapability {
+            id: id.into(),
+            card: card.into(),
+            render_node: None,
+            connector: connector.into(),
+            connected,
+            active_mode: None,
+            modes: Vec::new(),
+        }
+    }
+
+    /// A failing check names the grant and says what to run; none ever blocks.
+    fn assert_fail(check: &ReadinessCheck, summary: &str, fix: &str) {
+        assert_eq!(check.status, FAIL, "{check:?}");
+        assert!(check.summary.contains(summary), "{summary}: {check:?}");
+        assert!(check.remediation.contains(fix), "{fix}: {check:?}");
+        assert!(check.blocks.is_none(), "{check:?}");
+    }
+
     #[test]
-    fn every_check_skips_while_console_mode_is_off() {
-        let v = view(false);
-        for check in [check_display(&v), check_audio(&v), check_ddc(&v)] {
-            assert_eq!(check.status, super::super::SKIP, "{check:?}");
+    fn every_check_skips_while_console_mode_is_off_and_none_blocks() {
+        let off = ConsoleView::default();
+        let ids: Vec<String> = checks(&off).iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            ids,
+            [
+                "console_card",
+                "console_input",
+                "console_sound",
+                "console_terminal",
+                "console_udev",
+                "console_ddc"
+            ]
+        );
+        for check in checks(&off) {
+            assert_eq!(check.status, SKIP, "{check:?}");
+            assert!(check.blocks.is_none(), "{check:?}");
+        }
+        // A fully granted host passes every one.
+        for check in checks(&on()) {
+            assert_eq!(check.status, PASS, "{check:?}");
             assert!(check.blocks.is_none(), "{check:?}");
         }
     }
 
     #[test]
-    fn display_fails_without_access_and_is_unknown_before_the_first_preflight() {
-        let mut v = view(true);
-        let no_access = check_display(&v);
-        assert_eq!(no_access.status, super::super::FAIL);
-        assert!(no_access.blocks.is_none());
-
-        v.has_access = true;
-        let no_run = check_display(&v);
-        assert_eq!(no_run.status, super::super::UNKNOWN, "{no_run:?}");
-    }
-
-    #[test]
-    fn display_passes_or_fails_named_from_the_cached_preflight() {
-        let mut v = view(true);
-        v.has_access = true;
-        v.preflight = Some(Preflight {
-            ok: true,
-            detail: None,
-        });
-        assert_eq!(check_display(&v).status, super::super::PASS);
-
-        v.preflight = Some(Preflight {
-            ok: false,
-            detail: Some("gdm, the login screen holds the display".into()),
-        });
-        let failed = check_display(&v);
-        assert_eq!(failed.status, super::super::FAIL);
-        assert!(
-            failed.summary.contains("gdm, the login screen"),
-            "{failed:?}"
+    fn the_console_card_is_the_picked_outputs_or_the_connected_one() {
+        let outputs = [output("card0:DP-1", false), output("card1:HDMI-A-1", true)];
+        let visible = ["card0".to_string(), "card1".to_string()];
+        assert_eq!(
+            console_cards(Some("card0:DP-1"), &outputs, &visible),
+            ["card0"]
         );
-        assert!(failed.blocks.is_none());
-    }
-
-    #[test]
-    fn audio_passes_with_a_sink_and_warns_without_one() {
-        let mut v = view(true);
-        assert_eq!(check_audio(&v).status, super::super::WARN);
-        v.audio.sinks.push(crate::messages::AudioSink {
-            id: "hw:0,3".into(),
-            label: "HDMI / DisplayPort".into(),
-        });
-        let c = check_audio(&v);
-        assert_eq!(c.status, super::super::PASS);
-        assert!(c.summary.contains("hw:0,3"), "{c:?}");
-    }
-
-    #[test]
-    fn audio_names_the_configured_device_and_fails_named_when_it_is_absent() {
-        use crate::session::console_audio::{Refusal, Route};
-        let mut v = view(true);
-        v.audio.sinks = vec![
-            crate::messages::AudioSink {
-                id: "hw:CARD=Generic,DEV=0".into(),
-                label: "Analog".into(),
-            },
-            crate::messages::AudioSink {
-                id: "hw:CARD=NVidia,DEV=3".into(),
-                label: "HDMI / DisplayPort".into(),
-            },
-        ];
-        v.audio.route = Ok(Route::Alsa {
-            device: Some("hw:CARD=NVidia,DEV=3".into()),
-        });
-        let c = check_audio(&v);
-        assert_eq!(c.status, super::super::PASS, "{c:?}");
-        assert!(
-            c.summary
-                .contains("HDMI / DisplayPort (hw:CARD=NVidia,DEV=3)"),
-            "{c:?}"
-        );
-
-        v.audio.route = Err(Refusal::DeviceAbsent {
-            device: "hw:CARD=USB,DEV=0".into(),
-        });
-        let absent = check_audio(&v);
-        assert_eq!(absent.status, super::super::FAIL, "{absent:?}");
-        assert!(absent.summary.contains("hw:CARD=USB,DEV=0"), "{absent:?}");
-        assert!(absent.blocks.is_none());
-    }
-
-    #[test]
-    fn audio_passes_through_pipewire_and_fails_named_when_the_device_is_held() {
-        use crate::session::console_audio::{Refusal, Route};
-        let mut v = view(true);
-        v.audio.route = Ok(Route::PipeWire { device: None });
-        let c = check_audio(&v);
-        assert_eq!(c.status, super::super::PASS, "{c:?}");
-        assert!(c.summary.contains("PipeWire"), "{c:?}");
-
-        v.audio.route = Err(Refusal::DeviceHeld {
-            device: "hw:0,3".into(),
-            owner_pid: None,
-        });
-        let held = check_audio(&v);
-        assert_eq!(held.status, super::super::FAIL, "{held:?}");
-        assert!(
-            held.summary
-                .contains("the sound device (hw:0,3) is held by another program (PipeWire/pulse)"),
-            "{held:?}"
-        );
-        assert!(held.blocks.is_none());
-        assert!(!held.remediation.is_empty());
-
-        // Our own leg holding it is not "another program".
-        v.audio.playing = true;
-        assert_eq!(check_audio(&v).status, super::super::PASS);
-
-        v.audio.playing = false;
-        v.audio.route = Err(Refusal::PipeWireSilent {
-            output: "pipewire:default".into(),
-        });
-        let silent = check_audio(&v);
-        assert_eq!(silent.status, super::super::FAIL);
-        assert!(silent.blocks.is_none());
-
-        let mut off = v.clone();
-        off.enabled = false;
-        assert_eq!(check_audio(&off).status, super::super::SKIP);
-    }
-
-    /// Through the live host view: a temporary `/proc/asound` whose PCM is open, then a
-    /// real listening socket that takes over.
-    #[test]
-    fn audio_view_observes_a_held_pcm_and_a_listening_pipewire() {
-        use crate::session::console_audio::LiveHostAudio;
-        let dir = tempfile::tempdir().unwrap();
-        let asound = dir.path().join("asound");
-        let dev_snd = dir.path().join("snd");
-        std::fs::create_dir_all(asound.join("card1/pcm0p/sub0")).unwrap();
-        std::fs::create_dir_all(&dev_snd).unwrap();
-        std::fs::write(
-            asound.join("cards"),
-            " 1 [Generic ]: HDA-Intel - HD-Audio Generic\n",
-        )
-        .unwrap();
-        std::fs::write(
-            asound.join("pcm"),
-            "01-00: ALC1220 Analog : ALC1220 Analog : playback 1\n",
-        )
-        .unwrap();
-        std::fs::write(dev_snd.join("pcmC1D0p"), "").unwrap();
-        std::fs::write(asound.join("card1/pcm0p/sub0/status"), "state: RUNNING\n").unwrap();
-        let host = LiveHostAudio {
-            socket: dir.path().join("native"),
-            asound,
-            dev_snd,
-        };
-        let mut v = view(true);
-        v.audio = AudioView::observe(&host, "hw:1,0");
-        v.audio.playing = false;
-        let held = check_audio(&v);
-        assert_eq!(held.status, super::super::FAIL, "{held:?}");
-        assert!(held.summary.contains("held by another program"), "{held:?}");
-
-        let _listener = std::os::unix::net::UnixListener::bind(&host.socket).unwrap();
-        v.audio = AudioView::observe(&host, "auto");
-        v.audio.playing = false;
-        let pw = check_audio(&v);
-        assert_eq!(pw.status, super::super::PASS, "{pw:?}");
-        assert!(pw.summary.contains("PipeWire"), "{pw:?}");
-        assert_eq!(v.audio.sinks[0].id, "pipewire:default");
-    }
-
-    /// #433: the socket directory is there but the socket is not: the check says so,
-    /// says why, and gives the restart command, whether ALSA still works or not.
-    #[test]
-    fn audio_says_the_socket_is_missing_and_how_to_restart_pipewire_pulse() {
-        use crate::session::console_audio::{Refusal, Route};
-        let mut v = view(true);
-        v.audio.socket_missing = true;
-        v.audio.sinks.push(crate::messages::AudioSink {
-            id: "hw:CARD=Generic,DEV=0".into(),
-            label: "ALC1220 Analog".into(),
-        });
-        v.audio.route = Ok(Route::Alsa { device: None });
-        let fallback = check_audio(&v);
-        assert_eq!(fallback.status, super::super::WARN, "{fallback:?}");
-        for want in [
-            "console-audio socket (/run/quasar-console-audio/native) is missing",
-            "pipewire-pulse has not picked up host preparation's drop-in",
-            "the host's default ALSA device",
-        ] {
-            assert!(fallback.summary.contains(want), "{want}: {fallback:?}");
+        for auto in [None, Some("auto")] {
+            assert_eq!(console_cards(auto, &outputs, &visible), ["card1"]);
         }
-        assert!(
-            fallback
-                .remediation
-                .contains("runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service"),
-            "{fallback:?}"
+        // Auto with no monitor: any card could be the one.
+        assert_eq!(
+            console_cards(None, &[output("card0:DP-1", false)], &visible),
+            visible
         );
-        assert!(fallback.blocks.is_none());
+    }
 
-        v.audio.route = Err(Refusal::DeviceHeld {
-            device: "hw:CARD=Generic,DEV=0".into(),
-            owner_pid: None,
-        });
-        let held = check_audio(&v);
-        assert_eq!(held.status, super::super::FAIL, "{held:?}");
-        assert!(held.summary.contains("held by another program"), "{held:?}");
-        assert!(held.summary.contains("socket"), "{held:?}");
-        assert!(
-            held.remediation
-                .contains("runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service"),
-            "{held:?}"
+    #[test]
+    fn card_fails_naming_the_missing_grant_or_the_holder() {
+        let with = |access: CardAccess| {
+            let mut v = on();
+            v.card.cards = vec![("/dev/dri/card1".into(), access)];
+            v
+        };
+        assert_fail(
+            &check_card(&with(CardAccess::Unopenable(
+                "Permission denied (os error 13)".into(),
+            ))),
+            "/dev/dri/card1 cannot be opened (Permission denied",
+            "sudo sh prepare-host.sh --mode rootless --console",
+        );
+        assert_fail(
+            &check_card(&with(CardAccess::Missing)),
+            "/dev/dri/card1 is not in this agent's container",
+            "recovery actor re-creates the node agent",
+        );
+        let mut held = with(CardAccess::Held);
+        assert_fail(
+            &check_card(&held),
+            "another program holds DRM master on /dev/dri/card1",
+            "Stop the desktop or login screen",
+        );
+        held.card.holder = Some("gdm, the login screen".into());
+        assert_fail(
+            &check_card(&held),
+            "gdm, the login screen holds DRM master on /dev/dri/card1",
+            "a streamed app may hold it",
+        );
+        let mut none = on();
+        none.card.cards.clear();
+        assert_fail(
+            &check_card(&none),
+            "no display card node",
+            "turn console mode off and on again",
+        );
+        // The console session's own desktop holding it is the point, not a fault.
+        let claimed = check_card(&with(CardAccess::Claimed));
+        assert_eq!(claimed.status, PASS, "{claimed:?}");
+        assert!(claimed.summary.contains("console session's desktop"));
+    }
+
+    #[test]
+    fn the_rootful_fix_names_its_own_mode() {
+        let mut v = on();
+        v.rootless = false;
+        v.card.cards = vec![("/dev/dri/card0".into(), CardAccess::Unopenable("x".into()))];
+        assert_fail(
+            &check_card(&v),
+            "/dev/dri/card0",
+            "prepare-host.sh --mode rootful --console",
+        );
+    }
+
+    #[test]
+    fn input_fails_on_a_bad_setting_an_unreadable_directory_a_gone_or_a_closed_device() {
+        let mut bad = on();
+        bad.input.grant = Some(Err("input_devices must be \"auto\"".into()));
+        assert_fail(&check_input(&bad), "input devices setting", "Input devices");
+
+        let mut no_dir = on();
+        no_dir.input.dir = Some(Err("No such file or directory".into()));
+        assert_fail(
+            &check_input(&no_dir),
+            "/dev/input cannot be read",
+            "recovery actor re-creates the node agent",
         );
 
-        // An unprepared host keeps the old wording, with no restart advice.
-        v.audio.socket_missing = false;
-        assert!(!check_audio(&v)
-            .remediation
-            .contains("pipewire-pulse.service"));
+        let mut gone = on();
+        gone.input.grant = Some(Ok(InputGrant::Nodes(vec!["/dev/input/event9".into()])));
+        gone.input.nodes = vec![node("/dev/input/event9", false, false)];
+        assert_fail(
+            &check_input(&gone),
+            "/dev/input/event9 is not on this host",
+            "Plug it in",
+        );
+
+        let mut closed = on();
+        closed.input.nodes = vec![
+            node("/dev/input/event3", true, true),
+            node("/dev/input/event5", true, false),
+        ];
+        assert_fail(
+            &check_input(&closed),
+            "cannot open 1 of the input devices the console desktop would get (first: /dev/input/event5)",
+            "prepare-host.sh --mode rootless --console",
+        );
+
+        let mut unread = on();
+        unread.input.grant = None;
+        assert_eq!(check_input(&unread).status, UNKNOWN);
+    }
+
+    #[test]
+    fn input_passes_saying_how_a_later_device_opens_on_each_engine_mode() {
+        let rootless = check_input(&on());
+        assert_eq!(rootless.status, PASS);
+        assert!(
+            rootless.summary.contains("host preparation's access rule"),
+            "{rootless:?}"
+        );
+        let mut rootful = on();
+        rootful.rootless = false;
+        let rootful = check_input(&rootful);
+        assert!(
+            rootful.summary.contains("device-cgroup rule"),
+            "{rootful:?}"
+        );
+        // A host with no physical input yet is not a missing grant.
+        let mut empty = on();
+        empty.input.nodes.clear();
+        assert_eq!(check_input(&empty).status, PASS);
+    }
+
+    #[test]
+    fn sound_fails_when_absent_or_closed() {
+        let mut missing = on();
+        missing.sound = SoundView::Missing;
+        assert_fail(
+            &check_sound(&missing),
+            "no sound device (/dev/snd)",
+            "recovery actor re-creates the node agent",
+        );
+        let mut closed = on();
+        closed.sound = SoundView::Present {
+            denied: vec!["/dev/snd/controlC0".into()],
+        };
+        assert_fail(
+            &check_sound(&closed),
+            "cannot open 1 of the host's sound devices (first: /dev/snd/controlC0)",
+            "prepare-host.sh --mode rootless --console",
+        );
+    }
+
+    #[test]
+    fn terminal_passes_held_or_absent_and_fails_naming_why() {
+        for view in [TerminalView::Held, TerminalView::NoVts] {
+            let mut v = on();
+            v.terminal = view;
+            assert_eq!(check_terminal(&v).status, PASS);
+        }
+        let mut unusable = on();
+        unusable.terminal =
+            TerminalView::Unusable("/dev/tty8 is not in the agent's container".into());
+        assert_fail(
+            &check_terminal(&unusable),
+            "/dev/tty8 is not in the agent's container",
+            "--console",
+        );
+        let mut closed = on();
+        closed.terminal = TerminalView::Present {
+            openable: false,
+            startup: None,
+        };
+        assert_fail(
+            &check_terminal(&closed),
+            "tty8 cannot be opened read-write",
+            "prepare-host.sh --mode rootless --console",
+        );
+        let mut getty = on();
+        getty.terminal = TerminalView::Present {
+            openable: true,
+            startup: Some(Err(
+                "tty8 is another session's terminal (a login prompt on it?)".into(),
+            )),
+        };
+        assert_fail(
+            &check_terminal(&getty),
+            "console terminal: tty8 is another session's terminal",
+            "keeps login prompts off it",
+        );
+        // Startup never tried (console mode was turned on without a restart): judged by
+        // the node alone.
+        let mut untried = on();
+        untried.terminal = TerminalView::Present {
+            openable: true,
+            startup: None,
+        };
+        assert_eq!(check_terminal(&untried).status, PASS);
+    }
+
+    #[test]
+    fn udev_fails_when_the_host_has_none_and_is_unknown_until_the_actor_says() {
+        let mut missing = on();
+        missing.udev = UdevView::Missing;
+        assert_fail(
+            &check_udev(&missing),
+            "the host has no udev data (/run/udev/data)",
+            "systemd-udevd",
+        );
+        let mut untold = on();
+        untold.udev = UdevView::Unknown;
+        let unknown = check_udev(&untold);
+        assert_eq!(unknown.status, UNKNOWN, "{unknown:?}");
+        assert!(
+            unknown
+                .summary
+                .contains("turn console mode off and on again"),
+            "{unknown:?}"
+        );
+        assert!(unknown.blocks.is_none());
+        for (value, view) in [
+            (Some("1"), UdevView::Present),
+            (Some(" 0 "), UdevView::Missing),
+            (Some("yes"), UdevView::Unknown),
+            (None, UdevView::Unknown),
+        ] {
+            assert_eq!(UdevView::from_env(value), view, "{value:?}");
+        }
     }
 
     #[test]
     fn ddc_walks_available_bus_mapped_any_read_all_off_in_order() {
-        let mut v = view(true);
-        assert_eq!(check_ddc(&v).status, super::super::WARN, "no ddcutil");
+        let mut v = on();
+        v.ddc = Default::default();
+        assert_eq!(
+            check_ddc(&v).status,
+            SKIP,
+            "no ddcutil: optional, not a fault"
+        );
 
         v.ddc.available = true;
-        assert_eq!(check_ddc(&v).status, super::super::WARN, "no bus mapped");
+        v.i2c_nodes = false;
+        let unprepared = check_ddc(&v);
+        assert_eq!(unprepared.status, SKIP, "host not prepared: {unprepared:?}");
+        assert!(unprepared.summary.contains("--console"), "{unprepared:?}");
+
+        v.i2c_nodes = true;
+        assert_eq!(check_ddc(&v).status, WARN, "no bus mapped");
 
         v.ddc.bus_mapped = true;
-        assert_eq!(check_ddc(&v).status, super::super::UNKNOWN, "no read yet");
+        assert_eq!(check_ddc(&v).status, UNKNOWN, "no read yet");
 
         v.ddc.any_read = true;
         v.ddc.all_off = true;
-        assert_eq!(check_ddc(&v).status, super::super::WARN, "all off");
+        assert_eq!(check_ddc(&v).status, WARN, "all off");
 
         v.ddc.all_off = false;
-        assert_eq!(check_ddc(&v).status, super::super::PASS);
+        assert_eq!(check_ddc(&v).status, PASS);
+    }
+
+    /// Through the live reader: an absent directory, then one with a PCM-family node and
+    /// a node the desktop does not need.
+    #[test]
+    fn the_sound_reader_sees_what_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            SoundView::observe(&dir.path().join("snd")),
+            SoundView::Missing
+        );
+        let snd = dir.path().join("snd");
+        std::fs::create_dir_all(&snd).unwrap();
+        std::fs::write(snd.join("controlC0"), "").unwrap();
+        std::fs::write(snd.join("timer"), "").unwrap();
+        assert_eq!(
+            SoundView::observe(&snd),
+            SoundView::Present { denied: Vec::new() },
+            "a node this test may open read-write, and a non-PCM node ignored"
+        );
+    }
+
+    #[test]
+    fn i2c_nodes_are_found_by_name_only() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_i2c_nodes(dir.path()));
+        for name in ["i2c-", "i2c-dev", "tty8"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        assert!(!has_i2c_nodes(dir.path()));
+        std::fs::write(dir.path().join("i2c-4"), "").unwrap();
+        assert!(has_i2c_nodes(dir.path()));
     }
 }

@@ -6,6 +6,9 @@
 /// instead of nested. Contract with quasar-images' KDE and Steam launchers.
 pub const DIRECT_DISPLAY_ENV: &str = "QUASAR_DIRECT_DISPLAY";
 
+/// Where libudev reads device properties, on the host and in the console container.
+pub const UDEV_DATA: &str = "/run/udev/data";
+
 /// evdev's character major. Bind-mounting `/dev/input` alone is not enough: a device
 /// plugged in after start is a new node the device cgroup has never allowed.
 const INPUT_CGROUP_RULE: &str = "c 13:* rwm";
@@ -170,7 +173,7 @@ pub fn console_args(host: &ConsoleHost, input: &InputGrant) -> Vec<String> {
     // why the container shares the host's network namespace. The host's udev control
     // socket is never handed in (root inside could steer the host's udevd through it);
     // the image makes the placeholder libudev looks for.
-    bind("/run/udev/data");
+    bind(UDEV_DATA);
     match input {
         InputGrant::All => {
             args.extend(["--device-cgroup-rule".into(), INPUT_CGROUP_RULE.into()]);

@@ -16,9 +16,12 @@
 #   - installs Quasar's udev rules (the files in deploy/udev/, byte for byte): the
 #     `quasar` group gets /dev/uinput, the input devices Quasar itself creates
 #     (matched by name), and the GPU render nodes; with --console also the display
-#     cards, sound devices, i2c buses, and this machine's own keyboards, mice and
-#     game controllers (so console mode's exclusive grab can take them) that console
-#     mode needs, and its own virtual terminal (tty8, with no login prompt on it).
+#     cards, sound devices, i2c buses and this machine's own input devices, which a
+#     console session's desktop is given (it holds the screen and the raw input of
+#     this machine), and console mode's virtual terminal (tty8, with no login prompt
+#     on it). On a rootless engine these ACLs are the only access there is: no device
+#     rule reaches a rootless container, so a device plugged in later opens through
+#     them alone.
 #     A seat rule keeps Quasar's virtual input devices off the desktop's seat, so a
 #     desktop user logged in on the host does not receive a player's input. No broad
 #     group such as `input` or `video` is granted;
@@ -65,8 +68,9 @@ Usage: prepare-host.sh --mode rootless|rootful [options]
   --user NAME                   the Quasar user (default: quasar)
   --homes DIR                   create the homes root DIR, owned by the Quasar user
   --templates DIR               the same for the templates root (Steam's prepared home)
-  --console                     also grant the display, sound, i2c and physical
-                                input devices and the terminal (tty8) console mode uses
+  --console                     also grant the display cards, sound, i2c and this
+                                machine's input devices and the terminal (tty8) that
+                                console mode uses
   --console-audio-user USER     with --console: give console mode a PipeWire audio
                                 socket on USER's desktop session (refused without
                                 --console, or if USER does not exist)
@@ -363,24 +367,20 @@ EOF
 }
 rules_console() {
   cat <<'EOF'
-# Quasar device rules: console mode only (Quasar drives this machine's own screen).
+# Quasar device rules: console mode only (a desktop drives this machine's own screen).
 # Documented at https://accreleus.github.io/quasar/install/device-rules/
 # Each rule ADDS read/write for the 'quasar' group to one kind of device. It changes no
 # device's owner or mode. With these rules the 'quasar' group can read what is typed on
 # this machine's keyboards, so install this file only on a host that uses console mode.
 
-# Display cards: console mode drives the screen directly.
+# Display cards: the console desktop drives the screen directly, and Quasar reads which monitors are connected.
 SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# Local sound devices: console mode plays the session's audio on this machine.
+# Local sound devices: the console desktop plays its sound on this machine.
 SUBSYSTEM=="sound", KERNEL=="pcmC*|controlC*|timer", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
 # i2c buses: monitor control (DDC), such as switching the monitor's input.
 SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# This machine's keyboards, so console mode's exclusive grab (EVIOCGRAB) can take them while a session runs.
-SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# This machine's mice, for the same exclusive grab.
-SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# This machine's game controllers, for the same exclusive grab.
-SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_JOYSTICK}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
+# This machine's input devices (keyboards, mice, controllers, touchpads, buttons), so the console desktop can use them, including ones plugged in later.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
 # Console mode's own virtual terminal: a session makes it the active one with the kernel keyboard off, so nothing typed in the session reaches a login prompt.
 SUBSYSTEM=="tty", KERNEL=="tty8", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
 EOF
@@ -401,7 +401,7 @@ if rules_base | tailor | put /etc/udev/rules.d/70-quasar.rules 0644 "give the $Q
   rules_changed=1
 else unchanged; fi
 if [ "$CONSOLE" = 1 ]; then
-  if rules_console | tailor | put /etc/udev/rules.d/71-quasar-console.rules 0644 "console mode: give the $QUSER group the display cards, sound, i2c buses, tty8 and this machine's keyboards, mice and game controllers while console mode uses them; the $QUSER group can read what is typed on this machine's keyboard"; then
+  if rules_console | tailor | put /etc/udev/rules.d/71-quasar-console.rules 0644 "console mode: give the $QUSER group the display cards, sound, i2c buses, tty8 and this machine's input devices, which the console desktop is given; the $QUSER group can read what is typed on this machine's keyboard"; then
     rules_changed=1
   else unchanged; fi
 elif [ -f "$R/etc/udev/rules.d/71-quasar-console.rules" ]; then

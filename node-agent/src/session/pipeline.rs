@@ -1277,8 +1277,8 @@ fn selected_connector_id(cfg: &SessionConfig, drm_root: &std::path::Path) -> Opt
 /// sets it to `Null`, as [`LocalDisplay`] does.
 pub struct LocalAudio {
     pub pipeline: gst::Pipeline,
-    /// Counts an ALSA leg while it lives, so the `console_audio` readiness check does not
-    /// read our own open PCM as someone else's. Dropped after the pipeline is at `Null`.
+    /// Counts an ALSA leg while it lives (`console_audio::alsa_leg_live`). Dropped after
+    /// the pipeline is at `Null`.
     _alsa_leg: Option<super::console_audio::AlsaLeg>,
 }
 

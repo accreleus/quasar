@@ -1176,3 +1176,34 @@ fn the_console_vt_is_kept_after_console_mode_is_turned_off() {
     assert_eq!(devices, before.spec.devices);
     assert_eq!(m.inputs()["console_vt_kept"], true);
 }
+
+/// #460: turning console mode on reads whether the host has udev's database and tells the
+/// agent; an actor start never reads it, so a host whose answer changed (or a machine that
+/// predates the fact) re-creates nothing until console mode is turned on again.
+#[test]
+fn udev_data_is_read_when_console_mode_is_turned_on_and_never_at_a_start() {
+    let mut state = rootless();
+    state.probe_output = PROBE_ROOTLESS.replace("end\n", "udev data\nend\n");
+    let m = Machine::install(state);
+    let actor = m.actor();
+    run(&actor, enable());
+    let agent = m.one_running_agent("console on");
+    assert_eq!(
+        agent
+            .spec
+            .env
+            .get("QUASAR_HOST_UDEV_DATA")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(m.inputs()["devices"]["udev_data"], true);
+
+    m.engine
+        .with_state(|s| s.probe_output = PROBE_ROOTLESS.to_string());
+    drop(actor);
+    let actor = m.actor();
+    actor.resume().unwrap();
+    assert_eq!(actor.recheck_on_start(), None);
+    assert_eq!(m.agent().id, agent.id);
+    assert_eq!(m.inputs()["devices"]["udev_data"], true);
+}

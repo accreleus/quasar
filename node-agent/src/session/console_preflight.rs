@@ -69,8 +69,9 @@ trait DisplayProbe {
     fn probe(&self, path: &Path) -> io::Result<DisplayState>;
 }
 
-/// The real check: open read-write (an `EACCES`/`EPERM` here means the host was not
-/// prepared with `--console`, not that the display is held), then test mastership by
+/// The real check: open read-only, as every card read of the agent's is (#460; an
+/// `EACCES`/`EPERM` here means the host was not prepared with `--console`, not that the
+/// display is held). The open mode does not decide mastership. Then test mastership by
 /// re-issuing the DRM `SET_MASTER` ioctl — a no-op if the open already made this fd
 /// master (the free case), `EACCES`/`EPERM` if another process holds it (see the module
 /// doc). Frees the display again immediately so a subsequent `spawn_weston_console` can
@@ -87,10 +88,7 @@ impl DisplayProbe for RealDisplayProbe {
         }
         impl drm::Device for Card {}
 
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
         let card = Card(file);
         match card.acquire_master_lock() {
             Ok(()) => {
@@ -134,7 +132,7 @@ fn parse_kv(body: &str, key: &str) -> Option<String> {
 /// read-only at `host_run/systemd/{seats,sessions}` by the recipe when present (#407).
 /// `None` when they are absent, unreadable, or name nobody in particular — the caller
 /// falls back to a generic "another program holds the display".
-fn name_holder(host_run: &Path) -> Option<String> {
+pub(crate) fn name_holder(host_run: &Path) -> Option<String> {
     let seat0 = std::fs::read_to_string(host_run.join("systemd/seats/seat0")).ok()?;
     let session_id = parse_kv(&seat0, "ACTIVE")?;
     let session =
@@ -211,11 +209,10 @@ fn run_with(probe: &dyn DisplayProbe, dri_root: &Path, host_run: &Path) -> Prefl
     }))
 }
 
-/// The startup preflight's own finding, for `readiness::console::check_display` — the
-/// readiness check reads this cache rather than re-probing: re-opening a card node for
-/// master outside of startup would race a live `spawn_weston_console` for exactly the
-/// reason `session::console::drm_open_lock` exists to prevent.
-static LAST: std::sync::RwLock<Option<Preflight>> = std::sync::RwLock::new(None);
+/// The startup preflight's console-terminal finding, for `readiness::console`'s
+/// `console_terminal` (#460): taking the terminal again outside a session would switch the
+/// host's console, so the check reads what startup found.
+static LAST_TERMINAL: std::sync::RwLock<Option<Result<(), String>>> = std::sync::RwLock::new(None);
 
 /// A display that can be taken still fails when the console VT cannot
 /// (`session::console_vt`): a console session would refuse to start.
@@ -230,24 +227,23 @@ fn with_console_vt(display: Preflight, vt: Result<(), String>) -> Preflight {
 pub(crate) fn run() -> Preflight {
     // First: it also puts back a console an earlier agent left on the console VT.
     let vt = crate::session::console_vt::reconcile_at_startup();
-    let result = with_console_vt(
+    if let Ok(mut slot) = LAST_TERMINAL.write() {
+        *slot = Some(vt.clone());
+    }
+    with_console_vt(
         run_with(
             &RealDisplayProbe,
             Path::new("/dev/dri"),
             Path::new("/host/run"),
         ),
         vt,
-    );
-    if let Ok(mut slot) = LAST.write() {
-        *slot = Some(result.clone());
-    }
-    result
+    )
 }
 
-/// The most recent preflight's result; `None` before the first one has run (or on an
-/// agent that was never created with console access, which never runs one at all).
-pub(crate) fn last() -> Option<Preflight> {
-    LAST.read().ok().and_then(|g| g.clone())
+/// What the startup preflight found taking the console terminal; `None` before it has run
+/// (or on an agent that was never created with console access, which never runs one).
+pub(crate) fn last_terminal() -> Option<Result<(), String>> {
+    LAST_TERMINAL.read().ok().and_then(|g| g.clone())
 }
 
 /// Tell the recovery actor. Best-effort: an unreachable actor is logged, not fatal — the

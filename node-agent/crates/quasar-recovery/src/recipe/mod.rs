@@ -311,6 +311,12 @@ pub struct HostDevices {
     /// off. Read with `i2c`; written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub console_vt: bool,
+    /// Whether the host has udev's device database, `/run/udev/data` (#460), which a
+    /// console session's container is given read-only. Read only when console mode is
+    /// turned on, never at an actor start, so an upgrade alone re-creates no agent; `None`
+    /// until then. The agent learns it as `QUASAR_HOST_UDEV_DATA`. Written only when read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udev_data: Option<bool>,
     #[serde(flatten)]
     pub unknown: Unknown,
 }
@@ -331,6 +337,7 @@ impl Default for HostDevices {
             console_audio: false,
             dri_nodes: Vec::new(),
             console_vt: false,
+            udev_data: None,
             unknown: Unknown::new(),
         }
     }
@@ -1323,6 +1330,13 @@ fn console_access(spec: &mut ContainerSpec, inputs: &Inputs) {
         // (`/dev/dri`), so no major-226 rule.
         spec.device_cgroup_rules.push("c 89:* rmw".to_string());
     }
+    // The host's answer the agent cannot read itself, as `QUASAR_HOST_FUSE` is.
+    if let Some(udev_data) = inputs.devices.udev_data {
+        spec.env.insert(
+            HOST_UDEV_DATA_ENV.into(),
+            if udev_data { "1" } else { "0" }.into(),
+        );
+    }
     spec.env.insert(CONSOLE_ACCESS_ENV.into(), "1".into());
 }
 
@@ -1354,6 +1368,10 @@ pub const CONSOLE_AUDIO_DIR: &str = "/run/quasar-console-audio";
 
 /// Where console mode's host views live inside the agent: `/host/run/systemd/seats`, ...
 pub const CONSOLE_HOST_PREFIX: &str = "/host";
+
+/// `1` or `0`: whether the host has `/run/udev/data` ([`HostDevices::udev_data`]), on a
+/// console agent created since that was read.
+pub const HOST_UDEV_DATA_ENV: &str = "QUASAR_HOST_UDEV_DATA";
 
 /// `1` on an agent container created with the console additions, and absent otherwise.
 pub const CONSOLE_ACCESS_ENV: &str = "QUASAR_CONSOLE_ACCESS";

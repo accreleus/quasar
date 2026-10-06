@@ -50,6 +50,7 @@ pub fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             logind: false,
             console_audio: false,
             console_vt: false,
+            udev_data: None,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -1256,5 +1257,30 @@ fn agent_variables_are_documented() {
             docs.contains(&format!("| `{name}`")) || docs.contains(&format!("`{name}` /")),
             "{name} has no row in docs/configuration.md"
         );
+    }
+}
+
+/// #460: whether the host has udev's database reaches a console agent as an environment
+/// input, only once console mode has read it; a machine that never read it renders as before.
+#[test]
+fn a_console_agent_is_told_whether_the_host_has_udev_data_once_it_was_read() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let mut console = inputs(Some(GpuVendor::Amd));
+    console.console = true;
+    let unread = render(Role::NodeAgent, 3, &console, &image, &agent_secrets()).unwrap();
+    assert!(!unread.env.contains_key("QUASAR_HOST_UDEV_DATA"));
+    for (fact, value) in [(true, "1"), (false, "0")] {
+        let mut read = console.clone();
+        read.devices.udev_data = Some(fact);
+        let spec = render(Role::NodeAgent, 3, &read, &image, &agent_secrets()).unwrap();
+        assert_eq!(
+            spec.env.get("QUASAR_HOST_UDEV_DATA").map(String::as_str),
+            Some(value)
+        );
+        assert_eq!(spec.binds, unread.binds, "an input, never a mount");
+        // Console mode off: no console additions, so no such input either.
+        read.console = false;
+        let off = render(Role::NodeAgent, 3, &read, &image, &agent_secrets()).unwrap();
+        assert!(!off.env.contains_key("QUASAR_HOST_UDEV_DATA"));
     }
 }

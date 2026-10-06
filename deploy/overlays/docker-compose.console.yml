@@ -30,6 +30,11 @@ services:
     # of CM-09.
     cap_add:
       - SYS_ADMIN
+    environment:
+      # Whether this host has udev's device database (/run/udev/data), which a console
+      # session's container is given read-only; the agent's console_udev check reads it
+      # here. Set 0 on a host without systemd-udevd.
+      QUASAR_HOST_UDEV_DATA: "1"
     volumes:
       # Host audio for the local speakers / HDMI-DP output. The whole directory is
       # bound because the ALSA card and PCM device numbers are host-specific (an

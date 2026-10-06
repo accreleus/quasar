@@ -1468,6 +1468,62 @@ fn application_device_cgroup_rules_are_created_and_verified() {
     );
 }
 
+/// #460: a rootless engine cannot apply a device-cgroup rule (rootless Podman refuses the
+/// create outright), so the container is created without the request's rule, the journal
+/// records that, and the read-back expects none.
+#[test]
+fn a_rootless_engine_creates_the_application_without_its_device_cgroup_rules() {
+    let request = |operation: &str| ApplicationRequest {
+        device_cgroup_rules: vec!["c 13:* rwm".into()],
+        ..realized_requirements_request(operation)
+    };
+    let engine = Engine::new();
+    engine.state.lock().unwrap().info = Some(rootless_info(&["nvidia.com/gpu=all"]));
+    engine
+        .client()
+        .start_application(request("fixture-rootless-rules"))
+        .wait()
+        .unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert!(
+        body["HostConfig"]["DeviceCgroupRules"].is_null(),
+        "{}",
+        body["HostConfig"]
+    );
+    let journal = std::fs::read_dir(
+        engine
+            .config
+            .image_state_path
+            .as_ref()
+            .unwrap()
+            .join("applications"),
+    )
+    .unwrap()
+    .flatten()
+    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+    .find(|j| j.contains("fixture-rootless-rules"))
+    .unwrap();
+    let intent: Value = serde_json::from_str(&journal).unwrap();
+    assert_eq!(intent["device_cgroup_rules"], json!([]));
+    assert_eq!(
+        intent["request"]["device_cgroup_rules"],
+        json!(["c 13:* rwm"])
+    );
+
+    // The same launch on a rootful engine keeps the rule and reads it back.
+    let rootful = Engine::new();
+    rootful
+        .client()
+        .start_application(request("fixture-rootful-rules"))
+        .wait()
+        .unwrap();
+    let body = rootful.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(
+        body["HostConfig"]["DeviceCgroupRules"],
+        json!(["c 13:* rwm"])
+    );
+}
+
 #[test]
 fn application_accepts_normalized_typed_mount_defaults() {
     let engine = Engine::new();
@@ -2630,6 +2686,7 @@ fn application_recovery_skips_a_locked_record_and_cleans_a_later_obligation() {
         keep_id: None,
         engine_groups: Vec::new(),
         group_add: None,
+        device_cgroup_rules: None,
         nested_sandbox_label: false,
         phase: ApplicationPhase::Running,
         result: None,

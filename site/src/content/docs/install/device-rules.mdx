@@ -26,10 +26,10 @@ what they do.
 | [`70-quasar.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/70-quasar.rules) | `/dev/uinput` | Creating virtual keyboards, mice, gamepads and touch devices for players. | Rootless installs |
 | | Input devices named `Quasar Virtual *` | Sessions open the virtual devices Quasar created. On an SELinux host they also get the container label, so a confined session can open them. | Rootless installs |
 | | GPU render nodes (`/dev/dri/renderD*`) | Hardware encoding and rendering. | Rootless installs |
-| [`71-quasar-console.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/71-quasar-console.rules) | Display cards (`/dev/dri/card*`) | Showing a session on the host's own screen. | Console mode |
-| | Sound devices | Playing the session's audio on the host. | Console mode |
+| [`71-quasar-console.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/71-quasar-console.rules) | Display cards (`/dev/dri/card*`) | The console desktop drives the host's own screen; the agent reads which monitors are connected. | Console mode |
+| | Sound devices | The console desktop plays its sound on the host. | Console mode |
 | | i2c buses (`/dev/i2c-*`) | Monitor control (DDC), such as switching the monitor's input. | Console mode |
-| | The host's keyboards, mice and game controllers | Taking them exclusively while a session runs, so input goes to the game only. | Console mode |
+| | The host's input devices (keyboards, mice, controllers, touchpads, buttons) | The console desktop uses them, including ones plugged in later. | Console mode |
 | | `tty8` | Console mode's own terminal, so nothing typed reaches a login prompt. | Console mode |
 | [`72-quasar-seat.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/72-quasar-seat.rules) | Input devices named `Quasar Virtual *` | Moves them off the desktop's seat. See [below](#the-seat-rule). | Any host where someone logs into a desktop |
 
@@ -38,8 +38,8 @@ in both modes.
 
 <Aside type="caution" title="Console mode can read the host's keyboard">
 With `71-quasar-console.rules`, the `quasar` group can read what is typed on the
-host's own keyboards. Install it only on a host that uses
-[console mode](/quasar/admin/console/).
+host's own keyboards: the console session holds the screen and the raw input of the
+host. Install it only on a host that uses [console mode](/quasar/admin/console/).
 </Aside>
 
 ### The seat rule

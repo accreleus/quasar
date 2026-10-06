@@ -1,20 +1,16 @@
-# Quasar device rules: console mode only (Quasar drives this machine's own screen).
+# Quasar device rules: console mode only (a desktop drives this machine's own screen).
 # Documented at https://accreleus.github.io/quasar/install/device-rules/
 # Each rule ADDS read/write for the 'quasar' group to one kind of device. It changes no
 # device's owner or mode. With these rules the 'quasar' group can read what is typed on
 # this machine's keyboards, so install this file only on a host that uses console mode.
 
-# Display cards: console mode drives the screen directly.
+# Display cards: the console desktop drives the screen directly, and Quasar reads which monitors are connected.
 SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# Local sound devices: console mode plays the session's audio on this machine.
+# Local sound devices: the console desktop plays its sound on this machine.
 SUBSYSTEM=="sound", KERNEL=="pcmC*|controlC*|timer", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
 # i2c buses: monitor control (DDC), such as switching the monitor's input.
 SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# This machine's keyboards, so console mode's exclusive grab (EVIOCGRAB) can take them while a session runs.
-SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# This machine's mice, for the same exclusive grab.
-SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# This machine's game controllers, for the same exclusive grab.
-SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_JOYSTICK}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
+# This machine's input devices (keyboards, mice, controllers, touchpads, buttons), so the console desktop can use them, including ones plugged in later.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
 # Console mode's own virtual terminal: a session makes it the active one with the kernel keyboard off, so nothing typed in the session reaches a login prompt.
 SUBSYSTEM=="tty", KERNEL=="tty8", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
