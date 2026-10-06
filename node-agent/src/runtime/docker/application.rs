@@ -2558,6 +2558,8 @@ mod app_identity_tests {
             card_node: "/dev/dri/card1".into(),
             render_node: Some("/dev/dri/renderD129".into()),
             sound: true,
+            hidraw_nodes: Vec::new(),
+            hidraw_major: None,
         };
         for input in [
             InputGrant::All,
