@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # validate-local-audio.sh — one-command PASS/FAIL/SKIP validator for the Quasar
-# local-audio (console-mode) PulseAudio sidecar. Replaces the ~15 manual probes
+# session PulseAudio sidecar (a streamed session's audio; console sessions play
+# their own audio since #461). Replaces the ~15 manual probes
 # used during the 2026-07-14 local-audio debugging session. Run ON the lab host
 # (or via qnv sh), e.g.:
 #   qnv sh 'scripts/dev/validate-local-audio.sh'
@@ -24,11 +25,9 @@
 #   5. [optional --capture N] captures N seconds from quasar_output.monitor via
 #      parec inside the sidecar and reports per-second max amplitude (measurement
 #      only — never plays audio back)
-#   6. node-agent container is running, and (SKIP if no console session is live)
-#      has an open FD on an ALSA pcm device
 #
 # Exits non-zero if any check FAILs. A missing sidecar SKIPs sidecar-dependent
-# checks rather than failing the whole run (there may legitimately be no console
+# checks rather than failing the whole run (there may legitimately be no
 # session active).
 set -euo pipefail
 
@@ -68,7 +67,7 @@ pactl_sidecar() {
 PULSE_CONTAINER="$(docker ps --filter 'name=quasar-pulse-' --format '{{.Names}}' 2>/dev/null | head -n1 || true)"
 
 if [ -z "$PULSE_CONTAINER" ]; then
-  skip "no running quasar-pulse-* sidecar found — skipping all sidecar checks (no console session live?)"
+  skip "no running quasar-pulse-* sidecar found — skipping all sidecar checks (no session live?)"
   skip "session socket dir / cookie permissions (no sidecar)"
   skip "non-root pactl auth (no sidecar)"
   skip "sink/source defaults (no sidecar)"
@@ -214,23 +213,6 @@ PYEOF
     else
       fail "amplitude capture from quasar_output.monitor produced no output"
     fi
-  fi
-fi
-
-# --- 6. node-agent container + ALSA pcm FD (SKIP gracefully if no live session) ---
-AGENT_CONTAINER="$(docker ps --filter 'name=quasar-node-agent' --format '{{.Names}}' 2>/dev/null | head -n1 || true)"
-if [ -z "$AGENT_CONTAINER" ]; then
-  fail "no running quasar-node-agent container found"
-else
-  pass "node-agent container running (${AGENT_CONTAINER})"
-
-  AGENT_PID="$(docker inspect --format '{{.State.Pid}}' "$AGENT_CONTAINER")"
-  PCM_FD_COUNT="$(find "/proc/${AGENT_PID}/fd" -lname '*snd/pcm*' 2>/dev/null | wc -l | tr -d ' ')"
-  PCM_FD_COUNT="${PCM_FD_COUNT:-0}"
-  if [ "$PCM_FD_COUNT" -gt 0 ]; then
-    pass "node-agent (pid ${AGENT_PID}) has an open FD on an ALSA pcm device (console session live)"
-  else
-    skip "no ALSA pcm FD on node-agent (pid ${AGENT_PID}) — no console session currently live"
   fi
 fi
 

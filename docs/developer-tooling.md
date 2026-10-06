@@ -116,8 +116,8 @@ actually has a `pulseaudio` binary (the 2026-07-26 silent-audio outage). It abso
 former `deploy/build-agent-host.sh`, which was already a thin wrapper over this script.
 
 The companion check is `scripts/dev/validate-local-audio.sh [--capture N]` — PASS/FAIL/SKIP
-checks for the local-audio (console-mode) PulseAudio sidecar: socket/cookie permissions,
-non-root auth, sink/source defaults, log scan, optional amplitude capture, node-agent ALSA FD.
+checks for a session's PulseAudio sidecar: socket/cookie permissions, non-root auth,
+sink/source defaults, log scan, optional amplitude capture.
 
 ### The harness library
 
@@ -166,7 +166,7 @@ issue closes (precedent: 2026-07-17; recover any from git history). Current set:
 | `scripts/harness/readiness-fixture/` | Test-only Go module (relay rewriting agent readiness on wire, scripted host); never built into images; `make verify` guards this via `readiness-faults:*` checks |
 | `scripts/harness/checks/vram-telemetry.sh` | Live VRAM telemetry is flowing (read-only; sourceable) |
 | `scripts/harness/peer-driver.mjs` | The headless WebRTC peer the shell harnesses drive |
-| `scripts/dev/validate-local-audio.sh` | Console-mode Pulse sidecar audio |
+| `scripts/dev/validate-local-audio.sh` | Session Pulse sidecar audio |
 | `scripts/release/probe-vulkan-encoder-runtime.sh` | Vulkan encoder actually registered on this GPU |
 | `scripts/release/test-*.sh` | Offline contract tests for the release scripts (mock docker, fixtures). `test-release-preflight.sh`, `test-release-supply-chain.sh`, `test-probe-vulkan-encoder-runtime.sh`, `test-changelog-section.sh`, `test-platform-release-manifest.sh`, `test-release-cut.sh` (git-dependent cases run against a throwaway repo + bare "origin" under `mktemp`, never the real remote). Run them by hand — no verify stage does, except `test-platform-release-signature.sh`, which `make verify` runs as `release:signature-contract` |
 | `deploy/db-backup-restore-drill.sh` | Postgres backup/restore drill (disposable containers) |
