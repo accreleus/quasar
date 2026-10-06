@@ -26,7 +26,6 @@ use super::source::{AppSource, SessionResources};
 use super::vulkan_fault;
 use super::{pipeline, SessionConfig};
 
-mod console_leg;
 mod direct_display;
 use crate::messages::{AppExitPolicy, VideoTopology};
 
@@ -122,7 +121,7 @@ fn renderer_degraded_marker(warn: &gst::message::Warning) -> Option<String> {
 /// degradation produces a second marker inside 30s; a one-off transient does not.
 const RENDERER_DEGRADE_WINDOW: Duration = Duration::from_secs(30);
 
-/// One tracker per bus-pump loop (`run_blocking`, `run_local_only`): the first marker
+/// One tracker per bus-pump loop (`run_blocking`): the first marker
 /// warns and arms the window; only a SECOND marker inside
 /// [`RENDERER_DEGRADE_WINDOW`] fails the session closed.
 #[derive(Default)]
@@ -464,7 +463,6 @@ fn effective_media_snapshot(
     cfg: &SessionConfig,
     encode_pipe: &gst::Pipeline,
     interpipesrc: &gst::Element,
-    local_backend: Option<&str>,
 ) -> serde_json::Value {
     let encoder = encode_pipe
         .by_name(pipeline::VIDEO_ENCODER_NAME)
@@ -526,7 +524,7 @@ fn effective_media_snapshot(
     );
     // Must stay the same condition `pipeline::build_encode_pipeline` builds the audio
     // pipeline on: it is what a mic m-line can exist under.
-    let has_audio_pc = !pipeline::audio_disabled() && console_leg::streams_audio(cfg);
+    let has_audio_pc = !pipeline::audio_disabled();
     let mic_state = mic_state_label(cfg.stream.mic, pipeline::mic_disabled(), has_audio_pc);
 
     serde_json::json!({
@@ -547,11 +545,7 @@ fn effective_media_snapshot(
         "resolved": {
             "render_node": cfg.render_node,
             "cuda_device_id": cfg.cuda_device_id,
-            "stream": true,
-            "stream_audio": console_leg::stream_audio_setting(cfg),
-            "local_output": local_backend.is_some(),
-            "local_backend": local_backend,
-            "connector": console_leg::connector(cfg)
+            "stream": true
         },
         "actual": {
             "game_gpu_access": app_gpu_requested,
@@ -572,9 +566,7 @@ fn effective_media_snapshot(
             "gop": prop("gop-size").or_else(|| prop("key-int-max")).or_else(|| prop("idr-period")),
             "slices": prop("num-slices"),
             "source_topology": "interpipe",
-            "stream": true,
-            "local_output": local_backend.is_some(),
-            "local_backend": local_backend
+            "stream": true
         },
         // The app container's own display mode (what the app and any nested gamescope
         // see), distinct from the streamed mode above. `source`: `agent` |
@@ -1257,7 +1249,6 @@ fn start_first_source<F: Fn(SessionEvent)>(
     cuda_ctx: Option<&gst::Context>,
     va_ctx: Option<&gst::Context>,
     emit: &F,
-    before_start: impl FnOnce(&AppSource),
 ) -> Option<(AppSource, Option<VulkanContextBridge>)> {
     let cname0 = app_container_name(session_id, 0);
     let mut source =
@@ -1302,7 +1293,6 @@ fn start_first_source<F: Fn(SessionEvent)>(
         cfg.stream.width,
         cfg.stream.height,
     ));
-    before_start(&source);
     if let Err(e) = source.start() {
         tracing::error!(
             token = "runner-source-start-failed",
@@ -1383,8 +1373,8 @@ pub fn run_blocking(
     }
     let _metrics_hook_guard = MetricsHookGuard(session_metrics.clone());
 
-    // A direct-display console session has no media pipeline at all.
-    if direct_display::wants_direct(&cfg) {
+    // A console session has no media pipeline at all: its desktop drives the display.
+    if cfg.video_topology == VideoTopology::LocalOnly {
         drop(capture_rx);
         direct_display::run_direct(
             &session_id,
@@ -1432,14 +1422,6 @@ pub fn run_blocking(
     };
     emit(SessionEvent::Starting);
     emit(SessionEvent::Progress("preparing resources and image"));
-
-    let mut console_vt = match console_leg::take_terminal(&cfg, &stop) {
-        Ok(vt) => vt,
-        Err(reason) => {
-            emit(SessionEvent::Failed(reason));
-            return;
-        }
-    };
 
     // Session-level resources (input devices + PulseAudio sidecar) shared across
     // swaps. Dropping `res` releases the sidecar; each AppSource borrows its nodes.
@@ -1533,32 +1515,6 @@ pub fn run_blocking(
     // is kept in case a future zero-copy path needs cross-pipeline VA display sharing.
     let va_ctx: Option<gst::Context> = None;
 
-    // Local-only is an encoder-free topology: no encode pipeline, webrtcbin, RTP/audio
-    // transport, signaling or transport idle-reaper.
-    if cfg.video_topology == VideoTopology::LocalOnly {
-        // Nothing any capture kind can observe here. `capture::admit` already refuses
-        // `session_capture` for this topology; dropping the receiver makes that
-        // structural rather than a convention.
-        drop(capture_rx);
-        console_leg::run_local_only(
-            &session_id,
-            &cfg,
-            &emit,
-            diagnostic_tx,
-            stop,
-            swap_rx,
-            display_rx,
-            &res,
-            session_metrics.clone(),
-            &shared_clock,
-            shared_base,
-            cuda_ctx.as_ref(),
-            va_ctx.as_ref(),
-            console_vt.as_mut(),
-        );
-        return;
-    }
-
     // gen 0: the initial source (compositor + first app container) behind the interpipe
     // boundary; `sink_name` is the node the encoder listens to.
     let mut gen: u64 = 0;
@@ -1574,7 +1530,6 @@ pub fn run_blocking(
         cuda_ctx.as_ref(),
         va_ctx.as_ref(),
         &emit,
-        |_| {},
     ) else {
         return;
     };
@@ -1771,32 +1726,6 @@ pub fn run_blocking(
             tracing::info!("audio pipeline PLAYING (separate from encode, clock {clock})");
         }
     }
-    // The console fan-out of a streamed session; its field order is its teardown order.
-    let dual_output = match console_leg::DualOutputLeg::start(
-        &cfg,
-        &session_id,
-        &sink0,
-        &res,
-        &shared_clock,
-        shared_base,
-        vulkan_contexts.as_ref(),
-        cuda_ctx.as_ref(),
-        va_ctx.as_ref(),
-    ) {
-        Ok(leg) => leg,
-        Err(failure) => {
-            console_leg::fail_dualoutput_console(
-                &emit,
-                failure.reason,
-                &mut current_source,
-                &encode_pipe,
-                audio_pipeline.as_ref(),
-                defer_encode_teardown,
-            );
-            return;
-        }
-    };
-
     let Some(encode_bus) = encode_pipe.bus() else {
         tracing::error!(
             token = "runner-encode-bus-missing",
@@ -1860,18 +1789,6 @@ pub fn run_blocking(
     let mut last_ice_ufrag: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     loop {
-        if let Some(reason) = console_leg::terminal_lost(&mut console_vt) {
-            dual_output.halt_display();
-            console_leg::fail_dualoutput_console(
-                &emit,
-                format!("console terminal lost: {reason}"),
-                &mut current_source,
-                &encode_pipe,
-                audio_pipeline.as_ref(),
-                defer_encode_teardown,
-            );
-            return;
-        }
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
             current_source.teardown(); // remove the app container before media
@@ -1911,7 +1828,6 @@ pub fn run_blocking(
                         &cfg,
                         &encode_pipe,
                         &interpipesrc,
-                        dual_output.backend_name(),
                     )));
                     effective_media_sent = true;
                     // Emit the audio-degradation trace event here, not at detection: the
@@ -2234,7 +2150,6 @@ pub fn run_blocking(
             ) {
                 Ok(()) => {
                     emit(SessionEvent::SwapDone);
-                    dual_output.follow_source(&ipsink_name(&session_id, gen));
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
@@ -2297,11 +2212,7 @@ pub fn run_blocking(
             } else {
                 unhealthy_since = None;
             }
-            let reap_window = if console_leg::holds_physical_display(&cfg) {
-                Duration::ZERO
-            } else {
-                cfg.idle_timeout
-            };
+            let reap_window = cfg.idle_timeout;
             // #484: charge the never-connected window from the app-presented instant, not
             // the first offer — a cold app boot is 30–50 s. Appless sessions keep the old
             // clock.
@@ -2468,10 +2379,7 @@ pub fn run_blocking(
 
         // App-liveness on a 5 s cadence, aligned with the metrics heartbeat.
         if liveness_cadence_at.elapsed() >= Duration::from_secs(5) {
-            let cadence_elapsed = liveness_cadence_at.elapsed();
             liveness_cadence_at = Instant::now();
-            // The DualOutput console leg's delivered-frame cadence.
-            dual_output.log_cadence(&cfg, cadence_elapsed);
             if let Some(status) = current_source.take_container_exit() {
                 let policy = current_source.exit_policy();
                 // Read BOTH before any teardown: the app-surface counter lives on the

@@ -23,10 +23,8 @@ use source_roots::source_roots;
 /// server). Anything not listed here must be unique: two different conditions
 /// sharing a token makes the token useless for finding either one.
 const SHARED_TOKENS: &[&str] = &[
-    "app-exit-disposition-unrecognized",
     "audio-fallback-silent",
     "audio-unavailable-silent",
-    "console-weston-exit-timeout",
     // A rate-limited upgrade, from the normal and the diagnostic reconnect loops.
     "cp-connect-rate-limited",
     "datachannel-create-returned-nothing",

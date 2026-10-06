@@ -15,19 +15,14 @@ pub mod media_evidence;
 // telemetry burst), driven from the runner's supervision tick. Never a pad probe,
 // never on a streaming thread.
 pub mod capture;
-pub mod container;
-// Headless weston process manager for the nvidia-drm local-display path.
-pub(crate) mod console;
-// Where console local audio plays: the host's PipeWire, or ALSA when no PipeWire answers
-// and the device is free (#407 RH07-15, D13).
-pub(crate) mod console_audio;
 pub mod console_hotplug;
+pub mod container;
 // The grants a direct-display console container gets.
 pub mod console_plan;
 // Whether a console session is displaying.
 pub mod displaying;
-// Startup check that this agent can actually take the console display before it
-// reports healthy (#407 RH07-15).
+// Startup check that the console display can be taken and the console terminal held
+// before a console agent reports healthy (#407 RH07-15).
 pub(crate) mod console_preflight;
 // Console mode's own virtual terminal, keyboard off, for a local console session (#407).
 pub mod console_vt;
@@ -60,9 +55,6 @@ pub mod metrics;
 pub mod mount_policy;
 // #489: deferred NVENC encode-pipeline teardown (QUASAR_NVENC_DEFER_TEARDOWN).
 pub mod nvenc_defer;
-// Physical keyboard/mouse evdev grab, forwarded into virtual_input's uinput devices so
-// the compositor's single input path sees both WebRTC and physical input.
-pub mod physical_input;
 pub mod pipeline;
 /// `probe-encoder`: what the encode branch negotiates, through the production builders.
 pub mod probe_encoder;
@@ -496,8 +488,8 @@ pub struct SessionConfig {
     /// agent-local loss signal ([`fec::FecController`]).
     pub fec_mode: fec::FecMode,
     /// The host's console-mode config, snapshotted from the agent's latched
-    /// `config_update.console_config`. `None` ⇒ the runner falls back to
-    /// `QUASAR_LOCAL_DISPLAY`. Drives the local-display leg.
+    /// `config_update.console_config`. A `local_only` session needs it enabled; a streamed
+    /// session never reads it.
     pub console_config: Option<crate::messages::ConsoleConfig>,
     /// Assignment-scoped output plan; defaults to stream-only for old control planes and
     /// standalone/dev sessions.

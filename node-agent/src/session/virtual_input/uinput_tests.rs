@@ -302,23 +302,6 @@ fn uinput_gamepad_injection_reads_back_as_xpad_events() {
     }
 }
 
-/// A forwarded physical pad's `BTN_DPAD_*` is folded onto the hat; without
-/// that the kernel would drop it, since the virtual pad declares no such key.
-#[test]
-#[ignore = "needs /dev/uinput and root: make test-uinput"]
-fn uinput_forwarded_dpad_button_arrives_as_hat() {
-    let Some((devs, _)) = devices("uinput_forwarded_dpad_button_arrives_as_hat") else {
-        return;
-    };
-    let pad = open_evdev(&devs.gamepad_path);
-    devs.forward_gamepad_frame(&[ev(isys::EV_KEY as u16, isys::BTN_DPAD_UP as u16, 1), syn()])
-        .unwrap();
-    assert_eq!(read_frame(&pad), vec![abs(isys::ABS_HAT0Y, -1)]);
-    devs.forward_gamepad_frame(&[ev(isys::EV_KEY as u16, isys::BTN_DPAD_UP as u16, 0), syn()])
-        .unwrap();
-    assert_eq!(read_frame(&pad), vec![abs(isys::ABS_HAT0Y, 0)]);
-}
-
 /// Issue #350: a browser scroll-down (positive `dy`) is a NEGATIVE evdev wheel,
 /// and fractional steps add up to whole detents.
 #[test]

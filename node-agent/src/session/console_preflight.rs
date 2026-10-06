@@ -13,9 +13,9 @@
 //! namespace — a rootless container's own capability can never satisfy it. So a held
 //! display fails `acquire_master_lock` with `EACCES`/`EPERM` on BOTH engine modes; only
 //! the reason differs (rootful: lacks the grant too; rootless: no grant could ever help).
-//! Owner decision 6: a held display is a named failure, never a crash — weston itself
-//! would start and its atomic commits would just fail silently, which is why this module
-//! checks for itself instead of trusting weston's exit.
+//! Owner decision 6: a held display is a named failure, never a crash — a console desktop
+//! would start and its display would just stay dark, which is why this module checks for
+//! itself instead of trusting the desktop's exit.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -74,8 +74,8 @@ trait DisplayProbe {
 /// display is held). The open mode does not decide mastership. Then test mastership by
 /// re-issuing the DRM `SET_MASTER` ioctl — a no-op if the open already made this fd
 /// master (the free case), `EACCES`/`EPERM` if another process holds it (see the module
-/// doc). Frees the display again immediately so a subsequent `spawn_weston_console` can
-/// take it; never leaves this probe holding master.
+/// doc). Frees the display again immediately so a console desktop launched later can take
+/// it; never leaves this probe holding master.
 struct RealDisplayProbe;
 
 impl DisplayProbe for RealDisplayProbe {

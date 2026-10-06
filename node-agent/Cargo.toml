@@ -106,13 +106,6 @@ base64 = "0.23"
 sha2 = "0.11"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 
-# Console-mode local audio: enable the `IEC958 Playback Switch` ALSA mixer
-# control before starting the local-audio pipeline. HDA codec state (incl.
-# this switch) resets on reboot/module reload and the host has no
-# alsactl-restore, so the agent must flip it on itself every session start
-# (see `session::audio::enable_iec958_playback_switches`). Uses alsa-lib,
-# already a runtime dependency of `alsasink`/`pulsesrc`.
-alsa = "0.12"
 
 [features]
 # ZC-02 N-A (full zero-copy NVENC): FFI-links libgstcuda-1.0 to create one GstCudaContext

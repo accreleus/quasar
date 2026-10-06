@@ -699,9 +699,6 @@ impl Holder {
     }
 }
 
-/// The console VT, held for one local console session. Dropping it restores the previous
-/// VT; declare it before anything that can type (the session's virtual devices, the
-/// physical-input forwarder) so it drops after them.
 /// The console session holding the VT, for [`release_for_shutdown`].
 struct Registered {
     holder: Arc<Mutex<Holder>>,
@@ -714,6 +711,8 @@ fn active_slot() -> MutexGuard<'static, Option<Registered>> {
     ACTIVE.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// The console VT, held for one console session. Dropping it restores the previous VT;
+/// declare it before the session's container so it drops after the desktop is gone.
 pub struct ConsoleVt {
     holder: Option<Arc<Mutex<Holder>>>,
     // Last: the next take must not start before this one has restored.

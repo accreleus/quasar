@@ -264,12 +264,12 @@ impl ConsoleAccessManager {
         rx
     }
 
-    /// Why a console session (`local_only`, `dual_output`) is refused on this agent:
+    /// Why a console session (`local_only`) is refused on this agent:
     /// on an owned host, an agent created without console access cannot drive the
     /// display, so the launch fails closed here rather than half-way through its build.
     /// Reads how the agent was created, never the `access` state.
     pub fn launch_refusal(&self, topology: VideoTopology) -> Option<String> {
-        if topology == VideoTopology::StreamOnly || !self.owned() || self.marker {
+        if topology != VideoTopology::LocalOnly || !self.owned() || self.marker {
             return None;
         }
         Some(

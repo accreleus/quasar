@@ -9,6 +9,22 @@ pub const DIRECT_DISPLAY_ENV: &str = "QUASAR_DIRECT_DISPLAY";
 /// Where libudev reads device properties, on the host and in the console container.
 pub const UDEV_DATA: &str = "/run/udev/data";
 
+/// `1` or `0`: whether the host has a sound device (`/dev/snd`) to hand a console desktop.
+/// The agent holds none itself (#461), so the recovery actor reads it each time console
+/// mode is turned on and sets it on the agent, and the Compose console overlay sets it too.
+pub const HOST_SOUND_ENV: &str = "QUASAR_HOST_SOUND";
+
+/// The host's sound answer: the recovery actor's when it gave one, else whether `/dev/snd`
+/// is in the agent's own container (an agent created before the answer existed still had
+/// the host's sound device bound).
+pub fn host_sound(told: Option<&str>, own_dev_snd: bool) -> bool {
+    match told.map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => own_dev_snd,
+    }
+}
+
 /// evdev's character major. Bind-mounting `/dev/input` alone is not enough: a device
 /// plugged in after start is a new node the device cgroup has never allowed.
 const INPUT_CGROUP_RULE: &str = "c 13:* rwm";
@@ -87,7 +103,10 @@ pub fn input_grant(input_devices: &serde_json::Value) -> Result<InputGrant, Stri
 }
 
 /// Why an assignment's topology cannot run here (agent-api.md amendment 19): `dual_output`
-/// is retired, and a console session's app must declare `runtime_spec.direct_display`.
+/// is retired (it arrives as [`VideoTopology::Unsupported`]), and a console session's app
+/// must declare `runtime_spec.direct_display`.
+///
+/// [`VideoTopology::Unsupported`]: crate::messages::VideoTopology::Unsupported
 pub fn topology_refusal(
     topology: crate::messages::VideoTopology,
     app_direct: bool,
@@ -101,9 +120,9 @@ pub fn topology_refusal(
              cannot drive the display directly"
                 .into(),
         ),
-        VideoTopology::DualOutput => Some(
-            "dual_output is retired: a console session is never \
-             streamed"
+        VideoTopology::Unsupported => Some(
+            "this agent runs stream_only and local_only sessions only (dual_output is \
+             retired: a console session is never streamed)"
                 .into(),
         ),
     }
@@ -281,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn only_direct_console_apps_and_no_dual_output_are_accepted() {
+    fn only_direct_console_apps_and_no_other_topology_are_accepted() {
         use crate::messages::VideoTopology::*;
         assert_eq!(topology_refusal(StreamOnly, false), None);
         assert_eq!(topology_refusal(StreamOnly, true), None);
@@ -289,9 +308,18 @@ mod tests {
         assert!(topology_refusal(LocalOnly, false)
             .unwrap()
             .contains("direct_display"));
-        assert!(topology_refusal(DualOutput, true)
+        assert!(topology_refusal(Unsupported, true)
             .unwrap()
-            .contains("dual_output"));
+            .contains("stream_only and local_only"));
+    }
+
+    #[test]
+    fn the_host_sound_answer_is_the_actors_when_it_gave_one() {
+        assert!(host_sound(Some("1"), false));
+        assert!(!host_sound(Some("0"), true));
+        assert!(host_sound(None, true));
+        assert!(!host_sound(None, false));
+        assert!(host_sound(Some("garbage"), true));
     }
 
     #[test]

@@ -3115,8 +3115,7 @@ struct SessionManager {
     /// a stale cache misattributes a sample to the wrong physical GPU.
     vram_cache: Arc<VramCache>,
     /// CM-01: the host's console-mode config, latched from `config_update`
-    /// (agent-api.md). `None` until one is pushed — the runner then falls back to
-    /// `QUASAR_LOCAL_DISPLAY`.
+    /// (agent-api.md). `None` until one is pushed: console mode is off.
     console_config: Option<crate::messages::ConsoleConfig>,
     /// #175: home refs mounted by live sessions, shared with the GC reaper so it never
     /// reaps a store an active session uses. Updated on start/stop/swap.
@@ -4361,9 +4360,6 @@ impl SessionManager {
                         cc.output_id.clone(),
                         cc.input_devices.clone(),
                     );
-                    crate::session::console_audio::set_configured_output(
-                        cc.audio_output.as_deref(),
-                    );
                     self.console_access.request(cc.enabled);
                     // The control plane's capacity-report diff is the primary stop path
                     // for a local-only session, but its tracker is in-memory and lost on
@@ -4807,11 +4803,7 @@ impl SessionManager {
                         "displaying {}×{} @ {} Hz",
                         m.width,
                         m.height,
-                        crate::session::console::mode_fps(&crate::messages::ConsoleModeSelection {
-                            width: m.width,
-                            height: m.height,
-                            refresh_millihz: m.refresh_millihz,
-                        })
+                        m.refresh_hz()
                     ),
                     None => "displaying".to_string(),
                 };
@@ -7853,7 +7845,11 @@ mod tests {
             false,
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(4);
-        for topology in ["local_only", "dual_output"] {
+        // `dual_output` is retired (#461): refused as a topology, whatever the access.
+        for (topology, refusal) in [
+            ("local_only", "without console access"),
+            ("dual_output", "dual_output is retired"),
+        ] {
             let msg = serde_json::json!({
                 "type": "session_assign", "id": "c1", "session_id": topology, "gpu_index": 0,
                 "stream": {"width": 1920, "height": 1080, "fps": 60,
@@ -7870,7 +7866,7 @@ mod tests {
                     ok: false,
                     error: Some(e),
                     ..
-                }) => assert!(e.contains("without console access"), "{topology}: {e}"),
+                }) => assert!(e.contains(refusal), "{topology}: {e}"),
                 other => panic!("{topology}: expected a refusal, got {other:?}"),
             }
         }
