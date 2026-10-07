@@ -29,6 +29,9 @@
 #   - sets the kernel settings Quasar needs; --allow-kernel-log and
 #     --unprivileged-port-start N add two optional ones;
 #   - on an NVIDIA host, makes sure an NVIDIA CDI specification exists;
+#   - with --console on an SELinux host, loads a small SELinux module that lets a console
+#     session's confined type open this machine's input, sound and hidraw nodes and read
+#     the udev database (SELinux stays enforcing);
 #   - on Podman, makes the engine start Quasar's containers again at boot;
 #   - with --homes DIR (and --templates DIR), creates the homes root (and the templates
 #     root) owned by the Quasar user; on an SELinux Podman host, labels each for
@@ -67,7 +70,7 @@ Usage: prepare-host.sh --mode rootless|rootful [options]
   --templates DIR               the same for the templates root (Steam's prepared home)
   --console                     also grant the display cards, sound, i2c and this
                                 machine's input devices and the terminal (tty8) that
-                                console mode uses
+                                console mode uses (on SELinux, also a module for them)
   --allow-kernel-log            optional: let Quasar read GPU fault messages from
                                 the kernel log (kernel.dmesg_restrict=0)
   --unprivileged-port-start N   optional: let unprivileged services bind ports
@@ -220,6 +223,31 @@ containers_selinux() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# selinux_module NAME CIL PUT_REASON LOAD_REASON: write /etc/quasar/selinux/NAME.cil and load
+# it as the SELinux module NAME. Idempotent: the module is loaded again only when it is
+# missing or its text changed (what was loaded is kept beside it as .NAME.loaded).
+# SELinux stays enforcing; a module only adds the allow rules it names.
+selinux_module() {
+  m_name="$1"; m_cil="$2"
+  printf '%s\n' "$m_cil" | put "/etc/quasar/selinux/$m_name.cil" 0644 "$3" || unchanged
+  if live && ! have semodule; then
+    die "semodule was not found: install policycoreutils, then run this again"
+  fi
+  if live && semodule -l 2>/dev/null | grep -qx "$m_name" \
+      && cmp -s "$R/etc/quasar/selinux/$m_name.cil" "$R/etc/quasar/selinux/.$m_name.loaded"; then
+    say ok "SELinux module $m_name"
+  elif ! live && grep -qx "$m_name" "$R/.selinux-modules" 2>/dev/null \
+      && cmp -s "$R/etc/quasar/selinux/$m_name.cil" "$R/etc/quasar/selinux/.$m_name.loaded"; then
+    say ok "SELinux module $m_name"
+  else
+    run semodule -i "/etc/quasar/selinux/$m_name.cil"
+    # What was loaded, so a changed rule is loaded again on the next run.
+    [ "$DRY_RUN" = 1 ] || cp "$R/etc/quasar/selinux/$m_name.cil" "$R/etc/quasar/selinux/.$m_name.loaded"
+    stand_in && echo "$m_name" >> "$R/.selinux-modules"
+    say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux module $m_name — $4"
+  fi
+}
 
 # After a `put` that returned non-zero: 1 means "already right"; anything else is fatal.
 unchanged() { rc=$?; [ "$rc" -eq 1 ] || exit "$rc"; }
@@ -560,29 +588,40 @@ if [ -e "$R/proc/driver/nvidia/version" ] && [ -e "$R/dev/nvidiactl" ]; then
     # Sessions run as container_engine_t, the policy's confined type for nested sandboxes
     # (Steam's bwrap). The boolean above covers container_t only; this one rule gives
     # container_engine_t the same NVIDIA device access, and nothing more.
-    printf '%s\n' '; Written by Quasar host preparation (deploy/prepare-host.sh).' \
-      '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' \
-      | put /etc/quasar/selinux/quasar-nested-gpu.cil 0644 "the NVIDIA device rule for sessions' nested-sandbox SELinux type" || unchanged
-    if live && ! have semodule; then
-      die "semodule was not found: install policycoreutils, then run this again"
-    fi
-    if live && semodule -l 2>/dev/null | grep -qx quasar-nested-gpu \
-        && cmp -s "$R/etc/quasar/selinux/quasar-nested-gpu.cil" "$R/etc/quasar/selinux/.quasar-nested-gpu.loaded"; then
-      say ok "SELinux module quasar-nested-gpu"
-    elif ! live && grep -qx quasar-nested-gpu "$R/.selinux-modules" 2>/dev/null; then
-      say ok "SELinux module quasar-nested-gpu"
-    else
-      run semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil
-      # What was loaded, so a changed rule is loaded again on the next run.
-      [ "$DRY_RUN" = 1 ] || cp "$R/etc/quasar/selinux/quasar-nested-gpu.cil" "$R/etc/quasar/selinux/.quasar-nested-gpu.loaded"
-      stand_in && echo quasar-nested-gpu >> "$R/.selinux-modules"
-      say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux module quasar-nested-gpu — lets sessions (container_engine_t) open the NVIDIA device nodes, as the boolean does for container_t; SELinux stays enforcing"
-    fi
+    selinux_module quasar-nested-gpu "; Written by Quasar host preparation (deploy/prepare-host.sh).
+(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))" \
+      "the NVIDIA device rule for sessions' nested-sandbox SELinux type" \
+      "lets sessions (container_engine_t) open the NVIDIA device nodes, as the boolean does for container_t; SELinux stays enforcing"
   fi
 elif [ -e "$R/proc/driver/nvidia/version" ]; then
   say skipped "NVIDIA CDI specification — the NVIDIA driver is loaded but this machine has no NVIDIA device (/dev/nvidiactl)"
 else
   say skipped "NVIDIA CDI specification — no NVIDIA driver loaded"
+fi
+
+# ── SELinux: console devices ───────────────────────────────────────────────
+# A console session runs as container_engine_t too, and the policy gives that type none of
+# what a desktop on the screen needs: the input nodes (event_device_t, under /dev/input,
+# which is device_t), the sound nodes (sound_device_t), the hidraw nodes Steam Input reads
+# (usb_device_t) and the udev database libudev reads (udev_var_run_t). Without them KWin
+# starts with no keyboard or mouse. The display cards (dri_device_t) are already allowed by
+# the boolean above. One module names exactly these, and only when --console asks for them.
+STEP="SELinux console devices"
+console_cil="/etc/quasar/selinux/quasar-console-devices.cil"
+if [ "$CONSOLE" = 1 ]; then
+  if containers_selinux; then
+    selinux_module quasar-console-devices "; Written by Quasar host preparation (deploy/prepare-host.sh --console).
+(allow container_engine_t device_t (dir (getattr open read search)))
+(allow container_engine_t event_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t sound_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t usb_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t udev_var_run_t (dir (getattr open read search)))
+(allow container_engine_t udev_var_run_t (file (getattr open read map)))" \
+      "the input, sound, hidraw and udev-data rules for a console session's SELinux type" \
+      "lets console sessions (container_engine_t) open this machine's input, sound and hidraw nodes and read the udev database; SELinux stays enforcing"
+  fi
+elif [ -f "$R$console_cil" ] || { live && have semodule && semodule -l 2>/dev/null | grep -qx quasar-console-devices; }; then
+  say note "SELinux module quasar-console-devices is installed from an earlier --console run and is left in place: remove it with 'semodule -r quasar-console-devices' (and delete $console_cil) if console mode is retired on this machine"
 fi
 
 # ── Podman: restart at boot ────────────────────────────────────────────────

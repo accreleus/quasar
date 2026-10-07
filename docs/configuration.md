@@ -1127,7 +1127,10 @@ cannot apply a device-cgroup rule (rootless Podman refuses to create a container
 so the runtime leaves the input rule out there, records that in the launch journal, and logs
 `token=app-device-cgroup-rules-omitted`; every node, including one plugged in later, then opens
 through the host's own permissions: `prepare-host.sh --console` gives the `quasar` group the
-display cards, the sound devices, every input device and `tty8` by ACL. The read-back checks
+display cards, the sound devices, every input device and `tty8` by ACL. On an SELinux host the
+session's confined type (`container_engine_t`) is denied the input, sound and `hidraw` nodes and the
+udev database, so `--console` also loads the `quasar-console-devices` module that allows those
+and nothing else; without it the desktop starts with no keyboard or mouse. The read-back checks
 Docker's echoed rules exactly. Rootful Podman gives no positive proof that a rule was applied (its
 inspect has no such field): an empty report is accepted, and a rule it does report must be the
 request's. Streamed sessions are still given the whole `/dev/dri`, card nodes included (#464).
