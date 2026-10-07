@@ -934,23 +934,30 @@ fn unproven_bind_sources(
 }
 
 /// The bind-source check before a create (#426), as one decision. Only Podman needs it.
-/// One source is proven by a host fact instead of a bind the agent has: a console
-/// container's read-only `/run/udev/data`, which the recovery actor probes and reports as
-/// `QUASAR_HOST_UDEV_DATA` (`host_udev_data`). `Err` is the refusal's text.
+/// Two sources are proven by a host fact instead of a bind the agent has, since an owned
+/// install's agent holds neither the host's `/run` nor its `/dev`: a console container's
+/// read-only `/run/udev/data`, which the recovery actor probes and reports as
+/// `QUASAR_HOST_UDEV_DATA` (`host_udev_data`), and its read-only `/dev/snd`, reported as
+/// `QUASAR_HOST_SOUND` (`host_sound`). A sound fact of `0` or none proves nothing: the
+/// agent's own view (`/host/dev/snd` on a Compose install, else `/dev/snd`) is then
+/// checked like any other source. `Err` is the refusal's text.
 fn bind_source_check(
     dialect: super::dialect::Dialect,
     request: &ApplicationRequest,
     own_mounts: Option<&[quasar_runtime::Mount]>,
     exists: impl Fn(&Path) -> bool,
     host_udev_data: Option<&str>,
+    host_sound: Option<&str>,
 ) -> Result<(), String> {
     if dialect != super::dialect::Dialect::Podman {
         return Ok(());
     }
     let udev_proven = host_udev_data.map(str::trim) == Some("1");
+    let sound_proven = host_sound.map(str::trim) == Some("1");
     let unproven: Vec<String> = unproven_bind_sources(request, own_mounts, exists)
         .into_iter()
         .filter(|source| !(udev_proven && is_console_udev_bind(request, source)))
+        .filter(|source| !(sound_proven && is_console_sound_bind(request, source)))
         .collect();
     if unproven.is_empty() {
         return Ok(());
@@ -966,16 +973,31 @@ fn bind_source_check(
              mode off and on again so the recovery actor reads it",
         );
     }
+    if unproven.iter().any(|s| is_console_sound_bind(request, s)) {
+        why.push_str(
+            "; the host's sound device (/dev/snd) is not known to this agent: turn console \
+             mode off and on so the recovery actor reads it",
+        );
+    }
     Err(why)
 }
 
 /// `source` is the console plan's udev bind: `/run/udev/data` read-only at the same path.
 fn is_console_udev_bind(request: &ApplicationRequest, source: &str) -> bool {
     use crate::session::console_plan::UDEV_DATA;
-    source == UDEV_DATA
+    is_console_readonly_bind(request, source, UDEV_DATA)
+}
+
+/// `source` is the console plan's sound bind: `/dev/snd` read-only at the same path.
+fn is_console_sound_bind(request: &ApplicationRequest, source: &str) -> bool {
+    is_console_readonly_bind(request, source, "/dev/snd")
+}
+
+fn is_console_readonly_bind(request: &ApplicationRequest, source: &str, path: &str) -> bool {
+    source == path
         && request.typed_mounts.iter().any(|m| {
             matches!(m, ApplicationMount::Bind { source, target, read_only: true, .. }
-                if source == UDEV_DATA && target == UDEV_DATA)
+                if source == path && target == path)
         })
 }
 
@@ -1500,12 +1522,14 @@ pub(crate) async fn start(
                 let view = own_host_view(&docker).await?;
                 let host_udev_data =
                     std::env::var(crate::readiness::console::HOST_UDEV_DATA_ENV).ok();
+                let host_sound = std::env::var(crate::session::console_plan::HOST_SOUND_ENV).ok();
                 if let Err(why) = bind_source_check(
                     docker.dialect,
                     &request,
                     view.as_deref(),
                     Path::exists,
                     host_udev_data.as_deref(),
+                    host_sound.as_deref(),
                 ) {
                     // Refused before anything is journalled or created, as Docker refuses it.
                     tracing::warn!(
@@ -2814,7 +2838,7 @@ mod bind_source_tests {
         let mounts = [bind("/dev/input", "/dev/input")];
         let seen = |path: &Path| path == Path::new("/dev/input");
         let check = |dialect, request: &ApplicationRequest, fact: Option<&str>| {
-            bind_source_check(dialect, request, Some(&mounts), seen, fact)
+            bind_source_check(dialect, request, Some(&mounts), seen, fact, None)
         };
         let console = console_request();
         assert_eq!(check(Dialect::Podman, &console, Some("1")), Ok(()));
@@ -2846,12 +2870,11 @@ mod bind_source_tests {
         assert!(refused.contains("/run/udev/data"), "{refused}");
     }
 
-    /// #460: sound is a `/dev/snd` directory bind, which the agent proves through the host's
-    /// `/dev` it has at `/host/dev` (the same bind that lets it see the host has sound).
-    #[test]
-    fn the_console_sound_bind_is_proven_through_the_agents_host_dev_view() {
-        use super::super::dialect::Dialect;
-        let request = ApplicationRequest {
+    /// #460: the console plan's `/dev/snd` bind is proven on Podman by the recovery actor's
+    /// `QUASAR_HOST_SOUND=1` (an owned install's agent has neither `/host/dev` nor
+    /// `/dev/snd`), else by the agent's own view of the host's `/dev` (Compose).
+    fn sound_request() -> ApplicationRequest {
+        ApplicationRequest {
             typed_mounts: vec![ApplicationMount::Bind {
                 source: "/dev/snd".into(),
                 target: "/dev/snd".into(),
@@ -2859,16 +2882,95 @@ mod bind_source_tests {
                 consistency: None,
             }],
             ..Default::default()
-        };
+        }
+    }
+
+    #[test]
+    fn the_console_sound_bind_is_proven_through_the_agents_host_dev_view() {
+        use super::super::dialect::Dialect;
         let mounts = [bind("/dev", "/host/dev")];
         let with_sound = |path: &Path| path == Path::new("/host/dev/snd");
         assert_eq!(
-            bind_source_check(Dialect::Podman, &request, Some(&mounts), with_sound, None),
+            bind_source_check(
+                Dialect::Podman,
+                &sound_request(),
+                Some(&mounts),
+                with_sound,
+                None,
+                None
+            ),
             Ok(())
         );
-        let refused = bind_source_check(Dialect::Podman, &request, Some(&mounts), |_| false, None)
-            .unwrap_err();
-        assert!(refused.contains("/dev/snd"), "{refused}");
+        // A fact of 0 proves nothing; the agent's view still does.
+        assert_eq!(
+            bind_source_check(
+                Dialect::Podman,
+                &sound_request(),
+                Some(&mounts),
+                with_sound,
+                None,
+                Some("0")
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_console_sound_bind_is_proven_by_the_host_fact_on_an_owned_install() {
+        use super::super::dialect::Dialect;
+        // The agent's own mounts have no /host/dev and nothing it can see is /dev/snd.
+        let mounts = [bind("/dev/input", "/dev/input")];
+        let check = |request: &ApplicationRequest, fact: Option<&str>| {
+            bind_source_check(
+                Dialect::Podman,
+                request,
+                Some(&mounts),
+                |_| false,
+                None,
+                fact,
+            )
+        };
+        assert_eq!(check(&sound_request(), Some("1")), Ok(()));
+        for fact in [None, Some("0"), Some("yes")] {
+            let refused = check(&sound_request(), fact).unwrap_err();
+            assert!(refused.contains("/dev/snd"), "{refused}");
+            assert!(
+                refused.contains("turn console mode off and on so the recovery actor reads it"),
+                "{fact:?}: {refused}"
+            );
+        }
+        // The fact proves the console plan's sound bind only: a writable bind of the same
+        // path, or another missing source, is still refused.
+        let mut writable = sound_request();
+        writable.typed_mounts = vec![ApplicationMount::Bind {
+            source: "/dev/snd".into(),
+            target: "/dev/snd".into(),
+            read_only: false,
+            consistency: None,
+        }];
+        assert!(check(&writable, Some("1")).is_err());
+        let mut other = sound_request();
+        other.typed_mounts.push(ApplicationMount::Bind {
+            source: "/mnt/share/games".into(),
+            target: "/games".into(),
+            read_only: true,
+            consistency: None,
+        });
+        let refused = check(&other, Some("1")).unwrap_err();
+        assert!(refused.contains("/mnt/share/games"), "{refused}");
+        assert!(!refused.contains("sound device"), "{refused}");
+        // Docker checks nothing.
+        assert_eq!(
+            bind_source_check(
+                Dialect::Docker,
+                &sound_request(),
+                Some(&mounts),
+                |_| false,
+                None,
+                None
+            ),
+            Ok(())
+        );
     }
 }
 
