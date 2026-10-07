@@ -52,24 +52,28 @@ func (s *Store) UserExists(ctx context.Context, userID string) (bool, error) {
 }
 
 // DefaultAppFacts and DirectApps resolve the effective runtime_spec like
-// session.GetLaunchApp and test direct_display in SQL like RuntimeSpecDirect;
-// guarded by TestConsoleDirectAppsMatchLaunchSpec.
+// session.GetLaunchApp and test direct_display in SQL like RuntimeSpecDirect,
+// and test kind/parent in SQL like KindAllowsConsoleDefault; guarded by
+// TestConsoleDirectAppsMatchLaunchSpec.
 //
 // DefaultAppFacts reads what the console_default_app check needs about appID:
-// whether it exists, its name, whether it and (for a derived tile) its parent
-// are enabled, and whether its EFFECTIVE runtime_spec — a derived tile's
-// parent's, exactly as GetLaunchApp resolves it — declares direct_display.
+// whether it exists, its name, its own kind and parent, whether it and (for a
+// derived tile) its parent are enabled, and whether its EFFECTIVE runtime_spec
+// — a derived tile's parent's, exactly as GetLaunchApp resolves it — declares
+// direct_display.
 func (s *Store) DefaultAppFacts(ctx context.Context, appID string) (DefaultAppFacts, error) {
 	var (
-		facts DefaultAppFacts
-		spec  []byte
+		facts    DefaultAppFacts
+		parentID *string
+		spec     []byte
 	)
 	err := s.pool.QueryRow(ctx, `
-		SELECT a.name, a.enabled AND COALESCE(p.enabled, true),
+		SELECT a.name, a.kind, a.parent_app_id::text,
+		       a.enabled AND COALESCE(p.enabled, true),
 		       COALESCE(p.runtime_spec, a.runtime_spec)
 		  FROM apps a
 		  LEFT JOIN apps p ON p.id = a.parent_app_id
-		 WHERE a.id::text = $1`, appID).Scan(&facts.Name, &facts.Enabled, &spec)
+		 WHERE a.id::text = $1`, appID).Scan(&facts.Name, &facts.Kind, &parentID, &facts.Enabled, &spec)
 	if err == pgx.ErrNoRows {
 		return DefaultAppFacts{}, nil
 	}
@@ -77,21 +81,28 @@ func (s *Store) DefaultAppFacts(ctx context.Context, appID string) (DefaultAppFa
 		return DefaultAppFacts{}, fmt.Errorf("query default app: %w", err)
 	}
 	facts.Found = true
+	if parentID != nil {
+		facts.ParentAppID = *parentID
+	}
 	facts.Direct = RuntimeSpecDirect(spec)
 	return facts, nil
 }
 
 // DirectApps lists the apps a console's default-app pick may name (amendment
-// 19): enabled apps (with an enabled parent, for a derived tile) whose
-// effective runtime_spec declares `direct_display: true`, ordered by name.
-// Never nil, so it serializes as `[]`.
+// 19, narrowed to desktop/launcher kinds): enabled, non-derived apps of kind
+// `desktop` or `launcher` whose runtime_spec declares `direct_display: true`,
+// ordered by name. A Steam library tile is never offered, even though its
+// effective runtime_spec (its parent's) may declare direct_display — only a
+// desktop environment or a launcher like Steam itself drives the console
+// display; a game under it does not. Never nil, so it serializes as `[]`.
 func (s *Store) DirectApps(ctx context.Context) ([]DefaultApp, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT a.id::text, a.name
 		  FROM apps a
-		  LEFT JOIN apps p ON p.id = a.parent_app_id
-		 WHERE a.enabled AND COALESCE(p.enabled, true)
-		   AND COALESCE(p.runtime_spec, a.runtime_spec) -> 'direct_display' = 'true'::jsonb
+		 WHERE a.enabled
+		   AND a.parent_app_id IS NULL
+		   AND a.kind IN ('desktop', 'launcher')
+		   AND a.runtime_spec -> 'direct_display' = 'true'::jsonb
 		 ORDER BY a.name, a.id`)
 	if err != nil {
 		return nil, fmt.Errorf("query direct apps: %w", err)

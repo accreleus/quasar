@@ -113,8 +113,10 @@ With **Auto-start on display** on and a **Default app** and **Default user** set
 a display coming on launches that app as that user. The default user must have access to the app.
 
 **Default app** lists only apps that can drive the display themselves (their runtime
-spec declares `direct_display`). If the saved default app cannot, the page says so
-under it and console mode does not launch it; pick another app.
+spec declares `direct_display`) and are a desktop or a launcher — never a game, and
+never a Steam library tile, even one under a direct-capable launcher. If the saved
+default app cannot run direct or is a game, the page says so under it and console
+mode does not launch it; pick another app.
 
 Monitor power is read over DDC/CI. This needs the i2c buses (granted by
 the console device rules on rootless) and a monitor that answers DDC. Without them, every
