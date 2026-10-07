@@ -687,11 +687,24 @@ func TestIdleApplyWaitingReportsCurrentSessionAndPreparationBlockers(t *testing.
 	if err != nil || status.Remedy == nil || !strings.Contains(*status.Remedy, "fresh authenticated session inventory") {
 		t.Fatalf("missing heartbeat list reused previous inventory: %+v %v", status, err)
 	}
+	if err := store.ObserveIdleHeartbeat(ctx, hostID, connection, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveIdleHeartbeat(ctx, hostID, connection, []string{strings.Repeat("x", 65)}); !errors.Is(err, ErrIdleInventoryInvalid) {
+		t.Fatalf("oversized session id = %v, want ErrIdleInventoryInvalid", err)
+	}
+	status, err = store.GetIdleApply(ctx, hostID, approved.AttemptID)
+	if err != nil || status.Remedy == nil || !strings.Contains(*status.Remedy, "fresh authenticated session inventory") {
+		t.Fatalf("invalid heartbeat list kept the previous idle inventory: %+v %v", status, err)
+	}
 	if err := store.EndJournalConnection(ctx, hostID, connection); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ObserveIdleHeartbeat(ctx, hostID, connection, []string{}); err != ErrApprovalSuperseded {
-		t.Fatalf("late old heartbeat restored idle inventory: %v", err)
+	// #477: a displaced socket's late heartbeat is a connection fact, not an
+	// approval mismatch.
+	err = store.ObserveIdleHeartbeat(ctx, hostID, connection, []string{})
+	if !errors.Is(err, ErrIdleInventoryStale) || errors.Is(err, ErrApprovalSuperseded) {
+		t.Fatalf("late old heartbeat = %v, want ErrIdleInventoryStale", err)
 	}
 }
 

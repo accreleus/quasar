@@ -22,6 +22,10 @@ import (
 // is where the operator reads why (control-api.md §Console mode).
 var ErrConsoleAppNotDirect = errors.New("console app cannot run direct: its runtime spec does not declare direct_display")
 
+// ErrConsoleHomeSettling: a settling home hold (homeHoldRefusal), not a repair
+// case. Auto-start does not wait for it; the agent's cleanup proof re-runs it.
+var ErrConsoleHomeSettling = errors.New("managed home still held by the previous session until the agent confirms its cleanup")
+
 // LaunchConsoleSession launches one pinned console session on hostID, owned by
 // userID, running appID at the app's defaults. Called by the agentws capacity
 // handler's auto-start diff when a display connector goes absent->present.
@@ -77,8 +81,9 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 		// pin below is not negotiable, so a console tile whose home is on another
 		// host fails at resolveHomeSpec with home_not_provisioned rather than being
 		// placed elsewhere.
-		HomeAppID: homeAppID(app),
-		PinHostID: hostID, // the display lives here; not scheduler-picked
+		HomeAppID:        homeAppID(app),
+		NoHomeSettleWait: true,
+		PinHostID:        hostID, // the display lives here; not scheduler-picked
 		// Mic unset: local_only console launches have no WebRTC pipeline
 		// (agent-api.md), so capture never applies regardless of the setting.
 	}
@@ -93,6 +98,10 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	}
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
+	var settling *homeHoldSettlingError
+	if errors.As(err, &settling) {
+		return "", fmt.Errorf("console auto-start: schedule: %w (session %s)", ErrConsoleHomeSettling, settling.holder)
+	}
 	if err != nil {
 		return "", fmt.Errorf("console auto-start: schedule: %w", err)
 	}
@@ -137,11 +146,12 @@ func checkConsoleTopology(videoTopology string) error {
 	return fmt.Errorf("invalid console video topology %q: a console session is %q", videoTopology, console.ConsoleVideoTopology)
 }
 
-// StopConsoleSession is a thin wrapper over the normal Stop teardown, so console
-// auto-stop gets the same agent-dispatch and reservation-release behaviour as
-// DELETE /v1/sessions/{id}. Satisfies agentws.Events.
+// StopConsoleSession is the normal Stop teardown without its ack wait. Its
+// capacity-path callers run on the agent's read loop, the loop that would read
+// that ack, so the wait could only time out (#477); the agent's terminal
+// session_state confirms the stop. Satisfies agentws.Events.
 func (c *Coordinator) StopConsoleSession(ctx context.Context, sessionID, reason string) error {
-	_, err := c.Stop(ctx, sessionID, reason)
+	_, err := c.stop(ctx, sessionID, reason, false)
 	return err
 }
 
