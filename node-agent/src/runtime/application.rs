@@ -387,7 +387,7 @@ mod device_cgroup_rule_tests {
 
     #[test]
     fn only_character_device_rules_are_valid() {
-        for ok in ["c 13:* rwm", "c 116:3 rw", "c 226:0 r"] {
+        for ok in ["c 13:* rwm", "c 116:* rwm", "c 116:3 rw", "c 226:0 r"] {
             assert!(valid_device_cgroup_rule(ok), "{ok}");
         }
         for bad in [
