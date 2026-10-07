@@ -60,6 +60,11 @@ own; the two do not move together, and that is deliberate.
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
 
 ### Fixed
+- **A Steam library tile can no longer be set as the console's default app (#453).** The
+  console page's default-app list and the `console_default_app` readiness check treated a
+  game tile as direct-capable through its parent launcher, so it was offered alongside real
+  desktops and launchers. Both now also require kind `desktop` or `launcher` with no parent
+  app; a saved game or tile fails readiness naming the app's kind instead of launching it.
 - **A streamed session on a host with console mode on is reaped for a lost transport again
   (#461).** Every session on such a host was exempt from the idle reaper, an exemption meant
   for the retired dual output; a streamed session whose browser is gone now ends like any

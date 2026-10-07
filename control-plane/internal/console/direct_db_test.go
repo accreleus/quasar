@@ -12,12 +12,12 @@ import (
 )
 
 // seedConsoleTestApp inserts an app named console-test-<name> with spec.
-func seedConsoleTestApp(t *testing.T, pool *pgxpool.Pool, name, spec string, enabled bool) string {
+func seedConsoleTestApp(t *testing.T, pool *pgxpool.Pool, name, spec string, enabled bool, kind string) string {
 	t.Helper()
 	var id string
 	if err := pool.QueryRow(context.Background(),
-		`INSERT INTO apps (name, runtime_spec, enabled) VALUES ($1, $2::jsonb, $3) RETURNING id::text`,
-		"console-test-"+name, spec, enabled).Scan(&id); err != nil {
+		`INSERT INTO apps (name, runtime_spec, enabled, kind) VALUES ($1, $2::jsonb, $3, $4) RETURNING id::text`,
+		"console-test-"+name, spec, enabled, kind).Scan(&id); err != nil {
 		t.Fatalf("seed app %s: %v", name, err)
 	}
 	return id
@@ -76,27 +76,29 @@ func hasApp(apps []DefaultApp, id string) bool {
 }
 
 // The default-app list offers exactly the apps that can run direct: enabled,
-// with runtime_spec.direct_display true — a derived tile through its parent.
+// with runtime_spec.direct_display true AND kind desktop or launcher — never
+// a derived tile, even through a direct-capable parent (#453 follow-up).
 func TestGetOffersOnlyDirectApps(t *testing.T) {
 	pool := testPool(t)
 	hostID := seedTestHost(t, pool, "console-test-direct-list")
-	direct := seedConsoleTestApp(t, pool, "kde", `{"image":"kde:1","direct_display":true}`, true)
-	nested := seedConsoleTestApp(t, pool, "xfce", `{"image":"xfce:1"}`, true)
-	saysFalse := seedConsoleTestApp(t, pool, "false", `{"image":"x:1","direct_display":false}`, true)
-	saysString := seedConsoleTestApp(t, pool, "string", `{"image":"x:1","direct_display":"true"}`, true)
-	disabled := seedConsoleTestApp(t, pool, "disabled", `{"image":"kde:1","direct_display":true}`, false)
-	steam := seedConsoleTestApp(t, pool, "steam", `{"image":"steam:1","direct_display":true}`, true)
+	direct := seedConsoleTestApp(t, pool, "kde", `{"image":"kde:1","direct_display":true}`, true, "desktop")
+	nested := seedConsoleTestApp(t, pool, "xfce", `{"image":"xfce:1"}`, true, "desktop")
+	saysFalse := seedConsoleTestApp(t, pool, "false", `{"image":"x:1","direct_display":false}`, true, "desktop")
+	saysString := seedConsoleTestApp(t, pool, "string", `{"image":"x:1","direct_display":"true"}`, true, "desktop")
+	disabled := seedConsoleTestApp(t, pool, "disabled", `{"image":"kde:1","direct_display":true}`, false, "desktop")
+	game := seedConsoleTestApp(t, pool, "game", `{"image":"game:1","direct_display":true}`, true, "game")
+	steam := seedConsoleTestApp(t, pool, "steam", `{"image":"steam:1","direct_display":true}`, true, "launcher")
 	tile := seedConsoleTestTile(t, pool, steam, "hades", "1145360")
 
 	env := getEnvelope(t, NewHandler(NewStore(pool), &fakeDispatcher{}), hostID)
-	for _, want := range []string{direct, steam, tile} {
+	for _, want := range []string{direct, steam} {
 		if !hasApp(env.DefaultApps, want) {
 			t.Errorf("default_apps lacks direct app %s: %v", want, env.DefaultApps)
 		}
 	}
-	for _, not := range []string{nested, saysFalse, saysString, disabled} {
+	for _, not := range []string{nested, saysFalse, saysString, disabled, game, tile} {
 		if hasApp(env.DefaultApps, not) {
-			t.Errorf("default_apps offers %s, which cannot run direct or is disabled: %v", not, env.DefaultApps)
+			t.Errorf("default_apps offers %s, which cannot run direct, is disabled, or is not a desktop/launcher: %v", not, env.DefaultApps)
 		}
 	}
 	if len(env.Readiness) != 1 || env.Readiness[0].ID != DefaultAppCheckID || env.Readiness[0].Status != "skip" {
@@ -107,12 +109,60 @@ func TestGetOffersOnlyDirectApps(t *testing.T) {
 	}
 }
 
+// A Steam library tile is never a console default, even though its effective
+// runtime_spec (its direct-capable parent's) declares direct_display: the
+// readiness check fails naming it a game, not a desktop or launcher.
+func TestDefaultAppGameTileFailsReadinessNamingKind(t *testing.T) {
+	pool := testPool(t)
+	hostID := seedTestHost(t, pool, "console-test-tile-kind")
+	steam := seedConsoleTestApp(t, pool, "steam-kind", `{"image":"steam:1","direct_display":true}`, true, "launcher")
+	tile := seedConsoleTestTile(t, pool, steam, "hades-kind", "1145361")
+	h := NewHandler(NewStore(pool), &fakeDispatcher{})
+
+	rec := httptest.NewRecorder()
+	h.handlePatch(rec, patchRequest(t, hostID, map[string]any{"enabled": true, "default_app": tile}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	env := decodeEnvelope(t, rec.Body.Bytes())
+	if len(env.Readiness) != 1 {
+		t.Fatalf("readiness = %+v, want one check", env.Readiness)
+	}
+	c := env.Readiness[0]
+	if c.ID != DefaultAppCheckID || c.Status != "fail" ||
+		!strings.Contains(c.Summary, "console-test-hades-kind") ||
+		!strings.Contains(c.Summary, "game") || !strings.Contains(c.Summary, "desktop or launcher") {
+		t.Fatalf("check = %+v, want a fail naming the app a game, not a desktop or launcher", c)
+	}
+}
+
+// A game app (not a tile) is equally excluded by kind alone.
+func TestDefaultAppGameKindFailsReadinessNamingKind(t *testing.T) {
+	pool := testPool(t)
+	hostID := seedTestHost(t, pool, "console-test-game-kind")
+	game := seedConsoleTestApp(t, pool, "solo-game", `{"image":"game:1","direct_display":true}`, true, "game")
+	h := NewHandler(NewStore(pool), &fakeDispatcher{})
+
+	rec := httptest.NewRecorder()
+	h.handlePatch(rec, patchRequest(t, hostID, map[string]any{"enabled": true, "default_app": game}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	env := decodeEnvelope(t, rec.Body.Bytes())
+	c := env.Readiness[0]
+	if c.ID != DefaultAppCheckID || c.Status != "fail" ||
+		!strings.Contains(c.Summary, "console-test-solo-game") ||
+		!strings.Contains(c.Summary, "game") || !strings.Contains(c.Summary, "desktop or launcher") {
+		t.Fatalf("check = %+v, want a fail naming the app a game, not a desktop or launcher", c)
+	}
+}
+
 // A default app without the direct key is accepted (it exists) and shows up
 // as the failed console_default_app readiness check, naming the app.
 func TestDefaultAppWithoutDirectKeyFailsReadiness(t *testing.T) {
 	pool := testPool(t)
 	hostID := seedTestHost(t, pool, "console-test-direct-check")
-	nested := seedConsoleTestApp(t, pool, "nested-desktop", `{"image":"xfce:1"}`, true)
+	nested := seedConsoleTestApp(t, pool, "nested-desktop", `{"image":"xfce:1"}`, true, "desktop")
 	h := NewHandler(NewStore(pool), &fakeDispatcher{})
 
 	rec := httptest.NewRecorder()

@@ -161,6 +161,12 @@ func (s *Store) Telemetry() telemetry.Store { return s.tel }
 // are what the scheduler reserves.
 type LaunchApp struct {
 	ID string
+	// Kind is the app's OWN `kind` column ("game", "desktop" or "launcher") —
+	// never the parent's, even for a derived tile: console.KindAllowsConsoleDefault
+	// (the Go twin of console.Store.DirectApps' SQL) reads this plus ParentAppID
+	// to decide console-default eligibility, which is about the picked row's own
+	// identity, not what it borrows.
+	Kind string
 	// ParentAppID (migration 0044) is the provider app a DERIVED TILE borrows its
 	// runtime from, "" for an ordinary app. When set, every executable field below
 	// is ALREADY the parent's by the time GetLaunchApp returns.
@@ -342,7 +348,7 @@ func (s *Store) GetLaunchApp(ctx context.Context, appID string) (LaunchApp, erro
 		parentName    *string
 	)
 	err := s.pool.QueryRow(ctx, `
-		SELECT apps.id::text, apps.parent_app_id::text,
+		SELECT apps.id::text, apps.kind, apps.parent_app_id::text,
 		       parent.enabled, parent.name,
 		       apps.external_source, apps.external_id,
 		       COALESCE(parent.runtime_spec,          apps.runtime_spec),
@@ -369,7 +375,7 @@ func (s *Store) GetLaunchApp(ctx context.Context, appID string) (LaunchApp, erro
 		-- runtime_preset_id is NULL by CHECK, so this is the parent's or nothing.
 		LEFT JOIN runtime_presets rp ON rp.id = COALESCE(parent.runtime_preset_id, apps.runtime_preset_id)
 		WHERE apps.id = $1::uuid AND apps.enabled = true
-	`, appID).Scan(&a.ID, &parentID,
+	`, appID).Scan(&a.ID, &a.Kind, &parentID,
 		&parentEnabled, &parentName,
 		&a.ExternalSource, &a.ExternalID,
 		&a.RuntimeSpec,
