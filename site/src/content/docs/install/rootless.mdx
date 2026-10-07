@@ -141,14 +141,18 @@ the console desktop is given.
 
 <Aside type="caution" title="What you grant">
 The console session holds the screen and the raw input of the host. The `quasar` group
-can then read what is typed on this machine's keyboard.
+can then read what is typed on this machine's keyboard. On SELinux the console module
+allows its confined session type the same input, sound and `hidraw` nodes.
 </Aside>
 
 <Steps>
 
 1. **Install the console rules** from [Device rules](/quasar/install/device-rules/):
    the display cards, sound devices, i2c buses, this machine's input devices and
-   `tty8`, each by ACL. Or run `prepare-host.sh` with `--console`.
+   `tty8`, each by ACL. Or run `prepare-host.sh` with `--console`. On SELinux it
+   also loads the `quasar-console-devices` module, which lets the console session open
+   those input, sound and `hidraw` nodes and read the udev database; without it the
+   desktop starts with no keyboard, mouse or sound. SELinux stays enforcing.
 
 2. **Keep login prompts off `tty8`:**
 

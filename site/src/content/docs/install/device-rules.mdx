@@ -42,6 +42,29 @@ host's own keyboards: the console session holds the screen and the raw input of 
 host. Install it only on a host that uses [console mode](/quasar/admin/console/).
 </Aside>
 
+### SELinux and console mode
+
+On an SELinux host, sessions run as `container_engine_t`, and the policy gives that type
+none of the console's devices: without more, the desktop starts with no keyboard, mouse or
+sound. `prepare-host.sh --console` also loads a small module, `quasar-console-devices`,
+that allows exactly these and nothing else: the input nodes, the sound nodes, the `hidraw`
+nodes Steam Input reads, and the udev database. SELinux stays enforcing. By hand:
+
+```bash
+cat > quasar-console-devices.cil <<'EOF'
+(allow container_engine_t device_t (dir (getattr open read search)))
+(allow container_engine_t event_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t sound_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t usb_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t udev_var_run_t (dir (getattr open read search)))
+(allow container_engine_t udev_var_run_t (file (getattr open read map)))
+EOF
+sudo semodule -i quasar-console-devices.cil
+```
+
+Running `prepare-host.sh` again without `--console` leaves the module in place and says so;
+remove it with `sudo semodule -r quasar-console-devices`.
+
 ### The seat rule
 
 When someone is logged into a desktop on the host, systemd-logind gives that user

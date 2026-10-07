@@ -60,6 +60,12 @@ own; the two do not move together, and that is deliberate.
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
 
 ### Fixed
+- **A rootless console on an SELinux host had no keyboard, mouse or sound (#460).** The
+  console session runs as `container_engine_t`, and the policy denied it the input nodes,
+  the sound nodes and the udev database, so the desktop started with no input at all.
+  `prepare-host.sh --console` now loads a small `quasar-console-devices` SELinux module
+  that allows exactly those (and the `hidraw` nodes Steam Input reads); SELinux stays
+  enforcing. Run host preparation again with `--console` on an SELinux console host.
 - **A Steam library tile can no longer be set as the console's default app (#453).** The
   console page's default-app list and the `console_default_app` readiness check treated a
   game tile as direct-capable through its parent launcher, so it was offered alongside real

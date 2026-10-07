@@ -286,6 +286,62 @@ r7e="$tmp/r7e"; mk_root "$r7e" nvidia; mkdir -p "$r7e/sys/fs/selinux/booleans"; 
 prep "$r7e" "$tmp/docker-only" --mode rootful >/dev/null 2>&1
 if grep -q setsebool "$r7e/.prepare-host-commands" 2>/dev/null; then fail "no boolean for Docker" ""; else pass "Docker without SELinux does not get the SELinux boolean"; fi
 
+# ── 7f. --console on SELinux: the console devices module (#460) ─────────────
+# A console session runs as container_engine_t, which the policy denies the input nodes,
+# the sound nodes, hidraw and the udev database: KWin started with no keyboard or mouse.
+cil7f="etc/quasar/selinux/quasar-console-devices.cil"
+r7f="$tmp/r7f"; mk_root "$r7f"; mkdir -p "$r7f/sys/fs/selinux"
+out7f="$(prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)" || fail "console selinux run" "$out7f"
+grep -q 'semodule -i /etc/quasar/selinux/quasar-console-devices.cil' "$r7f/.prepare-host-commands" \
+  && printf '%s' "$out7f" | grep -q 'changed  SELinux module quasar-console-devices' \
+  && printf '%s' "$out7f" | grep -q 'changed  /etc/quasar/selinux/quasar-console-devices.cil' \
+  && pass "--console on SELinux writes and loads the console devices module" || fail "console module" "$(cat "$r7f/.prepare-host-commands") $out7f"
+c7f="$r7f/$cil7f"
+grep -qxF '(allow container_engine_t device_t (dir (getattr open read search)))' "$c7f" \
+  && grep -qxF '(allow container_engine_t event_device_t (chr_file (getattr ioctl lock map open read write append)))' "$c7f" \
+  && grep -qxF '(allow container_engine_t sound_device_t (chr_file (getattr ioctl lock map open read write append)))' "$c7f" \
+  && grep -qxF '(allow container_engine_t usb_device_t (chr_file (getattr ioctl lock map open read write append)))' "$c7f" \
+  && grep -qxF '(allow container_engine_t udev_var_run_t (dir (getattr open read search)))' "$c7f" \
+  && grep -qxF '(allow container_engine_t udev_var_run_t (file (getattr open read map)))' "$c7f" \
+  && [ "$(grep -c '^(allow' "$c7f")" = 6 ] \
+  && pass "the console module names exactly the input, sound, hidraw and udev-data rules" || fail "console module rules" "$(cat "$c7f")"
+if grep -v '^;' "$c7f" | grep -qE 'dri_device_t|xserver_misc_device_t|(^|[ (])(self|unconfined_t|container_t)[ )]'; then fail "console module is narrow" "$(cat "$c7f")"; else pass "the console module does not widen the display or NVIDIA rules"; fi
+out7f2="$(prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)"
+[ "$(grep -c 'semodule -i' "$r7f/.prepare-host-commands")" = 1 ] \
+  && printf '%s' "$out7f2" | grep -q 'ok       SELinux module quasar-console-devices' \
+  && ! printf '%s' "$out7f2" | grep -q 'changed' \
+  && pass "a second --console run leaves the console module alone" || fail "console module idempotent" "$out7f2"
+# What was loaded before differs from what is written now (a rule changed in a new release).
+printf '; older rules\n' > "$r7f/etc/quasar/selinux/.quasar-console-devices.loaded"
+prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman --console >/dev/null 2>&1
+[ "$(grep -c 'semodule -i' "$r7f/.prepare-host-commands")" = 2 ] && pass "a changed console module is loaded again" || fail "console module reload" "$(cat "$r7f/.prepare-host-commands")"
+# Without --console a module from an earlier run is named, not removed.
+out7f3="$(prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
+printf '%s' "$out7f3" | grep -q 'note     SELinux module quasar-console-devices is installed from an earlier --console run and is left in place' \
+  && [ -f "$c7f" ] && ! grep -q 'semodule -r' "$r7f/.prepare-host-commands" \
+  && pass "without --console an installed console module is reported as a note and left in place" || fail "console module note" "$out7f3"
+# No SELinux (or a non-confining engine): nothing is written.
+r7g="$tmp/r7g"; mk_root "$r7g"
+out7g="$(prep "$r7g" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)" || fail "console non-selinux run" "$out7g"
+[ ! -e "$r7g/$cil7f" ] && ! grep -qs 'semodule' "$r7g/.prepare-host-commands" && ! printf '%s' "$out7g" | grep -q 'quasar-console-devices' \
+  && pass "--console on a host without SELinux writes no console module" || fail "console module non-selinux" "$out7g"
+r7h="$tmp/r7h"; mk_root "$r7h"; mkdir -p "$r7h/sys/fs/selinux"
+out7h="$(prep "$r7h" "$tmp/docker-only" --mode rootful --engine docker --console 2>&1)" || fail "console docker run" "$out7h"
+[ ! -e "$r7h/$cil7f" ] && pass "--console on Docker without --selinux-enabled writes no console module" || fail "console module docker" "$out7h"
+# No --console on a fresh SELinux host: no module and no note.
+r7i="$tmp/r7i"; mk_root "$r7i"; mkdir -p "$r7i/sys/fs/selinux"
+out7i="$(prep "$r7i" "$tmp/podman-only" --mode rootless --engine podman 2>&1)" || fail "no console run" "$out7i"
+[ ! -e "$r7i/$cil7f" ] && ! printf '%s' "$out7i" | grep -q 'quasar-console-devices' \
+  && pass "no console module and no note without --console on a fresh host" || fail "console module absent" "$out7i"
+# A dry run writes and loads nothing, and says what it would do.
+r7j="$tmp/r7j"; mk_root "$r7j"; mkdir -p "$r7j/sys/fs/selinux"
+b7j="$(tree "$r7j")"
+out7j="$(prep "$r7j" "$tmp/podman-only" --mode rootless --engine podman --console --dry-run 2>&1)" || fail "console dry run" "$out7j"
+[ "$b7j" = "$(tree "$r7j")" ] && [ ! -e "$r7j/.prepare-host-commands" ] \
+  && printf '%s' "$out7j" | grep -q 'would    write /etc/quasar/selinux/quasar-console-devices.cil' \
+  && printf '%s' "$out7j" | grep -q 'would    SELinux module quasar-console-devices' \
+  && pass "--console dry run writes and loads no console module, and says it would" || fail "console module dry run" "$out7j"
+
 # ── 8. a dry run changes nothing ────────────────────────────────────────────
 r8="$tmp/r8"; mk_root "$r8" nvidia
 b8="$(tree "$r8")"
