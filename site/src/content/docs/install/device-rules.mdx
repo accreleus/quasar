@@ -65,6 +65,27 @@ sudo semodule -i quasar-console-devices.cil
 Running `prepare-host.sh` again without `--console` leaves the module in place and says so;
 remove it with `sudo semodule -r quasar-console-devices`.
 
+### SELinux and session sound
+
+On an SELinux host, an app that needs the nested-sandbox type (`container_engine_t`, Steam's
+sandbox) connects to its session's PulseAudio sidecar, which runs as `container_t`. The policy
+allows that connection only between containers of the same type, so without more the
+session is silent. `prepare-host.sh` loads a module, `quasar-nested-audio`, with exactly one
+rule for it, and SELinux stays enforcing. The rule is one permission between two types: any
+`container_engine_t` process on the host may connect to a `container_t` unix socket it can reach
+by path. Quasar mounts only the session's own sidecar directory into the app, and file labels
+and permissions still apply; an app given another session's socket directory could reach that
+session's audio. By hand:
+
+```bash
+echo '(allow container_engine_t container_t (unix_stream_socket (connectto)))' > quasar-nested-audio.cil
+sudo semodule -i quasar-nested-audio.cil
+```
+
+A host prepared before this module existed has no sound in Steam sessions until you run
+`prepare-host.sh` again; it is safe to repeat. Check with
+`sudo semodule -l | grep quasar-nested-audio`.
+
 ### The seat rule
 
 When someone is logged into a desktop on the host, systemd-logind gives that user

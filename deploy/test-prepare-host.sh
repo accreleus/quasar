@@ -281,10 +281,39 @@ grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil' "$r7d/.prepare-h
   && pass "the nested-sandbox type gets exactly one NVIDIA device rule" || fail "nested gpu module" "$(cat "$r7d/.prepare-host-commands")"
 out7d2="$(prep "$r7d" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
 printf '%s' "$out7d2" | grep -q 'ok       SELinux container_use_xserver_devices on' && pass "the boolean is left alone once on" || fail "selinux idempotent" "$out7d2"
-[ "$(grep -c 'semodule -i' "$r7d/.prepare-host-commands")" = 1 ] && pass "the module is installed once" || fail "module idempotent" "$(cat "$r7d/.prepare-host-commands")"
+[ "$(grep -c 'semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil' "$r7d/.prepare-host-commands")" = 1 ] && pass "the module is installed once" || fail "module idempotent" "$(cat "$r7d/.prepare-host-commands")"
 r7e="$tmp/r7e"; mk_root "$r7e" nvidia; mkdir -p "$r7e/sys/fs/selinux/booleans"; printf '0 0' > "$r7e/sys/fs/selinux/booleans/container_use_xserver_devices"
 prep "$r7e" "$tmp/docker-only" --mode rootful >/dev/null 2>&1
 if grep -q setsebool "$r7e/.prepare-host-commands" 2>/dev/null; then fail "no boolean for Docker" ""; else pass "Docker without SELinux does not get the SELinux boolean"; fi
+
+# ── 7e2. SELinux: sessions' PulseAudio socket (#476) ────────────────────────
+# A nested-sandbox app (container_engine_t) must connect to its session's sidecar
+# (container_t); the policy's connectto rule is same-type only.
+cil7k="etc/quasar/selinux/quasar-nested-audio.cil"
+r7k="$tmp/r7k"; mk_root "$r7k"; mkdir -p "$r7k/sys/fs/selinux"
+out7k="$(prep "$r7k" "$tmp/podman-only" --mode rootless --engine podman 2>&1)" || fail "audio selinux run" "$out7k"
+c7k="$r7k/$cil7k"
+grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-audio.cil' "$r7k/.prepare-host-commands" \
+  && printf '%s' "$out7k" | grep -q 'changed  SELinux module quasar-nested-audio' \
+  && pass "an SELinux host (no NVIDIA, no --console) loads the session sound module" || fail "audio module" "$(cat "$r7k/.prepare-host-commands") $out7k"
+grep -qxF '(allow container_engine_t container_t (unix_stream_socket (connectto)))' "$c7k" \
+  && [ "$(grep -c '^(allow' "$c7k")" = 1 ] \
+  && pass "the session sound module is exactly one connectto rule on unix_stream_socket" || fail "audio module rules" "$(cat "$c7k")"
+out7k2="$(prep "$r7k" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
+[ "$(grep -c 'semodule -i /etc/quasar/selinux/quasar-nested-audio.cil' "$r7k/.prepare-host-commands")" = 1 ] \
+  && printf '%s' "$out7k2" | grep -q 'ok       SELinux module quasar-nested-audio' \
+  && pass "a second run leaves the session sound module alone" || fail "audio module idempotent" "$out7k2"
+printf '; older rules\n' > "$r7k/etc/quasar/selinux/.quasar-nested-audio.loaded"
+prep "$r7k" "$tmp/podman-only" --mode rootless --engine podman >/dev/null 2>&1
+[ "$(grep -c 'semodule -i /etc/quasar/selinux/quasar-nested-audio.cil' "$r7k/.prepare-host-commands")" = 2 ] \
+  && pass "a changed session sound module is loaded again" || fail "audio module reload" "$(cat "$r7k/.prepare-host-commands")"
+r7l="$tmp/r7l"; mk_root "$r7l"
+out7l="$(prep "$r7l" "$tmp/podman-only" --mode rootless --engine podman 2>&1)" || fail "audio non-selinux run" "$out7l"
+[ ! -e "$r7l/$cil7k" ] && ! grep -qs 'semodule' "$r7l/.prepare-host-commands" && ! printf '%s' "$out7l" | grep -q 'quasar-nested-audio' \
+  && pass "a host without SELinux gets no session sound module" || fail "audio module non-selinux" "$out7l"
+r7m="$tmp/r7m"; mk_root "$r7m"; mkdir -p "$r7m/sys/fs/selinux"
+out7m="$(prep "$r7m" "$tmp/docker-only" --mode rootful --engine docker 2>&1)" || fail "audio docker run" "$out7m"
+[ ! -e "$r7m/$cil7k" ] && pass "Docker without --selinux-enabled gets no session sound module" || fail "audio module docker" "$out7m"
 
 # ── 7f. --console on SELinux: the console devices module (#460) ─────────────
 # A console session runs as container_engine_t, which the policy denies the input nodes,
@@ -307,14 +336,14 @@ grep -qxF '(allow container_engine_t device_t (dir (getattr open read search wat
   && pass "the console module names exactly the input, sound, hidraw and udev-data rules" || fail "console module rules" "$(cat "$c7f")"
 if grep -v '^;' "$c7f" | grep -qE 'dri_device_t|xserver_misc_device_t|(^|[ (])(self|unconfined_t|container_t)[ )]'; then fail "console module is narrow" "$(cat "$c7f")"; else pass "the console module does not widen the display or NVIDIA rules"; fi
 out7f2="$(prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)"
-[ "$(grep -c 'semodule -i' "$r7f/.prepare-host-commands")" = 1 ] \
+[ "$(grep -c 'semodule -i /etc/quasar/selinux/quasar-console-devices.cil' "$r7f/.prepare-host-commands")" = 1 ] \
   && printf '%s' "$out7f2" | grep -q 'ok       SELinux module quasar-console-devices' \
   && ! printf '%s' "$out7f2" | grep -q 'changed' \
   && pass "a second --console run leaves the console module alone" || fail "console module idempotent" "$out7f2"
 # What was loaded before differs from what is written now (a rule changed in a new release).
 printf '; older rules\n' > "$r7f/etc/quasar/selinux/.quasar-console-devices.loaded"
 prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman --console >/dev/null 2>&1
-[ "$(grep -c 'semodule -i' "$r7f/.prepare-host-commands")" = 2 ] && pass "a changed console module is loaded again" || fail "console module reload" "$(cat "$r7f/.prepare-host-commands")"
+[ "$(grep -c 'semodule -i /etc/quasar/selinux/quasar-console-devices.cil' "$r7f/.prepare-host-commands")" = 2 ] && pass "a changed console module is loaded again" || fail "console module reload" "$(cat "$r7f/.prepare-host-commands")"
 # Without --console a module from an earlier run is named, not removed.
 out7f3="$(prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
 printf '%s' "$out7f3" | grep -q 'note     SELinux module quasar-console-devices is installed from an earlier --console run and is left in place' \
@@ -394,7 +423,8 @@ out9f="$(prep "$r9f" "$tmp/docker-only" --mode rootful --engine docker --homes /
 grep -qF 'semanage fcontext -a -t container_file_t /var/lib/quasar/h(/.*)?' "$r9f/.prepare-host-commands" \
   && grep -qF 'semanage fcontext -a -t container_file_t /run/quasar-agent(/.*)?' "$r9f/.prepare-host-commands" \
   && grep -q 'setsebool -P container_use_xserver_devices on' "$r9f/.prepare-host-commands" \
-  && grep -q 'semodule -i' "$r9f/.prepare-host-commands" \
+  && grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil' "$r9f/.prepare-host-commands" \
+  && grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-audio.cil' "$r9f/.prepare-host-commands" \
   && grep -q SECLABEL "$r9f/etc/udev/rules.d/70-quasar.rules" \
   && grep -q 'd /run/quasar-agent 0755 root root' "$r9f/etc/tmpfiles.d/quasar.conf" \
   && pass "rootful Docker with --selinux-enabled gets the labels, boolean, module and a boot-made runtime dir" \

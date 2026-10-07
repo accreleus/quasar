@@ -60,6 +60,7 @@ own; the two do not move together, and that is deliberate.
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
 
 ### Fixed
+- **A streamed Steam session on an SELinux host now has sound (#476).** The app runs as the nested-sandbox type (`container_engine_t`), which the policy did not allow to connect to its session's PulseAudio sidecar (`container_t`): the policy's connect rule covers only two containers of the same type, so the stream was silent. `prepare-host.sh` now loads a `quasar-nested-audio` SELinux module granting one permission between the two types and nothing else: a nested-sandbox process may connect to a `container_t` unix socket it can reach by path, which is only its own session's pulse directory because that is all the agent mounts into the app (an app given another session's socket directory could reach that session's audio). **On an SELinux host, run `prepare-host.sh` again** (it is safe to repeat); a host that has not has no sound in those sessions until it does.
 - **A rootless console on an SELinux host had no keyboard, mouse or sound (#460).** The
   console session runs as `container_engine_t`, and the policy denied it the input nodes,
   the sound nodes and the udev database, so the desktop started with no input at all.
