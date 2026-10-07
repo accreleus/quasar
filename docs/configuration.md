@@ -1116,7 +1116,7 @@ given:
 | Grant | Why |
 |---|---|
 | the console GPU's card and render nodes | the desktop opens the card itself and becomes DRM master by being its first opener |
-| `/dev/snd` (when the host has it) | the desktop's own audio stack plays through the monitor or the sound card |
+| `/dev/snd` (when the host has it), bind-mounted read-only, with device-cgroup rule `c 116:* rwm` | the desktop's own audio stack plays through the monitor or the sound card, including a USB card plugged in later (rootful engines). It is a directory bind, never `--device /dev/snd`: rootless Podman cannot create device nodes, so it binds each `--device` node over an empty regular file, and `readdir` then lists every `/dev/snd/*` entry as a regular file, which PipeWire's ALSA monitor ignores ("card 0 has 0 PCM device(s)", only a Dummy Output) (#460). Nodes still open read-write on the read-only bind. |
 | `/dev/input`, bind-mounted read-only, with device-cgroup rule `c 13:* rwm` | input devices, including ones plugged in later. Nodes still open read-write; the container cannot change the host's nodes. An allowlist in `input_devices` (`/dev/input/eventN` only) passes just those nodes, and no rule. |
 | every `/dev/hidrawN` node present at launch, passed individually with `--device`, plus device-cgroup rule `c <major>:* rwm` (the major read fresh from `/proc/devices`, since it is dynamic) | Steam Input reads a controller's identity over hidraw; with none, Steam falls back to an evdev GUID match that can misname the pad (#462). An `input_devices` allowlist passes only the allowlisted events' hidraw siblings (resolved through sysfs), and no cgroup rule. `/dev/hidrawN`'s parent is `/dev` itself, so unlike `/dev/input` it is never bind-mounted — that would hand over the whole device directory. |
 | `/run/udev/data`, read-only | so libudev knows the devices. The host's udev control socket is not passed; the image makes the placeholder libudev checks for. |
@@ -1124,7 +1124,7 @@ given:
 
 **Rootless engines (#460).** The plan is the same request on every engine. A rootless engine
 cannot apply a device-cgroup rule (rootless Podman refuses to create a container that names one),
-so the runtime leaves the input rule out there, records that in the launch journal, and logs
+so the runtime leaves the input and sound rules out there, records that in the launch journal, and logs
 `token=app-device-cgroup-rules-omitted`; every node, including one plugged in later, then opens
 through the host's own permissions: `prepare-host.sh --console` gives the `quasar` group the
 display cards, the sound devices, every input device and `tty8` by ACL. The read-back checks

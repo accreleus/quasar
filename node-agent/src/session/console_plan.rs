@@ -29,6 +29,10 @@ pub fn host_sound(told: Option<&str>, own_dev_snd: bool) -> bool {
 /// plugged in after start is a new node the device cgroup has never allowed.
 const INPUT_CGROUP_RULE: &str = "c 13:* rwm";
 
+/// ALSA's character major, for a sound card plugged in after start (rootful engines; a
+/// rootless engine drops every cgroup rule in the runtime and relies on the host's ACL).
+const SOUND_CGROUP_RULE: &str = "c 116:* rwm";
+
 /// Where a hidraw device's sysfs sibling lives relative to its evdev `device` symlink:
 /// `event<N>/device` resolves to the HID device's `input/input<M>` directory, so its
 /// parent's parent is the HID device directory that also owns `hidraw/hidraw<K>`.
@@ -170,9 +174,6 @@ pub fn console_args(host: &ConsoleHost, input: &InputGrant) -> Vec<String> {
     if let Some(render) = &host.render_node {
         device(render);
     }
-    if host.sound {
-        device("/dev/snd");
-    }
     // `/dev/hidrawN`'s parent is `/dev` itself, so it is never bind-mounted (that would
     // hand over the whole device directory); each node the caller resolved is passed
     // individually instead, same as an input allowlist's nodes below.
@@ -187,6 +188,13 @@ pub fn console_args(host: &ConsoleHost, input: &InputGrant) -> Vec<String> {
     // chown or unlink the host's own nodes.
     if input == &InputGrant::All {
         bind("/dev/input");
+    }
+    // Sound is a directory bind, not `--device /dev/snd`: rootless Podman cannot mknod, so
+    // it realizes each `--device` node as a bind over an empty regular file, which `readdir`
+    // lists as DT_REG. PipeWire's ALSA monitor counts PCM devices from `/dev/snd` entries
+    // that are DT_CHR, found none, and ignored the card (#460).
+    if host.sound {
+        bind("/dev/snd");
     }
     // libudev reads device properties here. Hotplug events arrive over netlink, which is
     // why the container shares the host's network namespace. The host's udev control
@@ -209,6 +217,9 @@ pub fn console_args(host: &ConsoleHost, input: &InputGrant) -> Vec<String> {
                 args.extend(["--device".into(), node.clone()]);
             }
         }
+    }
+    if host.sound {
+        args.extend(["--device-cgroup-rule".into(), SOUND_CGROUP_RULE.into()]);
     }
     args.extend([
         "--network".into(),
@@ -421,13 +432,17 @@ mod tests {
         let args = console_args(&host(), &InputGrant::All);
         assert_eq!(
             pairs(&args, "--device"),
-            ["/dev/dri/card1", "/dev/dri/renderD129", "/dev/snd"]
+            ["/dev/dri/card1", "/dev/dri/renderD129"]
         );
-        assert_eq!(pairs(&args, "--device-cgroup-rule"), ["c 13:* rwm"]);
+        assert_eq!(
+            pairs(&args, "--device-cgroup-rule"),
+            ["c 13:* rwm", "c 116:* rwm"]
+        );
         assert_eq!(
             pairs(&args, "--mount"),
             [
                 "type=bind,src=/dev/input,dst=/dev/input,readonly",
+                "type=bind,src=/dev/snd,dst=/dev/snd,readonly",
                 "type=bind,src=/run/udev/data,dst=/run/udev/data,readonly",
             ]
         );
@@ -444,12 +459,12 @@ mod tests {
             [
                 "/dev/dri/card1",
                 "/dev/dri/renderD129",
-                "/dev/snd",
                 "/dev/input/event3",
                 "/dev/input/event7",
             ]
         );
-        assert!(pairs(&args, "--device-cgroup-rule").is_empty());
+        // No evdev/hidraw hotplug rule for an allowlist; sound still gets its own.
+        assert_eq!(pairs(&args, "--device-cgroup-rule"), ["c 116:* rwm"]);
         assert!(!pairs(&args, "--mount")
             .iter()
             .any(|m| m.contains("dst=/dev/input")));
@@ -468,6 +483,10 @@ mod tests {
         };
         let args = console_args(&bare, &InputGrant::All);
         assert_eq!(pairs(&args, "--device"), ["/dev/dri/card1"]);
+        assert_eq!(pairs(&args, "--device-cgroup-rule"), ["c 13:* rwm"]);
+        assert!(!pairs(&args, "--mount")
+            .iter()
+            .any(|m| m.contains("/dev/snd")));
     }
 
     #[test]
@@ -483,14 +502,13 @@ mod tests {
             [
                 "/dev/dri/card1",
                 "/dev/dri/renderD129",
-                "/dev/snd",
                 "/dev/hidraw0",
                 "/dev/hidraw3",
             ]
         );
         assert_eq!(
             pairs(&args, "--device-cgroup-rule"),
-            ["c 13:* rwm", "c 242:* rwm"]
+            ["c 13:* rwm", "c 242:* rwm", "c 116:* rwm"]
         );
     }
 
@@ -502,7 +520,25 @@ mod tests {
         assert!(!pairs(&args, "--device")
             .iter()
             .any(|d| d.contains("hidraw")));
-        assert_eq!(pairs(&args, "--device-cgroup-rule"), ["c 13:* rwm"]);
+        assert_eq!(
+            pairs(&args, "--device-cgroup-rule"),
+            ["c 13:* rwm", "c 116:* rwm"]
+        );
+    }
+
+    #[test]
+    fn sound_is_a_read_only_directory_bind_and_never_a_device_node() {
+        // Rootless Podman would list a `--device /dev/snd` node as a regular file (#460).
+        for input in [
+            InputGrant::All,
+            InputGrant::Nodes(vec!["/dev/input/event3".into()]),
+        ] {
+            let args = console_args(&host(), &input);
+            assert!(!pairs(&args, "--device").iter().any(|d| d.contains("snd")));
+            assert!(pairs(&args, "--mount")
+                .contains(&"type=bind,src=/dev/snd,dst=/dev/snd,readonly".to_string()));
+            assert!(pairs(&args, "--device-cgroup-rule").contains(&"c 116:* rwm".to_string()));
+        }
     }
 
     #[test]
@@ -520,12 +556,12 @@ mod tests {
             [
                 "/dev/dri/card1",
                 "/dev/dri/renderD129",
-                "/dev/snd",
                 "/dev/hidraw5",
                 "/dev/input/event11",
             ]
         );
-        assert!(pairs(&args, "--device-cgroup-rule").is_empty());
+        // Only the sound rule: no evdev or hidraw hotplug rule for an allowlist.
+        assert_eq!(pairs(&args, "--device-cgroup-rule"), ["c 116:* rwm"]);
     }
 
     #[test]
@@ -537,12 +573,7 @@ mod tests {
         let args = console_args(&host(), &input);
         assert_eq!(
             pairs(&args, "--device"),
-            [
-                "/dev/dri/card1",
-                "/dev/dri/renderD129",
-                "/dev/snd",
-                "/dev/input/event0",
-            ]
+            ["/dev/dri/card1", "/dev/dri/renderD129", "/dev/input/event0",]
         );
     }
 
@@ -641,8 +672,13 @@ mod tests {
         args.push("image".into());
         let request = super::super::container::application_request_for_test(&args);
         assert_eq!(request.network, "host");
-        assert_eq!(request.device_cgroup_rules, ["c 13:* rwm", "c 242:* rwm"]);
+        assert_eq!(
+            request.device_cgroup_rules,
+            ["c 13:* rwm", "c 242:* rwm", "c 116:* rwm"]
+        );
         assert!(request.devices.contains(&"/dev/dri/card1".to_string()));
+        assert!(!request.devices.iter().any(|d| d.contains("snd")));
+        assert!(request.is_valid());
         assert!(request.devices.contains(&"/dev/hidraw0".to_string()));
         assert!(request
             .environment

@@ -2566,6 +2566,8 @@ mod app_identity_tests {
             InputGrant::Nodes(vec!["/dev/input/event3".into()]),
         ] {
             let request = argv_request(console_args(&host, &input));
+            // The sound rule is one the runtime accepts, so the launch is not refused.
+            assert!(request.is_valid(), "{input:?}");
             let bodies = bodies(&request);
             let field = |body: &serde_json::Value, key: &str| body["HostConfig"][key].clone();
             let (_, _, reference) = &bodies[0];
@@ -2579,8 +2581,13 @@ mod app_identity_tests {
                 }
                 let rules = field(body, "DeviceCgroupRules");
                 match (&input, rootless) {
-                    (InputGrant::All, false) => {
-                        assert_eq!(rules, serde_json::json!(["c 13:* rwm"]), "{dialect:?}")
+                    (InputGrant::All, false) => assert_eq!(
+                        rules,
+                        serde_json::json!(["c 13:* rwm", "c 116:* rwm"]),
+                        "{dialect:?}"
+                    ),
+                    (InputGrant::Nodes(_), false) => {
+                        assert_eq!(rules, serde_json::json!(["c 116:* rwm"]), "{dialect:?}")
                     }
                     _ => assert!(
                         rules.is_null(),
@@ -2601,7 +2608,7 @@ mod app_identity_tests {
     #[test]
     fn only_a_rootless_engine_leaves_the_device_cgroup_rules_out() {
         let with_rule = ApplicationRequest {
-            device_cgroup_rules: vec!["c 13:* rwm".into()],
+            device_cgroup_rules: vec!["c 13:* rwm".into(), "c 116:* rwm".into()],
             ..request()
         };
         for dialect in [Dialect::Docker, Dialect::Podman] {
@@ -2837,6 +2844,31 @@ mod bind_source_tests {
         let writable = request(&["/run/udev/data"]);
         let refused = check(Dialect::Podman, &writable, Some("1")).unwrap_err();
         assert!(refused.contains("/run/udev/data"), "{refused}");
+    }
+
+    /// #460: sound is a `/dev/snd` directory bind, which the agent proves through the host's
+    /// `/dev` it has at `/host/dev` (the same bind that lets it see the host has sound).
+    #[test]
+    fn the_console_sound_bind_is_proven_through_the_agents_host_dev_view() {
+        use super::super::dialect::Dialect;
+        let request = ApplicationRequest {
+            typed_mounts: vec![ApplicationMount::Bind {
+                source: "/dev/snd".into(),
+                target: "/dev/snd".into(),
+                read_only: true,
+                consistency: None,
+            }],
+            ..Default::default()
+        };
+        let mounts = [bind("/dev", "/host/dev")];
+        let with_sound = |path: &Path| path == Path::new("/host/dev/snd");
+        assert_eq!(
+            bind_source_check(Dialect::Podman, &request, Some(&mounts), with_sound, None),
+            Ok(())
+        );
+        let refused = bind_source_check(Dialect::Podman, &request, Some(&mounts), |_| false, None)
+            .unwrap_err();
+        assert!(refused.contains("/dev/snd"), "{refused}");
     }
 }
 

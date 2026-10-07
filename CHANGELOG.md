@@ -60,6 +60,7 @@ own; the two do not move together, and that is deliberate.
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
 
 ### Fixed
+- **A rootless console desktop had no sound (#460).** The console plan passed `--device /dev/snd`, which rootless Podman realizes as a bind over an empty regular file per node, so `readdir` listed every sound node as a regular file and PipeWire's ALSA monitor counted "0 PCM device(s)" and ignored the card, leaving only a Dummy Output. The console container now gets `/dev/snd` as a read-only directory bind, like `/dev/input`, plus the device-cgroup rule `c 116:* rwm` (a USB sound card plugged in later opens on rootful engines; a rootless engine drops the rule as it does the input one).
 - **A Steam library tile can no longer be set as the console's default app (#453).** The
   console page's default-app list and the `console_default_app` readiness check treated a
   game tile as direct-capable through its parent launcher, so it was offered alongside real
