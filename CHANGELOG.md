@@ -86,6 +86,9 @@ own; the two do not move together, and that is deliberate.
   in `images::tests` shared the same too-tight bound on a non-blocking call and got a generous
   one.
 
+### Security
+- **A streamed game can no longer take the screen from a console session on a rootful Docker or Podman host (#464).** A streamed app now gets each render node and each card node mknod-only: the GPU still enumerates (radv and gamescope need the card node to exist) but the card never opens, so a console session started later still gets DRM master. NVIDIA hosts (the container toolkit grants the card read-write whatever is asked) and rootless engines (no device cgroup) cannot enforce this and keep today's grant: there the console holds the display by starting first, and `console_card` now says which case the host is in. The per-engine table is in `docs/configuration.md`, "Streamed sessions beside a console".
+
 ## 0.4.1 — 2026-10-04
 
 ### Added

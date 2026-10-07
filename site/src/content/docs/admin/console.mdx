@@ -66,12 +66,26 @@ buses, and no capability.
 - **The display must be free.** If a desktop or login screen holds it, `console_card`
   fails and names what holds it. Stop the login screen on that output, or choose
   another output.
-- **Streamed sessions are still given the display card.** If a streamed game takes
-  the display first, `console_card` says so.
+- **Streamed games beside the console.** Whether one can take the screen depends
+  on the host; see [below](#streamed-sessions-beside-the-console).
 - **Rootless:** a device plugged in later works through the device rules alone. If
   one doesn't, replug it after installing the rules.
 - **Devices are re-read** each time console mode is turned on and at every start.
   If a reboot renumbers the i2c buses, the agent is replaced to pick them up.
+
+## Streamed sessions beside the console
+
+A streamed game is given the display card so its GPU works, but where the engine
+allows, it can't open it.
+
+| Host | Can a streamed game take the screen? |
+| --- | --- |
+| Rootful Docker or Podman, AMD or Intel GPU | No. A console session started later still gets the screen. |
+| NVIDIA GPU, any engine | Yes, if it starts first. NVIDIA's container toolkit always gives it the card. |
+| Rootless Docker or Podman | Yes, if it starts first. A rootless engine can't restrict the card. |
+
+Where it can, start the console session first. If a streamed game holds the screen,
+`console_card` says so: end that session.
 
 ## The console terminal
 

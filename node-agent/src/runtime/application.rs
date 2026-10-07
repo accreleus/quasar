@@ -86,6 +86,11 @@ pub struct ApplicationRequest {
     /// syntax whose SELinux and consistency suffixes must remain byte exact.
     pub typed_mounts: Vec<ApplicationMount>,
     pub devices: Vec<String>,
+    /// `/dev/dri/cardN` nodes created with mknod-only cgroup permission (#464): libdrm
+    /// still lists the GPU's primary node, and every open fails, so the app can never take
+    /// the display. Realized per engine by `dialect::card_grant`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mknod_only_cards: Vec<String>,
     /// `c <major>:<minor|*> <rwm>` only; lets a node created after start be opened.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_cgroup_rules: Vec<String>,
@@ -111,6 +116,7 @@ impl Default for ApplicationRequest {
             mounts: Vec::new(),
             typed_mounts: Vec::new(),
             devices: Vec::new(),
+            mknod_only_cards: Vec::new(),
             device_cgroup_rules: Vec::new(),
             group_add: Vec::new(),
             network: "none".into(),
@@ -140,6 +146,7 @@ impl ApplicationRequest {
                 .mounts
                 .iter()
                 .all(|mount| !mount.is_empty() && !mount.contains('\0'))
+            && mknod_only_cards_ok(&self.mknod_only_cards, &self.devices)
             && self
                 .device_cgroup_rules
                 .iter()
@@ -154,6 +161,20 @@ impl ApplicationRequest {
                 }
             })
     }
+}
+
+/// Each mknod-only card is `/dev/dri/card<N>` exactly, and the same request never also
+/// grants it openable, by its own path or through the whole `/dev/dri`.
+pub(crate) fn mknod_only_cards_ok(cards: &[String], devices: &[String]) -> bool {
+    let card_node = |path: &str| {
+        path.strip_prefix("/dev/dri/card")
+            .is_some_and(|n| !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    cards.is_empty()
+        || (cards.iter().all(|card| card_node(card))
+            && !devices
+                .iter()
+                .any(|d| d == "/dev/dri" || d == "/dev/dri/" || cards.contains(d)))
 }
 
 /// A character-device rule with numeric major, numeric-or-`*` minor and a non-empty
@@ -268,6 +289,10 @@ pub(crate) struct ApplicationIntent {
     /// request's (a rootless engine: none); `None` is the request's own list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_cgroup_rules: Option<Vec<String>>,
+    /// #464: the engine cannot hold the request's `mknod_only_cards` to mknod
+    /// (`dialect::card_grant`), so they were created openable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cards_openable: bool,
     /// On an engine that confines with SELinux the app runs as the nested-sandbox type
     /// (`dialect::NESTED_SANDBOX_LABEL`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

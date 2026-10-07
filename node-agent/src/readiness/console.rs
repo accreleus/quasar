@@ -66,6 +66,9 @@ pub struct ConsoleView {
     pub enabled: bool,
     /// The engine is rootless: host preparation runs with `--mode rootless`.
     pub rootless: bool,
+    /// The streamed apps here can open a card node, so one may hold the display
+    /// (`container::streamed_cards_openable`, #464).
+    pub streamed_cards_openable: bool,
     pub card: CardView,
     pub input: InputView,
     pub sound: SoundView,
@@ -347,13 +350,18 @@ impl ConsoleView {
             };
         }
         let config = config();
+        let rootless = crate::buildinfo::install_facts()
+            .engine
+            .engine_mode
+            .as_deref()
+            == Some("rootless");
+        let nvidia = crate::session::container::ContainerRuntime::from_env().is_nvidia();
         ConsoleView {
             enabled,
-            rootless: crate::buildinfo::install_facts()
-                .engine
-                .engine_mode
-                .as_deref()
-                == Some("rootless"),
+            rootless,
+            streamed_cards_openable: crate::session::container::streamed_cards_openable(
+                nvidia, rootless,
+            ),
             card: CardView::observe(config.output_id.as_deref()),
             input: InputView::observe(&config.input_devices),
             sound: SoundView::observe(
@@ -415,14 +423,21 @@ pub fn check_card(v: &ConsoleView) -> ReadinessCheck {
                     .holder
                     .clone()
                     .unwrap_or_else(|| "another program".into());
+                let streamed = if v.streamed_cards_openable {
+                    "Streamed apps on this host can open the card too (NVIDIA's container \
+                     toolkit or a rootless engine grants it), so a streamed app may hold it: \
+                     end that session."
+                } else {
+                    "Streamed apps on this host are given the card for enumeration only and \
+                     cannot hold it."
+                };
                 return super::fail(
                     CHECK_CARD,
                     format!("{who} holds DRM master on {node}, so a console desktop cannot take the display"),
-                    "Stop the desktop or login screen driving that card (for example its \
-                     display manager), or pick an output on another card. Streamed sessions \
-                     are given the card node too, so a streamed app may hold it: end that \
-                     session."
-                        .into(),
+                    format!(
+                        "Stop the desktop or login screen driving that card (for example its \
+                         display manager), or pick an output on another card. {streamed}"
+                    ),
                 );
             }
             CardAccess::Free | CardAccess::Claimed => {}
@@ -722,6 +737,7 @@ mod tests {
         ConsoleView {
             enabled: true,
             rootless: true,
+            streamed_cards_openable: true,
             card: CardView {
                 cards: vec![("/dev/dri/card1".into(), CardAccess::Free)],
                 holder: None,
@@ -851,6 +867,15 @@ mod tests {
             "gdm, the login screen holds DRM master on /dev/dri/card1",
             "a streamed app may hold it",
         );
+        // #464: a rootful engine without NVIDIA gives streamed apps the card mknod-only.
+        held.streamed_cards_openable = false;
+        let fixed = check_card(&held);
+        assert_fail(
+            &fixed,
+            "holds DRM master",
+            "for enumeration only and cannot hold it",
+        );
+        assert!(!fixed.remediation.contains("end that session"), "{fixed:?}");
         let mut none = on();
         none.card.cards.clear();
         assert_fail(

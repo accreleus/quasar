@@ -163,7 +163,7 @@ fn security_options_compare_as_one_set() {
 
 #[test]
 fn devices_docker_exact_podman_only_what_was_asked_for() {
-    let requested = vec!["/dev/dri/renderD128".to_string()];
+    let requested = vec![device("/dev/dri/renderD128", "rwm")];
     assert!(Dialect::Docker.devices_ok(&[device("/dev/dri/renderD128", "rwm")], &requested, false));
     assert!(
         !Dialect::Docker.devices_ok(&[], &requested, false),
@@ -321,7 +321,7 @@ fn gpu_expansion_is_exact_and_refuses_traversal() {
     // A requested device spelled with traversal is refused too.
     assert!(!Dialect::Podman.devices_ok(
         &[device("/dev/dri/../sda", "")],
-        &["/dev/dri/../sda".to_string()],
+        &[device("/dev/dri/../sda", "rwm")],
         false
     ));
 }
@@ -370,7 +370,7 @@ fn each_injection_reads_back_only_its_own_request() {
 /// as the nodes its specification lists (the DRM ones included).
 #[test]
 fn podman_reports_a_requested_directory_as_its_drm_nodes_and_nothing_else() {
-    let requested = vec!["/dev/dri".to_string()];
+    let requested = vec![device("/dev/dri", "rwm")];
     let expanded = [
         device("/dev/dri/card1", ""),
         device("/dev/dri/renderD128", ""),
@@ -483,4 +483,70 @@ fn device_cgroup_rules_are_exact_on_docker_and_never_wider_on_podman() {
         !Dialect::Podman.device_cgroup_rules_ok(&rule, &[]),
         "unrequested"
     );
+}
+
+/// #464: only a rootful engine with no NVIDIA injection holds a card to mknod.
+#[test]
+fn a_card_is_held_to_mknod_only_on_a_rootful_engine_without_nvidia() {
+    use crate::runtime::GpuInjection::{Cdi, DeviceRequest};
+    assert_eq!(card_grant(false, None), CardGrant::MknodOnly);
+    for (rootless, injection) in [
+        (true, None),
+        (false, Some(Cdi)),
+        (false, Some(DeviceRequest)),
+        (true, Some(Cdi)),
+    ] {
+        assert!(
+            matches!(card_grant(rootless, injection), CardGrant::Openable(_)),
+            "rootless={rootless} {injection:?}"
+        );
+    }
+    let devices = vec!["/dev/dri/renderD128".to_string()];
+    let cards = vec!["/dev/dri/card0".to_string()];
+    assert_eq!(
+        device_mappings(&devices, &cards, false),
+        [
+            device("/dev/dri/renderD128", "rwm"),
+            device("/dev/dri/card0", "m")
+        ]
+    );
+    assert_eq!(
+        device_mappings(&devices, &cards, true),
+        [
+            device("/dev/dri/renderD128", "rwm"),
+            device("/dev/dri/card0", "rwm")
+        ]
+    );
+}
+
+/// #464: a mknod-only card reads back as asked. Docker echoes `m` (measured, Docker
+/// 29.8.1); rootful Podman's compatible inspect lists no device at all (measured, Podman
+/// 5.8.4). A card reported wider than asked is refused on both, even beside a GPU request.
+#[test]
+fn a_mknod_only_card_reads_back_as_asked_and_never_wider() {
+    let requested = [
+        device("/dev/dri/renderD128", "rwm"),
+        device("/dev/dri/card0", "m"),
+    ];
+    assert!(Dialect::Docker.devices_ok(&requested, &requested, false));
+    let widened = [
+        device("/dev/dri/renderD128", "rwm"),
+        device("/dev/dri/card0", "rwm"),
+    ];
+    assert!(!Dialect::Docker.devices_ok(&widened, &requested, false));
+    assert!(Dialect::Podman.devices_ok(&[], &requested, false));
+    assert!(Dialect::Podman.devices_ok(&requested, &requested, false));
+    assert!(Dialect::Podman.devices_ok(&[device("/dev/dri/card0", "")], &requested, false));
+    for gpu in [false, true] {
+        assert!(
+            !Dialect::Podman.devices_ok(&[device("/dev/dri/card0", "rwm")], &requested, gpu),
+            "gpu={gpu}"
+        );
+    }
+    // A card asked for openable is not satisfied by a mknod-only one either.
+    assert!(!Dialect::Docker.devices_ok(
+        &[device("/dev/dri/card0", "m")],
+        &[device("/dev/dri/card0", "rwm")],
+        false
+    ));
 }

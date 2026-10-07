@@ -83,7 +83,7 @@ mode off and on so the agent is re-created with the devices.
 | Failure | Fix |
 | --- | --- |
 | A card, input, sound or terminal node can't be opened | Install the console [device rules](/quasar/install/device-rules/) (`prepare-host.sh --console`). Replug an input device it missed. |
-| Another program holds the display | Stop the desktop or login screen on that output, or pick another. A streamed game can hold it too: end that session. |
+| Another program holds the display | Stop the desktop or login screen on that output, or pick another. On an NVIDIA or rootless host a streamed game can hold it too: end that session ([which hosts](/quasar/admin/console/#streamed-sessions-beside-the-console)). |
 | A listed input device is not on this host | Plug it in, or edit **Input devices**. Numbers can change when devices are replugged. |
 | No sound device | Check the host's sound driver is loaded. Without one the console desktop has no sound. |
 | `tty8` is another session's terminal | Stop the login prompt on `tty8` (host preparation masks `getty@tty8`). |

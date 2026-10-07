@@ -2687,6 +2687,7 @@ fn application_recovery_skips_a_locked_record_and_cleans_a_later_obligation() {
         engine_groups: Vec::new(),
         group_add: None,
         device_cgroup_rules: None,
+        cards_openable: false,
         nested_sandbox_label: false,
         phase: ApplicationPhase::Running,
         result: None,
@@ -5176,6 +5177,7 @@ fn nvidia_probe_request() -> (DiagnosticHelper, GpuProbeRun) {
             entrypoint: vec!["/usr/bin/timeout".into()],
             command: vec!["5s".into(), "/bin/sh".into(), "-c".into(), "exit 23".into()],
             devices: Vec::new(),
+            mknod_only_cards: Vec::new(),
             groups: Vec::new(),
             nvidia_device_request: true,
             nvidia: Some(nvidia_access()),
@@ -5192,6 +5194,7 @@ fn dri_probe_request(operation: &str) -> (DiagnosticHelper, GpuProbeRun) {
             entrypoint: vec!["/usr/bin/timeout".into()],
             command: vec!["5s".into(), "/bin/sh".into(), "-c".into(), "exit 23".into()],
             devices: vec!["/dev/dri".into()],
+            mknod_only_cards: Vec::new(),
             groups: vec![44, 991],
             nvidia_device_request: false,
             nvidia: None,
@@ -6432,4 +6435,110 @@ fn a_journal_written_before_the_injection_was_recorded_reads_as_gpus() {
         super::docker::dialect::recorded_injection(false, None),
         None
     );
+}
+
+fn streamed_app(operation: &str) -> ApplicationRequest {
+    ApplicationRequest {
+        operation: operation.into(),
+        name: format!("quasar-sess-{operation}"),
+        image: "quasar-app:test".into(),
+        devices: vec!["/dev/dri/renderD128".into()],
+        mknod_only_cards: vec!["/dev/dri/card0".into()],
+        gpu: true,
+        ..Default::default()
+    }
+}
+
+fn application_journal(engine: &Engine, operation: &str) -> Value {
+    let journal = std::fs::read_dir(
+        engine
+            .config
+            .image_state_path
+            .as_ref()
+            .unwrap()
+            .join("applications"),
+    )
+    .unwrap()
+    .flatten()
+    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+    .find(|j| j.contains(operation))
+    .unwrap();
+    serde_json::from_str(&journal).unwrap()
+}
+
+/// #464: a streamed app's card is created mknod-only on a rootful engine and read back
+/// as that. A rootless engine cannot hold it, so it is created openable and the journal
+/// says so. A card the engine reports wider than asked is refused.
+#[test]
+fn a_streamed_apps_card_is_mknod_only_on_a_rootful_engine_and_openable_rootless() {
+    let render = json!({"PathOnHost":"/dev/dri/renderD128","PathInContainer":"/dev/dri/renderD128","CgroupPermissions":"rwm"});
+    let card = |permissions: &str| json!({"PathOnHost":"/dev/dri/card0","PathInContainer":"/dev/dri/card0","CgroupPermissions":permissions});
+
+    let engine = Engine::new();
+    engine
+        .client()
+        .start_application(streamed_app("card-rootful"))
+        .wait()
+        .unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(body["HostConfig"]["Devices"], json!([render, card("m")]));
+    assert!(application_journal(&engine, "card-rootful")
+        .get("cards_openable")
+        .is_none());
+
+    let engine = Engine::new();
+    engine.state.lock().unwrap().info = Some(rootless_info(&[]));
+    engine
+        .client()
+        .start_application(streamed_app("card-rootless"))
+        .wait()
+        .unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(body["HostConfig"]["Devices"], json!([render, card("rwm")]));
+    assert_eq!(
+        application_journal(&engine, "card-rootless")["cards_openable"],
+        json!(true)
+    );
+
+    let engine = Engine::new();
+    engine.state.lock().unwrap().host_devices_override = Some(json!([render, card("rwm")]));
+    assert_eq!(
+        engine
+            .client()
+            .start_application(streamed_app("card-widened"))
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol,
+        "a card reported openable when it was asked for mknod-only"
+    );
+}
+
+/// #464: the GPU probe is given the streamed app's grant, card mknod-only where the engine
+/// holds it and openable where it does not.
+#[test]
+fn a_gpu_probe_mirrors_a_streamed_apps_card() {
+    let probe = |operation: &str| {
+        let (helper, mut run) = dri_probe_request(operation);
+        run.devices = vec!["/dev/dri/renderD128".into()];
+        run.mknod_only_cards = vec!["/dev/dri/card0".into()];
+        (helper, run)
+    };
+    for (rootless, permissions) in [(false, "m"), (true, "rwm")] {
+        let engine = Engine::new();
+        if rootless {
+            engine.state.lock().unwrap().info = Some(rootless_info(&[]));
+        }
+        let client = engine.client();
+        let (helper, run) = probe(&format!("card-probe-{rootless}"));
+        let id = client.run_gpu_probe(helper, run).wait().unwrap();
+        let body = engine.state.lock().unwrap().body.clone().unwrap();
+        assert_eq!(
+            body["HostConfig"]["Devices"][1],
+            json!({"PathOnHost":"/dev/dri/card0","PathInContainer":"/dev/dri/card0","CgroupPermissions":permissions}),
+            "rootless={rootless}"
+        );
+        client.observe_gpu_probe(id.clone()).wait().unwrap();
+        client.cleanup_gpu_probe(id).wait().unwrap();
+    }
 }

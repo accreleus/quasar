@@ -386,23 +386,29 @@ impl Dialect {
         }
     }
 
-    /// Is every reported device one Quasar asked for? Docker reports each requested device
-    /// in order with `rwm`, and nothing else. Podman may leave a requested device out and
-    /// reports permissions empty; what it does list must each be requested, or be a node
-    /// a requested GPU expands to (`/dev/nvidia*`, `/dev/dri/*`).
+    /// Is every reported device one Quasar asked for, as it asked? Docker reports each
+    /// requested device in order with its permissions, and nothing else. Podman may leave a
+    /// requested device out and reports permissions empty; what it does list must each be
+    /// requested with no wider permissions, or be a node a requested GPU expands to
+    /// (`/dev/nvidia*`, `/dev/dri/*`). A mknod-only card reported openable is refused even
+    /// then (#464).
     pub(crate) fn devices_ok(
         self,
         reported: &[DeviceMapping],
-        requested: &[String],
+        requested: &[DeviceMapping],
         gpu_requested: bool,
     ) -> bool {
         match self {
             Dialect::Docker => {
                 reported.len() == requested.len()
                     && reported.iter().zip(requested).all(|(actual, wanted)| {
-                        actual.path_on_host.as_deref() == Some(wanted.as_str())
-                            && actual.path_in_container.as_deref() == Some(wanted.as_str())
-                            && actual.cgroup_permissions.as_deref() == Some("rwm")
+                        let path = wanted.path_on_host.as_deref();
+                        path.is_some()
+                            && wanted.path_in_container.as_deref() == path
+                            && actual.path_on_host.as_deref() == path
+                            && actual.path_in_container.as_deref() == path
+                            && wanted.cgroup_permissions.is_some()
+                            && actual.cgroup_permissions == wanted.cgroup_permissions
                     })
             }
             Dialect::Podman => reported.iter().all(|actual| {
@@ -412,21 +418,29 @@ impl Dialect {
                 ) else {
                     return false;
                 };
-                if !normal_absolute(host) {
+                if !normal_absolute(host) || host != inside {
                     return false;
                 }
                 let permissions = actual.cgroup_permissions.as_deref().unwrap_or("");
+                let as_asked = |wanted: &DeviceMapping| {
+                    permissions.is_empty()
+                        || wanted.cgroup_permissions.as_deref() == Some(permissions)
+                };
+                if let Some(wanted) = requested
+                    .iter()
+                    .find(|w| w.path_on_host.as_deref() == Some(host))
+                {
+                    return as_asked(wanted);
+                }
                 // Podman expands a requested directory (`/dev/dri`) into its nodes, and a
                 // CDI GPU into the nodes its specification lists.
-                let under = |dir: &str| {
-                    Path::new(host).parent() == Some(Path::new(dir)) && gpu_expansion(host)
+                let under = |wanted: &DeviceMapping| {
+                    wanted.path_on_host.as_deref().map(Path::new) == Path::new(host).parent()
+                        && gpu_expansion(host)
+                        && as_asked(wanted)
                 };
-                host == inside
-                    && (permissions.is_empty() || permissions == "rwm")
-                    && (requested
-                        .iter()
-                        .any(|wanted| wanted == host || under(wanted))
-                        || (gpu_requested && gpu_expansion(host)))
+                (permissions.is_empty() || permissions == "rwm")
+                    && (requested.iter().any(under) || (gpu_requested && gpu_expansion(host)))
             }),
         }
     }
@@ -578,6 +592,49 @@ fn gpu_expansion(path: &str) -> bool {
         Some("/dev/nvidia-caps") => numbered(name, "nvidia-cap"),
         _ => false,
     }
+}
+
+/// How a request's mknod-only cards are created on this engine (#464).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardGrant {
+    /// The device cgroup allows only mknod: libdrm lists the node, and it never opens.
+    MknodOnly,
+    /// The engine cannot hold that; the card opens with the host's permissions.
+    Openable(&'static str),
+}
+
+/// Only a rootful engine's device cgroup holds a card to mknod. A rootless engine applies
+/// no device rule, and an NVIDIA injection (the `--gpus` hook and CDI alike) grants the
+/// GPU's card node read-write whatever else is asked (measured, toolkit 1.20.1). There the
+/// card is created openable rather than recording a guarantee the container does not have.
+pub(crate) fn card_grant(rootless: bool, injection: Option<GpuInjection>) -> CardGrant {
+    match (rootless, injection) {
+        (true, _) => CardGrant::Openable("a rootless engine applies no device cgroup"),
+        (false, Some(_)) => {
+            CardGrant::Openable("NVIDIA's container toolkit grants the GPU's card node read-write")
+        }
+        (false, None) => CardGrant::MknodOnly,
+    }
+}
+
+/// The device mappings a container is created with and read back against: each device
+/// `rwm`, and each mknod-only card `m`, or `rwm` where the engine cannot hold it.
+pub(crate) fn device_mappings(
+    devices: &[String],
+    mknod_only_cards: &[String],
+    cards_openable: bool,
+) -> Vec<DeviceMapping> {
+    let mapping = |path: &String, permissions: &str| DeviceMapping {
+        path_on_host: Some(path.clone()),
+        path_in_container: Some(path.clone()),
+        cgroup_permissions: Some(permissions.into()),
+    };
+    let card = if cards_openable { "rwm" } else { "m" };
+    devices
+        .iter()
+        .map(|device| mapping(device, "rwm"))
+        .chain(mknod_only_cards.iter().map(|c| mapping(c, card)))
+        .collect()
 }
 
 /// The device request that asks for every NVIDIA GPU the way `injection` says. The

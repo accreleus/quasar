@@ -544,6 +544,7 @@ fn real_docker_gpu_probe_profile_runs_with_dri_access_and_cleans_up() {
             "ls /dev/dri >/dev/null && id -G && exit 23".into(),
         ],
         devices: vec!["/dev/dri".into()],
+        mknod_only_cards: Vec::new(),
         groups: groups.clone(),
         nvidia_device_request: false,
         nvidia: None,

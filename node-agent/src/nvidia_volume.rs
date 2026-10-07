@@ -1945,6 +1945,7 @@ pub fn probe_sibling_egl() -> EglRuntime {
         // This launch gate reads the driver userspace, not a DRM node — unlike the
         // application-GPU host probe, which takes the whole of `AppGpuAccess`.
         devices: Vec::new(),
+        mknod_only_cards: Vec::new(),
         groups: Vec::new(),
         // This gate only ever runs on an NVIDIA host, so it asks for the GPU exactly as
         // a session's application container does.

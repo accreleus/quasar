@@ -1133,7 +1133,27 @@ udev database, so `--console` also loads the `quasar-console-devices` module tha
 and nothing else; without it the desktop starts with no keyboard or mouse. The read-back checks
 Docker's echoed rules exactly. Rootful Podman gives no positive proof that a rule was applied (its
 inspect has no such field): an empty report is accepted, and a rule it does report must be the
-request's. Streamed sessions are still given the whole `/dev/dri`, card nodes included (#464).
+request's.
+
+**Streamed sessions beside a console (#464).** Not a knob. A streamed app needs its GPU's card
+node to exist: without it radv lists no GPU (Vulkan falls back to llvmpipe) and nested gamescope
+refuses a device with no primary node. Where the engine can enforce it, the card node is created
+**mknod-only** (`--device <card>:<card>:m`): libdrm still lists it, and every open fails with
+`EPERM`, so the app can never become DRM master. What each engine gives a streamed app:
+
+| Engine | A streamed app's DRM nodes | Can it take the display from a console desktop? |
+|---|---|---|
+| rootful Docker or rootful Podman, no NVIDIA GPU | each render node read-write, each card node mknod-only | no: a console session started after it still becomes DRM master |
+| NVIDIA GPU (Docker's `--gpus` hook, or CDI on any engine) | the whole `/dev/dri`, as before | yes, if it opens the card first: the container toolkit grants the card read-write whatever is asked |
+| rootless Docker or rootless Podman | each render node, each card node openable | yes, if it opens the card first: a rootless engine applies no device cgroup, so the host's ACL decides |
+
+Where a streamed app can open the card, the console desktop holds the display by opening the card
+first, and `console_card` names a holder that got there before it. On an NVIDIA host streamed apps
+keep the whole `/dev/dri`, so a second, non-NVIDIA card beside the GPU opens too. The launch logs
+`token=app-card-nodes-mknod-only`, and the runtime logs `token=app-card-nodes-openable` (and
+records it in the launch journal) where the engine cannot hold the card. The application-GPU host
+probe is given the same grant as the session it stands for. The read-back refuses a card the
+engine reports wider than it was asked for.
 
 **The agent's card reads.** Every card node the agent opens (the output inventory, the displaying
 verdict, `console_card`, the startup preflight) is opened read-only. The open mode does not decide
