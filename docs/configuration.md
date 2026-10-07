@@ -1154,11 +1154,14 @@ which row the host is in, before any conflict. On an NVIDIA host streamed apps k
 `/dev/dri`, so a second, non-NVIDIA card beside the GPU opens too. The launch logs
 `token=app-card-nodes-mknod-only` for the mknod-only cards; wherever a streamed app's card opens
 (the NVIDIA and rootless rows) the runtime logs `token=app-card-nodes-openable` and records
-`cards_openable` in the launch journal. On a host with no NVIDIA GPU whose agent lists no DRM node
-in its own `/dev/dri`, a streamed app with a GPU is refused, naming why, and the application-GPU
-host probe fails the same way: the agent cannot have checked what it would grant, and the whole
-directory would hand over every card. Give the agent the host's `/dev/dri`. The application-GPU
-host probe is given the same grant as the session it stands for. The read-back refuses a card the
+`cards_openable` in the launch journal. A host whose agent has no `/dev/dri` at all already fails
+closed: its GPUs are left out of capacity (no render node it can open) and the GPU host probes read
+not applicable. Should a GPU still be inventoried while the agent lists no DRM node in its own
+`/dev/dri` (say every node's stat fails), a streamed app with a GPU on a host with no NVIDIA GPU is
+refused, naming why, and that GPU's application-GPU host probe fails the same way: the agent cannot
+have checked what it would grant, and the whole directory would hand over every card. Give the
+agent the host's `/dev/dri`. The application-GPU host probe is given the same grant as the session
+it stands for. The read-back refuses a card the
 engine reports wider than it was asked for.
 
 **The agent's card reads.** Every card node the agent opens (the output inventory, the displaying

@@ -2124,8 +2124,9 @@ struct DrmNodeOwner {
 }
 
 /// Stat every DRM node in `dir`. A node whose metadata will not read is dropped with a
-/// WARN and contributes no group, nor a node to [`StreamedDri::Nodes`]: a launch must never
-/// fail on a stat.
+/// WARN and contributes no group, nor a node to [`StreamedDri::Nodes`]: one failed stat never
+/// fails a launch. With no node read at all, a streamed launch on a host with no NVIDIA GPU
+/// is refused ([`DRI_UNLISTED`]) rather than given the whole directory.
 fn dri_node_owners(dir: &Path) -> Vec<DrmNodeOwner> {
     use std::os::unix::fs::MetadataExt as _;
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -2981,8 +2982,8 @@ mod tests {
 
     /// #464: a streamed app gets every render node and every card node mknod-only, so the
     /// GPU still enumerates with its primary node and the card never opens. NVIDIA keeps
-    /// the whole directory (its toolkit grants the card whatever is asked), and so does a
-    /// host whose nodes the agent cannot list.
+    /// the whole directory (its toolkit grants the card whatever is asked); an unlisted
+    /// inventory elsewhere is refused (the test after this one).
     #[test]
     fn a_streamed_app_gets_its_cards_mknod_only_except_on_nvidia() {
         let cases: [(&str, bool, &[&str], &[&str]); 5] = [
