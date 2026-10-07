@@ -939,13 +939,15 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				if ac.policyTyped && h.cfgStore != nil {
 					// A displaced socket's reader can still drain a heartbeat the
 					// agent sent before it reconnected; it is not inventory (#477).
+					// ErrIdleInventoryStale covers the race where the journal moved
+					// before the registry did.
 					var idleErr error
-					h.registry.withCurrent(ac, func() {
+					current := h.registry.withCurrent(ac, func() {
 						idleCtx, idleCancel := context.WithTimeout(bg, agentDBCallTimeout)
 						idleErr = h.cfgStore.ObserveIdleHeartbeat(idleCtx, hostID, ac.connectionIncarnation, hb.RunningSessions)
 						idleCancel()
 					})
-					if errors.Is(idleErr, hostcfg.ErrIdleInventoryStale) {
+					if !current || errors.Is(idleErr, hostcfg.ErrIdleInventoryStale) {
 						h.log.Debug("idle inventory heartbeat from a superseded connection ignored", "host_id", hostID)
 					} else if idleErr != nil {
 						h.log.Warn("RH05 idle inventory heartbeat rejected", "host_id", hostID, "err", idleErr)

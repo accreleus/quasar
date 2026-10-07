@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/storage"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -223,7 +224,8 @@ func TestConsoleAutoStartDoesNotWaitOutASettlingHold(t *testing.T) {
 	_, err = store.Transition(ctx, first.ID, StateFailed, strptr("host_lost"), nil)
 	must(t, err)
 	withHomeHoldSettleWait(t, 30*time.Second)
-	coord := newTestCoordinator(t, store, newCapturingDispatcher(), testLogger())
+	coord := newTestCoordinator(t, store, newCapturingDispatcher(), testLogger(),
+		WithHomeProvider(storage.NewLocal(pool, testHomeRoot)))
 
 	start := time.Now()
 	_, err = coord.LaunchConsoleSession(ctx, s.hostID, s.userID, appID, "local_only", 1920, 1080, 60)

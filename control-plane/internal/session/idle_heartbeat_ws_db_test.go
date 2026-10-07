@@ -47,11 +47,7 @@ func TestRejectedIdleHeartbeatKeepsSocketAndStartingSession(t *testing.T) {
 	boot, err := cfg.StartRH05Boot(ctx)
 	must(t, err)
 	const token = "idle-heartbeat-477"
-	sum := sha256.Sum256([]byte(token))
-	_, err = pool.Exec(ctx, `INSERT INTO host_enrollments (token_hash, created_by, node_name, max_uses, expires_at, note)
-		VALUES ($1, NULL, NULL, 10, NULL, 'test fixture')
-		ON CONFLICT (token_hash) DO UPDATE SET used_count=0, revoked_at=NULL, expires_at=NULL`, hex.EncodeToString(sum[:]))
-	must(t, err)
+	seedEnrollmentToken(t, pool, token)
 
 	registry := agentws.NewRegistry(log)
 	coord := newTestCoordinator(t, NewStore(pool), registry, log)
@@ -111,6 +107,9 @@ func TestRejectedIdleHeartbeatKeepsSocketAndStartingSession(t *testing.T) {
 	must(t, pool.QueryRow(ctx, `INSERT INTO sessions (user_id,app_id,host_id,state,width,height,fps,bitrate_kbps)
 		VALUES ($1::uuid,$2::uuid,$3::uuid,'starting',1280,720,60,5000) RETURNING id::text`,
 		userID, appID, hostID).Scan(&sessionID))
+	var journalConn string
+	must(t, pool.QueryRow(ctx, `SELECT connection_incarnation::text FROM host_journal_reconciliation
+		WHERE host_id=$1::uuid`, hostID).Scan(&journalConn))
 	_, err = pool.Exec(ctx, `UPDATE host_journal_reconciliation SET connection_incarnation=gen_random_uuid()
 		WHERE host_id=$1::uuid`, hostID)
 	must(t, err)
@@ -123,12 +122,28 @@ func TestRejectedIdleHeartbeatKeepsSocketAndStartingSession(t *testing.T) {
 	if !logs.contains("idle inventory heartbeat from a superseded connection ignored") {
 		t.Fatal("the idle inventory did not refuse the heartbeat; the test proves nothing")
 	}
-	if logs.contains("idle approval no longer matches") {
-		t.Fatal("a stale-connection heartbeat was reported as an approval mismatch")
+	if logs.contains("RH05 idle inventory heartbeat rejected") {
+		t.Fatal("a stale-connection heartbeat was reported as a rejection")
 	}
 	if !registry.IsConnected(hostID) {
 		t.Fatal("a refused idle heartbeat dropped the agent connection")
 	}
+
+	// The current socket sends a list the inventory cannot store: refused at
+	// Warn, and the socket still carries the next message.
+	_, err = pool.Exec(ctx, `UPDATE host_journal_reconciliation SET connection_incarnation=$2::uuid
+		WHERE host_id=$1::uuid`, hostID, journalConn)
+	must(t, err)
+	must(t, ws.WriteJSON(map[string]any{"type": "heartbeat", "running_sessions": []string{strings.Repeat("x", 65)}, "ts_unix_ms": time.Now().UnixMilli()}))
+	must(t, ws.WriteJSON(map[string]any{"type": "capacity", "host": map[string]any{"cpu_cores": 11, "mem_mb": 32000}, "gpus": gpus}))
+	waitForCores(t, pool, hostID, 11)
+	if !logs.contains(hostcfg.ErrIdleInventoryInvalid.Error()) {
+		t.Fatal("an invalid session list was not refused")
+	}
+	if !registry.IsConnected(hostID) {
+		t.Fatal("a refused idle heartbeat dropped the agent connection")
+	}
+
 	var state string
 	var detail *string
 	must(t, pool.QueryRow(ctx, `SELECT state,state_detail FROM sessions WHERE id=$1::uuid`, sessionID).Scan(&state, &detail))
@@ -144,6 +159,17 @@ func TestRejectedIdleHeartbeatKeepsSocketAndStartingSession(t *testing.T) {
 		err := pool.QueryRow(ctx, `SELECT state,state_detail FROM sessions WHERE id=$1::uuid`, sessionID).Scan(&state, &d)
 		return err == nil && state == "failed" && d != nil && *d == "host_lost"
 	})
+}
+
+// seedEnrollmentToken mints an unbound enrollment token so a test agent can
+// register through the real handler.
+func seedEnrollmentToken(t *testing.T, pool *pgxpool.Pool, token string) {
+	t.Helper()
+	sum := sha256.Sum256([]byte(token))
+	_, err := pool.Exec(context.Background(), `INSERT INTO host_enrollments (token_hash, created_by, node_name, max_uses, expires_at, note)
+		VALUES ($1, NULL, NULL, 10, NULL, 'test fixture')
+		ON CONFLICT (token_hash) DO UPDATE SET used_count=0, revoked_at=NULL, expires_at=NULL`, hex.EncodeToString(sum[:]))
+	must(t, err)
 }
 
 func waitForCores(t *testing.T, pool *pgxpool.Pool, hostID string, want int) {

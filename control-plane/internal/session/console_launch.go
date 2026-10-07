@@ -146,11 +146,12 @@ func checkConsoleTopology(videoTopology string) error {
 	return fmt.Errorf("invalid console video topology %q: a console session is %q", videoTopology, console.ConsoleVideoTopology)
 }
 
-// StopConsoleSession is a thin wrapper over the normal Stop teardown, so console
-// auto-stop gets the same agent-dispatch and reservation-release behaviour as
-// DELETE /v1/sessions/{id}. Satisfies agentws.Events.
+// StopConsoleSession is the normal Stop teardown without its ack wait. Its
+// callers run on the agent's read loop, the loop that would read that ack, so
+// the wait could only time out (#477); the agent's terminal session_state
+// confirms the stop. Satisfies agentws.Events.
 func (c *Coordinator) StopConsoleSession(ctx context.Context, sessionID, reason string) error {
-	_, err := c.Stop(ctx, sessionID, reason)
+	_, err := c.stop(ctx, sessionID, reason, false)
 	return err
 }
 
