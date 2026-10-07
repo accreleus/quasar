@@ -73,7 +73,8 @@ func selfHealHandler(t *testing.T) (*Handler, *pgxpool.Pool, *selfHealEvents) {
 	return h, pool, ev
 }
 
-// seedConsoleApp inserts an app for a console's default_app. direct sets
+// seedConsoleApp inserts a desktop app for a console's default_app (only desktops and
+// launchers are offered). direct sets
 // runtime_spec.direct_display, which amendment 19 requires before the
 // control plane auto-starts a console session with it.
 func seedConsoleApp(t *testing.T, pool *pgxpool.Pool, direct bool) string {
@@ -84,7 +85,7 @@ func seedConsoleApp(t *testing.T, pool *pgxpool.Pool, direct bool) string {
 	}
 	var id string
 	if err := pool.QueryRow(context.Background(),
-		`INSERT INTO apps(name, runtime_spec) VALUES ($1, $2::jsonb) RETURNING id::text`,
+		`INSERT INTO apps(name, kind, runtime_spec) VALUES ($1, 'desktop', $2::jsonb) RETURNING id::text`,
 		"console-app-"+t.Name(), spec).Scan(&id); err != nil {
 		t.Fatalf("seed console app: %v", err)
 	}
