@@ -232,14 +232,21 @@ generate new credentials: the database expects the old password.
 
 ## Adding a GPU host
 
-The command from Admin, Fleet, Enroll host still works. It installs an agent-only
-Compose project in `/opt/quasar-agent` (agent, updater, and a mode-0600 `.env`
-with the enrollment string). Re-running it updates that agent.
+Add hosts the current way: **Fleet ▸ Hosts ▸ Add host**. It mints a single-use
+enrollment token and prints a one-line installer (`sh enroll-host.sh` from the
+control plane's own `/enroll-host.sh`) to run as root on the new machine, plus
+the same seed as a one-service Compose stack for Dockge or Arcane on its second
+tab, including the control plane's certificate and the NVIDIA-specific grants.
+The installer checks the host and applies its fixes before it starts the seed;
+for a machine that then takes the stack by hand, `sh enroll-host.sh
+--fix-only` prepares it and stops. See [Upgrading, backing up, and rolling
+back](/quasar/operations/upgrading/), "Replacing an install made from the
+Compose files".
 
-For a manual install, from a checkout at your release's tag, run
-`sh deploy/enroll-host.sh --print-compose` (and `--print-nvidia-overlay` for
-NVIDIA). Put the output in a directory with a `.env` setting `QUASAR_ENROLLMENT`,
-`NODE_NAME`, `QUASAR_HOME_ROOT` and `QUASAR_AGENT_IMAGE`, then `docker compose up -d`.
+`sh deploy/enroll-host.sh --print-compose` and `--print-nvidia-overlay`, named
+by this page in the past, no longer exist; `--help` lists the sub-commands the
+script takes today (`--fix`, `--fix-only`, `--reset-identity`,
+`--print-apparmor-profile`).
 
 ## Health and logs
 
