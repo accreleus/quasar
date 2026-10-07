@@ -44,8 +44,12 @@ type CreateParams struct {
 	// veto would permanently kill the local console with only an error log. The
 	// cert bench must NOT set it — a VRAM-pressured host is a real finding.
 	SkipVramVeto bool
-	TokenHash    string
-	TokenExpires time.Time
+	// NoHomeSettleWait refuses a settling home hold at once (#477). Console
+	// auto-start only: it runs on the agent's read loop, the path the clearing
+	// proof arrives on, so the wait cannot succeed; the next capacity retries.
+	NoHomeSettleWait bool
+	TokenHash        string
+	TokenExpires     time.Time
 	// The EFFECTIVE runtime app's opt-in to persistent home storage (P5-02); true
 	// makes scheduleAttempt enforce the P5-04 single-writer guard. Must come from
 	// LaunchApp.ManagedHome, never apps.managed_home: a tile's own column is false
@@ -162,7 +166,7 @@ func (s *Store) ScheduleAndCreate(ctx context.Context, p CreateParams) (Session,
 	for {
 		sess, err := s.schedulePlacement(ctx, p)
 		var settling *homeHoldSettlingError
-		if errors.As(err, &settling) {
+		if errors.As(err, &settling) && !p.NoHomeSettleWait {
 			if settleUntil.IsZero() {
 				settleUntil = time.Now().Add(homeHoldSettleWait)
 			}

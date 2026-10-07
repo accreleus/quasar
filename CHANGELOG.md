@@ -60,6 +60,7 @@ own; the two do not move together, and that is deliberate.
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
 
 ### Fixed
+- **Console auto-start no longer stalls the agent connection on a reconnect (#477).** After an agent reconnect that ended a console launch, auto-start waited 10 s for the old session's managed home to be released. The agent's proof that releases it comes in on that same connection, and nothing on the connection was read during the wait, so every attempt ran out and logged "managed home location requires repair". Auto-start now skips the wait, logs that the home is still held by the previous session, and launches on the next capacity report once the proof arrives. A heartbeat from a replaced agent socket is now ignored instead of being logged as "idle approval no longer matches reviewed policy": it never involved an approval and never closed the connection.
 - **A rootless console on an SELinux host had no keyboard, mouse or sound (#460).** The
   console session runs as `container_engine_t`, and the policy denied it the input nodes,
   the sound nodes and the udev database, so the desktop started with no input at all.
