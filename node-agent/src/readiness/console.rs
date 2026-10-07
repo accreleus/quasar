@@ -66,9 +66,9 @@ pub struct ConsoleView {
     pub enabled: bool,
     /// The engine is rootless: host preparation runs with `--mode rootless`.
     pub rootless: bool,
-    /// The streamed apps here can open a card node, so one may hold the display
-    /// (`container::streamed_cards_openable`, #464).
-    pub streamed_cards_openable: bool,
+    /// Why streamed apps here can open a card node and so hold the display, if they can
+    /// (`container::streamed_card_gap`, #464).
+    pub streamed_card_gap: Option<&'static str>,
     pub card: CardView,
     pub input: InputView,
     pub sound: SoundView,
@@ -359,9 +359,7 @@ impl ConsoleView {
         ConsoleView {
             enabled,
             rootless,
-            streamed_cards_openable: crate::session::container::streamed_cards_openable(
-                nvidia, rootless,
-            ),
+            streamed_card_gap: crate::session::container::streamed_card_gap(nvidia, rootless),
             card: CardView::observe(config.output_id.as_deref()),
             input: InputView::observe(&config.input_devices),
             sound: SoundView::observe(
@@ -423,13 +421,14 @@ pub fn check_card(v: &ConsoleView) -> ReadinessCheck {
                     .holder
                     .clone()
                     .unwrap_or_else(|| "another program".into());
-                let streamed = if v.streamed_cards_openable {
-                    "Streamed apps on this host can open the card too (NVIDIA's container \
-                     toolkit or a rootless engine grants it), so a streamed app may hold it: \
-                     end that session."
-                } else {
-                    "Streamed apps on this host are given the card for enumeration only and \
-                     cannot hold it."
+                let streamed = match v.streamed_card_gap {
+                    Some(why) => format!(
+                        "Streamed apps on this host can open the card too ({why}), so a \
+                         streamed app may hold it: end that session."
+                    ),
+                    None => "Streamed apps on this host are given the card for enumeration \
+                             only and cannot hold it."
+                        .into(),
                 };
                 return super::fail(
                     CHECK_CARD,
@@ -444,11 +443,19 @@ pub fn check_card(v: &ConsoleView) -> ReadinessCheck {
         }
     }
     let nodes: Vec<&str> = v.card.cards.iter().map(|(n, _)| n.as_str()).collect();
+    // The per-engine guarantee, said before a conflict rather than only after one.
+    let streamed = match v.streamed_card_gap {
+        Some(why) => format!(
+            "streamed apps here can open the card too ({why}), so the console session holds \
+             the display only by starting first"
+        ),
+        None => "streamed apps here get the card for enumeration only and cannot take it".into(),
+    };
     if v.card.cards.iter().any(|(_, a)| *a == CardAccess::Claimed) {
         return super::pass(
             CHECK_CARD,
             format!(
-                "the console session's desktop holds the display on {}",
+                "the console session's desktop holds the display on {}; {streamed}",
                 nodes.join(", ")
             ),
         );
@@ -456,7 +463,8 @@ pub fn check_card(v: &ConsoleView) -> ReadinessCheck {
     super::pass(
         CHECK_CARD,
         format!(
-            "{} can be passed to the console desktop, and no other program holds the display",
+            "{} can be passed to the console desktop, and no other program holds the display; \
+             {streamed}",
             nodes.join(", ")
         ),
     )
@@ -737,7 +745,7 @@ mod tests {
         ConsoleView {
             enabled: true,
             rootless: true,
-            streamed_cards_openable: true,
+            streamed_card_gap: Some("a rootless engine applies no device cgroup"),
             card: CardView {
                 cards: vec![("/dev/dri/card1".into(), CardAccess::Free)],
                 holder: None,
@@ -868,7 +876,7 @@ mod tests {
             "a streamed app may hold it",
         );
         // #464: a rootful engine without NVIDIA gives streamed apps the card mknod-only.
-        held.streamed_cards_openable = false;
+        held.streamed_card_gap = None;
         let fixed = check_card(&held);
         assert_fail(
             &fixed,
@@ -883,6 +891,25 @@ mod tests {
             "no display card node",
             "turn console mode off and on again",
         );
+        // #464: the pass text states the per-engine guarantee before any conflict.
+        let mut nvidia = on();
+        nvidia.streamed_card_gap = crate::session::container::streamed_card_gap(true, false);
+        let open = check_card(&nvidia);
+        assert_eq!(open.status, PASS, "{open:?}");
+        assert!(
+            open.summary.contains("NVIDIA's container toolkit"),
+            "{open:?}"
+        );
+        assert!(open.summary.contains("only by starting first"), "{open:?}");
+        let mut rootful = on();
+        rootful.streamed_card_gap = None;
+        assert!(check_card(&rootful)
+            .summary
+            .contains("for enumeration only and cannot take it"));
+        rootful.card.cards = vec![("/dev/dri/card1".into(), CardAccess::Claimed)];
+        assert!(check_card(&rootful)
+            .summary
+            .contains("for enumeration only and cannot take it"));
         // The console session's own desktop holding it is the point, not a fault.
         let claimed = check_card(&with(CardAccess::Claimed));
         assert_eq!(claimed.status, PASS, "{claimed:?}");

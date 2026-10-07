@@ -443,13 +443,22 @@ fn group_add(intent: &ApplicationIntent) -> &Vec<String> {
         .unwrap_or(&intent.request.group_add)
 }
 
-/// Why the request's mknod-only cards are created openable on this engine, if they are.
+/// Why the app's card nodes open on this engine, if they do: it is given the whole
+/// `/dev/dri` (a streamed app on an NVIDIA host), or mknod-only cards the engine cannot
+/// hold, which are then created openable.
 fn cards_openable(
     rootless: bool,
     injection: Option<GpuInjection>,
     request: &ApplicationRequest,
 ) -> Option<&'static str> {
-    match card_grant(rootless, injection) {
+    let grant = card_grant(rootless, injection);
+    if request.devices.iter().any(|d| d == "/dev/dri") {
+        return Some(match grant {
+            CardGrant::Openable(why) => why,
+            CardGrant::MknodOnly => "the app is given the whole /dev/dri",
+        });
+    }
+    match grant {
         CardGrant::Openable(why) if !request.mknod_only_cards.is_empty() => Some(why),
         _ => None,
     }
@@ -2656,7 +2665,8 @@ mod app_identity_tests {
 
     /// #464: a streamed app's card nodes on every engine. A rootful Docker or Podman holds
     /// them to mknod; NVIDIA's toolkit (the `--gpus` hook and CDI) and a rootless engine
-    /// cannot, so there the card is openable and the journal says so.
+    /// cannot, so there the card is openable and the journal says so, the whole `/dev/dri`
+    /// of an NVIDIA host included.
     #[test]
     fn a_streamed_apps_card_is_mknod_only_where_the_engine_can_hold_it() {
         use crate::session::container::streamed_gpu_args_for_test as streamed;
@@ -2717,7 +2727,7 @@ mod app_identity_tests {
                 false,
                 Some(DeviceRequest),
                 &directory,
-                false,
+                true,
             ),
             (
                 "Podman with CDI",
@@ -2726,7 +2736,7 @@ mod app_identity_tests {
                 false,
                 Some(Cdi),
                 &directory,
-                false,
+                true,
             ),
             (
                 "rootless Podman with CDI",
@@ -2735,7 +2745,7 @@ mod app_identity_tests {
                 true,
                 Some(Cdi),
                 &directory,
-                false,
+                true,
             ),
             (
                 "no GPU",
@@ -2774,6 +2784,29 @@ mod app_identity_tests {
             assert!(
                 cards_openable(false, Some(injection), &asked).is_some(),
                 "{injection:?}"
+            );
+        }
+    }
+
+    /// #464: what readiness tells the admin (`container::streamed_card_gap`) is what the
+    /// engine journals and logs for the streamed grant, on every engine.
+    #[test]
+    fn readiness_and_the_engine_agree_on_whether_a_streamed_card_opens() {
+        use crate::session::container::{streamed_card_gap, streamed_gpu_args_for_test};
+        use GpuInjection::{Cdi, DeviceRequest};
+        for (nvidia, rootless, injection) in [
+            (false, false, None),
+            (false, true, None),
+            (true, false, Some(DeviceRequest)),
+            (true, false, Some(Cdi)),
+            (true, true, Some(Cdi)),
+        ] {
+            let request =
+                argv_request(streamed_gpu_args_for_test(nvidia, &["card0", "renderD128"]));
+            assert_eq!(
+                cards_openable(rootless, injection, &request),
+                streamed_card_gap(nvidia, rootless),
+                "nvidia={nvidia} rootless={rootless} {injection:?}"
             );
         }
     }

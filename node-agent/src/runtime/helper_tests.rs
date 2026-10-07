@@ -6500,6 +6500,18 @@ fn a_streamed_apps_card_is_mknod_only_on_a_rootful_engine_and_openable_rootless(
         json!(true)
     );
 
+    // An NVIDIA host's whole /dev/dri is journalled as openable too.
+    let engine = Engine::new();
+    engine
+        .client()
+        .start_application(nvidia_app("card-nvidia"))
+        .wait()
+        .unwrap();
+    assert_eq!(
+        application_journal(&engine, "card-nvidia")["cards_openable"],
+        json!(true)
+    );
+
     let engine = Engine::new();
     engine.state.lock().unwrap().host_devices_override = Some(json!([render, card("rwm")]));
     assert_eq!(

@@ -84,8 +84,9 @@ allows, it can't open it.
 | NVIDIA GPU, any engine | Yes, if it starts first. NVIDIA's container toolkit always gives it the card. |
 | Rootless Docker or Podman | Yes, if it starts first. A rootless engine can't restrict the card. |
 
-Where it can, start the console session first. If a streamed game holds the screen,
-`console_card` says so: end that session.
+Where it can, start the console session first. `console_card` says which case your
+host is in, and names a streamed game that holds the screen: end that session. A host
+wrongly detected as NVIDIA gets the NVIDIA row; set `QUASAR_GPU_NVIDIA=0` on its agent.
 
 ## The console terminal
 
@@ -144,7 +145,7 @@ session.
 
 | Check | What it reports |
 | --- | --- |
-| `console_card` | The console card can be passed in and nothing else holds the display. Names what holds it. |
+| `console_card` | The console card can be passed in and nothing else holds the display. Names what holds it, and says whether streamed games here can take it. |
 | `console_input` | The allowed input devices exist and the `quasar` account can open them. |
 | `console_sound` | The sound device can be passed in. |
 | `console_terminal` | `tty8` can be held for the session. |

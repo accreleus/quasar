@@ -532,7 +532,9 @@ pub(crate) fn streamed_gpu_args_for_test(nvidia: bool, nodes: &[&str]) -> Vec<St
             gid: 0,
         })
         .collect();
-    app_gpu_access(nvidia, None, &nodes).session_args("", &[])
+    app_gpu_access(nvidia, None, &nodes)
+        .session_args("", &[])
+        .expect("a streamed GPU grant")
 }
 
 fn parse_size(value: &str) -> Result<i64> {
@@ -1242,7 +1244,7 @@ impl ContainerRuntime {
                 }
             }
             let access = self.app_gpu_access_with(gated_volume);
-            if let (None, StreamedDri::Nodes { cards, .. }) = (direct, &access.dri) {
+            if let (None, Some(StreamedDri::Nodes { cards, .. })) = (direct, &access.dri) {
                 if !cards.is_empty() {
                     tracing::info!(
                         token = "app-card-nodes-mknod-only",
@@ -1255,8 +1257,8 @@ impl ContainerRuntime {
             let lib32 = nvidia_lib32_mount_args(&lib32);
             args.extend(match direct {
                 // The console GPU's own nodes come from the console plan.
-                Some(_) => access.args(&image_ld, &lib32, false),
-                None => access.session_args(&image_ld, &lib32),
+                Some(_) => access.args(&image_ld, &lib32, None),
+                None => access.session_args(&image_ld, &lib32)?,
             });
         }
 
@@ -1682,13 +1684,22 @@ pub struct AppGpuAccess {
     driver_volume: Option<VolumeInfo>,
     /// Non-zero, ascending and distinct, as the GPU probe profile requires.
     dri_groups: Vec<u32>,
-    dri: StreamedDri,
+    /// `None` on a host with no NVIDIA GPU whose agent lists no DRM node: a streamed app is
+    /// refused there ([`DRI_UNLISTED`]).
+    dri: Option<StreamedDri>,
 }
+
+/// Why a streamed app is refused on a host with no NVIDIA GPU whose agent lists no DRM node
+/// (#464): the whole directory would hand it every card node openable.
+const DRI_UNLISTED: &str = "this agent lists no DRM node in /dev/dri, so a streamed app cannot \
+     be given its render nodes and its card nodes mknod-only, and the whole directory would let \
+     it take the display; give the agent the host's /dev/dri (token=dri-node-stat-failed names \
+     a node it could not read)";
 
 /// What a streamed app is given of `/dev/dri` (#464).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StreamedDri {
-    /// The whole directory, every card node openable.
+    /// NVIDIA only: the whole directory, every card node openable.
     Directory,
     /// Each render node, and each card node mknod-only: libdrm still lists the GPU's
     /// primary node, without which radv enumerates no GPU and gamescope refuses it, and no
@@ -1701,9 +1712,12 @@ enum StreamedDri {
 }
 
 /// NVIDIA keeps the directory: its container toolkit grants the card node read-write
-/// whatever is asked (the `--gpus` hook and CDI alike). So does a host whose nodes the
-/// agent cannot list, where the engine resolves the directory on the host as before.
-fn streamed_dri(nvidia: bool, nodes: &[DrmNodeOwner]) -> StreamedDri {
+/// whatever is asked (the `--gpus` hook and CDI alike). Elsewhere an empty listing is no
+/// grant at all, never the directory: the agent cannot have checked what it would give.
+fn streamed_dri(nvidia: bool, nodes: &[DrmNodeOwner]) -> Option<StreamedDri> {
+    if nvidia {
+        return Some(StreamedDri::Directory);
+    }
     let paths = |prefix: &str| {
         let mut paths: Vec<String> = nodes
             .iter()
@@ -1715,17 +1729,19 @@ fn streamed_dri(nvidia: bool, nodes: &[DrmNodeOwner]) -> StreamedDri {
         paths
     };
     let (render, cards) = (paths("renderD"), paths("card"));
-    if nvidia || (render.is_empty() && cards.is_empty()) {
-        return StreamedDri::Directory;
-    }
-    StreamedDri::Nodes { render, cards }
+    (!render.is_empty() || !cards.is_empty()).then_some(StreamedDri::Nodes { render, cards })
 }
 
-/// Whether a streamed app on this host can open a card node, and so take the display
-/// before a console desktop does: NVIDIA keeps the whole directory ([`streamed_dri`]), and
-/// a rootless engine holds no card to mknod (`dialect::card_grant`).
-pub fn streamed_cards_openable(nvidia: bool, rootless: bool) -> bool {
-    nvidia || rootless
+/// Why a streamed app on this host can open a card node, and so take the display before a
+/// console desktop does, if it can: NVIDIA keeps the whole directory ([`streamed_dri`]), and
+/// a rootless engine holds no card to mknod. The engine's own decision at launch is
+/// `runtime::card_grant`; either NVIDIA injection widens the card the same way.
+pub fn streamed_card_gap(nvidia: bool, rootless: bool) -> Option<&'static str> {
+    let injection = nvidia.then_some(crate::runtime::GpuInjection::Cdi);
+    match crate::runtime::card_grant(rootless, injection) {
+        crate::runtime::CardGrant::Openable(why) => Some(why),
+        crate::runtime::CardGrant::MknodOnly => None,
+    }
 }
 
 impl StreamedDri {
@@ -1781,17 +1797,18 @@ impl AppGpuAccess {
         &self,
         image_ld_library_path: &str,
         nvidia_lib32_mount: &[String],
-    ) -> Vec<String> {
-        self.args(image_ld_library_path, nvidia_lib32_mount, true)
+    ) -> Result<Vec<String>> {
+        let dri = self.dri.as_ref().ok_or_else(|| anyhow!(DRI_UNLISTED))?;
+        Ok(self.args(image_ld_library_path, nvidia_lib32_mount, Some(dri)))
     }
 
-    /// [`Self::session_args`], with `streamed` choosing whether the streamed DRM grant is
-    /// passed (a console session's nodes come from its plan).
+    /// [`Self::session_args`], with `streamed` the streamed DRM grant to pass, if any (a
+    /// console session's nodes come from its plan).
     fn args(
         &self,
         image_ld_library_path: &str,
         nvidia_lib32_mount: &[String],
-        streamed: bool,
+        streamed: Option<&StreamedDri>,
     ) -> Vec<String> {
         let mut args = Vec::new();
         if self.nvidia {
@@ -1805,8 +1822,8 @@ impl AppGpuAccess {
             ));
         }
         // AMD/Intel, and NVIDIA's render node for Vulkan/EGL, all want the DRM nodes.
-        if streamed {
-            args.extend(self.dri.args());
+        if let Some(dri) = streamed {
+            args.extend(dri.args());
         }
         args.extend(self.group_add_args());
         args
@@ -1829,13 +1846,15 @@ impl AppGpuAccess {
     /// the container toolkit provisions no volume, and the device request is the only
     /// thing that gives the container an EGL stack — a probe without it fails on a host
     /// where a real session succeeds.
+    ///
+    /// Refused where [`Self::session_args`] is, for the same reason.
     pub fn probe_run(
         &self,
         entrypoint: Vec<String>,
         command: Vec<String>,
-    ) -> crate::runtime::GpuProbeRun {
-        let (devices, mknod_only_cards) = self.dri.probe_devices();
-        crate::runtime::GpuProbeRun {
+    ) -> Result<crate::runtime::GpuProbeRun, &'static str> {
+        let (devices, mknod_only_cards) = self.dri.as_ref().ok_or(DRI_UNLISTED)?.probe_devices();
+        Ok(crate::runtime::GpuProbeRun {
             entrypoint,
             command,
             devices,
@@ -1843,7 +1862,7 @@ impl AppGpuAccess {
             groups: self.dri_groups.clone(),
             nvidia_device_request: self.nvidia,
             nvidia: self.driver_volume.as_ref().and_then(nvidia_driver_access),
-        }
+        })
     }
 }
 
@@ -2666,7 +2685,9 @@ mod tests {
     fn dri_group_add_covers_every_node_the_app_cannot_open_otherwise() {
         let group_add = |nodes: &[DrmNodeOwner]| {
             flag_values(
-                &app_gpu_access(false, None, nodes).session_args("", &[]),
+                &app_gpu_access(false, None, nodes)
+                    .session_args("", &[])
+                    .unwrap(),
                 "--group-add",
             )
         };
@@ -2696,7 +2717,7 @@ mod tests {
         ])
         .is_empty());
 
-        assert!(group_add(&[]).is_empty());
+        assert!(granted_dri_gids(&[]).is_empty());
     }
 
     /// Readiness predicts app access with this same predicate; a divergence is how the
@@ -2785,11 +2806,21 @@ mod tests {
         ];
         for (label, nvidia, volume, nodes) in cases {
             let access = app_gpu_access(nvidia, volume, &nodes);
-            let session = access.session_args("/image/lib", &[]);
-            let probe = access.probe_run(
-                vec!["/usr/bin/timeout".into()],
-                vec!["20s".into(), "/usr/local/bin/quasar-node-agent".into()],
-            );
+            let (session, probe) = match (
+                access.session_args("/image/lib", &[]),
+                access.probe_run(
+                    vec!["/usr/bin/timeout".into()],
+                    vec!["20s".into(), "/usr/local/bin/quasar-node-agent".into()],
+                ),
+            ) {
+                (Ok(session), Ok(probe)) => (session, probe),
+                // #464: refused alike, for the same reason.
+                (Err(session), Err(probe)) => {
+                    assert_eq!(session.to_string(), probe, "{label}");
+                    continue;
+                }
+                other => panic!("{label}: one realization was refused: {other:?}"),
+            };
 
             assert_eq!(
                 flag_values(&session, "--group-add"),
@@ -2872,7 +2903,9 @@ mod tests {
     #[test]
     fn an_nvidia_host_without_a_driver_volume_still_gives_the_probe_the_device_request() {
         let access = app_gpu_access(true, None, &[node("renderD128", 0o660, 991)]);
-        let probe = access.probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()]);
+        let probe = access
+            .probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()])
+            .unwrap();
         assert!(
             probe.nvidia_device_request,
             "the toolkit path must still request the GPU"
@@ -2881,7 +2914,7 @@ mod tests {
             probe.nvidia.is_none(),
             "there is no Quasar driver volume to mount on this host"
         );
-        assert!(flag_values(&access.session_args("/image/lib", &[]), "--gpus") == ["all"]);
+        assert!(flag_values(&access.session_args("/image/lib", &[]).unwrap(), "--gpus") == ["all"]);
     }
 
     /// The driver-volume host keeps both halves: the device request and the volume.
@@ -2893,7 +2926,9 @@ mod tests {
             Some(volume(dir.path(), Some("quasar-nvidia-driver"), None)),
             &[node("renderD128", 0o660, 991)],
         );
-        let probe = access.probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()]);
+        let probe = access
+            .probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()])
+            .unwrap();
         assert!(probe.nvidia_device_request);
         assert!(probe.nvidia.is_some());
     }
@@ -2904,7 +2939,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for volume_info in [None, Some(volume(dir.path(), Some("stale"), None))] {
             let access = app_gpu_access(false, volume_info, &[node("renderD128", 0o660, 991)]);
-            let probe = access.probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()]);
+            let probe = access
+                .probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()])
+                .unwrap();
             assert!(!probe.nvidia_device_request);
             assert!(probe.nvidia.is_none());
         }
@@ -2928,13 +2965,15 @@ mod tests {
                 dri_groups,
                 dri,
             } = &access;
-            let probe = access.probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()]);
+            let probe = access
+                .probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()])
+                .unwrap();
             assert_eq!(*nvidia, probe.nvidia_device_request);
             assert_eq!(driver_volume.is_some(), probe.nvidia.is_some());
             assert_eq!(*dri_groups, probe.groups);
             assert_eq!(
-                dri.probe_devices(),
-                (probe.devices.clone(), probe.mknod_only_cards.clone()),
+                dri.as_ref().map(StreamedDri::probe_devices),
+                Some((probe.devices.clone(), probe.mknod_only_cards.clone())),
                 "nvidia={vendor_nvidia}"
             );
         }
@@ -2946,7 +2985,7 @@ mod tests {
     /// host whose nodes the agent cannot list.
     #[test]
     fn a_streamed_app_gets_its_cards_mknod_only_except_on_nvidia() {
-        let cases: [(&str, bool, &[&str], &[&str]); 6] = [
+        let cases: [(&str, bool, &[&str], &[&str]); 5] = [
             (
                 "amd",
                 false,
@@ -2970,7 +3009,6 @@ mod tests {
                 &["renderD128"],
                 &["/dev/dri/renderD128"],
             ),
-            ("no nodes listed", false, &[], &[DRI_DIR]),
             ("nvidia", true, &["card0", "renderD128"], &[DRI_DIR]),
             ("nvidia, no nodes listed", true, &[], &[DRI_DIR]),
         ];
@@ -3001,7 +3039,35 @@ mod tests {
         }
         // The console takes its card from its plan, never from this grant.
         let access = app_gpu_access(false, None, &[node("card1", 0o660, 44)]);
-        assert!(flag_values(&access.args("", &[], false), "--device").is_empty());
+        assert!(flag_values(&access.args("", &[], None), "--device").is_empty());
+    }
+
+    /// #464: with no NVIDIA GPU, an agent that lists no DRM node cannot have checked what
+    /// it would grant, so a streamed app and its host probe are refused, naming why,
+    /// rather than given the whole `/dev/dri` with every card openable.
+    #[test]
+    fn an_unlisted_inventory_refuses_the_streamed_grant_instead_of_widening_it() {
+        let unlisted = app_gpu_access(false, None, &[]);
+        let refused = unlisted.session_args("", &[]).unwrap_err().to_string();
+        assert!(
+            refused.contains("lists no DRM node in /dev/dri"),
+            "{refused}"
+        );
+        assert_eq!(
+            unlisted.probe_run(Vec::new(), Vec::new()).unwrap_err(),
+            refused
+        );
+        // So readiness saying such a host's streamed apps cannot take the display is true:
+        // none is launched with a GPU at all.
+        assert_eq!(streamed_card_gap(false, false), None);
+        // NVIDIA keeps the directory whatever the agent lists (the toolkit grants the card
+        // anyway), and says so.
+        let nvidia = app_gpu_access(true, None, &[]);
+        assert_eq!(
+            flag_values(&nvidia.session_args("", &[]).unwrap(), "--device"),
+            [DRI_DIR]
+        );
+        assert!(streamed_card_gap(true, false).is_some());
     }
 
     #[test]
@@ -3037,10 +3103,10 @@ mod tests {
 
     #[test]
     fn streamed_cards_open_on_nvidia_and_rootless_hosts_only() {
-        assert!(!streamed_cards_openable(false, false));
-        assert!(streamed_cards_openable(true, false));
-        assert!(streamed_cards_openable(false, true));
-        assert!(streamed_cards_openable(true, true));
+        assert_eq!(streamed_card_gap(false, false), None);
+        assert!(streamed_card_gap(true, false).unwrap().contains("NVIDIA"));
+        assert!(streamed_card_gap(false, true).unwrap().contains("rootless"));
+        assert!(streamed_card_gap(true, true).is_some());
     }
 
     /// The realized create body depends on argv order: the 32-bit bind must precede the
@@ -3053,7 +3119,9 @@ mod tests {
             Some(volume(dir.path(), Some("quasar-nvidia-driver"), None)),
             &[node("renderD128", 0o660, 991)],
         );
-        let args = access.session_args("/image/lib", &nvidia_lib32_mount_args("/usr/lib32"));
+        let args = access
+            .session_args("/image/lib", &nvidia_lib32_mount_args("/usr/lib32"))
+            .unwrap();
         assert_eq!(
             args,
             vec![
@@ -3803,6 +3871,7 @@ mod tests {
         assert!(rt
             .app_gpu_access_live()
             .session_args("", &[])
+            .unwrap()
             .iter()
             .all(|a| !a.starts_with("type=")));
     }

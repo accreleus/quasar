@@ -289,8 +289,9 @@ pub(crate) struct ApplicationIntent {
     /// request's (a rootless engine: none); `None` is the request's own list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_cgroup_rules: Option<Vec<String>>,
-    /// #464: the engine cannot hold the request's `mknod_only_cards` to mknod
-    /// (`dialect::card_grant`), so they were created openable.
+    /// #464: the app's card nodes open: it was given the whole `/dev/dri`, or the engine
+    /// cannot hold the request's `mknod_only_cards` to mknod (`dialect::card_grant`), so
+    /// they were created openable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cards_openable: bool,
     /// On an engine that confines with SELinux the app runs as the nested-sandbox type
