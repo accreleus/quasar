@@ -297,7 +297,7 @@ grep -q 'semodule -i /etc/quasar/selinux/quasar-console-devices.cil' "$r7f/.prep
   && printf '%s' "$out7f" | grep -q 'changed  /etc/quasar/selinux/quasar-console-devices.cil' \
   && pass "--console on SELinux writes and loads the console devices module" || fail "console module" "$(cat "$r7f/.prepare-host-commands") $out7f"
 c7f="$r7f/$cil7f"
-grep -qxF '(allow container_engine_t device_t (dir (getattr open read search)))' "$c7f" \
+grep -qxF '(allow container_engine_t device_t (dir (getattr open read search watch)))' "$c7f" \
   && grep -qxF '(allow container_engine_t event_device_t (chr_file (getattr ioctl lock map open read write append)))' "$c7f" \
   && grep -qxF '(allow container_engine_t sound_device_t (chr_file (getattr ioctl lock map open read write append)))' "$c7f" \
   && grep -qxF '(allow container_engine_t usb_device_t (chr_file (getattr ioctl lock map open read write append)))' "$c7f" \

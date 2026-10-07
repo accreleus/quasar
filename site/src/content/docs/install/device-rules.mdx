@@ -52,7 +52,7 @@ nodes Steam Input reads, and the udev database. SELinux stays enforcing. By hand
 
 ```bash
 cat > quasar-console-devices.cil <<'EOF'
-(allow container_engine_t device_t (dir (getattr open read search)))
+(allow container_engine_t device_t (dir (getattr open read search watch)))
 (allow container_engine_t event_device_t (chr_file (getattr ioctl lock map open read write append)))
 (allow container_engine_t sound_device_t (chr_file (getattr ioctl lock map open read write append)))
 (allow container_engine_t usb_device_t (chr_file (getattr ioctl lock map open read write append)))

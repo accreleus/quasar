@@ -65,7 +65,8 @@ own; the two do not move together, and that is deliberate.
   the sound nodes and the udev database, so the desktop started with no input at all.
   `prepare-host.sh --console` now loads a small `quasar-console-devices` SELinux module
   that allows exactly those (and the `hidraw` nodes Steam Input reads); SELinux stays
-  enforcing. Run host preparation again with `--console` on an SELinux console host.
+  enforcing (including the inotify watch PipeWire puts on `/dev/snd`, without which the desktop
+  found no sound card). Run host preparation again with `--console` on an SELinux console host.
 - **A rootless console desktop had no sound (#460).** The console plan passed `--device /dev/snd`, which rootless Podman realizes as a bind over an empty regular file per node, so `readdir` listed every sound node as a regular file and PipeWire's ALSA monitor counted "0 PCM device(s)" and ignored the card, leaving only a Dummy Output. The console container now gets `/dev/snd` as a read-only directory bind, like `/dev/input`, plus the device-cgroup rule `c 116:* rwm` (a USB sound card plugged in later opens on rootful engines; a rootless engine drops the rule as it does the input one).
 - **A Steam library tile can no longer be set as the console's default app (#453).** The
   console page's default-app list and the `console_default_app` readiness check treated a

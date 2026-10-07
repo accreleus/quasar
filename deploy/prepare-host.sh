@@ -605,13 +605,15 @@ fi
 # which is device_t), the sound nodes (sound_device_t), the hidraw nodes Steam Input reads
 # (usb_device_t) and the udev database libudev reads (udev_var_run_t). Without them KWin
 # starts with no keyboard or mouse. The display cards (dri_device_t) are already allowed by
-# the boolean above. One module names exactly these, and only when --console asks for them.
+# the boolean above. `watch` on the device directories is PipeWire's inotify on /dev/snd: without
+# it the ALSA monitor fails and the desktop has no sound card. One module names exactly these,
+# and only when --console asks for them.
 STEP="SELinux console devices"
 console_cil="/etc/quasar/selinux/quasar-console-devices.cil"
 if [ "$CONSOLE" = 1 ]; then
   if containers_selinux; then
     selinux_module quasar-console-devices "; Written by Quasar host preparation (deploy/prepare-host.sh --console).
-(allow container_engine_t device_t (dir (getattr open read search)))
+(allow container_engine_t device_t (dir (getattr open read search watch)))
 (allow container_engine_t event_device_t (chr_file (getattr ioctl lock map open read write append)))
 (allow container_engine_t sound_device_t (chr_file (getattr ioctl lock map open read write append)))
 (allow container_engine_t usb_device_t (chr_file (getattr ioctl lock map open read write append)))
