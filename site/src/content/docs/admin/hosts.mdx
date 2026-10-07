@@ -221,3 +221,8 @@ shared storage, not just the same path; otherwise use `locality` placement.
 New launches use the new directory; existing homes stay at the old path until you
 move them. To users, it looks like their saves vanished.
 </Aside>
+
+Throwaway agent homes (`agent-<hex>-<hex>`) are swept on their host so the home
+root doesn't fill the disk: idle 72 hours by default (`QUASAR_HOMES_GC_RETENTION_HOURS`),
+on by default, `QUASAR_HOMES_GC_DRY_RUN=1` to preview the deletions first. See
+[Environment variables](/quasar/reference/environment/).
