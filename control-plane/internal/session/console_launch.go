@@ -23,7 +23,7 @@ import (
 var ErrConsoleAppNotDirect = errors.New("console app cannot run direct: its runtime spec does not declare direct_display")
 
 // ErrConsoleHomeSettling: a settling home hold (homeHoldRefusal), not a repair
-// case. Auto-start does not wait for it; the next capacity report retries.
+// case. Auto-start does not wait for it; the agent's cleanup proof re-runs it.
 var ErrConsoleHomeSettling = errors.New("managed home still held by the previous session until the agent confirms its cleanup")
 
 // LaunchConsoleSession launches one pinned console session on hostID, owned by
@@ -147,9 +147,9 @@ func checkConsoleTopology(videoTopology string) error {
 }
 
 // StopConsoleSession is the normal Stop teardown without its ack wait. Its
-// callers run on the agent's read loop, the loop that would read that ack, so
-// the wait could only time out (#477); the agent's terminal session_state
-// confirms the stop. Satisfies agentws.Events.
+// capacity-path callers run on the agent's read loop, the loop that would read
+// that ack, so the wait could only time out (#477); the agent's terminal
+// session_state confirms the stop. Satisfies agentws.Events.
 func (c *Coordinator) StopConsoleSession(ctx context.Context, sessionID, reason string) error {
 	_, err := c.stop(ctx, sessionID, reason, false)
 	return err

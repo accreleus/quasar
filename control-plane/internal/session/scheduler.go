@@ -46,7 +46,7 @@ type CreateParams struct {
 	SkipVramVeto bool
 	// NoHomeSettleWait refuses a settling home hold at once (#477). Console
 	// auto-start only: it runs on the agent's read loop, the path the clearing
-	// proof arrives on, so the wait cannot succeed; the next capacity retries.
+	// proof arrives on, so the wait cannot succeed. The proof re-runs auto-start.
 	NoHomeSettleWait bool
 	TokenHash        string
 	TokenExpires     time.Time
