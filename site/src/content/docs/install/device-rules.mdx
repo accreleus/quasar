@@ -71,7 +71,11 @@ On an SELinux host, an app that needs the nested-sandbox type (`container_engine
 sandbox) connects to its session's PulseAudio sidecar, which runs as `container_t`. The policy
 allows that connection only between containers of the same type, so without more the
 session is silent. `prepare-host.sh` loads a module, `quasar-nested-audio`, with exactly one
-rule for it. SELinux stays enforcing. By hand:
+rule for it, and SELinux stays enforcing. The rule is one permission between two types: any
+`container_engine_t` process on the host may connect to a `container_t` unix socket it can reach
+by path. Quasar mounts only the session's own sidecar directory into the app, and file labels
+and permissions still apply; an app given another session's socket directory could reach that
+session's audio. By hand:
 
 ```bash
 echo '(allow container_engine_t container_t (unix_stream_socket (connectto)))' > quasar-nested-audio.cil

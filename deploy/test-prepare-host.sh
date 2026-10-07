@@ -423,7 +423,8 @@ out9f="$(prep "$r9f" "$tmp/docker-only" --mode rootful --engine docker --homes /
 grep -qF 'semanage fcontext -a -t container_file_t /var/lib/quasar/h(/.*)?' "$r9f/.prepare-host-commands" \
   && grep -qF 'semanage fcontext -a -t container_file_t /run/quasar-agent(/.*)?' "$r9f/.prepare-host-commands" \
   && grep -q 'setsebool -P container_use_xserver_devices on' "$r9f/.prepare-host-commands" \
-  && grep -q 'semodule -i' "$r9f/.prepare-host-commands" \
+  && grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil' "$r9f/.prepare-host-commands" \
+  && grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-audio.cil' "$r9f/.prepare-host-commands" \
   && grep -q SECLABEL "$r9f/etc/udev/rules.d/70-quasar.rules" \
   && grep -q 'd /run/quasar-agent 0755 root root' "$r9f/etc/tmpfiles.d/quasar.conf" \
   && pass "rootful Docker with --selinux-enabled gets the labels, boolean, module and a boot-made runtime dir" \
