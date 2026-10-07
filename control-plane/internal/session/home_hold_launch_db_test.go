@@ -208,7 +208,7 @@ func TestStuckHoldIsHomeConflictWithoutWaiting(t *testing.T) {
 
 // #477: console auto-start runs on the agent's read loop, the very path the
 // clearing proof arrives on, so it refuses a settling hold at once and names
-// it; the next capacity report relaunches once the proof has landed.
+// it; the agent's cleanup proof re-runs auto-start once it has landed.
 func TestConsoleAutoStartDoesNotWaitOutASettlingHold(t *testing.T) {
 	pool := testDB(t)
 	s := seed(t, pool, 2)
