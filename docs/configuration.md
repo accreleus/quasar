@@ -2787,8 +2787,8 @@ Images: the script resolves the stable channel's `latest` tags of `quasar-recove
 `quasar-control-plane` and `quasar-node-agent` to their registry digests on the host
 and starts the seed with those; the stack carries `@sha256:<digest>` placeholders and a
 one-line command that prints the three pins. Since 0.4.0 (#409) new owned installs
-follow the stable release channel (`QUASAR_IMAGE_TAG=o2-develop` pins the edge
-channel instead). The script checks for Docker, curl and, on a machine with an
+follow the stable release channel; the edge channel is a later choice in Fleet ▸
+Releases, not an install input. The script checks for Docker, curl and, on a machine with an
 agent, `/dev/dri`, refuses a host that still runs Compose-labelled Quasar services
 or an existing seed or recovery actor, and touches no kernel setting (it sets no
 sysctl and loads no module). It does not restart Docker or reconfigure the host's
