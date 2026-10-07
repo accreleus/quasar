@@ -233,19 +233,14 @@ generate new credentials: the database expects the old password.
 ## Adding a GPU host
 
 Add hosts the current way: **Fleet ▸ Hosts ▸ Add host**. It mints a single-use
-enrollment token and prints a one-line installer (`sh enroll-host.sh` from the
-control plane's own `/enroll-host.sh`) to run as root on the new machine, plus
-the same seed as a one-service Compose stack for Dockge or Arcane on its second
-tab, including the control plane's certificate and the NVIDIA-specific grants.
-The installer checks the host and applies its fixes before it starts the seed;
-for a machine that then takes the stack by hand, `sh enroll-host.sh
---fix-only` prepares it and stops. See [Upgrading, backing up, and rolling
-back](/quasar/operations/upgrading/), "Coming from a Compose install".
-
-`sh deploy/enroll-host.sh --print-compose` and `--print-nvidia-overlay`, named
-by this page in the past, no longer exist; `--help` lists the sub-commands the
-script takes today (`--fix`, `--fix-only`, `--reset-identity`,
-`--print-apparmor-profile`).
+enrollment token and prints a one-line installer to run as root on the new
+machine, plus the same seed as a one-service Compose stack on its Dockge or
+Arcane tab. The installer checks the host and, when you accept, applies a fix
+before it starts the seed. The stack carries only the enrollment string, so
+preparing the host, including NVIDIA, stays the one-line command's job
+(`sh enroll-host.sh --fix-only` prepares it and stops). See [Upgrading, backing
+up, and rolling back](/quasar/operations/upgrading/), "Coming from a Compose
+install".
 
 ## Health and logs
 

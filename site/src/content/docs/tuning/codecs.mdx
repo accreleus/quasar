@@ -77,10 +77,9 @@ client.
 ## Turning codecs on
 
 The codec is a property of a stream profile. Edit it in the stream profile's
-drawer under **Admin ▸ Streaming ▸ Stream profiles**; Launch profiles only
-order the rungs. The shipped profiles already include HEVC and AV1. The list is
-a preference order. H.264 can't be removed: a tier without an H.264 rung is
-rejected.
+drawer under **Admin ▸ Streaming ▸ Stream profiles**. Launch profiles order
+those rungs, best first, and that order is the preference. The shipped profiles
+already include HEVC and AV1. A launch profile with no H.264 rung is rejected.
 
 The catalog says `hevc`; the wire and session records say `h265`. Same codec.
 

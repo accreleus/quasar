@@ -107,7 +107,7 @@ host's Settings show the new root as verified and an existing save loads.
 `redeploy.sh` generates missing secrets and never overwrites existing ones.
 Hosts join with a `QUASAR_ENROLLMENT` string from Add host, or with
 `ENROLLMENT_TOKEN` set to a token minted there (the part of the string after
-its last `.`). The fleet-wide static token of pre-owned-install releases is gone.
+its last `.`).
 
 ## Setup and identity
 
@@ -126,7 +126,7 @@ its last `.`). The fleet-wide static token of pre-owned-install releases is gone
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUASAR_SECRET_KEY` | unset | Base64 of 32 bytes. Encrypts credentials stored in the admin UI. **Back it up; it can't be recovered.** |
-| `QUASAR_SECRET_KEY_PREVIOUS` | unset | Comma-separated decrypt-only predecessor keys (`<version>:<base64>`). Rotate by giving `QUASAR_SECRET_KEY` a higher version and moving the old key here; rows written under it keep decrypting while new writes use the new one. |
+| `QUASAR_SECRET_KEY_PREVIOUS` | unset | Comma-separated decrypt-only predecessor keys (`<version>:<base64>`). Rotate with `QUASAR_SECRET_KEY=2:<new-base64>` and keep the old key here as `1:<old-base64>`; rows written under it keep decrypting while new writes use the new one. |
 
 ## TLS and access
 
@@ -154,7 +154,7 @@ its last `.`). The fleet-wide static token of pre-owned-install releases is gone
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUASAR_HOME_ROOT` | unset | Fallback managed-home root. Without any root, managed-home apps can't launch. `redeploy.sh` sets `/var/lib/quasar/homes`. |
-| `QUASAR_HOMES_GC` | `1` (on) | Sweep throwaway homes (`agent-<hex>-<hex>`) past retention so the home root doesn't fill the disk. `0` disables; inert with no home root. |
+| `QUASAR_HOMES_GC` | `1` (on) | Agent. Sweep throwaway homes (`agent-` + 8 hex + `-` + 8 hex) past retention so the home root doesn't fill the disk. `0` disables; inert with no home root. |
 | `QUASAR_HOMES_GC_RETENTION_HOURS` | `72` | Hours a throwaway home must be idle before it's collectable. |
 | `QUASAR_HOMES_GC_DRY_RUN` | `0` (off) | `1` logs what would be deleted, removes nothing. |
 | `QUASAR_STORAGE_PROVIDER` | `auto` | `auto` or `local` (mount-path storage). `volume` is rejected. |
@@ -216,7 +216,7 @@ About fifteen more tuning settings exist; leave them unless you've measured a pr
 | `QUASAR_APP_PGID` | unset | Run apps as this group ID. |
 | `QUASAR_APP_PIDS_LIMIT` | `8192` | Process limit. |
 | `QUASAR_IDLE_TIMEOUT_SECS` | `120` | End idle sessions after this long. |
-| `QUASAR_CONSOLE_DISCONNECT_GRACE` | unset (never) | Console sessions: stop one once its display connector has been absent this long (a Go duration; `0` stops at once), for monitors that drop their link when powered off. Unset means never stopped for it. |
+| `QUASAR_CONSOLE_DISCONNECT_GRACE` | unset (never) | Control plane. Stop an auto-started console session once its display connector has been absent this long (a Go duration; `0` stops at once); unset never stops it. |
 
 ## Audio and microphone
 

@@ -11,7 +11,7 @@ import PortsTable from '../../../components/PortsTable.astro';
 <PortsTable />
 
 Change the published ports with `QUASAR_HTTP_PORT` and `QUASAR_TLS_PORT`
-(legacy Compose stacks: `CONTROL_PORT`). The hardened
+(legacy Compose: `CONTROL_PORT` for HTTP, `QUASAR_TLS_PORT` for HTTPS). The hardened
 Compose overlay puts Caddy on 443 and publishes no control-plane ports.
 
 ## What has to reach what

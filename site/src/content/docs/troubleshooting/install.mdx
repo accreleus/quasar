@@ -117,7 +117,7 @@ curl http://127.0.0.1:9091/health
 - `CONTROL_PLANE_URL` is right and reachable from that machine, including port 8080.
 - You used the `QUASAR_ENROLLMENT` string from **Fleet ▸ Hosts ▸ Add host**,
   or `ENROLLMENT_TOKEN` set to a token minted there (the part of the string
-  after its last `.`). The old fleet-wide static token no longer works.
+  after its last `.`).
 - The address is `wss://`. `ws://` to anything but localhost is refused unless
   `QUASAR_ALLOW_PLAINTEXT_AGENT=1`.
 

@@ -27,8 +27,8 @@ time.
 3. **Encoder compresses it.** Typically 7 to 19 ms. Above about 16 ms at 60 fps,
    it's your bottleneck.
 4. **Network carries it.**
-5. **Client buffers it.** An adaptive jitter buffer, from a tier-dependent
-   baseline down to a 50 ms floor. Automatic, no server setting.
+5. **Client buffers it.** An adaptive jitter buffer, from the rung's starting
+   buffer down toward 50 ms, never below that start. Automatic, no server setting.
 6. **Browser decodes and presents it.** Small with hardware decode, a few ms more
    for AV1 software decode.
 
