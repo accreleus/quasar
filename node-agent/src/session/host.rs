@@ -95,14 +95,13 @@ impl SessionHost {
             match PulseSidecar::start(session_id, &runtime, &cfg.runtime_dir) {
                 Ok(Some(s)) => Some(s),
                 Ok(None) => {
-                    audio_degraded = Some(
-                        "PulseAudio sidecar started but its socket never became ready".to_string(),
-                    );
+                    audio_degraded =
+                        Some("audio sidecar started but its socket never became ready".to_string());
                     None
                 }
                 Err(e) => {
                     // Audio failure must not kill video.
-                    audio_degraded = Some(format!("PulseAudio sidecar start failed: {e:#}"));
+                    audio_degraded = Some(format!("audio sidecar start failed: {e:#}"));
                     None
                 }
             }

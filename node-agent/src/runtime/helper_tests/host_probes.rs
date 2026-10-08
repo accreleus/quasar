@@ -289,8 +289,8 @@ fn audio_probe_recovers_a_stale_sidecar_before_its_own_create() {
     };
     let stale_run = AudioRun {
         socket_dir: stale_socket.clone(),
-        entrypoint: vec!["pulseaudio".into()],
-        command: crate::session::audio::pulse_command(&stale_socket.to_string_lossy()),
+        entrypoint: vec!["pipewire".into()],
+        command: crate::session::audio::pulse_command(),
     };
     let stale = client
         .run_audio_sidecar(stale_helper, stale_run)

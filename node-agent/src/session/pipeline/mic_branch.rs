@@ -298,7 +298,7 @@ fn build_mic_bin(pulse_server: Option<&str>) -> Result<gst::Bin> {
         // sidecar is unavailable.
         tracing::warn!(
             token = "mic-no-pulse-sidecar",
-            "microphone: no PulseAudio sidecar for this session — mic media will be \
+            "microphone: no audio sidecar for this session — mic media will be \
              received and DISCARDED (fakesink)"
         );
     }

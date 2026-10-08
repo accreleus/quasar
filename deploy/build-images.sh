@@ -161,9 +161,9 @@
 #                           agent process is the image's BAKED binary at
 #                           /usr/local/bin/quasar-node-agent, not a bind-mounted
 #                           target/release build re-introduced by a compose `command:`
-#                           override; and QUASAR_PULSE_IMAGE actually contains a
-#                           pulseaudio daemon (a sidecar without one muted every session
-#                           on the host with only a WARN — 2026-07-26).
+#                           override; and QUASAR_PULSE_IMAGE actually contains the
+#                           audio sidecar's daemon and config (a sidecar without one
+#                           muted every session on the host with only a WARN — 2026-07-26).
 #
 #                           Run it ON the host, from the repo root, e.g.
 #                             deploy/build-images.sh runtime --deploy
@@ -1072,14 +1072,17 @@ if [ "$DO_DEPLOY" = 1 ]; then
       exit 1 ;;
   esac
 
-  # Audio is the reason the image rework happened: a sidecar image with no `pulseaudio`
-  # binary muted every session (streamed AND console-local) with only a WARN in the log.
+  # Audio is the reason the image rework happened: a sidecar image with no audio daemon
+  # muted every session with only a WARN in the log. Since #392 the daemon is PipeWire with
+  # the baked session config the agent starts it with.
   PULSE_IMAGE="$(docker exec "$AGENT_CID" printenv QUASAR_PULSE_IMAGE 2>/dev/null || echo '')"
   PULSE_IMAGE="${PULSE_IMAGE:-$AGENT_IMG:latest}"
-  if docker run --rm --entrypoint sh "$PULSE_IMAGE" -c 'command -v pulseaudio' >/dev/null 2>&1; then
-    log "PASS: QUASAR_PULSE_IMAGE=$PULSE_IMAGE has a pulseaudio daemon"
+  if docker run --rm --entrypoint sh "$PULSE_IMAGE" -c \
+      'command -v pipewire && command -v wireplumber && test -f /etc/pipewire/quasar-session.conf' \
+      >/dev/null 2>&1; then
+    log "PASS: QUASAR_PULSE_IMAGE=$PULSE_IMAGE has the PipeWire audio sidecar"
   else
-    log "FAIL: QUASAR_PULSE_IMAGE=$PULSE_IMAGE has NO pulseaudio binary — every session"
+    log "FAIL: QUASAR_PULSE_IMAGE=$PULSE_IMAGE has NO PipeWire audio sidecar — every session"
     log "      on this host would be silent (streamed and console-local). Point it at an"
     log "      image built from the 'runtime' role."
     exit 1

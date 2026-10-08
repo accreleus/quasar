@@ -1,20 +1,19 @@
-//! Per-session PulseAudio sidecar.
+//! Per-session audio sidecar: PipeWire speaking the PulseAudio protocol (#392).
 //!
-//! Each session gets a dedicated PulseAudio process owning a Unix socket (Wolf's
-//! pattern). The app container sends audio to it (`PULSE_SERVER=unix:…`); the host
-//! pipeline captures via `pulsesrc`. Explicit stop and Drop request journalled
-//! cleanup; unreachable engines leave a durable obligation for recovery.
+//! Each session gets a dedicated daemon owning a Unix socket (Wolf's pattern). The app
+//! container sends audio to it (`PULSE_SERVER=unix:…`); the host pipeline captures via
+//! `pulsesrc`. Explicit stop and Drop request journalled cleanup; unreachable engines leave
+//! a durable obligation for recovery.
 //!
 //! The socket directory is `{runtime_dir}/pulse-{session_id}`: deterministic, per-session,
 //! and safe as a Docker bind-mount source because the same path applies on the host (where
-//! the daemon resolves it) and inside the agent container. The socket is `{dir}/native`,
-//! pinned by an explicit `module-native-protocol-unix socket=…` daemon arg, never via
-//! `PULSE_RUNTIME_PATH` — that must stay private, because PulseAudio force-chmods its
-//! runtime dir 0700 and locks out non-root app-container clients.
+//! the daemon resolves it) and inside the agent container. The socket is `{dir}/native`:
+//! the baked `deploy/audio/quasar-session-pulse.conf` binds `unix:../native` relative to
+//! the private `PULSE_RUNTIME_PATH={dir}/.runtime` the runtime profile sets.
 //!
-//! Image: `QUASAR_PULSE_IMAGE`, otherwise the running agent image. It ships
-//! the `pulseaudio` binary, so no extra pull is needed; the sidecar uses no GStreamer,
-//! Wayland, or GPU facilities from it.
+//! Image: `QUASAR_PULSE_IMAGE`, otherwise the running agent image. It ships PipeWire,
+//! WirePlumber and the session configs (`deploy/audio/`), so no extra pull is needed; the
+//! sidecar uses no GStreamer, Wayland, or GPU facilities from it.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -25,14 +24,14 @@ use anyhow::{anyhow, Context, Result};
 
 use super::container::ContainerRuntime;
 
-/// Name prefix for PulseAudio sidecars; CLI orphan cleanup must preserve these.
+/// Name prefix for audio sidecars; CLI orphan cleanup must preserve these.
 pub const PULSE_NAME_PREFIX: &str = "quasar-pulse-";
 
-/// The session's single PulseAudio sink, baked into the daemon args
+/// The session's output sink, baked into the daemon config
 /// (`module-null-sink sink_name=…`) and injected into app containers as `PULSE_SINK`, so a
 /// client enumerating sinks by name routes here instead of a phantom/`auto_null` sink.
 /// Public so both app dispatch sites (`host.rs`, `source.rs`) inject the same literal the
-/// daemon args use.
+/// daemon config uses.
 pub const QUASAR_SINK_NAME: &str = "quasar_output";
 
 /// The monitor source of [`QUASAR_SINK_NAME`], recorded by the host-audio capture
@@ -40,13 +39,13 @@ pub const QUASAR_SINK_NAME: &str = "quasar_output";
 /// `pulsesrc device=…`, never relying on it being the daemon DEFAULT source: the sidecar
 /// also loads a microphone feed sink and a remap-source, and a moved default would
 /// silently point host capture at the client's own microphone. Kept in lockstep with
-/// [`QUASAR_SINK_NAME`]; guarded by `device_name_constants_agree_with_baked_modules`.
+/// [`QUASAR_SINK_NAME`]; guarded by `device_name_constants_agree_with_the_baked_config`.
 pub const QUASAR_MONITOR_SOURCE_NAME: &str = "quasar_output.monitor";
 
 /// The session's microphone FEED sink. The agent's decoded client-mic audio plays into it
 /// (`pulsesink device=quasar_mic`), and its monitor is what [`QUASAR_MIC_SOURCE_NAME`]
-/// re-presents as a real capture source. Loaded unconditionally so the devices exist for
-/// the sidecar's whole life (a runtime `pactl load-module` does not survive a sidecar
+/// re-presents as a real capture source. Baked into the daemon config so the devices exist
+/// for the sidecar's whole life (a runtime `pactl load-module` does not survive a sidecar
 /// restart); silent unless the session negotiated a microphone m-line.
 pub const QUASAR_MIC_SINK_NAME: &str = "quasar_mic";
 
@@ -73,7 +72,7 @@ pub fn pulse_socket_dir(runtime_dir: &str, session_id: &str) -> PathBuf {
 pub(crate) const PULSE_WAIT_TOTAL: Duration = Duration::from_secs(2);
 const PULSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// A per-session PulseAudio sidecar container owning a Unix socket (`{dir}/native`) that
+/// A per-session audio sidecar container owning a Unix socket (`{dir}/native`) that
 /// the app container connects to and `pulsesrc` captures from. Drop requests cleanup.
 pub struct PulseSidecar {
     socket_dir: PathBuf,
@@ -133,8 +132,8 @@ impl PulseSidecar {
         };
         let request = crate::runtime::AudioRun {
             socket_dir: socket_dir.clone(),
-            entrypoint: vec!["pulseaudio".into()],
-            command: pulse_command(&socket_dir.to_string_lossy()),
+            entrypoint: vec!["pipewire".into()],
+            command: pulse_command(),
         };
         // Construct the cleanup backstop before submission: a lost create/start
         // response must not leave the caller without an explicit stop request.
@@ -150,7 +149,7 @@ impl PulseSidecar {
             Ok(id) => id,
             Err(error) => {
                 sidecar.stop();
-                return Err(anyhow!(error).context("pulseaudio sidecar start failed"));
+                return Err(anyhow!(error).context("audio sidecar start failed"));
             }
         };
         if !wait_for_socket(&sidecar.socket_dir.join("native")) {
@@ -170,13 +169,13 @@ impl PulseSidecar {
                 ),
             };
             tracing::warn!(token = "audio-pulse-socket-timeout",
-                "pulseaudio socket '{}' did not become ready within {}s — falling back to silent audio; the sidecar: {why}",
+                "audio sidecar socket '{}' did not become ready within {}s — falling back to silent audio; the sidecar: {why}",
                 sidecar.socket_dir.join("native").display(), PULSE_WAIT_TOTAL.as_secs());
             sidecar.stop();
             return Ok(None);
         }
         tracing::info!(
-            "PulseAudio sidecar ready: socket={}",
+            "audio sidecar ready: socket={}",
             sidecar.socket_dir.join("native").display()
         );
         Ok(Some(sidecar))
@@ -274,75 +273,10 @@ impl Drop for PulseSidecar {
     }
 }
 
-pub(crate) fn pulse_command(socket_dir: &str) -> Vec<String> {
-    // Runtime profile owns Docker settings, HOME and private PULSE_RUNTIME_PATH.
-    // Only the Pulse daemon command and device topology belong to this caller.
-    vec![
-        "--daemonize=no".into(),
-        "--system=no".into(),
-        "--disable-shm=true".into(),
-        "--exit-idle-time=-1".into(),
-        "--log-target=stderr".into(),
-        // `-n` skips default.pa and loads an explicit module set, so the socket lands at
-        // a pinned shared path instead of under the now-private runtime dir.
-        //
-        // `auth-anonymous=1` accepts every client on this socket without a cookie. The
-        // socket is already private (a per-session dir bind-mounted only into that
-        // session's own containers), so there is no untrusted peer to authenticate — the
-        // Wolf/GOW model. Not a convenience: cookie auth across the pressure-vessel
-        // (Proton/Steam) sandbox boundary is fundamentally broken, because
-        // pressure-vessel re-homes XDG_RUNTIME_DIR and remaps the cookie, so the file a
-        // Proton game reads diverges from the one the daemon wrote (three different
-        // cookie hashes were observed for one logical file) and every Proton title is
-        // silently denied. The anonymous grant removes that class of failure and lets the
-        // agent carry no cookie machinery at all.
-        "-n".into(),
-        // The session's one sink. `device.class=sound` because some clients (Steam) hide
-        // `abstract`-class devices (module-null-sink's default) from their output
-        // pickers. Baked into the daemon args so it lives as long as the sidecar: a live
-        // `pactl load-module` does not survive a restart. First sink loaded == default
-        // sink, so a default-source capture lands on its monitor.
-        //
-        // rate/channels are pinned to the Opus wire format. Unpinned, the sink starts at the
-        // daemon default 44100 and can only change rate while its monitor is idle, which it
-        // never is: pulsesrc captures it from session start (#351).
-        format!(
-            "--load=module-null-sink sink_name={QUASAR_SINK_NAME} \
-             rate=48000 channels=2 \
-             sink_properties=\"device.class='sound' device.description='Quasar Output'\""
-        ),
-        // Microphone capture (client → host). These two loads MUST stay AFTER the
-        // quasar_output null-sink above: PulseAudio makes the FIRST loaded sink the
-        // default, and the ordering is load-bearing for app clients that follow it. (The
-        // capture pulsesrc also pins `device=quasar_output.monitor` explicitly.)
-        //
-        // `quasar_mic` is the feed sink the agent's decoded mic audio plays into
-        // (`pulsesink device=quasar_mic`); `device.class='sound'` for the same Steam
-        // reason as above. rate/channels are pinned to the Opus wire format (48 kHz
-        // stereo) so decoded mic audio is not resampled through the daemon default 44100.
-        format!(
-            "--load=module-null-sink sink_name={QUASAR_MIC_SINK_NAME} \
-             rate=48000 channels=2 \
-             sink_properties=\"device.class='sound' device.description='Quasar Microphone Feed'\""
-        ),
-        // `quasar_mic_src` re-presents that sink's monitor as a first-class capture
-        // source, because Steam and many games hide monitor-class sources in their
-        // microphone pickers. The app container records from it (injected as
-        // PULSE_SOURCE at both dispatch sites). Loaded unconditionally: it is silent
-        // until a session negotiates a mic m-line, and a static argv stays testable.
-        format!(
-            "--load=module-remap-source master={QUASAR_MIC_SINK_NAME}.monitor \
-             source_name={QUASAR_MIC_SOURCE_NAME} \
-             source_properties=\"device.class='sound' device.description='Quasar Microphone'\""
-        ),
-        // The socket must load LAST: every consumer (the agent's `wait_for_socket` poll,
-        // and the app container started moments later) treats "socket exists" as
-        // "sidecar ready". Loading the protocol module after every device makes that
-        // signal true — no client can connect while the three devices are still being
-        // created, and the app container resolves PULSE_SINK/PULSE_SOURCE by name at
-        // connect, so it is genuinely exposed to that ordering window.
-        format!("--load=module-native-protocol-unix socket={socket_dir}/native auth-anonymous=1"),
-    ]
+/// The daemon's argv. Its devices, socket and auth live in the baked config
+/// (`deploy/audio/`); the runtime profile owns the environment that places the socket.
+pub(crate) fn pulse_command() -> Vec<String> {
+    vec!["-c".into(), "/etc/pipewire/quasar-session.conf".into()]
 }
 
 /// Probe without blocking on a saturated listener backlog.
@@ -444,22 +378,34 @@ mod tests {
 
     use super::*;
 
-    /// The device-name constants must stay in lockstep with the baked daemon argv: the
+    /// The pulse config the image installs at `/etc/pipewire/quasar-session-pulse.conf`.
+    fn baked_pulse_config() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/audio/quasar-session-pulse.conf");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    }
+
+    /// The device-name constants must stay in lockstep with the baked daemon config: the
     /// capture pulsesrc pins `quasar_output.monitor` by literal, and the mic
     /// remap-source's master is `quasar_mic.monitor`.
     #[test]
-    fn device_name_constants_agree_with_baked_modules() {
+    fn device_name_constants_agree_with_the_baked_config() {
         assert_eq!(
             QUASAR_MONITOR_SOURCE_NAME,
             format!("{QUASAR_SINK_NAME}.monitor")
         );
-        let args = pulse_command("/run/quasar-agent/pulse-test");
-        assert!(args
-            .iter()
-            .any(|arg| arg.contains(&format!("master={QUASAR_MIC_SINK_NAME}.monitor"))));
-        assert!(args
-            .iter()
-            .any(|arg| arg.contains(&format!("source_name={QUASAR_MIC_SOURCE_NAME}"))));
+        let config = baked_pulse_config();
+        for needle in [
+            format!("module-null-sink sink_name={QUASAR_SINK_NAME} "),
+            format!("module-null-sink sink_name={QUASAR_MIC_SINK_NAME} "),
+            format!(
+                "module-remap-source master={QUASAR_MIC_SINK_NAME}.monitor \
+                 source_name={QUASAR_MIC_SOURCE_NAME} "
+            ),
+        ] {
+            assert!(config.contains(&needle), "baked config lacks `{needle}`");
+        }
     }
 
     // The sidecar name and socket dir must be session-unique so two concurrent sessions
@@ -592,80 +538,48 @@ mod tests {
         );
     }
 
-    // The daemon's runtime path must be a PRIVATE subdir (PulseAudio force-chmods it
-    // 0700), while socket and sink are pinned at the shared socket dir via `-n --load=`
-    // so non-root app containers (Steam at 99:100) can reach them.
+    // Non-root app containers (Steam at 99:100, Proton behind pressure-vessel) must reach
+    // the socket at the shared `{dir}/native` without a cookie, while the daemon's runtime
+    // dir stays private (`PULSE_RUNTIME_PATH={dir}/.runtime`, the runtime profile's half).
     #[test]
-    fn pulse_run_pins_shared_paths_outside_private_runtime_dir() {
-        let dir = "/run/quasar-agent/pulse-test";
-        let args = pulse_command(dir);
-        assert!(args.iter().any(|arg| arg == "-n"));
-        let native = args
-            .iter()
-            .find(|arg| arg.starts_with("--load=module-native-protocol-unix"))
-            .expect("explicit native-protocol load");
-        assert!(native.contains(&format!("socket={dir}/native")));
-        // Anonymous grant on the private per-session socket: the Wolf/GOW model that lets
-        // Proton/pressure-vessel clients, whose remapped cookie diverges from any daemon
-        // cookie, authenticate at all. No cookie is pinned.
-        assert!(native.contains("auth-anonymous=1"));
-        assert!(!native.contains("auth-cookie"));
-        assert!(!args.iter().any(|arg| arg.starts_with("PULSE_COOKIE=")));
+    fn the_baked_config_pins_the_shared_socket_the_devices_and_the_wire_format() {
+        assert_eq!(pulse_command(), ["-c", "/etc/pipewire/quasar-session.conf"]);
+        let config = baked_pulse_config();
+        assert!(config.contains(
+            r#"server.address = [ { address = "unix:../native" client.access = "unrestricted" } ]"#
+        ));
 
-        // The baked module set is exactly: the session OUTPUT null-sink, the microphone
-        // FEED null-sink, and the remap-source over the latter's monitor, in that order.
-        // First sink loaded = default SINK, so `quasar_output` must never be displaced by
-        // `quasar_mic`. The default SOURCE does become `quasar_mic_src` (a remap-source
-        // outranks monitors regardless of load order), which is intended: an app reading
-        // the default source gets the microphone. Nothing on the capture side relies on
-        // the default — both agent `pulsesrc`s pin `device=quasar_output.monitor`.
-        let null_sinks: Vec<&String> = args
-            .iter()
-            .filter(|arg| arg.starts_with("--load=module-null-sink"))
-            .collect();
-        assert_eq!(null_sinks.len(), 2, "output sink + microphone feed sink");
-        assert!(null_sinks[0].contains("sink_name=quasar_output"));
-        assert!(null_sinks[0].contains("device.class='sound'"));
-        // Pinned to the Opus wire format: the capture pulsesrc holds the monitor from
-        // session start, so the sink cannot switch rate once a game connects.
-        assert!(null_sinks[0].contains("rate=48000"));
-        assert!(null_sinks[0].contains("channels=2"));
-        assert!(null_sinks[1].contains("sink_name=quasar_mic"));
-        assert!(null_sinks[1].contains("device.class='sound'"));
-        assert!(null_sinks[1].contains("device.description='Quasar Microphone Feed'"));
-        // Pinned to the Opus wire format so decoded mic audio is not resampled through
-        // the daemon default 44100.
-        assert!(null_sinks[1].contains("rate=48000"));
-        assert!(null_sinks[1].contains("channels=2"));
+        let line = |needle: &str| {
+            let at = config
+                .find(needle)
+                .unwrap_or_else(|| panic!("baked config lacks `{needle}`"));
+            (at, config[at..].lines().next().unwrap())
+        };
+        let (output_at, output) = line("sink_name=quasar_output ");
+        let (mic_at, mic) = line("sink_name=quasar_mic ");
+        let (remap_at, remap) = line("module-remap-source ");
+        assert!(mic_at < remap_at, "remap master must exist first");
+        assert!(output_at < mic_at);
+        for sink in [output, mic] {
+            // The capture pulsesrc holds the monitor from session start, so the sink cannot
+            // switch rate once a game connects (#351).
+            assert!(sink.contains("rate=48000 channels=2"), "{sink}");
+            // Steam hides `abstract`-class devices from its pickers.
+            assert!(sink.contains("device.class='sound'"), "{sink}");
+        }
+        assert!(remap.contains("device.class='sound'"), "{remap}");
 
-        let remap = args
-            .iter()
-            .find(|arg| arg.starts_with("--load=module-remap-source"))
-            .expect("baked-in microphone capture source");
-        assert!(remap.contains("master=quasar_mic.monitor"));
-        assert!(remap.contains("source_name=quasar_mic_src"));
-        // Steam hides `abstract`-class devices from its pickers, so the mic source must
-        // present as a real sound device or voice chat cannot select it.
-        assert!(remap.contains("device.class='sound'"));
-
-        // The remap-source must be loaded AFTER its master sink exists.
-        let mic_sink_at = args
-            .iter()
-            .position(|arg| arg.contains("sink_name=quasar_mic"))
-            .unwrap();
-        let output_sink_at = args
-            .iter()
-            .position(|arg| arg.contains("sink_name=quasar_output"))
-            .unwrap();
-        let remap_at = args
-            .iter()
-            .position(|arg| arg.starts_with("--load=module-remap-source"))
-            .unwrap();
-        assert!(
-            output_sink_at < mic_sink_at,
-            "quasar_output must load first so it stays the default sink"
-        );
-        assert!(mic_sink_at < remap_at, "remap master must exist first");
+        // quasar_output is the default sink by priority, not by discovery order. The default
+        // source is quasar_mic_src, the only non-monitor source, which is intended: an app
+        // reading the default source gets the microphone, and both agent pulsesrcs pin
+        // `device=quasar_output.monitor`.
+        let priority = |line: &str| -> u32 {
+            let value = line.split("priority.session=").nth(1).expect(line);
+            value[..value.find(|c: char| !c.is_ascii_digit()).unwrap()]
+                .parse()
+                .unwrap()
+        };
+        assert!(priority(output) > priority(mic));
     }
 }
 

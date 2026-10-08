@@ -85,7 +85,7 @@ async fn handle_peer(stream: tokio::net::TcpStream, cfg: &SessionConfig) -> Resu
         // reason lands on cfg + the log only.
         let reason = host
             .audio_degraded_reason()
-            .unwrap_or("PulseAudio sidecar unavailable")
+            .unwrap_or("audio sidecar unavailable")
             .to_string();
         if cfg_eff.audio_required {
             anyhow::bail!("audio required but unavailable: {reason}");

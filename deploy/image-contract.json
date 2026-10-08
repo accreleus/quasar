@@ -7,7 +7,7 @@
   "roles": {
 
     "runtime": {
-      "_role": "Vendor-neutral node-agent runtime (quasar-node-agent tag; quasar-vulkan before the 2026-08-26 role rename, still written as a transition alias). AMD/Intel VA + Vulkan encode. Also serves as the per-session PulseAudio sidecar image and the default app image on some stacks.",
+      "_role": "Vendor-neutral node-agent runtime (quasar-node-agent tag; quasar-vulkan before the 2026-08-26 role rename, still written as a transition alias). AMD/Intel VA + Vulkan encode. Also serves as the per-session audio sidecar image (PipeWire speaking the PulseAudio protocol, #392) and the default app image on some stacks.",
       "size_max_mb": 2000,
       "_size_note": "quasar-nv:prev (the same lineage built --target runtime) measured 1.57GB on 2026-07-26. 2000MB leaves headroom for the runtime's media, GPU and diagnostic dependencies. If a legitimate addition breaks the ceiling, raise it deliberately in a commit that says why -- do not raise it to make a red build green.",
 
@@ -22,7 +22,7 @@
           "mesa-vulkan-drivers-freeworld", "mesa-va-drivers-freeworld",
           "intel-media-driver", "libva-utils",
           "libglvnd", "mesa-libEGL", "mesa-libGLES", "mesa-libGL", "mesa-dri-drivers",
-          "alsa-lib", "pulseaudio-libs", "pulseaudio", "pulseaudio-utils",
+          "alsa-lib", "pulseaudio-libs", "pipewire", "pipewire-pulseaudio", "wireplumber", "pulseaudio-utils",
           "pciutils-libs", "libsrtp",
           "ddcutil", "procps-ng", "iproute",
           "hwdata",
@@ -30,7 +30,9 @@
           "openh264"
         ],
         "_required_notes": {
-          "pulseaudio": "THE DAEMON, not just pulseaudio-libs/-utils. QUASAR_PULSE_IMAGE points at this image; without the daemon binary the agent logs 'silent audio fallback' and every session is mute. This exact package was the 2026-07-26 lab-host audio outage.",
+          "pipewire": "THE DAEMON, not just pulseaudio-libs/-utils. QUASAR_PULSE_IMAGE points at this image; without the daemon binary the agent logs 'silent audio fallback' and every session is mute. That was the 2026-07-26 lab-host audio outage, when the daemon was the `pulseaudio` package. #392 replaced it with these three, which Fedora will not co-install with it: pipewire (the daemon), pipewire-pulseaudio (the PulseAudio protocol apps speak) and wireplumber (links streams to the session's devices; without it nothing plays). A replaced component, not a relaxed assertion.",
+          "pipewire-pulseaudio": "See pipewire.",
+          "wireplumber": "See pipewire.",
           "mesa-vulkan-drivers-freeworld": "Stock Fedora Mesa strips the patent-encumbered encode entrypoints. Without freeworld, RADV has NO Vulkan encode queue and vulkanh264enc registers but cannot encode.",
           "mesa-va-drivers-freeworld": "Same, for the VA encode entrypoints (vah264enc/vah264lpenc).",
           "intel-media-driver": "iHD, the VA driver for Intel Gen9+, from rpmfusion-NONFREE. #126: mesa-va-drivers is GALLIUM ONLY (radeonsi/nouveau/virtio/d3d12), so before this an Intel host had NO VA driver at all -- vaInitialize failed, vah264lpenc never registered, and the codec probe reported an empty set. That is the DEFAULT path on Intel (settings.rs encoder_default_for_vendor maps Intel to VA), so the documented default was unreachable on every Intel host. The NONFREE build is the one asserted, not Fedora's in-distro libva-intel-media-driver: both are MIT and BSD, Fedora's source RPM is named intel-media-driver-free, and measured on fc43 Fedora's build is 11.6 MB with 123 AVC/HEVC encode symbol references against this one's 40.5 MB and 516 -- the same patent split already accepted for AMD via mesa-va-drivers-freeworld, on identically licensed code. libva needs no wiring to prefer it: Fedora's libva has /usr/lib64/dri-nonfree:/usr/lib64/dri-freeworld:/usr/lib64/dri compiled in as its search path. Do not drop this assertion to make a build green.",
@@ -54,7 +56,7 @@
       "binaries": {
         "required": [
           "curl", "gst-inspect-1.0", "gst-launch-1.0",
-          "pulseaudio", "pactl",
+          "pipewire", "wireplumber", "pactl",
           "avahi-daemon",
           "quasar-node-agent", "quasar-node-agent-entrypoint"
         ],
@@ -76,9 +78,14 @@
           "/opt/gst/lib64/gstreamer-1.0/libgstnvcodec.so",
           "/usr/local/bin/quasar-node-agent",
           "/usr/local/bin/quasar-node-agent-entrypoint",
-          "/etc/ld.so.conf.d/gst-vulkan.conf"
+          "/etc/ld.so.conf.d/gst-vulkan.conf",
+          "/etc/pipewire/quasar-session.conf",
+          "/etc/pipewire/quasar-session-pulse.conf",
+          "/etc/wireplumber/wireplumber.conf.d/quasar-session.conf",
+          "/usr/lib64/pipewire-0.3/libpipewire-module-protocol-pulse.so"
         ],
         "_required_notes": {
+          "quasar-session.conf": "The per-session audio sidecar's configs (deploy/audio/, #392). The agent starts `pipewire -c /etc/pipewire/quasar-session.conf`; with any of these four missing the sidecar never opens its socket and every session is mute.",
           "libgstnvcodec.so": "Present in EVERY image on this lineage -- the whole point of the single build graph. On a non-NVIDIA host it loads, warns once about libcuda.so.1, and registers 0 features (asserted below). Its ABSENCE means the builder was run with CUDA_ENABLE=0, which produces an image that cannot serve an NVIDIA host and must not be shipped."
         },
         "forbidden": [
@@ -131,7 +138,7 @@
           "coloreffects"
         ],
         "_required_notes": "Device-free elements only -- everything here must register with no GPU attached. rtpgccbwe comes from gst-plugins-rs and is the element most often lost to a wrong 0.13/0.14/0.15 pin. interpipesrc/sink come from the gow gst-interpipe fork. The webrtc transport chain (rtpbin/nicesrc/dtlssrtpenc/sctpenc/rtprtxsend/rtpulpfecenc) is asserted because the published games-on-whales gst-wayland-display images build with -Dauto_features=disabled and lack all of it -- that is why they cannot be used as a base here. coloreffects is gst-plugins-bad's, asserted for #97 (the 'Colour Ripple' bench app's gst-launch pipeline fails with 'no element \"coloreffects\"' otherwise) -- not used by node-agent Rust.",
-        "_audio_note": "pulsesrc/audioconvert/audioresample/opusenc feed the streamed audio PeerConnection from the PulseAudio sidecar daemon (the `pulseaudio` package above); when quasar-nv shipped without the daemon on 2026-07-26, every session went silent. rtpopusdepay/opusdec are the microphone RECEIVE path (mic_branch.rs) -- client mic -> pulsesink device=quasar_mic in the sidecar. alsasink and kmssink are no longer required: they served the agent-drawn console (its local audio and its AMD display path), retired with it in #461 -- a console desktop now drives the display and plays its own audio from its own container (ADR 0009). A retired component, not a relaxed assertion.",
+        "_audio_note": "pulsesrc/audioconvert/audioresample/opusenc feed the streamed audio PeerConnection from the session's audio sidecar (the `pipewire` packages above, speaking the PulseAudio protocol); when quasar-nv shipped without its daemon on 2026-07-26, every session went silent. rtpopusdepay/opusdec are the microphone RECEIVE path (mic_branch.rs) -- client mic -> pulsesink device=quasar_mic in the sidecar. alsasink and kmssink are no longer required: they served the agent-drawn console (its local audio and its AMD display path), retired with it in #461 -- a console desktop now drives the display and plays its own audio from its own container (ADR 0009). A retired component, not a relaxed assertion.",
         "required_with_gpu": ["vulkanh264enc", "vulkanscale"],
         "_required_with_gpu_notes": "vah264enc/vah264lpenc are NOT asserted here: AMD VCN exposes the regular VAEntrypointEncSlice (vah264enc) while Intel exposes the low-power one (vah264lpenc), so the element name is host-dependent. Assert those per-host with --require-element instead. vulkanscale (added for #501) is the GPU scaler for memory:VulkanImage NV12/P010 frames, built in the Quasar gst-wayland-display fork alongside waylanddisplaysrc -- it is what gives a Vulkan host the external-resolution lever (ScaleStage::supported becomes true only when this factory registers). THIS ASSERTION WILL FAIL until GST_WAYLAND_DISPLAY_REF in deploy/pins.env is bumped to a fork commit that carries the element -- do not relax it to make a build green; bump the pin instead.",
         "forbidden_without_gpu": ["cudaconvert", "cudascale", "nvh264enc", "nvautogpuh264enc", "nvav1enc"],

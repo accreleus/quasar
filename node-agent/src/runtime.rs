@@ -451,7 +451,7 @@ impl RuntimeClient {
         )
     }
 
-    /// Start a fixed-profile PulseAudio sibling.  The returned identity is
+    /// Start a fixed-profile audio (PipeWire) sibling.  The returned identity is
     /// available while the daemon runs; observing it never terminates it.
     pub fn run_audio_sidecar(
         &self,

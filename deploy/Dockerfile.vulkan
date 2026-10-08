@@ -775,10 +775,10 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     # here -- it needs a repo enabled further down; see the RPM Fusion block.)
     libva-utils \
     libglvnd libglvnd-egl mesa-libEGL mesa-libGLES mesa-libGL mesa-dri-drivers \
-    # The unified image also serves as the per-session PulseAudio sidecar.
-    # pulseaudio-utils provides pactl/pacat but not the daemon executable;
-    # install the daemon explicitly (weak deps remain disabled above).
-    alsa-lib pulseaudio-libs pulseaudio \
+    # The unified image also serves as the per-session audio sidecar (#392): PipeWire, its
+    # PulseAudio protocol and WirePlumber, configured by deploy/audio/ below. Each is named
+    # explicitly (weak deps remain disabled above); pulseaudio-utils provides pactl/pacat.
+    alsa-lib pulseaudio-libs pipewire pipewire-pulseaudio wireplumber \
     pciutils-libs libsrtp \
     # ddcutil: console mode's monitor power over DDC (readiness console_ddc). A console
     # session's desktop drives the display from its own container (ADR 0009), so the
@@ -845,7 +845,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     # These are the packages whose absence has actually caused an outage or a
     # "no encoder found" report, so they are checked here, at the point of install,
     # in addition to deploy/image-contract.json checking the finished image.
-    rpm -q pulseaudio mesa-vulkan-drivers-freeworld mesa-va-drivers-freeworld intel-media-driver avahi || exit 1 ; \
+    rpm -q pipewire pipewire-pulseaudio wireplumber mesa-vulkan-drivers-freeworld mesa-va-drivers-freeworld intel-media-driver avahi || exit 1 ; \
     # -- Runtime image trim (2026-08-20), IN THIS LAYER ------------------------------
     # Two groups of packages that are pulled in as transitive dependencies and are
     # never used by any Quasar code path. Each is removed with `rpm -e --nodeps`
@@ -916,16 +916,21 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     find /usr/share/locale -mindepth 1 -maxdepth 1 -type d ! -name 'en*' -exec rm -rf {} + ; \
     ldconfig ; \
     # PROOF, in the same layer as the removal: every survivor that matters still
-    # resolves every soname it needs. `pulseaudio --version` execs the real binary, so
+    # resolves every soname it needs. `pipewire --version` execs the real binary, so
     # a missing library is an immediate non-zero exit rather than a surprise at the
     # first audio capture.
-    missing=$(for f in /usr/bin/pulseaudio /usr/bin/pactl \
-                       /usr/lib64/pulseaudio/modules/*.so /usr/lib64/pulse-*/modules/*.so ; do \
+    missing=$(for f in /usr/bin/pipewire /usr/bin/wireplumber /usr/bin/pactl \
+                       /usr/lib64/pipewire-0.3/*.so /usr/lib64/spa-0.2/*/*.so ; do \
                 { [ -e "$f" ] && ldd "$f" 2>/dev/null | grep 'not found' ; } || true ; \
               done) ; \
     if [ -n "$missing" ]; then echo "TRIM BROKE A SURVIVOR:"; echo "$missing"; exit 1; fi ; \
-    pulseaudio --version && echo "runtime trim OK: $(du -sh /usr/share/locale | cut -f1) locale, no distro GStreamer" ; \
+    pipewire --version && wireplumber --version && echo "runtime trim OK: $(du -sh /usr/share/locale | cut -f1) locale, no distro GStreamer" ; \
     ! test -e /usr/lib64/gstreamer-1.0/libgstapp.so
+
+# The per-session audio sidecar's configs (#392). The agent starts
+# `pipewire -c /etc/pipewire/quasar-session.conf`; the paths are asserted by the contract.
+COPY deploy/audio/quasar-session.conf deploy/audio/quasar-session-pulse.conf /etc/pipewire/
+COPY deploy/audio/wireplumber-quasar-session.conf /etc/wireplumber/wireplumber.conf.d/quasar-session.conf
 
 # ── Agent-INDEPENDENT half of this stage ──────────────────────────────────────
 # Everything from here down to the agent-binary COPY is keyed on the toolchain and
@@ -1034,8 +1039,8 @@ RUN gst-inspect-1.0 waylanddisplaysrc \
     && gst-inspect-1.0 pulsesrc \
     && gst-inspect-1.0 audiotestsrc \
     && gst-inspect-1.0 coloreffects \
-    && command -v pulseaudio \
-    && pulseaudio --version \
+    && pipewire --version \
+    && wireplumber --version \
     && ldd /usr/local/bin/quasar-node-agent | (! grep "not found")
 
 # The registry above was scanned with NO GPU present — drop it so the first runtime invocation

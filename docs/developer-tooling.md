@@ -112,7 +112,7 @@ deployment. The `--deploy` checks are, in order: the running container's image I
 fresh build (the 2026-07-14 wrong-tag trap); the agent process resolves to the image's
 **baked** binary at `/usr/local/bin/quasar-node-agent` and not a workspace-compiled one (a
 re-introduced compose `command:` override); and `QUASAR_PULSE_IMAGE` names an image that
-actually has a `pulseaudio` binary (the 2026-07-26 silent-audio outage). It absorbed the
+actually has the PipeWire audio sidecar (the 2026-07-26 silent-audio outage). It absorbed the
 former `deploy/build-agent-host.sh`, which was already a thin wrapper over this script.
 
 The companion check is `scripts/dev/validate-local-audio.sh [--capture N]` — PASS/FAIL/SKIP

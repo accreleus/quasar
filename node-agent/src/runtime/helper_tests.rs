@@ -3062,24 +3062,9 @@ fn audio_request(engine: &Engine) -> (DiagnosticHelper, AudioRun) {
             image: "quasar-agent:test".into(),
         },
         AudioRun {
-            socket_dir: socket_dir.clone(),
-            entrypoint: vec!["pulseaudio".into()],
-            command: vec![
-                "--daemonize=no".into(),
-                "--system=no".into(),
-                "--disable-shm=true".into(),
-                "--exit-idle-time=-1".into(),
-                "--log-target=stderr".into(),
-                "-n".into(),
-                "--load=module-null-sink sink_name=quasar_output".into(),
-                "--load=module-null-sink sink_name=quasar_mic".into(),
-                "--load=module-remap-source master=quasar_mic.monitor source_name=quasar_mic_src"
-                    .into(),
-                format!(
-                    "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
-                    socket_dir.display()
-                ),
-            ],
+            socket_dir,
+            entrypoint: vec!["pipewire".into()],
+            command: crate::session::audio::pulse_command(),
         },
     )
 }
@@ -3095,7 +3080,7 @@ fn audio_sidecar_uses_the_fixed_writable_pulse_profile_at_the_public_boundary() 
         .wait()
         .unwrap();
     let body = engine.state.lock().unwrap().body.clone().unwrap();
-    assert_eq!(body["Entrypoint"], json!(["pulseaudio"]));
+    assert_eq!(body["Entrypoint"], json!(["pipewire"]));
     assert_eq!(body["HostConfig"]["NetworkMode"], json!("none"));
     assert_eq!(body["HostConfig"]["ReadonlyRootfs"], json!(false));
     assert_eq!(body["HostConfig"]["CapDrop"], json!(["ALL"]));
@@ -3117,7 +3102,8 @@ fn audio_sidecar_uses_the_fixed_writable_pulse_profile_at_the_public_boundary() 
         body["Env"],
         json!([
             format!("HOME={}", socket.display()),
-            format!("PULSE_RUNTIME_PATH={}/.runtime", socket.display())
+            format!("PULSE_RUNTIME_PATH={}/.runtime", socket.display()),
+            "XDG_RUNTIME_DIR=/tmp"
         ])
     );
     assert_eq!(body["HostConfig"]["Mounts"][0]["Source"], json!(socket));
@@ -3311,10 +3297,6 @@ fn audio_profile_initializes_a_missing_parent_without_removing_it_on_cleanup() {
     let (helper, mut run) = audio_request(&engine);
     let parent = run.socket_dir.parent().unwrap().join("missing-parent");
     run.socket_dir = parent.join("pulse-fixture");
-    *run.command.last_mut().unwrap() = format!(
-        "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
-        run.socket_dir.display()
-    );
     let id = engine
         .client()
         .run_audio_sidecar(helper, run)
@@ -3644,10 +3626,6 @@ fn cleanup_finishes_when_reboot_has_removed_the_whole_runtime_parent() {
         .unwrap()
         .join("volatile-runtime");
     run.socket_dir = runtime_parent.join("pulse-fixture");
-    *run.command.last_mut().unwrap() = format!(
-        "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
-        run.socket_dir.display()
-    );
     let id = engine
         .client()
         .run_audio_sidecar(helper, run)
