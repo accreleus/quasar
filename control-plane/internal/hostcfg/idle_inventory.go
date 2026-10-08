@@ -11,6 +11,13 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// ErrIdleInventoryStale refuses a heartbeat from a socket that no longer owns
+// the host's journal (displaced or ended). No approval is involved (#477).
+var ErrIdleInventoryStale = errors.New("idle inventory heartbeat is not from the host's current journal connection")
+
+// ErrIdleInventoryInvalid also discards the stored inventory: unknown, never idle.
+var ErrIdleInventoryInvalid = errors.New("idle inventory heartbeat carried an invalid session list")
+
 // ObserveIdleHeartbeat stores the agent's current-connection session list for
 // operator wait reasons. A missing list is unknown, not an empty host.
 func (s *Store) ObserveIdleHeartbeat(ctx context.Context, hostID, connectionID string, running []string) error {
@@ -42,7 +49,7 @@ func (s *Store) ObserveIdleHeartbeat(ctx context.Context, hostID, connectionID s
 		return err
 	}
 	if current == nil || *current != connectionID {
-		return ErrApprovalSuperseded
+		return ErrIdleInventoryStale
 	}
 	if running == nil || !valid {
 		if _, err := tx.Exec(ctx, `DELETE FROM host_idle_inventory WHERE host_id=$1::uuid`, hostID); err != nil {
@@ -52,7 +59,7 @@ func (s *Store) ObserveIdleHeartbeat(ctx context.Context, hostID, connectionID s
 			return err
 		}
 		if !valid {
-			return ErrApprovalSuperseded
+			return ErrIdleInventoryInvalid
 		}
 		return nil
 	}

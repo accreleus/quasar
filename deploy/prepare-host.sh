@@ -599,6 +599,21 @@ else
   say skipped "NVIDIA CDI specification — no NVIDIA driver loaded"
 fi
 
+# ── SELinux: session sound ─────────────────────────────────────────────────
+# A session's PulseAudio sidecar runs as container_t and listens on a unix socket; an app that
+# needs the nested-sandbox type (Steam's bwrap) runs as container_engine_t and must connect to
+# it. The policy's own connectto rule is "self": it covers two containers of the same type
+# only, so without this one the connect is denied and the stream is silent. MCS categories do
+# not constrain connectto, so sharing them would change nothing. This is the one rule, on the
+# one class, and nothing else. It is written on every SELinux host, not only NVIDIA ones.
+STEP="SELinux session sound"
+if containers_selinux; then
+  selinux_module quasar-nested-audio "; Written by Quasar host preparation (deploy/prepare-host.sh).
+(allow container_engine_t container_t (unix_stream_socket (connectto)))" \
+    "the PulseAudio socket rule for sessions' nested-sandbox SELinux type" \
+    "lets sessions (container_engine_t) connect to their session's PulseAudio sidecar (container_t); SELinux stays enforcing"
+fi
+
 # ── SELinux: console devices ───────────────────────────────────────────────
 # A console session runs as container_engine_t too, and the policy gives that type none of
 # what a desktop on the screen needs: the input nodes (event_device_t, under /dev/input,

@@ -38,13 +38,16 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		c.log.Warn("ignoring unknown agent session state", "state", m.State, "session_id", m.SessionID)
 		return
 	}
+	cleared := 0
 	if to.IsTerminal() && m.HomeCleanupQualified {
 		// A qualified late terminal is useful even after a synthetic reaper or
 		// session-row deletion. The store checks the reporting host and clears
 		// only matching hold columns; it never changes public session history.
-		if err := c.store.ClearQualifiedHomeHolds(ctx, hostID, m.SessionID); err != nil {
+		n, err := c.store.clearQualifiedHomeHolds(ctx, hostID, m.SessionID)
+		if err != nil {
 			c.log.Error("apply home cleanup proof failed", "err", err)
 		}
+		cleared = n
 	}
 	hs, err := c.store.GetSessionHostState(ctx, m.SessionID)
 	if err != nil || hs.HostID == nil || *hs.HostID != hostID {
@@ -55,6 +58,12 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 	// proof was handled above; replaying the lifecycle transition would repeat
 	// audit, console and home-usage side effects for an already-ended session.
 	if hs.State.IsTerminal() {
+		// A console relaunch refused as settling (ErrConsoleHomeSettling) waits
+		// on this proof, and no capacity report may follow it (#477). A live
+		// row's own terminal transition fires the re-evaluation instead.
+		if cleared > 0 {
+			c.fireConsoleReeval(&hostID, m.SessionID)
+		}
 		return
 	}
 	if to == StateStarting && len(m.HomeSeed) != 0 {

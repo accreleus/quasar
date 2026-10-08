@@ -25,24 +25,31 @@ type HomeHoldDecision struct {
 // row is allowed; a present row must still belong to the reporting host.
 // Claim rows are locked in canonical order and NULL-host claims stay held.
 func (s *Store) ClearQualifiedHomeHolds(ctx context.Context, hostID, sessionID string) error {
+	_, err := s.clearQualifiedHomeHolds(ctx, hostID, sessionID)
+	return err
+}
+
+// clearQualifiedHomeHolds is ClearQualifiedHomeHolds reporting how many holds
+// it released.
+func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID string) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin home cleanup proof: %w", err)
+		return 0, fmt.Errorf("begin home cleanup proof: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var owner *string
 	err = tx.QueryRow(ctx, `SELECT host_id::text FROM sessions WHERE id=$1::uuid FOR UPDATE`, sessionID).Scan(&owner)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("lock cleanup session: %w", err)
+		return 0, fmt.Errorf("lock cleanup session: %w", err)
 	}
 	if err == nil && (owner == nil || *owner != hostID) {
-		return nil
+		return 0, nil
 	}
 	rows, err := tx.Query(ctx, `SELECT user_id::text,canonical_app_id::text
 		FROM managed_home_claims WHERE pending_home_session_id=$1::uuid
 		ORDER BY user_id,canonical_app_id FOR UPDATE`, sessionID)
 	if err != nil {
-		return fmt.Errorf("lock pending home claims: %w", err)
+		return 0, fmt.Errorf("lock pending home claims: %w", err)
 	}
 	type key struct{ user, app string }
 	var keys []key
@@ -50,29 +57,31 @@ func (s *Store) ClearQualifiedHomeHolds(ctx context.Context, hostID, sessionID s
 		var k key
 		if err := rows.Scan(&k.user, &k.app); err != nil {
 			rows.Close()
-			return fmt.Errorf("read pending home claim: %w", err)
+			return 0, fmt.Errorf("read pending home claim: %w", err)
 		}
 		keys = append(keys, k)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return fmt.Errorf("read pending home claims: %w", err)
+		return 0, fmt.Errorf("read pending home claims: %w", err)
 	}
 	rows.Close()
+	cleared := 0
 	for _, k := range keys {
-		_, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
+		tag, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
 			pending_home_token=NULL,pending_home_started_at=NULL
 			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid
 			  AND pending_home_session_id=$3::uuid AND host_id=$4::uuid`,
 			k.user, k.app, sessionID, hostID)
 		if err != nil {
-			return fmt.Errorf("apply qualified home cleanup: %w", err)
+			return 0, fmt.Errorf("apply qualified home cleanup: %w", err)
 		}
+		cleared += int(tag.RowsAffected())
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit home cleanup proof: %w", err)
+		return 0, fmt.Errorf("commit home cleanup proof: %w", err)
 	}
-	return nil
+	return cleared, nil
 }
 
 // HeldTerminalSessionIDsOnHost is the recovery scan after a capable register
