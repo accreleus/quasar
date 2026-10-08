@@ -188,10 +188,16 @@ fn pulse_caller_preserves_socket_until_daemon_cleanup_is_known() {
     );
     assert_eq!(fixture.inspect().unwrap()["State"]["Running"], true);
     fixture.restore();
-    pulse.stop();
+    // The unconfirmed stop latched, so `stop` will not repeat it (#314); recovery finishes
+    // the intent it recorded.
+    crate::runtime::configured()
+        .unwrap()
+        .recover_audio_sidecars()
+        .wait()
+        .unwrap();
     assert!(
         fixture.inspect().is_none(),
-        "retry removes the exact audio container"
+        "recovery removes the exact audio container"
     );
     assert!(
         !dir.exists(),
