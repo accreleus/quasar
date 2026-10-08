@@ -240,6 +240,14 @@ export const NVIDIA_TOOLKIT_URL = 'https://docs.nvidia.com/datacenter/cloud-nati
  */
 export const NESTED_GPU_CIL = '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))';
 
+/**
+ * The one SELinux rule sessions need on every SELinux host, NVIDIA or not (#478): a
+ * nested-sandbox process (container_engine_t, Steam's bwrap) connects to its session's
+ * PulseAudio sidecar socket (container_t). Same rule as deploy/prepare-host.sh writes;
+ * its scope is site/src/content/docs/install/device-rules.mdx "SELinux and session sound".
+ */
+export const NESTED_AUDIO_CIL = '(allow container_engine_t container_t (unix_stream_socket (connectto)))';
+
 /** NVIDIA's device nodes for SELinux-confined containers; SELinux stays enforcing. */
 function nvidiaSelinuxLines() {
   return [
@@ -250,13 +258,26 @@ function nvidiaSelinuxLines() {
 }
 
 /**
+ * Sessions' sound on an SELinux host (a streamed Steam app is the nested-sandbox
+ * SELinux type and must connect to its session's PulseAudio sidecar): written on
+ * every SELinux host, NVIDIA or not — the same module deploy/prepare-host.sh loads.
+ */
+function selinuxAudioLines() {
+  return [
+    `echo '${NESTED_AUDIO_CIL}' > quasar-nested-audio.cil`,
+    'sudo semodule -i quasar-nested-audio.cil',
+  ];
+}
+
+/**
  * The host commands a rootful install needs, run once by the reader before the
  * install script: visible, never a downloaded script. Unraid needs none.
  * Mirrors what deploy/prepare-host.sh does for a rootful engine: the engine at
  * boot (Podman: its API socket and podman-restart.service; the recovery actor makes
  * the agent's runtime directory itself at every boot, #439), and on NVIDIA the
  * container toolkit (Docker: its runtime; Podman: a CDI specification), plus,
- * on Fedora (SELinux), the boolean and the one rule NVIDIA's device nodes need.
+ * on Fedora (SELinux), the boolean and the one rule NVIDIA's device nodes need, and,
+ * on every SELinux host, the one rule sessions' sound needs (#478).
  */
 export function hostSteps(a) {
   const r = role(a.role);
@@ -278,6 +299,16 @@ export function hostSteps(a) {
       );
       if (selinux) lines.push('', '# SELinux: let containers open the NVIDIA devices. SELinux stays enforcing.', ...nvidiaSelinuxLines());
     }
+    if (selinux) {
+      lines.push(
+        '',
+        "# SELinux: let sessions' nested-sandbox apps (Steam) reach the session's",
+        "# PulseAudio sidecar sound socket, or those sessions are silent. Scope:",
+        '# https://accreleus.github.io/quasar/install/device-rules/ — see also',
+        "# docs/install/device-rules.mdx in hand-built sites. SELinux stays enforcing.",
+        ...selinuxAudioLines(),
+      );
+    }
   } else {
     lines.push('# Docker, now and at every boot (it brings Quasar\'s containers back).', 'sudo systemctl enable --now docker');
     if (nvidia) {
@@ -296,6 +327,16 @@ export function hostSteps(a) {
           ...nvidiaSelinuxLines(),
         );
       }
+    }
+    if (selinux) {
+      lines.push(
+        '',
+        "# SELinux: let sessions' nested-sandbox apps (Steam) reach the session's",
+        "# PulseAudio sidecar sound socket, or those sessions are silent. Scope:",
+        '# https://accreleus.github.io/quasar/install/device-rules/ — see also',
+        "# docs/install/device-rules.mdx in hand-built sites. SELinux stays enforcing.",
+        ...selinuxAudioLines(),
+      );
     }
   }
   return lines.join('\n');
