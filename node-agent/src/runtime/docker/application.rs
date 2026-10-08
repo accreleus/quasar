@@ -17,7 +17,8 @@ use bollard::{
 use futures_util::StreamExt;
 
 use super::dialect::{
-    is_nvidia_request, nvidia_device_request, recorded_injection, Engine, Namespace,
+    card_grant, device_mappings, is_nvidia_request, nvidia_device_request, recorded_injection,
+    CardGrant, Engine, Namespace,
 };
 use crate::runtime::GpuInjection;
 
@@ -442,6 +443,36 @@ fn group_add(intent: &ApplicationIntent) -> &Vec<String> {
         .unwrap_or(&intent.request.group_add)
 }
 
+/// Why the app's card nodes open on this engine, if they do: it is given the whole
+/// `/dev/dri` (a streamed app on an NVIDIA host), or mknod-only cards the engine cannot
+/// hold, which are then created openable.
+fn cards_openable(
+    rootless: bool,
+    injection: Option<GpuInjection>,
+    request: &ApplicationRequest,
+) -> Option<&'static str> {
+    let grant = card_grant(rootless, injection);
+    if request.devices.iter().any(|d| d == "/dev/dri") {
+        return Some(match grant {
+            CardGrant::Openable(why) => why,
+            CardGrant::MknodOnly => "the app is given the whole /dev/dri",
+        });
+    }
+    match grant {
+        CardGrant::Openable(why) if !request.mknod_only_cards.is_empty() => Some(why),
+        _ => None,
+    }
+}
+
+/// The devices the container is created with and read back against.
+fn intent_devices(intent: &ApplicationIntent) -> Vec<DeviceMapping> {
+    device_mappings(
+        &intent.request.devices,
+        &intent.request.mknod_only_cards,
+        intent.cards_openable,
+    )
+}
+
 /// The device-cgroup rules the container is created with and read back against.
 fn device_cgroup_rules(intent: &ApplicationIntent) -> &Vec<String> {
     intent
@@ -590,16 +621,7 @@ fn body(
             pids_limit: Some(r.security.pids_limit),
             shm_size: Some(r.security.shm_size),
             group_add: Some(group_add(intent).clone()),
-            devices: Some(
-                r.devices
-                    .iter()
-                    .map(|path| DeviceMapping {
-                        path_on_host: Some(path.clone()),
-                        path_in_container: Some(path.clone()),
-                        cgroup_permissions: Some("rwm".into()),
-                    })
-                    .collect(),
-            ),
+            devices: Some(intent_devices(intent)),
             device_cgroup_rules: Some(device_cgroup_rules(intent))
                 .filter(|rules| !rules.is_empty())
                 .cloned(),
@@ -1300,7 +1322,7 @@ async fn inspect_owned(
         (
             !dialect.devices_ok(
                 host.devices.as_deref().unwrap_or(&[]),
-                &intent.request.devices,
+                &intent_devices(intent),
                 intent.request.nvidia_gpu,
             ),
             "devices",
@@ -1565,6 +1587,16 @@ pub(crate) async fn start(
                      the host's permissions (host preparation's ACLs)"
                 );
             }
+            let cards_openable = cards_openable(rootless, gpu_injection, &request);
+            if let Some(why) = cards_openable {
+                tracing::info!(
+                    token = "app-card-nodes-openable",
+                    application = %request.name,
+                    cards = ?request.mknod_only_cards,
+                    "the app's card nodes open on this engine ({why}): a console desktop here \
+                     takes the display only by opening the card first"
+                );
+            }
             let keep_id = app.keep_id;
             // The catalog already runs these apps unconfined by seccomp for their own
             // sandboxes (bwrap); under SELinux the same need is the nested-sandbox type.
@@ -1599,6 +1631,7 @@ pub(crate) async fn start(
                 engine_groups: app.engine_groups,
                 group_add: app.group_add,
                 device_cgroup_rules: app.device_cgroup_rules,
+                cards_openable: cards_openable.is_some(),
                 nested_sandbox_label,
                 phase: ApplicationPhase::Creating,
                 result: None,
@@ -2435,6 +2468,7 @@ mod app_identity_tests {
             engine_groups: Vec::new(),
             group_add: None,
             device_cgroup_rules: None,
+            cards_openable: false,
             nested_sandbox_label: false,
             phase: ApplicationPhase::Creating,
             result: None,
@@ -2626,6 +2660,179 @@ mod app_identity_tests {
                     "{dialect:?} rootless={rootless}"
                 );
             }
+        }
+    }
+
+    /// #464: a streamed app's card nodes on every engine. A rootful Docker or Podman holds
+    /// them to mknod; NVIDIA's toolkit (the `--gpus` hook and CDI) and a rootless engine
+    /// cannot, so there the card is openable and the journal says so, the whole `/dev/dri`
+    /// of an NVIDIA host included.
+    #[test]
+    fn a_streamed_apps_card_is_mknod_only_where_the_engine_can_hold_it() {
+        use crate::session::container::streamed_gpu_args_for_test as streamed;
+        use GpuInjection::{Cdi, DeviceRequest};
+        let device = |path: &str, permissions: &str| serde_json::json!({"PathOnHost": path, "PathInContainer": path, "CgroupPermissions": permissions});
+        let held = serde_json::json!([
+            device("/dev/dri/renderD128", "rwm"),
+            device("/dev/dri/card0", "m")
+        ]);
+        let open = serde_json::json!([
+            device("/dev/dri/renderD128", "rwm"),
+            device("/dev/dri/card0", "rwm")
+        ]);
+        let directory = serde_json::json!([device("/dev/dri", "rwm")]);
+        // (label, GPU on the host: None or Some(NVIDIA), engine, rootless, injection,
+        //  the devices created, cards openable)
+        let cases = [
+            (
+                "rootful Docker",
+                Some(false),
+                Dialect::Docker,
+                false,
+                None,
+                &held,
+                false,
+            ),
+            (
+                "rootful Podman",
+                Some(false),
+                Dialect::Podman,
+                false,
+                None,
+                &held,
+                false,
+            ),
+            (
+                "rootless Podman",
+                Some(false),
+                Dialect::Podman,
+                true,
+                None,
+                &open,
+                true,
+            ),
+            (
+                "rootless Docker",
+                Some(false),
+                Dialect::Docker,
+                true,
+                None,
+                &open,
+                true,
+            ),
+            (
+                "Docker with the NVIDIA --gpus hook",
+                Some(true),
+                Dialect::Docker,
+                false,
+                Some(DeviceRequest),
+                &directory,
+                true,
+            ),
+            (
+                "Podman with CDI",
+                Some(true),
+                Dialect::Podman,
+                false,
+                Some(Cdi),
+                &directory,
+                true,
+            ),
+            (
+                "rootless Podman with CDI",
+                Some(true),
+                Dialect::Podman,
+                true,
+                Some(Cdi),
+                &directory,
+                true,
+            ),
+            (
+                "no GPU",
+                None,
+                Dialect::Docker,
+                false,
+                None,
+                &serde_json::json!([]),
+                false,
+            ),
+        ];
+        for (label, gpu, dialect, rootless, injection, devices, openable) in cases {
+            let args = gpu.map_or_else(Vec::new, |nvidia| {
+                streamed(nvidia, &["card0", "renderD128"])
+            });
+            let request = argv_request(args);
+            assert!(request.is_valid(), "{label}");
+            let why = cards_openable(rootless, injection, &request);
+            assert_eq!(why.is_some(), openable, "{label}");
+            let intent = ApplicationIntent {
+                cards_openable: why.is_some(),
+                ..intent(request, None)
+            };
+            let body = serde_json::to_value(body(&intent, injection, dialect)).unwrap();
+            assert_eq!(&body["HostConfig"]["Devices"], devices, "{label}");
+            assert_eq!(
+                body["HostConfig"]["DeviceRequests"],
+                serde_json::to_value(injection.map(|i| vec![nvidia_device_request(i)])).unwrap(),
+                "{label}"
+            );
+        }
+        // An NVIDIA injection never holds a card to mknod, whoever asks (defensive: the
+        // session plan already sends NVIDIA hosts the whole directory).
+        let asked = argv_request(streamed(false, &["card0", "renderD128"]));
+        for injection in [Cdi, DeviceRequest] {
+            assert!(
+                cards_openable(false, Some(injection), &asked).is_some(),
+                "{injection:?}"
+            );
+        }
+    }
+
+    /// #464: what readiness tells the admin (`container::streamed_card_gap`) is what the
+    /// engine journals and logs for the streamed grant, on every engine.
+    #[test]
+    fn readiness_and_the_engine_agree_on_whether_a_streamed_card_opens() {
+        use crate::session::container::{streamed_card_gap, streamed_gpu_args_for_test};
+        use GpuInjection::{Cdi, DeviceRequest};
+        for (nvidia, rootless, injection) in [
+            (false, false, None),
+            (false, true, None),
+            (true, false, Some(DeviceRequest)),
+            (true, false, Some(Cdi)),
+            (true, true, Some(Cdi)),
+        ] {
+            let request =
+                argv_request(streamed_gpu_args_for_test(nvidia, &["card0", "renderD128"]));
+            assert_eq!(
+                cards_openable(rootless, injection, &request),
+                streamed_card_gap(nvidia, rootless),
+                "nvidia={nvidia} rootless={rootless} {injection:?}"
+            );
+        }
+    }
+
+    /// #464: a console's card is the console plan's own, openable on every engine.
+    #[test]
+    fn a_console_card_stays_openable_on_every_engine() {
+        use crate::session::console_plan::{console_args, ConsoleHost, InputGrant};
+        let host = ConsoleHost {
+            card_node: "/dev/dri/card1".into(),
+            render_node: Some("/dev/dri/renderD129".into()),
+            sound: false,
+            hidraw_nodes: Vec::new(),
+            hidraw_major: None,
+        };
+        let request = argv_request(console_args(&host, &InputGrant::All));
+        assert!(request.mknod_only_cards.is_empty());
+        for rootless in [false, true] {
+            assert!(cards_openable(rootless, None, &request).is_none());
+        }
+        for (dialect, rootless, body) in bodies(&request) {
+            assert_eq!(
+                body["HostConfig"]["Devices"][0],
+                serde_json::json!({"PathOnHost": "/dev/dri/card1", "PathInContainer": "/dev/dri/card1", "CgroupPermissions": "rwm"}),
+                "{dialect:?} rootless={rootless}"
+            );
         }
     }
 
@@ -3080,6 +3287,7 @@ mod read_only_bind_tests {
             engine_groups: Vec::new(),
             group_add: None,
             device_cgroup_rules: None,
+            cards_openable: false,
             nested_sandbox_label: false,
             phase: ApplicationPhase::Creating,
             result: None,

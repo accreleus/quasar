@@ -291,12 +291,12 @@ async fn run_application_gpu(
         let image = match runtime.own_image() {
             Ok(image) => image,
             Err(error) => {
-                return Some(ContainerProbeEnd {
+                return Some(Ok(ContainerProbeEnd {
                     observed: Observed::RuntimeError(format!(
                         "identifying the agent's own image: {error}"
                     )),
                     reconciled: true,
-                });
+                }));
             }
         };
         let mut command = vec![
@@ -313,23 +313,34 @@ async fn run_application_gpu(
         command.push("--open-device".to_string());
         command.push("--render-node".to_string());
         command.push(device_path.clone());
-        let gpu_run = access.probe_run(vec!["/usr/bin/timeout".to_string()], command);
+        let gpu_run = match access.probe_run(vec!["/usr/bin/timeout".to_string()], command) {
+            Ok(run) => run,
+            Err(refused) => return Some(Err(refused)),
+        };
         let nonce = probe_nonce();
-        Some(app_gpu::run(
+        Some(Ok(app_gpu::run(
             api,
             &image,
             gpu_run,
             &nonce,
             APPLICATION_GPU_DEADLINE,
             &is_preempted,
-        ))
+        )))
     })
     .await;
 
     match end {
-        Ok(Some(end)) => RunEnd::Concluded {
+        Ok(Some(Ok(end))) => RunEnd::Concluded {
             outcome: app_gpu::outcome(target, &end),
             reconciled: end.reconciled,
+        },
+        // The launch this probe stands for is refused the same way (#464).
+        Ok(Some(Err(refused))) => RunEnd::Concluded {
+            outcome: ProbeOutcome::Fail {
+                summary: format!("A streamed app cannot be given GPU {gpu}: {refused}"),
+                remediation: super::outcome::remediation(ProbeKind::ApplicationGpu),
+            },
+            reconciled: true,
         },
         Ok(None) => RunEnd::Concluded {
             outcome: ProbeOutcome::Indeterminate {

@@ -113,6 +113,9 @@ pub struct GpuProbeRun {
     /// `/dev/dri` itself or device nodes directly beneath it, realized as
     /// `rwm` device mappings at the same path.
     pub devices: Vec<String>,
+    /// `/dev/dri/cardN` nodes given mknod-only, as a streamed application's are (#464).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mknod_only_cards: Vec<String>,
     /// Numeric supplementary groups owning those nodes: never 0, sorted, no
     /// duplicates, so one request has one fingerprint.
     pub groups: Vec<u32>,
@@ -204,6 +207,10 @@ pub(crate) struct HelperIntent {
     /// How the NVIDIA GPU was requested at create; the read-back judges against this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_injection: Option<crate::runtime::GpuInjection>,
+    /// #464: the engine cannot hold the probe's `mknod_only_cards` to mknod, so they were
+    /// created openable, as the application's are.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cards_openable: bool,
     /// Kept separate from `run` so journals written by the diagnostic-only
     /// implementation continue to decode as the diagnostic profile.
     #[serde(default)]

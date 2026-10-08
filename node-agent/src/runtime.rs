@@ -25,6 +25,7 @@ pub use helpers::{
 };
 pub(crate) use helpers::{HelperIntent, HelperJournal, NvidiaGpuRun};
 mod images;
+pub(crate) use docker::dialect::{card_grant, CardGrant};
 pub use docker::ExactRemoval;
 pub use images::{ImageInfo, ImageOperation, ImageProgress};
 pub use quasar_runtime::{

@@ -394,10 +394,15 @@ fn valid_gpu_probe(run: &GpuProbeRun, name: &str) -> bool {
         && valid_execution(&run.entrypoint, &run.command)
         && run.devices.len() <= 64
         && run.devices.iter().all(|device| valid_dri_device(device))
+        && run.mknod_only_cards.len() <= 64
+        && crate::runtime::application::mknod_only_cards_ok(&run.mknod_only_cards, &run.devices)
         // Sorted and distinct, so one set of groups has one fingerprint.
         && run.groups.first().is_none_or(|first| *first != 0)
         && run.groups.windows(2).all(|pair| pair[0] < pair[1])
-        && (!run.devices.is_empty() || run.nvidia.is_some() || run.nvidia_device_request)
+        && (!run.devices.is_empty()
+            || !run.mknod_only_cards.is_empty()
+            || run.nvidia.is_some()
+            || run.nvidia_device_request)
         && run.nvidia.as_ref().is_none_or(valid_driver_access)
         // A driver volume is only ever given together with the device request, as a
         // session's application container is given them.
@@ -563,6 +568,15 @@ fn intent_device_request(intent: &HelperIntent) -> bool {
             .gpu_probe
             .as_ref()
             .is_some_and(|probe| probe.nvidia_device_request)
+}
+
+/// A probe's devices as it is created and read back.
+fn probe_devices(intent: &HelperIntent, probe: &GpuProbeRun) -> Vec<DeviceMapping> {
+    super::dialect::device_mappings(
+        &probe.devices,
+        &probe.mknod_only_cards,
+        intent.cards_openable,
+    )
 }
 
 fn nvidia_mount(access: &NvidiaDriverAccess) -> Mount {
@@ -768,7 +782,7 @@ fn inspect_owned(
     if let Some(run) = probe {
         if !dialect.devices_ok(
             host.devices.as_deref().unwrap_or(&[]),
-            &run.devices,
+            &probe_devices(intent, run),
             run.nvidia_device_request,
         ) {
             return Err(ErrorKind::Protocol.into());
@@ -1118,6 +1132,7 @@ async fn create_or_adopt_inner(
         nvidia_gpu: None,
         gpu_probe,
         gpu_injection: None,
+        cards_openable: false,
         profile: if is_audio {
             HelperProfile::Audio
         } else if is_gpu_probe {
@@ -1157,6 +1172,18 @@ async fn create_or_adopt_inner(
                 return Err(ErrorKind::InvalidConfiguration.into());
             }
         }
+    }
+    // The probe's cards are created as the application's would be on this engine.
+    if intent
+        .gpu_probe
+        .as_ref()
+        .is_some_and(|probe| !probe.mknod_only_cards.is_empty())
+    {
+        let (rootless, _) = docker.confinement().await?;
+        intent.cards_openable = matches!(
+            super::dialect::card_grant(rootless, intent.gpu_injection),
+            super::dialect::CardGrant::Openable(_)
+        );
     }
     // Podman: pin the image by ID before anything is journalled, and create from that
     // ID, so read-back never depends on where a mutable tag points later.
@@ -1220,17 +1247,10 @@ async fn create_or_adopt_inner(
         crate::runtime::DiagnosticDevices::None => Vec::new(),
     };
     // Same path inside and out: a probe reads the node it was told to read.
-    let devices = intent.gpu_probe.as_ref().map_or(devices, |probe| {
-        probe
-            .devices
-            .iter()
-            .map(|path| DeviceMapping {
-                path_on_host: Some(path.clone()),
-                path_in_container: Some(path.clone()),
-                cgroup_permissions: Some("rwm".into()),
-            })
-            .collect()
-    });
+    let devices = intent
+        .gpu_probe
+        .as_ref()
+        .map_or(devices, |probe| probe_devices(&intent, probe));
     let group_add = intent
         .gpu_probe
         .as_ref()

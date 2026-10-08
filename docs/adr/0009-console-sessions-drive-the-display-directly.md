@@ -26,8 +26,13 @@ and the operator chose to give it up.
 ## What the decision commits us to
 
 - **One display owner per card.** The console desktop is DRM master of the card node; streamed
-  sessions on the same GPU receive only the render node, so they share the GPU without ever being
-  able to take the display. Capacity accounting treats the console as an ordinary session.
+  sessions on the same GPU share the GPU without being able to take the display. Capacity
+  accounting treats the console as an ordinary session. *Amended (#464):* a render node alone
+  breaks radv and gamescope, so streamed sessions are given the card node mknod-only, present but
+  unopenable, wherever the engine can enforce it (rootful Docker and Podman). NVIDIA's container
+  toolkit and rootless engines cannot; there the console holds the display by opening the card
+  first, and `console_card` names a holder (`docs/configuration.md`, "Streamed sessions beside a
+  console").
 - **The desktop owns its settings.** Resolution, refresh, VRR, HDR, idle blanking and the audio
   output are the desktop's, not the admin UI's. The admin picks the card and connector, the
   default app and user, and which input devices the desktop may have.
