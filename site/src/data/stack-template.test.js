@@ -31,6 +31,7 @@ import {
   podmanRunSeed,
   ROOTLESS_DOCS_URL,
   NESTED_GPU_CIL,
+  NESTED_AUDIO_CIL,
 } from './stack-template.js';
 import { PROXIES, proxyConfig } from './proxy-configs.js';
 import { PLATFORMS } from './platforms.js';
@@ -314,9 +315,23 @@ test('host steps on NVIDIA under SELinux (Fedora): the boolean and the one neste
   }
 });
 
-test('the nested-sandbox rule is the one deploy/prepare-host.sh writes', () => {
+test('host steps on SELinux (Fedora): every engine gets the nested-audio rule, NVIDIA or not (#478)', () => {
+  for (const engine of ENGINES) {
+    for (const nvidia of [false, true]) {
+      const fedora = hostSteps(full({ engine, nvidia, platform: 'fedora' }));
+      assert.ok(fedora.includes(NESTED_AUDIO_CIL), `${engine}/nvidia=${nvidia}`);
+      assert.match(fedora, /^echo '\(allow container_engine_t container_t \(unix_stream_socket \(connectto\)\)\)' > quasar-nested-audio\.cil$/m, `${engine}/nvidia=${nvidia}`);
+      assert.match(fedora, /^sudo semodule -i quasar-nested-audio\.cil$/m, `${engine}/nvidia=${nvidia}`);
+    }
+    // Sessions need it wherever SELinux is in play.
+    assert.ok(!hostSteps(full({ engine, nvidia: true, platform: 'ubuntu' })).includes('quasar-nested-audio'), `${engine} on Ubuntu`);
+  }
+});
+
+test('the audio and nested-sandbox rules are the ones deploy/prepare-host.sh writes', () => {
   const prep = readFileSync(fileURLToPath(new URL('../../../deploy/prepare-host.sh', import.meta.url)), 'utf8');
   assert.ok(prep.includes(NESTED_GPU_CIL));
+  assert.ok(prep.includes(NESTED_AUDIO_CIL));
 });
 
 test('QUASAR_IMAGE_NAMESPACE / QUASAR_IMAGE_TAG override the defaults', () => {
