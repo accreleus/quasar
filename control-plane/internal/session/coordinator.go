@@ -177,6 +177,10 @@ func (c *Coordinator) Launch(ctx context.Context, userID, appID string, ov Strea
 // Stop transitions to stopping and tells the agent to tear down; the agent
 // confirms via AgentState. Idempotent on a terminal session.
 func (c *Coordinator) Stop(ctx context.Context, sessionID, reason string) (Session, error) {
+	return c.stop(ctx, sessionID, reason, true)
+}
+
+func (c *Coordinator) stop(ctx context.Context, sessionID, reason string, awaitAck bool) (Session, error) {
 	sess, err := c.store.Get(ctx, sessionID)
 	if err != nil {
 		return Session{}, err
@@ -194,9 +198,14 @@ func (c *Coordinator) Stop(ctx context.Context, sessionID, reason string) (Sessi
 		cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sessionID, Reason: reason}
 		// Best-effort: if the agent is gone the host-disconnect reaper already
 		// drove this session terminal.
-		actx, cancel := context.WithTimeout(ctx, stopAckTimeout)
-		defer cancel()
-		if _, err := c.dispatcher.SendWithAck(actx, *sess.HostID, cmd.ID, cmd); err != nil {
+		if awaitAck {
+			actx, cancel := context.WithTimeout(ctx, stopAckTimeout)
+			defer cancel()
+			_, err = c.dispatcher.SendWithAck(actx, *sess.HostID, cmd.ID, cmd)
+		} else {
+			err = c.dispatcher.Send(*sess.HostID, cmd)
+		}
+		if err != nil {
 			c.log.Warn("session_stop dispatch failed", "session_id", sessionID, "err", err)
 		}
 	}
