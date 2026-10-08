@@ -264,6 +264,8 @@ function nvidiaSelinuxLines() {
  */
 function selinuxAudioLines() {
   return [
+    "# SELinux: let sessions' nested-sandbox apps (Steam) reach their session's sound",
+    '# socket, or those sessions are silent (Device rules, "SELinux and session sound").',
     `echo '${NESTED_AUDIO_CIL}' > quasar-nested-audio.cil`,
     'sudo semodule -i quasar-nested-audio.cil',
   ];
@@ -299,16 +301,7 @@ export function hostSteps(a) {
       );
       if (selinux) lines.push('', '# SELinux: let containers open the NVIDIA devices. SELinux stays enforcing.', ...nvidiaSelinuxLines());
     }
-    if (selinux) {
-      lines.push(
-        '',
-        "# SELinux: let sessions' nested-sandbox apps (Steam) reach the session's",
-        "# PulseAudio sidecar sound socket, or those sessions are silent. Scope:",
-        '# https://accreleus.github.io/quasar/install/device-rules/ — see also',
-        "# docs/install/device-rules.mdx in hand-built sites. SELinux stays enforcing.",
-        ...selinuxAudioLines(),
-      );
-    }
+    if (selinux) lines.push('', ...selinuxAudioLines());
   } else {
     lines.push('# Docker, now and at every boot (it brings Quasar\'s containers back).', 'sudo systemctl enable --now docker');
     if (nvidia) {
@@ -328,16 +321,7 @@ export function hostSteps(a) {
         );
       }
     }
-    if (selinux) {
-      lines.push(
-        '',
-        "# SELinux: let sessions' nested-sandbox apps (Steam) reach the session's",
-        "# PulseAudio sidecar sound socket, or those sessions are silent. Scope:",
-        '# https://accreleus.github.io/quasar/install/device-rules/ — see also',
-        "# docs/install/device-rules.mdx in hand-built sites. SELinux stays enforcing.",
-        ...selinuxAudioLines(),
-      );
-    }
+    if (selinux) lines.push('', ...selinuxAudioLines());
   }
   return lines.join('\n');
 }

@@ -63,9 +63,9 @@ own; the two do not move together, and that is deliberate.
 ### Fixed
 - **A hand-installed Fedora stack's Steam sessions were silent (#478).** `prepare-host.sh`
   loads the `quasar-nested-audio` SELinux module on every SELinux host (#476), but the
-  quick start's manual host steps emitted it only in the NVIDIA branches, so a machine
-  installed by hand never ran host preparation and the nested-sandbox type could not
-  reach its session's PulseAudio sidecar. The steps now emit the same one-line module
+  quick start's manual host steps never emitted it (only the NVIDIA device rule), and a
+  machine installed by hand never runs host preparation, so the nested-sandbox type could
+  not reach its session's PulseAudio sidecar. The steps now emit the same one-line module
   on every SELinux path, NVIDIA or not; the rule's scope is documented in Device rules
   ("SELinux and session sound").
 - **A streamed Steam session on an SELinux host now has sound (#476).** The app runs as the nested-sandbox type (`container_engine_t`), which the policy did not allow to connect to its session's PulseAudio sidecar (`container_t`): the policy's connect rule covers only two containers of the same type, so the stream was silent. `prepare-host.sh` now loads a `quasar-nested-audio` SELinux module granting one permission between the two types and nothing else: a nested-sandbox process may connect to a `container_t` unix socket it can reach by path, which is only its own session's pulse directory because that is all the agent mounts into the app (an app given another session's socket directory could reach that session's audio). **On an SELinux host, run `prepare-host.sh` again** (it is safe to repeat); a host that has not has no sound in those sessions until it does.
