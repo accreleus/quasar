@@ -28,6 +28,10 @@ entry is one of:
 - **Template**: a Dockerfile built on each host from a pinned commit, only when you
   ask.
 
+An operator running a fork or mirror of the catalog points
+`QUASAR_IMAGE_CATALOG_REPO` (and, if the path changed, `QUASAR_IMAGE_CATALOG_PATH`)
+at it on the control plane.
+
 ## Installing an image
 
 1. Open **Admin ▸ Library ▸ Images** and choose an image.

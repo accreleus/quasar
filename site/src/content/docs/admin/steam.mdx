@@ -36,7 +36,7 @@ It does not:
 3. Open the launcher, sign in to Steam and install a game.
 4. Scan under **Admin ▸ Library ▸ Sources**, or wait for the scheduled scan.
 
-The launcher is available to everyone. Installed games appear as separate tiles;
+The launcher is available to everyone unless an admin chose narrower access for it. Installed games appear as separate tiles;
 see [Set up your game library](/quasar/playing/library/).
 
 ## Requirements
@@ -49,8 +49,11 @@ see [Set up your game library](/quasar/playing/library/).
 
 ## Scanning
 
-Scans run every 360 minutes by default. Set `QUASAR_LIBRARY_SCAN_INTERVAL` (in
-minutes; `0` disables scheduled scans). **Admin ▸ Library ▸ Sources** can scan now.
+Scans run every 360 minutes by default (`6h`; change it under **Admin ▸
+Settings**, Libraries, Scan interval). Set `QUASAR_LIBRARY_SCAN_INTERVAL` as a
+Go duration such as `360m` or `6h` to override it; a bare number fails startup,
+and `0` disables discovery entirely regardless of the admin master switch.
+**Admin ▸ Library ▸ Sources** can scan now.
 
 ## Steam-derived apps
 

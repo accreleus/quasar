@@ -34,7 +34,7 @@ ABR never goes below a floor: by default 30% of the tier's bitrate, and at least
 ## The encoder speed ladder
 
 In `smooth` mode, sustained encoder saturation raises the encoder's speed setting
-instead of only cutting bitrate. It unwinds after four healthy windows. Disable it
+instead of only cutting bitrate. It unwinds after two healthy windows. Disable it
 with `QUASAR_ABR_LADDER=0`.
 
 Resolution and frame-rate rungs are opt-in (default off):
