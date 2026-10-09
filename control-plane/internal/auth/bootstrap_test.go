@@ -96,8 +96,14 @@ func TestEnsureBootstrapAdminPromotesExistingUser(t *testing.T) {
 		t.Fatalf("fresh registration must be role=%q, got %q", RoleUser, u.Role)
 	}
 
+	// Whoever registered the email holds a live token before the promotion.
+	before, err := svc.Login(ctx, "ada@quasar.local", "user-pw-12345", "")
+	if err != nil {
+		t.Fatalf("login before promote: %v", err)
+	}
+
 	// Bootstrapping that same email (no admin yet) promotes the account.
-	res, err := svc.EnsureBootstrapAdmin(ctx, "ada@quasar.local", "ada", "ignored-pw-12345")
+	res, err := svc.EnsureBootstrapAdmin(ctx, "ada@quasar.local", "ada", "bootstrap-pw-12345")
 	if err != nil {
 		t.Fatalf("bootstrap promote: %v", err)
 	}
@@ -105,8 +111,15 @@ func TestEnsureBootstrapAdminPromotesExistingUser(t *testing.T) {
 		t.Fatalf("existing user: want BootstrapPromoted, got %v", res)
 	}
 
-	// Promotion does not reset the password — the original still logs in.
-	tok, err := svc.Login(ctx, "ada@quasar.local", "user-pw-12345", "")
+	// The registrant's credentials do not become an admin's: the old password and the
+	// old token stop working, and only the configured password logs in.
+	if _, err := svc.Login(ctx, "ada@quasar.local", "user-pw-12345", ""); err == nil {
+		t.Fatal("the registrant's password must not log in to the promoted admin")
+	}
+	if _, _, err := svc.Authenticate(ctx, before.Plaintext); err == nil {
+		t.Fatal("a token issued before the promotion must be revoked")
+	}
+	tok, err := svc.Login(ctx, "ada@quasar.local", "bootstrap-pw-12345", "")
 	if err != nil {
 		t.Fatalf("login after promote: %v", err)
 	}

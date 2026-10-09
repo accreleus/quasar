@@ -273,8 +273,9 @@ const adminDemoteAdvisoryLock int64 = 0x5175_61_4445 // "Qua" + 'DE' mnemonic
 //   - else if an account with this email exists → promote it (BootstrapPromoted);
 //   - else insert a fresh admin account (BootstrapCreated).
 //
-// The password hash is used only on the insert path; promotion never resets a
-// password. A username collision on insert surfaces as ErrConflict.
+// Promotion sets the configured password and revokes the account's tokens: anyone
+// could have registered that email, so its own credentials must not become an
+// admin's. A username collision on insert surfaces as ErrConflict.
 func (s *store) ensureBootstrapAdmin(ctx context.Context, email, username, passwordHash string) (BootstrapResult, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -298,14 +299,22 @@ func (s *store) ensureBootstrapAdmin(ctx context.Context, email, username, passw
 	}
 
 	// No admin yet: promote a matching account if one already registered.
-	ct, err := tx.Exec(ctx, `
-		UPDATE users SET role = 'admin', updated_at = now()
+	var promotedID string
+	err = tx.QueryRow(ctx, `
+		UPDATE users SET role = 'admin', password_hash = $2, updated_at = now()
 		WHERE lower(email) = lower($1)
-	`, email)
-	if err != nil {
+		RETURNING id::text
+	`, email, passwordHash).Scan(&promotedID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return BootstrapSkipped, fmt.Errorf("promote bootstrap admin: %w", err)
 	}
-	if ct.RowsAffected() > 0 {
+	if err == nil {
+		if _, err := tx.Exec(ctx, `
+			UPDATE auth_tokens SET revoked_at = now()
+			WHERE user_id::text = $1 AND revoked_at IS NULL
+		`, promotedID); err != nil {
+			return BootstrapSkipped, fmt.Errorf("revoke promoted account's tokens: %w", err)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return BootstrapSkipped, fmt.Errorf("commit bootstrap: %w", err)
 		}
