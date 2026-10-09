@@ -37,7 +37,7 @@ Evidence keys used in the tables:
 | E6 | #409 [5892348346](https://github.com/accreleus/quasar/issues/409#issuecomment-5892348346): microphone, rootless Podman (NVIDIA) |
 | E7 | #401 [5891242775](https://github.com/accreleus/quasar/issues/401#issuecomment-5891242775): full per-button input replay, rootless Podman (NVIDIA) |
 | E8 | #409 [5949253849](https://github.com/accreleus/quasar/issues/409#issuecomment-5949253849): AMD rootful Docker on the release candidate: update, machine reboot, bench run `0f990801` |
-| E9 | #458 [6030011254](https://github.com/accreleus/quasar/issues/458#issuecomment-6030011254): direct-display console, rootful Docker (NVIDIA): auto-start at 3840x2160@240, monitor power cycle, controller, sound, a streamed session beside it |
+| E9 | #458 [6030011254](https://github.com/accreleus/quasar/issues/458#issuecomment-6030011254): direct-display console, rootful Docker (NVIDIA; host named in #453 [5994740293](https://github.com/accreleus/quasar/issues/453#issuecomment-5994740293)): auto-start at 3840x2160@240, monitor power cycle, controller, sound, a streamed session beside it |
 | E10 | #460 [6037368775](https://github.com/accreleus/quasar/issues/460#issuecomment-6037368775): direct-display console, rootless Podman with SELinux enforcing (NVIDIA): KDE at 3840x2160@240, keyboard, mouse, sound, monitor power cycle |
 
 ### Docker rootful
@@ -45,7 +45,7 @@ Evidence keys used in the tables:
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
 | AMD | PASS (E1) | PASS: #402 [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916); on the candidate (E8) | PASS (E8) | Not required: NVIDIA covers rootful Docker | PASS: run `0f990801`, "result: clean" (E8) |
-| NVIDIA | PASS over CDI (E1, E4); the `--gpus` fallback fails on a CUDA-only host (#413) | PASS (E4) | PASS (E4) | PASS: #395 [5884298398](https://github.com/accreleus/quasar/issues/395#issuecomment-5884298398); direct display (E9) | PASS: run `3e38e6e3` (E4) |
+| NVIDIA | PASS over CDI (E1, E4); the `--gpus` fallback is fixed (#413), checked with session-shaped containers, not an agent-created Steam session | PASS (E4) | PASS (E4) | PASS: #395 [5884298398](https://github.com/accreleus/quasar/issues/395#issuecomment-5884298398); direct display (E9) | PASS: run `3e38e6e3` (E4) |
 
 ### Docker rootless
 
@@ -67,8 +67,10 @@ The AMD Podman bench is an XFCE soak, not a Steam game.
 
 - **Podman rootful (Fedora):** experimental. A fresh Quadlet install reached `online, owned`
   (#406 [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850));
-  no session, update, reboot or console evidence; LAN traffic to the console port is
-  dropped under firewalld (#416).
+  no session, update, reboot or console evidence. LAN traffic to a published port was
+  dropped by Docker's `FORWARD DROP` policy beside firewalld; the documented
+  `ip-forward-no-drop` fix holds through a reboot (#416
+  [5963605444](https://github.com/accreleus/quasar/issues/416#issuecomment-5963605444)).
 - **Ubuntu 24.04:** no RH-07 hardware run on any engine. Docker rootful's `supported` label
   predates RH-07; the other rows are experimental.
 
@@ -107,7 +109,7 @@ The AMD Podman bench is an XFCE soak, not a Steam game.
 | 29 | One behavioural suite across every engine mode | Met | #408 [5893020059](https://github.com/accreleus/quasar/issues/408#issuecomment-5893020059), in CI on all four modes; its Podman findings (#424, #425, #426) are fixed |
 | 30 | Each required profile proven on hardware before `main` | Partly met | Every NVIDIA row and every AMD rootful Docker row passes (E8). AMD gaps: Docker rootless update, reboot, console, bench; Podman rootless update. Accepted for the v0.4.0 release; tracked in #502 |
 
-Met: 1–13, 15–19, 21–25, 27–29 (**24**). Partly met: 14, 20, 26, 30 (**4**). Not
+Met: 1–13, 15–19, 21–25, 27–29 (**26**). Partly met: 14, 20, 26, 30 (**4**). Not
 evidenced: none.
 
 ## 3. Open gaps
