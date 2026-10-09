@@ -564,7 +564,8 @@ func (h *Handler) handleSignalingToken(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	id := r.PathValue("id")
 	sess, err := h.store.Get(r.Context(), id)
-	if errors.Is(err, ErrNotFound) || (err == nil && !canAccess(user, sess)) {
+	// Owner only, never admin: a token attaches to the live stream and input (#496).
+	if errors.Is(err, ErrNotFound) || (err == nil && sess.UserID != user.ID) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
 		return
 	}
