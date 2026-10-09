@@ -256,3 +256,55 @@ func TestMalformedInventoryPageClosesConnection(t *testing.T) {
 		t.Fatalf("journal gate = %q, err=%v", gate, err)
 	}
 }
+
+func TestKnownRestartAttemptReportedUnderAnotherGroupKeepsHold(t *testing.T) {
+	x := newInventoryHarness(t)
+	ctx := context.Background()
+	attemptID := "00000000-0000-4000-8000-000000000401"
+	digest := strings.Repeat("a", 64)
+	var boot string
+	if err := x.pool.QueryRow(ctx, `SELECT incarnation::text FROM rh05_control_boot WHERE id=true`).Scan(&boot); err != nil {
+		t.Fatal(err)
+	}
+	// A cancelled, never-started hardware grant: the case the idle-apply hold exists for.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO host_config_approvals(id,host_id,group_key,revision,approved_digest,prerequisites_digest,boot_incarnation,review_id,expires_at,state)
+			VALUES($1::uuid,$2::uuid,'hardware',1,$3,$3,$4::uuid,'00000000-0000-4000-8000-000000000402',now()+interval '1 hour','cancel_pending')`,
+			[]any{attemptID, x.hostID, digest, boot}},
+		{`INSERT INTO host_config_attempts(id,host_id,group_key,approved_digest,approved_revision,scope,boot_incarnation,phase)
+			VALUES($1::uuid,$2::uuid,'hardware',$3,1,'restart',$4::uuid,'offered')`,
+			[]any{attemptID, x.hostID, digest, boot}},
+		{`INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+			VALUES($2::uuid,'idle_apply',$1::uuid,'idle_configuration')`,
+			[]any{attemptID, x.hostID}},
+	} {
+		if _, err := x.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The agent reports that attempt id under a group whose catalog scope matches.
+	entry := x.entry(1, "idle_timeout_secs", "next_session")
+	entry.AttemptID = attemptID
+	page := x.page(t, "00000000-0000-4000-8000-000000000306", nil, nil, map[string]string{}, []ConfigPolicyStateMsg{entry})
+	if err := x.h.acceptPolicyInventoryPage(ctx, x.c, page); err != nil {
+		t.Fatal(err)
+	}
+	if !x.c.policyInventoryUnknown || !x.c.policyInventoryBlocked.Load() {
+		t.Fatalf("regrouped attempt not blocked: unknown=%v blocked=%v", x.c.policyInventoryUnknown, x.c.policyInventoryBlocked.Load())
+	}
+	var phase, approval string
+	if err := x.pool.QueryRow(ctx, `SELECT phase FROM host_config_attempts WHERE id=$1::uuid`, attemptID).Scan(&phase); err != nil || phase != "offered" {
+		t.Fatalf("attempt phase = %q, err=%v", phase, err)
+	}
+	if err := x.pool.QueryRow(ctx, `SELECT state FROM host_config_approvals WHERE id=$1::uuid`, attemptID).Scan(&approval); err != nil || approval != "cancel_pending" {
+		t.Fatalf("approval state = %q, err=%v", approval, err)
+	}
+	var holds int
+	if err := x.pool.QueryRow(ctx, `SELECT count(*) FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, x.hostID, attemptID).Scan(&holds); err != nil || holds != 1 {
+		t.Fatalf("idle-apply hold = %d, err=%v", holds, err)
+	}
+	x.assertStillRestricted(t)
+}

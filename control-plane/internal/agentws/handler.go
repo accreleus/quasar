@@ -534,6 +534,15 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 			c.policyInventoryBlocked.Store(true)
 			continue
 		}
+		// An id the database holds under another group or scope must not pass as
+		// unrelated terminal history: it would hide that attempt from the journal view.
+		if contradicts, err := h.cfgStore.InventoryEntryContradictsRecord(ctx, c.hostID, entry.AttemptID, entry.Group, entry.Scope); err != nil {
+			return err
+		} else if contradicts {
+			c.policyInventoryUnknown = true
+			c.policyInventoryBlocked.Store(true)
+			continue
+		}
 		switch entry.Phase {
 		case "applied":
 			// A historical terminal record is not active readback. Reconcile
