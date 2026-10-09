@@ -157,6 +157,17 @@ impl DumpDir {
         DurableFile::new(self.dir.join(format!("{name}.json")), "json.tmp").with_mode(0o600)
     }
 
+    /// Any file of that name exists, readable or not: a new dump must not be renamed over it.
+    pub fn taken(&self, name: &str) -> bool {
+        [
+            self.dir.join(format!("{name}.json")),
+            self.file(name),
+            self.partial(name),
+        ]
+        .iter()
+        .any(|p| p.symlink_metadata().is_ok())
+    }
+
     /// `Ok(None)`: no complete dump of that name.
     pub fn load(&self, name: &str) -> io::Result<Option<DumpRecord>> {
         if !valid_name(name) || !self.dir.join(format!("{name}.json")).exists() {
@@ -435,6 +446,11 @@ mod tests {
         std::fs::write(dir.file(stored), b"PGDMP").unwrap();
         assert!(dir.load(renamed).is_err());
         assert!(dir.list().is_empty());
+        assert!(
+            dir.taken(renamed),
+            "an unreadable record still occupies its name"
+        );
+        assert!(!dir.taken("20260923T100000Z-schema-83"));
     }
 
     #[test]
