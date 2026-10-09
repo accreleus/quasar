@@ -1450,7 +1450,7 @@ pub fn run_blocking(
         // terminal.
         let reason = res
             .audio_degraded_reason()
-            .unwrap_or("PulseAudio sidecar unavailable")
+            .unwrap_or("audio sidecar unavailable")
             .to_string();
         if cfg.audio_required {
             tracing::error!(

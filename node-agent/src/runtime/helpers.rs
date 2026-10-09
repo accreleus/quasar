@@ -142,7 +142,7 @@ pub(crate) struct NvidiaGpuRun {
     pub has_gbm_backend: bool,
 }
 
-/// The fixed, long-running PulseAudio sibling profile.  This is deliberately
+/// The fixed, long-running audio (PipeWire) sibling profile.  This is deliberately
 /// not a general container request: the only writable mount is the
 /// session-private socket directory and its environment is fixed by the
 /// profile.

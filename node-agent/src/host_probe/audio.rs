@@ -39,8 +39,8 @@ pub fn run(
     };
     let request = AudioRun {
         socket_dir: socket_dir.clone(),
-        entrypoint: vec!["pulseaudio".into()],
-        command: crate::session::audio::pulse_command(&socket_dir.to_string_lossy()),
+        entrypoint: vec!["pipewire".into()],
+        command: crate::session::audio::pulse_command(),
     };
     let handle = match api.run_audio_sidecar(helper, request).wait() {
         Ok(handle) => handle,

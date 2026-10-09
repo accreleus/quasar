@@ -420,39 +420,9 @@ fn valid_audio(run: &AudioRun, name: &str) -> bool {
         && suffix.is_some_and(|id| {
             run.socket_dir.file_name().and_then(|v| v.to_str()) == Some(&format!("pulse-{id}"))
         })
-        && run.entrypoint == ["pulseaudio"]
-        && [
-            "--daemonize=no",
-            "--system=no",
-            "--disable-shm=true",
-            "--exit-idle-time=-1",
-            "--log-target=stderr",
-            "-n",
-        ]
-        .iter()
-        .all(|required| run.command.iter().any(|v| v == required))
-        && run.command.iter().any(|v| {
-            v == &format!(
-                "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
-                run.socket_dir.display()
-            )
-        })
-        && run
-            .command
-            .iter()
-            .any(|v| v.contains("module-null-sink sink_name=quasar_output"))
-        && run
-            .command
-            .iter()
-            .any(|v| v.contains("module-null-sink sink_name=quasar_mic"))
-        && run.command.iter().any(|v| {
-            v.contains("module-remap-source master=quasar_mic.monitor source_name=quasar_mic_src")
-        })
-        && run
-            .command
-            .iter()
-            .all(|v| !v.is_empty() && !v.contains('\0'))
-        && run.command.iter().map(String::len).sum::<usize>() <= 8 * 1024
+        // The device topology, socket and auth are baked into the image's config.
+        && run.entrypoint == ["pipewire"]
+        && run.command == ["-c", "/etc/pipewire/quasar-session.conf"]
 }
 fn fingerprint(
     helper: &DiagnosticHelper,
@@ -1297,7 +1267,11 @@ async fn create_or_adopt_inner(
             intent.audio.as_ref().map(|r| {
                 vec![
                     format!("HOME={}", r.socket_dir.display()),
+                    // The socket binds relative to it (deploy/audio/quasar-session-pulse.conf).
                     format!("PULSE_RUNTIME_PATH={}/.runtime", r.socket_dir.display()),
+                    // PipeWire's own socket, private to the sidecar. Not re-checked on
+                    // inspect: sidecars from before #392 carry the image's value.
+                    "XDG_RUNTIME_DIR=/tmp".into(),
                 ]
             })
         }),
