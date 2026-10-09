@@ -36,6 +36,7 @@ func TestDiscoveredTileIsEntitledOnlyToObservers(t *testing.T) {
 		 default_width, default_height, default_fps, default_bitrate_kbps)
 		VALUES ('Steam', 'steam', true, 1024, 1, 1280, 720, 60, 6000)
 		RETURNING id::text`).Scan(&parent))
+	entitleAll(t, pool, parent) // as EnsureProviderApp does; a tile also needs its parent's (#497)
 	for _, u := range []string{f.userID, f.adminID} {
 		must(t, execEnt(ctx, pool, `INSERT INTO user_homes (user_id, app_id, host_id, provider, ref)
 			VALUES ($1::uuid, $2::uuid, $3::uuid, 'local', '/homes/' || $1)`, u, parent, f.hostID))

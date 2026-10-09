@@ -839,3 +839,131 @@ func TestRefusedPatchLeavesTheAllowList(t *testing.T) {
 		t.Errorf("allow-list rows = %d, want 1: a refused patch must not clear it", n)
 	}
 }
+
+// TestRestrictingTheProviderWithdrawsItsTiles — a derived tile needs the
+// caller's entitlement to its parent provider app as well as its own (#497):
+// restricting the provider, or revoking the user from it, hides the tiles the
+// scan granted from GET /v1/apps, GET /v1/apps/{id} and favourites; restoring
+// access brings them back with nothing re-granted on the tile.
+func TestRestrictingTheProviderWithdrawsItsTiles(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newTestServer(t, pool)
+	ctx := context.Background()
+	adminTok := adminBearer(t, ctx, pool, authSvc, "admin@test.local", "admin")
+	user, err := authSvc.Register(ctx, "player@test.local", "player", "quasar-fixture-pw-02")
+	if err != nil {
+		t.Fatalf("register user: %v", err)
+	}
+	login, err := authSvc.Login(ctx, "player@test.local", "quasar-fixture-pw-02", "")
+	if err != nil {
+		t.Fatalf("login user: %v", err)
+	}
+	userTok := login.Plaintext
+
+	parent := seedPlainApp(t, ctx, pool, "steam")
+	var tile string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO apps (name, kind, parent_app_id, external_source, external_id, origin)
+		VALUES ('Portal 2', 'game', $1::uuid, 'steam', '620', 'discovered') RETURNING id::text`,
+		parent).Scan(&tile); err != nil {
+		t.Fatalf("seed tile: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO entitlements (subject_type, subject_id, app_id, granted_by, source_ref)
+		VALUES ('user', $1::uuid, $2::uuid, 'provider', 'library:steam:620')`, user.ID, tile); err != nil {
+		t.Fatalf("seed tile grant: %v", err)
+	}
+	setMode := func(mode string) {
+		t.Helper()
+		resp, body := post(t, srv.URL+"/v1/admin/library-providers/steam/entitlement-mode",
+			map[string]any{"mode": mode}, adminTok)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("set mode %s: want 200, got %d (%v)", mode, resp.StatusCode, body)
+		}
+	}
+	visible := func() bool {
+		t.Helper()
+		listed := contains(listAppIDs(t, srv.URL, "/v1/apps", userTok), tile)
+		resp, _ := getReq(t, srv.URL+"/v1/apps/"+tile, userTok)
+		if listed != (resp.StatusCode == http.StatusOK) {
+			t.Fatalf("GET /v1/apps lists the tile: %v, but GET /v1/apps/{id} is %d", listed, resp.StatusCode)
+		}
+		fav, _ := putReq(t, srv.URL+"/v1/me/favourites/"+tile, userTok)
+		if listed != (fav.StatusCode < 300) {
+			t.Fatalf("GET /v1/apps lists the tile: %v, but PUT favourite is %d", listed, fav.StatusCode)
+		}
+		return listed
+	}
+
+	setMode("all")
+	if !visible() {
+		t.Fatal("provider open to all: the tile is hidden")
+	}
+	setMode("user") // "only me": the admin, not the player
+	if visible() {
+		t.Error(`provider restricted to "only me": the player still sees the tile`)
+	}
+	setMode("all")
+	if !visible() {
+		t.Error("provider reopened to all: the tile did not come back")
+	}
+	setMode("none")
+	if visible() {
+		t.Error(`provider set to "nobody": the player still sees the tile`)
+	}
+	// Restored by a per-user grant on the provider app.
+	resp, body := post(t, srv.URL+"/v1/admin/apps/"+parent+"/entitlements",
+		map[string]any{"subject_type": "user", "subject_id": user.ID}, adminTok)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("grant the player the provider: want 201, got %d (%v)", resp.StatusCode, body)
+	}
+	if !visible() {
+		t.Error("player granted the provider again: the tile did not come back")
+	}
+}
+
+// TestDeletingTheOnlyProviderAppWhileDiscoveryIsOn — deleting a provider's only
+// app while discovery runs would have EnsureProviderApp recreate it open to
+// everyone (#497), so it is 409 provider_enabled, the same rule as the PATCH
+// clear; with discovery off, or another app still claiming the provider, the
+// delete goes through.
+func TestDeletingTheOnlyProviderAppWhileDiscoveryIsOn(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		discovery  bool
+		duplicate  bool
+		wantStatus int
+	}{
+		{"discovery on, only provider app", true, false, http.StatusConflict},
+		{"discovery off", false, false, http.StatusNoContent},
+		{"discovery on, another provider app remains", true, true, http.StatusNoContent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := testDB(t)
+			srv, authSvc := newTestServer(t, pool)
+			ctx := context.Background()
+			tok := adminBearer(t, ctx, pool, authSvc, "admin@test.local", "admin")
+			setLibraryDiscovery(t, pool, tc.discovery)
+			app := seedPlainApp(t, ctx, pool, "steam")
+			if tc.duplicate {
+				seedPlainApp(t, ctx, pool, "steam")
+			}
+
+			resp, body := deleteJSON(t, srv.URL+"/v1/apps/"+app, tok)
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("delete provider app: want %d, got %d (%v)", tc.wantStatus, resp.StatusCode, body)
+			}
+			var kept bool
+			if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM apps WHERE id = $1::uuid)`, app).Scan(&kept); err != nil {
+				t.Fatalf("read app: %v", err)
+			}
+			if tc.wantStatus == http.StatusConflict {
+				if code := errorCode(body); code != "provider_enabled" || !kept {
+					t.Errorf("refused delete: code %q, app kept %v; want provider_enabled and kept", code, kept)
+				}
+			} else if kept {
+				t.Error("app still exists after a 204")
+			}
+		})
+	}
+}

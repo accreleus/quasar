@@ -299,16 +299,25 @@ func (s *store) attachCapacities(ctx context.Context, hosts []Host) error {
 // invariant #6 bypass class. GET /v1/admin/apps is the separate admin view.
 //
 // Hand-copied (internal/session cannot import internal/crud) at
-// entitlements.go (entitledToApp), session/store.go (IsEntitled),
-// session/scheduler.go (scheduleAttempt, + FOR SHARE). A future 'group'
-// subject type must be added in all four. Do not add a fifth copy.
+// session/store.go (IsEntitled), session/scheduler.go (scheduleAttempt, + FOR SHARE) and
+// session/app_launch_profiles.go. A future 'group' subject type must be added in
+// all of them. Do not add another copy.
+//
+// A derived tile also needs the caller's entitlement to its parent provider app
+// (amendment 22, #497): restricting or revoking the provider must withdraw every
+// tile the scan granted, the same way the parent's enabled gates them.
 func entitledSQL(callerParam string) string {
-	return `EXISTS (
+	subject := `(e.subject_type = 'all'
+			       OR (e.subject_type = 'user' AND e.subject_id = ` + callerParam + `::uuid))`
+	return `(EXISTS (
 			SELECT 1 FROM entitlements e
 			WHERE e.app_id = apps.id
-			  AND (e.subject_type = 'all'
-			       OR (e.subject_type = 'user' AND e.subject_id = ` + callerParam + `::uuid))
-		)`
+			  AND ` + subject + `
+		) AND (apps.parent_app_id IS NULL OR EXISTS (
+			SELECT 1 FROM entitlements e
+			WHERE e.app_id = apps.parent_app_id
+			  AND ` + subject + `
+		)))`
 }
 
 // listApps returns enabled apps the caller is entitled to, cursor-paginated.
@@ -668,15 +677,16 @@ func refuseSecondProviderApp(ctx context.Context, tx pgx.Tx, provider, exceptID 
 	return nil
 }
 
-// ErrProviderClearWhileDiscoveryOn: un-marking the only app of a provider while
-// library discovery is on would let the next EnsureProviderApp create a fresh
-// one open to everyone, leaving the restriction behind on this app (#490).
-var ErrProviderClearWhileDiscoveryOn = errors.New("library discovery is on and this is its only provider app")
+// ErrLastProviderAppWhileDiscoveryOn: un-marking or deleting the only app of a
+// provider while library discovery is on would let the next EnsureProviderApp
+// create a fresh one open to everyone, leaving the restriction behind (#490,
+// #497).
+var ErrLastProviderAppWhileDiscoveryOn = errors.New("library discovery is on and this is its only provider app")
 
-// refuseProviderClearWhileDiscoveryOn guards PATCH library_provider "". A clear
-// stays allowed while another app still claims the provider or discovery is
-// off. Caller holds every provider lock (updateApp).
-func refuseProviderClearWhileDiscoveryOn(ctx context.Context, tx pgx.Tx, appID string) error {
+// refuseLastProviderAppWhileDiscoveryOn guards PATCH library_provider "" and
+// DELETE. Either stays allowed while another app still claims the provider or
+// discovery is off. Caller holds every provider lock (updateApp, deleteApp).
+func refuseLastProviderAppWhileDiscoveryOn(ctx context.Context, tx pgx.Tx, appID string) error {
 	var provider string
 	err := tx.QueryRow(ctx, `SELECT library_provider FROM apps WHERE id::text = $1`, appID).Scan(&provider)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && provider == "") {
@@ -693,7 +703,7 @@ func refuseProviderClearWhileDiscoveryOn(ctx context.Context, tx pgx.Tx, appID s
 		return fmt.Errorf("check provider clear for %q: %w", provider, err)
 	}
 	if refuse {
-		return ErrProviderClearWhileDiscoveryOn
+		return ErrLastProviderAppWhileDiscoveryOn
 	}
 	return nil
 }
@@ -960,7 +970,7 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 		if becomesProvider {
 			err = refuseSecondProviderApp(ctx, tx, *libraryProvider, id)
 		} else {
-			err = refuseProviderClearWhileDiscoveryOn(ctx, tx, id)
+			err = refuseLastProviderAppWhileDiscoveryOn(ctx, tx, id)
 		}
 		if err != nil {
 			return App{}, err
@@ -1485,6 +1495,17 @@ func (s *store) deleteApp(ctx context.Context, id string, deleteDerived bool) (s
 		return "", fmt.Errorf("begin delete app tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
+
+	// Every provider lock, before any row lock and before reading this app's
+	// provider, as updateApp: a designation committing in between would go unseen.
+	for _, p := range libraryProviders {
+		if err := images.LockProviderApp(ctx, tx, p); err != nil {
+			return "", err
+		}
+	}
+	if err := refuseLastProviderAppWhileDiscoveryOn(ctx, tx, id); err != nil {
+		return "", err
+	}
 
 	var name string
 	var parentID *string

@@ -1157,7 +1157,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description In use by an active session (pre-existing), OR (Phase 3) the app has derived tiles and ?delete_derived=true was not sent - the body then carries `derived_tiles`, OR (RH05) deleting the canonical parent would cascade a pending-home hold. The RH05 refusal uses ErrorEnvelope code `conflict` and a fixed managed-home-pending message. */
+                /** @description In use by an active session (pre-existing), OR (Phase 3) the app has derived tiles and ?delete_derived=true was not sent - the body then carries `derived_tiles`, OR (RH05) deleting the canonical parent would cascade a pending-home hold. The RH05 refusal uses ErrorEnvelope code `conflict` and a fixed managed-home-pending message. Amendment 22: code `provider_enabled` - the app is its library_provider's only app and library discovery is enabled; disable library discovery in Settings first. */
                 409: {
                     headers: {
                         [name: string]: unknown;
