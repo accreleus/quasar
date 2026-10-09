@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/accreleus/quasar/control-plane/internal/images"
 )
 
 // TestSetProviderEntitlementModeAll — enabling "all" after a prior "user"-only
@@ -377,5 +379,73 @@ func TestSetProviderEntitlementModeRequiresAdmin(t *testing.T) {
 		map[string]any{"mode": "all"}, tok.Plaintext)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("want 403, got %d (%v)", resp.StatusCode, body)
+	}
+}
+
+// TestStoredModeSurvivesAMixedCaseCatalogProvider — the catalog's
+// library_provider has no lowercase CHECK. A mode stored through the route for
+// "steam" must still be found when EnsureProviderApp runs for a catalog row
+// saying "Steam": same lock key, same DELETE key, so no fall-back to 'all'.
+func TestStoredModeSurvivesAMixedCaseCatalogProvider(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newTestServer(t, pool)
+	ctx := context.Background()
+	tok := adminBearer(t, ctx, pool, authSvc, "admin@test.local", "admin")
+	var adminID string
+	if err := pool.QueryRow(ctx, `SELECT id::text FROM users WHERE email = 'admin@test.local'`).Scan(&adminID); err != nil {
+		t.Fatalf("admin id: %v", err)
+	}
+
+	const imageID = "entitlement-mode-mixed-case"
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO image_catalog (id, manifest_version, display_name, kind, version, registry_ref, library_provider, raw)
+		VALUES ($1, 1, 'Steam', 'prebuilt', 'v1', 'registry.example.test/steam:v1', 'Steam', '{}'::jsonb)`, imageID); err != nil {
+		t.Fatalf("seed catalog image: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM image_catalog WHERE id = $1`, imageID) })
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO installed_images (image_id, version, registry_ref) VALUES ($1, 'v1', 'registry.example.test/steam:v1')`, imageID); err != nil {
+		t.Fatalf("seed adoption: %v", err)
+	}
+
+	resp, body := post(t, srv.URL+"/v1/admin/library-providers/steam/entitlement-mode",
+		map[string]any{"mode": "user"}, tok)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202, got %d (%v)", resp.StatusCode, body)
+	}
+
+	created, err := images.NewStoreWithFetcher(pool, nil).EnsureProviderApp(ctx, imageID, "Steam")
+	if err != nil || !created {
+		t.Fatalf("EnsureProviderApp = (%v, %v), want a created app", created, err)
+	}
+
+	rows, err := pool.Query(ctx, `
+		SELECT e.subject_type, e.subject_id::text FROM entitlements e
+		JOIN apps a ON a.id = e.app_id WHERE a.library_provider = 'steam'`)
+	if err != nil {
+		t.Fatalf("read entitlements: %v", err)
+	}
+	type grant struct {
+		subjectType string
+		subjectID   *string
+	}
+	var grants []grant
+	for rows.Next() {
+		var g grant
+		if err := rows.Scan(&g.subjectType, &g.subjectID); err != nil {
+			t.Fatalf("scan entitlement: %v", err)
+		}
+		grants = append(grants, g)
+	}
+	rows.Close()
+	if len(grants) != 1 || grants[0].subjectType != "user" || grants[0].subjectID == nil || *grants[0].subjectID != adminID {
+		t.Fatalf("entitlements = %+v, want exactly ('user', %s) and no 'all' row", grants, adminID)
+	}
+	var left int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pending_provider_entitlement_modes`).Scan(&left); err != nil {
+		t.Fatalf("count stored modes: %v", err)
+	}
+	if left != 0 {
+		t.Errorf("stored modes after create = %d, want 0", left)
 	}
 }
