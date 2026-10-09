@@ -606,7 +606,12 @@ mod tests {
         let pulse = baked_config("quasar-session-pulse.conf");
         let props = &pulse[pulse.find("pulse.properties = {").unwrap()..];
         let props = &props[..props.find("\n}").unwrap()];
-        assert!(props.contains("pulse.min.quantum = 512/48000"), "{props}");
+        assert!(
+            props
+                .lines()
+                .any(|l| l.trim() == "pulse.min.quantum = 512/48000"),
+            "{props}"
+        );
     }
 
     // Stock PipeWire's VM rule, copied from /usr/share/pipewire/pipewire{,-pulse}.conf: small
