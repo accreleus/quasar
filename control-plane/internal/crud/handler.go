@@ -636,31 +636,12 @@ func (h *Handler) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		req.DefaultVramMB, req.DefaultEncodeSlots,
 		req.DefaultWidth, req.DefaultHeight, req.DefaultFPS, req.DefaultBitratekbps,
 		req.RuntimeSpec, req.ManagedHome, req.HomeContainerPath, req.DefaultProfileID, req.ProfilePolicy,
-		req.RuntimePresetID, caller.ID)
+		req.RuntimePresetID, req.Entitle, caller.ID)
 	if err != nil {
 		if writeAppConstraintError(w, err) {
 			return
 		}
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not create app")
-		return
-	}
-
-	// §6.4 default 'all' entitlement, skipped on entitle:"none" or replaced by a
-	// provider's stored mode (grantOnCreate). Fail closed: on write failure,
-	// delete the app rather than leave it created-but-invisible with no field in
-	// the editor explaining why. The app is seconds old and cannot have sessions,
-	// so deleteApp's refuse-if-in-use guard cannot fire.
-	// (Discovered tiles get no 'all' row; that's Phase 4, not this handler.)
-	provider := ""
-	if req.LibraryProvider != nil {
-		provider = *req.LibraryProvider
-	}
-	if err := h.store.grantOnCreate(r.Context(), app.ID, provider, req.Entitle, actorID(r)); err != nil {
-		if _, delErr := h.store.deleteApp(r.Context(), app.ID, true); delErr != nil {
-			slog.Error("Phase 2: could not roll back an app whose default entitlement write failed — it exists INVISIBLE",
-				"app_id", app.ID, "write_err", err, "rollback_err", delErr)
-		}
-		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not set the app's default entitlement")
 		return
 	}
 
@@ -932,16 +913,6 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		}
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not update app")
 		return
-	}
-
-	if becomesProvider {
-		if err := h.store.applyStoredEntitlementMode(r.Context(), id, *req.LibraryProvider); err != nil {
-			slog.Error("app updated but its provider's stored entitlement mode was not applied; retry the PATCH",
-				"app_id", id, "err", err)
-			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal,
-				"app updated, but the stored entitlement mode for its provider could not be applied — retry")
-			return
-		}
 	}
 
 	// (b) from above: run only once updateApp's policy write has landed.

@@ -207,6 +207,10 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
     return () => window.clearInterval(id);
   }, [anyStillMoving, token]);
 
+  function modeLabel(kind: string) {
+    return ENTITLEMENT_MODE_OPTIONS.find((o) => o.value === (entitlementMode[kind] ?? "all"))?.label;
+  }
+
   function toggle(kind: string, next: boolean) {
     setSelected((prev) => ({ ...prev, [kind]: next }));
   }
@@ -232,15 +236,13 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
         errors[kind] = err instanceof ApiError ? err.message : `Could not enable ${kind}.`;
         continue; // nothing was enabled — no app to set a mode on
       }
-      // #465: second call, only when the mode differs from the create default.
-      const mode = entitlementMode[kind] ?? "all";
-      if (mode !== "all") {
-        try {
-          const res = await adminApi.setProviderEntitlementMode(token, kind, mode);
-          if ("pending_entitlement_mode" in res) pending[kind] = true;
-        } catch (err) {
-          modeFailures[kind] = err instanceof ApiError ? err.message : `Could not set who can see ${kind} yet.`;
-        }
+      // #465: second call, for every choice, so "all" also replaces a mode an
+      // earlier pass stored (#490).
+      try {
+        const res = await adminApi.setProviderEntitlementMode(token, kind, entitlementMode[kind] ?? "all");
+        if ("pending_entitlement_mode" in res) pending[kind] = true;
+      } catch (err) {
+        modeFailures[kind] = err instanceof ApiError ? err.message : `Could not set who can see ${kind} yet.`;
       }
     }
     setSubmitErrors(errors);
@@ -370,17 +372,17 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
           ))}
           {Object.keys(modesPending).map((kind) => (
             <p key={kind} className="field-hint m0">
-              “{ENTITLEMENT_MODE_OPTIONS.find((o) => o.value === entitlementMode[kind])?.label}” will apply to{" "}
+              “{modeLabel(kind)}” will apply to{" "}
               {providers.find((p) => p.kind === kind)?.displayName ?? kind} as soon as it finishes installing.
             </p>
           ))}
-          {/* An enabled provider stuck on "all" must say so honestly. */}
+          {/* A restriction that did not land leaves the provider on "all": say so. */}
           {Object.entries(modeErrors).map(([kind, msg]) => (
             <p key={kind} className="form-error m0">
-              {providers.find((p) => p.kind === kind)?.displayName ?? kind} is enabled and
-              visible to all users for now — could not switch it to{" "}
-              {ENTITLEMENT_MODE_OPTIONS.find((o) => o.value === entitlementMode[kind])?.label.toLowerCase()}{" "}
-              yet ({msg}). Set it from <strong>Admin → Apps</strong> once you're in.
+              {providers.find((p) => p.kind === kind)?.displayName ?? kind} is enabled
+              {(entitlementMode[kind] ?? "all") !== "all" && " and visible to all users for now"} — could
+              not switch it to {modeLabel(kind)?.toLowerCase()} yet ({msg}). Set it from{" "}
+              <strong>Admin → Apps</strong> once you're in.
             </p>
           ))}
           {submittedKinds.some((kind) => providerStatus(images ?? [], kind) === "failed") && (

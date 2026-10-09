@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/admission"
+	"github.com/accreleus/quasar/control-plane/internal/images"
 	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
@@ -495,7 +496,7 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 	parentAppID, libraryProvider *string,
 	vram, slots, w, h, fps, kbps *int32, runtimeSpec json.RawMessage,
 	managedHome bool, homeContainerPath string, defaultProfileID *string, profilePolicy string,
-	runtimePresetID *string, callerID string) (App, error) {
+	runtimePresetID *string, entitle string, callerID string) (App, error) {
 	if len(runtimeSpec) == 0 {
 		runtimeSpec = json.RawMessage(`{}`)
 	}
@@ -589,6 +590,17 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 		return App{}, fmt.Errorf("begin app create: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	provider := ""
+	if libraryProvider != nil {
+		provider = *libraryProvider
+	}
+	// Held through the grant so EnsureProviderApp and the entitlement-mode
+	// route see this app or none of it (#490).
+	if provider != "" {
+		if err := images.LockProviderApp(ctx, tx, provider); err != nil {
+			return App{}, err
+		}
+	}
 	if err := tx.QueryRow(ctx, query, args...).Scan(&id); err != nil {
 		if translated := appConstraintError(err); translated != nil {
 			return App{}, translated
@@ -600,6 +612,13 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 		return App{}, fmt.Errorf("read created app image: %w", err)
 	}
 	if err := fenceImageRequirementWrite(ctx, tx, newRef); err != nil {
+		return App{}, err
+	}
+	var actor *string
+	if callerID != "" {
+		actor = &callerID
+	}
+	if err := grantOnCreate(ctx, tx, id, provider, entitle, actor); err != nil {
 		return App{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -858,6 +877,14 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 		return App{}, fmt.Errorf("begin app update: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Making an app a provider's: same lock as createApp, and a mode stored
+	// before the provider app existed (#490) replaces its entitlements below.
+	becomesProvider := libraryProvider != nil && *libraryProvider != ""
+	if becomesProvider {
+		if err := images.LockProviderApp(ctx, tx, *libraryProvider); err != nil {
+			return App{}, err
+		}
+	}
 	oldRef := ""
 	if enabled != nil || len(runtimeSpec) > 0 || runtimePresetID != nil || parentAppID != nil {
 		oldRef, err = imageRefForApp(ctx, tx, id)
@@ -888,6 +915,11 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 			return App{}, fmt.Errorf("read new app image: %w", err)
 		}
 		if err := fenceImageRequirementWrite(ctx, tx, oldRef, newRef); err != nil {
+			return App{}, err
+		}
+	}
+	if becomesProvider {
+		if _, err := images.ApplyRequestedEntitlementMode(ctx, tx, id, *libraryProvider); err != nil {
 			return App{}, err
 		}
 	}

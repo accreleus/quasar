@@ -191,62 +191,31 @@ func (s *store) revokeEntitlement(ctx context.Context, appID, entitlementID stri
 
 // grantOnCreate writes the ('all', granted_by='admin') entitlement that makes a
 // newly created app visible (§6.4) — without it every new app is invisible by
-// default — unless entitle is "none". For a provider app it runs under
-// images.LockProviderApp: with no explicit entitle a mode stored before the app
-// existed (#490) replaces the default, and an explicit entitle drops it. One
-// transaction, so the entitlement-mode route cannot land between the stored
-// mode and the default. ON CONFLICT DO NOTHING guards entitlements_all_uk if
-// create ever gains a retry.
-func (s *store) grantOnCreate(ctx context.Context, appID, provider, entitle string, actorID *string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin default entitlement: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
-
+// default — unless entitle is "none". For a provider app, whose create holds
+// images.LockProviderApp, a mode stored before the app existed (#490) replaces
+// the default when entitle is absent, and an explicit entitle drops it. ON
+// CONFLICT DO NOTHING guards entitlements_all_uk if create ever gains a retry.
+func grantOnCreate(ctx context.Context, tx pgx.Tx, appID, provider, entitle string, actorID *string) error {
 	if provider != "" {
-		if err := images.LockProviderApp(ctx, tx, provider); err != nil {
-			return err
-		}
 		if entitle == "" {
 			applied, err := images.ApplyRequestedEntitlementMode(ctx, tx, appID, provider)
-			if err != nil {
+			if err != nil || applied {
 				return err
-			}
-			if applied {
-				return tx.Commit(ctx)
 			}
 		} else if _, err := tx.Exec(ctx, `DELETE FROM pending_provider_entitlement_modes WHERE provider = $1`, provider); err != nil {
 			return fmt.Errorf("drop stored entitlement mode: %w", err)
 		}
 	}
-	if entitle != "none" {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO entitlements (subject_type, subject_id, app_id, granted_by, granted_by_user)
-			VALUES ('all', NULL, $1::uuid, 'admin', $2::uuid)
-			ON CONFLICT DO NOTHING`, appID, actorID); err != nil {
-			return fmt.Errorf("grant default entitlement: %w", err)
-		}
+	if entitle == "none" {
+		return nil
 	}
-	return tx.Commit(ctx)
-}
-
-// applyStoredEntitlementMode runs after PATCH /v1/apps made appID provider's
-// app: a mode stored before that app existed (#490) replaces its entitlements,
-// under the same lock as grantOnCreate.
-func (s *store) applyStoredEntitlementMode(ctx context.Context, appID, provider string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin stored entitlement mode: %w", err)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO entitlements (subject_type, subject_id, app_id, granted_by, granted_by_user)
+		VALUES ('all', NULL, $1::uuid, 'admin', $2::uuid)
+		ON CONFLICT DO NOTHING`, appID, actorID); err != nil {
+		return fmt.Errorf("grant default entitlement: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
-	if err := images.LockProviderApp(ctx, tx, provider); err != nil {
-		return err
-	}
-	if _, err := images.ApplyRequestedEntitlementMode(ctx, tx, appID, provider); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // entitledToApp reports whether userID may see/launch appID. Copy of

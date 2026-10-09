@@ -84,6 +84,9 @@ describe("StepLibraries", () => {
     vi.mocked(adminApi.syncImages).mockReset();
     vi.mocked(adminApi.updateSettings).mockReset();
     vi.mocked(adminApi.setProviderEntitlementMode).mockReset();
+    vi.mocked(adminApi.setProviderEntitlementMode).mockResolvedValue({
+      entitlement_mode: { provider: "steam", app_id: "app-1", mode: "all", items: [] },
+    });
   });
 
   it("shows a loading state while the catalog is in flight", () => {
@@ -322,7 +325,8 @@ describe("StepLibraries", () => {
     expect(screen.getByRole("tab", { name: "Nobody yet" })).toBeInTheDocument();
   });
 
-  it("leaving the picker on Everyone (the default) does not call the entitlement-mode endpoint", async () => {
+  // #490: "all" is sent too, so it replaces a restriction an earlier pass stored.
+  it("leaving the picker on Everyone (the default) still sends mode 'all'", async () => {
     vi.mocked(adminApi.listImages).mockResolvedValue(syncedCatalog([steamImage()]));
     vi.mocked(adminApi.updateSettings).mockResolvedValue({} as never);
     renderStep();
@@ -332,9 +336,10 @@ describe("StepLibraries", () => {
     fireEvent.click(screen.getByRole("button", { name: /^continue$/i }));
 
     await waitFor(() => {
-      expect(adminApi.updateSettings).toHaveBeenCalledWith("tok", { library_discovery_enabled: true });
+      expect(adminApi.setProviderEntitlementMode).toHaveBeenCalledWith("tok", "steam", "all");
     });
-    expect(adminApi.setProviderEntitlementMode).not.toHaveBeenCalled();
+    expect(adminApi.updateSettings).toHaveBeenCalledWith("tok", { library_discovery_enabled: true });
+    expect(screen.queryByText(/could not switch/i)).not.toBeInTheDocument();
   });
 
   it("picking Only me submits the settings PATCH and then the entitlement-mode call", async () => {
