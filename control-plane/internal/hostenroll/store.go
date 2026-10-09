@@ -232,25 +232,25 @@ func (s *Store) Revoke(ctx context.Context, id string) error {
 // the row lock.
 //
 // A token bound to a node_name only redeems for that node_name; an unbound token redeems
-// for any. Zero rows ⇒ ErrInvalidToken for every reason, with no oracle.
-func Redeem(ctx context.Context, db DBTX, plaintext, nodeName string) error {
+// for any, and bound reports which it was (an unbound one may only create a host).
+// Zero rows ⇒ ErrInvalidToken for every reason, with no oracle.
+func Redeem(ctx context.Context, db DBTX, plaintext, nodeName string) (bound bool, err error) {
 	if plaintext == "" {
-		return ErrInvalidToken
+		return false, ErrInvalidToken
 	}
-	var id string
-	err := db.QueryRow(ctx, `
+	err = db.QueryRow(ctx, `
 		UPDATE host_enrollments
 		SET used_count = used_count + 1, last_used_at = now(), used_by_node_name = $2
 		WHERE token_hash = $1
 		  AND (node_name IS NULL OR node_name = $2)
 		  AND `+pendingSQL+`
-		RETURNING id::text
-	`, hashToken(plaintext), nodeName).Scan(&id)
+		RETURNING node_name IS NOT NULL
+	`, hashToken(plaintext), nodeName).Scan(&bound)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrInvalidToken
+		return false, ErrInvalidToken
 	}
 	if err != nil {
-		return fmt.Errorf("redeem host enrollment: %w", err)
+		return false, fmt.Errorf("redeem host enrollment: %w", err)
 	}
-	return nil
+	return bound, nil
 }

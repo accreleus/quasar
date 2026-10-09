@@ -413,6 +413,17 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 	return tx.Commit(ctx)
 }
 
+// InventoryEntryContradictsRecord reports whether the database already knows
+// attemptID under a different group or scope than the agent reported.
+func (s *Store) InventoryEntryContradictsRecord(ctx context.Context, hostID, attemptID, group, scope string) (bool, error) {
+	var contradicts bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host_config_attempts
+			WHERE host_id=$1::uuid AND id=$2::uuid AND (group_key<>$3 OR scope<>$4))
+		OR EXISTS(SELECT 1 FROM host_config_approvals
+			WHERE host_id=$1::uuid AND id=$2::uuid AND group_key<>$3)`, hostID, attemptID, group, scope).Scan(&contradicts)
+	return contradicts, err
+}
+
 type JournalInventoryEntry struct {
 	AttemptID, HostID, Group, Digest, Scope, Phase, Sequence string
 	Revision, GrantBoot, GrantConnection                     string

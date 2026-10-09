@@ -527,7 +527,18 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 			})
 			continue
 		}
-		if entry.HostID != c.hostID || !hostcfg.IsPolicyGroup(entry.Group) {
+		// A scope that disagrees with the group's catalog scope is malformed,
+		// not terminal history: a failed one must not hide an attempt.
+		if groupScope, known := hostcfg.PolicyGroupScope(entry.Group); entry.HostID != c.hostID || !known || entry.Scope != groupScope {
+			c.policyInventoryUnknown = true
+			c.policyInventoryBlocked.Store(true)
+			continue
+		}
+		// An id the database holds under another group or scope must not pass as
+		// unrelated terminal history: it would hide that attempt from the journal view.
+		if contradicts, err := h.cfgStore.InventoryEntryContradictsRecord(ctx, c.hostID, entry.AttemptID, entry.Group, entry.Scope); err != nil {
+			return err
+		} else if contradicts {
 			c.policyInventoryUnknown = true
 			c.policyInventoryBlocked.Store(true)
 			continue
@@ -1391,6 +1402,10 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			h.writeError(conn, "auth_failed",
 				"a live agent is already registered under this node name; stop it before re-enrolling, "+
 					"or enroll under a different node_name")
+		case errors.Is(err, ErrHostAlreadyEnrolled):
+			h.writeError(conn, "auth_failed",
+				"this node name is already enrolled; re-enrolling it needs an enrollment token "+
+					"minted for this node name (Admin -> Fleet -> Add host, with the name filled in)")
 		case errors.Is(err, ErrHostNotFound):
 			// Names the credential that was refused, not just the remedy: the old
 			// wording ("use enrollment_token to enroll first") is exactly what an
