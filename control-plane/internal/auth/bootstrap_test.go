@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -151,5 +152,102 @@ func assertAdminCount(t *testing.T, pool *pgxpool.Pool, want int) {
 	}
 	if n != want {
 		t.Fatalf("admin count: want %d, got %d", want, n)
+	}
+}
+
+// #485 review: a login that verified the old password while a promotion was still
+// uncommitted must not mint a token that outlives it. Token issue waits on the row
+// and re-checks the hash, so it is refused once the promotion commits.
+func TestTokenIssueWaitsForAnInFlightPasswordChange(t *testing.T) {
+	pool := testDB(t)
+	svc := testService(t, pool)
+	ctx := context.Background()
+
+	u, err := svc.Register(ctx, "ada@quasar.local", "ada", "user-pw-12345")
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	creds, err := svc.store.getCredentialsByEmail(ctx, "ada@quasar.local")
+	if err != nil {
+		t.Fatalf("credentials: %v", err)
+	}
+
+	promotion, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer promotion.Rollback(ctx) //nolint:errcheck
+	if _, err := promotion.Exec(ctx, `UPDATE users SET role = 'admin', password_hash = 'operator' WHERE id = $1::uuid`, u.ID); err != nil {
+		t.Fatalf("in-flight promotion: %v", err)
+	}
+
+	_, hash, err := generateToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.store.createToken(ctx, u.ID, creds.passwordHash, hash, time.Now().Add(time.Hour), "", "")
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO auth_tokens%')`).Scan(&waiting); err != nil {
+			t.Fatalf("pg_stat_activity: %v", err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("token issue did not wait for the uncommitted promotion (returned %v)", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("token issue never waited on the user row")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := promotion.Commit(ctx); err != nil {
+		t.Fatalf("commit promotion: %v", err)
+	}
+	if err := <-done; !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("token issue after the promotion: got %v, want ErrInvalidCredentials", err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM auth_tokens WHERE user_id = $1::uuid`, u.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("%d token(s) issued against the replaced password", n)
+	}
+}
+
+// A password change verified against a hash that has since been replaced does not
+// overwrite the new one.
+func TestPasswordChangeVerifiedAgainstAReplacedHashIsRefused(t *testing.T) {
+	pool := testDB(t)
+	svc := testService(t, pool)
+	ctx := context.Background()
+
+	u, err := svc.Register(ctx, "ada@quasar.local", "ada", "user-pw-12345")
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	creds, err := svc.store.getCredentialsByID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("credentials: %v", err)
+	}
+	if _, err := svc.EnsureBootstrapAdmin(ctx, "ada@quasar.local", "ada", "bootstrap-pw-12345"); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if err := svc.store.updatePasswordHash(ctx, u.ID, creds.passwordHash, "attacker"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("stale password change: got %v, want ErrInvalidCredentials", err)
+	}
+	if _, err := svc.Login(ctx, "ada@quasar.local", "bootstrap-pw-12345", ""); err != nil {
+		t.Fatalf("the operator's password must still log in: %v", err)
 	}
 }

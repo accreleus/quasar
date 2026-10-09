@@ -127,19 +127,20 @@ func (s *store) getCredentialsByID(ctx context.Context, id string) (credentials,
 	return c, nil
 }
 
-// updatePasswordHash rotates a user's stored password hash (CP-01). Existing
-// bearer tokens are intentionally left intact — the session survives the change.
-// Returns ErrUserNotFound if no row matches.
-func (s *store) updatePasswordHash(ctx context.Context, id, passwordHash string) error {
+// updatePasswordHash rotates a user's stored password hash (CP-01), only while it
+// is still verifiedHash: a hash replaced since the caller verified it (a bootstrap
+// promotion, a concurrent change) returns ErrInvalidCredentials. Existing bearer
+// tokens are intentionally left intact — the session survives the change.
+func (s *store) updatePasswordHash(ctx context.Context, id, verifiedHash, passwordHash string) error {
 	ct, err := s.pool.Exec(ctx, `
-		UPDATE users SET password_hash = $2, updated_at = now()
-		WHERE id::text = $1
-	`, id, passwordHash)
+		UPDATE users SET password_hash = $3, updated_at = now()
+		WHERE id::text = $1 AND password_hash = $2
+	`, id, verifiedHash, passwordHash)
 	if err != nil {
 		return fmt.Errorf("update password hash: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrUserNotFound
+		return ErrInvalidCredentials
 	}
 	return nil
 }
@@ -147,13 +148,25 @@ func (s *store) updatePasswordHash(ctx context.Context, id, passwordHash string)
 // createToken stores the hash of a freshly minted bearer token. deviceID, when
 // non-empty, is the user_devices id this token is bound to (LP-SEC-01 §B.5) — the
 // binding that makes per-device revocation real; empty ⇒ NULL (not device-revocable).
-func (s *store) createToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time, userAgent, deviceID string) error {
-	_, err := s.pool.Exec(ctx, `
+//
+// A non-empty verifiedHash issues the token only while the user's password_hash is
+// still that one, else ErrInvalidCredentials. FOR SHARE makes the insert wait for an
+// uncommitted change to the row (a bootstrap promotion revokes tokens before it
+// commits) and re-check the hash after it, so a login verified against the old
+// password cannot mint a token that outlives the change.
+func (s *store) createToken(ctx context.Context, userID, verifiedHash, tokenHash string, expiresAt time.Time, userAgent, deviceID string) error {
+	ct, err := s.pool.Exec(ctx, `
 		INSERT INTO auth_tokens (user_id, token_hash, expires_at, user_agent, device_id)
-		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, '')::uuid)
-	`, userID, tokenHash, expiresAt, userAgent, deviceID)
+		SELECT u.id, $3, $4, NULLIF($5, ''), NULLIF($6, '')::uuid
+		FROM users u
+		WHERE u.id::text = $1 AND ($2 = '' OR u.password_hash = $2)
+		FOR SHARE
+	`, userID, verifiedHash, tokenHash, expiresAt, userAgent, deviceID)
 	if err != nil {
 		return fmt.Errorf("insert token: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrInvalidCredentials
 	}
 	return nil
 }
