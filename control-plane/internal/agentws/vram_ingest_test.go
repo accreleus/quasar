@@ -297,7 +297,7 @@ func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 		if err := s.markOffline(ctx, res.HostID); err != nil {
 			t.Fatalf("mark offline: %v", err)
 		}
-		if _, err := s.enrollHost(ctx, "vram-reenroll", "v0", testEnrollmentToken); err != nil {
+		if _, err := s.enrollHost(ctx, "vram-reenroll", "v0", boundEnrollmentToken(t, pool, "vram-reenroll")); err != nil {
 			t.Fatalf("re-enroll: %v", err)
 		}
 		assertCleared(res.HostID, "enrollHost")
