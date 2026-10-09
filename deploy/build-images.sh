@@ -1078,7 +1078,11 @@ if [ "$DO_DEPLOY" = 1 ]; then
   PULSE_IMAGE="$(docker exec "$AGENT_CID" printenv QUASAR_PULSE_IMAGE 2>/dev/null || echo '')"
   PULSE_IMAGE="${PULSE_IMAGE:-$AGENT_IMG:latest}"
   if docker run --rm --entrypoint sh "$PULSE_IMAGE" -c \
-      'command -v pipewire && command -v wireplumber && test -f /etc/pipewire/quasar-session.conf' \
+      'command -v pipewire && command -v wireplumber \
+       && test -f /etc/pipewire/quasar-session.conf \
+       && test -f /etc/pipewire/quasar-session-pulse.conf \
+       && test -f /etc/wireplumber/wireplumber.conf.d/quasar-session.conf \
+       && test -f /usr/lib64/pipewire-0.3/libpipewire-module-protocol-pulse.so' \
       >/dev/null 2>&1; then
     log "PASS: QUASAR_PULSE_IMAGE=$PULSE_IMAGE has the PipeWire audio sidecar"
   else
