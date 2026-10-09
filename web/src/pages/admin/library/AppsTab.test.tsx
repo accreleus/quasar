@@ -462,6 +462,28 @@ describe("row menu", () => {
 
     await waitFor(() => expect(mocked.deleteApp).toHaveBeenCalledWith("tok", "a1"));
   });
+
+  it("a 409 provider_enabled delete toasts the server's remedy, not a generic failure (#497)", async () => {
+    mocked.listAdminApps.mockResolvedValue({
+      items: [app({ id: "p1", name: "Steam", kind: "launcher", library_provider: "steam" })],
+      next_cursor: null,
+    });
+    mocked.deleteApp.mockRejectedValue(
+      new ApiError(
+        409,
+        "provider_enabled",
+        "library discovery is enabled, so deleting its only provider app would have a new one created for every user; disable library discovery in Settings first",
+      ),
+    );
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Steam" }));
+    fireEvent.click(screen.getByText("Delete"));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete app" }));
+
+    expect(await screen.findByText(/disable library discovery in Settings first/)).toBeTruthy();
+    expect(screen.queryByText("could not delete app")).toBeNull();
+  });
 });
 
 describe("a failed pending fan-out", () => {

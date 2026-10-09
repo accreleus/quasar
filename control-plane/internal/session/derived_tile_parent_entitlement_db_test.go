@@ -10,9 +10,9 @@ import (
 
 // TestDerivedTileLaunchNeedsTheParentsEntitlement — a derived tile is launchable
 // only by a user entitled to both the tile and its parent provider app (#497).
-// Checked over POST /v1/sessions (IsEntitled, the pre-check) and directly on
+// Checked over POST /v1/sessions (IsEntitled, the pre-check), directly on
 // ScheduleAndCreate (the FOR SHARE boundary), which a caller can reach without
-// the pre-check.
+// the pre-check, and on GET /v1/me/profiles (AppProfileRestrictionByID).
 func TestDerivedTileLaunchNeedsTheParentsEntitlement(t *testing.T) {
 	pool := testDB(t)
 	ctx := context.Background()
@@ -41,6 +41,11 @@ func TestDerivedTileLaunchNeedsTheParentsEntitlement(t *testing.T) {
 		})
 		return err
 	}
+	profilesStatus := func() int {
+		resp := doJSON(t, "GET", f.base+"/v1/me/profiles?app_id="+tile, f.userTok, nil)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
 
 	// The tile's own grant, and nothing on the parent: refused at both gates.
 	if status, code := launchStatus(t, f.base, f.userTok, tile); status != http.StatusForbidden {
@@ -48,6 +53,9 @@ func TestDerivedTileLaunchNeedsTheParentsEntitlement(t *testing.T) {
 	}
 	if err := direct(); !errors.Is(err, ErrNotEntitled) {
 		t.Errorf("ScheduleAndCreate with no parent entitlement: got %v, want ErrNotEntitled", err)
+	}
+	if status := profilesStatus(); status != http.StatusNotFound {
+		t.Errorf("profiles menu with no parent entitlement: got %d, want 404", status)
 	}
 
 	// Restored on the parent: neither gate refuses on entitlement.
@@ -58,5 +66,8 @@ func TestDerivedTileLaunchNeedsTheParentsEntitlement(t *testing.T) {
 	}
 	if err := direct(); errors.Is(err, ErrNotEntitled) {
 		t.Errorf("ScheduleAndCreate with the parent restored: got %v", err)
+	}
+	if status := profilesStatus(); status != http.StatusOK {
+		t.Errorf("profiles menu with the parent restored: got %d, want 200", status)
 	}
 }
