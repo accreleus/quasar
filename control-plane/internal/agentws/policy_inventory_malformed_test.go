@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -307,4 +308,33 @@ func TestKnownRestartAttemptReportedUnderAnotherGroupKeepsHold(t *testing.T) {
 		t.Fatalf("idle-apply hold = %d, err=%v", holds, err)
 	}
 	x.assertStillRestricted(t)
+}
+
+func TestOverCapPolicyInventoryIsRefused(t *testing.T) {
+	const snapshot = "00000000-0000-4000-8000-000000000306"
+	t.Run("last page reaches the cap", func(t *testing.T) {
+		x := newInventoryHarness(t)
+		cursor := strconv.Itoa(maxPolicyInventoryEntries - 256)
+		x.c.policyInventoryCursor = &cursor
+		page := x.page(t, snapshot, &cursor, nil, map[string]string{}, x.failedEntries(1, 256))
+		if err := x.h.acceptPolicyInventoryPage(context.Background(), x.c, page); err != nil || !x.c.policyInventoryDone.Load() {
+			t.Fatalf("inventory at the cap: done=%v err=%v", x.c.policyInventoryDone.Load(), err)
+		}
+	})
+	t.Run("one entry past it", func(t *testing.T) {
+		x := newInventoryHarness(t)
+		cursor := strconv.Itoa(maxPolicyInventoryEntries)
+		x.c.policyInventoryCursor = &cursor
+		page := x.page(t, snapshot, &cursor, nil, map[string]string{}, x.failedEntries(1, 1))
+		if err := x.h.acceptPolicyInventoryPage(context.Background(), x.c, page); err == nil {
+			t.Fatal("over-cap inventory accepted")
+		}
+		if !x.c.policyInventoryUnknown || !x.c.policyInventoryBlocked.Load() || x.c.policyInventoryDone.Load() {
+			t.Fatalf("over-cap inventory: unknown=%v blocked=%v done=%v", x.c.policyInventoryUnknown, x.c.policyInventoryBlocked.Load(), x.c.policyInventoryDone.Load())
+		}
+		if len(x.c.policySequence) != 0 {
+			t.Fatalf("over-cap page cached %d entries", len(x.c.policySequence))
+		}
+		x.assertStillRestricted(t)
+	})
 }

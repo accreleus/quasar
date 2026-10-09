@@ -478,6 +478,16 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 	if page.InventoryID != c.policyInventoryID || page.SnapshotID == "" || !sameCursor(page.Cursor, c.policyInventoryCursor) || len(page.Entries) > 256 || page.RevisionHighWater == nil || page.ActiveSnapshots == nil {
 		return errors.New("invalid policy inventory page")
 	}
+	// The cursor is the entry count of the pages already accepted.
+	start := 0
+	if page.Cursor != nil {
+		start, _ = strconv.Atoi(*page.Cursor)
+	}
+	if start+len(page.Entries) > maxPolicyInventoryEntries {
+		c.policyInventoryUnknown = true
+		c.policyInventoryBlocked.Store(true)
+		return errors.New("policy inventory exceeds its entry cap")
+	}
 	for _, revision := range page.RevisionHighWater {
 		parsed, err := strconv.ParseUint(revision, 10, 64)
 		if err != nil || strconv.FormatUint(parsed, 10) != revision {
@@ -581,10 +591,6 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 		}
 	}
 	if page.NextCursor != nil {
-		start := 0
-		if page.Cursor != nil {
-			start, _ = strconv.Atoi(*page.Cursor)
-		}
 		if len(page.Entries) != 256 || *page.NextCursor != strconv.Itoa(start+len(page.Entries)) {
 			return errors.New("policy inventory cursor did not advance")
 		}
@@ -618,6 +624,10 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 	}
 	return h.maybeRunDeferredPolicyRefresh(ctx, c)
 }
+
+// The agent never prunes accepted records (agent-api.md), so lifetime history, not
+// groups × retry budget, sizes a real journal; 64 full pages is far past any real host.
+const maxPolicyInventoryEntries = 64 * 256
 
 func sameCursor(a, b *string) bool {
 	if a == nil || b == nil {
@@ -1138,6 +1148,15 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				if !ac.policyIdle {
 					continue
 				}
+				idle := hostcfg.IdleJournalState{AttemptID: state.AttemptID, Group: state.Group,
+					Revision: state.Revision, Digest: state.ContentSHA256,
+					GrantBoot: state.GrantBootIncarnation, GrantConnection: state.GrantConnectionIncarnation,
+					Phase: state.Phase, Sequence: state.JournalSequence, ErrorCode: policyStateErrorCode(state.Error)}
+				// Only a durable attempt may enter the sequence cache, or fabricated ids grow it unbounded.
+				if matches, err := h.cfgStore.IdleAttemptMatches(bg, hostID, idle); err != nil || !matches {
+					h.log.Warn("idle policy journal state for an unknown attempt ignored", "host_id", hostID, "attempt_id", state.AttemptID, "err", err)
+					continue
+				}
 				fresh, err := ac.acceptPolicySequence(state)
 				if err != nil {
 					ac.policyInventoryBlocked.Store(true)
@@ -1173,10 +1192,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 					}
 					observedAt = &at
 				}
-				idle := hostcfg.IdleJournalState{AttemptID: state.AttemptID, Group: state.Group,
-					Revision: state.Revision, Digest: state.ContentSHA256,
-					GrantBoot: state.GrantBootIncarnation, GrantConnection: state.GrantConnectionIncarnation,
-					Phase: state.Phase, Sequence: state.JournalSequence, ErrorCode: policyStateErrorCode(state.Error), VerifiedAt: observedAt}
+				idle.VerifiedAt = observedAt
 				if _, err := h.cfgStore.ObserveIdleState(bg, hostID, ac.connectionIncarnation, idle); err != nil {
 					h.log.Warn("idle policy journal state rejected", "host_id", hostID, "attempt_id", state.AttemptID, "err", err)
 				} else if state.Phase == "failed" && state.JournalSequence == "0" {

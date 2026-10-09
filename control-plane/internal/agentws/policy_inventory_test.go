@@ -214,9 +214,6 @@ func TestPolicyInventoryMatchingHistoricalAttemptPermitsInitialMap(t *testing.T)
 	if !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyDeliveryID == "" {
 		t.Fatalf("matching historical attempt should allow map delivery: done=%v blocked=%v delivery=%q", c.policyInventoryDone.Load(), c.policyInventoryBlocked.Load(), c.policyDeliveryID)
 	}
-	if len(c.policyOutstanding) == 0 {
-		t.Fatal("unfinished attempt allowed a competing offer")
-	}
 	if !registry.PolicyRestartConflict(hostID) {
 		t.Fatal("unfinished attempt allowed a legacy restart edit")
 	}
@@ -266,6 +263,13 @@ func TestPolicyInventoryMatchingHistoricalAttemptPermitsInitialMap(t *testing.T)
 	c.policyInitialMapApplied.Store(true)
 	if err := store.CompleteJournalReconciliation(ctx, hostID, connection, c.rh05RestartEntries, c.rh05Snapshots); err != nil {
 		t.Fatal(err)
+	}
+	// The gate is open now, so only the unfinished attempt holds back an offer.
+	h.offerNextSessionPolicy(ctx, c)
+	select {
+	case raw := <-c.out:
+		t.Fatalf("unfinished attempt allowed a competing offer: %s", raw)
+	default:
 	}
 	if err := h.restartPolicyInventory(ctx, c); err != nil {
 		t.Fatal(err)

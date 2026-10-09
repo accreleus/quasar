@@ -32,6 +32,17 @@ type IdleJournalState struct {
 	VerifiedAt                                                     *time.Time
 }
 
+// IdleAttemptMatches reports whether the host holds a durable attempt with this
+// exact grant identity, the same fields ObserveIdleState checks under its lock.
+func (s *Store) IdleAttemptMatches(ctx context.Context, hostID string, state IdleJournalState) (bool, error) {
+	var matches bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host_config_attempts
+		WHERE host_id=$1::uuid AND id=$2::uuid AND group_key=$3 AND approved_digest=$4
+		AND approved_revision::text=$5 AND boot_incarnation::text=$6 AND grant_connection::text=$7)`,
+		hostID, state.AttemptID, state.Group, state.Digest, state.Revision, state.GrantBoot, state.GrantConnection).Scan(&matches)
+	return matches, err
+}
+
 // ObserveIdleState advances one durable attempt under the host lock. A lost
 // accepted report can be reconstructed from the offered row; repeated or
 // out-of-order reports never mark a group applied or release another owner.
