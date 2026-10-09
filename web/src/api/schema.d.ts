@@ -1027,7 +1027,7 @@ export interface paths {
                 400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
-                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the request would create a library-provider app (non-empty library_provider) while library_discovery_enabled is false. Refused rather than created-then-suspended: discovery is a fail-closed, fleet-wide, privacy-relevant setting (it walks user homes), so an app create must not flip it as a side effect, and a 201 followed by a silent reconciler suspension reads as data loss. Enable library discovery in Settings first. Mirrors the existing 409 `provider_enabled` refusal on DELETE /v1/admin/images/{id}/install. */
+                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the request would create a library-provider app (non-empty library_provider) while library_discovery_enabled is false. Refused rather than created-then-suspended: discovery is a fail-closed, fleet-wide, privacy-relevant setting (it walks user homes), so an app create must not flip it as a side effect, and a 201 followed by a silent reconciler suspension reads as data loss. Enable library discovery in Settings first. Mirrors the existing 409 `provider_enabled` refusal on DELETE /v1/admin/images/{id}/install. Amendment 21: code `conflict` - another app already has this library_provider; one app per provider (edit that app instead). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -1201,7 +1201,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the edit would set a non-empty library_provider, or enable a reconciler-suspended provider app, while library_discovery_enabled is false (either write would be immediately reverted by the reconciler). The ways out are deliberate: clear library_provider, keep the app disabled, or enable library discovery in Settings. See the POST /v1/apps 409 for the rationale. */
+                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the edit would set a non-empty library_provider, or enable a reconciler-suspended provider app, while library_discovery_enabled is false (either write would be immediately reverted by the reconciler). The ways out are deliberate: clear library_provider, keep the app disabled, or enable library discovery in Settings. See the POST /v1/apps 409 for the rationale. Amendment 21: code `conflict` - the edit sets a library_provider another app already has (an app that already has it may keep it). Code `provider_enabled` - the edit clears library_provider on that provider's only app while library discovery is enabled; disable library discovery in Settings first. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -1768,7 +1768,7 @@ export interface paths {
         put?: never;
         /**
          * Set the WHOLE entitlement state of a provider app (all|user|none), by provider name.
-         * @description #465, additive. REPLACES every entitlement row on the provider app named by {provider} with exactly what mode implies - "all" writes one ('all', NULL) row, "user" writes one ('user', <acting admin>) row (this endpoint has no subject_id field - it always means the caller), "none" writes none. This is a MODE control (a radio button expressing one of three exclusive states), not an incremental grant: calling it discards whatever was there, including a hand-picked set of per-user grants made through POST /v1/admin/apps/{id}/entitlements. Use that route instead for anything short of a full state replacement. Exists because the caller (the setup wizard / settings library step) knows the provider name but not the app id - EnsureProviderApp creates the app off the request thread, as a side effect of PATCH /v1/admin/settings library_discovery_enabled false->true, so there is no response carrying an app_id to key the generic entitlements routes against. 404 not_found when no app exists yet with this library_provider (not enabled yet, or the async create has not landed) - the wizard's answer is "try again shortly", not a retry loop hidden here. Written to the admin activity log as app.entitlement.set_mode.
+         * @description #465, additive. REPLACES every entitlement row on the provider app named by {provider} with exactly what mode implies - "all" writes one ('all', NULL) row, "user" writes one ('user', <acting admin>) row (this endpoint has no subject_id field - it always means the caller), "none" writes none. This is a MODE control (a radio button expressing one of three exclusive states), not an incremental grant: calling it discards whatever was there, including a hand-picked set of per-user grants made through POST /v1/admin/apps/{id}/entitlements. Use that route instead for anything short of a full state replacement. Exists because the caller (the setup wizard / settings library step) knows the provider name but not the app id - EnsureProviderApp creates the app off the request thread, as a side effect of PATCH /v1/admin/settings library_discovery_enabled false->true, so there is no response carrying an app_id to key the generic entitlements routes against. Amendment 21 (#490): when no app exists yet but an image_catalog entry claims the provider (not enabled yet, or the async create has not landed), the mode is stored and the answer is 202 with pending_entitlement_mode. EnsureProviderApp applies a stored mode in place of its 'all' grant when it creates the app, then deletes it; a later call replaces a stored mode, and a call that finds the app applies at once and drops any stored one. 404 not_found only when neither an app nor a catalog entry claims the provider. Written to the admin activity log as app.entitlement.set_mode (a stored mode has target_type library_provider and details.pending true).
          */
         post: {
             parameters: {
@@ -1793,6 +1793,15 @@ export interface paths {
                     };
                     content: {
                         "application/json": components["schemas"]["ProviderEntitlementModeEnvelope"];
+                    };
+                };
+                /** @description Amendment 21. No provider app yet; the mode is stored and applied when the app is created. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ProviderEntitlementModePendingEnvelope"];
                     };
                 };
                 400: components["responses"]["ValidationFailed"];
@@ -5187,7 +5196,7 @@ export interface paths {
             requestBody?: {
                 content: {
                     "application/json": {
-                        /** @description Bind the token to exactly this node_name. Absent = any node_name; empty string is 400 (it would silently mint an any-node token). */
+                        /** @description Bind the token to exactly this node_name. Absent = any new node_name (re-enrolling an existing host needs a bound token, amendment 20); empty string is 400 (it would silently mint an any-node token). */
                         node_name?: string;
                         /** @default 1 */
                         max_uses?: number;
@@ -8452,7 +8461,7 @@ export interface components {
             /** @description UI-P5, OPTIONAL. The LAUNCH PROFILE ids a user may pick for this app. On create, absent or [] = unrestricted = today's behaviour. On patch: absent = UNCHANGED, [] = clear the allow-list (back to unrestricted), a non-empty array = replace it wholesale (it is a set, not an ordered list). EXPLICIT null IS 400 validation_failed. The contract gives null no meaning for this field - unlike default_profile_id and runtime_preset_id, where null explicitly means "clear" - and [] already says clear. Reinterpreting null would silently act on a value the caller clearly meant something by, which is exactly the defect fixed for the runtime-preset list fields. Every id must name a USER-VISIBLE launch profile (400 otherwise). A RUNG id (a stream profile) is not a launch profile and is rejected - the two id spaces look alike and differ only in table. Duplicates are deduped rather than rejected. SETTING IT WHILE profile_policy IS 'force' IS 400: that policy pins the app's launch profile, so no allow-list can ever apply. Switching an app TO 'force' CLEARS any stored list, even when the patch says nothing about it, so nothing can silently reactivate on a later switch back to 'prefer'. Note crud.decodeJSON sets DisallowUnknownFields(), so sending this to a control plane without the UI-P5 amendment is a hard 400 - deploy the control plane before the client. */
             launchable_profile_ids?: string[];
             /**
-             * @description Steam library discovery Phase 2, OPTIONAL and CREATE-ONLY. "all" (the default, and what an absent field means) creates the app with an ('all', granted_by='admin') entitlement, so it is immediately visible to everyone - i.e. EXACTLY the pre-entitlements behaviour of creating an app. "none" creates it entitled to nobody, for an admin who wants to configure access before anyone sees it. THE DEFAULT IS THE WHOLE POINT: once GET /v1/apps is entitlement-filtered a new app is invisible until something entitles it, so without a default grant "I made an app and nobody can see it" becomes the default experience - the same failure as an un-backfilled migration, one app at a time. Any other value is 400 validation_failed, REJECTED rather than treated as "none", because a typo ("nome", "None") that quietly created an invisible app would be diagnosed as "the catalogue is broken". CREATE-ONLY: this property is declared on the shared AppWrite shape, but PATCH /v1/apps/{id} does NOT accept it - sending it there is 400 validation_failed (crud.decodeJSON sets DisallowUnknownFields()). It describes how an app is BORN, not a property it carries; after creation, access is edited through /v1/admin/apps/{id}/entitlements, which is the surface that produces an audit row and can express a per-user grant. NOT a stored column and never returned on any read shape - the resulting entitlement row is what persists.
+             * @description Steam library discovery Phase 2, OPTIONAL and CREATE-ONLY. Amendment 21: with library_provider set and entitle absent, a mode stored for that provider before its app existed replaces the default; an explicit entitle wins and drops it. "all" (the default, and what an absent field means) creates the app with an ('all', granted_by='admin') entitlement, so it is immediately visible to everyone - i.e. EXACTLY the pre-entitlements behaviour of creating an app. "none" creates it entitled to nobody, for an admin who wants to configure access before anyone sees it. THE DEFAULT IS THE WHOLE POINT: once GET /v1/apps is entitlement-filtered a new app is invisible until something entitles it, so without a default grant "I made an app and nobody can see it" becomes the default experience - the same failure as an un-backfilled migration, one app at a time. Any other value is 400 validation_failed, REJECTED rather than treated as "none", because a typo ("nome", "None") that quietly created an invisible app would be diagnosed as "the catalogue is broken". CREATE-ONLY: this property is declared on the shared AppWrite shape, but PATCH /v1/apps/{id} does NOT accept it - sending it there is 400 validation_failed (crud.decodeJSON sets DisallowUnknownFields()). It describes how an app is BORN, not a property it carries; after creation, access is edited through /v1/admin/apps/{id}/entitlements, which is the surface that produces an audit row and can express a per-user grant. NOT a stored column and never returned on any read shape - the resulting entitlement row is what persists.
              * @default all
              * @enum {string}
              */
@@ -8528,6 +8537,14 @@ export interface components {
                 app_id: string;
                 mode: components["schemas"]["ProviderEntitlementMode"];
                 items: components["schemas"]["Entitlement"][];
+            };
+        };
+        /** @description Amendment 21 (#490). The 202 body of POST .../library-providers/{provider}/entitlement-mode: the mode is stored and EnsureProviderApp grants it when it creates the provider app. There is no app_id or items yet. */
+        ProviderEntitlementModePendingEnvelope: {
+            pending_entitlement_mode: {
+                /** @description Echoes the path parameter, normalized. */
+                provider: string;
+                mode: components["schemas"]["ProviderEntitlementMode"];
             };
         };
         /** @description Valid pairs: reflink/seeded, copy/seeded, cold/{template_unavailable,source_disabled,host_templates_disabled,host_setting_invalid,policy_unavailable,storage_unavailable,clone_failed,policy_changed}, existing/existing_home. Only reflink proves reflink storage saving. */

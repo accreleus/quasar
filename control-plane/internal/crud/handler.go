@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -636,44 +637,13 @@ func (h *Handler) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		req.DefaultVramMB, req.DefaultEncodeSlots,
 		req.DefaultWidth, req.DefaultHeight, req.DefaultFPS, req.DefaultBitratekbps,
 		req.RuntimeSpec, req.ManagedHome, req.HomeContainerPath, req.DefaultProfileID, req.ProfilePolicy,
-		req.RuntimePresetID, caller.ID)
+		req.RuntimePresetID, req.Entitle, allowList.ids, caller.ID)
 	if err != nil {
 		if writeAppConstraintError(w, err) {
 			return
 		}
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not create app")
 		return
-	}
-
-	// §6.4 default 'all' entitlement, skipped only on entitle:"none". Fail closed:
-	// on write failure, delete the app rather than leave it created-but-invisible
-	// with no field in the editor explaining why. The app is seconds old and
-	// cannot have sessions, so deleteApp's refuse-if-in-use guard cannot fire.
-	// (Discovered tiles get no 'all' row; that's Phase 4, not this handler.)
-	if req.Entitle != "none" {
-		if err := h.store.grantAllOnCreate(r.Context(), app.ID, actorID(r)); err != nil {
-			if _, delErr := h.store.deleteApp(r.Context(), app.ID, true); delErr != nil {
-				slog.Error("Phase 2: could not roll back an app whose default entitlement write failed — it exists INVISIBLE",
-					"app_id", app.ID, "write_err", err, "rollback_err", delErr)
-			}
-			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not set the app's default entitlement")
-			return
-		}
-	}
-
-	if len(allowList.ids) > 0 {
-		if err := h.store.setAppLaunchProfiles(r.Context(), app.ID, allowList.ids); err != nil {
-			// Fail closed: a created app with no allow-list reads as unrestricted,
-			// the opposite of what was asked. Delete it (seconds old, no sessions
-			// possible, so the refuse-if-in-use guard cannot fire).
-			if _, delErr := h.store.deleteApp(r.Context(), app.ID, true); delErr != nil {
-				slog.Error("UI-P5: could not roll back an app whose allow-list write failed — it exists UNRESTRICTED",
-					"app_id", app.ID, "write_err", err, "rollback_err", delErr)
-			}
-			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not set the app's launchable launch profiles")
-			return
-		}
-		app.LaunchableProfileIDs = allowList.ids
 	}
 
 	h.nudgeImages(r.Context())
@@ -841,8 +811,9 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 	// the derived-tile rule above) because two writes reach the same trap —
 	// making an app a provider, or re-enabling one that already is (updateApp
 	// clears library_discovery_suspended on `enabled` in the same statement).
-	// Clearing library_provider or disabling the app must always stay allowed —
-	// they're how an operator escapes without the instance-wide switch — and any
+	// Clearing library_provider or disabling the app must stay allowed here —
+	// they're how an operator escapes without the instance-wide switch (a clear
+	// while discovery is ON is updateApp's call, #490) — and any
 	// patch whose result is a disabled app is exempt (SuspendProviderApps only
 	// touches `enabled = true` rows).
 	effectiveEnabled := stored.Enabled
@@ -886,23 +857,17 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Two writes need opposite orderings against updateApp (not one transaction):
-	// (a) caller sent a list — write it BEFORE updateApp, since the safe half to
-	//     have applied on partial failure is the restriction, not a wider menu.
-	// (b) effective policy is `force` — clear any stored list AFTER a successful
-	//     updateApp; clearing first here would leave a failed patch's app
-	//     `prefer` with no list at all, i.e. silently unrestricted. Clearing
-	//     after makes the worst case a stale list on a `force` app, which is
-	//     inert (AppProfileRestrictionFor treats `force` as unrestricted).
-	if allowList.present {
+	// The allow-list commits inside updateApp's transaction, so a refused or
+	// failed patch leaves it as it was. Effective policy `force` clears any
+	// stored list even when the patch says nothing about it, so nothing can
+	// silently reactivate on a later switch back to `prefer`.
+	var launchProfiles *[]string
+	if allowList.present || effectivePolicy == "force" {
 		ids := allowList.ids
 		if effectivePolicy == "force" {
 			ids = nil
 		}
-		if err := h.store.setAppLaunchProfiles(r.Context(), id, ids); err != nil {
-			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not set the app's launchable launch profiles")
-			return
-		}
+		launchProfiles = &ids
 	}
 
 	caller, _ := auth.UserFromContext(r.Context())
@@ -913,7 +878,7 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		req.DefaultVramMB, req.DefaultEncodeSlots,
 		req.DefaultWidth, req.DefaultHeight, req.DefaultFPS, req.DefaultBitratekbps,
 		req.Enabled, req.RuntimeSpec, req.ManagedHome, req.HomeContainerPath, optionalUUIDArg(defaultProfilePatch, ok), req.ProfilePolicy,
-		optionalUUIDArg(presetPatch, presetOK), caller.ID)
+		optionalUUIDArg(presetPatch, presetOK), launchProfiles, caller.ID)
 	if err != nil {
 		if err == ErrNotFound {
 			httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "app not found")
@@ -929,15 +894,6 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		}
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not update app")
 		return
-	}
-
-	// (b) from above: run only once updateApp's policy write has landed.
-	if !allowList.present && effectivePolicy == "force" {
-		if err := h.store.setAppLaunchProfiles(r.Context(), id, nil); err != nil {
-			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not clear the app's launchable launch profiles")
-			return
-		}
-		app.LaunchableProfileIDs = nil
 	}
 
 	h.nudgeImages(r.Context())
@@ -1006,12 +962,15 @@ func validExternalID(id *string) bool {
 }
 
 const (
-	errLibraryProvider = `library_provider must be "" or "steam"`
-	errParentApp       = "parent_app_id must reference an existing app that is not itself a derived tile"
-	errParentOfAParent = "this app already has derived tiles of its own, so it cannot be given a parent — a tile borrows its parent's runtime one level only, and a chain leaves the middle app's tiles with no home to resolve to"
-	errDerivedProvider = "library_provider cannot be set on a derived tile — a tile borrows its parent's runtime and cannot itself be a library provider"
-	errDerivedShape    = "a derived tile carries identity only: with parent_app_id set, runtime_spec must be empty, runtime_preset_id must be null, managed_home must be false, library_provider must be empty, and external_source/external_id must both be set"
-	errDuplicateTile   = "a derived tile for that parent app and external_id already exists"
+	errLibraryProvider   = `library_provider must be "" or "steam"`
+	errParentApp         = "parent_app_id must reference an existing app that is not itself a derived tile"
+	errParentOfAParent   = "this app already has derived tiles of its own, so it cannot be given a parent — a tile borrows its parent's runtime one level only, and a chain leaves the middle app's tiles with no home to resolve to"
+	errDerivedProvider   = "library_provider cannot be set on a derived tile — a tile borrows its parent's runtime and cannot itself be a library provider"
+	errDerivedShape      = "a derived tile carries identity only: with parent_app_id set, runtime_spec must be empty, runtime_preset_id must be null, managed_home must be false, library_provider must be empty, and external_source/external_id must both be set"
+	errDuplicateTile     = "a derived tile for that parent app and external_id already exists"
+	errProviderAppExists = "another app is already this library provider's app — edit that app, or clear its library_provider first"
+	// Same remedy shape as provider_enabled on DELETE /v1/admin/images/{id}/install.
+	errProviderClearWhileDiscoveryOn = "library discovery is enabled, so un-marking its only provider app would have a new one created for every user; disable library discovery in Settings first"
 	// errDiscoveryDisabled (#534) names the setting AND the remedy, the same
 	// message shape the mirror-image refusal on DELETE /v1/admin/images/{id}/install
 	// already uses ("disable it in Settings first").
@@ -1068,8 +1027,12 @@ func validOrigin(origin *string) bool {
 // config, an admin marks the Steam app). nil is always fine; explicit "" is a
 // deliberate un-marking, like external_source.
 func validLibraryProvider(provider *string) bool {
-	return provider == nil || *provider == "" || *provider == "steam"
+	return provider == nil || *provider == "" || slices.Contains(libraryProviders, *provider)
 }
+
+// libraryProviders is every non-empty library_provider value
+// (apps_library_provider_ck, migration 0044), in provider-lock order.
+var libraryProviders = []string{"steam"}
 
 // derivedProviderConflict reports whether a CREATE is asking for a derived tile
 // that is also a library provider (§11.3). The patch path computes the same thing
@@ -1087,6 +1050,12 @@ func writeAppConstraintError(w http.ResponseWriter, err error) bool {
 		return true
 	case errors.Is(err, ErrDuplicateDerivedTile):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, errDuplicateTile)
+		return true
+	case errors.Is(err, ErrProviderAppExists):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, errProviderAppExists)
+		return true
+	case errors.Is(err, ErrProviderClearWhileDiscoveryOn):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeProviderEnabled, errProviderClearWhileDiscoveryOn)
 		return true
 	}
 	return false

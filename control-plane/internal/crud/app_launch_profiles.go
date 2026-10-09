@@ -89,7 +89,14 @@ func (s *store) setAppLaunchProfiles(ctx context.Context, appID string, ids []st
 		return fmt.Errorf("begin set app launch profiles: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
+	if err := writeAppLaunchProfiles(ctx, tx, appID, ids); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 
+// writeAppLaunchProfiles is setAppLaunchProfiles inside the caller's transaction.
+func writeAppLaunchProfiles(ctx context.Context, tx pgx.Tx, appID string, ids []string) error {
 	if _, err := tx.Exec(ctx, `DELETE FROM app_launch_profiles WHERE app_id::text = $1`, appID); err != nil {
 		return fmt.Errorf("clear app launch profiles: %w", err)
 	}
@@ -100,7 +107,7 @@ func (s *store) setAppLaunchProfiles(ctx context.Context, appID string, ids []st
 			return fmt.Errorf("insert app launch profile %q: %w", id, err)
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // appProfilePolicy reads an app's stored profile_policy, needed to resolve the

@@ -45,6 +45,7 @@ func testDB(t *testing.T) *pgxpool.Pool {
 		DELETE FROM hosts;
 		DELETE FROM apps;
 		DELETE FROM runtime_presets;
+		DELETE FROM pending_provider_entitlement_modes;
 		DELETE FROM auth_tokens;
 		DELETE FROM users;
 	`); err != nil {
