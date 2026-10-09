@@ -527,7 +527,18 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 			})
 			continue
 		}
-		if entry.HostID != c.hostID || !hostcfg.IsPolicyGroup(entry.Group) {
+		// A scope that disagrees with the group's catalog scope is malformed,
+		// not terminal history: a failed one must not hide an attempt.
+		if groupScope, known := hostcfg.PolicyGroupScope(entry.Group); entry.HostID != c.hostID || !known || entry.Scope != groupScope {
+			c.policyInventoryUnknown = true
+			c.policyInventoryBlocked.Store(true)
+			continue
+		}
+		// An id the database holds under another group or scope must not pass as
+		// unrelated terminal history: it would hide that attempt from the journal view.
+		if contradicts, err := h.cfgStore.InventoryEntryContradictsRecord(ctx, c.hostID, entry.AttemptID, entry.Group, entry.Scope); err != nil {
+			return err
+		} else if contradicts {
 			c.policyInventoryUnknown = true
 			c.policyInventoryBlocked.Store(true)
 			continue
