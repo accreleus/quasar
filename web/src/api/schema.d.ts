@@ -1027,7 +1027,7 @@ export interface paths {
                 400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
-                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the request would create a library-provider app (non-empty library_provider) while library_discovery_enabled is false. Refused rather than created-then-suspended: discovery is a fail-closed, fleet-wide, privacy-relevant setting (it walks user homes), so an app create must not flip it as a side effect, and a 201 followed by a silent reconciler suspension reads as data loss. Enable library discovery in Settings first. Mirrors the existing 409 `provider_enabled` refusal on DELETE /v1/admin/images/{id}/install. */
+                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the request would create a library-provider app (non-empty library_provider) while library_discovery_enabled is false. Refused rather than created-then-suspended: discovery is a fail-closed, fleet-wide, privacy-relevant setting (it walks user homes), so an app create must not flip it as a side effect, and a 201 followed by a silent reconciler suspension reads as data loss. Enable library discovery in Settings first. Mirrors the existing 409 `provider_enabled` refusal on DELETE /v1/admin/images/{id}/install. Amendment 21: code `conflict` - another app already has this library_provider; one app per provider (edit that app instead). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -1201,7 +1201,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the edit would set a non-empty library_provider, or enable a reconciler-suspended provider app, while library_discovery_enabled is false (either write would be immediately reverted by the reconciler). The ways out are deliberate: clear library_provider, keep the app disabled, or enable library discovery in Settings. See the POST /v1/apps 409 for the rationale. */
+                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the edit would set a non-empty library_provider, or enable a reconciler-suspended provider app, while library_discovery_enabled is false (either write would be immediately reverted by the reconciler). The ways out are deliberate: clear library_provider, keep the app disabled, or enable library discovery in Settings. See the POST /v1/apps 409 for the rationale. Amendment 21: code `conflict` - the edit sets a library_provider another app already has (an app that already has it may keep it). Code `provider_enabled` - the edit clears library_provider on that provider's only app while library discovery is enabled; disable library discovery in Settings first. */
                 409: {
                     headers: {
                         [name: string]: unknown;

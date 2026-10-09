@@ -398,16 +398,7 @@ func TestStoredModeSurvivesAMixedCaseCatalogProvider(t *testing.T) {
 	}
 
 	const imageID = "entitlement-mode-mixed-case"
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO image_catalog (id, manifest_version, display_name, kind, version, registry_ref, library_provider, raw)
-		VALUES ($1, 1, 'Steam', 'prebuilt', 'v1', 'registry.example.test/steam:v1', 'Steam', '{}'::jsonb)`, imageID); err != nil {
-		t.Fatalf("seed catalog image: %v", err)
-	}
-	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM image_catalog WHERE id = $1`, imageID) })
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO installed_images (image_id, version, registry_ref) VALUES ($1, 'v1', 'registry.example.test/steam:v1')`, imageID); err != nil {
-		t.Fatalf("seed adoption: %v", err)
-	}
+	seedInstalledProviderImage(t, ctx, pool, imageID, "Steam")
 
 	resp, body := post(t, srv.URL+"/v1/admin/library-providers/steam/entitlement-mode",
 		map[string]any{"mode": "user"}, tok)
@@ -549,4 +540,205 @@ func postProviderApp(t *testing.T, srv, tok string, extra map[string]any) string
 	app, _ := body["app"].(map[string]any)
 	id, _ := app["id"].(string)
 	return id
+}
+
+// seedInstalledProviderImage is a catalog image claiming provider, adopted, so
+// images.EnsureProviderApp can create its app.
+func seedInstalledProviderImage(t *testing.T, ctx context.Context, pool *pgxpool.Pool, imageID, provider string) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO image_catalog (id, manifest_version, display_name, kind, version, registry_ref, library_provider, raw)
+		VALUES ($1, 1, 'Steam', 'prebuilt', 'v1', 'registry.example.test/steam:v1', $2, '{}'::jsonb)`, imageID, provider); err != nil {
+		t.Fatalf("seed catalog image: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM image_catalog WHERE id = $1`, imageID) })
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO installed_images (image_id, version, registry_ref) VALUES ($1, 'v1', 'registry.example.test/steam:v1')`, imageID); err != nil {
+		t.Fatalf("seed adoption: %v", err)
+	}
+}
+
+// TestOneProviderAppPerProvider — EnsureProviderApp and the entitlement-mode
+// route address "the" provider app, so POST/PATCH /v1/apps refuse a second
+// one under the shared lock, in either order of arrival; an app that already
+// is the provider's (including a duplicate made before the rule) stays
+// editable.
+func TestOneProviderAppPerProvider(t *testing.T) {
+	const imageID = "one-provider-app"
+	for _, tc := range []struct {
+		name     string
+		wantApps int
+		run      func(t *testing.T, ctx context.Context, pool *pgxpool.Pool, srv, tok string)
+	}{
+		{"EnsureProviderApp first, then POST is 409", 1, func(t *testing.T, ctx context.Context, pool *pgxpool.Pool, srv, tok string) {
+			ensureProviderApp(t, ctx, pool, imageID, true)
+			resp, body := post(t, srv+"/v1/apps", map[string]any{"name": "Steam 2", "kind": "launcher", "library_provider": "steam"}, tok)
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("second provider app: want 409, got %d (%v)", resp.StatusCode, body)
+			}
+		}},
+		{"EnsureProviderApp first, then PATCH is 409", 1, func(t *testing.T, ctx context.Context, pool *pgxpool.Pool, srv, tok string) {
+			ensureProviderApp(t, ctx, pool, imageID, true)
+			other := seedPlainApp(t, ctx, pool, "")
+			resp, body := patch(t, srv+"/v1/apps/"+other, map[string]any{"library_provider": "steam"}, tok)
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("PATCH into a second provider app: want 409, got %d (%v)", resp.StatusCode, body)
+			}
+		}},
+		{"POST first, then EnsureProviderApp adopts it", 1, func(t *testing.T, ctx context.Context, pool *pgxpool.Pool, srv, tok string) {
+			postProviderApp(t, srv, tok, map[string]any{})
+			ensureProviderApp(t, ctx, pool, imageID, false)
+		}},
+		{"an app that already is the provider's stays editable", 2, func(t *testing.T, ctx context.Context, pool *pgxpool.Pool, srv, tok string) {
+			first := seedPlainApp(t, ctx, pool, "steam")
+			seedPlainApp(t, ctx, pool, "steam") // a duplicate made before the rule
+			resp, body := patch(t, srv+"/v1/apps/"+first, map[string]any{"library_provider": "steam", "name": "Steam (main)"}, tok)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("PATCH the existing provider app: want 200, got %d (%v)", resp.StatusCode, body)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := testDB(t)
+			srv, authSvc := newTestServer(t, pool)
+			ctx := context.Background()
+			tok := adminBearer(t, ctx, pool, authSvc, "admin@test.local", "admin")
+			setLibraryDiscovery(t, pool, true)
+			seedInstalledProviderImage(t, ctx, pool, imageID, "steam")
+
+			tc.run(t, ctx, pool, srv.URL, tok)
+			if got := countSteamApps(t, ctx, pool); got != tc.wantApps {
+				t.Errorf("steam apps = %d, want %d", got, tc.wantApps)
+			}
+		})
+	}
+}
+
+// TestFailedAllowListWriteKeepsTheStoredMode — the allow-list commits with the
+// app, its grants and the consumed stored mode, or none of them do: a create
+// that fails late must not have used up the restriction EnsureProviderApp
+// would otherwise apply.
+func TestFailedAllowListWriteKeepsTheStoredMode(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO pending_provider_entitlement_modes (provider, mode) VALUES ('steam', 'none')`); err != nil {
+		t.Fatalf("store mode: %v", err)
+	}
+	kind, provider := "launcher", "steam"
+	missingProfile := "00000000-0000-0000-0000-000000000490"
+	s := &store{pool: pool}
+	if _, err := s.createApp(ctx, "Steam", "", nil, &kind, nil, nil, nil, &provider,
+		nil, nil, nil, nil, nil, nil, nil, false, "", nil, "", nil, "", []string{missingProfile}, ""); err == nil {
+		t.Fatal("createApp with a launch profile that does not exist: want an error")
+	}
+	if n := countSteamApps(t, ctx, pool); n != 0 {
+		t.Errorf("steam apps = %d, want 0: the create must roll back whole", n)
+	}
+	var mode string
+	if err := pool.QueryRow(ctx, `SELECT mode FROM pending_provider_entitlement_modes WHERE provider = 'steam'`).Scan(&mode); err != nil || mode != "none" {
+		t.Errorf("stored mode = (%q, %v), want none still stored", mode, err)
+	}
+}
+
+func ensureProviderApp(t *testing.T, ctx context.Context, pool *pgxpool.Pool, imageID string, wantCreated bool) {
+	t.Helper()
+	created, err := images.NewStoreWithFetcher(pool, nil).EnsureProviderApp(ctx, imageID, "steam")
+	if err != nil || created != wantCreated {
+		t.Fatalf("EnsureProviderApp = (%v, %v), want created=%v", created, err, wantCreated)
+	}
+}
+
+func seedPlainApp(t *testing.T, ctx context.Context, pool *pgxpool.Pool, provider string) string {
+	t.Helper()
+	var id string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO apps (name, kind, enabled, runtime_spec, library_provider)
+		VALUES ('App', 'launcher', true, '{}'::jsonb, $1) RETURNING id::text`, provider).Scan(&id); err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+	return id
+}
+
+func countSteamApps(t *testing.T, ctx context.Context, pool *pgxpool.Pool) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM apps WHERE library_provider = 'steam'`).Scan(&n); err != nil {
+		t.Fatalf("count steam apps: %v", err)
+	}
+	return n
+}
+
+// TestClearingTheProviderAppWhileDiscoveryIsOn — un-marking the only provider
+// app while discovery runs would have EnsureProviderApp create a new one open
+// to everyone, so it is 409 provider_enabled; with discovery off, or another
+// app still claiming the provider, the clear goes through.
+func TestClearingTheProviderAppWhileDiscoveryIsOn(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		discovery  bool
+		duplicate  bool
+		wantStatus int
+	}{
+		{"discovery on, only provider app", true, false, http.StatusConflict},
+		{"discovery off", false, false, http.StatusOK},
+		{"discovery on, another provider app remains", true, true, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := testDB(t)
+			srv, authSvc := newTestServer(t, pool)
+			ctx := context.Background()
+			tok := adminBearer(t, ctx, pool, authSvc, "admin@test.local", "admin")
+			setLibraryDiscovery(t, pool, tc.discovery)
+			app := seedPlainApp(t, ctx, pool, "steam")
+			if tc.duplicate {
+				seedPlainApp(t, ctx, pool, "steam")
+			}
+
+			resp, body := patch(t, srv.URL+"/v1/apps/"+app, map[string]any{"library_provider": ""}, tok)
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("clear library_provider: want %d, got %d (%v)", tc.wantStatus, resp.StatusCode, body)
+			}
+			var provider string
+			if err := pool.QueryRow(ctx, `SELECT library_provider FROM apps WHERE id = $1::uuid`, app).Scan(&provider); err != nil {
+				t.Fatalf("read app: %v", err)
+			}
+			if tc.wantStatus == http.StatusConflict {
+				if code := errorCode(body); code != "provider_enabled" || provider != "steam" {
+					t.Errorf("refused clear: code %q, library_provider %q; want provider_enabled and steam kept", code, provider)
+				}
+			} else if provider != "" {
+				t.Errorf("library_provider = %q, want cleared", provider)
+			}
+		})
+	}
+}
+
+// TestLockProviderAppNormalizesTheProvider — every caller normalizes today;
+// the lock must not depend on it, or "Steam" and "steam" would not exclude
+// each other.
+func TestLockProviderAppNormalizesTheProvider(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := images.LockProviderApp(ctx, tx, " Steam "); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	other, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin other: %v", err)
+	}
+	defer other.Rollback(ctx) //nolint:errcheck
+	var got bool
+	if err := other.QueryRow(ctx,
+		`SELECT pg_try_advisory_xact_lock(hashtext('quasar_provider_app:' || 'steam')::bigint)`).Scan(&got); err != nil {
+		t.Fatalf("try lock: %v", err)
+	}
+	if got {
+		t.Error(`a lock taken for " Steam " did not exclude "steam"`)
+	}
 }

@@ -159,8 +159,9 @@ func (s *Store) EnsureProviderApp(ctx context.Context, imageID, provider string)
 // LockProviderApp takes the per-provider advisory lock held by every write
 // that creates or designates a provider app and by every read or write of its
 // requested entitlement mode (amendment 21, #490): EnsureProviderApp,
-// POST/PATCH /v1/apps and the entitlement-mode route. provider is lower-cased.
+// POST/PATCH /v1/apps and the entitlement-mode route.
 func LockProviderApp(ctx context.Context, tx pgx.Tx, provider string) error {
+	provider = strings.ToLower(strings.TrimSpace(provider))
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtext('quasar_provider_app:' || $1)::bigint)`, provider); err != nil {
 		return fmt.Errorf("lock provider app %q: %w", provider, err)

@@ -496,7 +496,7 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 	parentAppID, libraryProvider *string,
 	vram, slots, w, h, fps, kbps *int32, runtimeSpec json.RawMessage,
 	managedHome bool, homeContainerPath string, defaultProfileID *string, profilePolicy string,
-	runtimePresetID *string, entitle string, callerID string) (App, error) {
+	runtimePresetID *string, entitle string, launchProfileIDs []string, callerID string) (App, error) {
 	if len(runtimeSpec) == 0 {
 		runtimeSpec = json.RawMessage(`{}`)
 	}
@@ -600,6 +600,9 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 		if err := images.LockProviderApp(ctx, tx, provider); err != nil {
 			return App{}, err
 		}
+		if err := refuseSecondProviderApp(ctx, tx, provider, ""); err != nil {
+			return App{}, err
+		}
 	}
 	if err := tx.QueryRow(ctx, query, args...).Scan(&id); err != nil {
 		if translated := appConstraintError(err); translated != nil {
@@ -621,6 +624,11 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 	if err := grantOnCreate(ctx, tx, id, provider, entitle, actor); err != nil {
 		return App{}, err
 	}
+	// Same transaction: an app that commits without its allow-list reads as
+	// unrestricted, and one rolled back after a consumed stored mode would lose it.
+	if err := writeAppLaunchProfiles(ctx, tx, id, launchProfileIDs); err != nil {
+		return App{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return App{}, fmt.Errorf("commit app create: %w", err)
 	}
@@ -635,6 +643,63 @@ var ErrDerivedShape = errors.New("a derived tile carries identity only")
 // ErrDuplicateDerivedTile: apps_parent_external_uk refused a second tile for
 // the same (provider app, source, appid) — one tile per game, fleet-wide.
 var ErrDuplicateDerivedTile = errors.New("a tile for that provider app and external id already exists")
+
+// ErrProviderAppExists: another app already has this library_provider. One app
+// per provider, because EnsureProviderApp and the entitlement-mode route
+// address "the" provider app (#490); a second would sit outside its stored or
+// later-set entitlement mode.
+var ErrProviderAppExists = errors.New("another app is already this library provider's app")
+
+// refuseSecondProviderApp returns ErrProviderAppExists when an app other than
+// exceptID ("" on create) is provider's app, unless exceptID already is one, so
+// an app that predates the rule stays editable. Caller holds
+// images.LockProviderApp.
+func refuseSecondProviderApp(ctx context.Context, tx pgx.Tx, provider, exceptID string) error {
+	var taken bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM apps WHERE library_provider = $1 AND id::text <> $2)
+		   AND NOT EXISTS (SELECT 1 FROM apps WHERE library_provider = $1 AND id::text = $2)
+	`, provider, exceptID).Scan(&taken); err != nil {
+		return fmt.Errorf("check provider app %q: %w", provider, err)
+	}
+	if taken {
+		return ErrProviderAppExists
+	}
+	return nil
+}
+
+// ErrProviderClearWhileDiscoveryOn: un-marking the only app of a provider while
+// library discovery is on would let the next EnsureProviderApp create a fresh
+// one open to everyone, leaving the restriction behind on this app (#490).
+var ErrProviderClearWhileDiscoveryOn = errors.New("library discovery is on and this is its only provider app")
+
+// refuseProviderClearWhileDiscoveryOn guards PATCH library_provider "": the
+// stored provider is locked like every other provider-app write, and a clear
+// stays allowed while another app still claims the provider or discovery is off.
+func refuseProviderClearWhileDiscoveryOn(ctx context.Context, tx pgx.Tx, appID string) error {
+	var provider string
+	err := tx.QueryRow(ctx, `SELECT library_provider FROM apps WHERE id::text = $1`, appID).Scan(&provider)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && provider == "") {
+		return nil // no such app (the update reports 404) or not a provider app
+	}
+	if err != nil {
+		return fmt.Errorf("read app provider: %w", err)
+	}
+	if err := images.LockProviderApp(ctx, tx, provider); err != nil {
+		return err
+	}
+	var refuse bool
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE((SELECT library_discovery_enabled FROM instance_settings WHERE id = true), false)
+		   AND NOT EXISTS (SELECT 1 FROM apps WHERE library_provider = $1 AND id::text <> $2)
+	`, provider, appID).Scan(&refuse); err != nil {
+		return fmt.Errorf("check provider clear for %q: %w", provider, err)
+	}
+	if refuse {
+		return ErrProviderClearWhileDiscoveryOn
+	}
+	return nil
+}
 
 // appConstraintError maps the two Phase-3 constraints to sentinels, or nil
 // (stays a 500). Keyed on constraint name, never message text: names are ours,
@@ -882,6 +947,14 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 	becomesProvider := libraryProvider != nil && *libraryProvider != ""
 	if becomesProvider {
 		if err := images.LockProviderApp(ctx, tx, *libraryProvider); err != nil {
+			return App{}, err
+		}
+		if err := refuseSecondProviderApp(ctx, tx, *libraryProvider, id); err != nil {
+			return App{}, err
+		}
+	}
+	if libraryProvider != nil && *libraryProvider == "" {
+		if err := refuseProviderClearWhileDiscoveryOn(ctx, tx, id); err != nil {
 			return App{}, err
 		}
 	}

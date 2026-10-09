@@ -636,28 +636,13 @@ func (h *Handler) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		req.DefaultVramMB, req.DefaultEncodeSlots,
 		req.DefaultWidth, req.DefaultHeight, req.DefaultFPS, req.DefaultBitratekbps,
 		req.RuntimeSpec, req.ManagedHome, req.HomeContainerPath, req.DefaultProfileID, req.ProfilePolicy,
-		req.RuntimePresetID, req.Entitle, caller.ID)
+		req.RuntimePresetID, req.Entitle, allowList.ids, caller.ID)
 	if err != nil {
 		if writeAppConstraintError(w, err) {
 			return
 		}
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not create app")
 		return
-	}
-
-	if len(allowList.ids) > 0 {
-		if err := h.store.setAppLaunchProfiles(r.Context(), app.ID, allowList.ids); err != nil {
-			// Fail closed: a created app with no allow-list reads as unrestricted,
-			// the opposite of what was asked. Delete it (seconds old, no sessions
-			// possible, so the refuse-if-in-use guard cannot fire).
-			if _, delErr := h.store.deleteApp(r.Context(), app.ID, true); delErr != nil {
-				slog.Error("UI-P5: could not roll back an app whose allow-list write failed — it exists UNRESTRICTED",
-					"app_id", app.ID, "write_err", err, "rollback_err", delErr)
-			}
-			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not set the app's launchable launch profiles")
-			return
-		}
-		app.LaunchableProfileIDs = allowList.ids
 	}
 
 	h.nudgeImages(r.Context())
@@ -825,8 +810,9 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 	// the derived-tile rule above) because two writes reach the same trap —
 	// making an app a provider, or re-enabling one that already is (updateApp
 	// clears library_discovery_suspended on `enabled` in the same statement).
-	// Clearing library_provider or disabling the app must always stay allowed —
-	// they're how an operator escapes without the instance-wide switch — and any
+	// Clearing library_provider or disabling the app must stay allowed here —
+	// they're how an operator escapes without the instance-wide switch (a clear
+	// while discovery is ON is updateApp's call, #490) — and any
 	// patch whose result is a disabled app is exempt (SuspendProviderApps only
 	// touches `enabled = true` rows).
 	effectiveEnabled := stored.Enabled
@@ -990,12 +976,15 @@ func validExternalID(id *string) bool {
 }
 
 const (
-	errLibraryProvider = `library_provider must be "" or "steam"`
-	errParentApp       = "parent_app_id must reference an existing app that is not itself a derived tile"
-	errParentOfAParent = "this app already has derived tiles of its own, so it cannot be given a parent — a tile borrows its parent's runtime one level only, and a chain leaves the middle app's tiles with no home to resolve to"
-	errDerivedProvider = "library_provider cannot be set on a derived tile — a tile borrows its parent's runtime and cannot itself be a library provider"
-	errDerivedShape    = "a derived tile carries identity only: with parent_app_id set, runtime_spec must be empty, runtime_preset_id must be null, managed_home must be false, library_provider must be empty, and external_source/external_id must both be set"
-	errDuplicateTile   = "a derived tile for that parent app and external_id already exists"
+	errLibraryProvider   = `library_provider must be "" or "steam"`
+	errParentApp         = "parent_app_id must reference an existing app that is not itself a derived tile"
+	errParentOfAParent   = "this app already has derived tiles of its own, so it cannot be given a parent — a tile borrows its parent's runtime one level only, and a chain leaves the middle app's tiles with no home to resolve to"
+	errDerivedProvider   = "library_provider cannot be set on a derived tile — a tile borrows its parent's runtime and cannot itself be a library provider"
+	errDerivedShape      = "a derived tile carries identity only: with parent_app_id set, runtime_spec must be empty, runtime_preset_id must be null, managed_home must be false, library_provider must be empty, and external_source/external_id must both be set"
+	errDuplicateTile     = "a derived tile for that parent app and external_id already exists"
+	errProviderAppExists = "another app is already this library provider's app — edit that app, or clear its library_provider first"
+	// Same remedy shape as provider_enabled on DELETE /v1/admin/images/{id}/install.
+	errProviderClearWhileDiscoveryOn = "library discovery is enabled, so un-marking its only provider app would have a new one created for every user; disable library discovery in Settings first"
 	// errDiscoveryDisabled (#534) names the setting AND the remedy, the same
 	// message shape the mirror-image refusal on DELETE /v1/admin/images/{id}/install
 	// already uses ("disable it in Settings first").
@@ -1071,6 +1060,12 @@ func writeAppConstraintError(w http.ResponseWriter, err error) bool {
 		return true
 	case errors.Is(err, ErrDuplicateDerivedTile):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, errDuplicateTile)
+		return true
+	case errors.Is(err, ErrProviderAppExists):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, errProviderAppExists)
+		return true
+	case errors.Is(err, ErrProviderClearWhileDiscoveryOn):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeProviderEnabled, errProviderClearWhileDiscoveryOn)
 		return true
 	}
 	return false
