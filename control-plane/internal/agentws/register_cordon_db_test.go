@@ -119,7 +119,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	if err := s.markOffline(ctx, res.HostID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enrollHost(ctx, "removed-host", "0.3.1", testEnrollmentToken); err != nil {
+	if _, err := s.enrollHost(ctx, "removed-host", "0.3.1", boundEnrollmentToken(t, pool, "removed-host")); err != nil {
 		t.Fatalf("re-add: %v", err)
 	}
 	if got := hostStatus(t, pool, res.HostID); got != "online" {
@@ -142,7 +142,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	if err := s.markOffline(ctx, res2.HostID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enrollHost(ctx, "drained-then-removed", "0.3.1", testEnrollmentToken); err != nil {
+	if _, err := s.enrollHost(ctx, "drained-then-removed", "0.3.1", boundEnrollmentToken(t, pool, "drained-then-removed")); err != nil {
 		t.Fatalf("re-add: %v", err)
 	}
 	if got := hostStatus(t, pool, res2.HostID); got != "draining" {
@@ -165,7 +165,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	if err := s.markOffline(ctx, res3.HostID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enrollHost(ctx, "removed-mid-run", "0.3.1", testEnrollmentToken); err != nil {
+	if _, err := s.enrollHost(ctx, "removed-mid-run", "0.3.1", boundEnrollmentToken(t, pool, "removed-mid-run")); err != nil {
 		t.Fatalf("re-add: %v", err)
 	}
 	r, _ := holds.List(ctx, res3.HostID)
@@ -189,7 +189,7 @@ func TestEnrollHostKeepsADrainingHostDraining(t *testing.T) {
 	}
 	setHostStatus(t, pool, res.HostID, "draining")
 
-	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.1", testEnrollmentToken); err != nil {
+	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.1", boundEnrollmentToken(t, pool, "cordoned-enroll-host")); err != nil {
 		t.Fatalf("re-enroll: %v", err)
 	}
 	if got := hostStatus(t, pool, res.HostID); got != "draining" {
@@ -197,7 +197,7 @@ func TestEnrollHostKeepsADrainingHostDraining(t *testing.T) {
 	}
 
 	setHostStatus(t, pool, res.HostID, "offline")
-	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.2", testEnrollmentToken); err != nil {
+	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.2", boundEnrollmentToken(t, pool, "cordoned-enroll-host")); err != nil {
 		t.Fatalf("third enroll: %v", err)
 	}
 	if got := hostStatus(t, pool, res.HostID); got != "online" {
