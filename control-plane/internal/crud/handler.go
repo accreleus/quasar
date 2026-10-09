@@ -970,7 +970,8 @@ const (
 	errDuplicateTile     = "a derived tile for that parent app and external_id already exists"
 	errProviderAppExists = "another app is already this library provider's app — edit that app, or clear its library_provider first"
 	// Same remedy shape as provider_enabled on DELETE /v1/admin/images/{id}/install.
-	errProviderClearWhileDiscoveryOn = "library discovery is enabled, so un-marking its only provider app would have a new one created for every user; disable library discovery in Settings first"
+	errProviderClearWhileDiscoveryOn  = "library discovery is enabled, so un-marking its only provider app would have a new one created for every user; disable library discovery in Settings first"
+	errProviderDeleteWhileDiscoveryOn = "library discovery is enabled, so deleting its only provider app would have a new one created for every user; disable library discovery in Settings first"
 	// errDiscoveryDisabled (#534) names the setting AND the remedy, the same
 	// message shape the mirror-image refusal on DELETE /v1/admin/images/{id}/install
 	// already uses ("disable it in Settings first").
@@ -1054,7 +1055,7 @@ func writeAppConstraintError(w http.ResponseWriter, err error) bool {
 	case errors.Is(err, ErrProviderAppExists):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, errProviderAppExists)
 		return true
-	case errors.Is(err, ErrProviderClearWhileDiscoveryOn):
+	case errors.Is(err, ErrLastProviderAppWhileDiscoveryOn):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeProviderEnabled, errProviderClearWhileDiscoveryOn)
 		return true
 	}
@@ -1197,6 +1198,8 @@ func (h *Handler) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "app not found")
 	case errors.Is(err, ErrAppHasActiveSessions):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "app is in use by an active session — stop it first")
+	case errors.Is(err, ErrLastProviderAppWhileDiscoveryOn):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeProviderEnabled, errProviderDeleteWhileDiscoveryOn)
 	case errors.Is(err, ErrHomeCleanupPending):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Managed home cleanup is pending")
 	case errors.Is(err, ErrAppHasDerivedTiles):

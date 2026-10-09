@@ -282,10 +282,18 @@ func (s *Store) IsEntitled(ctx context.Context, userID, appID string) (bool, err
 	var ok bool
 	if err := s.pool.QueryRow(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM entitlements e
-			WHERE e.app_id = $1::uuid
-			  AND (e.subject_type = 'all'
-			       OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))
+			SELECT 1 FROM apps
+			WHERE apps.id = $1::uuid
+			  AND EXISTS (
+			      SELECT 1 FROM entitlements e
+			      WHERE e.app_id = apps.id
+			        AND (e.subject_type = 'all'
+			             OR (e.subject_type = 'user' AND e.subject_id = $2::uuid)))
+			  AND (apps.parent_app_id IS NULL OR EXISTS (
+			      SELECT 1 FROM entitlements e
+			      WHERE e.app_id = apps.parent_app_id
+			        AND (e.subject_type = 'all'
+			             OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))))
 		)`, appID, userID).Scan(&ok); err != nil {
 		return false, fmt.Errorf("check entitlement: %w", err)
 	}

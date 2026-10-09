@@ -618,6 +618,9 @@ func TestDeletingAProviderAppNeedsConfirmation(t *testing.T) {
 		}
 	}
 
+	// Discovery off, or the only-provider-app refusal (#497) answers first.
+	setLibraryDiscovery(t, pool, false)
+
 	// Unconfirmed: refused, and the body LISTS the tiles rather than counting
 	// them — the point of the confirmation is that the admin sees what they are
 	// about to destroy, and "2 tiles" is not that.
@@ -716,10 +719,12 @@ func TestDeletingAProviderAppRefusesWhileATileIsLive(t *testing.T) {
 		t.Fatalf("seed session: %v", err)
 	}
 
-	// Even WITH the confirmation, the live-session guard wins.
+	// Even WITH the confirmation, the live-session guard wins. Discovery off,
+	// or the only-provider-app refusal (#497) answers first.
+	setLibraryDiscovery(t, pool, false)
 	resp, body = deleteJSON(t, srv.URL+"/v1/apps/"+parent+"?delete_derived=true", admin)
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("delete with a live TILE session: want 409, got %d (%v)", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusConflict || errorCode(body) != "conflict" {
+		t.Fatalf("delete with a live TILE session: want 409 conflict, got %d (%v)", resp.StatusCode, body)
 	}
 	var n int
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM apps`).Scan(&n); err != nil {
