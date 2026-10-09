@@ -527,7 +527,9 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 			})
 			continue
 		}
-		if entry.HostID != c.hostID || !hostcfg.IsPolicyGroup(entry.Group) {
+		// A scope that disagrees with the group's catalog scope is malformed,
+		// not terminal history: a failed one must not hide an attempt.
+		if groupScope, known := hostcfg.PolicyGroupScope(entry.Group); entry.HostID != c.hostID || !known || entry.Scope != groupScope {
 			c.policyInventoryUnknown = true
 			c.policyInventoryBlocked.Store(true)
 			continue
