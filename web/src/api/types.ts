@@ -398,6 +398,9 @@ export type ProviderEntitlementModeSet = Schemas["ProviderEntitlementModeSet"];
 /** Replaces the whole entitlement set — `items` is the result, not a delta. */
 export type ProviderEntitlementModeEnvelope = Schemas["ProviderEntitlementModeEnvelope"];
 
+/** 202: no provider app yet; the server applies the mode when it creates one. */
+export type ProviderEntitlementModePendingEnvelope = Schemas["ProviderEntitlementModePendingEnvelope"];
+
 // ── App placement (RH05 #342, control-api.md "App placement, homes and explicit image cleanup") ──
 // Which hosts may run a canonical app. A derived tile has no placement of its
 // own: GET answers with the parent's, `inherited_from` set.

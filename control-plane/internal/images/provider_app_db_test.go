@@ -33,7 +33,7 @@ type providerAppRow struct {
 // asserts on "the provider app" in the singular.
 func clearApps(t *testing.T, env *actionsEnv) {
 	t.Helper()
-	if _, err := env.pool.Exec(context.Background(), `TRUNCATE apps CASCADE`); err != nil {
+	if _, err := env.pool.Exec(context.Background(), `TRUNCATE apps, pending_provider_entitlement_modes CASCADE`); err != nil {
 		t.Fatalf("truncate apps: %v", err)
 	}
 }
@@ -763,6 +763,63 @@ func TestEnsureProviderAppReconcileDoesNotResurrectDeletedEntitlement(t *testing
 
 	if n := len(readAppEntitlements(t, env, app.ID)); n != 0 {
 		t.Errorf("entitlements after reconcile = %d, want 0 (an operator's revoke must never be resurrected by a reconcile)", n)
+	}
+}
+
+// TestEnsureProviderAppAppliesAStoredMode — amendment 21 (#490): a mode an
+// admin set before the app existed (the row crud's entitlement-mode route
+// stores) replaces the 'all' grant at create, and is consumed. A "user" whose
+// requester was deleted grants nobody: fail closed, never open.
+func TestEnsureProviderAppAppliesAStoredMode(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode   string
+		requester    bool
+		wantSubjects []string
+	}{
+		{"user", "user", true, []string{"user"}},
+		{"none", "none", true, nil},
+		{"user whose requester is gone", "user", false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, _ := newActionsEnv(t)
+			ctx := context.Background()
+			clearApps(t, env)
+			seedCatalogRuntime(t, env, imgVer, imgDigest, "steam", steamRuntime)
+			var requester *string
+			if tc.requester {
+				id := seedTestUser(t, env, "requester@t.local", "requester")
+				requester = &id
+			}
+			if _, err := env.pool.Exec(ctx, `
+				INSERT INTO pending_provider_entitlement_modes (provider, mode, requested_by)
+				VALUES ('steam', $1, $2::uuid)`, tc.mode, requester); err != nil {
+				t.Fatalf("store mode: %v", err)
+			}
+
+			if err := env.store.EnsureProviders(ctx); err != nil {
+				t.Fatalf("EnsureProviders: %v", err)
+			}
+			app, ok := readProviderApp(t, env, "steam")
+			if !ok {
+				t.Fatal("no provider app created")
+			}
+			ents := readAppEntitlements(t, env, app.ID)
+			if len(ents) != len(tc.wantSubjects) {
+				t.Fatalf("entitlements = %+v, want subjects %v", ents, tc.wantSubjects)
+			}
+			for _, e := range ents {
+				if e.SubjectType != "user" || e.SubjectID == nil || *e.SubjectID != *requester || e.GrantedBy != "admin" {
+					t.Errorf("entitlement = %+v, want ('user', requester, admin)", e)
+				}
+			}
+			var left int
+			if err := env.pool.QueryRow(ctx, `SELECT count(*) FROM pending_provider_entitlement_modes`).Scan(&left); err != nil {
+				t.Fatalf("count stored modes: %v", err)
+			}
+			if left != 0 {
+				t.Errorf("stored modes after create = %d, want 0", left)
+			}
+		})
 	}
 }
 

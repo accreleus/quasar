@@ -359,6 +359,31 @@ describe("StepLibraries", () => {
     const settingsOrder = vi.mocked(adminApi.updateSettings).mock.invocationCallOrder[0];
     const modeOrder = vi.mocked(adminApi.setProviderEntitlementMode).mock.invocationCallOrder[0];
     expect(settingsOrder).toBeLessThan(modeOrder);
+    expect(screen.queryByText(/as soon as it finishes installing/i)).not.toBeInTheDocument();
+  });
+
+  // #490: before the provider app exists the server keeps the mode (202) and
+  // applies it at create — one call, no retry, and the step says so.
+  it("a stored (202) mode says it applies once installed, without retrying", async () => {
+    vi.mocked(adminApi.listImages).mockResolvedValue(syncedCatalog([steamImage()]));
+    vi.mocked(adminApi.updateSettings).mockResolvedValue({} as never);
+    vi.mocked(adminApi.setProviderEntitlementMode).mockResolvedValue({
+      pending_entitlement_mode: { provider: "steam", mode: "user" },
+    });
+    const onNext = renderStep();
+
+    await waitFor(() => expect(screen.getByText("Steam")).toBeInTheDocument());
+    fireEvent.click(screen.getByLabelText(/^enable$/i));
+    fireEvent.click(screen.getByRole("tab", { name: "Only me" }));
+    fireEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/“Only me” will apply to Steam as soon as it finishes installing/)).toBeInTheDocument();
+    });
+    expect(adminApi.setProviderEntitlementMode).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/visible to all users for now/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+    expect(onNext).toHaveBeenCalled();
   });
 
   it("picking Nobody yet submits mode 'none'", async () => {
@@ -380,10 +405,9 @@ describe("StepLibraries", () => {
     });
   });
 
-  // A non-404 failure (e.g. a genuine 500) must not be retried — it is not
-  // the "app not created yet" race this retry exists for — and must degrade
-  // to honest copy rather than block Continue (the provider IS enabled).
-  it("a non-404 entitlement-mode failure surfaces inline without blocking finish", async () => {
+  // A failure is not retried and degrades to honest copy rather than blocking
+  // Continue (the provider IS enabled).
+  it("an entitlement-mode failure surfaces inline without blocking finish", async () => {
     vi.mocked(adminApi.listImages).mockResolvedValue(syncedCatalog([steamImage()]));
     vi.mocked(adminApi.updateSettings).mockResolvedValue({} as never);
     vi.mocked(adminApi.setProviderEntitlementMode).mockRejectedValue(
@@ -399,7 +423,6 @@ describe("StepLibraries", () => {
     await waitFor(() => {
       expect(screen.getByText(/could not switch it to only me/i)).toBeInTheDocument();
     });
-    // Only one attempt — a non-404 must not be retried.
     expect(adminApi.setProviderEntitlementMode).toHaveBeenCalledTimes(1);
 
     const finishBtn = screen.getByRole("button", { name: /^continue$/i });
@@ -408,60 +431,4 @@ describe("StepLibraries", () => {
     expect(onNext).toHaveBeenCalled();
   });
 
-});
-
-// applyEntitlementModeWithRetry — the bounded-retry helper in isolation
-// (exported for exactly this). The real race it exists for: EnsureProviderApp
-// creates the provider app off the settings-PATCH request thread, so the
-// entitlement-mode call can legitimately 404 for a few seconds. Tested
-// standalone rather than through the rendered component so fake timers don't
-// have to interleave with React/testing-library's own timer usage.
-describe("applyEntitlementModeWithRetry", () => {
-  beforeEach(() => {
-    vi.mocked(adminApi.setProviderEntitlementMode).mockReset();
-  });
-
-  it("retries a 404 and resolves once a later attempt lands", async () => {
-    vi.useFakeTimers();
-    try {
-      vi.mocked(adminApi.setProviderEntitlementMode)
-        .mockRejectedValueOnce(new ApiError(404, "not_found", "no provider app exists yet for steam"))
-        .mockResolvedValueOnce({
-          entitlement_mode: { provider: "steam", app_id: "app-1", mode: "user", items: [] },
-        } as never);
-
-      const { applyEntitlementModeWithRetry } = await import("./StepLibraries");
-      const promise = applyEntitlementModeWithRetry("tok", "steam", "user", 3, 1500);
-
-      // First attempt happens synchronously (microtask) before the delay.
-      await vi.advanceTimersByTimeAsync(0);
-      expect(adminApi.setProviderEntitlementMode).toHaveBeenCalledTimes(1);
-
-      await vi.advanceTimersByTimeAsync(1500);
-      await promise; // resolves without throwing
-      expect(adminApi.setProviderEntitlementMode).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("does not retry a non-404 failure", async () => {
-    vi.mocked(adminApi.setProviderEntitlementMode).mockRejectedValue(
-      new ApiError(500, "internal", "boom"),
-    );
-    const { applyEntitlementModeWithRetry } = await import("./StepLibraries");
-
-    await expect(applyEntitlementModeWithRetry("tok", "steam", "user", 3, 1)).rejects.toThrow();
-    expect(adminApi.setProviderEntitlementMode).toHaveBeenCalledTimes(1);
-  });
-
-  it("gives up after the last attempt still 404s", async () => {
-    vi.mocked(adminApi.setProviderEntitlementMode).mockRejectedValue(
-      new ApiError(404, "not_found", "no provider app exists yet for steam"),
-    );
-    const { applyEntitlementModeWithRetry } = await import("./StepLibraries");
-
-    await expect(applyEntitlementModeWithRetry("tok", "steam", "user", 2, 1)).rejects.toThrow();
-    expect(adminApi.setProviderEntitlementMode).toHaveBeenCalledTimes(2);
-  });
 });

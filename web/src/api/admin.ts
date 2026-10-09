@@ -67,6 +67,7 @@ import type {
   EntitlementsResponse,
   ProviderEntitlementMode,
   ProviderEntitlementModeEnvelope,
+  ProviderEntitlementModePendingEnvelope,
   LibraryRulesResponse,
   LibraryRuleWriteRequest,
   LibraryRuleWriteResult,
@@ -383,14 +384,14 @@ export function listUserEntitlements(token: string, userId: string): Promise<Ent
 
 /** Addressed by provider name ("steam"), not app id, and REPLACES the whole
  *  entitlement state: "all" writes one all-users row, "user" entitles the acting
- *  admin only, "none" clears every row. 404 means the provider app isn't created
- *  yet (async install pending) — treat it as "try again shortly". */
+ *  admin only, "none" clears every row. Before the provider app exists the
+ *  server stores the mode and answers with `pending_entitlement_mode` (202). */
 export function setProviderEntitlementMode(
   token: string,
   provider: string,
   mode: ProviderEntitlementMode,
-): Promise<ProviderEntitlementModeEnvelope> {
-  return apiFetch<ProviderEntitlementModeEnvelope>(
+): Promise<ProviderEntitlementModeEnvelope | ProviderEntitlementModePendingEnvelope> {
+  return apiFetch<ProviderEntitlementModeEnvelope | ProviderEntitlementModePendingEnvelope>(
     `/admin/library-providers/${encodeURIComponent(provider)}/entitlement-mode`,
     { method: "POST", body: { mode }, token },
   );

@@ -1768,7 +1768,7 @@ export interface paths {
         put?: never;
         /**
          * Set the WHOLE entitlement state of a provider app (all|user|none), by provider name.
-         * @description #465, additive. REPLACES every entitlement row on the provider app named by {provider} with exactly what mode implies - "all" writes one ('all', NULL) row, "user" writes one ('user', <acting admin>) row (this endpoint has no subject_id field - it always means the caller), "none" writes none. This is a MODE control (a radio button expressing one of three exclusive states), not an incremental grant: calling it discards whatever was there, including a hand-picked set of per-user grants made through POST /v1/admin/apps/{id}/entitlements. Use that route instead for anything short of a full state replacement. Exists because the caller (the setup wizard / settings library step) knows the provider name but not the app id - EnsureProviderApp creates the app off the request thread, as a side effect of PATCH /v1/admin/settings library_discovery_enabled false->true, so there is no response carrying an app_id to key the generic entitlements routes against. 404 not_found when no app exists yet with this library_provider (not enabled yet, or the async create has not landed) - the wizard's answer is "try again shortly", not a retry loop hidden here. Written to the admin activity log as app.entitlement.set_mode.
+         * @description #465, additive. REPLACES every entitlement row on the provider app named by {provider} with exactly what mode implies - "all" writes one ('all', NULL) row, "user" writes one ('user', <acting admin>) row (this endpoint has no subject_id field - it always means the caller), "none" writes none. This is a MODE control (a radio button expressing one of three exclusive states), not an incremental grant: calling it discards whatever was there, including a hand-picked set of per-user grants made through POST /v1/admin/apps/{id}/entitlements. Use that route instead for anything short of a full state replacement. Exists because the caller (the setup wizard / settings library step) knows the provider name but not the app id - EnsureProviderApp creates the app off the request thread, as a side effect of PATCH /v1/admin/settings library_discovery_enabled false->true, so there is no response carrying an app_id to key the generic entitlements routes against. Amendment 21 (#490): when no app exists yet but an image_catalog entry claims the provider (not enabled yet, or the async create has not landed), the mode is stored and the answer is 202 with pending_entitlement_mode. EnsureProviderApp applies a stored mode in place of its 'all' grant when it creates the app, then deletes it; a later call replaces a stored mode, and a call that finds the app applies at once and drops any stored one. 404 not_found only when neither an app nor a catalog entry claims the provider. Written to the admin activity log as app.entitlement.set_mode (a stored mode has target_type library_provider and details.pending true).
          */
         post: {
             parameters: {
@@ -1793,6 +1793,15 @@ export interface paths {
                     };
                     content: {
                         "application/json": components["schemas"]["ProviderEntitlementModeEnvelope"];
+                    };
+                };
+                /** @description Amendment 21. No provider app yet; the mode is stored and applied when the app is created. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ProviderEntitlementModePendingEnvelope"];
                     };
                 };
                 400: components["responses"]["ValidationFailed"];
@@ -5187,7 +5196,7 @@ export interface paths {
             requestBody?: {
                 content: {
                     "application/json": {
-                        /** @description Bind the token to exactly this node_name. Absent = any node_name; empty string is 400 (it would silently mint an any-node token). */
+                        /** @description Bind the token to exactly this node_name. Absent = any new node_name (re-enrolling an existing host needs a bound token, amendment 20); empty string is 400 (it would silently mint an any-node token). */
                         node_name?: string;
                         /** @default 1 */
                         max_uses?: number;
@@ -8528,6 +8537,14 @@ export interface components {
                 app_id: string;
                 mode: components["schemas"]["ProviderEntitlementMode"];
                 items: components["schemas"]["Entitlement"][];
+            };
+        };
+        /** @description Amendment 21 (#490). The 202 body of POST .../library-providers/{provider}/entitlement-mode: the mode is stored and EnsureProviderApp grants it when it creates the provider app. There is no app_id or items yet. */
+        ProviderEntitlementModePendingEnvelope: {
+            pending_entitlement_mode: {
+                /** @description Echoes the path parameter, normalized. */
+                provider: string;
+                mode: components["schemas"]["ProviderEntitlementMode"];
             };
         };
         /** @description Valid pairs: reflink/seeded, copy/seeded, cold/{template_unavailable,source_disabled,host_templates_disabled,host_setting_invalid,policy_unavailable,storage_unavailable,clone_failed,policy_changed}, existing/existing_home. Only reflink proves reflink storage saving. */

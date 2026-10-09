@@ -7,6 +7,8 @@ import (
 	"context"
 	"net/http"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TestSetProviderEntitlementModeAll — enabling "all" after a prior "user"-only
@@ -191,9 +193,8 @@ func TestSetProviderEntitlementModeNone(t *testing.T) {
 	}
 }
 
-// TestSetProviderEntitlementModeUnknownProviderIs404 — the wizard's most
-// likely race: calling this before EnsureProviderApp's async pass has created
-// the app yet. Must be a clean 404, not a 500 or a silent no-op.
+// TestSetProviderEntitlementModeUnknownProviderIs404 — no app and no catalog
+// image claims the provider: a clean 404, and nothing stored.
 func TestSetProviderEntitlementModeUnknownProviderIs404(t *testing.T) {
 	pool := testDB(t)
 	srv, authSvc := newTestServer(t, pool)
@@ -210,10 +211,112 @@ func TestSetProviderEntitlementModeUnknownProviderIs404(t *testing.T) {
 		t.Fatalf("login: %v", err)
 	}
 
-	resp, body := post(t, srv.URL+"/v1/admin/library-providers/steam/entitlement-mode",
+	resp, body := post(t, srv.URL+"/v1/admin/library-providers/nosuchprovider/entitlement-mode",
 		map[string]any{"mode": "all"}, tok.Plaintext)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("want 404, got %d (%v)", resp.StatusCode, body)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pending_provider_entitlement_modes`).Scan(&n); err != nil {
+		t.Fatalf("count stored modes: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("stored modes = %d, want 0 for an unknown provider", n)
+	}
+}
+
+// seedProviderCatalogImage makes the catalog name a provider without creating
+// its app — the state between enabling discovery and EnsureProviderApp.
+func seedProviderCatalogImage(t *testing.T, ctx context.Context, pool *pgxpool.Pool, provider string) {
+	t.Helper()
+	id := "entitlement-mode-" + provider
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO image_catalog (id, manifest_version, display_name, kind, version, registry_ref, library_provider, raw)
+		VALUES ($1, 1, 'Provider', 'prebuilt', 'v1', 'registry.example.test/provider:v1', $2, '{}'::jsonb)`, id, provider); err != nil {
+		t.Fatalf("seed catalog image: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM image_catalog WHERE id = $1`, id) })
+}
+
+// TestSetProviderEntitlementModeStoredBeforeTheAppExists — amendment 21 (#490):
+// before the provider app exists the mode is stored (202) for EnsureProviderApp
+// rather than lost to a 404; a second request replaces it, and both are audited.
+func TestSetProviderEntitlementModeStoredBeforeTheAppExists(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newAuditedTestServer(t, pool)
+	ctx := context.Background()
+	tok := adminBearer(t, ctx, pool, authSvc, "admin@test.local", "admin")
+	var adminID string
+	if err := pool.QueryRow(ctx, `SELECT id::text FROM users WHERE email = 'admin@test.local'`).Scan(&adminID); err != nil {
+		t.Fatalf("admin id: %v", err)
+	}
+	seedProviderCatalogImage(t, ctx, pool, "steam")
+
+	for _, mode := range []string{"none", "user"} {
+		resp, body := post(t, srv.URL+"/v1/admin/library-providers/Steam/entitlement-mode",
+			map[string]any{"mode": mode}, tok)
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("mode %s: want 202, got %d (%v)", mode, resp.StatusCode, body)
+		}
+		pm, ok := body["pending_entitlement_mode"].(map[string]any)
+		if !ok || pm["provider"] != "steam" || pm["mode"] != mode {
+			t.Fatalf("mode %s: pending_entitlement_mode = %v", mode, body)
+		}
+		details, _ := auditDetails(t, pool, "app.entitlement.set_mode")
+		if details["mode"] != mode || details["pending"] != true {
+			t.Errorf("mode %s: audit details = %v", mode, details)
+		}
+	}
+
+	var mode string
+	var requestedBy *string
+	if err := pool.QueryRow(ctx, `
+		SELECT mode, requested_by::text FROM pending_provider_entitlement_modes WHERE provider = 'steam'`).
+		Scan(&mode, &requestedBy); err != nil {
+		t.Fatalf("read stored mode: %v", err)
+	}
+	if mode != "user" || requestedBy == nil || *requestedBy != adminID {
+		t.Errorf("stored = (%q, %v), want (user, %s): the later request replaces the earlier one", mode, requestedBy, adminID)
+	}
+	var apps int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM apps WHERE library_provider = 'steam'`).Scan(&apps); err != nil {
+		t.Fatalf("count apps: %v", err)
+	}
+	if apps != 0 {
+		t.Errorf("provider apps = %d, want 0: storing a mode must not create the app", apps)
+	}
+}
+
+// TestSetProviderEntitlementModeOnAnExistingAppClearsAStoredMode — once the app
+// exists the route applies immediately (200), and a stored request it
+// supersedes is dropped so it can never be applied later.
+func TestSetProviderEntitlementModeOnAnExistingAppClearsAStoredMode(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newTestServer(t, pool)
+	ctx := context.Background()
+	tok := adminBearer(t, ctx, pool, authSvc, "admin@test.local", "admin")
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO apps (name, kind, library_provider, enabled, managed_home, runtime_spec)
+		VALUES ('Steam', 'launcher', 'steam', true, true, '{"gpu":true}'::jsonb)`); err != nil {
+		t.Fatalf("seed provider app: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO pending_provider_entitlement_modes (provider, mode) VALUES ('steam', 'all')`); err != nil {
+		t.Fatalf("seed stored mode: %v", err)
+	}
+
+	resp, body := post(t, srv.URL+"/v1/admin/library-providers/steam/entitlement-mode",
+		map[string]any{"mode": "none"}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d (%v)", resp.StatusCode, body)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pending_provider_entitlement_modes`).Scan(&n); err != nil {
+		t.Fatalf("count stored modes: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("stored modes = %d, want 0 after an immediate apply", n)
 	}
 }
 

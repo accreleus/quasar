@@ -8,7 +8,8 @@
 // app id) because the wizard only has the provider name, not an app_id — the
 // provider app is created off-thread by the settings PATCH's
 // EnsureLibraryProviders side effect. This endpoint resolves provider name to
-// app id and applies the whole all/user/none state atomically server-side.
+// app id and applies the whole all/user/none state atomically server-side, or
+// stores it for EnsureProviderApp when the app does not exist yet (#490).
 package crud
 
 import (
@@ -48,9 +49,9 @@ func validEntitlementMode(mode string) bool {
 // ORDER BY created_at ASC, id ASC: library_provider has no unique index
 // (operators can set it by hand), so this picks a row deterministically if
 // more than one app ever carries the same value.
-func (s *store) findProviderAppID(ctx context.Context, provider string) (string, error) {
+func findProviderAppID(ctx context.Context, tx pgx.Tx, provider string) (string, error) {
 	var appID string
-	err := s.pool.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT id::text FROM apps
 		WHERE lower(library_provider) = lower($1)
 		ORDER BY created_at ASC, id ASC
@@ -75,20 +76,57 @@ func (s *store) findProviderAppID(ctx context.Context, provider string) (string,
 // 'all' subsumes them (control-api.md). Delete-then-insert in one transaction,
 // same pattern as setAppLaunchProfiles, so a partial write can't leave the app
 // over- or under-entitled.
-func (s *store) setProviderEntitlementMode(ctx context.Context, provider, mode string, actorID *string) (appID string, items []Entitlement, err error) {
-	appID, err = s.findProviderAppID(ctx, provider)
-	if err != nil {
-		return "", nil, err
-	}
-
+//
+// No app yet but a catalog image claims the provider: the mode is stored for
+// EnsureProviderApp to apply at create and pending is true (amendment 21, #490).
+// ErrNotFound only when neither exists.
+func (s *store) setProviderEntitlementMode(ctx context.Context, provider, mode string, actorID *string) (appID string, items []Entitlement, pending bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return "", nil, fmt.Errorf("begin set provider entitlement mode: %w", err)
+		return "", nil, false, fmt.Errorf("begin set provider entitlement mode: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
 
+	// Same key as images.EnsureProviderApp: without it the app could be created
+	// with 'all' between our existence check and the stored-mode write.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext('quasar_provider_app:' || $1)::bigint)`, provider); err != nil {
+		return "", nil, false, fmt.Errorf("lock provider app %q: %w", provider, err)
+	}
+
+	appID, err = findProviderAppID(ctx, tx, provider)
+	if errors.Is(err, ErrNotFound) {
+		var known bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM image_catalog WHERE lower(library_provider) = $1)`, provider).Scan(&known); err != nil {
+			return "", nil, false, fmt.Errorf("check catalog for provider %q: %w", provider, err)
+		}
+		if !known {
+			return "", nil, false, ErrNotFound
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pending_provider_entitlement_modes (provider, mode, requested_by)
+			VALUES ($1, $2, $3::uuid)
+			ON CONFLICT (provider) DO UPDATE
+			   SET mode = EXCLUDED.mode, requested_by = EXCLUDED.requested_by, requested_at = now()
+		`, provider, mode, actorID); err != nil {
+			return "", nil, false, fmt.Errorf("store entitlement mode for %q: %w", provider, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return "", nil, false, fmt.Errorf("commit stored entitlement mode for %q: %w", provider, err)
+		}
+		return "", nil, true, nil
+	}
+	if err != nil {
+		return "", nil, false, err
+	}
+
+	// A request stored before the app appeared is superseded by this one.
+	if _, err := tx.Exec(ctx, `DELETE FROM pending_provider_entitlement_modes WHERE provider = $1`, provider); err != nil {
+		return "", nil, false, fmt.Errorf("clear stored entitlement mode for %q: %w", provider, err)
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM entitlements WHERE app_id::text = $1`, appID); err != nil {
-		return "", nil, fmt.Errorf("clear provider app entitlements for %q: %w", provider, err)
+		return "", nil, false, fmt.Errorf("clear provider app entitlements for %q: %w", provider, err)
 	}
 
 	switch mode {
@@ -97,40 +135,40 @@ func (s *store) setProviderEntitlementMode(ctx context.Context, provider, mode s
 			INSERT INTO entitlements (subject_type, subject_id, app_id, granted_by, granted_by_user)
 			VALUES ('all', NULL, $1::uuid, 'admin', $2::uuid)
 		`, appID, actorID); err != nil {
-			return "", nil, fmt.Errorf("grant all-users entitlement for %q: %w", provider, err)
+			return "", nil, false, fmt.Errorf("grant all-users entitlement for %q: %w", provider, err)
 		}
 	case entitlementModeUser:
 		if actorID == nil {
 			// Unreachable via HTTP (RequireAuth guarantees an identity); guarded so
 			// a NULL subject_id fails here, not on the entitlements CHECK constraint.
-			return "", nil, fmt.Errorf("set provider entitlement mode to user: no acting admin in context")
+			return "", nil, false, fmt.Errorf("set provider entitlement mode to user: no acting admin in context")
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO entitlements (subject_type, subject_id, app_id, granted_by, granted_by_user)
 			VALUES ('user', $2::uuid, $1::uuid, 'admin', $2::uuid)
 		`, appID, actorID); err != nil {
-			return "", nil, fmt.Errorf("grant self-only entitlement for %q: %w", provider, err)
+			return "", nil, false, fmt.Errorf("grant self-only entitlement for %q: %w", provider, err)
 		}
 	case entitlementModeNone:
 		// Nothing to insert — the DELETE above already leaves it unentitled.
 	default:
-		return "", nil, fmt.Errorf("set provider entitlement mode: invalid mode %q", mode)
+		return "", nil, false, fmt.Errorf("set provider entitlement mode: invalid mode %q", mode)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return "", nil, fmt.Errorf("commit provider entitlement mode for %q: %w", provider, err)
+		return "", nil, false, fmt.Errorf("commit provider entitlement mode for %q: %w", provider, err)
 	}
 
 	rows, err := s.pool.Query(ctx, entitlementSelect+` WHERE e.app_id::text = $1
 		ORDER BY (e.subject_type = 'all') DESC, u.username ASC, e.created_at ASC`, appID)
 	if err != nil {
-		return "", nil, fmt.Errorf("read back provider entitlements for %q: %w", provider, err)
+		return "", nil, false, fmt.Errorf("read back provider entitlements for %q: %w", provider, err)
 	}
 	items, err = scanEntitlements(rows)
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
-	return appID, items, nil
+	return appID, items, false, nil
 }
 
 // --- handler -------------------------------------------------------------
@@ -156,14 +194,29 @@ func (h *Handler) handleSetProviderEntitlementMode(w http.ResponseWriter, r *htt
 	}
 
 	actor := actorID(r)
-	appID, items, err := h.store.setProviderEntitlementMode(r.Context(), provider, req.Mode, actor)
+	appID, items, pending, err := h.store.setProviderEntitlementMode(r.Context(), provider, req.Mode, actor)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound,
-			"no provider app exists yet for "+provider+" — enable it first, then retry")
+			"no library provider named "+provider+" in the image catalog")
 		return
 	case err != nil:
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not set entitlement mode")
+		return
+	}
+
+	if pending {
+		h.recordActivity(r, "app.entitlement.set_mode", "library_provider", provider, map[string]any{
+			"provider": provider,
+			"mode":     req.Mode,
+			"pending":  true,
+		})
+		httpx.WriteJSON(w, http.StatusAccepted, map[string]any{
+			"pending_entitlement_mode": map[string]any{
+				"provider": provider,
+				"mode":     req.Mode,
+			},
+		})
 		return
 	}
 
