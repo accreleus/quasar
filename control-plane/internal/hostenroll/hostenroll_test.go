@@ -170,7 +170,7 @@ func TestRedeemRecordsTheRedeemingNode(t *testing.T) {
 	if row.UsedByNodeName != nil {
 		t.Fatalf("freshly minted token already names a redeemer: %v", *row.UsedByNodeName)
 	}
-	if err := Redeem(ctx, pool, plaintext, "gpu-host-07"); err != nil {
+	if _, err := Redeem(ctx, pool, plaintext, "gpu-host-07"); err != nil {
 		t.Fatalf("redeem: %v", err)
 	}
 
@@ -253,7 +253,7 @@ func TestEnrollmentSurvivesItsMinter(t *testing.T) {
 		t.Fatalf("created_by_user_id = %v, want null once the minter is gone", *list[0].CreatedByUserID)
 	}
 	// And it still redeems: the credential a host is mid-enrollment with must survive.
-	if err := Redeem(ctx, pool, plaintext, "gpu-host-09"); err != nil {
+	if _, err := Redeem(ctx, pool, plaintext, "gpu-host-09"); err != nil {
 		t.Fatalf("redeem after the minter was deleted: %v", err)
 	}
 }

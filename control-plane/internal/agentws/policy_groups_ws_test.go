@@ -129,7 +129,7 @@ func connectTypedAgent(t *testing.T, pool *pgxpool.Pool, h *Handler, advertised 
 	agent := typedAgent{ws: ws}
 	agent.send(t, map[string]any{
 		"type": "register", "node_name": "rh05-336-groups", "agent_version": "test",
-		"auth":                   map[string]string{"enrollment_token": "test-token"},
+		"auth":                   map[string]string{"enrollment_token": boundEnrollmentToken(t, pool, "rh05-336-groups")},
 		"config_policy_versions": map[string]int{"typed_settings": 2, "execution_journal": 1, "deployment_baseline": 1},
 		"config_policy_groups":   advertised,
 	})

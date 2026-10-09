@@ -1402,6 +1402,10 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			h.writeError(conn, "auth_failed",
 				"a live agent is already registered under this node name; stop it before re-enrolling, "+
 					"or enroll under a different node_name")
+		case errors.Is(err, ErrHostAlreadyEnrolled):
+			h.writeError(conn, "auth_failed",
+				"this node name is already enrolled; re-enrolling it needs an enrollment token "+
+					"minted for this node name (Admin -> Fleet -> Add host, with the name filled in)")
 		case errors.Is(err, ErrHostNotFound):
 			// Names the credential that was refused, not just the remedy: the old
 			// wording ("use enrollment_token to enroll first") is exactly what an

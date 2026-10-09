@@ -42,7 +42,8 @@ func (r BootstrapResult) String() string {
 // Behaviour (idempotent, safe to call on every boot):
 //   - all of email/username/password empty ⇒ not configured ⇒ BootstrapSkipped;
 //   - an admin already exists ⇒ BootstrapSkipped (never a second admin);
-//   - the configured email already has an account ⇒ promote it (BootstrapPromoted);
+//   - the configured email already has an account ⇒ promote it, with the configured
+//     password and its tokens revoked (BootstrapPromoted);
 //   - otherwise create the admin account (BootstrapCreated).
 //
 // A partially-specified configuration is an operator error and returns

@@ -307,7 +307,7 @@ func (s *Service) LoginWithDevice(ctx context.Context, email, password, userAgen
 		return Token{}, err
 	}
 	expiresAt := time.Now().Add(s.tokenTTL)
-	if err := s.store.createToken(ctx, creds.userID, hash, expiresAt, userAgent, deviceID); err != nil {
+	if err := s.store.createToken(ctx, creds.userID, creds.passwordHash, hash, expiresAt, userAgent, deviceID); err != nil {
 		return Token{}, err
 	}
 
@@ -374,7 +374,7 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentPassword, n
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
-	if err := s.store.updatePasswordHash(ctx, userID, hash); err != nil {
+	if err := s.store.updatePasswordHash(ctx, userID, creds.passwordHash, hash); err != nil {
 		return err
 	}
 	// Revoke all active tokens so every device must re-authenticate with the new
