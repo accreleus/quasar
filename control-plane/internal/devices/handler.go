@@ -229,10 +229,13 @@ func (h *Handler) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Best-effort teardown: the token revocation (the security-critical part)
-	// has already committed, so a stopper failure is logged, not surfaced.
+	// has already committed, so a stopper failure is logged, not surfaced. The stop
+	// outlives the request: a client that disconnects mid-DELETE must not leave the
+	// device's sessions streaming.
 	if h.stopper != nil {
+		ctx := context.WithoutCancel(r.Context())
 		for _, sid := range sessionIDs {
-			if err := h.stopper(r.Context(), sid, "device_revoked"); err != nil {
+			if err := h.stopper(ctx, sid, "device_revoked"); err != nil {
 				slog.Warn("end session on device revoke failed", "session_id", sid, "err", err)
 			}
 		}
