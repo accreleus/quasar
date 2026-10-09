@@ -22,10 +22,10 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
+	"github.com/accreleus/quasar/control-plane/internal/images"
 )
 
-// Mirrors images.EntitlementMode's all|user|none without importing that
-// package: crud (admin/API) must not depend on images (installer).
+// The ProviderEntitlementMode vocabulary (control-api.md §Provider entitlement mode).
 const (
 	entitlementModeAll  = "all"
 	entitlementModeUser = "user"
@@ -87,11 +87,10 @@ func (s *store) setProviderEntitlementMode(ctx context.Context, provider, mode s
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
 
-	// Same key as images.EnsureProviderApp: without it the app could be created
-	// with 'all' between our existence check and the stored-mode write.
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtext('quasar_provider_app:' || $1)::bigint)`, provider); err != nil {
-		return "", nil, false, fmt.Errorf("lock provider app %q: %w", provider, err)
+	// Without it the app could be created with 'all' between our existence
+	// check and the stored-mode write.
+	if err := images.LockProviderApp(ctx, tx, provider); err != nil {
+		return "", nil, false, err
 	}
 
 	appID, err = findProviderAppID(ctx, tx, provider)

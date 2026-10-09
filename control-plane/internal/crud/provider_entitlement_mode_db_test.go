@@ -6,6 +6,7 @@ package crud
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -448,4 +449,104 @@ func TestStoredModeSurvivesAMixedCaseCatalogProvider(t *testing.T) {
 	if left != 0 {
 		t.Errorf("stored modes after create = %d, want 0", left)
 	}
+}
+
+// TestStoredModeAppliesToAProviderAppMadeByHand — an admin can make the
+// provider app themselves (POST /v1/apps, or PATCH /v1/apps setting
+// library_provider), after which EnsureProviderApp never runs its create path.
+// That write must consume the stored mode like EnsureProviderApp does; an
+// explicit entitle on POST wins and drops it.
+func TestStoredModeAppliesToAProviderAppMadeByHand(t *testing.T) {
+	for _, tc := range []struct {
+		name, stored string
+		write        func(t *testing.T, srv, tok string, pool *pgxpool.Pool) string
+		want         []string // subject_type of each grant, "user" meaning the admin
+	}{
+		{"POST without entitle", "none", func(t *testing.T, srv, tok string, _ *pgxpool.Pool) string {
+			return postProviderApp(t, srv, tok, map[string]any{})
+		}, nil},
+		{"POST with explicit entitle", "none", func(t *testing.T, srv, tok string, _ *pgxpool.Pool) string {
+			return postProviderApp(t, srv, tok, map[string]any{"entitle": "all"})
+		}, []string{"all"}},
+		{"PATCH setting library_provider", "user", func(t *testing.T, srv, tok string, pool *pgxpool.Pool) string {
+			var appID string
+			if err := pool.QueryRow(context.Background(), `
+				INSERT INTO apps (name, kind, enabled, runtime_spec) VALUES ('Steam', 'launcher', true, '{}'::jsonb)
+				RETURNING id::text`).Scan(&appID); err != nil {
+				t.Fatalf("seed app: %v", err)
+			}
+			if _, err := pool.Exec(context.Background(), `
+				INSERT INTO entitlements (subject_type, app_id, granted_by) VALUES ('all', $1::uuid, 'admin')`, appID); err != nil {
+				t.Fatalf("seed all grant: %v", err)
+			}
+			resp, body := patch(t, srv+"/v1/apps/"+appID, map[string]any{"library_provider": "steam"}, tok)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("PATCH: want 200, got %d (%v)", resp.StatusCode, body)
+			}
+			return appID
+		}, []string{"user"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := testDB(t)
+			srv, authSvc := newTestServer(t, pool)
+			ctx := context.Background()
+			tok := adminBearer(t, ctx, pool, authSvc, "admin@test.local", "admin")
+			setLibraryDiscovery(t, pool, true)
+			seedProviderCatalogImage(t, ctx, pool, "steam")
+
+			resp, body := post(t, srv.URL+"/v1/admin/library-providers/steam/entitlement-mode",
+				map[string]any{"mode": tc.stored}, tok)
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("store mode: want 202, got %d (%v)", resp.StatusCode, body)
+			}
+			appID := tc.write(t, srv.URL, tok, pool)
+
+			var got []string
+			rows, err := pool.Query(ctx, `
+				SELECT e.subject_type FROM entitlements e
+				LEFT JOIN users u ON u.id = e.subject_id
+				WHERE e.app_id = $1::uuid AND (e.subject_type = 'all' OR u.email = 'admin@test.local')
+				ORDER BY 1`, appID)
+			if err != nil {
+				t.Fatalf("read entitlements: %v", err)
+			}
+			for rows.Next() {
+				var s string
+				if err := rows.Scan(&s); err != nil {
+					t.Fatalf("scan: %v", err)
+				}
+				got = append(got, s)
+			}
+			rows.Close()
+			var total int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM entitlements WHERE app_id = $1::uuid`, appID).Scan(&total); err != nil {
+				t.Fatalf("count entitlements: %v", err)
+			}
+			if total != len(tc.want) || strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("entitlements = %v (%d rows), want %v", got, total, tc.want)
+			}
+			var left int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM pending_provider_entitlement_modes`).Scan(&left); err != nil {
+				t.Fatalf("count stored modes: %v", err)
+			}
+			if left != 0 {
+				t.Errorf("stored modes = %d, want 0", left)
+			}
+		})
+	}
+}
+
+func postProviderApp(t *testing.T, srv, tok string, extra map[string]any) string {
+	t.Helper()
+	req := map[string]any{"name": "Steam", "kind": "launcher", "library_provider": "steam"}
+	for k, v := range extra {
+		req[k] = v
+	}
+	resp, body := post(t, srv+"/v1/apps", req, tok)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /v1/apps: want 201, got %d (%v)", resp.StatusCode, body)
+	}
+	app, _ := body["app"].(map[string]any)
+	id, _ := app["id"].(string)
+	return id
 }

@@ -59,10 +59,10 @@ type catalogArtwork struct {
 // an app already has this library_provider (any enabled state — operator owns
 // it) or the image has no adoption/preset yet (a later reconcile picks it up).
 //
-// On create, grants the app's entitlements inline in the same transaction (see
-// grantProviderAppEntitlements): the all-users row by default — closing the
-// #456 follow-on where enabling Steam produced an app nobody could see — or the
-// mode an admin requested before the app existed. Only fires on created==true:
+// On create, grants the app's entitlements inline in the same transaction: the
+// all-users row by default — closing the #456 follow-on where enabling Steam
+// produced an app nobody could see — or the mode an admin requested before the
+// app existed (ApplyRequestedEntitlementMode). Only fires on created==true:
 // an operator who later deletes the entitlement (leaving the app) has that
 // respected forever, same as every other operator edit.
 //
@@ -86,9 +86,8 @@ func (s *Store) EnsureProviderApp(ctx context.Context, imageID, provider string)
 	// apps has no unique index on library_provider (it's operator-settable), so the
 	// exists-check + insert are made atomic with an advisory lock instead, since
 	// startup/post-sync/settings-enable reconciles can race.
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtext('quasar_provider_app:' || $1)::bigint)`, provider); err != nil {
-		return false, fmt.Errorf("lock provider app %q: %w", provider, err)
+	if err := LockProviderApp(ctx, tx, provider); err != nil {
+		return false, err
 	}
 
 	var exists bool
@@ -143,7 +142,11 @@ func (s *Store) EnsureProviderApp(ctx context.Context, imageID, provider string)
 		return false, fmt.Errorf("insert provider app for %q: %w", imageID, err)
 	}
 
-	if err := grantProviderAppEntitlements(ctx, tx, appID, provider); err != nil {
+	applied, err := ApplyRequestedEntitlementMode(ctx, tx, appID, provider)
+	if err == nil && !applied {
+		err = insertProviderAppAllEntitlement(ctx, tx, appID, provider)
+	}
+	if err != nil {
 		return false, fmt.Errorf("entitle provider app for %q: %w", imageID, err)
 	}
 
@@ -153,22 +156,37 @@ func (s *Store) EnsureProviderApp(ctx context.Context, imageID, provider string)
 	return true, nil
 }
 
-// grantProviderAppEntitlements consumes the mode an admin requested before the
-// app existed (amendment 21, #490) and grants it as that admin, or grants 'all'
-// when none was requested. The caller holds the provider advisory lock, which
-// crud's entitlement-mode route also takes, so a request cannot land between
-// this read and the app becoming visible to that route.
-func grantProviderAppEntitlements(ctx context.Context, tx dbExecutor, appID, provider string) error {
+// LockProviderApp takes the per-provider advisory lock held by every write
+// that creates or designates a provider app and by every read or write of its
+// requested entitlement mode (amendment 21, #490): EnsureProviderApp,
+// POST/PATCH /v1/apps and the entitlement-mode route. provider is lower-cased.
+func LockProviderApp(ctx context.Context, tx pgx.Tx, provider string) error {
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext('quasar_provider_app:' || $1)::bigint)`, provider); err != nil {
+		return fmt.Errorf("lock provider app %q: %w", provider, err)
+	}
+	return nil
+}
+
+// ApplyRequestedEntitlementMode consumes the mode an admin requested before
+// provider's app existed and makes it appID's whole entitlement set, granted as
+// that admin. Reports false, writing nothing, when none was stored. The caller
+// holds LockProviderApp, so a request cannot land between this read and the
+// app becoming visible to the entitlement-mode route.
+func ApplyRequestedEntitlementMode(ctx context.Context, tx pgx.Tx, appID, provider string) (bool, error) {
 	var mode string
 	var requestedBy *string
 	err := tx.QueryRow(ctx, `
 		DELETE FROM pending_provider_entitlement_modes WHERE provider = $1
 		RETURNING mode, requested_by::text`, provider).Scan(&mode, &requestedBy)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return insertProviderAppAllEntitlement(ctx, tx, appID, provider)
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("read requested entitlement mode: %w", err)
+		return false, fmt.Errorf("read requested entitlement mode: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM entitlements WHERE app_id = $1::uuid`, appID); err != nil {
+		return false, fmt.Errorf("clear entitlements for the requested mode: %w", err)
 	}
 	switch {
 	case mode == "all":
@@ -181,12 +199,15 @@ func grantProviderAppEntitlements(ctx context.Context, tx dbExecutor, appID, pro
 			VALUES ('user', $2::uuid, $1::uuid, 'admin', $2::uuid)`, appID, requestedBy)
 	}
 	// "none", or "user" whose requester was deleted: no grant, fail closed.
-	return err
+	if err != nil {
+		return false, fmt.Errorf("grant requested entitlement mode %q: %w", mode, err)
+	}
+	return true, nil
 }
 
 // insertProviderAppAllEntitlement writes the create-time subject_type='all'
 // grant. ON CONFLICT DO NOTHING makes it idempotent against a concurrent admin
-// grant, same pattern as grantAllOnCreate and the library-scan writer.
+// grant, same pattern as crud grantOnCreate and the library-scan writer.
 func insertProviderAppAllEntitlement(ctx context.Context, tx dbExecutor, appID, provider string) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO entitlements (subject_type, subject_id, app_id, granted_by, source_ref)
