@@ -51,14 +51,14 @@ Evidence keys used in the tables:
 
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
-| AMD | PASS (E1, E2) | GAP | GAP (container restarts only) | GAP | GAP |
+| AMD | PASS (E1, E2) | GAP (#502) | GAP: container restarts only (#502) | GAP (#502) | GAP (#502) |
 | NVIDIA | PASS (E1, E2, E4) | PASS (E4) | PASS (E4) | PASS: #407 [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752) | PASS: run `9384a95d` (E4) |
 
 ### Podman rootless (Fedora family)
 
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
-| AMD | PASS (E3): gamepad sequence identical to the reference, 30/30 keys, microphone RMS 2902 | GAP: E3 has no update row | PASS: VM reboot (E3) | PASS: HDMI picture, mouse, audio, DDC (E3; #407 [5912107863](https://github.com/accreleus/quasar/issues/407#issuecomment-5912107863)); no physical keyboard attached | PASS with no baseline: XFCE 1080p60 soak, `no_comparable_runs` (E3) |
+| AMD | PASS (E3): gamepad sequence identical to the reference, 30/30 keys, microphone RMS 2902 | GAP: E3 has no update row (#502) | PASS: VM reboot (E3) | PASS: HDMI picture, mouse, audio, DDC (E3; #407 [5912107863](https://github.com/accreleus/quasar/issues/407#issuecomment-5912107863)); no physical keyboard attached | PASS with no baseline: XFCE 1080p60 soak, `no_comparable_runs` (E3) |
 | NVIDIA | PASS (E4, E6, E7; audio: #411 [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147)) | PASS (E5) | PASS (E5) | PASS: #407 [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657); direct display (E10) | PASS: run `9cf88ede`, "result: clean" (#399 [5876277652](https://github.com/accreleus/quasar/issues/399#issuecomment-5876277652)) |
 
 The AMD Podman bench is an XFCE soak, not a Steam game.
@@ -105,32 +105,22 @@ The AMD Podman bench is an XFCE soak, not a Steam game.
 | 27 | Docs say a rootful socket is root-equivalent | Met | #406 [5884610608](https://github.com/accreleus/quasar/issues/406#issuecomment-5884610608) |
 | 28 | SELinux-enforcing hosts work without relaxing SELinux | Met | Every rootless run stayed `Enforcing`; sessions stay confined; the agent's `label=disable` per D17 |
 | 29 | One behavioural suite across every engine mode | Met | #408 [5893020059](https://github.com/accreleus/quasar/issues/408#issuecomment-5893020059), in CI on all four modes; its Podman findings (#424, #425, #426) are fixed |
-| 30 | Each required profile proven on hardware before `main` | Partly met | Every NVIDIA row and every AMD rootful Docker row passes (E8). AMD gaps: Docker rootless update, reboot, console, bench; Podman rootless update |
+| 30 | Each required profile proven on hardware before `main` | Partly met | Every NVIDIA row and every AMD rootful Docker row passes (E8). AMD gaps: Docker rootless update, reboot, console, bench; Podman rootless update. Accepted for the v0.4.0 release; tracked in #502 |
 
-Met: 1–11, 13, 15–19, 21–25, 27–29 (**23**). Partly met: 12, 14, 20, 26, 30 (**5**). Not
+Met: 1–13, 15–19, 21–25, 27–29 (**24**). Partly met: 14, 20, 26, 30 (**4**). Not
 evidenced: none.
 
 ## 3. Open gaps
 
-Each needs a run, or the owner's named acceptance under #409.
+The milestone closed on 2026-10-09 with these gaps accepted. Every remaining run is tracked in
+#502; none is a known defect.
 
-1. ~~**AMD, Docker rootful:** reboot, console mode, bench.~~ Closed by E8; console mode is
-   covered by NVIDIA.
-2. **AMD, Docker rootless:** update, machine reboot, console, bench.
-3. **AMD, Podman rootless:** update from the console; console run with a physical keyboard;
-   a Steam bench with a baseline.
-4. **Final candidate:** run on AMD rootful Docker (E8) only; the other profiles were not re-run
-   on it (see Candidate coverage).
-5. **#413:** the rootful `--gpus` fallback on a CUDA-only NVIDIA host (CDI works).
-6. **Known Podman defects, need a release decision:** #425 (a crash-looping service can
-   restart after an explicit stop), #426 (Podman creates a missing bind source), #424
-   (restart-policy update unsupported on Podman 4.9).
-7. **Story 26:** restore into a fresh rootless install, a v0.2.x dump, a live mid-restore
-   crash.
-8. **Story 20:** no live Xid fault on the shown path.
-9. **Podman rootful and Ubuntu:** not required; labels stay experimental (#416).
-10. **#432:** fixed in code, not yet verified on hardware (needs the lab VM). #429 was verified
-    and closed.
+1. **AMD, Docker rootless:** update, machine reboot, console, bench.
+2. **AMD, Podman rootless:** update from the console; the direct-display console with a
+   physical keyboard; a Steam bench with a baseline.
+3. **Story 20:** no live Xid fault on the shown path.
+4. **Story 26:** restore into a fresh rootless install, a v0.2.x dump, a live mid-restore crash.
+5. **Not required:** Podman rootful and Ubuntu keep their experimental labels.
 
-**Open defects touching these rows:** #410, #412, #413, #414, #416, #418, #421, #422, #424,
-#425, #426, #432, #433, #434, #439.
+Every defect this map listed as open on 2026-10-02 (#410, #412, #413, #414, #416, #418,
+#421, #422, #424, #425, #426, #432, #433, #434, #439) is closed.
