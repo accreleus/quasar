@@ -20,7 +20,7 @@ func (h *Handler) applyConsoleAccessReport(ctx context.Context, hostID string, a
 		return
 	}
 	if applied {
-		_ = h.registry.Send(hostID, ConfigUpdateCmd{Type: "config_update", ConsoleConfig: resolved})
+		_ = h.registry.SendOrReconnect(hostID, ConfigUpdateCmd{Type: "config_update", ConsoleConfig: resolved})
 		details := map[string]any{"target": *access.Target}
 		if access.RequestID != nil {
 			details["request_id"] = *access.RequestID
