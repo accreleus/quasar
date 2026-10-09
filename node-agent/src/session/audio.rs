@@ -600,6 +600,15 @@ mod tests {
         assert!(priority(output) > priority(mic));
     }
 
+    // Below 512 frames the non-RT pulse daemon misses graph cycles under host load (#392).
+    #[test]
+    fn pulse_floor_keeps_session_audio_click_free() {
+        let pulse = baked_config("quasar-session-pulse.conf");
+        let props = &pulse[pulse.find("pulse.properties = {").unwrap()..];
+        let props = &props[..props.find("\n}").unwrap()];
+        assert!(props.contains("pulse.min.quantum = 512/48000"), "{props}");
+    }
+
     // Stock PipeWire's VM rule, copied from /usr/share/pipewire/pipewire{,-pulse}.conf: small
     // quanta crackle under VM timer jitter, and the session daemon has no RT priority.
     #[test]
