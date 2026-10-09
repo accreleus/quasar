@@ -590,11 +590,22 @@ mod tests {
         let daemon = baked_config("quasar-session.conf");
         let pulse = baked_config("quasar-session-pulse.conf");
         for (config, section, floor) in [
-            (&daemon, "context.properties.rules", "default.clock.min-quantum = 1024"),
-            (&pulse, "pulse.properties.rules", "pulse.min.quantum = 1024/48000"),
+            (
+                &daemon,
+                "context.properties.rules",
+                "default.clock.min-quantum = 1024",
+            ),
+            (
+                &pulse,
+                "pulse.properties.rules",
+                "pulse.min.quantum = 1024/48000",
+            ),
         ] {
             let rules = &config[config.find(section).expect(section)..];
-            assert!(rules.contains("matches = [ { cpu.vm.name = !null } ]"), "{section}");
+            assert!(
+                rules.contains("matches = [ { cpu.vm.name = !null } ]"),
+                "{section}"
+            );
             assert!(rules.contains(floor), "{section} lacks `{floor}`");
         }
     }
