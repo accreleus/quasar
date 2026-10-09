@@ -28,7 +28,7 @@ time.
    it's your bottleneck.
 4. **Network carries it.**
 5. **Client buffers it.** An adaptive jitter buffer, from the rung's starting
-   buffer down toward 50 ms, never below that start. Automatic, no server setting.
+   buffer down toward 50 ms, or toward the start if that is lower. Automatic, no server setting.
 6. **Browser decodes and presents it.** Small with hardware decode, a few ms more
    for AV1 software decode.
 
