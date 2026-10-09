@@ -5,9 +5,13 @@ package devices
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/auth"
@@ -221,4 +225,150 @@ func userID(t *testing.T, pool *pgxpool.Pool, email string) string {
 		t.Fatalf("userID(%s): %v", email, err)
 	}
 	return id
+}
+
+// TestRevokeStopsSessionsOnDetachedContext: the stopper gets (sid, "device_revoked") on a
+// context that survives the request being cancelled (#489).
+func TestRevokeStopsSessionsOnDetachedContext(t *testing.T) {
+	pool := testDB(t)
+	authSvc, err := auth.NewService(pool, auth.DefaultParams(), time.Hour)
+	if err != nil {
+		t.Fatalf("auth service: %v", err)
+	}
+	type call struct{ sid, reason string }
+	var calls []call
+	var stopCtxErr error
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	defer cancelReq()
+	stopper := func(ctx context.Context, sid, reason string) error {
+		cancelReq() // the client disconnects before the stop runs
+		calls = append(calls, call{sid, reason})
+		stopCtxErr = ctx.Err()
+		return nil
+	}
+	mux := http.NewServeMux()
+	authHandler := auth.NewHandler(authSvc)
+	authHandler.Register(mux)
+	NewHandler(NewStore(pool), stopper).Register(mux, authHandler.RequireAuth)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	mustRegister(t, authSvc, "stop@x.io", "stopuser", "quasar-fixture-pw-09")
+	tok := loginHTTP(t, srv.URL, "stop@x.io", "quasar-fixture-pw-09", "stop-dev")
+	deviceID := listDevices(t, srv.URL, tok)[0].ID
+	uid := userID(t, pool, "stop@x.io")
+	sessID := seedSession(t, pool, uid, deviceID)
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/me/devices/"+deviceID, nil).WithContext(reqCtx)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE: got %d want 204 (%s)", rec.Code, rec.Body.String())
+	}
+	if len(calls) != 1 || calls[0] != (call{sessID, "device_revoked"}) {
+		t.Fatalf("stopper calls: got %v want [{%s device_revoked}]", calls, sessID)
+	}
+	if reqCtx.Err() == nil {
+		t.Fatal("request ctx was not cancelled; test proves nothing")
+	}
+	if stopCtxErr != nil {
+		t.Fatalf("stopper ctx cancelled with the request: %v", stopCtxErr)
+	}
+}
+
+// TestRevokeBlocksConcurrentSessionInsert: while Revoke holds the device row, a session
+// insert for that device waits, then fails on the FK once the row is deleted (#489).
+// The test pins Revoke mid-transaction by holding the device's token row, which Revoke
+// updates after taking its device lock.
+func TestRevokeBlocksConcurrentSessionInsert(t *testing.T) {
+	pool := testDB(t)
+	srv, svc := newServer(t, pool)
+	mustRegister(t, svc, "race@x.io", "raceuser", "quasar-fixture-pw-10")
+	tok := loginHTTP(t, srv.URL, "race@x.io", "quasar-fixture-pw-10", "race-dev")
+	deviceID := listDevices(t, srv.URL, tok)[0].ID
+	uid := userID(t, pool, "race@x.io")
+	ctx := context.Background()
+	var appID string
+	if err := pool.QueryRow(ctx, `INSERT INTO apps (name) VALUES ('t') RETURNING id::text`).Scan(&appID); err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+
+	pin, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin pin: %v", err)
+	}
+	defer pin.Rollback(ctx) //nolint:errcheck
+	if _, err := pin.Exec(ctx, `SELECT 1 FROM auth_tokens WHERE device_id = $1::uuid FOR UPDATE`, deviceID); err != nil {
+		t.Fatalf("pin token row: %v", err)
+	}
+
+	revokeDone := make(chan error, 1)
+	go func() {
+		_, err := NewStore(pool).Revoke(ctx, uid, deviceID)
+		revokeDone <- err
+	}()
+	waitLockWait(t, pool, "%UPDATE auth_tokens%") // Revoke now holds the device row
+
+	insertDone := make(chan error, 1)
+	go func() {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO sessions (user_id, app_id, state, width, height, fps, bitrate_kbps, device_id)
+			VALUES ($1::uuid, $2::uuid, 'running', 1280, 720, 60, 8000, $3::uuid)`, uid, appID, deviceID)
+		insertDone <- err
+	}()
+	waitLockWait(t, pool, "%INSERT INTO sessions%")
+	select {
+	case err := <-insertDone:
+		t.Fatalf("insert did not wait on the device row: %v", err)
+	default:
+	}
+
+	if err := pin.Rollback(ctx); err != nil {
+		t.Fatalf("release pin: %v", err)
+	}
+	if err := <-revokeDone; err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	var pgErr *pgconn.PgError
+	if err := <-insertDone; !errors.As(err, &pgErr) || pgErr.Code != "23503" {
+		t.Fatalf("insert after revoke: got %v want FK violation 23503", err)
+	}
+}
+
+// waitLockWait blocks until a backend running a query LIKE pattern is waiting on a lock.
+func waitLockWait(t *testing.T, pool *pgxpool.Pool, pattern string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := pool.QueryRow(context.Background(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND query LIKE $1`, pattern).Scan(&n); err != nil {
+			t.Fatalf("poll pg_stat_activity: %v", err)
+		}
+		if n > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no backend waiting on a lock for %q", pattern)
+}
+
+// seedSession inserts a running session bound to deviceID and returns its id.
+func seedSession(t *testing.T, pool *pgxpool.Pool, uid, deviceID string) string {
+	t.Helper()
+	ctx := context.Background()
+	var appID, sessID string
+	if err := pool.QueryRow(ctx, `INSERT INTO apps (name) VALUES ('t') RETURNING id::text`).Scan(&appID); err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO sessions (user_id, app_id, state, width, height, fps, bitrate_kbps, device_id)
+		VALUES ($1::uuid, $2::uuid, 'running', 1280, 720, 60, 8000, $3::uuid)
+		RETURNING id::text`, uid, appID, deviceID).Scan(&sessID); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	return sessID
 }
