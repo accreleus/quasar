@@ -133,9 +133,9 @@ volumes:
 </TabItem>
 </Tabs>
 
-- **`QUASAR_PUBLIC_HOST`** (required): the name or LAN address you type into the
-  browser. The certificate names it. Extra names go in `QUASAR_TLS_HOSTS`,
-  comma-separated.
+- **`QUASAR_PUBLIC_HOST`** (set it for LAN access): the name or LAN address you
+  type into the browser. The certificate names it. Extra names go in
+  `QUASAR_TLS_HOSTS`, comma-separated.
 - **Ports:** 8443 (console) and 8080 (agents and `/health`). Change with
   `QUASAR_TLS_PORT` and `QUASAR_HTTP_PORT`.
 - **Behind a reverse proxy:** add `QUASAR_TRUSTED_PROXIES`. See [Behind a reverse
