@@ -82,6 +82,8 @@ type conn struct {
 	rh05Snapshots             map[string]hostcfg.PolicySnapshot
 	policyActiveSnapshots     atomic.Pointer[map[string]hostcfg.PolicySnapshot]
 	policyOutstanding         map[string]ConfigPolicyStateMsg
+	policyIssued              map[string]*hostcfg.PolicyOffer // next_session grants sent on this connection
+	policyNudge               chan struct{}
 	policySequence            map[string]uint64
 	policySequenceContent     map[string][]byte
 	policyUncertain           bool
@@ -134,15 +136,17 @@ func (r *Registry) PolicyIdentity(hostID string) (string, string, bool) {
 	return c.bootIncarnation, c.connectionIncarnation, true
 }
 
-// PolicyActiveSnapshots returns only the authenticated current connection's
-// completed journal inventory snapshots, keyed by group. The map is never
-// mutated after publication.
-func (r *Registry) PolicyActiveSnapshots(hostID, connectionID string) map[string]hostcfg.PolicySnapshot {
+// NudgePolicyOffers asks the host's read loop to run its next-session offer
+// pass now. Offers are only issued there: the loop owns policyIssued.
+func (r *Registry) NudgePolicyOffers(hostID string) {
 	c, ok := r.get(hostID)
-	if !ok || !c.policyTyped || c.connectionIncarnation != connectionID || !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyAttemptOutstanding.Load() {
-		return nil
+	if !ok {
+		return
 	}
-	return c.activePolicySnapshots()
+	select {
+	case c.policyNudge <- struct{}{}:
+	default:
+	}
 }
 
 func (c *conn) activePolicySnapshots() map[string]hostcfg.PolicySnapshot {
@@ -185,6 +189,8 @@ func newConn(hostID string, ws *websocket.Conn) *conn {
 		out:    make(chan []byte, outBuffer),
 		done:   make(chan struct{}),
 		acks:   make(map[string]chan AckResult),
+
+		policyNudge: make(chan struct{}, 1),
 	}
 }
 
@@ -392,6 +398,25 @@ func (r *Registry) Send(hostID string, v any) error {
 		return ErrAgentNotConnected
 	}
 	return c.enqueue(v)
+}
+
+// SendOrReconnect is Send for state that register resends in full: when a
+// connected agent cannot take v, its connection is closed so the reconnect
+// delivers it instead of the change being lost until some later reconnect.
+func (r *Registry) SendOrReconnect(hostID string, v any) error {
+	c, ok := r.get(hostID)
+	if !ok {
+		return ErrAgentNotConnected
+	}
+	err := c.enqueue(v)
+	if err != nil {
+		r.log.Warn("agent send failed; closing its connection so the reconnect resends state", "host_id", hostID, "err", err)
+		c.close()
+		if c.ws != nil {
+			_ = c.ws.Close()
+		}
+	}
+	return err
 }
 
 // SendWithAck sends v (which must carry the given command id) and waits for the

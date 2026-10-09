@@ -11,7 +11,7 @@ import (
 
 type fakeDispatcher struct{ sent []any }
 
-func (d *fakeDispatcher) Send(hostID string, v any) error {
+func (d *fakeDispatcher) SendOrReconnect(hostID string, v any) error {
 	d.sent = append(d.sent, v)
 	return nil
 }

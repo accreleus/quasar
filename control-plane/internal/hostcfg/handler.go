@@ -196,41 +196,16 @@ func (h *Handler) handlePatchPolicy(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, code, err.Error())
 		return
 	}
-	h.sendNextSessionOffers(r.Context(), r.PathValue("id"))
+	h.nudgeNextSessionOffers(r.PathValue("id"))
 	httpx.WriteJSON(w, http.StatusOK, h.policyViewForConnection(r.Context(), r.PathValue("id"), view))
 }
 
-// sendNextSessionOffers sends one offer per ready next-session group to the
-// current typed connection. Offers need that connection's complete active
-// snapshots; the durable obligation, not this send, carries the intent.
-func (h *Handler) sendNextSessionOffers(ctx context.Context, hostID string) {
-	target, ok := h.dispatcher.(interface {
-		PolicyIdentity(string) (string, string, bool)
-	})
-	if !ok {
-		return
-	}
-	boot, connection, capable := target.PolicyIdentity(hostID)
-	if !capable {
-		return
-	}
-	source, ok := h.dispatcher.(interface {
-		PolicyActiveSnapshots(string, string) map[string]PolicySnapshot
-	})
-	if !ok {
-		return
-	}
-	snapshots := source.PolicyActiveSnapshots(hostID, connection)
-	if len(snapshots) == 0 {
-		return
-	}
-	offers, err := h.store.NextSessionOfferBatch(ctx, hostID, boot, connection, snapshots, newPolicyAttemptID)
-	if err != nil {
-		slog.Warn("host policy offer load failed", "host_id", hostID, "err", err)
-		return
-	}
-	for _, offer := range offers {
-		_ = h.dispatcher.Send(hostID, offer)
+// nudgeNextSessionOffers asks the host's agent connection to run its offer
+// pass now. Offers are issued only there, so every grant is recorded on the
+// connection that answers it (#498); the durable obligation carries the intent.
+func (h *Handler) nudgeNextSessionOffers(hostID string) {
+	if target, ok := h.dispatcher.(interface{ NudgePolicyOffers(string) }); ok {
+		target.NudgePolicyOffers(hostID)
 	}
 }
 
@@ -282,7 +257,7 @@ func (h *Handler) handleRetryPolicy(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("record admin activity failed", "action", "host.policy.retry", "err", err)
 		}
 	}
-	h.sendNextSessionOffers(r.Context(), hostID)
+	h.nudgeNextSessionOffers(hostID)
 	httpx.WriteJSON(w, http.StatusOK, h.policyViewForConnection(r.Context(), hostID, view))
 }
 
@@ -490,7 +465,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	// overlays them on its env baseline — a cleared override reverts to env,
 	// not the catalog default.
 	if typed {
-		h.sendNextSessionOffers(r.Context(), hostID)
+		h.nudgeNextSessionOffers(hostID)
 		if mapReady {
 			id := newPolicyAttemptID()
 			if settings, ok, err := h.store.PrepareLegacyDelivery(r.Context(), hostID, connectionID, id, provisional); err == nil && ok {

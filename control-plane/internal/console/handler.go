@@ -12,12 +12,14 @@ import (
 )
 
 // Dispatcher is the subset of the agent registry the handler needs: push a
-// config_update to a host's agent. agentws.Registry.Send satisfies it. Kept
-// as a local interface so console does not import agentws — agentws imports
+// config_update to a host's agent, forcing a reconnect (which resends the
+// console config) when a connected agent cannot take it.
+// agentws.Registry.SendOrReconnect satisfies it. Kept as a local interface
+// so console does not import agentws — agentws imports
 // console (for the after-registered snapshot + capacity upsert), and that
 // direction would cycle if console imported back.
 type Dispatcher interface {
-	Send(hostID string, v any) error
+	SendOrReconnect(hostID string, v any) error
 }
 
 // configUpdateCmd mirrors agentws.ConfigUpdateCmd on the wire (agent-api.md
@@ -213,8 +215,8 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	// Persist + push (control-api.md): the resolved console_config is pushed to
 	// the agent immediately via config_update. Fire-and-forget — no ack, not
 	// restart-class; a disconnected agent picks it up on its next registered
-	// snapshot.
-	_ = h.dispatcher.Send(hostID, configUpdateCmd{Type: "config_update", ConsoleConfig: resolved})
+	// snapshot, and a full send queue forces that reconnect.
+	_ = h.dispatcher.SendOrReconnect(hostID, configUpdateCmd{Type: "config_update", ConsoleConfig: resolved})
 	if h.auditor != nil {
 		keys := make([]string, 0, len(patch))
 		for key := range patch {

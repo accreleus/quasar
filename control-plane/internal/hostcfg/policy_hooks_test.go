@@ -22,22 +22,27 @@ func (localStorageProvider) StorageProvider(context.Context) (string, error) {
 }
 
 // offerDispatcher is a current typed connection with complete inventory: it
-// reports the connection identity and its per-group active snapshots.
+// reports the connection identity and, when nudged, runs the offer pass the
+// agentws read loop would and records what it sent.
 type offerDispatcher struct {
 	fakeDispatcher
+	store      *Store
 	connection string
 	snapshots  map[string]PolicySnapshot
 }
 
-func (d *offerDispatcher) PolicyIdentity(string) (string, string, bool) {
-	return "22222222-2222-4222-8222-222222222222", d.connection, true
+func (d *offerDispatcher) NudgePolicyOffers(hostID string) {
+	offers, err := d.store.NextSessionOfferBatch(context.Background(), hostID, "22222222-2222-4222-8222-222222222222", d.connection, d.snapshots, newPolicyAttemptID)
+	if err != nil {
+		panic(err)
+	}
+	for _, offer := range offers {
+		_ = d.Send(hostID, offer)
+	}
 }
 
-func (d *offerDispatcher) PolicyActiveSnapshots(_, connection string) map[string]PolicySnapshot {
-	if connection != d.connection {
-		return nil
-	}
-	return d.snapshots
+func (d *offerDispatcher) PolicyIdentity(string) (string, string, bool) {
+	return "22222222-2222-4222-8222-222222222222", d.connection, true
 }
 
 func (d *offerDispatcher) takeOffers() map[string]*PolicyOffer {
@@ -102,7 +107,7 @@ func TestTypedPatchEveryNextSessionKeySavesValidatesAndOffers(t *testing.T) {
 		t.Run(group, func(t *testing.T) {
 			pool := testPool(t)
 			host := newTypedHost(t, pool, group)
-			dispatcher := &offerDispatcher{connection: host.connection, snapshots: host.snapshots}
+			dispatcher := &offerDispatcher{store: store, connection: host.connection, snapshots: host.snapshots}
 			mux := policyMux(NewHandler(store, dispatcher, nil))
 			value := explicitSamples[group].valid
 
@@ -239,7 +244,7 @@ func TestHomeRootStaysInsideMountAndNeverStrandsExistingHomes(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET effective_settings='{"home_root":"/srv/homes"}'::jsonb WHERE id=$1::uuid`, host.id); err != nil {
 		t.Fatal(err)
 	}
-	dispatcher := &offerDispatcher{connection: host.connection, snapshots: host.snapshots}
+	dispatcher := &offerDispatcher{store: store, connection: host.connection, snapshots: host.snapshots}
 	mux := policyMux(NewHandler(store, dispatcher, stubCounter{}))
 	homeRoot := func(v string) map[string]PolicyChoice {
 		return map[string]PolicyChoice{"home_root": {Source: "explicit", Value: v}}
@@ -293,7 +298,7 @@ func TestHomeRootEditsFollowAReconfiguredMount(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET deployment_settings=$2::jsonb,effective_settings='{"home_root":"/srv/homes"}'::jsonb WHERE id=$1::uuid`, host.id, mustJSON(t, moved)); err != nil {
 		t.Fatal(err)
 	}
-	dispatcher := &offerDispatcher{connection: host.connection, snapshots: host.snapshots}
+	dispatcher := &offerDispatcher{store: store, connection: host.connection, snapshots: host.snapshots}
 	mux := policyMux(NewHandler(store, dispatcher, stubCounter{}))
 	legacy := func(value string) *httptest.ResponseRecorder {
 		rr := httptest.NewRecorder()
@@ -346,7 +351,7 @@ func TestHomeRootEditRacingFirstHomeClaimIsRefused(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("first home claim did not reach root resolution")
 	}
-	dispatcher := &offerDispatcher{connection: host.connection, snapshots: host.snapshots}
+	dispatcher := &offerDispatcher{store: store, connection: host.connection, snapshots: host.snapshots}
 	mux := policyMux(NewHandler(store, dispatcher, stubCounter{}))
 	editDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
@@ -642,7 +647,7 @@ func TestRetryPolicyHandlerResponses(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE host_setting_groups SET status='uncertain' WHERE host_id=$1::uuid AND group_key='target_usage'`, host.id); err != nil {
 		t.Fatal(err)
 	}
-	dispatcher := &offerDispatcher{connection: host.connection, snapshots: host.snapshots}
+	dispatcher := &offerDispatcher{store: store, connection: host.connection, snapshots: host.snapshots}
 	h := NewHandler(store, dispatcher, nil)
 	view, err := store.GetPolicy(ctx, host.id)
 	if err != nil {

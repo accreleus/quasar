@@ -318,12 +318,26 @@ func (h *Handler) offerNextSessionPolicy(ctx context.Context, c *conn) {
 		h.log.Warn("host policy offer load failed", "host_id", c.hostID, "err", err)
 		return
 	}
+	for id, issued := range c.policyIssued {
+		if time.Since(issued.ExpiresAt) > policyIssuedRetention {
+			delete(c.policyIssued, id)
+		}
+	}
 	for _, offer := range offers {
 		if err := h.registry.Send(c.hostID, offer); err != nil {
 			h.log.Warn("host policy offer failed", "host_id", c.hostID, "group", offer.Group, "err", err)
+			continue
 		}
+		if c.policyIssued == nil {
+			c.policyIssued = map[string]*hostcfg.PolicyOffer{}
+		}
+		c.policyIssued[offer.AttemptID] = offer
 	}
 }
+
+// policyIssuedRetention keeps an unanswered grant past its expiry long enough
+// for the agent's late rejection to land; an accepted one moves to policyOutstanding.
+const policyIssuedRetention = 5 * time.Minute
 
 func (h *Handler) offerIdlePolicy(ctx context.Context, c *conn) {
 	if !c.policyIdle || !c.policyAcknowledged.Load() || !c.policyInventoryDone.Load() ||
@@ -359,11 +373,14 @@ func (h *Handler) offerIdlePolicy(ctx context.Context, c *conn) {
 
 // Historical grants stay bound to their original identity across reconnects.
 // The current socket authenticates the report; inventory binds its attempt.
+// Anything else must be a grant this connection issued (agent-api.md: state is
+// accepted only for a matching durable attempt).
 func policyGrantMatches(c *conn, state ConfigPolicyStateMsg) bool {
 	if prior, ok := c.policyOutstanding[state.AttemptID]; ok {
 		return prior.HostID == state.HostID && prior.Group == state.Group && prior.Revision == state.Revision && prior.ContentSHA256 == state.ContentSHA256 && prior.Scope == state.Scope && prior.GrantBootIncarnation == state.GrantBootIncarnation && prior.GrantConnectionIncarnation == state.GrantConnectionIncarnation
 	}
-	return state.GrantBootIncarnation == c.bootIncarnation && state.GrantConnectionIncarnation == c.connectionIncarnation
+	offer, ok := c.policyIssued[state.AttemptID]
+	return ok && offer.HostID == state.HostID && offer.Group == state.Group && offer.Revision == state.Revision && offer.ContentSHA256 == state.ContentSHA256 && offer.Scope == state.Scope && offer.BootIncarnation == state.GrantBootIncarnation && offer.ConnectionIncarnation == state.GrantConnectionIncarnation
 }
 
 func policyEntryMatchesDesired(group hostcfg.PolicyGroup, entry ConfigPolicyStateMsg) bool {
@@ -906,13 +923,15 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	}
 
 	// Step 4 — message loop: heartbeats, acks, and session_state callbacks.
+	// One read is in flight at a time, so an offer nudge can be served between
+	// messages without a second reader (gorilla allows one).
+	type readResult struct {
+		raw []byte
+		err error
+	}
+	reads := make(chan readResult, 1)
+	reading := false
 	for {
-		// Fail fast if the server is shutting down.
-		select {
-		case <-reqCtx.Done():
-			return nil
-		default:
-		}
 		// A lost initial map or acknowledgement must not leave an apparently
 		// connected host gated forever. Renegotiate after a bounded wait; the
 		// durable gate remains closed until a current-connection exact-ID ack.
@@ -920,10 +939,27 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			return errors.New("policy initial settings map acknowledgement timed out")
 		}
 
-		conn.SetReadDeadline(time.Now().Add(readDeadlineDur))
-		raw, err := readTextMessage(conn)
-		if err != nil {
-			return fmt.Errorf("read: %w", err)
+		if !reading {
+			reading = true
+			conn.SetReadDeadline(time.Now().Add(readDeadlineDur))
+			go func() {
+				raw, err := readTextMessage(conn)
+				reads <- readResult{raw, err}
+			}()
+		}
+		var raw []byte
+		select {
+		case <-reqCtx.Done():
+			return nil
+		case <-ac.policyNudge:
+			h.offerNextSessionPolicy(bg, ac)
+			continue
+		case read := <-reads:
+			reading = false
+			if read.err != nil {
+				return fmt.Errorf("read: %w", read.err)
+			}
+			raw = read.raw
 		}
 
 		msgType, err := peekType(raw)
@@ -1149,6 +1185,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				continue
 			}
 			if !policyGrantMatches(ac, state) {
+				h.log.Warn("config policy state for an attempt not issued on this connection ignored", "host_id", hostID, "attempt_id", state.AttemptID)
 				continue
 			}
 			if scope, known := hostcfg.PolicyGroupScope(state.Group); !known || scope != "next_session" || state.Scope != scope {
