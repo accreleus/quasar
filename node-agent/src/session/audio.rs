@@ -378,10 +378,11 @@ mod tests {
 
     use super::*;
 
-    /// The pulse config the image installs at `/etc/pipewire/quasar-session-pulse.conf`.
-    fn baked_pulse_config() -> String {
+    /// A config the image installs under `/etc/pipewire/`.
+    fn baked_config(name: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../deploy/audio/quasar-session-pulse.conf");
+            .join("../deploy/audio")
+            .join(name);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
     }
@@ -395,7 +396,7 @@ mod tests {
             QUASAR_MONITOR_SOURCE_NAME,
             format!("{QUASAR_SINK_NAME}.monitor")
         );
-        let config = baked_pulse_config();
+        let config = baked_config("quasar-session-pulse.conf");
         for needle in [
             format!("module-null-sink sink_name={QUASAR_SINK_NAME} "),
             format!("module-null-sink sink_name={QUASAR_MIC_SINK_NAME} "),
@@ -544,7 +545,7 @@ mod tests {
     #[test]
     fn the_baked_config_pins_the_shared_socket_the_devices_and_the_wire_format() {
         assert_eq!(pulse_command(), ["-c", "/etc/pipewire/quasar-session.conf"]);
-        let config = baked_pulse_config();
+        let config = baked_config("quasar-session-pulse.conf");
         assert!(config.contains(
             r#"server.address = [ { address = "unix:../native" client.access = "unrestricted" } ]"#
         ));
@@ -580,6 +581,22 @@ mod tests {
                 .unwrap()
         };
         assert!(priority(output) > priority(mic));
+    }
+
+    // Stock PipeWire's VM rule, copied from /usr/share/pipewire/pipewire{,-pulse}.conf: small
+    // quanta crackle under VM timer jitter, and the session daemon has no RT priority.
+    #[test]
+    fn both_configs_keep_the_stock_vm_quantum_floor() {
+        let daemon = baked_config("quasar-session.conf");
+        let pulse = baked_config("quasar-session-pulse.conf");
+        for (config, section, floor) in [
+            (&daemon, "context.properties.rules", "default.clock.min-quantum = 1024"),
+            (&pulse, "pulse.properties.rules", "pulse.min.quantum = 1024/48000"),
+        ] {
+            let rules = &config[config.find(section).expect(section)..];
+            assert!(rules.contains("matches = [ { cpu.vm.name = !null } ]"), "{section}");
+            assert!(rules.contains(floor), "{section} lacks `{floor}`");
+        }
     }
 }
 
