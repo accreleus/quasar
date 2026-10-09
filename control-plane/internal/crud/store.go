@@ -673,9 +673,9 @@ func refuseSecondProviderApp(ctx context.Context, tx pgx.Tx, provider, exceptID 
 // one open to everyone, leaving the restriction behind on this app (#490).
 var ErrProviderClearWhileDiscoveryOn = errors.New("library discovery is on and this is its only provider app")
 
-// refuseProviderClearWhileDiscoveryOn guards PATCH library_provider "": the
-// stored provider is locked like every other provider-app write, and a clear
-// stays allowed while another app still claims the provider or discovery is off.
+// refuseProviderClearWhileDiscoveryOn guards PATCH library_provider "". A clear
+// stays allowed while another app still claims the provider or discovery is
+// off. Caller holds every provider lock (updateApp).
 func refuseProviderClearWhileDiscoveryOn(ctx context.Context, tx pgx.Tx, appID string) error {
 	var provider string
 	err := tx.QueryRow(ctx, `SELECT library_provider FROM apps WHERE id::text = $1`, appID).Scan(&provider)
@@ -684,9 +684,6 @@ func refuseProviderClearWhileDiscoveryOn(ctx context.Context, tx pgx.Tx, appID s
 	}
 	if err != nil {
 		return fmt.Errorf("read app provider: %w", err)
-	}
-	if err := images.LockProviderApp(ctx, tx, provider); err != nil {
-		return err
 	}
 	var refuse bool
 	if err := tx.QueryRow(ctx, `
@@ -747,7 +744,7 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 	parentAppID **string, libraryProvider *string,
 	vram, slots, w, h, fps, kbps *int32, enabled *bool, runtimeSpec json.RawMessage,
 	managedHome *bool, homeContainerPath *string, defaultProfileID **string, profilePolicy *string,
-	runtimePresetID **string, callerID string) (App, error) {
+	runtimePresetID **string, launchProfileIDs *[]string, callerID string) (App, error) {
 	// Checked before any SET clause is built (see ErrCoverURLOwnedByArtwork), so
 	// a patch touching cover_url and other fields is refused atomically.
 	if coverURL != nil {
@@ -917,6 +914,12 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 		argIdx++
 	}
 	if len(setClauses) == 0 {
+		// No column change, so nothing to refuse: only the allow-list.
+		if launchProfileIDs != nil {
+			if err := s.setAppLaunchProfiles(ctx, id, *launchProfileIDs); err != nil {
+				return App{}, err
+			}
+		}
 		return s.getAppFull(ctx, callerID, id)
 	}
 
@@ -942,19 +945,24 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 		return App{}, fmt.Errorf("begin app update: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	// Making an app a provider's: same lock as createApp, and a mode stored
-	// before the provider app existed (#490) replaces its entitlements below.
+	// A library_provider write takes every provider lock, in a fixed order,
+	// before reading this app's current provider: read first, and a concurrent
+	// designation could commit between that read and this UPDATE unseen (#490).
+	// Locks before the row lock, as every provider-app writer takes them.
+	// Making an app a provider's also applies a mode stored for it, below.
 	becomesProvider := libraryProvider != nil && *libraryProvider != ""
-	if becomesProvider {
-		if err := images.LockProviderApp(ctx, tx, *libraryProvider); err != nil {
-			return App{}, err
+	if libraryProvider != nil {
+		for _, p := range libraryProviders {
+			if err := images.LockProviderApp(ctx, tx, p); err != nil {
+				return App{}, err
+			}
 		}
-		if err := refuseSecondProviderApp(ctx, tx, *libraryProvider, id); err != nil {
-			return App{}, err
+		if becomesProvider {
+			err = refuseSecondProviderApp(ctx, tx, *libraryProvider, id)
+		} else {
+			err = refuseProviderClearWhileDiscoveryOn(ctx, tx, id)
 		}
-	}
-	if libraryProvider != nil && *libraryProvider == "" {
-		if err := refuseProviderClearWhileDiscoveryOn(ctx, tx, id); err != nil {
+		if err != nil {
 			return App{}, err
 		}
 	}
@@ -993,6 +1001,11 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 	}
 	if becomesProvider {
 		if _, err := images.ApplyRequestedEntitlementMode(ctx, tx, id, *libraryProvider); err != nil {
+			return App{}, err
+		}
+	}
+	if launchProfileIDs != nil {
+		if err := writeAppLaunchProfiles(ctx, tx, id, *launchProfileIDs); err != nil {
 			return App{}, err
 		}
 	}

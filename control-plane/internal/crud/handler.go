@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -856,23 +857,17 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Two writes need opposite orderings against updateApp (not one transaction):
-	// (a) caller sent a list — write it BEFORE updateApp, since the safe half to
-	//     have applied on partial failure is the restriction, not a wider menu.
-	// (b) effective policy is `force` — clear any stored list AFTER a successful
-	//     updateApp; clearing first here would leave a failed patch's app
-	//     `prefer` with no list at all, i.e. silently unrestricted. Clearing
-	//     after makes the worst case a stale list on a `force` app, which is
-	//     inert (AppProfileRestrictionFor treats `force` as unrestricted).
-	if allowList.present {
+	// The allow-list commits inside updateApp's transaction, so a refused or
+	// failed patch leaves it as it was. Effective policy `force` clears any
+	// stored list even when the patch says nothing about it, so nothing can
+	// silently reactivate on a later switch back to `prefer`.
+	var launchProfiles *[]string
+	if allowList.present || effectivePolicy == "force" {
 		ids := allowList.ids
 		if effectivePolicy == "force" {
 			ids = nil
 		}
-		if err := h.store.setAppLaunchProfiles(r.Context(), id, ids); err != nil {
-			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not set the app's launchable launch profiles")
-			return
-		}
+		launchProfiles = &ids
 	}
 
 	caller, _ := auth.UserFromContext(r.Context())
@@ -883,7 +878,7 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		req.DefaultVramMB, req.DefaultEncodeSlots,
 		req.DefaultWidth, req.DefaultHeight, req.DefaultFPS, req.DefaultBitratekbps,
 		req.Enabled, req.RuntimeSpec, req.ManagedHome, req.HomeContainerPath, optionalUUIDArg(defaultProfilePatch, ok), req.ProfilePolicy,
-		optionalUUIDArg(presetPatch, presetOK), caller.ID)
+		optionalUUIDArg(presetPatch, presetOK), launchProfiles, caller.ID)
 	if err != nil {
 		if err == ErrNotFound {
 			httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "app not found")
@@ -899,15 +894,6 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		}
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not update app")
 		return
-	}
-
-	// (b) from above: run only once updateApp's policy write has landed.
-	if !allowList.present && effectivePolicy == "force" {
-		if err := h.store.setAppLaunchProfiles(r.Context(), id, nil); err != nil {
-			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not clear the app's launchable launch profiles")
-			return
-		}
-		app.LaunchableProfileIDs = nil
 	}
 
 	h.nudgeImages(r.Context())
@@ -1041,8 +1027,12 @@ func validOrigin(origin *string) bool {
 // config, an admin marks the Steam app). nil is always fine; explicit "" is a
 // deliberate un-marking, like external_source.
 func validLibraryProvider(provider *string) bool {
-	return provider == nil || *provider == "" || *provider == "steam"
+	return provider == nil || *provider == "" || slices.Contains(libraryProviders, *provider)
 }
+
+// libraryProviders is every non-empty library_provider value
+// (apps_library_provider_ck, migration 0044), in provider-lock order.
+var libraryProviders = []string{"steam"}
 
 // derivedProviderConflict reports whether a CREATE is asking for a derived tile
 // that is also a library provider (§11.3). The patch path computes the same thing

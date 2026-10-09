@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -740,5 +741,101 @@ func TestLockProviderAppNormalizesTheProvider(t *testing.T) {
 	}
 	if got {
 		t.Error(`a lock taken for " Steam " did not exclude "steam"`)
+	}
+}
+
+// TestClearRacingADesignationIsRefused — PATCH A designates a plain app as
+// steam and is held open; PATCH B clears the same app. B must wait for A and
+// then see the app as the provider's only app (409), not read the old empty
+// provider, skip the guard and clear it after A commits.
+func TestClearRacingADesignationIsRefused(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newTestServer(t, pool)
+	ctx := context.Background()
+	tok := adminBearer(t, ctx, pool, authSvc, "admin@test.local", "admin")
+	setLibraryDiscovery(t, pool, true)
+	app := seedPlainApp(t, ctx, pool, "")
+
+	a, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin A: %v", err)
+	}
+	defer a.Rollback(ctx) //nolint:errcheck
+	if err := images.LockProviderApp(ctx, a, "steam"); err != nil {
+		t.Fatalf("A lock: %v", err)
+	}
+	if _, err := a.Exec(ctx, `UPDATE apps SET library_provider = 'steam' WHERE id = $1::uuid`, app); err != nil {
+		t.Fatalf("A designate: %v", err)
+	}
+
+	type result struct {
+		status int
+		body   map[string]any
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, body := patch(t, srv.URL+"/v1/apps/"+app, map[string]any{"library_provider": ""}, tok)
+		done <- result{resp.StatusCode, body}
+	}()
+
+	// B must be parked on a lock before A commits, or this is not the race.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM pg_stat_activity
+			 WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
+			t.Fatalf("poll waiters: %v", err)
+		}
+		if waiting > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("PATCH B never waited on a lock")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := a.Commit(ctx); err != nil {
+		t.Fatalf("commit A: %v", err)
+	}
+
+	got := <-done
+	if got.status != http.StatusConflict || errorCode(got.body) != "provider_enabled" {
+		t.Fatalf("racing clear: want 409 provider_enabled, got %d (%v)", got.status, got.body)
+	}
+	var provider string
+	if err := pool.QueryRow(ctx, `SELECT library_provider FROM apps WHERE id = $1::uuid`, app).Scan(&provider); err != nil {
+		t.Fatalf("read app: %v", err)
+	}
+	if provider != "steam" {
+		t.Errorf("library_provider = %q, want steam kept", provider)
+	}
+}
+
+// TestRefusedPatchLeavesTheAllowList — the allow-list commits with the rest of
+// the patch, so a clear refused with 409 must not have widened the app's menu.
+func TestRefusedPatchLeavesTheAllowList(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newTestServer(t, pool)
+	ctx := context.Background()
+	tok := adminBearer(t, ctx, pool, authSvc, "admin@test.local", "admin")
+	setLibraryDiscovery(t, pool, true)
+	app := seedPlainApp(t, ctx, pool, "steam")
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO app_launch_profiles (app_id, launch_profile_id) VALUES ($1::uuid, '720p60')`, app); err != nil {
+		t.Fatalf("seed allow-list: %v", err)
+	}
+
+	resp, body := patch(t, srv.URL+"/v1/apps/"+app,
+		map[string]any{"library_provider": "", "launchable_profile_ids": []string{}}, tok)
+	if resp.StatusCode != http.StatusConflict || errorCode(body) != "provider_enabled" {
+		t.Fatalf("want 409 provider_enabled, got %d (%v)", resp.StatusCode, body)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM app_launch_profiles WHERE app_id = $1::uuid`, app).Scan(&n); err != nil {
+		t.Fatalf("count allow-list: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("allow-list rows = %d, want 1: a refused patch must not clear it", n)
 	}
 }
