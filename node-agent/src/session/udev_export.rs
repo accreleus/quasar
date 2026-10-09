@@ -142,7 +142,8 @@ pub fn publish(
     Ok(Some(dir))
 }
 
-fn malformed_session_id(sid: &str) -> bool {
+/// A session id that cannot be a single path component under `runtime_dir`.
+pub(crate) fn malformed_session_id(sid: &str) -> bool {
     sid.is_empty() || sid.contains('/') || sid.contains("..")
 }
 
