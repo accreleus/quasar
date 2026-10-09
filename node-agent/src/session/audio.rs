@@ -109,6 +109,9 @@ impl PulseSidecar {
         runtime: &ContainerRuntime,
         runtime_dir: &str,
     ) -> Result<Option<Self>> {
+        if super::udev_export::malformed_session_id(session_id) {
+            return Err(anyhow!("refusing malformed session id {session_id:?}"));
+        }
         let socket_dir = pulse_socket_dir(runtime_dir, session_id);
         let image = sidecar_image(runtime)?;
         let api = crate::runtime::configured()?.clone();
@@ -426,6 +429,20 @@ mod tests {
         assert!(pulse_socket_dir(rt, a)
             .to_string_lossy()
             .contains(&format!("pulse-{a}")));
+    }
+
+    #[test]
+    fn start_refuses_a_malformed_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().to_str().unwrap();
+        let runtime = ContainerRuntime::from_env();
+        for sid in ["", "../escape", "a/b", ".."] {
+            let err = PulseSidecar::start(sid, &runtime, runtime_dir)
+                .err()
+                .unwrap_or_else(|| panic!("sid {sid:?} should be refused"));
+            assert!(err.to_string().contains("malformed session id"), "{err:#}");
+        }
+        assert!(std::fs::read_dir(runtime_dir).unwrap().next().is_none());
     }
 
     /// A runtime client bounded to ONE in-flight call, talking to a socket that

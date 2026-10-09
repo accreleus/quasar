@@ -171,6 +171,11 @@ impl DumpDir {
                     r.format
                 ),
             )),
+            // `name` later builds paths (`file`, `remove`), so it must be this file's own.
+            Some(r) if r.name != name => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("dump record {name} names {:?}", r.name),
+            )),
             other => Ok(other),
         }
     }
@@ -399,6 +404,37 @@ mod tests {
                 names[0].clone()
             ]
         );
+    }
+
+    #[test]
+    fn a_record_naming_another_dump_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = DumpDir::new(root.path());
+        let (stored, renamed) = ("20260921T100000Z-schema-81", "20260922T100000Z-schema-82");
+        dir.store(&DumpRecord {
+            format: FORMAT,
+            name: stored.into(),
+            schema_version: 81,
+            created_at: "2026-09-21T10:00:00Z".into(),
+            size_bytes: 5,
+            sha256: String::new(),
+            request_id: None,
+            control_plane: None,
+            recipe_revision: None,
+            returns_to: None,
+            restored_by: None,
+            restored_at: None,
+        })
+        .unwrap();
+        std::fs::rename(
+            dir.path().join(format!("{stored}.json")),
+            dir.path().join(format!("{renamed}.json")),
+        )
+        .unwrap();
+        std::fs::write(dir.file(renamed), b"PGDMP").unwrap();
+        std::fs::write(dir.file(stored), b"PGDMP").unwrap();
+        assert!(dir.load(renamed).is_err());
+        assert!(dir.list().is_empty());
     }
 
     #[test]
