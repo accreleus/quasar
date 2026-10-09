@@ -923,13 +923,15 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	}
 
 	// Step 4 — message loop: heartbeats, acks, and session_state callbacks.
+	// One read is in flight at a time, so an offer nudge can be served between
+	// messages without a second reader (gorilla allows one).
+	type readResult struct {
+		raw []byte
+		err error
+	}
+	reads := make(chan readResult, 1)
+	reading := false
 	for {
-		// Fail fast if the server is shutting down.
-		select {
-		case <-reqCtx.Done():
-			return nil
-		default:
-		}
 		// A lost initial map or acknowledgement must not leave an apparently
 		// connected host gated forever. Renegotiate after a bounded wait; the
 		// durable gate remains closed until a current-connection exact-ID ack.
@@ -937,10 +939,27 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			return errors.New("policy initial settings map acknowledgement timed out")
 		}
 
-		conn.SetReadDeadline(time.Now().Add(readDeadlineDur))
-		raw, err := readTextMessage(conn)
-		if err != nil {
-			return fmt.Errorf("read: %w", err)
+		if !reading {
+			reading = true
+			conn.SetReadDeadline(time.Now().Add(readDeadlineDur))
+			go func() {
+				raw, err := readTextMessage(conn)
+				reads <- readResult{raw, err}
+			}()
+		}
+		var raw []byte
+		select {
+		case <-reqCtx.Done():
+			return nil
+		case <-ac.policyNudge:
+			h.offerNextSessionPolicy(bg, ac)
+			continue
+		case read := <-reads:
+			reading = false
+			if read.err != nil {
+				return fmt.Errorf("read: %w", read.err)
+			}
+			raw = read.raw
 		}
 
 		msgType, err := peekType(raw)

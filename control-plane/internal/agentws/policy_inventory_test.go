@@ -214,8 +214,8 @@ func TestPolicyInventoryMatchingHistoricalAttemptPermitsInitialMap(t *testing.T)
 	if !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyDeliveryID == "" {
 		t.Fatalf("matching historical attempt should allow map delivery: done=%v blocked=%v delivery=%q", c.policyInventoryDone.Load(), c.policyInventoryBlocked.Load(), c.policyDeliveryID)
 	}
-	if got := registry.PolicyActiveSnapshots(hostID, connection); got != nil {
-		t.Fatalf("unfinished attempt allowed a competing offer: %+v", got)
+	if len(c.policyOutstanding) == 0 {
+		t.Fatal("unfinished attempt allowed a competing offer")
 	}
 	if !registry.PolicyRestartConflict(hostID) {
 		t.Fatal("unfinished attempt allowed a legacy restart edit")
