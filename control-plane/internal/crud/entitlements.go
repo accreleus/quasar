@@ -218,21 +218,15 @@ func grantOnCreate(ctx context.Context, tx pgx.Tx, appID, provider, entitle stri
 	return nil
 }
 
-// entitledToApp reports whether userID may see/launch appID. Copy of
-// entitledSQL (store.go, definition of record); kept in sync by hand since the
-// predicate can't cross the crud/session package boundary.
+// entitledToApp reports whether userID may see/launch appID, by entitledSQL.
 //
-// Casts the param, not the column (`e.app_id = $1::uuid`): casting the column
-// would make entitlements_all_uk/entitlements_user_uk unusable and force a
-// sequential scan. appID is isValidUUID-checked at both call sites first.
+// Casts the param, not the column (`apps.id = $1::uuid`), so the primary key
+// stays usable. appID is isValidUUID-checked at both call sites first.
 func (s *store) entitledToApp(ctx context.Context, userID, appID string) (bool, error) {
 	var ok bool
 	if err := s.pool.QueryRow(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM entitlements e
-			WHERE e.app_id = $1::uuid
-			  AND (e.subject_type = 'all'
-			       OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))
+			SELECT 1 FROM apps WHERE apps.id = $1::uuid AND `+entitledSQL("$2")+`
 		)`, appID, userID).Scan(&ok); err != nil {
 		return false, fmt.Errorf("check entitlement: %w", err)
 	}

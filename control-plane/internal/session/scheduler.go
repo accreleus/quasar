@@ -255,19 +255,33 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	//
 	// The params are cast, not the columns, so entitlements_all_uk /
 	// entitlements_user_uk stay usable.
-	var one int
-	err = tx.QueryRow(ctx, `
-		SELECT 1 FROM entitlements e
-		WHERE e.app_id = $1::uuid
-		  AND (e.subject_type = 'all'
-		       OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))
-		LIMIT 1
-		FOR SHARE`, p.AppID, p.UserID).Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Session{}, false, ErrNotEntitled
+	//
+	// A derived tile needs the parent's entitlement too, share-locked the same
+	// way. The parent is read here, not taken from p.HomeAppID, so a caller that
+	// leaves HomeAppID unset cannot skip it. Parent first, as the app locks above.
+	var parentID *string
+	if err := tx.QueryRow(ctx, `SELECT parent_app_id::text FROM apps WHERE id=$1::uuid`, p.AppID).Scan(&parentID); err != nil {
+		return Session{}, false, fmt.Errorf("read launch app parent: %w", err)
 	}
-	if err != nil {
-		return Session{}, false, fmt.Errorf("check entitlement: %w", err)
+	entitledIDs := []string{p.AppID}
+	if parentID != nil {
+		entitledIDs = []string{*parentID, p.AppID}
+	}
+	for _, appID := range entitledIDs {
+		var one int
+		err = tx.QueryRow(ctx, `
+			SELECT 1 FROM entitlements e
+			WHERE e.app_id = $1::uuid
+			  AND (e.subject_type = 'all'
+			       OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))
+			LIMIT 1
+			FOR SHARE`, appID, p.UserID).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Session{}, false, ErrNotEntitled
+		}
+		if err != nil {
+			return Session{}, false, fmt.Errorf("check entitlement: %w", err)
+		}
 	}
 	if p.ManagedHome {
 		owner, err := homeClaimOwner(ctx, tx, p)
