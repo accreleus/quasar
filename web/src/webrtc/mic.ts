@@ -18,6 +18,8 @@ export type MicErrorKind =
   | "permission-denied"
   | "no-device"
   | "device-busy"
+  /** stop() ran while the permission prompt was open; never shown. */
+  | "cancelled"
   | "unknown";
 
 export interface MicError {
@@ -165,6 +167,8 @@ export class MicCaptureError extends Error {
  */
 export class MicCapture {
   private stream: MediaStream | null = null;
+  /** Bumped by every stop(), so an in-flight start() can tell it was cancelled. */
+  private epoch = 0;
 
   /**
    * Fired when the device disappears underneath us (unplug, OS revoke). The
@@ -183,27 +187,26 @@ export class MicCapture {
   }
 
   /**
-   * Acquire the microphone. MUST be called from a user gesture.
+   * Acquire the microphone. MUST be called from a user gesture. A stop() while
+   * the browser prompt is open cancels this call: the stream is released and
+   * the "cancelled" error thrown, so a late grant cannot leave the device hot.
    *
    * @throws MicCaptureError with a displayable {@link MicError}.
    */
   async start(deviceId?: string): Promise<MediaStreamTrack> {
     if (!microphoneSupported()) throw new MicCaptureError(unsupportedMicError());
     this.stop();
+    const epoch = this.epoch;
+    const cancelled = () => new MicCaptureError({ kind: "cancelled", title: "", message: "" });
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia(micConstraints(deviceId));
+      stream = await this.acquire(deviceId);
     } catch (err) {
-      // A pinned device that no longer exists must not lock out the mic: retry default.
-      if (deviceId) {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia(micConstraints());
-        } catch (retryErr) {
-          throw new MicCaptureError(mapMicError(retryErr));
-        }
-      } else {
-        throw new MicCaptureError(mapMicError(err));
-      }
+      throw this.epoch === epoch ? err : cancelled();
+    }
+    if (this.epoch !== epoch) {
+      stream.getTracks().forEach((t) => t.stop());
+      throw cancelled();
     }
     const track = stream.getAudioTracks()[0];
     if (!track) {
@@ -222,8 +225,23 @@ export class MicCapture {
     return track;
   }
 
+  private async acquire(deviceId?: string): Promise<MediaStream> {
+    try {
+      return await navigator.mediaDevices.getUserMedia(micConstraints(deviceId));
+    } catch (err) {
+      // A pinned device that no longer exists must not lock out the mic: retry default.
+      if (!deviceId) throw new MicCaptureError(mapMicError(err));
+      try {
+        return await navigator.mediaDevices.getUserMedia(micConstraints());
+      } catch (retryErr) {
+        throw new MicCaptureError(mapMicError(retryErr));
+      }
+    }
+  }
+
   /** Release the device. Idempotent; safe to call when already stopped. */
   stop(): void {
+    this.epoch++;
     if (!this.stream) return;
     for (const t of this.stream.getTracks()) t.stop();
     this.stream = null;

@@ -1462,3 +1462,111 @@ describe("engage() WITH Pointer Lock — desktop path is unchanged", () => {
     cleanup();
   });
 });
+
+describe("Pointer Lock grants follow the latest intent, not the request that made them (#524)", () => {
+  type Pending = { grant: () => void; reject: (e: unknown) => void };
+
+  function setup() {
+    const pending: Pending[] = [];
+    setPointerLockApi(
+      () =>
+        new Promise<void>((grant, reject) => {
+          pending.push({ grant, reject });
+        }),
+    );
+    const exitPointerLock = vi.fn(() => unlockPointer());
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
+    const video = document.createElement("video");
+    const onCaptureChange = vi.fn();
+    const cap = setupCapture({ videoEl: video, sendInput: () => {}, onCaptureChange, channel: makeChannel() });
+    const tabReachesBrowser = () => {
+      const down = new KeyboardEvent("keydown", { code: "Tab", cancelable: true });
+      document.dispatchEvent(down);
+      return !down.defaultPrevented;
+    };
+    return { pending, exitPointerLock, video, onCaptureChange, tabReachesBrowser, ...cap };
+  }
+
+  afterEach(() => {
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+    unlockPointer();
+  });
+
+  it("hands back a grant that lands after release()", async () => {
+    const t = setup();
+    const engaging = t.engage();
+    t.release();
+    lockPointer(t.video);
+    t.pending[0]!.grant();
+    await engaging;
+
+    expect(t.exitPointerLock).toHaveBeenCalledTimes(1);
+    expect(t.onCaptureChange).not.toHaveBeenCalledWith({ captured: true, pointerLocked: true });
+    expect(t.tabReachesBrowser()).toBe(true);
+    t.cleanup();
+  });
+
+  it("request A, release, request B, A rejects, release: B's grant is handed back", async () => {
+    const t = setup();
+    const a = t.engage();
+    t.release();
+    const b = t.engage();
+    t.pending[0]!.reject(new Error("superseded"));
+    await expect(a).resolves.toMatchObject({ mode: "failed" });
+    t.release();
+    lockPointer(t.video);
+    t.pending[1]!.grant();
+    await b;
+
+    expect(t.exitPointerLock).toHaveBeenCalledTimes(1);
+    expect(t.tabReachesBrowser()).toBe(true);
+    expect(t.getMetrics().captured).toBe(false);
+    t.cleanup();
+  });
+
+  it("two pending grants, then release: both are handed back", async () => {
+    const t = setup();
+    const a = t.engage();
+    const b = t.engage();
+    t.release();
+    lockPointer(t.video);
+    t.pending[0]!.grant();
+    unlockPointer();
+    lockPointer(t.video);
+    t.pending[1]!.grant();
+    await Promise.all([a, b]);
+
+    expect(t.exitPointerLock).toHaveBeenCalledTimes(2);
+    expect(t.tabReachesBrowser()).toBe(true);
+    t.cleanup();
+  });
+
+  it("release, engage again, then the old grant lands: capture is wanted, so it captures", async () => {
+    const t = setup();
+    const a = t.engage();
+    t.release();
+    const b = t.engage();
+    lockPointer(t.video);
+    t.pending[0]!.grant();
+    await a;
+
+    expect(t.exitPointerLock).not.toHaveBeenCalled();
+    expect(t.onCaptureChange).toHaveBeenLastCalledWith({ captured: true, pointerLocked: true });
+    expect(t.tabReachesBrowser()).toBe(false);
+    t.pending[1]!.grant();
+    await b;
+    t.cleanup();
+  });
+
+  it("another element taking Pointer Lock changes nothing", () => {
+    const t = setup();
+    Object.defineProperty(document, "pointerLockElement", {
+      value: document.createElement("canvas"),
+      configurable: true,
+    });
+    document.dispatchEvent(new Event("pointerlockchange"));
+    expect(t.exitPointerLock).not.toHaveBeenCalled();
+    expect(t.getMetrics().captured).toBe(false);
+    t.cleanup();
+  });
+});
