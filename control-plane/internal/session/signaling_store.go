@@ -25,7 +25,9 @@ var (
 
 // ConsumeSignalingToken hashes plaintext, validates TTL and single-use,
 // atomically stamps consumed_at, and returns the session. FOR UPDATE ensures
-// two concurrent WS connects with the same token cannot both succeed.
+// two concurrent WS connects with the same token cannot both succeed. FOR SHARE
+// on the session row serialises against Store.transition's FOR UPDATE, so a
+// stop cannot commit between the state read and the consume.
 func (s *Store) ConsumeSignalingToken(ctx context.Context, plaintext string) (Session, error) {
 	h := sha256.Sum256([]byte(plaintext))
 	hash := hex.EncodeToString(h[:])
@@ -46,7 +48,7 @@ func (s *Store) ConsumeSignalingToken(ctx context.Context, plaintext string) (Se
 		FROM session_tokens t
 		JOIN sessions s ON s.id = t.session_id
 		WHERE t.token_hash = $1
-		FOR UPDATE OF t
+		FOR UPDATE OF t FOR SHARE OF s
 	`, hash).Scan(&sessionID, &state, &hostID, &expired, &consumed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrTokenInvalid

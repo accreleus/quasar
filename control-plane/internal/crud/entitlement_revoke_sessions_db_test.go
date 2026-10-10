@@ -182,6 +182,37 @@ func TestEntitlementModeStopsDerivedTileSessions(t *testing.T) {
 	}
 }
 
+type sendFailsDispatcher struct{ okDispatcher }
+
+func (sendFailsDispatcher) Send(string, any) error { return errors.New("send queue full") }
+
+// A session_stop that never reached the agent is still a stopped session (the
+// row is `stopping`, the heartbeat re-sends), and the activity row says the stop
+// was not clean.
+func TestRevokeFlagsAStopThatDidNotReachTheAgent(t *testing.T) {
+	pool := testDB(t)
+	coord := session.NewCoordinator(session.NewStore(pool), sendFailsDispatcher{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(coord.Close)
+	srv, tok := newRevokerTestServer(t, pool, coord.StopUnentitledSessions)
+	f := newRevokeFixture(t, pool)
+
+	var appID string
+	must43(t, pool.QueryRow(context.Background(), `INSERT INTO apps (name) VALUES ('app') RETURNING id::text`).Scan(&appID))
+	row := grant(t, pool, appID, nil)
+	sid := f.running(t, pool, f.user(t, pool, "player"), appID)
+
+	if resp := deleteReq(t, srv.URL+"/v1/admin/apps/"+appID+"/entitlements/"+row, tok); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke: got %d, want 204", resp.StatusCode)
+	}
+	if got := stateOf(t, pool, sid); got != "stopping" {
+		t.Errorf("session whose stop was not delivered: %s, want stopping", got)
+	}
+	details, _ := auditDetails(t, pool, "app.entitlement.revoke")
+	if details["sessions_stopped"] != float64(1) || details["sessions_stop_failed"] != true {
+		t.Errorf("audit details = %v, want sessions_stopped 1 and sessions_stop_failed", details)
+	}
+}
+
 // A failed stop is recorded, not surfaced: a retried DELETE would be a 404 that
 // sweeps nothing, and the periodic sweep finishes the job. A long stopped list
 // must stay inside the audit row's 4096-byte CHECK.

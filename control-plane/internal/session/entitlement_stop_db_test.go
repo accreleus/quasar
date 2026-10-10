@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 )
@@ -178,8 +179,10 @@ func TestStopIsConditionalOnTheEvaluatedApp(t *testing.T) {
 }
 
 // TestHeartbeatResendsAStopTheAgentNeverTook — a `stopping` row the agent still
-// lists past stopAckTimeout means the session_stop was lost; before the grace a
-// stop is assumed to be on its way and is not repeated.
+// lists past stopAckTimeout means the session_stop was lost. The grace runs from
+// this process's own record of the stop, so the session's owner cannot postpone
+// it by keeping sessions.updated_at fresh, and a row with no record (a restart)
+// is past it.
 func TestHeartbeatResendsAStopTheAgentNeverTook(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
@@ -188,23 +191,182 @@ func TestHeartbeatResendsAStopTheAgentNeverTook(t *testing.T) {
 	coord := newTestCoordinator(t, store, disp, testLogger())
 	ctx := context.Background()
 
-	// updated_at is set on INSERT: sessions_set_updated_at only fires on UPDATE.
-	var lost string
-	must(t, pool.QueryRow(ctx, `
-		INSERT INTO sessions (user_id, app_id, host_id, state, width, height, fps, bitrate_kbps, updated_at)
-		VALUES ($1::uuid, $2::uuid, $3::uuid, 'stopping', 1280, 720, 60, 6000, now() - interval '1 minute')
-		RETURNING id::text`, s.userID, s.appID, s.hostID).Scan(&lost))
-	fresh := insertSessionRow(t, pool, seedExtraUser(t, pool, 2, 1), s.appID, &s.hostID, "stopping")
-
-	coord.AgentHeartbeat(ctx, s.hostID, []string{lost, fresh})
-
-	if got := disp.noAckTypes(); !slices.Equal(got, []string{"stop:" + lost}) {
-		t.Fatalf("stops re-sent: %v, want only the one past the grace (%s)", got, lost)
+	sid := insertSessionRow(t, pool, s.userID, s.appID, &s.hostID, "running")
+	if _, err := coord.stop(ctx, sid, "", "user_requested", false); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
-	if got := disp.stopReason(lost); got != "error" {
+	stops := func() int {
+		n := 0
+		for _, ty := range disp.noAckTypes() {
+			if ty == "stop:"+sid {
+				n++
+			}
+		}
+		return n
+	}
+
+	coord.AgentHeartbeat(ctx, s.hostID, []string{sid})
+	if got := stops(); got != 1 {
+		t.Fatalf("stops sent inside the grace: %d, want only the original", got)
+	}
+
+	// The grace has passed, and the owner's stats POST has just rewritten the row.
+	coord.stopMu.Lock()
+	coord.stopRequested[sid] = time.Now().Add(-2 * stopAckTimeout)
+	coord.stopMu.Unlock()
+	must(t, store.UpdateSessionNegotiatedCodec(ctx, sid, wireCodecAV1))
+	var rowIsFresh bool
+	must(t, pool.QueryRow(ctx, `SELECT updated_at > now() - interval '5 seconds' FROM sessions WHERE id = $1::uuid`, sid).Scan(&rowIsFresh))
+	if !rowIsFresh {
+		t.Fatal("fixture: the codec update did not move updated_at")
+	}
+
+	coord.AgentHeartbeat(ctx, s.hostID, []string{sid})
+	if got := stops(); got != 2 {
+		t.Fatalf("stops sent past the grace on a row kept fresh: %d, want the re-send", got)
+	}
+	if got := disp.stopReason(sid); got != "error" {
 		t.Errorf("corrective session_stop reason: %q, want error", got)
 	}
-	if got := sessionState(t, store, lost); got != StateStopping {
+	// A repeated stop must not restart the grace.
+	if _, err := coord.stop(ctx, sid, "", "user_requested", false); err != nil {
+		t.Fatalf("second stop: %v", err)
+	}
+	if coord.stopInGrace(sid) {
+		t.Error("a repeated stop restarted the re-send grace")
+	}
+
+	// A stopping row this process holds no record for: no grace to wait out.
+	orphan := insertSessionRow(t, pool, seedExtraUser(t, pool, 2, 1), s.appID, &s.hostID, "stopping")
+	coord.AgentHeartbeat(ctx, s.hostID, []string{orphan})
+	if !slices.Contains(disp.noAckTypes(), "stop:"+orphan) {
+		t.Errorf("a stopping row with no stop on record got no re-send: %v", disp.noAckTypes())
+	}
+}
+
+// TestHeartbeatStopsAPreRunningSessionTheAgentNeverLists — a session stopped
+// before it started, whose session_stop was lost, is in no agent list, so only
+// this path can release its slot and home. The row is not made terminal here:
+// the agent's `stopped` does that.
+func TestHeartbeatStopsAPreRunningSessionTheAgentNeverLists(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	sid := insertSessionRow(t, pool, s.userID, s.appID, &s.hostID, "assigned")
+	if _, err := coord.stop(ctx, sid, "", StopReasonEntitlementRevoked, false); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	stops := func() int {
+		n := 0
+		for _, ty := range disp.noAckTypes() {
+			if ty == "stop:"+sid {
+				n++
+			}
+		}
+		return n
+	}
+
+	coord.AgentHeartbeat(ctx, s.hostID, []string{})
+	if got := stops(); got != 1 {
+		t.Fatalf("stops sent inside the grace: %d, want only the original", got)
+	}
+
+	coord.stopMu.Lock()
+	coord.stopRequested[sid] = time.Now().Add(-2 * stopAckTimeout)
+	coord.stopMu.Unlock()
+	coord.AgentHeartbeat(ctx, s.hostID, []string{})
+	if got := stops(); got != 2 {
+		t.Fatalf("stops sent past the grace for an unlisted pre-running row: %d, want the re-send", got)
+	}
+	if got := sessionState(t, store, sid); got != StateStopping {
 		t.Errorf("row after the re-send: %s, want stopping until the agent reports", got)
+	}
+}
+
+// TestSweepStopsASessionWhoseSwapNeverResolved — a row left in the durable
+// `swapping` guard names an app the agent may no longer run. A fresh coordinator
+// (a restart) has no swap on record for it; a swap on record is given
+// swapUnresolvedAfter.
+func TestSweepStopsASessionWhoseSwapNeverResolved(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	survivor := insertSessionRow(t, pool, seedExtraUser(t, pool, 2, 1), s.appID, &s.hostID, "running")
+	must(t, execEnt(ctx, pool, `UPDATE sessions SET state_detail = $2 WHERE id = $1::uuid`, survivor, swapDetailInProgress))
+	inFlight := runningSession(t, store, s)
+	if _, err := coord.Swap(ctx, inFlight.ID, insertApp(t, pool, "target", 512, 1)); err != nil {
+		t.Fatalf("swap: %v", err)
+	}
+
+	ids, err := coord.StopUnentitledSessions(ctx, "")
+	if err != nil || len(ids) != 0 {
+		t.Fatalf("sweep: got %v, %v; nobody here lost an entitlement", ids, err)
+	}
+	if got := sessionState(t, store, survivor); got != StateStopping {
+		t.Errorf("swapping row with no swap on record: %s, want stopping", got)
+	}
+	if got := disp.stopReason(survivor); got != "error" {
+		t.Errorf("session_stop reason for the unresolved swap: %q, want error", got)
+	}
+	if got := sessionState(t, store, inFlight.ID); got != StateRunning {
+		t.Fatalf("session with a swap in flight: %s, want running", got)
+	}
+
+	coord.swapper.mu.Lock()
+	coord.swapper.swapSince[inFlight.ID] = time.Now().Add(-2 * swapUnresolvedAfter)
+	coord.swapper.mu.Unlock()
+	if _, err := coord.StopUnentitledSessions(ctx, ""); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if got := sessionState(t, store, inFlight.ID); got != StateStopping {
+		t.Errorf("session whose swap outlived swapUnresolvedAfter: %s, want stopping", got)
+	}
+}
+
+// TestTokenConsumeWaitsForAStopInFlight — the consume locks the session row, so
+// it cannot read `running`, lose the race to a stop, and still attach.
+func TestTokenConsumeWaitsForAStopInFlight(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+
+	sid := insertSessionRow(t, pool, s.userID, s.appID, &s.hostID, "running")
+	tok, err := store.MintSignalingToken(ctx, sid)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+
+	// A stop that has written `stopping` and not yet committed.
+	stop, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer stop.Rollback(ctx) //nolint:errcheck
+	if _, err := stop.Exec(ctx, `UPDATE sessions SET state = 'stopping' WHERE id = $1::uuid`, sid); err != nil {
+		t.Fatalf("stop update: %v", err)
+	}
+
+	consumed := make(chan error, 1)
+	go func() {
+		_, err := store.ConsumeSignalingToken(ctx, tok.Plaintext)
+		consumed <- err
+	}()
+	select {
+	case err := <-consumed:
+		t.Fatalf("consume did not wait for the session row (returned %v)", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	must(t, stop.Commit(ctx))
+	if err := <-consumed; !errors.Is(err, ErrSessionTerminal) {
+		t.Fatalf("consume after the stop committed: %v, want ErrSessionTerminal", err)
 	}
 }

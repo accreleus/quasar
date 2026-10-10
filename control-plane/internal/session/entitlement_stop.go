@@ -16,6 +16,12 @@ const StopReasonEntitlementRevoked = "entitlement_revoked"
 // amendment 23).
 const entitlementSweepInterval = 30 * time.Second
 
+// swapUnresolvedAfter is how long a swap may stay in flight before the sweep
+// stops the session (swapper.unresolved). It must exceed the agent's own swap
+// budget (20 s for the compositor plus QUASAR_SWAP_APP_READY_TIMEOUT_MS, 45 s
+// by default) plus swapAckTimeout, or a slow healthy swap is stopped.
+const swapUnresolvedAfter = 4 * entitlementSweepInterval
+
 // RunEntitlementSweep stops unentitled sessions every entitlementSweepInterval
 // until ctx is cancelled. It is what makes the rule continuous: a swap that
 // commits into a revoked app, a library sync's revoke, a route sweep that hit a
@@ -48,7 +54,12 @@ func (c *Coordinator) RunEntitlementSweep(ctx context.Context) {
 // checked: one that swapped away in between is left for the next tick.
 //
 // Each returned session is `stopping` on return. The agent's ack is not awaited,
-// so an admin's request never waits stopAckTimeout per session.
+// so an admin's request never waits stopAckTimeout per session. One whose
+// session_stop could not be queued is returned too, with errStopNotDelivered
+// joined into the error.
+//
+// A session whose swap never resolved is stopped with reason `error`, entitled
+// or not, and is not in the returned ids.
 //
 // ponytail: one IsEntitled query per live session per tick; batch it if a fleet
 // ever holds hundreds of sessions.
@@ -60,6 +71,14 @@ func (c *Coordinator) StopUnentitledSessions(ctx context.Context, appID string) 
 	var stopped []string
 	var errs error
 	for _, s := range live {
+		if s.swapping && c.swapper.unresolved(s.id) {
+			c.log.Warn("stopping a session whose swap never resolved; the app it runs is unknown",
+				"session_id", s.id, "app_id", s.appID)
+			if _, err := c.stop(ctx, s.id, "", "error", false); err != nil {
+				errs = errors.Join(errs, fmt.Errorf("stop session %s: %w", s.id, err))
+			}
+			continue
+		}
 		entitled, err := c.store.IsEntitled(ctx, s.userID, s.appID)
 		if err != nil {
 			errs = errors.Join(errs, err)
@@ -74,7 +93,9 @@ func (c *Coordinator) StopUnentitledSessions(ctx context.Context, appID string) 
 		}
 		if err != nil {
 			errs = errors.Join(errs, fmt.Errorf("stop session %s: %w", s.id, err))
-			continue
+			if !errors.Is(err, errStopNotDelivered) {
+				continue
+			}
 		}
 		if sess.State != StateStopping {
 			continue // went terminal on its own since the list
@@ -85,7 +106,10 @@ func (c *Coordinator) StopUnentitledSessions(ctx context.Context, appID string) 
 	return stopped, errs
 }
 
-type liveSession struct{ id, userID, appID string }
+type liveSession struct {
+	id, userID, appID string
+	swapping          bool // the durable swap guard is set
+}
 
 // liveSessions lists the sessions not yet stopping or terminal; a non-empty
 // appID keeps those running it or a tile derived from it.
@@ -98,11 +122,12 @@ func (s *Store) liveSessions(ctx context.Context, appID string) ([]liveSession, 
 		filter = &appID
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT s.id::text, s.user_id::text, s.app_id::text
+		SELECT s.id::text, s.user_id::text, s.app_id::text,
+		       COALESCE(s.state_detail = $2, false)
 		FROM sessions s JOIN apps a ON a.id = s.app_id
 		WHERE s.state NOT IN ('stopping','stopped','failed')
 		  AND ($1::uuid IS NULL OR a.id = $1::uuid OR a.parent_app_id = $1::uuid)
-	`, filter)
+	`, filter, swapDetailInProgress)
 	if err != nil {
 		return nil, fmt.Errorf("list live sessions: %w", err)
 	}
@@ -110,7 +135,7 @@ func (s *Store) liveSessions(ctx context.Context, appID string) ([]liveSession, 
 	var out []liveSession
 	for rows.Next() {
 		var ls liveSession
-		if err := rows.Scan(&ls.id, &ls.userID, &ls.appID); err != nil {
+		if err := rows.Scan(&ls.id, &ls.userID, &ls.appID, &ls.swapping); err != nil {
 			return nil, fmt.Errorf("scan live session: %w", err)
 		}
 		out = append(out, ls)

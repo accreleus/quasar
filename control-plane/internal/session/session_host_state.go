@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -18,9 +17,6 @@ import (
 type SessionHostState struct {
 	HostID *string
 	State  State
-	// UpdatedAt is the row's last write: for a `stopping` row, no earlier than
-	// the stop request.
-	UpdatedAt time.Time
 }
 
 // GetSessionHostState is the trust boundary for agent metric ingestion (agent
@@ -33,8 +29,8 @@ func (s *Store) GetSessionHostState(ctx context.Context, sessionID string) (Sess
 	var st SessionHostState
 	var state string
 	err := s.pool.QueryRow(ctx, `
-		SELECT host_id::text, state, updated_at FROM sessions WHERE id = $1::uuid
-	`, sessionID).Scan(&st.HostID, &state, &st.UpdatedAt)
+		SELECT host_id::text, state FROM sessions WHERE id = $1::uuid
+	`, sessionID).Scan(&st.HostID, &state)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return SessionHostState{}, ErrNotFound
 	}

@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -198,6 +199,12 @@ func (h *Handler) handleSetProviderEntitlementMode(w http.ResponseWriter, r *htt
 	actor := actorID(r)
 	appID, items, pending, err := h.store.setProviderEntitlementMode(r.Context(), provider, req.Mode, actor)
 	if appID != "" {
+		if err != nil {
+			// The mode is in force, so this is a success with nothing to list: a
+			// 500 would invite a retry of a change that already happened.
+			slog.Warn("entitlement mode committed; read-back failed", "provider", provider, "err", err)
+			items, err = []Entitlement{}, nil
+		}
 		// Committed, whatever the read-back said: the sweep and the audit row must
 		// not depend on it. Identifiers + count only, same 4096-byte CHECK
 		// discipline as entitlements.go grant/revoke.

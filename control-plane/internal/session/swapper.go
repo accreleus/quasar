@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 )
@@ -21,11 +22,37 @@ type swapper struct {
 	mu           sync.Mutex
 	pendingSwaps map[string]string
 	pendingHome  map[string]bool
+	// swapSince is when this process last began writing each session's durable
+	// `swapping` guard; see unresolved. Kept until the session ends (forget): a
+	// rejected or rolled-back swap clears its pending entry before the row leaves
+	// `swapping`, and must not read as unresolved in between.
+	swapSince map[string]time.Time
 }
 
 func newSwapper(store *Store, dispatcher Dispatcher, log *slog.Logger, resolveHome func(context.Context, LaunchApp, string, string) ([]byte, error)) *swapper {
 	return &swapper{store: store, dispatcher: dispatcher, log: log, resolveHome: resolveHome,
-		pendingSwaps: make(map[string]string), pendingHome: make(map[string]bool)}
+		pendingSwaps: make(map[string]string), pendingHome: make(map[string]bool),
+		swapSince: make(map[string]time.Time)}
+}
+
+// noteSwapStart must run before the durable `swapping` guard is written, or a
+// sweep between the two reads a healthy swap as unresolved.
+func (s *swapper) noteSwapStart(sessionID string) {
+	s.mu.Lock()
+	s.swapSince[sessionID] = time.Now()
+	s.mu.Unlock()
+}
+
+// unresolved reports whether a row still in the durable `swapping` guard has no
+// swap this process can finish: none on record (a restart lost pendingSwaps, so
+// the agent's "swap complete" can no longer commit app_id) or one older than
+// swapUnresolvedAfter (its commit failed or its callback never came). The row's
+// app_id is then not known to be what the agent runs.
+func (s *swapper) unresolved(sessionID string) bool {
+	s.mu.Lock()
+	since, ok := s.swapSince[sessionID]
+	s.mu.Unlock()
+	return !ok || time.Since(since) > swapUnresolvedAfter
 }
 
 // Swap validates that a running session is swappable and the new app fits its
@@ -107,6 +134,7 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 		if conflictID != "" {
 			return Session{}, &HomeInUseError{SessionID: conflictID}
 		}
+		s.noteSwapStart(sessionID)
 		hold, err := s.store.GuardHomeForSwapWithHold(ctx, sessionID, sess.UserID, app,
 			*sess.HostID, epoch != nil && epoch.SupportsHomeCleanup())
 		if err != nil {
@@ -131,6 +159,7 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 
 	// Mark swapping + remember the target; app_id stays the OLD app until commit.
 	if !app.ManagedHome {
+		s.noteSwapStart(sessionID)
 		if err := s.store.GuardPlacementForSwap(ctx, sessionID, homeAppID(app), *sess.HostID); err != nil {
 			return Session{}, err
 		}
@@ -227,6 +256,7 @@ func (s *swapper) forget(sessionID string) {
 	s.mu.Lock()
 	delete(s.pendingSwaps, sessionID)
 	delete(s.pendingHome, sessionID)
+	delete(s.swapSince, sessionID)
 	s.mu.Unlock()
 }
 

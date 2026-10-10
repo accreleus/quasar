@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
@@ -106,6 +107,13 @@ type Coordinator struct {
 	// certRuns tracks in-flight certification runs; one per host at a time.
 	certRuns *certRunManager
 
+	// stopRequested is when this process first saw each session go `stopping`:
+	// AgentHeartbeat's re-send grace. In memory, never sessions.updated_at, which
+	// the session's owner can keep fresh (UpdateSessionNegotiatedCodec accepts a
+	// stopping row). A restart loses it, which reads as past the grace.
+	stopMu        sync.Mutex
+	stopRequested map[string]time.Time
+
 	// forgetters hold per-session in-memory state to drop when a session goes
 	// terminal (#402). Written once at construction, read-only after, so no lock
 	// here; each implementation owns its own.
@@ -126,6 +134,7 @@ func NewCoordinator(store *Store, dispatcher Dispatcher, log *slog.Logger, opts 
 		dispatcher:            dispatcher,
 		log:                   log,
 		startToRunningTimeout: defaultStartToRunningTimeout,
+		stopRequested:         make(map[string]time.Time),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	for _, o := range opts {
@@ -148,14 +157,36 @@ func (c *Coordinator) Close() {
 // forgetTerminalSession drops per-session in-memory state from every registered
 // forgetter (#402), at the same four terminal sites as healthEvaluator.forget:
 // each collaborator's own eviction path is driven by its own protocol, so a
-// session ending any other way leaks an entry. Takes no coordinator lock and is
-// called with none held; each forgetter takes only its own mutex.
+// session ending any other way leaks an entry. Called with no lock held; it
+// takes stopMu and each forgetter's own mutex, one at a time.
 func (c *Coordinator) forgetTerminalSession(sessionID string) {
+	c.stopMu.Lock()
+	delete(c.stopRequested, sessionID)
+	c.stopMu.Unlock()
 	for _, f := range c.forgetters {
 		if f != nil {
 			f.Forget(sessionID)
 		}
 	}
+}
+
+// noteStopRequested keeps the first time only: a repeated stop must not restart
+// the grace.
+func (c *Coordinator) noteStopRequested(sessionID string) {
+	c.stopMu.Lock()
+	if _, ok := c.stopRequested[sessionID]; !ok {
+		c.stopRequested[sessionID] = time.Now()
+	}
+	c.stopMu.Unlock()
+}
+
+// stopInGrace reports whether this process saw the stop begin less than
+// stopAckTimeout ago. No record is not in grace.
+func (c *Coordinator) stopInGrace(sessionID string) bool {
+	c.stopMu.Lock()
+	at, ok := c.stopRequested[sessionID]
+	c.stopMu.Unlock()
+	return ok && time.Since(at) < stopAckTimeout
 }
 
 func (c *Coordinator) Swap(ctx context.Context, sessionID, newAppID string) (Session, error) {
@@ -180,8 +211,13 @@ func (c *Coordinator) Stop(ctx context.Context, sessionID, reason string) (Sessi
 	return c.stop(ctx, sessionID, "", reason, true)
 }
 
+// errStopNotDelivered: the row is `stopping` but the non-awaited session_stop
+// did not reach the agent's queue. AgentHeartbeat re-sends it.
+var errStopNotDelivered = errors.New("session_stop not delivered")
+
 // A non-empty ifAppID stops the session only while it still runs that app
-// (errAppChanged otherwise); see Store.transition.
+// (errAppChanged otherwise); see Store.transition. With awaitAck false a failed
+// dispatch returns the committed session together with errStopNotDelivered.
 func (c *Coordinator) stop(ctx context.Context, sessionID, ifAppID, reason string, awaitAck bool) (Session, error) {
 	sess, err := c.store.Get(ctx, sessionID)
 	if err != nil {
@@ -195,6 +231,7 @@ func (c *Coordinator) stop(ctx context.Context, sessionID, ifAppID, reason strin
 	if err != nil {
 		return Session{}, err
 	}
+	c.noteStopRequested(sessionID)
 
 	if sess.HostID != nil {
 		cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sessionID, Reason: reason}
@@ -210,6 +247,9 @@ func (c *Coordinator) stop(ctx context.Context, sessionID, ifAppID, reason strin
 		}
 		if err != nil {
 			c.log.Warn("session_stop dispatch failed", "session_id", sessionID, "err", err)
+			if !awaitAck {
+				return sess, fmt.Errorf("%w: %v", errStopNotDelivered, err)
+			}
 		}
 	}
 	return sess, nil
@@ -319,7 +359,7 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 			// own. Past the grace either the command was lost (a full send queue, a
 			// dropped frame, a launch that overtook it) or teardown is slow, where
 			// the agent treats a repeat as a no-op.
-			if time.Since(hs.UpdatedAt) < stopAckTimeout {
+			if c.stopInGrace(sid) {
 				continue
 			}
 			c.log.Warn("agent still runs a session stopped past the grace; re-sending the stop",
@@ -333,6 +373,28 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 		case hs.HostID != nil && *hs.HostID != hostID:
 			c.log.Warn("agent reports another host's session; stopping its copy",
 				"host_id", hostID, "session_id", sid)
+		}
+		cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sid, Reason: "error"}
+		if err := c.dispatcher.Send(hostID, cmd); err != nil {
+			c.log.Warn("heartbeat reconcile: stop dispatch failed",
+				"host_id", hostID, "session_id", sid, "err", err)
+		}
+	}
+
+	// A session stopped before it started, whose stop was lost: the agent never
+	// lists the id, so nothing above sees it, and ReapHeartbeatMissing keeps a
+	// pre-running stop as launch-in-flight. The row would hold its encode slot
+	// and its home for the life of the connection. Ask the agent instead: its
+	// unknown-id path retires the id and reports `stopped`. Never terminal from
+	// here first, or the slot reopens under a session_start still in flight.
+	unstarted, err := c.store.StoppingNeverStartedOnHost(ctx, hostID)
+	if err != nil {
+		c.log.Warn("heartbeat reconcile: list unstarted stops failed", "host_id", hostID, "err", err)
+		return
+	}
+	for _, sid := range unstarted {
+		if _, listed := live[sid]; listed || c.stopInGrace(sid) {
+			continue
 		}
 		cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sid, Reason: "error"}
 		if err := c.dispatcher.Send(hostID, cmd); err != nil {

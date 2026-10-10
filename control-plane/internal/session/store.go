@@ -951,6 +951,25 @@ func (s *Store) RunningSessionIDsOnHost(ctx context.Context, hostID string) ([]s
 	return out, rows.Err()
 }
 
+// StoppingNeverStartedOnHost lists the host's `stopping` rows that never reached
+// `running`: the ones the agent's heartbeat cannot vouch for either way.
+func (s *Store) StoppingNeverStartedOnHost(ctx context.Context, hostID string) ([]string, error) {
+	if !isValidUUID(hostID) {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id::text FROM sessions
+		WHERE host_id = $1::uuid AND state = 'stopping' AND started_at IS NULL`, hostID)
+	if err != nil {
+		return nil, fmt.Errorf("list unstarted stopping sessions on host: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("list unstarted stopping sessions on host: %w", err)
+	}
+	return ids, nil
+}
+
 // Host mirrors the schema.md `hosts` columns; the response DTO is built from it.
 type Host struct {
 	ID             string
