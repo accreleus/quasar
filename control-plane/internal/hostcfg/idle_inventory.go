@@ -82,7 +82,8 @@ func (s *Store) BeginJournalReconciliation(ctx context.Context, hostID, connecti
 // AdoptOrphanedJournal begins reconciliation on the host's live connection when
 // no connection owns its pending journal: the state another process's boot
 // leaves, which no reconnect will release (#515). A journal another connection
-// owns is left alone.
+// owns is left alone; one this connection already owns is begun again, so a
+// caller that could not send its inventory request can call again.
 func (s *Store) AdoptOrphanedJournal(ctx context.Context, hostID, connectionID string) (bool, error) {
 	return s.beginJournalReconciliation(ctx, hostID, connectionID, true)
 }
@@ -94,9 +95,19 @@ func (s *Store) beginJournalReconciliation(ctx context.Context, hostID, connecti
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var status, boot string
-	// Boot row before the host row, the order fenceRH05Boot locks them in.
+	// Lock order: the boot row, then host rows in id order. fenceRH05Boot and
+	// the fleet cordon restore (platform/apply_fleet_store.go) take hosts in
+	// that order, so a re-fence must hold them all before this host's own row
+	// or the two deadlock.
 	if err := tx.QueryRow(ctx, `SELECT incarnation::text FROM rh05_control_boot WHERE id=true FOR UPDATE`).Scan(&boot); err != nil {
 		return false, err
+	}
+	own := s.boot.Load()
+	foreign := own != nil && *own != boot
+	if foreign {
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM hosts ORDER BY id FOR UPDATE`); err != nil {
+			return false, err
+		}
 	}
 	if err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status); err != nil {
 		return false, err
@@ -105,7 +116,7 @@ func (s *Store) beginJournalReconciliation(ctx context.Context, hostID, connecti
 		var owner *string
 		err := tx.QueryRow(ctx, `SELECT connection_incarnation::text FROM host_journal_reconciliation
 			WHERE host_id=$1::uuid AND state='pending'`, hostID).Scan(&owner)
-		if errors.Is(err, pgx.ErrNoRows) || err == nil && owner != nil {
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && owner != nil && *owner != connectionID {
 			return false, nil
 		}
 		if err != nil {
@@ -118,7 +129,7 @@ func (s *Store) beginJournalReconciliation(ctx context.Context, hostID, connecti
 	// ponytail: two live control planes on one database take the boot row from
 	// each other at every heartbeat; a boot lease with liveness is the upgrade
 	// when the control plane runs replicated.
-	if own := s.boot.Load(); own != nil && *own != boot {
+	if foreign {
 		if err := fenceRH05Boot(ctx, tx, *own); err != nil {
 			return false, err
 		}

@@ -78,14 +78,22 @@ func run() error {
 		return err
 	}
 
-	// Bound before the first database write, served only once everything is
-	// wired: a second process on this address must fail here, never after it
-	// has written a boot fence the serving one cannot see (#515).
+	// Both addresses are bound before the first database write and served only
+	// once everything is wired: a second process on either must fail here,
+	// never after it has written a boot fence the serving one cannot see (#515).
 	httpListener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %q: %w", cfg.ListenAddr, err)
 	}
 	defer httpListener.Close() //nolint:errcheck
+	var tlsListener net.Listener
+	if cfg.TLSEnabled() {
+		tlsListener, err = net.Listen("tcp", cfg.TLSAddr)
+		if err != nil {
+			return fmt.Errorf("tls: listen %q: %w", cfg.TLSAddr, err)
+		}
+		defer tlsListener.Close() //nolint:errcheck
+	}
 
 	// Database preflight (#518), before migrations: a bad DATABASE_URL is
 	// diagnosed as what it is instead of surfacing as a migration failure
@@ -225,15 +233,7 @@ func run() error {
 	// Optional HTTPS listener (#376): the same handler over TLS so the browser
 	// gets a secure context. Fatal on misconfiguration when QUASAR_TLS != off.
 	var tlsSrv *http.Server
-	var tlsListener net.Listener
 	if cfg.TLSEnabled() {
-		// Bind synchronously so a bad address / port-in-use is a loud fatal at
-		// startup rather than a swallowed goroutine error.
-		ln, err := net.Listen("tcp", cfg.TLSAddr)
-		if err != nil {
-			return fmt.Errorf("tls: listen %q: %w", cfg.TLSAddr, err)
-		}
-		tlsListener = ln
 		tlsSrv = newServer(cfg.TLSAddr, handler)
 		// The certificate comes from a callback, not a file pair — the indirection
 		// that lets POST /v1/admin/tls/certificate take effect without a restart

@@ -479,12 +479,21 @@ func (h *Handler) maybeSendInitialPolicyMap(ctx context.Context, c *conn) error 
 }
 
 func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []byte) error {
-	if !c.policyTyped || h.cfgStore == nil || c.policyInventoryDone.Load() || c.policyInventoryID == "" {
+	if !c.policyTyped || h.cfgStore == nil {
 		return errors.New("unexpected policy inventory page")
 	}
 	var page ConfigPolicyInventoryPage
 	if err := json.Unmarshal(raw, &page); err != nil {
 		return err
+	}
+	// The answer to a request this connection itself replaced is late, not a
+	// violation. One page per replaced request; any other id still fails below.
+	if c.policyInventorySuperseded[page.InventoryID] {
+		delete(c.policyInventorySuperseded, page.InventoryID)
+		return nil
+	}
+	if c.policyInventoryDone.Load() || c.policyInventoryID == "" {
+		return errors.New("unexpected policy inventory page")
 	}
 	if page.InventoryID != c.policyInventoryID || page.SnapshotID == "" || !sameCursor(page.Cursor, c.policyInventoryCursor) || len(page.Entries) > 256 || page.RevisionHighWater == nil || page.ActiveSnapshots == nil {
 		return errors.New("invalid policy inventory page")
@@ -688,6 +697,12 @@ func (h *Handler) requestPolicyInventory(ctx context.Context, c *conn) error {
 		c.policyDeliverySentAt = time.Time{}
 		c.policyInitialMapApplied.Store(false)
 	}
+	if c.policyInventoryID != "" && !c.policyInventoryDone.Load() {
+		if c.policyInventorySuperseded == nil {
+			c.policyInventorySuperseded = map[string]bool{}
+		}
+		c.policyInventorySuperseded[c.policyInventoryID] = true
+	}
 	c.policyRefreshPending = false
 	c.policyInventoryDone.Store(false)
 	c.policyInventoryBlocked.Store(false)
@@ -703,19 +718,36 @@ func (h *Handler) requestPolicyInventory(ctx context.Context, c *conn) error {
 	c.policySequenceContent = nil
 	c.policyAttemptOutstanding.Store(false)
 	c.policyActiveSnapshots.Store(nil)
-	return h.registry.Send(c.hostID, ConfigPolicyInventoryRequest{Type: "config_policy_journal_inventory_request", InventoryID: c.policyInventoryID, BootIncarnation: c.bootIncarnation, ConnectionIncarnation: c.connectionIncarnation})
+	if err := h.registry.Send(c.hostID, ConfigPolicyInventoryRequest{Type: "config_policy_journal_inventory_request", InventoryID: c.policyInventoryID, BootIncarnation: c.bootIncarnation, ConnectionIncarnation: c.connectionIncarnation}); err != nil {
+		c.policyInventoryID = "" // never sent: no page answers it
+		return err
+	}
+	return nil
 }
 
 // adoptOrphanedJournal reconciles on this live socket a journal that no
 // connection owns: only another process's boot leaves that under the registry's
-// current connection, and the agent has no reason to reconnect (#515).
-func (h *Handler) adoptOrphanedJournal(ctx context.Context, c *conn) error {
+// current connection, and the agent has no reason to reconnect (#515). stale is
+// this heartbeat finding the journal elsewhere. The adoption stays owed until
+// its inventory request is queued: a journal bound but never asked for would
+// hold the host forever, so every later heartbeat tries again.
+func (h *Handler) adoptOrphanedJournal(ctx context.Context, c *conn, stale bool) error {
+	if !stale && !c.policyAdoptionOwed {
+		return nil
+	}
+	c.policyAdoptionOwed = true
 	adopted, err := h.cfgStore.AdoptOrphanedJournal(ctx, c.hostID, c.connectionIncarnation)
-	if err != nil || !adopted {
+	if err != nil {
 		return err
 	}
-	h.log.Warn("RH05 journal had no owning connection; reconciling on the live one", "host_id", c.hostID)
-	return h.requestPolicyInventory(ctx, c)
+	if adopted {
+		h.log.Warn("RH05 journal had no owning connection; reconciling on the live one", "host_id", c.hostID)
+		if err := h.requestPolicyInventory(ctx, c); err != nil {
+			return err
+		}
+	}
+	c.policyAdoptionOwed = false
+	return nil
 }
 
 func (h *Handler) maybeRunDeferredPolicyRefresh(ctx context.Context, c *conn) error {
@@ -1037,10 +1069,8 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 						idleCtx, idleCancel := context.WithTimeout(bg, agentDBCallTimeout)
 						defer idleCancel()
 						idleErr = h.cfgStore.ObserveIdleHeartbeat(idleCtx, hostID, ac.connectionIncarnation, hb.RunningSessions)
-						if errors.Is(idleErr, hostcfg.ErrIdleInventoryStale) {
-							if err := h.adoptOrphanedJournal(idleCtx, ac); err != nil {
-								h.log.Warn("RH05 orphaned journal reconciliation failed", "host_id", hostID, "err", err)
-							}
+						if err := h.adoptOrphanedJournal(idleCtx, ac, errors.Is(idleErr, hostcfg.ErrIdleInventoryStale)); err != nil {
+							h.log.Warn("RH05 orphaned journal reconciliation failed; the next heartbeat retries", "host_id", hostID, "err", err)
 						}
 					})
 					if !current || errors.Is(idleErr, hostcfg.ErrIdleInventoryStale) {

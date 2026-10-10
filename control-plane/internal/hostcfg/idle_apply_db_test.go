@@ -1083,3 +1083,58 @@ func TestForeignBootIsReclaimedByTheServingStore(t *testing.T) {
 		t.Fatalf("adopted journal ended %s/%s %s owner=%v held=%v", current, gateBoot, state, owner, held)
 	}
 }
+
+// A re-fence from one host's reconciliation takes host rows in id order, as the
+// fleet cordon restore does, so the two cannot deadlock (#515).
+func TestForeignBootReclaimLocksHostsInIDOrder(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	first := seedHost(t, pool)
+	var second string
+	if err := pool.QueryRow(ctx, `INSERT INTO hosts (node_name, status) VALUES ('h2', 'online') RETURNING id::text`).Scan(&second); err != nil {
+		t.Fatal(err)
+	}
+	if second < first {
+		first, second = second, first
+	}
+	confirmPolicyGroups(t, pool, first, "hardware")
+	confirmPolicyGroups(t, pool, second, "hardware")
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewStore(pool).StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another transaction walks the hosts in id order and holds the first.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM hosts WHERE id=$1::uuid FOR UPDATE`, first); err != nil {
+		t.Fatal(err)
+	}
+	adopted := make(chan error, 1)
+	go func() {
+		_, err := store.AdoptOrphanedJournal(ctx, second, "00000000-0000-4000-8000-000000000515")
+		adopted <- err
+	}()
+	for waiting := 0; waiting == 0; time.Sleep(10 * time.Millisecond) {
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE NOT granted`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The re-fence waits for the first host without holding the second.
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM hosts WHERE id=$1::uuid FOR UPDATE`, second); err != nil {
+		t.Fatalf("the ordered walk could not take the second host: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-adopted; err != nil {
+		t.Fatalf("the re-fence did not finish once the hosts were free: %v", err)
+	}
+}
