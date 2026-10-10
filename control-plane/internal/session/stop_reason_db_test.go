@@ -10,16 +10,25 @@ import (
 // The closed vocabulary of control-api.md amendment 24: the other recorded
 // session_stop reasons are internal and must read null.
 func TestClientStopReasonIsAClosedSet(t *testing.T) {
-	if got := clientStopReason(strptr(StopReasonEntitlementRevoked)); got == nil || *got != "entitlement_revoked" {
-		t.Errorf("entitlement_revoked: got %v, want it passed through", got)
+	revoked := strptr(StopReasonEntitlementRevoked)
+	for _, state := range []State{StateStopping, StateStopped} {
+		if got := clientStopReason(state, revoked); got == nil || *got != "entitlement_revoked" {
+			t.Errorf("entitlement_revoked on a %s session: got %v, want it passed through", state, got)
+		}
 	}
 	for _, internal := range []string{"user_requested", "admin", "host_draining", "error", "cert bench complete", ""} {
-		if got := clientStopReason(&internal); got != nil {
+		if got := clientStopReason(StateStopped, &internal); got != nil {
 			t.Errorf("%q reached the client as %q", internal, *got)
 		}
 	}
-	if got := clientStopReason(nil); got != nil {
+	if got := clientStopReason(StateStopped, nil); got != nil {
 		t.Errorf("no recorded reason: got %q, want null", *got)
+	}
+	// Reaped while stopping: the session failed, and says host_lost instead.
+	for _, state := range []State{StateFailed, StateRunning} {
+		if got := clientStopReason(state, revoked); got != nil {
+			t.Errorf("a %s session served stop_reason %q", state, *got)
+		}
 	}
 }
 
@@ -110,5 +119,14 @@ func TestStopReasonReadsBackForARevokeOnly(t *testing.T) {
 	del(bySweep)
 	if _, reason := read(bySweep); reason != StopReasonEntitlementRevoked {
 		t.Errorf("after the owner stopped an already revoked session: stop_reason %v, want %s", reason, StopReasonEntitlementRevoked)
+	}
+
+	// The host is lost before the agent reports the teardown: the session ends
+	// `failed`/host_lost, and a failed session reads null (amendment 24).
+	if _, err := store.ReapHost(ctx, s.hostID, "agent disconnected"); err != nil {
+		t.Fatalf("reap host: %v", err)
+	}
+	if state, reason := read(bySweep); state != "failed" || reason != nil {
+		t.Errorf("revoked session reaped with its host: state %s, stop_reason %v; want failed, null", state, reason)
 	}
 }

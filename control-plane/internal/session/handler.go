@@ -343,7 +343,7 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		ErrorMessage:    s.ErrorMessage,
 		FailureCode:     s.FailureCode,
 		AppLogTail:      s.AppLogTail,
-		StopReason:      clientStopReason(s.StopReason),
+		StopReason:      clientStopReason(s.State, s.StopReason),
 		HomeSeed:        s.HomeSeed,
 		ProfileID:       s.ProfileID,
 		StreamProfileID: s.StreamProfileID,
@@ -361,8 +361,12 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 
 // clientStopReason keeps a recorded session_stop reason only when it is in the
 // closed stop_reason vocabulary of control-api.md amendment 24. The rest are
-// internal strings and must never reach a client.
-func clientStopReason(recorded *string) *string {
+// internal strings and must never reach a client. A session reaped to `failed`
+// while it was stopping reads null too: host_lost is then the explanation.
+func clientStopReason(state State, recorded *string) *string {
+	if state != StateStopping && state != StateStopped {
+		return nil
+	}
 	if recorded != nil && *recorded == StopReasonEntitlementRevoked {
 		return recorded
 	}
