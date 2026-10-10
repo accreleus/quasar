@@ -233,6 +233,10 @@ type ReconcileResult struct {
 	// Backfilled: existing discovered tiles of this parent whose blank description this scan
 	// filled in. See the backfill step at the end of Reconcile.
 	Backfilled int
+	// Capped: the report reached scanMaxEntries, so it is a prefix of the library and not
+	// evidence of absence; no game was pruned or revoked for being absent from it. UserID is for the caller's log.
+	Capped bool
+	UserID string
 	// CreatedAppIDs are the apps.id of the tiles step 3 created — exactly Created of them, in
 	// creation order. The handler hands them to the artwork resolver once the transaction has
 	// committed (#384); an existing tile is never in it, so a re-scan resolves nothing.
@@ -292,6 +296,8 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 		order = append(order, id)
 	}
 	res.Observed = len(order)
+	res.Capped = len(entries) >= scanMaxEntries
+	res.UserID = target.UserID
 
 	// An empty report over existing observations is how an unreadable or missing home reads;
 	// a real uninstall omits one appid from a non-empty report. Treated like MarkFailed so the
@@ -338,13 +344,17 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 			return res, fmt.Errorf("upsert observation: %w", err)
 		}
 	}
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM library_observations
-		 WHERE user_id = $1::uuid AND parent_app_id = $2::uuid AND host_id = $3::uuid
-		   AND external_source = $4
-		   AND NOT (external_id = ANY($5::text[]))
-	`, target.UserID, target.ParentID, target.HostID, SourceSteam, order); err != nil {
-		return res, fmt.Errorf("prune observations: %w", err)
+	// A report that hit the agent's cap is a prefix in directory order: it adds, never prunes
+	// (guarded by TestCappedReportPrunesAndRevokesNothing).
+	if !res.Capped {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM library_observations
+			 WHERE user_id = $1::uuid AND parent_app_id = $2::uuid AND host_id = $3::uuid
+			   AND external_source = $4
+			   AND NOT (external_id = ANY($5::text[]))
+		`, target.UserID, target.ParentID, target.HostID, SourceSteam, order); err != nil {
+			return res, fmt.Errorf("prune observations: %w", err)
+		}
 	}
 
 	// --- STEP 2: the suppression decision, computed once ---------------------
@@ -491,7 +501,8 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 	revoked, err := tx.Exec(ctx, `
 		DELETE FROM entitlements e
 		 USING apps a
-		 WHERE e.app_id = a.id
+		 WHERE NOT $4::bool
+		   AND e.app_id = a.id
 		   AND e.granted_by = 'provider'
 		   AND e.subject_type = 'user'
 		   AND e.subject_id = $1::uuid
@@ -504,7 +515,7 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 		          AND o.external_source = a.external_source
 		          AND o.external_id = a.external_id
 		   )
-	`, target.UserID, target.ParentID, SourceSteam)
+	`, target.UserID, target.ParentID, SourceSteam, res.Capped)
 	if err != nil {
 		return res, fmt.Errorf("revoke stale entitlements: %w", err)
 	}
