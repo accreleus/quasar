@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { launchFailureFromSession, takenOverFailure, unreachableFailure } from "./sessionFailure";
+import {
+  accessRevokedFailure,
+  launchFailureFromSession,
+  takenOverFailure,
+  unreachableFailure,
+} from "./sessionFailure";
 
 const s = (
   state: string,
@@ -131,6 +136,21 @@ describe("launchFailureFromSession", () => {
 
   it.each(["stopping", "stopped"])("reports %s before connect as an ended session", (state) => {
     expect(launchFailureFromSession(s(state))?.kind).toBe("ended");
+  });
+
+  // #516 — the control plane's stop reason outranks the generic "ended" copy,
+  // which invites relaunching an app the library no longer lists.
+  it.each(["stopping", "stopped"])("says the access was removed when %s for a revoke", (state) => {
+    const v = launchFailureFromSession({ ...s(state, "stop requested"), stop_reason: "entitlement_revoked" });
+    expect(v?.kind).toBe("access_revoked");
+    expect(v?.title).toBe("Your access to this app was removed");
+    expect(v?.message).toBeTruthy();
+    expect(v?.detail).toBeUndefined();
+  });
+
+  it("keeps today's verdict for a stop with no served reason", () => {
+    expect(launchFailureFromSession({ ...s("stopped"), stop_reason: null })?.kind).toBe("ended");
+    expect(accessRevokedFailure({ stop_reason: null })).toBeNull();
   });
 
   // #526 — a takeover is its own verdict, not "unreachable". The session is

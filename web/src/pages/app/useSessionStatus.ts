@@ -11,7 +11,7 @@ import { getSession } from "../../api/library";
 import type { Session } from "../../api/types";
 import { reportBestEffortFailure } from "../../lib/reportBestEffortFailure";
 import { healthBanner, type HealthBanner } from "./streamHealth";
-import { launchFailureFromSession, type LaunchFailure } from "./sessionFailure";
+import { accessRevokedFailure, launchFailureFromSession, type LaunchFailure } from "./sessionFailure";
 
 /** #484 §3.3: cap on how long the loader waits for "app presented" after
  * "app booting" before revealing anyway. Build-time constant — the design
@@ -53,9 +53,10 @@ export interface SessionStatus {
   hostAssigned: boolean;
   /** #482: has the control plane reported `state === "running"`? Sticky. */
   sessionRunning: boolean;
-  /** Poll once to find out why the WebRTC session dropped — called by
-   * SessionPage's onStatus on a signaling-relay 4500 / host-offline / ICE failure. */
-  pollHostLost: () => Promise<void>;
+  /** Poll once to find out why the WebRTC session dropped (host lost, access
+   * revoked) — called by SessionPage on a disconnect signature or a refused
+   * reconnect. */
+  pollEndReason: () => Promise<void>;
 }
 
 export function useSessionStatus(
@@ -111,15 +112,23 @@ export function useSessionStatus(
     if (session.state === "running") setSessionRunning(true);
   }, []);
 
+  // The server's stop reason replaces a verdict the client guessed earlier
+  // (e.g. "could not reach the stream"), so this one is not `prev ??`.
+  const noteAccessRevoked = useCallback((session: Parameters<typeof accessRevokedFailure>[0]) => {
+    const revoked = accessRevokedFailure(session);
+    if (revoked) setLaunchFailure((prev) => (prev?.kind === revoked.kind ? prev : revoked));
+  }, []);
+
   // When the WebRTC session drops unexpectedly, poll once to find out why — if
   // the server says failed/host_lost we show a clear "host went offline" message.
-  const pollHostLost = useCallback(async () => {
+  const pollEndReason = useCallback(async () => {
     if (!authToken || !sessionId || stopping) return;
     try {
       const { session } = await getSession(authToken, sessionId);
       if (session.state === "failed" && session.state_detail === "host_lost") {
         setHostLost(true);
       }
+      noteAccessRevoked(session);
     } catch (err) {
       // best-effort; the status bar message is already informative
       reportBestEffortFailure("silent-debug", "session: host-lost poll", err);
@@ -139,6 +148,7 @@ export function useSessionStatus(
           setHostLost(true);
           return;
         }
+        noteAccessRevoked(session);
         notePlacement(session as Session);
         // #484 §3.2: suppress the non-critical banners while the app hasn't
         // presented — healthBanner() itself decides which kinds that covers.
@@ -274,6 +284,6 @@ export function useSessionStatus(
     appPresented,
     hostAssigned,
     sessionRunning,
-    pollHostLost,
+    pollEndReason,
   };
 }

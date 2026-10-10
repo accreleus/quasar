@@ -109,6 +109,9 @@ vi.mock("../../webrtc/traceEvents", () => ({
  *  channelOpen by hand — exactly the ondatachannel/onopen path SessionPage
  *  itself drives, without a real RTCPeerConnection. */
 let lastOnChannel: ((ch: { readyState: string; onclose: (() => void) | null }) => void) | null = null;
+/** The runtime's recovery sink, same capture: a test plays the transport's
+ *  verdict (e.g. the 4404 close) without a WebSocket. */
+let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
 vi.mock("../../webrtc/session", () => ({
   QuasarSession: class {
     videoReceiver = null;
@@ -120,10 +123,17 @@ vi.mock("../../webrtc/session", () => ({
       _onTrack: unknown,
       _onStatus: unknown,
       onChannel: (ch: { readyState: string; onclose: (() => void) | null }) => void,
+      _initialPlayoutMs?: number,
+      onRecoveryState?: (state: Record<string, unknown>) => void,
     ) {
       lastOnChannel = onChannel;
+      lastOnRecovery = onRecoveryState ?? null;
     }
     close() {}
+    // As QuasarSession does: abandoning the reconnect terminalises recovery.
+    signalingUnrecoverable(message: string) {
+      lastOnRecovery?.({ phase: "failed", attempt: 0, maxAttempts: 3, message });
+    }
     getStats() {
       return Promise.resolve({});
     }
@@ -163,8 +173,11 @@ vi.mock("./hud/Hud", async () => {
   };
 });
 
+/** Returns the channel so a test can end it (`ch.onclose?.()`). */
 function openChannel() {
-  lastOnChannel?.({ readyState: "open", onclose: null });
+  const ch: { readyState: string; onclose: (() => void) | null } = { readyState: "open", onclose: null };
+  lastOnChannel?.(ch);
+  return ch;
 }
 
 function makeSession(overrides: Record<string, unknown> = {}) {
@@ -231,6 +244,7 @@ beforeEach(() => {
   // assertions below are per-test counts and read as cumulative without this.
   vi.clearAllMocks();
   lastOnChannel = null;
+  lastOnRecovery = null;
   lastDrawerProps = null;
   lastStripProps = null;
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
@@ -868,6 +882,207 @@ describe("SessionPage — #484 app-boot loader gate", () => {
 // Bench mode is a measurement instrument that reads back <video> pixels on every
 // displayed frame. It must be provably inert for an ordinary session: no RVFC
 // decode loop, and no `window.__qBench` for anything to drive.
+describe("SessionPage — a session the control plane stopped (#516)", () => {
+  /** Streams, then loses the session the way a stop looks from the browser:
+   *  signaling closes 4404 and the replacement token is refused. */
+  async function streamThenLoseTheSession(ended: Record<string, unknown>) {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      openChannel();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await waitFor(() => expect(document.querySelector(".sl-root")).toBeNull());
+
+    currentSession = makeSession(ended);
+    mintSignalingToken.mockRejectedValue(
+      new ApiError(409, "session_not_reconnectable", "session is not reconnectable"),
+    );
+    await act(async () => {
+      lastOnRecovery?.({
+        phase: "failed",
+        attempt: 0,
+        maxAttempts: 3,
+        message: "signaling: session not found or already ended",
+      });
+      await vi.advanceTimersByTimeAsync(100);
+    });
+  }
+
+  it("says the access was removed, not that recovery stopped", async () => {
+    await streamThenLoseTheSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+    const banner = screen.getByText("Your access to this app was removed").closest(".banner");
+    expect(banner?.getAttribute("role")).toBe("alert");
+    expect(banner?.textContent).toContain("you no longer have access");
+    expect(banner?.querySelector("button")?.textContent).toBe("Back to library");
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  it("keeps the recovery notice for a stop with no served reason", async () => {
+    await streamThenLoseTheSession({ state: "stopped", stop_reason: null });
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    expect(screen.queryByText("Your access to this app was removed")).toBeNull();
+  });
+
+  // The loader latches its handoff at the reveal: 1180 ms later it is
+  // transparent and inert, and the page removes it at 1400 ms. The page's
+  // removal used to be cancelled when the channel closed inside that window,
+  // which left the loader mounted for good and `loaderDone` false. Inside the
+  // window a session that ends is presented as it is after it: by a banner.
+  const refused = () =>
+    mintSignalingToken.mockRejectedValue(
+      new ApiError(409, "session_not_reconnectable", "session is not reconnectable"),
+    );
+  const failed = { phase: "failed", attempt: 0, maxAttempts: 3, message: "signaling: session not found or already ended" };
+  type Channel = { onclose: (() => void) | null };
+
+  /** In 100 ms steps: one long act() lets every timer fire before React renders
+   *  once, which hides exactly the ordering these tests are about. */
+  const advance = async (ms: number) => {
+    for (let t = 0; t < ms; t += 100) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+    }
+  };
+  /** Mounts, opens the channel and stops `intoRevealMs` after the reveal began. */
+  async function intoTheReveal(intoRevealMs: number): Promise<Channel> {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    let ch: Channel = { onclose: null };
+    await act(async () => {
+      ch = openChannel();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(intoRevealMs);
+    });
+    expect(document.querySelector(".sl-root")?.className).toContain("is-locking");
+    return ch;
+  }
+  /** Past the lock (1180 ms) and the loader's removal (1400 ms). */
+  const settleTheReveal = () => advance(3_000);
+  const alerts = () => screen.queryAllByRole("alert").map((el) => el.textContent ?? "");
+  const expectOnlyTheRevokeBanner = () => {
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(alerts()).toEqual([expect.stringContaining("Your access to this app was removed")]);
+    expect(screen.getByText("Your access to this app was removed").closest(".banner")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  };
+
+  it("shows the revoke banner when the reason is read inside the handoff with the channel still open", async () => {
+    // The app presented before the channel came up, so the 5 s poll is already
+    // ticking: its 5 s tick reads `stopping` and the reason 500 ms into the
+    // reveal, before the agent has torn anything down.
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await advance(4_500);
+    await act(async () => {
+      openChannel();
+    });
+    expect(document.querySelector(".sl-root")?.className).toContain("is-locking");
+    currentSession = makeSession({
+      state: "stopping",
+      state_detail: "stop requested",
+      stop_reason: "entitlement_revoked",
+    });
+    await advance(600);
+    // Read, and the loader is still on its way out: no banner yet.
+    expect(document.querySelector(".sl-root")?.textContent).toContain("Your access to this app was removed");
+    expect(document.querySelector(".banner")).toBeNull();
+
+    await settleTheReveal();
+
+    expectOnlyTheRevokeBanner();
+    expect(lastDrawerProps?.channelOpen).toBe(true);
+  });
+
+  it("shows the revoke banner when the channel closes inside the handoff", async () => {
+    const ch = await intoTheReveal(300);
+    await act(async () => {
+      currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+      refused();
+      ch.onclose?.();
+      lastOnRecovery?.(failed);
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    await settleTheReveal();
+
+    expectOnlyTheRevokeBanner();
+  });
+
+  it("never covers a stream that still works: signalling gives up inside the handoff", async () => {
+    // A slow app boot with the control plane away: every mint answers 503 until
+    // the 120 s budget runs out, which lands 1000 ms into the reveal. Media and
+    // input never stopped (the channel stays open).
+    currentSession = makeSession({ state: "running", state_detail: "app booting" });
+    mintSignalingToken.mockRejectedValue(new ApiError(503, "unavailable", "control plane unavailable"));
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      openChannel();
+      lastOnRecovery?.({ ...failed, phase: "signaling-lost", message: "signaling closed (1006)" });
+    });
+    // Backoff 1+2+4+8+16×6 s: the mint that exhausts the budget runs at ~112 s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(109_500);
+    });
+    expect(mintSignalingToken.mock.calls.length).toBeGreaterThan(5);
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+    // The reveal has begun and the client has not given up yet.
+    expect(document.querySelector(".sl-root")?.className).toContain("is-locking");
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+
+    await settleTheReveal();
+
+    // The loader went as it always did; the recovery banner states the verdict.
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(screen.getByText("Connection recovery stopped").closest(".banner")?.textContent).toContain(
+      "this session can no longer be resumed",
+    );
+    expect(alerts()).toHaveLength(1);
+    expect(lastDrawerProps?.channelOpen).toBe(true);
+  });
+
+  it("states a transport failure inside the handoff once, with the recovery banner", async () => {
+    const ch = await intoTheReveal(300);
+    await act(async () => {
+      currentSession = makeSession({ state: "stopped", stop_reason: null });
+      refused();
+      ch.onclose?.();
+      lastOnRecovery?.(failed);
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    await settleTheReveal();
+
+    expect(alerts()).toEqual([expect.stringContaining("Connection recovery stopped")]);
+    expect(document.querySelector(".sl-root")).toBeNull();
+  });
+
+  it("leaves the reveal alone for a takeover: signalling closed, the picture may still be live", async () => {
+    await intoTheReveal(300);
+    await act(async () => {
+      lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" });
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    await settleTheReveal();
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(alerts()).toHaveLength(0);
+  });
+});
+
 describe("SessionPage — bench mode", () => {
   it("does not arm the bench instrument for an ordinary session", async () => {
     delete (window as unknown as Record<string, unknown>)["__qBench"];

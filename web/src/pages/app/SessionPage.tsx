@@ -47,7 +47,7 @@ import {
   SessionBannerHost,
 } from "./sessionAlerts";
 import { SessionLoader } from "./SessionLoader";
-import { takenOverFailure, unreachableFailure } from "./sessionFailure";
+import { accessRevokedFailure, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
@@ -227,10 +227,17 @@ export function SessionPage() {
 
     const cancelled = () => !resumeMountedRef.current;
 
-    const bounce = (body: string) => {
+    const bounce = (body: string, title = "Can't resume that session") => {
       if (cancelled()) return;
-      addToast({ variant: "danger", title: "Can't resume that session", body });
+      addToast({ variant: "danger", title, body });
       navigate("/app", { replace: true });
+    };
+    // #516: an ended session says why when the server does. The generic copy
+    // invites relaunching an app the user can no longer open.
+    const bounceIfRevoked = (session: Parameters<typeof accessRevokedFailure>[0]) => {
+      const revoked = accessRevokedFailure(session);
+      if (revoked) bounce(revoked.message, revoked.title);
+      return revoked != null;
     };
 
     if (!authToken || !sessionId) {
@@ -242,6 +249,7 @@ export function SessionPage() {
       try {
         const { session } = await getSession(authToken, sessionId);
         if (cancelled()) return;
+        if (bounceIfRevoked(session)) return;
         if (RESUME_DEAD_STATES.has(session.state)) {
           bounce("That session has already ended. Launch it again from your library.");
           return;
@@ -249,7 +257,18 @@ export function SessionPage() {
         // A `failed` session is left to the poller's launch-failure verdict
         // (see RESUME_DEAD_STATES) — no mint, no bounce, no toast.
         if (session.state === "failed") return;
-        const res = await mintSignalingToken(authToken, sessionId);
+        let res: Awaited<ReturnType<typeof mintSignalingToken>>;
+        try {
+          res = await mintSignalingToken(authToken, sessionId);
+        } catch (err) {
+          // A revoke can land between the read and the mint. The refusal does
+          // not say why; the session does.
+          if (!(err instanceof ApiError)) throw err;
+          const again = await getSession(authToken, sessionId).catch(() => null);
+          if (cancelled()) return;
+          if (again && bounceIfRevoked(again.session)) return;
+          throw err;
+        }
         if (cancelled()) return;
         const signaling = res?.signaling;
         // Same shape check the runtime applies: a 2xx whose body isn't a
@@ -287,7 +306,7 @@ export function SessionPage() {
   }, [signalCoords, authToken, sessionId, navigate, addToast]);
 
   // Session status polling (host-lost, AS10-06 health, launch progress, #484
-  // §3.2 reveal-cap) lives in useSessionStatus.ts. `pollHostLost` and
+  // §3.2 reveal-cap) lives in useSessionStatus.ts. `pollEndReason` and
   // `setLaunchFailure` are called from the WebRTC mount effect below: a
   // signaling-relay disconnect polls once to explain itself, a failed
   // reconnect posts its own terminal verdict.
@@ -308,7 +327,7 @@ export function SessionPage() {
     appPresented,
     hostAssigned,
     sessionRunning,
-    pollHostLost,
+    pollEndReason,
   } = useSessionStatus(authToken, sessionId, stopping);
 
   // sessionRuntime.ts: one runtime instance per transport generation (law L1)
@@ -378,11 +397,15 @@ export function SessionPage() {
             duration: 10000,
           });
         },
-        onDisconnectSuspected: () => void pollHostLost(),
+        onDisconnectSuspected: () => void pollEndReason(),
         onReplacementSignaling: ({ url, token, iceServers }) =>
           setSignalCoords({ url, token, replacement: true, iceServers }),
-        onReconnectFailed: (detail) =>
-          setLaunchFailure((prev) => prev ?? unreachableFailure(detail)),
+        // A refused mint (409) is how a session the control plane stopped
+        // looks from here, so ask it why before settling on "unreachable".
+        onReconnectFailed: (detail) => {
+          setLaunchFailure((prev) => prev ?? unreachableFailure(detail));
+          void pollEndReason();
+        },
         // #526: another attach won this session. Terminal HERE only — the
         // session and the app are still running, in the tab that took it. The
         // page states it and stops; it must not re-mint (sessionRuntime L6).
@@ -698,14 +721,22 @@ export function SessionPage() {
   const revealReady = channelOpen && appPresented;
   const [loaderDone, setLoaderDone] = useState(false);
   const loaderDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Latched, like SessionLoader's own handoff: the gate can retract (the channel
+  // closes inside the reveal), and the loader is transparent and inert by then
+  // either way. A removal cancelled on the retract never happened again, and
+  // the revoke banner waits for `loaderDone`.
   useEffect(() => {
-    if (revealReady && !loaderDone) {
+    if (revealReady && !loaderDone && loaderDoneTimerRef.current === null) {
       loaderDoneTimerRef.current = setTimeout(() => setLoaderDone(true), LOADER_UNMOUNT_MS);
     }
-    return () => {
-      if (loaderDoneTimerRef.current) clearTimeout(loaderDoneTimerRef.current);
-    };
   }, [revealReady, loaderDone]);
+  useEffect(
+    () => () => {
+      if (loaderDoneTimerRef.current) clearTimeout(loaderDoneTimerRef.current);
+      loaderDoneTimerRef.current = null;
+    },
+    [],
+  );
 
   // #434: hold a screen wake lock while the session is LIVE. Liveness is the
   // page's existing notion — the input DataChannel being open is what every
@@ -753,13 +784,20 @@ export function SessionPage() {
       ? externalSize
       : null;
 
-  // Whether any of the three banner blocks below is on screen. The HUD takes
+  // #516: the control plane's reason stands in for the recovery notice the dead
+  // transport raises. Until the loader is gone it states the verdict itself.
+  const revoked = launchFailure?.kind === "access_revoked" ? launchFailure : null;
+  const accessRevoked = loaderDone ? revoked : null;
+
+  // Whether any of the banner blocks below is on screen. The HUD takes
   // no banner-state input, so it is carried as a class on the shared ancestor
   // instead — `.session-root.banner-on` pushes a top-docked HUD down (hud.css).
   const bannerOn =
     health != null ||
     clientUnsupported ||
-    (recovery != null &&
+    accessRevoked != null ||
+    (!revoked &&
+      recovery != null &&
       ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase));
 
   // Same shape, for the mic "hot" pill vs the toast host (`.session-root.mic-on`).
@@ -843,7 +881,20 @@ export function SessionPage() {
             />
           )}
 
-          {recovery &&
+          {accessRevoked && (
+            <SessionBanner
+              title={accessRevoked.title}
+              message={accessRevoked.message}
+              actions={
+                <Button variant="primary" onClick={() => navigate("/app")}>
+                  Back to library
+                </Button>
+              }
+            />
+          )}
+
+          {!revoked &&
+            recovery &&
             ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase) && (
               <SessionBanner
                 variant={recovery.phase === "failed" ? "critical" : "warning"}

@@ -227,7 +227,7 @@ func (c *Coordinator) stop(ctx context.Context, sessionID string, only rowGuard,
 		return sess, nil
 	}
 
-	sess, err = c.store.transition(ctx, sessionID, "", only, StateStopping, strptr("stop requested"), nil)
+	sess, err = c.store.transition(ctx, sessionID, "", only, StateStopping, strptr("stop requested"), nil, &reason)
 	if err != nil {
 		return Session{}, err
 	}
