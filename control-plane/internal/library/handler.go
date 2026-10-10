@@ -255,6 +255,10 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 		"created", res.Created, "disabled", res.Disabled,
 		"granted", res.Granted, "revoked", res.Revoked, "rejected", res.Rejected,
 		"backfilled", res.Backfilled)
+	if res.Capped {
+		h.log.Warn("library: scan hit the entry cap; nothing pruned or revoked for it",
+			"scan_id", req.ScanID, "user_id", res.UserID, "host_id", hostID, "entries", len(req.Entries))
+	}
 	h.resolveCreatedArtwork(r.Context(), req.ScanID, res.CreatedAppIDs)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"accepted": true})
 }

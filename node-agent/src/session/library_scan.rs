@@ -401,7 +401,11 @@ fn walk_until(
             &mut seen_appids,
             max_entries,
             max_manifest_bytes,
+            deadline,
         )?;
+    }
+    if Instant::now() >= deadline {
+        return Err(timed_out());
     }
     Ok(out)
 }
@@ -418,6 +422,19 @@ fn timed_out() -> String {
 /// benign — callers skip that and propagate this for everything else.
 fn read_failure(path: &Path, e: &std::io::Error) -> String {
     format!("reading {} failed: {:?}", path.display(), e.kind())
+}
+
+/// One item of a directory listing. `None` is an entry that vanished mid-walk
+/// (`NotFound`), skipped like the same error from `read_dir` or `symlink_metadata`.
+fn listed(
+    dir: &Path,
+    item: std::io::Result<std::fs::DirEntry>,
+) -> Result<Option<std::fs::DirEntry>, String> {
+    match item {
+        Ok(e) => Ok(Some(e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(read_failure(dir, &e)),
+    }
 }
 
 /// Bounded, depth-capped, containment-checked search for `steamapps`
@@ -453,7 +470,9 @@ fn find_steamapps_dirs(
         if Instant::now() >= deadline {
             return Err(timed_out());
         }
-        let entry = entry.map_err(|e| read_failure(dir, &e))?;
+        let Some(entry) = listed(dir, entry)? else {
+            continue;
+        };
         let path = entry.path();
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
@@ -478,13 +497,15 @@ fn find_steamapps_dirs(
 /// `relative_roots` and the depth walk must not double an entry.
 ///
 /// An absent `dir` is an empty library (`Ok`); any other read error on `dir`,
-/// one of its entries, or a manifest is `Err` so the scan reports `ok: false`.
+/// one of its entries, or a manifest is `Err` so the scan reports `ok: false`,
+/// and so is passing `deadline`.
 fn collect_manifests(
     dir: &Path,
     out: &mut Vec<ManifestEntry>,
     seen_appids: &mut HashSet<String>,
     max_entries: usize,
     max_manifest_bytes: u64,
+    deadline: Instant,
 ) -> Result<(), String> {
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -495,7 +516,12 @@ fn collect_manifests(
         if out.len() >= max_entries {
             return Ok(());
         }
-        let entry = entry.map_err(|e| read_failure(dir, &e))?;
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        let Some(entry) = listed(dir, entry)? else {
+            continue;
+        };
         let path = entry.path();
         let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -1064,7 +1090,15 @@ mod tests {
 
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        collect_manifests(&steamapps, &mut out, &mut seen, 512, 1_048_576).unwrap();
+        collect_manifests(
+            &steamapps,
+            &mut out,
+            &mut seen,
+            512,
+            1_048_576,
+            far_deadline(),
+        )
+        .unwrap();
         assert!(out.is_empty(), "a symlinked manifest must never be read");
     }
 
@@ -1130,7 +1164,15 @@ mod tests {
         }
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        collect_manifests(&steamapps, &mut out, &mut seen, 3, 1_048_576).unwrap();
+        collect_manifests(
+            &steamapps,
+            &mut out,
+            &mut seen,
+            3,
+            1_048_576,
+            far_deadline(),
+        )
+        .unwrap();
         assert_eq!(
             out.len(),
             3,
@@ -1158,7 +1200,7 @@ mod tests {
         // ~2000+. A cap of 300 sits strictly between them.
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        collect_manifests(&steamapps, &mut out, &mut seen, 512, 300).unwrap();
+        collect_manifests(&steamapps, &mut out, &mut seen, 512, 300, far_deadline()).unwrap();
         assert_eq!(
             out.len(),
             1,
@@ -1242,6 +1284,7 @@ mod tests {
             &mut HashSet::new(),
             512,
             1_048_576,
+            far_deadline(),
         )
         .unwrap();
         assert!(out.is_empty());
@@ -1309,6 +1352,29 @@ mod tests {
         let err = result.expect_err("a hidden library must fail the scan, not shrink the report");
         assert!(err.contains("hidden"), "error names the directory: {err}");
         assert!(err.contains("PermissionDenied"), "{err}");
+    }
+
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn expired_deadline_in_manifest_collection_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("appmanifest_444444.acf"),
+            &synth_manifest("444444"),
+        );
+        let err = collect_manifests(
+            dir.path(),
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            512,
+            1_048_576,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
     }
 
     #[test]
