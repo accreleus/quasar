@@ -29,7 +29,7 @@
 //!
 //! `appid` is validated as a bare positive integer (`^[1-9][0-9]{0,9}$`,
 //! [`is_valid_appid`]) before it may leave [`parse_acf`]. A manifest whose
-//! `appid` fails that check fails the scan, with an error that does not echo the
+//! `appid` fails that check is dropped, with a debug log that does not echo the
 //! value — validation point 1 of 4 (the other three: control-plane ingest, a
 //! database CHECK, and the launch-time render).
 
@@ -491,9 +491,10 @@ fn find_steamapps_dirs(
     Ok(())
 }
 
-/// The scan-report `error` for an `appmanifest_*.acf` that exists but cannot
-/// become an entry (torn mid-update, not UTF-8, bad appid, over the size cap).
-/// Omitting it would read as "uninstalled" and revoke the entitlement.
+/// The scan-report `error` for an `appmanifest_*.acf` whose content cannot be
+/// read (torn mid-update, not UTF-8, over the size cap). It may be a known
+/// game's manifest, so omitting it would read as "uninstalled" and revoke the
+/// entitlement. A parsed but invalid appid is different: never ingested, safe to skip.
 fn unusable_manifest(path: &Path, reason: &str) -> String {
     format!("manifest {} {reason}", path.display())
 }
@@ -505,9 +506,10 @@ fn unusable_manifest(path: &Path, reason: &str) -> String {
 ///
 /// An absent `dir` is an empty library (`Ok`); any other read error on `dir`,
 /// one of its entries, or a manifest is `Err` so the scan reports `ok: false`,
-/// and so is passing `deadline`. So is an `appmanifest_*.acf` regular file that
-/// cannot be turned into an entry (see [`unusable_manifest`]). Symlinks,
-/// non-files, other filenames, duplicates and the `max_entries` cap stay quiet.
+/// and so is passing `deadline`. So is an `appmanifest_*.acf` regular file whose
+/// content is unreadable (see [`unusable_manifest`]). An invalid appid is
+/// dropped; symlinks, non-files, other filenames, duplicates and the
+/// `max_entries` cap stay quiet.
 fn collect_manifests(
     dir: &Path,
     out: &mut Vec<ManifestEntry>,
@@ -576,12 +578,14 @@ fn collect_manifests(
                     out.push(parsed);
                 }
             }
-            // Never echo the appid value (validation point 1 of 4, spec §10).
+            // Validation point 1 of 4 (spec §10): drop the entry, and do NOT
+            // echo the value. Such an appid can never have been ingested, so
+            // omitting it prunes nothing.
             Err(AcfParseError::InvalidAppid) => {
-                return Err(unusable_manifest(
-                    &path,
-                    "has an appid that fails validation",
-                ));
+                debug!(
+                    "library-scan: manifest {} has an appid that fails validation — dropped",
+                    path.display()
+                );
             }
             Err(AcfParseError::Malformed) => {
                 return Err(unusable_manifest(
@@ -1238,15 +1242,12 @@ mod tests {
     }
 
     #[test]
-    fn invalid_appid_manifest_fails_the_scan_without_echoing_it() {
+    fn invalid_appid_manifest_is_dropped_and_the_good_one_is_still_reported() {
         let bad = r#""AppState" { "appid" "1; rm -rf /" "name" "x" }"#;
-        let err = scan_with_bad_manifest("appmanifest_222222.acf", bad.as_bytes(), 1_048_576)
-            .unwrap_err();
-        assert!(err.contains("appmanifest_222222.acf"), "{err}");
-        assert!(
-            !err.contains("rm -rf"),
-            "the appid value must not be echoed: {err}"
-        );
+        let entries =
+            scan_with_bad_manifest("appmanifest_222222.acf", bad.as_bytes(), 1_048_576).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].external_id, "333333");
     }
 
     #[test]
