@@ -162,13 +162,19 @@ vi.mock("./SessionSwapController", () => ({
 // with the bar's badge input under the name the badge assertions use.
 let lastStripProps: Record<string, unknown> | null = null;
 let lastDrawerProps: Record<string, unknown> | null = null;
-vi.mock("./hud/Hud", async () => {
-  const { forwardRef } = await import("react");
+/** Set by a test that needs the real HUD in the tree (what it exposes to the
+ *  keyboard and to assistive technology), not only its props. */
+let renderRealHud = false;
+vi.mock("./hud/Hud", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./hud/Hud")>();
+  const { forwardRef, createElement } = await import("react");
   return {
-    Hud: forwardRef((p: Record<string, unknown>, _ref: unknown) => {
+    Hud: forwardRef((p: Record<string, unknown>, ref: unknown) => {
       lastDrawerProps = p;
       lastStripProps = { ...p, externalSize: p.badgeExternalSize };
-      return null;
+      return renderRealHud
+        ? createElement(actual.Hud as never, { ...p, ref } as never)
+        : null;
     }),
   };
 });
@@ -245,6 +251,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
+  renderRealHud = false;
   lastDrawerProps = null;
   lastStripProps = null;
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
@@ -989,6 +996,39 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     // The recovery notice says the thing the verdict replaces; under the loader
     // it would be covered but still announced, and its button focusable.
     expect(document.querySelector(".banner")).toBeNull();
+    expect(alerts()).toHaveLength(1);
+  });
+
+  it("leaves nothing but the way out to reach under the loader that holds a revoke", async () => {
+    // The real HUD: under the loader it would still take Tab ("Open menu"),
+    // announce its "Session status" region and answer its keys.
+    renderRealHud = true;
+    const focusable = () =>
+      [
+        ...document.querySelectorAll<HTMLElement>(
+          'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ]
+        .filter((el) => !(el as HTMLButtonElement).disabled && !el.closest("[inert]"))
+        .map((el) => el.getAttribute("aria-label") ?? el.textContent);
+
+    const ch = await intoTheReveal(300);
+    // The HUD is there while the session is alive.
+    expect(screen.getByRole("status", { name: "Session status" })).not.toBeNull();
+    expect(focusable()).toContain("Open menu");
+
+    await act(async () => {
+      currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+      refused();
+      ch.onclose?.();
+      lastOnRecovery?.(failed);
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    await settleTheReveal();
+
+    expect(focusable()).toEqual(["Back to library"]);
+    expect(screen.queryAllByRole("status")).toHaveLength(0);
+    expect(document.querySelector(".hud-root")).toBeNull();
     expect(alerts()).toHaveLength(1);
   });
 

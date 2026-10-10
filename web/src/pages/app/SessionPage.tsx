@@ -790,8 +790,9 @@ export function SessionPage() {
   // transport raises.
   const revoked = launchFailure?.kind === "access_revoked" ? launchFailure : null;
   const accessRevoked = loaderDone ? revoked : null;
-  // While the loader holds a verdict it is the one alert on the page: a banner
-  // under it is covered but still announced, and its buttons still take focus.
+  // While the loader holds a verdict it is the only thing to read or act on.
+  // A banner or the HUD under it is covered but still announced, still takes
+  // Tab, and the HUD still answers its keys, so neither renders then.
   const loaderHoldsVerdict = !loaderDone && holdLoader;
 
   // Whether any of the banner blocks below is on screen. The HUD takes
@@ -980,7 +981,7 @@ export function SessionPage() {
         onToast={pushToast}
         onSwapStart={() => hudRef.current?.close()}
       >
-        {({ quickSwitch, swappingTo }) => (
+        {({ quickSwitch, swappingTo }) => !loaderHoldsVerdict && (
           <Hud
             ref={hudRef}
             register={registerTelemetry}
@@ -1055,7 +1056,7 @@ export function SessionPage() {
           reach this button (it hides on desktop during play), but where nothing
           is ever locked, taps still land here — the only route back for a
           controller-only tablet player. */}
-      {!pointerLocked && !hudOpen && (
+      {!loaderHoldsVerdict && !pointerLocked && !hudOpen && (
         <button
           type="button"
           className={`session-summon${inputCaptured ? " always" : ""}`}
