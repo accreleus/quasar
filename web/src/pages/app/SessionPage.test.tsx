@@ -162,19 +162,13 @@ vi.mock("./SessionSwapController", () => ({
 // with the bar's badge input under the name the badge assertions use.
 let lastStripProps: Record<string, unknown> | null = null;
 let lastDrawerProps: Record<string, unknown> | null = null;
-/** Set by a test that needs the real HUD in the tree (what it exposes to the
- *  keyboard and to assistive technology), not only its props. */
-let renderRealHud = false;
-vi.mock("./hud/Hud", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./hud/Hud")>();
-  const { forwardRef, createElement } = await import("react");
+vi.mock("./hud/Hud", async () => {
+  const { forwardRef } = await import("react");
   return {
-    Hud: forwardRef((p: Record<string, unknown>, ref: unknown) => {
+    Hud: forwardRef((p: Record<string, unknown>, _ref: unknown) => {
       lastDrawerProps = p;
       lastStripProps = { ...p, externalSize: p.badgeExternalSize };
-      return renderRealHud
-        ? createElement(actual.Hud as never, { ...p, ref } as never)
-        : null;
+      return null;
     }),
   };
 });
@@ -251,7 +245,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
-  renderRealHud = false;
   lastDrawerProps = null;
   lastStripProps = null;
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
@@ -936,10 +929,11 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     expect(screen.queryByText("Your access to this app was removed")).toBeNull();
   });
 
-  // The loader's handoff latches at the reveal and takes 1400 ms. Only a
-  // verdict that outranks it (sessionFailure.outranksHandoff) may take the
-  // loader back: the control plane's word that the session is over. The
-  // client's own verdicts leave the reveal alone, as before #516.
+  // The loader latches its handoff at the reveal: 1180 ms later it is
+  // transparent and inert, and the page removes it at 1400 ms. The page's
+  // removal used to be cancelled when the channel closed inside that window,
+  // which left the loader mounted for good and `loaderDone` false. Inside the
+  // window a session that ends is presented as it is after it: by a banner.
   const refused = () =>
     mintSignalingToken.mockRejectedValue(
       new ApiError(409, "session_not_reconnectable", "session is not reconnectable"),
@@ -947,6 +941,15 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
   const failed = { phase: "failed", attempt: 0, maxAttempts: 3, message: "signaling: session not found or already ended" };
   type Channel = { onclose: (() => void) | null };
 
+  /** In 100 ms steps: one long act() lets every timer fire before React renders
+   *  once, which hides exactly the ordering these tests are about. */
+  const advance = async (ms: number) => {
+    for (let t = 0; t < ms; t += 100) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+    }
+  };
   /** Mounts, opens the channel and stops `intoRevealMs` after the reveal began. */
   async function intoTheReveal(intoRevealMs: number): Promise<Channel> {
     currentSession = makeSession({ state: "running", state_detail: "app presented" });
@@ -964,59 +967,45 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     expect(document.querySelector(".sl-root")?.className).toContain("is-locking");
     return ch;
   }
-  /** Past the lock (1180 ms) and the loader's removal (1400 ms). In 100 ms
-   *  steps: one long act() lets every timer fire before React renders once, so
-   *  a verdict could never cancel the removal that follows it. */
-  const settleTheReveal = async () => {
-    for (let i = 0; i < 30; i++) {
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(100);
-      });
-    }
-  };
+  /** Past the lock (1180 ms) and the loader's removal (1400 ms). */
+  const settleTheReveal = () => advance(3_000);
   const alerts = () => screen.queryAllByRole("alert").map((el) => el.textContent ?? "");
+  const expectOnlyTheRevokeBanner = () => {
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(alerts()).toEqual([expect.stringContaining("Your access to this app was removed")]);
+    expect(screen.getByText("Your access to this app was removed").closest(".banner")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  };
 
-  it("brings the loader back for a revoke that lands inside the handoff, as the only alert", async () => {
-    const ch = await intoTheReveal(300);
+  it("shows the revoke banner when the reason is read inside the handoff with the channel still open", async () => {
+    // The app presented before the channel came up, so the 5 s poll is already
+    // ticking: its 5 s tick reads `stopping` and the reason 500 ms into the
+    // reveal, before the agent has torn anything down.
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await advance(4_500);
     await act(async () => {
-      currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
-      refused();
-      ch.onclose?.();
-      lastOnRecovery?.(failed);
-      await vi.advanceTimersByTimeAsync(100);
+      openChannel();
     });
+    expect(document.querySelector(".sl-root")?.className).toContain("is-locking");
+    currentSession = makeSession({
+      state: "stopping",
+      state_detail: "stop requested",
+      stop_reason: "entitlement_revoked",
+    });
+    await advance(600);
+    // Read, and the loader is still on its way out: no banner yet.
+    expect(document.querySelector(".sl-root")?.textContent).toContain("Your access to this app was removed");
+    expect(document.querySelector(".banner")).toBeNull();
+
     await settleTheReveal();
 
-    const loader = document.querySelector(".sl-root");
-    expect(loader?.textContent).toContain("Your access to this app was removed");
-    expect(loader?.className).not.toMatch(/is-locking|is-streaming/);
-    expect(loader?.hasAttribute("inert")).toBe(false);
-    expect(loader?.getAttribute("aria-hidden")).toBeNull();
-    expect(loader?.querySelector("button")?.textContent).toBe("Back to library");
-    // The recovery notice says the thing the verdict replaces; under the loader
-    // it would be covered but still announced, and its button focusable.
-    expect(document.querySelector(".banner")).toBeNull();
-    expect(alerts()).toHaveLength(1);
+    expectOnlyTheRevokeBanner();
+    expect(lastDrawerProps?.channelOpen).toBe(true);
   });
 
-  it("leaves nothing but the way out to reach under the loader that holds a revoke", async () => {
-    // The real HUD: under the loader it would still take Tab ("Open menu"),
-    // announce its "Session status" region and answer its keys.
-    renderRealHud = true;
-    const focusable = () =>
-      [
-        ...document.querySelectorAll<HTMLElement>(
-          'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-        ),
-      ]
-        .filter((el) => !(el as HTMLButtonElement).disabled && !el.closest("[inert]"))
-        .map((el) => el.getAttribute("aria-label") ?? el.textContent);
-
+  it("shows the revoke banner when the channel closes inside the handoff", async () => {
     const ch = await intoTheReveal(300);
-    // The HUD is there while the session is alive.
-    expect(screen.getByRole("status", { name: "Session status" })).not.toBeNull();
-    expect(focusable()).toContain("Open menu");
-
     await act(async () => {
       currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
       refused();
@@ -1026,10 +1015,7 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     });
     await settleTheReveal();
 
-    expect(focusable()).toEqual(["Back to library"]);
-    expect(screen.queryAllByRole("status")).toHaveLength(0);
-    expect(document.querySelector(".hud-root")).toBeNull();
-    expect(alerts()).toHaveLength(1);
+    expectOnlyTheRevokeBanner();
   });
 
   it("never covers a stream that still works: signalling gives up inside the handoff", async () => {
@@ -1070,7 +1056,7 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     expect(lastDrawerProps?.channelOpen).toBe(true);
   });
 
-  it("shows one alert, not two, when the transport fails inside the handoff", async () => {
+  it("states a transport failure inside the handoff once, with the recovery banner", async () => {
     const ch = await intoTheReveal(300);
     await act(async () => {
       currentSession = makeSession({ state: "stopped", stop_reason: null });
@@ -1082,14 +1068,7 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     await settleTheReveal();
 
     expect(alerts()).toEqual([expect.stringContaining("Connection recovery stopped")]);
-    // The handoff is not taken back for a client-side verdict: what is left of
-    // the loader is transparent, out of the accessibility tree and focus order.
-    const loader = document.querySelector(".sl-root");
-    if (loader) {
-      expect(loader.className).toContain("is-streaming");
-      expect(loader.hasAttribute("inert")).toBe(true);
-      expect(loader.getAttribute("aria-hidden")).toBe("true");
-    }
+    expect(document.querySelector(".sl-root")).toBeNull();
   });
 
   it("leaves the reveal alone for a takeover: signalling closed, the picture may still be live", async () => {

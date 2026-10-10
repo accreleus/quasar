@@ -9,12 +9,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, fireEvent } from "@testing-library/react";
 import { SessionLoader, PHASE_STALL_MS } from "./SessionLoader";
-import {
-  accessRevokedFailure,
-  launchFailureFromSession,
-  takenOverFailure,
-  unreachableFailure,
-} from "./sessionFailure";
+import { launchFailureFromSession, unreachableFailure } from "./sessionFailure";
 
 describe("SessionLoader — terminal failure", () => {
   it("replaces the progress copy with the failure and a way out", () => {
@@ -213,48 +208,6 @@ describe("SessionLoader — never a dead end", () => {
       />,
     );
     expect(enabledButtons().length).toBeGreaterThan(0);
-  });
-
-  // #516: the handoff latches, so a verdict that lands after it began renders
-  // in a transparent, inert scene. 300 ms is mid-lock, 2000 ms is past the fade.
-  describe.each([300, 2_000])("a verdict %d ms into the handoff", (afterMs) => {
-    const handedOff = (failure: ReturnType<typeof unreachableFailure> | null) => {
-      const props = { statusMsg: "pipeline live", onExit: vi.fn() };
-      const { rerender } = render(<SessionLoader {...props} streaming />);
-      act(() => void vi.advanceTimersByTime(afterMs));
-      const root = document.querySelector(".sl-root") as HTMLElement;
-      expect(root.className).toMatch(/is-locking|is-streaming/);
-      rerender(<SessionLoader {...props} streaming={false} failure={failure} />);
-      // The lock timer still fires after the verdict.
-      act(() => void vi.advanceTimersByTime(2_000));
-      return root;
-    };
-    beforeEach(() => void vi.useFakeTimers());
-    afterEach(() => void vi.useRealTimers());
-
-    it("takes the scene back for an entitlement revoke, with a way out", () => {
-      const failure = accessRevokedFailure({ stop_reason: "entitlement_revoked" });
-      const root = handedOff(failure);
-      expect(root.className).not.toMatch(/is-locking|is-streaming/);
-      expect(root.hasAttribute("inert")).toBe(false);
-      expect(root.getAttribute("aria-hidden")).toBeNull();
-      expect(root.getAttribute("role")).toBe("alert");
-      expect(screen.getByText(failure!.title)).toBeInTheDocument();
-      expect(enabledButtons().length).toBeGreaterThan(0);
-    });
-
-    // The client's own verdicts: signalling can end while the picture is live,
-    // so the handoff completes and the loader stays out of the way.
-    it.each([
-      ["an unreachable transport", unreachableFailure()],
-      ["a takeover", takenOverFailure()],
-    ])("completes the handoff and stays out of the way for %s", (_label, failure) => {
-      const root = handedOff(failure);
-      expect(root.className).toContain("is-streaming");
-      expect(root.hasAttribute("inert")).toBe(true);
-      expect(root.getAttribute("aria-hidden")).toBe("true");
-      expect(screen.queryAllByRole("alert")).toHaveLength(0);
-    });
   });
 
   it("offers a way out on a launch that simply never advances", () => {

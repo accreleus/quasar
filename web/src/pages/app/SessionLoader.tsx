@@ -13,7 +13,7 @@ import "./SessionLoader.css";
 import { Button } from "../../components/Button";
 import { QuasarMark } from "../../components/QuasarMark";
 import { CollapsibleLogTail } from "../../components/SessionFailureDetail";
-import { outranksHandoff, type LaunchFailure } from "./sessionFailure";
+import type { LaunchFailure } from "./sessionFailure";
 import { AccretionVisual } from "./AccretionVisual";
 import { GlyphRail } from "./GlyphRail";
 import { derivePhase, stallPhaseForStep } from "./loaderPhases";
@@ -214,10 +214,6 @@ export function SessionLoader({
   const keepWaiting = useCallback(() => setWaitAgain((n) => n + 1), []);
 
   const terminal = failure != null;
-  // The handoff latches, so a verdict that lands after it began renders in a
-  // transparent, inert scene. One that outranks the handoff takes the scene
-  // back; any other must leave the stream uncovered (outranksHandoff).
-  const shownScene = outranksHandoff(failure) ? "idle" : scene;
 
   // `inert` is not in React 18's JSX attribute set; setting it on the node keeps
   // the faded-out scene out of focus order and the accessibility tree together.
@@ -225,15 +221,15 @@ export function SessionLoader({
   useEffect(() => {
     const el = rootRef.current;
     if (!el) return;
-    if (shownScene === "streaming") el.setAttribute("inert", "");
+    if (scene === "streaming") el.setAttribute("inert", "");
     else el.removeAttribute("inert");
-  }, [shownScene]);
+  }, [scene]);
 
   // Kept in DOM briefly after streaming so the fade animation can play out
   const rootClass = [
     "sl-root",
-    shownScene === "locking" ? "is-locking" : "",
-    shownScene === "streaming" ? "is-streaming" : "",
+    scene === "locking" ? "is-locking" : "",
+    scene === "streaming" ? "is-streaming" : "",
     terminal ? "is-failed" : "",
     stalled ? "is-stalled" : "",
   ]
@@ -248,7 +244,7 @@ export function SessionLoader({
       aria-live="polite"
       aria-label={terminal ? "Session could not start" : "Establishing stream connection"}
       // Hidden from AT once streaming (video takes over)
-      aria-hidden={shownScene === "streaming" ? "true" : undefined}
+      aria-hidden={scene === "streaming" ? "true" : undefined}
     >
       <header className="sl-lockup">
         <QuasarMark size={38} className="sl-mark" />

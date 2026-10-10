@@ -176,11 +176,3 @@ export function accessRevokedFailure(s: StopReasonInput): LaunchFailure | null {
     message: "This session ended because you no longer have access to the app.",
   };
 }
-
-/** Whether a verdict takes the loader back from a hand-off that already began,
- * and keeps it mounted. Only the control plane's word that the session is over
- * does. The client's own verdicts can be wrong while media still flows
- * (signalling ends independently, signaling.md) and must never cover a stream. */
-export function outranksHandoff(f: LaunchFailure | null | undefined): boolean {
-  return f?.kind === "access_revoked";
-}

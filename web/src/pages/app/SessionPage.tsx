@@ -47,12 +47,7 @@ import {
   SessionBannerHost,
 } from "./sessionAlerts";
 import { SessionLoader } from "./SessionLoader";
-import {
-  accessRevokedFailure,
-  outranksHandoff,
-  takenOverFailure,
-  unreachableFailure,
-} from "./sessionFailure";
+import { accessRevokedFailure, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
@@ -726,19 +721,22 @@ export function SessionPage() {
   const revealReady = channelOpen && appPresented;
   const [loaderDone, setLoaderDone] = useState(false);
   const loaderDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // A verdict that outranks the handoff holds the loader: SessionLoader shows
-  // it whatever the handoff reached, and removing the loader mid-reveal would
-  // take the verdict off screen with it. Any other verdict leaves the removal
-  // alone, so a stream that still works is never covered.
-  const holdLoader = outranksHandoff(launchFailure);
+  // Latched, like SessionLoader's own handoff: the gate can retract (the channel
+  // closes inside the reveal), and the loader is transparent and inert by then
+  // either way. A removal cancelled on the retract never happened again, and
+  // the revoke banner waits for `loaderDone`.
   useEffect(() => {
-    if (revealReady && !loaderDone && !holdLoader) {
+    if (revealReady && !loaderDone && loaderDoneTimerRef.current === null) {
       loaderDoneTimerRef.current = setTimeout(() => setLoaderDone(true), LOADER_UNMOUNT_MS);
     }
-    return () => {
+  }, [revealReady, loaderDone]);
+  useEffect(
+    () => () => {
       if (loaderDoneTimerRef.current) clearTimeout(loaderDoneTimerRef.current);
-    };
-  }, [revealReady, loaderDone, holdLoader]);
+      loaderDoneTimerRef.current = null;
+    },
+    [],
+  );
 
   // #434: hold a screen wake lock while the session is LIVE. Liveness is the
   // page's existing notion — the input DataChannel being open is what every
@@ -787,25 +785,20 @@ export function SessionPage() {
       : null;
 
   // #516: the control plane's reason stands in for the recovery notice the dead
-  // transport raises.
+  // transport raises. Until the loader is gone it states the verdict itself.
   const revoked = launchFailure?.kind === "access_revoked" ? launchFailure : null;
   const accessRevoked = loaderDone ? revoked : null;
-  // While the loader holds a verdict it is the only thing to read or act on.
-  // A banner or the HUD under it is covered but still announced, still takes
-  // Tab, and the HUD still answers its keys, so neither renders then.
-  const loaderHoldsVerdict = !loaderDone && holdLoader;
 
   // Whether any of the banner blocks below is on screen. The HUD takes
   // no banner-state input, so it is carried as a class on the shared ancestor
   // instead — `.session-root.banner-on` pushes a top-docked HUD down (hud.css).
   const bannerOn =
-    !loaderHoldsVerdict &&
-    (health != null ||
-      clientUnsupported ||
-      accessRevoked != null ||
-      (!revoked &&
-        recovery != null &&
-        ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase)));
+    health != null ||
+    clientUnsupported ||
+    accessRevoked != null ||
+    (!revoked &&
+      recovery != null &&
+      ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase));
 
   // Same shape, for the mic "hot" pill vs the toast host (`.session-root.mic-on`).
   const rootClassName =
@@ -981,7 +974,7 @@ export function SessionPage() {
         onToast={pushToast}
         onSwapStart={() => hudRef.current?.close()}
       >
-        {({ quickSwitch, swappingTo }) => !loaderHoldsVerdict && (
+        {({ quickSwitch, swappingTo }) => (
           <Hud
             ref={hudRef}
             register={registerTelemetry}
@@ -1056,7 +1049,7 @@ export function SessionPage() {
           reach this button (it hides on desktop during play), but where nothing
           is ever locked, taps still land here — the only route back for a
           controller-only tablet player. */}
-      {!loaderHoldsVerdict && !pointerLocked && !hudOpen && (
+      {!pointerLocked && !hudOpen && (
         <button
           type="button"
           className={`session-summon${inputCaptured ? " always" : ""}`}
