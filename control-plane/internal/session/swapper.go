@@ -61,9 +61,8 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	// check in two requests. Against the session's OWNER, with no role bypass.
 	//
 	// A plain read with no FOR SHARE and no enclosing transaction, so a revoke
-	// committing before the dispatch is not serialized against. The commit
-	// re-checks instead (stopIfSwapLeftUnentitled): a swap that loses that race
-	// completes and is then stopped.
+	// committing before the dispatch is not serialized against. A swap that
+	// loses that race completes and RunEntitlementSweep stops it.
 	entitled, err := s.store.IsEntitled(ctx, sess.UserID, app.ID)
 	if err != nil {
 		return Session{}, err

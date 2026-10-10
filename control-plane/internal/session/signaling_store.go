@@ -58,7 +58,9 @@ func (s *Store) ConsumeSignalingToken(ctx context.Context, plaintext string) (Se
 	if expired || consumed {
 		return Session{}, ErrTokenInvalid
 	}
-	if state.IsTerminal() {
+	// Stopping too: MintSignalingToken refuses it, and a token minted before the
+	// stop must not attach to a stream that is being ended.
+	if state.IsTerminal() || state == StateStopping {
 		return Session{}, ErrSessionTerminal
 	}
 	if hostID == nil {

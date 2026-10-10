@@ -79,9 +79,6 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 	// handled before the generic transition, which treats running→running as a
 	// no-op and would drop the detail change and the app_id commit.
 	if c.swapper.handleSwapCallback(ctx, m) {
-		if m.Detail == swapDetailComplete {
-			c.stopIfSwapLeftUnentitled(ctx, m.SessionID)
-		}
 		return
 	}
 

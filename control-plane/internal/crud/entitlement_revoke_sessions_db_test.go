@@ -182,9 +182,10 @@ func TestEntitlementModeStopsDerivedTileSessions(t *testing.T) {
 	}
 }
 
-// A revoke that could not stop its sessions must not read as a clean success,
-// and a long stopped list must stay inside the audit row's 4096-byte CHECK.
-func TestRevokeReportsAFailedStopAndBoundsTheAuditList(t *testing.T) {
+// A failed stop is recorded, not surfaced: a retried DELETE would be a 404 that
+// sweeps nothing, and the periodic sweep finishes the job. A long stopped list
+// must stay inside the audit row's 4096-byte CHECK.
+func TestRevokeRecordsAFailedStopAndBoundsTheAuditList(t *testing.T) {
 	pool := testDB(t)
 	stopped := make([]string, 60)
 	for i := range stopped {
@@ -199,8 +200,8 @@ func TestRevokeReportsAFailedStopAndBoundsTheAuditList(t *testing.T) {
 	row := grant(t, pool, appID, nil)
 
 	resp := deleteReq(t, srv.URL+"/v1/admin/apps/"+appID+"/entitlements/"+row, tok)
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("revoke with a failed stop: got %d, want 500", resp.StatusCode)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke with a failed stop: got %d, want 204", resp.StatusCode)
 	}
 	details, _ := auditDetails(t, pool, "app.entitlement.revoke") // fails over 4096 bytes
 	if details["sessions_stopped"] != float64(60) || details["sessions_stop_failed"] != true {

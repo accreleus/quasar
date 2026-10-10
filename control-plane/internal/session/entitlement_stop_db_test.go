@@ -36,6 +36,10 @@ func TestRevokingTheAllRowStopsOnlyTheUsersItUncovers(t *testing.T) {
 	kept := insertSessionRow(t, pool, covered, s.appID, &s.hostID, "running")
 	other := insertApp(t, pool, "other", 512, 1)
 	elsewhere := insertSessionRow(t, pool, s.userID, other, &s.hostID, "running")
+	mintedBefore, err := store.MintSignalingToken(ctx, lost)
+	if err != nil {
+		t.Fatalf("mint before the revoke: %v", err)
+	}
 
 	// Nothing removed yet: the sweep stops nobody.
 	if ids, err := coord.StopUnentitledSessions(ctx, s.appID); err != nil || len(ids) != 0 {
@@ -68,6 +72,9 @@ func TestRevokingTheAllRowStopsOnlyTheUsersItUncovers(t *testing.T) {
 	}
 	if _, err := store.MintSignalingToken(ctx, lost); !errors.Is(err, ErrSessionTerminal) {
 		t.Errorf("signaling token for the stopped session: %v, want ErrSessionTerminal", err)
+	}
+	if _, err := store.ConsumeSignalingToken(ctx, mintedBefore.Plaintext); !errors.Is(err, ErrSessionTerminal) {
+		t.Errorf("consuming a token minted before the revoke: %v, want ErrSessionTerminal", err)
 	}
 }
 
@@ -106,10 +113,10 @@ func TestRestrictingTheParentStopsADerivedTileSession(t *testing.T) {
 	}
 }
 
-// TestSwapCommittedIntoARevokedAppIsStopped — the revoke lands after Swap's
-// entitlement check and before the commit, so the sweep listed the session under
-// its old app.
-func TestSwapCommittedIntoARevokedAppIsStopped(t *testing.T) {
+// TestSweepStopsASessionSwappedIntoARevokedApp — the revoke lands after Swap's
+// entitlement check and before the commit, so the route's sweep listed the
+// session under its old app. The periodic, unfiltered sweep is what ends it.
+func TestSweepStopsASessionSwappedIntoARevokedApp(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
 	s := seed(t, pool, 4)
@@ -118,6 +125,7 @@ func TestSwapCommittedIntoARevokedAppIsStopped(t *testing.T) {
 	ctx := context.Background()
 
 	sess := runningSession(t, store, s)
+	bystander := insertSessionRow(t, pool, seedExtraUser(t, pool, 2, 1), s.appID, &s.hostID, "running")
 	target := insertApp(t, pool, "target", 512, 1)
 	if _, err := coord.Swap(ctx, sess.ID, target); err != nil {
 		t.Fatalf("swap: %v", err)
@@ -126,14 +134,77 @@ func TestSwapCommittedIntoARevokedAppIsStopped(t *testing.T) {
 
 	must(t, execEnt(ctx, pool, `DELETE FROM entitlements WHERE app_id = $1::uuid`, target))
 	if ids, err := coord.StopUnentitledSessions(ctx, target); err != nil || len(ids) != 0 {
-		t.Fatalf("sweep mid-swap: got %v, %v; the session still names its old app", ids, err)
+		t.Fatalf("route sweep mid-swap: got %v, %v; the session still names its old app", ids, err)
 	}
-
 	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: sess.ID, State: "running", Detail: "swap complete"})
-	if got := sessionState(t, store, sess.ID); got != StateStopping {
-		t.Fatalf("session swapped into a revoked app: %s, want stopping", got)
+
+	ids, err := coord.StopUnentitledSessions(ctx, "")
+	if err != nil {
+		t.Fatalf("periodic sweep: %v", err)
+	}
+	if !slices.Equal(ids, []string{sess.ID}) {
+		t.Fatalf("periodic sweep stopped %v, want only %s", ids, sess.ID)
 	}
 	if got := disp.stopReason(sess.ID); got != StopReasonEntitlementRevoked {
 		t.Errorf("session_stop reason: %q, want %q", got, StopReasonEntitlementRevoked)
+	}
+	if got := sessionState(t, store, bystander); got != StateRunning {
+		t.Errorf("an entitled session under the unfiltered sweep: %s, want running", got)
+	}
+}
+
+// TestStopIsConditionalOnTheEvaluatedApp — a session that swapped to another app
+// between the sweep's entitlement check and its stop is left alone.
+func TestStopIsConditionalOnTheEvaluatedApp(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	sid := insertSessionRow(t, pool, s.userID, s.appID, &s.hostID, "running")
+	evaluated := insertApp(t, pool, "the app it ran when checked", 512, 1)
+
+	if _, err := coord.stop(ctx, sid, evaluated, StopReasonEntitlementRevoked, false); !errors.Is(err, errAppChanged) {
+		t.Fatalf("stop against an app the session no longer runs: %v, want errAppChanged", err)
+	}
+	if got := sessionState(t, store, sid); got != StateRunning {
+		t.Errorf("session after the refused stop: %s, want running", got)
+	}
+	if got := disp.noAckTypes(); len(got) != 0 {
+		t.Errorf("a refused stop still reached the agent: %v", got)
+	}
+}
+
+// TestHeartbeatResendsAStopTheAgentNeverTook — a `stopping` row the agent still
+// lists past stopAckTimeout means the session_stop was lost; before the grace a
+// stop is assumed to be on its way and is not repeated.
+func TestHeartbeatResendsAStopTheAgentNeverTook(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	// updated_at is set on INSERT: sessions_set_updated_at only fires on UPDATE.
+	var lost string
+	must(t, pool.QueryRow(ctx, `
+		INSERT INTO sessions (user_id, app_id, host_id, state, width, height, fps, bitrate_kbps, updated_at)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, 'stopping', 1280, 720, 60, 6000, now() - interval '1 minute')
+		RETURNING id::text`, s.userID, s.appID, s.hostID).Scan(&lost))
+	fresh := insertSessionRow(t, pool, seedExtraUser(t, pool, 2, 1), s.appID, &s.hostID, "stopping")
+
+	coord.AgentHeartbeat(ctx, s.hostID, []string{lost, fresh})
+
+	if got := disp.noAckTypes(); !slices.Equal(got, []string{"stop:" + lost}) {
+		t.Fatalf("stops re-sent: %v, want only the one past the grace (%s)", got, lost)
+	}
+	if got := disp.stopReason(lost); got != "error" {
+		t.Errorf("corrective session_stop reason: %q, want error", got)
+	}
+	if got := sessionState(t, store, lost); got != StateStopping {
+		t.Errorf("row after the re-send: %s, want stopping until the agent reports", got)
 	}
 }

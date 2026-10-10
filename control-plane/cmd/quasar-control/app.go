@@ -576,6 +576,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		time.Duration(cfg.SessionGraceSecs)*time.Second)
 	log.Info("session stale-host sweep started",
 		"grace_secs", cfg.SessionGraceSecs, "booted_at", bootedAt.Format(time.RFC3339))
+	go coordinator.RunEntitlementSweep(janitorCtx)
 
 	authHandler := auth.NewHandler(authSvc, auditStore).
 		WithVersionPolicy(cfg.MinClientVersion, cfg.LatestClientVersion).

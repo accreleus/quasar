@@ -177,10 +177,12 @@ func (c *Coordinator) Launch(ctx context.Context, userID, appID string, ov Strea
 // Stop transitions to stopping and tells the agent to tear down; the agent
 // confirms via AgentState. Idempotent on a terminal session.
 func (c *Coordinator) Stop(ctx context.Context, sessionID, reason string) (Session, error) {
-	return c.stop(ctx, sessionID, reason, true)
+	return c.stop(ctx, sessionID, "", reason, true)
 }
 
-func (c *Coordinator) stop(ctx context.Context, sessionID, reason string, awaitAck bool) (Session, error) {
+// A non-empty ifAppID stops the session only while it still runs that app
+// (errAppChanged otherwise); see Store.transition.
+func (c *Coordinator) stop(ctx context.Context, sessionID, ifAppID, reason string, awaitAck bool) (Session, error) {
 	sess, err := c.store.Get(ctx, sessionID)
 	if err != nil {
 		return Session{}, err
@@ -189,7 +191,7 @@ func (c *Coordinator) stop(ctx context.Context, sessionID, reason string, awaitA
 		return sess, nil
 	}
 
-	sess, err = c.store.Transition(ctx, sessionID, StateStopping, strptr("stop requested"), nil)
+	sess, err = c.store.transition(ctx, sessionID, "", ifAppID, StateStopping, strptr("stop requested"), nil)
 	if err != nil {
 		return Session{}, err
 	}
@@ -197,7 +199,8 @@ func (c *Coordinator) stop(ctx context.Context, sessionID, reason string, awaitA
 	if sess.HostID != nil {
 		cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sessionID, Reason: reason}
 		// Best-effort: if the agent is gone the host-disconnect reaper already
-		// drove this session terminal.
+		// drove this session terminal, and a stop a connected agent never took
+		// is re-sent by AgentHeartbeat.
 		if awaitAck {
 			actx, cancel := context.WithTimeout(ctx, stopAckTimeout)
 			defer cancel()
@@ -311,9 +314,16 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 			// running, so it legitimately lists these.
 			continue
 		case hs.State == StateStopping:
-			// A stop is already on its way. Re-sending one every heartbeat until
-			// teardown finishes would log an `error` stop over a user's own.
-			continue
+			// A stop is normally already on its way, and re-sending one every
+			// heartbeat during teardown would log an `error` stop over a user's
+			// own. Past the grace either the command was lost (a full send queue, a
+			// dropped frame, a launch that overtook it) or teardown is slow, where
+			// the agent treats a repeat as a no-op.
+			if time.Since(hs.UpdatedAt) < stopAckTimeout {
+				continue
+			}
+			c.log.Warn("agent still runs a session stopped past the grace; re-sending the stop",
+				"host_id", hostID, "session_id", sid)
 		case hs.State == StateRunning:
 			// Unreachable today: the only writer of `running` is AgentState on
 			// this same serialized read loop, so a running row would have been in

@@ -637,7 +637,7 @@ func (s *Store) ListAll(ctx context.Context, cursor string, limit int32, filter 
 // failed. ErrInvalidTransition if the move is not permitted, ErrNotFound if the
 // row is gone; a same-state report is an idempotent no-op.
 func (s *Store) Transition(ctx context.Context, id string, to State, detail, errMsg *string) (Session, error) {
-	return s.transition(ctx, id, "", to, detail, errMsg)
+	return s.transition(ctx, id, "", "", to, detail, errMsg)
 }
 
 // TransitionFromHost is the authenticated agent variant. It checks the
@@ -647,7 +647,7 @@ func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to St
 	var sess Session
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		sess, err = s.transition(ctx, id, hostID, to, detail, errMsg)
+		sess, err = s.transition(ctx, id, hostID, "", to, detail, errMsg)
 		var pgErr *pgconn.PgError
 		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
 			return sess, err
@@ -656,7 +656,11 @@ func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to St
 	return sess, err
 }
 
-func (s *Store) transition(ctx context.Context, id, reportHostID string, to State, detail, errMsg *string) (Session, error) {
+var errAppChanged = errors.New("session app changed")
+
+// A non-empty ifAppID applies the transition only while the session still runs
+// that app, checked under the row lock, and is errAppChanged otherwise.
+func (s *Store) transition(ctx context.Context, id, reportHostID, ifAppID string, to State, detail, errMsg *string) (Session, error) {
 	if !isValidUUID(id) {
 		return Session{}, ErrNotFound
 	}
@@ -682,6 +686,9 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, to Stat
 	}
 	if reportHostID != "" && (assignedHost == nil || *assignedHost != reportHostID) {
 		return Session{}, ErrNotFound
+	}
+	if ifAppID != "" && sessionApp != ifAppID {
+		return Session{}, errAppChanged
 	}
 	// A restart loses swapper.pendingSwaps but not this durable guard. A stop
 	// request or any nonterminal agent detail cannot clear it: the target may
