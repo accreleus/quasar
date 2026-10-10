@@ -21,7 +21,6 @@ type swapper struct {
 
 	mu           sync.Mutex
 	pendingSwaps map[string]string
-	pendingHome  map[string]bool
 	// swapSince is when this process last began writing each session's durable
 	// `swapping` guard; see unresolved. Kept until the session ends (forget): a
 	// rejected or rolled-back swap clears its pending entry before the row leaves
@@ -31,8 +30,7 @@ type swapper struct {
 
 func newSwapper(store *Store, dispatcher Dispatcher, log *slog.Logger, resolveHome func(context.Context, LaunchApp, string, string) ([]byte, error)) *swapper {
 	return &swapper{store: store, dispatcher: dispatcher, log: log, resolveHome: resolveHome,
-		pendingSwaps: make(map[string]string), pendingHome: make(map[string]bool),
-		swapSince: make(map[string]time.Time)}
+		pendingSwaps: make(map[string]string), swapSince: make(map[string]time.Time)}
 }
 
 // noteSwapStart must run before the durable `swapping` guard is written, or a
@@ -166,7 +164,6 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	}
 	s.mu.Lock()
 	s.pendingSwaps[sessionID] = newAppID
-	s.pendingHome[sessionID] = app.ManagedHome
 	s.mu.Unlock()
 
 	go s.dispatchSwap(*sess.HostID, sessionID, dispatchSpec, app.ManagedHome,
@@ -255,7 +252,6 @@ func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, man
 func (s *swapper) forget(sessionID string) {
 	s.mu.Lock()
 	delete(s.pendingSwaps, sessionID)
-	delete(s.pendingHome, sessionID)
 	delete(s.swapSince, sessionID)
 	s.mu.Unlock()
 }
@@ -263,7 +259,6 @@ func (s *swapper) forget(sessionID string) {
 func (s *swapper) clearPendingSwap(sessionID string) {
 	s.mu.Lock()
 	delete(s.pendingSwaps, sessionID)
-	delete(s.pendingHome, sessionID)
 	s.mu.Unlock()
 }
 
@@ -275,7 +270,6 @@ func (s *swapper) clearPendingSwap(sessionID string) {
 func (s *swapper) handleSwapCallback(ctx context.Context, m agentws.SessionStateMsg) bool {
 	s.mu.Lock()
 	newAppID, pending := s.pendingSwaps[m.SessionID]
-	managedHome := s.pendingHome[m.SessionID]
 	s.mu.Unlock()
 	if !pending {
 		return false
@@ -305,10 +299,11 @@ func (s *swapper) handleSwapCallback(ctx context.Context, m agentws.SessionState
 			s.log.Info("swap committed", "session_id", m.SessionID, "app_id", newAppID)
 		}
 	default:
-		// Any other running detail while pending: record it, never touch app_id.
-		if !managedHome {
-			_ = s.store.SetStateDetail(ctx, m.SessionID, m.Detail)
-		}
+		// Any other running detail while pending (app booting, app presented) is
+		// consumed and not recorded. The durable `swapping` marker must outlive it
+		// and clear only on a commit or a rollback: while it is set app_id names
+		// the old app, and the entitlement sweep, the home GC and Store.transition
+		// all read it to know that.
 	}
 	return true
 }

@@ -50,8 +50,9 @@ func (c *Coordinator) RunEntitlementSweep(ctx context.Context) {
 //
 // A launch racing an entitlement write holds FOR SHARE on the rows
 // (scheduleAttempt), so its session exists by the time a sweep after the write
-// lists. The stop applies only while the session still runs the app that was
-// checked: one that swapped away in between is left for the next tick.
+// lists. Each stop applies only while the row is still what was checked (the
+// same app, or still swapping): one that moved in between is left for the next
+// tick.
 //
 // Each returned session is `stopping` on return. The agent's ack is not awaited,
 // so an admin's request never waits stopAckTimeout per session. One whose
@@ -74,7 +75,7 @@ func (c *Coordinator) StopUnentitledSessions(ctx context.Context, appID string) 
 		if s.swapping && c.swapper.unresolved(s.id) {
 			c.log.Warn("stopping a session whose swap never resolved; the app it runs is unknown",
 				"session_id", s.id, "app_id", s.appID)
-			if _, err := c.stop(ctx, s.id, "", "error", false); err != nil {
+			if _, err := c.stop(ctx, s.id, stillSwapping, "error", false); err != nil && !errors.Is(err, errSessionMoved) {
 				errs = errors.Join(errs, fmt.Errorf("stop session %s: %w", s.id, err))
 			}
 			continue
@@ -87,8 +88,8 @@ func (c *Coordinator) StopUnentitledSessions(ctx context.Context, appID string) 
 		if entitled {
 			continue
 		}
-		sess, err := c.stop(ctx, s.id, s.appID, StopReasonEntitlementRevoked, false)
-		if errors.Is(err, errAppChanged) {
+		sess, err := c.stop(ctx, s.id, stillRuns(s.appID), StopReasonEntitlementRevoked, false)
+		if errors.Is(err, errSessionMoved) {
 			continue
 		}
 		if err != nil {
@@ -104,6 +105,14 @@ func (c *Coordinator) StopUnentitledSessions(ctx context.Context, appID string) 
 		stopped = append(stopped, s.id)
 	}
 	return stopped, errs
+}
+
+func stillRuns(appID string) rowGuard {
+	return func(app string, _ *string) bool { return app == appID }
+}
+
+func stillSwapping(_ string, detail *string) bool {
+	return detail != nil && *detail == swapDetailInProgress
 }
 
 type liveSession struct {

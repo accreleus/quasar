@@ -208,17 +208,17 @@ func (c *Coordinator) Launch(ctx context.Context, userID, appID string, ov Strea
 // Stop transitions to stopping and tells the agent to tear down; the agent
 // confirms via AgentState. Idempotent on a terminal session.
 func (c *Coordinator) Stop(ctx context.Context, sessionID, reason string) (Session, error) {
-	return c.stop(ctx, sessionID, "", reason, true)
+	return c.stop(ctx, sessionID, nil, reason, true)
 }
 
 // errStopNotDelivered: the row is `stopping` but the non-awaited session_stop
 // did not reach the agent's queue. AgentHeartbeat re-sends it.
 var errStopNotDelivered = errors.New("session_stop not delivered")
 
-// A non-empty ifAppID stops the session only while it still runs that app
-// (errAppChanged otherwise); see Store.transition. With awaitAck false a failed
+// A non-nil only stops the session while that still holds for its row
+// (errSessionMoved otherwise); see Store.transition. With awaitAck false a failed
 // dispatch returns the committed session together with errStopNotDelivered.
-func (c *Coordinator) stop(ctx context.Context, sessionID, ifAppID, reason string, awaitAck bool) (Session, error) {
+func (c *Coordinator) stop(ctx context.Context, sessionID string, only rowGuard, reason string, awaitAck bool) (Session, error) {
 	sess, err := c.store.Get(ctx, sessionID)
 	if err != nil {
 		return Session{}, err
@@ -227,7 +227,7 @@ func (c *Coordinator) stop(ctx context.Context, sessionID, ifAppID, reason strin
 		return sess, nil
 	}
 
-	sess, err = c.store.transition(ctx, sessionID, "", ifAppID, StateStopping, strptr("stop requested"), nil)
+	sess, err = c.store.transition(ctx, sessionID, "", only, StateStopping, strptr("stop requested"), nil)
 	if err != nil {
 		return Session{}, err
 	}

@@ -151,7 +151,7 @@ func checkConsoleTopology(videoTopology string) error {
 // that ack, so the wait could only time out (#477); the agent's terminal
 // session_state confirms the stop. Satisfies agentws.Events.
 func (c *Coordinator) StopConsoleSession(ctx context.Context, sessionID, reason string) error {
-	_, err := c.stop(ctx, sessionID, "", reason, false)
+	_, err := c.stop(ctx, sessionID, nil, reason, false)
 	return err
 }
 

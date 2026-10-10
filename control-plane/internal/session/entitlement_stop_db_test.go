@@ -155,7 +155,8 @@ func TestSweepStopsASessionSwappedIntoARevokedApp(t *testing.T) {
 }
 
 // TestStopIsConditionalOnTheEvaluatedApp — a session that swapped to another app
-// between the sweep's entitlement check and its stop is left alone.
+// between the sweep's entitlement check and its stop is left alone, and so is
+// one whose swap resolved between the sweep's list and its stop.
 func TestStopIsConditionalOnTheEvaluatedApp(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
@@ -167,8 +168,13 @@ func TestStopIsConditionalOnTheEvaluatedApp(t *testing.T) {
 	sid := insertSessionRow(t, pool, s.userID, s.appID, &s.hostID, "running")
 	evaluated := insertApp(t, pool, "the app it ran when checked", 512, 1)
 
-	if _, err := coord.stop(ctx, sid, evaluated, StopReasonEntitlementRevoked, false); !errors.Is(err, errAppChanged) {
-		t.Fatalf("stop against an app the session no longer runs: %v, want errAppChanged", err)
+	if _, err := coord.stop(ctx, sid, stillRuns(evaluated), StopReasonEntitlementRevoked, false); !errors.Is(err, errSessionMoved) {
+		t.Fatalf("stop against an app the session no longer runs: %v, want errSessionMoved", err)
+	}
+	// Listed as swapping, then the commit landed: the row reads "swap complete".
+	must(t, store.CommitSwappedApp(ctx, sid, evaluated, swapDetailComplete))
+	if _, err := coord.stop(ctx, sid, stillSwapping, "error", false); !errors.Is(err, errSessionMoved) {
+		t.Fatalf("unresolved-swap stop on a swap that resolved: %v, want errSessionMoved", err)
 	}
 	if got := sessionState(t, store, sid); got != StateRunning {
 		t.Errorf("session after the refused stop: %s, want running", got)
@@ -192,7 +198,7 @@ func TestHeartbeatResendsAStopTheAgentNeverTook(t *testing.T) {
 	ctx := context.Background()
 
 	sid := insertSessionRow(t, pool, s.userID, s.appID, &s.hostID, "running")
-	if _, err := coord.stop(ctx, sid, "", "user_requested", false); err != nil {
+	if _, err := coord.stop(ctx, sid, nil, "user_requested", false); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
 	stops := func() int {
@@ -229,7 +235,7 @@ func TestHeartbeatResendsAStopTheAgentNeverTook(t *testing.T) {
 		t.Errorf("corrective session_stop reason: %q, want error", got)
 	}
 	// A repeated stop must not restart the grace.
-	if _, err := coord.stop(ctx, sid, "", "user_requested", false); err != nil {
+	if _, err := coord.stop(ctx, sid, nil, "user_requested", false); err != nil {
 		t.Fatalf("second stop: %v", err)
 	}
 	if coord.stopInGrace(sid) {
@@ -257,7 +263,7 @@ func TestHeartbeatStopsAPreRunningSessionTheAgentNeverLists(t *testing.T) {
 	ctx := context.Background()
 
 	sid := insertSessionRow(t, pool, s.userID, s.appID, &s.hostID, "assigned")
-	if _, err := coord.stop(ctx, sid, "", StopReasonEntitlementRevoked, false); err != nil {
+	if _, err := coord.stop(ctx, sid, nil, StopReasonEntitlementRevoked, false); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
 	stops := func() int {
@@ -331,6 +337,73 @@ func TestSweepStopsASessionWhoseSwapNeverResolved(t *testing.T) {
 	}
 }
 
+// TestSwapMarkerSurvivesProgressCallbacks — the agent reports "app booting" and
+// "app presented" before "swap complete". Those must not replace the durable
+// `swapping` marker: it is the only thing telling the sweep that app_id is not
+// what the agent runs, when the commit then fails or a restart loses the swap.
+func TestSwapMarkerSurvivesProgressCallbacks(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	other := s
+	other.userID = seedExtraUser(t, pool, 2, 1)
+	commitFails := runningSession(t, store, s)
+	restarted := runningSession(t, store, other)
+	target := insertApp(t, pool, "target", 512, 1) // unmanaged
+	for _, sess := range []Session{commitFails, restarted} {
+		if _, err := coord.Swap(ctx, sess.ID, target); err != nil {
+			t.Fatalf("swap: %v", err)
+		}
+		for _, detail := range []string{appDetailBooting, appDetailPresented} {
+			coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: sess.ID, State: "running", Detail: detail})
+		}
+		got, err := store.Get(ctx, sess.ID)
+		must(t, err)
+		if got.StateDetail == nil || *got.StateDetail != swapDetailInProgress {
+			t.Fatalf("state_detail after the progress callbacks: %v, want the %q marker", got.StateDetail, swapDetailInProgress)
+		}
+	}
+
+	// The commit fails (a target that is no app violates the foreign key).
+	coord.swapper.mu.Lock()
+	coord.swapper.pendingSwaps[commitFails.ID] = "00000000-0000-4000-8000-000000000000"
+	coord.swapper.mu.Unlock()
+	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: commitFails.ID, State: "running", Detail: swapDetailComplete})
+	got, err := store.Get(ctx, commitFails.ID)
+	must(t, err)
+	if got.AppID != s.appID || got.StateDetail == nil || *got.StateDetail != swapDetailInProgress {
+		t.Fatalf("after a failed commit: app_id=%s detail=%v, want the old app still marked swapping", got.AppID, got.StateDetail)
+	}
+	coord.swapper.mu.Lock()
+	coord.swapper.swapSince[commitFails.ID] = time.Now().Add(-2 * swapUnresolvedAfter)
+	coord.swapper.mu.Unlock()
+	if _, err := coord.StopUnentitledSessions(ctx, ""); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if got := sessionState(t, store, commitFails.ID); got != StateStopping {
+		t.Errorf("session whose swap commit failed: %s, want stopping", got)
+	}
+	if got := sessionState(t, store, restarted.ID); got != StateRunning {
+		t.Fatalf("session with a swap still in flight: %s, want running", got)
+	}
+
+	// A restart: the row survives, the swap on record does not.
+	fresh := newTestCoordinator(t, store, disp, testLogger())
+	if _, err := fresh.StopUnentitledSessions(ctx, ""); err != nil {
+		t.Fatalf("sweep after the restart: %v", err)
+	}
+	if got := sessionState(t, store, restarted.ID); got != StateStopping {
+		t.Errorf("session whose swap was in flight across a restart: %s, want stopping", got)
+	}
+	if got := disp.stopReason(restarted.ID); got != "error" {
+		t.Errorf("session_stop reason: %q, want error", got)
+	}
+}
+
 // TestTokenConsumeWaitsForAStopInFlight — the consume locks the session row, so
 // it cannot read `running`, lose the race to a stop, and still attach.
 func TestTokenConsumeWaitsForAStopInFlight(t *testing.T) {
@@ -364,6 +437,11 @@ func TestTokenConsumeWaitsForAStopInFlight(t *testing.T) {
 	case err := <-consumed:
 		t.Fatalf("consume did not wait for the session row (returned %v)", err)
 	case <-time.After(300 * time.Millisecond):
+	}
+	// Session row, then its token rows: the order app and host deletion lock in.
+	// A consume holding the token while it waits on the session deadlocks here.
+	if _, err := stop.Exec(ctx, `SELECT 1 FROM session_tokens WHERE session_id = $1::uuid FOR UPDATE`, sid); err != nil {
+		t.Fatalf("locking the token rows behind the session row: %v", err)
 	}
 	must(t, stop.Commit(ctx))
 	if err := <-consumed; !errors.Is(err, ErrSessionTerminal) {
