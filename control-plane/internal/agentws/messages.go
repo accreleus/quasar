@@ -115,6 +115,13 @@ type ConfigPolicyStateMsg struct {
 	} `json:"evidence"`
 }
 
+// grantIdentity drops what policyGrantMatches never reads, so an outstanding
+// attempt retains none of a report's agent-sized error, scope or evidence.
+func (m ConfigPolicyStateMsg) grantIdentity() ConfigPolicyStateMsg {
+	m.Error, m.ActiveScope, m.Evidence = nil, nil, nil
+	return m
+}
+
 type ConfigPolicyInventoryRequest struct {
 	Type                  string  `json:"type"`
 	InventoryID           string  `json:"inventory_id"`

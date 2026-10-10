@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -361,4 +362,57 @@ func keys(m map[string]map[string]any) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// A live report replaces an outstanding attempt's cached state. It must not
+// retain the report's error, scope or evidence, which only the 1 MiB frame bounds.
+func TestLivePolicyReportDoesNotGrowRetainedState(t *testing.T) {
+	pool := testPool(t)
+	store := hostcfg.NewStore(pool)
+	ctx := context.Background()
+	boot, err := store.StartRH05Boot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, store, nil, boot)
+	t.Cleanup(h.Close)
+	agent, _ := connectTypedAgent(t, pool, h, []string{"idle_timeout_secs"}, nil)
+	if _, err := store.SavePolicy(ctx, agent.hostID, "0", map[string]hostcfg.PolicyChoice{
+		"idle_timeout_secs": {Source: "explicit", Value: float64(900)},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	offer := agent.collectOffers(t, pool, 1)["idle_timeout_secs"]
+	attemptID := offer["attempt_id"].(string)
+	big := strings.Repeat("e", 64<<10)
+	for sequence, phase := range []string{"accepted", "verifying"} {
+		agent.send(t, map[string]any{
+			"type": "config_policy_state", "attempt_id": attemptID, "host_id": agent.hostID,
+			"group": "idle_timeout_secs", "revision": offer["revision"], "content_sha256": offer["content_sha256"], "scope": "next_session",
+			"grant_boot_incarnation": offer["boot_incarnation"], "grant_connection_incarnation": offer["connection_incarnation"],
+			"journal_sequence": strconv.Itoa(sequence + 1), "phase": phase, "active_scope": big,
+			"error":    map[string]string{"code": "x", "detail": big},
+			"evidence": map[string]any{"resolved_settings": map[string]string{"padding": big}},
+		})
+	}
+	c, ok := h.registry.get(agent.hostID)
+	if !ok {
+		t.Fatal("connection gone")
+	}
+	// The read loop is done once the disconnect is recorded, so c is quiescent.
+	_ = agent.ws.Close()
+	waitUntil(t, "disconnect", func() bool {
+		var gone bool
+		err := pool.QueryRow(ctx, `SELECT agent_disconnected_at IS NOT NULL FROM hosts WHERE id=$1::uuid`, agent.hostID).Scan(&gone)
+		return err == nil && gone
+	})
+	if c.policySequence[attemptID] != 2 {
+		t.Fatalf("live reports not accepted: sequence=%d", c.policySequence[attemptID])
+	}
+	if _, outstanding := c.policyOutstanding[attemptID]; !outstanding {
+		t.Fatal("unfinished attempt not outstanding")
+	}
+	if n := retainedPolicyBytes(t, c, attemptID); n > 1024 {
+		t.Fatalf("two ~190 KiB live reports retain %d bytes", n)
+	}
 }

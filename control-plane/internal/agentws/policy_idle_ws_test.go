@@ -146,7 +146,7 @@ func TestFabricatedRestartAttemptsAreNotCached(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	attemptID := "00000000-0000-4000-8000-000000000501"
+	attemptID := "0000abcd-0000-4000-8000-000000000501"
 	grantConnection := "00000000-0000-4000-8000-000000000502"
 	digest := strings.Repeat("a", 64)
 	if _, err := pool.Exec(ctx, `INSERT INTO host_config_approvals(id,host_id,group_key,revision,approved_digest,prerequisites_digest,boot_incarnation,review_id,expires_at,state)
@@ -174,6 +174,13 @@ func TestFabricatedRestartAttemptsAreNotCached(t *testing.T) {
 	// The real attempt under a grant connection it was never offered on.
 	if err := ws.WriteJSON(report(attemptID, "00000000-0000-4000-8000-000000000504")); err != nil {
 		t.Fatal(err)
+	}
+	// Other spellings of the real id: a ::uuid cast resolves each to its row,
+	// and each would be its own cache key.
+	for _, alias := range []string{strings.ToUpper(attemptID), "{" + attemptID + "}", strings.ReplaceAll(attemptID, "-", "")} {
+		if err := ws.WriteJSON(report(alias, grantConnection)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := ws.WriteJSON(report(attemptID, grantConnection)); err != nil {
 		t.Fatal(err)

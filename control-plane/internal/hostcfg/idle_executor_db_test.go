@@ -3,6 +3,7 @@ package hostcfg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -473,6 +474,18 @@ func TestIdleExecutorJournalAdvancesOnlyOneOwnedAttempt(t *testing.T) {
 	}
 	state := IdleJournalState{AttemptID: offer.AttemptID, Group: "hardware", Revision: offer.Revision,
 		Digest: offer.ContentSHA256, GrantBoot: boot, GrantConnection: connection, Phase: "accepted", Sequence: "1"}
+	// The id matches only as issued; a ::uuid cast would also accept this spelling.
+	alias := state
+	alias.AttemptID = "{" + offer.AttemptID + "}"
+	if matches, err := store.IdleAttemptMatches(ctx, hostID, state); err != nil || !matches {
+		t.Fatalf("issued attempt id: matches=%v err=%v", matches, err)
+	}
+	if matches, err := store.IdleAttemptMatches(ctx, hostID, alias); err != nil || matches {
+		t.Fatalf("aliased attempt id: matches=%v err=%v", matches, err)
+	}
+	if _, err := store.ObserveIdleState(ctx, hostID, connection, alias); !errors.Is(err, ErrIdleAttemptNotFound) {
+		t.Fatalf("aliased attempt id observed: %v", err)
+	}
 	busy := state
 	busy.Phase = "failed"
 	busy.Sequence = "0"

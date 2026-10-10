@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -301,6 +303,13 @@ func newPolicyUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// canonicalPolicyUUID reports whether id is spelled exactly as newPolicyUUID and
+// Postgres' uuid::text spell one; a ::uuid cast accepts many other spellings.
+func canonicalPolicyUUID(id string) bool {
+	raw, err := hex.DecodeString(strings.ReplaceAll(id, "-", ""))
+	return err == nil && len(raw) == 16 && id == fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
+}
+
 func (h *Handler) offerNextSessionPolicy(ctx context.Context, c *conn) {
 	if !c.policyTyped || !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || len(c.policyOutstanding) != 0 || c.policyDeliveryID == "" || h.cfgStore == nil {
 		return
@@ -417,7 +426,8 @@ func policyEvidenceMatches(expected, evidence map[string]any) bool {
 }
 
 // Journal sequence survives terminal handling on a connection so delayed
-// accepted/retry frames cannot reopen an already completed attempt.
+// accepted/retry frames cannot reopen an already completed attempt. Only a
+// digest of the report is kept: its error and evidence are agent-sized.
 func (c *conn) acceptPolicySequence(state ConfigPolicyStateMsg) (bool, error) {
 	sequence, err := strconv.ParseUint(state.JournalSequence, 10, 64)
 	if err != nil || strconv.FormatUint(sequence, 10) != state.JournalSequence {
@@ -429,16 +439,17 @@ func (c *conn) acceptPolicySequence(state ConfigPolicyStateMsg) (bool, error) {
 		// accepts, so the per-attempt sequence cache must not consume it.
 		return true, nil
 	}
-	content, err := json.Marshal(state)
+	raw, err := json.Marshal(state)
 	if err != nil {
 		return false, err
 	}
+	content := sha256.Sum256(raw)
 	if previous, ok := c.policySequence[state.AttemptID]; ok {
 		if sequence < previous {
 			return false, nil
 		}
 		if sequence == previous {
-			if !bytes.Equal(c.policySequenceContent[state.AttemptID], content) {
+			if c.policySequenceContent[state.AttemptID] != content {
 				return false, errors.New("conflicting policy journal sequence")
 			}
 			return false, nil
@@ -446,7 +457,7 @@ func (c *conn) acceptPolicySequence(state ConfigPolicyStateMsg) (bool, error) {
 	}
 	if c.policySequence == nil {
 		c.policySequence = map[string]uint64{}
-		c.policySequenceContent = map[string][]byte{}
+		c.policySequenceContent = map[string][sha256.Size]byte{}
 	}
 	c.policySequence[state.AttemptID] = sequence
 	c.policySequenceContent[state.AttemptID] = content
@@ -523,6 +534,10 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 		return err
 	}
 	for _, entry := range page.Entries {
+		// The id keys the caches and reaches both ::uuid casts and text keys in the store.
+		if !canonicalPolicyUUID(entry.AttemptID) {
+			return errors.New("invalid policy inventory attempt id")
+		}
 		fresh, err := c.acceptPolicySequence(entry)
 		if err != nil {
 			return err
@@ -583,7 +598,7 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 			if c.policyOutstanding == nil {
 				c.policyOutstanding = map[string]ConfigPolicyStateMsg{}
 			}
-			c.policyOutstanding[entry.AttemptID] = entry
+			c.policyOutstanding[entry.AttemptID] = entry.grantIdentity()
 			c.policyAttemptOutstanding.Store(true)
 			if !policyEntryMatchesDesired(view.Groups[entry.Group], entry) {
 				c.policyInventoryBlocked.Store(true)
@@ -627,6 +642,7 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 
 // The agent never prunes accepted records (agent-api.md), so lifetime history, not
 // groups × retry budget, sizes a real journal; 64 full pages is far past any real host.
+// A page is one agentReadLimit frame, so an inventory pins at most 64 MiB of agent bytes.
 const maxPolicyInventoryEntries = 64 * 256
 
 func sameCursor(a, b *string) bool {
@@ -1241,7 +1257,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				if ac.policyOutstanding == nil {
 					ac.policyOutstanding = map[string]ConfigPolicyStateMsg{}
 				}
-				ac.policyOutstanding[state.AttemptID] = state
+				ac.policyOutstanding[state.AttemptID] = state.grantIdentity()
 				ac.policyAttemptOutstanding.Store(true)
 				if !matching {
 					ac.policyInventoryBlocked.Store(true)
