@@ -64,7 +64,7 @@ own; the two do not move together, and that is deliberate.
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
 
 ### Fixed
-- **An unreadable or missing Steam library no longer empties the library (#512).** A permission or I/O error reading a Steam library directory or its manifests now fails the library scan, and the control plane keeps a user's observations and provider entitlements when a scan reports no games at all while it already holds some, instead of revoking games that are still installed. Removing a game is still picked up; the last game of a library is only dropped once a scan sees another.
+- **An unreadable or missing Steam library no longer empties the library (#512).** A permission or I/O error reading a Steam library the scan was asked to read (the library directory, a folder on the way to it, or a manifest) now fails the scan, and the control plane keeps a user's observations and provider entitlements when a scan reports no games at all while it already holds some, instead of revoking games that are still installed. Removing a game is still picked up; the last game of a library is only dropped once a scan sees another. A library found only by the agent's folder search under the home, and unreadable, is still skipped.
 - **A hand-installed Fedora stack's Steam sessions were silent (#478).** `prepare-host.sh`
   loads the `quasar-nested-audio` SELinux module on every SELinux host (#476), but the
   quick start's manual host steps never emitted it (only the NVIDIA device rule), and a

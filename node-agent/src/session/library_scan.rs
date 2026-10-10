@@ -289,10 +289,14 @@ fn probe_dir(path: &Path) -> DirProbe {
 /// before recursing, same discipline as `find_steamapps_dirs`. Also refuses an
 /// absolute `rel` (which `PathBuf::join` would let replace `root` wholesale)
 /// and any `..` component.
-fn resolve_relative_root(root: &Path, rel: &str) -> Option<PathBuf> {
+///
+/// `Ok(None)` is a refused or absent root (skipped). A metadata error other than
+/// `NotFound` is `Err`: an unreadable ancestor must fail the scan, not make the
+/// library vanish from a report that still lists another one.
+fn resolve_relative_root(root: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
     let relp = Path::new(rel);
     if relp.is_absolute() || has_traversal(relp) {
-        return None;
+        return Ok(None);
     }
 
     let mut current = root.to_path_buf();
@@ -300,15 +304,16 @@ fn resolve_relative_root(root: &Path, rel: &str) -> Option<PathBuf> {
         let std::path::Component::Normal(name) = component else {
             // `has_traversal` already rejected `..`; refuse any other
             // component defensively rather than guess what it means.
-            return None;
+            return Ok(None);
         };
         // Refuse if `current` (about to be descended into) is itself a
         // symlink, missing, or not a directory — the check a single
         // `symlink_metadata` on the fully-joined path can never give.
         match std::fs::symlink_metadata(&current) {
-            Ok(m) if m.file_type().is_symlink() || !m.is_dir() => return None,
+            Ok(m) if m.file_type().is_symlink() || !m.is_dir() => return Ok(None),
             Ok(_) => {}
-            Err(_) => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(read_failure(&current, &e)),
         }
         current = current.join(name);
     }
@@ -316,9 +321,10 @@ fn resolve_relative_root(root: &Path, rel: &str) -> Option<PathBuf> {
     // The loop validated every directory BEFORE descending; the fully-joined
     // `current` (the target directory itself) still needs the same check.
     match std::fs::symlink_metadata(&current) {
-        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => None,
-        Ok(_) => Some(current),
-        Err(_) => None,
+        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => Ok(None),
+        Ok(_) => Ok(Some(current)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(read_failure(&current, &e)),
     }
 }
 
@@ -340,7 +346,7 @@ fn walk_and_parse(
     for rel in relative_roots {
         // See resolve_relative_root's doc for why a naive root.join(rel) +
         // one symlink_metadata call would not be sufficient.
-        if let Some(joined) = resolve_relative_root(root_path, rel) {
+        if let Some(joined) = resolve_relative_root(root_path, rel)? {
             if seen_dirs.insert(joined.clone()) {
                 dirs.push(joined);
             }
@@ -978,13 +984,16 @@ mod tests {
     fn resolve_relative_root_refuses_absolute_relative_root() {
         assert_eq!(
             resolve_relative_root(Path::new("/root"), "/etc/passwd"),
-            None
+            Ok(None)
         );
     }
 
     #[test]
     fn resolve_relative_root_refuses_traversal() {
-        assert_eq!(resolve_relative_root(Path::new("/root"), "../../etc"), None);
+        assert_eq!(
+            resolve_relative_root(Path::new("/root"), "../../etc"),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -994,7 +1003,7 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         assert_eq!(
             resolve_relative_root(dir.path(), ".local/share/Steam/steamapps"),
-            Some(target)
+            Ok(Some(target))
         );
     }
 
@@ -1003,7 +1012,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             resolve_relative_root(dir.path(), ".local/share/Steam/steamapps"),
-            None
+            Ok(None)
         );
     }
 
@@ -1053,7 +1062,7 @@ mod tests {
         // The resolver must refuse outright...
         assert_eq!(
             resolve_relative_root(&root, ".local/share/Steam/steamapps"),
-            None,
+            Ok(None),
             "a symlinked intermediate component must not be walked through"
         );
 
@@ -1253,5 +1262,37 @@ mod tests {
 
         let err = walk_and_parse(dir.path(), &[], 512, 1_048_576).unwrap_err();
         assert!(err.contains("appmanifest_888888.acf"), "{err}");
+    }
+
+    #[test]
+    fn unreadable_ancestor_of_a_requested_root_fails_the_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let share = dir.path().join(".local/share");
+        fs::create_dir_all(share.join("Steam/steamapps")).unwrap();
+        let readable = dir.path().join("games/steamapps");
+        fs::create_dir_all(&readable).unwrap();
+        write(
+            &readable.join("appmanifest_999999.acf"),
+            &synth_manifest("999999"),
+        );
+        fs::set_permissions(&share, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = walk_and_parse(
+            dir.path(),
+            &[
+                ".local/share/Steam/steamapps".to_string(),
+                "games/steamapps".to_string(),
+            ],
+            512,
+            1_048_576,
+        );
+        fs::set_permissions(&share, fs::Permissions::from_mode(0o755)).unwrap();
+        let err =
+            result.expect_err("a library hidden by an unreadable ancestor must fail the scan");
+        assert!(err.contains("PermissionDenied"), "{err}");
     }
 }
