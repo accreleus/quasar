@@ -1074,7 +1074,7 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     expect(document.querySelector(".sl-root")).toBeNull();
   });
 
-  it("leaves the reveal alone for a takeover: signalling closed, the picture may still be live", async () => {
+  it("states a takeover with the banner once the loader is gone, never with nothing (#527)", async () => {
     await intoTheReveal(300);
     await act(async () => {
       lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" });
@@ -1082,7 +1082,7 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     });
     await settleTheReveal();
     expect(document.querySelector(".sl-root")).toBeNull();
-    expect(alerts()).toHaveLength(0);
+    expect(alerts()).toEqual([expect.stringContaining("This session moved to another tab")]);
   });
 });
 

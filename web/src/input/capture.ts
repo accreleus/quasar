@@ -198,7 +198,7 @@ const LONG_PRESS_MS = 500;
  *  dx/dy are high-resolution wheel units). */
 const TOUCH_SCROLL_SCALE = 1;
 
-/** Newest live capture per video element: a stale Pointer Lock grant defers to it. */
+/** Newest live capture per video element: a stale grant or cleanup() leaves its lock alone. */
 const liveCapture = new WeakMap<object, object>();
 
 /**
@@ -913,7 +913,7 @@ export function setupCapture({
       keyboardLocked = false;
       keyboardLockApi()?.unlock();
     }
-    if (document.pointerLockElement === videoEl && document.exitPointerLock) {
+    if (document.pointerLockElement === videoEl && !liveCapture.has(videoEl) && document.exitPointerLock) {
       document.exitPointerLock();
     }
   };

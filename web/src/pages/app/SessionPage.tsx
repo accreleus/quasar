@@ -409,7 +409,9 @@ export function SessionPage() {
         // #526: another attach won this session. Terminal HERE only — the
         // session and the app are still running, in the tab that took it. The
         // page states it and stops; it must not re-mint (sessionRuntime L6).
-        onSessionTakenOver: () => setLaunchFailure((prev) => prev ?? takenOverFailure()),
+        // Replaces our own guess ("unreachable"), never a server-authored verdict.
+        onSessionTakenOver: () =>
+          setLaunchFailure((prev) => (prev && prev.kind !== "unreachable" ? prev : takenOverFailure())),
       },
     });
     runtimeRef.current = rt;
@@ -819,9 +821,13 @@ export function SessionPage() {
       : null;
 
   // #516: the control plane's reason stands in for the recovery notice the dead
-  // transport raises. Until the loader is gone it states the verdict itself.
-  const revoked = launchFailure?.kind === "access_revoked" ? launchFailure : null;
-  const accessRevoked = loaderDone ? revoked : null;
+  // transport raises; #527: so does a takeover. Until the loader is gone it
+  // states the verdict itself.
+  const bannerVerdict =
+    launchFailure?.kind === "access_revoked" || launchFailure?.kind === "taken_over"
+      ? launchFailure
+      : null;
+  const verdictBanner = loaderDone ? bannerVerdict : null;
 
   // Whether any of the banner blocks below is on screen. The HUD takes
   // no banner-state input, so it is carried as a class on the shared ancestor
@@ -829,8 +835,8 @@ export function SessionPage() {
   const bannerOn =
     health != null ||
     clientUnsupported ||
-    accessRevoked != null ||
-    (!revoked &&
+    verdictBanner != null ||
+    (!bannerVerdict &&
       recovery != null &&
       ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase));
 
@@ -915,10 +921,10 @@ export function SessionPage() {
             />
           )}
 
-          {accessRevoked && (
+          {verdictBanner && (
             <SessionBanner
-              title={accessRevoked.title}
-              message={accessRevoked.message}
+              title={verdictBanner.title}
+              message={verdictBanner.message}
               actions={
                 <Button variant="primary" onClick={() => navigate("/app")}>
                   Back to library
@@ -927,7 +933,7 @@ export function SessionPage() {
             />
           )}
 
-          {!revoked &&
+          {!bannerVerdict &&
             recovery &&
             ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase) && (
               <SessionBanner
