@@ -673,6 +673,12 @@ func (h *Handler) restartPolicyInventory(ctx context.Context, c *conn) error {
 			return nil
 		}
 	}
+	return h.requestPolicyInventory(ctx, c)
+}
+
+// requestPolicyInventory drops what the connection learned from its last
+// inventory and asks the agent for a fresh complete one.
+func (h *Handler) requestPolicyInventory(ctx context.Context, c *conn) error {
 	deliveryGate, err := h.cfgStore.PolicyDeliveryGate(ctx, c.hostID, c.connectionIncarnation)
 	if err != nil {
 		return err
@@ -698,6 +704,18 @@ func (h *Handler) restartPolicyInventory(ctx context.Context, c *conn) error {
 	c.policyAttemptOutstanding.Store(false)
 	c.policyActiveSnapshots.Store(nil)
 	return h.registry.Send(c.hostID, ConfigPolicyInventoryRequest{Type: "config_policy_journal_inventory_request", InventoryID: c.policyInventoryID, BootIncarnation: c.bootIncarnation, ConnectionIncarnation: c.connectionIncarnation})
+}
+
+// adoptOrphanedJournal reconciles on this live socket a journal that no
+// connection owns: only another process's boot leaves that under the registry's
+// current connection, and the agent has no reason to reconnect (#515).
+func (h *Handler) adoptOrphanedJournal(ctx context.Context, c *conn) error {
+	adopted, err := h.cfgStore.AdoptOrphanedJournal(ctx, c.hostID, c.connectionIncarnation)
+	if err != nil || !adopted {
+		return err
+	}
+	h.log.Warn("RH05 journal had no owning connection; reconciling on the live one", "host_id", c.hostID)
+	return h.requestPolicyInventory(ctx, c)
 }
 
 func (h *Handler) maybeRunDeferredPolicyRefresh(ctx context.Context, c *conn) error {
@@ -1017,8 +1035,13 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 					var idleErr error
 					current := h.registry.withCurrent(ac, func() {
 						idleCtx, idleCancel := context.WithTimeout(bg, agentDBCallTimeout)
+						defer idleCancel()
 						idleErr = h.cfgStore.ObserveIdleHeartbeat(idleCtx, hostID, ac.connectionIncarnation, hb.RunningSessions)
-						idleCancel()
+						if errors.Is(idleErr, hostcfg.ErrIdleInventoryStale) {
+							if err := h.adoptOrphanedJournal(idleCtx, ac); err != nil {
+								h.log.Warn("RH05 orphaned journal reconciliation failed", "host_id", hostID, "err", err)
+							}
+						}
 					})
 					if !current || errors.Is(idleErr, hostcfg.ErrIdleInventoryStale) {
 						h.log.Debug("idle inventory heartbeat from a superseded connection ignored", "host_id", hostID)

@@ -1022,3 +1022,64 @@ func TestAHardwareReportWithUnknownGPUsLeavesTheEvidenceAlone(t *testing.T) {
 		t.Fatalf("unknown GPUs replaced the evidence: %s", stored)
 	}
 }
+
+// #515: a boot written by a process that serves no agent is answered by the
+// serving store at its next reconciliation, on a reconnect or a live connection.
+func TestForeignBootIsReclaimedByTheServingStore(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+	first := seedHost(t, pool)
+	var second string
+	if err := pool.QueryRow(ctx, `INSERT INTO hosts (node_name, status) VALUES ('h2', 'online') RETURNING id::text`).Scan(&second); err != nil {
+		t.Fatal(err)
+	}
+	confirmPolicyGroups(t, pool, first, "hardware")
+	confirmPolicyGroups(t, pool, second, "hardware")
+	boot, err := store.StartRH05Boot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const connection, other = "00000000-0000-4000-8000-000000000338", "00000000-0000-4000-8000-000000000515"
+	completeEmptyHostJournal(t, store, first)
+	completeEmptyHostJournal(t, store, second)
+	if adopted, err := store.AdoptOrphanedJournal(ctx, first, other); err != nil || adopted {
+		t.Fatalf("a journal its connection still owns was adopted: %v %v", adopted, err)
+	}
+
+	foreign, err := NewStore(pool).StartRH05Boot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := func(hostID string) (current, gateBoot, state string, owner *string, held bool) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT b.incarnation::text,j.boot_incarnation::text,j.state,j.connection_incarnation::text,
+			EXISTS(SELECT 1 FROM host_admission_restrictions r WHERE r.host_id=j.host_id)
+			FROM host_journal_reconciliation j, rh05_control_boot b WHERE j.host_id=$1::uuid`, hostID).
+			Scan(&current, &gateBoot, &state, &owner, &held); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if current, _, state, owner, held := gate(first); current != foreign || state != "pending" || owner != nil || !held {
+		t.Fatalf("the foreign boot did not fence the host; the test proves nothing: %s %s %v %v", current, state, owner, held)
+	}
+
+	// A reconnect takes the boot row back and holds every other host under it.
+	if err := store.BeginJournalReconciliation(ctx, first, other); err != nil {
+		t.Fatal(err)
+	}
+	if current, gateBoot, state, owner, held := gate(second); current != boot || gateBoot != boot || state != "pending" || owner != nil || !held {
+		t.Fatalf("after the reclaim the other host is %s/%s %s owner=%v held=%v, want fenced under %s", current, gateBoot, state, owner, held, boot)
+	}
+	// The other host never reconnects: its live connection adopts the journal.
+	if adopted, err := store.AdoptOrphanedJournal(ctx, second, connection); err != nil || !adopted {
+		t.Fatalf("an ownerless journal was not adopted: %v %v", adopted, err)
+	}
+	if err := store.CompleteJournalReconciliation(ctx, second, connection, nil); err != nil {
+		t.Fatal(err)
+	}
+	if current, gateBoot, state, owner, held := gate(second); current != boot || gateBoot != boot || state != "complete" || owner == nil || *owner != connection || held {
+		t.Fatalf("adopted journal ended %s/%s %s owner=%v held=%v", current, gateBoot, state, owner, held)
+	}
+}

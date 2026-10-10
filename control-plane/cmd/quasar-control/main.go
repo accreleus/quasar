@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -25,10 +26,30 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		os.Exit(refuseArgs(os.Args[1:], os.Stdout, os.Stderr))
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// refuseArgs answers every invocation with an argument without starting. The
+// binary only serves: an ignored `--version` once booted a second control plane
+// against the live database, fencing every host (#515).
+func refuseArgs(args []string, out, errOut io.Writer) int {
+	if len(args) == 1 && (args[0] == "--version" || args[0] == "version") {
+		id := buildinfo.Get()
+		commit := "unknown"
+		if id.SourceCommit != nil {
+			commit = *id.SourceCommit
+		}
+		fmt.Fprintf(out, "quasar-control %s (%s)\n", id.Version, commit)
+		return 0
+	}
+	fmt.Fprintf(errOut, "quasar-control takes no arguments (got %q): it is configured by environment (docs/configuration.md). --version prints the build.\n", args)
+	return 2
 }
 
 func run() error {
@@ -56,6 +77,15 @@ func run() error {
 	if err := devCfg.Validate(); err != nil {
 		return err
 	}
+
+	// Bound before the first database write, served only once everything is
+	// wired: a second process on this address must fail here, never after it
+	// has written a boot fence the serving one cannot see (#515).
+	httpListener, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("listen %q: %w", cfg.ListenAddr, err)
+	}
+	defer httpListener.Close() //nolint:errcheck
 
 	// Database preflight (#518), before migrations: a bad DATABASE_URL is
 	// diagnosed as what it is instead of surfacing as a migration failure
@@ -239,7 +269,7 @@ func run() error {
 
 	go func() {
 		log.Info("listening", "addr", cfg.ListenAddr, "scheme", "http")
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server error", "err", err)
 			stop()
 		}

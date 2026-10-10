@@ -75,56 +75,93 @@ func (s *Store) ObserveIdleHeartbeat(ctx context.Context, hostID, connectionID s
 // BeginJournalReconciliation is called only for a newly authenticated RH05
 // connection. It closes admission before any inventory page is considered.
 func (s *Store) BeginJournalReconciliation(ctx context.Context, hostID, connectionID string) error {
+	_, err := s.beginJournalReconciliation(ctx, hostID, connectionID, false)
+	return err
+}
+
+// AdoptOrphanedJournal begins reconciliation on the host's live connection when
+// no connection owns its pending journal: the state another process's boot
+// leaves, which no reconnect will release (#515). A journal another connection
+// owns is left alone.
+func (s *Store) AdoptOrphanedJournal(ctx context.Context, hostID, connectionID string) (bool, error) {
+	return s.beginJournalReconciliation(ctx, hostID, connectionID, true)
+}
+
+func (s *Store) beginJournalReconciliation(ctx context.Context, hostID, connectionID string, orphanedOnly bool) (bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var status, boot string
-	if err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status); err != nil {
-		return err
+	// Boot row before the host row, the order fenceRH05Boot locks them in.
+	if err := tx.QueryRow(ctx, `SELECT incarnation::text FROM rh05_control_boot WHERE id=true FOR UPDATE`).Scan(&boot); err != nil {
+		return false, err
 	}
-	if err := tx.QueryRow(ctx, `SELECT incarnation::text FROM rh05_control_boot WHERE id=true`).Scan(&boot); err != nil {
-		return err
+	if err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status); err != nil {
+		return false, err
+	}
+	if orphanedOnly {
+		var owner *string
+		err := tx.QueryRow(ctx, `SELECT connection_incarnation::text FROM host_journal_reconciliation
+			WHERE host_id=$1::uuid AND state='pending'`, hostID).Scan(&owner)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && owner != nil {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+	// Another process booted against this database. No agent connection here
+	// carries its incarnation, so no offer could ever match it: fence again
+	// under this process's own before reconciling.
+	// ponytail: two live control planes on one database take the boot row from
+	// each other at every heartbeat; a boot lease with liveness is the upgrade
+	// when the control plane runs replicated.
+	if own := s.boot.Load(); own != nil && *own != boot {
+		if err := fenceRH05Boot(ctx, tx, *own); err != nil {
+			return false, err
+		}
+		boot = *own
 	}
 	if err := rotateHostReviewTokens(ctx, tx, hostID); err != nil {
-		return err
+		return false, err
 	}
 	// A same-boot waiting grant was never offered under the write-before-send
 	// invariant. Fence it locally; an offered grant needs journal proof.
 	if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions r USING host_config_approvals a
 		WHERE r.host_id=$1::uuid AND r.host_id=a.host_id AND r.owner_kind='idle_apply'
 		AND r.owner_id=a.id AND a.state='approved' AND a.boot_incarnation=$2::uuid`, hostID, boot); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE host_config_approvals SET state='revoked_unstarted'
 		WHERE host_id=$1::uuid AND state='approved' AND boot_incarnation=$2::uuid`, hostID, boot); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE host_config_approvals SET state='cancel_pending'
 		WHERE host_id=$1::uuid AND state='offered'`, hostID); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO host_journal_reconciliation(host_id,boot_incarnation,connection_incarnation,state)
 		VALUES($1::uuid,$2::uuid,$3::uuid,'pending') ON CONFLICT(host_id) DO UPDATE SET
 		boot_incarnation=excluded.boot_incarnation,connection_incarnation=excluded.connection_incarnation,
 		state='pending',completed_at=NULL,continuation_cursor=NULL`, hostID, boot, connectionID); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM host_idle_inventory WHERE host_id=$1::uuid`, hostID); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
 		VALUES($1::uuid,'reconciliation','00000000-0000-0000-0000-000000000002'::uuid,'journal_reconciliation')
 		ON CONFLICT(host_id,owner_kind,owner_id) DO UPDATE SET reason='journal_reconciliation'`, hostID); err != nil {
-		return err
+		return false, err
 	}
 	if status == "online" {
 		if _, err := tx.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id=$1::uuid`, hostID); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return tx.Commit(ctx)
+	return true, tx.Commit(ctx)
 }
 
 // BeginCurrentJournalRefresh fences an unstarted offer on the authenticated
