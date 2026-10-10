@@ -60,11 +60,10 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	// of a different app into a live session, so ungated it defeats the launch
 	// check in two requests. Against the session's OWNER, with no role bypass.
 	//
-	// Accepted residual: a plain read with no FOR SHARE and no enclosing
-	// transaction, so a revoke committing before the dispatch is not serialized
-	// against. Every step to dispatchSwap is a separate statement and a revoke
-	// does not terminate a running session either. Closing it means making the
-	// whole swap transactional; do not fix it here in isolation.
+	// A plain read with no FOR SHARE and no enclosing transaction, so a revoke
+	// committing before the dispatch is not serialized against. The commit
+	// re-checks instead (stopIfSwapLeftUnentitled): a swap that loses that race
+	// completes and is then stopped.
 	entitled, err := s.store.IsEntitled(ctx, sess.UserID, app.ID)
 	if err != nil {
 		return Session{}, err

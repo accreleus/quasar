@@ -221,11 +221,21 @@ func (h *Handler) handleSetProviderEntitlementMode(w http.ResponseWriter, r *htt
 
 	// Audited like entitlements.go grant/revoke; identifiers + count only,
 	// same 4096-byte CHECK discipline.
-	h.recordActivity(r, "app.entitlement.set_mode", "app", appID, map[string]any{
+	details := map[string]any{
 		"provider":   provider,
 		"mode":       req.Mode,
 		"item_count": len(items),
-	})
+	}
+	// "all" removes nobody's access to the provider app, so it stops nothing.
+	var stopErr error
+	if req.Mode != entitlementModeAll {
+		stopErr = h.endUnentitledSessions(r, appID, details)
+	}
+	h.recordActivity(r, "app.entitlement.set_mode", "app", appID, details)
+	if stopErr != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, sessionsNotStoppedMsg)
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"entitlement_mode": map[string]any{
 			"provider": provider,

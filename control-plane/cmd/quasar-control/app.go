@@ -583,6 +583,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	crudHandler := crud.NewHandler(pool, auditStore)
 	crudHandler.SetRegistry(agentRegistry) // lets DELETE /v1/hosts/{id} check live connectivity
 	crudHandler.SetReadinessStaleSecs(int(cfg.ReadinessStaleSecs))
+	crudHandler.SetSessionRevoker(coordinator.StopUnentitledSessions)
 	sessionHandler := session.NewHandler(coordinator, sessionStore, auditStore).
 		WithPublicBaseURL(cfg.PublicBaseURL).
 		WithICEServers(cfg.ICEServers)

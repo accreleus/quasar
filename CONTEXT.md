@@ -65,7 +65,8 @@ specific user; there is deliberately no admin arm. The authorization boundary
 is the transactional check inside scheduling, not the pre-check on the launch
 path — the pre-check exists only so an unentitled caller gets 403 before any
 other gate can leak a 409. A derived tile needs an entitlement to its parent
-app as well as its own.
+app as well as its own. An admin removing one stops the running sessions it
+left unentitled.
 
 **Home** — the per-(user, app) persistent storage a managed-home app mounts. A
 derived tile borrows its parent's home, which is why a tile is placed with a

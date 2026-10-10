@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -350,13 +351,45 @@ func (h *Handler) handleRevokeEntitlement(w http.ResponseWriter, r *http.Request
 	}
 	// granted_by is recorded because revoking a 'provider' row (Phase 4) can be
 	// re-granted by the next sync; the audit row explains that.
-	h.recordActivity(r, "app.entitlement.revoke", "app", appID, map[string]any{
+	details := map[string]any{
 		"entitlement_id": entID,
 		"subject_type":   subjectType,
 		"subject_id":     derefOr(subjectID, ""),
 		"granted_by":     grantedBy,
-	})
+	}
+	stopErr := h.endUnentitledSessions(r, appID, details)
+	h.recordActivity(r, "app.entitlement.revoke", "app", appID, details)
+	if stopErr != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, sessionsNotStoppedMsg)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// maxAuditedStoppedSessions keeps stopped_session_ids inside admin_activity's
+// 4096-byte details CHECK (migration 0028); sessions_stopped is the true count.
+const maxAuditedStoppedSessions = 50
+
+const sessionsNotStoppedMsg = "access was removed, but not every running session could be stopped; stop them from the session console"
+
+// endUnentitledSessions stops the sessions an entitlement removal on appID left
+// unentitled (control-api.md amendment 23) and adds them to the audit details.
+// The removal is already committed, so this must not be cancelled with the
+// request: a client hanging up would leave the sessions running.
+func (h *Handler) endUnentitledSessions(r *http.Request, appID string, details map[string]any) error {
+	if h.stopUnentitled == nil {
+		return nil
+	}
+	stopped, err := h.stopUnentitled(context.WithoutCancel(r.Context()), appID)
+	details["sessions_stopped"] = len(stopped)
+	if len(stopped) > 0 {
+		details["stopped_session_ids"] = stopped[:min(len(stopped), maxAuditedStoppedSessions)]
+	}
+	if err != nil {
+		details["sessions_stop_failed"] = true
+		slog.Error("stop sessions after entitlement removal failed", "app_id", appID, "err", err)
+	}
+	return err
 }
 
 func derefOr(p *string, fallback string) string {
