@@ -382,7 +382,12 @@ func TestLivePolicyReportDoesNotGrowRetainedState(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	offer := agent.collectOffers(t, pool, 1)["idle_timeout_secs"]
+	// Startup pass can claim the obligation before collectOffers samples its baseline, so read the offer instead of counting claims.
+	agent.send(t, map[string]any{"type": "heartbeat", "running_sessions": []string{}, "ts_unix_ms": time.Now().UnixMilli()})
+	offer := agent.readUntil(t, "config_policy_offer")
+	if offer["group"] != "idle_timeout_secs" {
+		t.Fatalf("offer group = %v", offer["group"])
+	}
 	attemptID := offer["attempt_id"].(string)
 	big := strings.Repeat("e", 64<<10)
 	for sequence, phase := range []string{"accepted", "verifying"} {
