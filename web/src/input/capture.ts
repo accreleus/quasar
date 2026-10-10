@@ -227,11 +227,11 @@ export function setupCapture({
   /** "lock": pointerlockchange owns the release; "fallback": release() does.
    *  Keeps another element's pointerlockchange from dropping a fallback capture. */
   let captureMode: "none" | "lock" | "fallback" = "none";
-  /** A Pointer Lock request is outstanding. */
-  let engaging = false;
-  /** release() ran while that request was outstanding: its grant, when it
-   *  lands, is handed straight back instead of recapturing. */
-  let abandoned = false;
+  /** The latest intent: engage() wants capture, release() does not. Pointer Lock
+   *  requests queue and settle in any order, so no request is tracked on its own;
+   *  a grant that lands while this is false is handed straight back. Starts true:
+   *  nothing has been released yet, and only engage() ever requests the lock. */
+  let wanted = true;
 
   const lockSupported = pointerLockSupported();
 
@@ -389,13 +389,11 @@ export function setupCapture({
 
   const onLockChange = () => {
     pointerLocked = document.pointerLockElement === videoEl;
-    if (pointerLocked && abandoned) {
-      abandoned = false;
+    if (pointerLocked && !wanted) {
       pointerLocked = false;
       document.exitPointerLock?.();
       onCaptureChange({ captured, pointerLocked });
     } else if (pointerLocked) {
-      engaging = false;
       captureMode = "lock";
       setCaptured(true);
     } else if (captureMode === "lock") {
@@ -416,6 +414,7 @@ export function setupCapture({
    * the user gesture the API requires.
    */
   const engage = async (): Promise<EngageResult> => {
+    wanted = true;
     if (captured) {
       return { mode: pointerLocked ? "pointer-lock" : "fallback" };
     }
@@ -424,8 +423,6 @@ export function setupCapture({
       setCaptured(true);
       return { mode: "fallback" };
     }
-    engaging = true;
-    abandoned = false;
     try {
       // Chrome ≥113 returns a Promise, older engines undefined; handle both
       // plus a synchronous throw.
@@ -435,8 +432,6 @@ export function setupCapture({
       }
       return { mode: "pointer-lock" };
     } catch (error) {
-      engaging = false;
-      abandoned = false;
       return { mode: "failed", error };
     }
   };
@@ -445,10 +440,7 @@ export function setupCapture({
    *  ours never diverge (pointerlockchange runs the release); fallback clears
    *  directly. */
   const release = () => {
-    if (engaging) {
-      engaging = false;
-      abandoned = true;
-    }
+    wanted = false;
     if (captureMode === "lock" && document.exitPointerLock) {
       document.exitPointerLock();
       return;
