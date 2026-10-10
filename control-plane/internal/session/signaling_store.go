@@ -24,8 +24,15 @@ var (
 )
 
 // ConsumeSignalingToken hashes plaintext, validates TTL and single-use,
-// atomically stamps consumed_at, and returns the session. FOR UPDATE ensures
-// two concurrent WS connects with the same token cannot both succeed.
+// atomically stamps consumed_at, and returns the session. FOR UPDATE on the
+// token ensures two concurrent WS connects with the same token cannot both
+// succeed. FOR SHARE on the session row serialises against Store.transition's
+// FOR UPDATE, so a stop cannot commit between the state read and the consume.
+//
+// Lock order is session row, then token row: app, host and user deletion lock
+// `sessions` and cascade into `session_tokens`, and the reverse order here
+// would deadlock against them. So the token is first read unlocked, only to
+// learn its session, and validated again once it is locked.
 func (s *Store) ConsumeSignalingToken(ctx context.Context, plaintext string) (Session, error) {
 	h := sha256.Sum256([]byte(plaintext))
 	hash := hex.EncodeToString(h[:])
@@ -40,14 +47,18 @@ func (s *Store) ConsumeSignalingToken(ctx context.Context, plaintext string) (Se
 	var hostID *string
 	var expired, consumed bool
 	var sessionID string
-	err = tx.QueryRow(ctx, `
-		SELECT s.id::text, s.state, s.host_id::text,
-		       t.expires_at < now(), t.consumed_at IS NOT NULL
-		FROM session_tokens t
-		JOIN sessions s ON s.id = t.session_id
-		WHERE t.token_hash = $1
-		FOR UPDATE OF t
-	`, hash).Scan(&sessionID, &state, &hostID, &expired, &consumed)
+	err = tx.QueryRow(ctx, `SELECT session_id::text FROM session_tokens WHERE token_hash = $1`, hash).Scan(&sessionID)
+	if err == nil {
+		err = tx.QueryRow(ctx, `SELECT state, host_id::text FROM sessions WHERE id = $1::uuid FOR SHARE`, sessionID).
+			Scan(&state, &hostID)
+	}
+	if err == nil {
+		err = tx.QueryRow(ctx, `
+			SELECT expires_at < now(), consumed_at IS NOT NULL
+			FROM session_tokens WHERE token_hash = $1 FOR UPDATE
+		`, hash).Scan(&expired, &consumed)
+	}
+	// No row at any step: an unknown token, or one deleted with its session.
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrTokenInvalid
 	}
@@ -58,7 +69,9 @@ func (s *Store) ConsumeSignalingToken(ctx context.Context, plaintext string) (Se
 	if expired || consumed {
 		return Session{}, ErrTokenInvalid
 	}
-	if state.IsTerminal() {
+	// Stopping too: MintSignalingToken refuses it, and a token minted before the
+	// stop must not attach to a stream that is being ended.
+	if state.IsTerminal() || state == StateStopping {
 		return Session{}, ErrSessionTerminal
 	}
 	if hostID == nil {

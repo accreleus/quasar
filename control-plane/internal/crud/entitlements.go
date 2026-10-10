@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -350,13 +351,48 @@ func (h *Handler) handleRevokeEntitlement(w http.ResponseWriter, r *http.Request
 	}
 	// granted_by is recorded because revoking a 'provider' row (Phase 4) can be
 	// re-granted by the next sync; the audit row explains that.
-	h.recordActivity(r, "app.entitlement.revoke", "app", appID, map[string]any{
+	details := map[string]any{
 		"entitlement_id": entID,
 		"subject_type":   subjectType,
 		"subject_id":     derefOr(subjectID, ""),
 		"granted_by":     grantedBy,
-	})
+	}
+	r = afterCommit(r)
+	h.endUnentitledSessions(r, appID, details)
+	h.recordActivity(r, "app.entitlement.revoke", "app", appID, details)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// afterCommit detaches r from the client's cancellation for the work that
+// follows a committed entitlement removal: a client hanging up must not leave
+// the sessions running or drop the audit row. The admin identity is kept.
+func afterCommit(r *http.Request) *http.Request {
+	return r.WithContext(context.WithoutCancel(r.Context()))
+}
+
+// maxAuditedStoppedSessions keeps stopped_session_ids inside admin_activity's
+// 4096-byte details CHECK (migration 0028); sessions_stopped is the true count.
+const maxAuditedStoppedSessions = 50
+
+// endUnentitledSessions stops the sessions an entitlement removal on appID left
+// unentitled (control-api.md amendment 23) and adds them to the audit details.
+// Takes an afterCommit request. A failure is recorded and logged, not surfaced:
+// the removal is committed, a retried request would not sweep again, and the
+// periodic sweep (session.RunEntitlementSweep) finishes the job.
+func (h *Handler) endUnentitledSessions(r *http.Request, appID string, details map[string]any) {
+	if h.stopUnentitled == nil {
+		return
+	}
+	stopped, err := h.stopUnentitled(r.Context(), appID)
+	details["sessions_stopped"] = len(stopped)
+	if len(stopped) > 0 {
+		details["stopped_session_ids"] = stopped[:min(len(stopped), maxAuditedStoppedSessions)]
+	}
+	if err != nil {
+		details["sessions_stop_failed"] = true
+		slog.Error("stop sessions after entitlement removal failed; the entitlement sweep retries",
+			"app_id", appID, "err", err)
+	}
 }
 
 func derefOr(p *string, fallback string) string {

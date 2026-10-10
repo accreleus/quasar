@@ -77,7 +77,7 @@ func TestAppBootDetailPassesThroughGenZero(t *testing.T) {
 // vocabulary as gen-0) must NOT be confused with the exact-match swap-commit
 // token "swap complete": it must not commit the pending swap's app_id, must
 // not clear the pending-swap tracking, and must fall into the `default:` arm
-// that just records the detail string. A subsequent genuine "swap complete"
+// that leaves the durable swap marker in place. A subsequent genuine "swap complete"
 // on the same session must still commit normally, proving the two tokens are
 // distinguished by exact string equality, not by any shared prefix/substring.
 func TestAppPresentedNotMistakenForSwapCommit(t *testing.T) {
@@ -121,8 +121,9 @@ func TestAppPresentedNotMistakenForSwapCommit(t *testing.T) {
 		t.Fatalf("%q was mistaken for a swap commit: app_id moved %s -> %s (want unchanged %s)",
 			appDetailPresented, origAppID, got.AppID, origAppID)
 	}
-	if got.StateDetail == nil || *got.StateDetail != appDetailPresented {
-		t.Fatalf("app presented detail during swap: got %v want %q", got.StateDetail, appDetailPresented)
+	// The durable swap marker holds through the progress callbacks (#503).
+	if got.StateDetail == nil || *got.StateDetail != swapDetailInProgress {
+		t.Fatalf("state_detail during swap: got %v want %q", got.StateDetail, swapDetailInProgress)
 	}
 	if got.State != StateRunning {
 		t.Fatalf("app presented during swap changed top-level state: %s want running", got.State)

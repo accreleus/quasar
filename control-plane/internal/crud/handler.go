@@ -38,6 +38,16 @@ type Handler struct {
 	auditor         interface {
 		Record(context.Context, string, string, string, string, map[string]any) error
 	}
+	// stopUnentitled ends the live sessions an entitlement removal on appID left
+	// unentitled and returns their ids (control-api.md amendment 23). nil stops
+	// nothing.
+	stopUnentitled func(ctx context.Context, appID string) ([]string, error)
+}
+
+// SetSessionRevoker wires session.Coordinator.StopUnentitledSessions. Call once
+// after NewHandler, before Register.
+func (h *Handler) SetSessionRevoker(stop func(ctx context.Context, appID string) ([]string, error)) {
+	h.stopUnentitled = stop
 }
 
 func (h *Handler) SetImageReconciler(reconcile func(context.Context) error) {

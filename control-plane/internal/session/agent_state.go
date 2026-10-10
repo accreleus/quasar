@@ -100,6 +100,11 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		return
 	}
 	c.log.Info("session state", "session_id", sess.ID, "state", sess.State)
+	if sess.State == StateStopping {
+		// The agent's own teardown (idle timeout): without this it has no record
+		// and AgentHeartbeat would repeat an `error` stop over it at once.
+		c.noteStopRequested(sess.ID)
+	}
 
 	// Failure classification and log tail, as a separate update outside the
 	// lifecycle transaction: the transition must commit (releasing the GPU

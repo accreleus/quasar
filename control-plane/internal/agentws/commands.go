@@ -75,7 +75,7 @@ type SessionStopCmd struct {
 	Type      string `json:"type"` // "session_stop"
 	ID        string `json:"id"`
 	SessionID string `json:"session_id"`
-	Reason    string `json:"reason"` // user_requested|idle_timeout|host_draining|admin|error
+	Reason    string `json:"reason"` // user_requested|idle_timeout|host_draining|admin|error|entitlement_revoked
 }
 
 // SessionSwapAppCmd swaps a running session's source app behind its interpipe

@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -80,6 +81,9 @@ func findProviderAppID(ctx context.Context, tx pgx.Tx, provider string) (string,
 // No app yet but a catalog image claims the provider: the mode is stored for
 // EnsureProviderApp to apply at create and pending is true (amendment 21, #490).
 // ErrNotFound only when neither exists.
+//
+// A non-empty appID means the mode committed, even alongside an error: only the
+// read-back of items can fail after the commit.
 func (s *store) setProviderEntitlementMode(ctx context.Context, provider, mode string, actorID *string) (appID string, items []Entitlement, pending bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -161,11 +165,11 @@ func (s *store) setProviderEntitlementMode(ctx context.Context, provider, mode s
 	rows, err := s.pool.Query(ctx, entitlementSelect+` WHERE e.app_id::text = $1
 		ORDER BY (e.subject_type = 'all') DESC, u.username ASC, e.created_at ASC`, appID)
 	if err != nil {
-		return "", nil, false, fmt.Errorf("read back provider entitlements for %q: %w", provider, err)
+		return appID, nil, false, fmt.Errorf("read back provider entitlements for %q: %w", provider, err)
 	}
 	items, err = scanEntitlements(rows)
 	if err != nil {
-		return "", nil, false, err
+		return appID, nil, false, err
 	}
 	return appID, items, false, nil
 }
@@ -194,6 +198,28 @@ func (h *Handler) handleSetProviderEntitlementMode(w http.ResponseWriter, r *htt
 
 	actor := actorID(r)
 	appID, items, pending, err := h.store.setProviderEntitlementMode(r.Context(), provider, req.Mode, actor)
+	if appID != "" {
+		if err != nil {
+			// The mode is in force, so this is a success with nothing to list: a
+			// 500 would invite a retry of a change that already happened.
+			slog.Warn("entitlement mode committed; read-back failed", "provider", provider, "err", err)
+			items, err = []Entitlement{}, nil
+		}
+		// Committed, whatever the read-back said: the sweep and the audit row must
+		// not depend on it. Identifiers + count only, same 4096-byte CHECK
+		// discipline as entitlements.go grant/revoke.
+		details := map[string]any{
+			"provider":   provider,
+			"mode":       req.Mode,
+			"item_count": len(items),
+		}
+		r = afterCommit(r)
+		// "all" removes nobody's access to the provider app, so it stops nothing.
+		if req.Mode != entitlementModeAll {
+			h.endUnentitledSessions(r, appID, details)
+		}
+		h.recordActivity(r, "app.entitlement.set_mode", "app", appID, details)
+	}
 	switch {
 	case errors.Is(err, ErrNotFound):
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound,
@@ -219,13 +245,6 @@ func (h *Handler) handleSetProviderEntitlementMode(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Audited like entitlements.go grant/revoke; identifiers + count only,
-	// same 4096-byte CHECK discipline.
-	h.recordActivity(r, "app.entitlement.set_mode", "app", appID, map[string]any{
-		"provider":   provider,
-		"mode":       req.Mode,
-		"item_count": len(items),
-	})
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"entitlement_mode": map[string]any{
 			"provider": provider,

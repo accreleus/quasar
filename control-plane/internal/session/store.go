@@ -637,7 +637,7 @@ func (s *Store) ListAll(ctx context.Context, cursor string, limit int32, filter 
 // failed. ErrInvalidTransition if the move is not permitted, ErrNotFound if the
 // row is gone; a same-state report is an idempotent no-op.
 func (s *Store) Transition(ctx context.Context, id string, to State, detail, errMsg *string) (Session, error) {
-	return s.transition(ctx, id, "", to, detail, errMsg)
+	return s.transition(ctx, id, "", nil, to, detail, errMsg)
 }
 
 // TransitionFromHost is the authenticated agent variant. It checks the
@@ -647,7 +647,7 @@ func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to St
 	var sess Session
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		sess, err = s.transition(ctx, id, hostID, to, detail, errMsg)
+		sess, err = s.transition(ctx, id, hostID, nil, to, detail, errMsg)
 		var pgErr *pgconn.PgError
 		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
 			return sess, err
@@ -656,7 +656,15 @@ func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to St
 	return sess, err
 }
 
-func (s *Store) transition(ctx context.Context, id, reportHostID string, to State, detail, errMsg *string) (Session, error) {
+// rowGuard is the row state a caller decided a transition on, re-checked under
+// the row lock so a swap that commits in between cannot be acted on stale.
+type rowGuard func(appID string, stateDetail *string) bool
+
+var errSessionMoved = errors.New("session no longer in the state the transition was decided on")
+
+// A non-nil only applies the transition while it still holds for the locked
+// row, and is errSessionMoved otherwise.
+func (s *Store) transition(ctx context.Context, id, reportHostID string, only rowGuard, to State, detail, errMsg *string) (Session, error) {
 	if !isValidUUID(id) {
 		return Session{}, ErrNotFound
 	}
@@ -682,6 +690,9 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, to Stat
 	}
 	if reportHostID != "" && (assignedHost == nil || *assignedHost != reportHostID) {
 		return Session{}, ErrNotFound
+	}
+	if only != nil && !only(sessionApp, curDetail) {
+		return Session{}, errSessionMoved
 	}
 	// A restart loses swapper.pendingSwaps but not this durable guard. A stop
 	// request or any nonterminal agent detail cannot clear it: the target may
@@ -942,6 +953,25 @@ func (s *Store) RunningSessionIDsOnHost(ctx context.Context, hostID string) ([]s
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// StoppingNeverStartedOnHost lists the host's `stopping` rows that never reached
+// `running`: the ones the agent's heartbeat cannot vouch for either way.
+func (s *Store) StoppingNeverStartedOnHost(ctx context.Context, hostID string) ([]string, error) {
+	if !isValidUUID(hostID) {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id::text FROM sessions
+		WHERE host_id = $1::uuid AND state = 'stopping' AND started_at IS NULL`, hostID)
+	if err != nil {
+		return nil, fmt.Errorf("list unstarted stopping sessions on host: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("list unstarted stopping sessions on host: %w", err)
+	}
+	return ids, nil
 }
 
 // Host mirrors the schema.md `hosts` columns; the response DTO is built from it.
