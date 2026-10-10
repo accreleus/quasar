@@ -809,6 +809,9 @@ func TestEntitlementSurvivesAHomeMovingHost(t *testing.T) {
 		return id
 	}
 	entries := []ReportEntry{{ExternalID: "517710", Name: "Redout: Enhanced Edition"}}
+	// A real uninstall is a non-empty report that omits the game; an empty one is kept (see
+	// TestEmptyReportOverObservationsKeepsLibrary).
+	others := []ReportEntry{{ExternalID: "620", Name: "Portal 2"}}
 
 	// The game is installed on host A.
 	_, err := f.store.Reconcile(ctx, scanOn(f.host), f.host, entries, nil)
@@ -834,7 +837,7 @@ func TestEntitlementSurvivesAHomeMovingHost(t *testing.T) {
 
 	// Now the user removes it from host A only. Host A's sweep runs and must NOT
 	// revoke: the observation on host B is still there.
-	res, err := f.store.Reconcile(ctx, scanOn(f.host), f.host, []ReportEntry{}, nil)
+	res, err := f.store.Reconcile(ctx, scanOn(f.host), f.host, others, nil)
 	must(t, err)
 	if res.Revoked != 0 {
 		t.Errorf("host A's sweep revoked %d entitlement(s) while host B still has the game "+
@@ -852,7 +855,7 @@ func TestEntitlementSurvivesAHomeMovingHost(t *testing.T) {
 	}
 
 	// Only when the LAST host stops reporting it does the entitlement go.
-	_, err = f.store.Reconcile(ctx, scanOn(hostB), hostB, []ReportEntry{}, nil)
+	_, err = f.store.Reconcile(ctx, scanOn(hostB), hostB, others, nil)
 	must(t, err)
 	if _, has := f.entitlementGrantedBy(t, f.user, tileID); has {
 		t.Error("the entitlement survived the game disappearing from EVERY host")
@@ -1039,6 +1042,47 @@ func TestFailedScanRevokesNothing(t *testing.T) {
 		t.Error("a failed scan changed a tile")
 	}
 	var state, msg string
+	must(t, pool.QueryRow(ctx, `SELECT state, error FROM library_scans WHERE id=$1::uuid`, scan).Scan(&state, &msg))
+	if state != "failed" || msg == "" {
+		t.Errorf("scan state = %q error = %q; want failed with the reason recorded", state, msg)
+	}
+}
+
+// TestEmptyReportOverObservationsKeepsLibrary: an ok-empty report (absent or unreadable home)
+// must not prune observations or revoke provider entitlements; a first-ever empty report is
+// still an ordinary success.
+func TestEmptyReportOverObservationsKeepsLibrary(t *testing.T) {
+	pool := testDB(t)
+	f := newFixture(t, pool)
+	ctx := context.Background()
+
+	first := f.claimedScan(t, f.user)
+	_, err := f.store.Reconcile(ctx, first, f.host, nil, nil)
+	must(t, err)
+	var state string
+	must(t, pool.QueryRow(ctx, `SELECT state FROM library_scans WHERE id=$1::uuid`, first).Scan(&state))
+	if state != "reported" {
+		t.Errorf("empty report with no observations: state = %q, want reported", state)
+	}
+
+	_, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host,
+		[]ReportEntry{{ExternalID: "517710", Name: "Redout: Enhanced Edition"}}, nil)
+	must(t, err)
+	tileID, _, _ := f.tile(t, "517710")
+
+	scan := f.claimedScan(t, f.user)
+	res, err := f.store.Reconcile(ctx, scan, f.host, nil, nil)
+	must(t, err)
+	if res.Revoked != 0 {
+		t.Errorf("Revoked = %d, want 0", res.Revoked)
+	}
+	if _, has := f.entitlementGrantedBy(t, f.user, tileID); !has {
+		t.Error("an empty report revoked a provider entitlement")
+	}
+	if n := countT(t, pool, `SELECT count(*) FROM library_observations WHERE user_id=$1::uuid`, f.user); n != 1 {
+		t.Errorf("observations after an empty report = %d, want 1", n)
+	}
+	var msg string
 	must(t, pool.QueryRow(ctx, `SELECT state, error FROM library_scans WHERE id=$1::uuid`, scan).Scan(&state, &msg))
 	if state != "failed" || msg == "" {
 		t.Errorf("scan state = %q error = %q; want failed with the reason recorded", state, msg)
