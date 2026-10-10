@@ -109,6 +109,9 @@ vi.mock("../../webrtc/traceEvents", () => ({
  *  channelOpen by hand — exactly the ondatachannel/onopen path SessionPage
  *  itself drives, without a real RTCPeerConnection. */
 let lastOnChannel: ((ch: { readyState: string; onclose: (() => void) | null }) => void) | null = null;
+/** The runtime's recovery sink, same capture: a test plays the transport's
+ *  verdict (e.g. the 4404 close) without a WebSocket. */
+let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
 vi.mock("../../webrtc/session", () => ({
   QuasarSession: class {
     videoReceiver = null;
@@ -120,10 +123,14 @@ vi.mock("../../webrtc/session", () => ({
       _onTrack: unknown,
       _onStatus: unknown,
       onChannel: (ch: { readyState: string; onclose: (() => void) | null }) => void,
+      _initialPlayoutMs?: number,
+      onRecoveryState?: (state: Record<string, unknown>) => void,
     ) {
       lastOnChannel = onChannel;
+      lastOnRecovery = onRecoveryState ?? null;
     }
     close() {}
+    signalingUnrecoverable() {}
     getStats() {
       return Promise.resolve({});
     }
@@ -231,6 +238,7 @@ beforeEach(() => {
   // assertions below are per-test counts and read as cumulative without this.
   vi.clearAllMocks();
   lastOnChannel = null;
+  lastOnRecovery = null;
   lastDrawerProps = null;
   lastStripProps = null;
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
@@ -868,6 +876,54 @@ describe("SessionPage — #484 app-boot loader gate", () => {
 // Bench mode is a measurement instrument that reads back <video> pixels on every
 // displayed frame. It must be provably inert for an ordinary session: no RVFC
 // decode loop, and no `window.__qBench` for anything to drive.
+describe("SessionPage — a session the control plane stopped (#516)", () => {
+  /** Streams, then loses the session the way a stop looks from the browser:
+   *  signaling closes 4404 and the replacement token is refused. */
+  async function streamThenLoseTheSession(ended: Record<string, unknown>) {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      openChannel();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await waitFor(() => expect(document.querySelector(".sl-root")).toBeNull());
+
+    currentSession = makeSession(ended);
+    mintSignalingToken.mockRejectedValue(
+      new ApiError(409, "session_not_reconnectable", "session is not reconnectable"),
+    );
+    await act(async () => {
+      lastOnRecovery?.({
+        phase: "failed",
+        attempt: 0,
+        maxAttempts: 3,
+        message: "signaling: session not found or already ended",
+      });
+      await vi.advanceTimersByTimeAsync(100);
+    });
+  }
+
+  it("says the access was removed, not that recovery stopped", async () => {
+    await streamThenLoseTheSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+    const banner = screen.getByText("Your access to this app was removed").closest(".banner");
+    expect(banner?.getAttribute("role")).toBe("alert");
+    expect(banner?.textContent).toContain("you no longer have access");
+    expect(banner?.querySelector("button")?.textContent).toBe("Back to library");
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  it("keeps the recovery notice for a stop with no served reason", async () => {
+    await streamThenLoseTheSession({ state: "stopped", stop_reason: null });
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    expect(screen.queryByText("Your access to this app was removed")).toBeNull();
+  });
+});
+
 describe("SessionPage — bench mode", () => {
   it("does not arm the bench instrument for an ordinary session", async () => {
     delete (window as unknown as Record<string, unknown>)["__qBench"];

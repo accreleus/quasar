@@ -19,7 +19,9 @@ export type LaunchFailureKind =
   /** The browser could not (re)establish transport and has stopped trying. */
   | "unreachable"
   /** #526 — another tab/window/device attached to this session and won. */
-  | "taken_over";
+  | "taken_over"
+  /** #516 — the control plane stopped the session: its owner lost access to the app. */
+  | "access_revoked";
 
 export interface LaunchFailure {
   kind: LaunchFailureKind;
@@ -37,10 +39,14 @@ export interface LaunchFailure {
   logTail?: string | null;
 }
 
+/** Optional: a control plane older than amendment 24 does not send it. */
+type StopReasonInput = Partial<Pick<Session, "stop_reason">>;
+
 type SessionVerdictInput = Pick<
   Session,
   "state" | "state_detail" | "error_message" | "failure_code" | "app_log_tail"
->;
+> &
+  StopReasonInput;
 
 // #484 §3.3: boot-watchdog failure (QUASAR_APP_BOOT_TIMEOUT_SECS expiry)
 // arrives the same way app_exited_early (§S5) does — structured
@@ -75,6 +81,8 @@ function splitAppNeverPresentedMessage(errorMessage: string): {
  * (pending/assigned/starting/running).
  */
 export function launchFailureFromSession(s: SessionVerdictInput): LaunchFailure | null {
+  const revoked = accessRevokedFailure(s);
+  if (revoked) return revoked;
   if (s.state === "failed") {
     // SessionPage's own host-lost card owns this one.
     if (s.state_detail === "host_lost") return null;
@@ -153,5 +161,18 @@ export function takenOverFailure(): LaunchFailure {
     title: "This session moved to another tab",
     message:
       "You opened this session somewhere else, and that window has the stream now. Close this one, or resume the session from your library to bring it back here.",
+  };
+}
+
+/** #516 — the verdict for a session stopped because its owner lost access to
+ * the app (`stop_reason`, control-api.md amendment 24); null for any other
+ * end. The copy names no actor: the library sync revokes too, not only an
+ * administrator. */
+export function accessRevokedFailure(s: StopReasonInput): LaunchFailure | null {
+  if (s.stop_reason !== "entitlement_revoked") return null;
+  return {
+    kind: "access_revoked",
+    title: "Your access to this app was removed",
+    message: "This session ended because you no longer have access to the app.",
   };
 }

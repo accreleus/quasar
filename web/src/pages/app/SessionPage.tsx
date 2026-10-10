@@ -287,7 +287,7 @@ export function SessionPage() {
   }, [signalCoords, authToken, sessionId, navigate, addToast]);
 
   // Session status polling (host-lost, AS10-06 health, launch progress, #484
-  // §3.2 reveal-cap) lives in useSessionStatus.ts. `pollHostLost` and
+  // §3.2 reveal-cap) lives in useSessionStatus.ts. `pollEndReason` and
   // `setLaunchFailure` are called from the WebRTC mount effect below: a
   // signaling-relay disconnect polls once to explain itself, a failed
   // reconnect posts its own terminal verdict.
@@ -308,7 +308,7 @@ export function SessionPage() {
     appPresented,
     hostAssigned,
     sessionRunning,
-    pollHostLost,
+    pollEndReason,
   } = useSessionStatus(authToken, sessionId, stopping);
 
   // sessionRuntime.ts: one runtime instance per transport generation (law L1)
@@ -378,11 +378,15 @@ export function SessionPage() {
             duration: 10000,
           });
         },
-        onDisconnectSuspected: () => void pollHostLost(),
+        onDisconnectSuspected: () => void pollEndReason(),
         onReplacementSignaling: ({ url, token, iceServers }) =>
           setSignalCoords({ url, token, replacement: true, iceServers }),
-        onReconnectFailed: (detail) =>
-          setLaunchFailure((prev) => prev ?? unreachableFailure(detail)),
+        // A refused mint (409) is how a session the control plane stopped
+        // looks from here, so ask it why before settling on "unreachable".
+        onReconnectFailed: (detail) => {
+          setLaunchFailure((prev) => prev ?? unreachableFailure(detail));
+          void pollEndReason();
+        },
         // #526: another attach won this session. Terminal HERE only — the
         // session and the app are still running, in the tab that took it. The
         // page states it and stops; it must not re-mint (sessionRuntime L6).
@@ -753,12 +757,17 @@ export function SessionPage() {
       ? externalSize
       : null;
 
-  // Whether any of the three banner blocks below is on screen. The HUD takes
+  // #516: while the loader is up it shows this verdict itself, above the banner.
+  const accessRevoked =
+    loaderDone && launchFailure?.kind === "access_revoked" ? launchFailure : null;
+
+  // Whether any of the banner blocks below is on screen. The HUD takes
   // no banner-state input, so it is carried as a class on the shared ancestor
   // instead — `.session-root.banner-on` pushes a top-docked HUD down (hud.css).
   const bannerOn =
     health != null ||
     clientUnsupported ||
+    accessRevoked != null ||
     (recovery != null &&
       ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase));
 
@@ -843,7 +852,22 @@ export function SessionPage() {
             />
           )}
 
-          {recovery &&
+          {/* #516: the control plane's own reason replaces the recovery notice
+              the dead transport would otherwise raise. */}
+          {accessRevoked && (
+            <SessionBanner
+              title={accessRevoked.title}
+              message={accessRevoked.message}
+              actions={
+                <Button variant="primary" onClick={() => navigate("/app")}>
+                  Back to library
+                </Button>
+              }
+            />
+          )}
+
+          {!accessRevoked &&
+            recovery &&
             ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase) && (
               <SessionBanner
                 variant={recovery.phase === "failed" ? "critical" : "warning"}
