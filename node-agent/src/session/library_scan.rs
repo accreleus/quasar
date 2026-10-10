@@ -491,6 +491,15 @@ fn find_steamapps_dirs(
     Ok(())
 }
 
+/// The scan-report `error` for an `appmanifest_*.acf` whose content cannot be
+/// read (damaged or incomplete, not UTF-8, over the size cap). It may be a known
+/// game's manifest, so omitting it would read as "uninstalled" and revoke the
+/// entitlement. A parsed appid that fails validation after trimming is different:
+/// the control plane rejects the same values, so it was never ingested and is safe to skip.
+fn unusable_manifest(path: &Path, reason: &str) -> String {
+    format!("manifest {} {reason}", path.display())
+}
+
 /// Glob `appmanifest_*.acf` directly inside `dir` (Steam never nests them
 /// further), enforcing the symlink refusal and the two caps from spec §7.4
 /// step 2, and deduplicating by appid — a directory reachable via both
@@ -498,7 +507,10 @@ fn find_steamapps_dirs(
 ///
 /// An absent `dir` is an empty library (`Ok`); any other read error on `dir`,
 /// one of its entries, or a manifest is `Err` so the scan reports `ok: false`,
-/// and so is passing `deadline`.
+/// and so is passing `deadline`. So is an `appmanifest_*.acf` regular file whose
+/// content is unreadable (see [`unusable_manifest`]). An invalid appid is
+/// dropped; symlinks, non-files, other filenames, duplicates and the
+/// `max_entries` cap stay quiet.
 fn collect_manifests(
     dir: &Path,
     out: &mut Vec<ManifestEntry>,
@@ -545,28 +557,21 @@ fn collect_manifests(
             continue;
         }
         if meta.len() > max_manifest_bytes {
-            debug!(
-                "library-scan: manifest {} exceeds max_manifest_bytes ({} > {}) — skipping",
-                path.display(),
-                meta.len(),
-                max_manifest_bytes
-            );
-            continue;
+            return Err(unusable_manifest(
+                &path,
+                &format!(
+                    "is {} bytes, over the {max_manifest_bytes} byte cap",
+                    meta.len()
+                ),
+            ));
         }
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(read_failure(&path, &e)),
         };
-        let text = match std::str::from_utf8(&bytes) {
-            Ok(t) => t,
-            Err(_) => {
-                debug!(
-                    "library-scan: manifest {} is not valid UTF-8 — skipping",
-                    path.display()
-                );
-                continue;
-            }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Err(unusable_manifest(&path, "is not valid UTF-8"));
         };
         match parse_acf(text) {
             Ok(parsed) => {
@@ -574,21 +579,20 @@ fn collect_manifests(
                     out.push(parsed);
                 }
             }
+            // Validation point 1 of 4 (spec §10): drop the entry, and do NOT
+            // echo the value. Such an appid can never have been ingested, so
+            // omitting it prunes nothing.
             Err(AcfParseError::InvalidAppid) => {
-                // Validation point 1 of 4 (spec §10): drop the entry, and do
-                // NOT echo the value — only the (trusted) file path is logged.
                 debug!(
                     "library-scan: manifest {} has an appid that fails validation — dropped",
                     path.display()
                 );
             }
             Err(AcfParseError::Malformed) => {
-                // A torn read (Steam writing the file mid-scan) or any other
-                // structurally invalid VDF. Skipped, not fatal (spec §7.4).
-                debug!(
-                    "library-scan: manifest {} failed to parse (malformed or torn) — skipped",
-                    path.display()
-                );
+                return Err(unusable_manifest(
+                    &path,
+                    "failed to parse (malformed or incomplete)",
+                ));
             }
         }
     }
@@ -776,10 +780,14 @@ fn parse_acf(text: &str) -> Result<ManifestEntry, AcfParseError> {
     let Some(appid) = appid_raw else {
         return Err(AcfParseError::Malformed);
     };
-    if !is_valid_appid(&appid) {
+    // Trimmed like the control plane's ingest (`strings.TrimSpace`; Rust's
+    // `trim` and Go's both use the Unicode White_Space set), so both
+    // validators accept the same ids.
+    let appid = appid.trim();
+    if !is_valid_appid(appid) {
         return Err(AcfParseError::InvalidAppid);
     }
-    entry.external_id = appid;
+    entry.external_id = appid.to_string();
     Ok(entry)
 }
 
@@ -931,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn torn_manifest_is_malformed_not_fatal() {
+    fn truncated_manifest_is_malformed() {
         let full = fixture("appmanifest_517710.acf");
         let torn = &full[..full.len() / 2];
         assert_eq!(parse_acf(torn), Err(AcfParseError::Malformed));
@@ -1180,33 +1188,129 @@ mod tests {
         );
     }
 
-    #[test]
-    fn max_manifest_bytes_cap_is_enforced() {
+    /// Scan a library holding one good manifest and `bad` named `bad_name`.
+    fn scan_with_bad_manifest(
+        bad_name: &str,
+        bad: &[u8],
+        max_manifest_bytes: u64,
+    ) -> Result<Vec<ManifestEntry>, String> {
         let dir = tempfile::tempdir().unwrap();
         let steamapps = dir.path().join("steamapps");
         fs::create_dir_all(&steamapps).unwrap();
-        // A manifest padded well past a tiny cap via a long name value.
-        let big_name = "x".repeat(2000);
-        let content = format!(
-            r#""AppState" {{ "appid" "222222" "name" "{big_name}" "installdir" "d" "SizeOnDisk" "1" "StateFlags" "4" }}"#
-        );
-        write(&steamapps.join("appmanifest_222222.acf"), &content);
         write(
             &steamapps.join("appmanifest_333333.acf"),
             &synth_manifest("333333"),
         );
+        fs::write(steamapps.join(bad_name), bad).unwrap();
+        walk_and_parse(dir.path(), &[], 512, max_manifest_bytes)
+    }
 
-        // The small (synthetic) manifest is ~140 bytes; the padded one is
-        // ~2000+. A cap of 300 sits strictly between them.
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        collect_manifests(&steamapps, &mut out, &mut seen, 512, 300, far_deadline()).unwrap();
-        assert_eq!(
-            out.len(),
-            1,
-            "the oversized manifest must be skipped, the small one kept"
+    #[test]
+    fn oversized_manifest_fails_the_scan() {
+        let big_name = "x".repeat(2000);
+        let content = format!(
+            r#""AppState" {{ "appid" "222222" "name" "{big_name}" "installdir" "d" "SizeOnDisk" "1" "StateFlags" "4" }}"#
         );
-        assert_eq!(out[0].external_id, "333333");
+        // The good manifest is ~140 bytes; the padded one ~2000+.
+        let err = scan_with_bad_manifest("appmanifest_222222.acf", content.as_bytes(), 300)
+            .expect_err("an oversized manifest must fail the scan, not shorten it");
+        assert!(err.contains("appmanifest_222222.acf"), "{err}");
+        assert!(err.contains("byte cap"), "{err}");
+    }
+
+    #[test]
+    fn truncated_manifest_fails_the_scan() {
+        let full = synth_manifest("222222");
+        let err = scan_with_bad_manifest(
+            "appmanifest_222222.acf",
+            &full.as_bytes()[..full.len() / 2],
+            1_048_576,
+        )
+        .expect_err("a truncated manifest must fail the scan");
+        assert!(err.contains("appmanifest_222222.acf"), "{err}");
+        assert!(err.contains("malformed or incomplete"), "{err}");
+    }
+
+    #[test]
+    fn empty_manifest_fails_the_scan() {
+        let err = scan_with_bad_manifest("appmanifest_222222.acf", b"", 1_048_576).unwrap_err();
+        assert!(err.contains("appmanifest_222222.acf"), "{err}");
+    }
+
+    #[test]
+    fn non_utf8_manifest_fails_the_scan() {
+        let mut bad = synth_manifest("222222").into_bytes();
+        bad.extend_from_slice(&[0xff, 0xfe]);
+        let err = scan_with_bad_manifest("appmanifest_222222.acf", &bad, 1_048_576).unwrap_err();
+        assert!(err.contains("appmanifest_222222.acf"), "{err}");
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn invalid_appid_manifest_is_dropped_and_the_good_one_is_still_reported() {
+        let bad = r#""AppState" { "appid" "1; rm -rf /" "name" "x" }"#;
+        let entries =
+            scan_with_bad_manifest("appmanifest_222222.acf", bad.as_bytes(), 1_048_576).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].external_id, "333333");
+    }
+
+    /// The control plane trims the appid before validating, so a padded one
+    /// can have an observation; the agent must report it, normalised.
+    #[test]
+    fn whitespace_padded_appid_is_reported_trimmed() {
+        for padded in [" 222222 ", "222222\n", "\u{a0}222222\t"] {
+            let manifest = format!(r#""AppState" {{ "appid" "{padded}" "name" "x" }}"#);
+            let entries =
+                scan_with_bad_manifest("appmanifest_222222.acf", manifest.as_bytes(), 1_048_576)
+                    .unwrap();
+            let mut ids: Vec<_> = entries.iter().map(|e| e.external_id.as_str()).collect();
+            ids.sort();
+            assert_eq!(ids, ["222222", "333333"], "padded {padded:?}");
+        }
+    }
+
+    #[test]
+    fn missing_appid_manifest_fails_the_scan() {
+        let bad = r#""AppState" { "name" "no appid" }"#;
+        scan_with_bad_manifest("appmanifest_222222.acf", bad.as_bytes(), 1_048_576).unwrap_err();
+    }
+
+    #[test]
+    fn garbage_in_a_file_that_is_not_a_manifest_is_ignored() {
+        for name in [
+            "appmanifest_222222.acf.tmp",
+            "libraryfolder.vdf",
+            "appmanifest_222222.bak",
+        ] {
+            let entries = scan_with_bad_manifest(name, &[0xff, b'{', b'"'], 1_048_576).unwrap();
+            assert_eq!(entries.len(), 1, "{name} must not be read as a manifest");
+        }
+    }
+
+    /// Well-formed states Steam really writes must stay entries, not failures:
+    /// update pending (StateFlags 1026) with nested depot objects, a filename
+    /// that disagrees with the appid, and unknown keys.
+    #[test]
+    fn well_formed_manifests_in_odd_states_still_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let steamapps = dir.path().join("steamapps");
+        fs::create_dir_all(&steamapps).unwrap();
+        write(
+            &steamapps.join("appmanifest_111.acf"),
+            r#""AppState" { "appid" "222" "name" "Mismatch" "StateFlags" "1026"
+               "BytesToDownload" "5" "FutureKey" "x"
+               "InstalledDepots" { "223" { "manifest" "9" "size" "1" } }
+               "UserConfig" { "language" "english" } }"#,
+        );
+        for f in ["1493710", "228980", "2183900"] {
+            write(
+                &steamapps.join(format!("appmanifest_{f}.acf")),
+                &fixture(&format!("appmanifest_{f}.acf")),
+            );
+        }
+        let entries = walk_and_parse(dir.path(), &[], 512, 1_048_576).unwrap();
+        assert_eq!(entries.len(), 4);
     }
 
     #[test]
