@@ -143,6 +143,9 @@ vi.mock("../../webrtc/session", () => ({
     hasMicSlot() {
       return false;
     }
+    detachMicTrack() {
+      return Promise.resolve();
+    }
     recoverMediaPath() {}
     mediaPathFlowing() {}
   },

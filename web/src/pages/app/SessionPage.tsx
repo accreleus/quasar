@@ -456,6 +456,10 @@ export function SessionPage() {
     if (!sessionOver) return;
     micRef.current?.stop();
     setMicOn(false);
+    // Same as the explicit disable: a stopped track must not stay on the sender.
+    runtimeRef.current
+      ?.detachMicTrack()
+      .catch((err) => reportBestEffortFailure("silent-debug", "session: detach mic on session end", err));
     runtimeRef.current?.release();
   }, [sessionOver]);
 
@@ -552,6 +556,14 @@ export function SessionPage() {
         });
       };
       await sess.attachMicTrack(track);
+      // stop() ran while the attach was pending (session over, transport
+      // rebuilt, page left): the track on the sender is dead, take it off.
+      if (mic.track !== track) {
+        await sess
+          .detachMicTrack()
+          .catch((err) => reportBestEffortFailure("silent-debug", "session: detach stopped mic", err));
+        return;
+      }
       setMicOn(true);
     } catch (err) {
       mic.stop();

@@ -1462,3 +1462,60 @@ describe("engage() WITH Pointer Lock — desktop path is unchanged", () => {
     cleanup();
   });
 });
+
+describe("release() while a Pointer Lock request is pending (#524)", () => {
+  afterEach(() => {
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+    unlockPointer();
+  });
+
+  it("hands a late grant straight back instead of recapturing", async () => {
+    let grant: () => void = () => {};
+    setPointerLockApi(() => new Promise<void>((resolve) => (grant = resolve)));
+    const exitPointerLock = vi.fn(() => unlockPointer());
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
+    const video = document.createElement("video");
+    const onCaptureChange = vi.fn();
+    const { engage, release, cleanup } = setupCapture({
+      videoEl: video,
+      sendInput: () => {},
+      onCaptureChange,
+      channel: makeChannel(),
+    });
+    const engaging = engage();
+    release();
+    lockPointer(video);
+    grant();
+    await engaging;
+
+    expect(exitPointerLock).toHaveBeenCalledTimes(1);
+    expect(onCaptureChange).not.toHaveBeenCalledWith({ captured: true, pointerLocked: true });
+    const down = new KeyboardEvent("keydown", { code: "Tab", cancelable: true });
+    document.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(false);
+    cleanup();
+  });
+
+  it("a later engage() is not affected by the earlier release", async () => {
+    setPointerLockApi(() => Promise.resolve());
+    Object.defineProperty(document, "exitPointerLock", {
+      value: vi.fn(() => unlockPointer()),
+      configurable: true,
+    });
+    const video = document.createElement("video");
+    const onCaptureChange = vi.fn();
+    const { engage, release, cleanup } = setupCapture({
+      videoEl: video,
+      sendInput: () => {},
+      onCaptureChange,
+      channel: makeChannel(),
+    });
+    const first = engage();
+    release();
+    await first;
+    await engage();
+    lockPointer(video);
+    expect(onCaptureChange).toHaveBeenLastCalledWith({ captured: true, pointerLocked: true });
+    cleanup();
+  });
+});

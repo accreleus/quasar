@@ -49,7 +49,9 @@ vi.mock("../../webrtc/traceEvents", () => ({
 type Channel = { readyState: string; onclose: (() => void) | null; send: () => void; bufferedAmount: number };
 let lastOnChannel: ((ch: Channel) => void) | null = null;
 let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
-const attachMicTrack = vi.fn(() => Promise.resolve());
+const attachMicTrack = vi.fn((_track: unknown) => Promise.resolve());
+const detachMicTrack = vi.fn(() => Promise.resolve());
+let constructed = 0;
 vi.mock("../../webrtc/session", () => ({
   QuasarSession: class {
     videoReceiver = null;
@@ -62,6 +64,7 @@ vi.mock("../../webrtc/session", () => ({
       _initialPlayoutMs?: number,
       onRecoveryState?: (state: Record<string, unknown>) => void,
     ) {
+      constructed++;
       lastOnChannel = onChannel;
       lastOnRecovery = onRecoveryState ?? null;
     }
@@ -79,9 +82,7 @@ vi.mock("../../webrtc/session", () => ({
       return true;
     }
     attachMicTrack = attachMicTrack;
-    detachMicTrack() {
-      return Promise.resolve();
-    }
+    detachMicTrack = detachMicTrack;
     recoverMediaPath() {}
     mediaPathFlowing() {}
   },
@@ -207,6 +208,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
+  constructed = 0;
   hud = {};
   track.stopped = false;
   getUserMedia.mockImplementation(() => new Promise<MediaStream>((r) => (grantMic = r)));
@@ -219,6 +221,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  delete (Element.prototype as unknown as { requestPointerLock?: unknown }).requestPointerLock;
+  delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+  Object.defineProperty(document, "pointerLockElement", { value: null, configurable: true });
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -231,6 +236,7 @@ describe("SessionPage — a session that is over for this page releases the mic 
     await advance(5_500);
     expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
     releasedAfterVerdict();
+    expect(detachMicTrack).toHaveBeenCalled();
     expect(hud.channelOpen).toBe(true);
   });
 
@@ -324,5 +330,100 @@ describe("SessionPage — a session that may still be streaming keeps the mic an
     stillLive();
     await act(async () => lastOnRecovery?.({ ...failed, phase: "signaling-lost", message: "signaling closed (1006)" }));
     stillLive();
+  });
+});
+
+describe("SessionPage — work still in flight when the verdict lands cannot undo it (#524)", () => {
+  const openChannel = () =>
+    act(async () => lastOnChannel?.({ readyState: "open", onclose: null, send() {}, bufferedAmount: 0 }));
+  const revoke = () => {
+    currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+    return advance(5_500);
+  };
+
+  it("a takeover during a replacement-token mint discards the mint: no new transport", async () => {
+    let resolveMint: (v: unknown) => void = () => {};
+    mintSignalingToken.mockReturnValue(new Promise((r) => (resolveMint = r)));
+    renderPage();
+    await advance(1_000);
+    // Before media connects, signalling loss re-seats through a mint.
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "signaling-lost", message: "signaling closed (1006)" }));
+    expect(mintSignalingToken).toHaveBeenCalledTimes(1);
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await act(async () => resolveMint({ signaling: { url: "wss://x", token: "y" } }));
+    await advance(100);
+    expect(constructed).toBe(1);
+  });
+
+  it("a takeover during the mint's backoff ends the retries", async () => {
+    mintSignalingToken.mockRejectedValue(new ApiError(503, "unavailable", "control plane unavailable"));
+    renderPage();
+    await advance(1_000);
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "signaling-lost", message: "signaling closed (1006)" }));
+    await advance(100);
+    expect(mintSignalingToken).toHaveBeenCalledTimes(1);
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(30_000);
+    expect(mintSignalingToken).toHaveBeenCalledTimes(1);
+    expect(constructed).toBe(1);
+  });
+
+  it("a Pointer Lock grant that lands after the release is handed back", async () => {
+    let grant: () => void = () => {};
+    Object.defineProperty(Element.prototype, "requestPointerLock", {
+      value: () => new Promise<void>((r) => (grant = r)),
+      configurable: true,
+      writable: true,
+    });
+    const exitPointerLock = vi.fn(() => {
+      Object.defineProperty(document, "pointerLockElement", { value: null, configurable: true });
+      document.dispatchEvent(new Event("pointerlockchange"));
+    });
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
+
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    await act(async () => (hud.onGrab as () => void)());
+    await revoke();
+    expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
+
+    await act(async () => {
+      Object.defineProperty(document, "pointerLockElement", {
+        value: document.querySelector("video"),
+        configurable: true,
+      });
+      document.dispatchEvent(new Event("pointerlockchange"));
+      grant();
+    });
+
+    expect(exitPointerLock).toHaveBeenCalled();
+    expect(hud.inputCaptured).toBe(false);
+    expect(keyReachesBrowser("Tab")).toBe(true);
+    expect(keyReachesBrowser("Enter")).toBe(true);
+  });
+
+  it("a sender attach that resolves after the verdict leaves the mic off and detaches the track", async () => {
+    let resolveAttach: () => void = () => {};
+    attachMicTrack.mockImplementationOnce(() => new Promise<void>((r) => (resolveAttach = r)));
+    getUserMedia.mockResolvedValue(stream);
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    await act(async () => (hud.onToggleMic as () => void)());
+    expect(attachMicTrack).toHaveBeenCalledTimes(1);
+
+    await revoke();
+    expect(track.stopped).toBe(true);
+    detachMicTrack.mockClear();
+    await act(async () => resolveAttach());
+
+    expect(micIndicator()).toBeNull();
+    expect(hud.micOn).toBe(false);
+    expect(detachMicTrack).toHaveBeenCalled();
   });
 });
