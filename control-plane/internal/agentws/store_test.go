@@ -47,6 +47,13 @@ func testPool(t *testing.T) *pgxpool.Pool {
 		pool.Close()
 		t.Fatalf("seed the test enrollment token: %v", err)
 	}
+	// Production writes the boot row (StartRH05Boot) before admission; a fresh database has none
+	// until a test elsewhere happens to, and typed-agent registration fails without it.
+	if _, err := pool.Exec(ctx, `INSERT INTO rh05_control_boot(id,incarnation,started_at)
+		VALUES(true,gen_random_uuid(),now()) ON CONFLICT(id) DO NOTHING`); err != nil {
+		pool.Close()
+		t.Fatalf("seed the rh05 boot row: %v", err)
+	}
 	t.Cleanup(pool.Close)
 	return pool
 }
