@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1086,6 +1087,59 @@ func TestEmptyReportOverObservationsKeepsLibrary(t *testing.T) {
 	must(t, pool.QueryRow(ctx, `SELECT state, error FROM library_scans WHERE id=$1::uuid`, scan).Scan(&state, &msg))
 	if state != "failed" || msg == "" {
 		t.Errorf("scan state = %q error = %q; want failed with the reason recorded", state, msg)
+	}
+}
+
+// TestCappedReportPrunesAndRevokesNothing: a report that reached scanMaxEntries is a prefix of
+// the library in directory order, so what it omits is not uninstalled. It adds and updates, and
+// one entry shorter it is an ordinary report again.
+func TestCappedReportPrunesAndRevokesNothing(t *testing.T) {
+	pool := testDB(t)
+	f := newFixture(t, pool)
+	ctx := context.Background()
+
+	known := []ReportEntry{
+		{ExternalID: "517710", Name: "Redout: Enhanced Edition"},
+		{ExternalID: "620", Name: "Portal 2"},
+	}
+	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, known, nil)
+	must(t, err)
+	portal, _, _ := f.tile(t, "620")
+
+	// filler pads a report to n entries after the leading ones.
+	report := func(n int, lead ...ReportEntry) []ReportEntry {
+		out := append([]ReportEntry(nil), lead...)
+		for i := 0; len(out) < n; i++ {
+			out = append(out, ReportEntry{ExternalID: strconv.Itoa(1000 + i), Name: "Filler " + strconv.Itoa(i)})
+		}
+		return out
+	}
+
+	res, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host,
+		report(scanMaxEntries, known[0]), nil)
+	must(t, err)
+	if !res.Capped || res.Revoked != 0 {
+		t.Errorf("capped report: Capped = %v Revoked = %d, want true and 0", res.Capped, res.Revoked)
+	}
+	if _, has := f.entitlementGrantedBy(t, f.user, portal); !has {
+		t.Error("a capped report revoked an entitlement for a game it merely omitted")
+	}
+	if n := countT(t, pool, `SELECT count(*) FROM library_observations WHERE user_id=$1::uuid AND external_id='620'`, f.user); n != 1 {
+		t.Errorf("observation for the omitted game = %d, want 1", n)
+	}
+	if n := countT(t, pool, `SELECT count(*) FROM library_observations WHERE user_id=$1::uuid`, f.user); n != scanMaxEntries+1 {
+		t.Errorf("observations after a capped report = %d, want %d (new ones added, none pruned)", n, scanMaxEntries+1)
+	}
+
+	// One entry short of the cap the report is complete again, and the omitted game goes.
+	res, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host,
+		report(scanMaxEntries-1, known[0]), nil)
+	must(t, err)
+	if res.Capped {
+		t.Error("a report below the cap was treated as capped")
+	}
+	if _, has := f.entitlementGrantedBy(t, f.user, portal); has {
+		t.Error("an uncapped report that omits a game left its entitlement")
 	}
 }
 

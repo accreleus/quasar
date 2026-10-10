@@ -332,14 +332,33 @@ fn resolve_relative_root(root: &Path, rel: &str) -> Result<Option<PathBuf>, Stri
 /// any directory named `steamapps` at depth `<= SCAN_STEAMAPPS_MAX_DEPTH`, each
 /// globbed for `appmanifest_*.acf`, capped at `max_entries` total /
 /// `max_manifest_bytes` per file. A read failure on a directory or manifest
-/// the walk chose to read is an `Err`, never a shorter list (see `read_failure`).
+/// the walk chose to read, or running out of `SCAN_WALK_TIMEOUT`, is an `Err`,
+/// never a shorter list (see `read_failure`). `max_entries` is the documented
+/// per-scan cap (openapi `max_entries`) and stays a quiet stop.
 fn walk_and_parse(
     root_path: &Path,
     relative_roots: &[String],
     max_entries: usize,
     max_manifest_bytes: u64,
 ) -> Result<Vec<ManifestEntry>, String> {
-    let deadline = Instant::now() + SCAN_WALK_TIMEOUT;
+    walk_until(
+        root_path,
+        relative_roots,
+        max_entries,
+        max_manifest_bytes,
+        Instant::now() + SCAN_WALK_TIMEOUT,
+    )
+}
+
+/// `walk_and_parse` with the deadline passed in. Passing the deadline in keeps
+/// the timeout path testable without sleeping.
+fn walk_until(
+    root_path: &Path,
+    relative_roots: &[String],
+    max_entries: usize,
+    max_manifest_bytes: u64,
+    deadline: Instant,
+) -> Result<Vec<ManifestEntry>, String> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
 
@@ -360,7 +379,7 @@ fn walk_and_parse(
         SCAN_STEAMAPPS_MAX_DEPTH,
         deadline,
         &mut discovered,
-    );
+    )?;
     for d in discovered {
         if seen_dirs.insert(d.clone()) {
             dirs.push(d);
@@ -370,8 +389,11 @@ fn walk_and_parse(
     let mut out = Vec::new();
     let mut seen_appids: HashSet<String> = HashSet::new();
     for dir in &dirs {
-        if out.len() >= max_entries || Instant::now() >= deadline {
+        if out.len() >= max_entries {
             break;
+        }
+        if Instant::now() >= deadline {
+            return Err(timed_out());
         }
         collect_manifests(
             dir,
@@ -379,9 +401,19 @@ fn walk_and_parse(
             &mut seen_appids,
             max_entries,
             max_manifest_bytes,
+            deadline,
         )?;
     }
+    if Instant::now() >= deadline {
+        return Err(timed_out());
+    }
     Ok(out)
+}
+
+/// The scan-report `error` for a walk that ran out of time. A shorter list
+/// would read as "the rest was uninstalled", same as an unreadable directory.
+fn timed_out() -> String {
+    format!("library scan timed out after {SCAN_WALK_TIMEOUT:?}")
 }
 
 /// The scan-report `error` for a failed read. An empty result from an
@@ -392,38 +424,60 @@ fn read_failure(path: &Path, e: &std::io::Error) -> String {
     format!("reading {} failed: {:?}", path.display(), e.kind())
 }
 
+/// One item of a directory listing. `None` is an entry that vanished mid-walk
+/// (`NotFound`), skipped like the same error from `read_dir` or `symlink_metadata`.
+fn listed(
+    dir: &Path,
+    item: std::io::Result<std::fs::DirEntry>,
+) -> Result<Option<std::fs::DirEntry>, String> {
+    match item {
+        Ok(e) => Ok(Some(e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(read_failure(dir, &e)),
+    }
+}
+
 /// Bounded, depth-capped, containment-checked search for `steamapps`
 /// directories, modelled on `home::du`'s wall-clock + depth discipline.
 /// `depth` is the depth of `dir`'s immediate children. Checks every directory
 /// it descends into for a symlink before recursing — same discipline as
 /// `resolve_relative_root` and for the same reason: a symlinked `steamapps` (or
 /// an ancestor) could otherwise point outside `root_path`.
+///
+/// A directory the search must read but cannot (anything but `NotFound`) is an
+/// `Err`: skipping it could hide a whole library from a report that still lists
+/// another one. Running out of time is an `Err` for the same reason. The depth
+/// cap and the symlink refusal are deliberate limits, not failures.
 fn find_steamapps_dirs(
     dir: &Path,
     depth: u32,
     max_depth: u32,
     deadline: Instant,
     found: &mut Vec<PathBuf>,
-) {
-    if depth > max_depth || Instant::now() >= deadline {
-        return;
+) -> Result<(), String> {
+    if depth > max_depth {
+        return Ok(());
+    }
+    if Instant::now() >= deadline {
+        return Err(timed_out());
     }
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(read_failure(dir, &e)),
     };
     for entry in rd {
         if Instant::now() >= deadline {
-            return;
+            return Err(timed_out());
         }
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Some(entry) = listed(dir, entry)? else {
+            continue;
         };
         let path = entry.path();
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(read_failure(&path, &e)),
         };
         if meta.file_type().is_symlink() || !meta.is_dir() {
             continue;
@@ -432,8 +486,9 @@ fn find_steamapps_dirs(
             found.push(path);
             continue; // steamapps is never nested inside steamapps
         }
-        find_steamapps_dirs(&path, depth + 1, max_depth, deadline, found);
+        find_steamapps_dirs(&path, depth + 1, max_depth, deadline, found)?;
     }
+    Ok(())
 }
 
 /// Glob `appmanifest_*.acf` directly inside `dir` (Steam never nests them
@@ -442,13 +497,15 @@ fn find_steamapps_dirs(
 /// `relative_roots` and the depth walk must not double an entry.
 ///
 /// An absent `dir` is an empty library (`Ok`); any other read error on `dir`,
-/// one of its entries, or a manifest is `Err` so the scan reports `ok: false`.
+/// one of its entries, or a manifest is `Err` so the scan reports `ok: false`,
+/// and so is passing `deadline`.
 fn collect_manifests(
     dir: &Path,
     out: &mut Vec<ManifestEntry>,
     seen_appids: &mut HashSet<String>,
     max_entries: usize,
     max_manifest_bytes: u64,
+    deadline: Instant,
 ) -> Result<(), String> {
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -459,7 +516,12 @@ fn collect_manifests(
         if out.len() >= max_entries {
             return Ok(());
         }
-        let entry = entry.map_err(|e| read_failure(dir, &e))?;
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        let Some(entry) = listed(dir, entry)? else {
+            continue;
+        };
         let path = entry.path();
         let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -1028,7 +1090,15 @@ mod tests {
 
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        collect_manifests(&steamapps, &mut out, &mut seen, 512, 1_048_576).unwrap();
+        collect_manifests(
+            &steamapps,
+            &mut out,
+            &mut seen,
+            512,
+            1_048_576,
+            far_deadline(),
+        )
+        .unwrap();
         assert!(out.is_empty(), "a symlinked manifest must never be read");
     }
 
@@ -1094,7 +1164,15 @@ mod tests {
         }
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        collect_manifests(&steamapps, &mut out, &mut seen, 3, 1_048_576).unwrap();
+        collect_manifests(
+            &steamapps,
+            &mut out,
+            &mut seen,
+            3,
+            1_048_576,
+            far_deadline(),
+        )
+        .unwrap();
         assert_eq!(
             out.len(),
             3,
@@ -1122,7 +1200,7 @@ mod tests {
         // ~2000+. A cap of 300 sits strictly between them.
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        collect_manifests(&steamapps, &mut out, &mut seen, 512, 300).unwrap();
+        collect_manifests(&steamapps, &mut out, &mut seen, 512, 300, far_deadline()).unwrap();
         assert_eq!(
             out.len(),
             1,
@@ -1206,6 +1284,7 @@ mod tests {
             &mut HashSet::new(),
             512,
             1_048_576,
+            far_deadline(),
         )
         .unwrap();
         assert!(out.is_empty());
@@ -1245,6 +1324,104 @@ mod tests {
             err.contains("PermissionDenied"),
             "error names the kind: {err}"
         );
+    }
+
+    #[test]
+    fn unreadable_ancestor_met_during_discovery_fails_the_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = dir.path().join("hidden");
+        let visible = dir.path().join("visible");
+        for d in [&hidden, &visible] {
+            let steamapps = d.join("steamapps");
+            fs::create_dir_all(&steamapps).unwrap();
+            let appid = if d == &hidden { "111111" } else { "222222" };
+            write(
+                &steamapps.join(format!("appmanifest_{appid}.acf")),
+                &synth_manifest(appid),
+            );
+        }
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // No requested roots: both libraries are found only by discovery.
+        let result = walk_and_parse(dir.path(), &[], 512, 1_048_576);
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = result.expect_err("a hidden library must fail the scan, not shrink the report");
+        assert!(err.contains("hidden"), "error names the directory: {err}");
+        assert!(err.contains("PermissionDenied"), "{err}");
+    }
+
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn expired_deadline_in_manifest_collection_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("appmanifest_444444.acf"),
+            &synth_manifest("444444"),
+        );
+        let err = collect_manifests(
+            dir.path(),
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            512,
+            1_048_576,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn expired_deadline_fails_the_scan_instead_of_shortening_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let steamapps = dir.path().join("lib/steamapps");
+        fs::create_dir_all(&steamapps).unwrap();
+        write(
+            &steamapps.join("appmanifest_333333.acf"),
+            &synth_manifest("333333"),
+        );
+
+        // Discovery meets the expired deadline. (The between-directories check in
+        // `walk_until` needs the deadline to pass mid-walk, which is not testable
+        // without sleeping.)
+        let err = walk_until(dir.path(), &[], 512, 1_048_576, Instant::now()).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+
+        // A deadline in the future is an ordinary success.
+        let ok = walk_until(
+            dir.path(),
+            &[],
+            512,
+            1_048_576,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(ok.len(), 1);
+    }
+
+    #[test]
+    fn unreadable_directory_past_the_depth_cap_is_not_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut deep = dir.path().to_path_buf();
+        for i in 0..=SCAN_STEAMAPPS_MAX_DEPTH {
+            deep = deep.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::set_permissions(&deep, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = walk_and_parse(dir.path(), &[], 512, 1_048_576);
+        fs::set_permissions(&deep, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
