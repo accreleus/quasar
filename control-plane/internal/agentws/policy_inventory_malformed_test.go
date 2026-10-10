@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -167,6 +168,11 @@ func TestMalformedMultiPageInventoryKeepsRestriction(t *testing.T) {
 			first(x, t)
 			return x.page(t, snapshot, str("256"), nil, map[string]string{"hardware": "2"}, x.failedEntries(257, 1))
 		}},
+		{"attempt id not canonical", func(x *inventoryHarness, t *testing.T) []byte {
+			entry := x.entry(1, "idle_timeout_secs", "next_session")
+			entry.AttemptID = "{" + entry.AttemptID + "}"
+			return x.page(t, snapshot, nil, nil, map[string]string{}, []ConfigPolicyStateMsg{entry})
+		}},
 		{"cursor repeats on later page", func(x *inventoryHarness, t *testing.T) []byte {
 			first(x, t)
 			return x.page(t, snapshot, str("256"), str("256"), map[string]string{}, x.failedEntries(257, 256))
@@ -307,4 +313,60 @@ func TestKnownRestartAttemptReportedUnderAnotherGroupKeepsHold(t *testing.T) {
 		t.Fatalf("idle-apply hold = %d, err=%v", holds, err)
 	}
 	x.assertStillRestricted(t)
+}
+
+func TestOverCapPolicyInventoryIsRefused(t *testing.T) {
+	const snapshot = "00000000-0000-4000-8000-000000000306"
+	t.Run("last page reaches the cap", func(t *testing.T) {
+		x := newInventoryHarness(t)
+		cursor := strconv.Itoa(maxPolicyInventoryEntries - 256)
+		x.c.policyInventoryCursor = &cursor
+		page := x.page(t, snapshot, &cursor, nil, map[string]string{}, x.failedEntries(1, 256))
+		if err := x.h.acceptPolicyInventoryPage(context.Background(), x.c, page); err != nil || !x.c.policyInventoryDone.Load() {
+			t.Fatalf("inventory at the cap: done=%v err=%v", x.c.policyInventoryDone.Load(), err)
+		}
+	})
+	t.Run("one entry past it", func(t *testing.T) {
+		x := newInventoryHarness(t)
+		cursor := strconv.Itoa(maxPolicyInventoryEntries)
+		x.c.policyInventoryCursor = &cursor
+		page := x.page(t, snapshot, &cursor, nil, map[string]string{}, x.failedEntries(1, 1))
+		if err := x.h.acceptPolicyInventoryPage(context.Background(), x.c, page); err == nil {
+			t.Fatal("over-cap inventory accepted")
+		}
+		if !x.c.policyInventoryUnknown || !x.c.policyInventoryBlocked.Load() || x.c.policyInventoryDone.Load() {
+			t.Fatalf("over-cap inventory: unknown=%v blocked=%v done=%v", x.c.policyInventoryUnknown, x.c.policyInventoryBlocked.Load(), x.c.policyInventoryDone.Load())
+		}
+		if len(x.c.policySequence) != 0 {
+			t.Fatalf("over-cap page cached %d entries", len(x.c.policySequence))
+		}
+		x.assertStillRestricted(t)
+	})
+}
+
+// retainedPolicyBytes is what the connection keeps for one attempt beyond its id.
+func retainedPolicyBytes(t *testing.T, c *conn, attemptID string) int {
+	t.Helper()
+	outstanding, err := json.Marshal(c.policyOutstanding[attemptID])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(c.policySequenceContent[attemptID]) + len(outstanding)
+}
+
+func TestInventoriedAttemptRetainsOnlyItsIdentity(t *testing.T) {
+	x := newInventoryHarness(t)
+	entry := x.entry(1, "idle_timeout_secs", "next_session")
+	entry.Phase = "accepted"
+	entry.Error = json.RawMessage(`{"code":"x","detail":"` + strings.Repeat("e", 64<<10) + `"}`)
+	page := x.page(t, "00000000-0000-4000-8000-000000000306", nil, nil, map[string]string{}, []ConfigPolicyStateMsg{entry})
+	if err := x.h.acceptPolicyInventoryPage(context.Background(), x.c, page); err != nil {
+		t.Fatal(err)
+	}
+	if _, outstanding := x.c.policyOutstanding[entry.AttemptID]; !outstanding {
+		t.Fatal("unfinished attempt not outstanding")
+	}
+	if n := retainedPolicyBytes(t, x.c, entry.AttemptID); n > 1024 {
+		t.Fatalf("a 64 KiB inventory entry retains %d bytes", n)
+	}
 }

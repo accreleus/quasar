@@ -2,6 +2,7 @@ package agentws
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,7 +86,7 @@ type conn struct {
 	policyIssued              map[string]*hostcfg.PolicyOffer // next_session grants sent on this connection
 	policyNudge               chan struct{}
 	policySequence            map[string]uint64
-	policySequenceContent     map[string][]byte
+	policySequenceContent     map[string][sha256.Size]byte
 	policyUncertain           bool
 	policyRefreshPending      bool
 	policyDeliveryID          string

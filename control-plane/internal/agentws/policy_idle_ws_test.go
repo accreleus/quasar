@@ -3,12 +3,16 @@ package agentws
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
+	"github.com/gorilla/websocket"
 )
 
 // Once the durable current-connection journal and legacy map are complete,
@@ -94,5 +98,113 @@ func TestIdleOfferAfterCompletedCurrentJournal(t *testing.T) {
 		}
 	default:
 		t.Fatal("durably ready idle approval was not offered")
+	}
+}
+
+// A restart-scope report is checked against the durable idle journal before
+// its sequence is cached, so fabricated attempt ids cannot grow the connection.
+func TestFabricatedRestartAttemptsAreNotCached(t *testing.T) {
+	pool := testPool(t)
+	store := hostcfg.NewStore(pool)
+	ctx := context.Background()
+	boot, err := store.StartRH05Boot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	registry := NewRegistry(log)
+	h := NewHandler(pool, log, registry, nil, nil, store, nil, boot)
+	t.Cleanup(h.Close)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ws.Close() })
+	_ = ws.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if err := ws.WriteJSON(map[string]any{
+		"type": "register", "node_name": "fabricated-restart-test", "agent_version": "test",
+		"auth":                   map[string]string{"enrollment_token": testEnrollmentToken},
+		"config_policy_versions": map[string]int{"typed_settings": 2, "execution_journal": 1, "deployment_baseline": 1, "idle_apply": 1},
+		"config_policy_groups":   []string{"hardware"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var registered map[string]any
+	if err := ws.ReadJSON(&registered); err != nil {
+		t.Fatal(err)
+	}
+	hostID, _ := registered["host_id"].(string)
+	if hostID == "" {
+		t.Fatalf("registered without host id: %+v", registered)
+	}
+	if err := ws.WriteJSON(map[string]any{
+		"type": "capacity", "host": map[string]any{"cpu_cores": 8, "mem_mb": 32000},
+		"gpus":                          []map[string]any{{"index": 0, "vendor": "nvidia", "model": "test", "vram_mb_total": 16384, "encode_slots_total": 2}},
+		"config_policy_accepted_groups": []string{"hardware"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	attemptID := "0000abcd-0000-4000-8000-000000000501"
+	grantConnection := "00000000-0000-4000-8000-000000000502"
+	digest := strings.Repeat("a", 64)
+	if _, err := pool.Exec(ctx, `INSERT INTO host_config_approvals(id,host_id,group_key,revision,approved_digest,prerequisites_digest,boot_incarnation,review_id,expires_at,state)
+		VALUES($1::uuid,$2::uuid,'hardware',1,$3,$3,$4::uuid,'00000000-0000-4000-8000-000000000503',now()+interval '1 hour','offered')`,
+		attemptID, hostID, digest, boot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_config_attempts(id,host_id,group_key,approved_digest,approved_revision,scope,boot_incarnation,grant_connection,phase)
+		VALUES($1::uuid,$2::uuid,'hardware',$3,1,'restart',$4::uuid,$5::uuid,'offered')`,
+		attemptID, hostID, digest, boot, grantConnection); err != nil {
+		t.Fatal(err)
+	}
+	report := func(id, connection string) ConfigPolicyStateMsg {
+		return ConfigPolicyStateMsg{
+			Type: "config_policy_state", AttemptID: id, HostID: hostID, Group: "hardware", Revision: "1",
+			ContentSHA256: digest, Scope: "restart", GrantBootIncarnation: boot,
+			GrantConnectionIncarnation: connection, JournalSequence: "1", Phase: "accepted",
+		}
+	}
+	for i := range 3 {
+		if err := ws.WriteJSON(report(fmt.Sprintf("00000000-0000-4000-8000-%012d", 600+i), grantConnection)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The real attempt under a grant connection it was never offered on.
+	if err := ws.WriteJSON(report(attemptID, "00000000-0000-4000-8000-000000000504")); err != nil {
+		t.Fatal(err)
+	}
+	// Other spellings of the real id: a ::uuid cast resolves each to its row,
+	// and each would be its own cache key.
+	for _, alias := range []string{strings.ToUpper(attemptID), "{" + attemptID + "}", strings.ReplaceAll(attemptID, "-", "")} {
+		if err := ws.WriteJSON(report(alias, grantConnection)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ws.WriteJSON(report(attemptID, grantConnection)); err != nil {
+		t.Fatal(err)
+	}
+	// Frames are handled in order, so the valid one landing means all were read.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var phase string
+		if err := pool.QueryRow(ctx, `SELECT phase FROM host_config_attempts WHERE id=$1::uuid`, attemptID).Scan(&phase); err != nil {
+			t.Fatal(err)
+		}
+		if phase == "accepted" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("valid restart report not observed: phase=%q", phase)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c, ok := registry.get(hostID)
+	if !ok {
+		t.Fatal("connection gone")
+	}
+	if _, cached := c.policySequence[attemptID]; !cached || len(c.policySequence) != 1 || len(c.policySequenceContent) != 1 {
+		t.Fatalf("sequence cache holds %d/%d entries, want only the valid attempt", len(c.policySequence), len(c.policySequenceContent))
 	}
 }
