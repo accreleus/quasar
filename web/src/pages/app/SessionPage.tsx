@@ -47,7 +47,12 @@ import {
   SessionBannerHost,
 } from "./sessionAlerts";
 import { SessionLoader } from "./SessionLoader";
-import { accessRevokedFailure, takenOverFailure, unreachableFailure } from "./sessionFailure";
+import {
+  accessRevokedFailure,
+  outranksHandoff,
+  takenOverFailure,
+  unreachableFailure,
+} from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
@@ -721,10 +726,11 @@ export function SessionPage() {
   const revealReady = channelOpen && appPresented;
   const [loaderDone, setLoaderDone] = useState(false);
   const loaderDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // A terminal verdict holds the loader: it is the surface that states one
-  // (SessionLoader shows it whatever its handoff reached), and removing it
-  // mid-reveal would take the verdict off screen with it.
-  const holdLoader = launchFailure != null;
+  // A verdict that outranks the handoff holds the loader: SessionLoader shows
+  // it whatever the handoff reached, and removing the loader mid-reveal would
+  // take the verdict off screen with it. Any other verdict leaves the removal
+  // alone, so a stream that still works is never covered.
+  const holdLoader = outranksHandoff(launchFailure);
   useEffect(() => {
     if (revealReady && !loaderDone && !holdLoader) {
       loaderDoneTimerRef.current = setTimeout(() => setLoaderDone(true), LOADER_UNMOUNT_MS);
@@ -781,21 +787,24 @@ export function SessionPage() {
       : null;
 
   // #516: the control plane's reason stands in for the recovery notice the dead
-  // transport raises. While the loader is up it shows the verdict itself, above
-  // the banners, so neither banner renders then.
+  // transport raises.
   const revoked = launchFailure?.kind === "access_revoked" ? launchFailure : null;
   const accessRevoked = loaderDone ? revoked : null;
+  // While the loader holds a verdict it is the one alert on the page: a banner
+  // under it is covered but still announced, and its buttons still take focus.
+  const loaderHoldsVerdict = !loaderDone && holdLoader;
 
   // Whether any of the banner blocks below is on screen. The HUD takes
   // no banner-state input, so it is carried as a class on the shared ancestor
   // instead — `.session-root.banner-on` pushes a top-docked HUD down (hud.css).
   const bannerOn =
-    health != null ||
-    clientUnsupported ||
-    accessRevoked != null ||
-    (!revoked &&
-      recovery != null &&
-      ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase));
+    !loaderHoldsVerdict &&
+    (health != null ||
+      clientUnsupported ||
+      accessRevoked != null ||
+      (!revoked &&
+        recovery != null &&
+        ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase)));
 
   // Same shape, for the mic "hot" pill vs the toast host (`.session-root.mic-on`).
   const rootClassName =

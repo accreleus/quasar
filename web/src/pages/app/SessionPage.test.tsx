@@ -130,7 +130,10 @@ vi.mock("../../webrtc/session", () => ({
       lastOnRecovery = onRecoveryState ?? null;
     }
     close() {}
-    signalingUnrecoverable() {}
+    // As QuasarSession does: abandoning the reconnect terminalises recovery.
+    signalingUnrecoverable(message: string) {
+      lastOnRecovery?.({ phase: "failed", attempt: 0, maxAttempts: 3, message });
+    }
     getStats() {
       return Promise.resolve({});
     }
@@ -926,80 +929,138 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     expect(screen.queryByText("Your access to this app was removed")).toBeNull();
   });
 
-  // The loader's handoff latches at the reveal and takes 1400 ms. A session
-  // that ended inside it left the verdict in a transparent, inert loader that
-  // was never removed, which also held the banner back: nothing on screen.
+  // The loader's handoff latches at the reveal and takes 1400 ms. Only a
+  // verdict that outranks it (sessionFailure.outranksHandoff) may take the
+  // loader back: the control plane's word that the session is over. The
+  // client's own verdicts leave the reveal alone, as before #516.
   const refused = () =>
     mintSignalingToken.mockRejectedValue(
       new ApiError(409, "session_not_reconnectable", "session is not reconnectable"),
     );
   const failed = { phase: "failed", attempt: 0, maxAttempts: 3, message: "signaling: session not found or already ended" };
-  it.each([
-    [
-      "an entitlement revoke",
-      "Your access to this app was removed",
-      (ch: { onclose: (() => void) | null }) => {
-        currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
-        refused();
-        ch.onclose?.();
-        lastOnRecovery?.(failed);
-      },
-    ],
-    [
-      "an unreachable transport",
-      "Could not reach the stream",
-      (ch: { onclose: (() => void) | null }) => {
-        currentSession = makeSession({ state: "stopped", stop_reason: null });
-        refused();
-        ch.onclose?.();
-        lastOnRecovery?.(failed);
-      },
-    ],
-    [
-      // The channel stays open: the reveal gate never retracts, and the loader
-      // used to be removed with the verdict in it.
-      "a takeover",
-      "This session moved to another tab",
-      () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }),
-    ],
-  ])("keeps the verdict on screen when the session ends inside the loader handoff: %s", async (_label, title, end) => {
+  type Channel = { onclose: (() => void) | null };
+
+  /** Mounts, opens the channel and stops `intoRevealMs` after the reveal began. */
+  async function intoTheReveal(intoRevealMs: number): Promise<Channel> {
     currentSession = makeSession({ state: "running", state_detail: "app presented" });
     renderPage();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
-    let ch = { onclose: null as (() => void) | null };
+    let ch: Channel = { onclose: null };
     await act(async () => {
       ch = openChannel();
     });
-    // 300 ms into the 1400 ms reveal: the handoff has latched, nothing is removed yet.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(300);
+      await vi.advanceTimersByTimeAsync(intoRevealMs);
     });
     expect(document.querySelector(".sl-root")?.className).toContain("is-locking");
+    return ch;
+  }
+  /** Past the lock (1180 ms) and the loader's removal (1400 ms). In 100 ms
+   *  steps: one long act() lets every timer fire before React renders once, so
+   *  a verdict could never cancel the removal that follows it. */
+  const settleTheReveal = async () => {
+    for (let i = 0; i < 30; i++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+    }
+  };
+  const alerts = () => screen.queryAllByRole("alert").map((el) => el.textContent ?? "");
 
+  it("brings the loader back for a revoke that lands inside the handoff, as the only alert", async () => {
+    const ch = await intoTheReveal(300);
     await act(async () => {
-      end(ch);
+      currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+      refused();
+      ch.onclose?.();
+      lastOnRecovery?.(failed);
       await vi.advanceTimersByTimeAsync(100);
     });
-    // Past the lock (1180 ms) and the removal (1400 ms).
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(3_000);
-    });
+    await settleTheReveal();
 
     const loader = document.querySelector(".sl-root");
-    expect(loader?.textContent).toContain(title);
+    expect(loader?.textContent).toContain("Your access to this app was removed");
     expect(loader?.className).not.toMatch(/is-locking|is-streaming/);
     expect(loader?.hasAttribute("inert")).toBe(false);
     expect(loader?.getAttribute("aria-hidden")).toBeNull();
     expect(loader?.querySelector("button")?.textContent).toBe("Back to library");
-    // One surface: the banner stands down while the loader states the verdict.
-    expect(document.querySelector(".banner")?.textContent ?? "").not.toContain(title);
-    // And for a revoke the recovery notice never renders, even under the loader:
-    // it is an alert, and it says the thing the verdict replaces.
-    if (title.startsWith("Your access")) {
-      expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+    // The recovery notice says the thing the verdict replaces; under the loader
+    // it would be covered but still announced, and its button focusable.
+    expect(document.querySelector(".banner")).toBeNull();
+    expect(alerts()).toHaveLength(1);
+  });
+
+  it("never covers a stream that still works: signalling gives up inside the handoff", async () => {
+    // A slow app boot with the control plane away: every mint answers 503 until
+    // the 120 s budget runs out, which lands 1000 ms into the reveal. Media and
+    // input never stopped (the channel stays open).
+    currentSession = makeSession({ state: "running", state_detail: "app booting" });
+    mintSignalingToken.mockRejectedValue(new ApiError(503, "unavailable", "control plane unavailable"));
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      openChannel();
+      lastOnRecovery?.({ ...failed, phase: "signaling-lost", message: "signaling closed (1006)" });
+    });
+    // Backoff 1+2+4+8+16×6 s: the mint that exhausts the budget runs at ~112 s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(109_500);
+    });
+    expect(mintSignalingToken.mock.calls.length).toBeGreaterThan(5);
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+    // The reveal has begun and the client has not given up yet.
+    expect(document.querySelector(".sl-root")?.className).toContain("is-locking");
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+
+    await settleTheReveal();
+
+    // The loader went as it always did; the recovery banner states the verdict.
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(screen.getByText("Connection recovery stopped").closest(".banner")?.textContent).toContain(
+      "this session can no longer be resumed",
+    );
+    expect(alerts()).toHaveLength(1);
+    expect(lastDrawerProps?.channelOpen).toBe(true);
+  });
+
+  it("shows one alert, not two, when the transport fails inside the handoff", async () => {
+    const ch = await intoTheReveal(300);
+    await act(async () => {
+      currentSession = makeSession({ state: "stopped", stop_reason: null });
+      refused();
+      ch.onclose?.();
+      lastOnRecovery?.(failed);
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    await settleTheReveal();
+
+    expect(alerts()).toEqual([expect.stringContaining("Connection recovery stopped")]);
+    // The handoff is not taken back for a client-side verdict: what is left of
+    // the loader is transparent, out of the accessibility tree and focus order.
+    const loader = document.querySelector(".sl-root");
+    if (loader) {
+      expect(loader.className).toContain("is-streaming");
+      expect(loader.hasAttribute("inert")).toBe(true);
+      expect(loader.getAttribute("aria-hidden")).toBe("true");
     }
+  });
+
+  it("leaves the reveal alone for a takeover: signalling closed, the picture may still be live", async () => {
+    await intoTheReveal(300);
+    await act(async () => {
+      lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" });
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    await settleTheReveal();
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(alerts()).toHaveLength(0);
   });
 });
 

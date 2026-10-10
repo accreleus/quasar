@@ -13,7 +13,7 @@ import "./SessionLoader.css";
 import { Button } from "../../components/Button";
 import { QuasarMark } from "../../components/QuasarMark";
 import { CollapsibleLogTail } from "../../components/SessionFailureDetail";
-import type { LaunchFailure } from "./sessionFailure";
+import { outranksHandoff, type LaunchFailure } from "./sessionFailure";
 import { AccretionVisual } from "./AccretionVisual";
 import { GlyphRail } from "./GlyphRail";
 import { derivePhase, stallPhaseForStep } from "./loaderPhases";
@@ -214,10 +214,10 @@ export function SessionLoader({
   const keepWaiting = useCallback(() => setWaitAgain((n) => n + 1), []);
 
   const terminal = failure != null;
-  // A terminal verdict outranks the handoff. The handoff latches, so a verdict
-  // that lands after it began (the transport died inside the reveal) would
-  // otherwise render in a transparent, inert scene and never be seen.
-  const shownScene = terminal ? "idle" : scene;
+  // The handoff latches, so a verdict that lands after it began renders in a
+  // transparent, inert scene. One that outranks the handoff takes the scene
+  // back; any other must leave the stream uncovered (outranksHandoff).
+  const shownScene = outranksHandoff(failure) ? "idle" : scene;
 
   // `inert` is not in React 18's JSX attribute set; setting it on the node keeps
   // the faded-out scene out of focus order and the accessibility tree together.
