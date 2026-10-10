@@ -1647,7 +1647,8 @@ fn register_message(
         updater_present: install.updater_present,
         recovery_actor_version: owned
             .then(|| install.recovery_actor_version.clone())
-            .flatten(),
+            .flatten()
+            .filter(|v| crate::buildinfo::actor_version_shape(v)),
         recovery_actor_source_commit: owned
             .then(|| install.recovery_actor_source_commit.clone())
             .flatten(),
@@ -6047,6 +6048,24 @@ mod tests {
         assert!(
             owned.get("seed_version").is_none(),
             "absent, not null: {owned}"
+        );
+
+        let owned_dev = register(&crate::buildinfo::InstallFacts {
+            install_mode: Some(crate::buildinfo::InstallMode::Owned),
+            updater_present: Some(true),
+            recovery_actor_version: Some("dev".into()),
+            recovery_actor_source_commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            seed_version: None,
+            engine: Default::default(),
+        });
+        assert_eq!(owned_dev["install_mode"], "owned");
+        assert!(
+            owned_dev.get("recovery_actor_version").is_none(),
+            "non-semver version should be filtered: {owned_dev}"
+        );
+        assert_eq!(
+            owned_dev["recovery_actor_source_commit"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
         let compose = register(&crate::buildinfo::InstallFacts {
