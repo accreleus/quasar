@@ -64,6 +64,7 @@ own; the two do not move together, and that is deliberate.
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
 
 ### Fixed
+- **The node agent no longer sends a non-semver recovery_actor_version on edge builds (#507).** The recovery actor on an edge (develop) build reports its version as `dev`. The agent now filters it: only semver versions reach the wire, matching the control plane's contract rule that non-matching values are treated as absent. The local readiness fact remains unchanged (an operator still sees the raw `dev` value), so the edge-build fact is visible when needed.
 - **A hand-installed Fedora stack's Steam sessions were silent (#478).** `prepare-host.sh`
   loads the `quasar-nested-audio` SELinux module on every SELinux host (#476), but the
   quick start's manual host steps never emitted it (only the NVIDIA device rule), and a
