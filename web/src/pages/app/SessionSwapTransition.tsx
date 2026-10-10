@@ -30,7 +30,7 @@ export function SessionSwapTransition({ transition }: SessionSwapTransitionProps
       {transition && (transition.phase === "error" || transition.phase === "timeout") ? (
         <div className="sw-err">
           {transition.phase === "timeout"
-            ? "Still waiting on a confirmation from the host. The session is unaffected — check back in a moment."
+            ? "Still waiting on a confirmation from the host. The switch may still finish. If the host never picked it up, the session will end shortly."
             : transition.message}
         </div>
       ) : (

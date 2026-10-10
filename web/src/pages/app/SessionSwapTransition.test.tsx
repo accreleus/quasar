@@ -36,7 +36,9 @@ describe("SessionSwapTransition", () => {
   it("shows a plain message on timeout, distinct from the switching subtitle", () => {
     render(<SessionSwapTransition transition={{ phase: "timeout", appName: "Purple App" }} />);
     expect(screen.queryByText("Starting…")).toBeNull();
-    expect(screen.getByText(/taking longer than expected|check back/i)).toBeTruthy();
+    expect(screen.getByText(/still waiting on a confirmation from the host/i)).toBeTruthy();
+    // An unresolved switch can end the session (control-api.md amendment 23).
+    expect(screen.queryByText(/unaffected/i)).toBeNull();
   });
 
   it("carries no focusable content in any phase", () => {
