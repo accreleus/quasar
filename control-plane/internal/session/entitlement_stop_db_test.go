@@ -404,6 +404,78 @@ func TestSwapMarkerSurvivesProgressCallbacks(t *testing.T) {
 	}
 }
 
+type noAgentDispatcher struct{ *fakeDispatcher }
+
+func (noAgentDispatcher) CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool) {
+	return nil, false
+}
+
+// TestUncertainUnmanagedSwapAckKeepsTheSwapPending — the unmanaged counterpart
+// of TestUncertainManagedSwapAckRetainsHomeHold. A transport error that does not
+// prove the frame never left must keep the pending target and the `swapping`
+// marker: the agent may have taken the swap, and its "swap complete" then has to
+// commit app_id, or the row names an app the session no longer runs.
+func TestUncertainUnmanagedSwapAckKeepsTheSwapPending(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		dispatch func(*fakeDispatcher) Dispatcher
+		wantKept bool
+	}{
+		{"queued, ack lost", func(f *fakeDispatcher) Dispatcher {
+			return &homeEpochDispatcher{fakeDispatcher: f,
+				epochs: []*scriptedHomeEpoch{{queued: true, err: context.DeadlineExceeded}}}
+		}, true},
+		{"dispatcher cannot say whether it queued", func(f *fakeDispatcher) Dispatcher {
+			f.ackSendErr = errors.New("ack lost")
+			return f
+		}, true},
+		{"never queued", func(f *fakeDispatcher) Dispatcher {
+			return &homeEpochDispatcher{fakeDispatcher: f,
+				epochs: []*scriptedHomeEpoch{{err: agentws.ErrSendQueueFull}}}
+		}, false},
+		{"agent not connected", func(f *fakeDispatcher) Dispatcher { return noAgentDispatcher{f} }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := testDB(t)
+			store := NewStore(pool)
+			s := seed(t, pool, 4)
+			ctx := context.Background()
+			sess := runningSession(t, store, s)
+			target := insertApp(t, pool, "target", 512, 1) // unmanaged
+			swap := newSwapper(store, tc.dispatch(newFakeDispatcher(true)), testLogger(), nil)
+
+			// What Swap has done by the time it dispatches.
+			swap.noteSwapStart(sess.ID)
+			must(t, store.GuardPlacementForSwap(ctx, sess.ID, target, s.hostID))
+			swap.pendingSwaps[sess.ID] = target
+			swap.dispatchSwap(s.hostID, sess.ID, []byte(`{}`), false, s.userID, target, nil, nil)
+
+			got, err := store.Get(ctx, sess.ID)
+			must(t, err)
+			_, pending := swap.pendingSwaps[sess.ID]
+			if !tc.wantKept {
+				if pending || got.StateDetail == nil || *got.StateDetail != swapDetailRejected {
+					t.Fatalf("frame that never left: pending=%v detail=%v, want cleared and %q", pending, got.StateDetail, swapDetailRejected)
+				}
+				return
+			}
+			if !pending || got.StateDetail == nil || *got.StateDetail != swapDetailInProgress {
+				t.Fatalf("uncertain ack: pending=%v detail=%v, want kept and %q", pending, got.StateDetail, swapDetailInProgress)
+			}
+			if _, err := swap.Swap(ctx, sess.ID, target); !errors.Is(err, ErrSessionNotSwappable) {
+				t.Errorf("a second swap while the first is unresolved: %v, want ErrSessionNotSwappable", err)
+			}
+			// The agent did take it: its completion still commits the target.
+			swap.handleSwapCallback(ctx, agentws.SessionStateMsg{SessionID: sess.ID, State: "running", Detail: swapDetailComplete})
+			got, err = store.Get(ctx, sess.ID)
+			must(t, err)
+			if got.AppID != target {
+				t.Fatalf("swap complete after a lost ack: app_id=%s, want the target %s", got.AppID, target)
+			}
+		})
+	}
+}
+
 // TestTokenConsumeWaitsForAStopInFlight — the consume locks the session row, so
 // it cannot read `running`, lose the race to a stop, and still attach.
 func TestTokenConsumeWaitsForAStopInFlight(t *testing.T) {

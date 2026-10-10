@@ -174,9 +174,13 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 }
 
 // dispatchSwap sends session_swap_app and waits for the ack. An explicit agent
-// rejection clears the pending target. A managed-home transport error leaves
-// the guard in place: the agent may have accepted a command whose ack was lost.
-// On accept, progress arrives via AgentState.
+// rejection clears the pending target, and so does a frame proven never to have
+// left the control plane. Any other transport error leaves the pending target
+// and the `swapping` marker in place, for a managed and an unmanaged target
+// alike: the agent may have accepted a command whose ack was lost, and its
+// "swap complete" must still be able to commit app_id. A swap it never ran is
+// ended by the sweep (swapUnresolvedAfter). On accept, progress arrives via
+// AgentState.
 func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, managedHome bool,
 	userID, canonicalAppID string, epoch agentws.HomeCommandEpoch, hold *HomeHoldDecision) {
 	app := runtimeSpec
@@ -184,14 +188,29 @@ func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, man
 		app = []byte("{}")
 	}
 	cmd := agentws.SessionSwapAppCmd{Type: "session_swap_app", ID: newCmdID(), SessionID: sessionID, App: app}
+	// Only an epoch reports whether the frame was queued. Swap takes one for a
+	// managed home; an unmanaged target gets its own here. provable stays false
+	// for a dispatcher with no epochs, where no error proves non-delivery.
+	provable := epoch != nil
+	if epoch == nil {
+		if provider, ok := s.dispatcher.(interface {
+			CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool)
+		}); ok {
+			provable = true
+			epoch, _ = provider.CurrentHomeCommandEpoch(hostID)
+		}
+	}
 	var res agentws.AckResult
 	var err error
 	var queued bool
 	for attempt := 0; attempt < 3; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), swapAckTimeout)
-		if epoch != nil {
+		switch {
+		case epoch != nil:
 			res, queued, err = epoch.SendWithAck(ctx, cmd.ID, cmd)
-		} else {
+		case provable:
+			err = agentws.ErrAgentNotConnected // no connection to hand the frame to
+		default:
 			res, err = s.dispatcher.SendWithAck(ctx, hostID, cmd.ID, cmd)
 			queued = err == nil
 		}
@@ -223,10 +242,11 @@ func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, man
 			reason = res.Error
 		}
 		s.log.Warn("swap rejected/undeliverable", "session_id", sessionID, "reason", reason)
-		if err != nil && managedHome && (epoch == nil || queued) {
+		if err != nil && (!provable || queued) {
 			// A timeout/lost ack does not prove that the agent never accepted
-			// the swap. Retain the hold after queue handoff or when a legacy
-			// dispatcher cannot prove the frame stayed out of its queue.
+			// the swap. Retain the pending target, the marker and any home hold
+			// after queue handoff, or when a legacy dispatcher cannot prove the
+			// frame stayed out of its queue.
 			return
 		}
 		if err == nil && !res.OK || err != nil && !queued {
