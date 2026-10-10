@@ -256,7 +256,7 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 		"granted", res.Granted, "revoked", res.Revoked, "rejected", res.Rejected,
 		"backfilled", res.Backfilled)
 	if res.Capped {
-		h.log.Warn("library: scan hit the entry cap; nothing pruned or revoked for it",
+		h.log.Warn("library: scan hit the entry cap; games absent from it were not pruned or revoked",
 			"scan_id", req.ScanID, "user_id", res.UserID, "host_id", hostID, "entries", len(req.Entries))
 	}
 	h.resolveCreatedArtwork(r.Context(), req.ScanID, res.CreatedAppIDs)

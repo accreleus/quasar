@@ -234,7 +234,7 @@ type ReconcileResult struct {
 	// filled in. See the backfill step at the end of Reconcile.
 	Backfilled int
 	// Capped: the report reached scanMaxEntries, so it is a prefix of the library and not
-	// evidence of absence; nothing was pruned or revoked for it. UserID is for the caller's log.
+	// evidence of absence; no game was pruned or revoked for being absent from it. UserID is for the caller's log.
 	Capped bool
 	UserID string
 	// CreatedAppIDs are the apps.id of the tiles step 3 created — exactly Created of them, in
