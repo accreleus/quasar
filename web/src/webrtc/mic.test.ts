@@ -229,4 +229,35 @@ describe("MicCapture", () => {
     expect(onEnded).toHaveBeenCalledOnce();
     expect(mic.active).toBe(false);
   });
+
+  it("releases a grant that arrives after stop() and reports it as cancelled", async () => {
+    const track = fakeTrack();
+    let grant: (s: MediaStream) => void = () => {};
+    stubGum(() => new Promise((resolve) => (grant = resolve)));
+    const mic = new MicCapture();
+    const started = mic.start();
+    mic.stop();
+    grant(fakeStream(track));
+    await expect(started).rejects.toMatchObject({ detail: { kind: "cancelled" } });
+    expect(track.stopped).toBe(true);
+    expect(mic.active).toBe(false);
+  });
+
+  it("reports a denial that arrives after stop() as cancelled, not as a permission error", async () => {
+    let deny: (e: unknown) => void = () => {};
+    stubGum(() => new Promise((_, reject) => (deny = reject)));
+    const mic = new MicCapture();
+    const started = mic.start();
+    mic.stop();
+    deny(Object.assign(new Error("no"), { name: "NotAllowedError" }));
+    await expect(started).rejects.toMatchObject({ detail: { kind: "cancelled" } });
+  });
+
+  it("a stop() before start() does not cancel it", async () => {
+    stubGum(() => Promise.resolve(fakeStream(fakeTrack())));
+    const mic = new MicCapture();
+    mic.stop();
+    await expect(mic.start()).resolves.toBeTruthy();
+    expect(mic.active).toBe(true);
+  });
 });

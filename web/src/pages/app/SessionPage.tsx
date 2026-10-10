@@ -440,6 +440,25 @@ export function SessionPage() {
     };
   }, [signalCoords]);
 
+  // This page can no longer continue the session. `unreachable` and a failed
+  // recovery also fire when only signalling gave up and media still flows, so
+  // they count once the input channel is gone too; the rest are server or
+  // close-code verdicts (a takeover leaves the single-peer agent serving the
+  // other tab).
+  const sessionOver =
+    hostLost ||
+    (launchFailure != null && (launchFailure.kind !== "unreachable" || !channelOpen)) ||
+    (recovery?.phase === "failed" && !channelOpen);
+
+  // Release what leaving the page releases, without destroying the transport:
+  // a destroy would say `bye` to a session another tab now owns.
+  useEffect(() => {
+    if (!sessionOver) return;
+    micRef.current?.stop();
+    setMicOn(false);
+    runtimeRef.current?.release();
+  }, [sessionOver]);
+
   // Must toggle, not just request: the drawer's row relabels to "Release
   // input" while captured, and in fallback mode it's a primary way out.
   const handleGrab = useCallback(() => {
@@ -458,6 +477,7 @@ export function SessionPage() {
     // engage() itself runs synchronously inside the gesture (requestPointerLock
     // requires that); only its RESULT is awaited. Null means the channel is not
     // open, and every control offering this is disabled in that state.
+    if (sessionOver) return;
     const engaging = rt?.engage();
     if (!engaging) return;
 
@@ -495,14 +515,14 @@ export function SessionPage() {
 
     // The HUD collapses itself when capture engages (Hud.tsx): the picture is
     // the point of capturing, and a shelf over it is not.
-  }, [addToast]);
+  }, [addToast, sessionOver]);
 
   // Mic spec §3.4: enable runs from the button click and is the only path
   // that calls getUserMedia; disable detaches the sender track and stops the device.
   const handleToggleMic = useCallback(async () => {
     const mic = micRef.current;
     const sess = runtimeRef.current;
-    if (!mic || micBusy) return;
+    if (!mic || micBusy || sessionOver) return;
     setMicBusy(true);
     try {
       if (micOn) {
@@ -536,6 +556,8 @@ export function SessionPage() {
     } catch (err) {
       mic.stop();
       setMicOn(false);
+      // stop() ran during the permission prompt; that was the user's or the page's own doing.
+      if (err instanceof MicCaptureError && err.detail.kind === "cancelled") return;
       let detail =
         err instanceof MicCaptureError
           ? err.detail
@@ -551,7 +573,7 @@ export function SessionPage() {
     } finally {
       setMicBusy(false);
     }
-  }, [micOn, micBusy, addToast]);
+  }, [micOn, micBusy, sessionOver, addToast]);
 
   // Release the capture device on unmount — a mic left hot after leaving the
   // session page would keep the OS recording indicator lit.
