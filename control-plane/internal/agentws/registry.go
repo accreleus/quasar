@@ -79,6 +79,8 @@ type conn struct {
 	policyInventorySnapshotID string
 	policyInventoryCursor     *string
 	policyInventoryHeader     []byte
+	policyInventorySuperseded map[string]bool // replaced on this connection while a page could still be on the wire
+	policyAdoptionOwed        bool            // an adopted journal whose inventory request is not queued yet
 	rh05RestartEntries        []hostcfg.JournalInventoryEntry
 	rh05Snapshots             map[string]hostcfg.PolicySnapshot
 	policyActiveSnapshots     atomic.Pointer[map[string]hostcfg.PolicySnapshot]
