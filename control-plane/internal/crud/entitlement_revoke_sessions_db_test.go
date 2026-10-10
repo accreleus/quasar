@@ -129,6 +129,12 @@ func TestRevokeRouteStopsTheSessionsItLeftUnentitled(t *testing.T) {
 	if got := stateOf(t, pool, kept); got != "running" {
 		t.Errorf("session of a user who keeps a personal row: %s, want running", got)
 	}
+	// control-api.md amendment 24: the session read tells its owner why.
+	var reason *string
+	must43(t, pool.QueryRow(ctx, `SELECT stop_reason FROM sessions WHERE id = $1::uuid`, lost).Scan(&reason))
+	if reason == nil || *reason != "entitlement_revoked" {
+		t.Errorf("stop_reason recorded by the revoke route: %v, want entitlement_revoked", reason)
+	}
 	details, _ := auditDetails(t, pool, "app.entitlement.revoke")
 	if details["sessions_stopped"] != float64(1) {
 		t.Errorf("audit sessions_stopped = %v, want 1", details["sessions_stopped"])
