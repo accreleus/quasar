@@ -293,6 +293,34 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 	}
 	res.Observed = len(order)
 
+	// An empty report over existing observations is how an unreadable or missing home reads;
+	// a real uninstall omits one appid from a non-empty report. Treated like MarkFailed so the
+	// prune and revoke below never run on it. Guarded by TestEmptyReportOverObservationsKeepsLibrary.
+	if len(order) == 0 {
+		var held bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+			    SELECT 1 FROM library_observations
+			     WHERE user_id = $1::uuid AND parent_app_id = $2::uuid AND host_id = $3::uuid
+			       AND external_source = $4)
+		`, target.UserID, target.ParentID, target.HostID, SourceSteam).Scan(&held); err != nil {
+			return res, fmt.Errorf("check existing observations: %w", err)
+		}
+		if held {
+			if _, err := tx.Exec(ctx, `
+				UPDATE library_scans
+				   SET state = 'failed', reported_at = now(), error = $2
+				 WHERE id::text = $1
+			`, scanID, "empty report over existing observations; library kept"); err != nil {
+				return res, fmt.Errorf("mark empty scan failed: %w", err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return res, fmt.Errorf("commit reconcile: %w", err)
+			}
+			return res, nil
+		}
+	}
+
 	// --- STEP 1: observations ------------------------------------------------
 	// Upsert one row per reported entry including suppressed ones (§7.6), then delete the
 	// rows for this (user, parent, host) triple the scan did not list. Only reached from a
