@@ -64,6 +64,7 @@ own; the two do not move together, and that is deliberate.
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
 
 ### Fixed
+- **An unreadable `steamapps` directory no longer empties the library (#512).** A permission or I/O error reading a Steam library directory or its manifests now fails the library scan instead of reporting an empty library, which revoked the provider entitlements of games that were still installed. A `steamapps` that doesn't exist is still an empty library.
 - **A hand-installed Fedora stack's Steam sessions were silent (#478).** `prepare-host.sh`
   loads the `quasar-nested-audio` SELinux module on every SELinux host (#476), but the
   quick start's manual host steps never emitted it (only the NVIDIA device rule), and a
