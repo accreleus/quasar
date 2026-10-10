@@ -123,7 +123,7 @@ func TestStopReasonReadsBackForARevokeOnly(t *testing.T) {
 
 	// The host is lost before the agent reports the teardown: the session ends
 	// `failed`/host_lost, and a failed session reads null (amendment 24).
-	if _, err := store.ReapHost(ctx, s.hostID, "agent disconnected"); err != nil {
+	if _, err := store.ReapHostExceptRunning(ctx, s.hostID, "agent reconnected"); err != nil {
 		t.Fatalf("reap host: %v", err)
 	}
 	if state, reason := read(bySweep); state != "failed" || reason != nil {
