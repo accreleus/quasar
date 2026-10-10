@@ -93,9 +93,11 @@ vi.mock("../../webrtc/session", () => ({
 vi.mock("./SessionSwapController", () => ({
   SessionSwapController: ({
     children,
+    sessionOver,
   }: {
     children: (p: { quickSwitch: null; swappingTo: null }) => React.ReactNode;
-  }) => children({ quickSwitch: null, swappingTo: null }),
+    sessionOver?: boolean;
+  }) => (sessionOver ? null : children({ quickSwitch: null, swappingTo: null })),
 }));
 
 let hud: Record<string, unknown> = {};
