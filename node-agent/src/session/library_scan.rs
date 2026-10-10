@@ -492,9 +492,10 @@ fn find_steamapps_dirs(
 }
 
 /// The scan-report `error` for an `appmanifest_*.acf` whose content cannot be
-/// read (torn mid-update, not UTF-8, over the size cap). It may be a known
+/// read (damaged or incomplete, not UTF-8, over the size cap). It may be a known
 /// game's manifest, so omitting it would read as "uninstalled" and revoke the
-/// entitlement. A parsed but invalid appid is different: never ingested, safe to skip.
+/// entitlement. A parsed appid that fails validation after trimming is different:
+/// the control plane rejects the same values, so it was never ingested and is safe to skip.
 fn unusable_manifest(path: &Path, reason: &str) -> String {
     format!("manifest {} {reason}", path.display())
 }
@@ -590,7 +591,7 @@ fn collect_manifests(
             Err(AcfParseError::Malformed) => {
                 return Err(unusable_manifest(
                     &path,
-                    "failed to parse (malformed or torn)",
+                    "failed to parse (malformed or incomplete)",
                 ));
             }
         }
@@ -779,10 +780,14 @@ fn parse_acf(text: &str) -> Result<ManifestEntry, AcfParseError> {
     let Some(appid) = appid_raw else {
         return Err(AcfParseError::Malformed);
     };
-    if !is_valid_appid(&appid) {
+    // Trimmed like the control plane's ingest (`strings.TrimSpace`; Rust's
+    // `trim` and Go's both use the Unicode White_Space set), so both
+    // validators accept the same ids.
+    let appid = appid.trim();
+    if !is_valid_appid(appid) {
         return Err(AcfParseError::InvalidAppid);
     }
-    entry.external_id = appid;
+    entry.external_id = appid.to_string();
     Ok(entry)
 }
 
@@ -934,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn torn_manifest_is_malformed() {
+    fn truncated_manifest_is_malformed() {
         let full = fixture("appmanifest_517710.acf");
         let torn = &full[..full.len() / 2];
         assert_eq!(parse_acf(torn), Err(AcfParseError::Malformed));
@@ -1214,16 +1219,16 @@ mod tests {
     }
 
     #[test]
-    fn torn_manifest_fails_the_scan() {
+    fn truncated_manifest_fails_the_scan() {
         let full = synth_manifest("222222");
         let err = scan_with_bad_manifest(
             "appmanifest_222222.acf",
             &full.as_bytes()[..full.len() / 2],
             1_048_576,
         )
-        .expect_err("a torn manifest must fail the scan");
+        .expect_err("a truncated manifest must fail the scan");
         assert!(err.contains("appmanifest_222222.acf"), "{err}");
-        assert!(err.contains("malformed or torn"), "{err}");
+        assert!(err.contains("malformed or incomplete"), "{err}");
     }
 
     #[test]
@@ -1248,6 +1253,21 @@ mod tests {
             scan_with_bad_manifest("appmanifest_222222.acf", bad.as_bytes(), 1_048_576).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].external_id, "333333");
+    }
+
+    /// The control plane trims the appid before validating, so a padded one
+    /// can have an observation; the agent must report it, normalised.
+    #[test]
+    fn whitespace_padded_appid_is_reported_trimmed() {
+        for padded in [" 222222 ", "222222\n", "\u{a0}222222\t"] {
+            let manifest = format!(r#""AppState" {{ "appid" "{padded}" "name" "x" }}"#);
+            let entries =
+                scan_with_bad_manifest("appmanifest_222222.acf", manifest.as_bytes(), 1_048_576)
+                    .unwrap();
+            let mut ids: Vec<_> = entries.iter().map(|e| e.external_id.as_str()).collect();
+            ids.sort();
+            assert_eq!(ids, ["222222", "333333"], "padded {padded:?}");
+        }
     }
 
     #[test]
