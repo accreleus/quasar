@@ -65,6 +65,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 - **A stop the node agent never received is now sent again (#503).** If the stop command was lost (a full send queue, a dropped frame), the control plane showed the session as stopping while the stream kept running. It now re-sends the stop when the agent's heartbeat still lists a session that went stopping more than 10 seconds ago, or at once after a control-plane restart. A session stopped before it started, which the agent never lists, gets the same re-send, so it no longer holds its encode slot and home. This covers every kind of stop, not only a revoke.
+- **The node agent no longer sends a non-semver recovery_actor_version on edge builds (#507).** The recovery actor on an edge (develop) build reports its version as `dev`. The agent now filters it: only semver versions reach the wire, matching the control plane's contract rule that non-matching values are treated as absent. The local readiness fact remains unchanged (an operator still sees the raw `dev` value), so the edge-build fact is visible when needed.
 - **A hand-installed Fedora stack's Steam sessions were silent (#478).** `prepare-host.sh`
   loads the `quasar-nested-audio` SELinux module on every SELinux host (#476), but the
   quick start's manual host steps never emitted it (only the NVIDIA device rule), and a
