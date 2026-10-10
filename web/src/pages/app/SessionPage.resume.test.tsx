@@ -256,6 +256,40 @@ describe("resuming a session with no router state (#524)", () => {
     expect(mintSignalingToken).not.toHaveBeenCalled();
   });
 
+  // #516: the generic copy tells the user to relaunch an app they can no
+  // longer open.
+  it("says the access was removed when a revoke ended the session", async () => {
+    getSession.mockResolvedValue({
+      session: makeSession({ state: "stopped", stop_reason: "entitlement_revoked" }),
+    });
+    renderResumed();
+
+    await waitFor(() => expect(screen.getByTestId("path").textContent).toBe("/app"));
+    expect(await screen.findByText("Your access to this app was removed")).toBeInTheDocument();
+    expect(screen.queryByText(/Launch it again/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Can't resume that session/)).not.toBeInTheDocument();
+    expect(mintSignalingToken).not.toHaveBeenCalled();
+  });
+
+  it("asks why when the mint is refused, and says the access was removed", async () => {
+    // The revoke lands between the read and the mint.
+    let revoked = false;
+    getSession.mockImplementation(async () => ({
+      session: revoked
+        ? makeSession({ state: "stopping", stop_reason: "entitlement_revoked" })
+        : makeSession(),
+    }));
+    mintSignalingToken.mockImplementation(async () => {
+      revoked = true;
+      throw new ApiError(409, "session_not_reconnectable", "session is not reconnectable");
+    });
+    renderResumed();
+
+    await waitFor(() => expect(screen.getByTestId("path").textContent).toBe("/app"));
+    expect(await screen.findByText("Your access to this app was removed")).toBeInTheDocument();
+    expect(screen.queryByText(/session is not reconnectable/)).not.toBeInTheDocument();
+  });
+
   it("bounces WITH a message when the session is not there (or not yours)", async () => {
     getSession.mockRejectedValue(new ApiError(404, "not_found", "session not found"));
     renderResumed();

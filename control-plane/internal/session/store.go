@@ -215,7 +215,11 @@ type Session struct {
 	FailureCode *string
 	// AppLogTail (migration 0062) is the app container's last ~100 log lines,
 	// newline-joined. The ONLY copy: app containers run with `--rm` (#463).
-	AppLogTail  *string
+	AppLogTail *string
+	// StopReason (migration 0101) is the session_stop reason recorded with the
+	// move to `stopping`, nil when the control plane never stopped the session.
+	// Not client-safe as is: see clientStopReason.
+	StopReason  *string
 	HomeSeed    json.RawMessage
 	Width       int32
 	Height      int32
@@ -637,7 +641,7 @@ func (s *Store) ListAll(ctx context.Context, cursor string, limit int32, filter 
 // failed. ErrInvalidTransition if the move is not permitted, ErrNotFound if the
 // row is gone; a same-state report is an idempotent no-op.
 func (s *Store) Transition(ctx context.Context, id string, to State, detail, errMsg *string) (Session, error) {
-	return s.transition(ctx, id, "", nil, to, detail, errMsg)
+	return s.transition(ctx, id, "", nil, to, detail, errMsg, nil)
 }
 
 // TransitionFromHost is the authenticated agent variant. It checks the
@@ -647,7 +651,7 @@ func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to St
 	var sess Session
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		sess, err = s.transition(ctx, id, hostID, nil, to, detail, errMsg)
+		sess, err = s.transition(ctx, id, hostID, nil, to, detail, errMsg, nil)
 		var pgErr *pgconn.PgError
 		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
 			return sess, err
@@ -663,8 +667,9 @@ type rowGuard func(appID string, stateDetail *string) bool
 var errSessionMoved = errors.New("session no longer in the state the transition was decided on")
 
 // A non-nil only applies the transition while it still holds for the locked
-// row, and is errSessionMoved otherwise.
-func (s *Store) transition(ctx context.Context, id, reportHostID string, only rowGuard, to State, detail, errMsg *string) (Session, error) {
+// row, and is errSessionMoved otherwise. stopReason is recorded with a state
+// change and never rewritten: a repeated stop keeps the first reason.
+func (s *Store) transition(ctx context.Context, id, reportHostID string, only rowGuard, to State, detail, errMsg, stopReason *string) (Session, error) {
 	if !isValidUUID(id) {
 		return Session{}, ErrNotFound
 	}
@@ -732,10 +737,11 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, only ro
 			    state         = $2,
 			    state_detail  = COALESCE($3, state_detail),
 			    error_message = CASE WHEN $2 = 'failed' THEN $4 ELSE error_message END,
+			    stop_reason   = COALESCE(stop_reason, $5),
 			    started_at    = CASE WHEN $2 = 'running' AND started_at IS NULL THEN now() ELSE started_at END,
 			    ended_at      = CASE WHEN $2 IN ('stopped','failed') AND ended_at IS NULL THEN now() ELSE ended_at END
 			WHERE id = $1::uuid
-		`, id, string(to), detail, errMsg)
+		`, id, string(to), detail, errMsg, stopReason)
 		if err != nil {
 			return Session{}, fmt.Errorf("update state: %w", err)
 		}
@@ -1459,7 +1465,7 @@ func (s *Store) UpdateSessionNegotiatedCodec(ctx context.Context, id, codec stri
 // RETURNING, kept in lockstep with scanSessionRow's Scan order.
 const sessionCols = `id::text, user_id::text, app_id::text, host_id::text, gpu_id::text,
 	state, state_detail, error_message,
-	failure_code, app_log_tail, home_seed,
+	failure_code, app_log_tail, stop_reason, home_seed,
 	width, height, fps, bitrate_kbps, h264_profile,
 	codec,
 	profile_id,
@@ -1516,7 +1522,7 @@ func scanSessionRow(r row, extra ...any) (Session, error) {
 	dest := []any{
 		&s.ID, &s.UserID, &s.AppID, &s.HostID, &s.GPUID,
 		&st, &s.StateDetail, &s.ErrorMessage,
-		&s.FailureCode, &s.AppLogTail, &s.HomeSeed,
+		&s.FailureCode, &s.AppLogTail, &s.StopReason, &s.HomeSeed,
 		&s.Width, &s.Height, &s.FPS, &s.BitrateKbps, &s.H264Profile,
 		&s.Codec,
 		&s.ProfileID,

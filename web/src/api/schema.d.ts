@@ -8570,6 +8570,11 @@ export interface components {
             failure_code: string | null;
             /** @description First-run-experience §S5. The app container's own captured log tail (newline-joined, oldest first, ~100 lines bound) - the only surviving copy, since app containers run --rm. Always serialized; null unless a failure warranted capturing it. Rendered preformatted, distinct from error_message's prose rendering. */
             app_log_tail: string | null;
+            /**
+             * @description Amendment 24 (#516). Why the control plane stopped the session, from a closed set: "entitlement_revoked" - the owner lost access to the app (amendment 23). Null for a live or failed session and for every other stop. Names no actor and no entitlement row. Always serialized; a client treats an unrecognised value as null.
+             * @enum {string|null}
+             */
+            stop_reason: "entitlement_revoked" | null;
             /** @description RH05 #344. Actual initial managed-home seeding outcome. Null means no authenticated evidence, including an older agent, a non-managed home or failure before provisioning. No inference of cold or storage savings from null. Swaps do not change the initial outcome. Never contains paths or free-form diagnostics. */
             home_seed: null | components["schemas"]["HomeSeedOutcome"];
             /** @description The profile the session was launched from; null for a legacy/tier/override launch. UI-P4: this is now a LAUNCH PROFILE id, i.e. the USER'S PICK. The rung it resolved to is stream_profile_id. */
