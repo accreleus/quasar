@@ -999,78 +999,82 @@ export function SessionPage() {
       {/* The HUD is a sibling of <video>, subscribing to the telemetry fan-out
           directly (#139). SessionSwapController owns all quick-switch wiring as
           one unit so the bar's `swappingTo` and the Games pane can never see a
-          different `transition` than the overlay renders. */}
-      <SessionSwapController
-        sessionId={sessionId}
-        authToken={authToken}
-        currentApp={currentApp}
-        onCommitted={(appId, appName) => setCurrentApp({ id: appId, name: appName })}
-        onToast={pushToast}
-        onSwapStart={() => hudRef.current?.close()}
-      >
-        {({ quickSwitch, swappingTo }) => (
-          <Hud
-            ref={hudRef}
-            register={registerTelemetry}
-            channelOpen={channelOpen}
-            appPresented={appPresented}
-            appName={appTitle}
-            tier={state?.tier}
-            resolvedCodec={state?.resolvedCodec}
-            sessionId={sessionId}
-            inputCaptured={inputCaptured}
-            onGrab={handleGrab}
-            onRelease={handleRelease}
-            pointerLockAvailable={pointerLockSupported()}
-            touchLook={touchLookSupported()}
-            // Without Pointer Lock, Esc is capture.ts's own release gesture and
-            // is never forwarded — so it always releases, fullscreen or not.
-            escReleases={
-              !pointerLockSupported() || !fullscreen || !keyboardLockSupported() || kbLockRefused
-            }
-            escInsecureContext={pointerLockSupported() && !keyboardLockSupported()}
-            // API presence alone cannot see these two, and both used to render
-            // the cheerful fullscreen hint exactly where it was wrong: on a
-            // bypassed-certificate origin the Keyboard Lock API exists
-            // (isSecureContext is true there), and a refused lock() leaves the
-            // API "supported" while Esc quits.
-            escCertUntrusted={certTrust === "untrusted-cert"}
-            escLockRefused={kbLockRefused}
-            micGranted={state?.micGranted === true}
-            micOn={micOn}
-            micBusy={micBusy}
-            onToggleMic={() => void handleToggleMic()}
-            fullscreen={fullscreen}
-            onFullscreen={handleFullscreen}
-            stopping={stopping}
-            onStop={() => void handleStop()}
-            swappingTo={swappingTo}
-            games={quickSwitch}
-            scalingMode={scalingMode}
-            onScalingChange={handleScalingChange}
-            startedAt={startedAt}
-            streamSize={streamSize}
-            // Null = "match the stream" / still at launch size — the pane
-            // resolves it against `streamSize`, so this page never duplicates
-            // the stream size into state.
-            externalSize={externalSize}
-            onStreamSizeChange={handleStreamSizeChange}
-            streamRungs={effectiveRungs}
-            externalResizeSupported={externalResizeSupported}
-            // ABR resolution ladder (T6b): server truth only, never
-            // client-side-simulate. `session.stream.external_owner`.
-            externalOwner={externalOwner}
-            streamAdapting={streamChanging}
-            renderSize={renderSize}
-            onRenderSizeChange={handleRenderSizeChange}
-            uiScale={uiScale}
-            onUiScaleChange={handleUiScaleChange}
-            displayBusy={displayBusy}
-            badgeExternalSize={badgeExternalSize}
-            onOpenChange={setHudOpen}
-          />
-        )}
-      </SessionSwapController>
+          different `transition` than the overlay renders. A session that is
+          over for the page has no use for either: the banner's button is the
+          only action, and no swap can start. */}
+      {!sessionOver && (
+        <SessionSwapController
+          sessionId={sessionId}
+          authToken={authToken}
+          currentApp={currentApp}
+          onCommitted={(appId, appName) => setCurrentApp({ id: appId, name: appName })}
+          onToast={pushToast}
+          onSwapStart={() => hudRef.current?.close()}
+        >
+          {({ quickSwitch, swappingTo }) => (
+            <Hud
+              ref={hudRef}
+              register={registerTelemetry}
+              channelOpen={channelOpen}
+              appPresented={appPresented}
+              appName={appTitle}
+              tier={state?.tier}
+              resolvedCodec={state?.resolvedCodec}
+              sessionId={sessionId}
+              inputCaptured={inputCaptured}
+              onGrab={handleGrab}
+              onRelease={handleRelease}
+              pointerLockAvailable={pointerLockSupported()}
+              touchLook={touchLookSupported()}
+              // Without Pointer Lock, Esc is capture.ts's own release gesture and
+              // is never forwarded — so it always releases, fullscreen or not.
+              escReleases={
+                !pointerLockSupported() || !fullscreen || !keyboardLockSupported() || kbLockRefused
+              }
+              escInsecureContext={pointerLockSupported() && !keyboardLockSupported()}
+              // API presence alone cannot see these two, and both used to render
+              // the cheerful fullscreen hint exactly where it was wrong: on a
+              // bypassed-certificate origin the Keyboard Lock API exists
+              // (isSecureContext is true there), and a refused lock() leaves the
+              // API "supported" while Esc quits.
+              escCertUntrusted={certTrust === "untrusted-cert"}
+              escLockRefused={kbLockRefused}
+              micGranted={state?.micGranted === true}
+              micOn={micOn}
+              micBusy={micBusy}
+              onToggleMic={() => void handleToggleMic()}
+              fullscreen={fullscreen}
+              onFullscreen={handleFullscreen}
+              stopping={stopping}
+              onStop={() => void handleStop()}
+              swappingTo={swappingTo}
+              games={quickSwitch}
+              scalingMode={scalingMode}
+              onScalingChange={handleScalingChange}
+              startedAt={startedAt}
+              streamSize={streamSize}
+              // Null = "match the stream" / still at launch size — the pane
+              // resolves it against `streamSize`, so this page never duplicates
+              // the stream size into state.
+              externalSize={externalSize}
+              onStreamSizeChange={handleStreamSizeChange}
+              streamRungs={effectiveRungs}
+              externalResizeSupported={externalResizeSupported}
+              // ABR resolution ladder (T6b): server truth only, never
+              // client-side-simulate. `session.stream.external_owner`.
+              externalOwner={externalOwner}
+              streamAdapting={streamChanging}
+              renderSize={renderSize}
+              onRenderSizeChange={handleRenderSizeChange}
+              uiScale={uiScale}
+              onUiScaleChange={handleUiScaleChange}
+              displayBusy={displayBusy}
+              badgeExternalSize={badgeExternalSize}
+              onOpenChange={setHudOpen}
+            />
+          )}
+        </SessionSwapController>
+      )}
 
       {/* Touch route into the shelf (UX assessment §2.3): the Ctrl+Alt+Shift+Q
           chord bootstrap can't be pressed on a phone. Shown only on a
@@ -1083,7 +1087,7 @@ export function SessionPage() {
           reach this button (it hides on desktop during play), but where nothing
           is ever locked, taps still land here — the only route back for a
           controller-only tablet player. */}
-      {!pointerLocked && !hudOpen && (
+      {!sessionOver && !pointerLocked && !hudOpen && (
         <button
           type="button"
           className={`session-summon${inputCaptured ? " always" : ""}`}

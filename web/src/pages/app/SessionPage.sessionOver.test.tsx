@@ -1,5 +1,7 @@
 // #524 — a session that is over for this page releases the microphone and input
 // capture; one that may still be streaming keeps both.
+// #529 — and draws no HUD, summon button or swap overlay; one that may still be
+// streaming keeps them.
 //
 // Real MicCapture and real input capture (jsdom has no Pointer Lock, so capture
 // runs in fallback mode); the transport, telemetry and HUD are doubles.
@@ -97,12 +99,14 @@ vi.mock("./SessionSwapController", () => ({
 }));
 
 let hud: Record<string, unknown> = {};
+const hudOpen = vi.fn();
 vi.mock("./hud/Hud", async () => {
-  const { forwardRef } = await import("react");
+  const { forwardRef, useImperativeHandle } = await import("react");
   return {
-    Hud: forwardRef((p: Record<string, unknown>, _ref: unknown) => {
+    Hud: forwardRef((p: Record<string, unknown>, ref: React.Ref<unknown>) => {
       hud = p;
-      return null;
+      useImperativeHandle(ref, () => ({ open: hudOpen, close() {}, stageClick() {} }));
+      return <div data-testid="hud" />;
     }),
   };
 });
@@ -237,7 +241,6 @@ describe("SessionPage — a session that is over for this page releases the mic 
     expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
     releasedAfterVerdict();
     expect(detachMicTrack).toHaveBeenCalled();
-    expect(hud.channelOpen).toBe(true);
   });
 
   it("host lost", async () => {
@@ -290,19 +293,6 @@ describe("SessionPage — a session that is over for this page releases the mic 
     expect(micIndicator()).toBeNull();
     expect(attachMicTrack).not.toHaveBeenCalled();
     expect(screen.queryByText("Microphone failed")).toBeNull();
-  });
-
-  it("the mic and Capture input cannot be turned on once the session is over", async () => {
-    currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
-    renderPage();
-    await advance(1_000);
-    await act(async () => lastOnChannel?.({ readyState: "open", onclose: null, send() {}, bufferedAmount: 0 }));
-    await advance(6_000);
-    expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
-    await act(async () => (hud.onToggleMic as () => void)());
-    await act(async () => (hud.onGrab as () => void)());
-    expect(getUserMedia).not.toHaveBeenCalled();
-    expect(keyReachesBrowser("Tab")).toBe(true);
   });
 });
 
@@ -400,7 +390,6 @@ describe("SessionPage — work still in flight when the verdict lands cannot und
     });
 
     expect(exitPointerLock).toHaveBeenCalled();
-    expect(hud.inputCaptured).toBe(false);
     expect(keyReachesBrowser("Tab")).toBe(true);
     expect(keyReachesBrowser("Enter")).toBe(true);
   });
@@ -423,7 +412,74 @@ describe("SessionPage — work still in flight when the verdict lands cannot und
     await act(async () => resolveAttach());
 
     expect(micIndicator()).toBeNull();
-    expect(hud.micOn).toBe(false);
     expect(detachMicTrack).toHaveBeenCalled();
+  });
+});
+
+describe("SessionPage — a session that is over for this page draws no HUD (#529)", () => {
+  const summonChord = () =>
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyQ", key: "Q", ctrlKey: true, altKey: true, shiftKey: true, bubbles: true }),
+    );
+  const openChannel = () =>
+    act(async () => lastOnChannel?.({ readyState: "open", onclose: null, send() {}, bufferedAmount: 0 }));
+  const gone = () => {
+    expect(screen.queryByTestId("hud")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Session menu" })).toBeNull();
+    hudOpen.mockClear();
+    summonChord();
+    expect(hudOpen).not.toHaveBeenCalled();
+  };
+  const present = () => {
+    expect(screen.queryByTestId("hud")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Session menu" })).not.toBeNull();
+    hudOpen.mockClear();
+    summonChord();
+    expect(hudOpen).toHaveBeenCalled();
+  };
+
+  it("streaming: the HUD, the summon button and the chord are there", async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    present();
+  });
+
+  it("access revoked mid-stream: only the banner's button is left", async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    present();
+    currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+    await advance(5_500);
+    expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
+    gone();
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Back to library"]);
+  });
+
+  it("taken over by another tab", async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    gone();
+  });
+
+  it("signalling gave up with the input channel open: still streaming, so the HUD stays", async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    refused();
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    present();
   });
 });
