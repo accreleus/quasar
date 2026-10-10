@@ -9,7 +9,12 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, fireEvent } from "@testing-library/react";
 import { SessionLoader, PHASE_STALL_MS } from "./SessionLoader";
-import { launchFailureFromSession, unreachableFailure } from "./sessionFailure";
+import {
+  accessRevokedFailure,
+  launchFailureFromSession,
+  takenOverFailure,
+  unreachableFailure,
+} from "./sessionFailure";
 
 describe("SessionLoader — terminal failure", () => {
   it("replaces the progress copy with the failure and a way out", () => {
@@ -208,6 +213,38 @@ describe("SessionLoader — never a dead end", () => {
       />,
     );
     expect(enabledButtons().length).toBeGreaterThan(0);
+  });
+
+  // #516: the handoff latches, so a verdict that lands after it began (the
+  // transport died inside the reveal) used to render in a transparent, inert
+  // scene. 300 ms is mid-lock, 2000 ms is past the fade.
+  describe.each([300, 2_000])("a verdict %d ms into the handoff", (afterMs) => {
+    it.each([
+      ["an entitlement revoke", accessRevokedFailure({ stop_reason: "entitlement_revoked" })],
+      ["an unreachable transport", unreachableFailure()],
+      ["a takeover", takenOverFailure()],
+    ])("is visible and offers a way out: %s", (_label, failure) => {
+      vi.useFakeTimers();
+      try {
+        const props = { statusMsg: "pipeline live", onExit: vi.fn() };
+        const { rerender } = render(<SessionLoader {...props} streaming />);
+        act(() => void vi.advanceTimersByTime(afterMs));
+        const root = document.querySelector(".sl-root") as HTMLElement;
+        expect(root.className).toMatch(/is-locking|is-streaming/);
+
+        rerender(<SessionLoader {...props} streaming={false} failure={failure} />);
+        // The lock timer still fires after the verdict; it must not hide it again.
+        act(() => void vi.advanceTimersByTime(2_000));
+        expect(root.className).not.toMatch(/is-locking|is-streaming/);
+        expect(root.hasAttribute("inert")).toBe(false);
+        expect(root.getAttribute("aria-hidden")).toBeNull();
+        expect(root.getAttribute("role")).toBe("alert");
+        expect(screen.getByText(failure!.title)).toBeInTheDocument();
+        expect(enabledButtons().length).toBeGreaterThan(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   it("offers a way out on a launch that simply never advances", () => {

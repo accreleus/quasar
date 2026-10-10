@@ -214,6 +214,10 @@ export function SessionLoader({
   const keepWaiting = useCallback(() => setWaitAgain((n) => n + 1), []);
 
   const terminal = failure != null;
+  // A terminal verdict outranks the handoff. The handoff latches, so a verdict
+  // that lands after it began (the transport died inside the reveal) would
+  // otherwise render in a transparent, inert scene and never be seen.
+  const shownScene = terminal ? "idle" : scene;
 
   // `inert` is not in React 18's JSX attribute set; setting it on the node keeps
   // the faded-out scene out of focus order and the accessibility tree together.
@@ -221,15 +225,15 @@ export function SessionLoader({
   useEffect(() => {
     const el = rootRef.current;
     if (!el) return;
-    if (scene === "streaming") el.setAttribute("inert", "");
+    if (shownScene === "streaming") el.setAttribute("inert", "");
     else el.removeAttribute("inert");
-  }, [scene]);
+  }, [shownScene]);
 
   // Kept in DOM briefly after streaming so the fade animation can play out
   const rootClass = [
     "sl-root",
-    scene === "locking" ? "is-locking" : "",
-    scene === "streaming" ? "is-streaming" : "",
+    shownScene === "locking" ? "is-locking" : "",
+    shownScene === "streaming" ? "is-streaming" : "",
     terminal ? "is-failed" : "",
     stalled ? "is-stalled" : "",
   ]
@@ -244,7 +248,7 @@ export function SessionLoader({
       aria-live="polite"
       aria-label={terminal ? "Session could not start" : "Establishing stream connection"}
       // Hidden from AT once streaming (video takes over)
-      aria-hidden={scene === "streaming" ? "true" : undefined}
+      aria-hidden={shownScene === "streaming" ? "true" : undefined}
     >
       <header className="sl-lockup">
         <QuasarMark size={38} className="sl-mark" />

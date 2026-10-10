@@ -170,8 +170,11 @@ vi.mock("./hud/Hud", async () => {
   };
 });
 
+/** Returns the channel so a test can end it (`ch.onclose?.()`). */
 function openChannel() {
-  lastOnChannel?.({ readyState: "open", onclose: null });
+  const ch: { readyState: string; onclose: (() => void) | null } = { readyState: "open", onclose: null };
+  lastOnChannel?.(ch);
+  return ch;
 }
 
 function makeSession(overrides: Record<string, unknown> = {}) {
@@ -921,6 +924,82 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     await streamThenLoseTheSession({ state: "stopped", stop_reason: null });
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     expect(screen.queryByText("Your access to this app was removed")).toBeNull();
+  });
+
+  // The loader's handoff latches at the reveal and takes 1400 ms. A session
+  // that ended inside it left the verdict in a transparent, inert loader that
+  // was never removed, which also held the banner back: nothing on screen.
+  const refused = () =>
+    mintSignalingToken.mockRejectedValue(
+      new ApiError(409, "session_not_reconnectable", "session is not reconnectable"),
+    );
+  const failed = { phase: "failed", attempt: 0, maxAttempts: 3, message: "signaling: session not found or already ended" };
+  it.each([
+    [
+      "an entitlement revoke",
+      "Your access to this app was removed",
+      (ch: { onclose: (() => void) | null }) => {
+        currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+        refused();
+        ch.onclose?.();
+        lastOnRecovery?.(failed);
+      },
+    ],
+    [
+      "an unreachable transport",
+      "Could not reach the stream",
+      (ch: { onclose: (() => void) | null }) => {
+        currentSession = makeSession({ state: "stopped", stop_reason: null });
+        refused();
+        ch.onclose?.();
+        lastOnRecovery?.(failed);
+      },
+    ],
+    [
+      // The channel stays open: the reveal gate never retracts, and the loader
+      // used to be removed with the verdict in it.
+      "a takeover",
+      "This session moved to another tab",
+      () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }),
+    ],
+  ])("keeps the verdict on screen when the session ends inside the loader handoff: %s", async (_label, title, end) => {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    let ch = { onclose: null as (() => void) | null };
+    await act(async () => {
+      ch = openChannel();
+    });
+    // 300 ms into the 1400 ms reveal: the handoff has latched, nothing is removed yet.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(document.querySelector(".sl-root")?.className).toContain("is-locking");
+
+    await act(async () => {
+      end(ch);
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    // Past the lock (1180 ms) and the removal (1400 ms).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+
+    const loader = document.querySelector(".sl-root");
+    expect(loader?.textContent).toContain(title);
+    expect(loader?.className).not.toMatch(/is-locking|is-streaming/);
+    expect(loader?.hasAttribute("inert")).toBe(false);
+    expect(loader?.getAttribute("aria-hidden")).toBeNull();
+    expect(loader?.querySelector("button")?.textContent).toBe("Back to library");
+    // One surface: the banner stands down while the loader states the verdict.
+    expect(document.querySelector(".banner")?.textContent ?? "").not.toContain(title);
+    // And for a revoke the recovery notice never renders, even under the loader:
+    // it is an alert, and it says the thing the verdict replaces.
+    if (title.startsWith("Your access")) {
+      expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+    }
   });
 });
 
