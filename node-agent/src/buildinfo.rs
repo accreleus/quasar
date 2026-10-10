@@ -179,6 +179,16 @@ fn source_commit_shape(c: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+pub fn actor_version_shape(v: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$"
+        )
+        .expect("actor_version_shape regex is invalid")
+    });
+    RE.is_match(v)
+}
+
 /// This host's install facts: the recovery actor's answer on an owned install (the
 /// actor put [`RECOVERY_SOCKET_ENV`] in this container's environment), else what the
 /// agent's own container image says, with no recovery actor.
@@ -763,5 +773,25 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn actor_version_shape_accepts_semver_and_rejects_non_semver() {
+        assert!(actor_version_shape("0.4.1"));
+        assert!(actor_version_shape("1.0.0"));
+        assert!(actor_version_shape("1.0.0-rc.1"));
+        assert!(actor_version_shape("1.0.0-alpha"));
+        assert!(actor_version_shape("1.0.0-0"));
+        assert!(actor_version_shape("10.20.30"));
+        assert!(actor_version_shape("0.0.0"));
+
+        assert!(!actor_version_shape("dev"));
+        assert!(!actor_version_shape("v0.4.1"));
+        assert!(!actor_version_shape("0.4.1+meta"));
+        assert!(!actor_version_shape("01.0.0"));
+        assert!(!actor_version_shape("0.01.0"));
+        assert!(!actor_version_shape("0.0.01"));
+        assert!(!actor_version_shape(""));
+        assert!(!actor_version_shape("0.4"));
     }
 }
