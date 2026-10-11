@@ -46,7 +46,7 @@ import {
   SessionBanner,
   SessionBannerHost,
 } from "./sessionAlerts";
-import { SessionLoader } from "./SessionLoader";
+import { LOCK_TO_STREAM_MS, SessionLoader } from "./SessionLoader";
 import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
@@ -764,21 +764,25 @@ export function SessionPage() {
   useLayoutEffect(() => {
     if (revealReady) revealStartedRef.current = true;
   }, [revealReady]);
+  const [loaderInert, setLoaderInert] = useState(false);
   const [loaderDone, setLoaderDone] = useState(false);
-  const loaderDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loaderTimersRef = useRef<ReturnType<typeof setTimeout>[] | null>(null);
   // Latched, like SessionLoader's own handoff: the gate can retract (the channel
   // closes inside the reveal), and the loader is transparent and inert by then
   // either way. A removal cancelled on the retract never happened again, and
-  // the revoke banner waits for `loaderDone`.
+  // the revoke banner waits for `loaderInert`.
   useEffect(() => {
-    if (revealReady && !loaderDone && loaderDoneTimerRef.current === null) {
-      loaderDoneTimerRef.current = setTimeout(() => setLoaderDone(true), LOADER_UNMOUNT_MS);
+    if (revealReady && loaderTimersRef.current === null) {
+      loaderTimersRef.current = [
+        setTimeout(() => setLoaderInert(true), LOCK_TO_STREAM_MS),
+        setTimeout(() => setLoaderDone(true), LOADER_UNMOUNT_MS),
+      ];
     }
-  }, [revealReady, loaderDone]);
+  }, [revealReady]);
   useEffect(
     () => () => {
-      if (loaderDoneTimerRef.current) clearTimeout(loaderDoneTimerRef.current);
-      loaderDoneTimerRef.current = null;
+      loaderTimersRef.current?.forEach(clearTimeout);
+      loaderTimersRef.current = null;
     },
     [],
   );
@@ -830,10 +834,10 @@ export function SessionPage() {
       : null;
 
   // #516: the control plane's reason stands in for the recovery notice the dead
-  // transport raises; #527: so does a takeover. Until the loader is gone it
+  // transport raises; #527: so does a takeover. Until the loader is inert it
   // states the verdict itself.
   const bannerVerdict = launchFailure && isBannerVerdict(launchFailure) ? launchFailure : null;
-  const verdictBanner = loaderDone ? bannerVerdict : null;
+  const verdictBanner = loaderInert ? bannerVerdict : null;
 
   // Whether any of the banner blocks below is on screen. The HUD takes
   // no banner-state input, so it is carried as a class on the shared ancestor
@@ -1007,7 +1011,8 @@ export function SessionPage() {
           // handleStop tears the session down server-side so "Back to
           // library" from a dead launch never orphans a session. Not for a
           // takeover: the other tab owns the session, and stopping it ends its stream.
-          onExit={() => (launchFailure?.kind === "taken_over" ? navigate("/app") : void handleStop())}
+          // Nor a revoke: the control plane already stopped it.
+          onExit={() => (launchFailure && isBannerVerdict(launchFailure) ? navigate("/app") : void handleStop())}
         />
       )}
 

@@ -29,7 +29,7 @@ export { PHASE_STALL_COPY, PHASE_STALL_MS, TRANSPORT_STALL_MS } from "./launchSt
 export type { LaunchPhase, TransportState } from "./launchStall";
 
 /** §D: `is-locking` (status drop, quasar collapse, aperture) before the fade. */
-const LOCK_TO_STREAM_MS = 1180;
+export const LOCK_TO_STREAM_MS = 1180;
 /** The word leaves, the text is replaced, the word comes back. */
 const STAGE_SWAP_MS = 110;
 
