@@ -22,6 +22,9 @@
 #   spa-takeover the takeover again with the REAL web client (a built web/dist, /v1
 #                mocked, microphone granted): input channel, microphone, tracks, banner
 #   spa-restart  the same, with an ICE-restart request landing between the two offers
+#   late-answer  the takeover, with the taking page's answer to the old transport's offer
+#                delivered a second time once the new transport has offered
+#   spa-late     the same with the real web client
 #
 # Env:
 #   PW_IMAGE    image with a real Chrome (H.264) and xvfb-run. Playwright's bundled
@@ -47,7 +50,7 @@ PORT="${PORT:-18535}"
 : "${PW_MODULES:?set PW_MODULES to a directory holding node_modules/playwright-core}"
 OUT="$ROOT/.diagnostics/takeover-peers"
 HOST_NAME="takeover-host-$PORT"
-[ $# -gt 0 ] || set -- takeover connecting reload samepeer reattach spa-takeover spa-restart
+[ $# -gt 0 ] || set -- takeover connecting reload samepeer reattach late-answer spa-takeover spa-restart spa-late
 SPA_DIST="${SPA_DIST:-$OUT/dist}"
 
 # Built from a copy, so the worktree gets no node_modules.
@@ -68,6 +71,10 @@ for scenario in "$@"; do
   host_env=()
   driver=(peers/driver.mjs "$scenario" "ws://127.0.0.1:$PORT" "file:///w/peers/peer.html")
   case "$scenario" in
+    late-answer)
+      host_env=(-e QUASAR_TAKEOVER_LATE_ANSWER=1)
+      driver=(peers/driver.mjs takeover "ws://127.0.0.1:$PORT" "file:///w/peers/peer.html")
+      ;;
     spa-*)
       if ! build_spa; then
         echo "FAIL — $scenario: the web client did not build"
@@ -76,6 +83,7 @@ for scenario in "$@"; do
       fi
       host_env=(-e QUASAR_TAKEOVER_MIC=1)
       [ "$scenario" = spa-restart ] && host_env+=(-e QUASAR_TAKEOVER_RESTART_BETWEEN=1)
+      [ "$scenario" = spa-late ] && host_env+=(-e QUASAR_TAKEOVER_LATE_ANSWER=1)
       driver=(peers/driver-spa.mjs "${scenario#spa-}" "ws://127.0.0.1:$PORT" /w/dist)
       ;;
   esac
@@ -122,7 +130,13 @@ errors = sum(1 for line in open(host_log, errors="replace")
              if "HOST bus error" in line and line.split(" ", 1)[0] < done)
 # A new peer gets one new transport per PC; the same peer never does. The spa
 # scenarios end with a third page, a plain resume, taking over once more.
-want = {"takeover": 2, "connecting": 2, "reload": 2, "spa-takeover": 4, "spa-restart": 4}.get(scenario, 0)
+want = {"takeover": 2, "connecting": 2, "reload": 2, "late-answer": 2,
+        "spa-takeover": 4, "spa-restart": 4, "spa-late": 4}.get(scenario, 0)
+if scenario in ("late-answer", "spa-late"):
+    # The page's answer to the new transport's offer has new ICE credentials; read as one
+    # more peer it would cost a third transport.
+    reoffered = sum(1 for line in open(host_log, errors="replace") if "transport-reoffered" in line)
+    checks["the late answer was corrected by one more offer on the same transport"] = reoffered >= 1
 if scenario == "spa-restart":
     absorbed = sum(1 for line in open(host_log, errors="replace") if "before the transport's first offer" in line)
     checks["the restart request that beat the new offer was absorbed"] = absorbed >= 1

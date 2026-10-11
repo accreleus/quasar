@@ -7,6 +7,7 @@
 // usage: node driver-spa.mjs <scenario> <ws-url> <dist-dir>
 //   takeover   a second browser resumes a session the first is streaming, mic granted
 //   restart    the same; the host is also asked for an ICE restart between its two offers
+//   late       the same; the host is handed the page's answer to the old offer twice
 // Prints one JSON object: what each page saw, and `checks` (name -> pass).
 import { chromium } from "playwright-core";
 import fs from "node:fs";
@@ -173,7 +174,7 @@ const B = await open("resume-mic");
 out.B = await until(B, (s) => s.frames >= 30 && s.channels?.some((c) => c.open), 25000);
 check("the page that resumes decodes", out.B.frames >= 30);
 check("its launch screen gives way to the stream", (await until(B, (s) => s.loader === false, 10000)).loader === false);
-const offers = scenario === "restart" ? 3 : 2;
+const offers = scenario === "takeover" ? 2 : 3;
 check(`it applied ${offers} video offers on one peer connection`, video(out.B).offers === offers && out.B.pcs.length === 2);
 check("it was given exactly one input channel, and it is open", out.B.channels.length === 1 && out.B.channels[0].open && !out.B.channels[0].closed);
 check("its input channel reaches the host", await pong(B));
