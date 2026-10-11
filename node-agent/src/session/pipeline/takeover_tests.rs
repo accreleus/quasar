@@ -1257,16 +1257,16 @@ fn a_new_transport_nobody_answers_does_not_hold_the_source() {
     );
 }
 
-/// The order `runner::stop_source` keeps. A source that renegotiates while a transport
-/// holds RTP waits on the encode chain, whichever transport it is; the session's first
-/// here, with the renegotiation forced.
+/// The session's first transport holds no RTP either while nobody has answered: a source
+/// that renegotiates then keeps running and can be stopped. (Held RTP is what
+/// `runner::stop_source` releases a transport for first; none is held any more.)
 #[test]
-fn releasing_the_transport_frees_a_source_that_waits_on_it() {
+fn a_source_that_renegotiates_before_anyone_answered_keeps_running() {
     if !live_webrtc_available() {
         return;
     }
     let _serial = serial();
-    let host = Host::start("release");
+    let host = Host::start("unanswered-reneg");
     let frames = source_frames(&host);
     std::thread::sleep(Duration::from_millis(800));
     let sink = host.source.iterate_sinks().into_iter().next();
@@ -1276,18 +1276,14 @@ fn releasing_the_transport_frees_a_source_that_waits_on_it() {
         .push_event(gst::event::Reconfigure::new());
     std::thread::sleep(Duration::from_millis(500));
     let before = frames.load(Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(
-        frames.load(Ordering::Relaxed),
-        before,
-        "the source is not waiting on the transport: this test no longer shows the hazard"
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        frames.load(Ordering::Relaxed) > before + 15,
+        "the source stalled behind a transport nobody answered"
     );
-
-    host.transports.video.release();
-
     assert!(
         stops_within(&host.source, Duration::from_secs(2)),
-        "the source did not stop once the transport was released"
+        "the source did not stop"
     );
 }
 
@@ -1813,6 +1809,24 @@ fn a_resize_and_a_swap_during_an_abandoned_takeover_leave_the_runner_free() {
     session.resize_swap_and_stop();
 }
 
+/// The same on the session's first transport, before anybody answered at all.
+#[test]
+fn a_resize_and_a_swap_before_anyone_answered_leave_the_runner_free() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("launch-resize-swap", Duration::from_secs(600));
+    session.mute = true;
+    let mut nobody = Peer::new();
+    let offered = session.pump(&mut nobody, Duration::from_secs(20), |s, _| {
+        s.offers == [1, 1]
+    });
+    assert!(offered, "offers per PC: {:?}", session.offers);
+    session.pump(&mut nobody, Duration::from_millis(800), |_, _| false);
+    session.resize_swap_and_stop();
+}
+
 /// A frame-rate step alone, with the fps rung on, renegotiates like a size step.
 #[test]
 fn an_fps_step_and_a_swap_do_not_wait_on_a_transport_nobody_answered() {
@@ -1854,7 +1868,12 @@ fn the_first_frame_a_new_peer_receives_is_a_keyframe() {
     }
     let _serial = serial();
     let mut host = Host::start("first-frame");
-    let _a = first_attach(&mut host);
+    let a = first_attach(&mut host);
+    let first = *a.video.first_nal.lock().unwrap();
+    assert!(
+        matches!(first, Some(5 | 7 | 8)),
+        "the first peer's first video packet starts with NAL type {first:?}"
+    );
     let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (lose, again) = (lost.clone(), host.encoder.clone());
     host.encoder.static_pad("src").unwrap().add_probe(

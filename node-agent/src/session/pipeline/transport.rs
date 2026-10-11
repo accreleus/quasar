@@ -39,8 +39,8 @@ pub struct VideoTransport {
     pub data_channel: Option<glib::Object>,
     bin: gst::Bin,
     retired: Arc<AtomicBool>,
-    /// The probe dropping RTP at the tail for a replacement whose peer has not connected.
-    /// An unconnected `webrtcbin` holds what is pushed into it, which parks the encode
+    /// The probe dropping RTP at the tail until this transport's peer has connected. An
+    /// unconnected `webrtcbin` holds what is pushed into it, which parks the encode
     /// chain's streaming thread: anything serialized behind it (the allocation query of a
     /// size step or an app swap) then waits for a peer that may never come.
     gate: Arc<Mutex<Option<gst::PadProbeId>>>,
@@ -113,13 +113,13 @@ fn transport_bin(webrtc: &gst::Element, retired: &Arc<AtomicBool>) -> Result<gst
     Ok(bin)
 }
 
-/// How long a connected replacement waits for the keyframe it asked for before it sends
-/// whatever the encoder produces.
+/// How long a transport whose peer has connected waits for the keyframe it asked for
+/// before it sends whatever the encoder produces.
 const KEYFRAME_WAIT: Duration = Duration::from_secs(1);
 
 /// Stop dropping RTP at the tail from the encoder's next keyframe on. The frames dropped
-/// before it leave a GOP the new peer has none of: what follows them in that GOP would
-/// reach it undecodable.
+/// before it leave a GOP the peer has none of: what follows them in that GOP would reach
+/// it undecodable.
 fn open_at_keyframe(
     encoder: &gst::Element,
     tail: &glib::WeakRef<gst::Pad>,
@@ -136,9 +136,9 @@ fn open_at_keyframe(
         }
         if !keyframe {
             tracing::warn!(
-                token = "transport-replacement-keyframe-missing",
+                token = "transport-keyframe-missing",
                 session_id = %session_id,
-                "video PC: no keyframe {} ms after the new peer connected; sending what the \
+                "video PC: no keyframe {} ms after the peer connected; sending what the \
                  encoder produces, which shows nothing until its next keyframe",
                 KEYFRAME_WAIT.as_millis()
             );
@@ -205,15 +205,15 @@ impl TransportSlot {
     /// Build a video transport on the tail. `replacement` is false for the session's
     /// first one, built while the pipeline is still NULL.
     ///
-    /// `gate` is the probe holding RTP back at the tail during a replacement; the new
-    /// transport keeps it until its peer connects.
+    /// `gate` is the probe already holding RTP back at the tail during a replacement.
+    /// Either way the transport keeps one until its peer connects.
     pub(super) fn attach_video(
         &self,
         replacement: bool,
         gate: Option<gst::PadProbeId>,
     ) -> Result<VideoTransport> {
         let cfg = &self.cfg;
-        let gate = Arc::new(Mutex::new(gate));
+        let gate = Arc::new(Mutex::new(gate.or_else(|| self.hold_rtp())));
         let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
         // Signals webrtcbin emits while it builds its send session: connect them first.
         if self.observe {
@@ -231,9 +231,8 @@ impl TransportSlot {
             .context("transport bin has no sink")?;
         if replacement {
             // Nothing a transport added mid-stream does may make the chain upstream
-            // renegotiate: its allocation query queues behind the RTP this transport
-            // holds until its peer connects, and the source's streaming thread waits on
-            // that query through interpipe, so the source could not be stopped or swapped.
+            // renegotiate: unfenced, two RECONFIGURE events reach the encoder at every
+            // replacement.
             sink.add_probe(gst::PadProbeType::EVENT_UPSTREAM, |_, info| {
                 match info.event().map(|e| e.type_()) {
                     Some(gst::EventType::Reconfigure) => gst::PadProbeReturn::Drop,
@@ -286,28 +285,30 @@ impl TransportSlot {
             PcId::Video,
             self.session_id.clone(),
         );
-        if replacement {
-            // The encoder is mid-GOP: the peer that just connected needs a keyframe.
-            let encoder = self.encoder.downgrade();
-            let session_id = self.session_id.clone();
-            let (tail, gate) = (self.tail.downgrade(), gate.clone());
-            webrtc.connect_notify(Some("connection-state"), move |webrtc, _| {
-                let state = webrtc
-                    .property::<gstreamer_webrtc::WebRTCPeerConnectionState>("connection-state");
-                if state == gstreamer_webrtc::WebRTCPeerConnectionState::Connected {
-                    if let Some(encoder) = encoder.upgrade() {
-                        tracing::info!(
-                            token = "transport-replacement-connected",
-                            session_id = %session_id,
-                            "video PC: the replacement transport's peer connected; forcing \
-                             a keyframe and sending from it"
-                        );
-                        open_at_keyframe(&encoder, &tail, &gate, &session_id);
-                        resize::force_idr(&encoder);
-                    }
-                }
-            });
-        }
+        // Its peer connected: the encoder is mid-GOP, so RTP flows from a keyframe on.
+        // Once per transport; the same peer reconnecting needs neither.
+        let encoder = self.encoder.downgrade();
+        let session_id = self.session_id.clone();
+        let (tail, held) = (self.tail.downgrade(), gate.clone());
+        webrtc.connect_notify(Some("connection-state"), move |webrtc, _| {
+            let state =
+                webrtc.property::<gstreamer_webrtc::WebRTCPeerConnectionState>("connection-state");
+            if state != gstreamer_webrtc::WebRTCPeerConnectionState::Connected
+                || held.lock().unwrap().is_none()
+            {
+                return;
+            }
+            if let Some(encoder) = encoder.upgrade() {
+                tracing::info!(
+                    token = "transport-peer-connected",
+                    session_id = %session_id,
+                    "video PC: the transport's peer connected; forcing a keyframe and \
+                     sending from it"
+                );
+                open_at_keyframe(&encoder, &tail, &held, &session_id);
+                resize::force_idr(&encoder);
+            }
+        });
 
         // webrtcbin must be at least READY before create-data-channel, and the channel
         // must exist before the offer.
@@ -376,16 +377,21 @@ impl TransportSlot {
         })
     }
 
+    /// Drop RTP at the tail until the returned probe is removed.
+    fn hold_rtp(&self) -> Option<gst::PadProbeId> {
+        self.tail.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            |_, _| gst::PadProbeReturn::Drop,
+        )
+    }
+
     /// Give the video PC a new transport and tear the old one down, with the encode chain
     /// live. The new transport offers as soon as it is up, and takes RTP once its peer
     /// has connected. On `Err` the old one is gone.
     pub fn replace_video(&self, video: &mut VideoTransport) -> Result<()> {
-        // RTP is dropped at the tail while the slot is empty: an unlinked push is
-        // not-linked, which errors the encode pipeline.
-        let gate = self.tail.add_probe(
-            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
-            |_, _| gst::PadProbeReturn::Drop,
-        );
+        // Also while the slot is empty: an unlinked push is not-linked, which errors the
+        // encode pipeline.
+        let gate = self.hold_rtp();
         video.retire(&self.tail, &self.pipeline);
         // A key the last peer held must not stay down for the next one.
         if let Some(devices) = &self.devices {
