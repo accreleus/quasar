@@ -49,8 +49,9 @@ class StubPeerConnection {
   addIceCandidate(c: { candidate: string }) {
     return this.gate(`candidate ${c.candidate}`, () => {});
   }
+  transceivers: Array<{ mid: string; direction: string }> = [];
   getTransceivers() {
-    return [];
+    return this.transceivers;
   }
   close() {}
   /** Settle the oldest pending step, as a failure when `error` is given. */
@@ -108,6 +109,21 @@ function startSession() {
 }
 
 const offer = (sdp: string, pc = "video") => ({ type: "offer", pc, sdp });
+const candidate = (name: string, pc = "video") => ({ type: "ice", pc, candidate: { candidate: name } });
+
+/** An audio offer with the host's send m-line and a recvonly one for the microphone. */
+const micOffer = (session: string) =>
+  [
+    "v=0",
+    `o=- ${session} 0 IN IP4 0.0.0.0`,
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+    "a=mid:audio0",
+    "a=sendonly",
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+    "a=mid:audio1",
+    "a=recvonly",
+    "",
+  ].join("\r\n");
 
 const g = globalThis as unknown as Record<string, unknown>;
 let realPc: unknown;
@@ -222,6 +238,104 @@ describe("QuasarSession offers for one pc (#535)", () => {
     expect(audio.calls).toEqual(["setRemote M"]);
     await audio.drain();
     expect(ws.answers()).toEqual(["audio: answer to M"]);
+  });
+
+  it("answers both offers when the second arrives after the first answer went out", async () => {
+    const { ws, video } = startSession();
+    ws.deliver(offer("A"));
+    await video.drain();
+    ws.deliver(offer("B"));
+    await video.drain();
+
+    expect(ws.answers()).toEqual(["video: answer to A", "video: answer to B"]);
+  });
+
+  // Offer A is in flight when its candidate, the offer that supersedes it and that
+  // offer's candidate arrive. A re-offer of the same transport shares A's candidates, so
+  // A's is still added; each lands after the offer it followed and before the next one.
+  it("keeps every candidate behind its own offer, a superseded offer's included", async () => {
+    const { ws, video } = startSession();
+    ws.deliver(offer("A"));
+    ws.deliver(candidate("for A"));
+    ws.deliver(offer("B"));
+    ws.deliver(candidate("for B"));
+    await video.drain();
+
+    expect(video.calls).toEqual([
+      "setRemote A",
+      "candidate for A",
+      "setRemote B",
+      "createAnswer",
+      "setLocal answer to B",
+      "candidate for B",
+    ]);
+    expect(ws.answers()).toEqual(["video: answer to B"]);
+  });
+
+  it("carries on when a candidate is refused", async () => {
+    const { ws, video } = startSession();
+    ws.deliver(offer("A"));
+    await video.drain();
+    ws.deliver(candidate("refused"));
+    ws.deliver(offer("B"));
+    await settle();
+
+    await video.step(new Error("no such m-line"));
+    await video.drain();
+
+    expect(ws.answers()).toEqual(["video: answer to A", "video: answer to B"]);
+  });
+
+  // The slot claimed on the first audio offer is the one the next offer names: claiming
+  // again would be a second write to a transceiver the answer already settled.
+  it("leaves the microphone claim in place on a second audio offer", async () => {
+    const { ws, session } = startSession();
+    let claims = 0;
+    const mic = {
+      mid: "audio1",
+      held: "recvonly",
+      get direction() {
+        return this.held;
+      },
+      set direction(to: string) {
+        claims += 1;
+        this.held = to;
+      },
+    };
+    ws.deliver(offer(micOffer("1"), "audio"));
+    await settle();
+    const audio = StubPeerConnection.all[1];
+    audio.transceivers = [{ mid: "audio0", direction: "recvonly" }, mic];
+    await audio.drain();
+    expect(mic.direction).toBe("sendonly");
+
+    ws.deliver(offer(micOffer("2"), "audio"));
+    await audio.drain();
+
+    expect(claims).toBe(1);
+    expect(mic.direction).toBe("sendonly");
+    expect(session.hasMicSlot()).toBe(true);
+    expect(ws.answers()).toHaveLength(2);
+  });
+
+  // Recovery asks for a restart while an offer is still being applied. The request goes
+  // out at once; the offer it brings waits its turn and supersedes the one in flight.
+  it("sends restart_ice at once while an offer is being applied", async () => {
+    const { ws, video, session } = startSession();
+    ws.deliver(offer("A"));
+    await settle();
+
+    session.recoverMediaPath();
+    await settle();
+    expect(ws.sent.map((m) => m.type)).toEqual(["restart_ice"]);
+    expect(video.calls).toEqual(["setRemote A"]);
+
+    ws.deliver(offer("B"));
+    await video.drain();
+    session.close(false);
+
+    expect(ws.sent.map((m) => m.type)).toEqual(["restart_ice", "answer"]);
+    expect(ws.answers()).toEqual(["video: answer to B"]);
   });
 
   // A later offer does not excuse a DTLS failure: the pc has one DTLS transport, and
