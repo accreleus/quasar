@@ -1260,6 +1260,29 @@ fn releasing_the_transport_frees_a_source_that_waits_on_it() {
     );
 }
 
+/// Hand `peer` the video offer the host has waiting and return its answer, undelivered.
+fn answer_to_the_pending_video_offer(host: &mut Host, peer: &mut Peer) -> SignalMsg {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        while let Ok(msg) = host.sig_rx.try_recv() {
+            if let SignalMsg::Offer { pc, .. } | SignalMsg::Ice { pc, .. } = &msg {
+                if pc.unwrap_or_default() == PcId::Video {
+                    peer.video.inbound(msg);
+                }
+            }
+        }
+        // Its candidates follow the answer and stay queued for the next pump.
+        if let Ok(SignalMsg::Answer { sdp, .. }) = peer.video.rx.try_recv() {
+            return SignalMsg::Answer {
+                sdp,
+                pc: Some(PcId::Video),
+            };
+        }
+        assert!(Instant::now() < deadline, "the peer never answered");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// A page that answered two offers from the old transport has the second answer land on
 /// the new one. A browser then answers the new transport's own offer with new ICE
 /// credentials and the certificate it had, which must read as that page correcting
@@ -1285,11 +1308,15 @@ fn a_late_answer_to_the_old_offer_costs_no_second_transport() {
         assert!(Instant::now() < offered, "the new transport never offered");
         std::thread::sleep(Duration::from_millis(10));
     }
-    host.inbound(to_old_offer);
 
-    // The page itself, answering the new transport's offer: other ICE credentials than
-    // the answer above, the same certificate.
+    // The page itself answers the new transport's offer: other ICE credentials than the
+    // answer above, the same certificate. Its two answers reach the host together, the
+    // late one first as it sent them, with no time for the first to finish applying.
     let mut b = Peer::new();
+    let to_new_offer = answer_to_the_pending_video_offer(&mut host, &mut b);
+    host.inbound(to_old_offer);
+    host.inbound(to_new_offer);
+
     host.inbound(SignalMsg::RestartIce {
         pc: Some(PcId::Audio),
     });

@@ -1004,7 +1004,12 @@ pub(crate) enum AnswerFrom {
 /// association is one endpoint's, and the same certificate under other credentials is
 /// another endpoint of one process (every webrtcbin in a process shares a certificate).
 /// Guarded by `takeover_tests::a_restart_from_the_same_peer_keeps_the_transport`.
-fn answer_from(
+///
+/// `negotiated` is the answer the transport was last handed, kept by the caller:
+/// webrtcbin applies a description asynchronously, and two answers a fraction of a
+/// millisecond apart must both be read against the first. `offer_pending` likewise: the
+/// caller asked the transport for another offer since then.
+pub(crate) fn answer_from(
     negotiated: Option<&str>,
     answer: &str,
     dtls_started: bool,
@@ -1028,15 +1033,8 @@ fn answer_from(
     }
 }
 
-/// The remote description `webrtc` last had applied, as text.
-fn negotiated(webrtc: &gst::Element) -> Option<String> {
-    webrtc
-        .property::<Option<gstreamer_webrtc::WebRTCSessionDescription>>("remote-description")
-        .and_then(|d| d.sdp().as_text().ok())
-}
-
 /// Has a DTLS handshake started on `webrtc`'s transport?
-fn dtls_started(webrtc: &gst::Element) -> bool {
+pub(crate) fn dtls_started(webrtc: &gst::Element) -> bool {
     let state = || {
         webrtc
             .emit_by_name::<Option<glib::Object>>("get-transceiver", &[&0i32])?
@@ -1045,16 +1043,6 @@ fn dtls_started(webrtc: &gst::Element) -> bool {
             .map(|t| t.property::<gstreamer_webrtc::WebRTCDTLSTransportState>("state"))
     };
     state().is_some_and(|s| s != gstreamer_webrtc::WebRTCDTLSTransportState::New)
-}
-
-/// Who `answer` is from, for the transport `webrtc`.
-pub(crate) fn who_answered(webrtc: &gst::Element, answer: &str) -> AnswerFrom {
-    answer_from(
-        negotiated(webrtc).as_deref(),
-        answer,
-        dtls_started(webrtc),
-        signaling_state_nick(webrtc).as_deref() == Some("have-local-offer"),
-    )
 }
 
 /// Has `webrtc` made an offer yet?
@@ -1067,14 +1055,6 @@ pub(crate) fn has_offered(webrtc: &gst::Element) -> bool {
 /// The ICE ufrag an SDP was written with.
 pub(crate) fn ice_ufrag(sdp: &str) -> Option<&str> {
     peer_identity(sdp).0
-}
-
-/// The ICE ufrag of the peer `webrtc` negotiated with, if any has answered.
-pub(crate) fn negotiated_ufrag(webrtc: &gst::Element) -> Option<String> {
-    negotiated(webrtc)
-        .as_deref()
-        .and_then(ice_ufrag)
-        .map(str::to_string)
 }
 
 /// Apply a remote SDP. For an inbound offer (answerer), `then_answer` runs once the remote

@@ -81,8 +81,8 @@ pub use abr_glue::{trigger, EncodeResolutionLever, ResolutionLever};
 mod webrtc;
 pub(crate) use webrtc::restart_ice;
 pub(crate) use webrtc::{
-    apply_remote_description, build_answerer_pipeline, has_offered, ice_ufrag, negotiated_ufrag,
-    remote_description_failure_reason, who_answered, AnswerFrom, RemoteDescriptionApplied,
+    answer_from, apply_remote_description, build_answerer_pipeline, dtls_started, has_offered,
+    ice_ufrag, remote_description_failure_reason, AnswerFrom, RemoteDescriptionApplied,
     RemoteDescriptionFailure, SrdFailTx, SrdOkTx,
 };
 use webrtc::{

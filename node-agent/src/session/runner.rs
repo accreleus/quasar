@@ -1171,6 +1171,41 @@ impl ReplacementBudget {
     }
 }
 
+/// What one PC's current transport has been told by its peer (#535).
+///
+/// Kept here, not read back from webrtcbin, which applies a description asynchronously: a
+/// second answer half a millisecond behind the first would be read against a transport
+/// that still looks unanswered, applied as a duplicate and lost.
+#[derive(Default)]
+struct Negotiation {
+    /// The answer the transport was last handed.
+    answer: Option<String>,
+    /// The transport was asked for another offer since that answer.
+    reoffered: bool,
+}
+
+impl Negotiation {
+    fn who(&self, answer: &str, dtls_started: bool) -> pipeline::AnswerFrom {
+        pipeline::answer_from(self.answer.as_deref(), answer, dtls_started, self.reoffered)
+    }
+
+    /// `answer` is being handed to the transport. Returns the ICE ufrag it supersedes
+    /// when it is a correction: those credentials answer nothing from here on.
+    fn applied(&mut self, answer: &str) -> Option<String> {
+        self.reoffered = false;
+        let was = self.answer.replace(answer.to_string());
+        let was = was.as_deref().and_then(pipeline::ice_ufrag)?;
+        (Some(was) != pipeline::ice_ufrag(answer)).then(|| was.to_string())
+    }
+
+    /// The transport is being replaced. Returns the ICE ufrag of the peer it leaves.
+    fn replaced(&mut self) -> Option<String> {
+        self.reoffered = false;
+        let gone = self.answer.take()?;
+        pipeline::ice_ufrag(&gone).map(str::to_string)
+    }
+}
+
 /// The session's WebRTC transports. Each is replaced, under the running encoder, when a
 /// peer other than the one it negotiated with answers on it (#535).
 pub(crate) struct SessionTransports {
@@ -1180,8 +1215,10 @@ pub(crate) struct SessionTransports {
     pub(crate) audio_pipeline: AudioPipelineGuard,
     /// Per PC (video, audio): replaced, and that offer not answered yet.
     unanswered: [bool; 2],
-    /// Per PC: the ICE ufrags of the peers whose transport was retired, newest last.
+    /// Per PC: ICE ufrags no current peer answers with any more, newest last. Those of
+    /// the peers whose transport was retired, and those a peer has since corrected.
     displaced: [Vec<String>; 2],
+    negotiation: [Negotiation; 2],
     budget: [ReplacementBudget; 2],
 }
 
@@ -1200,6 +1237,7 @@ impl SessionTransports {
             audio_pipeline: AudioPipelineGuard::new(audio_pipeline),
             unanswered: [false; 2],
             displaced: [Vec::new(), Vec::new()],
+            negotiation: Default::default(),
             budget: [
                 ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
                 ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
@@ -1234,7 +1272,9 @@ impl SessionTransports {
         srd_ok_tx: Option<&pipeline::SrdOkTx>,
     ) -> anyhow::Result<Option<PcId>> {
         let pc = match &msg {
-            SignalMsg::Answer { pc, .. } | SignalMsg::Ice { pc, .. } => pc.unwrap_or_default(),
+            SignalMsg::Answer { pc, .. }
+            | SignalMsg::Ice { pc, .. }
+            | SignalMsg::RestartIce { pc } => pc.unwrap_or_default(),
             _ => PcId::Video,
         };
         let i = pc as usize;
@@ -1242,12 +1282,19 @@ impl SessionTransports {
             PcId::Video => Some(&self.video.webrtc),
             PcId::Audio => self.audio_webrtc.as_ref(),
         };
+        let negotiation = &self.negotiation[i];
         let verdict =
             server::classify_inbound(&msg, &mut self.unanswered[i], &self.displaced[i], |sdp| {
-                target.map_or(pipeline::AnswerFrom::ThisPeer, |t| {
-                    pipeline::who_answered(t, sdp)
-                })
+                negotiation.who(sdp, target.is_some_and(pipeline::dtls_started))
             });
+        let remember_stale = |stale: &mut Vec<String>, ufrag: Option<String>| {
+            if let Some(ufrag) = ufrag {
+                stale.push(ufrag);
+                if stale.len() > DISPLACED_REMEMBERED {
+                    stale.remove(0);
+                }
+            }
+        };
         // Replacements and re-offers share one budget: both are a client making the host
         // do work with an answer.
         let over_budget = |budget: &mut ReplacementBudget| match budget.admit(Instant::now()) {
@@ -1286,13 +1333,7 @@ impl SessionTransports {
                     "{pc} PC: the answer is from a peer this transport has not negotiated \
                      with — replacing the transport"
                 );
-                if let Some(gone) = target.and_then(pipeline::negotiated_ufrag) {
-                    let displaced = &mut self.displaced[i];
-                    displaced.push(gone);
-                    if displaced.len() > DISPLACED_REMEMBERED {
-                        displaced.remove(0);
-                    }
-                }
+                remember_stale(&mut self.displaced[i], self.negotiation[i].replaced());
                 match pc {
                     PcId::Video => self.slot.replace_video(&mut self.video)?,
                     PcId::Audio => {
@@ -1331,9 +1372,19 @@ impl SessionTransports {
                      before any DTLS — its earlier answer was for another offer; offering \
                      again on the same transport"
                 );
+                self.negotiation[i].reoffered = true;
                 msg = SignalMsg::RestartIce { pc: Some(pc) };
             }
-            server::Inbound::Apply => {}
+            server::Inbound::Apply => match &msg {
+                SignalMsg::Answer { sdp, .. } => {
+                    remember_stale(&mut self.displaced[i], self.negotiation[i].applied(sdp));
+                }
+                // One that reaches a transport before its first offer is absorbed.
+                SignalMsg::RestartIce { .. } if target.is_some_and(pipeline::has_offered) => {
+                    self.negotiation[i].reoffered = true;
+                }
+                _ => {}
+            },
         }
         if let Err(e) = server::apply_inbound_as_offerer(
             msg,
@@ -3267,8 +3318,8 @@ mod tests {
         effective_encoder_device_path, fold_display_update, gen0_app_presented, idle_reap_reason,
         is_sctp_association_error, mic_state_label, stop_requested_for_transport_error,
         swap_source_ready, validate_display_update, AppExitStatus, AudioPipelineGuard,
-        DiagnosticEventTx, DisplayUpdateRequest, SessionEvent, TraceEvent, VulkanContextBridge,
-        REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
+        DiagnosticEventTx, DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent,
+        VulkanContextBridge, REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
     };
     use gstreamer::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4392,5 +4443,68 @@ mod tests {
         assert!(guard.as_ref().is_none());
         guard.finish();
         drop(guard);
+    }
+    // ── #535: what a transport has been told, kept ahead of webrtcbin ──────────────
+
+    fn answer_sdp(ufrag: &str, fingerprint: &str) -> String {
+        format!("v=0\r\na=ice-ufrag:{ufrag}\r\na=fingerprint:sha-256 {fingerprint}\r\n")
+    }
+
+    /// The race the harness loop found: the page's late answer to the old transport's
+    /// offer and its answer to the new one arrive together. The second must be read
+    /// against the first at once, not against what webrtcbin has applied so far.
+    #[test]
+    fn an_answer_right_behind_another_is_read_against_the_first() {
+        let mut negotiation = Negotiation::default();
+        let (late, current) = (answer_sdp("old1", "AA:01"), answer_sdp("new2", "AA:01"));
+        assert_eq!(
+            negotiation.who(&late, false),
+            pipeline::AnswerFrom::ThisPeer
+        );
+        assert_eq!(negotiation.applied(&late), None);
+
+        assert_eq!(
+            negotiation.who(&current, false),
+            pipeline::AnswerFrom::ThisPeerCorrecting
+        );
+    }
+
+    #[test]
+    fn a_correction_is_applied_once_the_transport_was_asked_to_offer_again() {
+        let mut negotiation = Negotiation::default();
+        let (late, current) = (answer_sdp("old1", "AA:01"), answer_sdp("new2", "AA:01"));
+        negotiation.applied(&late);
+        negotiation.reoffered = true;
+
+        assert_eq!(
+            negotiation.who(&current, false),
+            pipeline::AnswerFrom::ThisPeer
+        );
+        assert_eq!(
+            negotiation.applied(&current),
+            Some("old1".to_string()),
+            "the credentials it replaces are stale from here on"
+        );
+        assert!(!negotiation.reoffered);
+        assert_eq!(
+            negotiation.applied(&current),
+            None,
+            "a re-answer supersedes nothing"
+        );
+    }
+
+    #[test]
+    fn a_replaced_transport_starts_unanswered_and_names_the_peer_it_left() {
+        let mut negotiation = Negotiation::default();
+        negotiation.applied(&answer_sdp("aaaa", "AA:01"));
+        negotiation.reoffered = true;
+
+        assert_eq!(negotiation.replaced(), Some("aaaa".to_string()));
+        assert_eq!(
+            negotiation.who(&answer_sdp("bbbb", "BB:02"), false),
+            pipeline::AnswerFrom::ThisPeer
+        );
+        assert!(!negotiation.reoffered);
+        assert_eq!(negotiation.replaced(), None);
     }
 }
