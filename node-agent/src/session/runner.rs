@@ -1101,6 +1101,7 @@ impl AudioPipelineGuard {
         }
         if let Some(p) = &self.pipeline {
             let _ = p.set_state(gst::State::Null);
+            tracing::info!(token = "audio-pipeline-stopped", "audio pipeline at NULL");
         }
     }
 }
@@ -1219,7 +1220,7 @@ impl SessionTransports {
     /// session nothing to stream on.
     pub(crate) fn inbound(
         &mut self,
-        msg: SignalMsg,
+        mut msg: SignalMsg,
         out_tx: &pipeline::OutTx,
         srd_fail_tx: Option<&pipeline::SrdFailTx>,
         srd_ok_tx: Option<&pipeline::SrdOkTx>,
@@ -1235,8 +1236,27 @@ impl SessionTransports {
         };
         let verdict =
             server::classify_inbound(&msg, &mut self.unanswered[i], &self.displaced[i], |sdp| {
-                target.is_some_and(|t| pipeline::answer_is_from_new_peer(t, sdp))
+                target.map_or(pipeline::AnswerFrom::ThisPeer, |t| {
+                    pipeline::who_answered(t, sdp)
+                })
             });
+        // Replacements and re-offers share one budget: both are a client making the host
+        // do work with an answer.
+        let over_budget = |budget: &mut ReplacementBudget| match budget.admit(Instant::now()) {
+            Admission::Admitted => false,
+            Admission::Refused { first } => {
+                if first {
+                    tracing::warn!(
+                        token = "transport-replace-rate-limited",
+                        "{pc} PC: {MAX_REPLACEMENTS_PER_WINDOW} transport replacements or \
+                         re-offers in {} s — answers that ask for another are ignored \
+                         until the window clears; the current transport is kept",
+                        REPLACEMENT_WINDOW.as_secs()
+                    );
+                }
+                true
+            }
+        };
         match verdict {
             server::Inbound::Stale => {
                 if matches!(msg, SignalMsg::Answer { .. }) {
@@ -1248,21 +1268,9 @@ impl SessionTransports {
                 return Ok(None);
             }
             server::Inbound::NewPeer(pc) => {
-                match self.budget[i].admit(Instant::now()) {
-                    Admission::Admitted => {}
-                    // Not applied either: it would rebind the current peer's transport.
-                    Admission::Refused { first } => {
-                        if first {
-                            tracing::warn!(
-                                token = "transport-replace-rate-limited",
-                                "{pc} PC: {MAX_REPLACEMENTS_PER_WINDOW} transport replacements \
-                                 in {} s — answers from further new peers are ignored until \
-                                 the window clears; the current transport is kept",
-                                REPLACEMENT_WINDOW.as_secs()
-                            );
-                        }
-                        return Ok(None);
-                    }
+                // Not applied either: it would rebind the current peer's transport.
+                if over_budget(&mut self.budget[i]) {
+                    return Ok(None);
                 }
                 tracing::info!(
                     token = "transport-replaced",
@@ -1295,7 +1303,26 @@ impl SessionTransports {
                     }
                 }
                 self.unanswered[i] = true;
+                tracing::info!(
+                    token = "transport-replacement-built",
+                    "{pc} PC: new transport built and offering; {} replacement(s) on this \
+                     PC in the last {} s",
+                    self.budget[i].recent.len(),
+                    REPLACEMENT_WINDOW.as_secs()
+                );
                 return Ok(Some(pc));
+            }
+            server::Inbound::Reoffer(pc) => {
+                if over_budget(&mut self.budget[i]) {
+                    return Ok(None);
+                }
+                tracing::info!(
+                    token = "transport-reoffered",
+                    "{pc} PC: the negotiated peer answered with other ICE credentials \
+                     before any DTLS — its earlier answer was for another offer; offering \
+                     again on the same transport"
+                );
+                msg = SignalMsg::RestartIce { pc: Some(pc) };
             }
             server::Inbound::Apply => {}
         }
@@ -1314,6 +1341,18 @@ impl SessionTransports {
         }
         Ok(None)
     }
+}
+
+/// Stop the source on the session's way out. The video transport lets go first: one whose
+/// peer never connected holds the encode chain's push, and a source that waits on that
+/// chain through interpipe never reaches NULL (#535).
+fn stop_source(source: &mut AppSource, transports: &SessionTransports) {
+    transports.video.release();
+    tracing::info!(
+        token = "session-transport-released",
+        "video transport released ahead of the source teardown"
+    );
+    source.teardown();
 }
 
 /// Should an idle `running` session be reaped? `Some(reason)` to reap. Pure so the policy
@@ -1894,7 +1933,7 @@ pub fn run_blocking(
                 "encode pipeline READY transition (Vulkan device verification) failed"
             );
             emit(SessionEvent::Failed(reason));
-            current_source.teardown();
+            stop_source(&mut current_source, &transports);
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             return;
         }
@@ -1909,7 +1948,7 @@ pub fn run_blocking(
                 "verify Vulkan context identity failed"
             );
             emit(SessionEvent::Failed(reason));
-            current_source.teardown();
+            stop_source(&mut current_source, &transports);
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             return;
         }
@@ -1921,7 +1960,7 @@ pub fn run_blocking(
             "encode pipeline PLAYING transition failed"
         );
         emit(SessionEvent::Failed(format!("encode set PLAYING: {e}")));
-        current_source.teardown();
+        stop_source(&mut current_source, &transports);
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         return;
     }
@@ -1952,7 +1991,7 @@ pub fn run_blocking(
             "encode pipeline has no bus"
         );
         emit(SessionEvent::Failed("encode pipeline has no bus".into()));
-        current_source.teardown();
+        stop_source(&mut current_source, &transports);
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         transports.audio_pipeline.finish();
         return;
@@ -2013,7 +2052,7 @@ pub fn run_blocking(
     loop {
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
-            current_source.teardown(); // remove the app container before media
+            stop_source(&mut current_source, &transports); // remove the app container before media
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             emit(SessionEvent::Stopped {
@@ -2244,7 +2283,7 @@ pub fn run_blocking(
                         "video transport replacement failed"
                     );
                     emit(SessionEvent::Failed(reason));
-                    current_source.teardown();
+                    stop_source(&mut current_source, &transports);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     return;
@@ -2346,7 +2385,7 @@ pub fn run_blocking(
                 "webrtc: set-remote-description failed — failing session: {reason}"
             );
             emit(SessionEvent::Failed(reason));
-            current_source.teardown();
+            stop_source(&mut current_source, &transports);
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             return;
@@ -2423,7 +2462,7 @@ pub fn run_blocking(
                         "swap failed fatally; ending session"
                     );
                     emit(SessionEvent::Failed(failure.reason));
-                    current_source.teardown();
+                    stop_source(&mut current_source, &transports);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     return;
@@ -2472,7 +2511,7 @@ pub fn run_blocking(
                     app_presented_at.is_some()
                 );
                 emit(SessionEvent::Stopping);
-                current_source.teardown();
+                stop_source(&mut current_source, &transports);
                 super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                 transports.audio_pipeline.finish();
                 tracing::error!(
@@ -2511,7 +2550,7 @@ pub fn run_blocking(
                             "source pipeline bus error"
                         );
                         emit(SessionEvent::Failed(reason));
-                        current_source.teardown();
+                        stop_source(&mut current_source, &transports);
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         return;
@@ -2526,7 +2565,7 @@ pub fn run_blocking(
                                 "renderer degraded; failing session"
                             );
                             emit(SessionEvent::Failed(reason));
-                            current_source.teardown();
+                            stop_source(&mut current_source, &transports);
                             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                             transports.audio_pipeline.finish();
                             return;
@@ -2548,7 +2587,7 @@ pub fn run_blocking(
             emit(SessionEvent::Failed(format!(
                 "container launch failed: {err}"
             )));
-            current_source.teardown();
+            stop_source(&mut current_source, &transports);
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             return;
@@ -2599,7 +2638,7 @@ pub fn run_blocking(
                         reason_code: REASON_APP_NEVER_PRESENTED,
                         app_log_tail: current_source.app_log_tail(),
                     });
-                    current_source.teardown();
+                    stop_source(&mut current_source, &transports);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     return;
@@ -2661,7 +2700,7 @@ pub fn run_blocking(
                             "app container exited; unrecognized disposition treated as fail"
                         );
                         emit(app_exit_event(status, presented, app_log_tail));
-                        current_source.teardown();
+                        stop_source(&mut current_source, &transports);
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         return;
@@ -2674,7 +2713,7 @@ pub fn run_blocking(
                             "app container exited; on_app_exit=fail"
                         );
                         emit(app_exit_event(status, presented, app_log_tail));
-                        current_source.teardown();
+                        stop_source(&mut current_source, &transports);
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         return;
@@ -2713,7 +2752,7 @@ pub fn run_blocking(
                             err.debug()
                         );
                         emit(SessionEvent::Stopping);
-                        current_source.teardown();
+                        stop_source(&mut current_source, &transports);
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         emit(SessionEvent::Stopped {
@@ -2753,7 +2792,7 @@ pub fn run_blocking(
                             },
                         );
                         emit(SessionEvent::Stopping);
-                        current_source.teardown();
+                        stop_source(&mut current_source, &transports);
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         emit(SessionEvent::Stopped {
@@ -2778,7 +2817,7 @@ pub fn run_blocking(
                         "encode pipeline bus error"
                     );
                     emit(SessionEvent::Failed(reason));
-                    current_source.teardown();
+                    stop_source(&mut current_source, &transports);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     return;
@@ -2793,7 +2832,7 @@ pub fn run_blocking(
                     }
                 }
                 gst::MessageView::Eos(_) => {
-                    current_source.teardown();
+                    stop_source(&mut current_source, &transports);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     emit(SessionEvent::Stopped {

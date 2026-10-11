@@ -1,6 +1,8 @@
 //! The transport slot of the media path (`compositor -> encode -> [transport slot]`): the
-//! WebRTC transports as units that are built once at launch and replaced, with the
-//! encoder left running, when a different peer attaches (#535).
+//! WebRTC transports as units that are built once at launch and replaced under the
+//! running encode chain when a different peer attaches (#535). The encoder element is
+//! kept; a replacement sends it no event, and writes to it only what
+//! `abr_glue::reset_to_launch` logs.
 //!
 //! `webrtcbin` cannot serve a second peer on a transport a first one negotiated: it
 //! ignores the `ice-restart` offer option, so a re-offer carries the same ICE credentials
@@ -116,6 +118,14 @@ fn wait_idle(pad: &gst::Pad) {
 }
 
 impl VideoTransport {
+    /// Let go of whatever the transport holds, on a session's way out. Must run before
+    /// the source is stopped: a transport whose peer never connected parks the encode
+    /// chain's push, and a source waiting on that chain never reaches NULL.
+    pub fn release(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+        let _ = self.webrtc.set_state(gst::State::Null);
+    }
+
     /// Tear the transport down under a live encode chain. The caller holds RTP at `tail`.
     fn retire(&self, tail: &gst::Pad, pipeline: &gst::Pipeline) {
         self.retired.store(true, Ordering::SeqCst);
@@ -149,9 +159,28 @@ impl TransportSlot {
         let sink = bin
             .static_pad("sink")
             .context("transport bin has no sink")?;
-        self.tail
-            .link(&sink)
-            .context("failed to link video into webrtcbin")?;
+        if replacement {
+            // Nothing a transport added mid-stream does may make the chain upstream
+            // renegotiate: its allocation query queues behind the RTP this transport
+            // holds until its peer connects, and the source's streaming thread waits on
+            // that query through interpipe, so the source could not be stopped or swapped.
+            sink.add_probe(gst::PadProbeType::EVENT_UPSTREAM, |_, info| {
+                match info.event().map(|e| e.type_()) {
+                    Some(gst::EventType::Reconfigure) => gst::PadProbeReturn::Drop,
+                    _ => gst::PadProbeReturn::Ok,
+                }
+            });
+            self.tail
+                .link_full(
+                    &sink,
+                    gst::PadLinkCheck::DEFAULT | gst::PadLinkCheck::NO_RECONFIGURE,
+                )
+                .context("failed to link video into the replacement webrtcbin")?;
+        } else {
+            self.tail
+                .link(&sink)
+                .context("failed to link video into webrtcbin")?;
+        }
         enable_video_rtx(&webrtc);
         // ULPFEC/RED proactive burst-loss repair, no RTX round-trip. `fixed` negotiates
         // ulp-red at the static level; `auto` negotiates at 0% and the controller ramps
@@ -196,11 +225,18 @@ impl TransportSlot {
         if replacement {
             // The encoder is mid-GOP: the peer that just connected needs a keyframe.
             let encoder = self.encoder.downgrade();
+            let session_id = self.session_id.clone();
             webrtc.connect_notify(Some("connection-state"), move |webrtc, _| {
                 let state = webrtc
                     .property::<gstreamer_webrtc::WebRTCPeerConnectionState>("connection-state");
                 if state == gstreamer_webrtc::WebRTCPeerConnectionState::Connected {
                     if let Some(encoder) = encoder.upgrade() {
+                        tracing::info!(
+                            token = "transport-replacement-connected",
+                            session_id = %session_id,
+                            "video PC: the replacement transport's peer connected; forcing \
+                             a keyframe for it"
+                        );
                         resize::force_idr(&encoder);
                     }
                 }
@@ -271,11 +307,16 @@ impl TransportSlot {
         video.retire(&self.tail, &self.pipeline);
         // A key the last peer held must not stay down for the next one.
         if let Some(devices) = &self.devices {
-            if let Err(e) = devices.release_all() {
-                tracing::warn!(
+            match devices.release_all() {
+                Ok(()) => tracing::info!(
+                    token = "transport-replaced-input-released",
+                    "video PC: the previous transport is down; keys and buttons its peer \
+                     held are released"
+                ),
+                Err(e) => tracing::warn!(
                     token = "transport-replace-release-all-failed",
                     "release_all on transport replacement failed: {e:#}"
-                );
+                ),
             }
         }
         abr_glue::reset_to_launch(&self.encoder, &self.cfg, &self.lever, &self.metrics);

@@ -983,19 +983,49 @@ fn peer_identity(sdp: &str) -> (Option<&str>, Option<&str>) {
     (attr("a=ice-ufrag:"), attr("a=fingerprint:"))
 }
 
-/// Is `answer` from a different endpoint than the one that wrote `negotiated`?
-///
-/// This host never changes its own ICE credentials (webrtcbin ignores `ice-restart`), so
-/// an answerer has no reason to change its own: a new ufrag or certificate is a new peer
-/// connection. A webrtcbin that starts honouring `ice-restart` makes a same-peer answer
-/// look new here; guarded by `takeover_tests::a_restart_from_the_same_peer_keeps_the_transport`.
-fn is_new_peer(negotiated: Option<&str>, answer: &str) -> bool {
+/// Who wrote an answer, relative to the peer its transport negotiated with (#535).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerFrom {
+    /// The negotiated peer, or the first to answer.
+    ThisPeer,
+    /// The negotiated peer under other ICE credentials: the description this transport
+    /// holds is one that peer wrote for another transport's offer.
+    ThisPeerCorrecting,
+    /// A peer this transport cannot serve: its DTLS and SCTP associations are another's.
+    NewPeer,
+}
+
+/// This host never changes a transport's ICE credentials (webrtcbin ignores
+/// `ice-restart`), so its peer never changes theirs: another ufrag or certificate is
+/// another peer connection. The exception is a transport no DTLS has started on. A
+/// browser answers a new transport's offer with new credentials and the certificate it
+/// had, so an answer of its to the old transport's offer that arrived late and was
+/// applied here names credentials it has since dropped. Once DTLS has started the
+/// association is one endpoint's, and the same certificate under other credentials is
+/// another endpoint of one process (every webrtcbin in a process shares a certificate).
+/// Guarded by `takeover_tests::a_restart_from_the_same_peer_keeps_the_transport`.
+fn answer_from(
+    negotiated: Option<&str>,
+    answer: &str,
+    dtls_started: bool,
+    offer_pending: bool,
+) -> AnswerFrom {
     let Some(negotiated) = negotiated else {
-        return false; // nobody has answered on this transport yet
+        return AnswerFrom::ThisPeer; // nobody has answered on this transport yet
     };
     let (was_ufrag, was_fingerprint) = peer_identity(negotiated);
     let (ufrag, fingerprint) = peer_identity(answer);
-    was_ufrag != ufrag || was_fingerprint != fingerprint
+    if was_fingerprint != fingerprint {
+        AnswerFrom::NewPeer
+    } else if was_ufrag == ufrag {
+        AnswerFrom::ThisPeer
+    } else if dtls_started {
+        AnswerFrom::NewPeer
+    } else if offer_pending {
+        AnswerFrom::ThisPeer // the correction itself: its answer to the offer in flight
+    } else {
+        AnswerFrom::ThisPeerCorrecting
+    }
 }
 
 /// The remote description `webrtc` last had applied, as text.
@@ -1005,10 +1035,26 @@ fn negotiated(webrtc: &gst::Element) -> Option<String> {
         .and_then(|d| d.sdp().as_text().ok())
 }
 
-/// Is `answer` from a peer other than the one `webrtc` negotiated with (#535)? Such a
-/// peer cannot use this transport: its DTLS and SCTP associations belong to the first.
-pub(crate) fn answer_is_from_new_peer(webrtc: &gst::Element, answer: &str) -> bool {
-    is_new_peer(negotiated(webrtc).as_deref(), answer)
+/// Has a DTLS handshake started on `webrtc`'s transport?
+fn dtls_started(webrtc: &gst::Element) -> bool {
+    let state = || {
+        webrtc
+            .emit_by_name::<Option<glib::Object>>("get-transceiver", &[&0i32])?
+            .property::<Option<glib::Object>>("sender")?
+            .property::<Option<glib::Object>>("transport")
+            .map(|t| t.property::<gstreamer_webrtc::WebRTCDTLSTransportState>("state"))
+    };
+    state().is_some_and(|s| s != gstreamer_webrtc::WebRTCDTLSTransportState::New)
+}
+
+/// Who `answer` is from, for the transport `webrtc`.
+pub(crate) fn who_answered(webrtc: &gst::Element, answer: &str) -> AnswerFrom {
+    answer_from(
+        negotiated(webrtc).as_deref(),
+        answer,
+        dtls_started(webrtc),
+        signaling_state_nick(webrtc).as_deref() == Some("have-local-offer"),
+    )
 }
 
 /// Has `webrtc` made an offer yet?
@@ -1131,9 +1177,9 @@ pub(crate) fn apply_remote_description(
 #[cfg(test)]
 mod tests {
     use super::{
-        answer_is_duplicate, enable_video_fec, error_is_stale_answer, is_new_peer, make_webrtcbin,
+        answer_from, answer_is_duplicate, enable_video_fec, error_is_stale_answer, make_webrtcbin,
         munge_offer_sdp, remote_description_error, remote_description_failure_reason,
-        set_audio_receive_latency, signaling_state_nick, PcId, SrdFailureKind,
+        set_audio_receive_latency, signaling_state_nick, AnswerFrom, PcId, SrdFailureKind,
     };
     use gstreamer as gst;
     use gstreamer::prelude::*;
@@ -1283,23 +1329,62 @@ mod tests {
 
     #[test]
     fn the_first_answer_on_a_transport_is_never_a_new_peer() {
-        assert!(!is_new_peer(None, &answer("aaaa", "AA:01")));
+        for dtls in [false, true] {
+            assert_eq!(
+                answer_from(None, &answer("aaaa", "AA:01"), dtls, true),
+                AnswerFrom::ThisPeer
+            );
+        }
     }
 
     #[test]
     fn the_same_peer_answering_again_is_not_new() {
         let first = answer("aaaa", "AA:01");
-        assert!(!is_new_peer(Some(&first), &answer("aaaa", "AA:01")));
+        assert_eq!(
+            answer_from(Some(&first), &answer("aaaa", "AA:01"), true, true),
+            AnswerFrom::ThisPeer
+        );
     }
 
     #[test]
-    fn another_ice_agent_or_another_certificate_is_a_new_peer() {
+    fn another_certificate_is_a_new_peer_whatever_the_transport_has_done() {
         let first = answer("aaaa", "AA:01");
-        // Two browsers: both differ.
-        assert!(is_new_peer(Some(&first), &answer("bbbb", "BB:02")));
-        // Two peer connections sharing a certificate (webrtcbin does, per process).
-        assert!(is_new_peer(Some(&first), &answer("bbbb", "AA:01")));
-        assert!(is_new_peer(Some(&first), &answer("aaaa", "BB:02")));
+        for (dtls, pending) in [(false, false), (false, true), (true, false), (true, true)] {
+            for ufrag in ["aaaa", "bbbb"] {
+                assert_eq!(
+                    answer_from(Some(&first), &answer(ufrag, "BB:02"), dtls, pending),
+                    AnswerFrom::NewPeer
+                );
+            }
+        }
+    }
+
+    /// Two peer connections of one process share a certificate (webrtcbin's do).
+    #[test]
+    fn other_ice_credentials_once_dtls_has_started_are_a_new_peer() {
+        let first = answer("aaaa", "AA:01");
+        for pending in [false, true] {
+            assert_eq!(
+                answer_from(Some(&first), &answer("bbbb", "AA:01"), true, pending),
+                AnswerFrom::NewPeer
+            );
+        }
+    }
+
+    /// A browser's late answer to the old transport's offer was applied to the new one.
+    #[test]
+    fn other_ice_credentials_before_any_dtls_are_the_same_peer_correcting_itself() {
+        let late = answer("old1", "AA:01");
+        let current = answer("new2", "AA:01");
+        assert_eq!(
+            answer_from(Some(&late), &current, false, false),
+            AnswerFrom::ThisPeerCorrecting
+        );
+        assert_eq!(
+            answer_from(Some(&late), &current, false, true),
+            AnswerFrom::ThisPeer,
+            "the answer to the offer that correction asked for is applied"
+        );
     }
 
     #[test]

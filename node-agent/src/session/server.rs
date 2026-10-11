@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::host::SessionHost;
-use super::pipeline::{self, OutTx, SrdFailTx, SrdOkTx};
+use super::pipeline::{self, AnswerFrom, OutTx, SrdFailTx, SrdOkTx};
 use super::signaling::{PcId, SignalMsg};
 use super::SessionConfig;
 
@@ -377,6 +377,9 @@ pub(crate) enum Inbound {
     Apply,
     /// An answer from a peer this PC's transport has not negotiated with.
     NewPeer(PcId),
+    /// An answer from the negotiated peer that this PC's transport cannot take until it
+    /// has offered again.
+    Reoffer(PcId),
     /// From a negotiation that is over: an answer from a peer whose transport was
     /// retired, or a candidate sent before the answer to a replaced transport's offer.
     Stale,
@@ -391,28 +394,32 @@ pub(crate) enum Inbound {
 /// changes theirs.
 ///
 /// `unanswered`: this PC's transport was just replaced and nobody has answered its
-/// offer; candidates before that answer belong to the old negotiation. `new_peer` reads
-/// an answer against what the transport negotiated (nothing, for a fresh transport).
+/// offer; candidates before that answer belong to the old negotiation. `from` reads an
+/// answer against what the transport negotiated (nothing, for a fresh transport).
 ///
-/// Known bound: a client that answered two offers from the old transport has its second
-/// answer applied to the new one. Its ICE then fails and its own `restart_ice` recovers.
+/// A client that answered two offers from the old transport has its second answer
+/// applied to the new one. Its answer to the new transport's own offer then reads
+/// [`AnswerFrom::ThisPeerCorrecting`], and the transport offers once more.
 pub(crate) fn classify_inbound(
     msg: &SignalMsg,
     unanswered: &mut bool,
     displaced: &[String],
-    new_peer: impl FnOnce(&str) -> bool,
+    from: impl FnOnce(&str) -> AnswerFrom,
 ) -> Inbound {
     match msg {
         SignalMsg::Answer { sdp, pc } => {
             let from_displaced = pipeline::ice_ufrag(sdp)
                 .is_some_and(|ufrag| displaced.iter().any(|gone| gone == ufrag));
             if from_displaced {
-                Inbound::Stale
-            } else if new_peer(sdp) {
-                Inbound::NewPeer(pc.unwrap_or_default())
-            } else {
-                *unanswered = false;
-                Inbound::Apply
+                return Inbound::Stale;
+            }
+            match from(sdp) {
+                AnswerFrom::NewPeer => Inbound::NewPeer(pc.unwrap_or_default()),
+                AnswerFrom::ThisPeerCorrecting => Inbound::Reoffer(pc.unwrap_or_default()),
+                AnswerFrom::ThisPeer => {
+                    *unanswered = false;
+                    Inbound::Apply
+                }
             }
         }
         SignalMsg::Ice { .. } if *unanswered => Inbound::Stale,
@@ -566,7 +573,7 @@ where
 mod inbound_tests {
     //! #535: when an answer means "new peer", and what is stale after a replacement.
 
-    use super::{classify_inbound, Inbound};
+    use super::{classify_inbound, AnswerFrom, Inbound};
     use crate::session::signaling::{IceCandidate, PcId, SignalMsg};
 
     fn answer(pc: PcId, ufrag: &str) -> SignalMsg {
@@ -592,7 +599,7 @@ mod inbound_tests {
         let mut unanswered = false;
         assert_eq!(
             classify_inbound(&answer(PcId::Video, "aaaa"), &mut unanswered, &[], |_| {
-                false
+                AnswerFrom::ThisPeer
             }),
             Inbound::Apply
         );
@@ -602,9 +609,24 @@ mod inbound_tests {
     fn an_answer_from_another_peer_asks_for_a_new_transport_on_its_pc() {
         let mut unanswered = false;
         assert_eq!(
-            classify_inbound(&answer(PcId::Audio, "bbbb"), &mut unanswered, &[], |_| true),
+            classify_inbound(&answer(PcId::Audio, "bbbb"), &mut unanswered, &[], |_| {
+                AnswerFrom::NewPeer
+            }),
             Inbound::NewPeer(PcId::Audio)
         );
+    }
+
+    /// Nothing is applied, so the transport is not answered yet either.
+    #[test]
+    fn an_answer_the_transport_cannot_take_yet_asks_for_another_offer() {
+        let mut unanswered = true;
+        assert_eq!(
+            classify_inbound(&answer(PcId::Video, "bbbb"), &mut unanswered, &[], |_| {
+                AnswerFrom::ThisPeerCorrecting
+            }),
+            Inbound::Reoffer(PcId::Video)
+        );
+        assert!(unanswered);
     }
 
     /// The first answer to a replaced transport's offer ends the stale window. A fresh
@@ -618,7 +640,7 @@ mod inbound_tests {
         );
         assert_eq!(
             classify_inbound(&answer(PcId::Video, "bbbb"), &mut unanswered, &[], |_| {
-                false
+                AnswerFrom::ThisPeer
             }),
             Inbound::Apply
         );
@@ -672,7 +694,7 @@ mod inbound_tests {
                 &answer(PcId::Video, "cccc"),
                 &mut unanswered,
                 &displaced,
-                |_| { false }
+                |_| { AnswerFrom::ThisPeer }
             ),
             Inbound::Apply
         );

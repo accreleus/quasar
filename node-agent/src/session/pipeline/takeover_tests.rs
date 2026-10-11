@@ -19,26 +19,38 @@ use super::{
     build_source_pipeline, resolve_effective_encoder, EncodePipeline, OutTx,
 };
 use crate::session::metrics::SessionMetrics;
-use crate::session::runner::{DiagnosticEventTx, SessionTransports};
+use crate::session::runner::{DiagnosticEventTx, SessionEvent, SessionTransports};
 use crate::session::signaling::{PcId, SignalMsg};
 use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 
 /// The dev/runtime image has libnice, gst-interpipe and openh264; the devtools image
-/// `make test-rust` runs in has none of the first two. Same loud-SKIP rule as
-/// [`super::interpipe_available`].
+/// `make test-rust` runs in and the CI runner have none of the first two. A test that
+/// returns early counts as passed, so the skip is written past libtest's capture, once,
+/// and `scripts/verify/agent.sh` restates it.
 fn live_webrtc_available() -> bool {
-    if !super::interpipe_available() {
-        return false;
-    }
-    let missing: Vec<&str> = ["nicesrc", "openh264enc", "dtlsdec", "sctpenc"]
-        .into_iter()
-        .filter(|f| gst::ElementFactory::find(f).is_none())
-        .collect();
+    gst::init().unwrap();
+    let missing: Vec<&str> = [
+        "interpipesink",
+        "interpipesrc",
+        "nicesrc",
+        "openh264enc",
+        "dtlsdec",
+        "sctpenc",
+    ]
+    .into_iter()
+    .filter(|f| gst::ElementFactory::find(f).is_none())
+    .collect();
     if !missing.is_empty() {
-        eprintln!(
-            "SKIP — {missing:?} not installed in this image; the two-peer takeover tests did \
-             not run (they do run in the quasar-agent-dev container)"
-        );
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIP — session::pipeline::takeover_tests (#535): the live two-peer WebRTC \
+                 tests did NOT run, {missing:?} missing from this image; they run in the \
+                 quasar-agent-dev container"
+            );
+        });
     }
     missing.is_empty()
 }
@@ -91,6 +103,8 @@ struct Host {
     encoder: gst::Element,
     /// When the encoder emitted each keyframe.
     keyframes: Arc<Mutex<Vec<Instant>>>,
+    /// RECONFIGURE events that reached the encoder from downstream.
+    reconfigures: Arc<AtomicU64>,
     _metrics: Arc<SessionMetrics>,
     _trace_rx: mpsc::Receiver<(String, crate::session::runner::TraceEvent)>,
 }
@@ -170,6 +184,17 @@ impl Host {
                 }
                 gst::PadProbeReturn::Ok
             });
+        let reconfigures = Arc::new(AtomicU64::new(0));
+        let count = reconfigures.clone();
+        encoder.static_pad("src").unwrap().add_probe(
+            gst::PadProbeType::EVENT_UPSTREAM,
+            move |_, info| {
+                if info.event().map(|e| e.type_()) == Some(gst::EventType::Reconfigure) {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
         Host {
             source,
             pipeline,
@@ -183,6 +208,7 @@ impl Host {
             bus_errors: Vec::new(),
             encoder,
             keyframes,
+            reconfigures,
             _metrics: metrics,
             _trace_rx: trace_rx,
         }
@@ -221,6 +247,8 @@ impl Host {
 // while PLAYING leaves a dangling listener that segfaults the next test.
 impl Drop for Host {
     fn drop(&mut self) {
+        // The runner's order (`runner::stop_source`).
+        self.transports.video.release();
         let _ = self.source.set_state(gst::State::Null);
         let _ = self.pipeline.set_state(gst::State::Null);
         self.transports.audio_pipeline.finish();
@@ -589,6 +617,7 @@ fn a_takeover_mid_stream_moves_the_stream_to_the_new_peer() {
     let a = first_attach(&mut host);
     let first_transport = host.transports.video.webrtc.downgrade();
     let keyframes_before = host.keyframes.lock().unwrap().len();
+    let reconfigures_before = host.reconfigures.load(Ordering::Relaxed);
 
     let mut b = attach(&mut host);
 
@@ -616,6 +645,11 @@ fn a_takeover_mid_stream_moves_the_stream_to_the_new_peer() {
         Some(&host.encoder),
         "the encoder is not rebuilt"
     );
+    assert_eq!(
+        host.reconfigures.load(Ordering::Relaxed),
+        reconfigures_before,
+        "the replacement made the encoder renegotiate"
+    );
 
     // The displaced page: nothing reaches it any more, and its input is not heard.
     let a_video = rtp(&a.video);
@@ -640,15 +674,10 @@ fn a_takeover_mid_stream_moves_the_stream_to_the_new_peer() {
     assert_eq!(host.bus_errors, Vec::<String>::new());
 }
 
-/// The first page answered but its transport never connected (its loader is still up).
-/// The encode chain is then parked inside that transport, which is the hard teardown.
-#[test]
-fn a_takeover_while_the_first_peer_is_still_connecting_reaches_the_new_peer() {
-    if !live_webrtc_available() {
-        return;
-    }
-    let _serial = serial();
-    let mut host = Host::start("connecting");
+/// The first page answered but its transport never connected (its loader is still up),
+/// and a second page attaches.
+fn takeover_while_connecting(tag: &str, another_browser: bool) -> (Host, Peer) {
+    let mut host = Host::start(tag);
     let mut a = Peer::new();
     let answered = pump_with(&mut host, &mut a, Duration::from_secs(10), false, |h, _| {
         h.transports
@@ -659,12 +688,39 @@ fn a_takeover_while_the_first_peer_is_still_connecting_reaches_the_new_peer() {
     });
     assert!(answered, "the first peer's answer never applied");
     assert_eq!(rtp(&a.video), 0, "the first peer must not have connected");
-
+    if another_browser {
+        host.munge_answer = Some(with_another_certificate);
+    }
     let mut b = attach(&mut host);
-
-    assert!(host.replaced.contains(&PcId::Video));
     assert!(input_reaches_host(&mut host, &mut b));
     assert_eq!(host.bus_errors, Vec::<String>::new());
+    (host, b)
+}
+
+/// The encode chain is parked inside the transport that never connected, which is the
+/// hard teardown.
+#[test]
+fn a_takeover_while_the_first_peer_is_still_connecting_reaches_the_new_peer() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (host, _b) = takeover_while_connecting("connecting", true);
+    let mut replaced = host.replaced.clone();
+    replaced.sort_by_key(|pc| *pc as usize);
+    assert_eq!(replaced, [PcId::Video, PcId::Audio]);
+}
+
+/// The same from a peer with the first one's certificate, as two peer connections of one
+/// process have: no DTLS has started on the transports, so it takes them as they are.
+#[test]
+fn a_peer_with_the_same_certificate_takes_a_transport_that_never_connected_in_place() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (host, _b) = takeover_while_connecting("inplace", false);
+    assert_eq!(host.replaced, Vec::<PcId>::new());
 }
 
 /// The first page is gone before the second attaches (a reload, a resume). The agent
@@ -783,7 +839,7 @@ fn the_new_transports_offer_differs_from_the_old_one_only_as_an_ice_restart_does
         sdp_value(again, "a=ice-ufrag:"),
         sdp_value(launch, "a=ice-ufrag:"),
         "webrtcbin started honouring ice-restart: the same peer's answer will now look \
-         like a new peer's (see webrtc::is_new_peer)"
+         like a new peer's (see webrtc::answer_from)"
     );
 
     // The new transport: another SDP session with new ICE credentials...
@@ -1004,16 +1060,7 @@ fn fingerprint_evidence() {
     }
     let _serial = serial();
     let mut host = Host::start("fingerprint");
-    host.munge_answer = Some(|sdp| {
-        sdp.lines()
-            .map(|l| match l.strip_prefix("a=fingerprint:sha-256 ") {
-                Some(_) => format!("a=fingerprint:sha-256 {}", ["AB"; 32].join(":")),
-                None => l.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\r\n")
-            + "\r\n"
-    });
+    host.munge_answer = Some(with_another_certificate);
     let mut peer = Peer::new();
     let up = pump(&mut host, &mut peer, Duration::from_secs(10), |_, p| {
         streaming(p)
@@ -1021,6 +1068,421 @@ fn fingerprint_evidence() {
     eprintln!(
         "FINGERPRINT a peer whose answer carries a wrong fingerprint streams: {up} ({})",
         describe(&peer)
+    );
+}
+
+/// An answer as another browser would have written it: a certificate of its own. Every
+/// peer here shares the process's one; webrtcbin does not check the fingerprint against
+/// the handshake, so the peer still connects.
+fn with_another_certificate(sdp: String) -> String {
+    sdp.lines()
+        .map(|l| match l.strip_prefix("a=fingerprint:sha-256 ") {
+            Some(_) => format!("a=fingerprint:sha-256 {}", ["AB"; 32].join(":")),
+            None => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n"
+}
+
+/// An answer as another peer connection of the same process would have written it: other
+/// ICE credentials, the same certificate.
+fn with_other_ice(sdp: &str) -> String {
+    sdp.replace("a=ice-ufrag:", "a=ice-ufrag:x")
+}
+
+/// The last answer the host was handed for `pc`.
+fn last_answer(host: &Host, pc: PcId) -> String {
+    host.wire
+        .iter()
+        .rev()
+        .find(|(what, on, _)| *what == "answer" && *on == pc)
+        .map(|(_, _, sdp)| sdp.clone())
+        .unwrap_or_else(|| panic!("no {pc} answer on the wire"))
+}
+
+/// A page answered the old transports' offers and went away: each PC has a new transport
+/// whose offer nobody will answer.
+fn abandon_a_takeover(host: &mut Host) {
+    for pc in [PcId::Video, PcId::Audio] {
+        let sdp = with_other_ice(&last_answer(host, pc));
+        host.inbound(SignalMsg::Answer { sdp, pc: Some(pc) });
+    }
+    assert_eq!(host.replaced, [PcId::Video, PcId::Audio]);
+}
+
+/// Does `pipeline` reach NULL within `within`? A state change that blocks is left behind
+/// on its own thread.
+fn stops_within(pipeline: &gst::Pipeline, within: Duration) -> bool {
+    let pipeline = pipeline.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = pipeline.set_state(gst::State::Null);
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(within).is_ok()
+}
+
+/// Counts the frames the source hands to the encode pipeline.
+fn source_frames(host: &Host) -> Arc<AtomicU64> {
+    let frames = Arc::new(AtomicU64::new(0));
+    let count = frames.clone();
+    let sink = host
+        .source
+        .iterate_sinks()
+        .into_iter()
+        .next()
+        .and_then(Result::ok)
+        .expect("the source's interpipesink");
+    sink.static_pad("sink")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            count.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    frames
+}
+
+/// A transport nobody answers holds the encode chain's RTP until its peer connects. The
+/// source must not end up waiting on that: it could then be neither stopped nor swapped.
+#[test]
+fn a_new_transport_nobody_answers_does_not_hold_the_source() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("abandoned");
+    let _a = first_attach(&mut host);
+    let frames = source_frames(&host);
+
+    abandon_a_takeover(&mut host);
+
+    std::thread::sleep(Duration::from_millis(500));
+    let before = frames.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        frames.load(Ordering::Relaxed) > before + 15,
+        "the source stalled behind a transport nobody answered"
+    );
+    let audio = host.transports.audio_webrtc.clone().expect("audio PC");
+    let audio_pipeline = audio
+        .parent()
+        .and_downcast::<gst::Pipeline>()
+        .expect("audio pipeline");
+    assert!(
+        stops_within(&audio_pipeline, Duration::from_secs(2)),
+        "the audio pipeline did not stop behind a transport nobody answered"
+    );
+    assert!(
+        stops_within(&host.source, Duration::from_secs(2)),
+        "the source did not stop behind a transport nobody answered"
+    );
+}
+
+/// The order `runner::stop_source` keeps. A source that renegotiates while a transport
+/// holds RTP waits on the encode chain, whichever transport it is; the session's first
+/// here, with the renegotiation forced.
+#[test]
+fn releasing_the_transport_frees_a_source_that_waits_on_it() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("release");
+    let frames = source_frames(&host);
+    std::thread::sleep(Duration::from_millis(800));
+    let sink = host.source.iterate_sinks().into_iter().next();
+    let sink = sink.and_then(Result::ok).expect("interpipesink");
+    sink.static_pad("sink")
+        .unwrap()
+        .push_event(gst::event::Reconfigure::new());
+    std::thread::sleep(Duration::from_millis(500));
+    let before = frames.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        frames.load(Ordering::Relaxed),
+        before,
+        "the source is not waiting on the transport: this test no longer shows the hazard"
+    );
+
+    host.transports.video.release();
+
+    assert!(
+        stops_within(&host.source, Duration::from_secs(2)),
+        "the source did not stop once the transport was released"
+    );
+}
+
+/// A page that answered two offers from the old transport has the second answer land on
+/// the new one. A browser then answers the new transport's own offer with new ICE
+/// credentials and the certificate it had, which must read as that page correcting
+/// itself, not as one more peer: one more offer on the same transport, no third.
+#[test]
+fn a_late_answer_to_the_old_offer_costs_no_second_transport() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("late");
+    let _a = first_attach(&mut host);
+    // The taking page's two answers to the old transport's offers: the first replaces the
+    // transport, the second arrives once the new one has offered.
+    let to_old_offer = SignalMsg::Answer {
+        sdp: with_other_ice(&last_answer(&host, PcId::Video)),
+        pc: Some(PcId::Video),
+    };
+    host.inbound(to_old_offer.clone());
+    assert_eq!(host.replaced, [PcId::Video]);
+    let offered = Instant::now() + Duration::from_secs(10);
+    while !super::has_offered(&host.transports.video.webrtc) {
+        assert!(Instant::now() < offered, "the new transport never offered");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    host.inbound(to_old_offer);
+
+    // The page itself, answering the new transport's offer: other ICE credentials than
+    // the answer above, the same certificate.
+    let mut b = Peer::new();
+    host.inbound(SignalMsg::RestartIce {
+        pc: Some(PcId::Audio),
+    });
+    let up = pump(&mut host, &mut b, Duration::from_secs(20), |_, p| {
+        streaming(p)
+    });
+
+    assert!(up, "the taking page never streamed: {}", describe(&b));
+    assert_eq!(
+        host.replaced,
+        [PcId::Video, PcId::Audio],
+        "the late answer cost a second video transport"
+    );
+    assert!(input_reaches_host(&mut host, &mut b));
+    assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// A whole session on `runner::run_blocking`, with signaling carried by hand: what the
+/// runner does on its way out, which the [`Host`] above does not have.
+struct Session {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    events: mpsc::Receiver<(String, SessionEvent)>,
+    to_host: std::sync::mpsc::Sender<SignalMsg>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Offers the host sent, per PC.
+    offers: [usize; 2],
+    /// The last answer the peer gave, per PC.
+    answers: [Option<String>; 2],
+    /// The runner's last word: `Stopped` or `Failed`.
+    ended: Option<SessionEvent>,
+    /// Nothing the peer says reaches the host.
+    mute: bool,
+    // The runner reads a closed swap lane as its owner going away.
+    _swap: std::sync::mpsc::Sender<crate::session::runner::SwapRequest>,
+}
+
+impl Session {
+    fn start(tag: &str, idle_timeout: Duration) -> Session {
+        let mut cfg = host_cfg(false);
+        cfg.idle_timeout = idle_timeout;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (evt_tx, events) = mpsc::channel(256);
+        let (diag_tx, _) = mpsc::channel(1);
+        let diagnostics = DiagnosticEventTx::new(
+            diag_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let (to_host, sig_rx) = std::sync::mpsc::channel();
+        let (swap, swap_rx) = std::sync::mpsc::channel();
+        let (_, display_rx) = std::sync::mpsc::channel();
+        let (_, capture_rx) = std::sync::mpsc::channel();
+        let metrics = Arc::new(SessionMetrics::new("smooth", cfg.stream.fps as u32));
+        let (id, flag) = (format!("takeover-{tag}"), stop.clone());
+        let thread = std::thread::spawn(move || {
+            crate::session::runner::run_blocking(
+                id,
+                cfg,
+                evt_tx,
+                diagnostics,
+                flag,
+                sig_rx,
+                swap_rx,
+                display_rx,
+                capture_rx,
+                metrics,
+            )
+        });
+        Session {
+            stop,
+            events,
+            to_host,
+            thread: Some(thread),
+            offers: [0; 2],
+            answers: [None, None],
+            ended: None,
+            mute: false,
+            _swap: swap,
+        }
+    }
+
+    /// Carry signaling between the runner and `peer` until `done` or the deadline.
+    fn pump(
+        &mut self,
+        peer: &mut Peer,
+        within: Duration,
+        mut done: impl FnMut(&Session, &Peer) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            while let Ok((_, event)) = self.events.try_recv() {
+                match event {
+                    SessionEvent::Signaling(msg) => {
+                        let pc = match &msg {
+                            SignalMsg::Offer { pc, .. } => {
+                                self.offers[pc.unwrap_or_default() as usize] += 1;
+                                *pc
+                            }
+                            SignalMsg::Ice { pc, .. } => *pc,
+                            _ => continue,
+                        };
+                        peer.pc(pc).inbound(msg);
+                    }
+                    SessionEvent::Stopped { .. } | SessionEvent::Failed(_) => {
+                        self.ended = Some(event)
+                    }
+                    _ => {}
+                }
+            }
+            for id in [PcId::Video, PcId::Audio] {
+                while let Ok(msg) = peer.pc_mut(id).rx.try_recv() {
+                    let msg = match msg {
+                        SignalMsg::Answer { sdp, .. } => {
+                            self.answers[id as usize] = Some(sdp.clone());
+                            SignalMsg::Answer { sdp, pc: Some(id) }
+                        }
+                        SignalMsg::Ice { candidate, .. } => SignalMsg::Ice {
+                            candidate,
+                            pc: Some(id),
+                        },
+                        _ => continue,
+                    };
+                    if self.mute {
+                        continue;
+                    }
+                    let _ = self.to_host.send(msg);
+                }
+            }
+            if done(self, peer) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A page streams; a second one answers the old transports' offers and goes away. Each
+    /// PC is left on a new transport whose offer nobody will answer.
+    fn with_an_abandoned_takeover(tag: &str, idle_timeout: Duration) -> Session {
+        let mut session = Session::start(tag, idle_timeout);
+        let mut a = Peer::new();
+        let up = session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p));
+        assert!(up, "the first peer never streamed: {}", describe(&a));
+        for pc in [PcId::Video, PcId::Audio] {
+            let sdp = with_other_ice(session.answers[pc as usize].as_ref().unwrap());
+            let _ = session
+                .to_host
+                .send(SignalMsg::Answer { sdp, pc: Some(pc) });
+        }
+        let replaced = session.pump(&mut a, Duration::from_secs(10), |s, _| s.offers == [2, 2]);
+        assert!(
+            replaced,
+            "offers per PC after the takeover: {:?}",
+            session.offers
+        );
+        // RTP reaches the new transports and parks there.
+        session.pump(&mut a, Duration::from_millis(500), |_, _| false);
+        session
+    }
+
+    /// Wait for the runner's last event and for its thread, which returns only once the
+    /// source, the encode pipeline and the audio pipeline are down.
+    fn ends_within(&mut self, within: Duration) -> Option<SessionEvent> {
+        let mut nobody = Peer::new();
+        self.pump(&mut nobody, within, |s, _| {
+            s.ended.is_some() && s.thread.as_ref().is_some_and(|t| t.is_finished())
+        });
+        if self.thread.as_ref().is_some_and(|t| t.is_finished()) {
+            let _ = self.thread.take().map(|t| t.join());
+        }
+        self.thread.is_none().then(|| self.ended.clone()).flatten()
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The page that took the session over went away before answering. The operator's stop
+/// must still end the session: terminal event, and the runner off its thread.
+#[test]
+fn an_abandoned_takeover_does_not_keep_the_session_from_stopping() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::with_an_abandoned_takeover("stop", Duration::from_secs(600));
+
+    session.stop.store(true, Ordering::SeqCst);
+
+    let ended = session.ends_within(Duration::from_secs(15));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the session did not stop: {ended:?}"
+    );
+}
+
+/// The same, left alone: the idle reap ends it.
+#[test]
+fn an_abandoned_takeover_is_reaped_when_idle() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::with_an_abandoned_takeover("reap", Duration::from_secs(8));
+
+    let ended = session.ends_within(Duration::from_secs(30));
+    assert!(
+        matches!(&ended, Some(SessionEvent::Failed(reason)) if reason.starts_with("idle:")),
+        "the session was not reaped: {ended:?}"
+    );
+}
+
+/// The session's first transport, never answered by anyone: a stop ends it on `develop`
+/// too, and still does.
+#[test]
+fn a_session_nobody_answered_stops() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("unanswered", Duration::from_secs(600));
+    session.mute = true;
+    let mut nobody = Peer::new();
+    let offered = session.pump(&mut nobody, Duration::from_secs(20), |s, _| {
+        s.offers == [1, 1]
+    });
+    assert!(offered, "offers per PC: {:?}", session.offers);
+    session.pump(&mut nobody, Duration::from_millis(800), |_, _| false);
+
+    session.stop.store(true, Ordering::SeqCst);
+
+    let ended = session.ends_within(Duration::from_secs(15));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the session did not stop: {ended:?}"
     );
 }
 
@@ -1058,6 +1520,10 @@ fn browser_host() {
         // And again once that transport's offer is out and not yet answered.
         let restart_between = std::env::var("QUASAR_TAKEOVER_RESTART_BETWEEN").is_ok();
         let mut restart_after_offer = false;
+        // Replay the answer that replaced the video transport once the new transport has
+        // offered: the taking page's second answer to the old transport's offer.
+        let late_answer = std::env::var("QUASAR_TAKEOVER_LATE_ANSWER").is_ok();
+        let mut late: Option<SignalMsg> = None;
         let mut host = Host::start_with("browser", mic);
         let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
         eprintln!("HOST listening on ws://{addr} for {secs}s");
@@ -1144,6 +1610,10 @@ fn browser_host() {
                         if video_offer && std::mem::take(&mut restart_after_offer) {
                             host.inbound(SignalMsg::RestartIce { pc: Some(PcId::Video) });
                         }
+                        if let Some(answer) = late.take_if(|_| video_offer) {
+                            eprintln!("HOST replaying the answer that replaced the video transport");
+                            host.inbound(answer);
+                        }
                     }
                     host.drain_bus();
                     for e in &host.bus_errors[seen_errors..] {
@@ -1157,6 +1627,12 @@ fn browser_host() {
                         if restart_between && pc == PcId::Video {
                             host.inbound(SignalMsg::RestartIce { pc: Some(pc) });
                             restart_after_offer = true;
+                        }
+                        if late_answer && pc == PcId::Video {
+                            late = Some(SignalMsg::Answer {
+                                sdp: last_answer(&host, pc),
+                                pc: Some(pc),
+                            });
                         }
                     }
                 }

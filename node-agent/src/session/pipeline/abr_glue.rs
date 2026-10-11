@@ -998,6 +998,10 @@ pub(super) fn enable_abr(
 /// its ladder at rung 0; without this the encoder keeps the last peer's degraded bitrate,
 /// speed bias and rungs until GCC's estimate moves, which on a clean path is never.
 ///
+/// The encoder element and its pipeline stay; these property and caps writes are all a
+/// replacement does to it, and the log line names each. A size change is an encoder
+/// session restart on the Vulkan path, as any rung step is.
+///
 /// Drops the old loop's hooks first: they hold its estimator and would keep retargeting.
 pub(super) fn reset_to_launch(
     encoder: &gst::Element,
@@ -1006,28 +1010,60 @@ pub(super) fn reset_to_launch(
     metrics: &SessionMetrics,
 ) {
     metrics.clear_hooks();
+    let written = write_launch_point(encoder, cfg, lever, metrics);
+    tracing::info!(
+        token = "transport-replaced-encoder-kept",
+        "encoder {} kept across the transport replacement; written: {written}",
+        encoder.name()
+    );
+}
+
+/// What [`reset_to_launch`] writes, and its account of it.
+fn write_launch_point(
+    encoder: &gst::Element,
+    cfg: &SessionConfig,
+    lever: &EncodeResolutionLever,
+    metrics: &SessionMetrics,
+) -> String {
     if cfg.abr_mode == AbrMode::Off || !encoder_abr_writable(encoder, cfg.encoder) {
-        return; // nothing ever moved the encoder
+        return "nothing (nothing ever moved it)".into();
     }
     let fps = cfg.stream.fps.max(1) as u32;
     write_encoder_bitrate(encoder, cfg.encoder, cfg.stream.bitrate_kbps, fps);
-    if encoder_speed_bias_writable(encoder, cfg.encoder) {
+    let bias = encoder_speed_bias_writable(encoder, cfg.encoder);
+    if bias {
         write_encoder_speed_bias(encoder, cfg.encoder, 0, cfg.target_usage);
     }
     metrics.set_ladder_bias(0);
     metrics.set_abr_floor(0);
-    if !lever.stage().supported {
-        return;
+    let (mut fps_moved, mut size) = (false, "not written (no scale stage)");
+    if lever.stage().supported {
+        // `Err` is a stage with no fps rung.
+        fps_moved = lever.set_fps(cfg.stream.fps).unwrap_or(false);
+        metrics.set_ladder_fps(0);
+        metrics.set_target_fps(fps);
+        // A size a human pinned is theirs, not the ladder's.
+        size = if lever.pinned() {
+            "kept (pinned)"
+        } else {
+            metrics.set_ladder_res_rung(0);
+            match lever.set_rung(cfg.stream.width, cfg.stream.height) {
+                Ok(true) => "restored to launch",
+                Ok(false) => "already at launch",
+                Err(_) => "restore refused",
+            }
+        };
     }
-    // `Err` is a stage with no fps rung.
-    let _ = lever.set_fps(cfg.stream.fps);
-    metrics.set_ladder_fps(0);
-    metrics.set_target_fps(fps);
-    // A size a human pinned is theirs, not the ladder's.
-    if !lever.pinned() {
-        let _ = lever.set_rung(cfg.stream.width, cfg.stream.height);
-        metrics.set_ladder_res_rung(0);
-    }
+    format!(
+        "bitrate and CPB for {} kbit/s at {fps} fps, speed bias {}, fps {}, size {size}",
+        cfg.stream.bitrate_kbps,
+        if bias { "reset" } else { "not written" },
+        if fps_moved {
+            "restored to launch"
+        } else {
+            "unchanged"
+        },
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
