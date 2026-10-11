@@ -4036,7 +4036,8 @@ fn recovery_adopts_lost_create_without_starting_or_duplicating_it() {
 #[test]
 fn detached_run_replays_its_completed_operation_without_restarting() {
     let engine = Engine::new();
-    let client = engine.client();
+    // Own runtime on purpose: this guards a detached run keeping its client's runtime alive.
+    let client = RuntimeClient::new(engine.config.clone()).unwrap();
     let (helper, run) = request();
     drop(client.run_diagnostic(helper.clone(), run.clone()));
     drop(client);

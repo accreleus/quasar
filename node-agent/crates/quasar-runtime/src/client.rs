@@ -108,8 +108,12 @@ impl RuntimeClient {
     }
 
     /// A client that runs on the caller's runtime instead of building its own, so many
-    /// clients can share one set of threads and descriptors. The caller keeps `handle`'s
-    /// runtime alive for as long as any client or operation built on it.
+    /// clients can share one set of threads and descriptors. Test support: `handle` must
+    /// belong to a runtime that stays alive and driven (I/O and time enabled, running on
+    /// its own threads) for as long as any client or operation built on it, because a
+    /// detached operation does not keep that runtime alive and a blocking `wait` on an
+    /// undriven runtime hangs.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_handle(
         config: RuntimeConfig,
         handle: tokio::runtime::Handle,
