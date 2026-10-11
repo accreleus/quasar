@@ -246,3 +246,92 @@ describe("SessionSwapController — two swaps in one session", () => {
     expect(screen.getByText("PLAYING").closest("button")?.getAttribute("aria-label")).toBe("Ball");
   });
 });
+
+// #529: a verdict the page cannot continue from stops the controller drawing
+// (no way to start a swap, nothing over the banner) without ending its hook,
+// so a swap in flight survives a verdict that later clears.
+describe("SessionSwapController — sessionOver", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function Harness({ over, onCommitted }: { over: boolean; onCommitted: (id: string, name: string) => void }) {
+    const [app, setApp] = useState({ id: "a1", name: "Snow" });
+    return (
+      <SessionSwapController
+        sessionId="s1"
+        authToken="t"
+        currentApp={app}
+        onCommitted={(id, name) => {
+          setApp({ id, name });
+          onCommitted(id, name);
+        }}
+        onToast={() => {}}
+        sessionOver={over}
+      >
+        {({ quickSwitch, swappingTo }) => (
+          <>
+            <div data-testid="strip-identity">{swappingTo ? `Switching to ${swappingTo}` : app.name}</div>
+            {quickSwitch}
+          </>
+        )}
+      </SessionSwapController>
+    );
+  }
+
+  async function startSwap(over: boolean) {
+    swapSession.mockResolvedValue({ session: { id: "s1" } });
+    const onCommitted = vi.fn();
+    const view = render(<Harness over={over} onCommitted={onCommitted} />);
+    await waitFor(() => expect(screen.getByText("Redout: Enhanced Edition")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Redout: Enhanced Edition/ }));
+    expect(document.querySelector(".switcher.show")).not.toBeNull();
+    return { onCommitted, view };
+  }
+
+  it("a swap in flight survives a sessionOver that clears: committed once, identity moves", async () => {
+    getSession
+      .mockResolvedValueOnce(session("running", "swapping"))
+      .mockResolvedValue(session("running", "swap complete", "a2"));
+    const { onCommitted, view } = await startSwap(false);
+
+    view.rerender(<Harness over onCommitted={onCommitted} />);
+    expect(screen.queryByTestId("strip-identity")).toBeNull();
+    expect(document.querySelector(".switcher.show")).toBeNull();
+
+    view.rerender(<Harness over={false} onCommitted={onCommitted} />);
+    expect(document.querySelector(".switcher.show")).not.toBeNull(); // still pending
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await waitFor(() => expect(onCommitted).toHaveBeenCalledWith("a2", "Redout: Enhanced Edition"), {
+      timeout: 5000,
+    });
+    expect(onCommitted).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.getByTestId("strip-identity").textContent).toBe("Redout: Enhanced Edition"));
+    await waitFor(() => expect(document.querySelector(".switcher.show")).toBeNull(), { timeout: 5000 });
+  });
+
+  it("a swap in flight when a verdict lands does not sit over the banner", async () => {
+    getSession.mockResolvedValue(session("running", "swapping"));
+    const { onCommitted, view } = await startSwap(false);
+
+    view.rerender(<Harness over onCommitted={onCommitted} />);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const overlay = document.querySelector(".switcher");
+    expect(overlay?.classList.contains("show")).toBe(false);
+    expect(overlay?.getAttribute("aria-hidden")).toBe("true");
+    expect(screen.queryByTestId("strip-identity")).toBeNull();
+    expect(document.querySelector(".switcher")?.textContent).toBe("");
+  });
+
+  it("draws nothing to start a swap from while the session is over", async () => {
+    render(<Harness over onCommitted={() => {}} />);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(screen.queryByTestId("strip-identity")).toBeNull();
+    expect(listApps).not.toHaveBeenCalled();
+  });
+});

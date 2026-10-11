@@ -1,5 +1,7 @@
 // #524 — a session that is over for this page releases the microphone and input
 // capture; one that may still be streaming keeps both.
+// #529 — and draws no HUD, summon button or swap overlay; one that may still be
+// streaming keeps them.
 //
 // Real MicCapture and real input capture (jsdom has no Pointer Lock, so capture
 // runs in fallback mode); the transport, telemetry and HUD are doubles.
@@ -16,11 +18,12 @@ import { RecoveryController } from "../../webrtc/recovery";
 const getSession = vi.fn();
 vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
-  stopSession: vi.fn(),
+  stopSession: (...a: unknown[]) => stopSession(...a),
   mintSignalingToken: (...a: unknown[]) => mintSignalingToken(...a),
   updateSessionDisplay: vi.fn(),
 }));
 const mintSignalingToken = vi.fn();
+const stopSession = vi.fn();
 
 vi.mock("../../auth/context", () => ({ useAuth: () => ({ token: "t" }) }));
 
@@ -29,7 +32,9 @@ vi.mock("../../webrtc/telemetry", async (importOriginal) => {
   return {
     ...actual,
     SessionTelemetry: class {
-      onUpdate() {}
+      onUpdate(l: (snap: Record<string, unknown>) => void) {
+        telemetryListener = l;
+      }
       start() {}
       stop() {}
       setDecodeFailed() {}
@@ -47,6 +52,7 @@ vi.mock("../../webrtc/traceEvents", () => ({
   },
 }));
 
+let telemetryListener: ((snap: Record<string, unknown>) => void) | null = null;
 type Channel = { readyState: string; onclose: (() => void) | null; send: () => void; bufferedAmount: number };
 let lastOnChannel: ((ch: Channel) => void) | null = null;
 let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
@@ -92,18 +98,35 @@ vi.mock("../../webrtc/session", () => ({
 vi.mock("./SessionSwapController", () => ({
   SessionSwapController: ({
     children,
+    sessionOver,
+    onToast,
   }: {
     children: (p: { quickSwitch: null; swappingTo: null }) => React.ReactNode;
-  }) => children({ quickSwitch: null, swappingTo: null }),
+    sessionOver?: boolean;
+    onToast: (n: React.ReactNode) => void;
+  }) => {
+    swapToast = onToast;
+    return sessionOver ? null : children({ quickSwitch: null, swappingTo: null });
+  },
 }));
 
+let swapToast: ((n: React.ReactNode) => void) | null = null;
 let hud: Record<string, unknown> = {};
+const hudOpen = vi.fn();
 vi.mock("./hud/Hud", async () => {
-  const { forwardRef } = await import("react");
+  const { forwardRef, useImperativeHandle } = await import("react");
   return {
-    Hud: forwardRef((p: Record<string, unknown>, _ref: unknown) => {
+    Hud: forwardRef((p: Record<string, unknown>, ref: React.Ref<unknown>) => {
       hud = p;
-      return null;
+      useImperativeHandle(ref, () => ({ open: hudOpen, close() {}, stageClick() {} }));
+      // The real HUD's Exit session button is wired to onStop, which stops the server session.
+      return (
+        <div data-testid="hud">
+          <button type="button" onClick={p.onStop as () => void}>
+            Exit session
+          </button>
+        </div>
+      );
     }),
   };
 });
@@ -209,6 +232,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
+  telemetryListener = null;
   constructed = 0;
   hud = {};
   track.stopped = false;
@@ -238,7 +262,6 @@ describe("SessionPage — a session that is over for this page releases the mic 
     expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
     releasedAfterVerdict();
     expect(detachMicTrack).toHaveBeenCalled();
-    expect(hud.channelOpen).toBe(true);
   });
 
   it("host lost", async () => {
@@ -291,19 +314,6 @@ describe("SessionPage — a session that is over for this page releases the mic 
     expect(micIndicator()).toBeNull();
     expect(attachMicTrack).not.toHaveBeenCalled();
     expect(screen.queryByText("Microphone failed")).toBeNull();
-  });
-
-  it("the mic and Capture input cannot be turned on once the session is over", async () => {
-    currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
-    renderPage();
-    await advance(1_000);
-    await act(async () => lastOnChannel?.({ readyState: "open", onclose: null, send() {}, bufferedAmount: 0 }));
-    await advance(6_000);
-    expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
-    await act(async () => (hud.onToggleMic as () => void)());
-    await act(async () => (hud.onGrab as () => void)());
-    expect(getUserMedia).not.toHaveBeenCalled();
-    expect(keyReachesBrowser("Tab")).toBe(true);
   });
 });
 
@@ -401,7 +411,6 @@ describe("SessionPage — work still in flight when the verdict lands cannot und
     });
 
     expect(exitPointerLock).toHaveBeenCalled();
-    expect(hud.inputCaptured).toBe(false);
     expect(keyReachesBrowser("Tab")).toBe(true);
     expect(keyReachesBrowser("Enter")).toBe(true);
   });
@@ -424,8 +433,110 @@ describe("SessionPage — work still in flight when the verdict lands cannot und
     await act(async () => resolveAttach());
 
     expect(micIndicator()).toBeNull();
-    expect(hud.micOn).toBe(false);
     expect(detachMicTrack).toHaveBeenCalled();
+  });
+});
+
+describe("SessionPage — a session that is over for this page draws no HUD (#529)", () => {
+  const summonChord = () =>
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyQ", key: "Q", ctrlKey: true, altKey: true, shiftKey: true, bubbles: true }),
+    );
+  const openChannel = () =>
+    act(async () => lastOnChannel?.({ readyState: "open", onclose: null, send() {}, bufferedAmount: 0 }));
+  const gone = () => {
+    expect(screen.queryByTestId("hud")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Session menu" })).toBeNull();
+    hudOpen.mockClear();
+    summonChord();
+    expect(hudOpen).not.toHaveBeenCalled();
+  };
+  const present = () => {
+    expect(screen.queryByTestId("hud")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Session menu" })).not.toBeNull();
+    hudOpen.mockClear();
+    summonChord();
+    expect(hudOpen).toHaveBeenCalled();
+  };
+
+  it("streaming: the HUD, the summon button and the chord are there", async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    present();
+  });
+
+  it("access revoked mid-stream: only the banner's button is left", async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    present();
+    currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+    await advance(5_500);
+    expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
+    gone();
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Back to library"]);
+  });
+
+  const TAKEN = "This session moved to another tab";
+  const onlyWayBack = async () => {
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Back to library"]);
+    fireEvent.click(screen.getByRole("button", { name: "Back to library" }));
+    await advance(100);
+    // The other tab owns the session: nothing here may stop it.
+    expect(stopSession).not.toHaveBeenCalled();
+  };
+
+  it("taken over by another tab, after the loader is gone: the notice and the way back, no HUD", async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    present();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(100);
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    gone();
+    await onlyWayBack();
+  });
+
+  it("taken over after signalling gave up with the channel open: the HUD goes, the notice replaces the recovery banner", async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    refused();
+    const rc = new RecoveryController({ onRetry: () => {}, onState: (st) => lastOnRecovery?.(st as never) });
+    await act(async () => rc.terminal("signaling: session not found or already ended"));
+    await advance(100);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    present();
+
+    await act(async () => rc.superseded("opened in another tab"));
+    await advance(100);
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+    gone();
+    await onlyWayBack();
+  });
+
+  it("signalling gave up with the input channel open: still streaming, so the HUD stays", async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    refused();
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    present();
   });
 });
 
@@ -488,5 +599,81 @@ describe("SessionPage — a late takeover (#527)", () => {
     await act(async () => rc.superseded("opened in another tab"));
     await advance(100);
     expect(banners().length).toBe(1);
+  });
+});
+
+// #529 — a held verdict (takeover, access removed) is the only banner and the only
+// action: a Stop from the decoder or health banner would end a session another tab
+// owns. Without a verdict (recovery merely failed) the session is still the user's.
+describe("SessionPage — a held verdict is the only banner (#529)", () => {
+  const TAKEN = "This session moved to another tab";
+  const DECODER = "This stream isn’t supported on your device";
+  const HEALTH = "Stream quality is unsustainable on your network";
+  const stream = async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    const ch: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
+    await act(async () => lastOnChannel?.(ch));
+    await advance(3_000);
+    return ch;
+  };
+  const decoderLatches = async () => {
+    await act(async () => telemetryListener?.({ clientHealth: "client_unsupported", framesDecodedTotal: 0, bytesReceivedTotal: 0 }));
+    await advance(100);
+    expect(screen.getByText(DECODER)).not.toBeNull();
+  };
+  const takeover = async () => {
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(100);
+  };
+  const onlyTheVerdict = async () => {
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(screen.queryByText(DECODER)).toBeNull();
+    expect(screen.queryByText(HEALTH)).toBeNull();
+    expect(document.querySelectorAll(".banner").length).toBe(1);
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Back to library"]);
+    expect(stopSession).not.toHaveBeenCalled();
+  };
+
+  it("decoder banner latched, then a takeover: only the takeover banner", async () => {
+    await stream();
+    await decoderLatches();
+    await takeover();
+    await onlyTheVerdict();
+  });
+
+  it("decoder and health notices up, then a takeover: only the takeover banner", async () => {
+    await stream();
+    await decoderLatches();
+    currentSession = makeSession({ health_state: "unsustainable" });
+    await advance(5_500);
+    expect(screen.getByText(HEALTH)).not.toBeNull();
+    await takeover();
+    await onlyTheVerdict();
+  });
+
+  it("no verdict, recovery failed with the channel gone: the decoder banner keeps its Stop", async () => {
+    const ch = await stream();
+    await decoderLatches();
+    refused();
+    await act(async () => {
+      ch.onclose?.();
+      lastOnRecovery?.(failed);
+    });
+    await advance(100);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    expect(screen.getByText(DECODER)).not.toBeNull();
+    expect(screen.getAllByRole("button", { name: "Stop" }).length).toBeGreaterThan(0);
+  });
+
+  it("a swap finishing under a held verdict raises no toast next to the notice", async () => {
+    await stream();
+    await act(async () => swapToast?.("Now playing Elsewhere."));
+    expect(screen.queryByText(/Now playing/)).not.toBeNull();
+    await takeover();
+    expect(screen.queryByText(/Now playing/)).toBeNull();
+    await act(async () => swapToast?.("Now playing Again."));
+    expect(screen.queryByText(/Now playing/)).toBeNull();
   });
 });
