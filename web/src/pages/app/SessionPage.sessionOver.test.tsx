@@ -196,13 +196,13 @@ function keyReachesBrowser(code: string): boolean {
 }
 
 /** Streaming, mic on, input captured. `appPresented` false leaves the launch poll running. */
-async function streamingWithMicAndCapture(detail = "app presented"): Promise<Channel> {
+async function streamingWithMicAndCapture(detail = "app presented", settleMs = 3_000): Promise<Channel> {
   currentSession = makeSession({ state_detail: detail });
   renderPage();
   await advance(1_000);
   const ch: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
   await act(async () => lastOnChannel?.(ch));
-  await advance(3_000);
+  await advance(settleMs);
   getUserMedia.mockResolvedValue(stream);
   await act(async () => (hud.onToggleMic as () => void)());
   await act(async () => (hud.onGrab as () => void)());
@@ -749,7 +749,7 @@ describe("SessionPage — an app that exits early is not a network problem (#449
 
 // #449 — a launch verdict is loader copy. Latched after the loader is gone it would
 // end the page's input with no banner to say why or to leave by.
-describe("SessionPage — a launch verdict is held only while the loader shows it (#449)", () => {
+describe("SessionPage — a launch verdict is held only until the loader's reveal begins (#449)", () => {
   const TAKEN = "This session moved to another tab";
   const ENDED = "The session ended before it started";
   const banners = () => document.querySelectorAll(".banner");
@@ -816,5 +816,49 @@ describe("SessionPage — a launch verdict is held only while the loader shows i
 
     expect(keyReachesBrowser("Tab")).toBe(true);
     expect(document.querySelectorAll(".banner button").length).toBeGreaterThan(0);
+  });
+});
+
+// The loader is inert from about 1,180 ms into its 1,400 ms reveal, so a verdict
+// that lands inside the handoff has nothing to show it either.
+describe("SessionPage — the loader's handoff holds no launch verdict (#449)", () => {
+  const TAKEN = "This session moved to another tab";
+  const ENDED = "The session ended before it started";
+  const banners = () => document.querySelectorAll(".banner");
+  const inHandoff = async () => {
+    const ch = await streamingWithMicAndCapture("app presented", 220);
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    return ch;
+  };
+  const suspect = async () => {
+    mintSignalingToken.mockReturnValue(new Promise(() => {}));
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "degraded", message: "Network path interrupted" }));
+    await advance(100);
+  };
+
+  it("the session reads stopping inside the handoff, then recovery returns: nothing is held and the controls stay", async () => {
+    await inHandoff();
+    currentSession = makeSession({ state: "stopping", state_detail: "stop requested" });
+    await suspect();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "connected", message: "Connected" }));
+    await advance(2_000);
+
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(screen.queryByText(ENDED)).toBeNull();
+    expect(banners().length).toBe(0);
+    expect(screen.getByTestId("hud")).not.toBeNull();
+    stillLive();
+  });
+
+  it("the session reads failed inside the handoff, then another tab takes it: the takeover is shown with a way back", async () => {
+    await inHandoff();
+    currentSession = makeSession({ state: "failed", state_detail: "boom", failure_code: "app_exited_early", error_message: "boom" });
+    await suspect();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(2_000);
+
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(banners().length).toBe(1);
+    expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
   });
 });

@@ -305,9 +305,9 @@ export function SessionPage() {
     })();
   }, [signalCoords, authToken, sessionId, navigate, addToast]);
 
-  // Read by the status hook's end-reason poll, which runs from callbacks that
-  // outlive a render; assigned where loaderDone is declared.
-  const loaderDoneRef = useRef(false);
+  // Latched true when the loader's reveal begins (see revealReady). Read by the
+  // status hook's end-reason poll, which runs from callbacks that outlive a render.
+  const revealStartedRef = useRef(false);
 
   // Session status polling (host-lost, AS10-06 health, launch progress, #484
   // §3.2 reveal-cap) lives in useSessionStatus.ts. `pollEndReason` and
@@ -332,7 +332,7 @@ export function SessionPage() {
     hostAssigned,
     sessionRunning,
     pollEndReason,
-  } = useSessionStatus(authToken, sessionId, stopping, loaderDoneRef);
+  } = useSessionStatus(authToken, sessionId, stopping, revealStartedRef);
 
   // sessionRuntime.ts: one runtime instance per transport generation (law L1)
   // — a replacement token re-seats signalCoords, destroying this runtime and
@@ -758,13 +758,13 @@ export function SessionPage() {
   // cold app draws anything, and revealing on transport alone is the defect.
   const revealReady = channelOpen && appPresented;
   const [loaderDone, setLoaderDone] = useState(false);
-  loaderDoneRef.current = loaderDone;
   const loaderDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Latched, like SessionLoader's own handoff: the gate can retract (the channel
   // closes inside the reveal), and the loader is transparent and inert by then
   // either way. A removal cancelled on the retract never happened again, and
   // the revoke banner waits for `loaderDone`.
   useEffect(() => {
+    if (revealReady) revealStartedRef.current = true;
     if (revealReady && !loaderDone && loaderDoneTimerRef.current === null) {
       loaderDoneTimerRef.current = setTimeout(() => setLoaderDone(true), LOADER_UNMOUNT_MS);
     }

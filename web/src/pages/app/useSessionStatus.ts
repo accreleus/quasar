@@ -63,8 +63,8 @@ export function useSessionStatus(
   authToken: string | null | undefined,
   sessionId: string | undefined,
   stopping: boolean,
-  /** True once the launch loader is gone; only the loader can show a launch verdict. */
-  loaderDoneRef: { readonly current: boolean },
+  /** True once the loader's reveal has begun: from then on it is inert, and only the loader can show a launch verdict. */
+  revealStartedRef: { readonly current: boolean },
 ): SessionStatus {
   const [launchDetail, setLaunchDetail] = useState<string | null>("scheduling host");
   // Sticky once set; derived only from the control plane's session record
@@ -116,12 +116,13 @@ export function useSessionStatus(
 
   // What the control plane says about the session's end outranks the page's own
   // "unreachable" guess; see settleFailure. Launch verdicts (failed, ended) are
-  // loader copy: once the loader is gone nothing on the page could show one, so
-  // only a revoked access, which has a banner, is held then.
+  // loader copy: once the reveal has begun the loader is inert and nothing on the
+  // page could show one, so only a revoked access, which has a banner, is held.
+  // The launch poll below stops at appPresented, which the reveal requires.
   const noteServerVerdict = useCallback((session: Parameters<typeof launchFailureFromSession>[0]) => {
-    const verdict = loaderDoneRef.current ? accessRevokedFailure(session) : launchFailureFromSession(session);
+    const verdict = revealStartedRef.current ? accessRevokedFailure(session) : launchFailureFromSession(session);
     if (verdict) setLaunchFailure((prev) => settleFailure(prev, verdict));
-  }, [loaderDoneRef]);
+  }, [revealStartedRef]);
   const noteAccessRevoked = useCallback((session: Parameters<typeof accessRevokedFailure>[0]) => {
     const revoked = accessRevokedFailure(session);
     if (revoked) setLaunchFailure((prev) => settleFailure(prev, revoked));
