@@ -219,7 +219,7 @@ func TestReconcileObservedSet(t *testing.T) {
 	ctx := context.Background()
 
 	scan := f.claimedScan(t, f.user)
-	res, err := f.store.Reconcile(ctx, scan, f.host, observedEntries(), nil)
+	res, err := f.store.Reconcile(ctx, scan, f.host, observedEntries(), nil, testInterval)
 	must(t, err)
 
 	if res.Observed != 9 || res.Suppressed != 5 || res.Created != 4 || res.Granted != 4 {
@@ -295,7 +295,7 @@ func TestReconcileStoresOutcomeCountsOnTheScanRow(t *testing.T) {
 	ctx := context.Background()
 
 	scan := f.claimedScan(t, f.user)
-	res, err := f.store.Reconcile(ctx, scan, f.host, observedEntries(), nil)
+	res, err := f.store.Reconcile(ctx, scan, f.host, observedEntries(), nil, testInterval)
 	must(t, err)
 	if res.Observed != 9 || res.Suppressed != 5 || res.Created != 4 || res.Granted != 4 {
 		t.Fatalf("reconcile = %+v; want the same 9/5/4/4 TestReconcileObservedSet asserts", res)
@@ -372,7 +372,7 @@ func TestReconcileBackfillsBlankDescription(t *testing.T) {
 	scan := f.claimedScan(t, f.user)
 	res, err := f.store.Reconcile(ctx, scan, f.host,
 		[]ReportEntry{{ExternalID: "517710", Name: "Redout"}},
-		map[string]AppDetail{"517710": {IsGame: true, ShortDescription: "A fast racer."}})
+		map[string]AppDetail{"517710": {IsGame: true, ShortDescription: "A fast racer."}}, testInterval)
 	must(t, err)
 
 	if res.Backfilled != 1 {
@@ -398,7 +398,7 @@ func TestReconcileBackfillNeverOverwritesANonEmptyDescription(t *testing.T) {
 	scan := f.claimedScan(t, f.user)
 	res, err := f.store.Reconcile(ctx, scan, f.host,
 		[]ReportEntry{{ExternalID: "517710", Name: "Redout"}},
-		map[string]AppDetail{"517710": {IsGame: true, ShortDescription: "Valve's answer."}})
+		map[string]AppDetail{"517710": {IsGame: true, ShortDescription: "Valve's answer."}}, testInterval)
 	must(t, err)
 
 	if res.Backfilled != 0 {
@@ -425,7 +425,7 @@ func TestReconcileBackfillWithNoAppDetailsDoesNothing(t *testing.T) {
 
 	scan := f.claimedScan(t, f.user)
 	res, err := f.store.Reconcile(ctx, scan, f.host,
-		[]ReportEntry{{ExternalID: "517710", Name: "Redout"}}, nil)
+		[]ReportEntry{{ExternalID: "517710", Name: "Redout"}}, nil, testInterval)
 	must(t, err)
 
 	if res.Backfilled != 0 {
@@ -552,7 +552,7 @@ func TestDerivedTileInheritsARealLaunchProfileSlug(t *testing.T) {
 	// nothing else.
 	res, err := f.store.Reconcile(ctx, scan, f.host, []ReportEntry{
 		{ExternalID: "517710", Name: "Redout: Enhanced Edition"},
-	}, nil)
+	}, nil, testInterval)
 	if err != nil {
 		t.Fatalf("reconcile failed with a real launch-profile slug on the parent: %v\n"+
 			"default_profile_id is TEXT holding a slug; binding it as ::uuid is a 22P02 "+
@@ -604,14 +604,14 @@ func TestSecondUserSeesOnlyTheirOwn(t *testing.T) {
 	_, err := f.store.Reconcile(ctx, scanA, f.host, []ReportEntry{
 		{ExternalID: "517710", Name: "Redout: Enhanced Edition"},
 		{ExternalID: "1493710", Name: "Proton Experimental"},
-	}, nil)
+	}, nil, testInterval)
 	must(t, err)
 
 	scanB := f.claimedScan(t, f.other)
 	resB, err := f.store.Reconcile(ctx, scanB, f.host, []ReportEntry{
 		{ExternalID: "3179810", Name: "Tiny Dangerous Dungeons Remake"},
 		{ExternalID: "1493710", Name: "Proton Experimental"},
-	}, nil)
+	}, nil, testInterval)
 	must(t, err)
 	if resB.Created != 1 {
 		t.Errorf("user B created %d tiles; want 1 (the shared Proton must not create one, "+
@@ -646,7 +646,7 @@ func TestIgnoreIsDurableAndIsNotADelete(t *testing.T) {
 	ctx := context.Background()
 
 	entries := []ReportEntry{{ExternalID: "517710", Name: "Redout: Enhanced Edition"}}
-	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil)
+	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil, testInterval)
 	must(t, err)
 	tileID, enabled, ok := f.tile(t, "517710")
 	if !ok || !enabled {
@@ -665,7 +665,7 @@ func TestIgnoreIsDurableAndIsNotADelete(t *testing.T) {
 	}
 
 	// A subsequent scan re-observing the same appid on disk.
-	_, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil)
+	_, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil, testInterval)
 	must(t, err)
 
 	id2, enabled2, ok2 := f.tile(t, "517710")
@@ -735,7 +735,7 @@ func TestScanNeverReEnablesADisabledTile(t *testing.T) {
 	ctx := context.Background()
 
 	entries := []ReportEntry{{ExternalID: "517710", Name: "Redout: Enhanced Edition"}}
-	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil)
+	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil, testInterval)
 	must(t, err)
 	tileID, enabled, ok := f.tile(t, "517710")
 	if !ok || !enabled {
@@ -751,7 +751,7 @@ func TestScanNeverReEnablesADisabledTile(t *testing.T) {
 
 	// The game is still installed, so the very next scan reports it again and the
 	// ladder puts it squarely in `publish` — it reaches step 3's INSERT.
-	res, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil)
+	res, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil, testInterval)
 	must(t, err)
 	if res.Created != 0 {
 		t.Errorf("created = %d, want 0: the tile already exists", res.Created)
@@ -815,7 +815,7 @@ func TestEntitlementSurvivesAHomeMovingHost(t *testing.T) {
 	others := []ReportEntry{{ExternalID: "620", Name: "Portal 2"}}
 
 	// The game is installed on host A.
-	_, err := f.store.Reconcile(ctx, scanOn(f.host), f.host, entries, nil)
+	_, err := f.store.Reconcile(ctx, scanOn(f.host), f.host, entries, nil, testInterval)
 	must(t, err)
 	tileID, _, ok := f.tile(t, "517710")
 	if !ok {
@@ -826,7 +826,7 @@ func TestEntitlementSurvivesAHomeMovingHost(t *testing.T) {
 	}
 
 	// The user installs it on host B too. Host B's scan sees it.
-	_, err = f.store.Reconcile(ctx, scanOn(hostB), hostB, entries, nil)
+	_, err = f.store.Reconcile(ctx, scanOn(hostB), hostB, entries, nil, testInterval)
 	must(t, err)
 	if _, has := f.entitlementGrantedBy(t, f.user, tileID); !has {
 		t.Fatal("the entitlement vanished when a SECOND host also reported the game")
@@ -836,9 +836,12 @@ func TestEntitlementSurvivesAHomeMovingHost(t *testing.T) {
 		t.Fatalf("observations = %d, want 2 (one per host — they are independent sets)", n)
 	}
 
-	// Now the user removes it from host A only. Host A's sweep runs and must NOT
-	// revoke: the observation on host B is still there.
-	res, err := f.store.Reconcile(ctx, scanOn(f.host), f.host, others, nil)
+	// Now the user removes it from host A only. Host A's sweep runs twice, an interval
+	// apart (amendment 25), and must NOT revoke: the observation on host B is still there.
+	_, err = f.store.Reconcile(ctx, scanOn(f.host), f.host, others, nil, testInterval)
+	must(t, err)
+	f.timePasses(t, testInterval)
+	res, err := f.store.Reconcile(ctx, scanOn(f.host), f.host, others, nil, testInterval)
 	must(t, err)
 	if res.Revoked != 0 {
 		t.Errorf("host A's sweep revoked %d entitlement(s) while host B still has the game "+
@@ -856,7 +859,10 @@ func TestEntitlementSurvivesAHomeMovingHost(t *testing.T) {
 	}
 
 	// Only when the LAST host stops reporting it does the entitlement go.
-	_, err = f.store.Reconcile(ctx, scanOn(hostB), hostB, others, nil)
+	_, err = f.store.Reconcile(ctx, scanOn(hostB), hostB, others, nil, testInterval)
+	must(t, err)
+	f.timePasses(t, testInterval)
+	_, err = f.store.Reconcile(ctx, scanOn(hostB), hostB, others, nil, testInterval)
 	must(t, err)
 	if _, has := f.entitlementGrantedBy(t, f.user, tileID); has {
 		t.Error("the entitlement survived the game disappearing from EVERY host")
@@ -950,7 +956,7 @@ func TestAllowBeatsTheBuiltInDenylist(t *testing.T) {
 
 	// Proton Experimental: on the built-in appid list AND matching a name prefix.
 	entries := []ReportEntry{{ExternalID: "1493710", Name: "Proton Experimental"}}
-	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil)
+	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil, testInterval)
 	must(t, err)
 	if _, _, ok := f.tile(t, "1493710"); ok {
 		t.Fatal("the built-in denylist did not suppress Proton Experimental")
@@ -959,7 +965,7 @@ func TestAllowBeatsTheBuiltInDenylist(t *testing.T) {
 	_, err = f.store.SetRule(ctx, f.parent, SourceSteam, "1493710", RuleAllow, "not junk after all", nil)
 	must(t, err)
 
-	_, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil)
+	_, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil, testInterval)
 	must(t, err)
 	id, enabled, ok := f.tile(t, "1493710")
 	if !ok || !enabled {
@@ -980,7 +986,7 @@ func TestUninstallRevokesProviderNotAdmin(t *testing.T) {
 	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, []ReportEntry{
 		{ExternalID: "517710", Name: "Redout: Enhanced Edition"},
 		{ExternalID: "3179810", Name: "Tiny Dangerous Dungeons Remake"},
-	}, nil)
+	}, nil, testInterval)
 	must(t, err)
 	redout, _, _ := f.tile(t, "517710")
 	tiny, _, _ := f.tile(t, "3179810")
@@ -989,10 +995,12 @@ func TestUninstallRevokesProviderNotAdmin(t *testing.T) {
 	must(t, execT(ctx, pool, `INSERT INTO entitlements (subject_type, subject_id, app_id, granted_by)
 		VALUES ('user', $1::uuid, $2::uuid, 'admin')`, f.other, redout))
 
-	// The user uninstalls Redout and rescans.
-	res, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, []ReportEntry{
-		{ExternalID: "3179810", Name: "Tiny Dangerous Dungeons Remake"},
-	}, nil)
+	// The user uninstalls Redout; two scans an interval apart miss it (amendment 25).
+	remaining := []ReportEntry{{ExternalID: "3179810", Name: "Tiny Dangerous Dungeons Remake"}}
+	_, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, remaining, nil, testInterval)
+	must(t, err)
+	f.timePasses(t, testInterval)
+	res, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, remaining, nil, testInterval)
 	must(t, err)
 	if res.Revoked != 1 {
 		t.Errorf("revoked = %d, want 1", res.Revoked)
@@ -1026,7 +1034,7 @@ func TestFailedScanRevokesNothing(t *testing.T) {
 	ctx := context.Background()
 
 	entries := []ReportEntry{{ExternalID: "517710", Name: "Redout: Enhanced Edition"}}
-	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil)
+	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, entries, nil, testInterval)
 	must(t, err)
 	tileID, _, _ := f.tile(t, "517710")
 
@@ -1058,7 +1066,7 @@ func TestEmptyReportOverObservationsKeepsLibrary(t *testing.T) {
 	ctx := context.Background()
 
 	first := f.claimedScan(t, f.user)
-	_, err := f.store.Reconcile(ctx, first, f.host, nil, nil)
+	_, err := f.store.Reconcile(ctx, first, f.host, nil, nil, testInterval)
 	must(t, err)
 	var state string
 	must(t, pool.QueryRow(ctx, `SELECT state FROM library_scans WHERE id=$1::uuid`, first).Scan(&state))
@@ -1067,12 +1075,12 @@ func TestEmptyReportOverObservationsKeepsLibrary(t *testing.T) {
 	}
 
 	_, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host,
-		[]ReportEntry{{ExternalID: "517710", Name: "Redout: Enhanced Edition"}}, nil)
+		[]ReportEntry{{ExternalID: "517710", Name: "Redout: Enhanced Edition"}}, nil, testInterval)
 	must(t, err)
 	tileID, _, _ := f.tile(t, "517710")
 
 	scan := f.claimedScan(t, f.user)
-	res, err := f.store.Reconcile(ctx, scan, f.host, nil, nil)
+	res, err := f.store.Reconcile(ctx, scan, f.host, nil, nil, testInterval)
 	must(t, err)
 	if res.Revoked != 0 {
 		t.Errorf("Revoked = %d, want 0", res.Revoked)
@@ -1102,7 +1110,7 @@ func TestCappedReportPrunesAndRevokesNothing(t *testing.T) {
 		{ExternalID: "517710", Name: "Redout: Enhanced Edition"},
 		{ExternalID: "620", Name: "Portal 2"},
 	}
-	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, known, nil)
+	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host, known, nil, testInterval)
 	must(t, err)
 	portal, _, _ := f.tile(t, "620")
 
@@ -1116,7 +1124,7 @@ func TestCappedReportPrunesAndRevokesNothing(t *testing.T) {
 	}
 
 	res, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host,
-		report(scanMaxEntries, known[0]), nil)
+		report(scanMaxEntries, known[0]), nil, testInterval)
 	must(t, err)
 	if !res.Capped || res.Revoked != 0 {
 		t.Errorf("capped report: Capped = %v Revoked = %d, want true and 0", res.Capped, res.Revoked)
@@ -1131,13 +1139,18 @@ func TestCappedReportPrunesAndRevokesNothing(t *testing.T) {
 		t.Errorf("observations after a capped report = %d, want %d (new ones added, none pruned)", n, scanMaxEntries+1)
 	}
 
-	// One entry short of the cap the report is complete again, and the omitted game goes.
+	// One entry short of the cap the report is complete again, and the omitted game goes
+	// once a second complete report an interval later agrees (amendment 25).
 	res, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host,
-		report(scanMaxEntries-1, known[0]), nil)
+		report(scanMaxEntries-1, known[0]), nil, testInterval)
 	must(t, err)
 	if res.Capped {
 		t.Error("a report below the cap was treated as capped")
 	}
+	f.timePasses(t, testInterval)
+	_, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host,
+		report(scanMaxEntries-1, known[0]), nil, testInterval)
+	must(t, err)
 	if _, has := f.entitlementGrantedBy(t, f.user, portal); has {
 		t.Error("an uncapped report that omits a game left its entitlement")
 	}
@@ -1156,7 +1169,7 @@ func TestIngestRejectsBadAppIDsAndKeepsTheRest(t *testing.T) {
 		{ExternalID: "-1", Name: "negative"},
 		{ExternalID: "", Name: "empty"},
 		{ExternalID: "9999999999", Name: "past 2^32"},
-	}, nil)
+	}, nil, testInterval)
 	must(t, err)
 	if res.Observed != 1 || res.Rejected != 5 {
 		t.Fatalf("reconcile = %+v; want 1 observed / 5 rejected — one bad manifest must not "+
@@ -1917,7 +1930,7 @@ func TestAppDetailsNeverOverridesARule(t *testing.T) {
 
 	_, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host,
 		[]ReportEntry{{ExternalID: "1493710", Name: "Proton Experimental"}},
-		map[string]AppDetail{"1493710": {IsGame: false}}) // "Steam says: not a game"
+		map[string]AppDetail{"1493710": {IsGame: false}}, testInterval) // "Steam says: not a game"
 	must(t, err)
 	if _, enabled, ok := f.tile(t, "1493710"); !ok || !enabled {
 		t.Fatal("the appdetails rung overrode an operator's allow rule; §8.3 forbids it")
@@ -1927,7 +1940,7 @@ func TestAppDetailsNeverOverridesARule(t *testing.T) {
 	_, err = f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host,
 		[]ReportEntry{{ExternalID: "1493710", Name: "Proton Experimental"},
 			{ExternalID: "999888", Name: "Some Soundtrack"}},
-		map[string]AppDetail{"999888": {IsGame: false}})
+		map[string]AppDetail{"999888": {IsGame: false}}, testInterval)
 	must(t, err)
 	if _, _, ok := f.tile(t, "999888"); ok {
 		t.Error("the appdetails rung did not suppress a non-game the ladder would have published")
@@ -2080,7 +2093,7 @@ func TestLibraryStatusLastScanCompletedAt(t *testing.T) {
 
 	scanID := f.claimedScan(t, f.user)
 	_, err := f.store.Reconcile(ctx, scanID, f.host,
-		[]ReportEntry{{ExternalID: "517710", Name: "Redout"}}, nil)
+		[]ReportEntry{{ExternalID: "517710", Name: "Redout"}}, nil, testInterval)
 	must(t, err)
 
 	body := getStatus(t, srv)
@@ -2118,7 +2131,7 @@ func TestLibraryStatusRecentScans(t *testing.T) {
 	// A successful scan, whose counts must round-trip exactly.
 	okScan := f.claimedScan(t, f.user)
 	res, err := f.store.Reconcile(ctx, okScan, f.host,
-		[]ReportEntry{{ExternalID: "517710", Name: "Redout"}}, nil)
+		[]ReportEntry{{ExternalID: "517710", Name: "Redout"}}, nil, testInterval)
 	must(t, err)
 
 	// A failed scan, reported after the successful one so newest-first has

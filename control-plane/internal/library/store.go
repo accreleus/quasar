@@ -233,6 +233,10 @@ type ReconcileResult struct {
 	// Backfilled: existing discovered tiles of this parent whose blank description this scan
 	// filled in. See the backfill step at the end of Reconcile.
 	Backfilled int
+	// Missing: observations this scan did not list and marked. Pruned: marked observations
+	// this scan confirmed gone. Log-only, not stored on the scan row.
+	Missing int
+	Pruned  int
 	// Capped: the report reached scanMaxEntries, so it is a prefix of the library and not
 	// evidence of absence; no game was pruned or revoked for being absent from it. UserID is for the caller's log.
 	Capped bool
@@ -261,7 +265,10 @@ type Candidate struct {
 // transaction opens (a third-party call inside a DB transaction holds locks across a network
 // timeout). A missing entry means "not consulted": suppression degrades to "the denylist
 // alone decided" and backfill is skipped for that id.
-func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []ReportEntry, appDetails map[string]AppDetail) (ReconcileResult, error) {
+//
+// interval is the resolved scan interval (Resolver.ScanInterval), the distance step 1's prune
+// needs between the marking scan and the confirming one; <= 0 marks and never prunes.
+func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []ReportEntry, appDetails map[string]AppDetail, interval time.Duration) (ReconcileResult, error) {
 	var res ReconcileResult
 
 	tx, err := s.pool.Begin(ctx)
@@ -328,10 +335,10 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 	}
 
 	// --- STEP 1: observations ------------------------------------------------
-	// Upsert one row per reported entry including suppressed ones (§7.6), then delete the
-	// rows for this (user, parent, host) triple the scan did not list. Only reached from a
-	// successful scan (MarkFailed doesn't call in here); scoped by host too, since a user
-	// with homes on two hosts has independent observation sets.
+	// Upsert one row per reported entry including suppressed ones (§7.6); a sighting clears
+	// the row's missing mark. Only reached from a successful scan (MarkFailed doesn't call in
+	// here); scoped by host too, since a user with homes on two hosts has independent
+	// observation sets.
 	for _, id := range order {
 		e := seen[id]
 		if _, err := tx.Exec(ctx, `
@@ -339,22 +346,46 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 			    (user_id, parent_app_id, external_source, external_id, name, host_id, last_seen_at)
 			VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::uuid, now())
 			ON CONFLICT (user_id, parent_app_id, external_source, external_id, host_id)
-			DO UPDATE SET name = EXCLUDED.name, last_seen_at = now()
+			DO UPDATE SET name = EXCLUDED.name, last_seen_at = now(), missing_since = NULL
 		`, target.UserID, target.ParentID, SourceSteam, e.ExternalID, e.Name, target.HostID); err != nil {
 			return res, fmt.Errorf("upsert observation: %w", err)
 		}
 	}
-	// A report that hit the agent's cap is a prefix in directory order: it adds, never prunes
-	// (guarded by TestCappedReportPrunesAndRevokesNothing).
+	// A row this scan did not list is marked, not pruned: one scan cannot tell an uninstall
+	// from a library out of reach (schema.md amendment 25). The prune needs a scan queued at
+	// least one interval after the mark. That must stay Enqueue's recency arithmetic, so the
+	// next scheduled scan qualifies and a "scan now" pressed sooner does not; guarded by
+	// TestNextScheduledScanPrunesAnUninstall and TestScanNowTwiceDoesNotPrune. It reads the
+	// scan's created_at, never now(): a report delivered late is not a later look at the disk.
+	//
+	// A report that hit the agent's cap is a prefix in directory order: it neither marks nor
+	// prunes (guarded by TestCappedReportPrunesAndRevokesNothing).
 	if !res.Capped {
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM library_observations
+		if interval > 0 {
+			pruned, err := tx.Exec(ctx, `
+				DELETE FROM library_observations
+				 WHERE user_id = $1::uuid AND parent_app_id = $2::uuid AND host_id = $3::uuid
+				   AND external_source = $4
+				   AND NOT (external_id = ANY($5::text[]))
+				   AND missing_since <= (SELECT created_at FROM library_scans WHERE id::text = $6)
+				                        - make_interval(secs => $7)
+			`, target.UserID, target.ParentID, target.HostID, SourceSteam, order, scanID, interval.Seconds())
+			if err != nil {
+				return res, fmt.Errorf("prune observations: %w", err)
+			}
+			res.Pruned = int(pruned.RowsAffected())
+		}
+		marked, err := tx.Exec(ctx, `
+			UPDATE library_observations SET missing_since = now()
 			 WHERE user_id = $1::uuid AND parent_app_id = $2::uuid AND host_id = $3::uuid
 			   AND external_source = $4
 			   AND NOT (external_id = ANY($5::text[]))
-		`, target.UserID, target.ParentID, target.HostID, SourceSteam, order); err != nil {
-			return res, fmt.Errorf("prune observations: %w", err)
+			   AND missing_since IS NULL
+		`, target.UserID, target.ParentID, target.HostID, SourceSteam, order)
+		if err != nil {
+			return res, fmt.Errorf("mark missing observations: %w", err)
 		}
+		res.Missing = int(marked.RowsAffected())
 	}
 
 	// --- STEP 2: the suppression decision, computed once ---------------------
@@ -494,8 +525,9 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 	}
 
 	// ...and revoke this user's provider entitlements where no observation remains on any
-	// host. No host predicate in the NOT EXISTS is deliberate: a user who moved a game from
-	// host A to B still has it; scoping to the scanned host would flap the tile in and out.
+	// host; a row marked missing still counts. No host predicate in the NOT EXISTS is
+	// deliberate: a user who moved a game from host A to B still has it; scoping to the
+	// scanned host would flap the tile in and out.
 	// granted_by='provider' is the other load-bearing predicate: an admin grant survives an
 	// uninstall.
 	revoked, err := tx.Exec(ctx, `

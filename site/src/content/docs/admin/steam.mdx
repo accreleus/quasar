@@ -55,6 +55,10 @@ Go duration such as `360m` or `6h` to override it; a bare number fails startup,
 and `0` disables discovery entirely regardless of the admin master switch.
 **Admin ▸ Library ▸ Sources** can scan now.
 
+An uninstalled game leaves the library on the second scheduled scan that no
+longer finds it. One scan is not enough, so a library that is briefly
+unreachable costs nobody their games. Scan now does not speed this up.
+
 ## Steam-derived apps
 
 Each game becomes a normal app using the Steam image, launched at that title.
