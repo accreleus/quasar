@@ -112,7 +112,8 @@ teardown_local_stack() {
     dx_info "KEEP=1 — leaving local stack up ($PG, $CP on $NET, port ${CP_PORT:-?})"
     return 0
   fi
-  docker rm -f "$CP" "$PG" >/dev/null 2>&1 || true
+  # -v so the postgres data volume does not outlive the run (#205)
+  docker rm -fv "$CP" "$PG" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   # The container holding the key is gone, but the key FILE (a live secret
   # while the stack was up) is still sitting on disk under the results dir —
@@ -191,7 +192,7 @@ boot_local_stack() {
   # at the earliest point there is something to tear down, not after the last
   # container in the sequence starts (MAJOR 4).
   STACK_UP=1
-  docker rm -f "$PG" "$CP" >/dev/null 2>&1 || true
+  docker rm -fv "$PG" "$CP" >/dev/null 2>&1 || true
 
   dx_info "[1/3] postgres"
   docker run -d --name "$PG" --network "$NET" \
@@ -199,7 +200,9 @@ boot_local_stack() {
     postgres:16 >/dev/null
   local ready=0
   for _ in $(seq 1 30); do
-    if docker exec "$PG" pg_isready -U quasar >/dev/null 2>&1; then ready=1; break; fi
+    # TCP probe (-h): the official image's temporary init server listens on
+    # the Unix socket only, where a plain pg_isready answers too (#270).
+    if docker exec "$PG" pg_isready -h 127.0.0.1 -U quasar >/dev/null 2>&1; then ready=1; break; fi
     sleep 1
   done
   if [ "$ready" = "1" ]; then dx_pass postgres "ready"; else
