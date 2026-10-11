@@ -414,6 +414,14 @@
   animation: sl-aperture 1.65s cubic-bezier(0.5, 0, 0.15, 1) forwards;
 }
 
+/* The session is over (takeover, revoked access): there is no stream to
+   reveal, so the card stays up on the loader's own ground until the fade and
+   the page banner takes over (#533). */
+.sl-root.is-locking.is-over .sl-status,
+.sl-root.is-locking.is-over .sl-aperture {
+  animation: none;
+}
+
 .sl-root.is-streaming {
   opacity: 0;
   pointer-events: none;
