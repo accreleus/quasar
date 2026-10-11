@@ -63,6 +63,11 @@ own; the two do not move together, and that is deliberate.
   the sound device. After upgrading, turn a console host's console mode off and on once so the
   agent learns whether the host has a sound device (`console_sound` reads `unknown` until
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
+- **The contract no longer lists a `manifest_invalid` fault for the Releases view (#157).** It
+  was specified and no control plane ever raised it. A release whose manifest is missing or
+  invalid is still left out of the list, and the release detection job's run summary (Jobs
+  tab) still counts it. Nothing the control plane or the console does changes (protocol
+  amendment 26).
 
 ### Fixed
 - **A game a library scan could not see for a moment is no longer taken away (#521).** A successful scan can still miss an installed game, typically because its library sat on a mount that was briefly away. One such scan removed the game from the user's library and ended a running session of it. A missed game is now only marked, and is removed when a second scan, queued at least one scan interval after the first, also misses it; a scan that sees it again clears the mark. The cost: an uninstalled game leaves on the second scheduled scan instead of the first, and "Scan now" pressed sooner than one interval does not speed that up. A library that stays out of the scan's reach across both scans is still read as uninstalled (schema amendment 25, migration 0102).
