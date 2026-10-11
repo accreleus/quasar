@@ -484,9 +484,11 @@ fn device_cgroup_rules(intent: &ApplicationIntent) -> &Vec<String> {
 /// What the legacy NVIDIA hook behind Docker's `--gpus` is asked to inject (#413): its
 /// default (`compute,utility`, what it grants a container whose environment names none)
 /// plus `display`, the one capability that adds `/dev/nvidia-modeset`. The NVIDIA Vulkan
-/// driver in the driver volume cannot start without that node; CDI injects it anyway. On
-/// a full-driver host `display` also mounts the host's own graphics libraries, the same
-/// driver version as the volume, which stays first on `LD_LIBRARY_PATH`.
+/// driver in the driver volume normally needs that node. CDI injects only what its
+/// spec lists, and a spec generated before the node existed omits it (#449: the
+/// application-GPU probe's Vulkan step catches that). On a full-driver host `display` also
+/// mounts the host's own graphics libraries, the same driver version as the volume, which
+/// stays first on `LD_LIBRARY_PATH`.
 const GPUS_DRIVER_CAPABILITIES: &str = "compute,utility,display";
 const DRIVER_CAPABILITIES_ENV: &str = "NVIDIA_DRIVER_CAPABILITIES";
 

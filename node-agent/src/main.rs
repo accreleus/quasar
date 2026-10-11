@@ -40,6 +40,8 @@ enum Mode {
         /// `--render-node <path>`: open that hardware device rather than the first
         /// enumerated one.
         render_node: Option<String>,
+        /// `--vulkan`: also bring up a Vulkan device (NVIDIA GPUs only).
+        vulkan: bool,
     },
     /// #500: one throwaway-home sweep, then exit. Same knobs, guards and code path as the
     /// daily timer; `make homes-gc` execs it in the running agent container.
@@ -120,6 +122,7 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
             vendor_lib: args.get(1).filter(|s| !s.starts_with("--")).cloned(),
             open_device: args.iter().any(|a| a == "--open-device"),
             render_node: arg_value(args, "--render-node"),
+            vulkan: args.iter().any(|a| a == "--vulkan"),
         },
         Some("homes-gc") => Mode::HomesGc {
             dry_run: args.iter().any(|a| a == "--dry-run"),
@@ -186,12 +189,14 @@ async fn main() {
         vendor_lib,
         open_device,
         render_node,
+        vulkan,
     } = parse_args()
     {
         std::process::exit(quasar_node_agent::nvidia_volume::egl_selftest_main(
             vendor_lib.as_deref(),
             open_device,
             render_node.as_deref(),
+            vulkan,
         ));
     }
 
@@ -863,6 +868,20 @@ mod tests {
             panic!("did not parse as the EGL self-test");
         };
         assert_eq!(render_node, None);
+    }
+
+    #[test]
+    fn egl_selftest_vulkan_step_is_opt_in() {
+        let egl = quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG;
+        for (args, expected) in [
+            (vec![egl, "--open-device"], false),
+            (vec![egl, "--open-device", "--vulkan"], true),
+        ] {
+            let Ok(Mode::EglSelfTest { vulkan, .. }) = parse_mode(&argv(&args)) else {
+                panic!("{args:?} did not parse as the EGL self-test");
+            };
+            assert_eq!(vulkan, expected, "{args:?}");
+        }
     }
 
     #[test]
