@@ -64,6 +64,11 @@ own; the two do not move together, and that is deliberate.
   the sound device. After upgrading, turn a console host's console mode off and on once so the
   agent learns whether the host has a sound device (`console_sound` reads `unknown` until
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
+- **The contract no longer lists a `manifest_invalid` fault for the Releases view (#157).** It
+  was specified and no control plane ever raised it. A release whose manifest is missing or
+  invalid is still left out of the list, and the release detection job's run summary (Jobs
+  tab) still counts it. Nothing the control plane or the console does changes (protocol
+  amendment 26).
 
 ### Fixed
 - **An NVIDIA host whose containers are not given `/dev/nvidia-modeset` and cannot start Vulkan now fails readiness (#449).** The application GPU probe also tries to bring up a Vulkan device in the same container shape a session uses; when none comes up and the container has no `/dev/nvidia-modeset`, the check fails with the `nvidia-modprobe -m` and CDI regeneration fix, so launches stop failing one by one. Other Vulkan faults are shown but do not block launches. The install guide covers it, including Unraid's boot-time spec.

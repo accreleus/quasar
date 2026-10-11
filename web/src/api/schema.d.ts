@@ -4152,7 +4152,7 @@ export interface paths {
         };
         /**
          * The platform-release view — installed, available, eligibility, faults (admin).
-         * @description One read that answers the whole admin Releases page: the installed identities (this control plane plus every host), the releases available on the configured channel newest first with their notes, the per-target eligibility FOR THE NEWEST LISTED RELEASE with a stable reason identifier, and the faults. READ-ONLY AND NEVER A TRIGGER: it applies nothing, writes nothing, and does not run detection - detection is a jobs-framework job and "Check now" is POST /v1/admin/jobs/{job_id}/run. A release below the installed control plane's schema_version is never listed on either channel (ADR 0002), and a stable release whose manifest is missing or invalid is not listed either (ADR 0001 - there is nothing to pin it by); the latter surfaces as a manifest_invalid fault.
+         * @description One read that answers the whole admin Releases page: the installed identities (this control plane plus every host), the releases available on the configured channel newest first with their notes, the per-target eligibility FOR THE NEWEST LISTED RELEASE with a stable reason identifier, and the faults. READ-ONLY AND NEVER A TRIGGER: it applies nothing, writes nothing, and does not run detection - detection is a jobs-framework job and "Check now" is POST /v1/admin/jobs/{job_id}/run. A release below the installed control plane's schema_version is never listed on either channel (ADR 0002), and a stable release whose manifest is missing or invalid is not listed either (ADR 0001 - there is nothing to pin it by); the latter is not a fault in this view - the platform.release_detect job counts it in its run summary (amendment 26).
          */
         get: {
             parameters: {
@@ -9350,15 +9350,15 @@ export interface components {
             checks: components["schemas"]["PlatformPreflightCheck"][];
         };
         /**
-         * @description Everything wrong that is not an ineligibility. A CLOSED vocabulary. A fault gates nothing anywhere - it is reported so a wrong state is visible instead of silent. Prefixed (rather than a bare FaultKind) because "fault" already names an unrelated thing in this system - an NVIDIA Xid is a GPU fault. Full semantics: control-api.md §"Platform releases".
+         * @description Everything wrong that is not an ineligibility. A CLOSED vocabulary. A fault gates nothing anywhere - it is reported so a wrong state is visible instead of silent. Prefixed (rather than a bare FaultKind) because "fault" already names an unrelated thing in this system - an NVIDIA Xid is a GPU fault. Full semantics: control-api.md §"Platform releases". Amendment 26 (#157) removed a third value, manifest_invalid, that no control plane ever emitted.
          * @enum {string}
          */
-        PlatformReleaseFaultKind: "agent_ahead_of_control_plane" | "identity_unknown" | "manifest_invalid";
+        PlatformReleaseFaultKind: "agent_ahead_of_control_plane" | "identity_unknown";
         PlatformReleaseFault: {
             kind: components["schemas"]["PlatformReleaseFaultKind"];
             /**
              * Format: uuid
-             * @description Null on an instance-scoped fault (manifest_invalid).
+             * @description Null on an instance-scoped fault. Neither kind in the vocabulary is one today (amendment 26), so both name a host.
              */
             host_id: string | null;
             /** @description Null on an instance-scoped fault. */
@@ -9388,7 +9388,7 @@ export interface components {
                 control_plane: components["schemas"]["PlatformIdentity"];
                 hosts: components["schemas"]["PlatformHostIdentity"][];
             };
-            /** @description Releases the configured channel selects that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). On BETA, SemVer 2.0.0 precedence is inserted between those two keys, because that channel is the only one whose rows can arrive out of version order: 0.2.0-rc.2 orders below 0.2.0, which orders below 0.2.1-rc.1, whatever order they were built in. A release below the installed control plane's schema_version is NEVER here (ADR 0002); neither is one whose VERSION orders below an installed prerelease at the same schema_version, which is what stops a switch back to stable offering a downgrade (amendment 3); a prerelease is never here on stable; a stable or beta release with a missing or invalid manifest is never here either (it is a manifest_invalid fault instead). */
+            /** @description Releases the configured channel selects that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). On BETA, SemVer 2.0.0 precedence is inserted between those two keys, because that channel is the only one whose rows can arrive out of version order: 0.2.0-rc.2 orders below 0.2.0, which orders below 0.2.1-rc.1, whatever order they were built in. A release below the installed control plane's schema_version is NEVER here (ADR 0002); neither is one whose VERSION orders below an installed prerelease at the same schema_version, which is what stops a switch back to stable offering a downgrade (amendment 3); a prerelease is never here on stable; a stable or beta release with a missing or invalid manifest is never here either (and is not a fault - amendment 26). */
             available: components["schemas"]["PlatformRelease"][];
             /** @description One entry per target - the control plane, then every registered host - each evaluated against available[0]. When available is empty every target is eligible:false with reason "no_release". */
             targets: components["schemas"]["PlatformReleaseTarget"][];
@@ -9655,7 +9655,7 @@ export interface components {
         };
         /** @description The platform-release-manifest.json asset attached to a stable GitHub Release, produced by the publish workflow from the same tag as the notes so digests and prose cannot disagree. Served back VERBATIM as PlatformRelease.manifest. NOTE THE TWO VERSION FIELDS ARE DIFFERENT THINGS: format_version versions THIS DOCUMENT'S FORMAT, schema_version is the DATABASE MIGRATION VERSION the release's control-plane image embeds (ADR 0002's ordering key). Not to be confused with scripts/release/release-manifest.json in the quasar superproject, which is the release-preflight input set and a different file - the asset is named platform-release-manifest.json precisely so the two never collide. */
         ReleaseManifest: {
-            /** @description The manifest format's own version; 1 today. A consumer that meets a format_version it does not know treats the manifest as INVALID (a manifest_invalid fault, and the release is not listed) rather than guessing. */
+            /** @description The manifest format's own version; 1 today. A consumer that meets a format_version it does not know treats the manifest as INVALID (the release is not listed, and no fault is raised) rather than guessing. */
             format_version: number;
             /** @description Semver without a leading "v". */
             version: string;
@@ -9680,7 +9680,7 @@ export interface components {
         };
         /** @description AMENDMENT 14 (#353). The platform-release-manifest.v2.json asset of an RH06-era release: format 1's fields with their grammar and meaning unchanged, THREE components and a FLOOR. Published under its own asset name so a consumer that reads only the format-1 asset never sees it. Served back VERBATIM as PlatformRelease.manifest. A signed release carries platform-release-manifest.v2.json.sig, ADR 0003's document format over this asset's exact bytes. Full semantics: control-api.md §"RH06 — Quasar-owned installation", "Release manifest format 2". */
         ReleaseManifestV2: {
-            /** @description 2 for this shape. A consumer that meets a format_version it does not know treats the manifest as INVALID (manifest_invalid) rather than guessing. */
+            /** @description 2 for this shape. A consumer that meets a format_version it does not know treats the manifest as INVALID (the release is not listed) rather than guessing. */
             format_version: number;
             /** @description Semver without a leading "v". */
             version: string;
