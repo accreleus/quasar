@@ -293,10 +293,9 @@ fn scan_root_path(
     // literal `..` must be rejected first or `<root>/../../etc` would
     // lexically "start with" root while escaping it once resolved.
     if has_traversal(&root_path) {
-        tracing::warn!(
+        debug!(
             token = "library-scan-path-traversal",
-            "library-scan: scan {} root_path contains a '..' component — refusing",
-            scan.scan_id
+            "library-scan: scan {} root_path contains a '..' component — refusing", scan.scan_id
         );
         return Err(ScanError::new(
             CLASS_ROOT_OUTSIDE,
@@ -304,7 +303,7 @@ fn scan_root_path(
         ));
     }
     if !home::is_under_root(&configured_root, &root_path) {
-        tracing::warn!(
+        debug!(
             token = "library-scan-path-outside-root",
             "library-scan: scan {} root_path is outside the configured home root — refusing",
             scan.scan_id
@@ -319,10 +318,9 @@ fn scan_root_path(
         DirProbe::Missing => return Ok(Vec::new()), // home not provisioned yet — nothing to scan, not an error
         DirProbe::Real => {}
         DirProbe::SymlinkOrNotDir => {
-            tracing::warn!(
+            debug!(
                 token = "library-scan-path-not-a-dir",
-                "library-scan: scan {} root_path is not a real directory — refusing",
-                scan.scan_id
+                "library-scan: scan {} root_path is not a real directory — refusing", scan.scan_id
             );
             return Err(ScanError::new(
                 CLASS_ROOT_NOT_DIR,
