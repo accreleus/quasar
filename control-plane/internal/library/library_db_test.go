@@ -2205,14 +2205,17 @@ func TestFailedScanLogsTheClassAndStoresTheFullText(t *testing.T) {
 	var logs bytes.Buffer
 	set := &fakeSettings{enabled: true}
 	h := NewHandler(f.store, testStorageManager(f, set), set, NewAppDetails(false, quietLogger()),
-		newTestResolver(set), slog.New(slog.NewTextHandler(&logs, nil)))
+		newTestResolver(set), slog.New(slog.NewJSONHandler(&logs, nil)))
 	mux := http.NewServeMux()
 	h.Register(mux, func(next http.Handler) http.Handler { return next })
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
 	scan := f.claimedScan(t, f.user)
-	full := "manifest /homes/opaque-a/games/BaldursGate3/steamapps/appmanifest_730.acf is not valid UTF-8"
+	// The numeric appid is checked in the record's own fields; the letters-only tokens are
+	// checked on the whole line, which also carries random ids and a timestamp that can hold
+	// any short digit string.
+	full := "manifest /zzhomezz/zzgamezz/steamapps/appmanifest_730_zzfilezz.acf is not valid UTF-8"
 	resp := agentReq(t, "POST", srv.URL+"/v1/agent/library/scan-report", f.nodeName, f.secret,
 		ScanReport{ScanID: scan, OK: false, Error: full})
 	resp.Body.Close()
@@ -2226,10 +2229,24 @@ func TestFailedScanLogsTheClassAndStoresTheFullText(t *testing.T) {
 		t.Errorf("stored error = %q, want the agent's text %q", stored, full)
 	}
 	out := logs.String()
-	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, `cause="manifest not valid UTF-8"`) {
-		t.Errorf("want a WARN scan-failure line with the class, got %q", out)
+	var rec map[string]json.RawMessage
+	must(t, json.Unmarshal([]byte(strings.TrimSpace(out)), &rec))
+	if string(rec["level"]) != `"WARN"` || string(rec["cause"]) != `"manifest not valid UTF-8"` {
+		t.Errorf("want a WARN scan-failure record with the class, got %q", out)
 	}
-	for _, leak := range []string{"homes", "BaldursGate3", "730", "appmanifest"} {
+	// Every attribute but the three that carry random ids or a timestamp, raw so a numeric or
+	// nested value is checked too.
+	for key, raw := range rec {
+		if key == "time" || key == "scan_id" || key == "host_id" {
+			continue
+		}
+		for _, leak := range []string{"zzhomezz", "zzgamezz", "zzfilezz", "appmanifest", "730"} {
+			if strings.Contains(string(raw), leak) {
+				t.Errorf("attribute %q carries %q: %q", key, leak, out)
+			}
+		}
+	}
+	for _, leak := range []string{"zzhomezz", "zzgamezz", "zzfilezz", "appmanifest"} {
 		if strings.Contains(out, leak) {
 			t.Errorf("log carries %q: %q", leak, out)
 		}
