@@ -23,6 +23,7 @@ pub const ENGINE_INSPECTION_BUDGET: Duration = Duration::from_secs(5);
 // shutdown is safe even when the last caller lives on another Tokio executor.
 struct Executor {
     runtime: Option<tokio::runtime::Runtime>,
+    handle: tokio::runtime::Handle,
     slots: Arc<Semaphore>,
 }
 impl Drop for Executor {
@@ -95,6 +96,33 @@ pub struct RuntimeClient {
 }
 impl RuntimeClient {
     pub fn new(config: RuntimeConfig) -> Result<Self, RuntimeError> {
+        Self::validate(&config)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("quasar-runtime")
+            .enable_all()
+            .build()
+            .map_err(|_| RuntimeError::from(ErrorKind::Unavailable))?;
+        let handle = runtime.handle().clone();
+        Ok(Self::assemble(config, Some(runtime), handle))
+    }
+
+    /// A client that runs on the caller's runtime instead of building its own, so many
+    /// clients can share one set of threads and descriptors. Test support: `handle` must
+    /// belong to a runtime that stays alive and driven (I/O and time enabled, running on
+    /// its own threads) for as long as any client or operation built on it, because a
+    /// detached operation does not keep that runtime alive and a blocking `wait` on an
+    /// undriven runtime hangs.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_handle(
+        config: RuntimeConfig,
+        handle: tokio::runtime::Handle,
+    ) -> Result<Self, RuntimeError> {
+        Self::validate(&config)?;
+        Ok(Self::assemble(config, None, handle))
+    }
+
+    fn validate(config: &RuntimeConfig) -> Result<(), RuntimeError> {
         if !config.socket.is_absolute()
             || config.socket.to_str().is_none()
             || config.deadline.is_zero()
@@ -106,20 +134,23 @@ impl RuntimeClient {
         {
             return Err(ErrorKind::InvalidConfiguration.into());
         }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("quasar-runtime")
-            .enable_all()
-            .build()
-            .map_err(|_| RuntimeError::from(ErrorKind::Unavailable))?;
+        Ok(())
+    }
+
+    fn assemble(
+        config: RuntimeConfig,
+        runtime: Option<tokio::runtime::Runtime>,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
         let slots = Arc::new(Semaphore::new(config.max_in_flight));
-        Ok(Self {
+        Self {
             config,
             executor: Arc::new(Executor {
-                runtime: Some(runtime),
+                runtime,
+                handle,
                 slots,
             }),
-        })
+        }
     }
 
     /// The configuration this client was built with, for adapters layered on it.
@@ -165,11 +196,8 @@ impl RuntimeClient {
                 let deadline = tokio::time::Instant::now() + budget;
                 let owner = detached.then(|| self.executor.clone());
                 self.executor
-                    .runtime
-                    .as_ref()
-                    .expect("live executor")
+                    .handle
                     .spawn(async move {
-                        let _permit = permit;
                         let _owner = owner;
                         let result = tokio::select! {
                             biased;
@@ -177,6 +205,9 @@ impl RuntimeClient {
                             result = tokio::time::timeout_at(deadline, work) =>
                                 result.unwrap_or_else(|_| Err(if detached { ErrorKind::UnknownOutcome } else { ErrorKind::Timeout }.into())),
                         };
+                        // Free the slot before the caller can see the result: it may start its
+                        // next operation the instant `wait` returns.
+                        drop(permit);
                         let _ = send.send(result);
                     });
             }
