@@ -451,10 +451,10 @@ export function setupCapture({
 
   /** Idempotent. Lock mode goes through exitPointerLock so browser state and
    *  ours never diverge (pointerlockchange runs the release); fallback clears
-   *  directly. */
+   *  directly. A lock this capture inherited (an older capture's) is exited too. */
   const release = () => {
     wanted = false;
-    if (captureMode === "lock" && document.exitPointerLock) {
+    if ((captureMode === "lock" || document.pointerLockElement === videoEl) && document.exitPointerLock) {
       document.exitPointerLock();
       return;
     }

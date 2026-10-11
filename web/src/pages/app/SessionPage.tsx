@@ -997,8 +997,9 @@ export function SessionPage() {
           sessionRunning={sessionRunning}
           iceState={iceState}
           // handleStop tears the session down server-side so "Back to
-          // library" from a dead launch never orphans a session.
-          onExit={() => void handleStop()}
+          // library" from a dead launch never orphans a session. Not for a
+          // takeover: the other tab owns the session, and stopping it ends its stream.
+          onExit={() => (launchFailure?.kind === "taken_over" ? navigate("/app") : void handleStop())}
         />
       )}
 

@@ -16,7 +16,7 @@
 //   4. unmounts immediately when running arrives with no "app booting" at
 //      all (fail-open rule 1 — an older agent, or no app container)
 
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionPage, parseTierSize } from "./SessionPage";
@@ -1083,6 +1083,44 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     await settleTheReveal();
     expect(document.querySelector(".sl-root")).toBeNull();
     expect(alerts()).toEqual([expect.stringContaining("This session moved to another tab")]);
+  });
+});
+
+describe("SessionPage — the loader's exit (#527)", () => {
+  const exitFromLoader = async () => {
+    const card = document.querySelector(".sl-root")!;
+    await act(async () => {
+      fireEvent.click(within(card as HTMLElement).getByRole("button", { name: "Back to library" }));
+    });
+  };
+
+  it("a takeover card only navigates: the other tab's session is not stopped", async () => {
+    currentSession = makeSession({ state: "running", state_detail: "app booting" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      lastOnRecovery?.({ phase: "superseded", attempt: 0, maxAttempts: 3, message: "opened in another tab" });
+    });
+    expect(document.querySelector(".sl-root")?.textContent).toContain("This session moved to another tab");
+
+    await exitFromLoader();
+
+    expect(stopSession).not.toHaveBeenCalled();
+    expect(screen.getByTestId("summary")).not.toBeNull();
+  });
+
+  it("any other failure card still stops the session", async () => {
+    currentSession = makeSession({ state: "failed", state_detail: "boom", error_message: "boom" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    await exitFromLoader();
+
+    expect(stopSession).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -1694,4 +1694,21 @@ describe("a Pointer Lock grant that lands after cleanup() (#527)", () => {
     b.cleanup();
     expect(t.exitPointerLock).toHaveBeenCalledTimes(1);
   });
+
+  it("release() exits a lock it inherited from an older capture", async () => {
+    const t = setup();
+    const a = t.capture();
+    const engaging = a.engage();
+    lockPointer(t.video);
+    t.pending[0]!.grant();
+    await engaging;
+    const b = t.capture(); // never engaged: mode "none"
+    a.cleanup();
+    expect(t.exitPointerLock).not.toHaveBeenCalled();
+
+    b.release();
+
+    expect(t.exitPointerLock).toHaveBeenCalledTimes(1);
+    b.cleanup();
+  });
 });
