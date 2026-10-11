@@ -9,6 +9,7 @@
 //
 // No focusable content by design; doesn't touch SessionDrawer's
 // aria-hidden/focus logic.
+import { useEffect, useState } from "react";
 import { QuasarMark } from "../../components/QuasarMark";
 import type { SwapTransitionState } from "./useSwapTransition";
 
@@ -16,8 +17,21 @@ export interface SessionSwapTransitionProps {
   transition: SwapTransitionState | null;
 }
 
+// Longer than `.switcher`'s .35s opacity fade (session.css).
+const FADE_OUT_MS = 400;
+
 export function SessionSwapTransition({ transition }: SessionSwapTransitionProps) {
   const show = transition != null;
+  // The shell stays mounted so the fade and the live region work; its content
+  // is only in the document while a swap is in flight or fading out, so an idle
+  // session's page text carries none of it.
+  const [held, setHeld] = useState(transition);
+  if (transition && transition !== held) setHeld(transition);
+  useEffect(() => {
+    if (transition) return;
+    const t = setTimeout(() => setHeld(null), FADE_OUT_MS);
+    return () => clearTimeout(t);
+  }, [transition]);
   return (
     <div
       className={`switcher${show ? " show" : ""}`}
@@ -25,16 +39,20 @@ export function SessionSwapTransition({ transition }: SessionSwapTransitionProps
       aria-live="polite"
       aria-hidden={show ? undefined : "true"}
     >
-      <QuasarMark size={72} />
-      <div className="sw-nm">{transition?.appName ?? ""}</div>
-      {transition && (transition.phase === "error" || transition.phase === "timeout") ? (
-        <div className="sw-err">
-          {transition.phase === "timeout"
-            ? "Still waiting on a confirmation from the host. The switch may still finish. If the host never picked it up, the session will end shortly."
-            : transition.message}
-        </div>
-      ) : (
-        <div className="sw-sub">Starting…</div>
+      {held && (
+        <>
+          <QuasarMark size={72} />
+          <div className="sw-nm">{held.appName}</div>
+          {held.phase === "error" || held.phase === "timeout" ? (
+            <div className="sw-err">
+              {held.phase === "timeout"
+                ? "Still waiting on a confirmation from the host. The switch may still finish. If the host never picked it up, the session will end shortly."
+                : held.message}
+            </div>
+          ) : (
+            <div className="sw-sub">Starting…</div>
+          )}
+        </>
       )}
     </div>
   );
