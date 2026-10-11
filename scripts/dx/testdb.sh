@@ -103,27 +103,17 @@ GO_NAME="qgo-${TESTDB_INSTANCE}"
 
 # The owner identity stamped as the label quasar.testdb.owner on everything
 # this run creates, and the ONLY evidence the orphan sweep below accepts:
-# pid-namespace id, this shell's own pid ($$ stays the script's long-lived
-# shell even inside subshells) and that process's start time — pid reuse
-# makes a live pid number ambiguous on its own. A component that cannot be
-# read stays empty; the sweep refuses anything whose identity is not fully
-# there.
-testdb_starttime() { # testdb_starttime <pid> — field 22 of /proc/<pid>/stat
-  local stat
-  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
-  stat="${stat#*) }"   # pid and comm come first; comm itself may hold spaces
-  # The state field is field 3, so the k-th remaining field is field k+2
-  # overall: start time, field 22, is the 20th.
-  cut -d' ' -f20 <<<"$stat"
-}
+# the pid-namespace id and this shell's own pid ($$ stays the script's
+# long-lived shell even inside subshells). A component that cannot be read
+# stays empty; the sweep refuses anything whose identity is not fully there.
 TESTDB_PIDNS="$(readlink /proc/self/ns/pid 2>/dev/null || true)"
-# The raw output is `pid:[N]` — the same `pid:` prefix that would collide
-# with the owner value's own colons, so only N is kept: every label field is
-# numeric and the parse below stays unambiguous.
+# The raw output is `pid:[N]` — the wrapper's own colon would collide with
+# the owner value's field separator, so only N is kept: both label fields
+# are numeric and the parse below stays unambiguous.
 TESTDB_PIDNS="${TESTDB_PIDNS#pid:[}"
 TESTDB_PIDNS="${TESTDB_PIDNS%]}"
 TESTDB_PID="$$"
-TESTDB_OWNER="${TESTDB_PIDNS}:${TESTDB_PID}:$(testdb_starttime "$$")"
+TESTDB_OWNER="${TESTDB_PIDNS}:${TESTDB_PID}"
 
 # Never printed, never persisted.
 if dx_have openssl; then
@@ -156,50 +146,50 @@ docker network rm "$PG_NET" >/dev/null 2>&1 || true
 # operator-pinned instance whose id continues with digits matches another
 # run's per-run shape) and a pid read FROM a name says nothing across pid
 # namespaces — this script also runs inside the dev/devtools containers and
-# CI, whose pid numbers are another namespace's. A resource may be removed
-# ONLY when its label parses as <pidns>:<pid>:<starttime>, that pid-namespace
-# id is THIS namespace's, and the owner is provably gone: no such process, or
-# a live pid with a DIFFERENT start time (the kernel reused it). Anything
-# else — unlabelled (orphans of runs from before the label existed among
-# them), another namespace's, or not fully parseable — is left alone;
-# `make reset` remains the manual sweeper for those.
+# CI, whose pid numbers are another namespace's. The rule, in one sentence:
+# a labelled resource is removed only when its label names THIS pid
+# namespace and the pid in it has NO process. A live pid is never grounds
+# for removal, whatever it may look like: a start time read back from
+# /proc is reported relative to the READER's time namespace, so it cannot
+# prove a pid was reused, and its only safe use would be to keep things.
+# The accepted cost: an orphan whose pid number some other long-lived
+# process now occupies is not swept automatically; `make reset` remains the
+# manual sweeper for that — and, like the unlabelled orphan (one from
+# before this label existed), it is at worst waiting disk, never a running
+# Postgres mistaken for dead.
 
-# testdb_owner_gone <pid> <starttime> — 0 iff the owning run is provably
-# dead: either the pid has no process at all, or the pid is alive with a
-# DIFFERENT start time. kill -0 also fails for a live process this user
-# cannot signal, so the error text decides; a pid that cannot be
-# interrogated stays "not gone" — leaving an orphan is the harmless
-# direction, removing a live run's Postgres would not be.
+# testdb_owner_dead <pid> — 0 iff the label's pid has no process. kill -0
+# also fails for a live process this user cannot signal (EPERM), and its
+# error text is locale-dependent, so LC_ALL=C pins the one string we
+# recognise as proof of absence; every other failure means "cannot tell"
+# and keeps the resource. Leaving an orphan behind is the harmless
+# direction; removing a live run's Postgres would not be.
 # shellcheck disable=SC2329  # invoked by the sweep below, not by name
-testdb_owner_gone() {
-  local pid="$1" st="$2" err cur
-  err="$(kill -0 "$pid" 2>&1)" || {
-    case "$err" in
-      *"No such process"*) return 0 ;;
-      *) return 1 ;;
-    esac
-  }
-  cur="$(testdb_starttime "$pid")"
-  [ -n "$cur" ] && [ "$cur" != "$st" ]
+testdb_owner_dead() {
+  local err
+  err="$(LC_ALL=C kill -0 "$1" 2>&1)" && return 1
+  case "$err" in
+    *"No such process"*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # testdb_sweep_ok <label-value> — 0 iff the labelled resource may be removed.
-# The parsed fields must rebuild the value exactly (no extra fields, no
-# stray colons) and the pid, namespace id and start time must be numeric.
+# Exactly two numeric fields that rebuild the value, and a dead owner. A
+# stray third field (a label from the abandoned start-time format) fails the
+# rebuild and is left alone.
 # shellcheck disable=SC2329  # invoked by the sweep below, not by name
 testdb_sweep_ok() {
-  local owner="$1" ns rest pid st
+  local owner="$1" ns pid
   ns="${owner%%:*}"
-  rest="${owner#*:}"
-  pid="${rest%%:*}"
-  st="${rest#*:}"
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  case "$st" in ''|*[!0-9]*) return 1 ;; esac
+  pid="${owner#*:}"
   case "$ns" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$ns:$pid:$st" = "$owner" ] || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "${owner#*:}" ] || return 1
+  [ "$ns:$pid" = "$owner" ] || return 1
   [ -n "$TESTDB_PIDNS" ] || return 1
   [ "$ns" = "$TESTDB_PIDNS" ] || return 1
-  testdb_owner_gone "$pid" "$st"
+  testdb_owner_dead "$pid"
 }
 
 # Containers are read before networks, so a dead run's endpoints are gone by

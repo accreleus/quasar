@@ -24,14 +24,15 @@ RESULTS="${RESULTS_JSON:-$REPO/scripts/harness/apitest/results.json}"
 
 cleanup() {
   [ "${KEEP:-0}" = "1" ] && { echo "KEEP=1 — leaving stack up ($PG,$CP on $NET)"; return; }
-  docker rm -f "$CP" "$PG" >/dev/null 2>&1 || true
+  # -v so the postgres data volume does not outlive the run (#205)
+  docker rm -fv "$CP" "$PG" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 echo "=== [1/4] network + postgres ==="
 docker network create "$NET" >/dev/null 2>&1 || true
-docker rm -f "$PG" "$CP" >/dev/null 2>&1 || true
+docker rm -fv "$PG" "$CP" >/dev/null 2>&1 || true
 docker run -d --name "$PG" --network "$NET" \
   -e POSTGRES_USER=quasar -e POSTGRES_PASSWORD=quasar -e POSTGRES_DB=quasar \
   postgres:16 >/dev/null

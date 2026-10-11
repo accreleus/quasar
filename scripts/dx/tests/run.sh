@@ -3728,14 +3728,15 @@ case "$line" in
 esac
 
 printf '\n== test-db orphan sweep judged by label (#205) ==\n'
-# The sweep must remove ONLY resources carrying the owner label whose owner
-# is provably dead in THIS pid namespace. Driven end to end against a
-# recording docker stub that fabricates candidate orphans (every one of them
-# label-selected, as the real `--filter label=` selection is) and records
-# every removal: the sweep removes a fabricated resource ONLY when its label
-# says so, so any other selection fails here. Unlabelled containers never
-# even reach the sweep — docker's own label filter withholds them — and the
-# `testdb:sweep-*` assertions below pin the four judgement outcomes.
+# The sweep's rule, one sentence: remove a labelled resource only when its
+# label names THIS pid namespace and the pid in it has NO process. Driven end
+# to end against a recording docker stub that fabricates candidate orphans
+# (every one of them label-selected, as the real `--filter label=` selection
+# is) and records every removal, so any other selection fails here.
+# Unlabelled containers never even reach the sweep — docker's own label
+# filter withholds them — and the `testdb:sweep-*` assertions below pin the
+# outcomes, including the safety case the start-time era got wrong: a LIVE
+# pid must be kept whatever the label carries next to it.
 SWEEP_BIN="$WORK/sweepbin"
 mkdir -p "$SWEEP_BIN"
 for stub in "$STUB_BIN"/*; do cp "$stub" "$SWEEP_BIN/$(basename "$stub")"; done
@@ -3752,19 +3753,18 @@ wait "$SWEEP_DEAD_PID" 2>/dev/null || true
 # so do the same here.
 SWEEP_NS="$(readlink /proc/self/ns/pid 2>/dev/null || true)"
 SWEEP_NS="${SWEEP_NS#pid:[}"; SWEEP_NS="${SWEEP_NS%]}"
-# The start-time field, exactly the rule the script stamps: field 22 of
-# /proc/<pid>/stat (state is field 3, and comm may hold spaces).
-SWEEP_ST="$(cat /proc/$$/stat 2>/dev/null)"
-SWEEP_ST="${SWEEP_ST#*) }"
-SWEEP_ST="$(cut -d' ' -f20 <<<"$SWEEP_ST")"
-printf 'c1|c|%s:%s:123456\n' "$SWEEP_NS" "$SWEEP_DEAD_PID" >> "$SWEEP_STATE" # same ns, dead pid -> REMOVE
-# Alive and, apart from the start time, the same: the script's own sweep must read
-# this process's REAL start time and keep the resource.
-printf 'c2|c|%s:%s:%s\n' "$SWEEP_NS" "$$" "$SWEEP_ST"                       >> "$SWEEP_STATE" # alive, same start time -> KEEP
-printf 'c3|c|999999999:%s:123456\n' "$SWEEP_DEAD_PID"                       >> "$SWEEP_STATE" # another pid namespace -> KEEP
-printf 'c4|c|not-a-valid-owner\n'                                           >> "$SWEEP_STATE" # unparseable -> KEEP
-printf 'n1|n|%s:%s:456789\n' "$SWEEP_NS" "$SWEEP_DEAD_PID"                  >> "$SWEEP_STATE" # same ns, dead -> REMOVE
-printf 'n2|n|999999999:%s:456789\n' "$SWEEP_DEAD_PID"                       >> "$SWEEP_STATE" # another pid namespace -> KEEP
+printf 'c1|c|%s:%s\n' "$SWEEP_NS" "$SWEEP_DEAD_PID" >> "$SWEEP_STATE"  # same ns, dead pid        -> REMOVE (container -fv, then network n1)
+# A LIVE pid in this namespace must be kept — this is the case the old
+# start-time rule wrongly swept. Its label also carries a start-time-looking
+# third field, exactly what a resource stamped under that abandoned format
+# holds: unparseable now, kept.
+printf 'c2|c|%s:%s:111\n' "$SWEEP_NS" "$$"                             >> "$SWEEP_STATE" # live pid (old 3-field format) -> KEEP
+printf 'c3|c|%s:%s\n' "$SWEEP_NS" "$$"                                 >> "$SWEEP_STATE" # live pid (current format)     -> KEEP
+printf 'c4|c|999999999:%s\n' "$SWEEP_DEAD_PID"                         >> "$SWEEP_STATE" # another pid namespace         -> KEEP
+printf 'c5|c|not-a-valid-owner\n'                                      >> "$SWEEP_STATE" # unparseable                   -> KEEP
+printf 'c6|c|%s:%s:123456\n' "$SWEEP_NS" "$SWEEP_DEAD_PID"             >> "$SWEEP_STATE" # old 3-field format, dead pid  -> KEEP
+printf 'n1|n|%s:%s\n' "$SWEEP_NS" "$SWEEP_DEAD_PID"                    >> "$SWEEP_STATE" # same ns, dead pid             -> REMOVE
+printf 'n2|n|999999999:%s\n' "$SWEEP_DEAD_PID"                         >> "$SWEEP_STATE" # another pid namespace         -> KEEP
 
 # The recording docker stub: answers the script's whole lifecycle, prints the
 # fake ids for the label-filtered listing, reads the fabricated label value
@@ -3816,10 +3816,10 @@ else
   fail "testdb:sweep-network-dead-labelled-removed" "unexpected network removals: $(printf '%s' "$sweep_net" | tr '\n' '|')"
 fi
 
-if printf '%s' "$(cat "$SWEEP_LOG")" | grep -qE '(^| )(c2|c3|c4|n2)( |$)'; then
+if printf '%s' "$(cat "$SWEEP_LOG")" | grep -qE '(^| )(c2|c3|c4|c5|c6|n2)( |$)'; then
   fail "testdb:sweep-only-own-judgement" "a kept candidate was removed anyway: $(tr '\n' '|' < "$SWEEP_LOG")"
 else
-  pass "testdb:sweep-only-own-judgement" "alive-same-starttime, foreign-namespace and unparseable candidates all kept"
+  pass "testdb:sweep-only-own-judgement" "a live pid (old or current label format), a foreign namespace and every unparseable value kept"
 fi
 
 # Containers must be swept before networks (a dead run's endpoints have to
