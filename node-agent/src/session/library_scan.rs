@@ -187,8 +187,32 @@ impl LibraryScanClient {
 fn run_scan(scan: &ScanTask) -> ScanReport {
     match scan_root_path(scan, home::configured_home_root()) {
         Ok(entries) => ScanReport::ok(scan.scan_id.clone(), entries),
-        Err(e) => ScanReport::failed(scan.scan_id.clone(), e),
+        Err(e) => {
+            tracing::warn!(
+                token = "library-scan-failed",
+                "library-scan: scan {} failed: {}",
+                scan.scan_id,
+                redact_scan_error(&e, &scan.root_path)
+            );
+            ScanReport::failed(scan.scan_id.clone(), e)
+        }
     }
+}
+
+/// The failure text made safe for a log: paths relative to the scanned root (the
+/// absolute root is not logged) and any Steam appid in a manifest file name
+/// replaced. The report keeps the full text.
+fn redact_scan_error(error: &str, root_path: &str) -> String {
+    let root = root_path.trim_end_matches('/');
+    let relative = if root.is_empty() {
+        error.to_string()
+    } else {
+        error.replace(&format!("{root}/"), "").replace(root, ".")
+    };
+    regex::Regex::new(r"appmanifest_[^/\s]*?\.acf")
+        .expect("static pattern")
+        .replace_all(&relative, "appmanifest_<appid>.acf")
+        .into_owned()
 }
 
 /// `configured_root` is a parameter, not an env read, purely for test
@@ -1575,5 +1599,72 @@ mod tests {
         let err =
             result.expect_err("a library hidden by an unreadable ancestor must fail the scan");
         assert!(err.contains("PermissionDenied"), "{err}");
+    }
+
+    // ── Failure log redaction (#534) ────────────────────────────────────────
+
+    const ROOT: &str = "/mnt/user/appdata/quasar/homes/some-opaque-id";
+
+    #[test]
+    fn redaction_drops_the_root_and_the_appid_of_a_manifest() {
+        let err = format!(
+            "manifest {ROOT}/.local/share/Steam/steamapps/appmanifest_730.acf is not valid UTF-8"
+        );
+        assert_eq!(
+            redact_scan_error(&err, ROOT),
+            "manifest .local/share/Steam/steamapps/appmanifest_<appid>.acf is not valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn redaction_handles_a_nested_library_and_a_trailing_slash_root() {
+        let err = format!("manifest {ROOT}/games/SteamLibrary/steamapps/appmanifest_1086940.acf failed to parse (malformed or incomplete)");
+        assert_eq!(
+            redact_scan_error(&err, &format!("{ROOT}/")),
+            "manifest games/SteamLibrary/steamapps/appmanifest_<appid>.acf failed to parse (malformed or incomplete)"
+        );
+    }
+
+    #[test]
+    fn redaction_keeps_a_path_with_no_appid_relative() {
+        let err = format!("reading {ROOT}/games/steamapps failed: PermissionDenied");
+        assert_eq!(
+            redact_scan_error(&err, ROOT),
+            "reading games/steamapps failed: PermissionDenied"
+        );
+        assert_eq!(
+            redact_scan_error(&format!("reading {ROOT} failed: PermissionDenied"), ROOT),
+            "reading . failed: PermissionDenied"
+        );
+    }
+
+    #[test]
+    fn redaction_leaves_an_error_with_no_path_alone() {
+        let err = timed_out();
+        assert_eq!(redact_scan_error(&err, ROOT), err);
+        assert_eq!(
+            redact_scan_error("root_path outside configured home root", ROOT),
+            "root_path outside configured home root"
+        );
+    }
+
+    /// The real walk error, redacted: the report text keeps the absolute path, the log does not.
+    #[test]
+    fn a_damaged_manifest_error_is_redacted_for_the_log_but_not_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let steamapps = dir.path().join("steamapps");
+        fs::create_dir_all(&steamapps).unwrap();
+        fs::write(steamapps.join("appmanifest_42.acf"), [0xff, 0xfe]).unwrap();
+        let err = walk_and_parse(dir.path(), &["steamapps".to_string()], 512, 1_048_576)
+            .expect_err("a non-UTF-8 manifest fails the scan");
+        let root = dir.path().to_str().unwrap();
+        assert!(
+            err.contains(root) && err.contains("appmanifest_42.acf"),
+            "{err}"
+        );
+        assert_eq!(
+            redact_scan_error(&err, root),
+            "manifest steamapps/appmanifest_<appid>.acf is not valid UTF-8"
+        );
     }
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -206,7 +207,13 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 			h.writeScanErr(w, err, "could not record scan failure")
 			return
 		}
-		h.log.Info("library: scan reported failure", "scan_id", req.ScanID, "host_id", hostID)
+		// The stored error stays whole; the log gets it relative to the scan root with manifest
+		// appids removed. If the root cannot be resolved the cause is withheld, not logged raw.
+		cause := "(scan root unavailable; cause withheld)"
+		if root, err := h.store.ScanRoot(r.Context(), req.ScanID, hostID); err == nil && root != "" {
+			cause = redactScanError(req.Error, root)
+		}
+		h.log.Warn("library: scan reported failure", "scan_id", req.ScanID, "host_id", hostID, "cause", cause)
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"accepted": true})
 		return
 	}
@@ -794,4 +801,16 @@ func writeAppErr(w http.ResponseWriter, err error) bool {
 		return false
 	}
 	return true
+}
+
+var manifestAppID = regexp.MustCompile(`appmanifest_[^/\s]*?\.acf`)
+
+// redactScanError is a scan failure's text made safe for a log: paths relative to the scan
+// root and the Steam appid in any manifest file name replaced. The agent applies the same
+// rule before it logs (node-agent `redact_scan_error`).
+func redactScanError(msg, root string) string {
+	if root = strings.TrimRight(root, "/"); root != "" {
+		msg = strings.ReplaceAll(strings.ReplaceAll(msg, root+"/", ""), root, ".")
+	}
+	return manifestAppID.ReplaceAllString(msg, "appmanifest_<appid>.acf")
 }

@@ -217,6 +217,27 @@ func (s *Store) MarkFailed(ctx context.Context, scanID, hostID, msg string) erro
 	return nil
 }
 
+// ScanRoot is the home path a scan was handed (the `root_path` of its pending job), so a
+// failure cause can be logged relative to it. "" if the home is gone.
+func (s *Store) ScanRoot(ctx context.Context, scanID, hostID string) (string, error) {
+	var root string
+	err := s.pool.QueryRow(ctx, `
+		SELECT uh.ref
+		  FROM library_scans sc
+		  JOIN user_homes uh
+		    ON uh.user_id = sc.user_id AND uh.app_id = sc.app_id AND uh.host_id = sc.host_id
+		 WHERE sc.id::text = $1 AND sc.host_id::text = $2 AND uh.gc_after IS NULL
+		 LIMIT 1
+	`, scanID, hostID).Scan(&root)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve scan root: %w", err)
+	}
+	return root, nil
+}
+
 // --- reconciliation (§7.7) ---------------------------------------------------
 
 // ReconcileResult is what one successful scan changed. Counted because under auto-publish the
