@@ -53,10 +53,10 @@ including its required systemd socket, restart service and runtime directory.
 
 ## The display device node
 
-Quasar's apps run NVIDIA Vulkan, which needs `/dev/nvidia-modeset` inside the
-container. Nothing creates that node until something opens it, and a CDI description
-only lists device nodes that exist when it is generated. If a container is not given it,
-every app launch fails while the rest of the host looks healthy.
+NVIDIA Vulkan in a container normally needs `/dev/nvidia-modeset`. Nothing creates that
+node until something opens it, and a CDI description only lists device nodes that exist
+when it is generated. A host whose containers are not given the node can fail app
+launches while the rest of the host looks healthy.
 
 Create the node, then (on a host that uses a CDI description) generate it:
 

@@ -102,12 +102,17 @@ fn tail(stderr: &str) -> String {
     }
 }
 
-pub fn outcome(target: ProbeTarget, end: &ContainerProbeEnd) -> ProbeOutcome {
+/// `vulkan_requested`: the probe asked the self-test for its Vulkan step (an NVIDIA GPU).
+pub fn outcome(
+    target: ProbeTarget,
+    vulkan_requested: bool,
+    end: &ContainerProbeEnd,
+) -> ProbeOutcome {
     let (passed, failed, exercising) = wording(target);
     match &end.observed {
         Observed::Exited(result) => match result.exit_code {
             Some(0) => match parse_egl_device_open(&result.stdout) {
-                EglRuntime::Ok { loaded } => match parse_vulkan_probe(&result.stdout) {
+                EglRuntime::Ok { loaded } => match parse_vulkan_probe(&result.stdout, vulkan_requested) {
                     VulkanProbe::NotRun => ProbeOutcome::Pass {
                         summary: format!("{passed}: {loaded}"),
                     },
@@ -219,37 +224,147 @@ mod tests {
             ),
             true,
         );
-        match outcome(target(), &e) {
+        match outcome(target(), false, &e) {
             ProbeOutcome::Pass { summary } => assert!(summary.contains("renderD128"), "{summary}"),
             other => panic!("{other:?}"),
         }
     }
 
     const EGL_OPENED: &str = "LOADED=/usr/lib64/libEGL.so.1\nEXTENSIONS=EGL_EXT_device_enumeration\nDEVICES=1\nRENDER_NODES=/dev/dri/renderD128\nOPENED=/dev/dri/renderD128\n";
+    const NVIDIA_SUMMARY: &str = "Devices:\n========\nGPU0:\n\tvendorID = 0x10de\n\tdeviceID = 0x1f08\n\tdriverName = NVIDIA\n\tdriverInfo = 615.78.08\n";
+    const LLVMPIPE_SUMMARY: &str = "Devices:\n========\nGPU0:\n\tvendorID = 0x10005\n\tdeviceID = 0x0\n\tdriverName = llvmpipe\n\tdriverInfo = Mesa 25.3.6\n";
 
-    fn with_vulkan(lines: &str) -> ContainerProbeEnd {
-        end(exited(Some(0), &format!("{EGL_OPENED}{lines}"), ""), true)
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Verdict {
+        Pass,
+        Fail,
+        Unknown,
+    }
+    use Verdict::{Fail, Pass, Unknown};
+
+    fn node(absent: bool) -> &'static str {
+        if absent {
+            "absent"
+        } else {
+            "present"
+        }
     }
 
-    #[test]
-    fn a_working_vulkan_device_passes_naming_the_driver() {
+    /// The probe's stdout for one `vulkaninfo` run, built by the self-test's own classifier.
+    fn selftest_stdout(
+        modeset_absent: bool,
+        run: Option<(&str, Option<i32>, Option<i32>)>,
+    ) -> String {
+        let lines = crate::nvidia_volume::vulkan_selftest_lines(
+            modeset_absent,
+            run.map(|(out, code, signal)| (out.to_string(), code, signal)),
+        );
+        format!(
+            "{EGL_OPENED}NVIDIA_MODESET_NODE={}\n{}\n",
+            node(modeset_absent),
+            lines.join("\n")
+        )
+    }
+
+    fn verdict(stdout: &str, vulkan_requested: bool) -> Verdict {
         match outcome(
             target(),
-            &with_vulkan("NVIDIA_MODESET_NODE=present\nVULKAN_NVIDIA=615.78.08\n"),
+            vulkan_requested,
+            &end(exited(Some(0), stdout, ""), true),
         ) {
-            ProbeOutcome::Pass { summary } => {
-                assert!(summary.contains("Vulkan: NVIDIA 615.78.08"), "{summary}")
-            }
+            ProbeOutcome::Pass { .. } => Pass,
+            ProbeOutcome::Fail { .. } => Fail,
+            ProbeOutcome::Indeterminate { .. } => Unknown,
             other => panic!("{other:?}"),
         }
     }
 
+    type Run = Option<(&'static str, Option<i32>, Option<i32>)>;
+    type Row = (&'static str, Run, Verdict, Verdict);
+
+    /// The whole table: `(what vulkaninfo did, verdict with the node absent, with it present)`.
     #[test]
-    fn egl_open_with_a_crashing_vulkan_loader_and_no_modeset_node_fails_with_the_cdi_remediation() {
-        let e = with_vulkan(
-            "NVIDIA_MODESET_NODE=absent\nVULKAN_ERROR=vulkaninfo crashed with SIGSEGV\n",
-        );
-        match outcome(target(), &e) {
+    fn the_vulkan_step_gives_each_verdict_in_both_node_states() {
+        let (segv, kill) = (Some(libc::SIGSEGV), Some(libc::SIGKILL));
+        let rows: [Row; 12] = [
+            (
+                "NVIDIA listed, exit 0",
+                Some((NVIDIA_SUMMARY, Some(0), None)),
+                Pass,
+                Pass,
+            ),
+            (
+                "NVIDIA listed, exit 1",
+                Some((NVIDIA_SUMMARY, Some(1), None)),
+                Pass,
+                Pass,
+            ),
+            (
+                "NVIDIA listed, then SIGSEGV",
+                Some((NVIDIA_SUMMARY, None, segv)),
+                Pass,
+                Pass,
+            ),
+            (
+                "exit 0, none listed",
+                Some((LLVMPIPE_SUMMARY, Some(0), None)),
+                Fail,
+                Unknown,
+            ),
+            (
+                "exit 1, none listed",
+                Some(("", Some(1), None)),
+                Fail,
+                Unknown,
+            ),
+            (
+                "SIGSEGV, none listed",
+                Some(("", None, segv)),
+                Fail,
+                Unknown,
+            ),
+            ("exit 126", Some(("", Some(126), None)), Unknown, Unknown),
+            ("exit 127", Some(("", Some(127), None)), Unknown, Unknown),
+            ("SIGKILL", Some(("", None, kill)), Unknown, Unknown),
+            (
+                "SIGKILL after NVIDIA listed",
+                Some((NVIDIA_SUMMARY, None, kill)),
+                Pass,
+                Pass,
+            ),
+            ("no exit code", Some(("", None, None)), Unknown, Unknown),
+            ("did not run, or past its deadline", None, Unknown, Unknown),
+        ];
+        for (name, run, when_absent, when_present) in rows {
+            for (absent, want) in [(true, when_absent), (false, when_present)] {
+                let stdout = selftest_stdout(absent, run);
+                assert_eq!(
+                    verdict(&stdout, true),
+                    want,
+                    "{name}, node {}: {stdout}",
+                    node(absent)
+                );
+            }
+        }
+        for absent in [true, false] {
+            // The marker is there but the result line is not.
+            let marker_only = format!("{EGL_OPENED}NVIDIA_MODESET_NODE={}\n", node(absent));
+            assert_eq!(
+                verdict(&marker_only, true),
+                Unknown,
+                "marker only, node {}",
+                node(absent)
+            );
+        }
+        // No Vulkan line at all: lost when asked for, an EGL-only pass when not.
+        assert_eq!(verdict(EGL_OPENED, true), Unknown);
+        assert_eq!(verdict(EGL_OPENED, false), Pass);
+    }
+
+    #[test]
+    fn a_vulkan_fail_says_what_was_observed_and_the_fix() {
+        let stdout = selftest_stdout(true, Some(("", None, Some(libc::SIGSEGV))));
+        match outcome(target(), true, &end(exited(Some(0), &stdout, ""), true)) {
             ProbeOutcome::Fail {
                 summary,
                 remediation,
@@ -259,6 +374,10 @@ mod tests {
                     "{summary}"
                 );
                 assert!(summary.contains("/dev/nvidia-modeset"), "{summary}");
+                assert!(
+                    remediation.contains("were not given /dev/nvidia-modeset"),
+                    "{remediation}"
+                );
                 assert!(remediation.contains("nvidia-modprobe -m"), "{remediation}");
                 assert!(
                     remediation.contains("nvidia-ctk cdi generate"),
@@ -270,82 +389,26 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_vulkan_step_is_indeterminate_never_a_fail() {
-        for lines in [
-            "NVIDIA_MODESET_NODE=absent\nVULKAN_UNAVAILABLE=vulkaninfo did not run (absent, or past its deadline)\n",
-            "NVIDIA_MODESET_NODE=absent\n",
-        ] {
-            assert!(
-                matches!(outcome(target(), &with_vulkan(lines)), ProbeOutcome::Indeterminate { .. }),
-                "{lines}"
-            );
-        }
-    }
-
-    /// The probe's stdout for a `vulkaninfo` run, built by the self-test's own classifier.
-    fn selftest_stdout(modeset_absent: bool, signal: Option<i32>, code: Option<i32>) -> String {
-        let lines = crate::nvidia_volume::vulkan_selftest_lines(
-            modeset_absent,
-            Some((String::new(), code, signal)),
-        );
-        format!(
-            "{EGL_OPENED}NVIDIA_MODESET_NODE={}\n{}\n",
-            if modeset_absent { "absent" } else { "present" },
-            lines.join("\n")
-        )
-    }
-
-    fn outcome_of(stdout: &str) -> ProbeOutcome {
-        outcome(target(), &end(exited(Some(0), stdout, ""), true))
-    }
-
-    #[test]
-    fn a_vulkan_failure_blocks_only_when_the_modeset_node_is_absent() {
-        for (signal, code) in [
-            (Some(libc::SIGSEGV), None),
-            (None, Some(1)),
-            (None, Some(0)),
-        ] {
-            assert!(
-                matches!(
-                    outcome_of(&selftest_stdout(true, signal, code)),
-                    ProbeOutcome::Fail { .. }
-                ),
-                "{signal:?} {code:?}"
-            );
-            match outcome_of(&selftest_stdout(false, signal, code)) {
-                ProbeOutcome::Indeterminate { reason } => {
-                    assert!(
-                        reason.contains("/dev/nvidia-modeset is present"),
-                        "{reason}"
-                    )
-                }
-                other => panic!("{signal:?} {code:?}: {other:?}"),
+    fn an_indeterminate_vulkan_step_keeps_what_was_seen() {
+        let stdout = selftest_stdout(false, Some(("", None, Some(libc::SIGSEGV))));
+        match outcome(target(), true, &end(exited(Some(0), &stdout, ""), true)) {
+            ProbeOutcome::Indeterminate { reason } => {
+                assert!(
+                    reason.contains("SIGSEGV") && reason.contains("/dev/nvidia-modeset is present"),
+                    "{reason}"
+                )
             }
+            other => panic!("{other:?}"),
         }
-    }
-
-    #[test]
-    fn a_vulkaninfo_that_was_killed_not_crashed_is_indeterminate_even_without_the_node() {
-        for signal in [libc::SIGKILL, libc::SIGTERM] {
-            assert!(
-                matches!(
-                    outcome_of(&selftest_stdout(true, Some(signal), None)),
-                    ProbeOutcome::Indeterminate { .. }
-                ),
-                "{signal}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_working_nvidia_device_passes_in_both_node_states() {
-        for node in ["absent", "present"] {
-            let out = format!("{EGL_OPENED}NVIDIA_MODESET_NODE={node}\nVULKAN_NVIDIA=615.78.08\n");
-            assert!(
-                matches!(outcome_of(&out), ProbeOutcome::Pass { .. }),
-                "{node}"
-            );
+        let stdout = selftest_stdout(false, Some((NVIDIA_SUMMARY, Some(1), None)));
+        match outcome(target(), true, &end(exited(Some(0), &stdout, ""), true)) {
+            ProbeOutcome::Pass { summary } => {
+                assert!(
+                    summary.contains("615.78.08") && summary.contains("then exited 1"),
+                    "{summary}"
+                )
+            }
+            other => panic!("{other:?}"),
         }
     }
 
@@ -355,18 +418,10 @@ mod tests {
             exited(Some(0), "LOADED=/usr/lib64/libEGL.so.1\nEXTENSIONS=EGL_EXT_device_enumeration\nDEVICE_ERROR=eglInitialize failed (0x3003)\nVULKAN_NVIDIA=615.78.08\n", ""),
             true,
         );
-        match outcome(target(), &e) {
+        match outcome(target(), false, &e) {
             ProbeOutcome::Fail { summary, .. } => assert!(summary.contains("0x3003"), "{summary}"),
             other => panic!("{other:?}"),
         }
-    }
-
-    #[test]
-    fn a_probe_without_the_vulkan_step_passes_on_egl_alone() {
-        assert!(matches!(
-            outcome(target(), &with_vulkan("")),
-            ProbeOutcome::Pass { .. }
-        ));
     }
 
     #[test]
@@ -379,7 +434,7 @@ mod tests {
             ),
             true,
         );
-        match outcome(target(), &e) {
+        match outcome(target(), false, &e) {
             ProbeOutcome::Fail {
                 summary,
                 remediation,
@@ -401,14 +456,17 @@ mod tests {
             ),
             true,
         );
-        assert!(matches!(outcome(target(), &e), ProbeOutcome::Fail { .. }));
+        assert!(matches!(
+            outcome(target(), false, &e),
+            ProbeOutcome::Fail { .. }
+        ));
     }
 
     #[test]
     fn exit_124_is_indeterminate() {
         let e = end(exited(Some(124), "", ""), true);
         assert!(matches!(
-            outcome(target(), &e),
+            outcome(target(), false, &e),
             ProbeOutcome::Indeterminate { .. }
         ));
     }
@@ -416,7 +474,7 @@ mod tests {
     #[test]
     fn a_segv_fails_naming_the_signal() {
         let e = end(exited(Some(139), "", ""), true);
-        match outcome(target(), &e) {
+        match outcome(target(), false, &e) {
             ProbeOutcome::Fail { summary, .. } => assert!(summary.contains("SIGSEGV"), "{summary}"),
             other => panic!("{other:?}"),
         }
@@ -425,7 +483,7 @@ mod tests {
     #[test]
     fn exit_none_is_indeterminate_with_a_bounded_stderr_tail() {
         let e = end(exited(None, "", &"x".repeat(500)), true);
-        match outcome(target(), &e) {
+        match outcome(target(), false, &e) {
             ProbeOutcome::Indeterminate { reason } => assert!(reason.len() < 500),
             other => panic!("{other:?}"),
         }
@@ -441,7 +499,10 @@ mod tests {
         ] {
             let e = end(observed, false);
             assert!(
-                matches!(outcome(target(), &e), ProbeOutcome::Indeterminate { .. }),
+                matches!(
+                    outcome(target(), false, &e),
+                    ProbeOutcome::Indeterminate { .. }
+                ),
                 "{e:?}"
             );
         }

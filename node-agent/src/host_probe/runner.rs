@@ -340,7 +340,7 @@ async fn run_application_gpu(
 
     match end {
         Ok(Some(Ok(end))) => RunEnd::Concluded {
-            outcome: app_gpu::outcome(target, &end),
+            outcome: app_gpu::outcome(target, is_nvidia, &end),
             reconciled: end.reconciled,
         },
         // The launch this probe stands for is refused the same way (#464).

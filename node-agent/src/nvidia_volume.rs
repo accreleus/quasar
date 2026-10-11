@@ -1900,7 +1900,9 @@ pub enum VulkanProbe {
     },
 }
 
-pub fn parse_vulkan_probe(stdout: &str) -> VulkanProbe {
+/// `requested`: this probe asked for the Vulkan step. Then no marker at all means the step
+/// did not report (the helper keeps only the head of stdout), which is not an EGL-only pass.
+pub fn parse_vulkan_probe(stdout: &str, requested: bool) -> VulkanProbe {
     let field = |k: &str| {
         stdout
             .lines()
@@ -1918,10 +1920,16 @@ pub fn parse_vulkan_probe(stdout: &str) -> VulkanProbe {
         None if stdout.contains("NVIDIA_MODESET_NODE=") => VulkanProbe::Indeterminate {
             detail: "the Vulkan test produced no result (it crashed or was killed)".into(),
         },
+        None if requested => VulkanProbe::Indeterminate {
+            detail: "the Vulkan step left no result in the probe output".into(),
+        },
         None => VulkanProbe::NotRun,
     }
 }
 
+/// The probe helper keeps only the head of stdout (4 KiB), so the Vulkan lines print first
+/// and stay short.
+const MAX_VULKAN_LINE: usize = 200;
 const VULKANINFO_TIMEOUT: Duration = Duration::from_secs(10);
 const NVIDIA_PCI_VENDOR: u32 = 0x10de;
 /// Where the container toolkit puts the NVIDIA ICD manifests when it injects the driver.
@@ -1982,33 +1990,43 @@ fn vulkaninfo_command(icds: &[PathBuf]) -> (&'static str, Vec<String>) {
 /// What `vulkaninfo --summary` did: `(stdout, exit code, fatal signal)`.
 type VulkanRun = (String, Option<i32>, Option<i32>);
 
-/// The self-test's `KEY=value` lines. `VULKAN_ERROR` only when BOTH hold: the container was
-/// not given `/dev/nvidia-modeset` (observed, and shared by every NVIDIA card), and no
-/// NVIDIA device came up. Every other outcome that is not a pass is `VULKAN_UNAVAILABLE`
-/// and carries what was seen, so an operator can read it and it never blocks placement.
+/// The self-test's `KEY=value` lines. An NVIDIA device in the captured summary is a pass
+/// whatever the exit status: `vulkaninfo` prints it before tearing the devices down, and a
+/// crash there is not evidence the device did not come up. Otherwise `VULKAN_ERROR` only
+/// when BOTH hold: the container was not given `/dev/nvidia-modeset` (observed, and shared
+/// by every NVIDIA card) and no NVIDIA device came up. Every other outcome that is not a
+/// pass is `VULKAN_UNAVAILABLE` and carries what was seen, so an operator can read it and
+/// it never blocks placement.
 pub(crate) fn vulkan_selftest_lines(modeset_absent: bool, run: Option<VulkanRun>) -> Vec<String> {
     let unavailable = |why: String| vec![format!("VULKAN_UNAVAILABLE={why}")];
     let Some((stdout, code, signal)) = run else {
         return unavailable("vulkaninfo did not run (absent, or past its deadline)".into());
     };
-    let failure = match (signal, code) {
-        (Some(signal), _) => match crate::host_probe::outcome::fault_signal(signal) {
-            Some(name) => format!("vulkaninfo crashed with {name}"),
-            None => return unavailable(format!("vulkaninfo was stopped by signal {signal}")),
-        },
+    // `None` for a clean exit; otherwise how it ended, and whether that ending is a fault.
+    let ending = match (signal, code) {
+        (Some(signal), _) => Some(match crate::host_probe::outcome::fault_signal(signal) {
+            Some(name) => (format!("crashed with {name}"), true),
+            None => (format!("was stopped by signal {signal}"), false),
+        }),
+        (None, Some(0)) => None,
         // `env` could not exec vulkaninfo.
         (None, Some(126 | 127)) => return unavailable("vulkaninfo could not be executed".into()),
-        (None, Some(0)) => {
-            match crate::gpu_identity::parse_vulkan_summary(&stdout)
-                .iter()
-                .find(|d| d.vendor_id == NVIDIA_PCI_VENDOR)
-            {
-                Some(device) => return vec![format!("VULKAN_NVIDIA={}", device.driver_info)],
-                None => "the Vulkan loader lists no NVIDIA device".to_string(),
-            }
-        }
-        (None, Some(code)) => format!("vulkaninfo exited {code}"),
+        (None, Some(code)) => Some((format!("exited {code}"), true)),
         (None, None) => return unavailable("vulkaninfo ended without an exit code".into()),
+    };
+    if let Some(device) = crate::gpu_identity::parse_vulkan_summary(&stdout)
+        .iter()
+        .find(|d| d.vendor_id == NVIDIA_PCI_VENDOR)
+    {
+        let after = ending.map_or(String::new(), |(how, _)| {
+            format!(" (vulkaninfo then {how})")
+        });
+        return vec![format!("VULKAN_NVIDIA={}{after}", device.driver_info)];
+    }
+    let failure = match ending {
+        None => "the Vulkan loader lists no NVIDIA device".to_string(),
+        Some((how, true)) => format!("vulkaninfo {how}"),
+        Some((how, false)) => return unavailable(format!("vulkaninfo {how}")),
     };
     if modeset_absent {
         vec![format!("VULKAN_ERROR={failure}")]
@@ -2031,7 +2049,7 @@ fn report_vulkan() {
     let run = crate::vram::run_bounded(program, &args, VULKANINFO_TIMEOUT)
         .map(|(out, status)| (out, status.code(), status.signal()));
     for line in vulkan_selftest_lines(modeset_absent, run) {
-        println!("{line}");
+        println!("{}", line.chars().take(MAX_VULKAN_LINE).collect::<String>());
     }
 }
 
@@ -2275,6 +2293,10 @@ pub fn egl_selftest_main(
     render_node: Option<&str>,
     vulkan: bool,
 ) -> i32 {
+    // First, so the Vulkan lines are inside the 4 KiB of stdout the probe helper keeps.
+    if vulkan {
+        report_vulkan();
+    }
     // SAFETY: all four calls are plain libdl/EGL C entry points with the
     // documented signatures; every pointer handed in is either NULL or a
     // NUL-terminated CString that outlives the call, and every pointer read
@@ -2329,9 +2351,6 @@ pub fn egl_selftest_main(
             report_device_open(handle, render_node);
         }
         libc::dlclose(handle);
-    }
-    if vulkan {
-        report_vulkan();
     }
     0
 }
@@ -3176,62 +3195,22 @@ mod tests {
     // ── Vulkan step of the application-GPU self-test ────────────────────────
 
     const NVIDIA_SUMMARY: &str = "Devices:\n========\nGPU0:\n\tapiVersion = 1.4.312\n\tvendorID = 0x10de\n\tdeviceID = 0x1f08\n\tdriverName = NVIDIA\n\tdriverInfo = 615.78.08\n";
-    const LLVMPIPE_SUMMARY: &str = "Devices:\n========\nGPU0:\n\tvendorID = 0x10005\n\tdeviceID = 0x0\n\tdriverName = llvmpipe\n\tdriverInfo = Mesa 25.3.6\n";
-
-    fn lines(modeset_absent: bool, run: Option<VulkanRun>) -> Vec<String> {
-        vulkan_selftest_lines(modeset_absent, run)
-    }
-
-    fn run(code: Option<i32>, signal: Option<i32>, stdout: &str) -> Option<VulkanRun> {
-        Some((stdout.into(), code, signal))
-    }
 
     #[test]
-    fn vulkan_fails_only_when_the_modeset_node_is_absent_and_no_nvidia_device_came_up() {
-        for failure in [
-            run(None, Some(libc::SIGSEGV), ""),
-            run(Some(1), None, ""),
-            run(Some(0), None, LLVMPIPE_SUMMARY),
+    fn a_nvidia_device_listed_before_a_bad_ending_is_still_a_pass() {
+        for (code, signal, ending) in [
+            (Some(1), None, "then exited 1"),
+            (None, Some(libc::SIGSEGV), "then crashed with SIGSEGV"),
         ] {
-            let absent = lines(true, failure.clone());
-            assert!(absent[0].starts_with("VULKAN_ERROR="), "{absent:?}");
-            let present = lines(false, failure);
-            assert!(present[0].starts_with("VULKAN_UNAVAILABLE="), "{present:?}");
-            assert!(
-                present[0].contains("/dev/nvidia-modeset is present"),
-                "{present:?}"
-            );
-        }
-        assert!(lines(true, run(None, Some(libc::SIGSEGV), ""))[0].contains("SIGSEGV"));
-    }
-
-    #[test]
-    fn an_nvidia_device_passes_whether_or_not_the_node_is_there() {
-        for modeset_absent in [true, false] {
-            assert_eq!(
-                lines(modeset_absent, run(Some(0), None, NVIDIA_SUMMARY)),
-                vec!["VULKAN_NVIDIA=615.78.08"]
-            );
-        }
-    }
-
-    #[test]
-    fn a_signal_that_is_no_driver_fault_is_no_verdict() {
-        for signal in [libc::SIGKILL, libc::SIGTERM, libc::SIGHUP] {
-            let l = lines(true, run(None, Some(signal), ""));
-            assert!(
-                l[0].starts_with("VULKAN_UNAVAILABLE="),
-                "signal {signal}: {l:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn no_binary_or_deadline_is_no_verdict() {
-        assert!(lines(true, None)[0].starts_with("VULKAN_UNAVAILABLE="));
-        for code in [126, 127] {
-            let l = lines(true, run(Some(code), None, ""));
-            assert!(l[0].starts_with("VULKAN_UNAVAILABLE="), "{l:?}");
+            for modeset_absent in [true, false] {
+                let l = vulkan_selftest_lines(
+                    modeset_absent,
+                    Some((NVIDIA_SUMMARY.into(), code, signal)),
+                );
+                assert_eq!(l.len(), 1);
+                assert!(l[0].starts_with("VULKAN_NVIDIA=615.78.08"), "{l:?}");
+                assert!(l[0].contains(ending), "{l:?}");
+            }
         }
     }
 
@@ -3297,18 +3276,26 @@ mod tests {
     #[test]
     fn parse_vulkan_probe_reads_the_selftest_lines() {
         assert_eq!(
-            parse_vulkan_probe("LOADED=x\nOPENED=/dev/dri/renderD128\n"),
+            parse_vulkan_probe("LOADED=x\nOPENED=/dev/dri/renderD128\n", false),
             VulkanProbe::NotRun
         );
+        assert!(matches!(
+            parse_vulkan_probe("LOADED=x\n", true),
+            VulkanProbe::Indeterminate { .. }
+        ));
         assert_eq!(
-            parse_vulkan_probe("NVIDIA_MODESET_NODE=present\nVULKAN_NVIDIA=615.78.08\n"),
+            parse_vulkan_probe(
+                "NVIDIA_MODESET_NODE=present\nVULKAN_NVIDIA=615.78.08\n",
+                true
+            ),
             VulkanProbe::Ok {
                 driver: "615.78.08".into()
             }
         );
         assert_eq!(
             parse_vulkan_probe(
-                "NVIDIA_MODESET_NODE=absent\nVULKAN_ERROR=vulkaninfo crashed with SIGSEGV\n"
+                "NVIDIA_MODESET_NODE=absent\nVULKAN_ERROR=vulkaninfo crashed with SIGSEGV\n",
+                true
             ),
             VulkanProbe::Broken {
                 detail: "vulkaninfo crashed with SIGSEGV".into()
@@ -3316,7 +3303,8 @@ mod tests {
         );
         assert!(matches!(
             parse_vulkan_probe(
-                "NVIDIA_MODESET_NODE=absent\nVULKAN_UNAVAILABLE=vulkaninfo did not run\n"
+                "NVIDIA_MODESET_NODE=absent\nVULKAN_UNAVAILABLE=vulkaninfo did not run\n",
+                true
             ),
             VulkanProbe::Indeterminate { .. }
         ));

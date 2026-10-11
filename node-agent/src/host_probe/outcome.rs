@@ -135,12 +135,12 @@ pub fn remediation(kind: ProbeKind) -> String {
 /// The fix for the application-GPU probe's Vulkan fail (#449): the container was not given
 /// `/dev/nvidia-modeset`.
 pub fn vulkan_remediation() -> String {
-    "The container was not given /dev/nvidia-modeset, which the NVIDIA Vulkan driver cannot \
-     start without. On the host run `sudo nvidia-modprobe -m`; when the host uses a CDI spec, \
-     regenerate it (`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`, or your \
-     driver plugin's own generator). Then restart the agent container to re-run this check. \
-     Repeat after any boot that creates the spec before the node exists (docs: Install, \
-     NVIDIA)."
+    "Containers on this host were not given /dev/nvidia-modeset and could not start NVIDIA \
+     Vulkan; app launches will fail the same way. On the host run `sudo nvidia-modprobe -m`; \
+     when the host uses a CDI spec, regenerate it (`sudo nvidia-ctk cdi generate \
+     --output=/etc/cdi/nvidia.yaml`, or your driver plugin's own generator). Then restart the \
+     agent container to re-run this check. Repeat after any boot that creates the spec before \
+     the node exists (docs: Install, NVIDIA)."
         .into()
 }
 
