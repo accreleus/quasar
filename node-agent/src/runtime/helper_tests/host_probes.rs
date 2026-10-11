@@ -177,7 +177,7 @@ fn restart_recovery_finishes_a_lost_stop_under_the_original_identity() {
 
     // A fresh client over the same state dir, as `HostProbeRunner::reconcile` builds
     // when the orchestrator reconciles a container-probe kind before its next run.
-    let fresh = RuntimeClient::new(engine.config.clone()).unwrap();
+    let fresh = engine.client();
     fresh.recover_diagnostics().wait().unwrap();
     assert_eq!(
         engine.requests("POST /containers/create"),
