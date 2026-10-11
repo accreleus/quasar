@@ -54,11 +54,11 @@ including its required systemd socket, restart service and runtime directory.
 ## The display device node
 
 Quasar's apps run NVIDIA Vulkan, which needs `/dev/nvidia-modeset` inside the
-container. A CDI description only lists device nodes that exist when it is generated,
-and nothing creates this one until something opens it. If it is missing, every app
-launch fails while the rest of the host looks healthy.
+container. Nothing creates that node until something opens it, and a CDI description
+only lists device nodes that exist when it is generated. If a container is not given it,
+every app launch fails while the rest of the host looks healthy.
 
-Before you generate the CDI description:
+Create the node, then (on a host that uses a CDI description) generate it:
 
 ```bash
 sudo nvidia-modprobe -m
@@ -67,8 +67,8 @@ sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 ```
 
 Then restart the Quasar agent container. It worked when the **application GPU
-probe** check for your GPU is green; a missing node shows there as a failure that names
-`/dev/nvidia-modeset`.
+probe** check for your GPU is green; a container without the node shows there as a
+failure that names `/dev/nvidia-modeset`.
 
 ## Rootless Docker or Podman
 

@@ -239,9 +239,14 @@ async fn run_media(
     }
 }
 
-/// The application-GPU probe's in-container command. `--vulkan` rides only on an NVIDIA
+/// The application-GPU probe's in-container command. `--vulkan[-shared]` rides only on an NVIDIA
 /// GPU: AMD and Intel hosts keep the EGL-only probe.
-fn selftest_command(driver_volume: bool, is_nvidia: bool, device_path: &str) -> Vec<String> {
+fn selftest_command(
+    driver_volume: bool,
+    nvidia_gpus: usize,
+    is_nvidia: bool,
+    device_path: &str,
+) -> Vec<String> {
     let mut command = vec![
         "20s".to_string(),
         "/usr/local/bin/quasar-node-agent".to_string(),
@@ -254,7 +259,16 @@ fn selftest_command(driver_volume: bool, is_nvidia: bool, device_path: &str) -> 
         ));
     }
     if is_nvidia {
-        command.push("--vulkan".to_string());
+        // With several NVIDIA GPUs `vulkaninfo` creates a device on each, so the step
+        // cannot blame this one for a failure.
+        command.push(
+            if nvidia_gpus > 1 {
+                "--vulkan-shared"
+            } else {
+                "--vulkan"
+            }
+            .to_string(),
+        );
     }
     command.extend(["--open-device", "--render-node", device_path].map(String::from));
     command
@@ -304,6 +318,7 @@ async fn run_application_gpu(
     };
 
     let is_nvidia = gpu_cap.vendor == "nvidia";
+    let nvidia_gpus = inventory.iter().filter(|g| g.vendor == "nvidia").count();
     let watch_preempt = preempt.clone();
     let end = tokio::task::spawn_blocking(move || {
         let is_preempted = || *watch_preempt.borrow();
@@ -321,7 +336,12 @@ async fn run_application_gpu(
                 }));
             }
         };
-        let command = selftest_command(access.carries_driver_volume(), is_nvidia, &device_path);
+        let command = selftest_command(
+            access.carries_driver_volume(),
+            nvidia_gpus,
+            is_nvidia,
+            &device_path,
+        );
         let gpu_run = match access.probe_run(vec!["/usr/bin/timeout".to_string()], command) {
             Ok(run) => run,
             Err(refused) => return Some(Err(refused)),
@@ -464,10 +484,23 @@ mod tests {
 
     #[test]
     fn the_vulkan_step_is_asked_for_on_an_nvidia_gpu_only() {
-        let nvidia = selftest_command(false, true, "/dev/dri/renderD128");
-        assert!(nvidia.contains(&"--vulkan".to_string()), "{nvidia:?}");
-        let other = selftest_command(true, false, "/dev/dri/renderD128");
-        assert!(!other.contains(&"--vulkan".to_string()), "{other:?}");
+        let node = "/dev/dri/renderD128";
+        let has = |c: &[String], flag: &str| c.contains(&flag.to_string());
+        let one = selftest_command(false, 1, true, node);
+        assert!(
+            has(&one, "--vulkan") && !has(&one, "--vulkan-shared"),
+            "{one:?}"
+        );
+        let many = selftest_command(false, 2, true, node);
+        assert!(
+            has(&many, "--vulkan-shared") && !has(&many, "--vulkan"),
+            "{many:?}"
+        );
+        let other = selftest_command(true, 1, false, node);
+        assert!(
+            !has(&other, "--vulkan") && !has(&other, "--vulkan-shared"),
+            "{other:?}"
+        );
         assert_eq!(
             other[3],
             format!(
@@ -477,7 +510,7 @@ mod tests {
         );
         assert_eq!(
             &other[other.len() - 3..],
-            ["--open-device", "--render-node", "/dev/dri/renderD128"]
+            ["--open-device", "--render-node", node]
         );
     }
 

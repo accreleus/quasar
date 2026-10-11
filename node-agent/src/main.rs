@@ -40,8 +40,9 @@ enum Mode {
         /// `--render-node <path>`: open that hardware device rather than the first
         /// enumerated one.
         render_node: Option<String>,
-        /// `--vulkan`: also create a Vulkan instance and list devices (NVIDIA hosts only).
-        vulkan: bool,
+        /// `--vulkan` / `--vulkan-shared`: also create a Vulkan instance on the NVIDIA ICD
+        /// (NVIDIA GPUs only).
+        vulkan: quasar_node_agent::nvidia_volume::VulkanStep,
     },
     /// #500: one throwaway-home sweep, then exit. Same knobs, guards and code path as the
     /// daily timer; `make homes-gc` execs it in the running agent container.
@@ -122,7 +123,13 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
             vendor_lib: args.get(1).filter(|s| !s.starts_with("--")).cloned(),
             open_device: args.iter().any(|a| a == "--open-device"),
             render_node: arg_value(args, "--render-node"),
-            vulkan: args.iter().any(|a| a == "--vulkan"),
+            vulkan: if args.iter().any(|a| a == "--vulkan-shared") {
+                quasar_node_agent::nvidia_volume::VulkanStep::Shared
+            } else if args.iter().any(|a| a == "--vulkan") {
+                quasar_node_agent::nvidia_volume::VulkanStep::Own
+            } else {
+                quasar_node_agent::nvidia_volume::VulkanStep::Off
+            },
         },
         Some("homes-gc") => Mode::HomesGc {
             dry_run: args.iter().any(|a| a == "--dry-run"),
@@ -872,10 +879,12 @@ mod tests {
 
     #[test]
     fn egl_selftest_vulkan_step_is_opt_in() {
+        use quasar_node_agent::nvidia_volume::VulkanStep::*;
         let egl = quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG;
         for (args, expected) in [
-            (vec![egl, "--open-device"], false),
-            (vec![egl, "--open-device", "--vulkan"], true),
+            (vec![egl, "--open-device"], Off),
+            (vec![egl, "--open-device", "--vulkan"], Own),
+            (vec![egl, "--open-device", "--vulkan-shared"], Shared),
         ] {
             let Ok(Mode::EglSelfTest { vulkan, .. }) = parse_mode(&argv(&args)) else {
                 panic!("{args:?} did not parse as the EGL self-test");

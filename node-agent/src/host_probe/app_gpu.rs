@@ -121,7 +121,7 @@ pub fn outcome(target: ProbeTarget, end: &ContainerProbeEnd) -> ProbeOutcome {
                         summary: format!(
                             "{failed}: EGL opens it but Vulkan does not: {detail}{}",
                             if modeset_absent {
-                                " (/dev/nvidia-modeset is missing in the container)"
+                                " (the container was not given /dev/nvidia-modeset)"
                             } else {
                                 ""
                             }
@@ -309,6 +309,33 @@ mod tests {
                 "{lines}"
             );
         }
+    }
+
+    #[test]
+    fn a_vulkaninfo_that_was_killed_not_crashed_is_indeterminate_through_to_the_outcome() {
+        use crate::nvidia_volume::VulkanStep;
+        // The self-test's own output for each signal, as the probe reads it.
+        let stdout = |signal: i32| {
+            let lines = crate::nvidia_volume::vulkan_selftest_lines(
+                VulkanStep::Own,
+                true,
+                true,
+                Some((String::new(), None, Some(signal))),
+            );
+            format!(
+                "{EGL_OPENED}NVIDIA_MODESET_NODE=absent\n{}\n",
+                lines.join("\n")
+            )
+        };
+        for signal in [libc::SIGKILL, libc::SIGTERM] {
+            let e = end(exited(Some(0), &stdout(signal), ""), true);
+            assert!(
+                matches!(outcome(target(), &e), ProbeOutcome::Indeterminate { .. }),
+                "{signal}"
+            );
+        }
+        let e = end(exited(Some(0), &stdout(libc::SIGSEGV), ""), true);
+        assert!(matches!(outcome(target(), &e), ProbeOutcome::Fail { .. }));
     }
 
     #[test]
