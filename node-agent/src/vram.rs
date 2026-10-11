@@ -215,37 +215,74 @@ fn parse_amd_vram_used_bytes(text: &str) -> Option<i32> {
     Some((bytes / 1024 / 1024) as i32)
 }
 
-/// Spawn `cmd`, poll `try_wait`, and `kill()` + reap at the deadline, returning `None`.
-/// Never `Command::output()`: it blocks until the child exits, which leaked a blocking-pool
-/// thread and a zombie per heartbeat tick when `nvidia-smi` wedged on an Xid-faulted GPU.
+/// Most stdout [`run_bounded`] keeps. Output past it is still read, so the child never blocks on
+/// a full pipe, and discarded.
+const RUN_BOUNDED_MAX_OUTPUT: usize = 1 << 20;
+
+/// Spawn `cmd`, drain its stdout while polling `try_wait`, and `kill()` + reap at the deadline,
+/// returning `None`. Never `Command::output()`: it blocks until the child exits, which leaked a
+/// blocking-pool thread and a zombie per heartbeat tick when `nvidia-smi` wedged on an
+/// Xid-faulted GPU. Draining on this thread (non-blocking pipe, no reader thread) keeps the
+/// kill-and-reap exact and means a child that fills the pipe buffer cannot deadlock itself.
 /// `cmd` is a parameter so the mechanism can be tested against `sh`.
 ///
 /// A GPU wedged in an uninterruptible driver wait can still resist `kill()`; the
 /// single-flight guard in [`VramCache`] is what bounds that to ONE thread.
 ///
-/// The crate's one bounded-exec primitive (#407) — the capacity path's `nvidia-smi` fork
+/// The crate's one bounded-exec primitive (#407, #195) — the capacity path's `nvidia-smi` fork
 /// runs on the agent's select-loop thread and reuses it rather than re-implementing it.
 pub(crate) fn run_bounded(
-    cmd: &str,
+    cmd: impl AsRef<std::ffi::OsStr>,
     args: &[&str],
     timeout: Duration,
 ) -> Option<(String, std::process::ExitStatus)> {
+    use std::os::fd::AsRawFd;
     let deadline = Instant::now() + timeout;
     let mut child = Command::new(cmd)
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let mut out = child.stdout.take()?;
+    // SAFETY: fcntl on a pipe fd this function owns; F_GETFL/F_SETFL take and return plain ints.
+    let nonblocking = unsafe {
+        let fd = out.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    };
+    if !nonblocking {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+
+    let mut kept = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    // Reads until the pipe is empty (`WouldBlock`) or closed; true if it read anything.
+    let mut drain = |kept: &mut Vec<u8>| {
+        let mut any = false;
+        // The deadline bounds the loop: a child writing faster than we read must not hold us past it.
+        while Instant::now() < deadline {
+            match out.read(&mut chunk) {
+                Ok(n) if n > 0 => {
+                    any = true;
+                    let room = RUN_BOUNDED_MAX_OUTPUT.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+                _ => break,
+            }
+        }
+        any
+    };
 
     loop {
+        let progressed = drain(&mut kept);
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut stdout);
-                }
-                return Some((stdout, status));
+                drain(&mut kept);
+                return Some((String::from_utf8_lossy(&kept).into_owned(), status));
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -253,7 +290,9 @@ pub(crate) fn run_bounded(
                     let _ = child.wait();
                     return None;
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                if !progressed {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
             Err(_) => return None,
         }
@@ -608,6 +647,75 @@ mod tests {
         let (stdout, status) = result.expect("a fast process should complete normally");
         assert!(status.success());
         assert_eq!(stdout.trim(), "hello");
+    }
+
+    // ---- output is drained while waiting (#195) ----
+
+    #[test]
+    fn run_bounded_returns_output_larger_than_the_pipe_buffer() {
+        // 1 MiB is 16x the default 64 KiB pipe buffer: undrained, the child blocks on write
+        // and run_bounded used to hit the deadline with the output lost.
+        let start = Instant::now();
+        let (stdout, status) = run_bounded(
+            "sh",
+            &["-c", "head -c 1048576 /dev/zero | tr '\\0' x"],
+            Duration::from_secs(10),
+        )
+        .expect("a large-output child that exits must return its output");
+        assert!(status.success());
+        assert_eq!(stdout.len(), 1 << 20);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not wait out the deadline; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_bounded_kills_a_child_that_writes_a_lot_and_then_hangs() {
+        let start = Instant::now();
+        let result = run_bounded(
+            "sh",
+            &["-c", "head -c 1048576 /dev/zero; exec sleep 30"],
+            Duration::from_millis(500),
+        );
+        assert!(result.is_none(), "a hung child yields None");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must return in bounded time; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_bounded_keeps_output_and_status_of_a_failing_child() {
+        let (stdout, status) = run_bounded(
+            "sh",
+            &["-c", "echo partial; exit 3"],
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(stdout.trim(), "partial");
+    }
+
+    #[test]
+    fn run_bounded_returns_empty_output_for_a_silent_child() {
+        let (stdout, status) = run_bounded("true", &[], Duration::from_secs(2)).unwrap();
+        assert!(status.success());
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn run_bounded_keeps_only_the_first_cap_bytes_and_still_lets_the_child_exit() {
+        let (stdout, status) = run_bounded(
+            "sh",
+            &["-c", "head -c 3145728 /dev/zero | tr '\\0' x"],
+            Duration::from_secs(10),
+        )
+        .expect("output past the cap is discarded, not a failure");
+        assert!(status.success());
+        assert_eq!(stdout.len(), RUN_BOUNDED_MAX_OUTPUT);
     }
 
     // ---- VramCache: single-flight + cache invalidation ----
