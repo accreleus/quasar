@@ -574,3 +574,32 @@ fn a_docker_stop_is_read_back_and_repeated_only_while_it_runs() {
     assert!(served);
     assert!(result.is_ok(), "{result:?}");
 }
+
+#[test]
+fn clients_on_a_shared_handle_keep_their_own_admission_and_validation() {
+    let shared = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let silent = dir.path().join("silent.sock");
+    let _listener = UnixListener::bind(&silent).unwrap();
+    let mut config = RuntimeConfig::unix(silent);
+    config.deadline = Duration::from_millis(200);
+    config.max_in_flight = 1;
+    let a = RuntimeClient::with_handle(config.clone(), shared.handle().clone()).unwrap();
+    let b = RuntimeClient::with_handle(config.clone(), shared.handle().clone()).unwrap();
+    let held = a.discover();
+    // `a` is saturated; `b`, on the same runtime, is not.
+    assert_eq!(a.discover().wait().unwrap_err().kind, ErrorKind::Busy);
+    assert_eq!(b.discover().wait().unwrap_err().kind, ErrorKind::Timeout);
+    assert_eq!(held.wait().unwrap_err().kind, ErrorKind::Timeout);
+    config.max_in_flight = 0;
+    assert_eq!(
+        RuntimeClient::with_handle(config, shared.handle().clone())
+            .err()
+            .map(|e| e.kind),
+        Some(ErrorKind::InvalidConfiguration)
+    );
+}
