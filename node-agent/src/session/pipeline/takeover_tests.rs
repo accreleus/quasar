@@ -2072,10 +2072,21 @@ fn browser_host() {
                             host.inbound(SignalMsg::RestartIce { pc: Some(pc) });
                         }
                         if late_answer && pc == PcId::Video {
-                            late = Some(SignalMsg::Answer {
+                            let answer = SignalMsg::Answer {
                                 sdp: last_answer(&host, pc),
                                 pc: Some(pc),
-                            });
+                            };
+                            // Once the new transport has offered. If that offer is out
+                            // already, now: held for the next one, it would land after
+                            // the page had connected.
+                            if super::has_offered(&host.transports.video.webrtc) {
+                                eprintln!(
+                                    "HOST replaying the answer that replaced the video transport"
+                                );
+                                host.inbound(answer);
+                            } else {
+                                late = Some(answer);
+                            }
                         }
                     }
                 }
