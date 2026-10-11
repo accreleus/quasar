@@ -206,7 +206,9 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 			h.writeScanErr(w, err, "could not record scan failure")
 			return
 		}
-		h.log.Info("library: scan reported failure", "scan_id", req.ScanID, "host_id", hostID)
+		// The scan row keeps the agent's text; the log gets only its class (scanfailure.go).
+		h.log.Warn("library: scan reported failure", "scan_id", req.ScanID, "host_id", hostID,
+			"cause", scanFailureClass(req.Error))
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"accepted": true})
 		return
 	}

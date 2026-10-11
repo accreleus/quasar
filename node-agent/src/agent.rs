@@ -1144,7 +1144,7 @@ async fn verify_hardware_boot(settings: crate::session::settings::RuntimeSetting
         if settings.encoder != EncoderChoice::Openh264 {
             return false;
         }
-        let probed = offload_probe(move || probe_host_codecs(&settings)).await;
+        let probed = offload_probe(move || probe_host_codecs(&settings, false)).await;
         return probed.is_some_and(|report| report.codecs.iter().any(|codec| codec == "h264"));
     }
     let inventory = offload_probe(detect_capacity_blocking).await.gpus;
@@ -1205,22 +1205,44 @@ where
     probe(spec).await
 }
 
-/// Is a degraded vulkan codec plan the expected first-boot shape (driver volume still
-/// provisioning, so the Vulkan ICD is invisible to the registry scan) or an image
-/// defect? Pure so it is testable without the module's process-global state;
-/// `volume_current` is true once `nvidia_volume` has adopted a manifest.
-fn vulkan_plan_degradation_is_pending_driver_volume(
+/// Why a vulkan codec plan is degraded, which decides the log line.
+#[derive(Debug, PartialEq, Eq)]
+enum VulkanPlanDegradation {
+    /// NVIDIA host, driver volume still provisioning: the Vulkan ICD is invisible to
+    /// the registry scan and the agent self-restarts when provisioning finishes.
+    PendingDriverVolume,
+    /// No NVIDIA GPU, and an enabled codec has no Vulkan encoder on this host (the GPU
+    /// may not support it, or the image lacks the element): it is not advertised.
+    NoVulkanEncoder,
+    /// No NVIDIA GPU, and an enabled codec is served by the vendor encoder because its
+    /// Vulkan element is missing: possibly an image problem.
+    VendorFallback,
+    /// NVIDIA userspace is present or provisioning failed: an image defect.
+    ImageDefect,
+}
+
+/// Pure so it is testable without the module's process-global state; `volume_current`
+/// is true once `nvidia_volume` has adopted a manifest.
+fn classify_vulkan_plan_degradation(
+    nvidia_host: bool,
+    vendor_fallback: bool,
     volume_current: bool,
     status: &crate::nvidia_volume::Status,
-) -> bool {
-    if volume_current {
-        // Driver userspace is present, so a missing vulkan element is the image's
-        // fault, not a timing artifact.
-        return false;
+) -> VulkanPlanDegradation {
+    if !nvidia_host {
+        return if vendor_fallback {
+            VulkanPlanDegradation::VendorFallback
+        } else {
+            VulkanPlanDegradation::NoVulkanEncoder
+        };
     }
-    // `Failed` means provisioning already gave up: no restart is coming to fix this,
-    // so it earns the operator's attention rather than the quiet first-boot path.
-    !matches!(status, crate::nvidia_volume::Status::Failed(_))
+    // Driver userspace present: a missing vulkan element is the image's fault. `Failed`
+    // means provisioning gave up, so no restart is coming to fix it either.
+    if volume_current || matches!(status, crate::nvidia_volume::Status::Failed(_)) {
+        VulkanPlanDegradation::ImageDefect
+    } else {
+        VulkanPlanDegradation::PendingDriverVolume
+    }
 }
 
 /// Probe the host's codec set and per-codec throughput hint. See [`HostCodecReport`]
@@ -1230,6 +1252,7 @@ fn vulkan_plan_degradation_is_pending_driver_volume(
 /// keeping `hosts.codecs` equal to what sessions actually build.
 fn probe_host_codecs(
     settings: &crate::session::settings::RuntimeSettings,
+    nvidia_host: bool,
 ) -> Option<HostCodecReport> {
     let probe_cfg = SessionConfig::for_assignment_with(settings, StreamParams::default(), None);
     if let Err(e) = crate::session::ensure_gst_init(&probe_cfg) {
@@ -1262,7 +1285,9 @@ fn probe_host_codecs(
         // a mis-built image has to be loud at startup.
         let plan = crate::session::pipeline::describe_codec_plan(knobs);
         if plan.degraded {
-            if vulkan_plan_degradation_is_pending_driver_volume(
+            match classify_vulkan_plan_degradation(
+                nvidia_host,
+                plan.vendor_fallback,
                 crate::nvidia_volume::current().is_some(),
                 &crate::nvidia_volume::status(),
             ) {
@@ -1270,21 +1295,35 @@ fn probe_host_codecs(
                 // agent when it finishes and the second boot re-probes against a
                 // healthy ICD. A distinct token keeps dashboards keyed on
                 // `vulkan-codec-plan-degraded` free of this.
-                info!(
+                VulkanPlanDegradation::PendingDriverVolume => info!(
                     token = "vulkan-codec-plan-pending-driver-volume",
                     "vulkan codec plan: {} — expected on first boot: the NVIDIA driver volume is \
                      still provisioning (or has not started); the agent will self-restart once it \
                      completes and re-probe the codec plan",
                     plan.line
-                );
-            } else {
-                warn!(
+                ),
+                VulkanPlanDegradation::NoVulkanEncoder => info!(
+                    token = "vulkan-codec-plan-no-vulkan-encoder",
+                    "vulkan codec plan: {} — this host has no NVIDIA GPU, and at least one enabled \
+                     codec has no Vulkan encoder here (this GPU may not support it, or the image \
+                     lacks its element); a codec marked unavailable is not advertised",
+                    plan.line
+                ),
+                VulkanPlanDegradation::VendorFallback => warn!(
+                    token = "vulkan-codec-plan-vendor-fallback",
+                    "vulkan codec plan: {} — at least one enabled codec is served by the vendor \
+                     encoder (fallback:) because its Vulkan element is not registered; if this GPU \
+                     should encode it through Vulkan, check the image contract \
+                     (deploy/image-contract.json)",
+                    plan.line
+                ),
+                VulkanPlanDegradation::ImageDefect => warn!(
                     token = "vulkan-codec-plan-degraded",
                     "vulkan codec plan: {} — at least one ENABLED codec is not running on the vulkan \
                      encoder because its element is not registered on this image; check the image \
                      contract (deploy/image-contract.json)",
                     plan.line
-                );
+                ),
             }
         } else {
             info!("vulkan codec plan: {}", plan.line);
@@ -2123,14 +2162,14 @@ async fn connect_and_run(
     let first_settings = sessions.mgr.runtime_settings.clone();
     // Probed once (the gst registry is process-stable) and reused in every capacity
     // re-send below.
+    let nvidia_host = cap.gpus.iter().any(|g| g.vendor == "nvidia");
     let host_codec_report = {
         let settings = first_settings.clone();
-        offload_probe(move || probe_host_codecs(&settings)).await
+        offload_probe(move || probe_host_codecs(&settings, nvidia_host)).await
     };
     // The host readiness check set: advisory only, reported and logged, never gating.
     // Every input is already paid for (the vendor read, the #375 lib32 probe, the
     // codec probe above), so nothing here re-probes or launches a container.
-    let nvidia_host = cap.gpus.iter().any(|g| g.vendor == "nvidia");
     let gpu_present = !cap.gpus.is_empty();
     let readiness_gpus = cap.gpus.clone();
     let readiness = {
@@ -2544,8 +2583,12 @@ async fn connect_and_run(
                             // host whose live encoder cannot produce it, which fails it.
                             if mgr.host_codecs_stale() {
                                 let settings = mgr.runtime_settings.clone();
-                                mgr.host_codec_report =
-                                    offload_probe(move || probe_host_codecs(&settings)).await;
+                                let nvidia_host =
+                                    mgr.gpu_inventory.iter().any(|g| g.vendor == "nvidia");
+                                mgr.host_codec_report = offload_probe(move || {
+                                    probe_host_codecs(&settings, nvidia_host)
+                                })
+                                .await;
                                 mgr.probed_encoder = Some(mgr.runtime_settings.encoder);
                                 info!(
                                     "effective encoder changed by config_update; re-probed codecs: {:?}",
@@ -6432,52 +6475,80 @@ mod tests {
         }
     }
 
-    /// First boot: no volume adopted, provisioning not started or mid-flight. INFO
-    /// under `vulkan-codec-plan-pending-driver-volume`, not WARN.
+    /// NVIDIA first boot: no volume adopted, provisioning not started or mid-flight.
     #[test]
-    fn degraded_plan_is_pending_when_no_volume_adopted_and_not_yet_failed() {
+    fn degraded_plan_is_pending_on_nvidia_when_no_volume_adopted_and_not_yet_failed() {
         use crate::nvidia_volume::Status;
 
-        assert!(vulkan_plan_degradation_is_pending_driver_volume(
-            false,
-            &Status::Idle,
-        ));
-        assert!(vulkan_plan_degradation_is_pending_driver_volume(
-            false,
-            &Status::Provisioning {
-                phase: "downloading".to_string(),
-                percent: Some(42),
-            },
-        ));
+        for fallback in [false, true] {
+            assert_eq!(
+                classify_vulkan_plan_degradation(true, fallback, false, &Status::Idle),
+                VulkanPlanDegradation::PendingDriverVolume
+            );
+            assert_eq!(
+                classify_vulkan_plan_degradation(
+                    true,
+                    fallback,
+                    false,
+                    &Status::Provisioning {
+                        phase: "downloading".to_string(),
+                        percent: Some(42),
+                    },
+                ),
+                VulkanPlanDegradation::PendingDriverVolume
+            );
+        }
     }
 
-    /// Provisioning gave up: no restart is coming, so it stays WARN under the original
-    /// token even though no volume was ever adopted.
+    /// NVIDIA, provisioning gave up (no restart is coming) or a volume is adopted but a
+    /// vulkan element is still missing: an image defect, whatever the recorded status.
     #[test]
-    fn degraded_plan_is_not_pending_once_provisioning_has_failed() {
+    fn degraded_plan_on_nvidia_is_an_image_defect_once_failed_or_adopted() {
         use crate::nvidia_volume::Status;
 
-        assert!(!vulkan_plan_degradation_is_pending_driver_volume(
-            false,
-            &Status::Failed("network unreachable".to_string()),
-        ));
+        assert_eq!(
+            classify_vulkan_plan_degradation(
+                true,
+                false,
+                false,
+                &Status::Failed("network unreachable".to_string())
+            ),
+            VulkanPlanDegradation::ImageDefect
+        );
+        assert_eq!(
+            classify_vulkan_plan_degradation(
+                true,
+                false,
+                true,
+                &Status::Provisioned(nvvol_manifest())
+            ),
+            VulkanPlanDegradation::ImageDefect
+        );
+        assert_eq!(
+            classify_vulkan_plan_degradation(true, false, true, &Status::Idle),
+            VulkanPlanDegradation::ImageDefect
+        );
     }
 
-    /// Volume adopted but a codec's vulkan element still missing: an image defect, not
-    /// first-boot timing. NOT pending, whatever the recorded status.
+    /// #308: no NVIDIA GPU means no driver volume to wait for, whatever its status. A
+    /// codec served by the vendor encoder is the case that may be an image problem.
     #[test]
-    fn degraded_plan_is_not_pending_once_a_volume_is_adopted() {
+    fn degraded_plan_without_nvidia_gpu_is_never_blamed_on_the_driver_volume() {
         use crate::nvidia_volume::Status;
 
-        assert!(!vulkan_plan_degradation_is_pending_driver_volume(
-            true,
-            &Status::Provisioned(nvvol_manifest()),
-        ));
-        // Even a stale/odd status combination — volume presence wins.
-        assert!(!vulkan_plan_degradation_is_pending_driver_volume(
-            true,
-            &Status::Idle,
-        ));
+        for status in [
+            Status::Idle,
+            Status::Failed("network unreachable".to_string()),
+        ] {
+            assert_eq!(
+                classify_vulkan_plan_degradation(false, false, false, &status),
+                VulkanPlanDegradation::NoVulkanEncoder
+            );
+            assert_eq!(
+                classify_vulkan_plan_degradation(false, true, false, &status),
+                VulkanPlanDegradation::VendorFallback
+            );
+        }
     }
 
     /// #531: the defect was a poll that never yielded, so the assertion is on progress.
@@ -6527,7 +6598,7 @@ mod tests {
         assert_offloadable(crate::capacity::prewarm_nvidia_smi_rows);
 
         let settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
-        assert_offloadable(move || probe_host_codecs(&settings));
+        assert_offloadable(move || probe_host_codecs(&settings, false));
 
         let lib32 = String::new();
         assert_offloadable(move || {
