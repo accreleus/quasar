@@ -179,6 +179,79 @@ impl LibraryScanClient {
     }
 }
 
+// ── Failure classes (#534) ──────────────────────────────────────────────────
+
+pub(crate) const CLASS_NO_HOME_ROOT: &str = "home root not configured";
+pub(crate) const CLASS_ROOT_OUTSIDE: &str = "root outside the home root";
+pub(crate) const CLASS_ROOT_NOT_DIR: &str = "root is not a directory";
+pub(crate) const CLASS_TIMED_OUT: &str = "walk timed out";
+pub(crate) const CLASS_UNREADABLE_OTHER: &str = "path unreadable (other)";
+pub(crate) const CLASS_MANIFEST_OVER_CAP: &str = "manifest over the size cap";
+pub(crate) const CLASS_MANIFEST_NOT_UTF8: &str = "manifest not valid UTF-8";
+pub(crate) const CLASS_MANIFEST_UNPARSABLE: &str = "manifest unparsable";
+
+/// The io error kinds the log names; any other is `CLASS_UNREADABLE_OTHER`.
+const UNREADABLE_CLASSES: [(std::io::ErrorKind, &str); 9] = [
+    (
+        std::io::ErrorKind::PermissionDenied,
+        "path unreadable (PermissionDenied)",
+    ),
+    (
+        std::io::ErrorKind::NotADirectory,
+        "path unreadable (NotADirectory)",
+    ),
+    (
+        std::io::ErrorKind::IsADirectory,
+        "path unreadable (IsADirectory)",
+    ),
+    (
+        std::io::ErrorKind::InvalidData,
+        "path unreadable (InvalidData)",
+    ),
+    (
+        std::io::ErrorKind::Interrupted,
+        "path unreadable (Interrupted)",
+    ),
+    (std::io::ErrorKind::TimedOut, "path unreadable (TimedOut)"),
+    (
+        std::io::ErrorKind::ResourceBusy,
+        "path unreadable (ResourceBusy)",
+    ),
+    (
+        std::io::ErrorKind::ReadOnlyFilesystem,
+        "path unreadable (ReadOnlyFilesystem)",
+    ),
+    (
+        std::io::ErrorKind::StorageFull,
+        "path unreadable (StorageFull)",
+    ),
+];
+
+/// Why a scan failed. `message` is what the report carries (and the scan row stores);
+/// `class` is the only part that may reach a log: a fixed label with no path, file name
+/// or appid in it. The control plane re-derives the same label from `message`
+/// (`scanFailureClass`); both are pinned by `testdata/library/scan-failure-classes.json`.
+#[derive(Debug, PartialEq, Eq)]
+struct ScanError {
+    class: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl ScanError {
+    fn new(class: &'static str, message: impl Into<String>) -> Self {
+        ScanError {
+            class,
+            message: message.into(),
+        }
+    }
+}
+
 // ── The walk (spec §7.4) ────────────────────────────────────────────────────
 
 /// Run one scan end to end: validate containment, walk, parse, build the
@@ -192,27 +265,11 @@ fn run_scan(scan: &ScanTask) -> ScanReport {
                 token = "library-scan-failed",
                 "library-scan: scan {} failed: {}",
                 scan.scan_id,
-                redact_scan_error(&e, &scan.root_path)
+                e.class
             );
-            ScanReport::failed(scan.scan_id.clone(), e)
+            ScanReport::failed(scan.scan_id.clone(), e.message)
         }
     }
-}
-
-/// The failure text made safe for a log: paths relative to the scanned root (the
-/// absolute root is not logged) and any Steam appid in a manifest file name
-/// replaced. The report keeps the full text.
-fn redact_scan_error(error: &str, root_path: &str) -> String {
-    let root = root_path.trim_end_matches('/');
-    let relative = if root.is_empty() {
-        error.to_string()
-    } else {
-        error.replace(&format!("{root}/"), "").replace(root, ".")
-    };
-    regex::Regex::new(r"appmanifest_[^/\s]*?\.acf")
-        .expect("static pattern")
-        .replace_all(&relative, "appmanifest_<appid>.acf")
-        .into_owned()
 }
 
 /// `configured_root` is a parameter, not an env read, purely for test
@@ -222,9 +279,12 @@ fn redact_scan_error(error: &str, root_path: &str) -> String {
 fn scan_root_path(
     scan: &ScanTask,
     configured_root: Option<PathBuf>,
-) -> Result<Vec<ManifestEntry>, String> {
+) -> Result<Vec<ManifestEntry>, ScanError> {
     let Some(configured_root) = configured_root else {
-        return Err("agent has no configured home root".to_string());
+        return Err(ScanError::new(
+            CLASS_NO_HOME_ROOT,
+            "agent has no configured home root",
+        ));
     };
     let root_path = PathBuf::from(&scan.root_path);
 
@@ -238,7 +298,10 @@ fn scan_root_path(
             "library-scan: scan {} root_path contains a '..' component — refusing",
             scan.scan_id
         );
-        return Err("root_path outside configured home root".to_string());
+        return Err(ScanError::new(
+            CLASS_ROOT_OUTSIDE,
+            "root_path outside configured home root",
+        ));
     }
     if !home::is_under_root(&configured_root, &root_path) {
         tracing::warn!(
@@ -246,7 +309,10 @@ fn scan_root_path(
             "library-scan: scan {} root_path is outside the configured home root — refusing",
             scan.scan_id
         );
-        return Err("root_path outside configured home root".to_string());
+        return Err(ScanError::new(
+            CLASS_ROOT_OUTSIDE,
+            "root_path outside configured home root",
+        ));
     }
 
     match probe_dir(&root_path) {
@@ -258,7 +324,10 @@ fn scan_root_path(
                 "library-scan: scan {} root_path is not a real directory — refusing",
                 scan.scan_id
             );
-            return Err("root_path is not a real directory".to_string());
+            return Err(ScanError::new(
+                CLASS_ROOT_NOT_DIR,
+                "root_path is not a real directory",
+            ));
         }
     }
 
@@ -317,7 +386,7 @@ fn probe_dir(path: &Path) -> DirProbe {
 /// `Ok(None)` is a refused or absent root (skipped). A metadata error other than
 /// `NotFound` is `Err`: an unreadable ancestor must fail the scan, not make the
 /// library vanish from a report that still lists another one.
-fn resolve_relative_root(root: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
+fn resolve_relative_root(root: &Path, rel: &str) -> Result<Option<PathBuf>, ScanError> {
     let relp = Path::new(rel);
     if relp.is_absolute() || has_traversal(relp) {
         return Ok(None);
@@ -364,7 +433,7 @@ fn walk_and_parse(
     relative_roots: &[String],
     max_entries: usize,
     max_manifest_bytes: u64,
-) -> Result<Vec<ManifestEntry>, String> {
+) -> Result<Vec<ManifestEntry>, ScanError> {
     walk_until(
         root_path,
         relative_roots,
@@ -382,7 +451,7 @@ fn walk_until(
     max_entries: usize,
     max_manifest_bytes: u64,
     deadline: Instant,
-) -> Result<Vec<ManifestEntry>, String> {
+) -> Result<Vec<ManifestEntry>, ScanError> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
 
@@ -436,16 +505,26 @@ fn walk_until(
 
 /// The scan-report `error` for a walk that ran out of time. A shorter list
 /// would read as "the rest was uninstalled", same as an unreadable directory.
-fn timed_out() -> String {
-    format!("library scan timed out after {SCAN_WALK_TIMEOUT:?}")
+fn timed_out() -> ScanError {
+    ScanError::new(
+        CLASS_TIMED_OUT,
+        format!("library scan timed out after {SCAN_WALK_TIMEOUT:?}"),
+    )
 }
 
 /// The scan-report `error` for a failed read. An empty result from an
 /// unreadable library would read as "everything uninstalled" and revoke the
 /// provider entitlements, so only `NotFound` (absent, or removed mid-scan) is
 /// benign — callers skip that and propagate this for everything else.
-fn read_failure(path: &Path, e: &std::io::Error) -> String {
-    format!("reading {} failed: {:?}", path.display(), e.kind())
+fn read_failure(path: &Path, e: &std::io::Error) -> ScanError {
+    let class = UNREADABLE_CLASSES
+        .iter()
+        .find(|(kind, _)| *kind == e.kind())
+        .map_or(CLASS_UNREADABLE_OTHER, |(_, class)| class);
+    ScanError::new(
+        class,
+        format!("reading {} failed: {:?}", path.display(), e.kind()),
+    )
 }
 
 /// One item of a directory listing. `None` is an entry that vanished mid-walk
@@ -453,7 +532,7 @@ fn read_failure(path: &Path, e: &std::io::Error) -> String {
 fn listed(
     dir: &Path,
     item: std::io::Result<std::fs::DirEntry>,
-) -> Result<Option<std::fs::DirEntry>, String> {
+) -> Result<Option<std::fs::DirEntry>, ScanError> {
     match item {
         Ok(e) => Ok(Some(e)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -478,7 +557,7 @@ fn find_steamapps_dirs(
     max_depth: u32,
     deadline: Instant,
     found: &mut Vec<PathBuf>,
-) -> Result<(), String> {
+) -> Result<(), ScanError> {
     if depth > max_depth {
         return Ok(());
     }
@@ -520,8 +599,8 @@ fn find_steamapps_dirs(
 /// game's manifest, so omitting it would read as "uninstalled" and revoke the
 /// entitlement. A parsed appid that fails validation after trimming is different:
 /// the control plane rejects the same values, so it was never ingested and is safe to skip.
-fn unusable_manifest(path: &Path, reason: &str) -> String {
-    format!("manifest {} {reason}", path.display())
+fn unusable_manifest(path: &Path, class: &'static str, reason: &str) -> ScanError {
+    ScanError::new(class, format!("manifest {} {reason}", path.display()))
 }
 
 /// Glob `appmanifest_*.acf` directly inside `dir` (Steam never nests them
@@ -542,7 +621,7 @@ fn collect_manifests(
     max_entries: usize,
     max_manifest_bytes: u64,
     deadline: Instant,
-) -> Result<(), String> {
+) -> Result<(), ScanError> {
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -583,6 +662,7 @@ fn collect_manifests(
         if meta.len() > max_manifest_bytes {
             return Err(unusable_manifest(
                 &path,
+                CLASS_MANIFEST_OVER_CAP,
                 &format!(
                     "is {} bytes, over the {max_manifest_bytes} byte cap",
                     meta.len()
@@ -595,7 +675,11 @@ fn collect_manifests(
             Err(e) => return Err(read_failure(&path, &e)),
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
-            return Err(unusable_manifest(&path, "is not valid UTF-8"));
+            return Err(unusable_manifest(
+                &path,
+                CLASS_MANIFEST_NOT_UTF8,
+                "is not valid UTF-8",
+            ));
         };
         match parse_acf(text) {
             Ok(parsed) => {
@@ -615,6 +699,7 @@ fn collect_manifests(
             Err(AcfParseError::Malformed) => {
                 return Err(unusable_manifest(
                     &path,
+                    CLASS_MANIFEST_UNPARSABLE,
                     "failed to parse (malformed or incomplete)",
                 ));
             }
@@ -1031,7 +1116,7 @@ mod tests {
         let configured_root = Some(PathBuf::from("/mnt/user/appdata/quasar/homes"));
         let result = scan_root_path(&scan, configured_root);
         let err = result.expect_err("a root_path outside the configured root must be refused");
-        assert!(!err.is_empty());
+        assert!(!err.message.is_empty());
     }
 
     /// The positive case, proving the refusal above tests containment and not
@@ -1217,7 +1302,7 @@ mod tests {
         bad_name: &str,
         bad: &[u8],
         max_manifest_bytes: u64,
-    ) -> Result<Vec<ManifestEntry>, String> {
+    ) -> Result<Vec<ManifestEntry>, ScanError> {
         let dir = tempfile::tempdir().unwrap();
         let steamapps = dir.path().join("steamapps");
         fs::create_dir_all(&steamapps).unwrap();
@@ -1238,8 +1323,8 @@ mod tests {
         // The good manifest is ~140 bytes; the padded one ~2000+.
         let err = scan_with_bad_manifest("appmanifest_222222.acf", content.as_bytes(), 300)
             .expect_err("an oversized manifest must fail the scan, not shorten it");
-        assert!(err.contains("appmanifest_222222.acf"), "{err}");
-        assert!(err.contains("byte cap"), "{err}");
+        assert!(err.message.contains("appmanifest_222222.acf"), "{err}");
+        assert!(err.message.contains("byte cap"), "{err}");
     }
 
     #[test]
@@ -1251,14 +1336,14 @@ mod tests {
             1_048_576,
         )
         .expect_err("a truncated manifest must fail the scan");
-        assert!(err.contains("appmanifest_222222.acf"), "{err}");
-        assert!(err.contains("malformed or incomplete"), "{err}");
+        assert!(err.message.contains("appmanifest_222222.acf"), "{err}");
+        assert!(err.message.contains("malformed or incomplete"), "{err}");
     }
 
     #[test]
     fn empty_manifest_fails_the_scan() {
         let err = scan_with_bad_manifest("appmanifest_222222.acf", b"", 1_048_576).unwrap_err();
-        assert!(err.contains("appmanifest_222222.acf"), "{err}");
+        assert!(err.message.contains("appmanifest_222222.acf"), "{err}");
     }
 
     #[test]
@@ -1266,8 +1351,8 @@ mod tests {
         let mut bad = synth_manifest("222222").into_bytes();
         bad.extend_from_slice(&[0xff, 0xfe]);
         let err = scan_with_bad_manifest("appmanifest_222222.acf", &bad, 1_048_576).unwrap_err();
-        assert!(err.contains("appmanifest_222222.acf"), "{err}");
-        assert!(err.contains("UTF-8"), "{err}");
+        assert!(err.message.contains("appmanifest_222222.acf"), "{err}");
+        assert!(err.message.contains("UTF-8"), "{err}");
     }
 
     #[test]
@@ -1445,11 +1530,11 @@ mod tests {
             .expect_err("an unreadable steamapps must not look like an empty library");
         fs::set_permissions(&steamapps, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            err.contains("steamapps"),
+            err.message.contains("steamapps"),
             "error names the directory: {err}"
         );
         assert!(
-            err.contains("PermissionDenied"),
+            err.message.contains("PermissionDenied"),
             "error names the kind: {err}"
         );
     }
@@ -1478,8 +1563,11 @@ mod tests {
         let result = walk_and_parse(dir.path(), &[], 512, 1_048_576);
         fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
         let err = result.expect_err("a hidden library must fail the scan, not shrink the report");
-        assert!(err.contains("hidden"), "error names the directory: {err}");
-        assert!(err.contains("PermissionDenied"), "{err}");
+        assert!(
+            err.message.contains("hidden"),
+            "error names the directory: {err}"
+        );
+        assert!(err.message.contains("PermissionDenied"), "{err}");
     }
 
     fn far_deadline() -> Instant {
@@ -1502,7 +1590,7 @@ mod tests {
             Instant::now(),
         )
         .unwrap_err();
-        assert!(err.contains("timed out"), "{err}");
+        assert!(err.message.contains("timed out"), "{err}");
     }
 
     #[test]
@@ -1519,7 +1607,7 @@ mod tests {
         // `walk_until` needs the deadline to pass mid-walk, which is not testable
         // without sleeping.)
         let err = walk_until(dir.path(), &[], 512, 1_048_576, Instant::now()).unwrap_err();
-        assert!(err.contains("timed out"), "{err}");
+        assert!(err.message.contains("timed out"), "{err}");
 
         // A deadline in the future is an ordinary success.
         let ok = walk_until(
@@ -1566,7 +1654,7 @@ mod tests {
         fs::set_permissions(&manifest, fs::Permissions::from_mode(0o000)).unwrap();
 
         let err = walk_and_parse(dir.path(), &[], 512, 1_048_576).unwrap_err();
-        assert!(err.contains("appmanifest_888888.acf"), "{err}");
+        assert!(err.message.contains("appmanifest_888888.acf"), "{err}");
     }
 
     #[test]
@@ -1598,73 +1686,137 @@ mod tests {
         fs::set_permissions(&share, fs::Permissions::from_mode(0o755)).unwrap();
         let err =
             result.expect_err("a library hidden by an unreadable ancestor must fail the scan");
-        assert!(err.contains("PermissionDenied"), "{err}");
+        assert!(err.message.contains("PermissionDenied"), "{err}");
     }
 
-    // ── Failure log redaction (#534) ────────────────────────────────────────
+    // ── Failure classes (#534) ──────────────────────────────────────────────
 
-    const ROOT: &str = "/mnt/user/appdata/quasar/homes/some-opaque-id";
-
-    #[test]
-    fn redaction_drops_the_root_and_the_appid_of_a_manifest() {
-        let err = format!(
-            "manifest {ROOT}/.local/share/Steam/steamapps/appmanifest_730.acf is not valid UTF-8"
-        );
-        assert_eq!(
-            redact_scan_error(&err, ROOT),
-            "manifest .local/share/Steam/steamapps/appmanifest_<appid>.acf is not valid UTF-8"
-        );
+    fn class_fixture() -> serde_json::Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../testdata/library/scan-failure-classes.json");
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     }
 
+    /// The agent's class set is the control plane's, minus the one only it can say.
     #[test]
-    fn redaction_handles_a_nested_library_and_a_trailing_slash_root() {
-        let err = format!("manifest {ROOT}/games/SteamLibrary/steamapps/appmanifest_1086940.acf failed to parse (malformed or incomplete)");
-        assert_eq!(
-            redact_scan_error(&err, &format!("{ROOT}/")),
-            "manifest games/SteamLibrary/steamapps/appmanifest_<appid>.acf failed to parse (malformed or incomplete)"
-        );
+    fn the_agent_class_set_is_the_shared_fixtures() {
+        let fixture = class_fixture();
+        let mut want: Vec<&str> = fixture["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .filter(|c| *c != "unclassified; see the scan row")
+            .collect();
+        let mut have: Vec<&str> = [
+            CLASS_NO_HOME_ROOT,
+            CLASS_ROOT_OUTSIDE,
+            CLASS_ROOT_NOT_DIR,
+            CLASS_TIMED_OUT,
+            CLASS_UNREADABLE_OTHER,
+            CLASS_MANIFEST_OVER_CAP,
+            CLASS_MANIFEST_NOT_UTF8,
+            CLASS_MANIFEST_UNPARSABLE,
+        ]
+        .into_iter()
+        .chain(UNREADABLE_CLASSES.iter().map(|(_, class)| *class))
+        .collect();
+        want.sort_unstable();
+        have.sort_unstable();
+        assert_eq!(have, want);
     }
 
+    /// Every message shape the agent really produces, with the class it gives it, is a
+    /// `cases` entry the control plane maps to the same class.
     #[test]
-    fn redaction_keeps_a_path_with_no_appid_relative() {
-        let err = format!("reading {ROOT}/games/steamapps failed: PermissionDenied");
-        assert_eq!(
-            redact_scan_error(&err, ROOT),
-            "reading games/steamapps failed: PermissionDenied"
-        );
-        assert_eq!(
-            redact_scan_error(&format!("reading {ROOT} failed: PermissionDenied"), ROOT),
-            "reading . failed: PermissionDenied"
-        );
-    }
-
-    #[test]
-    fn redaction_leaves_an_error_with_no_path_alone() {
-        let err = timed_out();
-        assert_eq!(redact_scan_error(&err, ROOT), err);
-        assert_eq!(
-            redact_scan_error("root_path outside configured home root", ROOT),
-            "root_path outside configured home root"
-        );
-    }
-
-    /// The real walk error, redacted: the report text keeps the absolute path, the log does not.
-    #[test]
-    fn a_damaged_manifest_error_is_redacted_for_the_log_but_not_the_report() {
+    fn real_failures_match_the_shared_fixture() {
+        const HOMES: &str = "/mnt/homes/u1";
+        let fixture = class_fixture();
+        let cases: Vec<(String, String)> = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["message"].as_str().unwrap().to_string(),
+                    c["class"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
         let dir = tempfile::tempdir().unwrap();
-        let steamapps = dir.path().join("steamapps");
-        fs::create_dir_all(&steamapps).unwrap();
-        fs::write(steamapps.join("appmanifest_42.acf"), [0xff, 0xfe]).unwrap();
-        let err = walk_and_parse(dir.path(), &["steamapps".to_string()], 512, 1_048_576)
-            .expect_err("a non-UTF-8 manifest fails the scan");
         let root = dir.path().to_str().unwrap();
-        assert!(
-            err.contains(root) && err.contains("appmanifest_42.acf"),
-            "{err}"
+        let mut seen: Vec<ScanError> = Vec::new();
+
+        let task = |root_path: &str| ScanTask {
+            scan_id: "s".into(),
+            root_path: root_path.into(),
+            relative_roots: vec![],
+            max_entries: 512,
+            max_manifest_bytes: 1_048_576,
+        };
+        seen.push(scan_root_path(&task(root), None).unwrap_err());
+        seen.push(scan_root_path(&task("/elsewhere"), Some(dir.path().to_path_buf())).unwrap_err());
+        fs::write(dir.path().join("file"), "").unwrap();
+        seen.push(
+            scan_root_path(
+                &task(dir.path().join("file").to_str().unwrap()),
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap_err(),
         );
-        assert_eq!(
-            redact_scan_error(&err, root),
-            "manifest steamapps/appmanifest_<appid>.acf is not valid UTF-8"
-        );
+        seen.push(walk_until(dir.path(), &[], 512, 1, Instant::now()).unwrap_err());
+
+        for (name, bytes, cap) in [
+            ("over", &[b'x'; 20][..], 10),
+            ("utf8", &[0xff, 0xfe][..], 1_048_576),
+            ("parse", b"\"AppState\" {", 1_048_576),
+        ] {
+            let steamapps = dir.path().join(name).join("steamapps");
+            write(&steamapps.join("appmanifest_730.acf"), "");
+            fs::write(steamapps.join("appmanifest_730.acf"), bytes).unwrap();
+            seen.push(
+                walk_and_parse(&dir.path().join(name), &["steamapps".into()], 512, cap)
+                    .unwrap_err(),
+            );
+        }
+        for (kind, class) in UNREADABLE_CLASSES {
+            seen.push(read_failure(
+                &Path::new(HOMES).join("steamapps"),
+                &std::io::Error::from(kind),
+            ));
+            assert!(class.contains(&format!("{kind:?}")), "{class}");
+        }
+        seen.push(read_failure(
+            &Path::new(HOMES).join("steamapps/appmanifest_730.acf"),
+            &std::io::Error::from(std::io::ErrorKind::Unsupported),
+        ));
+
+        for err in seen {
+            let message = err.message.replace(root, HOMES);
+            // The tempdir manifests sit one directory deeper than the fixture's.
+            let message = ["over", "utf8", "parse"].iter().fold(message, |m, name| {
+                m.replace(&format!("{HOMES}/{name}/"), &format!("{HOMES}/"))
+            });
+            assert!(
+                cases.contains(&(message.clone(), err.class.to_string())),
+                "no fixture case for ({message:?}, {:?})",
+                err.class
+            );
+        }
+    }
+
+    /// A game directory, a SteamID64 and an appmanifest name the scanner accepts but a
+    /// regex would not are all in the path of a failure; none can reach the class.
+    #[test]
+    fn a_class_carries_nothing_from_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let steamapps = dir
+            .path()
+            .join("games/BaldursGate3_76561198012345678/steamapps");
+        fs::create_dir_all(&steamapps).unwrap();
+        fs::write(steamapps.join("appmanifest_730 backup.acf"), [0xff]).unwrap();
+        let err = walk_and_parse(dir.path(), &[], 512, 1_048_576).unwrap_err();
+        assert!(err.message.contains("BaldursGate3"), "{err}");
+        assert_eq!(err.class, CLASS_MANIFEST_NOT_UTF8);
     }
 }

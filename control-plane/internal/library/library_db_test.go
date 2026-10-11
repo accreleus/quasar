@@ -2197,9 +2197,9 @@ func TestLibraryStatusRecentScans(t *testing.T) {
 	}
 }
 
-// A failed scan's cause is logged relative to the scan root with the manifest appid removed;
-// the scan row keeps the agent's text exactly.
-func TestFailedScanLogsARedactedCauseAndStoresTheFullOne(t *testing.T) {
+// A failed scan's log line carries the failure class only; the scan row keeps the agent's
+// text exactly.
+func TestFailedScanLogsTheClassAndStoresTheFullText(t *testing.T) {
 	pool := testDB(t)
 	f := newFixture(t, pool)
 	var logs bytes.Buffer
@@ -2211,10 +2211,8 @@ func TestFailedScanLogsARedactedCauseAndStoresTheFullOne(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	var root string
-	must(t, pool.QueryRow(context.Background(), `SELECT ref FROM user_homes WHERE user_id::text = $1`, f.user).Scan(&root))
 	scan := f.claimedScan(t, f.user)
-	full := "manifest " + root + "/.local/share/Steam/steamapps/appmanifest_730.acf is not valid UTF-8"
+	full := "manifest /homes/opaque-a/games/BaldursGate3/steamapps/appmanifest_730.acf is not valid UTF-8"
 	resp := agentReq(t, "POST", srv.URL+"/v1/agent/library/scan-report", f.nodeName, f.secret,
 		ScanReport{ScanID: scan, OK: false, Error: full})
 	resp.Body.Close()
@@ -2228,13 +2226,12 @@ func TestFailedScanLogsARedactedCauseAndStoresTheFullOne(t *testing.T) {
 		t.Errorf("stored error = %q, want the agent's text %q", stored, full)
 	}
 	out := logs.String()
-	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "scan reported failure") {
-		t.Errorf("want a WARN scan-failure line, got %q", out)
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, `cause="manifest not valid UTF-8"`) {
+		t.Errorf("want a WARN scan-failure line with the class, got %q", out)
 	}
-	if !strings.Contains(out, `.local/share/Steam/steamapps/appmanifest_<appid>.acf is not valid UTF-8`) {
-		t.Errorf("log lacks the redacted cause: %q", out)
-	}
-	if strings.Contains(out, root) || strings.Contains(out, "appmanifest_730") {
-		t.Errorf("log carries the root or an appid: %q", out)
+	for _, leak := range []string{"homes", "BaldursGate3", "730", "appmanifest"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("log carries %q: %q", leak, out)
+		}
 	}
 }
