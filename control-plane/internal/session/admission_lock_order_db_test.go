@@ -144,13 +144,18 @@ func (g *stmtGate) awaitReached(t *testing.T) {
 	}
 }
 
-func gatedPool(t *testing.T, marker string) (*pgxpool.Pool, *stmtGate) {
+// A deadlockTimeout applies to every connection of the pool. Setting it needs a
+// superuser, which the test database's role is.
+func gatedPool(t *testing.T, marker string, deadlockTimeout ...string) (*pgxpool.Pool, *stmtGate) {
 	t.Helper()
 	g := &stmtGate{marker: marker, reached: make(chan struct{}), release: make(chan struct{})}
 	g.open = sync.OnceFunc(func() { close(g.release) })
 	cfg, err := pgxpool.ParseConfig(os.Getenv("TEST_DATABASE_URL"))
 	must(t, err)
 	cfg.ConnConfig.Tracer = g
+	for _, d := range deadlockTimeout {
+		cfg.ConnConfig.RuntimeParams["deadlock_timeout"] = d
+	}
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	must(t, err)
 	t.Cleanup(pool.Close)
