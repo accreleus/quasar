@@ -28,7 +28,10 @@
 #     pid+random suffix into its OWN instance id so concurrent runs never share
 #     a container name or a port-search starting point.
 #
-# The container is removed on EVERY exit path, signals included.
+# The container is removed on EVERY exit path, signals included — together
+# with its anonymous data volume (#205). A SIGKILLed run bypasses the trap;
+# its orphans (container, volume, network) are swept by the NEXT run, by dead
+# owner pid.
 
 set -euo pipefail
 # shellcheck source=scripts/dx/common.sh
@@ -98,6 +101,20 @@ PG_NET="qpgnet-${TESTDB_INSTANCE}"
 # of this script, and then holds an endpoint that blocks `docker network rm`.
 GO_NAME="qgo-${TESTDB_INSTANCE}"
 
+# The owner identity stamped as the label quasar.testdb.owner on everything
+# this run creates, and the ONLY evidence the orphan sweep below accepts:
+# the pid-namespace id and this shell's own pid ($$ stays the script's
+# long-lived shell even inside subshells). A component that cannot be read
+# stays empty; the sweep refuses anything whose identity is not fully there.
+TESTDB_PIDNS="$(readlink /proc/self/ns/pid 2>/dev/null || true)"
+# The raw output is `pid:[N]` — the wrapper's own colon would collide with
+# the owner value's field separator, so only N is kept: both label fields
+# are numeric and the parse below stays unambiguous.
+TESTDB_PIDNS="${TESTDB_PIDNS#pid:[}"
+TESTDB_PIDNS="${TESTDB_PIDNS%]}"
+TESTDB_PID="$$"
+TESTDB_OWNER="${TESTDB_PIDNS}:${TESTDB_PID}"
+
 # Never printed, never persisted.
 if dx_have openssl; then
   PG_PASS="$(openssl rand -hex 16)"
@@ -108,8 +125,8 @@ fi
 
 # shellcheck disable=SC2329  # invoked by the trap below, not by name
 cleanup() {
-  docker rm -f "$GO_NAME" >/dev/null 2>&1 || true
-  docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  docker rm -fv "$GO_NAME" >/dev/null 2>&1 || true
+  docker rm -fv "$PG_NAME" >/dev/null 2>&1 || true
   docker network rm "$PG_NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM HUP
@@ -117,12 +134,82 @@ trap cleanup EXIT INT TERM HUP
 # A stale container or network from a killed run would hold the name. Only
 # reachable with an operator-pinned QUASAR_INSTANCE, since an unpinned run mixes
 # pid+random into the id, but both names are derived so both are swept.
-docker rm -f "$GO_NAME" >/dev/null 2>&1 || true
-docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+docker rm -fv "$GO_NAME" >/dev/null 2>&1 || true
+docker rm -fv "$PG_NAME" >/dev/null 2>&1 || true
 docker network rm "$PG_NET" >/dev/null 2>&1 || true
+
+# Orphans of a DEAD run (#205): a run killed hard (SIGKILL bypasses the trap
+# above) leaves its Postgres container RUNNING and its data volume behind;
+# the next run removes them here, before they can leak further or block this
+# run's own port search. Ownership is read from each resource's LABEL
+# (quasar.testdb.owner), never from its name: a name is imitable (an
+# operator-pinned instance whose id continues with digits matches another
+# run's per-run shape) and a pid read FROM a name says nothing across pid
+# namespaces — this script also runs inside the dev/devtools containers and
+# CI, whose pid numbers are another namespace's. The rule, in one sentence:
+# a labelled resource is removed only when its label names THIS pid
+# namespace and the pid in it has NO process. A live pid is never grounds
+# for removal, whatever it may look like: a start time read back from
+# /proc is reported relative to the READER's time namespace, so it cannot
+# prove a pid was reused, and its only safe use would be to keep things.
+# The accepted cost: an orphan whose pid number some other long-lived
+# process now occupies is not swept automatically; `make reset` remains the
+# manual sweeper for that — and, like the unlabelled orphan (one from
+# before this label existed), it is at worst waiting disk, never a running
+# Postgres mistaken for dead.
+
+# testdb_owner_dead <pid> — 0 iff the label's pid has no process. kill -0
+# also fails for a live process this user cannot signal (EPERM), and its
+# error text is locale-dependent, so LC_ALL=C pins the one string we
+# recognise as proof of absence; every other failure means "cannot tell"
+# and keeps the resource. Leaving an orphan behind is the harmless
+# direction; removing a live run's Postgres would not be.
+# shellcheck disable=SC2329  # invoked by the sweep below, not by name
+testdb_owner_dead() {
+  local err
+  err="$(LC_ALL=C kill -0 "$1" 2>&1)" && return 1
+  case "$err" in
+    *"No such process"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# testdb_sweep_ok <label-value> — 0 iff the labelled resource may be removed.
+# Exactly two numeric fields that rebuild the value, and a dead owner. A
+# stray third field (a label from the abandoned start-time format) fails the
+# rebuild and is left alone.
+# shellcheck disable=SC2329  # invoked by the sweep below, not by name
+testdb_sweep_ok() {
+  local owner="$1" ns pid
+  ns="${owner%%:*}"
+  pid="${owner#*:}"
+  case "$ns" in ''|*[!0-9]*) return 1 ;; esac
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "${owner#*:}" ] || return 1
+  [ "$ns:$pid" = "$owner" ] || return 1
+  [ -n "$TESTDB_PIDNS" ] || return 1
+  [ "$ns" = "$TESTDB_PIDNS" ] || return 1
+  testdb_owner_dead "$pid"
+}
+
+# Containers are read before networks, so a dead run's endpoints are gone by
+# the time its network is removed. Each resource's own label is read back
+# and judged on its own; no resource name is ever parsed.
+while read -r ORPHAN_ID; do
+  [ -n "$ORPHAN_ID" ] || continue
+  ORPHAN_OWNER="$(docker inspect --format '{{index .Config.Labels "quasar.testdb.owner"}}' "$ORPHAN_ID" 2>/dev/null || true)"
+  testdb_sweep_ok "$ORPHAN_OWNER" || continue
+  docker rm -fv "$ORPHAN_ID" >/dev/null 2>&1 || true
+done < <(docker ps -aq --filter "label=quasar.testdb.owner" 2>/dev/null || true)
+while read -r ORPHAN_ID; do
+  [ -n "$ORPHAN_ID" ] || continue
+  ORPHAN_OWNER="$(docker inspect --format '{{index .Labels "quasar.testdb.owner"}}' "$ORPHAN_ID" 2>/dev/null || true)"
+  testdb_sweep_ok "$ORPHAN_OWNER" || continue
+  docker network rm "$ORPHAN_ID" >/dev/null 2>&1 || true
+done < <(docker network ls --filter "label=quasar.testdb.owner" --format '{{.ID}}' 2>/dev/null || true)
 # Not `|| true`: a create failure here would surface later as the retry loop's
 # misleading "no free port" verdict.
-if ! docker network create "$PG_NET" >/dev/null 2>&1; then
+if ! docker network create --label "quasar.testdb.owner=$TESTDB_OWNER" "$PG_NET" >/dev/null 2>&1; then
   dx_fail network "could not create the per-run docker network $PG_NET"
   dx_result "$TARGET"
 fi
@@ -143,6 +230,7 @@ while [ "$PG_START_ATTEMPTS" -lt "$PG_START_MAX" ]; do
   }
   if docker run -d --name "$PG_NAME" \
        --network "$PG_NET" \
+       --label "quasar.testdb.owner=$TESTDB_OWNER" \
        -e POSTGRES_PASSWORD="$PG_PASS" \
        -e POSTGRES_USER="$PG_USER" \
        -e POSTGRES_DB="$PG_DB" \
@@ -152,7 +240,7 @@ while [ "$PG_START_ATTEMPTS" -lt "$PG_START_MAX" ]; do
     PG_STARTED=1
     break
   fi
-  docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  docker rm -fv "$PG_NAME" >/dev/null 2>&1 || true
   PORT_HINT=$(( CANDIDATE_PORT + 1 ))
   PG_START_ATTEMPTS=$(( PG_START_ATTEMPTS + 1 ))
 done
@@ -164,11 +252,22 @@ else
   dx_result "$TARGET"
 fi
 
-# Wait for readiness (pg_isready inside the container — no host client needed).
+# Wait for the FINAL server (#270): the official image brings Postgres up
+# twice — a temporary server for its init steps, listening on the Unix socket
+# only (listen_addresses=''), then the real one — and the socket-based
+# pg_isready answers during BOTH, which is how the first test package could
+# connect in the switch-over window and get "connection reset by peer".
+# Probing over TCP (-h 127.0.0.1; the init server accepts no TCP connection)
+# can only succeed once the final server listens, and requiring two
+# consecutive successes ensures the gate does not straddle the restart.
 ready=0
+ready_streak=0
 for _ in $(seq 1 60); do
-  if docker exec "$PG_NAME" pg_isready -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
-    ready=1; break
+  if docker exec "$PG_NAME" pg_isready -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
+    ready_streak=$(( ready_streak + 1 ))
+    if [ "$ready_streak" -ge 2 ]; then ready=1; break; fi
+  else
+    ready_streak=0
   fi
   sleep 1
 done
@@ -209,6 +308,7 @@ else
   testdb_rc=0
   docker run --rm --name "$GO_NAME" \
     --network "$PG_NET" \
+    --label "quasar.testdb.owner=$TESTDB_OWNER" \
     -v "$DX_ROOT":/workspace \
     -v quasar-go-mod:/go/pkg/mod \
     -e GOFLAGS=-buildvcs=false \
