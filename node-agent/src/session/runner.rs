@@ -21,7 +21,7 @@ use super::encoder_stall;
 use super::metrics::SessionMetrics;
 use super::pipeline::{RemoteDescriptionApplied, RemoteDescriptionFailure};
 use super::server;
-use super::signaling::SignalMsg;
+use super::signaling::{PcId, SignalMsg};
 use super::source::{AppSource, SessionResources};
 use super::vulkan_fault;
 use super::{pipeline, SessionConfig};
@@ -1061,8 +1061,37 @@ impl AudioPipelineGuard {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn as_ref(&self) -> Option<&gst::Pipeline> {
         self.pipeline.as_ref()
+    }
+
+    /// #304: the audio pipeline is set PLAYING on its own, so neither it nor the encode
+    /// pipeline blocks the other's state transition.
+    ///
+    /// Never force the session's shared clock here (#351): the pipeline must run on the
+    /// capture's own clock. Slaved to the SystemClock, the monitor's sample count drifts
+    /// ahead of it (~80 ppm measured), audiobasesrc's skew slaving only corrects a capture
+    /// that runs slow, and webrtcbin's internal `clocksync sync=true` then holds each
+    /// buffer until its timestamp. After ~40 min that wait passes the 200 ms capture ring
+    /// buffer and the capture drops ~200 ms of every ~270 ms. Nothing needs the shared
+    /// clock: this PC is not lip-synced to video (#304).
+    pub(crate) fn play(&self) {
+        let Some(audio_pipe) = &self.pipeline else {
+            return;
+        };
+        if let Err(e) = audio_pipe.set_state(gst::State::Playing) {
+            tracing::warn!(
+                token = "audio-pipeline-play-failed",
+                "audio pipeline set PLAYING failed: {e:#} (audio disabled)"
+            );
+        } else {
+            let clock = audio_pipe
+                .clock()
+                .map(|c| c.name().to_string())
+                .unwrap_or_else(|| "none yet".into());
+            tracing::info!("audio pipeline PLAYING (separate from encode, clock {clock})");
+        }
     }
 
     /// Explicit NULL, idempotent: a second call (and the subsequent Drop) does nothing.
@@ -1079,6 +1108,104 @@ impl AudioPipelineGuard {
 impl Drop for AudioPipelineGuard {
     fn drop(&mut self) {
         self.finish();
+    }
+}
+
+/// The session's WebRTC transports. Each is replaced, under the running encoder, when a
+/// peer other than the one it negotiated with answers on it (#535).
+pub(crate) struct SessionTransports {
+    slot: pipeline::TransportSlot,
+    pub(crate) video: pipeline::VideoTransport,
+    pub(crate) audio_webrtc: Option<gst::Element>,
+    pub(crate) audio_pipeline: AudioPipelineGuard,
+    /// Per PC (video, audio): replaced, and that offer not answered yet.
+    unanswered: [bool; 2],
+}
+
+impl SessionTransports {
+    pub(crate) fn new(
+        slot: pipeline::TransportSlot,
+        video: pipeline::VideoTransport,
+        audio_webrtc: Option<gst::Element>,
+        audio_pipeline: Option<gst::Pipeline>,
+    ) -> Self {
+        Self {
+            slot,
+            video,
+            audio_webrtc,
+            // #408: owned by a Drop-to-NULL guard from the moment the pipeline exists.
+            audio_pipeline: AudioPipelineGuard::new(audio_pipeline),
+            unanswered: [false; 2],
+        }
+    }
+
+    /// Apply one inbound signaling message as the offerer. An answer from a new peer
+    /// replaces that PC's transport instead, and the new transport offers: `Ok(Some(pc))`.
+    /// `Err` only when the video transport could not be replaced, which leaves the
+    /// session nothing to stream on.
+    pub(crate) fn inbound(
+        &mut self,
+        msg: SignalMsg,
+        out_tx: &pipeline::OutTx,
+        srd_fail_tx: Option<&pipeline::SrdFailTx>,
+        srd_ok_tx: Option<&pipeline::SrdOkTx>,
+    ) -> anyhow::Result<Option<PcId>> {
+        let pc = match &msg {
+            SignalMsg::Answer { pc, .. } | SignalMsg::Ice { pc, .. } => pc.unwrap_or_default(),
+            _ => PcId::Video,
+        };
+        let target = match pc {
+            PcId::Video => Some(&self.video.webrtc),
+            PcId::Audio => self.audio_webrtc.as_ref(),
+        };
+        let verdict = server::classify_inbound(&msg, &mut self.unanswered[pc as usize], |sdp| {
+            target.is_some_and(|t| pipeline::answer_is_from_new_peer(t, sdp))
+        });
+        match verdict {
+            server::Inbound::Stale => return Ok(None),
+            server::Inbound::NewPeer(pc) => {
+                tracing::info!(
+                    token = "transport-replaced",
+                    "{pc} PC: the answer is from a peer this transport has not negotiated \
+                     with — replacing the transport"
+                );
+                match pc {
+                    PcId::Video => self.slot.replace_video(&mut self.video)?,
+                    PcId::Audio => {
+                        self.audio_pipeline.finish();
+                        let (webrtc, pipe) = self.slot.build_audio().unwrap_or_else(|e| {
+                            // Audio must never kill video.
+                            tracing::warn!(
+                                token = "audio-transport-replace-failed",
+                                "audio transport for the new peer failed to build: {e:#} \
+                                 (this peer gets no audio)"
+                            );
+                            (None, None)
+                        });
+                        self.audio_webrtc = webrtc;
+                        self.audio_pipeline = AudioPipelineGuard::new(pipe);
+                        self.audio_pipeline.play();
+                    }
+                }
+                self.unanswered[pc as usize] = true;
+                return Ok(Some(pc));
+            }
+            server::Inbound::Apply => {}
+        }
+        if let Err(e) = server::apply_inbound_as_offerer(
+            msg,
+            &self.video.webrtc,
+            self.audio_webrtc.as_ref(),
+            out_tx,
+            srd_fail_tx,
+            srd_ok_tx,
+        ) {
+            tracing::warn!(
+                token = "signaling-apply-failed",
+                "apply inbound signaling: {e:#}"
+            );
+        }
+        Ok(None)
     }
 }
 
@@ -1114,6 +1241,13 @@ fn idle_reap_reason(
         Some(d) if d >= window => Some("idle: WebRTC transport lost"),
         _ => None,
     }
+}
+
+/// Was `msg` posted by an element that is still in `pipeline`?
+fn posted_by_live_graph(msg: &gst::Message, pipeline: &gst::Pipeline) -> bool {
+    msg.src().is_none_or(|src| {
+        src == pipeline.upcast_ref::<gst::Object>() || src.has_as_ancestor(pipeline)
+    })
 }
 
 /// Whether an ICE connection state counts as "transport established".
@@ -1582,8 +1716,8 @@ pub fn run_blocking(
     };
     let pipeline::EncodePipeline {
         pipeline: encode_pipe,
-        webrtc,
-        data_channel: _dc,
+        video,
+        transport,
         interpipesrc,
         audio_webrtc,
         audio_pipeline: audio_pipeline_raw,
@@ -1608,9 +1742,9 @@ pub fn run_blocking(
              down every session on the host. Opt out with QUASAR_NVENC_DEFER_TEARDOWN=0"
         );
     }
-    // #408: take ownership in a Drop-to-NULL guard the moment the pipeline exists, so
-    // every early encode-setup failure return below is covered.
-    let audio_pipeline = AudioPipelineGuard::new(audio_pipeline_raw);
+    // #408: the audio pipeline is in its Drop-to-NULL guard from here, so every early
+    // encode-setup failure return below is covered.
+    let mut transports = SessionTransports::new(transport, video, audio_webrtc, audio_pipeline_raw);
     // Same clock + base as the source pipeline(s) so interpipesrc's pass-through PTS land
     // in this pipeline's running-time (#68).
     encode_pipe.set_start_time(None::<gst::ClockTime>);
@@ -1702,30 +1836,9 @@ pub fn run_blocking(
             );
         }
     }
-    // #304: the audio pipeline is a separate gst::Pipeline, set PLAYING independently so
-    // neither blocks the other's state transition. Teardown is the idempotent
-    // `audio_pipeline.finish()`, the one mechanism no exit path can skip.
-    if let Some(audio_pipe) = audio_pipeline.as_ref() {
-        // Never force the session's shared clock here (#351): the pipeline must run on
-        // the capture's own clock. Slaved to the SystemClock, the monitor's sample count
-        // drifts ahead of it (~80 ppm measured), audiobasesrc's skew slaving only corrects
-        // a capture that runs slow, and webrtcbin's internal `clocksync sync=true` then
-        // holds each buffer until its timestamp. After ~40 min that wait passes the 200 ms
-        // capture ring buffer and the capture drops ~200 ms of every ~270 ms. Nothing
-        // needs the shared clock: this PC is not lip-synced to video (#304).
-        if let Err(e) = audio_pipe.set_state(gst::State::Playing) {
-            tracing::warn!(
-                token = "audio-pipeline-play-failed",
-                "audio pipeline set PLAYING failed: {e:#} (audio disabled)"
-            );
-        } else {
-            let clock = audio_pipe
-                .clock()
-                .map(|c| c.name().to_string())
-                .unwrap_or_else(|| "none yet".into());
-            tracing::info!("audio pipeline PLAYING (separate from encode, clock {clock})");
-        }
-    }
+    // Teardown is the idempotent `audio_pipeline.finish()`, the one mechanism no exit
+    // path can skip.
+    transports.audio_pipeline.play();
     let Some(encode_bus) = encode_pipe.bus() else {
         tracing::error!(
             token = "runner-encode-bus-missing",
@@ -1734,7 +1847,7 @@ pub fn run_blocking(
         emit(SessionEvent::Failed("encode pipeline has no bus".into()));
         current_source.teardown();
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-        audio_pipeline.finish();
+        transports.audio_pipeline.finish();
         return;
     };
 
@@ -1750,6 +1863,8 @@ pub fn run_blocking(
     let mut running_since: Option<Instant> = None;
     let mut ever_connected = false;
     let mut unhealthy_since: Option<Instant> = None;
+    // When the video transport was last replaced for a new peer (#535).
+    let mut transport_since: Option<Instant> = None;
     // One debounce tracker for the session's lifetime, so a repeat marker across separate
     // bus-pump iterations is what trips the fail-closed path.
     let mut renderer_degrade_tracker = RendererDegradeTracker::default();
@@ -1793,7 +1908,7 @@ pub fn run_blocking(
             emit(SessionEvent::Stopping);
             current_source.teardown(); // remove the app container before media
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-            audio_pipeline.finish();
+            transports.audio_pipeline.finish();
             emit(SessionEvent::Stopped {
                 bytes_used: compute_bytes_used(&cfg),
                 detail: None,
@@ -2005,18 +2120,28 @@ pub fn run_blocking(
 
         // Inbound relay signaling (answer/ICE from the browser).
         while let Ok(msg) = sig_in_rx.try_recv() {
-            if let Err(e) = server::apply_inbound_as_offerer(
-                msg,
-                &webrtc,
-                audio_webrtc.as_ref(),
-                &sig_tx,
-                Some(&srd_fail_tx),
-                Some(&srd_ok_tx),
-            ) {
-                tracing::warn!(
-                    token = "signaling-apply-failed",
-                    "apply inbound signaling: {e:#}"
-                );
+            match transports.inbound(msg, &sig_tx, Some(&srd_fail_tx), Some(&srd_ok_tx)) {
+                Ok(None) => {}
+                // The idle reap watches the new video transport, which has yet to connect.
+                Ok(Some(PcId::Video)) => {
+                    ever_connected = false;
+                    unhealthy_since = None;
+                    transport_since = Some(Instant::now());
+                }
+                Ok(Some(PcId::Audio)) => {}
+                Err(e) => {
+                    let reason = format!("replace video transport for a new peer: {e:#}");
+                    tracing::error!(
+                        token = "runner-transport-replace-failed",
+                        reason = %reason,
+                        "video transport replacement failed"
+                    );
+                    emit(SessionEvent::Failed(reason));
+                    current_source.teardown();
+                    super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
+                    transports.audio_pipeline.finish();
+                    return;
+                }
             }
         }
 
@@ -2116,7 +2241,7 @@ pub fn run_blocking(
             emit(SessionEvent::Failed(reason));
             current_source.teardown();
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-            audio_pipeline.finish();
+            transports.audio_pipeline.finish();
             return;
         }
 
@@ -2193,7 +2318,7 @@ pub fn run_blocking(
                     emit(SessionEvent::Failed(failure.reason));
                     current_source.teardown();
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                    audio_pipeline.finish();
+                    transports.audio_pipeline.finish();
                     return;
                 }
                 Err(failure) => emit(SessionEvent::SwapRolledBack(failure.reason)),
@@ -2202,7 +2327,9 @@ pub fn run_blocking(
 
         // Idle reap: watch the live transport on the encode webrtcbin.
         if let Some(since) = running_since {
-            let ice = webrtc
+            let ice = transports
+                .video
+                .webrtc
                 .property::<gstreamer_webrtc::WebRTCICEConnectionState>("ice-connection-state");
             if ice_is_connected(ice) {
                 ever_connected = true;
@@ -2216,7 +2343,11 @@ pub fn run_blocking(
             // #484: charge the never-connected window from the app-presented instant, not
             // the first offer — a cold app boot is 30–50 s. Appless sessions keep the old
             // clock.
-            let running_for = app_presented_at.unwrap_or(since).elapsed();
+            // A replaced transport gets the whole window to connect, from its own start.
+            let running_for = app_presented_at
+                .unwrap_or(since)
+                .max(transport_since.unwrap_or(since))
+                .elapsed();
             let booting = app_boot_started_at.is_some() && app_presented_at.is_none();
             if let Some(reason) = idle_reap_reason(
                 reap_window,
@@ -2236,7 +2367,7 @@ pub fn run_blocking(
                 emit(SessionEvent::Stopping);
                 current_source.teardown();
                 super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                audio_pipeline.finish();
+                transports.audio_pipeline.finish();
                 tracing::error!(
                     token = "runner-idle-reap-failed",
                     reason = %reason,
@@ -2275,7 +2406,7 @@ pub fn run_blocking(
                         emit(SessionEvent::Failed(reason));
                         current_source.teardown();
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                        audio_pipeline.finish();
+                        transports.audio_pipeline.finish();
                         return;
                     }
                     gst::MessageView::Warning(warn) => {
@@ -2290,7 +2421,7 @@ pub fn run_blocking(
                             emit(SessionEvent::Failed(reason));
                             current_source.teardown();
                             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                            audio_pipeline.finish();
+                            transports.audio_pipeline.finish();
                             return;
                         }
                     }
@@ -2312,7 +2443,7 @@ pub fn run_blocking(
             )));
             current_source.teardown();
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-            audio_pipeline.finish();
+            transports.audio_pipeline.finish();
             return;
         }
 
@@ -2363,7 +2494,7 @@ pub fn run_blocking(
                     });
                     current_source.teardown();
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                    audio_pipeline.finish();
+                    transports.audio_pipeline.finish();
                     return;
                 } else if app_boot_last_wait_log.elapsed() >= APP_BOOT_WAIT_LOG_INTERVAL {
                     app_boot_last_wait_log = Instant::now();
@@ -2425,7 +2556,7 @@ pub fn run_blocking(
                         emit(app_exit_event(status, presented, app_log_tail));
                         current_source.teardown();
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                        audio_pipeline.finish();
+                        transports.audio_pipeline.finish();
                         return;
                     }
                     AppExitPolicy::Fail => {
@@ -2438,7 +2569,7 @@ pub fn run_blocking(
                         emit(app_exit_event(status, presented, app_log_tail));
                         current_source.teardown();
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                        audio_pipeline.finish();
+                        transports.audio_pipeline.finish();
                         return;
                     }
                 }
@@ -2448,6 +2579,15 @@ pub fn run_blocking(
         // Pump the encode bus (the transport); this paces the loop at ~POLL ms.
         if let Some(m) = encode_bus.timed_pop(gst::ClockTime::from_mseconds(POLL)) {
             match m.view() {
+                // A transport retired for a new peer may have posted before it left the
+                // pipeline. Its SCTP association dying is not this session's peer leaving.
+                gst::MessageView::Error(err) if !posted_by_live_graph(&m, &encode_pipe) => {
+                    tracing::debug!(
+                        "ignoring an error from a retired transport: {} ({:?})",
+                        err.error(),
+                        err.debug()
+                    );
+                }
                 gst::MessageView::Error(err) => {
                     // The SCTP signature lives in the DEBUG text, not the GError message
                     // (SCTP_ASSOCIATION_SIGNATURES): classify on both, concatenated.
@@ -2468,7 +2608,7 @@ pub fn run_blocking(
                         emit(SessionEvent::Stopping);
                         current_source.teardown();
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                        audio_pipeline.finish();
+                        transports.audio_pipeline.finish();
                         emit(SessionEvent::Stopped {
                             bytes_used: compute_bytes_used(&cfg),
                             detail: None,
@@ -2508,7 +2648,7 @@ pub fn run_blocking(
                         emit(SessionEvent::Stopping);
                         current_source.teardown();
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                        audio_pipeline.finish();
+                        transports.audio_pipeline.finish();
                         emit(SessionEvent::Stopped {
                             bytes_used: compute_bytes_used(&cfg),
                             detail: Some(PEER_DISCONNECT_DETAIL),
@@ -2533,7 +2673,7 @@ pub fn run_blocking(
                     emit(SessionEvent::Failed(reason));
                     current_source.teardown();
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                    audio_pipeline.finish();
+                    transports.audio_pipeline.finish();
                     return;
                 }
                 // `encoder.stall` reason discriminant only; this arm changes no behaviour.
@@ -2548,7 +2688,7 @@ pub fn run_blocking(
                 gst::MessageView::Eos(_) => {
                     current_source.teardown();
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                    audio_pipeline.finish();
+                    transports.audio_pipeline.finish();
                     emit(SessionEvent::Stopped {
                         bytes_used: compute_bytes_used(&cfg),
                         detail: None,
@@ -3982,6 +4122,27 @@ mod tests {
 
     /// A stand-in for the #304 audio pipeline, brought to READY as
     /// `build_encode_pipeline` leaves it.
+    /// #535: an error a retired transport posted before it left the pipeline is not the
+    /// session's. Reading it as one ends the session the new peer just took over.
+    #[test]
+    fn a_message_from_an_element_no_longer_in_the_pipeline_is_not_the_sessions() {
+        use gstreamer::prelude::*;
+        gstreamer::init().unwrap();
+        let pipeline = gstreamer::Pipeline::new();
+        let bin = gstreamer::Bin::new();
+        let inner = gstreamer::ElementFactory::make("identity").build().unwrap();
+        bin.add(&inner).unwrap();
+        pipeline.add(&bin).unwrap();
+        let error = |src: &gstreamer::Element| {
+            gstreamer::message::Error::builder(gstreamer::CoreError::Failed, "x")
+                .src(src)
+                .build()
+        };
+        assert!(super::posted_by_live_graph(&error(&inner), &pipeline));
+        pipeline.remove(&bin).unwrap();
+        assert!(!super::posted_by_live_graph(&error(&inner), &pipeline));
+    }
+
     fn ready_audio_pipeline() -> gstreamer::Pipeline {
         gstreamer::init().unwrap();
         let pipe = gstreamer::Pipeline::new();

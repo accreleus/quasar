@@ -360,6 +360,41 @@ fn pc_name(pc: Option<PcId>) -> &'static str {
     }
 }
 
+/// What the offerer does with one inbound message (#535).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Inbound {
+    Apply,
+    /// An answer from a peer this PC's transport has not negotiated with.
+    NewPeer(PcId),
+    /// A candidate from the negotiation a replaced transport's offer supersedes.
+    Stale,
+}
+
+/// Classify `msg` for one PC. `unanswered`: its transport was just replaced and that
+/// offer is still out, so the next answer is the one to it and candidates before that
+/// answer belong to the old transport. `new_peer` reads the answer against what the
+/// transport negotiated.
+///
+/// Known bound: a client that answered two offers from the old transport has its second
+/// answer applied to the new one. Its ICE then fails and its own `restart_ice` recovers.
+pub(crate) fn classify_inbound(
+    msg: &SignalMsg,
+    unanswered: &mut bool,
+    new_peer: impl FnOnce(&str) -> bool,
+) -> Inbound {
+    match msg {
+        SignalMsg::Answer { sdp, pc } => {
+            if std::mem::take(unanswered) || !new_peer(sdp) {
+                Inbound::Apply
+            } else {
+                Inbound::NewPeer(pc.unwrap_or_default())
+            }
+        }
+        SignalMsg::Ice { .. } if *unanswered => Inbound::Stale,
+        _ => Inbound::Apply,
+    }
+}
+
 /// Apply one inbound signaling message to the correct `webrtcbin` as the
 /// offerer: accept an answer, add an ICE candidate, or log diagnostics. Used by
 /// the P1-7 relay path (runner.rs drains inbound relay messages and calls this).
@@ -500,6 +535,83 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod inbound_tests {
+    //! #535: when an answer means "new peer", and which candidates are stale after it.
+
+    use super::{classify_inbound, Inbound};
+    use crate::session::signaling::{IceCandidate, PcId, SignalMsg};
+
+    fn answer(pc: PcId) -> SignalMsg {
+        SignalMsg::Answer {
+            sdp: "v=0".into(),
+            pc: Some(pc),
+        }
+    }
+
+    fn ice() -> SignalMsg {
+        SignalMsg::Ice {
+            candidate: IceCandidate {
+                candidate: "candidate:1 1 UDP 1 192.0.2.1 1 typ host".into(),
+                sdp_mid: None,
+                sdp_m_line_index: Some(0),
+            },
+            pc: None,
+        }
+    }
+
+    #[test]
+    fn an_answer_from_the_negotiated_peer_applies() {
+        let mut unanswered = false;
+        assert_eq!(
+            classify_inbound(&answer(PcId::Video), &mut unanswered, |_| false),
+            Inbound::Apply
+        );
+    }
+
+    #[test]
+    fn an_answer_from_another_peer_asks_for_a_new_transport_on_its_pc() {
+        let mut unanswered = false;
+        assert_eq!(
+            classify_inbound(&answer(PcId::Audio), &mut unanswered, |_| true),
+            Inbound::NewPeer(PcId::Audio)
+        );
+    }
+
+    /// The answer to a replaced transport's offer is never read as a new peer again, and
+    /// it ends the stale window.
+    #[test]
+    fn the_answer_to_a_fresh_transport_applies_and_reopens_candidates() {
+        let mut unanswered = true;
+        assert_eq!(
+            classify_inbound(&ice(), &mut unanswered, |_| unreachable!()),
+            Inbound::Stale
+        );
+        assert_eq!(
+            classify_inbound(&answer(PcId::Video), &mut unanswered, |_| unreachable!()),
+            Inbound::Apply
+        );
+        assert!(!unanswered);
+        assert_eq!(
+            classify_inbound(&ice(), &mut unanswered, |_| unreachable!()),
+            Inbound::Apply
+        );
+    }
+
+    /// `restart_ice` is never a reason to replace: the same peer asks for it in recovery.
+    #[test]
+    fn a_restart_request_always_applies() {
+        let mut unanswered = false;
+        let restart = SignalMsg::RestartIce {
+            pc: Some(PcId::Video),
+        };
+        assert_eq!(
+            classify_inbound(&restart, &mut unanswered, |_| unreachable!()),
+            Inbound::Apply
+        );
+    }
 }
 
 #[cfg(test)]

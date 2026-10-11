@@ -35,15 +35,11 @@ use caps::{caps_profile, raw_video_caps};
 mod codec_chain;
 use codec_chain::{build_bitstream_chain, BitstreamChain};
 mod rtp_ext;
-use rtp_ext::{
-    attach_abs_capture_time_egress_probe, attach_abs_capture_time_probe,
-    attach_abs_capture_time_verification_probe,
-};
+use rtp_ext::{attach_abs_capture_time_probe, attach_abs_capture_time_verification_probe};
 mod audio_branch;
 mod audio_health;
 use audio_branch::add_audio_chain;
 mod mic_branch;
-use mic_branch::add_mic_branch;
 mod probes;
 use probes::{
     attach_bitstream_capture, attach_encode_probes, attach_encoder_pts_trace,
@@ -78,7 +74,6 @@ mod scale_stage;
 use scale_stage::build_scale_stage;
 pub use scale_stage::ScaleStage;
 mod abr_glue;
-use abr_glue::enable_abr;
 // The interface the ABR ladder's resolution rung drives, and the runner's manual
 // `session_display_update` path with it.
 pub(crate) use abr_glue::resolution_lever_with_echo;
@@ -86,14 +81,16 @@ pub use abr_glue::{trigger, EncodeResolutionLever, ResolutionLever};
 mod webrtc;
 pub(crate) use webrtc::restart_ice;
 pub(crate) use webrtc::{
-    apply_remote_description, build_answerer_pipeline, remote_description_failure_reason,
-    RemoteDescriptionApplied, RemoteDescriptionFailure, SrdFailTx, SrdOkTx,
+    answer_is_from_new_peer, apply_remote_description, build_answerer_pipeline,
+    remote_description_failure_reason, RemoteDescriptionApplied, RemoteDescriptionFailure,
+    SrdFailTx, SrdOkTx,
 };
 use webrtc::{
     connect_data_channel_open, connect_ice_candidate, connect_negotiation_needed,
     connect_state_logging, enable_video_fec, enable_video_rtx, make_webrtcbin,
-    set_audio_receive_latency, spawn_fec_controller,
 };
+mod transport;
+pub use transport::{TransportSlot, VideoTransport};
 
 /// Outbound signaling messages produced by GStreamer callback threads, drained
 /// by whatever transport is driving this session (WS server / control relay).
@@ -648,10 +645,10 @@ pub(crate) fn build_scale_stage_for_test(cfg: &SessionConfig) -> Result<ScaleSta
 pub struct EncodePipeline {
     /// The persistent encode pipeline. PLAYING for the whole session, across every swap.
     pub pipeline: gst::Pipeline,
-    /// The video `webrtcbin` (inbound SDP/ICE, the one-offer invariant).
-    pub webrtc: gst::Element,
-    /// The `"input"` DataChannel, held alive for the session.
-    pub data_channel: Option<glib::Object>,
+    /// The video transport (inbound SDP/ICE, the `"input"` DataChannel).
+    pub video: VideoTransport,
+    /// Rebuilds either transport for a new peer.
+    pub transport: TransportSlot,
     /// The `interpipesrc` whose `listen-to` the runner re-points on a swap.
     pub interpipesrc: gst::Element,
     /// The audio `webrtcbin` (its own pipeline — #304).
@@ -707,7 +704,6 @@ pub fn build_encode_pipeline(
     // `resolve_effective_encoder` first), so every arm below keys on it, and
     // `encoder_factory` is the exact element name that resolution found.
     let pipeline = gst::Pipeline::new();
-    let (width, height) = (cfg.stream.width, cfg.stream.height);
     let codec = cfg.stream.codec;
     let effective_profile = resolve_codec_profile(cfg, codec)?;
 
@@ -796,8 +792,6 @@ pub fn build_encode_pipeline(
         .build()
         .context("capsfilter not found")?;
 
-    let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
-
     pipeline.add_many([
         &interpipesrc,
         &queue,
@@ -806,7 +800,6 @@ pub fn build_encode_pipeline(
         &parser,
         &pay,
         &rtp_capsfilter,
-        &webrtc,
     ])?;
     if !gpu_convert.is_empty() {
         pipeline.add_many(gpu_convert.iter())?;
@@ -849,14 +842,10 @@ pub fn build_encode_pipeline(
 
     // Write the abs-capture-time one-byte-header extension (8-byte NTP-64) per RTP
     // packet. Probing `pay`'s src pad means the buffer is already an RTP packet, so the
-    // extension can be appended before the capsfilter.
+    // extension can be appended before the capsfilter. The transport stamps it again at
+    // its egress seam (`TransportSlot::attach_video`).
     let capture_times = attach_abs_capture_time_probe(&pay);
     if !diag_no_obs {
-        attach_abs_capture_time_egress_probe(
-            &webrtc,
-            capture_times,
-            cfg.latency_probe.then(|| session_metrics.clone()),
-        );
         attach_abs_capture_time_verification_probe(&rtp_capsfilter);
     }
 
@@ -897,165 +886,35 @@ pub fn build_encode_pipeline(
         }
     }
 
-    let src_pad = rtp_capsfilter
-        .static_pad("src")
-        .context("rtp capsfilter has no src pad")?;
-    let sink_pad = webrtc
-        .request_pad_simple("sink_%u")
-        .context("webrtcbin refused a sink pad request (video)")?;
-    src_pad
-        .link(&sink_pad)
-        .context("failed to link video into webrtcbin")?;
-    enable_video_rtx(&webrtc);
-    // ULPFEC/RED proactive burst-loss repair, no RTX round-trip. `fixed` negotiates
-    // ulp-red at the static level; `auto` negotiates at 0% and the controller below ramps
-    // on loss. Knobs: QUASAR_FEC_MODE / QUASAR_FEC_PERCENTAGE.
-    let fec_plan = cfg.fec_plan();
-    enable_video_fec(&webrtc, fec_plan.negotiate, fec_plan.initial_pct);
-    if fec_plan.controller_enabled {
-        // Reads the loss signal off the video webrtcbin get-stats on its own poll thread
-        // and writes fec-percentage on each arm/disarm. Clone trace_tx + session_id: both
-        // are moved into connect_state_logging further down.
-        spawn_fec_controller(
-            &webrtc,
-            cfg.fec_controller_config(),
-            Arc::downgrade(&session_metrics),
-            trace_tx.clone(),
-            session_id.clone(),
-        );
-    }
-    // Arm the in-session ABR governor on the send path. Must be wired before the offer so
-    // rtpgccbwe is part of the single negotiated send session. No-op only when rtpgccbwe
-    // is absent or the encoder rejects live writes.
-    //
-    // The resolution lever is built here, not in the runner, because the ladder needs it
-    // at arm time. One `Arc`, two owners: the runner's manual PATCH path and the ladder's
-    // `on_window` closure.
+    // The resolution lever is built here, not in the runner, because the ABR ladder
+    // needs it at arm time. One `Arc`, two owners: the runner's manual PATCH path and the
+    // ladder's `on_window` closure.
     let resolution_lever = resolution_lever_with_echo(scale, encoder.clone(), &session_metrics);
-    enable_abr(
-        &webrtc,
-        &encoder,
-        cfg,
-        session_metrics.clone(),
-        trace_tx.clone(),
-        session_id.clone(),
-        Some(resolution_lever.clone()).filter(|l| l.stage().supported),
-    );
-
-    // Audio: pulsesrc from the session's PulseAudio sidecar (stable across swaps — the
-    // new app connects to the same one). Skipped under QUASAR_AUDIO_DISABLED.
-    //
-    // #304: the audio webrtcbin MUST live in its own gst::Pipeline. Two webrtcbins in one
-    // pipeline never reach PLAYING (the aggregate state transition stalls), and the split
-    // also stops the browser's A/V sync from inflating video playout. The audio pipeline
-    // is returned and set to PLAYING by runner.rs alongside the encode pipeline, sharing
-    // its clock + base time.
-    let (audio_webrtc, audio_pipeline) = if !audio_disabled() {
-        let audio_pipe = gst::Pipeline::new();
-        audio_health::watch_bus(&audio_pipe, &session_id);
-        let audio_tail = add_audio_chain(&audio_pipe, cfg, &session_id)?;
-        let audio_webrtc = make_webrtcbin(cfg.stun.as_deref())
-            .context("failed to create audio webrtcbin (encode pipeline)")?;
-        // #425: tune the mic receive-leg jitter buffer on the AUDIO PC only; the video
-        // webrtcbin is never touched here.
-        set_audio_receive_latency(&audio_webrtc, cfg.mic_jitter_ms);
-        audio_pipe.add(&audio_webrtc)?;
-        let audio_src_pad = audio_tail
+    let transport = TransportSlot {
+        cfg: cfg.clone(),
+        pipeline: pipeline.clone(),
+        tail: rtp_capsfilter
             .static_pad("src")
-            .context("audio rtp capsfilter has no src pad")?;
-        let audio_sink_pad = audio_webrtc
-            .request_pad_simple("sink_%u")
-            .context("audio webrtcbin refused a sink pad request")?;
-        audio_src_pad
-            .link(&audio_sink_pad)
-            .context("failed to link audio into audio webrtcbin")?;
-        // Microphone capture (client → host): a second, recvonly Opus m-line on this same
-        // audio PC, plus the decode bin that plays it into the sidecar's `quasar_mic`
-        // sink. Position is load-bearing: after the send transceiver, so the sendonly
-        // m-line stays m-line 0 and the wire is unchanged for mic-less sessions; and
-        // before READY/negotiation, because the mic m-line must ride the FIRST and only
-        // audio offer (`protocol/signaling.md` §Microphone m-line). Never renegotiated —
-        // the single-offer guard is untouched and mute/unmute is client-local.
-        if cfg.mic_enabled() {
-            add_mic_branch(&audio_pipe, &audio_webrtc, cfg.pulse_server.as_deref())?;
-        }
-        // The audio webrtcbin gets its own negotiation/ICE/state callbacks (PcId::Audio).
-        connect_ice_candidate(&audio_webrtc, out_tx.clone(), PcId::Audio);
-        // Pass devices so release_all fires on audio-PC disconnect too.
-        connect_state_logging(&audio_webrtc, devices.clone(), None, String::new());
-        // There is one `offer created` per PC (video + audio), so a harness asserting
-        // "exactly one offer" must count the VIDEO PC's line, not grep the session. Both
-        // lines carry the session id.
-        connect_negotiation_needed(
-            &audio_webrtc,
-            out_tx.clone(),
-            PcId::Audio,
-            session_id.clone(),
-        );
-        audio_pipe
-            .set_state(gst::State::Ready)
-            .context("audio pipeline failed to reach READY")?;
-        (Some(audio_webrtc), Some(audio_pipe))
-    } else {
-        tracing::info!("stream audio disabled by runtime or session topology — video-only offer");
-        if cfg.mic_enabled() {
-            // The mic m-line rides the audio PC, so no audio PC means no microphone path.
-            // Say so: a mic that silently does nothing is otherwise undiagnosable.
-            tracing::warn!(
-                token = "mic-no-audio-peerconnection",
-                "microphone requested but this session has no audio PeerConnection \
-                 (QUASAR_AUDIO_DISABLED or a local-only/stream-audio-off topology) — \
-                 no mic m-line will be offered"
-            );
-        }
-        (None, None)
+            .context("rtp capsfilter has no src pad")?,
+        encoder,
+        out_tx,
+        devices,
+        input_state,
+        metrics: session_metrics,
+        trace_tx,
+        session_id,
+        capture_times,
+        lever: resolution_lever.clone(),
+        observe: !diag_no_obs,
     };
-
-    connect_ice_candidate(&webrtc, out_tx.clone(), PcId::Video);
-    // Clone the devices Arc so connect_state_logging can release_all() on disconnect
-    // while the original is still available below for the DataChannel input_sink.
-    connect_state_logging(&webrtc, devices.clone(), Some(trace_tx), session_id.clone());
-    connect_negotiation_needed(&webrtc, out_tx, PcId::Video, session_id);
-
-    pipeline
-        .set_state(gst::State::Ready)
-        .context("encode pipeline failed to reach READY")?;
-
-    let (dc_init, input_channel_mode) = input_data_channel_init();
-    let data_channel = webrtc
-        .emit_by_name_with_values(
-            "create-data-channel",
-            &["input".to_value(), Some(dc_init).to_value()],
-        )
-        .and_then(|v| v.get::<glib::Object>().ok());
-    let input_sink = match devices {
-        Some(d) => InputSink::Virtual(d),
-        None => InputSink::None,
-    };
-    match &data_channel {
-        Some(dc) => {
-            connect_data_channel_open(
-                dc,
-                input_sink,
-                input_state,
-                width,
-                height,
-                input_channel_mode,
-            );
-            tracing::info!(
-                "created 'input' DataChannel ({input_channel_mode}, agent side, encode pipeline)"
-            );
-        }
-        None => tracing::warn!(
-            token = "datachannel-create-returned-nothing",
-            "create-data-channel returned no object"
-        ),
-    }
+    // Audio first: `attach_video` takes the encode pipeline to READY.
+    let (audio_webrtc, audio_pipeline) = transport.build_audio()?;
+    let video = transport.attach_video(false)?;
 
     Ok(EncodePipeline {
         pipeline,
-        webrtc,
-        data_channel,
+        video,
+        transport,
         interpipesrc,
         audio_webrtc,
         audio_pipeline,

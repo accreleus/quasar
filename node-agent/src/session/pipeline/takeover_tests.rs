@@ -1,8 +1,10 @@
-//! #535: the production encode pipeline against real `webrtcbin` peers, in process.
+//! #535: the production encode pipeline and the runner's transport state against real
+//! `webrtcbin` peers, in process.
 //!
-//! A peer here is what a browser page is to the host: its own ICE agent, DTLS
-//! certificate and SCTP association. Signaling is carried by hand, the way the
-//! control-plane relay carries it: host frames reach only the attached peer.
+//! A peer here is what a browser page is to the host: its own ICE agent and DTLS and
+//! SCTP associations. Signaling is carried by hand, the way the control-plane relay
+//! carries it: host frames reach only the attached peer. What a browser adds (its own
+//! certificate, an SCTP abort when the page goes) is `scripts/harness/run-takeover-peers.sh`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,9 +19,9 @@ use super::{
     build_source_pipeline, resolve_effective_encoder, EncodePipeline, OutTx,
 };
 use crate::session::metrics::SessionMetrics;
-use crate::session::runner::DiagnosticEventTx;
+use crate::session::runner::{DiagnosticEventTx, SessionTransports};
 use crate::session::signaling::{PcId, SignalMsg};
-use crate::session::{server, Codec, EncoderChoice, SessionConfig, StreamParams};
+use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 
 /// The dev/runtime image has libnice, gst-interpipe and openh264; the devtools image
 /// `make test-rust` runs in has none of the first two. Same loud-SKIP rule as
@@ -57,18 +59,34 @@ fn host_cfg() -> SessionConfig {
     let mut cfg = SessionConfig::for_assignment_with(&settings, stream, None);
     cfg.use_test_src = true;
     cfg.use_test_audio = true;
+    // No scheduled keyframe inside a test: one that shows up was asked for.
+    cfg.gop = 3600;
     cfg
+}
+
+/// Each test stands up some forty GStreamer threads and binds UDP ports; one at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The host half of a session: a test source feeding the production encode pipeline.
 struct Host {
     source: gst::Pipeline,
-    enc: EncodePipeline,
+    pipeline: gst::Pipeline,
+    /// The runner's own transport state and inbound dispatch.
+    transports: SessionTransports,
+    /// PCs whose transport was replaced for a new peer, in order.
+    replaced: Vec<PcId>,
     sig_tx: OutTx,
     sig_rx: mpsc::UnboundedReceiver<SignalMsg>,
     bus: gst::Bus,
     /// Every error the encode bus posted, message and debug text joined.
     bus_errors: Vec<String>,
+    encoder: gst::Element,
+    /// When the encoder emitted each keyframe.
+    keyframes: Arc<Mutex<Vec<Instant>>>,
     _metrics: Arc<SessionMetrics>,
     _trace_rx: mpsc::Receiver<(String, crate::session::runner::TraceEvent)>,
 }
@@ -109,36 +127,61 @@ impl Host {
             p.use_clock(Some(&clock));
             p.set_base_time(base);
         }
-        source.set_state(gst::State::Playing).expect("source PLAYING");
+        source
+            .set_state(gst::State::Playing)
+            .expect("source PLAYING");
         enc.pipeline
             .set_state(gst::State::Playing)
             .expect("encode PLAYING");
-        if let Some(audio) = &enc.audio_pipeline {
-            audio.set_state(gst::State::Playing).expect("audio PLAYING");
-        }
-        let bus = enc.pipeline.bus().expect("encode bus");
+        let EncodePipeline {
+            pipeline,
+            video,
+            transport,
+            audio_webrtc,
+            audio_pipeline,
+            ..
+        } = enc;
+        let transports = SessionTransports::new(transport, video, audio_webrtc, audio_pipeline);
+        transports.audio_pipeline.play();
+        let bus = pipeline.bus().expect("encode bus");
+        let encoder = pipeline
+            .by_name(super::VIDEO_ENCODER_NAME)
+            .expect("video encoder");
+        let keyframes = Arc::new(Mutex::new(Vec::new()));
+        let seen = keyframes.clone();
+        encoder
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(buffer) = info.buffer() {
+                    if !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT) {
+                        seen.lock().unwrap().push(Instant::now());
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
         Host {
             source,
-            enc,
+            pipeline,
+            transports,
+            replaced: Vec::new(),
             sig_tx,
             sig_rx,
             bus,
             bus_errors: Vec::new(),
+            encoder,
+            keyframes,
             _metrics: metrics,
             _trace_rx: trace_rx,
         }
     }
 
-    fn inbound(&self, msg: SignalMsg) {
-        server::apply_inbound_as_offerer(
-            msg,
-            &self.enc.webrtc,
-            self.enc.audio_webrtc.as_ref(),
-            &self.sig_tx,
-            None,
-            None,
-        )
-        .expect("apply inbound signaling");
+    fn inbound(&mut self, msg: SignalMsg) {
+        let replaced = self
+            .transports
+            .inbound(msg, &self.sig_tx, None, None)
+            .expect("replace the video transport");
+        self.replaced.extend(replaced);
     }
 
     fn drain_bus(&mut self) {
@@ -149,13 +192,15 @@ impl Host {
             }
         }
     }
+}
 
-    fn stop(self) {
+// A failed assertion must still take the pipelines to NULL: an interpipe pair dropped
+// while PLAYING leaves a dangling listener that segfaults the next test.
+impl Drop for Host {
+    fn drop(&mut self) {
         let _ = self.source.set_state(gst::State::Null);
-        let _ = self.enc.pipeline.set_state(gst::State::Null);
-        if let Some(audio) = &self.enc.audio_pipeline {
-            let _ = audio.set_state(gst::State::Null);
-        }
+        let _ = self.pipeline.set_state(gst::State::Null);
+        self.transports.audio_pipeline.finish();
     }
 }
 
@@ -215,7 +260,9 @@ impl PeerPc {
             *slot.lock().unwrap() = Some(Channel(dc));
             None
         });
-        pipeline.set_state(gst::State::Playing).expect("peer PLAYING");
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("peer PLAYING");
         PeerPc {
             id,
             pipeline,
@@ -291,6 +338,12 @@ impl PeerPc {
     }
 }
 
+impl Drop for PeerPc {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// A browser page: a video PC (media + input channel) and an audio PC.
 struct Peer {
     video: PeerPc,
@@ -325,32 +378,32 @@ impl Peer {
     }
 }
 
-/// Everything the wire carried, for the evidence dump.
-#[derive(Default)]
-struct Wire {
-    offers: Vec<(PcId, String)>,
-    answers: Vec<(PcId, String)>,
-}
-
 /// Carry signaling between the host and the attached peer until `done` or the deadline.
 /// Returns whether `done` held.
 fn pump(
     host: &mut Host,
     attached: &mut Peer,
-    wire: &mut Wire,
     within: Duration,
+    done: impl FnMut(&Host, &Peer) -> bool,
+) -> bool {
+    pump_with(host, attached, within, true, done)
+}
+
+/// [`pump`], optionally losing every ICE candidate: a peer that answers and never connects.
+fn pump_with(
+    host: &mut Host,
+    attached: &mut Peer,
+    within: Duration,
+    carry_ice: bool,
     mut done: impl FnMut(&Host, &Peer) -> bool,
 ) -> bool {
     let deadline = Instant::now() + within;
     loop {
         while let Ok(msg) = host.sig_rx.try_recv() {
             let pc = match &msg {
-                SignalMsg::Offer { sdp, pc } => {
-                    wire.offers.push((pc.unwrap_or_default(), sdp.clone()));
-                    *pc
-                }
-                SignalMsg::Ice { pc, .. } => *pc,
-                _ => None,
+                SignalMsg::Offer { pc, .. } => *pc,
+                SignalMsg::Ice { pc, .. } if carry_ice => *pc,
+                _ => continue,
             };
             attached.pc(pc).inbound(msg);
         }
@@ -358,15 +411,12 @@ fn pump(
             while let Ok(msg) = attached.pc_mut(id).rx.try_recv() {
                 // The answerer speaks the Phase-0 shapes; tag them as the SPA does.
                 let msg = match msg {
-                    SignalMsg::Answer { sdp, .. } => {
-                        wire.answers.push((id, sdp.clone()));
-                        SignalMsg::Answer { sdp, pc: Some(id) }
-                    }
-                    SignalMsg::Ice { candidate, .. } => SignalMsg::Ice {
+                    SignalMsg::Answer { sdp, .. } => SignalMsg::Answer { sdp, pc: Some(id) },
+                    SignalMsg::Ice { candidate, .. } if carry_ice => SignalMsg::Ice {
                         candidate,
                         pc: Some(id),
                     },
-                    other => other,
+                    _ => continue,
                 };
                 host.inbound(msg);
             }
@@ -382,32 +432,12 @@ fn pump(
     }
 }
 
-/// Agent log lines on stderr for the evidence runs.
+/// Agent log lines on stderr, for the browser host.
 fn trace_to_stderr() {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("quasar_node_agent=info")
         .try_init();
-}
-
-fn host_states(host: &Host) -> String {
-    let w = &host.enc.webrtc;
-    format!(
-        "ice={:?} conn={:?} signaling={}",
-        w.property::<gstreamer_webrtc::WebRTCICEConnectionState>("ice-connection-state"),
-        w.property::<gstreamer_webrtc::WebRTCPeerConnectionState>("connection-state"),
-        w.property_value("signaling-state")
-            .serialize()
-            .map(|s| s.to_string())
-            .unwrap_or_default(),
-    )
-}
-
-fn sdp_attr(sdp: &str, name: &str) -> String {
-    let prefix = format!("a={name}:");
-    sdp.lines()
-        .find_map(|l| l.trim().strip_prefix(&prefix).map(str::to_string))
-        .unwrap_or_else(|| "-".into())
 }
 
 fn rtp(pc: &PeerPc) -> u64 {
@@ -416,147 +446,250 @@ fn rtp(pc: &PeerPc) -> u64 {
 
 /// Attach a fresh peer the way a page does on its first socket: answer the offers the
 /// relay buffered, and wait for media and the input channel.
-fn first_attach(host: &mut Host, wire: &mut Wire) -> Peer {
+fn first_attach(host: &mut Host) -> Peer {
     let mut peer = Peer::new();
-    let up = pump(host, &mut peer, wire, Duration::from_secs(20), |_, p| {
-        rtp(&p.video) > 30 && rtp(&p.audio) > 10 && p.video.channel.lock().unwrap().is_some()
+    let up = pump(host, &mut peer, Duration::from_secs(20), |_, p| {
+        streaming(p)
     });
     assert!(
         up,
-        "first peer never received media: video rtp={} audio rtp={} ice={} dtls={}",
-        rtp(&peer.video),
-        rtp(&peer.audio),
-        peer.video.ice_state(),
-        peer.video.dtls_state()
+        "the first peer never received media: {}",
+        describe(&peer)
     );
     peer
 }
 
 /// What a page that opens `/app/session/<id>` sends when its socket opens
-/// (`web/src/webrtc/session.ts`, `requestOfferOnOpen`).
-fn request_offers(host: &Host) {
+/// (`web/src/webrtc/session.ts`, `requestOfferOnOpen`), then the wait for its media.
+fn attach(host: &mut Host) -> Peer {
+    let mut peer = Peer::new();
     host.inbound(SignalMsg::RestartIce {
         pc: Some(PcId::Video),
     });
     host.inbound(SignalMsg::RestartIce {
         pc: Some(PcId::Audio),
     });
+    let up = pump(host, &mut peer, Duration::from_secs(20), |_, p| {
+        streaming(p)
+    });
+    assert!(
+        up,
+        "the peer that attached never received media: {} (host replaced {:?})",
+        describe(&peer),
+        host.replaced
+    );
+    peer
 }
 
-/// Evidence run for #535, not a gate: prints what the wire and the two peers show when a
-/// second peer attaches to a session a first peer is streaming.
-/// `cargo test takeover_evidence -- --ignored --nocapture`
+fn streaming(peer: &Peer) -> bool {
+    rtp(&peer.video) > 30 && rtp(&peer.audio) > 10 && peer.video.channel.lock().unwrap().is_some()
+}
+
+fn describe(peer: &Peer) -> String {
+    format!(
+        "video rtp={} audio rtp={} ice={} dtls={}",
+        rtp(&peer.video),
+        rtp(&peer.audio),
+        peer.video.ice_state(),
+        peer.video.dtls_state()
+    )
+}
+
+/// Does the host answer this peer's input channel?
+fn input_reaches_host(host: &mut Host, peer: &mut Peer) -> bool {
+    let before = peer.video.pongs.load(Ordering::Relaxed);
+    peer.video.ping();
+    pump(host, peer, Duration::from_secs(2), |_, p| {
+        p.video.pongs.load(Ordering::Relaxed) > before
+    })
+}
+
+fn threads() -> usize {
+    std::fs::read_dir("/proc/self/task").map_or(0, |d| d.count())
+}
+
+/// The issue: a second page opens a session a first page is streaming.
 #[test]
-#[ignore = "evidence dump for #535; prints, asserts nothing about the outcome"]
-fn takeover_evidence() {
+fn a_takeover_mid_stream_moves_the_stream_to_the_new_peer() {
     if !live_webrtc_available() {
         return;
     }
-    trace_to_stderr();
-    let mut host = Host::start("evidence");
-    let mut wire = Wire::default();
-    let mut a = first_attach(&mut host, &mut wire);
-    eprintln!(
-        "EVIDENCE A up: video rtp={} audio rtp={} ice={} dtls={}",
-        rtp(&a.video),
-        rtp(&a.audio),
-        a.video.ice_state(),
-        a.video.dtls_state()
+    let _serial = serial();
+    let mut host = Host::start("midstream");
+    let a = first_attach(&mut host);
+    let first_transport = host.transports.video.webrtc.downgrade();
+    let keyframes_before = host.keyframes.lock().unwrap().len();
+
+    let mut b = attach(&mut host);
+
+    let mut replaced = host.replaced.clone();
+    replaced.sort_by_key(|pc| *pc as usize);
+    assert_eq!(
+        replaced,
+        [PcId::Video, PcId::Audio],
+        "each PC gets one new transport"
+    );
+    assert!(
+        first_transport.upgrade().is_none(),
+        "the displaced peer's transport is torn down by the host"
+    );
+    assert!(
+        input_reaches_host(&mut host, &mut b),
+        "the new peer's input channel must reach the host"
+    );
+    assert!(
+        host.keyframes.lock().unwrap().len() > keyframes_before,
+        "the new peer needs a keyframe to start decoding"
+    );
+    assert_eq!(
+        host.pipeline.by_name(super::VIDEO_ENCODER_NAME).as_ref(),
+        Some(&host.encoder),
+        "the encoder is not rebuilt"
     );
 
-    // B attaches. The relay now delivers host frames to B only; A keeps its transport.
-    let mut b = Peer::new();
-    request_offers(&host);
-    let a_before = rtp(&a.video);
-    let started = Instant::now();
-    let b_got_media = pump(&mut host, &mut b, &mut wire, Duration::from_secs(15), |_, p| {
-        rtp(&p.video) > 30
-    });
-    eprintln!(
-        "EVIDENCE takeover after {:?}: B decodes={b_got_media} B video rtp={} B audio rtp={} \
-         B ice={} B dtls={} | A video rtp {a_before} -> {} A ice={} A dtls={}",
-        started.elapsed(),
-        rtp(&b.video),
-        rtp(&b.audio),
-        b.video.ice_state(),
-        b.video.dtls_state(),
+    // The displaced page: nothing reaches it any more, and its input is not heard.
+    let a_video = rtp(&a.video);
+    let a_pongs = a.video.pongs.load(Ordering::Relaxed);
+    a.video.ping();
+    pump(&mut host, &mut b, Duration::from_secs(1), |_, _| false);
+    assert_eq!(
         rtp(&a.video),
-        a.video.ice_state(),
-        a.video.dtls_state()
+        a_video,
+        "the displaced peer still receives video"
     );
-    eprintln!("EVIDENCE host video PC after takeover: {}", host_states(&host));
-    for (pc, sdp) in &wire.offers {
-        eprintln!(
-            "EVIDENCE offer  pc={pc} ufrag={} setup={} candidates-in-sdp={} fingerprint={}",
-            sdp_attr(sdp, "ice-ufrag"),
-            sdp_attr(sdp, "setup"),
-            sdp.matches("a=candidate:").count(),
-            sdp_attr(sdp, "fingerprint")
-        );
-    }
-    for (pc, sdp) in &wire.answers {
-        eprintln!(
-            "EVIDENCE answer pc={pc} ufrag={} setup={} fingerprint={}",
-            sdp_attr(sdp, "ice-ufrag"),
-            sdp_attr(sdp, "setup"),
-            sdp_attr(sdp, "fingerprint")
-        );
-    }
+    assert_eq!(a.video.pongs.load(Ordering::Relaxed), a_pongs);
 
-    // The displaced page leaves.
+    // It leaves; the session carries on.
     a.stop();
-    pump(&mut host, &mut b, &mut wire, Duration::from_secs(8), |h, _| {
-        !h.bus_errors.is_empty()
-    });
-    eprintln!(
-        "EVIDENCE after A left: host bus errors={:?} B video rtp={}",
-        host.bus_errors,
-        rtp(&b.video)
+    let b_video = rtp(&b.video);
+    pump(&mut host, &mut b, Duration::from_secs(2), |_, _| false);
+    assert!(
+        rtp(&b.video) > b_video + 20,
+        "the stream stopped when the displaced peer left"
     );
-    let _ = &mut a;
-    b.stop();
-    host.stop();
+    assert_eq!(host.bus_errors, Vec::<String>::new());
 }
 
-/// Evidence run for the plain reload: the first page is gone before the second attaches.
+/// The first page answered but its transport never connected (its loader is still up).
+/// The encode chain is then parked inside that transport, which is the hard teardown.
 #[test]
-#[ignore = "evidence dump for #535; prints, asserts nothing about the outcome"]
-fn reload_evidence() {
+fn a_takeover_while_the_first_peer_is_still_connecting_reaches_the_new_peer() {
     if !live_webrtc_available() {
         return;
     }
-    trace_to_stderr();
+    let _serial = serial();
+    let mut host = Host::start("connecting");
+    let mut a = Peer::new();
+    let answered = pump_with(&mut host, &mut a, Duration::from_secs(10), false, |h, _| {
+        h.transports
+            .video
+            .webrtc
+            .property::<Option<gstreamer_webrtc::WebRTCSessionDescription>>("remote-description")
+            .is_some()
+    });
+    assert!(answered, "the first peer's answer never applied");
+    assert_eq!(rtp(&a.video), 0, "the first peer must not have connected");
+
+    let mut b = attach(&mut host);
+
+    assert!(host.replaced.contains(&PcId::Video));
+    assert!(input_reaches_host(&mut host, &mut b));
+    assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// The first page is gone before the second attaches (a reload, a resume). The agent
+/// cannot tell this from a takeover: the first transport is still up as far as it knows.
+#[test]
+fn a_peer_that_attaches_after_the_first_is_gone_gets_the_stream() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
     let mut host = Host::start("reload");
-    let mut wire = Wire::default();
-    let a = first_attach(&mut host, &mut wire);
+    let a = first_attach(&mut host);
     a.stop();
-    let mut b = Peer::new();
-    let gone = pump(&mut host, &mut b, &mut wire, Duration::from_secs(5), |h, _| {
-        !h.bus_errors.is_empty()
+
+    let mut b = attach(&mut host);
+
+    assert!(input_reaches_host(&mut host, &mut b));
+    assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// `restart_ice` from the peer the transport belongs to: media recovery, and an in-place
+/// signaling re-attach that had a retry in flight. Replacing the transport here would
+/// strand that peer's DTLS association. (An in-place re-attach with nothing in flight
+/// sends the agent nothing at all.)
+#[test]
+fn a_restart_from_the_same_peer_keeps_the_transport() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("samepeer");
+    let mut a = first_attach(&mut host);
+    let transport = host.transports.video.webrtc.clone();
+
+    host.inbound(SignalMsg::RestartIce {
+        pc: Some(PcId::Video),
     });
-    eprintln!(
-        "EVIDENCE reload: host saw the first peer leave={gone} errors={:?}",
-        host.bus_errors
+    host.inbound(SignalMsg::RestartIce {
+        pc: Some(PcId::Audio),
+    });
+    let before = rtp(&a.video);
+    pump(&mut host, &mut a, Duration::from_secs(2), |_, _| false);
+
+    assert_eq!(host.replaced, [], "the same peer must keep its transport");
+    assert_eq!(host.transports.video.webrtc, transport);
+    assert!(
+        rtp(&a.video) > before + 20,
+        "media stopped across the re-offer"
     );
-    request_offers(&host);
-    let b_got_media = pump(&mut host, &mut b, &mut wire, Duration::from_secs(15), |_, p| {
-        rtp(&p.video) > 30
-    });
-    b.video.ping();
-    pump(&mut host, &mut b, &mut wire, Duration::from_secs(2), |_, p| {
-        p.video.pongs.load(Ordering::Relaxed) > 0
-    });
-    eprintln!(
-        "EVIDENCE reload: B decodes={b_got_media} B video rtp={} B ice={} B dtls={} B pongs={} \
-         host errors={:?}",
-        rtp(&b.video),
-        b.video.ice_state(),
-        b.video.dtls_state(),
-        b.video.pongs.load(Ordering::Relaxed),
-        host.bus_errors
+    assert!(input_reaches_host(&mut host, &mut a));
+}
+
+/// Twenty takeovers in one session leave one transport's worth of everything.
+#[test]
+fn twenty_takeovers_leak_nothing() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("leak");
+    let mut current = first_attach(&mut host);
+    let mut retired = Vec::new();
+    let (mut elements, mut live_threads) = (0, 0);
+    for round in 0..20 {
+        retired.push(host.transports.video.webrtc.downgrade());
+        retired.extend(host.transports.audio_webrtc.as_ref().map(|w| w.downgrade()));
+        let next = attach(&mut host);
+        current.stop();
+        current = next;
+        if round == 0 {
+            // Past the first takeover, so both counts include a peer being stopped.
+            elements = host.pipeline.children().len();
+            live_threads = threads();
+        }
+    }
+    assert!(input_reaches_host(&mut host, &mut current));
+    assert_eq!(
+        host.replaced.len(),
+        40,
+        "every takeover replaces both transports once"
     );
-    b.stop();
-    host.stop();
+    let leaked = retired.iter().filter(|w| w.upgrade().is_some()).count();
+    assert_eq!(leaked, 0, "retired webrtcbins still alive");
+    assert_eq!(
+        host.pipeline.children().len(),
+        elements,
+        "the encode pipeline grew"
+    );
+    // A leaked transport keeps its webrtcbin, ICE and RTCP threads: several per takeover.
+    assert!(
+        threads() < live_threads + 19,
+        "threads grew from {live_threads} to {} over 19 takeovers",
+        threads()
+    );
+    assert_eq!(host.bus_errors, Vec::<String>::new());
 }
 
 /// A stand-in for the control-plane relay, for real browsers: one signaling WebSocket per
@@ -594,7 +727,7 @@ fn browser_host() {
         let mut attached: Option<(u64, mpsc::UnboundedSender<Message>)> = None;
         let mut buffered: Vec<Message> = Vec::new();
         let mut next_id = 0u64;
-        let mut seen_errors = 0usize;
+        let (mut seen_errors, mut seen_replaced) = (0, 0);
         let mut tick = tokio::time::interval(Duration::from_millis(10));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
         loop {
@@ -656,9 +789,12 @@ fn browser_host() {
                         eprintln!("HOST bus error: {e}");
                     }
                     seen_errors = host.bus_errors.len();
+                    for pc in &host.replaced[seen_replaced..] {
+                        eprintln!("HOST replaced the {pc} transport");
+                    }
+                    seen_replaced = host.replaced.len();
                 }
             }
         }
-        host.stop();
     });
 }

@@ -421,12 +421,14 @@ fn poll_video_loss(webrtc: &gst::Element) -> Option<(i64, u64)> {
 /// N→0 after a clean run.
 ///
 /// Lifetime: it holds a `std::sync::Weak<SessionMetrics>` for liveness (the glib `WeakRef`
-/// is `!Send`) and exits within one poll tick of teardown dropping it, so no stop plumbing
-/// is needed. The transceiver + webrtcbin are strong glib handles, released on exit.
+/// is `!Send`) and exits within one poll tick of teardown dropping it, or of `retired`
+/// being set when its transport is replaced. The transceiver + webrtcbin are strong glib
+/// handles, released on exit.
 pub(super) fn spawn_fec_controller(
     webrtc: &gst::Element,
     cfg: FecControllerConfig,
     metrics: std::sync::Weak<SessionMetrics>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
     trace_tx: TraceTx,
     session_id: String,
 ) {
@@ -474,8 +476,9 @@ pub(super) fn spawn_fec_controller(
             let mut elapsed = std::time::Duration::ZERO;
             loop {
                 std::thread::sleep(tick);
-                if metrics.upgrade().is_none() {
-                    break; // session gone — inherit teardown
+                if metrics.upgrade().is_none() || retired.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break; // session or transport gone — inherit teardown
                 }
                 elapsed += tick;
                 if elapsed < window {
@@ -514,7 +517,7 @@ pub(super) fn spawn_fec_controller(
                     None => {}
                 }
             }
-            tracing::debug!("auto FEC controller thread exiting (session gone)");
+            tracing::debug!("auto FEC controller thread exiting (session or transport gone)");
         });
     if let Err(e) = spawn {
         tracing::warn!(
@@ -969,6 +972,41 @@ pub(crate) fn remote_description_failure_reason(pc: PcId, webrtcbin_message: &st
     format!("webrtc: {pc} PeerConnection rejected the remote answer: {webrtcbin_message}{hint}")
 }
 
+/// The ICE ufrag and DTLS fingerprint of an SDP's first transport: what identifies the
+/// endpoint that wrote it.
+fn peer_identity(sdp: &str) -> (Option<&str>, Option<&str>) {
+    let attr = |name: &str| {
+        sdp.lines()
+            .find_map(|l| l.trim().strip_prefix(name))
+            .map(str::trim)
+    };
+    (attr("a=ice-ufrag:"), attr("a=fingerprint:"))
+}
+
+/// Is `answer` from a different endpoint than the one that wrote `negotiated`?
+///
+/// This host never changes its own ICE credentials (webrtcbin ignores `ice-restart`), so
+/// an answerer has no reason to change its own: a new ufrag or certificate is a new peer
+/// connection. A webrtcbin that starts honouring `ice-restart` makes a same-peer answer
+/// look new here; guarded by `takeover_tests::a_restart_from_the_same_peer_keeps_the_transport`.
+fn is_new_peer(negotiated: Option<&str>, answer: &str) -> bool {
+    let Some(negotiated) = negotiated else {
+        return false; // nobody has answered on this transport yet
+    };
+    let (was_ufrag, was_fingerprint) = peer_identity(negotiated);
+    let (ufrag, fingerprint) = peer_identity(answer);
+    was_ufrag != ufrag || was_fingerprint != fingerprint
+}
+
+/// Is `answer` from a peer other than the one `webrtc` negotiated with (#535)? Such a
+/// peer cannot use this transport: its DTLS and SCTP associations belong to the first.
+pub(crate) fn answer_is_from_new_peer(webrtc: &gst::Element, answer: &str) -> bool {
+    let negotiated = webrtc
+        .property::<Option<gstreamer_webrtc::WebRTCSessionDescription>>("remote-description")
+        .and_then(|d| d.sdp().as_text().ok());
+    is_new_peer(negotiated.as_deref(), answer)
+}
+
 /// Apply a remote SDP. For an inbound offer (answerer), `then_answer` runs once the remote
 /// description is set, creating the answer. Called by
 /// [`crate::session::server::handle_inbound`].
@@ -1069,7 +1107,7 @@ pub(crate) fn apply_remote_description(
 #[cfg(test)]
 mod tests {
     use super::{
-        answer_is_duplicate, enable_video_fec, error_is_stale_answer, make_webrtcbin,
+        answer_is_duplicate, enable_video_fec, error_is_stale_answer, is_new_peer, make_webrtcbin,
         munge_offer_sdp, remote_description_error, remote_description_failure_reason,
         set_audio_receive_latency, signaling_state_nick, PcId, SrdFailureKind,
     };
@@ -1208,6 +1246,36 @@ mod tests {
             set_audio_receive_latency(&webrtc, ms);
             assert_eq!(webrtc.property::<u32>("latency"), ms);
         }
+    }
+
+    // ── #535: which answers come from a peer this transport has not negotiated with ──
+
+    fn answer(ufrag: &str, fingerprint: &str) -> String {
+        format!(
+            "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=ice-ufrag:{ufrag}\r\n\
+             a=ice-pwd:pw\r\na=fingerprint:sha-256 {fingerprint}\r\na=setup:active\r\n"
+        )
+    }
+
+    #[test]
+    fn the_first_answer_on_a_transport_is_never_a_new_peer() {
+        assert!(!is_new_peer(None, &answer("aaaa", "AA:01")));
+    }
+
+    #[test]
+    fn the_same_peer_answering_again_is_not_new() {
+        let first = answer("aaaa", "AA:01");
+        assert!(!is_new_peer(Some(&first), &answer("aaaa", "AA:01")));
+    }
+
+    #[test]
+    fn another_ice_agent_or_another_certificate_is_a_new_peer() {
+        let first = answer("aaaa", "AA:01");
+        // Two browsers: both differ.
+        assert!(is_new_peer(Some(&first), &answer("bbbb", "BB:02")));
+        // Two peer connections sharing a certificate (webrtcbin does, per process).
+        assert!(is_new_peer(Some(&first), &answer("bbbb", "AA:01")));
+        assert!(is_new_peer(Some(&first), &answer("aaaa", "BB:02")));
     }
 
     #[test]
