@@ -1891,8 +1891,12 @@ fn browser_host() {
                     for pc in replaced {
                         eprintln!("HOST replaced the {pc} transport");
                         if restart_between && pc == PcId::Video {
+                            // One more offer either way: this request yields it if the
+                            // new transport has already offered, else it is absorbed and
+                            // the request after that offer does.
+                            restart_after_offer =
+                                !super::has_offered(&host.transports.video.webrtc);
                             host.inbound(SignalMsg::RestartIce { pc: Some(pc) });
-                            restart_after_offer = true;
                         }
                         if late_answer && pc == PcId::Video {
                             late = Some(SignalMsg::Answer {

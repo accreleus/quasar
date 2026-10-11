@@ -21,7 +21,8 @@
 #   reattach     the streaming page replaces its signaling socket and keeps its peers
 #   spa-takeover the takeover again with the REAL web client (a built web/dist, /v1
 #                mocked, microphone granted): input channel, microphone, tracks, banner
-#   spa-restart  the same, with an ICE-restart request landing between the two offers
+#   spa-restart  the same, with an ICE-restart request landing right at the replacement:
+#                absorbed if it beats the new transport's offer, a third offer if not
 #   late-answer  the takeover, with the taking page's answer to the old transport's offer
 #                delivered a second time once the new transport has offered
 #   spa-late     the same with the real web client
@@ -145,9 +146,6 @@ if scenario in ("late-answer", "spa-late"):
     # more peer it would cost a third transport.
     reoffered = sum(1 for line in open(host_log, errors="replace") if "transport-reoffered" in line)
     checks["the late answer was corrected by one more offer on the same transport"] = reoffered >= 1
-if scenario == "spa-restart":
-    absorbed = sum(1 for line in open(host_log, errors="replace") if "before the transport's first offer" in line)
-    checks["the restart request that beat the new offer was absorbed"] = absorbed >= 1
 if scenario == "spa-refused":
     refused = sum(1 for line in open(host_log, errors="replace") if "transport-replace-rate-limited" in line)
     checks["the host said it was past its budget"] = refused >= 1
