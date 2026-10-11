@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Future-only Discord delivery; deployments persist at-most-once send claims."""
 import datetime as dt
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -94,6 +96,36 @@ class Announcer:
         if str(hook.get('channel_id')) != CHANNEL or str(hook.get('guild_id')) != SERVER:
             raise DeliveryError('Webhook destination does not match verified channel/server')
 
+    def signed_claim(self, release_id):
+        # Domain-separated authentication; the private webhook is never persisted.
+        # Bind every routing/eligibility field so a signature cannot suppress a
+        # different release, channel, repository, or activation epoch.
+        data = {'version': 1, 'repository': REPO, 'task': TASK,
+                'environment': ENVIRONMENT, 'release_id': release_id,
+                'channel_id': CHANNEL, 'cutoff': self.cutoff}
+        canonical = json.dumps(data, sort_keys=True, separators=(',', ':')).encode()
+        data['signature'] = hmac.new(self.webhook.encode(),
+                                     b'quasar-discord-claim-v1\x00' + canonical,
+                                     hashlib.sha256).hexdigest()
+        return data
+
+    def authentic_claim(self, record, release_id):
+        data = record.get('payload') or {}
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (ValueError, TypeError):
+                return False
+        if not isinstance(data, dict):
+            return False
+        expected = self.signed_claim(release_id)
+        signature = data.get('signature')
+        return (isinstance(signature, str)
+                and re.fullmatch(r'[0-9a-f]{64}', signature) is not None
+                and {key: value for key, value in data.items() if key != 'signature'}
+                == {key: value for key, value in expected.items() if key != 'signature'}
+                and hmac.compare_digest(signature, expected['signature']))
+
     def deliver(self, release):
         if not eligible(release, self.cutoff):
             return 'historical-or-draft'
@@ -101,11 +133,8 @@ class Announcer:
         query = urllib.parse.urlencode({'environment': ENVIRONMENT, 'task': TASK})
         records = self.pages('/deployments?' + query)
         for record in records:
-            data = record.get('payload') or {}
-            if isinstance(data, str):
-                data = json.loads(data)
-            if data.get('release_id') == release['id'] and data.get('channel_id') == CHANNEL:
-                # ANY claim blocks automatic replay, including interrupted/failed runs.
+            if self.authentic_claim(record, release['id']):
+                # Only authenticated claims block replay, including failed runs.
                 return 'claimed'
         self.check_destination()
         claim = self.github('/deployments', 'POST', {
@@ -113,7 +142,7 @@ class Announcer:
             'auto_merge': False, 'required_contexts': [],
             'production_environment': False, 'transient_environment': True,
             'description': 'Discord release delivery claim',
-            'payload': {'release_id': release['id'], 'channel_id': CHANNEL}})
+            'payload': self.signed_claim(release['id'])})
         claim_id = claim['id']  # Must be confirmed before any Discord POST.
         result = self.api(self.webhook + '?wait=true', method='POST', data=payload)
         if str(result.get('channel_id')) != CHANNEL or not result.get('id'):

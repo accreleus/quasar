@@ -1,4 +1,5 @@
 import copy
+import json
 import unittest
 from discord_releases import Announcer, CHANNEL, SERVER, DeliveryError, eligible, message
 
@@ -125,6 +126,44 @@ class Tests(unittest.TestCase):
         with self.assertRaises(DeliveryError):
             self.sender.deliver(RELEASE)
         self.assertEqual(self.sender.deliver(RELEASE), 'claimed')
+
+    def test_forged_claims_cannot_suppress_delivery(self):
+        signed = self.sender.signed_claim(RELEASE['id'])
+        self.api.records = [
+            {'payload': {'release_id': RELEASE['id'], 'channel_id': CHANNEL}},
+            {'payload': dict(signed, signature='0' * 64)},
+            {'payload': 'not json'}, {'payload': []},
+            {'payload': dict(signed, signature='\u2603')},
+            {'payload': dict(signed, signature='\ud800')},
+        ]
+        self.assertEqual(self.sender.deliver(RELEASE), 'sent')
+
+    def test_signed_claim_bound_to_all_fields(self):
+        signed = self.sender.signed_claim(RELEASE['id'])
+        for key in ['version', 'repository', 'task', 'environment',
+                    'release_id', 'channel_id', 'cutoff']:
+            with self.subTest(field=key):
+                self.assertFalse(self.sender.authentic_claim(
+                    {'payload': dict(signed, **{key: 'tampered'})}, RELEASE['id']))
+        self.assertFalse(self.sender.authentic_claim(
+            {'payload': dict(signed, extra='injected')}, RELEASE['id']))
+
+    def test_other_webhook_cannot_forge_claim(self):
+        attacker = Announcer('fake', WEBHOOK + '_different', CUTOFF, self.api)
+        self.api.records = [{'payload': attacker.signed_claim(RELEASE['id'])}]
+        self.assertEqual(self.sender.deliver(RELEASE), 'sent')
+
+    def test_authenticated_json_claim_blocks_replay(self):
+        self.api.records = [{'payload': json.dumps(self.sender.signed_claim(RELEASE['id']))}]
+        self.assertEqual(self.sender.deliver(RELEASE), 'claimed')
+        self.assertFalse(any(call[1] == 'POST' for call in self.api.calls))
+
+    def test_receipt_contains_no_credentials(self):
+        self.sender.deliver(RELEASE)
+        receipt = json.dumps(self.api.records)
+        self.assertNotIn(WEBHOOK, receipt)
+        self.assertNotIn('test_token', receipt)
+        self.assertNotIn('fake-github-token', receipt)
 
 
 if __name__ == '__main__':

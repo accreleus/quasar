@@ -47,6 +47,8 @@ own; the two do not move together, and that is deliberate.
   preparation that fixes it. Before the first reboot it reads `unknown`.
 
 ### Fixed
+
+- Authenticate Discord release delivery claims so forged deployment records cannot suppress announcements.
 - **A KDE console session's resolution pick no longer snaps back (#447).** The compositor's
   follow-the-window fallback stays quiet while the desktop speaks wlr-output-management, so a
   stale frame at the old size during the switch is not read as a request to go back.

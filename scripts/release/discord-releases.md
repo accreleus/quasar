@@ -28,11 +28,15 @@ releases before using a manual run as a no-post verification.
 
 The workflow uses `contents: read` and `deployments: write`. It creates delivery receipts
 with task `discord-release-announcement` in environment `discord-announcements`, containing
-only the release ID and channel ID. These records do not deploy Quasar, merge refs, or modify
+the release/channel IDs, repository, activation cutoff, task/environment, and an HMAC-SHA256
+signature authenticated by the existing private webhook credential. The credential itself
+is never stored in receipts. Forged, unsigned, altered, and malformed claims are ignored;
+deployment-write access alone cannot generate a valid signature. These records do not
+deploy Quasar, merge refs, or modify
 release notes. They must be retained to preserve duplicate-delivery protection.
 
 A single concurrency group serializes runs. A receipt is claimed before the Discord POST;
-any existing claim blocks automatic replay, even if a run failed or was interrupted.
+an authenticated existing claim blocks automatic replay, even if a run failed or was interrupted.
 Successful acknowledgements add a status with the Discord message link. No POST is retried
 automatically after an uncertain result. This favors avoiding duplicates over automatic
 recovery: a crash after the claim but before sending can leave an unsent announcement.
@@ -41,6 +45,13 @@ For an interrupted or failed run, inspect the matching receipt and Discord chann
 reconciliation. Never blindly delete receipts or repeat a POST. Do not run parallel script
 copies outside the workflow's concurrency group. Disable delivery by removing the activation
 variable or disabling the workflow; revoke the Discord webhook if its URL is compromised.
+
+Webhook rotation changes the receipt authentication key. Before replacing the webhook secret,
+disable the workflow and reconcile any pending announcements. Reset the activation cutoff to
+the current UTC time before re-enabling it, so older signed receipts cannot cause replay.
+Do not rotate the credential while delivery is running. Repository actors who can change
+workflow code/access its secrets or delete genuine receipts remain trusted; signatures protect
+against forged claim insertion, not those broader privileges.
 
 ## Tests
 
