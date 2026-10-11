@@ -479,6 +479,31 @@ func TestPatchUpdatesScheduleFields(t *testing.T) {
 	if e := decodeErr(t, body); e.Error.Code != "validation_failed" {
 		t.Errorf("sub-floor interval code: %q", e.Error.Code)
 	}
+
+	// The floor itself is allowed and stored.
+	if status, body = doReq(t, http.MethodPatch, srv.URL+"/v1/admin/jobs/"+def.ID, `{"interval_secs": 60}`); status != http.StatusOK {
+		t.Fatalf("interval at the floor: status %d, want 200 (body %s)", status, body)
+	}
+	if j, err = store.Get(context.Background(), def.ID); err != nil || j.Schedule.IntervalSecs != 60 {
+		t.Fatalf("stored interval at the floor: %+v err %v", j.Schedule, err)
+	}
+}
+
+func TestPatchIntervalOnANonIntervalJobIsUnprocessable(t *testing.T) {
+	pool := testDB(t)
+	def := okDef()
+	def.ID = "template.warmup"
+	def.Default = Schedule{Kind: KindEvent, Timezone: "UTC"}
+	reg := NewRegistry()
+	if err := reg.Register(def); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, srv := newJobsServer(t, pool, reg, def)
+
+	status, body := doReq(t, http.MethodPatch, srv.URL+"/v1/admin/jobs/"+def.ID, `{"interval_secs": 3600}`)
+	if status != http.StatusUnprocessableEntity || decodeErr(t, body).Error.Code != "validation_failed" {
+		t.Fatalf("interval_secs on an event job: %d %s, want 422 validation_failed", status, body)
+	}
 }
 
 // TestPatchScheduleLockedByEnvOverride pins design §3.3/§3.6: an admin cannot

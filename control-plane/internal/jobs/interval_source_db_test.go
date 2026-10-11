@@ -244,6 +244,12 @@ func TestPatchOfASourcedIntervalIsRefusedUnlessItIsTheValueReported(t *testing.T
 	if status != http.StatusOK {
 		t.Fatalf("PATCH with the interval reported under the env override: %d %s, want 200", status, body)
 	}
+	// A positive reported period below the floor is resent unchanged too.
+	s.period.Store(int64(30 * time.Second))
+	status, body = doReq(t, http.MethodPatch, s.url, `{"interval_secs": 30}`)
+	if status != http.StatusOK {
+		t.Fatalf("PATCH resending a reported 30 s: %d %s, want 200", status, body)
+	}
 	s.period.Store(0)
 	status, body = doReq(t, http.MethodPatch, s.url, `{"interval_secs": 0}`)
 	if status != http.StatusOK {

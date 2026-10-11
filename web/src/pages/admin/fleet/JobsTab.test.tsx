@@ -746,6 +746,8 @@ describe("JobsTab — schedule modal", () => {
     ).toBeTruthy();
     expect(screen.queryByText(/instance_settings/)).toBeNull();
     expect(screen.queryByText(/Unset it/)).toBeNull();
+    const lock = document.querySelector(".job-lock");
+    expect(lock?.getAttribute("title")).toBe("Settings ▸ Libraries ▸ Scan interval sets this job's interval.");
   });
 
   it("saves a valid schedule edit via PATCH", async () => {
