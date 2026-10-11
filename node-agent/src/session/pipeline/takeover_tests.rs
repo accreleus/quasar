@@ -1746,6 +1746,150 @@ impl Drop for Session {
     }
 }
 
+/// An answer that refuses its first m-line the way a browser does that cannot decode the
+/// session's codec: port 0 and no ICE attributes there. webrtcbin cannot apply it
+/// ("media 0 is missing or contains an empty 'ice-ufrag' attribute").
+fn refusing_its_first_m_line(answer: &str) -> String {
+    let mut section = 0;
+    let mut refused_mid = String::new();
+    let mut out: Vec<String> = Vec::new();
+    for line in answer.lines() {
+        if line.starts_with("m=") {
+            section += 1;
+        }
+        if section != 1 {
+            out.push(line.to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("m=") {
+            let mut parts: Vec<&str> = rest.split(' ').collect();
+            parts[1] = "0";
+            out.push(format!("m={}", parts.join(" ")));
+        } else if let Some(mid) = line.strip_prefix("a=mid:") {
+            refused_mid = mid.trim().to_string();
+            out.push(line.to_string());
+        } else if !["a=ice-", "a=fingerprint:", "a=setup:", "a=candidate:"]
+            .iter()
+            .any(|p| line.starts_with(p))
+        {
+            out.push(line.to_string());
+        }
+    }
+    let bundle = format!(" {refused_mid}");
+    out.iter()
+        .map(|l| match l.strip_prefix("a=group:BUNDLE") {
+            Some(mids) => format!("a=group:BUNDLE{}", mids.replacen(&bundle, "", 1)),
+            None => l.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n"
+}
+
+impl Session {
+    /// A page streams. A second browser takes the session over, and its answer to the new
+    /// `refused` transport's offer is one webrtcbin cannot apply.
+    fn with_a_takeover_that_cannot_be_applied(tag: &str, refused: PcId) -> Session {
+        let mut session = Session::start(tag, Duration::from_secs(600));
+        let mut a = Peer::new();
+        let up = session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p));
+        assert!(up, "the first peer never streamed: {}", describe(&a));
+        let as_b = |sdp: &str| with_another_certificate(with_other_ice(sdp));
+        let answers = session.answers.clone();
+        for pc in [PcId::Video, PcId::Audio] {
+            let sdp = as_b(answers[pc as usize].as_ref().unwrap());
+            let _ = session
+                .to_host
+                .send(SignalMsg::Answer { sdp, pc: Some(pc) });
+        }
+        let replaced = session.pump(&mut a, Duration::from_secs(10), |s, _| s.offers == [2, 2]);
+        assert!(replaced, "offers per PC: {:?}", session.offers);
+
+        let sdp = as_b(&refusing_its_first_m_line(
+            answers[refused as usize].as_ref().unwrap(),
+        ));
+        let _ = session.to_host.send(SignalMsg::Answer {
+            sdp,
+            pc: Some(refused),
+        });
+        session.pump(&mut a, Duration::from_secs(2), |s, _| s.ended.is_some());
+        session
+    }
+
+    /// The session is still there for a peer that can take it: it attaches, streams, and
+    /// a stop then ends the session.
+    fn serves_the_next_peer_and_stops(&mut self) {
+        assert!(
+            self.ended.is_none(),
+            "an answer the host could not apply ended the session: {:?}",
+            self.ended
+        );
+        let mut next = Peer::new();
+        for pc in [PcId::Video, PcId::Audio] {
+            let _ = self.to_host.send(SignalMsg::RestartIce { pc: Some(pc) });
+        }
+        let up = self.pump(&mut next, Duration::from_secs(20), |_, p| streaming(p));
+        assert!(up, "the next peer never streamed: {}", describe(&next));
+
+        self.stop.store(true, Ordering::SeqCst);
+        let ended = self.ends_within(Duration::from_secs(10));
+        assert!(
+            matches!(ended, Some(SessionEvent::Stopped { .. })),
+            "the session did not stop: {ended:?}"
+        );
+    }
+}
+
+/// A browser that cannot decode the session's codec takes it over: the takeover is lost,
+/// the session is not.
+#[test]
+fn a_takeover_whose_video_answer_cannot_be_applied_leaves_the_session_running() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::with_a_takeover_that_cannot_be_applied("refused-video", PcId::Video);
+    session.serves_the_next_peer_and_stops();
+}
+
+#[test]
+fn a_takeover_whose_audio_answer_cannot_be_applied_leaves_the_session_running() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::with_a_takeover_that_cannot_be_applied("refused-audio", PcId::Audio);
+    session.serves_the_next_peer_and_stops();
+}
+
+/// The same answer from the first peer a session ever had still fails the launch, as it
+/// does on `develop`: there is no stream to keep, and the page is told why.
+#[test]
+fn a_first_answer_that_cannot_be_applied_still_fails_the_launch() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("refused-launch", Duration::from_secs(600));
+    session.mute = true;
+    let mut a = Peer::new();
+    let answered = session.pump(&mut a, Duration::from_secs(20), |s, _| {
+        s.answers[PcId::Video as usize].is_some()
+    });
+    assert!(answered, "the first peer never answered");
+    let sdp = refusing_its_first_m_line(session.answers[PcId::Video as usize].as_ref().unwrap());
+    let _ = session.to_host.send(SignalMsg::Answer {
+        sdp,
+        pc: Some(PcId::Video),
+    });
+
+    let ended = session.ends_within(Duration::from_secs(10));
+    assert!(
+        matches!(&ended, Some(SessionEvent::Failed(reason)) if reason.contains("rejected the remote answer")),
+        "the launch did not fail: {ended:?}"
+    );
+}
+
 /// The page that took the session over went away before answering. The operator's stop
 /// must still end the session: terminal event, and the runner off its thread.
 #[test]

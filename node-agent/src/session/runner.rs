@@ -1245,6 +1245,12 @@ impl SessionTransports {
         }
     }
 
+    /// Is `pc`'s transport one built for a peer that took the session over, not the one
+    /// the session launched on?
+    pub(crate) fn is_replacement(&self, pc: PcId) -> bool {
+        !self.displaced[pc as usize].is_empty()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_replacement_limit(&mut self, limit: usize) {
         for budget in &mut self.budget {
@@ -2445,6 +2451,21 @@ pub fn run_blocking(
                 continue;
             }
             let reason = pipeline::remote_description_failure_reason(failure.pc, &failure.reason);
+            // On a replacement the takeover is lost, not the session: it has streamed,
+            // and a second device that cannot take it (a browser without the session's
+            // codec answers like this) must not cost the app that is running. The
+            // transport stays as an abandoned one; the next peer gets its own.
+            if transports.is_replacement(failure.pc) {
+                tracing::warn!(
+                    token = "transport-replacement-answer-rejected",
+                    session_id = %session_id,
+                    pc = %failure.pc,
+                    "the peer taking the session over sent an answer the host cannot \
+                     apply; that takeover is abandoned and the session keeps running: \
+                     {reason}"
+                );
+                continue;
+            }
             tracing::error!(
                 token = "webrtc-set-remote-failed",
                 session_id = %session_id,
