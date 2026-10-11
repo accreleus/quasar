@@ -73,6 +73,7 @@ own; the two do not move together, and that is deliberate.
   amendment 26).
 
 ### Fixed
+- **A takeover or a revoked access that lands while the stream is being revealed is now readable for the whole handoff (#533).** The launch screen keeps its notice card up on its own ground instead of hiding it and flashing the reveal wipe, and the card fades out as the banner fades in.
 - **The failed-scan log test from #534 no longer fails now and then in CI (#534).** It checked that the whole log line did not contain the appid `730`, but the line also carries random scan and host ids and a timestamp, which contain those digits about one run in 75. It now checks every attribute of the record for the appid except the timestamp and the two random ids, and the whole line for letters-only markers that cannot occur in an id or a timestamp. A test-only change; the logs are unchanged.
 - **A takeover or a revoked access that lands while the stream is being revealed now shows its banner up to 220 ms sooner (#533).** The banner appears when the launch screen goes inert and starts to fade, not when it is removed. Leaving the screen's revoked-access card no longer asks the server to stop a session it has already stopped.
 - **A launch that deadlocks with a library scan report no longer fails with a server error (#553).** A launch could deadlock with a scan report that removes a game, on the host and the game's entitlement, and a launch that lost returned a 500. It is now retried, and refused cleanly if its game is gone.
