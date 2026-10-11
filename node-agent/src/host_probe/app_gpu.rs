@@ -232,6 +232,7 @@ mod tests {
 
     const EGL_OPENED: &str = "LOADED=/usr/lib64/libEGL.so.1\nEXTENSIONS=EGL_EXT_device_enumeration\nDEVICES=1\nRENDER_NODES=/dev/dri/renderD128\nOPENED=/dev/dri/renderD128\n";
     const NVIDIA_SUMMARY: &str = "Devices:\n========\nGPU0:\n\tvendorID = 0x10de\n\tdeviceID = 0x1f08\n\tdriverName = NVIDIA\n\tdriverInfo = 615.78.08\n";
+    const NVIDIA_NO_DRIVER_INFO: &str = "Devices:\n========\nGPU0:\n\tvendorID = 0x10de\n\tdeviceID = 0x1f08\n\tdriverName = NVIDIA\n";
     const LLVMPIPE_SUMMARY: &str = "Devices:\n========\nGPU0:\n\tvendorID = 0x10005\n\tdeviceID = 0x0\n\tdriverName = llvmpipe\n\tdriverInfo = Mesa 25.3.6\n";
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -286,7 +287,7 @@ mod tests {
     #[test]
     fn the_vulkan_step_gives_each_verdict_in_both_node_states() {
         let (segv, kill) = (Some(libc::SIGSEGV), Some(libc::SIGKILL));
-        let rows: [Row; 12] = [
+        let rows: [Row; 16] = [
             (
                 "NVIDIA listed, exit 0",
                 Some((NVIDIA_SUMMARY, Some(0), None)),
@@ -302,6 +303,30 @@ mod tests {
             (
                 "NVIDIA listed, then SIGSEGV",
                 Some((NVIDIA_SUMMARY, None, segv)),
+                Pass,
+                Pass,
+            ),
+            (
+                "NVIDIA listed, no driverInfo, exit 0",
+                Some((NVIDIA_NO_DRIVER_INFO, Some(0), None)),
+                Pass,
+                Pass,
+            ),
+            (
+                "NVIDIA listed, then exit 126",
+                Some((NVIDIA_SUMMARY, Some(126), None)),
+                Pass,
+                Pass,
+            ),
+            (
+                "NVIDIA listed, then exit 127",
+                Some((NVIDIA_SUMMARY, Some(127), None)),
+                Pass,
+                Pass,
+            ),
+            (
+                "NVIDIA listed, no exit code, no signal",
+                Some((NVIDIA_SUMMARY, None, None)),
                 Pass,
                 Pass,
             ),

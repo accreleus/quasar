@@ -2009,10 +2009,10 @@ pub(crate) fn vulkan_selftest_lines(modeset_absent: bool, run: Option<VulkanRun>
             None => (format!("was stopped by signal {signal}"), false),
         }),
         (None, Some(0)) => None,
-        // `env` could not exec vulkaninfo.
-        (None, Some(126 | 127)) => return unavailable("vulkaninfo could not be executed".into()),
+        // `env` could not exec vulkaninfo: no verdict of its own, but stdout is still read.
+        (None, Some(126 | 127)) => Some(("could not be executed".to_string(), false)),
         (None, Some(code)) => Some((format!("exited {code}"), true)),
-        (None, None) => return unavailable("vulkaninfo ended without an exit code".into()),
+        (None, None) => Some(("ended without an exit code".to_string(), false)),
     };
     if let Some(device) = crate::gpu_identity::parse_vulkan_summary(&stdout)
         .iter()
@@ -2021,7 +2021,13 @@ pub(crate) fn vulkan_selftest_lines(modeset_absent: bool, run: Option<VulkanRun>
         let after = ending.map_or(String::new(), |(how, _)| {
             format!(" (vulkaninfo then {how})")
         });
-        return vec![format!("VULKAN_NVIDIA={}{after}", device.driver_info)];
+        // `vulkaninfo` prints driver properties conditionally: a device with none is still
+        // listed, so the value is never empty.
+        let driver = match device.driver_info.trim() {
+            "" => format!("device 0x{:04x}", device.device_id),
+            info => info.to_string(),
+        };
+        return vec![format!("VULKAN_NVIDIA={driver}{after}")];
     }
     let failure = match ending {
         None => "the Vulkan loader lists no NVIDIA device".to_string(),
@@ -3160,6 +3166,20 @@ mod tests {
     // ── Vulkan step of the application-GPU self-test ────────────────────────
 
     const NVIDIA_SUMMARY: &str = "Devices:\n========\nGPU0:\n\tapiVersion = 1.4.312\n\tvendorID = 0x10de\n\tdeviceID = 0x1f08\n\tdriverName = NVIDIA\n\tdriverInfo = 615.78.08\n";
+
+    #[test]
+    fn a_listed_nvidia_device_without_driver_info_still_names_a_value() {
+        let summary = "Devices:\n========\nGPU0:\n\tvendorID = 0x10de\n\tdeviceID = 0x1f08\n\tdriverName = NVIDIA\n";
+        let l = vulkan_selftest_lines(true, Some((summary.into(), Some(0), None)));
+        assert_eq!(l, ["VULKAN_NVIDIA=device 0x1f08"]);
+        // Whatever the emitter produces, the parser accepts.
+        assert_eq!(
+            parse_vulkan_probe(&format!("{}\n", l[0]), true),
+            VulkanProbe::Ok {
+                driver: "device 0x1f08".into()
+            }
+        );
+    }
 
     #[test]
     fn a_nvidia_device_listed_before_a_bad_ending_is_still_a_pass() {
