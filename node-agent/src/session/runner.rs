@@ -1189,13 +1189,10 @@ impl Negotiation {
         pipeline::answer_from(self.answer.as_deref(), answer, dtls_started, self.reoffered)
     }
 
-    /// `answer` is being handed to the transport. Returns the ICE ufrag it supersedes
-    /// when it is a correction: those credentials answer nothing from here on.
-    fn applied(&mut self, answer: &str) -> Option<String> {
+    /// `answer` is being handed to the transport.
+    fn applied(&mut self, answer: &str) {
         self.reoffered = false;
-        let was = self.answer.replace(answer.to_string());
-        let was = was.as_deref().and_then(pipeline::ice_ufrag)?;
-        (Some(was) != pipeline::ice_ufrag(answer)).then(|| was.to_string())
+        self.answer = Some(answer.to_string());
     }
 
     /// The transport is being replaced. Returns the ICE ufrag of the peer it leaves.
@@ -1215,8 +1212,7 @@ pub(crate) struct SessionTransports {
     pub(crate) audio_pipeline: AudioPipelineGuard,
     /// Per PC (video, audio): replaced, and that offer not answered yet.
     unanswered: [bool; 2],
-    /// Per PC: ICE ufrags no current peer answers with any more, newest last. Those of
-    /// the peers whose transport was retired, and those a peer has since corrected.
+    /// Per PC: the ICE ufrags of the peers whose transport was retired, newest last.
     displaced: [Vec<String>; 2],
     negotiation: [Negotiation; 2],
     budget: [ReplacementBudget; 2],
@@ -1287,14 +1283,6 @@ impl SessionTransports {
             server::classify_inbound(&msg, &mut self.unanswered[i], &self.displaced[i], |sdp| {
                 negotiation.who(sdp, target.is_some_and(pipeline::dtls_started))
             });
-        let remember_stale = |stale: &mut Vec<String>, ufrag: Option<String>| {
-            if let Some(ufrag) = ufrag {
-                stale.push(ufrag);
-                if stale.len() > DISPLACED_REMEMBERED {
-                    stale.remove(0);
-                }
-            }
-        };
         // Replacements and re-offers share one budget: both are a client making the host
         // do work with an answer.
         let over_budget = |budget: &mut ReplacementBudget| match budget.admit(Instant::now()) {
@@ -1333,7 +1321,13 @@ impl SessionTransports {
                     "{pc} PC: the answer is from a peer this transport has not negotiated \
                      with — replacing the transport"
                 );
-                remember_stale(&mut self.displaced[i], self.negotiation[i].replaced());
+                if let Some(gone) = self.negotiation[i].replaced() {
+                    let displaced = &mut self.displaced[i];
+                    displaced.push(gone);
+                    if displaced.len() > DISPLACED_REMEMBERED {
+                        displaced.remove(0);
+                    }
+                }
                 match pc {
                     PcId::Video => self.slot.replace_video(&mut self.video)?,
                     PcId::Audio => {
@@ -1376,9 +1370,7 @@ impl SessionTransports {
                 msg = SignalMsg::RestartIce { pc: Some(pc) };
             }
             server::Inbound::Apply => match &msg {
-                SignalMsg::Answer { sdp, .. } => {
-                    remember_stale(&mut self.displaced[i], self.negotiation[i].applied(sdp));
-                }
+                SignalMsg::Answer { sdp, .. } => self.negotiation[i].applied(sdp),
                 // One that reaches a transport before its first offer is absorbed.
                 SignalMsg::RestartIce { .. } if target.is_some_and(pipeline::has_offered) => {
                     self.negotiation[i].reoffered = true;
@@ -4461,7 +4453,7 @@ mod tests {
             negotiation.who(&late, false),
             pipeline::AnswerFrom::ThisPeer
         );
-        assert_eq!(negotiation.applied(&late), None);
+        negotiation.applied(&late);
 
         assert_eq!(
             negotiation.who(&current, false),
@@ -4480,16 +4472,12 @@ mod tests {
             negotiation.who(&current, false),
             pipeline::AnswerFrom::ThisPeer
         );
-        assert_eq!(
-            negotiation.applied(&current),
-            Some("old1".to_string()),
-            "the credentials it replaces are stale from here on"
-        );
+        negotiation.applied(&current);
         assert!(!negotiation.reoffered);
         assert_eq!(
-            negotiation.applied(&current),
-            None,
-            "a re-answer supersedes nothing"
+            negotiation.who(&late, false),
+            pipeline::AnswerFrom::ThisPeerCorrecting,
+            "the transport now holds the correction"
         );
     }
 

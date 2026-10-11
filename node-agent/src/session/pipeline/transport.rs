@@ -113,6 +113,53 @@ fn transport_bin(webrtc: &gst::Element, retired: &Arc<AtomicBool>) -> Result<gst
     Ok(bin)
 }
 
+/// How long a connected replacement waits for the keyframe it asked for before it sends
+/// whatever the encoder produces.
+const KEYFRAME_WAIT: Duration = Duration::from_secs(1);
+
+/// Stop dropping RTP at the tail from the encoder's next keyframe on. The frames dropped
+/// before it leave a GOP the new peer has none of: what follows them in that GOP would
+/// reach it undecodable.
+fn open_at_keyframe(
+    encoder: &gst::Element,
+    tail: &glib::WeakRef<gst::Pad>,
+    gate: &Arc<Mutex<Option<gst::PadProbeId>>>,
+    session_id: &str,
+) {
+    let (tail, gate, session_id) = (tail.clone(), gate.clone(), session_id.to_string());
+    let open = move |keyframe: bool| {
+        let Some(gate) = gate.lock().unwrap().take() else {
+            return; // retired meanwhile, or opened already
+        };
+        if let Some(tail) = tail.upgrade() {
+            tail.remove_probe(gate);
+        }
+        if !keyframe {
+            tracing::warn!(
+                token = "transport-replacement-keyframe-missing",
+                session_id = %session_id,
+                "video PC: no keyframe {} ms after the new peer connected; sending what the \
+                 encoder produces, which shows nothing until its next keyframe",
+                KEYFRAME_WAIT.as_millis()
+            );
+        }
+    };
+    let Some(src) = encoder.static_pad("src") else {
+        return open(false);
+    };
+    let deadline = std::time::Instant::now() + KEYFRAME_WAIT;
+    src.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        let keyframe = info
+            .buffer()
+            .is_some_and(|b| !b.flags().contains(gst::BufferFlags::DELTA_UNIT));
+        if !keyframe && std::time::Instant::now() < deadline {
+            return gst::PadProbeReturn::Ok;
+        }
+        open(keyframe);
+        gst::PadProbeReturn::Remove
+    });
+}
+
 /// Return once no push from `pad` is in progress.
 fn wait_idle(pad: &gst::Pad) {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -248,17 +295,14 @@ impl TransportSlot {
                 let state = webrtc
                     .property::<gstreamer_webrtc::WebRTCPeerConnectionState>("connection-state");
                 if state == gstreamer_webrtc::WebRTCPeerConnectionState::Connected {
-                    if let (Some(tail), Some(gate)) = (tail.upgrade(), gate.lock().unwrap().take())
-                    {
-                        tail.remove_probe(gate);
-                    }
                     if let Some(encoder) = encoder.upgrade() {
                         tracing::info!(
                             token = "transport-replacement-connected",
                             session_id = %session_id,
                             "video PC: the replacement transport's peer connected; forcing \
-                             a keyframe for it"
+                             a keyframe and sending from it"
                         );
+                        open_at_keyframe(&encoder, &tail, &gate, &session_id);
                         resize::force_idr(&encoder);
                     }
                 }

@@ -56,8 +56,14 @@ fn live_webrtc_available() -> bool {
 }
 
 fn host_cfg(mic: bool) -> SessionConfig {
+    host_cfg_with(mic, false)
+}
+
+/// `fps_rung`: the scale stage also carries the frame-rate lever (`abr_ladder_fps`).
+fn host_cfg_with(mic: bool, fps_rung: bool) -> SessionConfig {
     let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
     settings.encoder = EncoderChoice::Openh264;
+    settings.ladder.fps_enabled = fps_rung;
     let stream = StreamParams {
         width: 320,
         height: 240,
@@ -120,7 +126,10 @@ impl Host {
     /// `mic`: the session was launched with the microphone granted, so the audio PC
     /// offers a second, recvonly m-line (decoded into a fakesink here: no sidecar).
     fn start_with(tag: &str, mic: bool) -> Host {
-        let mut cfg = host_cfg(mic);
+        Host::start_cfg(tag, host_cfg(mic))
+    }
+
+    fn start_cfg(tag: &str, mut cfg: SessionConfig) -> Host {
         let resolved = resolve_effective_encoder(&mut cfg).expect("resolve encoder");
         let sink = format!("takeover-{tag}-{}", std::process::id());
         let source = build_source_pipeline(&cfg, None, &sink).expect("source pipeline");
@@ -307,6 +316,23 @@ struct PeerPc {
     rtp: Arc<AtomicU64>,
     channel: Arc<Mutex<Option<Channel>>>,
     pongs: Arc<AtomicU64>,
+    /// The H.264 NAL unit type the first RTP packet out of webrtcbin starts with.
+    first_nal: Arc<Mutex<Option<u8>>>,
+}
+
+/// The NAL unit type an H.264 RTP packet starts with, looking inside a STAP-A or FU-A.
+fn first_nal_type(info: &gst::PadProbeInfo) -> Option<u8> {
+    let buffer: &gst::BufferRef = match info.buffer() {
+        Some(buffer) => buffer.as_ref(),
+        None => info.buffer_list()?.get(0)?,
+    };
+    let rtp = gstreamer_rtp::RTPBuffer::from_buffer_readable(buffer).ok()?;
+    let payload = rtp.payload().ok()?;
+    Some(match payload.first()? & 0x1f {
+        24 => payload.get(3)? & 0x1f,
+        28 => payload.get(1)? & 0x1f,
+        nal => nal,
+    })
 }
 
 impl PeerPc {
@@ -315,15 +341,19 @@ impl PeerPc {
         let (pipeline, webrtc) = build_answerer_pipeline(tx.clone()).expect("answerer");
         let rtp = Arc::new(AtomicU64::new(0));
         let counter = rtp.clone();
+        let first_nal = Arc::new(Mutex::new(None));
+        let first = first_nal.clone();
         webrtc.connect_pad_added(move |_, pad| {
             if pad.direction() != gst::PadDirection::Src {
                 return;
             }
-            let counter = counter.clone();
+            let (counter, first) = (counter.clone(), first.clone());
             pad.add_probe(
                 gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
-                move |_, _| {
-                    counter.fetch_add(1, Ordering::Relaxed);
+                move |_, info| {
+                    if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+                        *first.lock().unwrap() = first_nal_type(info);
+                    }
                     gst::PadProbeReturn::Ok
                 },
             );
@@ -356,6 +386,7 @@ impl PeerPc {
             rtp,
             channel,
             pongs,
+            first_nal,
         }
     }
 
@@ -1522,8 +1553,10 @@ struct Session {
     ended: Option<SessionEvent>,
     /// Nothing the peer says reaches the host.
     mute: bool,
-    // The runner reads a closed swap lane as its owner going away.
-    _swap: std::sync::mpsc::Sender<crate::session::runner::SwapRequest>,
+    /// The runner reported `SwapDone`.
+    swapped: bool,
+    swap: std::sync::mpsc::Sender<crate::session::runner::SwapRequest>,
+    display: std::sync::mpsc::Sender<crate::session::runner::DisplayUpdateRequest>,
 }
 
 impl Session {
@@ -1541,7 +1574,7 @@ impl Session {
         );
         let (to_host, sig_rx) = std::sync::mpsc::channel();
         let (swap, swap_rx) = std::sync::mpsc::channel();
-        let (_, display_rx) = std::sync::mpsc::channel();
+        let (display, display_rx) = std::sync::mpsc::channel();
         let (_, capture_rx) = std::sync::mpsc::channel();
         let metrics = Arc::new(SessionMetrics::new("smooth", cfg.stream.fps as u32));
         let (id, flag) = (format!("takeover-{tag}"), stop.clone());
@@ -1568,7 +1601,9 @@ impl Session {
             answers: [None, None],
             ended: None,
             mute: false,
-            _swap: swap,
+            swapped: false,
+            swap,
+            display,
         }
     }
 
@@ -1597,6 +1632,7 @@ impl Session {
                     SessionEvent::Stopped { .. } | SessionEvent::Failed(_) => {
                         self.ended = Some(event)
                     }
+                    SessionEvent::SwapDone => self.swapped = true,
                     _ => {}
                 }
             }
@@ -1731,6 +1767,124 @@ fn a_session_nobody_answered_stops() {
     assert!(
         matches!(ended, Some(SessionEvent::Stopped { .. })),
         "the session did not stop: {ended:?}"
+    );
+}
+
+impl Session {
+    /// A size step, then an app swap, then a stop, with whatever the transports are
+    /// waiting for still outstanding. The size step makes the source renegotiate; the
+    /// swap re-points the encoder on the runner's own thread. If a transport holds RTP,
+    /// the first waits behind it and the second waits on the first: no `SwapDone`, and a
+    /// runner that never sees the stop.
+    fn resize_swap_and_stop(&mut self) {
+        use crate::session::runner::{DisplayUpdateRequest, SwapRequest};
+        self.mute = true;
+        let mut nobody = Peer::new();
+        let step = DisplayUpdateRequest {
+            stream: Some((160, 120)),
+            ..Default::default()
+        };
+        self.display.send(step).expect("display lane");
+        self.pump(&mut nobody, Duration::from_secs(1), |_, _| false);
+
+        self.swap
+            .send(SwapRequest { container: None })
+            .expect("swap lane");
+        let swapped = self.pump(&mut nobody, Duration::from_secs(10), |s, _| s.swapped);
+        assert!(swapped, "the swap never completed");
+
+        self.stop.store(true, Ordering::SeqCst);
+        let ended = self.ends_within(Duration::from_secs(10));
+        assert!(
+            matches!(ended, Some(SessionEvent::Stopped { .. })),
+            "the session did not stop: {ended:?}"
+        );
+    }
+}
+
+/// One replacement per PC, nobody answering the new transports, is inside the budget.
+#[test]
+fn a_resize_and_a_swap_during_an_abandoned_takeover_leave_the_runner_free() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::with_an_abandoned_takeover("resize-swap", Duration::from_secs(600));
+    session.resize_swap_and_stop();
+}
+
+/// A frame-rate step alone, with the fps rung on, renegotiates like a size step.
+#[test]
+fn an_fps_step_and_a_swap_do_not_wait_on_a_transport_nobody_answered() {
+    if !live_webrtc_available() {
+        return;
+    }
+    use super::ResolutionLever;
+    let _serial = serial();
+    let mut host = Host::start_cfg("fps", host_cfg_with(false, true));
+    let _a = first_attach(&mut host);
+    abandon_a_takeover(&mut host);
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert_eq!(
+        host.lever.set_fps(15).ok(),
+        Some(true),
+        "this rig has no frame-rate lever"
+    );
+    let frames = source_frames(&host);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        frames.load(Ordering::Relaxed) > 15,
+        "the source stalled after a frame-rate step with nobody connected"
+    );
+    assert!(
+        host.swap_source("fps-2"),
+        "the swapped-out source did not stop with nobody connected"
+    );
+}
+
+/// RTP is dropped while a replacement waits for its peer, mid-GOP as it comes. What the
+/// peer then receives must start at a keyframe: the rest of the GOP it has none of would
+/// reach it undecodable. The encoder here acts on the keyframe request 300 ms late, as
+/// one with frames in flight does, so frames of the old GOP are there to be sent.
+#[test]
+fn the_first_frame_a_new_peer_receives_is_a_keyframe() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("first-frame");
+    let _a = first_attach(&mut host);
+    let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (lose, again) = (lost.clone(), host.encoder.clone());
+    host.encoder.static_pad("src").unwrap().add_probe(
+        gst::PadProbeType::EVENT_UPSTREAM,
+        move |_, info| {
+            let request = info
+                .event()
+                .is_some_and(|e| e.structure().is_some_and(|s| s.name() == "GstForceKeyUnit"));
+            if request && !lose.swap(true, Ordering::SeqCst) {
+                return gst::PadProbeReturn::Drop;
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+    std::thread::spawn(move || {
+        while !lost.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        super::resize::force_idr(&again);
+    });
+
+    let b = attach(&mut host);
+
+    let nal = *b.video.first_nal.lock().unwrap();
+    // 7 and 8 are the parameter sets a keyframe leads with, 5 an IDR slice; 1 is a
+    // slice of a frame that depends on earlier ones.
+    assert!(
+        matches!(nal, Some(5 | 7 | 8)),
+        "the new peer's first video packet starts with NAL type {nal:?}"
     );
 }
 
