@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- Future GitHub releases can be announced in the community Discord, with a channel-scoped webhook, an activation cutoff, and persistent duplicate-delivery protection.
+
 ## 0.4.1 — 2026-10-04
 
 ### Added
