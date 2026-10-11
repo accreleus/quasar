@@ -1111,6 +1111,65 @@ impl Drop for AudioPipelineGuard {
     }
 }
 
+/// How many times one PC's transport may be replaced in [`REPLACEMENT_WINDOW`] (#535).
+///
+/// A replacement is one new page taking the session over: a person changing device does
+/// it once, and cannot usefully do it more often than every ten seconds. Each one costs
+/// the runner up to 2 s and resets this session's encoder to its launch bitrate, so a
+/// client that loops answers (a displacement loop between two pages, or abuse) must not
+/// be served past this.
+const MAX_REPLACEMENTS_PER_WINDOW: usize = 6;
+const REPLACEMENT_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many displaced peers each PC remembers. The relay leaks at most one frame per
+/// displaced socket, so a short chain of takeovers is all there is to recognise.
+const DISPLACED_REMEMBERED: usize = 4;
+
+/// The sliding window behind [`MAX_REPLACEMENTS_PER_WINDOW`].
+struct ReplacementBudget {
+    limit: usize,
+    recent: std::collections::VecDeque<Instant>,
+    /// A refusal was logged and nothing has been admitted since.
+    refusing: bool,
+}
+
+/// What [`ReplacementBudget::admit`] decided.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Admitted,
+    /// Over the limit; `first` on the first refusal since the last admission.
+    Refused {
+        first: bool,
+    },
+}
+
+impl ReplacementBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            recent: std::collections::VecDeque::new(),
+            refusing: false,
+        }
+    }
+
+    fn admit(&mut self, now: Instant) -> Admission {
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= REPLACEMENT_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= self.limit {
+            let first = !std::mem::replace(&mut self.refusing, true);
+            return Admission::Refused { first };
+        }
+        self.recent.push_back(now);
+        self.refusing = false;
+        Admission::Admitted
+    }
+}
+
 /// The session's WebRTC transports. Each is replaced, under the running encoder, when a
 /// peer other than the one it negotiated with answers on it (#535).
 pub(crate) struct SessionTransports {
@@ -1120,6 +1179,9 @@ pub(crate) struct SessionTransports {
     pub(crate) audio_pipeline: AudioPipelineGuard,
     /// Per PC (video, audio): replaced, and that offer not answered yet.
     unanswered: [bool; 2],
+    /// Per PC: the ICE ufrags of the peers whose transport was retired, newest last.
+    displaced: [Vec<String>; 2],
+    budget: [ReplacementBudget; 2],
 }
 
 impl SessionTransports {
@@ -1136,6 +1198,18 @@ impl SessionTransports {
             // #408: owned by a Drop-to-NULL guard from the moment the pipeline exists.
             audio_pipeline: AudioPipelineGuard::new(audio_pipeline),
             unanswered: [false; 2],
+            displaced: [Vec::new(), Vec::new()],
+            budget: [
+                ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
+                ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
+            ],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_replacement_limit(&mut self, limit: usize) {
+        for budget in &mut self.budget {
+            budget.limit = limit;
         }
     }
 
@@ -1154,21 +1228,54 @@ impl SessionTransports {
             SignalMsg::Answer { pc, .. } | SignalMsg::Ice { pc, .. } => pc.unwrap_or_default(),
             _ => PcId::Video,
         };
+        let i = pc as usize;
         let target = match pc {
             PcId::Video => Some(&self.video.webrtc),
             PcId::Audio => self.audio_webrtc.as_ref(),
         };
-        let verdict = server::classify_inbound(&msg, &mut self.unanswered[pc as usize], |sdp| {
-            target.is_some_and(|t| pipeline::answer_is_from_new_peer(t, sdp))
-        });
+        let verdict =
+            server::classify_inbound(&msg, &mut self.unanswered[i], &self.displaced[i], |sdp| {
+                target.is_some_and(|t| pipeline::answer_is_from_new_peer(t, sdp))
+            });
         match verdict {
-            server::Inbound::Stale => return Ok(None),
+            server::Inbound::Stale => {
+                if matches!(msg, SignalMsg::Answer { .. }) {
+                    tracing::info!(
+                        token = "signaling-answer-from-displaced-peer",
+                        "{pc} PC: dropped an answer from a peer whose transport was replaced"
+                    );
+                }
+                return Ok(None);
+            }
             server::Inbound::NewPeer(pc) => {
+                match self.budget[i].admit(Instant::now()) {
+                    Admission::Admitted => {}
+                    // Not applied either: it would rebind the current peer's transport.
+                    Admission::Refused { first } => {
+                        if first {
+                            tracing::warn!(
+                                token = "transport-replace-rate-limited",
+                                "{pc} PC: {MAX_REPLACEMENTS_PER_WINDOW} transport replacements \
+                                 in {} s — answers from further new peers are ignored until \
+                                 the window clears; the current transport is kept",
+                                REPLACEMENT_WINDOW.as_secs()
+                            );
+                        }
+                        return Ok(None);
+                    }
+                }
                 tracing::info!(
                     token = "transport-replaced",
                     "{pc} PC: the answer is from a peer this transport has not negotiated \
                      with — replacing the transport"
                 );
+                if let Some(gone) = target.and_then(pipeline::negotiated_ufrag) {
+                    let displaced = &mut self.displaced[i];
+                    displaced.push(gone);
+                    if displaced.len() > DISPLACED_REMEMBERED {
+                        displaced.remove(0);
+                    }
+                }
                 match pc {
                     PcId::Video => self.slot.replace_video(&mut self.video)?,
                     PcId::Audio => {
@@ -1187,7 +1294,7 @@ impl SessionTransports {
                         self.audio_pipeline.play();
                     }
                 }
-                self.unanswered[pc as usize] = true;
+                self.unanswered[i] = true;
                 return Ok(Some(pc));
             }
             server::Inbound::Apply => {}
@@ -4122,6 +4229,29 @@ mod tests {
 
     /// A stand-in for the #304 audio pipeline, brought to READY as
     /// `build_encode_pipeline` leaves it.
+    /// #535: a PC's transport is replaced at most `limit` times a minute. The refusal is
+    /// reported once per streak, and the window slides.
+    #[test]
+    fn the_replacement_budget_admits_a_handful_a_minute_and_reports_a_refusal_once() {
+        use super::{
+            Admission, ReplacementBudget, MAX_REPLACEMENTS_PER_WINDOW, REPLACEMENT_WINDOW,
+        };
+        let mut budget = ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW);
+        let t0 = std::time::Instant::now();
+        for n in 0..MAX_REPLACEMENTS_PER_WINDOW {
+            let at = t0 + Duration::from_secs(n as u64);
+            assert_eq!(budget.admit(at), Admission::Admitted, "replacement {n}");
+        }
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(budget.admit(later), Admission::Refused { first: true });
+        assert_eq!(budget.admit(later), Admission::Refused { first: false });
+        // The first replacement leaves the window; one more is admitted, then refused
+        // again, and that is a new streak.
+        let cleared = t0 + REPLACEMENT_WINDOW;
+        assert_eq!(budget.admit(cleared), Admission::Admitted);
+        assert_eq!(budget.admit(cleared), Admission::Refused { first: true });
+    }
+
     /// #535: an error a retired transport posted before it left the pipeline is not the
     /// session's. Reading it as one ends the session the new peer just took over.
     #[test]

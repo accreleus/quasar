@@ -81,9 +81,9 @@ pub use abr_glue::{trigger, EncodeResolutionLever, ResolutionLever};
 mod webrtc;
 pub(crate) use webrtc::restart_ice;
 pub(crate) use webrtc::{
-    answer_is_from_new_peer, apply_remote_description, build_answerer_pipeline,
-    remote_description_failure_reason, RemoteDescriptionApplied, RemoteDescriptionFailure,
-    SrdFailTx, SrdOkTx,
+    answer_is_from_new_peer, apply_remote_description, build_answerer_pipeline, has_offered,
+    ice_ufrag, negotiated_ufrag, remote_description_failure_reason, RemoteDescriptionApplied,
+    RemoteDescriptionFailure, SrdFailTx, SrdOkTx,
 };
 use webrtc::{
     connect_data_channel_open, connect_ice_candidate, connect_negotiation_needed,

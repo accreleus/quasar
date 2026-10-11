@@ -59,6 +59,15 @@ pub struct TransportSlot {
     pub(super) observe: bool,
 }
 
+/// Give a `webrtcbin` sink pad the MediaStream id this PC always uses. Left unset,
+/// webrtcbin invents one per instance, and a client then sees a replaced transport's
+/// offer as a new stream: a second `track` event on a peer connection it already wired.
+fn pin_msid(pad: &gst::Pad, pc: PcId) {
+    if pad.find_property("msid").is_some() {
+        pad.set_property("msid", format!("quasar-{pc}"));
+    }
+}
+
 /// Wrap `webrtc` in a bin whose sink pad reports success for whatever a retired
 /// transport returns. A push parked inside a transport being torn down comes back
 /// FLUSHING, and FLUSHING reaching the encode chain pauses its streaming task for good.
@@ -68,6 +77,7 @@ fn transport_bin(webrtc: &gst::Element, retired: &Arc<AtomicBool>) -> Result<gst
     let target = webrtc
         .request_pad_simple("sink_%u")
         .context("webrtcbin refused a sink pad request (video)")?;
+    pin_msid(&target, PcId::Video);
     let (for_buffer, for_list) = (retired.clone(), retired.clone());
     let sink = gst::GhostPad::builder_with_target(&target)?
         .name("sink")
@@ -321,6 +331,7 @@ impl TransportSlot {
         let audio_sink_pad = audio_webrtc
             .request_pad_simple("sink_%u")
             .context("audio webrtcbin refused a sink pad request")?;
+        pin_msid(&audio_sink_pad, PcId::Audio);
         audio_src_pad
             .link(&audio_sink_pad)
             .context("failed to link audio into audio webrtcbin")?;

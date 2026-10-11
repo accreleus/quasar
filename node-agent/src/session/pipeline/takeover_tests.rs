@@ -43,7 +43,7 @@ fn live_webrtc_available() -> bool {
     missing.is_empty()
 }
 
-fn host_cfg() -> SessionConfig {
+fn host_cfg(mic: bool) -> SessionConfig {
     let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
     settings.encoder = EncoderChoice::Openh264;
     let stream = StreamParams {
@@ -54,7 +54,7 @@ fn host_cfg() -> SessionConfig {
         h264_profile: "constrained-baseline".to_string(),
         codec: Codec::H264,
         abr_floor_kbps: 0,
-        mic: false,
+        mic,
     };
     let mut cfg = SessionConfig::for_assignment_with(&settings, stream, None);
     cfg.use_test_src = true;
@@ -79,6 +79,10 @@ struct Host {
     transports: SessionTransports,
     /// PCs whose transport was replaced for a new peer, in order.
     replaced: Vec<PcId>,
+    /// Every offer the host sent and every answer it was handed, in order.
+    wire: Vec<(&'static str, PcId, String)>,
+    /// Rewrites an answer before the host sees it (evidence runs).
+    munge_answer: Option<fn(String) -> String>,
     sig_tx: OutTx,
     sig_rx: mpsc::UnboundedReceiver<SignalMsg>,
     bus: gst::Bus,
@@ -93,7 +97,13 @@ struct Host {
 
 impl Host {
     fn start(tag: &str) -> Host {
-        let mut cfg = host_cfg();
+        Host::start_with(tag, false)
+    }
+
+    /// `mic`: the session was launched with the microphone granted, so the audio PC
+    /// offers a second, recvonly m-line (decoded into a fakesink here: no sidecar).
+    fn start_with(tag: &str, mic: bool) -> Host {
+        let mut cfg = host_cfg(mic);
         let resolved = resolve_effective_encoder(&mut cfg).expect("resolve encoder");
         let sink = format!("takeover-{tag}-{}", std::process::id());
         let source = build_source_pipeline(&cfg, None, &sink).expect("source pipeline");
@@ -165,6 +175,8 @@ impl Host {
             pipeline,
             transports,
             replaced: Vec::new(),
+            wire: Vec::new(),
+            munge_answer: None,
             sig_tx,
             sig_rx,
             bus,
@@ -177,6 +189,17 @@ impl Host {
     }
 
     fn inbound(&mut self, msg: SignalMsg) {
+        let msg = match (msg, self.munge_answer) {
+            (SignalMsg::Answer { sdp, pc }, Some(munge)) => SignalMsg::Answer {
+                sdp: munge(sdp),
+                pc,
+            },
+            (msg, _) => msg,
+        };
+        if let SignalMsg::Answer { sdp, pc } = &msg {
+            self.wire
+                .push(("answer", pc.unwrap_or_default(), sdp.clone()));
+        }
         let replaced = self
             .transports
             .inbound(msg, &self.sig_tx, None, None)
@@ -401,7 +424,11 @@ fn pump_with(
     loop {
         while let Ok(msg) = host.sig_rx.try_recv() {
             let pc = match &msg {
-                SignalMsg::Offer { pc, .. } => *pc,
+                SignalMsg::Offer { pc, sdp } => {
+                    host.wire
+                        .push(("offer", pc.unwrap_or_default(), sdp.clone()));
+                    *pc
+                }
                 SignalMsg::Ice { pc, .. } if carry_ice => *pc,
                 _ => continue,
             };
@@ -440,6 +467,54 @@ fn trace_to_stderr() {
         .try_init();
 }
 
+/// The first value of an SDP attribute or line prefix.
+fn sdp_value<'a>(sdp: &'a str, prefix: &str) -> &'a str {
+    sdp.lines()
+        .find_map(|l| l.trim().strip_prefix(prefix))
+        .unwrap_or("-")
+}
+
+fn sdp_values<'a>(sdp: &'a str, prefix: &str) -> Vec<&'a str> {
+    sdp.lines()
+        .filter_map(|l| l.trim().strip_prefix(prefix))
+        .collect()
+}
+
+/// The MediaStream ids an SDP names, from its `a=ssrc:<id> msid:<stream> <track>` lines.
+fn sdp_msids(sdp: &str) -> std::collections::BTreeSet<&str> {
+    sdp_values(sdp, "a=ssrc:")
+        .into_iter()
+        .filter_map(|v| v.split_once(" msid:"))
+        .filter_map(|(_, msid)| msid.split(' ').next())
+        .collect()
+}
+
+/// What identifies an SDP's session and transport, one line.
+fn sdp_facts(sdp: &str) -> String {
+    let origin: Vec<&str> = sdp_value(sdp, "o=").split(' ').collect();
+    let ssrcs: std::collections::BTreeSet<&str> = sdp_values(sdp, "a=ssrc:")
+        .into_iter()
+        .filter_map(|v| v.split(' ').next())
+        .collect();
+    format!(
+        "o=(id {} v {}) ufrag={} fp={} setup={} mids={:?} bundle={} sctp-port={} ssrc={:?} msid={:?} m={:?}",
+        origin.get(1).unwrap_or(&"-"),
+        origin.get(2).unwrap_or(&"-"),
+        sdp_value(sdp, "a=ice-ufrag:").chars().take(8).collect::<String>(),
+        sdp_value(sdp, "a=fingerprint:").chars().take(24).collect::<String>(),
+        sdp_value(sdp, "a=setup:"),
+        sdp_values(sdp, "a=mid:"),
+        sdp_value(sdp, "a=group:BUNDLE "),
+        sdp_value(sdp, "a=sctp-port:"),
+        ssrcs,
+        sdp_msids(sdp),
+        sdp_values(sdp, "m=")
+            .iter()
+            .map(|m| m.split(' ').take(2).collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn rtp(pc: &PeerPc) -> u64 {
     pc.rtp.load(Ordering::Relaxed)
 }
@@ -463,12 +538,7 @@ fn first_attach(host: &mut Host) -> Peer {
 /// (`web/src/webrtc/session.ts`, `requestOfferOnOpen`), then the wait for its media.
 fn attach(host: &mut Host) -> Peer {
     let mut peer = Peer::new();
-    host.inbound(SignalMsg::RestartIce {
-        pc: Some(PcId::Video),
-    });
-    host.inbound(SignalMsg::RestartIce {
-        pc: Some(PcId::Audio),
-    });
+    request_offers(host);
     let up = pump(host, &mut peer, Duration::from_secs(20), |_, p| {
         streaming(p)
     });
@@ -629,12 +699,7 @@ fn a_restart_from_the_same_peer_keeps_the_transport() {
     let mut a = first_attach(&mut host);
     let transport = host.transports.video.webrtc.clone();
 
-    host.inbound(SignalMsg::RestartIce {
-        pc: Some(PcId::Video),
-    });
-    host.inbound(SignalMsg::RestartIce {
-        pc: Some(PcId::Audio),
-    });
+    request_offers(&mut host);
     let before = rtp(&a.video);
     pump(&mut host, &mut a, Duration::from_secs(2), |_, _| false);
 
@@ -647,6 +712,211 @@ fn a_restart_from_the_same_peer_keeps_the_transport() {
     assert!(input_reaches_host(&mut host, &mut a));
 }
 
+/// The `n`th SDP of one kind the wire carried for the video PC.
+fn video_sdp<'a>(host: &'a Host, what: &str, n: usize) -> &'a str {
+    host.wire
+        .iter()
+        .filter(|(w, pc, _)| *w == what && *pc == PcId::Video)
+        .nth(n)
+        .map(|(_, _, sdp)| sdp.as_str())
+        .unwrap_or_else(|| panic!("no video {what} #{n} on the wire"))
+}
+
+fn request_offers(host: &mut Host) {
+    host.inbound(SignalMsg::RestartIce {
+        pc: Some(PcId::Video),
+    });
+    host.inbound(SignalMsg::RestartIce {
+        pc: Some(PcId::Audio),
+    });
+}
+
+/// What the taking page is sent, as `protocol/signaling.md` states it (amendment 27):
+/// first the old transport's offer again, then the new transport's, which to the client
+/// is an ICE restart on the same DTLS identity.
+#[test]
+fn the_new_transports_offer_differs_from_the_old_one_only_as_an_ice_restart_does() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start_with("offers", true);
+    let _a = first_attach(&mut host);
+    let _b = attach(&mut host);
+
+    // The microphone m-line is in every audio offer, under the same mid: the slot a
+    // client claimed on the first one is the slot the last one offers.
+    let audio: Vec<&str> = host
+        .wire
+        .iter()
+        .filter(|(what, pc, _)| *what == "offer" && *pc == PcId::Audio)
+        .map(|(_, _, sdp)| sdp.as_str())
+        .collect();
+    assert_eq!(audio.len(), 3, "launch, again, and the new transport's");
+    for offer in &audio {
+        assert_eq!(
+            sdp_msids(offer),
+            sdp_msids(audio[0]),
+            "a new stream to the client"
+        );
+        assert_eq!(sdp_values(offer, "a=mid:"), sdp_values(audio[0], "a=mid:"));
+        assert_eq!(
+            sdp_values(offer, "a=mid:").len(),
+            2,
+            "audio out and microphone in"
+        );
+        assert!(offer.lines().any(|l| l.trim() == "a=recvonly"));
+    }
+
+    let (launch, again, fresh) = (
+        video_sdp(&host, "offer", 0),
+        video_sdp(&host, "offer", 1),
+        video_sdp(&host, "offer", 2),
+    );
+    let session = |sdp| sdp_value(sdp, "o=").split(' ').nth(1).map(str::to_string);
+    let version = |sdp| sdp_value(sdp, "o=").split(' ').nth(2).map(str::to_string);
+
+    // `restart_ice` on a transport: the same session, one version on, nothing restarted.
+    assert_eq!(session(again), session(launch));
+    assert_ne!(version(again), version(launch));
+    assert_eq!(
+        sdp_value(again, "a=ice-ufrag:"),
+        sdp_value(launch, "a=ice-ufrag:"),
+        "webrtcbin started honouring ice-restart: the same peer's answer will now look \
+         like a new peer's (see webrtc::is_new_peer)"
+    );
+
+    // The new transport: another SDP session with new ICE credentials...
+    assert_ne!(session(fresh), session(launch));
+    assert_ne!(
+        sdp_value(fresh, "a=ice-ufrag:"),
+        sdp_value(launch, "a=ice-ufrag:")
+    );
+    // ...and nothing else a client has to act on.
+    for same in [
+        "a=fingerprint:",
+        "a=setup:",
+        "a=group:BUNDLE ",
+        "a=sctp-port:",
+    ] {
+        assert_eq!(sdp_value(fresh, same), sdp_value(launch, same), "{same}");
+    }
+    assert_eq!(sdp_values(fresh, "a=mid:"), sdp_values(launch, "a=mid:"));
+    assert_eq!(sdp_values(fresh, "m="), sdp_values(launch, "m="));
+    // The same MediaStream: a client that wired the first offer's track keeps it.
+    assert!(!sdp_msids(launch).is_empty());
+    assert_eq!(sdp_msids(fresh), sdp_msids(launch));
+}
+
+/// The relay can deliver one frame the displaced page had already sent. Its answer must
+/// not bind the transport built for the new page: the new page's own answer would then
+/// read as yet another peer and cost a second transport and a third offer.
+#[test]
+fn an_answer_the_displaced_peer_had_sent_costs_no_transport() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("stale");
+    let _a = first_attach(&mut host);
+    let stale = SignalMsg::Answer {
+        sdp: video_sdp(&host, "answer", 0).to_string(),
+        pc: Some(PcId::Video),
+    };
+
+    let mut b = Peer::new();
+    request_offers(&mut host);
+    // Up to the replacement: the new transport's offer has not reached B yet.
+    let replaced = pump(&mut host, &mut b, Duration::from_secs(10), |h, _| {
+        h.replaced.contains(&PcId::Video)
+    });
+    assert!(
+        replaced,
+        "the new peer's answer did not replace the transport"
+    );
+    host.inbound(stale.clone());
+    let up = pump(&mut host, &mut b, Duration::from_secs(20), |_, p| {
+        streaming(p)
+    });
+    assert!(up, "the new peer never streamed: {}", describe(&b));
+
+    // And late, once the new peer streams: not a newer peer either.
+    host.inbound(stale);
+    pump(&mut host, &mut b, Duration::from_secs(1), |_, _| false);
+    let mut replaced = host.replaced.clone();
+    replaced.sort_by_key(|pc| *pc as usize);
+    assert_eq!(
+        replaced,
+        [PcId::Video, PcId::Audio],
+        "a stale answer cost a transport"
+    );
+    assert!(input_reaches_host(&mut host, &mut b));
+}
+
+/// A client's recovery can ask for an ICE restart in the gap between its answer to the
+/// old transport's offer and the new transport's first offer. Forcing an offer out of a
+/// transport that has no caps yet gives one with no stream in it, and the real offer
+/// then never comes.
+#[test]
+fn a_restart_request_before_the_new_transport_has_offered_is_absorbed() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("gap");
+    let _a = first_attach(&mut host);
+
+    let mut b = Peer::new();
+    request_offers(&mut host);
+    let replaced = pump(&mut host, &mut b, Duration::from_secs(10), |h, _| {
+        h.replaced.contains(&PcId::Video)
+    });
+    assert!(replaced);
+    host.inbound(SignalMsg::RestartIce {
+        pc: Some(PcId::Video),
+    });
+    let up = pump(&mut host, &mut b, Duration::from_secs(20), |_, p| {
+        streaming(p)
+    });
+
+    assert!(up, "the new peer never streamed: {}", describe(&b));
+    let fresh = video_sdp(&host, "offer", 2);
+    assert!(
+        !sdp_msids(fresh).is_empty(),
+        "the new transport's offer names no stream"
+    );
+    assert!(input_reaches_host(&mut host, &mut b));
+}
+
+/// Past the budget a new peer's answer is ignored: no transport, and the peer the
+/// session is streaming to keeps its own.
+#[test]
+fn past_the_replacement_budget_the_current_peer_keeps_the_transport() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("budget");
+    host.transports.set_replacement_limit(1);
+    let _a = first_attach(&mut host);
+    let mut b = attach(&mut host);
+    let transport = host.transports.video.webrtc.clone();
+
+    let mut c = Peer::new();
+    request_offers(&mut host);
+    let b_video = rtp(&b.video);
+    pump(&mut host, &mut c, Duration::from_secs(3), |_, _| false);
+
+    assert_eq!(host.replaced.len(), 2, "replaced past the budget");
+    assert_eq!(host.transports.video.webrtc, transport);
+    assert_eq!(rtp(&c.video), 0);
+    assert!(
+        rtp(&b.video) > b_video + 30,
+        "the current peer lost its stream"
+    );
+    assert!(input_reaches_host(&mut host, &mut b));
+}
+
 /// Twenty takeovers in one session leave one transport's worth of everything.
 #[test]
 fn twenty_takeovers_leak_nothing() {
@@ -655,6 +925,8 @@ fn twenty_takeovers_leak_nothing() {
     }
     let _serial = serial();
     let mut host = Host::start("leak");
+    // Twenty takeovers in half a minute is what the budget exists to refuse.
+    host.transports.set_replacement_limit(usize::MAX);
     let mut current = first_attach(&mut host);
     let mut retired = Vec::new();
     let (mut elements, mut live_threads) = (0, 0);
@@ -692,6 +964,66 @@ fn twenty_takeovers_leak_nothing() {
     assert_eq!(host.bus_errors, Vec::<String>::new());
 }
 
+/// Evidence, not a gate: what the wire carries across a takeover, one line per SDP.
+/// `cargo test wire_evidence -- --ignored --nocapture`
+#[test]
+#[ignore = "prints the offers and answers of a takeover"]
+fn wire_evidence() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("wire");
+    let _a = first_attach(&mut host);
+    let first_cert = dtls_certificate(&host.transports.video.webrtc);
+    let _b = attach(&mut host);
+    for (n, (what, pc, sdp)) in host.wire.iter().enumerate() {
+        eprintln!("WIRE {n} {what} {pc}: {}", sdp_facts(sdp));
+    }
+    eprintln!(
+        "WIRE the replaced video transport presents the same DTLS certificate: {}",
+        first_cert.is_some() && first_cert == dtls_certificate(&host.transports.video.webrtc)
+    );
+}
+
+/// The PEM a webrtcbin's DTLS transport presents.
+fn dtls_certificate(webrtc: &gst::Element) -> Option<String> {
+    let t = webrtc.emit_by_name::<Option<glib::Object>>("get-transceiver", &[&0i32])?;
+    let sender = t.property::<Option<glib::Object>>("sender")?;
+    let transport = sender.property::<Option<glib::Object>>("transport")?;
+    transport.property::<Option<String>>("certificate")
+}
+
+/// Evidence, not a gate: does the host's webrtcbin check the answer's fingerprint against
+/// the certificate the peer presents in DTLS?
+#[test]
+#[ignore = "prints whether a wrong fingerprint in the answer still connects"]
+fn fingerprint_evidence() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("fingerprint");
+    host.munge_answer = Some(|sdp| {
+        sdp.lines()
+            .map(|l| match l.strip_prefix("a=fingerprint:sha-256 ") {
+                Some(_) => format!("a=fingerprint:sha-256 {}", ["AB"; 32].join(":")),
+                None => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            + "\r\n"
+    });
+    let mut peer = Peer::new();
+    let up = pump(&mut host, &mut peer, Duration::from_secs(10), |_, p| {
+        streaming(p)
+    });
+    eprintln!(
+        "FINGERPRINT a peer whose answer carries a wrong fingerprint streams: {up} ({})",
+        describe(&peer)
+    );
+}
+
 /// A stand-in for the control-plane relay, for real browsers: one signaling WebSocket per
 /// page, the last attach wins and the displaced socket is closed 4410, host frames reach
 /// only the attached socket and buffer until the first one (`protocol/signaling.md`).
@@ -720,7 +1052,13 @@ fn browser_host() {
         .build()
         .unwrap();
     rt.block_on(async move {
-        let mut host = Host::start("browser");
+        let mic = std::env::var("QUASAR_TAKEOVER_MIC").is_ok();
+        // Ask for an ICE restart the moment the video transport is replaced: a client's
+        // recovery request landing between the old transport's offer and the new one's.
+        // And again once that transport's offer is out and not yet answered.
+        let restart_between = std::env::var("QUASAR_TAKEOVER_RESTART_BETWEEN").is_ok();
+        let mut restart_after_offer = false;
+        let mut host = Host::start_with("browser", mic);
         let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
         eprintln!("HOST listening on ws://{addr} for {secs}s");
         let (in_tx, mut in_rx) = mpsc::unbounded_channel::<(u64, String)>();
@@ -735,7 +1073,13 @@ fn browser_host() {
                 _ = tokio::time::sleep_until(deadline) => break,
                 accepted = listener.accept() => {
                     let Ok((stream, _)) = accepted else { continue };
-                    let Ok(ws) = tokio_tungstenite::accept_async(stream).await else { continue };
+                    let ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws) => ws,
+                        Err(e) => {
+                            eprintln!("HOST websocket handshake failed: {e}");
+                            continue;
+                        }
+                    };
                     next_id += 1;
                     let id = next_id;
                     let (mut sink, mut source) = ws.split();
@@ -771,17 +1115,34 @@ fn browser_host() {
                 Some((id, text)) = in_rx.recv() => {
                     if attached.as_ref().is_some_and(|(a, _)| *a == id) {
                         match SignalMsg::from_json(&text) {
-                            Ok(msg) => host.inbound(msg),
+                            Ok(msg) => {
+                                if let SignalMsg::Answer { sdp, pc } = &msg {
+                                    eprintln!(
+                                        "HOST answer {} from socket {id}: {}",
+                                        pc.unwrap_or_default(),
+                                        sdp_facts(sdp)
+                                    );
+                                }
+                                host.inbound(msg)
+                            }
                             Err(e) => eprintln!("HOST bad frame from {id}: {e}"),
                         }
                     }
                 }
                 _ = tick.tick() => {
                     while let Ok(msg) = host.sig_rx.try_recv() {
+                        let mut video_offer = false;
+                        if let SignalMsg::Offer { sdp, pc } = &msg {
+                            eprintln!("HOST offer {}: {}", pc.unwrap_or_default(), sdp_facts(sdp));
+                            video_offer = pc.unwrap_or_default() == PcId::Video;
+                        }
                         let frame = Message::Text(msg.to_json().unwrap().into());
                         match &attached {
                             Some((_, tx)) => { let _ = tx.send(frame); }
                             None => buffered.push(frame),
+                        }
+                        if video_offer && std::mem::take(&mut restart_after_offer) {
+                            host.inbound(SignalMsg::RestartIce { pc: Some(PcId::Video) });
                         }
                     }
                     host.drain_bus();
@@ -789,10 +1150,15 @@ fn browser_host() {
                         eprintln!("HOST bus error: {e}");
                     }
                     seen_errors = host.bus_errors.len();
-                    for pc in &host.replaced[seen_replaced..] {
-                        eprintln!("HOST replaced the {pc} transport");
-                    }
+                    let replaced: Vec<PcId> = host.replaced[seen_replaced..].to_vec();
                     seen_replaced = host.replaced.len();
+                    for pc in replaced {
+                        eprintln!("HOST replaced the {pc} transport");
+                        if restart_between && pc == PcId::Video {
+                            host.inbound(SignalMsg::RestartIce { pc: Some(pc) });
+                            restart_after_offer = true;
+                        }
+                    }
                 }
             }
         }

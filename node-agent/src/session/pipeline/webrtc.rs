@@ -998,13 +998,37 @@ fn is_new_peer(negotiated: Option<&str>, answer: &str) -> bool {
     was_ufrag != ufrag || was_fingerprint != fingerprint
 }
 
+/// The remote description `webrtc` last had applied, as text.
+fn negotiated(webrtc: &gst::Element) -> Option<String> {
+    webrtc
+        .property::<Option<gstreamer_webrtc::WebRTCSessionDescription>>("remote-description")
+        .and_then(|d| d.sdp().as_text().ok())
+}
+
 /// Is `answer` from a peer other than the one `webrtc` negotiated with (#535)? Such a
 /// peer cannot use this transport: its DTLS and SCTP associations belong to the first.
 pub(crate) fn answer_is_from_new_peer(webrtc: &gst::Element, answer: &str) -> bool {
-    let negotiated = webrtc
-        .property::<Option<gstreamer_webrtc::WebRTCSessionDescription>>("remote-description")
-        .and_then(|d| d.sdp().as_text().ok());
-    is_new_peer(negotiated.as_deref(), answer)
+    is_new_peer(negotiated(webrtc).as_deref(), answer)
+}
+
+/// Has `webrtc` made an offer yet?
+pub(crate) fn has_offered(webrtc: &gst::Element) -> bool {
+    webrtc
+        .property::<Option<gstreamer_webrtc::WebRTCSessionDescription>>("local-description")
+        .is_some()
+}
+
+/// The ICE ufrag an SDP was written with.
+pub(crate) fn ice_ufrag(sdp: &str) -> Option<&str> {
+    peer_identity(sdp).0
+}
+
+/// The ICE ufrag of the peer `webrtc` negotiated with, if any has answered.
+pub(crate) fn negotiated_ufrag(webrtc: &gst::Element) -> Option<String> {
+    negotiated(webrtc)
+        .as_deref()
+        .and_then(ice_ufrag)
+        .map(str::to_string)
 }
 
 /// Apply a remote SDP. For an inbound offer (answerer), `then_answer` runs once the remote
