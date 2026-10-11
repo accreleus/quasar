@@ -20,6 +20,8 @@ class FakeAPI:
 
     def __call__(self, url, method='GET', data=None, token=None):
         self.calls.append((url, method, data, token))
+        if '/releases/tags/' in url:
+            return dict(RELEASE)
         if '/deployments?' in url:
             return self.records
         if url == WEBHOOK:
@@ -164,6 +166,21 @@ class Tests(unittest.TestCase):
         self.assertNotIn(WEBHOOK, receipt)
         self.assertNotIn('test_token', receipt)
         self.assertNotIn('fake-github-token', receipt)
+
+    def test_manual_invocation_fetches_only_requested_release(self):
+        self.sender.run(RELEASE['tag_name'])
+        gets = [c[0] for c in self.api.calls if '/releases' in c[0]]
+        self.assertEqual(gets, ['https://api.github.com/repos/accreleus/quasar/releases/tags/v0.5.0'])
+
+    def test_manual_invocation_rejects_unsafe_tag(self):
+        with self.assertRaises(DeliveryError):
+            self.sender.run('v0.5.0/../../other')
+        self.assertEqual(self.api.calls, [])
+
+    def test_manual_invocation_rejects_wrong_release_response(self):
+        with self.assertRaises(DeliveryError):
+            self.sender.run('v0.6.0')
+        self.assertFalse(any(c[1] == 'POST' for c in self.api.calls))
 
 
 if __name__ == '__main__':

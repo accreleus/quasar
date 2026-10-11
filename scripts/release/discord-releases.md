@@ -1,6 +1,7 @@
 # Discord release announcements
 
-`Discord releases` posts a concise version and release-notes link for future published
+`Discord releases` is invoked manually by an operator or release agent to post a concise
+version and release-notes link for one explicitly selected published
 Quasar releases, including labeled prereleases. It never mentions users or roles and
 never cross-publishes to servers following the announcement channel.
 
@@ -14,15 +15,28 @@ never cross-publishes to servers following the announcement channel.
 - The script verifies the webhook's server and channel against its explicit destination
   constants. A mismatch stops delivery.
 
-Published-release events trigger prompt checks. An hourly scheduled check catches releases
-created by the Images workflow's `GITHUB_TOKEN`, which do not start separate release-event
-workflows. Scheduled runs can be delayed by GitHub. Releases published at or before the
+There are no scheduled checks or automatic published-release triggers. Releases published at or before the
 activation timestamp, drafts, and the previously announced v0.4.0 are excluded.
 
 A manual workflow run first performs `--check-config`: a read-only webhook GET that verifies
-credentials and destination without sending a message or creating a receipt. The subsequent
-scan sends only eligible future releases. Check the activation timestamp and published
-releases before using a manual run as a no-post verification.
+credentials and destination without sending a message or creating a receipt. The default
+`verify_only=true` stops there. Explicit posting fetches only the requested `release_tag`;
+it does not scan or post other releases.
+
+The release agent should invoke the workflow on `main`, keeping the webhook URL in GitHub:
+
+```sh
+# Read-only verification; no message is sent.
+gh workflow run discord-releases.yml --repo accreleus/quasar --ref main \
+  -f release_tag=vX.Y.Z -f verify_only=true
+
+# Post exactly the selected published release when instructed to announce it.
+gh workflow run discord-releases.yml --repo accreleus/quasar --ref main \
+  -f release_tag=vX.Y.Z -f verify_only=false
+```
+
+Replace `vX.Y.Z` with the published release's actual tag. No separate announcement-text
+template/input is implemented yet; the current post remains the version and release-notes link.
 
 ## Delivery receipts and failure recovery
 

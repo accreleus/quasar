@@ -1,11 +1,15 @@
 name: Discord releases
 on:
-  release:
-    types: [published]
-  schedule:
-    # Releases made with GITHUB_TOKEN do not trigger release workflows.
-    - cron: '17 * * * *'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag to announce
+        required: true
+        type: string
+      verify_only:
+        description: Verify destination without posting
+        default: true
+        type: boolean
 permissions:
   contents: read
   deployments: write
@@ -28,6 +32,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
           DISCORD_RELEASES_ENABLED_AFTER: ${{ vars.DISCORD_RELEASES_ENABLED_AFTER }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
         run: |
           python3 scripts/release/discord_releases.py --check-config
-          python3 scripts/release/discord_releases.py
+          if [ "$VERIFY_ONLY" != "true" ]; then
+            python3 scripts/release/discord_releases.py --release-tag "$RELEASE_TAG"
+          fi

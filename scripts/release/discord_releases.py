@@ -153,12 +153,15 @@ class Announcer:
             'environment_url': f'https://discord.com/channels/{SERVER}/{CHANNEL}/{result["id"]}'})
         return 'sent'
 
-    def run(self):
-        releases = list(self.pages('/releases'))
-        for release in sorted(releases, key=lambda item: item.get('published_at') or ''):
-            outcome = self.deliver(release)
-            # IDs only; no credentials or uncontrolled release text in logs.
-            print('release_id=' + str(release['id']) + ' outcome=' + outcome)
+    def run(self, tag):
+        if not re.fullmatch(r'[A-Za-z0-9._+-]{1,100}', tag):
+            raise DeliveryError('Unexpected release tag')
+        release = self.github('/releases/tags/' + urllib.parse.quote(tag, safe=''))
+        if release.get('tag_name') != tag:
+            raise DeliveryError('Requested release tag does not match response')
+        outcome = self.deliver(release)
+        # IDs only; no credentials or uncontrolled release text in logs.
+        print('release_id=' + str(release['id']) + ' outcome=' + outcome)
 
 
 if __name__ == '__main__':
@@ -168,8 +171,8 @@ if __name__ == '__main__':
         if sys.argv[1:] == ['--check-config']:
             announcer.check_destination()
             print('Webhook destination verified; no message sent or receipt created.')
-        elif not sys.argv[1:]:
-            announcer.run()
+        elif len(sys.argv) == 3 and sys.argv[1] == '--release-tag':
+            announcer.run(sys.argv[2])
         else:
             raise DeliveryError('Unexpected command arguments')
     except (DeliveryError, ValueError, KeyError, TypeError):
