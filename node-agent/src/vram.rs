@@ -709,23 +709,35 @@ mod tests {
     }
 
     #[test]
-    fn run_bounded_never_returns_a_partial_success_when_the_deadline_lands_near_exit() {
-        // Sweeps the deadline across the child's write-and-exit instant, so some runs expire
-        // inside the poll sleep right before exit. Every result is complete output or `None`.
-        for ms in (20..=140).step_by(10) {
-            let result = run_bounded(
-                "sh",
-                &["-c", "sleep 0.07; printf marker"],
-                Duration::from_millis(ms),
-            );
-            if let Some((stdout, status)) = result {
-                assert!(status.success());
-                assert_eq!(
-                    stdout, "marker",
-                    "deadline {ms} ms returned a partial success"
-                );
+    fn run_bounded_returns_complete_output_when_the_child_exits_after_the_deadline_passed() {
+        // The poll sleep is 20 ms, so a child that writes and exits inside the sleep in which
+        // the deadline also expires is found exited only after the deadline. That schedule
+        // cannot be forced from outside, so sweep the deadline across the exit in 1 ms steps
+        // until it has happened (a `Some` that returned after the deadline); every `Some` on
+        // the way must carry the whole marker, and never having hit it fails loudly.
+        let mut after_deadline = false;
+        'rounds: for _ in 0..3 {
+            for ms in 30..=130u64 {
+                let start = Instant::now();
+                let timeout = Duration::from_millis(ms);
+                let result = run_bounded("sh", &["-c", "sleep 0.07; printf marker"], timeout);
+                if let Some((stdout, status)) = result {
+                    assert!(status.success());
+                    assert_eq!(
+                        stdout, "marker",
+                        "deadline {ms} ms returned a partial success"
+                    );
+                    if start.elapsed() > timeout {
+                        after_deadline = true;
+                        break 'rounds;
+                    }
+                }
             }
         }
+        assert!(
+            after_deadline,
+            "no run found the child exited after its deadline; the post-exit drain went untested"
+        );
     }
 
     #[test]
