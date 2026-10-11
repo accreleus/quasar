@@ -45,6 +45,7 @@ own; the two do not move together, and that is deliberate.
   default-app list offers only apps whose `runtime_spec` declares `direct_display: true`; a
   default app without it shows a readiness failure on the console page and is not launched.
   Contract: protocol amendment 19.
+- **Dependencies updated** (eleven patch and minor bumps: the node agent's tokio, tokio-rustls, http, bytes and libc; the web client's vite, jsdom and Node types; the docs site's astro, sharp and starlight-openapi).
 
 ### Removed
 - **The old console path is gone: a console session runs only direct (#461).** Console mode
