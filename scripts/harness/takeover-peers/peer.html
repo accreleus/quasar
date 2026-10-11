@@ -1,0 +1,83 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>takeover peer</title>
+<video id="v" autoplay muted playsinline width="320" height="240"></video>
+<script>
+// The answerer half of protocol/signaling.md, as web/src/webrtc/session.ts does it: two
+// peer connections routed by `pc`, and `restart_ice` per PC on open when ?attach=1 (a
+// page that opens a session someone already streamed). ?noice=1 answers and never
+// connects: a page whose loader is still up.
+const q = new URLSearchParams(location.search);
+const log = [];
+const S = window.__peer = { log, wsCloses: [], pongs: 0, offers: { video: 0, audio: 0 }, t0: performance.now(), firstFrameMs: null };
+const note = (m) => log.push(`${Math.round(performance.now() - S.t0)}ms ${m}`);
+const noIce = q.get("noice") === "1";
+const pcs = {};
+let ws;
+const send = S.send = (o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
+function pcFor(id) {
+  if (pcs[id]) return pcs[id];
+  const pc = pcs[id] = new RTCPeerConnection();
+  pc.onicecandidate = (e) => e.candidate && !noIce && send({ type: "ice", pc: id, candidate: {
+    candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex } });
+  pc.oniceconnectionstatechange = () => note(`${id} ice=${pc.iceConnectionState}`);
+  pc.onconnectionstatechange = () => note(`${id} conn=${pc.connectionState}`);
+  pc.ontrack = (e) => {
+    if (e.track.kind !== "video") return;
+    const v = document.getElementById("v");
+    v.srcObject = e.streams[0] ?? new MediaStream([e.track]);
+    v.requestVideoFrameCallback(() => { S.firstFrameMs ??= Math.round(performance.now() - S.t0); note("first video frame"); });
+  };
+  pc.ondatachannel = (e) => {
+    S.channel = e.channel; note(`datachannel ${e.channel.label}`);
+    e.channel.onopen = () => note("datachannel open");
+    e.channel.onclose = () => note("datachannel close");
+    e.channel.onmessage = (m) => { if (String(m.data).includes('"pong"')) S.pongs++; };
+  };
+  return pc;
+}
+// A signaling socket. `requestOffers` is the fresh page; a re-attach of the same page
+// keeps its peer connections and asks for nothing unless a retry was in flight.
+function attach(requestOffers, retryInFlight) {
+  ws = new WebSocket(q.get("ws"));
+  ws.onopen = () => {
+    note("ws open");
+    if (requestOffers) { send({ type: "restart_ice", pc: "video" }); send({ type: "restart_ice", pc: "audio" }); }
+    if (retryInFlight) send({ type: "restart_ice", pc: "video" });
+  };
+  ws.onclose = (e) => { S.wsCloses.push(e.code); note(`ws close ${e.code}`); };
+  ws.onmessage = async (ev) => {
+    const msg = JSON.parse(ev.data); const id = msg.pc ?? "video";
+    if (msg.type === "offer") {
+      S.offers[id]++;
+      const uf = (msg.sdp.match(/a=ice-ufrag:(\S{6})/) || [])[1];
+      note(`${id} offer #${S.offers[id]} ufrag=${uf}`);
+      try {
+        const pc = pcFor(id);
+        await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({ type: "answer", pc: id, sdp: answer.sdp });
+      } catch (e) { note(`${id} negotiation FAILED ${e}`); }
+    } else if (msg.type === "ice" && msg.candidate && !noIce) {
+      try { await pcFor(id).addIceCandidate(msg.candidate); } catch { /* trickle errors are not fatal */ }
+    }
+  };
+}
+S.reattach = (retryInFlight) => { ws.onclose = null; ws.close(); attach(false, retryInFlight); };
+S.ping = () => S.channel?.readyState === "open" && S.channel.send('{"t":"ping","id":1,"tc":0}');
+S.snapshot = async () => {
+  const out = { wsCloses: S.wsCloses, pongs: S.pongs, offers: S.offers, firstFrameMs: S.firstFrameMs, log: log.slice() };
+  for (const [id, pc] of Object.entries(pcs)) {
+    let frames = null, bytes = 0;
+    (await pc.getStats()).forEach((r) => {
+      if (r.type !== "inbound-rtp") return;
+      bytes += r.bytesReceived ?? 0;
+      if (r.kind === "video") frames = r.framesDecoded;
+    });
+    out[id] = { ice: pc.iceConnectionState, conn: pc.connectionState, framesDecoded: frames, bytesReceived: bytes };
+  }
+  return out;
+};
+attach(q.get("attach") === "1", false);
+</script>
