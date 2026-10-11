@@ -16,7 +16,9 @@ for the old console path.
 **Candidate coverage.** E8 ran on the release candidate itself, built from `develop`
 `a7c12b98`; NVIDIA rootful Docker had a fresh quick-start install on the near-final build
 (#440). E1–E7 predate that candidate: they are real evidence for the code paths they ran, not
-a hardware pass of the final build. E11 and E12 ran on later `develop` builds.
+a hardware pass of the final build. E11 ran on later `develop` builds. E12 ran on the fixes'
+branch builds, `e425b5d9` and `c4cfe3a6`, since merged into `develop`; neither fix is in a
+tagged release yet.
 
 ## 1. Profile matrix (D19)
 
@@ -81,7 +83,7 @@ E3's AMD Podman bench was an XFCE soak; E11 adds a Steam bench with a baseline.
 | # | Story | Status | Evidence |
 |---|---|---|---|
 | 1 | Rootless engine; a compromise can't take the machine | Met | Recipe revision 3: #402 [5873589343](https://github.com/accreleus/quasar/issues/402#issuecomment-5873589343); ACL-only device grants: #400 [5870987736](https://github.com/accreleus/quasar/issues/400#issuecomment-5870987736) |
-| 2 | Podman install and update | Met | E5; on the published images the update needed a second apply (E11, #543) until the fix, which passes in one (E12) |
+| 2 | Podman install and update | Met | E5; on the published images the update needed a second apply (E11, #543) until the fix, which passes in one on the branch build `c4cfe3a6` (E12) |
 | 3 | Rootless Docker install and update | Met | #406 [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850); update on NVIDIA (E4) |
 | 4 | Rootful Docker and Unraid unchanged, with less privilege | Met | #402 [5877723916](https://github.com/accreleus/quasar/issues/402#issuecomment-5877723916); Unraid's path is unchanged by design (D4) |
 | 5 | Quick start and enrollment detect engine and mode | Met | #396 [5871843388](https://github.com/accreleus/quasar/issues/396#issuecomment-5871843388), #406 [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850) |
@@ -94,7 +96,7 @@ E3's AMD Podman bench was an XFCE soak; E11 adds a Steam bench with a baseline.
 | 12 | NVIDIA encode and GPU games on every engine mode | Met | CDI passes on all three required NVIDIA rows. The rootful `--gpus` fallback is fixed (#413 [5953691498](https://github.com/accreleus/quasar/issues/413#issuecomment-5953691498)), checked on the NVIDIA test host with session-shaped containers, not an agent-created Steam session |
 | 13 | Session audio and microphone on every engine mode | Met | Microphone: E1 (Docker, both vendors), E6 and E3 (Podman, both vendors) |
 | 14 | Home files owned by the Quasar user | Partly met | Rootless Podman: #404 [5876278031](https://github.com/accreleus/quasar/issues/404#issuecomment-5876278031); rootless Docker keeps subordinate IDs, accepted with a readiness warning: #404 [5884610200](https://github.com/accreleus/quasar/issues/404#issuecomment-5884610200) |
-| 15 | Console updates work on every engine mode | Met | One host per required engine mode (matrix Update column); Podman on the published images passes in one apply since #543 (E12) |
+| 15 | Console updates work on every engine mode | Met | One host per required engine mode (matrix Update column); Podman passes in one apply on the branch build `c4cfe3a6` with the #543 fix (E12) |
 | 16 | A rootless or Podman machine returns after reboot | Met | E5, E3, E4 |
 | 17 | Readiness names engine and mode, explains a missing capability | Met | #393 [5870715357](https://github.com/accreleus/quasar/issues/393#issuecomment-5870715357), #396 [5871843388](https://github.com/accreleus/quasar/issues/396#issuecomment-5871843388) |
 | 18 | A missing permission gives an exact-fix readiness check | Met | #401 [5878347040](https://github.com/accreleus/quasar/issues/401#issuecomment-5878347040) |
