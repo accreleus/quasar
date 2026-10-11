@@ -57,7 +57,7 @@ pub fn indeterminate_status() -> &'static str {
 
 /// Signals a process raises against itself by crashing. Anything else (SIGKILL from the
 /// OOM killer, SIGTERM from an operator) says nothing about the path under test.
-pub(super) fn fault_signal(signal: i32) -> Option<&'static str> {
+pub(crate) fn fault_signal(signal: i32) -> Option<&'static str> {
     match signal {
         libc::SIGSEGV => Some("SIGSEGV"),
         libc::SIGABRT => Some("SIGABRT"),
@@ -129,6 +129,25 @@ pub fn remediation(kind: ProbeKind) -> String {
             dri_node_app_access check) and, on NVIDIA, the driver volume \
             (driver_volume_version check)."
             .into(),
+    }
+}
+
+/// The fix for an NVIDIA Vulkan failure seen by the application-GPU probe.
+/// `modeset_absent`: the container had no `/dev/nvidia-modeset`.
+pub fn vulkan_remediation(modeset_absent: bool) -> String {
+    if modeset_absent {
+        "The container device spec (CDI) lacks /dev/nvidia-modeset, which the NVIDIA Vulkan \
+         driver cannot start without. On the host run `sudo nvidia-modprobe -m`, regenerate the \
+         spec (`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`, or your driver \
+         plugin's own generator), then restart the agent container to re-run this check. Repeat \
+         after any boot that writes the spec before the node exists (docs: Install, NVIDIA)."
+            .into()
+    } else {
+        "A container on this host cannot create a Vulkan device from the NVIDIA driver. Run \
+         `vulkaninfo --summary` in a container given the same GPU access, check `nvidia-ctk cdi \
+         list` names the GPU and the driver_volume_version check, then restart the agent \
+         container to re-run this check (docs: Install, NVIDIA)."
+            .into()
     }
 }
 

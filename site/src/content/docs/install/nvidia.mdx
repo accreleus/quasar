@@ -51,6 +51,25 @@ If SELinux is enabled, apply the [SELinux steps](#selinux).
 Then return to [Podman installation](/quasar/install/podman/#prepare-the-host),
 including its required systemd socket, restart service and runtime directory.
 
+## The display device node
+
+Quasar's apps run NVIDIA Vulkan, which needs `/dev/nvidia-modeset` inside the
+container. A CDI description only lists device nodes that exist when it is generated,
+and nothing creates this one until something opens it. If it is missing, every app
+launch fails while the rest of the host looks healthy.
+
+Before you generate the CDI description:
+
+```bash
+sudo nvidia-modprobe -m
+ls /dev/nvidia-modeset
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+Then restart the Quasar agent container. It worked when the **application GPU
+probe** check for your GPU is green; a missing node shows there as a failure that names
+`/dev/nvidia-modeset`.
+
 ## Rootless Docker or Podman
 
 Both rootless engines use CDI for Quasar's NVIDIA sessions. Generate and check the
@@ -107,4 +126,9 @@ Alternatively, use a host with a compatible packaged driver. See the
 [NVIDIA compatibility reference](/quasar/reference/nvidia-compatibility/).
 </Aside>
 
-4. Continue with [Unraid installation](/quasar/install/unraid/) for persistent storage and deployment.
+4. Unraid writes the CDI description at boot, before anything creates the display
+   device node. After each boot, run the steps in [The display device node](#the-display-device-node),
+   using the plugin's own CDI generator in place of the bare `nvidia-ctk` command (it also
+   applies a gbm symlink patch). Run both from a boot-time script, such as the User
+   Scripts plugin at array start, then restart the Quasar agent container.
+5. Continue with [Unraid installation](/quasar/install/unraid/) for persistent storage and deployment.

@@ -4,11 +4,11 @@
 use std::time::{Duration, Instant};
 
 use crate::container_ownership::PROBE_NAME_PREFIX;
-use crate::nvidia_volume::{parse_egl_device_open, EglRuntime};
+use crate::nvidia_volume::{parse_egl_device_open, parse_vulkan_probe, EglRuntime, VulkanProbe};
 use crate::runtime::{DiagnosticHelper, ErrorKind, GpuProbeRun, RuntimeClient};
 
 use super::container::{ContainerProbeEnd, Observed};
-use super::outcome::{fault_signal, remediation, wording, ProbeOutcome};
+use super::outcome::{fault_signal, remediation, vulkan_remediation, wording, ProbeOutcome};
 use super::ProbeTarget;
 
 /// Run one probe container to completion, or to `deadline`/pre-emption. Busy means an
@@ -107,8 +107,30 @@ pub fn outcome(target: ProbeTarget, end: &ContainerProbeEnd) -> ProbeOutcome {
     match &end.observed {
         Observed::Exited(result) => match result.exit_code {
             Some(0) => match parse_egl_device_open(&result.stdout) {
-                EglRuntime::Ok { loaded } => ProbeOutcome::Pass {
-                    summary: format!("{passed}: {loaded}"),
+                EglRuntime::Ok { loaded } => match parse_vulkan_probe(&result.stdout) {
+                    VulkanProbe::NotRun => ProbeOutcome::Pass {
+                        summary: format!("{passed}: {loaded}"),
+                    },
+                    VulkanProbe::Ok { driver } => ProbeOutcome::Pass {
+                        summary: format!("{passed}: {loaded}; Vulkan: NVIDIA {driver}"),
+                    },
+                    VulkanProbe::Broken {
+                        detail,
+                        modeset_absent,
+                    } => ProbeOutcome::Fail {
+                        summary: format!(
+                            "{failed}: EGL opens it but Vulkan does not: {detail}{}",
+                            if modeset_absent {
+                                " (/dev/nvidia-modeset is missing in the container)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        remediation: vulkan_remediation(modeset_absent),
+                    },
+                    VulkanProbe::Indeterminate { detail } => ProbeOutcome::Indeterminate {
+                        reason: format!("The Vulkan step of the host probe of {exercising}: {detail}"),
+                    },
                 },
                 EglRuntime::Broken { detail, .. } => ProbeOutcome::Fail {
                     summary: format!("{failed}: {detail}"),
@@ -209,6 +231,104 @@ mod tests {
             ProbeOutcome::Pass { summary } => assert!(summary.contains("renderD128"), "{summary}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    const EGL_OPENED: &str = "LOADED=/usr/lib64/libEGL.so.1\nEXTENSIONS=EGL_EXT_device_enumeration\nDEVICES=1\nRENDER_NODES=/dev/dri/renderD128\nOPENED=/dev/dri/renderD128\n";
+
+    fn with_vulkan(lines: &str) -> ContainerProbeEnd {
+        end(exited(Some(0), &format!("{EGL_OPENED}{lines}"), ""), true)
+    }
+
+    #[test]
+    fn a_working_vulkan_device_passes_naming_the_driver() {
+        match outcome(
+            target(),
+            &with_vulkan("NVIDIA_MODESET_NODE=present\nVULKAN_NVIDIA=615.78.08\n"),
+        ) {
+            ProbeOutcome::Pass { summary } => {
+                assert!(summary.contains("Vulkan: NVIDIA 615.78.08"), "{summary}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn egl_open_with_a_crashing_vulkan_loader_and_no_modeset_node_fails_with_the_cdi_remediation() {
+        let e = with_vulkan(
+            "NVIDIA_MODESET_NODE=absent\nVULKAN_ERROR=vulkaninfo crashed with SIGSEGV\n",
+        );
+        match outcome(target(), &e) {
+            ProbeOutcome::Fail {
+                summary,
+                remediation,
+            } => {
+                assert!(
+                    summary.contains("Vulkan does not") && summary.contains("SIGSEGV"),
+                    "{summary}"
+                );
+                assert!(summary.contains("/dev/nvidia-modeset"), "{summary}");
+                assert!(remediation.contains("nvidia-modprobe -m"), "{remediation}");
+                assert!(
+                    remediation.contains("nvidia-ctk cdi generate"),
+                    "{remediation}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_vulkan_failure_with_the_modeset_node_present_gets_the_generic_remediation() {
+        let e = with_vulkan(
+            "NVIDIA_MODESET_NODE=present\nVULKAN_ERROR=the Vulkan loader lists no NVIDIA device\n",
+        );
+        match outcome(target(), &e) {
+            ProbeOutcome::Fail {
+                summary,
+                remediation,
+            } => {
+                assert!(!summary.contains("/dev/nvidia-modeset"), "{summary}");
+                assert!(!remediation.contains("nvidia-modprobe"), "{remediation}");
+                assert!(
+                    remediation.contains("vulkaninfo --summary"),
+                    "{remediation}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unavailable_vulkan_step_is_indeterminate_never_a_fail() {
+        for lines in [
+            "NVIDIA_MODESET_NODE=absent\nVULKAN_UNAVAILABLE=vulkaninfo did not run (absent, or past its deadline)\n",
+            "NVIDIA_MODESET_NODE=absent\n",
+        ] {
+            assert!(
+                matches!(outcome(target(), &with_vulkan(lines)), ProbeOutcome::Indeterminate { .. }),
+                "{lines}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_egl_open_wins_over_the_vulkan_step() {
+        let e = end(
+            exited(Some(0), "LOADED=/usr/lib64/libEGL.so.1\nEXTENSIONS=EGL_EXT_device_enumeration\nDEVICE_ERROR=eglInitialize failed (0x3003)\nVULKAN_NVIDIA=615.78.08\n", ""),
+            true,
+        );
+        match outcome(target(), &e) {
+            ProbeOutcome::Fail { summary, .. } => assert!(summary.contains("0x3003"), "{summary}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_probe_without_the_vulkan_step_passes_on_egl_alone() {
+        assert!(matches!(
+            outcome(target(), &with_vulkan("")),
+            ProbeOutcome::Pass { .. }
+        ));
     }
 
     #[test]
