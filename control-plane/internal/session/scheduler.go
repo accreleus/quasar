@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // CreateParams are the resolved inputs to a launch: the owner, the app, the
@@ -396,6 +397,13 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		return Session{}, true, nil // inventory changed after candidate selection
 	}
 	if err != nil {
+		// A deadlock here is a cycle through the host row with another writer
+		// (#553); the rollback breaks it, so retry like any lost race. Guarded by
+		// TestLaunchRacingAPruneOfItsGameIsNeverAnInternalError.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+			return Session{}, true, nil
+		}
 		return Session{}, false, fmt.Errorf("recheck gpu: %w", err)
 	}
 	if !fits {
