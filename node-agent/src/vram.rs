@@ -219,6 +219,9 @@ fn parse_amd_vram_used_bytes(text: &str) -> Option<i32> {
 /// a full pipe, and discarded.
 const RUN_BOUNDED_MAX_OUTPUT: usize = 1 << 20;
 
+/// Budget for reading what an exited child left in the pipe.
+const RUN_BOUNDED_POST_EXIT: Duration = Duration::from_millis(500);
+
 /// Spawn `cmd`, drain its stdout while polling `try_wait`, and `kill()` + reap at the deadline,
 /// returning `None`. Never `Command::output()`: it blocks until the child exits, which leaked a
 /// blocking-pool thread and a zombie per heartbeat tick when `nvidia-smi` wedged on an
@@ -259,44 +262,73 @@ pub(crate) fn run_bounded(
     }
 
     let mut kept = Vec::new();
-    let mut chunk = [0u8; 16 * 1024];
-    // Reads until the pipe is empty (`WouldBlock`) or closed; true if it read anything.
-    let mut drain = |kept: &mut Vec<u8>| {
-        let mut any = false;
-        // The deadline bounds the loop: a child writing faster than we read must not hold us past it.
-        while Instant::now() < deadline {
-            match out.read(&mut chunk) {
-                Ok(n) if n > 0 => {
-                    any = true;
-                    let room = RUN_BOUNDED_MAX_OUTPUT.saturating_sub(kept.len());
-                    kept.extend_from_slice(&chunk[..n.min(room)]);
-                }
-                _ => break,
-            }
-        }
-        any
-    };
-
     loop {
-        let progressed = drain(&mut kept);
+        let progressed = match drain(&mut out, &mut kept, deadline) {
+            Ok((_, progressed)) => progressed,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        };
         match child.try_wait() {
             Ok(Some(status)) => {
-                drain(&mut kept);
-                return Some((String::from_utf8_lossy(&kept).into_owned(), status));
+                // Everything the child wrote is in the pipe now. Read it with a budget of its
+                // own, not the caller's deadline; output we gave up on is never returned.
+                return match drain(&mut out, &mut kept, Instant::now() + RUN_BOUNDED_POST_EXIT) {
+                    Ok((End::Eof | End::Empty, _)) => {
+                        Some((String::from_utf8_lossy(&kept).into_owned(), status))
+                    }
+                    _ => None,
+                };
             }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
+            Ok(None) if Instant::now() < deadline => {
                 if !progressed {
                     std::thread::sleep(Duration::from_millis(20));
                 }
             }
-            Err(_) => return None,
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     }
+}
+
+enum End {
+    /// The writer closed the pipe.
+    Eof,
+    /// Nothing more to read right now (a grandchild may still hold the pipe open).
+    Empty,
+    /// `until` passed first.
+    Budget,
+}
+
+/// Reads the non-blocking `out` into `kept` (capped) until it is empty, closed or `until`
+/// passes; the bool is whether anything was read. A child writing faster than we read cannot
+/// hold us past `until`.
+fn drain(
+    out: &mut std::process::ChildStdout,
+    kept: &mut Vec<u8>,
+    until: Instant,
+) -> std::io::Result<(End, bool)> {
+    let mut chunk = [0u8; 16 * 1024];
+    let mut any = false;
+    while Instant::now() < until {
+        match out.read(&mut chunk) {
+            Ok(0) => return Ok((End::Eof, any)),
+            Ok(n) => {
+                any = true;
+                let room = RUN_BOUNDED_MAX_OUTPUT.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..n.min(room)]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok((End::Empty, any)),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((End::Budget, any))
 }
 
 /// ONE fork for every NVIDIA target, bounded by [`run_bounded`].
@@ -655,7 +687,6 @@ mod tests {
     fn run_bounded_returns_output_larger_than_the_pipe_buffer() {
         // 1 MiB is 16x the default 64 KiB pipe buffer: undrained, the child blocks on write
         // and run_bounded used to hit the deadline with the output lost.
-        let start = Instant::now();
         let (stdout, status) = run_bounded(
             "sh",
             &["-c", "head -c 1048576 /dev/zero | tr '\\0' x"],
@@ -664,27 +695,56 @@ mod tests {
         .expect("a large-output child that exits must return its output");
         assert!(status.success());
         assert_eq!(stdout.len(), 1 << 20);
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "must not wait out the deadline; took {:?}",
-            start.elapsed()
-        );
     }
 
     #[test]
     fn run_bounded_kills_a_child_that_writes_a_lot_and_then_hangs() {
-        let start = Instant::now();
+        // Had the child not been killed it would exit after 30 s and yield `Some`.
         let result = run_bounded(
             "sh",
             &["-c", "head -c 1048576 /dev/zero; exec sleep 30"],
             Duration::from_millis(500),
         );
         assert!(result.is_none(), "a hung child yields None");
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "must return in bounded time; took {:?}",
-            start.elapsed()
-        );
+    }
+
+    #[test]
+    fn run_bounded_never_returns_a_partial_success_when_the_deadline_lands_near_exit() {
+        // Sweeps the deadline across the child's write-and-exit instant, so some runs expire
+        // inside the poll sleep right before exit. Every result is complete output or `None`.
+        for ms in (20..=140).step_by(10) {
+            let result = run_bounded(
+                "sh",
+                &["-c", "sleep 0.07; printf marker"],
+                Duration::from_millis(ms),
+            );
+            if let Some((stdout, status)) = result {
+                assert!(status.success());
+                assert_eq!(
+                    stdout, "marker",
+                    "deadline {ms} ms returned a partial success"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_bounded_does_not_wait_on_a_grandchild_that_keeps_the_pipe_open() {
+        let (stdout, status) = run_bounded(
+            "sh",
+            &["-c", "sleep 30 & echo done"],
+            Duration::from_secs(10),
+        )
+        .expect("the child exited; its output is complete");
+        assert!(status.success());
+        assert_eq!(stdout.trim(), "done");
+    }
+
+    #[test]
+    fn run_bounded_returns_invalid_utf8_lossily() {
+        let (stdout, _) =
+            run_bounded("sh", &["-c", "printf '\\377ok'"], Duration::from_secs(2)).unwrap();
+        assert_eq!(stdout, "\u{FFFD}ok");
     }
 
     #[test]
