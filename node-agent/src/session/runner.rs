@@ -1189,10 +1189,14 @@ impl Negotiation {
         pipeline::answer_from(self.answer.as_deref(), answer, dtls_started, self.reoffered)
     }
 
-    /// `answer` is being handed to the transport.
-    fn applied(&mut self, answer: &str) {
+    /// `answer` was handed to the transport. One that names no peer is not what the next
+    /// answer is read against: the transport has negotiated with nobody through it.
+    fn applied(&mut self, answer: String) {
+        if !pipeline::names_a_peer(&answer) {
+            return;
+        }
         self.reoffered = false;
-        self.answer = Some(answer.to_string());
+        self.answer = Some(answer);
     }
 
     /// The transport is being replaced. Returns the ICE ufrag of the peer it leaves.
@@ -1369,16 +1373,20 @@ impl SessionTransports {
                 self.negotiation[i].reoffered = true;
                 msg = SignalMsg::RestartIce { pc: Some(pc) };
             }
-            server::Inbound::Apply => match &msg {
-                SignalMsg::Answer { sdp, .. } => self.negotiation[i].applied(sdp),
+            server::Inbound::Apply => {
                 // One that reaches a transport before its first offer is absorbed.
-                SignalMsg::RestartIce { .. } if target.is_some_and(pipeline::has_offered) => {
+                if matches!(msg, SignalMsg::RestartIce { .. })
+                    && target.is_some_and(pipeline::has_offered)
+                {
                     self.negotiation[i].reoffered = true;
                 }
-                _ => {}
-            },
+            }
         }
-        if let Err(e) = server::apply_inbound_as_offerer(
+        let answer = match &msg {
+            SignalMsg::Answer { sdp, .. } => Some(sdp.clone()),
+            _ => None,
+        };
+        match server::apply_inbound_as_offerer(
             msg,
             &self.video.webrtc,
             self.audio_webrtc.as_ref(),
@@ -1386,10 +1394,17 @@ impl SessionTransports {
             srd_fail_tx,
             srd_ok_tx,
         ) {
-            tracing::warn!(
+            // Recorded only now: an answer that does not parse was handed to nothing, and
+            // must not stand for the peer the next answer is read against.
+            Ok(()) => {
+                if let Some(answer) = answer {
+                    self.negotiation[i].applied(answer);
+                }
+            }
+            Err(e) => tracing::warn!(
                 token = "signaling-apply-failed",
                 "apply inbound signaling: {e:#}"
-            );
+            ),
         }
         Ok(None)
     }
@@ -4453,7 +4468,7 @@ mod tests {
             negotiation.who(&late, false),
             pipeline::AnswerFrom::ThisPeer
         );
-        negotiation.applied(&late);
+        negotiation.applied(late.clone());
 
         assert_eq!(
             negotiation.who(&current, false),
@@ -4465,14 +4480,14 @@ mod tests {
     fn a_correction_is_applied_once_the_transport_was_asked_to_offer_again() {
         let mut negotiation = Negotiation::default();
         let (late, current) = (answer_sdp("old1", "AA:01"), answer_sdp("new2", "AA:01"));
-        negotiation.applied(&late);
+        negotiation.applied(late.clone());
         negotiation.reoffered = true;
 
         assert_eq!(
             negotiation.who(&current, false),
             pipeline::AnswerFrom::ThisPeer
         );
-        negotiation.applied(&current);
+        negotiation.applied(current.clone());
         assert!(!negotiation.reoffered);
         assert_eq!(
             negotiation.who(&late, false),
@@ -4482,9 +4497,24 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_that_names_no_peer_is_not_recorded() {
+        let mut negotiation = Negotiation::default();
+        negotiation.applied(String::new());
+        assert_eq!(
+            negotiation.who(&answer_sdp("aaaa", "AA:01"), false),
+            pipeline::AnswerFrom::ThisPeer,
+            "the first real answer is still the first"
+        );
+
+        negotiation.applied(answer_sdp("aaaa", "AA:01"));
+        negotiation.applied("not sdp".to_string());
+        assert_eq!(negotiation.replaced(), Some("aaaa".to_string()));
+    }
+
+    #[test]
     fn a_replaced_transport_starts_unanswered_and_names_the_peer_it_left() {
         let mut negotiation = Negotiation::default();
-        negotiation.applied(&answer_sdp("aaaa", "AA:01"));
+        negotiation.applied(answer_sdp("aaaa", "AA:01"));
         negotiation.reoffered = true;
 
         assert_eq!(negotiation.replaced(), Some("aaaa".to_string()));

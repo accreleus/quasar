@@ -1433,6 +1433,47 @@ fn a_size_step_and_a_swap_still_work_on_a_replaced_transport() {
     assert_eq!(host.bus_errors, Vec::<String>::new());
 }
 
+/// An answer that is not SDP is handed to nothing. It must not stand for a peer: not on a
+/// transport nobody has answered, where the real first answer would then read as a second
+/// peer, and not on one that is streaming, where it would cost the peer its transport.
+#[test]
+fn a_malformed_answer_costs_no_transport() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("malformed");
+    let malformed = |sdp: &str| SignalMsg::Answer {
+        sdp: sdp.to_string(),
+        pc: Some(PcId::Video),
+    };
+    // Once the transport is waiting for its answer: an empty one then fails to parse.
+    let offered = Instant::now() + Duration::from_secs(10);
+    while !super::has_offered(&host.transports.video.webrtc) {
+        assert!(Instant::now() < offered, "the transport never offered");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    host.inbound(malformed(""));
+
+    let mut a = first_attach(&mut host);
+    assert_eq!(
+        host.replaced,
+        Vec::<PcId>::new(),
+        "the first real answer was taken for a second peer"
+    );
+
+    host.inbound(malformed("not sdp"));
+    let before = rtp(&a.video);
+    pump(&mut host, &mut a, Duration::from_secs(1), |_, _| false);
+    assert_eq!(
+        host.replaced,
+        Vec::<PcId>::new(),
+        "a malformed answer replaced a streaming peer's transport"
+    );
+    assert!(rtp(&a.video) > before + 15, "the stream stopped");
+    assert!(input_reaches_host(&mut host, &mut a));
+}
+
 /// Holds every replacement's attach still for a while, so the encode chain is certain to
 /// push while the new transport is half built. Without it that takes a frame landing in
 /// under a millisecond: about one replacement in fifty.

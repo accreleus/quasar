@@ -983,6 +983,12 @@ fn peer_identity(sdp: &str) -> (Option<&str>, Option<&str>) {
     (attr("a=ice-ufrag:"), attr("a=fingerprint:"))
 }
 
+/// Does `sdp` carry both halves of a peer's identity? An answer that does not is not one a
+/// transport can be said to have negotiated with.
+pub(crate) fn names_a_peer(sdp: &str) -> bool {
+    matches!(peer_identity(sdp), (Some(_), Some(_)))
+}
+
 /// Who wrote an answer, relative to the peer its transport negotiated with (#535).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnswerFrom {
@@ -1018,6 +1024,11 @@ pub(crate) fn answer_from(
     let Some(negotiated) = negotiated else {
         return AnswerFrom::ThisPeer; // nobody has answered on this transport yet
     };
+    // Not something a peer wrote. Applying it is what reports that; it must not cost the
+    // negotiated peer its transport.
+    if !names_a_peer(answer) {
+        return AnswerFrom::ThisPeer;
+    }
     let (was_ufrag, was_fingerprint) = peer_identity(negotiated);
     let (ufrag, fingerprint) = peer_identity(answer);
     if was_fingerprint != fingerprint {
@@ -1334,6 +1345,20 @@ mod tests {
                 assert_eq!(
                     answer_from(Some(&first), &answer(ufrag, "BB:02"), dtls, pending),
                     AnswerFrom::NewPeer
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_that_names_no_peer_is_never_a_new_one() {
+        let first = answer("aaaa", "AA:01");
+        for malformed in ["", "not sdp", "v=0\r\na=ice-ufrag:bbbb\r\n"] {
+            for (dtls, pending) in [(false, false), (false, true), (true, false), (true, true)] {
+                assert_eq!(
+                    answer_from(Some(&first), malformed, dtls, pending),
+                    AnswerFrom::ThisPeer,
+                    "{malformed:?}"
                 );
             }
         }

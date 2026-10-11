@@ -82,8 +82,8 @@ mod webrtc;
 pub(crate) use webrtc::restart_ice;
 pub(crate) use webrtc::{
     answer_from, apply_remote_description, build_answerer_pipeline, dtls_started, has_offered,
-    ice_ufrag, remote_description_failure_reason, AnswerFrom, RemoteDescriptionApplied,
-    RemoteDescriptionFailure, SrdFailTx, SrdOkTx,
+    ice_ufrag, names_a_peer, remote_description_failure_reason, AnswerFrom,
+    RemoteDescriptionApplied, RemoteDescriptionFailure, SrdFailTx, SrdOkTx,
 };
 use webrtc::{
     connect_data_channel_open, connect_ice_candidate, connect_negotiation_needed,
