@@ -428,7 +428,7 @@ const ALLOWED_CONTROL_PLANE: &[(&str, &str, &str)] = &[
     ("+bind", "quasar-control-plane-secrets:/run/quasar-secrets:ro", "the control plane's per-service secrets volume, read-only (D5)"),
     ("-env", "QUASAR_WEB_ROOT", "the published control-plane image sets it (Dockerfile.control.prod)"),
     ("-key", "depends_on", "Compose-only start ordering; the recovery actor waits for Postgres to be healthy instead"),
-    ("-key", "healthcheck", "the published control-plane image carries the same healthcheck (Dockerfile.control.prod)"),
+    ("-key", "healthcheck", "revision 1 leaves it to the image's (Dockerfile.control.prod); revision 3 carries Compose's (the_control_planes_own_healthcheck_is_the_compose_definitions)"),
     ("-env", "BOOTSTRAP_ADMIN_EMAIL", "the first admin claims the instance with the per-boot setup token instead"),
     ("-env", "BOOTSTRAP_ADMIN_USERNAME", "the first admin claims the instance with the per-boot setup token instead"),
     ("-env", "BOOTSTRAP_ADMIN_PASSWORD", "the first admin claims the instance with the per-boot setup token instead"),
@@ -462,10 +462,9 @@ const COMPOSE_ONLY_KNOBS: &[&str] = &[
     "QUASAR_IMAGE_REGISTRY_HOSTS",
 ];
 
-#[test]
-fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_differences() {
+/// A combined machine's control plane at `revision`, and the inputs it was rendered from.
+fn control_plane_at(revision: u32) -> (Inputs, ContainerSpec) {
     use quasar_recovery::recipe::{ControlInputs, DatabaseInputs};
-    let base = deploy("docker-compose.yml");
     let mut inputs = inputs(Some(GpuVendor::Amd));
     inputs.control = Some(ControlInputs {
         unknown: Default::default(),
@@ -486,6 +485,21 @@ fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_d
             secrets::LOCAL_ENROLLMENT.to_string(),
         ]),
     };
+    let spec = render(
+        Role::ControlPlane,
+        revision,
+        &inputs,
+        &ImageRef::parse(CONTROL_IMAGE).unwrap(),
+        &secrets,
+    )
+    .unwrap();
+    (inputs, spec)
+}
+
+#[test]
+fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_differences() {
+    let base = deploy("docker-compose.yml");
+    let (inputs, spec) = control_plane_at(1);
     let dotenv = BTreeMap::from([
         ("QUASAR_CONTROL_IMAGE", CONTROL_IMAGE.to_string()),
         ("POSTGRES_PASSWORD", "from-the-env-file".to_string()),
@@ -497,14 +511,6 @@ fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_d
     compose.network_mode = compose
         .network_mode
         .or(Some(names::PLATFORM_NETWORK.into()));
-    let spec = render(
-        Role::ControlPlane,
-        1,
-        &inputs,
-        &ImageRef::parse(CONTROL_IMAGE).unwrap(),
-        &secrets,
-    )
-    .unwrap();
     let rendered = spec_shape(&spec);
     let found = differences(&compose, &rendered);
     let mut allowed: BTreeSet<(String, String)> = ALLOWED_CONTROL_PLANE
@@ -523,6 +529,44 @@ fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_d
     assert!(
         stale.is_empty(),
         "listed control-plane differences that no longer occur: {stale:?}"
+    );
+}
+
+/// Revision 3's healthcheck is the Compose definition's, in exec form: the image contract
+/// pins `curl`, not a shell.
+#[test]
+fn the_control_planes_own_healthcheck_is_the_compose_definitions() {
+    let (_, spec) = control_plane_at(3);
+    let check = spec.healthcheck.expect("revision 3 carries a healthcheck");
+    let compose = &deploy("docker-compose.yml")["services"]["quasar-control-plane"]["healthcheck"];
+    let seconds = |key: &str| -> u64 {
+        let value = compose[key].as_str().unwrap();
+        value
+            .strip_suffix('s')
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{key}: {value}"))
+    };
+    assert_eq!(check.test[0], "CMD");
+    assert_eq!(
+        strings(&compose["test"], &BTreeMap::new()),
+        [
+            "CMD-SHELL".to_string(),
+            format!("{} || exit 1", check.test[1..].join(" "))
+        ]
+    );
+    assert_eq!(
+        (
+            check.interval_s,
+            check.timeout_s,
+            check.start_period_s,
+            u64::from(check.retries)
+        ),
+        (
+            seconds("interval"),
+            seconds("timeout"),
+            seconds("start_period"),
+            compose["retries"].as_u64().unwrap()
+        )
     );
 }
 

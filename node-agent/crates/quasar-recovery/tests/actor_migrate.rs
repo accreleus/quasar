@@ -16,7 +16,7 @@ use quasar_recovery::engine::{
     Image, PlatformEngine, RestartPolicy, When,
 };
 use quasar_recovery::journal::Phase;
-use quasar_recovery::recipe::names;
+use quasar_recovery::recipe::{names, Book, Role};
 use quasar_recovery::restore::{self, RestorePhase};
 use quasar_recovery::seed::Outcome;
 use quasar_recovery::socket::{
@@ -177,7 +177,11 @@ struct Machine {
 impl Machine {
     /// Installed the documented way: the seed, then its actor's first `resume`.
     fn install(env: BTreeMap<String, String>, healthy: bool) -> Machine {
-        let engine = Arc::new(FakeEngine::new(control_host(env, healthy)));
+        Machine::install_on(control_host(env, healthy))
+    }
+
+    fn install_on(host: FakeState) -> Machine {
+        let engine = Arc::new(FakeEngine::new(host));
         let dir = tempfile::tempdir().unwrap();
         let sockets = tempfile::tempdir().unwrap();
         let created = seed(&engine, dir.path(), SEED_ID).step();
@@ -591,6 +595,106 @@ fn restore_loads_the_dump_and_starts_the_control_plane_it_was_taken_under() {
     let settled = m.engine.state().by_name();
     m.actor().resume().unwrap();
     assert_eq!(m.engine.state().by_name(), settled);
+}
+
+/// Podman with the published images (#543): the engine keeps no image healthcheck, so only
+/// a container's own reports. `revision` is the recipe revision each schema's image declares.
+fn podman_host(revision: impl Fn(i64) -> u32) -> FakeState {
+    let mut host = control_host(combined_env(), true);
+    host.image_healthchecks_dropped = true;
+    for image in host.registry.values_mut() {
+        if let Some(schema) = image.labels.get("org.quasar.schema.version") {
+            let declared = revision(schema.parse().unwrap()).to_string();
+            image.labels.insert("org.quasar.recipe".into(), declared);
+        }
+    }
+    host
+}
+
+/// A control plane must pass a healthcheck to be verified, and from revision 3 its recipe
+/// carries one: install, update and restore see it on an engine that keeps no image's.
+#[test]
+fn a_control_plane_passes_its_health_gates_on_an_engine_that_drops_the_images_healthcheck() {
+    let newest = *Book::window(Role::ControlPlane).unwrap().end();
+    let m = Machine::install_on(podman_host(|_| newest));
+    assert_eq!(
+        m.control_plane().health.as_deref(),
+        Some("healthy"),
+        "installed"
+    );
+
+    let updated = apply(&m.actor(), update(ID, 81));
+    assert_eq!(updated.state, State::Succeeded, "{updated:?}");
+    assert_eq!(m.control_plane().spec.image, control_image(81));
+
+    let dump = updated.dump.clone().unwrap();
+    let restored = run_restore(
+        &m.actor(),
+        restore_request(&nth_id(9), Some(&dump), Some("0.80.0")),
+    );
+    assert_eq!(restored.state, State::Succeeded, "{restored:?}");
+    assert_eq!(m.control_plane().spec.image, control_image(OLD_SCHEMA));
+    assert_eq!(m.control_plane().health.as_deref(), Some("healthy"));
+}
+
+/// The release that brings revision 3, on such an engine: the installed revision-2 control
+/// plane has no healthcheck and is left as it is, the update to a revision-3 image is
+/// verified healthy, and a restore back to the revision-2 one still cannot be
+/// (`docs/upgrading.md`): the dump is loaded and that control plane left running on it.
+#[test]
+fn an_update_from_a_control_plane_without_a_healthcheck_verifies_and_a_restore_back_cannot() {
+    let m = Machine::install_on(podman_host(
+        |schema| if schema == OLD_SCHEMA { 2 } else { 3 },
+    ));
+    let revision = |m: &Machine| m.control_plane().spec.labels["io.quasar.recipe"].clone();
+    let old = m.control_plane();
+    assert_eq!(
+        (revision(&m).as_str(), &old.spec.healthcheck, &old.health),
+        ("2", &None, &None)
+    );
+    m.actor().resume().unwrap();
+    assert_eq!(m.control_plane(), old, "left as it is, not re-created");
+
+    let updated = apply(&m.actor(), update(ID, 81));
+    assert_eq!(updated.state, State::Succeeded, "{updated:?}");
+    let new = m.control_plane();
+    assert_eq!(new.spec.image, control_image(81));
+    assert_eq!(
+        (revision(&m).as_str(), new.health.as_deref()),
+        ("3", Some("healthy"))
+    );
+    assert!(m.kept().is_none());
+
+    let dump = updated.dump.clone().unwrap();
+    let restored = run_restore(
+        &m.actor(),
+        restore_request(&nth_id(9), Some(&dump), Some("0.80.0")),
+    );
+    assert_eq!(restored.state, State::Failed, "{restored:?}");
+    assert_eq!(restored.reason, Some(Reason::Unhealthy));
+    assert!(
+        restored.output.contains("the database is restored")
+            && restored.output.contains("state=running health=none"),
+        "{}",
+        restored.output
+    );
+    assert_eq!(m.db().schema_version, OLD_SCHEMA);
+    let back = m.control_plane();
+    assert_eq!(back.spec.image, control_image(OLD_SCHEMA));
+    assert_eq!(
+        (revision(&m).as_str(), back.status.as_str(), &back.health),
+        ("2", "running", &None)
+    );
+    assert!(!m.dir.path().join("database-hold.json").exists());
+    m.never_an_older_control_plane("after the restore");
+    // The machine is whole: a further start changes nothing, and the next update gives the
+    // control plane its healthcheck.
+    let settled = m.engine.state().by_name();
+    m.actor().resume().unwrap();
+    assert_eq!(m.engine.state().by_name(), settled);
+    let again = apply(&m.actor(), update(&nth_id(10), 81));
+    assert_eq!(again.state, State::Succeeded, "{again:?}");
+    assert_eq!(m.control_plane().health.as_deref(), Some("healthy"));
 }
 
 #[test]
