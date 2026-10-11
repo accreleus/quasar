@@ -867,6 +867,9 @@ declared (`release.go:169`) but **never emitted** by `faults()` (`plan.go:481-52
 stands**: an old console shows nothing new, and only the job's summary carries
 `manifest_errors`.
 
+*(Note, 2026-10-11: protocol amendment 26 (#157) has since removed the `manifest_invalid` fault
+kind, so the bridge release proposed below has no frozen kind to emit.)*
+
 [P]:
 - The RH-06 release publishes **only** `platform-release-manifest.json` with
   `format_version: 2`. Every installed control plane drops it and offers nothing.

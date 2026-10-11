@@ -64,6 +64,11 @@ own; the two do not move together, and that is deliberate.
   the sound device. After upgrading, turn a console host's console mode off and on once so the
   agent learns whether the host has a sound device (`console_sound` reads `unknown` until
   then). The agent image drops weston, seatd and the `kmssink`/`alsasink` elements.
+- **The contract no longer lists a `manifest_invalid` fault for the Releases view (#157).** It
+  was specified and no control plane ever raised it. A release whose manifest is missing or
+  invalid is still left out of the list, and the release detection job's run summary (Jobs
+  tab) still counts it. Nothing the control plane or the console does changes (protocol
+  amendment 26).
 
 ### Fixed
 - **The node agent's runtime helper tests no longer run close to the file-descriptor limit (#295).** Each `engine.client()` in the suite built its own tokio runtime (a thread, an epoll descriptor and eventfds), 378 of them per run, so the suite failed at `ulimit -n 256`; the tests now run their clients on one shared runtime and peak open descriptors halve. The runtime crate gains an additive `RuntimeClient::with_handle` for this; the agent does not use it and behaves as before.

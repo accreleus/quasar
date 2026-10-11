@@ -83,7 +83,6 @@ export function eligibilityText(reason: EligibilityReason | string | null): stri
 const FAULT_TEXT: Record<string, string> = {
   agent_ahead_of_control_plane: "Agent ahead of the control plane",
   identity_unknown: "Build identity unknown",
-  manifest_invalid: "Release manifest invalid",
 };
 
 /** Apply progress, as a phrase the row reads as its state. */
