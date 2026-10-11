@@ -184,7 +184,10 @@ export function isBannerVerdict(f: LaunchFailure): boolean {
 
 /** What the page can still show after the loader's reveal has begun: a banner
  * verdict, or its own "unreachable" guess (the recovery banner covers that one).
- * Anything else is loader copy, and the loader is inert by then. */
+ * Anything else is loader copy, and the loader is inert by then.
+ * Invariant: once the reveal has begun, the page holds no verdict it cannot show.
+ * The write gate (`noteFailure`) keeps one in out; the reveal gate (`revealReady`)
+ * keeps the reveal from beginning while one is held. */
 export function showsAfterReveal(f: LaunchFailure): boolean {
   return isBannerVerdict(f) || f.kind === "unreachable";
 }

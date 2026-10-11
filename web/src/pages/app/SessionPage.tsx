@@ -47,7 +47,7 @@ import {
   SessionBannerHost,
 } from "./sessionAlerts";
 import { SessionLoader } from "./SessionLoader";
-import { accessRevokedFailure, isBannerVerdict, takenOverFailure, unreachableFailure } from "./sessionFailure";
+import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
@@ -756,7 +756,10 @@ export function SessionPage() {
   // #484 §3.2: the reveal gate is channelOpen AND appPresented, not
   // channelOpen alone — the compositor's transport comes up 30-50s before a
   // cold app draws anything, and revealing on transport alone is the defect.
-  const revealReady = channelOpen && appPresented;
+  // A held verdict the page could not show after the reveal keeps the loader (and
+  // its card) up instead; see showsAfterReveal.
+  const revealReady =
+    channelOpen && appPresented && (!launchFailure || showsAfterReveal(launchFailure));
   // Layout, not passive: set synchronously at commit, before any network callback can run.
   useLayoutEffect(() => {
     if (revealReady) revealStartedRef.current = true;

@@ -961,3 +961,72 @@ describe("SessionPage — an overlapping launch poll cannot hold a verdict the r
     expect(screen.getByTestId("hud")).not.toBeNull();
   });
 });
+
+// The other half of the same invariant: the reveal does not begin while a verdict
+// the page could not show afterwards is held.
+describe("SessionPage — the reveal waits for a verdict only the loader can show (#449)", () => {
+  const TAKEN = "This session moved to another tab";
+  const banners = () => document.querySelectorAll(".banner");
+  /** Channel open, an older launch poll still in flight, a newer one answering `newer`. */
+  async function heldThenLatePresented(newer: Record<string, unknown>) {
+    currentSession = makeSession({ state_detail: "app booting" });
+    renderPage();
+    await advance(1_000);
+    await act(async () => lastOnChannel?.({ readyState: "open", onclose: null, send() {}, bufferedAmount: 0 }));
+    const pending: Array<(s: { session: ReturnType<typeof makeSession> }) => void> = [];
+    getSession.mockImplementation(() => new Promise((resolve) => pending.push(resolve)));
+    await advance(1_100);
+    await advance(1_000);
+    expect(pending.length).toBe(2);
+    await act(async () => pending[1]({ session: makeSession(newer) }));
+    await advance(100);
+    return () => act(async () => pending[0]({ session: makeSession({ state_detail: "app presented" }) }));
+  }
+
+  it("ended is held, then a late app-presented: the loader's card stays, with its button", async () => {
+    const late = await heldThenLatePresented({ state: "stopping", state_detail: "stop requested" });
+    expect(screen.getByText("The session ended before it started")).not.toBeNull();
+    await late();
+    await advance(3_000);
+
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    expect(screen.getByText("The session ended before it started")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
+  });
+
+  it("failed is held, then a late app-presented: the loader's card stays, with its button", async () => {
+    const late = await heldThenLatePresented({
+      state: "failed",
+      state_detail: "app booting",
+      failure_code: "app_exited_early",
+      error_message: "the app exited with code 1 before producing any video.",
+    });
+    await late();
+    await advance(3_000);
+
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    expect(screen.getByText("The app exited before producing any video")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
+  });
+
+  it("a revoked access held before the reveal does not block it: the loader goes and the banner shows", async () => {
+    const late = await heldThenLatePresented({ state: "stopped", stop_reason: "entitlement_revoked" });
+    await late();
+    await advance(3_000);
+
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
+    expect(banners().length).toBe(1);
+  });
+
+  it("a takeover held before the reveal does not block it: the loader goes and the banner shows", async () => {
+    const late = await heldThenLatePresented({ state: "running", state_detail: "app booting" });
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await late();
+    await advance(3_000);
+
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(banners().length).toBe(1);
+  });
+});
