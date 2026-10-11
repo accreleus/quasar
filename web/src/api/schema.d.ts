@@ -7415,7 +7415,7 @@ export interface paths {
         head?: never;
         /**
          * Edit the admin-owned half of a job's schedule.
-         * @description The `jobs` row is split by OWNERSHIP: identity (name, description, plane, scope, managed) is code-owned and reconciled at every boot, and the schedule fields below are ADMIN-OWNED and never overwritten by that reconcile. An all-optional body, the repo's PATCH convention, so "absent" is distinguishable from "zero" — but an UNKNOWN key is rejected with 400 rather than silently ignored, because a typo'd field name accepted with a 200 is the "did my edit take effect" confusion this surface exists to end. `window_start` and `window_end` move together: both set, or both null to clear. 400 validation_failed = malformed body, unknown key, or a value of the wrong JSON type; 422 validation_failed = a well-formed value the schedule refuses (interval below 60s, interval_secs on a non-interval job, window_start == window_end, a window_days value outside 0..6, an unknown IANA zone, history_limit outside 1..500). 409 job_unmanaged = the job is not adopted and has no schedule to edit. 409 schedule_locked = an environment variable is authoritative over this job's interval; the edit is refused rather than silently accepted and overruled. Every accepted PATCH writes an admin_activity row (`job.update`, `{"keys": [...]}`).
+         * @description The `jobs` row is split by OWNERSHIP: identity (name, description, plane, scope, managed) is code-owned and reconciled at every boot, and the schedule fields below are ADMIN-OWNED and never overwritten by that reconcile. An all-optional body, the repo's PATCH convention, so "absent" is distinguishable from "zero" — but an UNKNOWN key is rejected with 400 rather than silently ignored, because a typo'd field name accepted with a 200 is the "did my edit take effect" confusion this surface exists to end. `window_start` and `window_end` move together: both set, or both null to clear. 400 validation_failed = malformed body, unknown key, or a value of the wrong JSON type; 422 validation_failed = a well-formed value the schedule refuses (interval below 60s, interval_secs on a non-interval job, window_start == window_end, a window_days value outside 0..6, an unknown IANA zone, history_limit outside 1..500). 409 job_unmanaged = the job is not adopted and has no schedule to edit. 409 schedule_locked = an environment variable is authoritative over this job's interval; the edit is refused rather than silently accepted and overruled. For `library.discovery` the period is the resolved Libraries interval, not admin-owned `interval_secs` (amendment 28): an `interval_secs` equal to the period the jobs read reports is accepted and not stored, and a different value is 409 schedule_locked. Every accepted PATCH writes an admin_activity row (`job.update`, `{"keys": [...]}`).
          */
         patch: {
             parameters: {
@@ -11408,7 +11408,7 @@ export interface components {
         /** @description The ADMIN-OWNED half of a job (the code-owned half is its identity), resolved exactly as the dispatcher resolves it - one implementation of "which source won", so the viewer and the scheduler cannot disagree about when a job will next run. */
         JobSchedule: {
             kind: components["schemas"]["JobScheduleKind"];
-            /** @description Null for a non-interval schedule. Floor of 60 (a CHECK in the migration and a guard in the handler): a job that wants to run more often than once a minute is not a background job. When `locked` is true this is the ENVIRONMENT's value, not the stored one. */
+            /** @description Null for a non-interval schedule. Floor of 60 (a CHECK in the migration and a guard in the handler): a job that wants to run more often than once a minute is not a background job. When `locked` is true this is the ENVIRONMENT's value, not the stored one. For `library.discovery` it is always the resolved Libraries interval (`QUASAR_LIBRARY_SCAN_INTERVAL`, else `instance_settings.library_discovery_interval_minutes`), read at every scheduling decision; a period stored on the job is ignored (amendment 28). */
             interval_secs: number | null;
             /** @description HH:MM:SS in `timezone`, or null for 'any time'. Paired with window_end by a CHECK - both set or both null. */
             window_start: string | null;
@@ -11418,9 +11418,9 @@ export interface components {
             window_days: number[];
             /** @description IANA zone name; windows are evaluated in it. Intervals are NOT: an interval is a duration in absolute time and has no opinion about the clock on the wall, so a DST transition can shift when a windowed run lands but can never lengthen an interval. */
             timezone: string;
-            /** @description True when an environment variable is authoritative over this job's interval. The env override stays the winner (the pre-existing documented behaviour of knobs like QUASAR_LIBRARY_SCAN_INTERVAL); the API says so rather than silently accepting an edit the environment will overrule - a PATCH of interval_secs on a locked job is 409 schedule_locked. */
+            /** @description True when an environment variable is authoritative over this job's interval, and, for `library.discovery`, whenever its interval is not writable here, which is always (amendment 28). The env override stays the winner (the pre-existing documented behaviour of knobs like QUASAR_LIBRARY_SCAN_INTERVAL); the API says so rather than silently accepting an edit the environment will overrule - a PATCH of interval_secs on a locked job is 409 schedule_locked. */
             locked: boolean;
-            /** @description The environment variable that is in force, e.g. "QUASAR_LIBRARY_SCAN_INTERVAL". Null when not locked. */
+            /** @description The authority that is in force: the environment variable, e.g. "QUASAR_LIBRARY_SCAN_INTERVAL", or, for `library.discovery` when that override is not set, `instance_settings.library_discovery_interval_minutes` (amendment 28). Null when not locked. */
             locked_by: string | null;
         };
         /** @description One record of one run - the shape that appears as `last_run` and as an item of the run-history page. */
@@ -11513,7 +11513,7 @@ export interface components {
         /** @description Every field optional; an absent field is left alone. AN UNKNOWN KEY IS A 400, not a silent ignore. `window_start` and `window_end` must be supplied together - both as strings to set a window, both as null to clear it - because a half-set window is a schedule nobody can reason about. */
         JobPatchRequest: {
             enabled?: boolean;
-            /** @description Only for an interval job (422 otherwise), never below 60, and refused with 409 schedule_locked while an env override is in force. */
+            /** @description Only for an interval job (422 otherwise), never below 60, and refused with 409 schedule_locked while an env override is in force. For `library.discovery` a value equal to the reported `interval_secs` is accepted and not stored, and a different value is 409 schedule_locked (amendment 28). */
             interval_secs?: number;
             /** @description "HH:MM" or "HH:MM:SS", or null to clear (with window_end). 24:00 is rejected rather than normalized - a bound that means two things is the seed of a missed run nobody can explain. */
             window_start?: string | null;
