@@ -22,7 +22,7 @@ const FADE_OUT_MS = 400;
 
 export function SessionSwapTransition({ transition }: SessionSwapTransitionProps) {
   const show = transition != null;
-  // The shell stays mounted so the fade and the live region work; its content
+  // The shell stays mounted so the fade and the live region work; its text
   // is only in the document while a swap is in flight or fading out, so an idle
   // session's page text carries none of it.
   const [held, setHeld] = useState(transition);
@@ -39,9 +39,13 @@ export function SessionSwapTransition({ transition }: SessionSwapTransitionProps
       aria-live="polite"
       aria-hidden={show ? undefined : "true"}
     >
+      {/* #544: the mark stays mounted while idle. Its running animation
+          (`.switcher svg`, session.css) is what keeps the page's frame
+          callbacks on a steady clock; without it the present-cadence telemetry
+          read 50% more jitter. It carries no text. */}
+      <QuasarMark size={72} />
       {held && (
         <>
-          <QuasarMark size={72} />
           <div className="sw-nm">{held.appName}</div>
           {held.phase === "error" || held.phase === "timeout" ? (
             <div className="sw-err">
