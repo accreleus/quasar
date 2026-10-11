@@ -122,10 +122,32 @@ export function runNowErrorMessage(code: string, fallback: string): string {
  * the handler can return on top of the generic validation ones (handler.go
  * `handlePatch`).
  */
+const LIBRARY_SETTING = "instance_settings.library_discovery_interval_minutes";
+const LIBRARY_ENV = "QUASAR_LIBRARY_SCAN_INTERVAL";
+const LIBRARY_SETTING_NAME = "Settings ▸ Libraries ▸ Scan interval";
+
+/** A known owner by its screen rather than its column; an unknown one keeps its raw name. */
+export function lockedOwnerName(lockedBy: string): string {
+  return lockedBy === LIBRARY_SETTING ? LIBRARY_SETTING_NAME : lockedBy;
+}
+
+/** What to do about a locked interval: unset an env var, or edit a setting where it lives.
+ *  The Libraries scan interval is the one job whose env var, once unset, hands the
+ *  interval to a setting rather than to this job. */
+export function lockedIntervalAdvice(lockedBy: string): string {
+  if (lockedBy === LIBRARY_SETTING) return "Change it there.";
+  if (lockedBy === LIBRARY_ENV) return `Unset it to use ${LIBRARY_SETTING_NAME}.`;
+  return lockedBy.startsWith("QUASAR_")
+    ? "Unset it to edit the interval here."
+    : "Change it there, not here.";
+}
+
 export function patchErrorMessage(code: string, fallback: string, lockedBy?: string | null): string {
   switch (code) {
     case "schedule_locked":
-      return `${lockedBy ?? "An environment variable"} sets this job's interval. Unset it to edit the interval here.`;
+      return lockedBy
+        ? `${lockedOwnerName(lockedBy)} sets this job's interval. ${lockedIntervalAdvice(lockedBy)}`
+        : "An environment variable sets this job's interval. Unset it to edit the interval here.";
     case "job_unmanaged":
       return "This job is not managed by the job framework, so it has no schedule to edit.";
     default:
