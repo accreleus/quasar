@@ -832,13 +832,15 @@ export function SessionPage() {
   // Whether any of the banner blocks below is on screen. The HUD takes
   // no banner-state input, so it is carried as a class on the shared ancestor
   // instead — `.session-root.banner-on` pushes a top-docked HUD down (hud.css).
+  // A held verdict is the only banner: the others' Stop would end a session
+  // another tab now owns.
   const bannerOn =
-    health != null ||
-    clientUnsupported ||
     verdictBanner != null ||
     (!bannerVerdict &&
-      recovery != null &&
-      ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase));
+      (health != null ||
+        clientUnsupported ||
+        (recovery != null &&
+          ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase))));
 
   // Same shape, for the mic "hot" pill vs the toast host (`.session-root.mic-on`).
   const rootClassName =
@@ -878,7 +880,7 @@ export function SessionPage() {
           {/* AS10-06: stream health. Warning (degrading) is non-blocking info;
               critical (unsustainable) offers Stop / Retry — the user always
               chooses, the client never auto-acts. */}
-          {health && (
+          {health && !bannerVerdict && (
             <SessionBanner
               variant={health.kind === "critical" ? "critical" : "warning"}
               title={health.title}
@@ -903,7 +905,7 @@ export function SessionPage() {
           )}
 
           {/* Multi-codec spec §6.1: client_unsupported. */}
-          {clientUnsupported && (
+          {clientUnsupported && !bannerVerdict && (
             <SessionBanner
               title={<>This stream isn&rsquo;t supported on your device</>}
               message={
@@ -1107,7 +1109,8 @@ export function SessionPage() {
         </button>
       )}
 
-      <SessionToastHost toast={toast} />
+      {/* A swap finishing under a held verdict must not announce itself next to the notice. */}
+      <SessionToastHost toast={bannerVerdict ? null : toast} />
 
       {/* Rendered outside every auto-hiding surface on purpose: a live
           microphone must not be able to become invisible, including under the

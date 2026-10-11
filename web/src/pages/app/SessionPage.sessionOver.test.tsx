@@ -32,7 +32,9 @@ vi.mock("../../webrtc/telemetry", async (importOriginal) => {
   return {
     ...actual,
     SessionTelemetry: class {
-      onUpdate() {}
+      onUpdate(l: (snap: Record<string, unknown>) => void) {
+        telemetryListener = l;
+      }
       start() {}
       stop() {}
       setDecodeFailed() {}
@@ -50,6 +52,7 @@ vi.mock("../../webrtc/traceEvents", () => ({
   },
 }));
 
+let telemetryListener: ((snap: Record<string, unknown>) => void) | null = null;
 type Channel = { readyState: string; onclose: (() => void) | null; send: () => void; bufferedAmount: number };
 let lastOnChannel: ((ch: Channel) => void) | null = null;
 let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
@@ -96,12 +99,18 @@ vi.mock("./SessionSwapController", () => ({
   SessionSwapController: ({
     children,
     sessionOver,
+    onToast,
   }: {
     children: (p: { quickSwitch: null; swappingTo: null }) => React.ReactNode;
     sessionOver?: boolean;
-  }) => (sessionOver ? null : children({ quickSwitch: null, swappingTo: null })),
+    onToast: (n: React.ReactNode) => void;
+  }) => {
+    swapToast = onToast;
+    return sessionOver ? null : children({ quickSwitch: null, swappingTo: null });
+  },
 }));
 
+let swapToast: ((n: React.ReactNode) => void) | null = null;
 let hud: Record<string, unknown> = {};
 const hudOpen = vi.fn();
 vi.mock("./hud/Hud", async () => {
@@ -223,6 +232,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
+  telemetryListener = null;
   constructed = 0;
   hud = {};
   track.stopped = false;
@@ -589,5 +599,81 @@ describe("SessionPage — a late takeover (#527)", () => {
     await act(async () => rc.superseded("opened in another tab"));
     await advance(100);
     expect(banners().length).toBe(1);
+  });
+});
+
+// #529 — a held verdict (takeover, access removed) is the only banner and the only
+// action: a Stop from the decoder or health banner would end a session another tab
+// owns. Without a verdict (recovery merely failed) the session is still the user's.
+describe("SessionPage — a held verdict is the only banner (#529)", () => {
+  const TAKEN = "This session moved to another tab";
+  const DECODER = "This stream isn’t supported on your device";
+  const HEALTH = "Stream quality is unsustainable on your network";
+  const stream = async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    const ch: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
+    await act(async () => lastOnChannel?.(ch));
+    await advance(3_000);
+    return ch;
+  };
+  const decoderLatches = async () => {
+    await act(async () => telemetryListener?.({ clientHealth: "client_unsupported", framesDecodedTotal: 0, bytesReceivedTotal: 0 }));
+    await advance(100);
+    expect(screen.getByText(DECODER)).not.toBeNull();
+  };
+  const takeover = async () => {
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(100);
+  };
+  const onlyTheVerdict = async () => {
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(screen.queryByText(DECODER)).toBeNull();
+    expect(screen.queryByText(HEALTH)).toBeNull();
+    expect(document.querySelectorAll(".banner").length).toBe(1);
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Back to library"]);
+    expect(stopSession).not.toHaveBeenCalled();
+  };
+
+  it("decoder banner latched, then a takeover: only the takeover banner", async () => {
+    await stream();
+    await decoderLatches();
+    await takeover();
+    await onlyTheVerdict();
+  });
+
+  it("decoder and health notices up, then a takeover: only the takeover banner", async () => {
+    await stream();
+    await decoderLatches();
+    currentSession = makeSession({ health_state: "unsustainable" });
+    await advance(5_500);
+    expect(screen.getByText(HEALTH)).not.toBeNull();
+    await takeover();
+    await onlyTheVerdict();
+  });
+
+  it("no verdict, recovery failed with the channel gone: the decoder banner keeps its Stop", async () => {
+    const ch = await stream();
+    await decoderLatches();
+    refused();
+    await act(async () => {
+      ch.onclose?.();
+      lastOnRecovery?.(failed);
+    });
+    await advance(100);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    expect(screen.getByText(DECODER)).not.toBeNull();
+    expect(screen.getAllByRole("button", { name: "Stop" }).length).toBeGreaterThan(0);
+  });
+
+  it("a swap finishing under a held verdict raises no toast next to the notice", async () => {
+    await stream();
+    await act(async () => swapToast?.("Now playing Elsewhere."));
+    expect(screen.queryByText(/Now playing/)).not.toBeNull();
+    await takeover();
+    expect(screen.queryByText(/Now playing/)).toBeNull();
+    await act(async () => swapToast?.("Now playing Again."));
+    expect(screen.queryByText(/Now playing/)).toBeNull();
   });
 });
