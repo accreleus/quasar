@@ -39,10 +39,9 @@ export function SessionSwapTransition({ transition }: SessionSwapTransitionProps
       aria-live="polite"
       aria-hidden={show ? undefined : "true"}
     >
-      {/* #544: the mark stays mounted while idle. Its running animation
-          (`.switcher svg`, session.css) is what keeps the page's frame
-          callbacks on a steady clock; without it the present-cadence telemetry
-          read 50% more jitter. It carries no text. */}
+      {/* #544: the mark stays mounted while idle. Its running animation kept the
+          frame callbacks, and the telemetry sampled in them, on a steady
+          cadence in the browsers measured. It carries no text. */}
       <QuasarMark size={72} />
       {held && (
         <>
