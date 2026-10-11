@@ -75,6 +75,14 @@ Games see an Xbox 360 controller. Some pads (for example 8BitDo over Bluetooth)
 aren't reported in the standard layout, and the **Controller & input** pane says
 so. Switch the pad to XInput mode, or connect it by cable or USB receiver.
 
+## X and Y are swapped on a gamepad page inside the session
+
+A gamepad tester or web game opened in a browser **inside** the streamed desktop
+shows X and Y swapped (seen in Firefox). Games and Steam read the pad correctly.
+Only web pages in the session that use the browser's Gamepad API are affected. The
+virtual pad is not backed by the Xbox kernel driver, so Firefox reads X and Y
+differently. This is a known limit; there is nothing to change.
+
 ## Touch input on a tablet
 
 Touch is forwarded. Open the session drawer with the on-screen button. Most games

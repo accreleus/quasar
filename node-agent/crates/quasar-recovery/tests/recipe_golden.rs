@@ -890,7 +890,7 @@ fn a_revision_the_book_does_not_carry_is_recipe_unsupported() {
         (Role::NodeAgent, 5),
         (Role::RecoveryActor, 2),
         (Role::ControlPlane, 0),
-        (Role::ControlPlane, 3),
+        (Role::ControlPlane, 4),
         (Role::Postgres, 2),
     ] {
         assert_eq!(
@@ -1143,6 +1143,26 @@ fn the_combined_and_control_only_recipes_render_their_golden_specifications() {
     .unwrap();
     check("control-plane-r2-control-only-external.json", &spec);
 
+    // Revision 3 (#543): the recipe carries the healthcheck.
+    let spec = render(
+        Role::ControlPlane,
+        3,
+        &enrolling,
+        &cp,
+        &control_secrets(true),
+    )
+    .unwrap();
+    check("control-plane-r3-combined.json", &spec);
+    let spec = render(
+        Role::ControlPlane,
+        3,
+        &control_only,
+        &cp,
+        &control_secrets(false),
+    )
+    .unwrap();
+    check("control-plane-r3-control-only-external.json", &spec);
+
     // Revision 1 has no fallback variables: an override, else the install-time image.
     let spec = render(
         Role::ControlPlane,
@@ -1159,6 +1179,32 @@ fn the_combined_and_control_only_recipes_render_their_golden_specifications() {
 
 const OVERRIDE_AGENT_IMAGE: &str =
     "registry.example.invalid/dev/quasar-node-agent@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+/// Revisions 1 and 2 keep no healthcheck, so an existing install's control plane renders
+/// as it was created; revision 3 is revision 2 plus the check.
+#[test]
+fn control_plane_revision_3_adds_only_its_own_healthcheck() {
+    let cp = ImageRef::parse(CONTROL_IMAGE).unwrap();
+    let owned = combined(DatabaseInputs::Owned);
+    let at = |revision| {
+        let mut spec = render(
+            Role::ControlPlane,
+            revision,
+            &owned,
+            &cp,
+            &control_secrets(true),
+        )
+        .unwrap();
+        spec.labels.remove("io.quasar.recipe");
+        spec.labels.remove("io.quasar.spec");
+        spec
+    };
+    assert_eq!(at(1).healthcheck, None);
+    let (two, mut three) = (at(2), at(3));
+    assert_eq!(two.healthcheck, None);
+    assert!(three.healthcheck.take().is_some());
+    assert_eq!(two, three);
+}
 
 #[test]
 fn a_gpu_hosts_agent_has_the_same_shape_at_revisions_1_and_2() {

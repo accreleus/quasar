@@ -51,8 +51,8 @@ pub struct ContainerSpec {
     /// field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PublishedPort>,
-    /// A healthcheck of the container's own, for an image that declares none. `None`
-    /// keeps the image's. Omitted from the JSON when `None`, as `ports`.
+    /// A healthcheck of the container's own. `None` leaves it to the image's, which
+    /// Podman drops for an OCI image. Omitted from the JSON when `None`, as `ports`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<Healthcheck>,
 }
