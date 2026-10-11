@@ -52,6 +52,9 @@ export class RecoveryController {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private attempt = 0;
   private stopped = false;
+  /** `superseded` is reported at most once, and never after `close()`. */
+  private takenOver = false;
+  private closed = false;
   /** #128 — signalling health, tracked independently of media health. */
   private signalingDown = false;
   /** The prose for the current signalling outage, so a media-side `connected()`
@@ -169,9 +172,12 @@ export class RecoveryController {
   /**
    * Sets `stopped` so the ICE failure that follows a takeover (host now offers
    * to the new peer) can't re-enter `interrupted()` and restart escalation.
+   * Delivered even after `failed` (#527): the runtime may be minting a
+   * replacement token, and a takeover must discard it.
    */
   superseded(message: string): void {
-    if (this.stopped) return;
+    if (this.takenOver || this.closed) return;
+    this.takenOver = true;
     this.clearPending();
     this.emit("superseded", message);
     this.stopped = true;
@@ -182,6 +188,7 @@ export class RecoveryController {
   }
 
   close(): void {
+    this.closed = true;
     this.stopped = true;
     this.clearPending();
   }

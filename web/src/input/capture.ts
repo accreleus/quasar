@@ -198,6 +198,9 @@ const LONG_PRESS_MS = 500;
  *  dx/dy are high-resolution wheel units). */
 const TOUCH_SCROLL_SCALE = 1;
 
+/** Newest live capture per video element: a stale grant or cleanup() leaves its lock alone. */
+const liveCapture = new WeakMap<object, object>();
+
 /**
  * Attach input listeners and pointer-lock tracking. cleanup() on unmount /
  * channel close; getMetrics() snapshots and resets the rate window (wall-clock
@@ -232,6 +235,10 @@ export function setupCapture({
    *  a grant that lands while this is false is handed straight back. Starts true:
    *  nothing has been released yet, and only engage() ever requests the lock. */
   let wanted = true;
+  /** Set by cleanup(): the capture's own listeners are gone. */
+  let cleanedUp = false;
+  const self = {};
+  liveCapture.set(videoEl, self);
 
   const lockSupported = pointerLockSupported();
 
@@ -429,6 +436,12 @@ export function setupCapture({
       const maybe: unknown = videoEl.requestPointerLock();
       if (maybe && typeof (maybe as PromiseLike<void>).then === "function") {
         await (maybe as PromiseLike<void>);
+        // The grant outlived cleanup(), so no pointerlockchange handler is left to
+        // hand it back. A newer capture on this element owns the lock instead.
+        // Engines whose requestPointerLock returns no promise are not covered.
+        if (cleanedUp && !liveCapture.has(videoEl) && document.pointerLockElement === videoEl) {
+          document.exitPointerLock?.();
+        }
       }
       return { mode: "pointer-lock" };
     } catch (error) {
@@ -438,10 +451,10 @@ export function setupCapture({
 
   /** Idempotent. Lock mode goes through exitPointerLock so browser state and
    *  ours never diverge (pointerlockchange runs the release); fallback clears
-   *  directly. */
+   *  directly. A lock this capture inherited (an older capture's) is exited too. */
   const release = () => {
     wanted = false;
-    if (captureMode === "lock" && document.exitPointerLock) {
+    if ((captureMode === "lock" || document.pointerLockElement === videoEl) && document.exitPointerLock) {
       document.exitPointerLock();
       return;
     }
@@ -880,6 +893,8 @@ export function setupCapture({
     resetTouch(sendBestEffort);
     captured = false;
     captureMode = "none";
+    cleanedUp = true;
+    if (liveCapture.get(videoEl) === self) liveCapture.delete(videoEl);
     document.removeEventListener("pointerlockchange", onLockChange);
     document.removeEventListener("pointerdown", onPointerDown, true);
     document.removeEventListener("pointermove", onPointerMove);
@@ -898,7 +913,7 @@ export function setupCapture({
       keyboardLocked = false;
       keyboardLockApi()?.unlock();
     }
-    if (document.pointerLockElement === videoEl && document.exitPointerLock) {
+    if (document.pointerLockElement === videoEl && !liveCapture.has(videoEl) && document.exitPointerLock) {
       document.exitPointerLock();
     }
   };
