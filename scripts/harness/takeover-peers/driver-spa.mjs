@@ -200,11 +200,22 @@ async function open(as) {
   const errors = [];
   // Firefox has no `headerExtensions` on receiver parameters, and the client's telemetry
   // probe (`hasAbsCaptureTimeExtension`) throws on it every tick: there before #535.
-  page.on("pageerror", (e) => { if (!(FIREFOX && String(e).includes("headerExtensions"))) errors.push(String(e).slice(0, 200)); });
+  const opened = Date.now();
+  page.on("pageerror", (e) => { if (!(FIREFOX && String(e).includes("headerExtensions"))) errors.push(`${as} +${Date.now() - opened}ms: ${String(e).slice(0, 200)}`); });
   page.on("console", (m) => { if (m.type() === "error" && consoleErrors.length < 12) consoleErrors.push(m.text().slice(0, 200)); });
   // The hold applies to the page that takes the session over.
   const hold = as === "resume-mic" && process.env.SPA_HOLD ? `&hold=${process.env.SPA_HOLD}` : "";
-  await page.goto(`${ORIGIN}/app/session/${SID}?as=${as}${hold}`);
+  const url = `${ORIGIN}/app/session/${SID}?as=${as}${hold}`;
+  await page.goto(url);
+  // With host networking the browser sees every interface of the machine, and aborts a
+  // load in flight when one comes or goes (ERR_NETWORK_CHANGED: another container
+  // starting). Such a page never boots and has attached nothing: load it again.
+  for (let again = 0; again < 2; again++) {
+    const booted = await page.waitForFunction(() => document.querySelector("#root")?.childElementCount > 0, null, { timeout: 8000 }).then(() => true, () => false);
+    if (booted) break;
+    reloads.push(as);
+    await page.goto(url);
+  }
   return { browser, page, errors };
 }
 
@@ -224,7 +235,8 @@ const video = (s) => s.pcs?.[0] ?? {};
 const audio = (s) => s.pcs?.[1] ?? {};
 
 const consoleErrors = [];
-const out = { scenario, browser: process.env.BROWSER === "firefox" ? "firefox" : "chrome", checks: {}, consoleErrors };
+const reloads = [];
+const out = { scenario, browser: process.env.BROWSER === "firefox" ? "firefox" : "chrome", checks: {}, consoleErrors, reloads };
 const check = (name, pass) => { out.checks[name] = Boolean(pass); };
 
 const A = await open("launch");
