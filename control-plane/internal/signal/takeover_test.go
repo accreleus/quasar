@@ -173,12 +173,28 @@ func TestDisplacedSocketForwardsNothingItHadAlreadyRead(t *testing.T) {
 		if err != nil {
 			t.Fatalf("round %d: dial second: %v", round, err)
 		}
-		// The probe comes back only once the second socket is registered, which
-		// is what displaces the first.
-		if err := relay.Deliver(sess.ID, []byte(`{"type":"ice","pc":"video","candidate":"registration probe"}`)); err != nil {
-			t.Fatalf("round %d: deliver registration probe: %v", round, err)
+		// A probe reaches the second socket only once it is registered, which is
+		// what displaces the first. Until then probes go to the first socket's
+		// queue, so keep delivering.
+		registered := make(chan struct{})
+		go func() {
+			secondConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, _, err := secondConn.ReadMessage(); err == nil {
+				close(registered)
+			}
+		}()
+		for attempt := 0; ; attempt++ {
+			_ = relay.Deliver(sess.ID, []byte(`{"type":"ice","pc":"video","candidate":"registration probe"}`))
+			select {
+			case <-registered:
+			case <-time.After(20 * time.Millisecond):
+				if attempt > 200 {
+					t.Fatalf("round %d: the second socket never registered", round)
+				}
+				continue
+			}
+			break
 		}
-		readBrowserFrame(t, secondConn)
 
 		close(agent.release)
 		first.SetReadDeadline(time.Now().Add(5 * time.Second))
