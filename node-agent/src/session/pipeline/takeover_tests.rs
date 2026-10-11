@@ -24,9 +24,9 @@ use crate::session::signaling::{PcId, SignalMsg};
 use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 
 /// The dev/runtime image has libnice, gst-interpipe and openh264; the devtools image
-/// `make test-rust` runs in and the CI runner have none of the first two. A test that
-/// returns early counts as passed, so the skip is written past libtest's capture, once,
-/// and `scripts/verify/agent.sh` restates it.
+/// `make test-rust` runs in has no gst-interpipe, and a CI runner may lack more. A test
+/// that returns early counts as passed, so the skip is written past libtest's capture,
+/// once, and `scripts/verify/agent.sh` restates it.
 fn live_webrtc_available() -> bool {
     gst::init().unwrap();
     let missing: Vec<&str> = [
