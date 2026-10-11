@@ -611,12 +611,21 @@ pub(crate) fn plan_is_degraded(knobs: EncoderKnobs, plan: &[(Codec, CodecPlan)])
     })
 }
 
+/// True when an enabled codec is served by a vendor encoder instead of its Vulkan element.
+pub(crate) fn plan_has_vendor_fallback(knobs: EncoderKnobs, plan: &[(Codec, CodecPlan)]) -> bool {
+    plan.iter()
+        .any(|(codec, p)| knobs.allows(*codec) && matches!(p, CodecPlan::Fallback(_)))
+}
+
 /// The operator-facing startup line for a Vulkan-encoder host, plus
 /// [`plan_is_degraded`] — the caller logs at WARN rather than INFO when degraded.
 pub struct CodecPlanReport {
     /// e.g. `h264=vulkan (default), h265=fallback:nvcudah265enc (env), av1=disabled (env)`
     pub line: String,
     pub degraded: bool,
+    /// An enabled codec is served by the vendor encoder because its Vulkan element is
+    /// missing (it is still advertised).
+    pub vendor_fallback: bool,
 }
 
 /// What each codec resolves to on this Vulkan-encoder host and where its knob value
@@ -631,12 +640,17 @@ pub fn describe_codec_plan(knobs: EncoderKnobs) -> CodecPlanReport {
         }
     }
     let degraded = plan_is_degraded(knobs, &plan);
+    let vendor_fallback = plan_has_vendor_fallback(knobs, &plan);
     let line = plan
         .into_iter()
         .map(|(codec, plan)| format!("{}={plan} ({})", codec.as_str(), knobs.knob(codec).source()))
         .collect::<Vec<_>>()
         .join(", ");
-    CodecPlanReport { line, degraded }
+    CodecPlanReport {
+        line,
+        degraded,
+        vendor_fallback,
+    }
 }
 
 /// Guarded property-set/read helpers shared by the three hardware encoder builders.
@@ -1129,9 +1143,9 @@ mod tests {
     use super::{
         codec_plan_with, cpb_size_kbits, effective_encoder_with, effective_gop, encoder_candidates,
         nvenc_encoder_candidates, nvenc_h264_encoder_candidates, openh264_supports,
-        plan_is_degraded, required_source_ring_depth, va_device_element_prefix,
-        va_encoder_candidates, va_h264_encoder_candidates, vulkan_element, CodecKnob, CodecPlan,
-        EncoderKnobs, ResolvedEncoder,
+        plan_has_vendor_fallback, plan_is_degraded, required_source_ring_depth,
+        va_device_element_prefix, va_encoder_candidates, va_h264_encoder_candidates,
+        vulkan_element, CodecKnob, CodecPlan, EncoderKnobs, ResolvedEncoder,
     };
     use crate::session::{Codec, EncoderChoice};
 
@@ -1471,6 +1485,22 @@ mod tests {
             !plan_is_degraded(knobs, &codec_plan_with(knobs, "software", &host)),
             "an operator-disabled codec is the knob working, never a degraded image"
         );
+    }
+
+    // #308: an unavailable codec is not advertised; a fallback one still is, and only
+    // the latter is a vendor fallback.
+    #[test]
+    fn vendor_fallback_is_told_apart_from_an_unavailable_codec() {
+        let knobs = EncoderKnobs::default();
+        let amd_no_vulkan_av1 = registry(&["vulkanh264enc", "vulkanh265enc"]);
+        assert!(!plan_has_vendor_fallback(
+            knobs,
+            &codec_plan_with(knobs, "software", &amd_no_vulkan_av1)
+        ));
+        let amd_vah264 = registry(&["vah264enc", "vulkanh265enc"]);
+        let plan = codec_plan_with(knobs, "software", &amd_vah264);
+        assert_eq!(plan[0].1, CodecPlan::Fallback("vah264enc".into()));
+        assert!(plan_has_vendor_fallback(knobs, &plan));
     }
 
     // A knob left ON whose vulkan element the image lacks is a DEGRADED plan,
