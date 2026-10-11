@@ -440,6 +440,8 @@ planner: a host whose actor or agent is below the control plane's declared floor
   never offered an in-place update. They show nothing (not a fault): `manifest_invalid` is
   reserved but never emitted ([F] `release.go:169`). **No bridge release**: with a handful of
   known testers, release notes and a direct message suffice (YAGNI).
+  *(Note, 2026-10-11: protocol amendment 26 (#157) has since removed the `manifest_invalid`
+  kind; the behaviour is unchanged.)*
 - **Edge.** Old control planes on `edge` resolve branch image tags directly ([F]
   `detect.go:150-200`) and would be offered RH-06 builds. RH-06-era edge builds publish under a
   new tag family (for example `o2-<branch>`, design 1), which old control planes never resolve.

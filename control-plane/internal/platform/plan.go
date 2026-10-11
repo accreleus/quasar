@@ -487,10 +487,10 @@ func hostReason(newest *Release, image *ImageFact, cp buildinfo.Identity, h Host
 // faults reports everything wrong that is not an ineligibility; a fault gates
 // nothing.
 //
-// manifest_invalid is not raised here: a manifest that fails validation carries
-// no trustworthy commit, built_at or schema_version, all three NOT NULL, so the
-// release is never stored and the detector reports the broken publish in its own
-// run record instead of inventing an identity (detect.go).
+// An invalid manifest is not a fault (amendment 26, #157): a manifest that fails
+// validation carries no trustworthy commit, built_at or schema_version, all three
+// NOT NULL, so the release is never stored and the detector counts the broken
+// publish in its own run record instead of inventing an identity (detect.go).
 // `channel` is the instance's channel, not the platform_releases.channel value:
 // the rows come from rowChannel(channel) — on beta those are not the same — and
 // the channel itself is what decides the ordering the agent_ahead comparison

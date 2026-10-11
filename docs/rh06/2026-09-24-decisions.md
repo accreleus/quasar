@@ -178,6 +178,8 @@ stacks redeploy.
     directly), so old edge installs would be offered RH-06 builds unless RH-06-era edge
     builds publish under a tag family old control planes do not resolve. The architecture
     document fixes both.
+  - *Note (2026-10-11):* protocol amendment 26 (#157) removed the `manifest_invalid` fault kind
+    from the contract and the code. It was never emitted, so the behaviour above is unchanged.
 - **This deliberately replaces tracker text.** #219's acceptance asks for "explicit
   migration from existing stacks", "failed adoption rollback" and preservation "during
   opt-in adoption"; #207 says Compose updating is removed "only after … installation

@@ -239,6 +239,27 @@ async fn run_media(
     }
 }
 
+/// The application-GPU probe's in-container command. `--vulkan` rides only on an NVIDIA
+/// GPU: AMD and Intel hosts keep the EGL-only probe.
+fn selftest_command(driver_volume: bool, is_nvidia: bool, device_path: &str) -> Vec<String> {
+    let mut command = vec![
+        "20s".to_string(),
+        "/usr/local/bin/quasar-node-agent".to_string(),
+        "egl-selftest".to_string(),
+    ];
+    if driver_volume {
+        command.push(format!(
+            "{}/lib64/libEGL_nvidia.so.0",
+            crate::nvidia_volume::VOLUME_MOUNT
+        ));
+    }
+    if is_nvidia {
+        command.push("--vulkan".to_string());
+    }
+    command.extend(["--open-device", "--render-node", device_path].map(String::from));
+    command
+}
+
 /// Everything blocking (`own_image`, `app_gpu_access_live`, `runtime::configured`) runs
 /// inside `spawn_blocking`, never on the orchestrator loop.
 async fn run_application_gpu(
@@ -282,6 +303,7 @@ async fn run_application_gpu(
         };
     };
 
+    let is_nvidia = gpu_cap.vendor == "nvidia";
     let watch_preempt = preempt.clone();
     let end = tokio::task::spawn_blocking(move || {
         let is_preempted = || *watch_preempt.borrow();
@@ -299,20 +321,7 @@ async fn run_application_gpu(
                 }));
             }
         };
-        let mut command = vec![
-            "20s".to_string(),
-            "/usr/local/bin/quasar-node-agent".to_string(),
-            "egl-selftest".to_string(),
-        ];
-        if access.carries_driver_volume() {
-            command.push(format!(
-                "{}/lib64/libEGL_nvidia.so.0",
-                crate::nvidia_volume::VOLUME_MOUNT
-            ));
-        }
-        command.push("--open-device".to_string());
-        command.push("--render-node".to_string());
-        command.push(device_path.clone());
+        let command = selftest_command(access.carries_driver_volume(), is_nvidia, &device_path);
         let gpu_run = match access.probe_run(vec!["/usr/bin/timeout".to_string()], command) {
             Ok(run) => run,
             Err(refused) => return Some(Err(refused)),
@@ -331,7 +340,7 @@ async fn run_application_gpu(
 
     match end {
         Ok(Some(Ok(end))) => RunEnd::Concluded {
-            outcome: app_gpu::outcome(target, &end),
+            outcome: app_gpu::outcome(target, is_nvidia, &end),
             reconciled: end.reconciled,
         },
         // The launch this probe stands for is refused the same way (#464).
@@ -452,6 +461,27 @@ mod tests {
     use crate::session::warmup::gate::HostActivity;
 
     const BOUND: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn the_vulkan_step_is_asked_for_on_an_nvidia_gpu_only() {
+        let node = "/dev/dri/renderD128";
+        let has = |c: &[String], flag: &str| c.contains(&flag.to_string());
+        let nvidia = selftest_command(false, true, node);
+        assert!(has(&nvidia, "--vulkan"), "{nvidia:?}");
+        let other = selftest_command(true, false, node);
+        assert!(!has(&other, "--vulkan"), "{other:?}");
+        assert_eq!(
+            other[3],
+            format!(
+                "{}/lib64/libEGL_nvidia.so.0",
+                crate::nvidia_volume::VOLUME_MOUNT
+            )
+        );
+        assert_eq!(
+            &other[other.len() - 3..],
+            ["--open-device", "--render-node", node]
+        );
+    }
 
     fn gpu(index: i32, vendor: &str, render_node: Option<&str>) -> GpuCapacity {
         GpuCapacity {

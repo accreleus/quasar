@@ -1881,6 +1881,184 @@ pub fn parse_egl_device_open(stdout: &str) -> EglRuntime {
     }
 }
 
+/// The `--vulkan` step of the application-GPU self-test: did the container bring up a
+/// Vulkan device from the NVIDIA driver, and if not, is `/dev/nvidia-modeset` why?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VulkanProbe {
+    /// The self-test ran without `--vulkan`.
+    NotRun,
+    Ok {
+        driver: String,
+    },
+    /// No NVIDIA device came up and the container was not given `/dev/nvidia-modeset`.
+    /// The only Vulkan failure the probe blames on the host (#449).
+    Broken {
+        detail: String,
+    },
+    Indeterminate {
+        detail: String,
+    },
+}
+
+/// `requested`: this probe asked for the Vulkan step. Then no marker at all means the step
+/// did not report (the helper keeps only the head of stdout), which is not an EGL-only pass.
+pub fn parse_vulkan_probe(stdout: &str, requested: bool) -> VulkanProbe {
+    let field = |k: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()))
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(detail) = field("VULKAN_ERROR=") {
+        return VulkanProbe::Broken { detail };
+    }
+    if let Some(driver) = field("VULKAN_NVIDIA=") {
+        return VulkanProbe::Ok { driver };
+    }
+    match field("VULKAN_UNAVAILABLE=") {
+        Some(detail) => VulkanProbe::Indeterminate { detail },
+        None if stdout.contains("NVIDIA_MODESET_NODE=") => VulkanProbe::Indeterminate {
+            detail: "the Vulkan test produced no result (it crashed or was killed)".into(),
+        },
+        None if requested => VulkanProbe::Indeterminate {
+            detail: "the Vulkan step left no result in the probe output".into(),
+        },
+        None => VulkanProbe::NotRun,
+    }
+}
+
+/// The probe helper keeps only the head of stdout (4 KiB), so the Vulkan lines print first
+/// and stay short.
+const MAX_VULKAN_LINE: usize = 200;
+const VULKANINFO_TIMEOUT: Duration = Duration::from_secs(10);
+const NVIDIA_PCI_VENDOR: u32 = 0x10de;
+/// Where the container toolkit puts the NVIDIA ICD manifests when it injects the driver.
+const TOOLKIT_ICD_DIRS: [&str; 3] = [
+    "/etc/vulkan/icd.d",
+    "/usr/share/vulkan/icd.d",
+    "/usr/local/share/vulkan/icd.d",
+];
+
+/// Every NVIDIA ICD manifest this container has, in either GPU access mode: the driver
+/// volume's copy and each `nvidia_icd*.json` the toolkit injected. All of them, because a
+/// multilib directory holds one per architecture and the loader skips the wrong one itself.
+fn find_nvidia_icds(volume: &Path, toolkit_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = vec![volume.join(layout::VULKAN_ICD_JSON)];
+    for dir in toolkit_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        found.extend(
+            entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|path| {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    name.starts_with("nvidia_icd") && name.ends_with(".json")
+                }),
+        );
+    }
+    found.retain(|path| path.is_file());
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// `vulkaninfo`'s arguments. With manifests, `env` restricts the loader to them (both
+/// variables: `VK_DRIVER_FILES`, and `VK_ICD_FILENAMES` for older loaders; `:`-separated),
+/// so no other ICD can fail the run. With none found that proves nothing, because the
+/// loader searches more places than this does, so it discovers drivers as usual.
+fn vulkaninfo_command(icds: &[PathBuf]) -> (&'static str, Vec<String>) {
+    if icds.is_empty() {
+        return ("vulkaninfo", vec!["--summary".into()]);
+    }
+    let list = icds
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    (
+        "env",
+        vec![
+            format!("VK_DRIVER_FILES={list}"),
+            format!("VK_ICD_FILENAMES={list}"),
+            "vulkaninfo".into(),
+            "--summary".into(),
+        ],
+    )
+}
+
+/// What `vulkaninfo --summary` did: `(stdout, exit code, fatal signal)`.
+type VulkanRun = (String, Option<i32>, Option<i32>);
+
+/// The self-test's `KEY=value` lines. An NVIDIA device in the captured summary is a pass
+/// whatever the exit status: `vulkaninfo` prints it before tearing the devices down, and a
+/// crash there is not evidence the device did not come up. Otherwise `VULKAN_ERROR` only
+/// when BOTH hold: the container was not given `/dev/nvidia-modeset` (observed, and shared
+/// by every NVIDIA card) and no NVIDIA device came up. Every other outcome that is not a
+/// pass is `VULKAN_UNAVAILABLE` and carries what was seen, so an operator can read it and
+/// it never blocks placement.
+pub(crate) fn vulkan_selftest_lines(modeset_absent: bool, run: Option<VulkanRun>) -> Vec<String> {
+    let unavailable = |why: String| vec![format!("VULKAN_UNAVAILABLE={why}")];
+    let Some((stdout, code, signal)) = run else {
+        return unavailable("vulkaninfo did not run (absent, or past its deadline)".into());
+    };
+    // `None` for a clean exit; otherwise how it ended, and whether that ending is a fault.
+    let ending = match (signal, code) {
+        (Some(signal), _) => Some(match crate::host_probe::outcome::fault_signal(signal) {
+            Some(name) => (format!("crashed with {name}"), true),
+            None => (format!("was stopped by signal {signal}"), false),
+        }),
+        (None, Some(0)) => None,
+        // `env` could not exec vulkaninfo: no verdict of its own, but stdout is still read.
+        (None, Some(126 | 127)) => Some(("could not be executed".to_string(), false)),
+        (None, Some(code)) => Some((format!("exited {code}"), true)),
+        (None, None) => Some(("ended without an exit code".to_string(), false)),
+    };
+    if let Some(device) = crate::gpu_identity::parse_vulkan_summary(&stdout)
+        .iter()
+        .find(|d| d.vendor_id == NVIDIA_PCI_VENDOR)
+    {
+        let after = ending.map_or(String::new(), |(how, _)| {
+            format!(" (vulkaninfo then {how})")
+        });
+        // `vulkaninfo` prints driver properties conditionally: a device with none is still
+        // listed, so the value is never empty.
+        let driver = match device.driver_info.trim() {
+            "" => format!("device 0x{:04x}", device.device_id),
+            info => info.to_string(),
+        };
+        return vec![format!("VULKAN_NVIDIA={driver}{after}")];
+    }
+    let failure = match ending {
+        None => "the Vulkan loader lists no NVIDIA device".to_string(),
+        Some((how, true)) => format!("vulkaninfo {how}"),
+        Some((how, false)) => return unavailable(format!("vulkaninfo {how}")),
+    };
+    if modeset_absent {
+        vec![format!("VULKAN_ERROR={failure}")]
+    } else {
+        unavailable(format!("{failure}; /dev/nvidia-modeset is present"))
+    }
+}
+
+fn report_vulkan() {
+    use std::os::unix::process::ExitStatusExt;
+    let modeset_absent = !Path::new("/dev/nvidia-modeset").exists();
+    println!(
+        "NVIDIA_MODESET_NODE={}",
+        if modeset_absent { "absent" } else { "present" }
+    );
+    let toolkit_dirs: Vec<PathBuf> = TOOLKIT_ICD_DIRS.iter().map(PathBuf::from).collect();
+    let (program, args) =
+        vulkaninfo_command(&find_nvidia_icds(Path::new(VOLUME_MOUNT), &toolkit_dirs));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let run = crate::vram::run_bounded(program, &args, VULKANINFO_TIMEOUT)
+        .map(|(out, status)| (out, status.code(), status.signal()));
+    for line in vulkan_selftest_lines(modeset_absent, run) {
+        println!("{}", line.chars().take(MAX_VULKAN_LINE).collect::<String>());
+    }
+}
+
 static SIBLING_EGL: Mutex<Option<(String, Instant, EglRuntime)>> = Mutex::new(None);
 
 /// Validate the driver through Docker's sibling-container namespace using the
@@ -2079,12 +2257,17 @@ const EGL_SELFTEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// stdout is byte-identical to what the readiness and launch-gate callers parse.
 /// `render_node` (only meaningful with `open_device`) pins which hardware device to open —
 /// the application-GPU host probe asks for the GPU it was placed on rather than whichever
-/// device EGL enumerates first.
+/// device EGL enumerates first. `vulkan` appends [`VulkanProbe`]'s lines (NVIDIA hosts).
 pub fn egl_selftest_main(
     vendor_lib: Option<&str>,
     open_device: bool,
     render_node: Option<&str>,
+    vulkan: bool,
 ) -> i32 {
+    // First, so the Vulkan lines are inside the 4 KiB of stdout the probe helper keeps.
+    if vulkan {
+        report_vulkan();
+    }
     // SAFETY: all four calls are plain libdl/EGL C entry points with the
     // documented signatures; every pointer handed in is either NULL or a
     // NUL-terminated CString that outlives the call, and every pointer read
@@ -2978,6 +3161,161 @@ mod tests {
             &st
         )
         .is_ok());
+    }
+
+    // ── Vulkan step of the application-GPU self-test ────────────────────────
+
+    const NVIDIA_SUMMARY: &str = "Devices:\n========\nGPU0:\n\tapiVersion = 1.4.312\n\tvendorID = 0x10de\n\tdeviceID = 0x1f08\n\tdriverName = NVIDIA\n\tdriverInfo = 615.78.08\n";
+
+    #[test]
+    fn a_listed_nvidia_device_without_driver_info_still_names_a_value() {
+        let summary = "Devices:\n========\nGPU0:\n\tvendorID = 0x10de\n\tdeviceID = 0x1f08\n\tdriverName = NVIDIA\n";
+        let l = vulkan_selftest_lines(true, Some((summary.into(), Some(0), None)));
+        assert_eq!(l, ["VULKAN_NVIDIA=device 0x1f08"]);
+        // Whatever the emitter produces, the parser accepts.
+        assert_eq!(
+            parse_vulkan_probe(&format!("{}\n", l[0]), true),
+            VulkanProbe::Ok {
+                driver: "device 0x1f08".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_nvidia_device_listed_before_a_bad_ending_is_still_a_pass() {
+        for (code, signal, ending) in [
+            (Some(1), None, "then exited 1"),
+            (None, Some(libc::SIGSEGV), "then crashed with SIGSEGV"),
+        ] {
+            for modeset_absent in [true, false] {
+                let l = vulkan_selftest_lines(
+                    modeset_absent,
+                    Some((NVIDIA_SUMMARY.into(), code, signal)),
+                );
+                assert_eq!(l.len(), 1);
+                assert!(l[0].starts_with("VULKAN_NVIDIA=615.78.08"), "{l:?}");
+                assert!(l[0].contains(ending), "{l:?}");
+            }
+        }
+    }
+
+    /// A summary far past a pipe buffer (64 KiB) comes back whole through `run_bounded`, and
+    /// the NVIDIA device at its end is found; a timed-out run is no verdict at all.
+    #[test]
+    fn a_vulkaninfo_sized_output_is_returned_whole_and_parsed() {
+        let script = "yes 'filler line that is not part of any device block' | head -n 4000; \
+                      printf 'Devices:\\n========\\nGPU0:\\n\\tvendorID = 0x10de\\n\\tdeviceID = 0x1f08\\n\\tdriverName = NVIDIA\\n\\tdriverInfo = 615.78.08\\n'; \
+                      exit 1";
+        let (out, status) =
+            crate::vram::run_bounded("sh", &["-c", script], Duration::from_secs(10)).unwrap();
+        assert!(out.len() > 128 * 1024, "{} bytes", out.len());
+        let run = Some((out, status.code(), None));
+        assert_eq!(
+            vulkan_selftest_lines(true, run),
+            ["VULKAN_NVIDIA=615.78.08 (vulkaninfo then exited 1)"]
+        );
+        // `None` is "did not run, or past its deadline", never a verdict.
+        assert!(
+            crate::vram::run_bounded("sh", &["-c", "sleep 5"], Duration::from_millis(100))
+                .is_none()
+        );
+        assert!(vulkan_selftest_lines(true, None)[0].starts_with("VULKAN_UNAVAILABLE="));
+    }
+
+    #[test]
+    fn manifests_restrict_the_loader_and_none_leaves_discovery_alone() {
+        let icds = [
+            PathBuf::from("/etc/vulkan/icd.d/nvidia_icd.i686.json"),
+            PathBuf::from("/etc/vulkan/icd.d/nvidia_icd.x86_64.json"),
+        ];
+        let (program, args) = vulkaninfo_command(&icds);
+        let list =
+            "/etc/vulkan/icd.d/nvidia_icd.i686.json:/etc/vulkan/icd.d/nvidia_icd.x86_64.json";
+        assert_eq!(program, "env");
+        assert_eq!(
+            args,
+            [
+                format!("VK_DRIVER_FILES={list}"),
+                format!("VK_ICD_FILENAMES={list}"),
+                "vulkaninfo".into(),
+                "--summary".into()
+            ]
+        );
+        let (program, args) = vulkaninfo_command(&[]);
+        assert_eq!(
+            (program, args),
+            ("vulkaninfo", vec!["--summary".to_string()])
+        );
+    }
+
+    #[test]
+    fn every_nvidia_manifest_is_found_in_the_volume_and_the_toolkit_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let volume = root.path().join("volume");
+        let toolkit = root.path().join("etc");
+        let other = root.path().join("share");
+        std::fs::create_dir_all(volume.join(layout::VULKAN_ICD_DIR)).unwrap();
+        std::fs::create_dir_all(&toolkit).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let dirs = [toolkit.clone(), other.clone(), root.path().join("absent")];
+        assert!(find_nvidia_icds(&volume, &dirs).is_empty());
+
+        // Another vendor's manifest is not the NVIDIA ICD.
+        std::fs::write(toolkit.join("radeon_icd.json"), "{}").unwrap();
+        assert!(find_nvidia_icds(&volume, &dirs).is_empty());
+
+        // A multilib directory: both architectures reach the loader.
+        for name in ["nvidia_icd.i686.json", "nvidia_icd.x86_64.json"] {
+            std::fs::write(toolkit.join(name), "{}").unwrap();
+        }
+        assert_eq!(
+            find_nvidia_icds(&volume, &dirs),
+            [
+                toolkit.join("nvidia_icd.i686.json"),
+                toolkit.join("nvidia_icd.x86_64.json")
+            ]
+        );
+
+        std::fs::write(volume.join(layout::VULKAN_ICD_JSON), "{}").unwrap();
+        assert_eq!(find_nvidia_icds(&volume, &dirs).len(), 3);
+        assert!(find_nvidia_icds(&volume, &dirs).contains(&volume.join(layout::VULKAN_ICD_JSON)));
+    }
+
+    #[test]
+    fn parse_vulkan_probe_reads_the_selftest_lines() {
+        assert_eq!(
+            parse_vulkan_probe("LOADED=x\nOPENED=/dev/dri/renderD128\n", false),
+            VulkanProbe::NotRun
+        );
+        assert!(matches!(
+            parse_vulkan_probe("LOADED=x\n", true),
+            VulkanProbe::Indeterminate { .. }
+        ));
+        assert_eq!(
+            parse_vulkan_probe(
+                "NVIDIA_MODESET_NODE=present\nVULKAN_NVIDIA=615.78.08\n",
+                true
+            ),
+            VulkanProbe::Ok {
+                driver: "615.78.08".into()
+            }
+        );
+        assert_eq!(
+            parse_vulkan_probe(
+                "NVIDIA_MODESET_NODE=absent\nVULKAN_ERROR=vulkaninfo crashed with SIGSEGV\n",
+                true
+            ),
+            VulkanProbe::Broken {
+                detail: "vulkaninfo crashed with SIGSEGV".into()
+            }
+        );
+        assert!(matches!(
+            parse_vulkan_probe(
+                "NVIDIA_MODESET_NODE=absent\nVULKAN_UNAVAILABLE=vulkaninfo did not run\n",
+                true
+            ),
+            VulkanProbe::Indeterminate { .. }
+        ));
     }
 
     // ── EGL runtime self-test verdicts ──────────────────────────────────────
