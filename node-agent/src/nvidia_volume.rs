@@ -2027,7 +2027,6 @@ fn sibling_egl_verdict(
 /// never `Broken`. Conflating them let one slow dlopen drag a healthy host into a
 /// 350 MB download and a session-killing agent restart.
 pub fn probe_egl_runtime(vendor_lib: Option<&Path>) -> EglRuntime {
-    use std::process::{Command, Stdio};
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -2036,53 +2035,19 @@ pub fn probe_egl_runtime(vendor_lib: Option<&Path>) -> EglRuntime {
             }
         }
     };
-    let mut cmd = Command::new(exe);
-    cmd.arg(EGL_SELFTEST_ARG);
-    if let Some(v) = vendor_lib {
-        cmd.arg(v);
-    }
-    let child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            return EglRuntime::Indeterminate {
-                detail: format!("could not spawn the EGL self-test: {e}"),
-            }
-        }
+    let mut args = vec![EGL_SELFTEST_ARG];
+    let vendor_lib = vendor_lib.map(|v| v.to_string_lossy().into_owned());
+    args.extend(vendor_lib.as_deref());
+    let Some((out, _)) = crate::vram::run_bounded(&exe, &args, EGL_SELFTEST_TIMEOUT) else {
+        return EglRuntime::Indeterminate {
+            detail: format!(
+                "the EGL self-test could not be spawned, or did not finish within \
+                 {EGL_SELFTEST_TIMEOUT:?}. That is a timeout, not a verdict: a first dlopen of \
+                 the NVIDIA stack on a loaded box with persistence mode off is not guaranteed \
+                 to beat it."
+            ),
+        };
     };
-    let deadline = Instant::now() + EGL_SELFTEST_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return EglRuntime::Indeterminate {
-                    detail: format!(
-                        "the EGL self-test did not finish within {EGL_SELFTEST_TIMEOUT:?}. That \
-                         is a timeout, not a verdict: a first dlopen of the NVIDIA stack on a \
-                         loaded box with persistence mode off is not guaranteed to beat it."
-                    ),
-                };
-            }
-            Err(e) => {
-                return EglRuntime::Indeterminate {
-                    detail: format!("EGL self-test wait failed: {e}"),
-                }
-            }
-        }
-    }
-    let mut out = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        let _ = s.read_to_string(&mut out);
-    }
     let verdict = parse_egl_selftest(&out);
     match &verdict {
         EglRuntime::Ok { loaded } => {
