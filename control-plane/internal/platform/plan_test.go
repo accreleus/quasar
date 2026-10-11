@@ -2,8 +2,13 @@ package platform
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 )
@@ -644,10 +649,10 @@ func TestEveryContractIdentifierIsEvaluatedOrReserved(t *testing.T) {
 	}
 
 	t.Run("fault kinds", func(t *testing.T) {
-		// agent_ahead_of_control_plane and identity_unknown are raised here;
-		// manifest_invalid belongs to detection (detect.go), which is where a
-		// release with an unusable manifest is met — the plan never sees one,
-		// so it must never raise it either.
+		// The plan raises exactly the kinds the contract's enum lists. A kind
+		// listed and never raised was #157: amendment 26 removed
+		// manifest_invalid, which detection counts in its run record instead
+		// (detect.go). A kind raised and not listed is the same drift reversed.
 		v := PlanRelease(PlanInputs{
 			Channel:      ChannelStable,
 			ControlPlane: cp(commitA, 74),
@@ -661,13 +666,48 @@ func TestEveryContractIdentifierIsEvaluatedOrReserved(t *testing.T) {
 		for _, f := range v.Faults {
 			kinds[f.Kind] = true
 		}
-		if !kinds[FaultAgentAhead] || !kinds[FaultIdentityUnknown] {
-			t.Fatalf("faults = %+v, want both agent_ahead_of_control_plane and identity_unknown", v.Faults)
+		contract := contractFaultKinds(t)
+		for _, kind := range contract {
+			if !kinds[kind] {
+				t.Errorf("PlatformReleaseFaultKind lists %q, which this build never raises: %+v", kind, v.Faults)
+			}
 		}
-		if kinds[FaultManifestInvalid] {
-			t.Fatalf("manifest_invalid is detection's fault to raise, not the plan's: %+v", v.Faults)
+		if len(kinds) != len(contract) {
+			t.Errorf("faults = %+v, want exactly the contract's kinds %v", v.Faults, contract)
 		}
 	})
+}
+
+// contractFaultKinds reads the PlatformReleaseFaultKind enum out of
+// protocol/openapi.yaml, so the fault vocabulary is checked against the
+// contract itself rather than a copy of it.
+func contractFaultKinds(t *testing.T) []string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "protocol", "openapi.yaml"))
+	if err != nil {
+		t.Fatalf("read openapi.yaml: %v (git submodule update --init protocol)", err)
+	}
+	var doc struct {
+		Components struct {
+			Schemas struct {
+				FaultKind struct {
+					Enum []string `yaml:"enum"`
+				} `yaml:"PlatformReleaseFaultKind"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse openapi.yaml: %v", err)
+	}
+	kinds := doc.Components.Schemas.FaultKind.Enum
+	if len(kinds) == 0 {
+		t.Fatal("openapi.yaml has no PlatformReleaseFaultKind enum")
+	}
+	return kinds
 }
 
 // A host ahead of the control plane is a fault AND still a target row: the row

@@ -57,7 +57,7 @@ pub fn indeterminate_status() -> &'static str {
 
 /// Signals a process raises against itself by crashing. Anything else (SIGKILL from the
 /// OOM killer, SIGTERM from an operator) says nothing about the path under test.
-pub(super) fn fault_signal(signal: i32) -> Option<&'static str> {
+pub(crate) fn fault_signal(signal: i32) -> Option<&'static str> {
     match signal {
         libc::SIGSEGV => Some("SIGSEGV"),
         libc::SIGABRT => Some("SIGABRT"),
@@ -130,6 +130,18 @@ pub fn remediation(kind: ProbeKind) -> String {
             (driver_volume_version check)."
             .into(),
     }
+}
+
+/// The fix for the application-GPU probe's Vulkan fail (#449): the container was not given
+/// `/dev/nvidia-modeset`.
+pub fn vulkan_remediation() -> String {
+    "Containers on this host were not given /dev/nvidia-modeset and could not start NVIDIA \
+     Vulkan; app launches will fail the same way. On the host run `sudo nvidia-modprobe -m`; \
+     when the host uses a CDI spec, regenerate it (`sudo nvidia-ctk cdi generate \
+     --output=/etc/cdi/nvidia.yaml`, or your driver plugin's own generator). Then restart the \
+     agent container to re-run this check. Repeat after any boot that creates the spec before \
+     the node exists (docs: Install, NVIDIA)."
+        .into()
 }
 
 /// [`remediation`] for the target's kind, except a codec probe. A codec probe's fail is
