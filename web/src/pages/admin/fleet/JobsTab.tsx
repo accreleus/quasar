@@ -36,6 +36,7 @@ import {
   DAY_ABBR,
   fmtDurationMs,
   fmtSchedule,
+  lockedIntervalAdvice,
   patchErrorMessage,
   resultChip,
   runNowErrorMessage,
@@ -693,7 +694,7 @@ function ScheduleModal({ job, token, onClose, onSaved }: ScheduleModalProps) {
             disabled={intervalLocked}
             hint={
               intervalLocked
-                ? `${s.locked_by} sets this interval. Unset it to edit the interval here.`
+                ? `${s.locked_by} sets this interval. ${lockedIntervalAdvice(s.locked_by ?? "")}`
                 : "Seconds. At least 60."
             }
           />

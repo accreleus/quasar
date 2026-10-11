@@ -768,8 +768,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			Kind:         jobs.KindInterval,
 			IntervalSecs: 360 * 60,
 		},
-		EnvOverride:    "QUASAR_LIBRARY_SCAN_INTERVAL",
-		IntervalSource: libraryResolver.ScanInterval,
+		EnvOverride:       "QUASAR_LIBRARY_SCAN_INTERVAL",
+		IntervalSource:    libraryResolver.ScanInterval,
+		IntervalOwner:     "instance_settings.library_discovery_interval_minutes",
+		IntervalOwnerHint: "Settings, Libraries, Scan interval",
 		Run: func(ctx context.Context, rc jobs.RunContext) (jobs.Outcome, error) {
 			res, skip := libraryJanitor.RunOnce(ctx)
 			if skip != "" {

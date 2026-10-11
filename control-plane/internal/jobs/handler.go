@@ -177,7 +177,7 @@ func timeOfDayStr(t *TimeOfDay) *string {
 // (design §3.3), exactly as the dispatcher's own materializeDue resolves it —
 // one implementation of "which source won" so the viewer and the scheduler
 // cannot disagree.
-func (h *Handler) toScheduleJSON(ctx context.Context, j Job, def Definition) scheduleJSON {
+func (h *Handler) toScheduleJSON(ctx context.Context, j Job, def Definition) (scheduleJSON, error) {
 	s := scheduleJSON{
 		Kind:        string(j.Schedule.Kind),
 		WindowStart: timeOfDayStr(j.Schedule.WindowStart),
@@ -191,9 +191,7 @@ func (h *Handler) toScheduleJSON(ctx context.Context, j Job, def Definition) sch
 	if j.Schedule.Kind == KindInterval {
 		interval, locked, lockedBy, err := ResolveInterval(ctx, j, def, h.getenv)
 		if err != nil {
-			// The stored column is only a stale seed for a sourced job; say so in the log.
-			h.log.Warn("job: could not resolve the interval", "job_id", j.ID, "err", err)
-			interval, locked, lockedBy = EffectiveInterval(j, def.EnvOverride, h.getenv)
+			return scheduleJSON{}, err
 		}
 		secs := int32(interval.Seconds())
 		s.IntervalSecs = &secs
@@ -202,14 +200,18 @@ func (h *Handler) toScheduleJSON(ctx context.Context, j Job, def Definition) sch
 			s.LockedBy = &lockedBy
 		}
 	}
-	return s
+	return s, nil
 }
 
 // toJobJSON assembles one list/get item. hostNames is the fleet's id->node_name
 // map (nil is fine — an unresolved name renders as "", never an error: a stale
 // host row must not break the whole list).
-func (h *Handler) toJobJSON(ctx context.Context, j Job, hostNames map[string]string) jobJSON {
+func (h *Handler) toJobJSON(ctx context.Context, j Job, hostNames map[string]string) (jobJSON, error) {
 	def, _ := h.reg.Get(j.ID)
+	sched, err := h.toScheduleJSON(ctx, j, def)
+	if err != nil {
+		return jobJSON{}, err
+	}
 	out := jobJSON{
 		ID:           j.ID,
 		Name:         j.Name,
@@ -218,7 +220,7 @@ func (h *Handler) toJobJSON(ctx context.Context, j Job, hostNames map[string]str
 		Scope:        string(j.Scope),
 		Managed:      j.Managed,
 		Enabled:      j.Enabled,
-		Schedule:     h.toScheduleJSON(ctx, j, def),
+		Schedule:     sched,
 		HistoryLimit: j.HistoryLimit,
 	}
 
@@ -226,7 +228,7 @@ func (h *Handler) toJobJSON(ctx context.Context, j Job, hostNames map[string]str
 		// design §3.7: null run-derived fields plus the note naming where the
 		// unadopted goroutine lives; the Description is that note's one author.
 		out.UnmanagedNote = j.Description
-		return out
+		return out, nil
 	}
 
 	if j.Scope == ScopeHost {
@@ -240,7 +242,7 @@ func (h *Handler) toJobJSON(ctx context.Context, j Job, hostNames map[string]str
 			targets = append(targets, h.toTargetJSON(ctx, j.ID, hostID, hostNames[hostID]))
 		}
 		out.Targets = targets
-		return out
+		return out, nil
 	}
 
 	running, nextRunAt, lastRun := h.runStateFor(ctx, j.ID, "")
@@ -249,7 +251,7 @@ func (h *Handler) toJobJSON(ctx context.Context, j Job, hostNames map[string]str
 	out.LastRun = lastRun
 	cf := h.consecutiveFailures(ctx, j.ID, "")
 	out.ConsecutiveFailures = &cf
-	return out
+	return out, nil
 }
 
 func (h *Handler) toTargetJSON(ctx context.Context, jobID, hostID, nodeName string) jobTargetJSON {
@@ -344,7 +346,13 @@ func (h *Handler) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]jobJSON, 0, len(page))
 	for _, j := range page {
-		items = append(items, h.toJobJSON(r.Context(), j, hostNames))
+		item, err := h.toJobJSON(r.Context(), j, hostNames)
+		if err != nil {
+			h.log.Warn("job: could not resolve the interval", "job_id", j.ID, "err", err)
+			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read job")
+			return
+		}
+		items = append(items, item)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nullableStr(next)})
 }
@@ -367,7 +375,13 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("job: could not list host names", "job_id", id, "err", err)
 		hostNames = nil
 	}
-	httpx.WriteJSON(w, http.StatusOK, h.toJobJSON(r.Context(), job, hostNames))
+	out, err := h.toJobJSON(r.Context(), job, hostNames)
+	if err != nil {
+		h.log.Warn("job: could not resolve the interval", "job_id", id, "err", err)
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read job")
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
 }
 
 // --- PATCH /v1/admin/jobs/{job_id} --------------------------------------------
@@ -432,31 +446,31 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "interval_secs must be an integer")
 			return
 		}
-		if n < MinIntervalSecs {
-			httpx.WriteError(w, http.StatusUnprocessableEntity, httpx.CodeValidationFailed,
-				fmt.Sprintf("interval_secs must be at least %d", MinIntervalSecs))
-			return
-		}
 		def, _ := h.reg.Get(id)
 		cur, locked, lockedBy, err := ResolveInterval(r.Context(), job, def, h.getenv)
 		if err != nil {
 			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read job")
 			return
 		}
-		if locked {
+		switch {
+		case !locked:
+			if n < MinIntervalSecs {
+				httpx.WriteError(w, http.StatusUnprocessableEntity, httpx.CodeValidationFailed,
+					fmt.Sprintf("interval_secs must be at least %d", MinIntervalSecs))
+				return
+			}
+			upd.IntervalSecs = &n
+		case def.IntervalSource != nil && int32(cur.Seconds()) == n:
+			// The value already reported is accepted and not stored, so a window save
+			// that resends the interval does not fail.
+		case def.IntervalSource != nil && lockedBy == def.IntervalOwner:
+			httpx.WriteError(w, http.StatusConflict, httpx.CodeScheduleLocked,
+				lockedBy+" sets this job's interval; change it in "+def.IntervalOwnerHint)
+			return
+		default:
 			httpx.WriteError(w, http.StatusConflict, httpx.CodeScheduleLocked,
 				lockedBy+" is set in the environment and is authoritative over this job's interval; "+
 					"unset it to make the admin-owned interval take effect")
-			return
-		}
-		switch {
-		case def.IntervalSource == nil:
-			upd.IntervalSecs = &n
-		case int32(cur.Seconds()) != n:
-			// The value already in force is accepted and ignored, so the Jobs tab can
-			// save a window edit, which sends the interval back unchanged.
-			httpx.WriteError(w, http.StatusUnprocessableEntity, httpx.CodeValidationFailed,
-				"this job's interval is set elsewhere; change it in Settings, Libraries, Scan interval")
 			return
 		}
 	}
@@ -566,7 +580,13 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	h.recordActivity(r, "job.update", "job", id, map[string]any{"keys": keys})
 
 	hostNames, _ := h.store.HostNames(r.Context())
-	httpx.WriteJSON(w, http.StatusOK, h.toJobJSON(r.Context(), updated, hostNames))
+	out, err := h.toJobJSON(r.Context(), updated, hostNames)
+	if err != nil {
+		h.log.Warn("job: could not resolve the interval", "job_id", id, "err", err)
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read job")
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
 }
 
 // --- POST /v1/admin/jobs/{job_id}/run -----------------------------------------

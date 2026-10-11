@@ -207,7 +207,8 @@ func BackoffFor(attempt int) time.Duration {
 }
 
 // ResolveInterval is EffectiveInterval for a definition: an IntervalSource, when
-// the definition has one, decides instead of the stored interval.
+// the definition has one, decides instead of the stored interval, and the interval
+// is then never writable through the jobs API (locked, by the env var or the owner).
 func ResolveInterval(ctx context.Context, j Job, def Definition, lookup func(string) string) (d time.Duration, locked bool, lockedBy string, err error) {
 	if def.IntervalSource == nil {
 		d, locked, lockedBy = EffectiveInterval(j, def.EnvOverride, lookup)
@@ -220,7 +221,7 @@ func ResolveInterval(ctx context.Context, j Job, def Definition, lookup func(str
 	if byEnv {
 		return d, true, def.EnvOverride, nil
 	}
-	return d, false, "", nil
+	return d, true, def.IntervalOwner, nil
 }
 
 // EffectiveInterval resolves the interval in force and says which source won.

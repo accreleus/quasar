@@ -122,10 +122,19 @@ export function runNowErrorMessage(code: string, fallback: string): string {
  * the handler can return on top of the generic validation ones (handler.go
  * `handlePatch`).
  */
+/** What to do about a locked interval: an env var is unset, any other owner (a setting) is edited there. */
+export function lockedIntervalAdvice(lockedBy: string): string {
+  return lockedBy.startsWith("QUASAR_")
+    ? "Unset it to edit the interval here."
+    : "Change it there, not here.";
+}
+
 export function patchErrorMessage(code: string, fallback: string, lockedBy?: string | null): string {
   switch (code) {
     case "schedule_locked":
-      return `${lockedBy ?? "An environment variable"} sets this job's interval. Unset it to edit the interval here.`;
+      return lockedBy
+        ? `${lockedBy} sets this job's interval. ${lockedIntervalAdvice(lockedBy)}`
+        : "An environment variable sets this job's interval. Unset it to edit the interval here.";
     case "job_unmanaged":
       return "This job is not managed by the job framework, so it has no schedule to edit.";
     default:

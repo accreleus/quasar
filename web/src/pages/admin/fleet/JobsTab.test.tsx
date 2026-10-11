@@ -714,6 +714,37 @@ describe("JobsTab — schedule modal", () => {
     ).toBeTruthy();
   });
 
+  it("names the setting, not the environment, when a setting owns the interval", async () => {
+    mocked.listJobs.mockResolvedValue(
+      jobsResponse([
+        instanceJob({
+          schedule: {
+            kind: "interval",
+            interval_secs: 900,
+            window_start: null,
+            window_end: null,
+            window_days: [],
+            timezone: "UTC",
+            locked: true,
+            locked_by: "instance_settings.library_discovery_interval_minutes",
+          },
+        }),
+      ]),
+    );
+    renderPage();
+
+    await screen.findByText("Artwork grabber");
+    fireEvent.click(screen.getByRole("button", { name: /actions for artwork grabber/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit schedule" }));
+
+    const input = (await screen.findByLabelText("Interval")) as HTMLInputElement;
+    expect(input.disabled).toBe(true);
+    expect(
+      screen.getByText(/instance_settings\.library_discovery_interval_minutes sets this interval\. Change it there/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Unset it/)).toBeNull();
+  });
+
   it("saves a valid schedule edit via PATCH", async () => {
     const job = instanceJob();
     mocked.listJobs.mockResolvedValue(jobsResponse([job]));

@@ -198,9 +198,12 @@ type Definition struct {
 	EnvOverride string
 	// When set, the owner of this job's period lives outside the jobs table (a
 	// setting another surface edits): it is read at every scheduling decision and
-	// wins over interval_secs, which stays only as the seeded column. overriddenByEnv
-	// says the env var named by EnvOverride decided it, so the schedule reports locked.
-	IntervalSource func(ctx context.Context) (d time.Duration, overriddenByEnv bool, err error)
+	// wins over interval_secs, which stays only as the seeded column. The schedule always
+	// reports locked: by EnvOverride when overriddenByEnv, else by IntervalOwner (the
+	// setting's name), whose edit surface IntervalOwnerHint names for the 409 message.
+	IntervalSource    func(ctx context.Context) (d time.Duration, overriddenByEnv bool, err error)
+	IntervalOwner     string
+	IntervalOwnerHint string
 	// Control-plane implementation; nil for PlaneAgent and unmanaged jobs.
 	Run RunFunc
 	// Supplies run params for a manual trigger on a job that is meaningless

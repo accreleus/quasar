@@ -161,6 +161,14 @@ describe("patchErrorMessage", () => {
     );
   });
 
+  it("sends a setting-owned interval to the setting, not to unsetting a variable", () => {
+    expect(
+      patchErrorMessage("schedule_locked", "fallback", "instance_settings.library_discovery_interval_minutes"),
+    ).toBe(
+      "instance_settings.library_discovery_interval_minutes sets this job's interval. Change it there, not here.",
+    );
+  });
+
   it("maps schedule_locked without a source", () => {
     expect(patchErrorMessage("schedule_locked", "fallback")).toMatch(/environment variable/);
   });

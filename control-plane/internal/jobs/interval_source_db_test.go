@@ -5,6 +5,7 @@ package jobs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -21,6 +22,7 @@ type sourcedJob struct {
 	url    string
 	period atomic.Int64 // nanoseconds
 	byEnv  atomic.Bool
+	fail   atomic.Bool
 	execs  atomic.Int32
 }
 
@@ -32,7 +34,12 @@ func newSourcedJob(t *testing.T, period time.Duration) *sourcedJob {
 	def := intervalDef("library.discovery")
 	def.EnvOverride = "QUASAR_LIBRARY_SCAN_INTERVAL"
 	def.Default.IntervalSecs = 21600
+	def.IntervalOwner = "instance_settings.library_discovery_interval_minutes"
+	def.IntervalOwnerHint = "Settings, Libraries, Scan interval"
 	def.IntervalSource = func(context.Context) (time.Duration, bool, error) {
+		if s.fail.Load() {
+			return 0, false, errors.New("settings unreadable")
+		}
 		return time.Duration(s.period.Load()), s.byEnv.Load(), nil
 	}
 	def.Run = func(context.Context, RunContext) (Outcome, error) {
@@ -104,8 +111,9 @@ func TestSourcedIntervalSchedulesAndIsReported(t *testing.T) {
 	near(t, "next run after the first pass", next.ScheduledFor.Sub(finished), 15*time.Minute)
 
 	j := s.reported(t)
-	if j.Schedule.IntervalSecs == nil || *j.Schedule.IntervalSecs != 900 || j.Schedule.Locked {
-		t.Fatalf("reported schedule = %+v, want interval_secs 900, not locked (the stored column is 21600)", j.Schedule)
+	if j.Schedule.IntervalSecs == nil || *j.Schedule.IntervalSecs != 900 || !j.Schedule.Locked ||
+		j.Schedule.LockedBy == nil || *j.Schedule.LockedBy != "instance_settings.library_discovery_interval_minutes" {
+		t.Fatalf("reported schedule = %+v, want interval_secs 900 locked by the setting (the stored column is 21600)", j.Schedule)
 	}
 	if j.NextRunAt == nil || !j.NextRunAt.Equal(next.ScheduledFor) {
 		t.Fatalf("next_run_at = %v, want %v", j.NextRunAt, next.ScheduledFor)
@@ -193,24 +201,35 @@ func TestSourcedEnvOverrideLocksAndZeroSchedulesNothing(t *testing.T) {
 	}
 }
 
-func TestPatchOfASourcedIntervalIsRefusedUnlessItIsTheValueInForce(t *testing.T) {
+func TestPatchOfASourcedIntervalIsRefusedUnlessItIsTheValueReported(t *testing.T) {
 	s := newSourcedJob(t, 15*time.Minute)
 	s.tick(t)
 
 	status, body := doReq(t, http.MethodPatch, s.url, `{"interval_secs": 3600}`)
-	if status != http.StatusUnprocessableEntity || decodeErr(t, body).Error.Code != "validation_failed" {
-		t.Fatalf("PATCH of a different interval: %d %s, want 422 validation_failed", status, body)
+	if status != http.StatusConflict || decodeErr(t, body).Error.Code != "schedule_locked" {
+		t.Fatalf("PATCH of a different interval: %d %s, want 409 schedule_locked", status, body)
 	}
 	got := decodeErr(t, body).Error.Message
-	if want := "Settings"; !strings.Contains(got, want) {
-		t.Fatalf("message %q does not point at Settings", got)
+	if !strings.Contains(got, "instance_settings.library_discovery_interval_minutes") || strings.Contains(got, "environment") {
+		t.Fatalf("message %q must name the setting, not the environment", got)
 	}
 
 	// The Jobs tab sends the interval back unchanged with a window edit.
-	status, body = doReq(t, http.MethodPatch, s.url,
-		`{"interval_secs": 900, "window_start": "01:00", "window_end": "05:00"}`)
+	patch := `{"interval_secs": 900, "window_start": "01:00", "window_end": "05:00"}`
+	status, body = doReq(t, http.MethodPatch, s.url, patch)
 	if status != http.StatusOK {
-		t.Fatalf("PATCH with the interval in force: %d %s, want 200", status, body)
+		t.Fatalf("PATCH with the interval reported: %d %s, want 200", status, body)
+	}
+	// ...and so under the environment override, kill switch included.
+	s.byEnv.Store(true)
+	status, body = doReq(t, http.MethodPatch, s.url, patch)
+	if status != http.StatusOK {
+		t.Fatalf("PATCH with the interval reported under the env override: %d %s, want 200", status, body)
+	}
+	s.period.Store(0)
+	status, body = doReq(t, http.MethodPatch, s.url, `{"interval_secs": 0}`)
+	if status != http.StatusOK {
+		t.Fatalf("PATCH resending the kill switch's 0: %d %s, want 200", status, body)
 	}
 	var stored int32
 	if err := s.store.pool.QueryRow(context.Background(),
@@ -219,5 +238,38 @@ func TestPatchOfASourcedIntervalIsRefusedUnlessItIsTheValueInForce(t *testing.T)
 	}
 	if stored != 21600 {
 		t.Fatalf("stored interval_secs = %d, want the seed 21600 untouched", stored)
+	}
+}
+
+func TestAnUnreadableSourceFailsTheJobsReadAndSkipsScheduling(t *testing.T) {
+	s := newSourcedJob(t, 15*time.Minute)
+	s.fail.Store(true)
+	if status, body := doReq(t, http.MethodGet, s.url, ""); status != http.StatusInternalServerError {
+		t.Fatalf("GET with an unreadable source: %d %s, want 500", status, body)
+	}
+	if status, _ := doReq(t, http.MethodGet, strings.TrimSuffix(s.url, "/library.discovery"), ""); status != http.StatusInternalServerError {
+		t.Fatalf("list with an unreadable source: %d, want 500", status)
+	}
+	s.tick(t)
+	if _, found, err := s.store.OpenRun(context.Background(), "library.discovery", ""); err != nil || found {
+		t.Fatalf("scheduled with an unreadable source: found=%v err=%v", found, err)
+	}
+}
+
+func TestAPendingRunWithNoFinishedRunKeepsItsDate(t *testing.T) {
+	s := newSourcedJob(t, 15*time.Minute)
+	_, next := s.firstPassAndSuccessor(t)
+	if _, err := s.store.pool.Exec(context.Background(),
+		`UPDATE job_runs SET scheduled_for = now() + interval '60 days' WHERE id = $1::uuid`, next.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.pool.Exec(context.Background(),
+		`DELETE FROM job_runs WHERE job_id = 'library.discovery' AND state <> 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	before := s.next(t).ScheduledFor
+	s.tick(t)
+	if got := s.next(t).ScheduledFor; !got.Equal(before) || s.execs.Load() != 1 {
+		t.Fatalf("scheduled_for %v -> %v, execs %d: a pending run with no finished run to measure from moved", before, got, s.execs.Load())
 	}
 }
