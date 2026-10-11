@@ -3727,6 +3727,122 @@ case "$line" in
     fail "testdb:go-present-uses-host" "expected the host runner, got: ${line:-<no runner line>}" ;;
 esac
 
+printf '\n== test-db orphan sweep judged by label (#205) ==\n'
+# The sweep's rule, one sentence: remove a labelled resource only when its
+# label names THIS pid namespace and the pid in it has NO process. Driven end
+# to end against a recording docker stub that fabricates candidate orphans
+# (every one of them label-selected, as the real `--filter label=` selection
+# is) and records every removal, so any other selection fails here.
+# Unlabelled containers never even reach the sweep — docker's own label
+# filter withholds them — and the `testdb:sweep-*` assertions below pin the
+# outcomes, including the safety case the start-time era got wrong: a LIVE
+# pid must be kept whatever the label carries next to it.
+SWEEP_BIN="$WORK/sweepbin"
+mkdir -p "$SWEEP_BIN"
+for stub in "$STUB_BIN"/*; do cp "$stub" "$SWEEP_BIN/$(basename "$stub")"; done
+SWEEP_LOG="$WORK/sweep-removals.log"
+SWEEP_STATE="$WORK/sweep-state"
+: > "$SWEEP_LOG"; : > "$SWEEP_STATE"
+
+# A provably dead pid: spawn, SIGKILL, reap.
+sleep 60 & SWEEP_DEAD_PID=$!
+kill -9 "$SWEEP_DEAD_PID" 2>/dev/null
+wait "$SWEEP_DEAD_PID" 2>/dev/null || true
+# The script stamps only the NUMERIC namespace id (it strips `pid:[…]` — the
+# wrapper's own colon would collide with the owner value's field separator),
+# so do the same here.
+SWEEP_NS="$(readlink /proc/self/ns/pid 2>/dev/null || true)"
+SWEEP_NS="${SWEEP_NS#pid:[}"; SWEEP_NS="${SWEEP_NS%]}"
+printf 'c1|c|%s:%s\n' "$SWEEP_NS" "$SWEEP_DEAD_PID" >> "$SWEEP_STATE"  # same ns, dead pid        -> REMOVE (container -fv, then network n1)
+# A LIVE pid in this namespace must be kept — this is the case the old
+# start-time rule wrongly swept. Its label also carries a start-time-looking
+# third field, exactly what a resource stamped under that abandoned format
+# holds: unparseable now, kept.
+printf 'c2|c|%s:%s:111\n' "$SWEEP_NS" "$$"                             >> "$SWEEP_STATE" # live pid (old 3-field format) -> KEEP
+printf 'c3|c|%s:%s\n' "$SWEEP_NS" "$$"                                 >> "$SWEEP_STATE" # live pid (current format)     -> KEEP
+printf 'c4|c|999999999:%s\n' "$SWEEP_DEAD_PID"                         >> "$SWEEP_STATE" # another pid namespace         -> KEEP
+printf 'c5|c|not-a-valid-owner\n'                                      >> "$SWEEP_STATE" # unparseable                   -> KEEP
+printf 'c6|c|%s:%s:123456\n' "$SWEEP_NS" "$SWEEP_DEAD_PID"             >> "$SWEEP_STATE" # old 3-field format, dead pid  -> KEEP
+printf 'n1|n|%s:%s\n' "$SWEEP_NS" "$SWEEP_DEAD_PID"                    >> "$SWEEP_STATE" # same ns, dead pid             -> REMOVE
+printf 'n2|n|999999999:%s\n' "$SWEEP_DEAD_PID"                         >> "$SWEEP_STATE" # another pid namespace         -> KEEP
+
+# The recording docker stub: answers the script's whole lifecycle, prints the
+# fake ids for the label-filtered listing, reads the fabricated label value
+# for each inspect, and records every rm / network rm.
+cat > "$SWEEP_BIN/docker" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  info) exit 0 ;;
+  ps)     awk -F'|' -v k=c '$2==k{print $1}' "$SWEEP_STATE" ;;
+  network)
+    case "${2:-}" in
+      ls)    awk -F'|' -v k=n '$2==k{print $1}' "$SWEEP_STATE" ;;
+      rm)    printf 'netrm %s\n' "$3" >> "$SWEEP_LOG"; exit 0 ;;
+      *)     exit 0 ;;
+    esac ;;
+  inspect)
+    id="${*: -1}"
+    awk -F'|' -v id="$id" '$1==id{print $3}' "$SWEEP_STATE" ;;
+  rm)   printf 'rm %s\n' "${*:2}" >> "$SWEEP_LOG"; exit 0 ;;
+  *)    exit 0 ;;
+esac
+SH
+
+sweep_out="$(env -u HOST -u TESTDB_CONTAINERISED PATH="$SWEEP_BIN:$PATH" \
+  SWEEP_LOG="$SWEEP_LOG" SWEEP_STATE="$SWEEP_STATE" bash "$DX/testdb.sh" 2>&1)"
+sweep_rc=$?
+if [ "$sweep_rc" -eq 0 ] && printf '%s' "$sweep_out" | grep -q '^RESULT status=ok target=test-db'; then
+  pass "testdb:sweep-script-ok" "testdb.sh completed under the recording docker stub"
+else
+  fail "testdb:sweep-script-ok" "rc=$sweep_rc: $(printf '%s' "$sweep_out" | tail -n 3 | tr '\n' ' ')"
+fi
+
+# The only removal a candidate may receive is a full-judgement pass. The
+# trap's own named reaping of qgo-/qpg-/qpgnet-<instance> is separate and is
+# filtered out here.
+sweep_keep="$(grep '^rm ' "$SWEEP_LOG" | grep -vE '^rm -fv q(go|pg|pgnet)-' || true)"
+if [ -z "$sweep_keep" ]; then
+  fail "testdb:sweep-dead-labelled-removed" "nothing was removed at all: $(tr '\n' '|' < "$SWEEP_LOG" | head -c 400)"
+elif [ "$sweep_keep" = "rm -fv c1" ]; then
+  pass "testdb:sweep-dead-labelled-removed" "same-namespace dead-owner container removed (--fv, so its volume goes too)"
+else
+  fail "testdb:sweep-dead-labelled-removed" "unexpected removals: $(printf '%s' "$sweep_keep" | tr '\n' '|')"
+fi
+
+sweep_net="$(grep '^netrm ' "$SWEEP_LOG" | grep -v 'netrm qpgnet-' || true)"
+if [ "$sweep_net" = "netrm n1" ]; then
+  pass "testdb:sweep-network-dead-labelled-removed" "same-namespace dead-owner network removed, and only it"
+else
+  fail "testdb:sweep-network-dead-labelled-removed" "unexpected network removals: $(printf '%s' "$sweep_net" | tr '\n' '|')"
+fi
+
+if printf '%s' "$(cat "$SWEEP_LOG")" | grep -qE '(^| )(c2|c3|c4|c5|c6|n2)( |$)'; then
+  fail "testdb:sweep-only-own-judgement" "a kept candidate was removed anyway: $(tr '\n' '|' < "$SWEEP_LOG")"
+else
+  pass "testdb:sweep-only-own-judgement" "a live pid (old or current label format), a foreign namespace and every unparseable value kept"
+fi
+
+# Containers must be swept before networks (a dead run's endpoints have to
+# be gone before its network can go).
+rm_c1_line="$(grep -n 'rm -fv c1' "$SWEEP_LOG" | head -n1 | cut -d: -f1)"
+netrm_n1_line="$(grep -n 'netrm n1' "$SWEEP_LOG" | head -n1 | cut -d: -f1)"
+if [ -n "$rm_c1_line" ] && [ -n "$netrm_n1_line" ] && [ "$rm_c1_line" -lt "$netrm_n1_line" ]; then
+  pass "testdb:sweep-containers-before-networks" "rm(c1) line $rm_c1_line precedes netrm(n1) line $netrm_n1_line"
+else
+  fail "testdb:sweep-containers-before-networks" "rm c1 at ${rm_c1_line:-?}, netrm n1 at ${netrm_n1_line:-?}"
+fi
+
+# Unlabelled resources never reach the sweep: the listing filters by label
+# KEY. Pin that the selection itself is label-filtered, so a name-based
+# path cannot sneak back.
+if grep -q 'docker ps -aq --filter "label=quasar.testdb.owner"' "$DX/testdb.sh" \
+   && grep -q 'docker network ls --filter "label=quasar.testdb.owner"' "$DX/testdb.sh" \
+   && ! grep -qE 'docker ps[^|]*--filter "name=' "$DX/testdb.sh"; then
+  pass "testdb:sweep-selects-by-label" "selection is the label filter only; no name filter reaches docker ps/docker network ls"
+else
+  fail "testdb:sweep-selects-by-label" "the sweep's selection no longer reads as label-only"
+fi
+
 # ── redeploy readiness classification (#177) ─────────────────────────────────
 # deploy/redeploy.sh's aggregate used to initialise readiness=ok the moment the
 # node-agent log was non-empty and only THEN look for a verdict, so a log with no

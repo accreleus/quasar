@@ -78,7 +78,8 @@ volume that must never be deleted**. Nothing reads or writes a Compose file or a
 
 An update is a **replacement**: the actor pulls the new image by digest, stops the old
 container and **keeps** it (renamed `<name>.kept`, its restart policy disabled), starts the new
-one and verifies it (running, and healthy if the image has a health check). A verified
+one and verifies it (running, and healthy if it has a health check; a control plane must
+report healthy). A verified
 container replaces the kept one; one that does not verify is removed and the kept one started
 again, with no pull (ADR 0004). An attempt may replace several services, and the recovery actor
 always **moves first**: it replaces itself by handing over to a successor, which must verify
@@ -187,6 +188,20 @@ anything (checksum, readable, schema matches the version named), holds every con
 loads the dump into a fresh database, starts that version's control plane and waits for it to
 report healthy; a restart part-way continues it. Details: `docs/configuration.md` "A migrating
 control-plane update, and `restore`".
+
+**On Podman, a restore back to 0.4.1 or earlier (or an older `edge` build) ends `unhealthy`
+after 300 s although it worked.** Those control planes have no health check of their own and
+Podman keeps none from a published image, so the restore cannot see one report healthy
+(`state=running health=none`). The dump is loaded and that version's control plane is left
+running on it.
+
+- **Check it yourself**, on that machine: `curl -fsS http://localhost:8080/health`
+  (`QUASAR_HTTP_PORT`) answers `{"status":"ok","db":"ok"}`, and the console signs you in.
+- **Do not run the restore again.** It would load the dump a second time and drop whatever was
+  written since.
+- The control plane gets a health check with its next update to a release after 0.4.1.
+
+Docker is not affected, and neither is a restore between two releases after 0.4.1.
 
 ### Reverting an agent
 

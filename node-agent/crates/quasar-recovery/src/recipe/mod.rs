@@ -694,7 +694,9 @@ impl Book {
             Role::RecoveryActor => Some(1..=revision::RECIPE_REVISION),
             // Revision 2: Add host's images arrive as operator overrides plus install-time
             // fallbacks, so the installed release's images can come between (#365).
-            Role::ControlPlane => Some(1..=2),
+            // Revision 3 (#543): the recipe carries the healthcheck, which Podman drops
+            // from an OCI image.
+            Role::ControlPlane => Some(1..=3),
             // The Postgres image carries no recipe label: its revision is this actor's own
             // (`control::POSTGRES_REVISION`).
             Role::Postgres => Some(1..=1),
