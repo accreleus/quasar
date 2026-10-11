@@ -6,6 +6,7 @@
 // Real MicCapture and real input capture (jsdom has no Pointer Lock, so capture
 // runs in fallback mode); the transport, telemetry and HUD are doubles.
 
+import { Fragment, StrictMode } from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -112,12 +113,24 @@ vi.mock("./SessionSwapController", () => ({
 
 let swapToast: ((n: React.ReactNode) => void) | null = null;
 let hud: Record<string, unknown> = {};
+let slowHudOnOpen = false;
+let afterHudCommit: (() => void) | null = null;
 const hudOpen = vi.fn();
 vi.mock("./hud/Hud", async () => {
-  const { forwardRef, useImperativeHandle } = await import("react");
+  const { forwardRef, useImperativeHandle, useLayoutEffect } = await import("react");
   return {
     Hud: forwardRef((p: Record<string, unknown>, ref: React.Ref<unknown>) => {
       hud = p;
+      if (slowHudOnOpen && p.channelOpen) {
+        slowHudOnOpen = false;
+        const end = performance.now() + 20;
+        while (performance.now() < end) { /* make concurrent work yield after commit */ }
+      }
+      useLayoutEffect(() => {
+        const run = afterHudCommit;
+        afterHudCommit = null;
+        run?.();
+      });
       useImperativeHandle(ref, () => ({ open: hudOpen, close() {}, stageClick() {} }));
       // The real HUD's Exit session button is wired to onStop, which stops the server session.
       return (
@@ -147,9 +160,10 @@ function makeSession(overrides: Record<string, unknown> = {}) {
 }
 let currentSession = makeSession();
 
-function renderPage() {
+function renderPage(strict = false) {
+  const Mode = strict ? StrictMode : Fragment;
   return render(
-    <MemoryRouter
+    <Mode><MemoryRouter
       initialEntries={[
         {
           pathname: "/app/session/s1",
@@ -172,7 +186,7 @@ function renderPage() {
           </Routes>
         </ToastProvider>
       </ThemeProvider>
-    </MemoryRouter>,
+    </MemoryRouter></Mode>,
   );
 }
 
@@ -196,13 +210,13 @@ function keyReachesBrowser(code: string): boolean {
 }
 
 /** Streaming, mic on, input captured. `appPresented` false leaves the launch poll running. */
-async function streamingWithMicAndCapture(detail = "app presented"): Promise<Channel> {
+async function streamingWithMicAndCapture(detail = "app presented", settleMs = 3_000): Promise<Channel> {
   currentSession = makeSession({ state_detail: detail });
   renderPage();
   await advance(1_000);
   const ch: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
   await act(async () => lastOnChannel?.(ch));
-  await advance(3_000);
+  await advance(settleMs);
   getUserMedia.mockResolvedValue(stream);
   await act(async () => (hud.onToggleMic as () => void)());
   await act(async () => (hud.onGrab as () => void)());
@@ -675,5 +689,344 @@ describe("SessionPage — a held verdict is the only banner (#529)", () => {
     expect(screen.queryByText(/Now playing/)).toBeNull();
     await act(async () => swapToast?.("Now playing Again."));
     expect(screen.queryByText(/Now playing/)).toBeNull();
+  });
+});
+
+// #449 — an app that exits before its first frame closes the session; the page sees
+// the transport die and a 409 on the replacement mint, which is not a network fault.
+describe("SessionPage — an app that exits early is not a network problem (#449)", () => {
+  const APP_EXIT = "The app exited before producing any video";
+  const NETWORK = "Could not reach the stream";
+  const exited = () =>
+    makeSession({
+      state: "failed",
+      state_detail: "app booting",
+      failure_code: "app_exited_early",
+      error_message: "the app exited with code 1 before producing any video.",
+      app_log_tail: "Vulkan loader failed",
+    });
+  const bootingPage = async () => {
+    currentSession = makeSession({ state: "running", state_detail: "app booting" });
+    renderPage();
+    await advance(1_000);
+  };
+  const mintRefused = async () => {
+    refused();
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+  };
+
+  it("the refused mint lands first, then the session reads failed: the app-exit card replaces the guess", async () => {
+    await bootingPage();
+    await mintRefused();
+    expect(screen.getByText(NETWORK)).not.toBeNull();
+
+    currentSession = exited();
+    await advance(1_500);
+
+    expect(screen.getByText(APP_EXIT)).not.toBeNull();
+    expect(screen.getByText(/exited with code 1/)).not.toBeNull();
+    expect(screen.queryByText(NETWORK)).toBeNull();
+  });
+
+  it("the refused mint lands first and the reason poll it triggers already reads failed", async () => {
+    await bootingPage();
+    currentSession = exited();
+    // No launch-poll tick falls inside this window: only pollEndReason can deliver the verdict.
+    await mintRefused();
+
+    expect(screen.getByText(APP_EXIT)).not.toBeNull();
+    expect(screen.queryByText(NETWORK)).toBeNull();
+  });
+
+  it("the poll reads failed first, then the mint is refused: the verdict stands", async () => {
+    await bootingPage();
+    currentSession = exited();
+    await advance(1_500);
+    expect(screen.getByText(APP_EXIT)).not.toBeNull();
+
+    await mintRefused();
+
+    expect(screen.getByText(APP_EXIT)).not.toBeNull();
+    expect(screen.queryByText(NETWORK)).toBeNull();
+  });
+
+  it("a session still running when the mint is refused keeps the network card", async () => {
+    await bootingPage();
+    await mintRefused();
+    await advance(3_000);
+
+    expect(screen.getByText(NETWORK)).not.toBeNull();
+    expect(screen.queryByText(APP_EXIT)).toBeNull();
+  });
+});
+
+// #449 — a launch verdict is loader copy. Latched after the loader is gone it would
+// end the page's input with no banner to say why or to leave by.
+describe("SessionPage — a launch verdict is held only until the loader's reveal begins (#449)", () => {
+  const TAKEN = "This session moved to another tab";
+  const ENDED = "The session ended before it started";
+  const banners = () => document.querySelectorAll(".banner");
+  const suspect = async () => {
+    mintSignalingToken.mockReturnValue(new Promise(() => {}));
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "degraded", message: "Network path interrupted" }));
+    await advance(100);
+  };
+
+  it("the session reads stopping while ICE degrades, then recovery returns: nothing is held and the controls stay", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopping", state_detail: "stop requested" });
+    await suspect();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "connected", message: "Connected" }));
+    await advance(100);
+
+    expect(screen.queryByText(ENDED)).toBeNull();
+    expect(banners().length).toBe(0);
+    expect(screen.getByTestId("hud")).not.toBeNull();
+    stillLive();
+  });
+
+  it("the session reads failed mid-stream, then another tab takes it: the takeover is shown with a way back", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "failed", state_detail: "boom", failure_code: "app_exited_early", error_message: "boom" });
+    await suspect();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(100);
+
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(banners().length).toBe(1);
+    expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
+  });
+
+  // Whenever the page has let go of the session after the loader, something on it says why and offers a way out.
+  const over: [string, () => Promise<void>][] = [
+    ["access revoked", async () => {
+      currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+      await advance(5_500);
+    }],
+    ["taken over", async () => {
+      await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    }],
+    ["recovery failed, input channel closed", async () => {
+      refused();
+      await act(async () => lastOnRecovery?.(failed));
+    }],
+    ["stopped mid-stream, then recovery failed, input channel closed", async () => {
+      currentSession = makeSession({ state: "stopped", state_detail: "stop requested" });
+      refused();
+      await act(async () => lastOnRecovery?.(failed));
+    }],
+    ["failed mid-stream, then recovery failed, input channel closed", async () => {
+      currentSession = makeSession({ state: "failed", failure_code: "app_exited_early", error_message: "boom" });
+      refused();
+      await act(async () => lastOnRecovery?.(failed));
+    }],
+  ];
+  it.each(over)("%s: input is released and a banner offers an action", async (name, reach) => {
+    const ch = await streamingWithMicAndCapture();
+    if (name.includes("channel closed")) await act(async () => ch.onclose?.());
+    await reach();
+    await advance(100);
+
+    expect(keyReachesBrowser("Tab")).toBe(true);
+    expect(document.querySelectorAll(".banner button").length).toBeGreaterThan(0);
+  });
+});
+
+// The loader is inert from about 1,180 ms into its 1,400 ms reveal, so a verdict
+// that lands inside the handoff has nothing to show it either.
+describe("SessionPage — the loader's handoff holds no launch verdict (#449)", () => {
+  const TAKEN = "This session moved to another tab";
+  const ENDED = "The session ended before it started";
+  const banners = () => document.querySelectorAll(".banner");
+  const inHandoff = async () => {
+    const ch = await streamingWithMicAndCapture("app presented", 220);
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    return ch;
+  };
+  const suspect = async () => {
+    mintSignalingToken.mockReturnValue(new Promise(() => {}));
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "degraded", message: "Network path interrupted" }));
+    await advance(100);
+  };
+
+  it("the session reads stopping inside the handoff, then recovery returns: nothing is held and the controls stay", async () => {
+    await inHandoff();
+    currentSession = makeSession({ state: "stopping", state_detail: "stop requested" });
+    await suspect();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "connected", message: "Connected" }));
+    await advance(2_000);
+
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(screen.queryByText(ENDED)).toBeNull();
+    expect(banners().length).toBe(0);
+    expect(screen.getByTestId("hud")).not.toBeNull();
+    stillLive();
+  });
+
+  it("the session reads failed inside the handoff, then another tab takes it: the takeover is shown with a way back", async () => {
+    await inHandoff();
+    currentSession = makeSession({ state: "failed", state_detail: "boom", failure_code: "app_exited_early", error_message: "boom" });
+    await suspect();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(2_000);
+
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(banners().length).toBe(1);
+    expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
+  });
+});
+
+
+describe("SessionPage — a verdict landing between the reveal's commit and its effects (#449)", () => {
+  it("a stopping read that resolves before the reveal effect holds nothing, and the controls stay", async () => {
+    vi.useRealTimers();
+    await act(async () => { renderPage(); });
+    expect(lastOnChannel).not.toBeNull();
+    let deliver: ((s: {session: ReturnType<typeof makeSession>}) => void) | undefined;
+    getSession.mockImplementationOnce(() => new Promise((resolve) => { deliver = resolve; }));
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "degraded", message: "Network path interrupted" }));
+    expect(deliver).toBeTypeOf("function");
+    let landedBeforeEffect = false;
+    const observer = new MutationObserver(() => {
+      const root = document.querySelector(".sl-root");
+      if (!document.querySelector(".session-hint") && root && !root.classList.contains("is-locking") && deliver) {
+        landedBeforeEffect = true;
+                const fn = deliver;
+        deliver = undefined;
+        fn({ session: makeSession({ state: "stopping", state_detail: "stop requested" }) });
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", false);
+    slowHudOnOpen = true;
+    const ch: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
+    lastOnChannel?.(ch);
+    await new Promise((r) => setTimeout(r, 150));
+    observer.disconnect();
+    expect(landedBeforeEffect).toBe(true);
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "connected", message: "Connected" }));
+    await new Promise((r) => setTimeout(r, 1_500));
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(document.querySelectorAll(".banner").length).toBe(0);
+    expect(screen.getByTestId("hud")).not.toBeNull();
+  });
+});
+
+
+describe("SessionPage — the channel closing inside the reveal (#449)", () => {
+  it("ignores an ordinary verdict read after the retract", async () => {
+    const ch = await streamingWithMicAndCapture("app presented", 1_220);
+    await act(async () => ch.onclose?.());
+    currentSession = makeSession({ state: "stopping", state_detail: "stop requested" });
+    mintSignalingToken.mockReturnValue(new Promise(() => {}));
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "degraded", message: "Network path interrupted" }));
+    await advance(100);
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "connected", message: "Connected" }));
+    const reopened: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
+    await act(async () => lastOnChannel?.(reopened));
+    await advance(2_000);
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(document.querySelectorAll(".banner").length).toBe(0);
+    expect(screen.getByTestId("hud")).not.toBeNull();
+  });
+});
+
+// A second launch poll can still be in flight when the first one commits the reveal.
+describe("SessionPage — an overlapping launch poll cannot hold a verdict the reveal has made unshowable (#449)", () => {
+  it("the reveal commits, then the other poll's stopping read lands before the poll's cleanup", async () => {
+    vi.useRealTimers();
+    currentSession = makeSession({ state_detail: "app booting" });
+    await act(async () => { renderPage(true); });
+    const ch: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
+    await act(async () => lastOnChannel?.(ch));
+    const pending: Array<(s: { session: ReturnType<typeof makeSession> }) => void> = [];
+    getSession.mockImplementation(() => new Promise((resolve) => pending.push(resolve)));
+    await new Promise((r) => setTimeout(r, 2_150));
+    expect(pending.length).toBe(2);
+    let committed = false;
+    afterHudCommit = () => {
+      committed = true;
+      pending[1]({ session: makeSession({ state: "stopping", state_detail: "stop requested" }) });
+    };
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", false);
+    slowHudOnOpen = true;
+    pending[0]({ session: makeSession({ state_detail: "app presented" }) });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(committed).toBe(true);
+    await new Promise((r) => setTimeout(r, 1_500));
+
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(document.querySelectorAll(".banner").length).toBe(0);
+    expect(screen.getByTestId("hud")).not.toBeNull();
+  });
+});
+
+// The other half of the same invariant: the reveal does not begin while a verdict
+// the page could not show afterwards is held.
+describe("SessionPage — the reveal waits for a verdict only the loader can show (#449)", () => {
+  const TAKEN = "This session moved to another tab";
+  const banners = () => document.querySelectorAll(".banner");
+  /** Channel open, an older launch poll still in flight, a newer one answering `newer`. */
+  async function heldThenLatePresented(newer: Record<string, unknown>) {
+    currentSession = makeSession({ state_detail: "app booting" });
+    renderPage();
+    await advance(1_000);
+    await act(async () => lastOnChannel?.({ readyState: "open", onclose: null, send() {}, bufferedAmount: 0 }));
+    const pending: Array<(s: { session: ReturnType<typeof makeSession> }) => void> = [];
+    getSession.mockImplementation(() => new Promise((resolve) => pending.push(resolve)));
+    await advance(1_100);
+    await advance(1_000);
+    expect(pending.length).toBe(2);
+    await act(async () => pending[1]({ session: makeSession(newer) }));
+    await advance(100);
+    return () => act(async () => pending[0]({ session: makeSession({ state_detail: "app presented" }) }));
+  }
+
+  it("ended is held, then a late app-presented: the loader's card stays, with its button", async () => {
+    const late = await heldThenLatePresented({ state: "stopping", state_detail: "stop requested" });
+    expect(screen.getByText("The session ended before it started")).not.toBeNull();
+    await late();
+    await advance(3_000);
+
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    expect(screen.getByText("The session ended before it started")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
+  });
+
+  it("failed is held, then a late app-presented: the loader's card stays, with its button", async () => {
+    const late = await heldThenLatePresented({
+      state: "failed",
+      state_detail: "app booting",
+      failure_code: "app_exited_early",
+      error_message: "the app exited with code 1 before producing any video.",
+    });
+    await late();
+    await advance(3_000);
+
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    expect(screen.getByText("The app exited before producing any video")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
+  });
+
+  it("a revoked access held before the reveal does not block it: the loader goes and the banner shows", async () => {
+    const late = await heldThenLatePresented({ state: "stopped", stop_reason: "entitlement_revoked" });
+    await late();
+    await advance(3_000);
+
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
+    expect(banners().length).toBe(1);
+  });
+
+  it("a takeover held before the reveal does not block it: the loader goes and the banner shows", async () => {
+    const late = await heldThenLatePresented({ state: "running", state_detail: "app booting" });
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await late();
+    await advance(3_000);
+
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(banners().length).toBe(1);
   });
 });

@@ -2199,7 +2199,6 @@ fn sibling_egl_verdict(
 /// never `Broken`. Conflating them let one slow dlopen drag a healthy host into a
 /// 350 MB download and a session-killing agent restart.
 pub fn probe_egl_runtime(vendor_lib: Option<&Path>) -> EglRuntime {
-    use std::process::{Command, Stdio};
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -2208,53 +2207,19 @@ pub fn probe_egl_runtime(vendor_lib: Option<&Path>) -> EglRuntime {
             }
         }
     };
-    let mut cmd = Command::new(exe);
-    cmd.arg(EGL_SELFTEST_ARG);
-    if let Some(v) = vendor_lib {
-        cmd.arg(v);
-    }
-    let child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            return EglRuntime::Indeterminate {
-                detail: format!("could not spawn the EGL self-test: {e}"),
-            }
-        }
+    let mut args = vec![EGL_SELFTEST_ARG];
+    let vendor_lib = vendor_lib.map(|v| v.to_string_lossy().into_owned());
+    args.extend(vendor_lib.as_deref());
+    let Some((out, _)) = crate::vram::run_bounded(&exe, &args, EGL_SELFTEST_TIMEOUT) else {
+        return EglRuntime::Indeterminate {
+            detail: format!(
+                "the EGL self-test could not be spawned, or did not finish within \
+                 {EGL_SELFTEST_TIMEOUT:?}. That is a timeout, not a verdict: a first dlopen of \
+                 the NVIDIA stack on a loaded box with persistence mode off is not guaranteed \
+                 to beat it."
+            ),
+        };
     };
-    let deadline = Instant::now() + EGL_SELFTEST_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return EglRuntime::Indeterminate {
-                    detail: format!(
-                        "the EGL self-test did not finish within {EGL_SELFTEST_TIMEOUT:?}. That \
-                         is a timeout, not a verdict: a first dlopen of the NVIDIA stack on a \
-                         loaded box with persistence mode off is not guaranteed to beat it."
-                    ),
-                };
-            }
-            Err(e) => {
-                return EglRuntime::Indeterminate {
-                    detail: format!("EGL self-test wait failed: {e}"),
-                }
-            }
-        }
-    }
-    let mut out = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        let _ = s.read_to_string(&mut out);
-    }
     let verdict = parse_egl_selftest(&out);
     match &verdict {
         EglRuntime::Ok { loaded } => {
@@ -3212,6 +3177,29 @@ mod tests {
                 assert!(l[0].contains(ending), "{l:?}");
             }
         }
+    }
+
+    /// A summary far past a pipe buffer (64 KiB) comes back whole through `run_bounded`, and
+    /// the NVIDIA device at its end is found; a timed-out run is no verdict at all.
+    #[test]
+    fn a_vulkaninfo_sized_output_is_returned_whole_and_parsed() {
+        let script = "yes 'filler line that is not part of any device block' | head -n 4000; \
+                      printf 'Devices:\\n========\\nGPU0:\\n\\tvendorID = 0x10de\\n\\tdeviceID = 0x1f08\\n\\tdriverName = NVIDIA\\n\\tdriverInfo = 615.78.08\\n'; \
+                      exit 1";
+        let (out, status) =
+            crate::vram::run_bounded("sh", &["-c", script], Duration::from_secs(10)).unwrap();
+        assert!(out.len() > 128 * 1024, "{} bytes", out.len());
+        let run = Some((out, status.code(), None));
+        assert_eq!(
+            vulkan_selftest_lines(true, run),
+            ["VULKAN_NVIDIA=615.78.08 (vulkaninfo then exited 1)"]
+        );
+        // `None` is "did not run, or past its deadline", never a verdict.
+        assert!(
+            crate::vram::run_bounded("sh", &["-c", "sleep 5"], Duration::from_millis(100))
+                .is_none()
+        );
+        assert!(vulkan_selftest_lines(true, None)[0].starts_with("VULKAN_UNAVAILABLE="));
     }
 
     #[test]

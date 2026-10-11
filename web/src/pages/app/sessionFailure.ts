@@ -176,3 +176,27 @@ export function accessRevokedFailure(s: StopReasonInput): LaunchFailure | null {
     message: "This session ended because you no longer have access to the app.",
   };
 }
+
+/** The kinds that have a banner once the loader is gone. */
+export function isBannerVerdict(f: LaunchFailure): boolean {
+  return f.kind === "access_revoked" || f.kind === "taken_over";
+}
+
+/** What the page can still show after the loader's reveal has begun: a banner
+ * verdict, or its own "unreachable" guess (the recovery banner covers that one).
+ * Anything else is loader copy, and the loader is inert by then.
+ * Invariant: once the reveal has begun, the page holds no verdict it cannot show.
+ * The write gate (`noteFailure`) keeps one in out; the reveal gate (`revealReady`)
+ * keeps the reveal from beginning while one is held. */
+export function showsAfterReveal(f: LaunchFailure): boolean {
+  return isBannerVerdict(f) || f.kind === "unreachable";
+}
+
+/** The one precedence rule for the page's sticky verdict: the browser's own
+ * guess ("unreachable") yields to anything the control plane says about the
+ * session's end, a revoked access beats every other verdict, and otherwise the
+ * first verdict stands. */
+export function settleFailure(prev: LaunchFailure | null, next: LaunchFailure): LaunchFailure {
+  const rank = (f: LaunchFailure) => (f.kind === "unreachable" ? 0 : f.kind === "access_revoked" ? 2 : 1);
+  return prev && rank(prev) >= rank(next) ? prev : next;
+}
