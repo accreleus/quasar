@@ -176,3 +176,12 @@ export function accessRevokedFailure(s: StopReasonInput): LaunchFailure | null {
     message: "This session ended because you no longer have access to the app.",
   };
 }
+
+/** The one precedence rule for the page's sticky verdict: the browser's own
+ * guess ("unreachable") yields to anything the control plane says about the
+ * session's end, a revoked access beats every other verdict, and otherwise the
+ * first verdict stands. */
+export function settleFailure(prev: LaunchFailure | null, next: LaunchFailure): LaunchFailure {
+  const rank = (f: LaunchFailure) => (f.kind === "unreachable" ? 0 : f.kind === "access_revoked" ? 2 : 1);
+  return prev && rank(prev) >= rank(next) ? prev : next;
+}

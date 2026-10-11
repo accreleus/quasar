@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   accessRevokedFailure,
   launchFailureFromSession,
+  settleFailure,
   takenOverFailure,
   unreachableFailure,
 } from "./sessionFailure";
@@ -174,5 +175,36 @@ describe("launchFailureFromSession", () => {
       expect(v?.title).toBeTruthy();
       expect(v?.message).toBeTruthy();
     }
+  });
+});
+
+// #449 — "unreachable" is the page's guess; whatever the control plane says about
+// the session's end replaces it, and a server verdict is never replaced by a guess.
+describe("settleFailure", () => {
+  const appExit = launchFailureFromSession(s("failed", null, "exit 1", "app_exited_early", "log"))!;
+  const ended = launchFailureFromSession(s("stopped"))!;
+  const revoked = accessRevokedFailure({ stop_reason: "entitlement_revoked" })!;
+  const guess = unreachableFailure("session is not reconnectable");
+
+  it("takes the first verdict when there is none", () => {
+    expect(settleFailure(null, guess)).toBe(guess);
+    expect(settleFailure(null, appExit)).toBe(appExit);
+  });
+
+  it("lets any server verdict replace the guess, whichever arrives first", () => {
+    for (const v of [appExit, ended, takenOverFailure(), revoked]) expect(settleFailure(guess, v)).toBe(v);
+  });
+
+  it("never lets the guess replace a server verdict", () => {
+    for (const v of [appExit, ended, takenOverFailure(), revoked]) expect(settleFailure(v, guess)).toBe(v);
+  });
+
+  it("keeps the first server verdict, except that a revoked access beats the rest", () => {
+    expect(settleFailure(appExit, ended)).toBe(appExit);
+    expect(settleFailure(ended, appExit)).toBe(ended);
+    expect(settleFailure(takenOverFailure(), appExit).kind).toBe("taken_over");
+    expect(settleFailure(appExit, revoked)).toBe(revoked);
+    expect(settleFailure(takenOverFailure(), revoked)).toBe(revoked);
+    expect(settleFailure(revoked, appExit)).toBe(revoked);
   });
 });

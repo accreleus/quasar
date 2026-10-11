@@ -11,7 +11,7 @@ import { getSession } from "../../api/library";
 import type { Session } from "../../api/types";
 import { reportBestEffortFailure } from "../../lib/reportBestEffortFailure";
 import { healthBanner, type HealthBanner } from "./streamHealth";
-import { accessRevokedFailure, launchFailureFromSession, type LaunchFailure } from "./sessionFailure";
+import { accessRevokedFailure, launchFailureFromSession, settleFailure, type LaunchFailure } from "./sessionFailure";
 
 /** #484 §3.3: cap on how long the loader waits for "app presented" after
  * "app booting" before revealing anyway. Build-time constant — the design
@@ -112,11 +112,16 @@ export function useSessionStatus(
     if (session.state === "running") setSessionRunning(true);
   }, []);
 
-  // The server's stop reason replaces a verdict the client guessed earlier
-  // (e.g. "could not reach the stream"), so this one is not `prev ??`.
+  // What the control plane says about the session's end outranks the page's own
+  // "unreachable" guess; see settleFailure. The 5s health poll only listens for
+  // a revoked access: its other verdicts are launch copy.
+  const noteServerVerdict = useCallback((session: Parameters<typeof launchFailureFromSession>[0]) => {
+    const verdict = launchFailureFromSession(session);
+    if (verdict) setLaunchFailure((prev) => settleFailure(prev, verdict));
+  }, []);
   const noteAccessRevoked = useCallback((session: Parameters<typeof accessRevokedFailure>[0]) => {
     const revoked = accessRevokedFailure(session);
-    if (revoked) setLaunchFailure((prev) => (prev?.kind === revoked.kind ? prev : revoked));
+    if (revoked) setLaunchFailure((prev) => settleFailure(prev, revoked));
   }, []);
 
   // When the WebRTC session drops unexpectedly, poll once to find out why — if
@@ -128,7 +133,7 @@ export function useSessionStatus(
       if (session.state === "failed" && session.state_detail === "host_lost") {
         setHostLost(true);
       }
-      noteAccessRevoked(session);
+      noteServerVerdict(session);
     } catch (err) {
       // best-effort; the status bar message is already informative
       reportBestEffortFailure("silent-debug", "session: host-lost poll", err);
@@ -212,7 +217,7 @@ export function useSessionStatus(
         // The control plane owns "this launch is over". Ask it, don't guess.
         const verdict = launchFailureFromSession(session);
         if (verdict) {
-          setLaunchFailure((prev) => prev ?? verdict);
+          setLaunchFailure((prev) => settleFailure(prev, verdict));
           return;
         }
         notePlacement(session);
