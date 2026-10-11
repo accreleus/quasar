@@ -67,7 +67,9 @@ fi
 # prefix to still catch an orphan left by a SIGKILLed run.
 readarray -t STALE_TESTDB < <(docker ps -aq --filter "name=^qpg-${QUASAR_INSTANCE}" 2>/dev/null || true)
 if [ "${#STALE_TESTDB[@]}" -gt 0 ]; then
-  if docker rm -f "${STALE_TESTDB[@]}" >/dev/null 2>&1; then
+  # -v, same as testdb.sh (#205): the postgres data volume must not outlive
+  # the container.
+  if docker rm -fv "${STALE_TESTDB[@]}" >/dev/null 2>&1; then
     dx_pass testdb "removed ${#STALE_TESTDB[@]} leftover ephemeral postgres container(s) matching qpg-${QUASAR_INSTANCE}*"
   else
     dx_warn testdb "found leftover ephemeral postgres container(s) matching qpg-${QUASAR_INSTANCE}* but could not remove all of them"
