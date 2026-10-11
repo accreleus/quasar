@@ -54,6 +54,7 @@ if (scenario === "takeover" || scenario === "connecting") {
   check("the stream survives the first page leaving", (await flowing(B)) > 20);
   check("input still works after the first page left", await pong(B));
   out.B_final = await snap(B);
+  out.done = new Date().toISOString();
   await browserB.close();
 } else if (scenario === "reload") {
   // Same tab navigates: the old document is unloaded, as on a reload.
@@ -77,5 +78,7 @@ if (scenario === "takeover" || scenario === "connecting") {
   check("the stream continues", (await flowing(A)) > 20);
   check("input still works", await pong(A));
 }
+// Past here the page that owns the session closes: the host seeing it go is expected.
+out.done ??= new Date().toISOString();
 try { await browserA.close(); } catch { /* already gone */ }
 console.log(JSON.stringify(out, null, 1));
