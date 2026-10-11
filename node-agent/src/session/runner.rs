@@ -1214,6 +1214,14 @@ impl SessionTransports {
         }
     }
 
+    /// The window clearing, without the wait.
+    #[cfg(test)]
+    pub(crate) fn forget_replacements(&mut self) {
+        for budget in &mut self.budget {
+            budget.recent.clear();
+        }
+    }
+
     /// Apply one inbound signaling message as the offerer. An answer from a new peer
     /// replaces that PC's transport instead, and the new transport offers: `Ok(Some(pc))`.
     /// `Err` only when the video transport could not be replaced, which leaves the
@@ -1249,8 +1257,9 @@ impl SessionTransports {
                     tracing::warn!(
                         token = "transport-replace-rate-limited",
                         "{pc} PC: {MAX_REPLACEMENTS_PER_WINDOW} transport replacements or \
-                         re-offers in {} s — answers that ask for another are ignored \
-                         until the window clears; the current transport is kept",
+                         re-offers in {} s — an answer that asks for another is ignored \
+                         until the window clears. The peer already connected keeps the \
+                         stream; the newer one gets no offer and no error",
                         REPLACEMENT_WINDOW.as_secs()
                     );
                 }

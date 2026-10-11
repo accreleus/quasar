@@ -909,7 +909,7 @@ pub fn build_encode_pipeline(
     };
     // Audio first: `attach_video` takes the encode pipeline to READY.
     let (audio_webrtc, audio_pipeline) = transport.build_audio()?;
-    let video = transport.attach_video(false)?;
+    let video = transport.attach_video(false, None)?;
 
     Ok(EncodePipeline {
         pipeline,

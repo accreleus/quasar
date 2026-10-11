@@ -101,6 +101,9 @@ struct Host {
     /// Every error the encode bus posted, message and debug text joined.
     bus_errors: Vec<String>,
     encoder: gst::Element,
+    cfg: SessionConfig,
+    interpipesrc: gst::Element,
+    lever: Arc<super::EncodeResolutionLever>,
     /// When the encoder emitted each keyframe.
     keyframes: Arc<Mutex<Vec<Instant>>>,
     /// RECONFIGURE events that reached the encoder from downstream.
@@ -163,7 +166,8 @@ impl Host {
             transport,
             audio_webrtc,
             audio_pipeline,
-            ..
+            interpipesrc,
+            resolution_lever: lever,
         } = enc;
         let transports = SessionTransports::new(transport, video, audio_webrtc, audio_pipeline);
         transports.audio_pipeline.play();
@@ -207,6 +211,9 @@ impl Host {
             bus,
             bus_errors: Vec::new(),
             encoder,
+            cfg,
+            interpipesrc,
+            lever,
             keyframes,
             reconfigures,
             _metrics: metrics,
@@ -231,6 +238,32 @@ impl Host {
             .inbound(msg, &self.sig_tx, None, None)
             .expect("replace the video transport");
         self.replaced.extend(replaced);
+    }
+
+    /// What a size or frame-rate step does to the chain: new caps at the scale stage and
+    /// a RECONFIGURE from there up to the source. Forced where the rig's encode path has
+    /// no stage.
+    fn step_the_size(&self) {
+        use super::ResolutionLever;
+        if self.lever.set_rung(160, 120).is_err() {
+            let sink = self.encoder.static_pad("sink").unwrap();
+            sink.push_event(gst::event::Reconfigure::new());
+        }
+    }
+
+    /// Swap the source as `runner::perform_swap` does: a second one comes up, the encoder
+    /// is re-pointed at it, the first goes down. Whether the first stopped in time.
+    fn swap_source(&mut self, tag: &str) -> bool {
+        let sink = format!("takeover-{tag}-{}", std::process::id());
+        let next = build_source_pipeline(&self.cfg, None, &sink).expect("second source");
+        next.set_start_time(None::<gst::ClockTime>);
+        next.use_clock(Some(&gst::SystemClock::obtain()));
+        next.set_base_time(self.pipeline.base_time().expect("encode base time"));
+        next.set_state(gst::State::Playing)
+            .expect("second source PLAYING");
+        self.interpipesrc.set_property("listen-to", sink.as_str());
+        let old = std::mem::replace(&mut self.source, next);
+        stops_within(&old, Duration::from_secs(2))
     }
 
     fn drain_bus(&mut self) {
@@ -971,6 +1004,20 @@ fn past_the_replacement_budget_the_current_peer_keeps_the_transport() {
         "the current peer lost its stream"
     );
     assert!(input_reaches_host(&mut host, &mut b));
+
+    // The window clears: the refused peer's next request is served like any other.
+    host.transports.forget_replacements();
+    request_offers(&mut host);
+    let up = pump(&mut host, &mut c, Duration::from_secs(20), |_, p| {
+        streaming(p)
+    });
+    assert!(
+        up,
+        "the refused peer was not served once the window cleared: {}",
+        describe(&c)
+    );
+    assert_eq!(host.replaced.len(), 4);
+    assert!(input_reaches_host(&mut host, &mut c));
 }
 
 /// Twenty takeovers in one session leave one transport's worth of everything.
@@ -1260,6 +1307,179 @@ fn a_late_answer_to_the_old_offer_costs_no_second_transport() {
     assert_eq!(host.bus_errors, Vec::<String>::new());
 }
 
+/// A size step and an app swap while the page that took the session over is still
+/// connecting. Neither may wait on its transport: RTP held there parks the encode chain,
+/// and the renegotiation both cause queues behind it with the source's streaming thread.
+#[test]
+fn a_size_step_and_a_swap_do_not_wait_on_a_transport_nobody_answered() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("midway");
+    let _a = first_attach(&mut host);
+    abandon_a_takeover(&mut host);
+    std::thread::sleep(Duration::from_millis(500));
+
+    host.step_the_size();
+    let frames = source_frames(&host);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        frames.load(Ordering::Relaxed) > 15,
+        "the source stalled after a size step with nobody connected"
+    );
+
+    assert!(
+        host.swap_source("midway-2"),
+        "the swapped-out source did not stop with nobody connected"
+    );
+    let frames = source_frames(&host);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        frames.load(Ordering::Relaxed) > 15,
+        "the swapped-in source is not running"
+    );
+
+    // The page arrives after all, and answers the offer that was waiting for it. (No
+    // re-offer: after a size step it names another H.264 level, which a webrtcbin peer
+    // refuses and a browser does not.)
+    let mut b = first_attach(&mut host);
+    assert!(input_reaches_host(&mut host, &mut b));
+    assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// The same two once the new peer is connected: nothing is left waiting on what the
+/// replacement skipped.
+#[test]
+fn a_size_step_and_a_swap_still_work_on_a_replaced_transport() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("after");
+    let _a = first_attach(&mut host);
+    let mut b = attach(&mut host);
+
+    host.step_the_size();
+    let before = rtp(&b.video);
+    pump(&mut host, &mut b, Duration::from_secs(1), |_, _| false);
+    assert!(
+        rtp(&b.video) > before + 15,
+        "the stream stopped at a size step"
+    );
+
+    assert!(
+        host.swap_source("after-2"),
+        "the swapped-out source did not stop"
+    );
+    let before = rtp(&b.video);
+    pump(&mut host, &mut b, Duration::from_secs(1), |_, _| false);
+    assert!(rtp(&b.video) > before + 15, "the stream stopped at a swap");
+    assert!(input_reaches_host(&mut host, &mut b));
+    assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// Holds every replacement's attach still for a while, so the encode chain is certain to
+/// push while the new transport is half built. Without it that takes a frame landing in
+/// under a millisecond: about one replacement in fifty.
+struct AttachPause;
+
+impl AttachPause {
+    fn of(ms: u64) -> AttachPause {
+        super::transport::ATTACH_PAUSE_MS.store(ms, Ordering::Relaxed);
+        AttachPause
+    }
+}
+
+impl Drop for AttachPause {
+    fn drop(&mut self) {
+        super::transport::ATTACH_PAUSE_MS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// A frame pushed while a replacement transport is being attached must not stop the
+/// encode chain. It did when the tail was linked to a transport whose pads were not
+/// active yet: the stream ended there, and the new transport never got caps, so it never
+/// made its offer either. `QUASAR_REPLACE_ROUNDS` / `QUASAR_ATTACH_PAUSE_MS` for a soak.
+#[test]
+fn every_replacement_transport_makes_its_offer() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let env = |name: &str| std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok());
+    let rounds = env("QUASAR_REPLACE_ROUNDS").unwrap_or(6) as usize;
+    let _pause = AttachPause::of(env("QUASAR_ATTACH_PAUSE_MS").unwrap_or(50));
+    let mut host = Host::start("offers");
+    host.transports.set_replacement_limit(usize::MAX);
+    let _a = first_attach(&mut host);
+    let answer = last_answer(&host, PcId::Video);
+    let encoded = Arc::new(AtomicU64::new(0));
+    let count = encoded.clone();
+    host.encoder
+        .static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            count.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    let mut silent = Vec::new();
+    for round in 0..rounds {
+        // Another browser each round: its own certificate and ICE credentials.
+        let sdp = answer
+            .replace(
+                "a=fingerprint:sha-256 ",
+                &format!("a=fingerprint:sha-256 {:02X}:", round % 256),
+            )
+            .replace("a=ice-ufrag:", &format!("a=ice-ufrag:r{round}"));
+        host.inbound(SignalMsg::Answer {
+            sdp: sdp.clone(),
+            pc: Some(PcId::Video),
+        });
+        assert_eq!(
+            host.replaced.len(),
+            round + 1,
+            "round {round} did not replace"
+        );
+        let before = encoded.load(Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !super::has_offered(&host.transports.video.webrtc) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if !super::has_offered(&host.transports.video.webrtc) {
+            let sink = host.transports.video.webrtc.sink_pads();
+            silent.push(format!(
+                "round {round}: no offer in 2 s; encoder emitted {} buffers meanwhile; \
+                 transport sink caps {:?}; state {:?}",
+                encoded.load(Ordering::Relaxed) - before,
+                sink.first().and_then(|p| p.current_caps()).is_some(),
+                host.transports.video.webrtc.current_state(),
+            ));
+            break;
+        }
+        // The new transport's own peer answers, so the next round reads as a new one.
+        host.inbound(SignalMsg::Answer {
+            sdp,
+            pc: Some(PcId::Video),
+        });
+        let applied = |h: &Host| {
+            h.transports
+                .video
+                .webrtc
+                .property::<Option<gstreamer_webrtc::WebRTCSessionDescription>>(
+                    "remote-description",
+                )
+                .is_some()
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !applied(&host) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(applied(&host), "round {round}: the answer never applied");
+    }
+    assert_eq!(silent, Vec::<String>::new());
+}
+
 /// A whole session on `runner::run_blocking`, with signaling carried by hand: what the
 /// runner does on its way out, which the [`Host`] above does not have.
 struct Session {
@@ -1281,6 +1501,7 @@ struct Session {
 
 impl Session {
     fn start(tag: &str, idle_timeout: Duration) -> Session {
+        trace_to_stderr();
         let mut cfg = host_cfg(false);
         cfg.idle_timeout = idle_timeout;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1524,7 +1745,16 @@ fn browser_host() {
         // offered: the taking page's second answer to the old transport's offer.
         let late_answer = std::env::var("QUASAR_TAKEOVER_LATE_ANSWER").is_ok();
         let mut late: Option<SignalMsg> = None;
+        // Past its budget for this long after the second page attaches: that page's
+        // answers are ignored, then the window clears.
+        let refuse_secs: Option<u64> = std::env::var("QUASAR_TAKEOVER_REFUSE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let mut refuse_until: Option<tokio::time::Instant> = None;
         let mut host = Host::start_with("browser", mic);
+        if refuse_secs.is_some() {
+            host.transports.set_replacement_limit(0);
+        }
         let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
         eprintln!("HOST listening on ws://{addr} for {secs}s");
         let (in_tx, mut in_rx) = mpsc::unbounded_channel::<(u64, String)>();
@@ -1567,6 +1797,9 @@ fn browser_host() {
                         }
                     });
                     eprintln!("HOST socket {id} attached");
+                    if let (2, Some(secs)) = (id, refuse_secs) {
+                        refuse_until = Some(tokio::time::Instant::now() + Duration::from_secs(secs));
+                    }
                     for m in buffered.drain(..) {
                         let _ = out_tx.send(m);
                     }
@@ -1596,6 +1829,12 @@ fn browser_host() {
                     }
                 }
                 _ = tick.tick() => {
+                    if refuse_until.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                        refuse_until = None;
+                        host.transports.set_replacement_limit(6);
+                        host.transports.forget_replacements();
+                        eprintln!("HOST the replacement window cleared");
+                    }
                     while let Ok(msg) = host.sig_rx.try_recv() {
                         let mut video_offer = false;
                         if let SignalMsg::Offer { sdp, pc } = &msg {

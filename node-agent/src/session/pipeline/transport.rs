@@ -9,7 +9,7 @@
 //! and the same DTLS association. A new peer therefore gets a new `webrtcbin`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -39,6 +39,11 @@ pub struct VideoTransport {
     pub data_channel: Option<glib::Object>,
     bin: gst::Bin,
     retired: Arc<AtomicBool>,
+    /// The probe dropping RTP at the tail for a replacement whose peer has not connected.
+    /// An unconnected `webrtcbin` holds what is pushed into it, which parks the encode
+    /// chain's streaming thread: anything serialized behind it (the allocation query of a
+    /// size step or an app swap) then waits for a peer that may never come.
+    gate: Arc<Mutex<Option<gst::PadProbeId>>>,
 }
 
 /// What it takes to put a transport on the encode chain's tail, kept for the session so
@@ -69,6 +74,12 @@ fn pin_msid(pad: &gst::Pad, pc: PcId) {
         pad.set_property("msid", format!("quasar-{pc}"));
     }
 }
+
+/// Test hook: how long a replacement's attach stands still before its transport is
+/// brought up, so the encode chain pushes into whatever state the slot is in.
+#[cfg(test)]
+pub(super) static ATTACH_PAUSE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Wrap `webrtc` in a bin whose sink pad reports success for whatever a retired
 /// transport returns. A push parked inside a transport being torn down comes back
@@ -129,6 +140,10 @@ impl VideoTransport {
     /// Tear the transport down under a live encode chain. The caller holds RTP at `tail`.
     fn retire(&self, tail: &gst::Pad, pipeline: &gst::Pipeline) {
         self.retired.store(true, Ordering::SeqCst);
+        // Its replacement brings its own.
+        if let Some(gate) = self.gate.lock().unwrap().take() {
+            tail.remove_probe(gate);
+        }
         // Out of the pipeline first: the dying SCTP association must not reach the
         // session's bus, where it reads as the peer leaving and ends the session.
         let _ = pipeline.remove(&self.bin);
@@ -142,8 +157,16 @@ impl VideoTransport {
 impl TransportSlot {
     /// Build a video transport on the tail. `replacement` is false for the session's
     /// first one, built while the pipeline is still NULL.
-    pub(super) fn attach_video(&self, replacement: bool) -> Result<VideoTransport> {
+    ///
+    /// `gate` is the probe holding RTP back at the tail during a replacement; the new
+    /// transport keeps it until its peer connects.
+    pub(super) fn attach_video(
+        &self,
+        replacement: bool,
+        gate: Option<gst::PadProbeId>,
+    ) -> Result<VideoTransport> {
         let cfg = &self.cfg;
+        let gate = Arc::new(Mutex::new(gate));
         let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
         // Signals webrtcbin emits while it builds its send session: connect them first.
         if self.observe {
@@ -170,12 +193,6 @@ impl TransportSlot {
                     _ => gst::PadProbeReturn::Ok,
                 }
             });
-            self.tail
-                .link_full(
-                    &sink,
-                    gst::PadLinkCheck::DEFAULT | gst::PadLinkCheck::NO_RECONFIGURE,
-                )
-                .context("failed to link video into the replacement webrtcbin")?;
         } else {
             self.tail
                 .link(&sink)
@@ -226,10 +243,15 @@ impl TransportSlot {
             // The encoder is mid-GOP: the peer that just connected needs a keyframe.
             let encoder = self.encoder.downgrade();
             let session_id = self.session_id.clone();
+            let (tail, gate) = (self.tail.downgrade(), gate.clone());
             webrtc.connect_notify(Some("connection-state"), move |webrtc, _| {
                 let state = webrtc
                     .property::<gstreamer_webrtc::WebRTCPeerConnectionState>("connection-state");
                 if state == gstreamer_webrtc::WebRTCPeerConnectionState::Connected {
+                    if let (Some(tail), Some(gate)) = (tail.upgrade(), gate.lock().unwrap().take())
+                    {
+                        tail.remove_probe(gate);
+                    }
                     if let Some(encoder) = encoder.upgrade() {
                         tracing::info!(
                             token = "transport-replacement-connected",
@@ -246,6 +268,10 @@ impl TransportSlot {
         // webrtcbin must be at least READY before create-data-channel, and the channel
         // must exist before the offer.
         if replacement {
+            #[cfg(test)]
+            std::thread::sleep(Duration::from_millis(
+                ATTACH_PAUSE_MS.load(Ordering::Relaxed),
+            ));
             bin.set_state(gst::State::Ready)
                 .context("transport failed to reach READY")?;
         } else {
@@ -286,17 +312,29 @@ impl TransportSlot {
         if replacement {
             bin.sync_state_with_parent()
                 .context("transport failed to follow the encode pipeline's state")?;
+            // Linked only now, with its pads active. The link makes the tail resend its
+            // sticky events on the next push, and an inactive pad refuses them FLUSHING:
+            // that fails the push before any probe or chain function sees it, and
+            // pauses the encode chain's streaming task for good.
+            self.tail
+                .link_full(
+                    &sink,
+                    gst::PadLinkCheck::DEFAULT | gst::PadLinkCheck::NO_RECONFIGURE,
+                )
+                .context("failed to link video into the replacement webrtcbin")?;
         }
         Ok(VideoTransport {
             webrtc,
             data_channel,
             bin,
             retired,
+            gate,
         })
     }
 
     /// Give the video PC a new transport and tear the old one down, with the encode chain
-    /// live. The new transport offers as soon as it is up. On `Err` the old one is gone.
+    /// live. The new transport offers as soon as it is up, and takes RTP once its peer
+    /// has connected. On `Err` the old one is gone.
     pub fn replace_video(&self, video: &mut VideoTransport) -> Result<()> {
         // RTP is dropped at the tail while the slot is empty: an unlinked push is
         // not-linked, which errors the encode pipeline.
@@ -320,11 +358,7 @@ impl TransportSlot {
             }
         }
         abr_glue::reset_to_launch(&self.encoder, &self.cfg, &self.lever, &self.metrics);
-        let new = self.attach_video(true);
-        if let Some(gate) = gate {
-            self.tail.remove_probe(gate);
-        }
-        *video = new?;
+        *video = self.attach_video(true, gate)?;
         // The pipeline handed its latency to the first transport on the way to PLAYING;
         // one added later has to be told.
         let _ = self.pipeline.recalculate_latency();
