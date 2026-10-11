@@ -25,6 +25,9 @@
 #   late-answer  the takeover, with the taking page's answer to the old transport's offer
 #                delivered a second time once the new transport has offered
 #   spa-late     the same with the real web client
+#   spa-refused  the real web client resumes while the host is past its replacement
+#                budget, and the window clears 30 s later (not in the default set: it
+#                takes over a minute)
 #
 # Env:
 #   PW_IMAGE    image with a real Chrome (H.264) and xvfb-run. Playwright's bundled
@@ -36,10 +39,13 @@
 #   IMAGE       agent dev image (default quasar-agent-dev:latest)
 #   PORT        signaling port on loopback (default 18535)
 #   SPA_DIST    a built web/dist for the spa-* scenarios (default: built here with
-#               node:22 into .diagnostics/takeover-peers/dist)
+#               node:22 into $OUT/dist)
+#   OUT         where results and logs go (default .diagnostics/takeover-peers). A loop
+#               gives each run its own, with its own PORT when runs overlap.
+#   SPA_HOLD    spa-* only: delay one step of the taking page's handling of a video
+#               offer, to force an interleaving (see driver-spa.mjs)
 #
-# Exit 0 = every check of every scenario passed. Output and logs go under
-# .diagnostics/takeover-peers/.
+# Exit 0 = every check of every scenario passed. Output and logs go under $OUT.
 
 set -euo pipefail
 
@@ -48,7 +54,7 @@ IMAGE="${IMAGE:-quasar-agent-dev:latest}"
 PORT="${PORT:-18535}"
 : "${PW_IMAGE:?set PW_IMAGE to an image with a real Chrome and xvfb-run}"
 : "${PW_MODULES:?set PW_MODULES to a directory holding node_modules/playwright-core}"
-OUT="$ROOT/.diagnostics/takeover-peers"
+OUT="${OUT:-$ROOT/.diagnostics/takeover-peers}"
 HOST_NAME="takeover-host-$PORT"
 [ $# -gt 0 ] || set -- takeover connecting reload samepeer reattach late-answer spa-takeover spa-restart spa-late
 SPA_DIST="${SPA_DIST:-$OUT/dist}"
@@ -84,6 +90,7 @@ for scenario in "$@"; do
       host_env=(-e QUASAR_TAKEOVER_MIC=1)
       [ "$scenario" = spa-restart ] && host_env+=(-e QUASAR_TAKEOVER_RESTART_BETWEEN=1)
       [ "$scenario" = spa-late ] && host_env+=(-e QUASAR_TAKEOVER_LATE_ANSWER=1)
+      [ "$scenario" = spa-refused ] && host_env+=(-e QUASAR_TAKEOVER_REFUSE_SECS=30 -e QUASAR_TAKEOVER_SECS=180)
       driver=(peers/driver-spa.mjs "${scenario#spa-}" "ws://127.0.0.1:$PORT" /w/dist)
       ;;
   esac
@@ -106,6 +113,7 @@ for scenario in "$@"; do
     continue
   fi
   docker run --rm --network host -e CHROME="${CHROME:-/usr/bin/google-chrome}" -e BROWSER="${BROWSER:-chrome}" \
+    -e SPA_HOLD="${SPA_HOLD:-}" \
     -v "$PW_MODULES/node_modules":/w/node_modules:ro \
     -v "$ROOT/scripts/harness/takeover-peers":/w/peers:ro -v "$SPA_DIST":/w/dist:ro -w /w \
     "$PW_IMAGE" sh -c 'xvfb-run -a -s "-screen 0 1280x800x24" node "$@"' _ "${driver[@]}" \
@@ -140,9 +148,13 @@ if scenario in ("late-answer", "spa-late"):
 if scenario == "spa-restart":
     absorbed = sum(1 for line in open(host_log, errors="replace") if "before the transport's first offer" in line)
     checks["the restart request that beat the new offer was absorbed"] = absorbed >= 1
-checks[f"the host replaced {want} transports"] = int(replaced) == want
-if scenario.startswith("spa-"):
-    checks["the microphone reaches the host on the new transport"] = int(mic_after) >= 1
+if scenario == "spa-refused":
+    refused = sum(1 for line in open(host_log, errors="replace") if "transport-replace-rate-limited" in line)
+    checks["the host said it was past its budget"] = refused >= 1
+else:
+    checks[f"the host replaced {want} transports"] = int(replaced) == want
+    if scenario.startswith("spa-") and result.get("browser") != "firefox":
+        checks["the microphone reaches the host on the new transport"] = int(mic_after) >= 1
 if scenario != "reload":
     # On a reload the unloading page aborts SCTP on the old transport before the new
     # page attaches; that one is the page leaving, as it is today.
