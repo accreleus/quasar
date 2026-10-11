@@ -214,12 +214,21 @@ func TestPatchOfASourcedIntervalIsRefusedUnlessItIsTheValueReported(t *testing.T
 		t.Fatalf("message %q must name the setting, not the environment", got)
 	}
 
+	// Shape comes before ownership, as for any job: a different value below 60 is 422.
+	status, body = doReq(t, http.MethodPatch, s.url, `{"interval_secs": 5}`)
+	if status != http.StatusUnprocessableEntity || decodeErr(t, body).Error.Code != "validation_failed" {
+		t.Fatalf("PATCH of a different value below the floor: %d %s, want 422 validation_failed", status, body)
+	}
+
 	// Under the env override the advice is that Settings takes over once it is unset.
 	s.byEnv.Store(true)
 	status, body = doReq(t, http.MethodPatch, s.url, `{"interval_secs": 3600}`)
 	if got := decodeErr(t, body).Error.Message; status != http.StatusConflict ||
 		!strings.Contains(got, "Settings, Libraries, Scan interval") || strings.Contains(got, "admin-owned") {
 		t.Fatalf("env-locked PATCH: %d %q, want 409 pointing at Settings once unset", status, got)
+	}
+	if status, body = doReq(t, http.MethodPatch, s.url, `{"interval_secs": 5}`); status != http.StatusUnprocessableEntity {
+		t.Fatalf("env-locked PATCH below the floor: %d %s, want 422", status, body)
 	}
 	s.byEnv.Store(false)
 

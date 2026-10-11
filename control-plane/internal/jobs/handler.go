@@ -447,25 +447,23 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		def, _ := h.reg.Get(id)
-		sourced := def.IntervalSource != nil
-		// An ordinary job keeps the floor ahead of the lock; only a sourced job's lock
-		// comes first, since its reported period (a kill switch's 0) may sit below it.
-		if !sourced && n < MinIntervalSecs {
-			httpx.WriteError(w, http.StatusUnprocessableEntity, httpx.CodeValidationFailed,
-				fmt.Sprintf("interval_secs must be at least %d", MinIntervalSecs))
-			return
-		}
 		cur, locked, lockedBy, err := ResolveInterval(r.Context(), job, def, h.getenv)
 		if err != nil {
 			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read job")
 			return
 		}
+		sourced := def.IntervalSource != nil
 		switch {
+		case sourced && int32(cur.Seconds()) == n:
+			// The one exception to the order below: the reported period resent unchanged
+			// (a kill switch's 0 included) is accepted and not stored, so a window save
+			// that resends the interval does not fail.
+		case n < MinIntervalSecs:
+			httpx.WriteError(w, http.StatusUnprocessableEntity, httpx.CodeValidationFailed,
+				fmt.Sprintf("interval_secs must be at least %d", MinIntervalSecs))
+			return
 		case !locked:
 			upd.IntervalSecs = &n
-		case sourced && int32(cur.Seconds()) == n:
-			// The value already reported is accepted and not stored, so a window save
-			// that resends the interval does not fail.
 		case sourced && lockedBy == def.IntervalOwner:
 			httpx.WriteError(w, http.StatusConflict, httpx.CodeScheduleLocked,
 				lockedBy+" sets this job's interval; change it in "+def.IntervalOwnerHint)
