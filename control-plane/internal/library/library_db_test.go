@@ -2229,14 +2229,21 @@ func TestFailedScanLogsTheClassAndStoresTheFullText(t *testing.T) {
 		t.Errorf("stored error = %q, want the agent's text %q", stored, full)
 	}
 	out := logs.String()
-	var rec struct{ Level, Msg, Cause string }
+	var rec map[string]json.RawMessage
 	must(t, json.Unmarshal([]byte(strings.TrimSpace(out)), &rec))
-	if rec.Level != "WARN" || rec.Cause != "manifest not valid UTF-8" {
+	if string(rec["level"]) != `"WARN"` || string(rec["cause"]) != `"manifest not valid UTF-8"` {
 		t.Errorf("want a WARN scan-failure record with the class, got %q", out)
 	}
-	for _, leak := range []string{"zzhomezz", "zzgamezz", "zzfilezz", "appmanifest", "730"} {
-		if strings.Contains(rec.Cause, leak) || strings.Contains(rec.Msg, leak) {
-			t.Errorf("cause/message carries %q: %q", leak, out)
+	// Every attribute but the three that carry random ids or a timestamp, raw so a numeric or
+	// nested value is checked too.
+	for key, raw := range rec {
+		if key == "time" || key == "scan_id" || key == "host_id" {
+			continue
+		}
+		for _, leak := range []string{"zzhomezz", "zzgamezz", "zzfilezz", "appmanifest", "730"} {
+			if strings.Contains(string(raw), leak) {
+				t.Errorf("attribute %q carries %q: %q", key, leak, out)
+			}
 		}
 	}
 	for _, leak := range []string{"zzhomezz", "zzgamezz", "zzfilezz", "appmanifest"} {
