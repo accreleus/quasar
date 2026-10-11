@@ -63,6 +63,8 @@ export function useSessionStatus(
   authToken: string | null | undefined,
   sessionId: string | undefined,
   stopping: boolean,
+  /** True once the launch loader is gone; only the loader can show a launch verdict. */
+  loaderDoneRef: { readonly current: boolean },
 ): SessionStatus {
   const [launchDetail, setLaunchDetail] = useState<string | null>("scheduling host");
   // Sticky once set; derived only from the control plane's session record
@@ -113,12 +115,13 @@ export function useSessionStatus(
   }, []);
 
   // What the control plane says about the session's end outranks the page's own
-  // "unreachable" guess; see settleFailure. The 5s health poll only listens for
-  // a revoked access: its other verdicts are launch copy.
+  // "unreachable" guess; see settleFailure. Launch verdicts (failed, ended) are
+  // loader copy: once the loader is gone nothing on the page could show one, so
+  // only a revoked access, which has a banner, is held then.
   const noteServerVerdict = useCallback((session: Parameters<typeof launchFailureFromSession>[0]) => {
-    const verdict = launchFailureFromSession(session);
+    const verdict = loaderDoneRef.current ? accessRevokedFailure(session) : launchFailureFromSession(session);
     if (verdict) setLaunchFailure((prev) => settleFailure(prev, verdict));
-  }, []);
+  }, [loaderDoneRef]);
   const noteAccessRevoked = useCallback((session: Parameters<typeof accessRevokedFailure>[0]) => {
     const revoked = accessRevokedFailure(session);
     if (revoked) setLaunchFailure((prev) => settleFailure(prev, revoked));

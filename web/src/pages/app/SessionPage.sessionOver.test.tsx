@@ -746,3 +746,75 @@ describe("SessionPage — an app that exits early is not a network problem (#449
     expect(screen.queryByText(APP_EXIT)).toBeNull();
   });
 });
+
+// #449 — a launch verdict is loader copy. Latched after the loader is gone it would
+// end the page's input with no banner to say why or to leave by.
+describe("SessionPage — a launch verdict is held only while the loader shows it (#449)", () => {
+  const TAKEN = "This session moved to another tab";
+  const ENDED = "The session ended before it started";
+  const banners = () => document.querySelectorAll(".banner");
+  const suspect = async () => {
+    mintSignalingToken.mockReturnValue(new Promise(() => {}));
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "degraded", message: "Network path interrupted" }));
+    await advance(100);
+  };
+
+  it("the session reads stopping while ICE degrades, then recovery returns: nothing is held and the controls stay", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopping", state_detail: "stop requested" });
+    await suspect();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "connected", message: "Connected" }));
+    await advance(100);
+
+    expect(screen.queryByText(ENDED)).toBeNull();
+    expect(banners().length).toBe(0);
+    expect(screen.getByTestId("hud")).not.toBeNull();
+    stillLive();
+  });
+
+  it("the session reads failed mid-stream, then another tab takes it: the takeover is shown with a way back", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "failed", state_detail: "boom", failure_code: "app_exited_early", error_message: "boom" });
+    await suspect();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(100);
+
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(banners().length).toBe(1);
+    expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
+  });
+
+  // Whenever the page has let go of the session after the loader, something on it says why and offers a way out.
+  const over: [string, () => Promise<void>][] = [
+    ["access revoked", async () => {
+      currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+      await advance(5_500);
+    }],
+    ["taken over", async () => {
+      await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    }],
+    ["recovery failed, input channel closed", async () => {
+      refused();
+      await act(async () => lastOnRecovery?.(failed));
+    }],
+    ["stopped mid-stream, then recovery failed, input channel closed", async () => {
+      currentSession = makeSession({ state: "stopped", state_detail: "stop requested" });
+      refused();
+      await act(async () => lastOnRecovery?.(failed));
+    }],
+    ["failed mid-stream, then recovery failed, input channel closed", async () => {
+      currentSession = makeSession({ state: "failed", failure_code: "app_exited_early", error_message: "boom" });
+      refused();
+      await act(async () => lastOnRecovery?.(failed));
+    }],
+  ];
+  it.each(over)("%s: input is released and a banner offers an action", async (name, reach) => {
+    const ch = await streamingWithMicAndCapture();
+    if (name.includes("channel closed")) await act(async () => ch.onclose?.());
+    await reach();
+    await advance(100);
+
+    expect(keyReachesBrowser("Tab")).toBe(true);
+    expect(document.querySelectorAll(".banner button").length).toBeGreaterThan(0);
+  });
+});

@@ -305,6 +305,10 @@ export function SessionPage() {
     })();
   }, [signalCoords, authToken, sessionId, navigate, addToast]);
 
+  // Read by the status hook's end-reason poll, which runs from callbacks that
+  // outlive a render; assigned where loaderDone is declared.
+  const loaderDoneRef = useRef(false);
+
   // Session status polling (host-lost, AS10-06 health, launch progress, #484
   // §3.2 reveal-cap) lives in useSessionStatus.ts. `pollEndReason` and
   // `setLaunchFailure` are called from the WebRTC mount effect below: a
@@ -328,7 +332,7 @@ export function SessionPage() {
     hostAssigned,
     sessionRunning,
     pollEndReason,
-  } = useSessionStatus(authToken, sessionId, stopping);
+  } = useSessionStatus(authToken, sessionId, stopping, loaderDoneRef);
 
   // sessionRuntime.ts: one runtime instance per transport generation (law L1)
   // — a replacement token re-seats signalCoords, destroying this runtime and
@@ -754,6 +758,7 @@ export function SessionPage() {
   // cold app draws anything, and revealing on transport alone is the defect.
   const revealReady = channelOpen && appPresented;
   const [loaderDone, setLoaderDone] = useState(false);
+  loaderDoneRef.current = loaderDone;
   const loaderDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Latched, like SessionLoader's own handoff: the gate can retract (the channel
   // closes inside the reveal), and the loader is transparent and inert by then
