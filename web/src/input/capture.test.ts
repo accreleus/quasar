@@ -1570,3 +1570,145 @@ describe("Pointer Lock grants follow the latest intent, not the request that mad
     t.cleanup();
   });
 });
+
+describe("a Pointer Lock grant that lands after cleanup() (#527)", () => {
+  type Pending = { grant: () => void; reject: (e: unknown) => void };
+
+  function setup() {
+    const pending: Pending[] = [];
+    setPointerLockApi(
+      () =>
+        new Promise<void>((grant, reject) => {
+          pending.push({ grant, reject });
+        }),
+    );
+    const exitPointerLock = vi.fn(() => unlockPointer());
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
+    const video = document.createElement("video");
+    const capture = () => {
+      const onCaptureChange = vi.fn();
+      const cap = setupCapture({ videoEl: video, sendInput: () => {}, onCaptureChange, channel: makeChannel() });
+      return { onCaptureChange, ...cap };
+    };
+    return { pending, exitPointerLock, video, capture };
+  }
+
+  afterEach(() => {
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+    unlockPointer();
+    vi.restoreAllMocks();
+  });
+
+  it("hands the grant straight back and captures nothing", async () => {
+    const t = setup();
+    const added = vi.spyOn(document, "addEventListener");
+    const removed = vi.spyOn(document, "removeEventListener");
+    const a = t.capture();
+    const engaging = a.engage();
+    a.cleanup();
+    lockPointer(t.video);
+    t.pending[0]!.grant();
+    await engaging;
+
+    expect(t.exitPointerLock).toHaveBeenCalledTimes(1);
+    expect(a.onCaptureChange).not.toHaveBeenCalledWith({ captured: true, pointerLocked: true });
+    expect(a.getMetrics().captured).toBe(false);
+    // Nothing is left behind: every listener the capture added came off.
+    expect(added.mock.calls.map(([type]) => type).sort()).toEqual(
+      removed.mock.calls.map(([type]) => type).sort(),
+    );
+  });
+
+  it("leaves nothing to undo when the request is rejected", async () => {
+    const t = setup();
+    const a = t.capture();
+    const engaging = a.engage();
+    a.cleanup();
+    t.pending[0]!.reject(new Error("refused"));
+
+    await expect(engaging).resolves.toMatchObject({ mode: "failed" });
+    expect(t.exitPointerLock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the lock a replacement capture obtained after its own engage", async () => {
+    const t = setup();
+    const a = t.capture();
+    const first = a.engage();
+    a.cleanup();
+    const b = t.capture(); // transport replacement: a new capture on the same element
+    const second = b.engage();
+    lockPointer(t.video);
+    t.pending[0]!.grant();
+    t.pending[1]!.grant();
+    await Promise.all([first, second]);
+
+    expect(t.exitPointerLock).not.toHaveBeenCalled();
+    expect(b.getMetrics().captured).toBe(true);
+    b.cleanup();
+  });
+
+  it("hands the grant back once the replacement capture is gone too", async () => {
+    const t = setup();
+    const a = t.capture();
+    const engaging = a.engage();
+    a.cleanup();
+    t.capture().cleanup();
+    lockPointer(t.video);
+    t.pending[0]!.grant();
+    await engaging;
+
+    expect(t.exitPointerLock).toHaveBeenCalledTimes(1);
+  });
+
+  it("cleanup of the older capture after the newer one is set up does not hand off", async () => {
+    const t = setup();
+    const a = t.capture();
+    const first = a.engage();
+    const b = t.capture();
+    const second = b.engage();
+    a.cleanup();
+    lockPointer(t.video);
+    t.pending[0]!.grant();
+    t.pending[1]!.grant();
+    await Promise.all([first, second]);
+
+    expect(t.exitPointerLock).not.toHaveBeenCalled();
+    expect(b.getMetrics().captured).toBe(true);
+    b.cleanup();
+  });
+
+  it("an older capture's cleanup does not take the lock a newer capture holds", async () => {
+    const t = setup();
+    const a = t.capture();
+    const b = t.capture();
+    const engaging = b.engage();
+    lockPointer(t.video);
+    t.pending[0]!.grant();
+    await engaging;
+    expect(b.getMetrics().captured).toBe(true);
+
+    a.cleanup();
+
+    expect(t.exitPointerLock).not.toHaveBeenCalled();
+    expect(b.getMetrics().captured).toBe(true);
+    b.cleanup();
+    expect(t.exitPointerLock).toHaveBeenCalledTimes(1);
+  });
+
+  it("release() exits a lock it inherited from an older capture", async () => {
+    const t = setup();
+    const a = t.capture();
+    const engaging = a.engage();
+    lockPointer(t.video);
+    t.pending[0]!.grant();
+    await engaging;
+    const b = t.capture(); // never engaged: mode "none"
+    a.cleanup();
+    expect(t.exitPointerLock).not.toHaveBeenCalled();
+
+    b.release();
+
+    expect(t.exitPointerLock).toHaveBeenCalledTimes(1);
+    b.cleanup();
+  });
+});
