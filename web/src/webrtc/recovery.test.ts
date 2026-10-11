@@ -124,6 +124,32 @@ describe("RecoveryController", () => {
     expect(retry).not.toHaveBeenCalled();
   });
 
+  // #527 — `failed` stops the ladder, but the runtime may still be minting a
+  // replacement token; it must hear about a takeover, exactly once.
+  it("superseded is delivered after `failed`, and only once", () => {
+    const states: RecoveryState[] = [];
+    const recovery = new RecoveryController({ onRetry: vi.fn(), onState: (state) => states.push(state) });
+
+    recovery.terminal("Peer connection failed (DTLS)");
+    recovery.superseded("taken over");
+    recovery.superseded("taken over");
+
+    expect(states.map(({ phase }) => phase).filter((p) => p !== "connecting")).toEqual([
+      "failed",
+      "superseded",
+    ]);
+  });
+
+  it("superseded is not delivered after close()", () => {
+    const states: RecoveryState[] = [];
+    const recovery = new RecoveryController({ onRetry: vi.fn(), onState: (state) => states.push(state) });
+
+    recovery.close();
+    recovery.superseded("taken over");
+
+    expect(states.map(({ phase }) => phase)).not.toContain("superseded");
+  });
+
   it("cancels pending recovery", () => {
     vi.useFakeTimers();
     const retry = vi.fn();

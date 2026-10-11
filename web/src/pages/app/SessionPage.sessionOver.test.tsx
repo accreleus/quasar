@@ -6,22 +6,24 @@
 // Real MicCapture and real input capture (jsdom has no Pointer Lock, so capture
 // runs in fallback mode); the transport, telemetry and HUD are doubles.
 
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionPage } from "./SessionPage";
 import { ApiError } from "../../api/client";
 import { ToastProvider } from "../../components/Toast";
 import { ThemeProvider } from "../../settings/ThemeContext";
+import { RecoveryController } from "../../webrtc/recovery";
 
 const getSession = vi.fn();
 vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
-  stopSession: vi.fn(),
+  stopSession: (...a: unknown[]) => stopSession(...a),
   mintSignalingToken: (...a: unknown[]) => mintSignalingToken(...a),
   updateSessionDisplay: vi.fn(),
 }));
 const mintSignalingToken = vi.fn();
+const stopSession = vi.fn();
 
 vi.mock("../../auth/context", () => ({ useAuth: () => ({ token: "t" }) }));
 
@@ -108,7 +110,14 @@ vi.mock("./hud/Hud", async () => {
     Hud: forwardRef((p: Record<string, unknown>, ref: React.Ref<unknown>) => {
       hud = p;
       useImperativeHandle(ref, () => ({ open: hudOpen, close() {}, stageClick() {} }));
-      return <div data-testid="hud" />;
+      // The real HUD's Exit session button is wired to onStop, which stops the server session.
+      return (
+        <div data-testid="hud">
+          <button type="button" onClick={p.onStop as () => void}>
+            Exit session
+          </button>
+        </div>
+      );
     }),
   };
 });
@@ -463,13 +472,48 @@ describe("SessionPage — a session that is over for this page draws no HUD (#52
     expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Back to library"]);
   });
 
-  it("taken over by another tab", async () => {
+  const TAKEN = "This session moved to another tab";
+  const onlyWayBack = async () => {
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Back to library"]);
+    fireEvent.click(screen.getByRole("button", { name: "Back to library" }));
+    await advance(100);
+    // The other tab owns the session: nothing here may stop it.
+    expect(stopSession).not.toHaveBeenCalled();
+  };
+
+  it("taken over by another tab, after the loader is gone: the notice and the way back, no HUD", async () => {
     currentSession = makeSession();
     renderPage();
     await advance(1_000);
     await openChannel();
+    await advance(3_000);
+    present();
     await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(100);
+    expect(screen.getByText(TAKEN)).not.toBeNull();
     gone();
+    await onlyWayBack();
+  });
+
+  it("taken over after signalling gave up with the channel open: the HUD goes, the notice replaces the recovery banner", async () => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await openChannel();
+    await advance(3_000);
+    refused();
+    const rc = new RecoveryController({ onRetry: () => {}, onState: (st) => lastOnRecovery?.(st as never) });
+    await act(async () => rc.terminal("signaling: session not found or already ended"));
+    await advance(100);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    present();
+
+    await act(async () => rc.superseded("opened in another tab"));
+    await advance(100);
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+    gone();
+    await onlyWayBack();
   });
 
   it("signalling gave up with the input channel open: still streaming, so the HUD stays", async () => {
@@ -483,5 +527,67 @@ describe("SessionPage — a session that is over for this page draws no HUD (#52
     await advance(100);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     present();
+  });
+});
+
+// #527 — a takeover that lands after the page already gave up on the transport.
+describe("SessionPage — a late takeover (#527)", () => {
+  const TAKEN = "This session moved to another tab";
+  const banners = () => document.querySelectorAll(".banner");
+  /** The real controller feeding the page, so `failed` -> `superseded` is the real sequence. */
+  const controller = () => new RecoveryController({ onRetry: () => {}, onState: (st) => lastOnRecovery?.(st as never) });
+
+  it("after signalling gave up with the channel open: mic and input are released and the takeover is the verdict", async () => {
+    await streamingWithMicAndCapture();
+    refused();
+    const rc = controller();
+    await act(async () => rc.terminal("signaling: session not found or already ended"));
+    await advance(100);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    stillLive();
+
+    await act(async () => rc.superseded("opened in another tab"));
+    await act(async () => rc.superseded("opened in another tab"));
+    await advance(100);
+
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+    expect(banners().length).toBe(1);
+    releasedAfterVerdict();
+  });
+
+  it("after a server verdict: the server's verdict stands", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+    await advance(5_500);
+    await act(async () => controller().superseded("opened in another tab"));
+
+    expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
+    expect(screen.queryByText(TAKEN)).toBeNull();
+    expect(banners().length).toBe(1);
+  });
+
+  it("a plain mid-stream takeover, loader already gone, shows the notice and a way back", async () => {
+    await streamingWithMicAndCapture();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(100);
+
+    expect(screen.getByText(TAKEN)).not.toBeNull();
+    expect(banners().length).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: "Back to library" }));
+    await advance(100);
+    expect(screen.queryByText(TAKEN)).toBeNull();
+  });
+
+  it("never leaves a terminal state with no notice: failed, then superseded", async () => {
+    await streamingWithMicAndCapture();
+    refused();
+    const rc = controller();
+    await act(async () => rc.terminal("Peer connection failed (DTLS)"));
+    await advance(100);
+    expect(banners().length).toBe(1);
+    await act(async () => rc.superseded("opened in another tab"));
+    await advance(100);
+    expect(banners().length).toBe(1);
   });
 });
