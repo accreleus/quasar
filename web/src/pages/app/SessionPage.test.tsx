@@ -1111,6 +1111,20 @@ describe("SessionPage — the loader's exit (#527)", () => {
     expect(screen.getByTestId("summary")).not.toBeNull();
   });
 
+  it("a revoked-access card only navigates: the control plane already stopped the session (#533)", async () => {
+    currentSession = makeSession({ state: "stopped", state_detail: "stop requested", stop_reason: "entitlement_revoked" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(document.querySelector(".sl-root")?.textContent).toContain("Your access to this app was removed");
+
+    await exitFromLoader();
+
+    expect(stopSession).not.toHaveBeenCalled();
+    expect(screen.getByTestId("summary")).not.toBeNull();
+  });
+
   it("any other failure card still stops the session", async () => {
     currentSession = makeSession({ state: "failed", state_detail: "boom", error_message: "boom" });
     renderPage();
