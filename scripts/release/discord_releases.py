@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Future-only Discord delivery; deployments persist at-most-once send claims."""
+"""Preview or manually post one structured announcement; never poll for releases."""
+import argparse
 import datetime as dt
+import hashlib
 import json
 import os
+from pathlib import Path
 import re
+import stat
 import sys
 import urllib.error
 import urllib.parse
@@ -12,8 +16,7 @@ import urllib.request
 REPO = 'accreleus/quasar'
 CHANNEL = '1545968515406630982'
 SERVER = '1545968231179624468'
-ENVIRONMENT = 'discord-announcements'
-TASK = 'discord-release-announcement'
+CUTOFF = '2026-10-11T04:03:05Z'
 
 
 class DeliveryError(Exception):
@@ -25,125 +28,160 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def request(url, method='GET', data=None, token=None):
-    headers = {'User-Agent': 'Quasar-release-announcer', 'Content-Type': 'application/json'}
-    if token:
-        headers.update({'Authorization': 'Bearer ' + token,
-                        'Accept': 'application/vnd.github+json',
-                        'X-GitHub-Api-Version': '2022-11-28'})
-    req = urllib.request.Request(url, method=method, headers=headers,
-                                 data=None if data is None else json.dumps(data).encode())
+def request(url, method='GET', data=None):
+    req = urllib.request.Request(url, method=method,
+        headers={'User-Agent': 'Quasar-release-announcer', 'Content-Type': 'application/json'},
+        data=None if data is None else json.dumps(data).encode())
     try:
         with urllib.request.build_opener(NoRedirect()).open(req, timeout=30) as response:
             return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Never log request URLs, response bodies, or exception text: webhook tokens
-        # can occur in all three. No automatic POST retries after ambiguous results.
-        raise DeliveryError('Remote API returned HTTP ' + str(exc.code)) from None
-    except (OSError, ValueError):
-        raise DeliveryError('Remote API response could not be confirmed') from None
+    except (urllib.error.HTTPError, OSError, ValueError):
+        # Exception text, URL and remote body may contain the private webhook token.
+        raise DeliveryError('Remote response could not be confirmed; no automatic retry') from None
 
 
-def timestamp(value):
-    parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
-    if parsed.tzinfo is None:
-        raise ValueError('Timestamp needs a timezone')
-    return parsed
+def text(data, name, maximum):
+    value = data.get(name)
+    if (not isinstance(value, str) or not value.strip() or len(value) > maximum
+            or any(ord(c) < 32 or 0xD800 <= ord(c) <= 0xDFFF for c in value)):
+        raise DeliveryError('Invalid announcement field: ' + name)
+    return value.strip()
 
 
-def eligible(release, cutoff):
-    return (not release.get('draft', True) and bool(release.get('published_at'))
-            and release.get('tag_name') != 'v0.4.0'
-            and timestamp(release['published_at']) > timestamp(cutoff))
+def message(data):
+    if not isinstance(data, dict):
+        raise DeliveryError('Expected an announcement object')
+    required = {'version', 'headline', 'summary', 'highlights', 'release_notes_url'}
+    if not required <= data.keys() or data.keys() - required - {'upgrade_note', 'prerelease'}:
+        raise DeliveryError('Unexpected or missing announcement fields')
+    version = text(data, 'version', 100)
+    if not re.fullmatch(r'[A-Za-z0-9._+-]{1,100}', version):
+        raise DeliveryError('Invalid release version')
+    url = text(data, 'release_notes_url', 250)
+    if url != f'https://github.com/{REPO}/releases/tag/{version}':
+        raise DeliveryError('Release URL must match the exact repository and version')
+    highlights = data['highlights']
+    if not isinstance(highlights, list) or not 1 <= len(highlights) <= 3:
+        raise DeliveryError('Provide one to three highlights')
+    bullets = [text({'highlight': value}, 'highlight', 200) for value in highlights]
+    preview = data.get('prerelease', False)
+    if not isinstance(preview, bool):
+        raise DeliveryError('prerelease must be boolean')
+    label = 'Preview release' if preview else 'Release'
+    content = (f'**Quasar {version} — {label}: {text(data, "headline", 100)}**\n\n'
+               + text(data, 'summary', 500) + '\n\n**What’s new**\n'
+               + '\n'.join('- ' + value for value in bullets))
+    if 'upgrade_note' in data:
+        content += '\n\n**Upgrading:** ' + text(data, 'upgrade_note', 300)
+    content += '\n\n**Full release notes:** ' + url
+    if len(content) > 2000:
+        raise DeliveryError('Announcement exceeds Discord message limit')
+    return {'content': content, 'allowed_mentions': {'parse': []}}
 
 
-def message(release):
-    url = release['html_url']
-    if not url.startswith('https://github.com/' + REPO + '/releases/tag/'):
-        raise DeliveryError('Unexpected release URL')
-    tag = release['tag_name']
-    if not re.fullmatch(r'[A-Za-z0-9._+-]{1,100}', tag):
-        raise DeliveryError('Unexpected release tag')
-    label = 'prerelease' if release.get('prerelease') else 'release'
-    return {'content': f'Quasar {tag} {label} is available.\n\nFull release notes: {url}',
-            'allowed_mentions': {'parse': []}}
+def private_file(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor) as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            raise DeliveryError('Webhook file must be owner-owned, regular, and mode 0600')
+        value = stream.read(8193).strip()
+    if not re.fullmatch(r'https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+', value):
+        raise DeliveryError('Invalid webhook credential file')
+    return value
 
 
-class Announcer:
-    def __init__(self, token, webhook, cutoff, api=request):
-        timestamp(cutoff)  # Refuse missing/malformed activation dates.
-        if not re.fullmatch(r'https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+', webhook):
-            raise DeliveryError('Expected a Discord webhook URL without query parameters')
-        self.token, self.webhook, self.cutoff, self.api = token, webhook, cutoff, api
+def state_directory(path):
+    path = Path(path)
+    path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    info = path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise DeliveryError('Receipt directory must be owner-owned and mode 0700')
+    return path
 
-    def github(self, path, method='GET', data=None):
-        return self.api('https://api.github.com/repos/' + REPO + path,
-                        method=method, data=data, token=self.token)
 
-    def pages(self, path):
-        separator = '&' if '?' in path else '?'
-        for page in range(1, 101):
-            rows = self.github(f'{path}{separator}per_page=100&page={page}')
-            yield from rows
-            if len(rows) < 100:
-                return
-        raise DeliveryError('Pagination limit exceeded; refusing an incomplete ledger')
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
-    def check_destination(self):
-        hook = self.api(self.webhook)
-        if str(hook.get('channel_id')) != CHANNEL or str(hook.get('guild_id')) != SERVER:
-            raise DeliveryError('Webhook destination does not match verified channel/server')
 
-    def deliver(self, release):
-        if not eligible(release, self.cutoff):
-            return 'historical-or-draft'
-        payload = message(release)
-        query = urllib.parse.urlencode({'environment': ENVIRONMENT, 'task': TASK})
-        records = self.pages('/deployments?' + query)
-        for record in records:
-            data = record.get('payload') or {}
-            if isinstance(data, str):
-                data = json.loads(data)
-            if data.get('release_id') == release['id'] and data.get('channel_id') == CHANNEL:
-                # ANY claim blocks automatic replay, including interrupted/failed runs.
-                return 'claimed'
-        self.check_destination()
-        claim = self.github('/deployments', 'POST', {
-            'ref': release['tag_name'], 'task': TASK, 'environment': ENVIRONMENT,
-            'auto_merge': False, 'required_contexts': [],
-            'production_environment': False, 'transient_environment': True,
-            'description': 'Discord release delivery claim',
-            'payload': {'release_id': release['id'], 'channel_id': CHANNEL}})
-        claim_id = claim['id']  # Must be confirmed before any Discord POST.
-        result = self.api(self.webhook + '?wait=true', method='POST', data=payload)
-        if str(result.get('channel_id')) != CHANNEL or not result.get('id'):
-            raise DeliveryError('Discord delivery acknowledgement could not be confirmed')
-        self.github(f'/deployments/{claim_id}/statuses', 'POST', {
-            'state': 'success', 'auto_inactive': False,
-            'description': 'Discord message ' + str(result['id']),
-            'environment_url': f'https://discord.com/channels/{SERVER}/{CHANNEL}/{result["id"]}'})
-        return 'sent'
+def send(data, webhook, state, api=request):
+    payload = message(data)
+    tag = data['version']
+    release = api(f'https://api.github.com/repos/{REPO}/releases/tags/'
+                  + urllib.parse.quote(tag, safe=''))
+    published = release.get('published_at')
+    if (release.get('tag_name') != tag or release.get('html_url') != data['release_notes_url']
+            or release.get('draft', True) or not published or tag == 'v0.4.0'
+            or dt.datetime.fromisoformat(published.replace('Z', '+00:00'))
+            <= dt.datetime.fromisoformat(CUTOFF.replace('Z', '+00:00'))):
+        raise DeliveryError('Release must match and be published after activation; no historical posts')
+    if bool(release.get('prerelease')) != data.get('prerelease', False):
+        raise DeliveryError('Announcement prerelease label does not match published release')
+    release_id = release.get('id')
+    if type(release_id) is not int or release_id <= 0:
+        raise DeliveryError('Invalid published release identity')
+    hook = api(webhook)
+    if str(hook.get('channel_id')) != CHANNEL or str(hook.get('guild_id')) != SERVER:
+        raise DeliveryError('Webhook destination does not match verified server/channel')
+    directory = state_directory(state)
+    receipt = directory / f'{release_id}-{CHANNEL}.json'
+    # Exclusive creation is the local inter-process claim. Persist before POST.
+    try:
+        descriptor = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        raise DeliveryError('Release already claimed; inspect Discord and receipt before reconciliation') from None
+    record = {'release_id': release_id, 'channel_id': CHANNEL, 'state': 'claimed',
+              'content_sha256': hashlib.sha256(payload['content'].encode()).hexdigest()}
+    with os.fdopen(descriptor, 'w') as stream:
+        json.dump(record, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    sync_directory(directory)
+    result = api(webhook + '?wait=true', method='POST', data=payload)
+    message_id = str(result.get('id', ''))
+    if str(result.get('channel_id')) != CHANNEL or not re.fullmatch(r'[0-9]+', message_id):
+        raise DeliveryError('Delivery acknowledgement uncertain; inspect Discord before reconciliation')
+    # If this status write fails, the durable claim still prevents blind replay.
+    record.update(state='sent', message_id=message_id)
+    descriptor = os.open(receipt, os.O_WRONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'w') as stream:
+        stream.seek(0)
+        json.dump(record, stream)
+        stream.truncate()
+        stream.flush()
+        os.fsync(stream.fileno())
+    return f'https://discord.com/channels/{SERVER}/{CHANNEL}/{message_id}'
 
-    def run(self):
-        releases = list(self.pages('/releases'))
-        for release in sorted(releases, key=lambda item: item.get('published_at') or ''):
-            outcome = self.deliver(release)
-            # IDs only; no credentials or uncontrolled release text in logs.
-            print('release_id=' + str(release['id']) + ' outcome=' + outcome)
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--announcement', type=Path, required=True)
+    parser.add_argument('--send', action='store_true', help='Explicitly post; default is offline preview')
+    parser.add_argument('--webhook-file', type=Path,
+                        default=Path.home() / '.config/quasar/discord-webhook-url')
+    parser.add_argument('--state-dir', type=Path,
+                        default=Path.home() / '.local/state/quasar-discord-announcements')
+    args = parser.parse_args()
+    try:
+        with args.announcement.open() as stream:
+            data = json.load(stream)
+        if args.send:
+            print('Posted: ' + send(data, private_file(args.webhook_file), args.state_dir))
+        else:
+            print(message(data)['content'])
+            print('\nPreview only; no credential read, network request, or receipt created.')
+        return 0
+    except (DeliveryError, OSError, ValueError, KeyError, TypeError):
+        print('Announcement stopped. Check inputs, private configuration, and delivery receipt; '
+              'do not blindly retry. No credentials or remote response bodies logged.', file=sys.stderr)
+        return 1
 
 
 if __name__ == '__main__':
-    try:
-        announcer = Announcer(os.environ['GITHUB_TOKEN'], os.environ['DISCORD_RELEASE_WEBHOOK_URL'],
-                              os.environ['DISCORD_RELEASES_ENABLED_AFTER'])
-        if sys.argv[1:] == ['--check-config']:
-            announcer.check_destination()
-            print('Webhook destination verified; no message sent or receipt created.')
-        elif not sys.argv[1:]:
-            announcer.run()
-        else:
-            raise DeliveryError('Unexpected command arguments')
-    except (DeliveryError, ValueError, KeyError, TypeError):
-        print('Release announcement stopped; inspect delivery claims before retrying. '
-              'No credentials or remote response bodies were logged.', file=sys.stderr)
-        sys.exit(1)
+    sys.exit(main())

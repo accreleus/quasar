@@ -1,49 +1,65 @@
-# Discord release announcements
+# Manual Discord release announcements
 
-`Discord releases` posts a concise version and release-notes link for future published
-Quasar releases, including labeled prereleases. It never mentions users or roles and
-never cross-publishes to servers following the announcement channel.
+Release agents invoke `quasar-release-announcement` to draft a structured announcement,
+preview it locally, show the full rendered text and ask for explicit approval of that exact announcement,
+then call `scripts/release/discord_releases.py` directly after approval. There is no posting workflow, schedule, release trigger or GitHub secret
+handoff at runtime. CI runs only mocked script tests.
 
-## Configuration
+## Inputs and preview
 
-- Create a channel-scoped Discord incoming webhook for the intended announcements channel.
-- Store its private URL directly in the GitHub repository Actions secret
-  `DISCORD_RELEASE_WEBHOOK_URL`. Never put the URL in source, issue text, or logs.
-- Set repository Actions variable `DISCORD_RELEASES_ENABLED_AFTER` to the UTC activation
-  time (`YYYY-MM-DDTHH:MM:SSZ`). Without this variable, the posting job is disabled.
-- The script verifies the webhook's server and channel against its explicit destination
-  constants. A mismatch stops delivery.
+Write a temporary JSON file outside the checkout with `version`, `headline`, `summary`,
+`highlights` (one to three), and `release_notes_url`. Optional inputs are `prerelease`
+(boolean) and `upgrade_note`. The skill describes field limits and writing guidance.
 
-Published-release events trigger prompt checks. An hourly scheduled check catches releases
-created by the Images workflow's `GITHUB_TOKEN`, which do not start separate release-event
-workflows. Scheduled runs can be delayed by GitHub. Releases published at or before the
-activation timestamp, drafts, and the previously announced v0.4.0 are excluded.
+```sh
+python3 scripts/release/discord_releases.py --announcement /tmp/quasar-announcement.json
+```
 
-A manual workflow run first performs `--check-config`: a read-only webhook GET that verifies
-credentials and destination without sending a message or creating a receipt. The subsequent
-scan sends only eligible future releases. Check the activation timestamp and published
-releases before using a manual run as a no-post verification.
+The default is an offline preview: no secret read, network call or receipt. No announcement
+text is committed or added to the GitHub release body. The output includes a headline,
+summary, highlights, optional upgrade note, and final full-release-notes link.
 
-## Delivery receipts and failure recovery
+## Private setup and posting
 
-The workflow uses `contents: read` and `deployments: write`. It creates delivery receipts
-with task `discord-release-announcement` in environment `discord-announcements`, containing
-only the release ID and channel ID. These records do not deploy Quasar, merge refs, or modify
-release notes. They must be retained to preserve duplicate-delivery protection.
+On the designated posting machine, the operator securely places the existing Discord
+webhook URL in `~/.config/quasar/discord-webhook-url`, owned by the operator with mode 0600.
+Do not place it in this repository, a skill file, a command argument, shell history, chat
+or logs. The GitHub Actions secret cannot be read back; transfer the existing URL directly
+from Discord using a private local editor or secret-management interface. Never have an
+agent print or inspect its value. No new webhook needs to be created.
 
-A single concurrency group serializes runs. A receipt is claimed before the Discord POST;
-any existing claim blocks automatic replay, even if a run failed or was interrupted.
-Successful acknowledgements add a status with the Discord message link. No POST is retried
-automatically after an uncertain result. This favors avoiding duplicates over automatic
-recovery: a crash after the claim but before sending can leave an unsent announcement.
+```sh
+python3 scripts/release/discord_releases.py --announcement /tmp/quasar-announcement.json --send
+```
 
-For an interrupted or failed run, inspect the matching receipt and Discord channel before
-reconciliation. Never blindly delete receipts or repeat a POST. Do not run parallel script
-copies outside the workflow's concurrency group. Disable delivery by removing the activation
-variable or disabling the workflow; revoke the Discord webhook if its URL is compromised.
+Optional `--webhook-file` selects an owner-owned 0600 regular file; symlinks are refused.
+The script reads the public release by exact tag, verifies publication/URL/prerelease,
+and checks the webhook guild/channel before posting. Historical releases before the
+original activation time (2026-10-11T04:03:05Z), drafts and v0.4.0 are refused. Pings are
+always disabled. It does not cross-publish to servers following the announcement channel.
+
+## Receipts and recovery
+
+Use one posting machine/operator account and persistent receipt directory. The default is
+`~/.local/state/quasar-discord-announcements`, mode 0700. `--state-dir` is available for a
+single centrally chosen location, not as a retry bypass. Different machines/accounts do
+not share duplicate protection. Preserve and securely migrate this directory when changing
+the posting machine. Local processes share atomic exclusive claim creation.
+
+Before any Discord POST, the script writes and fsyncs a mode-0600 receipt keyed by release
+ID and channel. A claim remains even after a crash/timeout, preventing automatic replay.
+A confirmed response adds the message ID and returns its Discord link. It never trusts
+GitHub deployment records, creates deployments or needs GitHub write access, eliminating
+the forged-deployment-claim issue. Webhook rotation does not invalidate local receipts.
+
+If sending or acknowledgement fails, inspect Discord and the local receipt before manual
+reconciliation. Do not blindly retry, delete claims, change accounts/directories or use a
+second machine. A crash after claiming but before posting can leave an unsent announcement;
+this favors avoiding duplicates over automatic recovery. No live test message is authorized
+by setup or preview alone. Revoking the webhook stops all direct posting.
 
 ## Tests
 
-Run `python3 -m unittest discover -s scripts/release -p test_discord_releases.py -v` and
-`actionlint .github/workflows/discord-releases.yml .github/workflows/ci.yml`.
-The unit tests mock all external APIs; they send no Discord messages and create no receipts.
+`python3 -m unittest discover -s scripts/release -p test_discord_releases.py -v`
+
+All external calls are mocked; tests send no Discord messages. Test receipts are temporary.
