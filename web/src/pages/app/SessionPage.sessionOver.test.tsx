@@ -677,3 +677,72 @@ describe("SessionPage — a held verdict is the only banner (#529)", () => {
     expect(screen.queryByText(/Now playing/)).toBeNull();
   });
 });
+
+// #449 — an app that exits before its first frame closes the session; the page sees
+// the transport die and a 409 on the replacement mint, which is not a network fault.
+describe("SessionPage — an app that exits early is not a network problem (#449)", () => {
+  const APP_EXIT = "The app exited before producing any video";
+  const NETWORK = "Could not reach the stream";
+  const exited = () =>
+    makeSession({
+      state: "failed",
+      state_detail: "app booting",
+      failure_code: "app_exited_early",
+      error_message: "the app exited with code 1 before producing any video.",
+      app_log_tail: "Vulkan loader failed",
+    });
+  const bootingPage = async () => {
+    currentSession = makeSession({ state: "running", state_detail: "app booting" });
+    renderPage();
+    await advance(1_000);
+  };
+  const mintRefused = async () => {
+    refused();
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+  };
+
+  it("the refused mint lands first, then the session reads failed: the app-exit card replaces the guess", async () => {
+    await bootingPage();
+    await mintRefused();
+    expect(screen.getByText(NETWORK)).not.toBeNull();
+
+    currentSession = exited();
+    await advance(1_500);
+
+    expect(screen.getByText(APP_EXIT)).not.toBeNull();
+    expect(screen.getByText(/exited with code 1/)).not.toBeNull();
+    expect(screen.queryByText(NETWORK)).toBeNull();
+  });
+
+  it("the refused mint lands first and the reason poll it triggers already reads failed", async () => {
+    await bootingPage();
+    currentSession = exited();
+    // No launch-poll tick falls inside this window: only pollEndReason can deliver the verdict.
+    await mintRefused();
+
+    expect(screen.getByText(APP_EXIT)).not.toBeNull();
+    expect(screen.queryByText(NETWORK)).toBeNull();
+  });
+
+  it("the poll reads failed first, then the mint is refused: the verdict stands", async () => {
+    await bootingPage();
+    currentSession = exited();
+    await advance(1_500);
+    expect(screen.getByText(APP_EXIT)).not.toBeNull();
+
+    await mintRefused();
+
+    expect(screen.getByText(APP_EXIT)).not.toBeNull();
+    expect(screen.queryByText(NETWORK)).toBeNull();
+  });
+
+  it("a session still running when the mint is refused keeps the network card", async () => {
+    await bootingPage();
+    await mintRefused();
+    await advance(3_000);
+
+    expect(screen.getByText(NETWORK)).not.toBeNull();
+    expect(screen.queryByText(APP_EXIT)).toBeNull();
+  });
+});

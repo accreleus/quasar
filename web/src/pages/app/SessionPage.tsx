@@ -47,7 +47,7 @@ import {
   SessionBannerHost,
 } from "./sessionAlerts";
 import { SessionLoader } from "./SessionLoader";
-import { accessRevokedFailure, takenOverFailure, unreachableFailure } from "./sessionFailure";
+import { accessRevokedFailure, settleFailure, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
@@ -403,15 +403,13 @@ export function SessionPage() {
         // A refused mint (409) is how a session the control plane stopped
         // looks from here, so ask it why before settling on "unreachable".
         onReconnectFailed: (detail) => {
-          setLaunchFailure((prev) => prev ?? unreachableFailure(detail));
+          setLaunchFailure((prev) => settleFailure(prev, unreachableFailure(detail)));
           void pollEndReason();
         },
         // #526: another attach won this session. Terminal HERE only — the
         // session and the app are still running, in the tab that took it. The
         // page states it and stops; it must not re-mint (sessionRuntime L6).
-        // Replaces our own guess ("unreachable"), never a server-authored verdict.
-        onSessionTakenOver: () =>
-          setLaunchFailure((prev) => (prev && prev.kind !== "unreachable" ? prev : takenOverFailure())),
+        onSessionTakenOver: () => setLaunchFailure((prev) => settleFailure(prev, takenOverFailure())),
       },
     });
     runtimeRef.current = rt;
