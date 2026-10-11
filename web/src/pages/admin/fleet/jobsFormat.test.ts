@@ -155,9 +155,24 @@ describe("summaryText", () => {
 });
 
 describe("patchErrorMessage", () => {
-  it("names the source that pins the interval", () => {
+  it("names an ordinary env var and says to unset it", () => {
+    expect(patchErrorMessage("schedule_locked", "fallback", "QUASAR_ARTWORK_SWEEP_INTERVAL")).toBe(
+      "QUASAR_ARTWORK_SWEEP_INTERVAL sets this job's interval. Unset it to edit the interval here.",
+    );
+  });
+
+  it("sends the Libraries interval to its screen, with or without the env var", () => {
+    expect(
+      patchErrorMessage("schedule_locked", "fallback", "instance_settings.library_discovery_interval_minutes"),
+    ).toBe("Settings ▸ Libraries ▸ Scan interval sets this job's interval. Change it there.");
     expect(patchErrorMessage("schedule_locked", "fallback", "QUASAR_LIBRARY_SCAN_INTERVAL")).toBe(
-      "QUASAR_LIBRARY_SCAN_INTERVAL sets this job's interval. Unset it to edit the interval here.",
+      "QUASAR_LIBRARY_SCAN_INTERVAL sets this job's interval. Unset it to use Settings ▸ Libraries ▸ Scan interval.",
+    );
+  });
+
+  it("keeps an unknown non-env owner's raw name", () => {
+    expect(patchErrorMessage("schedule_locked", "fallback", "instance_settings.other")).toBe(
+      "instance_settings.other sets this job's interval. Change it there, not here.",
     );
   });
 

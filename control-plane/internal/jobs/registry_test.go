@@ -11,6 +11,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func okDef() Definition {
@@ -140,5 +141,25 @@ func TestEmptyRegistryIsValid(t *testing.T) {
 	r := NewRegistry()
 	if len(r.All()) != 0 || len(r.IDs()) != 0 {
 		t.Fatal("a fresh registry is not empty")
+	}
+}
+
+func TestRegisterRefusesAnIntervalSourceWithoutAnOwnerToName(t *testing.T) {
+	src := func(context.Context) (time.Duration, bool, error) { return time.Hour, false, nil }
+	for name, mut := range map[string]func(*Definition){
+		"no owner": func(d *Definition) { d.IntervalOwner = ""; d.IntervalOwnerHint = "Settings" },
+		"no hint":  func(d *Definition) { d.IntervalOwner = "instance_settings.x"; d.IntervalOwnerHint = "" },
+	} {
+		d := okDef()
+		d.IntervalSource = src
+		mut(&d)
+		if err := NewRegistry().Register(d); err == nil {
+			t.Errorf("%s: a source with nobody to name must be refused: the 409 would start with a blank", name)
+		}
+	}
+	d := okDef()
+	d.IntervalSource, d.IntervalOwner, d.IntervalOwnerHint = src, "instance_settings.x", "Settings"
+	if err := NewRegistry().Register(d); err != nil {
+		t.Fatalf("register: %v", err)
 	}
 }
