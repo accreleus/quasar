@@ -487,19 +487,20 @@ fn stop_crash_loop(ctx: &Ctx) -> String {
     "a crash-looping service stopped stays down".into()
 }
 
-/// The engine runs a service's own healthcheck, both ways.
+/// The engine runs a service's own healthcheck, both ways and in both forms: exec with
+/// arguments, as the control-plane recipe's, and shell, as Postgres's.
 fn health(ctx: &Ctx) -> String {
-    let check = |test: &str| Healthcheck {
-        test: vec!["CMD-SHELL".into(), test.into()],
+    let check = |test: &[&str]| Healthcheck {
+        test: test.iter().map(|s| s.to_string()).collect(),
         interval_s: 1,
         timeout_s: 2,
         retries: 2,
         start_period_s: 0,
     };
     let mut good = ctx.service("healthy", "touch /tmp/suite-ready; exec sleep 300");
-    good.healthcheck = Some(check("test -f /tmp/suite-ready"));
+    good.healthcheck = Some(check(&["CMD", "test", "-f", "/tmp/suite-ready"]));
     let mut bad = ctx.service("unhealthy", "exec sleep 300");
-    bad.healthcheck = Some(check("test -f /tmp/never-there"));
+    bad.healthcheck = Some(check(&["CMD-SHELL", "test -f /tmp/never-there"]));
     let (good, bad) = (ctx.create(good), ctx.create(bad));
     ctx.start(&good);
     ctx.start(&bad);

@@ -26,7 +26,7 @@ reported as a skip with its reason, never counted as a pass). The mode table is
 | `cdi` | The engine injects NVIDIA through CDI (D10), and the app user opens what encode and render use: `/dev/nvidiactl`, `/dev/nvidia-uvm` and each `/dev/nvidiaN`. Other nodes a CDI specification lists may be withheld by host policy. | `cdi` |
 | `restart` | An `unless-stopped` service comes back after it exits, and a running one that is stopped stays down. | |
 | `stop-crash-loop` | A crash-looping `unless-stopped` service that is stopped stays down. Podman does not record a stop that finds it between two runs, so the runtime reads every stop back and makes it hold (#425). | |
-| `health` | The engine runs a service's own healthcheck, to `healthy` and to `unhealthy`. | `health` |
+| `health` | The engine runs a service's own healthcheck, to `healthy` (exec form) and to `unhealthy` (shell form). | `health` |
 | `removal` | A running service is removed; a volume in use refuses removal (`Busy`), outlives its container and is then removed; removing what is gone is not an error. | |
 | `errors` | A missing image is refused with a named error on both lifecycles and leaves nothing behind. | |
 | `missing-bind-source` | A typed bind whose source is missing is refused, the source is not created on the host, and nothing is left. | |

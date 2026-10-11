@@ -16,7 +16,7 @@ use quasar_recovery::engine::{
     Image, PlatformEngine, RestartPolicy, When,
 };
 use quasar_recovery::journal::Phase;
-use quasar_recovery::recipe::names;
+use quasar_recovery::recipe::{names, Book, Role};
 use quasar_recovery::restore::{self, RestorePhase};
 use quasar_recovery::seed::Outcome;
 use quasar_recovery::socket::{
@@ -177,7 +177,11 @@ struct Machine {
 impl Machine {
     /// Installed the documented way: the seed, then its actor's first `resume`.
     fn install(env: BTreeMap<String, String>, healthy: bool) -> Machine {
-        let engine = Arc::new(FakeEngine::new(control_host(env, healthy)));
+        Machine::install_on(control_host(env, healthy))
+    }
+
+    fn install_on(host: FakeState) -> Machine {
+        let engine = Arc::new(FakeEngine::new(host));
         let dir = tempfile::tempdir().unwrap();
         let sockets = tempfile::tempdir().unwrap();
         let created = seed(&engine, dir.path(), SEED_ID).step();
@@ -591,6 +595,41 @@ fn restore_loads_the_dump_and_starts_the_control_plane_it_was_taken_under() {
     let settled = m.engine.state().by_name();
     m.actor().resume().unwrap();
     assert_eq!(m.engine.state().by_name(), settled);
+}
+
+/// Podman keeps no healthcheck of an OCI image (#543), and a control plane must pass one to
+/// be verified: its recipe carries the check, so install, update and restore still see it.
+#[test]
+fn a_control_plane_passes_its_health_gates_on_an_engine_that_drops_the_images_healthcheck() {
+    let newest = Book::window(Role::ControlPlane).unwrap().end().to_string();
+    let mut host = control_host(combined_env(), true);
+    host.image_healthchecks_dropped = true;
+    for image in host.registry.values_mut() {
+        if image.labels.contains_key("org.quasar.schema.version") {
+            image
+                .labels
+                .insert("org.quasar.recipe".into(), newest.clone());
+        }
+    }
+    let m = Machine::install_on(host);
+    assert_eq!(
+        m.control_plane().health.as_deref(),
+        Some("healthy"),
+        "installed"
+    );
+
+    let updated = apply(&m.actor(), update(ID, 81));
+    assert_eq!(updated.state, State::Succeeded, "{updated:?}");
+    assert_eq!(m.control_plane().spec.image, control_image(81));
+
+    let dump = updated.dump.clone().unwrap();
+    let restored = run_restore(
+        &m.actor(),
+        restore_request(&nth_id(9), Some(&dump), Some("0.80.0")),
+    );
+    assert_eq!(restored.state, State::Succeeded, "{restored:?}");
+    assert_eq!(m.control_plane().spec.image, control_image(OLD_SCHEMA));
+    assert_eq!(m.control_plane().health.as_deref(), Some("healthy"));
 }
 
 #[test]

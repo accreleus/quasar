@@ -78,7 +78,8 @@ volume that must never be deleted**. Nothing reads or writes a Compose file or a
 
 An update is a **replacement**: the actor pulls the new image by digest, stops the old
 container and **keeps** it (renamed `<name>.kept`, its restart policy disabled), starts the new
-one and verifies it (running, and healthy if the image has a health check). A verified
+one and verifies it (running, and healthy if it has a health check; a control plane must
+report healthy). A verified
 container replaces the kept one; one that does not verify is removed and the kept one started
 again, with no pull (ADR 0004). An attempt may replace several services, and the recovery actor
 always **moves first**: it replaces itself by handing over to a successor, which must verify
