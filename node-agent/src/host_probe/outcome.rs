@@ -132,24 +132,16 @@ pub fn remediation(kind: ProbeKind) -> String {
     }
 }
 
-/// The fix for an NVIDIA Vulkan failure seen by the application-GPU probe.
-/// `modeset_absent`: the container had no `/dev/nvidia-modeset`.
-pub fn vulkan_remediation(modeset_absent: bool) -> String {
-    if modeset_absent {
-        "The container was not given /dev/nvidia-modeset, which the NVIDIA Vulkan driver \
-         cannot start without. On the host run `sudo nvidia-modprobe -m`; when the host uses a \
-         CDI spec, regenerate it (`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`, \
-         or your driver plugin's own generator). Then restart the agent container to re-run \
-         this check. Repeat after any boot that creates the spec before the node exists \
-         (docs: Install, NVIDIA)."
-            .into()
-    } else {
-        "A container on this host cannot create a Vulkan device from the NVIDIA driver. Run \
-         `vulkaninfo --summary` in a container given the same GPU access, check `nvidia-ctk cdi \
-         list` names the GPU and the driver_volume_version check, then restart the agent \
-         container to re-run this check (docs: Install, NVIDIA)."
-            .into()
-    }
+/// The fix for the application-GPU probe's Vulkan fail (#449): the container was not given
+/// `/dev/nvidia-modeset`.
+pub fn vulkan_remediation() -> String {
+    "The container was not given /dev/nvidia-modeset, which the NVIDIA Vulkan driver cannot \
+     start without. On the host run `sudo nvidia-modprobe -m`; when the host uses a CDI spec, \
+     regenerate it (`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`, or your \
+     driver plugin's own generator). Then restart the agent container to re-run this check. \
+     Repeat after any boot that creates the spec before the node exists (docs: Install, \
+     NVIDIA)."
+        .into()
 }
 
 /// [`remediation`] for the target's kind, except a codec probe. A codec probe's fail is

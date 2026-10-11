@@ -67,8 +67,8 @@ sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 ```
 
 Then restart the Quasar agent container. It worked when the **application GPU
-probe** check for your GPU is green; a container without the node shows there as a
-failure that names `/dev/nvidia-modeset`.
+probe** check for your GPU is green. The check fails when a container is not given
+`/dev/nvidia-modeset` and Vulkan does not start; it does not detect other Vulkan faults.
 
 ## Rootless Docker or Podman
 

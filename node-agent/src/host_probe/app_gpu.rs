@@ -114,19 +114,11 @@ pub fn outcome(target: ProbeTarget, end: &ContainerProbeEnd) -> ProbeOutcome {
                     VulkanProbe::Ok { driver } => ProbeOutcome::Pass {
                         summary: format!("{passed}: {loaded}; Vulkan: NVIDIA {driver}"),
                     },
-                    VulkanProbe::Broken {
-                        detail,
-                        modeset_absent,
-                    } => ProbeOutcome::Fail {
+                    VulkanProbe::Broken { detail } => ProbeOutcome::Fail {
                         summary: format!(
-                            "{failed}: EGL opens it but Vulkan does not: {detail}{}",
-                            if modeset_absent {
-                                " (the container was not given /dev/nvidia-modeset)"
-                            } else {
-                                ""
-                            }
+                            "{failed}: EGL opens it but Vulkan does not: {detail}, and the container was not given /dev/nvidia-modeset"
                         ),
-                        remediation: vulkan_remediation(modeset_absent),
+                        remediation: vulkan_remediation(),
                     },
                     VulkanProbe::Indeterminate { detail } => ProbeOutcome::Indeterminate {
                         reason: format!("The Vulkan step of the host probe of {exercising}: {detail}"),
@@ -278,27 +270,6 @@ mod tests {
     }
 
     #[test]
-    fn a_vulkan_failure_with_the_modeset_node_present_gets_the_generic_remediation() {
-        let e = with_vulkan(
-            "NVIDIA_MODESET_NODE=present\nVULKAN_ERROR=the Vulkan loader lists no NVIDIA device\n",
-        );
-        match outcome(target(), &e) {
-            ProbeOutcome::Fail {
-                summary,
-                remediation,
-            } => {
-                assert!(!summary.contains("/dev/nvidia-modeset"), "{summary}");
-                assert!(!remediation.contains("nvidia-modprobe"), "{remediation}");
-                assert!(
-                    remediation.contains("vulkaninfo --summary"),
-                    "{remediation}"
-                );
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
     fn an_unavailable_vulkan_step_is_indeterminate_never_a_fail() {
         for lines in [
             "NVIDIA_MODESET_NODE=absent\nVULKAN_UNAVAILABLE=vulkaninfo did not run (absent, or past its deadline)\n",
@@ -311,31 +282,71 @@ mod tests {
         }
     }
 
+    /// The probe's stdout for a `vulkaninfo` run, built by the self-test's own classifier.
+    fn selftest_stdout(modeset_absent: bool, signal: Option<i32>, code: Option<i32>) -> String {
+        let lines = crate::nvidia_volume::vulkan_selftest_lines(
+            modeset_absent,
+            Some((String::new(), code, signal)),
+        );
+        format!(
+            "{EGL_OPENED}NVIDIA_MODESET_NODE={}\n{}\n",
+            if modeset_absent { "absent" } else { "present" },
+            lines.join("\n")
+        )
+    }
+
+    fn outcome_of(stdout: &str) -> ProbeOutcome {
+        outcome(target(), &end(exited(Some(0), stdout, ""), true))
+    }
+
     #[test]
-    fn a_vulkaninfo_that_was_killed_not_crashed_is_indeterminate_through_to_the_outcome() {
-        use crate::nvidia_volume::VulkanStep;
-        // The self-test's own output for each signal, as the probe reads it.
-        let stdout = |signal: i32| {
-            let lines = crate::nvidia_volume::vulkan_selftest_lines(
-                VulkanStep::Own,
-                true,
-                true,
-                Some((String::new(), None, Some(signal))),
-            );
-            format!(
-                "{EGL_OPENED}NVIDIA_MODESET_NODE=absent\n{}\n",
-                lines.join("\n")
-            )
-        };
-        for signal in [libc::SIGKILL, libc::SIGTERM] {
-            let e = end(exited(Some(0), &stdout(signal), ""), true);
+    fn a_vulkan_failure_blocks_only_when_the_modeset_node_is_absent() {
+        for (signal, code) in [
+            (Some(libc::SIGSEGV), None),
+            (None, Some(1)),
+            (None, Some(0)),
+        ] {
             assert!(
-                matches!(outcome(target(), &e), ProbeOutcome::Indeterminate { .. }),
+                matches!(
+                    outcome_of(&selftest_stdout(true, signal, code)),
+                    ProbeOutcome::Fail { .. }
+                ),
+                "{signal:?} {code:?}"
+            );
+            match outcome_of(&selftest_stdout(false, signal, code)) {
+                ProbeOutcome::Indeterminate { reason } => {
+                    assert!(
+                        reason.contains("/dev/nvidia-modeset is present"),
+                        "{reason}"
+                    )
+                }
+                other => panic!("{signal:?} {code:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_vulkaninfo_that_was_killed_not_crashed_is_indeterminate_even_without_the_node() {
+        for signal in [libc::SIGKILL, libc::SIGTERM] {
+            assert!(
+                matches!(
+                    outcome_of(&selftest_stdout(true, Some(signal), None)),
+                    ProbeOutcome::Indeterminate { .. }
+                ),
                 "{signal}"
             );
         }
-        let e = end(exited(Some(0), &stdout(libc::SIGSEGV), ""), true);
-        assert!(matches!(outcome(target(), &e), ProbeOutcome::Fail { .. }));
+    }
+
+    #[test]
+    fn a_working_nvidia_device_passes_in_both_node_states() {
+        for node in ["absent", "present"] {
+            let out = format!("{EGL_OPENED}NVIDIA_MODESET_NODE={node}\nVULKAN_NVIDIA=615.78.08\n");
+            assert!(
+                matches!(outcome_of(&out), ProbeOutcome::Pass { .. }),
+                "{node}"
+            );
+        }
     }
 
     #[test]
