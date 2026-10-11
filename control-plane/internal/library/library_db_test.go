@@ -2196,3 +2196,42 @@ func TestLibraryStatusRecentScans(t *testing.T) {
 		t.Errorf("failed entry counts = %+v, want every count 0", gotFailed)
 	}
 }
+
+// A failed scan's log line carries the failure class only; the scan row keeps the agent's
+// text exactly.
+func TestFailedScanLogsTheClassAndStoresTheFullText(t *testing.T) {
+	pool := testDB(t)
+	f := newFixture(t, pool)
+	var logs bytes.Buffer
+	set := &fakeSettings{enabled: true}
+	h := NewHandler(f.store, testStorageManager(f, set), set, NewAppDetails(false, quietLogger()),
+		newTestResolver(set), slog.New(slog.NewTextHandler(&logs, nil)))
+	mux := http.NewServeMux()
+	h.Register(mux, func(next http.Handler) http.Handler { return next })
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	scan := f.claimedScan(t, f.user)
+	full := "manifest /homes/opaque-a/games/BaldursGate3/steamapps/appmanifest_730.acf is not valid UTF-8"
+	resp := agentReq(t, "POST", srv.URL+"/v1/agent/library/scan-report", f.nodeName, f.secret,
+		ScanReport{ScanID: scan, OK: false, Error: full})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("scan-report = %d, want 200", resp.StatusCode)
+	}
+
+	var stored string
+	must(t, pool.QueryRow(context.Background(), `SELECT error FROM library_scans WHERE id::text = $1`, scan).Scan(&stored))
+	if stored != full {
+		t.Errorf("stored error = %q, want the agent's text %q", stored, full)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, `cause="manifest not valid UTF-8"`) {
+		t.Errorf("want a WARN scan-failure line with the class, got %q", out)
+	}
+	for _, leak := range []string{"homes", "BaldursGate3", "730", "appmanifest"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("log carries %q: %q", leak, out)
+		}
+	}
+}
