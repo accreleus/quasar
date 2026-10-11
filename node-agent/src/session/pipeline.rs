@@ -1102,6 +1102,9 @@ pub(crate) fn interpipe_available() -> bool {
 }
 
 #[cfg(test)]
+mod takeover_tests;
+
+#[cfg(test)]
 mod source_interpipe_tests {
     use super::build_source_interpipe_sink;
     use gstreamer::prelude::*;
