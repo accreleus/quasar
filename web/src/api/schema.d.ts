@@ -7446,7 +7446,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description job_unmanaged (not adopted) or schedule_locked (an env var is authoritative). */
+                /** @description job_unmanaged (not adopted) or schedule_locked (an env var is authoritative, or `library.discovery`'s `interval_secs` differs from the period it reports: amendment 28). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -11418,7 +11418,7 @@ export interface components {
             window_days: number[];
             /** @description IANA zone name; windows are evaluated in it. Intervals are NOT: an interval is a duration in absolute time and has no opinion about the clock on the wall, so a DST transition can shift when a windowed run lands but can never lengthen an interval. */
             timezone: string;
-            /** @description True when an environment variable is authoritative over this job's interval, and, for `library.discovery`, whenever its interval is not writable here, which is always (amendment 28). The env override stays the winner (the pre-existing documented behaviour of knobs like QUASAR_LIBRARY_SCAN_INTERVAL); the API says so rather than silently accepting an edit the environment will overrule - a PATCH of interval_secs on a locked job is 409 schedule_locked. */
+            /** @description True when an environment variable is authoritative over this job's interval, and, for `library.discovery`, whenever its interval is not writable here, which is always (amendment 28). The env override stays the winner (the pre-existing documented behaviour of knobs like QUASAR_LIBRARY_SCAN_INTERVAL); the API says so rather than silently accepting an edit the environment will overrule - a PATCH of interval_secs on a locked job is 409 schedule_locked (for `library.discovery`, a value equal to the reported interval_secs is accepted and not stored, and only a different value is 409 schedule_locked: amendment 28). */
             locked: boolean;
             /** @description The authority that is in force: the environment variable, e.g. "QUASAR_LIBRARY_SCAN_INTERVAL", or, for `library.discovery` when that override is not set, `instance_settings.library_discovery_interval_minutes` (amendment 28). Null when not locked. */
             locked_by: string | null;
