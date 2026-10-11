@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // CreateParams are the resolved inputs to a launch: the owner, the app, the
@@ -184,19 +185,27 @@ func (s *Store) ScheduleAndCreate(ctx context.Context, p CreateParams) (Session,
 	}
 }
 
-// schedulePlacement retries scheduleAttempt under same-GPU contention.
+// schedulePlacement retries scheduleAttempt under same-GPU contention, and when
+// an attempt loses a deadlock (#553).
 func (s *Store) schedulePlacement(ctx context.Context, p CreateParams) (Session, error) {
 	for attempt := 0; attempt < maxPlacementAttempts; attempt++ {
 		if attemptObserver != nil {
 			attemptObserver(attempt)
 		}
 		sess, retry, err := s.scheduleAttempt(ctx, p)
+		// Whichever statement lost the deadlock, the attempt never committed and
+		// its rollback broke the cycle. An attempt must keep every effect inside
+		// its transaction for this retry to be safe.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+			continue
+		}
 		if !retry {
 			return sess, err
 		}
 	}
-	// Retry budget exhausted under sustained same-GPU contention: report the
-	// retryable "busy" code.
+	// Retry budget exhausted under sustained contention: report the retryable
+	// "busy" code.
 	return Session{}, withCodecConstraint(p, ErrCapacityExhausted)
 }
 

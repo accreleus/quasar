@@ -1030,3 +1030,43 @@ describe("SessionPage — the reveal waits for a verdict only the loader can sho
     expect(banners().length).toBe(1);
   });
 });
+
+describe("SessionPage — a verdict that lands inside the reveal is on screen when the loader goes inert (#533)", () => {
+  const LOCK_MS = 1_180;
+  const banners = () => document.querySelectorAll(".banner");
+
+  it.each([
+    ["a takeover", { kind: "recovery" }, "This session moved to another tab"],
+    ["a revoked access", { kind: "session" }, "Your access to this app was removed"],
+  ])("%s: the banner replaces the loader's card at the lock, before the loader is removed", async (_name, how, title) => {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await act(async () => lastOnChannel?.({ readyState: "open", onclose: null, send() {}, bufferedAmount: 0 }));
+    await advance(300);
+    expect(document.querySelector(".sl-root")?.className).toContain("is-locking");
+    if (how.kind === "recovery") {
+      await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    } else {
+      currentSession = makeSession({ state: "stopped", stop_reason: "entitlement_revoked" });
+      refused();
+      await act(async () => lastOnRecovery?.(failed));
+    }
+    await advance(LOCK_MS - 300 - 100);
+    // Still locking: the loader carries the verdict, the page adds nothing.
+    expect(banners().length).toBe(0);
+
+    await advance(200);
+    // Inert but not yet removed (1400 ms): the notice is the page's own banner.
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    expect(banners().length).toBe(1);
+    expect(screen.getAllByRole("alert").map((el) => el.textContent)).toEqual([expect.stringContaining(title)]);
+    expect(screen.queryByTestId("hud")).toBeNull();
+
+    await advance(2_000);
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(banners().length).toBe(1);
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(screen.queryByTestId("hud")).toBeNull();
+  });
+});

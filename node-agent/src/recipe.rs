@@ -6,7 +6,7 @@
 //! shape: `pub const RECIPE_REVISION: u32 = <n>;`.
 //!
 //! Bump it only when this agent starts needing a new mount, environment input, port,
-//! device or capability, and add that revision to the actor's recipe book
+//! device, capability or healthcheck, and add that revision to the actor's recipe book
 //! (`crates/quasar-recovery/src/recipe`) in the same commit; a code change alone never
 //! bumps it. The actor's test `every_revision_the_tree_declares_is_carried_by_the_book`
 //! reads this file and fails if the book does not carry it.

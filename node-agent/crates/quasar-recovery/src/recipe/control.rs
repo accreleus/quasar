@@ -241,6 +241,8 @@ pub(super) fn postgres_r1(
 /// changes Add host's images only: `QUASAR_ENROLL_*` carry just the operator's overrides and
 /// the install-time images move to `QUASAR_ENROLL_FALLBACK_*`, below the installed
 /// release's. Revision 1 gives an override, else the install-time image, as before.
+/// Revision 3 (#543) carries the healthcheck a control plane must pass to be verified:
+/// Podman keeps none from an OCI image, so one left to the image never reports there.
 pub(super) fn control_plane(
     revision: u32,
     inputs: &Inputs,
@@ -411,9 +413,30 @@ pub(super) fn control_plane(
                 host_ip: None,
             },
         ],
-        // The image's own (`curl /health`, which also reaches the database).
-        healthcheck: None,
+        healthcheck: (revision >= 3).then(healthcheck),
     })
+}
+
+/// `quasar-control-plane`'s check in `deploy/docker-compose.yml`, in exec form: the image
+/// contract pins `curl`, not a shell. `/health` also reaches the database. Guarded by
+/// `the_control_planes_own_healthcheck_is_the_compose_definitions`.
+fn healthcheck() -> Healthcheck {
+    Healthcheck {
+        test: [
+            "CMD",
+            "curl",
+            "-fsS",
+            "-o",
+            "/dev/null",
+            "http://localhost:8080/health",
+        ]
+        .map(String::from)
+        .to_vec(),
+        interval_s: 10,
+        timeout_s: 5,
+        retries: 6,
+        start_period_s: 15,
+    }
 }
 
 /// A combined host's own agent, from revision 2: it reaches the control plane on this

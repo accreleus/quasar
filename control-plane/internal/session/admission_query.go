@@ -189,6 +189,10 @@ func (c candidacy) candidateQuery(policy PlacementPolicy) (string, []any) {
 // rendered by the same functions as the candidate query; that identity is what
 // makes the retry loop terminate (TestPickAndRecheckAgree,
 // TestReadinessGateAndRecheckAgree).
+//
+// The OF list is the row-lock order: host first, like every transaction that
+// locks both. `OF g, h` or a bare FOR UPDATE locks the GPU first and deadlocks
+// the capacity write; guarded by TestRecheckLocksHostBeforeGPU.
 func (c candidacy) recheckQuery(gpuID string) (string, []any) {
 	a := &argset{}
 	gpuIdx := a.add(gpuID)
