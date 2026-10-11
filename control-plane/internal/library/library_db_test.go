@@ -1425,7 +1425,7 @@ func TestJanitorEnqueueIsIdempotentAndIntervalled(t *testing.T) {
 	}
 
 	// ...and must re-enqueue once the interval has elapsed.
-	must(t, execT(ctx, pool, `UPDATE library_scans SET reported_at = now() - interval '7 hours'`))
+	must(t, execT(ctx, pool, `UPDATE library_scans SET created_at = now() - interval '7 hours'`))
 	j.RunOnce(ctx)
 	if n := countT(t, pool, `SELECT count(*) FROM library_scans WHERE state='pending'`); n != 1 {
 		t.Errorf("pending scans after the interval elapsed = %d, want 1", n)

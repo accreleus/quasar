@@ -49,14 +49,17 @@ see [Set up your game library](/quasar/playing/library/).
 
 ## Scanning
 
-Scans run every 360 minutes by default (`6h`; change it under **Admin ▸
-Settings**, Libraries, Scan interval). Set `QUASAR_LIBRARY_SCAN_INTERVAL` as a
-Go duration such as `360m` or `6h` to override it; a bare number fails startup,
-and `0` disables discovery entirely regardless of the admin master switch.
+The scan interval is how often scans run: every 360 minutes (`6h`) by default.
+Change it under **Admin ▸ Settings**, Libraries, Scan interval; it applies within
+seconds, no restart. **Admin ▸ Fleet ▸ Jobs** shows the same interval for the
+Steam library discovery job and cannot set a different one. Set
+`QUASAR_LIBRARY_SCAN_INTERVAL` as a Go duration such as `360m` or `6h` to
+override it (the job then shows as locked); a bare number fails startup, and `0`
+disables discovery entirely regardless of the admin master switch.
 **Admin ▸ Library ▸ Sources** can scan now.
 
 An uninstalled game leaves the library once a second scan also no longer finds
-it. One scan is not enough, so a library that is briefly unreachable costs
+it, about two scan intervals after the first scan that missed it. One scan is not enough, so a library that is briefly unreachable costs
 nobody their games. Scan now cannot confirm a miss until one scan interval has
 passed since it.
 

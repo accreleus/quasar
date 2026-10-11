@@ -488,6 +488,19 @@ func (s *Store) Materialize(ctx context.Context, p MaterializeParams) (Run, Mate
 	return run, RunCreated, nil
 }
 
+// Reschedule moves a still-pending, still-future scheduled run to when. A run that is
+// already due, claimed or finished is left alone, so a change of period never makes a
+// run twice or pulls one out from under its claim.
+func (s *Store) Reschedule(ctx context.Context, runID string, when time.Time) error {
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE job_runs SET scheduled_for = $2
+		 WHERE id = $1::uuid AND state = 'pending' AND trigger = 'schedule'
+		   AND attempt = 1 AND scheduled_for > now() AND scheduled_for <> $2`, runID, when); err != nil {
+		return fmt.Errorf("reschedule run %s: %w", runID, err)
+	}
+	return nil
+}
+
 func openRunTx(ctx context.Context, tx pgx.Tx, jobID, hostID string) (Run, bool, error) {
 	r, err := scanRun(tx.QueryRow(ctx, `
 		SELECT`+runColumns+` FROM job_runs

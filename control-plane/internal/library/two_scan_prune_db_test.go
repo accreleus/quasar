@@ -389,3 +389,67 @@ func TestScanReportMeasuresTheDistanceByTheResolvedInterval(t *testing.T) {
 		t.Error("a report past the configured interval did not prune the game")
 	}
 }
+
+// TestPassOneIntervalAfterTheLastQueuesHomesTheAgentReportedLate: the agent reports a scan
+// after the pass that queued it, so a pass one interval after the last one's end finds
+// reported_at younger than the interval by the agent's lag. Enqueue goes by the queue time
+// and still takes the home; one queued a minute short of the interval stays skipped.
+func TestPassOneIntervalAfterTheLastQueuesHomesTheAgentReportedLate(t *testing.T) {
+	pool := testDB(t)
+	f := newFixture(t, pool)
+
+	f.scanVia(t, f.scheduled(t), redoutEntry)
+	age := func(queuedAgo time.Duration) {
+		t.Helper()
+		must(t, execT(context.Background(), pool, `UPDATE library_scans
+			SET created_at  = now() - make_interval(secs => $1),
+			    reported_at = now() - make_interval(secs => $1) + interval '55 seconds'`, queuedAgo.Seconds()))
+	}
+
+	age(testInterval - time.Minute)
+	if n := f.scheduled(t)(); n != 0 {
+		t.Errorf("a pass a minute short of the interval queued %d scans, want 0", n)
+	}
+	age(testInterval + time.Second)
+	if n := f.scheduled(t)(); n != 1 {
+		t.Errorf("a pass one interval after the last queued %d scans, want 1", n)
+	}
+}
+
+// TestTheScanOneIntervalAfterTheMarkingScanDoesNotPruneButTheNextDoes pins the production
+// gap: the mark is stamped when the agent reports (+55 s), the next scheduled scan is queued
+// one interval after the marking scan was queued, so it is short of the mark by the report lag.
+func TestTheScanOneIntervalAfterTheMarkingScanDoesNotPruneButTheNextDoes(t *testing.T) {
+	pool := testDB(t)
+	f := newFixture(t, pool)
+	ctx := context.Background()
+
+	base := time.Now().Add(-2*testInterval - 10*time.Minute)
+	scanQueuedAt := func(at time.Time) string {
+		t.Helper()
+		id := f.claimedScan(t, f.user)
+		must(t, execT(ctx, pool, `UPDATE library_scans SET created_at = $2 WHERE id = $1::uuid`, id, at))
+		return id
+	}
+	reconcile := func(id string, entries ...ReportEntry) ReconcileResult {
+		t.Helper()
+		res, err := f.store.Reconcile(ctx, id, f.host, entries, nil, testInterval)
+		must(t, err)
+		return res
+	}
+
+	reconcile(scanQueuedAt(base.Add(-testInterval)), redoutEntry, portalEntry)
+	reconcile(scanQueuedAt(base), portalEntry)
+	must(t, execT(ctx, pool, `UPDATE library_observations SET missing_since = $1 WHERE missing_since IS NOT NULL`,
+		base.Add(55*time.Second)))
+
+	if res := reconcile(scanQueuedAt(base.Add(testInterval)), portalEntry); res.Pruned != 0 {
+		t.Fatalf("the scan queued one interval after the marking scan pruned %d rows, want 0", res.Pruned)
+	}
+	if _, held := f.missingSince(t, f.host, "517710"); !held {
+		t.Fatal("the game is gone after the scan that is short of the mark")
+	}
+	if res := reconcile(scanQueuedAt(base.Add(2*testInterval)), portalEntry); res.Pruned != 1 {
+		t.Errorf("the scan queued two intervals after the marking scan pruned %d rows, want 1", res.Pruned)
+	}
+}
