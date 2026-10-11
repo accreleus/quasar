@@ -17,7 +17,8 @@ describe("SessionSwapTransition", () => {
     vi.useFakeTimers();
     const { container, rerender } = render(<SessionSwapTransition transition={null} />);
     expect(container.textContent).toBe("");
-    expect(container.querySelector("svg")).toBeNull();
+    // #544: the animated mark stays; removing it made frame presentation read less even.
+    expect(container.querySelector(".switcher svg")).not.toBeNull();
 
     rerender(<SessionSwapTransition transition={{ phase: "switching", appName: "Purple App" }} />);
     expect(container.textContent).toContain("Starting…");
