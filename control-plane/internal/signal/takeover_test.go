@@ -2,12 +2,17 @@ package signal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/accreleus/quasar/control-plane/internal/agentws"
+	"github.com/accreleus/quasar/control-plane/internal/origins"
 	"github.com/accreleus/quasar/control-plane/internal/session"
 )
 
@@ -98,5 +103,99 @@ func TestTakeoverCloseCodeIsDistinct(t *testing.T) {
 	}
 	if wsCloseTakenOver < 4000 || wsCloseTakenOver > 4999 {
 		t.Fatalf("wsCloseTakenOver (%d) is outside the application close-code range", wsCloseTakenOver)
+	}
+}
+
+// gatedAgentSender holds its first send until released, so a test can pile a
+// second frame and a takeover up behind the handler's pump.
+type gatedAgentSender struct {
+	frames  chan []byte
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedAgentSender) SendSignaling(_, _ string, innerMsg json.RawMessage) error {
+	g.frames <- append([]byte(nil), innerMsg...)
+	g.once.Do(func() {
+		close(g.entered)
+		<-g.release
+	})
+	return nil
+}
+
+// #535 — a displaced socket forwards nothing it had already read.
+//
+// The pump selects on the browser's next frame and on the takeover together,
+// and Go picks at random when both are ready. A frame from the displaced tab
+// that wins that draw reaches the agent after the new tab attached: an answer
+// there is applied to the transport the agent built for the new tab.
+//
+// Each round parks the pump inside a send, lets a second frame and a takeover
+// arrive behind it, and releases. Unfixed, the second frame is forwarded in
+// about half the rounds.
+func TestDisplacedSocketForwardsNothingItHadAlreadyRead(t *testing.T) {
+	pool := testDB(t)
+	store := session.NewStore(pool)
+
+	for round := 0; round < 12; round++ {
+		sess, firstToken := seedAssignedSession(t, pool)
+		relay := agentws.NewRelayBus(discardLog())
+		h := NewHandler(store, agentws.NewRegistry(discardLog()), relay, discardLog(),
+			origins.NewResolver("", false, nil, discardLog()))
+		agent := &gatedAgentSender{
+			frames:  make(chan []byte, 4),
+			entered: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		h.registry = agent
+		srv := httptest.NewServer(h)
+
+		first, _, err := websocket.DefaultDialer.Dial(signalURL(srv, firstToken), nil)
+		if err != nil {
+			t.Fatalf("round %d: dial first: %v", round, err)
+		}
+		writeBrowserFrame(t, first, `{"type":"ice","pc":"video","candidate":{"candidate":"first"}}`)
+		select {
+		case <-agent.entered:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("round %d: the first frame never reached the agent", round)
+		}
+		// Read by the handler's reader while the pump is parked in the send.
+		writeBrowserFrame(t, first, `{"type":"answer","pc":"video","sdp":"v=0 stale"}`)
+		time.Sleep(50 * time.Millisecond)
+
+		second, err := store.MintSignalingToken(context.Background(), sess.ID)
+		if err != nil {
+			t.Fatalf("round %d: mint second token: %v", round, err)
+		}
+		secondConn, _, err := websocket.DefaultDialer.Dial(signalURL(srv, second.Plaintext), nil)
+		if err != nil {
+			t.Fatalf("round %d: dial second: %v", round, err)
+		}
+		// The probe comes back only once the second socket is registered, which
+		// is what displaces the first.
+		if err := relay.Deliver(sess.ID, []byte(`{"type":"ice","pc":"video","candidate":"registration probe"}`)); err != nil {
+			t.Fatalf("round %d: deliver registration probe: %v", round, err)
+		}
+		readBrowserFrame(t, secondConn)
+
+		close(agent.release)
+		first.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for {
+			if _, _, err := first.ReadMessage(); err != nil {
+				var ce *websocket.CloseError
+				if !errors.As(err, &ce) || ce.Code != wsCloseTakenOver {
+					t.Fatalf("round %d: displaced socket ended with %v, want close %d", round, err, wsCloseTakenOver)
+				}
+				break
+			}
+		}
+		if got := len(agent.frames); got != 1 {
+			t.Fatalf("round %d: %d frames reached the agent, want only the one sent before the takeover", round, got)
+		}
+		first.Close()
+		secondConn.Close()
+		srv.Close()
 	}
 }
