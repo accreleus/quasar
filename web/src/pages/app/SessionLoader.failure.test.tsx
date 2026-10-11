@@ -9,7 +9,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, fireEvent } from "@testing-library/react";
 import { SessionLoader, PHASE_STALL_MS } from "./SessionLoader";
-import { launchFailureFromSession, unreachableFailure } from "./sessionFailure";
+import { accessRevokedFailure, launchFailureFromSession, takenOverFailure, unreachableFailure } from "./sessionFailure";
 
 describe("SessionLoader — terminal failure", () => {
   it("replaces the progress copy with the failure and a way out", () => {
@@ -220,5 +220,51 @@ describe("SessionLoader — never a dead end", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// #533: the card of a session that is over stays on the loader's own ground
+// through the handoff (the CSS keys on `is-over` + `is-locking`); a handoff
+// that carries no such verdict is the one it always was.
+describe("SessionLoader — the handoff", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const root = () => document.querySelector(".sl-root")!.className;
+  const reveal = async (failure: Parameters<typeof SessionLoader>[0]["failure"]) => {
+    const props = { statusMsg: "app presented", onExit: vi.fn(), failure };
+    const view = render(<SessionLoader {...props} streaming={false} />);
+    view.rerender(<SessionLoader {...props} streaming />);
+    return view;
+  };
+
+  it("a normal reveal walks idle, locking, streaming with nothing else on the root", async () => {
+    await reveal(null);
+    expect(root()).toBe("sl-root is-locking");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_179);
+    });
+    expect(root()).toBe("sl-root is-locking");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(root()).toBe("sl-root is-streaming");
+  });
+
+  it.each([
+    ["a takeover", takenOverFailure()],
+    ["a revoked access", accessRevokedFailure({ stop_reason: "entitlement_revoked" })!],
+  ])("%s marks the loader as over, from the lock to the fade", async (_n, failure) => {
+    await reveal(failure);
+    expect(root()).toBe("sl-root is-locking is-failed is-over");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_180);
+    });
+    expect(root()).toBe("sl-root is-streaming is-failed is-over");
+  });
+
+  it("the browser's own unreachable guess does not mark it over: the stream may still be playing", async () => {
+    await reveal(unreachableFailure());
+    expect(root()).toBe("sl-root is-locking is-failed");
   });
 });

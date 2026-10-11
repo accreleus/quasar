@@ -1070,3 +1070,51 @@ describe("SessionPage — a verdict that lands inside the reveal is on screen wh
     expect(screen.queryByTestId("hud")).toBeNull();
   });
 });
+
+describe("SessionPage — the loader's card is the notice until the lock, the banner after (#533)", () => {
+  const rootClass = () => document.querySelector(".sl-root")?.className;
+  const exposedAlerts = () => screen.queryAllByRole("alert").map((el) => el.textContent ?? "");
+  const TAKEN = "This session moved to another tab";
+
+  async function reveal() {
+    currentSession = makeSession();
+    renderPage();
+    await advance(1_000);
+    await act(async () => lastOnChannel?.({ readyState: "open", onclose: null, send() {}, bufferedAmount: 0 }));
+  }
+
+  it("a normal reveal: no verdict classes at any step, one banner-free handoff", async () => {
+    await reveal();
+    await advance(500);
+    expect(rootClass()).toBe("sl-root is-locking");
+    await advance(700);
+    expect(rootClass()).toBe("sl-root is-streaming");
+    expect(document.querySelectorAll(".banner")).toHaveLength(0);
+    await advance(300);
+    expect(document.querySelector(".sl-root")).toBeNull();
+  });
+
+  it.each([300, 700])("a takeover held %i ms into the reveal: one readable alert at every step: card, then banner", async (held) => {
+    await reveal();
+    await advance(held);
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "superseded", message: "opened in another tab" }));
+    await advance(100);
+    // Locking: the loader's card is the notice (not hidden by the lock), no banner yet.
+    expect(rootClass()).toBe("sl-root is-locking is-failed is-over");
+    expect(exposedAlerts()).toEqual([expect.stringContaining(TAKEN)]);
+    expect(document.querySelectorAll(".banner")).toHaveLength(0);
+    expect(screen.queryByTestId("hud")).toBeNull();
+
+    await advance(1_200 - held - 100);
+    // Locked: the loader is inert and fading, the banner has the notice.
+    expect(rootClass()).toBe("sl-root is-streaming is-failed is-over");
+    expect(exposedAlerts()).toEqual([expect.stringContaining(TAKEN)]);
+    expect(document.querySelectorAll(".banner")).toHaveLength(1);
+    expect(screen.queryByTestId("hud")).toBeNull();
+
+    await advance(1_000);
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(exposedAlerts()).toEqual([expect.stringContaining(TAKEN)]);
+    expect(screen.queryByTestId("hud")).toBeNull();
+  });
+});

@@ -13,7 +13,7 @@ import "./SessionLoader.css";
 import { Button } from "../../components/Button";
 import { QuasarMark } from "../../components/QuasarMark";
 import { CollapsibleLogTail } from "../../components/SessionFailureDetail";
-import type { LaunchFailure } from "./sessionFailure";
+import { isBannerVerdict, type LaunchFailure } from "./sessionFailure";
 import { AccretionVisual } from "./AccretionVisual";
 import { GlyphRail } from "./GlyphRail";
 import { derivePhase, stallPhaseForStep } from "./loaderPhases";
@@ -231,6 +231,7 @@ export function SessionLoader({
     scene === "locking" ? "is-locking" : "",
     scene === "streaming" ? "is-streaming" : "",
     terminal ? "is-failed" : "",
+    failure && isBannerVerdict(failure) ? "is-over" : "",
     stalled ? "is-stalled" : "",
   ]
     .filter(Boolean)
