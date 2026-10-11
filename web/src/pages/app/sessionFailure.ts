@@ -177,6 +177,18 @@ export function accessRevokedFailure(s: StopReasonInput): LaunchFailure | null {
   };
 }
 
+/** The kinds that have a banner once the loader is gone. */
+export function isBannerVerdict(f: LaunchFailure): boolean {
+  return f.kind === "access_revoked" || f.kind === "taken_over";
+}
+
+/** What the page can still show after the loader's reveal has begun: a banner
+ * verdict, or its own "unreachable" guess (the recovery banner covers that one).
+ * Anything else is loader copy, and the loader is inert by then. */
+export function showsAfterReveal(f: LaunchFailure): boolean {
+  return isBannerVerdict(f) || f.kind === "unreachable";
+}
+
 /** The one precedence rule for the page's sticky verdict: the browser's own
  * guess ("unreachable") yields to anything the control plane says about the
  * session's end, a revoked access beats every other verdict, and otherwise the

@@ -6,6 +6,7 @@
 // Real MicCapture and real input capture (jsdom has no Pointer Lock, so capture
 // runs in fallback mode); the transport, telemetry and HUD are doubles.
 
+import { Fragment, StrictMode } from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -113,9 +114,10 @@ vi.mock("./SessionSwapController", () => ({
 let swapToast: ((n: React.ReactNode) => void) | null = null;
 let hud: Record<string, unknown> = {};
 let slowHudOnOpen = false;
+let afterHudCommit: (() => void) | null = null;
 const hudOpen = vi.fn();
 vi.mock("./hud/Hud", async () => {
-  const { forwardRef, useImperativeHandle } = await import("react");
+  const { forwardRef, useImperativeHandle, useLayoutEffect } = await import("react");
   return {
     Hud: forwardRef((p: Record<string, unknown>, ref: React.Ref<unknown>) => {
       hud = p;
@@ -124,6 +126,11 @@ vi.mock("./hud/Hud", async () => {
         const end = performance.now() + 20;
         while (performance.now() < end) { /* make concurrent work yield after commit */ }
       }
+      useLayoutEffect(() => {
+        const run = afterHudCommit;
+        afterHudCommit = null;
+        run?.();
+      });
       useImperativeHandle(ref, () => ({ open: hudOpen, close() {}, stageClick() {} }));
       // The real HUD's Exit session button is wired to onStop, which stops the server session.
       return (
@@ -153,9 +160,10 @@ function makeSession(overrides: Record<string, unknown> = {}) {
 }
 let currentSession = makeSession();
 
-function renderPage() {
+function renderPage(strict = false) {
+  const Mode = strict ? StrictMode : Fragment;
   return render(
-    <MemoryRouter
+    <Mode><MemoryRouter
       initialEntries={[
         {
           pathname: "/app/session/s1",
@@ -178,7 +186,7 @@ function renderPage() {
           </Routes>
         </ToastProvider>
       </ThemeProvider>
-    </MemoryRouter>,
+    </MemoryRouter></Mode>,
   );
 }
 
@@ -918,6 +926,36 @@ describe("SessionPage — the channel closing inside the reveal (#449)", () => {
     const reopened: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
     await act(async () => lastOnChannel?.(reopened));
     await advance(2_000);
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(document.querySelectorAll(".banner").length).toBe(0);
+    expect(screen.getByTestId("hud")).not.toBeNull();
+  });
+});
+
+// A second launch poll can still be in flight when the first one commits the reveal.
+describe("SessionPage — an overlapping launch poll cannot hold a verdict the reveal has made unshowable (#449)", () => {
+  it("the reveal commits, then the other poll's stopping read lands before the poll's cleanup", async () => {
+    vi.useRealTimers();
+    currentSession = makeSession({ state_detail: "app booting" });
+    await act(async () => { renderPage(true); });
+    const ch: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
+    await act(async () => lastOnChannel?.(ch));
+    const pending: Array<(s: { session: ReturnType<typeof makeSession> }) => void> = [];
+    getSession.mockImplementation(() => new Promise((resolve) => pending.push(resolve)));
+    await new Promise((r) => setTimeout(r, 2_150));
+    expect(pending.length).toBe(2);
+    let committed = false;
+    afterHudCommit = () => {
+      committed = true;
+      pending[1]({ session: makeSession({ state: "stopping", state_detail: "stop requested" }) });
+    };
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", false);
+    slowHudOnOpen = true;
+    pending[0]({ session: makeSession({ state_detail: "app presented" }) });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(committed).toBe(true);
+    await new Promise((r) => setTimeout(r, 1_500));
+
     expect(document.querySelector(".sl-root")).toBeNull();
     expect(document.querySelectorAll(".banner").length).toBe(0);
     expect(screen.getByTestId("hud")).not.toBeNull();
