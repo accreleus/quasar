@@ -140,6 +140,9 @@ pub struct FakeState {
     /// Containers the engine started again after a stop of them had returned: a stop that
     /// did not hold (#425). What the recovery actor must never cause.
     pub restarted_after_stop: Vec<String>,
+    /// Podman with an OCI image (#543): the engine keeps no image healthcheck, so a
+    /// container reports a health only when its specification carries a check of its own.
+    pub image_healthchecks_dropped: bool,
 }
 
 /// A database: its `schema_migrations` row and a token standing for its rows.
@@ -677,6 +680,7 @@ impl PlatformEngine for FakeEngine {
                 .cloned();
             let ports_in_use = s.ports_in_use.clone();
             let host_dirs = s.host_dirs.clone();
+            let image_healthchecks_dropped = s.image_healthchecks_dropped;
             let c = s.containers.get_mut(&id).unwrap();
             if c.status == "running" {
                 return Ok(());
@@ -738,7 +742,9 @@ impl PlatformEngine for FakeEngine {
             } else {
                 c.status = "running".into();
                 if let Some(b) = behaviour {
-                    c.health = b.health;
+                    c.health = b
+                        .health
+                        .filter(|_| !image_healthchecks_dropped || c.spec.healthcheck.is_some());
                     c.logs = b.logs;
                     if let Some(again) = b.crash_loop {
                         s.crash_loops.insert(

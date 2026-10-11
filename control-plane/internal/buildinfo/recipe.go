@@ -4,5 +4,5 @@ package buildinfo
 // container shape a recovery actor renders it with. deploy/build-images.sh stamps it as
 // the image label org.quasar.recipe by reading the line below, so keep its exact shape.
 // Bump it only when the control plane starts needing a new mount, environment input,
-// port, device or capability, together with the actor's recipe book.
-const RecipeRevision = 2
+// port, device, capability or healthcheck, together with the actor's recipe book.
+const RecipeRevision = 3
