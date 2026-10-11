@@ -244,7 +244,13 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	res, err := h.store.Reconcile(r.Context(), req.ScanID, hostID, req.Entries, details)
+	// Fail-closed: with no interval to measure the prune distance by, the scan marks only.
+	interval, _, err := h.resolver.ScanInterval(r.Context())
+	if err != nil {
+		h.log.Warn("library: could not resolve the scan interval; this scan prunes nothing", "err", err)
+		interval = 0
+	}
+	res, err := h.store.Reconcile(r.Context(), req.ScanID, hostID, req.Entries, details, interval)
 	if err != nil {
 		h.writeScanErr(w, err, "could not reconcile scan")
 		return
@@ -254,7 +260,7 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 		"observed", res.Observed, "suppressed", res.Suppressed,
 		"created", res.Created, "disabled", res.Disabled,
 		"granted", res.Granted, "revoked", res.Revoked, "rejected", res.Rejected,
-		"backfilled", res.Backfilled)
+		"backfilled", res.Backfilled, "missing", res.Missing, "pruned", res.Pruned)
 	if res.Capped {
 		h.log.Warn("library: scan hit the entry cap; games absent from it were not pruned or revoked",
 			"scan_id", req.ScanID, "user_id", res.UserID, "host_id", hostID, "entries", len(req.Entries))

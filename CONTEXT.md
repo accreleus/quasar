@@ -78,6 +78,13 @@ tile discovered inside a parent app's library. It inherits the parent's
 runtime, image, and resource demand; a handful of fields (default profile,
 profile policy) stay on the tile.
 
+**Missing** — the state of a library observation (one game a scan saw installed
+for one user on one host) that the last complete scan of that home did not
+list. A missing game still counts as installed: its tile, entitlement and any
+running session stay. It is pruned when a scan queued at least one scan
+interval after the first miss also does not list it; a scan that lists it
+clears the state.
+
 **Console session** — a session whose desktop owns the host's own screen: it
 holds the display directly, reads the real input devices and plays audio to the
 host's sound device. It is never streamed. Other, streamed sessions keep running

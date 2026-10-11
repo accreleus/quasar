@@ -18,7 +18,9 @@ package session
 import (
 	"context"
 	"net/http"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/library"
 )
@@ -57,13 +59,13 @@ func TestDiscoveredTileIsEntitledOnlyToObservers(t *testing.T) {
 	if _, err := store.Reconcile(ctx, scanFor(f.userID), f.hostID, []library.ReportEntry{
 		{ExternalID: "517710", Name: "Redout: Enhanced Edition"},
 		{ExternalID: "1493710", Name: "Proton Experimental"},
-	}, nil); err != nil {
+	}, nil, 6*time.Hour); err != nil {
 		t.Fatalf("reconcile (user): %v", err)
 	}
 	if _, err := store.Reconcile(ctx, scanFor(f.adminID), f.hostID, []library.ReportEntry{
 		{ExternalID: "3179810", Name: "Tiny Dangerous Dungeons Remake"},
 		{ExternalID: "1493710", Name: "Proton Experimental"},
-	}, nil); err != nil {
+	}, nil, 6*time.Hour); err != nil {
 		t.Fatalf("reconcile (admin): %v", err)
 	}
 
@@ -99,5 +101,64 @@ func TestDiscoveredTileIsEntitledOnlyToObservers(t *testing.T) {
 		WHERE parent_app_id = $1::uuid AND external_id = '1493710'`, parent).Scan(&protonTiles))
 	if protonTiles != 0 {
 		t.Errorf("Proton Experimental produced %d tile(s); the denylist must suppress it for everyone", protonTiles)
+	}
+}
+
+// TestSessionOnAMissedGameOutlivesTheSweepUntilTheMissIsConfirmed — schema.md
+// amendment 25 (#521): one scan that omits a game leaves its entitlement, so the
+// sweep leaves its session; the confirming scan revokes, and the sweep then stops it.
+func TestSessionOnAMissedGameOutlivesTheSweepUntilTheMissIsConfirmed(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	const interval = 6 * time.Hour
+	parent := seedSteamApp(t, pool, `{"gpu":true}`)
+	lib := library.NewStore(pool)
+	scan := func(entries ...library.ReportEntry) {
+		t.Helper()
+		var id string
+		must(t, pool.QueryRow(ctx, `INSERT INTO library_scans (user_id, app_id, host_id, state, claimed_at)
+			VALUES ($1::uuid, $2::uuid, $3::uuid, 'claimed', now()) RETURNING id::text`,
+			s.userID, parent, s.hostID).Scan(&id))
+		if _, err := lib.Reconcile(ctx, id, s.hostID, entries, nil, interval); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+	redout := library.ReportEntry{ExternalID: "517710", Name: "Redout: Enhanced Edition"}
+	portal := library.ReportEntry{ExternalID: "620", Name: "Portal 2"}
+
+	scan(redout, portal)
+	var tile string
+	must(t, pool.QueryRow(ctx, `SELECT id::text FROM apps
+		WHERE parent_app_id = $1::uuid AND external_id = '517710'`, parent).Scan(&tile))
+	sess := insertSessionRow(t, pool, s.userID, tile, &s.hostID, "running")
+
+	scan(portal)
+	if ids, err := coord.StopUnentitledSessions(ctx, ""); err != nil || len(ids) != 0 {
+		t.Fatalf("sweep after one miss: stopped %v, %v; want none", ids, err)
+	}
+	if got := sessionState(t, store, sess); got != StateRunning {
+		t.Fatalf("session on a game one scan missed: %s, want running", got)
+	}
+
+	must(t, execEnt(ctx, pool, `UPDATE library_observations
+		SET missing_since = missing_since - make_interval(secs => $1)`, interval.Seconds()))
+	scan(portal)
+	ids, err := coord.StopUnentitledSessions(ctx, "")
+	if err != nil {
+		t.Fatalf("sweep after the confirming scan: %v", err)
+	}
+	if !slices.Equal(ids, []string{sess}) {
+		t.Fatalf("stopped %v, want only %s", ids, sess)
+	}
+	if got := sessionState(t, store, sess); got != StateStopping {
+		t.Errorf("session on an uninstalled game: %s, want stopping", got)
+	}
+	if got := disp.stopReason(sess); got != StopReasonEntitlementRevoked {
+		t.Errorf("session_stop reason: %q, want %q", got, StopReasonEntitlementRevoked)
 	}
 }
