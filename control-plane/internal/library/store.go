@@ -353,9 +353,10 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 	}
 	// A row this scan did not list is marked, not pruned: one scan cannot tell an uninstall
 	// from a library out of reach (schema.md amendment 25). The prune needs a scan queued at
-	// least one interval after the mark. That must stay Enqueue's recency arithmetic, so the
-	// next scheduled scan qualifies and a "scan now" pressed sooner does not; guarded by
-	// TestNextScheduledScanPrunesAnUninstall and TestScanNowTwiceDoesNotPrune. It reads the
+	// least one interval after the mark. That is Enqueue's interval arithmetic, so a "scan now"
+	// pressed sooner does not qualify. Marks are stamped at report time, after the queueing
+	// pass, so in practice the second scheduled scan after the mark is the first to qualify.
+	// Guarded by TestNextScheduledScanPrunesAnUninstall and TestScanNowTwiceDoesNotPrune. It reads the
 	// scan's created_at, never now(): a report delivered late is not a later look at the disk.
 	//
 	// A report that hit the agent's cap is a prefix in directory order: it neither marks nor
@@ -963,9 +964,11 @@ func (s *Store) ExpireStranded(ctx context.Context) (int, error) {
 }
 
 // Enqueue inserts a 'pending' scan for every (user, provider app, host) triple with a live
-// home, no open scan, and no successful scan inside interval (§11.1 step 3). The predicate is
-// the schedule: no timer, no queue service, so it's correct after a restart or a home move
-// with no state to rebuild. Reads apps.library_provider, not kind (§4.5.3 forbids branching on
+// home, no open scan, and no successful scan queued inside interval (§11.1 step 3). It reads
+// created_at, not reported_at: the agent reports a scan after the pass that queued it, so
+// against reported_at a pass one interval after the last would skip every home it just scanned
+// and halve the scan rate. The predicate is the schedule: no timer, no queue service, so it's
+// correct after a restart or a home move with no state to rebuild. Reads apps.library_provider, not kind (§4.5.3 forbids branching on
 // kind) — a Kind dropdown must not silently stop this job.
 func (s *Store) Enqueue(ctx context.Context, interval time.Duration) (int, error) {
 	tag, err := s.pool.Exec(ctx, `
@@ -995,7 +998,7 @@ func (s *Store) Enqueue(ctx context.Context, interval time.Duration) (int, error
 		       SELECT 1 FROM library_scans s
 		        WHERE s.user_id = uh.user_id AND s.app_id = uh.app_id AND s.host_id = uh.host_id
 		          AND s.state = 'reported'
-		          AND s.reported_at > now() - make_interval(secs => $1)
+		          AND s.created_at > now() - make_interval(secs => $1)
 		   )
 		ON CONFLICT DO NOTHING
 	`, interval.Seconds())

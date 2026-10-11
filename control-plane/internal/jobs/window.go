@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -203,6 +204,23 @@ func BackoffFor(attempt int) time.Duration {
 		d = deferralCap
 	}
 	return d
+}
+
+// ResolveInterval is EffectiveInterval for a definition: an IntervalSource, when
+// the definition has one, decides instead of the stored interval.
+func ResolveInterval(ctx context.Context, j Job, def Definition, lookup func(string) string) (d time.Duration, locked bool, lockedBy string, err error) {
+	if def.IntervalSource == nil {
+		d, locked, lockedBy = EffectiveInterval(j, def.EnvOverride, lookup)
+		return d, locked, lockedBy, nil
+	}
+	d, byEnv, err := def.IntervalSource(ctx)
+	if err != nil {
+		return 0, false, "", err
+	}
+	if byEnv {
+		return d, true, def.EnvOverride, nil
+	}
+	return d, false, "", nil
 }
 
 // EffectiveInterval resolves the interval in force and says which source won.

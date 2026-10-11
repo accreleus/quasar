@@ -389,3 +389,29 @@ func TestScanReportMeasuresTheDistanceByTheResolvedInterval(t *testing.T) {
 		t.Error("a report past the configured interval did not prune the game")
 	}
 }
+
+// TestPassOneIntervalAfterTheLastQueuesHomesTheAgentReportedLate: the agent reports a scan
+// after the pass that queued it, so a pass one interval after the last one's end finds
+// reported_at younger than the interval by the agent's lag. Enqueue goes by the queue time
+// and still takes the home; one queued a minute short of the interval stays skipped.
+func TestPassOneIntervalAfterTheLastQueuesHomesTheAgentReportedLate(t *testing.T) {
+	pool := testDB(t)
+	f := newFixture(t, pool)
+
+	f.scanVia(t, f.scheduled(t), redoutEntry)
+	age := func(queuedAgo time.Duration) {
+		t.Helper()
+		must(t, execT(context.Background(), pool, `UPDATE library_scans
+			SET created_at  = now() - make_interval(secs => $1),
+			    reported_at = now() - make_interval(secs => $1) + interval '55 seconds'`, queuedAgo.Seconds()))
+	}
+
+	age(testInterval - time.Minute)
+	if n := f.scheduled(t)(); n != 0 {
+		t.Errorf("a pass a minute short of the interval queued %d scans, want 0", n)
+	}
+	age(testInterval + time.Second)
+	if n := f.scheduled(t)(); n != 1 {
+		t.Errorf("a pass one interval after the last queued %d scans, want 1", n)
+	}
+}

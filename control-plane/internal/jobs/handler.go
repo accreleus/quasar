@@ -177,7 +177,7 @@ func timeOfDayStr(t *TimeOfDay) *string {
 // (design §3.3), exactly as the dispatcher's own materializeDue resolves it —
 // one implementation of "which source won" so the viewer and the scheduler
 // cannot disagree.
-func (h *Handler) toScheduleJSON(j Job, envOverride string) scheduleJSON {
+func (h *Handler) toScheduleJSON(ctx context.Context, j Job, def Definition) scheduleJSON {
 	s := scheduleJSON{
 		Kind:        string(j.Schedule.Kind),
 		WindowStart: timeOfDayStr(j.Schedule.WindowStart),
@@ -189,7 +189,12 @@ func (h *Handler) toScheduleJSON(j Job, envOverride string) scheduleJSON {
 		s.WindowDays = []int{}
 	}
 	if j.Schedule.Kind == KindInterval {
-		interval, locked, lockedBy := EffectiveInterval(j, envOverride, h.getenv)
+		interval, locked, lockedBy, err := ResolveInterval(ctx, j, def, h.getenv)
+		if err != nil {
+			// The stored column is only a stale seed for a sourced job; say so in the log.
+			h.log.Warn("job: could not resolve the interval", "job_id", j.ID, "err", err)
+			interval, locked, lockedBy = EffectiveInterval(j, def.EnvOverride, h.getenv)
+		}
 		secs := int32(interval.Seconds())
 		s.IntervalSecs = &secs
 		s.Locked = locked
@@ -213,7 +218,7 @@ func (h *Handler) toJobJSON(ctx context.Context, j Job, hostNames map[string]str
 		Scope:        string(j.Scope),
 		Managed:      j.Managed,
 		Enabled:      j.Enabled,
-		Schedule:     h.toScheduleJSON(j, def.EnvOverride),
+		Schedule:     h.toScheduleJSON(ctx, j, def),
 		HistoryLimit: j.HistoryLimit,
 	}
 
@@ -433,15 +438,27 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		def, _ := h.reg.Get(id)
-		if def.EnvOverride != "" {
-			if _, locked, lockedBy := EffectiveInterval(job, def.EnvOverride, h.getenv); locked {
-				httpx.WriteError(w, http.StatusConflict, httpx.CodeScheduleLocked,
-					lockedBy+" is set in the environment and is authoritative over this job's interval; "+
-						"unset it to make the admin-owned interval take effect")
-				return
-			}
+		cur, locked, lockedBy, err := ResolveInterval(r.Context(), job, def, h.getenv)
+		if err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read job")
+			return
 		}
-		upd.IntervalSecs = &n
+		if locked {
+			httpx.WriteError(w, http.StatusConflict, httpx.CodeScheduleLocked,
+				lockedBy+" is set in the environment and is authoritative over this job's interval; "+
+					"unset it to make the admin-owned interval take effect")
+			return
+		}
+		switch {
+		case def.IntervalSource == nil:
+			upd.IntervalSecs = &n
+		case int32(cur.Seconds()) != n:
+			// The value already in force is accepted and ignored, so the Jobs tab can
+			// save a window edit, which sends the interval back unchanged.
+			httpx.WriteError(w, http.StatusUnprocessableEntity, httpx.CodeValidationFailed,
+				"this job's interval is set elsewhere; change it in Settings, Libraries, Scan interval")
+			return
+		}
 	}
 
 	_, hasStart := raw["window_start"]
