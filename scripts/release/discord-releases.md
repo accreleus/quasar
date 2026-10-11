@@ -1,8 +1,8 @@
 # Manual Discord release announcements
 
 Release agents invoke `quasar-release-announcement` to draft a structured announcement,
-preview it locally, then call `scripts/release/discord_releases.py` directly when sending
-is authorized. There is no posting workflow, schedule, release trigger or GitHub secret
+preview it locally, show the full rendered text and ask for explicit approval of that exact announcement,
+then call `scripts/release/discord_releases.py` directly after approval. There is no posting workflow, schedule, release trigger or GitHub secret
 handoff at runtime. CI runs only mocked script tests.
 
 ## Inputs and preview

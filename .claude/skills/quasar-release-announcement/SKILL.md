@@ -20,7 +20,7 @@ Preview from the repository root:
 python3 scripts/release/discord_releases.py --announcement /tmp/quasar-announcement.json
 ```
 
-Show the preview for review. Post when the user's instructions cover sending this announcement; creating a release alone is not permission to send a Discord message. If authorization already covers the reviewed release announcement, continue without asking again.
+Always show the complete rendered preview in the conversation and ask the user to approve posting that exact announcement to the Accreleus Discord announcements channel. General approval to create/publish a release or use this skill does not cover posting. Wait for explicit approval of the displayed text; silence is not approval. Once that exact preview is approved, send it without asking a second time. If the version, destination, or wording changes after approval, show the revised complete preview and obtain fresh approval before posting.
 
 ```sh
 python3 scripts/release/discord_releases.py --announcement /tmp/quasar-announcement.json --send
