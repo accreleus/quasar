@@ -28,7 +28,10 @@
 #     pid+random suffix into its OWN instance id so concurrent runs never share
 #     a container name or a port-search starting point.
 #
-# The container is removed on EVERY exit path, signals included.
+# The container is removed on EVERY exit path, signals included — together
+# with its anonymous data volume (#205). A SIGKILLed run bypasses the trap;
+# its orphans (container, volume, network) are swept by the NEXT run, by dead
+# owner pid.
 
 set -euo pipefail
 # shellcheck source=scripts/dx/common.sh
@@ -108,8 +111,8 @@ fi
 
 # shellcheck disable=SC2329  # invoked by the trap below, not by name
 cleanup() {
-  docker rm -f "$GO_NAME" >/dev/null 2>&1 || true
-  docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  docker rm -fv "$GO_NAME" >/dev/null 2>&1 || true
+  docker rm -fv "$PG_NAME" >/dev/null 2>&1 || true
   docker network rm "$PG_NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM HUP
@@ -117,9 +120,57 @@ trap cleanup EXIT INT TERM HUP
 # A stale container or network from a killed run would hold the name. Only
 # reachable with an operator-pinned QUASAR_INSTANCE, since an unpinned run mixes
 # pid+random into the id, but both names are derived so both are swept.
-docker rm -f "$GO_NAME" >/dev/null 2>&1 || true
-docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+docker rm -fv "$GO_NAME" >/dev/null 2>&1 || true
+docker rm -fv "$PG_NAME" >/dev/null 2>&1 || true
 docker network rm "$PG_NET" >/dev/null 2>&1 || true
+
+# Orphans of a DEAD run (#205): a run killed hard (SIGKILL bypasses the trap
+# above) leaves its Postgres container RUNNING and its data volume behind;
+# the next run removes them here, before they can leak further or block this
+# run's own name/port search. Names match in the shell rather than through a
+# docker filter, and the embedded owner pid decides: a live pid — any
+# concurrent run in this worktree (a same-instance unpinned run mixes
+# pid+random, above) or elsewhere — is never touched. An operator-pinned
+# QUASAR_INSTANCE name carries no pid, so it is deliberately NOT swept here;
+# its cleanup stays the exact-name removal above.
+#
+# testdb_pid_liveness <pid> — 0 unless the pid provably has no process.
+# `kill -0` fails both for a dead pid and for a live one this user cannot
+# signal, so the error text decides; a pid it cannot interrogate is treated
+# as ALIVE. Keeping an orphan is the harmless direction; removing a live
+# run's Postgres would not be.
+# shellcheck disable=SC2329  # invoked by the sweep below, not by name
+testdb_pid_liveness() {
+  local err
+  err="$(kill -0 "$1" 2>&1)" && return 0
+  case "$err" in
+    *"No such process"*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Containers are listed before networks, so a dead run's endpoints are gone
+# (above) by the time its network is removed.
+{
+  docker ps -a --format '{{.Names}}'
+  docker network ls --format '{{.Name}}'
+} 2>/dev/null | while read -r ORPHAN; do
+  case "$ORPHAN" in
+    "qpg-${QUASAR_INSTANCE}-"*|"qgo-${QUASAR_INSTANCE}-"*|"qpgnet-${QUASAR_INSTANCE}-"*) ;;
+    *) continue ;;
+  esac
+  ORPHAN_REST="${ORPHAN#qpg-}"
+  ORPHAN_REST="${ORPHAN_REST#qgo-}"
+  ORPHAN_REST="${ORPHAN_REST#qpgnet-}"
+  ORPHAN_REST="${ORPHAN_REST#${QUASAR_INSTANCE}-}"
+  ORPHAN_PID="${ORPHAN_REST%%-*}"
+  case "$ORPHAN_PID" in ''|*[!0-9]*) continue ;; esac
+  testdb_pid_liveness "$ORPHAN_PID" && continue
+  case "$ORPHAN" in
+    qpgnet-*) docker network rm "$ORPHAN" >/dev/null 2>&1 || true ;;
+    *)        docker rm -fv "$ORPHAN" >/dev/null 2>&1 || true ;;
+  esac
+done
 # Not `|| true`: a create failure here would surface later as the retry loop's
 # misleading "no free port" verdict.
 if ! docker network create "$PG_NET" >/dev/null 2>&1; then
@@ -152,7 +203,7 @@ while [ "$PG_START_ATTEMPTS" -lt "$PG_START_MAX" ]; do
     PG_STARTED=1
     break
   fi
-  docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  docker rm -fv "$PG_NAME" >/dev/null 2>&1 || true
   PORT_HINT=$(( CANDIDATE_PORT + 1 ))
   PG_START_ATTEMPTS=$(( PG_START_ATTEMPTS + 1 ))
 done
@@ -164,11 +215,22 @@ else
   dx_result "$TARGET"
 fi
 
-# Wait for readiness (pg_isready inside the container — no host client needed).
+# Wait for the FINAL server (#270): the official image brings Postgres up
+# twice — a temporary server for its init steps, listening on the Unix socket
+# only (listen_addresses=''), then the real one — and the socket-based
+# pg_isready answers during BOTH, which is how the first test package could
+# connect in the switch-over window and get "connection reset by peer".
+# Probing over TCP (-h 127.0.0.1; the init server accepts no TCP connection)
+# can only succeed once the final server listens, and requiring two
+# consecutive successes ensures the gate does not straddle the restart.
 ready=0
+ready_streak=0
 for _ in $(seq 1 60); do
-  if docker exec "$PG_NAME" pg_isready -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
-    ready=1; break
+  if docker exec "$PG_NAME" pg_isready -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
+    ready_streak=$(( ready_streak + 1 ))
+    if [ "$ready_streak" -ge 2 ]; then ready=1; break; fi
+  else
+    ready_streak=0
   fi
   sleep 1
 done
