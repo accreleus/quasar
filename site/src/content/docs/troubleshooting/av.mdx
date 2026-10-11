@@ -79,9 +79,9 @@ so. Switch the pad to XInput mode, or connect it by cable or USB receiver.
 
 A gamepad tester or web game opened in a browser **inside** the streamed desktop
 shows X and Y swapped (seen in Firefox). Games and Steam read the pad correctly.
-Only web pages in the session that use the browser's Gamepad API are affected: the
-virtual pad has no kernel driver, and Firefox only corrects Xbox X and Y when it
-sees one. This is a known limit; there is nothing to change.
+Only web pages in the session that use the browser's Gamepad API are affected. The
+virtual pad is not backed by the Xbox kernel driver, so Firefox reads X and Y
+differently. This is a known limit; there is nothing to change.
 
 ## Touch input on a tablet
 
