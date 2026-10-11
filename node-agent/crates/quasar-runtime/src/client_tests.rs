@@ -603,3 +603,21 @@ fn clients_on_a_shared_handle_keep_their_own_admission_and_validation() {
         Some(ErrorKind::InvalidConfiguration)
     );
 }
+
+#[test]
+fn a_finished_operation_has_already_freed_its_slot_when_wait_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = RuntimeConfig::unix(dir.path().join("missing.sock"));
+    config.max_in_flight = 1;
+    let runtime = RuntimeClient::new(config).unwrap();
+    // The engine is absent, so each operation ends at once; with one slot, the next one
+    // must never see the previous one's slot still held. (Statistical on the old
+    // ordering: the permit used to drop just after the result was sent.)
+    for round in 0..20_000 {
+        assert_eq!(
+            runtime.discover().wait().unwrap_err().kind,
+            ErrorKind::Unavailable,
+            "round {round}: the previous operation's slot was still held"
+        );
+    }
+}

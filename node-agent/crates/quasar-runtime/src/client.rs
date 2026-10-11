@@ -194,7 +194,6 @@ impl RuntimeClient {
                 self.executor
                     .handle
                     .spawn(async move {
-                        let _permit = permit;
                         let _owner = owner;
                         let result = tokio::select! {
                             biased;
@@ -202,6 +201,9 @@ impl RuntimeClient {
                             result = tokio::time::timeout_at(deadline, work) =>
                                 result.unwrap_or_else(|_| Err(if detached { ErrorKind::UnknownOutcome } else { ErrorKind::Timeout }.into())),
                         };
+                        // Free the slot before the caller can see the result: it may start its
+                        // next operation the instant `wait` returns.
+                        drop(permit);
                         let _ = send.send(result);
                     });
             }
