@@ -24,12 +24,6 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
-### Added
-- Release agents can draft and preview structured Discord announcements, then invoke a local script directly with a private webhook and durable delivery receipts; no scheduled or event-triggered posting.
-
-### Fixed
-- Remove trust in GitHub deployment claims from Discord posting, preventing forged deployment records from suppressing announcements.
-
 ## 0.4.1 — 2026-10-04
 
 ### Added

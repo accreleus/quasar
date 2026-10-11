@@ -322,4 +322,3 @@ Landing a branch into `develop`, in order:
 | `quasar-image` | image audit/build/re-pin/deploy |
 | `quasar-ticket` | per-ticket implementation discipline |
 | `ship-milestone` | driving a whole GitHub milestone |
-| `quasar-release-announcement` | drafting, previewing and manually posting a published release to Discord; see `.claude/skills/quasar-release-announcement/SKILL.md` |
