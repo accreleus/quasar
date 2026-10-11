@@ -1051,7 +1051,9 @@ export function getJob(token: string, jobId: string): Promise<Job> {
 }
 
 /** Adopted jobs only (409 `job_unmanaged`). 409 `schedule_locked` when an
- *  environment variable is authoritative over `interval_secs`. */
+ *  environment variable is authoritative over `interval_secs`, and for
+ *  `library.discovery` whenever `interval_secs` differs from the period it reports
+ *  (an equal value is accepted and not stored). */
 export function patchJob(token: string, jobId: string, req: JobPatchRequest): Promise<Job> {
   return apiFetch<Job>(`/admin/jobs/${jobId}`, { method: "PATCH", body: req, token });
 }

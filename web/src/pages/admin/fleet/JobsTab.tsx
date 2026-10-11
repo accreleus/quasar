@@ -37,6 +37,7 @@ import {
   fmtDurationMs,
   fmtSchedule,
   lockedIntervalAdvice,
+  lockedOwnerName,
   patchErrorMessage,
   resultChip,
   runNowErrorMessage,
@@ -261,7 +262,7 @@ export function JobsTab() {
       <span className="sub">
         {fmtSchedule(job.schedule)}
         {lockedBy && (
-          <span className="job-lock" title={`${lockedBy} sets this job's interval.`}>
+          <span className="job-lock" title={`${lockedOwnerName(lockedBy)} sets this job's interval.`}>
             <IconLock />
           </span>
         )}
@@ -694,7 +695,7 @@ function ScheduleModal({ job, token, onClose, onSaved }: ScheduleModalProps) {
             disabled={intervalLocked}
             hint={
               intervalLocked
-                ? `${s.locked_by} sets this interval. ${lockedIntervalAdvice(s.locked_by ?? "")}`
+                ? `${lockedOwnerName(s.locked_by ?? "")} sets this interval. ${lockedIntervalAdvice(s.locked_by ?? "")}`
                 : "Seconds. At least 60."
             }
           />

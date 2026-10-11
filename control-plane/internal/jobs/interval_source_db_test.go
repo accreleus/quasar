@@ -214,6 +214,15 @@ func TestPatchOfASourcedIntervalIsRefusedUnlessItIsTheValueReported(t *testing.T
 		t.Fatalf("message %q must name the setting, not the environment", got)
 	}
 
+	// Under the env override the advice is that Settings takes over once it is unset.
+	s.byEnv.Store(true)
+	status, body = doReq(t, http.MethodPatch, s.url, `{"interval_secs": 3600}`)
+	if got := decodeErr(t, body).Error.Message; status != http.StatusConflict ||
+		!strings.Contains(got, "Settings, Libraries, Scan interval") || strings.Contains(got, "admin-owned") {
+		t.Fatalf("env-locked PATCH: %d %q, want 409 pointing at Settings once unset", status, got)
+	}
+	s.byEnv.Store(false)
+
 	// The Jobs tab sends the interval back unchanged with a window edit.
 	patch := `{"interval_secs": 900, "window_start": "01:00", "window_end": "05:00"}`
 	status, body = doReq(t, http.MethodPatch, s.url, patch)

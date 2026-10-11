@@ -512,6 +512,12 @@ func TestPatchScheduleLockedByEnvOverride(t *testing.T) {
 		t.Errorf("locked PATCH code: %q", e.Error.Code)
 	}
 
+	// An ordinary job keeps the floor ahead of the lock: below it is 422 even while locked.
+	status, body = doReq(t, http.MethodPatch, srv.URL+"/v1/admin/jobs/"+def.ID, `{"interval_secs": 5}`)
+	if status != http.StatusUnprocessableEntity || decodeErr(t, body).Error.Code != "validation_failed" {
+		t.Errorf("locked PATCH below the floor: %d %s, want 422 validation_failed", status, body)
+	}
+
 	// The unrelated timezone field is NOT locked by the interval override —
 	// only the field the environment actually governs is refused.
 	status, body = doReq(t, http.MethodPatch, srv.URL+"/v1/admin/jobs/"+def.ID, `{"timezone": "Europe/London"}`)

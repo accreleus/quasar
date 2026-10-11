@@ -710,7 +710,9 @@ describe("JobsTab — schedule modal", () => {
     const input = (await screen.findByLabelText("Interval")) as HTMLInputElement;
     expect(input.disabled).toBe(true);
     expect(
-      screen.getByText(/QUASAR_LIBRARY_SCAN_INTERVAL sets this interval\./),
+      screen.getByText(
+        "QUASAR_LIBRARY_SCAN_INTERVAL sets this interval. Unset it to use Settings ▸ Libraries ▸ Scan interval.",
+      ),
     ).toBeTruthy();
   });
 
@@ -740,8 +742,9 @@ describe("JobsTab — schedule modal", () => {
     const input = (await screen.findByLabelText("Interval")) as HTMLInputElement;
     expect(input.disabled).toBe(true);
     expect(
-      screen.getByText(/instance_settings\.library_discovery_interval_minutes sets this interval\. Change it there/),
+      screen.getByText("Settings ▸ Libraries ▸ Scan interval sets this interval. Change it there."),
     ).toBeTruthy();
+    expect(screen.queryByText(/instance_settings/)).toBeNull();
     expect(screen.queryByText(/Unset it/)).toBeNull();
   });
 
