@@ -11,7 +11,7 @@
 // snapshot, so the video/input subtree re-renders only on status/channelOpen/
 // pointerLocked/stopping/hostLost/health, never per telemetry tick.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import "../../styles/session.css";
 import "../../styles/hud.css";
@@ -47,7 +47,7 @@ import {
   SessionBannerHost,
 } from "./sessionAlerts";
 import { SessionLoader } from "./SessionLoader";
-import { accessRevokedFailure, takenOverFailure, unreachableFailure } from "./sessionFailure";
+import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
@@ -305,9 +305,13 @@ export function SessionPage() {
     })();
   }, [signalCoords, authToken, sessionId, navigate, addToast]);
 
+  // Latched true when the loader's reveal begins (see revealReady). Read by the
+  // status hook's end-reason poll, which runs from callbacks that outlive a render.
+  const revealStartedRef = useRef(false);
+
   // Session status polling (host-lost, AS10-06 health, launch progress, #484
   // §3.2 reveal-cap) lives in useSessionStatus.ts. `pollEndReason` and
-  // `setLaunchFailure` are called from the WebRTC mount effect below: a
+  // `noteFailure` are called from the WebRTC mount effect below: a
   // signaling-relay disconnect polls once to explain itself, a failed
   // reconnect posts its own terminal verdict.
   const {
@@ -323,12 +327,12 @@ export function SessionPage() {
     externalOwner,
     launchDetail,
     launchFailure,
-    setLaunchFailure,
+    noteFailure,
     appPresented,
     hostAssigned,
     sessionRunning,
     pollEndReason,
-  } = useSessionStatus(authToken, sessionId, stopping);
+  } = useSessionStatus(authToken, sessionId, stopping, revealStartedRef);
 
   // sessionRuntime.ts: one runtime instance per transport generation (law L1)
   // — a replacement token re-seats signalCoords, destroying this runtime and
@@ -403,15 +407,13 @@ export function SessionPage() {
         // A refused mint (409) is how a session the control plane stopped
         // looks from here, so ask it why before settling on "unreachable".
         onReconnectFailed: (detail) => {
-          setLaunchFailure((prev) => prev ?? unreachableFailure(detail));
+          noteFailure(unreachableFailure(detail));
           void pollEndReason();
         },
         // #526: another attach won this session. Terminal HERE only — the
         // session and the app are still running, in the tab that took it. The
         // page states it and stops; it must not re-mint (sessionRuntime L6).
-        // Replaces our own guess ("unreachable"), never a server-authored verdict.
-        onSessionTakenOver: () =>
-          setLaunchFailure((prev) => (prev && prev.kind !== "unreachable" ? prev : takenOverFailure())),
+        onSessionTakenOver: () => noteFailure(takenOverFailure()),
       },
     });
     runtimeRef.current = rt;
@@ -754,7 +756,14 @@ export function SessionPage() {
   // #484 §3.2: the reveal gate is channelOpen AND appPresented, not
   // channelOpen alone — the compositor's transport comes up 30-50s before a
   // cold app draws anything, and revealing on transport alone is the defect.
-  const revealReady = channelOpen && appPresented;
+  // A held verdict the page could not show after the reveal keeps the loader (and
+  // its card) up instead; see showsAfterReveal.
+  const revealReady =
+    channelOpen && appPresented && (!launchFailure || showsAfterReveal(launchFailure));
+  // Layout, not passive: set synchronously at commit, before any network callback can run.
+  useLayoutEffect(() => {
+    if (revealReady) revealStartedRef.current = true;
+  }, [revealReady]);
   const [loaderDone, setLoaderDone] = useState(false);
   const loaderDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Latched, like SessionLoader's own handoff: the gate can retract (the channel
@@ -823,10 +832,7 @@ export function SessionPage() {
   // #516: the control plane's reason stands in for the recovery notice the dead
   // transport raises; #527: so does a takeover. Until the loader is gone it
   // states the verdict itself.
-  const bannerVerdict =
-    launchFailure?.kind === "access_revoked" || launchFailure?.kind === "taken_over"
-      ? launchFailure
-      : null;
+  const bannerVerdict = launchFailure && isBannerVerdict(launchFailure) ? launchFailure : null;
   const verdictBanner = loaderDone ? bannerVerdict : null;
 
   // Whether any of the banner blocks below is on screen. The HUD takes

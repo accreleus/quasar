@@ -5,13 +5,13 @@
 // `externalSize`/`externalResizeSupported` are also written from OUTSIDE this
 // hook, by useDisplayPatch.ts on ack/revert (same PATCH endpoint the poll
 // below reads) — their setters are returned raw for that hook to call
-// directly, same pattern as `setLaunchFailure` (SessionPage's reconnect path).
+// directly.
 import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { getSession } from "../../api/library";
 import type { Session } from "../../api/types";
 import { reportBestEffortFailure } from "../../lib/reportBestEffortFailure";
 import { healthBanner, type HealthBanner } from "./streamHealth";
-import { accessRevokedFailure, launchFailureFromSession, type LaunchFailure } from "./sessionFailure";
+import { accessRevokedFailure, launchFailureFromSession, settleFailure, showsAfterReveal, type LaunchFailure } from "./sessionFailure";
 
 /** #484 §3.3: cap on how long the loader waits for "app presented" after
  * "app booting" before revealing anyway. Build-time constant — the design
@@ -45,8 +45,8 @@ export interface SessionStatus {
   launchDetail: string | null;
   /** UX assessment §2.2: the loader's terminal verdict. Sticky once set. */
   launchFailure: LaunchFailure | null;
-  /** Raw setter — also called by SessionPage's WebRTC reconnect path on a failed reconnect. */
-  setLaunchFailure: Dispatch<SetStateAction<LaunchFailure | null>>;
+  /** The only way the sticky verdict is written — also called by SessionPage's WebRTC callbacks. */
+  noteFailure: (next: LaunchFailure) => void;
   /** #484 §3.2: has the app committed its first presented frame (or do we not need to wait for it)? */
   appPresented: boolean;
   /** #482: has a host accepted this session (`host_id` set, or state past `assigned`)? Sticky. */
@@ -63,6 +63,8 @@ export function useSessionStatus(
   authToken: string | null | undefined,
   sessionId: string | undefined,
   stopping: boolean,
+  /** True once the loader's reveal has begun: from then on it is inert, and only the loader can show a launch verdict. */
+  revealStartedRef: { readonly current: boolean },
 ): SessionStatus {
   const [launchDetail, setLaunchDetail] = useState<string | null>("scheduling host");
   // Sticky once set; derived only from the control plane's session record
@@ -112,12 +114,17 @@ export function useSessionStatus(
     if (session.state === "running") setSessionRunning(true);
   }, []);
 
-  // The server's stop reason replaces a verdict the client guessed earlier
-  // (e.g. "could not reach the stream"), so this one is not `prev ??`.
-  const noteAccessRevoked = useCallback((session: Parameters<typeof accessRevokedFailure>[0]) => {
-    const revoked = accessRevokedFailure(session);
-    if (revoked) setLaunchFailure((prev) => (prev?.kind === revoked.kind ? prev : revoked));
-  }, []);
+  // The one writer of the sticky verdict. The control plane's word about the
+  // session's end outranks the page's own "unreachable" guess (settleFailure).
+  // Once the loader's reveal has begun it is inert, so a verdict only the loader
+  // could show (failed, ended) is dropped rather than held with no notice.
+  const noteFailure = useCallback(
+    (next: LaunchFailure) => {
+      if (revealStartedRef.current && !showsAfterReveal(next)) return;
+      setLaunchFailure((prev) => settleFailure(prev, next));
+    },
+    [revealStartedRef],
+  );
 
   // When the WebRTC session drops unexpectedly, poll once to find out why — if
   // the server says failed/host_lost we show a clear "host went offline" message.
@@ -128,12 +135,13 @@ export function useSessionStatus(
       if (session.state === "failed" && session.state_detail === "host_lost") {
         setHostLost(true);
       }
-      noteAccessRevoked(session);
+      const verdict = launchFailureFromSession(session);
+      if (verdict) noteFailure(verdict);
     } catch (err) {
       // best-effort; the status bar message is already informative
       reportBestEffortFailure("silent-debug", "session: host-lost poll", err);
     }
-  }, [authToken, sessionId, stopping]);
+  }, [authToken, sessionId, stopping, noteFailure]);
 
   // AS10-06: 5s poll for computed stream health. Server computes, client only
   // displays and lets the user choose.
@@ -148,7 +156,8 @@ export function useSessionStatus(
           setHostLost(true);
           return;
         }
-        noteAccessRevoked(session);
+        const revoked = accessRevokedFailure(session);
+        if (revoked) noteFailure(revoked);
         notePlacement(session as Session);
         // #484 §3.2: suppress the non-critical banners while the app hasn't
         // presented — healthBanner() itself decides which kinds that covers.
@@ -196,7 +205,7 @@ export function useSessionStatus(
       cancelled = true;
       clearInterval(t);
     };
-  }, [authToken, sessionId, appPresented]);
+  }, [authToken, sessionId, appPresented, noteFailure]);
 
   // Polls quickly during launch for agent substage detail. #484 §3.2: used to
   // stop at channelOpen — 30-50s before a cold app draws anything — so this is
@@ -212,7 +221,7 @@ export function useSessionStatus(
         // The control plane owns "this launch is over". Ask it, don't guess.
         const verdict = launchFailureFromSession(session);
         if (verdict) {
-          setLaunchFailure((prev) => prev ?? verdict);
+          noteFailure(verdict);
           return;
         }
         notePlacement(session);
@@ -237,7 +246,7 @@ export function useSessionStatus(
       cancelled = true;
       clearInterval(timer);
     };
-  }, [authToken, sessionId, appPresented]);
+  }, [authToken, sessionId, appPresented, noteFailure]);
 
   // #484 §3.2 fail-open rule 2: bounds how long the loader stays gated on
   // `appPresented` — armed from mount, disarmed once it flips true. A
@@ -280,7 +289,7 @@ export function useSessionStatus(
     externalOwner,
     launchDetail,
     launchFailure,
-    setLaunchFailure,
+    noteFailure,
     appPresented,
     hostAssigned,
     sessionRunning,
