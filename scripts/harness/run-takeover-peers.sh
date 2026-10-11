@@ -28,6 +28,8 @@
 #               Chromium has no H.264 and will not decode this stream.
 #   PW_MODULES  directory holding node_modules/playwright-core
 #   CHROME      Chrome inside PW_IMAGE (default /usr/bin/google-chrome)
+#   BROWSER     firefox runs the stand-in scenarios in Playwright's own Firefox; PW_IMAGE
+#               must then be the Playwright image matching playwright-core's version
 #   IMAGE       agent dev image (default quasar-agent-dev:latest)
 #   PORT        signaling port on loopback (default 18535)
 #   SPA_DIST    a built web/dist for the spa-* scenarios (default: built here with
@@ -95,7 +97,7 @@ for scenario in "$@"; do
     failed=1
     continue
   fi
-  docker run --rm --network host -e CHROME="${CHROME:-/usr/bin/google-chrome}" \
+  docker run --rm --network host -e CHROME="${CHROME:-/usr/bin/google-chrome}" -e BROWSER="${BROWSER:-chrome}" \
     -v "$PW_MODULES/node_modules":/w/node_modules:ro \
     -v "$ROOT/scripts/harness/takeover-peers":/w/peers:ro -v "$SPA_DIST":/w/dist:ro -w /w \
     "$PW_IMAGE" sh -c 'xvfb-run -a -s "-screen 0 1280x800x24" node "$@"' _ "${driver[@]}" \

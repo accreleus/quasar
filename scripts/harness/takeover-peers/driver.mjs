@@ -1,11 +1,23 @@
 // Two real Chrome processes against the takeover browser host (#535).
 // usage: node driver.mjs <scenario> <ws-url> <peer.html url>
 // Prints one JSON object: what each page saw, and `checks` (name -> pass).
-import { chromium } from "playwright-core";
+import { chromium, firefox } from "playwright-core";
 
 const [scenario, wsUrl, pageUrl] = process.argv.slice(2);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const open = () => chromium.launch({
+// BROWSER=firefox: Playwright's own Firefox build, for what another engine does with
+// the second offer. It may lack an H.264 decoder; the audio PC and the input channel
+// still show whether the negotiation holds.
+const open = () => process.env.BROWSER === "firefox" ? firefox.launch({
+  headless: true,
+  firefoxUserPrefs: {
+    "media.peerconnection.ice.obfuscate_host_addresses": false,
+    "media.navigator.permission.disabled": true,
+    "media.autoplay.default": 0,
+    "media.gmp-gmpopenh264.enabled": true,
+    "media.webrtc.hw.h264.enabled": true,
+  },
+}) : chromium.launch({
   executablePath: process.env.CHROME || "/usr/bin/google-chrome",
   headless: false,
   args: ["--no-sandbox", "--autoplay-policy=no-user-gesture-required", "--allow-file-access-from-files",
