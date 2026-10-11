@@ -9,6 +9,7 @@ use crate::readiness::runtime_facts::{self, RuntimeFault, RuntimeView};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
+// A watchdog for "nothing happened", not a latency claim: no assertion here reads the clock against it.
 const BOUND: Duration = Duration::from_secs(20);
 const OPERATION: &str = "session-fixture-diagnostic";
 

@@ -261,6 +261,23 @@ fn exact_cleanup_waits_until_a_starting_launch_has_created_its_container() {
     assert_eq!(cleanup.wait().unwrap(), ExactRemoval::Referenced);
     assert_eq!(engine.state.lock().unwrap().managed_remove_calls, 0);
 }
+/// A client for `config` that runs on one runtime shared by the whole suite. A
+/// runtime per client put the suite near the descriptor limit (#295): each one is an
+/// epoll fd, eventfds and a thread, and a client is built on every `engine.client()`.
+fn test_client(config: RuntimeConfig) -> RuntimeClient {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(64)
+            .thread_name("helper-tests")
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    RuntimeClient(
+        quasar_runtime::RuntimeClient::with_handle(config, runtime.handle().clone()).unwrap(),
+    )
+}
 impl Engine {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -367,8 +384,9 @@ impl Engine {
     fn inject_accept_error(&self, error: io::Error) {
         self.injected_accept_errors.lock().unwrap().push_back(error);
     }
+    /// A client of its own (own admission slots) on the suite's one shared runtime.
     fn client(&self) -> RuntimeClient {
-        RuntimeClient::new(self.config.clone()).unwrap()
+        test_client(self.config.clone())
     }
     fn requests(&self, prefix: &str) -> usize {
         self.state
@@ -922,7 +940,7 @@ fn application_abandon_before_intent_is_a_noop_without_opening_docker_and_allows
     };
     let mut unavailable = engine.config.clone();
     unavailable.socket = "/tmp/quasar-preflight-engine-unavailable.sock".into();
-    let unavailable_client = RuntimeClient::new(unavailable).unwrap();
+    let unavailable_client = test_client(unavailable);
     assert!(unavailable_client
         .start_application(request.clone())
         .wait()
@@ -946,7 +964,7 @@ fn saturated_application_admission_leaves_no_intent_so_abandon_releases_the_retr
         Some(("POST /containers/create".into(), gate.clone()));
     let mut config = engine.config.clone();
     config.max_in_flight = 1;
-    let client = RuntimeClient::new(config).unwrap();
+    let client = test_client(config);
     let first = client.start_application(ApplicationRequest {
         operation: "application-admission-slot-first".into(),
         name: "quasar-sess-admission-slot-first".into(),
@@ -2179,8 +2197,8 @@ fn application_cleanup_retries_after_a_runtime_restart_without_touching_active_w
             .kind,
         ErrorKind::UnknownOutcome
     );
-    RuntimeClient::new(engine.config.clone())
-        .unwrap()
+    engine
+        .client()
         .recover_application_cleanup()
         .wait()
         .unwrap();
@@ -2418,11 +2436,7 @@ fn application_startup_retirement_reconciles_lost_create_without_adopting_active
             .kind,
         ErrorKind::UnknownOutcome
     );
-    RuntimeClient::new(engine.config.clone())
-        .unwrap()
-        .retire_applications()
-        .wait()
-        .unwrap();
+    engine.client().retire_applications().wait().unwrap();
     assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
     assert_eq!(engine.requests("DELETE /containers/"), 1);
 }
@@ -2619,8 +2633,8 @@ fn periodic_recovery_resumes_interrupted_no_id_abandonment_without_creating() {
         ErrorKind::UnknownOutcome
     );
     engine.state.lock().unwrap().inspect_code = None;
-    RuntimeClient::new(engine.config.clone())
-        .unwrap()
+    engine
+        .client()
         .recover_application_cleanup()
         .wait()
         .unwrap();
@@ -2705,8 +2719,8 @@ fn application_recovery_skips_a_locked_record_and_cleans_a_later_obligation() {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    RuntimeClient::new(engine.config.clone())
-        .unwrap()
+    engine
+        .client()
         .recover_application_cleanup()
         .wait()
         .unwrap_err();
@@ -2724,8 +2738,8 @@ fn periodic_application_recovery_does_not_retire_a_running_unrequested_record() 
         ..Default::default()
     };
     engine.client().start_application(request).wait().unwrap();
-    RuntimeClient::new(engine.config.clone())
-        .unwrap()
+    engine
+        .client()
         .recover_application_cleanup()
         .wait()
         .unwrap();
@@ -4022,7 +4036,8 @@ fn recovery_adopts_lost_create_without_starting_or_duplicating_it() {
 #[test]
 fn detached_run_replays_its_completed_operation_without_restarting() {
     let engine = Engine::new();
-    let client = engine.client();
+    // Own runtime on purpose: this guards a detached run keeping its client's runtime alive.
+    let client = RuntimeClient::new(engine.config.clone()).unwrap();
     let (helper, run) = request();
     drop(client.run_diagnostic(helper.clone(), run.clone()));
     drop(client);
@@ -4291,7 +4306,7 @@ fn changed_request_node_or_endpoint_cannot_mutate_a_recorded_operation() {
         } else {
             config.socket = "/tmp/not-the-original-engine.sock".into();
         }
-        let other = RuntimeClient::new(config).unwrap();
+        let other = test_client(config);
         assert_eq!(
             other
                 .cleanup_diagnostic(id.clone())
@@ -4853,7 +4868,7 @@ fn urlencoding(value: &str) -> String {
 fn client_on_another_endpoint(engine: &Engine) -> RuntimeClient {
     let mut config = engine.config.clone();
     config.socket = engine.config.socket.with_file_name("proxy.sock");
-    RuntimeClient::new(config).unwrap()
+    test_client(config)
 }
 
 fn served(engine: &Engine) -> usize {
@@ -5987,7 +6002,7 @@ fn gpu_probe_without_verified_ownership_is_refused() {
     // Another owner reading the same journals cannot act on them either.
     let mut foreign = replaced.config.clone();
     foreign.diagnostic_owner = Some("another-agent".into());
-    let other = RuntimeClient::new(foreign).unwrap();
+    let other = test_client(foreign);
     assert_eq!(
         other.stop_gpu_probe(id.clone()).wait().unwrap_err().kind,
         ErrorKind::UnknownOutcome
