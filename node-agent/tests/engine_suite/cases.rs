@@ -487,23 +487,34 @@ fn stop_crash_loop(ctx: &Ctx) -> String {
     "a crash-looping service stopped stays down".into()
 }
 
-/// The engine runs a service's own healthcheck, both ways and in both forms: exec with
-/// arguments, as the control-plane recipe's, and shell, as Postgres's.
+/// The engine runs a service's own healthcheck, both ways, and a passing one in both
+/// forms: shell, as Postgres's, and exec with arguments, as the control plane's.
 fn health(ctx: &Ctx) -> String {
-    let check = |test: &[&str]| Healthcheck {
-        test: test.iter().map(|s| s.to_string()).collect(),
-        interval_s: 1,
-        timeout_s: 2,
-        retries: 2,
-        start_period_s: 0,
+    let service = |what: &str, script: &str, test: &[&str]| {
+        let mut spec = ctx.service(what, script);
+        spec.healthcheck = Some(Healthcheck {
+            test: test.iter().map(|s| s.to_string()).collect(),
+            interval_s: 1,
+            timeout_s: 2,
+            retries: 2,
+            start_period_s: 0,
+        });
+        let id = ctx.create(spec);
+        ctx.start(&id);
+        id
     };
-    let mut good = ctx.service("healthy", "touch /tmp/suite-ready; exec sleep 300");
-    good.healthcheck = Some(check(&["CMD", "test", "-f", "/tmp/suite-ready"]));
-    let mut bad = ctx.service("unhealthy", "exec sleep 300");
-    bad.healthcheck = Some(check(&["CMD-SHELL", "test -f /tmp/never-there"]));
-    let (good, bad) = (ctx.create(good), ctx.create(bad));
-    ctx.start(&good);
-    ctx.start(&bad);
+    let ready = "touch /tmp/suite-ready; exec sleep 300";
+    let shell = service("healthy", ready, &["CMD-SHELL", "test -f /tmp/suite-ready"]);
+    let exec = service(
+        "healthy-exec",
+        ready,
+        &["CMD", "test", "-f", "/tmp/suite-ready"],
+    );
+    let bad = service(
+        "unhealthy",
+        "exec sleep 300",
+        &["CMD-SHELL", "test -f /tmp/never-there"],
+    );
     let settle = |id: &str, want: &str| {
         poll(Duration::from_secs(60), || {
             let health = ctx.inspect(id).and_then(|c| c.health);
@@ -516,9 +527,10 @@ fn health(ctx: &Ctx) -> String {
             )
         })
     };
-    settle(&good, "healthy");
+    settle(&shell, "healthy");
+    settle(&exec, "healthy");
     settle(&bad, "unhealthy");
-    "a passing check read healthy and a failing one unhealthy".into()
+    "a passing check read healthy in shell and in exec form, and a failing one unhealthy".into()
 }
 
 /// Removing a service leaves its named volume; a volume in use refuses removal; removing

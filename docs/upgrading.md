@@ -189,6 +189,20 @@ loads the dump into a fresh database, starts that version's control plane and wa
 report healthy; a restart part-way continues it. Details: `docs/configuration.md` "A migrating
 control-plane update, and `restore`".
 
+**On Podman, a restore back to 0.4.1 or earlier (or an older `edge` build) ends `unhealthy`
+after 300 s although it worked.** Those control planes have no health check of their own and
+Podman keeps none from a published image, so the restore cannot see one report healthy
+(`state=running health=none`). The dump is loaded and that version's control plane is left
+running on it.
+
+- **Check it yourself**, on that machine: `curl -fsS http://localhost:8080/health`
+  (`QUASAR_HTTP_PORT`) answers `{"status":"ok","db":"ok"}`, and the console signs you in.
+- **Do not run the restore again.** It would load the dump a second time and drop whatever was
+  written since.
+- The control plane gets a health check with its next update to a release after 0.4.1.
+
+Docker is not affected, and neither is a restore between two releases after 0.4.1.
+
 ### Reverting an agent
 
 A host row also offers **Revert** once that host has one succeeded update behind it: an apply

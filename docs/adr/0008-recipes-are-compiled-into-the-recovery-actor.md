@@ -18,7 +18,8 @@ control plane or node agent is always that release's actor (#352 decisions 5 and
 - **The recipe image label.** Every platform image carries `org.quasar.recipe=<integer>`, stamped
   by `deploy/build-images.sh` from a constant in the service's source tree, and asserted by
   `deploy/image-contract.json` (a tightening). A revision bumps only when a container needs a new
-  mount, environment input, port, device or capability; a code change alone does not bump it.
+  mount, environment input, port, device, capability or health check; a code change alone does not
+  bump it.
 - **A service's versioned specification** is recipe revision + machine inputs + image digest.
   Machine inputs only ever grow, each with a default, so a new revision never needs an operator
   step. Nothing else — no template shipped in an image, no service-specification table — can
