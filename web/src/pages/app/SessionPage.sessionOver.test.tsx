@@ -112,12 +112,18 @@ vi.mock("./SessionSwapController", () => ({
 
 let swapToast: ((n: React.ReactNode) => void) | null = null;
 let hud: Record<string, unknown> = {};
+let slowHudOnOpen = false;
 const hudOpen = vi.fn();
 vi.mock("./hud/Hud", async () => {
   const { forwardRef, useImperativeHandle } = await import("react");
   return {
     Hud: forwardRef((p: Record<string, unknown>, ref: React.Ref<unknown>) => {
       hud = p;
+      if (slowHudOnOpen && p.channelOpen) {
+        slowHudOnOpen = false;
+        const end = performance.now() + 20;
+        while (performance.now() < end) { /* make concurrent work yield after commit */ }
+      }
       useImperativeHandle(ref, () => ({ open: hudOpen, close() {}, stageClick() {} }));
       // The real HUD's Exit session button is wired to onStop, which stops the server session.
       return (
@@ -860,5 +866,60 @@ describe("SessionPage — the loader's handoff holds no launch verdict (#449)", 
     expect(screen.getByText(TAKEN)).not.toBeNull();
     expect(banners().length).toBe(1);
     expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
+  });
+});
+
+
+describe("SessionPage — a verdict landing between the reveal's commit and its effects (#449)", () => {
+  it("a stopping read that resolves before the reveal effect holds nothing, and the controls stay", async () => {
+    vi.useRealTimers();
+    await act(async () => { renderPage(); });
+    expect(lastOnChannel).not.toBeNull();
+    let deliver: ((s: {session: ReturnType<typeof makeSession>}) => void) | undefined;
+    getSession.mockImplementationOnce(() => new Promise((resolve) => { deliver = resolve; }));
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "degraded", message: "Network path interrupted" }));
+    expect(deliver).toBeTypeOf("function");
+    let landedBeforeEffect = false;
+    const observer = new MutationObserver(() => {
+      const root = document.querySelector(".sl-root");
+      if (!document.querySelector(".session-hint") && root && !root.classList.contains("is-locking") && deliver) {
+        landedBeforeEffect = true;
+                const fn = deliver;
+        deliver = undefined;
+        fn({ session: makeSession({ state: "stopping", state_detail: "stop requested" }) });
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", false);
+    slowHudOnOpen = true;
+    const ch: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
+    lastOnChannel?.(ch);
+    await new Promise((r) => setTimeout(r, 150));
+    observer.disconnect();
+    expect(landedBeforeEffect).toBe(true);
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "connected", message: "Connected" }));
+    await new Promise((r) => setTimeout(r, 1_500));
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(document.querySelectorAll(".banner").length).toBe(0);
+    expect(screen.getByTestId("hud")).not.toBeNull();
+  });
+});
+
+
+describe("SessionPage — the channel closing inside the reveal (#449)", () => {
+  it("ignores an ordinary verdict read after the retract", async () => {
+    const ch = await streamingWithMicAndCapture("app presented", 1_220);
+    await act(async () => ch.onclose?.());
+    currentSession = makeSession({ state: "stopping", state_detail: "stop requested" });
+    mintSignalingToken.mockReturnValue(new Promise(() => {}));
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "degraded", message: "Network path interrupted" }));
+    await advance(100);
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "connected", message: "Connected" }));
+    const reopened: Channel = { readyState: "open", onclose: null, send() {}, bufferedAmount: 0 };
+    await act(async () => lastOnChannel?.(reopened));
+    await advance(2_000);
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(document.querySelectorAll(".banner").length).toBe(0);
+    expect(screen.getByTestId("hud")).not.toBeNull();
   });
 });

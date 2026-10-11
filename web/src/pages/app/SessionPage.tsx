@@ -757,6 +757,9 @@ export function SessionPage() {
   // channelOpen alone — the compositor's transport comes up 30-50s before a
   // cold app draws anything, and revealing on transport alone is the defect.
   const revealReady = channelOpen && appPresented;
+  // In render, not an effect: an end-reason response can resolve between this
+  // commit and its effects. Monotonic and idempotent, so safe to write here.
+  if (revealReady) revealStartedRef.current = true;
   const [loaderDone, setLoaderDone] = useState(false);
   const loaderDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Latched, like SessionLoader's own handoff: the gate can retract (the channel
@@ -764,7 +767,6 @@ export function SessionPage() {
   // either way. A removal cancelled on the retract never happened again, and
   // the revoke banner waits for `loaderDone`.
   useEffect(() => {
-    if (revealReady) revealStartedRef.current = true;
     if (revealReady && !loaderDone && loaderDoneTimerRef.current === null) {
       loaderDoneTimerRef.current = setTimeout(() => setLoaderDone(true), LOADER_UNMOUNT_MS);
     }
