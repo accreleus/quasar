@@ -412,7 +412,7 @@ fn check_env_sanity() {
     }
 }
 
-/// #532: the control loop must run as a SPAWNED task, never as the `#[tokio::main]` future.
+/// #532: the control loop must run as a SPAWNED task, never as the runtime's `block_on` future.
 /// Tokio emits `runtime.spawn` spans only for spawned tasks, so on the main future the
 /// busiest future in the process is absent from tokio-console, not merely slow. Panic
 /// behaviour is unchanged: a panic still aborts, re-raised from the `JoinError`.
