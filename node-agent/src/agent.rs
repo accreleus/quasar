@@ -1136,6 +1136,17 @@ fn detect_capacity_blocking() -> capacity::SystemCapacity {
     cap
 }
 
+/// Load the plugins behind `elements` (`SessionManager::encoders_to_preload`) off the
+/// runtime's workers.
+async fn preload_encoders(elements: Vec<String>) {
+    if !elements.is_empty() {
+        offload_probe(move || {
+            crate::session::pipeline::preload_encoder_plugins(&elements);
+        })
+        .await;
+    }
+}
+
 /// A restart marker is proved before registration. This uses fresh device
 /// inventory and a bounded media child in the new process; prior connection
 /// probe results are deliberately not reused as startup proof.
@@ -2167,6 +2178,13 @@ async fn connect_and_run(
         let settings = first_settings.clone();
         offload_probe(move || probe_host_codecs(&settings, nvidia_host)).await
     };
+    // Before the first capacity report, so before any assignment is handled.
+    preload_encoders(sessions.mgr.encoders_to_preload(
+        first_settings.encoder,
+        &gpu_inventory,
+        host_codec_report.is_some(),
+    ))
+    .await;
     // The host readiness check set: advisory only, reported and logged, never gating.
     // Every input is already paid for (the vendor read, the #375 lib32 probe, the
     // codec probe above), so nothing here re-probes or launches a container.
@@ -2590,6 +2608,12 @@ async fn connect_and_run(
                                 })
                                 .await;
                                 mgr.probed_encoder = Some(mgr.runtime_settings.encoder);
+                                preload_encoders(mgr.encoders_to_preload(
+                                    mgr.runtime_settings.encoder,
+                                    &mgr.gpu_inventory,
+                                    mgr.host_codec_report.is_some(),
+                                ))
+                                .await;
                                 info!(
                                     "effective encoder changed by config_update; re-probed codecs: {:?}",
                                     mgr.host_codec_report
@@ -3400,6 +3424,34 @@ impl SessionManager {
         }
     }
 
+    /// The encoder elements to load ahead of the next launch: what a session resolves to
+    /// host-wide and on each GPU, whose plan (#301) can fall back to another vendor's
+    /// plugin. Empty while a session or a warm-up is held, because a plugin's init
+    /// beside a live compositor is the overlap the preload exists to avoid; the runner
+    /// then loads it ahead of its own source. `registry` is false when GStreamer did
+    /// not initialise.
+    fn encoders_to_preload(
+        &self,
+        encoder: EncoderChoice,
+        gpus: &[crate::messages::GpuCapacity],
+        registry: bool,
+    ) -> Vec<String> {
+        if !registry
+            || !self.pending.is_empty()
+            || !self.running.is_empty()
+            || self.warmup_reserved()
+        {
+            return Vec::new();
+        }
+        let knobs = crate::session::pipeline::EncoderKnobs::from_env();
+        std::iter::once("software")
+            .chain(gpus.iter().map(gpu_render_node_for_plan))
+            .flat_map(|node| {
+                crate::session::pipeline::probe_codec_support(encoder, knobs, node).elements
+            })
+            .collect()
+    }
+
     /// Is a warm-up currently holding an encode slot?
     fn warmup_reserved(&self) -> bool {
         self.warmup_control
@@ -3903,7 +3955,11 @@ impl SessionManager {
                     let runner = self.runner.clone();
                     let panic_tx = evt_tx.clone();
                     let panic_sid = session_id.clone();
-                    let thread = std::thread::spawn(move || {
+                    // Named: an unnamed thread keeps its creator's name, and a crash in
+                    // the runner then reads as a tokio worker's.
+                    let thread = std::thread::Builder::new()
+                        .name("quasar-session".into())
+                        .spawn(move || {
                         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
                                 if let Some(preparation) = preparation {
@@ -3971,7 +4027,9 @@ impl SessionManager {
                                 );
                             }
                         }
-                    });
+                    })
+                    // What `std::thread::spawn` does on failure.
+                    .expect("failed to spawn the session runner thread");
                     self.running.insert(
                         session_id.clone(),
                         RunningHandle {
@@ -8832,6 +8890,56 @@ mod tests {
         assert!(
             matches!(event,Some((_,SessionEvent::Failed(message))) if message.contains("image preparation failed"))
         );
+    }
+
+    /// #267: an unnamed thread keeps its creator's kernel name, so a crash in the runner
+    /// read as a tokio worker's.
+    #[test]
+    fn the_session_runner_thread_has_a_name_of_its_own() {
+        let (name_tx, name_rx) = std::sync::mpsc::channel();
+        let name_tx = Mutex::new(name_tx);
+        let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
+            move |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {
+                let name = std::thread::current().name().map(str::to_string);
+                let _ = name_tx.lock().unwrap().send(name);
+            },
+        ));
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(8);
+        start_seam_session(&mut mgr, "named", &evt_tx);
+        assert_eq!(
+            name_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Some("quasar-session".to_string())
+        );
+    }
+
+    /// #267: a plugin's init must not run beside a live compositor, so nothing is
+    /// preloaded while a session is held, whatever the registry holds.
+    #[test]
+    fn no_encoder_is_preloaded_while_a_session_is_held() {
+        gstreamer::init().unwrap();
+        let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {},
+        ));
+        let idle = mgr.encoders_to_preload(EncoderChoice::Openh264, &[], true);
+        if gstreamer::ElementFactory::find("openh264enc").is_some() {
+            assert_eq!(
+                idle,
+                ["openh264enc"],
+                "an idle agent preloads what it would build"
+            );
+        }
+        assert!(
+            mgr.encoders_to_preload(EncoderChoice::Openh264, &[], false)
+                .is_empty(),
+            "no registry, nothing to resolve"
+        );
+
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(8);
+        start_seam_session(&mut mgr, "live", &evt_tx);
+        assert_eq!(mgr.running.len(), 1, "setup: one running session");
+        assert!(mgr
+            .encoders_to_preload(EncoderChoice::Openh264, &[], true)
+            .is_empty());
     }
 
     /// #128: a new connection must not disturb the sessions the agent carried

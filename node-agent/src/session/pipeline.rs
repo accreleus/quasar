@@ -47,6 +47,7 @@ use probes::{
     attach_vulkan_parent_meta_probe,
 };
 mod encoders;
+pub use encoders::preload_encoder_plugins;
 pub(crate) use encoders::{
     describe_codec_plan, probe_codec_support, rearm_vulkan_rc, EncoderKnobs, ResolvedEncoder,
     VULKAN_ENCODER_NAME,
@@ -69,7 +70,9 @@ pub(crate) const VIDEO_PAYLOADER_NAME: &str = "quasar-video-payloader";
 mod source_branch;
 // Also the media host probe's source + convert stage (`session::probe_media`): the probe
 // must build the compositor arm production builds, not a stand-in.
-pub(crate) use source_branch::{build_gpu_convert_stage, build_video_source};
+pub(crate) use source_branch::{
+    build_gpu_convert_stage, build_video_source, pin_vulkan_encode_ring,
+};
 mod scale_stage;
 use scale_stage::build_scale_stage;
 pub use scale_stage::ScaleStage;
