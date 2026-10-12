@@ -131,6 +131,9 @@ criterion = "0.8"
 # #530: `#[tokio::test(start_paused = true)]` needs the `test-util` feature (not
 # part of `full`) — used by the select!-arm-disable regression tests in agent.rs.
 tokio = { version = "1", features = ["test-util"] }
+# A test peer's own DTLS certificate (`takeover_tests`): GStreamer generates one per
+# process and exposes no key, and the dev image has no `openssl` binary.
+rcgen = "0.13"
 
 [[bench]]
 name = "encode_metrics"
