@@ -468,9 +468,11 @@ The `intra-refresh` property naming mirrors `vah264enc`/`nvh264enc`, so it is di
   all three encoder elements call `gst_vulkan_encoder_request_rc_update()` from
   `vkh264enc-rc-fix.patch`, which is the reset-free retarget.
 
-Checked before removal: the fully patched 1.28.8 tree with and without the patch differs in that
-doc comment and nothing else; on 1.28.4 it differed in the comment and the one `picture_clear`
-line. Every later patch applies without it. Do not bring it back at a later re-pin.
+Checked before removal: the patch as it stood does not apply to 1.28.8 at all (its first hunk
+collides with upstream's `52008dc`). With its second hunk alone, the fully patched 1.28.8 tree
+differs from the tree without it in that doc comment and nothing else; on 1.28.4, where the whole
+patch applied, the difference was the comment and the one `picture_clear` line. Every later patch
+applies without it. Do not bring it back at a later re-pin.
 
 ### `vulkanav1enc.patch`
 
