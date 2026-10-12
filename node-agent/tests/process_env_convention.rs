@@ -5,17 +5,21 @@
 //! drivers all read the environment while a device comes up. glibc 2.41 stopped freeing
 //! it, which is what the agent images ship; the rule keeps the agent right on any libc.
 //!
-//! Every write is in the table below. Each but one is reached only from `main`'s
-//! `prepare_environment`, which runs before the tokio runtime is built. A reviewer
-//! cannot see a new `set_var` on a session path by reading the diff that adds it, so
-//! the table is enforced: put a new write in `prepare_environment` or
+//! Every write is in the table below. All but one are reached only from `main`'s
+//! `prepare_environment`, which runs before the tokio runtime is built. The one that is
+//! not, `nvidia_volume::apply_process_env`, breaks the rule and is left that way: it
+//! writes from a blocking-pool thread at agent start, after the runtime's workers exist.
+//!
+//! A reviewer cannot see a new `set_var` on a session path by reading the diff that adds
+//! it, so the table is enforced: put a new write in `prepare_environment` or
 //! `session::prepare_gst_env`, then count it here.
 
 use std::path::{Path, PathBuf};
 
-/// (file, writes). `nvidia_volume.rs` is the exception: `apply_process_env` needs the
-/// adopted driver volume, so it runs once at agent start, on a blocking thread, before
-/// GStreamer, EGL or a session exists.
+/// (file, writes). `nvidia_volume.rs` is the write that still happens with other
+/// threads running: `apply_process_env` needs the adopted driver volume, which is found
+/// at agent start. It runs once, before GStreamer, EGL or a session exists, beside the
+/// runtime's workers, the health server and the homes sweeper.
 const WRITES: &[(&str, usize)] = &[
     ("main.rs", 2),
     ("nvidia_volume.rs", 1),

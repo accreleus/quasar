@@ -219,7 +219,7 @@ fn main() {
     // (`probe-encoder --json`). Format knob: QUASAR_LOG_FORMAT.
     quasar_node_agent::logging::init_subscriber();
     prepare_environment(&mode);
-    quasar_node_agent::crash_report::install();
+    quasar_node_agent::crash_report::install(std::env::args().nth(1).as_deref().unwrap_or("agent"));
 
     // Built by hand, not `#[tokio::main]`, so everything above runs while this is the
     // only thread.
@@ -230,10 +230,10 @@ fn main() {
         .block_on(run(mode));
 }
 
-/// Every write this process makes to its own environment, made before the runtime's
-/// threads exist (`session::prepare_gst_env` says why). The exception is
-/// `nvidia_volume::apply_process_env`, which needs the adopted driver volume: it runs
-/// once at agent start, before GStreamer, EGL or a session exists.
+/// The writes this process makes to its own environment, made before the runtime's
+/// threads exist (`session::prepare_gst_env` says why). One write is not here and does
+/// not follow the rule: `nvidia_volume::apply_process_env` needs the adopted driver
+/// volume, so it runs at agent start on a blocking-pool thread, after the workers exist.
 fn prepare_environment(mode: &Mode) {
     // Belt-and-braces for launches that bypass the Dockerfile.vulkan entrypoint (dev
     // stacks, `scripts/dev/dev.sh run`, a bare `cargo run`): that entrypoint already

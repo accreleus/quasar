@@ -1647,7 +1647,11 @@ fn start_first_source<F: Fn(SessionEvent)>(
         cfg.stream.width,
         cfg.stream.height,
     ));
-    stage("source-start");
+    // With its tid: for the length of `start` this thread carries the name it lends the
+    // compositor's, so the tid is what tells a fault in here from one over there.
+    // SAFETY: `gettid` is a plain syscall.
+    let tid = unsafe { libc::gettid() };
+    tracing::info!(stage = "source-start", tid, "session stage: source-start");
     if let Err(e) = source.start() {
         tracing::error!(
             token = "runner-source-start-failed",

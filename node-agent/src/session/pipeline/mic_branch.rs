@@ -205,8 +205,9 @@ fn verify_mic_routing(pipeline: &gst::Pipeline) {
         return;
     }
     let log_span = tracing::Span::current();
-    // Named, and `expect` is what `std::thread::spawn` does on failure.
-    let check = std::thread::Builder::new().name("quasar-mic-check".into());
+    // Named, in the 15 bytes the kernel keeps; `expect` is what `std::thread::spawn`
+    // does on failure.
+    let check = std::thread::Builder::new().name("quasar-mic-chk".into());
     let _ = check
         .spawn(move || {
             // Re-enter the session span so this thread's lines carry session=<id>.
