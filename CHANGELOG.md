@@ -139,6 +139,7 @@ own; the two do not move together, and that is deliberate.
   instead of a timed sleep, and the elapsed-time assertion is gone. A few sibling timing tests
   in `images::tests` shared the same too-tight bound on a non-blocking call and got a generous
   one.
+- **A host no longer loses memory and GPU memory with every session a browser streamed (#564).** Each one left a GPU device open in the node agent until the agent restarted: about 33 MB of memory and 19 MiB of GPU memory per session on an NVIDIA host, less on AMD. Present since 0.4.0.
 
 ### Security
 - **Losing access to an app now ends the sessions already running it (#503).** Removing an entitlement, or setting a library provider to "Only me" or "Nobody", used to take effect at the next launch: a session that was already running kept running and its owner could reconnect to it. Now a session whose owner is no longer entitled to its app is stopped: before the request returns when an admin removes the access, and within about 30 seconds otherwise (a library sync that drops an uninstalled game, a swap into an app revoked mid-swap). That includes sessions on a provider's discovered games. A session whose swap has not finished after two minutes, or was in flight when the control plane restarted, is ended, because the app it runs can no longer be known. A stopped session cannot be reconnected to, even with a token minted earlier. A user still covered by another grant keeps their session. The activity log records how many sessions an admin's change stopped (contract amendment 23).

@@ -50,6 +50,7 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 - `vulkanh265enc-radv-coded-height.patch`
 - `vulkanav1enc-exact-frame-size.patch`
 - `vulkanav1enc-min-qindex.patch`
+- `gstreamer-webrtc-stats-rtpsession-leak.patch` (not a Vulkan patch: `webrtcbin`, #564)
 - `vkh265enc-profile-template.patch` (**candidate — not applied**, see below)
 
 They are applied — **in this order** — to a from-source GStreamer `1.28.4`
@@ -74,10 +75,12 @@ shaped by the rc-fix, intra-refresh, rc-retarget and output-state-on-resize patc
 `vulkanh265enc-radv-coded-height.patch` applies **eleventh**: it edits the coded-size
 block of `new_sequence()` in `vkh265enc.c` that `vulkanh265enc.patch` and
 `vulkan-enc-output-state-on-resize.patch` shape first.
-`vulkanav1enc-exact-frame-size.patch` (twelfth) and `vulkanav1enc-min-qindex.patch` (thirteenth,
-last) both edit `vkav1enc.c`, which `vulkanav1enc.patch` creates; the second was diffed on top of
+`vulkanav1enc-exact-frame-size.patch` (twelfth) and `vulkanav1enc-min-qindex.patch` (thirteenth)
+both edit `vkav1enc.c`, which `vulkanav1enc.patch` creates; the second was diffed on top of
 the first.
-None of the thirteen are upstreamed into GStreamer itself yet.
+`gstreamer-webrtc-stats-rtpsession-leak.patch` applies **fourteenth (last)**. It touches only
+`ext/webrtc/gstwebrtcstats.c`, which no other patch here does, so its place in the order is free.
+None of the fourteen are upstreamed into GStreamer itself yet.
 
 `vkh265enc-profile-template.patch` is a **candidate that is NOT wired into
 `deploy/Dockerfile.vulkan` and is therefore NOT applied to any image today.** It is a
@@ -1469,3 +1472,29 @@ floors the rate controller's minimum Q index at 2 whenever rate control is activ
 `useMinQIndex`, which needs the driver's per-group Q index capability). Index 2 is visually identical
 to 1, and every key frame at index 2 or above decoded. A constant-QP request is left alone.
 
+
+
+### `gstreamer-webrtc-stats-rtpsession-leak.patch`
+
+Quasar-authored (#564). `_get_data_channel_transport_stats()` in
+`gst-plugins-bad/ext/webrtc/gstwebrtcstats.c` emitted rtpbin's `get-session`, which returns a new
+reference to the `GstRtpSession` element, and neither used nor dropped it. Every `get-stats` on a
+`webrtcbin` with a data channel leaked one reference, so the element outlived its `webrtcbin`.
+
+A `GstElement` keeps every `GstContext` it was given until it is disposed, and a bin hands its
+contexts to each child. The leaked element therefore kept the encode pipeline's
+`gst.vulkan.device` and `gst.vulkan.instance`: one `GstVulkanDevice` stayed alive for every session
+a peer connected to, until the agent restarted. The agent asks for stats each time ICE settles
+(`record_media_evidence` in `node-agent/src/session/pipeline/webrtc.rs`) and every 5 s under
+`QUASAR_FEC_MODE=auto`. Each replaced transport (#535) leaked its own element; they all held the
+same device, so the cost was per session.
+
+The patch deletes the unused emit. Nothing read its result.
+
+Measured without it on the AMD lab host with the leaks tracer: after four streamed sessions, four
+`GstRtpSession` (2 refs each: ICE `Connected` and `Completed`) and four `GstVulkanDevice` /
+`GstVulkanInstance` still alive, nothing else per session. Regression test:
+`session::pipeline::takeover_tests::a_streamed_session_gives_back_the_encode_pipelines_contexts`
+(needs libnice and interpipe, so it runs in `quasar-agent-dev`).
+
+The fix is absent upstream: checked through 1.28.8, 1.29.2 and `main` on 2026-10-12 (the emit came in with upstream MR 8698), so a bump to 1.28.8 does not remove the need for this patch. Re-check at every GStreamer bump and drop the patch once a release drops the reference.

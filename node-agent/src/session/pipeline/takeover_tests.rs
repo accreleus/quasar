@@ -114,7 +114,7 @@ struct Host {
     keyframes: Arc<Mutex<Vec<Instant>>>,
     /// RECONFIGURE events that reached the encoder from downstream.
     reconfigures: Arc<AtomicU64>,
-    _metrics: Arc<SessionMetrics>,
+    metrics: Arc<SessionMetrics>,
     _trace_rx: mpsc::Receiver<(String, crate::session::runner::TraceEvent)>,
 }
 
@@ -225,7 +225,7 @@ impl Host {
             lever,
             keyframes,
             reconfigures,
-            _metrics: metrics,
+            metrics,
             _trace_rx: trace_rx,
         }
     }
@@ -1096,6 +1096,43 @@ fn twenty_takeovers_leak_nothing() {
         threads()
     );
     assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// #564: a session a peer connected to gives back the contexts its encode pipeline was
+/// handed. `webrtcbin`'s `get-stats`, asked for each time ICE settles, kept the video PC's
+/// rtpsession alive past teardown, and an element keeps its contexts until it is
+/// disposed: on a Vulkan session, the `GstVulkanDevice`.
+#[test]
+fn a_streamed_session_gives_back_the_encode_pipelines_contexts() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("contexts");
+    // Stands in for the producer's device (`runner::install_vulkan_context_bridge`).
+    let device = gst::Bin::new();
+    let held = device.downgrade();
+    let mut context = gst::Context::new("gst.vulkan.device", true);
+    context
+        .get_mut()
+        .unwrap()
+        .structure_mut()
+        .set("device", device);
+    host.pipeline.set_context(&context);
+    drop(context);
+    let peer = first_attach(&mut host);
+    drop(peer);
+    // The runner's `MetricsHookGuard`.
+    host.metrics.clear_hooks();
+    drop(host);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while held.upgrade().is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        held.upgrade().is_none(),
+        "an element of the ended session still holds the encode pipeline's contexts"
+    );
 }
 
 /// Evidence, not a gate: what the wire carries across a takeover, one line per SDP.
