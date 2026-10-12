@@ -1,0 +1,90 @@
+name: Agent live tests
+
+# The node-agent suite inside the image the repo builds for it (#571).
+#
+# ci.yml's node-agent job compiles against the distribution's GStreamer, which has
+# no gst-interpipe, so every test behind `live_webrtc_available` returns early there
+# and counts as passed: the takeover suite and the #564 leak test with it. Here they
+# run, and QUASAR_REQUIRE_LIVE_WEBRTC turns one that cannot into a failure.
+#
+# The image is pulled, never built. It is quasar-gst-toolchain:<hash>: the patched
+# GStreamer, gst-interpipe and the compositor that every agent image is built from,
+# published by the Images workflow under deploy/toolchain-hash.sh. A pull request
+# that changes a pin, a patch or the toolchain stage has a hash nothing has
+# published yet, and this job fails on it and says so: dispatch Images on the branch
+# (its toolchain job publishes the tag), then re-run. Building it here would cost
+# ~40 minutes on every push and publish nothing, because this workflow holds no
+# write scope and must not gain one. A rebuilt base image moves the hash the same
+# way, for every branch, until Images has run on develop.
+#
+# Not a required check: it is path-filtered, and a pull request that matches no
+# path never reports it.
+#
+# The nightly run is develop's. A schedule only fires from the default branch's copy
+# of this file, so that run checks develop out by name.
+on:
+  pull_request:
+    paths:
+      - 'node-agent/**'
+      - 'deploy/Dockerfile.vulkan'
+      - 'deploy/patches/**'
+      - 'deploy/pins.env'
+      - 'deploy/toolchain-hash.sh'
+      - '.github/workflows/agent-live.yml'
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: agent-live-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only, and no registry login: the toolchain and base packages are public.
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: node-agent (live WebRTC tests, toolchain image)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || '' }}
+      - name: Pull the toolchain image for these pins
+        id: image
+        run: |
+          set -euo pipefail
+          # The Images workflow's derivation: the base's digest is part of the hash.
+          base="$(grep -E '^QUASAR_BASE_IMAGE=' deploy/pins.env | head -1 | cut -d= -f2-)"
+          QUASAR_BASE_DIGEST="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$base")"
+          export QUASAR_BASE_DIGEST
+          bash deploy/toolchain-hash.sh --explain
+          image="ghcr.io/$GITHUB_REPOSITORY/quasar-gst-toolchain:$(bash deploy/toolchain-hash.sh)"
+          if ! docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "::error::No published toolchain image for these pins: $image. A pin, a patch, the toolchain stage or the base image changed. Run the Images workflow on this branch (its toolchain job builds and publishes that tag), then re-run this job."
+            exit 1
+          fi
+          docker pull --quiet "$image"
+          echo "ref=$image" >> "$GITHUB_OUTPUT"
+      - name: The image carries the pinned GStreamer
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          want="$(grep -E '^GST_VERSION=' deploy/pins.env | head -1 | cut -d= -f2-)"
+          # What cargo links against, then what the loader resolves at run time.
+          links="$(docker run --rm "$IMAGE" pkg-config --modversion gstreamer-1.0)"
+          loads="$(docker run --rm "$IMAGE" gst-inspect-1.0 --version | sed -n 's/^GStreamer //p')"
+          echo "deploy/pins.env pins GStreamer $want; the image links $links and loads $loads"
+          if [ "$links" != "$want" ] || [ "$loads" != "$want" ]; then
+            echo "::error::$IMAGE is not the GStreamer deploy/pins.env pins (GST_VERSION=$want): it links $links and loads $loads."
+            exit 1
+          fi
+      - name: Test
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          docker run --rm --ulimit core=0 -v "$PWD":/workspace -w /workspace/node-agent \
+            -e QUASAR_REQUIRE_LIVE_WEBRTC=1 "$IMAGE" cargo test --workspace

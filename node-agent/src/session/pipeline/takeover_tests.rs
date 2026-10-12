@@ -26,7 +26,8 @@ use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 /// The dev/runtime image has libnice, gst-interpipe and openh264; the devtools image
 /// `make test-rust` runs in has no gst-interpipe, and a CI runner may lack more. A test
 /// that returns early counts as passed, so the skip is written past libtest's capture,
-/// once, and `scripts/verify/agent.sh` restates it.
+/// once, and `scripts/verify/agent.sh` restates it. With `QUASAR_REQUIRE_LIVE_WEBRTC`
+/// set the skip is a failure (#571).
 fn live_webrtc_available() -> bool {
     gst::init().unwrap();
     let missing: Vec<&str> = [
@@ -41,6 +42,12 @@ fn live_webrtc_available() -> bool {
     .filter(|f| gst::ElementFactory::find(f).is_none())
     .collect();
     if !missing.is_empty() {
+        if std::env::var_os("QUASAR_REQUIRE_LIVE_WEBRTC").is_some() {
+            panic!(
+                "the live two-peer WebRTC tests cannot run: {missing:?} missing from this \
+                 image, and QUASAR_REQUIRE_LIVE_WEBRTC is set"
+            );
+        }
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| {
             use std::io::Write;
