@@ -1,9 +1,10 @@
 //! #267: an encoder's GStreamer plugin is loaded before a session's compositor starts,
-//! and a fault during any plugin load stays a SIGSEGV.
+//! and in the agent a fault during any plugin load stays a SIGSEGV.
 //!
 //! In a binary of its own because whether a plugin is loaded is process-global, and the
-//! lib's unit tests load plugins in whatever order they run. The fault itself (two
-//! threads in one GPU driver) needs the hardware; these pin what the fix is made of.
+//! lib's unit tests load plugins in whatever order they run. The fault itself needs the
+//! hardware, and nothing here shows the preload prevents it; these pin what the change
+//! is made of.
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -20,11 +21,18 @@ fn plugin_loaded(element: &str) -> bool {
 }
 
 #[test]
-fn init_turns_segtrap_off_and_the_preload_loads_what_is_registered() {
-    session::init_gstreamer(&SessionConfig::from_env(true, None)).unwrap();
+fn the_agent_turns_segtrap_off_and_the_preload_loads_what_is_registered() {
+    let cfg = SessionConfig::from_env(true, None);
+    session::init_gstreamer(&cfg).unwrap();
+    assert!(
+        gst::segtrap_is_enabled(),
+        "a probe child inits this way and keeps segtrap: exit 255 reads as an \
+         indeterminate probe, a signal as a failed check"
+    );
+    session::ensure_gst_init(&cfg).unwrap();
     assert!(
         !gst::segtrap_is_enabled(),
-        "segtrap on: a fault during a plugin load exits 255 blamed on that plugin"
+        "segtrap on in the agent: a fault during a plugin load exits 255 blamed on that plugin"
     );
 
     // What makes the preload necessary: the scan registered the element without
@@ -62,23 +70,16 @@ fn offset(src: &str, needle: &str) -> usize {
     src.len() - after(src, needle).len()
 }
 
-/// The order the fix depends on, which no unit test can run: both sites sit in
+/// The order the change depends on, which no unit test can run: both sites sit in
 /// functions that need a control plane or a compositor.
 #[test]
 fn the_preload_runs_before_a_session_can_start() {
     let agent = source("agent.rs");
-    let probe = after(&agent, "\nfn probe_host_codecs(");
-    let probe = &probe[..offset(probe, "\n}\n")];
-    assert!(
-        probe.contains("preload_encoder_plugins("),
-        "the codec probe no longer preloads the encoders it reports"
-    );
-    // The probe's report goes into the first capacity report, and only the loop after
-    // that report handles an assignment.
+    // The agent's preload is awaited before the loop that handles an assignment.
     let connect = after(&agent, "\nasync fn connect_and_run(");
     assert!(
-        offset(connect, "probe_host_codecs(") < offset(connect, "mgr.handle_control("),
-        "connect_and_run handles control messages before the codec probe has run"
+        offset(connect, "encoders_to_preload(") < offset(connect, "mgr.handle_control("),
+        "connect_and_run handles control messages before the encoder preload has run"
     );
 
     let runner = source("session/runner.rs");

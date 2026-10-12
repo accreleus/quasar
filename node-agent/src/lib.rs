@@ -14,6 +14,7 @@ pub mod config;
 mod container_ownership;
 pub mod cp_http;
 pub mod cp_tls;
+pub mod crash_report;
 /// Runtime-provisioned CUDA userspace (NVRTC) — what registers the `cuda*`
 /// GStreamer elements on an NVIDIA host (#545).
 pub mod cuda_runtime;

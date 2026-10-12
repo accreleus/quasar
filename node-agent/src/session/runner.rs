@@ -1604,6 +1604,7 @@ fn start_first_source<F: Fn(SessionEvent)>(
     emit: &F,
 ) -> Option<(AppSource, Option<VulkanContextBridge>)> {
     let cname0 = app_container_name(session_id, 0);
+    stage("source-build");
     let mut source =
         match AppSource::new(cfg, session_id, sink0, &cname0, res, cfg.container.clone()) {
             Ok(s) => s,
@@ -1646,6 +1647,7 @@ fn start_first_source<F: Fn(SessionEvent)>(
         cfg.stream.width,
         cfg.stream.height,
     ));
+    stage("source-start");
     if let Err(e) = source.start() {
         tracing::error!(
             token = "runner-source-start-failed",
@@ -1658,6 +1660,7 @@ fn start_first_source<F: Fn(SessionEvent)>(
         return None;
     }
     let vulkan_contexts = if pipeline::vulkan_image_transport(cfg) {
+        stage("vulkan-capture");
         match VulkanContextBridge::capture(&source) {
             Ok(contexts) => Some(contexts),
             Err(e) => {
@@ -1677,6 +1680,13 @@ fn start_first_source<F: Fn(SessionEvent)>(
         None
     };
     Some((source, vulkan_contexts))
+}
+
+/// One line per step of a launch, so the last one before a crash says how far the runner
+/// thread had got. The compositor logs from its own thread, and without these the runner
+/// is silent from the assignment to the encoder's line (#267).
+fn stage(name: &'static str) {
+    tracing::info!(stage = name, "session stage: {name}");
 }
 
 /// Run one session to completion on the calling (dedicated) thread, over the split
@@ -1773,9 +1783,9 @@ pub fn run_blocking(
             return;
         }
     };
-    // Must stay ahead of the source start: the plugin's init never runs while this
-    // session's compositor brings up its device. A no-op once the agent's codec probe
-    // has loaded it.
+    // Must stay ahead of the source start, so the plugin's init is over before this
+    // session's compositor exists. A no-op when the agent preloaded it; after a live
+    // encoder change it is the only load, and other sessions may be running beside it.
     pipeline::preload_encoder_plugins(&[&resolved_encoder.factory]);
     emit(SessionEvent::Starting);
     emit(SessionEvent::Progress("preparing resources and image"));
@@ -1906,6 +1916,7 @@ pub fn run_blocking(
     let (sig_tx, mut sig_rx) = tokio::sync::mpsc::unbounded_channel::<SignalMsg>();
     // GStreamer callbacks (ABR retarget, ICE/connection state) use the bounded diagnostic
     // lane; lifecycle/signaling stays on evt_tx.
+    stage("encode-build");
     let built = match pipeline::build_encode_pipeline(
         &cfg,
         sig_tx.clone(),
@@ -1999,6 +2010,7 @@ pub fn run_blocking(
         // the fresh Vulkan device is unusable before any session owns it: a GPU-global
         // `device_open_failed`, which the agent escalates to a drain+restart. A plain
         // build error stays per-session; `build_failure_reason` picks.
+        stage("encode-ready");
         if let Err(e) = encode_pipe.set_state(gst::State::Ready) {
             let reason = vulkan_fault::build_failure_reason(
                 "encode set READY for Vulkan device verification",
@@ -2030,6 +2042,7 @@ pub fn run_blocking(
             return;
         }
     }
+    stage("encode-play");
     if let Err(e) = encode_pipe.set_state(gst::State::Playing) {
         tracing::error!(
             token = "runner-encode-playing-failed",

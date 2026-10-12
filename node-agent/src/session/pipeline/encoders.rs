@@ -345,9 +345,11 @@ fn any_registered(names: &[String]) -> bool {
 
 /// Loads the plugin behind each of `elements` that is registered and not yet loaded;
 /// returns the plugins it loaded. The registry scan runs no plugin init in this process,
-/// the first use does: `vulkan`, `nvcodec` and `va` open the GPU driver stack there, and
-/// that must never run while a session's compositor brings up its own device on another
-/// thread (#267). Soft: an unregistered element is skipped, a failed load warns.
+/// the first use does, and for `vulkan`, `nvcodec` and `va` that init opens the GPU
+/// driver stack. Callers pick a moment when no compositor of theirs is coming up: the
+/// agent while it holds no session, the runner ahead of its own source (#267). That the
+/// overlap ever faulted is a suspicion, not a finding. Soft: an unregistered element is
+/// skipped, a failed load warns.
 pub fn preload_encoder_plugins<S: AsRef<str>>(elements: &[S]) -> Vec<String> {
     let mut loaded = Vec::new();
     for element in elements.iter().map(AsRef::as_ref) {
