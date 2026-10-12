@@ -492,29 +492,6 @@ impl GenerationObserver {
     }
 }
 
-/// Renames the calling thread for as long as it lives. The kernel copies a thread's name
-/// to every thread it creates, which is the only way to name one another crate spawns.
-struct LentThreadName([libc::c_char; 16]);
-
-impl LentThreadName {
-    fn new(name: &std::ffi::CStr) -> Self {
-        let mut own = [0; 16];
-        // SAFETY: `PR_GET_NAME` writes at most 16 bytes; `name` is NUL-terminated.
-        unsafe {
-            libc::prctl(libc::PR_GET_NAME, own.as_mut_ptr());
-            libc::prctl(libc::PR_SET_NAME, name.as_ptr());
-        }
-        Self(own)
-    }
-}
-
-impl Drop for LentThreadName {
-    fn drop(&mut self) {
-        // SAFETY: the buffer `PR_GET_NAME` filled is NUL-terminated.
-        unsafe { libc::prctl(libc::PR_SET_NAME, self.0.as_ptr()) };
-    }
-}
-
 /// Dropping it stops the pipeline and removes the container, so a rolled-back or
 /// superseded source leaves no orphan.
 pub struct AppSource {
@@ -787,10 +764,6 @@ impl AppSource {
     /// Set the source pipeline PLAYING. The compositor starts and announces its Wayland
     /// socket on the bus, which [`Self::on_bus_message`] turns into the container launch.
     pub fn start(&self) -> anyhow::Result<()> {
-        // The compositor spawns its thread unnamed inside this call, and such a thread
-        // keeps its creator's name. Until the compositor names it, lend it one, so a
-        // crash line tells it from this thread (#267).
-        let _name = LentThreadName::new(c"quasar-wayland");
         self.pipeline
             .set_state(gst::State::Playing)
             .map(|_| ())
