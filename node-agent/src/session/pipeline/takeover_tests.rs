@@ -1193,7 +1193,9 @@ fn a_streamed_session_gives_back_the_encode_pipelines_contexts() {
     host.pipeline.set_context(&context);
     drop(context);
     let peer = first_attach(&mut host);
-    drop(peer);
+    // A replaced transport too: a second browser takes the session over.
+    let taker = attach_as(&mut host, Peer::another_browser());
+    drop((peer, taker));
     // The runner's `MetricsHookGuard`.
     host.metrics.clear_hooks();
     drop(host);
