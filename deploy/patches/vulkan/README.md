@@ -1497,5 +1497,4 @@ Measured without it on the AMD lab host with the leaks tracer: after four stream
 `session::pipeline::takeover_tests::a_streamed_session_gives_back_the_encode_pipelines_contexts`
 (needs libnice and interpipe, so it runs in `quasar-agent-dev`).
 
-**Upstream status:** unreported as of 2026-10-12; `main` carries the same lines. Upstreamable as
-written.
+The fix is absent upstream: checked through 1.28.8, 1.29.2 and `main` on 2026-10-12 (the emit came in with upstream MR 8698), so a bump to 1.28.8 does not remove the need for this patch. Re-check at every GStreamer bump and drop the patch once a release drops the reference.

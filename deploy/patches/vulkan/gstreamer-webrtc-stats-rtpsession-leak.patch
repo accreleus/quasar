@@ -18,7 +18,8 @@
 # GstVulkanDevice alive per ended streamed session. Regression test:
 # session::pipeline::takeover_tests::a_streamed_session_gives_back_the_encode_pipelines_contexts.
 #
-# Upstream: present in 1.28.4 and on main as of 2026-10-12. Not submitted.
+# Upstream: still there in 1.28.8, 1.29.2 and on main (checked 2026-10-12). Re-check at
+# every GStreamer bump and drop this patch once a release drops the reference.
 #
 diff --git a/subprojects/gst-plugins-bad/ext/webrtc/gstwebrtcstats.c b/subprojects/gst-plugins-bad/ext/webrtc/gstwebrtcstats.c
 --- a/subprojects/gst-plugins-bad/ext/webrtc/gstwebrtcstats.c
