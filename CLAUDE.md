@@ -269,8 +269,7 @@ session memory `current-focus.md`, not this file.**
   #489 is an NVIDIA-driver NVENC teardown UAF spanning the 595 **and** 610
   branches — no driver pin escapes it — and Vulkan is immune, so the default path
   is off the affected library. **AV1 on Vulkan exists as of
-  2026-08-22 (merge 345bad8c): our vendored `vulkanav1enc.patch` (gst-chain patch 8,
-  with the `gstreamer-vulkan-rc-retarget-no-reset.patch` library fix as patch 7)
+  2026-08-22 (merge 345bad8c): our vendored `vulkanav1enc.patch` (gst-chain patch 7)
   adds a genuine Vulkan Video AV1 encoder (needs NO ring pin, unlike HEVC).
   **The three per-codec knobs `QUASAR_VULKAN_H264` / `QUASAR_VULKAN_HEVC` /
   `QUASAR_VULKAN_AV1` all DEFAULT ON (2026-08-22)** — they exist only to
@@ -334,7 +333,7 @@ session memory `current-focus.md`, not this file.**
   probe caps-negotiation artifact (unpinned `profile` negotiating `main-444`), the
   production path always pinned `profile=main`, and the gate
   (`scale_stage::vulkan_resize_validated_for_codec`) now passes every codec.
-  HARD DEPENDENCY: the image must also carry the 9th vendored patch
+  HARD DEPENDENCY: the image must also carry the 8th vendored patch
   `vulkan-enc-output-state-on-resize.patch` — without it a grow step in any second
   Vulkan session is an NVENC MMU fault (Xid 31), because the encoder kept the launch-size
   DPB. Each rung step on Vulkan is an encoder session restart (VRAM flat over 84 flips).

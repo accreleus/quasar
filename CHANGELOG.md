@@ -50,7 +50,7 @@ own; the two do not move together, and that is deliberate.
   default app without it shows a readiness failure on the console page and is not launched.
   Contract: protocol amendment 19.
 - **Dependencies updated** (eleven patch and minor bumps: the node agent's tokio, tokio-rustls, http, bytes and libc; the web client's vite, jsdom and Node types; the docs site's astro, sharp and starlight-openapi).
-- **The node agent image builds GStreamer 1.28.8 (was 1.28.4), and with it libnice 0.1.24 (was 0.1.23).** The newer upstream release brings its fixes on the paths Quasar uses: WebRTC now checks the peer's certificate against the fingerprint in its answer, the RTP session is hardened against malformed and excessive input, the Vulkan encoders get fixes, and the VA encoders handle their output buffers better. One hunk of a vendored patch is upstream now and was dropped; the rest of the patch stack is unchanged.
+- **The node agent image builds GStreamer 1.28.8 (was 1.28.4), and with it libnice 0.1.24 (was 0.1.23).** The newer upstream release brings its fixes on the paths Quasar uses: WebRTC now checks the peer's certificate against the fingerprint in its answer, the RTP session is hardened against malformed and excessive input, the Vulkan encoders get fixes, and the VA encoders handle their output buffers better. One vendored patch is gone: the part of it that worked is upstream now, and the rest never took effect. The other patches are unchanged.
 
 ### Removed
 - **The old console path is gone: a console session runs only direct (#461).** Console mode

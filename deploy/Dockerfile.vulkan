@@ -308,13 +308,15 @@ RUN set -eux; \
 ARG CARGO_C_VERSION
 RUN cargo install cargo-c --version "${CARGO_C_VERSION}" --locked
 
-# Patched GStreamer 1.28.8 -> /opt/gst. Ten vendored patches, applied in the order below; the
+# Patched GStreamer 1.28.8 -> /opt/gst. Thirteen vendored patches, applied in the order below; the
 # order is load-bearing (each was diffed against the tree with its predecessors applied) and is
 # documented per patch in deploy/patches/vulkan/README.md. The fifth is a diagnostic A/B arm for
 # Lab-host Xid 32: it serializes every GstVulkanQueue wrapper through one process-wide submit domain.
-# The tenth (issue #507) recycles the per-frame Vulkan bitstream buffer and must apply LAST,
-# because it was diffed against gstvkencoder-private.c with all nine predecessors applied.
-# All ten must land after the clone and before Meson config/build.
+# The ninth (issue #507) recycles the per-frame Vulkan bitstream buffer and must apply after the
+# eight before it, because it was diffed against gstvkencoder-private.c with them applied.
+# All of them must land after the clone and before Meson config/build.
+# (gstreamer-vulkan-rc-retarget-no-reset.patch, once seventh, was removed at the 1.28.8 bump:
+# deploy/patches/vulkan/README.md says why.)
 # gstreamer-webrtc-stats-rtpsession-leak.patch (#564) touches only ext/webrtc, so its
 # place in the order is free; it goes last.
 ARG GST_VERSION
@@ -337,7 +339,6 @@ RUN git clone --depth 1 --branch "${GST_VERSION}" \
     && git apply /tmp/vkh264enc-num-slices.patch \
     && git apply /tmp/gstreamer-vulkan-global-submit-lock.patch \
     && git apply /tmp/vkh264enc-intra-refresh.patch \
-    && git apply /tmp/gstreamer-vulkan-rc-retarget-no-reset.patch \
     && git apply /tmp/vulkanav1enc.patch \
     && git apply /tmp/vulkan-enc-output-state-on-resize.patch \
     && git apply /tmp/vkenc-bitstream-buffer-pool.patch \
