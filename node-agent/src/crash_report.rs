@@ -6,65 +6,79 @@
 //!
 //! 1. the signal and its code, the thread's name and tid, the fault address, ip and sp;
 //! 2. `stack`: 48 words from sp, read through `/proc/self/mem` so a bad sp cannot fault;
-//! 3. `map`: from `/proc/self/maps`, each executable mapping and each file's offset-0
-//!    mapping, which is its load base;
+//! 3. `map`: from `/proc/self/maps`, each executable mapping and each file mapping at
+//!    offset 0;
 //! 4. `frame`: the unwinder's return addresses, as raw hex;
-//! 5. `end of report`. A report without it was cut short.
+//! 5. `end of report`, or `end of report, incomplete` when the mappings could not be
+//!    read to their end. A report with neither was cut short.
 //!
 //! # Reading a report
 //!
 //! Symbols are worked out offline, against the files of the same image. For an address
 //! (ip, a `frame`, or a `stack` word that falls in an executable mapping, such as the
 //! return address a wild call leaves at sp): find the `map` line whose range holds it,
-//! take that file's offset-0 `map` line as its base, and ask
+//! take the lowest `map` line of the same file as that file's base, and ask
 //! `llvm-symbolizer --obj=<file> 0x<address - base>` or
-//! `addr2line -Cfie <file> 0x<address - base>`. The first `frame` lines are the
-//! reporter's own and the signal trampoline; the fault is the frame equal to ip.
+//! `addr2line -Cfie <file> 0x<address - base>`. The lowest, because a file can have
+//! more than one line at offset 0: lld lets a small library's code share its first page.
+//! The first `frame` lines are the reporter's own and the signal trampoline; the fault
+//! is the frame equal to ip.
 //!
 //! # What the handler does and does not promise
 //!
 //! - Steps 1, 2, 3 and 5 make syscalls and do arithmetic on their own static buffers: no
-//!   lock, no allocation, no timer.
+//!   lock, no allocation, no timer. A syscall a signal interrupts is made again.
 //! - Step 4 is glibc's `backtrace`, which is not async-signal-safe by contract. What it
 //!   does with the libgcc and glibc the images ship: it finds unwind data without a lock
-//!   (the `locked` test holds the loader's lock on another thread), and it locks and
-//!   allocates only when the walk reaches code registered at run time, a JIT's, that
-//!   libgcc has not sorted yet. A fault inside `malloc` below such a frame would
-//!   deadlock it; nothing bounds that. With no unwind data for an address it reads the
-//!   code there, and faults if that is unmapped, so it runs last, and not at all when ip
-//!   is outside every readable executable mapping (a wild call or jump). It can still
-//!   fault on a smashed stack; see "re-entry" below.
+//!   (the `locked` test has another thread inside `dlopen`), and it locks and allocates
+//!   only when the walk reaches code registered at run time, a JIT's, that libgcc has
+//!   not sorted yet. A fault inside `malloc` below such a frame would deadlock it;
+//!   nothing bounds that. With no unwind data for an address it reads the code there,
+//!   and faults if that is unmapped, so it runs last, and not at all when ip is outside
+//!   every readable executable mapping (a wild call or jump).
+//! - Step 4 can still fault, on a smashed stack. Frames are printed once the walk is
+//!   over, so that loses every frame, and it can change the signal the process dies of;
+//!   see "re-entry" below.
 //! - It can stall: a `write` to stderr blocks for as long as the log pipe is full.
 //! - It can be skipped: on a thread with no alternate stack and a smashed or exhausted
 //!   stack the kernel cannot run a handler at all. The process dies of SIGSEGV unreported.
 //!
 //! # How the process dies
 //!
-//! As it did before. Once the report is out the reporter retires: every signal it took
-//! goes back to the disposition [`install`] found. A fault then runs again and meets
-//! Rust's stack-overflow check (SIGSEGV, SIGBUS) or the default action; a raised signal,
-//! and SIGTRAP, which does not run again, is raised again. Retiring all of them, not
-//! only the reported one, lets the abort that ends Rust's stack-overflow message die by
-//! default, with no second handler frame on Rust's 8 KiB alternate stack, where a
-//! larger version of this handler was seen not to fit.
+//! As it did before, with two exceptions named below. Once the report is out the
+//! reporter retires: every signal it took goes back to the disposition [`install`]
+//! found. A fault then runs again and meets Rust's stack-overflow check (SIGSEGV,
+//! SIGBUS) or the default action. Retiring all of them, not only the reported one, lets
+//! the abort that ends Rust's stack-overflow message die by default, with no second
+//! handler frame on Rust's 8 KiB alternate stack, where a larger version of this handler
+//! was seen not to fit.
 //!
+//! - **A raised signal, and SIGTRAP**, which does not run again: the reporter ends the
+//!   process by the signal's default action. First exception: that includes a SIGSEGV
+//!   or SIGBUS the process raises at itself, which Rust's handler alone swallowed once.
+//! - **The init of a PID namespace** (a pod, a bare `docker run`): the kernel drops a
+//!   raised default-fatal signal for it, so wherever the reporter ends the process that
+//!   way and the process is still there, it exits with 128 + the signal, the status a
+//!   shell gives such a death. Second exception: a fatal signal *sent* to such a
+//!   process, which the kernel would have dropped, now ends it.
 //! - **Sent by another process** (`kill`): not a fault, so one line and no report, and
-//!   the reporter stays. What follows is what followed before this module. The first
-//!   SIGSEGV or SIGBUS is ignored, because Rust's handler swallowed it, and the second
-//!   kills; any other signal kills at once. A real fault after a survived `kill` is
-//!   still reported.
+//!   the reporter stays. What follows is what followed before this module, and is kept
+//!   on purpose: the first SIGSEGV or SIGBUS is survived, because Rust's handler
+//!   swallowed it, and the second kills; any other signal kills at once. A real fault
+//!   after a survived `kill` is still reported.
 //! - **Re-entry**, a second signal while a report is being written: no second report.
-//!   On another thread, that signal is set to its default and the fault runs again, so
-//!   the process dies of it. On the reporting thread it is the report that faulted, and
-//!   the process is made to die of the signal being reported instead. Two cases escape
-//!   that: a fault with the reported signal's own number, which the kernel answers with
-//!   the default action because the signal is blocked, and a fault on Rust's alternate
-//!   stack with no room left for a second frame, which it answers with SIGSEGV. The
-//!   first loses only Rust's stack-overflow message. The second changes the signal the
-//!   process dies of, and only for a report of something other than SIGSEGV, on a
-//!   Rust-spawned thread, whose unwinding then faults. The other reported signals are
-//!   left unblocked in `sa_mask` for this: blocked, the kernel would always kill with
-//!   the report's own fault.
+//!   On another thread, that thread waits for the report to finish, two seconds at
+//!   most, and then dies of its own signal by default: dying at once cut the report
+//!   off. On the reporting thread it is the report that faulted, and the process is
+//!   made to die of the signal being reported instead. Two cases escape that: a fault
+//!   with the reported signal's own number, which the kernel answers with the default
+//!   action because the signal is blocked, and a fault on Rust's alternate stack with no
+//!   room left for a second frame, which it answers with SIGSEGV. The first loses only
+//!   Rust's stack-overflow message. The second changes the signal the process dies of,
+//!   and only for a report of something other than SIGSEGV, on a Rust-spawned thread,
+//!   whose unwinding then faults. The other reported signals are left unblocked in
+//!   `sa_mask` for this: blocked, the kernel would always kill with the report's own
+//!   fault.
 
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
@@ -96,6 +110,9 @@ static SETUP: OnceLock<Setup> = OnceLock::new();
 static REPORTING: AtomicBool = AtomicBool::new(false);
 static REPORTER_TID: AtomicI32 = AtomicI32::new(0);
 static REPORTED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+static REPORT_DONE: AtomicBool = AtomicBool::new(false);
+/// How long a thread that faults during another's report waits for it to finish.
+const WAIT_FOR_REPORT_MS: i64 = 2000;
 /// Whether a SIGSEGV / SIGBUS sent by another process has been ignored once already.
 static SENT_ONCE: [AtomicBool; SIGNALS.len()] = [const { AtomicBool::new(false) }; SIGNALS.len()];
 
@@ -273,9 +290,14 @@ unsafe fn thread_name(name: &mut [u8; 16]) -> usize {
     name.iter().position(|&b| b == 0).unwrap_or(name.len())
 }
 
-/// Give every reported signal back to what [`install`] found and, when returning would
-/// not raise `signal` again, raise it. `sent`: it was raised, not a fault. SIGTRAP is a
-/// trap, so the instruction after it is what would run.
+/// Whether returning from the handler raises `signal` again. A fault does; a raised
+/// signal does not, and nor does SIGTRAP, a trap: the instruction after it runs.
+fn runs_again(signal: libc::c_int, sent: bool) -> bool {
+    !sent && signal != libc::SIGTRAP
+}
+
+/// Give every reported signal back to what [`install`] found. A signal that would not
+/// run again ends the process here.
 unsafe fn retire(signal: libc::c_int, sent: bool) {
     for (index, (reported, _)) in SIGNALS.iter().enumerate() {
         match SETUP.get() {
@@ -287,20 +309,50 @@ unsafe fn retire(signal: libc::c_int, sent: bool) {
             }
         }
     }
-    if sent || signal == libc::SIGTRAP {
-        libc::raise(signal);
+    if !runs_again(signal, sent) {
+        die_of(signal);
     }
 }
 
 /// End the process by `signal`'s default action, from inside a handler that may have
-/// it blocked.
-unsafe fn die_of(signal: libc::c_int) {
+/// it blocked. Where that does not end it, exit with the status a shell gives such a
+/// death: the kernel drops a raised default-fatal signal for a PID namespace's init.
+unsafe fn die_of(signal: libc::c_int) -> ! {
     libc::signal(signal, libc::SIG_DFL);
     let mut only: libc::sigset_t = std::mem::zeroed();
     libc::sigemptyset(&mut only);
     libc::sigaddset(&mut only, signal);
     libc::pthread_sigmask(libc::SIG_UNBLOCK, &only, std::ptr::null_mut());
     libc::raise(signal);
+    libc::_exit(128 + signal)
+}
+
+/// Let the thread that is reporting finish, for a bounded time.
+unsafe fn wait_for_the_report() {
+    let now_ms = || {
+        let mut now: libc::timespec = std::mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+        now.tv_sec * 1000 + now.tv_nsec / 1_000_000
+    };
+    let started = now_ms();
+    let nap = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    while !REPORT_DONE.load(Ordering::SeqCst) && now_ms() - started < WAIT_FOR_REPORT_MS {
+        libc::nanosleep(&nap, std::ptr::null_mut());
+    }
+}
+
+/// A `read`-like call, made again for as long as a signal interrupts it: `sa_mask` is
+/// empty, so an unrelated handler can run in the middle of a report.
+unsafe fn uninterrupted(mut call: impl FnMut() -> isize) -> isize {
+    loop {
+        let got = call();
+        if got >= 0 || *libc::__errno_location() != libc::EINTR {
+            return got;
+        }
+    }
 }
 
 /// Step 2. `/proc/self/mem` instead of a read through sp: the kernel answers an
@@ -314,12 +366,14 @@ unsafe fn stack_words(scratch: &mut Scratch, sp: u64) {
     let got = if fd < 0 {
         -1
     } else {
-        let got = libc::pread(
-            fd,
-            scratch.words.as_mut_ptr().cast(),
-            STACK_WORDS * WORD,
-            sp as libc::off_t,
-        );
+        let got = uninterrupted(|| {
+            libc::pread(
+                fd,
+                scratch.words.as_mut_ptr().cast(),
+                STACK_WORDS * WORD,
+                sp as libc::off_t,
+            )
+        });
         libc::close(fd);
         got
     };
@@ -363,8 +417,9 @@ fn parse_map(line: &[u8]) -> Option<(u64, u64, bool, bool)> {
     ))
 }
 
-/// Step 3. Returns whether `ip` lies in a readable executable mapping.
-unsafe fn maps(scratch: &mut Scratch, ip: u64) -> bool {
+/// Step 3. `Some`: whether `ip` lies in a readable executable mapping. `None`: the
+/// mappings could not be read to their end, so nothing can be said about `ip`.
+unsafe fn maps(scratch: &mut Scratch, ip: u64) -> Option<bool> {
     let mut line = Line {
         bytes: &mut scratch.out,
         len: 0,
@@ -377,12 +432,18 @@ unsafe fn maps(scratch: &mut Scratch, ip: u64) -> bool {
         line.begin()
             .text(b"map: /proc/self/maps did not open")
             .end();
-        return false;
+        return None;
     }
     let (mut ip_mapped, mut held) = (false, 0);
     loop {
-        let got = libc::read(fd, scratch.chunk.as_mut_ptr().cast(), scratch.chunk.len());
-        if got <= 0 {
+        let got = uninterrupted(|| {
+            libc::read(fd, scratch.chunk.as_mut_ptr().cast(), scratch.chunk.len())
+        });
+        if got < 0 {
+            libc::close(fd);
+            return None;
+        }
+        if got == 0 {
             break;
         }
         for &byte in &scratch.chunk[..got as usize] {
@@ -404,7 +465,7 @@ unsafe fn maps(scratch: &mut Scratch, ip: u64) -> bool {
         }
     }
     libc::close(fd);
-    ip_mapped
+    Some(ip_mapped)
 }
 
 /// A signal another process sent. One line, then what happened before this module:
@@ -479,28 +540,40 @@ unsafe fn report(signal: libc::c_int, info: &libc::siginfo_t, context: *mut c_vo
     line.text(b" ip ").hex(ip).text(b" sp ").hex(sp).end();
 
     stack_words(scratch, sp);
-    let ip_mapped = maps(scratch, ip);
+    let mapped = maps(scratch, ip);
 
     let mut line = Line {
         bytes: &mut scratch.out,
         len: 0,
     };
-    if ip_mapped {
-        let count = libc::backtrace(scratch.frames.as_mut_ptr(), MAX_FRAMES as libc::c_int);
-        for (number, frame) in scratch.frames[..count.max(0) as usize].iter().enumerate() {
-            line.begin()
-                .text(b"frame ")
-                .dec(number as i64)
-                .text(b" ")
-                .hex(*frame as u64)
-                .end();
+    match mapped {
+        Some(true) => {
+            let count = libc::backtrace(scratch.frames.as_mut_ptr(), MAX_FRAMES as libc::c_int);
+            for (number, frame) in scratch.frames[..count.max(0) as usize].iter().enumerate() {
+                line.begin()
+                    .text(b"frame ")
+                    .dec(number as i64)
+                    .text(b" ")
+                    .hex(*frame as u64)
+                    .end();
+            }
         }
-    } else {
-        line.begin()
+        Some(false) => line
+            .begin()
             .text(b"frame: none, ip is in no readable executable mapping")
-            .end();
+            .end(),
+        None => line
+            .begin()
+            .text(b"frame: none, the mappings could not be read to their end")
+            .end(),
     }
-    line.begin().text(b"end of report").end();
+    line.begin()
+        .text(if mapped.is_some() {
+            &b"end of report"[..]
+        } else {
+            &b"end of report, incomplete"[..]
+        })
+        .end();
 }
 
 extern "C" fn handler(signal: libc::c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
@@ -522,10 +595,12 @@ extern "C" fn handler(signal: libc::c_int, info: *mut libc::siginfo_t, context: 
             if tid == REPORTER_TID.load(Ordering::SeqCst) {
                 die_of(REPORTED_SIGNAL.load(Ordering::SeqCst));
             }
-            libc::signal(signal, libc::SIG_DFL);
-            if sent {
-                libc::raise(signal);
+            // Another thread is mid-report, and dying now would cut it off.
+            wait_for_the_report();
+            if !runs_again(signal, sent) {
+                die_of(signal);
             }
+            libc::signal(signal, libc::SIG_DFL);
             return;
         }
         REPORTED_SIGNAL.store(signal, Ordering::SeqCst);
@@ -533,6 +608,7 @@ extern "C" fn handler(signal: libc::c_int, info: *mut libc::siginfo_t, context: 
         report(signal, info, context, tid);
         // From here a later signal on this thread is its own, not the report's.
         REPORTER_TID.store(0, Ordering::SeqCst);
+        REPORT_DONE.store(true, Ordering::SeqCst);
         retire(signal, sent);
     }
 }
