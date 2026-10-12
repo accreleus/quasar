@@ -39,7 +39,12 @@ fn the_aux_senders_of_every_transport_die_with_the_session() {
         let second = attach(&mut host);
         first.stop();
         assert_eq!(host.replaced.len(), 2, "the takeover replaced no transport");
-        held.extend(aux_senders(&host, "replacement"));
+        let replacement = aux_senders(&host, "replacement");
+        // "Every transport": the takeover built a pair of its own, not the launch pair again.
+        for ((name, new), (_, old)) in replacement.iter().zip(&held) {
+            assert_ne!(new.upgrade(), old.upgrade(), "{name} is the launch one");
+        }
+        held.extend(replacement);
         drop((first, second));
         // The runner's `MetricsHookGuard`: the drain hook holds the `rtpgccbwe`.
         host.metrics.clear_hooks();
