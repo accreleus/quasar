@@ -205,44 +205,49 @@ fn verify_mic_routing(pipeline: &gst::Pipeline) {
         return;
     }
     let log_span = tracing::Span::current();
-    std::thread::spawn(move || {
-        // Re-enter the session span so this thread's lines carry session=<id>.
-        let _log_span = log_span.enter();
-        // Let the pa stream finish connecting and the subscribe callback settle.
-        for (attempt, delay_ms) in [(1u8, 2_000u64), (2, 3_000)] {
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    // Named, in the 15 bytes the kernel keeps; `expect` is what `std::thread::spawn`
+    // does on failure.
+    let check = std::thread::Builder::new().name("quasar-mic-chk".into());
+    let _ = check
+        .spawn(move || {
+            // Re-enter the session span so this thread's lines carry session=<id>.
+            let _log_span = log_span.enter();
+            // Let the pa stream finish connecting and the subscribe callback settle.
+            for (attempt, delay_ms) in [(1u8, 2_000u64), (2, 3_000)] {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                let device = sink
+                    .property::<Option<String>>("device")
+                    .unwrap_or_default();
+                if device == QUASAR_MIC_SINK_NAME {
+                    if attempt > 1 {
+                        tracing::info!("microphone: routing re-verified on '{device}' — healed");
+                    }
+                    return;
+                }
+                tracing::error!(
+                    token = "mic-routing-wrong-device",
+                    "microphone: stream landed on '{device}' instead of \
+                 '{QUASAR_MIC_SINK_NAME}' — the mic would loop into the outbound \
+                 stream; re-asserting the device (attempt {attempt})"
+                );
+                sink.set_property("device", QUASAR_MIC_SINK_NAME);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2_000));
             let device = sink
                 .property::<Option<String>>("device")
                 .unwrap_or_default();
             if device == QUASAR_MIC_SINK_NAME {
-                if attempt > 1 {
-                    tracing::info!("microphone: routing re-verified on '{device}' — healed");
-                }
-                return;
-            }
-            tracing::error!(
-                token = "mic-routing-wrong-device",
-                "microphone: stream landed on '{device}' instead of \
-                 '{QUASAR_MIC_SINK_NAME}' — the mic would loop into the outbound \
-                 stream; re-asserting the device (attempt {attempt})"
-            );
-            sink.set_property("device", QUASAR_MIC_SINK_NAME);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2_000));
-        let device = sink
-            .property::<Option<String>>("device")
-            .unwrap_or_default();
-        if device == QUASAR_MIC_SINK_NAME {
-            tracing::info!("microphone: routing re-verified on '{device}' — healed");
-        } else {
-            tracing::error!(
-                token = "mic-routing-unrecoverable",
-                "microphone: routing STILL on '{device}' after re-assertion — mic \
+                tracing::info!("microphone: routing re-verified on '{device}' — healed");
+            } else {
+                tracing::error!(
+                    token = "mic-routing-unrecoverable",
+                    "microphone: routing STILL on '{device}' after re-assertion — mic \
                  audio is mixing into the outbound stream; manual fix: \
                  pactl move-sink-input <idx> {QUASAR_MIC_SINK_NAME} in the sidecar"
-            );
-        }
-    });
+                );
+            }
+        })
+        .expect("failed to spawn the mic routing check thread");
 }
 
 /// Build the mic decode bin with a `sink` ghost pad over the depayloader's sink.

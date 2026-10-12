@@ -643,11 +643,17 @@ fn start(mut command: Command, timeout: Duration) -> Result<(Child, String), Str
         return Err("the console terminal helper has no stdout".into());
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    // 15 bytes is all the kernel keeps of a thread's name.
+    let reader = std::thread::Builder::new().name("quasar-vt-read".into());
+    let spawned = reader.spawn(move || {
         let mut line = String::new();
         let _ = BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(line);
     });
+    if let Err(e) = spawned {
+        stop(&mut child);
+        return Err(format!("could not read the console terminal helper: {e}"));
+    }
     let line = match rx.recv_timeout(timeout) {
         Ok(line) => line,
         Err(_) => {

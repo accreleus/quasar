@@ -876,32 +876,49 @@ pub fn gst_initialised() -> bool {
 }
 
 /// Initialise GStreamer exactly once per process (see [`init_gstreamer`]). Safe from any
-/// thread; subsequent calls are no-ops.
+/// thread; subsequent calls are no-ops. The agent's init, and so the one place segtrap
+/// goes off: it turns a SIGSEGV on any thread during a plugin load into `exit(-1)`
+/// blamed on that plugin, and off, the fault keeps its signal and its core (#267). A
+/// probe child calls [`init_gstreamer`] itself and keeps it: its exit code is its
+/// verdict, and 255 reads as indeterminate where a signal reads as a failed check.
 pub fn ensure_gst_init(cfg: &SessionConfig) -> anyhow::Result<()> {
     let mut result = Ok(());
     GST_INIT.call_once(|| {
+        // SAFETY: sets one flag GStreamer reads at each plugin load. Called raw because
+        // the safe wrapper panics after init, which a test process has already done.
+        unsafe { gstreamer::ffi::gst_segtrap_set_enabled(glib::ffi::GFALSE) };
         result = init_gstreamer(cfg);
     });
     result
 }
 
-/// Initialise GStreamer for a session. Must run before any other GStreamer API.
+/// The per-process registry file. Per-process forces a scan against the runtime GPU:
+/// VA/NVENC/Vulkan elements register only for a GPU present at scan time, and the image
+/// bakes its registry with none.
+fn gst_registry_path() -> String {
+    format!("/tmp/quasar-gst-registry-{}.bin", std::process::id())
+}
+
+/// Every environment write GStreamer, Mesa and the compositor depend on. `main` calls it
+/// before the runtime's threads exist: `setenv` beside a `getenv` on another thread is a
+/// use-after-free on a libc that frees the old array, and all three read the environment
+/// while a device comes up. Guarded by `tests/process_env_convention.rs`.
 ///
-/// Stale-registry trap: VA/NVENC/Vulkan elements are device-probing and register only
-/// for a GPU present at registry-scan time, and the image bakes its registry with no
-/// GPU. So point `GST_REGISTRY` at a fresh per-process path to force a re-scan against
-/// the runtime GPU (registers `vah264enc` / `nvcudah264enc` + `cudaconvert` /
-/// `vulkanh264enc`). Unconditional, and harmless for software: gst init runs once per
-/// process at the startup codec probe, whose cfg carries the env-baseline encoder, but a
-/// `config_update` can flip a software-env host to a hardware encoder with no restart —
-/// gating the fresh scan on `cfg.encoder` would strand such a host on the baked registry
-/// with no hardware elements.
+/// `GST_REGISTRY` is unconditional: a `config_update` can flip a software-env host to a
+/// hardware encoder with no restart, and a scan gated on the encoder would strand it on
+/// the baked registry.
+pub fn prepare_gst_env() {
+    std::env::set_var("GST_REGISTRY", gst_registry_path());
+    apply_intel_vulkan_video_knob();
+    pipeline::pin_vulkan_encode_ring();
+}
+
+/// Initialise GStreamer. Must run before any other GStreamer API, and after
+/// [`prepare_gst_env`] in a process that streams. Removes a registry file a previous
+/// process left under this pid, which a container restart reuses.
 pub fn init_gstreamer(_cfg: &SessionConfig) -> anyhow::Result<()> {
     use anyhow::Context;
-    let path = format!("/tmp/quasar-gst-registry-{}.bin", std::process::id());
-    let _ = std::fs::remove_file(&path);
-    std::env::set_var("GST_REGISTRY", &path);
-    apply_intel_vulkan_video_knob();
+    let _ = std::fs::remove_file(gst_registry_path());
     gstreamer::init().context("failed to initialise GStreamer")?;
     Ok(())
 }

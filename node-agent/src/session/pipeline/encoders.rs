@@ -343,6 +343,44 @@ fn any_registered(names: &[String]) -> bool {
     names.iter().any(|n| gst::ElementFactory::find(n).is_some())
 }
 
+/// Loads the plugin behind each of `elements` that is registered and not yet loaded;
+/// returns the plugins it loaded. The registry scan runs no plugin init in this process,
+/// the first use does, and for `vulkan`, `nvcodec` and `va` that init opens the GPU
+/// driver stack. Callers pick a moment when no compositor of theirs is coming up: the
+/// agent while it holds no session, the runner ahead of its own source (#267). That the
+/// overlap ever faulted is a suspicion, not a finding. Soft: an unregistered element is
+/// skipped, a failed load warns.
+pub fn preload_encoder_plugins<S: AsRef<str>>(elements: &[S]) -> Vec<String> {
+    let mut loaded = Vec::new();
+    for element in elements.iter().map(AsRef::as_ref) {
+        let Some(factory) = gst::ElementFactory::find(element) else {
+            continue;
+        };
+        if factory.plugin().is_some_and(|p| p.is_loaded()) {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        match factory.load() {
+            Ok(factory) => {
+                let plugin = factory
+                    .plugin()
+                    .map_or_else(|| element.to_string(), |p| p.plugin_name().to_string());
+                tracing::info!(
+                    token = "encoder-plugin-preloaded",
+                    "GStreamer plugin {plugin} loaded for {element} in {} ms",
+                    started.elapsed().as_millis()
+                );
+                loaded.push(plugin);
+            }
+            Err(e) => tracing::warn!(
+                token = "encoder-plugin-preload-failed",
+                "could not load the GStreamer plugin for {element} ahead of a session: {e}"
+            ),
+        }
+    }
+    loaded
+}
+
 /// Keyframe interval in frames for a session at `fps`. The host `gop` setting is
 /// defined at the 60 fps REFERENCE (gop=60 ⇒ one keyframe/second); scaling keeps the
 /// cadence in TIME fps-invariant. Unscaled, 120 fps keyframes twice as often, and
