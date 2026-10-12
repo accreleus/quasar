@@ -24,6 +24,13 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Upgrading
+- **This release changes the database (four migrations, 0099–0102), so there is no going back below it.** Once applied, an older control plane will not start, and a failed update is not put back automatically. The only way back is a restore of the dump the update takes first (`docs/upgrading.md`, "The one-way migration rule").
+- **Update from the console, by hand.** Fleet ▸ Releases ▸ Update Quasar waits for live sessions to end before it replaces the control plane (force ends them). Automatic updates never install a release that changes the database.
+- **Nothing to migrate yourself.** The migrations add a session stop reason, a library "missing since" mark and a pending provider-access table, and drop the retired console settings from stored console configs. On a source install, redeploy the new ref.
+- **After the update, if console mode is on,** turn it off and on once, so the agent learns whether the host has a sound device and udev data (`console_sound` and `console_udev` read `unknown` until then). On an SELinux console host, run `prepare-host.sh --console` again. If you set `QUASAR_PULSE_IMAGE`, it must name an image from this release.
+- **It worked when** Fleet ▸ Releases shows this release on the control plane and every host and the run ends succeeded.
+
 ### Added
 - **A direct-display console session now passes hidraw nodes, not just evdev, so Steam Input identifies a controller correctly (#462).** The agent grants every `/dev/hidrawN` node present at launch (or, with an `input_devices` allowlist, just the allowlisted events' hidraw siblings, resolved through sysfs) plus a device-cgroup rule for hidraw's major, so a plugged controller shows up in Steam Big Picture as itself instead of falling back to an evdev GUID match. The hidraw devices are listed from sysfs and passed by their host paths, so an owned install, whose agent sees neither the host's `/dev/hidraw*` nor `/host/dev`, is covered too. A controller plugged in for the first time mid-session still isn't identified correctly until the next session start — the container gets no new `/dev/hidrawN` node without a udev client of its own — but keeps working over evdev in the meantime.
 - **A console session's desktop now drives the monitor itself (#458).** For an app that declares `runtime_spec.direct_display`, the node agent launches the app container with the console GPU's card node, the sound device, the input devices (plugged in later too) and the host's udev, and the desktop takes the display on its own DRM backend: no compositor, pipeline or second display server in between. The session is running once it is displaying, and reports the monitor's mode.
