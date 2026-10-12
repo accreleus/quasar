@@ -2316,3 +2316,6 @@ fn browser_host() {
         }
     });
 }
+
+/// What the host hands `webrtcbin` per transport, and whether it is given back.
+mod aux_senders;
