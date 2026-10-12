@@ -1,0 +1,42 @@
+# gstreamer-webrtc-stats-rtpsession-leak.patch
+#
+# Quasar-authored (issue #564). Not a Vulkan patch: it lives here because this is the
+# directory the GStreamer build applies from.
+#
+# What: _get_data_channel_transport_stats() no longer emits rtpbin's "get-session".
+#
+# Why: "get-session" hands back a new reference to the GstRtpSession element. This
+# function never used it and never dropped it, so every "get-stats" on a webrtcbin
+# that has a data channel leaked one reference. The element then outlives webrtcbin,
+# and a GstElement keeps every GstContext it was given until it is disposed. In
+# Quasar that is the encode pipeline's gst.vulkan.device and gst.vulkan.instance, so
+# one GstVulkanDevice (its VkDevice, device fds and driver threads) stayed alive per
+# session a peer connected to. The agent asks for stats each time ICE settles
+# (pipeline/webrtc.rs record_media_evidence) and every 5 s under QUASAR_FEC_MODE=auto.
+#
+# Measured without it (AMD lab host, leaks tracer): one GstRtpSession (2 refs) and one
+# GstVulkanDevice alive per ended streamed session. Regression test:
+# session::pipeline::takeover_tests::a_streamed_session_gives_back_the_encode_pipelines_contexts.
+#
+# Upstream: present in 1.28.4 and on main as of 2026-10-12. Not submitted.
+#
+diff --git a/subprojects/gst-plugins-bad/ext/webrtc/gstwebrtcstats.c b/subprojects/gst-plugins-bad/ext/webrtc/gstwebrtcstats.c
+--- a/subprojects/gst-plugins-bad/ext/webrtc/gstwebrtcstats.c
++++ b/subprojects/gst-plugins-bad/ext/webrtc/gstwebrtcstats.c
+@@ -1061,16 +1061,12 @@ _get_data_channel_transport_stats (GstWebRTCBin * webrtc, GstStructure * s)
+   struct transport_stream_stats ts_stats = {
+     NULL,
+   };
+-  GObject *gst_rtp_session;
+ 
+   if (!webrtc->priv->data_channel_transport)
+     return;
+ 
+   ts_stats.stream = webrtc->priv->data_channel_transport;
+ 
+-  g_signal_emit_by_name (webrtc->rtpbin, "get-session",
+-      ts_stats.stream->session_id, &gst_rtp_session);
+-
+   ts_stats.transport_id =
+       _get_stats_from_dtls_transport (webrtc, ts_stats.stream->transport,
+       GST_WEBRTC_ICE_STREAM (ts_stats.stream->stream), NULL, s);

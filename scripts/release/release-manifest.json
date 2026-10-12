@@ -87,7 +87,8 @@
     "deploy/patches/vulkan/vkenc-bitstream-buffer-pool.patch",
     "deploy/patches/vulkan/vulkanh265enc-radv-coded-height.patch",
     "deploy/patches/vulkan/vulkanav1enc-exact-frame-size.patch",
-    "deploy/patches/vulkan/vulkanav1enc-min-qindex.patch"
+    "deploy/patches/vulkan/vulkanav1enc-min-qindex.patch",
+    "deploy/patches/vulkan/gstreamer-webrtc-stats-rtpsession-leak.patch"
   ],
   "fork_carried_provenance": {
     "purpose": "Compositor modifications are no longer applied as a patch stack: since 2026-07-26 Dockerfile.vulkan builds the Quasar fork's develop branch (GST_WAYLAND_DISPLAY_REF above), which carries each former gst-wayland-display-*.patch as a commit. The patch files remain in deploy/patches/vulkan/ as the authored record for upstream submission (see its README and docs/third-party-pins.md); they are provenance, not build inputs, so they are deliberately NOT in the patches list below. That list is only an inventory: release-preflight.sh checks that each listed file exists and records its sha256. It does NOT verify that the list matches the Dockerfile's git apply sequence, cover every patch the build applies, or check apply order -- keeping those in step is a manual step when a patch is added or reordered.",

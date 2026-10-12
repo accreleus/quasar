@@ -315,6 +315,8 @@ RUN cargo install cargo-c --version "${CARGO_C_VERSION}" --locked
 # The tenth (issue #507) recycles the per-frame Vulkan bitstream buffer and must apply LAST,
 # because it was diffed against gstvkencoder-private.c with all nine predecessors applied.
 # All ten must land after the clone and before Meson config/build.
+# gstreamer-webrtc-stats-rtpsession-leak.patch (#564) touches only ext/webrtc, so its
+# place in the order is free; it goes last.
 ARG GST_VERSION
 
 # The gst-chain patches, copied HERE — directly above their only consumer — so a
@@ -341,7 +343,8 @@ RUN git clone --depth 1 --branch "${GST_VERSION}" \
     && git apply /tmp/vkenc-bitstream-buffer-pool.patch \
     && git apply /tmp/vulkanh265enc-radv-coded-height.patch \
     && git apply /tmp/vulkanav1enc-exact-frame-size.patch \
-    && git apply /tmp/vulkanav1enc-min-qindex.patch
+    && git apply /tmp/vulkanav1enc-min-qindex.patch \
+    && git apply /tmp/gstreamer-webrtc-stats-rtpsession-leak.patch
 
 # Upstream's docs/meson.build subdir_done() workaround (carried verbatim from
 # games-on-whales/gst-wayland-display's build recipe at the same pin) — with -Ddoc=disabled,
