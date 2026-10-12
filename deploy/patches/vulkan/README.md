@@ -22,7 +22,7 @@
 > ARE still applied at build time. Only the `gst-wayland-display-*` ones moved into the branch.
 
 These patches split across **two upstreams**: ten apply to a from-source **GStreamer**
-`1.28.4` checkout (`gst-plugins-bad`), while the patches named `gst-wayland-display-*` apply to the
+`1.28.8` checkout (`gst-plugins-bad`), while the patches named `gst-wayland-display-*` apply to the
 **gst-wayland-display** compositor checkout itself (see their dedicated sections below). Both sets
 are applied inside `deploy/Dockerfile.vulkan`, each at its own upstream's build step.
 
@@ -53,7 +53,7 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 - `gstreamer-webrtc-stats-rtpsession-leak.patch` (not a Vulkan patch: `webrtcbin`, #564)
 - `vkh265enc-profile-template.patch` (**candidate — not applied**, see below)
 
-They are applied — **in this order** — to a from-source GStreamer `1.28.4`
+They are applied — **in this order** — to a from-source GStreamer `1.28.8`
 checkout (see `deploy/Dockerfile.vulkan`); the rc-fix patch touches the same
 `new_sequence` region as the DPB patch, so it must apply **after** it, and the
 num-slices patch touches `new_sequence`, `_setup_slice`, `_setup_codec_pic`, and
@@ -455,14 +455,19 @@ The `intra-refresh` property naming mirrors `vah264enc`/`nvh264enc`, so it is di
 ### `gstreamer-vulkan-rc-retarget-no-reset.patch`
 
 **Library fix, codec-neutral (vulkanh264enc / vulkanh265enc / vulkanav1enc).** Two fixes to
-`gst-libs/gst/vulkan/gstvkencoder-private.c`: (A) `gst_vulkan_encoder_request_rc_reset()` raises
+`gst-libs/gst/vulkan/gstvkencoder-private.c`, of which the patch now carries only (A); (B) went
+upstream in GStreamer 1.28.8 and its hunk was dropped at that bump (2026-10-12):
+(A) `gst_vulkan_encoder_request_rc_reset()` raises
 only `VK_VIDEO_CODING_CONTROL_ENCODE_RATE_CONTROL_BIT_KHR` — previously it ORed in
 `RESET_BIT_KHR` unconditionally, resetting the video session, invalidating the DPB, and forcing an
 IDR on every live bitrate retarget (an ABR loop retargeting ~1/s would keyframe ~1/s). Genuine
 session (re)starts keep `RESET_BIT` (`gst_vulkan_encoder_start` / `set_rc_mode` set
 `session_reset` directly). (B) `gst_vulkan_encoder_picture_clear` released DPB slots with
 `slotIndex > 0`, so slot 0 — typically the first frame of a session — leaked for the session's
-lifetime; `>= 0` (the unset sentinel is `-1`). Depends on `vkh264enc-rc-fix.patch` (which
+lifetime; `>= 0` (the unset sentinel is `-1`). Upstream commit `52008dc` ("vulkan: encoder:
+release DPB slot 0 when clearing a picture") is the same change, and it also sets
+`dpb_slot.slotIndex = -1` in `gst_vulkan_encoder_picture_init`; do not re-add the hunk at a
+later re-pin. Depends on `vkh264enc-rc-fix.patch` (which
 introduces `request_rc_reset`). Applies seventh. See the `vulkanav1enc-campaign` record for the
 overlap analysis.
 
@@ -1330,7 +1335,7 @@ The DPB patch (vendored verbatim):
 | Source repo | `games-on-whales/gst-wayland-display` |
 | Source PR | [#37](https://github.com/games-on-whales/gst-wayland-display/pull/37) `feat/vulkan-encode` |
 | Vendored at commit | `43d4c25` |
-| Applied against | GStreamer `1.28.4` (`gst-plugins-bad`) |
+| Applied against | GStreamer `1.28.8` (`gst-plugins-bad`) |
 
 If the pin moves, re-fetch `vkh264enc-dpb-pool-in-new-sequence.patch` from the
 new commit's `patches/` directory verbatim (do not hand-edit) and update this

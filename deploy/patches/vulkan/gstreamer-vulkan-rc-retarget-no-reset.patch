@@ -1,8 +1,9 @@
 # gstreamer-vulkan-rc-retarget-no-reset.patch
 #
-# What: two independent, codec-neutral fixes to the shared Vulkan video-encode
-# library (gst-libs/gst/vulkan/gstvkencoder-private.{c,h}), no element files
-# touched:
+# What: a codec-neutral fix to the shared Vulkan video-encode library
+# (gst-libs/gst/vulkan/gstvkencoder-private.{c,h}), no element files touched.
+# It carried two fixes until the GStreamer 1.28.8 bump (2026-10-12); B is
+# upstream now and only A is left:
 #
 #   A. gst_vulkan_encoder_request_rc_reset() no longer raises
 #      VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR. It becomes a synonym of
@@ -13,17 +14,14 @@
 #      this function, so they still take the RESET_BIT path in
 #      gst_vulkan_encoder_encode()'s VkVideoCodingControlInfoKHR.flags.
 #
-#   B. gst_vulkan_encoder_picture_clear() never released DPB slot 0
-#      (`if (pic->dpb_slot.slotIndex > 0)`), so whichever picture claims slot
-#      0 -- typically the first frame encoded in a session -- is never marked
-#      free again. Over a long-running session this steadily shrinks the
-#      usable DPB by one slot for good. -1 is this codebase's established
-#      "no slot" sentinel (see gst_vulkan_encoder_encode()'s own
-#      `ref_slots[nb_refs].slotIndex = -1` for the setup slot, and this same
-#      function's `pic->dpb_slot.slotIndex = -1` two lines below the guard it
-#      fixes); slot indices returned by gst_vulkan_encoder_encode() range over
-#      [0, maxDpbSlots), so 0 is a legitimate, frequently-hit slot and the
-#      guard must be `>= 0`.
+#   B. DROPPED, upstream has it. gst_vulkan_encoder_picture_clear() never
+#      released DPB slot 0 (`if (pic->dpb_slot.slotIndex > 0)`), and this
+#      patch made the guard `>= 0`. GStreamer 1.28.8 carries the same change
+#      as upstream commit 52008dc ("vulkan: encoder: release DPB slot 0 when
+#      clearing a picture"), which also sets `pic->dpb_slot.slotIndex = -1`
+#      in gst_vulkan_encoder_picture_init() so a picture that was never
+#      encoded cannot release a live slot. The hunk and its comment were
+#      removed here; nothing of B is applied by this patch any more.
 #
 # Why: A live ABR bitrate retarget calls (or, for a codec ported from the
 # H.264 template without care, MAY call) gst_vulkan_encoder_request_rc_reset()
@@ -37,9 +35,7 @@
 # is already congested enough to trigger the retarget in the first place.
 # This is codec-neutral -- it lives in the shared encode library, so it hits
 # H.264, H.265 and AV1 identically; whichever Vulkan codec element reaches
-# for the "reset" entry point pays the same DPB-invalidation tax. B is the
-# same story: any codec's session eventually recycles slot 0 back to the
-# free pool it can never return to.
+# for the "reset" entry point pays the same DPB-invalidation tax.
 #
 # Symptom (measured, AV1, driver 610.57.04, harness
 # deploy/experiments/vulkanav1enc/vkvideoencodeav1cbr.c "rcreset-*-midgop"
@@ -69,9 +65,7 @@
 # be applied -- gst_vulkan_encoder_request_rc_reset(), the sibling
 # gst_vulkan_encoder_request_rc_update(), and the priv->rc_update field do
 # not exist in stock GStreamer 1.28.4. Apply after (in order) the Quasar
-# vulkan patch chain's vkh264enc-rc-fix.patch. Fix B has no such dependency;
-# gst_vulkan_encoder_picture_clear() is unmodified by any of the other
-# patches in the chain and the fix applies equally to stock 1.28.4. See
+# vulkan patch chain's vkh264enc-rc-fix.patch. See
 # libpatch-NOTES.md for the full GOW-baseline and six-patch overlap analysis.
 #
 # Scope: no QUASAR_* anything, no Quasar policy -- pure library bugfix,
@@ -85,19 +79,6 @@ diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-privat
 index 0b92160..a1b2c3d 100644
 --- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
 +++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
-@@ -294,7 +294,11 @@ gst_vulkan_encoder_picture_clear (GstVulkanEncoderPicture * pic,
-
-   priv = gst_vulkan_encoder_get_instance_private (self);
-
--  if (pic->dpb_slot.slotIndex > 0) {
-+  /* PATCH (rc-retarget-no-reset): -1 is the "no slot" sentinel used
-+   * throughout this file (see the setup slot below and the assignment two
-+   * lines down); real slot indices from gst_vulkan_encoder_encode() start at
-+   * 0, so a "> 0" guard here silently never released slot 0. */
-+  if (pic->dpb_slot.slotIndex >= 0) {
-     priv->slots[pic->dpb_slot.slotIndex] = NULL;
-     pic->dpb_slot.slotIndex = -1;
-   }
 @@ -1580,17 +1584,28 @@ gst_vulkan_encoder_request_rc_update (GstVulkanEncoder * self)
 
  /**

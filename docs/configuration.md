@@ -522,7 +522,7 @@ components deep is refused outright.
 
 ### `QUASAR_ENCODER=vulkan`
 
-`vulkanh264enc` comes from the patched GStreamer 1.28.4 in `deploy/Dockerfile.vulkan`
+`vulkanh264enc` comes from the patched GStreamer 1.28.8 in `deploy/Dockerfile.vulkan`
 (Fedora 43, carrying `deploy/patches/vulkan/vkh264enc-rc-fix.patch` for a post-PLAYING
 rate-control rearm bug upstream hasn't fixed). Since W0 (#367) **every** image lineage
 — `runtime` (`quasar-node-agent`) and `dev` — is built from that one Dockerfile and
