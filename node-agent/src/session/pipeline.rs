@@ -47,6 +47,7 @@ use probes::{
     attach_vulkan_parent_meta_probe,
 };
 mod encoders;
+pub use encoders::preload_encoder_plugins;
 pub(crate) use encoders::{
     describe_codec_plan, probe_codec_support, rearm_vulkan_rc, EncoderKnobs, ResolvedEncoder,
     VULKAN_ENCODER_NAME,

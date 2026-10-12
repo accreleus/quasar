@@ -1267,6 +1267,10 @@ fn probe_host_codecs(
     let knobs = crate::session::pipeline::EncoderKnobs::from_env();
     let support =
         crate::session::pipeline::probe_codec_support(settings.encoder, knobs, "software");
+    // At connect this is before the first capacity report, so before any assignment.
+    // A live encoder flip re-probes with sessions possibly running: the load then is
+    // no later than the next launch would have made it.
+    crate::session::pipeline::preload_encoder_plugins(&support.elements);
     let codecs = support.codec_strings();
     let throughput: BTreeMap<String, CodecThroughput> = support
         .pixel_rates_mpix_s()

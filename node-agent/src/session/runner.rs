@@ -1773,6 +1773,10 @@ pub fn run_blocking(
             return;
         }
     };
+    // Must stay ahead of the source start: the plugin's init never runs while this
+    // session's compositor brings up its device. A no-op once the agent's codec probe
+    // has loaded it.
+    pipeline::preload_encoder_plugins(&[&resolved_encoder.factory]);
     emit(SessionEvent::Starting);
     emit(SessionEvent::Progress("preparing resources and image"));
 

@@ -902,6 +902,11 @@ pub fn init_gstreamer(_cfg: &SessionConfig) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&path);
     std::env::set_var("GST_REGISTRY", &path);
     apply_intel_vulkan_video_knob();
+    // Segtrap turns a SIGSEGV on any thread during a plugin load into `exit(-1)` blamed
+    // on that plugin; off, the fault keeps its signal, its thread and its core (#267).
+    // SAFETY: sets one flag GStreamer reads at each plugin load. Called raw because the
+    // safe wrapper panics after init, and `session` mode and tests reach here twice.
+    unsafe { gstreamer::ffi::gst_segtrap_set_enabled(glib::ffi::GFALSE) };
     gstreamer::init().context("failed to initialise GStreamer")?;
     Ok(())
 }
