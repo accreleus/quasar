@@ -370,6 +370,26 @@ impl SessionResources {
     }
 }
 
+#[cfg(test)]
+impl SessionResources {
+    /// A session with no input devices whose sound server is `sidecar`.
+    pub(crate) fn with_sidecar(session_id: &str, sidecar: Box<dyn teardown::Sidecar>) -> Self {
+        SessionResources {
+            home_seed: None,
+            devices: None,
+            input_state: Arc::new(InputState::new()),
+            shared: Arc::new(SharedSessionRuntime::new(
+                session_id,
+                Some(sidecar),
+                None,
+                teardown::RetryBudget::spent(),
+            )),
+            runtime_dir: String::new(),
+            audio_degraded: None,
+        }
+    }
+}
+
 impl Drop for SessionResources {
     /// Final chance. [`AppSource::teardown`] already applied a non-final release
     /// on the normal paths; this catches an early return that never built a
