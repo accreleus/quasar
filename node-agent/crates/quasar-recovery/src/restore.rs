@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::actor::Actor;
+use crate::cli::Cli;
 use crate::database::{self, DbError, DbOp, Hold, HoldReason};
 use crate::dump_dir::{self as dump, DumpDir};
 use crate::engine::EngineError;
@@ -377,6 +378,37 @@ impl Actor {
         Ok(plan)
     }
 
+    /// The command that takes this install apart so a dump can be loaded into a fresh one:
+    /// `uninstall` stops this actor, so it runs in its own container on this actor's image,
+    /// with the engine socket this install recorded.
+    fn start_over(&self, cli: &Cli) -> String {
+        let image = self
+            .own_container()
+            .ok()
+            .flatten()
+            .and_then(|me| crate::actor::own_image(self.engine.as_ref(), &me))
+            .map(|i| i.reference())
+            .unwrap_or_else(|| crate::cli::IMAGE_PLACEHOLDER.to_owned());
+        // A manager redeploy gives the seed a new id, so look it up, not the recorded id.
+        let containers = self.engine.list_containers().unwrap_or_default();
+        let seed = crate::seed::find(&containers, self.config.seed_container.as_deref())
+            .map(|c| {
+                format!(
+                    " (first remove the seed the way you started it: {})",
+                    cli.remove_seed(&c.name)
+                )
+            })
+            .unwrap_or_default();
+        format!("`{}`{seed}", cli.beside(&image, "uninstall --purge"))
+    }
+
+    fn cli(&self, machine: Option<&Machine>) -> Cli {
+        match machine {
+            Some(m) => Cli::for_machine(self.engine.as_ref(), m),
+            None => Cli::new(Default::default(), crate::recipe::paths::ENGINE_SOCKET),
+        }
+    }
+
     /// An import's plan: only before this machine's first control plane, which it then
     /// starts.
     fn plan_import(
@@ -387,8 +419,8 @@ impl Actor {
     ) -> Result<Restore, String> {
         if !self.control_plane_never_created()? {
             return Err(format!(
-                "a pre-RH-06 dump is loaded only into a fresh install, before its control plane's first boot, and this machine's control plane has already been created. To load it, reinstall: `docker exec {} quasar-recovery uninstall --purge`, then install again with the seed and {}=1, then run the restore",
-                names::RECOVERY_ACTOR,
+                "a pre-RH-06 dump is loaded only into a fresh install, before its control plane's first boot, and this machine's control plane has already been created. To load it, reinstall: {}, then install again with the seed and {}=1, then run the restore",
+                self.start_over(&self.cli(Some(machine))),
                 crate::bootstrap::AWAIT_RESTORE
             ));
         }
@@ -1022,7 +1054,9 @@ impl Actor {
         let mut output = f.detail;
         if self.restore_mut(j).imported {
             output.push('\n');
-            output.push_str(&import_hint(at));
+            let machine = self.dir.load_machine().ok().flatten();
+            let cli = self.cli(machine.as_ref());
+            output.push_str(&import_hint(at, &cli, &self.start_over(&cli)));
         }
         if at.touched() {
             if let Some(c) = self.restore_mut(j).new_container.clone() {
@@ -1067,16 +1101,17 @@ impl Actor {
 
 /// What an operator does after a failed import: before the control plane is created the
 /// command can be run again, with the same file (its copy is not kept); after, the install
-/// has booted on the loaded data and only a reinstall loads another dump.
-fn import_hint(at: RestorePhase) -> String {
+/// has booted on the loaded data and only a reinstall loads another dump. `uninstall` is
+/// the command that takes the install apart (`Actor::start_over`).
+fn import_hint(at: RestorePhase, cli: &Cli, uninstall: &str) -> String {
     let start_over = format!(
-        "`docker exec {} quasar-recovery uninstall --purge`, then install again with the seed and {}=1",
-        names::RECOVERY_ACTOR,
+        "{uninstall}, then install again with the seed and {}=1",
         crate::bootstrap::AWAIT_RESTORE
     );
     if matches!(at, RestorePhase::Starting | RestorePhase::Verifying) {
         format!(
-            "The install's control plane was created on the loaded data, and its first boot migrates it forward; `docker logs {}` says how far it got. To load the dump again instead, start over: {start_over}",
+            "The install's control plane was created on the loaded data, and its first boot migrates it forward; `{} logs {}` says how far it got. To load the dump again instead, start over: {start_over}",
+            cli.name(),
             names::CONTROL_PLANE
         )
     } else {

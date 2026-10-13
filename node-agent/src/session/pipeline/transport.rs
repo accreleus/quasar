@@ -23,7 +23,7 @@ use super::rtp_ext::{attach_abs_capture_time_egress_probe, AbsCaptureTimeExtensi
 use super::webrtc::{
     connect_data_channel_open, connect_ice_candidate, connect_negotiation_needed,
     connect_state_logging, enable_video_fec, enable_video_rtx, make_webrtcbin,
-    set_audio_receive_latency, spawn_fec_controller,
+    set_audio_receive_latency, spawn_fec_controller, warn_on_fingerprint_mismatch,
 };
 use super::{audio_disabled, audio_health, input_data_channel_init, resize, OutTx, TraceTx};
 use crate::session::input::{InputSink, InputState};
@@ -285,6 +285,7 @@ impl TransportSlot {
             PcId::Video,
             self.session_id.clone(),
         );
+        warn_on_fingerprint_mismatch(&webrtc, PcId::Video, self.session_id.clone());
         // Its peer connected: the encoder is mid-GOP, so RTP flows from a keyframe on.
         // Once per transport; the same peer reconnecting needs neither.
         let encoder = self.encoder.downgrade();
@@ -483,6 +484,7 @@ impl TransportSlot {
             PcId::Audio,
             self.session_id.clone(),
         );
+        warn_on_fingerprint_mismatch(&audio_webrtc, PcId::Audio, self.session_id.clone());
         audio_pipe
             .set_state(gst::State::Ready)
             .context("audio pipeline failed to reach READY")?;
