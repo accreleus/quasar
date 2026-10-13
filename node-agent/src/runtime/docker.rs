@@ -144,10 +144,20 @@ async fn reconcile_image(
             return Err(ErrorKind::UnknownOutcome.into());
         }
         if let Some(id) = intent.build_id {
-            if state.as_ref().and_then(|s| s.build_id.as_deref()) != Some(&id) {
-                return Err(ErrorKind::UnknownOutcome.into());
+            // Only its own label proves a build finished. Any other record is retired:
+            // the lease proves no agent still drives it and the classic builder stops
+            // with its client, so the caller builds again. Refusing stranded every
+            // later build (#505).
+            if state.as_ref().and_then(|s| s.build_id.as_deref()) == Some(&id) {
+                recovered_build = intent.build_fingerprint;
+            } else {
+                tracing::info!(
+                    token = "image-build-intent-retired",
+                    image,
+                    present = existing.is_some(),
+                    "retired an interrupted build intent; engine state re-observed"
+                );
             }
-            recovered_build = Some(intent.build_fingerprint.ok_or(ErrorKind::UnknownOutcome)?);
             journal.clear()?;
         } else if intent.remove_id.is_some() && existing.is_none()
             || intent.remove_id.is_none() && existing.is_some()

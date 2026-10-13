@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- **An app image whose build was interrupted is built again (#505).** Replacing the node agent while it built a catalog image left that build's record behind, and every later build of the image failed at once with "image operation outcome unknown", which hid the build's real result. The next build now checks the engine: a build that finished is used, anything else is built again, and a build that then fails shows its own error. A build that ran out of time is settled the same way.
+
 ### Internal
 - **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A dump restored into a fresh rootless install and a restore interrupted at three points pass on the AMD test host. A machine reboot on that host is recorded as an accepted gap: the test hosts are containers, so both AMD Docker reboot rows were container restarts, and the earlier rootful row is corrected to say so. The lab-VM rows, a live GPU fault and a Podman bench re-run are accepted gaps too. The run's one product finding is #589.
 
