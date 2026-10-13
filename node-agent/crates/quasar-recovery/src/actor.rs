@@ -819,7 +819,7 @@ impl Actor {
         }
     }
 
-    fn own_container(&self) -> Result<Option<Container>, EngineError> {
+    pub(crate) fn own_container(&self) -> Result<Option<Container>, EngineError> {
         match &self.config.self_container {
             Some(id) => self.engine.inspect_container(id),
             None => Ok(None),
