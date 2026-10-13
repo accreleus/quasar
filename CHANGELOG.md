@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **Fleet ▸ Releases counts a host already on the newest release as done (#587).** The Targets card's Node agents read "0/2" with a warning bar when every host was up to date, because it counted only the hosts still eligible to update. It now counts the up-to-date hosts (2/2, success bar), and a host ineligible for another reason is not counted. Up-to-date hosts are no longer listed under the count.
 - **A job whose interval is longer than run retention no longer reruns at once (#559).** Pruning kept no terminal run once it was older than the retention window, and a scheduled run is already that old when it finishes, so the schedule lost its anchor and the next run was dated now. The newest terminal run of each job and target is now kept whatever its age.
 - **A Firefox without its OpenH264 plugin now reports that it cannot decode H.264, and a launch it refuses says so (#565).** Such a Firefox lists H.264 as supported and then refuses the video, so its device record was wrong and the launch failed with a generic message. On Firefox the device record now carries the browser's own answer to an H.264 offer (a local test, a few milliseconds, once per page), and a launch the browser refuses reads "This browser cannot play the stream", with the plugin to turn on in Firefox. The library does not block play on this, on purpose, and no other codec is tried yet: the control plane does not read the H.264 flag. Chrome and Safari are unchanged.
 
