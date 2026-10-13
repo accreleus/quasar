@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.4.2 — 2026-10-13
+
 ### Upgrading
 - **This release changes the database (five migrations, 0099–0103), so there is no going back below it.** Once applied, an older control plane will not start, and a failed update is not put back automatically. For Quasar's own database the way back is a restore of the dump the update takes first (`docs/upgrading.md`, "The one-way migration rule"). Quasar never dumps your own database, and a source install has no dump: back up first. On your own database the update asks you to confirm your backup; a source install is not updated from the console and is asked nothing.
 - **Update from the console, by hand.** Fleet ▸ Releases ▸ Update Quasar waits for live sessions to end on their own before it replaces the control plane. To end them instead, tick "Update now — ends every live session on N hosts"; if sessions are still up when the wait runs out, the update fails with `timeout`. Automatic updates never install a release that changes the database. On a source install, redeploy the new ref.
