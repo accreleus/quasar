@@ -1348,6 +1348,10 @@ fn a_peer_whose_fingerprint_is_not_its_certificates_gets_video_and_no_input_chan
         "outbound media must not wait on the fingerprint: {}",
         describe(&peer)
     );
+    let reported = pump(&mut host, &mut peer, Duration::from_secs(20), |_, _| {
+        fingerprint_warnings("forged").len() >= 2
+    });
+    assert!(reported, "no warning: {}", describe(&peer));
     assert!(
         !input_reaches_host(&mut host, &mut peer),
         "the host heard a peer whose answer names a certificate it did not present"

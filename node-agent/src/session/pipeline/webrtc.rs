@@ -1092,9 +1092,10 @@ pub(super) fn warn_on_fingerprint_mismatch(webrtc: &gst::Element, pc: PcId, sess
         }
         let (weak, session_id) = (webrtc.downgrade(), session_id.clone());
         let said = AtomicBool::new(false);
-        // `after`: webrtcbin makes the check in its own handler of this signal, on this
-        // thread. Read at `connection-state` instead, the verdict races that handler: an
-        // honest peer's pads were caught still coming unblocked.
+        // `after` puts this behind webrtcbin's own handler within the same emission, and
+        // that handler is where it makes the check. The pad read is `rtp_src`: `data_src`
+        // keeps a second block, for SCTP, lifted later on webrtcbin's task thread, which
+        // is the race a read at `connection-state` hits.
         dtls.connect("notify::state", true, move |values| {
             let dtls = values[0].get::<glib::Object>().ok()?;
             if dtls_state(&dtls) == gstreamer_webrtc::WebRTCDTLSTransportState::Connected
