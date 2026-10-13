@@ -1510,6 +1510,160 @@ fn a_new_transport_nobody_answers_does_not_hold_the_source() {
     );
 }
 
+/// The session's audio capture, once it runs.
+fn audio_capture(host: &Host) -> gst::Element {
+    let capture = host
+        .transports
+        .audio_pipeline
+        .as_ref()
+        .expect("audio pipeline")
+        .iterate_elements()
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|e| e.factory().is_some_and(|f| f.name() == "audiotestsrc"))
+        .expect("the audio capture");
+    let (_, state, _) = capture.state(gst::ClockTime::from_seconds(5));
+    assert_eq!(state, gst::State::Playing, "the audio capture never ran");
+    capture
+}
+
+/// What `pulsesrc` posts when its server goes away under it.
+fn sound_server_lost(capture: &gst::Element) {
+    gst::element_error!(
+        capture,
+        gst::ResourceError::Failed,
+        ("Disconnected: Connection terminated")
+    );
+}
+
+/// What `f` logs on this thread. The audio bus handler logs on the thread that posts.
+fn logged(f: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Lines(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let lines = Lines::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = lines.0.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The session's sound server as its end sees it. Nothing here can count on a
+/// PulseAudio-protocol server, so this one keeps what it found when it was stopped, and a
+/// capture still running then reports the loss as `pulsesrc` does.
+struct SoundServer {
+    capture: gst::Element,
+    /// The capture's state, and whether the audio bus still took a message.
+    at_stop: Arc<Mutex<Option<(gst::State, bool)>>>,
+}
+
+impl crate::session::teardown::Sidecar for SoundServer {
+    fn server_uri(&self) -> String {
+        "unix:/nonexistent/native".into()
+    }
+    fn socket_dir(&self) -> std::path::PathBuf {
+        "/nonexistent".into()
+    }
+    fn adopt_budget(&mut self, _: crate::session::teardown::RetryBudget) {}
+    fn stop(&mut self) {
+        let mut seen = self.at_stop.lock().unwrap();
+        if seen.is_some() {
+            return;
+        }
+        let state = self.capture.current_state();
+        // A flushing bus refuses a post. This message is no warning or error, so the
+        // handler drops it unlogged: its 60 s rate limit, which can hide the error below
+        // on a bus that does report, has no part in the answer.
+        let probe = gst::message::Application::new(gst::Structure::new_empty("probe"));
+        let reporting = self
+            .capture
+            .parent()
+            .and_downcast::<gst::Pipeline>()
+            .and_then(|audio| audio.bus())
+            .is_some_and(|bus| bus.post(probe).is_ok());
+        *seen = Some((state, reporting));
+        if matches!(state, gst::State::Paused | gst::State::Playing) {
+            sound_server_lost(&self.capture);
+        }
+    }
+}
+
+/// #588: every session end stops the sound server under a capture that is still PLAYING
+/// (`session::teardown`, "Audio ordering"), and the capture's report of that read as an
+/// audio fault.
+#[test]
+fn a_session_end_does_not_report_its_sound_server_stopping() {
+    use crate::session::source::{AppSource, SessionResources};
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("audio-end");
+    let at_stop = Arc::new(Mutex::new(None));
+    let res = SessionResources::with_sidecar(
+        "takeover-audio-end",
+        Box::new(SoundServer {
+            capture: audio_capture(&host),
+            at_stop: at_stop.clone(),
+        }),
+    );
+    let sink = format!("takeover-audio-end-app-{}", std::process::id());
+    let mut source = AppSource::new(&host.cfg, "takeover-audio-end", &sink, &sink, &res, None)
+        .expect("app source");
+
+    let log = logged(|| crate::session::runner::stop_source(&mut source, &host.transports));
+
+    // Read out first: a failed assertion that held this lock would poison it for the
+    // stops the session's destructors still make.
+    let at_stop = *at_stop.lock().unwrap();
+    assert!(
+        !log.contains("audio-pipeline-message"),
+        "the session end logged an audio fault:\n{log}"
+    );
+    // The log alone could be quiet for another reason: the handler's rate limit, had
+    // this pipeline logged anything in the minute before.
+    assert_eq!(
+        at_stop,
+        Some((gst::State::Playing, false)),
+        "when the sound server was stopped (capture state, audio bus still reporting): \
+         the capture is still up, because taking it down first waits on that server, and \
+         its bus reports nothing any more"
+    );
+}
+
+/// The report itself is as it was: a sound server lost under a live session (#392, #351)
+/// still reads as one.
+#[test]
+fn a_sound_server_lost_under_a_live_session_is_still_reported() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("audio-lost");
+    let capture = audio_capture(&host);
+
+    let log = logged(|| sound_server_lost(&capture));
+
+    assert!(
+        log.contains("WARN")
+            && log.contains("audio-pipeline-message")
+            && log.contains("Disconnected: Connection terminated"),
+        "a sound server lost under a live session was not reported:\n{log}"
+    );
+}
+
 /// The session's first transport holds no RTP either while nobody has answered: a source
 /// that renegotiates then keeps running and can be stopped. (Held RTP is what
 /// `runner::stop_source` releases a transport for first; none is held any more.)
