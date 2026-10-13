@@ -198,12 +198,12 @@ func run() error {
 		for _, n := range cfg.TrustedProxies {
 			nets = append(nets, n.String())
 		}
-		log.Info("trusted reverse proxies configured; X-Forwarded-For will be honoured from these networks",
+		log.Info("trusted reverse proxies configured; X-Forwarded-For, and X-Forwarded-Proto on the first-run claim, will be honoured from these networks",
 			"knob", "QUASAR_TRUSTED_PROXIES", "networks", strings.Join(nets, ","))
 	} else {
 		log.Info("no trusted reverse proxies configured; rate limits key on the direct peer address",
 			"knob", "QUASAR_TRUSTED_PROXIES",
-			"note", "set this to the proxy's network if this control plane sits behind one, or every client shares one budget")
+			"note", "set this to the proxy's network if this control plane sits behind one, or every client shares one budget and first-run setup through the proxy is refused")
 	}
 	newServer := func(addr string, h http.Handler) *http.Server {
 		// NOTE: the WebSocket endpoints (agent WS, signaling relay) survive these

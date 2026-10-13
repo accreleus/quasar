@@ -23,6 +23,8 @@ runs the engine (root for a rootful Podman install).
 
 The claim only works over HTTPS. Through a reverse proxy, the proxy must be in
 `QUASAR_TRUSTED_PROXIES` first: see [Behind a reverse proxy](/quasar/network/reverse-proxy/).
+A token sent over plain HTTP is refused, but it crossed the network in clear and
+stays valid: restart the control plane to rotate it, then read the new one.
 
 <Aside type="caution" title="Warning: restarting rotates the token">
 If the control plane restarts before you claim, read the token again.

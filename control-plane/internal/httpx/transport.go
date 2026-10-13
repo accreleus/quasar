@@ -9,7 +9,8 @@ import (
 )
 
 const insecureTransportMessage = "refused: this request reached the control plane over plain HTTP. " +
-	"Use its HTTPS port, or name your reverse proxy in QUASAR_TRUSTED_PROXIES and have it send X-Forwarded-Proto: https."
+	"Use its HTTPS port, or name your reverse proxy in QUASAR_TRUSTED_PROXIES and have it send X-Forwarded-Proto: https. " +
+	"A token or key sent this way crossed the network in clear and stays valid until a restart: restart the control plane to rotate it."
 
 // RefuseInsecure answers 401 and reports true unless the request's credential
 // stayed off the network in clear (#593). Routes whose credential is a per-boot

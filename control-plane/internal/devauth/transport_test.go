@@ -10,8 +10,16 @@ import (
 	"testing"
 )
 
+// unreadBody fails the test if the handler touches the request body.
+type unreadBody struct{ t *testing.T }
+
+func (b unreadBody) Read([]byte) (int, error) {
+	b.t.Error("a refused request must not read the body")
+	return 0, http.ErrBodyReadAfterClose
+}
+
 // A request on the plaintext listener is refused before the key is compared:
-// no mint, no "rejected key" line, the same answer for a right and a wrong key.
+// no mint, no body read, no log line, the same answer for a right and a wrong key.
 // The spoofed X-Forwarded-Proto is what used to carry it past the redirect (#594).
 func TestPlainHTTPRequestIsRefusedBeforeTheKeyIsCompared(t *testing.T) {
 	var logged bytes.Buffer
@@ -19,7 +27,7 @@ func TestPlainHTTPRequestIsRefusedBeforeTheKeyIsCompared(t *testing.T) {
 	svc := NewService(m, testSecret, slog.New(slog.NewTextHandler(&logged, nil)))
 
 	plain := func(key string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/v1/dev/agent-session", strings.NewReader(`{"role":"admin"}`))
+		req := httptest.NewRequest(http.MethodPost, "/v1/dev/agent-session", unreadBody{t})
 		req.Header.Set("X-Forwarded-Proto", "https")
 		req.Header.Set(KeyHeader, key)
 		w := httptest.NewRecorder()

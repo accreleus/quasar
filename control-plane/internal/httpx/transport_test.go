@@ -101,7 +101,7 @@ func TestRefuseInsecure(t *testing.T) {
 			if rr.Code != http.StatusUnauthorized || !strings.Contains(rr.Body.String(), `"code":"unauthorized"`) {
 				t.Fatalf("refusal = %d %s, want 401 unauthorized", rr.Code, rr.Body)
 			}
-			for _, want := range []string{"HTTPS port", "QUASAR_TRUSTED_PROXIES", "X-Forwarded-Proto: https"} {
+			for _, want := range []string{"HTTPS port", "QUASAR_TRUSTED_PROXIES", "X-Forwarded-Proto: https", "restart the control plane to rotate it"} {
 				if !strings.Contains(rr.Body.String(), want) {
 					t.Fatalf("refusal must name %q; got %s", want, rr.Body)
 				}

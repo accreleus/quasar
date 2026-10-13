@@ -539,7 +539,10 @@ QUASAR_ENV=production                     # optional, see below
   first admin. With it, the control plane reads `X-Forwarded-For` — but *only*
   from a peer inside these networks — and limits on real client addresses. Name
   your proxy and nothing else: anyone on a network you list can mint unlimited
-  budget. A `/0` is refused at startup; anything wider than `/8` boots with a
+  budget and say a plain-HTTP claim came over HTTPS. If every client reaches the
+  control plane from the same address (rootless engines, Docker Desktop), do not
+  list that address: point the proxy at the HTTPS port, or put it on the stack's
+  own network. A `/0` is refused at startup; anything wider than `/8` boots with a
   warning.
 - `QUASAR_ENV=production` is optional and cheap: it turns the dev-only
   agent-auth flag into a boot refusal rather than something to remember not to

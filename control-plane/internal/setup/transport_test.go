@@ -24,8 +24,9 @@ func (b unreadBody) Read([]byte) (int, error) {
 }
 
 // A claim on the plaintext listener is refused before anything looks at the
-// token: no compare, no failure counted, no log line, no body read. The spoofed
-// X-Forwarded-Proto is what used to carry it past the redirect (#593).
+// token: no compare, no body read, nothing charged to the token budget, and a
+// WARN that a flood cannot multiply. The spoofed X-Forwarded-Proto is what used
+// to carry it past the redirect (#593).
 func TestClaimOverPlainHTTPIsRefusedBeforeTheTokenIsCompared(t *testing.T) {
 	var logged bytes.Buffer
 	c := &fakeClaimer{}
@@ -51,17 +52,26 @@ func TestClaimOverPlainHTTPIsRefusedBeforeTheTokenIsCompared(t *testing.T) {
 		t.Fatalf("the refusal must say what to do; got %s", right.Body)
 	}
 
-	// More wrong tokens than the failure budget allows: none may be counted.
-	for i := 0; i < claimFailureLimit+5; i++ {
+	const refusal = "setup claim: refused over plain HTTP"
+	if got := strings.Count(logged.String(), refusal); got != 1 || !strings.Contains(logged.String(), "remote_addr=192.0.2.1") {
+		t.Fatalf("the first refusal must log once, with the source address; got %q", logged.String())
+	}
+
+	// A flood, several times the budget, all with a wrong token.
+	for i := 0; i < 3*claimFailureLimit; i++ {
 		if wrong := plain("wrong-token"); wrong.Body.String() != right.Body.String() {
 			t.Fatalf("refusal depends on the token:\n right=%s\n wrong=%s", right.Body, wrong.Body)
 		}
 	}
-	if logged.Len() != 0 {
-		t.Fatalf("a refused claim must not log; got %s", logged.String())
+	if got := strings.Count(logged.String(), refusal); got != claimFailureLimit {
+		t.Fatalf("refusal WARN lines = %d under a flood, want the bound %d", got, claimFailureLimit)
 	}
-	if rr := doClaim(t, svc, "wrong-token", goodBody); rr.Code != http.StatusUnauthorized {
-		t.Fatalf("refused claims were counted as failures: status = %d, want 401", rr.Code)
+	if strings.Contains(logged.String(), "rejected token") {
+		t.Fatalf("a refused claim reached the token compare: %s", logged.String())
+	}
+	// Same source, now over TLS: the flood above must not have cost it anything.
+	if rr := doClaim(t, svc, "the-real-token", goodBody); rr.Code != http.StatusCreated {
+		t.Fatalf("plaintext refusals were charged to the token budget: HTTPS claim = %d, want 201", rr.Code)
 	}
 }
 
