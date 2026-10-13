@@ -894,12 +894,12 @@ the reference, engine socket and original removal ID. Transport loss, a deadline
 or an ambiguous engine failure leaves the intent intact. The lock is held for an
 operation's whole life, so the next operation on that reference, in this agent or
 the one that replaces it, finds an intent only when nothing drives it any more. It
-retires an interrupted pull and pulls again, and settles an interrupted build
-against the engine (below). An absent reference resolves an uncertain removal. A
-removal whose reference is still present is not repeated, because a changed target
-cannot authorize deleting its replacement, and neither is a removal or build
-recorded against another engine socket: those fail with
-`image operation outcome unknown`.
+retires an interrupted pull, reusing a present image and pulling only when the tag
+is absent, and settles an interrupted build against the engine (below). An absent
+reference resolves an uncertain removal. A removal whose reference is still present
+is not repeated, because a changed target cannot authorize deleting its
+replacement, and neither is a removal or build recorded against another engine
+socket: those fail with `image operation outcome unknown`.
 
 Installation metadata, image environment, engine storage information and live
 container mounts are read through the same runtime API. Quasar does not infer a Compose
@@ -961,19 +961,21 @@ A build becomes ready only when inspection confirms the unique
 `io.quasar.build-operation` label written by that request. The intent also records
 a fingerprint of the packaged context, Dockerfile, tag and build arguments. After
 an interrupted build (a replaced agent, a broken response, a spent deadline) the
-next build of that tag settles the intent. The matching label proves completion,
-and a matching request fingerprint reuses that result. An old image or an absent
-tag proves nothing, so the intent is retired and the image is built again; the
-classic builder stops a build whose client has gone. A definitive build failure
-clears its intent and permits a corrected retry. Deadline expiry or observer
-cancellation does not promise daemon rollback or intermediate cleanup.
+next operation on that tag settles the intent. The matching label proves
+completion, and a matching request fingerprint reuses that result. An old image or
+an absent tag proves nothing, so the intent is retired and the next build builds
+the image again; the classic builder stops a build whose client has gone. A
+definitive build failure clears its intent and permits a corrected retry. Deadline
+expiry or observer cancellation does not promise daemon rollback or intermediate
+cleanup.
 
-If observation cannot resolve a removal intent, an operator must confirm that the old
-engine operation has finished before clearing that specific JSON intent with the
-agent stopped. Do not remove the `.lock` files or clear the entire directory while
-work might still be active. A daemon restart is one way to establish that no old
-request remains; it is not performed automatically. This conservative recovery
-path preserves uncertainty across agent restarts without adding a compose setting.
+If observation cannot resolve a removal intent, or one recorded against another
+engine socket, an operator must confirm that the old engine operation has finished
+before clearing that specific JSON intent with the agent stopped. Do not remove the
+`.lock` files or clear the entire directory while work might still be active. A
+daemon restart is one way to establish that no old request remains; it is not
+performed automatically. This conservative recovery path preserves uncertainty
+across agent restarts without adding a compose setting.
 
 ### Runtime endpoint, migration and recovery
 

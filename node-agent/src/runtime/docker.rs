@@ -148,6 +148,7 @@ async fn reconcile_image(
             // the lease proves no agent still drives it and the classic builder stops
             // with its client, so the caller builds again. Refusing stranded every
             // later build (#505).
+            journal.clear()?;
             if state.as_ref().and_then(|s| s.build_id.as_deref()) == Some(&id) {
                 recovered_build = intent.build_fingerprint;
             } else {
@@ -158,7 +159,6 @@ async fn reconcile_image(
                     "retired an interrupted build intent; engine state re-observed"
                 );
             }
-            journal.clear()?;
         } else if intent.remove_id.is_some() && existing.is_none()
             || intent.remove_id.is_none() && existing.is_some()
         {

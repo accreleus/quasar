@@ -407,7 +407,12 @@ fn a_build_that_fails_after_an_interrupted_one_reports_its_own_failure() {
 }
 
 /// The record a replaced agent leaves when it dies mid-build (#505).
-fn strand_build_record(config: &RuntimeConfig, image: &str) -> std::path::PathBuf {
+fn strand_build_record(
+    config: &RuntimeConfig,
+    image: &str,
+    socket: &std::path::Path,
+    fingerprint: Option<&str>,
+) -> std::path::PathBuf {
     use sha2::{Digest, Sha256};
     let root = config.image_state_path.clone().unwrap();
     std::fs::create_dir_all(&root).unwrap();
@@ -418,13 +423,58 @@ fn strand_build_record(config: &RuntimeConfig, image: &str) -> std::path::PathBu
     let path = root.join(key);
     let record = serde_json::json!({
         "image": image,
-        "socket": config.socket,
+        "socket": socket,
         "remove_id": null,
         "build_id": "previous-agent",
-        "build_fingerprint": "previous-context",
+        "build_fingerprint": fingerprint,
     });
     std::fs::write(&path, record.to_string()).unwrap();
     path
+}
+
+#[test]
+fn a_build_record_from_another_engine_socket_is_refused_and_kept() {
+    let (_dir, config, request, server) = engine(vec![version(), absent()]);
+    let record = strand_build_record(
+        &config,
+        &request.tag,
+        std::path::Path::new("/another-engine.sock"),
+        Some("previous-context"),
+    );
+    assert_eq!(
+        RuntimeClient::new(config)
+            .unwrap()
+            .build_image(request, Duration::from_secs(3))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert!(record.exists());
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn a_finished_build_whose_record_has_no_fingerprint_is_built_again() {
+    let finished = response(
+        "GET",
+        IMAGE_PATH,
+        200,
+        r#"{"Id":"sha256:earlier","Size":1,"Config":{"Labels":{"io.quasar.build-operation":"previous-agent"}}}"#,
+    );
+    let (_dir, config, request, server) = engine(vec![version(), finished, post(""), built()]);
+    let record = strand_build_record(&config, &request.tag, &config.socket, None);
+    assert_eq!(
+        RuntimeClient::new(config)
+            .unwrap()
+            .build_image(request, Duration::from_secs(3))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:built"
+    );
+    assert!(!record.exists());
+    assert_eq!(build_requests(&server.join().unwrap()), 1);
 }
 
 #[test]
@@ -432,7 +482,12 @@ fn a_build_record_is_left_alone_while_its_lease_is_held() {
     use std::os::fd::AsRawFd;
     let (_dir, config, request, server) =
         engine(vec![version(), version(), absent(), post(""), built()]);
-    let record = strand_build_record(&config, &request.tag);
+    let record = strand_build_record(
+        &config,
+        &request.tag,
+        &config.socket,
+        Some("previous-context"),
+    );
     // A held lease is a build still running, in this process or a replaced agent.
     let lease = std::fs::OpenOptions::new()
         .create(true)
