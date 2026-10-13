@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use quasar_recovery::actor::{Actor, ActorConfig, TrustConfig};
 use quasar_recovery::bootstrap::Bootstrap;
-use quasar_recovery::engine::DockerEngine;
+use quasar_recovery::engine::{DockerEngine, PlatformEngine};
 use quasar_recovery::recipe::{paths, Book};
 use quasar_recovery::seed::{self, profile, Seed, SeedConfig};
 use quasar_recovery::socket::{Request, State};
@@ -165,9 +165,9 @@ fn restore(args: &[String]) -> ExitCode {
     let socket = std::path::PathBuf::from(operator::SOCKET);
     if !socket.exists() {
         eprintln!(
-            "quasar-recovery restore: no operator socket at {}: run this inside the recovery actor, `docker exec {} quasar-recovery restore ...`, on the machine that runs the control plane",
+            "quasar-recovery restore: no operator socket at {}: run this inside the recovery actor, `{}`, on the machine that runs the control plane",
             socket.display(),
-            quasar_recovery::recipe::names::RECOVERY_ACTOR
+            operator_cli().exec("restore ...")
         );
         return ExitCode::FAILURE;
     }
@@ -214,7 +214,10 @@ fn restore(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("restore {followed} admitted; following it (it continues if this command stops)");
+    eprintln!(
+        "restore {followed} admitted; following it (it continues if this command stops). If the recovery actor goes away and this command is killed, do not run the restore again yet: `{}` says whether it resumed or failed",
+        operator_cli().exec("status")
+    );
     let mut said = None;
     loop {
         std::thread::sleep(Duration::from_secs(2));
@@ -255,6 +258,22 @@ fn restore(args: &[String]) -> ExitCode {
     }
 }
 
+/// The engine CLI this machine's operator uses, as the engine reports itself. An engine
+/// that does not answer within the short status deadline reads as Docker, so a silent
+/// engine costs the health probe (`status`) seconds, not its whole timeout.
+fn operator_cli() -> quasar_recovery::cli::Cli {
+    let kind = quasar_runtime::RuntimeConfig::from_environment()
+        .ok()
+        .and_then(|mut config| {
+            config.deadline = STATUS_ENGINE_DEADLINE;
+            DockerEngine::new(config).ok()
+        })
+        .and_then(|engine| engine.host().ok())
+        .map(|host| host.kind)
+        .unwrap_or_default();
+    quasar_recovery::cli::Cli::new(kind, paths::ENGINE_SOCKET)
+}
+
 fn import_dir() -> quasar_recovery::dump_dir::DumpDir {
     let machine_dir = env("QUASAR_MACHINE_DIR").unwrap_or_else(|| paths::MACHINE_DIR.into());
     quasar_recovery::dump_dir::DumpDir::new(std::path::Path::new(&machine_dir))
@@ -265,8 +284,8 @@ fn read_import() -> Result<String, ()> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
         eprintln!(
-            "quasar-recovery restore: --dump - reads the dump from stdin: `docker exec -i {} quasar-recovery restore --dump - < quasar.dump`",
-            quasar_recovery::recipe::names::RECOVERY_ACTOR
+            "quasar-recovery restore: --dump - reads the dump from stdin: `{} < quasar.dump`",
+            operator_cli().exec_stdin("restore --dump -")
         );
         return Err(());
     }
@@ -285,7 +304,10 @@ fn read_import() -> Result<String, ()> {
     match written {
         Ok(0) => {
             let _ = dir.remove(&name);
-            eprintln!("quasar-recovery restore: stdin was empty: `docker exec -i` (with -i) passes the file");
+            eprintln!(
+                "quasar-recovery restore: stdin was empty: `{} exec -i` (with -i) passes the file",
+                operator_cli().name()
+            );
             Err(())
         }
         Ok(n) => {
@@ -339,11 +361,17 @@ fn explain(body: &str) {
         return;
     };
     let dir = env("QUASAR_MACHINE_DIR").unwrap_or_else(|| paths::MACHINE_DIR.into());
-    let machine = quasar_recovery::machine::MachineDir::new(dir)
+    let machine = quasar_recovery::machine::MachineDir::new(&dir)
         .load_machine()
         .ok()
         .flatten();
-    for line in quasar_recovery::explain::explain(&status, machine.as_ref()) {
+    let hold = quasar_recovery::database::load_hold(std::path::Path::new(&dir))
+        .ok()
+        .flatten();
+    // At most one engine call per `status`, however many lines name a command.
+    let cli = std::cell::OnceCell::new();
+    let cli = || cli.get_or_init(operator_cli).clone();
+    for line in quasar_recovery::explain::explain(&status, machine.as_ref(), hold.as_ref(), &cli) {
         eprintln!("{line}");
     }
 }
