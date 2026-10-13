@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Security
+- **A drained host that is still connected can no longer be re-enrolled over (#596).** Enrolling onto a host whose agent is connected replaces its node secret, so it is refused. A drained host was only refused by the control plane that held its connection: for a short time after a control-plane restart, which is where every host stands during a fleet update, an enrollment token made for that host's name was accepted and locked the running agent out. Now a host counts as connected until its disconnect is recorded, whatever its status. The second of two simultaneous first enrollments of one name is refused the same way. A drained host that is gone for good can be re-added once its drain is lifted or the host is deleted. No wire or schema change.
+
 ### Internal
 - **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A dump restored into a fresh rootless install and a restore interrupted at three points pass on the AMD test host. A machine reboot on that host is recorded as an accepted gap: the test hosts are containers, so both AMD Docker reboot rows were container restarts, and the earlier rootful row is corrected to say so. The lab-VM rows, a live GPU fault and a Podman bench re-run are accepted gaps too. The run's one product finding is #589.
 

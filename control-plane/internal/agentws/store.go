@@ -150,7 +150,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	case errors.Is(err, pgx.ErrNoRows):
 		// A new node_name: nothing to take over, and nothing locked either — zero rows
 		// lock nothing. Concurrent first-enrollments of the same name serialize on the
-		// ON CONFLICT (node_name) below instead, which is the same outcome.
+		// ON CONFLICT (node_name) below instead, and the loser is refused after it.
 	default:
 		return registerResult{}, fmt.Errorf("look up host for enrollment: %w", err)
 	}
@@ -184,6 +184,11 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	// The deferred rollback restores the secret and gives the token's use back.
 	if !newlyCreated && !bound {
 		return registerResult{}, ErrHostAlreadyEnrolled
+	}
+	// The guard found no row to judge, so a concurrent first enrollment won this one: never
+	// rotate its secret. Guarded by TestConcurrentFirstEnrollmentDoesNotReplaceTheWinnersSecret.
+	if !newlyCreated && existingID == "" {
+		return registerResult{}, ErrHostAgentConnected
 	}
 	if newlyCreated {
 		// Only a genuinely new installation carries this unedited marker.
@@ -235,17 +240,16 @@ func releaseRemovalDrain(ctx context.Context, tx pgx.Tx, hostID string) error {
 	return nil
 }
 
-// hostIsLiveSQL is the DB half of the #96 takeover guard: the registry only sees
-// connections on THIS process, so a multi-replica control plane would let a
-// takeover through against a host connected to a sibling replica. markOffline
-// stamps agent_disconnected_at on every path that ends the read loop, so a row
-// that is online with none is one somebody believes they are still serving.
+// hostIsLiveSQL is the DB half of the #96 takeover guard and the one row definition of
+// "an agent is connected": the registry only sees THIS process, and nothing between a
+// control-plane restart and the agent's reconnect. A register writes registerStatusSQL
+// (never offline) and clears agent_disconnected_at; markOffline stamps it. Must not
+// narrow to 'online': a cordoned host is draining and still connected (#596).
 //
-// Tradeoff: after a control-plane crash the deferred markOffline never runs, so a
-// dead host reads as live until its agent connects and drops again — nothing
-// sweeps stale rows. A genuine re-enrollment in that window uses a new node_name,
-// or the admin deletes the host row first.
-const hostIsLiveSQL = `(status = 'online' AND agent_disconnected_at IS NULL)`
+// Fail-closed: a control-plane crash never stamps, so a dead host reads as live until
+// its agent connects and drops again, its cordon is lifted (an unconnected host projects
+// offline), or the admin deletes the host row.
+const hostIsLiveSQL = `(status <> 'offline' AND agent_disconnected_at IS NULL)`
 
 // reconnectHost verifies the node_secret and marks the host online.
 func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion, nodeSecret string) (registerResult, error) {
@@ -692,7 +696,7 @@ func (s *agentStore) updateHeartbeat(ctx context.Context, hostID string) error {
 func (s *agentStore) markLive(ctx context.Context, hostID string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE hosts SET status=`+registerStatusSQL+`, agent_disconnected_at=NULL
-		WHERE id=$1 AND (status='offline' OR agent_disconnected_at IS NOT NULL)
+		WHERE id=$1 AND NOT `+hostIsLiveSQL+`
 	`, hostID)
 	if err != nil {
 		return fmt.Errorf("mark live: %w", err)
