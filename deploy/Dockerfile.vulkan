@@ -165,19 +165,21 @@ FROM ${QUASAR_BASE_IMAGE} AS toolchain
 # behaves exactly as before.
 ENTRYPOINT []
 
-# Build toolchain + the -devel headers our widened GStreamer enable-set needs. `builddep` pulls in
-# everything the Fedora gstreamer1* packages themselves need to build, which covers most transitive
-# deps for free; the explicit list below is what's left for our OWN additions (webrtc/va/nvcodec/
-# openh264/vulkan/libnice/audio/input).
-RUN dnf install -y dnf-plugins-core 'dnf-command(builddep)' \
-    && dnf builddep -y gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free \
+# The build toolchain and the -devel packages GStreamer, the compositor and the agent build
+# against. An explicit list, not `dnf builddep gstreamer1*` (#198): that brings what Fedora's
+# whole plugin set needs, about 2 GB this build never reads. A missing package fails meson
+# loudly unless a subproject probes for it with `required: false`: without gnutls-devel
+# libnice silently switches to OpenSSL. So a change to this list is checked by running
+# GStreamer's `meson setup` on both package sets: the dependency lines and every config.h
+# must not differ. `clang` alone serves bindgen; clang-devel pulls 380 MB of llvm-static.
+RUN dnf install -y dnf-plugins-core \
     && dnf install -y --setopt=install_weak_deps=False \
         git ca-certificates curl \
-        gcc gcc-c++ make cmake pkgconf-pkg-config ninja-build nasm flex bison meson \
+        gcc gcc-c++ make cmake pkgconf-pkg-config ninja-build nasm flex bison meson glslc \
         glib2-devel libdrm-devel mesa-libgbm-devel systemd-devel \
         wayland-devel wayland-protocols-devel libxkbcommon-devel libX11-devel \
-        libinput-devel openssl-devel \
-        clang clang-devel llvm-devel libffi-devel expat-devel \
+        libinput-devel openssl-devel gnutls-devel libcurl-devel gmp-devel libatomic \
+        clang libffi-devel expat-devel \
         vulkan-headers vulkan-loader-devel \
         alsa-lib-devel opus-devel pulseaudio-libs-devel libseat-devel \
         libsrtp-devel libva-devel \
