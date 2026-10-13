@@ -826,10 +826,16 @@ fn build_and_run(
         // a `tee` pushes to its branches from the same streaming thread — an undrained
         // decode leg would eventually backpressure the count leg too.
         if let Some(leg) = &decode {
-            while let Some(sample) = leg
-                .appsink
-                .try_pull_sample(Some(gst::ClockTime::from_mseconds(0)))
-            {
+            // No further than the frames asked for: when scoring a frame takes longer than
+            // the source takes to make one, an unbounded drain never returns to send EOS
+            // or to check the budget.
+            while (decoded_seen as u64) < request.frames {
+                let Some(sample) = leg
+                    .appsink
+                    .try_pull_sample(Some(gst::ClockTime::from_mseconds(0)))
+                else {
+                    break;
+                };
                 decoded_seen += 1;
                 if decoded_seen <= pixel::SKIP_FRAMES {
                     continue;
