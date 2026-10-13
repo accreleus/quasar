@@ -79,7 +79,7 @@ export interface CodecCapabilities {
   vp9: boolean;
 }
 
-/** "Browser will accept in SDP", NOT "hardware decoded". */
+/** What the capability list claims. "Browser will accept in SDP", NOT "hardware decoded". */
 export function probeCodecs(): CodecCapabilities {
   if (!("RTCRtpReceiver" in window) || typeof RTCRtpReceiver.getCapabilities !== "function") {
     return { h264: true, hevc: false, av1: false, vp9: false }; // non-WebRTC browser fallback
@@ -97,6 +97,59 @@ export function probeCodecs(): CodecCapabilities {
     av1:  mimeTypes.some((m) => m.includes("av1")),
     vp9:  mimeTypes.some((m) => m.includes("vp9")),
   };
+}
+
+let h264Probe: Promise<boolean> | undefined;
+
+// A loopback negotiation takes a few ms; this only bounds a browser that never answers.
+const H264_LOOPBACK_TIMEOUT_MS = 1500;
+
+// What a host offers: one H.264-only video line it will send. Fixed text, so the probe needs
+// no setCodecPreferences (Firefox 128+) and the browser answers in its real role, as receiver.
+const H264_OFFER = [
+  "v=0", "o=- 4611731400430051336 0 IN IP4 0.0.0.0", "s=-", "t=0 0", "a=group:BUNDLE video0",
+  "m=video 9 UDP/TLS/RTP/SAVPF 96", "c=IN IP4 0.0.0.0", "a=setup:actpass", "a=ice-ufrag:abcd",
+  "a=ice-pwd:abcdefghijklmnopqrstuvwx", "a=rtcp-mux", "a=sendonly", "a=mid:video0",
+  "a=rtpmap:96 H264/90000",
+  "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1",
+  "a=fingerprint:sha-256 " + Array.from({ length: 32 }, (_, i) => (i + 16).toString(16).toUpperCase().padStart(2, "0")).join(":"),
+  "",
+].join("\r\n");
+
+/** Does this browser's answer to an H.264-only offer keep the video line? No ICE, no network. */
+async function answerKeepsH264(pc: RTCPeerConnection): Promise<boolean> {
+  await pc.setRemoteDescription({ type: "offer", sdp: H264_OFFER });
+  const sdp = (await pc.createAnswer()).sdp ?? "";
+  return /^m=video [1-9]/m.test(sdp) && /^a=rtpmap:\d+ H264\//im.test(sdp);
+}
+
+/**
+ * Can this browser decode H.264 over WebRTC? #565: a Firefox without its OpenH264 plugin
+ * still lists H.264 in `getCapabilities` and then answers an H.264 offer with `m=video 0`.
+ * Chrome and Safari tell the truth, so only Firefox pays for the check. Once per page.
+ * Any error or timeout keeps the capability list's answer.
+ */
+export function probeH264Decodable(): Promise<boolean> {
+  h264Probe ??= (async () => {
+    if (!probeCodecs().h264 || !/Firefox\//.test(navigator.userAgent)) return probeCodecs().h264;
+    let pc: RTCPeerConnection | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      pc = new RTCPeerConnection();
+      return await Promise.race([
+        answerKeepsH264(pc),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(true), H264_LOOPBACK_TIMEOUT_MS);
+        }),
+      ]);
+    } catch {
+      return true;
+    } finally {
+      clearTimeout(timer);
+      pc?.close();
+    }
+  })();
+  return h264Probe;
 }
 
 /**
@@ -513,7 +566,8 @@ export interface NativeCapabilities extends Omit<DeviceCapabilities, "client_typ
 
 /** All measurements are best-effort; null values are valid (JSONB column). */
 export async function probeCapabilities(): Promise<DeviceCapabilities> {
-  const [rttMs, bandwidthKbps, display, codecsDetail] = await Promise.all([
+  const [h264Decodable, rttMs, bandwidthKbps, display, codecsDetail] = await Promise.all([
+    probeH264Decodable(),
     probeRttMs(),
     probeBandwidthKbps(),
     probeDisplay(),
@@ -522,7 +576,9 @@ export async function probeCapabilities(): Promise<DeviceCapabilities> {
 
   return {
     client_type:       "web",
-    codecs:            probeCodecs(),
+    // Only the device record carries the verdict: the library still reads the plain list
+    // (probeCodecs) and so does not block play on it (#565).
+    codecs:            { ...probeCodecs(), h264: h264Decodable },
     codecs_detail:     codecsDetail,
     max_decode_height: probeMaxDecodeHeight(),
     browser:           probeBrowser(),
