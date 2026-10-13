@@ -25,6 +25,8 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **A job whose interval is longer than run retention no longer reruns at once (#559).** Pruning kept no terminal run once it was older than the retention window, and a scheduled run is already that old when it finishes, so the schedule lost its anchor and the next run was dated now. The newest terminal run of each job and target is now kept whatever its age.
+- **A Firefox without its OpenH264 plugin now reports that it cannot decode H.264, and a launch it refuses says so (#565).** Such a Firefox lists H.264 as supported and then refuses the video, so its device record was wrong and the launch failed with a generic message. On Firefox the device record now carries the browser's own answer to an H.264 offer (a local test, a few milliseconds, once per page), and a launch the browser refuses reads "This browser cannot play the stream", with the plugin to turn on in Firefox. The library does not block play on this, on purpose, and no other codec is tried yet: the control plane does not read the H.264 flag. Chrome and Safari are unchanged.
 - **A session that ends no longer logs an audio fault (#588).** Every streamed session logged `audio pipeline error from … pulsesrc …: Disconnected: Connection terminated` as it ended, because its sound server is stopped while the host is still capturing from it. A session that is ending no longer reports that. The same line on a session that is still running means what it says: that session lost its sound server.
 
 ### Internal

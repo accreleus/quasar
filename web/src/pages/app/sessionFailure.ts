@@ -62,6 +62,9 @@ const FAILURE_CODE_GENERIC_MESSAGE: Partial<Record<string, string>> = {
 // error_message text instead of the structured fields above (e.g. a
 // mismatched agent/control-plane pair mid-rollout). Never the primary path.
 const APP_NEVER_PRESENTED_MARKER = "(app_never_presented)";
+// #565: the agent words a refused video m-line this way (node-agent
+// `remote_description_failure_reason`); the reason has no failure_code of its own.
+const VIDEO_REFUSED_MARKER = "cannot decode the negotiated codec";
 const APP_LOG_TAIL_DELIMITER = "--- app log tail ---\n";
 
 function splitAppNeverPresentedMessage(errorMessage: string): {
@@ -115,6 +118,19 @@ export function launchFailureFromSession(s: SessionVerdictInput): LaunchFailure 
         message: message || FAILURE_CODE_GENERIC_MESSAGE.app_never_presented!,
         detail: s.state_detail ?? undefined,
         logTail: logTail ?? s.app_log_tail,
+      };
+    }
+
+    if (s.error_message?.includes(VIDEO_REFUSED_MARKER)) {
+      return {
+        kind: "failed",
+        title: "This browser cannot play the stream",
+        message:
+          "This browser refused the host's video, most likely because it cannot decode it. Try another browser." +
+          (/Firefox\//.test(navigator.userAgent)
+            ? " In Firefox, turn on OpenH264 Video Codec under Add-ons and themes, Plugins."
+            : ""),
+        detail: s.error_message,
       };
     }
 
