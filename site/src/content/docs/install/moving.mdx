@@ -96,7 +96,8 @@ Either way:
    Keep `-i`: the dump comes from standard input. The restore checks the file,
    loads it, creates the control plane and waits until it's healthy. If it fails
    before creating the control plane, nothing is kept: fix the named problem and
-   rerun. Rerunning after an interruption is also safe.
+   rerun. If the command stops without a message, see
+   [If the restore stops without a message](#if-the-restore-stops-without-a-message).
 
 6. **Sign in with your old admin account.** Every host shows **Offline**, except a
    combined machine's own.
@@ -146,20 +147,27 @@ An install can't be switched from rootful to rootless in place.
 
 <Steps>
 
-1. **Stop the old seed** (`docker rm -f quasar-seed`, or remove it in your stack
+1. **Stop the old seed** (`docker rm -f quasar-seed`, `systemctl stop quasar-seed`
+   for a Podman seed, with `--user` when rootless, or remove it in your stack
    manager). The next step refuses while a seed exists.
 
 2. **Take a final dump and remove the old install**, on the old machine:
 
    ```bash
-   docker exec quasar-recovery quasar-recovery uninstall --purge \
+   img=$(docker inspect -f '{{.Config.Image}}' quasar-recovery)
+   docker run --rm -it --security-opt label=disable \
+     -v /var/run/docker.sock:/var/run/docker.sock \
+     -v quasar-machine:/var/lib/quasar-machine "$img" uninstall --purge \
      --confirm <old node name> --dump-to /var/lib/quasar/move
    ```
 
-   This writes `/var/lib/quasar/move/quasar-final-<timestamp>.dump` on the host,
-   then removes the old containers, volumes and network. Homes and templates are
-   kept. If the dump fails, nothing is deleted. Copy the dump off if you're
-   changing machines, then:
+   It runs in its own container because it stops the recovery actor. (Running
+   `uninstall` through `docker exec` (`podman exec` on Podman) is refused and
+   prints this command for your engine.) This writes
+   `/var/lib/quasar/move/quasar-final-<timestamp>.dump` on the host, then removes
+   the old containers, volumes and network. Homes and templates are kept. If the
+   dump fails, nothing is deleted. Copy the dump off if you're changing machines,
+   then:
 
    ```bash
    docker volume rm quasar-machine
@@ -206,7 +214,9 @@ An install can't be switched from rootful to rootless in place.
    ```
 
    Keep `-i`: the dump comes from standard input. If it fails before the control
-   plane is created, nothing is kept: fix the named problem and rerun.
+   plane is created, nothing is kept: fix the named problem and rerun. If the
+   command stops without a message, see
+   [If the restore stops without a message](#if-the-restore-stops-without-a-message).
 
 7. **Sign in with the old admin account** and add each GPU host again
    ([Add a GPU host](/quasar/install/second-host/#4-run-it))
@@ -231,8 +241,28 @@ the recovery actor's own container.
 | --- | --- |
 | Dump is newer than this install's control plane | Take the new install apart with `uninstall --purge` and install that release or newer. |
 | Not a custom-format archive, or `pg_restore` can't read it | Dump again with `-Fc`. Check it starts with `PGDMP` and matches the size on the old machine. |
-| This machine's control plane has already been created | The install wasn't held, or has booted since. Run `docker exec quasar-recovery quasar-recovery uninstall --purge`, remove the `quasar-machine` volume, and install again with `QUASAR_AWAIT_RESTORE=1`. |
+| This machine's control plane has already been created | The install wasn't held, or has booted since. The message prints the command that takes it apart, filled in for your engine (it runs in its own container, as in [Move to rootless](#move-to-rootless), step 2). Then remove the `quasar-machine` volume and install again with `QUASAR_AWAIT_RESTORE=1`. |
 | Control plane did not report healthy | Check `docker logs quasar-control-plane`. To start over, take the new install apart as above. |
+
+## If the restore stops without a message
+
+The restore runs in the recovery actor, so if the actor restarts or is killed, the
+command ends (exit code 137) with nothing printed. The restore itself carries on
+or stops by itself. **Don't run it again yet.** Read:
+
+```bash
+docker exec quasar-recovery quasar-recovery status
+```
+
+(`podman exec` on Podman.)
+
+| `status` shows | Meaning | Do |
+| --- | --- | --- |
+| The control plane running and healthy | The restore finished. | Nothing. Running it again is refused. |
+| An attempt still open (`in_flight` set) | It resumed after the restart. | Wait, then read `status` again. |
+| A failed result whose output says "nothing was changed. Run the command again." | It stopped before touching anything. | Run the same restore command again. |
+| A failed result, control plane not created | The file was not kept. | Fix what the output names, then run the restore again with the file. |
+| A failed result, control plane created | The dump loaded, then the first boot or the health check failed. | Don't run it again (it is refused). Follow the start-over command the output prints, as in [If the restore says no](#if-the-restore-says-no). |
 
 ## Staying on Compose
 
