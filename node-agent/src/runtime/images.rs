@@ -117,9 +117,9 @@ impl RuntimeClient {
     }
 }
 
-/// A synced intent survives process/transport failure. A remove or build intent is
-/// cleared only by conclusive observed state or a terminal daemon response; a pull
-/// intent is retired by the next lease holder (`docker::reconcile_image`, #429).
+/// A synced intent survives process/transport failure. A remove intent is cleared
+/// only by conclusive observed state or a terminal daemon response; a pull or build
+/// intent is settled by the next lease holder (`docker::reconcile_image`, #429, #505).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct Intent {
     pub image: String,
