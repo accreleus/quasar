@@ -310,7 +310,7 @@ func (d *Dispatcher) materializeTarget(ctx context.Context, j Job, hostID string
 		return
 	}
 	if realign {
-		// With no finished run to measure from (pruned), the pending run keeps its date.
+		// A job that has never finished a run has nothing to measure from; the pending run keeps its date.
 		if !hadRun {
 			return
 		}

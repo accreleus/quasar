@@ -647,8 +647,192 @@ func TestPruneAppliesTheRowCapPerTargetAndTheAgeCap(t *testing.T) {
 	if _, err := s.PruneRuns(ctx, 30); err != nil {
 		t.Fatal(err)
 	}
-	if got := count("a.one", ""); got != 1 {
-		t.Fatalf("after the age cap: %d want 1 (the pending row only)", got)
+	if got := count("a.one", ""); got != 2 {
+		t.Fatalf("after the age cap: %d want 2 (the pending row and the anchor)", got)
+	}
+}
+
+// The newest terminal run of each (job, target) survives the age cap, whatever
+// its age or outcome: it anchors the interval (LastTerminalRun).
+func TestPruneRunsKeepsTheNewestTerminalRunPerTarget(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	hostA := newHost(t, pool, "host-a")
+	hostB := newHost(t, pool, "host-b")
+	s := seed(t, pool, hostDef("home.gc"))
+
+	// Three terminal runs per host, all older than the age cap. The newest by
+	// finished_at is the middle row by created_at, so the keeper is not simply
+	// the newest-created row. Host B's keeper failed: a failed run anchors too.
+	for _, h := range []struct{ id, state string }{{hostA, "succeeded"}, {hostB, "failed"}} {
+		for _, days := range []struct{ created, finished int }{{90, 89}, {80, 41}, {70, 60}} {
+			state := "succeeded"
+			if days.finished == 41 {
+				state = h.state
+			}
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO job_runs (job_id, host_id, state, trigger, scheduled_for, created_at, finished_at)
+				VALUES ('home.gc', $1::uuid, $2, 'schedule', now(),
+				        now() - make_interval(days => $3), now() - make_interval(days => $4))`,
+				h.id, state, days.created, days.finished); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if _, err := s.PruneRuns(ctx, 30); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{hostA, hostB} {
+		last, found, err := s.LastTerminalRun(ctx, "home.gc", h)
+		if err != nil || !found {
+			t.Fatalf("host %s lost its anchor: found=%v err=%v", h, found, err)
+		}
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM job_runs WHERE host_id = $1::uuid`, h).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 || last.FinishedAt == nil || time.Since(*last.FinishedAt) < 40*24*time.Hour || time.Since(*last.FinishedAt) > 42*24*time.Hour {
+			t.Fatalf("host %s: %d rows left, anchor finished %v; want only the run finished 41 days ago", h, n, last.FinishedAt)
+		}
+	}
+}
+
+// The row PruneRuns keeps is the row LastTerminalRun returned before it ran.
+// pruneRow: created and finished are days ago; finished -1 is NULL.
+type pruneRow struct {
+	created  int
+	finished int
+	state    string
+}
+
+func TestPruneRunsKeepsExactlyTheRowLastTerminalRunReturns(t *testing.T) {
+	cases := []struct {
+		name       string
+		limit      int
+		rows       []pruneRow
+		wantRows   int // terminal rows left in the partition
+		wantAnchor int // finished days ago of the survivor LastTerminalRun must return; -1 = by created
+	}{
+		{"newest finished is not newest created", 50,
+			[]pruneRow{{90, 89, "succeeded"}, {80, 41, "failed"}, {70, 60, "succeeded"}}, 1, 41},
+		{"a newer terminal row has no finished_at", 50,
+			[]pruneRow{{50, 45, "succeeded"}, {40, -1, "aborted"}}, 1, 45},
+		{"no row has finished_at", 50,
+			[]pruneRow{{50, -1, "aborted"}, {40, -1, "skipped"}}, 1, -1},
+		{"deferred skipped aborted all anchor", 50,
+			[]pruneRow{{60, 59, "skipped"}, {58, 57, "deferred"}, {56, 55, "aborted"}}, 1, 55},
+		{"row cap of one and anchor is not the newest created", 1,
+			[]pruneRow{{20, 5, "succeeded"}, {10, 8, "succeeded"}}, 2, 5},
+		{"row cap only, all recent", 2,
+			[]pruneRow{{5, 4, "succeeded"}, {4, 3, "succeeded"}, {3, 2, "failed"}, {2, 1, "succeeded"}}, 2, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := testDB(t)
+			ctx := context.Background()
+			host := newHost(t, pool, "host-a")
+			s := seed(t, pool, hostDef("home.gc"), intervalDef("a.one"))
+			if _, err := pool.Exec(ctx, `UPDATE jobs SET history_limit = $1`, tc.limit); err != nil {
+				t.Fatal(err)
+			}
+			// The same rows in a per-host partition and in the fleet partition.
+			for _, target := range []struct{ job, host string }{{"home.gc", host}, {"a.one", ""}} {
+				for _, r := range tc.rows {
+					if _, err := pool.Exec(ctx, `
+						INSERT INTO job_runs (job_id, host_id, state, trigger, scheduled_for, created_at, finished_at)
+						VALUES ($1, NULLIF($2, '')::uuid, $3, 'schedule', now(),
+						        now() - make_interval(days => $4::int),
+						        CASE WHEN $5::int < 0 THEN NULL ELSE now() - make_interval(days => $5::int) END)`,
+						target.job, target.host, r.state, r.created, r.finished); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// An open run is never the anchor and never pruned.
+				if _, err := pool.Exec(ctx, `
+					INSERT INTO job_runs (job_id, host_id, state, trigger, scheduled_for, created_at)
+					VALUES ($1, NULLIF($2, '')::uuid, 'pending', 'schedule', now() + interval '1 day', now() - interval '100 days')`,
+					target.job, target.host); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, target := range []struct{ job, host string }{{"home.gc", host}, {"a.one", ""}} {
+				before, found, err := s.LastTerminalRun(ctx, target.job, target.host)
+				if err != nil || !found {
+					t.Fatalf("%s: no anchor before the prune: %v", target.job, err)
+				}
+				if tc.wantAnchor >= 0 {
+					if before.FinishedAt == nil {
+						t.Fatalf("%s: LastTerminalRun picked a row with no finished_at", target.job)
+					}
+					age := time.Since(*before.FinishedAt)
+					want := time.Duration(tc.wantAnchor) * 24 * time.Hour
+					if age < want-time.Hour || age > want+time.Hour {
+						t.Fatalf("%s: LastTerminalRun picked finished %s ago, want %s", target.job, age, want)
+					}
+				}
+			}
+			type key struct{ job, host string }
+			befores := map[key]Run{}
+			for _, target := range []key{{"home.gc", host}, {"a.one", ""}} {
+				b, _, _ := s.LastTerminalRun(ctx, target.job, target.host)
+				befores[target] = b
+			}
+			if _, err := s.PruneRuns(ctx, 30); err != nil {
+				t.Fatal(err)
+			}
+			// A second prune must be a no-op: the survivor set is stable.
+			if n, err := s.PruneRuns(ctx, 30); err != nil || n != 0 {
+				t.Fatalf("second prune removed %d rows (err %v), want 0", n, err)
+			}
+			for target, b := range befores {
+				after, found, err := s.LastTerminalRun(ctx, target.job, target.host)
+				if err != nil || !found {
+					t.Fatalf("%s: the anchor was pruned: found=%v err=%v", target.job, found, err)
+				}
+				if after.ID != b.ID {
+					t.Fatalf("%s: prune kept %s, the dispatcher was measuring from %s", target.job, after.ID, b.ID)
+				}
+				var terminal, open int
+				if err := pool.QueryRow(ctx, `
+					SELECT count(*) FILTER (WHERE state NOT IN ('pending','running')),
+					       count(*) FILTER (WHERE state IN ('pending','running'))
+					FROM job_runs WHERE job_id = $1`, target.job).Scan(&terminal, &open); err != nil {
+					t.Fatal(err)
+				}
+				if terminal != tc.wantRows || open != 1 {
+					t.Fatalf("%s: %d terminal + %d open rows left, want %d + 1", target.job, terminal, open, tc.wantRows)
+				}
+			}
+		})
+	}
+}
+
+// Rows tied on finished_at and created_at: LastTerminalRun has no id
+// tie-break, PruneRuns has. Whichever survives, the schedule base is equal.
+func TestPruneRunsTieKeepsAnEqualAnchor(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	s := seed(t, pool, intervalDef("a.one"))
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO job_runs (job_id, state, trigger, scheduled_for, created_at, finished_at)
+		SELECT 'a.one', st, 'schedule', now(), now() - interval '50 days', now() - interval '45 days'
+		FROM unnest(ARRAY['succeeded','failed','aborted']) AS st`); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := s.LastTerminalRun(ctx, "a.one", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PruneRuns(ctx, 30); err != nil {
+		t.Fatal(err)
+	}
+	after, found, err := s.LastTerminalRun(ctx, "a.one", "")
+	if err != nil || !found {
+		t.Fatalf("the anchor was pruned: found=%v err=%v", found, err)
+	}
+	if !after.FinishedAt.Equal(*before.FinishedAt) || !after.CreatedAt.Equal(before.CreatedAt) {
+		t.Fatalf("the tie changed the schedule base: %v -> %v", before.FinishedAt, after.FinishedAt)
 	}
 }
 
