@@ -163,13 +163,14 @@
         "required": [
           "org.quasar.image.role",
           "org.quasar.pins.gwd",
-          "org.quasar.pins.gst",
+          "org.quasar.pins.gst>=1.28.6",
           "org.quasar.pins.plugins-rs",
           "org.quasar.pins.base",
           "org.quasar.source.commit",
           "org.quasar.built.at",
           "org.quasar.recipe"
         ],
+        "_gst_floor_note": "The agent returns its request-aux-sender elements as plain handles, which webrtcbin sinks correctly only from GStreamer 1.28.6 (upstream 23da5cc); under an older one every transport leaks an element. A GST_VERSION rollback below 1.28.6 needs that workaround back in node-agent first (takeover_tests::aux_senders is red there).",
         "_recipe_note": "org.quasar.recipe (ADR 0008): the recipe revision this agent image needs, stamped by build-images.sh from node-agent/src/recipe.rs. A recovery actor refuses to install an image without it (recipe_unsupported).",
         "_notes": "Provenance. Without these, an image pulled from GHCR or built on another box is opaque and `qimg status` cannot say which pins produced it — which is how the lab host and the aux host drifted under one tag undetected (2026-07-26). The build report is the richer local record; these labels are what make ANY image self-describing."
       }

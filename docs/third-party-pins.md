@@ -173,7 +173,7 @@ issue:
    hand-typed `docker build`, and never a relaxed assertion in `deploy/image-contract.json`. This
    step exists because a hand-typed build can silently take the wrong `--target` or skip a
    `deploy/pins.env` cross-check that catches a doc/Dockerfile pin drift before it ships.
-2. **One bench run submitted to `quasar-bench`** (`make bench-run HOST=devbox`) with verdict
+2. **One bench run submitted to `quasar-bench`** (`make bench-run HOST=gpu-test`) with verdict
    `nominal` and `regressed=0`, then `make bench-check` against the previous pin's runs
    (`BASE=<sha>` if the nearest benched ancestor is not it) with its verdict quoted verbatim —
    exit 4 "nothing comparable" is not a pass and is stated as such. This exists because it is the only step in this list that catches
@@ -183,7 +183,7 @@ issue:
    with no growth beyond noise. This exists because three of the defects behind these pins (#418,
    #428, the CUDA pool-config leak) were refcount leaks whose ONLY visible symptom was this number
    drifting session over session — nothing else in this list would have caught them.
-4. **A fallback-NVENC smoke: `make nvenc-fallback-smoke HOST=devbox ARGS='--app <name>'`**
+4. **A fallback-NVENC smoke: `make nvenc-fallback-smoke HOST=gpu-test ARGS='--app <name>'`**
    (`scripts/harness/run-nvenc-fallback-smoke.sh`, wrapped by `scripts/dx/nvenc_fallback_smoke.sh`). It
    requires `QUASAR_VULKAN_H264=0` already set on the running agent container (set it in
    `deploy/.env`, then `docker compose up -d --force-recreate quasar-node-agent` — the harness
@@ -218,7 +218,7 @@ acceptance condition observed live, and it is cheap to check while the sessions 
 `GST_VERSION` / `QUASAR_BASE_IMAGE` ARG (and the matching `deploy/pins.env` row) to the last pin
 that passed this same four-item exercise, not merely to "whatever was in `develop` before" — a
 prior pin that was never itself live-exercised is not a known-good rollback target. Re-run
-`deploy/build-images.sh` on devbox at the reverted pin and re-validate the contract before
+`deploy/build-images.sh` on the `gpu-test` host at the reverted pin and re-validate the contract before
 redeploying; do not redeploy an un-rebuilt image on the assumption that reverting the pin file
 alone is sufficient. If the failing bump already merged to `develop` and a host is running it,
 redeploy the reverted pin's image explicitly (`deploy/redeploy.sh`) rather than waiting for the

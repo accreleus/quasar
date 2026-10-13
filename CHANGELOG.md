@@ -35,6 +35,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Internal
 - **The contributor build image installs a named list of packages instead of everything Fedora's GStreamer needs to build (#198).** `dnf builddep` brought about 2 GB the build never read (GIS data, soundfonts, Qt, static LLVM). The list was checked by running GStreamer's configure step on both package sets: the same 331 dependency results and identical `config.h` files. The images an operator pulls are unchanged in content.
+- **Patch-chain notes left after the GStreamer 1.28.8 bump (#578).** The AV1 encoder patch's header says where it sits in the apply order, the fork-bump policy names hosts by role, and the image contract now refuses an agent image built on a GStreamer older than 1.28.6, which the agent's WebRTC code needs.
 - **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A dump restored into a fresh rootless install and a restore interrupted at three points pass on the AMD test host. A machine reboot on that host is recorded as an accepted gap: the test hosts are containers, so both AMD Docker reboot rows were container restarts, and the earlier rootful row is corrected to say so. The lab-VM rows, a live GPU fault and a Podman bench re-run are accepted gaps too. The run's one product finding is #589.
 
 ## 0.4.2 — 2026-10-13
