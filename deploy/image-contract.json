@@ -180,8 +180,8 @@
 
     "dev": {
       "_role": "Build/test environment ONLY. Never deployed as a node-agent. Carries the full toolchain by design.",
-      "size_max_mb": 11500,
-      "_size_note": "Measured 8.73GB on the lab host 2026-07-26 when built with CUDA_ENABLE=0. Once the builder is always CUDA-enabled (spec 4.3) this stage inherits the CUDA toolkit too, so the ceiling allows for that. Re-measure on the first build-images.sh run and tighten.",
+      "size_max_mb": 5500,
+      "_size_note": "Measured 4487MB (4,705,129,522 bytes) on 2026-10-13, built CUDA-on by build-images.sh: about 2.7GB under /usr (the CUDA toolkit is 1.1GB of it), 0.6GB each for /opt/cargo and /opt/rustup, 0.12GB for /opt/gst. It was 8978MB while the toolchain stage used dnf builddep and kept the unpacked crate sources and the GStreamer clone in its layers (#198). 5500MB leaves about 1GB; if the ceiling breaks, find out what grew before raising it in a commit that says why.",
       "packages": {
         "required": ["gcc", "cmake", "meson", "ninja-build", "clang", "weston"],
         "forbidden": []
