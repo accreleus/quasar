@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- **A Firefox without its OpenH264 plugin is no longer reported as able to decode H.264, and a launch it cannot play says so (#565).** Such a Firefox lists H.264 as supported and then refuses the video, so the launch failed with a generic message. On Firefox the device probe now asks the browser itself with a local test negotiation (a few milliseconds, cached for the page), and a launch that fails because the browser refused the video reads "This browser cannot play the stream" with the plugin to turn on. Chrome, Safari and a Firefox with the plugin are unchanged.
+
 ### Internal
 - **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A dump restored into a fresh rootless install and a restore interrupted at three points pass on the AMD test host. A machine reboot on that host is recorded as an accepted gap: the test hosts are containers, so both AMD Docker reboot rows were container restarts, and the earlier rootful row is corrected to say so. The lab-VM rows, a live GPU fault and a Podman bench re-run are accepted gaps too. The run's one product finding is #589.
 

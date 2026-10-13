@@ -65,6 +65,18 @@ describe("launchFailureFromSession", () => {
     expect(v?.logTail).toBe("exit code 1");
   });
 
+  // #565: the agent's reason for a refused video m-line (webrtc.rs
+  // remote_description_failure_reason) names the cause only in prose.
+  it("tells a user whose browser refused the video line that the browser cannot play the stream", () => {
+    const reason =
+      "webrtc: video PeerConnection rejected the remote answer: media 0 is missing ice-ufrag — the peer most likely rejected the video m-line (client cannot decode the negotiated codec)";
+    const v = launchFailureFromSession(s("failed", null, reason));
+    expect(v?.kind).toBe("failed");
+    expect(v?.title).toBe("This browser cannot play the stream");
+    expect(v?.message).toMatch(/OpenH264/);
+    expect(v?.detail).toBe(reason);
+  });
+
   it("an unrecognized failure_code falls through to the generic failed verdict", () => {
     const v = launchFailureFromSession(s("failed", "encoder_init", "no slots free", "some_future_code"));
     expect(v?.title).toBe("The launch failed");

@@ -79,8 +79,8 @@ export interface CodecCapabilities {
   vp9: boolean;
 }
 
-/** "Browser will accept in SDP", NOT "hardware decoded". */
-export function probeCodecs(): CodecCapabilities {
+/** What the capability list claims. "Browser will accept in SDP", NOT "hardware decoded". */
+function listedCodecs(): CodecCapabilities {
   if (!("RTCRtpReceiver" in window) || typeof RTCRtpReceiver.getCapabilities !== "function") {
     return { h264: true, hevc: false, av1: false, vp9: false }; // non-WebRTC browser fallback
   }
@@ -97,6 +97,66 @@ export function probeCodecs(): CodecCapabilities {
     av1:  mimeTypes.some((m) => m.includes("av1")),
     vp9:  mimeTypes.some((m) => m.includes("vp9")),
   };
+}
+
+/** The settled `probeH264Decodable` answer; `undefined` until it has run. */
+let h264Verdict: boolean | undefined;
+let h264Probe: Promise<boolean> | undefined;
+
+// A loopback negotiation takes ~12 ms; this only bounds a browser that never answers.
+const H264_LOOPBACK_TIMEOUT_MS = 1500;
+
+/** Offer H.264 only to a second connection in this page: does the answer keep the video line? */
+async function loopbackKeepsH264(): Promise<boolean> {
+  const offerer = new RTCPeerConnection();
+  const answerer = new RTCPeerConnection();
+  try {
+    const t = offerer.addTransceiver("video", { direction: "recvonly" });
+    t.setCodecPreferences(
+      RTCRtpReceiver.getCapabilities("video")!.codecs.filter((c) => c.mimeType.toLowerCase() === "video/h264"),
+    );
+    await answerer.setRemoteDescription(await offerer.createOffer());
+    const sdp = (await answerer.createAnswer()).sdp ?? "";
+    return /^m=video [1-9]/m.test(sdp) && /^a=rtpmap:\d+ H264\//im.test(sdp);
+  } finally {
+    offerer.close();
+    answerer.close();
+  }
+}
+
+/**
+ * Can this browser decode H.264 over WebRTC? #565: a Firefox without its OpenH264
+ * plugin still lists H.264 in `getCapabilities` and then answers an H.264 offer with
+ * `m=video 0`. Chrome and Safari tell the truth, so only Firefox pays for the check.
+ * Once per page. Any error or timeout keeps the capability list's answer.
+ */
+export function probeH264Decodable(): Promise<boolean> {
+  h264Probe ??= (async () => {
+    const listed = listedCodecs().h264;
+    if (!listed || !/Firefox\//.test(navigator.userAgent)) return listed;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const verdict = await Promise.race([
+        loopbackKeepsH264(),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(true), H264_LOOPBACK_TIMEOUT_MS);
+        }),
+      ]);
+      h264Verdict = verdict;
+      return verdict;
+    } catch {
+      return true;
+    } finally {
+      clearTimeout(timer);
+    }
+  })();
+  return h264Probe;
+}
+
+/** The list's answer, with H.264 struck once `probeH264Decodable` has found it undecodable. */
+export function probeCodecs(): CodecCapabilities {
+  const codecs = listedCodecs();
+  return h264Verdict === false ? { ...codecs, h264: false } : codecs;
 }
 
 /**
@@ -513,7 +573,8 @@ export interface NativeCapabilities extends Omit<DeviceCapabilities, "client_typ
 
 /** All measurements are best-effort; null values are valid (JSONB column). */
 export async function probeCapabilities(): Promise<DeviceCapabilities> {
-  const [rttMs, bandwidthKbps, display, codecsDetail] = await Promise.all([
+  const [, rttMs, bandwidthKbps, display, codecsDetail] = await Promise.all([
+    probeH264Decodable(), // settles h264Verdict before `codecs` is read below
     probeRttMs(),
     probeBandwidthKbps(),
     probeDisplay(),
