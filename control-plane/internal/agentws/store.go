@@ -240,15 +240,15 @@ func releaseRemovalDrain(ctx context.Context, tx pgx.Tx, hostID string) error {
 	return nil
 }
 
-// hostIsLiveSQL is the DB half of the #96 takeover guard and the one row definition of
-// "an agent is connected": the registry only sees THIS process, and nothing between a
-// control-plane restart and the agent's reconnect. A register writes registerStatusSQL
-// (never offline) and clears agent_disconnected_at; markOffline stamps it. Must not
-// narrow to 'online': a cordoned host is draining and still connected (#596).
+// hostIsLiveSQL is the DB half of the #96 takeover guard: the registry only sees THIS
+// process, and nothing between a control-plane restart and the agent's reconnect. A
+// register writes registerStatusSQL (never offline) and clears agent_disconnected_at;
+// markOffline stamps it. Must not narrow to 'online': a drained host is still connected,
+// and every boot drains every typed-settings host (#596).
 //
-// Fail-closed: a control-plane crash never stamps, so a dead host reads as live until
-// its agent connects and drops again, its cordon is lifted (an unconnected host projects
-// offline), or the admin deletes the host row.
+// Fail-closed: a control-plane stop never stamps, so a host whose agent never returns
+// reads as live until its row is deleted (an uncordon leaves the boot's reconciliation
+// hold). Guarded by TestAfterAControlPlaneRestartAHostRefusesReEnrollmentUntilItIsDeleted.
 const hostIsLiveSQL = `(status <> 'offline' AND agent_disconnected_at IS NULL)`
 
 // reconnectHost verifies the node_secret and marks the host online.

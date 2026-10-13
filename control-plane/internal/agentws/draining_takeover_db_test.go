@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/admission"
+	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 )
 
 func secretHash(t *testing.T, pool *pgxpool.Pool, hostID string) string {
@@ -94,39 +95,6 @@ func TestEnrollmentOnASecondReplicaCannotTakeOverAConnectedDrainingHost(t *testi
 	}
 }
 
-// A control-plane restart drops every socket and stamps nothing, so until the agent
-// reconnects the registry is empty and the row still describes a served, cordoned host.
-func TestEnrollmentCannotTakeOverADrainingHostAfterAControlPlaneRestart(t *testing.T) {
-	pool := testPool(t)
-	ctx := context.Background()
-	holds := admission.NewStore(pool)
-	booted := storeWithMintedTokens(pool, func(string) bool { return false })
-
-	first, err := booted.enrollHost(ctx, "drained-over-restart", "0.1.0", testEnrollmentToken)
-	if err != nil {
-		t.Fatalf("initial enrollment: %v", err)
-	}
-	if _, err := holds.AcquireOnline(ctx, first.HostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
-		t.Fatalf("cordon: %v", err)
-	}
-	bound := boundEnrollmentToken(t, pool, "drained-over-restart")
-	if _, err := booted.enrollHost(ctx, "drained-over-restart", "0.1.0", bound); !errors.Is(err, ErrHostAgentConnected) {
-		t.Fatalf("re-enrollment before the agent is back: got %v, want ErrHostAgentConnected", err)
-	}
-	if _, err := booted.reconnectHost(ctx, "drained-over-restart", "0.1.0", first.NodeSecret); err != nil {
-		t.Fatalf("the incumbent's reconnect after the refusal: %v", err)
-	}
-
-	// A host that never comes back must not hold its name: lifting the cordon with no
-	// agent connected projects it offline, and an offline row re-enrolls.
-	if _, err := holds.ReleaseManual(ctx, first.HostID, false); err != nil {
-		t.Fatalf("uncordon with no agent connected: %v", err)
-	}
-	if _, err := booted.enrollHost(ctx, "drained-over-restart", "0.1.0", bound); err != nil {
-		t.Fatalf("re-enrolling once the row is offline: %v", err)
-	}
-}
-
 // Two enrollments of a name that does not exist yet both pass the takeover guard, which
 // finds no row. The loser reaches the row only at the upsert, and must not replace the
 // secret the winner was just given.
@@ -134,7 +102,10 @@ func TestConcurrentFirstEnrollmentDoesNotReplaceTheWinnersSecret(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	st := storeWithMintedTokens(pool, func(string) bool { return false })
-	bound := boundEnrollmentToken(t, pool, "raced-first-enroll")
+	token, bound, err := hostenroll.NewStore(pool).Mint(ctx, hostenroll.MintParams{CreatedBy: seedAdmin(t, pool), NodeName: "raced-first-enroll"})
+	if err != nil {
+		t.Fatalf("mint a single-use token bound to the name: %v", err)
+	}
 
 	// The winner, held uncommitted: the loser's guard cannot see it, its upsert waits on it.
 	winner, err := pool.Begin(ctx)
@@ -168,6 +139,9 @@ func TestConcurrentFirstEnrollmentDoesNotReplaceTheWinnersSecret(t *testing.T) {
 	}
 	if got := secretHash(t, pool, hostID); got != "the-winners-hash" {
 		t.Fatalf("node_secret_hash = %q: the loser replaced the winner's secret", got)
+	}
+	if n := usedCount(t, pool, token.ID); n != 0 {
+		t.Fatalf("the refused loser spent its single-use token: used_count = %d, want 0", n)
 	}
 }
 
