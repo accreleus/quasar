@@ -640,6 +640,49 @@ func TestHostScopedJobMaterializesOneRunPerHost(t *testing.T) {
 	}
 }
 
+// An interval longer than run retention must still be measured from the end of
+// the previous pass: pruning may not take the anchor with it (#559).
+func TestIntervalLongerThanRetentionKeepsItsAnchor(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+
+	def := intervalDef("slow.job")
+	def.Default = Schedule{Kind: KindInterval, IntervalSecs: 60 * 86400, Timezone: "UTC"}
+	reg := NewRegistry()
+	if err := reg.Register(def); err != nil {
+		t.Fatal(err)
+	}
+	d, store := newDispatcher(t, pool, reg, def)
+
+	// The first pass runs now. Each later run is created when its predecessor
+	// finishes, so by the time it runs its created_at is a full interval old.
+	d.Tick(ctx)
+	d.Wait()
+	d.Tick(ctx) // materializes the next run
+	d.Wait()
+	if _, err := pool.Exec(ctx, `
+		UPDATE job_runs SET created_at = now() - interval '60 days',
+		       scheduled_for = CASE WHEN state = 'pending' THEN now() - interval '1 second' ELSE scheduled_for END
+		WHERE job_id = 'slow.job'`); err != nil {
+		t.Fatal(err)
+	}
+	d.Tick(ctx) // runs it, then prunes
+	d.Wait()
+	d.Tick(ctx) // materializes the one after
+
+	last, found, err := store.LastTerminalRun(ctx, "slow.job", "")
+	if err != nil || !found || last.FinishedAt == nil {
+		t.Fatalf("the anchor was pruned: found=%v err=%v", found, err)
+	}
+	open, found, err := store.OpenRun(ctx, "slow.job", "")
+	if err != nil || !found {
+		t.Fatalf("no next run: found=%v err=%v", found, err)
+	}
+	if wait := open.ScheduledFor.Sub(*last.FinishedAt); wait < 59*24*time.Hour {
+		t.Fatalf("next run is %s after the last one finished, want ~60 days", wait)
+	}
+}
+
 // TestReapedRunIsRematerializedOnTheNextTick — the A11 acceptance shape.
 func TestReapedRunIsRematerializedOnTheNextTick(t *testing.T) {
 	pool := testDB(t)

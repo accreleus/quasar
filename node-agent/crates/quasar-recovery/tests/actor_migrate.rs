@@ -1442,6 +1442,94 @@ fn a_pre_rh06_dump_is_restored_into_a_fresh_install_before_its_first_boot() {
     assert_eq!(m.db().rows, "accounts, apps and saves");
 }
 
+/// Boots an awaiting install, loads an import, then asks for a second one on an engine
+/// of `kind` whose socket the install recorded as `socket`: the refusal's text (#589).
+fn second_import_refusal(kind: quasar_runtime::EngineKind, socket: &str) -> String {
+    second_import_refusal_with(kind, socket, |_| {})
+}
+
+/// The same, after `adjust` has changed the engine (the seed's fate).
+fn second_import_refusal_with(
+    kind: quasar_runtime::EngineKind,
+    socket: &str,
+    adjust: impl FnOnce(&quasar_recovery::engine::FakeEngine),
+) -> String {
+    let m = awaiting_restore();
+    put_import(&m, &dump_bytes(&old_stack()));
+    let first = run_restore(&m.actor(), restore_request(&nth_id(2), Some(IMPORT), None));
+    assert_eq!(first.state, State::Succeeded, "{first:?}");
+    let dir = quasar_recovery::machine::MachineDir::new(m.dir.path());
+    let mut machine = dir.load_machine().unwrap().unwrap();
+    machine.inputs.docker_socket = socket.into();
+    dir.machine().store(&machine).unwrap();
+    m.engine.with_state(|s| s.host.kind = kind);
+    adjust(&m.engine);
+    put_import(&m, &dump_bytes(&old_stack()));
+    m.actor()
+        .submit_restore(restore_request(&nth_id(3), Some(IMPORT), None))
+        .unwrap_err()
+        .message
+}
+
+#[test]
+fn the_refused_import_names_an_uninstall_that_runs_for_the_engine_the_install_is_on() {
+    use quasar_runtime::EngineKind::{Docker, Podman};
+    let cases = [
+        (Docker, "/var/run/docker.sock", "docker run --rm -it --security-opt label=disable -v /var/run/docker.sock:/var/run/docker.sock "),
+        (Docker, "/run/user/1001/docker.sock", "docker run --rm -it --security-opt label=disable -v /run/user/1001/docker.sock:/var/run/docker.sock "),
+        (Podman, "/run/user/1001/podman/podman.sock", "podman run --rm -it --security-opt label=disable -v /run/user/1001/podman/podman.sock:/var/run/docker.sock "),
+    ];
+    for (kind, socket, start) in cases {
+        let message = second_import_refusal(kind, socket);
+        assert!(message.contains(start), "{message}");
+        // The seed goes the way it was started: a Podman seed is a unit that restarts a
+        // removed container, so `systemctl stop` comes before any `podman rm -f`.
+        if kind == Podman {
+            let stop = message.find("systemctl stop quasar-seed").expect(&message);
+            assert!(
+                message.find("podman rm -f").is_none_or(|rm| stop < rm),
+                "{message}"
+            );
+        } else {
+            assert!(message.contains("docker rm -f quasar-seed"), "{message}");
+        }
+        assert!(message.contains(" uninstall --purge`"), "{message}");
+        assert!(
+            message.contains("quasar-recovery@sha256:") || message.contains("<registry>"),
+            "{message}"
+        );
+        // The refused form: `uninstall` stops the actor, so it cannot run inside it.
+        assert!(
+            !message.contains("exec quasar-recovery quasar-recovery uninstall"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn the_seed_clause_follows_the_seed_a_redeploy_gave_a_new_id_and_is_dropped_without_one() {
+    use quasar_runtime::EngineKind::Docker;
+    let sock = "/var/run/docker.sock";
+    // A stack manager's redeploy: the seed has a new id (and name), the recorded one is gone.
+    let moved = second_import_refusal_with(Docker, sock, |engine| {
+        engine.with_state(|s| {
+            let mut seed = s.containers.remove(SEED_ID).expect("the seed");
+            seed.id = "5eed999999999999999999999999999999999999999999999999999999999999".into();
+            seed.spec.name = "quasar-seed-2".into();
+            s.containers.insert(seed.id.clone(), seed);
+        })
+    });
+    assert!(moved.contains("docker rm -f quasar-seed-2"), "{moved}");
+    // No seed on the machine: no clause, and no invented name.
+    let gone = second_import_refusal_with(Docker, sock, |engine| {
+        engine.with_state(|s| {
+            s.containers.remove(SEED_ID);
+        })
+    });
+    assert!(!gone.contains("first remove the seed"), "{gone}");
+    assert!(gone.contains(" uninstall --purge`"), "{gone}");
+}
+
 #[test]
 fn a_dump_newer_than_the_fresh_install_or_corrupt_is_refused_before_it_is_loaded() {
     let m = awaiting_restore();

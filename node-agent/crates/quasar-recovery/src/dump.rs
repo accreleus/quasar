@@ -36,10 +36,10 @@ pub enum Dest {
 }
 
 impl Dest {
-    /// Where the operator finds the dump.
-    pub fn describe(&self, name: &str) -> String {
+    /// Where the operator finds the dump. `cli` is the engine CLI to copy it out with.
+    pub fn describe(&self, name: &str, cli: &str) -> String {
         match self {
-            Dest::Volume(v) => format!("{name} in the {v} volume (copy it out with: docker run --rm -v {v}:/dump -v \"$PWD\":/out alpine cp /dump/{name} /out/)"),
+            Dest::Volume(v) => format!("{name} in the {v} volume (copy it out with: {cli} run --rm -v {v}:/dump -v \"$PWD\":/out alpine cp /dump/{name} /out/)"),
             Dest::HostDir(d) => format!("{}/{name} on this machine", d.trim_end_matches('/')),
         }
     }
@@ -150,5 +150,21 @@ fn helper_spec(image: &ImageRef, dump_mount: &str, name: &str) -> ContainerSpec 
         restart: RestartPolicy::No,
         ports: Vec::new(),
         healthcheck: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Dest;
+
+    #[test]
+    fn the_copy_out_hint_uses_the_engines_own_cli() {
+        let dest = Dest::Volume("quasar-final-dump".into());
+        assert!(dest
+            .describe("x.dump", "podman")
+            .contains("with: podman run --rm -v quasar-final-dump:/dump"));
+        assert!(dest
+            .describe("x.dump", "docker")
+            .contains("with: docker run --rm -v quasar-final-dump:/dump"));
     }
 }
