@@ -28,6 +28,9 @@ services:
       # LEFT EMPTY IT IS SAFE, JUST COARSE — the header is
       # never consulted, so nobody can spoof a limiter key; the shared budget
       # is the cost. Never widen this to a network you do not operate.
+      # Left empty, Caddy's X-Forwarded-Proto is not believed either, so the
+      # first-run claim through it is refused (#593): set this, or provision
+      # the admin with BOOTSTRAP_ADMIN_*.
       QUASAR_TRUSTED_PROXIES: ${QUASAR_TRUSTED_PROXIES:-}
 
   quasar-edge:

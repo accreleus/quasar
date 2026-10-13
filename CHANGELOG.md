@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Security
+- **The first-run setup claim and the dev-only agent-session route are no longer served over plain HTTP (#593, #594).** A request carrying `X-Forwarded-Proto: https` passed the HTTP-to-HTTPS redirect from any sender, and with `QUASAR_HTTP_REDIRECT=off` or `QUASAR_TLS=off` nothing stopped it at all, so the setup token, the new admin's password or the dev key could cross the network unencrypted. Both routes now answer only on the HTTPS port, or through a reverse proxy listed in `QUASAR_TRUSTED_PROXIES` that forwards `X-Forwarded-Proto: https`; anything else is refused before the secret is compared, with a message that says what to do. **If your proxy talks to the control plane's HTTP port, list it in `QUASAR_TRUSTED_PROXIES` before first-run setup** (the hardened Caddy overlay included), or claim on the HTTPS port. With `QUASAR_TLS=off` and no listed proxy, create the admin with `BOOTSTRAP_ADMIN_*`; the boot log says so. An install that already has an admin is not affected. The dev route also answers a caller inside the container, and a dev stack whose HTTP port is published on `127.0.0.1` only can set `QUASAR_DEV_AGENT_INSECURE_HTTP=1` (the local `make up` stack does).
+
 ### Internal
 - **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A dump restored into a fresh rootless install and a restore interrupted at three points pass on the AMD test host. A machine reboot on that host is recorded as an accepted gap: the test hosts are containers, so both AMD Docker reboot rows were container restarts, and the earlier rootful row is corrected to say so. The lab-VM rows, a live GPU fault and a Podman bench re-run are accepted gaps too. The run's one product finding is #589.
 

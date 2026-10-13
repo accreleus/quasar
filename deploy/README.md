@@ -529,8 +529,11 @@ QUASAR_ENV=production                     # optional, see below
   a proxy fronts the stack the browser's `Origin` is the proxy's name, and
   same-origin (the default) no longer matches. Keep the LAN URL if you still use
   it: `https://play.example.com,https://192.168.1.50:8443`.
-- **`QUASAR_TRUSTED_PROXIES` is the one that is easy to miss.** Without it every
-  request looks like it came from the proxy, so every client shares a single
+- **`QUASAR_TRUSTED_PROXIES` is the one that is easy to miss.** A proxy that
+  talks to the control plane's HTTP port must be listed before the setup wizard
+  can create the first admin through it: `X-Forwarded-Proto: https` is believed
+  only from a peer listed here, and the claim is refused otherwise. Without it every
+  request also looks like it came from the proxy, so every client shares a single
   rate-limit budget. On the first-admin claim endpoint that is a lockout:
   someone burns the shared budget with bad tokens and you can never create the
   first admin. With it, the control plane reads `X-Forwarded-For` — but *only*
@@ -592,8 +595,9 @@ docker compose -f deploy/docker-compose.yml \
                -f deploy/docker-compose.hardened.yml up -d
 ```
 
-It needs `QUASAR_PUBLIC_HOST` and `QUASAR_TLS_DIR` in `deploy/.env`, and it
-wants `QUASAR_TRUSTED_PROXIES` set to this compose project's own bridge network
+It needs `QUASAR_PUBLIC_HOST` and `QUASAR_TLS_DIR` in `deploy/.env`. The setup
+wizard cannot create the first admin through Caddy (use `BOOTSTRAP_ADMIN_*`
+instead) until `QUASAR_TRUSTED_PROXIES` is set to this compose project's own bridge network
 — read it off `docker network inspect deploy_default` (e.g. `172.18.0.0/16`),
 never the enclosing `172.16.0.0/12`, which would trust every other Docker stack
 on the box.

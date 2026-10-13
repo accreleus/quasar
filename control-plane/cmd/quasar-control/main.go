@@ -160,7 +160,8 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("dev agent auth: %w", err)
 		}
-		devSvc := devauth.NewService(svc.authSvc, secret, log)
+		devSvc := devauth.NewService(svc.authSvc, secret, log).
+			WithTransport(cfg.TrustedProxies, devCfg.InsecureHTTP)
 		devauth.Register(mux, devCfg, devSvc, log)
 		// The key goes to the log and the file: anyone who can read either
 		// already has host access.

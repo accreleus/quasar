@@ -68,6 +68,8 @@ type Service struct {
 // WithTrustedProxies configures which direct peers' X-Forwarded-For may be
 // believed (#438). Without it, every client behind the hardened Caddy overlay
 // shares one claim budget and an attacker can lock the operator out of setup.
+// It is also whose X-Forwarded-Proto the claim believes: a claim forwarded over
+// plain HTTP by any other peer is refused.
 func (s *Service) WithTrustedProxies(nets []*net.IPNet) *Service {
 	s.trustedProxies = nets
 	return s
@@ -152,12 +154,18 @@ type claimResponse struct {
 }
 
 // handleClaim serves POST /v1/setup/claim. Fail-closed, in order:
-//  1. token check FIRST, before the body is even read; every rejection produces
+//  0. transport: plain HTTP is refused before the token is looked at (#593).
+//     No loopback exception: this route is production surface.
+//  1. token check, before the body is even read; every rejection produces
 //     the identical 401 envelope with no missing-vs-wrong distinction, and the
 //     rejection is logged at WARN with the source address.
 //  2. body decode / password strength → 400 validation_failed.
 //  3. admin-exists gate (inside the advisory-locked claim tx) → 409.
 func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
+	if httpx.RefuseInsecure(w, r, s.trustedProxies, false) {
+		return
+	}
+
 	// Rate gate (finding 6), before the token compare and any logging. Reserve
 	// (not Allow) makes admission and in-flight accounting one atomic operation,
 	// same pattern as the signaling and enrollment limiters. Not a
