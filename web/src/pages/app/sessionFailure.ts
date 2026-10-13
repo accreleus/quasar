@@ -126,7 +126,10 @@ export function launchFailureFromSession(s: SessionVerdictInput): LaunchFailure 
         kind: "failed",
         title: "This browser cannot play the stream",
         message:
-          "Your browser refused the video. Try another browser, or in Firefox turn on the OpenH264 plugin (Add-ons, Plugins).",
+          "This browser refused the host's video, most likely because it cannot decode it. Try another browser." +
+          (/Firefox\//.test(navigator.userAgent)
+            ? " In Firefox, turn on OpenH264 Video Codec under Add-ons and themes, Plugins."
+            : ""),
         detail: s.error_message,
       };
     }
