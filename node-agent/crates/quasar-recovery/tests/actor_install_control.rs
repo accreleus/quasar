@@ -273,7 +273,7 @@ fn a_control_only_install_brings_up_no_agent_and_never_probes_for_a_gpu() {
             .unwrap()
             .as_ref(),
         None,
-        &docker_cli(),
+        &docker_cli,
     )
     .is_empty());
 }
@@ -348,7 +348,7 @@ fn an_unreachable_external_database_is_explained_by_status() {
         .load_machine()
         .unwrap();
     let lines =
-        quasar_recovery::explain::explain(&actor.status(), machine.as_ref(), None, &docker_cli());
+        quasar_recovery::explain::explain(&actor.status(), machine.as_ref(), None, &docker_cli);
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("db.example.invalid:5433"), "{}", lines[0]);
     assert!(
@@ -1082,7 +1082,6 @@ fn status_on_an_install_held_for_a_restore_says_so_and_names_the_restore_command
     let machine = quasar_recovery::machine::MachineDir::new(dir.path())
         .load_machine()
         .unwrap();
-    // The install waits for a restore, so the control plane is absent from the inventory.
     let status = actor.status();
     let hold = |reason| Hold {
         format: 1,
@@ -1090,6 +1089,12 @@ fn status_on_an_install_held_for_a_restore_says_so_and_names_the_restore_command
         since: "2026-10-14T00:00:00Z".into(),
         request_id: None,
     };
+    let explain = |status: &_, hold: Option<&Hold>, kind| {
+        quasar_recovery::explain::explain(status, machine.as_ref(), hold, &|| {
+            quasar_recovery::cli::Cli::new(kind, "/var/run/docker.sock")
+        })
+    };
+    let awaiting = hold(HoldReason::AwaitRestore);
     for (kind, exec) in [
         (
             Docker,
@@ -1100,13 +1105,7 @@ fn status_on_an_install_held_for_a_restore_says_so_and_names_the_restore_command
             "podman exec -i quasar-recovery quasar-recovery restore --dump - < <your dump file>",
         ),
     ] {
-        let cli = quasar_recovery::cli::Cli::new(kind, "/var/run/docker.sock");
-        let lines = quasar_recovery::explain::explain(
-            &status,
-            machine.as_ref(),
-            Some(&hold(HoldReason::AwaitRestore)),
-            &cli,
-        );
+        let lines = explain(&status, Some(&awaiting), kind);
         let held: Vec<_> = lines
             .iter()
             .filter(|l| l.contains("waiting for a restore"))
@@ -1115,17 +1114,70 @@ fn status_on_an_install_held_for_a_restore_says_so_and_names_the_restore_command
         assert!(held[0].contains(exec), "{}", held[0]);
         assert!(!lines.iter().any(|l| l.contains("restart")), "{lines:?}");
     }
-    // Without a hold the old line stands, spelled for the engine.
-    let lines = quasar_recovery::explain::explain(
-        &status,
-        machine.as_ref(),
-        None,
-        &quasar_recovery::cli::Cli::new(Podman, "/var/run/docker.sock"),
+    // A service the actor creates under any hold is still reported when it is gone.
+    let mut no_postgres = status.clone();
+    no_postgres.services.retain(|s| s.role != "postgres");
+    let lines = explain(&no_postgres, Some(&awaiting), Docker);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("quasar-postgres is not on this machine")
+                && l.contains("`docker restart quasar-recovery` creates it")),
+        "{lines:?}"
     );
+    // The agent follows the restore, so an awaiting install does not report it missing,
+    let mut no_agent = status.clone();
+    no_agent.services.retain(|s| s.role != "node-agent");
+    let lines = explain(&no_agent, Some(&awaiting), Docker);
+    assert!(
+        !lines.iter().any(|l| l.contains("quasar-node-agent")),
+        "{lines:?}"
+    );
+    // but an unfinished restore's install does: the actor recreates it on restart.
+    let incomplete = hold(HoldReason::RestoreIncomplete);
+    let lines = explain(&no_agent, Some(&incomplete), Docker);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("quasar-node-agent is not on this machine")
+                && l.contains("restart quasar-recovery")),
+        "{lines:?}"
+    );
+    // An unfinished restore holds the control plane; the line points at the result
+    // `status` already printed, never at running `status`.
+    let lines = explain(&status, Some(&incomplete), Docker);
+    let held: Vec<_> = lines
+        .iter()
+        .filter(|l| l.contains("held until a restore"))
+        .collect();
+    assert_eq!(held.len(), 1, "{lines:?}");
+    assert!(
+        held[0].contains("in the status above") && !held[0].contains("quasar-recovery status"),
+        "{}",
+        held[0]
+    );
+    // Without a hold the old line stands, spelled for the engine.
+    let lines = explain(&status, None, Podman);
     assert!(
         lines
             .iter()
             .any(|l| l.contains("`podman restart quasar-recovery` creates it")),
         "{lines:?}"
     );
+}
+
+/// The health probe runs `status`: a machine with nothing to explain never asks for the
+/// CLI, because asking calls the engine.
+#[test]
+fn a_status_with_nothing_to_say_never_asks_for_the_cli() {
+    let (engine, dir, id) = seeded(combined_env());
+    start(&engine, dir.path(), &id).resume().unwrap();
+    let actor = start(&engine, dir.path(), &id);
+    let machine = quasar_recovery::machine::MachineDir::new(dir.path())
+        .load_machine()
+        .unwrap();
+    let lines = quasar_recovery::explain::explain(&actor.status(), machine.as_ref(), None, &|| {
+        panic!("a healthy status asked for the CLI")
+    });
+    assert!(lines.is_empty(), "{lines:?}");
 }

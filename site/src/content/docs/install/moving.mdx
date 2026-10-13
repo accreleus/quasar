@@ -154,12 +154,15 @@ An install can't be switched from rootful to rootless in place.
 
    ```bash
    img=$(docker inspect -f '{{.Config.Image}}' quasar-recovery)
-   docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
+   docker run --rm -it --security-opt label=disable \
+     -v /var/run/docker.sock:/var/run/docker.sock \
      -v quasar-machine:/var/lib/quasar-machine "$img" uninstall --purge \
      --confirm <old node name> --dump-to /var/lib/quasar/move
    ```
 
-   It runs in its own container because it stops the recovery actor. This writes
+   It runs in its own container because it stops the recovery actor. (On Podman,
+   or rootless Docker, `docker exec … uninstall` is refused and prints this
+   command for your engine.) This writes
    `/var/lib/quasar/move/quasar-final-<timestamp>.dump` on the host, then removes the old containers, volumes and network. Homes and templates are
    kept. If the dump fails, nothing is deleted. Copy the dump off if you're
    changing machines, then:
@@ -254,9 +257,10 @@ docker exec quasar-recovery quasar-recovery status
 | `status` shows | Meaning | Do |
 | --- | --- | --- |
 | The control plane running and healthy | The restore finished. | Nothing. Running it again is refused. |
-| The restore still running | It resumed after the restart. | Wait, then read `status` again. |
-| "Nothing was changed. Run the command again." | It stopped before touching anything. | Run the same restore command again. |
-| Failed, naming a problem | The load or the start failed. | Fix what it names, then run the restore again. |
+| An attempt still open (`in_flight` set) | It resumed after the restart. | Wait, then read `status` again. |
+| A failed result whose output says "nothing was changed. Run the command again." | It stopped before touching anything. | Run the same restore command again. |
+| A failed result, control plane not created | The file was not kept. | Fix what the output names, then run the restore again with the file. |
+| A failed result, control plane created | The dump loaded, then the first boot or the health check failed. | Don't run it again (it is refused). Follow the start-over command the output prints, as in [If the restore says no](#if-the-restore-says-no). |
 
 ## Staying on Compose
 

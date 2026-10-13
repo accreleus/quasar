@@ -688,8 +688,8 @@ fn uninstall_removes_the_services_keeps_data_and_the_seed_idles() {
 fn uninstall_refuses_to_run_inside_the_recovery_actor_and_names_a_command_that_works() {
     use quasar_runtime::EngineKind::{Docker, Podman};
     let cases = [
-        (Docker, "/var/run/docker.sock", "docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock "),
-        (Docker, "/run/user/1001/docker.sock", "docker run --rm -it -v /run/user/1001/docker.sock:/var/run/docker.sock "),
+        (Docker, "/var/run/docker.sock", "docker run --rm -it --security-opt label=disable -v /var/run/docker.sock:/var/run/docker.sock "),
+        (Docker, "/run/user/1001/docker.sock", "docker run --rm -it --security-opt label=disable -v /run/user/1001/docker.sock:/var/run/docker.sock "),
         (Podman, "/run/user/1001/podman/podman.sock", "podman run --rm -it --security-opt label=disable -v /run/user/1001/podman/podman.sock:/var/run/docker.sock "),
     ];
     for (kind, socket, start) in cases {

@@ -25,16 +25,18 @@ fn state(s: &Service) -> String {
 
 /// The lines, in the order the services are created. Empty when everything this machine
 /// runs is running and healthy.
-/// `hold` is why the control plane is held back, when it is; `cli` spells the commands.
+/// `hold` is why the control plane is held back, when it is. `cli` spells the commands:
+/// it is asked only when a line names one, since it may call the engine and a healthy
+/// `status` (the image's health probe) must not.
 pub fn explain(
     status: &Status,
     machine: Option<&Machine>,
     hold: Option<&Hold>,
-    cli: &Cli,
+    cli: &dyn Fn() -> Cli,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let Some(machine) = machine else {
-        out.push(format!("this machine is not installed yet: the recovery actor installs it from the seed's inputs when it starts ({} logs {} says what it is waiting for)", cli.name(), names::RECOVERY_ACTOR));
+        out.push(format!("this machine is not installed yet: the recovery actor installs it from the seed's inputs when it starts ({} logs {} says what it is waiting for)", cli().name(), names::RECOVERY_ACTOR));
         return out;
     };
     if status.stale {
@@ -58,37 +60,42 @@ pub fn explain(
     if machine.role != MachineRole::ControlOnly {
         expected.push(Role::NodeAgent);
     }
+    let reason = hold.map(|h| h.reason);
     for role in expected {
         let container = role.container_name();
         match service(status, role.as_str()) {
-            // Held: no restart creates anything; the agent follows the control plane.
-            None if hold.is_some() && role != Role::ControlPlane => {}
-            None if hold.is_some() => {
-                out.push(match hold.map(|h| h.reason) {
-                    Some(HoldReason::AwaitRestore) => format!(
-                        "{container} is waiting for a restore: it is created when a dump is loaded. Load one with `{} < <your dump file>`",
-                        cli.exec_stdin("restore --dump -")
-                    ),
-                    _ => format!(
-                        "{container} is held until the restore that stopped it finishes: `{}` shows the restore's outcome; run the restore again if it failed",
-                        cli.exec("status")
-                    ),
-                })
+            // The actor creates the agent only after the restore has loaded the database.
+            None if reason == Some(HoldReason::AwaitRestore) && role == Role::NodeAgent => {}
+            None if role == Role::ControlPlane && reason == Some(HoldReason::AwaitRestore) => {
+                out.push(format!(
+                    "{container} is waiting for a restore: it is created when a dump is loaded. Load one with `{} < <your dump file>`",
+                    cli().exec_stdin("restore --dump -")
+                ))
             }
-            None => out.push(format!(
-                "{container} is not on this machine: `{} restart {}` creates it",
-                cli.name(),
-                names::RECOVERY_ACTOR
-            )),
+            None if role == Role::ControlPlane && reason == Some(HoldReason::RestoreIncomplete) => {
+                out.push(format!(
+                    "{container} is held until a restore has loaded the database and started it: the last restore's result is in the status above; if it failed, do what it says"
+                ))
+            }
+            None => {
+                let cli = cli();
+                out.push(format!(
+                    "{container} is not on this machine: `{} restart {}` creates it",
+                    cli.name(),
+                    names::RECOVERY_ACTOR
+                ))
+            }
             Some(s) if healthy(s) => {}
             Some(s) if role == Role::ControlPlane && external.is_some() => out.push(format!(
-                "{container} is {}. Its database is your own, at {}: check that it is up and reachable from this machine; `docker logs {container}` says why",
+                "{container} is {}. Its database is your own, at {}: check that it is up and reachable from this machine; `{} logs {container}` says why",
                 state(s),
-                external.as_deref().unwrap_or_default()
+                external.as_deref().unwrap_or_default(),
+                cli().name()
             )),
             Some(s) => out.push(format!(
-                "{container} is {}: `docker logs {container}` says why",
-                state(s)
+                "{container} is {}: `{} logs {container}` says why",
+                state(s),
+                cli().name()
             )),
         }
     }

@@ -52,7 +52,7 @@ func codecConstraint(chain profile.LaunchProfile, ov StreamOverride) (string, er
 func noHostMessage(err error) string {
 	var off *HomeHostOfflineRejection
 	if errors.As(err, &off) {
-		return "the host that holds your saves for this game is not online, or is no longer enrolled; ask your administrator to bring it back, or to release the claim and start you with empty saves"
+		return "the host that holds your saves for this game is not online, or is no longer enrolled; ask your administrator to bring it back, or to forget that host and then release the claim on your saves (you then start with empty saves)"
 	}
 	return "no host is available to serve this launch"
 }

@@ -38,6 +38,13 @@ impl Cli {
         Cli::new(kind, &machine.inputs.docker_socket)
     }
 
+    /// The same when no machine state is known: only the CLI's name is right, and the
+    /// socket is the rootful default.
+    pub fn for_engine(engine: &dyn PlatformEngine) -> Self {
+        let kind = engine.host().map(|h| h.kind).unwrap_or_default();
+        Cli::new(kind, paths::ENGINE_SOCKET)
+    }
+
     /// The engine CLI's name.
     pub fn name(&self) -> &'static str {
         self.name
@@ -64,14 +71,9 @@ impl Cli {
     /// `command` run in its own container on the recovery image, beside the actor: the
     /// way to run what stops the actor itself (`uninstall`). `image` is printed as it is.
     pub fn beside(&self, image: &str, command: &str) -> String {
-        // Podman confines a container's access to the engine socket unless told not to.
-        let label = if self.name == "podman" {
-            "--security-opt label=disable "
-        } else {
-            ""
-        };
+        // On every engine, as the seed's own command: required on SELinux, harmless elsewhere.
         format!(
-            "{} run --rm -it {label}-v {}:{} -v {}:{} {image} {command}",
+            "{} run --rm -it --security-opt label=disable -v {}:{} -v {}:{} {image} {command}",
             self.name,
             self.socket,
             paths::ENGINE_SOCKET,
@@ -92,7 +94,7 @@ mod tests {
         let c = Cli::new(EngineKind::Docker, "/var/run/docker.sock");
         assert_eq!(
             c.beside(IMAGE, "uninstall --purge"),
-            format!("docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock -v quasar-machine:{} {IMAGE} uninstall --purge", paths::MACHINE_DIR)
+            format!("docker run --rm -it --security-opt label=disable -v /var/run/docker.sock:/var/run/docker.sock -v quasar-machine:{} {IMAGE} uninstall --purge", paths::MACHINE_DIR)
         );
         assert_eq!(
             c.exec("status"),
@@ -106,7 +108,7 @@ mod tests {
             Cli::new(EngineKind::Docker, "/run/user/1001/docker.sock").beside(IMAGE, "uninstall");
         assert!(
             line.starts_with(
-                "docker run --rm -it -v /run/user/1001/docker.sock:/var/run/docker.sock "
+                "docker run --rm -it --security-opt label=disable -v /run/user/1001/docker.sock:/var/run/docker.sock "
             ),
             "{line}"
         );
@@ -123,5 +125,12 @@ mod tests {
         assert!(line.starts_with("podman run --rm -it --security-opt label=disable -v /run/user/1001/podman/podman.sock:/var/run/docker.sock "), "{line}");
         assert!(!line.contains("docker run"), "{line}");
         assert!(c.exec("restore --list").starts_with("podman exec "));
+    }
+
+    #[test]
+    fn rootful_podman_names_its_own_socket() {
+        let line =
+            Cli::new(EngineKind::Podman, "/run/podman/podman.sock").beside(IMAGE, "uninstall");
+        assert!(line.starts_with("podman run --rm -it --security-opt label=disable -v /run/podman/podman.sock:/var/run/docker.sock "), "{line}");
     }
 }

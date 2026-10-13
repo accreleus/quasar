@@ -363,8 +363,9 @@ fn explain(body: &str) {
     let hold = quasar_recovery::database::load_hold(std::path::Path::new(&dir))
         .ok()
         .flatten();
-    let cli = operator_cli();
-    for line in quasar_recovery::explain::explain(&status, machine.as_ref(), hold.as_ref(), &cli) {
+    for line in
+        quasar_recovery::explain::explain(&status, machine.as_ref(), hold.as_ref(), &operator_cli)
+    {
         eprintln!("{line}");
     }
 }

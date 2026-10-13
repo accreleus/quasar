@@ -566,10 +566,12 @@ func classifyRejectPlain(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 	if !totalsFit {
 		rej := noHostRejection(ctx, tx, cand.p.AppImage)
 		if cand.p.homePinned {
-			var online bool
-			err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM hosts WHERE id = $1::uuid AND status = 'online')`,
-				cand.p.PinHostID).Scan(&online)
-			if err == nil && !online {
+			// Only a host that is gone or offline: a draining one is connected and
+			// comes back by itself, so it keeps the generic text.
+			var connected bool
+			err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM hosts WHERE id = $1::uuid AND status <> 'offline')`,
+				cand.p.PinHostID).Scan(&connected)
+			if err == nil && !connected {
 				return &HomeHostOfflineRejection{err: rej}
 			}
 		}
@@ -632,7 +634,7 @@ func (e *NoHostRejection) Error() string {
 func (e *NoHostRejection) Unwrap() error { return e.err }
 
 // HomeHostOfflineRejection marks a no_host_available refusal whose cause is that
-// the user's managed home is claimed by a host that is not online (a host that
+// the user's managed home is claimed by a host that is offline or gone (a host that
 // was never enrolled again after a restore reads the same). It unwraps to the
 // plain rejection, so errors.Is and the fleet-count log are unchanged; only the
 // response text differs. It names no host.

@@ -36,6 +36,15 @@ func TestLaunchRefusesReplacementForOfflineHomeOwner(t *testing.T) {
 	if got := sessionsOnHost(t, pool, h2); got != 0 {
 		t.Fatalf("new host has %d sessions, want none", got)
 	}
+
+	// A cordoned home host is connected and comes back by itself: the generic text.
+	_, err = pool.Exec(context.Background(), `UPDATE hosts SET status='draining' WHERE id=$1::uuid`, s.hostID)
+	must(t, err)
+	_, err = NewStore(pool).ScheduleAndCreate(context.Background(), p)
+	if !errors.Is(err, ErrNoHostAvailable) || errors.As(err, &off) ||
+		noHostMessage(err) != "no host is available to serve this launch" {
+		t.Fatalf("home on draining host: %v (%q), want the plain no_host_available text", err, noHostMessage(err))
+	}
 }
 
 func TestLaunchRefusesHomeHeldByTerminalSession(t *testing.T) {

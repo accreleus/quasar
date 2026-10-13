@@ -389,9 +389,16 @@ impl Actor {
             .and_then(|me| crate::actor::own_image(self.engine.as_ref(), &me))
             .map(|i| i.reference())
             .unwrap_or_else(|| crate::cli::IMAGE_PLACEHOLDER.to_owned());
+        let seed = self
+            .config
+            .seed_container
+            .as_deref()
+            .and_then(|id| self.engine.inspect_container(id).ok().flatten())
+            .map_or_else(|| "quasar-seed".to_owned(), |c| c.name);
         format!(
-            "`{}` (remove the seed first)",
-            cli.beside(&image, "uninstall --purge")
+            "`{}` (first remove the seed: `{} rm -f {seed}`)",
+            cli.beside(&image, "uninstall --purge"),
+            cli.name()
         )
     }
 

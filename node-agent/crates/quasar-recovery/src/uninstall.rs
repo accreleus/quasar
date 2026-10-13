@@ -344,14 +344,17 @@ impl Uninstall {
                 }
                 None => {
                     return Err(refused(format!(
-                        "--purge needs a typed confirmation: run it in a terminal (docker run -it …), or add --confirm {node}"
+                        "--purge needs a typed confirmation: run it in a terminal ({} run -it …), or add --confirm {node}",
+                        cli().name()
                     )))
                 }
             }
             if let Some(s) = containers.iter().find(|c| seed::is_seed(c)) {
                 return Err(refused(format!(
-                    "a seed ({}) is still on this machine; a purge deletes the state that tells it this machine is uninstalled, so it would install Quasar again. Remove the seed first, the way you started it (from your manager, or docker rm -f {}), then run this again",
-                    s.name, s.name
+                    "a seed ({}) is still on this machine; a purge deletes the state that tells it this machine is uninstalled, so it would install Quasar again. Remove the seed first, the way you started it (from your manager, or {} rm -f {}), then run this again",
+                    s.name,
+                    cli().name(),
+                    s.name
                 )));
             }
         }
@@ -434,7 +437,8 @@ impl Uninstall {
                 None => format!("Purged.{homes}"),
             });
             report.say(format!(
-                "Remove the emptied machine-state volume once this command has exited: docker volume rm {}",
+                "Remove the emptied machine-state volume once this command has exited: {} volume rm {}",
+                cli().name(),
                 names::MACHINE_VOLUME
             ));
         } else {
@@ -518,8 +522,10 @@ impl Uninstall {
         }
         if let Some(s) = containers.iter().find(|c| seed::is_seed(c)) {
             return Err(refused(format!(
-                "a seed ({}) is still on this machine and would install Quasar again; remove it first (docker rm -f {})",
-                s.name, s.name
+                "a seed ({}) is still on this machine and would install Quasar again; remove it first ({} rm -f {})",
+                s.name,
+                Cli::for_engine(self.engine.as_ref()).name(),
+                s.name
             )));
         }
         for actor in ours(&containers, &id, Role::RecoveryActor) {
@@ -550,7 +556,8 @@ impl Uninstall {
             report.say(format!("Deleted the {name} volume."));
         }
         report.say(format!(
-            "Purged what installation {id} left. Remove the machine-state volume once this command has exited: docker volume rm {}",
+            "Purged what installation {id} left. Remove the machine-state volume once this command has exited: {} volume rm {}",
+            Cli::for_engine(self.engine.as_ref()).name(),
             names::MACHINE_VOLUME
         ));
         Ok(report)
@@ -566,7 +573,7 @@ impl Uninstall {
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 Err(quasar_runtime::LeaseError::Held(_)) => {
-                    return Err("a recovery actor still holds this machine's lease (actor.lease) after being stopped; stop it (docker stop quasar-recovery) and run again".into())
+                    return Err(format!("a recovery actor still holds this machine's lease (actor.lease) after being stopped; stop it ({} stop quasar-recovery) and run again", Cli::for_engine(self.engine.as_ref()).name()))
                 }
                 Err(quasar_runtime::LeaseError::Open(e)) => {
                     return Err(format!("the machine's lease cannot be opened: {e}"))
@@ -630,8 +637,8 @@ impl Uninstall {
             &name,
         ) {
             Ok(name) => {
-                report.say(format!("Final dump taken: {}.", dest.describe(&name, Cli::for_machine(self.engine.as_ref(), machine).name())
-                ));
+                let cli = Cli::for_machine(self.engine.as_ref(), machine);
+                report.say(format!("Final dump taken: {}.", dest.describe(&name, cli.name())));
                 Ok(Some(name))
             }
             Err(why) => Err(stopped(format!(
