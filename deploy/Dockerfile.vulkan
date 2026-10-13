@@ -172,11 +172,13 @@ ENTRYPOINT []
 # libnice silently switches to OpenSSL. So a change to this list is checked by running
 # GStreamer's `meson setup` on both package sets: the dependency lines and every config.h
 # must not differ. `clang` alone serves bindgen; clang-devel pulls 380 MB of llvm-static.
+# gstreamer1-devel is Fedora's own GStreamer, here for one file: gst-interpipe's meson
+# requires gstreamer-check-1.0, and /opt/gst is built without it.
 RUN dnf install -y dnf-plugins-core \
     && dnf install -y --setopt=install_weak_deps=False \
         git ca-certificates curl \
         gcc gcc-c++ make cmake pkgconf-pkg-config ninja-build nasm flex bison meson glslc \
-        glib2-devel libdrm-devel mesa-libgbm-devel systemd-devel \
+        glib2-devel gstreamer1-devel libdrm-devel mesa-libgbm-devel systemd-devel \
         wayland-devel wayland-protocols-devel libxkbcommon-devel libX11-devel \
         libinput-devel openssl-devel gnutls-devel libcurl-devel gmp-devel libatomic \
         clang libffi-devel expat-devel \
