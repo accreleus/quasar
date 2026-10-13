@@ -52,21 +52,19 @@
 //!
 //! The sidecar is stopped from inside the release, which is before the runner's
 //! `audio_pipeline.finish()`: `pulsesrc` is still PLAYING when its server dies.
-//! That cannot stall the later `finish()`. `AudioPipelineGuard::finish` is a
-//! synchronous downward `set_state(Null)`; `GstBaseSrc` calls the element's
-//! `unlock` before joining its streaming task, and `pulsesrc`'s unlock signals
-//! its own `pa_threaded_mainloop` rather than waiting on the server, while a
-//! dead socket makes the context fail and wakes the same mainloop. Neither the
-//! ring-buffer release nor `pa_context_disconnect` waits for a server reply.
-//! The element posts an error and the transition completes.
+//! That order is what keeps `finish()` from waiting on the server. On its way to
+//! NULL `pulsesrc` flushes its stream and waits for the reply: a dead server
+//! fails the context and ends the wait, a server that is alive but frozen holds
+//! it for libpulse's reply timeout. Measured with the session's PipeWire config,
+//! that NULL takes under 1 ms against a dead server, 1–3 ms against a live one
+//! and 30 s against a frozen one, 90 s with the mic's `pulsesink`. Never finish
+//! the audio pipeline ahead of the release.
 //!
-//! That is a reading of the element's contract, not a measurement: the one thing
-//! to watch for on a host is a session end that hangs between the
-//! `audio-pulse-cleanup-*` log and the encode pipeline reaching NULL. If that is
-//! ever seen, the guard is to finish the audio pipeline before the release
-//! rather than after it — `AudioPipelineGuard::finish` is idempotent, so the
-//! runner can call it earlier on the terminal paths without changing anything
-//! else.
+//! The price is one error: `pulsesrc` posts `Disconnected: Connection terminated`
+//! when its server goes. `runner::stop_source` stops reporting from the audio bus
+//! before the release (#588); the same error on a live session is the dead sound
+//! server signal and is still logged (`audio_health::watch_bus`). Guarded by
+//! `takeover_tests::a_session_end_does_not_report_its_sound_server_stopping`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
