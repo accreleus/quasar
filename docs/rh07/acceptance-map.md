@@ -28,7 +28,7 @@ applied from the console (**Update**); a machine reboot after which everything r
 (**Reboot**; a container restart does not count); console mode on one host per engine
 (**Console**); a bench run posted (**Bench**). The AMD and NVIDIA test hosts are containers on
 one hypervisor, so a restart of a test host is a container restart under this rule; a kernel
-boot is recorded only on the rootless lab VM (E3).
+boot is recorded only on the lab VM (E3, E4, E5).
 
 Evidence keys used in the tables:
 
@@ -59,7 +59,7 @@ Evidence keys used in the tables:
 
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
-| AMD | PASS (E1, E2) | PASS (E11): fleet run `d19ea045`, 43 s, Steam streamed afterwards | Accepted gap (§3): container restart only (E13). The test host's container was restarted from outside; the rootless engine and all five Quasar containers came back through the user service and lingering, the agent registered 3 s after the container's init started with no manual step, and Steam streamed 71 s with 0 freezes. It does not show a kernel boot; the host has no udev (a stand-in applied the device rules); and the product's `engine_restart_on_boot` check still read `unknown` afterwards. The rootful install on the same machine was stopped for the row, because two installs share the agent's health port | Accepted gap (§3): NVIDIA covers rootless Docker (#407 [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752)) | PASS (E12): run `c513f621`, "result: clean". The first run, `ae25b968`, read regressed (E11, #544, fixed) |
+| AMD | PASS (E1, E2) | PASS (E11): fleet run `d19ea045`, 43 s, Steam streamed afterwards | Accepted gap (§3): container restart only (E13). The test host's container was restarted from outside; the rootless engine and all five Quasar containers came back through the user service and lingering, the agent registered 3 s after the container's init started with no manual step, and Steam streamed 71 s with 0 freezes. It does not show a kernel boot; the host has no udev (a stand-in applied the device rules); and the product's `engine_restart_on_boot` check still read `unknown` afterwards. The rootful install's agent on the same machine was held down for the row, because two installs share the agent's health port | Accepted gap (§3): NVIDIA covers rootless Docker (#407 [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752)) | PASS (E12): run `c513f621`, "result: clean". The first run, `ae25b968`, read regressed (E11, #544, fixed) |
 | NVIDIA | PASS (E1, E2, E4) | PASS (E4) | PASS (E4) | PASS: #407 [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752) | PASS: run `9384a95d` (E4) |
 
 ### Podman rootless (Fedora family)
@@ -115,7 +115,7 @@ E3's AMD Podman bench was an XFCE soak; E11 adds a Steam bench with a baseline.
 | 27 | Docs say a rootful socket is root-equivalent | Met | #406 [5884610608](https://github.com/accreleus/quasar/issues/406#issuecomment-5884610608) |
 | 28 | SELinux-enforcing hosts work without relaxing SELinux | Met | Every rootless run on the lab VM stayed `Enforcing` (E3, E10 among them); sessions stay confined; the agent's `label=disable` per D17. E11 ran on a host with SELinux off |
 | 29 | One behavioural suite across every engine mode | Met | #408 [5893020059](https://github.com/accreleus/quasar/issues/408#issuecomment-5893020059), in CI on all four modes; its Podman findings (#424, #425, #426) are fixed |
-| 30 | Each required profile proven on hardware before `main` | Partly met | Proven: every NVIDIA row; AMD rootful Docker session, update and bench (E8); AMD rootless Docker update and bench (E11, E12); AMD rootless Podman update with the #543 fix (E12). Accepted gaps (§3): the AMD Docker reboot rows (rootful E8, rootless E13) were container restarts, not a kernel boot; the rootless lab VM console rows (AMD rootless Docker, and the AMD Podman direct-display console with a physical keyboard); and a Podman Steam bench after the #544 fix |
+| 30 | Each required profile proven on hardware before `main` | Partly met | Proven: every NVIDIA row; AMD rootful Docker session, update and bench (E1, E8); AMD rootless Docker update and bench (E11, E12); AMD rootless Podman update with the #543 fix (E12). Accepted gaps (§3): the AMD Docker reboot rows (rootful E8, rootless E13) were container restarts, not a kernel boot; the rootless lab VM console rows (AMD rootless Docker, and the AMD Podman direct-display console with a physical keyboard); and a Podman Steam bench after the #544 fix |
 
 Met: 1–13, 15–19, 21–29 (**27**). Partly met: 14, 20, 30 (**3**). Not
 evidenced: none.
@@ -124,7 +124,8 @@ evidenced: none.
 
 The milestone closed on 2026-10-09 with its gaps accepted. The AMD rootless runs of
 2026-10-11 (E11) closed one and found two defects, both fixed the same day (E12). The
-#502 close-out of 2026-10-13 (E13) ran the restore rows and a container restart of the rootless Docker install.
+#502 close-out of 2026-10-13 (E13) ran the restore rows and, for the rootless Docker
+install, a restart of the test host's container.
 
 1. **Defects found and fixed on 2026-10-11:** a Podman install on the published images failed
    the control-plane step of a console update (#543); the session page's frame callbacks lost
@@ -135,11 +136,11 @@ The milestone closed on 2026-10-09 with its gaps accepted. The AMD rootless runs
 2. **Found by the 2026-10-13 run:** restore and uninstall messages point at commands the
    product refuses (#589).
 3. **Accepted gaps, decided 2026-10-13, not going to be run:**
-   - **A kernel boot of the AMD test host under Docker (rootful E8, rootless E13):** both
-     reboot rows were restarts of the host's container, not a machine reboot. Booting a kernel
-     needs the rootless lab VM with the AMD iGPU passed through, which has wedged the
-     hypervisor's VM manager before. On AMD it is covered only by the rootless Podman lab-VM
-     reboot (E3); the NVIDIA reboot rows cite E4 and E5, which this map does not re-verify.
+   - **A machine reboot (a kernel boot) for the AMD Docker rows (rootful E8, rootless
+     E13):** both reboot rows were restarts of the host's container, not a machine reboot.
+     Booting a kernel needs the rootless lab VM with the AMD iGPU passed through, which has
+     wedged the hypervisor's VM manager before. On AMD it is covered only by the rootless
+     Podman lab-VM reboot (E3); the NVIDIA reboot rows (E4, E5) ran on the lab VM.
    - **The lab-VM console rows:** Docker rootless console mode and the Podman rootless
      direct-display console with a physical keyboard, for the same passthrough reason. Each is
      covered on another engine mode or GPU vendor: the console by E9 (rootful Docker) and E10
