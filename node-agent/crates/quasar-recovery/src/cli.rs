@@ -52,10 +52,13 @@ impl Cli {
     }
 
     /// How to take the seed `seed` away so that it stays away: the way it was started. On
-    /// Podman the documented seed is a systemd unit that restarts a removed container.
+    /// Podman the documented seed is a systemd unit that restarts a removed container; a
+    /// hand-run seed has no unit.
     pub fn remove_seed(&self, seed: &str) -> String {
         if self.name == "podman" {
-            format!("`systemctl stop {seed}` (`--user` when rootless), or your stack manager")
+            format!(
+                "`systemctl stop {seed}` (`--user` when rootless) if a systemd unit started it, else `podman rm -f {seed}`"
+            )
         } else {
             format!("your stack manager, or `docker rm -f {seed}`")
         }
@@ -139,11 +142,21 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_seed_is_the_way_it_was_started_never_a_bare_podman_rm() {
+    fn removing_a_seed_is_the_way_it_was_started_a_podman_unit_first() {
         let podman =
             Cli::new(EngineKind::Podman, "/run/podman/podman.sock").remove_seed("quasar-seed");
-        assert!(podman.contains("systemctl stop quasar-seed"), "{podman}");
-        assert!(!podman.contains("rm -f"), "{podman}");
+        // The unit first; a hand-run seed has none, so `rm -f` follows as the "else".
+        let stop = podman.find("systemctl stop quasar-seed").expect(&podman);
+        assert!(
+            podman
+                .find("podman rm -f quasar-seed")
+                .is_none_or(|rm| stop < rm),
+            "{podman}"
+        );
+        assert!(
+            podman.contains("if a systemd unit started it, else"),
+            "{podman}"
+        );
         let docker =
             Cli::new(EngineKind::Docker, "/var/run/docker.sock").remove_seed("quasar-seed");
         assert!(

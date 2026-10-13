@@ -1483,10 +1483,13 @@ fn the_refused_import_names_an_uninstall_that_runs_for_the_engine_the_install_is
         let message = second_import_refusal(kind, socket);
         assert!(message.contains(start), "{message}");
         // The seed goes the way it was started: a Podman seed is a unit that restarts a
-        // removed container, so a bare `podman rm -f` is never offered.
+        // removed container, so `systemctl stop` comes before any `podman rm -f`.
         if kind == Podman {
-            assert!(message.contains("systemctl stop quasar-seed"), "{message}");
-            assert!(!message.contains("podman rm -f"), "{message}");
+            let stop = message.find("systemctl stop quasar-seed").expect(&message);
+            assert!(
+                message.find("podman rm -f").is_none_or(|rm| stop < rm),
+                "{message}"
+            );
         } else {
             assert!(message.contains("docker rm -f quasar-seed"), "{message}");
         }

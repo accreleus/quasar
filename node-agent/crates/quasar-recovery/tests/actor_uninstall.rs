@@ -711,11 +711,15 @@ fn uninstall_refuses_to_run_inside_the_recovery_actor_and_names_a_command_that_w
 }
 
 #[test]
-fn the_seed_refusal_removes_a_seed_the_way_it_was_started_never_a_bare_podman_rm() {
+fn the_seed_refusal_removes_a_seed_the_way_it_was_started_a_podman_unit_first() {
     use quasar_runtime::EngineKind::{Docker, Podman};
-    for (kind, offered, never) in [
-        (Docker, "docker rm -f quasar-seed", ""),
-        (Podman, "systemctl stop quasar-seed", "podman rm -f"),
+    for (kind, offered, later) in [
+        (Docker, "docker rm -f quasar-seed", None),
+        (
+            Podman,
+            "systemctl stop quasar-seed",
+            Some("podman rm -f quasar-seed"),
+        ),
     ] {
         let (engine, dir, _) = seeded_gpu_host();
         engine.with_state(|s| s.host.kind = kind);
@@ -726,9 +730,14 @@ fn the_seed_refusal_removes_a_seed_the_way_it_was_started_never_a_bare_podman_rm
                 dump_to: None,
             })
             .expect_err("a seed is running");
+        let UninstallError::Refused(why) = &err else {
+            panic!("{err:?}")
+        };
+        let first = why.find(offered).unwrap_or_else(|| panic!("{why}"));
+        // A hand-run Podman seed has no unit, so `rm -f` may follow, never lead.
         assert!(
-            matches!(&err, UninstallError::Refused(why) if why.contains(offered) && (never.is_empty() || !why.contains(never))),
-            "{err:?}"
+            later.and_then(|l| why.find(l)).is_none_or(|rm| first < rm),
+            "{why}"
         );
     }
 }
