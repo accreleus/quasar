@@ -170,6 +170,10 @@ func (s *Store) Install(ctx context.Context, id string, lazy bool) (CatalogImage
 			return CatalogImage{}, fmt.Errorf("link runtime preset id=%q: %w", id, err)
 		}
 	}
+	// A reinstall reuses the managed preset, so apps may already link it.
+	if err := stampDirectDisplay(ctx, tx, id); err != nil {
+		return CatalogImage{}, err
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return CatalogImage{}, fmt.Errorf("commit install id=%q: %w", id, err)
@@ -369,6 +373,10 @@ func (s *Store) Update(ctx context.Context, id string) (applied bool, img Catalo
 			adoptedImageRef(oldRegistryRef, oldLocalTag), adoptedImageRef(registryRef, tag)); err != nil {
 			return false, CatalogImage{}, err
 		}
+	}
+	// After the provider app is re-linked, so a preset gained here is seen.
+	if err := stampDirectDisplay(ctx, tx, id); err != nil {
+		return false, CatalogImage{}, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
