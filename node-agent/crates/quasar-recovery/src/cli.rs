@@ -12,6 +12,7 @@ use crate::recipe::{names, paths};
 /// `quasar-recovery` container is left to inspect.
 pub const IMAGE_PLACEHOLDER: &str = "<registry>/quasar-recovery@sha256:<digest>";
 
+#[derive(Clone)]
 pub struct Cli {
     name: &'static str,
     socket: String,
@@ -48,6 +49,16 @@ impl Cli {
     /// The engine CLI's name.
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// How to take the seed `seed` away so that it stays away: the way it was started. On
+    /// Podman the documented seed is a systemd unit that restarts a removed container.
+    pub fn remove_seed(&self, seed: &str) -> String {
+        if self.name == "podman" {
+            format!("`systemctl stop {seed}` (`--user` when rootless), or your stack manager")
+        } else {
+            format!("your stack manager, or `docker rm -f {seed}`")
+        }
     }
 
     /// `command` run inside the recovery actor's container.
@@ -125,6 +136,20 @@ mod tests {
         assert!(line.starts_with("podman run --rm -it --security-opt label=disable -v /run/user/1001/podman/podman.sock:/var/run/docker.sock "), "{line}");
         assert!(!line.contains("docker run"), "{line}");
         assert!(c.exec("restore --list").starts_with("podman exec "));
+    }
+
+    #[test]
+    fn removing_a_seed_is_the_way_it_was_started_never_a_bare_podman_rm() {
+        let podman =
+            Cli::new(EngineKind::Podman, "/run/podman/podman.sock").remove_seed("quasar-seed");
+        assert!(podman.contains("systemctl stop quasar-seed"), "{podman}");
+        assert!(!podman.contains("rm -f"), "{podman}");
+        let docker =
+            Cli::new(EngineKind::Docker, "/var/run/docker.sock").remove_seed("quasar-seed");
+        assert!(
+            docker.contains("docker rm -f quasar-seed") && docker.contains("stack manager"),
+            "{docker}"
+        );
     }
 
     #[test]

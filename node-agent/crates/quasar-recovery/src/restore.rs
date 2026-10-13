@@ -389,17 +389,17 @@ impl Actor {
             .and_then(|me| crate::actor::own_image(self.engine.as_ref(), &me))
             .map(|i| i.reference())
             .unwrap_or_else(|| crate::cli::IMAGE_PLACEHOLDER.to_owned());
-        let seed = self
-            .config
-            .seed_container
-            .as_deref()
-            .and_then(|id| self.engine.inspect_container(id).ok().flatten())
-            .map_or_else(|| "quasar-seed".to_owned(), |c| c.name);
-        format!(
-            "`{}` (first remove the seed: `{} rm -f {seed}`)",
-            cli.beside(&image, "uninstall --purge"),
-            cli.name()
-        )
+        // A manager redeploy gives the seed a new id, so look it up, not the recorded id.
+        let containers = self.engine.list_containers().unwrap_or_default();
+        let seed = crate::seed::find(&containers, self.config.seed_container.as_deref())
+            .map(|c| {
+                format!(
+                    " (first remove the seed the way you started it: {})",
+                    cli.remove_seed(&c.name)
+                )
+            })
+            .unwrap_or_default();
+        format!("`{}`{seed}", cli.beside(&image, "uninstall --purge"))
     }
 
     fn cli(&self, machine: Option<&Machine>) -> Cli {

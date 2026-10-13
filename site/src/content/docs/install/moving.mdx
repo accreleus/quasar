@@ -147,7 +147,8 @@ An install can't be switched from rootful to rootless in place.
 
 <Steps>
 
-1. **Stop the old seed** (`docker rm -f quasar-seed`, or remove it in your stack
+1. **Stop the old seed** (`docker rm -f quasar-seed`, `systemctl stop quasar-seed`
+   for a Podman seed, with `--user` when rootless, or remove it in your stack
    manager). The next step refuses while a seed exists.
 
 2. **Take a final dump and remove the old install**, on the old machine:
@@ -160,11 +161,11 @@ An install can't be switched from rootful to rootless in place.
      --confirm <old node name> --dump-to /var/lib/quasar/move
    ```
 
-   It runs in its own container because it stops the recovery actor. (On Podman,
-   or rootless Docker, `docker exec … uninstall` is refused and prints this
-   command for your engine.) This writes
-   `/var/lib/quasar/move/quasar-final-<timestamp>.dump` on the host, then removes the old containers, volumes and network. Homes and templates are
-   kept. If the dump fails, nothing is deleted. Copy the dump off if you're
+   It runs in its own container because it stops the recovery actor. (Running
+   `uninstall` through `docker exec` (`podman exec` on Podman) is refused and
+   prints this command for your engine.) This writes
+   `/var/lib/quasar/move/quasar-final-<timestamp>.dump` on the host, then removes
+   the old containers, volumes and network. Homes and templates are kept. If the dump fails, nothing is deleted. Copy the dump off if you're
    changing machines, then:
 
    ```bash

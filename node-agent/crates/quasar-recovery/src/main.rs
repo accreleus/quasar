@@ -259,10 +259,15 @@ fn restore(args: &[String]) -> ExitCode {
 }
 
 /// The engine CLI this machine's operator uses, as the engine reports itself. An engine
-/// that does not answer reads as Docker.
+/// that does not answer within the short status deadline reads as Docker, so a silent
+/// engine costs the health probe (`status`) seconds, not its whole timeout.
 fn operator_cli() -> quasar_recovery::cli::Cli {
-    let kind = DockerEngine::from_environment()
+    let kind = quasar_runtime::RuntimeConfig::from_environment()
         .ok()
+        .and_then(|mut config| {
+            config.deadline = STATUS_ENGINE_DEADLINE;
+            DockerEngine::new(config).ok()
+        })
         .and_then(|engine| engine.host().ok())
         .map(|host| host.kind)
         .unwrap_or_default();
@@ -363,9 +368,10 @@ fn explain(body: &str) {
     let hold = quasar_recovery::database::load_hold(std::path::Path::new(&dir))
         .ok()
         .flatten();
-    for line in
-        quasar_recovery::explain::explain(&status, machine.as_ref(), hold.as_ref(), &operator_cli)
-    {
+    // At most one engine call per `status`, however many lines name a command.
+    let cli = std::cell::OnceCell::new();
+    let cli = || cli.get_or_init(operator_cli).clone();
+    for line in quasar_recovery::explain::explain(&status, machine.as_ref(), hold.as_ref(), &cli) {
         eprintln!("{line}");
     }
 }

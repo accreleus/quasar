@@ -711,6 +711,29 @@ fn uninstall_refuses_to_run_inside_the_recovery_actor_and_names_a_command_that_w
 }
 
 #[test]
+fn the_seed_refusal_removes_a_seed_the_way_it_was_started_never_a_bare_podman_rm() {
+    use quasar_runtime::EngineKind::{Docker, Podman};
+    for (kind, offered, never) in [
+        (Docker, "docker rm -f quasar-seed", ""),
+        (Podman, "systemctl stop quasar-seed", "podman rm -f"),
+    ] {
+        let (engine, dir, _) = seeded_gpu_host();
+        engine.with_state(|s| s.host.kind = kind);
+        let err = uninstaller(&engine, dir.path())
+            .run(&Options {
+                purge: true,
+                confirm: Some("gpu-host-01".into()),
+                dump_to: None,
+            })
+            .expect_err("a seed is running");
+        assert!(
+            matches!(&err, UninstallError::Refused(why) if why.contains(offered) && (never.is_empty() || !why.contains(never))),
+            "{err:?}"
+        );
+    }
+}
+
+#[test]
 fn an_interrupted_uninstall_leaves_the_machine_down_and_a_rerun_finishes_it() {
     let (engine, dir, actor_id) = seeded_gpu_host();
     let id = installation(&engine);

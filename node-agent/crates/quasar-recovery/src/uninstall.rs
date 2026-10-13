@@ -349,12 +349,11 @@ impl Uninstall {
                     )))
                 }
             }
-            if let Some(s) = containers.iter().find(|c| seed::is_seed(c)) {
+            if let Some(s) = seed::find(&containers, None) {
                 return Err(refused(format!(
-                    "a seed ({}) is still on this machine; a purge deletes the state that tells it this machine is uninstalled, so it would install Quasar again. Remove the seed first, the way you started it (from your manager, or {} rm -f {}), then run this again",
+                    "a seed ({}) is still on this machine; a purge deletes the state that tells it this machine is uninstalled, so it would install Quasar again. Remove the seed first, the way you started it: {}; then run this again",
                     s.name,
-                    cli().name(),
-                    s.name
+                    cli().remove_seed(&s.name)
                 )));
             }
         }
@@ -520,12 +519,11 @@ impl Uninstall {
                 "installation {id} has a database volume and no machine state, so its final dump cannot be taken"
             )));
         }
-        if let Some(s) = containers.iter().find(|c| seed::is_seed(c)) {
+        if let Some(s) = seed::find(&containers, None) {
             return Err(refused(format!(
-                "a seed ({}) is still on this machine and would install Quasar again; remove it first ({} rm -f {})",
+                "a seed ({}) is still on this machine and would install Quasar again; remove it first, the way you started it: {}",
                 s.name,
-                Cli::for_engine(self.engine.as_ref()).name(),
-                s.name
+                Cli::for_engine(self.engine.as_ref()).remove_seed(&s.name)
             )));
         }
         for actor in ours(&containers, &id, Role::RecoveryActor) {

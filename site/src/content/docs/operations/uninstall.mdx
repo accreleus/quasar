@@ -55,7 +55,8 @@ Works on any machine, including the first, with the console down. Use the seed's
 image:
 
 ```bash
-docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
+docker run --rm -it --security-opt label=disable \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   -v quasar-machine:/var/lib/quasar-machine \
   "$(docker inspect -f '{{.Config.Image}}' quasar-seed)" uninstall
 ```
@@ -67,12 +68,15 @@ time.
 
 <Aside type="danger" title="`--purge` deletes the data">
 `--purge` also removes this installation's volumes, network and machine state.
-It refuses while a seed exists, so remove the seed first:
+It refuses while a seed exists, so remove the seed first (on Podman the seed is a
+systemd unit that restarts a removed container: `systemctl stop quasar-seed`,
+with `--user` when rootless):
 
 ```bash
 img=$(docker inspect -f '{{.Config.Image}}' quasar-seed)
 docker rm -f quasar-seed                  # or remove the stack in Dockge or Arcane
-docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
+docker run --rm -it --security-opt label=disable \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   -v quasar-machine:/var/lib/quasar-machine "$img" uninstall --purge
 docker volume rm quasar-machine
 ```
