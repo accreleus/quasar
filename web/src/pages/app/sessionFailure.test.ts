@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   accessRevokedFailure,
   launchFailureFromSession,
@@ -63,6 +63,43 @@ describe("launchFailureFromSession", () => {
     expect(v?.title).toBe("The app exited before producing any video");
     expect(v?.message).toMatch(/check the log below/i);
     expect(v?.logTail).toBe("exit code 1");
+  });
+
+  // #565: the agent's reason for a refused video m-line (webrtc.rs
+  // remote_description_failure_reason) names the cause only in prose, for any codec and
+  // any browser, and says "most likely".
+  describe("#565: a refused video line", () => {
+    const reason =
+      "webrtc: video PeerConnection rejected the remote answer: media 0 is missing ice-ufrag — the peer most likely rejected the video m-line (client cannot decode the negotiated codec)";
+    const FIREFOX = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
+    const CHROME = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+    const asBrowser = (ua: string) =>
+      Object.defineProperty(navigator, "userAgent", { value: ua, configurable: true });
+    afterEach(() => {
+      delete (navigator as unknown as { userAgent?: unknown }).userAgent;
+    });
+
+    it("says the browser refused the video and names the Firefox plugin only in Firefox", () => {
+      asBrowser(FIREFOX);
+      const v = launchFailureFromSession(s("failed", null, reason));
+      expect(v?.kind).toBe("failed");
+      expect(v?.title).toBe("This browser cannot play the stream");
+      expect(v?.message).toMatch(/most likely because it cannot decode it/);
+      expect(v?.message).toMatch(/OpenH264 Video Codec under Add-ons and themes, Plugins/);
+      expect(v?.detail).toBe(reason);
+    });
+
+    it("leaves the Firefox sentence out for any other browser", () => {
+      asBrowser(CHROME);
+      const v = launchFailureFromSession(s("failed", null, reason));
+      expect(v?.title).toBe("This browser cannot play the stream");
+      expect(v?.message).not.toMatch(/Firefox|OpenH264/);
+    });
+
+    it("keeps a known failure_code's headline when the reason also carries the phrase", () => {
+      const v = launchFailureFromSession(s("failed", null, reason, "app_exited_early", "exit code 1"));
+      expect(v?.title).toBe("The app exited before producing any video");
+    });
   });
 
   it("an unrecognized failure_code falls through to the generic failed verdict", () => {
