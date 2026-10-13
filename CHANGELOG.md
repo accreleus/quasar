@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Internal
+- **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A reboot, a dump restored into a fresh rootless install and a restore interrupted at three points all pass on the AMD test host; the lab-VM rows, a live GPU fault and a Podman bench re-run are recorded as accepted gaps. The run's one product finding is #589.
+
 ## 0.4.2 — 2026-10-13
 
 ### Upgrading

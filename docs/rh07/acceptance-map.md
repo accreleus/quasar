@@ -1,7 +1,8 @@
 # RH-07 acceptance map
 
 Written for #409 (D19); reconciled 2026-10-02 against the newest hardware reports, updated
-2026-10-09 to close the milestone and 2026-10-11 with the AMD rootless runs (E11, E12). Sources:
+2026-10-09 to close the milestone, 2026-10-11 with the AMD rootless runs (E11, E12) and
+2026-10-13 with the #502 close-out (E13). Sources:
 #393–#437 and their comments, `docs/rh07/2026-09-28-decisions.md` (D1–D23), the
 specification (#390) and `testdata/engine-profiles/profiles.json`. Citations are an issue
 comment or a commit. Hosts are named by role: the AMD test host, the NVIDIA test host, and
@@ -18,7 +19,7 @@ for the old console path.
 (#440). E1–E7 predate that candidate: they are real evidence for the code paths they ran, not
 a hardware pass of the final build. E11 ran on later `develop` builds. E12 ran on the fixes'
 branch builds, `e425b5d9` and `c4cfe3a6`, since merged into `develop`; neither fix is in a
-tagged release yet.
+tagged release yet. E13 ran on v0.4.2.
 
 ## 1. Profile matrix (D19)
 
@@ -43,6 +44,7 @@ Evidence keys used in the tables:
 | E10 | #460 [6037368775](https://github.com/accreleus/quasar/issues/460#issuecomment-6037368775): direct-display console, rootless Podman with SELinux enforcing (NVIDIA): KDE at 3840x2160@240, keyboard, mouse, sound, monitor power cycle |
 | E11 | #502 [6105344873](https://github.com/accreleus/quasar/issues/502#issuecomment-6105344873): AMD rootless Docker and rootless Podman on the AMD test host, published images, `d0abbd82` → `49335cd2` from the console, a Steam session after each update, bench runs `ae25b968` and `d9e6570c` |
 | E12 | The fixes for what E11 found, proven on the AMD test host: #544 (PR #551, develop `8a627982`), bench run `c513f621` on rootless Docker, "result: clean" against `49335cd2` and against `d0abbd82`; #543 (PR #558, develop `33fe78ec`, [6106817010](https://github.com/accreleus/quasar/pull/558#issuecomment-6106817010)), rootless Podman and rootless Docker updated from the console in one apply |
+| E13 | #502 close-out comment, 2026-10-13: the AMD test host, rootless Docker, v0.4.2. A container restart; a v0.3.0 dump restored into a fresh install; the recovery actor killed at three points of a restore |
 
 ### Docker rootful
 
@@ -55,14 +57,14 @@ Evidence keys used in the tables:
 
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
-| AMD | PASS (E1, E2) | PASS (E11): fleet run `d19ea045`, 43 s, Steam streamed afterwards | GAP: container restarts only (#502) | GAP (#502) | PASS (E12): run `c513f621`, "result: clean". The first run, `ae25b968`, read regressed (E11, #544, fixed) |
+| AMD | PASS (E1, E2) | PASS (E11): fleet run `d19ea045`, 43 s, Steam streamed afterwards | PASS (E13): the test host's container was restarted from outside, as for E8. The rootless engine and the Quasar containers came back through the user service and lingering, the agent registered 3 s after boot with no manual step, and Steam streamed 71 s with 0 freezes. The host has no udev, so a stand-in applied the device rules at boot | Accepted gap (§3): NVIDIA covers rootless Docker (#407 [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752)) | PASS (E12): run `c513f621`, "result: clean". The first run, `ae25b968`, read regressed (E11, #544, fixed) |
 | NVIDIA | PASS (E1, E2, E4) | PASS (E4) | PASS (E4) | PASS: #407 [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752) | PASS: run `9384a95d` (E4) |
 
 ### Podman rootless (Fedora family)
 
 | GPU | Session | Update | Reboot | Console | Bench |
 |---|---|---|---|---|---|
-| AMD | PASS (E3): gamepad sequence identical to the reference, 30/30 keys, microphone RMS 2902 | PASS (E12): one apply, 29 s, Steam streamed afterwards. Before the fix the control-plane step timed out as `unhealthy` on the published images (E11, #543) | PASS: VM reboot (E3) | PASS: HDMI picture, mouse, audio, DDC (E3; #407 [5912107863](https://github.com/accreleus/quasar/issues/407#issuecomment-5912107863)); no physical keyboard attached | Not re-run after the fix: Steam run `d9e6570c` read regressed against `6ed548dd` on the same install (E11, #544); the fix reads clean on rootless Docker (E12). The earlier XFCE soak had no baseline (E3) |
+| AMD | PASS (E3): gamepad sequence identical to the reference, 30/30 keys, microphone RMS 2902 | PASS (E12): one apply, 29 s, Steam streamed afterwards. Before the fix the control-plane step timed out as `unhealthy` on the published images (E11, #543) | PASS: VM reboot (E3) | PASS: HDMI picture, mouse, audio, DDC (E3; #407 [5912107863](https://github.com/accreleus/quasar/issues/407#issuecomment-5912107863)); no physical keyboard attached | Accepted gap (§3), not re-run after the fix: Steam run `d9e6570c` read regressed against `6ed548dd` on the same install (E11, #544); the fix reads clean on rootless Docker (E12). The earlier XFCE soak had no baseline (E3) |
 | NVIDIA | PASS (E4, E6, E7; audio: #411 [5876349147](https://github.com/accreleus/quasar/issues/411#issuecomment-5876349147)) | PASS (E5) | PASS (E5) | PASS: #407 [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657); direct display (E10) | PASS: run `9cf88ede`, "result: clean" (#399 [5876277652](https://github.com/accreleus/quasar/issues/399#issuecomment-5876277652)) |
 
 E3's AMD Podman bench was an XFCE soak; E11 adds a Steam bench with a baseline.
@@ -107,20 +109,20 @@ E3's AMD Podman bench was an XFCE soak; E11 adds a Steam bench with a baseline.
 | 23 | Console audio through the host's PipeWire | Met | #407 [5912430462](https://github.com/accreleus/quasar/issues/407#issuecomment-5912430462): Quasar's Pulse socket bound, HDMI playback audible with ALSA owned by PipeWire (rootless Podman, NVIDIA). The direct-display console runs its own PipeWire on the host's sound devices instead; sound proven in E9 and E10 |
 | 24 | DDC monitor control rootless | Met | #407 [5890578752](https://github.com/accreleus/quasar/issues/407#issuecomment-5890578752), [5890937657](https://github.com/accreleus/quasar/issues/407#issuecomment-5890937657), [5912107863](https://github.com/accreleus/quasar/issues/407#issuecomment-5912107863) |
 | 25 | Documented Podman Quadlet install | Met | #406 [5887010850](https://github.com/accreleus/quasar/issues/406#issuecomment-5887010850) |
-| 26 | Reinstall plus dump restore, rootful to rootless | Partly met | A v0.3.0 dump restored and a Steam session streamed (#380, landed `da0ffdca`); not into a fresh rootless install, no v0.2.x dump, and the mid-restore crash was tested in memory only |
+| 26 | Reinstall plus dump restore, rootful to rootless | Met | **26a, Met (E13):** a v0.3.0 dump (schema 84) restored into a fresh rootless Docker install of 0.4.2 in 8.1 s, migrated to schema 103. The dump's admin and player sign in, Steam and its entitlement are there, the host returns under its old id and passes readiness, and the admin streamed Steam 71 s with 0 freezes. Earlier: #380, landed `da0ffdca`. **26b (a v0.2.x dump), dropped:** no dump of that era exists. **26c, Met (E13):** the recovery actor was killed at three points of a live restore (before the load, inside it, during the control plane's first boot). Before the load the attempt fails with "nothing was changed"; after it the restarted actor continues and the restore succeeds. The database was never left half-loaded |
 | 27 | Docs say a rootful socket is root-equivalent | Met | #406 [5884610608](https://github.com/accreleus/quasar/issues/406#issuecomment-5884610608) |
 | 28 | SELinux-enforcing hosts work without relaxing SELinux | Met | Every rootless run on the lab VM stayed `Enforcing` (E3, E10 among them); sessions stay confined; the agent's `label=disable` per D17. E11 ran on a host with SELinux off |
 | 29 | One behavioural suite across every engine mode | Met | #408 [5893020059](https://github.com/accreleus/quasar/issues/408#issuecomment-5893020059), in CI on all four modes; its Podman findings (#424, #425, #426) are fixed |
-| 30 | Each required profile proven on hardware before `main` | Partly met | Every NVIDIA row and every AMD rootful Docker row passes (E8). AMD rootless Docker update and bench pass (E11, E12), and AMD rootless Podman update passes with the #543 fix (E12). AMD rootless Docker reboot and console have no run yet (#502) |
+| 30 | Each required profile proven on hardware before `main` | Partly met | Proven: every NVIDIA row and every AMD rootful Docker row (E8); AMD rootless Docker update, bench and reboot (E11, E12, E13); AMD rootless Podman update with the #543 fix (E12). Accepted gaps (§3): the rootless lab VM rows (AMD rootless Docker console, the AMD Podman direct-display console with a physical keyboard, the VM form of the reboot row) and a Podman Steam bench after the #544 fix |
 
-Met: 1–13, 15–19, 21–25, 27–29 (**26**). Partly met: 14, 20, 26, 30 (**4**). Not
+Met: 1–13, 15–19, 21–29 (**27**). Partly met: 14, 20, 30 (**3**). Not
 evidenced: none.
 
-## 3. Open gaps
+## 3. Open gaps and accepted gaps
 
 The milestone closed on 2026-10-09 with its gaps accepted. The AMD rootless runs of
-2026-10-11 (E11) closed one and found two defects, both fixed the same day (E12). The runs
-still owed are tracked in #502.
+2026-10-11 (E11) closed one and found two defects, both fixed the same day (E12). The
+#502 close-out of 2026-10-13 (E13) ran the reboot and restore rows.
 
 1. **Defects found and fixed on 2026-10-11:** a Podman install on the published images failed
    the control-plane step of a console update (#543); the session page's frame callbacks lost
@@ -128,12 +130,21 @@ still owed are tracked in #502.
    restore back to 0.4.1 or earlier on Podman reports `unhealthy` although it worked
    (`docs/upgrading.md`), a rare recovery fault (#561), and the bench's present metrics follow
    the page's callback cadence (#552).
-2. **AMD, runs still owed (they need the lab VM):** Docker rootless machine reboot and
-   console; on Podman rootless, the direct-display console with a physical keyboard. A Steam
-   bench on Podman rootless has not been re-run since the #544 fix.
-3. **Story 20:** no live Xid fault on the shown path.
-4. **Story 26:** restore into a fresh rootless install, a v0.2.x dump, a live mid-restore crash.
-5. **Not required:** Podman rootful and Ubuntu keep their experimental labels.
+2. **Found by the 2026-10-13 run:** restore and uninstall messages point at commands the
+   product refuses (#589).
+3. **Accepted gaps, decided 2026-10-13, not going to be run:**
+   - **The rootless lab VM rows with the AMD iGPU passed through:** Docker rootless console
+     mode; the Podman rootless direct-display console with a physical keyboard; and the VM
+     form of the Docker rootless reboot row. That passthrough has wedged the hypervisor's VM
+     manager before, and each row is covered on another engine mode or GPU vendor: the console
+     by E9 (rootful Docker) and E10 (rootless Podman, keyboard and mouse) on NVIDIA, E3 on AMD
+     and the NVIDIA rootless Docker console (#407); the reboot by E3 and E8 on AMD and E4 on
+     NVIDIA, with a container restart on this row (E13).
+   - **Story 20:** a live GPU fault cannot be ordered. The parser is unit-tested and the skip
+     path is live.
+   - **A Steam bench on Podman rootless after the #544 fix:** the fix is in the browser page
+     and reads clean on Docker (E12).
+4. **Not required:** Podman rootful and Ubuntu keep their experimental labels.
 
 Every defect this map listed as open on 2026-10-02 (#410, #412, #413, #414, #416, #418,
 #421, #422, #424, #425, #426, #432, #433, #434, #439) is closed.
