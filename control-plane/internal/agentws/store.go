@@ -305,10 +305,11 @@ const registerStatusSQL = `CASE WHEN hosts.status = 'draining'
 // regardless of what this same statement writes — one atomic read-decide-write,
 // no TOCTOU. Restart (bump count, reset agent_process_started_at) when the
 // reported agent_version or source_commit differs from the row's (#586), or
-// when the gap since agent_disconnected_at is >= threshold. NULL
-// agent_disconnected_at, version or commit ⇒ unknown, never counted (fail toward
-// undercounting); a shorter gap on the same build ⇒ blip (process identity
-// unchanged). agent_disconnected_at is always cleared — consumed, so a stale
+// when the gap since agent_disconnected_at is >= threshold. Each NULL (stamp,
+// stored version, stored or reported commit) only makes its own clause no
+// evidence, failing toward undercounting: a NULL stamp on the same build is a
+// blip, but a changed build counts with or without a stamp. A shorter gap on the
+// same build ⇒ blip (process identity unchanged). agent_disconnected_at is always cleared — consumed, so a stale
 // value can never misclassify a later reconnect. $4 is the validated
 // source_commit of this register, NULL when it sent none.
 const reconnectHostSQL = `

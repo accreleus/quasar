@@ -833,8 +833,10 @@ func TestReconnectHostGenuineRestartIsCounted(t *testing.T) {
 // fail-toward-undercounting default: no recorded disconnect (the host never
 // disconnected under this control plane's watch, OR — the case that matters
 // most — a control-plane restart killed the process before markOffline ever
-// ran) must never be misclassified as an agent restart, regardless of how
-// long ago agent_process_started_at was.
+// ran) must never be misclassified as an agent restart on the gap, regardless
+// of how long ago agent_process_started_at was. "Never" holds for the same
+// build only: a changed build counts without a stamp
+// (TestReconnectHostClassifiesByBuildWithinTheGap).
 func TestReconnectHostNullDisconnectedAtNeverCountsAsRestart(t *testing.T) {
 	pool := testPool(t)
 	withRestartGap(t, 200*time.Millisecond)
@@ -876,13 +878,16 @@ func TestReconnectHostClassifiesByBuildWithinTheGap(t *testing.T) {
 		version      string
 		commit       *string
 		wantRestart  bool
+		noStamp      bool // no recorded disconnect (control plane restarted, or the old socket's teardown lost the race)
 	}{
-		{"new release", str("aaaaaaa"), "0.4.2", str("bbbbbbb"), true},
-		{"new version, no commit reported", str("aaaaaaa"), "0.4.2", nil, true},
-		{"same version, new commit", str("aaaaaaa"), "0.4.1", str("bbbbbbb"), true},
-		{"same build is a blip", str("aaaaaaa"), "0.4.1", str("aaaaaaa"), false},
-		{"stored commit unknown is not evidence", nil, "0.4.1", str("bbbbbbb"), false},
-		{"reported commit unknown is not evidence", str("aaaaaaa"), "0.4.1", nil, false},
+		{"new release", str("aaaaaaa"), "0.4.2", str("bbbbbbb"), true, false},
+		{"new version, no commit reported", str("aaaaaaa"), "0.4.2", nil, true, false},
+		{"same version, new commit", str("aaaaaaa"), "0.4.1", str("bbbbbbb"), true, false},
+		{"same build is a blip", str("aaaaaaa"), "0.4.1", str("aaaaaaa"), false, false},
+		{"stored commit unknown is not evidence", nil, "0.4.1", str("bbbbbbb"), false, false},
+		{"reported commit unknown is not evidence", str("aaaaaaa"), "0.4.1", nil, false, false},
+		{"changed build with no disconnect stamp", str("aaaaaaa"), "0.4.2", str("bbbbbbb"), true, true},
+		{"same build with no disconnect stamp is a blip", str("aaaaaaa"), "0.4.1", str("aaaaaaa"), false, true},
 	}
 	for i, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -893,8 +898,10 @@ func TestReconnectHostClassifiesByBuildWithinTheGap(t *testing.T) {
 			hostID := seedHostWithSecret(t, pool, node, secret)
 			processStart := time.Now().Add(-time.Hour).Truncate(time.Microsecond)
 			setAgentProcessStartedAt(t, pool, hostID, &processStart)
-			gone := time.Now().Add(-3 * time.Second)
-			setAgentDisconnectedAt(t, pool, hostID, &gone)
+			if !c.noStamp {
+				gone := time.Now().Add(-3 * time.Second)
+				setAgentDisconnectedAt(t, pool, hostID, &gone)
+			}
 			if _, err := pool.Exec(context.Background(),
 				`UPDATE hosts SET agent_version = '0.4.1', source_commit = $2 WHERE id::text = $1`, hostID, c.storedCommit); err != nil {
 				t.Fatal(err)
