@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -614,7 +615,7 @@ func TestReconnectHostClearsPendingRestart(t *testing.T) {
 		t.Fatalf("seed gpu: %v", err)
 	}
 
-	if _, err := s.reconnectHost(context.Background(), "reconnect-host", "0.2.0", secret); err != nil {
+	if _, err := s.reconnectHost(context.Background(), "reconnect-host", "0.2.0", nil, secret); err != nil {
 		t.Fatalf("reconnectHost: %v", err)
 	}
 
@@ -750,7 +751,7 @@ func TestReconnectHostBlipDoesNotCountAsRestart(t *testing.T) {
 	disconnectedAt := time.Now().Add(-100 * time.Millisecond) // well under the 2s threshold
 	setAgentDisconnectedAt(t, pool, hostID, &disconnectedAt)
 
-	result, err := s.reconnectHost(context.Background(), "blip-host", "0.3.0", "secret-1")
+	result, err := s.reconnectHost(context.Background(), "blip-host", "0.3.0", nil, "secret-1")
 	if err != nil {
 		t.Fatalf("reconnectHost: %v", err)
 	}
@@ -791,7 +792,7 @@ func TestReconnectHostGenuineRestartIsCounted(t *testing.T) {
 	setAgentDisconnectedAt(t, pool, hostID, &disconnectedAt)
 
 	before := time.Now()
-	result, err := s.reconnectHost(context.Background(), "restart-host", "0.3.0", "secret-2")
+	result, err := s.reconnectHost(context.Background(), "restart-host", "0.3.0", nil, "secret-2")
 	if err != nil {
 		t.Fatalf("reconnectHost: %v", err)
 	}
@@ -816,7 +817,7 @@ func TestReconnectHostGenuineRestartIsCounted(t *testing.T) {
 	// A second genuine restart accumulates rather than resets the tally.
 	disconnectedAt2 := time.Now().Add(-5 * time.Second)
 	setAgentDisconnectedAt(t, pool, hostID, &disconnectedAt2)
-	result2, err := s.reconnectHost(context.Background(), "restart-host", "0.3.0", "secret-2")
+	result2, err := s.reconnectHost(context.Background(), "restart-host", "0.3.0", nil, "secret-2")
 	if err != nil {
 		t.Fatalf("second reconnectHost: %v", err)
 	}
@@ -847,7 +848,7 @@ func TestReconnectHostNullDisconnectedAtNeverCountsAsRestart(t *testing.T) {
 	// the old CP process died before its handleConn defer (markOffline)
 	// could stamp anything, even though real downtime may have been minutes.
 
-	result, err := s.reconnectHost(context.Background(), "cp-restart-host", "0.3.0", "secret-3")
+	result, err := s.reconnectHost(context.Background(), "cp-restart-host", "0.3.0", nil, "secret-3")
 	if err != nil {
 		t.Fatalf("reconnectHost: %v", err)
 	}
@@ -861,6 +862,63 @@ func TestReconnectHostNullDisconnectedAtNeverCountsAsRestart(t *testing.T) {
 	}
 	if f.processStarted == nil || !f.processStarted.Equal(processStart) {
 		t.Errorf("agent_process_started_at = %v, want unchanged (%v) — unknown is not evidence of a restart", f.processStarted, processStart)
+	}
+}
+
+// TestReconnectHostClassifiesByBuildWithinTheGap (#586): a fleet apply recreates
+// an agent in seconds, under the gap. A register on a different agent_version or
+// source_commit is a new process whatever the gap; the same build is a blip.
+func TestReconnectHostClassifiesByBuildWithinTheGap(t *testing.T) {
+	str := func(v string) *string { return &v }
+	cases := []struct {
+		name         string
+		storedCommit *string
+		version      string
+		commit       *string
+		wantRestart  bool
+	}{
+		{"new release", str("aaaaaaa"), "0.4.2", str("bbbbbbb"), true},
+		{"new version, no commit reported", str("aaaaaaa"), "0.4.2", nil, true},
+		{"same version, new commit", str("aaaaaaa"), "0.4.1", str("bbbbbbb"), true},
+		{"same build is a blip", str("aaaaaaa"), "0.4.1", str("aaaaaaa"), false},
+		{"stored commit unknown is not evidence", nil, "0.4.1", str("bbbbbbb"), false},
+		{"reported commit unknown is not evidence", str("aaaaaaa"), "0.4.1", nil, false},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pool := testPool(t)
+			withRestartGap(t, time.Hour) // the gap alone never classifies here
+			s := storeWithMintedTokens(pool, nil)
+			node, secret := fmt.Sprintf("build-host-%d", i), fmt.Sprintf("secret-build-%d", i)
+			hostID := seedHostWithSecret(t, pool, node, secret)
+			processStart := time.Now().Add(-time.Hour).Truncate(time.Microsecond)
+			setAgentProcessStartedAt(t, pool, hostID, &processStart)
+			gone := time.Now().Add(-3 * time.Second)
+			setAgentDisconnectedAt(t, pool, hostID, &gone)
+			if _, err := pool.Exec(context.Background(),
+				`UPDATE hosts SET agent_version = '0.4.1', source_commit = $2 WHERE id::text = $1`, hostID, c.storedCommit); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := s.reconnectHost(context.Background(), node, c.version, c.commit, secret)
+			if err != nil {
+				t.Fatalf("reconnectHost: %v", err)
+			}
+			if result.AgentRestarted != c.wantRestart {
+				t.Errorf("AgentRestarted = %v, want %v", result.AgentRestarted, c.wantRestart)
+			}
+			f := readRestartFields(t, pool, hostID)
+			wantCount := int32(0)
+			if c.wantRestart {
+				wantCount = 1
+			}
+			if f.restartCount != wantCount {
+				t.Errorf("agent_restart_count = %d, want %d", f.restartCount, wantCount)
+			}
+			if moved := !f.processStarted.Equal(processStart); moved != c.wantRestart {
+				t.Errorf("agent_process_started_at moved = %v, want %v", moved, c.wantRestart)
+			}
+		})
 	}
 }
 
@@ -878,7 +936,7 @@ func TestReconnectHostSeedsProcessStartedAtWhenNull(t *testing.T) {
 	// agent_process_started_at and agent_disconnected_at both left NULL
 	// (fresh row / pre-migration backfill produced NULL for a never-registered host).
 
-	result, err := s.reconnectHost(context.Background(), "legacy-host", "0.3.0", "secret-4")
+	result, err := s.reconnectHost(context.Background(), "legacy-host", "0.3.0", nil, "secret-4")
 	if err != nil {
 		t.Fatalf("reconnectHost: %v", err)
 	}

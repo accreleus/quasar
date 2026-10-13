@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- **A node agent replaced by an update now counts as a restart (#586).** After a fleet update the Hosts page kept the agent's old restart count and "connected since" date, because a recreate takes under 15 seconds and was read as a network blip. A reconnect that reports a different agent version or commit than the host last had is now a restart whatever the gap. A restart on the same build inside 15 seconds, such as a hand-restarted container, is still read as a blip. No wire or schema change.
+
 ### Internal
 - **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A dump restored into a fresh rootless install and a restore interrupted at three points pass on the AMD test host. A machine reboot on that host is recorded as an accepted gap: the test hosts are containers, so both AMD Docker reboot rows were container restarts, and the earlier rootful row is corrected to say so. The lab-VM rows, a live GPU fault and a Podman bench re-run are accepted gaps too. The run's one product finding is #589.
 
