@@ -1442,6 +1442,49 @@ fn a_pre_rh06_dump_is_restored_into_a_fresh_install_before_its_first_boot() {
     assert_eq!(m.db().rows, "accounts, apps and saves");
 }
 
+/// Boots an awaiting install, loads an import, then asks for a second one on an engine
+/// of `kind` whose socket the install recorded as `socket`: the refusal's text (#589).
+fn second_import_refusal(kind: quasar_runtime::EngineKind, socket: &str) -> String {
+    let m = awaiting_restore();
+    put_import(&m, &dump_bytes(&old_stack()));
+    let first = run_restore(&m.actor(), restore_request(&nth_id(2), Some(IMPORT), None));
+    assert_eq!(first.state, State::Succeeded, "{first:?}");
+    let dir = quasar_recovery::machine::MachineDir::new(m.dir.path());
+    let mut machine = dir.load_machine().unwrap().unwrap();
+    machine.inputs.docker_socket = socket.into();
+    dir.machine().store(&machine).unwrap();
+    m.engine.with_state(|s| s.host.kind = kind);
+    put_import(&m, &dump_bytes(&old_stack()));
+    m.actor()
+        .submit_restore(restore_request(&nth_id(3), Some(IMPORT), None))
+        .unwrap_err()
+        .message
+}
+
+#[test]
+fn the_refused_import_names_an_uninstall_that_runs_for_the_engine_the_install_is_on() {
+    use quasar_runtime::EngineKind::{Docker, Podman};
+    let cases = [
+        (Docker, "/var/run/docker.sock", "docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock "),
+        (Docker, "/run/user/1001/docker.sock", "docker run --rm -it -v /run/user/1001/docker.sock:/var/run/docker.sock "),
+        (Podman, "/run/user/1001/podman/podman.sock", "podman run --rm -it --security-opt label=disable -v /run/user/1001/podman/podman.sock:/var/run/docker.sock "),
+    ];
+    for (kind, socket, start) in cases {
+        let message = second_import_refusal(kind, socket);
+        assert!(message.contains(start), "{message}");
+        assert!(message.contains(" uninstall --purge`"), "{message}");
+        assert!(
+            message.contains("quasar-recovery@sha256:") || message.contains("<registry>"),
+            "{message}"
+        );
+        // The refused form: `uninstall` stops the actor, so it cannot run inside it.
+        assert!(
+            !message.contains("exec quasar-recovery quasar-recovery uninstall"),
+            "{message}"
+        );
+    }
+}
+
 #[test]
 fn a_dump_newer_than_the_fresh_install_or_corrupt_is_refused_before_it_is_loaded() {
     let m = awaiting_restore();

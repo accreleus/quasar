@@ -159,3 +159,15 @@ func TestRefusalMessage(t *testing.T) {
 		t.Errorf("unconstrained: %q", got)
 	}
 }
+
+// #589: only a home on an offline host changes the plain no_host_available text.
+func TestNoHostMessageNamesAnOfflineHomeHostOnly(t *testing.T) {
+	plain := noHostMessage(&NoHostRejection{err: ErrNoHostAvailable})
+	if plain != "no host is available to serve this launch" {
+		t.Fatalf("plain refusal text changed: %q", plain)
+	}
+	home := noHostMessage(&HomeHostOfflineRejection{err: &NoHostRejection{err: ErrNoHostAvailable}})
+	if home == plain || !strings.Contains(home, "holds your saves") {
+		t.Fatalf("home-host refusal text: %q", home)
+	}
+}

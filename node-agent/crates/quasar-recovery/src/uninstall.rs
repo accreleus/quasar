@@ -29,6 +29,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::cli::Cli;
 use crate::dump;
 use crate::engine::{Container, EngineError, PlatformEngine, RestartPolicy};
 use crate::journal::JournalDir;
@@ -289,6 +290,8 @@ impl Uninstall {
             .list_containers()
             .map_err(|e| refused(engine_err("list containers", e)))?;
         let image = self.image_to_run(&containers);
+        // Asked only where a message names a command: it is an engine call.
+        let cli = || Cli::for_machine(self.engine.as_ref(), &machine);
         let me = self.self_container.clone();
         let is_me = |c: &Container| {
             me.as_deref()
@@ -299,7 +302,7 @@ impl Uninstall {
             if ours(std::slice::from_ref(me), &id, Role::RecoveryActor).len() == 1 {
                 return Err(refused(format!(
                     "uninstall stops the recovery actor, so it cannot run inside it; run it in its own container: {}",
-                    command_line(&image, "uninstall")
+                    cli().beside(&image, "uninstall")
                 )));
             }
         }
@@ -426,7 +429,7 @@ impl Uninstall {
             report.say(match &dump_name {
                 Some(name) => format!(
                     "Purged. The final dump of the database is {}.{homes}",
-                    self.dest(opts).describe(name),
+                    self.dest(opts).describe(name, cli().name()),
                 ),
                 None => format!("Purged.{homes}"),
             });
@@ -452,7 +455,7 @@ impl Uninstall {
             }
             report.say(format!(
                 "To delete the data as well: {}",
-                command_line(&image, "uninstall --purge")
+                cli().beside(&image, "uninstall --purge")
             ));
         }
         Ok(report)
@@ -627,7 +630,8 @@ impl Uninstall {
             &name,
         ) {
             Ok(name) => {
-                report.say(format!("Final dump taken: {}.", dest.describe(&name)));
+                report.say(format!("Final dump taken: {}.", dest.describe(&name, Cli::for_machine(self.engine.as_ref(), machine).name())
+                ));
                 Ok(Some(name))
             }
             Err(why) => Err(stopped(format!(
@@ -716,17 +720,6 @@ fn noun(role: Role) -> &'static str {
     crate::race_guard::noun(role.as_str())
 }
 
-/// The documented way to run an operator command beside the recovery actor: its own
-/// container on the recovery image, with the engine socket and machine state. `image` is
-/// printed as it is: after an uninstall no `quasar-recovery` container is left to inspect.
-pub fn command_line(image: &str, command: &str) -> String {
-    format!(
-        "docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock -v {}:{} {image} {command}",
-        names::MACHINE_VOLUME,
-        crate::recipe::paths::MACHINE_DIR,
-    )
-}
-
 impl Uninstall {
     /// The recovery image to run this command with again: the one it runs from, else the
     /// one `seed.json` names, else a placeholder.
@@ -744,7 +737,7 @@ impl Uninstall {
                     .flatten()
                     .map(|s| s.recovery_actor_image.reference())
             })
-            .unwrap_or_else(|| "<registry>/quasar-recovery@sha256:<digest>".to_owned())
+            .unwrap_or_else(|| crate::cli::IMAGE_PLACEHOLDER.to_owned())
     }
 }
 

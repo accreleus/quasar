@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,6 +27,11 @@ func TestLaunchRefusesReplacementForOfflineHomeOwner(t *testing.T) {
 	_, err = NewStore(pool).ScheduleAndCreate(context.Background(), p)
 	if !errors.Is(err, ErrNoHostAvailable) {
 		t.Fatalf("launch with home on offline host: %v, want no_host_available; other host %s must remain unused", err, h2)
+	}
+	// #589: the refusal says why, instead of the generic "no host is available".
+	var off *HomeHostOfflineRejection
+	if !errors.As(err, &off) || !strings.Contains(noHostMessage(err), "holds your saves") {
+		t.Fatalf("home on offline host: %v (%q), want the home-host refusal", err, noHostMessage(err))
 	}
 	if got := sessionsOnHost(t, pool, h2); got != 0 {
 		t.Fatalf("new host has %d sessions, want none", got)
