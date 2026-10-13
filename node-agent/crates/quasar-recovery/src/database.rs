@@ -59,8 +59,8 @@ pub enum DbOp {
     Load,
     /// [`DbOp::Load`] of an operator's file, a pre-RH-06 stack's `pg_dump` (#380), then
     /// every host it records set offline: their agents belonged to the old install and
-    /// are gone, and a row left `online` would read as a live agent, which refuses the
-    /// re-enrollment onto its node name (control-api.md "Redemption").
+    /// are gone, and a row left `online` or `draining` would read as a live agent, which
+    /// refuses the re-enrollment onto its node name (control-api.md "Redemption").
     Import,
     /// The live database's `schema_migrations` row.
     Schema,
@@ -119,9 +119,11 @@ impl DbOp {
 const LOAD: &str = r#"psql -X -v ON_ERROR_STOP=1 -d postgres -c "DROP DATABASE IF EXISTS \"$PGDATABASE\" WITH (FORCE)" -c "CREATE DATABASE \"$PGDATABASE\" OWNER \"$PGUSER\""; pg_restore --single-transaction --exit-on-error --no-owner --no-privileges -d "$PGDATABASE" "$QUASAR_DUMP_FILE""#;
 
 /// [`DbOp::Import`]'s second step, after [`LOAD`]: the old install's hosts offline. `status` is
-/// the one column every Quasar schema's `hosts` has had; "live" is `online` with no
-/// recorded disconnect, so `offline` alone makes a host re-enrollable.
-const OLD_HOSTS_OFFLINE: &str = r#"psql -X -v ON_ERROR_STOP=1 -tA -c "UPDATE hosts SET status = 'offline' WHERE status = 'online'""#;
+/// the one column every Quasar schema's `hosts` has had; "live" is not `offline` with no
+/// recorded disconnect (the control plane's `hostIsLiveSQL`), so `offline` alone makes a
+/// host re-enrollable. A drain held as an admission restriction comes back when the host
+/// re-enrolls; one a dump records only in `status` is not carried over.
+const OLD_HOSTS_OFFLINE: &str = r#"psql -X -v ON_ERROR_STOP=1 -tA -c "UPDATE hosts SET status = 'offline' WHERE status <> 'offline'""#;
 
 /// A `schema_migrations` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

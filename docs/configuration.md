@@ -2060,9 +2060,11 @@ automatically (ADR 0004 amendment):
   `schema_migrations` row is not dirty, and that its schema is **at or below** the installed
   control plane's (`org.quasar.schema.version`); a newer dump, a plain-SQL dump and a corrupt one
   are refused with nothing changed. The load is the same as a restore's, followed by one
-  statement that sets every host recorded `online` to `offline`: their agents belonged to the old
-  install, and a row left online would read as a live agent and refuse the re-enrollment onto its
-  node name (control-api.md "Redemption"). Then the schema floor is raised to the installed
+  statement that sets every host to `offline`: their agents belonged to the old install, and a
+  row left `online` or `draining` would read as a live agent and refuse the re-enrollment onto its
+  node name (control-api.md "Redemption"). A drained host is drained again once it is re-added,
+  unless the dump is older than schema 88, which kept a drain only in the status. Then the
+  schema floor is raised to the installed
   control plane's schema, the hold goes, and the install creates its control plane (and a
   combined machine's agent, enrolled with the local token under `QUASAR_NODE_NAME`), whose first
   boot migrates the data; the restore ends once it reports healthy. The copied file is removed

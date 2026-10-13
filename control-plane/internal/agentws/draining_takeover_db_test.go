@@ -170,3 +170,27 @@ func TestConcurrentFirstEnrollmentDoesNotReplaceTheWinnersSecret(t *testing.T) {
 		t.Fatalf("node_secret_hash = %q: the loser replaced the winner's secret", got)
 	}
 }
+
+// The recovery actor's dump import sets every imported host offline (quasar-recovery
+// OLD_HOSTS_OFFLINE). A drain held as a restriction must come back when the host is re-added.
+func TestReEnrollingAnOfflineHostWithAHeldDrainComesBackDraining(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	st := storeWithMintedTokens(pool, func(string) bool { return false })
+
+	res, err := st.enrollHost(ctx, "imported-drained", "0.1.0", testEnrollmentToken)
+	if err != nil {
+		t.Fatalf("initial enrollment: %v", err)
+	}
+	if _, err := admission.NewStore(pool).AcquireOnline(ctx, res.HostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+		t.Fatalf("cordon: %v", err)
+	}
+	setHostStatus(t, pool, res.HostID, "offline")
+
+	if _, err := st.enrollHost(ctx, "imported-drained", "0.1.0", boundEnrollmentToken(t, pool, "imported-drained")); err != nil {
+		t.Fatalf("re-adding the imported host: %v", err)
+	}
+	if got := hostStatus(t, pool, res.HostID); got != "draining" {
+		t.Fatalf("status after the re-add = %q, want draining: the drain is still held", got)
+	}
+}

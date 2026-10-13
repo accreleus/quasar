@@ -696,8 +696,8 @@ fn the_database_helpers_dump_check_and_load_a_real_postgres() {
     // The load can be repeated.
     assert_eq!(run(Some(DbOp::Load), "", Some("pending.dump.partial")).0, 0);
 
-    // An operator's import (#380) loads the same way, then sets the old install's live
-    // hosts offline; a draining one keeps its status.
+    // An operator's import (#380) loads the same way, then sets the old install's hosts
+    // offline, a draining one too: unrecorded as gone, it would refuse its re-enrollment.
     let (code, out) = run(Some(DbOp::Import), "", Some("pending.dump.partial"));
     assert_eq!(code, 0, "{out}");
     let (_, out) = run(Some(DbOp::Schema), "", None);
@@ -707,7 +707,7 @@ fn the_database_helpers_dump_check_and_load_a_real_postgres() {
         "psql -X -tA -c \"select string_agg(node_name || '=' || status, ',' order by node_name) from hosts\"",
         None,
     );
-    assert_eq!(hosts.trim(), "gpu-a=offline,gpu-b=draining", "{hosts}");
+    assert_eq!(hosts.trim(), "gpu-a=offline,gpu-b=offline", "{hosts}");
 
     // A file that is not an archive fails the check.
     assert_eq!(run(None, "echo garbage > /dumps/bad.dump", None).0, 0);
