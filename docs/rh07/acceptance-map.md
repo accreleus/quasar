@@ -44,7 +44,7 @@ Evidence keys used in the tables:
 | E10 | #460 [6037368775](https://github.com/accreleus/quasar/issues/460#issuecomment-6037368775): direct-display console, rootless Podman with SELinux enforcing (NVIDIA): KDE at 3840x2160@240, keyboard, mouse, sound, monitor power cycle |
 | E11 | #502 [6105344873](https://github.com/accreleus/quasar/issues/502#issuecomment-6105344873): AMD rootless Docker and rootless Podman on the AMD test host, published images, `d0abbd82` → `49335cd2` from the console, a Steam session after each update, bench runs `ae25b968` and `d9e6570c` |
 | E12 | The fixes for what E11 found, proven on the AMD test host: #544 (PR #551, develop `8a627982`), bench run `c513f621` on rootless Docker, "result: clean" against `49335cd2` and against `d0abbd82`; #543 (PR #558, develop `33fe78ec`, [6106817010](https://github.com/accreleus/quasar/pull/558#issuecomment-6106817010)), rootless Podman and rootless Docker updated from the console in one apply |
-| E13 | #502 close-out comment, 2026-10-13: the AMD test host, rootless Docker, v0.4.2. A container restart; a v0.3.0 dump restored into a fresh install; the recovery actor killed at three points of a restore |
+| E13 | #502 [6145392778](https://github.com/accreleus/quasar/issues/502#issuecomment-6145392778), 2026-10-13: the AMD test host, rootless Docker, v0.4.2. A container restart; a v0.3.0 dump restored into a fresh install; the recovery actor killed at three points of a restore |
 
 ### Docker rootful
 
