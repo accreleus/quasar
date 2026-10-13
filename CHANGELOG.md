@@ -25,7 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Internal
-- **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A reboot, a dump restored into a fresh rootless install and a restore interrupted at three points all pass on the AMD test host; the lab-VM rows, a live GPU fault and a Podman bench re-run are recorded as accepted gaps. The run's one product finding is #589.
+- **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A dump restored into a fresh rootless install and a restore interrupted at three points pass on the AMD test host. A machine reboot on that host is recorded as an accepted gap: the test hosts are containers, so both AMD Docker reboot rows were container restarts, and the earlier rootful row is corrected to say so. The lab-VM rows, a live GPU fault and a Podman bench re-run are accepted gaps too. The run's one product finding is #589.
 
 ## 0.4.2 — 2026-10-13
 
