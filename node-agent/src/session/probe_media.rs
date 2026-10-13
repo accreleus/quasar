@@ -6,8 +6,9 @@
 //! Parent half: `crate::host_probe::media`.
 //!
 //! #282 adds a pixel-verification leg: the probe decodes its own h264 output with
-//! `openh264dec` and scores the decoded picture against the compositor's known flat
-//! clear-colour field, so the check verifies the picture survived, not just that frames
+//! `openh264dec` and scores the decoded picture against the compositor's test picture
+//! (#289: a fixed grid of four colours, shown only while no client is mapped), so the
+//! check verifies the picture survived, moved pixels included, not just that frames
 //! arrived. Design: `docs/superpowers/plans/2026-09-20-282-media-probe-pixel-check.md`.
 //!
 //! A non-h264 request is a codec probe (#300): no pixel check, so reaching PLAYING and
@@ -167,93 +168,118 @@ enum PixelCheck {
     },
 }
 
-/// Pure scoring of a decoded frame against the compositor's known flat clear-colour
-/// field. No GStreamer types cross this boundary, so it unit-tests without a GPU.
+/// Pure scoring of a decoded frame against the compositor's test picture. No GStreamer
+/// types cross this boundary, so it unit-tests without a GPU.
 mod pixel {
-    /// One plane's disagreement with the flat reference the compositor should have
-    /// produced.
+    /// One plane's disagreement with the picture the compositor should have produced.
     pub(crate) struct PlaneScore {
         pub name: &'static str,
         pub off: f64,
     }
 
-    /// The decoded caps' colour range, reduced to what the reference rule (§2) needs.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum Range {
-        Limited,
-        Full,
-        Unknown,
-    }
-
-    /// A flat field is DC-predicted with zero residual at any QP, so reconstruction
-    /// error is 0-1 code; the RGB->YUV of exact black is 16/128 +/-1. 8 is more than 4x
-    /// any rounding chain and half the 16-code pedestal, so it cannot be crossed by the
-    /// range ambiguity either (design §4).
-    pub(crate) const TOL_SAMPLE: u8 = 8;
-    /// 1% of a 720p luma plane is 9,216 samples (a 96x96 block) — orders of magnitude
-    /// above any rounding artefact, and ~7x below the weakest #272 corruption measured
-    /// on the probe pipeline itself (design §4).
+    pub(crate) const COLS: usize = 16;
+    pub(crate) const ROWS: usize = 9;
+    /// Class of each cell of the compositor's test picture, rows top to bottom. The other
+    /// copy, with the colours, is `comp/test_picture.rs` in the gst-wayland-display fork:
+    /// change them together.
+    pub(crate) const GRID: [&[u8; COLS]; ROWS] = [
+        b"3010231302302312",
+        b"1202103130213231",
+        b"2321031023030302",
+        b"1230212131212010",
+        b"0312101302321203",
+        b"1231230121203030",
+        b"3023021310132312",
+        b"0310303203210120",
+        b"2023210310303031",
+    ];
+    /// Classes in ascending sample order on Y, Cb and Cr. The four colours rank this way
+    /// under BT.601 and BT.709, limited or full range, at least 30 code values apart, so
+    /// the score needs no absolute reference: the encode paths do not share one matrix.
+    pub(crate) const ORDER: [[usize; 4]; 3] = [[1, 3, 0, 2], [2, 3, 0, 1], [0, 2, 1, 3]];
+    /// Half the palette's smallest gap. Classes closer than this on a plane mean the plane
+    /// does not carry the picture at all (a flat field, swapped chroma).
+    pub(crate) const MIN_GAP: i16 = 15;
+    /// A cell is flat and, at the probe's 1280x720, lies on macroblock boundaries, so its
+    /// interior is DC-predicted with no residual and reconstruction error is 0-1 code. 8 is
+    /// far above that and about half of `MIN_GAP`, so no class reads as another.
+    pub(crate) const TOL_SAMPLE: i16 = 8;
+    /// 1% of the scored samples: far above any rounding artefact or the cursor, and below
+    /// a displaced 16-column band.
     pub(crate) const OFF_FLOOR: f64 = 0.01;
-    /// Decoded frames to discard before scoring — decoder warm-up, not rate-control
-    /// settle: a flat field has no residual to converge at any QP (design §3).
+    /// Decoded frames to discard before scoring: decoder warm-up (design §3).
     pub(crate) const SKIP_FRAMES: usize = 5;
     /// Fewer than this many scored frames and the run says nothing (design §7).
     pub(crate) const MIN_SCORED: usize = 5;
 
-    /// `off(p)` = fraction of `samples_rows` (already trimmed to the visible width by the
-    /// caller — reading `stride` bytes per row scores the padding, see
-    /// gstreamer-gotchas.md) further than `tol` from `reference`.
+    /// `off` = the fraction of a plane's scored samples further than [`TOL_SAMPLE`] from
+    /// the median of their own class, or 1.0 when the class medians are not in `order`
+    /// [`MIN_GAP`] apart. `rows` are already trimmed to the visible width: reading `stride`
+    /// bytes per row scores the padding (gstreamer-gotchas.md). The outer tenth of each
+    /// cell is not scored, which keeps chroma siting and deblocking at the edges out.
     pub(crate) fn score_plane(
         name: &'static str,
-        samples_rows: &[&[u8]],
-        reference: u8,
-        tol: u8,
+        rows: &[&[u8]],
+        order: &[usize; 4],
     ) -> PlaneScore {
-        let mut total = 0usize;
-        let mut bad = 0usize;
-        for row in samples_rows {
-            for &sample in *row {
-                total += 1;
-                if (sample as i16 - reference as i16).abs() > tol as i16 {
-                    bad += 1;
+        let (width, height) = (rows.first().map_or(0, |row| row.len()), rows.len());
+        let mut seen = [[0usize; 256]; 4];
+        for (row, classes) in GRID.iter().enumerate() {
+            let (y0, y1) = (row * height / ROWS, (row + 1) * height / ROWS);
+            let margin_y = ((y1 - y0) / 10).max(1);
+            for (col, class) in classes.iter().enumerate() {
+                let (x0, x1) = (col * width / COLS, (col + 1) * width / COLS);
+                let margin_x = ((x1 - x0) / 10).max(1);
+                let seen = &mut seen[(class - b'0') as usize];
+                for line in rows
+                    .iter()
+                    .take(y1.saturating_sub(margin_y))
+                    .skip(y0 + margin_y)
+                {
+                    for &sample in line
+                        .iter()
+                        .take(x1.saturating_sub(margin_x))
+                        .skip(x0 + margin_x)
+                    {
+                        seen[sample as usize] += 1;
+                    }
                 }
             }
         }
+
+        let median = |class: usize| -> i16 {
+            let half = seen[class].iter().sum::<usize>() / 2;
+            let mut below = 0;
+            for (value, count) in seen[class].iter().enumerate() {
+                below += count;
+                if below > half {
+                    return value as i16;
+                }
+            }
+            0
+        };
+        let medians = [median(0), median(1), median(2), median(3)];
+        let ordered = order
+            .windows(2)
+            .all(|pair| medians[pair[1]] - medians[pair[0]] >= MIN_GAP);
+        let total: usize = seen.iter().flatten().sum();
+        if !ordered || total == 0 {
+            return PlaneScore { name, off: 1.0 };
+        }
+        let bad: usize = seen
+            .iter()
+            .zip(medians)
+            .flat_map(|(counts, median)| {
+                counts
+                    .iter()
+                    .enumerate()
+                    .filter(move |(value, _)| (*value as i16 - median).abs() > TOL_SAMPLE)
+                    .map(|(_, count)| *count)
+            })
+            .sum();
         PlaneScore {
             name,
-            off: if total == 0 {
-                0.0
-            } else {
-                bad as f64 / total as f64
-            },
-        }
-    }
-
-    /// The plane's own median sample — the reference for the range-agnostic uniformity
-    /// cross-check, and what picks a luma reference when the caps carry no range.
-    pub(crate) fn median_u8(rows: &[&[u8]]) -> u8 {
-        let mut samples: Vec<u8> = rows.iter().flat_map(|row| row.iter().copied()).collect();
-        if samples.is_empty() {
-            return 0;
-        }
-        samples.sort_unstable();
-        samples[samples.len() / 2]
-    }
-
-    /// `ref(Y) = 16` for limited range, `0` for full; an absent/unknown range accepts
-    /// whichever of 0/16 the frame's own median luma is nearer (design §2), with 8 (the
-    /// midpoint) breaking the tie toward limited, the more common wire convention.
-    pub(crate) fn luma_reference(range: Range, median_luma: u8) -> u8 {
-        match range {
-            Range::Limited => 16,
-            Range::Full => 0,
-            Range::Unknown => {
-                if median_luma < 8 {
-                    0
-                } else {
-                    16
-                }
-            }
+            off: bad as f64 / total as f64,
         }
     }
 
@@ -291,13 +317,11 @@ struct ScoredFrame {
     v: f64,
     off: f64,
     planes: String,
-    range: &'static str,
 }
 
 /// Maps a decoded I420 `gst::Sample` to its [`ScoredFrame`], or `None` if the sample
 /// cannot be read (a diagnostic gap, not a probe failure — the caller's `MIN_SCORED`
-/// floor is what turns "too few usable frames" into Indeterminate). The range comes from
-/// the sample's own negotiated caps, never hard-coded (design §2).
+/// floor is what turns "too few usable frames" into Indeterminate).
 fn score_sample(sample: &gst::Sample) -> Option<ScoredFrame> {
     let caps = sample.caps()?;
     let info = gst_video::VideoInfo::from_caps(caps).ok()?;
@@ -328,30 +352,11 @@ fn score_sample(sample: &gst::Sample) -> Option<ScoredFrame> {
     let u_rows = rows_for(1)?;
     let v_rows = rows_for(2)?;
 
-    let (range, range_name) = match info.colorimetry().range() {
-        gst_video::VideoColorRange::Range16_235 => (pixel::Range::Limited, "limited"),
-        gst_video::VideoColorRange::Range0_255 => (pixel::Range::Full, "full"),
-        _ => (pixel::Range::Unknown, "unknown"),
-    };
-    let y_ref = pixel::luma_reference(range, pixel::median_u8(&y_rows));
-
-    let y_off = pixel::score_plane("y", &y_rows, y_ref, pixel::TOL_SAMPLE).off;
-    let u_off = pixel::score_plane("u", &u_rows, 128, pixel::TOL_SAMPLE).off;
-    let v_off = pixel::score_plane("v", &v_rows, 128, pixel::TOL_SAMPLE).off;
-    let (off, planes) = pixel::frame_off(&[
-        pixel::PlaneScore {
-            name: "y",
-            off: y_off,
-        },
-        pixel::PlaneScore {
-            name: "u",
-            off: u_off,
-        },
-        pixel::PlaneScore {
-            name: "v",
-            off: v_off,
-        },
-    ]);
+    let y = pixel::score_plane("y", &y_rows, &pixel::ORDER[0]);
+    let u = pixel::score_plane("u", &u_rows, &pixel::ORDER[1]);
+    let v = pixel::score_plane("v", &v_rows, &pixel::ORDER[2]);
+    let (y_off, u_off, v_off) = (y.off, u.off, v.off);
+    let (off, planes) = pixel::frame_off(&[y, u, v]);
 
     Some(ScoredFrame {
         y: y_off,
@@ -359,7 +364,6 @@ fn score_sample(sample: &gst::Sample) -> Option<ScoredFrame> {
         v: v_off,
         off,
         planes,
-        range: range_name,
     })
 }
 
@@ -389,7 +393,6 @@ impl DumpSink {
             "u": frame.u,
             "v": frame.v,
             "off": frame.off,
-            "range": frame.range,
         });
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
@@ -462,7 +465,7 @@ fn encoder_could_not_open(seen: &Observed) -> bool {
 }
 
 /// Pass iff the pipeline reached PLAYING, the wanted frames arrived with no bus error, and
-/// (h264 only) the decoded picture matched the compositor's known flat field. Pure:
+/// (h264 only) the decoded picture matched the compositor's test picture. Pure:
 /// unit-tested without a GPU.
 fn verdict(wanted: u64, seen: &Observed) -> ProbeVerdict {
     let state = match seen.reached {
@@ -570,7 +573,7 @@ pub fn run(request: &MediaProbeRequest) -> ProbeVerdict {
     );
 
     let render_node = cfg.render_node.clone();
-    match build_and_run(&mut cfg, codec, request) {
+    match build_and_run(&mut cfg, codec, request, |_| {}) {
         Ok(seen) => verdict(request.frames, &seen),
         // A build failure names its element through the production builders' contexts.
         Err(e) => ProbeVerdict::Fail(format!("{render_node}: {e:#}")),
@@ -670,10 +673,13 @@ fn bus_error_text(msg: &gst::Message) -> Option<String> {
     Some(format!("{from}: {} ({})", e.error(), e.debug().unwrap_or_default()).replace('\n', " "))
 }
 
+/// `tamper` is handed the encoder before the pipeline starts. The probe passes a no-op; a
+/// test uses it to damage the picture on its way in.
 fn build_and_run(
     cfg: &mut SessionConfig,
     codec: Codec,
     request: &MediaProbeRequest,
+    tamper: impl FnOnce(&gst::Element),
 ) -> anyhow::Result<Observed> {
     use anyhow::Context;
 
@@ -692,8 +698,8 @@ fn build_and_run(
 
     // The encoded-frame count still lands on the fakesink leg, unchanged in position and
     // meaning. A `tee` after the parser adds a second leg to `openh264dec`, which decodes
-    // the probe's own output so the picture can be checked against the compositor's known
-    // flat clear-colour field (#282).
+    // the probe's own output so the picture can be checked against the compositor's test
+    // picture (#282, #289).
     let tee = gst::ElementFactory::make("tee")
         .build()
         .context("tee not found")?;
@@ -738,6 +744,17 @@ fn build_and_run(
     } else {
         None
     };
+    // With no client mapped the compositor would clear to black, and on a flat field a
+    // displaced block is identical to the block it replaced (#289).
+    let test_picture = decode.is_some()
+        && pipeline.by_name("video-source").is_some_and(|source| {
+            let has = source.find_property("test-picture").is_some();
+            if has {
+                source.set_property("test-picture", true);
+            }
+            has
+        });
+    tamper(&encoder);
 
     let teardown = |pipeline: &gst::Pipeline| {
         // NULL on every path: a probe that leaves an encoder session open is worse than
@@ -884,6 +901,8 @@ fn build_and_run(
         PixelCheck::NotCovered(codec)
     } else if decode.is_none() {
         PixelCheck::NotRun("openh264dec is not registered on this image".into())
+    } else if !test_picture {
+        PixelCheck::NotRun("this image's compositor has no test picture".into())
     } else if !eos_seen && Instant::now() >= deadline {
         PixelCheck::NotRun(format!(
             "the probe's budget expired before the decode leg drained ({} of {} frames \
@@ -1137,74 +1156,136 @@ mod tests {
         ));
     }
 
-    // ── #282: pure scoring primitives ─────────────────────────────────────────────────
+    // ── #282, #289: pure scoring primitives ───────────────────────────────────────────
 
-    /// 720x720/2 chroma-shaped synthetic rows: `width` bytes per row, no padding, so the
-    /// tests exercise `score_plane` directly without a real `VideoFrameRef`.
-    fn flat_rows(value: u8, width: usize, height: usize) -> Vec<Vec<u8>> {
-        (0..height).map(|_| vec![value; width]).collect()
+    /// Limited-range Y, Cb, Cr of the test picture's four colours under each matrix.
+    const BT601: [[u8; 3]; 4] = [
+        [147, 163, 82],
+        [87, 198, 156],
+        [177, 51, 121],
+        [117, 86, 195],
+    ];
+    const BT709: [[u8; 3]; 4] = [
+        [153, 159, 84],
+        [73, 203, 162],
+        [188, 49, 115],
+        [108, 92, 193],
+    ];
+
+    type Planes = [Vec<Vec<u8>>; 3];
+
+    /// The test picture as a 1280x720 4:2:0 frame: Y, Cb and Cr rows, no padding.
+    fn picture(levels: &[[u8; 3]; 4]) -> Planes {
+        let plane = |p: usize, width: usize, height: usize| -> Vec<Vec<u8>> {
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| {
+                            let cell =
+                                pixel::GRID[y * pixel::ROWS / height][x * pixel::COLS / width];
+                            levels[(cell - b'0') as usize][p]
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        [plane(0, 1280, 720), plane(1, 640, 360), plane(2, 640, 360)]
     }
 
-    fn as_row_refs(rows: &[Vec<u8>]) -> Vec<&[u8]> {
-        rows.iter().map(|r| r.as_slice()).collect()
+    fn score(frame: &Planes) -> (f64, String) {
+        let plane = |p: usize, name| {
+            let rows: Vec<&[u8]> = frame[p].iter().map(|row| row.as_slice()).collect();
+            pixel::score_plane(name, &rows, &pixel::ORDER[p])
+        };
+        pixel::frame_off(&[plane(0, "y"), plane(1, "u"), plane(2, "v")])
     }
 
-    #[test]
-    fn score_plane_orders_identical_below_noise_below_displacement_and_green() {
-        let reference = 16u8;
-        let identical = flat_rows(reference, 64, 64);
-        let identical_off =
-            pixel::score_plane("y", &as_row_refs(&identical), reference, pixel::TOL_SAMPLE).off;
-        assert_eq!(identical_off, 0.0);
-
-        // Lossy-like noise: every sample within tolerance except a thin sliver — still
-        // near zero, but not identically zero.
-        let mut noise = flat_rows(reference, 64, 64);
-        for row in noise.iter_mut().take(1) {
-            row[0] = reference.saturating_add(pixel::TOL_SAMPLE + 1);
+    /// Swaps two bands of `width` luma columns on `planes`: the displacement a tiling or
+    /// stride defect produces, with every sample still a valid picture sample.
+    fn swap_columns(frame: &mut Planes, planes: &[usize], a: usize, b: usize, width: usize) {
+        for &p in planes {
+            let sub = if p == 0 { 1 } else { 2 };
+            for row in frame[p].iter_mut() {
+                for i in 0..width / sub {
+                    row.swap(a / sub + i, b / sub + i);
+                }
+            }
         }
-        let noise_off =
-            pixel::score_plane("y", &as_row_refs(&noise), reference, pixel::TOL_SAMPLE).off;
-        assert!(noise_off > identical_off);
-        assert!(noise_off < 0.05);
+    }
 
-        // A column displacement: a solid block of rows reading badly wrong content.
-        let mut displaced = flat_rows(reference, 64, 64);
-        for row in displaced.iter_mut().skip(32) {
-            row.fill(200);
+    #[test]
+    fn the_test_picture_scores_zero_under_either_matrix_and_with_noise_inside_the_tolerance() {
+        assert_eq!(score(&picture(&BT601)), (0.0, String::new()));
+        assert_eq!(score(&picture(&BT709)), (0.0, String::new()));
+
+        let mut noisy = picture(&BT601);
+        for plane in noisy.iter_mut() {
+            for (y, row) in plane.iter_mut().enumerate() {
+                for (x, sample) in row.iter_mut().enumerate() {
+                    *sample = sample
+                        .wrapping_add(((x * 7 + y * 13) % 13) as u8)
+                        .wrapping_sub(6);
+                }
+            }
         }
-        let displaced_off =
-            pixel::score_plane("y", &as_row_refs(&displaced), reference, pixel::TOL_SAMPLE).off;
-        assert!(displaced_off > noise_off);
-
-        // The measured #272 signature: a flat "green" region (zeroed chroma against a
-        // reference of 128).
-        let green = flat_rows(0, 64, 64);
-        let green_off = pixel::score_plane("u", &as_row_refs(&green), 128, pixel::TOL_SAMPLE).off;
-        assert_eq!(green_off, 1.0);
-        assert!(green_off > noise_off);
+        assert_eq!(score(&noisy), (0.0, String::new()));
     }
 
     #[test]
-    fn score_plane_all_black_and_all_white_against_a_limited_range_reference() {
-        let black = flat_rows(16, 16, 16);
-        assert_eq!(
-            pixel::score_plane("y", &as_row_refs(&black), 16, pixel::TOL_SAMPLE).off,
-            0.0
+    fn displaced_columns_fail_the_check_on_every_plane() {
+        let mut frame = picture(&BT601);
+        swap_columns(&mut frame, &[0, 1, 2], 160, 800, 64);
+        let (off, planes) = score(&frame);
+        // Two of sixteen cells per row hold another cell's colour over 56 of their 64
+        // scored columns.
+        assert!(
+            (off - 2.0 * 56.0 / 64.0 / 16.0).abs() < 0.001,
+            "off = {off}"
         );
-        let white = flat_rows(235, 16, 16);
-        assert_eq!(
-            pixel::score_plane("y", &as_row_refs(&white), 16, pixel::TOL_SAMPLE).off,
-            1.0
-        );
+        assert_eq!(planes, "y,u,v");
     }
 
     #[test]
-    fn median_u8_takes_the_middle_of_the_sorted_samples() {
-        let rows = vec![vec![5u8, 1, 3], vec![4, 2]];
-        assert_eq!(pixel::median_u8(&as_row_refs(&rows)), 3);
-        let empty: &[&[u8]] = &[];
-        assert_eq!(pixel::median_u8(empty), 0);
+    fn a_displacement_in_chroma_alone_names_only_chroma() {
+        let mut frame = picture(&BT709);
+        swap_columns(&mut frame, &[1, 2], 160, 800, 64);
+        let (off, planes) = score(&frame);
+        assert!(off > 10.0 * pixel::OFF_FLOOR, "off = {off}");
+        assert_eq!(planes, "u,v");
+    }
+
+    #[test]
+    fn a_picture_shifted_by_one_macroblock_fails() {
+        let mut frame = picture(&BT601);
+        frame[0].iter_mut().for_each(|row| row.rotate_right(16));
+        frame[1].iter_mut().for_each(|row| row.rotate_right(8));
+        frame[2].iter_mut().for_each(|row| row.rotate_right(8));
+        let (off, planes) = score(&frame);
+        // Each cell's first 8 scored columns of 64 come from its left neighbour, which is
+        // another class everywhere but in three cells the rotation wraps onto their own.
+        assert!(
+            (off - 141.0 / 144.0 * 8.0 / 64.0).abs() < 0.001,
+            "off = {off}"
+        );
+        assert_eq!(planes, "y,u,v");
+    }
+
+    #[test]
+    fn a_plane_that_does_not_carry_the_picture_is_wholly_off() {
+        // The flat black field the compositor shows without the test picture.
+        let black = [[16, 128, 128]; 4];
+        assert_eq!(score(&picture(&black)), (1.0, "y,u,v".to_string()));
+
+        // The #272 signature: chroma zeroed, luma intact.
+        let mut green = picture(&BT601);
+        for plane in &mut green[1..] {
+            plane.iter_mut().for_each(|row| row.fill(0));
+        }
+        assert_eq!(score(&green), (1.0, "u,v".to_string()));
+
+        let mut swapped = picture(&BT601);
+        swapped.swap(1, 2);
+        assert_eq!(score(&swapped), (1.0, "u,v".to_string()));
     }
 
     #[test]
@@ -1245,17 +1326,6 @@ mod tests {
     #[test]
     fn sustained_is_false_with_no_scored_frames() {
         assert!(!pixel::sustained(&[], pixel::OFF_FLOOR));
-    }
-
-    #[test]
-    fn luma_reference_is_16_for_limited_0_for_full_and_nearest_median_when_unknown() {
-        assert_eq!(pixel::luma_reference(pixel::Range::Limited, 0), 16);
-        assert_eq!(pixel::luma_reference(pixel::Range::Limited, 235), 16);
-        assert_eq!(pixel::luma_reference(pixel::Range::Full, 16), 0);
-        assert_eq!(pixel::luma_reference(pixel::Range::Unknown, 0), 0);
-        assert_eq!(pixel::luma_reference(pixel::Range::Unknown, 7), 0);
-        assert_eq!(pixel::luma_reference(pixel::Range::Unknown, 8), 16);
-        assert_eq!(pixel::luma_reference(pixel::Range::Unknown, 16), 16);
     }
 
     // ── #300: the codec probe (a non-H.264 request) ──────────────────────────────────
@@ -1436,5 +1506,104 @@ mod tests {
             target.blocks(),
             Some(ReadinessBlocks::gpu(3, "control_plane"))
         );
+    }
+    // ── #289: the probe path itself, on the software encoder ─────────────────────────
+
+    /// One compositor at a time: each binds a Wayland socket and starts llvmpipe.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs the probe's pipeline on the software path (llvmpipe compositor, openh264), or
+    /// returns `None` where this image cannot: the devtools image has no compositor
+    /// element. Like the live WebRTC tests, with `QUASAR_REQUIRE_LIVE_WEBRTC` set a skip is
+    /// a failure.
+    fn software_probe(tamper: impl FnOnce(&gst::Element)) -> Option<Observed> {
+        gst::init().unwrap();
+        let mut missing: Vec<&str> = ["waylanddisplaysrc", "openh264enc", "openh264dec"]
+            .into_iter()
+            .filter(|f| gst::ElementFactory::find(f).is_none())
+            .collect();
+        // The compositor binds its Wayland socket there and panics without it.
+        let has_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .is_some_and(|dir| std::path::Path::new(&dir).is_dir());
+        if !has_runtime_dir {
+            missing.push("a directory at $XDG_RUNTIME_DIR");
+        }
+        if !missing.is_empty() {
+            if std::env::var_os("QUASAR_REQUIRE_LIVE_WEBRTC").is_some() {
+                panic!(
+                    "the media probe's software path cannot run: {missing:?} missing, and \
+                     QUASAR_REQUIRE_LIVE_WEBRTC is set"
+                );
+            }
+            eprintln!("SKIP: the media probe's software path did not run, {missing:?} missing");
+            return None;
+        }
+
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let request = MediaProbeRequest::default();
+        let mut cfg = SessionConfig::from_env(false, None);
+        cfg.encoder = crate::session::EncoderChoice::Openh264;
+        cfg.configured_encoder = cfg.encoder;
+        cfg.render_node = "software".into();
+        cfg.stream.codec = Codec::H264;
+        (cfg.stream.width, cfg.stream.height, cfg.stream.fps) =
+            (request.width, request.height, request.fps);
+        Some(build_and_run(&mut cfg, Codec::H264, &request, tamper).expect("the probe builds"))
+    }
+
+    /// Swaps two 64-column bands of every I420 frame on its way into the encoder.
+    fn displace_columns(encoder: &gst::Element) {
+        let pad = encoder.static_pad("sink").unwrap();
+        pad.add_probe(gst::PadProbeType::BUFFER, |pad, info| {
+            let caps = pad.current_caps().expect("caps before the first buffer");
+            let video = gst_video::VideoInfo::from_caps(&caps).unwrap();
+            let buffer = info.buffer_mut().unwrap().make_mut();
+            let mut frame =
+                gst_video::VideoFrameRef::from_buffer_ref_writable(buffer, &video).unwrap();
+            for plane in 0..3u32 {
+                let sub = if plane == 0 { 1 } else { 2 };
+                let stride = frame.plane_stride()[plane as usize] as usize;
+                let data = frame.plane_data_mut(plane).unwrap();
+                for line in data.chunks_mut(stride) {
+                    for i in 0..64 / sub {
+                        line.swap(160 / sub + i, 800 / sub + i);
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    #[test]
+    fn the_probe_path_passes_untouched_and_fails_with_displaced_columns() {
+        let Some(healthy) = software_probe(|_| {}) else {
+            return;
+        };
+        let PixelCheck::Ok { off, frames } = healthy.pixel else {
+            panic!("a healthy software path must pass: {:?}", healthy.pixel);
+        };
+        eprintln!("healthy: worst plane {off:.6} over {frames} frames");
+        assert!(off < pixel::OFF_FLOOR / 10.0, "off = {off}");
+        assert!(matches!(
+            verdict(DEFAULT_FRAMES, &healthy),
+            ProbeVerdict::Pass(_)
+        ));
+
+        let displaced = software_probe(displace_columns).unwrap();
+        let PixelCheck::Mismatch {
+            off,
+            frames,
+            planes,
+        } = &displaced.pixel
+        else {
+            panic!("displaced columns must fail: {:?}", displaced.pixel);
+        };
+        eprintln!("displaced: worst plane {off:.6} over {frames} frames, planes {planes}");
+        assert!(*off > 5.0 * pixel::OFF_FLOOR, "off = {off}");
+        assert_eq!(planes, "y,u,v");
+        assert!(matches!(
+            verdict(DEFAULT_FRAMES, &displaced),
+            ProbeVerdict::Mismatch(_)
+        ));
     }
 }

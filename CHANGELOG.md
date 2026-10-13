@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Changed
+- **The media host check now fails on a picture whose pixels were moved, not only on one whose colours were damaged (#289).** `media_probe_gpu<N>` used to encode a black field, on which a displaced block looks the same as the block it replaced. The compositor now has a test picture, a fixed grid of four colours shown only while no app is on screen, and the check compares its own decoded output with it. Nothing to configure: the check id, what it blocks and its wording are unchanged, and a session never shows the picture.
 - **The compositor pin carries the follow-ups to the #267 and #570 fixes (#575).** The gst-wayland-display fork pin moves `d83122d7` → `2a5ba560`. The EGL display is now kept for the life of the agent process, so the `eglDestroyContext: EGL_NOT_INITIALIZED` line on NVIDIA cannot come back with a change in teardown order; an agent that has run a session keeps that display while idle. A test now fails on any Vulkan device table built the way that caused the #267 crash, and the loader race test says whether it ran.
 
 ### Fixed
