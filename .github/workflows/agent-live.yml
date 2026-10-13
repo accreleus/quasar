@@ -31,6 +31,7 @@ on:
       - 'deploy/pins.env'
       - 'deploy/toolchain-hash.sh'
       - '.github/workflows/agent-live.yml'
+      - '.github/workflows/images.yml'
   schedule:
     - cron: '23 4 * * *'
   workflow_dispatch:
@@ -52,18 +53,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'schedule' && 'develop' || '' }}
+          # The test step mounts this checkout into a container that runs the pull
+          # request's code, so the token must not be left in it.
+          persist-credentials: false
       - name: Pull the toolchain image for these pins
         id: image
         run: |
           set -euo pipefail
           # The Images workflow's derivation: the base's digest is part of the hash.
           base="$(grep -E '^QUASAR_BASE_IMAGE=' deploy/pins.env | head -1 | cut -d= -f2-)"
-          QUASAR_BASE_DIGEST="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$base")"
+          if ! QUASAR_BASE_DIGEST="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$base")"; then
+            echo "::error::Could not read the base image $base from the registry (the error is on the line above), so the toolchain tag cannot be worked out. This is not a missing toolchain image: re-run the job if the registry was unreachable."
+            exit 1
+          fi
           export QUASAR_BASE_DIGEST
           bash deploy/toolchain-hash.sh --explain
           image="ghcr.io/$GITHUB_REPOSITORY/quasar-gst-toolchain:$(bash deploy/toolchain-hash.sh)"
-          if ! docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo "::error::No published toolchain image for these pins: $image. A pin, a patch, the toolchain stage or the base image changed. Run the Images workflow on this branch (its toolchain job builds and publishes that tag), then re-run this job."
+          if ! said="$(docker manifest inspect "$image" 2>&1 >/dev/null)"; then
+            echo "::error::No published toolchain image for these pins: $image (the registry said: ${said//$'\n'/ }). A pin, a patch, the toolchain stage or the base image changed. Run the Images workflow on this branch (its toolchain job builds and publishes that tag), then re-run this job."
             exit 1
           fi
           docker pull --quiet "$image"
