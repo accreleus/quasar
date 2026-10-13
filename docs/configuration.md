@@ -2547,7 +2547,8 @@ control plane is upgraded (migration 0103) if its installed image is already the
 declaring version, and otherwise when the image is installed or updated to it. An
 install, an update or that migration never changes a `direct_display` the app
 already has, `false` included. Saving an app you made on a catalog preset rewrites
-the key to the manifest's value; a save never touches a library provider's app,
+the key to the manifest's value when the save changes its runtime settings or preset
+and the manifest states the key; a save never touches a library provider's app,
 Steam's for one.
 
 **The console auto-start goes through the same entitlement gate as any other
