@@ -309,9 +309,10 @@ const registerStatusSQL = `CASE WHEN hosts.status = 'draining'
 // stored version, stored or reported commit) only makes its own clause no
 // evidence, failing toward undercounting: a NULL stamp on the same build is a
 // blip, but a changed build counts with or without a stamp. A shorter gap on the
-// same build ⇒ blip (process identity unchanged). agent_disconnected_at is always cleared — consumed, so a stale
-// value can never misclassify a later reconnect. $4 is the validated
-// source_commit of this register, NULL when it sent none.
+// same build ⇒ blip (process identity unchanged). agent_disconnected_at is
+// always cleared — consumed, so a stale value can never misclassify a later
+// reconnect. $4 is the validated source_commit of this register, NULL when it
+// sent none.
 const reconnectHostSQL = `
 	WITH old AS (
 		SELECT agent_process_started_at,
