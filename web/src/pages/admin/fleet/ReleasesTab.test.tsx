@@ -242,11 +242,65 @@ describe("ReleasesTab", () => {
     mocked.getPlatformReleases.mockResolvedValue(eligibleHostView());
     renderTab();
 
-    // The rollup: the control plane's chip and k/N for the agents.
-    expect(await screen.findByText("1/1")).toBeInTheDocument();
+    // The rollup: the control plane's chip and k/N for the agents. The one host
+    // is eligible, so it is still to update and not yet counted.
+    expect(await screen.findByText("0/1")).toBeInTheDocument();
     expect(screen.getByText("Per-host detail")).toBeInTheDocument();
     openPerHostDetail();
     expect(screen.getByRole("columnheader", { name: "Target" })).toBeInTheDocument();
+  });
+
+  function nodeAgentsBar(count: string): Element | null | undefined {
+    return screen.getByText(count).parentElement?.querySelector(".bar");
+  }
+
+  it("counts every host already on the release as done, with a success bar", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      view({
+        targets: [
+          { kind: "control_plane", host_id: null, node_name: null, eligible: false, reason: "up_to_date", preflight: PF },
+          { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: false, reason: "up_to_date", preflight: PF },
+          { kind: "host", host_id: "h2", node_name: "gpu-host-02", eligible: false, reason: "up_to_date", preflight: PF },
+        ],
+      }),
+    );
+    renderTab();
+
+    expect(await screen.findByText("2/2")).toBeInTheDocument();
+    expect(nodeAgentsBar("2/2")).toHaveClass("success");
+    expect(nodeAgentsBar("2/2")).not.toHaveClass("warning");
+  });
+
+  it("counts an up-to-date host and leaves an eligible one to update, with a warning bar", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      view({
+        targets: [
+          { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null, preflight: PF },
+          { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: false, reason: "up_to_date", preflight: PF },
+          { kind: "host", host_id: "h2", node_name: "gpu-host-02", eligible: true, reason: null, preflight: PF },
+        ],
+      }),
+    );
+    renderTab();
+
+    expect(await screen.findByText("1/2")).toBeInTheDocument();
+    expect(nodeAgentsBar("1/2")).toHaveClass("warning");
+  });
+
+  it("does not count a host that is ineligible for another reason as done", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      view({
+        targets: [
+          { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null, preflight: PF },
+          { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: false, reason: "up_to_date", preflight: PF },
+          { kind: "host", host_id: "h2", node_name: "gpu-host-02", eligible: false, reason: "host_offline", preflight: PF },
+        ],
+      }),
+    );
+    renderTab();
+
+    expect(await screen.findByText("1/2")).toBeInTheDocument();
+    expect(nodeAgentsBar("1/2")).toHaveClass("warning");
   });
 
   it("renders release notes sanitised", async () => {

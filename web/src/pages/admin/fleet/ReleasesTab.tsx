@@ -940,9 +940,11 @@ function TargetsCard({
 
   const cp = view.targets.find((t) => t.kind === "control_plane");
   const hostTargets = view.targets.filter((t) => t.kind === "host");
-  const ready = hostTargets.filter((t) => t.eligible).length;
-  const holdouts = hostTargets.filter((t) => !t.eligible).slice(0, 3);
-  const moreHoldouts = hostTargets.length - ready - holdouts.length;
+  // Done is a host already on the evaluated release; an eligible host is still to update.
+  const upToDate = hostTargets.filter((t) => t.reason === "up_to_date").length;
+  const notEligible = hostTargets.filter((t) => !t.eligible);
+  const holdouts = notEligible.slice(0, 3);
+  const moreHoldouts = notEligible.length - holdouts.length;
   // Offered only the update (amendment 14 below_floor): never a revert.
   const belowFloor = new Set(view.installed.hosts.filter((h) => h.below_floor).map((h) => h.host_id));
   const mustUpdate = hostTargets.filter((t) => t.eligible && t.host_id && belowFloor.has(t.host_id));
@@ -1013,11 +1015,11 @@ function TargetsCard({
         <Fact label="Node agents">
           <span className="rowflex center">
             <span className="num">
-              {ready}/{hostTargets.length}
+              {upToDate}/{hostTargets.length}
             </span>
             <Bar
-              percent={hostTargets.length ? (ready / hostTargets.length) * 100 : 0}
-              variant={ready === hostTargets.length ? "success" : "warning"}
+              percent={hostTargets.length ? (upToDate / hostTargets.length) * 100 : 0}
+              variant={upToDate === hostTargets.length ? "success" : "warning"}
             />
           </span>
         </Fact>
