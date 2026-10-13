@@ -980,15 +980,6 @@ pub(super) fn enable_abr(
             ceiling_bps / 1000,
             fps
         );
-        // The aux-sender return MUST be handed back FLOATING: rtpbin ref_sinks it on
-        // bin-add expecting a C handler's floating ref, and gstreamer-rs already sank one
-        // at construction, so a plain strong handle leaks the rtpgccbwe (and its
-        // AbrLoop → encoder chain) per session (.claude/rules/gstreamer-gotchas.md).
-        unsafe {
-            gst::glib::gobject_ffi::g_object_force_floating(
-                bwe.as_ptr() as *mut gst::glib::gobject_ffi::GObject
-            );
-        }
         Some(bwe.to_value())
     });
 }

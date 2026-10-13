@@ -156,7 +156,7 @@ else
   PROBE_FACTORY=$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1])).get("encoder_factory") or "-")' "$PROBE_OUT" 2>/dev/null) || PROBE_FACTORY="-"
   harness_note "g1_probe_encoder_factory" "$PROBE_FACTORY"
   # node-agent/src/session/pipeline/encoders.rs:360-370 — GStreamer >=1.26 (this
-  # image is 1.28.4) renamed the CUDA NVENC element from nvcudah264enc back to
+  # image is 1.28.8) renamed the CUDA NVENC element from nvcudah264enc back to
   # nvh264enc; the agent tries nvcudah264enc first (pre-1.26 naming), then
   # nvh264enc. Both are the real vendor CUDA/NVENC path — only vulkanh264enc
   # (or anything else) means the fallback did NOT engage.

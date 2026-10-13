@@ -81,7 +81,6 @@
     "deploy/patches/vulkan/vkh264enc-num-slices.patch",
     "deploy/patches/vulkan/gstreamer-vulkan-global-submit-lock.patch",
     "deploy/patches/vulkan/vkh264enc-intra-refresh.patch",
-    "deploy/patches/vulkan/gstreamer-vulkan-rc-retarget-no-reset.patch",
     "deploy/patches/vulkan/vulkanav1enc.patch",
     "deploy/patches/vulkan/vulkan-enc-output-state-on-resize.patch",
     "deploy/patches/vulkan/vkenc-bitstream-buffer-pool.patch",

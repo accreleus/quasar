@@ -70,7 +70,7 @@ renumbered to their public issues.
   **The design lint (`npm run lint:design`) checks spacing, colours and inline styles, and its
   baseline (`web/src/styles/design-lint.baseline.json`) only ever goes down.**
 - `deploy/`       compose now, k8s manifests later. **Build images with `deploy/build-images.sh`, never a hand-typed `docker build`** — it forces an explicit `--target` (a bare build takes the LAST stage regardless of `-t`), rejects a `--build-arg` for an undeclared ARG (Docker ignores those silently), and validates every artifact against `deploy/image-contract.json` before promoting `:latest`. The contract is the durable form of every image defect that reached production; **never relax an assertion to make a build green.** **`deploy/` is the OPERATOR front door: it holds only what someone installing Quasar needs.** Contributor tooling lives under `scripts/` — `dev/` (the dev container wrapper and dev seeders), `verify/` (verify stages + the devtools image), `harness/` (acceptance harnesses, `lib/`, `checks/`, the `apitest` module, `peer-driver.mjs`), `release/` (release-evidence gates), `dx/` (the Makefile's orchestration) — and non-operator compose overlays live in `deploy/overlays/`. Don't add a new development script to `deploy/`.
-- **Third-party pins** — nothing is vendored as source: gst-wayland-display/inputtino/gst-interpipe/GStreamer are built from pins in `deploy/Dockerfile.vulkan` (the single image lineage: dev/runtime targets on the `quasar-base` family) plus patches in `deploy/patches/`. Pins + flip instructions live in **`docs/third-party-pins.md`** — current: gst-wayland-display fork `6638e07` (upstream base `43d4c25`, upstream `stable` `016b4fc` merged), gst-interpipe `0c454917` (gow fork) + two vendored caps-leak patches, GStreamer `1.28.4` + vendored patches. **A pin bump on either fork is gated on a live exercise, not a green build** — see "Fork-bump verification policy" in `docs/third-party-pins.md`.
+- **Third-party pins** — nothing is vendored as source: gst-wayland-display/inputtino/gst-interpipe/GStreamer are built from pins in `deploy/Dockerfile.vulkan` (the single image lineage: dev/runtime targets on the `quasar-base` family) plus patches in `deploy/patches/`. Pins + flip instructions live in **`docs/third-party-pins.md`** — current: gst-wayland-display fork `6638e07` (upstream base `43d4c25`, upstream `stable` `016b4fc` merged), gst-interpipe `0c454917` (gow fork) + two vendored caps-leak patches, GStreamer `1.28.8` + vendored patches. **A pin bump on either fork is gated on a live exercise, not a green build** — see "Fork-bump verification policy" in `docs/third-party-pins.md`.
 - `CONTEXT.md`    the domain glossary (chain, rung, cert cap, stream plan, device probe, envelope, host probe, readiness check, entitlement, home, derived tile). Read it before naming things; add a term when work resolves one, rather than coining a synonym.
 - `docs/`         design docs (config knobs: `docs/configuration.md` — every env var, default, accepted values). The scoped backlog of still-open review findings (all low/subjective or a future spike — none are bugs) and the executed TD-01/TD-02 refactor plans lived at `docs/tech-debt/REVIEW-REMAINING.md` and `docs/completed/tech-debt/`; both were deliberately not carried over to the public repository. **The finding numbers this bullet used to list were review-finding IDs from the pre-move tracker, not issues on this repo** — several of them collide with unrelated public issues, so they have been removed rather than left to mislead.
 
@@ -269,8 +269,7 @@ session memory `current-focus.md`, not this file.**
   #489 is an NVIDIA-driver NVENC teardown UAF spanning the 595 **and** 610
   branches — no driver pin escapes it — and Vulkan is immune, so the default path
   is off the affected library. **AV1 on Vulkan exists as of
-  2026-08-22 (merge 345bad8c): our vendored `vulkanav1enc.patch` (gst-chain patch 8,
-  with the `gstreamer-vulkan-rc-retarget-no-reset.patch` library fix as patch 7)
+  2026-08-22 (merge 345bad8c): our vendored `vulkanav1enc.patch` (gst-chain patch 7)
   adds a genuine Vulkan Video AV1 encoder (needs NO ring pin, unlike HEVC).
   **The three per-codec knobs `QUASAR_VULKAN_H264` / `QUASAR_VULKAN_HEVC` /
   `QUASAR_VULKAN_AV1` all DEFAULT ON (2026-08-22)** — they exist only to
@@ -334,7 +333,7 @@ session memory `current-focus.md`, not this file.**
   probe caps-negotiation artifact (unpinned `profile` negotiating `main-444`), the
   production path always pinned `profile=main`, and the gate
   (`scale_stage::vulkan_resize_validated_for_codec`) now passes every codec.
-  HARD DEPENDENCY: the image must also carry the 9th vendored patch
+  HARD DEPENDENCY: the image must also carry the 8th vendored patch
   `vulkan-enc-output-state-on-resize.patch` — without it a grow step in any second
   Vulkan session is an NVENC MMU fault (Xid 31), because the encoder kept the launch-size
   DPB. Each rung step on Vulkan is an encoder session restart (VRAM flat over 84 flips).

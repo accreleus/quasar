@@ -3,8 +3,8 @@
 //!
 //! A peer here is what a browser page is to the host: its own ICE agent and DTLS and
 //! SCTP associations. Signaling is carried by hand, the way the control-plane relay
-//! carries it: host frames reach only the attached peer. What a browser adds (its own
-//! certificate, an SCTP abort when the page goes) is `scripts/harness/run-takeover-peers.sh`.
+//! carries it: host frames reach only the attached peer. What a browser adds (an SCTP
+//! abort when the page goes) is `scripts/harness/run-takeover-peers.sh`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -99,7 +99,7 @@ struct Host {
     replaced: Vec<PcId>,
     /// Every offer the host sent and every answer it was handed, in order.
     wire: Vec<(&'static str, PcId, String)>,
-    /// Rewrites an answer before the host sees it (evidence runs).
+    /// Rewrites an answer before the host sees it.
     munge_answer: Option<fn(String) -> String>,
     sig_tx: OutTx,
     sig_rx: mpsc::UnboundedReceiver<SignalMsg>,
@@ -318,6 +318,8 @@ struct PeerPc {
     pongs: Arc<AtomicU64>,
     /// The H.264 NAL unit type the first RTP packet out of webrtcbin starts with.
     first_nal: Arc<Mutex<Option<u8>>>,
+    /// The `a=fingerprint` value of this PC's own certificate, when it was given one.
+    fingerprint: Option<String>,
 }
 
 /// The NAL unit type an H.264 RTP packet starts with, looking inside a STAP-A or FU-A.
@@ -335,10 +337,51 @@ fn first_nal_type(info: &gst::PadProbeInfo) -> Option<u8> {
     })
 }
 
+/// A certificate of a peer's own, as each browser has. Every `webrtcbin` in a process
+/// otherwise presents the one certificate GStreamer generates, and the host checks an
+/// answer's `a=fingerprint` against the certificate it is shown in DTLS, so a peer that
+/// stands for another browser needs a real one.
+struct Certificate {
+    /// Certificate and key, PEM.
+    pem: String,
+    /// What an SDP says of it: `sha-256 AB:CD:…`.
+    fingerprint: String,
+}
+
+impl Certificate {
+    fn mint() -> Certificate {
+        use sha2::Digest;
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["peer".to_string()]).expect("certificate");
+        let digest: Vec<String> = sha2::Sha256::digest(cert.der())
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+        Certificate {
+            pem: cert.pem() + &key_pair.serialize_pem(),
+            fingerprint: format!("sha-256 {}", digest.join(":")),
+        }
+    }
+}
+
 impl PeerPc {
-    fn new(id: PcId) -> PeerPc {
+    fn new(id: PcId, certificate: Option<&Certificate>) -> PeerPc {
         let (tx, rx) = mpsc::unbounded_channel();
         let (pipeline, webrtc) = build_answerer_pipeline(tx.clone()).expect("answerer");
+        // A certificate must be set while the DTLS elements are in NULL: `dtlsenc` takes
+        // its connection on the way to READY, and set after that the peer advertises this
+        // certificate and presents the process's one. webrtcbin builds a transport and
+        // starts it in one call, so the only moment is as the element is added.
+        if let Some(pem) = certificate.map(|c| c.pem.clone()) {
+            webrtc
+                .downcast_ref::<gst::Bin>()
+                .expect("webrtcbin is a bin")
+                .connect_deep_element_added(move |_, _, element| {
+                    if element.factory().is_some_and(|f| f.name() == "dtlsdec") {
+                        element.set_property("pem", &pem);
+                    }
+                });
+        }
         let rtp = Arc::new(AtomicU64::new(0));
         let counter = rtp.clone();
         let first_nal = Arc::new(Mutex::new(None));
@@ -387,7 +430,21 @@ impl PeerPc {
             channel,
             pongs,
             first_nal,
+            fingerprint: certificate.map(|c| c.fingerprint.clone()),
         }
+    }
+
+    /// The next frame this PC has for the host. webrtcbin misstates the fingerprint of a
+    /// certificate it was given (it hashes the key along with it,
+    /// `_add_fingerprint_to_media`), so an answer is made to name the certificate's own.
+    fn outbound(&mut self) -> Option<SignalMsg> {
+        Some(match (self.rx.try_recv().ok()?, &self.fingerprint) {
+            (SignalMsg::Answer { sdp, pc }, Some(own)) => SignalMsg::Answer {
+                sdp: with_fingerprint(&sdp, own),
+                pc,
+            },
+            (msg, _) => msg,
+        })
     }
 
     fn inbound(&self, msg: SignalMsg) {
@@ -466,10 +523,20 @@ struct Peer {
 }
 
 impl Peer {
+    /// A page of the one browser this process is: the certificate every peer here shares.
     fn new() -> Peer {
+        Peer::with(None)
+    }
+
+    /// A page in another browser: a certificate of its own.
+    fn another_browser() -> Peer {
+        Peer::with(Some(&Certificate::mint()))
+    }
+
+    fn with(certificate: Option<&Certificate>) -> Peer {
         Peer {
-            video: PeerPc::new(PcId::Video),
-            audio: PeerPc::new(PcId::Audio),
+            video: PeerPc::new(PcId::Video, certificate),
+            audio: PeerPc::new(PcId::Audio, certificate),
         }
     }
 
@@ -527,7 +594,7 @@ fn pump_with(
             attached.pc(pc).inbound(msg);
         }
         for id in [PcId::Video, PcId::Audio] {
-            while let Ok(msg) = attached.pc_mut(id).rx.try_recv() {
+            while let Some(msg) = attached.pc_mut(id).outbound() {
                 // The answerer speaks the Phase-0 shapes; tag them as the SPA does.
                 let msg = match msg {
                     SignalMsg::Answer { sdp, .. } => SignalMsg::Answer { sdp, pc: Some(id) },
@@ -629,7 +696,10 @@ fn first_attach(host: &mut Host) -> Peer {
 /// What a page that opens `/app/session/<id>` sends when its socket opens
 /// (`web/src/webrtc/session.ts`, `requestOfferOnOpen`), then the wait for its media.
 fn attach(host: &mut Host) -> Peer {
-    let mut peer = Peer::new();
+    attach_as(host, Peer::new())
+}
+
+fn attach_as(host: &mut Host, mut peer: Peer) -> Peer {
     request_offers(host);
     let up = pump(host, &mut peer, Duration::from_secs(20), |_, p| {
         streaming(p)
@@ -752,10 +822,12 @@ fn takeover_while_connecting(tag: &str, another_browser: bool) -> (Host, Peer) {
     });
     assert!(answered, "the first peer's answer never applied");
     assert_eq!(rtp(&a.video), 0, "the first peer must not have connected");
-    if another_browser {
-        host.munge_answer = Some(with_another_certificate);
-    }
-    let mut b = attach(&mut host);
+    let b = if another_browser {
+        Peer::another_browser()
+    } else {
+        Peer::new()
+    };
+    let mut b = attach_as(&mut host, b);
     assert!(input_reaches_host(&mut host, &mut b));
     assert_eq!(host.bus_errors, Vec::<String>::new());
     (host, b)
@@ -1121,7 +1193,9 @@ fn a_streamed_session_gives_back_the_encode_pipelines_contexts() {
     host.pipeline.set_context(&context);
     drop(context);
     let peer = first_attach(&mut host);
-    drop(peer);
+    // A replaced transport too: a second browser takes the session over.
+    let taker = attach_as(&mut host, Peer::another_browser());
+    drop((peer, taker));
     // The runner's `MetricsHookGuard`.
     host.metrics.clear_hooks();
     drop(host);
@@ -1165,35 +1239,77 @@ fn dtls_certificate(webrtc: &gst::Element) -> Option<String> {
     transport.property::<Option<String>>("certificate")
 }
 
-/// Evidence, not a gate: does the host's webrtcbin check the answer's fingerprint against
-/// the certificate the peer presents in DTLS?
+/// A second browser takes a streaming session over. Its certificate is its own, and the
+/// host hears it only because its answer's fingerprint is that certificate's.
 #[test]
-#[ignore = "prints whether a wrong fingerprint in the answer still connects"]
-fn fingerprint_evidence() {
+fn a_takeover_by_a_peer_with_its_own_certificate_reaches_the_host() {
     if !live_webrtc_available() {
         return;
     }
     let _serial = serial();
-    let mut host = Host::start("fingerprint");
+    let mut host = Host::start("own-cert");
+    let _a = first_attach(&mut host);
+
+    let mut b = attach_as(&mut host, Peer::another_browser());
+
+    assert_ne!(
+        sdp_value(&last_answer(&host, PcId::Video), "a=fingerprint:"),
+        sdp_value(video_sdp(&host, "answer", 0), "a=fingerprint:"),
+        "the second peer answered with the first one's certificate"
+    );
+    let mut replaced = host.replaced.clone();
+    replaced.sort_by_key(|pc| *pc as usize);
+    assert_eq!(replaced, [PcId::Video, PcId::Audio]);
+    assert!(
+        input_reaches_host(&mut host, &mut b),
+        "a peer with a certificate of its own, truthfully advertised, is not heard"
+    );
+    assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// The host checks an answer's `a=fingerprint` against the certificate the peer presents
+/// in DTLS (webrtcbin, GStreamer 1.28.5 on). A peer that fails it is still sent media, and
+/// nothing it sends is heard: no input channel, no RTCP. If this fails the check is gone,
+/// and the fingerprint `webrtc::answer_from` tells peers apart by authenticates nothing.
+#[test]
+fn a_peer_whose_fingerprint_is_not_its_certificates_gets_video_and_no_input_channel() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("forged");
     host.munge_answer = Some(with_another_certificate);
     let mut peer = Peer::new();
-    let up = pump(&mut host, &mut peer, Duration::from_secs(10), |_, p| {
-        streaming(p)
+    let video = pump(&mut host, &mut peer, Duration::from_secs(20), |_, p| {
+        rtp(&p.video) > 30
     });
-    eprintln!(
-        "FINGERPRINT a peer whose answer carries a wrong fingerprint streams: {up} ({})",
+    assert!(
+        video,
+        "outbound media must not wait on the fingerprint: {}",
         describe(&peer)
+    );
+    assert!(
+        !input_reaches_host(&mut host, &mut peer),
+        "the host heard a peer whose answer names a certificate it did not present"
+    );
+    assert!(
+        peer.video.channel.lock().unwrap().is_none(),
+        "the input channel opened to a peer whose answer names a certificate it did not present"
     );
 }
 
-/// An answer as another browser would have written it: a certificate of its own. Every
-/// peer here shares the process's one; webrtcbin does not check the fingerprint against
-/// the handshake, so the peer still connects.
+/// An answer naming a certificate nobody holds. With no peer behind it, it stands for
+/// another browser's answer; a peer that connects behind it is shut out by the host.
 fn with_another_certificate(sdp: String) -> String {
+    with_fingerprint(&sdp, &format!("sha-256 {}", ["AB"; 32].join(":")))
+}
+
+/// `sdp` with every `a=fingerprint` naming `fingerprint`.
+fn with_fingerprint(sdp: &str, fingerprint: &str) -> String {
     sdp.lines()
-        .map(|l| match l.strip_prefix("a=fingerprint:sha-256 ") {
-            Some(_) => format!("a=fingerprint:sha-256 {}", ["AB"; 32].join(":")),
-            None => l.to_string(),
+        .map(|l| match l.starts_with("a=fingerprint:") {
+            true => format!("a=fingerprint:{fingerprint}"),
+            false => l.to_string(),
         })
         .collect::<Vec<_>>()
         .join("\r\n")
@@ -1336,7 +1452,7 @@ fn answer_to_the_pending_video_offer(host: &mut Host, peer: &mut Peer) -> Signal
             }
         }
         // Its candidates follow the answer and stay queued for the next pump.
-        if let Ok(SignalMsg::Answer { sdp, .. }) = peer.video.rx.try_recv() {
+        if let Some(SignalMsg::Answer { sdp, .. }) = peer.video.outbound() {
             return SignalMsg::Answer {
                 sdp,
                 pc: Some(PcId::Video),
@@ -1711,7 +1827,7 @@ impl Session {
                 }
             }
             for id in [PcId::Video, PcId::Audio] {
-                while let Ok(msg) = peer.pc_mut(id).rx.try_recv() {
+                while let Some(msg) = peer.pc_mut(id).outbound() {
                     let msg = match msg {
                         SignalMsg::Answer { sdp, .. } => {
                             self.answers[id as usize] = Some(sdp.clone());
@@ -2316,3 +2432,6 @@ fn browser_host() {
         }
     });
 }
+
+/// What the host hands `webrtcbin` per transport, and whether it is given back.
+mod aux_senders;

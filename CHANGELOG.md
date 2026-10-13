@@ -50,6 +50,8 @@ own; the two do not move together, and that is deliberate.
   default app without it shows a readiness failure on the console page and is not launched.
   Contract: protocol amendment 19.
 - **Dependencies updated** (eleven patch and minor bumps: the node agent's tokio, tokio-rustls, http, bytes and libc; the web client's vite, jsdom and Node types; the docs site's astro, sharp and starlight-openapi).
+- **The node agent image builds GStreamer 1.28.8 (was 1.28.4), and with it libnice 0.1.24 (was 0.1.23).** This brings the upstream fixes in the parts Quasar streams through: RTP and RTCP handling survives malformed control packets and limits how many sources one session tracks; the DTLS handshake copes with a long certificate subject; the Vulkan encoders synchronise their reference pictures before each frame; the VA encoders size their output buffer for the bitrate and recover from a corrupt or overflowing one; and libnice fixes crashes in ICE. One vendored patch is gone: the part of it that worked is upstream now, and the rest never took effect.
+- **The host now holds a client to the `a=fingerprint` in its answer.** With GStreamer 1.28.8 the node agent checks the certificate a client presents in the DTLS handshake against the fingerprint its answer stated. A client whose fingerprint does not match its certificate still gets video, and the host takes nothing from it: no input, no microphone, no feedback. Browsers are unaffected, since each states its own certificate. A native or custom client must state the fingerprint of the certificate it really presents, written as browsers write it (`sha-256`, then upper-case hex pairs joined by colons).
 
 ### Removed
 - **The old console path is gone: a console session runs only direct (#461).** Console mode
