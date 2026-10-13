@@ -204,8 +204,8 @@ mod pixel {
     /// interior is DC-predicted with no residual and reconstruction error is 0-1 code. 8 is
     /// far above that and about half of `MIN_GAP`, so no class reads as another.
     pub(crate) const TOL_SAMPLE: i16 = 8;
-    /// 1% of the scored samples: far above any rounding artefact or the cursor, and below
-    /// a displaced 16-column band.
+    /// 1% of the scored samples: far above any rounding artefact or the cursor (0.03%), and
+    /// below one 16-column band displaced inside the scored area (1.6%).
     pub(crate) const OFF_FLOOR: f64 = 0.01;
     /// Decoded frames to discard before scoring: decoder warm-up (design §3).
     pub(crate) const SKIP_FRAMES: usize = 5;
