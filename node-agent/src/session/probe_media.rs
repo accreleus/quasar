@@ -1541,7 +1541,14 @@ mod tests {
                      QUASAR_REQUIRE_LIVE_WEBRTC is set"
                 );
             }
-            eprintln!("SKIP: the media probe's software path did not run, {missing:?} missing");
+            // Past libtest's capture, like the live WebRTC tests' skip: a skip nobody sees
+            // reads as a pass.
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIP — session::probe_media (#289): the media probe's software-path test did \
+                 NOT run, {missing:?} missing; it runs in the quasar-agent-dev container"
+            );
             return None;
         }
 

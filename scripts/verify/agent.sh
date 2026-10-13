@@ -7,3 +7,4 @@ run "Rust Linux unit tests" cargo test --workspace --all-targets
 skip "GPU/media live tests require the lab host or the aux host; run the applicable scripts/harness/run-*-acceptance script on that host"
 skip "gst-interpipe is not in Debian's gst packages, so it is absent from this image; the interpipe-backed leak-regression tests self-skip here (look for their own SKIP lines above) and run for real in the quasar-agent-dev container"
 skip "gst-interpipe is absent from this image; the live two-peer takeover tests (session::pipeline::takeover_tests, #535) self-skip here with their own SKIP line and run for real in the quasar-agent-dev container"
+skip "the compositor element is absent from this image; the media probe's software-path test (session::probe_media, #289) self-skips here with its own SKIP line and runs for real in the quasar-agent-dev container"
