@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- **The host now says so when a client fails the DTLS fingerprint check (#577).** A client whose answer does not name the certificate it presents in DTLS is sent video and sound, and nothing it sends is accepted: no input, no microphone. The node agent's log used to look healthy. It now has one warning for each of the session's two connections (video and sound), `token="transport-peer-fingerprint-mismatch"`, with the session id. The session is not ended and nothing changes for browsers, which always pass; this is for clients that write their own answer (`protocol/signaling.md`, "The answer's `a=fingerprint`").
+
 ### Internal
 - **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A dump restored into a fresh rootless install and a restore interrupted at three points pass on the AMD test host. A machine reboot on that host is recorded as an accepted gap: the test hosts are containers, so both AMD Docker reboot rows were container restarts, and the earlier rootful row is corrected to say so. The lab-VM rows, a live GPU fault and a Podman bench re-run are accepted gaps too. The run's one product finding is #589.
 
