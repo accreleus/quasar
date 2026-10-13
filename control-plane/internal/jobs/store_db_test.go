@@ -647,8 +647,54 @@ func TestPruneAppliesTheRowCapPerTargetAndTheAgeCap(t *testing.T) {
 	if _, err := s.PruneRuns(ctx, 30); err != nil {
 		t.Fatal(err)
 	}
-	if got := count("a.one", ""); got != 1 {
-		t.Fatalf("after the age cap: %d want 1 (the pending row only)", got)
+	if got := count("a.one", ""); got != 2 {
+		t.Fatalf("after the age cap: %d want 2 (the pending row and the anchor)", got)
+	}
+}
+
+// The newest terminal run of each (job, target) survives the age cap, whatever
+// its age or outcome: it anchors the interval (LastTerminalRun).
+func TestPruneRunsKeepsTheNewestTerminalRunPerTarget(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	hostA := newHost(t, pool, "host-a")
+	hostB := newHost(t, pool, "host-b")
+	s := seed(t, pool, hostDef("home.gc"))
+
+	// Three terminal runs per host, all older than the age cap. The newest by
+	// finished_at is the middle row by created_at, so the keeper is not simply
+	// the newest-created row. Host B's keeper failed: a failed run anchors too.
+	for _, h := range []struct{ id, state string }{{hostA, "succeeded"}, {hostB, "failed"}} {
+		for _, days := range []struct{ created, finished int }{{90, 89}, {80, 41}, {70, 60}} {
+			state := "succeeded"
+			if days.finished == 41 {
+				state = h.state
+			}
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO job_runs (job_id, host_id, state, trigger, scheduled_for, created_at, finished_at)
+				VALUES ('home.gc', $1::uuid, $2, 'schedule', now(),
+				        now() - make_interval(days => $3), now() - make_interval(days => $4))`,
+				h.id, state, days.created, days.finished); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if _, err := s.PruneRuns(ctx, 30); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{hostA, hostB} {
+		last, found, err := s.LastTerminalRun(ctx, "home.gc", h)
+		if err != nil || !found {
+			t.Fatalf("host %s lost its anchor: found=%v err=%v", h, found, err)
+		}
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM job_runs WHERE host_id = $1::uuid`, h).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 || last.FinishedAt == nil || time.Since(*last.FinishedAt) < 40*24*time.Hour || time.Since(*last.FinishedAt) > 42*24*time.Hour {
+			t.Fatalf("host %s: %d rows left, anchor finished %v; want only the run finished 41 days ago", h, n, last.FinishedAt)
+		}
 	}
 }
 
