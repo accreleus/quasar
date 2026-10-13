@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+- **The compositor pin carries the follow-ups to the #267 and #570 fixes (#575).** The gst-wayland-display fork pin moves `d83122d7` → `2a5ba560`. The EGL display is now kept for the life of the agent process, so the `eglDestroyContext: EGL_NOT_INITIALIZED` line on NVIDIA cannot come back with a change in teardown order; an agent that has run a session keeps that display while idle. A test now fails on any Vulkan device table built the way that caused the #267 crash, and the loader race test says whether it ran.
+
 ### Fixed
 - **Fleet ▸ Releases counts a host already on the newest release as done (#587).** The Targets card's Node agents read "0/2" with a warning bar when every host was up to date, because it counted only the hosts still eligible to update. It now counts the up-to-date hosts (2/2, success bar), and a host ineligible for another reason is not counted. Up-to-date hosts are no longer listed under the count.
 - **A job whose interval is longer than run retention no longer reruns at once (#559).** Pruning kept no terminal run once it was older than the retention window, and a scheduled run is already that old when it finishes, so the schedule lost its anchor and the next run was dated now. The newest terminal run of each job and target is now kept whatever its age.
