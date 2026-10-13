@@ -586,6 +586,7 @@ func (s *Store) LastTerminalRun(ctx context.Context, jobID, hostID string) (Run,
 		WHERE job_id = $1
 		  AND COALESCE(host_id, '`+zeroUUID+`'::uuid) = COALESCE(NULLIF($2, '')::uuid, '`+zeroUUID+`'::uuid)
 		  AND state NOT IN ('pending', 'running')
+		-- PruneRuns keeps this exact row; change the order there too.
 		ORDER BY finished_at DESC NULLS LAST, created_at DESC
 		LIMIT 1`, jobID, hostID))
 	if errors.Is(err, pgx.ErrNoRows) {
