@@ -100,6 +100,9 @@ that Compose project's bridge subnet. Empty is safe: forwarded addresses are ign
 Point node agents on the same machine or trusted network at the control plane
 directly (`/agent/ws` over HTTP), not through the proxy.
 
+When your proxy already compresses responses, set `QUASAR_COMPRESSION=false`
+on the control plane and let the proxy do it.
+
 ## Checking it worked
 
 1. Open the console at the proxy address and run Admin's access check.

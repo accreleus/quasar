@@ -52,10 +52,10 @@ func TestEnsureLocalIsInsertedOnceAndNeverRevived(t *testing.T) {
 		t.Fatalf("local row = %+v, want single-use, unexpiring, unminted, bound", e)
 	}
 
-	if err := Redeem(ctx, pool, localToken, "some-other-host"); !errors.Is(err, ErrInvalidToken) {
+	if _, err := Redeem(ctx, pool, localToken, "some-other-host"); !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("redeem by another node: %v, want ErrInvalidToken", err)
 	}
-	if err := Redeem(ctx, pool, localToken, "living-room-pc"); err != nil {
+	if _, err := Redeem(ctx, pool, localToken, "living-room-pc"); err != nil {
 		t.Fatalf("redeem by the bound node: %v", err)
 	}
 
@@ -67,7 +67,7 @@ func TestEnsureLocalIsInsertedOnceAndNeverRevived(t *testing.T) {
 	if len(rows) != 1 || rows[0].UsedCount != 1 {
 		t.Fatalf("after restart: %+v, want the one row with used_count 1", rows)
 	}
-	if err := Redeem(ctx, pool, localToken, "living-room-pc"); !errors.Is(err, ErrInvalidToken) {
+	if _, err := Redeem(ctx, pool, localToken, "living-room-pc"); !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("second redeem: %v, want the spent token refused", err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 )
@@ -20,12 +21,36 @@ type swapper struct {
 
 	mu           sync.Mutex
 	pendingSwaps map[string]string
-	pendingHome  map[string]bool
+	// swapSince is when this process last began writing each session's durable
+	// `swapping` guard; see unresolved. Kept until the session ends (forget): a
+	// rejected or rolled-back swap clears its pending entry before the row leaves
+	// `swapping`, and must not read as unresolved in between.
+	swapSince map[string]time.Time
 }
 
 func newSwapper(store *Store, dispatcher Dispatcher, log *slog.Logger, resolveHome func(context.Context, LaunchApp, string, string) ([]byte, error)) *swapper {
 	return &swapper{store: store, dispatcher: dispatcher, log: log, resolveHome: resolveHome,
-		pendingSwaps: make(map[string]string), pendingHome: make(map[string]bool)}
+		pendingSwaps: make(map[string]string), swapSince: make(map[string]time.Time)}
+}
+
+// noteSwapStart must run before the durable `swapping` guard is written, or a
+// sweep between the two reads a healthy swap as unresolved.
+func (s *swapper) noteSwapStart(sessionID string) {
+	s.mu.Lock()
+	s.swapSince[sessionID] = time.Now()
+	s.mu.Unlock()
+}
+
+// unresolved reports whether a row still in the durable `swapping` guard has no
+// swap this process can finish: none on record (a restart lost pendingSwaps, so
+// the agent's "swap complete" can no longer commit app_id) or one older than
+// swapUnresolvedAfter (its commit failed or its callback never came). The row's
+// app_id is then not known to be what the agent runs.
+func (s *swapper) unresolved(sessionID string) bool {
+	s.mu.Lock()
+	since, ok := s.swapSince[sessionID]
+	s.mu.Unlock()
+	return !ok || time.Since(since) > swapUnresolvedAfter
 }
 
 // Swap validates that a running session is swappable and the new app fits its
@@ -60,11 +85,9 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	// of a different app into a live session, so ungated it defeats the launch
 	// check in two requests. Against the session's OWNER, with no role bypass.
 	//
-	// Accepted residual: a plain read with no FOR SHARE and no enclosing
-	// transaction, so a revoke committing before the dispatch is not serialized
-	// against. Every step to dispatchSwap is a separate statement and a revoke
-	// does not terminate a running session either. Closing it means making the
-	// whole swap transactional; do not fix it here in isolation.
+	// A plain read with no FOR SHARE and no enclosing transaction, so a revoke
+	// committing before the dispatch is not serialized against. A swap that
+	// loses that race completes and RunEntitlementSweep stops it.
 	entitled, err := s.store.IsEntitled(ctx, sess.UserID, app.ID)
 	if err != nil {
 		return Session{}, err
@@ -109,6 +132,7 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 		if conflictID != "" {
 			return Session{}, &HomeInUseError{SessionID: conflictID}
 		}
+		s.noteSwapStart(sessionID)
 		hold, err := s.store.GuardHomeForSwapWithHold(ctx, sessionID, sess.UserID, app,
 			*sess.HostID, epoch != nil && epoch.SupportsHomeCleanup())
 		if err != nil {
@@ -133,13 +157,13 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 
 	// Mark swapping + remember the target; app_id stays the OLD app until commit.
 	if !app.ManagedHome {
+		s.noteSwapStart(sessionID)
 		if err := s.store.GuardPlacementForSwap(ctx, sessionID, homeAppID(app), *sess.HostID); err != nil {
 			return Session{}, err
 		}
 	}
 	s.mu.Lock()
 	s.pendingSwaps[sessionID] = newAppID
-	s.pendingHome[sessionID] = app.ManagedHome
 	s.mu.Unlock()
 
 	go s.dispatchSwap(*sess.HostID, sessionID, dispatchSpec, app.ManagedHome,
@@ -150,9 +174,13 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 }
 
 // dispatchSwap sends session_swap_app and waits for the ack. An explicit agent
-// rejection clears the pending target. A managed-home transport error leaves
-// the guard in place: the agent may have accepted a command whose ack was lost.
-// On accept, progress arrives via AgentState.
+// rejection clears the pending target, and so does a frame proven never to have
+// left the control plane. Any other transport error leaves the pending target
+// and the `swapping` marker in place, for a managed and an unmanaged target
+// alike: the agent may have accepted a command whose ack was lost, and its
+// "swap complete" must still be able to commit app_id. A swap it never ran is
+// ended by the sweep (swapUnresolvedAfter). On accept, progress arrives via
+// AgentState.
 func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, managedHome bool,
 	userID, canonicalAppID string, epoch agentws.HomeCommandEpoch, hold *HomeHoldDecision) {
 	app := runtimeSpec
@@ -160,14 +188,29 @@ func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, man
 		app = []byte("{}")
 	}
 	cmd := agentws.SessionSwapAppCmd{Type: "session_swap_app", ID: newCmdID(), SessionID: sessionID, App: app}
+	// Only an epoch reports whether the frame was queued. Swap takes one for a
+	// managed home; an unmanaged target gets its own here. provable stays false
+	// for a dispatcher with no epochs, where no error proves non-delivery.
+	provable := epoch != nil
+	if epoch == nil {
+		if provider, ok := s.dispatcher.(interface {
+			CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool)
+		}); ok {
+			provable = true
+			epoch, _ = provider.CurrentHomeCommandEpoch(hostID)
+		}
+	}
 	var res agentws.AckResult
 	var err error
 	var queued bool
 	for attempt := 0; attempt < 3; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), swapAckTimeout)
-		if epoch != nil {
+		switch {
+		case epoch != nil:
 			res, queued, err = epoch.SendWithAck(ctx, cmd.ID, cmd)
-		} else {
+		case provable:
+			err = agentws.ErrAgentNotConnected // no connection to hand the frame to
+		default:
 			res, err = s.dispatcher.SendWithAck(ctx, hostID, cmd.ID, cmd)
 			queued = err == nil
 		}
@@ -199,10 +242,11 @@ func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, man
 			reason = res.Error
 		}
 		s.log.Warn("swap rejected/undeliverable", "session_id", sessionID, "reason", reason)
-		if err != nil && managedHome && (epoch == nil || queued) {
+		if err != nil && (!provable || queued) {
 			// A timeout/lost ack does not prove that the agent never accepted
-			// the swap. Retain the hold after queue handoff or when a legacy
-			// dispatcher cannot prove the frame stayed out of its queue.
+			// the swap. Retain the pending target, the marker and any home hold
+			// after queue handoff, or when a legacy dispatcher cannot prove the
+			// frame stayed out of its queue.
 			return
 		}
 		if err == nil && !res.OK || err != nil && !queued {
@@ -228,14 +272,13 @@ func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, man
 func (s *swapper) forget(sessionID string) {
 	s.mu.Lock()
 	delete(s.pendingSwaps, sessionID)
-	delete(s.pendingHome, sessionID)
+	delete(s.swapSince, sessionID)
 	s.mu.Unlock()
 }
 
 func (s *swapper) clearPendingSwap(sessionID string) {
 	s.mu.Lock()
 	delete(s.pendingSwaps, sessionID)
-	delete(s.pendingHome, sessionID)
 	s.mu.Unlock()
 }
 
@@ -247,7 +290,6 @@ func (s *swapper) clearPendingSwap(sessionID string) {
 func (s *swapper) handleSwapCallback(ctx context.Context, m agentws.SessionStateMsg) bool {
 	s.mu.Lock()
 	newAppID, pending := s.pendingSwaps[m.SessionID]
-	managedHome := s.pendingHome[m.SessionID]
 	s.mu.Unlock()
 	if !pending {
 		return false
@@ -277,10 +319,11 @@ func (s *swapper) handleSwapCallback(ctx context.Context, m agentws.SessionState
 			s.log.Info("swap committed", "session_id", m.SessionID, "app_id", newAppID)
 		}
 	default:
-		// Any other running detail while pending: record it, never touch app_id.
-		if !managedHome {
-			_ = s.store.SetStateDetail(ctx, m.SessionID, m.Detail)
-		}
+		// Any other running detail while pending (app booting, app presented) is
+		// consumed and not recorded. The durable `swapping` marker must outlive it
+		// and clear only on a commit or a rollback: while it is set app_id names
+		// the old app, and the entitlement sweep, the home GC and Store.transition
+		// all read it to know that.
 	}
 	return true
 }

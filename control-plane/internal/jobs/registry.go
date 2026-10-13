@@ -77,6 +77,9 @@ func (r *Registry) Register(d Definition) error {
 	default:
 		return fmt.Errorf("jobs: %s has invalid schedule kind %q", d.ID, d.Default.Kind)
 	}
+	if d.IntervalSource != nil && (d.IntervalOwner == "" || d.IntervalOwnerHint == "") {
+		return fmt.Errorf("jobs: %s has an interval source and must name its IntervalOwner and IntervalOwnerHint", d.ID)
+	}
 	if (d.Default.WindowStart == nil) != (d.Default.WindowEnd == nil) {
 		return fmt.Errorf("jobs: %s must set both window bounds or neither", d.ID)
 	}

@@ -220,9 +220,13 @@ func (s *Store) Revoke(ctx context.Context, userID, deviceID string) ([]string, 
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
 
+	// FOR UPDATE: a concurrent sessions insert for this device (FK check) waits on this
+	// row and fails once it is deleted, so no launch commits between the session
+	// collection below and the DELETE and escapes the stop.
 	var exists bool
 	err = tx.QueryRow(ctx, `
 		SELECT true FROM user_devices WHERE id = $1::uuid AND user_id = $2::uuid
+		FOR UPDATE
 	`, deviceID, userID).Scan(&exists)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrForbidden

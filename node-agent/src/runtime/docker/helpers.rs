@@ -394,10 +394,15 @@ fn valid_gpu_probe(run: &GpuProbeRun, name: &str) -> bool {
         && valid_execution(&run.entrypoint, &run.command)
         && run.devices.len() <= 64
         && run.devices.iter().all(|device| valid_dri_device(device))
+        && run.mknod_only_cards.len() <= 64
+        && crate::runtime::application::mknod_only_cards_ok(&run.mknod_only_cards, &run.devices)
         // Sorted and distinct, so one set of groups has one fingerprint.
         && run.groups.first().is_none_or(|first| *first != 0)
         && run.groups.windows(2).all(|pair| pair[0] < pair[1])
-        && (!run.devices.is_empty() || run.nvidia.is_some() || run.nvidia_device_request)
+        && (!run.devices.is_empty()
+            || !run.mknod_only_cards.is_empty()
+            || run.nvidia.is_some()
+            || run.nvidia_device_request)
         && run.nvidia.as_ref().is_none_or(valid_driver_access)
         // A driver volume is only ever given together with the device request, as a
         // session's application container is given them.
@@ -415,39 +420,9 @@ fn valid_audio(run: &AudioRun, name: &str) -> bool {
         && suffix.is_some_and(|id| {
             run.socket_dir.file_name().and_then(|v| v.to_str()) == Some(&format!("pulse-{id}"))
         })
-        && run.entrypoint == ["pulseaudio"]
-        && [
-            "--daemonize=no",
-            "--system=no",
-            "--disable-shm=true",
-            "--exit-idle-time=-1",
-            "--log-target=stderr",
-            "-n",
-        ]
-        .iter()
-        .all(|required| run.command.iter().any(|v| v == required))
-        && run.command.iter().any(|v| {
-            v == &format!(
-                "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
-                run.socket_dir.display()
-            )
-        })
-        && run
-            .command
-            .iter()
-            .any(|v| v.contains("module-null-sink sink_name=quasar_output"))
-        && run
-            .command
-            .iter()
-            .any(|v| v.contains("module-null-sink sink_name=quasar_mic"))
-        && run.command.iter().any(|v| {
-            v.contains("module-remap-source master=quasar_mic.monitor source_name=quasar_mic_src")
-        })
-        && run
-            .command
-            .iter()
-            .all(|v| !v.is_empty() && !v.contains('\0'))
-        && run.command.iter().map(String::len).sum::<usize>() <= 8 * 1024
+        // The device topology, socket and auth are baked into the image's config.
+        && run.entrypoint == ["pipewire"]
+        && run.command == ["-c", "/etc/pipewire/quasar-session.conf"]
 }
 fn fingerprint(
     helper: &DiagnosticHelper,
@@ -563,6 +538,15 @@ fn intent_device_request(intent: &HelperIntent) -> bool {
             .gpu_probe
             .as_ref()
             .is_some_and(|probe| probe.nvidia_device_request)
+}
+
+/// A probe's devices as it is created and read back.
+fn probe_devices(intent: &HelperIntent, probe: &GpuProbeRun) -> Vec<DeviceMapping> {
+    super::dialect::device_mappings(
+        &probe.devices,
+        &probe.mknod_only_cards,
+        intent.cards_openable,
+    )
 }
 
 fn nvidia_mount(access: &NvidiaDriverAccess) -> Mount {
@@ -768,7 +752,7 @@ fn inspect_owned(
     if let Some(run) = probe {
         if !dialect.devices_ok(
             host.devices.as_deref().unwrap_or(&[]),
-            &run.devices,
+            &probe_devices(intent, run),
             run.nvidia_device_request,
         ) {
             return Err(ErrorKind::Protocol.into());
@@ -1118,6 +1102,7 @@ async fn create_or_adopt_inner(
         nvidia_gpu: None,
         gpu_probe,
         gpu_injection: None,
+        cards_openable: false,
         profile: if is_audio {
             HelperProfile::Audio
         } else if is_gpu_probe {
@@ -1157,6 +1142,18 @@ async fn create_or_adopt_inner(
                 return Err(ErrorKind::InvalidConfiguration.into());
             }
         }
+    }
+    // The probe's cards are created as the application's would be on this engine.
+    if intent
+        .gpu_probe
+        .as_ref()
+        .is_some_and(|probe| !probe.mknod_only_cards.is_empty())
+    {
+        let (rootless, _) = docker.confinement().await?;
+        intent.cards_openable = matches!(
+            super::dialect::card_grant(rootless, intent.gpu_injection),
+            super::dialect::CardGrant::Openable(_)
+        );
     }
     // Podman: pin the image by ID before anything is journalled, and create from that
     // ID, so read-back never depends on where a mutable tag points later.
@@ -1220,17 +1217,10 @@ async fn create_or_adopt_inner(
         crate::runtime::DiagnosticDevices::None => Vec::new(),
     };
     // Same path inside and out: a probe reads the node it was told to read.
-    let devices = intent.gpu_probe.as_ref().map_or(devices, |probe| {
-        probe
-            .devices
-            .iter()
-            .map(|path| DeviceMapping {
-                path_on_host: Some(path.clone()),
-                path_in_container: Some(path.clone()),
-                cgroup_permissions: Some("rwm".into()),
-            })
-            .collect()
-    });
+    let devices = intent
+        .gpu_probe
+        .as_ref()
+        .map_or(devices, |probe| probe_devices(&intent, probe));
     let group_add = intent
         .gpu_probe
         .as_ref()
@@ -1277,7 +1267,11 @@ async fn create_or_adopt_inner(
             intent.audio.as_ref().map(|r| {
                 vec![
                     format!("HOME={}", r.socket_dir.display()),
+                    // The socket binds relative to it (deploy/audio/quasar-session-pulse.conf).
                     format!("PULSE_RUNTIME_PATH={}/.runtime", r.socket_dir.display()),
+                    // PipeWire's own socket, private to the sidecar. Not re-checked on
+                    // inspect: sidecars from before #392 carry the image's value.
+                    "XDG_RUNTIME_DIR=/tmp".into(),
                 ]
             })
         }),

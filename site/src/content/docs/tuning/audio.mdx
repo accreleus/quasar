@@ -5,7 +5,7 @@ description: How audio reaches you, how to enable microphone capture, and the se
 
 ## Game audio
 
-Audio comes from the session's PulseAudio sidecar, encoded as Opus, on its own
+Audio comes from the session's audio sidecar (PipeWire, serving a PulseAudio socket), encoded as Opus, on its own
 peer connection separate from video. A struggling video stream doesn't drag audio
 down. Nothing to configure.
 
@@ -22,8 +22,8 @@ QUASAR_AUDIO_REQUIRED=1
 Use this when sound is required. **Admin ▸ Sessions**, session detail, shows
 whether audio degraded and why.
 
-The PulseAudio sidecar must come from the same image family as the agent. A
-mismatched image can lack PulseAudio and the session runs silent.
+The audio sidecar must come from the same image family as the agent. A
+mismatched image can lack PipeWire and the session runs silent.
 
 ## Microphone capture
 

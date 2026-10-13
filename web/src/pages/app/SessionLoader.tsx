@@ -13,7 +13,7 @@ import "./SessionLoader.css";
 import { Button } from "../../components/Button";
 import { QuasarMark } from "../../components/QuasarMark";
 import { CollapsibleLogTail } from "../../components/SessionFailureDetail";
-import type { LaunchFailure } from "./sessionFailure";
+import { isBannerVerdict, type LaunchFailure } from "./sessionFailure";
 import { AccretionVisual } from "./AccretionVisual";
 import { GlyphRail } from "./GlyphRail";
 import { derivePhase, stallPhaseForStep } from "./loaderPhases";
@@ -29,7 +29,7 @@ export { PHASE_STALL_COPY, PHASE_STALL_MS, TRANSPORT_STALL_MS } from "./launchSt
 export type { LaunchPhase, TransportState } from "./launchStall";
 
 /** §D: `is-locking` (status drop, quasar collapse, aperture) before the fade. */
-const LOCK_TO_STREAM_MS = 1180;
+export const LOCK_TO_STREAM_MS = 1180;
 /** The word leaves, the text is replaced, the word comes back. */
 const STAGE_SWAP_MS = 110;
 
@@ -231,6 +231,7 @@ export function SessionLoader({
     scene === "locking" ? "is-locking" : "",
     scene === "streaming" ? "is-streaming" : "",
     terminal ? "is-failed" : "",
+    failure && isBannerVerdict(failure) ? "is-over" : "",
     stalled ? "is-stalled" : "",
   ]
     .filter(Boolean)

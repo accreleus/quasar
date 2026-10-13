@@ -25,6 +25,7 @@ pub use helpers::{
 };
 pub(crate) use helpers::{HelperIntent, HelperJournal, NvidiaGpuRun};
 mod images;
+pub(crate) use docker::dialect::{card_grant, CardGrant};
 pub use docker::ExactRemoval;
 pub use images::{ImageInfo, ImageOperation, ImageProgress};
 pub use quasar_runtime::{
@@ -450,7 +451,7 @@ impl RuntimeClient {
         )
     }
 
-    /// Start a fixed-profile PulseAudio sibling.  The returned identity is
+    /// Start a fixed-profile audio (PipeWire) sibling.  The returned identity is
     /// available while the daemon runs; observing it never terminates it.
     pub fn run_audio_sidecar(
         &self,

@@ -21,8 +21,8 @@
 > The **GStreamer** patches here (`vkh264enc-*`, `vulkanh265enc`, `gstreamer-vulkan-global-submit-lock`)
 > ARE still applied at build time. Only the `gst-wayland-display-*` ones moved into the branch.
 
-These patches split across **two upstreams**: ten apply to a from-source **GStreamer**
-`1.28.4` checkout (`gst-plugins-bad`), while the patches named `gst-wayland-display-*` apply to the
+These patches split across **two upstreams**: thirteen apply to a from-source **GStreamer**
+`1.28.8` checkout (`gst-plugins-bad`), while the patches named `gst-wayland-display-*` apply to the
 **gst-wayland-display** compositor checkout itself (see their dedicated sections below). Both sets
 are applied inside `deploy/Dockerfile.vulkan`, each at its own upstream's build step.
 
@@ -43,40 +43,42 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 - `vkh264enc-num-slices.patch`
 - `gstreamer-vulkan-global-submit-lock.patch`
 - `vkh264enc-intra-refresh.patch`
-- `gstreamer-vulkan-rc-retarget-no-reset.patch`
 - `vulkanav1enc.patch`
 - `vulkan-enc-output-state-on-resize.patch`
 - `vkenc-bitstream-buffer-pool.patch`
 - `vulkanh265enc-radv-coded-height.patch`
 - `vulkanav1enc-exact-frame-size.patch`
 - `vulkanav1enc-min-qindex.patch`
+- `gstreamer-webrtc-stats-rtpsession-leak.patch` (not a Vulkan patch: `webrtcbin`, #564)
 - `vkh265enc-profile-template.patch` (**candidate — not applied**, see below)
 
-They are applied — **in this order** — to a from-source GStreamer `1.28.4`
+They are applied — **in this order** — to a from-source GStreamer `1.28.8`
 checkout (see `deploy/Dockerfile.vulkan`); the rc-fix patch touches the same
 `new_sequence` region as the DPB patch, so it must apply **after** it, and the
 num-slices patch touches `new_sequence`, `_setup_slice`, `_setup_codec_pic`, and
 the property table on top of the rc-fix state, so it applies **fourth**. The global-submit-lock
 diagnostic applies **fifth**, and the intra-refresh patch applies **sixth**: it was diffed against the tree with all five earlier patches applied (it shares
 `new_sequence`, `_setup_codec_pic`, the frame struct, and the property table with num-slices, and
-`gstvkdevice.c` with the submit-lock diagnostic), so it applies **sixth**. The
-rc-retarget-no-reset library fix applies **seventh** (it edits
-`gst_vulkan_encoder_request_rc_reset`, introduced by the rc-fix patch), and
-`vulkanav1enc.patch` applies **eighth**: it was diffed against the tree with all seven
-earlier patches applied and shares `ext/vulkan/meson.build` + `gstvulkan.c` registration context
-with `vulkanh265enc.patch`. `vulkan-enc-output-state-on-resize.patch` applies **ninth (last)**: it
+`gstvkdevice.c` with the submit-lock diagnostic), so it applies **sixth**.
+`vulkanav1enc.patch` applies **seventh**: it shares `ext/vulkan/meson.build` + `gstvulkan.c`
+registration context with `vulkanh265enc.patch`. (It was diffed with the six patches above and
+`gstreamer-vulkan-rc-retarget-no-reset.patch` applied. That patch, once seventh, was removed at
+the 1.28.8 bump, see its note below; every patch after it applies the same without it.)
+`vulkan-enc-output-state-on-resize.patch` applies **eighth**: it
 edits the `new_sequence()` of `vkh264enc.c` and `vkh265enc.c`, which the dpb-pool, rc-fix,
 num-slices and intra-refresh patches (h264) and `vulkanh265enc.patch` (h265) all shape first, and
-its rationale references the AV1 element the eighth patch introduces.
-`vkenc-bitstream-buffer-pool.patch` applies **tenth (last)**: it was diffed against
-`gst-libs/gst/vulkan/gstvkencoder-private.c` with all nine predecessors applied, and that file is
-shaped by the rc-fix, intra-refresh, rc-retarget and output-state-on-resize patches before it.
-`vulkanh265enc-radv-coded-height.patch` applies **eleventh**: it edits the coded-size
+its rationale references the AV1 element the seventh patch introduces.
+`vkenc-bitstream-buffer-pool.patch` applies **ninth**: it was diffed against
+`gst-libs/gst/vulkan/gstvkencoder-private.c` with its predecessors applied, and that file is
+shaped by the rc-fix, intra-refresh and output-state-on-resize patches before it.
+`vulkanh265enc-radv-coded-height.patch` applies **tenth**: it edits the coded-size
 block of `new_sequence()` in `vkh265enc.c` that `vulkanh265enc.patch` and
 `vulkan-enc-output-state-on-resize.patch` shape first.
-`vulkanav1enc-exact-frame-size.patch` (twelfth) and `vulkanav1enc-min-qindex.patch` (thirteenth,
-last) both edit `vkav1enc.c`, which `vulkanav1enc.patch` creates; the second was diffed on top of
+`vulkanav1enc-exact-frame-size.patch` (eleventh) and `vulkanav1enc-min-qindex.patch` (twelfth)
+both edit `vkav1enc.c`, which `vulkanav1enc.patch` creates; the second was diffed on top of
 the first.
+`gstreamer-webrtc-stats-rtpsession-leak.patch` applies **thirteenth (last)**. It touches only
+`ext/webrtc/gstwebrtcstats.c`, which no other patch here does, so its place in the order is free.
 None of the thirteen are upstreamed into GStreamer itself yet.
 
 `vkh265enc-profile-template.patch` is a **candidate that is NOT wired into
@@ -89,7 +91,7 @@ touches, so its position is a convention rather than a constraint. See its secti
 
 The gst-wayland-display patches (whose names begin `gst-wayland-display-`) are applied to a *different*
 checkout (gst-wayland-display, not GStreamer) at a *different* Dockerfile step, so it has no
-ordering relationship to the five above.
+ordering relationship to the patches above.
 
 ## What each does
 
@@ -449,19 +451,28 @@ A1` entry in `docs/reports/VULKAN-WORKLOG.md`.
 **Upstream status:** unreported as of 2026-07-20; same filing batch as the rc-fix/num-slices patches.
 The `intra-refresh` property naming mirrors `vah264enc`/`nvh264enc`, so it is directly upstreamable.
 
-### `gstreamer-vulkan-rc-retarget-no-reset.patch`
+### `gstreamer-vulkan-rc-retarget-no-reset.patch` (removed 2026-10-12, at the GStreamer 1.28.8 bump)
 
-**Library fix, codec-neutral (vulkanh264enc / vulkanh265enc / vulkanav1enc).** Two fixes to
-`gst-libs/gst/vulkan/gstvkencoder-private.c`: (A) `gst_vulkan_encoder_request_rc_reset()` raises
-only `VK_VIDEO_CODING_CONTROL_ENCODE_RATE_CONTROL_BIT_KHR` — previously it ORed in
-`RESET_BIT_KHR` unconditionally, resetting the video session, invalidating the DPB, and forcing an
-IDR on every live bitrate retarget (an ABR loop retargeting ~1/s would keyframe ~1/s). Genuine
-session (re)starts keep `RESET_BIT` (`gst_vulkan_encoder_start` / `set_rc_mode` set
-`session_reset` directly). (B) `gst_vulkan_encoder_picture_clear` released DPB slots with
-`slotIndex > 0`, so slot 0 — typically the first frame of a session — leaked for the session's
-lifetime; `>= 0` (the unset sentinel is `-1`). Depends on `vkh264enc-rc-fix.patch` (which
-introduces `request_rc_reset`). Applies seventh. See the `vulkanav1enc-campaign` record for the
-overlap analysis.
+**No longer in the tree or the build.** It was the seventh patch and had two halves, both in
+`gst-libs/gst/vulkan/gstvkencoder-private.c`:
+
+- `gst_vulkan_encoder_picture_clear` released DPB slots with `slotIndex > 0`, so slot 0 was never
+  released; the patch made the guard `>= 0`. That is upstream commit `52008dc` ("vulkan: encoder:
+  release DPB slot 0 when clearing a picture") in 1.28.8, which also sets
+  `dpb_slot.slotIndex = -1` in `gst_vulkan_encoder_picture_init`. It was the only code the patch
+  ever changed.
+- `gst_vulkan_encoder_request_rc_reset()` was meant to set `rc_update` instead of `session_reset`
+  (no `RESET_BIT`, so no key frame on a retarget). That line never reached a build: the hunk
+  header declared fewer lines than the hunk had, `git apply` stopped at the declared count, and
+  only the doc comment above the function was applied. Nothing calls `request_rc_reset` either:
+  all three encoder elements call `gst_vulkan_encoder_request_rc_update()` from
+  `vkh264enc-rc-fix.patch`, which is the reset-free retarget.
+
+Checked before removal: the patch as it stood does not apply to 1.28.8 at all (its first hunk
+collides with upstream's `52008dc`). With its second hunk alone, the fully patched 1.28.8 tree
+differs from the tree without it in that doc comment and nothing else; on 1.28.4, where the whole
+patch applied, the difference was the comment and the one `picture_clear` line. Every later patch
+applies without it. Do not bring it back at a later re-pin.
 
 ### `vulkanav1enc.patch`
 
@@ -473,15 +484,15 @@ assembly, colorimetry on output caps, CDEF/loop-filter/tile quality tuning, 200 
 registration in `meson.build`/`gstvulkan.c` (rank NONE, like vulkanh265enc), and an
 `av1_encode_caps()` addition to `ext/vulkan/gstvkvideocaps.c` (stock 1.28.4 returns
 `FALSE /* unimplemented */` for ENCODE_AV1, vetoing registration on every device). Applies
-eighth of nine (`vulkan-enc-output-state-on-resize.patch` is now the last). Gated in Quasar by `QUASAR_VULKAN_AV1`, which is ON by default since
+seventh. Gated in Quasar by `QUASAR_VULKAN_AV1`, which is ON by default since
 2026-08-22 (setting it to 0, or building an image without this patch, takes the NVENC fallback
 instead). Validated 2026-08-21 on RTX 5090 / driver 610.57.04: 120/120 + 600/600 frames
 decoded by `vulkanav1dec`, CBR 8 Mbps → 9.55 Mbps over 600 frames, upstream
 `libs_vkvideoencodeav1` conformance green, Khronos validation layer clean.
 
 **Upstream status:** GStreamer submissions are restricted (no MR path for us); the offer target is
-games-on-whales/gst-wayland-display `patches/`, bundled with its prerequisites
-(`vkh264enc-rc-fix.patch`, `gstreamer-vulkan-rc-retarget-no-reset.patch`) — posting gated on
+games-on-whales/gst-wayland-display `patches/`, bundled with its prerequisite
+(`vkh264enc-rc-fix.patch`) — posting gated on
 operator sign-off. Regenerate against every GStreamer re-pin (same standing cost as
 `vulkanh265enc.patch`).
 
@@ -489,7 +500,7 @@ operator sign-off. Regenerate against every GStreamer re-pin (same standing cost
 
 **Mandatory for any live external-resolution change on the Vulkan encode path** (#501, the
 `vulkanscale` lever). Three files: `ext/vulkan/vkh264enc.c`, `ext/vulkan/vkh265enc.c`, and one
-defensive line in `gst-libs/gst/vulkan/gstvkencoder-private.c`. Applies **ninth (last)**.
+defensive line in `gst-libs/gst/vulkan/gstvkencoder-private.c`. Applies **eighth**.
 
 Both elements early-returned from `new_sequence()` whenever the video **profile** was unchanged,
 which a pure resolution change always is. That early return skipped every size-derived step, and
@@ -577,7 +588,7 @@ Quasar-specific behaviour); same offer bundle as `vulkanav1enc.patch`, gated on 
 ### `vkenc-bitstream-buffer-pool.patch`
 
 **Quasar-authored, 2026-08-23, issue [#507](https://github.com/accreleus/quasar/issues/507).
-Applies tenth (last).** Recycles the Vulkan bitstream output buffer instead of allocating a new
+Applies ninth.** Recycles the Vulkan bitstream output buffer instead of allocating a new
 one for every frame. Codec-agnostic: it lives in the shared encoder library
 (`gst-libs/gst/vulkan/gstvkencoder-private.c`) and therefore benefits `vulkanh264enc`,
 `vulkanh265enc` and `vulkanav1enc` alike.
@@ -1327,7 +1338,7 @@ The DPB patch (vendored verbatim):
 | Source repo | `games-on-whales/gst-wayland-display` |
 | Source PR | [#37](https://github.com/games-on-whales/gst-wayland-display/pull/37) `feat/vulkan-encode` |
 | Vendored at commit | `43d4c25` |
-| Applied against | GStreamer `1.28.4` (`gst-plugins-bad`) |
+| Applied against | GStreamer `1.28.8` (`gst-plugins-bad`) |
 
 If the pin moves, re-fetch `vkh264enc-dpb-pool-in-new-sequence.patch` from the
 new commit's `patches/` directory verbatim (do not hand-edit) and update this
@@ -1377,7 +1388,7 @@ The intra-refresh patch (Quasar-authored):
 | Field | Value |
 |---|---|
 | Origin | Quasar (this repo) — not vendored |
-| Authored against | GStreamer `1.28.4` (`gst-plugins-bad`), on top of DPB + h265 + rc-fix + num-slices + global-submit-lock (applies **sixth** of nine) |
+| Authored against | GStreamer `1.28.4` (`gst-plugins-bad`), on top of DPB + h265 + rc-fix + num-slices + global-submit-lock (applies **sixth**) |
 | Requires | Vulkan headers ≥ 1.4.321 (image ships 1.4.341) and a driver exposing `VK_KHR_video_encode_intra_refresh` (RADV Mesa ≥ 25.3, current NVIDIA) |
 | Upstream status | unreported as of 2026-07-20; issue to be filed with the rc-fix/num-slices batch |
 
@@ -1469,3 +1480,29 @@ floors the rate controller's minimum Q index at 2 whenever rate control is activ
 `useMinQIndex`, which needs the driver's per-group Q index capability). Index 2 is visually identical
 to 1, and every key frame at index 2 or above decoded. A constant-QP request is left alone.
 
+
+
+### `gstreamer-webrtc-stats-rtpsession-leak.patch`
+
+Quasar-authored (#564). `_get_data_channel_transport_stats()` in
+`gst-plugins-bad/ext/webrtc/gstwebrtcstats.c` emitted rtpbin's `get-session`, which returns a new
+reference to the `GstRtpSession` element, and neither used nor dropped it. Every `get-stats` on a
+`webrtcbin` with a data channel leaked one reference, so the element outlived its `webrtcbin`.
+
+A `GstElement` keeps every `GstContext` it was given until it is disposed, and a bin hands its
+contexts to each child. The leaked element therefore kept the encode pipeline's
+`gst.vulkan.device` and `gst.vulkan.instance`: one `GstVulkanDevice` stayed alive for every session
+a peer connected to, until the agent restarted. The agent asks for stats each time ICE settles
+(`record_media_evidence` in `node-agent/src/session/pipeline/webrtc.rs`) and every 5 s under
+`QUASAR_FEC_MODE=auto`. Each replaced transport (#535) leaked its own element; they all held the
+same device, so the cost was per session.
+
+The patch deletes the unused emit. Nothing read its result.
+
+Measured without it on the AMD lab host with the leaks tracer: after four streamed sessions, four
+`GstRtpSession` (2 refs each: ICE `Connected` and `Completed`) and four `GstVulkanDevice` /
+`GstVulkanInstance` still alive, nothing else per session. Regression test:
+`session::pipeline::takeover_tests::a_streamed_session_gives_back_the_encode_pipelines_contexts`
+(needs libnice and interpipe, so it runs in `quasar-agent-dev`).
+
+The fix is absent upstream: checked through 1.28.8, 1.29.2 and `main` on 2026-10-12 (the emit came in with upstream MR 8698), so a bump to 1.28.8 does not remove the need for this patch. Re-check at every GStreamer bump and drop the patch once a release drops the reference.

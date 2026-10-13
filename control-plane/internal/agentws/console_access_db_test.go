@@ -96,7 +96,7 @@ func TestProcessCapacityWithoutConsoleCapabilitiesClearsAccessOnly(t *testing.T)
 
 	withAccess := capacityRaw(t, CapacityMsg{
 		ConsoleCapabilities: &console.Capabilities{
-			Connectors: []string{"DP-1"}, AudioSinks: []console.AudioSink{}, InputDevices: []console.InputDevicePath{},
+			Connectors: []string{"DP-1"}, InputDevices: []console.InputDevicePath{},
 			Access: &console.Access{State: "on", Target: abool(true), RequestID: astr("req-clear-1"), Summary: "on"},
 		},
 	})
@@ -146,7 +146,7 @@ func TestProcessCapacityRestoredResetsAuditsAndSettlesHold(t *testing.T) {
 
 	restored := capacityRaw(t, CapacityMsg{
 		ConsoleCapabilities: &console.Capabilities{
-			Connectors: []string{}, AudioSinks: []console.AudioSink{}, InputDevices: []console.InputDevicePath{},
+			Connectors: []string{}, InputDevices: []console.InputDevicePath{},
 			Access: &console.Access{State: "restored", Target: abool(true), RequestID: astr("req-flow-1"),
 				Reason: astr("unhealthy"), Summary: "restored"},
 		},

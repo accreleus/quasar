@@ -158,7 +158,7 @@ func TestEnrollmentCannotTakeOverAConnectedHost(t *testing.T) {
 	if err := st.markOffline(ctx, first.HostID); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
-	if _, err := st.enrollHost(ctx, "contested", "0.1.0", testEnrollmentToken); err != nil {
+	if _, err := st.enrollHost(ctx, "contested", "0.1.0", boundEnrollmentToken(t, pool, "contested")); err != nil {
 		t.Fatalf("re-enrolling a disconnected host: %v", err)
 	}
 }
@@ -256,8 +256,54 @@ func TestEnrollmentRefusesAHostOnlyTheDatabaseCallsLive(t *testing.T) {
 	if err := st.markOffline(ctx, res.HostID); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
-	if _, err := st.enrollHost(ctx, "other-replica", "0.1.0", testEnrollmentToken); err != nil {
+	if _, err := st.enrollHost(ctx, "other-replica", "0.1.0", boundEnrollmentToken(t, pool, "other-replica")); err != nil {
 		t.Fatalf("re-enrolling an offline row: %v", err)
+	}
+}
+
+// #487: an unbound token enrolls new node names only. Re-enrolling an existing (offline)
+// host takes a token bound to its name, or any holder of a shared token could become it.
+func TestUnboundTokenCannotBecomeAnExistingHost(t *testing.T) {
+	pool := testPool(t)
+	admin := seedAdmin(t, pool)
+	ctx := context.Background()
+	st := storeWithMintedTokens(pool, func(string) bool { return false })
+	mint := hostenroll.NewStore(pool)
+
+	victim, err := st.enrollHost(ctx, "victim", "0.1.0", testEnrollmentToken)
+	if err != nil {
+		t.Fatalf("initial enrollment: %v", err)
+	}
+	if err := st.markOffline(ctx, victim.HostID); err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
+
+	row, unbound, err := mint.Mint(ctx, hostenroll.MintParams{CreatedBy: admin, MaxUses: 5})
+	if err != nil {
+		t.Fatalf("mint unbound: %v", err)
+	}
+	if _, err := st.enrollHost(ctx, "victim", "0.1.0", unbound); !errors.Is(err, ErrHostAlreadyEnrolled) {
+		t.Fatalf("unbound token onto an existing host: got %v, want ErrHostAlreadyEnrolled", err)
+	}
+	if n := usedCount(t, pool, row.ID); n != 0 {
+		t.Fatalf("a refused takeover spent the token: used_count = %d", n)
+	}
+	if _, err := st.reconnectHost(ctx, "victim", "0.1.0", victim.NodeSecret); err != nil {
+		t.Fatalf("the host's own secret must survive a refused takeover: %v", err)
+	}
+	if err := st.markOffline(ctx, victim.HostID); err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
+
+	if _, err := st.enrollHost(ctx, "a-new-host", "0.1.0", unbound); err != nil {
+		t.Fatalf("an unbound token still enrolls a new name: %v", err)
+	}
+	_, bound, err := mint.Mint(ctx, hostenroll.MintParams{CreatedBy: admin, NodeName: "victim"})
+	if err != nil {
+		t.Fatalf("mint bound: %v", err)
+	}
+	if _, err := st.enrollHost(ctx, "victim", "0.1.0", bound); err != nil {
+		t.Fatalf("a token bound to the host re-enrolls it: %v", err)
 	}
 }
 
@@ -270,7 +316,7 @@ func TestRedemptionOutageIsNotAnAuthFailure(t *testing.T) {
 	st := &agentStore{
 		pool:             pool,
 		isAgentConnected: func(string) bool { return false },
-		redeemEnrollment: func(context.Context, hostenroll.DBTX, string, string) error { return outage },
+		redeemEnrollment: func(context.Context, hostenroll.DBTX, string, string) (bool, error) { return false, outage },
 	}
 
 	_, err := st.enrollHost(ctx, "outage-host", "0.1.0", "some-token")

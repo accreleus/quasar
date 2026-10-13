@@ -460,6 +460,8 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
             logind: false,
             console_audio: false,
             console_vt: false,
+            udev_data: None,
+            host_sound: None,
             fuse: false,
             dri: false,
             uinput: false,

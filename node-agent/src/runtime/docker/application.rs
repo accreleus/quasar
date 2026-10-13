@@ -17,7 +17,8 @@ use bollard::{
 use futures_util::StreamExt;
 
 use super::dialect::{
-    is_nvidia_request, nvidia_device_request, recorded_injection, Engine, Namespace,
+    card_grant, device_mappings, is_nvidia_request, nvidia_device_request, recorded_injection,
+    CardGrant, Engine, Namespace,
 };
 use crate::runtime::GpuInjection;
 
@@ -362,7 +363,24 @@ pub(super) struct AppIdentity {
     pub keep_id: Option<(u32, u32)>,
     pub engine_groups: Vec<u32>,
     pub group_add: Option<Vec<String>>,
+    /// `Some` when the engine cannot apply the request's device-cgroup rules: what the
+    /// container is created with instead.
+    pub device_cgroup_rules: Option<Vec<String>>,
     pub reason: &'static str,
+}
+
+/// A rootless engine applies no device-cgroup rule (#460): rootless Podman refuses to
+/// create a container that names one ("device cgroup rules are not supported in rootless
+/// mode or in a user namespace"), and no rootless runtime can install a device program.
+/// Access to a device node there is the node's own permissions, which host preparation
+/// grants the Quasar account: an input node plugged in after the container started opens
+/// through that host ACL alone. So the rules are left out rather than refused, and the
+/// read-back expects none.
+fn rootless_device_cgroup_rules(
+    rootless: bool,
+    request: &ApplicationRequest,
+) -> Option<Vec<String>> {
+    (rootless && !request.device_cgroup_rules.is_empty()).then(Vec::new)
 }
 
 pub(super) fn app_identity(
@@ -372,11 +390,13 @@ pub(super) fn app_identity(
     overflow_gid: u32,
 ) -> AppIdentity {
     use super::dialect::Dialect;
+    let device_cgroup_rules = rootless_device_cgroup_rules(rootless, request);
     match (dialect, rootless) {
         (Dialect::Podman, true) => AppIdentity {
             keep_id: Some(app_ids(&request.environment)),
             engine_groups: Vec::new(),
             group_add: None,
+            device_cgroup_rules,
             reason: "rootless Podman maps the app user onto the Quasar account (keep-id)",
         },
         // Inside a rootless Docker container gid 0 is the Quasar account's group: the only
@@ -394,6 +414,7 @@ pub(super) fn app_identity(
                     .cloned()
                     .collect(),
             ),
+            device_cgroup_rules,
             reason: "rootless Docker has no per-container mapping; the app joins the Quasar \
                      account's group (gid 0 inside)",
         },
@@ -401,6 +422,7 @@ pub(super) fn app_identity(
             keep_id: None,
             engine_groups: Vec::new(),
             group_add: None,
+            device_cgroup_rules,
             reason: "rootful engine: device nodes carry their host groups",
         },
     }
@@ -421,12 +443,52 @@ fn group_add(intent: &ApplicationIntent) -> &Vec<String> {
         .unwrap_or(&intent.request.group_add)
 }
 
+/// Why the app's card nodes open on this engine, if they do: it is given the whole
+/// `/dev/dri` (a streamed app on an NVIDIA host), or mknod-only cards the engine cannot
+/// hold, which are then created openable.
+fn cards_openable(
+    rootless: bool,
+    injection: Option<GpuInjection>,
+    request: &ApplicationRequest,
+) -> Option<&'static str> {
+    let grant = card_grant(rootless, injection);
+    if request.devices.iter().any(|d| d == "/dev/dri") {
+        return Some(match grant {
+            CardGrant::Openable(why) => why,
+            CardGrant::MknodOnly => "the app is given the whole /dev/dri",
+        });
+    }
+    match grant {
+        CardGrant::Openable(why) if !request.mknod_only_cards.is_empty() => Some(why),
+        _ => None,
+    }
+}
+
+/// The devices the container is created with and read back against.
+fn intent_devices(intent: &ApplicationIntent) -> Vec<DeviceMapping> {
+    device_mappings(
+        &intent.request.devices,
+        &intent.request.mknod_only_cards,
+        intent.cards_openable,
+    )
+}
+
+/// The device-cgroup rules the container is created with and read back against.
+fn device_cgroup_rules(intent: &ApplicationIntent) -> &Vec<String> {
+    intent
+        .device_cgroup_rules
+        .as_ref()
+        .unwrap_or(&intent.request.device_cgroup_rules)
+}
+
 /// What the legacy NVIDIA hook behind Docker's `--gpus` is asked to inject (#413): its
 /// default (`compute,utility`, what it grants a container whose environment names none)
 /// plus `display`, the one capability that adds `/dev/nvidia-modeset`. The NVIDIA Vulkan
-/// driver in the driver volume cannot start without that node; CDI injects it anyway. On
-/// a full-driver host `display` also mounts the host's own graphics libraries, the same
-/// driver version as the volume, which stays first on `LD_LIBRARY_PATH`.
+/// driver in the driver volume normally needs that node. CDI injects only what its
+/// spec lists, and a spec generated before the node existed omits it (#449: the
+/// application-GPU probe's Vulkan step catches that). On a full-driver host `display` also
+/// mounts the host's own graphics libraries, the same driver version as the volume, which
+/// stays first on `LD_LIBRARY_PATH`.
 const GPUS_DRIVER_CAPABILITIES: &str = "compute,utility,display";
 const DRIVER_CAPABILITIES_ENV: &str = "NVIDIA_DRIVER_CAPABILITIES";
 
@@ -561,16 +623,10 @@ fn body(
             pids_limit: Some(r.security.pids_limit),
             shm_size: Some(r.security.shm_size),
             group_add: Some(group_add(intent).clone()),
-            devices: Some(
-                r.devices
-                    .iter()
-                    .map(|path| DeviceMapping {
-                        path_on_host: Some(path.clone()),
-                        path_in_container: Some(path.clone()),
-                        cgroup_permissions: Some("rwm".into()),
-                    })
-                    .collect(),
-            ),
+            devices: Some(intent_devices(intent)),
+            device_cgroup_rules: Some(device_cgroup_rules(intent))
+                .filter(|rules| !rules.is_empty())
+                .cloned(),
             device_requests: match (r.nvidia_gpu, injection) {
                 (true, Some(injection)) => Some(vec![nvidia_device_request(injection)]),
                 _ => None,
@@ -901,6 +957,74 @@ fn unproven_bind_sources(
         .collect()
 }
 
+/// The bind-source check before a create (#426), as one decision. Only Podman needs it.
+/// Two sources are proven by a host fact instead of a bind the agent has, since an owned
+/// install's agent holds neither the host's `/run` nor its `/dev`: a console container's
+/// read-only `/run/udev/data`, which the recovery actor probes and reports as
+/// `QUASAR_HOST_UDEV_DATA` (`host_udev_data`), and its read-only `/dev/snd`, reported as
+/// `QUASAR_HOST_SOUND` (`host_sound`). A sound fact of `0` or none proves nothing: the
+/// agent's own view (`/host/dev/snd` on a Compose install, else `/dev/snd`) is then
+/// checked like any other source. `Err` is the refusal's text.
+fn bind_source_check(
+    dialect: super::dialect::Dialect,
+    request: &ApplicationRequest,
+    own_mounts: Option<&[quasar_runtime::Mount]>,
+    exists: impl Fn(&Path) -> bool,
+    host_udev_data: Option<&str>,
+    host_sound: Option<&str>,
+) -> Result<(), String> {
+    if dialect != super::dialect::Dialect::Podman {
+        return Ok(());
+    }
+    let udev_proven = host_udev_data.map(str::trim) == Some("1");
+    let sound_proven = host_sound.map(str::trim) == Some("1");
+    let unproven: Vec<String> = unproven_bind_sources(request, own_mounts, exists)
+        .into_iter()
+        .filter(|source| !(udev_proven && is_console_udev_bind(request, source)))
+        .filter(|source| !(sound_proven && is_console_sound_bind(request, source)))
+        .collect();
+    if unproven.is_empty() {
+        return Ok(());
+    }
+    let mut why = format!(
+        "a bind source is missing on the host (or not visible to the agent to prove it), and \
+         Podman would create it: {}",
+        unproven.join(", ")
+    );
+    if unproven.iter().any(|s| is_console_udev_bind(request, s)) {
+        why.push_str(
+            "; the host's udev data (/run/udev/data) is not known to this agent: turn console \
+             mode off and on again so the recovery actor reads it",
+        );
+    }
+    if unproven.iter().any(|s| is_console_sound_bind(request, s)) {
+        why.push_str(
+            "; the host's sound device (/dev/snd) is not known to this agent: turn console \
+             mode off and on so the recovery actor reads it",
+        );
+    }
+    Err(why)
+}
+
+/// `source` is the console plan's udev bind: `/run/udev/data` read-only at the same path.
+fn is_console_udev_bind(request: &ApplicationRequest, source: &str) -> bool {
+    use crate::session::console_plan::UDEV_DATA;
+    is_console_readonly_bind(request, source, UDEV_DATA)
+}
+
+/// `source` is the console plan's sound bind: `/dev/snd` read-only at the same path.
+fn is_console_sound_bind(request: &ApplicationRequest, source: &str) -> bool {
+    is_console_readonly_bind(request, source, "/dev/snd")
+}
+
+fn is_console_readonly_bind(request: &ApplicationRequest, source: &str, path: &str) -> bool {
+    source == path
+        && request.typed_mounts.iter().any(|m| {
+            matches!(m, ApplicationMount::Bind { source, target, read_only: true, .. }
+                if source == path && target == path)
+        })
+}
+
 /// How this process sees the engine's host, for [`unproven_bind_sources`]: `None` when it
 /// is not in a container; its own container's mounts when it is. A container the engine
 /// cannot name gives no mounts, so nothing in it counts as seen.
@@ -1107,7 +1231,7 @@ async fn inspect_owned(
     // Each check names what it guards, so a refusal says why (#397). Any one failing
     // refuses the container; nothing here ever retries with more privilege.
     let read_only_targets = read_only_bind_targets(&intent.request)?;
-    let refusals: [(bool, &str); 20] = [
+    let refusals: [(bool, &str); 21] = [
         (
             host.network_mode.as_deref() != Some(&intent.request.network),
             "network mode",
@@ -1200,10 +1324,17 @@ async fn inspect_owned(
         (
             !dialect.devices_ok(
                 host.devices.as_deref().unwrap_or(&[]),
-                &intent.request.devices,
+                &intent_devices(intent),
                 intent.request.nvidia_gpu,
             ),
             "devices",
+        ),
+        (
+            !dialect.device_cgroup_rules_ok(
+                &normalized(host.device_cgroup_rules.as_ref()),
+                device_cgroup_rules(intent),
+            ),
+            "device cgroup rules",
         ),
         (
             !dialect.mount_propagation_ok(podman.as_ref()),
@@ -1413,15 +1544,22 @@ pub(crate) async fn start(
             };
             if docker.dialect == super::dialect::Dialect::Podman {
                 let view = own_host_view(&docker).await?;
-                let unproven = unproven_bind_sources(&request, view.as_deref(), Path::exists);
-                if !unproven.is_empty() {
+                let host_udev_data =
+                    std::env::var(crate::readiness::console::HOST_UDEV_DATA_ENV).ok();
+                let host_sound = std::env::var(crate::session::console_plan::HOST_SOUND_ENV).ok();
+                if let Err(why) = bind_source_check(
+                    docker.dialect,
+                    &request,
+                    view.as_deref(),
+                    Path::exists,
+                    host_udev_data.as_deref(),
+                    host_sound.as_deref(),
+                ) {
                     // Refused before anything is journalled or created, as Docker refuses it.
                     tracing::warn!(
                         token = "application-bind-source-missing",
                         application = %request.name,
-                        sources = ?unproven,
-                        "refusing the launch: a bind source is missing on the host (or not \
-                         visible to the agent to prove it), and Podman would create it"
+                        "refusing the launch: {why}"
                     );
                     return Err(ErrorKind::Engine.into());
                 }
@@ -1442,6 +1580,25 @@ pub(crate) async fn start(
                 "app container groups decided by the engine mode: {}",
                 app.reason
             );
+            if app.device_cgroup_rules.is_some() {
+                tracing::info!(
+                    token = "app-device-cgroup-rules-omitted",
+                    application = %request.name,
+                    rules = ?request.device_cgroup_rules,
+                    "rootless engine: the device-cgroup rules are left out; device access is \
+                     the host's permissions (host preparation's ACLs)"
+                );
+            }
+            let cards_openable = cards_openable(rootless, gpu_injection, &request);
+            if let Some(why) = cards_openable {
+                tracing::info!(
+                    token = "app-card-nodes-openable",
+                    application = %request.name,
+                    cards = ?request.mknod_only_cards,
+                    "the app's card nodes open on this engine ({why}): a console desktop here \
+                     takes the display only by opening the card first"
+                );
+            }
             let keep_id = app.keep_id;
             // The catalog already runs these apps unconfined by seccomp for their own
             // sandboxes (bwrap); under SELinux the same need is the nested-sandbox type.
@@ -1475,6 +1632,8 @@ pub(crate) async fn start(
                 keep_id,
                 engine_groups: app.engine_groups,
                 group_add: app.group_add,
+                device_cgroup_rules: app.device_cgroup_rules,
+                cards_openable: cards_openable.is_some(),
                 nested_sandbox_label,
                 phase: ApplicationPhase::Creating,
                 result: None,
@@ -2310,6 +2469,8 @@ mod app_identity_tests {
             keep_id,
             engine_groups: Vec::new(),
             group_add: None,
+            device_cgroup_rules: None,
+            cards_openable: false,
             nested_sandbox_label: false,
             phase: ApplicationPhase::Creating,
             result: None,
@@ -2321,6 +2482,7 @@ mod app_identity_tests {
         ApplicationIntent {
             engine_groups: app.engine_groups,
             group_add: app.group_add,
+            device_cgroup_rules: app.device_cgroup_rules,
             ..intent(request(), app.keep_id)
         }
     }
@@ -2408,6 +2570,298 @@ mod app_identity_tests {
                 .collect::<Vec<_>>(),
             [&format!("{ENGINE_GROUPS_ENV}=0")]
         );
+    }
+
+    /// The four engine modes, each as the create body it produces for `request`.
+    fn bodies(request: &ApplicationRequest) -> Vec<(Dialect, bool, serde_json::Value)> {
+        [
+            (Dialect::Docker, false),
+            (Dialect::Docker, true),
+            (Dialect::Podman, false),
+            (Dialect::Podman, true),
+        ]
+        .into_iter()
+        .map(|(dialect, rootless)| {
+            let app = app_identity(dialect, rootless, request, OVERFLOW);
+            let intent = ApplicationIntent {
+                engine_groups: app.engine_groups,
+                group_add: app.group_add,
+                device_cgroup_rules: app.device_cgroup_rules,
+                ..intent(request.clone(), app.keep_id)
+            };
+            let body = serde_json::to_value(body(&intent, None, dialect)).unwrap();
+            (dialect, rootless, body)
+        })
+        .collect()
+    }
+
+    fn argv_request(plan: Vec<String>) -> ApplicationRequest {
+        let mut argv: Vec<String> = ["run", "--name", "quasar-sess-op"]
+            .map(String::from)
+            .to_vec();
+        argv.extend(plan);
+        argv.push("quasar-app:test".into());
+        ApplicationRequest {
+            operation: "op".into(),
+            ..crate::session::container::application_request_for_test(&argv)
+        }
+    }
+
+    /// #460: the console plan is the same request on every engine, and the same container
+    /// on the rootful ones. A rootless engine cannot apply a device-cgroup rule (rootless
+    /// Podman refuses the create), so it gets none: a later input device opens through the
+    /// host's ACL.
+    #[test]
+    fn the_console_plan_is_one_container_on_every_engine_less_the_rule_rootless() {
+        use crate::session::console_plan::{console_args, ConsoleHost, InputGrant};
+        let host = ConsoleHost {
+            card_node: "/dev/dri/card1".into(),
+            render_node: Some("/dev/dri/renderD129".into()),
+            sound: true,
+            hidraw_nodes: Vec::new(),
+            hidraw_major: None,
+        };
+        for input in [
+            InputGrant::All,
+            InputGrant::Nodes(vec!["/dev/input/event3".into()]),
+        ] {
+            let request = argv_request(console_args(&host, &input));
+            // The sound rule is one the runtime accepts, so the launch is not refused.
+            assert!(request.is_valid(), "{input:?}");
+            let bodies = bodies(&request);
+            let field = |body: &serde_json::Value, key: &str| body["HostConfig"][key].clone();
+            let (_, _, reference) = &bodies[0];
+            for (dialect, rootless, body) in &bodies {
+                for key in ["Devices", "NetworkMode"] {
+                    assert_eq!(
+                        field(body, key),
+                        field(reference, key),
+                        "{input:?} {dialect:?} rootless={rootless}: {key}"
+                    );
+                }
+                let rules = field(body, "DeviceCgroupRules");
+                match (&input, rootless) {
+                    (InputGrant::All, false) => assert_eq!(
+                        rules,
+                        serde_json::json!(["c 13:* rwm", "c 116:* rwm"]),
+                        "{dialect:?}"
+                    ),
+                    (InputGrant::Nodes(_), false) => {
+                        assert_eq!(rules, serde_json::json!(["c 116:* rwm"]), "{dialect:?}")
+                    }
+                    _ => assert!(
+                        rules.is_null(),
+                        "{input:?} {dialect:?} rootless={rootless}: {rules}"
+                    ),
+                }
+                assert!(
+                    body["Env"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::json!("QUASAR_DIRECT_DISPLAY=1")),
+                    "{dialect:?} rootless={rootless}"
+                );
+            }
+        }
+    }
+
+    /// #464: a streamed app's card nodes on every engine. A rootful Docker or Podman holds
+    /// them to mknod; NVIDIA's toolkit (the `--gpus` hook and CDI) and a rootless engine
+    /// cannot, so there the card is openable and the journal says so, the whole `/dev/dri`
+    /// of an NVIDIA host included.
+    #[test]
+    fn a_streamed_apps_card_is_mknod_only_where_the_engine_can_hold_it() {
+        use crate::session::container::streamed_gpu_args_for_test as streamed;
+        use GpuInjection::{Cdi, DeviceRequest};
+        let device = |path: &str, permissions: &str| serde_json::json!({"PathOnHost": path, "PathInContainer": path, "CgroupPermissions": permissions});
+        let held = serde_json::json!([
+            device("/dev/dri/renderD128", "rwm"),
+            device("/dev/dri/card0", "m")
+        ]);
+        let open = serde_json::json!([
+            device("/dev/dri/renderD128", "rwm"),
+            device("/dev/dri/card0", "rwm")
+        ]);
+        let directory = serde_json::json!([device("/dev/dri", "rwm")]);
+        // (label, GPU on the host: None or Some(NVIDIA), engine, rootless, injection,
+        //  the devices created, cards openable)
+        let cases = [
+            (
+                "rootful Docker",
+                Some(false),
+                Dialect::Docker,
+                false,
+                None,
+                &held,
+                false,
+            ),
+            (
+                "rootful Podman",
+                Some(false),
+                Dialect::Podman,
+                false,
+                None,
+                &held,
+                false,
+            ),
+            (
+                "rootless Podman",
+                Some(false),
+                Dialect::Podman,
+                true,
+                None,
+                &open,
+                true,
+            ),
+            (
+                "rootless Docker",
+                Some(false),
+                Dialect::Docker,
+                true,
+                None,
+                &open,
+                true,
+            ),
+            (
+                "Docker with the NVIDIA --gpus hook",
+                Some(true),
+                Dialect::Docker,
+                false,
+                Some(DeviceRequest),
+                &directory,
+                true,
+            ),
+            (
+                "Podman with CDI",
+                Some(true),
+                Dialect::Podman,
+                false,
+                Some(Cdi),
+                &directory,
+                true,
+            ),
+            (
+                "rootless Podman with CDI",
+                Some(true),
+                Dialect::Podman,
+                true,
+                Some(Cdi),
+                &directory,
+                true,
+            ),
+            (
+                "no GPU",
+                None,
+                Dialect::Docker,
+                false,
+                None,
+                &serde_json::json!([]),
+                false,
+            ),
+        ];
+        for (label, gpu, dialect, rootless, injection, devices, openable) in cases {
+            let args = gpu.map_or_else(Vec::new, |nvidia| {
+                streamed(nvidia, &["card0", "renderD128"])
+            });
+            let request = argv_request(args);
+            assert!(request.is_valid(), "{label}");
+            let why = cards_openable(rootless, injection, &request);
+            assert_eq!(why.is_some(), openable, "{label}");
+            let intent = ApplicationIntent {
+                cards_openable: why.is_some(),
+                ..intent(request, None)
+            };
+            let body = serde_json::to_value(body(&intent, injection, dialect)).unwrap();
+            assert_eq!(&body["HostConfig"]["Devices"], devices, "{label}");
+            assert_eq!(
+                body["HostConfig"]["DeviceRequests"],
+                serde_json::to_value(injection.map(|i| vec![nvidia_device_request(i)])).unwrap(),
+                "{label}"
+            );
+        }
+        // An NVIDIA injection never holds a card to mknod, whoever asks (defensive: the
+        // session plan already sends NVIDIA hosts the whole directory).
+        let asked = argv_request(streamed(false, &["card0", "renderD128"]));
+        for injection in [Cdi, DeviceRequest] {
+            assert!(
+                cards_openable(false, Some(injection), &asked).is_some(),
+                "{injection:?}"
+            );
+        }
+    }
+
+    /// #464: what readiness tells the admin (`container::streamed_card_gap`) is what the
+    /// engine journals and logs for the streamed grant, on every engine.
+    #[test]
+    fn readiness_and_the_engine_agree_on_whether_a_streamed_card_opens() {
+        use crate::session::container::{streamed_card_gap, streamed_gpu_args_for_test};
+        use GpuInjection::{Cdi, DeviceRequest};
+        for (nvidia, rootless, injection) in [
+            (false, false, None),
+            (false, true, None),
+            (true, false, Some(DeviceRequest)),
+            (true, false, Some(Cdi)),
+            (true, true, Some(Cdi)),
+        ] {
+            let request =
+                argv_request(streamed_gpu_args_for_test(nvidia, &["card0", "renderD128"]));
+            assert_eq!(
+                cards_openable(rootless, injection, &request),
+                streamed_card_gap(nvidia, rootless),
+                "nvidia={nvidia} rootless={rootless} {injection:?}"
+            );
+        }
+    }
+
+    /// #464: a console's card is the console plan's own, openable on every engine.
+    #[test]
+    fn a_console_card_stays_openable_on_every_engine() {
+        use crate::session::console_plan::{console_args, ConsoleHost, InputGrant};
+        let host = ConsoleHost {
+            card_node: "/dev/dri/card1".into(),
+            render_node: Some("/dev/dri/renderD129".into()),
+            sound: false,
+            hidraw_nodes: Vec::new(),
+            hidraw_major: None,
+        };
+        let request = argv_request(console_args(&host, &InputGrant::All));
+        assert!(request.mknod_only_cards.is_empty());
+        for rootless in [false, true] {
+            assert!(cards_openable(rootless, None, &request).is_none());
+        }
+        for (dialect, rootless, body) in bodies(&request) {
+            assert_eq!(
+                body["HostConfig"]["Devices"][0],
+                serde_json::json!({"PathOnHost": "/dev/dri/card1", "PathInContainer": "/dev/dri/card1", "CgroupPermissions": "rwm"}),
+                "{dialect:?} rootless={rootless}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_rootless_engine_leaves_the_device_cgroup_rules_out() {
+        let with_rule = ApplicationRequest {
+            device_cgroup_rules: vec!["c 13:* rwm".into(), "c 116:* rwm".into()],
+            ..request()
+        };
+        for dialect in [Dialect::Docker, Dialect::Podman] {
+            assert_eq!(
+                app_identity(dialect, true, &with_rule, OVERFLOW).device_cgroup_rules,
+                Some(Vec::new()),
+                "{dialect:?} rootless"
+            );
+            assert_eq!(
+                app_identity(dialect, false, &with_rule, OVERFLOW).device_cgroup_rules,
+                None,
+                "{dialect:?} rootful keeps the request's"
+            );
+            // No rule asked for: nothing recorded, so a streamed session's journal is
+            // unchanged.
+            assert_eq!(
+                app_identity(dialect, true, &request(), OVERFLOW).device_cgroup_rules,
+                None
+            );
+        }
     }
 
     #[test]
@@ -2569,6 +3023,164 @@ mod bind_source_tests {
     fn volumes_are_not_bind_sources() {
         assert!(unproven_bind_sources(&request(&[]), None, |_| false).is_empty());
     }
+
+    /// A console container's udev bind, beside the input bind the agent can see.
+    fn console_request() -> ApplicationRequest {
+        let bind = |path: &str| ApplicationMount::Bind {
+            source: path.into(),
+            target: path.into(),
+            read_only: true,
+            consistency: None,
+        };
+        ApplicationRequest {
+            typed_mounts: vec![bind("/dev/input"), bind("/run/udev/data")],
+            ..Default::default()
+        }
+    }
+
+    /// #460: the agent never sees the host's /run, so the console udev bind is proven by the
+    /// recovery actor's host fact on Podman; Docker checks nothing; every other bind is
+    /// still checked as before.
+    #[test]
+    fn the_console_udev_bind_is_proven_by_the_host_fact_on_podman_only() {
+        use super::super::dialect::Dialect;
+        let mounts = [bind("/dev/input", "/dev/input")];
+        let seen = |path: &Path| path == Path::new("/dev/input");
+        let check = |dialect, request: &ApplicationRequest, fact: Option<&str>| {
+            bind_source_check(dialect, request, Some(&mounts), seen, fact, None)
+        };
+        let console = console_request();
+        assert_eq!(check(Dialect::Podman, &console, Some("1")), Ok(()));
+        for fact in [None, Some("0"), Some("yes")] {
+            let refused = check(Dialect::Podman, &console, fact).unwrap_err();
+            assert!(refused.contains("/run/udev/data"), "{refused}");
+            assert!(
+                refused.contains("turn console mode off and on again"),
+                "{fact:?}: {refused}"
+            );
+        }
+        assert_eq!(check(Dialect::Docker, &console, None), Ok(()));
+
+        // The fact proves udev data only: another missing source is still refused, with no
+        // console advice.
+        let mut other = console_request();
+        other.typed_mounts.push(ApplicationMount::Bind {
+            source: "/mnt/share/games".into(),
+            target: "/games".into(),
+            read_only: true,
+            consistency: None,
+        });
+        let refused = check(Dialect::Podman, &other, Some("1")).unwrap_err();
+        assert!(refused.contains("/mnt/share/games"), "{refused}");
+        assert!(!refused.contains("/run/udev/data"), "{refused}");
+        // A writable bind of the same path is not the console plan's.
+        let writable = request(&["/run/udev/data"]);
+        let refused = check(Dialect::Podman, &writable, Some("1")).unwrap_err();
+        assert!(refused.contains("/run/udev/data"), "{refused}");
+    }
+
+    /// #460: the console plan's `/dev/snd` bind is proven on Podman by the recovery actor's
+    /// `QUASAR_HOST_SOUND=1` (an owned install's agent has neither `/host/dev` nor
+    /// `/dev/snd`), else by the agent's own view of the host's `/dev` (Compose).
+    fn sound_request() -> ApplicationRequest {
+        ApplicationRequest {
+            typed_mounts: vec![ApplicationMount::Bind {
+                source: "/dev/snd".into(),
+                target: "/dev/snd".into(),
+                read_only: true,
+                consistency: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_console_sound_bind_is_proven_through_the_agents_host_dev_view() {
+        use super::super::dialect::Dialect;
+        let mounts = [bind("/dev", "/host/dev")];
+        let with_sound = |path: &Path| path == Path::new("/host/dev/snd");
+        assert_eq!(
+            bind_source_check(
+                Dialect::Podman,
+                &sound_request(),
+                Some(&mounts),
+                with_sound,
+                None,
+                None
+            ),
+            Ok(())
+        );
+        // A fact of 0 proves nothing; the agent's view still does.
+        assert_eq!(
+            bind_source_check(
+                Dialect::Podman,
+                &sound_request(),
+                Some(&mounts),
+                with_sound,
+                None,
+                Some("0")
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_console_sound_bind_is_proven_by_the_host_fact_on_an_owned_install() {
+        use super::super::dialect::Dialect;
+        // The agent's own mounts have no /host/dev and nothing it can see is /dev/snd.
+        let mounts = [bind("/dev/input", "/dev/input")];
+        let check = |request: &ApplicationRequest, fact: Option<&str>| {
+            bind_source_check(
+                Dialect::Podman,
+                request,
+                Some(&mounts),
+                |_| false,
+                None,
+                fact,
+            )
+        };
+        assert_eq!(check(&sound_request(), Some("1")), Ok(()));
+        for fact in [None, Some("0"), Some("yes")] {
+            let refused = check(&sound_request(), fact).unwrap_err();
+            assert!(refused.contains("/dev/snd"), "{refused}");
+            assert!(
+                refused.contains("turn console mode off and on so the recovery actor reads it"),
+                "{fact:?}: {refused}"
+            );
+        }
+        // The fact proves the console plan's sound bind only: a writable bind of the same
+        // path, or another missing source, is still refused.
+        let mut writable = sound_request();
+        writable.typed_mounts = vec![ApplicationMount::Bind {
+            source: "/dev/snd".into(),
+            target: "/dev/snd".into(),
+            read_only: false,
+            consistency: None,
+        }];
+        assert!(check(&writable, Some("1")).is_err());
+        let mut other = sound_request();
+        other.typed_mounts.push(ApplicationMount::Bind {
+            source: "/mnt/share/games".into(),
+            target: "/games".into(),
+            read_only: true,
+            consistency: None,
+        });
+        let refused = check(&other, Some("1")).unwrap_err();
+        assert!(refused.contains("/mnt/share/games"), "{refused}");
+        assert!(!refused.contains("sound device"), "{refused}");
+        // Docker checks nothing.
+        assert_eq!(
+            bind_source_check(
+                Dialect::Docker,
+                &sound_request(),
+                Some(&mounts),
+                |_| false,
+                None,
+                None
+            ),
+            Ok(())
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2676,6 +3288,8 @@ mod read_only_bind_tests {
             keep_id: None,
             engine_groups: Vec::new(),
             group_add: None,
+            device_cgroup_rules: None,
+            cards_openable: false,
             nested_sandbox_label: false,
             phase: ApplicationPhase::Creating,
             result: None,

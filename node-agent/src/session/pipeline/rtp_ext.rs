@@ -240,14 +240,6 @@ pub(super) fn attach_abs_capture_time_egress_probe(
             }
             gst::PadProbeReturn::Ok
         });
-        // MUST be handed back FLOATING, like the ABR aux sender: webrtcbin ref_sinks the
-        // return on bin-add, and a sunk strong handle leaks one ref per session (the
-        // identity, and through its pad probe the abs-capture-time extension).
-        unsafe {
-            gst::glib::gobject_ffi::g_object_force_floating(
-                identity.as_ptr() as *mut gst::glib::gobject_ffi::GObject
-            );
-        }
         Some(identity.to_value())
     });
 }

@@ -89,8 +89,8 @@ func (g *Gate) StoreReport(ctx context.Context, hostID string, raw json.RawMessa
 // (the system, not an admin, withdrew it). Call this after every write of
 // hosts.readiness and after every GPU-set write, or the derived columns
 // describe a state older than the report. The caller's transaction must take
-// the host row lock before it touches gpus, as the capacity write does:
-// admission's recheck locks in the other order.
+// the host row lock before it touches gpus: every transaction that locks both
+// takes the host first, admission's recheck included; GPU-first deadlocks them.
 func (g *Gate) Recompute(ctx context.Context, tx pgx.Tx, hostID string) error {
 	var nodeName string
 	var raw []byte

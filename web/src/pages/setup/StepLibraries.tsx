@@ -11,8 +11,10 @@
 //
 // #465 entitlement mode: a second call after the settings PATCH
 // (POST /v1/admin/library-providers/{provider}/entitlement-mode, by provider
-// NAME — the app is created off-thread so no id exists yet), bounded-retried;
-// a lasting 404 degrades to honest copy, never blocks Continue.
+// NAME — the app is created off-thread so no id exists yet). Before the app
+// exists the server keeps the mode and applies it at create (202, #490), so
+// there is nothing to retry; a failure degrades to honest copy, never blocks
+// Continue.
 //
 // #461 virgin instance: zero catalog rows until a sync has run, so an empty
 // provider list with `fetched_at == null` triggers one auto-sync per mount
@@ -46,29 +48,6 @@ const ENTITLEMENT_MODE_HINT: Record<ProviderEntitlementMode, string> = {
   user: "Enabling this provider makes it available to your account only. You can invite others later from Admin → Apps.",
   none: "Enabling this provider creates it but grants nobody access yet. You'll need to grant access from Admin → Apps before anyone (including you) can see it.",
 };
-
-// The entitlement-mode call can legitimately 404 for a few seconds after the
-// settings PATCH (app creation is off-thread). 6 × 1.5s of patience, never an
-// unbounded loop, never blocks Continue.
-export async function applyEntitlementModeWithRetry(
-  token: string,
-  provider: string,
-  mode: ProviderEntitlementMode,
-  attempts = 6,
-  delayMs = 1500,
-): Promise<void> {
-  for (let i = 0; i < attempts; i++) {
-    try {
-      await adminApi.setProviderEntitlementMode(token, provider, mode);
-      return;
-    } catch (err) {
-      const isLastAttempt = i === attempts - 1;
-      const notReadyYet = err instanceof ApiError && err.status === 404;
-      if (isLastAttempt || !notReadyYet) throw err;
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-}
 
 interface StepLibrariesProps {
   /** Advances to step 5 (StepFinishing) — this step no longer finishes the wizard. */
@@ -132,6 +111,8 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
   // Second-call degradation only (mode call retried out); separate from
   // submitErrors, which is the settings PATCH itself failing.
   const [modeErrors, setModeErrors] = useState<Record<string, string>>({});
+  // Providers whose mode the server stored to apply once the app is created.
+  const [modesPending, setModesPending] = useState<Record<string, boolean>>({});
 
   function providersOf(rows: CatalogImage[]): ProviderEntry[] {
     const byKind = new Map<string, ProviderEntry>();
@@ -226,6 +207,10 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
     return () => window.clearInterval(id);
   }, [anyStillMoving, token]);
 
+  function modeLabel(kind: string) {
+    return ENTITLEMENT_MODE_OPTIONS.find((o) => o.value === (entitlementMode[kind] ?? "all"))?.label;
+  }
+
   function toggle(kind: string, next: boolean) {
     setSelected((prev) => ({ ...prev, [kind]: next }));
   }
@@ -239,6 +224,7 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
     setPhase("submitting");
     const errors: Record<string, string> = {};
     const modeFailures: Record<string, string> = {};
+    const pending: Record<string, boolean> = {};
     for (const kind of submittedKinds) {
       try {
         // Only "steam" maps to a settings field today — mirrors the
@@ -250,18 +236,18 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
         errors[kind] = err instanceof ApiError ? err.message : `Could not enable ${kind}.`;
         continue; // nothing was enabled — no app to set a mode on
       }
-      // #465: second call, only when the mode differs from the create default.
-      const mode = entitlementMode[kind] ?? "all";
-      if (mode !== "all") {
-        try {
-          await applyEntitlementModeWithRetry(token, kind, mode);
-        } catch (err) {
-          modeFailures[kind] = err instanceof ApiError ? err.message : `Could not set who can see ${kind} yet.`;
-        }
+      // #465: second call, for every choice, so "all" also replaces a mode an
+      // earlier pass stored (#490).
+      try {
+        const res = await adminApi.setProviderEntitlementMode(token, kind, entitlementMode[kind] ?? "all");
+        if ("pending_entitlement_mode" in res) pending[kind] = true;
+      } catch (err) {
+        modeFailures[kind] = err instanceof ApiError ? err.message : `Could not set who can see ${kind} yet.`;
       }
     }
     setSubmitErrors(errors);
     setModeErrors(modeFailures);
+    setModesPending(pending);
     setPhase("submitted");
     // Refresh immediately so the just-enabled provider's install state shows
     // up without waiting a full poll tick.
@@ -384,13 +370,19 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
               Could not enable {providers.find((p) => p.kind === kind)?.displayName ?? kind}: {msg}
             </p>
           ))}
-          {/* An enabled provider stuck on "all" must say so honestly. */}
+          {Object.keys(modesPending).map((kind) => (
+            <p key={kind} className="field-hint m0">
+              “{modeLabel(kind)}” will apply to{" "}
+              {providers.find((p) => p.kind === kind)?.displayName ?? kind} as soon as it finishes installing.
+            </p>
+          ))}
+          {/* A restriction that did not land leaves the provider on "all": say so. */}
           {Object.entries(modeErrors).map(([kind, msg]) => (
             <p key={kind} className="form-error m0">
-              {providers.find((p) => p.kind === kind)?.displayName ?? kind} is enabled and
-              visible to all users for now — could not switch it to{" "}
-              {ENTITLEMENT_MODE_OPTIONS.find((o) => o.value === entitlementMode[kind])?.label.toLowerCase()}{" "}
-              yet ({msg}). Set it from <strong>Admin → Apps</strong> once you're in.
+              {providers.find((p) => p.kind === kind)?.displayName ?? kind} is enabled
+              {(entitlementMode[kind] ?? "all") !== "all" && " and visible to all users for now"} — could
+              not switch it to {modeLabel(kind)?.toLowerCase()} yet ({msg}). Set it from{" "}
+              <strong>Admin → Apps</strong> once you're in.
             </p>
           ))}
           {submittedKinds.some((kind) => providerStatus(images ?? [], kind) === "failed") && (

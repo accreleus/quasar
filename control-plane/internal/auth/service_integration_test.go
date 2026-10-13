@@ -112,7 +112,7 @@ func TestServiceExpiredToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("token: %v", err)
 	}
-	if err := svc.store.createToken(ctx, user.ID, hash, time.Now().Add(-time.Hour), "", ""); err != nil {
+	if err := svc.store.createToken(ctx, user.ID, "", hash, time.Now().Add(-time.Hour), "", ""); err != nil {
 		t.Fatalf("create expired token: %v", err)
 	}
 	if _, _, err := svc.Authenticate(ctx, plaintext); !errors.Is(err, ErrUserNotFound) {

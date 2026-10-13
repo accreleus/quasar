@@ -67,6 +67,7 @@ import type {
   EntitlementsResponse,
   ProviderEntitlementMode,
   ProviderEntitlementModeEnvelope,
+  ProviderEntitlementModePendingEnvelope,
   LibraryRulesResponse,
   LibraryRuleWriteRequest,
   LibraryRuleWriteResult,
@@ -383,14 +384,14 @@ export function listUserEntitlements(token: string, userId: string): Promise<Ent
 
 /** Addressed by provider name ("steam"), not app id, and REPLACES the whole
  *  entitlement state: "all" writes one all-users row, "user" entitles the acting
- *  admin only, "none" clears every row. 404 means the provider app isn't created
- *  yet (async install pending) — treat it as "try again shortly". */
+ *  admin only, "none" clears every row. Before the provider app exists the
+ *  server stores the mode and answers with `pending_entitlement_mode` (202). */
 export function setProviderEntitlementMode(
   token: string,
   provider: string,
   mode: ProviderEntitlementMode,
-): Promise<ProviderEntitlementModeEnvelope> {
-  return apiFetch<ProviderEntitlementModeEnvelope>(
+): Promise<ProviderEntitlementModeEnvelope | ProviderEntitlementModePendingEnvelope> {
+  return apiFetch<ProviderEntitlementModeEnvelope | ProviderEntitlementModePendingEnvelope>(
     `/admin/library-providers/${encodeURIComponent(provider)}/entitlement-mode`,
     { method: "POST", body: { mode }, token },
   );
@@ -1050,7 +1051,9 @@ export function getJob(token: string, jobId: string): Promise<Job> {
 }
 
 /** Adopted jobs only (409 `job_unmanaged`). 409 `schedule_locked` when an
- *  environment variable is authoritative over `interval_secs`. */
+ *  environment variable is authoritative over `interval_secs`, and for
+ *  `library.discovery` when a value of 60 or more differs from the period it reports
+ *  (an equal value is accepted and not stored). */
 export function patchJob(token: string, jobId: string, req: JobPatchRequest): Promise<Job> {
   return apiFetch<Job>(`/admin/jobs/${jobId}`, { method: "PATCH", body: req, token });
 }

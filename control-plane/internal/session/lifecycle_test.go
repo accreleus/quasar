@@ -406,9 +406,11 @@ type fakeDispatcher struct {
 	// noAck records commands sent WITHOUT an ack. AgentHeartbeat's reverse
 	// reconcile must use Send, never SendWithAck: it runs inside the agent WS
 	// read loop, and that same loop is what would have to read the ack (#128).
-	noAck  []string
-	ackOK  bool
-	ackErr string
+	noAck []string
+	// stopReasons is the reason of each ack-less session_stop, by session id.
+	stopReasons map[string]string
+	ackOK       bool
+	ackErr      string
 	// ackSendErr, when set, makes SendWithAck fail outright (agent unreachable /
 	// no ack within the command timeout) instead of returning a nack. That is a
 	// distinct branch from ackOK=false for every caller that treats the two the
@@ -426,8 +428,18 @@ func (f *fakeDispatcher) Send(_ string, v any) error {
 	defer f.mu.Unlock()
 	if c, ok := v.(agentws.SessionStopCmd); ok {
 		f.noAck = append(f.noAck, "stop:"+c.SessionID)
+		if f.stopReasons == nil {
+			f.stopReasons = map[string]string{}
+		}
+		f.stopReasons[c.SessionID] = c.Reason
 	}
 	return nil
+}
+
+func (f *fakeDispatcher) stopReason(sessionID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stopReasons[sessionID]
 }
 
 // noAckTypes is the ack-less Send log; see fakeDispatcher.noAck.

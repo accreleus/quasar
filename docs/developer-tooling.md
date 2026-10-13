@@ -112,12 +112,12 @@ deployment. The `--deploy` checks are, in order: the running container's image I
 fresh build (the 2026-07-14 wrong-tag trap); the agent process resolves to the image's
 **baked** binary at `/usr/local/bin/quasar-node-agent` and not a workspace-compiled one (a
 re-introduced compose `command:` override); and `QUASAR_PULSE_IMAGE` names an image that
-actually has a `pulseaudio` binary (the 2026-07-26 silent-audio outage). It absorbed the
+actually has the PipeWire audio sidecar (the 2026-07-26 silent-audio outage). It absorbed the
 former `deploy/build-agent-host.sh`, which was already a thin wrapper over this script.
 
 The companion check is `scripts/dev/validate-local-audio.sh [--capture N]` — PASS/FAIL/SKIP
-checks for the local-audio (console-mode) PulseAudio sidecar: socket/cookie permissions,
-non-root auth, sink/source defaults, log scan, optional amplitude capture, node-agent ALSA FD.
+checks for a session's PulseAudio sidecar: socket/cookie permissions, non-root auth,
+sink/source defaults, log scan, optional amplitude capture.
 
 ### The harness library
 
@@ -160,13 +160,14 @@ issue closes (precedent: 2026-07-17; recover any from git history). Current set:
 | `scripts/harness/run-codec-validate.sh` | Per-codec encode/decode validation (h264/h265/av1) |
 | `scripts/harness/run-nvenc-fallback-smoke.sh` | Vulkan → vendor-encoder per-session fallback |
 | `scripts/harness/run-st-trace.sh` | Session tracer end-to-end (Observability v2) |
+| `scripts/harness/run-takeover-peers.sh` | Takeover negotiation with real Chrome pages and no GPU host or control plane (#535): a second browser gets the stream, the first stops, a page that keeps its peer connections keeps its transport. The `spa-*` scenarios drive the real web client (a built `web/dist`, `/v1` mocked) through it: input channel, microphone, tracks, the displaced page's notice. Drives the `browser_host` test in `node-agent` with `takeover-peers/` |
 | `scripts/harness/run-spt06-certify.sh` | Encoder certification bench (rung × bitrate, real peer) |
 | `scripts/harness/run-soak-profile.sh` | Leak detection: session-cycle soak → CSV → verdicts (LEAK/SUSPECT/FLAT…); `scripts/harness/lib/soak_report.py` |
 | `scripts/harness/run-readiness-faults.sh` | RH-02 host-readiness fault injection (#264): runtime stopped, homes root unwritable / exhausted, input withheld, GPU path broken per vendor, proxy and indeterminate results, refusal classification, the override lifecycle including a launch that succeeds, host-local honesty. Runs **on a docker host** against a disposable stack it creates and owns (compose project and label `quasar.harness.owner=<run id>`, host paths under `/var/lib/<run id>`, and a root-read snapshot of the agent's fixed `/run/quasar-agent` runtime path so cleanup can catch leftovers a kill scenario drops there), never a shared stack: `--control-image=REF --agent-image=REF --role=ROLE [--only=…] [--keep]`. Results are `pass` / `fail` / `unperformed`; exit `0` only when everything passed, `1` on a fail, `4` when something was unperformed, `3` with no docker (so under `dev.sh run readiness-faults` every row is `unperformed`, never passed). Writes a sanitized `deploy/results/readiness-faults-<ts>.json` and `.md`. Matrix: `docs/superpowers/plans/2026-09-19-rh02-264-harness-matrix.md` |
 | `scripts/harness/readiness-fixture/` | Test-only Go module (relay rewriting agent readiness on wire, scripted host); never built into images; `make verify` guards this via `readiness-faults:*` checks |
 | `scripts/harness/checks/vram-telemetry.sh` | Live VRAM telemetry is flowing (read-only; sourceable) |
 | `scripts/harness/peer-driver.mjs` | The headless WebRTC peer the shell harnesses drive |
-| `scripts/dev/validate-local-audio.sh` | Console-mode Pulse sidecar audio |
+| `scripts/dev/validate-local-audio.sh` | Session Pulse sidecar audio |
 | `scripts/release/probe-vulkan-encoder-runtime.sh` | Vulkan encoder actually registered on this GPU |
 | `scripts/release/test-*.sh` | Offline contract tests for the release scripts (mock docker, fixtures). `test-release-preflight.sh`, `test-release-supply-chain.sh`, `test-probe-vulkan-encoder-runtime.sh`, `test-changelog-section.sh`, `test-platform-release-manifest.sh`, `test-release-cut.sh` (git-dependent cases run against a throwaway repo + bare "origin" under `mktemp`, never the real remote). Run them by hand — no verify stage does, except `test-platform-release-signature.sh`, which `make verify` runs as `release:signature-contract` |
 | `deploy/db-backup-restore-drill.sh` | Postgres backup/restore drill (disposable containers) |

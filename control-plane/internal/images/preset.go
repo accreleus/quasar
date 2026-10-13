@@ -27,7 +27,7 @@ import (
 //
 // Deliberately NOT mapped here (ride apps.runtime_spec instead, no
 // runtime_presets column exists): no_new_privileges (#432 — Steam
-// re-escalates via sudo), gpu, systempaths_unconfined. See
+// re-escalates via sudo), gpu, systempaths_unconfined, direct_display. See
 // provider_app.go's providerRuntimeSpec for the one place a manifest value
 // reaches an app row.
 //
@@ -348,7 +348,7 @@ func reconcileRuntimeDrift(ctx context.Context, tx dbExecutor, log *slog.Logger,
 			return err
 		}
 	}
-	return nil
+	return stampDirectDisplay(ctx, tx, imageID)
 }
 
 // runtimeBlocksEqual compares semantically, not by bytes: old comes back as

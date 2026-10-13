@@ -47,6 +47,7 @@ struct Machine {
 
 impl Machine {
     fn install(state: FakeState) -> Machine {
+        capture_logs();
         let m = Machine {
             engine: Arc::new(FakeEngine::new(state)),
             dir: tempfile::tempdir().unwrap(),
@@ -368,12 +369,24 @@ fn an_agent_that_will_not_start_is_re_created_once_and_reported_truthfully() {
 
 // ----- the start's closing line (#432) -----
 
+/// The lines `logged_start` collects for the calling thread.
 #[derive(Clone, Default)]
 struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
 
-impl std::io::Write for Captured {
+thread_local! {
+    static SINK: std::cell::RefCell<Option<Captured>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Writes each line to the calling thread's `SINK`, or drops it.
+struct Routed;
+
+impl std::io::Write for Routed {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        SINK.with(|s| {
+            if let Some(c) = &*s.borrow() {
+                c.0.lock().unwrap().extend_from_slice(buf);
+            }
+        });
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -381,26 +394,33 @@ impl std::io::Write for Captured {
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-    type Writer = Captured;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
+/// One process-wide subscriber, installed before any test logs (every test starts with
+/// `Machine::install`). A per-test `with_default` subscriber loses events instead:
+/// `tracing` caches whether a callsite is enabled, and a callsite another test thread is
+/// registering as the first scoped subscriber appears can be cached as disabled for the
+/// rest of the process (#523).
+fn capture_logs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_writer(|| Routed)
+                .with_ansi(false)
+                .finish(),
+        )
+        .expect("no other subscriber in this test binary");
+    });
 }
 
 /// The lines one start logs, `resume` then `finish_start`, as the binary runs them.
 fn logged_start(m: &Machine) -> Vec<String> {
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_ansi(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        let actor = m.actor();
-        let resumed = actor.resume();
-        actor.finish_start(resumed.is_ok());
-        actor.wait_attempt();
-    });
+    SINK.with(|s| *s.borrow_mut() = Some(captured.clone()));
+    let actor = m.actor();
+    let resumed = actor.resume();
+    actor.finish_start(resumed.is_ok());
+    actor.wait_attempt();
+    SINK.with(|s| *s.borrow_mut() = None);
     let bytes = captured.0.lock().unwrap().clone();
     String::from_utf8(bytes)
         .unwrap()

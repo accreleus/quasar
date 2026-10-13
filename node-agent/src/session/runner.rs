@@ -21,10 +21,12 @@ use super::encoder_stall;
 use super::metrics::SessionMetrics;
 use super::pipeline::{RemoteDescriptionApplied, RemoteDescriptionFailure};
 use super::server;
-use super::signaling::SignalMsg;
+use super::signaling::{PcId, SignalMsg};
 use super::source::{AppSource, SessionResources};
 use super::vulkan_fault;
-use super::{console, pipeline, SessionConfig};
+use super::{pipeline, SessionConfig};
+
+mod direct_display;
 use crate::messages::{AppExitPolicy, VideoTopology};
 
 const SCTP_STOP_RACE_GRACE: Duration = Duration::from_secs(1);
@@ -119,7 +121,7 @@ fn renderer_degraded_marker(warn: &gst::message::Warning) -> Option<String> {
 /// degradation produces a second marker inside 30s; a one-off transient does not.
 const RENDERER_DEGRADE_WINDOW: Duration = Duration::from_secs(30);
 
-/// One tracker per bus-pump loop (`run_blocking`, `run_local_only`): the first marker
+/// One tracker per bus-pump loop (`run_blocking`): the first marker
 /// warns and arms the window; only a SECOND marker inside
 /// [`RENDERER_DEGRADE_WINDOW`] fails the session closed.
 #[derive(Default)]
@@ -288,41 +290,6 @@ fn assert_vulkan_encoder_device(
     Ok(())
 }
 
-/// A console session drives the host's own display: LocalOnly always, DualOutput when
-/// `console_config` enables it (`console_required` in `run_blocking`).
-fn wants_console_vt(cfg: &SessionConfig) -> bool {
-    cfg.console_config.as_ref().is_some_and(|c| c.enabled)
-        && matches!(
-            cfg.video_topology,
-            VideoTopology::LocalOnly | VideoTopology::DualOutput
-        )
-}
-
-/// Fail the whole DualOutput session when a required console local-display leg cannot
-/// be built or played: for a console session the local monitor IS the purpose, so emit
-/// `Failed` and tear down source + encode + audio rather than stream to the browser
-/// with a black monitor. Mirrors `run_local_only`'s hard-fail discipline.
-fn fail_dualoutput_console<F: Fn(SessionEvent)>(
-    emit: &F,
-    msg: String,
-    current_source: &mut AppSource,
-    encode_pipe: &gst::Pipeline,
-    audio_pipeline: Option<&gst::Pipeline>,
-    defer_encode_teardown: bool,
-) {
-    tracing::error!(
-        token = "runner-console-dualoutput-failed",
-        reason = %msg,
-        "console dual-output session failed"
-    );
-    emit(SessionEvent::Failed(msg));
-    current_source.teardown();
-    super::nvenc_defer::finish_encode(encode_pipe, defer_encode_teardown);
-    if let Some(ap) = audio_pipeline {
-        let _ = ap.set_state(gst::State::Null);
-    }
-}
-
 /// Lifecycle + signaling events emitted by a runner.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
@@ -331,6 +298,12 @@ pub enum SessionEvent {
     /// Fine-grained launch progress while the top-level state remains starting.
     Progress(&'static str),
     Running,
+    /// A console session's desktop is displaying at the connector's mode (`None` when the
+    /// card reports no mode). The first one is the session's `running`; later ones carry a
+    /// mode change or the display coming back.
+    Displaying(Option<super::displaying::ScanoutMode>),
+    /// A running console session's desktop stopped displaying; the session goes on.
+    NotDisplaying(String),
     Stopping,
     /// Session stopped cleanly. `bytes_used` is the post-session du measurement when
     /// `QUASAR_HOME_ROOT` is set, else `None`. `detail` is the terminal `stopped` row's
@@ -490,7 +463,6 @@ fn effective_media_snapshot(
     cfg: &SessionConfig,
     encode_pipe: &gst::Pipeline,
     interpipesrc: &gst::Element,
-    local_backend: Option<&str>,
 ) -> serde_json::Value {
     let encoder = encode_pipe
         .by_name(pipeline::VIDEO_ENCODER_NAME)
@@ -524,7 +496,6 @@ fn effective_media_snapshot(
                 .find(|feature| caps.contains(feature))
         })
         .unwrap_or("system");
-    let console = cfg.console_config.as_ref();
     // #384: what the app container was told its display is, which the stream mode alone
     // cannot answer (rendered at 1440p, or rendered at 1080p and upscaled?). Computed by
     // the same function the launch uses over the same catalog env, so it cannot drift
@@ -553,9 +524,7 @@ fn effective_media_snapshot(
     );
     // Must stay the same condition `pipeline::build_encode_pipeline` builds the audio
     // pipeline on: it is what a mic m-line can exist under.
-    let has_audio_pc = !pipeline::audio_disabled()
-        && (cfg.video_topology != VideoTopology::DualOutput
-            || cfg.console_config.as_ref().is_none_or(|c| c.stream_audio));
+    let has_audio_pc = !pipeline::audio_disabled();
     let mic_state = mic_state_label(cfg.stream.mic, pipeline::mic_disabled(), has_audio_pc);
 
     serde_json::json!({
@@ -576,11 +545,7 @@ fn effective_media_snapshot(
         "resolved": {
             "render_node": cfg.render_node,
             "cuda_device_id": cfg.cuda_device_id,
-            "stream": true,
-            "stream_audio": console.is_none_or(|c| c.stream_audio),
-            "local_output": local_backend.is_some(),
-            "local_backend": local_backend,
-            "connector": console.map(|c| c.connector.as_str()).unwrap_or("auto")
+            "stream": true
         },
         "actual": {
             "game_gpu_access": app_gpu_requested,
@@ -601,9 +566,7 @@ fn effective_media_snapshot(
             "gop": prop("gop-size").or_else(|| prop("key-int-max")).or_else(|| prop("idr-period")),
             "slices": prop("num-slices"),
             "source_topology": "interpipe",
-            "stream": true,
-            "local_output": local_backend.is_some(),
-            "local_backend": local_backend
+            "stream": true
         },
         // The app container's own display mode (what the app and any nested gamescope
         // see), distinct from the streamed mode above. `source`: `agent` |
@@ -1074,20 +1037,6 @@ fn push_display_to_source(
 /// inbound signaling dispatch.
 const POLL: u64 = 100;
 
-/// #413: exactly one `POLL`-bounded wait per `run_local_only` iteration.
-/// `Bus::timed_pop(POLL)` already blocks up to `POLL`, so adding a sleep on the
-/// no-message branch made stop latency ~200 ms instead of 100 ms. The sleep is gated on
-/// `display_bus.is_none()` (nothing to block on would spin hot), never on the pop result.
-fn poll_display_bus(display_bus: Option<&gst::Bus>) -> Option<gst::Message> {
-    match display_bus {
-        Some(bus) => bus.timed_pop(gst::ClockTime::from_mseconds(POLL)),
-        None => {
-            std::thread::sleep(Duration::from_millis(POLL));
-            None
-        }
-    }
-}
-
 /// #408: RAII owner of the session's optional audio `gst::Pipeline`.
 ///
 /// `gst::Pipeline` has no Drop-to-NULL (unlike `AppSource`): a READY audio pipeline that
@@ -1112,8 +1061,37 @@ impl AudioPipelineGuard {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn as_ref(&self) -> Option<&gst::Pipeline> {
         self.pipeline.as_ref()
+    }
+
+    /// #304: the audio pipeline is set PLAYING on its own, so neither it nor the encode
+    /// pipeline blocks the other's state transition.
+    ///
+    /// Never force the session's shared clock here (#351): the pipeline must run on the
+    /// capture's own clock. Slaved to the SystemClock, the monitor's sample count drifts
+    /// ahead of it (~80 ppm measured), audiobasesrc's skew slaving only corrects a capture
+    /// that runs slow, and webrtcbin's internal `clocksync sync=true` then holds each
+    /// buffer until its timestamp. After ~40 min that wait passes the 200 ms capture ring
+    /// buffer and the capture drops ~200 ms of every ~270 ms. Nothing needs the shared
+    /// clock: this PC is not lip-synced to video (#304).
+    pub(crate) fn play(&self) {
+        let Some(audio_pipe) = &self.pipeline else {
+            return;
+        };
+        if let Err(e) = audio_pipe.set_state(gst::State::Playing) {
+            tracing::warn!(
+                token = "audio-pipeline-play-failed",
+                "audio pipeline set PLAYING failed: {e:#} (audio disabled)"
+            );
+        } else {
+            let clock = audio_pipe
+                .clock()
+                .map(|c| c.name().to_string())
+                .unwrap_or_else(|| "none yet".into());
+            tracing::info!("audio pipeline PLAYING (separate from encode, clock {clock})");
+        }
     }
 
     /// Explicit NULL, idempotent: a second call (and the subsequent Drop) does nothing.
@@ -1123,6 +1101,7 @@ impl AudioPipelineGuard {
         }
         if let Some(p) = &self.pipeline {
             let _ = p.set_state(gst::State::Null);
+            tracing::info!(token = "audio-pipeline-stopped", "audio pipeline at NULL");
         }
     }
 }
@@ -1131,6 +1110,322 @@ impl Drop for AudioPipelineGuard {
     fn drop(&mut self) {
         self.finish();
     }
+}
+
+/// How many times one PC's transport may be replaced in [`REPLACEMENT_WINDOW`] (#535).
+///
+/// A replacement is one new page taking the session over: a person changing device does
+/// it once, and cannot usefully do it more often than every ten seconds. Each one costs
+/// the runner up to 2 s and resets this session's encoder to its launch bitrate, so a
+/// client that loops answers (a displacement loop between two pages, or abuse) must not
+/// be served past this.
+const MAX_REPLACEMENTS_PER_WINDOW: usize = 6;
+const REPLACEMENT_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many displaced peers each PC remembers. The relay leaks at most one frame per
+/// displaced socket, so a short chain of takeovers is all there is to recognise.
+const DISPLACED_REMEMBERED: usize = 4;
+
+/// The sliding window behind [`MAX_REPLACEMENTS_PER_WINDOW`].
+struct ReplacementBudget {
+    limit: usize,
+    recent: std::collections::VecDeque<Instant>,
+    /// A refusal was logged and nothing has been admitted since.
+    refusing: bool,
+}
+
+/// What [`ReplacementBudget::admit`] decided.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Admitted,
+    /// Over the limit; `first` on the first refusal since the last admission.
+    Refused {
+        first: bool,
+    },
+}
+
+impl ReplacementBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            recent: std::collections::VecDeque::new(),
+            refusing: false,
+        }
+    }
+
+    fn admit(&mut self, now: Instant) -> Admission {
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= REPLACEMENT_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= self.limit {
+            let first = !std::mem::replace(&mut self.refusing, true);
+            return Admission::Refused { first };
+        }
+        self.recent.push_back(now);
+        self.refusing = false;
+        Admission::Admitted
+    }
+}
+
+/// What one PC's current transport has been told by its peer (#535).
+///
+/// Kept here, not read back from webrtcbin, which applies a description asynchronously: a
+/// second answer half a millisecond behind the first would be read against a transport
+/// that still looks unanswered, applied as a duplicate and lost.
+#[derive(Default)]
+struct Negotiation {
+    /// The answer the transport was last handed.
+    answer: Option<String>,
+    /// The transport was asked for another offer since that answer.
+    reoffered: bool,
+}
+
+impl Negotiation {
+    fn who(&self, answer: &str, dtls_started: bool) -> pipeline::AnswerFrom {
+        pipeline::answer_from(self.answer.as_deref(), answer, dtls_started, self.reoffered)
+    }
+
+    /// `answer` was handed to the transport. One that names no peer is not what the next
+    /// answer is read against: the transport has negotiated with nobody through it.
+    fn applied(&mut self, answer: String) {
+        if !pipeline::names_a_peer(&answer) {
+            return;
+        }
+        self.reoffered = false;
+        self.answer = Some(answer);
+    }
+
+    /// The transport is being replaced. Returns the ICE ufrag of the peer it leaves.
+    fn replaced(&mut self) -> Option<String> {
+        self.reoffered = false;
+        let gone = self.answer.take()?;
+        pipeline::ice_ufrag(&gone).map(str::to_string)
+    }
+}
+
+/// The session's WebRTC transports. Each is replaced, under the running encoder, when a
+/// peer other than the one it negotiated with answers on it (#535).
+pub(crate) struct SessionTransports {
+    slot: pipeline::TransportSlot,
+    pub(crate) video: pipeline::VideoTransport,
+    pub(crate) audio_webrtc: Option<gst::Element>,
+    pub(crate) audio_pipeline: AudioPipelineGuard,
+    /// Per PC (video, audio): replaced, and that offer not answered yet.
+    unanswered: [bool; 2],
+    /// Per PC: the ICE ufrags of the peers whose transport was retired, newest last.
+    displaced: [Vec<String>; 2],
+    negotiation: [Negotiation; 2],
+    budget: [ReplacementBudget; 2],
+}
+
+impl SessionTransports {
+    pub(crate) fn new(
+        slot: pipeline::TransportSlot,
+        video: pipeline::VideoTransport,
+        audio_webrtc: Option<gst::Element>,
+        audio_pipeline: Option<gst::Pipeline>,
+    ) -> Self {
+        Self {
+            slot,
+            video,
+            audio_webrtc,
+            // #408: owned by a Drop-to-NULL guard from the moment the pipeline exists.
+            audio_pipeline: AudioPipelineGuard::new(audio_pipeline),
+            unanswered: [false; 2],
+            displaced: [Vec::new(), Vec::new()],
+            negotiation: Default::default(),
+            budget: [
+                ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
+                ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
+            ],
+        }
+    }
+
+    /// Is `pc`'s transport one built for a peer that took the session over, not the one
+    /// the session launched on?
+    pub(crate) fn is_replacement(&self, pc: PcId) -> bool {
+        !self.displaced[pc as usize].is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_replacement_limit(&mut self, limit: usize) {
+        for budget in &mut self.budget {
+            budget.limit = limit;
+        }
+    }
+
+    /// The window clearing, without the wait.
+    #[cfg(test)]
+    pub(crate) fn forget_replacements(&mut self) {
+        for budget in &mut self.budget {
+            budget.recent.clear();
+        }
+    }
+
+    /// Apply one inbound signaling message as the offerer. An answer from a new peer
+    /// replaces that PC's transport instead, and the new transport offers: `Ok(Some(pc))`.
+    /// `Err` only when the video transport could not be replaced, which leaves the
+    /// session nothing to stream on.
+    pub(crate) fn inbound(
+        &mut self,
+        mut msg: SignalMsg,
+        out_tx: &pipeline::OutTx,
+        srd_fail_tx: Option<&pipeline::SrdFailTx>,
+        srd_ok_tx: Option<&pipeline::SrdOkTx>,
+    ) -> anyhow::Result<Option<PcId>> {
+        let pc = match &msg {
+            SignalMsg::Answer { pc, .. }
+            | SignalMsg::Ice { pc, .. }
+            | SignalMsg::RestartIce { pc } => pc.unwrap_or_default(),
+            _ => PcId::Video,
+        };
+        let i = pc as usize;
+        let target = match pc {
+            PcId::Video => Some(&self.video.webrtc),
+            PcId::Audio => self.audio_webrtc.as_ref(),
+        };
+        let negotiation = &self.negotiation[i];
+        let verdict =
+            server::classify_inbound(&msg, &mut self.unanswered[i], &self.displaced[i], |sdp| {
+                negotiation.who(sdp, target.is_some_and(pipeline::dtls_started))
+            });
+        // Replacements and re-offers share one budget: both are a client making the host
+        // do work with an answer.
+        let over_budget = |budget: &mut ReplacementBudget| match budget.admit(Instant::now()) {
+            Admission::Admitted => false,
+            Admission::Refused { first } => {
+                if first {
+                    tracing::warn!(
+                        token = "transport-replace-rate-limited",
+                        "{pc} PC: {MAX_REPLACEMENTS_PER_WINDOW} transport replacements or \
+                         re-offers in {} s — an answer that asks for another is ignored \
+                         until the window clears. The peer already connected keeps the \
+                         stream; the newer one gets no offer and no error",
+                        REPLACEMENT_WINDOW.as_secs()
+                    );
+                }
+                true
+            }
+        };
+        match verdict {
+            server::Inbound::Stale => {
+                if matches!(msg, SignalMsg::Answer { .. }) {
+                    tracing::info!(
+                        token = "signaling-answer-from-displaced-peer",
+                        "{pc} PC: dropped an answer from a peer whose transport was replaced"
+                    );
+                }
+                return Ok(None);
+            }
+            server::Inbound::NewPeer(pc) => {
+                // Not applied either: it would rebind the current peer's transport.
+                if over_budget(&mut self.budget[i]) {
+                    return Ok(None);
+                }
+                tracing::info!(
+                    token = "transport-replaced",
+                    "{pc} PC: the answer is from a peer this transport has not negotiated \
+                     with — replacing the transport"
+                );
+                if let Some(gone) = self.negotiation[i].replaced() {
+                    let displaced = &mut self.displaced[i];
+                    displaced.push(gone);
+                    if displaced.len() > DISPLACED_REMEMBERED {
+                        displaced.remove(0);
+                    }
+                }
+                match pc {
+                    PcId::Video => self.slot.replace_video(&mut self.video)?,
+                    PcId::Audio => {
+                        self.audio_pipeline.finish();
+                        let (webrtc, pipe) = self.slot.build_audio().unwrap_or_else(|e| {
+                            // Audio must never kill video.
+                            tracing::warn!(
+                                token = "audio-transport-replace-failed",
+                                "audio transport for the new peer failed to build: {e:#} \
+                                 (this peer gets no audio)"
+                            );
+                            (None, None)
+                        });
+                        self.audio_webrtc = webrtc;
+                        self.audio_pipeline = AudioPipelineGuard::new(pipe);
+                        self.audio_pipeline.play();
+                    }
+                }
+                self.unanswered[i] = true;
+                tracing::info!(
+                    token = "transport-replacement-built",
+                    "{pc} PC: new transport built and offering; {} replacement(s) on this \
+                     PC in the last {} s",
+                    self.budget[i].recent.len(),
+                    REPLACEMENT_WINDOW.as_secs()
+                );
+                return Ok(Some(pc));
+            }
+            server::Inbound::Reoffer(pc) => {
+                if over_budget(&mut self.budget[i]) {
+                    return Ok(None);
+                }
+                tracing::info!(
+                    token = "transport-reoffered",
+                    "{pc} PC: the negotiated peer answered with other ICE credentials \
+                     before any DTLS — its earlier answer was for another offer; offering \
+                     again on the same transport"
+                );
+                self.negotiation[i].reoffered = true;
+                msg = SignalMsg::RestartIce { pc: Some(pc) };
+            }
+            server::Inbound::Apply => {
+                // One that reaches a transport before its first offer is absorbed.
+                if matches!(msg, SignalMsg::RestartIce { .. })
+                    && target.is_some_and(pipeline::has_offered)
+                {
+                    self.negotiation[i].reoffered = true;
+                }
+            }
+        }
+        let answer = match &msg {
+            SignalMsg::Answer { sdp, .. } => Some(sdp.clone()),
+            _ => None,
+        };
+        match server::apply_inbound_as_offerer(
+            msg,
+            &self.video.webrtc,
+            self.audio_webrtc.as_ref(),
+            out_tx,
+            srd_fail_tx,
+            srd_ok_tx,
+        ) {
+            // Recorded only now: an answer that does not parse was handed to nothing, and
+            // must not stand for the peer the next answer is read against.
+            Ok(()) => {
+                if let Some(answer) = answer {
+                    self.negotiation[i].applied(answer);
+                }
+            }
+            Err(e) => tracing::warn!(
+                token = "signaling-apply-failed",
+                "apply inbound signaling: {e:#}"
+            ),
+        }
+        Ok(None)
+    }
+}
+
+/// Stop the source on the session's way out. The video transport lets go first: one whose
+/// peer never connected holds the encode chain's push, and a source that waits on that
+/// chain through interpipe never reaches NULL (#535).
+fn stop_source(source: &mut AppSource, transports: &SessionTransports) {
+    transports.video.release();
+    tracing::info!(
+        token = "session-transport-released",
+        "video transport released ahead of the source teardown"
+    );
+    source.teardown();
 }
 
 /// Should an idle `running` session be reaped? `Some(reason)` to reap. Pure so the policy
@@ -1165,6 +1460,13 @@ fn idle_reap_reason(
         Some(d) if d >= window => Some("idle: WebRTC transport lost"),
         _ => None,
     }
+}
+
+/// Was `msg` posted by an element that is still in `pipeline`?
+fn posted_by_live_graph(msg: &gst::Message, pipeline: &gst::Pipeline) -> bool {
+    msg.src().is_none_or(|src| {
+        src == pipeline.upcast_ref::<gst::Object>() || src.has_as_ancestor(pipeline)
+    })
 }
 
 /// Whether an ICE connection state counts as "transport established".
@@ -1284,6 +1586,109 @@ fn swap_source_ready(
     }
 }
 
+/// Starts generation 0 (compositor plus first app container) behind `sink0`; on failure
+/// emits `Failed` and returns `None`. Keep the returned Vulkan contexts for the runner's
+/// life: every replacement compositor must receive them before start, or it may create a
+/// second VkDevice while the encoder stays bound to generation 0.
+#[allow(clippy::too_many_arguments)]
+fn start_first_source<F: Fn(SessionEvent)>(
+    cfg: &SessionConfig,
+    session_id: &str,
+    sink0: &str,
+    res: &SessionResources,
+    session_metrics: &Arc<SessionMetrics>,
+    shared_clock: &gst::Clock,
+    shared_base: gst::ClockTime,
+    cuda_ctx: Option<&gst::Context>,
+    va_ctx: Option<&gst::Context>,
+    emit: &F,
+) -> Option<(AppSource, Option<VulkanContextBridge>)> {
+    let cname0 = app_container_name(session_id, 0);
+    stage("source-build");
+    let mut source =
+        match AppSource::new(cfg, session_id, sink0, &cname0, res, cfg.container.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    token = "runner-source-build-failed",
+                    error = %format_args!("{e:#}"),
+                    "build source pipeline failed"
+                );
+                emit(SessionEvent::Failed(format!(
+                    "build source pipeline: {e:#}"
+                )));
+                return None;
+            }
+        };
+    if std::env::var("QUASAR_DIAG_NO_OBS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        tracing::warn!(
+            token = "diag-observability-disabled",
+            "QUASAR_DIAG_NO_OBS=1: compositor/encode/stage probes disabled (leak bisection)"
+        );
+    } else {
+        source.attach_compositor_metrics(session_metrics.clone(), cfg.latency_probe);
+    }
+    source.apply_shared_clock(shared_clock, shared_base);
+    // Both contexts must be injected before the source leaves NULL (no-op when None).
+    if let Some(ctx) = cuda_ctx {
+        source.apply_cuda_context(ctx);
+    }
+    if let Some(ctx) = va_ctx {
+        source.apply_va_context(ctx);
+    }
+    // Advertise the session's rung ladder as `wl_output` modes BEFORE the compositor
+    // starts, so a guest that reads its mode list once at startup sees all of them. No-op
+    // on a compositor image without the property. This is the internal half: what the app
+    // may pick from, independent of the external size.
+    source.set_mode_ladder(&super::rungs::available_rungs(
+        cfg.stream.width,
+        cfg.stream.height,
+    ));
+    stage("source-start");
+    if let Err(e) = source.start() {
+        tracing::error!(
+            token = "runner-source-start-failed",
+            error = %format_args!("{e:#}"),
+            "start source pipeline failed"
+        );
+        emit(SessionEvent::Failed(format!(
+            "start source pipeline: {e:#}"
+        )));
+        return None;
+    }
+    let vulkan_contexts = if pipeline::vulkan_image_transport(cfg) {
+        stage("vulkan-capture");
+        match VulkanContextBridge::capture(&source) {
+            Ok(contexts) => Some(contexts),
+            Err(e) => {
+                tracing::error!(
+                    token = "runner-vulkan-capture-failed",
+                    error = %format_args!("{e:#}"),
+                    "capture Vulkan producer contexts failed"
+                );
+                emit(SessionEvent::Failed(format!(
+                    "capture Vulkan producer contexts: {e:#}"
+                )));
+                source.teardown();
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    Some((source, vulkan_contexts))
+}
+
+/// One line per step of a launch, so the last one before a crash says how far the runner
+/// thread had got. The compositor logs from its own thread, and without these the runner
+/// is silent from the assignment to the encoder's line (#267).
+fn stage(name: &'static str) {
+    tracing::info!(stage = name, "session stage: {name}");
+}
+
 /// Run one session to completion on the calling (dedicated) thread, over the split
 /// pipeline so the source app can be swapped while encode + `webrtcbin` stay live.
 ///
@@ -1331,6 +1736,20 @@ pub fn run_blocking(
     }
     let _metrics_hook_guard = MetricsHookGuard(session_metrics.clone());
 
+    // A console session has no media pipeline at all: its desktop drives the display.
+    if cfg.video_topology == VideoTopology::LocalOnly {
+        drop(capture_rx);
+        direct_display::run_direct(
+            &session_id,
+            &cfg,
+            &emit,
+            diagnostic_tx,
+            stop,
+            session_metrics,
+        );
+        return;
+    }
+
     if let Err(e) = super::ensure_gst_init(&cfg) {
         tracing::error!(
             token = "runner-gst-init-failed",
@@ -1364,29 +1783,12 @@ pub fn run_blocking(
             return;
         }
     };
+    // Must stay ahead of the source start, so the plugin's init is over before this
+    // session's compositor exists. A no-op when the agent preloaded it; after a live
+    // encoder change it is the only load, and other sessions may be running beside it.
+    pipeline::preload_encoder_plugins(&[&resolved_encoder.factory]);
     emit(SessionEvent::Starting);
     emit(SessionEvent::Progress("preparing resources and image"));
-
-    // #407: a local console session holds the console VT, keyboard off, from before its
-    // virtual keyboard exists until after it is gone, so nothing typed in the session
-    // reaches a host login prompt. Must be declared before `res`, weston and the physical
-    // input forwarder so it drops after them. Fail-closed.
-    let mut console_vt: Option<super::console_vt::ConsoleVt> = if wants_console_vt(&cfg) {
-        match super::console_vt::ConsoleVt::take(stop.clone()) {
-            Ok(vt) => Some(vt),
-            Err(e) => {
-                tracing::error!(
-                    token = "runner-console-vt-failed",
-                    error = %format_args!("{e:#}"),
-                    "console session refused: the console terminal could not be taken"
-                );
-                emit(SessionEvent::Failed(format!("console terminal: {e:#}")));
-                return;
-            }
-        }
-    } else {
-        None
-    };
 
     // Session-level resources (input devices + PulseAudio sidecar) shared across
     // swaps. Dropping `res` releases the sidecar; each AppSource borrows its nodes.
@@ -1415,7 +1817,7 @@ pub fn run_blocking(
         // terminal.
         let reason = res
             .audio_degraded_reason()
-            .unwrap_or("PulseAudio sidecar unavailable")
+            .unwrap_or("audio sidecar unavailable")
             .to_string();
         if cfg.audio_required {
             tracing::error!(
@@ -1481,170 +1883,26 @@ pub fn run_blocking(
     let va_ctx: Option<gst::Context> = None;
 
     // gen 0: the initial source (compositor + first app container) behind the interpipe
-    // boundary; `sink_name` is the node the encoder listens to. Local-only MUST establish
-    // the physical DRM mode before the Vulkan capture compositor creates its
-    // device/context: on NVIDIA, modesetting Weston after waylanddisplaysrc was already
-    // PLAYING reproducibly faulted the source GPU channel (Xid 13/32, then
-    // VK_ERROR_DEVICE_LOST).
-    let local_backend = console::local_backend(cfg.console_config.as_ref());
-    let prestarted_weston = if cfg.video_topology == VideoTopology::LocalOnly
-        && local_backend == console::LocalBackend::Weston
-    {
-        match console::spawn_weston_console(&session_id, cfg.console_config.as_ref()) {
-            Ok(weston) => Some(weston),
-            Err(e) => {
-                tracing::error!(
-                    token = "runner-weston-prelaunch-failed",
-                    error = %format_args!("{e:#}"),
-                    "spawn weston console failed"
-                );
-                emit(SessionEvent::Failed(format!("spawn weston console: {e:#}")));
-                return;
-            }
-        }
-    } else {
-        None
-    };
-
+    // boundary; `sink_name` is the node the encoder listens to.
     let mut gen: u64 = 0;
     let sink0 = ipsink_name(&session_id, gen);
-    let cname0 = app_container_name(&session_id, gen);
-    let mut current_source = match AppSource::new(
+    let Some((mut current_source, vulkan_contexts)) = start_first_source(
         &cfg,
         &session_id,
         &sink0,
-        &cname0,
         &res,
-        cfg.container.clone(),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                token = "runner-source-build-failed",
-                error = %format_args!("{e:#}"),
-                "build source pipeline failed"
-            );
-            emit(SessionEvent::Failed(format!(
-                "build source pipeline: {e:#}"
-            )));
-            return;
-        }
-    };
-    if std::env::var("QUASAR_DIAG_NO_OBS")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
-        tracing::warn!(
-            token = "diag-observability-disabled",
-            "QUASAR_DIAG_NO_OBS=1: compositor/encode/stage probes disabled (leak bisection)"
-        );
-    } else {
-        current_source.attach_compositor_metrics(session_metrics.clone(), cfg.latency_probe);
-    }
-    current_source.apply_shared_clock(&shared_clock, shared_base);
-    // Both contexts must be injected before the source leaves NULL (no-op when None).
-    if let Some(ctx) = cuda_ctx.as_ref() {
-        current_source.apply_cuda_context(ctx);
-    }
-    if let Some(ctx) = va_ctx.as_ref() {
-        current_source.apply_va_context(ctx);
-    }
-    // Advertise the session's rung ladder as `wl_output` modes BEFORE the compositor
-    // starts, so a guest that reads its mode list once at startup sees all of them. No-op
-    // on a compositor image without the property. This is the internal half: what the app
-    // may pick from, independent of the external size.
-    current_source.set_mode_ladder(&super::rungs::available_rungs(
-        cfg.stream.width,
-        cfg.stream.height,
-    ));
-    // #445: a local console also advertises the monitor's REAL modes, each with its own
-    // refresh, so the app's display settings list them and a choice comes back as a mode
-    // request the local-only loop acts on. Same bind-time rule as the ladder.
-    let console_modes: Vec<crate::messages::ConsoleModeSelection> =
-        if cfg.video_topology == VideoTopology::LocalOnly {
-            let outputs = crate::capacity::detect_drm_outputs();
-            let modes = console::console_output_modes(cfg.console_config.as_ref(), &outputs);
-            if !modes.is_empty() {
-                let triples: Vec<(i32, i32, i32)> = modes
-                    .iter()
-                    .map(|m| (m.width as i32, m.height as i32, m.refresh_millihz as i32))
-                    .collect();
-                current_source.set_output_modes(&triples);
-            }
-            modes
-        } else {
-            Vec::new()
-        };
-    if let Err(e) = current_source.start() {
-        tracing::error!(
-            token = "runner-source-start-failed",
-            error = %format_args!("{e:#}"),
-            "start source pipeline failed"
-        );
-        emit(SessionEvent::Failed(format!(
-            "start source pipeline: {e:#}"
-        )));
+        &session_metrics,
+        &shared_clock,
+        shared_base,
+        cuda_ctx.as_ref(),
+        va_ctx.as_ref(),
+        &emit,
+    ) else {
         return;
-    }
-    // Retained for the full runner lifetime: every replacement compositor MUST receive
-    // these before start or it may create a second logical VkDevice while the persistent
-    // encoder stays bound to generation 0.
-    let vulkan_contexts = if pipeline::vulkan_image_transport(&cfg) {
-        match VulkanContextBridge::capture(&current_source) {
-            Ok(contexts) => Some(contexts),
-            Err(e) => {
-                tracing::error!(
-                    token = "runner-vulkan-capture-failed",
-                    error = %format_args!("{e:#}"),
-                    "capture Vulkan producer contexts failed"
-                );
-                emit(SessionEvent::Failed(format!(
-                    "capture Vulkan producer contexts: {e:#}"
-                )));
-                current_source.teardown();
-                return;
-            }
-        }
-    } else {
-        None
     };
     emit(SessionEvent::Progress(
         "container started; first frame ready",
     ));
-
-    // Local-only is an encoder-free topology: no encode pipeline, webrtcbin, RTP/audio
-    // transport, signaling or transport idle-reaper. The source feeds only the local
-    // display interpipe listener.
-    if cfg.video_topology == VideoTopology::LocalOnly {
-        // Nothing any capture kind can observe here. `capture::admit` already refuses
-        // `session_capture` for this topology; dropping the receiver makes that
-        // structural rather than a convention.
-        drop(capture_rx);
-        run_local_only(
-            &session_id,
-            &cfg,
-            &emit,
-            diagnostic_tx,
-            stop,
-            swap_rx,
-            display_rx,
-            &res,
-            &mut current_source,
-            &mut gen,
-            session_metrics.clone(),
-            &sink0,
-            &shared_clock,
-            shared_base,
-            cuda_ctx.as_ref(),
-            va_ctx.as_ref(),
-            vulkan_contexts.as_ref(),
-            local_backend,
-            prestarted_weston,
-            console_vt.as_mut(),
-            console_modes,
-        );
-        return;
-    }
 
     // session-display-update state: the compositor's app-facing render size (`None` is the
     // pinned encode size) and UI scale. Re-applied to each new source generation after a
@@ -1658,6 +1916,7 @@ pub fn run_blocking(
     let (sig_tx, mut sig_rx) = tokio::sync::mpsc::unbounded_channel::<SignalMsg>();
     // GStreamer callbacks (ABR retarget, ICE/connection state) use the bounded diagnostic
     // lane; lifecycle/signaling stays on evt_tx.
+    stage("encode-build");
     let built = match pipeline::build_encode_pipeline(
         &cfg,
         sig_tx.clone(),
@@ -1691,8 +1950,8 @@ pub fn run_blocking(
     };
     let pipeline::EncodePipeline {
         pipeline: encode_pipe,
-        webrtc,
-        data_channel: _dc,
+        video,
+        transport,
         interpipesrc,
         audio_webrtc,
         audio_pipeline: audio_pipeline_raw,
@@ -1717,9 +1976,9 @@ pub fn run_blocking(
              down every session on the host. Opt out with QUASAR_NVENC_DEFER_TEARDOWN=0"
         );
     }
-    // #408: take ownership in a Drop-to-NULL guard the moment the pipeline exists, so
-    // every early encode-setup failure return below is covered.
-    let audio_pipeline = AudioPipelineGuard::new(audio_pipeline_raw);
+    // #408: the audio pipeline is in its Drop-to-NULL guard from here, so every early
+    // encode-setup failure return below is covered.
+    let mut transports = SessionTransports::new(transport, video, audio_webrtc, audio_pipeline_raw);
     // Same clock + base as the source pipeline(s) so interpipesrc's pass-through PTS land
     // in this pipeline's running-time (#68).
     encode_pipe.set_start_time(None::<gst::ClockTime>);
@@ -1751,6 +2010,7 @@ pub fn run_blocking(
         // the fresh Vulkan device is unusable before any session owns it: a GPU-global
         // `device_open_failed`, which the agent escalates to a drain+restart. A plain
         // build error stays per-session; `build_failure_reason` picks.
+        stage("encode-ready");
         if let Err(e) = encode_pipe.set_state(gst::State::Ready) {
             let reason = vulkan_fault::build_failure_reason(
                 "encode set READY for Vulkan device verification",
@@ -1762,7 +2022,7 @@ pub fn run_blocking(
                 "encode pipeline READY transition (Vulkan device verification) failed"
             );
             emit(SessionEvent::Failed(reason));
-            current_source.teardown();
+            stop_source(&mut current_source, &transports);
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             return;
         }
@@ -1777,11 +2037,12 @@ pub fn run_blocking(
                 "verify Vulkan context identity failed"
             );
             emit(SessionEvent::Failed(reason));
-            current_source.teardown();
+            stop_source(&mut current_source, &transports);
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             return;
         }
     }
+    stage("encode-play");
     if let Err(e) = encode_pipe.set_state(gst::State::Playing) {
         tracing::error!(
             token = "runner-encode-playing-failed",
@@ -1789,7 +2050,7 @@ pub fn run_blocking(
             "encode pipeline PLAYING transition failed"
         );
         emit(SessionEvent::Failed(format!("encode set PLAYING: {e}")));
-        current_source.teardown();
+        stop_source(&mut current_source, &transports);
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         return;
     }
@@ -1811,256 +2072,18 @@ pub fn run_blocking(
             );
         }
     }
-    // #304: the audio pipeline is a separate gst::Pipeline, set PLAYING independently so
-    // neither blocks the other's state transition. Teardown is the idempotent
-    // `audio_pipeline.finish()`, the one mechanism no exit path can skip.
-    if let Some(audio_pipe) = audio_pipeline.as_ref() {
-        // Never force the session's shared clock here (#351): the pipeline must run on
-        // the capture's own clock. Slaved to the SystemClock, the monitor's sample count
-        // drifts ahead of it (~80 ppm measured), audiobasesrc's skew slaving only corrects
-        // a capture that runs slow, and webrtcbin's internal `clocksync sync=true` then
-        // holds each buffer until its timestamp. After ~40 min that wait passes the 200 ms
-        // capture ring buffer and the capture drops ~200 ms of every ~270 ms. Nothing
-        // needs the shared clock: this PC is not lip-synced to video (#304).
-        if let Err(e) = audio_pipe.set_state(gst::State::Playing) {
-            tracing::warn!(
-                token = "audio-pipeline-play-failed",
-                "audio pipeline set PLAYING failed: {e:#} (audio disabled)"
-            );
-        } else {
-            let clock = audio_pipe
-                .clock()
-                .map(|c| c.name().to_string())
-                .unwrap_or_else(|| "none yet".into());
-            tracing::info!("audio pipeline PLAYING (separate from encode, clock {clock})");
-        }
-    }
-    // Optional local-display fan-out (third interpipe listener into waylandsink+headless
-    // weston, or kmssink). The nvidia-drm path needs weston, since kmssink cannot drive
-    // nvidia's atomic-only KMS. Gated by console_config.enabled, falling back to the
-    // dev-only QUASAR_LOCAL_DISPLAY.
-    //
-    // Teardown order is load-bearing: `_weston` MUST be declared before `_local_display`
-    // so reverse-declaration drop releases waylandsink's surface before weston is killed.
-    let console_enabled = match cfg.console_config.as_ref() {
-        Some(cc) => cc.enabled && cfg.video_topology == VideoTopology::DualOutput,
-        None => std::env::var("QUASAR_LOCAL_DISPLAY")
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false),
-    };
-    // A real console session must drive the local display: its failure fails the session
-    // (fail-closed). The QUASAR_LOCAL_DISPLAY dev fallback stays best-effort, so this is
-    // `false` for the env path even when `console_enabled` is true.
-    let console_required = cfg
-        .console_config
-        .as_ref()
-        .map(|cc| cc.enabled)
-        .unwrap_or(false)
-        && cfg.video_topology == VideoTopology::DualOutput;
-    if let Some(cc) = cfg.console_config.as_ref() {
-        if cc.enabled && cc.compositor != "weston" {
-            tracing::info!(
-                token = "console-compositor-not-wired",
-                "console_config.compositor={:?} not yet wired (CM-04); using weston",
-                cc.compositor
-            );
-        }
-    }
-    let local_backend = console::local_backend(cfg.console_config.as_ref());
-    let _weston: Option<console::WestonConsole> = 'weston: {
-        if !console_enabled || local_backend == console::LocalBackend::DirectKms {
-            break 'weston None;
-        }
-        match console::spawn_weston_console(&session_id, cfg.console_config.as_ref()) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                tracing::warn!(
-                    token = "console-weston-spawn-failed",
-                    "spawn weston console failed: {e:#} (local display disabled)"
-                );
-                None
-            }
-        }
-    };
-    let _local_display: Option<pipeline::LocalDisplay> = 'local_display: {
-        if !console_enabled {
-            break 'local_display None;
-        }
-        // If Weston was selected but failed to come up, don't build the fan-out.
-        if local_backend == console::LocalBackend::Weston && _weston.is_none() {
-            if console_required {
-                fail_dualoutput_console(
-                    &emit,
-                    "console: weston compositor failed to start for local display".into(),
-                    &mut current_source,
-                    &encode_pipe,
-                    audio_pipeline.as_ref(),
-                    defer_encode_teardown,
-                );
-                return;
-            }
-            break 'local_display None;
-        }
-        let socket = _weston.as_ref().map(|weston| weston.socket.as_str());
-        let ld = match pipeline::build_local_display_pipeline(&cfg, &sink0, socket) {
-            Ok(ld) => ld,
-            Err(e) => {
-                if console_required {
-                    fail_dualoutput_console(
-                        &emit,
-                        format!("console: build local-display pipeline failed: {e:#}"),
-                        &mut current_source,
-                        &encode_pipe,
-                        audio_pipeline.as_ref(),
-                        defer_encode_teardown,
-                    );
-                    return;
-                }
-                tracing::warn!(
-                    token = "console-display-pipeline-build-failed",
-                    "build local-display pipeline failed: {e:#}"
-                );
-                break 'local_display None;
-            }
-        };
-        // Same clock+base as the source/encode pipelines (#68).
-        ld.pipeline.set_start_time(None::<gst::ClockTime>);
-        ld.pipeline.use_clock(Some(&shared_clock));
-        ld.pipeline.set_base_time(shared_base);
-        // The DualOutput local-display leg consumes the shared VulkanImage interpipe via
-        // `vulkandownload`, which needs the producer's Vulkan instance+device to map its
-        // images. Inject the gen-0 contexts BEFORE this pipeline's NULL->READY transition
-        // or `vulkandownload` binds a private device first (the va_share lesson) and the
-        // browser stream runs fine while the monitor stays black. Non-Vulkan legs never
-        // carry VulkanImage, so `vulkan_contexts` is `None` for them.
-        if let Some(vk) = vulkan_contexts.as_ref() {
-            vk.install_on_pipeline(&ld.pipeline);
-            tracing::info!(
-                gst_vulkan_device = format_args!("{:#x}", vk.device_identity),
-                "console: shared producer Vulkan instance/device installed on local-display pipeline"
-            );
-        }
-        // Vulkan/VA need the shared GPU context adopted before PLAYING (mirror encode pipe).
-        if let Some(ctx) = va_ctx.as_ref() {
-            ld.pipeline.set_context(ctx);
-            super::va_share::install_need_context_handler(&ld.pipeline, ctx);
-        }
-        if let Some(ctx) = cuda_ctx.as_ref() {
-            ld.pipeline.set_context(ctx);
-        }
-        if let Err(e) = ld.pipeline.set_state(gst::State::Playing) {
-            if console_required {
-                // Consumer-before-source teardown: NULL the local-display pipeline before
-                // fail_dualoutput_console tears down the producing source.
-                let _ = ld.pipeline.set_state(gst::State::Null);
-                fail_dualoutput_console(
-                    &emit,
-                    format!("console: local-display pipeline failed to reach PLAYING: {e:#}"),
-                    &mut current_source,
-                    &encode_pipe,
-                    audio_pipeline.as_ref(),
-                    defer_encode_teardown,
-                );
-                return;
-            }
-            tracing::warn!(
-                token = "console-display-pipeline-play-failed",
-                "local-display pipeline PLAYING failed: {e:#} \
-                 (console enabled but no local output)"
-            );
-            break 'local_display None;
-        }
-        let connector = cfg
-            .console_config
-            .as_ref()
-            .map(|c| c.connector.as_str())
-            .unwrap_or("auto");
-        tracing::info!(
-            "console mode: local-display fan-out PLAYING (connector={connector}, backend={})",
-            local_backend.name()
-        );
-        Some(ld)
-    };
-
-    // Optional local-audio fan-out: an independent `pulsesrc` client of the session's
-    // PulseAudio sidecar feeding a host ALSA device. Gated on `console_config.enabled` and
-    // a `Some` `audio_output`; `audio_output: null` means console video only, so nothing is
-    // built rather than built-then-muted (avoids an idle ALSA open and a spurious pulsesrc
-    // client). Needs no swap re-pointing: the sidecar is session-scoped and outlives every
-    // app swap.
-    let _local_audio: Option<pipeline::LocalAudio> = 'local_audio: {
-        let Some(cc) = cfg.console_config.as_ref() else {
-            break 'local_audio None;
-        };
-        if !cc.enabled {
-            break 'local_audio None;
-        }
-        let Some(audio_output) = cc.audio_output.as_deref() else {
-            break 'local_audio None;
-        };
-        let la = match pipeline::build_local_audio_pipeline(&cfg, audio_output) {
-            Ok(la) => la,
-            Err(e) => {
-                tracing::warn!(
-                    token = "console-audio-pipeline-build-failed",
-                    "build local-audio pipeline failed: {e:#}"
-                );
-                break 'local_audio None;
-            }
-        };
-        // pulsesrc/alsasink do not participate in the interpipe running-time contract
-        // (#68), but sharing the session clock+base keeps one coherent timebase.
-        la.pipeline.set_start_time(None::<gst::ClockTime>);
-        la.pipeline.use_clock(Some(&shared_clock));
-        la.pipeline.set_base_time(shared_base);
-        if let Err(e) = la.pipeline.set_state(gst::State::Playing) {
-            tracing::warn!(
-                token = "console-audio-pipeline-play-failed",
-                "local-audio pipeline PLAYING failed: {e:#} \
-                 (console audio disabled, video unaffected)"
-            );
-            break 'local_audio None;
-        }
-        tracing::info!("console mode: local-audio fan-out PLAYING (device={audio_output})");
-        Some(la)
-    };
-
-    // Optional physical keyboard/mouse grab, forwarded into the session's virtual devices
-    // (`physical_input.rs` says why a forwarder, not a second compositor input path).
-    // Gated on `console_config.enabled` AND `grab` AND a non-null `input_devices`, so
-    // console mode without grab never touches physical devices. Dropping it ungrabs every
-    // device, and a leaked grab locks host input.
-    let _physical_input: Option<super::physical_input::PhysicalInput> = 'phys_input: {
-        let Some(cc) = cfg.console_config.as_ref() else {
-            break 'phys_input None;
-        };
-        if !cc.enabled || !cc.grab || cc.input_devices.is_null() {
-            break 'phys_input None;
-        }
-        let Some(devices) = res.devices.as_ref() else {
-            tracing::warn!(
-                token = "console-grab-no-virtual-devices",
-                "console-mode: grab requested but this session has no virtual input \
-                 devices (use_test_src?) — physical input disabled"
-            );
-            break 'phys_input None;
-        };
-        Some(super::physical_input::PhysicalInput::start(
-            &cc.input_devices,
-            cc.auto_connect_controller,
-            devices,
-        ))
-    };
-
+    // Teardown is the idempotent `audio_pipeline.finish()`, the one mechanism no exit
+    // path can skip.
+    transports.audio_pipeline.play();
     let Some(encode_bus) = encode_pipe.bus() else {
         tracing::error!(
             token = "runner-encode-bus-missing",
             "encode pipeline has no bus"
         );
         emit(SessionEvent::Failed("encode pipeline has no bus".into()));
-        current_source.teardown();
+        stop_source(&mut current_source, &transports);
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-        audio_pipeline.finish();
+        transports.audio_pipeline.finish();
         return;
     };
 
@@ -2076,6 +2099,8 @@ pub fn run_blocking(
     let mut running_since: Option<Instant> = None;
     let mut ever_connected = false;
     let mut unhealthy_since: Option<Instant> = None;
+    // When the video transport was last replaced for a new peer (#535).
+    let mut transport_since: Option<Instant> = None;
     // One debounce tracker for the session's lifetime, so a repeat marker across separate
     // bus-pump iterations is what trips the fail-closed path.
     let mut renderer_degrade_tracker = RendererDegradeTracker::default();
@@ -2115,25 +2140,11 @@ pub fn run_blocking(
     let mut last_ice_ufrag: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     loop {
-        if let Some(reason) = console_vt.as_mut().and_then(|vt| vt.lost()) {
-            if let Some(ld) = _local_display.as_ref() {
-                let _ = ld.pipeline.set_state(gst::State::Null);
-            }
-            fail_dualoutput_console(
-                &emit,
-                format!("console terminal lost: {reason}"),
-                &mut current_source,
-                &encode_pipe,
-                audio_pipeline.as_ref(),
-                defer_encode_teardown,
-            );
-            return;
-        }
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
-            current_source.teardown(); // remove the app container before media
+            stop_source(&mut current_source, &transports); // remove the app container before media
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-            audio_pipeline.finish();
+            transports.audio_pipeline.finish();
             emit(SessionEvent::Stopped {
                 bytes_used: compute_bytes_used(&cfg),
                 detail: None,
@@ -2168,7 +2179,6 @@ pub fn run_blocking(
                         &cfg,
                         &encode_pipe,
                         &interpipesrc,
-                        _local_display.as_ref().map(|_| local_backend.name()),
                     )));
                     effective_media_sent = true;
                     // Emit the audio-degradation trace event here, not at detection: the
@@ -2346,18 +2356,28 @@ pub fn run_blocking(
 
         // Inbound relay signaling (answer/ICE from the browser).
         while let Ok(msg) = sig_in_rx.try_recv() {
-            if let Err(e) = server::apply_inbound_as_offerer(
-                msg,
-                &webrtc,
-                audio_webrtc.as_ref(),
-                &sig_tx,
-                Some(&srd_fail_tx),
-                Some(&srd_ok_tx),
-            ) {
-                tracing::warn!(
-                    token = "signaling-apply-failed",
-                    "apply inbound signaling: {e:#}"
-                );
+            match transports.inbound(msg, &sig_tx, Some(&srd_fail_tx), Some(&srd_ok_tx)) {
+                Ok(None) => {}
+                // The idle reap watches the new video transport, which has yet to connect.
+                Ok(Some(PcId::Video)) => {
+                    ever_connected = false;
+                    unhealthy_since = None;
+                    transport_since = Some(Instant::now());
+                }
+                Ok(Some(PcId::Audio)) => {}
+                Err(e) => {
+                    let reason = format!("replace video transport for a new peer: {e:#}");
+                    tracing::error!(
+                        token = "runner-transport-replace-failed",
+                        reason = %reason,
+                        "video transport replacement failed"
+                    );
+                    emit(SessionEvent::Failed(reason));
+                    stop_source(&mut current_source, &transports);
+                    super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
+                    transports.audio_pipeline.finish();
+                    return;
+                }
             }
         }
 
@@ -2448,6 +2468,21 @@ pub fn run_blocking(
                 continue;
             }
             let reason = pipeline::remote_description_failure_reason(failure.pc, &failure.reason);
+            // On a replacement the takeover is lost, not the session: it has streamed,
+            // and a second device that cannot take it (a browser without the session's
+            // codec answers like this) must not cost the app that is running. The
+            // transport stays as an abandoned one; the next peer gets its own.
+            if transports.is_replacement(failure.pc) {
+                tracing::warn!(
+                    token = "transport-replacement-answer-rejected",
+                    session_id = %session_id,
+                    pc = %failure.pc,
+                    "the peer taking the session over sent an answer the host cannot \
+                     apply; that takeover is abandoned and the session keeps running: \
+                     {reason}"
+                );
+                continue;
+            }
             tracing::error!(
                 token = "webrtc-set-remote-failed",
                 session_id = %session_id,
@@ -2455,9 +2490,9 @@ pub fn run_blocking(
                 "webrtc: set-remote-description failed — failing session: {reason}"
             );
             emit(SessionEvent::Failed(reason));
-            current_source.teardown();
+            stop_source(&mut current_source, &transports);
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-            audio_pipeline.finish();
+            transports.audio_pipeline.finish();
             return;
         }
 
@@ -2491,12 +2526,6 @@ pub fn run_blocking(
             ) {
                 Ok(()) => {
                     emit(SessionEvent::SwapDone);
-                    // Re-point the local-display listener at the new source's
-                    // interpipesink alongside the encoder's (the same `gen`).
-                    if let Some(ld) = &_local_display {
-                        let sink = ipsink_name(&session_id, gen);
-                        ld.interpipesrc.set_property("listen-to", sink.as_str());
-                    }
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
@@ -2538,9 +2567,9 @@ pub fn run_blocking(
                         "swap failed fatally; ending session"
                     );
                     emit(SessionEvent::Failed(failure.reason));
-                    current_source.teardown();
+                    stop_source(&mut current_source, &transports);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                    audio_pipeline.finish();
+                    transports.audio_pipeline.finish();
                     return;
                 }
                 Err(failure) => emit(SessionEvent::SwapRolledBack(failure.reason)),
@@ -2549,7 +2578,9 @@ pub fn run_blocking(
 
         // Idle reap: watch the live transport on the encode webrtcbin.
         if let Some(since) = running_since {
-            let ice = webrtc
+            let ice = transports
+                .video
+                .webrtc
                 .property::<gstreamer_webrtc::WebRTCICEConnectionState>("ice-connection-state");
             if ice_is_connected(ice) {
                 ever_connected = true;
@@ -2559,18 +2590,15 @@ pub fn run_blocking(
             } else {
                 unhealthy_since = None;
             }
-            // A console session's real output is the physical display, so it must NEVER be
-            // reaped for a missing/lost WebRTC transport. Disables the reap for any
-            // console-enabled session, local-only or dual-output.
-            let reap_window = if cfg.console_config.as_ref().is_some_and(|c| c.enabled) {
-                Duration::ZERO
-            } else {
-                cfg.idle_timeout
-            };
+            let reap_window = cfg.idle_timeout;
             // #484: charge the never-connected window from the app-presented instant, not
             // the first offer — a cold app boot is 30–50 s. Appless sessions keep the old
             // clock.
-            let running_for = app_presented_at.unwrap_or(since).elapsed();
+            // A replaced transport gets the whole window to connect, from its own start.
+            let running_for = app_presented_at
+                .unwrap_or(since)
+                .max(transport_since.unwrap_or(since))
+                .elapsed();
             let booting = app_boot_started_at.is_some() && app_presented_at.is_none();
             if let Some(reason) = idle_reap_reason(
                 reap_window,
@@ -2588,9 +2616,9 @@ pub fn run_blocking(
                     app_presented_at.is_some()
                 );
                 emit(SessionEvent::Stopping);
-                current_source.teardown();
+                stop_source(&mut current_source, &transports);
                 super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                audio_pipeline.finish();
+                transports.audio_pipeline.finish();
                 tracing::error!(
                     token = "runner-idle-reap-failed",
                     reason = %reason,
@@ -2627,9 +2655,9 @@ pub fn run_blocking(
                             "source pipeline bus error"
                         );
                         emit(SessionEvent::Failed(reason));
-                        current_source.teardown();
+                        stop_source(&mut current_source, &transports);
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                        audio_pipeline.finish();
+                        transports.audio_pipeline.finish();
                         return;
                     }
                     gst::MessageView::Warning(warn) => {
@@ -2642,9 +2670,9 @@ pub fn run_blocking(
                                 "renderer degraded; failing session"
                             );
                             emit(SessionEvent::Failed(reason));
-                            current_source.teardown();
+                            stop_source(&mut current_source, &transports);
                             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                            audio_pipeline.finish();
+                            transports.audio_pipeline.finish();
                             return;
                         }
                     }
@@ -2664,9 +2692,9 @@ pub fn run_blocking(
             emit(SessionEvent::Failed(format!(
                 "container launch failed: {err}"
             )));
-            current_source.teardown();
+            stop_source(&mut current_source, &transports);
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-            audio_pipeline.finish();
+            transports.audio_pipeline.finish();
             return;
         }
 
@@ -2715,9 +2743,9 @@ pub fn run_blocking(
                         reason_code: REASON_APP_NEVER_PRESENTED,
                         app_log_tail: current_source.app_log_tail(),
                     });
-                    current_source.teardown();
+                    stop_source(&mut current_source, &transports);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                    audio_pipeline.finish();
+                    transports.audio_pipeline.finish();
                     return;
                 } else if app_boot_last_wait_log.elapsed() >= APP_BOOT_WAIT_LOG_INTERVAL {
                     app_boot_last_wait_log = Instant::now();
@@ -2733,25 +2761,7 @@ pub fn run_blocking(
 
         // App-liveness on a 5 s cadence, aligned with the metrics heartbeat.
         if liveness_cadence_at.elapsed() >= Duration::from_secs(5) {
-            let cadence_elapsed = liveness_cadence_at.elapsed();
             liveness_cadence_at = Instant::now();
-            // The DualOutput console leg's delivered-frame cadence, so the local display
-            // is observable in-process: delivered_fps ~0 while the browser stream keeps
-            // running is the "monitor black" symptom.
-            if let Some(ld) = &_local_display {
-                let frames = ld.drain_sink_frames();
-                let seconds = cadence_elapsed.as_secs_f64();
-                let expected = (cfg.stream.fps as f64 * seconds).round() as u64;
-                let missing = expected.saturating_sub(frames);
-                tracing::info!(
-                    target_fps = cfg.stream.fps,
-                    frames,
-                    window_ms = cadence_elapsed.as_millis() as u64,
-                    delivered_fps = format_args!("{:.2}", frames as f64 / seconds),
-                    missing,
-                    "local-display cadence"
-                );
-            }
             if let Some(status) = current_source.take_container_exit() {
                 let policy = current_source.exit_policy();
                 // Read BOTH before any teardown: the app-surface counter lives on the
@@ -2795,9 +2805,9 @@ pub fn run_blocking(
                             "app container exited; unrecognized disposition treated as fail"
                         );
                         emit(app_exit_event(status, presented, app_log_tail));
-                        current_source.teardown();
+                        stop_source(&mut current_source, &transports);
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                        audio_pipeline.finish();
+                        transports.audio_pipeline.finish();
                         return;
                     }
                     AppExitPolicy::Fail => {
@@ -2808,9 +2818,9 @@ pub fn run_blocking(
                             "app container exited; on_app_exit=fail"
                         );
                         emit(app_exit_event(status, presented, app_log_tail));
-                        current_source.teardown();
+                        stop_source(&mut current_source, &transports);
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                        audio_pipeline.finish();
+                        transports.audio_pipeline.finish();
                         return;
                     }
                 }
@@ -2820,6 +2830,15 @@ pub fn run_blocking(
         // Pump the encode bus (the transport); this paces the loop at ~POLL ms.
         if let Some(m) = encode_bus.timed_pop(gst::ClockTime::from_mseconds(POLL)) {
             match m.view() {
+                // A transport retired for a new peer may have posted before it left the
+                // pipeline. Its SCTP association dying is not this session's peer leaving.
+                gst::MessageView::Error(err) if !posted_by_live_graph(&m, &encode_pipe) => {
+                    tracing::debug!(
+                        "ignoring an error from a retired transport: {} ({:?})",
+                        err.error(),
+                        err.debug()
+                    );
+                }
                 gst::MessageView::Error(err) => {
                     // The SCTP signature lives in the DEBUG text, not the GError message
                     // (SCTP_ASSOCIATION_SIGNATURES): classify on both, concatenated.
@@ -2838,9 +2857,9 @@ pub fn run_blocking(
                             err.debug()
                         );
                         emit(SessionEvent::Stopping);
-                        current_source.teardown();
+                        stop_source(&mut current_source, &transports);
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                        audio_pipeline.finish();
+                        transports.audio_pipeline.finish();
                         emit(SessionEvent::Stopped {
                             bytes_used: compute_bytes_used(&cfg),
                             detail: None,
@@ -2878,9 +2897,9 @@ pub fn run_blocking(
                             },
                         );
                         emit(SessionEvent::Stopping);
-                        current_source.teardown();
+                        stop_source(&mut current_source, &transports);
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                        audio_pipeline.finish();
+                        transports.audio_pipeline.finish();
                         emit(SessionEvent::Stopped {
                             bytes_used: compute_bytes_used(&cfg),
                             detail: Some(PEER_DISCONNECT_DETAIL),
@@ -2903,9 +2922,9 @@ pub fn run_blocking(
                         "encode pipeline bus error"
                     );
                     emit(SessionEvent::Failed(reason));
-                    current_source.teardown();
+                    stop_source(&mut current_source, &transports);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                    audio_pipeline.finish();
+                    transports.audio_pipeline.finish();
                     return;
                 }
                 // `encoder.stall` reason discriminant only; this arm changes no behaviour.
@@ -2918,9 +2937,9 @@ pub fn run_blocking(
                     }
                 }
                 gst::MessageView::Eos(_) => {
-                    current_source.teardown();
+                    stop_source(&mut current_source, &transports);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                    audio_pipeline.finish();
+                    transports.audio_pipeline.finish();
                     emit(SessionEvent::Stopped {
                         bytes_used: compute_bytes_used(&cfg),
                         detail: None,
@@ -2931,779 +2950,6 @@ pub fn run_blocking(
             }
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_local_only<F: Fn(SessionEvent)>(
-    session_id: &str,
-    launch_cfg: &SessionConfig,
-    emit: &F,
-    diagnostic_tx: DiagnosticEventTx,
-    stop: Arc<AtomicBool>,
-    swap_rx: std::sync::mpsc::Receiver<SwapRequest>,
-    display_rx: std::sync::mpsc::Receiver<DisplayUpdateRequest>,
-    res: &SessionResources,
-    current_source: &mut AppSource,
-    gen: &mut u64,
-    session_metrics: Arc<SessionMetrics>,
-    sink0: &str,
-    shared_clock: &gst::Clock,
-    shared_base: gst::ClockTime,
-    cuda_ctx: Option<&gst::Context>,
-    va_ctx: Option<&gst::Context>,
-    vulkan_contexts: Option<&VulkanContextBridge>,
-    local_backend: console::LocalBackend,
-    prestarted_weston: Option<console::WestonConsole>,
-    mut console_vt: Option<&mut super::console_vt::ConsoleVt>,
-    // #445: the monitor's modes the compositor advertises; empty when no display is
-    // connected (then no mode request can be honoured).
-    console_modes: Vec<crate::messages::ConsoleModeSelection>,
-) {
-    // #445: the session's mode can move (a mode the app picked), so the config the
-    // display pipeline, a swap and the cadence log read is this live copy, not the
-    // launch config.
-    let mut live_cfg: SessionConfig = launch_cfg.clone();
-    let Some(cc) = live_cfg.console_config.clone().filter(|c| c.enabled) else {
-        tracing::error!(
-            token = "runner-local-only-console-required",
-            "local_only assignment requires enabled console_config"
-        );
-        emit(SessionEvent::Failed(
-            "local_only assignment requires enabled console_config".into(),
-        ));
-        current_source.teardown();
-        return;
-    };
-
-    let mut weston = match (local_backend, prestarted_weston) {
-        (console::LocalBackend::Weston, Some(weston)) => Some(weston),
-        (console::LocalBackend::Weston, None) => {
-            match console::spawn_weston_console(session_id, live_cfg.console_config.as_ref()) {
-                Ok(weston) => Some(weston),
-                Err(e) => {
-                    tracing::error!(
-                        token = "runner-weston-launch-failed",
-                        error = %format_args!("{e:#}"),
-                        "spawn weston console failed"
-                    );
-                    emit(SessionEvent::Failed(format!("spawn weston console: {e:#}")));
-                    current_source.teardown();
-                    return;
-                }
-            }
-        }
-        (console::LocalBackend::DirectKms, _) => None,
-    };
-    let mut local_display = match bring_up_local_display(
-        &live_cfg,
-        sink0,
-        weston.as_ref().map(|weston| weston.socket.as_str()),
-        current_source,
-        shared_clock,
-        shared_base,
-        cuda_ctx,
-        va_ctx,
-    ) {
-        Ok(ld) => ld,
-        Err(e) => {
-            tracing::error!(
-                token = "runner-local-display-build-failed",
-                error = %e,
-                "local-display pipeline failed"
-            );
-            emit(SessionEvent::Failed(e));
-            current_source.teardown();
-            return;
-        }
-    };
-
-    let local_audio = cc.audio_output.as_deref().and_then(|output| {
-        match pipeline::build_local_audio_pipeline(&live_cfg, output) {
-            Ok(la) => {
-                la.pipeline.set_start_time(None::<gst::ClockTime>);
-                la.pipeline.use_clock(Some(shared_clock));
-                la.pipeline.set_base_time(shared_base);
-                match la.pipeline.set_state(gst::State::Playing) {
-                    Ok(_) => Some(la),
-                    Err(e) => {
-                        tracing::warn!(
-                            token = "local-audio-play-failed",
-                            "local-only audio set PLAYING failed: {e:#}"
-                        );
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    token = "local-audio-build-failed",
-                    "local-only audio build failed: {e:#}"
-                );
-                None
-            }
-        }
-    });
-    let _physical_input = if cc.grab && !cc.input_devices.is_null() {
-        res.devices.as_ref().map(|devices| {
-            super::physical_input::PhysicalInput::start(
-                &cc.input_devices,
-                cc.auto_connect_controller,
-                devices,
-            )
-        })
-    } else {
-        None
-    };
-
-    tracing::info!(
-        "local-only topology PLAYING (connector={}, backend={}, encode_slots=0, signaling=none)",
-        cc.connector,
-        local_backend.name()
-    );
-    emit(SessionEvent::Progress("local display pipeline ready"));
-    emit(SessionEvent::Running);
-
-    // #445: the mode the local display runs at, as the monitor names it (the DRM entry
-    // whose size is the session's and whose refresh is nearest the session fps), reported
-    // on every metrics window. `None` when no display is connected.
-    let mut console_current: Option<crate::messages::ConsoleModeSelection> = console_modes
-        .iter()
-        .filter(|m| {
-            m.width as i32 == live_cfg.stream.width && m.height as i32 == live_cfg.stream.height
-        })
-        .min_by_key(|m| (m.refresh_millihz as i64 - live_cfg.stream.fps as i64 * 1000).abs())
-        .cloned();
-    session_metrics.set_console_mode(
-        console_current
-            .as_ref()
-            .map(|m| (m.width, m.height, m.refresh_millihz)),
-    );
-
-    let mut display_bus = local_display.pipeline.bus();
-    // session-display-update state — see the matching declarations in run_blocking.
-    let encode_size = (live_cfg.stream.width, live_cfg.stream.height);
-    let mut current_render: Option<(i32, i32)> = None;
-    let mut current_ui_scale: f64 = 1.0;
-    // A local-only console session has no encode pipeline (the source feeds
-    // kmssink/waylandsink), so there is no external resolution and no lever. The agent
-    // loop rejects a `stream_*` update for such a session before it gets here.
-    session_metrics.set_external_resize_supported(false);
-    let mut cadence_at = Instant::now();
-    // See the matching declaration in run_blocking.
-    let mut renderer_degrade_tracker = RendererDegradeTracker::default();
-    loop {
-        if let Some(reason) = console_vt.as_mut().and_then(|vt| vt.lost()) {
-            tracing::error!(
-                token = "runner-console-vt-lost",
-                reason = %reason,
-                "console terminal lost mid-session"
-            );
-            emit(SessionEvent::Failed(format!(
-                "console terminal lost: {reason}"
-            )));
-            let _ = local_display.pipeline.set_state(gst::State::Null);
-            current_source.teardown();
-            return;
-        }
-        if let Some(weston) = weston.as_mut() {
-            match weston.try_exit() {
-                Ok(Some(status)) => {
-                    tracing::error!(
-                        token = "runner-weston-exited-unexpectedly",
-                        %status,
-                        "weston console exited unexpectedly"
-                    );
-                    emit(SessionEvent::Failed(format!(
-                        "weston console exited unexpectedly ({status})"
-                    )));
-                    let _ = local_display.pipeline.set_state(gst::State::Null);
-                    current_source.teardown();
-                    return;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!(
-                        token = "runner-weston-liveness-failed",
-                        error = %format_args!("{e:#}"),
-                        "weston console liveness check failed"
-                    );
-                    emit(SessionEvent::Failed(format!(
-                        "weston console liveness check failed: {e:#}"
-                    )));
-                    let _ = local_display.pipeline.set_state(gst::State::Null);
-                    current_source.teardown();
-                    return;
-                }
-            }
-        }
-        if stop.load(Ordering::Relaxed) {
-            emit(SessionEvent::Stopping);
-            // Stop interpipe consumers before the source producer: tearing the source down
-            // while a local listener is PLAYING can block the state transition
-            // indefinitely and leak Weston/DRM master.
-            let _ = local_display.pipeline.set_state(gst::State::Null);
-            if let Some(audio) = &local_audio {
-                let _ = audio.pipeline.set_state(gst::State::Null);
-            }
-            current_source.teardown();
-            emit(SessionEvent::Stopped {
-                bytes_used: compute_bytes_used(&live_cfg),
-                detail: None,
-            });
-            return;
-        }
-
-        // Apply-only; see `apply_display_update`.
-        while let Ok(req) = display_rx.try_recv() {
-            apply_display_update(
-                current_source,
-                &req,
-                &mut current_render,
-                &mut current_ui_scale,
-                encode_size,
-                &session_metrics,
-                // No encode pipeline on this topology ⇒ no resolution lever.
-                None,
-            );
-        }
-
-        // #445: a mode the app picked (through the compositor's wlr-output-management).
-        if let Some(request) = current_source.take_mode_request() {
-            let current =
-                console_current
-                    .clone()
-                    .unwrap_or(crate::messages::ConsoleModeSelection {
-                        width: live_cfg.stream.width as u16,
-                        height: live_cfg.stream.height as u16,
-                        refresh_millihz: live_cfg.stream.fps as u32 * 1000,
-                    });
-            match console::plan_mode_switch(request, &current, &console_modes, cc.stream) {
-                Ok(target) => {
-                    let outputs = crate::capacity::detect_drm_outputs();
-                    match switch_console_mode(
-                        session_id,
-                        &mut live_cfg,
-                        &cc,
-                        &target,
-                        &outputs,
-                        &mut weston,
-                        local_backend,
-                        &mut local_display,
-                        current_source,
-                        &ipsink_name(session_id, *gen),
-                        shared_clock,
-                        shared_base,
-                        cuda_ctx,
-                        va_ctx,
-                    ) {
-                        Ok(()) => {
-                            console_current = Some(target.clone());
-                            session_metrics.set_console_mode(Some((
-                                target.width,
-                                target.height,
-                                target.refresh_millihz,
-                            )));
-                            diagnostic_tx.try_emit(
-                                session_id.to_string(),
-                                TraceEvent {
-                                    ts_unix_ms: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as i64)
-                                        .unwrap_or(0),
-                                    event: "console.mode_switched",
-                                    payload: serde_json::json!({
-                                        "width": target.width,
-                                        "height": target.height,
-                                        "refresh_millihz": target.refresh_millihz,
-                                        "source": "app_request",
-                                    }),
-                                },
-                            );
-                        }
-                        Err(failure) if failure.fatal => {
-                            tracing::error!(
-                                token = "runner-console-mode-switch-failed",
-                                reason = %failure.reason,
-                                "console mode switch failed; ending session"
-                            );
-                            emit(SessionEvent::Failed(failure.reason));
-                            let _ = local_display.pipeline.set_state(gst::State::Null);
-                            if let Some(audio) = &local_audio {
-                                let _ = audio.pipeline.set_state(gst::State::Null);
-                            }
-                            current_source.teardown();
-                            return;
-                        }
-                        Err(failure) => {
-                            tracing::warn!(
-                                token = "runner-console-mode-switch-rolled-back",
-                                reason = %failure.reason,
-                                "console mode switch rolled back; session stays at its mode"
-                            );
-                        }
-                    }
-                    // Either way the local-display pipeline is a new object now.
-                    display_bus = local_display.pipeline.bus();
-                }
-                Err(refusal) => {
-                    tracing::info!(
-                        token = "console-mode-request-refused",
-                        ?request,
-                        ?refusal,
-                        "console mode request not applied"
-                    );
-                }
-            }
-        }
-
-        while let Ok(req) = swap_rx.try_recv() {
-            *gen += 1;
-            emit(SessionEvent::Swapping);
-            match perform_swap(
-                &live_cfg,
-                session_id,
-                *gen,
-                res,
-                &local_display.interpipesrc,
-                current_source,
-                req,
-                shared_clock,
-                shared_base,
-                cuda_ctx,
-                va_ctx,
-                vulkan_contexts,
-                session_metrics.clone(),
-                (current_render, current_ui_scale),
-                emit,
-            ) {
-                Ok(()) => {
-                    emit(SessionEvent::SwapDone);
-                    diagnostic_tx.try_emit(
-                        session_id.to_string(),
-                        TraceEvent {
-                            ts_unix_ms: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0),
-                            event: "pipeline.source_swapped",
-                            payload: serde_json::json!({"video_topology": "local_only"}),
-                        },
-                    );
-                }
-                // As on the browser path: a fatal swap failure left a compositor with no
-                // app in it, so end the session rather than claim a rollback.
-                Err(failure) if failure.fatal => {
-                    tracing::error!(
-                        token = "runner-swap-fatal-failed-local",
-                        reason = %failure.reason,
-                        "swap failed fatally (local-only); ending session"
-                    );
-                    emit(SessionEvent::Failed(failure.reason));
-                    let _ = local_display.pipeline.set_state(gst::State::Null);
-                    if let Some(audio) = &local_audio {
-                        let _ = audio.pipeline.set_state(gst::State::Null);
-                    }
-                    current_source.teardown();
-                    return;
-                }
-                Err(failure) => emit(SessionEvent::SwapRolledBack(failure.reason)),
-            }
-        }
-
-        if let Some(bus) = current_source.bus() {
-            while let Some(msg) = bus.pop() {
-                current_source.on_bus_message(&msg);
-                match msg.view() {
-                    gst::MessageView::Error(err) => {
-                        // A local-only session can also be a Vulkan session; classify
-                        // DEVICE_LOST here too.
-                        let debug_text = format!("{:?}", err.debug());
-                        let reason = if vulkan_fault::is_device_lost(&format!(
-                            "{} {debug_text}",
-                            err.error()
-                        )) {
-                            vulkan_fault::device_lost_reason(&err.error().to_string(), &debug_text)
-                        } else {
-                            format!("source pipeline error: {}", err.error())
-                        };
-                        tracing::error!(
-                            token = "runner-source-bus-error-local",
-                            reason = %reason,
-                            "source pipeline bus error (local-only)"
-                        );
-                        emit(SessionEvent::Failed(reason));
-                        let _ = local_display.pipeline.set_state(gst::State::Null);
-                        current_source.teardown();
-                        return;
-                    }
-                    gst::MessageView::Warning(warn) => {
-                        if let Some(reason) =
-                            renderer_degraded_failure(warn, &mut renderer_degrade_tracker)
-                        {
-                            tracing::error!(
-                                token = "runner-renderer-degraded-failed-local",
-                                reason = %reason,
-                                "renderer degraded (local-only); failing session"
-                            );
-                            emit(SessionEvent::Failed(reason));
-                            let _ = local_display.pipeline.set_state(gst::State::Null);
-                            current_source.teardown();
-                            return;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // Same fail-closed check as the encoded-session main loop: a container-launch
-        // failure never posts a gst bus Error.
-        if let Some(err) = current_source.take_launch_error() {
-            tracing::error!(
-                token = "runner-container-launch-failed-local",
-                error = %err,
-                "container launch failed (local-only)"
-            );
-            emit(SessionEvent::Failed(format!(
-                "container launch failed: {err}"
-            )));
-            let _ = local_display.pipeline.set_state(gst::State::Null);
-            current_source.teardown();
-            return;
-        }
-        if let Some(msg) = poll_display_bus(display_bus.as_ref()) {
-            if let gst::MessageView::Error(err) = msg.view() {
-                // DEVICE_LOST on the local-display bus.
-                let debug_text = format!("{:?}", err.debug());
-                let reason =
-                    if vulkan_fault::is_device_lost(&format!("{} {debug_text}", err.error())) {
-                        vulkan_fault::device_lost_reason(&err.error().to_string(), &debug_text)
-                    } else {
-                        format!(
-                            "local-display pipeline error: {} ({:?})",
-                            err.error(),
-                            err.debug()
-                        )
-                    };
-                tracing::error!(
-                    token = "runner-local-display-bus-error",
-                    reason = %reason,
-                    "local-display pipeline bus error"
-                );
-                emit(SessionEvent::Failed(reason));
-                let _ = local_display.pipeline.set_state(gst::State::Null);
-                current_source.teardown();
-                return;
-            }
-        }
-        let cadence_elapsed = cadence_at.elapsed();
-        if cadence_elapsed >= Duration::from_secs(5) {
-            let frames = local_display.drain_sink_frames();
-            let seconds = cadence_elapsed.as_secs_f64();
-            let delivered_fps = frames as f64 / seconds;
-            let expected = (live_cfg.stream.fps as f64 * seconds).round() as u64;
-            let missing = expected.saturating_sub(frames);
-            tracing::info!(
-                target_fps = live_cfg.stream.fps,
-                frames,
-                window_ms = cadence_elapsed.as_millis() as u64,
-                delivered_fps = format_args!("{delivered_fps:.2}"),
-                missing,
-                "local-display cadence"
-            );
-
-            // App-liveness on the same 5 s cadence; local_only defaults to `fail` unless
-            // the console catalog row opted into `keep`.
-            if let Some(status) = current_source.take_container_exit() {
-                let policy = current_source.exit_policy();
-                // Read BOTH before any teardown: the app-surface counter lives on the
-                // compositor element and the log ring is filled by threads whose streams
-                // close with the container, so tearing down first erases the evidence.
-                let presented = current_source.app_has_presented();
-                let app_log_tail = current_source.app_log_tail();
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                diagnostic_tx.try_emit(
-                    session_id.to_string(),
-                    TraceEvent {
-                        ts_unix_ms: ts,
-                        event: "app.exited",
-                        payload: serde_json::json!({
-                            "status": format!("{status:?}"),
-                            "policy": format!("{policy:?}"),
-                            "video_topology": "local_only",
-                        }),
-                    },
-                );
-                match policy {
-                    AppExitPolicy::Keep => {
-                        tracing::info!(
-                            "app container exited ({status:?}); on_app_exit=keep — session continues"
-                        );
-                    }
-                    AppExitPolicy::Unknown => {
-                        // Degrade fail-closed; see the Unknown arm in run_blocking.
-                        tracing::warn!(
-                            token = "app-exit-disposition-unrecognized",
-                            "unrecognized on_app_exit value, treating as fail"
-                        );
-                        tracing::error!(
-                            token = "runner-app-exit-unrecognized-failed-local",
-                            status = ?status,
-                            presented,
-                            "app container exited (local-only); unrecognized disposition treated as fail"
-                        );
-                        emit(app_exit_event(status, presented, app_log_tail));
-                        let _ = local_display.pipeline.set_state(gst::State::Null);
-                        current_source.teardown();
-                        return;
-                    }
-                    AppExitPolicy::Fail => {
-                        tracing::error!(
-                            token = "runner-app-exit-failed-local",
-                            status = ?status,
-                            presented,
-                            "app container exited (local-only); on_app_exit=fail"
-                        );
-                        emit(app_exit_event(status, presented, app_log_tail));
-                        let _ = local_display.pipeline.set_state(gst::State::Null);
-                        current_source.teardown();
-                        return;
-                    }
-                }
-            }
-
-            cadence_at = Instant::now();
-        }
-    }
-}
-
-/// Build the local-display pipeline (`interpipesrc(listen-to=sink) → … → waylandsink|kmssink`)
-/// against the live config, share the session clock and the producer's Vulkan/VA/CUDA
-/// contexts with it, and bring it to PLAYING. The one bring-up path for a console session's
-/// local display: the launch uses it, and so does a mode switch (#445) after re-pinning
-/// the source. Returns the `SessionEvent::Failed` reason on error.
-#[allow(clippy::too_many_arguments)]
-fn bring_up_local_display(
-    cfg: &SessionConfig,
-    sink_name: &str,
-    wayland_socket: Option<&str>,
-    current_source: &AppSource,
-    shared_clock: &gst::Clock,
-    shared_base: gst::ClockTime,
-    cuda_ctx: Option<&gst::Context>,
-    va_ctx: Option<&gst::Context>,
-) -> Result<pipeline::LocalDisplay, String> {
-    let local_display = pipeline::build_local_display_pipeline(cfg, sink_name, wayland_socket)
-        .map_err(|e| format!("build local-display pipeline: {e:#}"))?;
-    local_display
-        .pipeline
-        .set_start_time(None::<gst::ClockTime>);
-    local_display.pipeline.use_clock(Some(shared_clock));
-    local_display.pipeline.set_base_time(shared_base);
-    if pipeline::vulkan_image_transport(cfg) {
-        let mut shared = 0;
-        for context_type in ["gst.vulkan.instance", "gst.vulkan.device"] {
-            if let Some(context) = current_source.source_context(context_type) {
-                local_display.pipeline.set_context(&context);
-                shared += 1;
-            } else {
-                tracing::warn!(
-                    token = "vulkan-context-query-unanswered",
-                    "local-only Vulkan producer did not answer {context_type} context query"
-                );
-            }
-        }
-        tracing::info!("local-only Vulkan context bridge installed ({shared}/2 producer contexts)");
-    }
-    if let Some(ctx) = va_ctx {
-        local_display.pipeline.set_context(ctx);
-        super::va_share::install_need_context_handler(&local_display.pipeline, ctx);
-    }
-    if let Some(ctx) = cuda_ctx {
-        local_display.pipeline.set_context(ctx);
-    }
-    local_display
-        .pipeline
-        .set_state(gst::State::Playing)
-        .map_err(|e| format!("local-display set PLAYING: {e:#}"))?;
-    Ok(local_display)
-}
-
-/// Why a console mode switch did not complete. `fatal` means the session cannot go on
-/// (the display could not be brought back at any mode); otherwise it was rolled back to
-/// the mode it had.
-struct ModeSwitchFailure {
-    fatal: bool,
-    reason: String,
-}
-
-/// #445: move a local console session to `target`, the mode the app picked, without
-/// restarting the app: the local display pipeline is stopped, the source is HELD (PAUSED,
-/// so the compositor keeps serving its clients and nothing renders on the GPU during the
-/// modeset -- a modeset under a PLAYING Vulkan source has faulted NVIDIA, Xid 13/32),
-/// weston is restarted at the target mode (the DirectKms path has no weston: kmssink
-/// modesets from the new caps), the source tail is re-pinned to the new WxH@fps, the local
-/// display is rebuilt at the new caps, and the source resumes. The compositor sees the new
-/// caps, moves its `wl_output` to the target mode and configures every toplevel; a rootful
-/// Xwayland follows the configure, so the desktop's screen resizes in place.
-///
-/// If weston cannot start at the target mode, the previous mode is restored the same way;
-/// only a failure to come back at all is fatal.
-#[allow(clippy::too_many_arguments)]
-fn switch_console_mode(
-    session_id: &str,
-    live_cfg: &mut SessionConfig,
-    console_config: &crate::messages::ConsoleConfig,
-    target: &crate::messages::ConsoleModeSelection,
-    outputs: &[crate::messages::DrmOutputCapability],
-    weston: &mut Option<console::WestonConsole>,
-    local_backend: console::LocalBackend,
-    local_display: &mut pipeline::LocalDisplay,
-    current_source: &mut AppSource,
-    sink_name: &str,
-    shared_clock: &gst::Clock,
-    shared_base: gst::ClockTime,
-    cuda_ctx: Option<&gst::Context>,
-    va_ctx: Option<&gst::Context>,
-) -> Result<(), ModeSwitchFailure> {
-    let previous = (
-        live_cfg.stream.width,
-        live_cfg.stream.height,
-        live_cfg.stream.fps,
-    );
-    let fps = console::mode_fps(target);
-    tracing::info!(
-        token = "console-mode-switch",
-        from = %format_args!("{}x{}@{}", previous.0, previous.1, previous.2),
-        to = %format_args!("{}x{}@{} ({} mHz)", target.width, target.height, fps, target.refresh_millihz),
-        "console mode switch requested by the app"
-    );
-
-    // 1. Consumers before the producer (the same order as session stop).
-    let _ = local_display.pipeline.set_state(gst::State::Null);
-    current_source.pause().map_err(|e| ModeSwitchFailure {
-        fatal: true,
-        reason: format!("console mode switch: hold source: {e:#}"),
-    })?;
-
-    // 2. The physical display, at the target mode.
-    let mut at_mode = |mode: &crate::messages::ConsoleModeSelection| -> anyhow::Result<()> {
-        if local_backend == console::LocalBackend::Weston {
-            // Drop first: only one console weston may exist, and Drop drains the old one.
-            *weston = None;
-            let cfg_at = console::console_config_at_mode(console_config, mode.clone(), outputs);
-            *weston = Some(console::spawn_weston_console(session_id, Some(&cfg_at))?);
-        }
-        Ok(())
-    };
-    let mut restore = |live_cfg: &mut SessionConfig,
-                       weston: &Option<console::WestonConsole>,
-                       current_source: &mut AppSource,
-                       reason: String|
-     -> ModeSwitchFailure {
-        live_cfg.stream.width = previous.0;
-        live_cfg.stream.height = previous.1;
-        live_cfg.stream.fps = previous.2;
-        let caps = pipeline::raw_video_caps(live_cfg);
-        current_source.set_stream_mode(previous.0, previous.1, previous.2, &caps);
-        match bring_up_local_display(
-            live_cfg,
-            sink_name,
-            weston.as_ref().map(|w| w.socket.as_str()),
-            current_source,
-            shared_clock,
-            shared_base,
-            cuda_ctx,
-            va_ctx,
-        ) {
-            Ok(ld) => {
-                *local_display = ld;
-                match current_source.start() {
-                    Ok(()) => ModeSwitchFailure {
-                        fatal: false,
-                        reason,
-                    },
-                    Err(e) => ModeSwitchFailure {
-                        fatal: true,
-                        reason: format!("{reason}; and the source did not resume: {e:#}"),
-                    },
-                }
-            }
-            Err(e) => ModeSwitchFailure {
-                fatal: true,
-                reason: format!("{reason}; and the previous mode did not come back: {e}"),
-            },
-        }
-    };
-
-    if let Err(e) = at_mode(target) {
-        let reason = format!(
-            "console mode switch: weston did not start at {}x{}@{}: {e:#}",
-            target.width, target.height, fps
-        );
-        tracing::warn!(token = "console-mode-switch-weston-failed", "{reason}");
-        let previous_mode = crate::messages::ConsoleModeSelection {
-            width: previous.0 as u16,
-            height: previous.1 as u16,
-            refresh_millihz: previous.2 as u32 * 1000,
-        };
-        if let Err(e) = at_mode(&previous_mode) {
-            return Err(ModeSwitchFailure {
-                fatal: true,
-                reason: format!("{reason}; and it did not come back at the previous mode: {e:#}"),
-            });
-        }
-        return Err(restore(live_cfg, weston, current_source, reason));
-    }
-
-    // 3. The source, re-pinned to the new mode; the compositor applies it on the new caps.
-    live_cfg.stream.width = target.width as i32;
-    live_cfg.stream.height = target.height as i32;
-    live_cfg.stream.fps = fps;
-    let caps = pipeline::raw_video_caps(live_cfg);
-    if !current_source.set_stream_mode(target.width as i32, target.height as i32, fps, &caps) {
-        return Err(restore(
-            live_cfg,
-            weston,
-            current_source,
-            "console mode switch: the source has no re-pinnable caps".to_string(),
-        ));
-    }
-
-    // 4. The local display at the new caps, then the source resumes.
-    match bring_up_local_display(
-        live_cfg,
-        sink_name,
-        weston.as_ref().map(|w| w.socket.as_str()),
-        current_source,
-        shared_clock,
-        shared_base,
-        cuda_ctx,
-        va_ctx,
-    ) {
-        Ok(ld) => *local_display = ld,
-        Err(e) => {
-            return Err(ModeSwitchFailure {
-                fatal: true,
-                reason: format!("console mode switch: {e}"),
-            })
-        }
-    }
-    current_source.start().map_err(|e| ModeSwitchFailure {
-        fatal: true,
-        reason: format!("console mode switch: resume source: {e:#}"),
-    })?;
-
-    tracing::info!(
-        "app display mode: {}x{}@{} (source=app_request, refresh_millihz={})",
-        target.width,
-        target.height,
-        fps,
-        target.refresh_millihz
-    );
-    Ok(())
 }
 
 /// Bytes used by the session's local-driver home dirs after the container is torn down,
@@ -4115,10 +3361,10 @@ mod tests {
     use super::{
         app_boot_watchdog_fires, app_exit_event, audio_path_label, context_object_identity,
         effective_encoder_device_path, fold_display_update, gen0_app_presented, idle_reap_reason,
-        is_sctp_association_error, mic_state_label, poll_display_bus,
-        stop_requested_for_transport_error, swap_source_ready, validate_display_update,
-        AppExitStatus, AudioPipelineGuard, DiagnosticEventTx, DisplayUpdateRequest, SessionEvent,
-        TraceEvent, VulkanContextBridge, POLL, REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
+        is_sctp_association_error, mic_state_label, stop_requested_for_transport_error,
+        swap_source_ready, validate_display_update, AppExitStatus, AudioPipelineGuard,
+        DiagnosticEventTx, DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent,
+        VulkanContextBridge, REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
     };
     use gstreamer::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5127,6 +4373,50 @@ mod tests {
 
     /// A stand-in for the #304 audio pipeline, brought to READY as
     /// `build_encode_pipeline` leaves it.
+    /// #535: a PC's transport is replaced at most `limit` times a minute. The refusal is
+    /// reported once per streak, and the window slides.
+    #[test]
+    fn the_replacement_budget_admits_a_handful_a_minute_and_reports_a_refusal_once() {
+        use super::{
+            Admission, ReplacementBudget, MAX_REPLACEMENTS_PER_WINDOW, REPLACEMENT_WINDOW,
+        };
+        let mut budget = ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW);
+        let t0 = std::time::Instant::now();
+        for n in 0..MAX_REPLACEMENTS_PER_WINDOW {
+            let at = t0 + Duration::from_secs(n as u64);
+            assert_eq!(budget.admit(at), Admission::Admitted, "replacement {n}");
+        }
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(budget.admit(later), Admission::Refused { first: true });
+        assert_eq!(budget.admit(later), Admission::Refused { first: false });
+        // The first replacement leaves the window; one more is admitted, then refused
+        // again, and that is a new streak.
+        let cleared = t0 + REPLACEMENT_WINDOW;
+        assert_eq!(budget.admit(cleared), Admission::Admitted);
+        assert_eq!(budget.admit(cleared), Admission::Refused { first: true });
+    }
+
+    /// #535: an error a retired transport posted before it left the pipeline is not the
+    /// session's. Reading it as one ends the session the new peer just took over.
+    #[test]
+    fn a_message_from_an_element_no_longer_in_the_pipeline_is_not_the_sessions() {
+        use gstreamer::prelude::*;
+        gstreamer::init().unwrap();
+        let pipeline = gstreamer::Pipeline::new();
+        let bin = gstreamer::Bin::new();
+        let inner = gstreamer::ElementFactory::make("identity").build().unwrap();
+        bin.add(&inner).unwrap();
+        pipeline.add(&bin).unwrap();
+        let error = |src: &gstreamer::Element| {
+            gstreamer::message::Error::builder(gstreamer::CoreError::Failed, "x")
+                .src(src)
+                .build()
+        };
+        assert!(super::posted_by_live_graph(&error(&inner), &pipeline));
+        pipeline.remove(&bin).unwrap();
+        assert!(!super::posted_by_live_graph(&error(&inner), &pipeline));
+    }
+
     fn ready_audio_pipeline() -> gstreamer::Pipeline {
         gstreamer::init().unwrap();
         let pipe = gstreamer::Pipeline::new();
@@ -5199,36 +4489,78 @@ mod tests {
         guard.finish();
         drop(guard);
     }
+    // ── #535: what a transport has been told, kept ahead of webrtcbin ──────────────
 
-    // ---- #413: run_local_only idle-loop cadence ----
+    fn answer_sdp(ufrag: &str, fingerprint: &str) -> String {
+        format!("v=0\r\na=ice-ufrag:{ufrag}\r\na=fingerprint:sha-256 {fingerprint}\r\n")
+    }
 
-    /// An idle iteration must cost ONE `POLL` wait, not two; the old
-    /// `timed_pop(POLL)` + `else { sleep(POLL) }` shape took ~2x `iterations * POLL`.
+    /// The race the harness loop found: the page's late answer to the old transport's
+    /// offer and its answer to the new one arrive together. The second must be read
+    /// against the first at once, not against what webrtcbin has applied so far.
     #[test]
-    fn idle_local_display_loop_waits_one_poll_per_iteration() {
-        gstreamer::init().unwrap();
-        let pipe = gstreamer::Pipeline::new();
-        let bus = pipe.bus().expect("pipeline bus");
-        let iterations = 10u32;
-        let started = std::time::Instant::now();
-        for _ in 0..iterations {
-            assert!(poll_display_bus(Some(&bus)).is_none());
-        }
-        let elapsed = started.elapsed();
-        let budget = Duration::from_millis(POLL * u64::from(iterations) * 3 / 2);
-        assert!(
-            elapsed < budget,
-            "idle loop took {elapsed:?}, over the {budget:?} one-wait-per-iteration budget \
-             (a second sleep per iteration would land near {:?})",
-            Duration::from_millis(POLL * u64::from(iterations) * 2)
+    fn an_answer_right_behind_another_is_read_against_the_first() {
+        let mut negotiation = Negotiation::default();
+        let (late, current) = (answer_sdp("old1", "AA:01"), answer_sdp("new2", "AA:01"));
+        assert_eq!(
+            negotiation.who(&late, false),
+            pipeline::AnswerFrom::ThisPeer
+        );
+        negotiation.applied(late.clone());
+
+        assert_eq!(
+            negotiation.who(&current, false),
+            pipeline::AnswerFrom::ThisPeerCorrecting
         );
     }
 
-    /// The sleep is still required with no local-display pipeline, or the loop spins hot.
     #[test]
-    fn absent_display_bus_still_paces_the_loop() {
-        let started = std::time::Instant::now();
-        assert!(poll_display_bus(None).is_none());
-        assert!(started.elapsed() >= Duration::from_millis(POLL));
+    fn a_correction_is_applied_once_the_transport_was_asked_to_offer_again() {
+        let mut negotiation = Negotiation::default();
+        let (late, current) = (answer_sdp("old1", "AA:01"), answer_sdp("new2", "AA:01"));
+        negotiation.applied(late.clone());
+        negotiation.reoffered = true;
+
+        assert_eq!(
+            negotiation.who(&current, false),
+            pipeline::AnswerFrom::ThisPeer
+        );
+        negotiation.applied(current.clone());
+        assert!(!negotiation.reoffered);
+        assert_eq!(
+            negotiation.who(&late, false),
+            pipeline::AnswerFrom::ThisPeerCorrecting,
+            "the transport now holds the correction"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_names_no_peer_is_not_recorded() {
+        let mut negotiation = Negotiation::default();
+        negotiation.applied(String::new());
+        assert_eq!(
+            negotiation.who(&answer_sdp("aaaa", "AA:01"), false),
+            pipeline::AnswerFrom::ThisPeer,
+            "the first real answer is still the first"
+        );
+
+        negotiation.applied(answer_sdp("aaaa", "AA:01"));
+        negotiation.applied("not sdp".to_string());
+        assert_eq!(negotiation.replaced(), Some("aaaa".to_string()));
+    }
+
+    #[test]
+    fn a_replaced_transport_starts_unanswered_and_names_the_peer_it_left() {
+        let mut negotiation = Negotiation::default();
+        negotiation.applied(answer_sdp("aaaa", "AA:01"));
+        negotiation.reoffered = true;
+
+        assert_eq!(negotiation.replaced(), Some("aaaa".to_string()));
+        assert_eq!(
+            negotiation.who(&answer_sdp("bbbb", "BB:02"), false),
+            pipeline::AnswerFrom::ThisPeer
+        );
+        assert!(!negotiation.reoffered);
+        assert_eq!(negotiation.replaced(), None);
     }
 }

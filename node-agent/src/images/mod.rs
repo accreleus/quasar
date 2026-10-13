@@ -2651,7 +2651,9 @@ mod tests {
             emit_manager.emit_version_snapshot(); // coalesced while full
             done_tx.send(()).unwrap();
         });
-        let returned = done_rx.recv_timeout(Duration::from_millis(100));
+        // 2 s is a hang detector, not a timing claim: a non-blocking call under CPU
+        // contention must not read as a hang (#463). Same for the bounds below.
+        let returned = done_rx.recv_timeout(Duration::from_secs(2));
         let identity = ImageIdentity {
             image_id: "steam".into(),
             version: "v1".into(),
@@ -2740,7 +2742,9 @@ mod tests {
                 entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             }
         }
-        let responsive = started.elapsed() < Duration::from_millis(100);
+        // `scans_while_stalled` below is the real proof that the later calls coalesced;
+        // this only catches a hang.
+        let responsive = started.elapsed() < Duration::from_secs(2);
         let scans_while_stalled = calls.load(Ordering::SeqCst);
         release_tx.send(()).unwrap();
         assert!(responsive, "reconcile handler blocked on daemon scan");
@@ -3108,7 +3112,7 @@ mod tests {
             emit_manager.emit_version_snapshot();
             emit_done_tx.send(()).unwrap();
         });
-        let emit_returned = emit_done_rx.recv_timeout(Duration::from_millis(100));
+        let emit_returned = emit_done_rx.recv_timeout(Duration::from_secs(2));
         let mut premature = Vec::new();
         let probe_deadline = Instant::now() + Duration::from_millis(100);
         while Instant::now() < probe_deadline {
@@ -3912,7 +3916,7 @@ mod tests {
             finish_op(&worker_mgr, "steam");
             let _ = done_tx.send(());
         });
-        let completed = done_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+        let completed = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
         drop(rx); // also releases a regressed blocking worker before asserting
         worker.join().unwrap();
         drop(guard);

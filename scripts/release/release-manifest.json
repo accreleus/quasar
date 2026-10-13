@@ -69,7 +69,7 @@
   "upstream_pins": [
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_INTERPIPE_REF", "value": "0c454917"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_PLUGINS_RS_REF", "value": "cee45224cb2d10e1523af4f256d0dd64c8b29491"},
-    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_WAYLAND_DISPLAY_REF", "value": "bc38bf75c52d623871914baaa85d18d3d8cbedde"},
+    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_WAYLAND_DISPLAY_REF", "value": "d83122d7b731efbee1ccc14db6a7618058733d0c"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "CARGO_C_VERSION", "value": "0.10.23"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "RUST_VERSION", "value": "1.94.0"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "DOCKER_VERSION", "value": "27.5.1"}
@@ -81,13 +81,13 @@
     "deploy/patches/vulkan/vkh264enc-num-slices.patch",
     "deploy/patches/vulkan/gstreamer-vulkan-global-submit-lock.patch",
     "deploy/patches/vulkan/vkh264enc-intra-refresh.patch",
-    "deploy/patches/vulkan/gstreamer-vulkan-rc-retarget-no-reset.patch",
     "deploy/patches/vulkan/vulkanav1enc.patch",
     "deploy/patches/vulkan/vulkan-enc-output-state-on-resize.patch",
     "deploy/patches/vulkan/vkenc-bitstream-buffer-pool.patch",
     "deploy/patches/vulkan/vulkanh265enc-radv-coded-height.patch",
     "deploy/patches/vulkan/vulkanav1enc-exact-frame-size.patch",
-    "deploy/patches/vulkan/vulkanav1enc-min-qindex.patch"
+    "deploy/patches/vulkan/vulkanav1enc-min-qindex.patch",
+    "deploy/patches/vulkan/gstreamer-webrtc-stats-rtpsession-leak.patch"
   ],
   "fork_carried_provenance": {
     "purpose": "Compositor modifications are no longer applied as a patch stack: since 2026-07-26 Dockerfile.vulkan builds the Quasar fork's develop branch (GST_WAYLAND_DISPLAY_REF above), which carries each former gst-wayland-display-*.patch as a commit. The patch files remain in deploy/patches/vulkan/ as the authored record for upstream submission (see its README and docs/third-party-pins.md); they are provenance, not build inputs, so they are deliberately NOT in the patches list below. That list is only an inventory: release-preflight.sh checks that each listed file exists and records its sha256. It does NOT verify that the list matches the Dockerfile's git apply sequence, cover every patch the build applies, or check apply order -- keeping those in step is a manual step when a patch is added or reordered.",

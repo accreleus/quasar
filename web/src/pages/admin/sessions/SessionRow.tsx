@@ -28,6 +28,27 @@ export function sessionDotClass(session: AdminSession): string {
   return "info";
 }
 
+/** What the node agent last said about a running session: "app presented" for
+ *  a stream, "displaying 3840×2160 @ 240 Hz" or "not displaying: …" for a console
+ *  session. Null for any other state: these lines say what a live session is
+ *  doing now, and a failed session's detail is the failure card's to explain. */
+export function runningDetail(session: Pick<AdminSession, "state" | "state_detail">): string | null {
+  return session.state === "running" ? session.state_detail || null : null;
+}
+
+/** Longest headline a row shows before it ellipsises; past it the session
+ *  column would push the table's right-hand cells out of view. */
+const DETAIL_HEADLINE_MAX = 40;
+
+/** A row's cut of a detail: the headline before any ": <reason>". The reason is
+ *  free text ("not displaying: the desktop does not hold the display…") that a
+ *  nowrap table cell cannot hold, so the row carries the full detail as a
+ *  title and the session page shows it whole (Chip's rule for state_detail). */
+export function detailHeadline(detail: string): string {
+  const head = detail.split(": ")[0];
+  return head.length > DETAIL_HEADLINE_MAX ? `${head.slice(0, DETAIL_HEADLINE_MAX - 1)}…` : head;
+}
+
 export interface SessionRowProps {
   session: AdminSession;
   /** fps history collected across polls; fewer than two points draws no line. */
@@ -57,6 +78,7 @@ export function SessionRow({
   const codec = codecDisplayName(normaliseCodec(session.negotiated_codec) ?? session.stream?.codec);
   const ran = durationBetween(session.started_at, session.ended_at, now);
   const trendColor = degraded ? "var(--warning)" : "var(--success)";
+  const detail = runningDetail(session);
 
   return (
     <tr
@@ -75,6 +97,7 @@ export function SessionRow({
             <span className="sub mono">
               {session.id.slice(0, 8)}
               {session.state !== "running" && ` · ${session.state}`}
+              {detail && <span title={detail}> · {detailHeadline(detail)}</span>}
             </span>
           </div>
         </div>

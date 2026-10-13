@@ -227,8 +227,9 @@ fn device_name(kind: &str, tag: &str) -> String {
 /// The gamepad's device name. Deliberately NOT session-tagged (the tag goes in
 /// `phys`, see `gamepad_phys`): SDL 2.26+ folds a CRC of the name into the
 /// controller GUID, so a per-session name would key any layout a user saves in
-/// Steam to that one session. It must keep the "Quasar Virtual" prefix, which
-/// `physical_input` uses to never grab a session's own virtual devices.
+/// Steam to that one session. It must keep the "Quasar Virtual" prefix, by which the
+/// console input check (`readiness::console`) tells a session's own virtual devices from
+/// the host's physical ones.
 const GAMEPAD_NAME: &str = "Quasar Virtual Gamepad";
 
 /// Per-session `phys` for the gamepad, carrying the tag `device_name` carries
@@ -554,9 +555,6 @@ pub struct VirtualDevices {
     /// Last gamepad snapshot, for state-on-change diffing (`gp` arrives at frame
     /// rate; only transitions are emitted).
     last_pad: Mutex<PadSnapshot>,
-    /// Held `BTN_DPAD_*` of a forwarded physical pad, folded onto the hat
-    /// (see `DpadHat`).
-    forwarded_dpad: Mutex<DpadHat>,
     /// Last absolute pointer position (output pixels) so `ma` can emit a delta on
     /// the relative virtual mouse. `None` until the first `ma` seeds it.
     last_abs: Mutex<Option<(f64, f64)>>,
@@ -581,58 +579,6 @@ pub struct VirtualDevices {
 #[derive(Default)]
 struct PadSnapshot {
     buttons: Vec<bool>,
-}
-
-/// Held d-pad buttons of a forwarded physical pad. The virtual pad has only a
-/// hat d-pad (xpad's shape), so a pad reporting its d-pad as `BTN_DPAD_*`
-/// would otherwise lose it: uinput drops codes the device didn't declare.
-#[derive(Default)]
-struct DpadHat {
-    up: bool,
-    down: bool,
-    left: bool,
-    right: bool,
-}
-
-impl DpadHat {
-    /// Rewrite `BTN_DPAD_*` key events in one frame to `ABS_HAT0X/Y`; every
-    /// other event passes through unchanged and in order.
-    fn translate(&mut self, events: &[isys::input_event]) -> Vec<isys::input_event> {
-        events
-            .iter()
-            .map(|e| {
-                if e.type_ != isys::EV_KEY as u16 {
-                    return *e;
-                }
-                let held = e.value != 0;
-                let (axis, value) = match e.code as i32 {
-                    isys::BTN_DPAD_UP => {
-                        self.up = held;
-                        (isys::ABS_HAT0Y, self.down as i32 - self.up as i32)
-                    }
-                    isys::BTN_DPAD_DOWN => {
-                        self.down = held;
-                        (isys::ABS_HAT0Y, self.down as i32 - self.up as i32)
-                    }
-                    isys::BTN_DPAD_LEFT => {
-                        self.left = held;
-                        (isys::ABS_HAT0X, self.right as i32 - self.left as i32)
-                    }
-                    isys::BTN_DPAD_RIGHT => {
-                        self.right = held;
-                        (isys::ABS_HAT0X, self.right as i32 - self.left as i32)
-                    }
-                    _ => return *e,
-                };
-                isys::input_event {
-                    type_: isys::EV_ABS as u16,
-                    code: axis as u16,
-                    value,
-                    ..*e
-                }
-            })
-            .collect()
-    }
 }
 
 impl VirtualDevices {
@@ -696,7 +642,6 @@ impl VirtualDevices {
             udev_records,
             udev_export_ids: Mutex::new(None),
             last_pad: Mutex::new(PadSnapshot::default()),
-            forwarded_dpad: Mutex::new(DpadHat::default()),
             last_abs: Mutex::new(None),
             rel_accum: Mutex::new((0.0, 0.0)),
             wheel: Mutex::new((WheelAxis::default(), WheelAxis::default())),
@@ -1106,53 +1051,6 @@ impl VirtualDevices {
         Ok(())
     }
 
-    /// Forward one physical-keyboard evdev frame (already kernel-framed with its
-    /// own `SYN_REPORT`) verbatim into the virtual keyboard — no re-batching.
-    /// Held-key tracking updates from `EV_KEY` events so `release_all` (Wolf
-    /// #302) still zeroes a physically-forwarded key still down on grab release.
-    pub fn forward_keyboard_frame(&self, events: &[isys::input_event]) -> Result<()> {
-        self.keyboard
-            .write(events)
-            .context("forward physical keyboard frame")?;
-        let mut held = self.held.lock().unwrap();
-        for e in events {
-            if e.type_ == isys::EV_KEY as u16 {
-                held.note_key(e.code, e.value != 0);
-            }
-        }
-        Ok(())
-    }
-
-    /// Forward one physical-mouse evdev frame verbatim into the virtual mouse.
-    /// Bypasses `mouse_move_rel`'s batching — the device's own cadence is already
-    /// well-formed. Held-button tracking updates as in `forward_keyboard_frame`.
-    pub fn forward_mouse_frame(&self, events: &[isys::input_event]) -> Result<()> {
-        self.mouse
-            .write(events)
-            .context("forward physical mouse frame")?;
-        let mut held = self.held.lock().unwrap();
-        for e in events {
-            if e.type_ == isys::EV_KEY as u16 {
-                held.note_mouse_button(e.code, e.value != 0);
-            }
-        }
-        Ok(())
-    }
-
-    /// Forward a physical controller's already-framed evdev events into the
-    /// session gamepad. Linux gamepads use the same BTN_*/ABS_* event ABI as the
-    /// virtual Xbox-style device, so no Wayland/compositor path is involved.
-    ///
-    /// Codes the virtual pad doesn't declare are dropped by uinput; `BTN_DPAD_*`
-    /// is the one worth keeping, so it is folded onto the hat first.
-    pub fn forward_gamepad_frame(&self, events: &[isys::input_event]) -> Result<()> {
-        let events = self.forwarded_dpad.lock().unwrap().translate(events);
-        self.gamepad
-            .write(&events)
-            .map(|_| ())
-            .context("forward physical gamepad frame")
-    }
-
     /// Release all currently-held keys, mouse buttons, and gamepad buttons/analogs.
     /// Called on client disconnect (Wolf #302) and before a launcher<->game swap
     /// so a key held in one app doesn't bleed into the next.
@@ -1492,9 +1390,9 @@ mod tests {
     }
 
     /// The gamepad name is stable across sessions (SDL folds it into the
-    /// controller GUID) and keeps the prefix `physical_input` excludes by.
+    /// controller GUID) and keeps the prefix the console input check excludes by.
     #[test]
-    fn gamepad_name_is_stable_and_excluded_from_physical_grab() {
+    fn gamepad_name_is_stable_and_keeps_the_virtual_prefix() {
         assert!(GAMEPAD_NAME.contains("Quasar Virtual"));
         assert!(!GAMEPAD_NAME.contains('['), "no session tag in the name");
     }
@@ -1546,37 +1444,6 @@ mod tests {
         let w3c_by_sdl_index: Vec<usize> = codes.into_iter().map(|(_, i)| i).collect();
         // A, B, X, Y, LB, RB, Back, Start, Guide, L3, R3
         assert_eq!(w3c_by_sdl_index, vec![0, 1, 2, 3, 4, 5, 8, 9, 16, 10, 11]);
-    }
-
-    /// A forwarded pad's `BTN_DPAD_*` become hat events carrying the combined
-    /// state of both directions on the axis; other events pass through.
-    #[test]
-    fn forwarded_dpad_buttons_become_hat_events() {
-        let key = |code: i32, value: i32| ev(isys::EV_KEY as u16, code as u16, value);
-        let mut d = DpadHat::default();
-
-        let out = d.translate(&[key(isys::BTN_DPAD_LEFT, 1), syn()]);
-        assert_eq!(out.len(), 2);
-        assert_eq!(
-            (out[0].type_, out[0].code, out[0].value),
-            (isys::EV_ABS as u16, isys::ABS_HAT0X as u16, -1)
-        );
-        assert_eq!(out[1].type_, isys::EV_SYN as u16, "SYN passes through");
-
-        let out = d.translate(&[key(isys::BTN_DPAD_RIGHT, 1)]);
-        assert_eq!(out[0].value, 0, "left+right cancel");
-        let out = d.translate(&[key(isys::BTN_DPAD_LEFT, 0)]);
-        assert_eq!(out[0].value, 1, "right alone after left released");
-
-        let out = d.translate(&[key(isys::BTN_DPAD_UP, 1)]);
-        assert_eq!((out[0].code, out[0].value), (isys::ABS_HAT0Y as u16, -1));
-
-        let out = d.translate(&[key(isys::BTN_SOUTH, 1)]);
-        assert_eq!(
-            (out[0].type_, out[0].code, out[0].value),
-            (isys::EV_KEY as u16, isys::BTN_SOUTH as u16, 1),
-            "non-dpad keys untouched"
-        );
     }
 
     /// D-pad buttons fold onto the hat: up/left negative, opposing presses

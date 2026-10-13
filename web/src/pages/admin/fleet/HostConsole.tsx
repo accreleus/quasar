@@ -2,6 +2,11 @@
 // §A.6). Reads/writes the CM-01 console-config API (GET/PATCH
 // /v1/admin/hosts/{id}/console-config).
 //
+// The console desktop owns its mode, audio output and input, so the page edits
+// only what control-api.md §Console mode defines. The default-app list is the
+// server's `default_apps`; its `console_default_app` check explains a saved app
+// that cannot run direct.
+//
 // Input devices is the one place this page goes beyond a straight restyle
 // (InputDevicesRow, in ./console/): `ConsoleConfig.input_devices` is
 // `"auto" | string[]` of device paths and `ConsoleCapabilities.input_devices`
@@ -21,7 +26,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useParams } from "react-router-dom";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
-import type { AdminApp, AdminUser, ConsoleConfig } from "../../../api/types";
+import type { AdminUser, ConsoleConfig } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { Breadcrumbs } from "../../../components/Breadcrumbs";
 import { shortId } from "../../../lib/format/shortId";
@@ -32,13 +37,12 @@ import { ResourceStates } from "../../../components/ResourceStates";
 import { useToast } from "../../../components/Toast";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useConsoleLoad } from "./console/useConsoleLoad";
-import { consoleAudioBackend, readsAsOn } from "./console/access";
+import { readsAsOn } from "./console/access";
 import { ConsoleAccessNote } from "./console/ConsoleAccessNote";
 import { ConsoleAccessConfirmModal } from "./console/ConsoleAccessConfirmModal";
 import { InputDevicesRow } from "./console/InputDevicesRow";
 import { CapabilitiesRail } from "./console/CapabilitiesRail";
 
-const AUTO = "auto";
 const NONE = "__none__";
 
 function Switch({
@@ -65,13 +69,24 @@ function Switch({
   );
 }
 
-/** One `.cset` row: title + help on the left, one control on the right. */
-function ConsoleRow({ title, help, children }: { title: string; help: ReactNode; children: ReactNode }) {
+/** One `.cset` row: title + help (and an optional error) on the left, one control on the right. */
+function ConsoleRow({
+  title,
+  help,
+  error,
+  children,
+}: {
+  title: string;
+  help: ReactNode;
+  error?: string | null;
+  children: ReactNode;
+}) {
   return (
     <div className="cset">
       <div>
         <h3>{title}</h3>
         <p className="hint">{help}</p>
+        {error && <p className="form-error mt1">{error}</p>}
       </div>
       <div>{children}</div>
     </div>
@@ -93,8 +108,9 @@ export function HostConsole() {
   const host = data?.host ?? null;
   const config = data?.config ?? null;
   const capabilities = data?.capabilities ?? null;
-  const apps = data?.apps ?? [];
+  const directApps = data?.defaultApps ?? [];
   const users = data?.users ?? [];
+  const defaultAppCheck = (data?.readiness ?? []).find((check) => check.id === "console_default_app");
 
   const [pending, setPending] = useState<ConsoleConfig>({});
   const [saving, setSaving] = useState(false);
@@ -152,25 +168,20 @@ export function HostConsole() {
   const hasCapabilities = capabilities != null && (
     capabilities.connectors.length > 0 ||
     (capabilities.outputs?.length ?? 0) > 0 ||
-    capabilities.audio_sinks.length > 0 ||
     capabilities.input_devices.length > 0
   );
-  // RH07-15 (#407): the reported audio_sinks are one family or the other —
-  // the agent hides ALSA hw:* sinks while its host's PipeWire answers — so
-  // the help line under the selector names whichever this host reported
-  // (design_handoff_v3/screens/rh07/README.md specimens "on" / "on-alsa").
-  const audioBackend = consoleAudioBackend(capabilities?.audio_sinks);
-  const audioHelp =
-    audioBackend === "pipewire"
-      ? "This machine runs PipeWire, so console audio plays through it, beside the desktop's own sound. Quasar never takes the sound device from it."
-      : audioBackend === "alsa"
-        ? "No PipeWire runs on this machine, so console audio goes straight to the sound device (ALSA)."
-        : "Host sink for console-mode audio. Quiet plays no local audio.";
-  const connectedOutputs = (capabilities?.outputs ?? []).filter((output) => output.connected);
-  const selectedOutput = connectedOutputs.find((output) => output.id === effective.output_id);
-  const selectedModeValue = effective.mode
-    ? `${effective.mode.width}x${effective.mode.height}@${effective.mode.refresh_millihz}`
-    : NONE;
+  // The output pick means "this card, launch when this connector has a
+  // monitor", so a reported output is offered whether or not one is plugged in.
+  const outputs = capabilities?.outputs ?? [];
+  // A saved default app the server does not offer (it cannot run direct, or is
+  // gone) stays selectable as itself so the select shows the truth; the
+  // console_default_app check, shown as the row's help, says why it will not
+  // launch.
+  const savedApp = config?.default_app ?? null;
+  const savedAppOffered = savedApp == null || directApps.some((a) => a.id === savedApp);
+  // The saved app's failure; a pending pick has not been checked yet.
+  const defaultAppError =
+    defaultAppCheck?.status === "fail" && !("default_app" in pending) ? defaultAppCheck.summary : null;
 
   const discard = () => setPending({});
 
@@ -179,7 +190,14 @@ export function HostConsole() {
     setSaving(true);
     try {
       const saved = await adminApi.updateConsoleConfig(token, id, pending);
-      res.setData((prev) => ({ ...prev, config: saved.config, capabilities: saved.capabilities }));
+      res.setData((prev) => ({
+        ...prev,
+        config: saved.config,
+        capabilities: saved.capabilities,
+        // `?? []`: an older control plane predates this envelope.
+        defaultApps: saved.default_apps ?? [],
+        readiness: saved.readiness ?? [],
+      }));
       setPending({});
       addToast({ variant: "success", title: "Console config saved" });
     } catch (e: unknown) {
@@ -201,7 +219,7 @@ export function HostConsole() {
       />
       <PageHeader
         title="Local console"
-        sub={`Local display on ${host ? host.node_name : "this host"} with an explicit per-session output topology`}
+        sub={`The console desktop drives ${host ? host.node_name : "this host"}'s own display`}
         actions={
           <>
             <Button variant="ghost" disabled={loading || saving || locked || changedCount === 0} onClick={discard}>
@@ -234,8 +252,8 @@ export function HostConsole() {
                 <span className="panel-title">Console mode</span>
                 <p className="hint mt1">
                   {accessKnown
-                    ? "This machine shows games on its own screen, and can stream them too."
-                    : "Local display with an explicit per-session output topology."}
+                    ? "This machine shows games on its own screen."
+                    : "The desktop drives this host's own display, with its own resolution, sound and input."}
                 </p>
               </div>
               <div className="acts">
@@ -255,113 +273,32 @@ export function HostConsole() {
               </div>
             </div>
 
-            <Group title="Video" />
+            <Group title="Display" />
 
             <ConsoleRow
-              title="Video topology"
-              help={<>Local-only uses no encoder or WebRTC signaling resources. Dual output adds a
-                browser stream from the same VulkanImage source. Select a card-scoped output
-                and exact reported timing, or leave both automatic.</>}
+              title="Physical output"
+              help="Card-scoped DRM connector. The console session starts when this connector has a monitor; Automatic uses any connected output. The desktop sets its own resolution and refresh."
             >
-              <span className="mono t-xs muted">
-                Weston · Static mode · Fullscreen
-              </span>
-            </ConsoleRow>
-
-            <ConsoleRow title="Physical output" help="Card-scoped DRM connector. Automatic uses Weston's preferred connected output.">
               <select
                 className="select"
                 aria-label="Physical output"
                 disabled={locked}
                 value={effective.output_id ?? NONE}
                 onChange={(e) => {
-                  const output = connectedOutputs.find((item) => item.id === e.target.value);
-                  const preferred = output?.modes.find((mode) => mode.preferred) ?? output?.modes[0];
-                  setPending((prev) => ({
-                    ...prev,
-                    output_id: output?.id ?? null,
-                    mode: preferred ? {
-                      width: preferred.width,
-                      height: preferred.height,
-                      refresh_millihz: preferred.refresh_millihz,
-                    } : null,
-                  }));
+                  const v = e.target.value;
+                  setField("output_id", v === NONE ? null : v);
                 }}
               >
                 <option value={NONE}>Automatic</option>
-                {connectedOutputs.map((output) => (
-                  <option key={output.id} value={output.id}>{output.id}</option>
-                ))}
-              </select>
-            </ConsoleRow>
-
-            <ConsoleRow title="Physical mode" help="Exact DRM timing identity; fractional refresh rates are preserved.">
-              <select
-                className="select"
-                aria-label="Physical mode"
-                style={{ width: 260 }}
-                disabled={locked || !selectedOutput}
-                value={selectedModeValue}
-                onChange={(e) => {
-                  // "Preferred" stores the output's preferred mode: the API pins
-                  // output_id and mode together, so it cannot store a null mode (#422).
-                  const mode = e.target.value === NONE
-                    ? selectedOutput?.modes.find((item) => item.preferred) ?? selectedOutput?.modes[0]
-                    : selectedOutput?.modes.find((item) =>
-                      `${item.width}x${item.height}@${item.refresh_millihz}` === e.target.value);
-                  if (mode) setField("mode", {
-                    width: mode.width, height: mode.height, refresh_millihz: mode.refresh_millihz,
-                  });
-                }}
-              >
-                <option value={NONE}>Preferred</option>
-                {(selectedOutput?.modes ?? []).map((mode, index) => (
-                  <option key={`${mode.width}x${mode.height}@${mode.refresh_millihz}-${index}`} value={`${mode.width}x${mode.height}@${mode.refresh_millihz}`}>
-                    {mode.width}×{mode.height} @ {(mode.refresh_millihz / 1000).toFixed(3)} Hz{mode.preferred ? " · preferred" : ""}
+                {outputs.map((output) => (
+                  <option key={output.id} value={output.id}>
+                    {output.connected ? output.id : `${output.id} · no monitor`}
                   </option>
                 ))}
               </select>
             </ConsoleRow>
 
-            <Group title="Streaming" />
-
-            <ConsoleRow title="Also stream" help="Adds WebRTC video for dual output. Off is local-only.">
-              <Switch label="Also stream" checked={Boolean(effective.stream)} disabled={locked} onChange={(v) => setField("stream", v)} />
-            </ConsoleRow>
-
-            <ConsoleRow title="Stream audio" help="Adds the WebRTC Opus audio leg when streaming is enabled.">
-              <Switch
-                label="Stream audio"
-                checked={Boolean(effective.stream_audio)}
-                disabled={locked || !effective.stream}
-                onChange={(v) => setField("stream_audio", v)}
-              />
-            </ConsoleRow>
-
-            <Group title="Local input and audio" />
-
-            <ConsoleRow title="Local audio output" help={audioHelp}>
-              <select
-                className="select"
-                aria-label="Local audio output"
-                disabled={locked}
-                value={effective.audio_output ?? NONE}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  setField("audio_output", v === NONE ? null : v);
-                }}
-              >
-                <option value={AUTO}>Auto</option>
-                <option value={NONE}>Quiet (no local audio)</option>
-                {(capabilities?.audio_sinks ?? []).map((s) => (
-                  <option key={s.id} value={s.id}>{s.label}</option>
-                ))}
-              </select>
-            </ConsoleRow>
-
-            <ConsoleRow title="Grab local input" help="Exclusively grab the physical keyboard/mouse for the console session.">
-              <Switch label="Grab local input" checked={Boolean(effective.grab)} disabled={locked} onChange={(v) => setField("grab", v)} />
-            </ConsoleRow>
+            <Group title="Input" />
 
             <InputDevicesRow
               value={effective.input_devices}
@@ -372,9 +309,14 @@ export function HostConsole() {
 
             <Group title="Startup" />
 
-            <ConsoleRow title="Default app" help="App auto-launched on console start.">
+            <ConsoleRow
+              title="Default app"
+              help="The app the console session runs. Only apps that can drive the display directly are offered."
+              error={defaultAppError}
+            >
               <select
                 className="select"
+                aria-label="Default app"
                 disabled={locked}
                 value={effective.default_app ?? NONE}
                 onChange={(e) => {
@@ -383,7 +325,10 @@ export function HostConsole() {
                 }}
               >
                 <option value={NONE}>None</option>
-                {apps.map((a: AdminApp) => (
+                {!savedAppOffered && savedApp != null && (
+                  <option value={savedApp}>Current app (cannot run direct)</option>
+                )}
+                {directApps.map((a) => (
                   <option key={a.id} value={a.id}>{a.name}</option>
                 ))}
               </select>
@@ -392,6 +337,7 @@ export function HostConsole() {
             <ConsoleRow title="Default user" help="Owner of auto-started console sessions. Required for auto-start on display.">
               <select
                 className="select"
+                aria-label="Default user"
                 disabled={locked}
                 value={effective.default_user ?? NONE}
                 onChange={(e) => {
@@ -406,21 +352,12 @@ export function HostConsole() {
               </select>
             </ConsoleRow>
 
-            <ConsoleRow title="Auto-start on display" help="Auto-launch the console session when a display connects.">
+            <ConsoleRow title="Auto-start on display" help="Launch the console session when the output has a monitor.">
               <Switch
                 label="Auto-start on display"
                 checked={Boolean(effective.auto_start_on_display)}
                 disabled={locked}
                 onChange={(v) => setField("auto_start_on_display", v)}
-              />
-            </ConsoleRow>
-
-            <ConsoleRow title="Auto-connect controller" help="Auto-attach a connected controller to the console session.">
-              <Switch
-                label="Auto-connect controller"
-                checked={Boolean(effective.auto_connect_controller)}
-                disabled={locked}
-                onChange={(v) => setField("auto_connect_controller", v)}
               />
             </ConsoleRow>
           </div>

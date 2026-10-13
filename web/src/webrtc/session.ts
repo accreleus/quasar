@@ -335,40 +335,76 @@ export class QuasarSession {
         return;
       }
 
-      void (async () => {
-        const pc = (msg.pc ?? "video") as PcId;
-        if (msg.type === "offer" && msg.sdp) {
+      const pc = (msg.pc ?? "video") as PcId;
+      if (msg.type === "offer" && msg.sdp) {
+        const sdp = msg.sdp;
+        const epoch = ++this.offerEpoch[pc];
+        this.inOrder(pc, () => this.answerOffer(pc, sdp, epoch));
+      } else if (msg.type === "ice" && msg.candidate) {
+        const candidate = msg.candidate;
+        // Behind the offer it followed: applied before that offer, a candidate
+        // lands on the transport the offer is about to replace and is lost.
+        this.inOrder(pc, async () => {
           try {
-            const target = this.pcFor(pc);
-            await target.setRemoteDescription({ type: "offer", sdp: msg.sdp });
-            // Claim the mic transceiver as sendonly BEFORE createAnswer: left at
-            // its post-SRD default it answers `inactive` and the slot is gone for
-            // the session (host caps each PC at a single offer, no renegotiation).
-            if (pc === "audio") this.claimMicTransceiver(target, msg.sdp);
-            const answer = await target.createAnswer();
-            await target.setLocalDescription(answer);
-            this.wsSend({ type: "answer", pc, sdp: answer.sdp });
-            if (pc === "video") {
-              this.onStatus("answer sent — awaiting ICE");
-            }
-          } catch (e) {
-            console.error(`[quasar] ${pc} PC offer/answer failed:`, e);
-            this.onStatus(`${pc} PC negotiation failed: ${e}`);
-          }
-        } else if (msg.type === "ice" && msg.candidate) {
-          const target = this.pcFor(pc);
-          try {
-            await target.addIceCandidate(msg.candidate);
+            await this.pcFor(pc).addIceCandidate(candidate);
           } catch {
             /* ignore addIceCandidate failures — non-fatal trickle ICE errors */
           }
-        } else if (msg.type === "error") {
-          this.onStatus(`host error: ${msg.message ?? ""}`);
-        } else if (msg.type === "bye") {
-          this.onStatus("host ended the session");
-        }
-      })();
+        });
+      } else if (msg.type === "error") {
+        this.onStatus(`host error: ${msg.message ?? ""}`);
+      } else if (msg.type === "bye") {
+        this.onStatus("host ended the session");
+      }
     };
+  }
+
+  /** Bumped by every offer for a pc; an offer whose epoch is no longer current
+   *  was superseded. */
+  private readonly offerEpoch: Record<PcId, number> = { video: 0, audio: 0 };
+  /** The tail of each pc's inbound work. */
+  private readonly inbound: Record<PcId, Promise<void>> = {
+    video: Promise.resolve(),
+    audio: Promise.resolve(),
+  };
+
+  /**
+   * Run `job` after everything already queued for `pc`. The host can send two
+   * offers for one pc a few ms apart (#535: a new transport's offer, then a
+   * re-offer); handled on independent chains their steps interleave on the peer
+   * connection. Semantics: signaling.md §Mid-session reconnection.
+   */
+  private inOrder(pc: PcId, job: () => Promise<void>): void {
+    this.inbound[pc] = this.inbound[pc].then(async () => {
+      if (this.closed) return;
+      await job();
+    });
+  }
+
+  /** Apply one offer and answer it, unless a later offer for `pc` arrives first. */
+  private async answerOffer(pc: PcId, sdp: string, epoch: number): Promise<void> {
+    // The answer to a superseded offer is never sent: the later offer is next in
+    // the queue and its answer is the one the host is waiting for.
+    const superseded = () => epoch !== this.offerEpoch[pc];
+    try {
+      const target = this.pcFor(pc);
+      await target.setRemoteDescription({ type: "offer", sdp });
+      if (superseded()) return;
+      // Claim the mic transceiver as sendonly BEFORE createAnswer: left at its
+      // post-SRD default it answers `inactive` and the slot is gone.
+      if (pc === "audio") this.claimMicTransceiver(target, sdp);
+      const answer = await target.createAnswer();
+      if (superseded()) return;
+      await target.setLocalDescription(answer);
+      if (superseded()) return;
+      this.wsSend({ type: "answer", pc, sdp: answer.sdp });
+      if (pc === "video") {
+        this.onStatus("answer sent — awaiting ICE");
+      }
+    } catch (e) {
+      console.error(`[quasar] ${pc} PC offer/answer failed:`, e);
+      this.onStatus(`${pc} PC negotiation failed: ${e}`);
+    }
   }
 
   /** Audio PC is created lazily on the first `pc: "audio"` offer/ICE. */

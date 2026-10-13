@@ -11,7 +11,7 @@
 // snapshot, so the video/input subtree re-renders only on status/channelOpen/
 // pointerLocked/stopping/hostLost/health, never per telemetry tick.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import "../../styles/session.css";
 import "../../styles/hud.css";
@@ -46,8 +46,8 @@ import {
   SessionBanner,
   SessionBannerHost,
 } from "./sessionAlerts";
-import { SessionLoader } from "./SessionLoader";
-import { takenOverFailure, unreachableFailure } from "./sessionFailure";
+import { LOCK_TO_STREAM_MS, SessionLoader } from "./SessionLoader";
+import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
@@ -227,10 +227,17 @@ export function SessionPage() {
 
     const cancelled = () => !resumeMountedRef.current;
 
-    const bounce = (body: string) => {
+    const bounce = (body: string, title = "Can't resume that session") => {
       if (cancelled()) return;
-      addToast({ variant: "danger", title: "Can't resume that session", body });
+      addToast({ variant: "danger", title, body });
       navigate("/app", { replace: true });
+    };
+    // #516: an ended session says why when the server does. The generic copy
+    // invites relaunching an app the user can no longer open.
+    const bounceIfRevoked = (session: Parameters<typeof accessRevokedFailure>[0]) => {
+      const revoked = accessRevokedFailure(session);
+      if (revoked) bounce(revoked.message, revoked.title);
+      return revoked != null;
     };
 
     if (!authToken || !sessionId) {
@@ -242,6 +249,7 @@ export function SessionPage() {
       try {
         const { session } = await getSession(authToken, sessionId);
         if (cancelled()) return;
+        if (bounceIfRevoked(session)) return;
         if (RESUME_DEAD_STATES.has(session.state)) {
           bounce("That session has already ended. Launch it again from your library.");
           return;
@@ -249,7 +257,18 @@ export function SessionPage() {
         // A `failed` session is left to the poller's launch-failure verdict
         // (see RESUME_DEAD_STATES) — no mint, no bounce, no toast.
         if (session.state === "failed") return;
-        const res = await mintSignalingToken(authToken, sessionId);
+        let res: Awaited<ReturnType<typeof mintSignalingToken>>;
+        try {
+          res = await mintSignalingToken(authToken, sessionId);
+        } catch (err) {
+          // A revoke can land between the read and the mint. The refusal does
+          // not say why; the session does.
+          if (!(err instanceof ApiError)) throw err;
+          const again = await getSession(authToken, sessionId).catch(() => null);
+          if (cancelled()) return;
+          if (again && bounceIfRevoked(again.session)) return;
+          throw err;
+        }
         if (cancelled()) return;
         const signaling = res?.signaling;
         // Same shape check the runtime applies: a 2xx whose body isn't a
@@ -286,9 +305,13 @@ export function SessionPage() {
     })();
   }, [signalCoords, authToken, sessionId, navigate, addToast]);
 
+  // Latched true when the loader's reveal begins (see revealReady). Read by the
+  // status hook's end-reason poll, which runs from callbacks that outlive a render.
+  const revealStartedRef = useRef(false);
+
   // Session status polling (host-lost, AS10-06 health, launch progress, #484
-  // §3.2 reveal-cap) lives in useSessionStatus.ts. `pollHostLost` and
-  // `setLaunchFailure` are called from the WebRTC mount effect below: a
+  // §3.2 reveal-cap) lives in useSessionStatus.ts. `pollEndReason` and
+  // `noteFailure` are called from the WebRTC mount effect below: a
   // signaling-relay disconnect polls once to explain itself, a failed
   // reconnect posts its own terminal verdict.
   const {
@@ -304,12 +327,12 @@ export function SessionPage() {
     externalOwner,
     launchDetail,
     launchFailure,
-    setLaunchFailure,
+    noteFailure,
     appPresented,
     hostAssigned,
     sessionRunning,
-    pollHostLost,
-  } = useSessionStatus(authToken, sessionId, stopping);
+    pollEndReason,
+  } = useSessionStatus(authToken, sessionId, stopping, revealStartedRef);
 
   // sessionRuntime.ts: one runtime instance per transport generation (law L1)
   // — a replacement token re-seats signalCoords, destroying this runtime and
@@ -378,15 +401,19 @@ export function SessionPage() {
             duration: 10000,
           });
         },
-        onDisconnectSuspected: () => void pollHostLost(),
+        onDisconnectSuspected: () => void pollEndReason(),
         onReplacementSignaling: ({ url, token, iceServers }) =>
           setSignalCoords({ url, token, replacement: true, iceServers }),
-        onReconnectFailed: (detail) =>
-          setLaunchFailure((prev) => prev ?? unreachableFailure(detail)),
+        // A refused mint (409) is how a session the control plane stopped
+        // looks from here, so ask it why before settling on "unreachable".
+        onReconnectFailed: (detail) => {
+          noteFailure(unreachableFailure(detail));
+          void pollEndReason();
+        },
         // #526: another attach won this session. Terminal HERE only — the
         // session and the app are still running, in the tab that took it. The
         // page states it and stops; it must not re-mint (sessionRuntime L6).
-        onSessionTakenOver: () => setLaunchFailure((prev) => prev ?? takenOverFailure()),
+        onSessionTakenOver: () => noteFailure(takenOverFailure()),
       },
     });
     runtimeRef.current = rt;
@@ -417,6 +444,29 @@ export function SessionPage() {
     };
   }, [signalCoords]);
 
+  // This page can no longer continue the session. `unreachable` and a failed
+  // recovery also fire when only signalling gave up and media still flows, so
+  // they count once the input channel is gone too; the rest are server or
+  // close-code verdicts (a takeover leaves the single-peer agent serving the
+  // other tab).
+  const sessionOver =
+    hostLost ||
+    (launchFailure != null && (launchFailure.kind !== "unreachable" || !channelOpen)) ||
+    (recovery?.phase === "failed" && !channelOpen);
+
+  // Release what leaving the page releases, without destroying the transport:
+  // a destroy would say `bye` to a session another tab now owns.
+  useEffect(() => {
+    if (!sessionOver) return;
+    micRef.current?.stop();
+    setMicOn(false);
+    // Same as the explicit disable: a stopped track must not stay on the sender.
+    runtimeRef.current
+      ?.detachMicTrack()
+      .catch((err) => reportBestEffortFailure("silent-debug", "session: detach mic on session end", err));
+    runtimeRef.current?.release();
+  }, [sessionOver]);
+
   // Must toggle, not just request: the drawer's row relabels to "Release
   // input" while captured, and in fallback mode it's a primary way out.
   const handleGrab = useCallback(() => {
@@ -435,6 +485,7 @@ export function SessionPage() {
     // engage() itself runs synchronously inside the gesture (requestPointerLock
     // requires that); only its RESULT is awaited. Null means the channel is not
     // open, and every control offering this is disabled in that state.
+    if (sessionOver) return;
     const engaging = rt?.engage();
     if (!engaging) return;
 
@@ -472,14 +523,14 @@ export function SessionPage() {
 
     // The HUD collapses itself when capture engages (Hud.tsx): the picture is
     // the point of capturing, and a shelf over it is not.
-  }, [addToast]);
+  }, [addToast, sessionOver]);
 
   // Mic spec §3.4: enable runs from the button click and is the only path
   // that calls getUserMedia; disable detaches the sender track and stops the device.
   const handleToggleMic = useCallback(async () => {
     const mic = micRef.current;
     const sess = runtimeRef.current;
-    if (!mic || micBusy) return;
+    if (!mic || micBusy || sessionOver) return;
     setMicBusy(true);
     try {
       if (micOn) {
@@ -509,10 +560,20 @@ export function SessionPage() {
         });
       };
       await sess.attachMicTrack(track);
+      // stop() ran while the attach was pending (session over, transport
+      // rebuilt, page left): the track on the sender is dead, take it off.
+      if (mic.track !== track) {
+        await sess
+          .detachMicTrack()
+          .catch((err) => reportBestEffortFailure("silent-debug", "session: detach stopped mic", err));
+        return;
+      }
       setMicOn(true);
     } catch (err) {
       mic.stop();
       setMicOn(false);
+      // stop() ran during the permission prompt; that was the user's or the page's own doing.
+      if (err instanceof MicCaptureError && err.detail.kind === "cancelled") return;
       let detail =
         err instanceof MicCaptureError
           ? err.detail
@@ -528,7 +589,7 @@ export function SessionPage() {
     } finally {
       setMicBusy(false);
     }
-  }, [micOn, micBusy, addToast]);
+  }, [micOn, micBusy, sessionOver, addToast]);
 
   // Release the capture device on unmount — a mic left hot after leaving the
   // session page would keep the OS recording indicator lit.
@@ -695,17 +756,36 @@ export function SessionPage() {
   // #484 §3.2: the reveal gate is channelOpen AND appPresented, not
   // channelOpen alone — the compositor's transport comes up 30-50s before a
   // cold app draws anything, and revealing on transport alone is the defect.
-  const revealReady = channelOpen && appPresented;
+  // A held verdict the page could not show after the reveal keeps the loader (and
+  // its card) up instead; see showsAfterReveal.
+  const revealReady =
+    channelOpen && appPresented && (!launchFailure || showsAfterReveal(launchFailure));
+  // Layout, not passive: set synchronously at commit, before any network callback can run.
+  useLayoutEffect(() => {
+    if (revealReady) revealStartedRef.current = true;
+  }, [revealReady]);
+  const [loaderInert, setLoaderInert] = useState(false);
   const [loaderDone, setLoaderDone] = useState(false);
-  const loaderDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loaderTimersRef = useRef<ReturnType<typeof setTimeout>[] | null>(null);
+  // Latched, like SessionLoader's own handoff: the gate can retract (the channel
+  // closes inside the reveal), and the loader is transparent and inert by then
+  // either way. A removal cancelled on the retract never happened again, and
+  // the revoke banner waits for `loaderInert`.
   useEffect(() => {
-    if (revealReady && !loaderDone) {
-      loaderDoneTimerRef.current = setTimeout(() => setLoaderDone(true), LOADER_UNMOUNT_MS);
+    if (revealReady && loaderTimersRef.current === null) {
+      loaderTimersRef.current = [
+        setTimeout(() => setLoaderInert(true), LOCK_TO_STREAM_MS),
+        setTimeout(() => setLoaderDone(true), LOADER_UNMOUNT_MS),
+      ];
     }
-    return () => {
-      if (loaderDoneTimerRef.current) clearTimeout(loaderDoneTimerRef.current);
-    };
-  }, [revealReady, loaderDone]);
+  }, [revealReady]);
+  useEffect(
+    () => () => {
+      loaderTimersRef.current?.forEach(clearTimeout);
+      loaderTimersRef.current = null;
+    },
+    [],
+  );
 
   // #434: hold a screen wake lock while the session is LIVE. Liveness is the
   // page's existing notion — the input DataChannel being open is what every
@@ -753,14 +833,24 @@ export function SessionPage() {
       ? externalSize
       : null;
 
-  // Whether any of the three banner blocks below is on screen. The HUD takes
+  // #516: the control plane's reason stands in for the recovery notice the dead
+  // transport raises; #527: so does a takeover. Until the loader is inert it
+  // states the verdict itself.
+  const bannerVerdict = launchFailure && isBannerVerdict(launchFailure) ? launchFailure : null;
+  const verdictBanner = loaderInert ? bannerVerdict : null;
+
+  // Whether any of the banner blocks below is on screen. The HUD takes
   // no banner-state input, so it is carried as a class on the shared ancestor
   // instead — `.session-root.banner-on` pushes a top-docked HUD down (hud.css).
+  // A held verdict is the only banner: the others' Stop would end a session
+  // another tab now owns.
   const bannerOn =
-    health != null ||
-    clientUnsupported ||
-    (recovery != null &&
-      ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase));
+    verdictBanner != null ||
+    (!bannerVerdict &&
+      (health != null ||
+        clientUnsupported ||
+        (recovery != null &&
+          ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase))));
 
   // Same shape, for the mic "hot" pill vs the toast host (`.session-root.mic-on`).
   const rootClassName =
@@ -800,7 +890,7 @@ export function SessionPage() {
           {/* AS10-06: stream health. Warning (degrading) is non-blocking info;
               critical (unsustainable) offers Stop / Retry — the user always
               chooses, the client never auto-acts. */}
-          {health && (
+          {health && !bannerVerdict && (
             <SessionBanner
               variant={health.kind === "critical" ? "critical" : "warning"}
               title={health.title}
@@ -825,7 +915,7 @@ export function SessionPage() {
           )}
 
           {/* Multi-codec spec §6.1: client_unsupported. */}
-          {clientUnsupported && (
+          {clientUnsupported && !bannerVerdict && (
             <SessionBanner
               title={<>This stream isn&rsquo;t supported on your device</>}
               message={
@@ -843,7 +933,20 @@ export function SessionPage() {
             />
           )}
 
-          {recovery &&
+          {verdictBanner && (
+            <SessionBanner
+              title={verdictBanner.title}
+              message={verdictBanner.message}
+              actions={
+                <Button variant="primary" onClick={() => navigate("/app")}>
+                  Back to library
+                </Button>
+              }
+            />
+          )}
+
+          {!bannerVerdict &&
+            recovery &&
             ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase) && (
               <SessionBanner
                 variant={recovery.phase === "failed" ? "critical" : "warning"}
@@ -906,16 +1009,21 @@ export function SessionPage() {
           sessionRunning={sessionRunning}
           iceState={iceState}
           // handleStop tears the session down server-side so "Back to
-          // library" from a dead launch never orphans a session.
-          onExit={() => void handleStop()}
+          // library" from a dead launch never orphans a session. Not for a
+          // takeover: the other tab owns the session, and stopping it ends its stream.
+          // Nor a revoke: the control plane already stopped it.
+          onExit={() => (launchFailure && isBannerVerdict(launchFailure) ? navigate("/app") : void handleStop())}
         />
       )}
 
       {/* The HUD is a sibling of <video>, subscribing to the telemetry fan-out
           directly (#139). SessionSwapController owns all quick-switch wiring as
           one unit so the bar's `swappingTo` and the Games pane can never see a
-          different `transition` than the overlay renders. */}
+          different `transition` than the overlay renders. The controller stays
+          mounted for the page's life (an in-flight swap's poll must survive a
+          transient `sessionOver`); `sessionOver` only stops it drawing. */}
       <SessionSwapController
+        sessionOver={sessionOver}
         sessionId={sessionId}
         authToken={authToken}
         currentApp={currentApp}
@@ -998,7 +1106,7 @@ export function SessionPage() {
           reach this button (it hides on desktop during play), but where nothing
           is ever locked, taps still land here — the only route back for a
           controller-only tablet player. */}
-      {!pointerLocked && !hudOpen && (
+      {!sessionOver && !pointerLocked && !hudOpen && (
         <button
           type="button"
           className={`session-summon${inputCaptured ? " always" : ""}`}
@@ -1012,7 +1120,8 @@ export function SessionPage() {
         </button>
       )}
 
-      <SessionToastHost toast={toast} />
+      {/* A swap finishing under a held verdict must not announce itself next to the notice. */}
+      <SessionToastHost toast={bannerVerdict ? null : toast} />
 
       {/* Rendered outside every auto-hiding surface on purpose: a live
           microphone must not be able to become invisible, including under the

@@ -161,6 +161,12 @@ func (s *Store) Telemetry() telemetry.Store { return s.tel }
 // are what the scheduler reserves.
 type LaunchApp struct {
 	ID string
+	// Kind is the app's OWN `kind` column ("game", "desktop" or "launcher") —
+	// never the parent's, even for a derived tile: console.KindAllowsConsoleDefault
+	// (the Go twin of console.Store.DirectApps' SQL) reads this plus ParentAppID
+	// to decide console-default eligibility, which is about the picked row's own
+	// identity, not what it borrows.
+	Kind string
 	// ParentAppID (migration 0044) is the provider app a DERIVED TILE borrows its
 	// runtime from, "" for an ordinary app. When set, every executable field below
 	// is ALREADY the parent's by the time GetLaunchApp returns.
@@ -209,7 +215,11 @@ type Session struct {
 	FailureCode *string
 	// AppLogTail (migration 0062) is the app container's last ~100 log lines,
 	// newline-joined. The ONLY copy: app containers run with `--rm` (#463).
-	AppLogTail  *string
+	AppLogTail *string
+	// StopReason (migration 0101) is the session_stop reason recorded with the
+	// move to `stopping`, nil when the control plane never stopped the session.
+	// Not client-safe as is: see clientStopReason.
+	StopReason  *string
 	HomeSeed    json.RawMessage
 	Width       int32
 	Height      int32
@@ -276,10 +286,18 @@ func (s *Store) IsEntitled(ctx context.Context, userID, appID string) (bool, err
 	var ok bool
 	if err := s.pool.QueryRow(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM entitlements e
-			WHERE e.app_id = $1::uuid
-			  AND (e.subject_type = 'all'
-			       OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))
+			SELECT 1 FROM apps
+			WHERE apps.id = $1::uuid
+			  AND EXISTS (
+			      SELECT 1 FROM entitlements e
+			      WHERE e.app_id = apps.id
+			        AND (e.subject_type = 'all'
+			             OR (e.subject_type = 'user' AND e.subject_id = $2::uuid)))
+			  AND (apps.parent_app_id IS NULL OR EXISTS (
+			      SELECT 1 FROM entitlements e
+			      WHERE e.app_id = apps.parent_app_id
+			        AND (e.subject_type = 'all'
+			             OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))))
 		)`, appID, userID).Scan(&ok); err != nil {
 		return false, fmt.Errorf("check entitlement: %w", err)
 	}
@@ -342,7 +360,7 @@ func (s *Store) GetLaunchApp(ctx context.Context, appID string) (LaunchApp, erro
 		parentName    *string
 	)
 	err := s.pool.QueryRow(ctx, `
-		SELECT apps.id::text, apps.parent_app_id::text,
+		SELECT apps.id::text, apps.kind, apps.parent_app_id::text,
 		       parent.enabled, parent.name,
 		       apps.external_source, apps.external_id,
 		       COALESCE(parent.runtime_spec,          apps.runtime_spec),
@@ -369,7 +387,7 @@ func (s *Store) GetLaunchApp(ctx context.Context, appID string) (LaunchApp, erro
 		-- runtime_preset_id is NULL by CHECK, so this is the parent's or nothing.
 		LEFT JOIN runtime_presets rp ON rp.id = COALESCE(parent.runtime_preset_id, apps.runtime_preset_id)
 		WHERE apps.id = $1::uuid AND apps.enabled = true
-	`, appID).Scan(&a.ID, &parentID,
+	`, appID).Scan(&a.ID, &a.Kind, &parentID,
 		&parentEnabled, &parentName,
 		&a.ExternalSource, &a.ExternalID,
 		&a.RuntimeSpec,
@@ -623,7 +641,7 @@ func (s *Store) ListAll(ctx context.Context, cursor string, limit int32, filter 
 // failed. ErrInvalidTransition if the move is not permitted, ErrNotFound if the
 // row is gone; a same-state report is an idempotent no-op.
 func (s *Store) Transition(ctx context.Context, id string, to State, detail, errMsg *string) (Session, error) {
-	return s.transition(ctx, id, "", to, detail, errMsg)
+	return s.transition(ctx, id, "", nil, to, detail, errMsg, nil)
 }
 
 // TransitionFromHost is the authenticated agent variant. It checks the
@@ -633,7 +651,7 @@ func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to St
 	var sess Session
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		sess, err = s.transition(ctx, id, hostID, to, detail, errMsg)
+		sess, err = s.transition(ctx, id, hostID, nil, to, detail, errMsg, nil)
 		var pgErr *pgconn.PgError
 		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
 			return sess, err
@@ -642,7 +660,16 @@ func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to St
 	return sess, err
 }
 
-func (s *Store) transition(ctx context.Context, id, reportHostID string, to State, detail, errMsg *string) (Session, error) {
+// rowGuard is the row state a caller decided a transition on, re-checked under
+// the row lock so a swap that commits in between cannot be acted on stale.
+type rowGuard func(appID string, stateDetail *string) bool
+
+var errSessionMoved = errors.New("session no longer in the state the transition was decided on")
+
+// A non-nil only applies the transition while it still holds for the locked
+// row, and is errSessionMoved otherwise. stopReason is recorded with a state
+// change and never rewritten: a repeated stop keeps the first reason.
+func (s *Store) transition(ctx context.Context, id, reportHostID string, only rowGuard, to State, detail, errMsg, stopReason *string) (Session, error) {
 	if !isValidUUID(id) {
 		return Session{}, ErrNotFound
 	}
@@ -668,6 +695,9 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, to Stat
 	}
 	if reportHostID != "" && (assignedHost == nil || *assignedHost != reportHostID) {
 		return Session{}, ErrNotFound
+	}
+	if only != nil && !only(sessionApp, curDetail) {
+		return Session{}, errSessionMoved
 	}
 	// A restart loses swapper.pendingSwaps but not this durable guard. A stop
 	// request or any nonterminal agent detail cannot clear it: the target may
@@ -707,10 +737,11 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, to Stat
 			    state         = $2,
 			    state_detail  = COALESCE($3, state_detail),
 			    error_message = CASE WHEN $2 = 'failed' THEN $4 ELSE error_message END,
+			    stop_reason   = COALESCE(stop_reason, $5),
 			    started_at    = CASE WHEN $2 = 'running' AND started_at IS NULL THEN now() ELSE started_at END,
 			    ended_at      = CASE WHEN $2 IN ('stopped','failed') AND ended_at IS NULL THEN now() ELSE ended_at END
 			WHERE id = $1::uuid
-		`, id, string(to), detail, errMsg)
+		`, id, string(to), detail, errMsg, stopReason)
 		if err != nil {
 			return Session{}, fmt.Errorf("update state: %w", err)
 		}
@@ -928,6 +959,25 @@ func (s *Store) RunningSessionIDsOnHost(ctx context.Context, hostID string) ([]s
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// StoppingNeverStartedOnHost lists the host's `stopping` rows that never reached
+// `running`: the ones the agent's heartbeat cannot vouch for either way.
+func (s *Store) StoppingNeverStartedOnHost(ctx context.Context, hostID string) ([]string, error) {
+	if !isValidUUID(hostID) {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id::text FROM sessions
+		WHERE host_id = $1::uuid AND state = 'stopping' AND started_at IS NULL`, hostID)
+	if err != nil {
+		return nil, fmt.Errorf("list unstarted stopping sessions on host: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("list unstarted stopping sessions on host: %w", err)
+	}
+	return ids, nil
 }
 
 // Host mirrors the schema.md `hosts` columns; the response DTO is built from it.
@@ -1415,7 +1465,7 @@ func (s *Store) UpdateSessionNegotiatedCodec(ctx context.Context, id, codec stri
 // RETURNING, kept in lockstep with scanSessionRow's Scan order.
 const sessionCols = `id::text, user_id::text, app_id::text, host_id::text, gpu_id::text,
 	state, state_detail, error_message,
-	failure_code, app_log_tail, home_seed,
+	failure_code, app_log_tail, stop_reason, home_seed,
 	width, height, fps, bitrate_kbps, h264_profile,
 	codec,
 	profile_id,
@@ -1472,7 +1522,7 @@ func scanSessionRow(r row, extra ...any) (Session, error) {
 	dest := []any{
 		&s.ID, &s.UserID, &s.AppID, &s.HostID, &s.GPUID,
 		&st, &s.StateDetail, &s.ErrorMessage,
-		&s.FailureCode, &s.AppLogTail, &s.HomeSeed,
+		&s.FailureCode, &s.AppLogTail, &s.StopReason, &s.HomeSeed,
 		&s.Width, &s.Height, &s.FPS, &s.BitrateKbps, &s.H264Profile,
 		&s.Codec,
 		&s.ProfileID,

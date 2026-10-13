@@ -58,7 +58,7 @@ pub(super) fn add_audio_chain(
         .build()
         .context("audioresample not found")?;
     // The Opus wire format (`opus/48000/2`), not opusenc's own caps fixation. A passthrough
-    // while the capture sink stays pinned to the same format (`audio::pulse_command`).
+    // while the capture sink stays pinned to the same format (`deploy/audio/`).
     let audio_raw_caps = gst::ElementFactory::make("capsfilter")
         .property(
             "caps",

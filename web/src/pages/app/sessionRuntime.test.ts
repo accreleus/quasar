@@ -20,6 +20,7 @@ import type { TelemetrySnapshot } from "../../webrtc/telemetry";
 import type { ICEServer } from "../../api/types";
 import type { RebindOutcome } from "../../webrtc/session";
 import { ApiError } from "../../api/client";
+import { RecoveryController } from "../../webrtc/recovery";
 
 // ── fakes ───────────────────────────────────────────────────────────────────
 
@@ -648,6 +649,40 @@ describe("recovery and the replacement handoff (L4)", () => {
     const h = harness();
     h.runtime.start();
     h.transport.fireRecovery("superseded", "This session was opened in another tab or window");
+    await flush();
+    await flush();
+
+    expect(h.callbacks.onSessionTakenOver).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
+    expect(h.callbacks.onReconnectFailed).not.toHaveBeenCalled();
+    expect(h.runtime.getSnapshot().recovery).toMatchObject({ phase: "superseded" });
+  });
+
+  // #527 — recovery already ended (`failed`) and the mint is pending: the real
+  // controller must still deliver the takeover, once, and the mint must lose.
+  it("a takeover after `failed` discards the pending mint and reports once (#527)", async () => {
+    const gate: { release: (() => void) | undefined } = { release: undefined };
+    const minted = new Promise<void>((r) => {
+      gate.release = r;
+    });
+    const mint = vi.fn(async () => {
+      await minted;
+      return { signaling: { url: "wss://new", token: "tok-2" } };
+    });
+    const h = harness({ mint: mint as never });
+    h.runtime.start();
+    const recovery = new RecoveryController({
+      onRetry: () => {},
+      onState: (state) => h.transport.opts.onRecoveryState(state),
+    });
+
+    recovery.terminal("Peer connection failed (DTLS)");
+    await flush();
+    expect(mint).toHaveBeenCalledTimes(1);
+
+    recovery.superseded("This session was opened in another tab or window");
+    recovery.superseded("This session was opened in another tab or window");
+    gate.release?.();
     await flush();
     await flush();
 

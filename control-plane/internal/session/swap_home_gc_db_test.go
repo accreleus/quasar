@@ -194,7 +194,6 @@ func TestUncertainManagedSwapAckRetainsHomeHold(t *testing.T) {
 	disp.ackSendErr = errors.New("ack lost")
 	swap := newSwapper(store, disp, testLogger(), nil)
 	swap.pendingSwaps[sess.ID] = target
-	swap.pendingHome[sess.ID] = true
 	swap.dispatchSwap(s.hostID, sess.ID, []byte(`{}`), true, s.userID, target, nil, nil)
 	if _, pending := swap.pendingSwaps[sess.ID]; !pending {
 		t.Fatal("uncertain ack removed pending target")

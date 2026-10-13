@@ -41,15 +41,6 @@ const UI_SCALE: &str = "ui-scale";
 /// `"WxH,WxH,…"` string. One string for the same reason `render-size` is: a partially
 /// applied ladder is still a mode set the app can pick from.
 const MODE_LADDER: &str = "mode-ladder";
-/// #445: the display's real mode set, `"WxH@mHz,…"`, each mode with its own refresh. The
-/// compositor advertises it on `wl_output` and through `wlr-output-management`, and posts a
-/// client's choice as the [`MODE_REQUEST`] bus message.
-const OUTPUT_MODES: &str = "output-modes";
-/// #445: the application message `waylanddisplaysrc` posts when a client applied an output
-/// configuration (fields `width`, `height`, `refresh-millihz`).
-const MODE_REQUEST: &str = "quasar-mode-request";
-/// The source tail capsfilter (`pipeline::build_video_source`), re-pinned on a mode switch.
-const SOURCE_CAPS: &str = "source-caps";
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -267,13 +258,12 @@ impl SessionResources {
             match PulseSidecar::start(session_id, &runtime, &cfg.runtime_dir) {
                 Ok(Some(s)) => Some(s),
                 Ok(None) => {
-                    audio_degraded = Some(
-                        "PulseAudio sidecar started but its socket never became ready".to_string(),
-                    );
+                    audio_degraded =
+                        Some("audio sidecar started but its socket never became ready".to_string());
                     None
                 }
                 Err(e) => {
-                    audio_degraded = Some(format!("PulseAudio sidecar start failed: {e:#}"));
+                    audio_degraded = Some(format!("audio sidecar start failed: {e:#}"));
                     None
                 }
             }
@@ -546,9 +536,6 @@ pub struct AppSource {
     /// semantics via [`Self::take_launch_error`], so the caller fails the session exactly
     /// once per occurrence rather than on every poll.
     launch_error: Option<String>,
-    /// #445: the latest client mode request the compositor posted and nobody has taken yet;
-    /// see [`Self::take_mode_request`].
-    pending_mode_request: Option<(i32, i32, i32)>,
     /// The CURRENT container's exit slot and log ring, replaced on every launch. The
     /// exit status is written once by the RuntimeClient observer spawned in
     /// [`Self::launch`] and consumed by [`Self::take_container_exit`]; `None` while still
@@ -634,7 +621,6 @@ impl AppSource {
             wl_display: None,
             metrics_probe: None,
             launch_error: None,
-            pending_mode_request: None,
             observation: GenerationObservation::new(),
             app_commits_at_launch: None,
             shared: res.shared.clone(),
@@ -788,9 +774,9 @@ impl AppSource {
         self.pipeline.bus()
     }
 
-    /// Query the compositor source for a context it owns. Required by local-only Vulkan
-    /// fan-out: interpipe does not forward context queries across its source/sink
-    /// pipeline boundary, so the consumer pipeline must receive the producer's
+    /// Query the compositor source for a context it owns. Required by the Vulkan encode
+    /// bridge: interpipe does not forward context queries across its source/sink pipeline
+    /// boundary, so the encode pipeline must receive the producer's
     /// GstVulkanInstance/GstVulkanDevice explicitly.
     pub fn source_context(&self, context_type: &str) -> Option<gst::Context> {
         let source = self.pipeline.by_name("video-source")?;
@@ -872,76 +858,6 @@ impl AppSource {
             self.session_id,
         );
         true
-    }
-
-    /// #445: advertise the display's real mode set (`[(width, height, refresh_mHz)]`, each
-    /// with its own refresh) on this compositor, so the app's display settings list them and
-    /// a client can ask for one through `wlr-output-management`. Set BEFORE the compositor
-    /// starts for the same bind-time reason as [`Self::set_mode_ladder`]. Guarded on
-    /// `find_property`; an older image debug-logs and no-ops. Returns whether it was taken.
-    pub fn set_output_modes(&self, modes: &[(i32, i32, i32)]) -> bool {
-        let Some(source) = self.pipeline.by_name("video-source") else {
-            tracing::warn!(
-                token = "output-modes-no-video-source",
-                "output modes: source pipeline has no video-source element"
-            );
-            return false;
-        };
-        if source.find_property(OUTPUT_MODES).is_none() {
-            tracing::debug!(
-                "compositor lacks the {OUTPUT_MODES} property (older gst-wayland-display); \
-                 the guest cannot pick a display mode"
-            );
-            return false;
-        }
-        let value = modes
-            .iter()
-            .map(|(w, h, r)| format!("{w}x{h}@{r}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        source.set_property(OUTPUT_MODES, value.as_str());
-        tracing::info!(
-            "session {}: compositor output modes set to [{value}]",
-            self.session_id,
-        );
-        true
-    }
-
-    /// #445: the latest mode a client asked for through the compositor, `(width, height,
-    /// refresh_mHz)`, taken once. Fed by [`Self::on_bus_message`].
-    pub fn take_mode_request(&mut self) -> Option<(i32, i32, i32)> {
-        self.pending_mode_request.take()
-    }
-
-    /// #445: re-pin this generation's source tail to `caps` (the session's raw video caps at
-    /// a new WxH@fps) and remember the mode for the next app container this source
-    /// launches. Call with the pipeline PAUSED; the next buffer re-negotiates upstream, and
-    /// the compositor applies the new size and rate to its `wl_output` (and every mapped
-    /// toplevel) on the new caps.
-    pub fn set_stream_mode(&mut self, width: i32, height: i32, fps: i32, caps: &gst::Caps) -> bool {
-        let Some(tail) = self.pipeline.by_name(SOURCE_CAPS) else {
-            tracing::warn!(
-                token = "stream-mode-no-source-caps",
-                "mode switch: source pipeline has no {SOURCE_CAPS} capsfilter"
-            );
-            return false;
-        };
-        tail.set_property("caps", caps);
-        self.display = AppDisplayMode { width, height, fps };
-        tracing::info!(
-            "session {}: source re-pinned to {width}x{height}@{fps}",
-            self.session_id,
-        );
-        true
-    }
-
-    /// Hold the source pipeline (PAUSED): the compositor keeps serving its clients, no
-    /// frame is pulled or rendered. The counterpart of [`Self::start`].
-    pub fn pause(&self) -> anyhow::Result<()> {
-        self.pipeline
-            .set_state(gst::State::Paused)
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("source pipeline failed to reach PAUSED: {e}"))
     }
 
     /// Whether the compositor has produced its first frame. This is NOT "the app is on
@@ -1060,12 +976,6 @@ impl AppSource {
     /// launches the app container into the compositor once, or under
     /// [`Self::defer_app_launch`] records the socket for a later explicit launch.
     pub fn on_bus_message(&mut self, msg: &gst::Message) {
-        if let Some(request) = mode_request_from_message(msg) {
-            // Last one wins: a client that clicks through three modes before the runner
-            // polls gets the mode it ended on, not three switches.
-            self.pending_mode_request = Some(request);
-            return;
-        }
         if self.launched {
             return;
         }
@@ -1211,6 +1121,7 @@ impl AppSource {
             container_name: Some(self.container_name.clone()),
             nvidia_lib32_path: &self.nvidia_lib32_path,
             display: self.display,
+            direct_display: None,
         };
         // Snapshot the commit counter BEFORE the container exists, so anything counted
         // from here on can only have been drawn by the container about to start. Read
@@ -1256,46 +1167,13 @@ impl AppSource {
         }
     }
 
-    /// Spawn the dedicated RuntimeClient observer for a just-launched container. One thread
-    /// per generation owns only observation: each request is bounded, the intentional-stop
-    /// marker ends the loop, and cancellation never asks the engine to stop the workload.
-    /// A verified terminal result supplies final logs before this thread publishes status.
+    /// [`spawn_observer`] for this source's generation.
     fn spawn_exit_waiter(
         &self,
         application: crate::runtime::ApplicationId,
         observer: GenerationObserver,
     ) {
-        let sink_name = self.sink_name.clone();
-        let thread_sink_name = sink_name.clone();
-        let builder = std::thread::Builder::new().name("quasar-app-wait".to_string());
-        let log_span = tracing::Span::current();
-        if let Err(e) = builder.spawn(move || {
-            // Re-enter the session span so this thread's lines carry session=<id>.
-            let _log_span = log_span.enter();
-            let sink_name = thread_sink_name;
-            let observed = application.clone();
-            let tailed = application;
-            observe_until_exit(
-                &observer,
-                &sink_name,
-                || {
-                    crate::runtime::configured()
-                        .and_then(|api| api.observe_application(observed.clone()).wait())
-                },
-                || {
-                    crate::runtime::configured()
-                        .and_then(|api| api.application_log_tail(tailed.clone()).wait())
-                        .ok()
-                },
-                || std::thread::sleep(OBSERVATION_RETRY_DELAY),
-            );
-        }) {
-            tracing::warn!(
-                token = "app-liveness-waiter-spawn-failed",
-                "source '{sink_name}': failed to spawn app-liveness waiter thread: {e} — \
-                 an app exit for this generation will go undetected"
-            );
-        }
+        spawn_observer(self.sink_name.clone(), application, observer);
     }
 
     /// Tear down (idempotent): stop the app container, release the pulse sidecar
@@ -1362,6 +1240,47 @@ impl AppSource {
                 report
             }
         }
+    }
+}
+
+/// Spawn the dedicated RuntimeClient observer for a just-launched container. One thread
+/// per generation owns only observation: each request is bounded, the intentional-stop
+/// marker ends the loop, and cancellation never asks the engine to stop the workload.
+/// A verified terminal result supplies final logs before this thread publishes status.
+/// `label` names the generation in logs.
+pub(crate) fn spawn_observer(
+    label: String,
+    application: crate::runtime::ApplicationId,
+    observer: GenerationObserver,
+) {
+    let thread_label = label.clone();
+    let builder = std::thread::Builder::new().name("quasar-app-wait".to_string());
+    let log_span = tracing::Span::current();
+    if let Err(e) = builder.spawn(move || {
+        // Re-enter the session span so this thread's lines carry session=<id>.
+        let _log_span = log_span.enter();
+        let observed = application.clone();
+        let tailed = application;
+        observe_until_exit(
+            &observer,
+            &thread_label,
+            || {
+                crate::runtime::configured()
+                    .and_then(|api| api.observe_application(observed.clone()).wait())
+            },
+            || {
+                crate::runtime::configured()
+                    .and_then(|api| api.application_log_tail(tailed.clone()).wait())
+                    .ok()
+            },
+            || std::thread::sleep(OBSERVATION_RETRY_DELAY),
+        );
+    }) {
+        tracing::warn!(
+            token = "app-liveness-waiter-spawn-failed",
+            "source '{label}': failed to spawn app-liveness waiter thread: {e} — \
+             an app exit for this generation will go undetected"
+        );
     }
 }
 
@@ -1467,57 +1386,6 @@ impl Drop for AppSource {
             self.shared.apply(report, false);
         }
         let _ = self.pipeline.set_state(gst::State::Null);
-    }
-}
-
-/// #445: the `(width, height, refresh_mHz)` a `quasar-mode-request` application message
-/// carries, or `None` for any other message.
-pub(crate) fn mode_request_from_message(msg: &gst::Message) -> Option<(i32, i32, i32)> {
-    let gst::MessageView::Application(app) = msg.view() else {
-        return None;
-    };
-    let s = app.structure()?;
-    if s.name() != MODE_REQUEST {
-        return None;
-    }
-    Some((
-        s.get::<i32>("width").ok()?,
-        s.get::<i32>("height").ok()?,
-        s.get::<i32>("refresh-millihz").ok()?,
-    ))
-}
-
-#[cfg(test)]
-mod mode_request_tests {
-    use super::mode_request_from_message;
-    use gstreamer as gst;
-
-    /// #445: the compositor's `quasar-mode-request` application message is the one source
-    /// of a mode request; anything else on the bus is not one.
-    #[test]
-    fn mode_request_is_read_from_the_compositors_bus_message() {
-        gst::init().unwrap();
-        let s = gst::Structure::builder("quasar-mode-request")
-            .field("width", 2560i32)
-            .field("height", 1440i32)
-            .field("refresh-millihz", 143_981i32)
-            .build();
-        let msg = gst::message::Application::new(s);
-        assert_eq!(mode_request_from_message(&msg), Some((2560, 1440, 143_981)));
-
-        let other = gst::message::Application::new(
-            gst::Structure::builder("wayland.src")
-                .field("WAYLAND_DISPLAY", "wayland-3")
-                .build(),
-        );
-        assert_eq!(mode_request_from_message(&other), None);
-
-        let incomplete = gst::message::Application::new(
-            gst::Structure::builder("quasar-mode-request")
-                .field("width", 2560i32)
-                .build(),
-        );
-        assert_eq!(mode_request_from_message(&incomplete), None);
     }
 }
 

@@ -124,10 +124,9 @@ out3="$(prep "$r3" "$tmp/podman-only" --mode rootless --engine podman --console 
 grep -q 'KERNEL=="card\[0-9\]\*"' "$r3/etc/udev/rules.d/71-quasar-console.rules" && grep -q 'i2c-dev' "$r3/etc/modules-load.d/quasar.conf" \
   && pass "--console adds display, sound and i2c, and loads i2c-dev" || fail "--console" ""
 r3rules="$r3/etc/udev/rules.d/71-quasar-console.rules"
-grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_KEYBOARD}=="1"' "$r3rules" \
-  && grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_MOUSE}=="1"' "$r3rules" \
-  && grep -q 'SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT_JOYSTICK}=="1"' "$r3rules" \
-  && pass "--console grants the host's physical keyboards, mice and joysticks by udev property" || fail "physical input rules" "$(cat "$r3rules")"
+grep -q '^SUBSYSTEM=="input", KERNEL=="event\*", ENV{ID_INPUT}=="1", ACTION!="remove", ENV{DEVNAME}=="?\*", RUN+="/usr/bin/setfacl -m g:quasar:rw \$devnode"$' "$r3rules" \
+  && [ "$(grep -c 'SUBSYSTEM=="input"' "$r3rules")" = 1 ] \
+  && pass "--console grants the host's input devices, every one udev classifies as input (#460)" || fail "physical input rules" "$(cat "$r3rules")"
 printf '%s' "$out3" | grep -q "the quasar group can read what is typed on this machine's keyboard" \
   && pass "--console states plainly that the quasar group can read this machine's keyboard" || fail "plain keyboard warning" "$out3"
 grep -q '^SUBSYSTEM=="tty", KERNEL=="tty8", ACTION!="remove", ENV{DEVNAME}=="?\*", RUN+="/usr/bin/setfacl -m g:quasar:rw \$devnode"$' "$r3rules" \
@@ -192,55 +191,17 @@ out3d="$(prep "$r3d" "$tmp/podman-only" --mode rootless --engine podman --consol
 [ ! -e "$r3d/etc/systemd/system" ] && printf '%s' "$out3d" | grep -q 'would    getty@tty8.service masked' \
   && pass "--console dry run masks nothing and says it would" || fail "tty8 dry run" "$out3d"
 
-# ── 3b. console audio (PipeWire) ────────────────────────────────────────────
+# ── 3b. console audio is retired ────────────────────────────────────────────
 r3b="$tmp/r3b"; mk_root "$r3b"; printf 'alice:x:1500:1500::/home/alice:/bin/bash\n' >> "$r3b/etc/passwd"
-out3b="$(prep "$r3b" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)" || fail "console audio run" "$out3b"
-pw="$r3b/etc/pipewire/pipewire-pulse.conf.d/90-quasar-console.conf"
-grep -q '"unix:native"' "$pw" && grep -q 'address = "unix:/run/quasar-console-audio/native"' "$pw" && grep -q 'client.access = "restricted"' "$pw" \
-  && pass "the PipeWire drop-in keeps unix:native and adds the Quasar console socket" || fail "pipewire drop-in" "$(cat "$pw" 2>&1)"
-tf="$r3b/etc/tmpfiles.d/quasar-console-audio.conf"
-grep -q '^d /run/quasar-console-audio 0750 alice quasar -$' "$tf" \
-  && pass "tmpfiles.d creates /run/quasar-console-audio owned alice:quasar 0750" || fail "console audio tmpfiles" "$(cat "$tf" 2>&1)"
-restart_cmd="runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1500 systemctl --user restart pipewire-pulse.service"
-unit="$r3b/etc/systemd/user/quasar-console-audio.service"
-grep -qx 'ConditionUser=alice' "$unit" && grep -qx 'Wants=pipewire-pulse.service' "$unit" && grep -qx 'WantedBy=default.target' "$unit" \
-  && [ "$(readlink "$r3b/etc/systemd/user/default.target.wants/quasar-console-audio.service")" = /etc/systemd/user/quasar-console-audio.service ] \
-  && grep -qxF 'systemctl --global enable quasar-console-audio.service' "$r3b/.prepare-host-commands" \
-  && pass "a user unit, enabled globally but only for alice, starts her pipewire-pulse with her manager (the socket survives a reboot)" || fail "console audio boot unit" "$(cat "$unit" 2>&1)"
-# #433: alice is not logged in here, so nothing is restarted and the exact command is the next step.
-! grep -q 'pipewire-pulse' "$r3b/.prepare-host-commands" 2>/dev/null && printf '%s' "$out3b" | grep -qF "$restart_cmd" \
-  && pass "with no user manager running for alice, nothing is restarted and the restart command is printed" || fail "console audio restart note" "$out3b"
-
-if prep "$tmp/none" "$tmp/podman-only" --mode rootless --console-audio-user ghost 2>/dev/null; then fail "unknown console-audio-user" "exit 0"; else pass "--console-audio-user refuses an unknown account"; fi
-if prep "$tmp/none" "$tmp/podman-only" --mode rootless --console-audio-user alice 2>/dev/null; then fail "console-audio-user without --console" "exit 0"; else pass "--console-audio-user without --console is refused"; fi
-
-before3b="$(tree "$r3b")"
-out3b2="$(prep "$r3b" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)"
-[ "$before3b" = "$(tree "$r3b")" ] && pass "console audio re-run leaves every file identical" || fail "console audio idempotent files" "$(diff <(echo "$before3b") <(tree "$r3b") | head)"
-if printf '%s' "$out3b2" | grep -qE '^  (changed|would) '; then fail "console audio re-run reports no change" "$(printf '%s' "$out3b2" | grep -E '^  (changed|would)')"; else pass "console audio re-run prints only ok lines"; fi
-printf '%s' "$out3b2" | grep -q 'socket is not there yet' && printf '%s' "$out3b2" | grep -qF "$restart_cmd" \
-  && pass "a re-run with the socket still missing says so and prints the restart command" || fail "console audio missing socket note" "$out3b2"
-
-# ── 3c. console audio: alice's user manager runs, so her pipewire-pulse is restarted ──
-r3c="$tmp/r3c"; mk_root "$r3c"; printf 'alice:x:1500:1500::/home/alice:/bin/bash\nbob:x:1501:1501::/home/bob:/bin/bash\n' >> "$r3c/etc/passwd"
-mkdir -p "$r3c/run/user/1500/systemd" "$r3c/run/user/1501/systemd"; : > "$r3c/run/user/1500/systemd/private"; : > "$r3c/run/user/1501/systemd/private"
-out3d="$(prep "$r3c" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice --dry-run 2>&1)"
-! grep -q 'pipewire-pulse' "$r3c/.prepare-host-commands" 2>/dev/null && printf '%s' "$out3d" | grep -q "would    restart alice's pipewire-pulse" \
-  && pass "a dry run restarts nothing and says it would restart alice's pipewire-pulse" || fail "console audio dry-run restart" "$out3d"
-out3c="$(prep "$r3c" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)" || fail "console audio restart run" "$out3c"
-[ "$(grep -c 'pipewire-pulse' "$r3c/.prepare-host-commands")" = 1 ] && grep -qxF "$restart_cmd" "$r3c/.prepare-host-commands" \
-  && printf '%s' "$out3c" | grep -q "changed  alice's pipewire-pulse restarted" \
-  && pass "a changed drop-in restarts alice's pipewire-pulse, and no other account's" || fail "console audio restart" "$(cat "$r3c/.prepare-host-commands") $out3c"
-out3c2="$(prep "$r3c" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)"
-[ "$(grep -c 'pipewire-pulse' "$r3c/.prepare-host-commands")" = 1 ] && ! printf '%s' "$out3c2" | grep -qE 'pipewire-pulse (restarted|did not)|restart .*pipewire-pulse|not there yet' \
-  && pass "a re-run with the drop-in unchanged and the socket present restarts nothing" || fail "console audio restart idempotent" "$(cat "$r3c/.prepare-host-commands") $out3c2"
-# After a reboot the socket is gone (Fedora socket-activates pipewire-pulse): a re-run starts
-# it, never restarts it, so a running session is not disturbed.
-rm -f "$r3c/run/quasar-console-audio/native"
-out3c3="$(prep "$r3c" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)"
-grep -qxF "runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1500 systemctl --user start pipewire-pulse.service" "$r3c/.prepare-host-commands" \
-  && [ "$(grep -c 'restart pipewire-pulse' "$r3c/.prepare-host-commands")" = 1 ] && printf '%s' "$out3c3" | grep -q "changed  alice's pipewire-pulse started" \
-  && pass "with the drop-in unchanged and the socket missing, alice's pipewire-pulse is started, not restarted" || fail "console audio start" "$(cat "$r3c/.prepare-host-commands") $out3c3"
+out3b="$(prep "$r3b" "$tmp/podman-only" --mode rootless --engine podman --console --console-audio-user alice 2>&1)" || fail "retired console audio run" "$out3b"
+[ ! -e "$r3b/etc/pipewire" ] && [ ! -e "$r3b/etc/tmpfiles.d/quasar-console-audio.conf" ] && [ ! -e "$r3b/etc/systemd/user" ] \
+  && ! grep -q 'pipewire-pulse\|console-audio' "$r3b/.prepare-host-commands" 2>/dev/null \
+  && printf '%s' "$out3b" | grep -q 'console-audio-user is retired and ignored' \
+  && pass "--console-audio-user is accepted, says it is retired, and writes nothing" || fail "retired console audio" "$out3b"
+mkdir -p "$r3b/etc/tmpfiles.d"; : > "$r3b/etc/tmpfiles.d/quasar-console-audio.conf"
+out3b2="$(prep "$r3b" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)"
+printf '%s' "$out3b2" | grep -q 'quasar-console-audio.conf was written by an earlier run for console audio' && [ -e "$r3b/etc/tmpfiles.d/quasar-console-audio.conf" ] \
+  && pass "an earlier run's console audio file is named and left in place" || fail "retired console audio leftovers" "$out3b2"
 
 # ── 4. optional settings only when asked ────────────────────────────────────
 if grep -qE 'dmesg_restrict|unprivileged_port_start' "$r/etc/sysctl.d/99-quasar.conf"; then fail "no optional sysctl by default" ""; else pass "optional kernel settings absent unless asked"; fi
@@ -320,10 +281,95 @@ grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil' "$r7d/.prepare-h
   && pass "the nested-sandbox type gets exactly one NVIDIA device rule" || fail "nested gpu module" "$(cat "$r7d/.prepare-host-commands")"
 out7d2="$(prep "$r7d" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
 printf '%s' "$out7d2" | grep -q 'ok       SELinux container_use_xserver_devices on' && pass "the boolean is left alone once on" || fail "selinux idempotent" "$out7d2"
-[ "$(grep -c 'semodule -i' "$r7d/.prepare-host-commands")" = 1 ] && pass "the module is installed once" || fail "module idempotent" "$(cat "$r7d/.prepare-host-commands")"
+[ "$(grep -c 'semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil' "$r7d/.prepare-host-commands")" = 1 ] && pass "the module is installed once" || fail "module idempotent" "$(cat "$r7d/.prepare-host-commands")"
 r7e="$tmp/r7e"; mk_root "$r7e" nvidia; mkdir -p "$r7e/sys/fs/selinux/booleans"; printf '0 0' > "$r7e/sys/fs/selinux/booleans/container_use_xserver_devices"
 prep "$r7e" "$tmp/docker-only" --mode rootful >/dev/null 2>&1
 if grep -q setsebool "$r7e/.prepare-host-commands" 2>/dev/null; then fail "no boolean for Docker" ""; else pass "Docker without SELinux does not get the SELinux boolean"; fi
+
+# ── 7e2. SELinux: sessions' PulseAudio socket (#476) ────────────────────────
+# A nested-sandbox app (container_engine_t) must connect to its session's sidecar
+# (container_t); the policy's connectto rule is same-type only.
+cil7k="etc/quasar/selinux/quasar-nested-audio.cil"
+r7k="$tmp/r7k"; mk_root "$r7k"; mkdir -p "$r7k/sys/fs/selinux"
+out7k="$(prep "$r7k" "$tmp/podman-only" --mode rootless --engine podman 2>&1)" || fail "audio selinux run" "$out7k"
+c7k="$r7k/$cil7k"
+grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-audio.cil' "$r7k/.prepare-host-commands" \
+  && printf '%s' "$out7k" | grep -q 'changed  SELinux module quasar-nested-audio' \
+  && pass "an SELinux host (no NVIDIA, no --console) loads the session sound module" || fail "audio module" "$(cat "$r7k/.prepare-host-commands") $out7k"
+grep -qxF '(allow container_engine_t container_t (unix_stream_socket (connectto)))' "$c7k" \
+  && [ "$(grep -c '^(allow' "$c7k")" = 1 ] \
+  && pass "the session sound module is exactly one connectto rule on unix_stream_socket" || fail "audio module rules" "$(cat "$c7k")"
+out7k2="$(prep "$r7k" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
+[ "$(grep -c 'semodule -i /etc/quasar/selinux/quasar-nested-audio.cil' "$r7k/.prepare-host-commands")" = 1 ] \
+  && printf '%s' "$out7k2" | grep -q 'ok       SELinux module quasar-nested-audio' \
+  && pass "a second run leaves the session sound module alone" || fail "audio module idempotent" "$out7k2"
+printf '; older rules\n' > "$r7k/etc/quasar/selinux/.quasar-nested-audio.loaded"
+prep "$r7k" "$tmp/podman-only" --mode rootless --engine podman >/dev/null 2>&1
+[ "$(grep -c 'semodule -i /etc/quasar/selinux/quasar-nested-audio.cil' "$r7k/.prepare-host-commands")" = 2 ] \
+  && pass "a changed session sound module is loaded again" || fail "audio module reload" "$(cat "$r7k/.prepare-host-commands")"
+r7l="$tmp/r7l"; mk_root "$r7l"
+out7l="$(prep "$r7l" "$tmp/podman-only" --mode rootless --engine podman 2>&1)" || fail "audio non-selinux run" "$out7l"
+[ ! -e "$r7l/$cil7k" ] && ! grep -qs 'semodule' "$r7l/.prepare-host-commands" && ! printf '%s' "$out7l" | grep -q 'quasar-nested-audio' \
+  && pass "a host without SELinux gets no session sound module" || fail "audio module non-selinux" "$out7l"
+r7m="$tmp/r7m"; mk_root "$r7m"; mkdir -p "$r7m/sys/fs/selinux"
+out7m="$(prep "$r7m" "$tmp/docker-only" --mode rootful --engine docker 2>&1)" || fail "audio docker run" "$out7m"
+[ ! -e "$r7m/$cil7k" ] && pass "Docker without --selinux-enabled gets no session sound module" || fail "audio module docker" "$out7m"
+
+# ── 7f. --console on SELinux: the console devices module (#460) ─────────────
+# A console session runs as container_engine_t, which the policy denies the input nodes,
+# the sound nodes, hidraw and the udev database: KWin started with no keyboard or mouse.
+cil7f="etc/quasar/selinux/quasar-console-devices.cil"
+r7f="$tmp/r7f"; mk_root "$r7f"; mkdir -p "$r7f/sys/fs/selinux"
+out7f="$(prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)" || fail "console selinux run" "$out7f"
+grep -q 'semodule -i /etc/quasar/selinux/quasar-console-devices.cil' "$r7f/.prepare-host-commands" \
+  && printf '%s' "$out7f" | grep -q 'changed  SELinux module quasar-console-devices' \
+  && printf '%s' "$out7f" | grep -q 'changed  /etc/quasar/selinux/quasar-console-devices.cil' \
+  && pass "--console on SELinux writes and loads the console devices module" || fail "console module" "$(cat "$r7f/.prepare-host-commands") $out7f"
+c7f="$r7f/$cil7f"
+grep -qxF '(allow container_engine_t device_t (dir (getattr open read search watch)))' "$c7f" \
+  && grep -qxF '(allow container_engine_t event_device_t (chr_file (getattr ioctl lock map open read write append)))' "$c7f" \
+  && grep -qxF '(allow container_engine_t sound_device_t (chr_file (getattr ioctl lock map open read write append)))' "$c7f" \
+  && grep -qxF '(allow container_engine_t usb_device_t (chr_file (getattr ioctl lock map open read write append)))' "$c7f" \
+  && grep -qxF '(allow container_engine_t udev_var_run_t (dir (getattr open read search)))' "$c7f" \
+  && grep -qxF '(allow container_engine_t udev_var_run_t (file (getattr open read map)))' "$c7f" \
+  && [ "$(grep -c '^(allow' "$c7f")" = 6 ] \
+  && pass "the console module names exactly the input, sound, hidraw and udev-data rules" || fail "console module rules" "$(cat "$c7f")"
+if grep -v '^;' "$c7f" | grep -qE 'dri_device_t|xserver_misc_device_t|(^|[ (])(self|unconfined_t|container_t)[ )]'; then fail "console module is narrow" "$(cat "$c7f")"; else pass "the console module does not widen the display or NVIDIA rules"; fi
+out7f2="$(prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)"
+[ "$(grep -c 'semodule -i /etc/quasar/selinux/quasar-console-devices.cil' "$r7f/.prepare-host-commands")" = 1 ] \
+  && printf '%s' "$out7f2" | grep -q 'ok       SELinux module quasar-console-devices' \
+  && ! printf '%s' "$out7f2" | grep -q 'changed' \
+  && pass "a second --console run leaves the console module alone" || fail "console module idempotent" "$out7f2"
+# What was loaded before differs from what is written now (a rule changed in a new release).
+printf '; older rules\n' > "$r7f/etc/quasar/selinux/.quasar-console-devices.loaded"
+prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman --console >/dev/null 2>&1
+[ "$(grep -c 'semodule -i /etc/quasar/selinux/quasar-console-devices.cil' "$r7f/.prepare-host-commands")" = 2 ] && pass "a changed console module is loaded again" || fail "console module reload" "$(cat "$r7f/.prepare-host-commands")"
+# Without --console a module from an earlier run is named, not removed.
+out7f3="$(prep "$r7f" "$tmp/podman-only" --mode rootless --engine podman 2>&1)"
+printf '%s' "$out7f3" | grep -q 'note     SELinux module quasar-console-devices is installed from an earlier --console run and is left in place' \
+  && [ -f "$c7f" ] && ! grep -q 'semodule -r' "$r7f/.prepare-host-commands" \
+  && pass "without --console an installed console module is reported as a note and left in place" || fail "console module note" "$out7f3"
+# No SELinux (or a non-confining engine): nothing is written.
+r7g="$tmp/r7g"; mk_root "$r7g"
+out7g="$(prep "$r7g" "$tmp/podman-only" --mode rootless --engine podman --console 2>&1)" || fail "console non-selinux run" "$out7g"
+[ ! -e "$r7g/$cil7f" ] && ! grep -qs 'semodule' "$r7g/.prepare-host-commands" && ! printf '%s' "$out7g" | grep -q 'quasar-console-devices' \
+  && pass "--console on a host without SELinux writes no console module" || fail "console module non-selinux" "$out7g"
+r7h="$tmp/r7h"; mk_root "$r7h"; mkdir -p "$r7h/sys/fs/selinux"
+out7h="$(prep "$r7h" "$tmp/docker-only" --mode rootful --engine docker --console 2>&1)" || fail "console docker run" "$out7h"
+[ ! -e "$r7h/$cil7f" ] && pass "--console on Docker without --selinux-enabled writes no console module" || fail "console module docker" "$out7h"
+# No --console on a fresh SELinux host: no module and no note.
+r7i="$tmp/r7i"; mk_root "$r7i"; mkdir -p "$r7i/sys/fs/selinux"
+out7i="$(prep "$r7i" "$tmp/podman-only" --mode rootless --engine podman 2>&1)" || fail "no console run" "$out7i"
+[ ! -e "$r7i/$cil7f" ] && ! printf '%s' "$out7i" | grep -q 'quasar-console-devices' \
+  && pass "no console module and no note without --console on a fresh host" || fail "console module absent" "$out7i"
+# A dry run writes and loads nothing, and says what it would do.
+r7j="$tmp/r7j"; mk_root "$r7j"; mkdir -p "$r7j/sys/fs/selinux"
+b7j="$(tree "$r7j")"
+out7j="$(prep "$r7j" "$tmp/podman-only" --mode rootless --engine podman --console --dry-run 2>&1)" || fail "console dry run" "$out7j"
+[ "$b7j" = "$(tree "$r7j")" ] && [ ! -e "$r7j/.prepare-host-commands" ] \
+  && printf '%s' "$out7j" | grep -q 'would    write /etc/quasar/selinux/quasar-console-devices.cil' \
+  && printf '%s' "$out7j" | grep -q 'would    SELinux module quasar-console-devices' \
+  && pass "--console dry run writes and loads no console module, and says it would" || fail "console module dry run" "$out7j"
 
 # ── 8. a dry run changes nothing ────────────────────────────────────────────
 r8="$tmp/r8"; mk_root "$r8" nvidia
@@ -377,7 +423,8 @@ out9f="$(prep "$r9f" "$tmp/docker-only" --mode rootful --engine docker --homes /
 grep -qF 'semanage fcontext -a -t container_file_t /var/lib/quasar/h(/.*)?' "$r9f/.prepare-host-commands" \
   && grep -qF 'semanage fcontext -a -t container_file_t /run/quasar-agent(/.*)?' "$r9f/.prepare-host-commands" \
   && grep -q 'setsebool -P container_use_xserver_devices on' "$r9f/.prepare-host-commands" \
-  && grep -q 'semodule -i' "$r9f/.prepare-host-commands" \
+  && grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil' "$r9f/.prepare-host-commands" \
+  && grep -q 'semodule -i /etc/quasar/selinux/quasar-nested-audio.cil' "$r9f/.prepare-host-commands" \
   && grep -q SECLABEL "$r9f/etc/udev/rules.d/70-quasar.rules" \
   && grep -q 'd /run/quasar-agent 0755 root root' "$r9f/etc/tmpfiles.d/quasar.conf" \
   && pass "rootful Docker with --selinux-enabled gets the labels, boolean, module and a boot-made runtime dir" \

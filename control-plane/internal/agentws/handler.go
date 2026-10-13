@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -104,6 +106,17 @@ func (h *Handler) WithAuditor(rec audit.Recorder) *Handler {
 	return h
 }
 
+// WithConsoleDisconnectGrace makes an absent console connector stop the auto-started
+// session once it has been absent for `grace` (`config.Config.ConsoleDisconnectGrace`).
+// Without it the session runs on and the desktop handles the display's return.
+func (h *Handler) WithConsoleDisconnectGrace(grace time.Duration) *Handler {
+	h.consoleAuto.mu.Lock()
+	h.consoleAuto.disconnectStops = true
+	h.consoleAuto.disconnectGrace = grace
+	h.consoleAuto.mu.Unlock()
+	return h
+}
+
 // WithTrustedProxies configures which direct peers are reverse proxies whose
 // X-Forwarded-For may be believed when keying the enrollment failure limiter
 // (#438).
@@ -128,6 +141,19 @@ type consoleAutoState struct {
 	launching      map[string]bool            // hostID → launch currently being scheduled
 	lastConnectors map[string][]string        // hostID → last-reported connector list
 	backoff        map[string]*consoleBackoff // hostID → crash-loop backoff state
+	// hostID → the running session's connector has been absent since; at most one
+	// grace timer per host. Cleared when the connector is back or the session ends.
+	absent map[string]*consoleAbsence
+	// QUASAR_CONSOLE_DISCONNECT_GRACE: whether an absent connector ever stops the
+	// session, and after how long. A monitor that drops its link on power-off reads
+	// as unplugged, so the default is never.
+	disconnectStops bool
+	disconnectGrace time.Duration
+}
+
+type consoleAbsence struct {
+	since time.Time
+	timer *time.Timer
 }
 
 func newConsoleAutoState() *consoleAutoState {
@@ -136,6 +162,7 @@ func newConsoleAutoState() *consoleAutoState {
 		launching:      make(map[string]bool),
 		lastConnectors: make(map[string][]string),
 		backoff:        make(map[string]*consoleBackoff),
+		absent:         make(map[string]*consoleAbsence),
 	}
 }
 
@@ -276,6 +303,13 @@ func newPolicyUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// canonicalPolicyUUID reports whether id is spelled exactly as newPolicyUUID and
+// Postgres' uuid::text spell one; a ::uuid cast accepts many other spellings.
+func canonicalPolicyUUID(id string) bool {
+	raw, err := hex.DecodeString(strings.ReplaceAll(id, "-", ""))
+	return err == nil && len(raw) == 16 && id == fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
+}
+
 func (h *Handler) offerNextSessionPolicy(ctx context.Context, c *conn) {
 	if !c.policyTyped || !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || len(c.policyOutstanding) != 0 || c.policyDeliveryID == "" || h.cfgStore == nil {
 		return
@@ -293,12 +327,26 @@ func (h *Handler) offerNextSessionPolicy(ctx context.Context, c *conn) {
 		h.log.Warn("host policy offer load failed", "host_id", c.hostID, "err", err)
 		return
 	}
+	for id, issued := range c.policyIssued {
+		if time.Since(issued.ExpiresAt) > policyIssuedRetention {
+			delete(c.policyIssued, id)
+		}
+	}
 	for _, offer := range offers {
 		if err := h.registry.Send(c.hostID, offer); err != nil {
 			h.log.Warn("host policy offer failed", "host_id", c.hostID, "group", offer.Group, "err", err)
+			continue
 		}
+		if c.policyIssued == nil {
+			c.policyIssued = map[string]*hostcfg.PolicyOffer{}
+		}
+		c.policyIssued[offer.AttemptID] = offer
 	}
 }
+
+// policyIssuedRetention keeps an unanswered grant past its expiry long enough
+// for the agent's late rejection to land; an accepted one moves to policyOutstanding.
+const policyIssuedRetention = 5 * time.Minute
 
 func (h *Handler) offerIdlePolicy(ctx context.Context, c *conn) {
 	if !c.policyIdle || !c.policyAcknowledged.Load() || !c.policyInventoryDone.Load() ||
@@ -334,11 +382,14 @@ func (h *Handler) offerIdlePolicy(ctx context.Context, c *conn) {
 
 // Historical grants stay bound to their original identity across reconnects.
 // The current socket authenticates the report; inventory binds its attempt.
+// Anything else must be a grant this connection issued (agent-api.md: state is
+// accepted only for a matching durable attempt).
 func policyGrantMatches(c *conn, state ConfigPolicyStateMsg) bool {
 	if prior, ok := c.policyOutstanding[state.AttemptID]; ok {
 		return prior.HostID == state.HostID && prior.Group == state.Group && prior.Revision == state.Revision && prior.ContentSHA256 == state.ContentSHA256 && prior.Scope == state.Scope && prior.GrantBootIncarnation == state.GrantBootIncarnation && prior.GrantConnectionIncarnation == state.GrantConnectionIncarnation
 	}
-	return state.GrantBootIncarnation == c.bootIncarnation && state.GrantConnectionIncarnation == c.connectionIncarnation
+	offer, ok := c.policyIssued[state.AttemptID]
+	return ok && offer.HostID == state.HostID && offer.Group == state.Group && offer.Revision == state.Revision && offer.ContentSHA256 == state.ContentSHA256 && offer.Scope == state.Scope && offer.BootIncarnation == state.GrantBootIncarnation && offer.ConnectionIncarnation == state.GrantConnectionIncarnation
 }
 
 func policyEntryMatchesDesired(group hostcfg.PolicyGroup, entry ConfigPolicyStateMsg) bool {
@@ -375,7 +426,8 @@ func policyEvidenceMatches(expected, evidence map[string]any) bool {
 }
 
 // Journal sequence survives terminal handling on a connection so delayed
-// accepted/retry frames cannot reopen an already completed attempt.
+// accepted/retry frames cannot reopen an already completed attempt. Only a
+// digest of the report is kept: its error and evidence are agent-sized.
 func (c *conn) acceptPolicySequence(state ConfigPolicyStateMsg) (bool, error) {
 	sequence, err := strconv.ParseUint(state.JournalSequence, 10, 64)
 	if err != nil || strconv.FormatUint(sequence, 10) != state.JournalSequence {
@@ -387,16 +439,17 @@ func (c *conn) acceptPolicySequence(state ConfigPolicyStateMsg) (bool, error) {
 		// accepts, so the per-attempt sequence cache must not consume it.
 		return true, nil
 	}
-	content, err := json.Marshal(state)
+	raw, err := json.Marshal(state)
 	if err != nil {
 		return false, err
 	}
+	content := sha256.Sum256(raw)
 	if previous, ok := c.policySequence[state.AttemptID]; ok {
 		if sequence < previous {
 			return false, nil
 		}
 		if sequence == previous {
-			if !bytes.Equal(c.policySequenceContent[state.AttemptID], content) {
+			if c.policySequenceContent[state.AttemptID] != content {
 				return false, errors.New("conflicting policy journal sequence")
 			}
 			return false, nil
@@ -404,7 +457,7 @@ func (c *conn) acceptPolicySequence(state ConfigPolicyStateMsg) (bool, error) {
 	}
 	if c.policySequence == nil {
 		c.policySequence = map[string]uint64{}
-		c.policySequenceContent = map[string][]byte{}
+		c.policySequenceContent = map[string][sha256.Size]byte{}
 	}
 	c.policySequence[state.AttemptID] = sequence
 	c.policySequenceContent[state.AttemptID] = content
@@ -426,15 +479,34 @@ func (h *Handler) maybeSendInitialPolicyMap(ctx context.Context, c *conn) error 
 }
 
 func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []byte) error {
-	if !c.policyTyped || h.cfgStore == nil || c.policyInventoryDone.Load() || c.policyInventoryID == "" {
+	if !c.policyTyped || h.cfgStore == nil {
 		return errors.New("unexpected policy inventory page")
 	}
 	var page ConfigPolicyInventoryPage
 	if err := json.Unmarshal(raw, &page); err != nil {
 		return err
 	}
+	// The answer to a request this connection itself replaced is late, not a
+	// violation. One page per replaced request; any other id still fails below.
+	if c.policyInventorySuperseded[page.InventoryID] {
+		delete(c.policyInventorySuperseded, page.InventoryID)
+		return nil
+	}
+	if c.policyInventoryDone.Load() || c.policyInventoryID == "" {
+		return errors.New("unexpected policy inventory page")
+	}
 	if page.InventoryID != c.policyInventoryID || page.SnapshotID == "" || !sameCursor(page.Cursor, c.policyInventoryCursor) || len(page.Entries) > 256 || page.RevisionHighWater == nil || page.ActiveSnapshots == nil {
 		return errors.New("invalid policy inventory page")
+	}
+	// The cursor is the entry count of the pages already accepted.
+	start := 0
+	if page.Cursor != nil {
+		start, _ = strconv.Atoi(*page.Cursor)
+	}
+	if start+len(page.Entries) > maxPolicyInventoryEntries {
+		c.policyInventoryUnknown = true
+		c.policyInventoryBlocked.Store(true)
+		return errors.New("policy inventory exceeds its entry cap")
 	}
 	for _, revision := range page.RevisionHighWater {
 		parsed, err := strconv.ParseUint(revision, 10, 64)
@@ -471,6 +543,10 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 		return err
 	}
 	for _, entry := range page.Entries {
+		// The id keys the caches and reaches both ::uuid casts and text keys in the store.
+		if !canonicalPolicyUUID(entry.AttemptID) {
+			return errors.New("invalid policy inventory attempt id")
+		}
 		fresh, err := c.acceptPolicySequence(entry)
 		if err != nil {
 			return err
@@ -502,7 +578,18 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 			})
 			continue
 		}
-		if entry.HostID != c.hostID || !hostcfg.IsPolicyGroup(entry.Group) {
+		// A scope that disagrees with the group's catalog scope is malformed,
+		// not terminal history: a failed one must not hide an attempt.
+		if groupScope, known := hostcfg.PolicyGroupScope(entry.Group); entry.HostID != c.hostID || !known || entry.Scope != groupScope {
+			c.policyInventoryUnknown = true
+			c.policyInventoryBlocked.Store(true)
+			continue
+		}
+		// An id the database holds under another group or scope must not pass as
+		// unrelated terminal history: it would hide that attempt from the journal view.
+		if contradicts, err := h.cfgStore.InventoryEntryContradictsRecord(ctx, c.hostID, entry.AttemptID, entry.Group, entry.Scope); err != nil {
+			return err
+		} else if contradicts {
 			c.policyInventoryUnknown = true
 			c.policyInventoryBlocked.Store(true)
 			continue
@@ -520,7 +607,7 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 			if c.policyOutstanding == nil {
 				c.policyOutstanding = map[string]ConfigPolicyStateMsg{}
 			}
-			c.policyOutstanding[entry.AttemptID] = entry
+			c.policyOutstanding[entry.AttemptID] = entry.grantIdentity()
 			c.policyAttemptOutstanding.Store(true)
 			if !policyEntryMatchesDesired(view.Groups[entry.Group], entry) {
 				c.policyInventoryBlocked.Store(true)
@@ -528,10 +615,6 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 		}
 	}
 	if page.NextCursor != nil {
-		start := 0
-		if page.Cursor != nil {
-			start, _ = strconv.Atoi(*page.Cursor)
-		}
 		if len(page.Entries) != 256 || *page.NextCursor != strconv.Itoa(start+len(page.Entries)) {
 			return errors.New("policy inventory cursor did not advance")
 		}
@@ -566,6 +649,11 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 	return h.maybeRunDeferredPolicyRefresh(ctx, c)
 }
 
+// The agent never prunes accepted records (agent-api.md), so lifetime history, not
+// groups × retry budget, sizes a real journal; 64 full pages is far past any real host.
+// A page is one agentReadLimit frame, so an inventory pins at most 64 MiB of agent bytes.
+const maxPolicyInventoryEntries = 64 * 256
+
 func sameCursor(a, b *string) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
@@ -594,6 +682,12 @@ func (h *Handler) restartPolicyInventory(ctx context.Context, c *conn) error {
 			return nil
 		}
 	}
+	return h.requestPolicyInventory(ctx, c)
+}
+
+// requestPolicyInventory drops what the connection learned from its last
+// inventory and asks the agent for a fresh complete one.
+func (h *Handler) requestPolicyInventory(ctx context.Context, c *conn) error {
 	deliveryGate, err := h.cfgStore.PolicyDeliveryGate(ctx, c.hostID, c.connectionIncarnation)
 	if err != nil {
 		return err
@@ -602,6 +696,12 @@ func (h *Handler) restartPolicyInventory(ctx context.Context, c *conn) error {
 		c.policyDeliveryID = ""
 		c.policyDeliverySentAt = time.Time{}
 		c.policyInitialMapApplied.Store(false)
+	}
+	if c.policyInventoryID != "" && !c.policyInventoryDone.Load() {
+		if c.policyInventorySuperseded == nil {
+			c.policyInventorySuperseded = map[string]bool{}
+		}
+		c.policyInventorySuperseded[c.policyInventoryID] = true
 	}
 	c.policyRefreshPending = false
 	c.policyInventoryDone.Store(false)
@@ -618,7 +718,36 @@ func (h *Handler) restartPolicyInventory(ctx context.Context, c *conn) error {
 	c.policySequenceContent = nil
 	c.policyAttemptOutstanding.Store(false)
 	c.policyActiveSnapshots.Store(nil)
-	return h.registry.Send(c.hostID, ConfigPolicyInventoryRequest{Type: "config_policy_journal_inventory_request", InventoryID: c.policyInventoryID, BootIncarnation: c.bootIncarnation, ConnectionIncarnation: c.connectionIncarnation})
+	if err := h.registry.Send(c.hostID, ConfigPolicyInventoryRequest{Type: "config_policy_journal_inventory_request", InventoryID: c.policyInventoryID, BootIncarnation: c.bootIncarnation, ConnectionIncarnation: c.connectionIncarnation}); err != nil {
+		c.policyInventoryID = "" // never sent: no page answers it
+		return err
+	}
+	return nil
+}
+
+// adoptOrphanedJournal reconciles on this live socket a journal that no
+// connection owns: only another process's boot leaves that under the registry's
+// current connection, and the agent has no reason to reconnect (#515). stale is
+// this heartbeat finding the journal elsewhere. The adoption stays owed until
+// its inventory request is queued: a journal bound but never asked for would
+// hold the host forever, so every later heartbeat tries again.
+func (h *Handler) adoptOrphanedJournal(ctx context.Context, c *conn, stale bool) error {
+	if !stale && !c.policyAdoptionOwed {
+		return nil
+	}
+	c.policyAdoptionOwed = true
+	adopted, err := h.cfgStore.AdoptOrphanedJournal(ctx, c.hostID, c.connectionIncarnation)
+	if err != nil {
+		return err
+	}
+	if adopted {
+		h.log.Warn("RH05 journal had no owning connection; reconciling on the live one", "host_id", c.hostID)
+		if err := h.requestPolicyInventory(ctx, c); err != nil {
+			return err
+		}
+	}
+	c.policyAdoptionOwed = false
+	return nil
 }
 
 func (h *Handler) maybeRunDeferredPolicyRefresh(ctx context.Context, c *conn) error {
@@ -870,13 +999,15 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	}
 
 	// Step 4 — message loop: heartbeats, acks, and session_state callbacks.
+	// One read is in flight at a time, so an offer nudge can be served between
+	// messages without a second reader (gorilla allows one).
+	type readResult struct {
+		raw []byte
+		err error
+	}
+	reads := make(chan readResult, 1)
+	reading := false
 	for {
-		// Fail fast if the server is shutting down.
-		select {
-		case <-reqCtx.Done():
-			return nil
-		default:
-		}
 		// A lost initial map or acknowledgement must not leave an apparently
 		// connected host gated forever. Renegotiate after a bounded wait; the
 		// durable gate remains closed until a current-connection exact-ID ack.
@@ -884,10 +1015,27 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			return errors.New("policy initial settings map acknowledgement timed out")
 		}
 
-		conn.SetReadDeadline(time.Now().Add(readDeadlineDur))
-		raw, err := readTextMessage(conn)
-		if err != nil {
-			return fmt.Errorf("read: %w", err)
+		if !reading {
+			reading = true
+			conn.SetReadDeadline(time.Now().Add(readDeadlineDur))
+			go func() {
+				raw, err := readTextMessage(conn)
+				reads <- readResult{raw, err}
+			}()
+		}
+		var raw []byte
+		select {
+		case <-reqCtx.Done():
+			return nil
+		case <-ac.policyNudge:
+			h.offerNextSessionPolicy(bg, ac)
+			continue
+		case read := <-reads:
+			reading = false
+			if read.err != nil {
+				return fmt.Errorf("read: %w", read.err)
+			}
+			raw = read.raw
 		}
 
 		msgType, err := peekType(raw)
@@ -912,11 +1060,23 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			} else {
 				h.log.Debug("heartbeat", "host_id", hostID, "running_sessions", len(hb.RunningSessions))
 				if ac.policyTyped && h.cfgStore != nil {
-					idleCtx, idleCancel := context.WithTimeout(bg, agentDBCallTimeout)
-					idleErr := h.cfgStore.ObserveIdleHeartbeat(idleCtx, hostID, ac.connectionIncarnation, hb.RunningSessions)
-					idleCancel()
-					if err := idleErr; err != nil {
-						h.log.Warn("RH05 idle inventory heartbeat rejected", "host_id", hostID, "err", err)
+					// A displaced socket's reader can still drain a heartbeat the
+					// agent sent before it reconnected; it is not inventory (#477).
+					// ErrIdleInventoryStale covers the race where the journal moved
+					// before the registry did.
+					var idleErr error
+					current := h.registry.withCurrent(ac, func() {
+						idleCtx, idleCancel := context.WithTimeout(bg, agentDBCallTimeout)
+						defer idleCancel()
+						idleErr = h.cfgStore.ObserveIdleHeartbeat(idleCtx, hostID, ac.connectionIncarnation, hb.RunningSessions)
+						if err := h.adoptOrphanedJournal(idleCtx, ac, errors.Is(idleErr, hostcfg.ErrIdleInventoryStale)); err != nil {
+							h.log.Warn("RH05 orphaned journal reconciliation failed; the next heartbeat retries", "host_id", hostID, "err", err)
+						}
+					})
+					if !current || errors.Is(idleErr, hostcfg.ErrIdleInventoryStale) {
+						h.log.Debug("idle inventory heartbeat from a superseded connection ignored", "host_id", hostID)
+					} else if idleErr != nil {
+						h.log.Warn("RH05 idle inventory heartbeat rejected", "host_id", hostID, "err", idleErr)
 					}
 				}
 			}
@@ -1057,6 +1217,15 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				if !ac.policyIdle {
 					continue
 				}
+				idle := hostcfg.IdleJournalState{AttemptID: state.AttemptID, Group: state.Group,
+					Revision: state.Revision, Digest: state.ContentSHA256,
+					GrantBoot: state.GrantBootIncarnation, GrantConnection: state.GrantConnectionIncarnation,
+					Phase: state.Phase, Sequence: state.JournalSequence, ErrorCode: policyStateErrorCode(state.Error)}
+				// Only a durable attempt may enter the sequence cache, or fabricated ids grow it unbounded.
+				if matches, err := h.cfgStore.IdleAttemptMatches(bg, hostID, idle); err != nil || !matches {
+					h.log.Warn("idle policy journal state for an unknown attempt ignored", "host_id", hostID, "attempt_id", state.AttemptID, "err", err)
+					continue
+				}
 				fresh, err := ac.acceptPolicySequence(state)
 				if err != nil {
 					ac.policyInventoryBlocked.Store(true)
@@ -1092,10 +1261,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 					}
 					observedAt = &at
 				}
-				idle := hostcfg.IdleJournalState{AttemptID: state.AttemptID, Group: state.Group,
-					Revision: state.Revision, Digest: state.ContentSHA256,
-					GrantBoot: state.GrantBootIncarnation, GrantConnection: state.GrantConnectionIncarnation,
-					Phase: state.Phase, Sequence: state.JournalSequence, ErrorCode: policyStateErrorCode(state.Error), VerifiedAt: observedAt}
+				idle.VerifiedAt = observedAt
 				if _, err := h.cfgStore.ObserveIdleState(bg, hostID, ac.connectionIncarnation, idle); err != nil {
 					h.log.Warn("idle policy journal state rejected", "host_id", hostID, "attempt_id", state.AttemptID, "err", err)
 				} else if state.Phase == "failed" && state.JournalSequence == "0" {
@@ -1104,6 +1270,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				continue
 			}
 			if !policyGrantMatches(ac, state) {
+				h.log.Warn("config policy state for an attempt not issued on this connection ignored", "host_id", hostID, "attempt_id", state.AttemptID)
 				continue
 			}
 			if scope, known := hostcfg.PolicyGroupScope(state.Group); !known || scope != "next_session" || state.Scope != scope {
@@ -1143,7 +1310,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				if ac.policyOutstanding == nil {
 					ac.policyOutstanding = map[string]ConfigPolicyStateMsg{}
 				}
-				ac.policyOutstanding[state.AttemptID] = state
+				ac.policyOutstanding[state.AttemptID] = state.grantIdentity()
 				ac.policyAttemptOutstanding.Store(true)
 				if !matching {
 					ac.policyInventoryBlocked.Store(true)
@@ -1357,6 +1524,10 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			h.writeError(conn, "auth_failed",
 				"a live agent is already registered under this node name; stop it before re-enrolling, "+
 					"or enroll under a different node_name")
+		case errors.Is(err, ErrHostAlreadyEnrolled):
+			h.writeError(conn, "auth_failed",
+				"this node name is already enrolled; re-enrolling it needs an enrollment token "+
+					"minted for this node name (Admin -> Fleet -> Add host, with the name filled in)")
 		case errors.Is(err, ErrHostNotFound):
 			// Names the credential that was refused, not just the remedy: the old
 			// wording ("use enrollment_token to enroll first") is exactly what an
@@ -1703,6 +1874,7 @@ func (h *Handler) ConsoleSessionTerminated(ctx context.Context, hostID, sessionI
 		return
 	}
 	delete(h.consoleAuto.sessions, hostID)
+	h.clearConsoleAbsenceLocked(hostID)
 	connectors := h.consoleAuto.lastConnectors[hostID]
 	bo := h.consoleAuto.backoffFor(hostID)
 	now := time.Now()
@@ -1800,6 +1972,7 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 	if alreadyLaunched && !h.events.ConsoleSessionActive(ctx, recordedID) {
 		h.consoleAuto.mu.Lock()
 		delete(h.consoleAuto.sessions, hostID)
+		h.clearConsoleAbsenceLocked(hostID)
 		h.consoleAuto.mu.Unlock()
 		alreadyLaunched = false
 		h.log.Info("console auto-start: prior session terminated, will relaunch",
@@ -1817,6 +1990,7 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 		h.consoleAuto.mu.Lock()
 		sessionID, ok := h.consoleAuto.sessions[hostID]
 		delete(h.consoleAuto.sessions, hostID)
+		h.clearConsoleAbsenceLocked(hostID)
 		h.consoleAuto.mu.Unlock()
 		if !ok {
 			return
@@ -1831,21 +2005,51 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 
 	// Level-triggered, not edge-triggered: a console session runs whenever the
 	// display is present, so it is (re)started on agent connect and boot-with-
-	// display (monitor power off/on is invisible to the OS).
+	// display.
 	//
 	// Presence keys on the pinned connector (console.ConsoleConfig.PinnedConnector).
 	// A pinned connector missing from the report is simply not-present — never a
 	// silent fallback to a different monitor.
 	nowPresent := connectorPresent(connectors, cfg.PinnedConnector())
+	if nowPresent {
+		h.consoleAuto.mu.Lock()
+		wasAbsent := h.clearConsoleAbsenceLocked(hostID)
+		h.consoleAuto.mu.Unlock()
+		if wasAbsent && alreadyLaunched {
+			h.log.Info("console auto-stop: display back, session kept",
+				"host_id", hostID, "session_id", recordedID)
+		}
+	}
 
 	switch {
 	case nowPresent && !alreadyLaunched:
+		// A default app that cannot run direct fails console_default_app: no
+		// launch, and no failure for the backoff to count.
+		check, err := h.consoleStore.DefaultAppReadiness(ctx, cfg)
+		if err != nil {
+			h.log.Warn("console auto-start: evaluate console readiness failed", "host_id", hostID, "err", err)
+			return
+		}
+		if check.Status != "pass" {
+			h.log.Info("console auto-start: not launching", "host_id", hostID,
+				"check", check.ID, "status", check.Status, "summary", check.Summary)
+			return
+		}
 		h.attemptConsoleLaunch(ctx, hostID, cfg, isCapacityPath)
 	case !nowPresent && alreadyLaunched:
 		h.consoleAuto.mu.Lock()
-		sessionID, ok := h.consoleAuto.sessions[hostID]
-		delete(h.consoleAuto.sessions, hostID)
+		stopNow := h.consoleConnectorAbsentLocked(hostID)
+		var sessionID string
+		ok := false
+		if stopNow {
+			sessionID, ok = h.consoleAuto.sessions[hostID]
+			delete(h.consoleAuto.sessions, hostID)
+			h.clearConsoleAbsenceLocked(hostID)
+		}
 		h.consoleAuto.mu.Unlock()
+		if !stopNow {
+			return
+		}
 		if !ok {
 			h.log.Debug("console auto-stop: no session recorded for host, nothing to stop", "host_id", hostID)
 			return
@@ -1864,6 +2068,71 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 				"host_id", hostID, "pinned_connector", pinned, "reported_connectors", connectors)
 		}
 	}
+}
+
+// consoleConnectorAbsentLocked records that the running session's connector is
+// absent and answers whether the session is stopped now. The first absence arms
+// the grace timer, which re-evaluates the host when the grace ends; a monitor that
+// drops its link on power-off is kept this way. Caller holds consoleAuto.mu.
+func (h *Handler) consoleConnectorAbsentLocked(hostID string) bool {
+	st := h.consoleAuto
+	if !st.disconnectStops {
+		if _, noted := st.absent[hostID]; !noted {
+			st.absent[hostID] = &consoleAbsence{since: time.Now()}
+			h.log.Info("console auto-stop: connector absent, session kept (no disconnect grace configured)",
+				"host_id", hostID)
+		}
+		return false
+	}
+	if st.disconnectGrace <= 0 {
+		return true
+	}
+	if a, waiting := st.absent[hostID]; waiting {
+		return time.Since(a.since) >= st.disconnectGrace
+	}
+	a := &consoleAbsence{since: time.Now()}
+	a.timer = time.AfterFunc(st.disconnectGrace, func() { h.consoleGraceEnded(hostID) })
+	st.absent[hostID] = a
+	h.log.Info("console auto-stop: connector absent, waiting out the disconnect grace",
+		"host_id", hostID, "grace", st.disconnectGrace.String())
+	return false
+}
+
+// consoleGraceEnded re-evaluates a host whose connector has been absent for the whole
+// grace. The re-evaluation stops the session; if it could not (a failed config read,
+// say), the timer is re-armed rather than left for a capacity report that a static
+// unplugged display never sends.
+func (h *Handler) consoleGraceEnded(hostID string) {
+	h.consoleAuto.mu.Lock()
+	a, stillAbsent := h.consoleAuto.absent[hostID]
+	connectors := h.consoleAuto.lastConnectors[hostID]
+	h.consoleAuto.mu.Unlock()
+	if !stillAbsent {
+		return
+	}
+	h.reevalConsole(context.Background(), hostID, connectors, false)
+	h.consoleAuto.mu.Lock()
+	defer h.consoleAuto.mu.Unlock()
+	if cur, still := h.consoleAuto.absent[hostID]; still && cur == a {
+		if _, tracked := h.consoleAuto.sessions[hostID]; tracked {
+			a.timer = time.AfterFunc(min(h.consoleAuto.disconnectGrace, consoleBackoffMax),
+				func() { h.consoleGraceEnded(hostID) })
+		}
+	}
+}
+
+// clearConsoleAbsenceLocked forgets a host's absence and its timer; reports whether
+// there was one. Caller holds consoleAuto.mu.
+func (h *Handler) clearConsoleAbsenceLocked(hostID string) bool {
+	a, ok := h.consoleAuto.absent[hostID]
+	if !ok {
+		return false
+	}
+	if a.timer != nil {
+		a.timer.Stop()
+	}
+	delete(h.consoleAuto.absent, hostID)
+	return true
 }
 
 // attemptConsoleLaunch launches the auto-start console session, gated by the
@@ -1893,9 +2162,8 @@ func (h *Handler) attemptConsoleLaunch(ctx context.Context, hostID string, cfg c
 	if !h.consoleAuto.claimLaunch(hostID) {
 		return
 	}
-	// #422: the session's initial size and rate follow the configured mode, else
-	// (local-only) the physical display; see console.ResolveSessionMode for the
-	// rule and the streaming exception. A capabilities read failure only costs
+	// #422: the session's initial size and rate follow the physical display;
+	// see console.ResolveSessionMode. A capabilities read failure only costs
 	// the physical follow: the launch proceeds at the app defaults.
 	caps, err := h.consoleStore.GetCapabilities(ctx, hostID)
 	if err != nil {
@@ -1905,7 +2173,7 @@ func (h *Handler) attemptConsoleLaunch(ctx context.Context, hostID string, cfg c
 	mode := console.ResolveSessionMode(cfg, caps)
 	h.log.Info("console auto-start: session mode", "host_id", hostID,
 		"width", mode.Width, "height", mode.Height, "fps", mode.FPS, "source", string(mode.Source))
-	sessionID, err := h.events.LaunchConsoleSession(ctx, hostID, *cfg.DefaultUser, *cfg.DefaultApp, cfg.VideoTopology(), mode.Width, mode.Height, mode.FPS)
+	sessionID, err := h.events.LaunchConsoleSession(ctx, hostID, *cfg.DefaultUser, *cfg.DefaultApp, console.ConsoleVideoTopology, mode.Width, mode.Height, mode.FPS)
 	if err != nil {
 		h.consoleAuto.finishLaunch(hostID, "", false)
 		h.log.Warn("console auto-start: launch failed", "host_id", hostID, "connector", cfg.PinnedConnector(), "err", err)

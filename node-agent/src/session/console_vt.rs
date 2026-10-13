@@ -325,6 +325,16 @@ pub(crate) fn presence(sys_class_tty: &Path, node: &Path) -> Presence {
     }
 }
 
+/// Whether a console session holds the console VT now (`readiness::console`, #460).
+pub(crate) fn held() -> bool {
+    active_slot().is_some()
+}
+
+/// The console VT's device node, as the agent sees it.
+pub(crate) fn console_node() -> PathBuf {
+    node_path(CONSOLE_VT)
+}
+
 fn node_path(n: u32) -> PathBuf {
     PathBuf::from(format!("/dev/tty{n}"))
 }
@@ -633,11 +643,17 @@ fn start(mut command: Command, timeout: Duration) -> Result<(Child, String), Str
         return Err("the console terminal helper has no stdout".into());
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    // 15 bytes is all the kernel keeps of a thread's name.
+    let reader = std::thread::Builder::new().name("quasar-vt-read".into());
+    let spawned = reader.spawn(move || {
         let mut line = String::new();
         let _ = BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(line);
     });
+    if let Err(e) = spawned {
+        stop(&mut child);
+        return Err(format!("could not read the console terminal helper: {e}"));
+    }
     let line = match rx.recv_timeout(timeout) {
         Ok(line) => line,
         Err(_) => {
@@ -689,9 +705,6 @@ impl Holder {
     }
 }
 
-/// The console VT, held for one local console session. Dropping it restores the previous
-/// VT; declare it before anything that can type (the session's virtual devices, the
-/// physical-input forwarder) so it drops after them.
 /// The console session holding the VT, for [`release_for_shutdown`].
 struct Registered {
     holder: Arc<Mutex<Holder>>,
@@ -704,6 +717,8 @@ fn active_slot() -> MutexGuard<'static, Option<Registered>> {
     ACTIVE.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// The console VT, held for one console session. Dropping it restores the previous VT;
+/// declare it before the session's container so it drops after the desktop is gone.
 pub struct ConsoleVt {
     holder: Option<Arc<Mutex<Holder>>>,
     // Last: the next take must not start before this one has restored.

@@ -493,7 +493,7 @@ fn a_container_holding_the_agent_name_without_our_labels_is_never_touched() {
 
 #[test]
 fn an_agent_image_without_a_revision_this_actor_carries_is_refused_before_anything_is_created() {
-    for label in [None, Some("4"), Some("one")] {
+    for label in [None, Some("5"), Some("one")] {
         let mut state = amd_host();
         state
             .registry

@@ -64,7 +64,10 @@ rung would restore an unclamped number.
 specific user; there is deliberately no admin arm. The authorization boundary
 is the transactional check inside scheduling, not the pre-check on the launch
 path — the pre-check exists only so an unentitled caller gets 403 before any
-other gate can leak a 409.
+other gate can leak a 409. A derived tile needs an entitlement to its parent
+app as well as its own. A session whose owner loses theirs is stopped: at once
+by the admin route that removed it, otherwise by the periodic entitlement sweep.
+That session's read then carries `stop_reason: entitlement_revoked`.
 
 **Home** — the per-(user, app) persistent storage a managed-home app mounts. A
 derived tile borrows its parent's home, which is why a tile is placed with a
@@ -75,20 +78,32 @@ tile discovered inside a parent app's library. It inherits the parent's
 runtime, image, and resource demand; a handful of fields (default profile,
 profile policy) stay on the tile.
 
-**Mode set** — the display modes a console session's compositor advertises to the
-app: the connected monitor's real DRM modes, each with its own refresh rate, not
-filtered by what the session renders at now. Distinct from the *mode ladder*
-(smaller same-aspect sizes at one refresh, for an in-game resolution menu on a
-streamed session). _Avoid_: "resolutions" (a mode carries a refresh too).
+**Missing** — the state of a library observation (one game a scan saw installed
+for one user on one host) that the last complete scan of that home did not
+list. A missing game still counts as installed: its tile, entitlement and any
+running session stay. It is pruned when a scan queued at least one scan
+interval after the first miss also does not list it; a scan that lists it
+clears the state.
 
-**Mode request** — a client's pick of one mode from the mode set, made inside the
-session through `wlr-output-management` and surfaced by the compositor as a
-`quasar-mode-request` bus message. The compositor changes nothing itself: the
-node agent decides (`plan_mode_switch`), moves the monitor and re-pins the
-compositor's caps, and the app follows its display's new configure without a
-restart. The physical mode that results is reported as
-`session_metrics.console_mode`. _Avoid_: "resize" (that is the stream's external
-size), "modeset" unqualified (weston's DRM modeset is one step of it).
+**Console session** — a session whose desktop owns the host's own screen: it
+holds the display directly, reads the real input devices and plays audio to the
+host's sound device. It is never streamed. Other, streamed sessions keep running
+beside it on the same GPU. _Avoid_: "local session" (ambiguous with a dev
+standalone launch), "dual output" (a retired topology that streamed the console
+session too).
+
+**Direct display** — how a console session reaches the screen: the desktop
+itself drives the display device, with no compositor, pipeline or display server
+of Quasar's between it and the monitor. _Avoid_: "local display" (the retired
+path, which rendered the session into a Quasar-owned display server).
+
+**Displaying** — a console session's health verdict: its container is alive, its
+desktop holds the display, and a frame is on screen. A still desktop is
+displaying; no frame cadence is required. The mode the connector runs at is
+reported as `session_metrics.console_mode`; the desktop chose it. _Avoid_: "mode
+set" and "mode request" (retired with the path that drew the console through a
+compositor of Quasar's, which advertised the monitor's modes to the app and
+forwarded its pick: a direct desktop lists and sets its own modes).
 
 **Generation** — one app container launched into one session: the gen-0
 container the session boots with, and each replacement a swap launches after

@@ -16,7 +16,6 @@
 //! (strict browsers reject a bare-index mid), NACK/RTX on the video transceiver, and the
 //! input DataChannel created before the first offer.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -29,25 +28,18 @@ use super::metrics::SessionMetrics;
 use super::signaling::{PcId, SignalMsg};
 use super::virtual_input::VirtualDevices;
 use super::{Codec, EncoderChoice, SessionConfig};
-use crate::messages::VideoTopology;
 
 mod caps;
-use caps::caps_profile;
 pub(crate) use caps::vulkan_image_transport;
-// #445: the console mode switch re-pins the source tail to these caps at the new mode.
-pub(crate) use caps::raw_video_caps;
+use caps::{caps_profile, raw_video_caps};
 mod codec_chain;
 use codec_chain::{build_bitstream_chain, BitstreamChain};
 mod rtp_ext;
-use rtp_ext::{
-    attach_abs_capture_time_egress_probe, attach_abs_capture_time_probe,
-    attach_abs_capture_time_verification_probe,
-};
+use rtp_ext::{attach_abs_capture_time_probe, attach_abs_capture_time_verification_probe};
 mod audio_branch;
 mod audio_health;
 use audio_branch::add_audio_chain;
 mod mic_branch;
-use mic_branch::add_mic_branch;
 mod probes;
 use probes::{
     attach_bitstream_capture, attach_encode_probes, attach_encoder_pts_trace,
@@ -55,6 +47,7 @@ use probes::{
     attach_vulkan_parent_meta_probe,
 };
 mod encoders;
+pub use encoders::preload_encoder_plugins;
 pub(crate) use encoders::{
     describe_codec_plan, probe_codec_support, rearm_vulkan_rc, EncoderKnobs, ResolvedEncoder,
     VULKAN_ENCODER_NAME,
@@ -77,12 +70,13 @@ pub(crate) const VIDEO_PAYLOADER_NAME: &str = "quasar-video-payloader";
 mod source_branch;
 // Also the media host probe's source + convert stage (`session::probe_media`): the probe
 // must build the compositor arm production builds, not a stand-in.
-pub(crate) use source_branch::{build_gpu_convert_stage, build_video_source};
+pub(crate) use source_branch::{
+    build_gpu_convert_stage, build_video_source, pin_vulkan_encode_ring,
+};
 mod scale_stage;
 use scale_stage::build_scale_stage;
 pub use scale_stage::ScaleStage;
 mod abr_glue;
-use abr_glue::enable_abr;
 // The interface the ABR ladder's resolution rung drives, and the runner's manual
 // `session_display_update` path with it.
 pub(crate) use abr_glue::resolution_lever_with_echo;
@@ -90,14 +84,16 @@ pub use abr_glue::{trigger, EncodeResolutionLever, ResolutionLever};
 mod webrtc;
 pub(crate) use webrtc::restart_ice;
 pub(crate) use webrtc::{
-    apply_remote_description, build_answerer_pipeline, remote_description_failure_reason,
+    answer_from, apply_remote_description, build_answerer_pipeline, dtls_started, has_offered,
+    ice_ufrag, names_a_peer, remote_description_failure_reason, AnswerFrom,
     RemoteDescriptionApplied, RemoteDescriptionFailure, SrdFailTx, SrdOkTx,
 };
 use webrtc::{
     connect_data_channel_open, connect_ice_candidate, connect_negotiation_needed,
     connect_state_logging, enable_video_fec, enable_video_rtx, make_webrtcbin,
-    set_audio_receive_latency, spawn_fec_controller,
 };
+mod transport;
+pub use transport::{TransportSlot, VideoTransport};
 
 /// Outbound signaling messages produced by GStreamer callback threads, drained
 /// by whatever transport is driving this session (WS server / control relay).
@@ -652,10 +648,10 @@ pub(crate) fn build_scale_stage_for_test(cfg: &SessionConfig) -> Result<ScaleSta
 pub struct EncodePipeline {
     /// The persistent encode pipeline. PLAYING for the whole session, across every swap.
     pub pipeline: gst::Pipeline,
-    /// The video `webrtcbin` (inbound SDP/ICE, the one-offer invariant).
-    pub webrtc: gst::Element,
-    /// The `"input"` DataChannel, held alive for the session.
-    pub data_channel: Option<glib::Object>,
+    /// The video transport (inbound SDP/ICE, the `"input"` DataChannel).
+    pub video: VideoTransport,
+    /// Rebuilds either transport for a new peer.
+    pub transport: TransportSlot,
     /// The `interpipesrc` whose `listen-to` the runner re-points on a swap.
     pub interpipesrc: gst::Element,
     /// The audio `webrtcbin` (its own pipeline — #304).
@@ -711,7 +707,6 @@ pub fn build_encode_pipeline(
     // `resolve_effective_encoder` first), so every arm below keys on it, and
     // `encoder_factory` is the exact element name that resolution found.
     let pipeline = gst::Pipeline::new();
-    let (width, height) = (cfg.stream.width, cfg.stream.height);
     let codec = cfg.stream.codec;
     let effective_profile = resolve_codec_profile(cfg, codec)?;
 
@@ -800,8 +795,6 @@ pub fn build_encode_pipeline(
         .build()
         .context("capsfilter not found")?;
 
-    let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
-
     pipeline.add_many([
         &interpipesrc,
         &queue,
@@ -810,7 +803,6 @@ pub fn build_encode_pipeline(
         &parser,
         &pay,
         &rtp_capsfilter,
-        &webrtc,
     ])?;
     if !gpu_convert.is_empty() {
         pipeline.add_many(gpu_convert.iter())?;
@@ -853,14 +845,10 @@ pub fn build_encode_pipeline(
 
     // Write the abs-capture-time one-byte-header extension (8-byte NTP-64) per RTP
     // packet. Probing `pay`'s src pad means the buffer is already an RTP packet, so the
-    // extension can be appended before the capsfilter.
+    // extension can be appended before the capsfilter. The transport stamps it again at
+    // its egress seam (`TransportSlot::attach_video`).
     let capture_times = attach_abs_capture_time_probe(&pay);
     if !diag_no_obs {
-        attach_abs_capture_time_egress_probe(
-            &webrtc,
-            capture_times,
-            cfg.latency_probe.then(|| session_metrics.clone()),
-        );
         attach_abs_capture_time_verification_probe(&rtp_capsfilter);
     }
 
@@ -901,531 +889,40 @@ pub fn build_encode_pipeline(
         }
     }
 
-    let src_pad = rtp_capsfilter
-        .static_pad("src")
-        .context("rtp capsfilter has no src pad")?;
-    let sink_pad = webrtc
-        .request_pad_simple("sink_%u")
-        .context("webrtcbin refused a sink pad request (video)")?;
-    src_pad
-        .link(&sink_pad)
-        .context("failed to link video into webrtcbin")?;
-    enable_video_rtx(&webrtc);
-    // ULPFEC/RED proactive burst-loss repair, no RTX round-trip. `fixed` negotiates
-    // ulp-red at the static level; `auto` negotiates at 0% and the controller below ramps
-    // on loss. Knobs: QUASAR_FEC_MODE / QUASAR_FEC_PERCENTAGE.
-    let fec_plan = cfg.fec_plan();
-    enable_video_fec(&webrtc, fec_plan.negotiate, fec_plan.initial_pct);
-    if fec_plan.controller_enabled {
-        // Reads the loss signal off the video webrtcbin get-stats on its own poll thread
-        // and writes fec-percentage on each arm/disarm. Clone trace_tx + session_id: both
-        // are moved into connect_state_logging further down.
-        spawn_fec_controller(
-            &webrtc,
-            cfg.fec_controller_config(),
-            Arc::downgrade(&session_metrics),
-            trace_tx.clone(),
-            session_id.clone(),
-        );
-    }
-    // Arm the in-session ABR governor on the send path. Must be wired before the offer so
-    // rtpgccbwe is part of the single negotiated send session. No-op only when rtpgccbwe
-    // is absent or the encoder rejects live writes.
-    //
-    // The resolution lever is built here, not in the runner, because the ladder needs it
-    // at arm time. One `Arc`, two owners: the runner's manual PATCH path and the ladder's
-    // `on_window` closure.
+    // The resolution lever is built here, not in the runner, because the ABR ladder
+    // needs it at arm time. One `Arc`, two owners: the runner's manual PATCH path and the
+    // ladder's `on_window` closure.
     let resolution_lever = resolution_lever_with_echo(scale, encoder.clone(), &session_metrics);
-    enable_abr(
-        &webrtc,
-        &encoder,
-        cfg,
-        session_metrics.clone(),
-        trace_tx.clone(),
-        session_id.clone(),
-        Some(resolution_lever.clone()).filter(|l| l.stage().supported),
-    );
-
-    // Audio: pulsesrc from the session's PulseAudio sidecar (stable across swaps — the
-    // new app connects to the same one). Skipped under QUASAR_AUDIO_DISABLED.
-    //
-    // #304: the audio webrtcbin MUST live in its own gst::Pipeline. Two webrtcbins in one
-    // pipeline never reach PLAYING (the aggregate state transition stalls), and the split
-    // also stops the browser's A/V sync from inflating video playout. The audio pipeline
-    // is returned and set to PLAYING by runner.rs alongside the encode pipeline, sharing
-    // its clock + base time.
-    let stream_audio_enabled = cfg.video_topology != VideoTopology::DualOutput
-        || cfg.console_config.as_ref().is_none_or(|c| c.stream_audio);
-    let (audio_webrtc, audio_pipeline) = if !audio_disabled() && stream_audio_enabled {
-        let audio_pipe = gst::Pipeline::new();
-        audio_health::watch_bus(&audio_pipe, &session_id);
-        let audio_tail = add_audio_chain(&audio_pipe, cfg, &session_id)?;
-        let audio_webrtc = make_webrtcbin(cfg.stun.as_deref())
-            .context("failed to create audio webrtcbin (encode pipeline)")?;
-        // #425: tune the mic receive-leg jitter buffer on the AUDIO PC only; the video
-        // webrtcbin is never touched here.
-        set_audio_receive_latency(&audio_webrtc, cfg.mic_jitter_ms);
-        audio_pipe.add(&audio_webrtc)?;
-        let audio_src_pad = audio_tail
+    let transport = TransportSlot {
+        cfg: cfg.clone(),
+        pipeline: pipeline.clone(),
+        tail: rtp_capsfilter
             .static_pad("src")
-            .context("audio rtp capsfilter has no src pad")?;
-        let audio_sink_pad = audio_webrtc
-            .request_pad_simple("sink_%u")
-            .context("audio webrtcbin refused a sink pad request")?;
-        audio_src_pad
-            .link(&audio_sink_pad)
-            .context("failed to link audio into audio webrtcbin")?;
-        // Microphone capture (client → host): a second, recvonly Opus m-line on this same
-        // audio PC, plus the decode bin that plays it into the sidecar's `quasar_mic`
-        // sink. Position is load-bearing: after the send transceiver, so the sendonly
-        // m-line stays m-line 0 and the wire is unchanged for mic-less sessions; and
-        // before READY/negotiation, because the mic m-line must ride the FIRST and only
-        // audio offer (`protocol/signaling.md` §Microphone m-line). Never renegotiated —
-        // the single-offer guard is untouched and mute/unmute is client-local.
-        if cfg.mic_enabled() {
-            add_mic_branch(&audio_pipe, &audio_webrtc, cfg.pulse_server.as_deref())?;
-        }
-        // The audio webrtcbin gets its own negotiation/ICE/state callbacks (PcId::Audio).
-        connect_ice_candidate(&audio_webrtc, out_tx.clone(), PcId::Audio);
-        // Pass devices so release_all fires on audio-PC disconnect too.
-        connect_state_logging(&audio_webrtc, devices.clone(), None, String::new());
-        // There is one `offer created` per PC (video + audio), so a harness asserting
-        // "exactly one offer" must count the VIDEO PC's line, not grep the session. Both
-        // lines carry the session id.
-        connect_negotiation_needed(
-            &audio_webrtc,
-            out_tx.clone(),
-            PcId::Audio,
-            session_id.clone(),
-        );
-        audio_pipe
-            .set_state(gst::State::Ready)
-            .context("audio pipeline failed to reach READY")?;
-        (Some(audio_webrtc), Some(audio_pipe))
-    } else {
-        tracing::info!("stream audio disabled by runtime or session topology — video-only offer");
-        if cfg.mic_enabled() {
-            // The mic m-line rides the audio PC, so no audio PC means no microphone path.
-            // Say so: a mic that silently does nothing is otherwise undiagnosable.
-            tracing::warn!(
-                token = "mic-no-audio-peerconnection",
-                "microphone requested but this session has no audio PeerConnection \
-                 (QUASAR_AUDIO_DISABLED or a local-only/stream-audio-off topology) — \
-                 no mic m-line will be offered"
-            );
-        }
-        (None, None)
+            .context("rtp capsfilter has no src pad")?,
+        encoder,
+        out_tx,
+        devices,
+        input_state,
+        metrics: session_metrics,
+        trace_tx,
+        session_id,
+        capture_times,
+        lever: resolution_lever.clone(),
+        observe: !diag_no_obs,
     };
-
-    connect_ice_candidate(&webrtc, out_tx.clone(), PcId::Video);
-    // Clone the devices Arc so connect_state_logging can release_all() on disconnect
-    // while the original is still available below for the DataChannel input_sink.
-    connect_state_logging(&webrtc, devices.clone(), Some(trace_tx), session_id.clone());
-    connect_negotiation_needed(&webrtc, out_tx, PcId::Video, session_id);
-
-    pipeline
-        .set_state(gst::State::Ready)
-        .context("encode pipeline failed to reach READY")?;
-
-    let (dc_init, input_channel_mode) = input_data_channel_init();
-    let data_channel = webrtc
-        .emit_by_name_with_values(
-            "create-data-channel",
-            &["input".to_value(), Some(dc_init).to_value()],
-        )
-        .and_then(|v| v.get::<glib::Object>().ok());
-    let input_sink = match devices {
-        Some(d) => InputSink::Virtual(d),
-        None => InputSink::None,
-    };
-    match &data_channel {
-        Some(dc) => {
-            connect_data_channel_open(
-                dc,
-                input_sink,
-                input_state,
-                width,
-                height,
-                input_channel_mode,
-            );
-            tracing::info!(
-                "created 'input' DataChannel ({input_channel_mode}, agent side, encode pipeline)"
-            );
-        }
-        None => tracing::warn!(
-            token = "datachannel-create-returned-nothing",
-            "create-data-channel returned no object"
-        ),
-    }
+    // Audio first: `attach_video` takes the encode pipeline to READY.
+    let (audio_webrtc, audio_pipeline) = transport.build_audio()?;
+    let video = transport.attach_video(false, None)?;
 
     Ok(EncodePipeline {
         pipeline,
-        webrtc,
-        data_channel,
+        video,
+        transport,
         interpipesrc,
         audio_webrtc,
         audio_pipeline,
         resolution_lever,
     })
-}
-
-// Console-mode local-display fan-out: a third interpipe listener → kmssink.
-//
-// The per-app source's interpipesink already fans out to multiple listeners (drop=true,
-// sync=false). This adds a third, in its OWN gst::Pipeline (same reason as the #304 audio
-// pipeline: a heavy consumer in the encode pipeline stalls its state transition), which
-// downloads the interpipe's encoder-dependent memory to a scannable surface and scans it
-// out to a locally-attached display while the session streams to the browser. Knob:
-// QUASAR_LOCAL_DISPLAY. Agent-only; no control-plane/schema/protocol change.
-
-/// A local-display fan-out pipeline: `interpipesrc(listen-to=sinkN) → queue →
-/// [download → videoconvert] → {waylandsink|kmssink}`. Owns its own `gst::Pipeline`, torn
-/// down on Drop (every session exit path).
-pub struct LocalDisplay {
-    pub pipeline: gst::Pipeline,
-    /// The runner re-points `listen-to` on a swap.
-    pub interpipesrc: gst::Element,
-    sink_frames: Arc<AtomicU64>,
-}
-
-impl LocalDisplay {
-    pub fn drain_sink_frames(&self) -> u64 {
-        self.sink_frames.swap(0, Ordering::AcqRel)
-    }
-}
-
-impl Drop for LocalDisplay {
-    fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
-    }
-}
-
-/// Build the [`LocalDisplay`] fan-out for `cfg`, listening to `initial_sink_name`.
-///
-/// The interpipesrc config must mirror the encode pipeline's exactly
-/// (`do-timestamp=false`, `allow-renegotiation=false`, `caps=raw_video_caps`, `is-live`,
-/// `format=time`): the runner shares one clock + base time across all pipelines, so the
-/// source's PTS are already valid here and re-stamping breaks pacing (#68).
-///
-/// The download bridge is encoder-aware: the interpipe carries CUDAMemory / VulkanImage /
-/// DMABuf / system memory depending on the encoder (`caps::raw_video_caps`,
-/// `source_branch`), but the terminal sink only scans out system or dmabuf memory.
-///
-/// Terminal sink: `wayland_socket = Some(sock)` → `waylandsink` into a headless weston,
-/// the nvidia-drm path (nvidia-drm exposes KMS only via the ATOMIC API, which kmssink
-/// cannot drive but weston's drm-backend can, so weston owns DRM master). `None` →
-/// `kmssink`, for amdgpu/legacy KMS where kmssink can take DRM master directly.
-pub fn build_local_display_pipeline(
-    cfg: &SessionConfig,
-    initial_sink_name: &str,
-    wayland_socket: Option<&str>,
-) -> Result<LocalDisplay> {
-    let pipeline = gst::Pipeline::new();
-
-    let raw_caps = raw_video_caps(cfg);
-    let interpipesrc = gst::ElementFactory::make("interpipesrc")
-        .name(format!("{initial_sink_name}-dispsrc"))
-        .property("listen-to", initial_sink_name)
-        .property("is-live", true)
-        .property("do-timestamp", false)
-        .property_from_str("format", "time")
-        .property("allow-renegotiation", false)
-        .property("caps", &raw_caps)
-        .build()
-        .context("interpipesrc not found — is gst-interpipe installed in the image?")?;
-    // Short leaky queue: drop stale frames across a swap rather than build latency.
-    let queue = gst::ElementFactory::make("queue")
-        .property("max-size-buffers", 3u32)
-        .property("max-size-bytes", 0u32)
-        .property("max-size-time", 0u64)
-        .property_from_str("leaky", "downstream")
-        .build()
-        .context("queue not found")?;
-
-    // Encoder-aware download bridge: bring the interpipe memory down to a scannable
-    // layout. Arms are split per encoder (no unreachable pattern under either cargo
-    // feature), mirroring `caps::raw_video_caps_for`.
-    let make_el = |name: &'static str| -> Result<gst::Element> {
-        gst::ElementFactory::make(name)
-            .build()
-            .with_context(|| format!("{name} not found — is the plugin in the image?"))
-    };
-    let mut bridge: Vec<gst::Element> = Vec::new();
-    match cfg.encoder {
-        // memory:CUDAMemory BGRA → download to system, then convert.
-        #[cfg(feature = "cuda")]
-        EncoderChoice::Nvenc => {
-            bridge.push(make_el("cudadownload")?);
-            bridge.push(make_el("videoconvert")?);
-        }
-        // No cuda feature: the interpipe carries system RGBx, so just convert.
-        #[cfg(not(feature = "cuda"))]
-        EncoderChoice::Nvenc => bridge.push(make_el("videoconvert")?),
-        // memory:VulkanImage NV12 → download to system, then convert.
-        EncoderChoice::Vulkan => {
-            if caps::vulkan_image_transport(cfg) {
-                bridge.push(make_el("vulkandownload")?);
-            }
-            if !caps::local_dmabuf_transport(cfg) {
-                bridge.push(make_el("videoconvert")?);
-            }
-        }
-        // VA: under ZC-03 dmabuf RGB, kmssink imports the dmabuf directly — videoconvert
-        // cannot negotiate the DMABuf memory feature. Otherwise system RGBx → convert.
-        EncoderChoice::Va => {
-            if caps::dmabuf_zerocopy_format(cfg).is_none() {
-                bridge.push(make_el("videoconvert")?);
-            }
-        }
-        // openh264: system I420 → convert.
-        EncoderChoice::Openh264 => bridge.push(make_el("videoconvert")?),
-    }
-
-    let terminal = if let Some(sock) = wayland_socket {
-        // waylandsink reads XDG_RUNTIME_DIR from env (the dir weston used); `display` is
-        // the socket name. weston owns DRM master.
-        //
-        // Never set `fullscreen` at construction: it races the sink's wl surface creation
-        // (`gst_wl_window_ensure_fullscreen: assertion 'self' failed` — the GstWlWindow
-        // does not exist until the sink realizes its surface on the first buffer).
-        // Fullscreen is compositor-side instead: `console::spawn_weston_console` launches
-        // weston with `--shell=kiosk-shell.so`, which fullscreens every toplevel on map.
-        gst::ElementFactory::make("waylandsink")
-            .name("local-display")
-            .property("display", sock)
-            .build()
-            .context("waylandsink not found — is the wayland plugin in the image?")?
-    } else {
-        // force-modesetting=true takes DRM master to drive a headless-attached connector.
-        // Pin both the amdgpu driver and the selected card-scoped connector when sysfs
-        // exposes its DRM object id: a multi-GPU host must never silently scan out
-        // through a different card/connector.
-        let mut builder = gst::ElementFactory::make("kmssink")
-            .name("local-display")
-            .property("sync", true)
-            .property("force-modesetting", true)
-            .property("driver-name", "amdgpu");
-        if let Some(connector_id) =
-            selected_connector_id(cfg, std::path::Path::new("/sys/class/drm"))
-        {
-            builder = builder.property("connector-id", connector_id);
-        }
-        builder
-            .build()
-            .context("kmssink not found — is the kms plugin in the image (GPU-less build)?")?
-    };
-
-    let sink_frames = Arc::new(AtomicU64::new(0));
-    let sink_frames_probe = sink_frames.clone();
-    terminal
-        .static_pad("sink")
-        .context("local-display terminal has no sink pad")?
-        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            sink_frames_probe.fetch_add(1, Ordering::Relaxed);
-            gst::PadProbeReturn::Ok
-        });
-
-    let mut elems: Vec<gst::Element> = vec![interpipesrc.clone(), queue];
-    elems.extend(bridge);
-    elems.push(terminal);
-    pipeline.add_many(elems.iter())?;
-    gst::Element::link_many(elems.iter()).context("failed to link local-display chain")?;
-
-    Ok(LocalDisplay {
-        pipeline,
-        interpipesrc,
-        sink_frames,
-    })
-}
-
-fn selected_connector_id(cfg: &SessionConfig, drm_root: &std::path::Path) -> Option<i32> {
-    let output_id = cfg.console_config.as_ref()?.output_id.as_deref()?;
-    let (card, connector) = output_id.split_once(':')?;
-    std::fs::read_to_string(drm_root.join(format!("{card}-{connector}/connector_id")))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-// Local-audio output (`pulsesrc` → the host's PipeWire, or a host ALSA device).
-//
-// Unlike `LocalDisplay` this does not tap the interpipe fan-out: it is a second,
-// independent `pulsesrc` client of the session's PulseAudio sidecar (the same one
-// `pipeline/audio_branch.rs` captures from; PulseAudio allows any number of monitor
-// clients). So there is no `listen-to` to re-point on an app swap — the sidecar is
-// session-scoped, not per-app, so this pipeline is built once and untouched until
-// teardown. Where it plays is `console_audio::choose_route` (RH-07 #407, D13).
-
-/// A local-audio output pipeline: `pulsesrc → audioconvert → audioresample →` either
-/// `pulsesink` (the host's PipeWire) or `alsasink`. Owns its own `gst::Pipeline`; `Drop`
-/// sets it to `Null`, as [`LocalDisplay`] does.
-pub struct LocalAudio {
-    pub pipeline: gst::Pipeline,
-    /// Counts an ALSA leg while it lives, so the `console_audio` readiness check does not
-    /// read our own open PCM as someone else's. Dropped after the pipeline is at `Null`.
-    _alsa_leg: Option<super::console_audio::AlsaLeg>,
-}
-
-impl Drop for LocalAudio {
-    fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
-    }
-}
-
-/// Build the [`LocalAudio`] leg for `cfg`, playing out `audio_output`.
-///
-/// `audio_output` is `"auto"`, `"pipewire:default"`, `"pipewire:<sink name>"` or an ALSA
-/// id (`"hw:1,3"`). While the host's PipeWire answers on the console-audio socket, `auto`
-/// and `pipewire:*` play through it (`pulsesink server=unix:/run/quasar-console-audio/native`,
-/// `device` unless default) and an ALSA id is refused; with no PipeWire answering, an ALSA
-/// id (or `auto`, the operator's `/etc/asound.conf` / `default` PCM) plays through
-/// `alsasink` only when the device is not already open. A refusal fails this leg with the
-/// named reason (logged under its token); the session runs on, console video quiet.
-///
-/// The `pulsesrc` derivation mirrors `pipeline/audio_branch.rs`'s capture branch: `server`
-/// from `cfg.pulse_server` when present, and `device` pinned to
-/// [`QUASAR_MONITOR_SOURCE_NAME`](super::audio::QUASAR_MONITOR_SOURCE_NAME) on both paths.
-/// The pin is required: once the sidecar started baking a microphone feed sink +
-/// remap-source, following its default source stopped being safe. Low-latency by
-/// construction — no RTP/jitter-buffer stage, this is a local device fan-out.
-pub fn build_local_audio_pipeline(cfg: &SessionConfig, audio_output: &str) -> Result<LocalAudio> {
-    use super::console_audio::{self, Route};
-
-    let route = console_audio::choose_route(audio_output, &console_audio::LiveHostAudio::live())
-        .map_err(|refusal| {
-            tracing::warn!(
-                token = "console-audio-refused",
-                reason = refusal.reason(),
-                "console audio will not play ({refusal}); console video runs quiet"
-            );
-            anyhow::anyhow!("{refusal}")
-        })?;
-    tracing::info!("console audio plays through {}", route.describe());
-
-    let pipeline = gst::Pipeline::new();
-
-    let monitor = super::audio::QUASAR_MONITOR_SOURCE_NAME;
-    let mut src_builder = gst::ElementFactory::make("pulsesrc");
-    if let Some(server) = &cfg.pulse_server {
-        tracing::info!("local audio source: pulsesrc server={server} device={monitor}");
-        src_builder = src_builder.property("server", server.as_str());
-    } else {
-        tracing::info!("local audio source: pulsesrc (default server) device={monitor}");
-    }
-    // Pin the capture device rather than following the daemon default: the sidecar also
-    // carries a microphone feed sink + remap-source, and a moved default would route the
-    // client's own mic to the console speakers.
-    src_builder = src_builder.property("device", monitor);
-    let pulse_src = src_builder.build().context(
-        "pulsesrc not found (local audio) — is pulseaudio / gst-plugins-good installed?",
-    )?;
-
-    let audio_convert = gst::ElementFactory::make("audioconvert")
-        .build()
-        .context("audioconvert not found (local audio)")?;
-    let audio_resample = gst::ElementFactory::make("audioresample")
-        .build()
-        .context("audioresample not found (local audio)")?;
-
-    if let Route::Alsa { .. } = &route {
-        // Console-only playback pre-flight: an explicit `hw:*` sink opens that card, `auto`
-        // enumerates the cards visible inside the agent container. PipeWire owns its own
-        // mixer, so this is ALSA only. Streamed audio uses a separate WebRTC pipeline and
-        // never reaches here.
-        match super::audio::enable_iec958_playback_switches(audio_output) {
-            Ok(n) if n > 0 => {
-                tracing::info!(
-                    "enabled {n} IEC958 playback switch(es) on {audio_output} for local audio"
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    token = "audio-iec958-enable-failed-batch",
-                    "could not enable IEC958 playback switches for {audio_output}: {e:#}"
-                );
-            }
-        }
-    }
-
-    let sink = local_audio_sink(&route)?;
-
-    pipeline.add_many([&pulse_src, &audio_convert, &audio_resample, &sink])?;
-    gst::Element::link_many([&pulse_src, &audio_convert, &audio_resample, &sink])
-        .context("failed to link local-audio chain")?;
-
-    let alsa_leg = matches!(route, Route::Alsa { .. }).then(super::console_audio::AlsaLeg::open);
-    Ok(LocalAudio {
-        pipeline,
-        _alsa_leg: alsa_leg,
-    })
-}
-
-/// The sink element for a console audio route, named `local-audio`.
-fn local_audio_sink(route: &super::console_audio::Route) -> Result<gst::Element> {
-    use super::console_audio::{Route, PIPEWIRE_SERVER};
-    match route {
-        Route::PipeWire { device } => {
-            let mut b = gst::ElementFactory::make("pulsesink")
-                .name("local-audio")
-                .property("server", PIPEWIRE_SERVER)
-                .property("client-name", "Quasar console");
-            if let Some(d) = device {
-                b = b.property("device", d.as_str());
-            }
-            tracing::info!(
-                "local audio sink: pulsesink server={PIPEWIRE_SERVER} device={device:?}"
-            );
-            b.build().context(
-                "pulsesink not found — is the PulseAudio plugin (gst-plugins-good) in the image?",
-            )
-        }
-        Route::Alsa { device } => {
-            let mut b = gst::ElementFactory::make("alsasink").name("local-audio");
-            match device {
-                Some(d) => {
-                    tracing::info!("local audio sink: alsasink device={d}");
-                    b = b.property("device", d.as_str());
-                }
-                None => tracing::info!("local audio sink: alsasink (default ALSA device)"),
-            }
-            b.build()
-                .context("alsasink not found — is the ALSA plugin (gst-plugins-good) in the image?")
-        }
-    }
-}
-
-#[cfg(test)]
-mod local_audio_sink_tests {
-    use super::local_audio_sink;
-    use crate::session::console_audio::{Route, PIPEWIRE_SERVER};
-    use gstreamer::prelude::*;
-
-    /// The PipeWire route is a `pulsesink` on the console-audio socket, `device` only for a
-    /// named sink (gst-plugins-good, which every image that runs these tests carries).
-    #[test]
-    fn the_pipewire_route_builds_a_pulsesink_on_the_console_audio_socket() {
-        gstreamer::init().unwrap();
-        let pw = local_audio_sink(&Route::PipeWire {
-            device: Some("alsa_output.hdmi".into()),
-        })
-        .unwrap();
-        assert_eq!(pw.factory().unwrap().name(), "pulsesink");
-        assert_eq!(
-            pw.property::<Option<String>>("server").as_deref(),
-            Some(PIPEWIRE_SERVER)
-        );
-        assert_eq!(
-            pw.property::<Option<String>>("device").as_deref(),
-            Some("alsa_output.hdmi")
-        );
-        let pw_default = local_audio_sink(&Route::PipeWire { device: None }).unwrap();
-        assert_eq!(pw_default.property::<Option<String>>("device"), None);
-
-        // The ALSA route builds the same `alsasink` as before this change; alsasink is
-        // gst-plugins-base's ALSA plugin, which the test image does not carry.
-    }
 }
 
 /// The transport-wide congestion control RTP header-extension URI Chrome negotiates.
@@ -1465,6 +962,9 @@ pub(crate) fn interpipe_available() -> bool {
     }
     ok
 }
+
+#[cfg(test)]
+mod takeover_tests;
 
 #[cfg(test)]
 mod source_interpipe_tests {

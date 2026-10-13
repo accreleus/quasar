@@ -177,7 +177,7 @@ fn restart_recovery_finishes_a_lost_stop_under_the_original_identity() {
 
     // A fresh client over the same state dir, as `HostProbeRunner::reconcile` builds
     // when the orchestrator reconciles a container-probe kind before its next run.
-    let fresh = RuntimeClient::new(engine.config.clone()).unwrap();
+    let fresh = engine.client();
     fresh.recover_diagnostics().wait().unwrap();
     assert_eq!(
         engine.requests("POST /containers/create"),
@@ -289,8 +289,8 @@ fn audio_probe_recovers_a_stale_sidecar_before_its_own_create() {
     };
     let stale_run = AudioRun {
         socket_dir: stale_socket.clone(),
-        entrypoint: vec!["pulseaudio".into()],
-        command: crate::session::audio::pulse_command(&stale_socket.to_string_lossy()),
+        entrypoint: vec!["pipewire".into()],
+        command: crate::session::audio::pulse_command(),
     };
     let stale = client
         .run_audio_sidecar(stale_helper, stale_run)

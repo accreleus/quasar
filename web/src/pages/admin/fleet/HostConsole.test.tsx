@@ -6,7 +6,7 @@ const { addToastMock } = vi.hoisted(() => ({ addToastMock: vi.fn() }));
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "token" }) }));
 vi.mock("../../../components/Toast", () => ({ useToast: () => ({ addToast: addToastMock }) }));
 vi.mock("../../../api/admin", () => ({
-  getHost: vi.fn(), getConsoleConfig: vi.fn(), listAdminApps: vi.fn(),
+  getHost: vi.fn(), getConsoleConfig: vi.fn(),
   listUsers: vi.fn(), updateConsoleConfig: vi.fn(),
 }));
 
@@ -15,7 +15,11 @@ import { ApiError } from "../../../api/client";
 import { clockTime } from "../../../lib/format/clockTime";
 import { HostConsole } from "./HostConsole";
 
-describe("HostConsole truthful topology", () => {
+const KDE_ID = "6f1c0000-0000-0000-0000-000000000001";
+const STEAM_ID = "9a070000-0000-0000-0000-000000000002";
+const NESTED_ID = "3c4d0000-0000-0000-0000-000000000003";
+
+describe("HostConsole direct display (amendment 19)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     addToastMock.mockClear();
@@ -24,14 +28,11 @@ describe("HostConsole truthful topology", () => {
     } as never);
     vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
       config: {
-        enabled: false, connector: "auto", compositor: "weston", audio_output: null,
-        stream: false, stream_audio: false, input_devices: "auto", grab: true,
-        auto_start_on_display: false, auto_connect_controller: false,
-        default_app: null, default_user: null, fullscreen: true,
+        enabled: false, output_id: null, input_devices: "auto",
+        auto_start_on_display: false, default_app: null, default_user: null,
       },
       capabilities: {
         connectors: ["DP-4"],
-        audio_sinks: [{ id: "hw:0,3", label: "NVIDIA HDA — HDMI 0" }],
         input_devices: [
           { path: "/dev/input/event3", label: "Keychron K2 Keyboard" },
           { path: "/dev/input/event5", label: "Logitech G502 Mouse" },
@@ -41,10 +42,17 @@ describe("HostConsole truthful topology", () => {
           connector: "DP-4", connected: true, active_mode: null,
           modes: [{ name: "2560x1440", width: 2560, height: 1440, refresh_millihz: 119880,
             preferred: true, interlaced: false, clock_khz: 497750, htotal: 2720, vtotal: 1526 }],
+        }, {
+          id: "card1:HDMI-A-1", card: "card1", render_node: "/dev/dri/renderD128",
+          connector: "HDMI-A-1", connected: false, active_mode: null, modes: [],
         }],
       },
+      default_apps: [{ id: KDE_ID, name: "KDE Plasma" }, { id: STEAM_ID, name: "Steam" }],
+      readiness: [{
+        id: "console_default_app", status: "skip", source: "operator",
+        summary: "No default app is set, so console mode has nothing to run.", remediation: "",
+      }],
     } as never);
-    vi.mocked(adminApi.listAdminApps).mockResolvedValue({ items: [] } as never);
     vi.mocked(adminApi.listUsers).mockResolvedValue({ items: [] } as never);
   });
 
@@ -56,20 +64,80 @@ describe("HostConsole truthful topology", () => {
     );
   }
 
-  it("offers local-only and dual-output controls while retaining fixed display choices", async () => {
+  it("edits only the six settings that survive direct display", async () => {
     renderPage();
 
-    await waitFor(() => expect(screen.getByText("Video topology")).toBeTruthy());
-    expect(screen.getByText("Weston · Static mode · Fullscreen")).toBeTruthy();
-    expect(screen.getAllByText("card1:DP-4")).toHaveLength(2);
-    expect(screen.getByText("2560×1440 @ 119.880 Hz")).toBeTruthy();
-    expect(screen.getByText("Physical output")).toBeTruthy();
-    expect(screen.getByText("Physical mode")).toBeTruthy();
-    expect(screen.queryByText("Display connector")).toBeNull();
-    expect(screen.queryByText("Compositor")).toBeNull();
-    expect(screen.getByText("Also stream")).toBeTruthy();
-    expect(screen.getByText("Stream audio")).toBeTruthy();
-    expect(screen.queryByText("Fullscreen")).toBeNull();
+    await screen.findByRole("switch", { name: "Enabled" });
+    expect(screen.getByRole("combobox", { name: "Physical output" })).toBeTruthy();
+    expect(screen.getByText("Input devices")).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Default app" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Default user" })).toBeTruthy();
+    expect(screen.getByRole("switch", { name: "Auto-start on display" })).toBeTruthy();
+    // Retired by amendment 19: the desktop owns these now.
+    for (const gone of ["Video topology", "Physical mode", "Also stream", "Stream audio",
+      "Local audio output", "Grab local input", "Auto-connect controller"]) {
+      expect(screen.queryByText(gone)).toBeNull();
+    }
+    expect(screen.queryByText(/Audio sinks/)).toBeNull();
+  });
+
+  it("offers every reported output, a monitorless one included, and saves only output_id", async () => {
+    const current = await adminApi.getConsoleConfig("token", "host-1");
+    vi.mocked(adminApi.updateConsoleConfig).mockResolvedValue(current as never);
+    renderPage();
+
+    const output = await screen.findByRole("combobox", { name: "Physical output" });
+    expect(screen.getByRole("option", { name: "Automatic" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "card1:DP-4" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "card1:HDMI-A-1 · no monitor" })).toBeTruthy();
+    fireEvent.change(output, { target: { value: "card1:HDMI-A-1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(adminApi.updateConsoleConfig).toHaveBeenCalledWith(
+      "token", "host-1", { output_id: "card1:HDMI-A-1" },
+    ));
+  });
+
+  it("the default-app select offers only the apps the server says can run direct", async () => {
+    const current = await adminApi.getConsoleConfig("token", "host-1");
+    vi.mocked(adminApi.updateConsoleConfig).mockResolvedValue(current as never);
+    renderPage();
+
+    const select = await screen.findByRole("combobox", { name: "Default app" });
+    const options = Array.from((select as HTMLSelectElement).options).map((o) => o.textContent);
+    expect(options).toEqual(["None", "KDE Plasma", "Steam"]);
+    fireEvent.change(select, { target: { value: STEAM_ID } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(adminApi.updateConsoleConfig).toHaveBeenCalledWith(
+      "token", "host-1", { default_app: STEAM_ID },
+    ));
+  });
+
+  it("a saved default app that cannot run direct shows the readiness failure as an error", async () => {
+    const current = await adminApi.getConsoleConfig("token", "host-1");
+    const summary = "The console's default app Old Desktop cannot run direct: its runtime spec does " +
+      "not declare direct_display, so console mode will not launch it.";
+    vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
+      ...current,
+      config: { ...current.config, default_app: NESTED_ID },
+      readiness: [{
+        id: "console_default_app", status: "fail", source: "operator", summary,
+        remediation: "Pick a default app from the console page's list.",
+      }],
+    } as never);
+    renderPage();
+
+    const failure = await screen.findByText(summary);
+    expect(failure).toHaveClass("form-error");
+    expect(screen.getByText(/Only apps that can drive the display directly are offered/)).toBeTruthy();
+    const select = screen.getByRole("combobox", { name: "Default app" }) as HTMLSelectElement;
+    expect(select.value).toBe(NESTED_ID);
+    expect(screen.getByRole("option", { name: "Current app (cannot run direct)" })).toBeTruthy();
+
+    // A new pick has not been checked yet, so the saved app's failure goes.
+    fireEvent.change(select, { target: { value: KDE_ID } });
+    expect(screen.queryByText(summary)).toBeNull();
   });
 
   it("crumbs to Fleet and the host, and heads with the mock's title/sub", async () => {
@@ -77,7 +145,7 @@ describe("HostConsole truthful topology", () => {
 
     await waitFor(() => expect(screen.getByRole("heading", { name: "Local console" })).toBeTruthy());
     expect(screen.getByText("Fleet")).toBeTruthy();
-    expect(screen.getByText(/Local display on lab-host with an explicit per-session output topology/)).toBeTruthy();
+    expect(screen.getByText(/The console desktop drives lab-host's own display/)).toBeTruthy();
   });
 
   it("disables Discard and Save changes while the draft is clean, and enables them once dirty", async () => {
@@ -128,59 +196,6 @@ describe("HostConsole truthful topology", () => {
       "token", "host-1", { enabled: false },
     ));
     await waitFor(() => expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled());
-  });
-
-  it("selects a reported sound card for console-only playback", async () => {
-    const current = await adminApi.getConsoleConfig("token", "host-1");
-    vi.mocked(adminApi.updateConsoleConfig).mockResolvedValue({
-      ...current,
-      config: { ...current.config, audio_output: "hw:0,3" },
-    } as never);
-
-    renderPage();
-
-    const output = await screen.findByRole("combobox", { name: "Local audio output" });
-    expect(screen.getByRole("option", { name: "NVIDIA HDA — HDMI 0" })).toBeTruthy();
-    fireEvent.change(output, { target: { value: "hw:0,3" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-
-    await waitFor(() => expect(adminApi.updateConsoleConfig).toHaveBeenCalledWith(
-      "token", "host-1", { audio_output: "hw:0,3" },
-    ));
-  });
-
-  it("#422: Preferred can be re-selected after picking another mode", async () => {
-    const current = await adminApi.getConsoleConfig("token", "host-1");
-    const output = current.capabilities.outputs![0];
-    vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
-      ...current,
-      capabilities: {
-        ...current.capabilities,
-        outputs: [{
-          ...output,
-          modes: [...output.modes, { name: "1920x1080", width: 1920, height: 1080, refresh_millihz: 60000,
-            preferred: false, interlaced: false, clock_khz: 148500, htotal: 2200, vtotal: 1125 }],
-        }],
-      },
-    } as never);
-    vi.mocked(adminApi.updateConsoleConfig).mockResolvedValue(current as never);
-
-    renderPage();
-
-    fireEvent.change(await screen.findByRole("combobox", { name: "Physical output" }), {
-      target: { value: "card1:DP-4" },
-    });
-    const mode = screen.getByRole("combobox", { name: "Physical mode" });
-    fireEvent.change(mode, { target: { value: "1920x1080@60000" } });
-    expect((mode as HTMLSelectElement).value).toBe("1920x1080@60000");
-    fireEvent.change(mode, { target: { value: "__none__" } });
-    expect((mode as HTMLSelectElement).value).toBe("2560x1440@119880");
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-
-    await waitFor(() => expect(adminApi.updateConsoleConfig).toHaveBeenCalledWith(
-      "token", "host-1",
-      { output_id: "card1:DP-4", mode: { width: 2560, height: 1440, refresh_millihz: 119880 } },
-    ));
   });
 
   it("#521: shows the ApiError message alone, never the machine code prefix", async () => {
@@ -302,19 +317,19 @@ describe("HostConsole truthful topology", () => {
 // button — none of which a host with no `access` sees (covered above).
 describe("HostConsole console access (amendment 18)", () => {
   const BASE_CONFIG = {
-    enabled: false, connector: "auto", compositor: "weston", audio_output: null,
-    stream: false, stream_audio: false, input_devices: "auto", grab: true,
-    auto_start_on_display: false, auto_connect_controller: false,
-    default_app: null, default_user: null, fullscreen: true,
+    enabled: false, output_id: null, input_devices: "auto",
+    auto_start_on_display: false, default_app: null, default_user: null,
   };
   const BASE_CAPS = {
-    connectors: [], audio_sinks: [], input_devices: [],
+    connectors: [], input_devices: [],
   };
 
   function mockAccess(access: Record<string, unknown>, configOverrides: Record<string, unknown> = {}) {
     vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
       config: { ...BASE_CONFIG, ...configOverrides },
       capabilities: { ...BASE_CAPS, access },
+      default_apps: [],
+      readiness: [],
     } as never);
   }
 
@@ -324,7 +339,6 @@ describe("HostConsole console access (amendment 18)", () => {
     vi.mocked(adminApi.getHost).mockResolvedValue({
       host: { id: "host-1", node_name: "lab-host", status: "online", capacity: { active_sessions: 2 } },
     } as never);
-    vi.mocked(adminApi.listAdminApps).mockResolvedValue({ items: [] } as never);
     vi.mocked(adminApi.listUsers).mockResolvedValue({ items: [] } as never);
   });
 
@@ -345,7 +359,7 @@ describe("HostConsole console access (amendment 18)", () => {
 
     await screen.findByText("Console mode is off.");
     expect(screen.getByText("Off")).toBeTruthy();
-    expect(screen.getByText("This machine shows games on its own screen, and can stream them too.")).toBeTruthy();
+    expect(screen.getByText("This machine shows games on its own screen.")).toBeTruthy();
 
     fireEvent.click(await screen.findByRole("switch", { name: "Enabled" }));
 
@@ -400,11 +414,10 @@ describe("HostConsole console access (amendment 18)", () => {
     // not just the switch.
     expect(screen.getByRole("button", { name: "Discard" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
-    expect(screen.getByRole("switch", { name: "Also stream" })).toBeDisabled();
-    expect(screen.getByRole("switch", { name: "Grab local input" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Physical output" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Default app" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Default user" })).toBeDisabled();
     expect(screen.getByRole("switch", { name: "Auto-start on display" })).toBeDisabled();
-    expect(screen.getByRole("switch", { name: "Auto-connect controller" })).toBeDisabled();
-    expect(screen.getByRole("combobox", { name: "Local audio output" })).toBeDisabled();
     await screen.findByText("Input devices");
     expect(screen.getByRole("tab", { name: "Specific devices" })).toBeDisabled();
   });
@@ -493,6 +506,8 @@ describe("HostConsole console access (amendment 18)", () => {
     vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
       config: BASE_CONFIG,
       capabilities: BASE_CAPS,
+      default_apps: [],
+      readiness: [],
     } as never);
     renderPage();
 
@@ -500,7 +515,7 @@ describe("HostConsole console access (amendment 18)", () => {
     expect(screen.queryByText("Off")).toBeNull();
     expect(screen.queryByText("On")).toBeNull();
     expect(screen.queryByText("Console mode is off.")).toBeNull();
-    expect(screen.getByText("Local display with an explicit per-session output topology.")).toBeTruthy();
+    expect(screen.getByText("The desktop drives this host's own display, with its own resolution, sound and input.")).toBeTruthy();
     expect(screen.queryByText(/shows games on its own screen/)).toBeNull();
   });
 
@@ -576,43 +591,6 @@ describe("HostConsole console access (amendment 18)", () => {
     expect(screen.getByTestId("console-access-prepare-snippet")).toHaveTextContent(
       "sudo systemctl mask getty@tty8.service autovt@tty8.service",
     );
-  });
-
-  it("Local audio output: PipeWire sinks show the PipeWire help line and labels", async () => {
-    vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
-      config: BASE_CONFIG,
-      capabilities: {
-        ...BASE_CAPS,
-        audio_sinks: [
-          { id: "pipewire:default", label: "Host PipeWire · default output" },
-          { id: "pipewire:alsa_output.hdmi", label: "Host PipeWire · HDMI (LG TV)" },
-        ],
-      },
-    } as never);
-    renderPage();
-
-    await screen.findByText("Host PipeWire · default output");
-    expect(screen.getByText("Host PipeWire · HDMI (LG TV)")).toBeTruthy();
-    expect(screen.getByText(
-      "This machine runs PipeWire, so console audio plays through it, beside the desktop's own " +
-        "sound. Quasar never takes the sound device from it.",
-    )).toBeTruthy();
-  });
-
-  it("Local audio output: ALSA sinks show the ALSA help line", async () => {
-    vi.mocked(adminApi.getConsoleConfig).mockResolvedValue({
-      config: BASE_CONFIG,
-      capabilities: {
-        ...BASE_CAPS,
-        audio_sinks: [{ id: "hw:0,3", label: "HDMI / DisplayPort (RTX 4080 Super)" }],
-      },
-    } as never);
-    renderPage();
-
-    await screen.findByText("HDMI / DisplayPort (RTX 4080 Super)");
-    expect(screen.getByText(
-      "No PipeWire runs on this machine, so console audio goes straight to the sound device (ALSA).",
-    )).toBeTruthy();
   });
 
   it("409 surfaced: a conflicting PATCH toasts the server's message", async () => {

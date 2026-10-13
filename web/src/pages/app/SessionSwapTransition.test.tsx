@@ -1,14 +1,36 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { act, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionSwapTransition } from "./SessionSwapTransition";
 
 describe("SessionSwapTransition", () => {
+  afterEach(() => vi.useRealTimers());
+
   it("renders hidden (no .show, aria-hidden) when there is no transition", () => {
     const { container } = render(<SessionSwapTransition transition={null} />);
     const el = container.querySelector(".switcher");
     expect(el).not.toBeNull();
     expect(el?.classList.contains("show")).toBe(false);
     expect(el?.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  it("puts no text in the document while idle, and drops it once the fade-out is over (#529)", () => {
+    vi.useFakeTimers();
+    const { container, rerender } = render(<SessionSwapTransition transition={null} />);
+    expect(container.textContent).toBe("");
+    // #544: the animated mark stays; removing it made frame presentation read less even.
+    expect(container.querySelector(".switcher svg")).not.toBeNull();
+
+    rerender(<SessionSwapTransition transition={{ phase: "switching", appName: "Purple App" }} />);
+    expect(container.textContent).toContain("Starting…");
+
+    rerender(<SessionSwapTransition transition={null} />);
+    const el = container.querySelector(".switcher");
+    expect(el?.classList.contains("show")).toBe(false);
+    expect(container.textContent).toContain("Starting…"); // still fading out
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    expect(container.textContent).toBe("");
   });
 
   it("shows the target app name and 'Starting…' while switching", () => {
@@ -36,7 +58,9 @@ describe("SessionSwapTransition", () => {
   it("shows a plain message on timeout, distinct from the switching subtitle", () => {
     render(<SessionSwapTransition transition={{ phase: "timeout", appName: "Purple App" }} />);
     expect(screen.queryByText("Starting…")).toBeNull();
-    expect(screen.getByText(/taking longer than expected|check back/i)).toBeTruthy();
+    expect(screen.getByText(/still waiting on a confirmation from the host/i)).toBeTruthy();
+    // An unresolved switch can end the session (control-api.md amendment 23).
+    expect(screen.queryByText(/unaffected/i)).toBeNull();
   });
 
   it("carries no focusable content in any phase", () => {

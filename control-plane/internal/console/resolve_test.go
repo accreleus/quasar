@@ -1,6 +1,9 @@
 package console
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func okApp(string) (bool, error) { return true, nil }
 func noApp(string) (bool, error) { return false, nil }
@@ -8,13 +11,19 @@ func noApp(string) (bool, error) { return false, nil }
 func okUser(string) (bool, error) { return true, nil }
 func noUser(string) (bool, error) { return false, nil }
 
+// retiredKeyNames are former settings the console desktop now owns
+var retiredKeyNames = []string{
+	"connector", "mode", "compositor", "audio_output", "stream",
+	"stream_audio", "grab", "auto_connect_controller", "fullscreen",
+}
+
 func TestValidatePatch(t *testing.T) {
 	reported := Capabilities{
-		Connectors: []string{"DP-4", "HDMI-A-1"},
-		Outputs: []DRMOutput{{ID: "card0:DP-4", Connector: "DP-4", Connected: true, Modes: []DRMMode{{
-			Width: 3840, Height: 2160, RefreshMillihz: 119879,
-		}}}},
-		AudioSinks:   []AudioSink{{ID: "hw:1,3", Label: "GPU HDA"}},
+		Connectors: []string{"DP-4"},
+		Outputs: []DRMOutput{
+			{ID: "card0:DP-4", Connector: "DP-4", Connected: true},
+			{ID: "card1:HDMI-A-1", Connector: "HDMI-A-1", Connected: false},
+		},
 		InputDevices: []InputDevicePath{{Path: "/dev/input/event4", Label: "Keyboard"}},
 	}
 	empty := EmptyCapabilities()
@@ -25,95 +34,114 @@ func TestValidatePatch(t *testing.T) {
 		caps    Capabilities
 		app     func(string) (bool, error)
 		user    func(string) (bool, error)
-		wantErr bool
+		wantErr string // "" = accepted; otherwise a substring of the error
 	}{
-		{"unknown key rejected", map[string]any{"bogus": 1}, empty, okApp, okUser, true},
-		{"weston compositor ok", map[string]any{"compositor": "weston"}, empty, okApp, okUser, false},
-		{"cage compositor rejected", map[string]any{"compositor": "cage"}, empty, okApp, okUser, true},
-		{"compositor enum bad", map[string]any{"compositor": "gnome"}, empty, okApp, okUser, true},
-		{"bool type checked", map[string]any{"enabled": "yes"}, empty, okApp, okUser, true},
-		{"auto connector accepted", map[string]any{"connector": "auto"}, empty, okApp, okUser, false},
-		{"explicit connector rejected when caps empty", map[string]any{"connector": "DP-4"}, empty, okApp, okUser, true},
-		{"connector rejected when reported and absent", map[string]any{"connector": "DP-9"}, reported, okApp, okUser, true},
-		{"reported explicit connector still rejected", map[string]any{"connector": "DP-4"}, reported, okApp, okUser, true},
-		{"reported output accepted", map[string]any{"output_id": "card0:DP-4"}, reported, okApp, okUser, false},
-		{"unknown output rejected", map[string]any{"output_id": "card9:DP-9"}, reported, okApp, okUser, true},
-		{"reported exact mode accepted", map[string]any{"mode": map[string]any{"width": float64(3840), "height": float64(2160), "refresh_millihz": float64(119879)}}, reported, okApp, okUser, false},
-		{"unreported mode rejected", map[string]any{"mode": map[string]any{"width": float64(3840), "height": float64(2160), "refresh_millihz": float64(120000)}}, reported, okApp, okUser, true},
-		{"dual stream true accepted", map[string]any{"stream": true, "stream_audio": true}, empty, okApp, okUser, false},
-		{"local-only stream false accepted", map[string]any{"stream": false}, empty, okApp, okUser, false},
-		{"stream audio false accepted", map[string]any{"stream_audio": false}, empty, okApp, okUser, false},
-		{"fullscreen true accepted", map[string]any{"fullscreen": true}, empty, okApp, okUser, false},
-		{"windowed fullscreen false rejected", map[string]any{"fullscreen": false}, empty, okApp, okUser, true},
-		{"null clears unsupported topology overrides", map[string]any{"connector": nil, "compositor": nil, "stream": nil, "stream_audio": nil, "fullscreen": nil}, empty, okApp, okUser, false},
-		{"audio_output null allowed (quiet)", map[string]any{"audio_output": nil}, empty, okApp, okUser, false},
-		{"audio_output allowed when caps empty", map[string]any{"audio_output": "hw:9,9"}, empty, okApp, okUser, false},
-		{"audio_output rejected when reported and absent", map[string]any{"audio_output": "hw:9,9"}, reported, okApp, okUser, true},
-		{"audio_output auto always ok", map[string]any{"audio_output": "auto"}, reported, okApp, okUser, false},
-		{"input_devices auto ok", map[string]any{"input_devices": "auto"}, reported, okApp, okUser, false},
-		{"input_devices list rejected when reported and absent", map[string]any{"input_devices": []any{"/dev/input/event9"}}, reported, okApp, okUser, true},
-		{"input_devices list allowed when caps empty", map[string]any{"input_devices": []any{"/dev/input/event9"}}, empty, okApp, okUser, false},
-		{"default_app null clears", map[string]any{"default_app": nil}, empty, okApp, okUser, false},
-		{"default_app unknown rejected", map[string]any{"default_app": "id"}, empty, noApp, okUser, true},
-		{"default_app known ok", map[string]any{"default_app": "id"}, empty, okApp, okUser, false},
-		{"default_user null clears", map[string]any{"default_user": nil}, empty, okApp, okUser, false},
-		{"default_user unknown rejected", map[string]any{"default_user": "id"}, empty, okApp, noUser, true},
-		{"default_user known ok", map[string]any{"default_user": "id"}, empty, okApp, okUser, false},
-		{"enabled true + audio null valid (quiet console)", map[string]any{"enabled": true, "audio_output": nil}, empty, okApp, okUser, false},
+		// Accept: the six trimmed settings.
+		{"enabled bool accepted", map[string]any{"enabled": true}, empty, okApp, okUser, ""},
+		{"auto start bool accepted", map[string]any{"auto_start_on_display": true}, empty, okApp, okUser, ""},
+		{"connected output accepted", map[string]any{"output_id": "card0:DP-4"}, reported, okApp, okUser, ""},
+		{"unplugged output accepted (launch when a monitor appears)", map[string]any{"output_id": "card1:HDMI-A-1"}, reported, okApp, okUser, ""},
+		{"output null clears to automatic", map[string]any{"output_id": nil}, empty, okApp, okUser, ""},
+		{"input_devices auto accepted", map[string]any{"input_devices": "auto"}, reported, okApp, okUser, ""},
+		{"input_devices reported list accepted", map[string]any{"input_devices": []any{"/dev/input/event4"}}, reported, okApp, okUser, ""},
+		{"input_devices list allowed when caps empty", map[string]any{"input_devices": []any{"/dev/input/event9"}}, empty, okApp, okUser, ""},
+		{"default_app known accepted", map[string]any{"default_app": "id"}, empty, okApp, okUser, ""},
+		{"default_app null clears", map[string]any{"default_app": nil}, empty, okApp, okUser, ""},
+		{"default_user known accepted", map[string]any{"default_user": "id"}, empty, okApp, okUser, ""},
+		{"default_user null clears", map[string]any{"default_user": nil}, empty, okApp, okUser, ""},
+
+		// Reject: bad values and keys the trimmed shape does not have.
+		{"unknown key rejected", map[string]any{"bogus": 1}, empty, okApp, okUser, "unknown console-config key"},
+		{"enabled type checked", map[string]any{"enabled": "yes"}, empty, okApp, okUser, "boolean"},
+		{"auto start type checked", map[string]any{"auto_start_on_display": 1}, empty, okApp, okUser, "boolean"},
+		{"unreported output rejected", map[string]any{"output_id": "card9:DP-9"}, reported, okApp, okUser, "not a reported DRM output"},
+		{"output rejected when nothing reported", map[string]any{"output_id": "card0:DP-4"}, empty, okApp, okUser, "not a reported DRM output"},
+		{"empty output rejected", map[string]any{"output_id": ""}, reported, okApp, okUser, "non-empty string"},
+		{"input_devices bad string rejected", map[string]any{"input_devices": "all"}, reported, okApp, okUser, "auto"},
+		{"input_devices unreported entry rejected", map[string]any{"input_devices": []any{"/dev/input/event9"}}, reported, okApp, okUser, "unreported device"},
+		{"default_app unknown rejected", map[string]any{"default_app": "id"}, empty, noApp, okUser, "unknown app"},
+		{"default_user unknown rejected", map[string]any{"default_user": "id"}, empty, okApp, noUser, "unknown user"},
+	}
+	for _, key := range retiredKeyNames {
+		cases = append(cases, struct {
+			name    string
+			patch   map[string]any
+			caps    Capabilities
+			app     func(string) (bool, error)
+			user    func(string) (bool, error)
+			wantErr string
+		}{"retired " + key + " rejected", map[string]any{key: true}, empty, okApp, okUser, "no longer a setting"})
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidatePatch(tc.patch, tc.caps, tc.app, tc.user)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("ValidatePatch(%v) err=%v, wantErr=%v", tc.patch, err, tc.wantErr)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidatePatch(%v) = %v, want accepted", tc.patch, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidatePatch(%v) = %v, want an error containing %q", tc.patch, err, tc.wantErr)
 			}
 		})
 	}
 }
 
-func TestValidateOutputSelection(t *testing.T) {
-	caps := Capabilities{Outputs: []DRMOutput{{
-		ID: "card0:DP-4", Connected: true,
-		Modes: []DRMMode{{Width: 3840, Height: 2160, RefreshMillihz: 119879}},
-	}, {ID: "card1:DP-1", Connected: false}}}
-	validMode := map[string]any{"width": float64(3840), "height": float64(2160), "refresh_millihz": float64(119879)}
-	if err := ValidateOutputSelection(map[string]any{"output_id": "card0:DP-4", "mode": validMode}, caps); err != nil {
-		t.Fatalf("valid selection rejected: %v", err)
+func TestDefaultsAreTheSixSettings(t *testing.T) {
+	got := Defaults()
+	want := []string{"enabled", "output_id", "input_devices", "auto_start_on_display", "default_app", "default_user"}
+	if len(got) != len(want) {
+		t.Fatalf("Defaults() has %d keys, want the six: %v", len(got), got)
 	}
-	for _, config := range []map[string]any{
-		{"output_id": "card0:DP-4"},
-		{"mode": validMode},
-		{"output_id": "card1:DP-1", "mode": validMode},
-		{"output_id": "card0:DP-4", "mode": map[string]any{"width": float64(1920), "height": float64(1080), "refresh_millihz": float64(60000)}},
-	} {
-		if err := ValidateOutputSelection(config, caps); err == nil {
-			t.Fatalf("invalid selection accepted: %#v", config)
+	for _, key := range want {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("Defaults() lacks %q: %v", key, got)
 		}
 	}
 }
 
-func TestResolveReportsActualFixedTopologyDespiteStaleOverrides(t *testing.T) {
-	got, err := Resolve(map[string]any{
-		"connector": "DP-4", "compositor": "cage", "stream": false,
-		"stream_audio": false, "fullscreen": false,
-	})
+// Ignore: a stored row written before amendment 19 (or by a later release)
+// carries keys this reader does not know. They never block a read.
+func TestResolveIgnoresRetiredAndUnknownKeys(t *testing.T) {
+	stored := map[string]any{
+		"enabled": true, "output_id": "card0:DP-4", "auto_start_on_display": true,
+		"default_app": "app-1", "default_user": "user-1",
+		"input_devices": []any{"/dev/input/event4"},
+		// Retired keys, including values the old validator would refuse today.
+		"connector": "DP-4", "mode": map[string]any{"width": "wide"}, "compositor": "cage",
+		"audio_output": 7, "stream": "yes", "stream_audio": true, "grab": false,
+		"auto_connect_controller": true, "fullscreen": false,
+		// A key some later release might add.
+		"future_setting": map[string]any{"nested": true},
+	}
+	got, err := Resolve(stored)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if got.Connector != "auto" || got.Compositor != "weston" || got.Stream || got.StreamAudio || !got.Fullscreen {
-		t.Fatalf("resolved topology is not runtime truth: %+v", got)
+	if !got.Enabled || !got.AutoStartOnDisplay || got.OutputID == nil || *got.OutputID != "card0:DP-4" ||
+		got.DefaultApp == nil || *got.DefaultApp != "app-1" || got.DefaultUser == nil || *got.DefaultUser != "user-1" ||
+		got.InputDevices.Auto || len(got.InputDevices.Paths) != 1 {
+		t.Fatalf("Resolve lost a kept setting: %+v", got)
 	}
 }
 
-func TestResolveNullClearsToLocalOnlyDefaults(t *testing.T) {
-	got, err := Resolve(map[string]any{
-		"connector": nil, "compositor": nil, "stream": nil,
-		"stream_audio": nil, "fullscreen": nil,
-	})
+func TestResolveDefaults(t *testing.T) {
+	got, err := Resolve(map[string]any{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if got.Connector != "auto" || got.Compositor != "weston" || got.Stream || got.StreamAudio || !got.Fullscreen {
-		t.Fatalf("cleared topology did not resolve to supported values: %+v", got)
+	if got.Enabled || got.AutoStartOnDisplay || got.OutputID != nil || got.DefaultApp != nil ||
+		got.DefaultUser != nil || !got.InputDevices.Auto {
+		t.Fatalf("defaults = %+v, want off, automatic output, every input device, no app or owner", got)
+	}
+}
+
+// KnownOnly is what a PATCH merge writes back: a stored retired key does not
+// survive the next write.
+func TestKnownOnlyDropsRetiredKeys(t *testing.T) {
+	got := KnownOnly(map[string]any{"enabled": true, "grab": true, "stream": true, "default_app": "a"})
+	if len(got) != 2 || got["enabled"] != true || got["default_app"] != "a" {
+		t.Fatalf("KnownOnly = %v, want enabled and default_app only", got)
 	}
 }

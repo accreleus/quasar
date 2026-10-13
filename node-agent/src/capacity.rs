@@ -1,5 +1,5 @@
 //! Host and GPU capacity detection from sysfs/procfs, plus the console-mode inventory
-//! (DRM outputs, audio sinks, physical input) the admin UI populates selectors from.
+//! (DRM outputs and input devices) the admin UI populates selectors from.
 //!
 //! `encode_slots_total` is what admission RESERVES against; live free VRAM is a separate,
 //! advisory signal sampled by [`crate::vram`]. Detection failure fails CLOSED — an empty GPU
@@ -10,8 +10,8 @@
 
 use crate::gpu_identity::DriverIdentities;
 use crate::messages::{
-    AudioSink, ConsoleCapabilities, DrmModeCapability, DrmOutputCapability, GpuCapacity,
-    HostCapacity, InputDeviceInfo, StorageVolume,
+    ConsoleCapabilities, DrmModeCapability, DrmOutputCapability, GpuCapacity, HostCapacity,
+    InputDeviceInfo, StorageVolume,
 };
 use crate::session::EncoderChoice;
 use crate::vram::VramTarget;
@@ -155,24 +155,127 @@ pub(crate) fn detect_console_capabilities() -> ConsoleCapabilities {
         .filter(|o| o.connected)
         .map(|o| o.connector.clone())
         .collect();
+    let claimed = outputs.iter().any(|o| display_claimed(&o.card));
     ConsoleCapabilities {
         connectors: if typed_connectors.is_empty() {
             detect_drm_connectors()
-        } else {
+        } else if ddc_probe_allowed(claimed) {
             crate::ddc::powered_connectors(typed_connectors)
+        } else {
+            typed_connectors
         },
         outputs,
-        audio_sinks: detect_audio_sinks(),
         input_devices: detect_input_devices(),
         access: None,
     }
 }
 
-/// Output/connector inventory only, without the DDC power probe and audio/input enumeration
-/// `detect_console_capabilities` also does. `session::console::spawn_weston_console` calls
-/// this per launch; the full probe would eat its 15s socket-wait budget for discarded data.
+/// Process-wide lock around the *moment* of opening a DRM primary node (#407). Opening a
+/// card node, in any mode, makes the opener DRM master when nobody holds it
+/// (`drm_auth.c`), so two of the agent's own reads racing each other could leave one of
+/// them master for an instant. Callers hold it only around an open, never across a
+/// session.
+pub(crate) fn drm_open_lock() -> &'static std::sync::Mutex<()> {
+    static DRM_OPEN_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    DRM_OPEN_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Output/connector inventory only, without the DDC power probe and input enumeration
+/// `detect_console_capabilities` also does: what a console launch and readiness read.
 pub(crate) fn detect_drm_outputs() -> Vec<DrmOutputCapability> {
-    detect_drm_outputs_at(std::path::Path::new("/dev/dri"))
+    detect_drm_outputs_at(
+        std::path::Path::new("/dev/dri"),
+        std::path::Path::new("/sys/class/drm"),
+    )
+}
+
+/// Cards whose display a console desktop owns, with the outputs read before the claim.
+/// The inventory never opens a claimed card's node: opening a primary node while nobody
+/// holds DRM master makes the opener master, and a poll landing while the desktop starts
+/// would leave it without the display.
+type ClaimedCards = std::collections::BTreeMap<String, (u64, Vec<DrmOutputCapability>)>;
+
+fn claimed_cards() -> &'static std::sync::Mutex<ClaimedCards> {
+    static CLAIMED: std::sync::OnceLock<std::sync::Mutex<ClaimedCards>> =
+        std::sync::OnceLock::new();
+    CLAIMED.get_or_init(Default::default)
+}
+
+/// Held for a console session's life: while it lives, `card`'s outputs are its last
+/// read with `connected` refreshed from sysfs. A later claim of the same card replaces
+/// this one, and this one's drop then leaves the later claim in place.
+#[derive(Debug)]
+pub(crate) struct DisplayClaim {
+    card: String,
+    generation: u64,
+}
+
+/// Claims `card` (e.g. `card0`) for a console desktop. Call before the desktop starts.
+pub(crate) fn claim_display(card: &str) -> DisplayClaim {
+    let outputs = detect_drm_outputs()
+        .into_iter()
+        .filter(|o| o.card == card)
+        .collect();
+    claim_display_with(card, outputs)
+}
+
+fn claim_display_with(card: &str, outputs: Vec<DrmOutputCapability>) -> DisplayClaim {
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    claimed_cards()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(card.to_string(), (generation, outputs));
+    DisplayClaim {
+        card: card.to_string(),
+        generation,
+    }
+}
+
+impl Drop for DisplayClaim {
+    fn drop(&mut self) {
+        let mut claimed = claimed_cards()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if claimed
+            .get(&self.card)
+            .is_some_and(|(generation, _)| *generation == self.generation)
+        {
+            claimed.remove(&self.card);
+        }
+    }
+}
+
+/// Whether a console desktop currently owns `card`'s display.
+pub(crate) fn display_claimed(card: &str) -> bool {
+    claimed_cards()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(card)
+}
+
+/// The DDC power read tells a powered-off monitor from an unplugged one so auto-start
+/// does not launch into a sleeping panel. It is over a second of i2c traffic on the
+/// display link, which a running desktop feels as a hitch every poll, and while a
+/// desktop owns the display the panel's power is the desktop's business.
+fn ddc_probe_allowed(display_claimed: bool) -> bool {
+    !display_claimed
+}
+
+fn claimed_outputs(card: &str, sysfs_root: &std::path::Path) -> Option<Vec<DrmOutputCapability>> {
+    let claimed = claimed_cards()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut outputs = claimed.get(card)?.1.clone();
+    for output in &mut outputs {
+        let status = sysfs_root
+            .join(format!("{card}-{}", output.connector))
+            .join("status");
+        output.connected = std::fs::read_to_string(status)
+            .map(|s| s.trim() == "connected")
+            .unwrap_or(output.connected);
+    }
+    Some(outputs)
 }
 
 #[derive(Debug)]
@@ -212,7 +315,10 @@ fn drm_mode_capability(mode: &drm::control::Mode) -> DrmModeCapability {
     }
 }
 
-fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability> {
+fn detect_drm_outputs_at(
+    dri_root: &std::path::Path,
+    sysfs_root: &std::path::Path,
+) -> Vec<DrmOutputCapability> {
     use drm::control::{connector, Device as _};
 
     let mut cards: Vec<_> = std::fs::read_dir(dri_root)
@@ -225,17 +331,17 @@ fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability>
     let mut outputs = Vec::new();
     for entry in cards {
         let card_name = entry.file_name().to_string_lossy().into_owned();
-        // #407: opening a primary node read-write can make the opener DRM master
-        // automatically when the display is free, racing spawn_weston_console's own
-        // open for it — see session::console::drm_open_lock. Held for this card only.
-        let _drm_open_guard = crate::session::console::drm_open_lock()
+        if let Some(claimed) = claimed_outputs(&card_name, sysfs_root) {
+            outputs.extend(claimed);
+            continue;
+        }
+        // #407: opening a primary node can make the opener DRM master automatically when
+        // the display is free (whatever the open mode) — see `drm_open_lock`. Held for this
+        // card only.
+        let _drm_open_guard = drm_open_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(entry.path())
-        else {
+        let Ok(file) = open_card_read_only(&entry.path()) else {
             continue;
         };
         let card = DrmCard(file);
@@ -247,13 +353,9 @@ fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability>
             let Ok(info) = card.get_connector(*handle, false) else {
                 continue;
             };
-            let connector_name = format!("{}-{}", info.interface().as_str(), info.interface_id());
+            let connector_name = connector_name(&info);
             let modes = info.modes().iter().map(drm_mode_capability).collect();
-            let active_mode = info
-                .current_encoder()
-                .and_then(|encoder| card.get_encoder(encoder).ok())
-                .and_then(|encoder| encoder.crtc())
-                .and_then(|crtc| card.get_crtc(crtc).ok())
+            let active_mode = connector_crtc(&card, &info)
                 .and_then(|crtc| crtc.mode().map(|mode| drm_mode_capability(&mode)));
             outputs.push(DrmOutputCapability {
                 id: format!("{card_name}:{connector_name}"),
@@ -268,6 +370,142 @@ fn detect_drm_outputs_at(dri_root: &std::path::Path) -> Vec<DrmOutputCapability>
     }
     outputs.sort_by(|a, b| a.id.cmp(&b.id));
     outputs
+}
+
+/// `DP-1`-style name of a connector, as sysfs and console config spell it.
+fn connector_name(info: &drm::control::connector::Info) -> String {
+    format!("{}-{}", info.interface().as_str(), info.interface_id())
+}
+
+/// The CRTC a connector is currently driven by, if any.
+fn connector_crtc(
+    card: &DrmCard,
+    info: &drm::control::connector::Info,
+) -> Option<drm::control::crtc::Info> {
+    use drm::control::Device as _;
+    let encoder = card.get_encoder(info.current_encoder()?).ok()?;
+    card.get_crtc(encoder.crtc()?).ok()
+}
+
+/// What a card says about one connector's display.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConnectorScanout {
+    /// A client other than the agent holds DRM master on the card.
+    pub master_held: bool,
+    /// The connector's CRTC scans out a framebuffer.
+    pub framebuffer: bool,
+    pub mode: Option<DrmModeCapability>,
+}
+
+/// Reads `connector` (e.g. `DP-1`) on `card_node`. An unreadable card reports nothing
+/// held and nothing scanned out.
+///
+/// Opening a primary node while nobody holds master makes the opener master. DROP_MASTER
+/// succeeds only for the current master, so it both tells whether another client held the
+/// card and hands the display straight back if this open took it. A desktop opening the
+/// card inside that window (microseconds) would come up without master, so callers read
+/// only once the desktop has had time to open the card itself.
+pub(crate) fn connector_scanout(card_node: &std::path::Path, connector: &str) -> ConnectorScanout {
+    use drm::control::Device as _;
+    use drm::Device as _;
+
+    let _drm_open_guard = drm_open_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Ok(file) = open_card_read_only(card_node) else {
+        return ConnectorScanout::default();
+    };
+    let card = DrmCard(file);
+    let master_held = card.release_master_lock().is_err();
+    let crtc = card.resource_handles().ok().and_then(|resources| {
+        resources.connectors().iter().find_map(|handle| {
+            let info = card.get_connector(*handle, false).ok()?;
+            (connector_name(&info) == connector).then(|| connector_crtc(&card, &info))?
+        })
+    });
+    ConnectorScanout {
+        master_held,
+        framebuffer: crtc
+            .as_ref()
+            .is_some_and(|crtc| crtc.framebuffer().is_some()),
+        mode: crtc
+            .and_then(|crtc| crtc.mode())
+            .map(|mode| drm_mode_capability(&mode)),
+    }
+}
+
+/// Every card node the agent opens, it opens read-only: the mode-setting reads (resources,
+/// connectors, encoders, CRTCs) and DROP_MASTER are ioctls the kernel allows on a read-only
+/// file. The open mode does not decide mastership: the first opener of a card nobody holds
+/// becomes DRM master and stays master until it drops it or closes the card.
+/// [`connector_scanout`] and [`console_card_access`] drop it at once; the inventory keeps it
+/// until it closes the card after its reads, which is why it never opens a claimed card.
+fn open_card_read_only(card_node: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).open(card_node)
+}
+
+/// What the agent can tell about a console card without taking it (#460,
+/// `readiness::console`'s `console_card`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardAccess {
+    /// The node is not in this agent's container.
+    Missing,
+    /// The node is there but will not open read-only.
+    Unopenable(String),
+    /// Opened read-only; nobody else holds DRM master.
+    Free,
+    /// Another process holds DRM master.
+    Held,
+    /// This agent's console session claimed it: its desktop holds the display.
+    Claimed,
+}
+
+/// `card` (e.g. `card0`) as `connector_scanout` reads it: never opened while claimed, and
+/// opened read-only otherwise, giving back at once any mastership the open took. A card
+/// this account cannot open read-write, as the desktop will, is unopenable.
+pub(crate) fn console_card_access(card: &str) -> CardAccess {
+    console_card_access_at(std::path::Path::new("/dev/dri"), card)
+}
+
+fn console_card_access_at(dri_root: &std::path::Path, card: &str) -> CardAccess {
+    use drm::Device as _;
+    let node = dri_root.join(card);
+    if !node.exists() {
+        return CardAccess::Missing;
+    }
+    // The desktop opens the card read-write; the agent proves that without doing it.
+    if let Err(e) = access_read_write(&node) {
+        return CardAccess::Unopenable(format!("not read-write for this account: {e}"));
+    }
+    let _drm_open_guard = drm_open_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Under the lock: a claim taken while this waited must keep the agent off the card.
+    if display_claimed(card) {
+        return CardAccess::Claimed;
+    }
+    match open_card_read_only(&node) {
+        Err(e) => CardAccess::Unopenable(e.to_string()),
+        Ok(file) => {
+            if DrmCard(file).release_master_lock().is_err() {
+                CardAccess::Held
+            } else {
+                CardAccess::Free
+            }
+        }
+    }
+}
+
+/// `access(2)` for read and write: the caller's real ids against the node's mode and ACL.
+pub(crate) fn access_read_write(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: a valid NUL-terminated path, no other pointers.
+    match unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,118 +577,7 @@ fn detect_drm_connectors() -> Vec<String> {
     crate::ddc::powered_connectors(out)
 }
 
-/// Console audio sinks: the host PipeWire's while its console-audio socket answers (the
-/// `hw:*` ones hidden then, never fought for), otherwise the host's ALSA playback PCMs
-/// (`session::console_audio`, RH-07 #407 D13).
-pub(crate) fn detect_audio_sinks() -> Vec<AudioSink> {
-    crate::session::console_audio::sinks(&crate::session::console_audio::LiveHostAudio::live())
-}
-
-/// ALSA playback sinks from an asound root (`/proc/asound` or the host bind at
-/// `/host-proc/asound`). A card name alone is insufficient for HDMI/DP: the active output
-/// is often device 3 or 7, not the non-existent device zero. Ids name the card by its id
-/// (`hw:CARD=<id>,DEV=<device>`), which a driver reload does not move (#407 live).
-pub(crate) fn alsa_sinks_at(asound: &std::path::Path, dev_snd: &std::path::Path) -> Vec<AudioSink> {
-    let cards = std::fs::read_to_string(asound.join("cards")).unwrap_or_default();
-    let pcm = std::fs::read_to_string(asound.join("pcm")).unwrap_or_default();
-    let ids = crate::session::console_audio::read_card_ids(asound);
-    parse_audio_sinks(&cards, &pcm, &ids)
-        .into_iter()
-        // Compose may expose only one sound device; advertising the rest of the host's
-        // inventory hands an operator a sink whose ALSA node the pipeline cannot open.
-        // Card-level fallbacks name a controller, not a playback PCM; still useful on a
-        // host that exposes no pcm data.
-        .filter(|(pcm, _)| {
-            pcm.is_none_or(|(card, device)| pcm_device_path(dev_snd, card, device).exists())
-        })
-        .map(|(_, sink)| sink)
-        .collect()
-}
-
-fn pcm_device_path(dev_snd: &std::path::Path, card: u32, device: u32) -> std::path::PathBuf {
-    dev_snd.join(format!("pcmC{card}D{device}p"))
-}
-
-/// Each playback sink with the `(card index, device)` it is at now (`None` for a
-/// card-level fallback). `ids` maps a card index to its id; a card with none keeps the
-/// index form.
-fn parse_audio_sinks(
-    cards: &str,
-    pcm: &str,
-    ids: &std::collections::BTreeMap<u32, String>,
-) -> Vec<(Option<(u32, u32)>, AudioSink)> {
-    use crate::session::console_audio::{alsa_card_sink_id, alsa_sink_id};
-    let mut labels = std::collections::BTreeMap::new();
-    for line in cards.lines() {
-        let trimmed = line.trim_start();
-        let Some((idx_str, rest)) = trimmed.split_once(' ') else {
-            continue;
-        };
-        let Ok(idx) = idx_str.trim().parse::<u32>() else {
-            continue;
-        };
-        let label = rest
-            .rsplit_once(" - ")
-            .map(|(_, l)| l.trim())
-            .filter(|l| !l.is_empty())
-            .unwrap_or_else(|| rest.trim())
-            .to_string();
-        labels.insert(idx, label);
-    }
-
-    let mut out = Vec::new();
-    for line in pcm.lines() {
-        // Kernel format: "00-03: HDMI 0 : HDMI 0 : playback 1".
-        let Some((address, detail)) = line.split_once(':') else {
-            continue;
-        };
-        if !detail.contains("playback") {
-            continue;
-        }
-        let Some((card, device)) = address.trim().split_once('-') else {
-            continue;
-        };
-        let (Ok(card), Ok(device)) = (card.parse::<u32>(), device.parse::<u32>()) else {
-            continue;
-        };
-        let endpoint = detail
-            .split(':')
-            .next()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or("playback");
-        let card_label = labels
-            .get(&card)
-            .cloned()
-            .unwrap_or_else(|| format!("card {card}"));
-        let id = match ids.get(&card) {
-            Some(card_id) => alsa_sink_id(card_id, device),
-            None => format!("hw:{card},{device}"),
-        };
-        out.push((
-            Some((card, device)),
-            AudioSink {
-                id,
-                label: format!("{card_label} — {endpoint}"),
-            },
-        ));
-    }
-
-    // A card with no PCM detail yet (a USB DAC still initializing) keeps a card-level option.
-    if out.is_empty() {
-        out.extend(labels.into_iter().map(|(idx, label)| {
-            let id = match ids.get(&idx) {
-                Some(card_id) => alsa_card_sink_id(card_id),
-                None => format!("hw:{idx}"),
-            };
-            (None, AudioSink { id, label })
-        }));
-    }
-    out
-}
-
-/// `/dev/input/event*` with the name from `/sys/class/input/<event>/device/name`. Also
-/// resolves `console_config.input_devices: "auto"` in `session::physical_input`.
+/// `/dev/input/event*` with the name from `/sys/class/input/<event>/device/name`.
 pub(crate) fn detect_input_devices() -> Vec<InputDeviceInfo> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
@@ -1287,6 +1414,96 @@ fn detection_failure(
 mod tests {
     use super::*;
 
+    fn claimed_output(card: &str, connector: &str) -> DrmOutputCapability {
+        DrmOutputCapability {
+            id: format!("{card}:{connector}"),
+            card: card.into(),
+            render_node: None,
+            connector: connector.into(),
+            connected: true,
+            active_mode: None,
+            modes: Vec::new(),
+        }
+    }
+
+    /// The monitor-power read is the agent talking to the panel over the display link; it
+    /// never happens while a desktop owns that display.
+    #[test]
+    fn ddc_is_not_read_while_a_display_is_claimed() {
+        assert!(ddc_probe_allowed(false));
+        assert!(!ddc_probe_allowed(true));
+        let claim = claim_display_with("card93", Vec::new());
+        assert!(display_claimed("card93"));
+        drop(claim);
+        assert!(!display_claimed("card93"));
+    }
+
+    /// An old session's claim dropping after a new session claimed the same card must
+    /// leave the new claim in place.
+    /// #460: `console_card` never opens a card a console session has claimed, and a node
+    /// that is not there is named as missing.
+    #[test]
+    fn console_card_access_respects_a_claim_and_names_a_missing_node() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            console_card_access_at(dir.path(), "card90"),
+            CardAccess::Missing
+        );
+        std::fs::write(dir.path().join("card90"), "").unwrap();
+        let claim = claim_display_with("card90", Vec::new());
+        assert_eq!(
+            console_card_access_at(dir.path(), "card90"),
+            CardAccess::Claimed
+        );
+        drop(claim);
+        // A plain file is no DRM device: DROP_MASTER fails, which reads as held.
+        assert_eq!(
+            console_card_access_at(dir.path(), "card90"),
+            CardAccess::Held
+        );
+    }
+
+    #[test]
+    fn a_stale_claim_never_releases_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let dri = dir.path().join("dri");
+        std::fs::create_dir_all(&dri).unwrap();
+        std::fs::write(dri.join("card92"), b"").unwrap();
+        let old = claim_display_with("card92", vec![claimed_output("card92", "DP-1")]);
+        let new = claim_display_with("card92", vec![claimed_output("card92", "DP-2")]);
+        drop(old);
+        let outputs = detect_drm_outputs_at(&dri, dir.path());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].id, "card92:DP-2");
+        drop(new);
+        assert!(detect_drm_outputs_at(&dri, dir.path()).is_empty());
+    }
+
+    /// A claimed card is reported from its claim, never opened: the fake node here is a
+    /// plain file whose resource ioctl would fail and drop the card from the inventory.
+    #[test]
+    fn a_claimed_card_is_read_from_its_claim_and_sysfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let dri = dir.path().join("dri");
+        let sys = dir.path().join("sys");
+        std::fs::create_dir_all(&dri).unwrap();
+        std::fs::create_dir_all(sys.join("card91-DP-1")).unwrap();
+        std::fs::write(dri.join("card91"), b"").unwrap();
+        std::fs::write(sys.join("card91-DP-1/status"), "disconnected\n").unwrap();
+
+        assert!(detect_drm_outputs_at(&dri, &sys).is_empty());
+        let claim = claim_display_with("card91", vec![claimed_output("card91", "DP-1")]);
+        let outputs = detect_drm_outputs_at(&dri, &sys);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].id, "card91:DP-1");
+        assert!(
+            !outputs[0].connected,
+            "connected follows sysfs while claimed"
+        );
+        drop(claim);
+        assert!(detect_drm_outputs_at(&dri, &sys).is_empty());
+    }
+
     const PCI_IDS_FIXTURE: &str = "\
 # comment line, ignored
 0001  Some Other Vendor
@@ -1428,106 +1645,6 @@ mod tests {
     #[test]
     fn pci_ids_parser_unknown_returns_none() {
         assert_eq!(parse_pci_ids(PCI_IDS_FIXTURE, "ffff", "ffff"), None);
-    }
-
-    #[test]
-    fn audio_sinks_report_exact_playback_pcm_devices() {
-        let cards = "\
- 0 [NVidia         ]: HDA-Intel - HDA NVidia
- 1 [Generic        ]: HDA-Intel - HD-Audio Generic
-";
-        let pcm = "\
-00-03: HDMI 0 : HDMI 0 : playback 1
-00-07: HDMI 1 : HDMI 1 : playback 1
-01-00: ALC1220 Analog : ALC1220 Analog : playback 1 : capture 1
-";
-        let ids = std::collections::BTreeMap::from([
-            (0, "NVidia".to_string()),
-            (1, "Generic".to_string()),
-        ]);
-        assert_eq!(
-            parse_audio_sinks(cards, pcm, &ids),
-            vec![
-                (
-                    Some((0, 3)),
-                    AudioSink {
-                        id: "hw:CARD=NVidia,DEV=3".to_string(),
-                        label: "HDA NVidia — HDMI 0".to_string(),
-                    }
-                ),
-                (
-                    Some((0, 7)),
-                    AudioSink {
-                        id: "hw:CARD=NVidia,DEV=7".to_string(),
-                        label: "HDA NVidia — HDMI 1".to_string(),
-                    }
-                ),
-                (
-                    Some((1, 0)),
-                    AudioSink {
-                        id: "hw:CARD=Generic,DEV=0".to_string(),
-                        label: "HD-Audio Generic — ALC1220 Analog".to_string(),
-                    }
-                ),
-            ]
-        );
-        // A card whose id cannot be read keeps the index form.
-        assert_eq!(
-            parse_audio_sinks(cards, pcm, &Default::default())[2].1.id,
-            "hw:1,0"
-        );
-    }
-
-    /// Through a temporary asound root: the id is the card's, wherever its index moved.
-    #[test]
-    fn alsa_sinks_name_the_card_id_and_keep_only_openable_pcms() {
-        let dir = tempfile::tempdir().unwrap();
-        let (asound, dev_snd) = (dir.path().join("asound"), dir.path().join("snd"));
-        std::fs::create_dir_all(asound.join("card1")).unwrap();
-        std::fs::create_dir_all(&dev_snd).unwrap();
-        std::fs::write(
-            asound.join("cards"),
-            " 0 [Generic        ]: HDA-Intel - HD-Audio Generic\n 1 [NVidia         ]: HDA-Intel - HDA NVidia\n",
-        )
-        .unwrap();
-        std::fs::write(asound.join("card1/id"), "NVidia\n").unwrap();
-        std::fs::write(
-            asound.join("pcm"),
-            "00-00: ALC1220 Analog : ALC1220 Analog : playback 1\n01-03: HDMI 0 : HDMI 0 : playback 1\n",
-        )
-        .unwrap();
-        std::fs::write(dev_snd.join("pcmC1D3p"), "").unwrap();
-        assert_eq!(
-            alsa_sinks_at(&asound, &dev_snd),
-            vec![AudioSink {
-                id: "hw:CARD=NVidia,DEV=3".to_string(),
-                label: "HDA NVidia — HDMI 0".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn audio_sinks_fall_back_to_card_when_pcm_is_unavailable() {
-        let cards = " 0 [NVidia ]: HDA-Intel - HDA NVidia\n";
-        let ids = std::collections::BTreeMap::from([(0, "NVidia".to_string())]);
-        assert_eq!(
-            parse_audio_sinks(cards, "", &ids),
-            vec![(
-                None,
-                AudioSink {
-                    id: "hw:CARD=NVidia".to_string(),
-                    label: "HDA NVidia".to_string(),
-                }
-            )]
-        );
-    }
-
-    #[test]
-    fn audio_sink_pcm_path_matches_alsa_endpoint() {
-        assert_eq!(
-            pcm_device_path(std::path::Path::new("/dev/snd"), 0, 3),
-            std::path::Path::new("/dev/snd/pcmC0D3p")
-        );
     }
 
     #[test]

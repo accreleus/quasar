@@ -26,8 +26,11 @@ var (
 	// takeover: the incumbent's next reconnect fails and the scheduler keeps placing work
 	// on the row the caller now authenticates as. A genuinely dead host is unaffected.
 	ErrHostAgentConnected = errors.New("a live agent is already registered under this node name")
-	ErrHostNotFound       = errors.New("host not found")
-	ErrInvalidNodeSecret  = errors.New("invalid node secret")
+	// ErrHostAlreadyEnrolled refuses an unbound token onto an existing host: becoming an
+	// enrolled host takes a token minted for its node_name (control-api.md amendment 20).
+	ErrHostAlreadyEnrolled = errors.New("this node name is already enrolled; its token must be bound to it")
+	ErrHostNotFound        = errors.New("host not found")
+	ErrInvalidNodeSecret   = errors.New("invalid node secret")
 )
 
 type agentStore struct {
@@ -41,7 +44,7 @@ type agentStore struct {
 	// redeemEnrollment consumes a minted token inside the caller's transaction. Injected
 	// so agentws does not import hostenroll (and so tests can supply a stub). Nil means
 	// minted tokens are unavailable, and then nothing enrolls.
-	redeemEnrollment func(ctx context.Context, db hostenroll.DBTX, plaintext, nodeName string) error
+	redeemEnrollment func(ctx context.Context, db hostenroll.DBTX, plaintext, nodeName string) (bound bool, err error)
 }
 
 // Takes a host's GPU inventory out of scheduling before a capacity report
@@ -117,7 +120,8 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	if s.redeemEnrollment == nil {
 		return registerResult{}, ErrInvalidEnrollmentToken // minted tokens unavailable
 	}
-	if err := s.redeemEnrollment(ctx, tx, token, nodeName); err != nil {
+	bound, err := s.redeemEnrollment(ctx, tx, token, nodeName)
+	if err != nil {
 		// Only a genuinely unusable token is an auth failure. A DB outage reported as
 		// "authentication failed" sends the operator to rotate a token that was fine.
 		if errors.Is(err, hostenroll.ErrInvalidToken) {
@@ -175,6 +179,11 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	`, nodeName, agentVersion, secretHash).Scan(&hostID, &newlyCreated)
 	if err != nil {
 		return registerResult{}, fmt.Errorf("upsert host: %w", err)
+	}
+	// After the upsert, so a concurrent first enrollment of the same name is caught too.
+	// The deferred rollback restores the secret and gives the token's use back.
+	if !newlyCreated && !bound {
+		return registerResult{}, ErrHostAlreadyEnrolled
 	}
 	if newlyCreated {
 		// Only a genuinely new installation carries this unedited marker.

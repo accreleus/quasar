@@ -189,7 +189,6 @@ type Target struct {
 const (
 	FaultAgentAhead      = "agent_ahead_of_control_plane"
 	FaultIdentityUnknown = "identity_unknown"
-	FaultManifestInvalid = "manifest_invalid"
 )
 
 // Fault is one `PlatformReleaseFault`. host_id/node_name are null on an

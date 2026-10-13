@@ -26,7 +26,7 @@ func TestNewEnrollmentDefaultsSupportedHardwareToAutomatic(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET status='offline',agent_disconnected_at=now() WHERE id=$1::uuid`, newHost.HostID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.enrollHost(ctx, "automatic-new-host", "0.3.1", testEnrollmentToken); err != nil {
+	if _, err := store.enrollHost(ctx, "automatic-new-host", "0.3.1", boundEnrollmentToken(t, pool, "automatic-new-host")); err != nil {
 		t.Fatal(err)
 	}
 	policy := hostcfg.NewStore(pool)
@@ -57,7 +57,7 @@ func TestNewEnrollmentDefaultsSupportedHardwareToAutomatic(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET status='offline',agent_disconnected_at=now() WHERE id=$1::uuid`, newHost.HostID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.enrollHost(ctx, "automatic-new-host", "0.3.2", testEnrollmentToken); err != nil {
+	if _, err := store.enrollHost(ctx, "automatic-new-host", "0.3.2", boundEnrollmentToken(t, pool, "automatic-new-host")); err != nil {
 		t.Fatal(err)
 	}
 	view, err = hostcfg.NewStore(pool).GetPolicy(ctx, newHost.HostID)

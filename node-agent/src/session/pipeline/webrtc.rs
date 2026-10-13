@@ -421,12 +421,14 @@ fn poll_video_loss(webrtc: &gst::Element) -> Option<(i64, u64)> {
 /// N→0 after a clean run.
 ///
 /// Lifetime: it holds a `std::sync::Weak<SessionMetrics>` for liveness (the glib `WeakRef`
-/// is `!Send`) and exits within one poll tick of teardown dropping it, so no stop plumbing
-/// is needed. The transceiver + webrtcbin are strong glib handles, released on exit.
+/// is `!Send`) and exits within one poll tick of teardown dropping it, or of `retired`
+/// being set when its transport is replaced. The transceiver + webrtcbin are strong glib
+/// handles, released on exit.
 pub(super) fn spawn_fec_controller(
     webrtc: &gst::Element,
     cfg: FecControllerConfig,
     metrics: std::sync::Weak<SessionMetrics>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
     trace_tx: TraceTx,
     session_id: String,
 ) {
@@ -474,8 +476,9 @@ pub(super) fn spawn_fec_controller(
             let mut elapsed = std::time::Duration::ZERO;
             loop {
                 std::thread::sleep(tick);
-                if metrics.upgrade().is_none() {
-                    break; // session gone — inherit teardown
+                if metrics.upgrade().is_none() || retired.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break; // session or transport gone — inherit teardown
                 }
                 elapsed += tick;
                 if elapsed < window {
@@ -514,7 +517,7 @@ pub(super) fn spawn_fec_controller(
                     None => {}
                 }
             }
-            tracing::debug!("auto FEC controller thread exiting (session gone)");
+            tracing::debug!("auto FEC controller thread exiting (session or transport gone)");
         });
     if let Err(e) = spawn {
         tracing::warn!(
@@ -969,6 +972,102 @@ pub(crate) fn remote_description_failure_reason(pc: PcId, webrtcbin_message: &st
     format!("webrtc: {pc} PeerConnection rejected the remote answer: {webrtcbin_message}{hint}")
 }
 
+/// The ICE ufrag and DTLS fingerprint of an SDP's first transport: what identifies the
+/// endpoint that wrote it.
+fn peer_identity(sdp: &str) -> (Option<&str>, Option<&str>) {
+    let attr = |name: &str| {
+        sdp.lines()
+            .find_map(|l| l.trim().strip_prefix(name))
+            .map(str::trim)
+    };
+    (attr("a=ice-ufrag:"), attr("a=fingerprint:"))
+}
+
+/// Does `sdp` carry both halves of a peer's identity? An answer that does not is not one a
+/// transport can be said to have negotiated with.
+pub(crate) fn names_a_peer(sdp: &str) -> bool {
+    matches!(peer_identity(sdp), (Some(_), Some(_)))
+}
+
+/// Who wrote an answer, relative to the peer its transport negotiated with (#535).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerFrom {
+    /// The negotiated peer, or the first to answer.
+    ThisPeer,
+    /// The negotiated peer under other ICE credentials: the description this transport
+    /// holds is one that peer wrote for another transport's offer.
+    ThisPeerCorrecting,
+    /// A peer this transport cannot serve: its DTLS and SCTP associations are another's.
+    NewPeer,
+}
+
+/// This host never changes a transport's ICE credentials (webrtcbin ignores
+/// `ice-restart`), so its peer never changes theirs: another ufrag or certificate is
+/// another peer connection. The exception is a transport no DTLS has started on. A
+/// browser answers a new transport's offer with new credentials and the certificate it
+/// had, so an answer of its to the old transport's offer that arrived late and was
+/// applied here names credentials it has since dropped. Once DTLS has started the
+/// association is one endpoint's, and the same certificate under other credentials is
+/// another endpoint of one process (every webrtcbin in a process shares a certificate).
+/// Guarded by `takeover_tests::a_restart_from_the_same_peer_keeps_the_transport`.
+///
+/// `negotiated` is the answer the transport was last handed, kept by the caller:
+/// webrtcbin applies a description asynchronously, and two answers a fraction of a
+/// millisecond apart must both be read against the first. `offer_pending` likewise: the
+/// caller asked the transport for another offer since then.
+pub(crate) fn answer_from(
+    negotiated: Option<&str>,
+    answer: &str,
+    dtls_started: bool,
+    offer_pending: bool,
+) -> AnswerFrom {
+    let Some(negotiated) = negotiated else {
+        return AnswerFrom::ThisPeer; // nobody has answered on this transport yet
+    };
+    // Not something a peer wrote. Applying it is what reports that; it must not cost the
+    // negotiated peer its transport.
+    if !names_a_peer(answer) {
+        return AnswerFrom::ThisPeer;
+    }
+    let (was_ufrag, was_fingerprint) = peer_identity(negotiated);
+    let (ufrag, fingerprint) = peer_identity(answer);
+    if was_fingerprint != fingerprint {
+        AnswerFrom::NewPeer
+    } else if was_ufrag == ufrag {
+        AnswerFrom::ThisPeer
+    } else if dtls_started {
+        AnswerFrom::NewPeer
+    } else if offer_pending {
+        AnswerFrom::ThisPeer // the correction itself: its answer to the offer in flight
+    } else {
+        AnswerFrom::ThisPeerCorrecting
+    }
+}
+
+/// Has a DTLS handshake started on `webrtc`'s transport?
+pub(crate) fn dtls_started(webrtc: &gst::Element) -> bool {
+    let state = || {
+        webrtc
+            .emit_by_name::<Option<glib::Object>>("get-transceiver", &[&0i32])?
+            .property::<Option<glib::Object>>("sender")?
+            .property::<Option<glib::Object>>("transport")
+            .map(|t| t.property::<gstreamer_webrtc::WebRTCDTLSTransportState>("state"))
+    };
+    state().is_some_and(|s| s != gstreamer_webrtc::WebRTCDTLSTransportState::New)
+}
+
+/// Has `webrtc` made an offer yet?
+pub(crate) fn has_offered(webrtc: &gst::Element) -> bool {
+    webrtc
+        .property::<Option<gstreamer_webrtc::WebRTCSessionDescription>>("local-description")
+        .is_some()
+}
+
+/// The ICE ufrag an SDP was written with.
+pub(crate) fn ice_ufrag(sdp: &str) -> Option<&str> {
+    peer_identity(sdp).0
+}
+
 /// Apply a remote SDP. For an inbound offer (answerer), `then_answer` runs once the remote
 /// description is set, creating the answer. Called by
 /// [`crate::session::server::handle_inbound`].
@@ -1069,9 +1168,9 @@ pub(crate) fn apply_remote_description(
 #[cfg(test)]
 mod tests {
     use super::{
-        answer_is_duplicate, enable_video_fec, error_is_stale_answer, make_webrtcbin,
+        answer_from, answer_is_duplicate, enable_video_fec, error_is_stale_answer, make_webrtcbin,
         munge_offer_sdp, remote_description_error, remote_description_failure_reason,
-        set_audio_receive_latency, signaling_state_nick, PcId, SrdFailureKind,
+        set_audio_receive_latency, signaling_state_nick, AnswerFrom, PcId, SrdFailureKind,
     };
     use gstreamer as gst;
     use gstreamer::prelude::*;
@@ -1208,6 +1307,89 @@ mod tests {
             set_audio_receive_latency(&webrtc, ms);
             assert_eq!(webrtc.property::<u32>("latency"), ms);
         }
+    }
+
+    // ── #535: which answers come from a peer this transport has not negotiated with ──
+
+    fn answer(ufrag: &str, fingerprint: &str) -> String {
+        format!(
+            "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=ice-ufrag:{ufrag}\r\n\
+             a=ice-pwd:pw\r\na=fingerprint:sha-256 {fingerprint}\r\na=setup:active\r\n"
+        )
+    }
+
+    #[test]
+    fn the_first_answer_on_a_transport_is_never_a_new_peer() {
+        for dtls in [false, true] {
+            assert_eq!(
+                answer_from(None, &answer("aaaa", "AA:01"), dtls, true),
+                AnswerFrom::ThisPeer
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_peer_answering_again_is_not_new() {
+        let first = answer("aaaa", "AA:01");
+        assert_eq!(
+            answer_from(Some(&first), &answer("aaaa", "AA:01"), true, true),
+            AnswerFrom::ThisPeer
+        );
+    }
+
+    #[test]
+    fn another_certificate_is_a_new_peer_whatever_the_transport_has_done() {
+        let first = answer("aaaa", "AA:01");
+        for (dtls, pending) in [(false, false), (false, true), (true, false), (true, true)] {
+            for ufrag in ["aaaa", "bbbb"] {
+                assert_eq!(
+                    answer_from(Some(&first), &answer(ufrag, "BB:02"), dtls, pending),
+                    AnswerFrom::NewPeer
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_that_names_no_peer_is_never_a_new_one() {
+        let first = answer("aaaa", "AA:01");
+        for malformed in ["", "not sdp", "v=0\r\na=ice-ufrag:bbbb\r\n"] {
+            for (dtls, pending) in [(false, false), (false, true), (true, false), (true, true)] {
+                assert_eq!(
+                    answer_from(Some(&first), malformed, dtls, pending),
+                    AnswerFrom::ThisPeer,
+                    "{malformed:?}"
+                );
+            }
+        }
+    }
+
+    /// Two peer connections of one process share a certificate (webrtcbin's do).
+    #[test]
+    fn other_ice_credentials_once_dtls_has_started_are_a_new_peer() {
+        let first = answer("aaaa", "AA:01");
+        for pending in [false, true] {
+            assert_eq!(
+                answer_from(Some(&first), &answer("bbbb", "AA:01"), true, pending),
+                AnswerFrom::NewPeer
+            );
+        }
+    }
+
+    /// A browser's late answer to the old transport's offer was applied to the new one.
+    #[test]
+    fn other_ice_credentials_before_any_dtls_are_the_same_peer_correcting_itself() {
+        let late = answer("old1", "AA:01");
+        let current = answer("new2", "AA:01");
+        assert_eq!(
+            answer_from(Some(&late), &current, false, false),
+            AnswerFrom::ThisPeerCorrecting
+        );
+        assert_eq!(
+            answer_from(Some(&late), &current, false, true),
+            AnswerFrom::ThisPeer,
+            "the answer to the offer that correction asked for is applied"
+        );
     }
 
     #[test]

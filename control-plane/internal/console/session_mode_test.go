@@ -65,19 +65,7 @@ func TestResolveSessionMode(t *testing.T) {
 		want SessionMode
 	}{
 		{
-			name: "configured mode wins over the physical one",
-			cfg:  ConsoleConfig{OutputID: strp("card0:DP-4"), Mode: &ModeSelection{Width: 2560, Height: 1440, RefreshMillihz: 119998}},
-			caps: caps(fourK),
-			want: SessionMode{Width: 2560, Height: 1440, FPS: 120, Source: ModeSourceConfigured},
-		},
-		{
-			name: "configured mode still wins when streaming",
-			cfg:  ConsoleConfig{Stream: true, OutputID: strp("card0:DP-4"), Mode: &ModeSelection{Width: 3840, Height: 2160, RefreshMillihz: 239990}},
-			caps: caps(fourK),
-			want: SessionMode{Width: 3840, Height: 2160, FPS: 240, Source: ModeSourceConfigured},
-		},
-		{
-			name: "automatic local-only follows the preferred mode weston lights",
+			name: "automatic follows the first connected output's preferred mode",
 			cfg:  ConsoleConfig{},
 			caps: caps(unplugged, fourK, qhd),
 			want: SessionMode{Width: 3840, Height: 2160, FPS: 60, Source: ModeSourcePreferred},
@@ -115,12 +103,6 @@ func TestResolveSessionMode(t *testing.T) {
 		{
 			name: "pinned output absent from the report keeps the app default",
 			cfg:  ConsoleConfig{OutputID: strp("card1:DP-1")},
-			caps: caps(fourK),
-			want: SessionMode{Source: ModeSourceAppDefault},
-		},
-		{
-			name: "streaming with no configured mode keeps the app default",
-			cfg:  ConsoleConfig{Stream: true},
 			caps: caps(fourK),
 			want: SessionMode{Source: ModeSourceAppDefault},
 		},

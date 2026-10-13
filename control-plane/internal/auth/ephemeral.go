@@ -60,7 +60,7 @@ func (s *Service) MintEphemeral(ctx context.Context, role string, ttl time.Durat
 	if err != nil {
 		return Token{}, err
 	}
-	if err := s.store.createToken(ctx, user.ID, tokenHash, expiresAt, "quasar-dev-agent", ""); err != nil {
+	if err := s.store.createToken(ctx, user.ID, "", tokenHash, expiresAt, "quasar-dev-agent", ""); err != nil {
 		return Token{}, err
 	}
 	return Token{Plaintext: plaintext, ExpiresAt: expiresAt, User: user}, nil

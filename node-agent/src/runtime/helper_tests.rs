@@ -261,6 +261,23 @@ fn exact_cleanup_waits_until_a_starting_launch_has_created_its_container() {
     assert_eq!(cleanup.wait().unwrap(), ExactRemoval::Referenced);
     assert_eq!(engine.state.lock().unwrap().managed_remove_calls, 0);
 }
+/// A client for `config` that runs on one runtime shared by the whole suite. A
+/// runtime per client put the suite near the descriptor limit (#295): each one is an
+/// epoll fd, eventfds and a thread, and a client is built on every `engine.client()`.
+fn test_client(config: RuntimeConfig) -> RuntimeClient {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(64)
+            .thread_name("helper-tests")
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    RuntimeClient(
+        quasar_runtime::RuntimeClient::with_handle(config, runtime.handle().clone()).unwrap(),
+    )
+}
 impl Engine {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -367,8 +384,9 @@ impl Engine {
     fn inject_accept_error(&self, error: io::Error) {
         self.injected_accept_errors.lock().unwrap().push_back(error);
     }
+    /// A client of its own (own admission slots) on the suite's one shared runtime.
     fn client(&self) -> RuntimeClient {
-        RuntimeClient::new(self.config.clone()).unwrap()
+        test_client(self.config.clone())
     }
     fn requests(&self, prefix: &str) -> usize {
         self.state
@@ -922,7 +940,7 @@ fn application_abandon_before_intent_is_a_noop_without_opening_docker_and_allows
     };
     let mut unavailable = engine.config.clone();
     unavailable.socket = "/tmp/quasar-preflight-engine-unavailable.sock".into();
-    let unavailable_client = RuntimeClient::new(unavailable).unwrap();
+    let unavailable_client = test_client(unavailable);
     assert!(unavailable_client
         .start_application(request.clone())
         .wait()
@@ -946,7 +964,7 @@ fn saturated_application_admission_leaves_no_intent_so_abandon_releases_the_retr
         Some(("POST /containers/create".into(), gate.clone()));
     let mut config = engine.config.clone();
     config.max_in_flight = 1;
-    let client = RuntimeClient::new(config).unwrap();
+    let client = test_client(config);
     let first = client.start_application(ApplicationRequest {
         operation: "application-admission-slot-first".into(),
         name: "quasar-sess-admission-slot-first".into(),
@@ -1439,6 +1457,89 @@ fn application_rejects_mismatched_realized_mount_device_and_security_requirement
             "{kind} realization must be rejected"
         );
     }
+}
+
+#[test]
+fn application_device_cgroup_rules_are_created_and_verified() {
+    let request = |operation: &str| ApplicationRequest {
+        device_cgroup_rules: vec!["c 13:* rwm".into()],
+        ..realized_requirements_request(operation)
+    };
+    let engine = Engine::new();
+    assert!(engine
+        .client()
+        .start_application(request("fixture-cgroup-rules"))
+        .wait()
+        .is_ok());
+
+    let engine = Engine::new();
+    engine.state.lock().unwrap().host_config_patch = Some(json!({"DeviceCgroupRules": null}));
+    assert_eq!(
+        engine
+            .client()
+            .start_application(request("fixture-cgroup-rules-dropped"))
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol,
+        "an engine that did not apply the rule must be refused"
+    );
+}
+
+/// #460: a rootless engine cannot apply a device-cgroup rule (rootless Podman refuses the
+/// create outright), so the container is created without the request's rule, the journal
+/// records that, and the read-back expects none.
+#[test]
+fn a_rootless_engine_creates_the_application_without_its_device_cgroup_rules() {
+    let request = |operation: &str| ApplicationRequest {
+        device_cgroup_rules: vec!["c 13:* rwm".into()],
+        ..realized_requirements_request(operation)
+    };
+    let engine = Engine::new();
+    engine.state.lock().unwrap().info = Some(rootless_info(&["nvidia.com/gpu=all"]));
+    engine
+        .client()
+        .start_application(request("fixture-rootless-rules"))
+        .wait()
+        .unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert!(
+        body["HostConfig"]["DeviceCgroupRules"].is_null(),
+        "{}",
+        body["HostConfig"]
+    );
+    let journal = std::fs::read_dir(
+        engine
+            .config
+            .image_state_path
+            .as_ref()
+            .unwrap()
+            .join("applications"),
+    )
+    .unwrap()
+    .flatten()
+    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+    .find(|j| j.contains("fixture-rootless-rules"))
+    .unwrap();
+    let intent: Value = serde_json::from_str(&journal).unwrap();
+    assert_eq!(intent["device_cgroup_rules"], json!([]));
+    assert_eq!(
+        intent["request"]["device_cgroup_rules"],
+        json!(["c 13:* rwm"])
+    );
+
+    // The same launch on a rootful engine keeps the rule and reads it back.
+    let rootful = Engine::new();
+    rootful
+        .client()
+        .start_application(request("fixture-rootful-rules"))
+        .wait()
+        .unwrap();
+    let body = rootful.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(
+        body["HostConfig"]["DeviceCgroupRules"],
+        json!(["c 13:* rwm"])
+    );
 }
 
 #[test]
@@ -2096,8 +2197,8 @@ fn application_cleanup_retries_after_a_runtime_restart_without_touching_active_w
             .kind,
         ErrorKind::UnknownOutcome
     );
-    RuntimeClient::new(engine.config.clone())
-        .unwrap()
+    engine
+        .client()
         .recover_application_cleanup()
         .wait()
         .unwrap();
@@ -2335,11 +2436,7 @@ fn application_startup_retirement_reconciles_lost_create_without_adopting_active
             .kind,
         ErrorKind::UnknownOutcome
     );
-    RuntimeClient::new(engine.config.clone())
-        .unwrap()
-        .retire_applications()
-        .wait()
-        .unwrap();
+    engine.client().retire_applications().wait().unwrap();
     assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
     assert_eq!(engine.requests("DELETE /containers/"), 1);
 }
@@ -2536,8 +2633,8 @@ fn periodic_recovery_resumes_interrupted_no_id_abandonment_without_creating() {
         ErrorKind::UnknownOutcome
     );
     engine.state.lock().unwrap().inspect_code = None;
-    RuntimeClient::new(engine.config.clone())
-        .unwrap()
+    engine
+        .client()
         .recover_application_cleanup()
         .wait()
         .unwrap();
@@ -2603,6 +2700,8 @@ fn application_recovery_skips_a_locked_record_and_cleans_a_later_obligation() {
         keep_id: None,
         engine_groups: Vec::new(),
         group_add: None,
+        device_cgroup_rules: None,
+        cards_openable: false,
         nested_sandbox_label: false,
         phase: ApplicationPhase::Running,
         result: None,
@@ -2620,8 +2719,8 @@ fn application_recovery_skips_a_locked_record_and_cleans_a_later_obligation() {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    RuntimeClient::new(engine.config.clone())
-        .unwrap()
+    engine
+        .client()
         .recover_application_cleanup()
         .wait()
         .unwrap_err();
@@ -2639,8 +2738,8 @@ fn periodic_application_recovery_does_not_retire_a_running_unrequested_record() 
         ..Default::default()
     };
     engine.client().start_application(request).wait().unwrap();
-    RuntimeClient::new(engine.config.clone())
-        .unwrap()
+    engine
+        .client()
         .recover_application_cleanup()
         .wait()
         .unwrap();
@@ -2977,24 +3076,9 @@ fn audio_request(engine: &Engine) -> (DiagnosticHelper, AudioRun) {
             image: "quasar-agent:test".into(),
         },
         AudioRun {
-            socket_dir: socket_dir.clone(),
-            entrypoint: vec!["pulseaudio".into()],
-            command: vec![
-                "--daemonize=no".into(),
-                "--system=no".into(),
-                "--disable-shm=true".into(),
-                "--exit-idle-time=-1".into(),
-                "--log-target=stderr".into(),
-                "-n".into(),
-                "--load=module-null-sink sink_name=quasar_output".into(),
-                "--load=module-null-sink sink_name=quasar_mic".into(),
-                "--load=module-remap-source master=quasar_mic.monitor source_name=quasar_mic_src"
-                    .into(),
-                format!(
-                    "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
-                    socket_dir.display()
-                ),
-            ],
+            socket_dir,
+            entrypoint: vec!["pipewire".into()],
+            command: crate::session::audio::pulse_command(),
         },
     )
 }
@@ -3010,7 +3094,7 @@ fn audio_sidecar_uses_the_fixed_writable_pulse_profile_at_the_public_boundary() 
         .wait()
         .unwrap();
     let body = engine.state.lock().unwrap().body.clone().unwrap();
-    assert_eq!(body["Entrypoint"], json!(["pulseaudio"]));
+    assert_eq!(body["Entrypoint"], json!(["pipewire"]));
     assert_eq!(body["HostConfig"]["NetworkMode"], json!("none"));
     assert_eq!(body["HostConfig"]["ReadonlyRootfs"], json!(false));
     assert_eq!(body["HostConfig"]["CapDrop"], json!(["ALL"]));
@@ -3032,7 +3116,8 @@ fn audio_sidecar_uses_the_fixed_writable_pulse_profile_at_the_public_boundary() 
         body["Env"],
         json!([
             format!("HOME={}", socket.display()),
-            format!("PULSE_RUNTIME_PATH={}/.runtime", socket.display())
+            format!("PULSE_RUNTIME_PATH={}/.runtime", socket.display()),
+            "XDG_RUNTIME_DIR=/tmp"
         ])
     );
     assert_eq!(body["HostConfig"]["Mounts"][0]["Source"], json!(socket));
@@ -3226,10 +3311,6 @@ fn audio_profile_initializes_a_missing_parent_without_removing_it_on_cleanup() {
     let (helper, mut run) = audio_request(&engine);
     let parent = run.socket_dir.parent().unwrap().join("missing-parent");
     run.socket_dir = parent.join("pulse-fixture");
-    *run.command.last_mut().unwrap() = format!(
-        "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
-        run.socket_dir.display()
-    );
     let id = engine
         .client()
         .run_audio_sidecar(helper, run)
@@ -3559,10 +3640,6 @@ fn cleanup_finishes_when_reboot_has_removed_the_whole_runtime_parent() {
         .unwrap()
         .join("volatile-runtime");
     run.socket_dir = runtime_parent.join("pulse-fixture");
-    *run.command.last_mut().unwrap() = format!(
-        "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
-        run.socket_dir.display()
-    );
     let id = engine
         .client()
         .run_audio_sidecar(helper, run)
@@ -3959,7 +4036,8 @@ fn recovery_adopts_lost_create_without_starting_or_duplicating_it() {
 #[test]
 fn detached_run_replays_its_completed_operation_without_restarting() {
     let engine = Engine::new();
-    let client = engine.client();
+    // Own runtime on purpose: this guards a detached run keeping its client's runtime alive.
+    let client = RuntimeClient::new(engine.config.clone()).unwrap();
     let (helper, run) = request();
     drop(client.run_diagnostic(helper.clone(), run.clone()));
     drop(client);
@@ -4228,7 +4306,7 @@ fn changed_request_node_or_endpoint_cannot_mutate_a_recorded_operation() {
         } else {
             config.socket = "/tmp/not-the-original-engine.sock".into();
         }
-        let other = RuntimeClient::new(config).unwrap();
+        let other = test_client(config);
         assert_eq!(
             other
                 .cleanup_diagnostic(id.clone())
@@ -4790,7 +4868,7 @@ fn urlencoding(value: &str) -> String {
 fn client_on_another_endpoint(engine: &Engine) -> RuntimeClient {
     let mut config = engine.config.clone();
     config.socket = engine.config.socket.with_file_name("proxy.sock");
-    RuntimeClient::new(config).unwrap()
+    test_client(config)
 }
 
 fn served(engine: &Engine) -> usize {
@@ -5092,6 +5170,7 @@ fn nvidia_probe_request() -> (DiagnosticHelper, GpuProbeRun) {
             entrypoint: vec!["/usr/bin/timeout".into()],
             command: vec!["5s".into(), "/bin/sh".into(), "-c".into(), "exit 23".into()],
             devices: Vec::new(),
+            mknod_only_cards: Vec::new(),
             groups: Vec::new(),
             nvidia_device_request: true,
             nvidia: Some(nvidia_access()),
@@ -5108,6 +5187,7 @@ fn dri_probe_request(operation: &str) -> (DiagnosticHelper, GpuProbeRun) {
             entrypoint: vec!["/usr/bin/timeout".into()],
             command: vec!["5s".into(), "/bin/sh".into(), "-c".into(), "exit 23".into()],
             devices: vec!["/dev/dri".into()],
+            mknod_only_cards: Vec::new(),
             groups: vec![44, 991],
             nvidia_device_request: false,
             nvidia: None,
@@ -5922,7 +6002,7 @@ fn gpu_probe_without_verified_ownership_is_refused() {
     // Another owner reading the same journals cannot act on them either.
     let mut foreign = replaced.config.clone();
     foreign.diagnostic_owner = Some("another-agent".into());
-    let other = RuntimeClient::new(foreign).unwrap();
+    let other = test_client(foreign);
     assert_eq!(
         other.stop_gpu_probe(id.clone()).wait().unwrap_err().kind,
         ErrorKind::UnknownOutcome
@@ -6348,4 +6428,122 @@ fn a_journal_written_before_the_injection_was_recorded_reads_as_gpus() {
         super::docker::dialect::recorded_injection(false, None),
         None
     );
+}
+
+fn streamed_app(operation: &str) -> ApplicationRequest {
+    ApplicationRequest {
+        operation: operation.into(),
+        name: format!("quasar-sess-{operation}"),
+        image: "quasar-app:test".into(),
+        devices: vec!["/dev/dri/renderD128".into()],
+        mknod_only_cards: vec!["/dev/dri/card0".into()],
+        gpu: true,
+        ..Default::default()
+    }
+}
+
+fn application_journal(engine: &Engine, operation: &str) -> Value {
+    let journal = std::fs::read_dir(
+        engine
+            .config
+            .image_state_path
+            .as_ref()
+            .unwrap()
+            .join("applications"),
+    )
+    .unwrap()
+    .flatten()
+    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+    .find(|j| j.contains(operation))
+    .unwrap();
+    serde_json::from_str(&journal).unwrap()
+}
+
+/// #464: a streamed app's card is created mknod-only on a rootful engine and read back
+/// as that. A rootless engine cannot hold it, so it is created openable and the journal
+/// says so. A card the engine reports wider than asked is refused.
+#[test]
+fn a_streamed_apps_card_is_mknod_only_on_a_rootful_engine_and_openable_rootless() {
+    let render = json!({"PathOnHost":"/dev/dri/renderD128","PathInContainer":"/dev/dri/renderD128","CgroupPermissions":"rwm"});
+    let card = |permissions: &str| json!({"PathOnHost":"/dev/dri/card0","PathInContainer":"/dev/dri/card0","CgroupPermissions":permissions});
+
+    let engine = Engine::new();
+    engine
+        .client()
+        .start_application(streamed_app("card-rootful"))
+        .wait()
+        .unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(body["HostConfig"]["Devices"], json!([render, card("m")]));
+    assert!(application_journal(&engine, "card-rootful")
+        .get("cards_openable")
+        .is_none());
+
+    let engine = Engine::new();
+    engine.state.lock().unwrap().info = Some(rootless_info(&[]));
+    engine
+        .client()
+        .start_application(streamed_app("card-rootless"))
+        .wait()
+        .unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(body["HostConfig"]["Devices"], json!([render, card("rwm")]));
+    assert_eq!(
+        application_journal(&engine, "card-rootless")["cards_openable"],
+        json!(true)
+    );
+
+    // An NVIDIA host's whole /dev/dri is journalled as openable too.
+    let engine = Engine::new();
+    engine
+        .client()
+        .start_application(nvidia_app("card-nvidia"))
+        .wait()
+        .unwrap();
+    assert_eq!(
+        application_journal(&engine, "card-nvidia")["cards_openable"],
+        json!(true)
+    );
+
+    let engine = Engine::new();
+    engine.state.lock().unwrap().host_devices_override = Some(json!([render, card("rwm")]));
+    assert_eq!(
+        engine
+            .client()
+            .start_application(streamed_app("card-widened"))
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol,
+        "a card reported openable when it was asked for mknod-only"
+    );
+}
+
+/// #464: the GPU probe is given the streamed app's grant, card mknod-only where the engine
+/// holds it and openable where it does not.
+#[test]
+fn a_gpu_probe_mirrors_a_streamed_apps_card() {
+    let probe = |operation: &str| {
+        let (helper, mut run) = dri_probe_request(operation);
+        run.devices = vec!["/dev/dri/renderD128".into()];
+        run.mknod_only_cards = vec!["/dev/dri/card0".into()];
+        (helper, run)
+    };
+    for (rootless, permissions) in [(false, "m"), (true, "rwm")] {
+        let engine = Engine::new();
+        if rootless {
+            engine.state.lock().unwrap().info = Some(rootless_info(&[]));
+        }
+        let client = engine.client();
+        let (helper, run) = probe(&format!("card-probe-{rootless}"));
+        let id = client.run_gpu_probe(helper, run).wait().unwrap();
+        let body = engine.state.lock().unwrap().body.clone().unwrap();
+        assert_eq!(
+            body["HostConfig"]["Devices"][1],
+            json!({"PathOnHost":"/dev/dri/card0","PathInContainer":"/dev/dri/card0","CgroupPermissions":permissions}),
+            "rootless={rootless}"
+        );
+        client.observe_gpu_probe(id.clone()).wait().unwrap();
+        client.cleanup_gpu_probe(id).wait().unwrap();
+    }
 }

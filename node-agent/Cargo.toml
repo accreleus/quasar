@@ -48,7 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 #
 # GStreamer floor: gstreamer-sys 0.25 requires gstreamer-1.0 >= 1.14 by default and
 # >= 1.20 with the `v1_20` feature enabled below. The vendored runtime is pinned at
-# 1.28.4 (docs/third-party-pins.md) and CI runs against 1.24, so do NOT enable a
+# 1.28.8 (docs/third-party-pins.md) and CI runs against 1.24, so do NOT enable a
 # `v1_26`/`v1_28`/`v1_30` feature here — it would raise the floor above CI's gst.
 #
 # Cargo.lock PIN: `kstring` is held at 2.0.2. gstreamer 0.25 depends on it (^2.0) and
@@ -106,14 +106,6 @@ base64 = "0.23"
 sha2 = "0.11"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 
-# Console-mode local audio: enable the `IEC958 Playback Switch` ALSA mixer
-# control before starting the local-audio pipeline. HDA codec state (incl.
-# this switch) resets on reboot/module reload and the host has no
-# alsactl-restore, so the agent must flip it on itself every session start
-# (see `session::audio::enable_iec958_playback_switches`). Uses alsa-lib,
-# already a runtime dependency of `alsasink`/`pulsesrc`.
-alsa = "0.12"
-
 [features]
 # ZC-02 N-A (full zero-copy NVENC): FFI-links libgstcuda-1.0 to create one GstCudaContext
 # and share it across the source + encode pipelines so the compositor's memory:CUDAMemory
@@ -139,6 +131,9 @@ criterion = "0.8"
 # #530: `#[tokio::test(start_paused = true)]` needs the `test-util` feature (not
 # part of `full`) — used by the select!-arm-disable regression tests in agent.rs.
 tokio = { version = "1", features = ["test-util"] }
+# A test peer's own DTLS certificate (`takeover_tests`): GStreamer generates one per
+# process and exposes no key, and the dev image has no `openssl` binary.
+rcgen = "0.13"
 
 [[bench]]
 name = "encode_metrics"

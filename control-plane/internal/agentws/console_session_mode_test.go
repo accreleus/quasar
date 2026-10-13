@@ -8,7 +8,7 @@ import (
 )
 
 // #422: an auto-started console launches at the physical display's mode, not
-// the app's 1920x1080@60, unless it streams with no configured mode.
+// the app's 1920x1080@60.
 func seedConsoleCapsFourK(t *testing.T, h *Handler, hostID string) {
 	t.Helper()
 	caps := console.EmptyCapabilities()
@@ -37,18 +37,20 @@ func TestConsoleAutoStartLocalOnlyFollowsPhysicalMode(t *testing.T) {
 		t.Fatalf("launch count = %d, want 1", got)
 	}
 	if got, want := ev.lastMode, [3]int32{3840, 2160, 60}; got != want {
-		t.Fatalf("launch mode = %v, want %v (Automatic follows weston's preferred mode)", got, want)
+		t.Fatalf("launch mode = %v, want %v (Automatic follows the preferred mode)", got, want)
 	}
 }
 
-func TestConsoleAutoStartStreamingKeepsAppDefaults(t *testing.T) {
+// Amendment 19: a default app that does not declare direct_display fails the
+// console_default_app readiness check and is never launched, and that is not a
+// launch failure either: nothing is tracked and no backoff is armed.
+func TestConsoleAutoStartSkipsAppThatCannotRunDirect(t *testing.T) {
 	h, pool, ev := selfHealHandler(t)
 	hostID := seedHost(t, pool)
 	cfg := map[string]any{
 		"enabled":               true,
 		"auto_start_on_display": true,
-		"stream":                true,
-		"default_app":           "00000000-0000-0000-0000-0000000000aa",
+		"default_app":           seedConsoleApp(t, pool, false),
 		"default_user":          "00000000-0000-0000-0000-0000000000bb",
 	}
 	if err := h.consoleStore.Upsert(context.Background(), hostID, cfg, nil); err != nil {
@@ -58,10 +60,17 @@ func TestConsoleAutoStartStreamingKeepsAppDefaults(t *testing.T) {
 
 	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-4"})
 
-	if got := ev.count(); got != 1 {
-		t.Fatalf("launch count = %d, want 1", got)
+	if got := ev.count(); got != 0 {
+		t.Fatalf("launch count = %d, want 0 (the default app cannot run direct)", got)
 	}
-	if got, want := ev.lastMode, [3]int32{0, 0, 0}; got != want {
-		t.Fatalf("launch mode = %v, want %v (streaming with no configured mode keeps the app defaults)", got, want)
+	h.consoleAuto.mu.Lock()
+	_, tracked := h.consoleAuto.sessions[hostID]
+	bo, backedOff := h.consoleAuto.backoff[hostID]
+	h.consoleAuto.mu.Unlock()
+	if tracked {
+		t.Fatal("no session may be tracked for an app that cannot run direct")
+	}
+	if backedOff && bo.consecutiveFailures != 0 {
+		t.Fatalf("a readiness refusal counted as %d launch failure(s)", bo.consecutiveFailures)
 	}
 }

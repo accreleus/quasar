@@ -576,6 +576,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		time.Duration(cfg.SessionGraceSecs)*time.Second)
 	log.Info("session stale-host sweep started",
 		"grace_secs", cfg.SessionGraceSecs, "booted_at", bootedAt.Format(time.RFC3339))
+	go coordinator.RunEntitlementSweep(janitorCtx)
 
 	authHandler := auth.NewHandler(authSvc, auditStore).
 		WithVersionPolicy(cfg.MinClientVersion, cfg.LatestClientVersion).
@@ -583,6 +584,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	crudHandler := crud.NewHandler(pool, auditStore)
 	crudHandler.SetRegistry(agentRegistry) // lets DELETE /v1/hosts/{id} check live connectivity
 	crudHandler.SetReadinessStaleSecs(int(cfg.ReadinessStaleSecs))
+	crudHandler.SetSessionRevoker(coordinator.StopUnentitledSessions)
 	sessionHandler := session.NewHandler(coordinator, sessionStore, auditStore).
 		WithPublicBaseURL(cfg.PublicBaseURL).
 		WithICEServers(cfg.ICEServers)
@@ -613,6 +615,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	agentHandler := agentws.NewHandler(pool, log, agentRegistry, coordinator, relayBus, cfgStore, consoleStore, idleBoot).
 		WithTrustedProxies(cfg.TrustedProxies).
 		WithAuditor(auditStore)
+	if cfg.ConsoleDisconnectGraceSet {
+		agentHandler.WithConsoleDisconnectGrace(cfg.ConsoleDisconnectGrace)
+	}
 	// CM-09 item 2: console re-eval hook, set after both exist. A plain func value
 	// because session must not import agentws.Handler, only its agentws.Events subset.
 	coordinator.ConsoleReeval = agentHandler.ConsoleSessionTerminated
@@ -749,18 +754,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		libraryHandler.SetArtwork(artworkSvc)
 	}
 
-	// jobs.interval_secs is seeded once from instance_settings.
-	// library_discovery_interval_minutes (design §8.2); after this boot an admin owns
-	// it by PATCH and that column is no longer read for the schedule.
-	// QUASAR_LIBRARY_SCAN_INTERVAL stays authoritative via EnvOverride.
-	libDiscoverySeedCtx, libDiscoverySeedCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	libDiscoverySeedMinutes, libDiscoverySeedErr := settingsStore.LibraryDiscoveryIntervalMinutes(libDiscoverySeedCtx)
-	libDiscoverySeedCancel()
-	if libDiscoverySeedErr != nil || libDiscoverySeedMinutes <= 0 {
-		// Fail-open to the documented default (360 min): this only seeds a new
-		// row's starting point, which an admin PATCH can fix.
-		libDiscoverySeedMinutes = 360
-	}
+	// The job's period is the resolved scan interval (IntervalSource), so Settings, Libraries,
+	// Scan interval and QUASAR_LIBRARY_SCAN_INTERVAL drive it with no second write. The seeded
+	// interval_secs below is never read for scheduling.
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          "library.discovery",
 		Name:        "Steam library discovery",
@@ -770,9 +766,12 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		Managed:     true,
 		Default: jobs.Schedule{
 			Kind:         jobs.KindInterval,
-			IntervalSecs: int32(libDiscoverySeedMinutes) * 60,
+			IntervalSecs: 360 * 60,
 		},
-		EnvOverride: "QUASAR_LIBRARY_SCAN_INTERVAL",
+		EnvOverride:       "QUASAR_LIBRARY_SCAN_INTERVAL",
+		IntervalSource:    libraryResolver.ScanInterval,
+		IntervalOwner:     "instance_settings.library_discovery_interval_minutes",
+		IntervalOwnerHint: "Settings, Libraries, Scan interval",
 		Run: func(ctx context.Context, rc jobs.RunContext) (jobs.Outcome, error) {
 			res, skip := libraryJanitor.RunOnce(ctx)
 			if skip != "" {

@@ -343,6 +343,45 @@ fn any_registered(names: &[String]) -> bool {
     names.iter().any(|n| gst::ElementFactory::find(n).is_some())
 }
 
+/// Loads the plugin behind each of `elements` that is registered and not yet loaded;
+/// returns the plugins it loaded. The registry scan runs no plugin init in this process,
+/// the first use does, and for `vulkan`, `nvcodec` and `va` that init opens the GPU
+/// driver stack. Callers pick a moment when no compositor of theirs is coming up: the
+/// agent while it holds no session, the runner ahead of its own source (#267). Hardening:
+/// it takes one Vulkan instance creation out of the first session. The #267 crash was a
+/// Vulkan loader race, fixed by the compositor pin (`docs/third-party-pins.md`), not by
+/// this. Soft: an unregistered element is skipped, a failed load warns.
+pub fn preload_encoder_plugins<S: AsRef<str>>(elements: &[S]) -> Vec<String> {
+    let mut loaded = Vec::new();
+    for element in elements.iter().map(AsRef::as_ref) {
+        let Some(factory) = gst::ElementFactory::find(element) else {
+            continue;
+        };
+        if factory.plugin().is_some_and(|p| p.is_loaded()) {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        match factory.load() {
+            Ok(factory) => {
+                let plugin = factory
+                    .plugin()
+                    .map_or_else(|| element.to_string(), |p| p.plugin_name().to_string());
+                tracing::info!(
+                    token = "encoder-plugin-preloaded",
+                    "GStreamer plugin {plugin} loaded for {element} in {} ms",
+                    started.elapsed().as_millis()
+                );
+                loaded.push(plugin);
+            }
+            Err(e) => tracing::warn!(
+                token = "encoder-plugin-preload-failed",
+                "could not load the GStreamer plugin for {element} ahead of a session: {e}"
+            ),
+        }
+    }
+    loaded
+}
+
 /// Keyframe interval in frames for a session at `fps`. The host `gop` setting is
 /// defined at the 60 fps REFERENCE (gop=60 ⇒ one keyframe/second); scaling keeps the
 /// cadence in TIME fps-invariant. Unscaled, 120 fps keyframes twice as often, and
@@ -611,12 +650,21 @@ pub(crate) fn plan_is_degraded(knobs: EncoderKnobs, plan: &[(Codec, CodecPlan)])
     })
 }
 
+/// True when an enabled codec is served by a vendor encoder instead of its Vulkan element.
+pub(crate) fn plan_has_vendor_fallback(knobs: EncoderKnobs, plan: &[(Codec, CodecPlan)]) -> bool {
+    plan.iter()
+        .any(|(codec, p)| knobs.allows(*codec) && matches!(p, CodecPlan::Fallback(_)))
+}
+
 /// The operator-facing startup line for a Vulkan-encoder host, plus
 /// [`plan_is_degraded`] — the caller logs at WARN rather than INFO when degraded.
 pub struct CodecPlanReport {
     /// e.g. `h264=vulkan (default), h265=fallback:nvcudah265enc (env), av1=disabled (env)`
     pub line: String,
     pub degraded: bool,
+    /// An enabled codec is served by the vendor encoder because its Vulkan element is
+    /// missing (it is still advertised).
+    pub vendor_fallback: bool,
 }
 
 /// What each codec resolves to on this Vulkan-encoder host and where its knob value
@@ -631,12 +679,17 @@ pub fn describe_codec_plan(knobs: EncoderKnobs) -> CodecPlanReport {
         }
     }
     let degraded = plan_is_degraded(knobs, &plan);
+    let vendor_fallback = plan_has_vendor_fallback(knobs, &plan);
     let line = plan
         .into_iter()
         .map(|(codec, plan)| format!("{}={plan} ({})", codec.as_str(), knobs.knob(codec).source()))
         .collect::<Vec<_>>()
         .join(", ");
-    CodecPlanReport { line, degraded }
+    CodecPlanReport {
+        line,
+        degraded,
+        vendor_fallback,
+    }
 }
 
 /// Guarded property-set/read helpers shared by the three hardware encoder builders.
@@ -1129,9 +1182,9 @@ mod tests {
     use super::{
         codec_plan_with, cpb_size_kbits, effective_encoder_with, effective_gop, encoder_candidates,
         nvenc_encoder_candidates, nvenc_h264_encoder_candidates, openh264_supports,
-        plan_is_degraded, required_source_ring_depth, va_device_element_prefix,
-        va_encoder_candidates, va_h264_encoder_candidates, vulkan_element, CodecKnob, CodecPlan,
-        EncoderKnobs, ResolvedEncoder,
+        plan_has_vendor_fallback, plan_is_degraded, required_source_ring_depth,
+        va_device_element_prefix, va_encoder_candidates, va_h264_encoder_candidates,
+        vulkan_element, CodecKnob, CodecPlan, EncoderKnobs, ResolvedEncoder,
     };
     use crate::session::{Codec, EncoderChoice};
 
@@ -1471,6 +1524,22 @@ mod tests {
             !plan_is_degraded(knobs, &codec_plan_with(knobs, "software", &host)),
             "an operator-disabled codec is the knob working, never a degraded image"
         );
+    }
+
+    // #308: an unavailable codec is not advertised; a fallback one still is, and only
+    // the latter is a vendor fallback.
+    #[test]
+    fn vendor_fallback_is_told_apart_from_an_unavailable_codec() {
+        let knobs = EncoderKnobs::default();
+        let amd_no_vulkan_av1 = registry(&["vulkanh264enc", "vulkanh265enc"]);
+        assert!(!plan_has_vendor_fallback(
+            knobs,
+            &codec_plan_with(knobs, "software", &amd_no_vulkan_av1)
+        ));
+        let amd_vah264 = registry(&["vah264enc", "vulkanh265enc"]);
+        let plan = codec_plan_with(knobs, "software", &amd_vah264);
+        assert_eq!(plan[0].1, CodecPlan::Fallback("vah264enc".into()));
+        assert!(plan_has_vendor_fallback(knobs, &plan));
     }
 
     // A knob left ON whose vulkan element the image lacks is a DEGRADED plan,

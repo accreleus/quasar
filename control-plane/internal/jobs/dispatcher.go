@@ -232,7 +232,11 @@ func (d *Dispatcher) materializeDue(ctx context.Context) {
 			// under a running process. Skip rather than guess.
 			continue
 		}
-		interval, locked, lockedBy := EffectiveInterval(j, def.EnvOverride, d.getenv)
+		interval, locked, lockedBy, err := ResolveInterval(ctx, j, def, d.getenv)
+		if err != nil {
+			d.log.Warn("job: could not resolve the interval, skipping", "job_id", j.ID, "err", err)
+			continue
+		}
 		if interval <= 0 {
 			// The documented kill-switch shape (QUASAR_LIBRARY_SCAN_INTERVAL=0):
 			// pinned off in the environment, so nothing is scheduled.
@@ -261,20 +265,24 @@ func (d *Dispatcher) materializeDue(ctx context.Context) {
 			targets = hosts
 		}
 		for _, target := range targets {
-			d.materializeTarget(ctx, j, target, interval, loc)
+			d.materializeTarget(ctx, j, target, interval, loc, def.IntervalSource != nil)
 		}
 	}
 }
 
-func (d *Dispatcher) materializeTarget(ctx context.Context, j Job, hostID string, interval time.Duration, loc *time.Location) {
-	_, open, err := d.store.OpenRun(ctx, j.ID, hostID)
+// materializeTarget creates the next run for one target. With realign (a job whose
+// interval comes from an IntervalSource) a pending scheduled run is re-dated to the
+// interval now in force instead of keeping the date the old one gave it.
+func (d *Dispatcher) materializeTarget(ctx context.Context, j Job, hostID string, interval time.Duration, loc *time.Location, realign bool) {
+	open, found, err := d.store.OpenRun(ctx, j.ID, hostID)
 	if err != nil {
 		d.log.Warn("job: could not read open run", "job_id", j.ID, "host_id", hostField(hostID), "err", err)
 		return
 	}
-	if open {
-		// A pending row IS the next run; a running row is this one. Nothing to
-		// materialize either way.
+	// A pending row IS the next run; a running row is this one. Nothing to
+	// materialize either way.
+	realign = realign && found && open.State == StatePending && open.Trigger == TriggerSchedule && open.Attempt == 1
+	if found && !realign {
 		return
 	}
 	last, hadRun, err := d.store.LastTerminalRun(ctx, j.ID, hostID)
@@ -299,6 +307,16 @@ func (d *Dispatcher) materializeTarget(ctx context.Context, j Job, hostID string
 	when, err := NextScheduledFor(now, lastFinished, j.Schedule, interval, loc)
 	if err != nil {
 		d.log.Warn("job: unsatisfiable run window, skipping", "job_id", j.ID, "err", err)
+		return
+	}
+	if realign {
+		// With no finished run to measure from (pruned), the pending run keeps its date.
+		if !hadRun {
+			return
+		}
+		if err := d.store.Reschedule(ctx, open.ID, when); err != nil {
+			d.log.Warn("job: could not realign pending run", "job_id", j.ID, "run_id", open.ID, "err", err)
+		}
 		return
 	}
 	run, m, err := d.store.Materialize(ctx, MaterializeParams{

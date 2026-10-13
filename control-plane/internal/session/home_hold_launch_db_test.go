@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/storage"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -202,5 +203,47 @@ func TestStuckHoldIsHomeConflictWithoutWaiting(t *testing.T) {
 				t.Fatal("a pending hold must never be persisted as a claim conflict")
 			}
 		})
+	}
+}
+
+// #477: console auto-start runs on the agent's read loop, the very path the
+// clearing proof arrives on, so it refuses a settling hold at once and names
+// it; the agent's cleanup proof re-runs auto-start once it has landed.
+func TestConsoleAutoStartDoesNotWaitOutASettlingHold(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 2)
+	appID := seedManagedApp(t, pool, `{"direct_display":true}`)
+	seedHome(t, pool, s.userID, appID, s.hostID)
+	store := NewStore(pool)
+	p := managedLaunchParams(s, appID)
+	p.PinHostID = s.hostID
+	ctx := context.Background()
+	first, err := store.ScheduleAndCreate(ctx, p)
+	must(t, err)
+	holdHomeFor(t, pool, s.userID, appID, first.ID)
+	_, err = store.Transition(ctx, first.ID, StateFailed, strptr("host_lost"), nil)
+	must(t, err)
+	withHomeHoldSettleWait(t, 30*time.Second)
+	coord := newTestCoordinator(t, store, newCapturingDispatcher(), testLogger(),
+		WithHomeProvider(storage.NewLocal(pool, testHomeRoot)))
+
+	start := time.Now()
+	_, err = coord.LaunchConsoleSession(ctx, s.hostID, s.userID, appID, "local_only", 1920, 1080, 60)
+	if !errors.Is(err, ErrConsoleHomeSettling) {
+		t.Fatalf("console launch over a settling hold = %v, want ErrConsoleHomeSettling", err)
+	}
+	if errors.Is(err, ErrHomeConflict) {
+		t.Fatal("a settling hold was reported as needing repair")
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Fatalf("console launch waited %v on the read loop that carries the proof", waited)
+	}
+	if got := claimState(t, pool, s.userID, appID); got == "conflict" {
+		t.Fatal("a pending hold must never be persisted as a claim conflict")
+	}
+
+	must(t, store.ClearQualifiedHomeHolds(ctx, s.hostID, first.ID))
+	if _, err := coord.LaunchConsoleSession(ctx, s.hostID, s.userID, appID, "local_only", 1920, 1080, 60); err != nil {
+		t.Fatalf("console relaunch after the proof: %v", err)
 	}
 }

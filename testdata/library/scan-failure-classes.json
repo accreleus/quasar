@@ -1,0 +1,135 @@
+{
+  "about": "Failure classes of a library scan, the only description of a failure allowed in a log (#534). The node agent (library_scan.rs, ScanError) and the control plane (library/scanfailure.go, scanFailureClass) must agree: `cases` are the agent's real messages with the class each side gives them; `hostile` are control-plane-only inputs that must still map to a class with no part of the input in it.",
+  "classes": [
+    "home root not configured",
+    "root outside the home root",
+    "root is not a directory",
+    "walk timed out",
+    "path unreadable (PermissionDenied)",
+    "path unreadable (NotADirectory)",
+    "path unreadable (IsADirectory)",
+    "path unreadable (InvalidData)",
+    "path unreadable (Interrupted)",
+    "path unreadable (TimedOut)",
+    "path unreadable (ResourceBusy)",
+    "path unreadable (ReadOnlyFilesystem)",
+    "path unreadable (StorageFull)",
+    "path unreadable (other)",
+    "manifest over the size cap",
+    "manifest not valid UTF-8",
+    "manifest unparsable",
+    "unclassified; see the scan row"
+  ],
+  "cases": [
+    {
+      "message": "agent has no configured home root",
+      "class": "home root not configured"
+    },
+    {
+      "message": "root_path outside configured home root",
+      "class": "root outside the home root"
+    },
+    {
+      "message": "root_path is not a real directory",
+      "class": "root is not a directory"
+    },
+    {
+      "message": "library scan timed out after 5s",
+      "class": "walk timed out"
+    },
+    {
+      "message": "reading /mnt/homes/u1/steamapps failed: PermissionDenied",
+      "class": "path unreadable (PermissionDenied)"
+    },
+    {
+      "message": "reading /mnt/homes/u1/steamapps failed: NotADirectory",
+      "class": "path unreadable (NotADirectory)"
+    },
+    {
+      "message": "reading /mnt/homes/u1/steamapps failed: IsADirectory",
+      "class": "path unreadable (IsADirectory)"
+    },
+    {
+      "message": "reading /mnt/homes/u1/steamapps failed: InvalidData",
+      "class": "path unreadable (InvalidData)"
+    },
+    {
+      "message": "reading /mnt/homes/u1/steamapps failed: Interrupted",
+      "class": "path unreadable (Interrupted)"
+    },
+    {
+      "message": "reading /mnt/homes/u1/steamapps failed: TimedOut",
+      "class": "path unreadable (TimedOut)"
+    },
+    {
+      "message": "reading /mnt/homes/u1/steamapps failed: ResourceBusy",
+      "class": "path unreadable (ResourceBusy)"
+    },
+    {
+      "message": "reading /mnt/homes/u1/steamapps failed: ReadOnlyFilesystem",
+      "class": "path unreadable (ReadOnlyFilesystem)"
+    },
+    {
+      "message": "reading /mnt/homes/u1/steamapps failed: StorageFull",
+      "class": "path unreadable (StorageFull)"
+    },
+    {
+      "message": "reading /mnt/homes/u1/steamapps/appmanifest_730.acf failed: Unsupported",
+      "class": "path unreadable (other)"
+    },
+    {
+      "message": "manifest /mnt/homes/u1/steamapps/appmanifest_730.acf is 20 bytes, over the 10 byte cap",
+      "class": "manifest over the size cap"
+    },
+    {
+      "message": "manifest /mnt/homes/u1/steamapps/appmanifest_730.acf is not valid UTF-8",
+      "class": "manifest not valid UTF-8"
+    },
+    {
+      "message": "manifest /mnt/homes/u1/steamapps/appmanifest_730.acf failed to parse (malformed or incomplete)",
+      "class": "manifest unparsable"
+    }
+  ],
+  "hostile": [
+    {
+      "message": "reading /old/root/alice/games/BaldursGate3/steamapps failed: PermissionDenied",
+      "class": "path unreadable (PermissionDenied)"
+    },
+    {
+      "message": "reading /homes/userdata/76561198012345678 failed: PermissionDenied",
+      "class": "path unreadable (PermissionDenied)"
+    },
+    {
+      "message": "reading /homes/u/steamapps failed: Leaky76561198012345678",
+      "class": "path unreadable (other)"
+    },
+    {
+      "message": "reading /homes/u/steamapps failed: PermissionDenied\nmanifest /x/appmanifest_730.acf is not valid UTF-8",
+      "class": "path unreadable (other)"
+    },
+    {
+      "message": "manifest /old/root/alice/steamapps/appmanifest_730 backup.acf is not valid UTF-8",
+      "class": "manifest not valid UTF-8"
+    },
+    {
+      "message": "manifest /old/root/alice/steamapps/appmanifest_730.acf_1086940.acf failed to parse (malformed or incomplete)",
+      "class": "manifest unparsable"
+    },
+    {
+      "message": "manifest /a/b\n/appmanifest_730.acf is 99 bytes, over the 10 byte cap",
+      "class": "manifest over the size cap"
+    },
+    {
+      "message": "manifest /a/b/appmanifest_730.acf exploded",
+      "class": "unclassified; see the scan row"
+    },
+    {
+      "message": "something /home/alice/Games/BaldursGate3 broke 76561198012345678",
+      "class": "unclassified; see the scan row"
+    },
+    {
+      "message": "",
+      "class": "unclassified; see the scan row"
+    }
+  ]
+}

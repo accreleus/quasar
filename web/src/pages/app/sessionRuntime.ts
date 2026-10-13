@@ -603,15 +603,19 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
   // session outright. Only the mint call is retried — a successful response
   // with a malformed envelope is a local bug, not a transient condition, and
   // stays a single, immediate failure (matches the pre-#128 behaviour).
+  /** Destroyed, or reconnection abandoned (including by a takeover): a late
+   *  mint or rebind result must be discarded, never acted on. */
+  const halted = (): boolean => destroyed || reconnectGaveUp;
+
   async function mintReplacementWithRetry(): Promise<void> {
     let elapsedBackoffMs = 0;
     for (let attempt = 0; ; attempt++) {
-      if (destroyed) return;
+      if (halted()) return;
       let res: Awaited<ReturnType<typeof deps.mintSignalingToken>>;
       try {
         res = await deps.mintSignalingToken(cfg.authToken, cfg.sessionId);
       } catch (err) {
-        if (destroyed) return;
+        if (halted()) return;
         const delay = Math.min(
           MINT_RETRY_BASE_DELAY_MS * 2 ** attempt,
           MINT_RETRY_MAX_DELAY_MS,
@@ -619,13 +623,13 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
         if (isTransientMintError(err) && elapsedBackoffMs + delay <= MINT_RETRY_BUDGET_MS) {
           elapsedBackoffMs += delay;
           await mintRetryWait(delay);
-          if (destroyed) return;
+          if (halted()) return;
           continue;
         }
         failReconnect(err);
         return;
       }
-      if (destroyed) return;
+      if (halted()) return;
       // apiFetch resolves a bodyless 2xx to undefined; a malformed reconnect
       // response is a failed reconnect, not a TypeError at the user.
       const signaling = res?.signaling;
@@ -654,7 +658,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
         signaling.url,
         signaling.token,
       ) ?? Promise.resolve<RebindOutcome>("terminal"));
-      if (destroyed) return;
+      if (halted()) return;
 
       // The recovery controller latches itself stopped on its terminal phase,
       // so a media failure that arrived while this rebind was in flight was
@@ -689,7 +693,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       }
       elapsedBackoffMs += delay;
       await mintRetryWait(delay);
-      if (destroyed) return;
+      if (halted()) return;
     }
   }
 
@@ -700,6 +704,10 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     // L6 — `superseded` must never reach the mint below; the controller has
     // already latched itself stopped, so this notification arrives once.
     if (next.phase === "superseded") {
+      // A mint already in flight must not replace the transport afterwards: this
+      // page has stopped, and the replacement would re-attach over the new owner.
+      reconnectGaveUp = true;
+      cancelMintRetryWait();
       if (!destroyed) cfg.callbacks.onSessionTakenOver();
       return;
     }

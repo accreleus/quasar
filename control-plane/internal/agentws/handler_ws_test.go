@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	stdlog "log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -114,7 +115,15 @@ func failedAgentRegister(t *testing.T, url string, headers map[string]string) {
 }
 
 func TestEnrollmentFailuresAreRateLimitedPreUpgradeAndIgnoreXFF(t *testing.T) {
-	_, url := websocketTestServer(t)
+	// The nil pool makes every failed enrollment panic in enrollHost; net/http recovers and
+	// closes the socket, which is the failure this test counts. Keep the stacks out of the log.
+	h := NewHandler(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil, nil)
+	t.Cleanup(h.Close)
+	srv := httptest.NewUnstartedServer(h)
+	srv.Config.ErrorLog = stdlog.New(io.Discard, "", 0)
+	srv.Start()
+	t.Cleanup(srv.Close)
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
 	for i := 0; i < enrollmentFailureLimit; i++ {
 		failedAgentRegister(t, url, map[string]string{"X-Forwarded-For": fmt.Sprintf("203.0.113.%d", i)})
 	}

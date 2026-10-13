@@ -70,8 +70,10 @@ another host; the user relaunches.
 
 ## Retention
 
-Session metrics keep about an hour and are pruned when the session ends. To keep a
-record of a problem, take a diagnostic bundle while it happens.
+While a session runs, its metrics keep a rolling hour; when it ends, the
+telemetry is frozen and kept 24 hours by default
+(`QUASAR_TELEMETRY_POSTMORTEM_RETENTION`). To keep a record of a problem, take
+a diagnostic bundle while it happens.
 
 ## The audit log
 

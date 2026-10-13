@@ -5,8 +5,6 @@ package console
 type ModeSource string
 
 const (
-	// ModeSourceConfigured: the admin's console_config.mode.
-	ModeSourceConfigured ModeSource = "configured"
 	// ModeSourceActive: the output's active mode (what its CRTC runs now).
 	ModeSourceActive ModeSource = "physical_active"
 	// ModeSourcePreferred: the output's DRM-preferred mode.
@@ -25,38 +23,18 @@ type SessionMode struct {
 	Source             ModeSource
 }
 
-// ResolveSessionMode picks the console session's initial mode (#422) from the
-// resolved console config and the host's last capability report. Pure; caps may
-// be empty.
+// ResolveSessionMode picks the console session's launch size and rate (#422),
+// recorded on the session row, from the resolved config and the host's last
+// capability report. Pure; caps may be empty. The desktop sets the real mode.
 //
-//   - A configured mode always wins, streaming or not.
-//   - With streaming off (a local-only console) the session follows the
-//     physical display, mirroring what the agent's weston lights:
-//     a pinned output_id runs at that output's active mode, else its preferred
-//     mode, else its first mode (the agent writes the same choice into weston's
-//     config, session/console.rs). Automatic writes no weston config, and weston's
-//     default for an unconfigured output is its preferred mode, so Automatic
-//     takes the first connected output's preferred mode, else its active mode,
-//     else its first mode.
-//   - With streaming on and no configured mode, the session keeps the app's
-//     defaults. This is the stream rule for now: an encoder is never started at
-//     a physical mode nobody chose (a 4K 240 Hz monitor would otherwise drive a
-//     4K 240 fps encode the browser cannot take). An admin who wants the
-//     physical mode on a streamed console configures it.
+//   - A pinned output_id runs at that output's active mode, else its preferred
+//     mode, else its first mode.
+//   - Automatic takes the first connected output's preferred mode, else its
+//     active mode, else its first mode.
+//   - Nothing to follow keeps the app's defaults.
 //
 // Fps is the refresh rate rounded to the nearest Hz (119879 mHz -> 120).
 func ResolveSessionMode(cfg ConsoleConfig, caps Capabilities) SessionMode {
-	if cfg.Mode != nil {
-		return SessionMode{
-			Width:  int32(cfg.Mode.Width),
-			Height: int32(cfg.Mode.Height),
-			FPS:    roundHz(cfg.Mode.RefreshMillihz),
-			Source: ModeSourceConfigured,
-		}
-	}
-	if cfg.Stream {
-		return SessionMode{Source: ModeSourceAppDefault}
-	}
 	if cfg.OutputID != nil {
 		out := outputByID(caps.Outputs, *cfg.OutputID)
 		if out == nil || !out.Connected {

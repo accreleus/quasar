@@ -104,6 +104,17 @@ describe("QuasarSession WebSocket close handling (#526)", () => {
     expect(states.map((s) => s.phase)).not.toContain("failed");
   });
 
+  // #527: DTLS failure ends recovery while the socket is still open; a takeover
+  // after that must still reach the runtime, once.
+  it("reports a takeover that arrives after recovery already failed", () => {
+    const { states, ws, pc } = startSession();
+    pc.connectionState = "failed";
+    (pc.onconnectionstatechange as () => void)();
+    ws.onclose!({ code: WS_CLOSE_TAKEN_OVER });
+
+    expect(states.map((s) => s.phase).filter((p) => p !== "connecting")).toEqual(["failed", "superseded"]);
+  });
+
   // #128: an ordinary close is a SIGNALLING fault, not a session fault. `failed`
   // is the media verdict and is what used to destroy a healthy peer connection.
   it("maps an ordinary close to `signaling-lost`, never `failed`", () => {

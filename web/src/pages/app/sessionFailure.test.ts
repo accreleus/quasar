@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { launchFailureFromSession, takenOverFailure, unreachableFailure } from "./sessionFailure";
+import {
+  accessRevokedFailure,
+  launchFailureFromSession,
+  settleFailure,
+  takenOverFailure,
+  unreachableFailure,
+} from "./sessionFailure";
 
 const s = (
   state: string,
@@ -133,6 +139,21 @@ describe("launchFailureFromSession", () => {
     expect(launchFailureFromSession(s(state))?.kind).toBe("ended");
   });
 
+  // #516 — the control plane's stop reason outranks the generic "ended" copy,
+  // which invites relaunching an app the library no longer lists.
+  it.each(["stopping", "stopped"])("says the access was removed when %s for a revoke", (state) => {
+    const v = launchFailureFromSession({ ...s(state, "stop requested"), stop_reason: "entitlement_revoked" });
+    expect(v?.kind).toBe("access_revoked");
+    expect(v?.title).toBe("Your access to this app was removed");
+    expect(v?.message).toBeTruthy();
+    expect(v?.detail).toBeUndefined();
+  });
+
+  it("keeps today's verdict for a stop with no served reason", () => {
+    expect(launchFailureFromSession({ ...s("stopped"), stop_reason: null })?.kind).toBe("ended");
+    expect(accessRevokedFailure({ stop_reason: null })).toBeNull();
+  });
+
   // #526 — a takeover is its own verdict, not "unreachable". The session is
   // still running; it is this VIEW that lost it, and the copy has to say so or
   // the user relaunches an app that is already up.
@@ -154,5 +175,36 @@ describe("launchFailureFromSession", () => {
       expect(v?.title).toBeTruthy();
       expect(v?.message).toBeTruthy();
     }
+  });
+});
+
+// #449 — "unreachable" is the page's guess; whatever the control plane says about
+// the session's end replaces it, and a server verdict is never replaced by a guess.
+describe("settleFailure", () => {
+  const appExit = launchFailureFromSession(s("failed", null, "exit 1", "app_exited_early", "log"))!;
+  const ended = launchFailureFromSession(s("stopped"))!;
+  const revoked = accessRevokedFailure({ stop_reason: "entitlement_revoked" })!;
+  const guess = unreachableFailure("session is not reconnectable");
+
+  it("takes the first verdict when there is none", () => {
+    expect(settleFailure(null, guess)).toBe(guess);
+    expect(settleFailure(null, appExit)).toBe(appExit);
+  });
+
+  it("lets any server verdict replace the guess, whichever arrives first", () => {
+    for (const v of [appExit, ended, takenOverFailure(), revoked]) expect(settleFailure(guess, v)).toBe(v);
+  });
+
+  it("never lets the guess replace a server verdict", () => {
+    for (const v of [appExit, ended, takenOverFailure(), revoked]) expect(settleFailure(v, guess)).toBe(v);
+  });
+
+  it("keeps the first server verdict, except that a revoked access beats the rest", () => {
+    expect(settleFailure(appExit, ended)).toBe(appExit);
+    expect(settleFailure(ended, appExit)).toBe(ended);
+    expect(settleFailure(takenOverFailure(), appExit).kind).toBe("taken_over");
+    expect(settleFailure(appExit, revoked)).toBe(revoked);
+    expect(settleFailure(takenOverFailure(), revoked)).toBe(revoked);
+    expect(settleFailure(revoked, appExit)).toBe(revoked);
   });
 });

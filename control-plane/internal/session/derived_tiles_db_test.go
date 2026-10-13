@@ -419,7 +419,7 @@ func TestConsoleDerivedLaunchRefusesBeforeClaimWithoutHome(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
 	s := seed(t, pool, 8)
-	parent := seedSteamApp(t, pool, `{"image":"steam:1"}`)
+	parent := seedSteamApp(t, pool, `{"image":"steam:1","direct_display":true}`)
 	hades := seedTile(t, pool, parent, "Hades", "1145360")
 	// NO home: nobody has launched Steam on this host.
 	ctx := context.Background()
@@ -466,7 +466,7 @@ func TestDerivedTileKeepsItsFlagsWhenTheParentIsNotManagedHome(t *testing.T) {
 		(name, default_vram_mb, default_encode_slots, default_width, default_height,
 		 default_fps, default_bitrate_kbps, runtime_spec, managed_home, kind, library_provider)
 		VALUES ('Steam (unmanaged)', 4096, 1, 1920, 1080, 60, 12000,
-		        '{"image":"steam:1","env":{"DISPLAY":":0"}}', false, 'launcher', 'steam')
+		        '{"image":"steam:1","env":{"DISPLAY":":0"},"direct_display":true}', false, 'launcher', 'steam')
 		RETURNING id::text`).Scan(&parent))
 	entitleAll(t, pool, parent)
 	hades := seedTile(t, pool, parent, "Hades", "1145360")

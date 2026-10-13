@@ -104,9 +104,10 @@ host's Settings show the new root as verified and an existing save loads.
 | `CONTROL_PLANE_URL` | Agent side. WebSocket URL of the control plane. |
 | `POSTGRES_PASSWORD` | Compose. Generated on a fresh install. |
 
-`redeploy.sh` generates missing secrets and never overwrites existing ones. Hosts
-join with a `QUASAR_ENROLLMENT` string from Add host; the old static
-`ENROLLMENT_TOKEN` is no longer accepted.
+`redeploy.sh` generates missing secrets and never overwrites existing ones.
+Hosts join with a `QUASAR_ENROLLMENT` string from Add host, or with
+`ENROLLMENT_TOKEN` set to a token minted there (the part of the string after
+its last `.`).
 
 ## Setup and identity
 
@@ -125,6 +126,7 @@ join with a `QUASAR_ENROLLMENT` string from Add host; the old static
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUASAR_SECRET_KEY` | unset | Base64 of 32 bytes. Encrypts credentials stored in the admin UI. **Back it up; it can't be recovered.** |
+| `QUASAR_SECRET_KEY_PREVIOUS` | unset | Comma-separated decrypt-only predecessor keys (`<version>:<base64>`). Rotate with `QUASAR_SECRET_KEY=2:<new-base64>` and keep the old key here as `1:<old-base64>`; rows written under it keep decrypting while new writes use the new one. |
 
 ## TLS and access
 
@@ -142,6 +144,8 @@ join with a `QUASAR_ENROLLMENT` string from Add host; the old static
 | `LISTEN_ADDR` | `:8080` | HTTP listener. |
 | `CONTROL_PORT` | `8080` | Compose. Host port for HTTP. |
 | `QUASAR_TLS_PORT` | `8443` | Compose. Host port for HTTPS. |
+| `QUASAR_COMPRESSION` | `true` | gzip compression of text responses. Set `false` only behind a compressing reverse proxy. |
+| `QUASAR_ACCESS_LOG` | `errors` | `off`, `errors` or `all`: which requests get one log line. `true`/`false` map to `all`/`off`. |
 | `CONTROL_PLANE_FINGERPRINT` | unset | Agent side. Manual certificate pin (SHA-256), overriding the one in `QUASAR_ENROLLMENT`. |
 | `QUASAR_ALLOW_PLAINTEXT_AGENT` | off | Agent side. `1` allows a `ws://` control-plane URL to a non-localhost address. |
 
@@ -150,6 +154,9 @@ join with a `QUASAR_ENROLLMENT` string from Add host; the old static
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUASAR_HOME_ROOT` | unset | Fallback managed-home root. Without any root, managed-home apps can't launch. `redeploy.sh` sets `/var/lib/quasar/homes`. |
+| `QUASAR_HOMES_GC` | `1` (on) | Agent. Sweep throwaway homes (`agent-` + 8 hex + `-` + 8 hex) past retention so the home root doesn't fill the disk. `0` disables; inert with no home root. |
+| `QUASAR_HOMES_GC_RETENTION_HOURS` | `72` | Hours a throwaway home must be idle before it's collectable. |
+| `QUASAR_HOMES_GC_DRY_RUN` | `0` (off) | `1` logs what would be deleted, removes nothing. |
 | `QUASAR_STORAGE_PROVIDER` | `auto` | `auto` or `local` (mount-path storage). `volume` is rejected. |
 | `QUASAR_ARTWORK_DIR` | `/var/lib/quasar-control/artwork` | Artwork cache. Needs a persistent volume. |
 | `QUASAR_ARTWORK_PROVIDER` | `steamgriddb` | `steamgriddb` or `none`. |
@@ -160,7 +167,7 @@ join with a `QUASAR_ENROLLMENT` string from Add host; the old static
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUASAR_ENCODER` | auto | AMD and NVIDIA use `vulkan`, Intel `va`, no GPU `openh264`. Set `va`, `nvenc`, `vulkan` or `openh264` to override. |
-| `QUASAR_RENDER_NODE` | unset | Pin a DRM render node. Prefer a `/dev/dri/by-path/` path. |
+| `QUASAR_RENDER_NODE` | `software` | Pin a DRM render node. Prefer a `/dev/dri/by-path/` path; leave `software` for the SW path. |
 | `QUASAR_NVIDIA_DRIVER_HOST_PATH` | automatic | Recovery override: the host directory already mounted at `/opt/quasar/nvidia-driver` in the agent. It doesn't create the mount. Custom stacks without container identity also need `QUASAR_PULSE_IMAGE`. Recreate the agent after changing it. |
 | `QUASAR_CUDA_DEVICE` | `0` | NVENC device index on a multi-GPU host. |
 | `QUASAR_ZEROCOPY` | off | Full zero-copy on the VA path. |
@@ -209,6 +216,7 @@ About fifteen more tuning settings exist; leave them unless you've measured a pr
 | `QUASAR_APP_PGID` | unset | Run apps as this group ID. |
 | `QUASAR_APP_PIDS_LIMIT` | `8192` | Process limit. |
 | `QUASAR_IDLE_TIMEOUT_SECS` | `120` | End idle sessions after this long. |
+| `QUASAR_CONSOLE_DISCONNECT_GRACE` | unset (never) | Control plane. Stop an auto-started console session once its display connector has been absent this long (a Go duration; `0` stops at once); unset never stops it. |
 
 ## Audio and microphone
 
@@ -221,9 +229,11 @@ About fifteen more tuning settings exist; leave them unless you've measured a pr
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_LIBRARY_SCAN_INTERVAL` | 360 minutes | Library discovery interval. `0` disables scheduled scans. |
+| `QUASAR_LIBRARY_SCAN_INTERVAL` | unset | Library discovery interval when set, as a Go duration (`360m`, `6h`); the admin setting wins when unset. `0` disables discovery entirely; a bare number fails startup. |
 | `QUASAR_LIBRARY_PROVIDERS` | `steam` | Allowed providers. |
 | `QUASAR_IMAGE_REGISTRY_HOSTS` | `ghcr.io` | Registries Quasar resolves images and artwork from. |
+| `QUASAR_IMAGE_CATALOG_REPO` | `accreleus/quasar-images` | `owner/name` of the GitHub repo app-image sync fetches the manifest from; point it at a fork or mirror. |
+| `QUASAR_IMAGE_CATALOG_PATH` | `quasar-manifest.json` | The manifest's path within that repo. |
 | `QUASAR_ARTWORK_MAX_BYTES` | `8388608` | Maximum artwork size (8 MiB). |
 
 ## Updates and releases

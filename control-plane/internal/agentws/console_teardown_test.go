@@ -3,6 +3,7 @@ package agentws
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/accreleus/quasar/control-plane/internal/console"
@@ -12,15 +13,25 @@ import (
 // liveness for the tracked session.
 type teardownEvents struct {
 	noopEvents
+	mu          sync.Mutex
 	active      bool
 	stopped     []string
 	stopReasons []string
 }
 
 func (e *teardownEvents) StopConsoleSession(_ context.Context, sessionID, reason string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.stopped = append(e.stopped, sessionID)
 	e.stopReasons = append(e.stopReasons, reason)
 	return nil
+}
+
+// reasons is the stop reasons so far, safe against a grace timer appending.
+func (e *teardownEvents) reasons() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.stopReasons...)
 }
 
 func (e *teardownEvents) ConsoleSessionActive(context.Context, string) bool { return e.active }

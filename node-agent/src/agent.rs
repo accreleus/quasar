@@ -1136,6 +1136,17 @@ fn detect_capacity_blocking() -> capacity::SystemCapacity {
     cap
 }
 
+/// Load the plugins behind `elements` (`SessionManager::encoders_to_preload`) off the
+/// runtime's workers.
+async fn preload_encoders(elements: Vec<String>) {
+    if !elements.is_empty() {
+        offload_probe(move || {
+            crate::session::pipeline::preload_encoder_plugins(&elements);
+        })
+        .await;
+    }
+}
+
 /// A restart marker is proved before registration. This uses fresh device
 /// inventory and a bounded media child in the new process; prior connection
 /// probe results are deliberately not reused as startup proof.
@@ -1144,7 +1155,7 @@ async fn verify_hardware_boot(settings: crate::session::settings::RuntimeSetting
         if settings.encoder != EncoderChoice::Openh264 {
             return false;
         }
-        let probed = offload_probe(move || probe_host_codecs(&settings)).await;
+        let probed = offload_probe(move || probe_host_codecs(&settings, false)).await;
         return probed.is_some_and(|report| report.codecs.iter().any(|codec| codec == "h264"));
     }
     let inventory = offload_probe(detect_capacity_blocking).await.gpus;
@@ -1205,22 +1216,44 @@ where
     probe(spec).await
 }
 
-/// Is a degraded vulkan codec plan the expected first-boot shape (driver volume still
-/// provisioning, so the Vulkan ICD is invisible to the registry scan) or an image
-/// defect? Pure so it is testable without the module's process-global state;
-/// `volume_current` is true once `nvidia_volume` has adopted a manifest.
-fn vulkan_plan_degradation_is_pending_driver_volume(
+/// Why a vulkan codec plan is degraded, which decides the log line.
+#[derive(Debug, PartialEq, Eq)]
+enum VulkanPlanDegradation {
+    /// NVIDIA host, driver volume still provisioning: the Vulkan ICD is invisible to
+    /// the registry scan and the agent self-restarts when provisioning finishes.
+    PendingDriverVolume,
+    /// No NVIDIA GPU, and an enabled codec has no Vulkan encoder on this host (the GPU
+    /// may not support it, or the image lacks the element): it is not advertised.
+    NoVulkanEncoder,
+    /// No NVIDIA GPU, and an enabled codec is served by the vendor encoder because its
+    /// Vulkan element is missing: possibly an image problem.
+    VendorFallback,
+    /// NVIDIA userspace is present or provisioning failed: an image defect.
+    ImageDefect,
+}
+
+/// Pure so it is testable without the module's process-global state; `volume_current`
+/// is true once `nvidia_volume` has adopted a manifest.
+fn classify_vulkan_plan_degradation(
+    nvidia_host: bool,
+    vendor_fallback: bool,
     volume_current: bool,
     status: &crate::nvidia_volume::Status,
-) -> bool {
-    if volume_current {
-        // Driver userspace is present, so a missing vulkan element is the image's
-        // fault, not a timing artifact.
-        return false;
+) -> VulkanPlanDegradation {
+    if !nvidia_host {
+        return if vendor_fallback {
+            VulkanPlanDegradation::VendorFallback
+        } else {
+            VulkanPlanDegradation::NoVulkanEncoder
+        };
     }
-    // `Failed` means provisioning already gave up: no restart is coming to fix this,
-    // so it earns the operator's attention rather than the quiet first-boot path.
-    !matches!(status, crate::nvidia_volume::Status::Failed(_))
+    // Driver userspace present: a missing vulkan element is the image's fault. `Failed`
+    // means provisioning gave up, so no restart is coming to fix it either.
+    if volume_current || matches!(status, crate::nvidia_volume::Status::Failed(_)) {
+        VulkanPlanDegradation::ImageDefect
+    } else {
+        VulkanPlanDegradation::PendingDriverVolume
+    }
 }
 
 /// Probe the host's codec set and per-codec throughput hint. See [`HostCodecReport`]
@@ -1230,6 +1263,7 @@ fn vulkan_plan_degradation_is_pending_driver_volume(
 /// keeping `hosts.codecs` equal to what sessions actually build.
 fn probe_host_codecs(
     settings: &crate::session::settings::RuntimeSettings,
+    nvidia_host: bool,
 ) -> Option<HostCodecReport> {
     let probe_cfg = SessionConfig::for_assignment_with(settings, StreamParams::default(), None);
     if let Err(e) = crate::session::ensure_gst_init(&probe_cfg) {
@@ -1262,7 +1296,9 @@ fn probe_host_codecs(
         // a mis-built image has to be loud at startup.
         let plan = crate::session::pipeline::describe_codec_plan(knobs);
         if plan.degraded {
-            if vulkan_plan_degradation_is_pending_driver_volume(
+            match classify_vulkan_plan_degradation(
+                nvidia_host,
+                plan.vendor_fallback,
                 crate::nvidia_volume::current().is_some(),
                 &crate::nvidia_volume::status(),
             ) {
@@ -1270,21 +1306,35 @@ fn probe_host_codecs(
                 // agent when it finishes and the second boot re-probes against a
                 // healthy ICD. A distinct token keeps dashboards keyed on
                 // `vulkan-codec-plan-degraded` free of this.
-                info!(
+                VulkanPlanDegradation::PendingDriverVolume => info!(
                     token = "vulkan-codec-plan-pending-driver-volume",
                     "vulkan codec plan: {} — expected on first boot: the NVIDIA driver volume is \
                      still provisioning (or has not started); the agent will self-restart once it \
                      completes and re-probe the codec plan",
                     plan.line
-                );
-            } else {
-                warn!(
+                ),
+                VulkanPlanDegradation::NoVulkanEncoder => info!(
+                    token = "vulkan-codec-plan-no-vulkan-encoder",
+                    "vulkan codec plan: {} — this host has no NVIDIA GPU, and at least one enabled \
+                     codec has no Vulkan encoder here (this GPU may not support it, or the image \
+                     lacks its element); a codec marked unavailable is not advertised",
+                    plan.line
+                ),
+                VulkanPlanDegradation::VendorFallback => warn!(
+                    token = "vulkan-codec-plan-vendor-fallback",
+                    "vulkan codec plan: {} — at least one enabled codec is served by the vendor \
+                     encoder (fallback:) because its Vulkan element is not registered; if this GPU \
+                     should encode it through Vulkan, check the image contract \
+                     (deploy/image-contract.json)",
+                    plan.line
+                ),
+                VulkanPlanDegradation::ImageDefect => warn!(
                     token = "vulkan-codec-plan-degraded",
                     "vulkan codec plan: {} — at least one ENABLED codec is not running on the vulkan \
                      encoder because its element is not registered on this image; check the image \
                      contract (deploy/image-contract.json)",
                     plan.line
-                );
+                ),
             }
         } else {
             info!("vulkan codec plan: {}", plan.line);
@@ -1647,7 +1697,8 @@ fn register_message(
         updater_present: install.updater_present,
         recovery_actor_version: owned
             .then(|| install.recovery_actor_version.clone())
-            .flatten(),
+            .flatten()
+            .filter(|v| crate::buildinfo::actor_version_shape(v)),
         recovery_actor_source_commit: owned
             .then(|| install.recovery_actor_source_commit.clone())
             .flatten(),
@@ -2110,9 +2161,8 @@ async fn connect_and_run(
         }
     }
     info!(
-        "console capabilities: {} connector(s), {} audio sink(s), {} input device(s)",
+        "console capabilities: {} connector(s), {} input device(s)",
         cap.console.connectors.len(),
-        cap.console.audio_sinks.len(),
         cap.console.input_devices.len()
     );
     let gpu_inventory = cap.gpus.clone();
@@ -2123,14 +2173,21 @@ async fn connect_and_run(
     let first_settings = sessions.mgr.runtime_settings.clone();
     // Probed once (the gst registry is process-stable) and reused in every capacity
     // re-send below.
+    let nvidia_host = cap.gpus.iter().any(|g| g.vendor == "nvidia");
     let host_codec_report = {
         let settings = first_settings.clone();
-        offload_probe(move || probe_host_codecs(&settings)).await
+        offload_probe(move || probe_host_codecs(&settings, nvidia_host)).await
     };
+    // Before the first capacity report, so before any assignment is handled.
+    preload_encoders(sessions.mgr.encoders_to_preload(
+        first_settings.encoder,
+        &gpu_inventory,
+        host_codec_report.is_some(),
+    ))
+    .await;
     // The host readiness check set: advisory only, reported and logged, never gating.
     // Every input is already paid for (the vendor read, the #375 lib32 probe, the
     // codec probe above), so nothing here re-probes or launches a container.
-    let nvidia_host = cap.gpus.iter().any(|g| g.vendor == "nvidia");
     let gpu_present = !cap.gpus.is_empty();
     let readiness_gpus = cap.gpus.clone();
     let readiness = {
@@ -2544,9 +2601,19 @@ async fn connect_and_run(
                             // host whose live encoder cannot produce it, which fails it.
                             if mgr.host_codecs_stale() {
                                 let settings = mgr.runtime_settings.clone();
-                                mgr.host_codec_report =
-                                    offload_probe(move || probe_host_codecs(&settings)).await;
+                                let nvidia_host =
+                                    mgr.gpu_inventory.iter().any(|g| g.vendor == "nvidia");
+                                mgr.host_codec_report = offload_probe(move || {
+                                    probe_host_codecs(&settings, nvidia_host)
+                                })
+                                .await;
                                 mgr.probed_encoder = Some(mgr.runtime_settings.encoder);
+                                preload_encoders(mgr.encoders_to_preload(
+                                    mgr.runtime_settings.encoder,
+                                    &mgr.gpu_inventory,
+                                    mgr.host_codec_report.is_some(),
+                                ))
+                                .await;
                                 info!(
                                     "effective encoder changed by config_update; re-probed codecs: {:?}",
                                     mgr.host_codec_report
@@ -2611,9 +2678,8 @@ async fn connect_and_run(
                     // A hotplug can change the GPU set a probe result depended on.
                     mgr.notify_probe_inputs();
                     info!(
-                        "console hotplug: {reason}; re-sending capacity ({} connector(s), {} audio sink(s), {} input device(s))",
+                        "console hotplug: {reason}; re-sending capacity ({} connector(s), {} input device(s))",
                         cap.console.connectors.len(),
-                        cap.console.audio_sinks.len(),
                         cap.console.input_devices.len()
                     );
                     // Reported-copy only — see `send_fresh_capacity`.
@@ -3117,8 +3183,7 @@ struct SessionManager {
     /// a stale cache misattributes a sample to the wrong physical GPU.
     vram_cache: Arc<VramCache>,
     /// CM-01: the host's console-mode config, latched from `config_update`
-    /// (agent-api.md). `None` until one is pushed — the runner then falls back to
-    /// `QUASAR_LOCAL_DISPLAY`.
+    /// (agent-api.md). `None` until one is pushed: console mode is off.
     console_config: Option<crate::messages::ConsoleConfig>,
     /// #175: home refs mounted by live sessions, shared with the GC reaper so it never
     /// reaps a store an active session uses. Updated on start/stop/swap.
@@ -3357,6 +3422,34 @@ impl SessionManager {
                 !self.pending.is_empty() || self.running.values().any(|h| !h.reached_running);
             handle.sessions_changed(live_gpus, launching);
         }
+    }
+
+    /// The encoder elements to load ahead of the next launch: what a session resolves to
+    /// host-wide and on each GPU, whose plan (#301) can fall back to another vendor's
+    /// plugin. Empty while a session or a warm-up is held, because a plugin's init
+    /// beside a live compositor is the overlap the preload exists to avoid; the runner
+    /// then loads it ahead of its own source. `registry` is false when GStreamer did
+    /// not initialise.
+    fn encoders_to_preload(
+        &self,
+        encoder: EncoderChoice,
+        gpus: &[crate::messages::GpuCapacity],
+        registry: bool,
+    ) -> Vec<String> {
+        if !registry
+            || !self.pending.is_empty()
+            || !self.running.is_empty()
+            || self.warmup_reserved()
+        {
+            return Vec::new();
+        }
+        let knobs = crate::session::pipeline::EncoderKnobs::from_env();
+        std::iter::once("software")
+            .chain(gpus.iter().map(gpu_render_node_for_plan))
+            .flat_map(|node| {
+                crate::session::pipeline::probe_codec_support(encoder, knobs, node).elements
+            })
+            .collect()
     }
 
     /// Is a warm-up currently holding an encode slot?
@@ -3690,6 +3783,17 @@ impl SessionManager {
                         return Some(ack(id, false, Some(error.to_string())));
                     }
                 };
+                if let Some(refusal) = crate::session::console_plan::topology_refusal(
+                    video_topology,
+                    container.as_ref().is_some_and(|c| c.direct_display),
+                ) {
+                    warn!(
+                        token = "session-assign-rejected",
+                        "session {session_id} assignment rejected: {refusal}"
+                    );
+                    self.note_session_count();
+                    return Some(ack(id, false, Some(refusal)));
+                }
                 let params = match stream_to_params(stream) {
                     Ok(p) => p,
                     Err(error) => {
@@ -3851,7 +3955,11 @@ impl SessionManager {
                     let runner = self.runner.clone();
                     let panic_tx = evt_tx.clone();
                     let panic_sid = session_id.clone();
-                    let thread = std::thread::spawn(move || {
+                    // Named: an unnamed thread keeps its creator's name, and a crash in
+                    // the runner then reads as a tokio worker's.
+                    let thread = std::thread::Builder::new()
+                        .name("quasar-session".into())
+                        .spawn(move || {
                         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
                                 if let Some(preparation) = preparation {
@@ -3919,7 +4027,9 @@ impl SessionManager {
                                 );
                             }
                         }
-                    });
+                    })
+                    // What `std::thread::spawn` does on failure.
+                    .expect("failed to spawn the session runner thread");
                     self.running.insert(
                         session_id.clone(),
                         RunningHandle {
@@ -4337,15 +4447,20 @@ impl SessionManager {
                 // Latch for the next session build. Absent ⇒ keep the current value.
                 if let Some(cc) = console_config {
                     info!(
-                        "console config updated: enabled={} connector={} compositor={} stream={} audio_output={:?}",
-                        cc.enabled, cc.connector, cc.compositor, cc.stream, cc.audio_output
+                        "console config updated: enabled={} output_id={:?} input_devices={} auto_start_on_display={} default_app={:?}",
+                        cc.enabled,
+                        cc.output_id,
+                        cc.input_devices,
+                        cc.auto_start_on_display,
+                        cc.default_app
                     );
                     // #411: the DDC power probe forks `ddcutil` per connected connector
                     // on the 2 s hotplug poll, and nothing consumes a reading unless
                     // console mode is on — latch it so `ddc` can short-circuit.
                     crate::ddc::set_console_enabled(cc.enabled);
-                    crate::session::console_audio::set_configured_output(
-                        cc.audio_output.as_deref(),
+                    crate::readiness::console::set_config(
+                        cc.output_id.clone(),
+                        cc.input_devices.clone(),
                     );
                     self.console_access.request(cc.enabled);
                     // The control plane's capacity-report diff is the primary stop path
@@ -4780,6 +4895,25 @@ impl SessionManager {
                     None,
                 )
             }
+            SessionEvent::Displaying(mode) => {
+                if let Some(handle) = self.running.get_mut(session_id) {
+                    handle.reached_running = true;
+                }
+                self.note_session_count();
+                let detail = match mode {
+                    Some(m) => format!(
+                        "displaying {}×{} @ {} Hz",
+                        m.width,
+                        m.height,
+                        m.refresh_hz()
+                    ),
+                    None => "displaying".to_string(),
+                };
+                ("running", Some(detail), None)
+            }
+            SessionEvent::NotDisplaying(why) => {
+                ("running", Some(format!("not displaying: {why}")), None)
+            }
             SessionEvent::Stopping => ("stopping", Some("tearing down".to_string()), None),
             // A clean stop never carries an `error_message`. `detail` carries a reason
             // on a peer disconnect, recorded as `state_detail`, so operators see why it
@@ -4881,6 +5015,7 @@ fn app_to_container(app: AppSpec, mounts: &MountPolicy) -> anyhow::Result<Option
         network: app.network,
         systempaths_unconfined: app.systempaths_unconfined,
         require_local_image: false,
+        direct_display: app.direct_display,
     }))
 }
 
@@ -6016,6 +6151,24 @@ mod tests {
             "absent, not null: {owned}"
         );
 
+        let owned_dev = register(&crate::buildinfo::InstallFacts {
+            install_mode: Some(crate::buildinfo::InstallMode::Owned),
+            updater_present: Some(true),
+            recovery_actor_version: Some("dev".into()),
+            recovery_actor_source_commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            seed_version: None,
+            engine: Default::default(),
+        });
+        assert_eq!(owned_dev["install_mode"], "owned");
+        assert!(
+            owned_dev.get("recovery_actor_version").is_none(),
+            "non-semver version should be filtered: {owned_dev}"
+        );
+        assert_eq!(
+            owned_dev["recovery_actor_source_commit"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
         let compose = register(&crate::buildinfo::InstallFacts {
             install_mode: Some(crate::buildinfo::InstallMode::Registry),
             updater_present: Some(true),
@@ -6380,52 +6533,80 @@ mod tests {
         }
     }
 
-    /// First boot: no volume adopted, provisioning not started or mid-flight. INFO
-    /// under `vulkan-codec-plan-pending-driver-volume`, not WARN.
+    /// NVIDIA first boot: no volume adopted, provisioning not started or mid-flight.
     #[test]
-    fn degraded_plan_is_pending_when_no_volume_adopted_and_not_yet_failed() {
+    fn degraded_plan_is_pending_on_nvidia_when_no_volume_adopted_and_not_yet_failed() {
         use crate::nvidia_volume::Status;
 
-        assert!(vulkan_plan_degradation_is_pending_driver_volume(
-            false,
-            &Status::Idle,
-        ));
-        assert!(vulkan_plan_degradation_is_pending_driver_volume(
-            false,
-            &Status::Provisioning {
-                phase: "downloading".to_string(),
-                percent: Some(42),
-            },
-        ));
+        for fallback in [false, true] {
+            assert_eq!(
+                classify_vulkan_plan_degradation(true, fallback, false, &Status::Idle),
+                VulkanPlanDegradation::PendingDriverVolume
+            );
+            assert_eq!(
+                classify_vulkan_plan_degradation(
+                    true,
+                    fallback,
+                    false,
+                    &Status::Provisioning {
+                        phase: "downloading".to_string(),
+                        percent: Some(42),
+                    },
+                ),
+                VulkanPlanDegradation::PendingDriverVolume
+            );
+        }
     }
 
-    /// Provisioning gave up: no restart is coming, so it stays WARN under the original
-    /// token even though no volume was ever adopted.
+    /// NVIDIA, provisioning gave up (no restart is coming) or a volume is adopted but a
+    /// vulkan element is still missing: an image defect, whatever the recorded status.
     #[test]
-    fn degraded_plan_is_not_pending_once_provisioning_has_failed() {
+    fn degraded_plan_on_nvidia_is_an_image_defect_once_failed_or_adopted() {
         use crate::nvidia_volume::Status;
 
-        assert!(!vulkan_plan_degradation_is_pending_driver_volume(
-            false,
-            &Status::Failed("network unreachable".to_string()),
-        ));
+        assert_eq!(
+            classify_vulkan_plan_degradation(
+                true,
+                false,
+                false,
+                &Status::Failed("network unreachable".to_string())
+            ),
+            VulkanPlanDegradation::ImageDefect
+        );
+        assert_eq!(
+            classify_vulkan_plan_degradation(
+                true,
+                false,
+                true,
+                &Status::Provisioned(nvvol_manifest())
+            ),
+            VulkanPlanDegradation::ImageDefect
+        );
+        assert_eq!(
+            classify_vulkan_plan_degradation(true, false, true, &Status::Idle),
+            VulkanPlanDegradation::ImageDefect
+        );
     }
 
-    /// Volume adopted but a codec's vulkan element still missing: an image defect, not
-    /// first-boot timing. NOT pending, whatever the recorded status.
+    /// #308: no NVIDIA GPU means no driver volume to wait for, whatever its status. A
+    /// codec served by the vendor encoder is the case that may be an image problem.
     #[test]
-    fn degraded_plan_is_not_pending_once_a_volume_is_adopted() {
+    fn degraded_plan_without_nvidia_gpu_is_never_blamed_on_the_driver_volume() {
         use crate::nvidia_volume::Status;
 
-        assert!(!vulkan_plan_degradation_is_pending_driver_volume(
-            true,
-            &Status::Provisioned(nvvol_manifest()),
-        ));
-        // Even a stale/odd status combination — volume presence wins.
-        assert!(!vulkan_plan_degradation_is_pending_driver_volume(
-            true,
-            &Status::Idle,
-        ));
+        for status in [
+            Status::Idle,
+            Status::Failed("network unreachable".to_string()),
+        ] {
+            assert_eq!(
+                classify_vulkan_plan_degradation(false, false, false, &status),
+                VulkanPlanDegradation::NoVulkanEncoder
+            );
+            assert_eq!(
+                classify_vulkan_plan_degradation(false, true, false, &status),
+                VulkanPlanDegradation::VendorFallback
+            );
+        }
     }
 
     /// #531: the defect was a poll that never yielded, so the assertion is on progress.
@@ -6475,7 +6656,7 @@ mod tests {
         assert_offloadable(crate::capacity::prewarm_nvidia_smi_rows);
 
         let settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
-        assert_offloadable(move || probe_host_codecs(&settings));
+        assert_offloadable(move || probe_host_codecs(&settings, false));
 
         let lib32 = String::new();
         assert_offloadable(move || {
@@ -7812,7 +7993,11 @@ mod tests {
             false,
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(4);
-        for topology in ["local_only", "dual_output"] {
+        // `dual_output` is retired: refused as a topology, whatever the access.
+        for (topology, refusal) in [
+            ("local_only", "without console access"),
+            ("dual_output", "dual_output is retired"),
+        ] {
             let msg = serde_json::json!({
                 "type": "session_assign", "id": "c1", "session_id": topology, "gpu_index": 0,
                 "stream": {"width": 1920, "height": 1080, "fps": 60,
@@ -7829,7 +8014,7 @@ mod tests {
                     ok: false,
                     error: Some(e),
                     ..
-                }) => assert!(e.contains("without console access"), "{topology}: {e}"),
+                }) => assert!(e.contains(refusal), "{topology}: {e}"),
                 other => panic!("{topology}: expected a refusal, got {other:?}"),
             }
         }
@@ -8705,6 +8890,56 @@ mod tests {
         assert!(
             matches!(event,Some((_,SessionEvent::Failed(message))) if message.contains("image preparation failed"))
         );
+    }
+
+    /// #267: an unnamed thread keeps its creator's kernel name, so a crash in the runner
+    /// read as a tokio worker's.
+    #[test]
+    fn the_session_runner_thread_has_a_name_of_its_own() {
+        let (name_tx, name_rx) = std::sync::mpsc::channel();
+        let name_tx = Mutex::new(name_tx);
+        let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
+            move |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {
+                let name = std::thread::current().name().map(str::to_string);
+                let _ = name_tx.lock().unwrap().send(name);
+            },
+        ));
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(8);
+        start_seam_session(&mut mgr, "named", &evt_tx);
+        assert_eq!(
+            name_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Some("quasar-session".to_string())
+        );
+    }
+
+    /// #267: a plugin's init must not run beside a live compositor, so nothing is
+    /// preloaded while a session is held, whatever the registry holds.
+    #[test]
+    fn no_encoder_is_preloaded_while_a_session_is_held() {
+        gstreamer::init().unwrap();
+        let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {},
+        ));
+        let idle = mgr.encoders_to_preload(EncoderChoice::Openh264, &[], true);
+        if gstreamer::ElementFactory::find("openh264enc").is_some() {
+            assert_eq!(
+                idle,
+                ["openh264enc"],
+                "an idle agent preloads what it would build"
+            );
+        }
+        assert!(
+            mgr.encoders_to_preload(EncoderChoice::Openh264, &[], false)
+                .is_empty(),
+            "no registry, nothing to resolve"
+        );
+
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(8);
+        start_seam_session(&mut mgr, "live", &evt_tx);
+        assert_eq!(mgr.running.len(), 1, "setup: one running session");
+        assert!(mgr
+            .encoders_to_preload(EncoderChoice::Openh264, &[], true)
+            .is_empty());
     }
 
     /// #128: a new connection must not disturb the sessions the agent carried

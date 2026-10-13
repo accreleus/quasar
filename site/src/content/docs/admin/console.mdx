@@ -1,18 +1,21 @@
 ---
 title: Console mode
-description: Show sessions on a screen plugged into the host, with local audio and input.
+description: Run a desktop on a screen plugged into the host, with its own sound and input.
 ---
 
+import { Aside } from '@astrojs/starlight/components';
 import Shot from '../../../components/Shot.astro';
 import admin_console from '../../../assets/shots/admin-console.png';
 
 Console mode shows games on a screen plugged into the host, like a games console
-under the television. A console session can also stream to a browser at the same
-time. Each host has its own page: **Admin ▸ Fleet ▸** the host **▸ Local console**.
+under the television. The console desktop drives the screen itself and picks its own
+resolution, refresh and sound output; a console session is not streamed. Streamed
+sessions keep running beside it. Each host has its own page: **Admin ▸ Fleet ▸** the
+host **▸ Local console**.
 
 <Shot
 	label="Local console"
-	sublabel="The console page of a host with console mode on: the physical output and its mode, the stream switches, and local audio through the desktop's PipeWire."
+	sublabel="The console page of a host with console mode on: the physical output, the input devices passed to the desktop, and what starts on its own."
 	src={admin_console}
 	alt="The Local console page for a host, with console mode on"
 />
@@ -21,22 +24,18 @@ time. Each host has its own page: **Admin ▸ Fleet ▸** the host **▸ Local c
 
 | Setting | What it does |
 | --- | --- |
-| **Physical output**, **Physical mode** | Which connector and timing to use. Both can stay automatic. |
-| **Also stream** | Off: local only, no encoder used. On: also streamed to a browser. |
-| **Stream audio** | With **Also stream**, the browser gets the sound too. |
-| **Local audio output** | **Auto**, a sink the host reported, or **Quiet**. See [Local audio](#local-audio). |
-| **Grab local input**, **Input devices** | Takes the host's keyboards, mice and controllers for the session. See [Local input](#local-input). |
+| **Physical output** | Which card and connector the console uses. The session starts when that connector has a monitor. **Automatic** uses any connected output. |
+| **Input devices** | Which of the host's keyboards, mice and controllers the desktop gets. See [Local input](#local-input). |
 | **Default app**, **Default user**, **Auto-start on display** | Launches that app as that user when a display comes on. See [Starting on its own](#starting-on-its-own). |
-| **Auto-connect controller** | With a list of input devices, also attaches any controller plugged in. Auto already takes every controller. |
 
-The right-hand column lists the host's connectors and modes, audio sinks and
-input devices.
+The desktop sets its own resolution, refresh and sound output, in its own settings.
+The right-hand column lists the host's connectors and modes, and its input devices.
 
 ## Turning it on
 
-Turning console mode on (or off) replaces the host's node agent with one that can
-reach the display, sound and monitor control. The page asks you to confirm,
-because this **ends the host's live sessions**.
+Turning console mode on (or off) replaces the host's node agent with one that holds
+the console terminal and can read the display and monitor control. The page asks you
+to confirm, because this **ends the host's live sessions**.
 
 - While it runs, the page reads **Applying** and new sessions on the host wait.
 - If the new agent is unhealthy, the old one is put back and the page shows the
@@ -51,19 +50,43 @@ instead.
 
 ## Rootful and rootless hosts
 
-Console mode works in every engine mode. Install the console rules from [Device
-rules](/quasar/install/device-rules/) first; on a rootless host this is required.
-They grant the display cards, sound devices, i2c buses (monitor power over DDC),
-this machine's keyboards, mice and controllers (so console mode can grab them;
-**the `quasar` group can then read what is typed on this keyboard**), and `tty8`.
+Console mode works the same in every engine mode. Install the console rules from
+[Device rules](/quasar/install/device-rules/) first; on a rootless host this is
+required. They grant the display cards, sound devices, i2c buses (monitor power over
+DDC), this machine's input devices and `tty8`.
 
-On a rootless host:
+<Aside type="caution" title="What console mode grants">
+The console session holds the screen and the raw input of the host. Its desktop is
+given the display card, every input device you allow (**the `quasar` group can read
+what is typed on this machine's keyboard**) and the sound device. The node agent holds
+none of these: it gets only `tty8`, read access to the display cards and the i2c
+buses, and no capability.
+</Aside>
 
-- **The display must be free.** If a desktop or login screen holds it, the attempt
+- **The display must be free.** If a desktop or login screen holds it, `console_card`
   fails and names what holds it. Stop the login screen on that output, or choose
   another output.
+- **Streamed games beside the console.** Whether one can take the screen depends
+  on the host; see [below](#streamed-sessions-beside-the-console).
+- **Rootless:** a device plugged in later works through the device rules alone. If
+  one doesn't, replug it after installing the rules.
 - **Devices are re-read** each time console mode is turned on and at every start.
   If a reboot renumbers the i2c buses, the agent is replaced to pick them up.
+
+## Streamed sessions beside the console
+
+A streamed game is given the display card so its GPU works, but where the engine
+allows, it can't open it.
+
+| Host | Can a streamed game take the screen? |
+| --- | --- |
+| Rootful Docker or Podman, AMD or Intel GPU | No. A console session started later still gets the screen. |
+| NVIDIA GPU, any engine | Yes, if it starts first. NVIDIA's container toolkit always gives it the card. |
+| Rootless Docker or Podman | Yes, if it starts first. A rootless engine can't restrict the card. |
+
+Where it can, start the console session first. `console_card` says which case your
+host is in, and names a streamed game that holds the screen: end that session. A host
+wrongly detected as NVIDIA gets the NVIDIA row; set `QUASAR_GPU_NVIDIA=0` on its agent.
 
 ## The console terminal
 
@@ -82,56 +105,43 @@ back when the session ends.
 To get the screen back by hand, put `tty8` back in text mode, then `chvt` to the
 terminal you want.
 
-## Local audio
+## Sound
 
-**Local audio output** lists what the host reported:
+The desktop plays through the host's sound device, which it is given; pick the output
+in its own settings. `console_sound` checks the host has one.
 
-- **Host PipeWire**: when the host has a Quasar-only PipeWire socket on a desktop
-  user's session ([`deploy/prepare-host.sh`](https://github.com/accreleus/quasar/blob/main/deploy/prepare-host.sh)
-  `--console-audio-user USER` sets one up; read it first), sound
-  plays through that user's PipeWire, beside the desktop's own sound. Raw devices are hidden while PipeWire answers.
-- **Sound device (ALSA)**: used when no PipeWire answers and the device is free.
-  Listed as `hw:CARD=<id>,DEV=<n>`; an older `hw:N,M` setting still works.
-- Otherwise the console is quiet, and the `console_audio` readiness check names
-  what holds the device.
-
-PipeWire output is newer and less tested than ALSA.
-
-Host preparation with `--console-audio-user USER` makes USER's pipewire-pulse open
-the socket:
-
-| USER is | What happens |
-| --- | --- |
-| Logged in, or lingering | Host preparation restarts their pipewire-pulse. |
-| Not logged in | The socket opens when they next log in. |
-
-After a reboot their pipewire-pulse starts with their session, so the socket is back
-without a step.
-
-It worked when `/run/quasar-console-audio/native` exists on the host and the
-`console_audio` check names PipeWire. If the check says the socket is missing, run
-host preparation again, or as root:
-`runuser -u USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u USER) systemctl --user restart pipewire-pulse.service`.
+Host preparation's `--console-audio-user` is retired: it is accepted and does nothing.
+Files an earlier run wrote for it are named when host preparation runs; nothing uses
+them.
 
 ## Local input
 
-**Grab local input** takes the host's keyboards and mice exclusively for the
-console session. **Input devices** picks what is passed in: by class, by device
-path, or none.
+**Input devices** picks what is passed in to the console desktop: by class, by
+device path, or none. **Auto** passes every input device.
 
-A device plugged in during a session is grabbed within about a second, and released
-when it is unplugged. With a list of device paths, a listed device is grabbed when it
-appears, and **Auto-connect controller** also grabs any controller that is plugged in.
+A device plugged in during a session reaches the desktop within about a second. With a
+list of device paths, a listed device is passed in when it appears.
 
 ## Starting on its own
 
 With **Auto-start on display** on and a **Default app** and **Default user** set,
 a display coming on launches that app as that user. The default user must have access to the app.
 
+**Default app** lists only apps that can drive the display themselves (their runtime
+spec declares `direct_display`) and are a desktop or a launcher — never a game, and
+never a Steam library tile, even one under a direct-capable launcher. If the saved
+default app cannot run direct or is a game, the page says so under it and console
+mode does not launch it; pick another app.
+
 Monitor power is read over DDC/CI. This needs the i2c buses (granted by
 the console device rules on rootless) and a monitor that answers DDC. Without them, every
 connected display counts as on. Set `QUASAR_CONSOLE_DDC=0` on the agent to turn
 the power reading off.
+
+A monitor switching off doesn't end the auto-started session: some monitors
+drop their DisplayPort link when powered off, indistinguishable from an unplug
+to the connector. To stop the session once that state has lasted a while, set
+`QUASAR_CONSOLE_DISCONNECT_GRACE` (a Go duration; `0` stops at once) on the control plane.
 
 ## Readiness
 
@@ -140,15 +150,18 @@ session.
 
 | Check | What it reports |
 | --- | --- |
-| `console_display` | Whether the agent has console access and the display is free. Names what holds it. |
-| `console_audio` | The audio route (PipeWire or a named device), or why none is usable. |
+| `console_card` | The console card can be passed in and nothing else holds the display. Names what holds it, and says whether streamed games here can take it. |
+| `console_input` | The allowed input devices exist and the `quasar` account can open them. |
+| `console_sound` | The sound device can be passed in. |
+| `console_terminal` | `tty8` can be held for the session. |
+| `console_udev` | The host's device database (`/run/udev/data`) can be passed in, so devices plugged in later reach the desktop. |
 | `console_ddc` | Whether monitor power can be read (`ddcutil`, a mapped i2c bus, a reading). |
+| `console_default_app` | Shown on the console page, not the host's list: whether the default app can run direct. A fail names the app and nothing is launched. |
 
 See [Readiness checks](/quasar/troubleshooting/readiness/) for fixes.
 
 ## Known limits
 
-- Not every monitor mode and refresh rate is offered yet.
 - With an NVIDIA GPU passed through to a virtual machine, the console picture can
   stay black. The virtual machine's own boot screen is black too, so the cause is in
   the hand-off of the card, not in Quasar. It has happened after the hypervisor used

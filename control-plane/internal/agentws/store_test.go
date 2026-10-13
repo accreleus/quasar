@@ -47,12 +47,33 @@ func testPool(t *testing.T) *pgxpool.Pool {
 		pool.Close()
 		t.Fatalf("seed the test enrollment token: %v", err)
 	}
+	// Production writes the boot row (StartRH05Boot) before admission; a fresh database has none
+	// until a test elsewhere happens to, and typed-agent registration fails without it.
+	if _, err := pool.Exec(ctx, `INSERT INTO rh05_control_boot(id,incarnation,started_at)
+		VALUES(true,gen_random_uuid(),now()) ON CONFLICT(id) DO NOTHING`); err != nil {
+		pool.Close()
+		t.Fatalf("seed the rh05 boot row: %v", err)
+	}
 	t.Cleanup(pool.Close)
 	return pool
 }
 
-// testEnrollmentToken is the minted token testPool seeds.
+// testEnrollmentToken is the minted token testPool seeds. It is unbound, so it only
+// enrolls new node names; re-enrolling an existing host takes boundEnrollmentToken.
 const testEnrollmentToken = "test-token"
+
+// boundEnrollmentToken seeds a practically unlimited token bound to nodeName.
+func boundEnrollmentToken(t *testing.T, pool *pgxpool.Pool, nodeName string) string {
+	t.Helper()
+	plaintext := "test-token-" + nodeName
+	sum := sha256.Sum256([]byte(plaintext))
+	if _, err := pool.Exec(context.Background(), `INSERT INTO host_enrollments (token_hash, created_by, node_name, max_uses, expires_at, note)
+		VALUES ($1, NULL, $2, 1000000, NULL, 'test fixture')
+		ON CONFLICT (token_hash) DO UPDATE SET used_count = 0, revoked_at = NULL`, hex.EncodeToString(sum[:]), nodeName); err != nil {
+		t.Fatalf("seed a bound enrollment token: %v", err)
+	}
+	return plaintext
+}
 
 func seedHost(t *testing.T, pool *pgxpool.Pool) string {
 	t.Helper()
@@ -629,7 +650,7 @@ func TestEnrollHostClearsPendingRestart(t *testing.T) {
 		t.Fatalf("seed gpu: %v", err)
 	}
 
-	if _, err := s.enrollHost(context.Background(), "enroll-host", "0.2.0", testEnrollmentToken); err != nil {
+	if _, err := s.enrollHost(context.Background(), "enroll-host", "0.2.0", boundEnrollmentToken(t, pool, "enroll-host")); err != nil {
 		t.Fatalf("enrollHost: %v", err)
 	}
 
@@ -925,7 +946,7 @@ func TestEnrollHostResetsRestartState(t *testing.T) {
 		t.Fatalf("seed restart history: %v", err)
 	}
 
-	if _, err := s.enrollHost(context.Background(), "re-enroll-host", "0.3.1", testEnrollmentToken); err != nil {
+	if _, err := s.enrollHost(context.Background(), "re-enroll-host", "0.3.1", boundEnrollmentToken(t, pool, "re-enroll-host")); err != nil {
 		t.Fatalf("re-enroll: %v", err)
 	}
 

@@ -1027,7 +1027,7 @@ export interface paths {
                 400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
-                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the request would create a library-provider app (non-empty library_provider) while library_discovery_enabled is false. Refused rather than created-then-suspended: discovery is a fail-closed, fleet-wide, privacy-relevant setting (it walks user homes), so an app create must not flip it as a side effect, and a 201 followed by a silent reconciler suspension reads as data loss. Enable library discovery in Settings first. Mirrors the existing 409 `provider_enabled` refusal on DELETE /v1/admin/images/{id}/install. */
+                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the request would create a library-provider app (non-empty library_provider) while library_discovery_enabled is false. Refused rather than created-then-suspended: discovery is a fail-closed, fleet-wide, privacy-relevant setting (it walks user homes), so an app create must not flip it as a side effect, and a 201 followed by a silent reconciler suspension reads as data loss. Enable library discovery in Settings first. Mirrors the existing 409 `provider_enabled` refusal on DELETE /v1/admin/images/{id}/install. Amendment 21: code `conflict` - another app already has this library_provider; one app per provider (edit that app instead). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -1157,7 +1157,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description In use by an active session (pre-existing), OR (Phase 3) the app has derived tiles and ?delete_derived=true was not sent - the body then carries `derived_tiles`, OR (RH05) deleting the canonical parent would cascade a pending-home hold. The RH05 refusal uses ErrorEnvelope code `conflict` and a fixed managed-home-pending message. */
+                /** @description In use by an active session (pre-existing), OR (Phase 3) the app has derived tiles and ?delete_derived=true was not sent - the body then carries `derived_tiles`, OR (RH05) deleting the canonical parent would cascade a pending-home hold. The RH05 refusal uses ErrorEnvelope code `conflict` and a fixed managed-home-pending message. Amendment 22: code `provider_enabled` - the app is its library_provider's only app and library discovery is enabled; disable library discovery in Settings first. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -1201,7 +1201,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the edit would set a non-empty library_provider, or enable a reconciler-suspended provider app, while library_discovery_enabled is false (either write would be immediately reverted by the reconciler). The ways out are deliberate: clear library_provider, keep the app disabled, or enable library discovery in Settings. See the POST /v1/apps 409 for the rationale. */
+                /** @description #534 AMENDMENT (2026-08-25), ADDITIVE: code `library_discovery_disabled` - the edit would set a non-empty library_provider, or enable a reconciler-suspended provider app, while library_discovery_enabled is false (either write would be immediately reverted by the reconciler). The ways out are deliberate: clear library_provider, keep the app disabled, or enable library discovery in Settings. See the POST /v1/apps 409 for the rationale. Amendment 21: code `conflict` - the edit sets a library_provider another app already has (an app that already has it may keep it). Code `provider_enabled` - the edit clears library_provider on that provider's only app while library discovery is enabled; disable library discovery in Settings first. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -1768,7 +1768,7 @@ export interface paths {
         put?: never;
         /**
          * Set the WHOLE entitlement state of a provider app (all|user|none), by provider name.
-         * @description #465, additive. REPLACES every entitlement row on the provider app named by {provider} with exactly what mode implies - "all" writes one ('all', NULL) row, "user" writes one ('user', <acting admin>) row (this endpoint has no subject_id field - it always means the caller), "none" writes none. This is a MODE control (a radio button expressing one of three exclusive states), not an incremental grant: calling it discards whatever was there, including a hand-picked set of per-user grants made through POST /v1/admin/apps/{id}/entitlements. Use that route instead for anything short of a full state replacement. Exists because the caller (the setup wizard / settings library step) knows the provider name but not the app id - EnsureProviderApp creates the app off the request thread, as a side effect of PATCH /v1/admin/settings library_discovery_enabled false->true, so there is no response carrying an app_id to key the generic entitlements routes against. 404 not_found when no app exists yet with this library_provider (not enabled yet, or the async create has not landed) - the wizard's answer is "try again shortly", not a retry loop hidden here. Written to the admin activity log as app.entitlement.set_mode.
+         * @description #465, additive. REPLACES every entitlement row on the provider app named by {provider} with exactly what mode implies - "all" writes one ('all', NULL) row, "user" writes one ('user', <acting admin>) row (this endpoint has no subject_id field - it always means the caller), "none" writes none. This is a MODE control (a radio button expressing one of three exclusive states), not an incremental grant: calling it discards whatever was there, including a hand-picked set of per-user grants made through POST /v1/admin/apps/{id}/entitlements. Use that route instead for anything short of a full state replacement. Exists because the caller (the setup wizard / settings library step) knows the provider name but not the app id - EnsureProviderApp creates the app off the request thread, as a side effect of PATCH /v1/admin/settings library_discovery_enabled false->true, so there is no response carrying an app_id to key the generic entitlements routes against. Amendment 21 (#490): when no app exists yet but an image_catalog entry claims the provider (not enabled yet, or the async create has not landed), the mode is stored and the answer is 202 with pending_entitlement_mode. EnsureProviderApp applies a stored mode in place of its 'all' grant when it creates the app, then deletes it; a later call replaces a stored mode, and a call that finds the app applies at once and drops any stored one. 404 not_found only when neither an app nor a catalog entry claims the provider. Written to the admin activity log as app.entitlement.set_mode (a stored mode has target_type library_provider and details.pending true).
          */
         post: {
             parameters: {
@@ -1793,6 +1793,15 @@ export interface paths {
                     };
                     content: {
                         "application/json": components["schemas"]["ProviderEntitlementModeEnvelope"];
+                    };
+                };
+                /** @description Amendment 21. No provider app yet; the mode is stored and applied when the app is created. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ProviderEntitlementModePendingEnvelope"];
                     };
                 };
                 400: components["responses"]["ValidationFailed"];
@@ -4143,7 +4152,7 @@ export interface paths {
         };
         /**
          * The platform-release view — installed, available, eligibility, faults (admin).
-         * @description One read that answers the whole admin Releases page: the installed identities (this control plane plus every host), the releases available on the configured channel newest first with their notes, the per-target eligibility FOR THE NEWEST LISTED RELEASE with a stable reason identifier, and the faults. READ-ONLY AND NEVER A TRIGGER: it applies nothing, writes nothing, and does not run detection - detection is a jobs-framework job and "Check now" is POST /v1/admin/jobs/{job_id}/run. A release below the installed control plane's schema_version is never listed on either channel (ADR 0002), and a stable release whose manifest is missing or invalid is not listed either (ADR 0001 - there is nothing to pin it by); the latter surfaces as a manifest_invalid fault.
+         * @description One read that answers the whole admin Releases page: the installed identities (this control plane plus every host), the releases available on the configured channel newest first with their notes, the per-target eligibility FOR THE NEWEST LISTED RELEASE with a stable reason identifier, and the faults. READ-ONLY AND NEVER A TRIGGER: it applies nothing, writes nothing, and does not run detection - detection is a jobs-framework job and "Check now" is POST /v1/admin/jobs/{job_id}/run. A release below the installed control plane's schema_version is never listed on either channel (ADR 0002), and a stable release whose manifest is missing or invalid is not listed either (ADR 0001 - there is nothing to pin it by); the latter is not a fault in this view - the platform.release_detect job counts it in its run summary (amendment 26).
          */
         get: {
             parameters: {
@@ -5187,7 +5196,7 @@ export interface paths {
             requestBody?: {
                 content: {
                     "application/json": {
-                        /** @description Bind the token to exactly this node_name. Absent = any node_name; empty string is 400 (it would silently mint an any-node token). */
+                        /** @description Bind the token to exactly this node_name. Absent = any new node_name (re-enrolling an existing host needs a bound token, amendment 20); empty string is 400 (it would silently mint an any-node token). */
                         node_name?: string;
                         /** @default 1 */
                         max_uses?: number;
@@ -7406,7 +7415,7 @@ export interface paths {
         head?: never;
         /**
          * Edit the admin-owned half of a job's schedule.
-         * @description The `jobs` row is split by OWNERSHIP: identity (name, description, plane, scope, managed) is code-owned and reconciled at every boot, and the schedule fields below are ADMIN-OWNED and never overwritten by that reconcile. An all-optional body, the repo's PATCH convention, so "absent" is distinguishable from "zero" — but an UNKNOWN key is rejected with 400 rather than silently ignored, because a typo'd field name accepted with a 200 is the "did my edit take effect" confusion this surface exists to end. `window_start` and `window_end` move together: both set, or both null to clear. 400 validation_failed = malformed body, unknown key, or a value of the wrong JSON type; 422 validation_failed = a well-formed value the schedule refuses (interval below 60s, interval_secs on a non-interval job, window_start == window_end, a window_days value outside 0..6, an unknown IANA zone, history_limit outside 1..500). 409 job_unmanaged = the job is not adopted and has no schedule to edit. 409 schedule_locked = an environment variable is authoritative over this job's interval; the edit is refused rather than silently accepted and overruled. Every accepted PATCH writes an admin_activity row (`job.update`, `{"keys": [...]}`).
+         * @description The `jobs` row is split by OWNERSHIP: identity (name, description, plane, scope, managed) is code-owned and reconciled at every boot, and the schedule fields below are ADMIN-OWNED and never overwritten by that reconcile. An all-optional body, the repo's PATCH convention, so "absent" is distinguishable from "zero" — but an UNKNOWN key is rejected with 400 rather than silently ignored, because a typo'd field name accepted with a 200 is the "did my edit take effect" confusion this surface exists to end. `window_start` and `window_end` move together: both set, or both null to clear. 400 validation_failed = malformed body, unknown key, or a value of the wrong JSON type; 422 validation_failed = a well-formed value the schedule refuses (interval below 60s, interval_secs on a non-interval job, window_start == window_end, a window_days value outside 0..6, an unknown IANA zone, history_limit outside 1..500; except `library.discovery`'s reported period resent unchanged: amendment 28). 409 job_unmanaged = the job is not adopted and has no schedule to edit. 409 schedule_locked = an environment variable is authoritative over this job's interval; the edit is refused rather than silently accepted and overruled. For `library.discovery` the period is the resolved Libraries interval, not admin-owned `interval_secs` (amendment 28): an `interval_secs` equal to the period the jobs read reports is accepted and not stored; a different value is 422 validation_failed below 60, otherwise 409 schedule_locked. Every accepted PATCH writes an admin_activity row (`job.update`, `{"keys": [...]}`).
          */
         patch: {
             parameters: {
@@ -7437,7 +7446,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description job_unmanaged (not adopted) or schedule_locked (an env var is authoritative). */
+                /** @description job_unmanaged (not adopted) or schedule_locked (an env var is authoritative, or `library.discovery`'s `interval_secs` of 60 or more differs from the period it reports: amendment 28). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -7719,7 +7728,7 @@ export interface paths {
         put?: never;
         /**
          * Node-agent internal: report one scan's result. (Not operator-facing.)
-         * @description Phase 4. Accepting an ok:true report runs the whole reconciliation IN ONE TRANSACTION with marking the scan reported - observations upserted and pruned, the suppression ladder evaluated ONCE, tiles created for what publishes, tiles disabled and their provider entitlements revoked for what suppresses, and the scanning user's provider entitlements granted and revoked. Tile creation and the first entitlement commit TOGETHER, because auto-publish means they are no longer separated by an admin decision and a tile that exists with no entitlement is a window in which a user sees nothing where the feature just claimed to add something. Scan-observability amendment (2026-08-01): reconciliation additionally BACKFILLS existing tiles of this parent whose enrichable fields are EMPTY (description, initially), from the same appdetails source the suppression rung uses - gated by the SAME appdetails switch (off = no backfill, no third-party call), bounded per scan, and FILL-BLANKS-ONLY: a non-empty field is never overwritten, so an operator's edit survives every scan. This is why "Scan now" is also the "fetch newly-supported data for what I already have" button - as enrichment capabilities grow, a re-scan tops up blanks instead of requiring tiles to be deleted and re-discovered. The per-scan outcome counts (including backfilled) are stored on the scan row (migration 0048) and surfaced via LibraryStatus.recent_scans. An ok:false report CHANGES NOTHING BUT ITS OWN ROW: revocation is driven by absence, and absence is exactly what a transient error looks like, so "reconcile whatever entries did arrive" would make a partial walk indistinguishable from an uninstall. 404 for a scan the calling host does not own - indistinguishable from one that does not exist, deliberately, since a 403 would confirm another host's scan id to anyone holding one valid node secret. 409 for a scan that is not currently claimed, which is where a duplicate report after a successful reconcile lands.
+         * @description Phase 4. Accepting an ok:true report runs the whole reconciliation IN ONE TRANSACTION with marking the scan reported - observations upserted, the ones this scan did not list marked missing and pruned only once a second scan agrees (amendment 25), the suppression ladder evaluated ONCE, tiles created for what publishes, tiles disabled and their provider entitlements revoked for what suppresses, and the scanning user's provider entitlements granted and revoked. Tile creation and the first entitlement commit TOGETHER, because auto-publish means they are no longer separated by an admin decision and a tile that exists with no entitlement is a window in which a user sees nothing where the feature just claimed to add something. Scan-observability amendment (2026-08-01): reconciliation additionally BACKFILLS existing tiles of this parent whose enrichable fields are EMPTY (description, initially), from the same appdetails source the suppression rung uses - gated by the SAME appdetails switch (off = no backfill, no third-party call), bounded per scan, and FILL-BLANKS-ONLY: a non-empty field is never overwritten, so an operator's edit survives every scan. This is why "Scan now" is also the "fetch newly-supported data for what I already have" button - as enrichment capabilities grow, a re-scan tops up blanks instead of requiring tiles to be deleted and re-discovered. The per-scan outcome counts (including backfilled) are stored on the scan row (migration 0048) and surfaced via LibraryStatus.recent_scans. An ok:false report CHANGES NOTHING BUT ITS OWN ROW: revocation is driven by absence, and absence is exactly what a transient error looks like, so "reconcile whatever entries did arrive" would make a partial walk indistinguishable from an uninstall. 404 for a scan the calling host does not own - indistinguishable from one that does not exist, deliberately, since a 403 would confirm another host's scan id to anyone holding one valid node secret. 409 for a scan that is not currently claimed, which is where a duplicate report after a successful reconcile lands.
          */
         post: {
             parameters: {
@@ -8412,6 +8421,8 @@ export interface components {
             };
             mounts?: string[];
             gpu?: boolean;
+            /** @description Amendment 19, optional (absent = false): the app's image can run as a console session, driving the host's display itself. Gates the console's default-app list and its console_default_app readiness check. */
+            direct_display?: boolean;
         };
         /** @description Admin create/edit shape. runtime_spec + resource defaults are admin/scheduler-internal. */
         AppWrite: {
@@ -8450,7 +8461,7 @@ export interface components {
             /** @description UI-P5, OPTIONAL. The LAUNCH PROFILE ids a user may pick for this app. On create, absent or [] = unrestricted = today's behaviour. On patch: absent = UNCHANGED, [] = clear the allow-list (back to unrestricted), a non-empty array = replace it wholesale (it is a set, not an ordered list). EXPLICIT null IS 400 validation_failed. The contract gives null no meaning for this field - unlike default_profile_id and runtime_preset_id, where null explicitly means "clear" - and [] already says clear. Reinterpreting null would silently act on a value the caller clearly meant something by, which is exactly the defect fixed for the runtime-preset list fields. Every id must name a USER-VISIBLE launch profile (400 otherwise). A RUNG id (a stream profile) is not a launch profile and is rejected - the two id spaces look alike and differ only in table. Duplicates are deduped rather than rejected. SETTING IT WHILE profile_policy IS 'force' IS 400: that policy pins the app's launch profile, so no allow-list can ever apply. Switching an app TO 'force' CLEARS any stored list, even when the patch says nothing about it, so nothing can silently reactivate on a later switch back to 'prefer'. Note crud.decodeJSON sets DisallowUnknownFields(), so sending this to a control plane without the UI-P5 amendment is a hard 400 - deploy the control plane before the client. */
             launchable_profile_ids?: string[];
             /**
-             * @description Steam library discovery Phase 2, OPTIONAL and CREATE-ONLY. "all" (the default, and what an absent field means) creates the app with an ('all', granted_by='admin') entitlement, so it is immediately visible to everyone - i.e. EXACTLY the pre-entitlements behaviour of creating an app. "none" creates it entitled to nobody, for an admin who wants to configure access before anyone sees it. THE DEFAULT IS THE WHOLE POINT: once GET /v1/apps is entitlement-filtered a new app is invisible until something entitles it, so without a default grant "I made an app and nobody can see it" becomes the default experience - the same failure as an un-backfilled migration, one app at a time. Any other value is 400 validation_failed, REJECTED rather than treated as "none", because a typo ("nome", "None") that quietly created an invisible app would be diagnosed as "the catalogue is broken". CREATE-ONLY: this property is declared on the shared AppWrite shape, but PATCH /v1/apps/{id} does NOT accept it - sending it there is 400 validation_failed (crud.decodeJSON sets DisallowUnknownFields()). It describes how an app is BORN, not a property it carries; after creation, access is edited through /v1/admin/apps/{id}/entitlements, which is the surface that produces an audit row and can express a per-user grant. NOT a stored column and never returned on any read shape - the resulting entitlement row is what persists.
+             * @description Steam library discovery Phase 2, OPTIONAL and CREATE-ONLY. Amendment 21: with library_provider set and entitle absent, a mode stored for that provider before its app existed replaces the default; an explicit entitle wins and drops it. "all" (the default, and what an absent field means) creates the app with an ('all', granted_by='admin') entitlement, so it is immediately visible to everyone - i.e. EXACTLY the pre-entitlements behaviour of creating an app. "none" creates it entitled to nobody, for an admin who wants to configure access before anyone sees it. THE DEFAULT IS THE WHOLE POINT: once GET /v1/apps is entitlement-filtered a new app is invisible until something entitles it, so without a default grant "I made an app and nobody can see it" becomes the default experience - the same failure as an un-backfilled migration, one app at a time. Any other value is 400 validation_failed, REJECTED rather than treated as "none", because a typo ("nome", "None") that quietly created an invisible app would be diagnosed as "the catalogue is broken". CREATE-ONLY: this property is declared on the shared AppWrite shape, but PATCH /v1/apps/{id} does NOT accept it - sending it there is 400 validation_failed (crud.decodeJSON sets DisallowUnknownFields()). It describes how an app is BORN, not a property it carries; after creation, access is edited through /v1/admin/apps/{id}/entitlements, which is the surface that produces an audit row and can express a per-user grant. NOT a stored column and never returned on any read shape - the resulting entitlement row is what persists.
              * @default all
              * @enum {string}
              */
@@ -8528,6 +8539,14 @@ export interface components {
                 items: components["schemas"]["Entitlement"][];
             };
         };
+        /** @description Amendment 21 (#490). The 202 body of POST .../library-providers/{provider}/entitlement-mode: the mode is stored and EnsureProviderApp grants it when it creates the provider app. There is no app_id or items yet. */
+        ProviderEntitlementModePendingEnvelope: {
+            pending_entitlement_mode: {
+                /** @description Echoes the path parameter, normalized. */
+                provider: string;
+                mode: components["schemas"]["ProviderEntitlementMode"];
+            };
+        };
         /** @description Valid pairs: reflink/seeded, copy/seeded, cold/{template_unavailable,source_disabled,host_templates_disabled,host_setting_invalid,policy_unavailable,storage_unavailable,clone_failed,policy_changed}, existing/existing_home. Only reflink proves reflink storage saving. */
         HomeSeedOutcome: {
             /** @enum {string} */
@@ -8551,6 +8570,11 @@ export interface components {
             failure_code: string | null;
             /** @description First-run-experience §S5. The app container's own captured log tail (newline-joined, oldest first, ~100 lines bound) - the only surviving copy, since app containers run --rm. Always serialized; null unless a failure warranted capturing it. Rendered preformatted, distinct from error_message's prose rendering. */
             app_log_tail: string | null;
+            /**
+             * @description Amendment 24 (#516). Why the control plane stopped the session, from a closed set: "entitlement_revoked" - the owner lost access to the app (amendment 23). Null for a live or failed session and for every other stop. Names no actor and no entitlement row. Always serialized; a client treats an unrecognised value as null.
+             * @enum {string|null}
+             */
+            stop_reason: "entitlement_revoked" | null;
             /** @description RH05 #344. Actual initial managed-home seeding outcome. Null means no authenticated evidence, including an older agent, a non-managed home or failure before provisioning. No inference of cold or storage savings from null. Swaps do not change the initial outcome. Never contains paths or free-form diagnostics. */
             home_seed: null | components["schemas"]["HomeSeedOutcome"];
             /** @description The profile the session was launched from; null for a legacy/tier/override launch. UI-P4: this is now a LAUNCH PROFILE id, i.e. the USER'S PICK. The rung it resolved to is stream_profile_id. */
@@ -9326,15 +9350,15 @@ export interface components {
             checks: components["schemas"]["PlatformPreflightCheck"][];
         };
         /**
-         * @description Everything wrong that is not an ineligibility. A CLOSED vocabulary. A fault gates nothing anywhere - it is reported so a wrong state is visible instead of silent. Prefixed (rather than a bare FaultKind) because "fault" already names an unrelated thing in this system - an NVIDIA Xid is a GPU fault. Full semantics: control-api.md §"Platform releases".
+         * @description Everything wrong that is not an ineligibility. A CLOSED vocabulary. A fault gates nothing anywhere - it is reported so a wrong state is visible instead of silent. Prefixed (rather than a bare FaultKind) because "fault" already names an unrelated thing in this system - an NVIDIA Xid is a GPU fault. Full semantics: control-api.md §"Platform releases". Amendment 26 (#157) removed a third value, manifest_invalid, that no control plane ever emitted.
          * @enum {string}
          */
-        PlatformReleaseFaultKind: "agent_ahead_of_control_plane" | "identity_unknown" | "manifest_invalid";
+        PlatformReleaseFaultKind: "agent_ahead_of_control_plane" | "identity_unknown";
         PlatformReleaseFault: {
             kind: components["schemas"]["PlatformReleaseFaultKind"];
             /**
              * Format: uuid
-             * @description Null on an instance-scoped fault (manifest_invalid).
+             * @description Null on an instance-scoped fault. Neither kind in the vocabulary is one today (amendment 26), so both name a host.
              */
             host_id: string | null;
             /** @description Null on an instance-scoped fault. */
@@ -9364,7 +9388,7 @@ export interface components {
                 control_plane: components["schemas"]["PlatformIdentity"];
                 hosts: components["schemas"]["PlatformHostIdentity"][];
             };
-            /** @description Releases the configured channel selects that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). On BETA, SemVer 2.0.0 precedence is inserted between those two keys, because that channel is the only one whose rows can arrive out of version order: 0.2.0-rc.2 orders below 0.2.0, which orders below 0.2.1-rc.1, whatever order they were built in. A release below the installed control plane's schema_version is NEVER here (ADR 0002); neither is one whose VERSION orders below an installed prerelease at the same schema_version, which is what stops a switch back to stable offering a downgrade (amendment 3); a prerelease is never here on stable; a stable or beta release with a missing or invalid manifest is never here either (it is a manifest_invalid fault instead). */
+            /** @description Releases the configured channel selects that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). On BETA, SemVer 2.0.0 precedence is inserted between those two keys, because that channel is the only one whose rows can arrive out of version order: 0.2.0-rc.2 orders below 0.2.0, which orders below 0.2.1-rc.1, whatever order they were built in. A release below the installed control plane's schema_version is NEVER here (ADR 0002); neither is one whose VERSION orders below an installed prerelease at the same schema_version, which is what stops a switch back to stable offering a downgrade (amendment 3); a prerelease is never here on stable; a stable or beta release with a missing or invalid manifest is never here either (and is not a fault - amendment 26). */
             available: components["schemas"]["PlatformRelease"][];
             /** @description One entry per target - the control plane, then every registered host - each evaluated against available[0]. When available is empty every target is eligible:false with reason "no_release". */
             targets: components["schemas"]["PlatformReleaseTarget"][];
@@ -9631,7 +9655,7 @@ export interface components {
         };
         /** @description The platform-release-manifest.json asset attached to a stable GitHub Release, produced by the publish workflow from the same tag as the notes so digests and prose cannot disagree. Served back VERBATIM as PlatformRelease.manifest. NOTE THE TWO VERSION FIELDS ARE DIFFERENT THINGS: format_version versions THIS DOCUMENT'S FORMAT, schema_version is the DATABASE MIGRATION VERSION the release's control-plane image embeds (ADR 0002's ordering key). Not to be confused with scripts/release/release-manifest.json in the quasar superproject, which is the release-preflight input set and a different file - the asset is named platform-release-manifest.json precisely so the two never collide. */
         ReleaseManifest: {
-            /** @description The manifest format's own version; 1 today. A consumer that meets a format_version it does not know treats the manifest as INVALID (a manifest_invalid fault, and the release is not listed) rather than guessing. */
+            /** @description The manifest format's own version; 1 today. A consumer that meets a format_version it does not know treats the manifest as INVALID (the release is not listed, and no fault is raised) rather than guessing. */
             format_version: number;
             /** @description Semver without a leading "v". */
             version: string;
@@ -9656,7 +9680,7 @@ export interface components {
         };
         /** @description AMENDMENT 14 (#353). The platform-release-manifest.v2.json asset of an RH06-era release: format 1's fields with their grammar and meaning unchanged, THREE components and a FLOOR. Published under its own asset name so a consumer that reads only the format-1 asset never sees it. Served back VERBATIM as PlatformRelease.manifest. A signed release carries platform-release-manifest.v2.json.sig, ADR 0003's document format over this asset's exact bytes. Full semantics: control-api.md §"RH06 — Quasar-owned installation", "Release manifest format 2". */
         ReleaseManifestV2: {
-            /** @description 2 for this shape. A consumer that meets a format_version it does not know treats the manifest as INVALID (manifest_invalid) rather than guessing. */
+            /** @description 2 for this shape. A consumer that meets a format_version it does not know treats the manifest as INVALID (the release is not listed) rather than guessing. */
             format_version: number;
             /** @description Semver without a leading "v". */
             version: string;
@@ -10542,50 +10566,35 @@ export interface components {
         ConfigCatalogResponse: {
             knobs: components["schemas"]["ConfigKnob"][];
         };
-        /** @description Per-host console-mode config. On PATCH the body is partial (any subset); on GET it is the resolved object. Off + local-only by default; audio_output has no default (null = quiet). */
+        /** @description Per-host console-mode config. On PATCH the body is partial (any subset); on GET it is the resolved object. Off by default. AMENDMENT 19 (#453/#455): trimmed to these six fields for direct display; connector, mode, compositor, audio_output, stream, stream_audio, grab, auto_connect_controller and fullscreen are retired. A PATCH naming any other key is 400 validation_failed; a stored key the server does not know is ignored on read. */
         ConsoleConfig: {
             enabled?: boolean;
-            /** @description 'auto' or a DRM connector name (DP-4, HDMI-A-1, …). */
-            connector?: string;
-            /** @description Card-scoped DRM output id from capabilities.outputs; null selects automatic output. */
+            /** @description The output pick: a card-scoped DRM output id from capabilities.outputs (card0:DP-4), meaning this card, launch when this connector has a monitor. null = automatic (any connected output). Need not be connected at write time. */
             output_id?: string | null;
-            /** @description Exact static physical mode for output_id; null selects the compositor preferred mode. */
-            mode?: null | components["schemas"]["ConsoleModeSelection"];
-            /** @enum {string} */
-            compositor?: "weston" | "cage";
-            /** @description Local host sink id ('auto' | alsa hw id | hdmi | motherboard | usb:*), or null = no local audio. */
-            audio_output?: string | null;
-            /** @description Also stream over WebRTC (dual-output). Default false = local-only. */
-            stream?: boolean;
-            stream_audio?: boolean;
-            /** @description 'auto' or an explicit list of /dev/input/event* paths. */
+            /** @description 'auto' (every input device) or an explicit list of /dev/input/event* paths: the allowlist passed into the console container. */
             input_devices?: "auto" | string[];
-            grab?: boolean;
             auto_start_on_display?: boolean;
-            auto_connect_controller?: boolean;
-            /** Format: uuid */
+            /**
+             * Format: uuid
+             * @description The app the console session runs. Offered from ConsoleConfigEnvelope.default_apps (runtime_spec.direct_display true); one without the key is accepted and reported by the console_default_app readiness check.
+             */
             default_app?: string | null;
             /**
              * Format: uuid
              * @description CM-06: owner of auto-started console sessions (users.id). Required when auto_start_on_display=true.
              */
             default_user?: string | null;
-            fullscreen?: boolean;
         };
         ConsoleModeSelection: {
             width: number;
             height: number;
             refresh_millihz: number;
         };
-        /** @description What the host can do in console mode (from agent-api capacity.console_capabilities). Empty arrays if unreported. */
+        /** @description What the host can do in console mode (from agent-api capacity.console_capabilities). Empty arrays if unreported. Amendment 19: audio_sinks is no longer served. */
         ConsoleCapabilities: {
             connectors: string[];
             /** @description Typed per-card DRM connector and mode inventory. Additive; absent from older agents. */
             outputs?: components["schemas"]["DrmOutputCapability"][];
-            audio_sinks: {
-                id: string;
-                label: string;
-            }[];
             input_devices: {
                 path: string;
                 label: string;
@@ -10633,6 +10642,15 @@ export interface components {
         ConsoleConfigEnvelope: {
             config: components["schemas"]["ConsoleConfig"];
             capabilities: components["schemas"]["ConsoleCapabilities"];
+            /** @description Amendment 19: the enabled apps whose effective runtime_spec (a derived tile's parent's) declares direct_display true, ordered by name. The only apps the console page offers as default_app. */
+            default_apps: components["schemas"]["ConsoleDefaultApp"][];
+            /** @description Amendment 19: console readiness checks the control plane evaluates (source operator, never blocks). Today exactly one, console_default_app: skip with no default app, pass when it declares direct_display, fail when it is gone, disabled or does not declare it. While not pass, no console session is auto-started. */
+            readiness: components["schemas"]["ReadinessCheck"][];
+        };
+        ConsoleDefaultApp: {
+            /** Format: uuid */
+            id: string;
+            name: string;
         };
         TraceSeriesPoint: {
             ts_unix_ms?: number;
@@ -11214,7 +11232,7 @@ export interface components {
             ok: boolean;
             /** @description Failure text on ok:false. Omitted when empty; truncated server-side. */
             error?: string;
-            /** @description Omitted when empty. An absent entries on an ok:true report is a legitimate "this user has nothing installed" and is reconciled as such - which is how an uninstall of the last game is recognised. */
+            /** @description Omitted when empty. An absent entries on an ok:true report is a legitimate "this user has nothing installed" and is reconciled as such when the home has no known library; over a known library it removes nothing (amendment 25). */
             entries?: components["schemas"]["LibraryScanReportEntry"][];
         };
         LibraryScanAccepted: {
@@ -11390,7 +11408,7 @@ export interface components {
         /** @description The ADMIN-OWNED half of a job (the code-owned half is its identity), resolved exactly as the dispatcher resolves it - one implementation of "which source won", so the viewer and the scheduler cannot disagree about when a job will next run. */
         JobSchedule: {
             kind: components["schemas"]["JobScheduleKind"];
-            /** @description Null for a non-interval schedule. Floor of 60 (a CHECK in the migration and a guard in the handler): a job that wants to run more often than once a minute is not a background job. When `locked` is true this is the ENVIRONMENT's value, not the stored one. */
+            /** @description Null for a non-interval schedule. Floor of 60 (a CHECK in the migration and a guard in the handler): a job that wants to run more often than once a minute is not a background job. When `locked` is true this is the ENVIRONMENT's value, not the stored one. For `library.discovery` it is always the resolved Libraries interval (`QUASAR_LIBRARY_SCAN_INTERVAL`, else `instance_settings.library_discovery_interval_minutes`), read at every scheduling decision; a period stored on the job is ignored (amendment 28). */
             interval_secs: number | null;
             /** @description HH:MM:SS in `timezone`, or null for 'any time'. Paired with window_end by a CHECK - both set or both null. */
             window_start: string | null;
@@ -11400,9 +11418,9 @@ export interface components {
             window_days: number[];
             /** @description IANA zone name; windows are evaluated in it. Intervals are NOT: an interval is a duration in absolute time and has no opinion about the clock on the wall, so a DST transition can shift when a windowed run lands but can never lengthen an interval. */
             timezone: string;
-            /** @description True when an environment variable is authoritative over this job's interval. The env override stays the winner (the pre-existing documented behaviour of knobs like QUASAR_LIBRARY_SCAN_INTERVAL); the API says so rather than silently accepting an edit the environment will overrule - a PATCH of interval_secs on a locked job is 409 schedule_locked. */
+            /** @description True when an environment variable is authoritative over this job's interval, and, for `library.discovery`, whenever its interval is not writable here, which is always (amendment 28). The env override stays the winner (the pre-existing documented behaviour of knobs like QUASAR_LIBRARY_SCAN_INTERVAL); the API says so rather than silently accepting an edit the environment will overrule - a PATCH of interval_secs on a locked job is 409 schedule_locked (for `library.discovery`, a value equal to the reported interval_secs is accepted and not stored, and a different one is 422 below 60, otherwise 409 schedule_locked: amendment 28). */
             locked: boolean;
-            /** @description The environment variable that is in force, e.g. "QUASAR_LIBRARY_SCAN_INTERVAL". Null when not locked. */
+            /** @description The authority that is in force: the environment variable, e.g. "QUASAR_LIBRARY_SCAN_INTERVAL", or, for `library.discovery` when that override is not set, `instance_settings.library_discovery_interval_minutes` (amendment 28). Null when not locked. */
             locked_by: string | null;
         };
         /** @description One record of one run - the shape that appears as `last_run` and as an item of the run-history page. */
@@ -11495,7 +11513,7 @@ export interface components {
         /** @description Every field optional; an absent field is left alone. AN UNKNOWN KEY IS A 400, not a silent ignore. `window_start` and `window_end` must be supplied together - both as strings to set a window, both as null to clear it - because a half-set window is a schedule nobody can reason about. */
         JobPatchRequest: {
             enabled?: boolean;
-            /** @description Only for an interval job (422 otherwise), never below 60, and refused with 409 schedule_locked while an env override is in force. */
+            /** @description Only for an interval job (422 otherwise), never below 60, and refused with 409 schedule_locked while an env override is in force. For `library.discovery` a value equal to the reported `interval_secs` is accepted and not stored, and a different one is 422 below 60, otherwise 409 schedule_locked (amendment 28). */
             interval_secs?: number;
             /** @description "HH:MM" or "HH:MM:SS", or null to clear (with window_end). 24:00 is rejected rather than normalized - a bound that means two things is the seed of a missed run nobody can explain. */
             window_start?: string | null;

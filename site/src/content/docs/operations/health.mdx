@@ -13,7 +13,7 @@ description: The containers Quasar runs, how to check each one, and the log line
 | `quasar-control-plane` | API, signaling, scheduler, web app. Runs migrations at startup. | Control plane |
 | `quasar-node-agent` | Runs sessions: compositor, encoder, app containers. Host networking. | GPU hosts |
 
-During a session you'll also see the app container and a PulseAudio sidecar.
+During a session you'll also see the app container and an audio sidecar (PipeWire).
 During an update, a stopped `quasar-node-agent.kept` may briefly appear: the old
 agent, kept until the new one is verified.
 

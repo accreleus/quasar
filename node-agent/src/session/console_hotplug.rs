@@ -7,7 +7,7 @@
 //!
 //! Polling, not a `udev` netlink monitor: `udev` isn't a crate dependency and a
 //! hotplug event isn't latency-sensitive, so a dedicated thread re-reads the same
-//! sysfs/procfs sources `capacity::detect_console_capabilities` uses every
+//! sysfs and `/dev` sources `capacity::detect_console_capabilities` uses every
 //! [`POLL_INTERVAL`] and diffs the snapshot.
 //!
 //! Debounce: a change must repeat on two consecutive polls before it fires — since
@@ -167,13 +167,6 @@ fn describe_change(before: &ConsoleCapabilities, after: &ConsoleCapabilities) ->
             "input devices changed {} -> {}",
             before.input_devices.len(),
             after.input_devices.len()
-        ));
-    }
-    if before.audio_sinks.len() != after.audio_sinks.len() {
-        parts.push(format!(
-            "audio sinks changed {} -> {}",
-            before.audio_sinks.len(),
-            after.audio_sinks.len()
         ));
     }
     if parts.is_empty() {

@@ -290,6 +290,8 @@ fn inputs(vendor: Option<GpuVendor>) -> Inputs {
             logind: false,
             console_audio: false,
             console_vt: false,
+            udev_data: None,
+            host_sound: None,
             fuse: false,
             dri: vendor.is_some(),
             uinput: true,
@@ -426,7 +428,7 @@ const ALLOWED_CONTROL_PLANE: &[(&str, &str, &str)] = &[
     ("+bind", "quasar-control-plane-secrets:/run/quasar-secrets:ro", "the control plane's per-service secrets volume, read-only (D5)"),
     ("-env", "QUASAR_WEB_ROOT", "the published control-plane image sets it (Dockerfile.control.prod)"),
     ("-key", "depends_on", "Compose-only start ordering; the recovery actor waits for Postgres to be healthy instead"),
-    ("-key", "healthcheck", "the published control-plane image carries the same healthcheck (Dockerfile.control.prod)"),
+    ("-key", "healthcheck", "revision 1 leaves it to the image's (Dockerfile.control.prod); revision 3 carries Compose's (the_control_planes_own_healthcheck_is_the_compose_definitions)"),
     ("-env", "BOOTSTRAP_ADMIN_EMAIL", "the first admin claims the instance with the per-boot setup token instead"),
     ("-env", "BOOTSTRAP_ADMIN_USERNAME", "the first admin claims the instance with the per-boot setup token instead"),
     ("-env", "BOOTSTRAP_ADMIN_PASSWORD", "the first admin claims the instance with the per-boot setup token instead"),
@@ -460,10 +462,9 @@ const COMPOSE_ONLY_KNOBS: &[&str] = &[
     "QUASAR_IMAGE_REGISTRY_HOSTS",
 ];
 
-#[test]
-fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_differences() {
+/// A combined machine's control plane at `revision`, and the inputs it was rendered from.
+fn control_plane_at(revision: u32) -> (Inputs, ContainerSpec) {
     use quasar_recovery::recipe::{ControlInputs, DatabaseInputs};
-    let base = deploy("docker-compose.yml");
     let mut inputs = inputs(Some(GpuVendor::Amd));
     inputs.control = Some(ControlInputs {
         unknown: Default::default(),
@@ -484,6 +485,21 @@ fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_d
             secrets::LOCAL_ENROLLMENT.to_string(),
         ]),
     };
+    let spec = render(
+        Role::ControlPlane,
+        revision,
+        &inputs,
+        &ImageRef::parse(CONTROL_IMAGE).unwrap(),
+        &secrets,
+    )
+    .unwrap();
+    (inputs, spec)
+}
+
+#[test]
+fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_differences() {
+    let base = deploy("docker-compose.yml");
+    let (inputs, spec) = control_plane_at(1);
     let dotenv = BTreeMap::from([
         ("QUASAR_CONTROL_IMAGE", CONTROL_IMAGE.to_string()),
         ("POSTGRES_PASSWORD", "from-the-env-file".to_string()),
@@ -495,14 +511,6 @@ fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_d
     compose.network_mode = compose
         .network_mode
         .or(Some(names::PLATFORM_NETWORK.into()));
-    let spec = render(
-        Role::ControlPlane,
-        1,
-        &inputs,
-        &ImageRef::parse(CONTROL_IMAGE).unwrap(),
-        &secrets,
-    )
-    .unwrap();
     let rendered = spec_shape(&spec);
     let found = differences(&compose, &rendered);
     let mut allowed: BTreeSet<(String, String)> = ALLOWED_CONTROL_PLANE
@@ -521,6 +529,44 @@ fn the_rendered_control_plane_matches_the_compose_definition_except_the_listed_d
     assert!(
         stale.is_empty(),
         "listed control-plane differences that no longer occur: {stale:?}"
+    );
+}
+
+/// Revision 3's healthcheck is the Compose definition's, in exec form: the image contract
+/// pins `curl`, not a shell.
+#[test]
+fn the_control_planes_own_healthcheck_is_the_compose_definitions() {
+    let (_, spec) = control_plane_at(3);
+    let check = spec.healthcheck.expect("revision 3 carries a healthcheck");
+    let compose = &deploy("docker-compose.yml")["services"]["quasar-control-plane"]["healthcheck"];
+    let seconds = |key: &str| -> u64 {
+        let value = compose[key].as_str().unwrap();
+        value
+            .strip_suffix('s')
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{key}: {value}"))
+    };
+    assert_eq!(check.test[0], "CMD");
+    assert_eq!(
+        strings(&compose["test"], &BTreeMap::new()),
+        [
+            "CMD-SHELL".to_string(),
+            format!("{} || exit 1", check.test[1..].join(" "))
+        ]
+    );
+    assert_eq!(
+        (
+            check.interval_s,
+            check.timeout_s,
+            check.start_period_s,
+            u64::from(check.retries)
+        ),
+        (
+            seconds("interval"),
+            seconds("timeout"),
+            seconds("start_period"),
+            compose["retries"].as_u64().unwrap()
+        )
     );
 }
 
@@ -577,25 +623,24 @@ fn the_rendered_node_agent_matches_the_compose_definitions_except_the_listed_dif
     );
 }
 
+/// The node-agent recipe revision the console overlay is compared with: the one this tree's
+/// agent image declares.
+const CONSOLE_REVISION: u32 = 4;
+
 /// `(kind, item, reason)`: how the console additions (RH-07 #395) differ from what
 /// `deploy/overlays/docker-compose.console.yml` adds to the Compose service. `-`: the
 /// overlay adds it and the recipe does not; `+`: the reverse.
 const ALLOWED_CONSOLE: &[(&str, &str, &str)] = &[
     (
-        "-rule",
-        "c 116:* rmw",
-        "ALSA nodes arrive with the /dev/snd bind and nothing creates one, so no `m`",
-    ),
-    ("+rule", "c 116:* rw", "the same ALSA access without `m`"),
-    (
-        "-rule",
-        "c 226:* rmw",
-        "revision 3 maps /dev/dri as a device, which already grants its DRM nodes",
-    ),
-    (
         "+env",
         "QUASAR_CONSOLE_ACCESS=1",
         "how the agent tells that its container carries the console additions",
+    ),
+    (
+        "+env",
+        "QUASAR_HOST_SOUND=1",
+        "the overlay sets no sound fact: a Compose agent sees the host's /dev/snd through the \
+         base file's /dev:/host/dev bind; an owned agent has no host /dev, so the actor tells it",
     ),
 ];
 
@@ -627,8 +672,9 @@ fn delta(without: &Shape, with: &Shape) -> BTreeSet<(String, String)> {
 }
 
 /// The console additions compared as additions: the overlay's to the Compose service, the
-/// recipe's to revision 3 without console mode. Revision 3's own differences from Compose
-/// (RH-07 #402) are not the console's, so the base shapes are not compared here.
+/// recipe's to the current revision (4) without console mode. Revision 3's own
+/// differences from Compose (RH-07 #402) are not the console's, so the base shapes are not
+/// compared here.
 #[test]
 fn the_console_additions_match_the_console_overlay_except_the_listed_differences() {
     let base = deploy("docker-compose.yml");
@@ -647,10 +693,13 @@ fn the_console_additions_match_the_console_overlay_except_the_listed_differences
         let plain = inputs(vendor);
         let mut on = plain.clone();
         on.console = true;
-        // The overlay grants sound and the console VT unconditionally; the recipe only on a
-        // host that has them.
+        // The overlay grants the console VT and says the host has udev's database
+        // unconditionally; the recipe only on a host that has them.
         on.devices.sound = true;
+        // What the actor writes when console mode is turned on (revision 4).
+        on.devices.host_sound = Some(true);
         on.devices.console_vt = true;
+        on.devices.udev_data = Some(true);
         let mut files = vec![base.clone()];
         if vendor == Some(GpuVendor::Nvidia) {
             files.push(nvidia.clone());
@@ -660,8 +709,10 @@ fn the_console_additions_match_the_console_overlay_except_the_listed_differences
         let compose_console = compose_shape(&files, &dotenv(&on));
         let overlay = delta(&compose_plain, &compose_console);
         let recipe = delta(
-            &spec_shape(&render(Role::NodeAgent, 3, &plain, &image, &secrets).unwrap()),
-            &spec_shape(&render(Role::NodeAgent, 3, &on, &image, &secrets).unwrap()),
+            &spec_shape(
+                &render(Role::NodeAgent, CONSOLE_REVISION, &plain, &image, &secrets).unwrap(),
+            ),
+            &spec_shape(&render(Role::NodeAgent, CONSOLE_REVISION, &on, &image, &secrets).unwrap()),
         );
         let mut found = BTreeSet::new();
         for (kind, item) in overlay.difference(&recipe) {

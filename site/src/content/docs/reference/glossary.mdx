@@ -44,8 +44,9 @@ failing checks block launches until fixed or overridden.
 
 **Session.** One user, one app, one host, one connection.
 
-**Stream profile.** One encode rung: codec, resolution, frame rate, bitrate and
-eligibility thresholds. Users don't see these.
+**Stream profile.** The database row behind one encode rung: codec, resolution,
+frame rate, bitrate and eligibility thresholds. See **Rung**. Users don't see
+these.
 
 ## Advanced technical terms
 
@@ -173,8 +174,9 @@ never stops Quasar.
 **Signaling.** The exchange over `/v1/signal` that lets a browser and a node agent
 set up a direct connection.
 
-**STUN and TURN.** WebRTC NAT traversal and relaying. Quasar uses neither: media
-goes directly, over a LAN or VPN.
+**STUN and TURN.** WebRTC NAT traversal and relaying. Quasar ships no ICE relay:
+media goes directly, over a LAN or VPN. An experimental, unsupported
+`QUASAR_ICE_SERVERS` knob exists; leave it unset.
 
 **VA-API.** The video acceleration interface for AMD and Intel encoding.
 

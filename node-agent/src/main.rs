@@ -40,6 +40,8 @@ enum Mode {
         /// `--render-node <path>`: open that hardware device rather than the first
         /// enumerated one.
         render_node: Option<String>,
+        /// `--vulkan`: also bring up a Vulkan device (NVIDIA GPUs only).
+        vulkan: bool,
     },
     /// #500: one throwaway-home sweep, then exit. Same knobs, guards and code path as the
     /// daily timer; `make homes-gc` execs it in the running agent container.
@@ -58,6 +60,21 @@ enum Mode {
         seconds: u64,
         json: bool,
     },
+}
+
+impl Mode {
+    /// The modes that initialise GStreamer, and so need its environment prepared.
+    fn uses_gstreamer(&self) -> bool {
+        matches!(
+            self,
+            Mode::Agent
+                | Mode::Session { .. }
+                | Mode::SessionAnswerer { .. }
+                | Mode::InjectSelfTest
+                | Mode::MediaProbe(_)
+                | Mode::ProbeEncoder { .. }
+        )
+    }
 }
 
 /// Parse `--size 1920x1080@60`. Any part omitted keeps the default.
@@ -120,6 +137,7 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
             vendor_lib: args.get(1).filter(|s| !s.starts_with("--")).cloned(),
             open_device: args.iter().any(|a| a == "--open-device"),
             render_node: arg_value(args, "--render-node"),
+            vulkan: args.iter().any(|a| a == "--vulkan"),
         },
         Some("homes-gc") => Mode::HomesGc {
             dry_run: args.iter().any(|a| a == "--dry-run"),
@@ -178,27 +196,45 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.get(pos + 1).filter(|s| !s.starts_with("--")).cloned()
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let mode = parse_args();
     // Must run before the subscriber and any other setup: its stdout contract is
     // `KEY=value` lines only, and it must observe the loader in a virgin process.
     if let Mode::EglSelfTest {
         vendor_lib,
         open_device,
         render_node,
-    } = parse_args()
+        vulkan,
+    } = &mode
     {
         std::process::exit(quasar_node_agent::nvidia_volume::egl_selftest_main(
             vendor_lib.as_deref(),
-            open_device,
+            *open_device,
             render_node.as_deref(),
+            *vulkan,
         ));
     }
 
     // Logs go to stderr: stdout belongs to machine-readable subcommands
     // (`probe-encoder --json`). Format knob: QUASAR_LOG_FORMAT.
     quasar_node_agent::logging::init_subscriber();
+    prepare_environment(&mode);
+    quasar_node_agent::crash_report::install(std::env::args().nth(1).as_deref().unwrap_or("agent"));
 
+    // Built by hand, not `#[tokio::main]`, so everything above runs while this is the
+    // only thread.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(run(mode));
+}
+
+/// The writes this process makes to its own environment, made before the runtime's
+/// threads exist (`session::prepare_gst_env` says why). One write is not here and does
+/// not follow the rule: `nvidia_volume::apply_process_env` needs the adopted driver
+/// volume, so it runs at agent start on a blocking-pool thread, after the workers exist.
+fn prepare_environment(mode: &Mode) {
     // Belt-and-braces for launches that bypass the Dockerfile.vulkan entrypoint (dev
     // stacks, `scripts/dev/dev.sh run`, a bare `cargo run`): that entrypoint already
     // unsets these before exec, for the same reason (#94 — libva treats a present-but-
@@ -208,10 +244,22 @@ async fn main() {
         "MESA_LOADER_DRIVER_OVERRIDE",
         "LIBGL_ALWAYS_SOFTWARE",
     ]);
+    // `--image` is sugar for QUASAR_APP_IMAGE, which `SessionConfig::from_env` reads.
+    if let Mode::Session {
+        image: Some(image), ..
+    } = mode
+    {
+        std::env::set_var("QUASAR_APP_IMAGE", image);
+    }
+    if mode.uses_gstreamer() {
+        session::prepare_gst_env();
+    }
+}
 
+async fn run(mode: Mode) {
     install_sigusr1_fallback();
 
-    match parse_args() {
+    match mode {
         Mode::Agent => {
             install_shutdown_handler();
             spawn_agent().await
@@ -220,8 +268,8 @@ async fn main() {
             addr,
             use_test_src,
             stun,
-            image,
-        } => run_session(addr, use_test_src, stun, image).await,
+            image: _,
+        } => run_session(addr, use_test_src, stun).await,
         Mode::SessionAnswerer { url } => run_session_answerer(url).await,
         Mode::HomesGc { dry_run } => run_homes_gc(dry_run),
         Mode::ConsoleVt { args } => std::process::exit(session::console_vt::helper_main(&args)),
@@ -364,7 +412,7 @@ fn check_env_sanity() {
     }
 }
 
-/// #532: the control loop must run as a SPAWNED task, never as the `#[tokio::main]` future.
+/// #532: the control loop must run as a SPAWNED task, never as the runtime's `block_on` future.
 /// Tokio emits `runtime.spawn` spans only for spawned tasks, so on the main future the
 /// busiest future in the process is absent from tokio-console, not merely slow. Panic
 /// behaviour is unchanged: a panic still aborts, re-raised from the `JoinError`.
@@ -432,18 +480,8 @@ fn label_runtime_dir() {
     }
 }
 
-async fn run_session(
-    addr: String,
-    use_test_src: bool,
-    stun: Option<String>,
-    image: Option<String>,
-) {
-    // `--image` is sugar for QUASAR_APP_IMAGE, which `SessionConfig::from_env` reads.
-    if let Some(img) = image {
-        std::env::set_var("QUASAR_APP_IMAGE", img);
-    }
+async fn run_session(addr: String, use_test_src: bool, stun: Option<String>) {
     let cfg = SessionConfig::from_env(use_test_src, stun);
-    // GST_REGISTRY for the VA encoder must be set before `gst::init()`.
     if let Err(e) = session::init_gstreamer(&cfg) {
         eprintln!("gstreamer init failed: {e:#}");
         std::process::exit(1);
@@ -863,6 +901,20 @@ mod tests {
             panic!("did not parse as the EGL self-test");
         };
         assert_eq!(render_node, None);
+    }
+
+    #[test]
+    fn egl_selftest_vulkan_step_is_opt_in() {
+        let egl = quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG;
+        for (args, expected) in [
+            (vec![egl, "--open-device"], false),
+            (vec![egl, "--open-device", "--vulkan"], true),
+        ] {
+            let Ok(Mode::EglSelfTest { vulkan, .. }) = parse_mode(&argv(&args)) else {
+                panic!("{args:?} did not parse as the EGL self-test");
+            };
+            assert_eq!(vulkan, expected, "{args:?}");
+        }
     }
 
     #[test]

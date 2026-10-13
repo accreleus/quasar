@@ -15,15 +15,14 @@ pub mod media_evidence;
 // telemetry burst), driven from the runner's supervision tick. Never a pad probe,
 // never on a streaming thread.
 pub mod capture;
-pub mod container;
-// Headless weston process manager for the nvidia-drm local-display path.
-pub(crate) mod console;
-// Where console local audio plays: the host's PipeWire, or ALSA when no PipeWire answers
-// and the device is free (#407 RH07-15, D13).
-pub(crate) mod console_audio;
 pub mod console_hotplug;
-// Startup check that this agent can actually take the console display before it
-// reports healthy (#407 RH07-15).
+pub mod container;
+// The grants a direct-display console container gets.
+pub mod console_plan;
+// Whether a console session is displaying.
+pub mod displaying;
+// Startup check that the console display can be taken and the console terminal held
+// before a console agent reports healthy (#407 RH07-15).
 pub(crate) mod console_preflight;
 // Console mode's own virtual terminal, keyboard off, for a local console session (#407).
 pub mod console_vt;
@@ -56,9 +55,6 @@ pub mod metrics;
 pub mod mount_policy;
 // #489: deferred NVENC encode-pipeline teardown (QUASAR_NVENC_DEFER_TEARDOWN).
 pub mod nvenc_defer;
-// Physical keyboard/mouse evdev grab, forwarded into virtual_input's uinput devices so
-// the compositor's single input path sees both WebRTC and physical input.
-pub mod physical_input;
 pub mod pipeline;
 /// `probe-encoder`: what the encode branch negotiates, through the production builders.
 pub mod probe_encoder;
@@ -492,8 +488,8 @@ pub struct SessionConfig {
     /// agent-local loss signal ([`fec::FecController`]).
     pub fec_mode: fec::FecMode,
     /// The host's console-mode config, snapshotted from the agent's latched
-    /// `config_update.console_config`. `None` ⇒ the runner falls back to
-    /// `QUASAR_LOCAL_DISPLAY`. Drives the local-display leg.
+    /// `config_update.console_config`. A `local_only` session needs it enabled; a streamed
+    /// session never reads it.
     pub console_config: Option<crate::messages::ConsoleConfig>,
     /// Assignment-scoped output plan; defaults to stream-only for old control planes and
     /// standalone/dev sessions.
@@ -880,32 +876,49 @@ pub fn gst_initialised() -> bool {
 }
 
 /// Initialise GStreamer exactly once per process (see [`init_gstreamer`]). Safe from any
-/// thread; subsequent calls are no-ops.
+/// thread; subsequent calls are no-ops. The agent's init, and so the one place segtrap
+/// goes off: it turns a SIGSEGV on any thread during a plugin load into `exit(-1)`
+/// blamed on that plugin, and off, the fault keeps its signal and its core (#267). A
+/// probe child calls [`init_gstreamer`] itself and keeps it: its exit code is its
+/// verdict, and 255 reads as indeterminate where a signal reads as a failed check.
 pub fn ensure_gst_init(cfg: &SessionConfig) -> anyhow::Result<()> {
     let mut result = Ok(());
     GST_INIT.call_once(|| {
+        // SAFETY: sets one flag GStreamer reads at each plugin load. Called raw because
+        // the safe wrapper panics after init, which a test process has already done.
+        unsafe { gstreamer::ffi::gst_segtrap_set_enabled(glib::ffi::GFALSE) };
         result = init_gstreamer(cfg);
     });
     result
 }
 
-/// Initialise GStreamer for a session. Must run before any other GStreamer API.
+/// The per-process registry file. Per-process forces a scan against the runtime GPU:
+/// VA/NVENC/Vulkan elements register only for a GPU present at scan time, and the image
+/// bakes its registry with none.
+fn gst_registry_path() -> String {
+    format!("/tmp/quasar-gst-registry-{}.bin", std::process::id())
+}
+
+/// Every environment write GStreamer, Mesa and the compositor depend on. `main` calls it
+/// before the runtime's threads exist: `setenv` beside a `getenv` on another thread is a
+/// use-after-free on a libc that frees the old array, and all three read the environment
+/// while a device comes up. Guarded by `tests/process_env_convention.rs`.
 ///
-/// Stale-registry trap: VA/NVENC/Vulkan elements are device-probing and register only
-/// for a GPU present at registry-scan time, and the image bakes its registry with no
-/// GPU. So point `GST_REGISTRY` at a fresh per-process path to force a re-scan against
-/// the runtime GPU (registers `vah264enc` / `nvcudah264enc` + `cudaconvert` /
-/// `vulkanh264enc`). Unconditional, and harmless for software: gst init runs once per
-/// process at the startup codec probe, whose cfg carries the env-baseline encoder, but a
-/// `config_update` can flip a software-env host to a hardware encoder with no restart —
-/// gating the fresh scan on `cfg.encoder` would strand such a host on the baked registry
-/// with no hardware elements.
+/// `GST_REGISTRY` is unconditional: a `config_update` can flip a software-env host to a
+/// hardware encoder with no restart, and a scan gated on the encoder would strand it on
+/// the baked registry.
+pub fn prepare_gst_env() {
+    std::env::set_var("GST_REGISTRY", gst_registry_path());
+    apply_intel_vulkan_video_knob();
+    pipeline::pin_vulkan_encode_ring();
+}
+
+/// Initialise GStreamer. Must run before any other GStreamer API, and after
+/// [`prepare_gst_env`] in a process that streams. Removes a registry file a previous
+/// process left under this pid, which a container restart reuses.
 pub fn init_gstreamer(_cfg: &SessionConfig) -> anyhow::Result<()> {
     use anyhow::Context;
-    let path = format!("/tmp/quasar-gst-registry-{}.bin", std::process::id());
-    let _ = std::fs::remove_file(&path);
-    std::env::set_var("GST_REGISTRY", &path);
-    apply_intel_vulkan_video_knob();
+    let _ = std::fs::remove_file(gst_registry_path());
     gstreamer::init().context("failed to initialise GStreamer")?;
     Ok(())
 }

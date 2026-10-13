@@ -14,7 +14,7 @@ from, how to retake them, and what is still worth adding.
 | `playing/in-session.mdx` | `session-stats.png` | The Performance stats pane of a live session. |
 | `admin/overview.mdx` | `admin-overview.png` | Live sessions, needs attention, fleet capacity, recent activity. |
 | `admin/hosts.mdx` | `admin-hosts.png` | The fleet host list, one host expanded. |
-| `admin/console.mdx` | `admin-console.png` | The Local console page of a host with console mode on and PipeWire audio. |
+| `admin/console.mdx` | `admin-console.png` | The Local console page of a host with console mode on (direct-display settings, #455). |
 | `troubleshooting/readiness.mdx` | `host-readiness.png` | Part of a rootless Docker host's readiness card: storage, network, engine and console checks. |
 | `admin/sessions.mdx` | `admin-sessions.png` | Live and recent sessions. |
 | `admin/images.mdx` | `admin-images.png` | The image catalog and per-host rollout state. |

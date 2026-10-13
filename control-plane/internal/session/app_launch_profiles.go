@@ -137,6 +137,12 @@ func (s *Store) AppProfileRestrictionByID(ctx context.Context, callerID, appID s
 		        AND (e.subject_type = 'all'
 		             OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))
 		  )
+		  AND (apps.parent_app_id IS NULL OR EXISTS (
+		      SELECT 1 FROM entitlements e
+		      WHERE e.app_id = apps.parent_app_id
+		        AND (e.subject_type = 'all'
+		             OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))
+		  ))
 	`, appID, callerID).Scan(&policy, &defaultProfileID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AppProfileRestriction{}, ErrNotFound

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/admission"
+	"github.com/accreleus/quasar/control-plane/internal/images"
 	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
@@ -298,16 +299,25 @@ func (s *store) attachCapacities(ctx context.Context, hosts []Host) error {
 // invariant #6 bypass class. GET /v1/admin/apps is the separate admin view.
 //
 // Hand-copied (internal/session cannot import internal/crud) at
-// entitlements.go (entitledToApp), session/store.go (IsEntitled),
-// session/scheduler.go (scheduleAttempt, + FOR SHARE). A future 'group'
-// subject type must be added in all four. Do not add a fifth copy.
+// session/store.go (IsEntitled), session/scheduler.go (scheduleAttempt, + FOR SHARE) and
+// session/app_launch_profiles.go. A future 'group' subject type must be added in
+// all of them. Do not add another copy.
+//
+// A derived tile also needs the caller's entitlement to its parent provider app
+// (amendment 22, #497): restricting or revoking the provider must withdraw every
+// tile the scan granted, the same way the parent's enabled gates them.
 func entitledSQL(callerParam string) string {
-	return `EXISTS (
+	subject := `(e.subject_type = 'all'
+			       OR (e.subject_type = 'user' AND e.subject_id = ` + callerParam + `::uuid))`
+	return `(EXISTS (
 			SELECT 1 FROM entitlements e
 			WHERE e.app_id = apps.id
-			  AND (e.subject_type = 'all'
-			       OR (e.subject_type = 'user' AND e.subject_id = ` + callerParam + `::uuid))
-		)`
+			  AND ` + subject + `
+		) AND (apps.parent_app_id IS NULL OR EXISTS (
+			SELECT 1 FROM entitlements e
+			WHERE e.app_id = apps.parent_app_id
+			  AND ` + subject + `
+		)))`
 }
 
 // listApps returns enabled apps the caller is entitled to, cursor-paginated.
@@ -495,7 +505,7 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 	parentAppID, libraryProvider *string,
 	vram, slots, w, h, fps, kbps *int32, runtimeSpec json.RawMessage,
 	managedHome bool, homeContainerPath string, defaultProfileID *string, profilePolicy string,
-	runtimePresetID *string, callerID string) (App, error) {
+	runtimePresetID *string, entitle string, launchProfileIDs []string, callerID string) (App, error) {
 	if len(runtimeSpec) == 0 {
 		runtimeSpec = json.RawMessage(`{}`)
 	}
@@ -589,6 +599,20 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 		return App{}, fmt.Errorf("begin app create: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	provider := ""
+	if libraryProvider != nil {
+		provider = *libraryProvider
+	}
+	// Held through the grant so EnsureProviderApp and the entitlement-mode
+	// route see this app or none of it (#490).
+	if provider != "" {
+		if err := images.LockProviderApp(ctx, tx, provider); err != nil {
+			return App{}, err
+		}
+		if err := refuseSecondProviderApp(ctx, tx, provider, ""); err != nil {
+			return App{}, err
+		}
+	}
 	if err := tx.QueryRow(ctx, query, args...).Scan(&id); err != nil {
 		if translated := appConstraintError(err); translated != nil {
 			return App{}, translated
@@ -600,6 +624,18 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 		return App{}, fmt.Errorf("read created app image: %w", err)
 	}
 	if err := fenceImageRequirementWrite(ctx, tx, newRef); err != nil {
+		return App{}, err
+	}
+	var actor *string
+	if callerID != "" {
+		actor = &callerID
+	}
+	if err := grantOnCreate(ctx, tx, id, provider, entitle, actor); err != nil {
+		return App{}, err
+	}
+	// Same transaction: an app that commits without its allow-list reads as
+	// unrestricted, and one rolled back after a consumed stored mode would lose it.
+	if err := writeAppLaunchProfiles(ctx, tx, id, launchProfileIDs); err != nil {
 		return App{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -616,6 +652,61 @@ var ErrDerivedShape = errors.New("a derived tile carries identity only")
 // ErrDuplicateDerivedTile: apps_parent_external_uk refused a second tile for
 // the same (provider app, source, appid) — one tile per game, fleet-wide.
 var ErrDuplicateDerivedTile = errors.New("a tile for that provider app and external id already exists")
+
+// ErrProviderAppExists: another app already has this library_provider. One app
+// per provider, because EnsureProviderApp and the entitlement-mode route
+// address "the" provider app (#490); a second would sit outside its stored or
+// later-set entitlement mode.
+var ErrProviderAppExists = errors.New("another app is already this library provider's app")
+
+// refuseSecondProviderApp returns ErrProviderAppExists when an app other than
+// exceptID ("" on create) is provider's app, unless exceptID already is one, so
+// an app that predates the rule stays editable. Caller holds
+// images.LockProviderApp.
+func refuseSecondProviderApp(ctx context.Context, tx pgx.Tx, provider, exceptID string) error {
+	var taken bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM apps WHERE library_provider = $1 AND id::text <> $2)
+		   AND NOT EXISTS (SELECT 1 FROM apps WHERE library_provider = $1 AND id::text = $2)
+	`, provider, exceptID).Scan(&taken); err != nil {
+		return fmt.Errorf("check provider app %q: %w", provider, err)
+	}
+	if taken {
+		return ErrProviderAppExists
+	}
+	return nil
+}
+
+// ErrLastProviderAppWhileDiscoveryOn: un-marking or deleting the only app of a
+// provider while library discovery is on would let the next EnsureProviderApp
+// create a fresh one open to everyone, leaving the restriction behind (#490,
+// #497).
+var ErrLastProviderAppWhileDiscoveryOn = errors.New("library discovery is on and this is its only provider app")
+
+// refuseLastProviderAppWhileDiscoveryOn guards PATCH library_provider "" and
+// DELETE. Either stays allowed while another app still claims the provider or
+// discovery is off. Caller holds every provider lock (updateApp, deleteApp).
+func refuseLastProviderAppWhileDiscoveryOn(ctx context.Context, tx pgx.Tx, appID string) error {
+	var provider string
+	err := tx.QueryRow(ctx, `SELECT library_provider FROM apps WHERE id::text = $1`, appID).Scan(&provider)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && provider == "") {
+		return nil // no such app (the update reports 404) or not a provider app
+	}
+	if err != nil {
+		return fmt.Errorf("read app provider: %w", err)
+	}
+	var refuse bool
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE((SELECT library_discovery_enabled FROM instance_settings WHERE id = true), false)
+		   AND NOT EXISTS (SELECT 1 FROM apps WHERE library_provider = $1 AND id::text <> $2)
+	`, provider, appID).Scan(&refuse); err != nil {
+		return fmt.Errorf("check provider clear for %q: %w", provider, err)
+	}
+	if refuse {
+		return ErrLastProviderAppWhileDiscoveryOn
+	}
+	return nil
+}
 
 // appConstraintError maps the two Phase-3 constraints to sentinels, or nil
 // (stays a 500). Keyed on constraint name, never message text: names are ours,
@@ -663,7 +754,7 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 	parentAppID **string, libraryProvider *string,
 	vram, slots, w, h, fps, kbps *int32, enabled *bool, runtimeSpec json.RawMessage,
 	managedHome *bool, homeContainerPath *string, defaultProfileID **string, profilePolicy *string,
-	runtimePresetID **string, callerID string) (App, error) {
+	runtimePresetID **string, launchProfileIDs *[]string, callerID string) (App, error) {
 	// Checked before any SET clause is built (see ErrCoverURLOwnedByArtwork), so
 	// a patch touching cover_url and other fields is refused atomically.
 	if coverURL != nil {
@@ -833,6 +924,12 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 		argIdx++
 	}
 	if len(setClauses) == 0 {
+		// No column change, so nothing to refuse: only the allow-list.
+		if launchProfileIDs != nil {
+			if err := s.setAppLaunchProfiles(ctx, id, *launchProfileIDs); err != nil {
+				return App{}, err
+			}
+		}
 		return s.getAppFull(ctx, callerID, id)
 	}
 
@@ -858,6 +955,27 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 		return App{}, fmt.Errorf("begin app update: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// A library_provider write takes every provider lock, in a fixed order,
+	// before reading this app's current provider: read first, and a concurrent
+	// designation could commit between that read and this UPDATE unseen (#490).
+	// Locks before the row lock, as every provider-app writer takes them.
+	// Making an app a provider's also applies a mode stored for it, below.
+	becomesProvider := libraryProvider != nil && *libraryProvider != ""
+	if libraryProvider != nil {
+		for _, p := range libraryProviders {
+			if err := images.LockProviderApp(ctx, tx, p); err != nil {
+				return App{}, err
+			}
+		}
+		if becomesProvider {
+			err = refuseSecondProviderApp(ctx, tx, *libraryProvider, id)
+		} else {
+			err = refuseLastProviderAppWhileDiscoveryOn(ctx, tx, id)
+		}
+		if err != nil {
+			return App{}, err
+		}
+	}
 	oldRef := ""
 	if enabled != nil || len(runtimeSpec) > 0 || runtimePresetID != nil || parentAppID != nil {
 		oldRef, err = imageRefForApp(ctx, tx, id)
@@ -888,6 +1006,16 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 			return App{}, fmt.Errorf("read new app image: %w", err)
 		}
 		if err := fenceImageRequirementWrite(ctx, tx, oldRef, newRef); err != nil {
+			return App{}, err
+		}
+	}
+	if becomesProvider {
+		if _, err := images.ApplyRequestedEntitlementMode(ctx, tx, id, *libraryProvider); err != nil {
+			return App{}, err
+		}
+	}
+	if launchProfileIDs != nil {
+		if err := writeAppLaunchProfiles(ctx, tx, id, *launchProfileIDs); err != nil {
 			return App{}, err
 		}
 	}
@@ -1367,6 +1495,17 @@ func (s *store) deleteApp(ctx context.Context, id string, deleteDerived bool) (s
 		return "", fmt.Errorf("begin delete app tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
+
+	// Every provider lock, before any row lock and before reading this app's
+	// provider, as updateApp: a designation committing in between would go unseen.
+	for _, p := range libraryProviders {
+		if err := images.LockProviderApp(ctx, tx, p); err != nil {
+			return "", err
+		}
+	}
+	if err := refuseLastProviderAppWhileDiscoveryOn(ctx, tx, id); err != nil {
+		return "", err
+	}
 
 	var name string
 	var parentID *string

@@ -398,6 +398,9 @@ export type ProviderEntitlementModeSet = Schemas["ProviderEntitlementModeSet"];
 /** Replaces the whole entitlement set — `items` is the result, not a delta. */
 export type ProviderEntitlementModeEnvelope = Schemas["ProviderEntitlementModeEnvelope"];
 
+/** 202: no provider app yet; the server applies the mode when it creates one. */
+export type ProviderEntitlementModePendingEnvelope = Schemas["ProviderEntitlementModePendingEnvelope"];
+
 // ── App placement (RH05 #342, control-api.md "App placement, homes and explicit image cleanup") ──
 // Which hosts may run a canonical app. A derived tile has no placement of its
 // own: GET answers with the parent's, `inherited_from` set.
@@ -679,6 +682,9 @@ export type ConsoleConfig = Schemas["ConsoleConfig"];
 export type ConsoleCapabilities = Schemas["ConsoleCapabilities"];
 
 export type ConsoleConfigEnvelope = Schemas["ConsoleConfigEnvelope"];
+
+/** Amendment 19: one entry of the console's default-app list (an app that can run direct). */
+export type ConsoleDefaultApp = Schemas["ConsoleDefaultApp"];
 
 /** Amendment 18. "Has access" (`control-api.md` §Console mode, `agent-api.md`
  *  `capacity.console_capabilities.access`): `state` is `on`, or `restored` with

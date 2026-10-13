@@ -120,8 +120,8 @@ export function useSwapTransition({
           setTransition({ phase: "timeout", appName: target.name });
           onToast(
             <>
-              Switching to <b>{target.name}</b> is taking longer than expected. The session is
-              unaffected — check back in a moment.
+              Switching to <b>{target.name}</b> is taking longer than expected. It may still
+              finish. If the host never picked it up, the session will end shortly.
             </>,
           );
           return;

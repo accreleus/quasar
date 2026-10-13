@@ -980,17 +980,81 @@ pub(super) fn enable_abr(
             ceiling_bps / 1000,
             fps
         );
-        // The aux-sender return MUST be handed back FLOATING: rtpbin ref_sinks it on
-        // bin-add expecting a C handler's floating ref, and gstreamer-rs already sank one
-        // at construction, so a plain strong handle leaks the rtpgccbwe (and its
-        // AbrLoop → encoder chain) per session (.claude/rules/gstreamer-gotchas.md).
-        unsafe {
-            gst::glib::gobject_ffi::g_object_force_floating(
-                bwe.as_ptr() as *mut gst::glib::gobject_ffi::GObject
-            );
-        }
         Some(bwe.to_value())
     });
+}
+
+/// Put the encoder back at its launch operating point for a transport that replaces
+/// another (#535). [`enable_abr`] starts the new transport's governor at the ceiling and
+/// its ladder at rung 0; without this the encoder keeps the last peer's degraded bitrate,
+/// speed bias and rungs until GCC's estimate moves, which on a clean path is never.
+///
+/// The encoder element and its pipeline stay; these property and caps writes are all a
+/// replacement does to it, and the log line names each. A size change is an encoder
+/// session restart on the Vulkan path, as any rung step is.
+///
+/// Drops the old loop's hooks first: they hold its estimator and would keep retargeting.
+pub(super) fn reset_to_launch(
+    encoder: &gst::Element,
+    cfg: &SessionConfig,
+    lever: &EncodeResolutionLever,
+    metrics: &SessionMetrics,
+) {
+    metrics.clear_hooks();
+    let written = write_launch_point(encoder, cfg, lever, metrics);
+    tracing::info!(
+        token = "transport-replaced-encoder-kept",
+        "encoder {} kept across the transport replacement; written: {written}",
+        encoder.name()
+    );
+}
+
+/// What [`reset_to_launch`] writes, and its account of it.
+fn write_launch_point(
+    encoder: &gst::Element,
+    cfg: &SessionConfig,
+    lever: &EncodeResolutionLever,
+    metrics: &SessionMetrics,
+) -> String {
+    if cfg.abr_mode == AbrMode::Off || !encoder_abr_writable(encoder, cfg.encoder) {
+        return "nothing (nothing ever moved it)".into();
+    }
+    let fps = cfg.stream.fps.max(1) as u32;
+    write_encoder_bitrate(encoder, cfg.encoder, cfg.stream.bitrate_kbps, fps);
+    let bias = encoder_speed_bias_writable(encoder, cfg.encoder);
+    if bias {
+        write_encoder_speed_bias(encoder, cfg.encoder, 0, cfg.target_usage);
+    }
+    metrics.set_ladder_bias(0);
+    metrics.set_abr_floor(0);
+    let (mut fps_moved, mut size) = (false, "not written (no scale stage)");
+    if lever.stage().supported {
+        // `Err` is a stage with no fps rung.
+        fps_moved = lever.set_fps(cfg.stream.fps).unwrap_or(false);
+        metrics.set_ladder_fps(0);
+        metrics.set_target_fps(fps);
+        // A size a human pinned is theirs, not the ladder's.
+        size = if lever.pinned() {
+            "kept (pinned)"
+        } else {
+            metrics.set_ladder_res_rung(0);
+            match lever.set_rung(cfg.stream.width, cfg.stream.height) {
+                Ok(true) => "restored to launch",
+                Ok(false) => "already at launch",
+                Err(_) => "restore refused",
+            }
+        };
+    }
+    format!(
+        "bitrate and CPB for {} kbit/s at {fps} fps, speed bias {}, fps {}, size {size}",
+        cfg.stream.bitrate_kbps,
+        if bias { "reset" } else { "not written" },
+        if fps_moved {
+            "restored to launch"
+        } else {
+            "unchanged"
+        },
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1376,6 +1440,57 @@ mod tests {
         // Above the launch size: the compositor has no more pixels than this.
         assert!(lever.set_rung(2560, 1440).is_err());
         assert_eq!(lever.current(), (1280, 720));
+    }
+
+    // #535: a transport that replaces another starts from the launch operating point, not
+    // from wherever the last peer's congestion left the encoder and the rungs.
+    #[test]
+    fn reset_to_launch_undoes_what_the_last_governor_did() {
+        init();
+        let cfg = cfg_with_floors(0, None);
+        let launch_bps = cfg.stream.bitrate_kbps * 1000;
+        let Ok(encoder) = gst::ElementFactory::make("openh264enc")
+            .property("bitrate", launch_bps / 4)
+            .build()
+        else {
+            return; // openh264 unavailable: skip
+        };
+        let lever = software_lever((cfg.stream.width, cfg.stream.height));
+        lever.set_rung(1280, 720).unwrap();
+        let metrics = SessionMetrics::new("smooth", cfg.stream.fps as u32);
+        let held_by_hook = Arc::new(());
+        let held = held_by_hook.clone();
+        metrics.set_on_drain(Box::new(move || {
+            let _ = &held;
+        }));
+
+        reset_to_launch(&encoder, &cfg, &lever, &metrics);
+
+        assert_eq!(encoder.property::<u32>("bitrate"), launch_bps);
+        assert_eq!(
+            lever.stage().requested(),
+            (cfg.stream.width, cfg.stream.height)
+        );
+        // The old loop's hooks hold its estimator; they must not outlive its transport.
+        assert_eq!(Arc::strong_count(&held_by_hook), 1);
+    }
+
+    // A size a human chose survives the peer changing.
+    #[test]
+    fn reset_to_launch_leaves_a_pinned_size_alone() {
+        init();
+        let cfg = cfg_with_floors(0, None);
+        let Ok(encoder) = gst::ElementFactory::make("openh264enc").build() else {
+            return; // openh264 unavailable: skip
+        };
+        let lever = software_lever((cfg.stream.width, cfg.stream.height));
+        lever.set_rung(1280, 720).unwrap();
+        lever.set_pinned(true);
+        let metrics = SessionMetrics::new("smooth", cfg.stream.fps as u32);
+
+        reset_to_launch(&encoder, &cfg, &lever, &metrics);
+
+        assert_eq!(lever.stage().requested(), (1280, 720));
     }
 
     // The lever starts AUTO: the ladder owns the size until a human takes it.

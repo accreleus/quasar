@@ -16,6 +16,12 @@ struct Reply {
     body: String,
     incomplete: bool,
     hold: Duration,
+    /// Block after writing this reply until the test sends on this channel,
+    /// instead of guessing a `hold` long enough to outlast whatever the client
+    /// side is doing. Deterministic under any amount of scheduling pressure: the
+    /// server waits for exactly as long as the test needs it to, never racing a
+    /// wall-clock margin against the client's own deadline.
+    release: Option<std::sync::mpsc::Receiver<()>>,
     auth: Option<serde_json::Value>,
 }
 fn reply(request: &str, status: u16, body: impl Into<String>) -> Reply {
@@ -25,6 +31,7 @@ fn reply(request: &str, status: u16, body: impl Into<String>) -> Reply {
         body: body.into(),
         incomplete: false,
         hold: Duration::ZERO,
+        release: None,
         auth: None,
     }
 }
@@ -62,7 +69,13 @@ fn serve(
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
                 let mut byte = [0];
-                socket.read_exact(&mut byte).unwrap();
+                if let Err(e) = socket.read_exact(&mut byte) {
+                    panic!(
+                        "reading request for {:?}: {e} (partial: {:?})",
+                        reply.request,
+                        String::from_utf8_lossy(&request)
+                    );
+                }
                 request.push(byte[0]);
                 assert!(request.len() < 16384);
             }
@@ -91,7 +104,14 @@ fn serve(
             }
             let length = reply.body.len() + usize::from(reply.incomplete) * 100;
             let _ = write!(socket, "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{}", reply.status, reply.body);
-            std::thread::sleep(reply.hold);
+            match reply.release {
+                // Errs once the test drops the sender (including on an early
+                // panic/assertion failure), so this never deadlocks the fixture.
+                Some(release) => {
+                    let _ = release.recv();
+                }
+                None => std::thread::sleep(reply.hold),
+            }
         }
     });
     let mut config = RuntimeConfig::unix(path);
@@ -215,9 +235,15 @@ fn interrupted_pull_is_retired_and_pulled_again_after_client_restart() {
 
 #[test]
 fn silent_pull_deadline_releases_capacity_and_the_next_pull_proceeds() {
+    // The fixture holds this connection open — never completing the body, never
+    // closing the socket — until the test explicitly releases it below. That is
+    // what makes the first `ensure_image` call time out via the client's own
+    // deadline rather than via a premature EOF: there is no server-side sleep
+    // duration to race against the client's budget.
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let mut silent = reply(PULL, 200, "");
     silent.incomplete = true;
-    silent.hold = Duration::from_millis(350);
+    silent.release = Some(release_rx);
     let (_dir, mut config, server) = serve(vec![
         discovery(),
         reply(INSPECT, 404, ABSENT),
@@ -229,16 +255,26 @@ fn silent_pull_deadline_releases_capacity_and_the_next_pull_proceeds() {
     ]);
     config.max_in_flight = 1;
     let runtime = RuntimeClient::new(config).unwrap();
-    let start = Instant::now();
+    // A generous budget, not a race: this call still has to reach the pull step
+    // (discover, inspect, open the connection) before its own deadline can be the
+    // thing that cuts it off, and under a loaded machine the single-worker
+    // executor can sit unscheduled for a while before it gets to run any of
+    // that. A second is far more than the work itself ever needs and far more
+    // than any realistic scheduling delay, so the deadline — not a lucky
+    // scheduler — is reliably what ends this call.
     assert_eq!(
         runtime
-            .ensure_image("test", Duration::from_millis(150))
+            .ensure_image("test", Duration::from_secs(1))
             .wait(|_| {})
             .unwrap_err()
             .kind,
         ErrorKind::UnknownOutcome
     );
-    assert!(start.elapsed() < Duration::from_secs(2));
+    // The first operation has already concluded (the deadline fired and the
+    // semaphore permit was released), so letting the fixture move on now can
+    // never race the client's own timeout — regardless of how long the above
+    // actually took under load.
+    release_tx.send(()).unwrap();
     assert_eq!(
         runtime
             .ensure_image("test", Duration::from_secs(2))

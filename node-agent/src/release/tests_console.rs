@@ -265,11 +265,12 @@ fn only_an_owned_agent_without_the_marker_refuses_a_console_launch() {
     let m = console_machine(Behaviour::default());
     let without = ConsoleAccessManager::owned_for_test(&m.socket, false);
     let with = ConsoleAccessManager::owned_for_test(&m.socket, true);
-    for t in [VideoTopology::LocalOnly, VideoTopology::DualOutput] {
-        assert!(without.launch_refusal(t).is_some(), "{t:?}");
-        assert!(with.launch_refusal(t).is_none(), "{t:?}");
+    assert!(without.launch_refusal(VideoTopology::LocalOnly).is_some());
+    assert!(with.launch_refusal(VideoTopology::LocalOnly).is_none());
+    // Not a console session: refused, if at all, as a topology (`topology_refusal`).
+    for t in [VideoTopology::StreamOnly, VideoTopology::Unsupported] {
+        assert!(without.launch_refusal(t).is_none(), "{t:?}");
     }
-    assert!(without.launch_refusal(VideoTopology::StreamOnly).is_none());
 }
 
 /// Polls until `until` holds; panics naming `what` after 20 s.

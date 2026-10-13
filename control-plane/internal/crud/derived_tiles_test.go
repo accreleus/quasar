@@ -489,14 +489,20 @@ func TestOneTilePerParentAndAppid(t *testing.T) {
 		t.Fatalf("duplicate tile: want 409, got %d (%v)", resp.StatusCode, b)
 	}
 
-	// A DIFFERENT parent with the same appid is fine — the key is the pair, so two
-	// Steam accounts (two provider apps) each get their own tile for one game.
-	other := createProviderApp(t, pool, srv.URL, admin, "Steam (second account)")
+	// A DIFFERENT parent with the same appid is fine — the key is the pair. The
+	// API refuses a second Steam provider app (#490), so seed one as an app made
+	// before that rule would exist.
+	var other string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO apps (name, kind, library_provider, managed_home, runtime_spec)
+		VALUES ('Steam (second account)', 'launcher', 'steam', true, '{"image":"steam:1"}'::jsonb)
+		RETURNING id::text`).Scan(&other); err != nil {
+		t.Fatalf("seed second provider app: %v", err)
+	}
 	body["parent_app_id"] = other
 	if resp, b := post(t, srv.URL+"/v1/apps", body, admin); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("same appid under a different parent: want 201, got %d (%v)", resp.StatusCode, b)
 	}
-	_ = ctx
 }
 
 // TestParentAppIDMustNameANonDerivedApp covers the rule the database cannot
@@ -612,6 +618,9 @@ func TestDeletingAProviderAppNeedsConfirmation(t *testing.T) {
 		}
 	}
 
+	// Discovery off, or the only-provider-app refusal (#497) answers first.
+	setLibraryDiscovery(t, pool, false)
+
 	// Unconfirmed: refused, and the body LISTS the tiles rather than counting
 	// them — the point of the confirmation is that the admin sees what they are
 	// about to destroy, and "2 tiles" is not that.
@@ -710,10 +719,12 @@ func TestDeletingAProviderAppRefusesWhileATileIsLive(t *testing.T) {
 		t.Fatalf("seed session: %v", err)
 	}
 
-	// Even WITH the confirmation, the live-session guard wins.
+	// Even WITH the confirmation, the live-session guard wins. Discovery off,
+	// or the only-provider-app refusal (#497) answers first.
+	setLibraryDiscovery(t, pool, false)
 	resp, body = deleteJSON(t, srv.URL+"/v1/apps/"+parent+"?delete_derived=true", admin)
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("delete with a live TILE session: want 409, got %d (%v)", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusConflict || errorCode(body) != "conflict" {
+		t.Fatalf("delete with a live TILE session: want 409 conflict, got %d (%v)", resp.StatusCode, body)
 	}
 	var n int
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM apps`).Scan(&n); err != nil {

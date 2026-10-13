@@ -26,10 +26,10 @@ what they do.
 | [`70-quasar.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/70-quasar.rules) | `/dev/uinput` | Creating virtual keyboards, mice, gamepads and touch devices for players. | Rootless installs |
 | | Input devices named `Quasar Virtual *` | Sessions open the virtual devices Quasar created. On an SELinux host they also get the container label, so a confined session can open them. | Rootless installs |
 | | GPU render nodes (`/dev/dri/renderD*`) | Hardware encoding and rendering. | Rootless installs |
-| [`71-quasar-console.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/71-quasar-console.rules) | Display cards (`/dev/dri/card*`) | Showing a session on the host's own screen. | Console mode |
-| | Sound devices | Playing the session's audio on the host. | Console mode |
+| [`71-quasar-console.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/71-quasar-console.rules) | Display cards (`/dev/dri/card*`) | The console desktop drives the host's own screen; the agent reads which monitors are connected. | Console mode |
+| | Sound devices | The console desktop plays its sound on the host. | Console mode |
 | | i2c buses (`/dev/i2c-*`) | Monitor control (DDC), such as switching the monitor's input. | Console mode |
-| | The host's keyboards, mice and game controllers | Taking them exclusively while a session runs, so input goes to the game only. | Console mode |
+| | The host's input devices (keyboards, mice, controllers, touchpads, buttons) | The console desktop uses them, including ones plugged in later. | Console mode |
 | | `tty8` | Console mode's own terminal, so nothing typed reaches a login prompt. | Console mode |
 | [`72-quasar-seat.rules`](https://github.com/accreleus/quasar/blob/main/deploy/udev/72-quasar-seat.rules) | Input devices named `Quasar Virtual *` | Moves them off the desktop's seat. See [below](#the-seat-rule). | Any host where someone logs into a desktop |
 
@@ -38,9 +38,53 @@ in both modes.
 
 <Aside type="caution" title="Console mode can read the host's keyboard">
 With `71-quasar-console.rules`, the `quasar` group can read what is typed on the
-host's own keyboards. Install it only on a host that uses
-[console mode](/quasar/admin/console/).
+host's own keyboards: the console session holds the screen and the raw input of the
+host. Install it only on a host that uses [console mode](/quasar/admin/console/).
 </Aside>
+
+### SELinux and console mode
+
+On an SELinux host, sessions run as `container_engine_t`, and the policy gives that type
+none of the console's devices: without more, the desktop starts with no keyboard, mouse or
+sound. `prepare-host.sh --console` also loads a small module, `quasar-console-devices`,
+that allows exactly these and nothing else: the input nodes, the sound nodes, the `hidraw`
+nodes Steam Input reads, and the udev database. SELinux stays enforcing. By hand:
+
+```bash
+cat > quasar-console-devices.cil <<'EOF'
+(allow container_engine_t device_t (dir (getattr open read search watch)))
+(allow container_engine_t event_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t sound_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t usb_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t udev_var_run_t (dir (getattr open read search)))
+(allow container_engine_t udev_var_run_t (file (getattr open read map)))
+EOF
+sudo semodule -i quasar-console-devices.cil
+```
+
+Running `prepare-host.sh` again without `--console` leaves the module in place and says so;
+remove it with `sudo semodule -r quasar-console-devices`.
+
+### SELinux and session sound
+
+On an SELinux host, an app that needs the nested-sandbox type (`container_engine_t`, Steam's
+sandbox) connects to its session's audio sidecar (PipeWire, serving a PulseAudio socket), which runs as `container_t`. The policy
+allows that connection only between containers of the same type, so without more the
+session is silent. `prepare-host.sh` loads a module, `quasar-nested-audio`, with exactly one
+rule for it, and SELinux stays enforcing. The rule is one permission between two types: any
+`container_engine_t` process on the host may connect to a `container_t` unix socket it can reach
+by path. Quasar mounts only the session's own sidecar directory into the app, and file labels
+and permissions still apply; an app given another session's socket directory could reach that
+session's audio. By hand:
+
+```bash
+echo '(allow container_engine_t container_t (unix_stream_socket (connectto)))' > quasar-nested-audio.cil
+sudo semodule -i quasar-nested-audio.cil
+```
+
+A host prepared before this module existed has no sound in Steam sessions until you run
+`prepare-host.sh` again; it is safe to repeat. Check with
+`sudo semodule -l | grep quasar-nested-audio`.
 
 ### The seat rule
 

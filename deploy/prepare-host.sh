@@ -16,19 +16,22 @@
 #   - installs Quasar's udev rules (the files in deploy/udev/, byte for byte): the
 #     `quasar` group gets /dev/uinput, the input devices Quasar itself creates
 #     (matched by name), and the GPU render nodes; with --console also the display
-#     cards, sound devices, i2c buses, and this machine's own keyboards, mice and
-#     game controllers (so console mode's exclusive grab can take them) that console
-#     mode needs, and its own virtual terminal (tty8, with no login prompt on it).
+#     cards, sound devices, i2c buses and this machine's own input devices, which a
+#     console session's desktop is given (it holds the screen and the raw input of
+#     this machine), and console mode's virtual terminal (tty8, with no login prompt
+#     on it). On a rootless engine these ACLs are the only access there is: no device
+#     rule reaches a rootless container, so a device plugged in later opens through
+#     them alone.
 #     A seat rule keeps Quasar's virtual input devices off the desktop's seat, so a
 #     desktop user logged in on the host does not receive a player's input. No broad
 #     group such as `input` or `video` is granted;
-#   - with --console --console-audio-user USER, gives console mode a PipeWire
-#     Pulse socket on USER's own desktop session, reachable only by the `quasar`
-#     group, so it can play audio through a real login rather than raw ALSA;
 #   - loads the kernel modules Quasar needs, now and at boot;
 #   - sets the kernel settings Quasar needs; --allow-kernel-log and
 #     --unprivileged-port-start N add two optional ones;
 #   - on an NVIDIA host, makes sure an NVIDIA CDI specification exists;
+#   - with --console on an SELinux host, loads a small SELinux module that lets a console
+#     session's confined type open this machine's input, sound and hidraw nodes and read
+#     the udev database (SELinux stays enforcing);
 #   - on Podman, makes the engine start Quasar's containers again at boot;
 #   - with --homes DIR (and --templates DIR), creates the homes root (and the templates
 #     root) owned by the Quasar user; on an SELinux Podman host, labels each for
@@ -50,7 +53,7 @@ QUSER="quasar"
 HOMES=""
 TEMPLATES=""
 CONSOLE=0
-CONSOLE_AUDIO_USER=""
+CONSOLE_AUDIO_RETIRED=0
 KERNEL_LOG=0
 PORT_START=""
 DRY_RUN=0
@@ -65,11 +68,9 @@ Usage: prepare-host.sh --mode rootless|rootful [options]
   --user NAME                   the Quasar user (default: quasar)
   --homes DIR                   create the homes root DIR, owned by the Quasar user
   --templates DIR               the same for the templates root (Steam's prepared home)
-  --console                     also grant the display, sound, i2c and physical
-                                input devices and the terminal (tty8) console mode uses
-  --console-audio-user USER     with --console: give console mode a PipeWire audio
-                                socket on USER's desktop session (refused without
-                                --console, or if USER does not exist)
+  --console                     also grant the display cards, sound, i2c and this
+                                machine's input devices and the terminal (tty8) that
+                                console mode uses (on SELinux, also a module for them)
   --allow-kernel-log            optional: let Quasar read GPU fault messages from
                                 the kernel log (kernel.dmesg_restrict=0)
   --unprivileged-port-start N   optional: let unprivileged services bind ports
@@ -88,7 +89,9 @@ while [ $# -gt 0 ]; do
     --homes) [ $# -ge 2 ] || die "--homes needs a value"; HOMES="$2"; shift 2 ;;
     --templates) [ $# -ge 2 ] || die "--templates needs a value"; TEMPLATES="$2"; shift 2 ;;
     --console) CONSOLE=1; shift ;;
-    --console-audio-user) [ $# -ge 2 ] || die "--console-audio-user needs a value"; CONSOLE_AUDIO_USER="$2"; shift 2 ;;
+    # Retired (#461): a console desktop plays its own audio. Accepted so an existing
+    # command line still runs; it changes nothing.
+    --console-audio-user) [ $# -ge 2 ] || die "--console-audio-user needs a value"; CONSOLE_AUDIO_RETIRED=1; shift 2 ;;
     --allow-kernel-log) KERNEL_LOG=1; shift ;;
     --unprivileged-port-start) [ $# -ge 2 ] || die "--unprivileged-port-start needs a value"; PORT_START="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -105,10 +108,6 @@ esac
 if [ -n "$PORT_START" ]; then
   case "$PORT_START" in ''|*[!0-9]*) die "--unprivileged-port-start must be a port number" ;; esac
   [ "$PORT_START" -ge 1 ] && [ "$PORT_START" -le 1024 ] || die "--unprivileged-port-start must be between 1 and 1024"
-fi
-if [ -n "$CONSOLE_AUDIO_USER" ]; then
-  [ "$CONSOLE" = 1 ] || die "--console-audio-user needs --console"
-  case "$CONSOLE_AUDIO_USER" in ''|-*|*[!a-z0-9_-]*) die "--console-audio-user must be a lowercase account name" ;; esac
 fi
 for pair in "homes:$HOMES" "templates:$TEMPLATES"; do
   opt="${pair%%:*}"; dir="${pair#*:}"
@@ -225,6 +224,31 @@ containers_selinux() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# selinux_module NAME CIL PUT_REASON LOAD_REASON: write /etc/quasar/selinux/NAME.cil and load
+# it as the SELinux module NAME. Idempotent: the module is loaded again only when it is
+# missing or its text changed (what was loaded is kept beside it as .NAME.loaded).
+# SELinux stays enforcing; a module only adds the allow rules it names.
+selinux_module() {
+  m_name="$1"; m_cil="$2"
+  printf '%s\n' "$m_cil" | put "/etc/quasar/selinux/$m_name.cil" 0644 "$3" || unchanged
+  if live && ! have semodule; then
+    die "semodule was not found: install policycoreutils, then run this again"
+  fi
+  if live && semodule -l 2>/dev/null | grep -qx "$m_name" \
+      && cmp -s "$R/etc/quasar/selinux/$m_name.cil" "$R/etc/quasar/selinux/.$m_name.loaded"; then
+    say ok "SELinux module $m_name"
+  elif ! live && grep -qx "$m_name" "$R/.selinux-modules" 2>/dev/null \
+      && cmp -s "$R/etc/quasar/selinux/$m_name.cil" "$R/etc/quasar/selinux/.$m_name.loaded"; then
+    say ok "SELinux module $m_name"
+  else
+    run semodule -i "/etc/quasar/selinux/$m_name.cil"
+    # What was loaded, so a changed rule is loaded again on the next run.
+    [ "$DRY_RUN" = 1 ] || cp "$R/etc/quasar/selinux/$m_name.cil" "$R/etc/quasar/selinux/.$m_name.loaded"
+    stand_in && echo "$m_name" >> "$R/.selinux-modules"
+    say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux module $m_name — $4"
+  fi
+}
+
 # After a `put` that returned non-zero: 1 means "already right"; anything else is fatal.
 unchanged() { rc=$?; [ "$rc" -eq 1 ] || exit "$rc"; }
 unchanged_then_false() { rc=$?; [ "$rc" -eq 1 ] || exit "$rc"; return 1; }
@@ -235,11 +259,6 @@ passwd_has() {
   if live && { [ "$1" = passwd ] || [ "$1" = group ]; }; then getent "$1" "$2" >/dev/null 2>&1
   else grep -q "^$2:" "$R/etc/$1" 2>/dev/null; fi
 }
-
-if [ -n "$CONSOLE_AUDIO_USER" ]; then
-  passwd_has passwd "$CONSOLE_AUDIO_USER" \
-    || die "--console-audio-user: no such account ($CONSOLE_AUDIO_USER). Console audio reaches a real desktop login, so the account must already exist."
-fi
 
 printf 'Quasar host preparation (%s%s)\n' "$MODE" "$([ "$DRY_RUN" = 1 ] && echo ', dry run' || true)"
 
@@ -363,24 +382,20 @@ EOF
 }
 rules_console() {
   cat <<'EOF'
-# Quasar device rules: console mode only (Quasar drives this machine's own screen).
+# Quasar device rules: console mode only (a desktop drives this machine's own screen).
 # Documented at https://accreleus.github.io/quasar/install/device-rules/
 # Each rule ADDS read/write for the 'quasar' group to one kind of device. It changes no
 # device's owner or mode. With these rules the 'quasar' group can read what is typed on
 # this machine's keyboards, so install this file only on a host that uses console mode.
 
-# Display cards: console mode drives the screen directly.
+# Display cards: the console desktop drives the screen directly, and Quasar reads which monitors are connected.
 SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# Local sound devices: console mode plays the session's audio on this machine.
+# Local sound devices: the console desktop plays its sound on this machine.
 SUBSYSTEM=="sound", KERNEL=="pcmC*|controlC*|timer", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
 # i2c buses: monitor control (DDC), such as switching the monitor's input.
 SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# This machine's keyboards, so console mode's exclusive grab (EVIOCGRAB) can take them while a session runs.
-SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# This machine's mice, for the same exclusive grab.
-SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
-# This machine's game controllers, for the same exclusive grab.
-SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_JOYSTICK}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
+# This machine's input devices (keyboards, mice, controllers, touchpads, buttons), so the console desktop can use them, including ones plugged in later.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT}=="1", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
 # Console mode's own virtual terminal: a session makes it the active one with the kernel keyboard off, so nothing typed in the session reaches a login prompt.
 SUBSYSTEM=="tty", KERNEL=="tty8", ACTION!="remove", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m g:quasar:rw $devnode"
 EOF
@@ -401,7 +416,7 @@ if rules_base | tailor | put /etc/udev/rules.d/70-quasar.rules 0644 "give the $Q
   rules_changed=1
 else unchanged; fi
 if [ "$CONSOLE" = 1 ]; then
-  if rules_console | tailor | put /etc/udev/rules.d/71-quasar-console.rules 0644 "console mode: give the $QUSER group the display cards, sound, i2c buses, tty8 and this machine's keyboards, mice and game controllers while console mode uses them; the $QUSER group can read what is typed on this machine's keyboard"; then
+  if rules_console | tailor | put /etc/udev/rules.d/71-quasar-console.rules 0644 "console mode: give the $QUSER group the display cards, sound, i2c buses, tty8 and this machine's input devices, which the console desktop is given; the $QUSER group can read what is typed on this machine's keyboard"; then
     rules_changed=1
   else unchanged; fi
 elif [ -f "$R/etc/udev/rules.d/71-quasar-console.rules" ]; then
@@ -447,122 +462,18 @@ if [ "$CONSOLE" = 1 ]; then
   done
 fi
 
-# ── console audio (PipeWire) ───────────────────────────────────────────────
-if [ -n "$CONSOLE_AUDIO_USER" ]; then
-  STEP="console audio"
-  dropin_changed=0
-  if {
-    cat <<EOF
-# Written by Quasar host preparation (deploy/prepare-host.sh). A second PipeWire
-# Pulse listen socket for console mode, reachable only through
-# /run/quasar-console-audio (see quasar-console-audio.conf in tmpfiles.d, which
-# restricts that directory to $CONSOLE_AUDIO_USER and the $QUSER group). The
-# default socket (unix:native) is kept as-is, so $CONSOLE_AUDIO_USER's own
-# desktop audio is unaffected; $CONSOLE_AUDIO_USER's pipewire-pulse must be
-# restarted (or $CONSOLE_AUDIO_USER must log in again) to pick this file up.
-#
-# This is PipeWire's documented server.address form: a plain string is today's
-# default, an object adds an access-controlled extra socket. Drop-in merge
-# behaviour for this array can vary by PipeWire version — verify against the
-# version installed here. If the socket does not appear after a restart, check
-# "pactl info" as $CONSOLE_AUDIO_USER and merge this by hand into
-# pipewire-pulse.conf instead of this drop-in.
-pulse.properties = {
-    server.address = [
-        "unix:native"
-        {
-            address = "unix:/run/quasar-console-audio/native"
-            # "restricted" if playback still works through a restricted socket
-            # (the default here); flip to "unrestricted" and update this
-            # comment if it does not, and record that choice for the operator.
-            client.access = "restricted"
-        }
-    ]
-}
-EOF
-  } | put /etc/pipewire/pipewire-pulse.conf.d/90-quasar-console.conf 0644 \
-      "a Quasar-only PipeWire socket on $CONSOLE_AUDIO_USER's session, so console mode can play audio through a real desktop login without full access to it"; then
-    dropin_changed=1
-  else
-    unchanged
-  fi
-
-  printf '# Written by Quasar host preparation. The console-audio socket %s'"'"'s pipewire-pulse listens on, reachable by the %s group only.\nd /run/quasar-console-audio 0750 %s %s -\n' "$CONSOLE_AUDIO_USER" "$QUSER" "$CONSOLE_AUDIO_USER" "$QUSER" \
-    | put /etc/tmpfiles.d/quasar-console-audio.conf 0644 "/run/quasar-console-audio, owned by $CONSOLE_AUDIO_USER and readable by the $QUSER group, recreated at every boot" || unchanged
-  run systemd-tmpfiles --create /etc/tmpfiles.d/quasar-console-audio.conf
-  stand_in && mkdir -p "$R/run/quasar-console-audio"
-
-  # pipewire-pulse opens the console-audio socket only while it runs, and Fedora only
-  # socket-activates it: after a boot nothing starts it until a client connects (#433,
-  # measured on the lab host). This user unit starts it with $CONSOLE_AUDIO_USER's manager
-  # (at boot when lingering, else at login). ConditionUser skips it for everyone else.
-  cat <<EOF | put /etc/systemd/user/quasar-console-audio.service 0644 \
-      "starts $CONSOLE_AUDIO_USER's pipewire-pulse with their user manager, so the console-audio socket is there after a reboot" || unchanged
-# Written by Quasar host preparation (deploy/prepare-host.sh). Starts
-# $CONSOLE_AUDIO_USER's pipewire-pulse with their user manager, so it opens the
-# console-audio socket (/run/quasar-console-audio/native) without waiting for a client.
-# Skipped for every other user.
-[Unit]
-Description=Quasar console audio: start pipewire-pulse for $CONSOLE_AUDIO_USER
-ConditionUser=$CONSOLE_AUDIO_USER
-Wants=pipewire-pulse.service
-After=pipewire-pulse.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/true
-RemainAfterExit=yes
-
-[Install]
-WantedBy=default.target
-EOF
-  wants=/etc/systemd/user/default.target.wants/quasar-console-audio.service
-  if [ -L "$R$wants" ]; then
-    say ok "$wants"
-  else
-    run systemctl --global enable quasar-console-audio.service
-    stand_in && { mkdir -p "$(dirname "$R$wants")" && ln -s /etc/systemd/user/quasar-console-audio.service "$R$wants"; }
-    say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "quasar-console-audio.service enabled for user managers (it runs only for $CONSOLE_AUDIO_USER)"
-  fi
-
-  # A running pipewire-pulse reads the drop-in only when it starts (#433). Restart it
-  # only when the drop-in just changed, only for $CONSOLE_AUDIO_USER, and only while that
-  # user's manager runs; with the drop-in unchanged and the socket missing, start it
-  # (a no-op for a running one). Through runuser: `systemctl --user -M USER@` needs
-  # machined's transient units, which fail on Fedora CoreOS (uCore, systemd 259).
-  if live; then
-    audio_uid="$(getent passwd "$CONSOLE_AUDIO_USER" | awk -F: '{print $3}')"
-    audio_manager() { systemctl is-active --quiet "user@$audio_uid.service"; }
-  else
-    audio_uid="$(awk -F: -v u="$CONSOLE_AUDIO_USER" '$1==u {print $3}' "$R/etc/passwd")"
-    audio_manager() { [ -e "$R/run/user/$audio_uid/systemd/private" ]; }
-  fi
-  user_systemctl() { run runuser -u "$CONSOLE_AUDIO_USER" -- env "XDG_RUNTIME_DIR=/run/user/$audio_uid" systemctl --user "$@"; }
-  restart_cmd="runuser -u $CONSOLE_AUDIO_USER -- env XDG_RUNTIME_DIR=/run/user/$audio_uid systemctl --user restart pipewire-pulse.service"
-  if [ "$dropin_changed" = 1 ] && audio_manager; then
-    if [ "$DRY_RUN" = 1 ]; then
-      say would "restart $CONSOLE_AUDIO_USER's pipewire-pulse, so it opens the console-audio socket now"
-    elif user_systemctl restart pipewire-pulse.service; then
-      stand_in && : > "$R/run/quasar-console-audio/native"
-      say changed "$CONSOLE_AUDIO_USER's pipewire-pulse restarted — it now also listens on /run/quasar-console-audio/native"
-    else
-      say warn "$CONSOLE_AUDIO_USER's pipewire-pulse did not restart; run: $restart_cmd"
-    fi
-  elif [ "$dropin_changed" = 1 ]; then
-    say note "$CONSOLE_AUDIO_USER has no running user session: their pipewire-pulse opens the console-audio socket when they next log in (if it already runs, run: $restart_cmd)"
-  elif [ ! -e "$R/run/quasar-console-audio/native" ] && audio_manager; then
-    if [ "$DRY_RUN" = 1 ]; then
-      say would "start $CONSOLE_AUDIO_USER's pipewire-pulse, so it opens the console-audio socket"
-    elif user_systemctl start pipewire-pulse.service; then
-      stand_in && : > "$R/run/quasar-console-audio/native"
-      say changed "$CONSOLE_AUDIO_USER's pipewire-pulse started — it now listens on /run/quasar-console-audio/native"
-    else
-      say warn "$CONSOLE_AUDIO_USER's pipewire-pulse did not start; run: $restart_cmd"
-    fi
-  elif [ ! -e "$R/run/quasar-console-audio/native" ]; then
-    say note "the console-audio socket is not there yet: log $CONSOLE_AUDIO_USER in, or run: $restart_cmd"
-  fi
-fi
+# ── console audio (retired) ────────────────────────────────────────────────
+# A console session's desktop plays its own audio through the sound device it is given.
+# Earlier runs could give the agent a PipeWire socket on a desktop user's session; nothing
+# uses it now, and what they wrote is named here rather than removed from under that user.
+STEP="console audio"
+[ "$CONSOLE_AUDIO_RETIRED" = 1 ] \
+  && say note "--console-audio-user is retired and ignored: a console desktop plays its own audio"
+for f in /etc/pipewire/pipewire-pulse.conf.d/90-quasar-console.conf \
+         /etc/tmpfiles.d/quasar-console-audio.conf \
+         /etc/systemd/user/quasar-console-audio.service; do
+  [ -e "$R$f" ] && say note "$f was written by an earlier run for console audio, which is retired: nothing uses it, remove it when convenient"
+done
 
 # ── kernel modules ─────────────────────────────────────────────────────────
 STEP="kernel modules"
@@ -677,29 +588,57 @@ if [ -e "$R/proc/driver/nvidia/version" ] && [ -e "$R/dev/nvidiactl" ]; then
     # Sessions run as container_engine_t, the policy's confined type for nested sandboxes
     # (Steam's bwrap). The boolean above covers container_t only; this one rule gives
     # container_engine_t the same NVIDIA device access, and nothing more.
-    printf '%s\n' '; Written by Quasar host preparation (deploy/prepare-host.sh).' \
-      '(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))' \
-      | put /etc/quasar/selinux/quasar-nested-gpu.cil 0644 "the NVIDIA device rule for sessions' nested-sandbox SELinux type" || unchanged
-    if live && ! have semodule; then
-      die "semodule was not found: install policycoreutils, then run this again"
-    fi
-    if live && semodule -l 2>/dev/null | grep -qx quasar-nested-gpu \
-        && cmp -s "$R/etc/quasar/selinux/quasar-nested-gpu.cil" "$R/etc/quasar/selinux/.quasar-nested-gpu.loaded"; then
-      say ok "SELinux module quasar-nested-gpu"
-    elif ! live && grep -qx quasar-nested-gpu "$R/.selinux-modules" 2>/dev/null; then
-      say ok "SELinux module quasar-nested-gpu"
-    else
-      run semodule -i /etc/quasar/selinux/quasar-nested-gpu.cil
-      # What was loaded, so a changed rule is loaded again on the next run.
-      [ "$DRY_RUN" = 1 ] || cp "$R/etc/quasar/selinux/quasar-nested-gpu.cil" "$R/etc/quasar/selinux/.quasar-nested-gpu.loaded"
-      stand_in && echo quasar-nested-gpu >> "$R/.selinux-modules"
-      say "$([ "$DRY_RUN" = 1 ] && echo would || echo changed)" "SELinux module quasar-nested-gpu — lets sessions (container_engine_t) open the NVIDIA device nodes, as the boolean does for container_t; SELinux stays enforcing"
-    fi
+    selinux_module quasar-nested-gpu "; Written by Quasar host preparation (deploy/prepare-host.sh).
+(allow container_engine_t xserver_misc_device_t (chr_file (getattr ioctl lock map open read write append)))" \
+      "the NVIDIA device rule for sessions' nested-sandbox SELinux type" \
+      "lets sessions (container_engine_t) open the NVIDIA device nodes, as the boolean does for container_t; SELinux stays enforcing"
   fi
 elif [ -e "$R/proc/driver/nvidia/version" ]; then
   say skipped "NVIDIA CDI specification — the NVIDIA driver is loaded but this machine has no NVIDIA device (/dev/nvidiactl)"
 else
   say skipped "NVIDIA CDI specification — no NVIDIA driver loaded"
+fi
+
+# ── SELinux: session sound ─────────────────────────────────────────────────
+# A session's PulseAudio sidecar runs as container_t and listens on a unix socket; an app that
+# needs the nested-sandbox type (Steam's bwrap) runs as container_engine_t and must connect to
+# it. The policy's own connectto rule is "self": it covers two containers of the same type
+# only, so without this one the connect is denied and the stream is silent. MCS categories do
+# not constrain connectto, so sharing them would change nothing. This is the one rule, on the
+# one class, and nothing else. It is written on every SELinux host, not only NVIDIA ones.
+STEP="SELinux session sound"
+if containers_selinux; then
+  selinux_module quasar-nested-audio "; Written by Quasar host preparation (deploy/prepare-host.sh).
+(allow container_engine_t container_t (unix_stream_socket (connectto)))" \
+    "the PulseAudio socket rule for sessions' nested-sandbox SELinux type" \
+    "lets sessions (container_engine_t) connect to their session's PulseAudio sidecar (container_t); SELinux stays enforcing"
+fi
+
+# ── SELinux: console devices ───────────────────────────────────────────────
+# A console session runs as container_engine_t too, and the policy gives that type none of
+# what a desktop on the screen needs: the input nodes (event_device_t, under /dev/input,
+# which is device_t), the sound nodes (sound_device_t), the hidraw nodes Steam Input reads
+# (usb_device_t) and the udev database libudev reads (udev_var_run_t). Without them KWin
+# starts with no keyboard or mouse. The display cards (dri_device_t) are already allowed by
+# the boolean above. `watch` on the device directories is PipeWire's inotify on /dev/snd: without
+# it the ALSA monitor fails and the desktop has no sound card. One module names exactly these,
+# and only when --console asks for them.
+STEP="SELinux console devices"
+console_cil="/etc/quasar/selinux/quasar-console-devices.cil"
+if [ "$CONSOLE" = 1 ]; then
+  if containers_selinux; then
+    selinux_module quasar-console-devices "; Written by Quasar host preparation (deploy/prepare-host.sh --console).
+(allow container_engine_t device_t (dir (getattr open read search watch)))
+(allow container_engine_t event_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t sound_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t usb_device_t (chr_file (getattr ioctl lock map open read write append)))
+(allow container_engine_t udev_var_run_t (dir (getattr open read search)))
+(allow container_engine_t udev_var_run_t (file (getattr open read map)))" \
+      "the input, sound, hidraw and udev-data rules for a console session's SELinux type" \
+      "lets console sessions (container_engine_t) open this machine's input, sound and hidraw nodes and read the udev database; SELinux stays enforcing"
+  fi
+elif [ -f "$R$console_cil" ] || { live && have semodule && semodule -l 2>/dev/null | grep -qx quasar-console-devices; }; then
+  say note "SELinux module quasar-console-devices is installed from an earlier --console run and is left in place: remove it with 'semodule -r quasar-console-devices' (and delete $console_cil) if console mode is retired on this machine"
 fi
 
 # ── Podman: restart at boot ────────────────────────────────────────────────

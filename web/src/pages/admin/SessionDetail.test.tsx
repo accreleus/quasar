@@ -413,6 +413,16 @@ describe("SessionHero", () => {
     expect(screen.getByText("1h 0m")).toBeInTheDocument();
   });
 
+  it("follows the state with a running session's detail", () => {
+    renderHero(makeSession({ state_detail: "displaying 3840×2160 @ 240 Hz" }));
+    expect(screen.getByText("ada · quasar-node-1 · running · displaying 3840×2160 @ 240 Hz")).toBeInTheDocument();
+  });
+
+  it("names no detail for a terminal session, even when one was recorded", () => {
+    renderHero(makeSession({ state: "stopped", state_detail: "peer disconnected", ended_at: "2024-01-01T00:30:00Z" }), false);
+    expect(screen.getByText("ada · quasar-node-1 · stopped")).toBeInTheDocument();
+  });
+
   it("shows the size the ladder is actually encoding, not the launch size", () => {
     renderHero(
       makeSession({

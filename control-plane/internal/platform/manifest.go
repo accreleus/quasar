@@ -19,8 +19,9 @@ import (
 //
 // Validation must stay as strict as the producer's validator
 // (scripts/release/validate-platform-release-manifest.sh): what is being accepted is the
-// digest set a fleet is about to be pinned to (ADR 0001). Every rejection is a
-// manifest_invalid and the release is not listed.
+// digest set a fleet is about to be pinned to (ADR 0001). Every rejection is
+// counted by detection (manifest_invalid in its run record) and the release is
+// not listed.
 
 // The two formats this build understands; any other value is invalid rather than
 // best-effort parsed.

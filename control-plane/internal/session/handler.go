@@ -224,7 +224,10 @@ type sessionResp struct {
 	// The app container's last ~100 log lines, oldest first, captured while it
 	// ran: containers use `--rm`, so the daemon has discarded them by the time
 	// anyone looks (#463).
-	AppLogTail *string         `json:"app_log_tail"`
+	AppLogTail *string `json:"app_log_tail"`
+	// Why the control plane stopped the session, from a closed set; null for
+	// every other end. Semantics: control-api.md amendment 24.
+	StopReason *string         `json:"stop_reason"`
 	HomeSeed   json.RawMessage `json:"home_seed"`
 	// The launch profile the session came from, null for a legacy/tier/override
 	// launch. Resolved values are in Stream; metadata at GET /v1/me/profiles.
@@ -340,6 +343,7 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		ErrorMessage:    s.ErrorMessage,
 		FailureCode:     s.FailureCode,
 		AppLogTail:      s.AppLogTail,
+		StopReason:      clientStopReason(s.State, s.StopReason),
 		HomeSeed:        s.HomeSeed,
 		ProfileID:       s.ProfileID,
 		StreamProfileID: s.StreamProfileID,
@@ -353,6 +357,20 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		StartedAt:    s.StartedAt,
 		EndedAt:      s.EndedAt,
 	}
+}
+
+// clientStopReason keeps a recorded session_stop reason only when it is in the
+// closed stop_reason vocabulary of control-api.md amendment 24. The rest are
+// internal strings and must never reach a client. A session reaped to `failed`
+// while it was stopping reads null too: host_lost is then the explanation.
+func clientStopReason(state State, recorded *string) *string {
+	if state != StateStopping && state != StateStopped {
+		return nil
+	}
+	if recorded != nil && *recorded == StopReasonEntitlementRevoked {
+		return recorded
+	}
+	return nil
 }
 
 // --- handlers ----------------------------------------------------------------
@@ -564,7 +582,8 @@ func (h *Handler) handleSignalingToken(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	id := r.PathValue("id")
 	sess, err := h.store.Get(r.Context(), id)
-	if errors.Is(err, ErrNotFound) || (err == nil && !canAccess(user, sess)) {
+	// Owner only, never admin: a token attaches to the live stream and input (#496).
+	if errors.Is(err, ErrNotFound) || (err == nil && sess.UserID != user.ID) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
 		return
 	}

@@ -372,6 +372,20 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 		}
 	}()
 
+	// #415: a later attach owns this session's signaling — this connection is
+	// deaf to agent frames and must tear down now.
+	// #526: close with a code the client can act on; 1000 looked like an
+	// ordinary hang-up, so the displaced tab re-minted and displaced the
+	// displacer, ping-pong forever. Last attach wins and the loser is told it
+	// lost. A client's own reconnect also lands here, harmlessly: its old
+	// transport is already torn down, so only a still-live socket — a
+	// different tab — observes this frame.
+	takenOver := func() {
+		h.log.Info("signaling WS taken over by a later attach",
+			"token", "signal-taken-over", "session_id", sess.ID)
+		wsClose(wsCloseTakenOver, "session attached from another client", "taken-over")
+	}
+
 	// --- 4. Pump: agent→browser and browser→agent ---
 	for {
 		select {
@@ -388,6 +402,14 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 					reason = "browser-read-failed"
 				}
 				closedNoFrame(reason, res.err)
+				return
+			}
+			// #535: select picks at random when this frame and the takeover are
+			// both ready. A frame from a displaced socket must not reach the agent:
+			// the later attach owns the negotiation, and a stale answer there
+			// costs the new client a transport.
+			if displaced(signals) {
+				takenOver()
 				return
 			}
 			// #505: an ICE restart for a PC whose offer is still outstanding is
@@ -435,21 +457,22 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 			wsClose(wsCloseNotFound, "session is terminal", "session-ended")
 			return
 		case <-signals.Displaced:
-			// #415: a later attach owns this session's signaling — this
-			// connection is deaf to agent frames and must tear down now.
-			// #526: close with a code the client can act on; 1000 looked like
-			// an ordinary hang-up, so the displaced tab re-minted and displaced
-			// the displacer, ping-pong forever. Last attach wins and the loser
-			// is told it lost. A client's own reconnect also lands here,
-			// harmlessly: its old transport is already torn down, so only a
-			// still-live socket — a different tab — observes this frame.
-			h.log.Info("signaling WS taken over by a later attach",
-				"token", "signal-taken-over", "session_id", sess.ID)
-			wsClose(wsCloseTakenOver, "session attached from another client", "taken-over")
+			takenOver()
 			return
 		case <-ctx.Done():
 			closedNoFrame("context-cancelled", ctx.Err())
 			return
 		}
+	}
+}
+
+// displaced reports, without blocking, whether a later attach has taken this
+// socket's session.
+func displaced(signals agentws.BrowserSignals) bool {
+	select {
+	case <-signals.Displaced:
+		return true
+	default:
+		return false
 	}
 }

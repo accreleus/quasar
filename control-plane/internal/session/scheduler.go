@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // CreateParams are the resolved inputs to a launch: the owner, the app, the
@@ -44,8 +45,12 @@ type CreateParams struct {
 	// veto would permanently kill the local console with only an error log. The
 	// cert bench must NOT set it — a VRAM-pressured host is a real finding.
 	SkipVramVeto bool
-	TokenHash    string
-	TokenExpires time.Time
+	// NoHomeSettleWait refuses a settling home hold at once (#477). Console
+	// auto-start only: it runs on the agent's read loop, the path the clearing
+	// proof arrives on, so the wait cannot succeed. The proof re-runs auto-start.
+	NoHomeSettleWait bool
+	TokenHash        string
+	TokenExpires     time.Time
 	// The EFFECTIVE runtime app's opt-in to persistent home storage (P5-02); true
 	// makes scheduleAttempt enforce the P5-04 single-writer guard. Must come from
 	// LaunchApp.ManagedHome, never apps.managed_home: a tile's own column is false
@@ -162,7 +167,7 @@ func (s *Store) ScheduleAndCreate(ctx context.Context, p CreateParams) (Session,
 	for {
 		sess, err := s.schedulePlacement(ctx, p)
 		var settling *homeHoldSettlingError
-		if errors.As(err, &settling) {
+		if errors.As(err, &settling) && !p.NoHomeSettleWait {
 			if settleUntil.IsZero() {
 				settleUntil = time.Now().Add(homeHoldSettleWait)
 			}
@@ -180,19 +185,27 @@ func (s *Store) ScheduleAndCreate(ctx context.Context, p CreateParams) (Session,
 	}
 }
 
-// schedulePlacement retries scheduleAttempt under same-GPU contention.
+// schedulePlacement retries scheduleAttempt under same-GPU contention, and when
+// an attempt loses a deadlock (#553).
 func (s *Store) schedulePlacement(ctx context.Context, p CreateParams) (Session, error) {
 	for attempt := 0; attempt < maxPlacementAttempts; attempt++ {
 		if attemptObserver != nil {
 			attemptObserver(attempt)
 		}
 		sess, retry, err := s.scheduleAttempt(ctx, p)
+		// Whichever statement lost the deadlock, the attempt never committed and
+		// its rollback broke the cycle. An attempt must keep every effect inside
+		// its transaction for this retry to be safe.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+			continue
+		}
 		if !retry {
 			return sess, err
 		}
 	}
-	// Retry budget exhausted under sustained same-GPU contention: report the
-	// retryable "busy" code.
+	// Retry budget exhausted under sustained contention: report the retryable
+	// "busy" code.
 	return Session{}, withCodecConstraint(p, ErrCapacityExhausted)
 }
 
@@ -251,19 +264,33 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	//
 	// The params are cast, not the columns, so entitlements_all_uk /
 	// entitlements_user_uk stay usable.
-	var one int
-	err = tx.QueryRow(ctx, `
-		SELECT 1 FROM entitlements e
-		WHERE e.app_id = $1::uuid
-		  AND (e.subject_type = 'all'
-		       OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))
-		LIMIT 1
-		FOR SHARE`, p.AppID, p.UserID).Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Session{}, false, ErrNotEntitled
+	//
+	// A derived tile needs the parent's entitlement too, share-locked the same
+	// way. The parent is read here, not taken from p.HomeAppID, so a caller that
+	// leaves HomeAppID unset cannot skip it. Parent first, as the app locks above.
+	var parentID *string
+	if err := tx.QueryRow(ctx, `SELECT parent_app_id::text FROM apps WHERE id=$1::uuid`, p.AppID).Scan(&parentID); err != nil {
+		return Session{}, false, fmt.Errorf("read launch app parent: %w", err)
 	}
-	if err != nil {
-		return Session{}, false, fmt.Errorf("check entitlement: %w", err)
+	entitledIDs := []string{p.AppID}
+	if parentID != nil {
+		entitledIDs = []string{*parentID, p.AppID}
+	}
+	for _, appID := range entitledIDs {
+		var one int
+		err = tx.QueryRow(ctx, `
+			SELECT 1 FROM entitlements e
+			WHERE e.app_id = $1::uuid
+			  AND (e.subject_type = 'all'
+			       OR (e.subject_type = 'user' AND e.subject_id = $2::uuid))
+			LIMIT 1
+			FOR SHARE`, appID, p.UserID).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Session{}, false, ErrNotEntitled
+		}
+		if err != nil {
+			return Session{}, false, fmt.Errorf("check entitlement: %w", err)
+		}
 	}
 	if p.ManagedHome {
 		owner, err := homeClaimOwner(ctx, tx, p)

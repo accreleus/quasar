@@ -29,6 +29,10 @@ export interface SessionSwapControllerProps {
    *  this to collapse the HUD shelf. Kept separate from the transition state
    *  machine itself, which knows nothing about the HUD. */
   onSwapStart?: () => void;
+  /** The session is over for the page: draw neither the children (no way to
+   *  start a swap) nor the overlay (it must not cover the banner). The hook
+   *  keeps running, so a swap in flight survives a verdict that clears. */
+  sessionOver?: boolean;
   /** Render prop: caller gets only the two derived values its children need
    *  (the Games pane, the bar's swappingTo). The transition screen is rendered here,
    *  so no second call site can render it with a stale `transition` value. */
@@ -42,6 +46,7 @@ export function SessionSwapController({
   onCommitted,
   onToast,
   onSwapStart,
+  sessionOver = false,
   children,
 }: SessionSwapControllerProps) {
   const { transition, startSwap, rejectSwap } = useSwapTransition({
@@ -69,11 +74,11 @@ export function SessionSwapController({
 
   return (
     <>
-      {children({ quickSwitch, swappingTo })}
+      {!sessionOver && children({ quickSwitch, swappingTo })}
       {/* z-index 60, above the HUD (20); onSwapStart above collapses the
           shelf. Held until the poll observes the server's own outcome, never
           on the request alone — see useSwapTransition.ts. */}
-      <SessionSwapTransition transition={transition} />
+      <SessionSwapTransition transition={sessionOver ? null : transition} />
     </>
   );
 }

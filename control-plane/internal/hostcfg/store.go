@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,6 +18,9 @@ type Store struct {
 	// policyErrors holds the last agent rejection code per host/group for the
 	// typed remedy. Display-only: durable retry state lives in the obligation.
 	policyErrors sync.Map
+	// boot is the incarnation this process wrote in StartRH05Boot; nil in a
+	// store that never booted.
+	boot atomic.Pointer[string]
 }
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }

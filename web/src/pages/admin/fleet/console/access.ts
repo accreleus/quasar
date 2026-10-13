@@ -5,10 +5,8 @@
  * the component.
  */
 
-import type { ConsoleAccess, ConsoleCapabilities } from "../../../../api/types";
+import type { ConsoleAccess } from "../../../../api/types";
 import { failureText } from "../releasesCopy";
-
-type AudioSink = ConsoleCapabilities["audio_sinks"][number];
 
 /** "Has access": `state` is `on`, or `restored` with `target` false (a failed
  *  attempt to turn it OFF, so the host kept the access it had). Every other
@@ -76,18 +74,3 @@ export const CONSOLE_RULES_COMMAND =
   "sudo cp deploy/udev/71-quasar-console.rules /etc/udev/rules.d/ && " +
   "sudo udevadm control --reload && sudo udevadm trigger && " +
   "sudo systemctl mask getty@tty8.service autovt@tty8.service";
-
-/**
- * Whether the "Local audio output" selector's reported sinks are the host's
- * PipeWire (ids `pipewire:<node>` / `pipewire:default`, RH07-15 §3) or ALSA
- * `hw:*` sinks — the two never mix, since the agent reports one family or the
- * other for a given host. `"none"` when no sinks were reported at all (an
- * older agent, or a host that has not probed audio), which keeps today's
- * generic help text.
- */
-export type ConsoleAudioBackend = "pipewire" | "alsa" | "none";
-
-export function consoleAudioBackend(sinks: AudioSink[] | undefined | null): ConsoleAudioBackend {
-  if (!sinks || sinks.length === 0) return "none";
-  return sinks.some((s) => s.id.startsWith("pipewire:")) ? "pipewire" : "alsa";
-}

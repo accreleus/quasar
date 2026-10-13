@@ -343,31 +343,45 @@ func (s *Store) StartRH05Boot(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := fenceRH05Boot(ctx, tx, boot); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	s.boot.Store(&boot)
+	return boot, nil
+}
+
+// fenceRH05Boot makes boot the database's control-plane incarnation and holds
+// every host until its agent's complete journal is proven under it. It locks
+// the boot row before the host rows; a caller holding either must keep that order.
+func fenceRH05Boot(ctx context.Context, tx pgx.Tx, boot string) error {
 	if _, err := tx.Exec(ctx, `INSERT INTO rh05_control_boot(id,incarnation,started_at)
 		VALUES(true,$1::uuid,now()) ON CONFLICT(id) DO UPDATE SET incarnation=excluded.incarnation,started_at=excluded.started_at`, boot); err != nil {
-		return "", err
+		return err
 	}
 	hostRows, err := tx.Query(ctx, `SELECT id::text FROM hosts ORDER BY id FOR UPDATE`)
 	if err != nil {
-		return "", err
+		return err
 	}
 	var hostIDs []string
 	for hostRows.Next() {
 		var id string
 		if err := hostRows.Scan(&id); err != nil {
 			hostRows.Close()
-			return "", err
+			return err
 		}
 		hostIDs = append(hostIDs, id)
 	}
 	err = hostRows.Err()
 	hostRows.Close()
 	if err != nil {
-		return "", err
+		return err
 	}
 	for _, hostID := range hostIDs {
 		if err := rotateHostReviewTokens(ctx, tx, hostID); err != nil {
-			return "", err
+			return err
 		}
 	}
 	// A stopped-stack database restore may have erased an offer committed after
@@ -375,7 +389,7 @@ func (s *Store) StartRH05Boot(ctx context.Context) (string, error) {
 	// until the current agent's complete journal proves nonacceptance.
 	if _, err := tx.Exec(ctx, `UPDATE host_config_approvals SET state='cancel_pending'
 		WHERE state IN ('approved','offered')`); err != nil {
-		return "", err
+		return err
 	}
 	// Every host that negotiated v2 or ever had a typed-owned group must prove
 	// complete journal state after this boot before scheduling resumes.
@@ -384,24 +398,21 @@ func (s *Store) StartRH05Boot(ctx context.Context) (string, error) {
 		WHERE config_policy_versions->>'typed_settings'='2' OR config_policy_ever_owned_groups<>'[]'::jsonb
 		ON CONFLICT(host_id) DO UPDATE SET boot_incarnation=excluded.boot_incarnation,
 		connection_incarnation=NULL,state='pending',completed_at=NULL,continuation_cursor=NULL`, boot); err != nil {
-		return "", err
+		return err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM host_idle_inventory`); err != nil {
-		return "", err
+		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
 		SELECT host_id,'reconciliation','00000000-0000-0000-0000-000000000002'::uuid,'journal_reconciliation'
 		FROM host_journal_reconciliation ON CONFLICT(host_id,owner_kind,owner_id) DO UPDATE SET reason='journal_reconciliation'`); err != nil {
-		return "", err
+		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE hosts SET status='draining' WHERE status='online' AND
 		EXISTS(SELECT 1 FROM host_admission_restrictions r WHERE r.host_id=hosts.id)`); err != nil {
-		return "", err
+		return err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return "", err
-	}
-	return boot, nil
+	return nil
 }
 
 func (s *Store) GetIdleApply(ctx context.Context, hostID, attemptID string) (IdleApplyAttempt, error) {

@@ -9,9 +9,7 @@ use gstreamer::prelude::*;
 use crate::session::virtual_input::VirtualDevices;
 use crate::session::{EncoderChoice, SessionConfig};
 
-use super::caps::{
-    dmabuf_zerocopy_format, local_dmabuf_transport, raw_video_caps, vulkan_image_transport,
-};
+use super::caps::{dmabuf_zerocopy_format, raw_video_caps, vulkan_image_transport};
 use super::encoders::va_device_element_prefix;
 
 /// Self-heal the compositor's Vulkan encode-src ring-slot tiling defect by pinning the
@@ -20,12 +18,14 @@ use super::encoders::va_device_element_prefix;
 ///
 /// The pin is HOST-WIDE, not per-session, and must stay that way: the compositor caches
 /// the ring depth process-globally (`ring_used()` `OnceLock`, read at the first encode-src
-/// allocation), so per-session pinning is unreliable. Once any session's knobs require a
-/// pin it covers every Vulkan session for the process lifetime, H.264 and AV1 included;
-/// RING=2 costs neither any smoothness. An explicit operator `WOLF_VULKAN_RING` still wins.
-fn pin_vulkan_encode_ring() {
-    // Ambient env read at compositor-element construction time, independent of the session
-    // build's own `EncoderKnobs::from_env()`.
+/// allocation), so per-session pinning is unreliable. It covers every Vulkan session for
+/// the process lifetime, H.264 and AV1 included; RING=2 costs neither any smoothness, and
+/// no other encoder reads it. An explicit operator `WOLF_VULKAN_RING` still wins.
+///
+/// Called from `session::prepare_gst_env`, before any thread exists: it used to run in
+/// the first Vulkan session's source build, a `setenv` beside every thread of a serving
+/// agent. The knobs it reads come from the environment, so they are the same there.
+pub(crate) fn pin_vulkan_encode_ring() {
     let knobs = super::encoders::EncoderKnobs::from_env();
     let Some(depth) = super::encoders::required_source_ring_depth(knobs) else {
         return;
@@ -36,10 +36,6 @@ fn pin_vulkan_encode_ring() {
     if std::env::var("WOLF_VULKAN_RING").is_ok_and(|v| !v.is_empty()) {
         return;
     }
-    // MUST be set before the compositor element leaves NULL: its first encode-src
-    // allocation, where `ring_used()` caches this, waits for the first frame. `set_var` is
-    // process-global and not thread-safe against a concurrent read; the timing (and the
-    // repo's pre-element env convention, e.g. GST_REGISTRY) keeps it race-free.
     std::env::set_var("WOLF_VULKAN_RING", depth.to_string());
     tracing::info!(
         "vulkan encode-src ring pinned to {depth} slots (WOLF_VULKAN_RING={depth}) for ALL \
@@ -87,12 +83,6 @@ pub(crate) fn build_video_source(
             tracing::info!(
                 "VK-05: waylanddisplaysrc vulkan=true (emit memory:VulkanImage NV12 for vulkanh264enc)"
             );
-            pin_vulkan_encode_ring();
-        } else if local_dmabuf_transport(cfg) {
-            el.set_property("nv12", true);
-            tracing::info!(
-                "local display: waylanddisplaysrc nv12=true (prefer display-importable NV12 DMABuf)"
-            );
         }
         // libinput's path backend opens these directly (no udev/seat). The gamepad
         // reaches the app through the container's mounted device node instead.
@@ -111,7 +101,6 @@ pub(crate) fn build_video_source(
     // The caps that cross the interpipe boundary. The framerate field is load-bearing:
     // without it waylanddisplaysrc produces 1 fps.
     let tail_caps = raw_video_caps(cfg);
-    // Named so a console mode switch (#445) can re-pin it to the new WxH@fps in place.
     let tail = gst::ElementFactory::make("capsfilter")
         .name("source-caps")
         .property("caps", &tail_caps)
@@ -163,29 +152,9 @@ pub(crate) fn build_video_source(
         // arms. No videoconvert/videoscale — neither can negotiate the VulkanImage memory
         // feature, so either would fail negotiation at runtime.
         EncoderChoice::Vulkan => {
-            if vulkan_image_transport(cfg) {
-                pipeline.add_many([&src, &tail])?;
-                gst::Element::link_many([&src, &tail]).context(
-                    "failed to link Vulkan video source (compositor → VulkanImage NV12)",
-                )?;
-            } else if local_dmabuf_transport(cfg) {
-                pipeline.add_many([&src, &tail])?;
-                gst::Element::link_many([&src, &tail])
-                    .context("failed to link local-only DMABuf source (compositor → DMA_DRM)")?;
-                tracing::info!(
-                    "local-only topology: source emits DMABuf DMA_DRM for direct display import"
-                );
-            } else {
-                let scale = gst::ElementFactory::make("videoscale")
-                    .build()
-                    .context("videoscale not found")?;
-                pipeline.add_many([&src, &scale, &tail])?;
-                gst::Element::link_many([&src, &scale, &tail])
-                    .context("failed to link local-only Vulkan-host source (compositor → RGBx)")?;
-                tracing::info!(
-                    "local-only topology: Vulkan encode transport bypassed; source emits system RGBx"
-                );
-            }
+            pipeline.add_many([&src, &tail])?;
+            gst::Element::link_many([&src, &tail])
+                .context("failed to link Vulkan video source (compositor → VulkanImage NV12)")?;
         }
         EncoderChoice::Openh264 => {
             let scale = gst::ElementFactory::make("videoscale")

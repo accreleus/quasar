@@ -206,7 +206,9 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 			h.writeScanErr(w, err, "could not record scan failure")
 			return
 		}
-		h.log.Info("library: scan reported failure", "scan_id", req.ScanID, "host_id", hostID)
+		// The scan row keeps the agent's text; the log gets only its class (scanfailure.go).
+		h.log.Warn("library: scan reported failure", "scan_id", req.ScanID, "host_id", hostID,
+			"cause", scanFailureClass(req.Error))
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"accepted": true})
 		return
 	}
@@ -244,7 +246,13 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	res, err := h.store.Reconcile(r.Context(), req.ScanID, hostID, req.Entries, details)
+	// Fail-closed: with no interval to measure the prune distance by, the scan marks only.
+	interval, _, err := h.resolver.ScanInterval(r.Context())
+	if err != nil {
+		h.log.Warn("library: could not resolve the scan interval; this scan prunes nothing", "err", err)
+		interval = 0
+	}
+	res, err := h.store.Reconcile(r.Context(), req.ScanID, hostID, req.Entries, details, interval)
 	if err != nil {
 		h.writeScanErr(w, err, "could not reconcile scan")
 		return
@@ -254,7 +262,11 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 		"observed", res.Observed, "suppressed", res.Suppressed,
 		"created", res.Created, "disabled", res.Disabled,
 		"granted", res.Granted, "revoked", res.Revoked, "rejected", res.Rejected,
-		"backfilled", res.Backfilled)
+		"backfilled", res.Backfilled, "missing", res.Missing, "pruned", res.Pruned)
+	if res.Capped {
+		h.log.Warn("library: scan hit the entry cap; games absent from it were not pruned or revoked",
+			"scan_id", req.ScanID, "user_id", res.UserID, "host_id", hostID, "entries", len(req.Entries))
+	}
 	h.resolveCreatedArtwork(r.Context(), req.ScanID, res.CreatedAppIDs)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"accepted": true})
 }
