@@ -57,8 +57,10 @@
 //! fails the context and ends the wait, a server that is alive but frozen holds
 //! it for libpulse's reply timeout. Measured with the session's PipeWire config,
 //! that NULL takes under 1 ms against a dead server, 1–3 ms against a live one
-//! and 30 s against a frozen one, 90 s with the mic's `pulsesink`. Never finish
-//! the audio pipeline ahead of the release.
+//! and 30 s against a frozen one, 90 s with the mic's `pulsesink`. So a session
+//! end never finishes the audio pipeline ahead of the release. A takeover has to
+//! take the old one to NULL under a live server (`SessionTransports::inbound`),
+//! and carries that wait (#613).
 //!
 //! The price is one error: `pulsesrc` posts `Disconnected: Connection terminated`
 //! when its server goes. `runner::stop_source` stops reporting from the audio bus

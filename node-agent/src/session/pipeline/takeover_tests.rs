@@ -1468,11 +1468,12 @@ fn logged(f: impl FnOnce()) -> String {
 }
 
 /// The session's sound server as its end sees it. Nothing here can count on a
-/// PulseAudio-protocol server, so this one keeps the state its capture was in when it was
-/// stopped, and a capture still running then reports the loss as `pulsesrc` does.
+/// PulseAudio-protocol server, so this one keeps what it found when it was stopped, and a
+/// capture still running then reports the loss as `pulsesrc` does.
 struct SoundServer {
     capture: gst::Element,
-    capture_at_stop: Arc<Mutex<Option<gst::State>>>,
+    /// The capture's state, and whether the audio bus still took a message.
+    at_stop: Arc<Mutex<Option<(gst::State, bool)>>>,
 }
 
 impl crate::session::teardown::Sidecar for SoundServer {
@@ -1484,12 +1485,22 @@ impl crate::session::teardown::Sidecar for SoundServer {
     }
     fn adopt_budget(&mut self, _: crate::session::teardown::RetryBudget) {}
     fn stop(&mut self) {
-        let mut seen = self.capture_at_stop.lock().unwrap();
+        let mut seen = self.at_stop.lock().unwrap();
         if seen.is_some() {
             return;
         }
         let state = self.capture.current_state();
-        *seen = Some(state);
+        // A flushing bus refuses a post. This message is no warning or error, so the
+        // handler drops it unlogged: its 60 s rate limit, which can hide the error below
+        // on a bus that does report, has no part in the answer.
+        let probe = gst::message::Application::new(gst::Structure::new_empty("probe"));
+        let reporting = self
+            .capture
+            .parent()
+            .and_downcast::<gst::Pipeline>()
+            .and_then(|audio| audio.bus())
+            .is_some_and(|bus| bus.post(probe).is_ok());
+        *seen = Some((state, reporting));
         if matches!(state, gst::State::Paused | gst::State::Playing) {
             sound_server_lost(&self.capture);
         }
@@ -1507,12 +1518,12 @@ fn a_session_end_does_not_report_its_sound_server_stopping() {
     }
     let _serial = serial();
     let host = Host::start("audio-end");
-    let capture_at_stop = Arc::new(Mutex::new(None));
+    let at_stop = Arc::new(Mutex::new(None));
     let res = SessionResources::with_sidecar(
         "takeover-audio-end",
         Box::new(SoundServer {
             capture: audio_capture(&host),
-            capture_at_stop: capture_at_stop.clone(),
+            at_stop: at_stop.clone(),
         }),
     );
     let sink = format!("takeover-audio-end-app-{}", std::process::id());
@@ -1521,15 +1532,21 @@ fn a_session_end_does_not_report_its_sound_server_stopping() {
 
     let log = logged(|| crate::session::runner::stop_source(&mut source, &host.transports));
 
-    assert_eq!(
-        *capture_at_stop.lock().unwrap(),
-        Some(gst::State::Playing),
-        "the audio pipeline was taken down ahead of its sound server, where it waits on \
-         that server"
-    );
+    // Read out first: a failed assertion that held this lock would poison it for the
+    // stops the session's destructors still make.
+    let at_stop = *at_stop.lock().unwrap();
     assert!(
         !log.contains("audio-pipeline-message"),
         "the session end logged an audio fault:\n{log}"
+    );
+    // The log alone could be quiet for another reason: the handler's rate limit, had
+    // this pipeline logged anything in the minute before.
+    assert_eq!(
+        at_stop,
+        Some((gst::State::Playing, false)),
+        "when the sound server was stopped (capture state, audio bus still reporting): \
+         the capture is still up, because taking it down first waits on that server, and \
+         its bus reports nothing any more"
     );
 }
 
