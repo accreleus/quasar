@@ -68,7 +68,7 @@ import {
   restoreCardFor,
 } from "./migratingUpdate";
 import { RefusedBanner, RestoreCard } from "./MigratingUpdateCards";
-import { blockingChecks, holdoutText, unknownChecks } from "./preflight";
+import { blockingChecks, holdoutText, unknownChecks, willBeSkipped } from "./preflight";
 import {
   FailedAttemptPanel,
   RevertConfirmModal,
@@ -942,9 +942,9 @@ function TargetsCard({
   const hostTargets = view.targets.filter((t) => t.kind === "host");
   // Done is a host already on the evaluated release; an eligible host is still to update.
   const upToDate = hostTargets.filter((t) => t.reason === "up_to_date").length;
-  const notEligible = hostTargets.filter((t) => !t.eligible);
-  const holdouts = notEligible.slice(0, 3);
-  const moreHoldouts = notEligible.length - holdouts.length;
+  const notDone = willBeSkipped(view.targets);
+  const holdouts = notDone.slice(0, 3);
+  const moreHoldouts = notDone.length - holdouts.length;
   // Offered only the update (amendment 14 below_floor): never a revert.
   const belowFloor = new Set(view.installed.hosts.filter((h) => h.below_floor).map((h) => h.host_id));
   const mustUpdate = hostTargets.filter((t) => t.eligible && t.host_id && belowFloor.has(t.host_id));

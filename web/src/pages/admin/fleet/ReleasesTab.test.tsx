@@ -15,6 +15,7 @@ import type {
   PlatformApplyAttempt,
   PlatformPreflight,
   PlatformRelease,
+  PlatformReleaseTarget,
   PlatformReleaseView,
 } from "../../../api/types";
 import { SectionHeadProvider } from "../../../components/shell/sectionHead";
@@ -245,10 +246,15 @@ describe("ReleasesTab", () => {
     // The rollup: the control plane's chip and k/N for the agents. The one host
     // is eligible, so it is still to update and not yet counted.
     expect(await screen.findByText("0/1")).toBeInTheDocument();
+    expect(nodeAgentsBar("0/1")).toHaveClass("warning");
     expect(screen.getByText("Per-host detail")).toBeInTheDocument();
     openPerHostDetail();
     expect(screen.getByRole("columnheader", { name: "Target" })).toBeInTheDocument();
   });
+
+  function cp(eligible: boolean, reason: PlatformReleaseTarget["reason"]): PlatformReleaseTarget {
+    return { kind: "control_plane", host_id: null, node_name: null, eligible, reason, preflight: PF };
+  }
 
   function nodeAgentsBar(count: string): Element | null | undefined {
     return screen.getByText(count).parentElement?.querySelector(".bar");
@@ -301,6 +307,50 @@ describe("ReleasesTab", () => {
 
     expect(await screen.findByText("1/2")).toBeInTheDocument();
     expect(nodeAgentsBar("1/2")).toHaveClass("warning");
+  });
+
+  it("lists no host rows for a fully updated fleet, even past three hosts", async () => {
+    const up = (i: number) => ({
+      kind: "host" as const, host_id: `h${i}`, node_name: `gpu-host-0${i}`, eligible: false, reason: "up_to_date" as const, preflight: PF,
+    });
+    mocked.getPlatformReleases.mockResolvedValue(
+      view({
+        targets: [cp(false, "up_to_date"), up(1), up(2), up(3), up(4), up(5)],
+      }),
+    );
+    const { container } = renderTab();
+
+    expect(await screen.findByText("5/5")).toBeInTheDocument();
+    expect(nodeAgentsBar("5/5")).toHaveClass("success");
+    expect(container.querySelectorAll(".rel-holdout")).toHaveLength(0);
+    expect(screen.queryByText(/more not ready/)).not.toBeInTheDocument();
+  });
+
+  it("lists only the hosts that are not done, behind a count of the done ones", async () => {
+    const up = (i: number) => ({
+      kind: "host" as const, host_id: `h${i}`, node_name: `gpu-host-0${i}`, eligible: false, reason: "up_to_date" as const, preflight: PF,
+    });
+    mocked.getPlatformReleases.mockResolvedValue(
+      view({
+        targets: [
+          cp(false, "up_to_date"),
+          up(1),
+          up(2),
+          up(3),
+          { kind: "host", host_id: "h4", node_name: "gpu-host-04", eligible: false, reason: "host_offline", preflight: PF },
+          { kind: "host", host_id: "h5", node_name: "gpu-host-05", eligible: false, reason: "install_mode_source", preflight: PF },
+        ],
+      }),
+    );
+    const { container } = renderTab();
+
+    expect(await screen.findByText("3/5")).toBeInTheDocument();
+    expect(nodeAgentsBar("3/5")).toHaveClass("warning");
+    const rows = [...container.querySelectorAll(".rel-holdout")].map((r) => r.textContent ?? "");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toContain("gpu-host-04");
+    expect(rows[1]).toContain("gpu-host-05");
+    expect(screen.queryByText(/more not ready/)).not.toBeInTheDocument();
   });
 
   it("renders release notes sanitised", async () => {
