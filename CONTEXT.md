@@ -49,10 +49,12 @@ persist. Computed from gathered inputs with no I/O, so the decision is
 separable from the reads that feed it and the write that records it.
 
 **Device probe** — a device-capability measurement reported by a client
-(bandwidth, RTT, max decode height, refresh rate, decode matrix). Per account,
-not per launching client: the latest device probe may describe a different
-device than the one launching now, which is why the H.264 lift is keyed on the
-request's declared client type as well as the device probe. _Avoid_: bare
+(bandwidth, RTT, max decode height, refresh rate, decode matrix). Per device:
+a launch reads the launching device's probe, and one that names no device
+reads the account's most recently seen device, which may not be the one
+launching now (`protocol/schema.md` §`sessions`, amendment 31). The H.264 lift
+is keyed on the request's declared client type as well as the device probe:
+the declaration is a claim, the probe a measurement. _Avoid_: bare
 "probe" in new prose (a *host probe* is a different thing, see Host readiness).
 
 **Envelope** — the conservative ceiling derived from a device probe: a safe bitrate
