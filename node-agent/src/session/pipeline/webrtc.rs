@@ -1044,16 +1044,76 @@ pub(crate) fn answer_from(
     }
 }
 
+/// `webrtc`'s DTLS transport, once it has made an offer.
+fn dtls_transport(webrtc: &gst::Element) -> Option<glib::Object> {
+    webrtc
+        .emit_by_name::<Option<glib::Object>>("get-transceiver", &[&0i32])?
+        .property::<Option<glib::Object>>("sender")?
+        .property::<Option<glib::Object>>("transport")
+}
+
+fn dtls_state(transport: &glib::Object) -> gstreamer_webrtc::WebRTCDTLSTransportState {
+    transport.property("state")
+}
+
 /// Has a DTLS handshake started on `webrtc`'s transport?
 pub(crate) fn dtls_started(webrtc: &gst::Element) -> bool {
-    let state = || {
-        webrtc
-            .emit_by_name::<Option<glib::Object>>("get-transceiver", &[&0i32])?
-            .property::<Option<glib::Object>>("sender")?
-            .property::<Option<glib::Object>>("transport")
-            .map(|t| t.property::<gstreamer_webrtc::WebRTCDTLSTransportState>("state"))
-    };
-    state().is_some_and(|s| s != gstreamer_webrtc::WebRTCDTLSTransportState::New)
+    dtls_transport(webrtc)
+        .is_some_and(|t| dtls_state(&t) != gstreamer_webrtc::WebRTCDTLSTransportState::New)
+}
+
+/// Is `webrtc` still holding back what its transport receives? `webrtcbin` blocks its
+/// receive bin's source pads until the certificate the peer presented in DTLS matches
+/// the answer's `a=fingerprint`, and through GStreamer 1.28.8 that block is the only
+/// place the verdict shows: no property, signal or bus message, and DTLS reads
+/// `connected` either way. One receive bin per `webrtcbin` (`max-bundle`). `None` when
+/// it is not there to ask, which must read as no verdict.
+fn holds_inbound(webrtc: &gst::Element) -> Option<bool> {
+    let receive = webrtc
+        .downcast_ref::<gst::Bin>()?
+        .children()
+        .into_iter()
+        .find(|e| e.type_().name() == "TransportReceiveBin")?;
+    Some(receive.static_pad("rtp_src")?.is_blocked())
+}
+
+/// Warn, once per transport, when its peer fails the fingerprint check (#577;
+/// `protocol/signaling.md` §The answer's `a=fingerprint`). The session goes on.
+pub(super) fn warn_on_fingerprint_mismatch(webrtc: &gst::Element, pc: PcId, session_id: String) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let watched = AtomicBool::new(false);
+    // The DTLS transport exists from the first offer, and connects only after an answer.
+    webrtc.connect_notify(Some("signaling-state"), move |webrtc, _| {
+        let Some(dtls) = dtls_transport(webrtc) else {
+            return;
+        };
+        if watched.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (weak, session_id) = (webrtc.downgrade(), session_id.clone());
+        let said = AtomicBool::new(false);
+        // `after` puts this behind webrtcbin's own handler within the same emission, and
+        // that handler is where it makes the check. The pad read is `rtp_src`: `data_src`
+        // keeps a second block, for SCTP, lifted later on webrtcbin's task thread, which
+        // is the race a read at `connection-state` hits.
+        dtls.connect("notify::state", true, move |values| {
+            let dtls = values[0].get::<glib::Object>().ok()?;
+            if dtls_state(&dtls) == gstreamer_webrtc::WebRTCDTLSTransportState::Connected
+                && holds_inbound(&weak.upgrade()?) == Some(true)
+                && !said.swap(true, Ordering::SeqCst)
+            {
+                tracing::warn!(
+                    token = "transport-peer-fingerprint-mismatch",
+                    session_id = %session_id,
+                    "{pc} PC: this client failed the DTLS fingerprint check: the certificate \
+                     it presented does not match its answer's a=fingerprint as the host \
+                     reads it. It is sent media and nothing it sends is accepted (no input, \
+                     no microphone, no RTCP feedback)"
+                );
+            }
+            None
+        });
+    });
 }
 
 /// Has `webrtc` made an offer yet?
