@@ -280,7 +280,10 @@ func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion s
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var isRestart bool
-	err = tx.QueryRow(ctx, reconnectHostSQL, hostID, agentVersion, agentRestartMinGap.Milliseconds(), sourceCommit).Scan(&isRestart)
+	err = tx.QueryRow(ctx, reconnectHostSQL, hostID, agentVersion, agentRestartMinGap.Milliseconds(), sourceCommit, storedHash).Scan(&isRestart)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return registerResult{}, ErrInvalidNodeSecret // rotated or the row replaced since the lookup
+	}
 	if err != nil {
 		return registerResult{}, fmt.Errorf("update host: %w", err)
 	}
@@ -316,7 +319,8 @@ const registerStatusSQL = `CASE WHEN hosts.status = 'draining'
 // same build ⇒ blip (process identity unchanged). agent_disconnected_at is
 // always cleared — consumed, so a stale value can never misclassify a later
 // reconnect. $4 is the validated source_commit of this register, NULL when it
-// sent none.
+// sent none. $5 is the node_secret_hash the secret was checked against: the lock
+// re-reads the row, so an enrollment that rotated it since leaves zero rows (#618).
 const reconnectHostSQL = `
 	WITH old AS (
 		SELECT agent_process_started_at,
@@ -325,7 +329,7 @@ const reconnectHostSQL = `
 		       OR (agent_version IS NOT NULL AND agent_version <> $2)
 		       OR (source_commit IS NOT NULL AND $4::text IS NOT NULL AND source_commit <> $4::text)
 		       AS restarted
-		FROM hosts WHERE id = $1
+		FROM hosts WHERE id = $1 AND node_secret_hash = $5
 		FOR UPDATE
 	)
 	UPDATE hosts SET
