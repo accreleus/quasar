@@ -310,7 +310,7 @@ func (h *Handler) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		Disabled              *bool   `json:"disabled"`
 		MaxConcurrentSessions *int32  `json:"max_concurrent_sessions"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "malformed JSON body")
 		return
 	}
@@ -318,7 +318,7 @@ func (h *Handler) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "role must be user or admin")
 		return
 	}
-	u, err := h.svc.UpdateUser(r.Context(), id, req.Role, req.Disabled, req.MaxConcurrentSessions)
+	u, changed, err := h.svc.UpdateUser(r.Context(), id, req.Role, req.Disabled, req.MaxConcurrentSessions)
 	if err != nil {
 		if errors.Is(err, ErrUserNotFound) {
 			httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "user not found")
@@ -333,7 +333,7 @@ func (h *Handler) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	// After the error switch, like handleDeleteUser: the feed records what
 	// happened, so a refused change must leave no row.
-	h.recordUserUpdate(r, id, req.Role, req.Disabled, req.MaxConcurrentSessions)
+	h.recordUserUpdate(r, id, req.Role, req.Disabled, req.MaxConcurrentSessions, changed)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"user": toAdminUserResp(u)})
 }
 
@@ -375,21 +375,22 @@ func (h *Handler) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 // disable switch are separate operator intentions with separate severities, and
 // collapsing them into one "user.updated" row would lose which one happened.
 // Values only where the value is the point (the new role, the new quota); never
-// a password, never an email.
-func (h *Handler) recordUserUpdate(r *http.Request, id string, role *string, disabled *bool, quota *int32) {
+// a password, never an email. A field carried with the value the row already
+// held records nothing (#624): the feed shows what changed, not what was sent.
+func (h *Handler) recordUserUpdate(r *http.Request, id string, role *string, disabled *bool, quota *int32, changed UserChanges) {
 	caller, _ := UserFromContext(r.Context())
-	if role != nil {
+	if changed.Role {
 		audit.TryRecord(r.Context(), h.auditor, caller.ID, "user.role_changed", "user", id,
 			map[string]any{"role": *role})
 	}
-	if disabled != nil {
+	if changed.Disabled {
 		action := "user.enabled"
 		if *disabled {
 			action = "user.disabled"
 		}
 		audit.TryRecord(r.Context(), h.auditor, caller.ID, action, "user", id, nil)
 	}
-	if quota != nil {
+	if changed.Quota {
 		audit.TryRecord(r.Context(), h.auditor, caller.ID, "user.quota_changed", "user", id,
 			map[string]any{"max_concurrent_sessions": *quota})
 	}

@@ -129,7 +129,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var patch map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&patch); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid body")
 		return
 	}

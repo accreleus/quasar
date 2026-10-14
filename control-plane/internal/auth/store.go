@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -567,96 +568,93 @@ func (s *store) listUsers(ctx context.Context, cursor string, limit int32) ([]Ad
 	return out, next, nil
 }
 
+// UserChanges names the fields an update really changed: a field carried with
+// the value the row already held is not a change, and must not read as one in
+// the audit feed.
+type UserChanges struct {
+	Role, Disabled, Quota bool
+}
+
 // updateUser applies partial updates to a user (admin only). Only non-nil fields
-// are changed. Returns ErrUserNotFound if the user doesn't exist.
-func (s *store) updateUser(ctx context.Context, id string, role *string, disabled *bool, maxSessions *int32) (AdminUser, error) {
+// that differ from the stored row are written. Returns ErrUserNotFound if the
+// user doesn't exist.
+func (s *store) updateUser(ctx context.Context, id string, role *string, disabled *bool, maxSessions *int32) (AdminUser, UserChanges, error) {
+	var ch UserChanges
+	// One transaction reads the prior row under a row lock and writes the
+	// difference, so "changed" is judged against what was really replaced.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return AdminUser{}, ch, fmt.Errorf("begin update tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
 	// Last-admin guard. Check and UPDATE must be one critical section — two
 	// concurrent demotions can each observe admin_count=2 and demote both
 	// admins (#148). Advisory lock: cheaper than SERIALIZABLE, contention nil.
-	if role != nil && *role == RoleUser {
-		tx, err := s.pool.Begin(ctx)
-		if err != nil {
-			return AdminUser{}, fmt.Errorf("begin demote tx: %w", err)
-		}
-		defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
+	demote := role != nil && *role == RoleUser
+	if demote {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, adminDemoteAdvisoryLock); err != nil {
-			return AdminUser{}, fmt.Errorf("demote advisory lock: %w", err)
+			return AdminUser{}, ch, fmt.Errorf("demote advisory lock: %w", err)
 		}
-		var currentRole string
+	}
+	var curRole string
+	var curDisabled bool
+	var curQuota int32
+	err = tx.QueryRow(ctx, `SELECT role, disabled_at IS NOT NULL, max_concurrent_sessions
+		FROM users WHERE id::text = $1 FOR UPDATE`, id).Scan(&curRole, &curDisabled, &curQuota)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AdminUser{}, ch, ErrUserNotFound
+	}
+	if err != nil {
+		return AdminUser{}, ch, fmt.Errorf("read user: %w", err)
+	}
+	ch = UserChanges{
+		Role:     role != nil && *role != curRole,
+		Disabled: disabled != nil && *disabled != curDisabled,
+		Quota:    maxSessions != nil && *maxSessions != curQuota,
+	}
+	if demote && curRole == RoleAdmin {
 		var adminCount int
-		err = tx.QueryRow(ctx, `SELECT role FROM users WHERE id::text = $1`, id).Scan(&currentRole)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return AdminUser{}, ErrUserNotFound
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&adminCount); err != nil {
+			return AdminUser{}, UserChanges{}, fmt.Errorf("count admins: %w", err)
 		}
-		if err != nil {
-			return AdminUser{}, fmt.Errorf("check user role: %w", err)
+		if adminCount <= 1 {
+			return AdminUser{}, UserChanges{}, ErrLastAdmin
 		}
-		if currentRole == RoleAdmin {
-			if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&adminCount); err != nil {
-				return AdminUser{}, fmt.Errorf("count admins: %w", err)
-			}
-			if adminCount <= 1 {
-				return AdminUser{}, ErrLastAdmin
-			}
-			// Demote inside the same locked tx; the generic UPDATE below then
-			// only applies the remaining fields (role already final here when
-			// it is the sole change).
-		}
-		if _, err := tx.Exec(ctx, `UPDATE users SET role = $2 WHERE id::text = $1`, id, *role); err != nil {
-			return AdminUser{}, fmt.Errorf("demote user: %w", err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return AdminUser{}, fmt.Errorf("commit demote: %w", err)
-		}
-		role = nil // applied; don't re-apply in the generic UPDATE
 	}
 
 	var sets []string
 	var args []any
 	i := 1
-	if role != nil {
+	if ch.Role {
 		sets = append(sets, fmt.Sprintf("role = $%d", i))
 		args = append(args, *role)
 		i++
 	}
-	if disabled != nil {
+	if ch.Disabled {
 		if *disabled {
-			sets = append(sets, fmt.Sprintf("disabled_at = CASE WHEN disabled_at IS NULL THEN now() ELSE disabled_at END"))
+			sets = append(sets, "disabled_at = now()")
 		} else {
 			sets = append(sets, "disabled_at = NULL")
 		}
 	}
-	if maxSessions != nil {
+	if ch.Quota {
 		sets = append(sets, fmt.Sprintf("max_concurrent_sessions = $%d", i))
 		args = append(args, *maxSessions)
 		i++
 	}
-	if len(sets) == 0 {
-		return s.readAdminUser(ctx, id) // no-op: fetch current
-	}
-
-	query := "UPDATE users SET "
-	for j, s := range sets {
-		if j > 0 {
-			query += ", "
+	if len(sets) > 0 {
+		args = append(args, id)
+		if _, err := tx.Exec(ctx, "UPDATE users SET "+strings.Join(sets, ", ")+fmt.Sprintf(" WHERE id::text = $%d", i), args...); err != nil {
+			return AdminUser{}, UserChanges{}, fmt.Errorf("update user: %w", err)
 		}
-		query += s
 	}
-	// RETURNING only the id: the two derived AdminUser fields are aggregates over
-	// other tables, so the shape is read back through the one projection every
-	// other AdminUser read uses rather than duplicated into this UPDATE.
-	query += fmt.Sprintf(` WHERE id::text = $%d RETURNING id::text`, i)
-	args = append(args, id)
-
-	var updated string
-	err := s.pool.QueryRow(ctx, query, args...).Scan(&updated)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return AdminUser{}, ErrUserNotFound
+	if err := tx.Commit(ctx); err != nil {
+		return AdminUser{}, UserChanges{}, fmt.Errorf("commit update: %w", err)
 	}
-	if err != nil {
-		return AdminUser{}, fmt.Errorf("update user: %w", err)
-	}
-	return s.readAdminUser(ctx, updated)
+	// The two derived AdminUser fields are aggregates over other tables, so the
+	// shape is read through the one projection every other AdminUser read uses.
+	u, err := s.readAdminUser(ctx, id)
+	return u, ch, err
 }
 
 // deleteUser hard-deletes an account. Session history and tokens/devices
