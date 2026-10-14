@@ -59,8 +59,8 @@
 //! that NULL takes under 1 ms against a dead server, 1–3 ms against a live one
 //! and 30 s against a frozen one, 90 s with the mic's `pulsesink`. So a session
 //! end never finishes the audio pipeline ahead of the release. A takeover has to
-//! take the old one to NULL under a live server (`SessionTransports::inbound`),
-//! and carries that wait (#613).
+//! take the old one to NULL under a live server, so it does that and builds the
+//! new one off the runner thread, waiting a bounded time (`runner::replace_audio`, #613).
 //!
 //! The price is one error: `pulsesrc` posts `Disconnected: Connection terminated`
 //! when its server goes. `runner::stop_source` stops reporting from the audio bus

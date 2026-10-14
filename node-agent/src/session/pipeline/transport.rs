@@ -75,6 +75,10 @@ fn pin_msid(pad: &gst::Pad, pc: PcId) {
     }
 }
 
+/// Test hook: the session id of every `build_audio` call, in order.
+#[cfg(test)]
+pub(super) static AUDIO_BUILDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Test hook: how long a replacement's attach stands still before its transport is
 /// brought up, so the encode chain pushes into whatever state the slot is in.
 #[cfg(test)]
@@ -423,6 +427,8 @@ impl TransportSlot {
     /// pipeline never reach PLAYING (the aggregate state transition stalls), and the split
     /// also stops the browser's A/V sync from inflating video playout.
     pub fn build_audio(&self) -> Result<(Option<gst::Element>, Option<gst::Pipeline>)> {
+        #[cfg(test)]
+        AUDIO_BUILDS.lock().unwrap().push(self.session_id.clone());
         let cfg = &self.cfg;
         if audio_disabled() {
             tracing::info!(

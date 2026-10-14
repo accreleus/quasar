@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/console"
 )
 
@@ -180,5 +182,36 @@ func TestProcessCapacityRestoredResetsAuditsAndSettlesHold(t *testing.T) {
 	}
 	if aud.count("console.access.restored") != 1 {
 		t.Fatalf("console.access.restored fired %d times after replay, want still 1", aud.count("console.access.restored"))
+	}
+}
+
+// An agent-supplied reason or request_id over the audit details limit must not
+// make the console.access.restored insert fail: the reset still happens, so the
+// record has to land too (#624). Uses the real audit store, which is what
+// enforces the limit.
+func TestRestoredResetAuditSurvivesOversizedAgentText(t *testing.T) {
+	h, pool, _ := consoleAccessHandler(t)
+	h.auditor = audit.NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `DELETE FROM admin_activity WHERE action = 'console.access.restored'`); err != nil {
+		t.Fatalf("clear activity: %v", err)
+	}
+	if err := h.consoleStore.Upsert(ctx, hostID, map[string]any{"enabled": true}, nil); err != nil {
+		t.Fatalf("seed console_config: %v", err)
+	}
+	long := strings.Repeat("x", 5000)
+	h.applyConsoleAccessReport(ctx, hostID, console.Access{
+		State: "restored", Target: abool(true), RequestID: astr(long), Reason: astr(long), Summary: "restored",
+	})
+
+	var reason, requestID int
+	err := pool.QueryRow(ctx, `SELECT length(details->>'reason'), length(details->>'request_id')
+		FROM admin_activity WHERE action = 'console.access.restored' AND target_id = $1`, hostID).Scan(&reason, &requestID)
+	if err != nil {
+		t.Fatalf("console.access.restored row missing after an oversized reason: %v", err)
+	}
+	if reason != maxAuditAgentText || requestID != maxAuditAgentText {
+		t.Fatalf("reason/request_id lengths = %d/%d, want both bounded to %d", reason, requestID, maxAuditAgentText)
 	}
 }

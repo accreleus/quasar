@@ -433,8 +433,8 @@ fn strand_build_record(
 }
 
 #[test]
-fn a_build_record_from_another_engine_socket_is_refused_and_kept() {
-    let (_dir, config, request, server) = engine(vec![version(), absent()]);
+fn a_build_record_from_another_engine_socket_is_retired_and_built_again() {
+    let (_dir, config, request, server) = engine(vec![version(), absent(), post(""), built()]);
     let record = strand_build_record(
         &config,
         &request.tag,
@@ -446,12 +446,59 @@ fn a_build_record_from_another_engine_socket_is_refused_and_kept() {
             .unwrap()
             .build_image(request, Duration::from_secs(3))
             .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:built"
+    );
+    assert!(!record.exists());
+    assert_eq!(build_requests(&server.join().unwrap()), 1);
+}
+
+#[test]
+fn an_unparsable_record_is_retired_and_built_again() {
+    let (_dir, config, request, server) = engine(vec![version(), absent(), post(""), built()]);
+    let record = strand_build_record(&config, &request.tag, &config.socket, None);
+    std::fs::write(&record, "").unwrap();
+    assert_eq!(
+        RuntimeClient::new(config)
+            .unwrap()
+            .build_image(request, Duration::from_secs(3))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:built"
+    );
+    assert!(!record.exists());
+    assert_eq!(build_requests(&server.join().unwrap()), 1);
+}
+
+#[test]
+fn an_unparsable_record_is_left_alone_while_its_lease_is_held() {
+    use std::os::fd::AsRawFd;
+    let (_dir, config, request, server) = engine(vec![version()]);
+    let record = strand_build_record(&config, &request.tag, &config.socket, None);
+    std::fs::write(&record, "").unwrap();
+    let lease = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(record.with_extension("lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert_eq!(
+        RuntimeClient::new(config)
+            .unwrap()
+            .build_image(request, Duration::from_secs(1))
+            .wait(|_| {})
             .unwrap_err()
             .kind,
         ErrorKind::UnknownOutcome
     );
     assert!(record.exists());
-    assert_eq!(server.join().unwrap().len(), 2);
+    assert_eq!(server.join().unwrap().len(), 1);
 }
 
 #[test]
