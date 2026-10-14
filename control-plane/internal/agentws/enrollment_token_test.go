@@ -155,7 +155,7 @@ func TestEnrollmentCannotTakeOverAConnectedHost(t *testing.T) {
 	// guard must not break. markOffline is what really runs on every path that ends
 	// the read loop, and the guard's DB half now requires it.
 	connected = false
-	if err := st.markOffline(ctx, first.HostID); err != nil {
+	if err := st.markOffline(ctx, first.HostID, res.RegisteredAt); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
 	if _, err := st.enrollHost(ctx, "contested", "0.1.0", boundEnrollmentToken(t, pool, "contested")); err != nil {
@@ -225,7 +225,7 @@ func TestRefusedTakeoverDoesNotBurnAMintedToken(t *testing.T) {
 	}
 
 	connected = false
-	if err := st.markOffline(ctx, first.HostID); err != nil {
+	if err := st.markOffline(ctx, first.HostID, first.RegisteredAt); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
 	if _, err := st.enrollHost(ctx, "burned", "0.1.0", plaintext); err != nil {
@@ -253,7 +253,7 @@ func TestEnrollmentRefusesAHostOnlyTheDatabaseCallsLive(t *testing.T) {
 
 	// Offline is the whole condition: the row must be re-enrollable once its agent is
 	// recorded as gone, or a host that lost its node_secret could never come back.
-	if err := st.markOffline(ctx, res.HostID); err != nil {
+	if err := st.markOffline(ctx, res.HostID, res.RegisteredAt); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
 	if _, err := st.enrollHost(ctx, "other-replica", "0.1.0", boundEnrollmentToken(t, pool, "other-replica")); err != nil {
@@ -274,7 +274,7 @@ func TestUnboundTokenCannotBecomeAnExistingHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initial enrollment: %v", err)
 	}
-	if err := st.markOffline(ctx, victim.HostID); err != nil {
+	if err := st.markOffline(ctx, victim.HostID, victim.RegisteredAt); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
 
@@ -288,10 +288,11 @@ func TestUnboundTokenCannotBecomeAnExistingHost(t *testing.T) {
 	if n := usedCount(t, pool, row.ID); n != 0 {
 		t.Fatalf("a refused takeover spent the token: used_count = %d", n)
 	}
-	if _, err := st.reconnectHost(ctx, "victim", "0.1.0", nil, victim.NodeSecret); err != nil {
+	again, err := st.reconnectHost(ctx, "victim", "0.1.0", nil, victim.NodeSecret)
+	if err != nil {
 		t.Fatalf("the host's own secret must survive a refused takeover: %v", err)
 	}
-	if err := st.markOffline(ctx, victim.HostID); err != nil {
+	if err := st.markOffline(ctx, victim.HostID, again.RegisteredAt); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
 
@@ -363,7 +364,7 @@ func TestLocalEnrollmentTokenEnrollsItsOwnNodeOnly(t *testing.T) {
 	if res.NodeSecret == "" {
 		t.Fatal("enrollment returned no node secret")
 	}
-	if err := st.markOffline(ctx, res.HostID); err != nil {
+	if err := st.markOffline(ctx, res.HostID, res.RegisteredAt); err != nil {
 		t.Fatalf("mark offline: %v", err)
 	}
 	if _, err := st.enrollHost(ctx, "combined-own", "0.1.0", local); !errors.Is(err, ErrInvalidEnrollmentToken) {

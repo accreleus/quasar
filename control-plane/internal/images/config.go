@@ -261,7 +261,7 @@ func (r *RegistryResolver) tryGet(ctx context.Context, url, accept, token string
 		return nil, "", fmt.Errorf("get %s: %w", url, err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, registryMaxBodyBytes))
 		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode == http.StatusUnauthorized {

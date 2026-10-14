@@ -119,6 +119,29 @@ describe("buildOptionSpace", () => {
     expect(explicit?.reasons[0].code).toBe("host_encoder_not_supported");
   });
 
+  it("without H.264, Auto plays a profile through a codec the browser decodes and refuses an H.264-only one (#605)", () => {
+    const noH264: CodecCapabilities = { h264: false, hevc: false, av1: true, vp9: false };
+    const space = buildOptionSpace(catalog120(), noH264, "720p120");
+    const auto = space.entriesByCodec.get("auto")!;
+    expect(auto.find((e) => e.profileId === "1080p120")).toMatchObject({ codec: "av1", eligibility: "eligible" });
+    const h264Only = auto.find((e) => e.profileId === "720p120")!;
+    expect(h264Only).toMatchObject({ eligibility: "ineligible", recommended: false });
+    expect(h264Only.reasons.map((r) => r.code)).toEqual(["codec_not_supported"]);
+    // The draft opens on something that plays rather than on the recommendation.
+    expect(resolveSelection(space, defaultDraft(space, "720p120"))?.profileId).toBe("4k120");
+  });
+
+  it("without H.264, refuses Auto when the first allowed rung is H.264 but keeps the AV1 row (#605)", () => {
+    const noH264: CodecCapabilities = { h264: false, hevc: false, av1: true, vp9: false };
+    const chain = [rung("h264", "h264", 1920, 1080, 60, 1, 8000), rung("av1", "av1", 1920, 1080, 60, 2, 6000)];
+    const space = buildOptionSpace([profile("p", chain)], noH264, "p");
+    // The server walks rungs in position order and H.264 passes its decode clamp.
+    expect(space.entriesByCodec.get("auto")![0]).toMatchObject({ codec: "h264", eligibility: "ineligible" });
+    expect(space.entriesByCodec.get("av1")![0]).toMatchObject({ profileId: "p", eligibility: "eligible" });
+    // A browser with H.264 keeps today's Auto, whatever it lacks.
+    expect(buildOptionSpace([profile("p", chain)], H264_ONLY, "p").entriesByCodec.get("auto")![0].eligibility).toBe("eligible");
+  });
+
   it("offers auto + every catalog codec the client can decode", () => {
     const space = buildOptionSpace(catalog120(), ALL_CODECS, "1080p120");
     expect(space.codecs).toEqual(["auto", "h264", "hevc", "av1"]);
