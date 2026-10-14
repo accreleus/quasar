@@ -41,6 +41,17 @@ var (
 	ErrInvalidReason    = errors.New("invalid admission reason for owner")
 )
 
+// HostIsLiveSQL is the DB half of the #96 takeover guard: the registry only sees THIS
+// process, and nothing between a control-plane restart and the agent's reconnect. An
+// agentws register writes registerStatusSQL (never offline) and clears
+// agent_disconnected_at; markOffline stamps it. Must not narrow to 'online': a drained
+// host is still connected, and every boot drains every typed-settings host (#596).
+//
+// Fail-closed: a control-plane stop never stamps, so a host whose agent never returns
+// reads as live until its row is deleted (an uncordon leaves the boot's reconciliation
+// hold). Guarded by TestAfterAControlPlaneRestartAHostRefusesReEnrollmentUntilItIsDeleted.
+const HostIsLiveSQL = `(status <> 'offline' AND agent_disconnected_at IS NULL)`
+
 type Owner struct {
 	Kind Kind
 	ID   string

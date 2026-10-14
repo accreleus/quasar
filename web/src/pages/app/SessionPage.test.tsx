@@ -17,7 +17,7 @@
 //      all (fail-open rule 1 — an older agent, or no app container)
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionPage, parseTierSize } from "./SessionPage";
 import { ApiError } from "../../api/client";
@@ -1083,6 +1083,56 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     await settleTheReveal();
     expect(document.querySelector(".sl-root")).toBeNull();
     expect(alerts()).toEqual([expect.stringContaining("This session moved to another tab")]);
+  });
+});
+
+describe("SessionPage — a new session id is a new page (#560)", () => {
+  // "Go to session" on a refused-launch toast moves the mounted page from one
+  // session to another without unmounting it; the first session's verdict and
+  // loader latches must not follow.
+  function GoToSecond() {
+    const navigate = useNavigate();
+    return <button onClick={() => navigate("/app/session/s2", { state: { signalingUrl: "wss://host/v1/signal", signalingToken: "tok" } })}>go</button>;
+  }
+
+  it("shows the launch loader and holds no earlier verdict after the id changes", async () => {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    render(
+      <MemoryRouter initialEntries={[{ pathname: "/app/session/s1", state: { signalingUrl: "wss://host/v1/signal", signalingToken: "tok" } }]}>
+        <ThemeProvider>
+          <ToastProvider>
+            <GoToSecond />
+            <Routes>
+              <Route path="/app/session/:id" element={<SessionPage />} />
+            </Routes>
+          </ToastProvider>
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      openChannel();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    await act(async () => {
+      lastOnRecovery?.({ phase: "superseded", attempt: 0, maxAttempts: 3, message: "opened in another tab" });
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(screen.getByText("This session moved to another tab")).not.toBeNull();
+
+    currentSession = makeSession({ id: "s2" });
+    await act(async () => {
+      fireEvent.click(screen.getByText("go"));
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    expect(screen.queryByText("This session moved to another tab")).toBeNull();
   });
 });
 

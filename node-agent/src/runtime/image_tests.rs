@@ -328,6 +328,133 @@ fn a_pull_intent_left_by_a_previous_agent_does_not_strand_the_next_pull() {
 }
 
 #[test]
+fn an_unparsable_record_does_not_strand_the_next_pull() {
+    let (_dir, config, server) = serve(vec![
+        discovery(),
+        reply(INSPECT, 404, ABSENT),
+        reply(PULL, 200, "{\"status\":\"Pull complete\"}\n"),
+        reply(INSPECT, 200, PRESENT),
+    ]);
+    let journal = strand_pull_intent(&config, "test");
+    std::fs::write(&journal, "").unwrap();
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime
+            .ensure_image("test", Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:fixture"
+    );
+    assert!(!journal.exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn an_unparsable_record_is_left_alone_while_its_lease_is_held() {
+    use std::os::fd::AsRawFd;
+    let (_dir, config, server) = serve(vec![discovery()]);
+    let journal = strand_pull_intent(&config, "test");
+    std::fs::write(&journal, "").unwrap();
+    let lease = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(journal.with_extension("lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert!(runtime
+        .ensure_image("test", Duration::from_secs(1))
+        .wait(|_| {})
+        .is_err());
+    assert!(journal.exists());
+    server.join().unwrap();
+}
+
+/// Records a retire must not touch: ensure_image fails `Protocol` after one inspection.
+fn assert_record_kept(body: String, image: &str) {
+    let (_dir, config, server) = serve(vec![discovery(), reply(INSPECT, 404, ABSENT)]);
+    let journal = strand_pull_intent(&config, image);
+    std::fs::write(&journal, body).unwrap();
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime
+            .ensure_image(image, Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+    assert!(journal.exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn an_oversized_record_is_kept() {
+    let removal =
+        serde_json::json!({"image":"test","socket":"/s","remove_id":"sha256:x"}).to_string();
+    assert_record_kept(format!("{removal}{}", " ".repeat(9000)), "test");
+}
+
+#[test]
+fn a_record_this_agent_does_not_understand_is_kept() {
+    assert_record_kept(r#"{"image":"test","future":[1]}"#.to_owned(), "test");
+}
+
+#[test]
+fn a_removal_record_from_another_engine_socket_is_refused_and_kept() {
+    let (_dir, config, server) = serve(vec![discovery(), reply(INSPECT, 404, ABSENT)]);
+    let journal = strand_pull_intent(&config, "test");
+    std::fs::write(
+        &journal,
+        serde_json::json!({"image":"test","socket":"/another-engine.sock","remove_id":"sha256:x"})
+            .to_string(),
+    )
+    .unwrap();
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime
+            .ensure_image("test", Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert!(journal.exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn startup_sweep_retires_unparsable_records_unless_leased() {
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = RuntimeConfig::unix(dir.path().join("engine.sock"));
+    config.image_state_path = Some(dir.path().join("operations"));
+    let orphan = strand_pull_intent(&config, "orphan");
+    let live = strand_pull_intent(&config, "live");
+    std::fs::write(&orphan, "").unwrap();
+    std::fs::write(&live, "").unwrap();
+    let lease = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(live.with_extension("lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert!(runtime.retire_orphaned_pull_intents().unwrap().is_empty());
+    assert!(!orphan.exists());
+    assert!(live.exists());
+}
+
+#[test]
 fn a_pull_intent_whose_image_landed_is_retired_without_pulling_again() {
     let (_dir, config, server) = serve(vec![discovery(), reply(INSPECT, 200, PRESENT)]);
     let journal = strand_pull_intent(&config, "test");
