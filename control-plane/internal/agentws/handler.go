@@ -852,7 +852,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 
 	// Step 1 — register
 	registerCtx, cancelRegister := context.WithTimeout(bg, handshakeTimeout)
-	hostID, regImages, regCommit, terminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, err := h.handleRegister(registerCtx, conn, clientIP)
+	hostID, registeredAt, regImages, regCommit, terminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, err := h.handleRegister(registerCtx, conn, clientIP)
 	cancelRegister()
 	h.failures.Release(clientIP)
 	if err != nil {
@@ -890,8 +890,8 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		ac.imageVersionsObservedAt = time.Now().UTC()
 	}
 	h.registry.add(ac)
-	// The predecessor may have projected offline between this register's write and
-	// add; restate liveness now that this connection is current.
+	// A drain released between this register's write and add projects offline (no
+	// connection was registered); restate liveness now that this connection is current.
 	h.registry.withCurrent(ac, func() {
 		if err := h.store.markLive(bg, hostID); err != nil {
 			h.log.Error("mark live failed", "host_id", hostID, "err", err)
@@ -918,7 +918,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			h.events.HostDisconnected(ctx, hostID)
 			// Bounds the rate-limiter map by the live connection set.
 			h.imageLimiter.evict(hostID)
-			if err := h.store.markOffline(bg, hostID); err != nil {
+			if err := h.store.markOffline(bg, hostID, registeredAt); err != nil {
 				h.log.Error("mark offline failed", "host_id", hostID, "err", err)
 			}
 		})
@@ -1486,15 +1486,16 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 }
 
 // handleRegister performs the register handshake and returns the resolved host
-// id plus the agent's optional image-management P2 `images` snapshot (nil when
-// the agent sent no such field — see RegisterMsg.Images).
-// The third return value is the identity commit the agent reported (nil when it
+// id, the last_registered_at it wrote (markOffline's key), and the agent's optional
+// image-management P2 `images` snapshot (nil when the agent sent no such field — see
+// RegisterMsg.Images).
+// The fourth return value is the identity commit the agent reported (nil when it
 // reported none or one this build refused), which the caller hands to the
 // platform-apply success-evidence hook.
-func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
-	fail := func(err error) (string, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
+func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, time.Time, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
+	fail := func(err error) (string, time.Time, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
 		h.failures.Failure(clientIP)
-		return "", nil, nil, false, false, nil, "", ImageCleanupRegister{}, err
+		return "", time.Time{}, nil, nil, false, false, nil, "", ImageCleanupRegister{}, err
 	}
 	conn.SetReadDeadline(time.Now().Add(registerReadTimeout))
 	raw, err := readTextMessage(conn)
@@ -1627,7 +1628,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	if err := conn.WriteJSON(resp); err != nil {
-		return "", nil, nil, false, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
+		return "", time.Time{}, nil, nil, false, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
 	}
 	cleanupRegister := ImageCleanupRegister{Capable: reg.ImageCleanupV1}
 	if reg.ImageCleanupV1 {
@@ -1637,7 +1638,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			cleanupRegister.Versions = versions
 		}
 	}
-	return result.HostID, reg.Images, identity.SourceCommit, reg.TerminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
+	return result.HostID, result.RegisteredAt, reg.Images, identity.SourceCommit, reg.TerminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }
 
 func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, ac *conn) error {

@@ -294,7 +294,7 @@ func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 		prime(res.HostID)
 		// Re-enrollment is refused while the row still reads online (#96 takeover
 		// guard), so mark it offline first as the dropped read loop would.
-		if err := s.markOffline(ctx, res.HostID); err != nil {
+		if err := s.markOffline(ctx, res.HostID, res.RegisteredAt); err != nil {
 			t.Fatalf("mark offline: %v", err)
 		}
 		if _, err := s.enrollHost(ctx, "vram-reenroll", "v0", boundEnrollmentToken(t, pool, "vram-reenroll")); err != nil {
