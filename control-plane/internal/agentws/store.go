@@ -76,6 +76,8 @@ type registerResult struct {
 	// rather than a WS blip (#429; see agentRestartMinGap). Always false from
 	// enrollHost — enrollment is an identity event, not a counted restart.
 	AgentRestarted bool
+	// The last_registered_at this registration wrote: its connection's markOffline key.
+	RegisteredAt time.Time
 }
 
 // Minimum offline gap for a reconnect to classify as a genuine agent-process
@@ -165,6 +167,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	// stale pending disconnect into its first reconnect.
 	var hostID string
 	var newlyCreated bool
+	var registeredAt time.Time
 	err = tx.QueryRow(ctx, `
 		INSERT INTO hosts (node_name, agent_version, node_secret_hash, status, last_registered_at, capacity_detection, agent_process_started_at)
 		VALUES ($1, $2, $3, 'online', now(), 'unavailable', now())
@@ -180,8 +183,8 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		        ,agent_restart_count      = 0
 		        ,agent_last_restart_at    = NULL
 		        ,agent_disconnected_at    = NULL
-		RETURNING id::text, (xmax = 0)
-	`, nodeName, agentVersion, secretHash).Scan(&hostID, &newlyCreated)
+		RETURNING id::text, (xmax = 0), last_registered_at
+	`, nodeName, agentVersion, secretHash).Scan(&hostID, &newlyCreated, &registeredAt)
 	if err != nil {
 		return registerResult{}, fmt.Errorf("upsert host: %w", err)
 	}
@@ -210,7 +213,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	if err := tx.Commit(ctx); err != nil {
 		return registerResult{}, fmt.Errorf("commit enrollment: %w", err)
 	}
-	return registerResult{HostID: hostID, NodeSecret: secretHex}, nil
+	return registerResult{HostID: hostID, NodeSecret: secretHex, RegisteredAt: registeredAt}, nil
 }
 
 // removalDrainWindow bounds how long after taking its cordon the remove route records
@@ -280,9 +283,10 @@ func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion s
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var isRestart bool
-	err = tx.QueryRow(ctx, reconnectHostSQL, hostID, agentVersion, agentRestartMinGap.Milliseconds(), sourceCommit, storedHash).Scan(&isRestart)
+	var registeredAt time.Time
+	err = tx.QueryRow(ctx, reconnectHostSQL, hostID, agentVersion, agentRestartMinGap.Milliseconds(), sourceCommit, storedHash).Scan(&isRestart, &registeredAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return registerResult{}, ErrInvalidNodeSecret // rotated or the row replaced since the lookup
+		return registerResult{}, ErrInvalidNodeSecret // rotated or the row deleted since the lookup
 	}
 	if err != nil {
 		return registerResult{}, fmt.Errorf("update host: %w", err)
@@ -293,7 +297,7 @@ func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion s
 	if err := tx.Commit(ctx); err != nil {
 		return registerResult{}, fmt.Errorf("commit reconnect: %w", err)
 	}
-	return registerResult{HostID: hostID, AgentRestarted: isRestart}, nil
+	return registerResult{HostID: hostID, AgentRestarted: isRestart, RegisteredAt: registeredAt}, nil
 }
 
 // registerStatusSQL is what a register does to the scheduling status: offline →
@@ -354,7 +358,7 @@ const reconnectHostSQL = `
 		agent_disconnected_at = NULL
 	FROM old
 	WHERE hosts.id = $1
-	RETURNING old.restarted
+	RETURNING old.restarted, hosts.last_registered_at
 `
 
 // upsertCapacity replaces the host's cpu/mem and full GPU set; storage and
@@ -719,13 +723,18 @@ func (s *agentStore) markLive(ctx context.Context, hostID string) error {
 // now(), the anchor for
 // reconnectHost's blip-vs-restart classification — see agentRestartMinGap for
 // why a control-plane restart cannot misattribute its own downtime.
-func (s *agentStore) markOffline(ctx context.Context, hostID string) error {
+//
+// Only while registeredAt (the closing connection's own write) is still the row's last
+// registration: a reconnect that committed while this one closed must stay live, or an
+// enrollment rotates the secret before that socket is registered and it then replaces
+// the new agent (#618; TestAClosingConnectionDoesNotReopenAHostAReconnectClaimed).
+func (s *agentStore) markOffline(ctx context.Context, hostID string, registeredAt time.Time) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE hosts SET status=CASE WHEN EXISTS (
 		    SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id=hosts.id
 		) THEN 'draining' ELSE 'offline' END,
-		agent_disconnected_at=now() WHERE id=$1
-	`, hostID)
+		agent_disconnected_at=now() WHERE id=$1 AND last_registered_at=$2
+	`, hostID, registeredAt)
 	if err != nil {
 		return fmt.Errorf("mark offline: %w", err)
 	}
