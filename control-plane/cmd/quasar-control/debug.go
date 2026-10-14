@@ -60,14 +60,17 @@ func newDebugServer(addr string, pool *pgxpool.Pool, log *slog.Logger) *http.Ser
 }
 
 // loopbackOnly closes the browser path to the loopback bind (#625). A control
-// plane in the host network namespace is reachable from a page in a browser on
-// that machine: a cross-site POST carries an Origin, a DNS-rebinding request
-// carries the attacker's Host. The operator's tools (wget, curl) send neither
-// an Origin nor a non-loopback Host, so both are refused outright.
+// plane in the host network namespace is reachable from a web page on that
+// machine: a cross-site POST carries an Origin, a DNS-rebinding request carries
+// the attacker's Host, and a navigation or <img>/<script> GET carries neither
+// but does carry Sec-Fetch-Site (Fetch Metadata), which every current browser
+// sends to loopback. wget, curl and `go tool pprof` send none of the three, so
+// any of them is refused. Residual: a browser too old to send Sec-Fetch-Site or
+// Origin (Chrome < 76, Firefox < 90, Safari < 16.4) is not stopped.
 func loopbackOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Origin") != "" || !isLoopbackHost(r.Host) {
-			http.Error(w, "debug listener: loopback Host and no Origin only", http.StatusForbidden)
+		if r.Header.Get("Origin") != "" || r.Header.Get("Sec-Fetch-Site") != "" || !isLoopbackHost(r.Host) {
+			http.Error(w, "debug listener: loopback Host only, no Origin or Sec-Fetch-Site", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)

@@ -330,9 +330,13 @@ window, capture `/debug/pprof/mutex` or `/debug/pprof/block`, then disarm.
   endpoint can hold a profile open indefinitely.
 
 The loopback bind answers all three, which is why it is the default and why the
-port is published nowhere. The listener also answers `403` to any request with an
-`Origin` header or a non-loopback `Host`, so a web page on the host cannot drive
-it (cross-site POST, DNS rebinding); `wget` and `curl` send neither.
+port is published nowhere. The listener also answers `403` to any request with an `Origin` header, a
+`Sec-Fetch-Site` header (every current browser sends one to loopback, on
+navigations and `<img>`/`<script>` loads too) or a non-loopback `Host`, so a web
+page on the host cannot drive it (cross-site POST, image GET, DNS rebinding);
+`wget`, `curl` and `go tool pprof` send none of them. A browser too old to send
+`Sec-Fetch-Site` or `Origin` (Chrome before 76, Firefox before 90, Safari before
+16.4) is not stopped.
 **If a profile is needed from a remote box, pull it
 over SSH — do not widen the bind address:**
 
