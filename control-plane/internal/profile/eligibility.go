@@ -70,6 +70,7 @@ type Probe struct {
 	RTTMs            int32   // measured round-trip time (ms)
 	MaxDecodeHeight  int32   // max decode resolution height the client supports
 	DisplayRefreshHz float64 // measured presentation display refresh; zero means unknown
+	BrowserName      string  // capabilities.browser.name, "" when absent
 	// Codecs is the set of codecs the client accepts (decode capability). A nil
 	// map means codec acceptance was not probed (unknown → allow). A non-nil map
 	// with a codec absent/false means the client cannot decode it.
@@ -190,7 +191,11 @@ func evaluateProfile(p Profile, in EvalInput) ProfileEval {
 	// fractional timings such as 119.88 Hz for a nominal 120 fps profile.
 	if p.HighRefreshDisplay == DisplayRequired {
 		if in.Probe == nil || in.Probe.DisplayRefreshHz <= 0 {
-			soft(ReasonDisplayRefreshUnknown, "profile needs a high-refresh display; the client display rate is unknown")
+			// Safari caps rAF near 60 Hz, so a Safari probe with no rate counts as
+			// high-refresh (control-api.md amendment 34).
+			if in.Probe == nil || in.Probe.BrowserName != "Safari" {
+				soft(ReasonDisplayRefreshUnknown, "profile needs a high-refresh display; the client display rate is unknown")
+			}
 		} else if in.Probe.DisplayRefreshHz < float64(p.FPS)*0.98 {
 			soft(ReasonDisplayRefreshTooLow, "measured display refresh is below the profile frame rate")
 		}
