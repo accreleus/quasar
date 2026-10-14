@@ -71,7 +71,7 @@ run a fresh command.
 | Message | Fix |
 | --- | --- |
 | `auth_failed` | The token expired, was used, or is for another name. Create a new command. |
-| Name already registered | That host's agent is still connected. Stop it, or pick another name. |
+| Name already registered | That host's agent is still connected. Stop it, or pick another name. If the machine is gone, forget the host first with the admin API (`DELETE /v1/hosts/{id}`); that deletes its history and tombstones its homes. |
 | `cp-tls-pin-mismatch` | The certificate doesn't match. Create the command from the control plane's own page. |
 | A host check failed | Apply the printed fix and rerun the same command. |
 | Old Compose agent found | Run `docker compose --project-directory /opt/quasar-agent down` (homes are kept), then rerun. |
