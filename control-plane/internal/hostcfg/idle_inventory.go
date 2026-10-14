@@ -319,9 +319,15 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 		return tx.Commit(ctx)
 	}
 	quarantine := false
-	seen := make(map[string]bool, len(restartEntries))
+	seen := make(map[string]JournalInventoryEntry, len(restartEntries))
 	for _, entry := range restartEntries {
-		seen[entry.AttemptID] = true
+		// Every entry validates against the pre-apply row, so two for one
+		// attempt must be the same report.
+		if prior, ok := seen[entry.AttemptID]; ok && (prior.Sequence != entry.Sequence || prior.Phase != entry.Phase) {
+			quarantine = true
+			break
+		}
+		seen[entry.AttemptID] = entry
 		if entry.HostID != hostID || entry.Scope != "restart" || !validPolicyDigest(entry.Digest) || entry.AttemptID == "" || entry.Group == "" || entry.Phase == "" || entry.Sequence == "" {
 			quarantine = true
 			break
@@ -344,7 +350,7 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 			knownAccepted.Close()
 			return err
 		}
-		if !seen[id] {
+		if _, ok := seen[id]; !ok {
 			quarantine = true
 		}
 	}
@@ -375,7 +381,7 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 			pending.Close()
 			return err
 		}
-		if seen[id] {
+		if _, ok := seen[id]; ok {
 			// Durable acceptance won the race with cancellation. Reconstruct it
 			// below; cancellation cannot revoke execution after fsync.
 		} else {
@@ -545,7 +551,7 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 	revision, _ := strconv.ParseInt(entry.Revision, 10, 64)
 	terminal := entry.Phase == "applied" || entry.Phase == "recovered" || entry.Phase == "uncertain" ||
 		entry.Phase == "revoked_unstarted" || entry.Phase == "failed" && seq == 0
-	if _, err := tx.Exec(ctx, `INSERT INTO host_config_attempts
+	upsert, err := tx.Exec(ctx, `INSERT INTO host_config_attempts
 		(id,host_id,group_key,approved_digest,approved_revision,scope,boot_incarnation,grant_connection,phase,journal_sequence,started_at,terminal_at,recovery_attempted,error_code)
 		VALUES($1::uuid,$2::uuid,$3,$4,$5,'restart',$6::uuid,$7::uuid,$8,$9,
 			CASE WHEN $9::bigint>0 THEN now() ELSE NULL END,CASE WHEN $10::boolean THEN now() ELSE NULL END,
@@ -556,7 +562,8 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			recovery_attempted=host_config_attempts.recovery_attempted OR excluded.recovery_attempted,
 			error_code=COALESCE(excluded.error_code,host_config_attempts.error_code)
 		WHERE host_config_attempts.terminal_at IS NULL AND (host_config_attempts.journal_sequence IS NULL OR host_config_attempts.journal_sequence<$9::bigint)`,
-		entry.AttemptID, hostID, entry.Group, entry.Digest, revision, entry.GrantBoot, entry.GrantConnection, entry.Phase, seq, terminal, safeIdleErrorCode(entry.ErrorCode)); err != nil {
+		entry.AttemptID, hostID, entry.Group, entry.Digest, revision, entry.GrantBoot, entry.GrantConnection, entry.Phase, seq, terminal, safeIdleErrorCode(entry.ErrorCode))
+	if err != nil {
 		return err
 	}
 	if seq > 0 {
@@ -583,6 +590,11 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			WHERE host_id=$1::uuid AND kind='idle_apply' AND resource_key=$2`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
+	}
+	// A phase that did not land on the row moves no hold or group status, except
+	// an applied replay that now carries its active proof.
+	if upsert.RowsAffected() == 0 && (entry.Phase != "applied" || !active) {
+		return nil
 	}
 	if entry.Phase == "applied" && active {
 		if _, err := tx.Exec(ctx, `UPDATE host_setting_groups SET applied_revision=$3,applied_digest=$4,status='applied',

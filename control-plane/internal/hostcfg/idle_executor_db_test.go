@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/jobs"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -712,6 +713,74 @@ func TestHistoricalAppliedInventoryCannotClaimAChangedActiveSnapshot(t *testing.
 	}
 	if view, err = store.GetPolicy(ctx, hostID); err != nil || view.Groups["hardware"].Status != "applied" {
 		t.Fatalf("matching active proof did not apply the group: %+v %v", view.Groups["hardware"], err)
+	}
+	var hostStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid`, hostID).Scan(&hostStatus); err != nil || hostStatus != "online" {
+		t.Fatalf("released host did not return online: %s %v", hostStatus, err)
+	}
+}
+
+// Two entries for one attempt each pass validation against the same row; the
+// second must not move holds after the first has made the row terminal.
+func TestJournalInventoryWithTwoPhasesForOneAttemptQuarantines(t *testing.T) {
+	for _, tc := range []struct {
+		name, second string
+		proven       bool
+		heldByFirst  int
+	}{
+		{name: "recovered after unproven applied", second: "recovered", proven: false, heldByFirst: 1},
+		{name: "uncertain after proven applied", second: "uncertain", proven: true, heldByFirst: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := testPool(t)
+			store := NewStore(pool)
+			hostID, boot, offer := offeredHardwareAttempt(t, pool, store)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			applied := restartInventoryEntry(hostID, boot, offer, "applied", "4")
+			applied.VerifiedAt = &now
+			later := restartInventoryEntry(hostID, boot, offer, tc.second, "5")
+			active := map[string]PolicySnapshot{"hardware": {Kind: "verified", Digest: strings.Repeat("a", 64)}}
+			if tc.proven {
+				active["hardware"] = PolicySnapshot{Kind: "verified", Digest: offer.ContentSHA256}
+			}
+			holds := func(db interface {
+				QueryRow(context.Context, string, ...any) pgx.Row
+			}) (idle, recovery int) {
+				if err := db.QueryRow(ctx, `SELECT count(*) FILTER (WHERE owner_kind='idle_apply'),count(*) FILTER (WHERE owner_kind='recovery')
+					FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_id=$2::uuid`, hostID, offer.AttemptID).Scan(&idle, &recovery); err != nil {
+					t.Fatal(err)
+				}
+				return idle, recovery
+			}
+			second := "00000000-0000-4000-8000-000000000339"
+			if err := store.BeginJournalReconciliation(ctx, hostID, second); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CompleteJournalReconciliation(ctx, hostID, second, []JournalInventoryEntry{applied, later}, active); err != nil {
+				t.Fatal(err)
+			}
+			if gate, err := store.JournalGate(ctx, hostID); err != nil || gate != "quarantined" {
+				t.Fatalf("two phases for one attempt did not quarantine: gate=%s err=%v", gate, err)
+			}
+			if idle, recovery := holds(pool); idle != 1 || recovery != 0 {
+				t.Fatalf("quarantined inventory moved holds: idle_apply=%d recovery=%d", idle, recovery)
+			}
+			// Each entry on its own: the second no longer lands, so it moves nothing.
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx) //nolint:errcheck
+			for _, entry := range []JournalInventoryEntry{applied, later} {
+				if err := applyRestartInventoryEntry(ctx, tx, hostID, second, entry, tc.proven); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if idle, recovery := holds(tx); idle != tc.heldByFirst || recovery != 0 {
+				t.Fatalf("entry that did not land moved holds: idle_apply=%d recovery=%d", idle, recovery)
+			}
+		})
 	}
 }
 
