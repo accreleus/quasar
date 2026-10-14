@@ -1134,6 +1134,11 @@ impl Drop for AudioPipelineGuard {
 const MAX_REPLACEMENTS_PER_WINDOW: usize = 6;
 const REPLACEMENT_WINDOW: Duration = Duration::from_secs(60);
 
+/// How long a takeover waits on its audio replacement (#613). Stopping the old capture
+/// and starting the new one each wait on the sound server, and a frozen one holds each
+/// for libpulse's 30 s reply timeout (90 s with the mic's `pulsesink`).
+const AUDIO_REPLACE_BOUND: Duration = Duration::from_secs(2);
+
 /// How many displaced peers each PC remembers. The relay leaks at most one frame per
 /// displaced socket, so a short chain of takeovers is all there is to recognise.
 const DISPLACED_REMEMBERED: usize = 4;
@@ -1222,7 +1227,7 @@ impl Negotiation {
 /// The session's WebRTC transports. Each is replaced, under the running encoder, when a
 /// peer other than the one it negotiated with answers on it (#535).
 pub(crate) struct SessionTransports {
-    slot: pipeline::TransportSlot,
+    slot: Arc<pipeline::TransportSlot>,
     pub(crate) video: pipeline::VideoTransport,
     pub(crate) audio_webrtc: Option<gst::Element>,
     pub(crate) audio_pipeline: AudioPipelineGuard,
@@ -1242,7 +1247,7 @@ impl SessionTransports {
         audio_pipeline: Option<gst::Pipeline>,
     ) -> Self {
         Self {
-            slot,
+            slot: Arc::new(slot),
             video,
             audio_webrtc,
             // #408: owned by a Drop-to-NULL guard from the moment the pipeline exists.
@@ -1353,18 +1358,11 @@ impl SessionTransports {
                 match pc {
                     PcId::Video => self.slot.replace_video(&mut self.video)?,
                     PcId::Audio => {
-                        self.audio_pipeline.finish();
-                        let (webrtc, pipe) = self.slot.build_audio().unwrap_or_else(|e| {
-                            // Audio must never kill video.
-                            tracing::warn!(
-                                token = "audio-transport-replace-failed",
-                                "audio transport for the new peer failed to build: {e:#} \
-                                 (this peer gets no audio)"
-                            );
-                            (None, None)
-                        });
-                        self.audio_webrtc = webrtc;
-                        self.audio_pipeline = AudioPipelineGuard::new(pipe);
+                        let old = std::mem::replace(
+                            &mut self.audio_pipeline,
+                            AudioPipelineGuard::new(None),
+                        );
+                        (self.audio_webrtc, self.audio_pipeline) = replace_audio(&self.slot, old);
                         self.audio_pipeline.play();
                     }
                 }
@@ -1426,6 +1424,54 @@ impl SessionTransports {
         }
         Ok(None)
     }
+}
+
+/// Take `old` to NULL and build the audio PC for a new peer on a thread of their own,
+/// waiting at most [`AUDIO_REPLACE_BOUND`]: both wait on the sound server, and the runner
+/// must stay free to serve a stop (#613). Past the bound the new peer gets no audio.
+fn replace_audio(
+    slot: &Arc<pipeline::TransportSlot>,
+    old: AudioPipelineGuard,
+) -> (Option<gst::Element>, AudioPipelineGuard) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let slot = Arc::clone(slot);
+    let log_span = tracing::Span::current();
+    // Named, in the 15 bytes the kernel keeps. If it cannot start, `old` stops here and
+    // the closed channel reads as a failed build.
+    let _ = std::thread::Builder::new()
+        .name("quasar-aud-repl".into())
+        .spawn(move || {
+            let _log_span = log_span.enter();
+            drop(old);
+            let built = slot.build_audio();
+            drop(slot);
+            // Guarded, so a pipeline nobody takes any more still goes to NULL (#408).
+            let _ = tx.send(built.map(|(webrtc, pipe)| (webrtc, AudioPipelineGuard::new(pipe))));
+        });
+    let built = match rx.recv_timeout(AUDIO_REPLACE_BOUND) {
+        Ok(built) => built,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                token = "audio-transport-replace-timed-out",
+                "the audio transport for the new peer was not ready within {} s: the \
+                 sound server is not answering (this peer gets no audio)",
+                AUDIO_REPLACE_BOUND.as_secs()
+            );
+            return (None, AudioPipelineGuard::new(None));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow::anyhow!("its thread ended without a result"))
+        }
+    };
+    built.unwrap_or_else(|e| {
+        // Audio must never kill video.
+        tracing::warn!(
+            token = "audio-transport-replace-failed",
+            "audio transport for the new peer failed to build: {e:#} \
+             (this peer gets no audio)"
+        );
+        (None, AudioPipelineGuard::new(None))
+    })
 }
 
 /// Stop the source on the session's way out. The video transport lets go first: one whose
