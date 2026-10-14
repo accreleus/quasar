@@ -301,7 +301,13 @@ describe("device capability post freshness", () => {
   });
 
   it("treats unreadable storage as stale rather than throwing", () => {
-    localStorage.setItem("quasar_device_posted", "not json");
+    localStorage.setItem("quasar_device_posted_v2", "not json");
     expect(deviceProbeIsFresh("u1")).toBe(false);
+  });
+
+  it("ignores a stamp from before the Safari refresh change, so that probe is posted again (#632)", () => {
+    localStorage.clear();
+    localStorage.setItem("quasar_device_posted", JSON.stringify({ user: "u1", at: 1_000_000 }));
+    expect(deviceProbeIsFresh("u1", 1_000_000)).toBe(false);
   });
 });

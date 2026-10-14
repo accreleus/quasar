@@ -47,8 +47,10 @@ export function getOrCreateDeviceKey(): string {
  * load — enough of them on one token and the endpoint rate-limits (429). The
  * server's staleness horizon is 30 days (probeMaxAgeDays), so a day is ample.
  * Keyed by user id: two accounts sharing a browser each need their own row.
+ * Bump the key's version when the probe changes in a way the server must see
+ * at once: a stamp under an old key forces one post (#632).
  */
-const DEVICE_POST_STORAGE_KEY = "quasar_device_posted";
+const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v2";
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function deviceProbeIsFresh(userId: string, now: number = Date.now()): boolean {
