@@ -237,6 +237,10 @@ export interface paths {
          *     client path works unchanged. The minted identity is a REAL user row with a
          *     real token — server-side role enforcement is untouched — and is deleted
          *     (with its sessions and device bindings) when its TTL lapses.
+         *     Amendment 33: served only over TLS (the HTTPS listener, or a proxy named in
+         *     QUASAR_TRUSTED_PROXIES that forwards X-Forwarded-Proto: https) or to a loopback peer,
+         *     unless QUASAR_DEV_AGENT_INSECURE_HTTP=1. Any other request → 401 unauthorized before the
+         *     key is compared.
          */
         post: {
             parameters: {
@@ -333,6 +337,9 @@ export interface paths {
          *     under the same advisory lock as BOOTSTRAP_ADMIN_* provisioning, so the two
          *     paths can never both create an admin). Response is login-shaped so the
          *     operator is signed in as their new admin.
+         *     Amendment 33: served only over TLS (the HTTPS listener, or a proxy named in
+         *     QUASAR_TRUSTED_PROXIES that forwards X-Forwarded-Proto: https). Any other request → 401
+         *     unauthorized before the token is compared, the same for a right, wrong or missing token.
          */
         post: {
             parameters: {
@@ -4992,8 +4999,10 @@ export interface paths {
          *
          *     FORWARDED HEADERS SOFTEN ADVICE AND NOTHING ELSE. They are trivially spoofable by any
          *     client; the worst a hostile one achieves is making an admin-gated diagnostics page tell
-         *     THEM that their own certificate is not in use. No access decision, on this route or any
-         *     other, reads them.
+         *     THEM that their own certificate is not in use. No access decision on this route reads
+         *     them. Amendment 33, the one exception on any route: POST /v1/setup/claim and the dev-only
+         *     POST /v1/dev/agent-session believe X-Forwarded-Proto from a peer named in
+         *     QUASAR_TRUSTED_PROXIES, and from no other peer.
          *
          *     Admin-gated by the existing RequireAuth -> RequireAdmin middleware. It reflects the Host
          *     and Origin headers, so both are LENGTH-CAPPED (256 chars) and are only ever rendered as
