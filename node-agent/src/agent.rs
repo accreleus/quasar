@@ -1049,10 +1049,10 @@ pub(crate) fn advertised_codec_throughput(
 
 /// How long register preparation may take before the agent says so. Register
 /// preparation (the image reconcile and the install probe, both against the
-/// container runtime) runs before the socket is dialled, so it can no longer eat the
-/// control plane's handshake window — but the window is 15 s (agentws
-/// `handshakeTimeout`), and a runtime slow enough to approach it deserves a log line
-/// naming it rather than a slow, mysterious reconnect (#191).
+/// container runtime) runs before the socket is dialled, so it never eats the
+/// control plane's register window (agentws `registerReadTimeout`, 5 s); a runtime
+/// this slow still deserves a log line naming it rather than a slow, mysterious
+/// reconnect (#191).
 const REGISTER_PREP_BUDGET: Duration = Duration::from_secs(10);
 
 fn register_prep_over_budget(elapsed: Duration) -> bool {
@@ -1990,7 +1990,7 @@ async fn connect_and_run(
 
     // Everything `register` needs from the container runtime is gathered BEFORE the
     // socket is opened (#191). The control plane gives a fresh connection its
-    // handshake window (agentws `handshakeTimeout`, 15 s) to send `register`; these
+    // register window (agentws `registerReadTimeout`, 5 s) to send `register`; these
     // two probes used to run after the dial, and on a host whose docker daemon
     // answers `inspect` slowly (each is bounded at 30 s) they pushed `register` past
     // that deadline. The control plane closed the socket without a close frame, the
@@ -7318,10 +7318,7 @@ mod tests {
     // ---- #191: register preparation runs before the dial ----
 
     #[test]
-    fn register_prep_budget_sits_inside_the_control_plane_handshake_window() {
-        // agentws handshakeTimeout is 15 s. The budget exists to NAME a slow runtime,
-        // so it must trip before the peer would have given up on a same-window dial.
-        assert!(REGISTER_PREP_BUDGET < Duration::from_secs(15));
+    fn register_prep_budget_names_a_slow_runtime() {
         assert!(!register_prep_over_budget(Duration::from_millis(800)));
         assert!(register_prep_over_budget(Duration::from_secs(11)));
         // The field case: one 30 s inspect timeout.

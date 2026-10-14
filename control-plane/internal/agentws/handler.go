@@ -41,8 +41,12 @@ const (
 	heartbeatIntervalMs = 5000
 	// Allow 4× heartbeat_interval before declaring the read stale.
 	readDeadlineDur = time.Duration(heartbeatIntervalMs*4) * time.Millisecond
-	// How long to wait for the initial register / capacity messages.
+	// Bounds register's DB work and the wait for the first capacity message.
 	handshakeTimeout = 15 * time.Second
+	// How long an unauthenticated socket may hold an admission slot before its
+	// register arrives (#627). The agent prepares register before it dials
+	// (#191), so a real one lands within a round trip of the upgrade.
+	registerReadTimeout = 5 * time.Second
 	// Bounds the read loop's per-message DB work (#416) so a stalled store
 	// surfaces as a dropped agent connection instead of parking the loop. Must
 	// stay below db.DefaultStatementTimeout (30s) or the DB's own timeout wins
@@ -1491,7 +1495,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		h.failures.Failure(clientIP)
 		return "", nil, nil, false, false, nil, "", ImageCleanupRegister{}, err
 	}
-	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	conn.SetReadDeadline(time.Now().Add(registerReadTimeout))
 	raw, err := readTextMessage(conn)
 	if err != nil {
 		return fail(fmt.Errorf("read: %w", describeHandshakeRead(err)))
@@ -1656,7 +1660,7 @@ func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, ac *
 }
 
 // describeHandshakeRead names the one register-read failure operators meet in the
-// field: the agent opened the socket and then sent nothing for handshakeTimeout.
+// field: the agent opened the socket and then sent nothing for registerReadTimeout.
 // Before #191 the agent ran its container-runtime probes INSIDE that window, so a
 // slow docker daemon on the host surfaced here as a bare i/o timeout and, on the
 // agent, as "connection reset without closing handshake" — two logs that did not
@@ -1666,7 +1670,7 @@ func describeHandshakeRead(err error) error {
 	if errors.As(err, &ne) && ne.Timeout() {
 		return fmt.Errorf("no register within %s of the connection opening — an agent "+
 			"whose container runtime answers slowly can take longer than this to prepare "+
-			"its register (#191): %w", handshakeTimeout, err)
+			"its register (#191): %w", registerReadTimeout, err)
 	}
 	return err
 }

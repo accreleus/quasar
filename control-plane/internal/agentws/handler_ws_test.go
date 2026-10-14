@@ -46,6 +46,25 @@ func TestAgentRejectsBinaryRegister(t *testing.T) {
 	}
 }
 
+// #627: a peer that upgrades and never sends register holds an admission slot
+// until the server drops it, so that hold must be short, not the 15 s capacity window.
+func TestSilentAgentSocketIsDroppedQuickly(t *testing.T) {
+	_, url := websocketTestServer(t)
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	start := time.Now()
+	conn.SetReadDeadline(start.Add(20 * time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("a silent peer was sent a message instead of being dropped")
+	}
+	if held := time.Since(start); held > 8*time.Second {
+		t.Fatalf("silent peer held its slot for %s, want under 8s", held)
+	}
+}
+
 func TestAgentRejectsOversizedRegister(t *testing.T) {
 	_, url := websocketTestServer(t)
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
