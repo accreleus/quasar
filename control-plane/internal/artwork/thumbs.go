@@ -61,7 +61,7 @@ func inlineThumb(ctx context.Context, f *Fetcher, rawURL string) string {
 	if err != nil || u.Scheme != "https" || !thumbHostAllowed(u.Hostname()) {
 		return ""
 	}
-	data, _, err := f.Get(ctx, u.String())
+	data, _, err := f.GetOnHosts(ctx, u.String(), thumbHostAllowed)
 	if err != nil || len(data) == 0 {
 		return ""
 	}

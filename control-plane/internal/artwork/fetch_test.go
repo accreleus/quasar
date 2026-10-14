@@ -6,6 +6,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -225,5 +228,106 @@ func TestIsPublicIP(t *testing.T) {
 	}
 	if isPublicIP(nil) {
 		t.Error("isPublicIP(nil): want false")
+	}
+}
+
+// --- #623: concurrency bound, redirect allowlist, no URL in errors ----------
+
+func TestFetcherBoundsConcurrentFetches(t *testing.T) {
+	var inflight, peak atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := inflight.Add(1)
+		defer inflight.Add(-1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+		_, _ = w.Write(onePixelPNG)
+	}))
+	defer srv.Close()
+	f := unguardedFetcher(t, 1<<20)
+
+	var wg sync.WaitGroup
+	for range 4 * maxConcurrentFetches {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, err := f.Get(context.Background(), srv.URL); err != nil {
+				t.Errorf("get: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := peak.Load(); got > maxConcurrentFetches {
+		t.Fatalf("peak concurrent fetches = %d, want <= %d", got, maxConcurrentFetches)
+	}
+}
+
+func TestFetcherQueuedFetchHonoursContext(t *testing.T) {
+	f := unguardedFetcher(t, 1<<20)
+	for range maxConcurrentFetches {
+		f.slots <- struct{}{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, _, err := f.Get(ctx, "https://example.com/a.png"); !errors.Is(err, ErrFetchFailed) {
+		t.Fatalf("want ErrFetchFailed when the context ends in the queue, got %v", err)
+	}
+}
+
+// A redirect must not carry a thumbnail fetch off the provider's hosts.
+func TestGetOnHostsChecksEveryRedirectHop(t *testing.T) {
+	var offListHits atomic.Int32
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		offListHits.Add(1)
+		_, _ = w.Write(onePixelPNG)
+	}))
+	defer target.Close()
+	_, port, _ := net.SplitHostPort(target.Listener.Addr().String())
+	start := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://example.com:"+port+"/x.png", http.StatusFound)
+	}))
+	defer start.Close()
+
+	f := unguardedFetcher(t, 1<<20)
+	tr := start.Client().Transport.(*http.Transport).Clone()
+	// example.com is in the httptest certificate; the dial stays on loopback.
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		_, p, _ := net.SplitHostPort(addr)
+		return (&net.Dialer{}).DialContext(ctx, network, "127.0.0.1:"+p)
+	}
+	f.client = &http.Client{Transport: tr}
+
+	_, _, err := f.GetOnHosts(context.Background(), start.URL, func(h string) bool { return h == "127.0.0.1" })
+	if err == nil {
+		t.Fatal("a redirect off the allowlist must fail")
+	}
+	if offListHits.Load() != 0 {
+		t.Fatal("the off-allowlist host was contacted")
+	}
+	// Control: with the host allowed the same chain succeeds.
+	if _, _, err := f.GetOnHosts(context.Background(), start.URL, func(string) bool { return true }); err != nil {
+		t.Fatalf("allowed redirect: %v", err)
+	}
+}
+
+func TestFetchErrorsDoNotCarryTheURL(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close() // connection refused
+	f := unguardedFetcher(t, 1<<20)
+	for _, raw := range []string{srv.URL + "/a.png?token=s3cret", "http://exa mple.com/a.png?token=s3cret"} {
+		_, _, err := f.Get(context.Background(), raw)
+		if err == nil {
+			t.Fatalf("%q: want an error", raw)
+		}
+		if strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), "a.png") {
+			t.Errorf("%q: error leaks the URL: %v", raw, err)
+		}
+		if !errors.Is(err, ErrFetchFailed) {
+			t.Errorf("%q: want ErrFetchFailed, got %v", raw, err)
+		}
 	}
 }

@@ -1,10 +1,15 @@
 package artwork
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/jpeg" // registers the JPEG header reader for image.DecodeConfig
+	_ "image/png"  // registers the PNG header reader for image.DecodeConfig
 	"io"
 	"io/fs"
 	"net/http"
@@ -100,6 +105,9 @@ func (b *BlobStore) Put(declaredType string, data []byte) (string, error) {
 	if declared := normalizeMediaType(declaredType); declared != "" && declared != sniffed {
 		return "", fmt.Errorf("%w: declared %q but bytes are %q", ErrUnsupportedType, declared, sniffed)
 	}
+	if err := checkDimensions(sniffed, data); err != nil {
+		return "", err
+	}
 
 	sum := sha256.Sum256(data)
 	name := hex.EncodeToString(sum[:]) + "." + ext
@@ -136,6 +144,54 @@ func (b *BlobStore) Put(declaredType string, data []byte) (string, error) {
 		return "", fmt.Errorf("artwork: publish blob: %w", err)
 	}
 	return name, nil
+}
+
+// maxImagePixels caps width x height of a stored image. Byte size is no bound
+// on decoded size (a tiny PNG can declare a billion pixels), and the browser
+// decodes every tile it shows. 16 MP is 4x the largest crop the provider
+// queries ask for (3840x1240) and holds a 4K upload (3840x2160).
+const maxImagePixels = 16 << 20
+
+// checkDimensions reads only the image header and refuses an image whose
+// declared size is unreadable, empty or over maxImagePixels.
+func checkDimensions(mediaType string, data []byte) error {
+	var w, h int
+	if mediaType == "image/webp" {
+		w, h = webpSize(data)
+	} else if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		w, h = cfg.Width, cfg.Height
+	}
+	if w <= 0 || h <= 0 {
+		return fmt.Errorf("%w: unreadable image header", ErrUnsupportedType)
+	}
+	if int64(w)*int64(h) > maxImagePixels {
+		return fmt.Errorf("%w: image is %dx%d, over the %d pixel limit", ErrInvalidRequest, w, h, maxImagePixels)
+	}
+	return nil
+}
+
+// webpSize reads the canvas size from a WebP header (the stdlib has no WebP
+// reader and the repo carries no x/image). 0, 0 means unreadable.
+func webpSize(d []byte) (w, h int) {
+	if len(d) < 30 || string(d[0:4]) != "RIFF" || string(d[8:12]) != "WEBP" {
+		return 0, 0
+	}
+	switch string(d[12:16]) {
+	case "VP8 ": // lossy: 14-bit sizes after the 9d 01 2a start code
+		if d[23] != 0x9d || d[24] != 0x01 || d[25] != 0x2a {
+			return 0, 0
+		}
+		return int(binary.LittleEndian.Uint16(d[26:]) & 0x3fff), int(binary.LittleEndian.Uint16(d[28:]) & 0x3fff)
+	case "VP8L": // lossless: signature 0x2f, then two 14-bit (size-1) fields
+		if d[20] != 0x2f {
+			return 0, 0
+		}
+		bits := binary.LittleEndian.Uint32(d[21:])
+		return int(bits&0x3fff) + 1, int(bits>>14&0x3fff) + 1
+	case "VP8X": // extended: two 24-bit (size-1) fields
+		return (int(d[24]) | int(d[25])<<8 | int(d[26])<<16) + 1, (int(d[27]) | int(d[28])<<8 | int(d[29])<<16) + 1
+	}
+	return 0, 0
 }
 
 // Open returns a blob's bytes and its content type. An invalid name is

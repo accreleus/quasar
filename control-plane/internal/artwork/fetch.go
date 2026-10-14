@@ -48,9 +48,15 @@ var ErrFetchFailed = errors.New("artwork: could not fetch the image")
 type Fetcher struct {
 	client   *http.Client
 	maxBytes int64
+	slots    chan struct{} // one token per in-flight fetch
 }
 
 const maxRedirects = 3
+
+// maxConcurrentFetches bounds in-flight fetches for the whole Fetcher (one per
+// process): an admin search starts one per result, and without a shared cap
+// repeated searches fan out unboundedly. Matches the transport's MaxIdleConns.
+const maxConcurrentFetches = 4
 
 // NewFetcher builds the guarded fetcher. timeout bounds the whole request
 // including redirects and body read.
@@ -81,6 +87,7 @@ func NewFetcher(timeout time.Duration, maxBytes int64) *Fetcher {
 	}
 	return &Fetcher{
 		maxBytes: maxBytes,
+		slots:    make(chan struct{}, maxConcurrentFetches),
 		client: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
@@ -108,12 +115,39 @@ func NewFetcher(timeout time.Duration, maxBytes int64) *Fetcher {
 // Get fetches rawURL and returns the body bytes plus the declared content type.
 // The URL is validated before the request and the body is capped at maxBytes.
 func (f *Fetcher) Get(ctx context.Context, rawURL string) (data []byte, contentType string, err error) {
+	return f.GetOnHosts(ctx, rawURL, nil)
+}
+
+// GetOnHosts is Get, and when allow is non-nil every redirect hop's host must
+// also satisfy it — the caller vets the first URL itself, so without this a
+// redirect could leave the allowlist for any public host.
+func (f *Fetcher) GetOnHosts(ctx context.Context, rawURL string, allow func(host string) bool) (data []byte, contentType string, err error) {
+	select {
+	case f.slots <- struct{}{}:
+		defer func() { <-f.slots }()
+	case <-ctx.Done():
+		return nil, "", fmt.Errorf("%w: %w", ErrFetchFailed, ctx.Err())
+	}
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: invalid url: %v", ErrFetchFailed, err)
+		return nil, "", fmt.Errorf("%w: invalid url: %w", ErrFetchFailed, redactURLError(err))
 	}
 	if err := validateURLScheme(u); err != nil {
 		return nil, "", err
+	}
+	client := f.client
+	if allow != nil {
+		c := *f.client // shares the Transport; only the redirect hook differs
+		c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if !allow(strings.ToLower(req.URL.Hostname())) {
+				return fmt.Errorf("artwork: redirect to a host outside the allowlist")
+			}
+			if f.client.CheckRedirect == nil {
+				return nil
+			}
+			return f.client.CheckRedirect(req, via)
+		}
+		client = &c
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -122,9 +156,11 @@ func (f *Fetcher) Get(ctx context.Context, rawURL string) (data []byte, contentT
 	req.Header.Set("Accept", "image/jpeg,image/png,image/webp")
 	req.Header.Set("User-Agent", userAgent)
 
-	resp, err := f.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: %w", ErrFetchFailed, unwrapBlocked(err))
+		// *url.Error carries the full URL, query included; callers log this
+		// error, so keep only the host and the cause.
+		return nil, "", fmt.Errorf("%w: %s: %w", ErrFetchFailed, u.Hostname(), unwrapBlocked(redactURLError(err)))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -155,6 +191,16 @@ func validateURLScheme(u *url.URL) error {
 		return fmt.Errorf("%w: url has no host", ErrFetchFailed)
 	}
 	return nil
+}
+
+// redactURLError drops the request URL that net/http and url.Parse embed in
+// their errors.
+func redactURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
 
 // unwrapBlocked surfaces ErrBlockedAddress through the http.Client's own error
