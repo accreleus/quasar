@@ -33,7 +33,11 @@ func TestReconnectPreservesOwnedRestrictionAfterOfflineProjection(t *testing.T) 
 		ID: "00000000-0000-0000-0000-000000000123"}, "Platform apply"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.markOffline(ctx, hostID); err != nil {
+	first, err := s.reconnectHost(ctx, "owned-reconnect-host", "0.3.0", nil, "secret-rh05")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.markOffline(ctx, hostID, first.RegisteredAt); err != nil {
 		t.Fatal(err)
 	}
 	if got := hostStatus(t, pool, hostID); got != "draining" {
@@ -117,7 +121,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	}
 	setDrainCreatedAt(t, pool, res.HostID, "2 hours")
 	recordRemoval(t, pool, res.HostID, "7196 seconds")
-	if err := s.markOffline(ctx, res.HostID); err != nil {
+	if err := s.markOffline(ctx, res.HostID, res.RegisteredAt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.enrollHost(ctx, "removed-host", "0.3.1", boundEnrollmentToken(t, pool, "removed-host")); err != nil {
@@ -140,7 +144,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	}
 	setDrainCreatedAt(t, pool, res2.HostID, "3 hours")
 	recordRemoval(t, pool, res2.HostID, "1 hour")
-	if err := s.markOffline(ctx, res2.HostID); err != nil {
+	if err := s.markOffline(ctx, res2.HostID, res2.RegisteredAt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.enrollHost(ctx, "drained-then-removed", "0.3.1", boundEnrollmentToken(t, pool, "drained-then-removed")); err != nil {
@@ -163,7 +167,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 		t.Fatal(err)
 	}
 	recordRemoval(t, pool, res3.HostID, "0 seconds")
-	if err := s.markOffline(ctx, res3.HostID); err != nil {
+	if err := s.markOffline(ctx, res3.HostID, res3.RegisteredAt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.enrollHost(ctx, "removed-mid-run", "0.3.1", boundEnrollmentToken(t, pool, "removed-mid-run")); err != nil {

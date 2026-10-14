@@ -230,6 +230,60 @@ func TestDebugServerSurface(t *testing.T) {
 	})
 }
 
+// TestDebugServerRefusesBrowserRequests: a page in a browser on the host can
+// reach a loopback bind (cross-site POST carries an Origin; DNS rebinding
+// carries the attacker's Host; a navigation or <img> GET carries only
+// Sec-Fetch-Site). None may arm profiling or start a profile/GC (#625).
+func TestDebugServerRefusesBrowserRequests(t *testing.T) {
+	t.Cleanup(func() { runtime.SetMutexProfileFraction(0) })
+	h := newDebugServer("127.0.0.1:0", nil, discardLogger()).Handler
+
+	do := func(method, target, host, origin string, fetch ...string) int {
+		req := httptest.NewRequest(method, target, nil)
+		req.Host = host
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		if len(fetch) > 0 { // Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest
+			req.Header.Set("Sec-Fetch-Site", fetch[0])
+			req.Header.Set("Sec-Fetch-Mode", fetch[1])
+			req.Header.Set("Sec-Fetch-Dest", fetch[2])
+		}
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	for _, tc := range []struct {
+		name, method, target, host, origin string
+		fetch                              []string
+		want                               int
+	}{
+		{"cross-site POST", "POST", "/debug/quasar/mutexprofile?fraction=7", "127.0.0.1:6060", "https://evil.example", nil, 403},
+		{"same-origin-looking Origin", "POST", "/debug/quasar/blockprofile?rate=1", "127.0.0.1:6060", "http://127.0.0.1:6060", nil, 403},
+		{"rebound Host POST", "POST", "/debug/quasar/mutexprofile?fraction=7", "evil.example:6060", "", nil, 403},
+		{"rebound Host pprof", "GET", "/debug/pprof/cmdline", "evil.example", "", nil, 403},
+		{"opaque Origin", "GET", "/debug/pprof/", "127.0.0.1:6060", "null", nil, 403},
+		{"img GET: profile", "GET", "/debug/pprof/profile?seconds=1", "127.0.0.1:6060", "", []string{"cross-site", "no-cors", "image"}, 403},
+		{"img GET: heap gc", "GET", "/debug/pprof/heap?gc=1", "127.0.0.1:6060", "", []string{"cross-site", "no-cors", "image"}, 403},
+		{"navigation GET", "GET", "/debug/quasar/runtime", "localhost:6060", "", []string{"none", "navigate", "document"}, 403},
+		{"form POST without Origin", "POST", "/debug/quasar/mutexprofile?fraction=1", "127.0.0.1:6060", "", []string{"cross-site", "navigate", "document"}, 403},
+		{"0.0.0.0 Host", "GET", "/debug/pprof/heap", "0.0.0.0:6060", "", nil, 403},
+		{"mapped IPv4 Host, dotted", "GET", "/debug/pprof/profile?seconds=1", "[::ffff:127.0.0.1]:6060", "", nil, 403},
+		{"mapped IPv4 Host, hex", "GET", "/debug/pprof/profile?seconds=1", "[::ffff:7f00:1]:6060", "", nil, 403},
+		{"IPv4 loopback", "GET", "/debug/quasar/runtime", "127.0.0.1:6060", "", nil, 200},
+		{"localhost", "GET", "/debug/quasar/runtime", "localhost:6060", "", nil, 200},
+		{"IPv6 loopback", "GET", "/debug/quasar/runtime", "[::1]:6060", "", nil, 200},
+	} {
+		if got := do(tc.method, tc.target, tc.host, tc.origin, tc.fetch...); got != tc.want {
+			t.Errorf("%s: status = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	if got := runtime.SetMutexProfileFraction(-1); got != 0 {
+		t.Errorf("a refused request changed the mutex fraction to %d", got)
+	}
+}
+
 // TestNoComposeFilePublishesTheDebugPort enforces the other half of the loopback
 // guarantee. The bind address keeps the listener on 127.0.0.1 inside the network
 // namespace; this keeps a `ports:` entry from forwarding the host straight past

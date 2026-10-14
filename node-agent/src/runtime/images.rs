@@ -197,7 +197,7 @@ impl Journal {
             _lease: lease,
         }))
     }
-    pub fn pending(&self) -> Result<Option<Intent>, RuntimeError> {
+    fn read(&self) -> Result<Option<Vec<u8>>, RuntimeError> {
         use std::{io::Read, os::unix::fs::OpenOptionsExt};
         match std::fs::OpenOptions::new()
             .read(true)
@@ -209,16 +209,39 @@ impl Journal {
                 file.take(8193)
                     .read_to_end(&mut bytes)
                     .map_err(|_| ErrorKind::Unavailable)?;
-                if bytes.len() > 8192 {
-                    return Err(ErrorKind::Protocol.into());
-                }
-                serde_json::from_slice(&bytes)
-                    .map(Some)
-                    .map_err(|_| ErrorKind::Protocol.into())
+                Ok(Some(bytes))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(_) => Err(ErrorKind::Unavailable.into()),
         }
+    }
+    pub fn pending(&self) -> Result<Option<Intent>, RuntimeError> {
+        match self.read()? {
+            None => Ok(None),
+            Some(bytes) if bytes.len() > 8192 => Err(ErrorKind::Protocol.into()),
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|_| ErrorKind::Protocol.into()),
+        }
+    }
+    /// `pending`, except an empty or truncated file is retired: `begin` returns only once a
+    /// whole JSON record is synced and every engine call comes after, so a file that is not
+    /// a JSON value is a `begin` that died mid-write (#609). An oversized file, or a JSON
+    /// value this agent does not understand, may be a record that guards a live engine
+    /// operation: it stays, and the caller gets `Protocol`.
+    pub fn pending_or_retire(&self) -> Result<Option<Intent>, RuntimeError> {
+        if let Some(bytes) = self.read()? {
+            if bytes.len() <= 8192 && serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+                self.clear()?;
+                tracing::info!(
+                    token = "image-record-unreadable-retired",
+                    record = %self.path.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+                    "retired an empty or truncated image record"
+                );
+                return Ok(None);
+            }
+        }
+        self.pending()
     }
     pub fn begin(&self, intent: Intent) -> Result<(), RuntimeError> {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
@@ -252,8 +275,9 @@ impl Journal {
 }
 
 /// Boot-time sweep: retire every pull intent whose lease nobody holds, so a pull
-/// interrupted by an agent replacement is not reported as pending (#429). Remove
-/// and build intents are left to their next operation's reconciliation.
+/// interrupted by an agent replacement is not reported as pending (#429), and every
+/// record that does not parse (#609). Remove and build intents are left to their next
+/// operation's reconciliation.
 pub(super) fn retire_orphaned_pull_intents(
     config: &RuntimeConfig,
 ) -> Result<Vec<String>, RuntimeError> {
@@ -278,7 +302,7 @@ pub(super) fn retire_orphaned_pull_intents(
         let Some(journal) = Journal::try_acquire(root, key)? else {
             continue;
         };
-        match journal.pending() {
+        match journal.pending_or_retire() {
             Ok(Some(intent)) if intent.is_pull() && journal_key(&intent.image) == key => {
                 journal.clear()?;
                 retired.push(intent.image);
