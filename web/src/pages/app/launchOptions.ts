@@ -3,11 +3,12 @@
 // each an ordered chain of rungs; no invented CAPS matrix, a walk over real chains.
 //
 // "auto" codec segment: one row per profile, keyed by the profile's own nominal
-// and profile-level eligibility, ineligible when no permitted rung decodes here
-// (codec previews the first permitted, decodable rung; the server picks at
-// launch). An explicit codec: one row per profile's FIRST rung matching that
-// codec (mirrors the launch resolver's clamp-0 rule, control-plane rung.go),
-// deduped by (width,height,fps); eligibility is rung-level here.
+// and profile-level eligibility, ineligible on a browser without H.264 when the
+// first permitted rung does not decode here (codec previews the first permitted,
+// decodable rung; the server picks at launch). An explicit codec: one row per
+// profile's FIRST rung matching that codec (mirrors the launch resolver's clamp-0
+// rule, control-plane rung.go), deduped by (width,height,fps); eligibility is
+// rung-level here.
 //
 // fps segment and resolution list always render the FIXED union of rows across
 // every codec, disabling combos the current selection doesn't reach.
@@ -98,10 +99,8 @@ export interface ResolvedSelection {
 
 const CODEC_ORDER: readonly CatalogCodec[] = ["h264", "hevc", "av1"];
 
-const UNDECODABLE: ProfileReason = {
-  code: "codec_not_supported",
-  message: "this browser cannot decode any rung this profile can launch",
-};
+// Copy comes from the code (reasonSentence); the message is never shown.
+const NOT_DECODABLE: ProfileReason = { code: "codec_not_supported", message: "" };
 
 function decodable(codec: CatalogCodec, caps: CodecCapabilities): boolean {
   if (codec === "h264") return caps.h264;
@@ -127,19 +126,20 @@ export function buildOptionSpace(
     const rungs = orderedRungs(p);
     // Preview only a codec the current evaluation permits. Placement still
     // owns the final choice; Auto never sends an explicit codec override.
-    const playable = rungs.find((r) => r.eligibility !== "ineligible" && decodable(r.codec, codecCaps));
-    // The server counts H.264 as decodable everywhere (control-api.md §Codec
-    // resolution), so only this browser can say none of the rungs it allows plays here.
-    const undecodable = !playable && rungs.length > 0 && p.eligibility !== "ineligible";
+    const topRung = rungs.find((r) => r.eligibility !== "ineligible" && decodable(r.codec, codecCaps)) ?? rungs[0];
+    // The server's walk takes H.264 whenever it reaches it (control-api.md §Codec
+    // resolution), so without H.264 here Auto lands on the first allowed rung.
+    const allowed = rungs.find((r) => r.eligibility !== "ineligible");
+    const undecodable = !codecCaps.h264 && allowed !== undefined && !decodable(allowed.codec, codecCaps);
     return {
-      codec: (playable ?? rungs[0])?.codec ?? "h264",
+      codec: (undecodable ? allowed : topRung)?.codec ?? "h264",
       width: p.nominal.width,
       height: p.nominal.height,
       fps: p.nominal.fps,
       bitrateKbps: p.nominal.bitrate_kbps,
       profileId: p.id,
       eligibility: undecodable ? "ineligible" : p.eligibility,
-      reasons: undecodable ? [UNDECODABLE, ...p.reasons] : p.reasons,
+      reasons: undecodable ? [NOT_DECODABLE, ...p.reasons] : p.reasons,
       recommended: p.id === recommendedId && !undecodable,
     };
   });

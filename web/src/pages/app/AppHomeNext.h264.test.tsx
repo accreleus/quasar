@@ -21,7 +21,7 @@ vi.mock("../../api/library");
 const mocked = vi.mocked(libraryApi);
 
 const FIREFOX_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
-const NOTE = /can't decode the video format this option uses/;
+const NOTE = /Without H\.264 this device cannot play any stream/;
 
 const auth: AuthContextValue = {
   status: "authenticated",
@@ -128,7 +128,7 @@ describe("the library and the H.264 probe verdict (#565)", () => {
   it("still blocks an H.264-only profile when the capability list leaves H.264 out", async () => {
     stubFirefox(false, "m=video 0 UDP/TLS/RTP/SAVPF 120\r\n");
     await openBand();
-    expect((await screen.findAllByText(NOTE)).length).toBeGreaterThan(0);
+    expect(await screen.findByText(NOTE)).toBeInTheDocument();
     expect(play()).toBeDisabled();
   });
 
