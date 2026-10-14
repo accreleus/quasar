@@ -561,9 +561,9 @@ func TestEnsureDispatchesImageBuildForTemplate(t *testing.T) {
 	if c.ContextURL != wantURL {
 		t.Fatalf("context_url: got %q want %q", c.ContextURL, wantURL)
 	}
-	if c.ContextSubdir != "xfce-desktop" || c.Dockerfile != "Dockerfile" {
-		t.Fatalf("dockerfile split: subdir=%q dockerfile=%q, want subdir=xfce-desktop dockerfile=Dockerfile",
-			c.ContextSubdir, c.Dockerfile)
+	if c.ContextSubdir != "." || c.Dockerfile != tplDockerfile {
+		t.Fatalf("dockerfile split: subdir=%q dockerfile=%q, want the repo root and %q",
+			c.ContextSubdir, c.Dockerfile, tplDockerfile)
 	}
 	if c.LocalTag != tplLocalTag(tplVer) || c.Version != tplVer {
 		t.Fatalf("local_tag/version: got %q/%q want %q/%q", c.LocalTag, c.Version, tplLocalTag(tplVer), tplVer)

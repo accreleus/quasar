@@ -626,17 +626,15 @@ func (e *Ensurer) markUnsupported(hostID string) {
 }
 
 // splitDockerfilePath renders image_catalog.dockerfile (one repo-root-relative
-// path, e.g. "steam/Dockerfile") into the (context_subdir, dockerfile) pair
-// image_build wants (protocol/agent-api.md §image_build): everything before
-// the last slash / everything after. A bare "Dockerfile" splits to
-// context_subdir="." (repo root is the build context).
+// path, e.g. "images/quasar-probe/Dockerfile") into the (context_subdir,
+// dockerfile) pair image_build wants (protocol/agent-api.md §image_build). The
+// build context is always the repo root ("."): the catalog repo builds every
+// Dockerfile from there (`docker build -f <path> .`), so a COPY names its
+// source from the root. The agent resolves dockerfile inside that context.
 func splitDockerfilePath(df string) (contextSubdir, dockerfile string) {
 	df = strings.TrimSpace(df)
 	if df == "" {
 		df = "Dockerfile"
-	}
-	if i := strings.LastIndex(df, "/"); i >= 0 {
-		return df[:i], df[i+1:]
 	}
 	return ".", df
 }
