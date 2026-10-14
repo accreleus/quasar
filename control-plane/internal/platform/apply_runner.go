@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 )
@@ -657,8 +658,13 @@ func (r *Runner) HandleReleaseState(ctx context.Context, hostID string, rep Rele
 
 	switch rep.State {
 	case AttemptSucceeded:
-		// Corroboration, not the gate — but an apply that somehow reported its
-		// own success is still resolved by it.
+		// Corroboration, not the gate, wherever a register can prove the outcome:
+		// a faulty agent must not resolve its own apply (#619).
+		if r.registerIsEvidence(ctx, a) || !slices.Equal(rep.Components, a.RequestedDigests) {
+			r.log.Warn("release_state says succeeded, but only a register on the requested build resolves this apply; not recorded",
+				"attempt_id", a.ID, "host_id", hostID, "token", "apply-relayed-success-ignored")
+			return
+		}
 		if done, err := r.store.SucceedAttempt(ctx, a.ID); err != nil {
 			r.log.Warn("release_state: could not record success", "attempt_id", a.ID, "err", err)
 		} else if done {
@@ -793,6 +799,23 @@ func restoredDigests(requested []ComponentDigest, previous []PreviousDigest) []C
 	return out
 }
 
+// registerIsEvidence is whether HandleRegister resolves `a` on a register
+// reporting its commit; keep the two in step. A release always names one
+// (platform_releases.source_commit is NOT NULL), so it is not read.
+func (r *Runner) registerIsEvidence(ctx context.Context, a Attempt) bool {
+	if namesOnly(a.RequestedDigests, ComponentRecovery) {
+		return false
+	}
+	if a.ReleaseID != nil {
+		return true
+	}
+	if a.Kind == KindDeveloperApply {
+		ev, err := r.developerCommit(ctx, a)
+		return err == nil && ev.registerIsEvidence
+	}
+	return false
+}
+
 // HandleRegister is the success-evidence hook, on every agent register. A
 // register is the only thing that clears the apply-unsupported flag, and one
 // carrying the requested source_commit resolves that host's open attempt.
@@ -860,7 +883,7 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 			return
 		}
 		if actor == nil || !commitsMatch(wantCommit, *actor) {
-			r.log.Info("register reports the requested agent but not the requested recovery actor; the relayed outcome decides",
+			r.log.Info("register reports the requested agent but not the requested recovery actor; a relayed failure or the deadline decides",
 				"host_id", hostID, "attempt_id", a.ID)
 			return
 		}

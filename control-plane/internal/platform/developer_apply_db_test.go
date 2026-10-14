@@ -206,7 +206,9 @@ func TestAReAdoptedDeveloperApplyReadsItsCommitAgain(t *testing.T) {
 	if a, _ := h.store.Attempt(ctx, attempt.ID); TerminalAttemptState(a.State) {
 		t.Fatalf("a register resolved a re-adopted developer apply: %+v", a)
 	}
-	fresh.HandleReleaseState(ctx, h.hostID, ReleaseStateReport{RequestID: h.agent.sent[0].RequestID, State: AttemptSucceeded})
+	fresh.HandleReleaseState(ctx, h.hostID, ReleaseStateReport{
+		RequestID: h.agent.sent[0].RequestID, State: AttemptSucceeded, Components: []ComponentDigest{agentComponent()},
+	})
 	waitFor(t, "success", func() bool {
 		a, _ := h.store.Attempt(ctx, attempt.ID)
 		return a.State == AttemptSucceeded
@@ -289,9 +291,14 @@ func TestARestoredDeveloperApplyIsRecordedWithItsAutoRevertAndIsARevertSourceWhe
 	}
 	waitFor(t, "release_apply", func() bool { return h.agent.sentCount() == 2 })
 	h.runner.HandleReleaseState(ctx, h.hostID, ReleaseStateReport{
-		RequestID: h.agent.sent[1].RequestID, State: AttemptSucceeded,
+		RequestID: h.agent.sent[1].RequestID, State: AttemptSucceeded, Components: []ComponentDigest{agentComponent()},
 		Previous: []PreviousDigest{{Name: ComponentNodeAgent, Digest: &prev}},
 	})
+	if a, _ := h.store.AttemptByRequestID(ctx, h.agent.sent[1].RequestID); TerminalAttemptState(a.State) {
+		t.Fatalf("the agent's own succeeded resolved an apply its register can prove: %+v", a)
+	}
+	want := commitB
+	h.runner.HandleRegister(ctx, h.hostID, &want)
 	code, body = h.post(t, h.revertURL(), h.adminToken, map[string]any{"force": true})
 	if code != http.StatusAccepted {
 		t.Fatalf("revert = %d (%s), want 202", code, body)

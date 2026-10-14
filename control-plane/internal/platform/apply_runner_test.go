@@ -504,6 +504,53 @@ func TestReleaseStateForAnUnknownRequestIsDropped(t *testing.T) {
 	}
 }
 
+// A host's own `succeeded` is the outcome only where a register cannot prove
+// one, and then only for the digests requested. Anywhere else the
+// register on the requested commit decides (agent-api.md §release_state).
+func TestARelayedSuccessResolvesOnlyAnAttemptARegisterCannotProve(t *testing.T) {
+	agent, actor, other := []ComponentDigest{agentDigest('b')}, []ComponentDigest{actorDigest('a')}, []ComponentDigest{actorDigest('c')}
+	both := []ComponentDigest{actorDigest('a'), agentDigest('b')}
+	old, running := strings.Repeat("0", 40), testCommit
+	for _, tc := range []struct {
+		name      string
+		kind      string
+		requested []ComponentDigest
+		echoed    []ComponentDigest
+		before    *string // a developer apply's host commit when it was requested
+		want      string
+	}{
+		{"a release apply waits for the register", KindApply, agent, agent, nil, AttemptPending},
+		{"so does one that also moves the actor", KindApply, both, both, nil, AttemptPending},
+		{"a developer apply to a new commit waits for the register", KindDeveloperApply, agent, agent, &old, AttemptPending},
+		{"an actor-only apply is decided by its relay", KindApply, actor, actor, nil, AttemptSucceeded},
+		{"a developer apply of the running commit too", KindDeveloperApply, agent, agent, &running, AttemptSucceeded},
+		{"a revert to a build no release names too", KindRevert, agent, agent, nil, AttemptSucceeded},
+		{"but not a relay naming other digests", KindApply, actor, other, nil, AttemptPending},
+		{"or none", KindApply, actor, nil, nil, AttemptPending},
+	} {
+		a := queuedAttempt(true)
+		a.Kind, a.RequestedDigests = tc.kind, tc.requested
+		if tc.kind != KindApply {
+			a.ReleaseID = nil
+		}
+		store := newFakeStore(a)
+		fa := &fakeAgent{ack: Ack{OK: true}}
+		r := testRunner(store, fa.deps())
+		if tc.kind == KindDeveloperApply {
+			r.RememberDeveloperCommit(a.ID, testCommit, tc.before)
+		}
+		r.Start(a)
+		waitFor(t, "release_apply to be sent", func() bool { return fa.sentCount() == 1 })
+		r.HandleReleaseState(context.Background(), testHostID, ReleaseStateReport{
+			RequestID: fa.sent[0].RequestID, State: AttemptSucceeded, Components: tc.echoed,
+		})
+		r.Close()
+		if got := store.snapshot(a.ID).State; got != tc.want {
+			t.Errorf("%s: state %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 // A host an admin had already cordoned STAYS cordoned: the apply restores the
 // state it found, it does not impose one.
 func TestAnAlreadyCordonedHostIsLeftCordoned(t *testing.T) {
