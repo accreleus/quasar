@@ -167,7 +167,7 @@ case "$HTTP_CODE" in
     dx_fail request "404 from $URL/v1/dev/agent-session — the route is not registered on that stack; set QUASAR_DEV_AGENT_AUTH=1 and restart it" >&2
     dx_result "$TARGET" >&2 ;;
   401)
-    dx_fail request "401 from $URL/v1/dev/agent-session — the dev key is wrong or stale (it is per-boot; re-fetch it rather than reusing an old one)" >&2
+    dx_fail request "401 from $URL/v1/dev/agent-session — the dev key is wrong or stale (it is per-boot; re-fetch it rather than reusing an old one), or the stack refuses the route over plain HTTP (use its https:// URL). Server said: $(tr -d '\n' < "$RESP_FILE" | cut -c1-420)" >&2
     dx_result "$TARGET" >&2 ;;
   ""|000)
     dx_fail request "no response from $URL/v1/dev/agent-session — is the stack up? (make up / make status)" >&2

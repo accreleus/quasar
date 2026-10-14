@@ -30,6 +30,14 @@ func ClientIP(r *http.Request, trusted []*net.IPNet) string {
 	return rightmostUntrusted(r.Header.Values("X-Forwarded-For"), trusted, peer)
 }
 
+// DirectPeer returns the TCP peer's address (nil when RemoteAddr is not an IP)
+// and whether it is inside QUASAR_TRUSTED_PROXIES. A forwarded header must
+// never be believed from a peer that is not.
+func DirectPeer(r *http.Request, trusted []*net.IPNet) (net.IP, bool) {
+	ip := net.ParseIP(peerHost(r.RemoteAddr))
+	return ip, ip != nil && containsIP(trusted, ip)
+}
+
 // Bounds the flattened chain (a legitimate one is one or two hops; parsing an
 // unbounded list is attacker-controlled work). Over the cap the whole header
 // is discarded — the same fallback as a malformed chain, so exceeding it

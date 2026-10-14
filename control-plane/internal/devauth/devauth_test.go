@@ -107,7 +107,7 @@ func TestMuxWithFlagOnServesTheRoute(t *testing.T) {
 	mux := http.NewServeMux()
 	Register(mux, Config{Enabled: true}, NewService(okMinter(), testSecret, testLogger()), testLogger())
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/dev/agent-session", nil)
+	req := httptest.NewRequest(http.MethodPost, "https://quasar.test/v1/dev/agent-session", nil)
 	req.Header.Set(KeyHeader, testSecret)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -165,13 +165,14 @@ func TestLoadConfigReadsTheEnvironment(t *testing.T) {
 
 // --- gate 3/5: the key -------------------------------------------------------
 
+// post calls the route on the TLS listener: an https target makes httptest set r.TLS.
 func post(t *testing.T, svc *Service, key string, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	var r io.Reader
 	if body != "" {
 		r = strings.NewReader(body)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/dev/agent-session", r)
+	req := httptest.NewRequest(http.MethodPost, "https://quasar.test/v1/dev/agent-session", r)
 	if key != "" {
 		req.Header.Set(KeyHeader, key)
 	}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -38,6 +39,17 @@ type Service struct {
 	// is fixed-width — subtle.ConstantTimeCompare on raw strings returns early
 	// on a length mismatch.
 	secretDigest [sha256.Size]byte
+
+	// trustedProxies and insecureHTTP decide which transports Handle accepts.
+	trustedProxies []*net.IPNet
+	insecureHTTP   bool
+}
+
+// WithTransport sets whose X-Forwarded-Proto is believed (QUASAR_TRUSTED_PROXIES)
+// and whether plain HTTP is served to any peer (Config.InsecureHTTP).
+func (s *Service) WithTransport(trustedProxies []*net.IPNet, insecureHTTP bool) *Service {
+	s.trustedProxies, s.insecureHTTP = trustedProxies, insecureHTTP
+	return s
 }
 
 // NewService builds the dev-auth service. secret is the per-boot key.
@@ -61,7 +73,8 @@ func Register(mux httpx.Router, cfg Config, svc *Service, log *slog.Logger) {
 	}
 	// Gate 4: a WARN banner every enabled boot — visible without knowing to look.
 	log.Warn("DEV-ONLY AGENT AUTH IS ENABLED — POST /v1/dev/agent-session mints throwaway identities",
-		"knob", EnvFlag, "disable", EnvFlag+"=0 (or unset) then restart")
+		"knob", EnvFlag, "disable", EnvFlag+"=0 (or unset) then restart",
+		"served_over_plain_http_to_any_peer", cfg.InsecureHTTP)
 	mux.HandleFunc(Route, svc.Handle)
 }
 
@@ -121,7 +134,11 @@ const (
 
 // Handle serves POST /v1/dev/agent-session.
 func (s *Service) Handle(w http.ResponseWriter, r *http.Request) {
-	// Gate 5: key check first, before the body is read; every failure produces
+	// Gate 5, before the key is looked at.
+	if !s.insecureHTTP && httpx.RefuseInsecure(w, r, s.trustedProxies, true) {
+		return
+	}
+	// Gate 6: key check, before the body is read; every failure produces
 	// the identical envelope (no missing-vs-wrong distinction, no length leak —
 	// see secretDigest).
 	if !s.keyOK(r.Header.Get(KeyHeader)) {

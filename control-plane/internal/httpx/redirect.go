@@ -17,6 +17,7 @@ import (
 // X-Forwarded-Proto: https is served normally — redirecting a request that
 // already crossed a TLS-terminating proxy loops. The header is spoofable, but
 // this is a UX aid, not access control: both listeners serve the same handler.
+// A route that must not run over plain HTTP calls RefuseInsecure.
 //
 // Browsers never follow a redirect on a WebSocket upgrade, so those get 426.
 func RedirectToHTTPS(next http.Handler, port string) http.Handler {
