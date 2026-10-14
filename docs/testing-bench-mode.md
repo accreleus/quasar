@@ -364,9 +364,9 @@ reconcile: A+B+C = 71.60 ms   measured g2g = 71.90 ms   residual = 0.30 ms
 
 A run whose suite/scenario/baseline name has no pinned baseline prints every stage as `no data`/unscored, not a failure — a budget run against a suite nobody has baselined yet is informative, not broken.
 
-### NVIDIA encode time follows the card's power state, not the build
+### NVIDIA encode time follows the card's power state
 
-On an NVIDIA host, the agent's `encode_ms` settles at one of three levels: about 1.1, 2.9 or 6.7 ms on an RTX 5090. Each level is a power state the driver picks by itself under a light stream: P1, P5 or P8. Measured 2026-10-14: rank correlation −0.90 between encode time and memory clock over 96 windows. Two soaks of the same build four minutes apart settled at 6.2 and 2.9 ms. So an NVIDIA `encode_ms` or `encode_ms_max` regression alone does not block a landing: say it is the power state in the summary, and judge the run on the glass-to-glass and present-cadence keys. A stall in a single frame still shows in `encode_ms_max` against runs at the same level.
+On an RTX 5090, a light 1080p60 Vulkan H.264 stream's per-window `encode_ms` p50 is about 1.1 ms only while the app is starting (about the first 20 s, P1, already stepping through P3). After that the driver moves on its own between about 2.9 ms (P5) and about 6.7 ms (P8). Measured 2026-10-14: rank correlation −0.90 between that p50 and the memory clock over 96 windows. Two soaks of the same build four minutes apart settled at 6.2 and 2.9 ms. An `encode_ms` gap inside that P5/P8 band, with both plateaus still at those times, is the power-state mix: name the level each run sat on. Exit 3 still blocks the landing when a plateau moves, or when `encode_ms_max` rises above the slow band. Glass-to-glass and present cadence staying green does not explain it.
 
 ### Baseline policy — when to re-baseline
 
