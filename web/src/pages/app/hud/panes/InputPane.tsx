@@ -147,14 +147,13 @@ function escNote(props: InputPaneProps): string {
   if (props.escInsecureContext) {
     return (
       "In-game Esc capture needs the HTTPS address — Keyboard Lock is unavailable on this " +
-      "insecure origin, so the browser keeps Esc and it releases capture. Esc still reaches " +
-      "the game once; click Resume to go back in."
+      "insecure origin, so the browser keeps Esc and it releases capture."
     );
   }
   if (props.escNoKeyboardLock) {
     return (
-      "This browser always keeps Esc for itself, so it leaves fullscreen and releases " +
-      "capture. Quasar sends that Esc to the game once; click Resume to go back in."
+      "This browser keeps Esc for itself, so the game never sees it. It may leave " +
+      "fullscreen, but capture stays on until you use the release combo."
     );
   }
   return (
@@ -210,7 +209,13 @@ export function InputPane(props: InputPaneProps) {
           <div className="col-lb">Keys</div>
           <div className="ov-kv">
             <span>Esc key</span>
-            <b>{props.escReleases ? "Releases capture" : "Sent to the app"}</b>
+            <b>
+              {props.escNoKeyboardLock
+                ? "Not sent to the app"
+                : props.escReleases
+                  ? "Releases capture"
+                  : "Sent to the app"}
+            </b>
           </div>
           {/* Gesture reference — only where the gestures are actually live; a
               desktop cannot produce them. */}

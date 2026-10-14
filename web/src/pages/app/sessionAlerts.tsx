@@ -10,7 +10,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Button } from "../../components/Button";
 
 /** How long an informational toast stays up. */
 const TOAST_MS = 4200;
@@ -50,25 +49,6 @@ export function SessionToastHost({ toast }: { toast: SessionToast | null }) {
   return (
     <div className="ev-toast" role="status" key={toast.id}>
       {toast.text}
-    </div>
-  );
-}
-
-/**
- * A toast that carries one action and stays until it is used or no longer
- * true. The toast tier times out and the banner tier is full-width and moves
- * the HUD, so neither fits "Esc went to the game, click to resume" (#631).
- * Same `.ev-toast` surface as the toast, plus a Button.
- */
-export function SessionResumePrompt({ onResume }: { onResume: () => void }) {
-  return (
-    <div className="ev-toast" role="status">
-      <span>
-        <b>Esc went to the game.</b>
-      </span>
-      <Button variant="primary" size="sm" onClick={onResume}>
-        Resume
-      </Button>
     </div>
   );
 }

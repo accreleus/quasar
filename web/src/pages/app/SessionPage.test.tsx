@@ -39,36 +39,29 @@ vi.mock("../../auth/context", () => ({
   useAuth: () => ({ token: "t" }),
 }));
 
-/** The options the page handed the last capture, and how often it engaged. */
-let lastCaptureOptions: Record<string, (...a: unknown[]) => void> | null = null;
-let engageCalls = 0;
+/** What keyboardLockSupported() answers: false is Safari/Firefox, true Chrome/Edge. */
+let keyboardLockOn = false;
 vi.mock("../../input/capture", () => ({
-  setupCapture: (options: Record<string, (...a: unknown[]) => void>) => {
-    lastCaptureOptions = options;
-    return {
-      cleanup: () => {},
-      getMetrics: () => ({
-        pointerLocked: false,
-        coalescedSupported: true,
-        inputMsgPerSec: 0,
-        coalescedSamplesPerSec: 0,
-        channelBufferedAmount: 0,
-        backpressureDetected: false,
-        gamepadCount: 0,
-        pads: [],
-        gamepadSendPerSec: 0,
-        mmSentPerSec: 0,
-        inputTrace: false,
-      }),
-      syncKeyboardLock: () => {},
-      engage: () => {
-        engageCalls++;
-        return Promise.resolve({ mode: "pointer-lock" });
-      },
-      release: () => {},
-    };
-  },
-  keyboardLockSupported: () => false,
+  setupCapture: () => ({
+    cleanup: () => {},
+    getMetrics: () => ({
+      pointerLocked: false,
+      coalescedSupported: true,
+      inputMsgPerSec: 0,
+      coalescedSamplesPerSec: 0,
+      channelBufferedAmount: 0,
+      backpressureDetected: false,
+      gamepadCount: 0,
+      pads: [],
+      gamepadSendPerSec: 0,
+      mmSentPerSec: 0,
+      inputTrace: false,
+    }),
+    syncKeyboardLock: () => {},
+    engage: () => Promise.resolve({ mode: "pointer-lock" }),
+    release: () => {},
+  }),
+  keyboardLockSupported: () => keyboardLockOn,
   // A desktop-shaped default: this suite exercises the display/resolution
   // controls, not the capture modality. The touch and no-Pointer-Lock paths
   // have their own coverage in capture.touch.test.ts / capture.test.ts.
@@ -257,8 +250,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
-  lastCaptureOptions = null;
-  engageCalls = 0;
+  keyboardLockOn = false;
   lastDrawerProps = null;
   lastStripProps = null;
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
@@ -769,95 +761,36 @@ describe("SessionPage — stream (external) resolution", () => {
   });
 });
 
-describe("SessionPage — the Esc the browser took (#631)", () => {
-  async function mountStreaming() {
+// #631: where Esc leaves fullscreen but capture.ts has just asked for the lock
+// back, the page must not exit it again.
+describe("SessionPage — leaving fullscreen with the mouse locked (#631)", () => {
+  async function fullscreenExitWithLock(): Promise<ReturnType<typeof vi.fn>> {
     currentSession = makeSession({ state: "running", state_detail: "app presented" });
     renderPage();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
-    await act(async () => {
-      openChannel();
-    });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(2_000);
-    });
-  }
-
-  const setFullscreenElement = (el: Element | null) =>
-    Object.defineProperty(document, "fullscreenElement", { value: el, configurable: true });
-
-  afterEach(() => {
-    delete (document as unknown as { fullscreenElement?: unknown }).fullscreenElement;
-    delete (HTMLElement.prototype as unknown as { requestFullscreen?: unknown }).requestFullscreen;
-  });
-
-  it("shows no prompt until capture.ts reports a guessed Esc", async () => {
-    await mountStreaming();
-    expect(screen.queryByText(/Esc went to the game/)).toBeNull();
-  });
-
-  it("offers one click: it captures again and the prompt goes once capture is back", async () => {
-    await mountStreaming();
-    act(() => lastCaptureOptions!.onEscGuessed());
-    expect(screen.getByText(/Esc went to the game/)).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
-    expect(engageCalls).toBe(1);
-
-    act(() => lastCaptureOptions!.onCaptureChange({ captured: true, pointerLocked: true }));
-    expect(screen.queryByText(/Esc went to the game/)).toBeNull();
-  });
-
-  it("re-enters fullscreen first when the session was fullscreen, and captures once it resolves", async () => {
-    const requestFullscreen = vi.fn(() => Promise.resolve());
-    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
-      value: requestFullscreen,
-      configurable: true,
-    });
-    await mountStreaming();
-    setFullscreenElement(document.body); // Firefox: capture ends while still fullscreen
-    act(() => lastCaptureOptions!.onEscGuessed());
-    setFullscreenElement(null); // ...then the browser leaves fullscreen
-    act(() => {
-      document.dispatchEvent(new Event("fullscreenchange"));
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
-    expect(requestFullscreen).toHaveBeenCalledTimes(1);
-    expect(engageCalls).toBe(0); // Firefox drops a lock requested in the same tick
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(engageCalls).toBe(1);
-  });
-
-  it("counts a fullscreen exit that came just BEFORE the capture ended (WebKit order)", async () => {
-    const requestFullscreen = vi.fn(() => Promise.resolve());
-    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
-      value: requestFullscreen,
-      configurable: true,
-    });
-    await mountStreaming();
+    const exitPointerLock = vi.fn();
+    Object.defineProperty(document, "pointerLockElement", { value: document.body, configurable: true });
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
     act(() => {
       document.dispatchEvent(new Event("fullscreenchange")); // fullscreenElement is null: an exit
     });
-    act(() => lastCaptureOptions!.onEscGuessed());
-    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
-    expect(requestFullscreen).toHaveBeenCalledTimes(1);
+    return exitPointerLock;
+  }
+
+  afterEach(() => {
+    delete (document as unknown as { pointerLockElement?: unknown }).pointerLockElement;
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
   });
 
-  it("does not touch fullscreen when the session was windowed", async () => {
-    const requestFullscreen = vi.fn(() => Promise.resolve());
-    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
-      value: requestFullscreen,
-      configurable: true,
-    });
-    await mountStreaming();
-    act(() => lastCaptureOptions!.onEscGuessed());
-    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
-    expect(requestFullscreen).not.toHaveBeenCalled();
-    expect(engageCalls).toBe(1);
+  it("keeps the lock without Keyboard Lock (Safari, Firefox)", async () => {
+    expect(await fullscreenExitWithLock()).not.toHaveBeenCalled();
+  });
+
+  it("still releases it with Keyboard Lock (Chrome, Edge: unchanged)", async () => {
+    keyboardLockOn = true;
+    expect(await fullscreenExitWithLock()).toHaveBeenCalledTimes(1);
   });
 });
 

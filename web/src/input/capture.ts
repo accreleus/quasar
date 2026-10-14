@@ -135,11 +135,6 @@ export interface CaptureOptions {
    *  line up, and cutting it off entirely would be worse — so the page must
    *  tell the user their buttons may be mixed up (quasar#348). */
   onNonStandardGamepad?: (pad: GamepadIdentity) => void;
-  /** Capture ended without our release combo, in a browser with no Keyboard
-   *  Lock, while the page kept focus and was visible: the browser took an Esc.
-   *  One Esc tap was already sent to the host (quasar#631); the page offers the
-   *  one-click way back in. */
-  onEscGuessed?: () => void;
 }
 
 /** bufferedAmount above which we flag backpressure (16 KiB). */
@@ -165,10 +160,15 @@ export function keyboardLockSupported(): boolean {
   return keyboardLockApi() != null;
 }
 
-/** How long the guessed Esc stays down. Zero would be a down/up pair in one
- *  message batch, which a game polling once per frame can miss; Chrome's own
- *  Keyboard Lock tap lasts about this long. */
-const ESC_TAP_HOLD_MS = 50;
+/** Re-request Pointer Lock at most this often after the browser drops it. A
+ *  browser that grants the lock and drops it again at once must not spin us in
+ *  a request loop; the second loss inside the gap releases capture as before.
+ *  Two Esc presses closer together than this release capture. */
+const RELOCK_MIN_GAP_MS = 500;
+
+/** A re-request neither granted nor refused by now (a browser that raises
+ *  neither `pointerlockchange` nor `pointerlockerror`) counts as refused. */
+const RELOCK_GRANT_MS = 1000;
 
 /** Probed on `Element.prototype`, not `"pointerLockElement" in document` —
  *  WebKit ships the two independently, and the element method is the one the
@@ -226,7 +226,6 @@ export function setupCapture({
   onKeyboardLockRefused,
   onSummonOverlay,
   onNonStandardGamepad,
-  onEscGuessed,
 }: CaptureOptions): {
   cleanup: () => void;
   getMetrics: () => CaptureMetrics;
@@ -267,8 +266,8 @@ export function setupCapture({
     console.info(
       window.isSecureContext
         ? "input: Keyboard Lock API unavailable in this browser — Esc stays " +
-            "browser-owned and releases capture; Quasar sends one Esc to the game " +
-            "and offers a click to resume."
+            "browser-owned (the game never sees it); Quasar asks for the mouse " +
+            "lock again so capture continues."
         : "input: Keyboard Lock API unavailable (secure context required) — " +
             "Esc stays browser-owned and will release capture; use HTTPS (Chrome, " +
             "Edge) to enable in-game Esc.",
@@ -291,8 +290,10 @@ export function setupCapture({
   // otherwise a key held when capture drops sticks down on the host.
   const heldKeys = new Set<number>();
 
-  // The guessed Esc's pending key-up (quasar#631); cleanup() sends it early.
-  let escTapTimer: ReturnType<typeof setTimeout> | null = null;
+  // quasar#631: a Pointer Lock re-request is in flight (see relock()).
+  let relocking = false;
+  let lastRelockAt = -Infinity;
+  let relockTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Idempotency guard so repeated syncs don't re-lock/re-unlock.
   let keyboardLocked = false;
@@ -414,21 +415,54 @@ export function setupCapture({
     updateKeyboardLock();
   };
 
-  /** quasar#631: Safari and Firefox always keep Esc for themselves — it ends
-   *  Pointer Lock (and fullscreen) and, measured, the page gets no `keydown`
-   *  (Firefox: no key event at all; WebKit: a bare `keyup`). Tell that apart
-   *  from a deliberate release or a lost window, and hand the host the Esc the
-   *  player pressed. A `keydown` that did arrive first is already in `heldKeys`
-   *  and gets its key-up from the flush; one that arrives after capture ended is
-   *  dropped by the `captured` gate. Either way the host sees one tap. */
-  const guessEsc = () => {
-    const esc = EVDEV.Escape;
-    send({ t: "k", code: esc, pressed: true });
-    escTapTimer = setTimeout(() => {
-      escTapTimer = null;
-      sendBestEffort({ t: "k", code: esc, pressed: false });
-    }, ESC_TAP_HOLD_MS);
-    onEscGuessed?.();
+  /** The re-request is over, granted or not. */
+  const endRelock = () => {
+    relocking = false;
+    if (relockTimer !== null) {
+      clearTimeout(relockTimer);
+      relockTimer = null;
+    }
+  };
+
+  /** The browser refused the re-request: release capture, as before #631. */
+  const relockRefused = () => {
+    if (!relocking) return;
+    endRelock();
+    captureMode = "none";
+    setCaptured(false);
+  };
+
+  /** quasar#631: Safari and Firefox always keep Esc for themselves: it drops
+   *  Pointer Lock (and fullscreen) and the page gets no `keydown`. Capture used
+   *  to survive that; ask for the lock again at once, no gesture needed (measured
+   *  in Firefox, windowed and fullscreen). True when a request went out; the
+   *  grant arrives as `pointerlockchange`, a refusal as a rejection, a throw or
+   *  `pointerlockerror`. Capture stays on meanwhile, so held keys stay held. */
+  const relock = (): boolean => {
+    const now = performance.now();
+    if (
+      !wanted || // release() (every combo, the menu) clears this
+      relocking ||
+      keyboardLockApi() || // Chrome/Edge: Keyboard Lock already gave the game its Esc
+      !document.hasFocus() || // Cmd-Tab
+      document.visibilityState !== "visible" || // a tab switch
+      now - lastRelockAt < RELOCK_MIN_GAP_MS
+    ) {
+      return false;
+    }
+    lastRelockAt = now;
+    relocking = true;
+    relockTimer = setTimeout(relockRefused, RELOCK_GRANT_MS);
+    try {
+      // Chrome returns a Promise, Firefox undefined (it raises pointerlockerror).
+      const maybe: unknown = videoEl.requestPointerLock();
+      if (maybe && typeof (maybe as PromiseLike<void>).then === "function") {
+        (maybe as PromiseLike<void>).then(undefined, relockRefused);
+      }
+    } catch {
+      relockRefused();
+    }
+    return true;
   };
 
   const onLockChange = () => {
@@ -438,25 +472,25 @@ export function setupCapture({
       document.exitPointerLock?.();
       onCaptureChange({ captured, pointerLocked });
     } else if (pointerLocked) {
+      endRelock();
       captureMode = "lock";
       setCaptured(true);
     } else if (captureMode === "lock") {
-      // the lock owned this capture, so its loss is the release; a fallback-mode
-      // pointerlockchange belongs to another element and must not touch our state
-      const browserTookEsc =
-        wanted && // release() (every combo, the menu) clears this
-        !keyboardLockApi() && // Chrome/Edge: Keyboard Lock already gave the game its Esc
-        !heldKeys.has(EVDEV.Escape) && // a real keydown won
-        document.hasFocus() &&
-        document.visibilityState === "visible"; // Cmd-Tab or a tab switch
-      captureMode = "none";
-      setCaptured(false);
-      if (browserTookEsc) guessEsc();
+      // the lock owned this capture, so its loss is the release unless the
+      // browser just took an Esc (relock); a fallback-mode pointerlockchange
+      // belongs to another element and must not touch our state
+      if (relocking || relock()) {
+        onCaptureChange({ captured, pointerLocked });
+      } else {
+        captureMode = "none";
+        setCaptured(false);
+      }
     } else {
       onCaptureChange({ captured, pointerLocked });
     }
   };
   document.addEventListener("pointerlockchange", onLockChange);
+  document.addEventListener("pointerlockerror", relockRefused);
 
   /**
    * Engage from a user gesture. A refused lock on a lock-capable device is
@@ -498,6 +532,13 @@ export function setupCapture({
    *  directly. A lock this capture inherited (an older capture's) is exited too. */
   const release = () => {
     wanted = false;
+    if (relocking) {
+      // no lock is held to exit, so no pointerlockchange would run the release
+      endRelock();
+      captureMode = "none";
+      setCaptured(false);
+      return;
+    }
     if ((captureMode === "lock" || document.pointerLockElement === videoEl) && document.exitPointerLock) {
       document.exitPointerLock();
       return;
@@ -928,11 +969,7 @@ export function setupCapture({
   // ── Cleanup ───────────────────────────────────────────────────────────────
 
   const cleanup = () => {
-    if (escTapTimer !== null) {
-      clearTimeout(escTapTimer);
-      escTapTimer = null;
-      sendBestEffort({ t: "k", code: EVDEV.Escape, pressed: false });
-    }
+    endRelock();
     // Release everything before listeners come down, so an abrupt unmount while
     // captured doesn't leave the host with stuck keys or gamepad buttons.
     if (captured) {
@@ -945,6 +982,7 @@ export function setupCapture({
     cleanedUp = true;
     if (liveCapture.get(videoEl) === self) liveCapture.delete(videoEl);
     document.removeEventListener("pointerlockchange", onLockChange);
+    document.removeEventListener("pointerlockerror", relockRefused);
     document.removeEventListener("pointerdown", onPointerDown, true);
     document.removeEventListener("pointermove", onPointerMove);
     document.removeEventListener("mousedown", onMouseDown);
