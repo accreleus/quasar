@@ -364,6 +364,10 @@ reconcile: A+B+C = 71.60 ms   measured g2g = 71.90 ms   residual = 0.30 ms
 
 A run whose suite/scenario/baseline name has no pinned baseline prints every stage as `no data`/unscored, not a failure — a budget run against a suite nobody has baselined yet is informative, not broken.
 
+### NVIDIA encode time follows the card's power state, not the build
+
+On an NVIDIA host, the agent's `encode_ms` settles at one of three levels: about 1.1, 2.9 or 6.7 ms on an RTX 5090. Each level is a power state the driver picks by itself under a light stream: P1, P5 or P8. Measured 2026-10-14: rank correlation −0.90 between encode time and memory clock over 96 windows. Two soaks of the same build four minutes apart settled at 6.2 and 2.9 ms. So an NVIDIA `encode_ms` or `encode_ms_max` regression alone does not block a landing: say it is the power state in the summary, and judge the run on the glass-to-glass and present-cadence keys. A stall in a single frame still shows in `encode_ms_max` against runs at the same level.
+
 ### Baseline policy — when to re-baseline
 
 The pinned baseline is `latency-budget/1080p60-h264-local`, set from the median of the three clean local cells in the (no-longer-recoverable) `docs/reports/2026-08-19-latency-budget/REPORT.md` (run `640d5b00`, g2g p50 66.0 ms — the report's own headline number). Re-baseline:
