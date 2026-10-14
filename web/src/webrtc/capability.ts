@@ -397,9 +397,9 @@ const RAF_CAP_HZ = 60;
 const RAF_CAP_TOLERANCE_HZ = 5;
 
 /**
- * What the probe may say about the display. Safari, and the browsers that
- * report as Safari (every iOS browser is WebKit), holds rAF near 60 Hz even on a 120 Hz screen, so a ~60 measured there is the
- * browser's cap, not the display's rate (#632). Reporting it makes the control
+ * What the probe may say about the display. Safari, and the iOS browsers that
+ * report as Safari (they are WebKit), hold rAF near 60 Hz even on a 120 Hz
+ * screen, so a ~60 measured there is the browser's cap, not the display's rate (#632). Reporting it makes the control
  * plane read a ProMotion screen as "slower than this frame rate"; leaving it out
  * says "unknown", which is true. A real 60 Hz Safari screen is unknown too: the
  * two cannot be told apart from here, and the control plane treats a Safari

@@ -191,7 +191,7 @@ func evaluateProfile(p Profile, in EvalInput) ProfileEval {
 	// fractional timings such as 119.88 Hz for a nominal 120 fps profile.
 	if p.HighRefreshDisplay == DisplayRequired {
 		if in.Probe == nil || in.Probe.DisplayRefreshHz <= 0 {
-			// Safari caps rAF near 60 Hz, so its rate is never known; it counts as
+			// Safari caps rAF near 60 Hz, so a Safari probe with no rate counts as
 			// high-refresh (control-api.md amendment 34).
 			if in.Probe == nil || in.Probe.BrowserName != "Safari" {
 				soft(ReasonDisplayRefreshUnknown, "profile needs a high-refresh display; the client display rate is unknown")

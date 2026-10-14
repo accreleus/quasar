@@ -209,7 +209,7 @@ describe("probeCapabilities", () => {
     expect(safari.display).not.toHaveProperty("refresh_hz");
   });
 
-  // Every iOS browser is WebKit and reports Safari/ in its UA: Chrome on iOS
+  // iOS browsers are WebKit and their UA carries Safari/: Chrome on iOS
   // (CriOS) shares Safari's rAF cap, so it must be treated as Safari (#632).
   it("omits refresh_hz for Chrome on iOS, which is WebKit and reports as Safari (#632)", async () => {
     stubEnv({ uaData: undefined });

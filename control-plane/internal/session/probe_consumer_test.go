@@ -372,8 +372,10 @@ func TestParseDeviceProbeReadsBrowserName(t *testing.T) {
 	if dp := parseDeviceProbe(caps); dp == nil || dp.BrowserName != "Safari" {
 		t.Fatalf("parseDeviceProbe = %+v, want BrowserName Safari", dp)
 	}
-	caps, _ = json.Marshal(map[string]any{"measured_at": now})
-	if dp := parseDeviceProbe(caps); dp == nil || dp.BrowserName != "" {
-		t.Fatalf("parseDeviceProbe without browser = %+v, want BrowserName empty", dp)
+	for _, browser := range []any{nil, "Safari", []string{"Safari"}, map[string]any{"name": 5}} {
+		caps, _ = json.Marshal(map[string]any{"browser": browser, "bandwidth_kbps": 40000, "measured_at": now})
+		if dp := parseDeviceProbe(caps); dp == nil || dp.BrowserName != "" || dp.BandwidthKbps != 40000 {
+			t.Fatalf("browser %#v: parseDeviceProbe = %+v, want the probe kept with no name", browser, dp)
+		}
 	}
 }
