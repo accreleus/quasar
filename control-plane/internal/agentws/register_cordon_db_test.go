@@ -6,6 +6,7 @@ package agentws
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -188,6 +189,9 @@ func TestEnrollHostKeepsADrainingHostDraining(t *testing.T) {
 		t.Fatalf("initial enroll: %v", err)
 	}
 	setHostStatus(t, pool, res.HostID, "draining")
+	// Its agent is gone: a cordoned host that is still connected refuses re-enrollment.
+	gone := time.Now()
+	setAgentDisconnectedAt(t, pool, res.HostID, &gone)
 
 	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.1", boundEnrollmentToken(t, pool, "cordoned-enroll-host")); err != nil {
 		t.Fatalf("re-enroll: %v", err)
