@@ -239,9 +239,17 @@ pub fn extract_context(
         comps.next();
         let below_top = comps.as_path();
 
-        // Everything outside context_subdir (codeload's `pax_global_header`, PAX
-        // extension headers, the rest of the repo) is skipped before touching disk,
-        // so the link guard below only has to cover entries actually unpacked.
+        // Nothing below the top-level prefix is not repo content: the `<repo>-<sha>/`
+        // directory itself and codeload's `pax_global_header` (typeflag `g`). Skip it
+        // here, because a root context ("." gives an empty `subdir`) would otherwise
+        // match it below and trip the special-file guard.
+        if below_top.as_os_str().is_empty() {
+            continue;
+        }
+
+        // Everything outside context_subdir (the rest of the repo) is skipped before
+        // touching disk, so the link guard below only has to cover entries actually
+        // unpacked.
         let Ok(under) = below_top.strip_prefix(&subdir) else {
             continue;
         };
@@ -411,6 +419,60 @@ mod tests {
         assert!(out.join("sub/app.sh").is_file());
         // Files outside the subdir are not extracted.
         assert!(!out.join("README.md").exists());
+    }
+
+    #[test]
+    fn root_context_skips_the_global_pax_header_and_lays_out_the_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = dir.path().join("ctx.tar.gz");
+        let file = std::fs::File::create(&tarball).unwrap();
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(enc);
+        // codeload's first entry: a global PAX header (typeflag `g`), named like this.
+        let record = b"15 comment=abc\n";
+        let mut g = tar::Header::new_gnu();
+        g.set_entry_type(tar::EntryType::XGlobalHeader);
+        g.set_path("pax_global_header").unwrap();
+        g.set_size(record.len() as u64);
+        g.set_mode(0o666);
+        g.set_cksum();
+        builder.append(&g, &record[..]).unwrap();
+        for (path, is_dir, contents) in [
+            ("quasar-images-sha/", true, &b""[..]),
+            ("quasar-images-sha/README.md", false, b"top"),
+            ("quasar-images-sha/images/", true, b""),
+            ("quasar-images-sha/images/p/", true, b""),
+            (
+                "quasar-images-sha/images/p/Dockerfile",
+                false,
+                b"FROM alpine\n",
+            ),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(path).unwrap();
+            h.set_mode(0o644);
+            if is_dir {
+                h.set_entry_type(tar::EntryType::Directory);
+            }
+            h.set_size(contents.len() as u64);
+            h.set_cksum();
+            builder.append(&h, contents).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        extract_context(&tarball, ".", &out, far_future()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(out.join("README.md")).unwrap(),
+            "top"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("images/p/Dockerfile")).unwrap(),
+            "FROM alpine\n"
+        );
+        assert!(!out.join("pax_global_header").exists());
     }
 
     /// A raw ustar entry. Hand-rolled because `Builder::set_path` refuses to write a
