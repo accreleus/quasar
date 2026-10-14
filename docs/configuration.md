@@ -330,7 +330,10 @@ window, capture `/debug/pprof/mutex` or `/debug/pprof/block`, then disarm.
   endpoint can hold a profile open indefinitely.
 
 The loopback bind answers all three, which is why it is the default and why the
-port is published nowhere. **If a profile is needed from a remote box, pull it
+port is published nowhere. The listener also answers `403` to any request with an
+`Origin` header or a non-loopback `Host`, so a web page on the host cannot drive
+it (cross-site POST, DNS rebinding); `wget` and `curl` send neither.
+**If a profile is needed from a remote box, pull it
 over SSH — do not widen the bind address:**
 
 ```bash

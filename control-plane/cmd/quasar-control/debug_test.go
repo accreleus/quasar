@@ -230,6 +230,46 @@ func TestDebugServerSurface(t *testing.T) {
 	})
 }
 
+// TestDebugServerRefusesBrowserRequests: a page in a browser on the host can
+// reach a loopback bind (cross-site POST carries an Origin; DNS rebinding
+// carries the attacker's Host). Neither may arm profiling or read pprof (#625).
+func TestDebugServerRefusesBrowserRequests(t *testing.T) {
+	t.Cleanup(func() { runtime.SetMutexProfileFraction(0) })
+	h := newDebugServer("127.0.0.1:0", nil, discardLogger()).Handler
+
+	do := func(method, target, host, origin string) int {
+		req := httptest.NewRequest(method, target, nil)
+		req.Host = host
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	for _, tc := range []struct {
+		name, method, target, host, origin string
+		want                               int
+	}{
+		{"cross-site POST", "POST", "/debug/quasar/mutexprofile?fraction=7", "127.0.0.1:6060", "https://evil.example", 403},
+		{"same-origin-looking Origin", "POST", "/debug/quasar/blockprofile?rate=1", "127.0.0.1:6060", "http://127.0.0.1:6060", 403},
+		{"rebound Host POST", "POST", "/debug/quasar/mutexprofile?fraction=7", "evil.example:6060", "", 403},
+		{"rebound Host pprof", "GET", "/debug/pprof/cmdline", "evil.example", "", 403},
+		{"opaque Origin", "GET", "/debug/pprof/", "127.0.0.1:6060", "null", 403},
+		{"IPv4 loopback", "GET", "/debug/quasar/runtime", "127.0.0.1:6060", "", 200},
+		{"localhost", "GET", "/debug/quasar/runtime", "localhost:6060", "", 200},
+		{"IPv6 loopback", "GET", "/debug/quasar/runtime", "[::1]:6060", "", 200},
+	} {
+		if got := do(tc.method, tc.target, tc.host, tc.origin); got != tc.want {
+			t.Errorf("%s: status = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	if got := runtime.SetMutexProfileFraction(-1); got != 0 {
+		t.Errorf("a refused request changed the mutex fraction to %d", got)
+	}
+}
+
 // TestNoComposeFilePublishesTheDebugPort enforces the other half of the loopback
 // guarantee. The bind address keeps the listener on 127.0.0.1 inside the network
 // namespace; this keeps a `ports:` entry from forwarding the host straight past
