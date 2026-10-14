@@ -2214,7 +2214,8 @@ func (h *Handler) resolveAuth(ctx context.Context, reg RegisterMsg) (registerRes
 	}
 	var tryReconnect AuthReconnect
 	if json.Unmarshal(reg.Auth, &tryReconnect) == nil && tryReconnect.NodeSecret != "" {
-		return h.store.reconnectHost(ctx, reg.NodeName, reg.AgentVersion,
+		identity, _ := identityFromRegister(reg) // malformed fields are logged by handleRegister
+		return h.store.reconnectHost(ctx, reg.NodeName, reg.AgentVersion, identity.SourceCommit,
 			tryReconnect.NodeSecret)
 	}
 	return registerResult{}, errors.New("auth must contain enrollment_token or node_secret")

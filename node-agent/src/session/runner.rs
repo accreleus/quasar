@@ -1094,6 +1094,18 @@ impl AudioPipelineGuard {
         }
     }
 
+    /// The session is ending: report nothing more from this pipeline's bus (#588). The
+    /// source's teardown stops the sound server under a capture that is still PLAYING
+    /// (`teardown`'s "Audio ordering"), and `pulsesrc` answers that with an error.
+    ///
+    /// One-way: only NULL→READY clears a flushing bus, and this pipeline never makes
+    /// that step again. Call it only on a path that ends the session.
+    pub(crate) fn stop_reporting(&self) {
+        if let Some(bus) = self.pipeline.as_ref().and_then(|p| p.bus()) {
+            bus.set_flushing(true);
+        }
+    }
+
     /// Explicit NULL, idempotent: a second call (and the subsequent Drop) does nothing.
     pub(crate) fn finish(&self) {
         if self.finished.replace(true) {
@@ -1419,12 +1431,16 @@ impl SessionTransports {
 /// Stop the source on the session's way out. The video transport lets go first: one whose
 /// peer never connected holds the encode chain's push, and a source that waits on that
 /// chain through interpipe never reaches NULL (#535).
-fn stop_source(source: &mut AppSource, transports: &SessionTransports) {
+///
+/// Session ends only: the audio pipeline reports nothing after this
+/// (`AudioPipelineGuard::stop_reporting`), so a caller must never keep the session.
+pub(crate) fn stop_source(source: &mut AppSource, transports: &SessionTransports) {
     transports.video.release();
     tracing::info!(
         token = "session-transport-released",
         "video transport released ahead of the source teardown"
     );
+    transports.audio_pipeline.stop_reporting();
     source.teardown();
 }
 

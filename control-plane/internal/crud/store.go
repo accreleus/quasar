@@ -169,8 +169,10 @@ type Host struct {
 	CreatedAt          time.Time                `json:"created_at"`
 	// AgentConnectedSince/AgentRestartCount/AgentLastRestartAt (#429, migration
 	// 0067): surfaces a container silently revived by Docker's `unless-stopped`.
-	// Derived server-side in agentws.reconnectHost from WS timing, not
-	// agent-reported. Null until the host's first (re)connect.
+	// Derived server-side in agentws.reconnectHost from WS timing and the
+	// build the agent reports (a changed agent_version or source_commit), not
+	// from any process id the agent sends. Null until the host's first
+	// (re)connect.
 	AgentConnectedSince *time.Time `json:"agent_connected_since"`
 	AgentRestartCount   int32      `json:"agent_restart_count"`
 	AgentLastRestartAt  *time.Time `json:"agent_last_restart_at"`

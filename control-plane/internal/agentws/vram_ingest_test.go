@@ -279,7 +279,7 @@ func TestVramSampleInvalidatedOnReconnect(t *testing.T) {
 		}
 		seedGPURow(t, pool, res.HostID, 0, 16384)
 		prime(res.HostID)
-		if _, err := s.reconnectHost(ctx, "vram-reconnect", "v0", res.NodeSecret); err != nil {
+		if _, err := s.reconnectHost(ctx, "vram-reconnect", "v0", nil, res.NodeSecret); err != nil {
 			t.Fatalf("reconnect: %v", err)
 		}
 		assertCleared(res.HostID, "reconnectHost")

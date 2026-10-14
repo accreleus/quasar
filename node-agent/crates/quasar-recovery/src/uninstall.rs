@@ -29,6 +29,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::cli::Cli;
 use crate::dump;
 use crate::engine::{Container, EngineError, PlatformEngine, RestartPolicy};
 use crate::journal::JournalDir;
@@ -289,6 +290,8 @@ impl Uninstall {
             .list_containers()
             .map_err(|e| refused(engine_err("list containers", e)))?;
         let image = self.image_to_run(&containers);
+        // Asked only where a message names a command: it is an engine call.
+        let cli = || Cli::for_machine(self.engine.as_ref(), &machine);
         let me = self.self_container.clone();
         let is_me = |c: &Container| {
             me.as_deref()
@@ -299,7 +302,7 @@ impl Uninstall {
             if ours(std::slice::from_ref(me), &id, Role::RecoveryActor).len() == 1 {
                 return Err(refused(format!(
                     "uninstall stops the recovery actor, so it cannot run inside it; run it in its own container: {}",
-                    command_line(&image, "uninstall")
+                    cli().beside(&image, "uninstall")
                 )));
             }
         }
@@ -341,14 +344,16 @@ impl Uninstall {
                 }
                 None => {
                     return Err(refused(format!(
-                        "--purge needs a typed confirmation: run it in a terminal (docker run -it …), or add --confirm {node}"
+                        "--purge needs a typed confirmation: run it in a terminal ({} run -it …), or add --confirm {node}",
+                        cli().name()
                     )))
                 }
             }
-            if let Some(s) = containers.iter().find(|c| seed::is_seed(c)) {
+            if let Some(s) = seed::find(&containers, None) {
                 return Err(refused(format!(
-                    "a seed ({}) is still on this machine; a purge deletes the state that tells it this machine is uninstalled, so it would install Quasar again. Remove the seed first, the way you started it (from your manager, or docker rm -f {}), then run this again",
-                    s.name, s.name
+                    "a seed ({}) is still on this machine; a purge deletes the state that tells it this machine is uninstalled, so it would install Quasar again. Remove the seed first, the way you started it: {}; then run this again",
+                    s.name,
+                    cli().remove_seed(&s.name)
                 )));
             }
         }
@@ -426,12 +431,13 @@ impl Uninstall {
             report.say(match &dump_name {
                 Some(name) => format!(
                     "Purged. The final dump of the database is {}.{homes}",
-                    self.dest(opts).describe(name),
+                    self.dest(opts).describe(name, cli().name()),
                 ),
                 None => format!("Purged.{homes}"),
             });
             report.say(format!(
-                "Remove the emptied machine-state volume once this command has exited: docker volume rm {}",
+                "Remove the emptied machine-state volume once this command has exited: {} volume rm {}",
+                cli().name(),
                 names::MACHINE_VOLUME
             ));
         } else {
@@ -452,7 +458,7 @@ impl Uninstall {
             }
             report.say(format!(
                 "To delete the data as well: {}",
-                command_line(&image, "uninstall --purge")
+                cli().beside(&image, "uninstall --purge")
             ));
         }
         Ok(report)
@@ -513,10 +519,11 @@ impl Uninstall {
                 "installation {id} has a database volume and no machine state, so its final dump cannot be taken"
             )));
         }
-        if let Some(s) = containers.iter().find(|c| seed::is_seed(c)) {
+        if let Some(s) = seed::find(&containers, None) {
             return Err(refused(format!(
-                "a seed ({}) is still on this machine and would install Quasar again; remove it first (docker rm -f {})",
-                s.name, s.name
+                "a seed ({}) is still on this machine and would install Quasar again; remove it first, the way you started it: {}",
+                s.name,
+                Cli::for_engine(self.engine.as_ref()).remove_seed(&s.name)
             )));
         }
         for actor in ours(&containers, &id, Role::RecoveryActor) {
@@ -547,7 +554,8 @@ impl Uninstall {
             report.say(format!("Deleted the {name} volume."));
         }
         report.say(format!(
-            "Purged what installation {id} left. Remove the machine-state volume once this command has exited: docker volume rm {}",
+            "Purged what installation {id} left. Remove the machine-state volume once this command has exited: {} volume rm {}",
+            Cli::for_engine(self.engine.as_ref()).name(),
             names::MACHINE_VOLUME
         ));
         Ok(report)
@@ -563,7 +571,7 @@ impl Uninstall {
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 Err(quasar_runtime::LeaseError::Held(_)) => {
-                    return Err("a recovery actor still holds this machine's lease (actor.lease) after being stopped; stop it (docker stop quasar-recovery) and run again".into())
+                    return Err(format!("a recovery actor still holds this machine's lease (actor.lease) after being stopped; stop it ({} stop quasar-recovery) and run again", Cli::for_engine(self.engine.as_ref()).name()))
                 }
                 Err(quasar_runtime::LeaseError::Open(e)) => {
                     return Err(format!("the machine's lease cannot be opened: {e}"))
@@ -627,7 +635,8 @@ impl Uninstall {
             &name,
         ) {
             Ok(name) => {
-                report.say(format!("Final dump taken: {}.", dest.describe(&name)));
+                let cli = Cli::for_machine(self.engine.as_ref(), machine);
+                report.say(format!("Final dump taken: {}.", dest.describe(&name, cli.name())));
                 Ok(Some(name))
             }
             Err(why) => Err(stopped(format!(
@@ -716,17 +725,6 @@ fn noun(role: Role) -> &'static str {
     crate::race_guard::noun(role.as_str())
 }
 
-/// The documented way to run an operator command beside the recovery actor: its own
-/// container on the recovery image, with the engine socket and machine state. `image` is
-/// printed as it is: after an uninstall no `quasar-recovery` container is left to inspect.
-pub fn command_line(image: &str, command: &str) -> String {
-    format!(
-        "docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock -v {}:{} {image} {command}",
-        names::MACHINE_VOLUME,
-        crate::recipe::paths::MACHINE_DIR,
-    )
-}
-
 impl Uninstall {
     /// The recovery image to run this command with again: the one it runs from, else the
     /// one `seed.json` names, else a placeholder.
@@ -744,7 +742,7 @@ impl Uninstall {
                     .flatten()
                     .map(|s| s.recovery_actor_image.reference())
             })
-            .unwrap_or_else(|| "<registry>/quasar-recovery@sha256:<digest>".to_owned())
+            .unwrap_or_else(|| crate::cli::IMAGE_PLACEHOLDER.to_owned())
     }
 }
 

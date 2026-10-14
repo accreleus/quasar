@@ -39,7 +39,7 @@ func TestReconnectPreservesOwnedRestrictionAfterOfflineProjection(t *testing.T) 
 	if got := hostStatus(t, pool, hostID); got != "draining" {
 		t.Fatalf("disconnect status = %q, want draining while owner holds", got)
 	}
-	if _, err := s.reconnectHost(ctx, "owned-reconnect-host", "0.3.0", "secret-rh05"); err != nil {
+	if _, err := s.reconnectHost(ctx, "owned-reconnect-host", "0.3.0", nil, "secret-rh05"); err != nil {
 		t.Fatal(err)
 	}
 	if got := hostStatus(t, pool, hostID); got != "draining" {
@@ -64,7 +64,7 @@ func TestReconnectHostKeepsADrainingHostDraining(t *testing.T) {
 	hostID := seedHostWithSecret(t, pool, "cordoned-reconnect-host", "secret-140")
 
 	setHostStatus(t, pool, hostID, "draining")
-	if _, err := s.reconnectHost(context.Background(), "cordoned-reconnect-host", "0.3.0", "secret-140"); err != nil {
+	if _, err := s.reconnectHost(context.Background(), "cordoned-reconnect-host", "0.3.0", nil, "secret-140"); err != nil {
 		t.Fatalf("reconnectHost: %v", err)
 	}
 	if got := hostStatus(t, pool, hostID); got != "draining" {
@@ -73,7 +73,7 @@ func TestReconnectHostKeepsADrainingHostDraining(t *testing.T) {
 
 	// The ordinary case is untouched: an offline host's reconnect brings it back.
 	setHostStatus(t, pool, hostID, "offline")
-	if _, err := s.reconnectHost(context.Background(), "cordoned-reconnect-host", "0.3.0", "secret-140"); err != nil {
+	if _, err := s.reconnectHost(context.Background(), "cordoned-reconnect-host", "0.3.0", nil, "secret-140"); err != nil {
 		t.Fatalf("second reconnectHost: %v", err)
 	}
 	if got := hostStatus(t, pool, hostID); got != "online" {

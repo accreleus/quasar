@@ -79,10 +79,15 @@ type registerResult struct {
 }
 
 // Minimum offline gap for a reconnect to classify as a genuine agent-process
-// restart rather than a WS blip (#429). agent-api.md carries no instance id to
-// tell the two apart, so gap length is the only server-side signal: measured, a
-// blip re-registers in ~0.6-2.4 s, a real restart in ~43-59 s; 15 s has ample
-// margin both ways. A var so tests can retune it.
+// restart rather than a WS blip (#429). agent-api.md carries no instance id, so
+// apart from a changed build (below) gap length is the only server-side signal:
+// measured, a blip re-registers in ~0.6-2.4 s, a real restart in ~43-59 s; 15 s
+// has ample margin both ways. A var so tests can retune it.
+//
+// A register that reports a different agent_version or source_commit than the
+// row holds is a new process whatever the gap (#586): a fleet apply recreates an
+// agent in 2-17 s, under the gap. Still misread as a blip: a restart on the very
+// same build (a hand-restarted container, a crash) inside the gap.
 //
 // The gap runs from agent_disconnected_at (stamped by markOffline) to now() —
 // both DB-clock reads, immune to app/DB skew. agent_disconnected_at is consumed
@@ -252,7 +257,7 @@ func releaseRemovalDrain(ctx context.Context, tx pgx.Tx, hostID string) error {
 const hostIsLiveSQL = `(status <> 'offline' AND agent_disconnected_at IS NULL)`
 
 // reconnectHost verifies the node_secret and marks the host online.
-func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion, nodeSecret string) (registerResult, error) {
+func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion string, sourceCommit *string, nodeSecret string) (registerResult, error) {
 	var hostID, storedHash string
 	err := s.pool.QueryRow(ctx, `
 		SELECT id::text, node_secret_hash FROM hosts WHERE node_name = $1
@@ -275,7 +280,7 @@ func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion, 
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var isRestart bool
-	err = tx.QueryRow(ctx, reconnectHostSQL, hostID, agentVersion, agentRestartMinGap.Milliseconds()).Scan(&isRestart)
+	err = tx.QueryRow(ctx, reconnectHostSQL, hostID, agentVersion, agentRestartMinGap.Milliseconds(), sourceCommit).Scan(&isRestart)
 	if err != nil {
 		return registerResult{}, fmt.Errorf("update host: %w", err)
 	}
@@ -300,16 +305,26 @@ const registerStatusSQL = `CASE WHEN hosts.status = 'draining'
 
 // Reconnect UPDATE with #429 restart classification (rationale at
 // agentRestartMinGap). The `old` CTE snapshots the pre-reconnect values under
-// FOR UPDATE so the CASEs and RETURNING read them regardless of what this same
-// statement writes — one atomic read-decide-write, no TOCTOU. NULL
-// agent_disconnected_at ⇒ unknown, never counted (fail toward undercounting);
-// gap < threshold ⇒ blip (process identity unchanged); gap >= threshold ⇒
-// restart (bump count, reset agent_process_started_at). agent_disconnected_at
-// is always cleared — consumed, so a stale value can never misclassify a later
-// reconnect.
+// FOR UPDATE and decides `restarted` once, so the CASEs and RETURNING read it
+// regardless of what this same statement writes — one atomic read-decide-write,
+// no TOCTOU. Restart (bump count, reset agent_process_started_at) when the
+// reported agent_version or source_commit differs from the row's (#586), or
+// when the gap since agent_disconnected_at is >= threshold. Each NULL (stamp,
+// stored version, stored or reported commit) only makes its own clause no
+// evidence, failing toward undercounting: a NULL stamp on the same build is a
+// blip, but a changed build counts with or without a stamp. A shorter gap on the
+// same build ⇒ blip (process identity unchanged). agent_disconnected_at is
+// always cleared — consumed, so a stale value can never misclassify a later
+// reconnect. $4 is the validated source_commit of this register, NULL when it
+// sent none.
 const reconnectHostSQL = `
 	WITH old AS (
-		SELECT agent_disconnected_at, agent_process_started_at
+		SELECT agent_process_started_at,
+		       (agent_disconnected_at IS NOT NULL
+		        AND EXTRACT(EPOCH FROM (now() - agent_disconnected_at)) * 1000 >= $3::bigint)
+		       OR (agent_version IS NOT NULL AND agent_version <> $2)
+		       OR (source_commit IS NOT NULL AND $4::text IS NOT NULL AND source_commit <> $4::text)
+		       AS restarted
 		FROM hosts WHERE id = $1
 		FOR UPDATE
 	)
@@ -321,31 +336,21 @@ const reconnectHostSQL = `
 		capacity_detection  = 'unavailable',
 		capacity_reason     = 'awaiting fresh capacity report',
 		agent_restart_count = CASE
-			WHEN old.agent_disconnected_at IS NOT NULL
-			     AND EXTRACT(EPOCH FROM (now() - old.agent_disconnected_at)) * 1000 >= $3::bigint
-			THEN hosts.agent_restart_count + 1
+			WHEN old.restarted THEN hosts.agent_restart_count + 1
 			ELSE hosts.agent_restart_count
 		END,
 		agent_last_restart_at = CASE
-			WHEN old.agent_disconnected_at IS NOT NULL
-			     AND EXTRACT(EPOCH FROM (now() - old.agent_disconnected_at)) * 1000 >= $3::bigint
-			THEN now()
+			WHEN old.restarted THEN now()
 			ELSE hosts.agent_last_restart_at
 		END,
 		agent_process_started_at = CASE
-			WHEN old.agent_process_started_at IS NULL THEN now()
-			WHEN old.agent_disconnected_at IS NOT NULL
-			     AND EXTRACT(EPOCH FROM (now() - old.agent_disconnected_at)) * 1000 >= $3::bigint
-			THEN now()
+			WHEN old.agent_process_started_at IS NULL OR old.restarted THEN now()
 			ELSE old.agent_process_started_at
 		END,
 		agent_disconnected_at = NULL
 	FROM old
 	WHERE hosts.id = $1
-	RETURNING (
-		old.agent_disconnected_at IS NOT NULL
-		AND EXTRACT(EPOCH FROM (now() - old.agent_disconnected_at)) * 1000 >= $3::bigint
-	)
+	RETURNING old.restarted
 `
 
 // upsertCapacity replaces the host's cpu/mem and full GPU set; storage and
