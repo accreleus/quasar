@@ -365,14 +365,6 @@
   line-height: 1.5;
 }
 
-/* Launch capability the host cannot meet at all (home/BandNotes.tsx); the
-   detail band tightens it in home.css. */
-.lm-cap-fatal {
-  margin: var(--s2) 0 0;
-  font-size: var(--t-xs);
-  color: var(--danger-text);
-}
-
 /* Inline validation message below a field (SecretField). */
 .apps-field-err {
   font-size: var(--t-xs);

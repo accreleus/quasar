@@ -150,7 +150,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
 
   const playDisabled = isLive
     ? false
-    : launching || isBlocked || !codecCaps.h264 || !resolved || isDeadEnd;
+    : launching || isBlocked || !resolved || isDeadEnd;
   const playLabel = isLive
     ? "Resume session"
     : waitingForSlot
@@ -238,7 +238,6 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
           isBlocked={isBlocked}
           blockedByName={blockedByName}
           liveSessionId={liveSessionId}
-          canDecodeH264={codecCaps.h264}
           waitingForSlot={waitingForSlot}
           waitingReason={waitingReason}
           onRetryProfiles={onRetryProfiles}

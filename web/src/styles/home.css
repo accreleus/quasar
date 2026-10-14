@@ -1139,11 +1139,6 @@
 .detail .lib-why .btn {
   margin-top: var(--s3);
 }
-.detail .lm-cap-fatal {
-  color: var(--danger-text);
-  font-size: var(--t-sm);
-}
-
 /* Controls ON artwork are glass, not theme chrome — a surface-coloured button
    over a poster reads as a hole in the picture. */
 .detail .d-rec .btn,

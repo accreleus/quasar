@@ -25,7 +25,6 @@ export interface BandNotesProps {
   isBlocked: boolean;
   blockedByName: string | null;
   liveSessionId: string | null;
-  canDecodeH264: boolean;
   waitingForSlot: boolean;
   /** "slot" (capacity_exhausted) vs "host" (no_host_available) — the latter
    *  must not claim a slot is being freed. */
@@ -43,7 +42,6 @@ export function BandNotes({
   isBlocked,
   blockedByName,
   liveSessionId,
-  canDecodeH264,
   waitingForSlot,
   waitingReason = "slot",
   onRetryProfiles,
@@ -102,12 +100,6 @@ export function BandNotes({
             )}
           </div>
         </div>
-      )}
-
-      {!canDecodeH264 && (
-        <p className="lm-cap-fatal" role="alert">
-          Without H.264 this device cannot play any stream. Try a different browser.
-        </p>
       )}
 
       {waitingForSlot && (

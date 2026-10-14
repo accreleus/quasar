@@ -119,6 +119,18 @@ describe("buildOptionSpace", () => {
     expect(explicit?.reasons[0].code).toBe("host_encoder_not_supported");
   });
 
+  it("without H.264, Auto plays a profile through a codec the browser decodes and refuses an H.264-only one (#605)", () => {
+    const noH264: CodecCapabilities = { h264: false, hevc: false, av1: true, vp9: false };
+    const space = buildOptionSpace(catalog120(), noH264, "720p120");
+    const auto = space.entriesByCodec.get("auto")!;
+    expect(auto.find((e) => e.profileId === "1080p120")).toMatchObject({ codec: "av1", eligibility: "eligible" });
+    const h264Only = auto.find((e) => e.profileId === "720p120")!;
+    expect(h264Only).toMatchObject({ eligibility: "ineligible", recommended: false });
+    expect(h264Only.reasons.map((r) => r.code)).toEqual(["codec_not_supported"]);
+    // The draft opens on something that plays rather than on the recommendation.
+    expect(resolveSelection(space, defaultDraft(space, "720p120"))?.profileId).toBe("4k120");
+  });
+
   it("offers auto + every catalog codec the client can decode", () => {
     const space = buildOptionSpace(catalog120(), ALL_CODECS, "1080p120");
     expect(space.codecs).toEqual(["auto", "h264", "hevc", "av1"]);

@@ -304,9 +304,16 @@ describe("DetailBand", () => {
     expect(document.querySelector(".note")?.textContent).toMatch(/waiting for a slot/i);
   });
 
-  it("refuses to pretend a browser with no H.264 can play anything", () => {
+  it("plays an AV1 profile on a browser with no H.264 (#605)", () => {
     renderBand({ codecCaps: { ...CAPS, h264: false } });
-    expect(screen.getByRole("alert").textContent).toMatch(/Without H\.264/);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("button", { name: /^Play$/ })).toBeEnabled();
+  });
+
+  it("refuses an H.264-only profile on a browser with no H.264 (#605)", () => {
+    const h264Only = { ...PROFILES, recommended_id: "p-1080", profiles: [PROFILES.profiles[1]] };
+    renderBand({ codecCaps: { ...CAPS, h264: false }, profiles: h264Only });
+    expect(screen.getByRole("alert").textContent).toMatch(/can't decode the video format/);
     expect(screen.getByRole("button", { name: /^Play$/ })).toBeDisabled();
   });
 
