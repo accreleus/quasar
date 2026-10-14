@@ -279,9 +279,8 @@ if [ -z "$SOAK_TOKEN" ]; then
   dx_fail auth "no admin bearer for host=$DX_HOST. Next: scripts/dx/admin_token.sh --host $DX_HOST --fresh (it names every tier it tried)."
   dx_result "$TARGET" "out=$OUT"
 fi
-# The remote path exports this into a shell snippet as QSOAK_TOKEN='$SOAK_TOKEN'
-# — single-quoted, which a `'` in the token would close. Validate before it can
-# reach the remote shell.
+# The remote path sends this as a stdin line the remote shell reads into
+# QSOAK_TOKEN; a newline in it would split that line. Validate before it leaves here.
 dx_require_safe "$TARGET" "admin bearer token" "$SOAK_TOKEN" "$DX_RE_TOKEN" \
   "A bearer token is base64url text. Re-mint with: scripts/dx/admin_token.sh --host $DX_HOST --fresh"
 
@@ -296,10 +295,12 @@ else
   RARGS=""
   for a in "${DRV[@]}"; do RARGS="$RARGS $(printf '%q' "$a")"; done
   dx_info "soaking $DX_REMOTE_NAME over ssh (driver runs on the host, one connection)"
-  dx_ssh_remote "cd '$DX_REMOTE_DIR'
+  # The bearer is stdin's first line, never in the remote command text or argv
+  # (ps on both ends); the driver follows it on the same stream.
+  { printf '%s\n' "$SOAK_TOKEN"; cat "$DRIVER"; } | dx_ssh_remote "cd '$DX_REMOTE_DIR'
 export QSOAK_API='$DX_REMOTE_API'
-export QSOAK_TOKEN='$SOAK_TOKEN'
-exec python3 -$RARGS" < "$DRIVER" >>"$RAW" &
+IFS= read -r QSOAK_TOKEN && export QSOAK_TOKEN
+exec python3 -$RARGS" >>"$RAW" &
   DRIVER_PID=$!
 fi
 wait "$DRIVER_PID" || DRIVER_RC=$?
