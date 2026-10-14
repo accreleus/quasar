@@ -207,7 +207,7 @@ if [ "$DX_HOST" = "local" ]; then
     )"
     if [ -n "$TOKEN" ]; then note "tier 3b: deploy/.env BOOTSTRAP_ADMIN_* -> POST /v1/auth/login"; fi
   fi
-  NEXT_HINT="Next, pick ONE: export QUASAR_ADMIN_TOKEN=<bearer>; or bring the local stack up with QUASAR_DEV_AGENT_AUTH=1 (make up) so /run/quasar/dev-agent-key exists; or set BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD in $DX_ROOT/deploy/.env."
+  NEXT_HINT="Next, pick ONE: export QUASAR_ADMIN_TOKEN=<bearer>; or bring the local stack up with QUASAR_DEV_AGENT_AUTH=1 (make up; a stack that is not the local overlay also needs QUASAR_DEV_AGENT_INSECURE_HTTP=1, the route is refused over plain HTTP) so /run/quasar/dev-agent-key exists; or set BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD in $DX_ROOT/deploy/.env."
 else
   note "tier 3: minting on $HOST_NAME over ssh ($HOST_API)"
   TOKEN="$(dx_ssh_remote "$(mint_snippet "$HOST_API" "$HOST_DIR")" 2>"$MINT_ERR" | tail -n 1 | tr -d '\r')" || TOKEN=""
@@ -219,7 +219,7 @@ else
       "$HOST_NAME" "$HOST_API/health" "$(sed -n 's/^stack=down http=//p' "$MINT_ERR" | head -n1)" "$DX_HOST" >&2
     exit 2
   fi
-  NEXT_HINT="Next, pick ONE: export QUASAR_ADMIN_TOKEN=<bearer>; or set QUASAR_DEV_AGENT_AUTH=1 on $HOST_NAME and restart its control-plane (the per-boot key then appears at /run/quasar/dev-agent-key); or set BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD in $HOST_DIR/deploy/.env on $HOST_NAME."
+  NEXT_HINT="Next, pick ONE: export QUASAR_ADMIN_TOKEN=<bearer>; or set QUASAR_DEV_AGENT_AUTH=1 on $HOST_NAME and restart its control-plane (the per-boot key then appears at /run/quasar/dev-agent-key), and give it an https:// api URL in hosts.json (the route is refused over plain HTTP); or set BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD in $HOST_DIR/deploy/.env on $HOST_NAME."
 fi
 
 if [ -z "${TOKEN:-}" ]; then
@@ -227,7 +227,7 @@ if [ -z "${TOKEN:-}" ]; then
     printf 'admin-token: no admin bearer could be obtained for host=%s.\n' "$HOST_NAME"
     printf '  tier 1  $QUASAR_ADMIN_TOKEN            — unset or empty\n'
     printf '  tier 2  %s — absent or expired\n' "$CACHE_FILE"
-    printf '  tier 3a per-boot dev key -> POST /v1/dev/agent-session   — no key, or the route is off (needs QUASAR_DEV_AGENT_AUTH=1)\n'
+    printf '  tier 3a per-boot dev key -> POST /v1/dev/agent-session   — no key, or the route is off (needs QUASAR_DEV_AGENT_AUTH=1), or its API URL is http:// (refused over plain HTTP)\n'
     printf '  tier 3b BOOTSTRAP_ADMIN_* -> POST /v1/auth/login          — not in deploy/.env, or the password was rotated\n'
     if [ -s "$MINT_ERR" ]; then
       printf '  ssh/mint stderr: %s\n' "$(tr '\n' ' ' < "$MINT_ERR" | cut -c1-400)"

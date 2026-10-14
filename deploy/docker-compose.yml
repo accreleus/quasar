@@ -148,7 +148,9 @@ services:
       # deployment. Behind a proxy it MUST name that proxy's network, or every
       # rate limiter keys on the proxy and all clients share one failure budget —
       # a pre-auth lockout on POST /v1/setup/claim leaves the first admin
-      # uncreatable. Must be passed here: an .env entry with no passthrough is
+      # uncreatable. A proxy on the HTTP port must also be named here before
+      # that claim is served through it: X-Forwarded-Proto is believed from
+      # these networks only. Must be passed here: an .env entry with no passthrough is
       # silently inert. Asserted by scripts/dev/test-compose-overlays.sh.
       QUASAR_TRUSTED_PROXIES: ${QUASAR_TRUSTED_PROXIES:-}
       # STUN/TURN servers handed to the browser with every session's signaling

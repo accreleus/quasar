@@ -364,6 +364,10 @@ reconcile: A+B+C = 71.60 ms   measured g2g = 71.90 ms   residual = 0.30 ms
 
 A run whose suite/scenario/baseline name has no pinned baseline prints every stage as `no data`/unscored, not a failure — a budget run against a suite nobody has baselined yet is informative, not broken.
 
+### NVIDIA encode time follows the card's power state
+
+On an RTX 5090, a light 1080p60 Vulkan H.264 stream's per-window `encode_ms` p50 is about 1.1 ms only while the app is starting (about the first 20 s, P1, already stepping through P3). After that the driver moves on its own between about 2.9 ms (P5) and about 6.7 ms (P8). Measured 2026-10-14: rank correlation −0.90 between that p50 and the memory clock over 96 windows. Two soaks of the same build four minutes apart settled at 6.2 and 2.9 ms. An `encode_ms` gap inside that P5/P8 band, with both plateaus still at those times, is the power-state mix: name the level each run sat on. Exit 3 still blocks the landing when a plateau moves, or when `encode_ms_max` rises above the slow band. Glass-to-glass and present cadence staying green does not explain it.
+
 ### Baseline policy — when to re-baseline
 
 The pinned baseline is `latency-budget/1080p60-h264-local`, set from the median of the three clean local cells in the (no-longer-recoverable) `docs/reports/2026-08-19-latency-budget/REPORT.md` (run `640d5b00`, g2g p50 66.0 ms — the report's own headline number). Re-baseline:
