@@ -304,10 +304,38 @@ describe("DetailBand", () => {
     expect(document.querySelector(".note")?.textContent).toMatch(/waiting for a slot/i);
   });
 
-  it("refuses to pretend a browser with no H.264 can play anything", () => {
+  it("plays an AV1 profile on a browser with no H.264 (#605)", () => {
     renderBand({ codecCaps: { ...CAPS, h264: false } });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("button", { name: /^Play$/ })).toBeEnabled();
+  });
+
+  it("refuses an H.264-only profile on a browser with no H.264 (#605)", () => {
+    const h264Only = { ...PROFILES, recommended_id: "p-1080", profiles: [PROFILES.profiles[1]] };
+    renderBand({ codecCaps: { ...CAPS, h264: false }, profiles: h264Only });
+    expect(screen.getByRole("alert").textContent).toMatch(/Without H\.264 this device cannot play any stream/);
+    expect(screen.getByRole("button", { name: /^Play$/ })).toBeDisabled();
+  });
+
+  it("refuses Auto on an H.264-first profile without H.264, and an explicit AV1 sends av1 (#605)", () => {
+    const [h264] = PROFILES.profiles[1].rungs;
+    const av1 = { ...PROFILES.profiles[0].rungs[0], width: 1920, height: 1080, position: 2 };
+    const h264First = {
+      ...PROFILES,
+      recommended_id: "p-1080",
+      profiles: [{ ...PROFILES.profiles[1], rungs: [h264, av1] }],
+    } as unknown as ProfilesResponse;
+    const caps = { ...CAPS, h264: false };
+
+    const band = renderBand({ codecCaps: caps, profiles: h264First });
     expect(screen.getByRole("alert").textContent).toMatch(/Without H\.264/);
     expect(screen.getByRole("button", { name: /^Play$/ })).toBeDisabled();
+    band.unmount();
+
+    const { props } = renderBand({ codecCaps: caps, profiles: h264First, optionsOpen: true });
+    fireEvent.click(screen.getByRole("radio", { name: /^AV1/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Play now/ }));
+    expect(props.onConfirmProfile).toHaveBeenCalledWith("p-1080", "av1");
   });
 
   it("takes the ref the page scrolls the band into view with", () => {
