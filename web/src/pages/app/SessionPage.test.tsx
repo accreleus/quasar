@@ -39,6 +39,8 @@ vi.mock("../../auth/context", () => ({
   useAuth: () => ({ token: "t" }),
 }));
 
+/** What keyboardLockSupported() answers: false is Safari/Firefox, true Chrome/Edge. */
+let keyboardLockOn = false;
 vi.mock("../../input/capture", () => ({
   setupCapture: () => ({
     cleanup: () => {},
@@ -59,7 +61,7 @@ vi.mock("../../input/capture", () => ({
     engage: () => Promise.resolve({ mode: "pointer-lock" }),
     release: () => {},
   }),
-  keyboardLockSupported: () => false,
+  keyboardLockSupported: () => keyboardLockOn,
   // A desktop-shaped default: this suite exercises the display/resolution
   // controls, not the capture modality. The touch and no-Pointer-Lock paths
   // have their own coverage in capture.touch.test.ts / capture.test.ts.
@@ -248,6 +250,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
+  keyboardLockOn = false;
   lastDrawerProps = null;
   lastStripProps = null;
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
@@ -755,6 +758,39 @@ describe("SessionPage — stream (external) resolution", () => {
       },
     });
     expect(drawer<boolean>(props(), "externalResizeSupported")).toBe(false);
+  });
+});
+
+// #631: where Esc leaves fullscreen but capture.ts has just asked for the lock
+// back, the page must not exit it again.
+describe("SessionPage — leaving fullscreen with the mouse locked (#631)", () => {
+  async function fullscreenExitWithLock(): Promise<ReturnType<typeof vi.fn>> {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    const exitPointerLock = vi.fn();
+    Object.defineProperty(document, "pointerLockElement", { value: document.body, configurable: true });
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
+    act(() => {
+      document.dispatchEvent(new Event("fullscreenchange")); // fullscreenElement is null: an exit
+    });
+    return exitPointerLock;
+  }
+
+  afterEach(() => {
+    delete (document as unknown as { pointerLockElement?: unknown }).pointerLockElement;
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+  });
+
+  it("keeps the lock without Keyboard Lock (Safari, Firefox)", async () => {
+    expect(await fullscreenExitWithLock()).not.toHaveBeenCalled();
+  });
+
+  it("still releases it with Keyboard Lock (Chrome, Edge: unchanged)", async () => {
+    keyboardLockOn = true;
+    expect(await fullscreenExitWithLock()).toHaveBeenCalledTimes(1);
   });
 });
 

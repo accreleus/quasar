@@ -734,7 +734,9 @@ export function SessionPage() {
   useEffect(() => {
     const onFullscreenChange = () => {
       setFullscreen(!!document.fullscreenElement);
-      if (!document.fullscreenElement && document.pointerLockElement) {
+      // Not without Keyboard Lock: Esc leaves fullscreen there and capture.ts
+      // has just asked for the lock back, which this must not undo (#631).
+      if (!document.fullscreenElement && document.pointerLockElement && keyboardLockSupported()) {
         document.exitPointerLock();
       }
       // Entering fullscreen while captured engages Keyboard Lock (Esc → game);
@@ -1051,7 +1053,10 @@ export function SessionPage() {
             escReleases={
               !pointerLockSupported() || !fullscreen || !keyboardLockSupported() || kbLockRefused
             }
-            escInsecureContext={pointerLockSupported() && !keyboardLockSupported()}
+            escInsecureContext={pointerLockSupported() && !keyboardLockSupported() && !window.isSecureContext}
+            // A secure page in a browser with no Keyboard Lock at all (Firefox,
+            // Safari): HTTPS cannot help, so say what Esc does instead (#631).
+            escNoKeyboardLock={pointerLockSupported() && !keyboardLockSupported() && window.isSecureContext}
             // API presence alone cannot see these two, and both used to render
             // the cheerful fullscreen hint exactly where it was wrong: on a
             // bypassed-certificate origin the Keyboard Lock API exists

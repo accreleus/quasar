@@ -50,6 +50,8 @@ export interface HudProps {
   onRelease: () => void;
   escReleases: boolean;
   escInsecureContext: boolean;
+  /** Secure page, browser without Keyboard Lock (Firefox, Safari). */
+  escNoKeyboardLock: boolean;
   /** Certificate bypassed rather than trusted (lib/certTrust.ts); selects the
    *  trust-the-certificate Esc wording. Only SessionPage supplies it. */
   escCertUntrusted?: boolean;
@@ -367,6 +369,7 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             onGrab={props.onGrab}
             escReleases={props.escReleases}
             escInsecureContext={props.escInsecureContext}
+            escNoKeyboardLock={props.escNoKeyboardLock}
             escCertUntrusted={props.escCertUntrusted}
             escLockRefused={props.escLockRefused}
             pointerLockAvailable={props.pointerLockAvailable}

@@ -1712,3 +1712,197 @@ describe("a Pointer Lock grant that lands after cleanup() (#527)", () => {
     b.cleanup();
   });
 });
+
+// quasar#631 — Safari and Firefox always keep Esc: it drops Pointer Lock (and
+// fullscreen) and the page gets no keydown. Capture used to survive that. When
+// the lock goes while the page still wants it, capture asks for it back.
+describe("Esc drops the mouse lock: capture asks for it back (quasar#631)", () => {
+  function setup(opts: { keyboardLock?: boolean; requestPointerLock?: () => unknown } = {}) {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    if (opts.keyboardLock) {
+      Object.defineProperty(navigator, "keyboard", {
+        value: { lock: vi.fn(() => Promise.resolve()), unlock: vi.fn() },
+        configurable: true,
+      });
+    }
+    // Firefox shape by default: no Promise, a refusal arrives as pointerlockerror.
+    const requestPointerLock = vi.fn(opts.requestPointerLock ?? (() => undefined));
+    const video = { requestPointerLock } as unknown as HTMLVideoElement;
+    const sendInput = vi.fn();
+    const onCaptureChange = vi.fn();
+    const cap = setupCapture({
+      videoEl: video,
+      sendInput,
+      onCaptureChange,
+      channel: makeChannel(),
+    });
+    lockPointer(video);
+    const last = () => onCaptureChange.mock.calls.at(-1)?.[0];
+    return { cap, video, sendInput, requestPointerLock, onCaptureChange, last };
+  }
+  const pointerLockError = () => document.dispatchEvent(new Event("pointerlockerror"));
+
+  it("asks for the lock again at once and keeps capture on, held keys held", () => {
+    const { cap, video, sendInput, requestPointerLock, last } = setup();
+    dispatchKeyDown("KeyW");
+    sendInput.mockClear();
+    unlockPointer();
+    expect(requestPointerLock).toHaveBeenCalledTimes(1);
+    expect(last()).toEqual({ captured: true, pointerLocked: false });
+    expect(sendInput).not.toHaveBeenCalled(); // no key-up for W: it is still down
+    lockPointer(video); // the browser grants it
+    expect(last()).toEqual({ captured: true, pointerLocked: true });
+    dispatchKeyUp("KeyW");
+    expect(sendInput).toHaveBeenCalledWith({ t: "k", code: EVDEV.KeyW, pressed: false });
+    cap.cleanup();
+  });
+
+  it("falls back to release when the browser raises pointerlockerror", () => {
+    const { cap, sendInput, last } = setup();
+    dispatchKeyDown("KeyW");
+    unlockPointer();
+    pointerLockError();
+    expect(last()).toEqual({ captured: false, pointerLocked: false });
+    expect(sendInput).toHaveBeenCalledWith({ t: "k", code: EVDEV.KeyW, pressed: false });
+    cap.cleanup();
+  });
+
+  it("falls back to release when the request rejects", async () => {
+    const { cap, last } = setup({ requestPointerLock: () => Promise.reject(new DOMException("no", "SecurityError")) });
+    unlockPointer();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(last()).toEqual({ captured: false, pointerLocked: false });
+    cap.cleanup();
+  });
+
+  it("falls back to release when the request throws", () => {
+    const { cap, last } = setup({
+      requestPointerLock: () => {
+        throw new DOMException("no", "InvalidStateError");
+      },
+    });
+    unlockPointer();
+    expect(last()).toEqual({ captured: false, pointerLocked: false });
+    cap.cleanup();
+  });
+
+  it("falls back to release when the browser neither grants nor refuses", () => {
+    const { cap, last } = setup();
+    unlockPointer();
+    vi.advanceTimersByTime(900);
+    expect(last()).toEqual({ captured: true, pointerLocked: false });
+    vi.advanceTimersByTime(200);
+    expect(last()).toEqual({ captured: false, pointerLocked: false });
+    cap.cleanup();
+  });
+
+  it("does not ask after a deliberate release (the Z combo, the menu)", () => {
+    const { cap, requestPointerLock, last } = setup();
+    Object.defineProperty(document, "exitPointerLock", { value: () => unlockPointer(), configurable: true });
+    cap.release();
+    expect(requestPointerLock).not.toHaveBeenCalled();
+    expect(last()).toEqual({ captured: false, pointerLocked: false });
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+    cap.cleanup();
+  });
+
+  it("a release() while the request is in flight releases capture at once", () => {
+    const { cap, video, requestPointerLock, last } = setup();
+    unlockPointer();
+    expect(requestPointerLock).toHaveBeenCalledTimes(1);
+    cap.release();
+    expect(last()).toEqual({ captured: false, pointerLocked: false });
+    lockPointer(video); // a late grant is handed straight back
+    expect(last().captured).toBe(false);
+    cap.cleanup();
+  });
+
+  it("does not ask when the window lost focus (Cmd-Tab)", () => {
+    const { cap, requestPointerLock, last } = setup();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    unlockPointer();
+    expect(requestPointerLock).not.toHaveBeenCalled();
+    expect(last()).toEqual({ captured: false, pointerLocked: false });
+    cap.cleanup();
+  });
+
+  it("does not ask when the page was hidden (tab switch)", () => {
+    const { cap, requestPointerLock, last } = setup();
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    unlockPointer();
+    expect(requestPointerLock).not.toHaveBeenCalled();
+    expect(last()).toEqual({ captured: false, pointerLocked: false });
+    cap.cleanup();
+  });
+
+  it("Chrome and Edge are untouched: with Keyboard Lock a lost lock is a release", () => {
+    const { cap, requestPointerLock, last } = setup({ keyboardLock: true });
+    unlockPointer();
+    expect(requestPointerLock).not.toHaveBeenCalled();
+    expect(last()).toEqual({ captured: false, pointerLocked: false });
+    cap.cleanup();
+  });
+
+  it("asks once per loss, and not again within 500 ms of the last request", () => {
+    const { cap, video, requestPointerLock, last } = setup();
+    unlockPointer();
+    lockPointer(video); // granted...
+    vi.advanceTimersByTime(100);
+    unlockPointer(); // ...and dropped again at once: no second request
+    expect(requestPointerLock).toHaveBeenCalledTimes(1);
+    expect(last()).toEqual({ captured: false, pointerLocked: false });
+    cap.cleanup();
+  });
+
+  it("asks again for a later Esc, once the gap has passed", () => {
+    const { cap, video, requestPointerLock, last } = setup();
+    unlockPointer();
+    lockPointer(video);
+    vi.advanceTimersByTime(600);
+    unlockPointer();
+    expect(requestPointerLock).toHaveBeenCalledTimes(2);
+    expect(last()).toEqual({ captured: true, pointerLocked: false });
+    cap.cleanup();
+  });
+
+  it("cleanup() mid-request leaves no timer to release a capture that is gone", () => {
+    const { cap, onCaptureChange } = setup();
+    unlockPointer();
+    cap.cleanup();
+    onCaptureChange.mockClear();
+    vi.advanceTimersByTime(2000);
+    pointerLockError();
+    expect(onCaptureChange).not.toHaveBeenCalled();
+  });
+});
+
+describe("the console line says what is true about Keyboard Lock (quasar#631)", () => {
+  afterEach(() => {
+    delete (window as unknown as { isSecureContext?: unknown }).isSecureContext;
+  });
+
+  function infoFor(isSecureContext: boolean): string {
+    setPointerLockApi(() => undefined);
+    Object.defineProperty(window, "isSecureContext", { value: isSecureContext, configurable: true });
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    setupCapture({
+      videoEl: makeVideo(),
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+    }).cleanup();
+    return String(info.mock.calls[0]?.[0]);
+  }
+
+  it("an insecure page is told to use HTTPS", () => {
+    expect(infoFor(false)).toMatch(/secure context required[\s\S]*use HTTPS/);
+  });
+
+  it("a secure page without Keyboard Lock is not told to use HTTPS", () => {
+    const line = infoFor(true);
+    expect(line).toMatch(/unavailable in this browser/);
+    expect(line).not.toMatch(/HTTPS/);
+  });
+});

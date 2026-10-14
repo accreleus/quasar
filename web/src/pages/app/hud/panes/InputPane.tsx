@@ -27,8 +27,12 @@ export interface InputPaneProps {
   onGrab: () => void;
   /** True when Esc is browser-owned (or ours) and releases capture. */
   escReleases: boolean;
-  /** True when that is specifically because Keyboard Lock is unavailable. */
+  /** True when that is specifically because Keyboard Lock is unavailable on an
+   *  insecure page (`!isSecureContext`), where HTTPS is the fix in Chrome/Edge. */
   escInsecureContext: boolean;
+  /** Keyboard Lock is unavailable on a SECURE page: the browser has none
+   *  (Firefox, Safari), so HTTPS is not advice. */
+  escNoKeyboardLock: boolean;
   /** Certificate bypassed rather than trusted (lib/certTrust.ts). Takes wording
    *  precedence over the other Esc explanations: "use HTTPS" is wrong advice on
    *  an origin that already IS https. */
@@ -146,6 +150,12 @@ function escNote(props: InputPaneProps): string {
       "insecure origin, so the browser keeps Esc and it releases capture."
     );
   }
+  if (props.escNoKeyboardLock) {
+    return (
+      "This browser keeps Esc for itself, so the game never sees it. It may leave " +
+      "fullscreen, but capture stays on until you use the release combo."
+    );
+  }
   return (
     "Fullscreen and a secure origin let Quasar forward Esc to the game. Over plain HTTP, " +
     "or outside fullscreen, the browser keeps it and capture releases instead."
@@ -199,7 +209,13 @@ export function InputPane(props: InputPaneProps) {
           <div className="col-lb">Keys</div>
           <div className="ov-kv">
             <span>Esc key</span>
-            <b>{props.escReleases ? "Releases capture" : "Sent to the app"}</b>
+            <b>
+              {props.escNoKeyboardLock
+                ? "Not sent to the app"
+                : props.escReleases
+                  ? "Releases capture"
+                  : "Sent to the app"}
+            </b>
           </div>
           {/* Gesture reference — only where the gestures are actually live; a
               desktop cannot produce them. */}

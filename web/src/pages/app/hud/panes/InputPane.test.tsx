@@ -34,6 +34,7 @@ const base = {
   onGrab: vi.fn(),
   escReleases: false,
   escInsecureContext: false,
+  escNoKeyboardLock: false,
   pointerLockAvailable: true,
   touchLook: false,
   scalingMode: "contain" as const,
@@ -87,6 +88,22 @@ describe("InputPane keys", () => {
     expect(
       screen.getByText(/Keyboard Lock is unavailable on this insecure origin/i),
     ).toBeTruthy();
+  });
+
+  it("a secure page in a browser with no Keyboard Lock gets no HTTPS advice (#631)", () => {
+    render(<InputPane {...base} inputCaptured escReleases escNoKeyboardLock />);
+    expect(screen.getByText(/keeps Esc for itself/i)).toBeTruthy();
+    expect(screen.getByText(/capture stays on until you use the release combo/i)).toBeTruthy();
+    expect(screen.getByText(/not sent to the app/i)).toBeTruthy();
+    expect(screen.queryByText(/releases capture/i)).toBeNull();
+    expect(screen.queryByText(/HTTPS/i)).toBeNull();
+    expect(screen.queryByText(/insecure origin/i)).toBeNull();
+  });
+
+  it("the insecure origin still says HTTPS (#631)", () => {
+    render(<InputPane {...base} inputCaptured escReleases escInsecureContext />);
+    expect(screen.getByText(/needs the HTTPS address/i)).toBeTruthy();
+    expect(screen.queryByText(/not sent to the app/i)).toBeNull();
   });
 
   it("names the untrusted certificate — 'use HTTPS' is wrong advice on an origin that already is https", () => {
