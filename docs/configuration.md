@@ -970,9 +970,12 @@ definitive build failure clears its intent and permits a corrected retry. Deadli
 expiry or observer cancellation does not promise daemon rollback or intermediate
 cleanup.
 
-A record file that does not parse (an agent killed while writing it) is retired by
+An empty or truncated record file (an agent killed while writing it) is retired by
 the next operation on that reference or by the startup sweep; the agent logs
-`image-record-unreadable-retired`.
+`image-record-unreadable-retired`. An oversized file, or a record this agent does
+not understand, is left for an operator: operations on that reference fail with
+`image operation failed; inspect node-agent logs` until it is cleared with the
+agent stopped.
 
 If observation cannot resolve a removal intent, or a removal recorded against another
 engine socket, an operator must confirm that the old engine operation has finished

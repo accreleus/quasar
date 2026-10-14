@@ -375,6 +375,59 @@ fn an_unparsable_record_is_left_alone_while_its_lease_is_held() {
     server.join().unwrap();
 }
 
+/// Records a retire must not touch: ensure_image fails `Protocol` after one inspection.
+fn assert_record_kept(body: String, image: &str) {
+    let (_dir, config, server) = serve(vec![discovery(), reply(INSPECT, 404, ABSENT)]);
+    let journal = strand_pull_intent(&config, image);
+    std::fs::write(&journal, body).unwrap();
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime
+            .ensure_image(image, Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+    assert!(journal.exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn an_oversized_record_is_kept() {
+    let removal =
+        serde_json::json!({"image":"test","socket":"/s","remove_id":"sha256:x"}).to_string();
+    assert_record_kept(format!("{removal}{}", " ".repeat(9000)), "test");
+}
+
+#[test]
+fn a_record_this_agent_does_not_understand_is_kept() {
+    assert_record_kept(r#"{"image":"test","future":[1]}"#.to_owned(), "test");
+}
+
+#[test]
+fn a_removal_record_from_another_engine_socket_is_refused_and_kept() {
+    let (_dir, config, server) = serve(vec![discovery(), reply(INSPECT, 404, ABSENT)]);
+    let journal = strand_pull_intent(&config, "test");
+    std::fs::write(
+        &journal,
+        serde_json::json!({"image":"test","socket":"/another-engine.sock","remove_id":"sha256:x"})
+            .to_string(),
+    )
+    .unwrap();
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime
+            .ensure_image("test", Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert!(journal.exists());
+    server.join().unwrap();
+}
+
 #[test]
 fn startup_sweep_retires_unparsable_records_unless_leased() {
     use std::os::fd::AsRawFd;
