@@ -60,8 +60,8 @@ export interface UseLaunchOptions {
   apps: readonly App[];
   /** The caller's live session, if any — resume beats launch (see quickLaunch). */
   liveSession: Session | null;
-  /** Whether this browser can decode h264 at all; without it, one-click has
-   *  nothing to offer and the band explains why. */
+  /** Whether this browser can decode h264 at all. Without it one-click opens the
+   *  band instead: the server's recommendation assumes H.264 always decodes. */
   canDecodeH264: boolean;
   /** Evaluates launch profiles for `app`; the detail band owns the state, so
    *  the result lands there as well as here. */
