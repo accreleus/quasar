@@ -261,7 +261,7 @@ func TestUpdateUserLastAdminRace(t *testing.T) {
 	for _, id := range []string{a, b} {
 		id := id
 		go func() {
-			_, err := svc.UpdateUser(ctx, id, &role, nil, nil)
+			_, _, err := svc.UpdateUser(ctx, id, &role, nil, nil)
 			errs <- err
 		}()
 	}
@@ -311,7 +311,7 @@ func TestUpdateUserDemoteWithOtherFields(t *testing.T) {
 
 	role := RoleUser
 	max := int32(7)
-	got, err := svc.UpdateUser(ctx, ids[0], &role, nil, &max)
+	got, _, err := svc.UpdateUser(ctx, ids[0], &role, nil, &max)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}

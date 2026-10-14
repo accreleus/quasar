@@ -330,7 +330,16 @@ window, capture `/debug/pprof/mutex` or `/debug/pprof/block`, then disarm.
   endpoint can hold a profile open indefinitely.
 
 The loopback bind answers all three, which is why it is the default and why the
-port is published nowhere. **If a profile is needed from a remote box, pull it
+port is published nowhere. The listener also answers `403` to any
+request with an `Origin` header, a `Sec-Fetch-Site` header (every current browser
+sends one to loopback, on navigations and `<img>`/`<script>` loads too) or a
+`Host` that is not `127.0.0.1`, `[::1]` or `localhost`, so a web page on the host
+cannot drive it (cross-site POST, image GET, DNS rebinding). The IPv4-mapped
+`[::ffff:127.0.0.1]` is refused as well, because a browser sends no
+`Sec-Fetch-Site` to it. `wget`, `curl` and `go tool pprof` send none of these. A
+browser too old to send `Sec-Fetch-Site` or `Origin` (Chrome before 76, Firefox
+before 90, Safari before 16.4) is not stopped.
+**If a profile is needed from a remote box, pull it
 over SSH — do not widen the bind address:**
 
 ```bash
@@ -964,13 +973,20 @@ a fingerprint of the packaged context, Dockerfile, tag and build arguments. Afte
 an interrupted build (a replaced agent, a broken response, a spent deadline) the
 next operation on that tag settles the intent. The matching label proves
 completion, and a matching request fingerprint reuses that result. An old image or
-an absent tag proves nothing, so the intent is retired and the next build builds
-the image again; the classic builder stops a build whose client has gone. A
+an absent tag proves nothing, and neither does an intent recorded against another
+engine socket, so the intent is retired and the next build builds the image again; the classic builder stops a build whose client has gone. A
 definitive build failure clears its intent and permits a corrected retry. Deadline
 expiry or observer cancellation does not promise daemon rollback or intermediate
 cleanup.
 
-If observation cannot resolve a removal intent, or one recorded against another
+An empty or truncated record file (an agent killed while writing it) is retired by
+the next operation on that reference or by the startup sweep; the agent logs
+`image-record-unreadable-retired`. An oversized file, or a record this agent does
+not understand, is left for an operator: operations on that reference fail with
+`image operation failed; inspect node-agent logs` until it is cleared with the
+agent stopped.
+
+If observation cannot resolve a removal intent, or a removal recorded against another
 engine socket, an operator must confirm that the old engine operation has finished
 before clearing that specific JSON intent with the agent stopped. Do not remove the
 `.lock` files or clear the entire directory while work might still be active. A

@@ -118,7 +118,7 @@ func TestUserMutationsAreAudited(t *testing.T) {
 	patchUser(t, srv, tok, subjectID, map[string]any{"role": "admin"})
 	patchUser(t, srv, tok, subjectID, map[string]any{"disabled": true})
 	patchUser(t, srv, tok, subjectID, map[string]any{"disabled": false})
-	patchUser(t, srv, tok, subjectID, map[string]any{"max_concurrent_sessions": 3})
+	patchUser(t, srv, tok, subjectID, map[string]any{"max_concurrent_sessions": 5})
 
 	resp, _ := do(t, req(t, http.MethodDelete, srv.URL+"/v1/users/"+subjectID, nil, tok))
 	if resp.StatusCode != http.StatusNoContent {
@@ -144,8 +144,8 @@ func TestUserMutationsAreAudited(t *testing.T) {
 	if got := rows[0].Details["role"]; got != "admin" {
 		t.Errorf("user.role_changed details.role = %v, want admin", got)
 	}
-	if got := rows[3].Details["max_concurrent_sessions"]; got != float64(3) {
-		t.Errorf("user.quota_changed details = %v, want max_concurrent_sessions 3", rows[3].Details)
+	if got := rows[3].Details["max_concurrent_sessions"]; got != float64(5) {
+		t.Errorf("user.quota_changed details = %v, want max_concurrent_sessions 5", rows[3].Details)
 	}
 	// Nothing that could be a credential ever reaches details.
 	for _, r := range rows {
@@ -154,6 +154,25 @@ func TestUserMutationsAreAudited(t *testing.T) {
 				t.Errorf("%s details carries %q", r.Action, k)
 			}
 		}
+	}
+}
+
+// TestNoOpUserPatchIsNotAudited (#624): a field carried with the value the row
+// already holds is not a change. The subject starts as an enabled user with the
+// default quota; only the real transition in the mixed PATCH may leave a row.
+func TestNoOpUserPatchIsNotAudited(t *testing.T) {
+	srv, pool, tok, _, subjectID := newAuditedUserServer(t)
+
+	patchUser(t, srv, tok, subjectID, map[string]any{"role": "user", "disabled": false, "max_concurrent_sessions": 3})
+	if rows := auditRows(t, pool); len(rows) != 0 {
+		t.Fatalf("a no-op PATCH recorded %v", rowActions(rows))
+	}
+
+	patchUser(t, srv, tok, subjectID, map[string]any{"role": "user", "disabled": true, "max_concurrent_sessions": 3})
+	patchUser(t, srv, tok, subjectID, map[string]any{"disabled": true})
+	rows := auditRows(t, pool)
+	if len(rows) != 1 || rows[0].Action != "user.disabled" {
+		t.Fatalf("recorded %v, want exactly [user.disabled]", rowActions(rows))
 	}
 }
 
