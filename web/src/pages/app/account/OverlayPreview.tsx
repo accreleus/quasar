@@ -179,6 +179,7 @@ export function OverlayPreview() {
             onRelease={noop}
             escReleases={false}
             escInsecureContext={false}
+            escNoKeyboardLock={false}
             pointerLockAvailable
             touchLook={false}
             // Granted, so the mic button previews in its normal enabled state

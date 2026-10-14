@@ -161,6 +161,10 @@ export interface SessionRuntimeCallbacks {
    *  fires this once per pad). Optional and informational: the page explains
    *  that its buttons may be mixed up; the pad is still forwarded. */
   onNonStandardGamepad?(pad: GamepadIdentity): void;
+  /** capture.ts sent the host one Esc tap for the Esc the browser took
+   *  (quasar#631). Optional and informational: the page offers the click that
+   *  re-enters fullscreen and re-captures. */
+  onEscGuessed?(): void;
   /** A disconnect signature was seen on the status channel. The host-lost poll
    *  stays on the page: hostLost is page state and the poller is page-owned. */
   onDisconnectSuspected(): void;
@@ -486,6 +490,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       onSummonOverlay: () => cfg.callbacks.onSummonOverlay(),
       onKeyboardLockRefused: (error) => cfg.callbacks.onKeyboardLockRefused?.(error),
       onNonStandardGamepad: (pad) => cfg.callbacks.onNonStandardGamepad?.(pad),
+      onEscGuessed: () => cfg.callbacks.onEscGuessed?.(),
     });
     captureCleanup = capture.cleanup;
     captureKbSync = capture.syncKeyboardLock;

@@ -54,6 +54,7 @@ const base = {
   onRelease: vi.fn(),
   escReleases: false,
   escInsecureContext: false,
+  escNoKeyboardLock: false,
   pointerLockAvailable: true,
   touchLook: false,
   micGranted: true,

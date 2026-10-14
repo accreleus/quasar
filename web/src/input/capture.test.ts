@@ -1712,3 +1712,155 @@ describe("a Pointer Lock grant that lands after cleanup() (#527)", () => {
     b.cleanup();
   });
 });
+
+// quasar#631 — Safari and Firefox always keep Esc: it ends Pointer Lock (and
+// fullscreen) and the page gets no keydown (Firefox: no key event; WebKit: a
+// bare keyup). capture.ts hands the host the Esc the player pressed.
+describe("the Esc the browser took (quasar#631)", () => {
+  const ESC = EVDEV.Escape;
+  const escDown = { t: "k", code: ESC, pressed: true };
+  const escUp = { t: "k", code: ESC, pressed: false };
+
+  function setup(opts: { keyboardLock?: boolean } = {}) {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    if (opts.keyboardLock) {
+      Object.defineProperty(navigator, "keyboard", {
+        value: { lock: vi.fn(() => Promise.resolve()), unlock: vi.fn() },
+        configurable: true,
+      });
+    }
+    const video = makeVideo();
+    const sendInput = vi.fn();
+    const onEscGuessed = vi.fn();
+    const cap = setupCapture({
+      videoEl: video,
+      sendInput,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+      isFullscreen: () => true,
+      onEscGuessed,
+    });
+    lockPointer(video);
+    return { cap, sendInput, onEscGuessed };
+  }
+
+  const escMessages = (sendInput: ReturnType<typeof vi.fn>) =>
+    sendInput.mock.calls.map((c) => c[0]).filter((m) => m.t === "k" && m.code === ESC);
+
+  it("sends one Esc tap, down then up, when capture ends with focus and visibility and no Keyboard Lock", () => {
+    const { cap, sendInput, onEscGuessed } = setup();
+    unlockPointer();
+    expect(escMessages(sendInput)).toEqual([escDown]);
+    expect(onEscGuessed).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(60);
+    expect(escMessages(sendInput)).toEqual([escDown, escUp]);
+    cap.cleanup();
+  });
+
+  it("a real Esc keydown that arrives first wins: one tap, no guess", () => {
+    const { cap, sendInput, onEscGuessed } = setup();
+    dispatchKeyDown("Escape");
+    unlockPointer(); // the flush gives the held Esc its key-up
+    dispatchKeyUp("Escape");
+    vi.advanceTimersByTime(200);
+    expect(escMessages(sendInput)).toEqual([escDown, escUp]);
+    expect(onEscGuessed).not.toHaveBeenCalled();
+    cap.cleanup();
+  });
+
+  it("a keydown that arrives after capture ended cannot add a second tap", () => {
+    const { cap, sendInput } = setup();
+    unlockPointer();
+    dispatchKeyDown("Escape");
+    dispatchKeyUp("Escape");
+    vi.advanceTimersByTime(200);
+    expect(escMessages(sendInput)).toEqual([escDown, escUp]);
+    cap.cleanup();
+  });
+
+  it("sends nothing when the window lost focus (Cmd-Tab)", () => {
+    const { cap, sendInput, onEscGuessed } = setup();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    unlockPointer();
+    vi.advanceTimersByTime(200);
+    expect(escMessages(sendInput)).toEqual([]);
+    expect(onEscGuessed).not.toHaveBeenCalled();
+    cap.cleanup();
+  });
+
+  it("sends nothing when the page was hidden (tab switch)", () => {
+    const { cap, sendInput, onEscGuessed } = setup();
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    unlockPointer();
+    vi.advanceTimersByTime(200);
+    expect(escMessages(sendInput)).toEqual([]);
+    expect(onEscGuessed).not.toHaveBeenCalled();
+    cap.cleanup();
+  });
+
+  it("sends nothing after a deliberate release (the Z combo and the menu)", () => {
+    const { cap, sendInput, onEscGuessed } = setup();
+    Object.defineProperty(document, "exitPointerLock", {
+      value: () => unlockPointer(),
+      configurable: true,
+    });
+    cap.release();
+    vi.advanceTimersByTime(200);
+    expect(escMessages(sendInput)).toEqual([]);
+    expect(onEscGuessed).not.toHaveBeenCalled();
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+    cap.cleanup();
+  });
+
+  it("Chrome and Edge are untouched: with Keyboard Lock a lost lock sends no Esc, and a real Esc keydown is forwarded as before", () => {
+    const { cap, sendInput, onEscGuessed } = setup({ keyboardLock: true });
+    dispatchKeyDown("Escape"); // Keyboard Lock delivers it to the page
+    dispatchKeyUp("Escape");
+    expect(escMessages(sendInput)).toEqual([escDown, escUp]);
+    sendInput.mockClear();
+    unlockPointer();
+    vi.advanceTimersByTime(200);
+    expect(escMessages(sendInput)).toEqual([]);
+    expect(onEscGuessed).not.toHaveBeenCalled();
+    cap.cleanup();
+  });
+
+  it("cleanup() inside the hold sends the pending key-up at once", () => {
+    const { cap, sendInput } = setup();
+    unlockPointer();
+    cap.cleanup();
+    expect(escMessages(sendInput)).toEqual([escDown, escUp]);
+    vi.advanceTimersByTime(200);
+    expect(escMessages(sendInput)).toEqual([escDown, escUp]);
+  });
+});
+
+describe("the console line says what is true about Keyboard Lock (quasar#631)", () => {
+  afterEach(() => {
+    delete (window as unknown as { isSecureContext?: unknown }).isSecureContext;
+  });
+
+  function infoFor(isSecureContext: boolean): string {
+    setPointerLockApi(() => undefined);
+    Object.defineProperty(window, "isSecureContext", { value: isSecureContext, configurable: true });
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    setupCapture({
+      videoEl: makeVideo(),
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+    }).cleanup();
+    return String(info.mock.calls[0]?.[0]);
+  }
+
+  it("an insecure page is told to use HTTPS", () => {
+    expect(infoFor(false)).toMatch(/secure context required[\s\S]*use HTTPS/);
+  });
+
+  it("a secure page without Keyboard Lock is not told to use HTTPS", () => {
+    const line = infoFor(true);
+    expect(line).toMatch(/unavailable in this browser/);
+    expect(line).not.toMatch(/HTTPS/);
+  });
+});

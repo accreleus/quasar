@@ -45,6 +45,7 @@ import {
   SessionToastHost,
   SessionBanner,
   SessionBannerHost,
+  SessionResumePrompt,
 } from "./sessionAlerts";
 import { LOCK_TO_STREAM_MS, SessionLoader } from "./SessionLoader";
 import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailure, unreachableFailure } from "./sessionFailure";
@@ -84,6 +85,10 @@ export function parseTierSize(tier: string | undefined): { w: number; h: number 
  * that with a worse, generic answer.
  */
 const RESUME_DEAD_STATES: ReadonlySet<string> = new Set(["stopping", "stopped"]);
+
+/** Firefox ends capture before it leaves fullscreen and WebKit after; a
+ *  fullscreen exit this recent still counts as "was fullscreen" (#631). */
+const ESC_FULLSCREEN_EXIT_MS = 300;
 
 interface SessionState {
   signalingUrl: string;
@@ -174,6 +179,11 @@ export function SessionPage() {
   // honest Esc wording even though keyboardLockSupported() (pure API presence)
   // says the feature exists.
   const [kbLockRefused, setKbLockRefused] = useState(false);
+  // quasar#631: the browser took an Esc and capture.ts passed it to the game.
+  // Shows the one-click resume prompt until capture is back or the menu opens.
+  const [escResume, setEscResume] = useState(false);
+  const resumeFullscreenRef = useRef(false);
+  const fullscreenExitedAtRef = useRef(-Infinity);
   // Currently-running app: seeded from router state, re-seated by a quick-switch
   // swap (final review, finding 3) — router state is write-once, and the
   // server's `app_id` still names the OLD app until the agent confirms the swap
@@ -389,6 +399,15 @@ export function SessionPage() {
                   "pressing Esc releases input instead of reaching the game. " +
                   "Re-entering fullscreen usually restores it.",
           });
+        },
+        // quasar#631: capture.ts sent the Esc the browser took. Remember whether
+        // the player was fullscreen (Firefox ends capture before it leaves
+        // fullscreen, WebKit after) so the click can put both back.
+        onEscGuessed: () => {
+          resumeFullscreenRef.current =
+            document.fullscreenElement != null ||
+            performance.now() - fullscreenExitedAtRef.current < ESC_FULLSCREEN_EXIT_MS;
+          setEscResume(true);
         },
         // quasar#348: the browser didn't recognise this pad, so its raw
         // button order is going out as if it were the standard layout. Say so
@@ -734,6 +753,7 @@ export function SessionPage() {
   useEffect(() => {
     const onFullscreenChange = () => {
       setFullscreen(!!document.fullscreenElement);
+      if (!document.fullscreenElement) fullscreenExitedAtRef.current = performance.now();
       if (!document.fullscreenElement && document.pointerLockElement) {
         document.exitPointerLock();
       }
@@ -744,6 +764,26 @@ export function SessionPage() {
     document.addEventListener("fullscreenchange", onFullscreenChange);
     return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
   }, []);
+
+  // Capture is back: the prompt has done its job.
+  useEffect(() => {
+    if (inputCaptured) setEscResume(false);
+  }, [inputCaptured]);
+
+  // The prompt's click is the user gesture. Fullscreen first and capture once
+  // it resolves: Firefox drops a Pointer Lock requested in the same tick as
+  // fullscreen (measured), but grants one inside fullscreen.
+  const handleResume = useCallback(() => {
+    const el = containerRef.current;
+    if (resumeFullscreenRef.current && el && !document.fullscreenElement) {
+      el.requestFullscreen().then(handleGrab, (err: unknown) => {
+        console.warn("fullscreen request failed:", err);
+        handleGrab();
+      });
+      return;
+    }
+    handleGrab();
+  }, [handleGrab]);
 
   // Live identity — follows a quick-switch swap (finding 3), unlike the
   // launch-time router state it is seeded from.
@@ -1051,7 +1091,10 @@ export function SessionPage() {
             escReleases={
               !pointerLockSupported() || !fullscreen || !keyboardLockSupported() || kbLockRefused
             }
-            escInsecureContext={pointerLockSupported() && !keyboardLockSupported()}
+            escInsecureContext={pointerLockSupported() && !keyboardLockSupported() && !window.isSecureContext}
+            // A secure page in a browser with no Keyboard Lock at all (Firefox,
+            // Safari): HTTPS cannot help, so say what Esc does instead (#631).
+            escNoKeyboardLock={pointerLockSupported() && !keyboardLockSupported() && window.isSecureContext}
             // API presence alone cannot see these two, and both used to render
             // the cheerful fullscreen hint exactly where it was wrong: on a
             // bypassed-certificate origin the Keyboard Lock API exists
@@ -1118,6 +1161,10 @@ export function SessionPage() {
             <path d="M4 7h16M4 12h16M4 17h16" />
           </svg>
         </button>
+      )}
+
+      {escResume && !inputCaptured && !hudOpen && !sessionOver && (
+        <SessionResumePrompt onResume={handleResume} />
       )}
 
       {/* A swap finishing under a held verdict must not announce itself next to the notice. */}
