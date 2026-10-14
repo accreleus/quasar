@@ -504,10 +504,10 @@ func validateRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID string
 		WHERE host_id=$1::uuid AND id=$2::uuid`, hostID, entry.AttemptID).
 		Scan(&group, &digest, &oldRevision, &grantBoot, &grantConnection, &phase, &oldSeq, &terminalAt)
 	if err == nil {
-		if phase == "revoked_unstarted" && terminalAt != nil {
-			// An absent complete journal closed this attempt. A later started
-			// entry contradicts that proof; quarantine rather than resurrect it
-			// under a still-terminal row with an already released hold.
+		if terminalAt != nil && (seq != oldSeq || phase != entry.Phase) {
+			// terminal_at is never cleared, so only an exact replay of the
+			// terminal entry passes; anything later quarantines rather than
+			// resurrect the attempt under an already released hold.
 			return false, nil
 		}
 		return group == entry.Group && digest == entry.Digest && oldRevision == revision && grantBoot == entry.GrantBoot &&
@@ -555,7 +555,7 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			terminal_at=COALESCE(host_config_attempts.terminal_at,excluded.terminal_at),
 			recovery_attempted=host_config_attempts.recovery_attempted OR excluded.recovery_attempted,
 			error_code=COALESCE(excluded.error_code,host_config_attempts.error_code)
-		WHERE host_config_attempts.journal_sequence IS NULL OR host_config_attempts.journal_sequence<$9::bigint`,
+		WHERE host_config_attempts.terminal_at IS NULL AND (host_config_attempts.journal_sequence IS NULL OR host_config_attempts.journal_sequence<$9::bigint)`,
 		entry.AttemptID, hostID, entry.Group, entry.Digest, revision, entry.GrantBoot, entry.GrantConnection, entry.Phase, seq, terminal, safeIdleErrorCode(entry.ErrorCode)); err != nil {
 		return err
 	}
@@ -606,7 +606,13 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
-	} else if terminal {
+		// A restored ledger can hold the attempt without its restriction.
+		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+			VALUES($1::uuid,'recovery',$2::uuid,'configuration_recovery') ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
+			return err
+		}
+	} else if terminal && (entry.Phase != "applied" || active) {
+		// An applied entry releases its hold only with the matching verified active snapshot.
 		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
