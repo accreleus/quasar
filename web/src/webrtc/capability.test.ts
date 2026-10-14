@@ -209,6 +209,19 @@ describe("probeCapabilities", () => {
     expect(safari.display).not.toHaveProperty("refresh_hz");
   });
 
+  // Every iOS browser is WebKit and reports Safari/ in its UA: Chrome on iOS
+  // (CriOS) shares Safari's rAF cap, so it must be treated as Safari (#632).
+  it("omits refresh_hz for Chrome on iOS, which is WebKit and reports as Safari (#632)", async () => {
+    stubEnv({ uaData: undefined });
+    Object.defineProperty(navigator, "userAgent", {
+      value: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/130.0.6723.37 Mobile/15E148 Safari/604.1",
+      configurable: true,
+    });
+    const caps = await probeCapabilities();
+    expect(caps.browser.name).toBe("Safari");
+    expect(caps.display).not.toHaveProperty("refresh_hz");
+  });
+
   it("falls back to UA-string sniffing when UA-CH is absent", async () => {
     stubEnv({ uaData: undefined });
     Object.defineProperty(navigator, "userAgent", {
