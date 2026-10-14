@@ -19,8 +19,9 @@ func Defaults() map[string]any {
 	}
 }
 
-// An input_devices list longer than a host has /dev/input nodes, or a path longer
-// than a path can be, is not a real allowlist; refuse it before it is stored.
+// The agent accepts only /dev/input/eventN paths, so a list with more entries
+// than a host has input nodes, or a path longer than that form, is not a real
+// allowlist; refuse it before it is stored.
 const (
 	maxInputDevices    = 256
 	maxInputDevicePath = 256
