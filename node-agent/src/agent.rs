@@ -1050,7 +1050,7 @@ pub(crate) fn advertised_codec_throughput(
 /// How long register preparation may take before the agent says so. Register
 /// preparation (the image reconcile and the install probe, both against the
 /// container runtime) runs before the socket is dialled, so it never eats the
-/// control plane's register window (agentws `registerReadTimeout`, 5 s); a runtime
+/// control plane's register window (agentws `registerReadTimeout`); a runtime
 /// this slow still deserves a log line naming it rather than a slow, mysterious
 /// reconnect (#191).
 const REGISTER_PREP_BUDGET: Duration = Duration::from_secs(10);
@@ -1990,7 +1990,7 @@ async fn connect_and_run(
 
     // Everything `register` needs from the container runtime is gathered BEFORE the
     // socket is opened (#191). The control plane gives a fresh connection its
-    // register window (agentws `registerReadTimeout`, 5 s) to send `register`; these
+    // register window (agentws `registerReadTimeout`) to send `register`; these
     // two probes used to run after the dial, and on a host whose docker daemon
     // answers `inspect` slowly (each is bounded at 30 s) they pushed `register` past
     // that deadline. The control plane closed the socket without a close frame, the
@@ -2050,13 +2050,6 @@ async fn connect_and_run(
     // `Option`-wrapped for `recv_or_disabled`.
     let mut image_rx = Some(image_rx);
     let _image_upstream_guard = image_mgr.attach_upstream(image_tx);
-
-    // Same shape for `release_state`. Attaching re-emits the current state of every
-    // updater result file still present, which is how an apply that destroyed the
-    // previous agent still gets reported (agent-api.md `release_state`).
-    let (release_tx, release_rx) = mpsc::channel::<AgentMsg>(16);
-    let mut release_rx = Some(release_rx);
-    let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
 
     // --- Steps 1 and 2: send register, receive registered ---
     let (host_id, heartbeat_interval_ms, policy_identity, policy_groups) =
@@ -2256,6 +2249,15 @@ async fn connect_and_run(
             send(&mut tx, &recovered_terminal(&session_id)).await?;
         }
     }
+
+    // Same shape as the image upstream, for `release_state`. Attaching re-emits the
+    // recovery actor's current attempt, which is how an apply that destroyed the
+    // previous agent still gets reported (agent-api.md `release_state`). It waits on the
+    // actor's status (up to 10 s), so it must stay after `register` and `capacity`, which
+    // the control plane times (#627). `release_rx` is read only by the loop below.
+    let (release_tx, release_rx) = mpsc::channel::<AgentMsg>(16);
+    let mut release_rx = Some(release_rx);
+    let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
 
     // Sent first on purpose: the card carries the remediation, and the gate below may end
     // the process a few seconds later.
@@ -7323,6 +7325,65 @@ mod tests {
         assert!(register_prep_over_budget(Duration::from_secs(11)));
         // The field case: one 30 s inspect timeout.
         assert!(register_prep_over_budget(Duration::from_secs(30)));
+    }
+
+    /// #627: the control plane drops a socket whose `register` has not arrived within
+    /// agentws `registerReadTimeout`, so nothing between `dial` and `register` may wait
+    /// on the recovery actor, whose status read alone may take 10 s.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_reaches_the_control_plane_before_the_recovery_actor_answers() {
+        // `connect_and_run` records the install facts it discovers.
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        // Never accepts: a status request connects through the backlog, then waits.
+        let actor = dir.path().join("actor.sock");
+        let _actor = std::os::unix::net::UnixListener::bind(&actor).unwrap();
+        let release_mgr = ReleaseManager::owned(&actor);
+
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret = dir.path().join("secret");
+        let cfg = Config {
+            control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = cp.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let opened = Instant::now();
+            let first = ws.read().ok().and_then(|m| m.into_text().ok());
+            let _ = first_tx.send((first.map(|t| t.to_string()), opened.elapsed()));
+            // Dropping `ws` closes the socket unanswered, which ends the attempt.
+        });
+
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        let attempt = connect_and_run(
+            &cfg,
+            &health,
+            "",
+            "test",
+            &image_mgr,
+            &release_mgr,
+            &mut sessions,
+            false,
+        )
+        .await;
+        assert!(attempt.is_err(), "the fake control plane never answers");
+        let (first, waited) = first_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        let first = first.expect("a text frame");
+        assert!(first.contains(r#""type":"register""#), "first frame: {first}");
+        assert!(
+            waited < Duration::from_secs(1),
+            "register reached the control plane {waited:?} after the upgrade"
+        );
     }
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`

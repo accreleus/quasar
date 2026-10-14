@@ -44,9 +44,10 @@ const (
 	// Bounds register's DB work and the wait for the first capacity message.
 	handshakeTimeout = 15 * time.Second
 	// How long an unauthenticated socket may hold an admission slot before its
-	// register arrives (#627). The agent prepares register before it dials
-	// (#191), so a real one lands within a round trip of the upgrade.
-	registerReadTimeout = 5 * time.Second
+	// register arrives (#627). An agent built before #627 asks its recovery actor
+	// for status (10 s budget) between dialling and register, so this covers that
+	// plus a round trip. Drop it to 5 s once every supported agent sends register first.
+	registerReadTimeout = 11 * time.Second
 	// Bounds the read loop's per-message DB work (#416) so a stalled store
 	// surfaces as a dropped agent connection instead of parking the loop. Must
 	// stay below db.DefaultStatementTimeout (30s) or the DB's own timeout wins

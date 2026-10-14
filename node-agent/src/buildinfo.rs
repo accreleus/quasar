@@ -429,6 +429,11 @@ pub fn discover_install(facts: &dyn ContainerFacts) -> InstallFacts {
 /// subcommands that never register.
 static INSTALL_FACTS: std::sync::RwLock<Option<InstallFacts>> = std::sync::RwLock::new(None);
 
+/// Held by every test that writes [`INSTALL_FACTS`] and then reads it back, so two
+/// such tests never interleave.
+#[cfg(test)]
+pub(crate) static INSTALL_FACTS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Record this process's discovered install facts, replacing any earlier answer.
 pub fn set_install_facts(facts: InstallFacts) {
     if let Ok(mut slot) = INSTALL_FACTS.write() {

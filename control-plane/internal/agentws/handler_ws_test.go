@@ -60,8 +60,8 @@ func TestSilentAgentSocketIsDroppedQuickly(t *testing.T) {
 	if _, _, err := conn.ReadMessage(); err == nil {
 		t.Fatal("a silent peer was sent a message instead of being dropped")
 	}
-	if held := time.Since(start); held > 8*time.Second {
-		t.Fatalf("silent peer held its slot for %s, want under 8s", held)
+	if held := time.Since(start); held > 13*time.Second {
+		t.Fatalf("silent peer held its slot for %s, want under 13s", held)
 	}
 }
 
