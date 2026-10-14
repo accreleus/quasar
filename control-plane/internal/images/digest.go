@@ -108,7 +108,8 @@ type RegistryResolver struct {
 // addresses allowed, for exactly the operator-named hosts
 // (QUASAR_PLATFORM_INSECURE_REGISTRIES): a contributor's test registry, read
 // only by the developer apply's image-identity check. It follows no redirect
-// and bounds bodies like the production resolver; it is never the catalog's.
+// and bounds bodies like the production resolver, at each read site since its
+// bare client has no cap; it is never the catalog's.
 func NewPlainHTTPRegistryResolver(hosts map[string]struct{}, timeout time.Duration) *RegistryResolver {
 	client := &http.Client{Timeout: timeout, CheckRedirect: outbound.NoRedirect}
 	return &RegistryResolver{client: client, allowHosts: hosts, plainHTTP: true}
@@ -363,7 +364,7 @@ func (r *RegistryResolver) headManifest(ctx context.Context, p parsedRef, token 
 		return "", "", fmt.Errorf("head manifest %s: %w", url, err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, registryMaxBodyBytes))
 		_ = resp.Body.Close()
 	}()
 
@@ -430,12 +431,13 @@ func (r *RegistryResolver) fetchToken(ctx context.Context, realm, service, scope
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("fetch registry token: status %d", resp.StatusCode)
 	}
-	// Unbounded-looking on purpose: the outbound client caps the body at
-	// registryMaxBodyBytes and errors past it, so the bound is enforced in one
-	// place for every caller rather than re-derived at each read site.
-	body, err := io.ReadAll(resp.Body)
+	// Read through our own cap too: the plain-HTTP resolver's client has none.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, registryMaxBodyBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("read registry token: %w", err)
+	}
+	if int64(len(body)) > registryMaxBodyBytes {
+		return "", fmt.Errorf("fetch registry token: response exceeds %d bytes", registryMaxBodyBytes)
 	}
 	var tr tokenResponse
 	if err := json.Unmarshal(body, &tr); err != nil {
