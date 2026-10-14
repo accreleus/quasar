@@ -19,6 +19,13 @@ func Defaults() map[string]any {
 	}
 }
 
+// An input_devices list longer than a host has /dev/input nodes, or a path longer
+// than a path can be, is not a real allowlist; refuse it before it is stored.
+const (
+	maxInputDevices    = 256
+	maxInputDevicePath = 256
+)
+
 // knownKeys is the console-config field set. PATCH validation rejects any
 // other key; a stored config's other keys are ignored on read (KnownOnly).
 var knownKeys = map[string]bool{
@@ -130,10 +137,16 @@ func validateField(k string, v any, caps Capabilities, appExists func(appID stri
 				return fmt.Errorf("%q string value must be %q", k, "auto")
 			}
 		case []any:
+			if len(vv) > maxInputDevices {
+				return fmt.Errorf("%q has more than %d entries", k, maxInputDevices)
+			}
 			for _, item := range vv {
 				s, ok := item.(string)
 				if !ok {
 					return fmt.Errorf("%q entries must be strings", k)
+				}
+				if len(s) > maxInputDevicePath {
+					return fmt.Errorf("%q entries must be at most %d bytes", k, maxInputDevicePath)
 				}
 				if len(caps.InputDevices) > 0 && !inputDeviceKnown(caps.InputDevices, s) {
 					return fmt.Errorf("%q contains an unreported device %q", k, s)

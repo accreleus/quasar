@@ -88,6 +88,26 @@ func TestValidatePatch(t *testing.T) {
 	}
 }
 
+// input_devices is capped by entry count and path length (#622), even when the
+// host has reported no devices (which skips the reported-device check).
+func TestValidatePatchInputDevicesAreBounded(t *testing.T) {
+	empty := Capabilities{}
+	many := make([]any, maxInputDevices+1)
+	for i := range many {
+		many[i] = "/dev/input/event0"
+	}
+	if err := ValidatePatch(map[string]any{"input_devices": many}, empty, okApp, okUser); err == nil {
+		t.Fatalf("%d entries accepted, want refused", len(many))
+	}
+	long := "/dev/input/" + strings.Repeat("e", maxInputDevicePath)
+	if err := ValidatePatch(map[string]any{"input_devices": []any{long}}, empty, okApp, okUser); err == nil {
+		t.Fatalf("a %d-byte path accepted, want refused", len(long))
+	}
+	if err := ValidatePatch(map[string]any{"input_devices": many[:maxInputDevices]}, empty, okApp, okUser); err != nil {
+		t.Fatalf("exactly %d entries refused: %v", maxInputDevices, err)
+	}
+}
+
 func TestDefaultsAreTheSixSettings(t *testing.T) {
 	got := Defaults()
 	want := []string{"enabled", "output_id", "input_devices", "auto_start_on_display", "default_app", "default_user"}

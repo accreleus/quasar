@@ -17,14 +17,13 @@ func (h *Handler) handleIdleApply(w http.ResponseWriter, r *http.Request) {
 		Group string `json:"group"`
 		ApprovalReview
 	}
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid idle approval")
 		return
 	}
-	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid idle approval")
 		return
 	}
