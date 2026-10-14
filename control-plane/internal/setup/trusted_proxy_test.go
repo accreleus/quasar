@@ -18,10 +18,11 @@ func mustCIDR(t *testing.T, cidr string) *net.IPNet {
 }
 
 // claimFrom drives one setup claim with an explicit peer address and forwarded
-// chain, which is the only thing that varies across these tests.
+// chain, which is the only thing that varies across these tests. Over TLS, so
+// the transport gate (transport_test.go) stays out of the limiter's way.
 func claimFrom(t *testing.T, svc *Service, peer, xff, token string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/setup/claim", strings.NewReader(goodBody))
+	req := httptest.NewRequest(http.MethodPost, "https://quasar.test/v1/setup/claim", strings.NewReader(goodBody))
 	req.RemoteAddr = peer
 	if xff != "" {
 		req.Header.Set("X-Forwarded-For", xff)

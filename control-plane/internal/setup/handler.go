@@ -58,6 +58,9 @@ type Service struct {
 	// failures bounds repeated rejected claims per source IP (finding 6). See
 	// handleClaim for why this cannot become a wrong-vs-missing oracle.
 	failures *ratelimit.FailureLimiter
+	// refusals bounds the WARN for a claim refused over plain HTTP. Never
+	// failures itself: plaintext tries must not 429 the operator's HTTPS claim.
+	refusals *ratelimit.FailureLimiter
 
 	// trustedProxies is the #438 trusted-proxy policy. nil means "key on the
 	// direct peer" — correct for a direct-LAN deployment; the hardened overlay
@@ -68,6 +71,8 @@ type Service struct {
 // WithTrustedProxies configures which direct peers' X-Forwarded-For may be
 // believed (#438). Without it, every client behind the hardened Caddy overlay
 // shares one claim budget and an attacker can lock the operator out of setup.
+// It is also whose X-Forwarded-Proto the claim believes: a claim forwarded over
+// plain HTTP by any other peer is refused.
 func (s *Service) WithTrustedProxies(nets []*net.IPNet) *Service {
 	s.trustedProxies = nets
 	return s
@@ -84,6 +89,7 @@ func NewService(claimer Claimer, state StateReader, secret string, log *slog.Log
 		secret:       secret,
 		secretDigest: sha256.Sum256([]byte(secret)),
 		failures:     ratelimit.NewFailureLimiter(claimFailureLimit, claimFailureTTL, claimFailureMaxIPs),
+		refusals:     ratelimit.NewFailureLimiter(claimFailureLimit, claimFailureTTL, claimFailureMaxIPs),
 	}
 }
 
@@ -152,12 +158,23 @@ type claimResponse struct {
 }
 
 // handleClaim serves POST /v1/setup/claim. Fail-closed, in order:
-//  1. token check FIRST, before the body is even read; every rejection produces
+//  0. transport: plain HTTP is refused before the token is looked at (#593),
+//     logged at WARN within a per-source bound. No loopback exception: this
+//     route is production surface.
+//  1. token check, before the body is even read; every rejection produces
 //     the identical 401 envelope with no missing-vs-wrong distinction, and the
 //     rejection is logged at WARN with the source address.
 //  2. body decode / password strength → 400 validation_failed.
 //  3. admin-exists gate (inside the advisory-locked claim tx) → 409.
 func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
+	if httpx.RefuseInsecure(w, r, s.trustedProxies, false) {
+		if ip := ratelimit.ClientIP(r, s.trustedProxies); s.refusals.Allow(ip) {
+			s.refusals.Failure(ip)
+			s.log.Warn("setup claim: refused over plain HTTP", "remote_addr", ip)
+		}
+		return
+	}
+
 	// Rate gate (finding 6), before the token compare and any logging. Reserve
 	// (not Allow) makes admission and in-flight accounting one atomic operation,
 	// same pattern as the signaling and enrollment limiters. Not a

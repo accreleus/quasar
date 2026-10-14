@@ -1286,7 +1286,7 @@ case "$verdict" in
     summary
     exit 0 ;;
   live)
-    refused "the control plane refused the enrollment: a live agent is already registered as '$shown_name'. Stop that agent, or create a command with another node name." ;;
+    refused "the control plane refused the enrollment: a live agent is already registered as '$shown_name'. Stop that agent, or create a command with another node name. If that machine is gone, forget the host first with the admin API (DELETE /v1/hosts/{id}); that deletes its history and tombstones its homes." ;;
   auth_failed)
     refused "the control plane refused the enrollment string (auth_failed): it has expired, was already used, or was created for a different node name than '$shown_name'." ;;
   pin_mismatch)

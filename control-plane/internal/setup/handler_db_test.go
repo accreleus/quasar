@@ -83,7 +83,8 @@ func newDBHarness(t *testing.T, token string) *dbHarness {
 	mux.Handle("GET /v1/admin/probe", admin(
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })))
 
-	srv := httptest.NewServer(mux)
+	// TLS, as on the HTTPS listener: the claim is refused over plain HTTP.
+	srv := httptest.NewTLSServer(mux)
 	t.Cleanup(srv.Close)
 	return &dbHarness{pool: pool, setupS: setupS, authSvc: authSvc, srv: srv, token: token}
 }
@@ -98,7 +99,7 @@ func (h *dbHarness) claim(t *testing.T, token, body string) *http.Response {
 	if token != "" {
 		req.Header.Set(TokenHeader, token)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := h.srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +108,7 @@ func (h *dbHarness) claim(t *testing.T, token, body string) *http.Response {
 
 func (h *dbHarness) status(t *testing.T) statusResponse {
 	t.Helper()
-	res, err := http.Get(h.srv.URL + "/v1/setup/status")
+	res, err := h.srv.Client().Get(h.srv.URL + "/v1/setup/status")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +187,7 @@ func TestClaimTokenClearsRealAdminGate(t *testing.T) {
 	// The claim token must pass the real admin gate.
 	req, _ := http.NewRequest(http.MethodGet, h.srv.URL+"/v1/admin/probe", nil)
 	req.Header.Set("Authorization", "Bearer "+body.AccessToken)
-	probe, err := http.DefaultClient.Do(req)
+	probe, err := h.srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +231,7 @@ func (h *dbHarness) completeAs(t *testing.T, bearer string) (int, string) {
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := h.srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

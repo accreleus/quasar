@@ -35,7 +35,9 @@ operator from ever creating the first admin. Set it to the **/16 this compose pr
 allocates** — read it off `docker network inspect <project>_default`, e.g. `172.18.0.0/16` — and each
 client is limited on the address Caddy actually saw. Do not use the enclosing `172.16.0.0/12`: it
 spans every Docker bridge on the box, including the default bridge and the host gateway. Leaving it unset is safe but coarse — the
-header is never read, so nobody can spoof a limiter key. Never name a network you do not operate.
+header is never read, so nobody can spoof a limiter key. Unset, the control plane does not believe
+Caddy's `X-Forwarded-Proto` either, so the first-run claim through Caddy is refused: set it, or
+provision the admin with the bootstrap secrets. Never name a network you do not operate.
 `deploy/Caddyfile.hardened` overwrites `X-Forwarded-For` with the address Caddy saw and strips any
 inbound `X-Real-IP`, so a client-supplied chain cannot survive the edge. Full semantics:
 `docs/configuration.md`.
