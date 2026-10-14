@@ -60,4 +60,8 @@ describe("QuasarSession.hasAbsCaptureTimeExtension (#610)", () => {
   it("answers false, not a throw, when the browser reports no headerExtensions", () => {
     expect(probe({ codecs: [] })).toBe(false);
   });
+
+  it("answers false when getParameters returns nothing", () => {
+    expect(probe(undefined)).toBe(false);
+  });
 });
