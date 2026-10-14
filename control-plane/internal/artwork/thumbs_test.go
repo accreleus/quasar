@@ -1,7 +1,10 @@
 package artwork
 
 import (
+	"bytes"
 	"context"
+	"image"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -106,5 +109,28 @@ func TestInlineSearchThumbsIsBestEffort(t *testing.T) {
 	}
 	if cands[1].ThumbURL != "" || cands[2].ThumbURL != "" {
 		t.Fatalf("failed/absent thumbs must drop to empty: %+v", cands[1:])
+	}
+}
+
+// A preview is decoded by the admin's browser, so it gets the same type and
+// pixel limits as a stored image (#623).
+func TestInlineThumbRefusesOversizedAndUnstoredTypes(t *testing.T) {
+	allowTestHost(t)
+	var bomb bytes.Buffer
+	if err := png.Encode(&bomb, image.NewGray(image.Rect(0, 0, 5000, 5000))); err != nil {
+		t.Fatal(err)
+	}
+	// GIF89a, 65535x65535 logical screen: sniffed image/gif, a type Put refuses.
+	gif := append([]byte("GIF89a\xff\xff\xff\xff\x00\x00\x00"), 0x3b)
+	for name, body := range map[string][]byte{"png over the pixel cap": bomb.Bytes(), "gif": gif} {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(body)
+		}))
+		f := unguardedFetcher(t, 1<<20)
+		f.client = srv.Client()
+		if got := inlineThumb(context.Background(), f, srv.URL); got != "" {
+			t.Errorf("%s: want the thumb dropped, got %.60q", name, got)
+		}
+		srv.Close()
 	}
 }

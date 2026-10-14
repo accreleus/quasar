@@ -151,7 +151,7 @@ func (f *Fetcher) GetOnHosts(ctx context.Context, rawURL string, allow func(host
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("%w: %w", ErrFetchFailed, redactURLError(err))
 	}
 	req.Header.Set("Accept", "image/jpeg,image/png,image/webp")
 	req.Header.Set("User-Agent", userAgent)

@@ -148,8 +148,8 @@ func (b *BlobStore) Put(declaredType string, data []byte) (string, error) {
 
 // maxImagePixels caps width x height of a stored image. Byte size is no bound
 // on decoded size (a tiny PNG can declare a billion pixels), and the browser
-// decodes every tile it shows. 16 MP is 4x the largest crop the provider
-// queries ask for (3840x1240) and holds a 4K upload (3840x2160).
+// decodes every tile it shows. 16 MP is about 3.5x the largest crop the
+// provider queries ask for (3840x1240) and holds a 4K upload (3840x2160).
 const maxImagePixels = 16 << 20
 
 // checkDimensions reads only the image header and refuses an image whose
