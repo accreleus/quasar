@@ -67,7 +67,8 @@ func TestNoHostAvailable_Offline(t *testing.T) {
 }
 
 // TestNoHostAvailable_RecordedDisconnect: a recorded agent disconnect keeps a
-// host out of placement even while its status still reads online (#626).
+// host out of placement even while its status still reads online, and out of
+// the refusal's online count (#626).
 func TestNoHostAvailable_RecordedDisconnect(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
@@ -77,8 +78,13 @@ func TestNoHostAvailable_RecordedDisconnect(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET agent_disconnected_at=now() WHERE id::text=$1`, s.hostID); err != nil {
 		t.Fatalf("record disconnect: %v", err)
 	}
-	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); !errors.Is(err, ErrNoHostAvailable) {
-		t.Fatalf("disconnected-host launch: got %v want ErrNoHostAvailable", err)
+	_, err := store.ScheduleAndCreate(ctx, launchParams(s))
+	var rej *NoHostRejection
+	if !errors.Is(err, ErrNoHostAvailable) || !errors.As(err, &rej) {
+		t.Fatalf("disconnected-host launch: got %v want a NoHostRejection", err)
+	}
+	if rej.OnlineHosts != 0 {
+		t.Fatalf("the refusal counted the disconnected host online: %v", rej)
 	}
 }
 
