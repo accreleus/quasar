@@ -1523,8 +1523,8 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			// so this adds a case rather than changing one.
 			h.writeError(conn, "auth_failed",
 				"a live agent is already registered under this node name; stop it before re-enrolling, "+
-					"or enroll under a different node_name. If that machine is gone, delete the host in "+
-					"the console first.")
+					"or enroll under a different node_name. If that machine is gone, forget the host first "+
+					"with the admin API (DELETE /v1/hosts/{id}); that deletes its history and tombstones its homes.")
 		case errors.Is(err, ErrHostAlreadyEnrolled):
 			h.writeError(conn, "auth_failed",
 				"this node name is already enrolled; re-enrolling it needs an enrollment token "+
