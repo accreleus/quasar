@@ -400,8 +400,8 @@ const RAF_CAP_TOLERANCE_HZ = 5;
  * browser's cap, not the display's rate (#632). Reporting it makes the control
  * plane read a ProMotion screen as "slower than this frame rate"; leaving it out
  * says "unknown", which is true. A real 60 Hz Safari screen is unknown too: the
- * two cannot be told apart from here, and unknown never recommends a 120 fps
- * profile (eligibility.go: a DisplayRequired profile is risky, not recommended).
+ * two cannot be told apart from here, and the control plane treats a Safari
+ * screen with no rate as high-refresh (control-api.md amendment 34).
  */
 export function displayRefreshToReport(measuredHz: number | null, browserName: string): number | null {
   if (measuredHz == null) return null;

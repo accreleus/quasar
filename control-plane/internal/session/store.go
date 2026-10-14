@@ -1204,6 +1204,7 @@ type DeviceProbe struct {
 	RTTMs            int32
 	MaxDecodeHeight  int32
 	DisplayRefreshHz float64
+	BrowserName      string // capabilities.browser.name; feeds profile eligibility only
 	// ClientType is the native-client identity tag (capabilities.client_type),
 	// "" for the web probe. Never an eligibility gate for the tier ladder; read
 	// only by nativeHighEligible.
@@ -1230,6 +1231,9 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 		Display         struct {
 			RefreshHz *float64 `json:"refresh_hz"`
 		} `json:"display"`
+		Browser struct {
+			Name string `json:"name"`
+		} `json:"browser"`
 		// Optional native-client fields; the web probe omits them. Parsed
 		// leniently: any absent or odd shape yields the zero value, not an error.
 		ClientType string `json:"client_type"`
@@ -1283,6 +1287,7 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 	}
 	// client_type and the H.264 decode profiles, for native-high eligibility only.
 	// Never affects freshness or the tier gate above.
+	p.BrowserName = caps.Browser.Name
 	p.ClientType = caps.ClientType
 	p.H264DecodeProfiles = caps.Decode.H264.Profiles
 	p.HEVC = caps.Codecs.HEVC

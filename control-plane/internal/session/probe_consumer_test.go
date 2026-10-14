@@ -364,3 +364,16 @@ func unboundProbe(store *Store, ctx context.Context, userID string) (*DeviceProb
 	scope, err := store.ResolveDeviceScope(ctx, userID, "", scopeSiteProfiles)
 	return scope.Probe, err
 }
+
+// TestParseDeviceProbeReadsBrowserName: browser.name reaches eligibility (amendment 34).
+func TestParseDeviceProbeReadsBrowserName(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	caps, _ := json.Marshal(map[string]any{"browser": map[string]any{"name": "Safari", "version": "18.0"}, "measured_at": now})
+	if dp := parseDeviceProbe(caps); dp == nil || dp.BrowserName != "Safari" {
+		t.Fatalf("parseDeviceProbe = %+v, want BrowserName Safari", dp)
+	}
+	caps, _ = json.Marshal(map[string]any{"measured_at": now})
+	if dp := parseDeviceProbe(caps); dp == nil || dp.BrowserName != "" {
+		t.Fatalf("parseDeviceProbe without browser = %+v, want BrowserName empty", dp)
+	}
+}
