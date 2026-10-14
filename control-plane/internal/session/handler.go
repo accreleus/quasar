@@ -521,7 +521,7 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	// semantics: control-api.md §Admission control
 	case errors.Is(err, ErrNoHostAvailable):
 		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
-			refusalMessage(err, "no host is available to serve this launch",
+			refusalMessage(err, noHostMessage(err),
 				"no host has a GPU that can encode %s"))
 		return
 	// Names no check, scope, GPU or host: readiness detail is admin-only and

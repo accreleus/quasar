@@ -69,6 +69,9 @@ type CreateParams struct {
 	// PinHostID restricts the scheduler to one host's GPUs. Placement policy and
 	// capacity within it are unchanged.
 	PinHostID string
+	// homePinned: PinHostID is the host that already holds this user's managed
+	// home (scheduleAttempt), not a caller's pin. Set by the scheduler only.
+	homePinned bool
 	// PinGPUIndex narrows PinHostID to one GPU (the cert bench); ignored without
 	// a host pin, since an index is per host.
 	PinGPUIndex *int32
@@ -315,6 +318,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 				return Session{}, false, ErrHomeConflict
 			}
 			p.PinHostID = owner
+			p.homePinned = true
 		}
 	}
 
@@ -560,7 +564,18 @@ func classifyRejectPlain(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 		return fmt.Errorf("classify rejection: %w", err)
 	}
 	if !totalsFit {
-		return noHostRejection(ctx, tx, cand.p.AppImage)
+		rej := noHostRejection(ctx, tx, cand.p.AppImage)
+		if cand.p.homePinned {
+			// Only a host that is gone or offline: a draining one is connected and
+			// comes back by itself, so it keeps the generic text.
+			var connected bool
+			err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM hosts WHERE id = $1::uuid AND status <> 'offline')`,
+				cand.p.PinHostID).Scan(&connected)
+			if err == nil && !connected {
+				return &HomeHostOfflineRejection{err: rej}
+			}
+		}
+		return rej
 	}
 	// Readiness is diagnosed here, in the position of the veto diagnostic and
 	// never inside totalsQuery, and only claims the refusal when it is the sole
@@ -617,6 +632,19 @@ func (e *NoHostRejection) Error() string {
 }
 
 func (e *NoHostRejection) Unwrap() error { return e.err }
+
+// HomeHostOfflineRejection marks a no_host_available refusal whose cause is that
+// the user's managed home is claimed by a host that is offline or gone (a host that
+// was never enrolled again after a restore reads the same). It unwraps to the
+// plain rejection, so errors.Is and the fleet-count log are unchanged; only the
+// response text differs. It names no host.
+type HomeHostOfflineRejection struct{ err error }
+
+func (e *HomeHostOfflineRejection) Error() string {
+	return fmt.Sprintf("%v (the host that holds the user's home is not online)", e.err)
+}
+
+func (e *HomeHostOfflineRejection) Unwrap() error { return e.err }
 
 // noHostRejection attaches fleet counts to ErrNoHostAvailable so the launcher
 // can log why nothing fit. Fail-open on its own query failure: a wrong log

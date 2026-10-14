@@ -143,7 +143,7 @@ func TestEnrollmentCannotTakeOverAConnectedHost(t *testing.T) {
 	}
 
 	// And the incumbent's secret is untouched — the refusal must not have rotated it.
-	res, err := st.reconnectHost(ctx, "contested", "0.1.0", first.NodeSecret)
+	res, err := st.reconnectHost(ctx, "contested", "0.1.0", nil, first.NodeSecret)
 	if err != nil {
 		t.Fatalf("incumbent reconnect after a refused takeover: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestUnboundTokenCannotBecomeAnExistingHost(t *testing.T) {
 	if n := usedCount(t, pool, row.ID); n != 0 {
 		t.Fatalf("a refused takeover spent the token: used_count = %d", n)
 	}
-	if _, err := st.reconnectHost(ctx, "victim", "0.1.0", victim.NodeSecret); err != nil {
+	if _, err := st.reconnectHost(ctx, "victim", "0.1.0", nil, victim.NodeSecret); err != nil {
 		t.Fatalf("the host's own secret must survive a refused takeover: %v", err)
 	}
 	if err := st.markOffline(ctx, victim.HostID); err != nil {

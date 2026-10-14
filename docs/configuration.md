@@ -101,7 +101,7 @@ then arrive as files.
 | `QUASAR_JOBS_TICK_SECS` | `10` | How often the dispatcher materializes due runs, claims control-plane runs, reaps abandoned claims and prunes history. Lower bounds manual-trigger latency for control-plane jobs; agent-plane latency is bounded by `QUASAR_JOB_POLL_SECS` on the agent instead. Any positive integer; an invalid value fails startup. |
 | `QUASAR_JOBS_TIMEZONE` | `UTC` | IANA timezone used as the seed default for a newly registered job's run window (`jobs.timezone`). Per-job values are admin-editable afterwards and this variable is never re-applied to an existing row. Set it to the site's zone so that "02:00-06:00" means what an operator means by it. An unknown zone name fails startup. |
 | `QUASAR_JOBS_RUN_RETENTION` | `50` | Per-job run-history cap. Rows beyond this per (job, host) are pruned by the dispatcher. Also the per-job default for `jobs.history_limit`, which an admin may raise to 500 for a job under investigation. |
-| `QUASAR_JOBS_RUN_RETENTION_DAYS` | `30` | Age cap on run history, applied in addition to the row cap: a run older than this is pruned even if the job is below its row cap. `0` disables the age rule. |
+| `QUASAR_JOBS_RUN_RETENTION_DAYS` | `30` | Age cap on run history, applied in addition to the row cap: a run older than this is pruned even if the job is below its row cap. The newest finished run of each job and target is kept whatever its age: it is what the schedule measures from. `0` disables the age rule. |
 | `QUASAR_JOBS_CLAIM_TIMEOUT_SECS` | `3600` | How long a claimed (running) run may go without a report before the dispatcher marks it `aborted` and re-materializes. Covers an agent that died mid-run. Must exceed the longest expected job; the #488 warm-up's own bound is `QUASAR_TEMPLATE_WARMUP_TIMEOUT_SECS` (600), so the default has 6× headroom. |
 | `QUASAR_TELEMETRY_ROLLING_WINDOW` | `1h` | **Session-telemetry retention, rule 1.** While a session is **non-terminal**, its `session_metrics` samples and `session_trace_events` older than this are swept — the bound on a long-lived session. Any positive Go duration; `0`, a negative value, or an unparseable one **fails startup** (unbounded telemetry is not an option an operator gets by typo). Measured against the server-side `created_at` (the ingestion clock), never a reporter's `ts_unix_ms`, so a skewed reporter clock cannot evade the cap. Distinct from the *read* window an admin trace/bundle request asks for (2-10 min, `contract-amendment.md`): that is what a caller wants to see, this is what the server still has. |
 | `QUASAR_TELEMETRY_POSTMORTEM_RETENTION` | `24h` | **Session-telemetry retention, rule 2.** When a session reaches a terminal state its telemetry is **frozen, not deleted** — the rolling window stops being applied to it — and kept for this long so `GET .../verdict` and `GET .../diagnostic-bundle` (and `make session-verdict` / `make session-bundle`) still answer on a session that failed hours ago. After it expires the session's samples, its non-capture events, and its `session_trace_clock` row are swept. **Must be >= `QUASAR_TELEMETRY_ROLLING_WINDOW`**, validated at boot: a post-mortem shorter than the window it preserves would delete the evidence it exists to keep. Capture results (`diag.*`) are exempt from this rule and from the rolling window — they leave only with the session row's `ON DELETE CASCADE`. |
@@ -892,11 +892,15 @@ Mutation intents are synced under `<NODE_SECRET_PATH>.runtime-images` before an
 engine mutation. Keep this directory with the node's persistent identity. Each
 reference has a persistent lock file and, while uncertain, a JSON intent containing
 the reference, engine socket and original removal ID. Transport loss, a deadline
-or an ambiguous engine failure leaves the intent intact. On retry, a present image
-resolves an uncertain pull; an absent reference resolves an uncertain removal.
-An absent image alone cannot establish that an old pull has stopped, and a changed
-removal target cannot authorize deleting its replacement. Those cases fail with
-`image operation outcome unknown` instead of repeating the mutation.
+or an ambiguous engine failure leaves the intent intact. The lock is held for an
+operation's whole life, so the next operation on that reference, in this agent or
+the one that replaces it, finds an intent only when nothing drives it any more. It
+retires an interrupted pull, reusing a present image and pulling only when the tag
+is absent, and settles an interrupted build against the engine (below). An absent
+reference resolves an uncertain removal. A removal whose reference is still present
+is not repeated, because a changed target cannot authorize deleting its
+replacement, and neither is a removal or build recorded against another engine
+socket: those fail with `image operation outcome unknown`.
 
 Installation metadata, image environment, engine storage information and live
 container mounts are read through the same runtime API. Quasar does not infer a Compose
@@ -957,18 +961,22 @@ including credential-store enumeration, are supplied for private base images.
 A build becomes ready only when inspection confirms the unique
 `io.quasar.build-operation` label written by that request. The intent also records
 a fingerprint of the packaged context, Dockerfile, tag and build arguments. After
-an interrupted response, the matching label proves completion; a matching request
-fingerprint reuses that result. An old image or an absent tag cannot prove that the
-build finished, so neither authorizes retrying an uncertain mutation. A definitive
-build failure clears its intent and permits a corrected retry. Deadline expiry or
-observer cancellation does not promise daemon rollback or intermediate cleanup.
+an interrupted build (a replaced agent, a broken response, a spent deadline) the
+next operation on that tag settles the intent. The matching label proves
+completion, and a matching request fingerprint reuses that result. An old image or
+an absent tag proves nothing, so the intent is retired and the next build builds
+the image again; the classic builder stops a build whose client has gone. A
+definitive build failure clears its intent and permits a corrected retry. Deadline
+expiry or observer cancellation does not promise daemon rollback or intermediate
+cleanup.
 
-If observation cannot resolve an intent, an operator must confirm that the old
-engine operation has finished before clearing that specific JSON intent with the
-agent stopped. Do not remove the `.lock` files or clear the entire directory while
-work might still be active. A daemon restart is one way to establish that no old
-request remains; it is not performed automatically. This conservative recovery
-path preserves uncertainty across agent restarts without adding a compose setting.
+If observation cannot resolve a removal intent, or one recorded against another
+engine socket, an operator must confirm that the old engine operation has finished
+before clearing that specific JSON intent with the agent stopped. Do not remove the
+`.lock` files or clear the entire directory while work might still be active. A
+daemon restart is one way to establish that no old request remains; it is not
+performed automatically. This conservative recovery path preserves uncertainty
+across agent restarts without adding a compose setting.
 
 ### Runtime endpoint, migration and recovery
 

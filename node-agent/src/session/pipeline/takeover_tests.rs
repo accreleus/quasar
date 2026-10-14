@@ -137,6 +137,7 @@ impl Host {
     }
 
     fn start_cfg(tag: &str, mut cfg: SessionConfig) -> Host {
+        trace_to_stderr();
         let resolved = resolve_effective_encoder(&mut cfg).expect("resolve encoder");
         let sink = format!("takeover-{tag}-{}", std::process::id());
         let source = build_source_pipeline(&cfg, None, &sink).expect("source pipeline");
@@ -625,12 +626,58 @@ fn pump_with(
     }
 }
 
-/// Agent log lines on stderr, for the browser host.
+/// Every WARN and ERROR line this process logged, as `field=value ` pairs.
+static WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+struct WarningLog;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningLog {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Line(String);
+        impl tracing::field::Visit for Line {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0 += &format!("{}={value:?} ", field.name());
+            }
+        }
+        if *event.metadata().level() <= tracing::Level::WARN {
+            let mut line = Line(String::new());
+            event.record(&mut line);
+            WARNINGS.lock().unwrap().push(line.0);
+        }
+    }
+}
+
+/// Agent log lines on stderr, for the browser host, and its warnings kept in
+/// [`WARNINGS`]. Process-wide: `webrtcbin`'s threads carry no span, so a subscriber set
+/// for the test's thread never sees what they log.
 fn trace_to_stderr() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_env_filter("quasar_node_agent=info")
+    use tracing_subscriber::prelude::*;
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_test_writer()
+                .with_filter(tracing_subscriber::EnvFilter::new("quasar_node_agent=info")),
+        )
+        .with(WarningLog)
         .try_init();
+}
+
+/// The PCs of session `tag` that warned their peer failed the fingerprint check, one
+/// entry per line logged.
+fn fingerprint_warnings(tag: &str) -> Vec<&'static str> {
+    let session = format!("session_id=takeover-{tag} ");
+    let lines = WARNINGS.lock().unwrap();
+    let said = |pc: &str| {
+        lines
+            .iter()
+            .filter(|l| l.contains(r#"token="transport-peer-fingerprint-mismatch""#))
+            .filter(|l| l.contains(&session) && l.contains(&format!("{pc} PC:")))
+            .count()
+    };
+    ["video", "audio"]
+        .into_iter()
+        .flat_map(|pc| std::iter::repeat_n(pc, said(pc)))
+        .collect()
 }
 
 /// The first value of an SDP attribute or line prefix.
@@ -813,6 +860,11 @@ fn a_takeover_mid_stream_moves_the_stream_to_the_new_peer() {
         "the stream stopped when the displaced peer left"
     );
     assert_eq!(host.bus_errors, Vec::<String>::new());
+    assert_eq!(
+        fingerprint_warnings("midstream"),
+        Vec::<&str>::new(),
+        "neither honest peer failed the fingerprint check"
+    );
 }
 
 /// The first page answered but its transport never connected (its loader is still up),
@@ -1272,6 +1324,7 @@ fn a_takeover_by_a_peer_with_its_own_certificate_reaches_the_host() {
         "a peer with a certificate of its own, truthfully advertised, is not heard"
     );
     assert_eq!(host.bus_errors, Vec::<String>::new());
+    assert_eq!(fingerprint_warnings("own-cert"), Vec::<&str>::new());
 }
 
 /// The host checks an answer's `a=fingerprint` against the certificate the peer presents
@@ -1295,6 +1348,10 @@ fn a_peer_whose_fingerprint_is_not_its_certificates_gets_video_and_no_input_chan
         "outbound media must not wait on the fingerprint: {}",
         describe(&peer)
     );
+    let reported = pump(&mut host, &mut peer, Duration::from_secs(20), |_, _| {
+        fingerprint_warnings("forged").len() >= 2
+    });
+    assert!(reported, "no warning: {}", describe(&peer));
     assert!(
         !input_reaches_host(&mut host, &mut peer),
         "the host heard a peer whose answer names a certificate it did not present"
@@ -1303,6 +1360,42 @@ fn a_peer_whose_fingerprint_is_not_its_certificates_gets_video_and_no_input_chan
         peer.video.channel.lock().unwrap().is_none(),
         "the input channel opened to a peer whose answer names a certificate it did not present"
     );
+    assert_eq!(
+        fingerprint_warnings("forged"),
+        ["video", "audio"],
+        "each transport says once that its peer failed the check"
+    );
+}
+
+/// A transport built for a takeover reports a failed check as the launch one does, and
+/// the honest peer it displaced was never reported (#577).
+#[test]
+fn a_takeover_by_a_peer_that_fails_the_fingerprint_check_is_reported() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("forged-takeover");
+    let _a = first_attach(&mut host);
+
+    host.munge_answer = Some(with_another_certificate);
+    request_offers(&mut host);
+    let mut b = Peer::new();
+    let reported = pump(&mut host, &mut b, Duration::from_secs(20), |_, _| {
+        fingerprint_warnings("forged-takeover").len() >= 2
+    });
+    assert!(reported, "no warning: {}", describe(&b));
+    pump(&mut host, &mut b, Duration::from_secs(1), |_, _| false);
+
+    let mut replaced = host.replaced.clone();
+    replaced.sort_by_key(|pc| *pc as usize);
+    assert_eq!(replaced, [PcId::Video, PcId::Audio]);
+    assert_eq!(
+        fingerprint_warnings("forged-takeover"),
+        ["video", "audio"],
+        "each replacement transport says once that its peer failed the check"
+    );
+    assert_eq!(host.bus_errors, Vec::<String>::new());
 }
 
 /// An answer naming a certificate nobody holds. With no peer behind it, it stands for
@@ -1414,6 +1507,160 @@ fn a_new_transport_nobody_answers_does_not_hold_the_source() {
     assert!(
         stops_within(&host.source, Duration::from_secs(2)),
         "the source did not stop behind a transport nobody answered"
+    );
+}
+
+/// The session's audio capture, once it runs.
+fn audio_capture(host: &Host) -> gst::Element {
+    let capture = host
+        .transports
+        .audio_pipeline
+        .as_ref()
+        .expect("audio pipeline")
+        .iterate_elements()
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|e| e.factory().is_some_and(|f| f.name() == "audiotestsrc"))
+        .expect("the audio capture");
+    let (_, state, _) = capture.state(gst::ClockTime::from_seconds(5));
+    assert_eq!(state, gst::State::Playing, "the audio capture never ran");
+    capture
+}
+
+/// What `pulsesrc` posts when its server goes away under it.
+fn sound_server_lost(capture: &gst::Element) {
+    gst::element_error!(
+        capture,
+        gst::ResourceError::Failed,
+        ("Disconnected: Connection terminated")
+    );
+}
+
+/// What `f` logs on this thread. The audio bus handler logs on the thread that posts.
+fn logged(f: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Lines(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let lines = Lines::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = lines.0.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The session's sound server as its end sees it. Nothing here can count on a
+/// PulseAudio-protocol server, so this one keeps what it found when it was stopped, and a
+/// capture still running then reports the loss as `pulsesrc` does.
+struct SoundServer {
+    capture: gst::Element,
+    /// The capture's state, and whether the audio bus still took a message.
+    at_stop: Arc<Mutex<Option<(gst::State, bool)>>>,
+}
+
+impl crate::session::teardown::Sidecar for SoundServer {
+    fn server_uri(&self) -> String {
+        "unix:/nonexistent/native".into()
+    }
+    fn socket_dir(&self) -> std::path::PathBuf {
+        "/nonexistent".into()
+    }
+    fn adopt_budget(&mut self, _: crate::session::teardown::RetryBudget) {}
+    fn stop(&mut self) {
+        let mut seen = self.at_stop.lock().unwrap();
+        if seen.is_some() {
+            return;
+        }
+        let state = self.capture.current_state();
+        // A flushing bus refuses a post. This message is no warning or error, so the
+        // handler drops it unlogged: its 60 s rate limit, which can hide the error below
+        // on a bus that does report, has no part in the answer.
+        let probe = gst::message::Application::new(gst::Structure::new_empty("probe"));
+        let reporting = self
+            .capture
+            .parent()
+            .and_downcast::<gst::Pipeline>()
+            .and_then(|audio| audio.bus())
+            .is_some_and(|bus| bus.post(probe).is_ok());
+        *seen = Some((state, reporting));
+        if matches!(state, gst::State::Paused | gst::State::Playing) {
+            sound_server_lost(&self.capture);
+        }
+    }
+}
+
+/// #588: every session end stops the sound server under a capture that is still PLAYING
+/// (`session::teardown`, "Audio ordering"), and the capture's report of that read as an
+/// audio fault.
+#[test]
+fn a_session_end_does_not_report_its_sound_server_stopping() {
+    use crate::session::source::{AppSource, SessionResources};
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("audio-end");
+    let at_stop = Arc::new(Mutex::new(None));
+    let res = SessionResources::with_sidecar(
+        "takeover-audio-end",
+        Box::new(SoundServer {
+            capture: audio_capture(&host),
+            at_stop: at_stop.clone(),
+        }),
+    );
+    let sink = format!("takeover-audio-end-app-{}", std::process::id());
+    let mut source = AppSource::new(&host.cfg, "takeover-audio-end", &sink, &sink, &res, None)
+        .expect("app source");
+
+    let log = logged(|| crate::session::runner::stop_source(&mut source, &host.transports));
+
+    // Read out first: a failed assertion that held this lock would poison it for the
+    // stops the session's destructors still make.
+    let at_stop = *at_stop.lock().unwrap();
+    assert!(
+        !log.contains("audio-pipeline-message"),
+        "the session end logged an audio fault:\n{log}"
+    );
+    // The log alone could be quiet for another reason: the handler's rate limit, had
+    // this pipeline logged anything in the minute before.
+    assert_eq!(
+        at_stop,
+        Some((gst::State::Playing, false)),
+        "when the sound server was stopped (capture state, audio bus still reporting): \
+         the capture is still up, because taking it down first waits on that server, and \
+         its bus reports nothing any more"
+    );
+}
+
+/// The report itself is as it was: a sound server lost under a live session (#392, #351)
+/// still reads as one.
+#[test]
+fn a_sound_server_lost_under_a_live_session_is_still_reported() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("audio-lost");
+    let capture = audio_capture(&host);
+
+    let log = logged(|| sound_server_lost(&capture));
+
+    assert!(
+        log.contains("WARN")
+            && log.contains("audio-pipeline-message")
+            && log.contains("Disconnected: Connection terminated"),
+        "a sound server lost under a live session was not reported:\n{log}"
     );
 }
 
