@@ -39,7 +39,7 @@ type agentStore struct {
 	// PROCESS. A func rather than the Registry itself, so the store stays testable
 	// without one. It is only half the liveness answer: another replica's connection is
 	// invisible here, which is why enrollHost also reads the host row's own status (see
-	// hostIsLiveSQL). Nil is treated as "no local connections".
+	// admission.HostIsLiveSQL). Nil is treated as "no local connections".
 	isAgentConnected func(hostID string) bool
 	// redeemEnrollment consumes a minted token inside the caller's transaction. Injected
 	// so agentws does not import hostenroll (and so tests can supply a stub). Nil means
@@ -144,7 +144,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	var existingID string
 	var dbLive bool
 	err = tx.QueryRow(ctx,
-		`SELECT id::text, `+hostIsLiveSQL+` FROM hosts WHERE node_name = $1 FOR UPDATE`,
+		`SELECT id::text, `+admission.HostIsLiveSQL+` FROM hosts WHERE node_name = $1 FOR UPDATE`,
 		nodeName).Scan(&existingID, &dbLive)
 	switch {
 	case err == nil:
@@ -247,17 +247,6 @@ func releaseRemovalDrain(ctx context.Context, tx pgx.Tx, hostID string) error {
 	}
 	return nil
 }
-
-// hostIsLiveSQL is the DB half of the #96 takeover guard: the registry only sees THIS
-// process, and nothing between a control-plane restart and the agent's reconnect. A
-// register writes registerStatusSQL (never offline) and clears agent_disconnected_at;
-// markOffline stamps it. Must not narrow to 'online': a drained host is still connected,
-// and every boot drains every typed-settings host (#596).
-//
-// Fail-closed: a control-plane stop never stamps, so a host whose agent never returns
-// reads as live until its row is deleted (an uncordon leaves the boot's reconciliation
-// hold). Guarded by TestAfterAControlPlaneRestartAHostRefusesReEnrollmentUntilItIsDeleted.
-const hostIsLiveSQL = `(status <> 'offline' AND agent_disconnected_at IS NULL)`
 
 // reconnectHost verifies the node_secret and marks the host online.
 func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion string, sourceCommit *string, nodeSecret string) (registerResult, error) {
@@ -709,7 +698,7 @@ func (s *agentStore) updateHeartbeat(ctx context.Context, hostID string) error {
 func (s *agentStore) markLive(ctx context.Context, hostID string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE hosts SET status=`+registerStatusSQL+`, agent_disconnected_at=NULL
-		WHERE id=$1 AND NOT `+hostIsLiveSQL+`
+		WHERE id=$1 AND NOT `+admission.HostIsLiveSQL+`
 	`, hostID)
 	if err != nil {
 		return fmt.Errorf("mark live: %w", err)
