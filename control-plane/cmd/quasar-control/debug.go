@@ -87,7 +87,9 @@ func isLoopbackHost(hostport string) bool {
 		return true
 	}
 	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	// An IPv6 literal carrying an IPv4 address ([::ffff:127.0.0.1]) is loopback to
+	// Go but not to a browser, which then sends no Sec-Fetch-Site: refuse it.
+	return ip != nil && ip.IsLoopback() && !(strings.Contains(host, ":") && ip.To4() != nil)
 }
 
 // mutexProfileHandler arms or disarms mutex profiling.

@@ -269,6 +269,8 @@ func TestDebugServerRefusesBrowserRequests(t *testing.T) {
 		{"navigation GET", "GET", "/debug/quasar/runtime", "localhost:6060", "", []string{"none", "navigate", "document"}, 403},
 		{"form POST without Origin", "POST", "/debug/quasar/mutexprofile?fraction=1", "127.0.0.1:6060", "", []string{"cross-site", "navigate", "document"}, 403},
 		{"0.0.0.0 Host", "GET", "/debug/pprof/heap", "0.0.0.0:6060", "", nil, 403},
+		{"mapped IPv4 Host, dotted", "GET", "/debug/pprof/profile?seconds=1", "[::ffff:127.0.0.1]:6060", "", nil, 403},
+		{"mapped IPv4 Host, hex", "GET", "/debug/pprof/profile?seconds=1", "[::ffff:7f00:1]:6060", "", nil, 403},
 		{"IPv4 loopback", "GET", "/debug/quasar/runtime", "127.0.0.1:6060", "", nil, 200},
 		{"localhost", "GET", "/debug/quasar/runtime", "localhost:6060", "", nil, 200},
 		{"IPv6 loopback", "GET", "/debug/quasar/runtime", "[::1]:6060", "", nil, 200},
