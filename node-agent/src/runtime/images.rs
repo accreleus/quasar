@@ -220,6 +220,24 @@ impl Journal {
             Err(_) => Err(ErrorKind::Unavailable.into()),
         }
     }
+    /// `pending`, except a record that does not parse is retired. `begin` returns only once
+    /// the record is written and synced, and every engine call comes after, so an
+    /// unparsable record (a file created, the agent killed before the write) belongs to an
+    /// operation that never reached the engine; the lease holder may remove it (#609).
+    pub fn pending_or_retire(&self) -> Result<Option<Intent>, RuntimeError> {
+        match self.pending() {
+            Err(e) if e.kind == ErrorKind::Protocol => {
+                self.clear()?;
+                tracing::info!(
+                    token = "image-record-unreadable-retired",
+                    record = %self.path.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+                    "retired an image record that does not parse"
+                );
+                Ok(None)
+            }
+            other => other,
+        }
+    }
     pub fn begin(&self, intent: Intent) -> Result<(), RuntimeError> {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
         let mut file = std::fs::OpenOptions::new()
@@ -252,8 +270,9 @@ impl Journal {
 }
 
 /// Boot-time sweep: retire every pull intent whose lease nobody holds, so a pull
-/// interrupted by an agent replacement is not reported as pending (#429). Remove
-/// and build intents are left to their next operation's reconciliation.
+/// interrupted by an agent replacement is not reported as pending (#429), and every
+/// record that does not parse (#609). Remove and build intents are left to their next
+/// operation's reconciliation.
 pub(super) fn retire_orphaned_pull_intents(
     config: &RuntimeConfig,
 ) -> Result<Vec<String>, RuntimeError> {
@@ -278,7 +297,7 @@ pub(super) fn retire_orphaned_pull_intents(
         let Some(journal) = Journal::try_acquire(root, key)? else {
             continue;
         };
-        match journal.pending() {
+        match journal.pending_or_retire() {
             Ok(Some(intent)) if intent.is_pull() && journal_key(&intent.image) == key => {
                 journal.clear()?;
                 retired.push(intent.image);
