@@ -1695,7 +1695,8 @@ fn audio_replacement_running() -> bool {
 
 /// #613: a takeover takes the old audio pipeline to NULL, and `pulsesrc` waits on its
 /// sound server on the way: 30 s when that server is frozen. The runner must not wait
-/// with it, so a stop is still served.
+/// with it, so a stop is still served; and the stop the worker sees must neither be
+/// reported (#588) nor be followed by another build.
 #[test]
 fn a_takeover_does_not_hold_the_runner_on_an_audio_pipeline_that_will_not_stop() {
     use crate::session::source::{AppSource, SessionResources};
@@ -1722,6 +1723,13 @@ fn a_takeover_does_not_hold_the_runner_on_an_audio_pipeline_that_will_not_stop()
     parked
         .recv_timeout(Duration::from_secs(5))
         .expect("the audio capture never reached the probe");
+    let old_bus = host
+        .transports
+        .audio_pipeline
+        .as_ref()
+        .unwrap()
+        .bus()
+        .unwrap();
 
     request_offers(&mut host);
     let mut next = Peer::new();
@@ -1744,6 +1752,12 @@ fn a_takeover_does_not_hold_the_runner_on_an_audio_pipeline_that_will_not_stop()
         host.transports.audio_webrtc.is_none(),
         "past the bound the new peer gets no audio"
     );
+    let probe = gst::message::Application::new(gst::Structure::new_empty("probe"));
+    assert!(
+        old_bus.post(probe).is_err(),
+        "the old audio pipeline still reports while it stops: a session end would log the \
+         sound server's stop as a fault (#588)"
+    );
 
     let res = SessionResources::with_sidecar("takeover-audio-held", Box::new(NoSoundServer));
     let sink = format!("takeover-audio-held-app-{}", std::process::id());
@@ -1760,6 +1774,11 @@ fn a_takeover_does_not_hold_the_runner_on_an_audio_pipeline_that_will_not_stop()
         audio_replacement_running(),
         "the old audio pipeline was not held through the stop"
     );
+    let builds = || {
+        let all = super::transport::AUDIO_BUILDS.lock().unwrap();
+        all.iter().filter(|id| *id == "takeover-audio-held").count()
+    };
+    let built_before_release = builds();
 
     drop(release);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1769,6 +1788,11 @@ fn a_takeover_does_not_hold_the_runner_on_an_audio_pipeline_that_will_not_stop()
     assert!(
         !audio_replacement_running(),
         "the old audio pipeline never stopped once released"
+    );
+    assert_eq!(
+        builds(),
+        built_before_release,
+        "the takeover's worker built an audio pipeline after the session stopped"
     );
 }
 
