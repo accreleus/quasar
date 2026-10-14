@@ -47,8 +47,10 @@ export function getOrCreateDeviceKey(): string {
  * load — enough of them on one token and the endpoint rate-limits (429). The
  * server's staleness horizon is 30 days (probeMaxAgeDays), so a day is ample.
  * Keyed by user id: two accounts sharing a browser each need their own row.
+ * Bump the key's version when the probe changes in a way the server must see
+ * at once: a stamp under an old key forces one post (#632).
  */
-const DEVICE_POST_STORAGE_KEY = "quasar_device_posted";
+const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v2";
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function deviceProbeIsFresh(userId: string, now: number = Date.now()): boolean {
@@ -385,9 +387,28 @@ async function probeDisplay(): Promise<DisplayInfo> {
     height: screen.height,
     device_pixel_ratio: window.devicePixelRatio || 1,
   };
-  const hz = await sampleRefreshHz();
+  const hz = displayRefreshToReport(await sampleRefreshHz(), probeBrowser().name);
   if (hz != null) info.refresh_hz = hz;
   return info;
+}
+
+/** Around 60 Hz, in a browser that holds requestAnimationFrame there. */
+const RAF_CAP_HZ = 60;
+const RAF_CAP_TOLERANCE_HZ = 5;
+
+/**
+ * What the probe may say about the display. Safari, and the iOS browsers that
+ * report as Safari (they are WebKit), hold rAF near 60 Hz even on a 120 Hz
+ * screen, so a ~60 measured there is the browser's cap, not the display's rate (#632). Reporting it makes the control
+ * plane read a ProMotion screen as "slower than this frame rate"; leaving it out
+ * says "unknown", which is true. A real 60 Hz Safari screen is unknown too: the
+ * two cannot be told apart from here, and the control plane treats a Safari
+ * screen with no rate as high-refresh (control-api.md amendment 34).
+ */
+export function displayRefreshToReport(measuredHz: number | null, browserName: string): number | null {
+  if (measuredHz == null) return null;
+  if (browserName === "Safari" && Math.abs(measuredHz - RAF_CAP_HZ) <= RAF_CAP_TOLERANCE_HZ) return null;
+  return measuredHz;
 }
 
 /** Null when rAF is unavailable or the sample is unusable (e.g. throttled bg tab). */
