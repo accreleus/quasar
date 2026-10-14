@@ -511,36 +511,49 @@ func TestARelayedSuccessResolvesOnlyAnAttemptARegisterCannotProve(t *testing.T) 
 	agent, actor, other := []ComponentDigest{agentDigest('b')}, []ComponentDigest{actorDigest('a')}, []ComponentDigest{actorDigest('c')}
 	both := []ComponentDigest{actorDigest('a'), agentDigest('b')}
 	old, running := strings.Repeat("0", 40), testCommit
+	reads := func(context.Context, []ComponentDigest) (string, error) { return testCommit, nil }
+	unreadable := func(context.Context, []ComponentDigest) (string, error) { return "", errors.New("registry down") }
 	for _, tc := range []struct {
 		name      string
 		kind      string
+		release   bool
 		requested []ComponentDigest
 		echoed    []ComponentDigest
 		before    *string // a developer apply's host commit when it was requested
-		want      string
+		// restart forgets what was remembered at the request; the images are read again with it.
+		restart func(context.Context, []ComponentDigest) (string, error)
+		want    string
 	}{
-		{"a release apply waits for the register", KindApply, agent, agent, nil, AttemptPending},
-		{"so does one that also moves the actor", KindApply, both, both, nil, AttemptPending},
-		{"a developer apply to a new commit waits for the register", KindDeveloperApply, agent, agent, &old, AttemptPending},
-		{"an actor-only apply is decided by its relay", KindApply, actor, actor, nil, AttemptSucceeded},
-		{"a developer apply of the running commit too", KindDeveloperApply, agent, agent, &running, AttemptSucceeded},
-		{"a revert to a build no release names too", KindRevert, agent, agent, nil, AttemptSucceeded},
-		{"but not a relay naming other digests", KindApply, actor, other, nil, AttemptPending},
-		{"or none", KindApply, actor, nil, nil, AttemptPending},
+		{"a release apply waits for the register", KindApply, true, agent, agent, nil, nil, AttemptPending},
+		{"so does one that also moves the actor", KindApply, true, both, both, nil, nil, AttemptPending},
+		{"and a revert to a named build", KindRevert, true, agent, agent, nil, nil, AttemptPending},
+		{"a developer apply to a new commit waits for the register", KindDeveloperApply, false, agent, agent, &old, nil, AttemptPending},
+		{"and still does after a restart", KindDeveloperApply, false, agent, agent, &old, reads, AttemptPending},
+		{"an actor-only apply is decided by its relay", KindApply, true, actor, actor, nil, nil, AttemptSucceeded},
+		{"a developer apply of the running commit too", KindDeveloperApply, false, agent, agent, &running, nil, AttemptSucceeded},
+		{"but not once a restart lost that, and the images cannot be read", KindDeveloperApply, false, agent, agent, &running, unreadable, AttemptPending},
+		{"a revert to a build no release names too", KindRevert, false, agent, agent, nil, nil, AttemptSucceeded},
+		{"but not a relay naming other digests", KindApply, true, actor, other, nil, nil, AttemptPending},
+		{"or none", KindApply, true, actor, nil, nil, nil, AttemptPending},
 	} {
 		a := queuedAttempt(true)
 		a.Kind, a.RequestedDigests = tc.kind, tc.requested
-		if tc.kind != KindApply {
+		if !tc.release {
 			a.ReleaseID = nil
 		}
 		store := newFakeStore(a)
 		fa := &fakeAgent{ack: Ack{OK: true}}
-		r := testRunner(store, fa.deps())
+		deps := fa.deps()
+		deps.DeveloperCommit = tc.restart
+		r := testRunner(store, deps)
 		if tc.kind == KindDeveloperApply {
 			r.RememberDeveloperCommit(a.ID, testCommit, tc.before)
 		}
 		r.Start(a)
 		waitFor(t, "release_apply to be sent", func() bool { return fa.sentCount() == 1 })
+		if tc.restart != nil {
+			r.forgetDeveloperCommit(a.ID)
+		}
 		r.HandleReleaseState(context.Background(), testHostID, ReleaseStateReport{
 			RequestID: fa.sent[0].RequestID, State: AttemptSucceeded, Components: tc.echoed,
 		})

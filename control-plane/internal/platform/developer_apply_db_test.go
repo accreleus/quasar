@@ -199,16 +199,18 @@ func TestAReAdoptedDeveloperApplyReadsItsCommitAgain(t *testing.T) {
 	if got := h.agent.sent[0].Release.SourceCommit; got != commitB {
 		t.Fatalf("provenance commit = %q, want the images' %q", got, commitB)
 	}
-	// This process never saw the host's earlier commit, so a register is not
-	// evidence; the relayed outcome is.
-	want := commitB
-	fresh.HandleRegister(ctx, h.hostID, &want)
-	if a, _ := h.store.Attempt(ctx, attempt.ID); TerminalAttemptState(a.State) {
-		t.Fatalf("a register resolved a re-adopted developer apply: %+v", a)
-	}
+	// This process never saw the host's earlier commit, so it fails closed: the
+	// host, still on A, closes the apply only by registering B.
 	fresh.HandleReleaseState(ctx, h.hostID, ReleaseStateReport{
 		RequestID: h.agent.sent[0].RequestID, State: AttemptSucceeded, Components: []ComponentDigest{agentComponent()},
 	})
+	old := commitA
+	fresh.HandleRegister(ctx, h.hostID, &old)
+	if a, _ := h.store.Attempt(ctx, attempt.ID); TerminalAttemptState(a.State) {
+		t.Fatalf("a re-adopted developer apply closed without a register of its commit: %+v", a)
+	}
+	want := commitB
+	fresh.HandleRegister(ctx, h.hostID, &want)
 	waitFor(t, "success", func() bool {
 		a, _ := h.store.Attempt(ctx, attempt.ID)
 		return a.State == AttemptSucceeded
