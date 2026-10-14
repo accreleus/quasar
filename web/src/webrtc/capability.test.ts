@@ -6,6 +6,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   deviceProbeIsFresh,
+  displayRefreshToReport,
   markDeviceProbePosted,
   probeCapabilities,
   probeFeatures,
@@ -19,6 +20,8 @@ afterEach(() => {
   vi.clearAllMocks();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  // A per-test userAgent override must not reach the next test (#632).
+  delete (navigator as unknown as { userAgent?: unknown }).userAgent;
   // Remove any navigator props defined per-test (jsdom lacks getGamepads).
   delete (navigator as unknown as { getGamepads?: unknown }).getGamepads;
   // Multi-codec spec §6.1: jsdom lacks mediaCapabilities; remove the per-test stub
@@ -64,6 +67,32 @@ describe("probeFeatures", () => {
     expect(f.jitter_buffer_target).toBe(false);
     expect(f.playout_delay_hint).toBe(false);
     expect(f.coalesced_pointer_events).toBe(false);
+  });
+});
+
+// #632 — Safari holds requestAnimationFrame near 60 Hz on every screen, so a ~60
+// there is its cap, not the display's rate.
+describe("displayRefreshToReport", () => {
+  it("leaves out a ~60 measured in Safari (the rAF cap, rate unknown)", () => {
+    for (const hz of [55, 59, 60, 61, 65]) expect(displayRefreshToReport(hz, "Safari")).toBeNull();
+  });
+
+  it("still reports a Safari rate that is not near the cap", () => {
+    expect(displayRefreshToReport(120, "Safari")).toBe(120);
+    expect(displayRefreshToReport(48, "Safari")).toBe(48);
+    expect(displayRefreshToReport(66, "Safari")).toBe(66);
+  });
+
+  it("reports a real 60 Hz in every other browser: Chrome and Firefox read the display", () => {
+    for (const name of ["Chrome", "Edge", "Firefox", "Opera"]) {
+      expect(displayRefreshToReport(60, name)).toBe(60);
+    }
+    expect(displayRefreshToReport(120, "Firefox")).toBe(120);
+  });
+
+  it("keeps an unusable sample unknown", () => {
+    expect(displayRefreshToReport(null, "Safari")).toBeNull();
+    expect(displayRefreshToReport(null, "Chrome")).toBeNull();
   });
 });
 
@@ -158,6 +187,26 @@ describe("probeCapabilities", () => {
     expect(native.codecs).toEqual(web.codecs);
     expect(native.report_version).toBe(1);
     expect(native.metrics?.glass_to_glass_ms_p95).toBe(104);
+  });
+
+  // The rAF stub above ticks at ~60 Hz. Same page, two browsers: Chrome's number
+  // is the display's, Safari's is its cap and must not reach the control plane.
+  it("reports the measured ~60 Hz in Chrome and omits refresh_hz in Safari (#632)", async () => {
+    stubEnv({ uaData: undefined });
+    Object.defineProperty(navigator, "userAgent", {
+      value: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+      configurable: true,
+    });
+    const chrome = await probeCapabilities();
+    expect(chrome.display.refresh_hz).toBe(60);
+
+    Object.defineProperty(navigator, "userAgent", {
+      value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+      configurable: true,
+    });
+    const safari = await probeCapabilities();
+    expect(safari.browser.name).toBe("Safari");
+    expect(safari.display).not.toHaveProperty("refresh_hz");
   });
 
   it("falls back to UA-string sniffing when UA-CH is absent", async () => {

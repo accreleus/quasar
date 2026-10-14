@@ -385,9 +385,28 @@ async function probeDisplay(): Promise<DisplayInfo> {
     height: screen.height,
     device_pixel_ratio: window.devicePixelRatio || 1,
   };
-  const hz = await sampleRefreshHz();
+  const hz = displayRefreshToReport(await sampleRefreshHz(), probeBrowser().name);
   if (hz != null) info.refresh_hz = hz;
   return info;
+}
+
+/** Around 60 Hz, in a browser that holds requestAnimationFrame there. */
+const RAF_CAP_HZ = 60;
+const RAF_CAP_TOLERANCE_HZ = 5;
+
+/**
+ * What the probe may say about the display. Safari (and every WebKit browser)
+ * holds rAF near 60 Hz even on a 120 Hz screen, so a ~60 measured there is the
+ * browser's cap, not the display's rate (#632). Reporting it makes the control
+ * plane read a ProMotion screen as "slower than this frame rate"; leaving it out
+ * says "unknown", which is true. A real 60 Hz Safari screen is unknown too: the
+ * two cannot be told apart from here, and unknown never recommends a 120 fps
+ * profile (eligibility.go: a DisplayRequired profile is risky, not recommended).
+ */
+export function displayRefreshToReport(measuredHz: number | null, browserName: string): number | null {
+  if (measuredHz == null) return null;
+  if (browserName === "Safari" && Math.abs(measuredHz - RAF_CAP_HZ) <= RAF_CAP_TOLERANCE_HZ) return null;
+  return measuredHz;
 }
 
 /** Null when rAF is unavailable or the sample is unusable (e.g. throttled bg tab). */
