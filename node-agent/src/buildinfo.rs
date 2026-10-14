@@ -432,7 +432,8 @@ static INSTALL_FACTS: std::sync::RwLock<Option<InstallFacts>> = std::sync::RwLoc
 /// Held by every test that writes [`INSTALL_FACTS`] and then reads it back, so two
 /// such tests never interleave.
 #[cfg(test)]
-pub(crate) static INSTALL_FACTS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static INSTALL_FACTS_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Record this process's discovered install facts, replacing any earlier answer.
 pub fn set_install_facts(facts: InstallFacts) {

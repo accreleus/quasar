@@ -7379,7 +7379,10 @@ mod tests {
         assert!(attempt.is_err(), "the fake control plane never answers");
         let (first, waited) = first_rx.recv_timeout(Duration::from_secs(15)).unwrap();
         let first = first.expect("a text frame");
-        assert!(first.contains(r#""type":"register""#), "first frame: {first}");
+        assert!(
+            first.contains(r#""type":"register""#),
+            "first frame: {first}"
+        );
         assert!(
             waited < Duration::from_secs(1),
             "register reached the control plane {waited:?} after the upgrade"
