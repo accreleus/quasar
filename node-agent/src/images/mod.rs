@@ -1044,7 +1044,8 @@ impl ImageManager {
         ack(id, true, None)
     }
 
-    /// Decision + bookkeeping half of [`Self::handle_ensure`] (no thread, no docker);
+    /// Decision + bookkeeping half of [`Self::handle_ensure`] (no thread; one bounded engine
+    /// inspect for a `ready` record, see [`Self::demote_ready_if_gone`]);
     /// `true` when a fresh worker must be started.
     fn plan_ensure(self: &Arc<Self>, image_id: &str, registry_ref: &str, version: &str) -> bool {
         self.demote_ready_if_gone(image_id, version);
@@ -1096,7 +1097,10 @@ impl ImageManager {
     /// #675: a `ready` record the engine no longer has (removed behind the agent's back)
     /// would be re-acked as ready until a restart. One inspect of the recorded tag; if the
     /// engine definitively says it is gone the record goes absent, so the ensure that
-    /// follows takes the normal pull path. An engine error keeps the record, as at startup.
+    /// follows takes the normal pull path. An engine error or timeout keeps the record, as
+    /// at startup. Bounded by `ENGINE_INSPECTION_BUDGET`: this runs on the connection task,
+    /// and a hung engine must not outlast the control plane's read deadline. Tests that
+    /// plan an ensure on a `ready` record reach `configured()`'s engine.
     fn demote_ready_if_gone(&self, image_id: &str, version: &str) {
         let registry_ref = {
             let ops = self.ops.lock().unwrap();
@@ -1112,7 +1116,11 @@ impl ImageManager {
                 _ => return,
             }
         };
-        if !matches!(self.runtime.image_present(&registry_ref), Ok(false)) {
+        if !matches!(
+            self.runtime
+                .image_present_within(&registry_ref, crate::runtime::ENGINE_INSPECTION_BUDGET),
+            Ok(false)
+        ) {
             return;
         }
         let ops = self.ops.lock().unwrap();
@@ -3693,37 +3701,22 @@ mod tests {
         assert!(records["steam"].error.is_empty());
     }
 
-    // serialization bookkeeping (no threads, no docker)
+    // serialization bookkeeping (no threads; a `ready` ensure makes one engine inspect)
 
     /// #675. `configured()` is process-wide, so the engine is faked in a child process
-    /// pointed at a socket this process serves: `/version`, then 404 for the tag.
-    #[test]
-    fn ensure_of_a_ready_image_the_engine_lost_takes_the_pull_path() {
+    /// (running `test`, `mode` in `QUASAR_IMAGES_ENGINE_CHILD`) pointed at a socket this
+    /// process serves: `/version`, then `image` for the tag: 404, 500, or never answered.
+    /// Returns how many image inspects the child made.
+    fn run_against_fake_engine(test: &str, mode: &str, image: Option<(u16, &str)>) -> usize {
         use std::io::{Read, Write};
-        if std::env::var_os("QUASAR_IMAGES_LOST_TAG_CHILD").is_some() {
-            let m = ImageManager::empty_for_test();
-            m.set_ready_for_test("steam", REF1, "v1");
-            assert!(
-                m.plan_ensure("steam", REF1, "v1"),
-                "a lost tag must start a pull"
-            );
-            assert_eq!(
-                m.records.lock().unwrap()["steam"].state,
-                ImageState::Pulling
-            );
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let no_context = tempfile::tempdir().unwrap();
         let socket = dir.path().join("engine.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "images::tests::ensure_of_a_ready_image_the_engine_lost_takes_the_pull_path",
-            ])
-            .env("QUASAR_IMAGES_LOST_TAG_CHILD", "1")
+            .args(["--exact", test])
+            .env("QUASAR_IMAGES_ENGINE_CHILD", mode)
             .env("DOCKER_HOST", format!("unix://{}", socket.display()))
             .env("DOCKER_CONFIG", no_context.path())
             .env_remove("CONTAINER_HOST")
@@ -3733,9 +3726,14 @@ mod tests {
             .env_remove("DOCKER_API_VERSION")
             .spawn()
             .unwrap();
+        let (give_up, mut inspects, mut held) = (Instant::now(), 0, Vec::new());
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
+            }
+            if give_up.elapsed() > Duration::from_secs(60) {
+                let _ = child.kill();
+                panic!("child did not finish");
             }
             let Ok((mut conn, _)) = listener.accept() else {
                 std::thread::sleep(Duration::from_millis(10));
@@ -3755,11 +3753,82 @@ mod tests {
                     r#"{"Platform":{"Name":"Docker Engine - Community"},"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.24"}"#,
                 )
             } else {
-                (404, r#"{"message":"No such image"}"#)
+                inspects += 1;
+                match image {
+                    Some(reply) => reply,
+                    None => {
+                        held.push(conn); // accepted, never answered
+                        continue;
+                    }
+                }
             };
             write!(conn, "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         };
         assert!(status.success());
+        inspects
+    }
+
+    fn engine_child_mode() -> Option<String> {
+        std::env::var("QUASAR_IMAGES_ENGINE_CHILD").ok()
+    }
+
+    #[test]
+    fn ensure_of_a_ready_image_the_engine_lost_takes_the_pull_path() {
+        const THIS: &str =
+            "images::tests::ensure_of_a_ready_image_the_engine_lost_takes_the_pull_path";
+        if engine_child_mode().is_some() {
+            let m = ImageManager::empty_for_test();
+            m.set_ready_for_test("steam", REF1, "v1");
+            assert!(
+                m.plan_ensure("steam", REF1, "v1"),
+                "a lost tag must start a pull"
+            );
+            assert_eq!(
+                m.records.lock().unwrap()["steam"].state,
+                ImageState::Pulling
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        assert_eq!(run_against_fake_engine(THIS, "lost", reply), 1);
+    }
+
+    #[test]
+    fn an_engine_error_on_the_inspect_keeps_the_ready_record() {
+        const THIS: &str = "images::tests::an_engine_error_on_the_inspect_keeps_the_ready_record";
+        if engine_child_mode().is_some() {
+            let m = ImageManager::empty_for_test();
+            m.set_ready_for_test("steam", REF1, "v1");
+            assert!(!m.plan_ensure("steam", REF1, "v1"));
+            assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Ready);
+            return;
+        }
+        let reply = Some((500, r#"{"message":"boom"}"#));
+        assert_eq!(run_against_fake_engine(THIS, "error", reply), 1);
+    }
+
+    /// A hung engine must not park the connection task past the control plane's 20 s
+    /// read deadline: the inspect is bounded by `ENGINE_INSPECTION_BUDGET` and keeps
+    /// the record.
+    #[test]
+    fn a_hung_engine_inspect_is_bounded_and_keeps_the_ready_record() {
+        const THIS: &str =
+            "images::tests::a_hung_engine_inspect_is_bounded_and_keeps_the_ready_record";
+        if engine_child_mode().is_some() {
+            let m = ImageManager::empty_for_test();
+            m.set_ready_for_test("steam", REF1, "v1");
+            let started = Instant::now();
+            assert!(!m.plan_ensure("steam", REF1, "v1"));
+            assert!(
+                started.elapsed()
+                    < crate::runtime::ENGINE_INSPECTION_BUDGET + Duration::from_secs(3),
+                "blocked {:?}",
+                started.elapsed()
+            );
+            assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Ready);
+            return;
+        }
+        assert_eq!(run_against_fake_engine(THIS, "hung", None), 1);
     }
 
     #[test]
@@ -4389,7 +4458,7 @@ mod tests {
         );
     }
 
-    // serialization bookkeeping (no threads, no docker)
+    // serialization bookkeeping (no threads; a `ready` ensure makes one engine inspect)
 
     #[test]
     fn completed_builds_replay_ready_or_fixed_failure_after_control_plane_disconnect() {
