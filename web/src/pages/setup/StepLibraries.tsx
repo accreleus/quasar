@@ -205,7 +205,9 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
     images !== null &&
     submittedKinds.some((k) => {
       const s = providerStatus(images, k);
-      return s === null || s === "pulling" || s === "building" || s === "settling";
+      // "failed" keeps polling: the control plane retries a failed host build
+      // (30/60/120 s backoff), so the row can still turn ready or disappear.
+      return s === null || s === "pulling" || s === "building" || s === "settling" || s === "failed";
     });
 
   useEffect(() => {
@@ -372,13 +374,13 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
           {submittedKinds.map((kind) => {
             const provider = providers.find((p) => p.kind === kind);
             const status = images ? providerStatus(images, kind) : null;
+            // Not gated on status: a failure on one host stays visible while another still builds.
+            const failure = images ? providerFailure(images, kind) : null;
             return (
               <div key={kind} className="setup-host setup-install-row row between gap3">
                 <span>{provider?.displayName ?? kind}</span>
                 <span className="row gap3">
-                  {status === "failed" && images && (
-                    <span className="sub tone-danger">{providerFailure(images, kind)}</span>
-                  )}
+                  {failure && <span className="sub tone-danger">{failure}</span>}
                   <StatusChip status={providerStatusKey(status)} config={PROVIDER_STATUS_CHIP_CONFIG} />
                 </span>
               </div>
