@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,6 +52,7 @@ func newBlobs(t *testing.T) *BlobStore {
 	if err != nil {
 		t.Fatalf("NewBlobStore: %v", err)
 	}
+	b.log = slog.New(slog.DiscardHandler)
 	return b
 }
 

@@ -2,6 +2,8 @@ package artwork
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -20,58 +22,75 @@ import (
 // query string so a non-canonical spelling ("0320") is not a member.
 var variantWidths = map[string]int{"96": 96, "320": 320, "480": 480, "560": 560}
 
-// variantName is a derived copy on disk: the source asset's full name, the
-// width, then the encoded type. It sits in the source's shard directory and is
-// never reachable through Open, which only accepts assetName.
-var variantName = regexp.MustCompile(`^([0-9a-f]{64}\.(?:jpg|png|webp))\.[0-9]+\.(?:jpg|png)$`)
+// variantName is a derived file on disk: the source asset's full name, the
+// width, then the encoded type, or "orig" for the empty marker that says no
+// copy is smaller than the source. It sits in the source's shard directory and
+// is never reachable through Open, which only accepts assetName.
+var variantName = regexp.MustCompile(`^([0-9a-f]{64}\.(?:jpg|png|webp))\.[0-9]+\.(?:jpg|png|orig)$`)
 
-// maxConcurrentResizes bounds decode memory: the route is unauthenticated and a
-// 16 MP source decodes to about 64 MiB.
+// maxConcurrentResizes bounds resize memory on an unauthenticated route. One
+// 16 MP decode holds up to ~320 MiB (a progressive CMYK JPEG keeps all its
+// coefficients; a 16-bit PNG is 128 MiB), plus the source bytes and the scaled
+// copy: about 0.4 GiB a slot. A request waiting for a slot holds none of it.
 const maxConcurrentResizes = 2
 
-// OpenVariant returns the blob scaled down to the smallest size that still
-// covers a 2:3 frame of a width in variantWidths, made on first request and
-// cached beside the original. An unknown width or invalid name is ErrBadAsset.
-// A source that already fits the frame is returned as is. Any other error is a
-// failed resize, and the caller may fall back to Open.
-func (b *BlobStore) OpenVariant(name, width string) ([]byte, string, error) {
+// OpenVariant answers `?w=`: the blob scaled down to the smallest size that
+// still covers a 2:3 frame of a width in variantWidths, made on first request
+// and cached beside the original. The original is returned when no smaller
+// copy covers the frame or the copy would not be smaller in bytes. An unknown
+// width or invalid name is ErrBadAsset, a cancelled ctx is ctx.Err().
+//
+// immutable is false only when a resize failed and the original stands in for
+// the copy, so a browser does not keep it under this URL for a year.
+func (b *BlobStore) OpenVariant(ctx context.Context, name, width string) (data []byte, contentType string, immutable bool, err error) {
 	w, ok := variantWidths[width]
 	if !ok || !assetName.MatchString(name) {
-		return nil, "", ErrBadAsset
+		return nil, "", false, ErrBadAsset
 	}
 	if data, ct, ok := b.readVariant(name, width); ok {
-		return data, ct, nil
+		return data, ct, true, nil
 	}
-	raw, ct, err := b.Open(name)
-	if err != nil {
-		return nil, "", err
+	if _, bad := b.undecodable.Load(name); bad {
+		return b.fallback(name)
 	}
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
-	if err != nil {
-		return nil, "", fmt.Errorf("artwork: read header of %s: %w", name, err)
+	scale, err := b.coverScale(name, w)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil, "", false, err
+	case err != nil:
+		b.undecodable.Store(name, struct{}{})
+		b.log.Warn("artwork: cannot resize asset, serving the original", "err", err)
+		return b.fallback(name)
+	case scale >= 1:
+		data, ct, err := b.Open(name)
+		return data, ct, true, err
 	}
-	// Covering the frame rather than matching its width keeps a wider image (a
-	// hero standing in for a tile, a 16:10 cover) sharp under object-fit: cover.
-	scale := max(float64(w)/float64(cfg.Width), float64(w)*3/2/float64(cfg.Height))
-	if scale >= 1 {
-		return raw, ct, nil
-	}
-	if int64(cfg.Width)*int64(cfg.Height) > maxImagePixels {
-		return nil, "", fmt.Errorf("artwork: %s is %dx%d, over the pixel limit", name, cfg.Width, cfg.Height)
-	}
-	v, err, _ := b.resizes.Do(name+"@"+width, func() (any, error) {
-		if data, ct, ok := b.readVariant(name, width); ok {
-			return variant{data, ct}, nil
+	for {
+		ch := b.resizes.DoChan(name+"@"+width, func() (any, error) { return b.resize(ctx, name, width, scale) })
+		select {
+		case <-ctx.Done():
+			return nil, "", false, ctx.Err()
+		case res := <-ch:
+			switch {
+			case res.Err == nil:
+				v := res.Val.(variant)
+				return v.data, v.contentType, true, nil
+			case errors.Is(res.Err, context.Canceled) || errors.Is(res.Err, context.DeadlineExceeded):
+				if ctx.Err() == nil {
+					continue // the request that started this resize left while queued
+				}
+				return nil, "", false, ctx.Err()
+			case errors.Is(res.Err, os.ErrNotExist):
+				return nil, "", false, res.Err
+			}
+			return b.fallback(name)
 		}
-		b.resizeSlots <- struct{}{}
-		defer func() { <-b.resizeSlots }()
-		return b.makeVariant(name, width, raw, scale)
-	})
-	if err != nil {
-		return nil, "", err
 	}
-	out := v.(variant)
-	return out.data, out.contentType, nil
+}
+
+func (b *BlobStore) fallback(name string) ([]byte, string, bool, error) {
+	data, ct, err := b.Open(name)
+	return data, ct, false, err
 }
 
 type variant struct {
@@ -89,15 +108,63 @@ func (b *BlobStore) readVariant(name, width string) ([]byte, string, bool) {
 			return data, mt, true
 		}
 	}
+	if _, err := os.Stat(b.variantPath(name, width, "orig")); err == nil {
+		if data, ct, err := b.Open(name); err == nil {
+			return data, ct, true
+		}
+	}
 	return nil, "", false
 }
 
-// makeVariant decodes, scales and encodes: JPEG when the source is opaque, PNG
-// when it has transparency.
-func (b *BlobStore) makeVariant(name, width string, raw []byte, scale float64) (variant, error) {
+// coverScale reads only the header and returns the factor that makes the image
+// just cover a w×1.5w frame; 1 or more means it already does.
+func (b *BlobStore) coverScale(name string, w int) (float64, error) {
+	f, err := os.Open(b.pathFor(name))
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	cfg, _, err := image.DecodeConfig(f)
+	if err != nil {
+		return 0, fmt.Errorf("artwork: read header of %s: %w", name, err)
+	}
+	// Covering the frame rather than matching its width keeps a wider image (a
+	// hero standing in for a tile, a 16:10 cover) sharp under object-fit: cover.
+	scale := max(float64(w)/float64(cfg.Width), float64(w)*3/2/float64(cfg.Height))
+	if scale < 1 && int64(cfg.Width)*int64(cfg.Height) > maxImagePixels {
+		return 0, fmt.Errorf("artwork: %s is %dx%d, over the pixel limit", name, cfg.Width, cfg.Height)
+	}
+	return scale, nil
+}
+
+// resize takes a slot, then reads, decodes, scales and encodes: JPEG when the
+// source is opaque, PNG when it has transparency. ctx only bounds the wait;
+// once a slot is taken the copy is finished and cached for whoever asks next.
+func (b *BlobStore) resize(ctx context.Context, name, width string, scale float64) (variant, error) {
+	if data, ct, ok := b.readVariant(name, width); ok { // finished since the caller looked
+		return variant{data, ct}, nil
+	}
+	select {
+	case b.resizeSlots <- struct{}{}:
+	case <-ctx.Done():
+		return variant{}, ctx.Err()
+	}
+	defer func() { <-b.resizeSlots }()
+	if err := ctx.Err(); err != nil { // select picks at random when both are ready
+		return variant{}, err
+	}
+	raw, rawType, err := b.Open(name)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			b.log.Warn("artwork: could not read asset to resize, serving the original", "err", err)
+		}
+		return variant{}, err
+	}
 	src, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
-		return variant{}, fmt.Errorf("artwork: decode %s: %w", name, err)
+		b.undecodable.Store(name, struct{}{})
+		b.log.Warn("artwork: cannot decode asset, serving the original", "asset", name, "err", err)
+		return variant{}, err
 	}
 	sb := src.Bounds()
 	dst := image.NewRGBA(image.Rect(0, 0,
@@ -113,12 +180,19 @@ func (b *BlobStore) makeVariant(name, width string, raw []byte, scale float64) (
 		err = png.Encode(&buf, dst)
 	}
 	if err != nil {
-		return variant{}, fmt.Errorf("artwork: encode %s at %s: %w", name, width, err)
-	}
-	if err := writeAtomic(b.variantPath(name, width, extForType[ct]), buf.Bytes()); err != nil {
+		b.log.Warn("artwork: could not encode a sized copy, serving the original", "asset", name, "w", width, "err", err)
 		return variant{}, err
 	}
-	return variant{buf.Bytes(), ct}, nil
+	// The bytes are a pure function of (source, w), so they are served as the
+	// immutable answer whether or not the cache write below succeeds.
+	out, path, file := variant{buf.Bytes(), ct}, b.variantPath(name, width, extForType[ct]), buf.Bytes()
+	if buf.Len() >= len(raw) {
+		out, path, file = variant{raw, rawType}, b.variantPath(name, width, "orig"), nil
+	}
+	if err := writeAtomic(path, file); err != nil {
+		b.log.Warn("artwork: could not cache a sized copy", "asset", name, "w", width, "err", err)
+	}
+	return out, nil
 }
 
 // writeAtomic writes through a temp file and a rename so a reader only ever

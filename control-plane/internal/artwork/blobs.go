@@ -12,11 +12,13 @@ import (
 	_ "image/png"  // registers the PNG header reader for image.DecodeConfig
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -60,9 +62,14 @@ var ErrUnsupportedType = errors.New("artwork: unsupported image type")
 // persistent volume.
 type BlobStore struct {
 	root string
+	log  *slog.Logger
 
 	resizes     singleflight.Group
 	resizeSlots chan struct{}
+	// undecodable holds the names of stored blobs that cannot be resized, so
+	// they are not decoded again on every `?w=`. Only a blob that exists is
+	// added and PruneOrphans removes it, so it never outgrows the store.
+	undecodable sync.Map
 }
 
 // NewBlobStore creates (or adopts) the cache directory at root.
@@ -73,7 +80,7 @@ func NewBlobStore(root string) (*BlobStore, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("artwork: create cache dir: %w", err)
 	}
-	return &BlobStore{root: filepath.Clean(root), resizeSlots: make(chan struct{}, maxConcurrentResizes)}, nil
+	return &BlobStore{root: filepath.Clean(root), log: slog.Default(), resizeSlots: make(chan struct{}, maxConcurrentResizes)}, nil
 }
 
 // Root reports the cache directory (used by tests and diagnostics).
@@ -242,6 +249,7 @@ func (b *BlobStore) PruneOrphans(referenced map[string]struct{}) (int, error) {
 		}
 		if name == source {
 			removed++
+			b.undecodable.Delete(name)
 		}
 		return nil
 	})

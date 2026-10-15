@@ -93,6 +93,7 @@ func New(store *Store, blobRoot string, opts Options, log *slog.Logger) (*Servic
 	if err != nil {
 		return nil, err
 	}
+	blobs.log = log
 	if opts.MaxImageBytes <= 0 {
 		opts.MaxImageBytes = DefaultMaxImageBytes
 	}

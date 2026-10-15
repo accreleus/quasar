@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -144,19 +145,21 @@ func (h *Handler) handleAsset(w http.ResponseWriter, r *http.Request) {
 	var (
 		data        []byte
 		contentType string
-		err         error
+		immutable   = true
 	)
-	switch widths, sized := r.URL.Query()["w"]; {
+	// ParseQuery, not r.URL.Query(): that drops a pair it cannot parse
+	// ("w=320;x"), which would turn a bad w into no w.
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	switch widths, sized := query["w"]; {
+	case err != nil, sized && len(widths) != 1:
+		err = ErrBadAsset
 	case !sized:
 		data, contentType, err = blobs.Open(name)
-	case len(widths) != 1:
-		err = ErrBadAsset
 	default:
-		data, contentType, err = blobs.OpenVariant(name, widths[0])
-		if err != nil && !errors.Is(err, ErrBadAsset) && !errors.Is(err, os.ErrNotExist) {
-			h.log.Warn("artwork: could not resize asset, serving the original", "err", err)
-			data, contentType, err = blobs.Open(name)
-		}
+		data, contentType, immutable, err = blobs.OpenVariant(r.Context(), name, widths[0])
+	}
+	if r.Context().Err() != nil {
+		return // the client left while its resize was queued
 	}
 	if err != nil {
 		// A bad name and a missing file are the same answer. Never 500: an
@@ -176,8 +179,13 @@ func (h *Handler) handleAsset(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	// Content-addressed name ⇒ the bytes at this URL can never change, so it is
 	// safe to cache forever. This is what makes art survive a redeploy without
-	// a single refetch at browse time.
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	// a single refetch at browse time. The exception is the original standing in
+	// for a copy that failed, which must not pin itself under the `?w=` URL.
+	if immutable {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	_, _ = w.Write(data)
 }
