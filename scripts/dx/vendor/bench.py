@@ -1,10 +1,9 @@
 # VENDORED FILE — DO NOT EDIT HERE.
 #
 # Source: quasar-bench client/bench.py
-# Commit: d55c43808dbde9eb9140a01580b16eb848ee960f (2026-09-22)  __version__ 1.7.0
-# Fetched: 2026-09-22, as the bench.py inside the qbench 1.7.0 zipapp your bench
-#          server publishes (GET $BENCH_URL/cli/qbench); byte-identical to the
-#          file at the commit above (git blob 6edf2cb99c6d).
+# Commit: d488f493b974fd94f729796e7a45697d201ca394 (2026-10-11)  __version__ 1.10.0
+# Fetched: 2026-10-15, from a quasar-bench checkout at the commit above
+#          (git blob 557e7154e8800b2d6dd153f06cb8a4a8cb984366).
 #
 # Re-vendor with (from a quasar-bench checkout, or unzip the zipapp):
 #   cp ../quasar-bench/client/bench.py scripts/dx/vendor/bench.py
@@ -79,7 +78,7 @@ from typing import Any, Iterable
 
 # Bump on every change to this file so a vendoring harness can detect drift:
 #   python3 -c "import bench; print(bench.__version__)"
-__version__ = "1.7.0"
+__version__ = "1.10.0"
 
 DEFAULT_URL = "http://localhost:9400"
 GZIP_THRESHOLD = 64 * 1024
@@ -95,6 +94,15 @@ class BenchError(RuntimeError):
         super().__init__(message)
         self.status, self.server_message = status, server_message
         self.method, self.path = method, path
+
+
+class AmbiguousBaseline(BenchError):
+    """Several hosts have a pinned baseline for the scenario and none was named.
+    `hosts` lists them; pass host= to pick one."""
+
+    def __init__(self, message: str, hosts: list[str], method: str = "", path: str = ""):
+        super().__init__(message, status=409, server_message=message, method=method, path=path)
+        self.hosts = hosts
 
 
 class CountMismatch(BenchError):
@@ -151,6 +159,9 @@ class Bench:
                                     int(body.get("expected", 0)),
                                     int(body.get("actual", 0))) from None
             msg = str(body.get("error") or detail or e.reason)
+            if e.code == 409 and body.get("code") == "ambiguous_baseline":
+                raise AmbiguousBaseline(f"{method} {path} -> 409: {msg}",
+                                        [str(h) for h in body.get("hosts") or []], method, path) from None
             raise BenchError(f"{method} {path} -> {e.code}: {msg}", status=e.code,
                              server_message=msg, method=method, path=path) from None
         except urllib.error.URLError as e:
@@ -175,9 +186,12 @@ class Bench:
             headers["Content-Encoding"] = "gzip"
         return self._request_status("POST", path, body=body, headers=headers)
 
-    def _get(self, path: str, params: dict | None = None) -> Any:
+    def _get(self, path: str, params: dict | None = None, keep_empty: tuple = ()) -> Any:
+        """GET with query params; None and "" are dropped, except for the keys in
+        keep_empty, where "" is sent (e.g. host= for the runs with no host)."""
         if params:
-            clean = {k: v for k, v in params.items() if v not in (None, "")}
+            clean = {k: v for k, v in params.items()
+                     if v is not None and (v != "" or k in keep_empty)}
             path += "?" + urllib.parse.urlencode(clean)
         return self._request("GET", path)
 
@@ -391,11 +405,13 @@ class Bench:
         self.mark(run_id, "harness.mark", {"phase": phase, "edge": edge}, ts_ms)
 
     def set_baseline(self, suite: str, scenario: str, run_id: str, name: str = "default",
-                     thresholds: dict[str, float] | None = None) -> None:
-        """Pin a run as the baseline. thresholds is per-metric percent."""
-        self._post("/v1/baselines", {"suite": suite, "scenario": scenario,
-                                     "name": name, "run_id": run_id,
-                                     "thresholds": thresholds or {}})
+                     thresholds: dict[str, float] | None = None) -> dict:
+        """Pin a run as the baseline for its own host (the server reads the
+        host from the run). thresholds is per-metric percent. Returns the
+        server's answer, {"ok": true, "host": ...}."""
+        return self._post("/v1/baselines", {"suite": suite, "scenario": scenario,
+                                            "name": name, "run_id": run_id,
+                                            "thresholds": thresholds or {}})
 
     # ---------------------------------------------------------------- reports
 
@@ -654,17 +670,21 @@ class Bench:
             "source": source, "window": window, "align": align})
 
     def regressions(self, suite: str, scenario: str, metric: str, agg: str = "p50",
-                    window: str = "", baseline: str = "", pct: float | None = None) -> dict:
-        """Compare runs against the pinned baseline for suite+scenario.
+                    window: str = "", baseline: str = "", pct: float | None = None,
+                    host: str | None = None) -> dict:
+        """Compare runs against the pinned baseline for suite+scenario. Baselines
+        are per host: only that host's runs are judged (host=None takes the only
+        pin; AmbiguousBaseline if several hosts have one; host="" is the runs
+        with no host).
 
         Direction comes from the metric registry: for a lower-is-better metric
         a RISE is the regression. Neutral metrics are never flagged.
         """
         params = {"suite": suite, "scenario": scenario, "metric": metric,
-                  "agg": agg, "window": window, "baseline": baseline}
+                  "agg": agg, "window": window, "baseline": baseline, "host": host}
         if pct is not None:
             params["pct"] = pct
-        return self._get("/v1/regressions", params)
+        return self._get("/v1/regressions", params, keep_empty=("host",))
 
     def metrics(self) -> list[dict]:
         """The metric registry: better = higher | lower | neutral."""
@@ -682,10 +702,15 @@ class Bench:
         citing reports and baseline_delta."""
         return self._get(f"/v1/runs/{run_id}/summary")
 
-    def baseline(self, suite: str, scenario: str, name: str = "default") -> dict:
-        """The pinned baseline for suite+scenario ({"run_id": ...}); 404 if none."""
+    def baseline(self, suite: str, scenario: str, name: str = "default",
+                 host: str | None = None) -> dict:
+        """The pinned baseline for suite+scenario ({"run_id", "host", "name"}); 404
+        if none. Baselines are per host: with host=None the scenario's only pin is
+        returned, and AmbiguousBaseline (with .hosts) when several hosts have one.
+        host="" asks for the runs that recorded no host."""
         return self._get(f"/v1/baselines/{urllib.parse.quote(suite, safe='')}/"
-                         f"{urllib.parse.quote(scenario, safe='')}", {"name": name})
+                         f"{urllib.parse.quote(scenario, safe='')}", {"name": name, "host": host},
+                         keep_empty=("host",))
 
     # ---------------------------------------------------------- commit compare
 
@@ -698,10 +723,12 @@ class Bench:
         """Judge commit `head` against commit `base` (short prefixes read as
         long as they are unique; a 409 means the prefix is ambiguous).
 
-        For every (suite, scenario) with a valid run at both commits: the
-        latest run at each, a direction-aware delta table and a verdict
-        (regressed | improved | mixed | unchanged). Plus only_base/only_head
-        (scenarios that ran at only one commit) and excluded_invalid runs.
+        For every (suite, scenario, host) with a valid run at both commits:
+        the latest run from that host at each (never another host's), a
+        direction-aware delta table and a verdict (regressed | improved |
+        mixed | unchanged). Each entry carries its `host`. Plus
+        only_base/only_head (scenario/host pairs that ran at only one
+        commit) and excluded_invalid runs.
         repo defaults to BENCH_DEFAULT_REPO server-side when omitted.
         """
         return self._get("/v1/commits/compare", {
@@ -809,6 +836,9 @@ def _report_snippet(rep: dict) -> str:
         if regressed:
             bits.append(f"worse on {', '.join(regressed)}")
         lines.append("**Runs:** " + ("; ".join(bits) if bits else f"{len(deltas)} metric(s) compared, none beyond threshold"))
+
+    if rep.get("host_mismatch_note"):  # run pair or any sprint metric row; the server sends the text
+        lines.append(f"**Note:** {rep['host_mismatch_note']}")
 
     if "goal_counts" in rep and rep["goal_counts"]:
         gc = rep["goal_counts"]

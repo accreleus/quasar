@@ -504,8 +504,8 @@ export class QuasarSession {
       .getReceivers()
       .find((receiver) => receiver.track?.kind === "video")
       ?.getParameters()
-      .headerExtensions
-      .some((extension) => extension.uri === uri) ?? false;
+      // Firefox omits headerExtensions here; a throw would end every telemetry poll (#610).
+      ?.headerExtensions?.some((extension) => extension.uri === uri) ?? false;
   }
 
   /**
