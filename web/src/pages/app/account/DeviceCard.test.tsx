@@ -141,7 +141,7 @@ describe("DeviceCard", () => {
     const onRevoke = vi.fn();
     renderCard(device({ trusted: false }), { onSetTrusted, onRevoke });
 
-    fireEvent.click(screen.getByRole("checkbox", { name: "Trusted device" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Trusted device Studio desktop" }));
     expect(onSetTrusted).toHaveBeenCalledWith("d1", true);
 
     fireEvent.click(screen.getByRole("button", { name: "Revoke Studio desktop" }));
@@ -156,9 +156,18 @@ describe("DeviceCard", () => {
     expect(screen.getByRole("button", { name: "Revoke Device d1f9c40a" })).toBeTruthy();
   });
 
+  it("names its device in the trust switch, keeping the visible label first", () => {
+    renderCard(device({ name: "Living room TV" }));
+    expect(screen.getByRole("checkbox", { name: "Trusted device Living room TV" })).toBeTruthy();
+    expect(screen.getByText("Trusted device").textContent).toBe("Trusted device");
+    cleanup();
+    renderCard(device({ name: null }));
+    expect(screen.getByRole("checkbox", { name: "Trusted device Device d1f9c40a" })).toBeTruthy();
+  });
+
   it("goes inert while its own request is in flight", () => {
     renderCard(device(), { busy: true });
-    expect(screen.getByRole("checkbox", { name: "Trusted device" })).toHaveProperty(
+    expect(screen.getByRole("checkbox", { name: "Trusted device Studio desktop" })).toHaveProperty(
       "disabled",
       true,
     );
@@ -192,7 +201,7 @@ describe("AccountDevices", () => {
   it("sends a trust change to the API", async () => {
     renderPage();
     await screen.findByText("Studio desktop");
-    fireEvent.click(screen.getByRole("checkbox", { name: "Trusted device" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Trusted device Studio desktop" }));
     await waitFor(() =>
       expect(updateDevice).toHaveBeenCalledWith("t0k3n", "d1", { trusted: false }),
     );
