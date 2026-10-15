@@ -117,7 +117,7 @@ export function Switch({ checked, onChange, label, id, disabled, "aria-label": a
           checked={checked}
           onChange={(e) => onChange(e.target.checked)}
           disabled={disabled}
-          aria-label={label ? undefined : ariaLabel}
+          aria-label={ariaLabel}
         />
         <span className="track" />
         <span className="thumb" />
