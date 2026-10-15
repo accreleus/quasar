@@ -3,7 +3,7 @@
 // profiles being evaluated for it. DetailBand renders it; this owns when it
 // opens, where it opens, and what it is fed.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as libraryApi from "../../../api/library";
 import { ApiError } from "../../../api/client";
 import type { App, ProfilesResponse } from "../../../api/types";
@@ -87,11 +87,23 @@ export function useDetailBand({
     setInsertAfterId(null);
   }, []);
 
+  /** The last tile in `id`'s row, by measured `offsetTop` (libraryGrid.lastIndexInRow:
+   *  column-count agnostic), or null while `id` has no box: a tile the windowed
+   *  grid has not mounted yet. Unmounted tiles must not be measured as a row. */
+  const rowEndOf = useCallback((list: readonly App[], id: string): string | null => {
+    const ids = list.map((a) => a.id);
+    const index = ids.indexOf(id);
+    if (index < 0) return id;
+    if (!tileBoxOf(tileRefs.current.get(id))) return null;
+    const offsetTops = ids.map((i) => tileBoxOf(tileRefs.current.get(i))?.offsetTop ?? -1);
+    return ids[lastIndexInRow(offsetTops, index)] ?? id;
+  }, []);
+
   /**
    * Opens `app`'s band anchored after the last tile in its row. `list` must be
-   * the grid the tile actually lives in (the source group in Library view).
-   * Row detection is by measured `offsetTop` (libraryGrid.lastIndexInRow) —
-   * column-count agnostic.
+   * the grid the tile actually lives in (the source group in Library view). A
+   * tile outside the windowed grid's mounted rows (rail card, gated launch) is
+   * pinned by `openId` first; the anchor is found once its row exists (below).
    */
   const open = useCallback(
     (app: App, list: readonly App[]) => {
@@ -99,17 +111,21 @@ export function useDetailBand({
         close();
         return;
       }
-      const ids = list.map((a) => a.id);
-      const index = ids.indexOf(app.id);
-      const offsetTops = ids.map((id) => tileBoxOf(tileRefs.current.get(id))?.offsetTop ?? 0);
-      const lastIdx = index >= 0 ? lastIndexInRow(offsetTops, index) : -1;
       setOpenId(app.id);
-      setInsertAfterId(ids[lastIdx] ?? app.id);
+      setInsertAfterId(rowEndOf(list, app.id));
       setOptionsOpen(false);
       ensureProfiles(app);
     },
-    [openId, close, ensureProfiles],
+    [openId, close, ensureProfiles, rowEndOf],
   );
+
+  // A band opened for an unmounted tile has no anchor yet: its row mounted with
+  // the render that set `openId`, so measure it before paint.
+  useLayoutEffect(() => {
+    if (!openId || insertAfterId) return;
+    const list = visibleLists.find((l) => l.some((a) => a.id === openId));
+    setInsertAfterId((list && rowEndOf(list, openId)) ?? openId);
+  }, [openId, insertAfterId, visibleLists, rowEndOf]);
 
   /** Find the currently-rendered list that contains `id`, or null. */
   const listContaining = useCallback(
@@ -161,10 +177,7 @@ export function useDetailBand({
         timer = null;
         const list = visibleLists.find((l) => l.some((a) => a.id === openId));
         if (!list) return;
-        const ids = list.map((a) => a.id);
-        const index = ids.indexOf(openId);
-        const offsetTops = ids.map((id) => tileBoxOf(tileRefs.current.get(id))?.offsetTop ?? 0);
-        setInsertAfterId(ids[lastIndexInRow(offsetTops, index)] ?? openId);
+        setInsertAfterId(rowEndOf(list, openId) ?? openId);
       }, 150);
     };
     window.addEventListener("resize", onResize);
@@ -172,7 +185,7 @@ export function useDetailBand({
       if (timer !== null) clearTimeout(timer);
       window.removeEventListener("resize", onResize);
     };
-  }, [openId, visibleLists]);
+  }, [openId, visibleLists, rowEndOf]);
 
   useEffect(() => {
     if (!openId) return;
