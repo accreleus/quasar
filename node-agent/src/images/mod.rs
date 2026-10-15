@@ -141,14 +141,20 @@ pub fn cleanup_attempt(
 /// (agent-api.md).
 const MAX_CONCURRENT_PULLS: usize = 2;
 
+/// How long a background `ready` check keeps retrying a `Busy` engine client: one inspection
+/// budget, enough for a healthy burst to drain (an inspect is milliseconds). On a hung
+/// engine every inspect times out and nothing demotes, so a longer retry would only keep
+/// all four runtime permits taken from launches and readiness. Past it the record is kept
+/// and the next ensure tries again.
+const READY_CHECK_DEADLINE: Duration = crate::runtime::ENGINE_INSPECTION_BUDGET;
+
+/// How long a pull keeps resubmitting after the client refused it a slot (`Busy`) before
+/// the refusal counts as a failed pull: two inspection budgets, which outlasts a wave of
+/// `ready` checks holding the permits. `Busy` writes nothing, so asking again is safe.
+const PULL_BUSY_BUDGET: Duration = Duration::from_secs(10);
+
 /// Wall-clock bound after a catalog pull acquires its shared pull/build permit.
 /// Assignment preparation uses a shorter ten-minute budget.
-/// How long a background `ready` check keeps retrying a `Busy` engine client. The client
-/// has four slots and each inspect holds one for at most `ENGINE_INSPECTION_BUDGET` (5 s),
-/// so the 32 ensures the control plane can queue drain in about 8 rounds (40 s) on a
-/// hung engine; 60 s covers that with margin. Past it the record is kept.
-const READY_CHECK_DEADLINE: Duration = Duration::from_secs(60);
-
 const PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Field bounds. The control plane is trusted, but these strings become map keys,
@@ -197,6 +203,16 @@ enum ImageOp {
         build_args: BTreeMap<String, String>,
     },
     Remove,
+}
+
+/// Frees an image id's slot in `ready_checks` when its background check ends, even by panic.
+struct ReadyCheck(Arc<ImageManager>, String);
+impl Drop for ReadyCheck {
+    fn drop(&mut self) {
+        if let Ok(mut checks) = self.0.ready_checks.lock() {
+            checks.remove(&self.1);
+        }
+    }
 }
 
 /// What is running now (generation stamped on its worker) and the one queued follow-up.
@@ -1053,12 +1069,13 @@ impl ImageManager {
             // #675: the ack must not wait on the engine, so the check runs off this task,
             // one at a time per image.
             if self.ready_checks.lock().unwrap().insert(image_id.clone()) {
+                let check = ReadyCheck(self.clone(), image_id.clone());
                 let mgr = self.clone();
                 std::thread::spawn(move || {
+                    let _check = check;
                     if mgr.demote_ready_if_gone(&image_id, &recorded, &registry_ref, &version) {
-                        mgr.spawn_worker(image_id.clone());
+                        mgr.spawn_worker(image_id);
                     }
-                    mgr.ready_checks.lock().unwrap().remove(&image_id);
                 });
             }
         }
@@ -1909,9 +1926,10 @@ impl ImageManager {
     /// An id already holding a slot always may (it only re-acks or replaces pending);
     /// a new id only under [`MAX_CONCURRENT_OPS`]. Checked before planning because a
     /// refusal is an `ack{ok:false}`, not a state transition. Advisory, not atomic with
-    /// the insert: the connection task dispatches sequentially, but a background `ready`
-    /// check also starts ops (re-checking the cap itself, under the lock), so the cap can
-    /// be overshot by one at most.
+    /// the insert: the connection task and the diagnostic socket each dispatch sequentially
+    /// but not against each other, and a background `ready` check also starts ops
+    /// (re-checking the cap itself, under the lock), so the cap can be overshot by two at
+    /// most.
     fn has_op_capacity(&self, image_id: &str) -> bool {
         let ops = self.ops.lock().unwrap();
         ops.contains_key(image_id) || ops.len() < MAX_CONCURRENT_OPS
@@ -2087,16 +2105,27 @@ impl ImageManager {
     ) -> Result<u64, String> {
         let runtime = crate::runtime::configured().map_err(errors::map_runtime_error)?;
         let mut throttle = ProgressThrottle::new();
-        runtime
-            .ensure_image(registry_ref, PULL_TIMEOUT)
-            .wait(|sample| {
-                if throttle.should_emit(Instant::now(), sample.percent) {
-                    self.set_pulling(image_id, generation, sample.percent, sample.bytes);
-                    self.emit(image_id);
+        let give_up = Instant::now() + PULL_BUSY_BUDGET;
+        loop {
+            let result = runtime
+                .ensure_image(registry_ref, PULL_TIMEOUT)
+                .wait(|sample| {
+                    if throttle.should_emit(Instant::now(), sample.percent) {
+                        self.set_pulling(image_id, generation, sample.percent, sample.bytes);
+                        self.emit(image_id);
+                    }
+                });
+            match result {
+                Err(e) if e.kind == crate::runtime::ErrorKind::Busy && Instant::now() < give_up => {
+                    std::thread::sleep(crate::session::teardown::STOP_PAUSE);
                 }
-            })
-            .map(|info| info.bytes)
-            .map_err(errors::map_runtime_error)
+                other => {
+                    return other
+                        .map(|info| info.bytes)
+                        .map_err(errors::map_runtime_error)
+                }
+            }
+        }
     }
 
     /// Run a template build: take a shared pull/build permit, disk-guard, download +
@@ -3814,7 +3843,8 @@ mod tests {
                 conn.read_exact(&mut byte).unwrap();
                 request.push(byte[0]);
             }
-            let (code, body) = if String::from_utf8_lossy(&request).contains("/version") {
+            let request = String::from_utf8_lossy(&request);
+            let (code, body) = if request.contains("/version") {
                 (
                     200,
                     r#"{"Platform":{"Name":"Docker Engine - Community"},"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.24"}"#,
@@ -3822,17 +3852,21 @@ mod tests {
             } else {
                 inspects += 1;
                 match image {
-                    Some(reply) => {
-                        std::thread::sleep(delay);
-                        reply
-                    }
-                    None => {
-                        held.push(conn); // accepted, never answered
+                    // A ref containing "hang" is accepted and never answered, whatever `image` says.
+                    Some(reply) if !request.contains("hang") => reply,
+                    _ => {
+                        held.push(conn);
                         continue;
                     }
                 }
             };
-            let _ = write!(conn, "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            // Answered on its own thread, so a delay holds the client's slot without
+            // serialising the other requests.
+            let body = body.to_owned();
+            std::thread::spawn(move || {
+                std::thread::sleep(if code == 200 { Duration::ZERO } else { delay });
+                let _ = write!(conn, "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            });
         };
         assert!(status.success());
         inspects
@@ -3903,14 +3937,16 @@ mod tests {
         assert!(served >= 2, "inspect, then a pull: {served}");
     }
 
-    /// More ready images than the engine client has slots (4), against an engine that
-    /// answers 404 after a short delay: the surplus gets `Busy` and must retry, not
-    /// give up, so every image is inspected and leaves `ready`.
+    /// More ready images (8) than the engine client has slots (4), against an engine that
+    /// answers 404 after a short delay: the surplus gets `Busy` and must retry, not give
+    /// up, and each re-pull a 404 starts must reach the engine rather than fail `Busy`
+    /// against the sibling checks still retrying. A pull that reached the engine ends in
+    /// the engine's own error (the fake 404s the pull too), never "runtime busy".
     #[test]
-    fn a_burst_of_more_ready_images_than_engine_slots_is_all_inspected() {
+    fn a_burst_of_more_ready_images_than_engine_slots_is_all_repulled() {
         const THIS: &str =
-            "images::tests::a_burst_of_more_ready_images_than_engine_slots_is_all_inspected";
-        const IDS: [&str; 6] = ["a", "b", "c", "d", "e", "f"];
+            "images::tests::a_burst_of_more_ready_images_than_engine_slots_is_all_repulled";
+        const IDS: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
         if engine_child_mode().is_some() {
             let m = ImageManager::empty_for_test();
             for id in IDS {
@@ -3920,21 +3956,59 @@ mod tests {
                 m.handle_ensure("e".into(), id.into(), REF1.into(), "v1".into());
             }
             let give_up = Instant::now();
-            while IDS
-                .iter()
-                .any(|id| m.records.lock().unwrap()[*id].state == ImageState::Ready)
-            {
+            while IDS.iter().any(|id| {
+                m.records.lock().unwrap()[*id].state != ImageState::Failed
+                    || m.ops.lock().unwrap().contains_key(*id)
+            }) {
                 assert!(
-                    give_up.elapsed() < Duration::from_secs(30),
-                    "an image was never inspected"
+                    give_up.elapsed() < Duration::from_secs(60),
+                    "an image was not inspected and pulled"
                 );
                 std::thread::sleep(Duration::from_millis(50));
+            }
+            for id in IDS {
+                let error = m.records.lock().unwrap()[id].error.clone();
+                assert_ne!(
+                    error,
+                    errors::map_runtime_error(crate::runtime::ErrorKind::Busy.into()),
+                    "{id}"
+                );
             }
             return;
         }
         let reply = Some((404, r#"{"message":"No such image"}"#));
         let served = run_against_fake_engine(THIS, "slots", reply, Duration::from_millis(300));
-        assert!(served >= IDS.len(), "{served}");
+        assert!(served >= 2 * IDS.len(), "{served}");
+    }
+
+    /// A pull refused an engine slot (`Busy`) waits for one rather than ending `failed`:
+    /// with all four slots held by unanswered inspects (released at the 5 s budget) the
+    /// pull still reaches the engine.
+    #[test]
+    fn a_pull_refused_a_slot_waits_for_one_instead_of_failing_busy() {
+        const THIS: &str =
+            "images::tests::a_pull_refused_a_slot_waits_for_one_instead_of_failing_busy";
+        if engine_child_mode().is_some() {
+            let runtime = crate::runtime::configured().unwrap();
+            let _held: Vec<_> = (0..4)
+                .map(|i| {
+                    runtime.image_present_within(
+                        format!("ghcr.io/x/hang:{i}"),
+                        crate::runtime::ENGINE_INSPECTION_BUDGET,
+                    )
+                })
+                .collect();
+            let m = ImageManager::empty_for_test();
+            let error = m.pull_with_progress("steam", 1, REF1).unwrap_err();
+            assert_ne!(
+                error,
+                errors::map_runtime_error(crate::runtime::ErrorKind::Busy.into())
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = run_against_fake_engine(THIS, "pull-busy", reply, Duration::ZERO);
+        assert!(served >= 6, "four held inspects, then the pull: {served}");
     }
 
     /// A repeated ensure for an image whose check is already running spawns no second
