@@ -117,8 +117,9 @@ func (s *Store) acquire(ctx context.Context, hostID string, owner Owner, reason 
 }
 
 // Release deletes only the named owner's row. connected is the live websocket
-// observation at call time; a missing agent projects offline when the final
-// restriction leaves, never a schedulable online host.
+// observation at call time, and a disconnect recorded since then overrides it:
+// a missing agent projects offline when the final restriction leaves, never a
+// schedulable online host.
 func (s *Store) Release(ctx context.Context, hostID string, owner Owner, connected bool) (string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -126,12 +127,14 @@ func (s *Store) Release(ctx context.Context, hostID string, owner Owner, connect
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var status string
-	if err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status); err != nil {
+	var live bool
+	if err := tx.QueryRow(ctx, `SELECT status, `+HostIsLiveSQL+` FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status, &live); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", ErrHostNotFound
 		}
 		return "", fmt.Errorf("lock host: %w", err)
 	}
+	connected = connected && live
 	if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions
 		WHERE host_id=$1::uuid AND owner_kind=$2 AND owner_id=$3::uuid`, hostID, owner.Kind, owner.ID); err != nil {
 		return "", err
@@ -165,6 +168,7 @@ func (s *Store) Release(ctx context.Context, hostID string, owner Owner, connect
 
 // ReleaseManual clears the two fixed operator/legacy owners in one host-locked
 // transaction. It never touches a platform, idle-apply or recovery owner.
+// connected is read as in Release.
 func (s *Store) ReleaseManual(ctx context.Context, hostID string, connected bool) (string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -172,12 +176,14 @@ func (s *Store) ReleaseManual(ctx context.Context, hostID string, connected bool
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var status string
-	if err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status); err != nil {
+	var live bool
+	if err := tx.QueryRow(ctx, `SELECT status, `+HostIsLiveSQL+` FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status, &live); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", ErrHostNotFound
 		}
 		return "", err
 	}
+	connected = connected && live
 	deleted, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid
 		AND ((owner_kind='manual' AND owner_id='00000000-0000-0000-0000-000000000000'::uuid)
 		  OR (owner_kind='legacy' AND owner_id='00000000-0000-0000-0000-000000000001'::uuid))`, hostID)

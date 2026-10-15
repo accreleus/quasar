@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 )
 
 // ErrIdleInventoryStale refuses a heartbeat from a socket that no longer owns
@@ -295,8 +297,8 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var boot, status string
-	var deliveryGate bool
-	if err := tx.QueryRow(ctx, `SELECT status,config_policy_gate_connection IS NOT NULL FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status, &deliveryGate); err != nil {
+	var deliveryGate, live bool
+	if err := tx.QueryRow(ctx, `SELECT status,config_policy_gate_connection IS NOT NULL,`+admission.HostIsLiveSQL+` FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status, &deliveryGate, &live); err != nil {
 		return err
 	}
 	if !deliveryGate {
@@ -459,7 +461,10 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 	if held && status == "online" {
 		status = "draining"
 	} else if !held && status == "draining" {
-		status = "online"
+		status = "offline"
+		if live {
+			status = "online"
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE hosts SET status=$2 WHERE id=$1::uuid`, hostID, status); err != nil {
 		return err
@@ -633,6 +638,14 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 	} else if terminal && (entry.Phase != "applied" || active) {
 		// An applied entry releases its hold only with the matching verified active snapshot.
 		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
+			return err
+		}
+	} else if !terminal {
+		// A restored ledger can omit both an unfinished attempt and its
+		// restriction (agent-api.md); the rebuilt attempt holds admission again.
+		// failed with a sequence is unfinished: recovery follows it.
+		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+			VALUES($1::uuid,'idle_apply',$2::uuid,'idle_configuration') ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
 	}

@@ -1072,3 +1072,33 @@ func TestRunSkipsPartialStateAndRetryOfRoundTrip(t *testing.T) {
 		t.Fatalf("row = %+v, want a terminal succeeded auto_revert on the run", a)
 	}
 }
+
+// A host whose agent disconnected during the run comes back offline, not
+// online, when the run's restore lifts its last hold (#656).
+func TestOwnedRestoreKeepsADisconnectedHostOffline(t *testing.T) {
+	h := newFleetHarness(t, commitA, parkedDrivers{})
+	ctx := context.Background()
+	holds := admission.NewStore(h.pool)
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetCordonedHosts(ctx, run.ID, []HostCordon{{HostID: h.hostID, WasCordoned: false}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holds.Acquire(ctx, h.hostID, admission.Owner{Kind: admission.Platform, ID: run.ID}, admission.ReasonPlatformApply); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `UPDATE hosts SET agent_disconnected_at=now() WHERE id=$1::uuid`, h.hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `UPDATE platform_apply_runs SET state='failed',finished_at=now() WHERE id=$1::uuid`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.RestoreOwnedCordons(ctx, run.ID, func(string) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	if status, err := h.store.HostStatus(ctx, h.hostID); err != nil || status != "offline" {
+		t.Fatalf("restored disconnected host = %q (%v), want offline", status, err)
+	}
+}

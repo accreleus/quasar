@@ -9,6 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 )
 
 // Data access for the fleet half: `platform_apply_runs`, and the control-plane
@@ -399,6 +401,7 @@ func (s *Store) MarkCordonsRestored(ctx context.Context, runID string) error {
 // RestoreOwnedCordons commits the run's restriction releases, host status
 // projections, and restore marker together. An error before commit rolls all
 // three back; an ambiguous commit result is safe to retry using the marker.
+// A disconnect recorded on the host row overrides connected.
 func (s *Store) RestoreOwnedCordons(ctx context.Context, runID string, connected func(string) bool) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -437,7 +440,8 @@ func (s *Store) RestoreOwnedCordons(ctx context.Context, runID string, connected
 	sort.Strings(hostIDs)
 	for _, hostID := range hostIDs {
 		var status string
-		err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status)
+		var live bool
+		err := tx.QueryRow(ctx, `SELECT status, `+admission.HostIsLiveSQL+` FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status, &live)
 		if errors.Is(err, pgx.ErrNoRows) {
 			continue // a deleted host has no restriction to restore
 		}
@@ -457,7 +461,7 @@ func (s *Store) RestoreOwnedCordons(ctx context.Context, runID string, connected
 			next = "draining"
 		} else if !held && status == "draining" {
 			next = "offline"
-			if connected != nil && connected(hostID) {
+			if live && connected != nil && connected(hostID) {
 				next = "online"
 			}
 		}
