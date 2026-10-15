@@ -30,6 +30,18 @@ func ClientIP(r *http.Request, trusted []*net.IPNet) string {
 	return rightmostUntrusted(r.Header.Values("X-Forwarded-For"), trusted, peer)
 }
 
+// PrefixKey is ClientIP with an IPv6 address collapsed to its /64, the smallest
+// block an ISP hands one subscriber: a per-address key gives one subscriber
+// 2^64 budgets. IPv4 (including ::ffff:a.b.c.d, which ClientIP already
+// renders as dotted-quad) stays per address, as does a non-IP opaque key.
+func PrefixKey(r *http.Request, trusted []*net.IPNet) string {
+	key := ClientIP(r, trusted)
+	if ip := net.ParseIP(key); ip != nil && ip.To4() == nil {
+		return (&net.IPNet{IP: ip.Mask(net.CIDRMask(64, 128)), Mask: net.CIDRMask(64, 128)}).String()
+	}
+	return key
+}
+
 // DirectPeer returns the TCP peer's address (nil when RemoteAddr is not an IP)
 // and whether it is inside QUASAR_TRUSTED_PROXIES. A forwarded header must
 // never be believed from a peer that is not.

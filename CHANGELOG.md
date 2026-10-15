@@ -65,6 +65,7 @@ own; the two do not move together, and that is deliberate.
 ### Internal
 - **The bench guide says why NVIDIA encode time jumps between runs.** On an RTX 5090, a light stream's `encode_ms` windows sit near 2.9 ms (P5) or 6.7 ms (P8), so two runs of the same build can differ by about 2×. That mix explains a gap inside the band when both plateaus are unchanged. A moved plateau, or an `encode_ms_max` above the slow band, still blocks a landing (`docs/testing-bench-mode.md`).
 - **The RH-07 acceptance map records the last hardware runs and the accepted gaps (#502).** A dump restored into a fresh rootless install and a restore interrupted at three points pass on the AMD test host. A machine reboot on that host is recorded as an accepted gap: the test hosts are containers, so both AMD Docker reboot rows were container restarts, and the earlier rootful row is corrected to say so. The lab-VM rows, a live GPU fault and a Podman bench re-run are accepted gaps too. The run's one product finding is #589.
+- **The agent socket's pre-auth limit now counts an IPv6 client by its /64 (#674).** The cap of 10 unauthenticated sockets per client and the failed-register limit were keyed on the full address, so one IPv6 subscriber, who holds a whole /64, had a fresh budget for every address in it. They are now keyed on the /64; IPv4 is still per address. Other limiters (sign-in, setup claim, signaling) are unchanged. No wire, schema or setting change.
 
 ## 0.4.2 — 2026-10-13
 
