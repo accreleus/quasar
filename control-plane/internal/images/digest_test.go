@@ -369,3 +369,17 @@ func TestParseChallenge(t *testing.T) {
 		t.Fatalf("scope: got %q (a comma inside the quoted value must not split it)", params["scope"])
 	}
 }
+
+// The plain-HTTP resolver's client has no body cap of its own, so the token read
+// must refuse an oversized answer itself (#628).
+func TestFetchTokenRefusesAnOversizedBodyOnABareClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"token":%q}`, strings.Repeat("a", int(registryMaxBodyBytes)))
+	}))
+	t.Cleanup(srv.Close)
+	r := newTestResolver(&http.Client{Timeout: 5 * time.Second}, srv.URL)
+
+	if _, err := r.fetchToken(context.Background(), "https://ghcr.io/token", "ghcr.io", "scope"); err == nil {
+		t.Fatal("an over-limit token response was accepted")
+	}
+}

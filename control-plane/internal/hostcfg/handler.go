@@ -150,14 +150,13 @@ func (h *Handler) handlePatchPolicy(w http.ResponseWriter, r *http.Request) {
 		ExpectedRevision string                  `json:"expected_revision"`
 		Changes          map[string]PolicyChoice `json:"changes"`
 	}
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid policy edit")
 		return
 	}
-	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid policy edit")
 		return
 	}
@@ -217,14 +216,13 @@ func (h *Handler) handleRetryPolicy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Group string `json:"group"`
 	}
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil || req.Group == "" {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid retry request: body must be {\"group\":\"<group>\"}")
 		return
 	}
-	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid retry request: body must be {\"group\":\"<group>\"}")
 		return
 	}
@@ -354,7 +352,7 @@ func liveSessionRestartBlocked(liveSessions int, confirm bool) bool {
 func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	hostID := r.PathValue("id")
 	var req patchReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid body")
 		return
 	}
@@ -536,7 +534,7 @@ func (h *Handler) handleRestart(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		// The request body is optional (openapi.yaml requestBody required: false) —
 		// an empty body is not an error, only a malformed one.
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid body")
 			return
 		}

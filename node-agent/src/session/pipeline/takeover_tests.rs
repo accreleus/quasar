@@ -106,6 +106,8 @@ struct Host {
     replaced: Vec<PcId>,
     /// Every offer the host sent and every answer it was handed, in order.
     wire: Vec<(&'static str, PcId, String)>,
+    /// The longest the runner's inbound dispatch took over one message.
+    slowest_inbound: Duration,
     /// Rewrites an answer before the host sees it.
     munge_answer: Option<fn(String) -> String>,
     sig_tx: OutTx,
@@ -222,6 +224,7 @@ impl Host {
             transports,
             replaced: Vec::new(),
             wire: Vec::new(),
+            slowest_inbound: Duration::ZERO,
             munge_answer: None,
             sig_tx,
             sig_rx,
@@ -250,10 +253,12 @@ impl Host {
             self.wire
                 .push(("answer", pc.unwrap_or_default(), sdp.clone()));
         }
+        let started = Instant::now();
         let replaced = self
             .transports
             .inbound(msg, &self.sig_tx, None, None)
             .expect("replace the video transport");
+        self.slowest_inbound = self.slowest_inbound.max(started.elapsed());
         self.replaced.extend(replaced);
     }
 
@@ -1661,6 +1666,133 @@ fn a_sound_server_lost_under_a_live_session_is_still_reported() {
             && log.contains("audio-pipeline-message")
             && log.contains("Disconnected: Connection terminated"),
         "a sound server lost under a live session was not reported:\n{log}"
+    );
+}
+
+/// A sound server with nothing to stop.
+struct NoSoundServer;
+
+impl crate::session::teardown::Sidecar for NoSoundServer {
+    fn server_uri(&self) -> String {
+        "unix:/nonexistent/native".into()
+    }
+    fn socket_dir(&self) -> std::path::PathBuf {
+        "/nonexistent".into()
+    }
+    fn adopt_budget(&mut self, _: crate::session::teardown::RetryBudget) {}
+    fn stop(&mut self) {}
+}
+
+/// Is the thread that replaces the audio transport (`runner::replace_audio`) alive?
+fn audio_replacement_running() -> bool {
+    std::fs::read_dir("/proc/self/task").is_ok_and(|tasks| {
+        tasks.filter_map(Result::ok).any(|task| {
+            std::fs::read_to_string(task.path().join("comm"))
+                .is_ok_and(|name| name.trim_end() == "quasar-aud-repl")
+        })
+    })
+}
+
+/// #613: a takeover takes the old audio pipeline to NULL, and `pulsesrc` waits on its
+/// sound server on the way: 30 s when that server is frozen. The runner must not wait
+/// with it, so a stop is still served; and the stop the worker sees must neither be
+/// reported (#588) nor be followed by another build.
+#[test]
+fn a_takeover_does_not_hold_the_runner_on_an_audio_pipeline_that_will_not_stop() {
+    use crate::session::source::{AppSource, SessionResources};
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("audio-held");
+    let _first = first_attach(&mut host);
+    // Parks the capture's streaming thread, so its pipeline cannot reach NULL until
+    // `release` drops: after 10 s at most, so a runner that waits fails and does not hang.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (parked_tx, parked) = std::sync::mpsc::channel::<()>();
+    let probe = Mutex::new((held, parked_tx));
+    audio_capture(&host).static_pad("src").unwrap().add_probe(
+        gst::PadProbeType::BUFFER,
+        move |_, _| {
+            let probe = probe.lock().unwrap();
+            let _ = probe.1.send(());
+            let _ = probe.0.recv_timeout(Duration::from_secs(10));
+            gst::PadProbeReturn::Ok
+        },
+    );
+    parked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the audio capture never reached the probe");
+    let old_bus = host
+        .transports
+        .audio_pipeline
+        .as_ref()
+        .unwrap()
+        .bus()
+        .unwrap();
+
+    request_offers(&mut host);
+    let mut next = Peer::new();
+    let up = pump(&mut host, &mut next, Duration::from_secs(20), |h, p| {
+        rtp(&p.video) > 30 && h.replaced.contains(&PcId::Audio)
+    });
+    assert!(
+        up,
+        "the peer that took over never got video, or its audio transport was not \
+         replaced: {} (host replaced {:?})",
+        describe(&next),
+        host.replaced
+    );
+    assert!(
+        host.slowest_inbound < Duration::from_secs(3),
+        "the takeover held the runner {:?} on the old audio pipeline",
+        host.slowest_inbound
+    );
+    assert!(
+        host.transports.audio_webrtc.is_none(),
+        "past the bound the new peer gets no audio"
+    );
+    let probe = gst::message::Application::new(gst::Structure::new_empty("probe"));
+    assert!(
+        old_bus.post(probe).is_err(),
+        "the old audio pipeline still reports while it stops: a session end would log the \
+         sound server's stop as a fault (#588)"
+    );
+
+    let res = SessionResources::with_sidecar("takeover-audio-held", Box::new(NoSoundServer));
+    let sink = format!("takeover-audio-held-app-{}", std::process::id());
+    let mut source = AppSource::new(&host.cfg, "takeover-audio-held", &sink, &sink, &res, None)
+        .expect("app source");
+    let stopping = Instant::now();
+    crate::session::runner::stop_source(&mut source, &host.transports);
+    assert!(
+        stopping.elapsed() < Duration::from_secs(3),
+        "the stop took {:?}",
+        stopping.elapsed()
+    );
+    assert!(
+        audio_replacement_running(),
+        "the old audio pipeline was not held through the stop"
+    );
+    let builds = || {
+        let all = super::transport::AUDIO_BUILDS.lock().unwrap();
+        all.iter().filter(|id| *id == "takeover-audio-held").count()
+    };
+    let built_before_release = builds();
+
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while audio_replacement_running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !audio_replacement_running(),
+        "the old audio pipeline never stopped once released"
+    );
+    assert_eq!(
+        builds(),
+        built_before_release,
+        "the takeover's worker built an audio pipeline after the session stopped"
     );
 }
 

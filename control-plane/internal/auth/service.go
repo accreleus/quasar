@@ -387,8 +387,9 @@ func (s *Service) ListUsers(ctx context.Context, cursor string, limit int32) ([]
 	return s.store.listUsers(ctx, cursor, limit)
 }
 
-// UpdateUser applies partial updates to a user. Admin use only.
-func (s *Service) UpdateUser(ctx context.Context, id string, role *string, disabled *bool, maxSessions *int32) (AdminUser, error) {
+// UpdateUser applies partial updates to a user. Admin use only. The returned
+// UserChanges says which carried fields actually differed from the stored row.
+func (s *Service) UpdateUser(ctx context.Context, id string, role *string, disabled *bool, maxSessions *int32) (AdminUser, UserChanges, error) {
 	return s.store.updateUser(ctx, id, role, disabled, maxSessions)
 }
 

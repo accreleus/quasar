@@ -3,11 +3,13 @@ package main
 import (
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"runtime"
 	rtdebug "runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -45,7 +47,7 @@ func newDebugServer(addr string, pool *pgxpool.Pool, log *slog.Logger) *http.Ser
 
 	return &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: loopbackOnly(mux),
 		// ReadHeaderTimeout, not ReadTimeout: bounded so a stuck client cannot
 		// pin a connection, but the body is irrelevant here.
 		ReadHeaderTimeout: 5 * time.Second,
@@ -55,6 +57,39 @@ func newDebugServer(addr string, pool *pgxpool.Pool, log *slog.Logger) *http.Ser
 		WriteTimeout: 0,
 		IdleTimeout:  60 * time.Second,
 	}
+}
+
+// loopbackOnly closes the browser path to the loopback bind (#625). A control
+// plane in the host network namespace is reachable from a web page on that
+// machine: a cross-site POST carries an Origin, a DNS-rebinding request carries
+// the attacker's Host, and a navigation or <img>/<script> GET carries neither
+// but does carry Sec-Fetch-Site (Fetch Metadata), which every current browser
+// sends to loopback. wget, curl and `go tool pprof` send none of the three, so
+// any of them is refused. Residual: a browser too old to send Sec-Fetch-Site or
+// Origin (Chrome < 76, Firefox < 90, Safari < 16.4) is not stopped.
+func loopbackOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Origin") != "" || r.Header.Get("Sec-Fetch-Site") != "" || !isLoopbackHost(r.Host) {
+			http.Error(w, "debug listener: loopback Host only, no Origin or Sec-Fetch-Site", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isLoopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport // no port, e.g. "localhost" or a bracket-less literal
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	// An IPv6 literal carrying an IPv4 address ([::ffff:127.0.0.1]) is loopback to
+	// Go but not to a browser, which then sends no Sec-Fetch-Site: refuse it.
+	return ip != nil && ip.IsLoopback() && !(strings.Contains(host, ":") && ip.To4() != nil)
 }
 
 // mutexProfileHandler arms or disarms mutex profiling.

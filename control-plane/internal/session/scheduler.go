@@ -649,20 +649,21 @@ func (e *HomeHostOfflineRejection) Unwrap() error { return e.err }
 // noHostRejection attaches fleet counts to ErrNoHostAvailable so the launcher
 // can log why nothing fit. Fail-open on its own query failure: a wrong log
 // beats a wrong refusal, so a query error falls back to the plain error.
+// "Online" is placement's: status online and no recorded disconnect (liveHostSQL).
 func noHostRejection(ctx context.Context, tx pgx.Tx, appImage string) error {
 	rej := &NoHostRejection{err: ErrNoHostAvailable}
 	err := tx.QueryRow(ctx, `
 		SELECT
-			(SELECT COUNT(*) FROM hosts WHERE status = 'online'),
-			(SELECT COUNT(*) FROM hosts WHERE status = 'online' AND capacity_detection != 'ok'),
+			(SELECT COUNT(*) FROM hosts h WHERE h.status = 'online'`+liveHostSQL+`),
+			(SELECT COUNT(*) FROM hosts h WHERE h.status = 'online'`+liveHostSQL+` AND h.capacity_detection != 'ok'),
 			(SELECT COUNT(*) FROM gpus g JOIN hosts h ON h.id = g.host_id
-			  WHERE h.status = 'online' AND NOT g.reported),
-			(SELECT COUNT(*) FROM hosts
-			  WHERE status = 'online' AND last_registered_at > now() - interval '15 seconds'),
+			  WHERE h.status = 'online'`+liveHostSQL+` AND NOT g.reported),
+			(SELECT COUNT(*) FROM hosts h
+			  WHERE h.status = 'online'`+liveHostSQL+` AND h.last_registered_at > now() - interval '15 seconds'),
 			(SELECT COUNT(DISTINCT hi.host_id) FROM host_images hi
 			   JOIN installed_images ii ON ii.image_id = hi.image_id
 			   JOIN hosts h ON h.id = hi.host_id
-			  WHERE h.status = 'online' AND hi.state = 'failed'
+			  WHERE h.status = 'online'`+liveHostSQL+` AND hi.state = 'failed'
 			    AND $1::text <> '' AND (ii.registry_ref = $1::text OR ii.local_tag = $1::text))
 	`, appImage).Scan(&rej.OnlineHosts, &rej.HostsCapacityNotOK, &rej.GPUsUnreported, &rej.HostsRecentlyRegistered, &rej.HostsImageFailed)
 	if err != nil {
