@@ -138,6 +138,7 @@ export function DeviceCard({ device, busy, onRename, onSetTrusted, onRevoke }: D
           onChange={(checked) => void onSetTrusted(device.id, checked)}
           id={`trust-${device.id}`}
           label="Trusted device"
+          aria-label={`Trusted device ${deviceLabel(device)}`}
         />
       </div>
 
