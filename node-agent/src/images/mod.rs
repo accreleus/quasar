@@ -1040,15 +1040,21 @@ impl ImageManager {
         }
         if self.plan_ensure(&image_id, &registry_ref, &version) {
             self.spawn_worker(image_id);
+        } else if let Some(recorded) = self.ready_ref(&image_id, &version) {
+            // #675: the ack must not wait on the engine, so the check runs off this task.
+            let mgr = self.clone();
+            std::thread::spawn(move || {
+                if mgr.demote_ready_if_gone(&image_id, &recorded, &registry_ref, &version) {
+                    mgr.spawn_worker(image_id);
+                }
+            });
         }
         ack(id, true, None)
     }
 
-    /// Decision + bookkeeping half of [`Self::handle_ensure`] (no thread; one bounded engine
-    /// inspect for a `ready` record, see [`Self::demote_ready_if_gone`]);
+    /// Decision + bookkeeping half of [`Self::handle_ensure`] (no thread, no docker);
     /// `true` when a fresh worker must be started.
     fn plan_ensure(self: &Arc<Self>, image_id: &str, registry_ref: &str, version: &str) -> bool {
-        self.demote_ready_if_gone(image_id, version);
         let started = {
             let mut ops = self.ops.lock().unwrap();
             let mut records = self.records.lock().unwrap();
@@ -1094,46 +1100,57 @@ impl ImageManager {
         started
     }
 
+    /// The recorded ref of an idle `ready` record at `version`, i.e. what
+    /// [`decide_ensure`] would re-ack.
+    fn ready_ref(&self, image_id: &str, version: &str) -> Option<String> {
+        let ops = self.ops.lock().unwrap();
+        let records = self.records.lock().unwrap();
+        let rec = records.get(image_id)?;
+        (!ops.contains_key(image_id) && rec.state == ImageState::Ready && rec.version == version)
+            .then(|| rec.registry_ref.clone())
+    }
+
     /// #675: a `ready` record the engine no longer has (removed behind the agent's back)
-    /// would be re-acked as ready until a restart. One inspect of the recorded tag; if the
-    /// engine definitively says it is gone the record goes absent, so the ensure that
-    /// follows takes the normal pull path. An engine error or timeout keeps the record, as
-    /// at startup. Bounded by `ENGINE_INSPECTION_BUDGET`: this runs on the connection task,
-    /// and a hung engine must not outlast the control plane's read deadline. Tests that
-    /// plan an ensure on a `ready` record reach `configured()`'s engine.
-    fn demote_ready_if_gone(&self, image_id: &str, version: &str) {
-        let registry_ref = {
+    /// would be re-acked as ready until a restart. Blocking, so never on the connection
+    /// task: one inspect of the recorded tag, bounded by `ENGINE_INSPECTION_BUDGET`. If
+    /// the engine definitively says it is gone the record goes absent and the ensure is
+    /// planned again (`true`: the caller starts the worker), the same path an ensure of
+    /// an absent image takes. An engine error or timeout keeps the record, as at startup.
+    /// Tests that run an ensure on a `ready` record reach `configured()`'s engine.
+    fn demote_ready_if_gone(
+        self: &Arc<Self>,
+        image_id: &str,
+        recorded_ref: &str,
+        registry_ref: &str,
+        version: &str,
+    ) -> bool {
+        if !matches!(
+            self.runtime
+                .image_present_within(recorded_ref, crate::runtime::ENGINE_INSPECTION_BUDGET),
+            Ok(false)
+        ) {
+            return false;
+        }
+        let _admission = self.admission.read().unwrap();
+        if !self.has_op_capacity(image_id) {
+            return false;
+        }
+        {
             let ops = self.ops.lock().unwrap();
-            let records = self.records.lock().unwrap();
-            match records.get(image_id) {
+            let mut records = self.records.lock().unwrap();
+            match records.get_mut(image_id) {
                 Some(rec)
                     if !ops.contains_key(image_id)
                         && rec.state == ImageState::Ready
-                        && rec.version == version =>
+                        && rec.registry_ref == recorded_ref =>
                 {
-                    rec.registry_ref.clone()
+                    rec.mark_absent();
                 }
-                _ => return,
-            }
-        };
-        if !matches!(
-            self.runtime
-                .image_present_within(&registry_ref, crate::runtime::ENGINE_INSPECTION_BUDGET),
-            Ok(false)
-        ) {
-            return;
-        }
-        let ops = self.ops.lock().unwrap();
-        let mut records = self.records.lock().unwrap();
-        if let Some(rec) = records.get_mut(image_id) {
-            if !ops.contains_key(image_id)
-                && rec.state == ImageState::Ready
-                && rec.registry_ref == registry_ref
-            {
-                rec.mark_absent();
-                info!("image {image_id}: ready -> Absent, {registry_ref} is gone from the engine");
+                _ => return false,
             }
         }
+        info!("image {image_id}: ready -> Absent, {recorded_ref} is gone from the engine");
+        self.plan_ensure(image_id, registry_ref, version)
     }
 
     /// `image_build` (agent-api.md). Acks immediately; download + `docker build` run
@@ -3701,7 +3718,7 @@ mod tests {
         assert!(records["steam"].error.is_empty());
     }
 
-    // serialization bookkeeping (no threads; a `ready` ensure makes one engine inspect)
+    // serialization bookkeeping (no threads, no docker)
 
     /// #675. `configured()` is process-wide, so the engine is faked in a child process
     /// (running `test`, `mode` in `QUASAR_IMAGES_ENGINE_CHILD`) pointed at a socket this
@@ -3772,15 +3789,20 @@ mod tests {
         std::env::var("QUASAR_IMAGES_ENGINE_CHILD").ok()
     }
 
+    fn ready_manager() -> Arc<ImageManager> {
+        let m = ImageManager::empty_for_test();
+        m.set_ready_for_test("steam", REF1, "v1");
+        m
+    }
+
     #[test]
     fn ensure_of_a_ready_image_the_engine_lost_takes_the_pull_path() {
         const THIS: &str =
             "images::tests::ensure_of_a_ready_image_the_engine_lost_takes_the_pull_path";
         if engine_child_mode().is_some() {
-            let m = ImageManager::empty_for_test();
-            m.set_ready_for_test("steam", REF1, "v1");
+            let m = ready_manager();
             assert!(
-                m.plan_ensure("steam", REF1, "v1"),
+                m.demote_ready_if_gone("steam", REF1, REF1, "v1"),
                 "a lost tag must start a pull"
             );
             assert_eq!(
@@ -3793,13 +3815,33 @@ mod tests {
         assert_eq!(run_against_fake_engine(THIS, "lost", reply), 1);
     }
 
+    /// End to end through `handle_ensure`: acked as ready, then the background check
+    /// finds the tag gone and the normal pull op starts (the record leaves `ready`).
+    #[test]
+    fn a_lost_tag_found_after_the_ack_starts_a_pull() {
+        const THIS: &str = "images::tests::a_lost_tag_found_after_the_ack_starts_a_pull";
+        if engine_child_mode().is_some() {
+            let m = ready_manager();
+            match m.handle_ensure("e".into(), "steam".into(), REF1.into(), "v1".into()) {
+                AgentMsg::Ack { ok, .. } => assert!(ok),
+                other => panic!("expected Ack, got {other:?}"),
+            }
+            let give_up = Instant::now();
+            while m.records.lock().unwrap()["steam"].state == ImageState::Ready {
+                assert!(give_up.elapsed() < Duration::from_secs(10), "still ready");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return;
+        }
+        run_against_fake_engine(THIS, "e2e", Some((404, r#"{"message":"No such image"}"#)));
+    }
+
     #[test]
     fn an_engine_error_on_the_inspect_keeps_the_ready_record() {
         const THIS: &str = "images::tests::an_engine_error_on_the_inspect_keeps_the_ready_record";
         if engine_child_mode().is_some() {
-            let m = ImageManager::empty_for_test();
-            m.set_ready_for_test("steam", REF1, "v1");
-            assert!(!m.plan_ensure("steam", REF1, "v1"));
+            let m = ready_manager();
+            assert!(!m.demote_ready_if_gone("steam", REF1, REF1, "v1"));
             assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Ready);
             return;
         }
@@ -3807,18 +3849,15 @@ mod tests {
         assert_eq!(run_against_fake_engine(THIS, "error", reply), 1);
     }
 
-    /// A hung engine must not park the connection task past the control plane's 20 s
-    /// read deadline: the inspect is bounded by `ENGINE_INSPECTION_BUDGET` and keeps
-    /// the record.
+    /// A hung engine is bounded by `ENGINE_INSPECTION_BUDGET` and keeps the record.
     #[test]
     fn a_hung_engine_inspect_is_bounded_and_keeps_the_ready_record() {
         const THIS: &str =
             "images::tests::a_hung_engine_inspect_is_bounded_and_keeps_the_ready_record";
         if engine_child_mode().is_some() {
-            let m = ImageManager::empty_for_test();
-            m.set_ready_for_test("steam", REF1, "v1");
+            let m = ready_manager();
             let started = Instant::now();
-            assert!(!m.plan_ensure("steam", REF1, "v1"));
+            assert!(!m.demote_ready_if_gone("steam", REF1, REF1, "v1"));
             assert!(
                 started.elapsed()
                     < crate::runtime::ENGINE_INSPECTION_BUDGET + Duration::from_secs(3),
@@ -3829,6 +3868,37 @@ mod tests {
             return;
         }
         assert_eq!(run_against_fake_engine(THIS, "hung", None), 1);
+    }
+
+    /// The ack never waits on the engine: a burst of ready ensures against an engine
+    /// that never answers is acked at once (the control plane's ack timeout is 15 s).
+    #[test]
+    fn a_burst_of_ready_ensures_is_acked_without_waiting_for_a_hung_engine() {
+        const THIS: &str =
+            "images::tests::a_burst_of_ready_ensures_is_acked_without_waiting_for_a_hung_engine";
+        if engine_child_mode().is_some() {
+            let m = ImageManager::empty_for_test();
+            for id in ["a", "b", "c"] {
+                m.set_ready_for_test(id, REF1, "v1");
+            }
+            let started = Instant::now();
+            for id in ["a", "b", "c"] {
+                match m.handle_ensure("e".into(), id.into(), REF1.into(), "v1".into()) {
+                    AgentMsg::Ack { ok, .. } => assert!(ok),
+                    other => panic!("expected Ack, got {other:?}"),
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+            for id in ["a", "b", "c"] {
+                assert_eq!(m.records.lock().unwrap()[id].state, ImageState::Ready);
+            }
+            return;
+        }
+        run_against_fake_engine(THIS, "burst", None);
     }
 
     #[test]
@@ -4458,7 +4528,7 @@ mod tests {
         );
     }
 
-    // serialization bookkeeping (no threads; a `ready` ensure makes one engine inspect)
+    // serialization bookkeeping (no threads, no docker)
 
     #[test]
     fn completed_builds_replay_ready_or_fixed_failure_after_control_plane_disconnect() {
