@@ -66,9 +66,9 @@ type BlobStore struct {
 
 	resizes     singleflight.Group
 	resizeSlots chan struct{}
-	// undecodable holds the names of stored blobs that cannot be resized, so
-	// they are not decoded again on every `?w=`. Only a blob that exists is
-	// added and PruneOrphans removes it, so it never outgrows the store.
+	// undecodable holds the names of stored blobs whose bytes cannot be
+	// resized, so they are not decoded again on every `?w=`. Only a blob that
+	// was read is added and PruneOrphans removes it, so it never outgrows the store.
 	undecodable sync.Map
 }
 

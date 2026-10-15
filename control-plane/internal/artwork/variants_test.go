@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"image"
 	"image/color"
@@ -11,14 +12,119 @@ import (
 	"image/png"
 	"io"
 	"log/slog"
+	"math/bits"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"testing/synctest"
 )
+
+// fakeDecode backs the "QFAKE" format, which only a test writes to disk (Put
+// sniffs it as no image): its header reads as 600x900 and decoding calls this.
+var fakeDecode func() (image.Image, error)
+
+func init() {
+	image.RegisterFormat("qfake", "QFAKE",
+		func(io.Reader) (image.Image, error) { return fakeDecode() },
+		func(io.Reader) (image.Config, error) { return image.Config{Width: 600, Height: 900}, nil })
+}
+
+// putRaw stores bytes Put would refuse, under a .png name.
+func putRaw(t *testing.T, b *BlobStore, raw []byte) string {
+	t.Helper()
+	name := sha(raw) + ".png"
+	if err := os.MkdirAll(filepath.Dir(b.pathFor(name)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b.pathFor(name), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return name
+}
+
+// losslessWebP encodes an opaque image as the simplest VP8L stream: no
+// transforms, an 8-bit code per colour channel and a one-symbol alpha code.
+// x/image has no WebP encoder.
+func losslessWebP(img *image.NRGBA) []byte {
+	var out []byte
+	var acc uint64
+	var n uint
+	put := func(v uint64, width uint) { // VP8L packs bits from the low end
+		acc |= v << n
+		for n += width; n >= 8; n -= 8 {
+			out = append(out, byte(acc))
+			acc >>= 8
+		}
+	}
+	bit := func(c bool) uint64 {
+		if c {
+			return 1
+		}
+		return 0
+	}
+	r := img.Bounds()
+	put(0x2f, 8)
+	put(uint64(r.Dx()-1), 14)
+	put(uint64(r.Dy()-1), 14)
+	put(0, 1+3+1+1+1) // alpha hint, version, no transform, no colour cache, no meta codes
+	eightBit := func(alphabet int) {
+		put(0, 1)    // normal code
+		put(12-4, 4) // code-length code lengths, in order 17 18 0 1 2 3 4 5 16 6 7 8
+		for i := range 12 {
+			put(bit(i == 2 || i == 11), 3) // only lengths 0 and 8 are used, one bit each
+		}
+		put(0, 1) // lengths for the whole alphabet follow
+		for s := range alphabet {
+			put(bit(s < 256), 1) // 1 is length 8, 0 is unused
+		}
+	}
+	eightBit(256 + 24) // green, then the unused length prefixes
+	eightBit(256)      // red
+	eightBit(256)      // blue
+	put(1, 1)          // alpha: simple code,
+	put(0, 1)          // one symbol,
+	put(1, 1)          // 8 bits wide:
+	put(255, 8)        // opaque
+	put(1, 1)          // distance: simple code,
+	put(0, 1)          // one symbol,
+	put(0, 1)          // 1 bit wide:
+	put(0, 1)          // unused
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		for x := r.Min.X; x < r.Max.X; x++ {
+			c := img.NRGBAAt(x, y)
+			for _, v := range []uint8{c.G, c.R, c.B} {
+				put(uint64(bits.Reverse8(v)), 8) // a prefix code is read from its top bit
+			}
+		}
+	}
+	if n > 0 {
+		out = append(out, byte(acc))
+	}
+	size := len(out)
+	if size%2 == 1 {
+		out = append(out, 0) // RIFF pads a chunk to even length
+	}
+	le := binary.LittleEndian
+	file := le.AppendUint32([]byte("RIFF"), uint32(12+len(out)))
+	file = append(file, "WEBPVP8L"...)
+	file = le.AppendUint32(file, uint32(size))
+	return append(file, out...)
+}
+
+func serveAssets(t *testing.T, b *BlobStore) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	pass := func(next http.Handler) http.Handler { return next }
+	NewHandler(&Service{blobs: b}, slog.New(slog.DiscardHandler)).Register(mux, pass, pass)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
 
 func encodePNG(t *testing.T, img image.Image) []byte {
 	t.Helper()
@@ -142,7 +248,7 @@ func TestOpenVariantKeepsTransparencyAsPNG(t *testing.T) {
 
 // The fixture is so small that any copy is bigger, so the decode shows as the
 // marker rather than as a JPEG.
-func TestOpenVariantDecodesWebP(t *testing.T) {
+func TestOpenVariantDecodesLossyWebP(t *testing.T) {
 	b := newBlobs(t)
 	name, err := b.Put("image/webp", webp120x180)
 	if err != nil {
@@ -154,6 +260,21 @@ func TestOpenVariantDecodesWebP(t *testing.T) {
 	}
 	if _, err := os.Stat(b.variantPath(name, "96", "orig")); err != nil {
 		t.Errorf("the WebP was not decoded and scaled: %v", err)
+	}
+}
+
+func TestOpenVariantServesAnOpaqueWebPAsJPEG(t *testing.T) {
+	b := newBlobs(t)
+	name, err := b.Put("image/webp", losslessWebP(gradient(400, 600, 255)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, ct, immutable, err := b.OpenVariant(t.Context(), name, "96")
+	if err != nil || ct != "image/jpeg" || !immutable || http.DetectContentType(data) != "image/jpeg" {
+		t.Fatalf("want a JPEG copy, immutable, got %s, %v, %v", ct, immutable, err)
+	}
+	if w, h := decodeSize(t, data); w != 96 || h != 144 {
+		t.Errorf("size: want 96x144, got %dx%d", w, h)
 	}
 }
 
@@ -232,7 +353,7 @@ func TestOpenVariantCancelledWhileQueuedDoesNotDecode(t *testing.T) {
 // with the original without queueing for a slot, and pruning the blob forgets it.
 func TestOpenVariantRemembersUndecodableSources(t *testing.T) {
 	b := newBlobs(t)
-	raw := brokenJPEG(t)
+	raw := brokenJPEG(t, 600, 900)
 	name, err := b.Put("image/jpeg", raw)
 	if err != nil {
 		t.Fatal(err)
@@ -306,11 +427,101 @@ func TestOpenVariantServesTheCopyWhenTheCacheWriteFails(t *testing.T) {
 	}
 }
 
+// A width that needs no copy keeps the immutable original after another width
+// failed, and a header that does not parse falls back at every width.
+func TestOpenVariantFailureLeavesAFittingWidthImmutable(t *testing.T) {
+	b := newBlobs(t)
+	name, _ := b.Put("image/jpeg", brokenJPEG(t, 500, 800))
+	for i, step := range []struct {
+		w         string
+		immutable bool
+	}{{"560", true}, {"96", false}, {"560", true}} {
+		if _, _, immutable, err := b.OpenVariant(t.Context(), name, step.w); err != nil || immutable != step.immutable {
+			t.Errorf("step %d, w=%s: want immutable=%v, got %v, %v", i, step.w, step.immutable, immutable, err)
+		}
+	}
+
+	raw := []byte("not an image header")
+	garbled := putRaw(t, b, raw)
+	for w := range variantWidths {
+		if data, _, immutable, err := b.OpenVariant(t.Context(), garbled, w); err != nil || immutable || !bytes.Equal(data, raw) {
+			t.Errorf("unparseable header, w=%s: want the original, not immutable, got %v, %v", w, immutable, err)
+		}
+	}
+}
+
+// A read error is not a property of the blob: that request gets the original,
+// and the next one makes the copy.
+func TestOpenVariantRetriesAfterAReadError(t *testing.T) {
+	b := newBlobs(t)
+	raw := encodePNG(t, gradient(600, 900, 255))
+	name, _ := b.Put("image/png", raw)
+	openBlob = func(string) (*os.File, error) { return nil, syscall.EMFILE }
+	t.Cleanup(func() { openBlob = os.Open })
+	data, _, immutable, err := b.OpenVariant(t.Context(), name, "96")
+	if err != nil || immutable || !bytes.Equal(data, raw) {
+		t.Fatalf("want the original, not immutable, got %d bytes, %v, %v", len(data), immutable, err)
+	}
+	openBlob = os.Open
+	if _, ct, immutable, err := b.OpenVariant(t.Context(), name, "96"); err != nil || ct != "image/jpeg" || !immutable {
+		t.Fatalf("the read error was remembered: got %s, %v, %v", ct, immutable, err)
+	}
+}
+
+// A decoder panic would otherwise end the process: singleflight re-panics it
+// on a goroutine of its own. The blob is then remembered like any other that
+// does not decode.
+func TestAssetRouteSurvivesADecoderPanic(t *testing.T) {
+	b := newBlobs(t)
+	var decodes atomic.Int32
+	fakeDecode = func() (image.Image, error) { decodes.Add(1); panic("decoder bug") }
+	t.Cleanup(func() { fakeDecode = nil })
+	raw := []byte("QFAKE that panics")
+	name := putRaw(t, b, raw)
+	srv := serveAssets(t, b)
+	for i := range 2 {
+		resp, err := http.Get(srv.URL + "/v1/artwork/" + name + "?w=96")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !bytes.Equal(body, raw) || resp.Header.Get("Cache-Control") != "public, max-age=300" {
+			t.Fatalf("request %d: want the original with a short max-age, got %d %q", i, resp.StatusCode, resp.Header.Get("Cache-Control"))
+		}
+	}
+	if n := decodes.Load(); n != 1 {
+		t.Errorf("decoded %d times, want 1", n)
+	}
+}
+
+// A copy finished after a prune removed its source is not left behind.
+func TestOpenVariantDropsACopyWhoseSourceWasPruned(t *testing.T) {
+	b := newBlobs(t)
+	// Padded so that the copy is smaller and a JPEG is written.
+	name := putRaw(t, b, append([]byte("QFAKE"), make([]byte, 64<<10)...))
+	fakeDecode = func() (image.Image, error) {
+		if _, err := b.PruneOrphans(nil); err != nil {
+			t.Error(err)
+		}
+		return gradient(600, 900, 255), nil
+	}
+	t.Cleanup(func() { fakeDecode = nil })
+	if _, _, _, err := b.OpenVariant(t.Context(), name, "96"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("want not-exist, got %v", err)
+	}
+	for _, ext := range []string{"jpg", "png", "orig"} {
+		if _, err := os.Stat(b.variantPath(name, "96", ext)); !os.IsNotExist(err) {
+			t.Errorf("the .%s copy of a pruned source was kept", ext)
+		}
+	}
+}
+
 // brokenJPEG is a JPEG whose header reads but whose body does not decode.
-func brokenJPEG(t *testing.T) []byte {
+func brokenJPEG(t *testing.T, w, h int) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, gradient(600, 900, 255), nil); err != nil {
+	if err := jpeg.Encode(&buf, gradient(w, h, 255), nil); err != nil {
 		t.Fatal(err)
 	}
 	return buf.Bytes()[:buf.Len()/2]
@@ -362,17 +573,12 @@ func TestAssetRouteServesSizedVariants(t *testing.T) {
 	name, _ := b.Put("image/png", encodePNG(t, gradient(600, 900, 255)))
 	smallRaw := encodePNG(t, gradient(300, 450, 255))
 	small, _ := b.Put("image/png", smallRaw)
-	broken := brokenJPEG(t)
+	broken := brokenJPEG(t, 600, 900)
 	brokenName, err := b.Put("image/jpeg", broken)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	mux := http.NewServeMux()
-	pass := func(next http.Handler) http.Handler { return next }
-	NewHandler(&Service{blobs: b}, slog.New(slog.DiscardHandler)).Register(mux, pass, pass)
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+	srv := serveAssets(t, b)
 
 	get := func(path string) (*http.Response, []byte) {
 		t.Helper()

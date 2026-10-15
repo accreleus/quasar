@@ -50,20 +50,22 @@ func (b *BlobStore) OpenVariant(ctx context.Context, name, width string) (data [
 	if data, ct, ok := b.readVariant(name, width); ok {
 		return data, ct, true, nil
 	}
-	if _, bad := b.undecodable.Load(name); bad {
-		return b.fallback(name)
-	}
+	// A header error is never remembered: it may be a read error that passes,
+	// and an unparseable header costs no decode to find again.
 	scale, err := b.coverScale(name, w)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return nil, "", false, err
 	case err != nil:
-		b.undecodable.Store(name, struct{}{})
-		b.log.Warn("artwork: cannot resize asset, serving the original", "err", err)
+		b.log.Warn("artwork: cannot resize asset, serving the original", "asset", name, "err", err)
 		return b.fallback(name)
 	case scale >= 1:
 		data, ct, err := b.Open(name)
 		return data, ct, true, err
+	}
+	// Only here, so a width that needs no copy stays immutable after a failure at another.
+	if _, bad := b.undecodable.Load(name); bad {
+		return b.fallback(name)
 	}
 	for {
 		ch := b.resizes.DoChan(name+"@"+width, func() (any, error) { return b.resize(ctx, name, width, scale) })
@@ -116,10 +118,13 @@ func (b *BlobStore) readVariant(name, width string) ([]byte, string, bool) {
 	return nil, "", false
 }
 
+// openBlob is os.Open; a test swaps it to inject a read error.
+var openBlob = os.Open
+
 // coverScale reads only the header and returns the factor that makes the image
 // just cover a w×1.5w frame; 1 or more means it already does.
 func (b *BlobStore) coverScale(name string, w int) (float64, error) {
-	f, err := os.Open(b.pathFor(name))
+	f, err := openBlob(b.pathFor(name))
 	if err != nil {
 		return 0, err
 	}
@@ -140,7 +145,7 @@ func (b *BlobStore) coverScale(name string, w int) (float64, error) {
 // resize takes a slot, then reads, decodes, scales and encodes: JPEG when the
 // source is opaque, PNG when it has transparency. ctx only bounds the wait;
 // once a slot is taken the copy is finished and cached for whoever asks next.
-func (b *BlobStore) resize(ctx context.Context, name, width string, scale float64) (variant, error) {
+func (b *BlobStore) resize(ctx context.Context, name, width string, scale float64) (_ variant, err error) {
 	if data, ct, ok := b.readVariant(name, width); ok { // finished since the caller looked
 		return variant{data, ct}, nil
 	}
@@ -160,6 +165,16 @@ func (b *BlobStore) resize(ctx context.Context, name, width string, scale float6
 		}
 		return variant{}, err
 	}
+	// A decode failure or a panic past this point is a property of the bytes and
+	// is remembered. The panic must be recovered here: singleflight re-panics it
+	// on the DoChan goroutine, where it kills the process.
+	defer func() {
+		if p := recover(); p != nil {
+			b.undecodable.Store(name, struct{}{})
+			b.log.Error("artwork: resize panicked, serving the original", "asset", name, "w", width, "panic", p)
+			err = fmt.Errorf("artwork: resize %s: panic: %v", name, p)
+		}
+	}()
 	src, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
 		b.undecodable.Store(name, struct{}{})
@@ -191,6 +206,12 @@ func (b *BlobStore) resize(ctx context.Context, name, width string, scale float6
 	}
 	if err := writeAtomic(path, file); err != nil {
 		b.log.Warn("artwork: could not cache a sized copy", "asset", name, "w", width, "err", err)
+	}
+	// A prune that removed the source meanwhile has walked past this file. A
+	// prune racing this check can still leave it, until the next prune.
+	if !b.Has(name) {
+		_ = os.Remove(path)
+		return variant{}, os.ErrNotExist
 	}
 	return out, nil
 }
