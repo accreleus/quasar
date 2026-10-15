@@ -154,9 +154,6 @@ const READY_CHECK_DEADLINE: Duration = crate::runtime::ENGINE_INSPECTION_BUDGET;
 /// waiting pull never takes the permit a launch's last attempt is after.
 const PULL_BUSY_BUDGET: Duration = Duration::from_secs(4);
 
-/// `run_pull`'s error when a queued operation replaced the pull while it waited for a slot.
-const SUPERSEDED: &str = "superseded by a queued operation";
-
 /// Wall-clock bound after a catalog pull acquires its shared pull/build permit.
 /// Assignment preparation uses a shorter ten-minute budget.
 const PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -2085,7 +2082,10 @@ impl ImageManager {
         self.emit(image_id);
 
         match self.pull_with_progress(image_id, generation, registry_ref) {
-            Ok(bytes) => {
+            // Superseded while waiting for a slot: nothing was pulled and nothing failed.
+            // Leave the record as staged; the worker promotes the queued op.
+            Ok(None) => return,
+            Ok(Some(bytes)) => {
                 self.commit(image_id, generation, |rec| rec.mark_ready(bytes));
                 info!("image {image_id} ({registry_ref}) pulled: ready ({bytes} bytes), version {version}");
                 // The one choke-point where an image becomes usable on this host, so
@@ -2104,7 +2104,6 @@ impl ImageManager {
         self.emit_terminal(image_id);
     }
 
-    /// Observe coalesced API progress; engine work outlives control-plane reconnects.
     /// `generation`'s op still owns the slot and nothing newer is queued behind it.
     fn is_latest_intent(&self, image_id: &str, generation: u64) -> bool {
         let ops = self.ops.lock().unwrap();
@@ -2112,12 +2111,14 @@ impl ImageManager {
             .is_some_and(|slot| slot.generation == generation && slot.pending.is_none())
     }
 
+    /// Observe coalesced API progress; engine work outlives control-plane reconnects.
+    /// `Ok(None)`: a queued op replaced this pull while it waited out `Busy`.
     fn pull_with_progress(
         &self,
         image_id: &str,
         generation: u64,
         registry_ref: &str,
-    ) -> Result<u64, String> {
+    ) -> Result<Option<u64>, String> {
         let runtime = crate::runtime::configured().map_err(errors::map_runtime_error)?;
         let mut throttle = ProgressThrottle::new();
         let give_up = Instant::now() + PULL_BUSY_BUDGET;
@@ -2133,19 +2134,19 @@ impl ImageManager {
             match result {
                 Err(e) if e.kind == crate::runtime::ErrorKind::Busy => {
                     std::thread::sleep(crate::session::teardown::STOP_PAUSE);
+                    // A resubmitted pull is detached and ignores cancellation, so ask only
+                    // while this op is still the latest intent. Checked before the deadline
+                    // so a queued op is never reported as a busy failure.
+                    if !self.is_latest_intent(image_id, generation) {
+                        return Ok(None);
+                    }
                     if Instant::now() >= give_up {
                         return Err(errors::map_runtime_error(e));
-                    }
-                    // A resubmitted pull is detached and ignores cancellation, so ask only
-                    // while this op is still the latest intent; the worker then promotes
-                    // what was queued.
-                    if !self.is_latest_intent(image_id, generation) {
-                        return Err(SUPERSEDED.to_string());
                     }
                 }
                 other => {
                     return other
-                        .map(|info| info.bytes)
+                        .map(|info| Some(info.bytes))
                         .map_err(errors::map_runtime_error)
                 }
             }
@@ -4041,12 +4042,14 @@ mod tests {
         assert!(served >= 6, "four held inspects, then the pull: {served}");
     }
 
-    /// A remove queued while the pull waits out `Busy` supersedes it: no `ensure_image`
-    /// reaches the engine (only the four unanswered inspects that held the slots do).
+    /// A first pull (no `registry_ref` yet) waiting out `Busy` with all four engine slots held
+    /// is replaced by a remove queued meanwhile. Driven through the worker: no
+    /// `ensure_image` reaches the engine, no `failed` state is emitted or committed, and
+    /// the record ends `absent`.
     #[test]
-    fn a_queued_op_ends_a_pull_waiting_out_busy_without_resubmitting() {
+    fn a_queued_remove_supersedes_a_pull_waiting_out_busy_without_a_failed_state() {
         const THIS: &str =
-            "images::tests::a_queued_op_ends_a_pull_waiting_out_busy_without_resubmitting";
+            "images::tests::a_queued_remove_supersedes_a_pull_waiting_out_busy_without_a_failed_state";
         if engine_child_mode().is_some() {
             let runtime = crate::runtime::configured().unwrap();
             let _held: Vec<_> = (0..4)
@@ -4058,23 +4061,34 @@ mod tests {
                 })
                 .collect();
             let m = ImageManager::empty_for_test();
-            m.ops.lock().unwrap().insert(
-                "steam".into(),
-                OpSlot {
-                    running: ensure("v1", REF1),
-                    generation: 1,
-                    pending: None,
-                },
-            );
-            let queuer = m.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                queuer.ops.lock().unwrap().get_mut("steam").unwrap().pending =
-                    Some(ImageOp::Remove);
-            });
+            let (tx, mut rx) = mpsc::channel(64);
+            let _guard = m.attach_upstream(tx);
+            match m.handle_ensure("e".into(), "steam".into(), REF1.into(), "v1".into()) {
+                AgentMsg::Ack { ok, .. } => assert!(ok),
+                other => panic!("expected Ack, got {other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            m.handle_remove("r".into(), "steam".into());
+            let give_up = Instant::now();
+            while m.ops.lock().unwrap().contains_key("steam") {
+                assert!(
+                    give_up.elapsed() < Duration::from_secs(10),
+                    "worker never finished"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Absent);
+            let mut states = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                if let AgentMsg::ImageState { state, .. } = msg {
+                    states.push(state);
+                }
+            }
+            assert!(!states.iter().any(|s| s == "failed"), "{states:?}");
             assert_eq!(
-                m.pull_with_progress("steam", 1, REF1).unwrap_err(),
-                SUPERSEDED
+                states.last().map(String::as_str),
+                Some("absent"),
+                "{states:?}"
             );
             return;
         }
