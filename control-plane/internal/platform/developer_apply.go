@@ -221,7 +221,7 @@ func (h *ApplyHandler) handleDeveloperApply(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var req DeveloperApplyRequest
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "the request body is not a developer apply: "+err.Error())
