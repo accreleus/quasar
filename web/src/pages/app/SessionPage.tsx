@@ -106,7 +106,14 @@ interface SessionState {
   playoutOverride?: number | null;
 }
 
+// Keyed on the id so a route change between two sessions (a toast's "Go to
+// session", back/forward) starts the next one with fresh state (#560).
 export function SessionPage() {
+  const { id } = useParams<{ id: string }>();
+  return <SessionPageBody key={id} />;
+}
+
+function SessionPageBody() {
   const { id: sessionId } = useParams<{ id: string }>();
   const { state } = useLocation() as { state: SessionState | null };
   const { token: authToken } = useAuth();
