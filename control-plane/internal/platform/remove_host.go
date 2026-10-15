@@ -98,7 +98,7 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req RemoveHostRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "the request body is not valid JSON")
 		return
 	}

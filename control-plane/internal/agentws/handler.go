@@ -808,7 +808,7 @@ func (h *Handler) Register(mux httpx.Router) {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	clientIP := ratelimit.ClientIP(r, h.trustedProxies)
+	clientIP := ratelimit.PrefixKey(r, h.trustedProxies) // #674: an IPv6 /64 is one budget
 	if !h.failures.Reserve(clientIP, enrollmentMaxInFlightIP, enrollmentMaxInFlight) {
 		http.Error(w, "too many failed enrollment attempts; try again later", http.StatusTooManyRequests)
 		return
