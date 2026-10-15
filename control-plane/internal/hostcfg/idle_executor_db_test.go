@@ -720,6 +720,75 @@ func TestHistoricalAppliedInventoryCannotClaimAChangedActiveSnapshot(t *testing.
 	}
 }
 
+// A retry can apply the revision an earlier attempt recovered from. The agent
+// reports every record in attempt-id order, so the recovered one may follow.
+func TestRecoveredReplayKeepsALaterAppliedGroup(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID, boot, first := offeredHardwareAttempt(t, pool, store)
+	ctx := context.Background()
+	recovered := restartInventoryEntry(hostID, boot, first, "recovered", "6")
+	recovered.ErrorCode = "candidate_startup_failed"
+	seeded := map[string]PolicySnapshot{"hardware": {Kind: "seeded", Digest: strings.Repeat("a", 64)}}
+	second := "00000000-0000-4000-8000-000000000339"
+	if err := store.BeginJournalReconciliation(ctx, hostID, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteJournalReconciliation(ctx, hostID, second, []JournalInventoryEntry{recovered}, seeded); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, second,
+		json.RawMessage(`{"encoder":"openh264","render_node":"","cuda_device":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := store.PreviewIdleApply(ctx, hostID, "hardware")
+	if err != nil || preview == nil || !preview.Available {
+		t.Fatalf("retry preview: %+v %v", preview, err)
+	}
+	if _, err := store.ApproveIdleApply(ctx, hostID, "hardware", reviewedIdleApply(preview)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveIdleHeartbeat(ctx, hostID, second, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET source_preparation_reported_at=now(),last_registered_at=now()-interval '1 minute' WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := store.NextIdleOffer(ctx, hostID, boot, second)
+	if err != nil || retry == nil {
+		t.Fatalf("retry offer: %+v %v", retry, err)
+	}
+	if retry.Revision != first.Revision || retry.ContentSHA256 != first.ContentSHA256 {
+		t.Fatal("fixture must retry the same revision and digest")
+	}
+	// A leftover hold of the recovered attempt is still released on replay.
+	if _, err := pool.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+		VALUES($1::uuid,'idle_apply',$2::uuid,'idle_configuration')`, hostID, first.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	applied := restartInventoryEntry(hostID, boot, retry, "applied", "4")
+	applied.GrantConnection = second
+	applied.VerifiedAt = &now
+	third := "00000000-0000-4000-8000-000000000340"
+	if err := store.BeginJournalReconciliation(ctx, hostID, third); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteJournalReconciliation(ctx, hostID, third, []JournalInventoryEntry{applied, recovered},
+		map[string]PolicySnapshot{"hardware": {Kind: "verified", Digest: retry.ContentSHA256}}); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.GetPolicy(ctx, hostID)
+	if err != nil || view.Groups["hardware"].Status != "applied" {
+		t.Fatalf("recovered replay overwrote the applied retry: %+v %v", view.Groups["hardware"], err)
+	}
+	var leftover int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_id=$2::uuid`,
+		hostID, first.AttemptID).Scan(&leftover); err != nil || leftover != 0 {
+		t.Fatalf("recovered replay kept its hold: %d %v", leftover, err)
+	}
+}
+
 // Two entries for one attempt each pass validation against the same row; the
 // second must not move holds after the first has made the row terminal.
 func TestJournalInventoryWithTwoPhasesForOneAttemptQuarantines(t *testing.T) {
