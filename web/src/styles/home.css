@@ -970,7 +970,7 @@
 /* The band scrolls itself into view with block:nearest, which lines its bottom up with the
    viewport's: under the fixed phone tab bar (hiding Play) and the glass topbar. */
 .detail {
-  scroll-margin-top: calc(var(--topbar-h) + var(--s4));
+  scroll-margin-top: calc(64px + var(--s4));
 }
 @media (max-width: 820px) {
   .detail {
@@ -1151,7 +1151,7 @@
   margin-top: var(--s3);
 }
 .detail .lm-cap-fatal {
-  color: var(--danger-text);
+  color: var(--d-danger);
   font-size: var(--t-sm);
 }
 
@@ -1187,7 +1187,7 @@
   color: var(--d-ink-strong);
 }
 .detail .d-actions .icon-btn[aria-pressed="true"] svg {
-  color: var(--danger-text);
+  color: var(--d-danger);
 }
 
 /* ---- launch options overlay ------------------------------------------- */

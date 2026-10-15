@@ -695,9 +695,9 @@
     background: var(--accent);
   }
 
-  /* The bar floats over the page; give the scrolled box room under it. */
+  /* The bar floats over the page; give the scrolled box room under it, home-indicator gutter included. */
   .main {
-    padding-bottom: calc(var(--tabbar-h) + var(--s6));
+    padding-bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px) + var(--s6));
   }
 }
 
