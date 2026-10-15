@@ -374,6 +374,7 @@ export const UTILITIES: ReadonlyMap<string, string> = new Map([
   ["color:var(--muted)", "muted"],
   ["color:var(--text-2)", "sec"],
   ["color:var(--warning-text)", "tone-warning"],
+  ["color:var(--danger-text)", "tone-danger"],
   ["color:var(--info-text)", "tone-info"],
 ]);
 

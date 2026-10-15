@@ -12,12 +12,11 @@
  * purpose: `rgba(var(--scrim-rgb), a)` needs a comma triple, while
  * `rgb(var(--accent-rgb))` uses the space syntax home.css's fallback uses. */
 export interface HeroPalette {
-  /** "r,g,b" — the 80%-mixed scrim colour. */
+  /** "r,g,b" — the art's average mixed 80% toward black. Always toward black: the
+   *  band's ink is pinned light in both themes, so a light scrim has no contrast. */
   scrimRgb: string;
   /** "r g b" — the most saturated accent pixel. */
   accentRgb: string;
-  /** true when the art reads dark enough that hero text should be light. */
-  darkArt: boolean;
 }
 
 /** Brand violet (106,69,245) over the app's dark ink-2 (#11111a) — used
@@ -26,19 +25,16 @@ export interface HeroPalette {
 export const DEFAULT_HERO_PALETTE: HeroPalette = {
   scrimRgb: "17,17,26",
   accentRgb: "106 69 245",
-  darkArt: true,
 };
 
 const SAMPLE_WIDTH = 64;
 const SAMPLE_HEIGHT = 36;
 /** Only the left 55% is sampled — that's where the band's text sits. */
 const SAMPLE_FRACTION = 0.55;
-/** Below this average luminance (out of 255), art counts as "dark". */
-const DARK_LUMINANCE_THRESHOLD = 140;
 /** A candidate accent pixel must clear this brightness floor — otherwise
  * near-black noise pixels can score as "highly saturated". */
 const ACCENT_BRIGHTNESS_FLOOR = 70;
-/** How far the average colour is mixed toward the scrim's pole (black/white). */
+/** How far the average colour is mixed toward black. */
 const SCRIM_MIX = 0.8;
 
 /**
@@ -82,18 +78,13 @@ export function computePalette(data: Uint8ClampedArray): HeroPalette {
   const r = rSum / n;
   const g = gSum / n;
   const b = bSum / n;
-  const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  const darkArt = luminance < DARK_LUMINANCE_THRESHOLD;
 
-  const mix = (channel: number, pole: number) =>
-    Math.round(channel * (1 - SCRIM_MIX) + pole * SCRIM_MIX);
-  const pole = darkArt ? 0 : 255;
-  const scrim = [mix(r, pole), mix(g, pole), mix(b, pole)];
+  const mix = (channel: number) => Math.round(channel * (1 - SCRIM_MIX));
+  const scrim = [mix(r), mix(g), mix(b)];
 
   return {
     scrimRgb: scrim.join(","),
     accentRgb: `${accentR} ${accentG} ${accentB}`,
-    darkArt,
   };
 }
 

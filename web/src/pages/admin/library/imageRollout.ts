@@ -14,16 +14,47 @@ import { dominantInFlightState, HOST_STATE_COPY } from "./imageStatus";
 export interface ImgVersion {
   version: string;
   sub: string;
-  tone?: "info" | "warning";
+  tone?: "info" | "warning" | "danger";
+}
+
+/** The fleet's host ids, or null while they are unknown: still loading, or the
+ *  first hosts load failed (the list is then the empty seed, not an empty fleet). */
+export function knownFleetIds(
+  hosts: readonly { id: string }[],
+  loading: boolean,
+  hostsError: string | null,
+): ReadonlySet<string> | null {
+  if (loading || (hostsError && hosts.length === 0)) return null;
+  return new Set(hosts.map((h) => h.id));
+}
+
+/** "Failed on 3 of 4 hosts", or null when no fleet host reports a failed build.
+ *  Numerator and denominator are the same set: the current fleet (`fleetHostIds`),
+ *  so a host deleted since the catalog last polled stops counting. `null` means the
+ *  fleet has not loaded yet, so there is no honest denominator: "Failed on 3 hosts".
+ *  The catalog-level `installed` / `update_available` flags never see a per-host
+ *  failure, so every summary of an image's state goes through this first. */
+export function imageFailure(img: CatalogImage, fleetHostIds: ReadonlySet<string> | null): string | null {
+  const failed = (img.hosts ?? []).filter((h) => h.state === "failed");
+  const n = fleetHostIds ? failed.filter((h) => fleetHostIds.has(h.host_id)).length : failed.length;
+  if (n === 0) return null;
+  if (!fleetHostIds) return `Failed on ${n} host${n === 1 ? "" : "s"}`;
+  return `Failed on ${n} of ${fleetHostIds.size} host${fleetHostIds.size === 1 ? "" : "s"}`;
 }
 
 /** §A.13: `{version}` plus a sub of Downloading…/Building… (the same labels
  *  the per-host chips use — HOST_STATE_COPY, not a generic "installing") /
  *  not installed / running {installed} / up to date. In-flight beats
  *  everything else — a real install/update already running must not also
- *  read as "update available". */
-export function imgVersion(img: CatalogImage): ImgVersion {
+ *  read as "update available". A failure on any host beats even that: see
+ *  `imageFailure`. */
+export function imgVersion(img: CatalogImage, fleetHostIds: ReadonlySet<string> | null): ImgVersion {
+  const failed = imageFailure(img, fleetHostIds);
   const inFlight = dominantInFlightState(img);
+  if (failed) {
+    const sub = inFlight ? `${failed} · ${HOST_STATE_COPY[inFlight].label}` : failed;
+    return { version: img.version, sub, tone: "danger" };
+  }
   if (inFlight) return { version: img.version, sub: HOST_STATE_COPY[inFlight].label, tone: "info" };
   if (!img.installed) return { version: img.version, sub: "not installed" };
   if (img.update_available) {

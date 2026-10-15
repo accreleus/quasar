@@ -25,7 +25,7 @@ import type {
 
 // Hosts come from the fleet poll AdminLayout mounts above this page.
 vi.mock("../../../lib/fleet/FleetContext", () => ({
-  useFleetContext: () => ({ hosts: [], sessions: [] }),
+  useFleetContext: () => ({ hosts: [], sessions: [], loading: false, errors: { hosts: null, sessions: null } }),
 }));
 
 vi.mock("../../../api/admin", () => ({

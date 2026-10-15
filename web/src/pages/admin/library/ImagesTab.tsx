@@ -28,7 +28,7 @@ import { useFleetContext } from "../../../lib/fleet/FleetContext";
 import { useResource } from "../../../lib/resource/react";
 import { fmtClockTime, fmtDate } from "../../../lib/formatLegacy";
 import { relativeTime } from "../../../lib/format/relativeTime";
-import { imgRollout, imgVersion, hostImageState, POLICY_COPY } from "./imageRollout";
+import { imgRollout, imgVersion, hostImageState, knownFleetIds, POLICY_COPY } from "./imageRollout";
 import { isImageInFlight } from "./imageStatus";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 
@@ -153,7 +153,12 @@ export function ImagesTab() {
   const images = catalog.data?.images ?? [];
 
   // The fleet poll above this page already holds the hosts (lib/fleet).
-  const { hosts } = useFleetContext();
+  const { hosts, loading: fleetLoading, errors: fleetErrors } = useFleetContext();
+  // null until the fleet is known: a failure count then has no honest denominator.
+  const fleetHostIds = useMemo(
+    () => knownFleetIds(hosts, fleetLoading, fleetErrors.hosts),
+    [hosts, fleetLoading, fleetErrors.hosts],
+  );
 
   const [policySaving, setPolicySaving] = useState(false);
   const settingsRes = useResource({
@@ -351,11 +356,11 @@ export function ImagesTab() {
       key: "version",
       header: "Version",
       render: (img) => {
-        const v = imgVersion(img);
+        const v = imgVersion(img, fleetHostIds);
         return (
           <div>
             <div className="num">{v.version}</div>
-            <div className={v.tone === "warning" ? "sub tone-warning" : v.tone === "info" ? "sub tone-info" : "sub"}>
+            <div className={v.tone ? `sub tone-${v.tone}` : "sub"}>
               {v.sub}
             </div>
           </div>
@@ -382,7 +387,6 @@ export function ImagesTab() {
       render: (img) => {
         const ui = uiFor(img.id);
         const pending = ui.pending !== null;
-        const v = imgVersion(img);
         // A pinned image cannot update. A refresh leaves the adoption intact.
         const isUpdate = img.installed && img.update_available && !img.pinned;
         // The resolver skips non-prebuilt entries, so Install on a template
@@ -399,10 +403,10 @@ export function ImagesTab() {
                 !installable
                   ? notInstallableTitle
                   : isUpdate
-                    ? `Update to ${v.version}`
+                    ? `Update to ${img.version}`
                     : "Refresh adoption status"
               }
-              aria-label={isUpdate ? `Update to ${v.version}` : "Refresh adoption status"}
+              aria-label={isUpdate ? `Update to ${img.version}` : "Refresh adoption status"}
               disabled={pending || !installable}
               onClick={() => void (isUpdate ? handleUpdate(img) : img.installed ? catalog.refresh({ silent: true }) : handleInstall(img))}
             >
