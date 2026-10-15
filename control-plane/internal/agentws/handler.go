@@ -1226,6 +1226,17 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 					h.log.Warn("idle policy journal state for an unknown attempt ignored", "host_id", hostID, "attempt_id", state.AttemptID, "err", err)
 					continue
 				}
+				// Until this connection's journal is applied its pages are the record: a
+				// cached report would make the page's entry conflict or be skipped (#656).
+				// A seq-0 failure is never cached and still reaches its refresh below.
+				if state.Phase != "failed" || state.JournalSequence != "0" {
+					if gate, err := h.cfgStore.JournalGate(bg, hostID); err != nil {
+						h.log.Warn("idle policy journal gate unreadable; state ignored", "host_id", hostID, "err", err)
+						continue
+					} else if gate != "complete" {
+						continue
+					}
+				}
 				fresh, err := ac.acceptPolicySequence(state)
 				if err != nil {
 					ac.policyInventoryBlocked.Store(true)

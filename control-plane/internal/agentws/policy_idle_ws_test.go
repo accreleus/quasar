@@ -223,3 +223,99 @@ func TestFabricatedRestartAttemptsAreNotCached(t *testing.T) {
 		t.Fatalf("sequence cache holds %d/%d entries, want only the valid attempt", len(c.policySequence), len(c.policySequenceContent))
 	}
 }
+
+// A restart report that arrives before this connection's journal is applied is
+// dropped whole: cached, it would make the page carrying the same attempt at the
+// same sequence conflict (the report has a type, the entry none) and drop the
+// connection (#656).
+func TestARestartReportBeforeTheJournalLeavesThePageToApply(t *testing.T) {
+	pool := testPool(t)
+	store := hostcfg.NewStore(pool)
+	ctx := context.Background()
+	boot, err := store.StartRH05Boot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	registry := NewRegistry(log)
+	h := NewHandler(pool, log, registry, nil, nil, store, nil, boot)
+	t.Cleanup(h.Close)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ws.Close() })
+	agent := typedAgent{ws: ws}
+	agent.send(t, map[string]any{
+		"type": "register", "node_name": "journal-pending-656", "agent_version": "test",
+		"auth":                   map[string]string{"enrollment_token": boundEnrollmentToken(t, pool, "journal-pending-656")},
+		"config_policy_versions": map[string]int{"typed_settings": 2, "execution_journal": 1, "deployment_baseline": 1, "idle_apply": 1},
+		"config_policy_groups":   []string{"hardware", "idle_timeout_secs"},
+	})
+	registered := agent.readUntil(t, "registered")
+	agent.hostID, _ = registered["host_id"].(string)
+	// A next-session group lets the legacy-map acknowledgement open the delivery gate.
+	var echo []string
+	snapshots := map[string]any{}
+	for _, group := range registered["config_policy_groups"].([]any) {
+		echo = append(echo, group.(string))
+		snapshots[group.(string)] = map[string]string{"kind": "seeded", "digest": strings.Repeat("a", 64)}
+	}
+	attemptID := "0000abcd-0000-4000-8000-000000000656"
+	grantConnection := "00000000-0000-4000-8000-000000000657"
+	digest := strings.Repeat("b", 64)
+	if _, err := pool.Exec(ctx, `INSERT INTO host_config_approvals(id,host_id,group_key,revision,approved_digest,prerequisites_digest,boot_incarnation,review_id,expires_at,state)
+		VALUES($1::uuid,$2::uuid,'hardware',1,$3,$3,$4::uuid,'00000000-0000-4000-8000-000000000658',now()+interval '1 hour','accepted')`,
+		attemptID, agent.hostID, digest, boot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_config_attempts(id,host_id,group_key,approved_digest,approved_revision,scope,boot_incarnation,grant_connection,phase,journal_sequence,started_at)
+		VALUES($1::uuid,$2::uuid,'hardware',$3,1,'restart',$4::uuid,$5::uuid,'accepted',1,now())`,
+		attemptID, agent.hostID, digest, boot, grantConnection); err != nil {
+		t.Fatal(err)
+	}
+	capacity := map[string]any{
+		"type": "capacity", "host": map[string]any{"cpu_cores": 8, "mem_mb": 32000},
+		"gpus":                          []map[string]any{{"index": 0, "vendor": "nvidia", "model": "test", "vram_mb_total": 16384, "encode_slots_total": 2}},
+		"config_policy_accepted_groups": echo, "deployment_settings": policyBaseline(),
+	}
+	agent.send(t, capacity)
+	request := agent.readUntil(t, "config_policy_journal_inventory_request")
+	entry := map[string]any{
+		"attempt_id": attemptID, "host_id": agent.hostID, "group": "hardware", "revision": "1",
+		"content_sha256": digest, "scope": "restart", "grant_boot_incarnation": boot,
+		"grant_connection_incarnation": grantConnection, "journal_sequence": "2", "phase": "awaiting_startup",
+	}
+	report := map[string]any{"type": "config_policy_state"}
+	for k, v := range entry {
+		report[k] = v
+	}
+	agent.send(t, report)
+	agent.send(t, map[string]any{
+		"type": "config_policy_journal_inventory_page", "inventory_id": request["inventory_id"],
+		"snapshot_id": "00000000-0000-4000-8000-000000000659", "cursor": nil, "next_cursor": nil,
+		"revision_high_water": map[string]string{"hardware": "1"},
+		"active_snapshots":    snapshots,
+		"entries":             []any{entry},
+	})
+	delivery := agent.readUntil(t, "config_update")
+	for delivery["settings_delivery_id"] == nil {
+		delivery = agent.readUntil(t, "config_update")
+	}
+	capacity["config_policy_legacy_map_applied_id"] = delivery["settings_delivery_id"]
+	agent.send(t, capacity)
+	waitUntil(t, "the journal to complete on this connection", func() bool {
+		gate, err := store.JournalGate(ctx, agent.hostID)
+		return err == nil && gate == "complete"
+	})
+	if !registry.IsConnected(agent.hostID) {
+		t.Fatal("the connection was dropped")
+	}
+	var phase string
+	var seq int64
+	if err := pool.QueryRow(ctx, `SELECT phase,journal_sequence FROM host_config_attempts WHERE id=$1::uuid`, attemptID).Scan(&phase, &seq); err != nil || phase != "awaiting_startup" || seq != 2 {
+		t.Fatalf("attempt = %s/%d (%v), want the page's awaiting_startup/2", phase, seq, err)
+	}
+}
