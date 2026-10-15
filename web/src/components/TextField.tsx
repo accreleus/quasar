@@ -101,8 +101,9 @@ interface SwitchProps {
   label?: string;
   id?: string;
   disabled?: boolean;
-  /** Accessible name for a switch with no visible `label` (a trailing,
-   *  bare toggle). Ignored when `label` is set — that already names it. */
+  /** Accessible name for a bare toggle, or a more specific one for a labelled
+   *  switch. It replaces the visible `label` as the accessible name, so when
+   *  `label` is set it must start with that text (WCAG 2.5.3 label-in-name). */
   "aria-label"?: string;
 }
 
