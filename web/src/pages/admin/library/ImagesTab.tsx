@@ -351,11 +351,11 @@ export function ImagesTab() {
       key: "version",
       header: "Version",
       render: (img) => {
-        const v = imgVersion(img);
+        const v = imgVersion(img, hosts.length);
         return (
           <div>
             <div className="num">{v.version}</div>
-            <div className={v.tone === "warning" ? "sub tone-warning" : v.tone === "info" ? "sub tone-info" : "sub"}>
+            <div className={v.tone ? `sub tone-${v.tone}` : "sub"}>
               {v.sub}
             </div>
           </div>

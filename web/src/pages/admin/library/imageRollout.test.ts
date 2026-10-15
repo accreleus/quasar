@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hostImageState, imgRollout, imgVersion } from "./imageRollout";
+import { hostImageState, imageFailure, imgRollout, imgVersion } from "./imageRollout";
 import type { CatalogImage, Host } from "../../../api/types";
 
 function image(over: Partial<CatalogImage> = {}): CatalogImage {
@@ -172,5 +172,30 @@ describe("hostImageState — null guards", () => {
       hosts: [{ host_id: "h1", state: "ready", version: "1.0.0", error: null }],
     });
     expect(hostImageState(img, "h1")).toBe("ready");
+  });
+});
+
+describe("imageFailure", () => {
+  const failedOn = (...states: string[]) =>
+    image({ installed: true, hosts: states.map((state, i) => ({ host_id: `h${i}`, state, version: null, error: null })) as CatalogImage["hosts"] });
+
+  it("is null when no host failed, however the rest look", () => {
+    expect(imageFailure(failedOn("ready", "building", "absent"), 3)).toBeNull();
+    expect(imageFailure(image({ hosts: undefined }), 4)).toBeNull();
+  });
+
+  it("counts failed hosts against the whole fleet, never more failures than hosts", () => {
+    expect(imageFailure(failedOn("failed", "failed", "failed", "absent"), 4)).toBe("Failed on 3 of 4 hosts");
+    expect(imageFailure(failedOn("failed", "ready"), 4)).toBe("Failed on 1 of 4 hosts");
+    expect(imageFailure(failedOn("failed"), 1)).toBe("Failed on 1 of 1 host");
+    expect(imageFailure(failedOn("failed", "failed"), 0)).toBe("Failed on 2 of 2 hosts");
+  });
+
+  it("imgVersion reads failed, not up to date, and failure beats in-flight and update-available", () => {
+    const done = { version: "2.0.0", installed_version: "2.0.0" };
+    const up = { ...failedOn("failed", "failed", "failed", "ready"), ...done };
+    expect(imgVersion(up, 4)).toEqual({ version: "2.0.0", sub: "Failed on 3 of 4 hosts", tone: "danger" });
+    const busy = { ...failedOn("failed", "building"), ...done, update_available: true };
+    expect(imgVersion(busy, 2).tone).toBe("danger");
   });
 });

@@ -1300,6 +1300,9 @@ table.qtable {
   font-size: var(--t-xs);
 }
 
+/* A toned sub-line keeps its tone: `.qtable .sub` out-ranks the bare `.tone-*`. */
+.qtable .sub.tone-danger { color: var(--danger-text); }
+
 .qtable td.right,
 .qtable th.right {
   text-align: right;

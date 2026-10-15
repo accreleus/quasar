@@ -14,15 +14,28 @@ import { dominantInFlightState, HOST_STATE_COPY } from "./imageStatus";
 export interface ImgVersion {
   version: string;
   sub: string;
-  tone?: "info" | "warning";
+  tone?: "info" | "warning" | "danger";
+}
+
+/** "Failed on 3 of 4 hosts", or null when no host reports a failed build. The
+ *  catalog-level `installed` / `update_available` flags never see a per-host
+ *  failure, so every summary of an image's state goes through this first. */
+export function imageFailure(img: CatalogImage, totalHosts: number): string | null {
+  const n = (img.hosts ?? []).filter((h) => h.state === "failed").length;
+  if (n === 0) return null;
+  const of = Math.max(totalHosts, n);
+  return `Failed on ${n} of ${of} host${of === 1 ? "" : "s"}`;
 }
 
 /** §A.13: `{version}` plus a sub of Downloading…/Building… (the same labels
  *  the per-host chips use — HOST_STATE_COPY, not a generic "installing") /
  *  not installed / running {installed} / up to date. In-flight beats
  *  everything else — a real install/update already running must not also
- *  read as "update available". */
-export function imgVersion(img: CatalogImage): ImgVersion {
+ *  read as "update available". A failure on any host beats even that: see
+ *  `imageFailure`. */
+export function imgVersion(img: CatalogImage, totalHosts = 0): ImgVersion {
+  const failed = imageFailure(img, totalHosts);
+  if (failed) return { version: img.version, sub: failed, tone: "danger" };
   const inFlight = dominantInFlightState(img);
   if (inFlight) return { version: img.version, sub: HOST_STATE_COPY[inFlight].label, tone: "info" };
   if (!img.installed) return { version: img.version, sub: "not installed" };
