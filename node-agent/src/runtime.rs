@@ -133,6 +133,23 @@ impl RuntimeClient {
         self.submit(async move { docker::inspect_image(&config, &image).await })
     }
 
+    /// [`Self::image_present`] under `budget` (capped by the client deadline): the image
+    /// manager's background check of a `ready` record bounds each inspect by it (#675).
+    pub fn image_present_within(
+        &self,
+        image: impl Into<String>,
+        budget: Duration,
+    ) -> Operation<bool> {
+        let config = self.config().clone();
+        let image = image.into();
+        let budget = std::cmp::min(config.deadline, budget);
+        self.submit_owned(
+            async move { docker::inspect_image(&config, &image).await },
+            budget,
+            false,
+        )
+    }
+
     /// Retire pull intents left by a previous agent; returns the image refs retired.
     pub fn retire_orphaned_pull_intents(&self) -> Result<Vec<String>, RuntimeError> {
         images::retire_orphaned_pull_intents(self.config())
