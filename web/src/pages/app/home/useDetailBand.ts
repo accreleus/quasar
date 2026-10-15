@@ -27,7 +27,7 @@ export interface UseDetailBandOptions {
   /** Identifies the filter, search and view the grids were built from. The
    *  band closes when this changes after it opened, not when it changes in the
    *  same commit that opens it (a rail card clears the filter and opens). */
-  viewKey?: string;
+  viewKey: string;
   /** Whether to animate the scroll that brings the band into view. */
   smoothScroll: boolean;
 }
@@ -36,7 +36,7 @@ export function useDetailBand({
   token,
   visibleLists,
   onClearFilter,
-  viewKey = "",
+  viewKey,
   smoothScroll,
 }: UseDetailBandOptions) {
   const [openId, setOpenId] = useState<string | null>(null);
@@ -49,8 +49,6 @@ export function useDetailBand({
   const detailRef = useRef<HTMLDivElement>(null);
   const optionsToggleRef = useRef<HTMLButtonElement>(null);
   const profilesForRef = useRef<string | null>(null);
-  const viewKeyRef = useRef(viewKey);
-  viewKeyRef.current = viewKey;
   const openedUnderRef = useRef(viewKey);
 
   const fetchProfiles = useCallback(
@@ -89,9 +87,9 @@ export function useDetailBand({
   }, [openId]);
 
   // A filter or view change drops the band without moving focus: its anchor
-  // row may no longer exist and nothing was dismissed by hand. Declared before
-  // the reveal effect below so a band that effect opens in the same commit
-  // wins.
+  // row may no longer exist and nothing was dismissed by hand. `open` records
+  // the key of the render that made it, so a band the reveal effect opens in
+  // the same commit as the key change is not closed again.
   useEffect(() => {
     if (openedUnderRef.current === viewKey) return;
     openedUnderRef.current = viewKey;
@@ -123,13 +121,13 @@ export function useDetailBand({
         close();
         return;
       }
-      openedUnderRef.current = viewKeyRef.current;
+      openedUnderRef.current = viewKey;
       setOpenId(app.id);
       setInsertAfterId(rowEndOf(list, app.id));
       setOptionsOpen(false);
       ensureProfiles(app);
     },
-    [openId, close, ensureProfiles, rowEndOf],
+    [openId, viewKey, close, ensureProfiles, rowEndOf],
   );
 
   // A band opened for an unmounted tile has no anchor yet: its row mounted with
