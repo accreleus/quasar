@@ -51,6 +51,7 @@ import { Hero } from "./home/Hero";
 import { FeaturedRail } from "./home/FeaturedRail";
 import { LibraryGrid } from "./home/LibraryGrid";
 import { LibraryTile } from "./home/LibraryTile";
+import { WindowedGrid } from "./home/WindowedGrid";
 import { groupBySource } from "./home/librarySources";
 import { LibraryStates, SessionSummaryCard, StopSessionModal } from "./home/panels";
 import { useDetailBand } from "./home/useDetailBand";
@@ -378,8 +379,11 @@ export function AppHomeNext() {
 
   const renderGrid = useCallback(
     (list: App[], key: string) => (
-      <div className="lib-grid" key={key}>
-        {list.map((app) => (
+      <WindowedGrid
+        key={key}
+        list={list}
+        pinIds={[openId, detail.insertAfterId]}
+        tile={(app) => (
           <LibraryTile
             key={app.id}
             app={app}
@@ -394,8 +398,8 @@ export function AppHomeNext() {
             onPlay={() => void quickLaunch(app)}
             detail={renderDetail(app)}
           />
-        ))}
-      </div>
+        )}
+      />
     ),
     [
       liveSession,

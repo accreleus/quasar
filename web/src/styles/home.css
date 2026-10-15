@@ -544,6 +544,12 @@
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: var(--s4);
 }
+/* Stands in for library rows the windowed grid has not rendered; its inline
+   height is exactly what they occupy (WindowedGrid.tsx). */
+.lib-gap {
+  grid-column: 1 / -1;
+  pointer-events: none;
+}
 
 /* ---- tile --------------------------------------------------------------
    One 2:3 box: the gradient fallback (with glyph and name) underneath, the

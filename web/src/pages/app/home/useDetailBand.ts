@@ -91,7 +91,8 @@ export function useDetailBand({
    * Opens `app`'s band anchored after the last tile in its row. `list` must be
    * the grid the tile actually lives in (the source group in Library view).
    * Row detection is by measured `offsetTop` (libraryGrid.lastIndexInRow) —
-   * column-count agnostic.
+   * column-count agnostic. A tile the windowed grid has not rendered has no
+   * box: -1 matches no row.
    */
   const open = useCallback(
     (app: App, list: readonly App[]) => {
@@ -101,7 +102,7 @@ export function useDetailBand({
       }
       const ids = list.map((a) => a.id);
       const index = ids.indexOf(app.id);
-      const offsetTops = ids.map((id) => tileBoxOf(tileRefs.current.get(id))?.offsetTop ?? 0);
+      const offsetTops = ids.map((id) => tileBoxOf(tileRefs.current.get(id))?.offsetTop ?? -1);
       const lastIdx = index >= 0 ? lastIndexInRow(offsetTops, index) : -1;
       setOpenId(app.id);
       setInsertAfterId(ids[lastIdx] ?? app.id);
@@ -163,7 +164,7 @@ export function useDetailBand({
         if (!list) return;
         const ids = list.map((a) => a.id);
         const index = ids.indexOf(openId);
-        const offsetTops = ids.map((id) => tileBoxOf(tileRefs.current.get(id))?.offsetTop ?? 0);
+        const offsetTops = ids.map((id) => tileBoxOf(tileRefs.current.get(id))?.offsetTop ?? -1);
         setInsertAfterId(ids[lastIndexInRow(offsetTops, index)] ?? openId);
       }, 150);
     };
