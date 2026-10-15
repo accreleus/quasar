@@ -2,7 +2,7 @@
 // only AccountDevices can produce: a trust toggle reaching updateDevice, and
 // revoking the current device signing this browser out.
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DeviceCard, buildCapChips, deviceLabel } from "./DeviceCard";
@@ -133,7 +133,7 @@ describe("DeviceCard", () => {
 
   it("falls back to a readable label when the device has no name", () => {
     renderCard(device({ name: null }));
-    expect(screen.getByRole("button", { name: /Device d1f9c40a/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Device d1f9c40a" })).toBeTruthy();
   });
 
   it("reports a trust change and a revoke to its owner", () => {
@@ -144,8 +144,16 @@ describe("DeviceCard", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "Trusted device" }));
     expect(onSetTrusted).toHaveBeenCalledWith("d1", true);
 
-    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke Studio desktop" }));
     expect(onRevoke).toHaveBeenCalled();
+  });
+
+  it("names its device in the Revoke button, so a list of them is not four identical buttons", () => {
+    renderCard(device({ name: "Living room TV" }));
+    expect(screen.getByRole("button", { name: "Revoke Living room TV" }).textContent).toBe("Revoke");
+    cleanup();
+    renderCard(device({ name: null }));
+    expect(screen.getByRole("button", { name: "Revoke Device d1f9c40a" })).toBeTruthy();
   });
 
   it("goes inert while its own request is in flight", () => {
@@ -154,7 +162,7 @@ describe("DeviceCard", () => {
       "disabled",
       true,
     );
-    expect(screen.getByRole("button", { name: "Revoke" })).toHaveProperty("disabled", true);
+    expect(screen.getByRole("button", { name: "Revoke Studio desktop" })).toHaveProperty("disabled", true);
   });
 });
 
@@ -193,7 +201,7 @@ describe("AccountDevices", () => {
   it("confirms before revoking", async () => {
     renderPage();
     await screen.findByText("Studio desktop");
-    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke Studio desktop" }));
     expect(screen.getByRole("button", { name: "Revoke device" })).toBeTruthy();
     expect(revokeDevice).not.toHaveBeenCalled();
   });
@@ -201,7 +209,7 @@ describe("AccountDevices", () => {
   it("signs this browser out when the revoked device is the current one", async () => {
     renderPage();
     await screen.findByText("Studio desktop");
-    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke Studio desktop" }));
     fireEvent.click(screen.getByRole("button", { name: "Revoke device" }));
 
     await waitFor(() => expect(revokeDevice).toHaveBeenCalledWith("t0k3n", "d1"));
@@ -214,7 +222,7 @@ describe("AccountDevices", () => {
     listDevices.mockResolvedValue({ devices: [device({ current: false })] });
     renderPage();
     await screen.findByText("Studio desktop");
-    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke Studio desktop" }));
     fireEvent.click(screen.getByRole("button", { name: "Revoke device" }));
 
     await waitFor(() => expect(revokeDevice).toHaveBeenCalled());
