@@ -34,6 +34,7 @@ import { SegmentedControl } from "../../components/SegmentedControl";
 import { StatusChip, type StatusChipConfig } from "../../components/StatusChip";
 import { Switch } from "../../components/TextField";
 import { dominantInFlightState, HOST_STATE_COPY } from "../admin/library/imageStatus";
+import { imageFailure } from "../admin/library/imageRollout";
 
 // Kept beside the mode list so the summary chip and the picker hint can never
 // drift into describing different modes.
@@ -63,6 +64,19 @@ interface ProviderEntry {
 type ProviderStatus = "pulling" | "building" | "ready" | "failed" | "settling";
 
 /**
+ * "Failed on 2 hosts" when any of the provider's images failed to build on a
+ * host, else null. The wizard sits outside the admin FleetProvider and has no
+ * host list, so the fleet is unknown (`null`): the count form, no denominator.
+ */
+function providerFailure(images: CatalogImage[], kind: string): string | null {
+  const parts = images
+    .filter((img) => img.library_provider === kind)
+    .map((img) => imageFailure(img, null))
+    .filter((f): f is string => f !== null);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/**
  * One chip's worth of provider state. "settling" covers isImageInFlight's
  * documented gap: adopted with no host report yet — neither in-flight nor
  * honestly "ready".
@@ -74,9 +88,9 @@ function providerStatus(images: CatalogImage[], kind: string): ProviderStatus | 
   // building row beat a pulling one on array order alone (flickering chip).
   if (rows.some((r) => dominantInFlightState(r) === "pulling")) return "pulling";
   if (rows.some((r) => dominantInFlightState(r) === "building")) return "building";
-  if (rows.some((r) => (r.hosts ?? []).some((h) => h.state === "failed")) && !rows.some((r) => r.installed)) {
-    return "failed";
-  }
+  // A failed build on any host reads failed even when the catalog flags say
+  // installed (they never see a per-host failure — see imageFailure).
+  if (providerFailure(images, kind)) return "failed";
   if (rows.every((r) => r.installed)) return "ready";
   return "settling";
 }
@@ -191,7 +205,9 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
     images !== null &&
     submittedKinds.some((k) => {
       const s = providerStatus(images, k);
-      return s === null || s === "pulling" || s === "building" || s === "settling";
+      // "failed" keeps polling: the control plane retries a failed host build
+      // (30/60/120 s backoff), so the row can still turn ready or disappear.
+      return s === null || s === "pulling" || s === "building" || s === "settling" || s === "failed";
     });
 
   useEffect(() => {
@@ -358,10 +374,15 @@ export function StepLibraries({ onNext }: StepLibrariesProps) {
           {submittedKinds.map((kind) => {
             const provider = providers.find((p) => p.kind === kind);
             const status = images ? providerStatus(images, kind) : null;
+            // Not gated on status: a failure on one host stays visible while another still builds.
+            const failure = images ? providerFailure(images, kind) : null;
             return (
               <div key={kind} className="setup-host setup-install-row row between gap3">
                 <span>{provider?.displayName ?? kind}</span>
-                <StatusChip status={providerStatusKey(status)} config={PROVIDER_STATUS_CHIP_CONFIG} />
+                <span className="row gap3">
+                  {failure && <span className="sub tone-danger">{failure}</span>}
+                  <StatusChip status={providerStatusKey(status)} config={PROVIDER_STATUS_CHIP_CONFIG} />
+                </span>
               </div>
             );
           })}
