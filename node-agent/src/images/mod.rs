@@ -149,9 +149,13 @@ const MAX_CONCURRENT_PULLS: usize = 2;
 const READY_CHECK_DEADLINE: Duration = crate::runtime::ENGINE_INSPECTION_BUDGET;
 
 /// How long a pull keeps resubmitting after the client refused it a slot (`Busy`) before
-/// the refusal counts as a failed pull: two inspection budgets, which outlasts a wave of
-/// `ready` checks holding the permits. `Busy` writes nothing, so asking again is safe.
-const PULL_BUSY_BUDGET: Duration = Duration::from_secs(10);
+/// the refusal counts as a failed pull. `Busy` writes nothing, so asking again is safe. Kept
+/// strictly below a launch's own busy budget (`LAUNCH_BUSY_BUDGET`, 5 s, in `agent.rs`) so a
+/// waiting pull never takes the permit a launch's last attempt is after.
+const PULL_BUSY_BUDGET: Duration = Duration::from_secs(4);
+
+/// `run_pull`'s error when a queued operation replaced the pull while it waited for a slot.
+const SUPERSEDED: &str = "superseded by a queued operation";
 
 /// Wall-clock bound after a catalog pull acquires its shared pull/build permit.
 /// Assignment preparation uses a shorter ten-minute budget.
@@ -1198,8 +1202,12 @@ impl ImageManager {
                     .wait()
             });
             match result {
-                Err(e) if e.kind == crate::runtime::ErrorKind::Busy && Instant::now() < give_up => {
+                Err(e) if e.kind == crate::runtime::ErrorKind::Busy => {
                     std::thread::sleep(Duration::from_millis(100));
+                    // Past the deadline no more submits: a hung wave would refill the permits.
+                    if Instant::now() >= give_up {
+                        break Err(e);
+                    }
                 }
                 other => break other,
             }
@@ -2097,6 +2105,13 @@ impl ImageManager {
     }
 
     /// Observe coalesced API progress; engine work outlives control-plane reconnects.
+    /// `generation`'s op still owns the slot and nothing newer is queued behind it.
+    fn is_latest_intent(&self, image_id: &str, generation: u64) -> bool {
+        let ops = self.ops.lock().unwrap();
+        ops.get(image_id)
+            .is_some_and(|slot| slot.generation == generation && slot.pending.is_none())
+    }
+
     fn pull_with_progress(
         &self,
         image_id: &str,
@@ -2116,8 +2131,17 @@ impl ImageManager {
                     }
                 });
             match result {
-                Err(e) if e.kind == crate::runtime::ErrorKind::Busy && Instant::now() < give_up => {
+                Err(e) if e.kind == crate::runtime::ErrorKind::Busy => {
                     std::thread::sleep(crate::session::teardown::STOP_PAUSE);
+                    if Instant::now() >= give_up {
+                        return Err(errors::map_runtime_error(e));
+                    }
+                    // A resubmitted pull is detached and ignores cancellation, so ask only
+                    // while this op is still the latest intent; the worker then promotes
+                    // what was queued.
+                    if !self.is_latest_intent(image_id, generation) {
+                        return Err(SUPERSEDED.to_string());
+                    }
                 }
                 other => {
                     return other
@@ -3982,12 +4006,47 @@ mod tests {
     }
 
     /// A pull refused an engine slot (`Busy`) waits for one rather than ending `failed`:
-    /// with all four slots held by unanswered inspects (released at the 5 s budget) the
-    /// pull still reaches the engine.
+    /// with all four slots held by unanswered inspects (released after 1 s) the pull still
+    /// reaches the engine.
     #[test]
     fn a_pull_refused_a_slot_waits_for_one_instead_of_failing_busy() {
         const THIS: &str =
             "images::tests::a_pull_refused_a_slot_waits_for_one_instead_of_failing_busy";
+        if engine_child_mode().is_some() {
+            let runtime = crate::runtime::configured().unwrap();
+            let _held: Vec<_> = (0..4)
+                .map(|i| {
+                    runtime
+                        .image_present_within(format!("ghcr.io/x/hang:{i}"), Duration::from_secs(1))
+                })
+                .collect();
+            let m = ImageManager::empty_for_test();
+            m.ops.lock().unwrap().insert(
+                "steam".into(),
+                OpSlot {
+                    running: ensure("v1", REF1),
+                    generation: 1,
+                    pending: None,
+                },
+            );
+            let error = m.pull_with_progress("steam", 1, REF1).unwrap_err();
+            assert_ne!(
+                error,
+                errors::map_runtime_error(crate::runtime::ErrorKind::Busy.into())
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = run_against_fake_engine(THIS, "pull-busy", reply, Duration::ZERO);
+        assert!(served >= 6, "four held inspects, then the pull: {served}");
+    }
+
+    /// A remove queued while the pull waits out `Busy` supersedes it: no `ensure_image`
+    /// reaches the engine (only the four unanswered inspects that held the slots do).
+    #[test]
+    fn a_queued_op_ends_a_pull_waiting_out_busy_without_resubmitting() {
+        const THIS: &str =
+            "images::tests::a_queued_op_ends_a_pull_waiting_out_busy_without_resubmitting";
         if engine_child_mode().is_some() {
             let runtime = crate::runtime::configured().unwrap();
             let _held: Vec<_> = (0..4)
@@ -3999,16 +4058,29 @@ mod tests {
                 })
                 .collect();
             let m = ImageManager::empty_for_test();
-            let error = m.pull_with_progress("steam", 1, REF1).unwrap_err();
-            assert_ne!(
-                error,
-                errors::map_runtime_error(crate::runtime::ErrorKind::Busy.into())
+            m.ops.lock().unwrap().insert(
+                "steam".into(),
+                OpSlot {
+                    running: ensure("v1", REF1),
+                    generation: 1,
+                    pending: None,
+                },
+            );
+            let queuer = m.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                queuer.ops.lock().unwrap().get_mut("steam").unwrap().pending =
+                    Some(ImageOp::Remove);
+            });
+            assert_eq!(
+                m.pull_with_progress("steam", 1, REF1).unwrap_err(),
+                SUPERSEDED
             );
             return;
         }
         let reply = Some((404, r#"{"message":"No such image"}"#));
-        let served = run_against_fake_engine(THIS, "pull-busy", reply, Duration::ZERO);
-        assert!(served >= 6, "four held inspects, then the pull: {served}");
+        let served = run_against_fake_engine(THIS, "superseded", reply, Duration::ZERO);
+        assert_eq!(served, 4, "only the held inspects reach the engine");
     }
 
     /// A repeated ensure for an image whose check is already running spawns no second
