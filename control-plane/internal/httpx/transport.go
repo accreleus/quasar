@@ -21,14 +21,16 @@ const insecureTransportMessage = "refused: this request reached the control plan
 // loopbackOK also accepts a loopback peer. Only for a route production never
 // serves: behind a same-host proxy every client is a loopback peer.
 func RefuseInsecure(w http.ResponseWriter, r *http.Request, trusted []*net.IPNet, loopbackOK bool) bool {
-	if secureTransport(r, trusted, loopbackOK) {
+	if SecureTransport(r, trusted, loopbackOK) {
 		return false
 	}
 	WriteError(w, http.StatusUnauthorized, CodeUnauthorized, insecureTransportMessage)
 	return true
 }
 
-func secureTransport(r *http.Request, trusted []*net.IPNet, loopbackOK bool) bool {
+// SecureTransport is the predicate behind RefuseInsecure, for a route that only
+// warns.
+func SecureTransport(r *http.Request, trusted []*net.IPNet, loopbackOK bool) bool {
 	peer, isProxy := ratelimit.DirectPeer(r, trusted)
 	if isProxy {
 		// What a trusted proxy says about the client's hop outranks our own
