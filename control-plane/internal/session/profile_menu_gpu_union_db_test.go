@@ -363,3 +363,32 @@ func TestProfileMenuUnionHonoursTheManagedHomeOwner(t *testing.T) {
 		t.Fatalf("av1 must not come from a host other than the home's: %+v", av1)
 	}
 }
+
+// TestProfileMenuUnionSkipsADisconnectedHost: a host whose agent disconnect is
+// recorded is unplaceable while its status still reads online, so its AV1 is not
+// offered (#656).
+func TestProfileMenuUnionSkipsADisconnectedHost(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 4)
+	hostB, _ := addHost(t, pool, "host-2", 4)
+	setGPUCodecsRaw(t, pool, s.hostID, 0, `["h264","h265"]`)
+	setGPUCodecsRaw(t, pool, hostB, 0, `["h264","h265","av1"]`)
+	must(t, exec(t, pool, `UPDATE hosts SET agent_disconnected_at=now() WHERE id=$1::uuid`, hostB))
+
+	srv, authSvc, _ := newMetricsServer(t, pool)
+	ctx := context.Background()
+	u, err := authSvc.Register(ctx, "menu-disconnected@test.local", "menu-disconnected", "quasar-fixture-pw-08")
+	must(t, err)
+	tok := loginTok(t, authSvc, "menu-disconnected@test.local", "quasar-fixture-pw-08")
+	enableChainCodecs(t, pool, "1440p60", "av1", "hevc", "h264")
+	upsertCodecProbe(t, pool, u.ID, true, true)
+
+	_, body := getProfiles(t, srv.URL+"/v1/me/profiles?app_id="+s.appID, tok)
+	av1 := rungByID(body, "1440p60-av1")
+	if av1 == nil || av1.Eligibility != "ineligible" || !hasReasonCode(av1.Reasons, "host_encoder_not_supported") {
+		t.Fatalf("av1 must not come from a disconnected host: %+v", av1)
+	}
+	if hevc := rungByID(body, "1440p60-hevc"); hevc == nil || hevc.Eligibility != "eligible" {
+		t.Fatalf("hevc (offered by the connected host) must stay available: %+v", hevc)
+	}
+}
