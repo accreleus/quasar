@@ -248,3 +248,42 @@ func TestAJournalRebuiltUnfinishedAttemptHoldsAdmission(t *testing.T) {
 		t.Fatalf("rebuilt unfinished attempt left the host %s, want draining", got)
 	}
 }
+
+// While this connection's journal is pending, the journal is the record: a live
+// report writes nothing, so it can neither close the attempt nor plant a recovery
+// hold the journal then contradicts and quarantines on (#656).
+func TestALiveReportBeforeTheJournalCompletesWritesNothing(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	boot, offer := offerRestartAttempt(t, pool, store, hostID)
+	if _, err := store.ObserveIdleState(ctx, hostID, offerConnection, liveReport(boot, offer, "accepted", "1")); err != nil {
+		t.Fatal(err)
+	}
+	second := "00000000-0000-4000-8000-000000000339"
+	if err := store.BeginJournalReconciliation(ctx, hostID, second); err != nil {
+		t.Fatal(err)
+	}
+	if fresh, err := store.ObserveIdleState(ctx, hostID, second, liveReport(boot, offer, "uncertain", "6")); err != nil || fresh {
+		t.Fatalf("live report on a pending journal: fresh=%v err=%v, want no write", fresh, err)
+	}
+	entry := JournalInventoryEntry{AttemptID: offer.AttemptID, HostID: hostID, Group: "hardware", Digest: offer.ContentSHA256,
+		Scope: "restart", Phase: "awaiting_startup", Sequence: "5", Revision: offer.Revision, GrantBoot: boot, GrantConnection: offerConnection}
+	if err := store.CompleteJournalReconciliation(ctx, hostID, second, []JournalInventoryEntry{entry}, seededHardware); err != nil {
+		t.Fatal(err)
+	}
+	if gate, err := store.JournalGate(ctx, hostID); err != nil || gate != "complete" {
+		t.Fatalf("journal gate = %s (%v), want complete", gate, err)
+	}
+	var phase string
+	var seq int64
+	if err := pool.QueryRow(ctx, `SELECT phase,journal_sequence FROM host_config_attempts WHERE id=$1::uuid`, offer.AttemptID).Scan(&phase, &seq); err != nil || phase != "awaiting_startup" || seq != 5 {
+		t.Fatalf("attempt = %s/%d (%v), want the journal's awaiting_startup/5", phase, seq, err)
+	}
+	var recovery, idle int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE owner_kind='recovery'),count(*) FILTER (WHERE owner_kind='idle_apply')
+		FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_id=$2::uuid`, hostID, offer.AttemptID).Scan(&recovery, &idle); err != nil || recovery != 0 || idle != 1 {
+		t.Fatalf("holds recovery=%d idle_apply=%d (%v), want 0 and 1", recovery, idle, err)
+	}
+}

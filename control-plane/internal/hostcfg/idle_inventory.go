@@ -643,6 +643,7 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 	} else if !terminal {
 		// A restored ledger can omit both an unfinished attempt and its
 		// restriction (agent-api.md); the rebuilt attempt holds admission again.
+		// failed with a sequence is unfinished: recovery follows it.
 		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
 			VALUES($1::uuid,'idle_apply',$2::uuid,'idle_configuration') ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
 			return err

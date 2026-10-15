@@ -71,11 +71,17 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 		return false, err
 	}
 	var current *string
-	if err := tx.QueryRow(ctx, `SELECT connection_incarnation::text FROM host_journal_reconciliation WHERE host_id=$1::uuid`, hostID).Scan(&current); err != nil {
+	var gate string
+	if err := tx.QueryRow(ctx, `SELECT connection_incarnation::text,state FROM host_journal_reconciliation WHERE host_id=$1::uuid`, hostID).Scan(&current, &gate); err != nil {
 		return false, err
 	}
 	if current == nil || *current != connectionID {
 		return false, ErrApprovalSuperseded
+	}
+	if gate != "complete" {
+		// Until this connection's journal is applied it is the record: a report
+		// written first could close the attempt and quarantine every later journal.
+		return false, tx.Commit(ctx)
 	}
 	var group, digest, grantBoot, grantConnection, phase string
 	var revision, oldSeq int64

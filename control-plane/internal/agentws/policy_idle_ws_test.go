@@ -159,6 +159,21 @@ func TestFabricatedRestartAttemptsAreNotCached(t *testing.T) {
 		attemptID, hostID, digest, boot, grantConnection); err != nil {
 		t.Fatal(err)
 	}
+	// A live report applies only after this connection's journal (#656). This
+	// test answers no inventory request, so it completes the opened gate itself.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		tag, err := pool.Exec(ctx, `UPDATE host_journal_reconciliation SET state='complete'
+			WHERE host_id=$1::uuid AND state='pending' AND connection_incarnation IS NOT NULL`, hostID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tag.RowsAffected() == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("this connection never opened its journal gate")
+		}
+	}
 	report := func(id, connection string) ConfigPolicyStateMsg {
 		return ConfigPolicyStateMsg{
 			Type: "config_policy_state", AttemptID: id, HostID: hostID, Group: "hardware", Revision: "1",
