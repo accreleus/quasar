@@ -381,6 +381,7 @@ fn an_owned_manager_with_no_actor_socket_is_absent() {
 /// re-dials only when the actor answering now is not the one it registered.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_apply_naming_the_actor_redials_only_when_another_actor_answers() {
+    let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
     for (registered_as_now, want) in [(true, false), (false, true)] {
         let m = machine(Behaviour::default());
         let mgr = ReleaseManager::owned(&m.socket);
