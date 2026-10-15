@@ -17,3 +17,20 @@ export function artFor(app: Pick<App, "cover_url" | "hero_url">, surface: ArtSur
   const hero = app.hero_url ?? null;
   return surface === "hero" ? hero ?? tile : tile ?? hero;
 }
+
+/** A width the artwork route can scale a cover to (control-api.md §GET /v1/artwork/{asset}). */
+export type ArtWidth = 96 | 320 | 480 | 560;
+
+// Only artwork-service URLs take `?w=`; a directly written cover_url can point anywhere.
+const LOCAL_ART = /^\/v1\/artwork\/[0-9a-f]{64}\.(jpg|png|webp)$/;
+
+/** `url` scaled for a tile `w` px wide, or unchanged when it is not local artwork. */
+export function sizedArt(url: string, w: ArtWidth): string {
+  return LOCAL_ART.test(url) ? `${url}?w=${w}` : url;
+}
+
+/** A `srcSet` of the tile widths, so the browser picks by device pixel ratio; undefined
+ *  when the URL is not local artwork. */
+export function artSrcSet(url: string): string | undefined {
+  return LOCAL_ART.test(url) ? ([320, 480, 560] as const).map((w) => `${sizedArt(url, w)} ${w}w`).join(", ") : undefined;
+}

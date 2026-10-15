@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { artFor } from "./appArtwork";
+import { artFor, artSrcSet, sizedArt } from "./appArtwork";
 
 const app = (cover: string | null, hero: string | null) => ({
   cover_url: cover,
@@ -34,5 +34,22 @@ describe("artFor", () => {
   // to `undefined` reaching an <img src>.
   it("treats undefined like null", () => {
     expect(artFor({ cover_url: undefined, hero_url: undefined } as never, "tile")).toBeNull();
+  });
+});
+
+describe("sizedArt / artSrcSet", () => {
+  const local = `/v1/artwork/${"a".repeat(64)}.png`;
+
+  it("sizes local artwork URLs", () => {
+    expect(sizedArt(local, 96)).toBe(`${local}?w=96`);
+    expect(artSrcSet(local)).toBe(`${local}?w=320 320w, ${local}?w=480 480w, ${local}?w=560 560w`);
+  });
+
+  // A cover_url written directly can point anywhere; a query added to it could break it.
+  it("leaves every other URL alone", () => {
+    for (const url of ["https://cdn.example/a.png", "/covers/1.png", `${local}?w=320`, "/v1/artwork/AAAA.png"]) {
+      expect(sizedArt(url, 320)).toBe(url);
+      expect(artSrcSet(url)).toBeUndefined();
+    }
   });
 });

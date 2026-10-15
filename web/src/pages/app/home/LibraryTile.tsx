@@ -24,7 +24,7 @@ import type { ReactNode } from "react";
 import type { App } from "../../../api/types";
 import { Chip } from "../../../components/Chip";
 import { IconHeart, IconPlayGlyph } from "../../../components/icons";
-import { artFor } from "../../../lib/appArtwork";
+import { artFor, artSrcSet, sizedArt } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
 
 /** The `.lib-tile` box a surface button belongs to. The surface button is
@@ -88,9 +88,12 @@ export function LibraryTile({
                in-viewport image and shrinks its prefetch margin on a slow link,
                adapting better than a hardcoded row count. No width/height
                needed: `.cover` is `aspect-ratio: 2/3` with `.cover-img`
-               `position:absolute; inset:0`, so layout cannot shift. */
+               `position:absolute; inset:0`, so layout cannot shift. `sizes` is the
+               measured tile width (`.lib-grid` minmax(160px, 1fr)). */
             <img
-              src={art}
+              src={sizedArt(art, 320)}
+              srcSet={artSrcSet(art)}
+              sizes="176px"
               alt=""
               className="cover-img"
               loading="lazy"

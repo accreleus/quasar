@@ -17,7 +17,7 @@ import { listApps, swapSession } from "../../../../api/library";
 import { ApiError } from "../../../../api/client";
 import type { App } from "../../../../api/types";
 import { useAuth } from "../../../../auth/context";
-import { artFor } from "../../../../lib/appArtwork";
+import { artFor, artSrcSet, sizedArt } from "../../../../lib/appArtwork";
 import { appGlyph } from "../../../../lib/appGlyph";
 import { coverClassAt } from "../../libraryGrid";
 
@@ -152,7 +152,15 @@ export function GamesPane({
             >
               <span className={`cv ${coverClass}`} aria-hidden="true">
                 {tileArt ? (
-                  <img src={tileArt} alt="" className="cover-img" loading="lazy" decoding="async" />
+                  <img
+                    src={sizedArt(tileArt, 320)}
+                    srcSet={artSrcSet(tileArt)}
+                    sizes="172px"
+                    alt=""
+                    className="cover-img"
+                    loading="lazy"
+                    decoding="async"
+                  />
                 ) : (
                   <span className="glyph">{appGlyph(a.name)}</span>
                 )}

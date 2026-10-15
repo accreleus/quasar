@@ -134,13 +134,30 @@ func toResp(r Record) *artworkResp {
 
 // --- handlers ----------------------------------------------------------------
 
-// handleAsset serves a cached blob.
+// handleAsset serves a cached blob, or its sized variant for `?w=`.
 func (h *Handler) handleAsset(w http.ResponseWriter, r *http.Request) {
 	if h.svc == nil {
 		http.NotFound(w, r)
 		return
 	}
-	data, contentType, err := h.svc.Blobs().Open(r.PathValue("asset"))
+	blobs, name := h.svc.Blobs(), r.PathValue("asset")
+	var (
+		data        []byte
+		contentType string
+		err         error
+	)
+	switch widths, sized := r.URL.Query()["w"]; {
+	case !sized:
+		data, contentType, err = blobs.Open(name)
+	case len(widths) != 1:
+		err = ErrBadAsset
+	default:
+		data, contentType, err = blobs.OpenVariant(name, widths[0])
+		if err != nil && !errors.Is(err, ErrBadAsset) && !errors.Is(err, os.ErrNotExist) {
+			h.log.Warn("artwork: could not resize asset, serving the original", "err", err)
+			data, contentType, err = blobs.Open(name)
+		}
+	}
 	if err != nil {
 		// A bad name and a missing file are the same answer. Never 500: an
 		// invalid name is an attempted traversal or a stale link.
