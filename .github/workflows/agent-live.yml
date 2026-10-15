@@ -94,4 +94,4 @@ jobs:
           IMAGE: ${{ steps.image.outputs.ref }}
         run: |
           docker run --rm --ulimit core=0 -v "$PWD":/workspace -w /workspace/node-agent \
-            -e QUASAR_REQUIRE_LIVE_WEBRTC=1 "$IMAGE" cargo test --workspace
+            -e QUASAR_REQUIRE_LIVE_WEBRTC=1 -e XDG_RUNTIME_DIR=/tmp "$IMAGE" cargo test --workspace
