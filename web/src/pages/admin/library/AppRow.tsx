@@ -59,7 +59,7 @@ export function AppRow({
             style={{ width: 26, height: 26 }}
           >
             {app.cover_url ? (
-              <img src={app.cover_url} alt="" className="cover-img" />
+              <img src={app.cover_url} alt="" className="cover-img" loading="lazy" decoding="async" />
             ) : (
               <span className="glyph">
                 {appGlyph(app.name)}

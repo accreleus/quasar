@@ -134,6 +134,22 @@ describe("head sub, actions and tab count", () => {
   });
 });
 
+describe("row artwork", () => {
+  // A 1,500-app catalogue fetched every cover eagerly (937 MB for 26 px thumbnails).
+  it("loads each row's cover lazily", async () => {
+    mocked.listAdminApps.mockResolvedValue({
+      items: [app({ id: "a1", cover_url: "/art/a1/grid" })],
+      next_cursor: null,
+    });
+    renderPage();
+
+    await screen.findByText("Half-Life 2");
+    const img = document.querySelector<HTMLImageElement>("img.cover-img");
+    expect(img?.getAttribute("loading")).toBe("lazy");
+    expect(img?.getAttribute("decoding")).toBe("async");
+  });
+});
+
 describe("toolbar filtering", () => {
   it("filters by segment, then search, then source", async () => {
     mocked.listAdminApps.mockResolvedValue({
