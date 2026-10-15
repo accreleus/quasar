@@ -147,14 +147,14 @@ func (h *Handler) handleAsset(w http.ResponseWriter, r *http.Request) {
 		contentType string
 		immutable   = true
 	)
-	// ParseQuery, not r.URL.Query(): that drops a pair it cannot parse
-	// ("w=320;x"), which would turn a bad w into no w.
+	// A query that names no w is ignored however malformed, as before amendment 37.
+	// One that does must parse: ParseQuery drops a pair it cannot ("w=320;x").
 	query, err := url.ParseQuery(r.URL.RawQuery)
-	switch widths, sized := query["w"]; {
-	case err != nil, sized && len(widths) != 1:
-		err = ErrBadAsset
-	case !sized:
+	switch widths := query["w"]; {
+	case !namesWidth(r.URL.RawQuery):
 		data, contentType, err = blobs.Open(name)
+	case err != nil, len(widths) != 1:
+		err = ErrBadAsset
 	default:
 		data, contentType, immutable, err = blobs.OpenVariant(r.Context(), name, widths[0])
 	}
@@ -188,6 +188,18 @@ func (h *Handler) handleAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	_, _ = w.Write(data)
+}
+
+// namesWidth reports whether the raw query has a w key in any form, including
+// a pair url.ParseQuery drops (it splits on & only and rejects a pair with ;).
+func namesWidth(raw string) bool {
+	for _, pair := range strings.FieldsFunc(raw, func(c rune) bool { return c == '&' || c == ';' }) {
+		key, _, _ := strings.Cut(pair, "=")
+		if key, _ = url.QueryUnescape(key); key == "w" {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {

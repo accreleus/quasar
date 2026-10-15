@@ -405,9 +405,19 @@ func TestAssetRouteServesSizedVariants(t *testing.T) {
 	}
 
 	// "w=320;x" and a bad escape fail to parse; r.URL.Query() would read them as no w.
-	for _, q := range []string{"?w=100", "?w=640", "?w=", "?w=320&w=480", "?w=0320", "?w=320;x", "?w=320&%zz", "?w=96&w"} {
+	for _, q := range []string{"?w=100", "?w=640", "?w=", "?w=320&w=480", "?w=96&w=96", "?w=0320",
+		"?w=320;x", "?w=%zz", "?w", "?w=320&%zz", "?w=96&w", "?x;w=96"} {
 		if resp, _ := get("/v1/artwork/" + name + q); resp.StatusCode != http.StatusNotFound {
 			t.Errorf("%s: want 404, got %d", q, resp.StatusCode)
+		}
+	}
+	// A query naming no w is ignored however malformed, as before amendment 37.
+	for _, q := range []string{"?a;b", "?x=%zz", "?v=2"} {
+		resp, _ := get("/v1/artwork/" + name + q)
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "image/png" ||
+			resp.Header.Get("Cache-Control") != "public, max-age=31536000, immutable" {
+			t.Errorf("%s: want the original, immutable; got %d %s %q", q, resp.StatusCode,
+				resp.Header.Get("Content-Type"), resp.Header.Get("Cache-Control"))
 		}
 	}
 	if resp, _ := get("/v1/artwork/" + sha([]byte("x")) + ".png?w=96"); resp.StatusCode != http.StatusNotFound {
