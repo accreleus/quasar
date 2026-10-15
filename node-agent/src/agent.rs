@@ -2051,6 +2051,13 @@ async fn connect_and_run(
     let mut image_rx = Some(image_rx);
     let _image_upstream_guard = image_mgr.attach_upstream(image_tx);
 
+    // Same shape for `release_state`. Attaching re-emits the current state of every
+    // updater result file still present, which is how an apply that destroyed the
+    // previous agent still gets reported (agent-api.md `release_state`).
+    let (release_tx, release_rx) = mpsc::channel::<AgentMsg>(16);
+    let mut release_rx = Some(release_rx);
+    let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
+
     // --- Steps 1 and 2: send register, receive registered ---
     let (host_id, heartbeat_interval_ms, policy_identity, policy_groups) =
         register_and_await_registered(
@@ -2249,15 +2256,6 @@ async fn connect_and_run(
             send(&mut tx, &recovered_terminal(&session_id)).await?;
         }
     }
-
-    // Same shape as the image upstream, for `release_state`. Attaching re-emits the
-    // recovery actor's current attempt, which is how an apply that destroyed the
-    // previous agent still gets reported (agent-api.md `release_state`). It waits on the
-    // actor's status (up to 10 s), so it must stay after `register` and `capacity`, which
-    // the control plane times (#627). `release_rx` is read only by the loop below.
-    let (release_tx, release_rx) = mpsc::channel::<AgentMsg>(16);
-    let mut release_rx = Some(release_rx);
-    let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
 
     // Sent first on purpose: the card carries the remediation, and the gate below may end
     // the process a few seconds later.
@@ -7327,11 +7325,12 @@ mod tests {
         assert!(register_prep_over_budget(Duration::from_secs(30)));
     }
 
-    /// #627: the control plane drops a socket whose `register` has not arrived within
-    /// agentws `registerReadTimeout`, so nothing between `dial` and `register` may wait
-    /// on the recovery actor, whose status read alone may take 10 s.
+    /// #627: a recovery actor that never answers must not hold the connection's only
+    /// reader. `register` has to beat agentws `registerReadTimeout`, and the ack of an
+    /// assign sent right after `capacity` (the console auto-start) has to beat the control
+    /// plane's 10 s `assignAckTimeout`, the same 10 s the actor's status read may take.
     #[tokio::test(flavor = "multi_thread")]
-    async fn register_reaches_the_control_plane_before_the_recovery_actor_answers() {
+    async fn a_silent_recovery_actor_delays_neither_register_nor_an_ack() {
         // `connect_and_run` records the install facts it discovers.
         let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
@@ -7346,14 +7345,50 @@ mod tests {
             control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
             ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
         };
-        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let (timings_tx, timings_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            fn next_text(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> String {
+                loop {
+                    if let Message::Text(t) = ws.read().expect("the agent stays connected") {
+                        return t.to_string();
+                    }
+                }
+            }
             let (stream, _) = cp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
             let mut ws = tungstenite::accept(stream).unwrap();
             let opened = Instant::now();
-            let first = ws.read().ok().and_then(|m| m.into_text().ok());
-            let _ = first_tx.send((first.map(|t| t.to_string()), opened.elapsed()));
-            // Dropping `ws` closes the socket unanswered, which ends the attempt.
+            let register = next_text(&mut ws);
+            let register_after = opened.elapsed();
+            assert!(register.contains(r#""type":"register""#), "{register}");
+            ws.send(Message::Text(
+                r#"{"type":"registered","host_id":"h1","node_secret":null,"heartbeat_interval_ms":5000}"#
+                    .into(),
+            ))
+            .unwrap();
+            while !next_text(&mut ws).contains(r#""type":"capacity""#) {}
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "session_assign", "id": "assign-1", "session_id": "s1",
+                    "gpu_index": 0,
+                    "stream": {"width": 1920, "height": 1080, "fps": 60,
+                        "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+            let assigned = Instant::now();
+            loop {
+                let frame = next_text(&mut ws);
+                if frame.contains(r#""type":"ack""#) && frame.contains(r#""id":"assign-1""#) {
+                    break;
+                }
+            }
+            let _ = timings_tx.send((register_after, assigned.elapsed()));
+            // Dropping `ws` closes the socket, which ends the attempt.
         });
 
         let health = HealthState::new();
@@ -7374,18 +7409,18 @@ mod tests {
             &release_mgr,
             &mut sessions,
             false,
-        )
-        .await;
-        assert!(attempt.is_err(), "the fake control plane never answers");
-        let (first, waited) = first_rx.recv_timeout(Duration::from_secs(15)).unwrap();
-        let first = first.expect("a text frame");
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(90), attempt).await;
+        let (register_after, ack_after) = timings_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake control plane saw register and the assign's ack");
         assert!(
-            first.contains(r#""type":"register""#),
-            "first frame: {first}"
+            register_after < Duration::from_secs(1),
+            "register reached the control plane {register_after:?} after the upgrade"
         );
         assert!(
-            waited < Duration::from_secs(1),
-            "register reached the control plane {waited:?} after the upgrade"
+            ack_after < Duration::from_secs(3),
+            "the assign was acked {ack_after:?} after it was sent"
         );
     }
 
