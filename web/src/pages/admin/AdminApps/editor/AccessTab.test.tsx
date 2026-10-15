@@ -180,11 +180,24 @@ describe("Access tab — granting a specific user", () => {
 });
 
 describe("Access tab — revoking, and the provider-grant warning", () => {
+  it("names each row's Revoke button for its user, keeping the visible label", async () => {
+    renderPanel([
+      entitlement(),
+      entitlement({ id: "ent-2", subject_id: "user-2", subject_username: "bob" }),
+      entitlement({ id: "ent-3", subject_id: "user-3", subject_username: null }),
+    ]);
+
+    const alice = await screen.findByRole("button", { name: "Revoke alice" });
+    expect(alice.textContent).toBe("Revoke");
+    expect(screen.getByRole("button", { name: "Revoke bob" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Revoke deleted user" })).toBeTruthy();
+  });
+
   it("revokes a plain admin grant with no special warning", async () => {
     mocked.revokeEntitlement.mockResolvedValue(undefined);
     renderPanel([entitlement({ granted_by: "admin" })]);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke alice" }));
     expect(screen.queryByText(/library sync/i)).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Revoke access" }));
@@ -199,7 +212,7 @@ describe("Access tab — revoking, and the provider-grant warning", () => {
   it("warns that a provider grant may be re-granted by the next sync, and names the fix", async () => {
     renderPanel([entitlement({ granted_by: "provider" })]);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke alice" }));
 
     await screen.findByText(/This grant came from a library sync/i);
     expect(
