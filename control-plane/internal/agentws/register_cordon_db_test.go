@@ -6,6 +6,7 @@ package agentws
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -32,13 +33,17 @@ func TestReconnectPreservesOwnedRestrictionAfterOfflineProjection(t *testing.T) 
 		ID: "00000000-0000-0000-0000-000000000123"}, "Platform apply"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.markOffline(ctx, hostID); err != nil {
+	first, err := s.reconnectHost(ctx, "owned-reconnect-host", "0.3.0", nil, "secret-rh05")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.markOffline(ctx, hostID, first.RegisteredAt); err != nil {
 		t.Fatal(err)
 	}
 	if got := hostStatus(t, pool, hostID); got != "draining" {
 		t.Fatalf("disconnect status = %q, want draining while owner holds", got)
 	}
-	if _, err := s.reconnectHost(ctx, "owned-reconnect-host", "0.3.0", "secret-rh05"); err != nil {
+	if _, err := s.reconnectHost(ctx, "owned-reconnect-host", "0.3.0", nil, "secret-rh05"); err != nil {
 		t.Fatal(err)
 	}
 	if got := hostStatus(t, pool, hostID); got != "draining" {
@@ -63,7 +68,7 @@ func TestReconnectHostKeepsADrainingHostDraining(t *testing.T) {
 	hostID := seedHostWithSecret(t, pool, "cordoned-reconnect-host", "secret-140")
 
 	setHostStatus(t, pool, hostID, "draining")
-	if _, err := s.reconnectHost(context.Background(), "cordoned-reconnect-host", "0.3.0", "secret-140"); err != nil {
+	if _, err := s.reconnectHost(context.Background(), "cordoned-reconnect-host", "0.3.0", nil, "secret-140"); err != nil {
 		t.Fatalf("reconnectHost: %v", err)
 	}
 	if got := hostStatus(t, pool, hostID); got != "draining" {
@@ -72,7 +77,7 @@ func TestReconnectHostKeepsADrainingHostDraining(t *testing.T) {
 
 	// The ordinary case is untouched: an offline host's reconnect brings it back.
 	setHostStatus(t, pool, hostID, "offline")
-	if _, err := s.reconnectHost(context.Background(), "cordoned-reconnect-host", "0.3.0", "secret-140"); err != nil {
+	if _, err := s.reconnectHost(context.Background(), "cordoned-reconnect-host", "0.3.0", nil, "secret-140"); err != nil {
 		t.Fatalf("second reconnectHost: %v", err)
 	}
 	if got := hostStatus(t, pool, hostID); got != "online" {
@@ -116,7 +121,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	}
 	setDrainCreatedAt(t, pool, res.HostID, "2 hours")
 	recordRemoval(t, pool, res.HostID, "7196 seconds")
-	if err := s.markOffline(ctx, res.HostID); err != nil {
+	if err := s.markOffline(ctx, res.HostID, res.RegisteredAt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.enrollHost(ctx, "removed-host", "0.3.1", boundEnrollmentToken(t, pool, "removed-host")); err != nil {
@@ -139,7 +144,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 	}
 	setDrainCreatedAt(t, pool, res2.HostID, "3 hours")
 	recordRemoval(t, pool, res2.HostID, "1 hour")
-	if err := s.markOffline(ctx, res2.HostID); err != nil {
+	if err := s.markOffline(ctx, res2.HostID, res2.RegisteredAt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.enrollHost(ctx, "drained-then-removed", "0.3.1", boundEnrollmentToken(t, pool, "drained-then-removed")); err != nil {
@@ -162,7 +167,7 @@ func TestReEnrollmentAfterAConsoleRemovalLiftsOnlyTheRemovalsDrain(t *testing.T)
 		t.Fatal(err)
 	}
 	recordRemoval(t, pool, res3.HostID, "0 seconds")
-	if err := s.markOffline(ctx, res3.HostID); err != nil {
+	if err := s.markOffline(ctx, res3.HostID, res3.RegisteredAt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.enrollHost(ctx, "removed-mid-run", "0.3.1", boundEnrollmentToken(t, pool, "removed-mid-run")); err != nil {
@@ -188,6 +193,9 @@ func TestEnrollHostKeepsADrainingHostDraining(t *testing.T) {
 		t.Fatalf("initial enroll: %v", err)
 	}
 	setHostStatus(t, pool, res.HostID, "draining")
+	// Its agent is gone: a cordoned host that is still connected refuses re-enrollment.
+	gone := time.Now()
+	setAgentDisconnectedAt(t, pool, res.HostID, &gone)
 
 	if _, err := s.enrollHost(context.Background(), "cordoned-enroll-host", "0.3.1", boundEnrollmentToken(t, pool, "cordoned-enroll-host")); err != nil {
 		t.Fatalf("re-enroll: %v", err)

@@ -364,3 +364,44 @@ func unboundProbe(store *Store, ctx context.Context, userID string) (*DeviceProb
 	scope, err := store.ResolveDeviceScope(ctx, userID, "", scopeSiteProfiles)
 	return scope.Probe, err
 }
+
+// TestParseDeviceProbeReadsBrowserName: browser.name reaches eligibility (amendment 34).
+func TestParseDeviceProbeReadsBrowserName(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	caps, _ := json.Marshal(map[string]any{"browser": map[string]any{"name": "Safari", "version": "18.0"}, "measured_at": now})
+	if dp := parseDeviceProbe(caps); dp == nil || dp.BrowserName != "Safari" {
+		t.Fatalf("parseDeviceProbe = %+v, want BrowserName Safari", dp)
+	}
+	for _, browser := range []any{nil, "Safari", []string{"Safari"}, map[string]any{"name": 5}} {
+		caps, _ = json.Marshal(map[string]any{"browser": browser, "bandwidth_kbps": 40000, "measured_at": now})
+		if dp := parseDeviceProbe(caps); dp == nil || dp.BrowserName != "" || dp.BandwidthKbps != 40000 {
+			t.Fatalf("browser %#v: parseDeviceProbe = %+v, want the probe kept with no name", browser, dp)
+		}
+	}
+}
+
+// TestParseDeviceProbeH264Refused: only a boolean false refuses H.264
+// (control-api.md §Codec resolution, amendment 35); absent, true or a non-boolean
+// accepts it and keeps the rest of the probe, and a stale false is no probe at all.
+func TestParseDeviceProbeH264Refused(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	caps, _ := json.Marshal(map[string]any{"codecs": map[string]any{"h264": false, "av1": true}, "measured_at": now})
+	if dp := parseDeviceProbe(caps); dp == nil || !dp.H264Refused || !dp.AV1 {
+		t.Fatalf("h264:false: parseDeviceProbe = %+v, want H264Refused and AV1", dp)
+	}
+	for _, h264 := range []any{true, nil, "false", 0, map[string]any{}} {
+		caps, _ = json.Marshal(map[string]any{"codecs": map[string]any{"h264": h264, "av1": true}, "measured_at": now})
+		if dp := parseDeviceProbe(caps); dp == nil || dp.H264Refused || !dp.AV1 {
+			t.Fatalf("h264 %#v: parseDeviceProbe = %+v, want the probe kept with h264 accepted", h264, dp)
+		}
+	}
+	caps, _ = json.Marshal(map[string]any{"bandwidth_kbps": 40000, "measured_at": now})
+	if dp := parseDeviceProbe(caps); dp == nil || dp.H264Refused {
+		t.Fatalf("no codecs: parseDeviceProbe = %+v, want h264 accepted", dp)
+	}
+	stale := time.Now().Add(-(probeMaxAgeDays + 1) * 24 * time.Hour).UTC().Format(time.RFC3339)
+	caps, _ = json.Marshal(map[string]any{"codecs": map[string]any{"h264": false}, "measured_at": stale})
+	if dp := parseDeviceProbe(caps); dp != nil || !deviceAccepts(wireCodecH264, dp) {
+		t.Fatalf("stale h264:false: parseDeviceProbe = %+v, want nil and h264 accepted", dp)
+	}
+}

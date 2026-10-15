@@ -1049,10 +1049,10 @@ pub(crate) fn advertised_codec_throughput(
 
 /// How long register preparation may take before the agent says so. Register
 /// preparation (the image reconcile and the install probe, both against the
-/// container runtime) runs before the socket is dialled, so it can no longer eat the
-/// control plane's handshake window — but the window is 15 s (agentws
-/// `handshakeTimeout`), and a runtime slow enough to approach it deserves a log line
-/// naming it rather than a slow, mysterious reconnect (#191).
+/// container runtime) runs before the socket is dialled, so it never eats the
+/// control plane's register window (agentws `registerReadTimeout`); a runtime
+/// this slow still deserves a log line naming it rather than a slow, mysterious
+/// reconnect (#191).
 const REGISTER_PREP_BUDGET: Duration = Duration::from_secs(10);
 
 fn register_prep_over_budget(elapsed: Duration) -> bool {
@@ -1990,7 +1990,7 @@ async fn connect_and_run(
 
     // Everything `register` needs from the container runtime is gathered BEFORE the
     // socket is opened (#191). The control plane gives a fresh connection its
-    // handshake window (agentws `handshakeTimeout`, 15 s) to send `register`; these
+    // register window (agentws `registerReadTimeout`) to send `register`; these
     // two probes used to run after the dial, and on a host whose docker daemon
     // answers `inspect` slowly (each is bounded at 30 s) they pushed `register` past
     // that deadline. The control plane closed the socket without a close frame, the
@@ -3278,6 +3278,46 @@ struct PendingAssignment {
     gpu_index: i32,
 }
 
+/// How long a launch keeps asking for its image preparation after the runtime
+/// client refused it for lack of a free slot.
+const LAUNCH_BUSY_BUDGET: Duration = Duration::from_secs(5);
+
+/// Wait for a launch's image preparation. An admission `Busy` never reached the
+/// engine and wrote nothing, so the preparation is submitted again until `budget`
+/// is spent or the launch is stopped; any other error ends the wait as it is.
+fn await_image_preparation(
+    session: &str,
+    first: crate::runtime::ImageOperation<crate::runtime::ImageInfo>,
+    mut resubmit: impl FnMut() -> Result<
+        crate::runtime::ImageOperation<crate::runtime::ImageInfo>,
+        crate::runtime::RuntimeError,
+    >,
+    stop: &AtomicBool,
+    budget: &crate::session::teardown::RetryBudget,
+    pause: Duration,
+) -> Result<crate::runtime::ImageInfo, crate::runtime::RuntimeError> {
+    use crate::runtime::ErrorKind;
+    let mut operation = first;
+    loop {
+        match operation.wait_with_cancel(|_| {}, || stop.load(Ordering::Relaxed)) {
+            Err(error) if error.kind == ErrorKind::Busy && budget.live() => {
+                warn!(
+                    token = "launch-image-busy",
+                    session_id = %session,
+                    "image preparation was refused a runtime slot; asking again"
+                );
+                std::thread::sleep(pause);
+                // A resubmitted pull ignores cancellation, so ask only while still wanted.
+                if stop.load(Ordering::Relaxed) {
+                    return Err(ErrorKind::Cancelled.into());
+                }
+                operation = resubmit()?;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// The per-running-session handles the agent loop holds.
 struct RunningHandle {
     stop: Arc<AtomicBool>,
@@ -3963,9 +4003,26 @@ impl SessionManager {
                         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
                                 if let Some(preparation) = preparation {
-                                    if let Err(error) = preparation
-                                        .wait_with_cancel(|_| {}, || stop.load(Ordering::Relaxed))
-                                    {
+                                    let image = cfg
+                                        .container
+                                        .as_ref()
+                                        .map(|c| c.image.clone())
+                                        .unwrap_or_default();
+                                    if let Err(error) = await_image_preparation(
+                                        &panic_sid,
+                                        preparation,
+                                        || {
+                                            crate::runtime::configured().map(|runtime| {
+                                                runtime
+                                                    .ensure_image(image.clone(), Duration::from_secs(600))
+                                            })
+                                        },
+                                        &stop,
+                                        &crate::session::teardown::RetryBudget::new(
+                                            LAUNCH_BUSY_BUDGET,
+                                        ),
+                                        crate::session::teardown::STOP_PAUSE,
+                                    ) {
                                         let event = if error.kind
                                             == crate::runtime::ErrorKind::Cancelled
                                         {
@@ -7261,14 +7318,110 @@ mod tests {
     // ---- #191: register preparation runs before the dial ----
 
     #[test]
-    fn register_prep_budget_sits_inside_the_control_plane_handshake_window() {
-        // agentws handshakeTimeout is 15 s. The budget exists to NAME a slow runtime,
-        // so it must trip before the peer would have given up on a same-window dial.
-        assert!(REGISTER_PREP_BUDGET < Duration::from_secs(15));
+    fn register_prep_budget_names_a_slow_runtime() {
         assert!(!register_prep_over_budget(Duration::from_millis(800)));
         assert!(register_prep_over_budget(Duration::from_secs(11)));
         // The field case: one 30 s inspect timeout.
         assert!(register_prep_over_budget(Duration::from_secs(30)));
+    }
+
+    /// #627: a recovery actor that never answers must not hold the connection's only
+    /// reader. `register` has to beat agentws `registerReadTimeout`, and the ack of an
+    /// assign sent right after `capacity` (the console auto-start) has to beat the control
+    /// plane's 10 s `assignAckTimeout`, the same 10 s the actor's status read may take.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_recovery_actor_delays_neither_register_nor_an_ack() {
+        // `connect_and_run` records the install facts it discovers.
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        // Never accepts: a status request connects through the backlog, then waits.
+        let actor = dir.path().join("actor.sock");
+        let _actor = std::os::unix::net::UnixListener::bind(&actor).unwrap();
+        let release_mgr = ReleaseManager::owned(&actor);
+
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret = dir.path().join("secret");
+        let cfg = Config {
+            control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let (timings_tx, timings_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            fn next_text(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> String {
+                loop {
+                    if let Message::Text(t) = ws.read().expect("the agent stays connected") {
+                        return t.to_string();
+                    }
+                }
+            }
+            let (stream, _) = cp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let opened = Instant::now();
+            let register = next_text(&mut ws);
+            let register_after = opened.elapsed();
+            assert!(register.contains(r#""type":"register""#), "{register}");
+            ws.send(Message::Text(
+                r#"{"type":"registered","host_id":"h1","node_secret":null,"heartbeat_interval_ms":5000}"#
+                    .into(),
+            ))
+            .unwrap();
+            while !next_text(&mut ws).contains(r#""type":"capacity""#) {}
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "session_assign", "id": "assign-1", "session_id": "s1",
+                    "gpu_index": 0,
+                    "stream": {"width": 1920, "height": 1080, "fps": 60,
+                        "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+            let assigned = Instant::now();
+            loop {
+                let frame = next_text(&mut ws);
+                if frame.contains(r#""type":"ack""#) && frame.contains(r#""id":"assign-1""#) {
+                    break;
+                }
+            }
+            let _ = timings_tx.send((register_after, assigned.elapsed()));
+            // Dropping `ws` closes the socket, which ends the attempt.
+        });
+
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        let attempt = connect_and_run(
+            &cfg,
+            &health,
+            "",
+            "test",
+            &image_mgr,
+            &release_mgr,
+            &mut sessions,
+            false,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(90), attempt).await;
+        let (register_after, ack_after) = timings_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake control plane saw register and the assign's ack");
+        assert!(
+            register_after < Duration::from_secs(1),
+            "register reached the control plane {register_after:?} after the upgrade"
+        );
+        assert!(
+            ack_after < Duration::from_secs(3),
+            "the assign was acked {ack_after:?} after it was sent"
+        );
     }
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`
@@ -8851,6 +9004,125 @@ mod tests {
             observed.load(Ordering::SeqCst),
             "prepared assignment could implicitly pull through CLI"
         );
+    }
+
+    /// A runtime client with one slot, held for `hold`, and an engine that has the
+    /// image: what a launch sees when its preparation is refused for lack of a slot.
+    fn one_slot_runtime(
+        hold: Duration,
+    ) -> (
+        tempfile::TempDir,
+        crate::runtime::RuntimeClient,
+        crate::runtime::Operation<()>,
+    ) {
+        use std::io::{Read, Write};
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::thread::spawn(move || {
+            // Every request is answered; the client's own calls decide how many arrive.
+            while let Ok((mut socket, _)) = listener.accept() {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    if socket.read_exact(&mut byte).is_err() {
+                        break;
+                    }
+                    request.push(byte[0]);
+                }
+                let body = if String::from_utf8_lossy(&request).contains("/version") {
+                    r#"{"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.40"}"#
+                } else {
+                    r#"{"Id":"sha256:fixture","Size":100}"#
+                };
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let mut config = crate::runtime::RuntimeConfig::unix(socket_path);
+        config.image_state_path = Some(directory.path().join("operations"));
+        config.max_in_flight = 1;
+        let runtime = crate::runtime::RuntimeClient::new(config).unwrap();
+        let holder = runtime.submit_owned(
+            async move {
+                tokio::time::sleep(hold).await;
+                Ok(())
+            },
+            Duration::from_secs(60),
+            false,
+        );
+        (directory, runtime, holder)
+    }
+
+    #[test]
+    fn a_launch_refused_a_slot_waits_for_one_and_prepares_its_image() {
+        let (_dir, runtime, _holder) = one_slot_runtime(Duration::from_millis(300));
+        let first = runtime.ensure_image("test", Duration::from_secs(5));
+        let mut resubmitted = 0;
+        let image = await_image_preparation(
+            "s",
+            first,
+            || {
+                resubmitted += 1;
+                Ok(runtime.ensure_image("test", Duration::from_secs(5)))
+            },
+            &AtomicBool::new(false),
+            &crate::session::teardown::RetryBudget::new(Duration::from_secs(5)),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(image.id, "sha256:fixture");
+        assert!(resubmitted >= 1);
+    }
+
+    #[test]
+    fn a_launch_that_is_never_given_a_slot_fails_busy_when_the_budget_is_spent() {
+        let (_dir, runtime, _holder) = one_slot_runtime(Duration::from_secs(60));
+        let first = runtime.ensure_image("test", Duration::from_secs(5));
+        let mut resubmitted = 0;
+        let started = Instant::now();
+        let error = await_image_preparation(
+            "s",
+            first,
+            || {
+                resubmitted += 1;
+                Ok(runtime.ensure_image("test", Duration::from_secs(5)))
+            },
+            &AtomicBool::new(false),
+            &crate::session::teardown::RetryBudget::new(Duration::from_millis(300)),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, crate::runtime::ErrorKind::Busy);
+        assert!(resubmitted >= 2, "resubmitted {resubmitted} times");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_cancelled_launch_stops_waiting_for_a_slot_at_once() {
+        let (_dir, runtime, _holder) = one_slot_runtime(Duration::from_secs(60));
+        let first = runtime.ensure_image("test", Duration::from_secs(5));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stopper.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let error = await_image_preparation(
+            "s",
+            first,
+            || Ok(runtime.ensure_image("test", Duration::from_secs(5))),
+            &stop,
+            &crate::session::teardown::RetryBudget::new(Duration::from_secs(30)),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, crate::runtime::ErrorKind::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

@@ -215,6 +215,8 @@ boot_local_stack() {
   # below passes it to agentcreds.sh via $QUASAR_DEV_AGENT_KEY, bypassing its
   # own docker-exec discovery, which assumes a compose service name this
   # ad-hoc stack does not have).
+  # QUASAR_DEV_AGENT_INSECURE_HTTP=1 is safe only with the 127.0.0.1 publish
+  # below: the mint arrives from the bridge gateway, not loopback.
   docker run -d --name "$CP" --network "$NET" \
     -p "127.0.0.1:${CP_PORT}:8080" \
     -v "$DX_ROOT/control-plane":/w \
@@ -230,6 +232,7 @@ boot_local_stack() {
     -e QUASAR_TLS=off \
     -e QUASAR_WEB_ROOT=/app/web \
     -e QUASAR_DEV_AGENT_AUTH=1 \
+    -e QUASAR_DEV_AGENT_INSECURE_HTTP=1 \
     -e QUASAR_DEV_AGENT_KEY_PATH=/run/quasar/dev-agent-key \
     "$GO_IMAGE" sh -c 'go run ./cmd/quasar-control' >/dev/null
 

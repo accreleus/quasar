@@ -625,22 +625,6 @@ func (e *Ensurer) markUnsupported(hostID string) {
 	}
 }
 
-// splitDockerfilePath renders image_catalog.dockerfile (one repo-root-relative
-// path, e.g. "steam/Dockerfile") into the (context_subdir, dockerfile) pair
-// image_build wants (protocol/agent-api.md §image_build): everything before
-// the last slash / everything after. A bare "Dockerfile" splits to
-// context_subdir="." (repo root is the build context).
-func splitDockerfilePath(df string) (contextSubdir, dockerfile string) {
-	df = strings.TrimSpace(df)
-	if df == "" {
-		df = "Dockerfile"
-	}
-	if i := strings.LastIndex(df, "/"); i >= 0 {
-		return df[:i], df[i+1:]
-	}
-	return ".", df
-}
-
 // parseBuildArgs decodes the frozen installed_images.build_args (validated as
 // strings at sync, manifest.go) into image_build's map[string]string. Errors
 // rather than dropping to empty: a build_args that won't decode to
@@ -710,9 +694,16 @@ func (e *Ensurer) sendEnsure(hostID string, img installedImage) bool {
 			}
 			return false
 		}
-		contextSubdir, dockerfile := splitDockerfilePath(img.Dockerfile)
+		// image_catalog.dockerfile is one repo-root-relative path, and the catalog
+		// repo builds every Dockerfile from the repo root (`docker build -f <path> .`),
+		// so the context is always the root ("."): a COPY names its source from the
+		// root. The agent resolves the Dockerfile path inside that context.
+		dockerfile := strings.TrimSpace(img.Dockerfile)
+		if dockerfile == "" {
+			dockerfile = "Dockerfile"
+		}
 		res, err = e.disp.SendImageBuild(ctx, hostID, cmdID, img.ImageID,
-			e.contextURLFor(img), contextSubdir, dockerfile, buildArgs, img.LocalTag, img.Version)
+			e.contextURLFor(img), ".", dockerfile, buildArgs, img.LocalTag, img.Version)
 	} else {
 		res, err = e.disp.SendImageEnsure(ctx, hostID, cmdID, img.ImageID, img.RegistryRef, img.Version)
 	}

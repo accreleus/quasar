@@ -419,6 +419,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		log.Warn("FIRST-RUN SETUP: no admin exists — claim the instance at POST /v1/setup/claim with header X-Quasar-Setup-Token",
 			"token_file", setupTokenPath,
 			"note", "read the token from the file (e.g. docker exec <control-plane> cat "+setupTokenPath+"); it is per-boot — a restart before claim rotates it")
+		if !cfg.TLSEnabled() && len(cfg.TrustedProxies) == 0 {
+			log.Warn("FIRST-RUN SETUP cannot be claimed as configured: the claim is refused over plain HTTP, and QUASAR_TLS=off with no QUASAR_TRUSTED_PROXIES leaves no other way in",
+				"fix", "turn QUASAR_TLS back on, or name the TLS-terminating reverse proxy in QUASAR_TRUSTED_PROXIES, or provision the admin with BOOTSTRAP_ADMIN_*")
+		}
 	}
 	setupHandler := setup.NewService(authSvc, settingsStore, setupSecret, log).
 		WithTrustedProxies(cfg.TrustedProxies)
@@ -580,7 +584,12 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 
 	authHandler := auth.NewHandler(authSvc, auditStore).
 		WithVersionPolicy(cfg.MinClientVersion, cfg.LatestClientVersion).
-		WithTrustedProxies(cfg.TrustedProxies)
+		WithTrustedProxies(cfg.TrustedProxies).
+		WithLogger(log)
+	if !cfg.TLSEnabled() && len(cfg.TrustedProxies) == 0 {
+		log.Warn("sign-in over plain HTTP: QUASAR_TLS=off with no QUASAR_TRUSTED_PROXIES; the next release refuses sign-in, registration and password change over plain HTTP",
+			"fix", "turn QUASAR_TLS back on, or name the TLS-terminating reverse proxy in QUASAR_TRUSTED_PROXIES")
+	}
 	crudHandler := crud.NewHandler(pool, auditStore)
 	crudHandler.SetRegistry(agentRegistry) // lets DELETE /v1/hosts/{id} check live connectivity
 	crudHandler.SetReadinessStaleSecs(int(cfg.ReadinessStaleSecs))

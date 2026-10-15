@@ -13,12 +13,18 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 )
 
 var ErrApprovalSuperseded = errors.New("idle approval no longer matches reviewed policy")
 var ErrIdleAttemptConflict = errors.New("another disruptive host attempt is open")
 var ErrIdleAttemptNotFound = errors.New("idle apply attempt not found")
 var ErrIdleCancelTooLate = errors.New("idle apply already accepted")
+
+// releasedStatusSQL is the status of a draining host whose last restriction
+// left: online only while no disconnect is recorded (#656).
+const releasedStatusSQL = `CASE WHEN ` + admission.HostIsLiveSQL + ` THEN 'online' ELSE 'offline' END`
 
 // IdleApplyAttempt is the public projection of one owned waiting restriction.
 // No field here claims that the setting has applied.
@@ -505,7 +511,9 @@ func (s *Store) CurrentIdleApply(ctx context.Context, hostID string) (IdleApplyA
 // CancelIdleApply fences a never-offered approval and releases exactly its
 // restriction in one host-locked transaction. An offered grant is retained as
 // cancel_pending until an authenticated agent journal proves nonacceptance.
-func (s *Store) CancelIdleApply(ctx context.Context, hostID, attemptID string, connected bool) (IdleApplyAttempt, error) {
+// Liveness is read under that lock, never from a registry snapshot taken before
+// it: a disconnect in between would leave a dead host online (#626).
+func (s *Store) CancelIdleApply(ctx context.Context, hostID, attemptID string) (IdleApplyAttempt, error) {
 	var empty IdleApplyAttempt
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -513,7 +521,8 @@ func (s *Store) CancelIdleApply(ctx context.Context, hostID, attemptID string, c
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var hostStatus string
-	if err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&hostStatus); errors.Is(err, pgx.ErrNoRows) {
+	var connected bool
+	if err := tx.QueryRow(ctx, `SELECT status, `+admission.HostIsLiveSQL+` FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&hostStatus, &connected); errors.Is(err, pgx.ErrNoRows) {
 		return empty, ErrIdleAttemptNotFound
 	} else if err != nil {
 		return empty, err

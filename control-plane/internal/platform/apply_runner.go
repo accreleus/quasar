@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 )
@@ -258,25 +259,29 @@ type developerEvidence struct {
 	// A register on `commit` proves nothing when the host already ran it: the old
 	// agent a failed attempt restored registers the same commit, possibly before its
 	// relayed failure (agent-api.md §release_state, "A successful node-agent apply
-	// is usually never reported…"). Then only the relayed outcome decides.
+	// is usually never reported…"). Then only the relayed outcome decides. An
+	// unknown earlier commit fails closed: the register decides (#619).
 	registerIsEvidence bool
 }
 
 // RememberDeveloperCommit records the commit the developer apply endpoint read
 // off the attempt's images and the commit the host ran before it, so neither the
-// send nor the register hook reads the registry again.
+// send nor the register hook reads the registry again. A nil earlier commit is
+// unknown history.
 func (r *Runner) RememberDeveloperCommit(attemptID, commit string, hostCommitBefore *string) {
 	r.mu.Lock()
 	r.developerCommits[attemptID] = developerEvidence{
 		commit:             commit,
-		registerIsEvidence: hostCommitBefore != nil && !commitsMatch(*hostCommitBefore, commit),
+		registerIsEvidence: hostCommitBefore == nil || !commitsMatch(*hostCommitBefore, commit),
 	}
 	r.mu.Unlock()
 }
 
 // developerCommit is the commit a developer_apply attempt carries, and whether a
 // register on it is success evidence. An attempt re-adopted after a restart does
-// not know the host's earlier commit, so for it only the relayed outcome decides.
+// not know the host's earlier commit, so only a register of `commit` resolves it.
+// For one of the commit the host already ran, that is the host's next register,
+// whatever the apply's outcome.
 func (r *Runner) developerCommit(ctx context.Context, a Attempt) (developerEvidence, error) {
 	r.mu.Lock()
 	ev, ok := r.developerCommits[a.ID]
@@ -292,7 +297,7 @@ func (r *Runner) developerCommit(ctx context.Context, a Attempt) (developerEvide
 		return developerEvidence{}, err
 	}
 	r.RememberDeveloperCommit(a.ID, commit, nil)
-	return developerEvidence{commit: commit}, nil
+	return developerEvidence{commit: commit, registerIsEvidence: true}, nil
 }
 
 func (r *Runner) forgetDeveloperCommit(attemptID string) {
@@ -657,8 +662,18 @@ func (r *Runner) HandleReleaseState(ctx context.Context, hostID string, rep Rele
 
 	switch rep.State {
 	case AttemptSucceeded:
-		// Corroboration, not the gate — but an apply that somehow reported its
-		// own success is still resolved by it.
+		// Corroboration, not the gate, wherever a register can prove the outcome:
+		// a faulty agent must not resolve its own apply (#619).
+		if !slices.Equal(rep.Components, a.RequestedDigests) {
+			r.log.Warn("release_state says succeeded for components this apply did not request; not recorded",
+				"attempt_id", a.ID, "host_id", hostID, "token", "apply-relayed-success-ignored")
+			return
+		}
+		if r.registerIsEvidence(ctx, a) {
+			r.log.Info("relayed success noted; waiting for the register on the requested build",
+				"attempt_id", a.ID, "host_id", hostID)
+			return
+		}
 		if done, err := r.store.SucceedAttempt(ctx, a.ID); err != nil {
 			r.log.Warn("release_state: could not record success", "attempt_id", a.ID, "err", err)
 		} else if done {
@@ -793,6 +808,24 @@ func restoredDigests(requested []ComponentDigest, previous []PreviousDigest) []C
 	return out
 }
 
+// registerIsEvidence is whether HandleRegister resolves `a` on a register
+// reporting its commit; keep the two in step. A release always names one
+// (platform_releases.source_commit is NOT NULL), so it is not read. Fails closed
+// when a developer apply's images cannot be read.
+func (r *Runner) registerIsEvidence(ctx context.Context, a Attempt) bool {
+	if namesOnly(a.RequestedDigests, ComponentRecovery) {
+		return false
+	}
+	if a.ReleaseID != nil {
+		return true
+	}
+	if a.Kind == KindDeveloperApply {
+		ev, err := r.developerCommit(ctx, a)
+		return err != nil || ev.registerIsEvidence
+	}
+	return false
+}
+
 // HandleRegister is the success-evidence hook, on every agent register. A
 // register is the only thing that clears the apply-unsupported flag, and one
 // carrying the requested source_commit resolves that host's open attempt.
@@ -820,7 +853,7 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 	if wantCommit == "" && a.Kind == KindDeveloperApply {
 		ev, err := r.developerCommit(ctx, a)
 		if err != nil {
-			// The actor's relayed outcome or the deadline decides.
+			// A relayed failure or the deadline decides.
 			r.log.Warn("register: could not read the developer apply's commit", "attempt_id", a.ID, "err", err)
 			return
 		}
@@ -860,7 +893,7 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 			return
 		}
 		if actor == nil || !commitsMatch(wantCommit, *actor) {
-			r.log.Info("register reports the requested agent but not the requested recovery actor; the relayed outcome decides",
+			r.log.Info("register reports the requested agent but not the requested recovery actor; a relayed failure or the deadline decides",
 				"host_id", hostID, "attempt_id", a.ID)
 			return
 		}

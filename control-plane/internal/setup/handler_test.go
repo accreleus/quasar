@@ -61,9 +61,10 @@ func quietLog() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// doClaim claims on the TLS listener: an https target makes httptest set r.TLS.
 func doClaim(t *testing.T, svc *Service, token, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/setup/claim", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "https://quasar.test/v1/setup/claim", strings.NewReader(body))
 	if token != "" {
 		req.Header.Set(TokenHeader, token)
 	}

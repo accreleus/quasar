@@ -50,14 +50,14 @@ func codecSet(hostCodecs []string) map[string]bool {
 	return set
 }
 
-// deviceAccepts is clamps 2+3. H.264 is universal; HEVC and AV1 are hard-gated
-// on an explicit probe capability, so a stale or absent probe means no. An
-// undecodable codec is a black stream, not a quality drop, so uncertainty
-// resolves to the H.264 floor.
+// deviceAccepts is clamps 2+3. H.264 is refused only by a fresh explicit false,
+// and the floor still dispatches it; HEVC and AV1 are hard-gated on an explicit
+// probe capability, so a stale or absent probe means no. An undecodable codec is
+// a black stream, not a quality drop, so uncertainty resolves to the H.264 floor.
 func deviceAccepts(wire string, dp *DeviceProbe) bool {
 	switch wire {
 	case wireCodecH264:
-		return true
+		return dp == nil || !dp.H264Refused
 	case wireCodecH265:
 		return dp != nil && dp.HEVC
 	case wireCodecAV1:

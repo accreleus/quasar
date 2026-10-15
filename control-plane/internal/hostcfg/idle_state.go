@@ -71,20 +71,26 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 		return false, err
 	}
 	var current *string
-	if err := tx.QueryRow(ctx, `SELECT connection_incarnation::text FROM host_journal_reconciliation WHERE host_id=$1::uuid`, hostID).Scan(&current); err != nil {
+	var gate string
+	if err := tx.QueryRow(ctx, `SELECT connection_incarnation::text,state FROM host_journal_reconciliation WHERE host_id=$1::uuid`, hostID).Scan(&current, &gate); err != nil {
 		return false, err
 	}
 	if current == nil || *current != connectionID {
 		return false, ErrApprovalSuperseded
 	}
+	if gate != "complete" {
+		// Until this connection's journal is applied it is the record: a report
+		// written first could close the attempt and quarantine every later journal.
+		return false, tx.Commit(ctx)
+	}
 	var group, digest, grantBoot, grantConnection, phase string
 	var revision, oldSeq int64
-	var started *time.Time
+	var started, terminalAt *time.Time
 	var previousError *string
 	err = tx.QueryRow(ctx, `SELECT group_key,approved_digest,approved_revision,boot_incarnation::text,
-		grant_connection::text,phase,COALESCE(journal_sequence,-1),started_at,error_code
+		grant_connection::text,phase,COALESCE(journal_sequence,-1),started_at,terminal_at,error_code
 		FROM host_config_attempts WHERE host_id=$1::uuid AND id::text=$2 FOR UPDATE`, hostID, state.AttemptID).
-		Scan(&group, &digest, &revision, &grantBoot, &grantConnection, &phase, &oldSeq, &started, &previousError)
+		Scan(&group, &digest, &revision, &grantBoot, &grantConnection, &phase, &oldSeq, &started, &terminalAt, &previousError)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrIdleAttemptNotFound
 	}
@@ -139,7 +145,8 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 		}
 		return false, tx.Commit(ctx)
 	}
-	if phase == "applied" || phase == "recovered" || phase == "uncertain" || phase == "revoked_unstarted" {
+	if terminalAt != nil {
+		// Includes a seq-0 failed closed by a complete journal: its hold is gone.
 		return false, ErrApprovalSuperseded
 	}
 	if started != nil && seq == 0 {
@@ -183,12 +190,22 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 			WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, state.AttemptID); err != nil {
 			return false, err
 		}
+		// A restored ledger can hold the attempt without its restriction.
+		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+			VALUES($1::uuid,'recovery',$2::uuid,'configuration_recovery') ON CONFLICT DO NOTHING`, hostID, state.AttemptID); err != nil {
+			return false, err
+		}
+		if hostStatus == "online" {
+			if _, err := tx.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id=$1::uuid`, hostID); err != nil {
+				return false, err
+			}
+		}
 	} else if terminal {
 		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, state.AttemptID); err != nil {
 			return false, err
 		}
 		if hostStatus == "draining" {
-			if _, err := tx.Exec(ctx, `UPDATE hosts SET status='online' WHERE id=$1::uuid AND NOT EXISTS
+			if _, err := tx.Exec(ctx, `UPDATE hosts SET status=`+releasedStatusSQL+` WHERE id=$1::uuid AND NOT EXISTS
 				(SELECT 1 FROM host_admission_restrictions WHERE host_id=$1::uuid)`, hostID); err != nil {
 				return false, err
 			}

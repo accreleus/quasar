@@ -41,8 +41,13 @@ const (
 	heartbeatIntervalMs = 5000
 	// Allow 4× heartbeat_interval before declaring the read stale.
 	readDeadlineDur = time.Duration(heartbeatIntervalMs*4) * time.Millisecond
-	// How long to wait for the initial register / capacity messages.
+	// Bounds register's DB work and the wait for the first capacity message.
 	handshakeTimeout = 15 * time.Second
+	// How long an unauthenticated socket may hold an admission slot before its
+	// register arrives (#627). An agent built before #627 waits for its recovery
+	// actor's status (10 s budget) between dialling and register, so this covers that
+	// plus a round trip. Drop it to 5 s once no supported agent waits.
+	registerReadTimeout = 11 * time.Second
 	// Bounds the read loop's per-message DB work (#416) so a stalled store
 	// surfaces as a dropped agent connection instead of parking the loop. Must
 	// stay below db.DefaultStatementTimeout (30s) or the DB's own timeout wins
@@ -808,7 +813,7 @@ func (h *Handler) Register(mux httpx.Router) {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	clientIP := ratelimit.ClientIP(r, h.trustedProxies)
+	clientIP := ratelimit.PrefixKey(r, h.trustedProxies) // #674: an IPv6 /64 is one budget
 	if !h.failures.Reserve(clientIP, enrollmentMaxInFlightIP, enrollmentMaxInFlight) {
 		http.Error(w, "too many failed enrollment attempts; try again later", http.StatusTooManyRequests)
 		return
@@ -847,7 +852,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 
 	// Step 1 — register
 	registerCtx, cancelRegister := context.WithTimeout(bg, handshakeTimeout)
-	hostID, regImages, regCommit, terminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, err := h.handleRegister(registerCtx, conn, clientIP)
+	hostID, registeredAt, regImages, regCommit, terminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, err := h.handleRegister(registerCtx, conn, clientIP)
 	cancelRegister()
 	h.failures.Release(clientIP)
 	if err != nil {
@@ -885,8 +890,8 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		ac.imageVersionsObservedAt = time.Now().UTC()
 	}
 	h.registry.add(ac)
-	// The predecessor may have projected offline between this register's write and
-	// add; restate liveness now that this connection is current.
+	// A drain released between this register's write and add projects offline (no
+	// connection was registered); restate liveness now that this connection is current.
 	h.registry.withCurrent(ac, func() {
 		if err := h.store.markLive(bg, hostID); err != nil {
 			h.log.Error("mark live failed", "host_id", hostID, "err", err)
@@ -913,7 +918,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			h.events.HostDisconnected(ctx, hostID)
 			// Bounds the rate-limiter map by the live connection set.
 			h.imageLimiter.evict(hostID)
-			if err := h.store.markOffline(bg, hostID); err != nil {
+			if err := h.store.markOffline(bg, hostID, registeredAt); err != nil {
 				h.log.Error("mark offline failed", "host_id", hostID, "err", err)
 			}
 		})
@@ -1226,6 +1231,17 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 					h.log.Warn("idle policy journal state for an unknown attempt ignored", "host_id", hostID, "attempt_id", state.AttemptID, "err", err)
 					continue
 				}
+				// Until this connection's journal is applied its pages are the record: a
+				// cached report would make the page's entry conflict or be skipped (#656).
+				// A seq-0 failure is never cached and still reaches its refresh below.
+				if state.Phase != "failed" || state.JournalSequence != "0" {
+					if gate, err := h.cfgStore.JournalGate(bg, hostID); err != nil {
+						h.log.Warn("idle policy journal gate unreadable; state ignored", "host_id", hostID, "err", err)
+						continue
+					} else if gate != "complete" {
+						continue
+					}
+				}
 				fresh, err := ac.acceptPolicySequence(state)
 				if err != nil {
 					ac.policyInventoryBlocked.Store(true)
@@ -1481,17 +1497,18 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 }
 
 // handleRegister performs the register handshake and returns the resolved host
-// id plus the agent's optional image-management P2 `images` snapshot (nil when
-// the agent sent no such field — see RegisterMsg.Images).
-// The third return value is the identity commit the agent reported (nil when it
+// id, the last_registered_at it wrote (markOffline's key), and the agent's optional
+// image-management P2 `images` snapshot (nil when the agent sent no such field — see
+// RegisterMsg.Images).
+// The fourth return value is the identity commit the agent reported (nil when it
 // reported none or one this build refused), which the caller hands to the
 // platform-apply success-evidence hook.
-func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
-	fail := func(err error) (string, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
+func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, time.Time, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
+	fail := func(err error) (string, time.Time, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
 		h.failures.Failure(clientIP)
-		return "", nil, nil, false, false, nil, "", ImageCleanupRegister{}, err
+		return "", time.Time{}, nil, nil, false, false, nil, "", ImageCleanupRegister{}, err
 	}
-	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	conn.SetReadDeadline(time.Now().Add(registerReadTimeout))
 	raw, err := readTextMessage(conn)
 	if err != nil {
 		return fail(fmt.Errorf("read: %w", describeHandshakeRead(err)))
@@ -1523,7 +1540,8 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			// so this adds a case rather than changing one.
 			h.writeError(conn, "auth_failed",
 				"a live agent is already registered under this node name; stop it before re-enrolling, "+
-					"or enroll under a different node_name")
+					"or enroll under a different node_name. If that machine is gone, forget the host first "+
+					"with the admin API (DELETE /v1/hosts/{id}); that deletes its history and tombstones its homes.")
 		case errors.Is(err, ErrHostAlreadyEnrolled):
 			h.writeError(conn, "auth_failed",
 				"this node name is already enrolled; re-enrolling it needs an enrollment token "+
@@ -1621,7 +1639,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	if err := conn.WriteJSON(resp); err != nil {
-		return "", nil, nil, false, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
+		return "", time.Time{}, nil, nil, false, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
 	}
 	cleanupRegister := ImageCleanupRegister{Capable: reg.ImageCleanupV1}
 	if reg.ImageCleanupV1 {
@@ -1631,7 +1649,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			cleanupRegister.Versions = versions
 		}
 	}
-	return result.HostID, reg.Images, identity.SourceCommit, reg.TerminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
+	return result.HostID, result.RegisteredAt, reg.Images, identity.SourceCommit, reg.TerminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }
 
 func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, ac *conn) error {
@@ -1655,7 +1673,7 @@ func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, ac *
 }
 
 // describeHandshakeRead names the one register-read failure operators meet in the
-// field: the agent opened the socket and then sent nothing for handshakeTimeout.
+// field: the agent opened the socket and then sent nothing for registerReadTimeout.
 // Before #191 the agent ran its container-runtime probes INSIDE that window, so a
 // slow docker daemon on the host surfaced here as a bare i/o timeout and, on the
 // agent, as "connection reset without closing handshake" — two logs that did not
@@ -1665,7 +1683,7 @@ func describeHandshakeRead(err error) error {
 	if errors.As(err, &ne) && ne.Timeout() {
 		return fmt.Errorf("no register within %s of the connection opening — an agent "+
 			"whose container runtime answers slowly can take longer than this to prepare "+
-			"its register (#191): %w", handshakeTimeout, err)
+			"its register (#191): %w", registerReadTimeout, err)
 	}
 	return err
 }
@@ -2213,7 +2231,8 @@ func (h *Handler) resolveAuth(ctx context.Context, reg RegisterMsg) (registerRes
 	}
 	var tryReconnect AuthReconnect
 	if json.Unmarshal(reg.Auth, &tryReconnect) == nil && tryReconnect.NodeSecret != "" {
-		return h.store.reconnectHost(ctx, reg.NodeName, reg.AgentVersion,
+		identity, _ := identityFromRegister(reg) // malformed fields are logged by handleRegister
+		return h.store.reconnectHost(ctx, reg.NodeName, reg.AgentVersion, identity.SourceCommit,
 			tryReconnect.NodeSecret)
 	}
 	return registerResult{}, errors.New("auth must contain enrollment_token or node_secret")

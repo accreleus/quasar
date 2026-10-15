@@ -100,11 +100,12 @@ func (h *Handler) handleListProfiles(w http.ResponseWriter, r *http.Request) {
 			RTTMs:            dp.RTTMs,
 			MaxDecodeHeight:  dp.MaxDecodeHeight,
 			DisplayRefreshHz: dp.DisplayRefreshHz,
-			// h264 decode is always allowed; hevc/av1 come from the probe. nil/stale
+			BrowserName:      dp.BrowserName,
+			// h264 is refused only by an explicit false; hevc/av1 need a true. nil/stale
 			// probe leaves Codecs nil (unknown → allow). Feeds eligibility's
 			// codec_not_supported gate only; never touches HostCaps or launch clamps.
 			Codecs: map[profile.Codec]bool{
-				profile.CodecH264: true,
+				profile.CodecH264: !dp.H264Refused,
 				profile.CodecHEVC: dp.HEVC,
 				profile.CodecAV1:  dp.AV1,
 			},

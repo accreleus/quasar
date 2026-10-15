@@ -67,6 +67,11 @@ services:
       # without it an ambient QUASAR_DEV_AGENT_AUTH=1 is silently inert and
       # `make ui-audit`/`make agent-creds` cannot mint against a local stack.
       QUASAR_DEV_AGENT_AUTH: ${QUASAR_DEV_AGENT_AUTH:-}
+      # The DX verbs mint through the published HTTP port, which the control
+      # plane sees as the bridge gateway, not loopback. Safe here only because
+      # the ports above are published on 127.0.0.1. Never copy this to a stack
+      # whose HTTP port the network can reach.
+      QUASAR_DEV_AGENT_INSECURE_HTTP: "1"
       # First-admin bootstrap: idempotent, no-op once an admin exists. Set these
       # so a fresh local DB is immediately usable in the admin UI.
       # The password must not CONTAIN the username or the email local-part

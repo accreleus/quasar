@@ -296,10 +296,10 @@ func TestProfilesEndpointCodecAwareH264Only(t *testing.T) {
 		t.Errorf("1440p60-h264 rung missing from response")
 	} else {
 		if r.Eligibility != "eligible" {
-			t.Errorf("1440p60-h264 eligibility = %q, want eligible (h264 is never codec-gated)", r.Eligibility)
+			t.Errorf("1440p60-h264 eligibility = %q, want eligible (the probe says h264: true)", r.Eligibility)
 		}
 		if hasReasonCode(r.Reasons, "codec_not_supported") {
-			t.Errorf("1440p60-h264 got codec_not_supported — h264 rungs must never be codec-gated")
+			t.Errorf("1440p60-h264 got codec_not_supported though the probe says h264: true")
 		}
 	}
 
@@ -324,6 +324,32 @@ func TestProfilesEndpointCodecAwareH264Only(t *testing.T) {
 		t.Errorf("1080p60 missing from response")
 	} else if lp.Eligibility != "eligible" {
 		t.Errorf("1080p60 eligibility = %q, want eligible (h264-only chain, unaffected by codec gating)", lp.Eligibility)
+	}
+}
+
+// TestProfilesEndpointH264Refused (#605): a fresh h264:false probe makes the h264
+// rung codec_not_supported and leaves the av1 rung it decodes eligible.
+func TestProfilesEndpointH264Refused(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc, _ := newMetricsServer(t, pool)
+
+	u, err := authSvc.Register(context.Background(), "noh264@test.local", "noh264user", "quasar-fixture-pw-08")
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	tok := loginTok(t, authSvc, "noh264@test.local", "quasar-fixture-pw-08")
+	enableChainCodecs(t, pool, "1440p60", "av1", "h264")
+	upsertProbeCodecs(t, pool, u.ID, `{"h264":false,"hevc":false,"av1":true}`)
+
+	resp, body := getProfiles(t, srv.URL+"/v1/me/profiles", tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/me/profiles = %d, want 200", resp.StatusCode)
+	}
+	if r := rungByID(body, "1440p60-h264"); r == nil || !hasReasonCode(r.Reasons, "codec_not_supported") {
+		t.Errorf("1440p60-h264 = %+v, want codec_not_supported", r)
+	}
+	if r := rungByID(body, "1440p60-av1"); r == nil || hasReasonCode(r.Reasons, "codec_not_supported") {
+		t.Errorf("1440p60-av1 = %+v, want no codec_not_supported", r)
 	}
 }
 
@@ -386,7 +412,7 @@ func TestProfilesEndpointCodecAwareHevcAv1Supported(t *testing.T) {
 // testDB's baseline (see TestProfilesEndpointNoProbe) gives every chain here
 // exactly one h264 rung, so an h264-only probe (upsertProbe never sets
 // capabilities.codecs.{hevc,av1}, which parses as false/false) never actually
-// exercises codec gating in this fixture — h264 is never codec-gated. The
+// exercises codec gating in this fixture (it says h264: true). The
 // codec_not_supported path (Workstream A, 2026-08-01 library-hero-band spec)
 // is covered by TestProfilesEndpointCodecAware*, which build a real
 // multi-codec chain via enableChainCodecs before asserting on it.

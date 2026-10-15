@@ -434,6 +434,53 @@ func TestHighRefreshUsesMeasuredDisplay(t *testing.T) {
 	}
 }
 
+// TestSafariUnknownRefreshCountsAsHighRefresh: Safari with no refresh rate is
+// recommended what Chrome at 120 Hz is, on the same link and decoder (amendment 34).
+func TestSafariUnknownRefreshCountsAsHighRefresh(t *testing.T) {
+	probe := func(browser string, hz float64) *Probe {
+		// A 1080 decoder rules out 1440p60, which would outrank 1080p120 in catalog order.
+		return &Probe{BandwidthKbps: 120000, RTTMs: 15, MaxDecodeHeight: 1080, DisplayRefreshHz: hz, BrowserName: browser,
+			Codecs: map[Codec]bool{CodecH264: true}}
+	}
+	chrome := evaluate(EvalInput{Probe: probe("Chrome", 120)})
+	if top, ok := testRungByID(chrome.RecommendedID); !ok || top.HighRefreshDisplay != DisplayRequired {
+		t.Fatalf("fixture: Chrome at 120 Hz recommends %q, want a high-refresh profile", chrome.RecommendedID)
+	}
+
+	safari := evaluate(EvalInput{Probe: probe("Safari", 0)})
+	if safari.RecommendedID != chrome.RecommendedID {
+		t.Errorf("Safari with no rate recommends %q, Chrome at 120 Hz %q", safari.RecommendedID, chrome.RecommendedID)
+	}
+	for _, pe := range safari.Profiles {
+		if hasReason(pe, ReasonDisplayRefreshUnknown) {
+			t.Errorf("%s: Safari with no rate carries display_refresh_unknown", pe.LaunchProfile.ID)
+		}
+		if want := evalByID(t, chrome, pe.LaunchProfile.ID).Eligibility; pe.Eligibility != want {
+			t.Errorf("%s: Safari %s, Chrome at 120 Hz %s", pe.LaunchProfile.ID, pe.Eligibility, want)
+		}
+	}
+
+	// Every other browser with no rate keeps the unknown rule; the name is matched exactly.
+	for _, b := range []string{"", "Chrome", "Firefox", "safari"} {
+		ev := evaluate(EvalInput{Probe: probe(b, 0)})
+		if ev.RecommendedID == chrome.RecommendedID {
+			t.Errorf("browser %q with no rate recommends %q, want a non-high-refresh profile", b, ev.RecommendedID)
+		}
+		if !hasReason(evalByID(t, ev, chrome.RecommendedID), ReasonDisplayRefreshUnknown) {
+			t.Errorf("browser %q with no rate: %s lost display_refresh_unknown", b, chrome.RecommendedID)
+		}
+	}
+
+	// Safari that reports a rate keeps today's rule.
+	low := evaluate(EvalInput{Probe: probe("Safari", 60)})
+	if pe := evalByID(t, low, chrome.RecommendedID); !hasReason(pe, ReasonDisplayRefreshTooLow) {
+		t.Errorf("Safari at 60 Hz: %s reasons = %+v, want display_refresh_too_low", pe.LaunchProfile.ID, pe.Reasons)
+	}
+	if low.RecommendedID == chrome.RecommendedID {
+		t.Errorf("Safari at 60 Hz recommends %q, a high-refresh profile", low.RecommendedID)
+	}
+}
+
 // TestHistoricalFailureBlocks: a profile in HistoricalFailures is hard-ineligible.
 func TestHistoricalFailureBlocks(t *testing.T) {
 	ev := evaluate(EvalInput{

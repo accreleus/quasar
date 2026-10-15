@@ -363,6 +363,41 @@ func mustGetLaunchProfile(t *testing.T, store *Store, id string) profile.LaunchP
 	return lp
 }
 
+// #610: a sample with no class is a window the browser could not measure. It
+// clears the run, so a smooth before and a smooth after it cannot add up to a pass.
+func TestEvaluateClientHealthUnclassifiedSampleClearsRun(t *testing.T) {
+	pool := testDB(t)
+	store, coord, _ := newCoord(t, pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+
+	sess := runningProfileSession(t, store, pool, s, "1080p60")
+
+	// A real sustained decode failure still records its fail.
+	coord.health.mu.Lock()
+	coord.health.clientRuns[sess.ID] = &clientHealthRun{class: ClientHealthDecode, since: time.Now().Add(-time.Minute)}
+	coord.health.mu.Unlock()
+	coord.EvaluateClientHealth(ctx, sess.ID, ClientHealthSample{Class: ClientHealthDecode, DeviceKey: "dev-1"})
+	if fails, _ := store.ProfileFailures(ctx, s.userID, "dev-1"); !fails["1080p60"] {
+		t.Fatal("a sustained decode_degrading must record a fail")
+	}
+
+	// A smooth run that began 31 s ago, then an unmeasured window.
+	coord.health.mu.Lock()
+	coord.health.clientRuns[sess.ID] = &clientHealthRun{class: ClientHealthSmooth, since: time.Now().Add(-31 * time.Second)}
+	coord.health.mu.Unlock()
+	coord.EvaluateClientHealth(ctx, sess.ID, ClientHealthSample{DeviceKey: "dev-1"})
+	if _, inClientRuns := healthMapsContain(coord, sess.ID); inClientRuns {
+		t.Fatal("a sample with no class must clear the client-health run")
+	}
+
+	// The next smooth starts a new run: no pass, so the fail stays.
+	coord.EvaluateClientHealth(ctx, sess.ID, ClientHealthSample{Class: ClientHealthSmooth, DeviceKey: "dev-1"})
+	if fails, _ := store.ProfileFailures(ctx, s.userID, "dev-1"); !fails["1080p60"] {
+		t.Fatal("smooth on both sides of an unmeasured window must not record a pass")
+	}
+}
+
 func TestEvaluateClientHealthHiddenNeverRecords(t *testing.T) {
 	pool := testDB(t)
 	store, coord, _ := newCoord(t, pool)
