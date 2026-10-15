@@ -835,25 +835,27 @@ func TestUncertainInventoryRestoresAMissingRecoveryHold(t *testing.T) {
 	store := NewStore(pool)
 	hostID, boot, offer := offeredHardwareAttempt(t, pool, store)
 	ctx := context.Background()
-	// A restored ledger can keep the attempt but not its restriction.
-	if _, err := pool.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind='idle_apply'`, hostID); err != nil {
-		t.Fatal(err)
-	}
-	second := "00000000-0000-4000-8000-000000000339"
-	if err := store.BeginJournalReconciliation(ctx, hostID, second); err != nil {
-		t.Fatal(err)
-	}
 	entry := restartInventoryEntry(hostID, boot, offer, "uncertain", "3")
 	entry.ErrorCode = "recovery_verification_failed"
-	if err := store.CompleteJournalReconciliation(ctx, hostID, second, []JournalInventoryEntry{entry}); err != nil {
-		t.Fatal(err)
-	}
-	var recoveryHolds int
-	var hostStatus string
-	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM host_admission_restrictions WHERE host_id=$1::uuid
-		AND owner_kind='recovery' AND owner_id=$2::uuid AND reason='configuration_recovery'),
-		(SELECT status FROM hosts WHERE id=$1::uuid)`, hostID, offer.AttemptID).Scan(&recoveryHolds, &hostStatus); err != nil ||
-		recoveryHolds != 1 || hostStatus != "draining" {
-		t.Fatalf("uncertain attempt left admission open: holds=%d status=%s err=%v", recoveryHolds, hostStatus, err)
+	// A restored ledger can keep the attempt but not its restriction: first on
+	// the open row, then on the already terminal uncertain row (an exact replay).
+	for i, connection := range []string{"00000000-0000-4000-8000-000000000339", "00000000-0000-4000-8000-000000000340"} {
+		if _, err := pool.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind IN ('idle_apply','recovery')`, hostID); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.BeginJournalReconciliation(ctx, hostID, connection); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CompleteJournalReconciliation(ctx, hostID, connection, []JournalInventoryEntry{entry}); err != nil {
+			t.Fatal(err)
+		}
+		var recoveryHolds int
+		var hostStatus string
+		if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM host_admission_restrictions WHERE host_id=$1::uuid
+			AND owner_kind='recovery' AND owner_id=$2::uuid AND reason='configuration_recovery'),
+			(SELECT status FROM hosts WHERE id=$1::uuid)`, hostID, offer.AttemptID).Scan(&recoveryHolds, &hostStatus); err != nil ||
+			recoveryHolds != 1 || hostStatus != "draining" {
+			t.Fatalf("reconciliation %d left the uncertain attempt open: holds=%d status=%s err=%v", i+1, recoveryHolds, hostStatus, err)
+		}
 	}
 }

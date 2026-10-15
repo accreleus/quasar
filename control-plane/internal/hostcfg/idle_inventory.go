@@ -551,7 +551,7 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 	revision, _ := strconv.ParseInt(entry.Revision, 10, 64)
 	terminal := entry.Phase == "applied" || entry.Phase == "recovered" || entry.Phase == "uncertain" ||
 		entry.Phase == "revoked_unstarted" || entry.Phase == "failed" && seq == 0
-	upsert, err := tx.Exec(ctx, `INSERT INTO host_config_attempts
+	if _, err := tx.Exec(ctx, `INSERT INTO host_config_attempts
 		(id,host_id,group_key,approved_digest,approved_revision,scope,boot_incarnation,grant_connection,phase,journal_sequence,started_at,terminal_at,recovery_attempted,error_code)
 		VALUES($1::uuid,$2::uuid,$3,$4,$5,'restart',$6::uuid,$7::uuid,$8,$9,
 			CASE WHEN $9::bigint>0 THEN now() ELSE NULL END,CASE WHEN $10::boolean THEN now() ELSE NULL END,
@@ -562,8 +562,7 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			recovery_attempted=host_config_attempts.recovery_attempted OR excluded.recovery_attempted,
 			error_code=COALESCE(excluded.error_code,host_config_attempts.error_code)
 		WHERE host_config_attempts.terminal_at IS NULL AND (host_config_attempts.journal_sequence IS NULL OR host_config_attempts.journal_sequence<$9::bigint)`,
-		entry.AttemptID, hostID, entry.Group, entry.Digest, revision, entry.GrantBoot, entry.GrantConnection, entry.Phase, seq, terminal, safeIdleErrorCode(entry.ErrorCode))
-	if err != nil {
+		entry.AttemptID, hostID, entry.Group, entry.Digest, revision, entry.GrantBoot, entry.GrantConnection, entry.Phase, seq, terminal, safeIdleErrorCode(entry.ErrorCode)); err != nil {
 		return err
 	}
 	if seq > 0 {
@@ -591,9 +590,14 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			return err
 		}
 	}
-	// A phase that did not land on the row moves no hold or group status, except
-	// an applied replay that now carries its active proof.
-	if upsert.RowsAffected() == 0 && (entry.Phase != "applied" || !active) {
+	// Holds and group status follow the phase the row now holds: an exact replay
+	// repairs them, a phase that did not land on the row changes neither.
+	var stored string
+	if err := tx.QueryRow(ctx, `SELECT phase FROM host_config_attempts WHERE host_id=$1::uuid AND id=$2::uuid`,
+		hostID, entry.AttemptID).Scan(&stored); err != nil {
+		return err
+	}
+	if stored != entry.Phase {
 		return nil
 	}
 	if entry.Phase == "applied" && active {
