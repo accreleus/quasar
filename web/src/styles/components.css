@@ -207,7 +207,8 @@
      .sec      color: --text-2 (same as .text-2)
      .muted    color: --text-3 (the only --text-3 class)
      .tone-warning  color: --warning-text
-     .tone-info     color: --info-text */
+     .tone-info     color: --info-text
+     .tone-danger   color: --danger-text */
 .row { display: flex; align-items: center; gap: var(--s3); }
 .col { display: flex; flex-direction: column; }
 .between { justify-content: space-between; }
@@ -238,6 +239,7 @@
 .sec { color: var(--text-2); }
 .tone-warning { color: var(--warning-text); }
 .tone-info { color: var(--info-text); }
+.tone-danger { color: var(--danger-text); }
 
 
 /* ---------- CHART / SPARKLINE ---------- */

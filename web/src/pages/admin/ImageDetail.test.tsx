@@ -18,7 +18,7 @@ import type { AdminApp, CatalogImage, Host, RuntimePreset } from "../../api/type
 // ever opens one again, these fixtures stop reaching it.
 let fleetHosts: Host[] = [];
 vi.mock("../../lib/fleet/FleetContext", () => ({
-  useFleetContext: () => ({ hosts: fleetHosts, sessions: [] }),
+  useFleetContext: () => ({ hosts: fleetHosts, sessions: [], loading: false, errors: { hosts: null, sessions: null } }),
 }));
 
 vi.mock("../../api/admin", () => ({
