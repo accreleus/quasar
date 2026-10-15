@@ -74,7 +74,7 @@ func (h *ApplyHandler) handleFleetApply(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req FleetApplyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "the request body is not valid JSON")
 		return
 	}

@@ -204,7 +204,7 @@ func (h *Handler) handlePatchAppPlacement(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var p placementPatch
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	decodeErr := decoder.Decode(&p)
 	var extra any

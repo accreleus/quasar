@@ -282,3 +282,37 @@ func TestClientIPNeverReadsXRealIP(t *testing.T) {
 		t.Fatalf("ClientIP = %q, want the peer (X-Real-IP must be ignored)", got)
 	}
 }
+
+// TestPrefixKey pins #674: an IPv6 peer is keyed on its /64, IPv4 (and its
+// mapped spelling) stays per address.
+func TestPrefixKey(t *testing.T) {
+	proxy := mustCIDRs(t, "172.18.0.0/16")
+	cases := []struct {
+		name    string
+		remote  string
+		xff     string
+		trusted []*net.IPNet
+		want    string
+	}{
+		{"ipv4 per address", "203.0.113.7:1234", "", nil, "203.0.113.7"},
+		{"ipv4 neighbour is its own key", "203.0.113.8:1234", "", nil, "203.0.113.8"},
+		{"ipv6 in one /64 (a)", "[2001:db8:1:2:aaaa::1]:1234", "", nil, "2001:db8:1:2::/64"},
+		{"ipv6 in one /64 (b)", "[2001:db8:1:2:bbbb:cccc:dddd:eeee]:1234", "", nil, "2001:db8:1:2::/64"},
+		{"ipv6 in another /64", "[2001:db8:1:3::1]:1234", "", nil, "2001:db8:1:3::/64"},
+		{"ipv4-mapped stays per address", "[::ffff:203.0.113.7]:1234", "", nil, "203.0.113.7"},
+		{"opaque key verbatim", "pipe", "", nil, "pipe"},
+		{"forwarded ipv6 is prefixed too", "172.18.0.2:1234", "2001:db8:9:9:1::5", proxy, "2001:db8:9:9::/64"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = tc.remote
+			if tc.xff != "" {
+				r.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			if got := PrefixKey(r, tc.trusted); got != tc.want {
+				t.Fatalf("PrefixKey = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

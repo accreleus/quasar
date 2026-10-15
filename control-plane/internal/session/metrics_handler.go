@@ -225,10 +225,11 @@ func (h *Handler) handlePostStats(w http.ResponseWriter, r *http.Request) {
 
 	// Latest sample's client health maps into AS10-06 client_* states and
 	// profile-certification history (network states win; a hidden tab never
-	// fails). Runs in its own goroutine; never affects the 202 or ABR.
+	// fails; a sample with no class clears the run). Runs in its own goroutine;
+	// never affects the 202 or ABR.
 	if n := len(req.Samples); n > 0 {
 		last := req.Samples[n-1]
-		if last.ClientHealth != "" && h.coord != nil {
+		if h.coord != nil {
 			cs := ClientHealthSample{
 				Class:     last.ClientHealth,
 				Reason:    last.ClientHealthReason,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -44,6 +45,10 @@ type Handler struct {
 	// direct peer" (today's behaviour). Set via WithTrustedProxies.
 	trustedProxies []*net.IPNet
 
+	// plaintext bounds the credential-route-plaintext WARN per source (#604).
+	plaintext *ratelimit.FailureLimiter
+	log       *slog.Logger
+
 	// auditor records the admin user-management mutations; nil in tests.
 	auditor audit.Recorder
 }
@@ -52,7 +57,12 @@ type Handler struct {
 func NewHandler(svc *Service, auditors ...audit.Recorder) *Handler {
 	// 10 quick attempts, then ~1 every 5s per IP — generous for humans,
 	// useless for credential stuffing.
-	h := &Handler{svc: svc, limiter: newLoginLimiter(10, 5*time.Second)}
+	h := &Handler{
+		svc:       svc,
+		limiter:   newLoginLimiter(10, 5*time.Second),
+		plaintext: ratelimit.NewFailureLimiter(10, time.Minute, 4096),
+		log:       slog.Default(),
+	}
 	if len(auditors) > 0 {
 		h.auditor = auditors[0]
 	}
@@ -66,6 +76,26 @@ func NewHandler(svc *Service, auditors ...audit.Recorder) *Handler {
 func (h *Handler) WithTrustedProxies(nets []*net.IPNet) *Handler {
 	h.trustedProxies = nets
 	return h
+}
+
+// WithLogger sets the logger for the plain-HTTP credential warning.
+func (h *Handler) WithLogger(log *slog.Logger) *Handler {
+	h.log = log
+	return h
+}
+
+// warnPlaintext logs one bounded WARN when a password-bearing route is served
+// over a transport the #593 rule would refuse. The request is served either way.
+func (h *Handler) warnPlaintext(r *http.Request, route string) {
+	if httpx.SecureTransport(r, h.trustedProxies, false) {
+		return
+	}
+	ip := ratelimit.ClientIP(r, h.trustedProxies)
+	if h.plaintext.Allow(ip) {
+		h.plaintext.Failure(ip)
+		h.log.Warn("credential-route-plaintext", "route", route, "remote_addr", ip,
+			"note", "a later release refuses this over plain HTTP: use the HTTPS port or name the proxy in QUASAR_TRUSTED_PROXIES")
+	}
 }
 
 // WithVersionPolicy configures the native-client version handshake (P9-08):
@@ -130,6 +160,7 @@ func toBrief(u User) userBrief {
 // --- handlers ----------------------------------------------------------------
 
 func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
+	h.warnPlaintext(r, "POST /v1/auth/register")
 	if !h.limiter.allow(ratelimit.ClientIP(r, h.trustedProxies)) {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited,
 			"too many attempts; try again later")
@@ -172,6 +203,7 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
+	h.warnPlaintext(r, "POST /v1/auth/login")
 	if !h.limiter.allow(ratelimit.ClientIP(r, h.trustedProxies)) {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited,
 			"too many attempts; try again later")
@@ -257,6 +289,7 @@ func (h *Handler) handleMe(w http.ResponseWriter, r *http.Request) {
 //   - 401 invalid_credentials when current_password is wrong
 //   - 400 validation_failed when new_password is too short/long
 func (h *Handler) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	h.warnPlaintext(r, "POST /v1/me/password")
 	user, ok := UserFromContext(r.Context())
 	if !ok {
 		httpx.WriteError(w, http.StatusUnauthorized, httpx.CodeUnauthorized, "authentication required")

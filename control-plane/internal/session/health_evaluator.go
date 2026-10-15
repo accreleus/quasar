@@ -143,7 +143,12 @@ func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, 
 // flip and no cert failure.
 func (h *healthEvaluator) EvaluateClientHealth(ctx context.Context, sessionID string, sample ClientHealthSample) {
 	if sample.Class == "" {
-		return // older browser: no client signal
+		// An unmeasured window ends the run like a hidden tab, so a smooth on each
+		// side of it cannot add up to a pass. A client that never sends a class has no run.
+		h.mu.Lock()
+		delete(h.clientRuns, sessionID)
+		h.mu.Unlock()
+		return
 	}
 
 	sess, err := h.store.Get(ctx, sessionID)
