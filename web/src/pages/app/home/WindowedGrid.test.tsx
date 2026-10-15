@@ -1,6 +1,7 @@
 // Windowed library grid: only rows near the viewport mount, spacers keep the
 // scroll height, and the rows an arrow key or the open band needs stay put.
 
+import { useMemo, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, render } from "@testing-library/react";
 import type { App } from "../../../api/types";
@@ -147,9 +148,17 @@ describe("the detail band in a windowed grid", () => {
   const SCROLLED = 20000;
   let band: ReturnType<typeof useDetailBand>;
 
-  function Page() {
-    const list = apps;
-    band = useDetailBand({ token: null, visibleLists: [list], onClearFilter: () => {}, smoothScroll: false });
+  // `startFiltered` hides a201 behind a kind filter that `onClearFilter` lifts.
+  function Page({ startFiltered = false }: { startFiltered?: boolean }) {
+    const [filtered, setFiltered] = useState(startFiltered);
+    const list = useMemo(() => (filtered ? apps.filter((a) => a.id !== "a201") : apps), [filtered]);
+    band = useDetailBand({
+      token: null,
+      visibleLists: [list],
+      onClearFilter: () => setFiltered(false),
+      viewKey: filtered ? "game" : "all",
+      smoothScroll: false,
+    });
     return (
       <div className="home-lib">
         <WindowedGrid
@@ -180,6 +189,15 @@ describe("the detail band in a windowed grid", () => {
     const detail = container.querySelector<HTMLElement>(".detail")!;
     expect(detail.dataset.for).toBe("a201");
     expect(detail.previousElementSibling?.getAttribute("data-id")).toBe("a203");
+  });
+
+  it("opens a filtered-out tile under its own row once the filter is lifted", () => {
+    fakeLayout(SCROLLED);
+    const { container } = render(<Page startFiltered />);
+    act(() => band.reveal(apps[201], false));
+    expect(band.openId).toBe("a201");
+    expect(band.insertAfterId).toBe("a203");
+    expect(container.querySelector<HTMLElement>(".detail")!.previousElementSibling?.getAttribute("data-id")).toBe("a203");
   });
 
   it("opens a mounted tile under its own row", () => {

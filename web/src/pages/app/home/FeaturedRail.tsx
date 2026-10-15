@@ -198,7 +198,7 @@ function FeaturedCard({
               className="cover-img"
               decoding="async"
               onError={() => setArtFailed(true)}
-              {...(priority ? { fetchpriority: "high" } : { loading: "lazy" as const })}
+              {...(priority ? { fetchPriority: "high" as const } : { loading: "lazy" as const })}
             />
           )}
         </span>
