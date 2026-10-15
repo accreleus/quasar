@@ -482,9 +482,11 @@ while IFS= read -r spec; do
     if [ -n "$actual" ]; then hemit PASS "label.$name" "$actual"
     else hemit FAIL "label.$name" "not declared on the image"; fi
   elif [ "${spec#"$name>="}" != "$spec" ]; then
-    # name>=version: a floor, compared as versions.
+    # name>=version: a floor, compared as versions. Both must be bare dotted numbers: sort -V
+    # ranks `dev` or `1.28.6-rc1` above 1.28.6.
     want="${spec#"$name>="}"
-    if [ -n "$actual" ] && [ "$(printf '%s\n%s\n' "$want" "$actual" | sort -V | head -n1)" = "$want" ]; then
+    num='^[0-9]+(\.[0-9]+)*$'
+    if [[ $actual =~ $num && $want =~ $num ]] && [ "$(printf '%s\n%s\n' "$want" "$actual" | sort -V | head -n1)" = "$want" ]; then
       hemit PASS "label.$name" "$actual >= $want"
     else hemit FAIL "label.$name" "image declares '${actual:-<unset>}', contract wants at least '$want'"; fi
   else
