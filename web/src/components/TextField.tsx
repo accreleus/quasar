@@ -101,8 +101,9 @@ interface SwitchProps {
   label?: string;
   id?: string;
   disabled?: boolean;
-  /** Accessible name for a switch with no visible `label` (a trailing,
-   *  bare toggle). Ignored when `label` is set — that already names it. */
+  /** Accessible name for a bare toggle, or a more specific one for a labelled
+   *  switch. It replaces the visible `label` as the accessible name, so when
+   *  `label` is set it must start with that text (WCAG 2.5.3 label-in-name). */
   "aria-label"?: string;
 }
 
@@ -117,7 +118,7 @@ export function Switch({ checked, onChange, label, id, disabled, "aria-label": a
           checked={checked}
           onChange={(e) => onChange(e.target.checked)}
           disabled={disabled}
-          aria-label={label ? undefined : ariaLabel}
+          aria-label={ariaLabel}
         />
         <span className="track" />
         <span className="thumb" />

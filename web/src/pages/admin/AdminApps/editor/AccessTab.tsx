@@ -157,6 +157,7 @@ export function AccessTab({
                     <Button
                       variant="ghost"
                       size="sm"
+                      aria-label={`Revoke ${g.subject_username ?? "deleted user"}`}
                       disabled={busy}
                       onClick={() => setRevokeTarget(g)}
                     >
