@@ -146,7 +146,13 @@ export function DeviceCard({ device, busy, onRename, onSetTrusted, onRevoke }: D
           {caps?.measured_at ? `Measured ${fmtDate(caps.measured_at)}` : "Not yet measured"}
         </span>
         <span className="hint ml-auto">Last seen {relativeTime(device.last_seen_at)}</span>
-        <Button variant="ghost" size="sm" disabled={busy} onClick={() => onRevoke(device)}>
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={busy}
+          aria-label={`Revoke ${deviceLabel(device)}`}
+          onClick={() => onRevoke(device)}
+        >
           Revoke
         </Button>
       </div>
