@@ -2,10 +2,9 @@
 # VENDORED FILE — DO NOT EDIT HERE.
 #
 # Source: quasar-bench client/qbench (the qbench agent CLI)
-# Commit: d55c43808dbde9eb9140a01580b16eb848ee960f (2026-09-22)  qbench 1.7.0
-# Fetched: 2026-09-22, as qbench_cli.py inside the qbench 1.7.0 zipapp your bench
-#          server publishes (GET $BENCH_URL/cli/qbench); byte-identical to the
-#          file at the commit above (git blob 7c3b8c1f33a7).
+# Commit: d488f493b974fd94f729796e7a45697d201ca394 (2026-10-11)  qbench 1.10.0
+# Fetched: 2026-10-15, from a quasar-bench checkout at the commit above
+#          (git blob 6bb7a59038c9a1b688eb494d42491cbb4bdc438e).
 #
 # It imports bench.py from this directory, so the two are vendored as a pair and
 # must carry the same commit. Run it as `python3 scripts/dx/vendor/qbench …`.
@@ -349,18 +348,23 @@ def compare_url(ctx: Ctx, repo: str, base: str, head: str) -> str:
     return f"{ctx.url}/commits/compare?{q}"
 
 
+def scenario_label(s: dict) -> str:
+    """suite/scenario, plus @host when the server named one."""
+    return f"{s.get('suite')}/{s.get('scenario')}" + (f" @{s['host']}" if s.get("host") else "")
+
+
 def print_commit_compare(res: dict) -> None:
     print((res.get("verdict") or {}).get("text") or "(no verdict text)")
     for s in res.get("scenarios") or []:
         if s.get("verdict") != "unchanged":
-            print(f"  {s.get('verdict'):<10} {s.get('suite')}/{s.get('scenario')}: {s.get('text', '')}")
+            print(f"  {s.get('verdict'):<10} {scenario_label(s)}: {s.get('text', '')}")
     for label, key in (("only at base", "only_base"), ("only at head", "only_head")):
         items = res.get(key) or []
         if items:
-            print(f"  {label}: " + ", ".join(f"{i.get('suite')}/{i.get('scenario')}" for i in items))
+            print(f"  {label}: " + ", ".join(scenario_label(i) for i in items))
     for x in res.get("excluded_invalid") or []:
         print(f"  excluded ({x.get('which')}): run {short(x.get('run_id'))} "
-              f"{x.get('suite')}/{x.get('scenario')} is {x.get('validity')}")
+              f"{scenario_label(x)} is {x.get('validity')}")
 
 
 def cmd_check(ctx: Ctx, args) -> int:
@@ -436,11 +440,11 @@ def cmd_check(ctx: Ctx, args) -> int:
 
 def run_row(r: dict) -> list[str]:
     return [short(r.get("id")), ts(r.get("started_at")), f"{r.get('suite')}/{r.get('scenario')}",
-            r.get("status") or "", r.get("verdict") or "-", r.get("validity") or "valid",
-            short(r.get("commit")) or "-"]
+            r.get("host") or "-", r.get("status") or "", r.get("verdict") or "-",
+            r.get("validity") or "valid", short(r.get("commit")) or "-"]
 
 
-RUN_HEADER = ["id", "started", "suite/scenario", "status", "verdict", "validity", "commit"]
+RUN_HEADER = ["id", "started", "suite/scenario", "host", "status", "verdict", "validity", "commit"]
 
 
 def cmd_runs(ctx: Ctx, args) -> int:
@@ -539,7 +543,7 @@ def cmd_commits(ctx: Ctx, args) -> int:
 def cmd_regressions(ctx: Ctx, args) -> int:
     b = ctx.bench()
     res = b.regressions(args.suite, args.scenario, args.metric, args.agg, args.window,
-                        args.baseline, args.pct)
+                        args.baseline, args.pct, args.host)
 
     def human(d):
         print(f"{d.get('metric')} ({d.get('better')}, {d.get('agg')}, window={d.get('window') or 'run'}) "
@@ -559,12 +563,17 @@ def cmd_baseline(ctx: Ctx, args) -> int:
     b = ctx.bench()
     if args.cmd == "pin":
         thresholds = {k: float(v) for k, v in kv_pairs(args.threshold, "--threshold").items()}
-        b.set_baseline(args.suite, args.scenario, args.run, args.name, thresholds or None)
+        pinned = b.set_baseline(args.suite, args.scenario, args.run, args.name, thresholds or None)
         res = {"suite": args.suite, "scenario": args.scenario, "name": args.name, "run_id": args.run}
-        out(args, res, lambda d: print(f"pinned {d['run_id']} as the '{d['name']}' baseline for "
-                                       f"{d['suite']}/{d['scenario']}"))
+        if isinstance(pinned, dict) and "host" in pinned:  # an older server does not say
+            res["host"] = pinned["host"]
+
+        def human(d):
+            where = (f" on host {d['host']}" if d["host"] else " (the run recorded no host)") if "host" in d else ""
+            print(f"pinned {d['run_id']} as the '{d['name']}' baseline for {d['suite']}/{d['scenario']}{where}")
+        out(args, res, human)
     else:
-        res = b.baseline(args.suite, args.scenario, args.name)
+        res = b.baseline(args.suite, args.scenario, args.name, args.host)
         out(args, res, lambda d: print(d.get("run_id")))
     return EXIT_OK
 
@@ -724,6 +733,11 @@ def print_report(rep: dict, base_url: str, t: Target) -> None:
         if d.get("regressed") or d.get("improved"):
             word = "regressed" if d.get("regressed") else "improved"
             print(f"run delta: {d.get('metric')} {word} {d.get('delta_pct', 0):+.1f}%")
+    flagged = [m for m in (rep.get("sections") or {}).get("metrics") or [] if m.get("host_mismatch")]
+    for m in flagged:
+        print(f"metric {m.get('label')}: the two runs are from different machines")
+    if rep.get("host_mismatch_note"):  # sent by the server once, for the run pair or any metric row
+        print(f"note: {rep['host_mismatch_note']}")
     arts = [a for a in rep.get("artifacts") or [] if not a.get("deleted_at")]
     if arts:
         print("evidence: " + ", ".join(f"{a.get('name')} ({a.get('role')})" for a in arts))
@@ -940,7 +954,7 @@ def build_parser() -> argparse.ArgumentParser:
         rl.add_argument(f"--{f}", default="")
     rl.add_argument("--validity", default="", choices=["", "valid", "contaminated", "withdrawn"])
     rl.add_argument("--tag", action="append", default=[], metavar="K=V")
-    rl.add_argument("--latest", action="store_true", help="newest valid run per suite/scenario")
+    rl.add_argument("--latest", action="store_true", help="newest valid run per suite/scenario/host")
     rl.add_argument("--limit", default="20")
     add(rsub, "show", "one run: tags, phases, mismatches, artifacts").add_argument("run")
     add(rsub, "summary", "one run judged against its pinned baseline").add_argument("run")
@@ -972,6 +986,8 @@ def build_parser() -> argparse.ArgumentParser:
     rg.add_argument("--agg", default="p50")
     rg.add_argument("--window", default="")
     rg.add_argument("--baseline", default="")
+    rg.add_argument("--host", default=None,
+                    help="whose pinned baseline to use (needed when several hosts have one; '' = runs with no host)")
     rg.add_argument("--pct", type=float, default=None)
 
     bl = top.add_parser("baseline", help="pin or read a scenario's last-known-good run")
@@ -984,6 +1000,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--scenario", required=True)
         sp.add_argument("--name", default="default")
     bp.add_argument("--threshold", action="append", default=[], metavar="METRIC=PCT")
+    bs.add_argument("--host", default=None,
+                    help="read this host's pin (needed when several hosts have one; '' = runs with no host)")
 
     # harness
     run = top.add_parser("run", help="post a harness run: new, samples, event, mark, capture, finish, validity")
@@ -1170,13 +1188,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {e}", file=sys.stderr)
         return EXIT_AUTH
     except BenchError as e:
+        hosts = getattr(e, "hosts", None)
         if as_json:
-            print(json.dumps({"error": {"status": getattr(e, "status", 0),
-                                        "message": getattr(e, "server_message", "") or str(e),
-                                        "method": getattr(e, "method", ""),
-                                        "path": getattr(e, "path", "")}}))
+            err = {"status": getattr(e, "status", 0),
+                   "message": getattr(e, "server_message", "") or str(e),
+                   "method": getattr(e, "method", ""),
+                   "path": getattr(e, "path", "")}
+            if hosts is not None:
+                err["hosts"] = hosts
+            print(json.dumps({"error": err}))
         else:
             print(f"error: {e}", file=sys.stderr)
+            if hosts is not None:
+                print("hosts with a pinned baseline: " + ", ".join(hosts or ["(none named)"]) +
+                      "  (pass --host)", file=sys.stderr)
             if getattr(e, "status", 0) == 403:
                 print("hint: a read-only key cannot write; qbench doctor shows the key's permissions",
                       file=sys.stderr)
