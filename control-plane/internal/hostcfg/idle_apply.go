@@ -22,6 +22,10 @@ var ErrIdleAttemptConflict = errors.New("another disruptive host attempt is open
 var ErrIdleAttemptNotFound = errors.New("idle apply attempt not found")
 var ErrIdleCancelTooLate = errors.New("idle apply already accepted")
 
+// releasedStatusSQL is the status of a draining host whose last restriction
+// left: online only while no disconnect is recorded (#656).
+const releasedStatusSQL = `CASE WHEN ` + admission.HostIsLiveSQL + ` THEN 'online' ELSE 'offline' END`
+
 // IdleApplyAttempt is the public projection of one owned waiting restriction.
 // No field here claims that the setting has applied.
 type IdleApplyAttempt struct {

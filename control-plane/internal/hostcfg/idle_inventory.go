@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 )
 
 // ErrIdleInventoryStale refuses a heartbeat from a socket that no longer owns
@@ -295,8 +297,8 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var boot, status string
-	var deliveryGate bool
-	if err := tx.QueryRow(ctx, `SELECT status,config_policy_gate_connection IS NOT NULL FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status, &deliveryGate); err != nil {
+	var deliveryGate, live bool
+	if err := tx.QueryRow(ctx, `SELECT status,config_policy_gate_connection IS NOT NULL,`+admission.HostIsLiveSQL+` FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status, &deliveryGate, &live); err != nil {
 		return err
 	}
 	if !deliveryGate {
@@ -453,7 +455,10 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 	if held && status == "online" {
 		status = "draining"
 	} else if !held && status == "draining" {
-		status = "online"
+		status = "offline"
+		if live {
+			status = "online"
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE hosts SET status=$2 WHERE id=$1::uuid`, hostID, status); err != nil {
 		return err
@@ -564,6 +569,13 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			return err
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM host_reconcile_obligations WHERE host_id=$1::uuid AND kind='idle_apply' AND resource_key=$2`, hostID, entry.AttemptID); err != nil {
+			return err
+		}
+		// A restored ledger can omit both an unfinished attempt and its
+		// restriction (agent-api.md); the rebuilt attempt holds admission again.
+		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+			SELECT host_id,'idle_apply',id,'idle_configuration' FROM host_config_attempts
+			WHERE host_id=$1::uuid AND id=$2::uuid AND terminal_at IS NULL ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
 	} else if entry.Phase == "failed" {

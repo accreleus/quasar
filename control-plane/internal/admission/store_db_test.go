@@ -2,6 +2,7 @@ package admission
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"os"
 	"testing"
@@ -173,5 +174,45 @@ func TestRestrictionSchemaBoundsReasonAndReconciliationOwner(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// A disconnect recorded after the caller's connection read wins: releasing the
+// last hold projects offline, and an uncordon with nothing to lift keeps its
+// 409 (control-api.md uncordon semantic amendment) (#656).
+func TestReleaseProjectsARecordedDisconnectOffline(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	var hostID string
+	if err := pool.QueryRow(ctx, `INSERT INTO hosts (node_name,status,agent_disconnected_at)
+		VALUES ('rh05-release-disconnected','draining',now()) RETURNING id::text`).Scan(&hostID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM hosts WHERE id=$1::uuid`, hostID) })
+	// What markOffline leaves while a hold is held.
+	draining := func() {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id=$1::uuid`, hostID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	holds := NewStore(pool)
+	platform := Owner{Kind: Platform, ID: "00000000-0000-4000-8000-000000000656"}
+	if _, err := holds.Acquire(ctx, hostID, platform, ReasonPlatformApply); err != nil {
+		t.Fatal(err)
+	}
+	if status, err := holds.Release(ctx, hostID, platform, true); err != nil || status != "offline" {
+		t.Fatalf("platform release = %q (%v), want offline", status, err)
+	}
+	draining()
+	if _, err := holds.Acquire(ctx, hostID, ManualOwner, ReasonManualDrain); err != nil {
+		t.Fatal(err)
+	}
+	if status, err := holds.ReleaseManual(ctx, hostID, true); err != nil || status != "offline" {
+		t.Fatalf("uncordon = %q (%v), want offline", status, err)
+	}
+	draining()
+	if _, err := holds.ReleaseManual(ctx, hostID, true); !errors.Is(err, ErrHostOffline) {
+		t.Fatalf("uncordon with no hold: %v, want ErrHostOffline", err)
 	}
 }

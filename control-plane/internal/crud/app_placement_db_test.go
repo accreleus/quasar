@@ -178,6 +178,13 @@ func TestAppPlacementReadinessRequiresFreshEvidence(t *testing.T) {
 	if got := read(); got != true {
 		t.Fatalf("fresh ready = %v, want true", got)
 	}
+	// Placement refuses a recorded disconnect whatever the status says (#656).
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET agent_disconnected_at=now() WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got != false {
+		t.Fatalf("disconnected ready = %v, want false", got)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET readiness_reported_at=now()-interval '10 minutes' WHERE id=$1::uuid`, hostID); err != nil {
 		t.Fatal(err)
 	}
