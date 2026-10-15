@@ -24,6 +24,10 @@ export interface UseDetailBandOptions {
   /** Clears the kind filter so a rail card for a filtered-out app can still be
    *  revealed. */
   onClearFilter: () => void;
+  /** Identifies the filter, search and view the grids were built from. The
+   *  band closes when this changes after it opened, not when it changes in the
+   *  same commit that opens it (a rail card clears the filter and opens). */
+  viewKey?: string;
   /** Whether to animate the scroll that brings the band into view. */
   smoothScroll: boolean;
 }
@@ -32,6 +36,7 @@ export function useDetailBand({
   token,
   visibleLists,
   onClearFilter,
+  viewKey = "",
   smoothScroll,
 }: UseDetailBandOptions) {
   const [openId, setOpenId] = useState<string | null>(null);
@@ -44,6 +49,9 @@ export function useDetailBand({
   const detailRef = useRef<HTMLDivElement>(null);
   const optionsToggleRef = useRef<HTMLButtonElement>(null);
   const profilesForRef = useRef<string | null>(null);
+  const viewKeyRef = useRef(viewKey);
+  viewKeyRef.current = viewKey;
+  const openedUnderRef = useRef(viewKey);
 
   const fetchProfiles = useCallback(
     async (app: App): Promise<ProfilesResponse | null> => {
@@ -80,12 +88,16 @@ export function useDetailBand({
     profilesForRef.current = null;
   }, [openId]);
 
-  /** Drops the band without moving focus — for a filter or view change, where
-   *  the anchor row may no longer exist and nothing was dismissed by hand. */
-  const reset = useCallback(() => {
+  // A filter or view change drops the band without moving focus: its anchor
+  // row may no longer exist and nothing was dismissed by hand. Declared before
+  // the reveal effect below so a band that effect opens in the same commit
+  // wins.
+  useEffect(() => {
+    if (openedUnderRef.current === viewKey) return;
+    openedUnderRef.current = viewKey;
     setOpenId(null);
     setInsertAfterId(null);
-  }, []);
+  }, [viewKey]);
 
   /** The last tile in `id`'s row, by measured `offsetTop` (libraryGrid.lastIndexInRow:
    *  column-count agnostic), or null while `id` has no box: a tile the windowed
@@ -111,6 +123,7 @@ export function useDetailBand({
         close();
         return;
       }
+      openedUnderRef.current = viewKeyRef.current;
       setOpenId(app.id);
       setInsertAfterId(rowEndOf(list, app.id));
       setOptionsOpen(false);
@@ -226,7 +239,6 @@ export function useDetailBand({
       fetchProfiles,
       open,
       close,
-      reset,
       reveal,
     }),
     [
@@ -239,7 +251,6 @@ export function useDetailBand({
       fetchProfiles,
       open,
       close,
-      reset,
       reveal,
     ],
   );

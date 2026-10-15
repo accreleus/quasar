@@ -181,6 +181,7 @@ export function AppHomeNext() {
     token,
     visibleLists,
     onClearFilter: () => setKindFilter("all"),
+    viewKey: `${view}|${kindFilter}|${search}`,
     smoothScroll: !prefersReducedMotion(),
   });
   const launch = useLaunch({
@@ -192,13 +193,6 @@ export function AppHomeNext() {
     revealDetail: detail.reveal,
   });
   const busy = launch.launching || launch.resolvingId !== null;
-
-  // Filtering or switching view closes any open band — its anchor row may no
-  // longer exist.
-  const resetBand = detail.reset;
-  useEffect(() => {
-    resetBand();
-  }, [kindFilter, search, view, resetBand]);
 
   // ── Featured rail ─────────────────────────────────────────────────────────
   // `highlights` arrives ranked and labelled; this is a join + copy layer
