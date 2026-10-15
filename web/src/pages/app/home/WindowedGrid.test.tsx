@@ -2,8 +2,10 @@
 // scroll height, and the rows an arrow key or the open band needs stay put.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { act, render } from "@testing-library/react";
 import type { App } from "../../../api/types";
+import { moveRovingFocus } from "./rovingFocus";
+import { useDetailBand } from "./useDetailBand";
 import { WindowedGrid, rowsAround } from "./WindowedGrid";
 
 const COLS = 4;
@@ -13,20 +15,30 @@ const PITCH = TILE_H + GAP;
 
 const apps = Array.from({ length: 400 }, (_, i) => ({ id: `a${i}`, name: `App ${i}` }) as unknown as App);
 
-function fakeLayout() {
+const rowOf = (el: HTMLElement) => Math.floor(Number(el.closest<HTMLElement>("[data-id]")!.dataset.id!.slice(1)) / COLS);
+
+/** `scrolled`: how far the page is scrolled, so the grid's top is above the viewport. */
+function fakeLayout(scrolled = 0) {
   vi.spyOn(window, "getComputedStyle").mockReturnValue({
     rowGap: `${GAP}px`,
     gridTemplateColumns: Array(COLS).fill("200px").join(" "),
   } as unknown as CSSStyleDeclaration);
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
-    const h = this.classList.contains("lib-tile") ? TILE_H : 0;
-    return { top: 0, bottom: h, height: h, left: 0, right: 0, width: 0, x: 0, y: 0, toJSON() {} };
+    const isTile = this.classList.contains("lib-tile");
+    const h = isTile ? TILE_H : 0;
+    const top = isTile || this.classList.contains("lib-tile-surface") ? rowOf(this) * PITCH - scrolled : -scrolled;
+    return { top, bottom: top + h, height: h, left: 0, right: 0, width: 0, x: 0, y: top, toJSON() {} };
+  });
+  vi.spyOn(HTMLElement.prototype, "offsetTop", "get").mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains("lib-tile") ? rowOf(this) * PITCH : 0;
   });
 }
 
 const tile = (a: App) => (
   <div key={a.id} className="lib-tile" data-id={a.id}>
-    {a.id}
+    <button className="lib-tile-surface" data-app-id={a.id}>
+      {a.id}
+    </button>
   </div>
 );
 const renderedIds = (c: HTMLElement) =>
@@ -84,5 +96,98 @@ describe("WindowedGrid", () => {
     expect(ids).toContain("a300");
     expect(ids).toContain("a303");
     expect(ids).toContain("a0");
+  });
+});
+
+describe("WindowedGrid scrolled into a long library", () => {
+  const SCROLLED = 20000;
+  const mountedRows = (c: HTMLElement) => [...new Set(renderedIds(c).map((id) => Math.floor(Number(id!.slice(1)) / COLS)))];
+
+  it("keeps the first row and the viewport window, with nothing between", () => {
+    fakeLayout(SCROLLED);
+    const { container } = render(
+      <div className="home-lib">
+        <WindowedGrid list={apps} tile={tile} pinIds={[]} />
+      </div>,
+    );
+    const rows = mountedRows(container);
+    expect(rows[0]).toBe(0);
+    expect(rows[1]).toBeGreaterThan(40);
+    expect(renderedIds(container)).not.toContain("a4");
+  });
+
+  it("ArrowUp from the top of the window lands on the row above, not the first row", () => {
+    fakeLayout(SCROLLED);
+    const { container } = render(
+      <div className="home-lib">
+        <WindowedGrid list={apps} tile={tile} pinIds={[]} />
+      </div>,
+    );
+    const top = mountedRows(container)[1];
+    const from = container.querySelector<HTMLElement>(`[data-app-id="a${top * COLS + 1}"]`)!;
+    act(() => from.focus());
+    expect(moveRovingFocus("up", { railTrack: null, grids: container, smooth: false })).toBe(true);
+    expect(document.activeElement?.getAttribute("data-app-id")).toBe(`a${(top - 1) * COLS + 1}`);
+  });
+
+  it("ArrowDown from the first row lands on the second", () => {
+    fakeLayout(SCROLLED);
+    const { container } = render(
+      <div className="home-lib">
+        <WindowedGrid list={apps} tile={tile} pinIds={[]} />
+      </div>,
+    );
+    act(() => container.querySelector<HTMLElement>('[data-app-id="a1"]')!.focus());
+    expect(moveRovingFocus("down", { railTrack: null, grids: container, smooth: false })).toBe(true);
+    expect(document.activeElement?.getAttribute("data-app-id")).toBe(`a${COLS + 1}`);
+  });
+});
+
+describe("the detail band in a windowed grid", () => {
+  const SCROLLED = 20000;
+  let band: ReturnType<typeof useDetailBand>;
+
+  function Page() {
+    const list = apps;
+    band = useDetailBand({ token: null, visibleLists: [list], onClearFilter: () => {}, smoothScroll: false });
+    return (
+      <div className="home-lib">
+        <WindowedGrid
+          list={list}
+          pinIds={[band.openId, band.insertAfterId]}
+          tile={(a) => (
+            <>
+              <div key={a.id} className="lib-tile" data-id={a.id}>
+                <button className="lib-tile-surface" data-app-id={a.id} ref={band.setTileRef(a.id)}>
+                  {a.id}
+                </button>
+              </div>
+              {band.insertAfterId === a.id && <div key={`d-${a.id}`} className="detail" data-for={band.openId} />}
+            </>
+          )}
+        />
+      </div>
+    );
+  }
+
+  it("opens a tile that is not mounted under its own row", () => {
+    fakeLayout(SCROLLED);
+    const { container } = render(<Page />);
+    expect(renderedIds(container)).not.toContain("a201");
+    act(() => band.open(apps[201], apps));
+    // Row 50 is a200-a203; the old shared -1 offset anchored after the last title in the library.
+    expect(band.insertAfterId).toBe("a203");
+    const detail = container.querySelector<HTMLElement>(".detail")!;
+    expect(detail.dataset.for).toBe("a201");
+    expect(detail.previousElementSibling?.getAttribute("data-id")).toBe("a203");
+  });
+
+  it("opens a mounted tile under its own row", () => {
+    fakeLayout(SCROLLED);
+    const { container } = render(<Page />);
+    const id = renderedIds(container)[5]!;
+    const row = Math.floor(Number(id.slice(1)) / COLS);
+    act(() => band.open(apps[Number(id.slice(1))], apps));
+    expect(band.insertAfterId).toBe(`a${row * COLS + COLS - 1}`);
   });
 });

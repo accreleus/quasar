@@ -15,6 +15,7 @@
 // Known loss: the browser's find-in-page only sees rendered tiles.
 
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import type { ReactNode } from "react";
 import type { App } from "../../../api/types";
 
@@ -79,7 +80,8 @@ export function WindowedGrid({
   const [unmeasured, setUnmeasured] = useState(false);
   const plain = list.length <= PLAIN_UNDER;
 
-  const update = useCallback(() => {
+  // `sync`: commit before the next paint (a scroll jump must not show spacers).
+  const update = useCallback((sync = false) => {
     const g = ref.current;
     if (!g) return;
     // A grid scrolled far off renders only spacers: reuse its last measurement.
@@ -120,7 +122,8 @@ export function WindowedGrid({
       fEnd = clamp(Math.ceil((fr.bottom - top + 2 * m.pitch) / m.pitch));
     }
     const firstGrid = g.closest(".home-lib")?.querySelector(".lib-grid") === g;
-    setWin((prev) => {
+    const apply = (f: (prev: Win | null) => Win | null) => (sync ? flushSync(() => setWin(f)) : setWin(f));
+    apply((prev) => {
       // Hysteresis: keep the rendered rows while they still cover ±1 screen and
       // lie within ±3, then re-cut at ±2, so a scroll re-renders about once a screen.
       const [ns, ne] = rowsAround(m, top, rows, 1, slack, vh);
@@ -148,7 +151,8 @@ export function WindowedGrid({
     const queue = () => {
       if (!raf) raf = requestAnimationFrame(() => ((raf = 0), update()));
     };
-    window.addEventListener("scroll", queue, { passive: true });
+    const onScroll = () => update(true);
+    window.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("resize", queue);
     const ro = typeof ResizeObserver === "function" ? new ResizeObserver(queue) : null;
     if (ref.current) ro?.observe(ref.current);
@@ -156,7 +160,7 @@ export function WindowedGrid({
     return () => {
       grids.delete(update);
       cancelAnimationFrame(raf);
-      window.removeEventListener("scroll", queue);
+      window.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", queue);
       ro?.disconnect();
     };

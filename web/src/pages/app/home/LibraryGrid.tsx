@@ -33,7 +33,7 @@ export interface LibraryGridProps {
   groups: readonly SourceGroup<App>[] | null;
   /** Home view: the one flat grid. */
   apps: readonly App[];
-  renderGrid: (list: App[], key: string) => ReactNode;
+  renderGrid: (list: readonly App[], key: string) => ReactNode;
   /** The box the page's roving-focus model queries tiles out of. */
   gridsRef: RefObject<HTMLDivElement | null>;
   /** Loading / error / empty panels, rendered above the grids. */
@@ -99,7 +99,7 @@ export function LibraryGrid({
                 {renderGrid(group.apps, group.id)}
               </section>
             ))
-          : apps.length > 0 && renderGrid([...apps], "all")}
+          : apps.length > 0 && renderGrid(apps, "all")}
       </div>
     </section>
   );

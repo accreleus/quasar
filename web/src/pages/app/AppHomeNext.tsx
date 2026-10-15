@@ -378,7 +378,7 @@ export function AppHomeNext() {
   );
 
   const renderGrid = useCallback(
-    (list: App[], key: string) => (
+    (list: readonly App[], key: string) => (
       <WindowedGrid
         key={key}
         list={list}
