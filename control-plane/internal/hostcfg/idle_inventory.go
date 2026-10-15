@@ -578,13 +578,6 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 		if _, err := tx.Exec(ctx, `DELETE FROM host_reconcile_obligations WHERE host_id=$1::uuid AND kind='idle_apply' AND resource_key=$2`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
-		// A restored ledger can omit both an unfinished attempt and its
-		// restriction (agent-api.md); the rebuilt attempt holds admission again.
-		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
-			SELECT host_id,'idle_apply',id,'idle_configuration' FROM host_config_attempts
-			WHERE host_id=$1::uuid AND id=$2::uuid AND terminal_at IS NULL ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
-			return err
-		}
 	} else if entry.Phase == "failed" {
 		// A complete authenticated inventory can prove this offered grant never
 		// started even if its live rejection report was lost before reconnect.
@@ -645,6 +638,13 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 	} else if terminal && (entry.Phase != "applied" || active) {
 		// An applied entry releases its hold only with the matching verified active snapshot.
 		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
+			return err
+		}
+	} else if !terminal {
+		// A restored ledger can omit both an unfinished attempt and its
+		// restriction (agent-api.md); the rebuilt attempt holds admission again.
+		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+			VALUES($1::uuid,'idle_apply',$2::uuid,'idle_configuration') ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
 	}
