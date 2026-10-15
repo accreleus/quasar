@@ -1301,6 +1301,7 @@ table.qtable {
 }
 
 /* A toned sub-line keeps its tone: `.qtable .sub` out-ranks the bare `.tone-*`. */
+.qtable .sub.tone-danger { color: var(--danger-text); }
 .qtable .sub.tone-warning { color: var(--warning-text); }
 .qtable .sub.tone-info { color: var(--info-text); }
 
