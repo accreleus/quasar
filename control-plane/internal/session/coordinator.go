@@ -448,18 +448,6 @@ const (
 	maxAuditReason      = 200
 )
 
-// truncateBytes cuts s to at most n BYTES (the CHECK counts bytes), stepping
-// back off a partial UTF-8 sequence so the result is still valid JSON text.
-func truncateBytes(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && s[n]&0xC0 == 0x80 {
-		n--
-	}
-	return s[:n]
-}
-
 // recordSessionFailed writes the one audit row with NO acting admin — a failure
 // is the instance's own event, which is what actor_user_id's nullability is for.
 //
@@ -480,13 +468,13 @@ func (c *Coordinator) recordSessionFailed(ctx context.Context, sess Session, sou
 		details["host_id"] = *sess.HostID
 	}
 	if sess.StateDetail != nil {
-		details["state_detail"] = truncateBytes(*sess.StateDetail, maxAuditStateDetail)
+		details["state_detail"] = audit.TruncateBytes(*sess.StateDetail, maxAuditStateDetail)
 	}
 	if failureCode != nil {
-		details["failure_code"] = truncateBytes(*failureCode, maxAuditStateDetail)
+		details["failure_code"] = audit.TruncateBytes(*failureCode, maxAuditStateDetail)
 	}
 	if reason != "" {
-		details["reason"] = truncateBytes(reason, maxAuditReason)
+		details["reason"] = audit.TruncateBytes(reason, maxAuditReason)
 	}
 	audit.TryRecord(ctx, c.auditor, "", "session.failed", "session", sess.ID, details)
 }

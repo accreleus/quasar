@@ -1,9 +1,13 @@
 package artwork
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,12 +30,15 @@ var onePixelPNG = []byte{
 	0x00, 0x00, 'I', 'E', 'N', 'D', 0xae, 0x42, 0x60, 0x82,
 }
 
-// onePixelJPEG is a real minimal JPEG (SOI + APP0/JFIF + EOI is enough for the
-// sniffer, which keys on the FFD8FF prefix).
-var onePixelJPEG = append([]byte{
-	0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00,
-	0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
-}, 0xff, 0xd9)
+// onePixelJPEG is a real 1x1 JPEG: the pixel check reads the frame header, so
+// a bare SOI/APP0/EOI that the sniffer accepts is no longer enough.
+var onePixelJPEG = func() []byte {
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, image.NewGray(image.Rect(0, 0, 1, 1)), nil); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}()
 
 func sha(data []byte) string {
 	sum := sha256.Sum256(data)
@@ -246,5 +253,60 @@ func TestCopyLimited(t *testing.T) {
 func TestNewBlobStoreRejectsEmptyRoot(t *testing.T) {
 	if _, err := NewBlobStore("  "); err == nil {
 		t.Fatal("want an error for an empty root")
+	}
+}
+
+// --- #623: decoded-size limit -----------------------------------------------
+
+// A few KB of zeros compress to almost nothing, so this passes the byte cap
+// while declaring 25 MP — the shape of a decompression bomb.
+func TestPutRejectsImagesOverThePixelLimit(t *testing.T) {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewGray(image.Rect(0, 0, 5000, 5000))); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() > int(DefaultMaxImageBytes) {
+		t.Fatalf("fixture is %d bytes; it must fit the byte cap to prove the pixel cap", buf.Len())
+	}
+	b, _ := NewBlobStore(t.TempDir())
+	if _, err := b.Put("image/png", buf.Bytes()); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("want ErrInvalidRequest for a 25 MP PNG, got %v", err)
+	}
+}
+
+func TestPutRejectsAnUnreadableHeader(t *testing.T) {
+	b, _ := NewBlobStore(t.TempDir())
+	// Right magic, no header behind it.
+	if _, err := b.Put("image/png", onePixelPNG[:12]); !errors.Is(err, ErrUnsupportedType) {
+		t.Fatalf("want ErrUnsupportedType for a truncated PNG, got %v", err)
+	}
+}
+
+func TestWebPSize(t *testing.T) {
+	head := func(chunk string, body []byte) []byte {
+		d := append([]byte("RIFF\x00\x00\x00\x00WEBP"+chunk+"\x00\x00\x00\x00"), body...)
+		return append(d, make([]byte, 30)...)
+	}
+	vp8x := head("VP8X", append([]byte{0, 0, 0, 0}, 0x0f, 0x27, 0, 0xe7, 0x03, 0)) // 10000 x 1000
+	vp8l := head("VP8L", []byte{0x2f, 0x63, 0x00, 0x00, 0x00})                     // 100 x 1: 14-bit size-1 fields
+	vp8 := head("VP8 ", []byte{0, 0, 0, 0x9d, 0x01, 0x2a, 0x58, 0x02, 0x20, 0x03}) // 600 x 800
+	for name, c := range map[string]struct {
+		in   []byte
+		w, h int
+	}{
+		"vp8x":      {vp8x, 10000, 1000},
+		"vp8l":      {vp8l, 100, 1},
+		"vp8":       {vp8, 600, 800},
+		"short":     {[]byte("RIFF\x00\x00\x00\x00WEBPVP8X"), 0, 0},
+		"bad start": {head("VP8 ", []byte{0, 0, 0, 1, 2, 3, 0, 0, 0, 0}), 0, 0},
+	} {
+		if w, h := webpSize(c.in); w != c.w || h != c.h {
+			t.Errorf("%s: webpSize = %dx%d, want %dx%d", name, w, h, c.w, c.h)
+		}
+	}
+	b, _ := NewBlobStore(t.TempDir())
+	huge := head("VP8X", append([]byte{0, 0, 0, 0}, 0xff, 0xff, 0, 0xff, 0xff, 0)) // 65536 x 65536
+	if _, err := b.Put("image/webp", huge); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("want ErrInvalidRequest for a 4 GP WebP, got %v", err)
 	}
 }

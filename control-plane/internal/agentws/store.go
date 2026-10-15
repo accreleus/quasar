@@ -39,7 +39,7 @@ type agentStore struct {
 	// PROCESS. A func rather than the Registry itself, so the store stays testable
 	// without one. It is only half the liveness answer: another replica's connection is
 	// invisible here, which is why enrollHost also reads the host row's own status (see
-	// hostIsLiveSQL). Nil is treated as "no local connections".
+	// admission.HostIsLiveSQL). Nil is treated as "no local connections".
 	isAgentConnected func(hostID string) bool
 	// redeemEnrollment consumes a minted token inside the caller's transaction. Injected
 	// so agentws does not import hostenroll (and so tests can supply a stub). Nil means
@@ -76,6 +76,8 @@ type registerResult struct {
 	// rather than a WS blip (#429; see agentRestartMinGap). Always false from
 	// enrollHost — enrollment is an identity event, not a counted restart.
 	AgentRestarted bool
+	// The last_registered_at this registration wrote: its connection's markOffline key.
+	RegisteredAt time.Time
 }
 
 // Minimum offline gap for a reconnect to classify as a genuine agent-process
@@ -142,7 +144,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	var existingID string
 	var dbLive bool
 	err = tx.QueryRow(ctx,
-		`SELECT id::text, `+hostIsLiveSQL+` FROM hosts WHERE node_name = $1 FOR UPDATE`,
+		`SELECT id::text, `+admission.HostIsLiveSQL+` FROM hosts WHERE node_name = $1 FOR UPDATE`,
 		nodeName).Scan(&existingID, &dbLive)
 	switch {
 	case err == nil:
@@ -165,6 +167,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	// stale pending disconnect into its first reconnect.
 	var hostID string
 	var newlyCreated bool
+	var registeredAt time.Time
 	err = tx.QueryRow(ctx, `
 		INSERT INTO hosts (node_name, agent_version, node_secret_hash, status, last_registered_at, capacity_detection, agent_process_started_at)
 		VALUES ($1, $2, $3, 'online', now(), 'unavailable', now())
@@ -180,8 +183,8 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		        ,agent_restart_count      = 0
 		        ,agent_last_restart_at    = NULL
 		        ,agent_disconnected_at    = NULL
-		RETURNING id::text, (xmax = 0)
-	`, nodeName, agentVersion, secretHash).Scan(&hostID, &newlyCreated)
+		RETURNING id::text, (xmax = 0), last_registered_at
+	`, nodeName, agentVersion, secretHash).Scan(&hostID, &newlyCreated, &registeredAt)
 	if err != nil {
 		return registerResult{}, fmt.Errorf("upsert host: %w", err)
 	}
@@ -210,7 +213,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	if err := tx.Commit(ctx); err != nil {
 		return registerResult{}, fmt.Errorf("commit enrollment: %w", err)
 	}
-	return registerResult{HostID: hostID, NodeSecret: secretHex}, nil
+	return registerResult{HostID: hostID, NodeSecret: secretHex, RegisteredAt: registeredAt}, nil
 }
 
 // removalDrainWindow bounds how long after taking its cordon the remove route records
@@ -245,17 +248,6 @@ func releaseRemovalDrain(ctx context.Context, tx pgx.Tx, hostID string) error {
 	return nil
 }
 
-// hostIsLiveSQL is the DB half of the #96 takeover guard: the registry only sees THIS
-// process, and nothing between a control-plane restart and the agent's reconnect. A
-// register writes registerStatusSQL (never offline) and clears agent_disconnected_at;
-// markOffline stamps it. Must not narrow to 'online': a drained host is still connected,
-// and every boot drains every typed-settings host (#596).
-//
-// Fail-closed: a control-plane stop never stamps, so a host whose agent never returns
-// reads as live until its row is deleted (an uncordon leaves the boot's reconciliation
-// hold). Guarded by TestAfterAControlPlaneRestartAHostRefusesReEnrollmentUntilItIsDeleted.
-const hostIsLiveSQL = `(status <> 'offline' AND agent_disconnected_at IS NULL)`
-
 // reconnectHost verifies the node_secret and marks the host online.
 func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion string, sourceCommit *string, nodeSecret string) (registerResult, error) {
 	var hostID, storedHash string
@@ -280,7 +272,11 @@ func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion s
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var isRestart bool
-	err = tx.QueryRow(ctx, reconnectHostSQL, hostID, agentVersion, agentRestartMinGap.Milliseconds(), sourceCommit).Scan(&isRestart)
+	var registeredAt time.Time
+	err = tx.QueryRow(ctx, reconnectHostSQL, hostID, agentVersion, agentRestartMinGap.Milliseconds(), sourceCommit, storedHash).Scan(&isRestart, &registeredAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return registerResult{}, ErrInvalidNodeSecret // rotated or the row deleted since the lookup
+	}
 	if err != nil {
 		return registerResult{}, fmt.Errorf("update host: %w", err)
 	}
@@ -290,7 +286,7 @@ func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion s
 	if err := tx.Commit(ctx); err != nil {
 		return registerResult{}, fmt.Errorf("commit reconnect: %w", err)
 	}
-	return registerResult{HostID: hostID, AgentRestarted: isRestart}, nil
+	return registerResult{HostID: hostID, AgentRestarted: isRestart, RegisteredAt: registeredAt}, nil
 }
 
 // registerStatusSQL is what a register does to the scheduling status: offline →
@@ -316,7 +312,8 @@ const registerStatusSQL = `CASE WHEN hosts.status = 'draining'
 // same build ⇒ blip (process identity unchanged). agent_disconnected_at is
 // always cleared — consumed, so a stale value can never misclassify a later
 // reconnect. $4 is the validated source_commit of this register, NULL when it
-// sent none.
+// sent none. $5 is the node_secret_hash the secret was checked against: the lock
+// re-reads the row, so an enrollment that rotated it since leaves zero rows (#618).
 const reconnectHostSQL = `
 	WITH old AS (
 		SELECT agent_process_started_at,
@@ -325,7 +322,7 @@ const reconnectHostSQL = `
 		       OR (agent_version IS NOT NULL AND agent_version <> $2)
 		       OR (source_commit IS NOT NULL AND $4::text IS NOT NULL AND source_commit <> $4::text)
 		       AS restarted
-		FROM hosts WHERE id = $1
+		FROM hosts WHERE id = $1 AND node_secret_hash = $5
 		FOR UPDATE
 	)
 	UPDATE hosts SET
@@ -350,7 +347,7 @@ const reconnectHostSQL = `
 		agent_disconnected_at = NULL
 	FROM old
 	WHERE hosts.id = $1
-	RETURNING old.restarted
+	RETURNING old.restarted, hosts.last_registered_at
 `
 
 // upsertCapacity replaces the host's cpu/mem and full GPU set; storage and
@@ -701,7 +698,7 @@ func (s *agentStore) updateHeartbeat(ctx context.Context, hostID string) error {
 func (s *agentStore) markLive(ctx context.Context, hostID string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE hosts SET status=`+registerStatusSQL+`, agent_disconnected_at=NULL
-		WHERE id=$1 AND NOT `+hostIsLiveSQL+`
+		WHERE id=$1 AND NOT `+admission.HostIsLiveSQL+`
 	`, hostID)
 	if err != nil {
 		return fmt.Errorf("mark live: %w", err)
@@ -715,13 +712,18 @@ func (s *agentStore) markLive(ctx context.Context, hostID string) error {
 // now(), the anchor for
 // reconnectHost's blip-vs-restart classification — see agentRestartMinGap for
 // why a control-plane restart cannot misattribute its own downtime.
-func (s *agentStore) markOffline(ctx context.Context, hostID string) error {
+//
+// Only while registeredAt (the closing connection's own write) is still the row's last
+// registration: a reconnect that committed while this one closed must stay live, or an
+// enrollment rotates the secret before that socket is registered and it then replaces
+// the new agent (#618; TestAClosingConnectionDoesNotReopenAHostAReconnectClaimed).
+func (s *agentStore) markOffline(ctx context.Context, hostID string, registeredAt time.Time) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE hosts SET status=CASE WHEN EXISTS (
 		    SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id=hosts.id
 		) THEN 'draining' ELSE 'offline' END,
-		agent_disconnected_at=now() WHERE id=$1
-	`, hostID)
+		agent_disconnected_at=now() WHERE id=$1 AND last_registered_at=$2
+	`, hostID, registeredAt)
 	if err != nil {
 		return fmt.Errorf("mark offline: %w", err)
 	}

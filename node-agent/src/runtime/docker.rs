@@ -123,7 +123,7 @@ async fn reconcile_image(
     let state = image_state(&docker, image).await?;
     let existing = state.as_ref().map(|s| s.info.clone());
     let mut recovered_build = None;
-    if let Some(intent) = journal.pending()? {
+    if let Some(intent) = journal.pending_or_retire()? {
         if intent.image != image {
             return Err(ErrorKind::UnknownOutcome.into());
         }
@@ -140,14 +140,15 @@ async fn reconcile_image(
             );
             return Ok((docker, journal, existing, None));
         }
-        if intent.socket != config.socket {
+        if intent.build_id.is_none() && intent.socket != config.socket {
             return Err(ErrorKind::UnknownOutcome.into());
         }
         if let Some(id) = intent.build_id {
-            // Only its own label proves a build finished. Any other record is retired:
-            // the lease proves no agent still drives it and the classic builder stops
-            // with its client, so the caller builds again. Refusing stranded every
-            // later build (#505).
+            // Only its own label proves a build finished. Any other record is retired,
+            // whichever engine socket it names: the lease proves no agent still drives it,
+            // the classic builder stops with its client, and a build sent to another
+            // engine cannot move this engine's tag, so the caller builds again. Refusing
+            // stranded every later build (#505, #608).
             journal.clear()?;
             if state.as_ref().and_then(|s| s.build_id.as_deref()) == Some(&id) {
                 recovered_build = intent.build_fingerprint;
