@@ -299,6 +299,20 @@ func TestRestartUnknownHostReturns404(t *testing.T) {
 	}
 }
 
+// The restart body is optional: an empty one decodes to io.EOF and must still
+// reach the host lookup (#622 bounded the reader, not the optionality).
+func TestRestartEmptyBodyIsAccepted(t *testing.T) {
+	pool := testPool(t)
+	h := NewHandler(NewStore(pool), &fakeDispatcher{}, fakeCounter(0))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
+	req.SetPathValue("id", "00000000-0000-0000-0000-000000000000")
+	h.handleRestart(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (past the body decode)", rr.Code)
+	}
+}
+
 // TestRestartOfflineHostReturns409Conflict verifies an offline host (agent not
 // connected) refuses the restart with a plain 409 conflict, distinct from the
 // restart_required shape.

@@ -383,7 +383,9 @@ host_curl() { # host_curl <path> [method]
   if [ "$DX_HOST" = local ]; then
     curl -fsSk -m 20 -X "$method" "$API_BASE$1" -H "Authorization: Bearer $QSES_ADMIN_TOKEN"
   else
-    dx_ssh_remote "curl -fsSk -m 20 -X $method '$API_BASE$1' -H 'Authorization: Bearer $QSES_ADMIN_TOKEN'"
+    # Remote: the bearer rides stdin as a curl config line (curl -K -), never argv.
+    printf 'header = "Authorization: Bearer %s"\n' "$QSES_ADMIN_TOKEN" \
+      | dx_ssh_remote "curl -K - -fsSk -m 20 -X $method '$API_BASE$1'"
   fi
 }
 
@@ -395,7 +397,8 @@ host_curl_code() { # host_curl_code <path> [method]
     curl -sSk -m 20 -o /dev/null -w '%{http_code}' -X "$method" "$API_BASE$1" \
       -H "Authorization: Bearer $QSES_ADMIN_TOKEN"
   else
-    dx_ssh_remote "curl -sSk -m 20 -o /dev/null -w '%{http_code}' -X $method '$API_BASE$1' -H 'Authorization: Bearer $QSES_ADMIN_TOKEN'"
+    printf 'header = "Authorization: Bearer %s"\n' "$QSES_ADMIN_TOKEN" \
+      | dx_ssh_remote "curl -K - -sSk -m 20 -o /dev/null -w '%{http_code}' -X $method '$API_BASE$1'"
   fi
 }
 
@@ -406,7 +409,8 @@ host_curl_body() { # host_curl_body <path> <method> <json-body>
     curl -fsSk -m 20 -X "$2" "$API_BASE$1" \
       -H "Authorization: Bearer $QSES_ADMIN_TOKEN" -H 'Content-Type: application/json' -d "$3"
   else
-    dx_ssh_remote "curl -fsSk -m 20 -X $2 '$API_BASE$1' -H 'Authorization: Bearer $QSES_ADMIN_TOKEN' -H 'Content-Type: application/json' -d '$3'"
+    printf 'header = "Authorization: Bearer %s"\n' "$QSES_ADMIN_TOKEN" \
+      | dx_ssh_remote "curl -K - -fsSk -m 20 -X $2 '$API_BASE$1' -H 'Content-Type: application/json' -d '$3'"
   fi
 }
 
@@ -419,7 +423,8 @@ host_patch_profile_policy() { # host_patch_profile_policy <app_id> <policy>
     curl -fsSk -m 20 -X PATCH "$API_BASE/v1/apps/$1" \
       -H "Authorization: Bearer $QSES_ADMIN_TOKEN" -H 'Content-Type: application/json' -d "$body"
   else
-    dx_ssh_remote "curl -fsSk -m 20 -X PATCH '$API_BASE/v1/apps/$1' -H 'Authorization: Bearer $QSES_ADMIN_TOKEN' -H 'Content-Type: application/json' -d '$body'"
+    printf 'header = "Authorization: Bearer %s"\n' "$QSES_ADMIN_TOKEN" \
+      | dx_ssh_remote "curl -K - -fsSk -m 20 -X PATCH '$API_BASE/v1/apps/$1' -H 'Content-Type: application/json' -d '$body'"
   fi
 }
 

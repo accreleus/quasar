@@ -964,10 +964,14 @@ func TestReconnectHostSeedsProcessStartedAtWhenNull(t *testing.T) {
 func TestMarkOfflineStampsDisconnectedAt(t *testing.T) {
 	pool := testPool(t)
 	s := storeWithMintedTokens(pool, nil)
-	hostID := seedHost(t, pool)
+	res, err := s.enrollHost(context.Background(), "h1", "0.3.0", testEnrollmentToken)
+	if err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	hostID := res.HostID
 
 	before := time.Now()
-	if err := s.markOffline(context.Background(), hostID); err != nil {
+	if err := s.markOffline(context.Background(), hostID, res.RegisteredAt); err != nil {
 		t.Fatalf("markOffline: %v", err)
 	}
 

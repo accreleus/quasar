@@ -61,14 +61,16 @@ func inlineThumb(ctx context.Context, f *Fetcher, rawURL string) string {
 	if err != nil || u.Scheme != "https" || !thumbHostAllowed(u.Hostname()) {
 		return ""
 	}
-	data, _, err := f.Get(ctx, u.String())
+	data, _, err := f.GetOnHosts(ctx, u.String(), thumbHostAllowed)
 	if err != nil || len(data) == 0 {
 		return ""
 	}
 	// Trust bytes over headers: the URI's MIME type is what the browser will
 	// act on, so derive it from the payload the way the browser would.
 	mime := http.DetectContentType(data)
-	if !strings.HasPrefix(mime, "image/") {
+	// Only what BlobStore stores, under the same pixel cap: the admin's
+	// browser decodes this body, so a GIF or a declared-huge PNG is refused.
+	if _, ok := extForType[mime]; !ok || checkDimensions(mime, data) != nil {
 		return ""
 	}
 	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)

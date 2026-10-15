@@ -7,6 +7,11 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/console"
 )
 
+// maxAuditAgentText bounds the agent-supplied free text carried into audit
+// details: an over-long value would exceed the 4096-byte details CHECK, the
+// insert would fail, and the reset would go unrecorded.
+const maxAuditAgentText = 200
+
 // applyConsoleAccessReport is amendment 18's control-plane reaction to one
 // capacity.console_capabilities.access report (agent-api.md, control-api.md
 // §Console mode): the once-per-request_id restored reset ("Restored attempt")
@@ -23,10 +28,10 @@ func (h *Handler) applyConsoleAccessReport(ctx context.Context, hostID string, a
 		_ = h.registry.SendOrReconnect(hostID, ConfigUpdateCmd{Type: "config_update", ConsoleConfig: resolved})
 		details := map[string]any{"target": *access.Target}
 		if access.RequestID != nil {
-			details["request_id"] = *access.RequestID
+			details["request_id"] = audit.TruncateBytes(*access.RequestID, maxAuditAgentText)
 		}
 		if access.Reason != nil {
-			details["reason"] = *access.Reason
+			details["reason"] = audit.TruncateBytes(*access.Reason, maxAuditAgentText)
 		}
 		audit.TryRecord(ctx, h.auditor, "", "console.access.restored", "host", hostID, details)
 	}
