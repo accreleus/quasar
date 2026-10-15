@@ -1049,10 +1049,10 @@ pub(crate) fn advertised_codec_throughput(
 
 /// How long register preparation may take before the agent says so. Register
 /// preparation (the image reconcile and the install probe, both against the
-/// container runtime) runs before the socket is dialled, so it can no longer eat the
-/// control plane's handshake window — but the window is 15 s (agentws
-/// `handshakeTimeout`), and a runtime slow enough to approach it deserves a log line
-/// naming it rather than a slow, mysterious reconnect (#191).
+/// container runtime) runs before the socket is dialled, so it never eats the
+/// control plane's register window (agentws `registerReadTimeout`); a runtime
+/// this slow still deserves a log line naming it rather than a slow, mysterious
+/// reconnect (#191).
 const REGISTER_PREP_BUDGET: Duration = Duration::from_secs(10);
 
 fn register_prep_over_budget(elapsed: Duration) -> bool {
@@ -1990,7 +1990,7 @@ async fn connect_and_run(
 
     // Everything `register` needs from the container runtime is gathered BEFORE the
     // socket is opened (#191). The control plane gives a fresh connection its
-    // handshake window (agentws `handshakeTimeout`, 15 s) to send `register`; these
+    // register window (agentws `registerReadTimeout`) to send `register`; these
     // two probes used to run after the dial, and on a host whose docker daemon
     // answers `inspect` slowly (each is bounded at 30 s) they pushed `register` past
     // that deadline. The control plane closed the socket without a close frame, the
@@ -7318,14 +7318,110 @@ mod tests {
     // ---- #191: register preparation runs before the dial ----
 
     #[test]
-    fn register_prep_budget_sits_inside_the_control_plane_handshake_window() {
-        // agentws handshakeTimeout is 15 s. The budget exists to NAME a slow runtime,
-        // so it must trip before the peer would have given up on a same-window dial.
-        assert!(REGISTER_PREP_BUDGET < Duration::from_secs(15));
+    fn register_prep_budget_names_a_slow_runtime() {
         assert!(!register_prep_over_budget(Duration::from_millis(800)));
         assert!(register_prep_over_budget(Duration::from_secs(11)));
         // The field case: one 30 s inspect timeout.
         assert!(register_prep_over_budget(Duration::from_secs(30)));
+    }
+
+    /// #627: a recovery actor that never answers must not hold the connection's only
+    /// reader. `register` has to beat agentws `registerReadTimeout`, and the ack of an
+    /// assign sent right after `capacity` (the console auto-start) has to beat the control
+    /// plane's 10 s `assignAckTimeout`, the same 10 s the actor's status read may take.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_recovery_actor_delays_neither_register_nor_an_ack() {
+        // `connect_and_run` records the install facts it discovers.
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        // Never accepts: a status request connects through the backlog, then waits.
+        let actor = dir.path().join("actor.sock");
+        let _actor = std::os::unix::net::UnixListener::bind(&actor).unwrap();
+        let release_mgr = ReleaseManager::owned(&actor);
+
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret = dir.path().join("secret");
+        let cfg = Config {
+            control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let (timings_tx, timings_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            fn next_text(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> String {
+                loop {
+                    if let Message::Text(t) = ws.read().expect("the agent stays connected") {
+                        return t.to_string();
+                    }
+                }
+            }
+            let (stream, _) = cp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let opened = Instant::now();
+            let register = next_text(&mut ws);
+            let register_after = opened.elapsed();
+            assert!(register.contains(r#""type":"register""#), "{register}");
+            ws.send(Message::Text(
+                r#"{"type":"registered","host_id":"h1","node_secret":null,"heartbeat_interval_ms":5000}"#
+                    .into(),
+            ))
+            .unwrap();
+            while !next_text(&mut ws).contains(r#""type":"capacity""#) {}
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "session_assign", "id": "assign-1", "session_id": "s1",
+                    "gpu_index": 0,
+                    "stream": {"width": 1920, "height": 1080, "fps": 60,
+                        "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+            let assigned = Instant::now();
+            loop {
+                let frame = next_text(&mut ws);
+                if frame.contains(r#""type":"ack""#) && frame.contains(r#""id":"assign-1""#) {
+                    break;
+                }
+            }
+            let _ = timings_tx.send((register_after, assigned.elapsed()));
+            // Dropping `ws` closes the socket, which ends the attempt.
+        });
+
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        let attempt = connect_and_run(
+            &cfg,
+            &health,
+            "",
+            "test",
+            &image_mgr,
+            &release_mgr,
+            &mut sessions,
+            false,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(90), attempt).await;
+        let (register_after, ack_after) = timings_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake control plane saw register and the assign's ack");
+        assert!(
+            register_after < Duration::from_secs(1),
+            "register reached the control plane {register_after:?} after the upgrade"
+        );
+        assert!(
+            ack_after < Duration::from_secs(3),
+            "the assign was acked {ack_after:?} after it was sent"
+        );
     }
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`

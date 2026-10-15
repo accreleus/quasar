@@ -3648,8 +3648,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Install a catalog image (adopt + ensure-everywhere unless lazy).
-         * @description P3. Seeds installed_images with the catalog's current (version, registry_digest) and, unless lazy:true, dispatches ensure-everywhere immediately. A lazy install seeds the adoption row only; hosts pull on first launch placement.
+         * Install a catalog image (adopt; unless lazy, prepared on the hosts its enabled apps are placed on).
+         * @description P3. Seeds installed_images with the catalog's current (version, registry_digest) and, unless lazy:true, prepares the image on each host an enabled app using it is placed on (nothing until such an app exists). A lazy install seeds the adoption row only; hosts pull on first launch placement.
          */
         post: {
             parameters: {
@@ -3681,7 +3681,7 @@ export interface paths {
                 409: components["responses"]["Conflict"];
             };
         };
-        /** Uninstall (best-effort image_remove to every host that has it, then drop the adoption row). */
+        /** Uninstall (drop the adoption row; each host keeps the image until RH05 host image cleanup removes it). */
         delete: {
             parameters: {
                 query?: never;
