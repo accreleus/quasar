@@ -17,6 +17,17 @@ export interface ImgVersion {
   tone?: "info" | "warning" | "danger";
 }
 
+/** The fleet's host ids, or null while they are unknown: still loading, or the
+ *  first hosts load failed (the list is then the empty seed, not an empty fleet). */
+export function knownFleetIds(
+  hosts: readonly { id: string }[],
+  loading: boolean,
+  hostsError: string | null,
+): ReadonlySet<string> | null {
+  if (loading || (hostsError && hosts.length === 0)) return null;
+  return new Set(hosts.map((h) => h.id));
+}
+
 /** "Failed on 3 of 4 hosts", or null when no fleet host reports a failed build.
  *  Numerator and denominator are the same set: the current fleet (`fleetHostIds`),
  *  so a host deleted since the catalog last polled stops counting. `null` means the

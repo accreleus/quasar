@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hostImageState, imageFailure, imgRollout, imgVersion } from "./imageRollout";
+import { hostImageState, imageFailure, imgRollout, imgVersion, knownFleetIds } from "./imageRollout";
 import type { CatalogImage, Host } from "../../../api/types";
 
 function image(over: Partial<CatalogImage> = {}): CatalogImage {
@@ -216,5 +216,25 @@ describe("imageFailure", () => {
   it("keeps the in-flight label beside a failure", () => {
     const img = failedOn("failed", "building", "ready", "ready");
     expect(imgVersion(img, fleet(4)).sub).toBe("Failed on 1 of 4 hosts · Building…");
+  });
+});
+
+describe("knownFleetIds", () => {
+  it("is unknown while loading, and when the first hosts load failed", () => {
+    expect(knownFleetIds([{ id: "h1" }], true, null)).toBeNull();
+    // A failed first load leaves the empty seed: that is not an empty fleet.
+    expect(knownFleetIds([], false, "could not load hosts")).toBeNull();
+  });
+
+  it("keeps the last good list when a later poll fails, and trusts a real empty fleet", () => {
+    expect(knownFleetIds([{ id: "h1" }, { id: "h2" }], false, "could not load hosts")).toEqual(new Set(["h1", "h2"]));
+    expect(knownFleetIds([], false, null)).toEqual(new Set());
+  });
+
+  it("keeps a failed image failed when the hosts load errored", () => {
+    const img = image({ installed: true, installed_version: "1.0.0", hosts: [
+      { host_id: "h0", state: "failed", version: null, error: null },
+    ] as CatalogImage["hosts"] });
+    expect(imgVersion(img, knownFleetIds([], false, "boom")).sub).toBe("Failed on 1 host");
   });
 });

@@ -24,7 +24,7 @@ import { useToast } from "../../components/Toast";
 import { useFleetContext } from "../../lib/fleet/FleetContext";
 import { useResource } from "../../lib/resource/react";
 import { SteamPreparationStatus } from "./library/SteamPreparationStatus";
-import { hostImageState, imageFailure, imgRollout, POLICY_COPY } from "./library/imageRollout";
+import { hostImageState, imageFailure, imgRollout, knownFleetIds, POLICY_COPY } from "./library/imageRollout";
 import { ImageCleanupModal } from "./library/ImageCleanupModal";
 import { dominantInFlightState, HOST_STATE_COPY } from "./library/imageStatus";
 
@@ -97,7 +97,7 @@ export function ImageDetail() {
   const data = resource.data;
   const img = useMemo(() => data?.images.find((i) => i.id === id), [data, id]);
   // Off the fleet poll above this page (lib/fleet), not a read of its own.
-  const { hosts, loading: fleetLoading } = useFleetContext();
+  const { hosts, loading: fleetLoading, errors: fleetErrors } = useFleetContext();
 
   const roll = img ? imgRollout(img, hosts) : null;
 
@@ -253,7 +253,7 @@ export function ImageDetail() {
   // Wire-derived, not local `pending` — a background pull (e.g. a provider
   // auto-ensure) is in flight whether or not this tab is the one that started it.
   const inFlight = img ? dominantInFlightState(img) : null;
-  const failed = img ? imageFailure(img, fleetLoading ? null : new Set(hosts.map((h) => h.id))) : null;
+  const failed = img ? imageFailure(img, knownFleetIds(hosts, fleetLoading, fleetErrors.hosts)) : null;
 
   return (
     <section className="page image-detail-page">

@@ -28,7 +28,7 @@ import { useFleetContext } from "../../../lib/fleet/FleetContext";
 import { useResource } from "../../../lib/resource/react";
 import { fmtClockTime, fmtDate } from "../../../lib/formatLegacy";
 import { relativeTime } from "../../../lib/format/relativeTime";
-import { imgRollout, imgVersion, hostImageState, POLICY_COPY } from "./imageRollout";
+import { imgRollout, imgVersion, hostImageState, knownFleetIds, POLICY_COPY } from "./imageRollout";
 import { isImageInFlight } from "./imageStatus";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 
@@ -153,9 +153,12 @@ export function ImagesTab() {
   const images = catalog.data?.images ?? [];
 
   // The fleet poll above this page already holds the hosts (lib/fleet).
-  const { hosts, loading: fleetLoading } = useFleetContext();
-  // null until the fleet loads: a failure count then has no honest denominator.
-  const fleetHostIds = useMemo(() => (fleetLoading ? null : new Set(hosts.map((h) => h.id))), [fleetLoading, hosts]);
+  const { hosts, loading: fleetLoading, errors: fleetErrors } = useFleetContext();
+  // null until the fleet is known: a failure count then has no honest denominator.
+  const fleetHostIds = useMemo(
+    () => knownFleetIds(hosts, fleetLoading, fleetErrors.hosts),
+    [hosts, fleetLoading, fleetErrors.hosts],
+  );
 
   const [policySaving, setPolicySaving] = useState(false);
   const settingsRes = useResource({
