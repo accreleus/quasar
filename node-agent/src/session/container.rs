@@ -1408,17 +1408,6 @@ impl ContainerRuntime {
             .and_then(|runtime| runtime.image_present(registry_ref).wait())
             .map_err(|error| error.to_string())
     }
-
-    /// [`Self::image_present`] under `budget` instead of the client's full deadline.
-    pub fn image_present_within(
-        &self,
-        registry_ref: &str,
-        budget: Duration,
-    ) -> Result<bool, String> {
-        crate::runtime::configured()
-            .and_then(|runtime| runtime.image_present_within(registry_ref, budget).wait())
-            .map_err(|error| error.to_string())
-    }
 }
 
 /// A terminal app-container exit, classified for the app-liveness policy (spec §2/§3).

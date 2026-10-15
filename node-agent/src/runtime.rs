@@ -133,8 +133,8 @@ impl RuntimeClient {
         self.submit(async move { docker::inspect_image(&config, &image).await })
     }
 
-    /// [`Self::image_present`] under `budget` (capped by the client deadline), for callers on
-    /// a connection task that a full deadline would silence (#675).
+    /// [`Self::image_present`] under `budget` (capped by the client deadline): the image
+    /// manager's background check of a `ready` record bounds each inspect by it (#675).
     pub fn image_present_within(
         &self,
         image: impl Into<String>,
