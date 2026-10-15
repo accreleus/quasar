@@ -109,7 +109,7 @@ ARG GST_VERSION=1.28.8
 ARG GST_PLUGINS_RS_REF=cee45224cb2d10e1523af4f256d0dd64c8b29491
 ARG GST_INTERPIPE_REF=0c454917
 ARG GST_WAYLAND_DISPLAY_REPO=https://github.com/salty2011/gst-wayland-display.git
-ARG GST_WAYLAND_DISPLAY_REF=227352d6571332ea8e618541b42197ab700bff23
+ARG GST_WAYLAND_DISPLAY_REF=6ae654ec3bb3b85d7923bf46154a8ba1e11e0f87
 ARG RUST_VERSION=1.94.0
 ARG CARGO_C_VERSION=0.10.23
 ARG RUSTUP_VERSION=1.29.0
@@ -169,9 +169,10 @@ ENTRYPOINT []
 # against. An explicit list, not `dnf builddep gstreamer1*` (#198): that brings what Fedora's
 # whole plugin set needs, about 2 GB this build never reads. A missing package fails meson
 # loudly unless a subproject probes for it with `required: false`: without gnutls-devel
-# libnice silently switches to OpenSSL. So a change to this list is checked by running
-# GStreamer's `meson setup` on both package sets: the dependency lines and every config.h
-# must not differ. `clang` alone serves bindgen; clang-devel pulls 380 MB of llvm-static.
+# libnice would switch to OpenSSL (the GStreamer RUN fails if libnice does not link gnutls).
+# So a change to this list is checked by running GStreamer's `meson setup` on both package
+# sets: the dependency lines and every config.h must not differ. `clang` alone serves
+# bindgen; clang-devel pulls 380 MB of llvm-static.
 # gstreamer1-devel is Fedora's own GStreamer, here for one file: gst-interpipe's meson
 # requires gstreamer-check-1.0, and /opt/gst is built without it.
 RUN dnf install -y dnf-plugins-core \
@@ -495,6 +496,9 @@ RUN git clone --depth 1 --branch "${GST_VERSION}" \
     -Dgst-plugins-good:rtp=enabled \
     -Dgst-plugins-good:udp=enabled \
     && ninja -C build install \
+    # libnice picks its crypto backend with `required: false`: fail here, not silently on OpenSSL.
+    && { readelf -d /opt/gst/lib64/libnice.so | grep -q 'NEEDED.*libgnutls' \
+         || { echo "libnice was built without gnutls (is gnutls-devel installed?)" >&2; exit 1; }; } \
     && if [ "$GST_TESTS" = "enabled" ]; then \
          echo "GST_TESTS=enabled -- retaining /opt/gstreamer-src for conformance runs"; \
        else rm -rf /opt/gstreamer-src; fi
