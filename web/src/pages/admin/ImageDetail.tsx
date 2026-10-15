@@ -97,7 +97,7 @@ export function ImageDetail() {
   const data = resource.data;
   const img = useMemo(() => data?.images.find((i) => i.id === id), [data, id]);
   // Off the fleet poll above this page (lib/fleet), not a read of its own.
-  const { hosts } = useFleetContext();
+  const { hosts, loading: fleetLoading } = useFleetContext();
 
   const roll = img ? imgRollout(img, hosts) : null;
 
@@ -253,7 +253,7 @@ export function ImageDetail() {
   // Wire-derived, not local `pending` — a background pull (e.g. a provider
   // auto-ensure) is in flight whether or not this tab is the one that started it.
   const inFlight = img ? dominantInFlightState(img) : null;
-  const failed = img ? imageFailure(img, hosts.length) : null;
+  const failed = img ? imageFailure(img, fleetLoading ? null : new Set(hosts.map((h) => h.id))) : null;
 
   return (
     <section className="page image-detail-page">
@@ -395,7 +395,7 @@ export function ImageDetail() {
                   <div className="ae-fact">
                     <span>State</span>
                     <span className={failed ? "tone-danger" : inFlight ? "tone-info" : img.update_available ? "tone-warning" : undefined}>
-                      {failed ??
+                      {(failed && inFlight ? `${failed} · ${HOST_STATE_COPY[inFlight].label}` : failed) ??
                         (inFlight
                           ? HOST_STATE_COPY[inFlight].label
                           : img.update_available

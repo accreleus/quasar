@@ -22,7 +22,7 @@ function host(id: string, node_name: string): Host {
 
 describe("imgVersion", () => {
   it("not installed", () => {
-    expect(imgVersion(image({ version: "2.0.0" }))).toEqual({ version: "2.0.0", sub: "not installed" });
+    expect(imgVersion(image({ version: "2.0.0" }), null)).toEqual({ version: "2.0.0", sub: "not installed" });
   });
 
   it("in flight beats every other state, even mid-update, and keeps the Downloading…/Building… distinction", () => {
@@ -34,24 +34,26 @@ describe("imgVersion", () => {
           update_available: true,
           hosts: [{ host_id: "h1", state: "pulling", version: null, error: null }],
         }),
+        null,
       ),
     ).toEqual({ version: "2.0.0", sub: "Downloading…", tone: "info" });
 
     expect(
       imgVersion(
         image({ version: "2.0.0", installed: false, hosts: [{ host_id: "h1", state: "building", version: null, error: null }] }),
+        null,
       ),
     ).toEqual({ version: "2.0.0", sub: "Building…", tone: "info" });
   });
 
   it("update available", () => {
     expect(
-      imgVersion(image({ version: "2.0.0", installed: true, installed_version: "1.9.0", update_available: true })),
+      imgVersion(image({ version: "2.0.0", installed: true, installed_version: "1.9.0", update_available: true }), null),
     ).toEqual({ version: "2.0.0", sub: "running 1.9.0", tone: "warning" });
   });
 
   it("up to date", () => {
-    expect(imgVersion(image({ version: "2.0.0", installed: true, installed_version: "2.0.0" }))).toEqual({
+    expect(imgVersion(image({ version: "2.0.0", installed: true, installed_version: "2.0.0" }), null)).toEqual({
       version: "2.0.0",
       sub: "up to date",
     });
@@ -178,24 +180,41 @@ describe("hostImageState — null guards", () => {
 describe("imageFailure", () => {
   const failedOn = (...states: string[]) =>
     image({ installed: true, hosts: states.map((state, i) => ({ host_id: `h${i}`, state, version: null, error: null })) as CatalogImage["hosts"] });
+  const fleet = (n: number) => new Set(Array.from({ length: n }, (_, i) => `h${i}`));
 
   it("is null when no host failed, however the rest look", () => {
-    expect(imageFailure(failedOn("ready", "building", "absent"), 3)).toBeNull();
-    expect(imageFailure(image({ hosts: undefined }), 4)).toBeNull();
+    expect(imageFailure(failedOn("ready", "building", "absent"), fleet(3))).toBeNull();
+    expect(imageFailure(image({ hosts: undefined }), fleet(4))).toBeNull();
+    expect(imageFailure(failedOn("ready", "failed"), null)).toBe("Failed on 1 host");
   });
 
-  it("counts failed hosts against the whole fleet, never more failures than hosts", () => {
-    expect(imageFailure(failedOn("failed", "failed", "failed", "absent"), 4)).toBe("Failed on 3 of 4 hosts");
-    expect(imageFailure(failedOn("failed", "ready"), 4)).toBe("Failed on 1 of 4 hosts");
-    expect(imageFailure(failedOn("failed"), 1)).toBe("Failed on 1 of 1 host");
-    expect(imageFailure(failedOn("failed", "failed"), 0)).toBe("Failed on 2 of 2 hosts");
+  it("counts failed hosts against the current fleet, both sides the same set", () => {
+    expect(imageFailure(failedOn("failed", "failed", "failed", "absent"), fleet(4))).toBe("Failed on 3 of 4 hosts");
+    expect(imageFailure(failedOn("failed", "ready"), fleet(4))).toBe("Failed on 1 of 4 hosts");
+    expect(imageFailure(failedOn("failed"), fleet(1))).toBe("Failed on 1 of 1 host");
+  });
+
+  it("states no denominator while the fleet has not loaded", () => {
+    expect(imageFailure(failedOn("failed", "failed", "failed", "ready"), null)).toBe("Failed on 3 hosts");
+  });
+
+  it("ignores a failed host that is no longer in the fleet", () => {
+    // h0 failed, h1-h3 ready; h0 was deleted since the catalog last polled.
+    const img = failedOn("failed", "ready", "ready", "ready");
+    expect(imageFailure(img, new Set(["h1", "h2", "h3"]))).toBeNull();
+    expect(imgVersion({ ...img, installed_version: "1.0.0" }, new Set(["h1", "h2", "h3"])).sub).toBe("up to date");
   });
 
   it("imgVersion reads failed, not up to date, and failure beats in-flight and update-available", () => {
     const done = { version: "2.0.0", installed_version: "2.0.0" };
     const up = { ...failedOn("failed", "failed", "failed", "ready"), ...done };
-    expect(imgVersion(up, 4)).toEqual({ version: "2.0.0", sub: "Failed on 3 of 4 hosts", tone: "danger" });
+    expect(imgVersion(up, fleet(4))).toEqual({ version: "2.0.0", sub: "Failed on 3 of 4 hosts", tone: "danger" });
     const busy = { ...failedOn("failed", "building"), ...done, update_available: true };
-    expect(imgVersion(busy, 2).tone).toBe("danger");
+    expect(imgVersion(busy, fleet(2)).tone).toBe("danger");
+  });
+
+  it("keeps the in-flight label beside a failure", () => {
+    const img = failedOn("failed", "building", "ready", "ready");
+    expect(imgVersion(img, fleet(4)).sub).toBe("Failed on 1 of 4 hosts · Building…");
   });
 });

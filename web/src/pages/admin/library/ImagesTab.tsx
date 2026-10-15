@@ -153,7 +153,9 @@ export function ImagesTab() {
   const images = catalog.data?.images ?? [];
 
   // The fleet poll above this page already holds the hosts (lib/fleet).
-  const { hosts } = useFleetContext();
+  const { hosts, loading: fleetLoading } = useFleetContext();
+  // null until the fleet loads: a failure count then has no honest denominator.
+  const fleetHostIds = useMemo(() => (fleetLoading ? null : new Set(hosts.map((h) => h.id))), [fleetLoading, hosts]);
 
   const [policySaving, setPolicySaving] = useState(false);
   const settingsRes = useResource({
@@ -351,7 +353,7 @@ export function ImagesTab() {
       key: "version",
       header: "Version",
       render: (img) => {
-        const v = imgVersion(img, hosts.length);
+        const v = imgVersion(img, fleetHostIds);
         return (
           <div>
             <div className="num">{v.version}</div>
@@ -382,7 +384,6 @@ export function ImagesTab() {
       render: (img) => {
         const ui = uiFor(img.id);
         const pending = ui.pending !== null;
-        const v = imgVersion(img);
         // A pinned image cannot update. A refresh leaves the adoption intact.
         const isUpdate = img.installed && img.update_available && !img.pinned;
         // The resolver skips non-prebuilt entries, so Install on a template
@@ -399,10 +400,10 @@ export function ImagesTab() {
                 !installable
                   ? notInstallableTitle
                   : isUpdate
-                    ? `Update to ${v.version}`
+                    ? `Update to ${img.version}`
                     : "Refresh adoption status"
               }
-              aria-label={isUpdate ? `Update to ${v.version}` : "Refresh adoption status"}
+              aria-label={isUpdate ? `Update to ${img.version}` : "Refresh adoption status"}
               disabled={pending || !installable}
               onClick={() => void (isUpdate ? handleUpdate(img) : img.installed ? catalog.refresh({ silent: true }) : handleInstall(img))}
             >

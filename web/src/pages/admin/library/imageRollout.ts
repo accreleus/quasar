@@ -17,14 +17,18 @@ export interface ImgVersion {
   tone?: "info" | "warning" | "danger";
 }
 
-/** "Failed on 3 of 4 hosts", or null when no host reports a failed build. The
- *  catalog-level `installed` / `update_available` flags never see a per-host
+/** "Failed on 3 of 4 hosts", or null when no fleet host reports a failed build.
+ *  Numerator and denominator are the same set: the current fleet (`fleetHostIds`),
+ *  so a host deleted since the catalog last polled stops counting. `null` means the
+ *  fleet has not loaded yet, so there is no honest denominator: "Failed on 3 hosts".
+ *  The catalog-level `installed` / `update_available` flags never see a per-host
  *  failure, so every summary of an image's state goes through this first. */
-export function imageFailure(img: CatalogImage, totalHosts: number): string | null {
-  const n = (img.hosts ?? []).filter((h) => h.state === "failed").length;
+export function imageFailure(img: CatalogImage, fleetHostIds: ReadonlySet<string> | null): string | null {
+  const failed = (img.hosts ?? []).filter((h) => h.state === "failed");
+  const n = fleetHostIds ? failed.filter((h) => fleetHostIds.has(h.host_id)).length : failed.length;
   if (n === 0) return null;
-  const of = Math.max(totalHosts, n);
-  return `Failed on ${n} of ${of} host${of === 1 ? "" : "s"}`;
+  if (!fleetHostIds) return `Failed on ${n} host${n === 1 ? "" : "s"}`;
+  return `Failed on ${n} of ${fleetHostIds.size} host${fleetHostIds.size === 1 ? "" : "s"}`;
 }
 
 /** §A.13: `{version}` plus a sub of Downloading…/Building… (the same labels
@@ -33,10 +37,13 @@ export function imageFailure(img: CatalogImage, totalHosts: number): string | nu
  *  everything else — a real install/update already running must not also
  *  read as "update available". A failure on any host beats even that: see
  *  `imageFailure`. */
-export function imgVersion(img: CatalogImage, totalHosts = 0): ImgVersion {
-  const failed = imageFailure(img, totalHosts);
-  if (failed) return { version: img.version, sub: failed, tone: "danger" };
+export function imgVersion(img: CatalogImage, fleetHostIds: ReadonlySet<string> | null): ImgVersion {
+  const failed = imageFailure(img, fleetHostIds);
   const inFlight = dominantInFlightState(img);
+  if (failed) {
+    const sub = inFlight ? `${failed} · ${HOST_STATE_COPY[inFlight].label}` : failed;
+    return { version: img.version, sub, tone: "danger" };
+  }
   if (inFlight) return { version: img.version, sub: HOST_STATE_COPY[inFlight].label, tone: "info" };
   if (!img.installed) return { version: img.version, sub: "not installed" };
   if (img.update_available) {
