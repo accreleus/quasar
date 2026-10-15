@@ -1047,6 +1047,7 @@ impl ImageManager {
     /// Decision + bookkeeping half of [`Self::handle_ensure`] (no thread, no docker);
     /// `true` when a fresh worker must be started.
     fn plan_ensure(self: &Arc<Self>, image_id: &str, registry_ref: &str, version: &str) -> bool {
+        self.demote_ready_if_gone(image_id, version);
         let started = {
             let mut ops = self.ops.lock().unwrap();
             let mut records = self.records.lock().unwrap();
@@ -1090,6 +1091,41 @@ impl ImageManager {
         }
         self.emit(image_id);
         started
+    }
+
+    /// #675: a `ready` record the engine no longer has (removed behind the agent's back)
+    /// would be re-acked as ready until a restart. One inspect of the recorded tag; if the
+    /// engine definitively says it is gone the record goes absent, so the ensure that
+    /// follows takes the normal pull path. An engine error keeps the record, as at startup.
+    fn demote_ready_if_gone(&self, image_id: &str, version: &str) {
+        let registry_ref = {
+            let ops = self.ops.lock().unwrap();
+            let records = self.records.lock().unwrap();
+            match records.get(image_id) {
+                Some(rec)
+                    if !ops.contains_key(image_id)
+                        && rec.state == ImageState::Ready
+                        && rec.version == version =>
+                {
+                    rec.registry_ref.clone()
+                }
+                _ => return,
+            }
+        };
+        if !matches!(self.runtime.image_present(&registry_ref), Ok(false)) {
+            return;
+        }
+        let ops = self.ops.lock().unwrap();
+        let mut records = self.records.lock().unwrap();
+        if let Some(rec) = records.get_mut(image_id) {
+            if !ops.contains_key(image_id)
+                && rec.state == ImageState::Ready
+                && rec.registry_ref == registry_ref
+            {
+                rec.mark_absent();
+                info!("image {image_id}: ready -> Absent, {registry_ref} is gone from the engine");
+            }
+        }
     }
 
     /// `image_build` (agent-api.md). Acks immediately; download + `docker build` run
@@ -3658,6 +3694,73 @@ mod tests {
     }
 
     // serialization bookkeeping (no threads, no docker)
+
+    /// #675. `configured()` is process-wide, so the engine is faked in a child process
+    /// pointed at a socket this process serves: `/version`, then 404 for the tag.
+    #[test]
+    fn ensure_of_a_ready_image_the_engine_lost_takes_the_pull_path() {
+        use std::io::{Read, Write};
+        if std::env::var_os("QUASAR_IMAGES_LOST_TAG_CHILD").is_some() {
+            let m = ImageManager::empty_for_test();
+            m.set_ready_for_test("steam", REF1, "v1");
+            assert!(
+                m.plan_ensure("steam", REF1, "v1"),
+                "a lost tag must start a pull"
+            );
+            assert_eq!(
+                m.records.lock().unwrap()["steam"].state,
+                ImageState::Pulling
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let no_context = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "images::tests::ensure_of_a_ready_image_the_engine_lost_takes_the_pull_path",
+            ])
+            .env("QUASAR_IMAGES_LOST_TAG_CHILD", "1")
+            .env("DOCKER_HOST", format!("unix://{}", socket.display()))
+            .env("DOCKER_CONFIG", no_context.path())
+            .env_remove("CONTAINER_HOST")
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_TLS")
+            .env_remove("DOCKER_TLS_VERIFY")
+            .env_remove("DOCKER_API_VERSION")
+            .spawn()
+            .unwrap();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            let Ok((mut conn, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            conn.set_nonblocking(false).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                conn.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let (code, body) = if String::from_utf8_lossy(&request).contains("/version") {
+                (
+                    200,
+                    r#"{"Platform":{"Name":"Docker Engine - Community"},"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.24"}"#,
+                )
+            } else {
+                (404, r#"{"message":"No such image"}"#)
+            };
+            write!(conn, "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        };
+        assert!(status.success());
+    }
 
     #[test]
     fn plan_ensure_stages_a_pulling_record_synchronously_so_reack_can_emit() {
