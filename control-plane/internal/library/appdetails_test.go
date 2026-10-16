@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // valveFromFixture serves testdata/appdetails/<appid>.json, recorded from the live store
@@ -108,5 +109,27 @@ func TestStoreDetailsWireToleratesOddShapesAndBoundsText(t *testing.T) {
 	}
 	if got := (storeDetailsWire{ControllerSupport: []byte(`"none"`)}).parse(); got.ControllerSupport != "" {
 		t.Fatalf("unknown controller value kept: %q", got.ControllerSupport)
+	}
+}
+
+// nul.json is hand-made in 620's shape: U+0000 in every text field and one invalid UTF-8
+// byte, which Postgres TEXT refuses and would fail the scan's transaction.
+func TestAppDetailsStripsNULAndInvalidUTF8(t *testing.T) {
+	det, ok, _ := fetchFixture(t, "nul", "620")
+	if !ok {
+		t.Fatal("not consulted")
+	}
+	want := AppDetail{IsGame: true, ShortDescription: "Portal", Genres: []string{"Action"},
+		Developer: "Valve", Publisher: "Valve, �Bad", ReleaseDate: "18 Apr, 2011", ControllerSupport: "full"}
+	if !reflect.DeepEqual(det, want) {
+		t.Fatalf("got %+v\nwant %+v", det, want)
+	}
+	for _, s := range append([]string{det.ShortDescription, det.Developer, det.Publisher, det.ReleaseDate}, det.Genres...) {
+		if strings.ContainsRune(s, 0) || !utf8.ValidString(s) {
+			t.Fatalf("unstorable text %q", s)
+		}
+	}
+	if got := storableText("a\x00b\xffc"); got != "abc" {
+		t.Fatalf("storableText = %q", got)
 	}
 }

@@ -239,9 +239,57 @@ func TestAppReadsCarryTitleFacts(t *testing.T) {
 		}
 	}
 
-	// Read-only: not accepted on the write shape.
-	resp, _ = patch(t, f.srvURL+"/v1/apps/"+withFacts, map[string]any{"genres": []string{"Puzzle"}}, f.adminToken)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("PATCH genres = %d, want 400", resp.StatusCode)
+}
+
+// Each of the eight is read-only: naming it on a create or a patch is 400.
+func TestTitleFactsAreNotWritable(t *testing.T) {
+	f := newTwoUsers(t)
+	appID := f.seedApp(t, "Writable?", time.Now())
+	for field, value := range map[string]any{
+		"added_at": "2026-08-01T12:00:00Z", "genres": []string{"Puzzle"}, "developer": "x", "publisher": "x",
+		"release_date": "2011", "controller_support": "full", "logo_url": "/v1/artwork/l.png", "icon_url": "/v1/artwork/i.png",
+	} {
+		t.Run(field, func(t *testing.T) {
+			if resp, body := post(t, f.srvURL+"/v1/apps", map[string]any{"name": "new " + field, field: value}, f.adminToken); resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("POST with %s = %d (%v), want 400", field, resp.StatusCode, body)
+			}
+			if resp, body := patch(t, f.srvURL+"/v1/apps/"+appID, map[string]any{field: value}, f.adminToken); resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("PATCH with %s = %d (%v), want 400", field, resp.StatusCode, body)
+			}
+		})
+	}
+}
+
+// A disabled app's history is hidden, and so is a derived tile's once its parent is
+// revoked (amendment 22's parent rule).
+func TestPlayHistoryHidesDisabledAppsAndTilesOfARevokedParent(t *testing.T) {
+	f := newTwoUsers(t)
+	ctx := context.Background()
+	now := time.Now()
+	disabled := f.seedApp(t, "Disabled", now)
+	parent := f.seedApp(t, "Steam", now)
+	var tile string
+	if err := f.pool.QueryRow(ctx, `
+		INSERT INTO apps (name, parent_app_id, external_source, external_id, origin)
+		VALUES ('Portal 2', $1::uuid, 'steam', '620', 'discovered') RETURNING id::text`, parent).Scan(&tile); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, `INSERT INTO entitlements (subject_type, subject_id, app_id, granted_by)
+		VALUES ('all', NULL, $1::uuid, 'admin')`, tile); err != nil {
+		t.Fatal(err)
+	}
+	for _, app := range []string{disabled, tile} {
+		f.sessionFor(t, f.userID, app, "stopped", ptime(now.Add(-2*time.Hour)), ptime(now.Add(-time.Hour)))
+	}
+	if got := appIDs(f.playHistory(t, f.token)); len(got) != 2 {
+		t.Fatalf("before: %v, want both", got)
+	}
+
+	if _, err := f.pool.Exec(ctx, `UPDATE apps SET enabled = false WHERE id::text = $1`, disabled); err != nil {
+		t.Fatal(err)
+	}
+	f.revokeEntitlements(t, parent)
+	if got := f.playHistory(t, f.token); len(got) != 0 {
+		t.Fatalf("after: %v, want none", got)
 	}
 }

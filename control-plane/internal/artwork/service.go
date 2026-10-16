@@ -736,17 +736,14 @@ func (s *Service) backfillLogoIcon(ctx context.Context, provider Provider, res *
 		if ctx.Err() != nil {
 			return
 		}
-		rec.LogoAsset, rec.IconAsset, rec.LogoIconChecked = "", "", false
+		// A crop still on disk (the other half of a re-queued record) is kept unless replaced.
 		if rec.Provider == provider.Name() && rec.ProviderRef != "" {
 			app, err := s.store.App(ctx, rec.AppID)
 			if err != nil {
 				continue
 			}
-			source := ""
-			if app.ExternalSource != "" && app.ExternalID == rec.ProviderRef {
-				source = app.ExternalSource
-			}
-			rec.LogoAsset, rec.IconAsset, rec.LogoIconChecked = s.fetchLogoIcon(ctx, provider, source, rec.ProviderRef)
+			logo, icon, ok := s.fetchLogoIcon(ctx, provider, refSource(app, rec.ProviderRef), rec.ProviderRef)
+			rec.LogoAsset, rec.IconAsset, rec.LogoIconChecked = firstNonEmpty(logo, rec.LogoAsset), firstNonEmpty(icon, rec.IconAsset), ok
 		}
 		// Saved either way: the bumped updated_at moves an unanswered record to the back.
 		if err := s.store.SaveLogoIcon(ctx, rec); err != nil {
@@ -780,7 +777,7 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 	}
 	attempts := 0
 	for _, rec := range recs {
-		if ctx.Err() != nil || attempts >= s.sweepBatch {
+		if ctx.Err() != nil {
 			return
 		}
 		tileMissing, tileErr := s.missing(rec.TileAsset)
@@ -791,31 +788,99 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 			s.log.Warn("artwork: could not check a cached image; it is not fetched again", "app_id", rec.AppID, "err", err)
 			continue
 		}
-		// A lost logo or icon puts an unlocked provider record back on backfillLogoIcon's queue.
-		if (logoMissing || iconMissing) && rec.Source == SourceProvider && !rec.Locked {
-			rec.LogoAsset, rec.IconAsset, rec.LogoIconChecked = "", "", false
-			if err := s.store.SaveLogoIcon(ctx, rec); err != nil {
+		if logoMissing || iconMissing {
+			// Never serve a URL to a missing file, whatever the lock; only the lost crop goes.
+			if err := s.store.DropLogoIcon(ctx, rec.AppID, logoMissing, iconMissing); err != nil {
 				s.log.Warn("artwork: could not clear a missing logo or icon", "app_id", rec.AppID, "err", err)
+				continue
 			}
+			if logoMissing {
+				rec.LogoAsset = ""
+			}
+			if iconMissing {
+				rec.IconAsset = ""
+			}
+			rec.LogoIconChecked = false
 		}
-		if !tileMissing && !heroMissing {
+		if !tileMissing && !heroMissing && !logoMissing && !iconMissing {
 			continue
 		}
 		if rec.ProviderRef == "" || rec.Provider != provider.Name() {
+			if !tileMissing && !heroMissing {
+				continue // a dropped logo or icon with nothing to fetch it from stays dropped
+			}
 			if _, seen := s.unrepairable.LoadOrStore(rec.AppID, struct{}{}); !seen {
 				s.log.Warn("artwork: a cached image is missing and has no provider reference to fetch it again from; upload or set it again",
 					"token", "artwork-image-unrecoverable", "app_id", rec.AppID, "source", rec.Source)
 			}
 			continue
 		}
-		attempts++
-		if err := s.repairOne(ctx, provider, rec, tileMissing, heroMissing); err != nil {
-			s.log.Info("artwork: could not fetch a missing cached image again; the next sweep retries",
-				"app_id", rec.AppID, "err", err)
+		// Only provider calls count against the batch; the drop above runs for every record.
+		if attempts >= s.sweepBatch {
 			continue
 		}
-		res.ArtworkRepaired++
+		attempts++
+		repaired := false
+		if logoMissing || iconMissing {
+			// On failure an unlocked provider record is still on backfillLogoIcon's queue.
+			if err := s.repairLogoIcon(ctx, provider, &rec, logoMissing, iconMissing); err != nil {
+				s.log.Info("artwork: could not fetch a missing logo or icon again", "app_id", rec.AppID, "err", err)
+			} else {
+				repaired = true
+			}
+		}
+		if tileMissing || heroMissing {
+			if err := s.repairOne(ctx, provider, rec, tileMissing, heroMissing); err != nil {
+				s.log.Info("artwork: could not fetch a missing cached image again; the next sweep retries",
+					"app_id", rec.AppID, "err", err)
+			} else {
+				repaired = true
+			}
+		}
+		if repaired {
+			res.ArtworkRepaired++
+		}
 	}
+}
+
+// repairLogoIcon fetches a record's lost logo or icon again from its own
+// reference, locked or not, as repairOne does for the tile and hero. The crop
+// still on disk is kept.
+func (s *Service) repairLogoIcon(ctx context.Context, provider Provider, rec *Record, logoMissing, iconMissing bool) error {
+	app, err := s.store.App(ctx, rec.AppID)
+	if err != nil {
+		return err
+	}
+	logoURL, iconURL, err := provider.LogoIcon(ctx, refSource(app, rec.ProviderRef), rec.ProviderRef)
+	if err != nil {
+		return err
+	}
+	next := *rec
+	if logoMissing {
+		if next.LogoAsset, err = s.cacheOne(ctx, logoURL); err != nil {
+			return fmt.Errorf("logo: %w", err)
+		}
+	}
+	if iconMissing {
+		if next.IconAsset, err = s.cacheOne(ctx, iconURL); err != nil {
+			return fmt.Errorf("icon: %w", err)
+		}
+	}
+	next.LogoIconChecked = true
+	if err := s.store.RepairLogoIcon(ctx, next); err != nil {
+		return err
+	}
+	*rec = next
+	return nil
+}
+
+// refSource is the external source to resolve ref by: the app's own when ref is
+// its external id (an appid match), else "" for the provider's own reference.
+func refSource(app appRef, ref string) string {
+	if app.ExternalSource != "" && app.ExternalID == ref {
+		return app.ExternalSource
+	}
+	return ""
 }
 
 // missing reports whether a recorded asset's file is gone; "" was never stored.

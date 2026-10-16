@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -578,7 +579,12 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 		if genres == nil {
 			genres = []string{}
 		}
-		tag, err := tx.Exec(ctx, `
+		// A savepoint per tile: a value Postgres refuses skips this tile, never the scan.
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return res, fmt.Errorf("backfill savepoint: %w", err)
+		}
+		tag, err := sp.Exec(ctx, `
 			UPDATE apps SET
 			       description = CASE WHEN description = '' THEN $4 ELSE description END,
 			       genres = CASE WHEN store_details_at IS NULL THEN $5::text[] ELSE genres END,
@@ -593,7 +599,14 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 			nullIfEmpty(det.Developer), nullIfEmpty(det.Publisher),
 			nullIfEmpty(det.ReleaseDate), nullIfEmpty(det.ControllerSupport))
 		if err != nil {
-			return res, fmt.Errorf("backfill tile: %w", err)
+			if rbErr := sp.Rollback(ctx); rbErr != nil {
+				return res, fmt.Errorf("backfill tile %s: %w (rollback: %v)", id, err, rbErr)
+			}
+			slog.Warn("library: a store value could not be stored; the tile is left as it was", "external_id", id, "err", err)
+			continue
+		}
+		if err := sp.Commit(ctx); err != nil {
+			return res, fmt.Errorf("backfill savepoint release: %w", err)
 		}
 		res.Backfilled += int(tag.RowsAffected())
 	}

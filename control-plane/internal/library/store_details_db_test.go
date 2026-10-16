@@ -111,3 +111,58 @@ func TestReconcileWithoutAnAnswerLeavesStoreDetailsUnwritten(t *testing.T) {
 		t.Fatalf("existing %v", existing)
 	}
 }
+
+// The fixture's NUL and invalid UTF-8 reach the database cleaned, and the scan commits.
+func TestReconcileStoresCleanedStoreText(t *testing.T) {
+	pool := testDB(t)
+	f := newFixture(t, pool)
+	ctx := context.Background()
+
+	det, ok, _ := fetchFixture(t, "nul", "620")
+	if !ok {
+		t.Fatal("not consulted")
+	}
+	tileID := f.seedDiscoveredTile(t, "620", "")
+	_, err := f.store.Reconcile(ctx, f.claimedScan(t, f.user), f.host,
+		[]ReportEntry{{ExternalID: "620", Name: "Portal 2"}}, map[string]AppDetail{"620": det}, testInterval)
+	must(t, err)
+	got := readStoreDetails(t, f, tileID)
+	if got.Description != "Portal" || !got.Written || *got.Developer != "Valve" || *got.ReleaseDate != "18 Apr, 2011" {
+		t.Fatalf("%+v", got)
+	}
+}
+
+// A value Postgres refuses skips that tile only: the scan still commits and the next tile
+// is still filled.
+func TestReconcileSurvivesAnUnstorableStoreValue(t *testing.T) {
+	pool := testDB(t)
+	f := newFixture(t, pool)
+	ctx := context.Background()
+
+	bad := f.seedDiscoveredTile(t, "620", "")
+	good := f.seedDiscoveredTile(t, "400", "")
+	scan := f.claimedScan(t, f.user)
+	res, err := f.store.Reconcile(ctx, scan, f.host,
+		[]ReportEntry{{ExternalID: "620", Name: "Portal 2"}, {ExternalID: "400", Name: "Portal"}},
+		map[string]AppDetail{
+			"620": {IsGame: true, ShortDescription: "nul\x00here", Developer: "Val\x00ve"},
+			"400": {IsGame: true, ShortDescription: "Fine.", Developer: "Valve"},
+		}, testInterval)
+	if err != nil {
+		t.Fatalf("an unstorable value failed the scan: %v", err)
+	}
+	if res.Backfilled != 1 {
+		t.Fatalf("Backfilled = %d, want 1", res.Backfilled)
+	}
+	if got := readStoreDetails(t, f, bad); got.Written || got.Description != "" {
+		t.Fatalf("bad tile %+v", got)
+	}
+	if got := readStoreDetails(t, f, good); !got.Written || got.Description != "Fine." {
+		t.Fatalf("good tile %+v", got)
+	}
+	var state string
+	must(t, pool.QueryRow(ctx, `SELECT state FROM library_scans WHERE id::text = $1`, scan).Scan(&state))
+	if state != "reported" {
+		t.Fatalf("scan state %q, want reported", state)
+	}
+}

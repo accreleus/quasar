@@ -142,7 +142,7 @@ func (a *AppDetails) fetchOne(ctx context.Context, id string) (AppDetail, bool) 
 	}
 	det := entry.Data.storeDetailsWire.parse()
 	det.IsGame = strings.EqualFold(entry.Data.Type, "game")
-	det.ShortDescription = strings.TrimSpace(entry.Data.ShortDescription)
+	det.ShortDescription = strings.TrimSpace(storableText(entry.Data.ShortDescription))
 	return det, true
 }
 
@@ -190,7 +190,7 @@ func (w storeDetailsWire) parse() AppDetail {
 	}
 	var cs string
 	if json.Unmarshal(w.ControllerSupport, &cs) == nil {
-		if cs = strings.ToLower(strings.TrimSpace(cs)); cs == "full" || cs == "partial" {
+		if cs = strings.ToLower(strings.TrimSpace(storableText(cs))); cs == "full" || cs == "partial" {
 			d.ControllerSupport = cs
 		}
 	}
@@ -212,9 +212,15 @@ func joinCredits(raw json.RawMessage) string {
 	return clipText(strings.Join(kept, ", "), maxCreditsLen)
 }
 
-// clipText trims s and cuts it to at most n runes.
+// storableText drops what Postgres TEXT refuses, NUL and invalid UTF-8: one such
+// string from Valve would otherwise fail the scan's transaction on every scan.
+func storableText(s string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(s, ""), "\x00", "")
+}
+
+// clipText makes s storable, trims it and cuts it to at most n runes.
 func clipText(s string, n int) string {
-	s = strings.TrimSpace(s)
+	s = strings.TrimSpace(storableText(s))
 	if r := []rune(s); len(r) > n {
 		s = strings.TrimSpace(string(r[:n]))
 	}

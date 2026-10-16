@@ -235,7 +235,7 @@ func (s *Store) AllApps(ctx context.Context) ([]appRef, error) {
 // sweep's check that each named file still exists (#441).
 func (s *Store) RecordsWithAssets(ctx context.Context) ([]Record, error) {
 	return s.records(ctx, `SELECT `+recordCols+`
-		FROM app_artwork WHERE tile_asset <> '' OR hero_asset <> ''
+		FROM app_artwork WHERE tile_asset <> '' OR hero_asset <> '' OR logo_asset <> '' OR icon_asset <> ''
 		ORDER BY updated_at`)
 }
 
@@ -271,6 +271,16 @@ func (s *Store) records(ctx context.Context, query string, args ...any) ([]Recor
 // URLs, only while the row is still the unlocked provider match that was read: an
 // admin override that landed meanwhile wins. It always bumps updated_at.
 func (s *Store) SaveLogoIcon(ctx context.Context, rec Record) error {
+	return s.setLogoIcon(ctx, rec, ` AND source = '`+SourceProvider+`' AND NOT locked`)
+}
+
+// RepairLogoIcon writes a lost logo or icon fetched again, locked record or not,
+// while the row still names the provider reference it was fetched by.
+func (s *Store) RepairLogoIcon(ctx context.Context, rec Record) error {
+	return s.setLogoIcon(ctx, rec, "")
+}
+
+func (s *Store) setLogoIcon(ctx context.Context, rec Record, guard string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("artwork: begin: %w", err)
@@ -279,8 +289,8 @@ func (s *Store) SaveLogoIcon(ctx context.Context, rec Record) error {
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE app_artwork SET logo_asset = $3, icon_asset = $4, logo_icon_checked = $5, updated_at = now()
-		WHERE app_id::text = $1 AND provider_ref = $2 AND source = '`+SourceProvider+`' AND NOT locked
-	`, rec.AppID, rec.ProviderRef, rec.LogoAsset, rec.IconAsset, rec.LogoIconChecked)
+		WHERE app_id::text = $1 AND provider_ref = $2`+guard,
+		rec.AppID, rec.ProviderRef, rec.LogoAsset, rec.IconAsset, rec.LogoIconChecked)
 	if err != nil {
 		return fmt.Errorf("artwork: save logo and icon: %w", err)
 	}
@@ -290,6 +300,30 @@ func (s *Store) SaveLogoIcon(ctx context.Context, rec Record) error {
 	if _, err := tx.Exec(ctx, `UPDATE apps SET logo_url = $2, icon_url = $3, updated_at = now() WHERE id::text = $1`,
 		rec.AppID, assetURLOrNil(rec.LogoAsset), assetURLOrNil(rec.IconAsset)); err != nil {
 		return fmt.Errorf("artwork: update app logo and icon urls: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// DropLogoIcon un-names a logo or icon whose file is gone, on any record, so no
+// URL points at a missing file. updated_at is left alone: an unlocked provider
+// record re-queued here keeps its place in LogoIconPending's oldest-first order.
+func (s *Store) DropLogoIcon(ctx context.Context, appID string, logo, icon bool) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("artwork: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		UPDATE app_artwork SET logo_asset = CASE WHEN $2 THEN '' ELSE logo_asset END,
+		       icon_asset = CASE WHEN $3 THEN '' ELSE icon_asset END, logo_icon_checked = false
+		WHERE app_id::text = $1`, appID, logo, icon); err != nil {
+		return fmt.Errorf("artwork: drop logo or icon: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE apps SET logo_url = CASE WHEN $2 THEN NULL ELSE logo_url END,
+		       icon_url = CASE WHEN $3 THEN NULL ELSE icon_url END
+		WHERE id::text = $1`, appID, logo, icon); err != nil {
+		return fmt.Errorf("artwork: drop logo or icon url: %w", err)
 	}
 	return tx.Commit(ctx)
 }

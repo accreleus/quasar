@@ -25,7 +25,8 @@ func logoCDN(t *testing.T) string {
 		}
 		return b.Bytes()
 	}
-	files := map[string][]byte{"/logo.png": encode(4, 1), "/icon.png": encode(2, 2)}
+	files := map[string][]byte{"/logo.png": encode(4, 1), "/icon.png": encode(2, 2),
+		"/logo2.png": encode(5, 1), "/tile2.png": encode(2, 3), "/hero2.png": encode(6, 2)}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		data, ok := files[r.URL.Path]
 		if !ok {
@@ -238,18 +239,162 @@ func TestOverridesKeepOrReplaceLogoAndIcon(t *testing.T) {
 	}
 }
 
-func TestSweepRefetchesALostLogo(t *testing.T) {
+func (h *harness) urls(t *testing.T, appID string) (logo, icon string) {
+	t.Helper()
+	l, i := h.logoIconURLs(t, appID)
+	if l != nil {
+		logo = *l
+	}
+	if i != nil {
+		icon = *i
+	}
+	return logo, icon
+}
+
+// lostLogoSetup resolves two apps with all four crops, makes the second an older
+// unchecked record ahead of the first in the backfill queue, deletes only the
+// first's logo file, and limits each sweep to one record.
+func lostLogoSetup(t *testing.T) (*harness, *fakeProvider, string, string, Record) {
+	h, fp, cdn := newLogoHarness(t)
+	ctx := context.Background()
+	first := appidApp(t, h, fp, cdn, "620")
+	older := appidApp(t, h, fp, cdn, "400")
+	fp.logoIcon["steam:400"] = [2]string{cdn + "/logo2.png", cdn + "/icon.png"} // its own logo file
+	h.svc.SweepOnce(ctx)
+	if _, err := h.pool.Exec(ctx, `UPDATE app_artwork SET logo_icon_checked = false, updated_at = now() - interval '1 hour'
+		WHERE app_id::text = $1`, older); err != nil {
+		t.Fatal(err)
+	}
+	rec := h.record(t, first)
+	if err := os.Remove(h.svc.blobs.pathFor(rec.LogoAsset)); err != nil {
+		t.Fatal(err)
+	}
+	h.svc.sweepBatch = 1
+	return h, fp, first, older, rec
+}
+
+// Only the lost crop goes, and it comes back in the same sweep from the record's
+// own reference, ahead of an older record waiting in the backfill queue.
+func TestLostLogoIsFetchedAgainAndTheIconKept(t *testing.T) {
+	h, _, first, _, before := lostLogoSetup(t)
+	ctx := context.Background()
+	logoURL, iconURL := h.urls(t, first)
+
+	res := h.svc.SweepOnce(ctx)
+	after := h.record(t, first)
+	if res.ArtworkRepaired != 1 || after.IconAsset != before.IconAsset || after.LogoAsset != before.LogoAsset ||
+		!after.LogoIconChecked || !h.cached(t, after.LogoAsset) {
+		t.Fatalf("result %+v\nbefore %+v\nafter %+v", res, before, after)
+	}
+	if l, i := h.urls(t, first); l != logoURL || i != iconURL {
+		t.Fatalf("urls %q %q, want %q %q", l, i, logoURL, iconURL)
+	}
+	if _, err := h.svc.PruneOrphans(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !h.cached(t, before.IconAsset) || !h.cached(t, before.LogoAsset) {
+		t.Fatal("the prune deleted a referenced logo or icon")
+	}
+}
+
+// With the provider down the lost logo's URL is dropped at once (never a URL to a
+// missing file), the icon is kept, and a later sweep fetches the logo again.
+func TestLostLogoThatCannotBeFetchedIsDroppedThenRefetched(t *testing.T) {
+	h, fp, first, _, before := lostLogoSetup(t)
+	ctx := context.Background()
+	_, iconURL := h.urls(t, first)
+	fp.logoIconErr = errTransient
+
+	h.svc.SweepOnce(ctx)
+	if l, i := h.urls(t, first); l != "" || i != iconURL {
+		t.Fatalf("urls %q %q: want the logo dropped and the icon %q kept", l, i, iconURL)
+	}
+	if rec := h.record(t, first); rec.LogoAsset != "" || rec.IconAsset != before.IconAsset || !h.cached(t, rec.IconAsset) {
+		t.Fatalf("%+v", rec)
+	}
+
+	fp.logoIconErr = nil
+	for range 3 { // two records in the queue, one per sweep
+		h.svc.SweepOnce(ctx)
+		if rec := h.record(t, first); rec.LogoAsset == before.LogoAsset && rec.IconAsset == before.IconAsset {
+			return
+		}
+	}
+	t.Fatalf("the dropped logo was not fetched again: %+v", h.record(t, first))
+}
+
+// Dropping costs no provider call, so it is not held back by the sweep's batch:
+// no record keeps a URL to a missing file past one sweep.
+func TestLostLogosAreDroppedBeyondTheSweepBatch(t *testing.T) {
+	h, fp, cdn := newLogoHarness(t)
+	ctx := context.Background()
+	a := appidApp(t, h, fp, cdn, "620")
+	b := appidApp(t, h, fp, cdn, "400") // same logo bytes: one file backs both
+	h.svc.SweepOnce(ctx)
+	if err := os.Remove(h.svc.blobs.pathFor(h.record(t, a).LogoAsset)); err != nil {
+		t.Fatal(err)
+	}
+	h.svc.sweepBatch = 1
+	fp.logoIconErr = errTransient
+
+	h.svc.SweepOnce(ctx)
+	for _, id := range []string{a, b} {
+		if l, i := h.urls(t, id); l != "" || i == "" {
+			t.Fatalf("%s: logo %q (want dropped), icon %q (want kept)", id, l, i)
+		}
+	}
+}
+
+// A locked record's lost logo is dropped and fetched again by its own reference,
+// as the tile and hero repair does; it stays locked.
+func TestLockedRecordLostLogoIsDroppedAndFetchedAgain(t *testing.T) {
 	h, fp, cdn := newLogoHarness(t)
 	ctx := context.Background()
 	appID := appidApp(t, h, fp, cdn, "620")
 	h.svc.SweepOnce(ctx)
-	rec := h.record(t, appID)
-	if err := os.Remove(h.svc.blobs.pathFor(rec.LogoAsset)); err != nil {
+	if _, err := h.pool.Exec(ctx, `UPDATE app_artwork SET source = 'manual', locked = true WHERE app_id::text = $1`, appID); err != nil {
 		t.Fatal(err)
 	}
+	before := h.record(t, appID)
+	lose := func() {
+		if err := os.Remove(h.svc.blobs.pathFor(before.LogoAsset)); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	res := h.svc.SweepOnce(ctx)
-	if res.LogoIconFilled != 1 || !h.cached(t, rec.LogoAsset) || fp.logoIconCalls != 2 {
-		t.Fatalf("result %+v, %d calls, logo present %v", res, fp.logoIconCalls, h.cached(t, rec.LogoAsset))
+	lose()
+	h.svc.SweepOnce(ctx)
+	after := h.record(t, appID)
+	if after.LogoAsset != before.LogoAsset || !h.cached(t, after.LogoAsset) || !after.Locked || after.Source != SourceManual {
+		t.Fatalf("before %+v\nafter %+v", before, after)
+	}
+
+	lose()
+	fp.logoIconErr = errTransient
+	h.svc.SweepOnce(ctx)
+	if l, i := h.urls(t, appID); l != "" || i == "" {
+		t.Fatalf("locked record serves logo %q (want none) icon %q", l, i)
+	}
+}
+
+func TestRematchReplacesAllFourCrops(t *testing.T) {
+	h, fp, cdn := newLogoHarness(t)
+	ctx := context.Background()
+	appID := appidApp(t, h, fp, cdn, "620")
+	h.svc.SweepOnce(ctx)
+	before := h.record(t, appID)
+
+	fp.artByExternal["steam:620"] = Candidate{Name: "Portal 2", TileURL: cdn + "/tile2.png", HeroURL: cdn + "/hero2.png"}
+	fp.logoIcon["steam:620"] = [2]string{cdn + "/logo2.png", ""}
+	after, err := h.svc.ResolveByID(ctx, appID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.TileAsset == before.TileAsset || after.HeroAsset == before.HeroAsset ||
+		after.LogoAsset == before.LogoAsset || after.LogoAsset == "" || after.IconAsset != "" {
+		t.Fatalf("before %+v\nafter %+v", before, after)
+	}
+	if l, i := h.urls(t, appID); l != AssetURL(after.LogoAsset) || i != "" {
+		t.Fatalf("urls %q %q", l, i)
 	}
 }
