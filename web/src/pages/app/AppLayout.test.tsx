@@ -457,6 +457,29 @@ describe("new design (no Classic layout pin)", () => {
       fireEvent.click(await within(dialog).findByRole("option", { name: /Portal 2/ }));
       await playHasFocusAndPLaunches();
     });
+
+    it("not on Back onto a search entry; a fresh pick still does", async () => {
+      renderApp("/app/library");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "Portal" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      const play = await screen.findByRole("button", { name: "Play" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+
+      const heart = screen.getByRole("button", { name: "Add Portal 2 to favourites" });
+      act(() => heart.focus());
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      await act(async () => {});
+      expect(document.activeElement).toBe(heart);
+
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "Enter" });
+      await playHasFocusAndPLaunches();
+    });
   });
 
   describe("a pick always opens the chosen game's page", () => {

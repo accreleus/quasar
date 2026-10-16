@@ -7,7 +7,7 @@
 // Only the per-game memory of the last launch comes from gameData.ts.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useLocation, useNavigate, useNavigationType } from "react-router-dom";
 import * as libraryApi from "../../../api/library";
 import { ApiError } from "../../../api/client";
 import type { App, ProfilePreferencesResponse, ProfilesResponse, Session } from "../../../api/types";
@@ -95,14 +95,18 @@ export function useGamePage(app: App) {
   /** undefined = still loading; null = the read failed. */
   const [prefs, setPrefs] = useState<ProfilePreferencesResponse | null | undefined>(undefined);
   const prefsSeq = useRef(0);
+  /** A read is in flight: the sheet's Play waits for it. */
+  const [prefsBusy, setPrefsBusy] = useState(false);
   const loadPrefs = useCallback(() => {
     if (!token) return;
     const seq = ++prefsSeq.current;
+    setPrefsBusy(true);
     libraryApi
       .getProfilePreferences(token)
       .then((p) => seq === prefsSeq.current && setPrefs(p))
       // A failed re-read keeps the last good read; only a failed first read is unknown.
-      .catch(() => seq === prefsSeq.current && setPrefs((old) => old ?? null));
+      .catch(() => seq === prefsSeq.current && setPrefs((old) => old ?? null))
+      .finally(() => seq === prefsSeq.current && setPrefsBusy(false));
   }, [token]);
   useEffect(() => {
     loadPrefs();
@@ -144,11 +148,13 @@ export function useGamePage(app: App) {
   const { commit } = selection;
 
   // A new seed (the preferences are re-read when Change opens) moves the selection,
-  // unless this game's own settings hold it. Nothing else is ever committed.
+  // unless this game's own settings hold it. Nothing else is ever committed. A pick
+  // the user made in the open sheet is theirs: the commit (which the draft follows) waits.
   const committed = selection.committed;
+  const edited = optionsOpen && Boolean(selection.draft && committed && !sameDraft(selection.draft, committed));
   useEffect(() => {
-    if (model && !remembered && committed && !sameDraft(committed, model.seed)) commit(model.seed);
-  }, [model, remembered]); // not on `committed`: only a seed change moves it
+    if (model && !remembered && !edited && committed && !sameDraft(committed, model.seed)) commit(model.seed);
+  }, [model, remembered, edited]); // not on `committed`: only a seed change moves it
 
   // Seed from the last launch of this game, once, after the band's own seed.
   const appliedRef = useRef(false);
@@ -206,8 +212,9 @@ export function useGamePage(app: App) {
 
   const play = useCallback(
     (next?: LaunchDraft | null) => {
-      const current = selection.committed;
-      if (!model || !current) return;
+      if (!model || !selection.committed) return;
+      // The seed, unless this game's own settings hold the selection (the commit can lag the seed while a pick is open).
+      const current = remembered ? selection.committed : model.seed;
       // A Play from Change that changed nothing is Play. A change is never
       // committed: a launch that works leaves the page, one that fails leaves Play as it was.
       const change = !locked && next && !sameDraft(next, current) ? next : null;
@@ -230,7 +237,7 @@ export function useGamePage(app: App) {
       if (oneClick && !change) void launch.launchApp(app);
       else void launch.launchApp(app, profileId, wireCodec);
     },
-    [model, selection.committed, locked, token, saved, app, launch, oneClick],
+    [model, selection.committed, remembered, locked, token, saved, app, launch, oneClick],
   );
 
   /** Back to the default selection, and forget this game's own settings. */
@@ -273,9 +280,11 @@ export function useGamePage(app: App) {
   const playRef = useRef<HTMLButtonElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
   const handOffRef = useRef<"arrived" | "waiting" | null>(null);
+  // Only a new arrival: Back or Forward onto that entry leaves focus where it is.
+  const navType = useNavigationType();
   useEffect(() => {
-    if (from === "search" || from === "palette") handOffRef.current = "arrived";
-  }, [from, location.key]);
+    if ((from === "search" || from === "palette") && navType !== "POP") handOffRef.current = "arrived";
+  }, [from, navType, location.key]);
   useEffect(() => {
     const h = handOffRef.current;
     if (!h) return;
@@ -295,6 +304,12 @@ export function useGamePage(app: App) {
     setOptionsOpen(false);
     requestAnimationFrame(() => changeRef.current?.focus());
   }, []);
+  // A re-read that locks the page takes the sheet away (its pick would not be sent) and shows the lock line.
+  useEffect(() => {
+    if (!locked || !optionsOpen) return;
+    setOptionsOpen(false);
+    requestAnimationFrame(() => playRef.current?.focus());
+  }, [locked, optionsOpen]);
 
   // ── Favourite (optimistic, as the home page does it) ────────────────────
   const toggleFavourite = useCallback(async () => {
@@ -382,6 +397,8 @@ export function useGamePage(app: App) {
     resetToRecommended,
     notes,
     optionsOpen,
+    /** The sheet's Play waits for the re-read Change started. */
+    checking: prefsBusy,
     openOptions: () => {
       setOptionsOpen(true);
       loadPrefs();

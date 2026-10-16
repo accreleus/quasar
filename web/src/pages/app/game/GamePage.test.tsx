@@ -4,7 +4,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { MemoryRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { GamePageRoute } from "./GamePage";
 import { DetailBand } from "../home/DetailBand";
 import { AuthContext, type AuthContextValue } from "../../../auth/context";
@@ -161,10 +161,22 @@ async function ready(path = "/app/game/a1") {
   await act(async () => {});
 }
 
-async function openChange() {
+/** Open Change; unless `checking`, wait for the preferences re-read it starts. */
+async function openChange(checking = false) {
   fireEvent.click(screen.getByRole("button", { name: /Change/ }));
   await waitFor(() => expect(screen.getByRole("dialog", { name: "Launch options for Portal 2" })).toBeTruthy());
-  return screen.getByRole("dialog", { name: "Launch options for Portal 2" });
+  const sheet = screen.getByRole("dialog", { name: "Launch options for Portal 2" });
+  if (!checking) await waitFor(() => expect(within(sheet).queryByRole("button", { name: "Checking…" })).toBeNull());
+  return sheet;
+}
+
+/** The next preferences read waits until `settle` is called. */
+function deferPrefs() {
+  let settle!: (over: Record<string, unknown>) => void;
+  mocked.getProfilePreferences.mockReturnValueOnce(
+    new Promise((r) => (settle = (over) => r({ ...prefsBase, ...over }))) as never,
+  );
+  return (over: Record<string, unknown>) => act(async () => settle(over));
 }
 
 const fetchSpy = vi.fn();
@@ -397,6 +409,71 @@ describe("game page", () => {
     expect(sent(0)).toEqual({ app_id: "a1", mic: true });
   });
 
+  it("the sheet's Play waits for the re-read Change starts: a click meanwhile sends nothing", async () => {
+    await ready();
+    const settle = deferPrefs();
+    const sheet = await openChange(true);
+    const sheetPlay = within(sheet).getByRole("button", { name: /^(Play now|Checking…)$/ });
+    expect(sheetPlay).toBeDisabled();
+    fireEvent.click(sheetPlay);
+    await act(async () => {});
+    expect(mocked.launchSession).not.toHaveBeenCalled();
+    await settle({ default_profile_id: "p-720" });
+    await waitFor(() => expect(sheetPlay).toBeEnabled());
+    expect(sheetPlay).toHaveTextContent("Play now");
+    fireEvent.click(sheetPlay);
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent()).toEqual({ app_id: "a1", mic: true });
+  });
+
+  it("a late re-read keeps a pick made in the sheet; with nothing picked, the sheet moves to the new seed", async () => {
+    mocked.getProfiles.mockResolvedValue(
+      response("p-1440", ...profiles.profiles, launchProfile("p-1080", [rung("1080-h264", "h264", 1080, 60, 10000)])) as never,
+    );
+    mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
+    await ready();
+    let settle = deferPrefs();
+    let sheet = await openChange(true);
+    fireEvent.click(within(sheet).getByRole("radio", { name: /720p/ }));
+    await settle({ default_profile_id: "p-1080" });
+    const playNow = () => within(sheet).getByRole("button", { name: "Play now" });
+    await waitFor(() => expect(playNow()).toBeEnabled());
+    expect(checked(sheet, "Resolution")).toMatch(/720p/);
+    fireEvent.click(playNow());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent(0)).toEqual({ app_id: "a1", mic: true, profile_id: "p-720" });
+    // Picking the new seed is Play: the server starts it with no profile sent.
+    await waitFor(() => expect(playNow()).toBeEnabled());
+    fireEvent.click(within(sheet).getByRole("radio", { name: /1080p/ }));
+    fireEvent.click(playNow());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(2));
+    expect(sent(1)).toEqual({ app_id: "a1", mic: true });
+
+    await waitFor(() => expect(playNow()).toBeEnabled());
+    fireEvent.click(within(sheet).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    settle = deferPrefs();
+    sheet = await openChange(true);
+    expect(checked(sheet, "Resolution")).toMatch(/1080p/);
+    await settle({ default_profile_id: "p-720" });
+    await waitFor(() => expect(checked(sheet, "Resolution")).toMatch(/720p/));
+  });
+
+  it("a re-read that turns overrides off closes the sheet, puts focus on Play, and Play sends no profile", async () => {
+    await ready();
+    const settle = deferPrefs();
+    const sheet = await openChange(true);
+    fireEvent.click(within(sheet).getByRole("radio", { name: /720p/ }));
+    await settle({ user_overrides_allowed: false });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(playButton()));
+    expect(screen.getByRole("button", { name: /Change/ })).toBeDisabled();
+    expect(recLine()).toBe("An admin has disabled user profile overrides.");
+    fireEvent.click(playButton());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent()).toEqual({ app_id: "a1", mic: true });
+  });
+
   it("when the preferences do not load, says so, sends no profile even for a risky recommendation, and Retry reads them again", async () => {
     mocked.getProfiles.mockResolvedValue(riskyRecommendation() as never);
     mocked.getProfilePreferences.mockRejectedValueOnce(new ApiError(500, "internal", "boom"));
@@ -580,11 +657,13 @@ describe("game page", () => {
     let resolve!: (v: unknown) => void;
     mocked.getProfiles.mockReturnValue(new Promise((r) => (resolve = r)) as never);
     render(
-      <MemoryRouter initialEntries={[{ pathname: "/app/game/a1", state: { from: "search" } }]}>
+      <MemoryRouter initialEntries={["/pick"]}>
         <AuthContext.Provider value={auth}>
           <LibraryCatalogProvider>
             <ToastProvider>
               <Routes>
+                {/* A pick pushes the page; Back or Forward onto it (a POP) is not an arrival. */}
+                <Route path="/pick" element={<Navigate to="/app/game/a1" state={{ from: "search" }} />} />
                 <Route path="/app/game/:id" element={<GamePageRoute />} />
               </Routes>
             </ToastProvider>

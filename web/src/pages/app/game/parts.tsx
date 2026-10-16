@@ -142,6 +142,7 @@ export function OptionsSheet({ g }: { g: GamePage }) {
           spec={selection.draftSpec}
           verdict={selection.draftVerdict}
           launching={g.launching}
+          checking={g.checking}
           waitingForSlot={g.waitingForSlot}
           waitingReason={g.waitingReason}
           closeRef={closeRef}
