@@ -83,6 +83,17 @@ pub(crate) fn container_home_from(
         .map(str::to_string)
 }
 
+/// The warm-up has no runtime preset, so it sets Big Picture itself: the Steam
+/// image no longer bakes in a UI mode (#724).
+fn warmup_env(container_home: &str) -> BTreeMap<String, String> {
+    // The mount is at the image's own home path, so HOME is a no-op for a
+    // well-formed image and a correction for one whose WorkingDir we fell back to.
+    BTreeMap::from([
+        ("HOME".to_string(), container_home.to_string()),
+        ("STEAM_STARTUP_FLAGS".to_string(), "-bigpicture".to_string()),
+    ])
+}
+
 impl WarmupHost for AgentWarmupHost {
     /// §3.3 step 4: `Config.Env HOME`, then `Config.WorkingDir`.
     ///
@@ -146,18 +157,12 @@ impl WarmupHost for AgentWarmupHost {
     }
 
     fn launch(&self, req: &WarmupLaunch) -> Result<Box<dyn WarmupSession>, String> {
-        let mut env = BTreeMap::new();
-        // The mount is at the image's own home path, so this is a no-op for a
-        // well-formed image and a correction for one whose WorkingDir we fell
-        // back to.
-        env.insert("HOME".to_string(), req.container_home.clone());
-
         let container = ContainerSpec {
             image: req.image.clone(),
-            // §1.4.4: the default `-bigpicture` CMD is what makes #484's `app
-            // presented` a usable completion gate.
+            // §1.4.4: Big Picture (set by `warmup_env`) is what makes #484's
+            // `app presented` a usable completion gate.
             args: Vec::new(),
-            env,
+            env: warmup_env(&req.container_home),
             mounts: vec![format!(
                 "{}:{}",
                 req.scratch_home.display(),
@@ -383,6 +388,14 @@ mod tests {
             mount,
             "/var/lib/quasar/templates/.staging/steam/scratch-home:/home/quasar"
         );
+    }
+
+    #[test]
+    fn a_warm_up_sets_big_picture_and_its_home_in_the_container_env() {
+        let env = warmup_env("/home/quasar");
+        assert_eq!(env.len(), 2);
+        assert_eq!(env["HOME"], "/home/quasar");
+        assert_eq!(env["STEAM_STARTUP_FLAGS"], "-bigpicture");
     }
 
     #[test]
