@@ -1,6 +1,7 @@
 // The stream line is labelled, names only what Play asks for (with no profile
 // sent it names nothing), and wraps only between groups; a game's own settings
 // get a "This game" marker and a one-press way back to the device recommendation.
+// Settings that did not load say so, with Retry in Change's place.
 
 import { Fragment } from "react";
 import { Chip } from "../../../components/Chip";
@@ -11,12 +12,21 @@ import type { GamePage } from "./useGamePage";
 
 export function StreamSettings({ g }: { g: GamePage }) {
   const r = g.ready ? g.selection.resolved : null;
+  const prefsFailed = g.locked === "prefs";
   const groups = !r
     ? null
+    : prefsFailed
+      ? ["Your stream settings didn't load"]
+      : g.oneClick
+        ? ["Default settings"]
+        : [resolutionLabel(r.height), `${r.fps} fps`, formatBitrate(r.bitrateKbps), ...(r.codec ? [codecLabel(r.codec)] : [])];
+  const chosenBy = prefsFailed
+    ? "(Play lets the server choose)"
     : g.oneClick
-      ? ["Default settings"]
-      : [resolutionLabel(r.height), `${r.fps} fps`, formatBitrate(r.bitrateKbps), ...(r.codec ? [codecLabel(r.codec)] : [])];
-  const chosenBy = g.oneClick ? "(chosen by the server at launch)" : r && !r.codec ? "(codec chosen by the server)" : null;
+      ? "(chosen by the server at launch)"
+      : r && !r.codec
+        ? "(codec chosen by the server)"
+        : null;
   const rec = g.recommended;
   return (
     <>
@@ -44,8 +54,8 @@ export function StreamSettings({ g }: { g: GamePage }) {
             )}
           </p>
         </div>
-        {g.profilesError ? (
-          <button type="button" className="btn btn-sm" onClick={g.notes.onRetryProfiles}>
+        {g.profilesError || prefsFailed ? (
+          <button type="button" className="btn btn-sm" onClick={g.profilesError ? g.notes.onRetryProfiles : g.retryPrefs}>
             Retry
           </button>
         ) : (
@@ -53,7 +63,7 @@ export function StreamSettings({ g }: { g: GamePage }) {
             type="button"
             ref={g.changeRef}
             className="btn btn-sm"
-            disabled={!g.model || g.locked}
+            disabled={!g.model || g.locked !== null}
             aria-haspopup="dialog"
             aria-expanded={g.optionsOpen}
             onClick={g.openOptions}

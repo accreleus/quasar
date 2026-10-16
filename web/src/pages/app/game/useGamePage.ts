@@ -1,10 +1,9 @@
 // The game page's state. Reuse, not a fork: profiles come from
 // GET /v1/me/profiles?app_id, the selection is the band's own useLaunchDraft
 // over optionsFor's model, and a launch goes through useLaunch.launchApp.
-// Play sends what Home's one-click Play sends (no profile: the server picks the
-// app's pin, the account default or the recommendation). Wherever one-click
-// would open the band instead it sends what the band sends, and a Play from
-// Change sends a profile only for a selection that differs from Play's.
+// What Play sends is launchPlan's: no profile wherever the server's own pick
+// streams here (as Home's one-click Play), otherwise what the band sends. A Play
+// from Change sends a profile only for a selection that differs from Play's.
 // Only the per-game memory of the last launch comes from gameData.ts.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -18,7 +17,6 @@ import { probeCodecs } from "../../../webrtc/capability";
 import {
   blockingReasons,
   defaultDraft,
-  isRecommendationEligible,
   optionsFor,
   resolveSelection,
   toWireCodec,
@@ -32,6 +30,7 @@ import { useLaunch } from "../home/useLaunch";
 import { useLaunchDraft } from "../home/useLaunchDraft";
 import { useLibraryExtras } from "../library/libraryExtras";
 import { clearGameSettings, getGameSettings, putGameSettings, type GameSettings } from "./gameData";
+import { launchPlan } from "./launchPlan";
 
 function isTypingTarget(t: EventTarget | null): boolean {
   const el = t as HTMLElement | null;
@@ -93,19 +92,28 @@ export function useGamePage(app: App) {
     void fetchProfiles({ id: appId });
   }, [fetchProfiles, appId]);
 
-  /** undefined = still loading; null = unavailable, read as overrides allowed and no defaults. */
+  /** undefined = still loading; null = the read failed. */
   const [prefs, setPrefs] = useState<ProfilePreferencesResponse | null | undefined>(undefined);
-  useEffect(() => {
+  const prefsSeq = useRef(0);
+  const loadPrefs = useCallback(() => {
     if (!token) return;
-    let live = true;
+    const seq = ++prefsSeq.current;
     libraryApi
       .getProfilePreferences(token)
-      .then((p) => live && setPrefs(p))
-      .catch(() => live && setPrefs(null));
-    return () => {
-      live = false;
-    };
+      .then((p) => seq === prefsSeq.current && setPrefs(p))
+      // A failed re-read keeps the last good read; only a failed first read is unknown.
+      .catch(() => seq === prefsSeq.current && setPrefs((old) => old ?? null));
   }, [token]);
+  useEffect(() => {
+    loadPrefs();
+    return () => {
+      prefsSeq.current++;
+    };
+  }, [loadPrefs]);
+  const retryPrefs = useCallback(() => {
+    setPrefs(undefined);
+    loadPrefs();
+  }, [loadPrefs]);
 
   /** undefined = still loading; null = nothing remembered. */
   const [saved, setSaved] = useState<GameSettings | null | undefined>(undefined);
@@ -120,27 +128,29 @@ export function useGamePage(app: App) {
 
   const loaded = typeof profiles === "object" && profiles !== null ? profiles : null;
   const profilesError = typeof profiles === "string" ? profiles : null;
-  const model = useMemo(() => {
+  const [remembered, setRemembered] = useState(false);
+  const planned = useMemo(() => {
     if (!loaded || prefs === undefined) return null;
     const m = optionsFor({ app, data: loaded, caps: codecCaps, isAdmin });
-    // Open on what a Play with no profile launches: the server's pick, in
-    // ResolveDefaultProfile's order (profile_preferences.go).
-    const auto = m.space.entriesByCodec.get("auto") ?? [];
-    const pick = [app.profile_policy === "inherit" ? null : app.default_profile_id, prefs?.default_profile_id, prefs?.global_default_profile_id]
-      .find((id) => id && auto.some((e) => e.profileId === id));
-    const usable = auto.some((e) => e.profileId === pick && e.eligibility !== "ineligible");
-    return pick && usable ? { ...m, seed: defaultDraft(m.space, pick) } : m;
-  }, [loaded, prefs, app, codecCaps, isAdmin]);
-  /** Policy leaves the choice to the server, which refuses any other profile (launcher.go): Play sends none, Change is off. */
-  const locked =
-    !isAdmin && !model?.pinnedProfileId && (app.profile_policy === "force" || prefs?.user_overrides_allowed === false);
+    const plan = launchPlan({ app, model: m, recommendedId: loaded.recommended_id, prefs, isAdmin, h264: codecCaps.h264, remembered });
+    return { plan, model: plan.seedId ? { ...m, seed: defaultDraft(m.space, plan.seedId) } : m };
+  }, [loaded, prefs, app, codecCaps, isAdmin, remembered]);
+  const model = planned?.model ?? null;
+  const locked = planned?.plan.locked ?? null;
+  const oneClick = planned?.plan.oneClick ?? false;
 
   const [optionsOpen, setOptionsOpen] = useState(false);
   const selection = useLaunchDraft(model, app, optionsOpen);
   const { commit } = selection;
 
+  // A new seed (the preferences are re-read when Change opens) moves the selection,
+  // unless this game's own settings hold it. Nothing else is ever committed.
+  const committed = selection.committed;
+  useEffect(() => {
+    if (model && !remembered && committed && !sameDraft(committed, model.seed)) commit(model.seed);
+  }, [model, remembered]); // not on `committed`: only a seed change moves it
+
   // Seed from the last launch of this game, once, after the band's own seed.
-  const [remembered, setRemembered] = useState(false);
   const appliedRef = useRef(false);
   useEffect(() => {
     if (!model || saved === undefined || appliedRef.current) return;
@@ -169,11 +179,14 @@ export function useGamePage(app: App) {
   const isRecommendation = selection.committed?.codec === "auto" && Boolean(resolved?.recommended);
   /** This game's own remembered settings are what Play will use. */
   const perGame = remembered && !isRecommendation && rec.tone === "ok";
-  /** Play sends no profile and no codec, as quickLaunch does. */
-  const oneClick = locked || (!remembered && codecCaps.h264 && loaded !== null && isRecommendationEligible(loaded));
   const recLabel = recommended ? `${resolutionLabel(recommended.height)} at ${recommended.fps} fps` : null;
   // With no profile sent the stream line says the server picks, so this line names no selection.
-  const oneClickText = locked ? "An admin has disabled user profile overrides." : recLabel && `The recommendation here is ${recLabel}.`;
+  const oneClickText =
+    locked === "forced"
+      ? "This game's settings are fixed by an admin."
+      : locked === "overrides"
+        ? "An admin has disabled user profile overrides."
+        : recLabel && `The recommendation here is ${recLabel}.`;
   const recText =
     remembered && !isRecommendation && rec.tone === "ok"
       ? `Your last settings for this game.${recLabel ? ` Recommended here: ${recLabel}.` : ""}`
@@ -254,24 +267,27 @@ export function useGamePage(app: App) {
         : "Play";
   const onPlay = isLive ? resume : () => play();
 
-  // A pick in the top-bar search or the palette leaves focus in the field (the
-  // palette hands it back there), where P would type: move it to Play, or to the
-  // title until Play is live.
+  // A pick in the top-bar search or the palette (this game again included) leaves
+  // focus in the field (the palette hands it back there), where P would type: move
+  // it to Play, or to the title until Play is live, and then on only if it is still there.
   const playRef = useRef<HTMLButtonElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
-  const handOffRef = useRef(false);
+  const handOffRef = useRef<"arrived" | "waiting" | null>(null);
   useEffect(() => {
-    if (from === "search" || from === "palette") handOffRef.current = true;
+    if (from === "search" || from === "palette") handOffRef.current = "arrived";
   }, [from, location.key]);
   useEffect(() => {
-    if (!handOffRef.current) return;
-    if (playDisabled) {
-      titleRef.current?.focus();
-      return;
+    const h = handOffRef.current;
+    if (!h) return;
+    if (optionsOpen) handOffRef.current = null;
+    else if (playDisabled) {
+      if (h === "arrived") titleRef.current?.focus();
+      handOffRef.current = "waiting";
+    } else {
+      handOffRef.current = null;
+      if (h === "arrived" || document.activeElement === titleRef.current) playRef.current?.focus();
     }
-    handOffRef.current = false;
-    if (document.activeElement === titleRef.current) playRef.current?.focus();
-  }, [playDisabled, location.key]);
+  }, [playDisabled, optionsOpen, location.key]);
 
   // ── Options sheet ─────────────────────────────────────────────────────────
   const changeRef = useRef<HTMLButtonElement>(null);
@@ -366,7 +382,11 @@ export function useGamePage(app: App) {
     resetToRecommended,
     notes,
     optionsOpen,
-    openOptions: () => setOptionsOpen(true),
+    openOptions: () => {
+      setOptionsOpen(true);
+      loadPrefs();
+    },
+    retryPrefs,
     closeOptions,
     changeRef,
     // launch

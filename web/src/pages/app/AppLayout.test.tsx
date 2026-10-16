@@ -435,6 +435,28 @@ describe("new design (no Classic layout pin)", () => {
       fireEvent.click(await within(dialog).findByRole("option", { name: /Portal 2/ }));
       await playHasFocusAndPLaunches();
     });
+
+    it("again for the game already open, from the top-bar search and from the palette", async () => {
+      renderApp("/app/library");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "Portal" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      const play = await screen.findByRole("button", { name: "Play" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+      expect(input).toHaveAttribute("aria-expanded", "false");
+
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "k", ctrlKey: true });
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByRole("combobox"), { target: { value: "Portal" } });
+      fireEvent.click(await within(dialog).findByRole("option", { name: /Portal 2/ }));
+      await playHasFocusAndPLaunches();
+    });
   });
 
   describe("a pick always opens the chosen game's page", () => {

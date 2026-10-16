@@ -145,6 +145,13 @@ const riskyRecommendation = () =>
     launchProfile("p-720", [rung("720-h264", "h264", 720, 60, 5000)]),
   );
 const sent = (i = 0) => mocked.launchSession.mock.calls[i][1];
+/** The usual menu plus a 4K profile this device cannot stream. */
+const withIneligible4k = () =>
+  response(
+    "p-1440",
+    ...profiles.profiles,
+    launchProfile("p-4k", [rung("4k-h264", "h264", 2160, 60, 40000)], "ineligible", [{ code: "decode_height_too_low", message: "" }]),
+  );
 
 /** Render the page and wait until Play is live. */
 async function ready(path = "/app/game/a1") {
@@ -274,6 +281,25 @@ describe("game page", () => {
     expect(sent(1)).toEqual({ app_id: "a1", mic: true });
   });
 
+  it("after a Change whose launch fails, a risky Play still sends the recommendation (nothing was committed)", async () => {
+    mocked.getProfiles.mockResolvedValue(riskyRecommendation() as never);
+    mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
+    await ready();
+    const sheet = await openChange();
+    fireEvent.click(within(sheet).getByRole("radio", { name: /720p/ }));
+    fireEvent.click(within(sheet).getByRole("button", { name: "Play now" }));
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent(0)).toEqual({ app_id: "a1", mic: true, profile_id: "p-720" });
+    await waitFor(() => expect(within(sheet).getByRole("button", { name: "Play now" })).toBeEnabled());
+    fireEvent.click(within(sheet).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    expect(line()).toBe("1440p · 60 fps · 20 Mbps (codec chosen by the server)");
+    fireEvent.click(playButton());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(2));
+    expect(sent(1)).toEqual({ app_id: "a1", mic: true, profile_id: "p-1440" });
+  });
+
   it("a preferred app opens Change on its pin: unchanged sends no profile, a change sends the pick", async () => {
     mocked.listApps.mockResolvedValue({ items: [{ ...game, profile_policy: "prefer", default_profile_id: "p-720" }] } as never);
     mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
@@ -299,6 +325,105 @@ describe("game page", () => {
     await ready();
     const sheet = await openChange();
     expect(checked(sheet, "Resolution")).toMatch(/720p/);
+  });
+
+  it("Play and an unchanged Change send no profile when the account default streams here; a change sends the pick", async () => {
+    policy({ default_profile_id: "p-720" });
+    mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
+    await ready();
+    expect(line()).toBe("Default settings (chosen by the server at launch)");
+    fireEvent.click(playButton());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent(0)).toEqual({ app_id: "a1", mic: true });
+
+    await waitFor(() => expect(playButton()).toBeEnabled());
+    const sheet = await openChange();
+    const playNow = () => within(sheet).getByRole("button", { name: "Play now" });
+    fireEvent.click(playNow());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(2));
+    expect(sent(1)).toEqual({ app_id: "a1", mic: true });
+
+    await waitFor(() => expect(playNow()).toBeEnabled());
+    fireEvent.click(within(sheet).getByRole("radio", { name: /1440p/ }));
+    fireEvent.click(playNow());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(3));
+    expect(sent(2)).toEqual({ app_id: "a1", mic: true, profile_id: "p-1440" });
+  });
+
+  it("an account default this device cannot stream: Play and an unchanged Change send the recommendation, as the band does", async () => {
+    mocked.getProfiles.mockResolvedValue(withIneligible4k() as never);
+    policy({ default_profile_id: "p-4k" });
+    mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
+    await ready();
+    expect(line()).toBe("1440p · 60 fps · 12 Mbps (codec chosen by the server)");
+    fireEvent.click(playButton());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent(0)).toEqual({ app_id: "a1", mic: true, profile_id: "p-1440" });
+
+    await waitFor(() => expect(playButton()).toBeEnabled());
+    const sheet = await openChange();
+    expect(checked(sheet, "Resolution")).toMatch(/1440p/);
+    fireEvent.click(within(sheet).getByRole("button", { name: "Play now" }));
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(2));
+    expect(sent(1)).toEqual(sent(0));
+  });
+
+  it("a risky account default is sent by id, so the launch is the one the line names", async () => {
+    mocked.getProfiles.mockResolvedValue(
+      response(
+        "p-1440",
+        ...profiles.profiles,
+        launchProfile("p-1080", [rung("1080-h264", "h264", 1080, 60, 10000)], "risky", [{ code: "bandwidth_too_low", message: "" }]),
+      ) as never,
+    );
+    policy({ default_profile_id: "p-1080" });
+    await ready();
+    expect(line()).toBe("1080p · 60 fps · 10 Mbps (codec chosen by the server)");
+    fireEvent.click(playButton());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalled());
+    expect(sent()).toEqual({ app_id: "a1", mic: true, profile_id: "p-1080" });
+  });
+
+  it("re-reads the preferences when Change opens, and opens on what the server would start now", async () => {
+    mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
+    await ready();
+    // Changed in another tab since this page loaded.
+    policy({ default_profile_id: "p-720" });
+    const sheet = await openChange();
+    await waitFor(() => expect(checked(sheet, "Resolution")).toMatch(/720p/));
+    expect(mocked.getProfilePreferences).toHaveBeenCalledTimes(2);
+    fireEvent.click(within(sheet).getByRole("button", { name: "Play now" }));
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent(0)).toEqual({ app_id: "a1", mic: true });
+  });
+
+  it("when the preferences do not load, says so, sends no profile even for a risky recommendation, and Retry reads them again", async () => {
+    mocked.getProfiles.mockResolvedValue(riskyRecommendation() as never);
+    mocked.getProfilePreferences.mockRejectedValueOnce(new ApiError(500, "internal", "boom"));
+    mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
+    await ready();
+    expect(line()).toBe("Your stream settings didn't load (Play lets the server choose)");
+    expect(screen.queryByRole("button", { name: /Change/ })).toBeNull();
+    fireEvent.click(playButton());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent(0)).toEqual({ app_id: "a1", mic: true });
+
+    await waitFor(() => expect(playButton()).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Change/ })).toBeEnabled());
+    expect(mocked.getProfilePreferences).toHaveBeenCalledTimes(2);
+    expect(line()).toBe("1440p · 60 fps · 20 Mbps (codec chosen by the server)");
+  });
+
+  it("a forced app whose pin cannot stream here says the game is fixed, offers no Change, and sends no profile", async () => {
+    mocked.getProfiles.mockResolvedValue(withIneligible4k() as never);
+    mocked.listApps.mockResolvedValue({ items: [{ ...game, profile_policy: "force", default_profile_id: "p-4k" }] } as never);
+    await ready();
+    expect(recLine()).toBe("This game's settings are fixed by an admin.");
+    expect(screen.getByRole("button", { name: /Change/ })).toBeDisabled();
+    fireEvent.click(playButton());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalled());
+    expect(sent()).toEqual({ app_id: "a1", mic: true });
   });
 
   it("a Change with a codec sends the profile and the codec, as the band does", async () => {
@@ -449,6 +574,31 @@ describe("game page", () => {
     await openChange();
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("an arrival from search waits on the title, and leaves a control the user moved to alone", async () => {
+    let resolve!: (v: unknown) => void;
+    mocked.getProfiles.mockReturnValue(new Promise((r) => (resolve = r)) as never);
+    render(
+      <MemoryRouter initialEntries={[{ pathname: "/app/game/a1", state: { from: "search" } }]}>
+        <AuthContext.Provider value={auth}>
+          <LibraryCatalogProvider>
+            <ToastProvider>
+              <Routes>
+                <Route path="/app/game/:id" element={<GamePageRoute />} />
+              </Routes>
+            </ToastProvider>
+          </LibraryCatalogProvider>
+        </AuthContext.Provider>
+      </MemoryRouter>,
+    );
+    const title = await screen.findByRole("heading", { level: 1, name: "Portal 2" });
+    await waitFor(() => expect(document.activeElement).toBe(title));
+    const heart = screen.getByRole("button", { name: "Add Portal 2 to favourites" });
+    act(() => heart.focus());
+    await act(async () => resolve(profiles));
+    await waitFor(() => expect(playButton()).toBeEnabled());
+    expect(document.activeElement).toBe(heart);
   });
 
   it("favourites from the hero", async () => {
