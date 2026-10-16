@@ -1,0 +1,21 @@
+[package]
+name = "quasar-launch-watch"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Steam launch detection core for the in-container launch helper, without GStreamer or CUDA"
+
+# This crate is linked by the launch helper, which runs inside an app container
+# next to untrusted game code. It must never depend on gstreamer*, glib or
+# anything CUDA, and it reads only what the watcher is pointed at: a /proc
+# root, Steam's console_log.txt and a caller-supplied window list.
+#
+# Every requirement below is written exactly as the agent writes it, so the
+# single workspace Cargo.lock resolves both to the same version and nothing
+# is bumped.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

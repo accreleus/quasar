@@ -1552,6 +1552,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "quasar-launch-watch"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "quasar-node-agent"
 version = "0.1.0"
 dependencies = [
