@@ -41,13 +41,18 @@ export function moveRovingFocus(dir: RoveDir, refs: RovingRefs): boolean {
   const railItems = Array.from(
     refs.railTrack?.querySelectorAll<HTMLButtonElement>(".home-feat-surface") ?? [],
   );
-  const tiles = Array.from(
-    refs.grids?.querySelectorAll<HTMLButtonElement>(".lib-tile-surface") ?? [],
-  );
+  // Letter sections (new design) are separate regions in reading order: they
+  // are one list on screen, but each starts a new row, so a flat list would
+  // step up/down by the wrong stride across a boundary.
+  const sections = Array.from(refs.grids?.querySelectorAll<HTMLElement>("[data-letter-section]") ?? []);
+  const sectioned = sections.length > 0;
+  const tileGroups = sectioned
+    ? sections.map((s) => Array.from(s.querySelectorAll<HTMLButtonElement>(".lib-tile-surface")))
+    : [Array.from(refs.grids?.querySelectorAll<HTMLButtonElement>(".lib-tile-surface") ?? [])];
   // Order is the model: rail above grid on screen. An empty region is dropped,
   // not kept as a zero-length row — in Library view the rail is unmounted, so
   // ArrowUp from the top row must find nothing.
-  const groups = [railItems, tiles].filter((g) => g.length > 0);
+  const groups = [railItems, ...tileGroups].filter((g) => g.length > 0);
   const railRegion = railItems.length > 0 ? 0 : -1;
 
   let from: RovingPos | null = null;
@@ -61,6 +66,7 @@ export function moveRovingFocus(dir: RoveDir, refs: RovingRefs): boolean {
     // The rail is one row by construction (flex track) — measuring it risks a
     // sub-pixel split. The grid uses measured `offsetTop` off the tile box, so
     // column count is irrelevant.
+    flow: sectioned && r !== railRegion,
     offsetTops: r === railRegion ? g.map(() => 0) : g.map((el) => tileBoxOf(el)?.offsetTop ?? 0),
     // Viewport centres, used only for the rail↔grid crossing ("down from this
     // card" lands under it); viewport not offset, since the rail scrolls.

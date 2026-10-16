@@ -44,6 +44,10 @@ import {
   type SettingItem,
 } from "./settingsSearch/settingsIndex";
 import { useDeviceSettings } from "./settingsSearch/useDeviceSettings";
+import { isGamePick, runGamePick, searchPaletteFuzzy } from "./paletteGames";
+import { useNewDesign, useNewSearch } from "../../settings/OverlayPreferencesContext";
+import { useLibrarySearch } from "../../pages/app/librarySearchContext";
+import { useLibraryExtras } from "../../pages/app/library/libraryExtras";
 
 /** One frozen empty list for every absent source, so an omitted prop does not
  *  churn the search memo on each render. */
@@ -82,6 +86,7 @@ export function CommandPalette({
   const { isAdmin } = useAuth();
   const { toggleTheme } = useTheme();
   const navigate = useNavigate();
+  const { setQuery: setLibraryQuery } = useLibrarySearch();
   const [query, setQuery] = useState("");
   const [sel, setSel] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -89,22 +94,25 @@ export function CommandPalette({
   /** Whatever had focus when the palette opened, owed it back on close. */
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
-  // Settings seam (new design only): settings join the results, the current
-  // place's first. Classic keeps the groups exactly as searchPalette returns them.
+  // Settings seam: settings join the results, the current place's first. It
+  // follows the stored choice (useNewSearch), so the console keeps it; the
+  // fuzzy game search is the redesigned library's and follows useNewDesign.
   const newDesign = useNewDesign();
+  const newSearch = useNewSearch();
+  const extras = useLibraryExtras();
   const { pathname } = useLocation();
-  const place = newDesign ? placeOf(pathname, isAdmin) : null;
+  const place = newSearch ? placeOf(pathname, isAdmin) : null;
   const devices = useDeviceSettings(open && place !== null && place.kind !== "admin");
   const shippedGroups = useMemo(
     () =>
-      searchPalette(query, {
+      (newDesign ? (q: string, s: Parameters<typeof searchPalette>[1]) => searchPaletteFuzzy(q, s, extras) : searchPalette)(query, {
         hosts: hosts ?? NONE,
         sessions: sessions ?? NONE,
         apps: apps ?? NONE,
         users: users ?? NONE,
         isAdmin,
       }),
-    [query, hosts, sessions, apps, users, isAdmin],
+    [query, hosts, sessions, apps, users, isAdmin, newDesign, extras],
   );
   const placeKey = place ? JSON.stringify(place) : "";
   const groups = useMemo(
@@ -171,14 +179,16 @@ export function CommandPalette({
     (item: PaletteItem | undefined) => {
       if (!item) return;
       onOpenChange(false);
+      const to = item.to;
       const reveal = (item as SettingItem).reveal;
-      if (item.action === "toggle-appearance") toggleTheme();
-      else if (item.to && reveal) {
-        if (item.to !== pathname) navigate(item.to);
+      if (newDesign && to && isGamePick(item, isAdmin)) runGamePick(item, setLibraryQuery, () => navigate(to));
+      else if (item.action === "toggle-appearance") toggleTheme();
+      else if (to && reveal) {
+        if (to !== pathname) navigate(to);
         revealWhenReady(reveal);
-      } else if (item.to) navigate(item.to);
+      } else if (to) navigate(to);
     },
-    [navigate, onOpenChange, toggleTheme, pathname],
+    [navigate, onOpenChange, toggleTheme, newDesign, isAdmin, setLibraryQuery, pathname],
   );
 
   /** Cycle focus inside the panel. Tab is handled outright rather than only

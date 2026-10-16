@@ -321,13 +321,23 @@ describe("OverlayPreferencesProvider", () => {
         expect(design()).toBeUndefined();
       });
 
-      it("is absent under /admin even though the hook reports the choice", async () => {
-        localStorage.setItem("quasar.ui.classic.u1", "1");
-        getUIPreferences.mockResolvedValue({ session_overlay: {}, classic_layout: true });
+      it("is absent under /admin, and the hook reports false there whatever the choice", async () => {
+        getUIPreferences.mockResolvedValue({ session_overlay: {} });
         mount("/admin/fleet");
         await waitFor(() => expect(getUIPreferences).toHaveBeenCalled());
         expect(design()).toBeUndefined();
         expect(nd()).toBe("false");
+      });
+
+      it("matches /admin the way the router does: case-insensitive, bare /admin too", async () => {
+        getUIPreferences.mockReturnValue(new Promise(() => {}));
+        for (const path of ["/admin", "/Admin/Fleet"]) {
+          const { unmount } = mount(path);
+          expect(nd()).toBe("false");
+          unmount();
+        }
+        mount("/administrator");
+        expect(nd()).toBe("true");
       });
 
       it("appears when navigating out of admin and goes away on entering it", async () => {
