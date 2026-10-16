@@ -75,6 +75,8 @@ beforeEach(() => {
   vi.resetAllMocks();
   mockedSetup.getSetupStatus.mockResolvedValue({ admin_exists: true, setup_completed: true });
   localStorage.clear();
+  // This file pins the classic shells; the new design has its own tests.
+  localStorage.setItem("quasar.ui.classic.u1", "1");
   document.body.removeAttribute("data-rail");
   mockedLibrary.listApps.mockResolvedValue({
     items: [

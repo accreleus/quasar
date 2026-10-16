@@ -1,0 +1,63 @@
+/* One search, in the top bar (new design). The .ss-* classes exist only in the
+   new design's markup, so classic renders none of this. */
+
+/* The chosen setting, lit for a moment after the palette takes you to it:
+   the selection violet, as a ring plus the soft fill a selected palette row uses. */
+.ss-hit {
+  transition: outline-color 0.24s ease, background-color 0.24s ease;
+  outline: 2px solid transparent;
+  outline-offset: var(--s1);
+}
+.ss-flash {
+  outline-color: var(--accent);
+  background-color: var(--accent-soft);
+}
+/* A whole section or card keeps its own surface: the ring alone says "here". */
+section.ss-flash,
+.card.ss-flash {
+  background-color: transparent;
+  outline-offset: var(--s2);
+}
+.ss-hit:not(section, .card) {
+  border-radius: var(--r-control);
+}
+@media (prefers-reduced-motion: reduce) {
+  .ss-hit { transition: none; }
+}
+
+/* The trigger's short label is for phones only. */
+.cmdk .ss-short {
+  display: none;
+}
+@media (max-width: 600px) {
+  .cmdk .ss-long {
+    display: none;
+  }
+  .cmdk .ss-short {
+    display: inline;
+  }
+}
+
+/* Phones: the palette is a full-width sheet under the top edge, its rows are touch
+   height, and the keyboard hints (meaningless on a touch screen) go. */
+@media (max-width: 600px) {
+  .ss-sheet.scrim-top {
+    padding-top: 0;
+    grid-template-columns: minmax(0, 1fr);
+    place-items: start stretch;
+  }
+  .ss-sheet .pal {
+    width: 100%;
+    border-top: 0;
+    border-radius: 0 0 var(--r-panel) var(--r-panel);
+  }
+  .ss-sheet .pal-list {
+    max-height: min(560px, 70dvh);
+  }
+  .ss-sheet .pal-item {
+    min-height: 44px;
+  }
+  .ss-sheet .pal-foot {
+    display: none;
+  }
+}

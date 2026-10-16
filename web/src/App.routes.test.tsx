@@ -98,9 +98,11 @@ function renderAt(entry: string) {
 }
 
 beforeEach(() => {
+  // These routes are the classic account tabs; the new design renders one page instead.
+  localStorage.setItem("quasar.ui.classic.u1", "1");
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } })),
+    vi.fn(async () => new Response('{"classic_layout":true}', { status: 200, headers: { "content-type": "application/json" } })),
   );
 });
 

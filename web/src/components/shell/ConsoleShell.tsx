@@ -17,6 +17,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { useLocation } from "react-router-dom";
 import { useAuth } from "../../auth/context";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
 import { CommandPalette } from "./CommandPalette";
 import {
   paletteScope,
@@ -27,6 +28,7 @@ import {
   type PaletteUser,
 } from "./paletteSearch";
 import { Rail } from "./Rail";
+import { placeOf, settingsShortLabel, settingsTriggerLabel } from "./settingsSearch/settingsIndex";
 import type { RailBadgeCounts, RailSection } from "./navTypes";
 import { TabBar } from "./TabBar";
 import { Topbar } from "./Topbar";
@@ -64,14 +66,17 @@ export function ConsoleShell({
 }) {
   const { pathname } = useLocation();
   const { isAdmin } = useAuth();
+  const newDesign = useNewDesign();
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [railOpen, setRailOpen] = useState(false);
 
   // The trigger names what this area actually handed the palette, so /admin and
   // /app/account promise different things from the same component.
+  // New design: the trigger also promises settings, worded for the place.
+  const area = newDesign ? placeOf(pathname, isAdmin).kind : null;
   const searchLabel = useMemo(
-    () => paletteTriggerLabel(paletteScope({ isAdmin, ...palette })),
-    [isAdmin, palette],
+    () => (area ? settingsTriggerLabel(area) : paletteTriggerLabel(paletteScope({ isAdmin, ...palette }))),
+    [isAdmin, palette, area],
   );
 
   // A followed link must not stay covered by the drawer it was tapped in.
@@ -93,6 +98,7 @@ export function ConsoleShell({
       <Topbar
         onOpenPalette={() => setPaletteOpen(true)}
         searchLabel={searchLabel}
+        searchShort={area ? settingsShortLabel(area) : undefined}
         onToggleRail={() => setRailOpen((v) => !v)}
         railOpen={railOpen}
       />

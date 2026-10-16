@@ -21,8 +21,9 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../../auth/context";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
 import { useTheme } from "../../settings/ThemeContext";
 import { IconSearch, ShellIcon } from "../icons";
 import {
@@ -35,6 +36,14 @@ import {
   type PaletteSession,
   type PaletteUser,
 } from "./paletteSearch";
+import { revealWhenReady } from "./settingsSearch/reveal";
+import {
+  arrangeWithSettings,
+  placeOf,
+  settingsPlaceholder,
+  type SettingItem,
+} from "./settingsSearch/settingsIndex";
+import { useDeviceSettings } from "./settingsSearch/useDeviceSettings";
 
 /** One frozen empty list for every absent source, so an omitted prop does not
  *  churn the search memo on each render. */
@@ -80,7 +89,13 @@ export function CommandPalette({
   /** Whatever had focus when the palette opened, owed it back on close. */
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
-  const groups = useMemo(
+  // Settings seam (new design only): settings join the results, the current
+  // place's first. Classic keeps the groups exactly as searchPalette returns them.
+  const newDesign = useNewDesign();
+  const { pathname } = useLocation();
+  const place = newDesign ? placeOf(pathname, isAdmin) : null;
+  const devices = useDeviceSettings(open && place !== null && place.kind !== "admin");
+  const shippedGroups = useMemo(
     () =>
       searchPalette(query, {
         hosts: hosts ?? NONE,
@@ -91,12 +106,19 @@ export function CommandPalette({
       }),
     [query, hosts, sessions, apps, users, isAdmin],
   );
+  const placeKey = place ? JSON.stringify(place) : "";
+  const groups = useMemo(
+    () => (place ? arrangeWithSettings(shippedGroups, query, place, devices) : shippedGroups),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `place` is rebuilt each render; placeKey is its value
+    [shippedGroups, query, placeKey, devices],
+  );
   // Derived from the sources actually handed down, not from the role alone —
   // see paletteScope. The account area gets the same palette with a shorter
   // promise, rather than an advert for three lists it does not hold.
   const placeholder = useMemo(
-    () => palettePlaceholder(paletteScope({ isAdmin, hosts, sessions, apps, users })),
-    [isAdmin, hosts, sessions, apps, users],
+    () => (place ? settingsPlaceholder(place.kind) : palettePlaceholder(paletteScope({ isAdmin, hosts, sessions, apps, users }))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- place.kind is the only part of `place` read
+    [isAdmin, hosts, sessions, apps, users, place?.kind],
   );
   const flat = useMemo(() => groups.flatMap((g) => g.items), [groups]);
   // Clamped rather than reset: the list shrinks under the cursor as you type.
@@ -149,10 +171,14 @@ export function CommandPalette({
     (item: PaletteItem | undefined) => {
       if (!item) return;
       onOpenChange(false);
+      const reveal = (item as SettingItem).reveal;
       if (item.action === "toggle-appearance") toggleTheme();
-      else if (item.to) navigate(item.to);
+      else if (item.to && reveal) {
+        if (item.to !== pathname) navigate(item.to);
+        revealWhenReady(reveal);
+      } else if (item.to) navigate(item.to);
     },
-    [navigate, onOpenChange, toggleTheme],
+    [navigate, onOpenChange, toggleTheme, pathname],
   );
 
   /** Cycle focus inside the panel. Tab is handled outright rather than only
@@ -178,7 +204,7 @@ export function CommandPalette({
 
   return (
     <div
-      className="scrim scrim-top"
+      className={place ? "scrim scrim-top ss-sheet" : "scrim scrim-top"}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onOpenChange(false);
       }}

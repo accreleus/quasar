@@ -29,6 +29,8 @@ mock back in.
 | # | The mock does | The rule is | Enforced by |
 |---|---|---|---|
 | 1 | Spacing values off the 4px scale (5, 6, 7, 9, 10, 11, 13, 14px…) copied between components | All padding, margin and gap use `--s1`…`--s10`. Ties round **up**, because text was too tight against borders; they round down only where rounding up widens or overflows a dense row (table cells horizontally, table-row chips, the HUD pill, the rail). | `spacing-scale` lint rule |
+| 2 | A tabbed account area: three rail rows, each with its own tab row. | **New design only, operator-approved from the UX lab (2026-10-16, #714):** one scrolling account page (`pages/app/account/onepage/`) with a rail row and a phone chip per section, sections editing in place, and devices grouped in use / not used in 90 days. The Classic layout switch has its own Appearance section. Classic layout keeps the tabs. | `AccountLayout` test |
+| 3 | A top-bar search that finds games and fleet objects only. | **New design only, operator-approved from the UX lab (2026-10-16, #714):** the palette also finds account settings, devices and, for admins in the console, admin pages and settings, current place first; choosing one lands on it focused and highlighted (`components/shell/settingsSearch/`). Classic layout keeps the previous palette. | `settingsIndex` and `CommandPalette` tests |
 
 *Owner to add: the unpolished v3 elements already identified. Each needs the mock
 behaviour, the replacement rule, and whether a lint rule can enforce it.*
