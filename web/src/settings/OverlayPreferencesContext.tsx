@@ -36,7 +36,7 @@ interface OverlayPreferencesValue {
   save: (next: SessionOverlayPreferences) => Promise<void>;
   error: string | null;
   /** The user opted back into the previous layout (`classic_layout`). Read it
-   *  through `useNewDesign()`, not directly. */
+   *  through `useNewDesign()` or `useNewSearch()`, not directly. */
   classicLayout: boolean;
   /** What `useNewDesign()` returns: the user's choice, forced off on /admin. */
   newDesign: boolean;
@@ -266,6 +266,12 @@ export function useOverlayPreferences(): OverlayPreferencesValue {
  *  is true. */
 export function useNewDesign(): boolean {
   return useOverlayPreferences().newDesign;
+}
+
+/** The stored choice with no /admin exception, for the top-bar search only: the
+ *  console is not redesigned, but its search finds admin pages and settings. */
+export function useNewSearch(): boolean {
+  return !useOverlayPreferences().classicLayout;
 }
 
 /** Layout-route wrapper: mounts the provider once for every authenticated

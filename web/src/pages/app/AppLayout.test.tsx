@@ -600,3 +600,39 @@ describe("command palette sources", () => {
     expect(await screen.findByRole("option", { name: /Portal 2/ })).toBeInTheDocument();
   });
 });
+
+// ── The account area in the new design ───────────────────────────────────────
+
+describe("account area, new design (no Classic layout pin)", () => {
+  beforeEach(() => {
+    localStorage.removeItem("quasar.ui.classic.u1");
+  });
+
+  it("keeps the tab bar and the user-menu route back to the library", async () => {
+    renderApp("/app/account");
+    const bar = await tabBarWhenReady();
+    expect(within(bar).getByRole("link", { name: "Account" })).toHaveClass("active");
+    expect(within(bar).getByRole("link", { name: "Library" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /tester/ }));
+    expect(screen.getByRole("menuitem", { name: "Game library" })).toHaveAttribute("href", "/app");
+  });
+
+  it("/app/storage lands on the one page with its Storage row lit", async () => {
+    renderApp("/app/storage");
+    const rail = await screen.findByRole("navigation", { name: "Account sections" });
+    await waitFor(() => expect(within(rail).getByRole("link", { name: "Storage" })).toHaveClass("active"));
+    expect(screen.getByRole("heading", { name: "Storage", level: 2 })).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Storage" })).toBeNull();
+  });
+
+  it("the palette carries the catalogue and the account settings into the account shell", async () => {
+    renderApp("/app/account/profile");
+    await screen.findByRole("navigation", { name: "Account sections" });
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    const box = await screen.findByPlaceholderText("Search settings and games");
+    fireEvent.change(box, { target: { value: "Portal" } });
+    expect(await screen.findByRole("option", { name: /Portal 2/ })).toBeInTheDocument();
+    fireEvent.change(box, { target: { value: "classic" } });
+    expect(await screen.findByRole("option", { name: /Classic layout/ })).toBeInTheDocument();
+  });
+});

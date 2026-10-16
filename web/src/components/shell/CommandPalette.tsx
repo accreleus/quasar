@@ -21,7 +21,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../../auth/context";
 import { useTheme } from "../../settings/ThemeContext";
 import { IconSearch, ShellIcon } from "../icons";
@@ -35,8 +35,16 @@ import {
   type PaletteSession,
   type PaletteUser,
 } from "./paletteSearch";
+import { revealWhenReady, useCancelRevealOnNavigation } from "./settingsSearch/reveal";
+import {
+  arrangeWithSettings,
+  placeOf,
+  settingsPlaceholder,
+  type SettingItem,
+} from "./settingsSearch/settingsIndex";
+import { useDeviceSettings } from "./settingsSearch/useDeviceSettings";
 import { searchPaletteFuzzy } from "./paletteGames";
-import { useNewDesign } from "../../settings/OverlayPreferencesContext";
+import { useNewDesign, useNewSearch } from "../../settings/OverlayPreferencesContext";
 import { useLibraryExtras } from "../../pages/app/library/libraryExtras";
 
 /** One frozen empty list for every absent source, so an omitted prop does not
@@ -83,9 +91,17 @@ export function CommandPalette({
   /** Whatever had focus when the palette opened, owed it back on close. */
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
+  // Settings seam: settings join the results, the current place's first. It
+  // follows the stored choice (useNewSearch), so the console keeps it; the
+  // fuzzy game search is the redesigned library's and follows useNewDesign.
   const newDesign = useNewDesign();
+  const newSearch = useNewSearch();
   const extras = useLibraryExtras();
-  const groups = useMemo(
+  const { pathname, key: locationKey } = useLocation();
+  useCancelRevealOnNavigation();
+  const place = newSearch ? placeOf(pathname, isAdmin) : null;
+  const devices = useDeviceSettings(open && place !== null && place.kind !== "admin");
+  const shippedGroups = useMemo(
     () =>
       (newDesign ? (q: string, s: Parameters<typeof searchPalette>[1]) => searchPaletteFuzzy(q, s, extras) : searchPalette)(query, {
         hosts: hosts ?? NONE,
@@ -96,12 +112,19 @@ export function CommandPalette({
       }),
     [query, hosts, sessions, apps, users, isAdmin, newDesign, extras],
   );
+  const placeKey = place ? JSON.stringify(place) : "";
+  const groups = useMemo(
+    () => (place ? arrangeWithSettings(shippedGroups, query, place, devices) : shippedGroups),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `place` is rebuilt each render; placeKey is its value
+    [shippedGroups, query, placeKey, devices],
+  );
   // Derived from the sources actually handed down, not from the role alone —
   // see paletteScope. The account area gets the same palette with a shorter
   // promise, rather than an advert for three lists it does not hold.
   const placeholder = useMemo(
-    () => palettePlaceholder(paletteScope({ isAdmin, hosts, sessions, apps, users })),
-    [isAdmin, hosts, sessions, apps, users],
+    () => (place ? settingsPlaceholder(place.kind) : palettePlaceholder(paletteScope({ isAdmin, hosts, sessions, apps, users }))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- place.kind is the only part of `place` read
+    [isAdmin, hosts, sessions, apps, users, place?.kind],
   );
   const flat = useMemo(() => groups.flatMap((g) => g.items), [groups]);
   // Clamped rather than reset: the list shrinks under the cursor as you type.
@@ -155,11 +178,17 @@ export function CommandPalette({
       if (!item) return;
       onOpenChange(false);
       const to = item.to;
+      const reveal = (item as SettingItem).reveal;
       if (item.action === "toggle-appearance") toggleTheme();
-      // `from` lets the game page's Back return here.
-      else if (to) navigate(to, to.startsWith("/app/game/") ? { state: { from: "palette" } } : undefined);
+      else if (to && reveal) {
+        if (to !== pathname) navigate(to);
+        revealWhenReady(reveal, locationKey, to !== pathname);
+      } else if (to) {
+        // `from` lets the game page's Back return here.
+        navigate(to, to.startsWith("/app/game/") ? { state: { from: "palette" } } : undefined);
+      }
     },
-    [navigate, onOpenChange, toggleTheme],
+    [navigate, onOpenChange, toggleTheme, pathname, locationKey],
   );
 
   /** Cycle focus inside the panel. Tab is handled outright rather than only
@@ -185,7 +214,7 @@ export function CommandPalette({
 
   return (
     <div
-      className="scrim scrim-top"
+      className={place ? "scrim scrim-top ss-sheet" : "scrim scrim-top"}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onOpenChange(false);
       }}

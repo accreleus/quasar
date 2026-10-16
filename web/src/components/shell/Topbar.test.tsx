@@ -59,4 +59,14 @@ describe("Topbar", () => {
     renderTopbar("admin", { onToggleRail: vi.fn(), railOpen: false });
     expect(screen.getByRole("button", { name: "Sections" })).toHaveAttribute("aria-expanded", "false");
   });
+
+  it("renders the label as bare text unless a short form is handed down", () => {
+    const { container } = renderTopbar("user");
+    expect(container.querySelector(".cmdk")?.querySelector("span")).toBeNull();
+
+    renderTopbar("user", { searchLabel: "Search settings and games…", searchShort: "Search settings…" });
+    const trigger = screen.getByRole("button", { name: "Search settings and games…" });
+    expect(trigger.querySelector(".ss-long")).toHaveTextContent("Search settings and games…");
+    expect(trigger.querySelector(".ss-short")).toHaveTextContent("Search settings…");
+  });
 });
