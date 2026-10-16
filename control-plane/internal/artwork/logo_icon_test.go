@@ -723,3 +723,41 @@ func TestUnlockedLogoFetchedIconFailed(t *testing.T) {
 		t.Fatalf("the backfill did not fetch the icon: %+v", rec)
 	}
 }
+
+// Seat B's repro: an unlocked record whose icon download failed loses its logo
+// file later. The repair fetches only the logo; the empty icon was not asked for,
+// so the record must stay on the backfill queue and the icon come back.
+func TestRepairOfOneCropDoesNotStrandAnEmptyOther(t *testing.T) {
+	h, fp, cdn := newLogoHarness(t)
+	ctx := context.Background()
+	appID := appidApp(t, h, fp, cdn, "620")
+	h.svc.SweepOnce(ctx)
+	before := h.record(t, appID)
+	lose := func(assets ...string) {
+		for _, a := range assets {
+			if err := os.Remove(h.svc.blobs.pathFor(a)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Logo back, icon failed: the icon is empty and the record is queued.
+	lose(before.LogoAsset, before.IconAsset)
+	fp.logoIcon["steam:620"] = [2]string{cdn + "/logo.png", cdn + "/gone.png"}
+	h.svc.SweepOnce(ctx)
+	if rec := h.record(t, appID); rec.IconAsset != "" || rec.LogoIconChecked {
+		t.Fatalf("setup: %+v", rec)
+	}
+
+	// The logo file is lost again while the provider now has the icon.
+	fp.logoIcon["steam:620"] = [2]string{cdn + "/logo.png", cdn + "/icon.png"}
+	lose(before.LogoAsset)
+	for range 2 {
+		h.svc.SweepOnce(ctx)
+	}
+	rec := h.record(t, appID)
+	if _, icon := h.urls(t, appID); rec.IconAsset != before.IconAsset || icon != AssetURL(before.IconAsset) ||
+		rec.LogoAsset != before.LogoAsset || !rec.LogoIconChecked {
+		t.Fatalf("the empty icon was stranded: %+v, icon url %q", rec, icon)
+	}
+}

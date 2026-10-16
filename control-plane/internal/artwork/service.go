@@ -845,7 +845,8 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 // refetch fetches rec's missing crops from its own reference and returns rec
 // with every crop that arrived (got: at least one did). One that failed stays
 // as it was, and the error says which; logo_icon_checked is set only once every
-// lost logo or icon is back or the provider says it has none.
+// lost logo or icon is back or the provider says it has none, and no logo or
+// icon is left empty unasked.
 func (s *Service) refetch(ctx context.Context, provider Provider, rec Record, tileMissing, heroMissing, logoGone, iconGone bool) (_ Record, got bool, _ error) {
 	app, err := s.store.App(ctx, rec.AppID)
 	if err != nil {
@@ -882,7 +883,7 @@ func (s *Service) refetch(ctx context.Context, provider Provider, rec Record, ti
 		if err != nil {
 			return rec, got, errors.Join(append(errs, err)...)
 		}
-		answered := true
+		pre, answered := rec, true
 		for _, c := range []struct {
 			gone  bool
 			url   string
@@ -901,7 +902,9 @@ func (s *Service) refetch(ctx context.Context, provider Provider, rec Record, ti
 			}
 			*c.asset, *c.lost, got = fresh, false, true
 		}
-		if answered {
+		// A crop left empty by an earlier failed download was not asked for here:
+		// the flag stays as it was, so the backfill asks for both.
+		if answered && (logoGone || pre.LogoAsset != "") && (iconGone || pre.IconAsset != "") {
 			rec.LogoIconChecked = true
 		}
 	}
