@@ -7,7 +7,9 @@ import { useMemo } from "react";
 import type { CSSProperties } from "react";
 import { Link, Navigate, useParams } from "react-router-dom";
 import type { App } from "../../../api/types";
+import { Button } from "../../../components/Button";
 import { useNewDesign } from "../../../settings/OverlayPreferencesContext";
+import { HomeState } from "../home/panels";
 import { useHeroPalette } from "../home/useHeroPalette";
 import { useLibraryCatalog } from "../libraryCatalog";
 import "../../../styles/home.css";
@@ -37,14 +39,25 @@ export interface OpenBandState {
 export function GamePageRoute() {
   const { id = "" } = useParams();
   const newDesign = useNewDesign();
-  const { apps, loading } = useLibraryCatalog();
+  const { apps, settled, error, reload } = useLibraryCatalog();
   if (!newDesign) return <Navigate to="/app" replace state={{ openApp: id } satisfies OpenBandState} />;
   const app = apps.find((a) => a.id === id);
   if (app) return <LaunchFirst key={app.id} app={app} />;
   return (
     <div className="home gp">
-      <div className="gp-missing" aria-busy={loading || undefined}>
-        {loading ? (
+      <div className="gp-missing" aria-busy={!settled || undefined}>
+        {error ? (
+          <HomeState
+            tone="error"
+            title="Your library didn't load"
+            body={<>The server didn't return your catalogue. It reported: “{error}”.</>}
+            action={
+              <Button variant="primary" onClick={reload}>
+                Try again
+              </Button>
+            }
+          />
+        ) : !settled ? (
           <p className="muted">Loading…</p>
         ) : (
           <>
@@ -83,7 +96,7 @@ function LaunchFirst({ app }: { app: App }) {
           <div className="d-inner gp-hero-inner">
             <BackButton onBack={g.back} />
             <div className="gp-hero-body">
-              <GameTitle name={app.name} logoUrl={x?.logo_url ?? null} pending={!g.extrasMap} />
+              <GameTitle name={app.name} logoUrl={x?.logo_url ?? null} />
               {meta && <p className="gp-meta">{meta}</p>}
               <LaunchBlock g={g} />
               {history && <p className="gp-history">{history}</p>}
@@ -102,11 +115,13 @@ function LaunchFirst({ app }: { app: App }) {
               <LastSession s={x.play.last_session} />
             </Section>
           )}
-          <Section title="About" className="gp-about">
-            {app.description && <p className="gp-desc">{app.description}</p>}
-            {x && <GenreChips genres={x.genres} />}
-            {x && <Credits extras={x} />}
-          </Section>
+          {(app.description || x) && (
+            <Section title="About" className="gp-about">
+              {app.description && <p className="gp-desc">{app.description}</p>}
+              {x && <GenreChips genres={x.genres} />}
+              {x && <Credits extras={x} />}
+            </Section>
+          )}
           {like.length > 0 && (
             <Section title="More like this" className="gp-wide">
               <TileRow apps={like} coverClassById={g.coverClassById} label="More like this" />

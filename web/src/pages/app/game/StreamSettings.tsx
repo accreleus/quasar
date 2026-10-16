@@ -1,6 +1,7 @@
-// The stream line is labelled, says the codec was chosen automatically instead
-// of "Auto · AV1", and wraps only between groups; a game's own settings get a
-// "This game" marker and a one-press way back to the device recommendation.
+// The stream line is labelled, names only what Play sends (a size or a codec the
+// server may not pick is never promised), and wraps only between groups; a
+// game's own settings get a "This game" marker and a one-press way back to the
+// device recommendation.
 
 import { Fragment } from "react";
 import { Chip } from "../../../components/Chip";
@@ -11,10 +12,12 @@ import type { GamePage } from "./useGamePage";
 
 export function StreamSettings({ g }: { g: GamePage }) {
   const r = g.ready ? g.selection.resolved : null;
-  const auto = g.selection.committed?.codec === "auto";
-  const groups = r
-    ? [resolutionLabel(r.height), `${r.fps} fps`, formatBitrate(r.bitrateKbps), codecLabel(r.entryCodec)]
-    : null;
+  const groups = !r
+    ? null
+    : g.oneClick
+      ? ["Default settings"]
+      : [resolutionLabel(r.height), `${r.fps} fps`, formatBitrate(r.bitrateKbps), ...(r.codec ? [codecLabel(r.codec)] : [])];
+  const chosenBy = g.oneClick ? "(chosen by the server at launch)" : r && !r.codec ? "(codec chosen by the server)" : null;
   const rec = g.recommended;
   return (
     <>
@@ -30,10 +33,10 @@ export function StreamSettings({ g }: { g: GamePage }) {
                     <span className="gp-stream-group">{i > 0 ? `· ${t}` : t}</span>
                   </Fragment>
                 ))}
-                {auto && (
+                {chosenBy && (
                   <>
                     {" "}
-                    <span className="gp-stream-auto">(chosen automatically)</span>
+                    <span className="gp-stream-auto">{chosenBy}</span>
                   </>
                 )}
               </>

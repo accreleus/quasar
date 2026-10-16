@@ -67,11 +67,22 @@ export function useHomeKeys({
       const onTile = activeEl?.classList.contains("lib-tile-surface") ?? false;
       const onRailCard = activeEl?.classList.contains("home-feat-surface") ?? false;
       if (!activeEl || (!onTile && !onRailCard)) return;
+      // Ctrl/Cmd+F and +P are the browser's find and print; a held key would toggle on every repeat.
+      const letter = !(e.ctrlKey || e.metaKey || e.altKey || e.repeat);
 
-      if (onFavourite && onTile && e.key.toLowerCase() === "f") {
+      // `F` is the keyboard route to a tile's heart, so a tile without one (a shelf tile) ignores it.
+      const tile = activeEl.closest(".lib-tile");
+      if (letter && onFavourite && onTile && e.key.toLowerCase() === "f" && tile?.querySelector(".tile-heart")) {
         e.preventDefault();
         const app = apps.find((a) => a.id === activeEl.getAttribute("data-app-id"));
-        if (app) onFavourite(app);
+        if (!app) return;
+        // An unfavourite under the Favourites filter drops the tile; keep focus in its row.
+        const row = [...(tile.parentElement?.querySelectorAll<HTMLElement>(".lib-tile-surface") ?? [])];
+        const at = row.indexOf(activeEl);
+        onFavourite(app);
+        requestAnimationFrame(() => {
+          if (!activeEl.isConnected) (row[at + 1] ?? row[at - 1])?.focus();
+        });
         return;
       }
 
@@ -82,7 +93,7 @@ export function useHomeKeys({
       // Dispatches on the card, not the app: a live card resumes, every other
       // card launches — resolving only the app would turn resume into launch
       // (the 409 the single-writer lock exists to prevent).
-      if (e.key.toLowerCase() === "p") {
+      if (letter && e.key.toLowerCase() === "p") {
         e.preventDefault();
         const appId = activeEl.getAttribute("data-app-id");
         const app = appId ? apps.find((a) => a.id === appId) : undefined;

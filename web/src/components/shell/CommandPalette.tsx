@@ -152,9 +152,10 @@ export function CommandPalette({
     (item: PaletteItem | undefined) => {
       if (!item) return;
       onOpenChange(false);
-      const to = paletteGameHref(item, isAdmin, newDesign) ?? item.to;
+      const gameHref = paletteGameHref(item, isAdmin, newDesign);
+      const to = gameHref ?? item.to;
       if (item.action === "toggle-appearance") toggleTheme();
-      else if (to) navigate(to);
+      else if (to) navigate(to, gameHref ? { state: { from: "palette" } } : undefined);
     },
     [navigate, onOpenChange, toggleTheme, isAdmin, newDesign],
   );

@@ -145,6 +145,59 @@ describe("Home, new design", () => {
     fireEvent.click(within(jump).getByRole("button", { name: "Celeste" }));
     expect(screen.getByTestId("path").textContent).toBe("/app/game/a3");
   });
+
+  it("leaves Ctrl/Cmd/Alt+F and a held F to the browser", async () => {
+    renderHome();
+    await waitForGrid();
+    const celeste = within(grid()).getByRole("button", { name: "Celeste" });
+    expect(celeste.getAttribute("aria-keyshortcuts")).toBe("F");
+    act(() => celeste.focus());
+    for (const mod of [{ ctrlKey: true }, { metaKey: true }, { altKey: true }, { repeat: true }]) {
+      expect(fireEvent.keyDown(celeste, { key: "f", ...mod })).toBe(true); // not default-prevented
+    }
+    expect(fireEvent.keyDown(celeste, { key: "p", ctrlKey: true })).toBe(true);
+    expect(mocked.favouriteApp).not.toHaveBeenCalled();
+    expect(mocked.getProfiles).not.toHaveBeenCalled();
+  });
+
+  it("ignores F on a shelf tile, which shows no heart", async () => {
+    renderHome();
+    await waitForGrid();
+    const shelfTile = within(screen.getByRole("region", { name: "Favourites" })).getByRole("button", { name: "Hades" });
+    act(() => shelfTile.focus());
+    fireEvent.keyDown(shelfTile, { key: "f" });
+    expect(mocked.unfavouriteApp).not.toHaveBeenCalled();
+  });
+
+  it("keeps focus in the grid when F drops a tile from the Favourites filter", async () => {
+    mocked.listApps.mockResolvedValue({
+      items: [app("a1", "Portal 2", { favourite: true }), app("a2", "Hades", { favourite: true }), app("a3", "Celeste")],
+    } as never);
+    renderHome();
+    await waitForGrid();
+    fireEvent.click(screen.getByRole("tab", { name: "Favourites" }));
+    await waitFor(() => expect(grid().querySelectorAll(".lib-tile")).toHaveLength(2));
+    const hades = within(grid()).getByRole("button", { name: "Hades" });
+    act(() => hades.focus());
+    fireEvent.keyDown(hades, { key: "f" });
+    await waitFor(() => expect(mocked.unfavouriteApp).toHaveBeenCalledWith("tok", "a2"));
+    await waitFor(() => expect(document.activeElement?.getAttribute("aria-label")).toBe("Portal 2"));
+  });
+
+  it("opens the game's page, not the band, where one-click Play cannot launch", async () => {
+    renderHome();
+    await waitForGrid();
+    fireEvent.click(within(grid()).getByRole("button", { name: "Play Portal 2" }));
+    await waitFor(() => expect(screen.getByTestId("path").textContent).toBe("/app/game/a1"));
+    expect(document.querySelector(".detail")).toBeNull();
+    expect(mocked.launchSession).not.toHaveBeenCalled();
+  });
+
+  it("gives a Classic redirect back to the game page when the switch has flipped", async () => {
+    renderHome({ openApp: "a3" });
+    await waitFor(() => expect(screen.getByTestId("path").textContent).toBe("/app/game/a3"));
+    expect(document.querySelector(".detail")).toBeNull();
+  });
 });
 
 describe("Home, Classic layout", () => {

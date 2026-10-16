@@ -188,13 +188,18 @@ export function AppHomeNext() {
     viewKey: `${view}|${kindFilter}|${search}`,
     smoothScroll: !prefersReducedMotion(),
   });
+  // New design opens a game's page; the band stays for Classic layout.
+  const openGamePage = useCallback(
+    (app: App) => navigate(`/app/game/${app.id}`, { state: { from: "home" } }),
+    [navigate],
+  );
   const launch = useLaunch({
     token,
     apps,
     liveSession,
     canDecodeH264: codecCaps.h264,
     fetchProfiles: detail.fetchProfiles,
-    revealDetail: detail.reveal,
+    revealDetail: newDesign ? openGamePage : detail.reveal,
   });
   const busy = launch.launching || launch.resolvingId !== null;
 
@@ -324,21 +329,19 @@ export function AppHomeNext() {
   });
 
   const openApp = openId ? appById.get(openId) ?? null : null;
-  // New design opens a game's page; the band stays for Classic layout.
-  const openGamePage = useCallback(
-    (app: App) => navigate(`/app/game/${app.id}`, { state: { from: "home" } }),
-    [navigate],
-  );
 
-  // A game-page URL under Classic layout lands here asking for that game's band.
+  // A game-page URL under Classic layout lands here asking for that game's band;
+  // if the switch has flipped back meanwhile, the page gets the URL back.
   const wantedId = location.state?.openApp;
   const wanted = wantedId ? appById.get(wantedId) : undefined;
   const { reveal } = detail;
   useEffect(() => {
-    if (!wanted) return;
-    reveal(wanted, false);
-    navigate("/app", { replace: true, state: null });
-  }, [wanted, reveal, navigate]);
+    if (wantedId && newDesign) navigate(`/app/game/${wantedId}`, { replace: true });
+    else if (wanted) {
+      reveal(wanted, false);
+      navigate("/app", { replace: true, state: null });
+    }
+  }, [wantedId, wanted, newDesign, reveal, navigate]);
 
   const renderDetail = useCallback(
     (app: App): ReactNode =>

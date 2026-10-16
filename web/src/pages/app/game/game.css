@@ -81,9 +81,6 @@
   text-wrap: balance;
   margin: 0;
 }
-.gp-title[data-pending] {
-  opacity: 0;
-}
 .gp-title-logo {
   line-height: 0;
 }

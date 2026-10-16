@@ -159,6 +159,7 @@ export function LibraryTile({
           aria-label={app.name}
           aria-expanded={opensPage ? undefined : isOpen}
           aria-controls={opensPage ? undefined : detailId}
+          aria-keyshortcuts={onFavourite ? "F" : undefined}
           onClick={onOpen}
           ref={tileRef}
         >

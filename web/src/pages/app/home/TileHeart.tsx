@@ -13,7 +13,6 @@ export function TileHeart({ name, on, onToggle }: { name: string; on: boolean; o
       className="tile-heart"
       tabIndex={-1}
       aria-pressed={on}
-      aria-keyshortcuts="F"
       aria-label={on ? `Remove ${name} from favourites` : `Add ${name} to favourites`}
       title={on ? "Remove from favourites (F)" : "Add to favourites (F)"}
       onClick={onToggle}

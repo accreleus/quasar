@@ -38,7 +38,7 @@ export function HeroArt({ app, hero, coverClass }: { app: App; hero: HeroArtStat
  * The game's name as its logo when the logo reads on the scrim, else as text.
  * Either way it is one h1 named after the game (the logo's alt is the name).
  */
-export function GameTitle({ name, logoUrl, pending }: { name: string; logoUrl: string | null; pending: boolean }) {
+export function GameTitle({ name, logoUrl }: { name: string; logoUrl: string | null }) {
   const [state, setState] = useState<"checking" | "logo" | "text">(logoUrl ? "checking" : "text");
   const imgRef = useRef<HTMLImageElement>(null);
   useEffect(() => setState(logoUrl ? "checking" : "text"), [logoUrl]);
@@ -49,9 +49,7 @@ export function GameTitle({ name, logoUrl, pending }: { name: string; logoUrl: s
   }, [state]);
   if (state === "text" || !logoUrl)
     return (
-      <h1 className="gp-title" data-pending={pending || undefined}>
-        {name}
-      </h1>
+      <h1 className="gp-title">{name}</h1>
     );
   return (
     <h1 className="gp-title gp-title-logo" data-state={state}>
@@ -265,7 +263,7 @@ export function TileRow({ apps, coverClassById, label }: { apps: App[]; coverCla
     <ul className="gp-tiles" aria-label={label}>
       {apps.map((a) => (
         <li key={a.id}>
-          <Link to={`/app/game/${a.id}`} className="gp-tile">
+          <Link to={`/app/game/${a.id}`} state={{ from: "game" }} className="gp-tile">
             <span className={`cover ${coverClassById.get(a.id) ?? "cv-violet"}`} aria-hidden>
               <span className="glyph">{appGlyph(a.name)}</span>
               {a.cover_url && (

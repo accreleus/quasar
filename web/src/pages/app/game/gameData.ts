@@ -1,12 +1,7 @@
 // Game-page data the control-api contract does not carry yet: logo art, genres
 // and credits, per-user play history, the last session's delivery, and per-game
-// stream settings. The paths are proposals, not contract: until the control
-// plane serves them every read below degrades to "nothing known" and the page
-// shows what the catalogue already holds.
-
-import { useEffect, useState } from "react";
-import { apiFetch } from "../../../api/client";
-import { useAuth } from "../../../auth/context";
+// stream settings. Until it does (issue #720) every source below yields nothing
+// and sends no request, and the page shows what the catalogue already holds.
 
 export interface GameSessionStats {
   started_at: string;
@@ -44,27 +39,9 @@ export interface GameExtras {
 
 export type ExtrasMap = Record<string, GameExtras>;
 
-let cache: Promise<ExtrasMap> | null = null;
-
-/** Fetched once per page; `null` until it lands, `{}` when the server has none. */
+/** Null until the control-api carries these facts (issue #720). */
 export function useGameExtras(): ExtrasMap | null {
-  const { token } = useAuth();
-  const [data, setData] = useState<ExtrasMap | null>(null);
-  useEffect(() => {
-    if (!token) return;
-    cache ??= apiFetch<ExtrasMap>("/lab/extras", { token }).catch(() => ({}));
-    let live = true;
-    void cache.then((d) => live && setData(d));
-    return () => {
-      live = false;
-    };
-  }, [token]);
-  return data;
-}
-
-/** Drop the cached extras after a launch moves "last played". */
-export function invalidateGameExtras(): void {
-  cache = null;
+  return null;
 }
 
 // ── Per-game stream settings ────────────────────────────────────────────────
@@ -79,16 +56,18 @@ export interface GameSettings {
   updated_at?: string;
 }
 
-export function getGameSettings(token: string, appId: string): Promise<GameSettings | null> {
-  return apiFetch<GameSettings>(`/lab/game-settings/${encodeURIComponent(appId)}`, { token }).catch(() => null);
+// Per-game stream settings have no control-api home yet (issue #720): nothing is
+// read or written, so the page always opens on the device recommendation.
+export function getGameSettings(_token: string, _appId: string): Promise<GameSettings | null> {
+  return Promise.resolve(null);
 }
 
-export function putGameSettings(token: string, appId: string, s: GameSettings): Promise<GameSettings> {
-  return apiFetch<GameSettings>(`/lab/game-settings/${encodeURIComponent(appId)}`, { method: "PUT", body: s, token });
+export function putGameSettings(_token: string, _appId: string, s: GameSettings): Promise<GameSettings> {
+  return Promise.resolve(s);
 }
 
-export function clearGameSettings(token: string, appId: string): Promise<void> {
-  return apiFetch<void>(`/lab/game-settings/${encodeURIComponent(appId)}`, { method: "DELETE", token });
+export function clearGameSettings(_token: string, _appId: string): Promise<void> {
+  return Promise.resolve();
 }
 
 // ── Formatting shared by the experiments ────────────────────────────────────

@@ -1,6 +1,10 @@
 // The game page's state. Reuse, not a fork: profiles come from
 // GET /v1/me/profiles?app_id, the selection is the band's own useLaunchDraft
 // over optionsFor's model, and a launch goes through useLaunch.launchApp.
+// Play sends what Home's one-click Play sends (no profile: the server picks the
+// app's pin, the account default or the recommendation). Wherever one-click
+// would open the band instead, and after a Play from Change, it sends what the
+// band sends.
 // Only the per-game memory of the last launch and the play history come from
 // gameData.ts.
 
@@ -14,6 +18,7 @@ import { useToast } from "../../../components/Toast";
 import { probeCodecs } from "../../../webrtc/capability";
 import {
   blockingReasons,
+  isRecommendationEligible,
   optionsFor,
   resolveSelection,
   toWireCodec,
@@ -22,13 +27,12 @@ import {
 } from "../launchOptions";
 import { LIVE_STATES, blockedFamilyIds, coverClassAt, familyRootApp } from "../libraryGrid";
 import { useLibraryCatalog } from "../libraryCatalog";
-import { formatBitrate, recommendation, resolutionLabel } from "../home/launchOptionRules";
+import { recommendation, resolutionLabel } from "../home/launchOptionRules";
 import { useLaunch } from "../home/useLaunch";
 import { useLaunchDraft } from "../home/useLaunchDraft";
 import {
   clearGameSettings,
   getGameSettings,
-  invalidateGameExtras,
   putGameSettings,
   useGameExtras,
   type GameSettings,
@@ -129,7 +133,7 @@ export function useGamePage(app: App) {
     setRemembered(true);
   }, [model, saved, commit]);
 
-  const ready = Boolean(model || profilesError) && saved !== undefined;
+  const ready = Boolean(model || profilesError);
   const resolved = selection.resolved;
   const isDeadEnd = Boolean(loaded) && !profilesError && (!resolved || resolved.eligibility === "ineligible");
   const recommended = (model?.space.entriesByCodec.get("auto") ?? []).find((e) => e.recommended) ?? null;
@@ -148,16 +152,11 @@ export function useGamePage(app: App) {
       ? `Your last settings for this game.${recommended ? ` Recommended here: ${resolutionLabel(recommended.height)} at ${recommended.fps} fps.` : ""}`
       : rec.text;
 
-  /** "1440p · 120 fps · 25 Mbps · Auto · AV1", or null until it is known. */
-  const sentence =
-    ready && resolved
-      ? [
-          resolutionLabel(resolved.height),
-          `${resolved.fps} fps`,
-          formatBitrate(resolved.bitrateKbps),
-          selection.spec.codec,
-        ].join(" · ")
-      : null;
+  /** A Play from Change sends its selection from then on. */
+  const [changed, setChanged] = useState(false);
+  /** Play sends no profile and no codec, as quickLaunch does. */
+  const oneClick =
+    !changed && !remembered && codecCaps.h264 && loaded !== null && isRecommendationEligible(loaded);
 
   // ── Launch ────────────────────────────────────────────────────────────────
   const launch = useLaunch({
@@ -176,6 +175,7 @@ export function useGamePage(app: App) {
       const r = resolveSelection(model.space, chosen);
       if (!r) return;
       commit(chosen);
+      if (next) setChanged(true);
       const wireCodec = chosen.codec === "auto" || r.codec === null ? undefined : toWireCodec(r.codec);
       const profileId = model.pinnedProfileId ?? r.profileId;
       // Remember what was launched, unless it is just the device's recommendation.
@@ -189,10 +189,10 @@ export function useGamePage(app: App) {
           : putGameSettings(token, app.id, { profile_id: profileId, codec: wireCodec, source: "remembered" });
         void write?.catch(() => {});
       }
-      invalidateGameExtras();
-      void launch.launchApp(app, profileId, wireCodec);
+      if (oneClick && !next) void launch.launchApp(app);
+      else void launch.launchApp(app, profileId, wireCodec);
     },
-    [model, selection.committed, commit, token, saved, app, launch],
+    [model, selection.committed, commit, token, saved, app, launch, oneClick],
   );
 
   /** Back to the device recommendation, and forget this game's own settings. */
@@ -257,7 +257,7 @@ export function useGamePage(app: App) {
   // ── Keys: P plays, Escape closes the sheet ──────────────────────────────
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
       if (e.key === "Escape" && optionsOpen) {
         e.preventDefault();
         closeOptions();
@@ -314,7 +314,7 @@ export function useGamePage(app: App) {
     model,
     profilesError,
     selection,
-    sentence,
+    oneClick,
     rec: { tone: rec.tone, text: recText },
     perGame,
     recommended,

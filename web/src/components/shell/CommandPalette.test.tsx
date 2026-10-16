@@ -258,3 +258,35 @@ describe("CommandPalette result semantics", () => {
     }
   });
 });
+
+describe("CommandPalette for a player, new design", () => {
+  it("opens a game's page with where it came from, so the page's Back returns there", async () => {
+    function State() {
+      return <span data-testid="state">{JSON.stringify(useLocation().state)}</span>;
+    }
+    function PlayerHarness() {
+      const [open, setOpen] = useState(true);
+      return (
+        <>
+          <CommandPalette open={open} onOpenChange={setOpen} apps={apps} />
+          <Routes>
+            <Route path="*" element={<><Where /><State /></>} />
+          </Routes>
+        </>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/app"]}>
+        <AuthContext.Provider value={{ ...auth, isAdmin: false, user: { ...auth.user!, role: "user" } }}>
+          <ThemeProvider>
+            <PlayerHarness />
+          </ThemeProvider>
+        </AuthContext.Provider>
+      </MemoryRouter>,
+    );
+    fireEvent.change(input(), { target: { value: "blender" } });
+    fireEvent.click(screen.getByRole("option", { name: /Blender/ }));
+    expect(await screen.findByTestId("where")).toHaveTextContent("/app/game/a1");
+    expect(screen.getByTestId("state")).toHaveTextContent('{"from":"palette"}');
+  });
+});
