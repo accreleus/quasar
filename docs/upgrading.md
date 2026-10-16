@@ -95,6 +95,7 @@ continues to verification. Nothing is retried on its own.
   length of the replacement. The control plane writes the request down before it asks, and the
   build that boots reads the actor's verdict back. A new control plane that never becomes
   healthy is put back automatically, unless the release changes the database (below).
+- **If you edited the Steam runtime preset, add `STEAM_STARTUP_FLAGS=-bigpicture` to it yourself to keep Big Picture on the plain Steam app.** The Steam image no longer bakes in a UI mode; the catalog's managed Steam preset now carries that flag, so an install whose Steam preset is still the managed one picks it up when the Steam image updates and the preset is re-materialized. An admin-edited preset is never overwritten, so it does not pick the flag up — the Steam launcher logs a warning naming this fix when the plain app starts without a UI mode.
 
 ### Applying from the console
 
