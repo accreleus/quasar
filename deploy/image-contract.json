@@ -58,10 +58,12 @@
           "curl", "gst-inspect-1.0", "gst-launch-1.0",
           "pipewire", "wireplumber", "pactl",
           "avahi-daemon",
-          "quasar-node-agent", "quasar-node-agent-entrypoint"
+          "quasar-node-agent", "quasar-node-agent-entrypoint",
+          "quasar-launch-helper"
         ],
         "_required_notes": {
-          "quasar-node-agent": "The BAKED binary. Its presence is what lets the deployment stop compiling the agent inside the container."
+          "quasar-node-agent": "The BAKED binary. Its presence is what lets the deployment stop compiling the agent inside the container.",
+          "quasar-launch-helper": "#731: the in-container Steam launch helper. The agent copies it into its runtime dir at start-up and mounts it into derived Steam tiles; without it those sessions report no app_launch_state."
         },
         "forbidden": ["cargo", "rustc", "rustup", "cc", "gcc", "meson", "ninja", "docker", "podman", "weston", "seatd"],
         "_forbidden_notes": {
@@ -78,6 +80,7 @@
           "/opt/gst/lib64/gstreamer-1.0/libgstnvcodec.so",
           "/usr/local/bin/quasar-node-agent",
           "/usr/local/bin/quasar-node-agent-entrypoint",
+          "/usr/local/bin/quasar-launch-helper",
           "/etc/ld.so.conf.d/gst-vulkan.conf",
           "/etc/pipewire/quasar-session.conf",
           "/etc/pipewire/quasar-session-pulse.conf",
@@ -151,6 +154,13 @@
         "no_unresolved_libs": true,
         "must_start": true,
         "_notes": "Verified 2026-07-26 on the live CUDA-built binary: readelf -d shows DT_NEEDED for glib/gst/asound/libc only. libgstcuda-1.0.so itself carries no libcuda DT_NEEDED -- it dlopens. So a --features cuda binary links and starts cleanly on a driver-less host, which is what lets ONE binary serve both vendors. must_start accepts the config-validation exit ('CONTROL_PLANE_URL is required') as success: reaching config validation proves process start and dynamic linking both succeeded."
+      },
+
+      "commands": {
+        "must_succeed": {
+          "ldd /usr/local/bin/quasar-launch-helper | grep -q 'statically linked'": "#731: the launch helper runs inside the Steam app image, not this one, so it may need no libc from either; a dynamic build would load this image's glibc and break on another distribution.",
+          "env -i /usr/local/bin/quasar-launch-helper": "#731: the helper starts, and with no -applaunch appid it exits 0, as it must for every app that is not a derived Steam tile."
+        }
       },
 
       "image_config": {
