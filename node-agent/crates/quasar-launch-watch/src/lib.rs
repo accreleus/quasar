@@ -108,6 +108,8 @@ pub struct Watcher {
     log_pending: Vec<u8>,
     log_game: Option<bool>,
     log_waiting_needs: Option<NeedsUser>,
+    log_waiting_fresh: bool,
+    log_discarding: bool,
     running_via_reaper: bool,
     last_game_window: bool,
     active_needs: Option<NeedsUser>,
@@ -126,6 +128,8 @@ impl Watcher {
             log_pending: Vec::new(),
             log_game: None,
             log_waiting_needs: None,
+            log_waiting_fresh: false,
+            log_discarding: false,
             running_via_reaper: false,
             last_game_window: false,
             active_needs: None,
@@ -162,20 +166,38 @@ impl Watcher {
                     self.last_game_window = on_screen;
                     reports.push(Report::GameWindow { on_screen });
                 }
-                let desired = classify_windows(&windows, self.cfg.appid).or(self.log_waiting_needs);
+                // The higher-ranked of the window and log reasons wins.
+                let desired = [
+                    classify_windows(&windows, self.cfg.appid),
+                    self.held_log_needs(),
+                ]
+                .into_iter()
+                .flatten()
+                .min_by_key(|reason| needs_rank(*reason));
                 self.update_needs(desired, &mut reports);
             }
             Err(_) => {
                 // The window source is skipped for this pass: neither the
                 // on-screen flag nor a window-derived reason changes, but a
                 // log-derived wait-for-user can still be reported.
-                if let Some(reason) = self.log_waiting_needs {
+                if let Some(reason) = self.held_log_needs() {
                     self.update_needs(Some(reason), &mut reports);
                 }
             }
         }
 
+        // A wait read this pass only becomes reportable if it is still in
+        // force on a later poll (see parse_log_line).
+        self.log_waiting_fresh = false;
         reports
+    }
+
+    fn held_log_needs(&self) -> Option<NeedsUser> {
+        if self.log_waiting_fresh {
+            None
+        } else {
+            self.log_waiting_needs
+        }
     }
 
     fn update_needs(&mut self, desired: Option<NeedsUser>, reports: &mut Vec<Report>) {
@@ -227,21 +249,27 @@ impl Watcher {
 
     fn read_log_tail(&mut self) {
         let path = self.cfg.steam_log_dir.join("console_log.txt");
-        let Ok(metadata) = std::fs::metadata(&path) else {
+        let metadata = std::fs::metadata(&path);
+
+        // Decided on the first poll, not the first sighting: the home
+        // persists between sessions and the helper polls before Steam
+        // starts, so a file already present at the first poll predates this
+        // session and starts at its end; a file created later is this
+        // session's and is read from 0 (the inode check below sees
+        // None != Some(new inode) and restarts it). Only a new file
+        // (rotation) or a shorter one (truncation) restarts at 0 after that.
+        if !self.log_seen {
+            self.log_seen = true;
+            if let Ok(seen) = &metadata {
+                self.log_file_id = Some(seen.ino());
+                self.log_offset = seen.len();
+            }
+            return;
+        }
+        let Ok(metadata) = metadata else {
             return;
         };
         let file_id = metadata.ino();
-
-        // The home persists between sessions and the helper starts before
-        // Steam, so whatever the file already holds on first sight predates
-        // this session: start at its current end. Only a new file (rotation,
-        // a different inode) or a shorter one (truncation) restarts at 0.
-        if !self.log_seen {
-            self.log_seen = true;
-            self.log_file_id = Some(file_id);
-            self.log_offset = metadata.len();
-            return;
-        }
         if self.log_file_id != Some(file_id) {
             self.reset_log();
             self.log_file_id = Some(file_id);
@@ -273,15 +301,26 @@ impl Watcher {
 
         while let Some(newline) = self.log_pending.iter().position(|b| *b == b'\n') {
             let raw: Vec<u8> = self.log_pending.drain(..=newline).collect();
+            if self.log_discarding {
+                // The tail of a dropped over-long line ends here.
+                self.log_discarding = false;
+                continue;
+            }
             if raw.len() <= MAX_LOG_LINE_BYTES {
                 let line = String::from_utf8_lossy(&raw);
                 self.parse_log_line(line.trim_end());
             }
         }
-        // A partial line that grows past the cap is dropped, not buffered
-        // forever on input the game controls.
-        if self.log_pending.len() > MAX_LOG_LINE_BYTES {
+        if self.log_discarding {
+            // Still inside the dropped line: drop what arrived, keep waiting
+            // for its newline.
             self.log_pending.clear();
+        } else if self.log_pending.len() > MAX_LOG_LINE_BYTES {
+            // A partial line that grows past the cap is dropped, not buffered
+            // forever on input the game controls, and its tail is ignored
+            // up to and including its newline.
+            self.log_pending.clear();
+            self.log_discarding = true;
         }
     }
 
@@ -290,6 +329,8 @@ impl Watcher {
         self.log_pending.clear();
         self.log_game = None;
         self.log_waiting_needs = None;
+        self.log_waiting_fresh = false;
+        self.log_discarding = false;
     }
 
     fn parse_log_line(&mut self, line: &str) {
@@ -297,12 +338,17 @@ impl Watcher {
         // beside `Game process removed: AppID` in the research notes), so the
         // phrases are matched without their colon and the id is taken from
         // the `AppID` that follows.
+        // Install scripts (Proton's iscriptevaluator and friends) run under
+        // their own Install=1 reaper before the game and are not the game:
+        // their added/removed lines must neither start nor end it.
+        let is_install_script =
+            line.contains("Install=1") || line.to_lowercase().contains("iscriptevaluator");
         if line.contains("Game process added") {
-            if extract_appid(line) == Some(self.cfg.appid) {
+            if !is_install_script && extract_appid(line) == Some(self.cfg.appid) {
                 self.log_game = Some(true);
             }
         } else if line.contains("Game process removed") {
-            if extract_appid(line) == Some(self.cfg.appid) {
+            if !is_install_script && extract_appid(line) == Some(self.cfg.appid) {
                 self.log_game = Some(false);
             }
         } else if line.contains("GameAction") {
@@ -317,11 +363,19 @@ impl Watcher {
                     .split_whitespace()
                     .next()
                     .unwrap_or("");
-                self.log_waiting_needs = Some(if task == "SynchronizingCloud" {
-                    NeedsUser::CloudConflict
-                } else {
-                    NeedsUser::Other
-                });
+                // CreatingProcess waits on every ordinary launch, so it is
+                // never armed. Any other wait is armed fresh: it is only
+                // reported if still in force on a later poll, because a
+                // wait+continue pair written together is routine too, while
+                // a real hold (a cloud conflict) survives a poll.
+                if task != "CreatingProcess" {
+                    self.log_waiting_needs = Some(if task == "SynchronizingCloud" {
+                        NeedsUser::CloudConflict
+                    } else {
+                        NeedsUser::Other
+                    });
+                    self.log_waiting_fresh = true;
+                }
             } else if line.contains("LaunchApp continues with user response")
                 || line.contains("LaunchApp changed task to")
             {
@@ -419,6 +473,16 @@ fn read_cmdline(path: &std::path::Path) -> Result<Option<Vec<u8>>, ()> {
 }
 
 fn is_reaper_for(args: &[String], appid: u32) -> bool {
+    // An Install=1 reaper runs an install script (Proton's
+    // iscriptevaluator.exe) before the game; it is not the game, and its
+    // exit must never read as the game's.
+    if args.iter().any(|arg| arg == "Install=1")
+        || args
+            .iter()
+            .any(|arg| basename(arg).to_lowercase() == "iscriptevaluator.exe")
+    {
+        return false;
+    }
     let appid_arg = format!("AppId={appid}");
     args.iter().any(|arg| basename(arg) == "reaper")
         && args.iter().any(|arg| arg == "SteamLaunch")

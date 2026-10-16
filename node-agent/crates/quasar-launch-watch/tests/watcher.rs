@@ -91,7 +91,7 @@ impl Rig {
     }
 }
 
-fn write_proc(proc_root: &Path, pid: u32, _name: &str, _ppid: u32, args: &[&str]) {
+fn write_proc(proc_root: &Path, pid: u32, args: &[&str]) {
     // Only cmdline: it is the one file the watcher reads per pid.
     let dir = proc_root.join(pid.to_string());
     std::fs::create_dir_all(&dir).unwrap();
@@ -162,7 +162,7 @@ fn appid_from_flags_cases() {
 #[test]
 fn first_poll_is_starting_then_client_only_and_never_exits_before_running() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
 
     assert_eq!(
         rig.watcher.poll(),
@@ -247,7 +247,7 @@ fn launcher_shim_reaper_alone_is_running_until_it_goes() {
 #[test]
 fn fixture_console_log_drives_transitions_line_by_line() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
     let log = std::fs::read_to_string(fixture("console_log.txt")).unwrap();
     let mut lines = log.lines();
 
@@ -263,12 +263,10 @@ fn fixture_console_log_drives_transitions_line_by_line() {
     rig.append_log(lines.next().unwrap());
     assert_eq!(rig.watcher.poll(), vec![]);
 
-    // Waiting for the user on that task does, and the continues line clears it.
+    // A wait read and cleared between polls never reports (see the
+    // held-for-a-poll rule in waiting_for_user_response_reports_once_and_clears).
     rig.append_log(lines.next().unwrap());
-    assert_eq!(
-        rig.watcher.poll(),
-        vec![Report::SteamNeedsUser(NeedsUser::CloudConflict)]
-    );
+    assert_eq!(rig.watcher.poll(), vec![]);
     rig.append_log(lines.next().unwrap());
     assert_eq!(rig.watcher.poll(), vec![]);
 
@@ -298,7 +296,7 @@ fn fixture_console_log_drives_transitions_line_by_line() {
 #[test]
 fn log_removal_ends_the_game_when_the_tree_is_unreadable() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
     assert_eq!(
         rig.watcher.poll(),
         vec![
@@ -330,7 +328,7 @@ fn log_removal_ends_the_game_when_the_tree_is_unreadable() {
 #[test]
 fn truncated_log_restarts_at_zero() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
     assert_eq!(
         rig.watcher.poll(),
         vec![
@@ -384,7 +382,7 @@ fn a_vanished_pid_mid_read_is_skipped() {
 #[test]
 fn a_window_list_error_skips_only_the_window_source() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
     rig.windows.set_fail(true);
 
     assert_eq!(
@@ -493,7 +491,7 @@ fn stale_log_from_the_previous_session_is_not_replayed() {
         vec![Report::LaunchState(LaunchState::Starting)]
     );
 
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::LaunchState(LaunchState::ClientOnly)]
@@ -503,7 +501,7 @@ fn stale_log_from_the_previous_session_is_not_replayed() {
 #[test]
 fn routine_cloud_sync_is_not_needs_user() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
     assert_eq!(
         rig.watcher.poll(),
         vec![
@@ -523,7 +521,7 @@ fn routine_cloud_sync_is_not_needs_user() {
 #[test]
 fn waiting_for_user_response_reports_once_and_clears() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
     assert_eq!(
         rig.watcher.poll(),
         vec![
@@ -532,9 +530,11 @@ fn waiting_for_user_response_reports_once_and_clears() {
         ]
     );
 
+    // Read on this poll: not yet reported. Still held on the next: reported.
     rig.append_log(&format!(
         "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
     ));
+    assert_eq!(rig.watcher.poll(), vec![]);
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::SteamNeedsUser(NeedsUser::CloudConflict)]
@@ -547,8 +547,9 @@ fn waiting_for_user_response_reports_once_and_clears() {
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
     rig.append_log(&format!(
-        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to CreatingProcess \"\""
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SiteLicenseSeatCheckout \"\""
     ));
+    assert_eq!(rig.watcher.poll(), vec![]);
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::SteamNeedsUser(NeedsUser::Other)]
@@ -560,8 +561,9 @@ fn waiting_for_user_response_reports_once_and_clears() {
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
     rig.append_log(&format!(
-        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to CreatingProcess \"\""
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SiteLicenseSeatCheckout \"\""
     ));
+    assert_eq!(rig.watcher.poll(), vec![]);
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::SteamNeedsUser(NeedsUser::Other)]
@@ -569,10 +571,51 @@ fn waiting_for_user_response_reports_once_and_clears() {
 }
 
 #[test]
+fn creating_process_wait_alone_reports_nothing() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to CreatingProcess \"\""
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn waiting_and_continue_in_one_poll_report_nothing() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
+    ));
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp continues with user response \"SynchronizingCloud\""
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
 fn reaper_seen_then_gone_on_a_readable_tree_exits_despite_a_stale_added_line() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
-    write_proc(&rig.proc_root, 200, "reaper", 100, REAPER);
+    write_proc(&rig.proc_root, 100, STEAM);
+    write_proc(&rig.proc_root, 200, REAPER);
     assert_eq!(
         rig.watcher.poll(),
         vec![
@@ -596,8 +639,8 @@ fn reaper_seen_then_gone_on_a_readable_tree_exits_despite_a_stale_added_line() {
 #[test]
 fn a_removed_log_line_while_the_reaper_lives_keeps_running() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
-    write_proc(&rig.proc_root, 200, "reaper", 100, REAPER);
+    write_proc(&rig.proc_root, 100, STEAM);
+    write_proc(&rig.proc_root, 200, REAPER);
     assert_eq!(
         rig.watcher.poll(),
         vec![
@@ -615,12 +658,10 @@ fn a_removed_log_line_while_the_reaper_lives_keeps_running() {
 #[test]
 fn an_appid_sharing_leading_digits_is_ignored() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
     write_proc(
         &rig.proc_root,
         200,
-        "reaper",
-        100,
         &[
             "/home/gamer/.local/share/Steam/ubuntu12_32/reaper",
             "SteamLaunch",
@@ -644,7 +685,7 @@ fn an_appid_sharing_leading_digits_is_ignored() {
 #[test]
 fn rotation_is_read_from_zero() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
     assert_eq!(
         rig.watcher.poll(),
         vec![
@@ -672,9 +713,9 @@ fn rotation_is_read_from_zero() {
 }
 
 #[test]
-fn a_partial_log_line_past_the_cap_is_dropped() {
+fn a_dropped_partial_lines_tail_is_not_parsed() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 100, STEAM);
     assert_eq!(
         rig.watcher.poll(),
         vec![
@@ -682,15 +723,9 @@ fn a_partial_log_line_past_the_cap_is_dropped() {
             Report::LaunchState(LaunchState::ClientOnly),
         ]
     );
-    rig.append_log(&format!(
-        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
-    ));
-    assert_eq!(
-        rig.watcher.poll(),
-        vec![Report::LaunchState(LaunchState::GameRunning)]
-    );
 
-    // 70 KiB with no newline: dropped, and the next line still parses.
+    // 70 KiB with no newline is dropped; the rest of that same line, even
+    // carrying a parseable phrase, is ignored up to and including its \n.
     {
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -699,20 +734,34 @@ fn a_partial_log_line_past_the_cap_is_dropped() {
         file.write_all(&vec![b'x'; 70 * 1024]).unwrap();
     }
     assert_eq!(rig.watcher.poll(), vec![]);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(rig.log_path())
+            .unwrap();
+        writeln!(
+            file,
+            " Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
+        )
+        .unwrap();
+    }
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    // The discard ends at that newline: a clean line after it parses.
     rig.append_log(&format!(
-        "\nGame process removed: AppID {APPID} \"game\", ProcID 201"
+        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
     ));
     assert_eq!(
         rig.watcher.poll(),
-        vec![Report::LaunchState(LaunchState::GameExited)]
+        vec![Report::LaunchState(LaunchState::GameRunning)]
     );
 }
 
 #[test]
 fn a_non_notfound_cmdline_error_marks_the_pass_unreadable() {
     let mut rig = Rig::new();
-    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
-    write_proc(&rig.proc_root, 200, "reaper", 100, REAPER);
+    write_proc(&rig.proc_root, 100, STEAM);
+    write_proc(&rig.proc_root, 200, REAPER);
     assert_eq!(
         rig.watcher.poll(),
         vec![
@@ -731,5 +780,153 @@ fn a_non_notfound_cmdline_error_marks_the_pass_unreadable() {
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::LaunchState(LaunchState::GameExited)]
+    );
+}
+
+const INSTALL_REAPER: &[&str] = &[
+    "/home/gamer/.local/share/Steam/ubuntu12_32/reaper",
+    "SteamLaunch",
+    "AppId=730",
+    "Install=1",
+    "--",
+    "/home/gamer/.local/share/Steam/steamapps/common/Proton/files/bin/iscriptevaluator.exe",
+];
+
+#[test]
+fn an_install_script_reaper_is_not_the_game() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+
+    write_proc(&rig.proc_root, 200, INSTALL_REAPER);
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    // Its exit is not the game's: no GameExited, still ClientOnly.
+    remove_proc(&rig.proc_root, 200);
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    write_proc(&rig.proc_root, 300, REAPER);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)]
+    );
+}
+
+#[test]
+fn install_script_log_lines_are_ignored() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"/home/gamer/.local/share/Steam/ubuntu12_32/reaper SteamLaunch AppId={APPID} Install=1 -- iscriptevaluator.exe\", ProcID 201, IP 0.0.0.0:0"
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.append_log(&format!(
+        "Game process removed: AppID {APPID} \"iscriptevaluator.exe\", ProcID 201"
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"game\", ProcID 301, IP 0.0.0.0:0"
+    ));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)]
+    );
+}
+
+#[test]
+fn a_log_file_created_after_the_first_poll_is_read_from_zero() {
+    let mut rig = Rig::new();
+    std::fs::remove_file(rig.log_path()).unwrap();
+    write_proc(&rig.proc_root, 100, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+
+    std::fs::write(
+        rig.log_path(),
+        format!("Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)]
+    );
+}
+
+#[test]
+fn cmdline_read_is_capped_at_four_kibibytes() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+
+    // The reaper tokens sit past the 4 KiB cap, behind a padding arg: the
+    // capped read never sees them, so this process is not the reaper.
+    let dir = rig.proc_root.join("200");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cmdline = Vec::new();
+    cmdline.extend_from_slice(b"/home/gamer/.local/share/Steam/ubuntu12_64/steam\0");
+    cmdline.extend_from_slice(&vec![b'x'; 5 * 1024]);
+    cmdline.extend_from_slice(
+        b"\0/home/gamer/.local/share/Steam/ubuntu12_32/reaper\0SteamLaunch\0AppId=730\0",
+    );
+    std::fs::write(dir.join("cmdline"), cmdline).unwrap();
+
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+}
+
+#[test]
+fn a_log_tail_over_one_mib_is_read_over_two_passes() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+
+    // A 1.2 MiB line, then the added line: the first pass reads only its
+    // 1 MiB slice, the second pass reaches the added line.
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(rig.log_path())
+            .unwrap();
+        let mut padding = vec![b'#'; 1_200_000];
+        padding.push(b'\n');
+        file.write_all(&padding).unwrap();
+    }
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)]
     );
 }
