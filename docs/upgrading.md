@@ -95,7 +95,6 @@ continues to verification. Nothing is retried on its own.
   length of the replacement. The control plane writes the request down before it asks, and the
   build that boots reads the actor's verdict back. A new control plane that never becomes
   healthy is put back automatically, unless the release changes the database (below).
-
 ### Applying from the console
 
 Admin › Fleet › Releases lists every target and, for an eligible host, offers **Apply**. The
@@ -237,6 +236,10 @@ on the path users run. It is never offered and never unattended. Setup and rules
 `docs/configuration.md` (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, `QUASAR_PLATFORM_INSECURE_REGISTRIES`).
 
 ---
+
+## App-image updates and the Steam preset
+
+App images (Admin ▸ Library ▸ Images) update separately from platform releases, on every kind of install. If your Steam app uses a runtime preset you made yourself, rather than the one the Steam image installed, add `STEAM_STARTUP_FLAGS=-bigpicture` to it to keep Big Picture on the plain Steam app.
 
 ## Back up the database
 
