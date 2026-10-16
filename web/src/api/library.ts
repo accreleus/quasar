@@ -6,6 +6,7 @@ import type {
   AppsResponse,
   HighlightsResponse,
   LaunchResponse,
+  PlayHistoryResponse,
   ProfilePreferencesResponse,
   ProfilesResponse,
   SessionResponse,
@@ -31,6 +32,11 @@ export function listApps(token: string): Promise<AppsResponse> {
  *  re-derive or re-sort it, or two rankers drift apart. Empty is a normal 200. */
 export function getHighlights(token: string): Promise<HighlightsResponse> {
   return apiFetch<HighlightsResponse>("/me/highlights", { token });
+}
+
+/** The caller's own play history, one item per app played (control-api.md amendment 38). */
+export function getPlayHistory(token: string): Promise<PlayHistoryResponse> {
+  return apiFetch<PlayHistoryResponse>("/me/play-history", { token });
 }
 
 export function favouriteApp(token: string, appId: string): Promise<void> {

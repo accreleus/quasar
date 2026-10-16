@@ -34,7 +34,8 @@ export function metaFor(app: App, extras: ExtrasMap | null): string {
 function Icon({ app, extras }: { app: App; extras: ExtrasMap | null }) {
   // The title's icon, then the grid art, then the glyph underneath both.
   const tile = artFor(app, "tile");
-  const sources = [extras?.[app.id]?.icon_url, tile && sizedArt(tile, 96)].filter((s): s is string => Boolean(s));
+  const icon = extras?.[app.id]?.icon_url;
+  const sources = [icon && sizedArt(icon, 96), tile && sizedArt(tile, 96)].filter((s): s is string => Boolean(s));
   const [failed, setFailed] = useState(0);
   const src = sources[failed];
   return (

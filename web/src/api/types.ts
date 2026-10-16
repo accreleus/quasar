@@ -188,6 +188,9 @@ export type Highlight = Schemas["Highlight"];
 /** The server owns the ranking — `items` is never re-sorted client-side. */
 export type HighlightsResponse = Schemas["HighlightList"];
 
+export type PlayHistoryItem = Schemas["PlayHistoryItem"];
+export type PlayHistoryResponse = Schemas["PlayHistoryList"];
+
 /** Kept local: the OpenAPI `Stream` schema types playout0_ms/h264_profile as
  *  optional, but a session's stream always carries both. */
 export interface StreamParams {
