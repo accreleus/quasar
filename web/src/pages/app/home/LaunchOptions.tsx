@@ -22,6 +22,8 @@ export interface LaunchOptionsProps {
   spec: LaunchSpec;
   verdict: Verdict;
   launching: boolean;
+  /** Play waits on a read that can change what it sends. */
+  checking?: boolean;
   waitingForSlot: boolean;
   /** "slot" (capacity_exhausted) vs "host" (no_host_available). */
   waitingReason?: WaitingReason | null;
@@ -43,6 +45,7 @@ export function LaunchOptions({
   spec,
   verdict,
   launching,
+  checking = false,
   waitingForSlot,
   waitingReason = "slot",
   onSelectCodec,
@@ -58,7 +61,9 @@ export function LaunchOptions({
       : "Waiting for a slot…"
     : launching
       ? "Launching…"
-      : "Play now";
+      : checking
+        ? "Checking…"
+        : "Play now";
   return (
     <div className={`lo${open ? " show" : ""}`} id={id} aria-label="Launch options">
       <div className="qp-head">
@@ -116,7 +121,8 @@ export function LaunchOptions({
           </Button>
           <Button
             variant="primary"
-            disabled={verdict.tone === "off" || launching}
+            disabled={verdict.tone === "off" || launching || checking}
+            aria-busy={checking || undefined}
             onClick={onPlay}
           >
             <IconPlayGlyph className="ic" />

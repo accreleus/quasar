@@ -18,6 +18,11 @@ import * as libraryApi from "../../api/library";
 import type { App } from "../../api/types";
 
 vi.mock("../../api/library");
+// This suite drives the detail band, which is the Classic layout.
+vi.mock("../../settings/OverlayPreferencesContext", async (orig) => ({
+  ...(await orig<typeof import("../../settings/OverlayPreferencesContext")>()),
+  useNewDesign: () => false,
+}));
 const mocked = vi.mocked(libraryApi);
 
 const FIREFOX_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";

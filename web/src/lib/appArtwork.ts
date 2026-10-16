@@ -32,5 +32,5 @@ export function sizedArt(url: string, w: ArtWidth): string {
 /** A `srcSet` of the tile widths, so the browser picks by device pixel ratio; undefined
  *  when the URL is not local artwork. */
 export function artSrcSet(url: string): string | undefined {
-  return LOCAL_ART.test(url) ? ([320, 480, 560] as const).map((w) => `${sizedArt(url, w)} ${w}w`).join(", ") : undefined;
+  return LOCAL_ART.test(url) ? ([96, 320, 480, 560] as const).map((w) => `${sizedArt(url, w)} ${w}w`).join(", ") : undefined;
 }

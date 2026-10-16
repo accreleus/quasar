@@ -42,7 +42,7 @@ describe("sizedArt / artSrcSet", () => {
 
   it("sizes local artwork URLs", () => {
     expect(sizedArt(local, 96)).toBe(`${local}?w=96`);
-    expect(artSrcSet(local)).toBe(`${local}?w=320 320w, ${local}?w=480 480w, ${local}?w=560 560w`);
+    expect(artSrcSet(local)).toBe(`${local}?w=96 96w, ${local}?w=320 320w, ${local}?w=480 480w, ${local}?w=560 560w`);
   });
 
   // A cover_url written directly can point anywhere; a query added to it could break it.

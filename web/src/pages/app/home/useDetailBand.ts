@@ -110,24 +110,29 @@ export function useDetailBand({
   }, []);
 
   /**
-   * Opens `app`'s band anchored after the last tile in its row. `list` must be
-   * the grid the tile actually lives in (the source group in Library view). A
-   * tile outside the windowed grid's mounted rows (rail card, gated launch) is
-   * pinned by `openId` first; the anchor is found once its row exists (below).
+   * Shows `app`'s band anchored after the last tile in its row, even if it is
+   * already open. `list` must be the grid the tile actually lives in (the source group in Library view). A tile outside
+   * the windowed grid's mounted rows (rail card, gated launch) is pinned by
+   * `openId` first; the anchor is found once its row exists (below).
    */
-  const open = useCallback(
+  const show = useCallback(
     (app: App, list: readonly App[]) => {
-      if (openId === app.id) {
-        close();
-        return;
-      }
       openedUnderRef.current = viewKey;
       setOpenId(app.id);
       setInsertAfterId(rowEndOf(list, app.id));
       setOptionsOpen(false);
       ensureProfiles(app);
     },
-    [openId, viewKey, close, ensureProfiles, rowEndOf],
+    [viewKey, ensureProfiles, rowEndOf],
+  );
+
+  /** A tile click: opens the band, or closes it when it is already open. */
+  const open = useCallback(
+    (app: App, list: readonly App[]) => {
+      if (openId === app.id) close();
+      else show(app, list);
+    },
+    [openId, close, show],
   );
 
   // A band opened for an unmounted tile has no anchor yet: its row mounted with
@@ -154,14 +159,14 @@ export function useDetailBand({
     (app: App, expandOptions: boolean) => {
       const list = listContaining(app.id);
       if (list) {
-        if (openId !== app.id) open(app, list);
+        show(app, list);
         if (expandOptions) setOptionsOpen(true);
         return;
       }
       onClearFilter();
       setPendingOptions({ id: app.id, expand: expandOptions });
     },
-    [listContaining, openId, open, onClearFilter],
+    [listContaining, show, onClearFilter],
   );
 
   useEffect(() => {
@@ -171,9 +176,9 @@ export function useDetailBand({
     const expand = pendingOptions.expand;
     setPendingOptions(null);
     if (!list || !app) return;
-    if (openId !== app.id) open(app, list);
+    show(app, list);
     if (expand) setOptionsOpen(true);
-  }, [pendingOptions, listContaining, openId, open]);
+  }, [pendingOptions, listContaining, show]);
 
   // The band is anchored after the last tile of its row, and a resize
   // recomposes the rows: without this the band sits mid-row until the next

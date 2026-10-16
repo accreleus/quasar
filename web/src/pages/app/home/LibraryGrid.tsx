@@ -38,6 +38,10 @@ export interface LibraryGridProps {
   gridsRef: RefObject<HTMLDivElement | null>;
   /** Loading / error / empty panels, rendered above the grids. */
   children?: ReactNode;
+  /** New design: controls that join the head row, after the kind filter. */
+  headExtra?: ReactNode;
+  /** New design: the A–Z index, between the head and the grids. */
+  index?: ReactNode;
 }
 
 export function LibraryGrid({
@@ -53,6 +57,8 @@ export function LibraryGrid({
   renderGrid,
   gridsRef,
   children,
+  headExtra,
+  index,
 }: LibraryGridProps) {
   const title = view === "library" ? "Library" : "Your library";
   return (
@@ -73,6 +79,7 @@ export function LibraryGrid({
             options={[...kindOptions]}
           />
         )}
+        {headExtra}
         <span className="grow" />
         {actions}
         {/* Home shows the catalogue flat; Library groups it by source. The
@@ -85,6 +92,7 @@ export function LibraryGrid({
         )}
       </div>
 
+      {index}
       {children}
 
       <div ref={gridsRef}>

@@ -16,8 +16,8 @@
 //     which is now a real page in the account rail.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { App } from "../../App";
 import { buildUserNav, SEARCHABLE_ROUTES } from "./AppLayout";
 import { buildUserTabs } from "./userTabs";
@@ -55,6 +55,10 @@ const auth: AuthContextValue = {
   logout: vi.fn(),
 };
 
+function Path() {
+  return <span data-testid="path">{useLocation().pathname}</span>;
+}
+
 function renderApp(path: string) {
   return render(
     <MemoryRouter initialEntries={[path]}>
@@ -63,6 +67,7 @@ function renderApp(path: string) {
           <SetupStatusProvider>
             <ToastProvider>
               <App />
+              <Path />
             </ToastProvider>
           </SetupStatusProvider>
         </AuthContext.Provider>
@@ -75,6 +80,8 @@ beforeEach(() => {
   vi.resetAllMocks();
   mockedSetup.getSetupStatus.mockResolvedValue({ admin_exists: true, setup_completed: true });
   localStorage.clear();
+  // These pin the shipped layout; the redesign has its own tests.
+  localStorage.setItem("quasar.ui.classic.u1", "1");
   document.body.removeAttribute("data-rail");
   mockedLibrary.listApps.mockResolvedValue({
     items: [
@@ -95,6 +102,7 @@ beforeEach(() => {
   } as never);
   mockedLibrary.getMySessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mockedLibrary.getHighlights.mockResolvedValue({ items: [] } as never);
+  mockedLibrary.getProfilePreferences.mockResolvedValue({ user_overrides_allowed: true } as never);
   mockedStorage.getMyStorage.mockResolvedValue({ items: [] } as never);
 });
 
@@ -324,6 +332,219 @@ describe("topbar search box", () => {
       expect(document.querySelectorAll(".lib-tile").length).toBe(0);
     });
   });
+
+  it("a palette hit routes into the library with the name in the box", async () => {
+    renderApp("/app");
+    await screen.findByRole("textbox", { name: "Search library" });
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    const palette = within(await screen.findByRole("dialog")).getByRole("combobox");
+    fireEvent.change(palette, { target: { value: "Portal" } });
+    fireEvent.click(await screen.findByRole("option", { name: /Portal 2/ }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Search library" })).toHaveValue("Portal 2"));
+    expect(screen.getByTestId("path")).toHaveTextContent("/app/library");
+  });
+});
+
+// ── The same four, in the new design (the default) ───────────────────────────
+//
+// The box is a combobox there (a results popover under it), so these query that
+// role; what they pin is the same shell behaviour.
+
+describe("new design (no Classic layout pin)", () => {
+  beforeEach(() => {
+    localStorage.removeItem("quasar.ui.classic.u1");
+  });
+  const box = () => screen.findByRole("combobox", { name: "Search library" });
+
+  it("the search box appears on /app and on /app/library", async () => {
+    const { unmount } = renderApp("/app");
+    expect(await box()).toBeInTheDocument();
+    unmount();
+    renderApp("/app/library");
+    expect(await box()).toBeInTheDocument();
+  });
+
+  it("is seeded from ?q= and typing then filters", async () => {
+    renderApp("/app/library?q=Portal");
+    const input = await box();
+    expect(input).toHaveValue("Portal");
+    await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(1));
+    fireEvent.change(input, { target: { value: "zzz" } });
+    expect(input).toHaveValue("zzz");
+    await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(0));
+  });
+
+  it("a palette hit opens the game's page", async () => {
+    renderApp("/app");
+    await box();
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    const palette = within(await screen.findByRole("dialog")).getByRole("combobox");
+    fireEvent.change(palette, { target: { value: "Portal" } });
+    fireEvent.click(await screen.findByRole("option", { name: /Portal 2/ }));
+    await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent("/app/game/"));
+    expect(await screen.findByRole("heading", { level: 1, name: "Portal 2" })).toBeInTheDocument();
+  });
+
+  it("a top-bar result opens the game's page, and Back returns to the library", async () => {
+    renderApp("/app/library");
+    fireEvent.change(await box(), { target: { value: "Portal" } });
+    fireEvent.click(await screen.findByRole("option", { name: "Portal 2" }));
+    expect(await screen.findByRole("heading", { level: 1, name: "Portal 2" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent("/app/library"));
+  });
+
+  describe("a pick hands focus to Play, so P launches rather than typing into the search", () => {
+    beforeEach(() => {
+      const rung = { id: "r", display_name: "r", codec: "h264", width: 1920, height: 1080, fps: 60, nominal_bitrate_kbps: 8000, position: 1, eligibility: "eligible", reasons: [] };
+      mockedLibrary.getProfiles.mockResolvedValue({
+        recommended_id: "p",
+        confidence: "high",
+        notes: [],
+        profiles: [{ id: "p", display_name: "p", description: "", nominal: { width: 1920, height: 1080, fps: 60, bitrate_kbps: 8000 }, eligibility: "eligible", reasons: [], rungs: [rung] }],
+      } as never);
+      mockedLibrary.launchSession.mockRejectedValue(new Error("not here"));
+    });
+    async function playHasFocusAndPLaunches() {
+      const play = await screen.findByRole("button", { name: "Play" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+      const input = await box();
+      expect(input).toHaveAttribute("aria-expanded", "false");
+      fireEvent.keyDown(play, { key: "p" });
+      await waitFor(() => expect(mockedLibrary.launchSession).toHaveBeenCalledTimes(1));
+      expect(mockedLibrary.launchSession.mock.calls[0][1]).toEqual({ app_id: "a1", mic: true });
+      expect(input).toHaveValue("Portal");
+    }
+
+    it("from the top-bar search", async () => {
+      renderApp("/app/library");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "Portal" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await playHasFocusAndPLaunches();
+    });
+
+    it("from the palette, which hands focus back to the search field it was opened from", async () => {
+      renderApp("/app/library?q=Portal");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "k", ctrlKey: true });
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByRole("combobox"), { target: { value: "Portal" } });
+      fireEvent.click(await within(dialog).findByRole("option", { name: /Portal 2/ }));
+      await playHasFocusAndPLaunches();
+    });
+
+    it("again for the game already open, from the top-bar search and from the palette", async () => {
+      renderApp("/app/library");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "Portal" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      const play = await screen.findByRole("button", { name: "Play" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+      expect(input).toHaveAttribute("aria-expanded", "false");
+
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "k", ctrlKey: true });
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByRole("combobox"), { target: { value: "Portal" } });
+      fireEvent.click(await within(dialog).findByRole("option", { name: /Portal 2/ }));
+      await playHasFocusAndPLaunches();
+    });
+
+    it("not on Back onto a search entry; a fresh pick still does", async () => {
+      renderApp("/app/library");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "Portal" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      const play = await screen.findByRole("button", { name: "Play" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+
+      const heart = screen.getByRole("button", { name: "Add Portal 2 to favourites" });
+      act(() => heart.focus());
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      await act(async () => {});
+      expect(document.activeElement).toBe(heart);
+
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "Enter" });
+      await playHasFocusAndPLaunches();
+    });
+  });
+
+  describe("a pick always opens the chosen game's page", () => {
+    const game = (id: string, name: string) => ({ ...mockedAppBase, id, name });
+    const mockedAppBase = {
+      description: "",
+      kind: "game",
+      cover_url: null,
+      hero_url: null,
+      parent_app_id: null,
+      external_source: "steam",
+      external_id: "",
+      favourite: false,
+      enabled: true,
+    };
+    async function pick(name: string, option = 0) {
+      fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByRole("combobox"), { target: { value: name } });
+      fireEvent.click((await within(dialog).findAllByRole("option", { name: new RegExp(name) }))[option]);
+    }
+    const page = async (id: string, name: string) => {
+      await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent(`/app/game/${id}`));
+      expect(await screen.findByRole("heading", { level: 1, name })).toBeInTheDocument();
+    };
+    const nav = (name: string) => within(screen.getAllByRole("navigation")[0]).getByRole("link", { name });
+    const twoGames = () =>
+      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Portal 2"), game("a2", "Celeste")] } as never);
+
+    it("again after going Home, from its own page, and for a different game", async () => {
+      twoGames();
+      renderApp("/app");
+      await box();
+      await pick("Portal 2");
+      await page("a1", "Portal 2");
+      fireEvent.click(nav("Home"));
+      await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent(/^\/app$/));
+      await pick("Portal 2");
+      await page("a1", "Portal 2");
+      await pick("Celeste");
+      await page("a2", "Celeste");
+      await pick("Celeste");
+      await page("a2", "Celeste");
+    });
+
+    it("when the kind filter hides it", async () => {
+      mockedLibrary.listApps.mockResolvedValue({
+        items: [game("a1", "Portal 2"), { ...game("a2", "Weston Terminal"), kind: "desktop" }],
+      } as never);
+      renderApp("/app/library");
+      await box();
+      const tabs = await screen.findByRole("tablist", { name: "Filter by kind" });
+      fireEvent.click(within(tabs).getByRole("tab", { name: "Desktops" }));
+      await pick("Portal 2");
+      await page("a1", "Portal 2");
+    });
+
+    it("two games with the same name: the chosen id opens", async () => {
+      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Twin"), game("a2", "Twin")] } as never);
+      renderApp("/app/library");
+      await box();
+      await pick("Twin", 1);
+      await page("a2", "Twin");
+    });
+  });
 });
 
 // ── The moved Storage route ──────────────────────────────────────────────────
@@ -377,5 +598,41 @@ describe("command palette sources", () => {
     expect(box).toHaveAttribute("placeholder", "Search games or jump to a page");
     fireEvent.change(box, { target: { value: "Portal" } });
     expect(await screen.findByRole("option", { name: /Portal 2/ })).toBeInTheDocument();
+  });
+});
+
+// ── The account area in the new design ───────────────────────────────────────
+
+describe("account area, new design (no Classic layout pin)", () => {
+  beforeEach(() => {
+    localStorage.removeItem("quasar.ui.classic.u1");
+  });
+
+  it("keeps the tab bar and the user-menu route back to the library", async () => {
+    renderApp("/app/account");
+    const bar = await tabBarWhenReady();
+    expect(within(bar).getByRole("link", { name: "Account" })).toHaveClass("active");
+    expect(within(bar).getByRole("link", { name: "Library" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /tester/ }));
+    expect(screen.getByRole("menuitem", { name: "Game library" })).toHaveAttribute("href", "/app");
+  });
+
+  it("/app/storage lands on the one page with its Storage row lit", async () => {
+    renderApp("/app/storage");
+    const rail = await screen.findByRole("navigation", { name: "Account sections" });
+    await waitFor(() => expect(within(rail).getByRole("link", { name: "Storage" })).toHaveClass("active"));
+    expect(screen.getByRole("heading", { name: "Storage", level: 2 })).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Storage" })).toBeNull();
+  });
+
+  it("the palette carries the catalogue and the account settings into the account shell", async () => {
+    renderApp("/app/account/profile");
+    await screen.findByRole("navigation", { name: "Account sections" });
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    const box = await screen.findByPlaceholderText("Search settings and games");
+    fireEvent.change(box, { target: { value: "Portal" } });
+    expect(await screen.findByRole("option", { name: /Portal 2/ })).toBeInTheDocument();
+    fireEvent.change(box, { target: { value: "classic" } });
+    expect(await screen.findByRole("option", { name: /Classic layout/ })).toBeInTheDocument();
   });
 });
