@@ -20,6 +20,8 @@ struct FakeWindows {
 struct FakeState {
     windows: Vec<WindowInfo>,
     fail: bool,
+    focused: Option<u32>,
+    focus_fail: bool,
 }
 
 impl FakeWindows {
@@ -28,6 +30,12 @@ impl FakeWindows {
     }
     fn set_fail(&self, fail: bool) {
         self.state.lock().unwrap().fail = fail;
+    }
+    fn set_focus(&self, focused: Option<u32>) {
+        self.state.lock().unwrap().focused = focused;
+    }
+    fn set_focus_fail(&self, fail: bool) {
+        self.state.lock().unwrap().focus_fail = fail;
     }
 }
 
@@ -38,6 +46,14 @@ impl Windows for FakeWindows {
             Err(std::io::Error::other("fake window list failure"))
         } else {
             Ok(state.windows.clone())
+        }
+    }
+    fn focused_app(&mut self) -> std::io::Result<Option<u32>> {
+        let state = self.state.lock().unwrap();
+        if state.focus_fail {
+            Err(std::io::Error::other("fake focus failure"))
+        } else {
+            Ok(state.focused)
         }
     }
 }
@@ -396,6 +412,7 @@ fn a_window_list_error_skips_only_the_window_source() {
     rig.windows.set(vec![game_window()]);
     assert_eq!(rig.watcher.poll(), vec![]);
 
+    rig.windows.set_focus(Some(APPID));
     rig.windows.set_fail(false);
     assert_eq!(
         rig.watcher.poll(),
@@ -404,24 +421,74 @@ fn a_window_list_error_skips_only_the_window_source() {
 }
 
 #[test]
-fn game_window_is_reported_on_each_change() {
+fn game_window_follows_focus_not_the_mapped_list() {
     let mut rig = Rig::new();
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::LaunchState(LaunchState::Starting)]
     );
 
+    // Mapped, but gamescope's focus is elsewhere: not on screen.
     rig.windows.set(vec![game_window()]);
+    rig.windows.set_focus(Some(769));
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    rig.windows.set_focus(Some(APPID));
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::GameWindow { on_screen: true }]
     );
     assert_eq!(rig.watcher.poll(), vec![]);
 
-    rig.windows.set(vec![]);
+    rig.windows.set_focus(None);
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::GameWindow { on_screen: false }]
+    );
+}
+
+#[test]
+fn a_focused_app_error_skips_the_on_screen_check() {
+    let mut rig = Rig::new();
+    rig.windows.set_focus(Some(APPID));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::GameWindow { on_screen: true },
+        ]
+    );
+
+    // The focus read fails and the focus has in fact left: nothing is
+    // reported for that pass, and the change lands on the next good read.
+    rig.windows.set_focus(None);
+    rig.windows.set_focus_fail(true);
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    rig.windows.set_focus_fail(false);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::GameWindow { on_screen: false }]
+    );
+}
+
+#[test]
+fn the_measured_sign_in_to_steam_window_needs_the_user() {
+    let mut rig = Rig::new();
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::Starting)]
+    );
+
+    // The #723 measurement: STEAM_GAME=769, WM_CLASS steamwebhelper/steam.
+    rig.windows.set(vec![WindowInfo {
+        steam_game: Some(769),
+        wm_class: "steamwebhelper".into(),
+        title: "Sign in to Steam".into(),
+    }]);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
     );
 }
 
@@ -462,6 +529,7 @@ fn steam_needs_user_is_once_per_reason_while_it_holds() {
         wm_class: "Steam".into(),
         title: "Sign in to Steam".into(),
     }]);
+    rig.windows.set_focus(Some(APPID));
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::GameWindow { on_screen: true }]

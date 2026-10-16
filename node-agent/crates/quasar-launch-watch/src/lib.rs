@@ -16,8 +16,12 @@
 //!   end of whatever a previous session left behind — the second source,
 //!   which may move the state earlier than the reaper and may end it when
 //!   the reaper scan is unreadable;
-//! - a caller-supplied window list, classified here; the core makes no X11
-//!   call. `registry.vdf` `RunningAppID` is never read (it stays 0 on Linux).
+//! - a caller-supplied window list and gamescope's published focus,
+//!   classified here; the core makes no X11 call. "Game window on screen" is
+//!   that focus (`GAMESCOPE_FOCUSED_APP` == the appid, amendment 1 from the
+//!   #723 spike), not a mapped `STEAM_GAME` window, which under `-silent` is
+//!   black until the baselayer is pinned. `registry.vdf` `RunningAppID` is
+//!   never read (it stays 0 on Linux).
 
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -68,6 +72,8 @@ pub struct WindowInfo {
 
 pub trait Windows {
     fn mapped(&mut self) -> std::io::Result<Vec<WindowInfo>>;
+    /// gamescope's root `GAMESCOPE_FOCUSED_APP` (CARDINAL); Ok(None) when unset.
+    fn focused_app(&mut self) -> std::io::Result<Option<u32>>;
 }
 
 pub struct WatchConfig {
@@ -159,13 +165,18 @@ impl Watcher {
             reports.push(Report::LaunchState(next));
         }
 
+        // On screen is gamescope's published focus alone; an error skips
+        // the check for this pass, leaving the last reported value standing.
+        if let Ok(focused) = self.windows.focused_app() {
+            let on_screen = focused == Some(self.cfg.appid);
+            if on_screen != self.last_game_window {
+                self.last_game_window = on_screen;
+                reports.push(Report::GameWindow { on_screen });
+            }
+        }
+
         match self.windows.mapped() {
             Ok(windows) => {
-                let on_screen = windows.iter().any(|w| w.steam_game == Some(self.cfg.appid));
-                if on_screen != self.last_game_window {
-                    self.last_game_window = on_screen;
-                    reports.push(Report::GameWindow { on_screen });
-                }
                 // The higher-ranked of the window and log reasons wins.
                 let desired = [
                     classify_windows(&windows, self.cfg.appid),
@@ -177,9 +188,9 @@ impl Watcher {
                 self.update_needs(desired, &mut reports);
             }
             Err(_) => {
-                // The window source is skipped for this pass: neither the
-                // on-screen flag nor a window-derived reason changes, but a
-                // log-derived wait-for-user can still be reported.
+                // The mapped list is skipped for this pass: no window-derived
+                // reason changes, but a log-derived wait-for-user can still
+                // be reported.
                 if let Some(reason) = self.held_log_needs() {
                     self.update_needs(Some(reason), &mut reports);
                 }
@@ -516,9 +527,9 @@ fn classify_windows(windows: &[WindowInfo], appid: u32) -> Option<NeedsUser> {
 /// The one place window strings are matched. Sources: the research notes for
 /// #645 (old VGUI titles such as "Steam Guard - Computer Authorization
 /// Required" and "Steam - Self Updater", carried in maintained window-manager
-/// lists). The current CEF
-/// client's titles are not authoritatively documented anywhere, so this table
-/// is deliberately small and the lab spike (#723) will correct it.
+/// lists), plus the #723 spike's measurement on the current client: the
+/// sign-in window under `-silent` is titled "Sign in to Steam" (WM_CLASS
+/// steamwebhelper/steam, STEAM_GAME=769). The table stays deliberately small.
 fn classify_window(window: &WindowInfo, appid: u32) -> Option<NeedsUser> {
     // The game's own window is never Steam asking for the user.
     if window.steam_game == Some(appid) {
@@ -544,7 +555,8 @@ fn classify_window(window: &WindowInfo, appid: u32) -> Option<NeedsUser> {
         || title.contains("setup")
     {
         Some(NeedsUser::Install)
-    } else if title.contains("sign in")
+    } else if title.contains("sign in to steam")
+        || title.contains("sign in")
         || title.contains("sign-in")
         || title.contains("log in")
         || title.contains("login")
