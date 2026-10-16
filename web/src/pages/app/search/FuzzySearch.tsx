@@ -8,7 +8,7 @@
 import { useId, useMemo, useState } from "react";
 import type { App } from "../../../api/types";
 import { IconSearch } from "../../../components/icons";
-import { artFor } from "../../../lib/appArtwork";
+import { artFor, sizedArt } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
 import { relativeDay, useLibraryExtras, type ExtrasMap } from "../library/libraryExtras";
 import { rank } from "./match";
@@ -33,7 +33,9 @@ export function metaFor(app: App, extras: ExtrasMap | null): string {
 
 function Icon({ app, extras }: { app: App; extras: ExtrasMap | null }) {
   // The title's icon, then the grid art, then the glyph underneath both.
-  const sources = [extras?.[app.id]?.icon_url, artFor(app, "tile")].filter((s): s is string => Boolean(s));
+  const tile = artFor(app, "tile");
+  const icon = extras?.[app.id]?.icon_url;
+  const sources = [icon && sizedArt(icon, 96), tile && sizedArt(tile, 96)].filter((s): s is string => Boolean(s));
   const [failed, setFailed] = useState(0);
   const src = sources[failed];
   return (

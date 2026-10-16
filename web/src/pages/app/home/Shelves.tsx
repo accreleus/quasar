@@ -60,6 +60,7 @@ function Shelf({
             onOpen={() => tile.onOpen(app)}
             onPlay={() => tile.onPlay(app)}
             opensPage
+            artSizes="96px" /* shelves.css flex-basis */
             meta={meta?.(app)}
           />
         ))}

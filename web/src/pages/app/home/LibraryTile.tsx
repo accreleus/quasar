@@ -24,7 +24,7 @@ import type { ReactNode } from "react";
 import type { App } from "../../../api/types";
 import { Chip } from "../../../components/Chip";
 import { IconHeart, IconPlayGlyph } from "../../../components/icons";
-import { artFor } from "../../../lib/appArtwork";
+import { artFor, artSrcSet, sizedArt } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
 import { TileHeart } from "./TileHeart";
 
@@ -58,6 +58,8 @@ export interface LibraryTileProps {
   onFavourite?: () => void;
   /** New design: a press opens the game's page, not the band. */
   opensPage?: boolean;
+  /** The tile's rendered CSS width, for the art's `sizes`. */
+  artSizes?: string;
 }
 
 export function LibraryTile({
@@ -75,6 +77,7 @@ export function LibraryTile({
   meta,
   onFavourite,
   opensPage,
+  artSizes = "176px",
 }: LibraryTileProps) {
   // The mock's `onerror="this.remove()"`: the gradient + glyph underneath is a
   // design, not a broken state, so a 404 cover falls back to it instead of
@@ -102,9 +105,12 @@ export function LibraryTile({
                in-viewport image and shrinks its prefetch margin on a slow link,
                adapting better than a hardcoded row count. No width/height
                needed: `.cover` is `aspect-ratio: 2/3` with `.cover-img`
-               `position:absolute; inset:0`, so layout cannot shift. */
+               `position:absolute; inset:0`, so layout cannot shift. The default
+               `sizes` is the measured grid tile width (`.lib-grid` minmax(160px, 1fr)). */
             <img
-              src={art}
+              src={sizedArt(art, 320)}
+              srcSet={artSrcSet(art)}
+              sizes={artSizes}
               alt=""
               className="cover-img"
               loading="lazy"

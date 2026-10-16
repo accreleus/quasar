@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -35,8 +36,8 @@ func (h *harness) assetsPresent(t *testing.T, appID string) Record {
 		t.Fatalf("get %s: ok=%v err=%v", appID, ok, err)
 	}
 	for _, a := range []string{rec.TileAsset, rec.HeroAsset} {
-		if a != "" && !h.svc.blobs.Has(a) {
-			t.Fatalf("asset %s of %s is still missing", a, appID)
+		if ok, err := h.svc.blobs.Has(a); a != "" && !ok {
+			t.Fatalf("asset %s of %s is still missing (err %v)", a, appID, err)
 		}
 	}
 	return rec
@@ -179,4 +180,28 @@ func TestSweepRepairIsRetriedAfterAProviderError(t *testing.T) {
 		t.Fatalf("result = %+v, want the repair on the next sweep", res)
 	}
 	h.assetsPresent(t, appID)
+}
+
+// A file that cannot be checked is not a missing file: the sweep must not fetch
+// it again or rewrite the row on a stat error other than not-exist.
+func TestSweepDoesNotRefetchAFileItCannotCheck(t *testing.T) {
+	pool := testDB(t)
+	fp := &fakeProvider{artByExternal: map[string]Candidate{}}
+	h := newHarness(t, pool, fp)
+	fp.artByExternal["steam:620"] = Candidate{TileURL: h.artSrv.URL + "/grid.png"}
+	appID := h.seedExternalApp(t, "Portal 2", "game", "steam", "620")
+	h.svc.SweepOnce(context.Background())
+	before := h.assetsPresent(t, appID)
+	h.emptyCache(t)
+	// The shard path as a file: stat of the tile fails with ENOTDIR.
+	if err := os.WriteFile(filepath.Join(h.svc.blobs.Root(), before.TileAsset[:2]), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if res := h.svc.SweepOnce(context.Background()); res.ArtworkRepaired != 0 || fp.externalCalls != 1 {
+		t.Fatalf("result = %+v, external calls %d; want no repair and no fetch", res, fp.externalCalls)
+	}
+	if rec, _, _ := h.svc.store.Get(context.Background(), appID); rec.TileAsset != before.TileAsset {
+		t.Fatalf("the row changed: %+v -> %+v", before, rec)
+	}
 }

@@ -12,11 +12,15 @@ import (
 	_ "image/png"  // registers the PNG header reader for image.DecodeConfig
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // The only image types we will ever store or serve. Anything else is rejected
@@ -58,6 +62,14 @@ var ErrUnsupportedType = errors.New("artwork: unsupported image type")
 // persistent volume.
 type BlobStore struct {
 	root string
+	log  *slog.Logger
+
+	resizes     singleflight.Group
+	resizeSlots chan struct{}
+	// undecodable holds the names of stored blobs whose bytes cannot be
+	// resized, so they are not decoded again on every `?w=`. Only a blob that
+	// was read is added and PruneOrphans removes it, so it never outgrows the store.
+	undecodable sync.Map
 }
 
 // NewBlobStore creates (or adopts) the cache directory at root.
@@ -68,7 +80,7 @@ func NewBlobStore(root string) (*BlobStore, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("artwork: create cache dir: %w", err)
 	}
-	return &BlobStore{root: filepath.Clean(root)}, nil
+	return &BlobStore{root: filepath.Clean(root), log: slog.Default(), resizeSlots: make(chan struct{}, maxConcurrentResizes)}, nil
 }
 
 // Root reports the cache directory (used by tests and diagnostics).
@@ -122,26 +134,8 @@ func (b *BlobStore) Put(declaredType string, data []byte) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", fmt.Errorf("artwork: create shard dir: %w", err)
 	}
-	// Write to a temp file in the same directory then rename: a reader can only
-	// ever observe a complete blob, never a half-written one.
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".tmp-*")
-	if err != nil {
-		return "", fmt.Errorf("artwork: temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once the rename succeeded
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return "", fmt.Errorf("artwork: write blob: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("artwork: close blob: %w", err)
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return "", fmt.Errorf("artwork: chmod blob: %w", err)
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		return "", fmt.Errorf("artwork: publish blob: %w", err)
+	if err := writeAtomic(dst, data); err != nil {
+		return "", err
 	}
 	return name, nil
 }
@@ -170,8 +164,7 @@ func checkDimensions(mediaType string, data []byte) error {
 	return nil
 }
 
-// webpSize reads the canvas size from a WebP header (the stdlib has no WebP
-// reader and the repo carries no x/image). 0, 0 means unreadable.
+// webpSize reads the canvas size from a WebP header. 0, 0 means unreadable.
 func webpSize(d []byte) (w, h int) {
 	if len(d) < 30 || string(d[0:4]) != "RIFF" || string(d[8:12]) != "WEBP" {
 		return 0, 0
@@ -213,13 +206,18 @@ func (b *BlobStore) Open(name string) (data []byte, contentType string, err erro
 	return nil, "", ErrBadAsset
 }
 
-// Has reports whether a blob exists (and has a valid name).
-func (b *BlobStore) Has(name string) bool {
+// Has reports whether a blob exists (and has a valid name). Only a not-exist
+// stat error means it does not; any other is returned, and must never make a
+// caller delete or fetch again.
+func (b *BlobStore) Has(name string) (bool, error) {
 	if !assetName.MatchString(name) {
-		return false
+		return false, nil
 	}
 	_, err := os.Stat(b.pathFor(name))
-	return err == nil
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // PruneOrphans deletes every cached blob that `referenced` does not name.
@@ -230,7 +228,8 @@ func (b *BlobStore) Has(name string) bool {
 // is also what cleans up after a re-match, where the old blob simply stops
 // being referenced by anything.
 //
-// It returns the number removed. A file it cannot parse as an asset name is
+// It returns the number of blobs removed; their sized variants (variants.go)
+// go with them uncounted. A file it cannot parse as an asset or variant name is
 // left alone: this function deletes only things it is certain it created.
 func (b *BlobStore) PruneOrphans(referenced map[string]struct{}) (int, error) {
 	removed := 0
@@ -241,17 +240,22 @@ func (b *BlobStore) PruneOrphans(referenced map[string]struct{}) (int, error) {
 		if d.IsDir() {
 			return nil
 		}
-		name := d.Name()
-		if !assetName.MatchString(name) {
+		name, source := d.Name(), d.Name()
+		if m := variantName.FindStringSubmatch(name); m != nil {
+			source = m[1] // a sized copy goes with its source
+		} else if !assetName.MatchString(name) {
 			return nil // not ours — leave it
 		}
-		if _, keep := referenced[name]; keep {
+		if _, keep := referenced[source]; keep {
 			return nil
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
-		removed++
+		if name == source {
+			removed++
+			b.undecodable.Delete(name)
+		}
 		return nil
 	})
 	if err != nil {

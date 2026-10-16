@@ -48,6 +48,15 @@ func (h *harness) logoIconURLs(t *testing.T, appID string) (logo, icon *string) 
 	return logo, icon
 }
 
+func (h *harness) cached(t *testing.T, asset string) bool {
+	t.Helper()
+	ok, err := h.svc.blobs.Has(asset)
+	if err != nil {
+		t.Fatalf("has %s: %v", asset, err)
+	}
+	return ok
+}
+
 func (h *harness) record(t *testing.T, appID string) Record {
 	t.Helper()
 	rec, ok, err := h.svc.store.Get(context.Background(), appID)
@@ -188,7 +197,7 @@ func TestOrphanPruneKeepsCachedLogoAndIcon(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.svc.SweepOnce(ctx)
-	if !h.svc.blobs.Has(rec.LogoAsset) || !h.svc.blobs.Has(rec.IconAsset) {
+	if !h.cached(t, rec.LogoAsset) || !h.cached(t, rec.IconAsset) {
 		t.Fatal("the prune deleted a referenced logo or icon")
 	}
 
@@ -198,7 +207,7 @@ func TestOrphanPruneKeepsCachedLogoAndIcon(t *testing.T) {
 	if logo, icon := h.logoIconURLs(t, appID); logo != nil || icon != nil {
 		t.Fatal("clear left logo or icon urls")
 	}
-	if n, err := h.svc.PruneOrphans(ctx); err != nil || n < 2 || h.svc.blobs.Has(rec.LogoAsset) {
+	if n, err := h.svc.PruneOrphans(ctx); err != nil || n < 2 || h.cached(t, rec.LogoAsset) {
 		t.Fatalf("pruned %d (err %v); an unreferenced logo must go", n, err)
 	}
 }
@@ -240,7 +249,7 @@ func TestSweepRefetchesALostLogo(t *testing.T) {
 	}
 
 	res := h.svc.SweepOnce(ctx)
-	if res.LogoIconFilled != 1 || !h.svc.blobs.Has(rec.LogoAsset) || fp.logoIconCalls != 2 {
-		t.Fatalf("result %+v, %d calls, logo present %v", res, fp.logoIconCalls, h.svc.blobs.Has(rec.LogoAsset))
+	if res.LogoIconFilled != 1 || !h.cached(t, rec.LogoAsset) || fp.logoIconCalls != 2 {
+		t.Fatalf("result %+v, %d calls, logo present %v", res, fp.logoIconCalls, h.cached(t, rec.LogoAsset))
 	}
 }

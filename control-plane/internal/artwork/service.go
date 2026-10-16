@@ -93,6 +93,7 @@ func New(store *Store, blobRoot string, opts Options, log *slog.Logger) (*Servic
 	if err != nil {
 		return nil, err
 	}
+	blobs.log = log
 	if opts.MaxImageBytes <= 0 {
 		opts.MaxImageBytes = DefaultMaxImageBytes
 	}
@@ -782,16 +783,21 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 		if ctx.Err() != nil || attempts >= s.sweepBatch {
 			return
 		}
+		tileMissing, tileErr := s.missing(rec.TileAsset)
+		heroMissing, heroErr := s.missing(rec.HeroAsset)
+		logoMissing, logoErr := s.missing(rec.LogoAsset)
+		iconMissing, iconErr := s.missing(rec.IconAsset)
+		if err := errors.Join(tileErr, heroErr, logoErr, iconErr); err != nil {
+			s.log.Warn("artwork: could not check a cached image; it is not fetched again", "app_id", rec.AppID, "err", err)
+			continue
+		}
 		// A lost logo or icon puts an unlocked provider record back on backfillLogoIcon's queue.
-		if rec.Source == SourceProvider && !rec.Locked &&
-			((rec.LogoAsset != "" && !s.blobs.Has(rec.LogoAsset)) || (rec.IconAsset != "" && !s.blobs.Has(rec.IconAsset))) {
+		if (logoMissing || iconMissing) && rec.Source == SourceProvider && !rec.Locked {
 			rec.LogoAsset, rec.IconAsset, rec.LogoIconChecked = "", "", false
 			if err := s.store.SaveLogoIcon(ctx, rec); err != nil {
 				s.log.Warn("artwork: could not clear a missing logo or icon", "app_id", rec.AppID, "err", err)
 			}
 		}
-		tileMissing := rec.TileAsset != "" && !s.blobs.Has(rec.TileAsset)
-		heroMissing := rec.HeroAsset != "" && !s.blobs.Has(rec.HeroAsset)
 		if !tileMissing && !heroMissing {
 			continue
 		}
@@ -810,6 +816,15 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 		}
 		res.ArtworkRepaired++
 	}
+}
+
+// missing reports whether a recorded asset's file is gone; "" was never stored.
+func (s *Service) missing(asset string) (bool, error) {
+	if asset == "" {
+		return false, nil
+	}
+	ok, err := s.blobs.Has(asset)
+	return !ok && err == nil, err
 }
 
 func (s *Service) repairOne(ctx context.Context, provider Provider, rec Record, tileMissing, heroMissing bool) error {
