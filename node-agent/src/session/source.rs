@@ -1160,9 +1160,10 @@ impl AppSource {
             display: self.display,
             direct_display: None,
             // A swap to another app gets no helper: the socket reports one appid.
-            launch_helper: self.launch.as_ref().filter(|mount| {
-                super::launch_helper::appid_from_env(&effective_spec.env) == Some(mount.appid)
-            }),
+            launch_helper: self
+                .launch
+                .as_ref()
+                .and_then(|mount| mount.for_app(&effective_spec.env)),
         };
         // Snapshot the commit counter BEFORE the container exists, so anything counted
         // from here on can only have been drawn by the container about to start. Read

@@ -10,8 +10,9 @@
 //! The helper shares its container with untrusted game code, so every byte on the socket
 //! is hostile input. Lines over [`MAX_LINE`] bytes and anything that is not the wire shape
 //! are dropped, at most [`MAX_LINES_PER_SEC`] lines a second are read (the rest wait in the
-//! socket, so a flooding writer blocks), one connection is served at a time, and nothing
-//! here can end, fail or block the session.
+//! socket, so a flooding writer blocks), one connection is served at a time and dropped
+//! after [`IDLE`] without a line, launch states only move forward, and nothing here can
+//! end, fail or block the session.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -40,6 +41,9 @@ pub const MAX_LINES_PER_SEC: u32 = 10;
 /// Trace events and info lines one session's helper may cause; the metric keeps updating.
 const MAX_NOTABLE: u32 = 32;
 const POLL: Duration = Duration::from_millis(100);
+/// A served connection with no complete line for this long is dropped, so a silent holder
+/// cannot keep the helper out; the helper reconnects when its next line fails.
+pub const IDLE: Duration = Duration::from_secs(1);
 const LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Copy the helper shipped beside the agent binary into the runtime dir, the one path the
@@ -194,6 +198,8 @@ pub enum Rejected {
     Malformed,
     UnknownVersion,
     UnknownValue,
+    /// A launch state that does not move forward from the last one.
+    OutOfOrder,
 }
 
 impl Rejected {
@@ -204,6 +210,7 @@ impl Rejected {
             Rejected::Malformed => "malformed",
             Rejected::UnknownVersion => "unknown_version",
             Rejected::UnknownValue => "unknown_value",
+            Rejected::OutOfOrder => "out_of_order",
         }
     }
 }
@@ -225,7 +232,9 @@ pub fn parse(line: &[u8]) -> Result<Report, Rejected> {
 }
 
 /// The latest of each report the helper has made this session. A hint, never an
-/// authority: what the reveal (#727) and game-exit (#726) work reads.
+/// authority: what the reveal (#727) and game-exit (#726) work reads. Any process in the
+/// app container runs as the helper's user and can write a well-formed line or replace the
+/// helper; the bounds above limit what it can make the agent believe, nothing more.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaunchReports {
     pub launch_state: Option<LaunchState>,
@@ -234,15 +243,59 @@ pub struct LaunchReports {
     pub needs_user: Option<NeedsUser>,
 }
 
+/// Launch states only move forward (#725 amendment 2): `game_exited` only after
+/// `game_running`, nothing after it. `game_running` from nothing is a reconnect's replay.
+fn forward(from: Option<LaunchState>, to: LaunchState) -> bool {
+    use LaunchState::*;
+    match (from, to) {
+        (Some(GameExited), _) => false,
+        (_, Starting) => true,
+        (None | Some(Starting), ClientOnly) => true,
+        (None | Some(Starting | ClientOnly), GameRunning) => true,
+        (Some(GameRunning), GameExited) => true,
+        _ => false,
+    }
+}
+
+/// The reader's state, shared with every generation's mount.
+struct Shared {
+    /// False while the session's app is not its derived tile (after a swap away).
+    active: AtomicBool,
+    reports: Mutex<LaunchReports>,
+    metrics: Arc<SessionMetrics>,
+}
+
+impl Shared {
+    fn reports(&self) -> std::sync::MutexGuard<'_, LaunchReports> {
+        self.reports.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// What a generation's app container is given when it is the session's derived tile.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct LaunchMount {
     pub appid: u32,
     helper: PathBuf,
     socket_dir: PathBuf,
+    shared: Arc<Shared>,
 }
 
 impl LaunchMount {
+    /// The mount for a generation that runs `env`: the session's own tile gets it and
+    /// re-arms the reader. Any other app gets none, the reports go back to unknown and the
+    /// reader drops lines (a dead helper's may still be queued) until the tile is back.
+    /// The socket stays, so a rollback to the tile finds its bind source.
+    pub fn for_app(&self, env: &BTreeMap<String, String>) -> Option<&Self> {
+        let ours = appid_from_env(env) == Some(self.appid);
+        let mut reports = self.shared.reports();
+        self.shared.active.store(ours, Ordering::Relaxed);
+        if !ours {
+            *reports = LaunchReports::default();
+            self.shared.metrics.set_app_launch_state(None);
+        }
+        ours.then_some(self)
+    }
+
     /// Container args, in the bind shape `container::application_request_from_args` takes.
     pub fn args(&self) -> Vec<String> {
         vec![
@@ -289,7 +342,6 @@ pub fn retire_all_owned(runtime_dir: &str, owner: &str) -> owned_entry::Summary 
 /// A session's listening socket. Dropping it stops the reader and removes the directory.
 pub struct LaunchSocket {
     mount: LaunchMount,
-    reports: Arc<Mutex<LaunchReports>>,
     stop: Arc<AtomicBool>,
     runtime_dir: String,
     session_id: String,
@@ -360,8 +412,12 @@ impl LaunchSocket {
                 appid,
                 helper,
                 socket_dir: owned_entry::entry_dir(runtime_dir, PREFIX, session_id),
+                shared: Arc::new(Shared {
+                    active: AtomicBool::new(true),
+                    reports: Mutex::default(),
+                    metrics,
+                }),
             },
-            reports: Arc::default(),
             stop: Arc::default(),
             runtime_dir: runtime_dir.to_string(),
             session_id: session_id.to_string(),
@@ -378,10 +434,9 @@ impl LaunchSocket {
         listener.set_nonblocking(true)?;
         let mut reader = Reader {
             stop: socket.stop.clone(),
-            reports: socket.reports.clone(),
+            shared: socket.mount.shared.clone(),
             appid,
             session_id: session_id.to_string(),
-            metrics,
             trace,
             window: (Instant::now(), 0),
             notable_left: MAX_NOTABLE,
@@ -407,7 +462,7 @@ impl LaunchSocket {
     }
 
     pub fn reports(&self) -> LaunchReports {
-        *self.reports.lock().unwrap_or_else(PoisonError::into_inner)
+        *self.mount.shared.reports()
     }
 }
 
@@ -443,10 +498,9 @@ impl Limiter {
 
 struct Reader {
     stop: Arc<AtomicBool>,
-    reports: Arc<Mutex<LaunchReports>>,
+    shared: Arc<Shared>,
     appid: u32,
     session_id: String,
-    metrics: Arc<SessionMetrics>,
     trace: DiagnosticEventTx,
     /// Start of the current one-second window and the lines read in it.
     window: (Instant, u32),
@@ -486,7 +540,12 @@ impl Reader {
         let mut len = 0;
         // Inside a line already dropped as oversize, up to its newline.
         let mut skipping = false;
+        let mut last_line = Instant::now();
         while !self.stopped() {
+            if last_line.elapsed() >= IDLE {
+                tracing::debug!("launch helper connection quiet for {IDLE:?}; dropped");
+                return;
+            }
             match stream.read(&mut buf[len..]) {
                 Ok(0) => return,
                 Ok(n) => len += n,
@@ -506,6 +565,7 @@ impl Reader {
             while let Some(end) = buf[start..len].iter().position(|&b| b == b'\n') {
                 let line = start..start + end;
                 start += end + 1;
+                last_line = Instant::now();
                 if std::mem::take(&mut skipping) {
                     continue;
                 }
@@ -578,12 +638,22 @@ impl Reader {
     }
 
     fn apply(&mut self, report: Report) {
-        let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut reports = self.shared.reports();
+        if !self.shared.active.load(Ordering::Relaxed) {
+            return;
+        }
         match report {
             Report::LaunchState(state) if reports.launch_state != Some(state) => {
+                if !forward(reports.launch_state, state) {
+                    drop(reports);
+                    return self.drop_line(Rejected::OutOfOrder);
+                }
                 reports.launch_state = Some(state);
+                // Under the reports lock, so a swap's reset cannot land in between.
+                self.shared
+                    .metrics
+                    .set_app_launch_state(Some(state.as_str()));
                 drop(reports);
-                self.metrics.set_app_launch_state(Some(state.as_str()));
                 if self.notable() {
                     tracing::info!(
                         state = state.as_str(),
@@ -737,6 +807,11 @@ mod tests {
             appid: 620,
             helper: "/run/quasar-agent/quasar-launch-helper".into(),
             socket_dir: "/run/quasar-agent/launch-s1".into(),
+            shared: Arc::new(Shared {
+                active: AtomicBool::new(true),
+                reports: Mutex::default(),
+                metrics: Arc::new(SessionMetrics::new("off", 60)),
+            }),
         };
         let mut args: Vec<String> = [
             "run",
@@ -858,6 +933,8 @@ mod tests {
     }
 
     const CLIENT_ONLY: &[u8] = b"{\"type\":\"launch_state\",\"v\":1,\"state\":\"client_only\"}\n";
+    const STARTING: &[u8] = b"{\"type\":\"launch_state\",\"v\":1,\"state\":\"starting\"}\n";
+    const GAME_WINDOW: &[u8] = b"{\"type\":\"game_window\",\"v\":1,\"on_screen\":true}\n";
 
     #[test]
     fn a_fake_helper_moves_the_metric_and_the_trace_through_the_four_states() {
@@ -1011,16 +1088,135 @@ mod tests {
     }
 
     #[test]
-    fn a_second_connection_waits_for_the_first() {
+    fn a_quiet_connection_is_dropped_and_the_next_one_is_served() {
         let s = Session::open(620);
-        let first = s.connect();
-        std::thread::sleep(POLL * 2);
-        let mut second = s.connect();
-        second.write_all(CLIENT_ONLY).unwrap();
+        // A holder that said one thing and then went quiet, the way a process that killed
+        // the helper and took its place could.
+        let mut holder = s.connect();
+        holder.write_all(STARTING).unwrap();
+        s.wait_for(|r| r.launch_state == Some(LaunchState::Starting));
+        let mut helper = s.connect();
+        helper.write_all(CLIENT_ONLY).unwrap();
         std::thread::sleep(POLL * 3);
-        assert_eq!(s.socket().reports().launch_state, None);
-        drop(first);
+        assert_eq!(
+            s.socket().reports().launch_state,
+            Some(LaunchState::Starting),
+            "one connection at a time"
+        );
+        s.wait_for(|r| r.launch_state == Some(LaunchState::ClientOnly));
+        holder.set_read_timeout(Some(POLL)).unwrap();
+        assert_eq!(
+            holder.read(&mut [0u8; 1]).unwrap(),
+            0,
+            "the holder was closed"
+        );
+    }
+
+    #[test]
+    fn launch_states_only_move_forward() {
+        use LaunchState::*;
+        let allowed = [
+            (None, Starting),
+            (None, ClientOnly),
+            (None, GameRunning),
+            (Some(Starting), ClientOnly),
+            (Some(Starting), GameRunning),
+            (Some(ClientOnly), Starting),
+            (Some(ClientOnly), GameRunning),
+            (Some(GameRunning), Starting),
+            (Some(GameRunning), GameExited),
+        ];
+        for from in [
+            None,
+            Some(Starting),
+            Some(ClientOnly),
+            Some(GameRunning),
+            Some(GameExited),
+        ] {
+            for to in [Starting, ClientOnly, GameRunning, GameExited] {
+                if from != Some(to) {
+                    assert_eq!(
+                        forward(from, to),
+                        allowed.contains(&(from, to)),
+                        "{from:?} -> {to:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn state_line(state: &str) -> Vec<u8> {
+        format!("{{\"type\":\"launch_state\",\"v\":1,\"state\":\"{state}\"}}\n").into_bytes()
+    }
+
+    #[test]
+    fn a_launch_state_out_of_order_changes_nothing() {
+        let mut s = Session::open(620);
+        let mut helper = s.connect();
+        // A title that never ran cannot have exited.
+        helper.write_all(&state_line("game_exited")).unwrap();
+        // A reconnect replays only the latest state, so running from nothing is fine.
+        helper.write_all(&state_line("game_running")).unwrap();
+        s.wait_for(|r| r.launch_state == Some(LaunchState::GameRunning));
+        helper.write_all(&state_line("client_only")).unwrap();
+        helper.write_all(&state_line("game_exited")).unwrap();
+        s.wait_for(|r| r.launch_state == Some(LaunchState::GameExited));
+        // Nothing after the exit.
+        for state in ["starting", "client_only", "game_running"] {
+            helper.write_all(&state_line(state)).unwrap();
+        }
+        helper.write_all(GAME_WINDOW).unwrap();
+        s.wait_for(|r| r.game_window_on_screen.is_some());
+        assert_eq!(
+            s.socket().reports().launch_state,
+            Some(LaunchState::GameExited)
+        );
+        assert_eq!(s.wire_state().as_deref(), Some("game_exited"));
+        let states: Vec<_> = s.traces().iter().map(|p| p["state"].clone()).collect();
+        assert_eq!(states, ["game_running", "game_exited"]);
+    }
+
+    #[test]
+    fn a_swap_away_from_the_tile_clears_the_reports_until_it_is_back() {
+        let s = Session::open(620);
+        let mount = s.socket().mount().clone();
+        let mut helper = s.connect();
+        helper.write_all(&state_line("game_running")).unwrap();
         s.wait_for(|r| r.launch_state.is_some());
+
+        // Another tile, the plain Steam app or a non-Steam app: no mount for any of them.
+        for other in [env("-applaunch 730"), env("-bigpicture"), BTreeMap::new()] {
+            assert!(mount.for_app(&other).is_none());
+        }
+        assert_eq!(s.socket().reports(), LaunchReports::default());
+        assert_eq!(s.wire_state(), None, "absent: the app no longer reports");
+        // A dead helper's queued line is dropped while the tile is away.
+        helper.write_all(&state_line("game_exited")).unwrap();
+        helper.write_all(GAME_WINDOW).unwrap();
+        std::thread::sleep(POLL * 3);
+        assert_eq!(s.socket().reports(), LaunchReports::default());
+        assert_eq!(s.wire_state(), None);
+
+        // A rollback or a swap back to the tile gets the mount and re-arms the reader.
+        assert!(mount.for_app(&env("-bigpicture -applaunch 620")).is_some());
+        helper.write_all(CLIENT_ONLY).unwrap();
+        s.wait_for(|r| r.launch_state == Some(LaunchState::ClientOnly));
+        assert_eq!(s.wire_state().as_deref(), Some("client_only"));
+    }
+
+    #[test]
+    fn the_log_limiter_lets_one_line_through_an_interval_and_counts_the_rest() {
+        let mut limiter = Limiter::default();
+        assert_eq!(limiter.ready(), Some(0));
+        assert_eq!(limiter.ready(), None);
+        assert_eq!(limiter.ready(), None);
+        limiter.last = limiter.last.and_then(|t| t.checked_sub(LOG_INTERVAL));
+        assert_eq!(
+            limiter.ready(),
+            Some(2),
+            "the next line says how many it held back"
+        );
+        assert_eq!(limiter.ready(), None);
     }
 
     #[test]

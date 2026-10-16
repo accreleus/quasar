@@ -4,7 +4,7 @@
 //! (`QUASAR_LAUNCH_HELPER`). It watches the derived tile's game with `quasar-launch-watch`
 //! and writes each change to `QUASAR_LAUNCH_SOCKET` as one line of the #725 wire, whose
 //! reader is `node-agent/src/session/launch_helper.rs`. Report-only: it reads nothing from
-//! the socket and writes nothing to the X display.
+//! the socket, and on the X display it changes nothing but interning the atoms it reads.
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -111,32 +111,39 @@ impl Agent {
         if self.conn.is_some() || Instant::now() < self.next_try {
             return;
         }
-        self.next_try = Instant::now() + RECONNECT;
-        let Ok(conn) = UnixStream::connect(&self.path) else {
+        let conn = UnixStream::connect(&self.path)
+            .and_then(|conn| conn.set_write_timeout(Some(WRITE_TIMEOUT)).map(|()| conn));
+        let Ok(conn) = conn else {
+            // Only a failed connect waits: the agent drops a quiet connection, and the
+            // next line has to go out on a new one at once.
+            self.next_try = Instant::now() + RECONNECT;
             return;
         };
-        if conn.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
-            return;
-        }
         self.conn = Some(conn);
         for line in self.latest.clone().into_iter().flatten() {
-            self.write(&line);
+            if !self.write(&line) {
+                return;
+            }
         }
     }
 
     fn send(&mut self, report: Report) {
         let (kind, line) = line(report);
-        self.write(&line);
-        self.latest[kind] = Some(line);
+        self.latest[kind] = Some(line.clone());
+        if !self.write(&line) {
+            self.connect();
+        }
     }
 
-    fn write(&mut self, line: &str) {
-        if let Some(conn) = &mut self.conn {
-            if conn.write_all(line.as_bytes()).is_err() {
-                eprintln!("quasar-launch-helper: lost the agent's socket; reconnecting");
-                self.conn = None;
-            }
+    fn write(&mut self, line: &str) -> bool {
+        let Some(conn) = &mut self.conn else {
+            return false;
+        };
+        let written = conn.write_all(line.as_bytes()).is_ok();
+        if !written {
+            self.conn = None;
         }
+        written
     }
 }
 
@@ -441,24 +448,31 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_socket_is_dropped_and_retried() {
+    fn a_dropped_connection_is_replaced_at_the_next_line() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("launch.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let mut agent = Agent::new(path.clone());
         agent.connect();
+        agent.send(Report::LaunchState(LaunchState::Starting));
+        // The agent drops a connection that goes quiet.
         let (first, _) = listener.accept().unwrap();
         drop(first);
-        // The first write after the peer closed may still succeed; the next one cannot.
-        for _ in 0..3 {
-            agent.send(Report::GameWindow { on_screen: true });
-        }
-        assert!(agent.conn.is_none());
-        agent.next_try = Instant::now();
-        agent.connect();
+        agent.send(Report::LaunchState(LaunchState::ClientOnly));
+        agent.send(Report::GameWindow { on_screen: true });
         drop(agent);
-        let (second, _) = listener.accept().unwrap();
-        let lines: Vec<String> = BufReader::new(second).lines().map(Result::unwrap).collect();
-        assert_eq!(lines, [r#"{"type":"game_window","v":1,"on_screen":true}"#]);
+        // Already queued, or the helper never reconnected: fail, do not hang.
+        listener.set_nonblocking(true).unwrap();
+        let (second, _) = listener.accept().expect("the helper reconnected");
+        second.set_nonblocking(false).unwrap();
+        let mut lines: Vec<String> = BufReader::new(second).lines().map(Result::unwrap).collect();
+        lines.dedup();
+        assert_eq!(
+            lines,
+            [
+                r#"{"type":"launch_state","v":1,"state":"client_only"}"#,
+                r#"{"type":"game_window","v":1,"on_screen":true}"#,
+            ]
+        );
     }
 }
