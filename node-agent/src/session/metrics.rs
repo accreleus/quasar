@@ -195,6 +195,9 @@ pub struct MetricsWindow {
     /// refresh_mHz)`. Not an echo: present in every window once set (a console session
     /// always has one), absent on a streamed session, which has none.
     pub console_mode: Option<(u16, u16, u32)>,
+    /// #731: the launch helper's last `app_launch_state`. Present in every window once
+    /// set, absent for a session with no helper (absence means unknown).
+    pub app_launch_state: Option<&'static str>,
     /// SPT-01: the raw rtpgccbwe estimate (kbit/s) BEFORE the governor's EWMA / deadband
     /// / step logic; its delta against `abr_setpoint_kbps` is the governor's smoothing
     /// contribution. `None` when ABR is disarmed or no estimate has arrived.
@@ -275,6 +278,7 @@ pub struct SessionMetrics {
     display: LiveEcho,
     /// #445: the console session's physical display mode; see `MetricsWindow::console_mode`.
     console_mode: Mutex<Option<(u16, u16, u32)>>,
+    app_launch_state: Mutex<Option<&'static str>>,
     /// SPT-03: the frame rate the classifier should expect, seeded from the launch fps.
     /// Drives the per-frame encode budget (`1000 / target_fps`) so the saturation trip
     /// scales with the tier instead of assuming 60.
@@ -433,6 +437,7 @@ impl SessionMetrics {
             abr_mode,
             display: LiveEcho::default(),
             console_mode: Mutex::new(None),
+            app_launch_state: Mutex::new(None),
             target_fps: AtomicU64::new(target_fps as u64),
             last_setpoint_kbps: Mutex::new(0),
             last_encode_in_ms: AtomicU64::new(0),
@@ -845,6 +850,14 @@ impl SessionMetrics {
         *self.console_mode.lock().unwrap() = mode;
     }
 
+    /// See `MetricsWindow::app_launch_state`.
+    pub fn set_app_launch_state(&self, state: Option<&'static str>) {
+        *self
+            .app_launch_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+    }
+
     /// SPT-08 (D6): publish the ladder's speed-bias rung. Written by the ladder's
     /// `on_window` closure per actuated step; a snapshot, not a counter.
     pub fn set_ladder_bias(&self, bias: u8) {
@@ -1151,6 +1164,10 @@ impl SessionMetrics {
             ladder_fps: echo.ladder_fps.reported(),
             external_owner: echo.external_owner.reported(),
             console_mode: *self.console_mode.lock().unwrap(),
+            app_launch_state: *self
+                .app_launch_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             gcc_estimate_kbps,
             abr_mode: self.abr_mode,
             adaptation_state,

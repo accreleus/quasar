@@ -268,6 +268,7 @@ fn run_until_end<F: Fn(SessionEvent)>(
             fps: cfg.stream.fps,
         },
         direct_display: Some(DirectDisplay { host, input }),
+        launch_helper: None,
     };
     let mut observation = GenerationObservation::new();
     let mut container = match ContainerRuntime::from_env().run(&spec, &params) {

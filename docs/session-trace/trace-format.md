@@ -88,7 +88,7 @@ document records (§8, §9) were estimator confusion, one level apart.
 <!-- GENERATED from docs/session-trace/metrics.json by scripts/dx/gen_trace_docs.py.
      Do not edit between these markers; edit the manifest and run `make docs-trace`. -->
 
-*Manifest version `2026-08-24.1` — 46 curated series of 124 documented keys.*
+*Manifest version `2026-08-24.1` — 46 curated series of 125 documented keys.*
 
 | taxonomy name | source | raw key | unit | clock | window | estimator | n | meaning / the trap it avoids |
 |---|---|---|---|---|---|---|---|---|
@@ -211,7 +211,7 @@ what is in the payload, and whether a missing row means anything — were only i
 | `session.effective_media` | reliable | `configured`, `resolved`, `actual`, `app_display`, `audio`, `mic` | `host_wall` | The one-shot, first-offer snapshot of what the session actually built: element readbacks and negotiated caps, kept separate from what was requested. ONE-SHOT BY CONTRACT — it is never re-emitted, which is why caps.negotiated exists. |
 | `abr.retarget` | diagnostic | `from_kbps`, `to_kbps`, `reason` | `host_wall` | The in-session ABR governor moved its CBR setpoint. Pairs with the abr.* sample series: the samples say where the setpoint sat, this says when and why it moved. |
 | `app.exited` | diagnostic | `status`, `policy` | `host_wall` | The session's app container exited, with the on_app_exit policy that decided what happened next. A Keep policy means the session continues with an empty compositor. |
-| `app.launch_state` | diagnostic | `state`, `appid` | `host_wall` | Declared by agent-api.md as the event-driven counterpart of the app_launch_state sample key. Contract-defined; no node-agent emitter today. |
+| `app.launch_state` | diagnostic | `state`, `appid` | `host_wall` | The in-container launch helper reported a new app_launch_state for a derived Steam tile; appid is the tile's Steam appid as a string. One event per transition, capped per session; the event-driven counterpart of the app_launch_state sample key. |
 | `audio.degraded` | diagnostic | `reason`, `required` | `host_wall` | The per-session PulseAudio sidecar was wanted and unavailable, so the session is MUTE. Emitted at the first offer, not at detection: the control plane drops an event for a session that is not yet running, and the sidecar fails during resource prepare. |
 | `encoder.drop_detected` | diagnostic | `frames_dropped`, `window_ms` | `host_wall` | A non-trivial frame-drop burst in one window, from the 500 ms per-frame drop scan. Deliberately independent of encoder.stall: this counts frames that produced no output, that reports the encoder having stopped. |
 | `pipeline.source_swapped` | diagnostic | `from_app`, `to_app` | `host_wall` | A launcher-to-game source-pipeline swap completed. The encode pipeline and webrtcbin are NOT touched (P2-07), so this is a source-generation change, not a renegotiation — caps.negotiated{trigger:source_swap} follows it and reports the caps. |

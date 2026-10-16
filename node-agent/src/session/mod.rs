@@ -50,6 +50,8 @@ pub mod cuda_share;
 pub mod host;
 pub mod input;
 pub mod ladder;
+/// The in-container Steam launch helper's socket, mount and wire (#731).
+pub mod launch_helper;
 pub mod metrics;
 // Host-path policy for wire-supplied bind mounts (QUASAR_APP_MOUNT_ALLOW).
 pub mod mount_policy;
