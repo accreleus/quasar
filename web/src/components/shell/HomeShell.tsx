@@ -29,12 +29,15 @@ import { UserMenu } from "./UserMenu";
 import { useLibraryCatalog } from "../../pages/app/libraryCatalog";
 import { buildUserNav, SEARCHABLE_ROUTES } from "../../pages/app/navItems";
 import { useLibrarySearch } from "../../pages/app/librarySearchContext";
+import { FuzzySearch } from "../../pages/app/search/FuzzySearch";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
 
 export function HomeShell({ children }: { children: ReactNode }) {
   const { pathname } = useLocation();
   const { query, setQuery } = useLibrarySearch();
   const { apps } = useLibraryCatalog();
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const newDesign = useNewDesign();
 
   // Exact match, not `startsWith` — /app/session/:id has no shell; a future
   // /app/* child must opt in explicitly.
@@ -63,7 +66,8 @@ export function HomeShell({ children }: { children: ReactNode }) {
 
         <div className="spacer" />
 
-        {searchable && (
+        {searchable && newDesign && <FuzzySearch query={query} setQuery={setQuery} apps={apps} />}
+        {searchable && !newDesign && (
           <div className="search">
             <IconSearch className="ic" />
             <input

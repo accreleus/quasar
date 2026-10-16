@@ -35,6 +35,9 @@ import {
   type PaletteSession,
   type PaletteUser,
 } from "./paletteSearch";
+import { beforePaletteRun, searchPaletteFuzzy } from "./paletteGames";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
+import { useLibraryExtras } from "../../pages/app/library/libraryExtras";
 
 /** One frozen empty list for every absent source, so an omitted prop does not
  *  churn the search memo on each render. */
@@ -80,16 +83,18 @@ export function CommandPalette({
   /** Whatever had focus when the palette opened, owed it back on close. */
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
+  const newDesign = useNewDesign();
+  const extras = useLibraryExtras();
   const groups = useMemo(
     () =>
-      searchPalette(query, {
+      (newDesign ? (q: string, s: Parameters<typeof searchPalette>[1]) => searchPaletteFuzzy(q, s, extras) : searchPalette)(query, {
         hosts: hosts ?? NONE,
         sessions: sessions ?? NONE,
         apps: apps ?? NONE,
         users: users ?? NONE,
         isAdmin,
       }),
-    [query, hosts, sessions, apps, users, isAdmin],
+    [query, hosts, sessions, apps, users, isAdmin, newDesign, extras],
   );
   // Derived from the sources actually handed down, not from the role alone —
   // see paletteScope. The account area gets the same palette with a shorter
@@ -148,11 +153,12 @@ export function CommandPalette({
   const run = useCallback(
     (item: PaletteItem | undefined) => {
       if (!item) return;
+      if (newDesign) beforePaletteRun(item, isAdmin);
       onOpenChange(false);
       if (item.action === "toggle-appearance") toggleTheme();
       else if (item.to) navigate(item.to);
     },
-    [navigate, onOpenChange, toggleTheme],
+    [navigate, onOpenChange, toggleTheme, newDesign, isAdmin],
   );
 
   /** Cycle focus inside the panel. Tab is handled outright rather than only

@@ -14,6 +14,9 @@ import { CommandPalette } from "./CommandPalette";
 import { AuthContext, type AuthContextValue } from "../../auth/context";
 import { ThemeProvider } from "../../settings/ThemeContext";
 
+// These pin the shipped palette; the new design's game search is in paletteGames.test.ts.
+vi.mock("../../settings/OverlayPreferencesContext", () => ({ useNewDesign: () => false }));
+
 const apps = [{ id: "a1", name: "Blender", kind: "desktop" }];
 const hosts = [{ id: "h1", node_name: "quasar-node-1", status: "online" }];
 

@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **The library is easier to move through (#714).** The library section is one row of controls (title and count, a kind filter, and Genre and Sort menus once the server provides genres and play history), an A–Z index down the right edge over letter sections, and a search that ranks results and forgives typos, in the top bar and in the Ctrl+K palette. Account ▸ Preferences ▸ Appearance ▸ Classic layout brings back the previous library.
 - **Account ▸ Preferences ▸ Appearance has a Classic layout switch (#714).** Off by default. It is the switch for the redesigned library, game page and account pages, which arrive in following changes; turning it on keeps the previous layout. The choice is saved with your account, so it follows you to every device. Nothing changes on screen yet.
 
 ### Changed

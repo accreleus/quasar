@@ -1,0 +1,403 @@
+/* The redesigned library controls (operator-approved from the UX lab): `.lib-head`
+   stays the one row (title, count, the chosen-genre chip, the type tabs, then
+   Genre and Sort), the A–Z index is a column in the right page gutter, letter
+   heads and the caption strip belong to the sorted grid. Overrides of shipped
+   classes are scoped to the new design; the rest only exists in its markup. */
+
+
+/* ---- the row ---------------------------------------------------------- */
+
+html[data-design="new"] .lib-head {
+  flex-wrap: nowrap;
+  gap: var(--s3);
+}
+html[data-design="new"] .lib-head > h2,
+html[data-design="new"] .lib-head > .count {
+  flex: none;
+  white-space: nowrap;
+}
+/* The tabs give way first: they scroll inside their own box (home.css). */
+html[data-design="new"] .lib-head > .segmented {
+  flex: 0 1 auto;
+}
+/* The menus take the right edge; the head's spacer is not needed. */
+html[data-design="new"] .lib-head > .grow {
+  display: none;
+}
+/* The segmented control's box (primitives.css `.segmented`), drawn here rather
+   than borrowed: that class's button rules would restyle the list's options. */
+.lib-menus {
+  display: inline-flex;
+  flex: none;
+  gap: var(--s1);
+  margin-left: auto;
+  padding: var(--s1);
+  background: color-mix(in oklch, var(--surf-inset) 72%, transparent);
+  /* No backdrop blur of its own: it would make this box the list's backdrop
+     root, and the list would show the art through it unblurred. */
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-panel);
+}
+
+/* ---- the triggers: segments that open a list ------------------------------ */
+
+.lib-pick {
+  position: relative;
+}
+.lib-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  height: auto;
+  padding: var(--s2) var(--s3);
+  border: 1px solid transparent;
+  border-radius: 6px; /* the home segment's radius (home.css) */
+  background: none;
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--t-sm);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background .16s ease, color .16s ease;
+}
+.lib-trigger:hover,
+.lib-trigger[aria-expanded="true"] {
+  background: var(--glass-control);
+  color: var(--text);
+}
+.lib-trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.lib-icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--text-3);
+}
+.lib-trigger:hover .lib-icon,
+.lib-trigger[aria-expanded="true"] .lib-icon {
+  color: var(--text-2);
+}
+.lib-chev {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--text-3);
+  transition: transform .16s ease;
+}
+.lib-trigger[aria-expanded="true"] .lib-chev {
+  transform: rotate(180deg);
+}
+
+/* ---- the list: the user menu's material (shell.css `.user-pop`) ----------- */
+
+.lib-pop {
+  position: absolute;
+  top: calc(100% + var(--s2));
+  right: 0;
+  z-index: 80;
+  width: max-content;
+  min-width: 220px;
+  max-height: min(60vh, 440px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--s2);
+  background: color-mix(in oklch, var(--surf-raised) 90%, transparent);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-panel);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem var(--pop-shadow);
+  animation: lib-in .16s ease;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-3) transparent;
+}
+@keyframes lib-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+.lib-opt {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  width: 100%;
+  min-height: 40px;
+  padding: var(--s2) var(--s3);
+  border: 0;
+  border-radius: var(--r-control);
+  background: none;
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--t-sm);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.lib-opt:hover,
+.lib-opt:focus-visible {
+  background: var(--glass-control);
+  color: var(--text);
+  outline: none;
+}
+.lib-opt:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.lib-opt[aria-selected="true"] {
+  color: var(--text);
+  font-weight: 600;
+}
+.lib-tick {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--accent-text);
+  visibility: hidden;
+}
+.lib-opt[aria-selected="true"] .lib-tick {
+  visibility: visible;
+}
+.lib-opt-label {
+  flex: 1;
+}
+.lib-opt-count {
+  margin-left: var(--s5);
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  font-variant-numeric: tabular-nums;
+}
+/* "All genres" is the way back; a hairline sets it apart from the genres. */
+.lib-opt:first-child:has(+ .lib-opt .lib-opt-count) {
+  margin-bottom: var(--s1);
+  box-shadow: 0 1px 0 var(--line);
+  border-radius: var(--r-control) var(--r-control) 0 0;
+}
+
+/* ---- the chosen genre: selection, so violet (`.chip-accent` roles) -------- */
+
+.lib-chip {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s1);
+  min-height: 32px;
+  padding: var(--s1) var(--s2) var(--s1) var(--s3);
+  border: 1px solid var(--accent-soft-2);
+  border-radius: var(--r-pill);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font: inherit;
+  font-size: var(--t-sm);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease;
+  animation: lib-in .16s ease;
+}
+/* 44px hit area around the 32px pill. */
+.lib-chip::after {
+  content: "";
+  position: absolute;
+  inset: -6px -2px;
+}
+.lib-chip:hover {
+  background: var(--accent-soft-2);
+  border-color: var(--accent-text);
+}
+.lib-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.lib-chip-x {
+  width: 14px;
+  height: 14px;
+}
+
+/* ---- the A–Z index: a column in the right gutter --------------------------- */
+
+.lib-index {
+  /* Its height: the viewport under the 64px topbar, less a breath top and bottom. */
+  --index-h: calc(100dvh - 64px - var(--s4));
+  position: sticky;
+  top: calc(64px + var(--s2));
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: var(--page-pad);
+  height: var(--index-h);
+  /* Takes no height in flow and sits in the gutter, so the grid keeps its width. */
+  margin: 0 calc(-1 * var(--page-pad)) calc(-1 * var(--index-h)) auto;
+  touch-action: none;
+}
+.lib-index button {
+  flex: 0 1 28px;
+  min-height: 0;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-control);
+  background: none;
+  color: var(--text-3);
+  font: inherit;
+  font-size: var(--t-xs);
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  transition: color .12s ease, background .12s ease;
+}
+@media (hover: hover) {
+  .lib-index button:hover:not(:disabled) {
+    color: var(--text);
+    background: var(--surf-control);
+  }
+}
+.lib-index button:disabled {
+  color: var(--text-4);
+  cursor: default;
+}
+.lib-index button[aria-current="location"] {
+  color: var(--text);
+  background: var(--accent-soft-2);
+}
+.lib-index button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* No bar on top any more: a jump parks a section just under the topbar. */
+html[data-design="new"] .lib-letter {
+  scroll-margin-top: calc(64px + var(--s3));
+}
+
+/* ---- tablets: the triggers fold to their icons ----------------------------- */
+
+@media (max-width: 1060px) {
+  .lib-text {
+    display: none;
+  }
+  .lib-trigger {
+    gap: var(--s1);
+    min-height: 36px;
+    padding-inline: var(--s2);
+  }
+}
+
+/* ---- phones: title line, then tabs + the two triggers ---------------------- */
+
+@media (max-width: 760px) {
+  html[data-design="new"] .lib-head {
+    flex-wrap: wrap;
+    row-gap: var(--s3);
+  }
+  /* Line 1: title, count, chip, then Home's link (or Stop session) on the right. */
+  html[data-design="new"] .lib-head > h2,
+  html[data-design="new"] .lib-head > .count {
+    order: -5;
+  }
+  html[data-design="new"] .lib-head > .lib-chip {
+    order: -4;
+  }
+  html[data-design="new"] .lib-head > .grow {
+    display: block;
+    order: -3;
+  }
+  html[data-design="new"] .lib-head > * {
+    order: -3;
+  }
+  /* The line break. */
+  html[data-design="new"] .lib-head::after {
+    content: "";
+    order: -2;
+    flex-basis: 100%;
+  }
+  /* Line 2: the tabs take what the two triggers leave and scroll inside. */
+  html[data-design="new"] .lib-head > .segmented {
+    order: -1;
+    flex: 1 1 0;
+    margin-left: 0;
+  }
+  /* After the tabs. */
+  html[data-design="new"] .lib-head > .lib-menus {
+    order: 2;
+    margin-left: 0;
+  }
+  /* The column's 44px hit width reaches over the tiles' outer edge a little;
+     the glyphs themselves sit in the gutter. */
+  .lib-index {
+    --index-h: calc(100dvh - 64px - var(--tabbar-h) - env(safe-area-inset-bottom, 0px) - var(--s4));
+    width: 44px;
+  }
+  .lib-index button {
+    flex-basis: 24px;
+    text-align: right;
+    padding-right: var(--s1);
+  }
+  html[data-design="new"] .home-lib:has(> .lib-index) > div:last-child {
+    padding-right: var(--s4);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lib-pop,
+  .lib-chip {
+    animation: none;
+  }
+  .lib-trigger,
+  .lib-chev,
+  .lib-chip,
+  .lib-index button {
+    transition: none;
+  }
+}
+
+/* ---- letter sections and the caption strip ------------------------------- */
+
+/* Letter heads: a smaller `.src-head`. */
+.lib-letter-h {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s3);
+  margin: var(--s6) 0 var(--s3);
+  font-size: var(--t-lg);
+  font-weight: 600;
+  color: var(--text);
+}
+.lib-letter:first-child .lib-letter-h {
+  margin-top: var(--s2);
+}
+.lib-letter-h .count {
+  font-size: var(--t-sm);
+  font-weight: 500;
+  color: var(--text-3);
+}
+
+/* Recency / play-time sorts: a caption strip under the art. The cover goes
+   back into flow at 2:3 and the strip sits in the tile's own padding, inside
+   the surface button, so pressing the caption opens the tile. */
+.lib-meta .lib-tile {
+  aspect-ratio: auto;
+  padding-bottom: calc(var(--t-xs) * 1.4 + 2 * var(--s2));
+}
+.lib-meta .lib-tile > .cover {
+  position: relative;
+  display: block;
+  aspect-ratio: 2 / 3;
+}
+.lib-tile-meta {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: var(--s2) var(--s3);
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: var(--t-xs);
+  line-height: 1.4;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

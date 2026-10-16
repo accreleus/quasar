@@ -51,6 +51,8 @@ export interface LibraryTileProps {
   /** The detail band, when this tile is the last one in the opened row. Kept
    *  as a sibling of the tile so it is always the next grid child. */
   detail?: ReactNode;
+  /** New design: a caption inside the surface button. */
+  meta?: ReactNode;
 }
 
 export function LibraryTile({
@@ -65,6 +67,7 @@ export function LibraryTile({
   onOpen,
   onPlay,
   detail = null,
+  meta,
 }: LibraryTileProps) {
   // The mock's `onerror="this.remove()"`: the gradient + glyph underneath is a
   // design, not a broken state, so a 404 cover falls back to it instead of
@@ -146,7 +149,9 @@ export function LibraryTile({
           aria-controls={detailId}
           onClick={onOpen}
           ref={tileRef}
-        />
+        >
+          {meta}
+        </button>
       </div>
       {detail}
     </>
