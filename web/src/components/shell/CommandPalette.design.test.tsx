@@ -2,18 +2,17 @@
  * The palette under the real design switch (CommandPalette.test.tsx pins the
  * shipped palette with a mock). Admin keeps the shipped game search whatever the
  * user chose, and gains the console's own pages and settings unless they chose
- * Classic; a player's chosen game asks the library page to open it.
+ * Classic; a player's chosen game opens its page.
  */
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 
 import { CommandPalette } from "./CommandPalette";
 import { AuthContext, type AuthContextValue } from "../../auth/context";
 import { OverlayPreferencesProvider } from "../../settings/OverlayPreferencesContext";
 import { ThemeProvider } from "../../settings/ThemeContext";
-import { OPEN_EVENT } from "../../pages/app/search/useFuzzy";
 
 vi.mock("../../api/me", () => ({
   getUIPreferences: () => new Promise(() => {}),
@@ -35,7 +34,13 @@ const auth = (isAdmin: boolean): AuthContextValue => ({
 
 function Open() {
   const [open, setOpen] = useState(true);
-  return <CommandPalette open={open} onOpenChange={setOpen} apps={apps} />;
+  const { pathname, state } = useLocation();
+  return (
+    <>
+      <CommandPalette open={open} onOpenChange={setOpen} apps={apps} />
+      <span data-testid="where">{`${pathname} ${JSON.stringify(state)}`}</span>
+    </>
+  );
 }
 
 function mount(path: string, isAdmin: boolean, classic = false) {
@@ -79,15 +84,17 @@ describe("CommandPalette on /admin", () => {
 });
 
 describe("CommandPalette in the player area with the new design on", () => {
-  it("a game row asks the page to open it, even when no navigation changes the list", () => {
+  it("a game row opens its page, saying where it came from so Back returns there", () => {
     mount("/app/library", false);
-    const onOpen = vi.fn();
-    window.addEventListener(OPEN_EVENT, onOpen);
     type("ruina");
-    act(() => {
-      fireEvent.keyDown(screen.getByRole("combobox"), { key: "Enter" });
-    });
-    window.removeEventListener(OPEN_EVENT, onOpen);
-    expect(onOpen).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(screen.getByRole("combobox"), { key: "Enter" });
+    expect(screen.getByTestId("where")).toHaveTextContent('/app/game/a1 {"from":"palette"}');
+  });
+
+  it("a settings row carries no game-page hand-off state, so Play never takes the focus the setting is owed", () => {
+    mount("/app/library", false);
+    type("classic layout");
+    fireEvent.keyDown(screen.getByRole("combobox"), { key: "Enter" });
+    expect(screen.getByTestId("where")).toHaveTextContent("/app/account/appearance null");
   });
 });

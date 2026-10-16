@@ -159,3 +159,24 @@ describe("library tile", () => {
     expect(tileBoxOf(null)).toBeNull();
   });
 });
+
+describe("library tile, new design props", () => {
+  it("without them it is the classic tile: favourite marker, expandable surface", () => {
+    renderTiles([app("a1", "Portal 2", { favourite: true })]);
+    expect(document.querySelector(".fav-marker")).not.toBeNull();
+    expect(document.querySelector(".tile-heart, .tile-titled")).toBeNull();
+    expect(screen.getByRole("button", { name: "Portal 2" }).getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("with onFavourite it swaps the marker for a heart that toggles, and titles the tile", () => {
+    const onFavourite = vi.fn();
+    renderTiles([app("a1", "Portal 2")], { onFavourite, opensPage: true });
+    expect(document.querySelector(".lib-tile.tile-titled")?.getAttribute("data-title")).toBe("Portal 2");
+    expect(document.querySelector(".fav-marker")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Add Portal 2 to favourites" }));
+    expect(onFavourite).toHaveBeenCalledOnce();
+    const surface = screen.getByRole("button", { name: "Portal 2" });
+    expect(surface.hasAttribute("aria-expanded")).toBe(false);
+    expect(surface.hasAttribute("aria-controls")).toBe(false);
+  });
+});

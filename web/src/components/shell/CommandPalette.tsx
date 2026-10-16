@@ -43,9 +43,8 @@ import {
   type SettingItem,
 } from "./settingsSearch/settingsIndex";
 import { useDeviceSettings } from "./settingsSearch/useDeviceSettings";
-import { isGamePick, runGamePick, searchPaletteFuzzy } from "./paletteGames";
+import { searchPaletteFuzzy } from "./paletteGames";
 import { useNewDesign, useNewSearch } from "../../settings/OverlayPreferencesContext";
-import { useLibrarySearch } from "../../pages/app/librarySearchContext";
 import { useLibraryExtras } from "../../pages/app/library/libraryExtras";
 
 /** One frozen empty list for every absent source, so an omitted prop does not
@@ -85,7 +84,6 @@ export function CommandPalette({
   const { isAdmin } = useAuth();
   const { toggleTheme } = useTheme();
   const navigate = useNavigate();
-  const { setQuery: setLibraryQuery } = useLibrarySearch();
   const [query, setQuery] = useState("");
   const [sel, setSel] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -181,14 +179,16 @@ export function CommandPalette({
       onOpenChange(false);
       const to = item.to;
       const reveal = (item as SettingItem).reveal;
-      if (newDesign && to && isGamePick(item, isAdmin)) runGamePick(item, setLibraryQuery, () => navigate(to));
-      else if (item.action === "toggle-appearance") toggleTheme();
+      if (item.action === "toggle-appearance") toggleTheme();
       else if (to && reveal) {
         if (to !== pathname) navigate(to);
         revealWhenReady(reveal, locationKey, to !== pathname);
-      } else if (to) navigate(to);
+      } else if (to) {
+        // `from` lets the game page's Back return here.
+        navigate(to, to.startsWith("/app/game/") ? { state: { from: "palette" } } : undefined);
+      }
     },
-    [navigate, onOpenChange, toggleTheme, newDesign, isAdmin, setLibraryQuery, pathname, locationKey],
+    [navigate, onOpenChange, toggleTheme, pathname, locationKey],
   );
 
   /** Cycle focus inside the panel. Tab is handled outright rather than only

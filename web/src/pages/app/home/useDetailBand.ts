@@ -111,9 +111,7 @@ export function useDetailBand({
 
   /**
    * Shows `app`'s band anchored after the last tile in its row, even if it is
-   * already open: a palette pick that changes the view queues a close in the
-   * same commit, and this is what outlasts it. `list` must be the grid the
-   * tile actually lives in (the source group in Library view). A tile outside
+   * already open. `list` must be the grid the tile actually lives in (the source group in Library view). A tile outside
    * the windowed grid's mounted rows (rail card, gated launch) is pinned by
    * `openId` first; the anchor is found once its row exists (below).
    */

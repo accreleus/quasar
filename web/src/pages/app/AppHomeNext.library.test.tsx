@@ -173,26 +173,12 @@ describe("library, new design with play history and genres", () => {
     await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(70));
   });
 
-  it("changing the genre closes an open band", async () => {
+  it("re-sorting drops the letter sections and adds captions", async () => {
     renderLibrary();
     await ready();
-    fireEvent.click(screen.getAllByRole("button", { name: "Agame 0" })[0]);
-    await waitFor(() => expect(document.querySelector(".detail")).not.toBeNull());
-    fireEvent.click(screen.getByRole("button", { name: "Genre" }));
-    fireEvent.click(screen.getByRole("option", { name: /Action/ }));
-    await waitFor(() => expect(document.querySelector(".detail")).toBeNull());
-  });
-
-  it("re-sorting drops the letter sections, adds captions, and closes an open band", async () => {
-    renderLibrary();
-    await ready();
-    fireEvent.click(screen.getAllByRole("button", { name: "Agame 0" })[0]);
-    await waitFor(() => expect(document.querySelector(".detail")).not.toBeNull());
-
     fireEvent.click(screen.getByRole("button", { name: "Sort: A–Z" }));
     fireEvent.click(screen.getByRole("option", { name: "Most played" }));
-    await waitFor(() => expect(document.querySelector(".detail")).toBeNull());
-    expect(sections()).toHaveLength(0);
+    await waitFor(() => expect(sections()).toHaveLength(0));
     // The one played title leads, with its hours.
     expect(document.querySelector(".lib-tile-surface")).toHaveAttribute("aria-label", "Agame 3");
     expect(document.querySelector(".lib-tile-meta")?.textContent).toMatch(/^2 h · /);

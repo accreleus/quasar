@@ -117,6 +117,8 @@ export function useLaunch({
   // POST /v1/sessions can still land server-side with nobody left waiting.
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const launchAbortRef = useRef<AbortController | null>(null);
+  // `launching` mirrored synchronously: two clicks in one turn both read the state as false.
+  const inFlightRef = useRef(false);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -131,7 +133,8 @@ export function useLaunch({
 
   const launchApp = useCallback(
     async (app: App, profileId?: string, streamCodec?: "h264" | "h265" | "av1") => {
-      if (!token || launching) return;
+      if (!token || launching || inFlightRef.current) return;
+      inFlightRef.current = true;
       setLaunching(true);
       setWaitingForSlot(false); // clear any stale copy from a previous attempt
       setWaitingReason(null);
@@ -259,6 +262,7 @@ export function useLaunch({
           } else {
             addToast({ variant: "danger", title: "Launch failed", body: "Launch failed." });
           }
+          inFlightRef.current = false;
           setLaunching(false);
           setWaitingForSlot(false);
           setWaitingReason(null);

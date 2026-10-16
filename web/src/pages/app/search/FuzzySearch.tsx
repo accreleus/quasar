@@ -3,16 +3,16 @@
 // Same box, same place, same `.search` class as the classic field (so `/` still
 // focuses it). Typing still filters the grid below; the popover adds the six
 // best hits with icon, genre and last played, and Enter opens the top one's
-// launcher. Focus on an empty box offers Recently played and Favourites.
+// page. Focus on an empty box offers Recently played and Favourites.
 
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import type { App } from "../../../api/types";
 import { IconSearch } from "../../../components/icons";
 import { artFor } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
 import { relativeDay, useLibraryExtras, type ExtrasMap } from "../library/libraryExtras";
 import { rank } from "./match";
-import { OPEN_EVENT, recencyOf, requestOpen } from "./useFuzzy";
+import { recencyOf } from "./useFuzzy";
 import "../../../styles/search-fuzzy.css";
 
 const HITS = 6;
@@ -48,30 +48,18 @@ export function FuzzySearch({
   query,
   setQuery,
   apps,
-  onChoose = (app) => requestOpen(app.id),
+  onChoose,
 }: {
   query: string;
   setQuery: (q: string) => void;
   apps: readonly App[];
-  /** What choosing a game does; by default its launcher opens in the library. */
-  onChoose?: (app: App) => void;
+  onChoose: (app: App) => void;
 }) {
   const extras = useLibraryExtras();
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const id = useId();
   const q = query.trim();
-  // A chosen game (here or in the palette) hands focus back to this field; that
-  // return is not a request for quick picks over the launcher it just opened.
-  const quietUntil = useRef(0);
-  useEffect(() => {
-    const on = () => {
-      quietUntil.current = Date.now() + 600;
-      setOpen(false);
-    };
-    window.addEventListener(OPEN_EVENT, on);
-    return () => window.removeEventListener(OPEN_EVENT, on);
-  }, []);
 
   const groups = useMemo<Group[]>(() => {
     const recency = recencyOf(extras);
@@ -110,7 +98,7 @@ export function FuzzySearch({
         aria-activedescendant={showing && sel >= 0 ? optId(sel) : undefined}
         autoComplete="off"
         spellCheck={false}
-        onFocus={() => setOpen(Date.now() > quietUntil.current)}
+        onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
         onChange={(e) => {
           setQuery(e.target.value);
@@ -126,7 +114,7 @@ export function FuzzySearch({
             e.preventDefault();
             choose(flat[sel]);
           } else if (e.key === "Escape" && showing) {
-            // Ours alone: the page's Escape would also close an open band.
+            // Ours alone: the page below has its own Escape.
             e.stopPropagation();
             setOpen(false);
           }
