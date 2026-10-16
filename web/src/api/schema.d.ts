@@ -2126,7 +2126,10 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description Amendment 37 (#707): a copy for a tile this many pixels wide. Aspect ratio kept; the smallest copy that still covers a w x 1.5w (2:3) box, so a wider image stays wider than w. Any other value (empty, repeated, or non-canonical such as 0320) is 404, as is a query that names w but does not parse (w=320;x, w=%zz). A query that names no w is ignored, as before. The original bytes are served when the image is no wider than w or no taller than 1.5w, and when the copy would not be smaller in bytes: a response is never larger than the original. Content-Type names the bytes served: a scaled copy is image/jpeg when opaque and image/png when it has transparency, whatever the stored type. Unauthenticated and nosniff as the original, and immutable except for the original served after a failed resize, which has a short max-age. */
+                    w?: "96" | "320" | "480" | "560";
+                };
                 header?: never;
                 path: {
                     /** @description The cached blob's CONTENT-ADDRESSED name: the lowercase hex SHA-256 of the image bytes plus an extension derived from the sniffed type. Nothing a remote supplies influences it, so path traversal is impossible by construction; anything not matching the pattern is 404, never 500. */
@@ -2136,7 +2139,7 @@ export interface paths {
             };
             requestBody?: never;
             responses: {
-                /** @description The image. */
+                /** @description The image, or its sized variant when w is given. */
                 200: {
                     headers: {
                         [name: string]: unknown;

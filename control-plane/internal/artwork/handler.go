@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -134,13 +135,32 @@ func toResp(r Record) *artworkResp {
 
 // --- handlers ----------------------------------------------------------------
 
-// handleAsset serves a cached blob.
+// handleAsset serves a cached blob, or its sized variant for `?w=`.
 func (h *Handler) handleAsset(w http.ResponseWriter, r *http.Request) {
 	if h.svc == nil {
 		http.NotFound(w, r)
 		return
 	}
-	data, contentType, err := h.svc.Blobs().Open(r.PathValue("asset"))
+	blobs, name := h.svc.Blobs(), r.PathValue("asset")
+	var (
+		data        []byte
+		contentType string
+		immutable   = true
+	)
+	// A query that names no w is ignored however malformed, as before amendment 37.
+	// One that does must parse: ParseQuery drops a pair it cannot ("w=320;x").
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	switch widths := query["w"]; {
+	case !namesWidth(r.URL.RawQuery):
+		data, contentType, err = blobs.Open(name)
+	case err != nil, len(widths) != 1:
+		err = ErrBadAsset
+	default:
+		data, contentType, immutable, err = blobs.OpenVariant(r.Context(), name, widths[0])
+	}
+	if r.Context().Err() != nil {
+		return // the client left while its resize was queued
+	}
 	if err != nil {
 		// A bad name and a missing file are the same answer. Never 500: an
 		// invalid name is an attempted traversal or a stale link.
@@ -159,10 +179,27 @@ func (h *Handler) handleAsset(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	// Content-addressed name ⇒ the bytes at this URL can never change, so it is
 	// safe to cache forever. This is what makes art survive a redeploy without
-	// a single refetch at browse time.
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	// a single refetch at browse time. The exception is the original standing in
+	// for a copy that failed, which must not pin itself under the `?w=` URL.
+	if immutable {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	_, _ = w.Write(data)
+}
+
+// namesWidth reports whether the raw query has a w key in any form, including
+// a pair url.ParseQuery drops (it splits on & only and rejects a pair with ;).
+func namesWidth(raw string) bool {
+	for _, pair := range strings.FieldsFunc(raw, func(c rune) bool { return c == '&' || c == ';' }) {
+		key, _, _ := strings.Cut(pair, "=")
+		if key, _ = url.QueryUnescape(key); key == "w" {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
