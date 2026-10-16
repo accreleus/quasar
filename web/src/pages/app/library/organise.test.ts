@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { App } from "../../../api/types";
 import type { ExtrasMap, LibraryExtras } from "./libraryExtras";
-import { arrangeApps, genreOptions, letterOf, lettered, metaLine, spyLetter, topGenres } from "./organise";
+import { LETTERS, arrangeApps, genreOptions, letterOf, lettered, metaLine, spyLetter, topGenres } from "./organise";
 
 const app = (id: string, name: string, favourite = false) => ({ id, name, favourite, kind: "game" }) as unknown as App;
 const ext = (genres: string[], played?: { at: string; secs: number }, added = "2026-01-01T00:00:00Z"): LibraryExtras => ({
@@ -23,6 +23,21 @@ describe("organised library", () => {
     expect(letterOf("Évoland")).toBe("E");
     expect(letterOf("7 Days")).toBe("#");
     expect(letterOf("鬼谷八荒")).toBe("#");
+  });
+
+  it("a letter is never split: Äpple sits with Apple even where the locale sorts Ä after Z", () => {
+    const list = [app("z", "Zebra"), app("ae", "Äpple"), app("a", "Apple"), app("ss", "ßtest")];
+    const sorted = arrangeApps(list, "az", null, null);
+    expect(sorted.map((a) => a.id)).toEqual(["a", "ae", "ss", "z"]);
+    const letters = sorted.map((a) => letterOf(a.name));
+    expect(letters).toEqual(["A", "A", "S", "Z"]);
+    // Contiguous runs: no letter appears in two sections.
+    expect(new Set(letters).size).toBe(letters.filter((l, i) => l !== letters[i - 1]).length);
+  });
+
+  it("a multi-letter uppercasing still maps to an index letter", () => {
+    expect(letterOf("ßtest")).toBe("S");
+    expect(LETTERS).toContain(letterOf("ßtest"));
   });
 
   it("A–Z is one unbroken alphabet, # last, favourites not floated", () => {

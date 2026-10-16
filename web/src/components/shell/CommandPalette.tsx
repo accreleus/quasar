@@ -35,7 +35,7 @@ import {
   type PaletteSession,
   type PaletteUser,
 } from "./paletteSearch";
-import { beforePaletteRun, searchPaletteFuzzy } from "./paletteGames";
+import { afterPaletteRun, beforePaletteRun, searchPaletteFuzzy } from "./paletteGames";
 import { useNewDesign } from "../../settings/OverlayPreferencesContext";
 import { useLibraryExtras } from "../../pages/app/library/libraryExtras";
 
@@ -157,6 +157,7 @@ export function CommandPalette({
       onOpenChange(false);
       if (item.action === "toggle-appearance") toggleTheme();
       else if (item.to) navigate(item.to);
+      if (newDesign) afterPaletteRun(item, isAdmin);
     },
     [navigate, onOpenChange, toggleTheme, newDesign, isAdmin],
   );

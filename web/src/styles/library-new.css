@@ -20,9 +20,13 @@ html[data-design="new"] .lib-head > .count {
 html[data-design="new"] .lib-head > .segmented {
   flex: 0 1 auto;
 }
-/* The menus take the right edge; the head's spacer is not needed. */
-html[data-design="new"] .lib-head > .grow {
-  display: none;
+/* The menus take the right edge, so the head's spacer is not needed; without
+   them (no genre or sort data) the spacer still pushes the link right. The
+   phone layout (below) brings the spacer back either way. */
+@media (min-width: 761px) {
+  html[data-design="new"] .lib-head > .lib-menus ~ .grow {
+    display: none;
+  }
 }
 /* The segmented control's box (primitives.css `.segmented`), drawn here rather
    than borrowed: that class's button rules would restyle the list's options. */
@@ -269,7 +273,8 @@ html[data-design="new"] .lib-head > .grow {
   outline-offset: -2px;
 }
 /* No bar on top any more: a jump parks a section just under the topbar. */
-html[data-design="new"] .lib-letter {
+html[data-design="new"] .lib-letter,
+html[data-design="new"] .home-lib {
   scroll-margin-top: calc(64px + var(--s3));
 }
 

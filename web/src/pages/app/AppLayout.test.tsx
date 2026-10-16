@@ -328,6 +328,46 @@ describe("topbar search box", () => {
   });
 });
 
+// ── The same four, in the new design (the default) ───────────────────────────
+//
+// The box is a combobox there (a results popover under it), so these query that
+// role; what they pin is the same shell behaviour.
+
+describe("new design (no Classic layout pin)", () => {
+  beforeEach(() => {
+    localStorage.removeItem("quasar.ui.classic.u1");
+  });
+  const box = () => screen.findByRole("combobox", { name: "Search library" });
+
+  it("the search box appears on /app and on /app/library", async () => {
+    const { unmount } = renderApp("/app");
+    expect(await box()).toBeInTheDocument();
+    unmount();
+    renderApp("/app/library");
+    expect(await box()).toBeInTheDocument();
+  });
+
+  it("is seeded from ?q= and typing then filters", async () => {
+    renderApp("/app/library?q=Portal");
+    const input = await box();
+    expect(input).toHaveValue("Portal");
+    await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(1));
+    fireEvent.change(input, { target: { value: "zzz" } });
+    expect(input).toHaveValue("zzz");
+    await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(0));
+  });
+
+  it("a palette hit routes into the library with the name in the box", async () => {
+    renderApp("/app");
+    await box();
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    const palette = within(await screen.findByRole("dialog")).getByRole("combobox");
+    fireEvent.change(palette, { target: { value: "Portal" } });
+    fireEvent.click(await screen.findByRole("option", { name: /Portal 2/ }));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Search library" })).toHaveValue("Portal 2"));
+  });
+});
+
 // ── The moved Storage route ──────────────────────────────────────────────────
 
 describe("/app/storage", () => {

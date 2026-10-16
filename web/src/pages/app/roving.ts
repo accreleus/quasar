@@ -43,6 +43,11 @@ export function dirForKey(key: string): RoveDir | null {
 export interface RovingRegion {
   offsetTops: readonly number[];
   centers: readonly number[];
+  /** One part of a longer list laid out in reading order (a letter section).
+   *  Moves follow the screen: up/down land on the tile nearest above/below
+   *  even in a short row, and left/right continue into the neighbouring flow
+   *  region. Unset keeps the plain grid arithmetic above. */
+  flow?: boolean;
 }
 
 export interface RovingPos {
@@ -54,6 +59,16 @@ function indicesInRow(offsetTops: readonly number[], rowTop: number): number[] {
   const out: number[] = [];
   for (let i = 0; i < offsetTops.length; i++) if (offsetTops[i] === rowTop) out.push(i);
   return out;
+}
+
+/** Indices of the row just below/above `i`'s row, or null at the first/last row. */
+function adjacentRow(offsetTops: readonly number[], i: number, dir: "up" | "down"): number[] | null {
+  const top = offsetTops[i];
+  let rowTop: number | null = null;
+  for (const t of offsetTops) {
+    if (dir === "down" ? t > top && (rowTop === null || t < rowTop) : t < top && (rowTop === null || t > rowTop)) rowTop = t;
+  }
+  return rowTop === null ? null : indicesInRow(offsetTops, rowTop);
 }
 
 /** The candidate whose centre is closest to `center`; the first candidate when
@@ -90,8 +105,20 @@ export function nextRovingPos(
   const region = regions[from.region];
   if (!region) return null;
 
-  const within = nextTileIndex(region.offsetTops, from.index, DIR_TO_NAV[dir]);
-  if (within != null) return { region: from.region, index: within };
+  if (region.flow) {
+    if (dir === "left" || dir === "right") {
+      const within = nextTileIndex(region.offsetTops, from.index, DIR_TO_NAV[dir]);
+      if (within != null) return { region: from.region, index: within };
+      const next = regions[from.region + (dir === "right" ? 1 : -1)];
+      if (!next?.flow || next.offsetTops.length === 0) return null;
+      return { region: from.region + (dir === "right" ? 1 : -1), index: dir === "right" ? 0 : next.offsetTops.length - 1 };
+    }
+    const row = adjacentRow(region.offsetTops, from.index, dir);
+    if (row) return { region: from.region, index: nearestByCenter(row, region.centers, region.centers[from.index] ?? 0) };
+  } else {
+    const within = nextTileIndex(region.offsetTops, from.index, DIR_TO_NAV[dir]);
+    if (within != null) return { region: from.region, index: within };
+  }
 
   if (dir !== "up" && dir !== "down") return null;
 

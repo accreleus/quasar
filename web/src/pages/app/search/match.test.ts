@@ -50,3 +50,31 @@ describe("relative cutoff", () => {
     expect(rank(list, "fale ann")[0].name).toBe("Fable Anniversary");
   });
 });
+
+describe("the cutoff keeps every clean hit", () => {
+  const titles = [
+    "Tomb Raider", "Rise of the Tomb Raider", "Shadow of the Tomb Raider", "Raiders of the Broken Planet",
+    "Space Engineers", "Kerbal Space Program", "Dead Space", "Spaceteam",
+    "Apex Legends", "League of Legends", "Legend of Zelda",
+    "Risk of Rain 2", "Half-Life 2", "Left 4 Dead 2", "2K Basketball", "GRIS", "Prison Architect",
+  ].map((name, i) => ({ id: `t${i}`, name }));
+  const got = (q: string) => rank(titles, q).map((a) => a.name);
+
+  it("a whole-word match late in a name is not cut by a better-scoring one", () => {
+    expect(got("tomb raider")).toEqual(
+      expect.arrayContaining(["Tomb Raider", "Rise of the Tomb Raider", "Shadow of the Tomb Raider"]),
+    );
+    expect(got("space")).toEqual(expect.arrayContaining(["Kerbal Space Program", "Dead Space", "Space Engineers"]));
+    expect(got("legends")).toEqual(expect.arrayContaining(["Apex Legends", "League of Legends"]));
+    expect(got("2")).toEqual(expect.arrayContaining(["Risk of Rain 2", "Half-Life 2", "Left 4 Dead 2", "2K Basketball"]));
+  });
+
+  it("still drops typo-level hits once something matches cleanly", () => {
+    expect(got("gris")).toEqual(["GRIS"]);
+    expect(got("tomb raider")).not.toContain("Prison Architect");
+  });
+
+  it("keeps typo hits when nothing matches cleanly", () => {
+    expect(got("gruis")).toContain("GRIS");
+  });
+});

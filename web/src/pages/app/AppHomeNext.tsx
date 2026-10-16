@@ -206,6 +206,16 @@ export function AppHomeNext() {
   });
   // A game chosen in the topbar popover or the palette opens its launcher here.
   useOpenRequests(filteredApps, detail.reveal, search);
+  // A new search replaces the list under a viewport that may be scrolled far
+  // down it (a letter jump): bring the library head back so the results show.
+  // The grid keeps its A–Z order; the ranked order is the popover's.
+  const searched = useRef(search);
+  useEffect(() => {
+    if (searched.current === search) return;
+    searched.current = search;
+    const lib = newDesign ? gridsRef.current?.closest<HTMLElement>(".home-lib") : null;
+    if (lib && lib.getBoundingClientRect().top < 0) lib.scrollIntoView({ block: "start" });
+  }, [search, newDesign]);
   const launch = useLaunch({
     token,
     apps,

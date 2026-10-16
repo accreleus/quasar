@@ -13,6 +13,8 @@ export interface LibraryExtras {
 
 export type ExtrasMap = Record<string, LibraryExtras>;
 
+/** Null until the control-api carries these facts: issue #720 (needs an
+ *  amendment and owner sign-off). Everything above degrades without them. */
 export function useLibraryExtras(): ExtrasMap | null {
   return null;
 }

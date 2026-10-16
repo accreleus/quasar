@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import type { App } from "../../../api/types";
-import { FuzzySearch } from "./FuzzySearch";
+import type { LibraryExtras } from "../library/libraryExtras";
+import { FuzzySearch, metaFor } from "./FuzzySearch";
 
 const app = (id: string, name: string, over: Partial<App> = {}) => ({ id, name, kind: "game", cover_url: null, favourite: false, ...over }) as unknown as App;
 const apps = [app("c", "Cities: Skylines"), app("p", "Portal 2"), app("f", "Fable Anniversary", { favourite: true })];
@@ -20,7 +21,8 @@ describe("FuzzySearch", () => {
     expect(screen.getByRole("option", { name: "Fable Anniversary" })).toBeInTheDocument();
     fireEvent.change(box, { target: { value: "ciies sky" } });
     expect(screen.getAllByRole("option").map((o) => o.getAttribute("aria-label"))).toEqual(["Cities: Skylines"]);
-    expect(screen.getByRole("option")).toHaveTextContent("Game · not played yet");
+    // No play data to go on: the kind alone, never "not played yet".
+    expect(screen.getByRole("option").querySelector(".fz-meta")).toHaveTextContent(/^Game$/);
   });
 
   it("Enter chooses the top hit; a click chooses the clicked one", () => {
@@ -42,5 +44,14 @@ describe("FuzzySearch", () => {
     expect(screen.getByText("No games match “zzzzzz”")).toBeInTheDocument();
     fireEvent.keyDown(box, { key: "Escape" });
     expect(screen.queryByRole("listbox")).toBeNull();
+  });
+});
+
+describe("metaFor", () => {
+  it("is the kind alone without play data, and says not played only when the data says so", () => {
+    expect(metaFor(apps[1], null)).toBe("Game");
+    expect(metaFor(apps[1], {})).toBe("Game");
+    const e = { genres: ["Puzzle"], added_at: "2026-01-01T00:00:00Z", play: null } as LibraryExtras;
+    expect(metaFor(apps[1], { p: e })).toBe("Puzzle · not played yet");
   });
 });

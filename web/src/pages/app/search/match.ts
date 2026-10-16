@@ -75,19 +75,26 @@ function wordScore(q: string, p: Prepared): number {
   return best;
 }
 
-/** 0 = no match. Higher is better; exact name > name prefix > word matches > typos. */
-export function score(app: Matchable, query: string): number {
+/** A whole-word, prefix or joined-name hit scores at least this per query word;
+ *  below it a word matched only by typo tolerance. */
+const CLEAN = 1.5;
+
+/** `s` 0 = no match. Higher is better; exact name > name prefix > word matches > typos.
+ *  `clean`: every query word landed without a typo (and not only via the description). */
+function detail(app: Matchable, query: string): { s: number; clean: boolean } {
   const qw = words(query);
-  if (!qw.length) return 0;
+  if (!qw.length) return { s: 0, clean: false };
   const p = prep(app.name);
   let s = 0;
+  let clean = true;
   for (const q of qw) {
     const w = wordScore(q, p);
     if (!w) {
       // The shipped filter also matched descriptions; keep that, ranked last.
       const d = app.description ? norm(app.description) : "";
-      return d.includes(norm(query.trim())) ? 0.1 : 0;
+      return { s: d.includes(norm(query.trim())) ? 0.1 : 0, clean: false };
     }
+    if (w < CLEAN) clean = false;
     s += w;
   }
   const q = qw.join(" ");
@@ -96,21 +103,24 @@ export function score(app: Matchable, query: string): number {
   // A name is remembered by its first word: "portl" means Portal before Portia.
   const first = p.words[0] ? wordScore(qw[0], { words: [p.words[0]], joined: p.words[0], full: p.words[0] }) : 0;
   s += first >= 2 ? 1 : first > 0 ? 0.5 : 0;
-  return s;
+  return { s, clean };
 }
+
+export const score = (app: Matchable, query: string): number => detail(app, query).s;
 
 /** Every match, best first; ties by recency, then favourite, then name. */
 export function rank<T extends Matchable>(apps: readonly T[], query: string, recency: Recency = () => 0): T[] {
-  const hits: { a: T; s: number }[] = [];
+  const hits: { a: T; s: number; clean: boolean }[] = [];
   for (const a of apps) {
-    const s = score(a, query);
-    if (s > 0) hits.push({ a, s });
+    const d = detail(a, query);
+    if (d.s > 0) hits.push({ a, ...d });
   }
-  // A typo match only counts next to hits of its own quality. Once something
-  // matches exactly or by prefix, near-misses are noise ("gris" → 21 apps).
-  const top = Math.max(0, ...hits.map((h) => h.s));
+  // A typo (or description-only) match only counts when nothing matches cleanly.
+  // Once a word matches exactly or by prefix, near-misses are noise ("gris" → 21
+  // apps); every clean hit stays, however far it trails ("space" → Dead Space).
+  const anyClean = hits.some((h) => h.clean);
   return hits
-    .filter((h) => h.s >= top * 0.5)
+    .filter((h) => !anyClean || h.clean)
     .sort(
       (x, y) =>
         y.s - x.s ||

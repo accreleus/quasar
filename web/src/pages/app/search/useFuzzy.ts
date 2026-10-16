@@ -28,19 +28,25 @@ export function useFuzzyFilter() {
 // navigation mounted it.
 export const OPEN_EVENT = "quasar:open-game";
 const EVENT = OPEN_EVENT;
-let pending: { id: string; at: number } | null = null;
+let pending: { id: string; at: number; q?: string } | null = null;
+
+/** Wakes the page to look at `pending`. */
+export function pokeOpenRequests(): void {
+  window.dispatchEvent(new Event(EVENT));
+}
 
 /** Topbar: the page is already showing the list the game is in; open it now. */
 export function requestOpen(appId: string): void {
   queueOpen(appId);
-  window.dispatchEvent(new Event(EVENT));
+  pokeOpenRequests();
 }
 
 /** Palette: the navigation it is about to make changes the list; open the game
  *  when that new list lands, not in the list being left (whose view change
- *  would close the band straight away). */
-export function queueOpen(appId: string): void {
-  pending = { id: appId, at: Date.now() };
+ *  would close the band straight away). `q` is the search the navigation
+ *  seeds: the request waits until the box holds it. */
+export function queueOpen(appId: string, q?: string): void {
+  pending = { id: appId, at: Date.now(), q };
 }
 
 /** Opens a requested app's band once it is in the list on screen. */
@@ -57,10 +63,9 @@ export function useOpenRequests(apps: readonly App[], reveal: (app: App, expand:
       pending = null; // stale: never land on a launcher nobody asked for just now
       return;
     }
-    // A `?q=` the box has not taken yet means this list is about to be replaced
+    // A search the box has not taken yet means this list is about to be replaced
     // (and the band closed with it): wait for the list that query produces.
-    const q = new URLSearchParams(window.location.search).get("q");
-    if (q && q !== search) return;
+    if (pending.q !== undefined && pending.q !== search) return;
     const id = pending.id;
     const app = apps.find((a) => a.id === id);
     if (!app) return; // not filtered in yet: the next list change retries

@@ -72,7 +72,10 @@ const auth: AuthContextValue = {
 };
 
 function renderLibrary(query = "") {
-  return render(
+  return render(tree(query));
+}
+function tree(query: string) {
+  return (
     <MemoryRouter initialEntries={["/app/library"]}>
       <AuthContext.Provider value={auth}>
         <LibrarySearchContext.Provider value={{ query, setQuery: vi.fn() }}>
@@ -83,7 +86,7 @@ function renderLibrary(query = "") {
           </LibraryCatalogProvider>
         </LibrarySearchContext.Provider>
       </AuthContext.Provider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
 }
 
@@ -129,8 +132,29 @@ describe("library, new design", () => {
   });
 
   it("finds a misspelled title", async () => {
-    renderLibrary("bgame 3");
+    // "agmae 3" is a substring of nothing; typed after the list has loaded.
+    const { rerender } = renderLibrary("agame 3");
     await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(1));
+    rerender(tree("agmae 3"));
+    await waitFor(() => expect(document.querySelector(".lib-tile-surface")).toHaveAttribute("aria-label", "Agame 3"));
+    expect(document.querySelectorAll(".lib-tile")).toHaveLength(1);
+  });
+
+  it("brings the library head back into view when the search changes under a scrolled page", async () => {
+    const scroll = vi.fn();
+    Element.prototype.scrollIntoView = scroll;
+    const { rerender } = renderLibrary("");
+    await ready();
+    const lib = document.querySelector(".home-lib") as HTMLElement;
+    lib.getBoundingClientRect = () => ({ top: -900 }) as DOMRect;
+    rerender(tree("game 3"));
+    await waitFor(() => expect(scroll).toHaveBeenCalledTimes(1));
+    expect(scroll.mock.contexts[0]).toBe(lib);
+    // Head already on screen: left alone.
+    lib.getBoundingClientRect = () => ({ top: 80 }) as DOMRect;
+    rerender(tree("game 4"));
+    await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(10));
+    expect(scroll).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -147,6 +171,16 @@ describe("library, new design with play history and genres", () => {
     await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(20));
     fireEvent.click(screen.getByRole("button", { name: "Clear genre: Action" }));
     await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(70));
+  });
+
+  it("changing the genre closes an open band", async () => {
+    renderLibrary();
+    await ready();
+    fireEvent.click(screen.getAllByRole("button", { name: "Agame 0" })[0]);
+    await waitFor(() => expect(document.querySelector(".detail")).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Genre" }));
+    fireEvent.click(screen.getByRole("option", { name: /Action/ }));
+    await waitFor(() => expect(document.querySelector(".detail")).toBeNull());
   });
 
   it("re-sorting drops the letter sections, adds captions, and closes an open band", async () => {
@@ -181,7 +215,10 @@ describe("library, Classic layout", () => {
   });
 
   it("filters by substring, not by typo", async () => {
-    renderLibrary("bgame 3");
-    await waitFor(() => expect(screen.queryAllByRole("button", { name: /game/ })).toHaveLength(0));
+    // Wait for the loaded list first: an empty result only means something then.
+    const { rerender } = renderLibrary("agame 3");
+    await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(1));
+    rerender(tree("agmae 3"));
+    await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(0));
   });
 });

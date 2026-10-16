@@ -9,7 +9,7 @@ import { searchPalette } from "./paletteSearch";
 import type { ExtrasMap } from "../../pages/app/library/libraryExtras";
 import { rank } from "../../pages/app/search/match";
 import { metaFor } from "../../pages/app/search/FuzzySearch";
-import { queueOpen, recencyOf } from "../../pages/app/search/useFuzzy";
+import { pokeOpenRequests, queueOpen, recencyOf } from "../../pages/app/search/useFuzzy";
 
 const CAP = 6;
 
@@ -32,5 +32,11 @@ export function searchPaletteFuzzy(query: string, sources: PaletteSources, extra
 
 /** Before the palette navigates: a game row also asks the page to open it. */
 export function beforePaletteRun(item: PaletteItem, isAdmin: boolean): void {
-  if (!isAdmin && item.id.startsWith("app-")) queueOpen(item.id.slice(4));
+  if (!isAdmin && item.id.startsWith("app-")) queueOpen(item.id.slice(4), new URLSearchParams(item.to?.split("?")[1]).get("q") ?? undefined);
+}
+
+/** After it navigated: wake the page, so a box already holding the search the
+ *  link seeds (no change to react to) still opens the game. */
+export function afterPaletteRun(item: PaletteItem, isAdmin: boolean): void {
+  if (!isAdmin && item.id.startsWith("app-")) pokeOpenRequests();
 }

@@ -26,7 +26,9 @@ interface Group {
 export function metaFor(app: App, extras: ExtrasMap | null): string {
   const e = extras?.[app.id];
   const genre = e?.genres[0] ?? (app.kind === "game" ? "Game" : app.kind.charAt(0).toUpperCase() + app.kind.slice(1));
-  return e?.play ? `${genre} · played ${relativeDay(e.play.last_played_at)}` : `${genre} · not played yet`;
+  // No play data at all (nothing serves it yet) says nothing about playing.
+  if (!e) return genre;
+  return e.play ? `${genre} · played ${relativeDay(e.play.last_played_at)}` : `${genre} · not played yet`;
 }
 
 function Icon({ app, extras }: { app: App; extras: ExtrasMap | null }) {

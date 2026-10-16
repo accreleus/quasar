@@ -24,18 +24,21 @@ export function lettered(sort: SortMode, n: number): boolean {
   return sort === "az" && n >= LETTER_MIN;
 }
 
-/** "B" for "Borderlands", "E" for "Évoland", "#" for "7 Days" or a CJK title. */
+/** "B" for "Borderlands", "E" for "Évoland", "S" for "ßtest" (uppercases to
+ *  "SS"), "#" for "7 Days" or a CJK title. Always an index letter or "#". */
 export function letterOf(name: string): string {
-  const c = name.trim().normalize("NFD").charAt(0).toUpperCase();
+  const c = name.trim().normalize("NFD").charAt(0).toUpperCase().charAt(0);
   return c >= "A" && c <= "Z" ? c : "#";
 }
 
-/** A–Z with "#" after Z, matching the index. Favourites are not floated: an
- *  index needs one unbroken alphabet, and Favourites has its own filter. */
+/** Sections A–Z, "#" last, matching the index; names by locale inside one. The
+ *  letter decides first, not the locale, so a letter is never split in two
+ *  (Swedish sorts "Ä" after "Z"). Favourites are not floated: an index needs
+ *  one unbroken alphabet, and Favourites has its own filter. */
 function byName(a: App, b: App): number {
-  const la = letterOf(a.name) === "#" ? 1 : 0;
-  const lb = letterOf(b.name) === "#" ? 1 : 0;
-  return la - lb || a.name.localeCompare(b.name);
+  const la = letterOf(a.name);
+  const lb = letterOf(b.name);
+  return la === lb ? a.name.localeCompare(b.name) : la === "#" ? 1 : lb === "#" ? -1 : la < lb ? -1 : 1;
 }
 
 export function arrangeApps(apps: readonly App[], sort: SortMode, genre: string | null, extras: ExtrasMap | null): App[] {
