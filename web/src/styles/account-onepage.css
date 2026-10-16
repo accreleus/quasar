@@ -134,6 +134,7 @@
 
 .os-dev-name {
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 .os-dev-acts {

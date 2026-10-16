@@ -23,7 +23,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../../auth/context";
-import { useNewDesign } from "../../settings/OverlayPreferencesContext";
 import { useTheme } from "../../settings/ThemeContext";
 import { IconSearch, ShellIcon } from "../icons";
 import {
@@ -36,7 +35,7 @@ import {
   type PaletteSession,
   type PaletteUser,
 } from "./paletteSearch";
-import { revealWhenReady } from "./settingsSearch/reveal";
+import { revealWhenReady, useCancelRevealOnNavigation } from "./settingsSearch/reveal";
 import {
   arrangeWithSettings,
   placeOf,
@@ -100,7 +99,8 @@ export function CommandPalette({
   const newDesign = useNewDesign();
   const newSearch = useNewSearch();
   const extras = useLibraryExtras();
-  const { pathname } = useLocation();
+  const { pathname, key: locationKey } = useLocation();
+  useCancelRevealOnNavigation();
   const place = newSearch ? placeOf(pathname, isAdmin) : null;
   const devices = useDeviceSettings(open && place !== null && place.kind !== "admin");
   const shippedGroups = useMemo(
@@ -185,10 +185,10 @@ export function CommandPalette({
       else if (item.action === "toggle-appearance") toggleTheme();
       else if (to && reveal) {
         if (to !== pathname) navigate(to);
-        revealWhenReady(reveal);
+        revealWhenReady(reveal, locationKey, to !== pathname);
       } else if (to) navigate(to);
     },
-    [navigate, onOpenChange, toggleTheme, newDesign, isAdmin, setLibraryQuery, pathname],
+    [navigate, onOpenChange, toggleTheme, newDesign, isAdmin, setLibraryQuery, pathname, locationKey],
   );
 
   /** Cycle focus inside the panel. Tab is handled outright rather than only

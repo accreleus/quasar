@@ -1,7 +1,8 @@
 /**
  * The palette under the real design switch (CommandPalette.test.tsx pins the
- * shipped palette with a mock). Admin must keep the shipped search whatever the
- * user chose; a player's chosen game asks the library page to open it.
+ * shipped palette with a mock). Admin keeps the shipped game search whatever the
+ * user chose, and gains the console's own pages and settings unless they chose
+ * Classic; a player's chosen game asks the library page to open it.
  */
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
@@ -37,7 +38,8 @@ function Open() {
   return <CommandPalette open={open} onOpenChange={setOpen} apps={apps} />;
 }
 
-function mount(path: string, isAdmin: boolean) {
+function mount(path: string, isAdmin: boolean, classic = false) {
+  localStorage.setItem("quasar.ui.classic.u1", classic ? "1" : "0");
   return render(
     <MemoryRouter initialEntries={[path]}>
       <AuthContext.Provider value={auth(isAdmin)}>
@@ -54,14 +56,25 @@ function mount(path: string, isAdmin: boolean) {
 const type = (value: string) => fireEvent.change(screen.getByRole("combobox"), { target: { value } });
 const options = () => screen.getAllByRole("option").map((o) => o.textContent ?? "");
 
-describe("CommandPalette on /admin with the new design on", () => {
-  it("is the shipped palette: actions lead, no ranked game rows, no typo hits", () => {
+describe("CommandPalette on /admin", () => {
+  it("new design: the shipped game search, with the console's pages and settings ahead of the jumps", () => {
     mount("/admin/fleet", true);
+    expect(screen.getByRole("combobox")).toHaveAttribute("placeholder", "Search hosts, sessions, apps, users, pages or settings");
+    type("lib");
+    const secs = [...document.querySelectorAll(".pal-sec")].map((e) => e.textContent);
+    expect(secs[0]).not.toBe("Actions");
+    expect(options().some((o) => /^Library Of Ruina/.test(o))).toBe(true);
+    type("libary");
+    expect([...document.querySelectorAll(".pal-sec")].map((e) => e.textContent)).toEqual(["No matches"]);
+  });
+
+  it("Classic layout: exactly the shipped palette, actions first", () => {
+    mount("/admin/fleet", true, true);
     type("lib");
     expect(options()[0]).toMatch(/^Go to Library/);
     expect([...document.querySelectorAll(".pal-sec")].map((e) => e.textContent)[0]).toBe("Actions");
-    type("libary");
-    expect([...document.querySelectorAll(".pal-sec")].map((e) => e.textContent)).toEqual(["No matches"]);
+    expect(screen.getByRole("combobox")).toHaveAttribute("placeholder", "Search apps or jump to a page");
+    expect(screen.queryByText("Elsewhere in the console")).toBeNull();
   });
 });
 

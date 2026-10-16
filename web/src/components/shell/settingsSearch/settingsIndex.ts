@@ -233,8 +233,8 @@ const HERE_CAP_EMPTY = 8;
  * Takes the shipped palette groups and adds settings, current place first:
  * account → Settings, games, actions; Home/Library → games, Settings, actions;
  * admin → this area's pages and settings, then hosts/sessions/apps/users, then the
- * rest of the console, then actions (the "Go to" jumps drop out once you type: the
- * page index answers them).
+ * rest of the console, then actions (the "Go to" jumps drop out once you type and the
+ * page index has a hit: it answers them).
  */
 export function arrangeWithSettings(
   groups: readonly PaletteGroup[],
@@ -257,7 +257,8 @@ export function arrangeWithSettings(
     push(AREA_LABEL[place.area] ?? "This page", hits.filter((e) => e.area === place.area).map(toItem));
     entities.forEach((g) => push(g.title, g.items));
     if (q) push("Elsewhere in the console", hits.filter((e) => e.area !== place.area).slice(0, ELSEWHERE_CAP).map(toItem));
-    if (actions) push("Actions", q ? actions.items.filter((a) => !a.id.startsWith("go-") || a.id === "go-account") : actions.items);
+    // The page index answers a typed query, but "go to fleet" names no page word: keep the jumps then.
+    if (actions) push("Actions", q && hits.length ? actions.items.filter((a) => !a.id.startsWith("go-") || a.id === "go-account") : actions.items);
   } else {
     const all = [...ACCOUNT_SETTINGS, ...devices];
     const cap = place.kind === "home" ? SETTINGS_CAP_HOME : SETTINGS_CAP;

@@ -25,6 +25,17 @@ section.ss-flash,
   .ss-hit { transition: none; }
 }
 
+/* A long unbroken label (a device name) is cut, not allowed to push the row wide. */
+.ss-sheet .pal-item .k {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ss-sheet .pal-item .m {
+  flex: none;
+}
+
 /* The trigger's short label is for phones only. */
 .cmdk .ss-short {
   display: none;

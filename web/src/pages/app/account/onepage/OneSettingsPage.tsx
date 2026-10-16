@@ -5,7 +5,7 @@
 // pages as-is; stream quality and devices are rebuilt here (a labelled select
 // that saves on change, devices grouped by use with named actions).
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import * as authApi from "../../../../api/auth";
 import type { Device } from "../../../../api/auth";
@@ -37,9 +37,10 @@ const UNUSED_DAYS = 90;
 const daysSince = (iso: string) => Math.floor((Date.now() - Date.parse(iso)) / DAY);
 
 export function OneSettingsPage() {
-  const { pathname } = useLocation();
+  const { pathname, key } = useLocation();
 
   // A path names a section: scroll to it (the bare page and Profile are the top).
+  // `key` re-runs this when the current section's own link is clicked after scrolling away.
   const target = sectionForPath(pathname);
   useEffect(() => {
     const el = target && target !== "profile" ? document.getElementById(`set-${target}`) : null;
@@ -47,7 +48,7 @@ export function OneSettingsPage() {
     else document.querySelector(".main")?.scrollTo({ top: 0 });
     // Phones: bring the lit chip into the chip row's view.
     document.querySelector(".os-link.active")?.scrollIntoView({ block: "nearest", inline: "center" });
-  }, [target]);
+  }, [target, key]);
 
   const body: Record<OneSectionId, ReactNode> = {
     profile: <ProfileStrip />,
@@ -140,12 +141,18 @@ function StreamSection() {
     },
   });
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  // The pick, shown at once and held until the save settles; it also holds the select shut, so one save runs at a time.
+  const [picked, setPicked] = useState<string | null>(null);
+  const hadFocus = useRef(false);
   const prefs = res.data;
   const recommended = `Recommended (${prefs?.recommendedName ?? "for this device"})`;
   const current = prefs?.defaultId ? (prefs.profiles.find((p) => p.id === prefs.defaultId)?.name ?? prefs.defaultId) : recommended;
 
   // Saves on change: the select is labelled and the result is said back at once.
   const save = async (id: string) => {
+    if (picked !== null) return;
+    hadFocus.current = document.activeElement?.id === "stream-default";
+    setPicked(id);
     setStatus(null);
     try {
       await res.mutate(
@@ -156,16 +163,24 @@ function StreamSection() {
       setStatus({ ok: true, text: name ? `Saved. Your next launch asks for ${name}.` : "Saved. Launches use the recommendation again." });
     } catch (e) {
       setStatus({ ok: false, text: e instanceof ApiError ? e.message : "Could not save the stream default." });
+    } finally {
+      setPicked(null);
     }
   };
+  // A disabled select drops focus; give it back once the save has settled.
+  useEffect(() => {
+    if (picked !== null || !hadFocus.current) return;
+    hadFocus.current = false;
+    document.getElementById("stream-default")?.focus();
+  }, [picked]);
 
   return (
     <div className="card sec-card">
       <div className="os-field">
         <SelectField
           label="Stream default"
-          value={prefs?.defaultId ?? ""}
-          disabled={!prefs || !prefs.overridesAllowed}
+          value={picked ?? prefs?.defaultId ?? ""}
+          disabled={!prefs || !prefs.overridesAllowed || picked !== null}
           onChange={(e) => void save(e.target.value)}
         >
           <option value="">{recommended}</option>

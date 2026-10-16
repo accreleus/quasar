@@ -304,4 +304,21 @@ describe("CommandPalette settings results (new design)", () => {
     type("releases");
     expect(screen.getByRole("option", { name: /Releases/ })).toBeInTheDocument();
   });
+
+  it("classic layout on /admin keeps the shipped palette exactly", () => {
+    renderPalette("/admin/fleet/hosts", true);
+    type("releases");
+    expect(screen.queryByText("Elsewhere in the console")).toBeNull();
+    expect(screen.queryByRole("option", { name: /Releases/ })).toBeNull();
+    expect(input()).toHaveAttribute("placeholder", expect.stringContaining("hosts"));
+  });
+
+  it("new design in the console still finds the Go to jumps by their name", () => {
+    renderPalette("/admin/sessions", false);
+    type("go to fleet");
+    expect(screen.getByRole("option", { name: /Go to Fleet/ })).toBeInTheDocument();
+    type("go to");
+    expect(screen.getAllByRole("option").length).toBeGreaterThan(1);
+    expect(screen.getByRole("option", { name: /Go to Fleet/ })).toBeInTheDocument();
+  });
 });

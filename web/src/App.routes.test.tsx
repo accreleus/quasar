@@ -145,6 +145,20 @@ describe("legacy admin paths", () => {
   });
 });
 
+describe("the account paths in the new design", () => {
+  beforeEach(() => {
+    localStorage.setItem("quasar.ui.classic.u1", "0");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } })));
+  });
+
+  it.each(["/app/account", "/app/account/security", "/app/account/devices"])("%s shows the one page and does not redirect", async (entry) => {
+    renderAt(entry);
+    expect(await screen.findByRole("heading", { name: "Account", level: 1 })).toBeInTheDocument();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(path).toBe(entry);
+  });
+});
+
 describe("RedirectWithParams", () => {
   it("substitutes the matched params into the target", async () => {
     render(

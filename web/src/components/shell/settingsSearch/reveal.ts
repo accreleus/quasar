@@ -3,6 +3,8 @@
 // The page may still be loading, so wait until the target exists and has stopped
 // moving before scrolling to it.
 
+import { useEffect } from "react";
+import { useLocation } from "react-router-dom";
 import type { Target } from "./settingsIndex";
 import "../../../styles/settings-search.css";
 
@@ -38,7 +40,7 @@ function coveredTop(el: HTMLElement): number {
 
 function reveal(t: Target, match: HTMLElement): void {
   const row = (t.up && match.closest<HTMLElement>(t.up)) || match;
-  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const reduce = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   // Runtime value: the covered height is only known now.
   const covered = coveredTop(row);
   row.style.scrollMarginTop = `${covered + 16}px`;
@@ -63,22 +65,63 @@ function reveal(t: Target, match: HTMLElement): void {
   window.setTimeout(() => row.classList.remove("ss-hit"), FLASH_MS + 400);
 }
 
-/** Call right after navigating (or not, when already there). */
-export function revealWhenReady(t: Target): void {
+interface Pending {
+  stop: () => void;
+  /** Router location key when the wait began. */
+  from: string;
+  /** Key of the page the reveal is for; null until the navigation it started lands. */
+  at: string | null;
+}
+let pending: Pending | null = null;
+
+/** Call right after navigating (or not, when already there). `from` is the
+ *  location key at the call and `moves` whether a navigation was just started.
+ *  Any navigation after that one (see useCancelRevealOnNavigation), or another
+ *  reveal, ends the wait; a target that never appears ends it without a trace. */
+export function revealWhenReady(t: Target, from: string, moves: boolean): void {
+  pending?.stop();
+  let timer = 0;
+  const me: Pending = {
+    stop: () => {
+      window.clearTimeout(timer);
+      if (pending === me) pending = null;
+    },
+    from,
+    at: moves ? null : from,
+  };
+  pending = me;
   const start = performance.now();
   let lastTop = NaN;
   let still = 0;
+  const done = (el: HTMLElement) => {
+    me.stop();
+    reveal(t, el);
+  };
   const tick = () => {
     const el = find(t);
-    if (el) {
+    // A disabled control cannot take focus: wait for it (a save in flight, a list loading).
+    if (el && !(el as HTMLInputElement).disabled) {
       const top = el.getBoundingClientRect().top;
       still = Math.abs(top - lastTop) < 1 ? still + 1 : 0;
       lastTop = top;
       // ~180 ms without moving: the sections above it have loaded.
-      if (still >= 3) return reveal(t, el);
+      if (still >= 3) return done(el);
     }
-    if (performance.now() - start < 4000) window.setTimeout(tick, 60);
-    else if (el) reveal(t, el);
+    if (performance.now() - start < 4000) timer = window.setTimeout(tick, 60);
+    else if (el) done(el);
+    else me.stop();
   };
-  window.setTimeout(tick, 0);
+  timer = window.setTimeout(tick, 0);
+}
+
+/** Mounted where the palette is: the first location change after the reveal's own
+ *  navigation (Back, a link, another choice) cancels a wait still in progress. */
+export function useCancelRevealOnNavigation(): void {
+  const { key } = useLocation();
+  useEffect(() => {
+    if (!pending) return;
+    if (pending.at === null) {
+      if (key !== pending.from) pending.at = key;
+    } else if (key !== pending.at) pending.stop();
+  }, [key]);
 }
