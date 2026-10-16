@@ -21,7 +21,9 @@ use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt, GetPropertyReply, M
 use x11rb::rust_connection::RustConnection;
 use x11rb::x11_utils::TryParse;
 
-const POLL: Duration = Duration::from_millis(500);
+/// A few passes a second: the reveal (#727) and the game exit (#726) wait on this, and the
+/// core reads at most 1 MiB of Steam's log a pass.
+const POLL: Duration = Duration::from_millis(250);
 const RECONNECT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_WINDOWS: usize = 256;
@@ -48,10 +50,16 @@ fn main() {
     );
     let mut agent = Agent::new(socket.into());
     eprintln!("quasar-launch-helper: watching Steam app {appid}");
+    let mut ready = Some(std::io::stdout());
     loop {
         agent.connect();
         for report in watcher.poll() {
             agent.send(report);
+        }
+        // The core picks where to start reading Steam's log on its first pass, so the
+        // launcher holds Steam back (at most 2 s) until this line.
+        if let Some(mut out) = ready.take() {
+            let _ = writeln!(out, "ready");
         }
         std::thread::sleep(POLL);
     }
