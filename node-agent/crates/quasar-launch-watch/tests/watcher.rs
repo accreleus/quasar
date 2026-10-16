@@ -559,14 +559,74 @@ fn a_games_own_setup_or_login_window_is_not_steam_needing_the_user() {
         "Sign in",
         "Sign-in required",
     ] {
-        for steam_game in [None, Some(769)] {
+        // The game's own windows: untagged, tagged with the tile's appid, or Proton's.
+        for (steam_game, wm_class) in [
+            (None, "game game"),
+            (Some(APPID), "game game"),
+            (None, "steam_app_730 steam_app_730"),
+        ] {
             rig.windows.set(vec![WindowInfo {
                 steam_game,
-                wm_class: "game game".into(),
+                wm_class: wm_class.into(),
                 title: title.into(),
             }]);
-            assert_eq!(rig.watcher.poll(), vec![], "{title} ({steam_game:?})");
+            assert_eq!(
+                rig.watcher.poll(),
+                vec![],
+                "{title} ({steam_game:?}, {wm_class})"
+            );
         }
+    }
+}
+
+#[test]
+fn steams_own_windows_may_use_the_generic_words() {
+    for (window, reason) in [
+        (
+            WindowInfo {
+                steam_game: Some(769),
+                wm_class: "steamwebhelper steam".into(),
+                title: "Install".into(),
+            },
+            NeedsUser::Install,
+        ),
+        (
+            WindowInfo {
+                steam_game: Some(769),
+                wm_class: "steamwebhelper steam".into(),
+                title: "Log in".into(),
+            },
+            NeedsUser::SignIn,
+        ),
+        (
+            WindowInfo {
+                steam_game: None,
+                wm_class: "steam steam".into(),
+                title: "Setup".into(),
+            },
+            NeedsUser::Install,
+        ),
+        (
+            WindowInfo {
+                steam_game: Some(769),
+                wm_class: String::new(),
+                title: "Sign-in required".into(),
+            },
+            NeedsUser::SignIn,
+        ),
+    ] {
+        let mut rig = Rig::new();
+        assert_eq!(
+            rig.watcher.poll(),
+            vec![Report::LaunchState(LaunchState::Starting)]
+        );
+        let title = window.title.clone();
+        rig.windows.set(vec![window]);
+        assert_eq!(
+            rig.watcher.poll(),
+            vec![Report::SteamNeedsUser(reason)],
+            "{title}"
+        );
     }
 }
 

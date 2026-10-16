@@ -518,6 +518,9 @@ fn needs_rank(reason: NeedsUser) -> u8 {
     }
 }
 
+/// The `STEAM_GAME` of Steam's own client windows (measured by the #723 spike).
+const STEAM_CLIENT_APPID: u32 = 769;
+
 fn classify_windows(windows: &[WindowInfo], appid: u32) -> Option<NeedsUser> {
     windows
         .iter()
@@ -538,6 +541,11 @@ fn classify_window(window: &WindowInfo, appid: u32) -> Option<NeedsUser> {
     }
     let title = window.title.to_lowercase();
     let class = window.wm_class.to_lowercase();
+    // Only Steam's own windows may use the generic words; a game's "Setup" or "Log in"
+    // never counts. Proton names a game's windows `steam_app_<id>`, which is not Steam.
+    let steams_own = window.steam_game == Some(STEAM_CLIENT_APPID)
+        || (class.contains("steam") && !class.contains("steam_app_"));
+    let generic = |words: &[&str]| steams_own && words.iter().any(|w| title.contains(w));
 
     if title.contains("steam guard") {
         Some(NeedsUser::SteamGuard)
@@ -550,10 +558,14 @@ fn classify_window(window: &WindowInfo, appid: u32) -> Option<NeedsUser> {
         || title.contains("license agreement")
     {
         Some(NeedsUser::Eula)
-    } else if title.contains("self updater") || title.contains("updating steam") {
+    } else if title.contains("self updater")
+        || title.contains("updating steam")
+        || generic(&["install", "setup"])
+    {
         Some(NeedsUser::Install)
-    } else if title.contains("sign in to steam") {
-        // Specific phrases only: a game's own "Setup" or "Log in" window is not Steam.
+    } else if title.contains("sign in to steam")
+        || generic(&["sign in", "sign-in", "log in", "login"])
+    {
         Some(NeedsUser::SignIn)
     } else if class.contains("steam") && (title.contains("dialog") || title.contains("prompt")) {
         // A Steam dialog we have no specific row for still needs the user.
