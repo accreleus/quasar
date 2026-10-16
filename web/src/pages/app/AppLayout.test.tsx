@@ -366,6 +366,78 @@ describe("new design (no Classic layout pin)", () => {
     fireEvent.click(await screen.findByRole("option", { name: /Portal 2/ }));
     await waitFor(() => expect(screen.getByRole("combobox", { name: "Search library" })).toHaveValue("Portal 2"));
   });
+
+  describe("a palette pick always opens the chosen game", () => {
+    const game = (id: string, name: string) => ({ ...mockedAppBase, id, name });
+    const mockedAppBase = {
+      description: "",
+      kind: "game",
+      cover_url: null,
+      hero_url: null,
+      parent_app_id: null,
+      external_source: "steam",
+      external_id: "",
+      favourite: false,
+      enabled: true,
+    };
+    async function pick(name: string, option = 0) {
+      fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+      const palette = within(await screen.findByRole("dialog")).getByRole("combobox");
+      fireEvent.change(palette, { target: { value: name } });
+      fireEvent.click((await screen.findAllByRole("option", { name: new RegExp(name) }))[option]);
+    }
+    const band = (id: string) => waitFor(() => expect(document.getElementById(`lib-detail-${id}`)).not.toBeNull());
+    const nav = (name: string) => within(screen.getAllByRole("navigation")[0]).getByRole("link", { name });
+
+    it("from Home, with the box already holding the name from an earlier pick", async () => {
+      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Portal 2"), game("a2", "Celeste")] } as never);
+      renderApp("/app");
+      await box();
+      await pick("Portal 2");
+      await band("a1");
+      expect(nav("Library")).toHaveClass("active");
+      fireEvent.click(nav("Home"));
+      await waitFor(() => expect(nav("Home")).toHaveClass("active"));
+      expect(screen.getByRole("combobox", { name: "Search library" })).toHaveValue("Portal 2");
+      await pick("Portal 2");
+      await band("a1");
+      expect(nav("Library")).toHaveClass("active");
+    });
+
+    it("after the box was cleared while the URL still carries the same ?q=", async () => {
+      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Portal 2"), game("a2", "Celeste")] } as never);
+      renderApp("/app/library");
+      await box();
+      await pick("Celeste");
+      await band("a2");
+      fireEvent.change(screen.getByRole("combobox", { name: "Search library" }), { target: { value: "" } });
+      await waitFor(() => expect(document.getElementById("lib-detail-a2")).toBeNull());
+      await pick("Celeste");
+      await band("a2");
+      expect(screen.getByRole("combobox", { name: "Search library" })).toHaveValue("Celeste");
+      await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(1));
+    });
+
+    it("a different game opens its own band", async () => {
+      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Portal 2"), game("a2", "Celeste")] } as never);
+      renderApp("/app/library");
+      await box();
+      await pick("Portal 2");
+      await band("a1");
+      await pick("Celeste");
+      await band("a2");
+      expect(document.getElementById("lib-detail-a1")).toBeNull();
+    });
+
+    it("two games with the same name: the chosen id opens", async () => {
+      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Twin"), game("a2", "Twin")] } as never);
+      renderApp("/app/library");
+      await box();
+      await pick("Twin", 1);
+      await band("a2");
+      expect(document.getElementById("lib-detail-a1")).toBeNull();
+    });
+  });
 });
 
 // ── The moved Storage route ──────────────────────────────────────────────────

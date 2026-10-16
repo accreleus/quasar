@@ -35,8 +35,9 @@ import {
   type PaletteSession,
   type PaletteUser,
 } from "./paletteSearch";
-import { afterPaletteRun, beforePaletteRun, searchPaletteFuzzy } from "./paletteGames";
+import { isGamePick, runGamePick, searchPaletteFuzzy } from "./paletteGames";
 import { useNewDesign } from "../../settings/OverlayPreferencesContext";
+import { useLibrarySearch } from "../../pages/app/librarySearchContext";
 import { useLibraryExtras } from "../../pages/app/library/libraryExtras";
 
 /** One frozen empty list for every absent source, so an omitted prop does not
@@ -76,6 +77,7 @@ export function CommandPalette({
   const { isAdmin } = useAuth();
   const { toggleTheme } = useTheme();
   const navigate = useNavigate();
+  const { setQuery: setLibraryQuery } = useLibrarySearch();
   const [query, setQuery] = useState("");
   const [sel, setSel] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -153,13 +155,13 @@ export function CommandPalette({
   const run = useCallback(
     (item: PaletteItem | undefined) => {
       if (!item) return;
-      if (newDesign) beforePaletteRun(item, isAdmin);
       onOpenChange(false);
-      if (item.action === "toggle-appearance") toggleTheme();
-      else if (item.to) navigate(item.to);
-      if (newDesign) afterPaletteRun(item, isAdmin);
+      const to = item.to;
+      if (newDesign && to && isGamePick(item, isAdmin)) runGamePick(item, setLibraryQuery, () => navigate(to));
+      else if (item.action === "toggle-appearance") toggleTheme();
+      else if (to) navigate(to);
     },
-    [navigate, onOpenChange, toggleTheme, newDesign, isAdmin],
+    [navigate, onOpenChange, toggleTheme, newDesign, isAdmin, setLibraryQuery],
   );
 
   /** Cycle focus inside the panel. Tab is handled outright rather than only

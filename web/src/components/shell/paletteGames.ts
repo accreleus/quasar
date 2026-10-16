@@ -1,8 +1,9 @@
 // The Ctrl+K palette's game search in the new design: the same matcher and the
 // same result line as the topbar popover. Games lead when the query names one;
-// a non-admin's chosen game opens its launcher (queueOpen) on the library route
+// a non-admin's chosen game opens its launcher (runGamePick) on the library route
 // it already used.
 
+import { startTransition } from "react";
 import type { App } from "../../api/types";
 import type { PaletteGroup, PaletteItem, PaletteSources } from "./paletteSearch";
 import { searchPalette } from "./paletteSearch";
@@ -30,13 +31,17 @@ export function searchPaletteFuzzy(query: string, sources: PaletteSources, extra
   return groups.length ? groups : [{ title: "No matches", items: [] }];
 }
 
-/** Before the palette navigates: a game row also asks the page to open it. */
-export function beforePaletteRun(item: PaletteItem, isAdmin: boolean): void {
-  if (!isAdmin && item.id.startsWith("app-")) queueOpen(item.id.slice(4), new URLSearchParams(item.to?.split("?")[1]).get("q") ?? undefined);
-}
+export const isGamePick = (item: PaletteItem, isAdmin: boolean) => !isAdmin && item.id.startsWith("app-");
 
-/** After it navigated: wake the page, so a box already holding the search the
- *  link seeds (no change to react to) still opens the game. */
-export function afterPaletteRun(item: PaletteItem, isAdmin: boolean): void {
-  if (!isAdmin && item.id.startsWith("app-")) pokeOpenRequests();
+/** A player's chosen game. The box is set to its name here, not only through
+ *  `?q=` (which may not change); the open request names the box text and the
+ *  app id, and the box, the navigation and the wake-up commit in one transition,
+ *  so the request is never served from the list being left. */
+export function runGamePick(item: PaletteItem, setQuery: (q: string) => void, go: () => void): void {
+  queueOpen(item.id.slice(4), item.label);
+  startTransition(() => {
+    setQuery(item.label);
+    go();
+    pokeOpenRequests();
+  });
 }

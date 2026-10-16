@@ -25,7 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
-- **The library is easier to move through (#714).** A library of 60 or more titles is split into letter sections with an A–Z index down the right edge, and the Home row keeps "Open full library" at its right edge. Search ranks results and forgives typos: the top bar shows the best matches under the box (Enter opens the first one's launcher) and Ctrl+K lists the games first. Account ▸ Preferences ▸ Appearance ▸ Classic layout brings back the previous library and search.
+- **The library is easier to move through (#714).** A library of 60 or more titles is split into letter sections with an A–Z index down the right edge. Search ranks results and forgives typos: the top bar shows the best matches under the box (Enter opens the first one's launcher) and Ctrl+K lists the games first. Account ▸ Preferences ▸ Appearance ▸ Classic layout brings back the previous library and search.
 - **Account ▸ Preferences ▸ Appearance has a Classic layout switch (#714).** Off by default, so you get the redesigned pages; turning it on keeps the previous layout. It covers the library now and the game page and account pages as they arrive. The choice is saved with your account, so it follows you to every device.
 
 ### Changed

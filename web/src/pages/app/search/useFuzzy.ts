@@ -43,8 +43,8 @@ export function requestOpen(appId: string): void {
 
 /** Palette: the navigation it is about to make changes the list; open the game
  *  when that new list lands, not in the list being left (whose view change
- *  would close the band straight away). `q` is the search the navigation
- *  seeds: the request waits until the box holds it. */
+ *  would close the band straight away). `q` is the text the pick puts in the
+ *  box: the request waits until the box holds it. */
 export function queueOpen(appId: string, q?: string): void {
   pending = { id: appId, at: Date.now(), q };
 }

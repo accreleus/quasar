@@ -106,7 +106,7 @@ export function FuzzySearch({
         aria-label="Search library"
         aria-autocomplete="list"
         aria-expanded={showing}
-        aria-controls={`${id}-list`}
+        aria-controls={showing && total > 0 ? `${id}-list` : undefined}
         aria-activedescendant={showing && sel >= 0 ? optId(sel) : undefined}
         autoComplete="off"
         spellCheck={false}
@@ -133,7 +133,10 @@ export function FuzzySearch({
         }}
       />
       {showing && (
-        <div className="fz-pop" id={`${id}-list`} role="listbox" aria-label="Search results">
+        <div
+          className="fz-pop"
+          {...(total > 0 ? { id: `${id}-list`, role: "listbox", "aria-label": "Search results" } : {})}
+        >
           {total === 0 && <p className="fz-empty">No games match “{q}”</p>}
           {groups.map((g) => (
             <div key={g.title} role="group" aria-labelledby={`${id}-${g.title}`}>

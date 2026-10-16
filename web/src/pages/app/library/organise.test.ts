@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { App } from "../../../api/types";
 import type { ExtrasMap, LibraryExtras } from "./libraryExtras";
 import { LETTERS, arrangeApps, genreOptions, letterOf, lettered, metaLine, spyLetter, topGenres } from "./organise";
@@ -26,13 +26,23 @@ describe("organised library", () => {
   });
 
   it("a letter is never split: Äpple sits with Apple even where the locale sorts Ä after Z", () => {
-    const list = [app("z", "Zebra"), app("ae", "Äpple"), app("a", "Apple"), app("ss", "ßtest")];
-    const sorted = arrangeApps(list, "az", null, null);
-    expect(sorted.map((a) => a.id)).toEqual(["a", "ae", "ss", "z"]);
-    const letters = sorted.map((a) => letterOf(a.name));
-    expect(letters).toEqual(["A", "A", "S", "Z"]);
-    // Contiguous runs: no letter appears in two sections.
-    expect(new Set(letters).size).toBe(letters.filter((l, i) => l !== letters[i - 1]).length);
+    // Swedish collation puts "Ä" after "Z", so a pure locale sort splits the A run.
+    const sv = new Intl.Collator("sv");
+    const spy = vi.spyOn(String.prototype, "localeCompare").mockImplementation(function (this: string, other: string) {
+      return sv.compare(this, other);
+    });
+    try {
+      const list = [app("z", "Zebra"), app("ae", "Äpple"), app("a", "Apple"), app("ss", "ßtest")];
+      expect(sv.compare("Äpple", "Zebra")).toBeGreaterThan(0);
+      const sorted = arrangeApps(list, "az", null, null);
+      expect(sorted.map((a) => a.id)).toEqual(["a", "ae", "ss", "z"]);
+      const letters = sorted.map((a) => letterOf(a.name));
+      expect(letters).toEqual(["A", "A", "S", "Z"]);
+      // Contiguous runs: no letter appears in two sections.
+      expect(new Set(letters).size).toBe(letters.filter((l, i) => l !== letters[i - 1]).length);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("a multi-letter uppercasing still maps to an index letter", () => {

@@ -29,7 +29,9 @@ describe("FuzzySearch", () => {
     const onChoose = vi.fn();
     render(<Box onChoose={onChoose} />);
     const box = screen.getByRole("combobox");
+    expect(box).not.toHaveAttribute("aria-controls");
     fireEvent.change(box, { target: { value: "portl" } });
+    expect(box).toHaveAttribute("aria-controls", screen.getByRole("listbox").id);
     fireEvent.keyDown(box, { key: "Enter" });
     expect(onChoose).toHaveBeenLastCalledWith(apps[1]);
     fireEvent.change(box, { target: { value: "fabl" } });
@@ -42,6 +44,9 @@ describe("FuzzySearch", () => {
     const box = screen.getByRole("combobox");
     fireEvent.change(box, { target: { value: "zzzzzz" } });
     expect(screen.getByText("No games match “zzzzzz”")).toBeInTheDocument();
+    // The empty line is not an option container, and nothing points at a listbox that is absent.
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(box).not.toHaveAttribute("aria-controls");
     fireEvent.keyDown(box, { key: "Escape" });
     expect(screen.queryByRole("listbox")).toBeNull();
   });
