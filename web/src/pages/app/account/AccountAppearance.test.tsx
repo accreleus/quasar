@@ -1,4 +1,5 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountAppearance } from "./AccountAppearance";
 import { ToastProvider } from "../../../components/Toast";
@@ -16,11 +17,13 @@ vi.mock("../../../auth/context", () => ({
 
 function renderPage() {
   return render(
-    <ToastProvider>
-      <OverlayPreferencesProvider>
-        <AccountAppearance />
-      </OverlayPreferencesProvider>
-    </ToastProvider>,
+    <MemoryRouter>
+      <ToastProvider>
+        <OverlayPreferencesProvider>
+          <AccountAppearance />
+        </OverlayPreferencesProvider>
+      </ToastProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -62,5 +65,31 @@ describe("AccountAppearance", () => {
     await waitFor(() => expect(sw.checked).toBe(false));
     expect(await screen.findByText("Could not save layout")).toBeTruthy();
     expect(localStorage.getItem("quasar.ui.classic.u1")).toBe("0");
+  });
+
+  it("disables the switch while the save is pending and ignores a second click", async () => {
+    let settle!: (v: unknown) => void;
+    patchUIPreferences.mockReturnValue(new Promise((r) => { settle = r; }));
+    renderPage();
+    const sw = screen.getByLabelText("Classic layout") as HTMLInputElement;
+    await waitFor(() => expect(sw.disabled).toBe(false));
+
+    fireEvent.click(sw);
+    await waitFor(() => expect(sw.disabled).toBe(true));
+    fireEvent.click(sw);
+    expect(patchUIPreferences).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      settle({});
+    });
+    expect(sw.disabled).toBe(false);
+    expect(sw.checked).toBe(true);
+  });
+
+  it("describes the switch with its hint", async () => {
+    renderPage();
+    const sw = screen.getByLabelText("Classic layout");
+    expect(sw.getAttribute("aria-describedby")).toBe("classic-layout-hint");
+    expect(document.getElementById("classic-layout-hint")?.textContent).toMatch(/previous library/);
   });
 });

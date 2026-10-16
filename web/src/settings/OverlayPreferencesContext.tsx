@@ -7,9 +7,17 @@
 // possible moment. The server value always wins once it arrives; the mirror is
 // a cache, never an authority, and is never merged with the server's answer.
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import type { ReactNode } from "react";
-import { Outlet } from "react-router-dom";
+import { Outlet, useLocation } from "react-router-dom";
 import { getUIPreferences, patchUIPreferences } from "../api/me";
 import { useAuth } from "../auth/context";
 import {
@@ -30,9 +38,12 @@ interface OverlayPreferencesValue {
   /** The user opted back into the previous layout (`classic_layout`). Read it
    *  through `useNewDesign()`, not directly. */
   classicLayout: boolean;
-  /** Optimistic; on a failed PATCH it reverts and REJECTS, so the caller can
-   *  show its own toast. */
+  /** Optimistic; on a failed PATCH it reverts to the value before the call and
+   *  REJECTS, so the caller can show its own toast. One PATCH at a time: a call
+   *  made while `classicSaving` is true does nothing. */
   setClassicLayout: (next: boolean) => Promise<void>;
+  /** A `classic_layout` PATCH is in flight. The switch disables itself on it. */
+  classicSaving: boolean;
 }
 
 const Ctx = createContext<OverlayPreferencesValue | null>(null);
@@ -98,6 +109,12 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
   // design shows until the answer arrives, then it switches to classic.
   const [classicLayout, setClassicState] = useState(() => readClassicCache(user?.id));
   const classicRef = useRef(classicLayout);
+  // Set synchronously by setClassicLayout. The guard lives here, not in the UI,
+  // so no caller can overlap two PATCHes (their order on the server is not
+  // ours) and the initial GET can tell the user already chose.
+  const classicSavingRef = useRef(false);
+  const classicTouchedRef = useRef(false);
+  const [classicSaving, setClassicSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Mirrors `prefs`, but updated SYNCHRONOUSLY at the call site of every
@@ -126,9 +143,12 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
         const next = fromWire(wire.session_overlay);
         applyPrefs(next);
         writeCache(user?.id, next);
-        classicRef.current = wire.classic_layout === true;
-        setClassicState(classicRef.current);
-        writeClassicCache(user?.id, classicRef.current);
+        // A choice made before this answer arrived is newer than the answer.
+        if (!classicTouchedRef.current) {
+          classicRef.current = wire.classic_layout === true;
+          setClassicState(classicRef.current);
+          writeClassicCache(user?.id, classicRef.current);
+        }
       } catch {
         // Keep whatever the cache gave us. A preferences read failing must not
         // block the library or a live session.
@@ -167,7 +187,10 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
 
   const setClassicLayout = useCallback(
     async (next: boolean) => {
-      if (!token) return;
+      if (!token || classicSavingRef.current) return;
+      classicSavingRef.current = true;
+      classicTouchedRef.current = true;
+      setClassicSaving(true);
       const previous = classicRef.current;
       classicRef.current = next;
       setClassicState(next);
@@ -177,12 +200,15 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
         // and any other key are left alone.
         await patchUIPreferences(token, { classic_layout: next });
       } catch (e: unknown) {
-        if (classicRef.current === next) {
-          classicRef.current = previous;
-          setClassicState(previous);
-          writeClassicCache(user?.id, previous);
-        }
+        // Back to "not chosen": a late GET is then the better authority.
+        classicTouchedRef.current = false;
+        classicRef.current = previous;
+        setClassicState(previous);
+        writeClassicCache(user?.id, previous);
         throw e;
+      } finally {
+        classicSavingRef.current = false;
+        setClassicSaving(false);
       }
     },
     [token, user?.id],
@@ -190,16 +216,25 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
 
   // Styles that only the new design uses scope themselves under
   // html[data-design="new"], so switching back to classic needs no reload.
-  useEffect(() => {
+  // Layout effect so the attribute is in place before paint (as useDarkLock
+  // does). Admin is excluded (#714): this provider wraps /admin too, so the
+  // attribute is left off there. useNewDesign() still reports the user's
+  // choice on admin; nothing on admin calls it.
+  const inAdmin = /^\/admin(\/|$)/.test(useLocation().pathname);
+  useLayoutEffect(() => {
     const root = document.documentElement;
-    root.dataset.design = classicLayout ? "classic" : "new";
-    return () => {
-      delete root.dataset.design;
-    };
-  }, [classicLayout]);
+    if (inAdmin) delete root.dataset.design;
+    else root.dataset.design = classicLayout ? "classic" : "new";
+  }, [classicLayout, inAdmin]);
+  useLayoutEffect(
+    () => () => {
+      delete document.documentElement.dataset.design;
+    },
+    [],
+  );
 
   return (
-    <Ctx.Provider value={{ prefs, loaded, save, error, classicLayout, setClassicLayout }}>
+    <Ctx.Provider value={{ prefs, loaded, save, error, classicLayout, setClassicLayout, classicSaving }}>
       {children}
     </Ctx.Provider>
   );
@@ -218,12 +253,16 @@ export function useOverlayPreferences(): OverlayPreferencesValue {
     error: null,
     classicLayout: false,
     setClassicLayout: async () => {},
+    classicSaving: false,
   };
 }
 
 /** True when the redesigned library, game page and account pages should render
  *  (the default); false when the user chose "Classic layout". Outside the
- *  provider (signed-out pages, admin, bare test harnesses) it is true. */
+ *  provider (signed-out pages, bare test harnesses) it is true. The provider
+ *  also wraps /admin, where it reports the user's choice; admin is not
+ *  redesigned and nothing there calls it (the data-design attribute is left
+ *  off there too). */
 export function useNewDesign(): boolean {
   return !useOverlayPreferences().classicLayout;
 }
