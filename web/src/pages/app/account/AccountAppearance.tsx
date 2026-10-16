@@ -10,7 +10,7 @@ import { useSectionHead } from "../../../components/shell/sectionHead";
 import { useOverlayPreferences } from "../../../settings/OverlayPreferencesContext";
 
 export function AccountAppearance() {
-  const { loaded, classicLayout, setClassicLayout } = useOverlayPreferences();
+  const { loaded, classicLayout, setClassicLayout, classicSaving } = useOverlayPreferences();
   const { addToast } = useToast();
   useSectionHead({ sub: "How the library, game page and account pages look. This follows your account to every device." });
 
@@ -30,11 +30,12 @@ export function AccountAppearance() {
           label="Classic layout"
           id="classic-layout"
           checked={classicLayout}
-          disabled={!loaded}
+          disabled={!loaded || classicSaving}
+          aria-describedby="classic-layout-hint"
           onChange={(v) => void toggle(v)}
         />
       </div>
-      <p className="muted mt3">Use the previous library, game page and account layout.</p>
+      <p className="hint mt3" id="classic-layout-hint">Use the previous library, game page and account layout.</p>
     </div>
   );
 }
