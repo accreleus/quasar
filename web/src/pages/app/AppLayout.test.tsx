@@ -382,9 +382,9 @@ describe("new design (no Classic layout pin)", () => {
     };
     async function pick(name: string, option = 0) {
       fireEvent.keyDown(document, { key: "k", ctrlKey: true });
-      const palette = within(await screen.findByRole("dialog")).getByRole("combobox");
-      fireEvent.change(palette, { target: { value: name } });
-      fireEvent.click((await screen.findAllByRole("option", { name: new RegExp(name) }))[option]);
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByRole("combobox"), { target: { value: name } });
+      fireEvent.click((await within(dialog).findAllByRole("option", { name: new RegExp(name) }))[option]);
     }
     const band = (id: string) => waitFor(() => expect(document.getElementById(`lib-detail-${id}`)).not.toBeNull());
     const nav = (name: string) => within(screen.getAllByRole("navigation")[0]).getByRole("link", { name });
@@ -427,6 +427,56 @@ describe("new design (no Classic layout pin)", () => {
       await pick("Celeste");
       await band("a2");
       expect(document.getElementById("lib-detail-a1")).toBeNull();
+    });
+
+    const twoGames = () =>
+      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Portal 2"), game("a2", "Celeste")] } as never);
+    const boxEl = () => screen.getByRole("combobox", { name: "Search library" });
+
+    it("from Home, a tile that is already open stays open when it is picked", async () => {
+      twoGames();
+      renderApp("/app");
+      fireEvent.change(await box(), { target: { value: "Celeste" } });
+      fireEvent.click(await screen.findByRole("button", { name: "Celeste" }));
+      await band("a2");
+      await pick("Celeste");
+      await waitFor(() => expect(nav("Library")).toHaveClass("active"));
+      await band("a2");
+    });
+
+    it("on Library, a tile opened under a prefix stays open when it is picked", async () => {
+      twoGames();
+      renderApp("/app/library");
+      fireEvent.change(await box(), { target: { value: "cel" } });
+      fireEvent.click(await screen.findByRole("button", { name: "Celeste" }));
+      await band("a2");
+      await pick("Celeste");
+      await waitFor(() => expect(boxEl()).toHaveValue("Celeste"));
+      await band("a2");
+    });
+
+    it("a pick the kind filter hides clears the filter and opens", async () => {
+      mockedLibrary.listApps.mockResolvedValue({
+        items: [game("a1", "Portal 2"), { ...game("a2", "Weston Terminal"), kind: "desktop" }],
+      } as never);
+      renderApp("/app/library");
+      await box();
+      const tabs = await screen.findByRole("tablist", { name: "Filter by kind" });
+      fireEvent.click(within(tabs).getByRole("tab", { name: "Desktops" }));
+      await pick("Portal 2");
+      await band("a1");
+      expect(within(tabs).getByRole("tab", { name: "All" })).toHaveAttribute("aria-selected", "true");
+    });
+
+    it("a second click on an open tile still closes it", async () => {
+      twoGames();
+      renderApp("/app/library");
+      await box();
+      const tile = await screen.findByRole("button", { name: "Celeste" });
+      fireEvent.click(tile);
+      await band("a2");
+      fireEvent.click(tile);
+      await waitFor(() => expect(document.getElementById("lib-detail-a2")).toBeNull());
     });
 
     it("two games with the same name: the chosen id opens", async () => {

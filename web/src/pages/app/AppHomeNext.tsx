@@ -204,8 +204,9 @@ export function AppHomeNext() {
     viewKey: `${view}|${kindFilter}|${search}|${e01?.sort}|${e01?.genre}`,
     smoothScroll: !prefersReducedMotion(),
   });
-  // A game chosen in the topbar popover or the palette opens its launcher here.
-  useOpenRequests(filteredApps, detail.reveal, search);
+  // A game chosen in the topbar popover or the palette opens its launcher here;
+  // it looks in the whole catalogue so `reveal` can clear a kind filter hiding it.
+  useOpenRequests(apps, detail.reveal, search);
   // A new search replaces the list under a viewport that may be scrolled far
   // down it (a letter jump): bring the library head back so the results show.
   // The grid keeps its A–Z order; the ranked order is the popover's.
