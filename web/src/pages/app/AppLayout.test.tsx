@@ -31,6 +31,11 @@ import * as storageApi from "../../api/storage";
 import * as setupApi from "../../api/setup";
 
 vi.mock("../../api/library");
+// This suite drives the detail band, which is the Classic layout.
+vi.mock("../../settings/OverlayPreferencesContext", async (orig) => ({
+  ...(await orig<typeof import("../../settings/OverlayPreferencesContext")>()),
+  useNewDesign: () => false,
+}));
 vi.mock("../../api/storage");
 // App.tsx wraps every route in RequireClaimedInstance, which reads this —
 // an already-claimed, fully-set-up instance is the case these /app tests

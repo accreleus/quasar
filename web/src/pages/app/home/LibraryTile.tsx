@@ -26,6 +26,7 @@ import { Chip } from "../../../components/Chip";
 import { IconHeart, IconPlayGlyph } from "../../../components/icons";
 import { artFor } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
+import { TileHeart } from "./TileHeart";
 
 /** The `.lib-tile` box a surface button belongs to. The surface button is
  * absolutely positioned and inset:0, so its own `offsetTop` is always 0 —
@@ -51,6 +52,12 @@ export interface LibraryTileProps {
   /** The detail band, when this tile is the last one in the opened row. Kept
    *  as a sibling of the tile so it is always the next grid child. */
   detail?: ReactNode;
+  /** A caption inside the surface button. */
+  meta?: ReactNode;
+  /** New design: a resting heart and a one-line title strip, and `F` favourites. */
+  onFavourite?: () => void;
+  /** New design: a press opens the game's page, not the band. */
+  opensPage?: boolean;
 }
 
 export function LibraryTile({
@@ -65,6 +72,9 @@ export function LibraryTile({
   onOpen,
   onPlay,
   detail = null,
+  meta,
+  onFavourite,
+  opensPage,
 }: LibraryTileProps) {
   // The mock's `onerror="this.remove()"`: the gradient + glyph underneath is a
   // design, not a broken state, so a 404 cover falls back to it instead of
@@ -74,7 +84,11 @@ export function LibraryTile({
   const detailId = `lib-detail-${app.id}`;
   return (
     <>
-      <div className="lib-tile" data-open={isOpen ? "true" : undefined}>
+      <div
+        className={onFavourite ? "lib-tile tile-titled" : "lib-tile"}
+        data-open={isOpen ? "true" : undefined}
+        data-title={onFavourite ? app.name : undefined}
+      >
         {/* The fallback is always rendered and the cover sits on top of it —
             that is what makes the name visible on the product's default,
             artwork-less catalogue without a hover. */}
@@ -111,7 +125,8 @@ export function LibraryTile({
             <Chip variant="warning" title={`${blockedByName} is already running`}>In use</Chip>
           </span>
         )}
-        {app.favourite && (
+        {onFavourite && <TileHeart name={app.name} on={!!app.favourite} onToggle={onFavourite} />}
+        {!onFavourite && app.favourite && (
           <span className="fav-marker">
             <IconHeart filled />
             <span className="sr-only">Favourite</span>
@@ -142,11 +157,13 @@ export function LibraryTile({
           className="lib-tile-surface"
           data-app-id={app.id}
           aria-label={app.name}
-          aria-expanded={isOpen}
-          aria-controls={detailId}
+          aria-expanded={opensPage ? undefined : isOpen}
+          aria-controls={opensPage ? undefined : detailId}
           onClick={onOpen}
           ref={tileRef}
-        />
+        >
+          {meta}
+        </button>
       </div>
       {detail}
     </>

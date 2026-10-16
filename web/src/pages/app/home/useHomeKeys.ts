@@ -28,6 +28,8 @@ export interface UseHomeKeysOptions {
   onCloseBand: () => void;
   onLaunch: (app: App) => void;
   onResume: (sessionId: string) => void;
+  /** `F` on a focused grid tile toggles its favourite (new design). */
+  onFavourite?: (app: App) => void;
 }
 
 export function useHomeKeys({
@@ -43,6 +45,7 @@ export function useHomeKeys({
   onCloseBand,
   onLaunch,
   onResume,
+  onFavourite,
 }: UseHomeKeysOptions): void {
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
@@ -64,6 +67,13 @@ export function useHomeKeys({
       const onTile = activeEl?.classList.contains("lib-tile-surface") ?? false;
       const onRailCard = activeEl?.classList.contains("home-feat-surface") ?? false;
       if (!activeEl || (!onTile && !onRailCard)) return;
+
+      if (onFavourite && onTile && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        const app = apps.find((a) => a.id === activeEl.getAttribute("data-app-id"));
+        if (app) onFavourite(app);
+        return;
+      }
 
       // `P` fires on the rail too: its play control is `tabIndex={-1}` like the
       // tile's (surface + play button both as tab stops doubles the cost of
@@ -118,5 +128,6 @@ export function useHomeKeys({
     onCloseBand,
     onLaunch,
     onResume,
+    onFavourite,
   ]);
 }

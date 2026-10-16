@@ -32,6 +32,11 @@ import { ApiError } from "../../api/client";
 import type { App, Session } from "../../api/types";
 
 vi.mock("../../api/library");
+// This suite drives the detail band, which is the Classic layout.
+vi.mock("../../settings/OverlayPreferencesContext", async (orig) => ({
+  ...(await orig<typeof import("../../settings/OverlayPreferencesContext")>()),
+  useNewDesign: () => false,
+}));
 
 const mocked = vi.mocked(libraryApi);
 

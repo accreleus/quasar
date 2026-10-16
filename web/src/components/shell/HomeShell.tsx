@@ -20,7 +20,7 @@
 
 import { useState } from "react";
 import type { ReactNode } from "react";
-import { Link, NavLink, useLocation } from "react-router-dom";
+import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { QuasarMark } from "../QuasarMark";
 import { IconSearch } from "../icons";
 import { CommandPalette } from "./CommandPalette";
@@ -29,16 +29,28 @@ import { UserMenu } from "./UserMenu";
 import { useLibraryCatalog } from "../../pages/app/libraryCatalog";
 import { buildUserNav, SEARCHABLE_ROUTES } from "../../pages/app/navItems";
 import { useLibrarySearch } from "../../pages/app/librarySearchContext";
+import { searchOnGamePage } from "../../pages/app/game/searchToPage";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
 
 export function HomeShell({ children }: { children: ReactNode }) {
   const { pathname } = useLocation();
-  const { query, setQuery } = useLibrarySearch();
+  const { query, setQuery: setLibraryQuery } = useLibrarySearch();
+  const navigate = useNavigate();
+  const newDesign = useNewDesign();
   const { apps } = useLibraryCatalog();
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   // Exact match, not `startsWith` — /app/session/:id has no shell; a future
   // /app/* child must opt in explicitly.
-  const searchable = (SEARCHABLE_ROUTES as readonly string[]).includes(pathname);
+  // The game page shows the field too; typing there takes you to the library it filters.
+  const onGamePage = searchOnGamePage(pathname, newDesign);
+  const searchable = (SEARCHABLE_ROUTES as readonly string[]).includes(pathname) || onGamePage;
+  const setQuery = onGamePage
+    ? (q: string) => {
+        setLibraryQuery(q);
+        navigate("/app/library");
+      }
+    : setLibraryQuery;
 
   return (
     <div className="app app-home">

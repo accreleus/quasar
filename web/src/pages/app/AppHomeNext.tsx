@@ -57,6 +57,9 @@ import { LibraryStates, SessionSummaryCard, StopSessionModal } from "./home/pane
 import { useDetailBand } from "./home/useDetailBand";
 import { useHomeKeys } from "./home/useHomeKeys";
 import { useLaunch } from "./home/useLaunch";
+import { FavouritesShelf, JumpBackShelf } from "./home/Shelves";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
+import type { OpenBandState } from "./game/GamePage";
 import "../../styles/home.css";
 
 type HomeView = "home" | "library";
@@ -74,8 +77,9 @@ export function AppHomeNext() {
   const navigate = useNavigate();
   const location = useLocation() as {
     pathname: string;
-    state: { sessionSummary?: SessionSummary } | null;
+    state: ({ sessionSummary?: SessionSummary } & OpenBandState) | null;
   };
+  const newDesign = useNewDesign();
   const summary = location.state?.sessionSummary;
   // Home vs Library is derived from the URL — see the header. `startsWith` so a
   // trailing slash ("/app/library/") resolves the same way.
@@ -316,9 +320,25 @@ export function AppHomeNext() {
     onCloseBand: closeDetail,
     onLaunch: launchFromKey,
     onResume: resumeFromKey,
+    onFavourite: newDesign ? toggleFavourite : undefined,
   });
 
   const openApp = openId ? appById.get(openId) ?? null : null;
+  // New design opens a game's page; the band stays for Classic layout.
+  const openGamePage = useCallback(
+    (app: App) => navigate(`/app/game/${app.id}`, { state: { from: "home" } }),
+    [navigate],
+  );
+
+  // A game-page URL under Classic layout lands here asking for that game's band.
+  const wantedId = location.state?.openApp;
+  const wanted = wantedId ? appById.get(wantedId) : undefined;
+  const { reveal } = detail;
+  useEffect(() => {
+    if (!wanted) return;
+    reveal(wanted, false);
+    navigate("/app", { replace: true, state: null });
+  }, [wanted, reveal, navigate]);
 
   const renderDetail = useCallback(
     (app: App): ReactNode =>
@@ -388,9 +408,11 @@ export function AppHomeNext() {
             isBusy={busy}
             coverClass={coverClassById.get(app.id) ?? coverClassAt(0)}
             tileRef={detail.setTileRef(app.id)}
-            onOpen={() => detail.open(app, list)}
+            onOpen={() => (newDesign ? openGamePage(app) : detail.open(app, list))}
             onPlay={() => void quickLaunch(app)}
             detail={renderDetail(app)}
+            opensPage={newDesign}
+            onFavourite={newDesign ? () => void toggleFavourite(app) : undefined}
           />
         )}
       />
@@ -405,8 +427,21 @@ export function AppHomeNext() {
       detail,
       quickLaunch,
       renderDetail,
+      newDesign,
+      openGamePage,
+      toggleFavourite,
     ],
   );
+
+  const shelfTile = {
+    busy,
+    liveAppId: liveSession?.app_id ?? null,
+    blockedIds,
+    blockedByName,
+    coverClass: (a: App) => coverClassById.get(a.id) ?? coverClassAt(0),
+    onOpen: openGamePage,
+    onPlay: (a: App) => void quickLaunch(a),
+  };
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -432,7 +467,7 @@ export function AppHomeNext() {
                 coverClassById={coverClassById}
                 busy={busy}
                 blockedIds={blockedIds}
-                onOpen={(app) => detail.reveal(app, false)}
+                onOpen={(app) => (newDesign ? openGamePage(app) : detail.reveal(app, false))}
                 onPlay={(card, app) => {
                   if (card.sessionId) navigate(`/app/session/${card.sessionId}`);
                   else void quickLaunch(app);
@@ -440,6 +475,13 @@ export function AppHomeNext() {
               />
             )}
           </Hero>
+        )}
+
+        {newDesign && view === "home" && !error && (
+          <>
+            <JumpBackShelf apps={apps} tile={shelfTile} />
+            <FavouritesShelf apps={filterLibraryApps(sortedApps, "favourite", "")} tile={shelfTile} />
+          </>
         )}
 
         <LibraryGrid

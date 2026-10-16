@@ -23,7 +23,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../../auth/context";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
 import { useTheme } from "../../settings/ThemeContext";
+import { paletteGameHref } from "../../pages/app/game/searchToPage";
 import { IconSearch, ShellIcon } from "../icons";
 import {
   palettePlaceholder,
@@ -71,6 +73,7 @@ export function CommandPalette({
   users?: readonly PaletteUser[];
 }) {
   const { isAdmin } = useAuth();
+  const newDesign = useNewDesign();
   const { toggleTheme } = useTheme();
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
@@ -149,10 +152,11 @@ export function CommandPalette({
     (item: PaletteItem | undefined) => {
       if (!item) return;
       onOpenChange(false);
+      const to = paletteGameHref(item, isAdmin, newDesign) ?? item.to;
       if (item.action === "toggle-appearance") toggleTheme();
-      else if (item.to) navigate(item.to);
+      else if (to) navigate(to);
     },
-    [navigate, onOpenChange, toggleTheme],
+    [navigate, onOpenChange, toggleTheme, isAdmin, newDesign],
   );
 
   /** Cycle focus inside the panel. Tab is handled outright rather than only
