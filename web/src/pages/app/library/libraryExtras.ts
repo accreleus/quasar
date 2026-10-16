@@ -1,14 +1,44 @@
-// Per-title facts the organising controls and the search results read: genres,
-// when a title was added, this user's play history, a small icon. The control-api
-// carries none of them yet, so the source below yields null and every consumer
-// degrades to what `App` itself has (A–Z only, no Genre menu, no captions).
-// Wiring a source here is the whole change once an amendment adds them.
+// Per-title facts the organising controls, the search results, the Home shelves
+// and the game page read: genres, when a title was added, this user's play
+// history, a small icon, and the game page's logo, credits and last session. The
+// control-api carries none of them yet, so the source below yields null and every
+// consumer degrades to what `App` itself has (A–Z only, no Genre menu, no
+// captions, no history). Wiring a source here is the whole change once an
+// amendment adds them.
+
+export interface GameSessionStats {
+  started_at: string;
+  duration_seconds: number;
+  requested: { width: number; height: number; fps: number; bitrate_kbps: number; codec: string };
+  delivered: {
+    width: number;
+    height: number;
+    fps_avg: number;
+    bitrate_kbps_avg: number;
+    codec: string;
+    rtt_ms_p50: number;
+    held_full_res_pct: number;
+    host: string;
+  };
+}
 
 export interface LibraryExtras {
   genres: string[];
   added_at: string | null;
-  play: { last_played_at: string; total_seconds: number } | null;
+  play: {
+    last_played_at: string;
+    total_seconds: number;
+    sessions?: number;
+    last_session?: GameSessionStats | null;
+  } | null;
   icon_url?: string | null;
+  // Game page only.
+  rank?: number;
+  logo_url?: string | null;
+  developer?: string | null;
+  publisher?: string | null;
+  release_date?: string | null;
+  controller_support?: string | null;
 }
 
 export type ExtrasMap = Record<string, LibraryExtras>;

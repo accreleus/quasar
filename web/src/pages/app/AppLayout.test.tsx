@@ -16,8 +16,8 @@
 //     which is now a real page in the account rail.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { App } from "../../App";
 import { buildUserNav, SEARCHABLE_ROUTES } from "./AppLayout";
 import { buildUserTabs } from "./userTabs";
@@ -55,6 +55,10 @@ const auth: AuthContextValue = {
   logout: vi.fn(),
 };
 
+function Path() {
+  return <span data-testid="path">{useLocation().pathname}</span>;
+}
+
 function renderApp(path: string) {
   return render(
     <MemoryRouter initialEntries={[path]}>
@@ -63,6 +67,7 @@ function renderApp(path: string) {
           <SetupStatusProvider>
             <ToastProvider>
               <App />
+              <Path />
             </ToastProvider>
           </SetupStatusProvider>
         </AuthContext.Provider>
@@ -97,6 +102,7 @@ beforeEach(() => {
   } as never);
   mockedLibrary.getMySessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mockedLibrary.getHighlights.mockResolvedValue({ items: [] } as never);
+  mockedLibrary.getProfilePreferences.mockResolvedValue({ user_overrides_allowed: true } as never);
   mockedStorage.getMyStorage.mockResolvedValue({ items: [] } as never);
 });
 
@@ -326,6 +332,17 @@ describe("topbar search box", () => {
       expect(document.querySelectorAll(".lib-tile").length).toBe(0);
     });
   });
+
+  it("a palette hit routes into the library with the name in the box", async () => {
+    renderApp("/app");
+    await screen.findByRole("textbox", { name: "Search library" });
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    const palette = within(await screen.findByRole("dialog")).getByRole("combobox");
+    fireEvent.change(palette, { target: { value: "Portal" } });
+    fireEvent.click(await screen.findByRole("option", { name: /Portal 2/ }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Search library" })).toHaveValue("Portal 2"));
+    expect(screen.getByTestId("path")).toHaveTextContent("/app/library");
+  });
 });
 
 // ── The same four, in the new design (the default) ───────────────────────────
@@ -357,17 +374,115 @@ describe("new design (no Classic layout pin)", () => {
     await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(0));
   });
 
-  it("a palette hit routes into the library with the name in the box", async () => {
+  it("a palette hit opens the game's page", async () => {
     renderApp("/app");
     await box();
     fireEvent.keyDown(document, { key: "k", ctrlKey: true });
     const palette = within(await screen.findByRole("dialog")).getByRole("combobox");
     fireEvent.change(palette, { target: { value: "Portal" } });
     fireEvent.click(await screen.findByRole("option", { name: /Portal 2/ }));
-    await waitFor(() => expect(screen.getByRole("combobox", { name: "Search library" })).toHaveValue("Portal 2"));
+    await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent("/app/game/"));
+    expect(await screen.findByRole("heading", { level: 1, name: "Portal 2" })).toBeInTheDocument();
   });
 
-  describe("a palette pick always opens the chosen game", () => {
+  it("a top-bar result opens the game's page, and Back returns to the library", async () => {
+    renderApp("/app/library");
+    fireEvent.change(await box(), { target: { value: "Portal" } });
+    fireEvent.click(await screen.findByRole("option", { name: "Portal 2" }));
+    expect(await screen.findByRole("heading", { level: 1, name: "Portal 2" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent("/app/library"));
+  });
+
+  describe("a pick hands focus to Play, so P launches rather than typing into the search", () => {
+    beforeEach(() => {
+      const rung = { id: "r", display_name: "r", codec: "h264", width: 1920, height: 1080, fps: 60, nominal_bitrate_kbps: 8000, position: 1, eligibility: "eligible", reasons: [] };
+      mockedLibrary.getProfiles.mockResolvedValue({
+        recommended_id: "p",
+        confidence: "high",
+        notes: [],
+        profiles: [{ id: "p", display_name: "p", description: "", nominal: { width: 1920, height: 1080, fps: 60, bitrate_kbps: 8000 }, eligibility: "eligible", reasons: [], rungs: [rung] }],
+      } as never);
+      mockedLibrary.launchSession.mockRejectedValue(new Error("not here"));
+    });
+    async function playHasFocusAndPLaunches() {
+      const play = await screen.findByRole("button", { name: "Play" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+      const input = await box();
+      expect(input).toHaveAttribute("aria-expanded", "false");
+      fireEvent.keyDown(play, { key: "p" });
+      await waitFor(() => expect(mockedLibrary.launchSession).toHaveBeenCalledTimes(1));
+      expect(mockedLibrary.launchSession.mock.calls[0][1]).toEqual({ app_id: "a1", mic: true });
+      expect(input).toHaveValue("Portal");
+    }
+
+    it("from the top-bar search", async () => {
+      renderApp("/app/library");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "Portal" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await playHasFocusAndPLaunches();
+    });
+
+    it("from the palette, which hands focus back to the search field it was opened from", async () => {
+      renderApp("/app/library?q=Portal");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "k", ctrlKey: true });
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByRole("combobox"), { target: { value: "Portal" } });
+      fireEvent.click(await within(dialog).findByRole("option", { name: /Portal 2/ }));
+      await playHasFocusAndPLaunches();
+    });
+
+    it("again for the game already open, from the top-bar search and from the palette", async () => {
+      renderApp("/app/library");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "Portal" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      const play = await screen.findByRole("button", { name: "Play" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+      expect(input).toHaveAttribute("aria-expanded", "false");
+
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "k", ctrlKey: true });
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByRole("combobox"), { target: { value: "Portal" } });
+      fireEvent.click(await within(dialog).findByRole("option", { name: /Portal 2/ }));
+      await playHasFocusAndPLaunches();
+    });
+
+    it("not on Back onto a search entry; a fresh pick still does", async () => {
+      renderApp("/app/library");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "Portal" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      const play = await screen.findByRole("button", { name: "Play" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+
+      const heart = screen.getByRole("button", { name: "Add Portal 2 to favourites" });
+      act(() => heart.focus());
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      await act(async () => {});
+      expect(document.activeElement).toBe(heart);
+
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "Enter" });
+      await playHasFocusAndPLaunches();
+    });
+  });
+
+  describe("a pick always opens the chosen game's page", () => {
     const game = (id: string, name: string) => ({ ...mockedAppBase, id, name });
     const mockedAppBase = {
       description: "",
@@ -386,76 +501,31 @@ describe("new design (no Classic layout pin)", () => {
       fireEvent.change(within(dialog).getByRole("combobox"), { target: { value: name } });
       fireEvent.click((await within(dialog).findAllByRole("option", { name: new RegExp(name) }))[option]);
     }
-    const band = (id: string) => waitFor(() => expect(document.getElementById(`lib-detail-${id}`)).not.toBeNull());
+    const page = async (id: string, name: string) => {
+      await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent(`/app/game/${id}`));
+      expect(await screen.findByRole("heading", { level: 1, name })).toBeInTheDocument();
+    };
     const nav = (name: string) => within(screen.getAllByRole("navigation")[0]).getByRole("link", { name });
-
-    it("from Home, with the box already holding the name from an earlier pick", async () => {
-      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Portal 2"), game("a2", "Celeste")] } as never);
-      renderApp("/app");
-      await box();
-      await pick("Portal 2");
-      await band("a1");
-      expect(nav("Library")).toHaveClass("active");
-      fireEvent.click(nav("Home"));
-      await waitFor(() => expect(nav("Home")).toHaveClass("active"));
-      expect(screen.getByRole("combobox", { name: "Search library" })).toHaveValue("Portal 2");
-      await pick("Portal 2");
-      await band("a1");
-      expect(nav("Library")).toHaveClass("active");
-    });
-
-    it("after the box was cleared while the URL still carries the same ?q=", async () => {
-      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Portal 2"), game("a2", "Celeste")] } as never);
-      renderApp("/app/library");
-      await box();
-      await pick("Celeste");
-      await band("a2");
-      fireEvent.change(screen.getByRole("combobox", { name: "Search library" }), { target: { value: "" } });
-      await waitFor(() => expect(document.getElementById("lib-detail-a2")).toBeNull());
-      await pick("Celeste");
-      await band("a2");
-      expect(screen.getByRole("combobox", { name: "Search library" })).toHaveValue("Celeste");
-      await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(1));
-    });
-
-    it("a different game opens its own band", async () => {
-      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Portal 2"), game("a2", "Celeste")] } as never);
-      renderApp("/app/library");
-      await box();
-      await pick("Portal 2");
-      await band("a1");
-      await pick("Celeste");
-      await band("a2");
-      expect(document.getElementById("lib-detail-a1")).toBeNull();
-    });
-
     const twoGames = () =>
       mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Portal 2"), game("a2", "Celeste")] } as never);
-    const boxEl = () => screen.getByRole("combobox", { name: "Search library" });
 
-    it("from Home, a tile that is already open stays open when it is picked", async () => {
+    it("again after going Home, from its own page, and for a different game", async () => {
       twoGames();
       renderApp("/app");
-      fireEvent.change(await box(), { target: { value: "Celeste" } });
-      fireEvent.click(await screen.findByRole("button", { name: "Celeste" }));
-      await band("a2");
+      await box();
+      await pick("Portal 2");
+      await page("a1", "Portal 2");
+      fireEvent.click(nav("Home"));
+      await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent(/^\/app$/));
+      await pick("Portal 2");
+      await page("a1", "Portal 2");
       await pick("Celeste");
-      await waitFor(() => expect(nav("Library")).toHaveClass("active"));
-      await band("a2");
+      await page("a2", "Celeste");
+      await pick("Celeste");
+      await page("a2", "Celeste");
     });
 
-    it("on Library, a tile opened under a prefix stays open when it is picked", async () => {
-      twoGames();
-      renderApp("/app/library");
-      fireEvent.change(await box(), { target: { value: "cel" } });
-      fireEvent.click(await screen.findByRole("button", { name: "Celeste" }));
-      await band("a2");
-      await pick("Celeste");
-      await waitFor(() => expect(boxEl()).toHaveValue("Celeste"));
-      await band("a2");
-    });
-
-    it("a pick the kind filter hides clears the filter and opens", async () => {
+    it("when the kind filter hides it", async () => {
       mockedLibrary.listApps.mockResolvedValue({
         items: [game("a1", "Portal 2"), { ...game("a2", "Weston Terminal"), kind: "desktop" }],
       } as never);
@@ -464,19 +534,7 @@ describe("new design (no Classic layout pin)", () => {
       const tabs = await screen.findByRole("tablist", { name: "Filter by kind" });
       fireEvent.click(within(tabs).getByRole("tab", { name: "Desktops" }));
       await pick("Portal 2");
-      await band("a1");
-      expect(within(tabs).getByRole("tab", { name: "All" })).toHaveAttribute("aria-selected", "true");
-    });
-
-    it("a second click on an open tile still closes it", async () => {
-      twoGames();
-      renderApp("/app/library");
-      await box();
-      const tile = await screen.findByRole("button", { name: "Celeste" });
-      fireEvent.click(tile);
-      await band("a2");
-      fireEvent.click(tile);
-      await waitFor(() => expect(document.getElementById("lib-detail-a2")).toBeNull());
+      await page("a1", "Portal 2");
     });
 
     it("two games with the same name: the chosen id opens", async () => {
@@ -484,8 +542,7 @@ describe("new design (no Classic layout pin)", () => {
       renderApp("/app/library");
       await box();
       await pick("Twin", 1);
-      await band("a2");
-      expect(document.getElementById("lib-detail-a1")).toBeNull();
+      await page("a2", "Twin");
     });
   });
 });

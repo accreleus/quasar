@@ -23,6 +23,11 @@ import * as libraryApi from "../../../api/library";
 import type { App } from "../../../api/types";
 
 vi.mock("../../../api/library");
+// This suite drives the detail band, which is the Classic layout.
+vi.mock("../../../settings/OverlayPreferencesContext", async (orig) => ({
+  ...(await orig<typeof import("../../../settings/OverlayPreferencesContext")>()),
+  useNewDesign: () => false,
+}));
 
 // The band's codec segment is intersected with the client's decode probe, and
 // jsdom answers nothing — pin the probe so the panel's codec buttons exist.

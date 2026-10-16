@@ -22,6 +22,8 @@ export interface LibraryCatalogValue {
   apps: App[];
   /** True only before the first load settles — a refresh never re-flashes it. */
   loading: boolean;
+  /** The first load has finished, with data or an error; `loading` is false before it starts too. */
+  settled: boolean;
   error: string | null;
   reload: () => void;
   setApps: (updater: (apps: App[]) => App[]) => void;
@@ -41,11 +43,12 @@ export function LibraryCatalogProvider({ children }: { children: ReactNode }) {
     () => ({
       apps: res.data ?? [],
       loading: res.loading,
+      settled: res.status !== "idle" && res.status !== "loading",
       error: res.errorMessage,
       reload: () => void res.refresh(),
       setApps: res.setData,
     }),
-    [res.data, res.loading, res.errorMessage, res.refresh, res.setData],
+    [res.data, res.loading, res.status, res.errorMessage, res.refresh, res.setData],
   );
 
   return <LibraryCatalogCtx.Provider value={value}>{children}</LibraryCatalogCtx.Provider>;

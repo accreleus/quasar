@@ -14,10 +14,10 @@ const sources = (isAdmin: boolean): PaletteSources => ({
 });
 
 describe("searchPaletteFuzzy", () => {
-  it("leads with ranked games for a typo, routing a player into the library", () => {
+  it("leads with ranked games for a typo, routing a player to the game's page", () => {
     const [games] = searchPaletteFuzzy("ciies sky", sources(false), null);
     expect(games.title).toBe("Games");
-    expect(games.items.map((i) => [i.label, i.to])).toEqual([["Cities: Skylines", "/app/library?q=Cities%3A%20Skylines"]]);
+    expect(games.items.map((i) => [i.label, i.to])).toEqual([["Cities: Skylines", "/app/game/c"]]);
   });
 
   it("sends an admin's hit to the app editor", () => {
