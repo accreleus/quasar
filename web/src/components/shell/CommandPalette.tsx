@@ -35,6 +35,10 @@ import {
   type PaletteSession,
   type PaletteUser,
 } from "./paletteSearch";
+import { isGamePick, runGamePick, searchPaletteFuzzy } from "./paletteGames";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
+import { useLibrarySearch } from "../../pages/app/librarySearchContext";
+import { useLibraryExtras } from "../../pages/app/library/libraryExtras";
 
 /** One frozen empty list for every absent source, so an omitted prop does not
  *  churn the search memo on each render. */
@@ -73,6 +77,7 @@ export function CommandPalette({
   const { isAdmin } = useAuth();
   const { toggleTheme } = useTheme();
   const navigate = useNavigate();
+  const { setQuery: setLibraryQuery } = useLibrarySearch();
   const [query, setQuery] = useState("");
   const [sel, setSel] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -80,16 +85,18 @@ export function CommandPalette({
   /** Whatever had focus when the palette opened, owed it back on close. */
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
+  const newDesign = useNewDesign();
+  const extras = useLibraryExtras();
   const groups = useMemo(
     () =>
-      searchPalette(query, {
+      (newDesign ? (q: string, s: Parameters<typeof searchPalette>[1]) => searchPaletteFuzzy(q, s, extras) : searchPalette)(query, {
         hosts: hosts ?? NONE,
         sessions: sessions ?? NONE,
         apps: apps ?? NONE,
         users: users ?? NONE,
         isAdmin,
       }),
-    [query, hosts, sessions, apps, users, isAdmin],
+    [query, hosts, sessions, apps, users, isAdmin, newDesign, extras],
   );
   // Derived from the sources actually handed down, not from the role alone —
   // see paletteScope. The account area gets the same palette with a shorter
@@ -149,10 +156,12 @@ export function CommandPalette({
     (item: PaletteItem | undefined) => {
       if (!item) return;
       onOpenChange(false);
-      if (item.action === "toggle-appearance") toggleTheme();
-      else if (item.to) navigate(item.to);
+      const to = item.to;
+      if (newDesign && to && isGamePick(item, isAdmin)) runGamePick(item, setLibraryQuery, () => navigate(to));
+      else if (item.action === "toggle-appearance") toggleTheme();
+      else if (to) navigate(to);
     },
-    [navigate, onOpenChange, toggleTheme],
+    [navigate, onOpenChange, toggleTheme, newDesign, isAdmin, setLibraryQuery],
   );
 
   /** Cycle focus inside the panel. Tab is handled outright rather than only

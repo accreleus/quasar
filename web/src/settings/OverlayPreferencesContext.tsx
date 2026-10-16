@@ -17,7 +17,7 @@ import {
   useState,
 } from "react";
 import type { ReactNode } from "react";
-import { Outlet, useLocation } from "react-router-dom";
+import { Outlet, useMatch } from "react-router-dom";
 import { getUIPreferences, patchUIPreferences } from "../api/me";
 import { useAuth } from "../auth/context";
 import {
@@ -38,6 +38,8 @@ interface OverlayPreferencesValue {
   /** The user opted back into the previous layout (`classic_layout`). Read it
    *  through `useNewDesign()`, not directly. */
   classicLayout: boolean;
+  /** What `useNewDesign()` returns: the user's choice, forced off on /admin. */
+  newDesign: boolean;
   /** Optimistic; on a failed PATCH it reverts to the value before the call and
    *  REJECTS, so the caller can show its own toast. One PATCH at a time: a call
    *  made while `classicSaving` is true does nothing. */
@@ -218,9 +220,8 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
   // html[data-design="new"], so switching back to classic needs no reload.
   // Layout effect so the attribute is in place before paint (as useDarkLock
   // does). Admin is excluded (#714): this provider wraps /admin too, so the
-  // attribute is left off there. useNewDesign() still reports the user's
-  // choice on admin; nothing on admin calls it.
-  const inAdmin = /^\/admin(\/|$)/.test(useLocation().pathname);
+  // attribute is left off there and useNewDesign() reports false there.
+  const inAdmin = useMatch("/admin/*") !== null;
   useLayoutEffect(() => {
     const root = document.documentElement;
     if (inAdmin) delete root.dataset.design;
@@ -234,7 +235,7 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
   );
 
   return (
-    <Ctx.Provider value={{ prefs, loaded, save, error, classicLayout, setClassicLayout, classicSaving }}>
+    <Ctx.Provider value={{ prefs, loaded, save, error, classicLayout, newDesign: !classicLayout && !inAdmin, setClassicLayout, classicSaving }}>
       {children}
     </Ctx.Provider>
   );
@@ -252,19 +253,19 @@ export function useOverlayPreferences(): OverlayPreferencesValue {
     save: async () => {},
     error: null,
     classicLayout: false,
+    newDesign: true,
     setClassicLayout: async () => {},
     classicSaving: false,
   };
 }
 
 /** True when the redesigned library, game page and account pages should render
- *  (the default); false when the user chose "Classic layout". Outside the
- *  provider (signed-out pages, bare test harnesses) it is true. The provider
- *  also wraps /admin, where it reports the user's choice; admin is not
- *  redesigned and nothing there calls it (the data-design attribute is left
- *  off there too). */
+ *  (the default); false when the user chose "Classic layout", and always false
+ *  on /admin, which is not redesigned (the data-design attribute is left off
+ *  there too). Outside the provider (signed-out pages, bare test harnesses) it
+ *  is true. */
 export function useNewDesign(): boolean {
-  return !useOverlayPreferences().classicLayout;
+  return useOverlayPreferences().newDesign;
 }
 
 /** Layout-route wrapper: mounts the provider once for every authenticated

@@ -45,6 +45,12 @@ import {
 } from "./libraryGrid";
 import { useLibraryCatalog } from "./libraryCatalog";
 import { useLibrarySearch } from "./librarySearchContext";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
+import { LetterIndex } from "./library/LetterIndex";
+import { sectioned, tileMeta } from "./library/LetterSections";
+import { LibraryToolbar } from "./library/LibraryToolbar";
+import { useOrganised } from "./library/useOrganised";
+import { useFuzzyFilter, useOpenRequests } from "./search/useFuzzy";
 import type { SessionSummary } from "./sessionSummary";
 import { DetailBand } from "./home/DetailBand";
 import { Hero } from "./home/Hero";
@@ -58,6 +64,7 @@ import { useDetailBand } from "./home/useDetailBand";
 import { useHomeKeys } from "./home/useHomeKeys";
 import { useLaunch } from "./home/useLaunch";
 import "../../styles/home.css";
+import "../../styles/library-new.css";
 
 type HomeView = "home" | "library";
 
@@ -82,6 +89,12 @@ export function AppHomeNext() {
   const view: HomeView = location.pathname.startsWith("/app/library") ? "library" : "home";
   const { addToast } = useToast();
   const { query: search } = useLibrarySearch();
+  // The hooks below run in both designs (hooks cannot branch); only the new
+  // design reads their results.
+  const newDesign = useNewDesign();
+  const organised = useOrganised();
+  const fuzzyFilter = useFuzzyFilter();
+  const e01 = newDesign ? organised : null;
 
   // Catalogue, loading and error come from the layout's one read (see
   // ./libraryCatalog) — the command palette in the shell above renders the same
@@ -164,10 +177,17 @@ export function AppHomeNext() {
   }, [appsByName]);
 
   const sortedApps = useMemo(() => sortLibraryApps(appsByName), [appsByName]);
-  const filteredApps = useMemo(
-    () => filterLibraryApps(sortedApps, kindFilter, search),
-    [sortedApps, kindFilter, search],
+  // Kind + search, before the genre filter (the toolbar counts each genre over it).
+  const kindApps = useMemo(
+    () =>
+      newDesign
+        ? fuzzyFilter(filterLibraryApps(sortedApps, kindFilter, ""), search)
+        : filterLibraryApps(sortedApps, kindFilter, search),
+    [sortedApps, kindFilter, search, newDesign, fuzzyFilter],
   );
+  const arrange = e01?.arrange;
+  const metaFor = e01?.metaFor;
+  const filteredApps = useMemo(() => (arrange ? arrange(kindApps) : kindApps), [kindApps, arrange]);
 
   /** The grids currently on screen, in DOM order. Home view is one flat grid;
    *  Library view is one grid per source group. */
@@ -181,9 +201,22 @@ export function AppHomeNext() {
     token,
     visibleLists,
     onClearFilter: () => setKindFilter("all"),
-    viewKey: `${view}|${kindFilter}|${search}`,
+    viewKey: `${view}|${kindFilter}|${search}|${e01?.sort}|${e01?.genre}`,
     smoothScroll: !prefersReducedMotion(),
   });
+  // A game chosen in the topbar popover or the palette opens its launcher here;
+  // it looks in the whole catalogue so `reveal` can clear a kind filter hiding it.
+  useOpenRequests(apps, detail.reveal, search);
+  // A new search replaces the list under a viewport that may be scrolled far
+  // down it (a letter jump): bring the library head back so the results show.
+  // The grid keeps its A–Z order; the ranked order is the popover's.
+  const searched = useRef(search);
+  useEffect(() => {
+    if (searched.current === search) return;
+    searched.current = search;
+    const lib = newDesign ? gridsRef.current?.closest<HTMLElement>(".home-lib") : null;
+    if (lib && lib.getBoundingClientRect().top < 0) lib.scrollIntoView({ block: "start" });
+  }, [search, newDesign]);
   const launch = useLaunch({
     token,
     apps,
@@ -391,6 +424,7 @@ export function AppHomeNext() {
             onOpen={() => detail.open(app, list)}
             onPlay={() => void quickLaunch(app)}
             detail={renderDetail(app)}
+            meta={metaFor && tileMeta(metaFor, app)}
           />
         )}
       />
@@ -405,6 +439,7 @@ export function AppHomeNext() {
       detail,
       quickLaunch,
       renderDetail,
+      metaFor,
     ],
   );
 
@@ -458,8 +493,10 @@ export function AppHomeNext() {
           }
           groups={view === "library" ? sourceGroups : null}
           apps={filteredApps}
-          renderGrid={renderGrid}
+          renderGrid={e01 ? sectioned(e01.sort, filteredApps.length, renderGrid) : renderGrid}
           gridsRef={gridsRef}
+          headExtra={e01 && !error && <LibraryToolbar o={e01} apps={kindApps} />}
+          index={e01 && !error && <LetterIndex o={e01} apps={filteredApps} />}
         >
           <LibraryStates
             loading={loading}

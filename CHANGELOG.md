@@ -25,7 +25,8 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
-- **Account ▸ Preferences ▸ Appearance has a Classic layout switch (#714).** Off by default. It is the switch for the redesigned library, game page and account pages, which arrive in following changes; turning it on keeps the previous layout. The choice is saved with your account, so it follows you to every device. Nothing changes on screen yet.
+- **The library is easier to move through (#714).** A library of 60 or more titles is split into letter sections with an A–Z index down the right edge. Search ranks results and forgives typos: the top bar shows the best matches under the box (Enter opens the first one's launcher) and Ctrl+K lists the games first. Account ▸ Preferences ▸ Appearance ▸ Classic layout brings back the previous library and search.
+- **Account ▸ Preferences ▸ Appearance has a Classic layout switch (#714).** Off by default, so you get the redesigned pages; turning it on keeps the previous layout. It covers the library now and the game page and account pages as they arrive. The choice is saved with your account, so it follows you to every device.
 
 ### Changed
 - **The media host check now fails on a picture whose pixels were moved, not only on one whose colours were damaged (#289).** `media_probe_gpu<N>` used to encode a black field, on which a displaced block looks the same as the block it replaced. The compositor now has a test picture, a fixed grid of four colours shown only while no app is on screen, and the check compares its own decoded output with it. Nothing to configure: the check id, what it blocks and its wording are unchanged, and a session never shows the picture.
