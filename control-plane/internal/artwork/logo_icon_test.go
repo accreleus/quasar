@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
+	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 )
 
 // logoCDN serves a logo and an icon whose bytes differ from each other and from
@@ -482,34 +484,6 @@ func TestLogoFetchedIconFailedKeepsTheLogo(t *testing.T) {
 	}
 }
 
-// The writes are guarded on the file name the sweep read: an admin re-pick that
-// lands between the sweep's list and its write is never wiped or overwritten.
-func TestDropAndRepairNeverTouchARePickedCrop(t *testing.T) {
-	h, fp, cdn := newLogoHarness(t)
-	ctx := context.Background()
-	appID := appidApp(t, h, fp, cdn, "620")
-	h.svc.SweepOnce(ctx)
-	rec := h.record(t, appID)
-	logo, icon := h.urls(t, appID)
-	stale := strings.Repeat("0", 64) + ".png" // what the sweep read, before the re-pick
-
-	for _, unname := range []bool{true, false} {
-		if err := h.svc.store.DropLogoIcon(ctx, appID, stale, stale, unname); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := h.svc.store.RepairCrop(ctx, appID, rec.ProviderRef, "logo", stale, stale, false); err != nil {
-		t.Fatal(err)
-	}
-	after := h.record(t, appID)
-	if after.LogoAsset != rec.LogoAsset || after.IconAsset != rec.IconAsset || after.LogoIconChecked != rec.LogoIconChecked {
-		t.Fatalf("re-picked row changed:\nbefore %+v\nafter  %+v", rec, after)
-	}
-	if l, i := h.urls(t, appID); l != logo || i != icon {
-		t.Fatalf("urls %q %q, want %q %q", l, i, logo, icon)
-	}
-}
-
 func TestRematchReplacesAllFourCrops(t *testing.T) {
 	h, fp, cdn := newLogoHarness(t)
 	ctx := context.Background()
@@ -529,5 +503,223 @@ func TestRematchReplacesAllFourCrops(t *testing.T) {
 	}
 	if l, i := h.urls(t, appID); l != AssetURL(after.LogoAsset) || i != "" {
 		t.Fatalf("urls %q %q", l, i)
+	}
+}
+
+// adminActions are the admin writes a sweep can race: each must win.
+func adminActions(h *harness, fp *fakeProvider, cdn string) map[string]func(t *testing.T, appID string) {
+	return map[string]func(t *testing.T, appID string){
+		"pick": func(t *testing.T, appID string) {
+			fp.art["88"] = Candidate{Ref: "88", Name: "Other", TileURL: cdn + "/tile2.png"}
+			fp.logoIcon[":88"] = [2]string{cdn + "/logo2.png", ""}
+			if _, err := h.svc.ApplyCandidate(context.Background(), appID, "88"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"upload": func(t *testing.T, appID string) {
+			if _, err := h.svc.Upload(context.Background(), appID, CropTile, "image/jpeg", onePixelJPEG); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+}
+
+// A sweep holding a snapshot older than an admin write writes nothing for that
+// row: the guard every sweep write goes through.
+func TestSweepWriteRefusesARowAnAdminChanged(t *testing.T) {
+	for _, name := range []string{"pick", "upload"} {
+		t.Run(name, func(t *testing.T) {
+			h, fp, cdn := newLogoHarness(t)
+			ctx := context.Background()
+			appID := appidApp(t, h, fp, cdn, "620")
+			h.svc.SweepOnce(ctx)
+			seen := h.record(t, appID) // what the sweep listed
+
+			adminActions(h, fp, cdn)[name](t, appID)
+			admin := h.record(t, appID)
+			logo, icon := h.urls(t, appID)
+
+			want := seen
+			want.LogoAsset, want.LogoLost, want.LogoIconChecked = "", true, false
+			if _, ok := h.svc.sweepWrite(ctx, seen, want); ok {
+				t.Fatal("a write from a stale snapshot was accepted")
+			}
+			if got := h.record(t, appID); !reflect.DeepEqual(got, admin) {
+				t.Fatalf("admin's row changed:\n got %+v\nwant %+v", got, admin)
+			}
+			if l, i := h.urls(t, appID); l != logo || i != icon {
+				t.Fatalf("urls %q %q, want %q %q", l, i, logo, icon)
+			}
+		})
+	}
+}
+
+// An admin action landing while the sweep fetches (between its list and its
+// repair or backfill write) leaves the admin's row as the admin wrote it.
+func TestAdminActionDuringASweepFetchWins(t *testing.T) {
+	for _, pass := range []string{"repair", "backfill"} {
+		for _, name := range []string{"pick", "upload"} {
+			t.Run(pass+"/"+name, func(t *testing.T) {
+				h, fp, cdn := newLogoHarness(t)
+				ctx := context.Background()
+				appID := appidApp(t, h, fp, cdn, "620")
+				if pass == "backfill" {
+					fp.logoIconErr = errTransient // resolved with no logo: on the backfill queue
+				}
+				h.svc.SweepOnce(ctx)
+				fp.logoIconErr = nil
+				if pass == "repair" {
+					if err := os.Remove(h.svc.blobs.pathFor(h.record(t, appID).LogoAsset)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var admin Record
+				var logo, icon string
+				fp.onLogoIcon = func() {
+					fp.onLogoIcon = nil
+					adminActions(h, fp, cdn)[name](t, appID)
+					admin = h.record(t, appID)
+					logo, icon = h.urls(t, appID)
+				}
+
+				h.svc.SweepOnce(ctx)
+				if admin.AppID == "" {
+					t.Fatal("the sweep never fetched")
+				}
+				if got := h.record(t, appID); !reflect.DeepEqual(got, admin) {
+					t.Fatalf("the sweep overwrote the admin's row:\n got %+v\nwant %+v", got, admin)
+				}
+				if l, i := h.urls(t, appID); l != logo || i != icon {
+					t.Fatalf("urls %q %q, want %q %q", l, i, logo, icon)
+				}
+			})
+		}
+	}
+}
+
+// A logo or icon is served only when Has says (true, nil). A stat error (here
+// ENOTDIR) unserves it and changes nothing else: no unname, no fetch. When the
+// file can be found again, the next sweep serves it with no provider call.
+func TestLogoThatCannotBeCheckedIsOnlyUnservedThenServedAgain(t *testing.T) {
+	h, fp, cdn := newLogoHarness(t)
+	ctx := context.Background()
+	appID := appidApp(t, h, fp, cdn, "620")
+	h.svc.SweepOnce(ctx)
+	before := h.record(t, appID)
+	logoURL, iconURL := h.urls(t, appID)
+	shard := filepath.Join(h.svc.blobs.Root(), before.LogoAsset[:2])
+	for _, a := range []string{before.TileAsset, before.HeroAsset, before.IconAsset} {
+		if a[:2] == before.LogoAsset[:2] {
+			t.Fatalf("fixture: %s shares the logo's shard", a)
+		}
+	}
+	data, err := os.ReadFile(h.svc.blobs.pathFor(before.LogoAsset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The shard path as a file: stat of the logo fails with ENOTDIR.
+	if err := os.RemoveAll(shard); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(shard, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := fp.logoIconCalls
+
+	h.svc.SweepOnce(ctx)
+	after := h.record(t, appID)
+	if l, i := h.urls(t, appID); l != "" || i != iconURL {
+		t.Fatalf("urls %q %q: want the logo unserved and the icon %q kept", l, i, iconURL)
+	}
+	if after.LogoAsset != before.LogoAsset || after.LogoIconChecked != before.LogoIconChecked || fp.logoIconCalls != calls {
+		t.Fatalf("a stat error changed more than the url: %+v, %d LogoIcon calls", after, fp.logoIconCalls-calls)
+	}
+
+	// The cache comes back (a late mount): served again, nothing fetched.
+	if err := os.Remove(shard); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(shard, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.svc.blobs.pathFor(before.LogoAsset), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.svc.SweepOnce(ctx)
+	if l, _ := h.urls(t, appID); l != logoURL || fp.logoIconCalls != calls {
+		t.Fatalf("logo url %q (want %q), %d LogoIcon calls", l, logoURL, fp.logoIconCalls-calls)
+	}
+}
+
+func (h *harness) updatedAts(t *testing.T, appID string) (artwork, app time.Time) {
+	t.Helper()
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT w.updated_at, a.updated_at FROM app_artwork w JOIN apps a ON a.id = w.app_id
+		WHERE w.app_id::text = $1`, appID).Scan(&artwork, &app); err != nil {
+		t.Fatal(err)
+	}
+	return artwork, app
+}
+
+// A locked record whose logo stays unfetchable is written once, not every sweep:
+// neither its row nor its app is touched while nothing changes. The boot prune
+// is untroubled by the kept name of the missing file.
+func TestUnfetchableLockedLogoIsWrittenOnceAndSurvivesThePrune(t *testing.T) {
+	h, fp, _, ids, before := lockedPair(t)
+	ctx := context.Background()
+	fp.logoIconErr = errTransient
+	h.svc.sweepBatch = 25
+	h.svc.SweepOnce(ctx)
+	w1, a1 := h.updatedAts(t, ids[0])
+
+	h.svc.SweepOnce(ctx)
+	if w2, a2 := h.updatedAts(t, ids[0]); !w2.Equal(w1) || !a2.Equal(a1) {
+		t.Fatalf("a sweep with nothing to change wrote: artwork %v -> %v, app %v -> %v", w1, w2, a1, a2)
+	}
+
+	if _, err := h.svc.PruneOrphans(ctx); err != nil {
+		t.Fatalf("prune with a kept name for a missing file: %v", err)
+	}
+	rec := h.record(t, ids[0])
+	if rec.LogoAsset != before[ids[0]].LogoAsset || !h.cached(t, rec.IconAsset) || !h.cached(t, rec.TileAsset) || !h.cached(t, rec.HeroAsset) {
+		t.Fatalf("after prune: %+v", rec)
+	}
+	if l, _ := h.urls(t, ids[0]); l != "" {
+		t.Fatalf("logo served at %q after prune", l)
+	}
+}
+
+// Unlocked: logo fetched, icon fails. The logo is named and served, the icon is
+// forgotten and the record stays on the backfill queue, which fetches it later.
+func TestUnlockedLogoFetchedIconFailed(t *testing.T) {
+	h, fp, cdn := newLogoHarness(t)
+	ctx := context.Background()
+	appID := appidApp(t, h, fp, cdn, "620")
+	h.svc.SweepOnce(ctx)
+	before := h.record(t, appID)
+	for _, a := range []string{before.LogoAsset, before.IconAsset} {
+		if err := os.Remove(h.svc.blobs.pathFor(a)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fp.logoIcon["steam:620"] = [2]string{cdn + "/logo.png", cdn + "/gone.png"}
+
+	h.svc.SweepOnce(ctx)
+	if _, err := h.svc.PruneOrphans(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rec := h.record(t, appID)
+	logo, icon := h.urls(t, appID)
+	if rec.LogoAsset != before.LogoAsset || !h.cached(t, rec.LogoAsset) || logo != AssetURL(rec.LogoAsset) {
+		t.Fatalf("logo not kept: %+v, url %q", rec, logo)
+	}
+	if rec.IconAsset != "" || icon != "" || rec.LogoIconChecked {
+		t.Fatalf("icon: name %q url %q checked %v; want forgotten and queued", rec.IconAsset, icon, rec.LogoIconChecked)
+	}
+
+	fp.logoIcon["steam:620"] = [2]string{cdn + "/logo.png", cdn + "/icon.png"}
+	h.svc.SweepOnce(ctx)
+	if rec := h.record(t, appID); rec.IconAsset != before.IconAsset || !rec.LogoIconChecked {
+		t.Fatalf("the backfill did not fetch the icon: %+v", rec)
 	}
 }

@@ -57,10 +57,16 @@ type fakeProvider struct {
 	logoIcon      map[string][2]string
 	logoIconErr   error
 	logoIconCalls int
+	// onLogoIcon runs at the start of LogoIcon: a test lands an admin action in
+	// the middle of a sweep with it. Clear it inside to run once.
+	onLogoIcon func()
 }
 
 func (f *fakeProvider) LogoIcon(_ context.Context, source, ref string) (string, string, error) {
 	f.logoIconCalls++
+	if f.onLogoIcon != nil {
+		f.onLogoIcon()
+	}
 	if f.logoIconErr != nil {
 		return "", "", f.logoIconErr
 	}
