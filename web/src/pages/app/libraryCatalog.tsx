@@ -43,11 +43,11 @@ export function LibraryCatalogProvider({ children }: { children: ReactNode }) {
     initialData: [] as App[],
     fetch: async (ctx) => (await libraryApi.listApps(ctx.token)).items,
   });
-  const history = useResource({
+  const history = useResource<PlayHistoryItem[]>({
     label: "play history",
     fetch: async (ctx) => (await libraryApi.getPlayHistory(ctx.token)).items,
   });
-  const playHistory = history.status === "ready" || history.status === "refreshing" ? history.data : null;
+  const playHistory = history.status === "ready" || history.status === "refreshing" ? (history.data ?? null) : null;
 
   const value = useMemo<LibraryCatalogValue>(
     () => ({
