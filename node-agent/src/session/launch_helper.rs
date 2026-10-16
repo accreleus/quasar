@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -241,18 +242,23 @@ pub struct LaunchReports {
     pub game_window_on_screen: Option<bool>,
     /// The last reason reported; the wire has no "cleared".
     pub needs_user: Option<NeedsUser>,
+    /// A `game_running` was taken since the reader was last armed, which is what makes
+    /// a later `game_exited` legal.
+    pub seen_running: bool,
 }
 
-/// Launch states only move forward (#725 amendment 2): `game_exited` only after
-/// `game_running`, nothing after it. `game_running` from nothing is a reconnect's replay.
-fn forward(from: Option<LaunchState>, to: LaunchState) -> bool {
+/// Launch states move forward (#725 amendment 2): `game_exited` only once `game_running`
+/// was seen since the reader was armed, nothing after it. `starting` is taken from
+/// anything but `game_exited` because a new helper process (the launcher restarts a dead
+/// one) truthfully starts there; `game_running` from nothing is a reconnect's replay.
+fn forward(from: Option<LaunchState>, to: LaunchState, seen_running: bool) -> bool {
     use LaunchState::*;
     match (from, to) {
         (Some(GameExited), _) => false,
         (_, Starting) => true,
         (None | Some(Starting), ClientOnly) => true,
         (None | Some(Starting | ClientOnly), GameRunning) => true,
-        (Some(GameRunning), GameExited) => true,
+        (_, GameExited) => seen_running,
         _ => false,
     }
 }
@@ -442,6 +448,7 @@ impl LaunchSocket {
             notable_left: MAX_NOTABLE,
             dropped: Limiter::default(),
             held: Limiter::default(),
+            idle: IDLE,
         };
         let log_span = tracing::Span::current();
         std::thread::Builder::new()
@@ -507,6 +514,8 @@ struct Reader {
     notable_left: u32,
     dropped: Limiter,
     held: Limiter,
+    /// [`IDLE`]; a field so a test can close a connection at once.
+    idle: Duration,
 }
 
 impl Reader {
@@ -541,10 +550,19 @@ impl Reader {
         // Inside a line already dropped as oversize, up to its newline.
         let mut skipping = false;
         let mut last_line = Instant::now();
+        let mut closing = false;
         while !self.stopped() {
-            if last_line.elapsed() >= IDLE {
-                tracing::debug!("launch helper connection quiet for {IDLE:?}; dropped");
-                return;
+            if !closing && last_line.elapsed() >= self.idle {
+                // Shut reading, then drain to EOF: a line queued before this is still read,
+                // and a write after it fails, so the helper reconnects and replays it.
+                if stream.shutdown(Shutdown::Read).is_err() {
+                    return;
+                }
+                tracing::debug!(
+                    "launch helper connection quiet for {:?}; closing",
+                    self.idle
+                );
+                closing = true;
             }
             match stream.read(&mut buf[len..]) {
                 Ok(0) => return,
@@ -644,11 +662,12 @@ impl Reader {
         }
         match report {
             Report::LaunchState(state) if reports.launch_state != Some(state) => {
-                if !forward(reports.launch_state, state) {
+                if !forward(reports.launch_state, state, reports.seen_running) {
                     drop(reports);
                     return self.drop_line(Rejected::OutOfOrder);
                 }
                 reports.launch_state = Some(state);
+                reports.seen_running |= state == LaunchState::GameRunning;
                 // Under the reports lock, so a swap's reset cannot land in between.
                 self.shared
                     .metrics
@@ -961,6 +980,7 @@ mod tests {
                 launch_state: Some(LaunchState::GameRunning),
                 game_window_on_screen: Some(true),
                 needs_user: Some(NeedsUser::CloudConflict),
+                seen_running: true,
             }
         );
         assert_eq!(s.wire_state().as_deref(), Some("game_running"));
@@ -1115,7 +1135,7 @@ mod tests {
     #[test]
     fn launch_states_only_move_forward() {
         use LaunchState::*;
-        let allowed = [
+        let always = [
             (None, Starting),
             (None, ClientOnly),
             (None, GameRunning),
@@ -1124,21 +1144,25 @@ mod tests {
             (Some(ClientOnly), Starting),
             (Some(ClientOnly), GameRunning),
             (Some(GameRunning), Starting),
-            (Some(GameRunning), GameExited),
         ];
-        for from in [
-            None,
-            Some(Starting),
-            Some(ClientOnly),
-            Some(GameRunning),
-            Some(GameExited),
-        ] {
-            for to in [Starting, ClientOnly, GameRunning, GameExited] {
-                if from != Some(to) {
+        for seen_running in [false, true] {
+            for from in [
+                None,
+                Some(Starting),
+                Some(ClientOnly),
+                Some(GameRunning),
+                Some(GameExited),
+            ] {
+                for to in [Starting, ClientOnly, GameRunning, GameExited] {
+                    if from == Some(to) {
+                        continue;
+                    }
+                    let exit_after_running =
+                        to == GameExited && seen_running && from != Some(GameExited);
                     assert_eq!(
-                        forward(from, to),
-                        allowed.contains(&(from, to)),
-                        "{from:?} -> {to:?}"
+                        forward(from, to, seen_running),
+                        always.contains(&(from, to)) || exit_after_running,
+                        "{from:?} -> {to:?}, seen_running={seen_running}"
                     );
                 }
             }
@@ -1177,6 +1201,19 @@ mod tests {
     }
 
     #[test]
+    fn a_real_exit_after_a_restarted_helpers_starting_is_accepted() {
+        let mut s = Session::open(620);
+        let mut helper = s.connect();
+        // The helper died mid-game; the launcher's new one first says starting.
+        for state in ["game_running", "starting", "game_exited"] {
+            helper.write_all(&state_line(state)).unwrap();
+        }
+        s.wait_for(|r| r.launch_state == Some(LaunchState::GameExited));
+        let states: Vec<_> = s.traces().iter().map(|p| p["state"].clone()).collect();
+        assert_eq!(states, ["game_running", "starting", "game_exited"]);
+    }
+
+    #[test]
     fn a_swap_away_from_the_tile_clears_the_reports_until_it_is_back() {
         let s = Session::open(620);
         let mount = s.socket().mount().clone();
@@ -1197,11 +1234,49 @@ mod tests {
         assert_eq!(s.socket().reports(), LaunchReports::default());
         assert_eq!(s.wire_state(), None);
 
-        // A rollback or a swap back to the tile gets the mount and re-arms the reader.
+        // A rollback or a swap back to the tile gets the mount and re-arms the reader, and
+        // the game it saw running before the swap does not make an exit legal now.
         assert!(mount.for_app(&env("-bigpicture -applaunch 620")).is_some());
+        helper.write_all(&state_line("game_exited")).unwrap();
         helper.write_all(CLIENT_ONLY).unwrap();
         s.wait_for(|r| r.launch_state == Some(LaunchState::ClientOnly));
         assert_eq!(s.wire_state().as_deref(), Some("client_only"));
+    }
+
+    #[test]
+    fn a_line_queued_as_a_quiet_connection_closes_is_still_read() {
+        let shared = Arc::new(Shared {
+            active: AtomicBool::new(true),
+            reports: Mutex::default(),
+            metrics: Arc::new(SessionMetrics::new("off", 60)),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut reader = Reader {
+            stop: Arc::default(),
+            shared: shared.clone(),
+            appid: 620,
+            session_id: "s1".into(),
+            trace: DiagnosticEventTx::new(tx, Arc::default(), Arc::default()),
+            window: (Instant::now(), 0),
+            notable_left: MAX_NOTABLE,
+            dropped: Limiter::default(),
+            held: Limiter::default(),
+            // Quiet from the start: the close begins before the first read.
+            idle: Duration::ZERO,
+        };
+        let (ours, mut helper) = UnixStream::pair().unwrap();
+        helper.write_all(CLIENT_ONLY).unwrap();
+        reader.read_connection(ours);
+        assert_eq!(
+            shared.reports().launch_state,
+            Some(LaunchState::ClientOnly),
+            "the line the helper wrote before the close was read"
+        );
+        assert_eq!(
+            helper.write_all(STARTING).unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "the next write fails, so the helper reconnects and replays"
+        );
     }
 
     #[test]
