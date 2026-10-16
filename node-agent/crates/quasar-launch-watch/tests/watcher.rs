@@ -263,6 +263,15 @@ fn fixture_console_log_drives_transitions_line_by_line() {
     rig.append_log(lines.next().unwrap());
     assert_eq!(rig.watcher.poll(), vec![]);
 
+    // Waiting for the user on that task does, and the continues line clears it.
+    rig.append_log(lines.next().unwrap());
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::CloudConflict)]
+    );
+    rig.append_log(lines.next().unwrap());
+    assert_eq!(rig.watcher.poll(), vec![]);
+
     // The log alone moves ClientOnly to GameRunning, before any reaper.
     rig.append_log(lines.next().unwrap());
     assert_eq!(

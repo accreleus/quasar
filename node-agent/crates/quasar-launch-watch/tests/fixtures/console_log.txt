@@ -1,4 +1,6 @@
 [2026-10-16 09:00:00] GameAction [AppID 730, ActionID 1] : LaunchApp changed task to SynchronizingCloud
+[2026-10-16 09:00:02] GameAction [AppID 730, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud ""
+[2026-10-16 09:00:03] GameAction [AppID 730, ActionID 1] : LaunchApp continues with user response "SynchronizingCloud"
 [2026-10-16 09:00:05] Game process added : AppID 730 "/home/gamer/.local/share/Steam/ubuntu12_32/reaper SteamLaunch AppId=730 -- /games/Game/Game.exe", ProcID 201, IP 0.0.0.0:0
 [2026-10-16 09:01:00] GameAction [AppID 730, ActionID 1] : LaunchApp changed task to WaitingGameWindow
 [2026-10-16 09:02:00] Game process removed: AppID 730 "/games/Game/Game.exe", ProcID 201
