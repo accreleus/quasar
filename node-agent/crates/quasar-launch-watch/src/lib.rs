@@ -84,23 +84,24 @@ pub struct WatchConfig {
 
 /// `-applaunch <id>` out of `STEAM_STARTUP_FLAGS`; None for anything else (plain Steam app).
 pub fn appid_from_flags(flags: &str) -> Option<u32> {
-    let mut tokens = flags.split_whitespace();
+    // The agent's rule (`node-agent/src/session/launch_helper.rs` `appid_from_env`): one
+    // `-applaunch`, then a bare positive integer with no sign or leading zero. Anything
+    // else is not a launch: refuse rather than guess.
+    let mut tokens = flags.split_ascii_whitespace();
+    let mut appid = None;
     while let Some(token) = tokens.next() {
         if token == "-applaunch" {
-            // A trailing `-applaunch` with nothing after it, or a next token
-            // that is not a plain non-zero integer, is not a launch: refuse
-            // rather than guess. Digits only, because `u32::from_str` would
-            // otherwise accept a leading `+`.
-            return tokens.next().and_then(|next| {
-                if !next.is_empty() && next.bytes().all(|b| b.is_ascii_digit()) {
-                    next.parse::<u32>().ok().filter(|id| *id != 0)
-                } else {
-                    None
-                }
-            });
+            let value = tokens.next()?;
+            if appid.is_some()
+                || value.starts_with('0')
+                || !value.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            appid = Some(value.parse().ok()?);
         }
     }
-    None
+    appid
 }
 
 pub struct Watcher {
@@ -549,18 +550,10 @@ fn classify_window(window: &WindowInfo, appid: u32) -> Option<NeedsUser> {
         || title.contains("license agreement")
     {
         Some(NeedsUser::Eula)
-    } else if title.contains("self updater")
-        || title.contains("updating steam")
-        || title.contains("install")
-        || title.contains("setup")
-    {
+    } else if title.contains("self updater") || title.contains("updating steam") {
         Some(NeedsUser::Install)
-    } else if title.contains("sign in to steam")
-        || title.contains("sign in")
-        || title.contains("sign-in")
-        || title.contains("log in")
-        || title.contains("login")
-    {
+    } else if title.contains("sign in to steam") {
+        // Specific phrases only: a game's own "Setup" or "Log in" window is not Steam.
         Some(NeedsUser::SignIn)
     } else if class.contains("steam") && (title.contains("dialog") || title.contains("prompt")) {
         // A Steam dialog we have no specific row for still needs the user.

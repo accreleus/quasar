@@ -168,7 +168,14 @@ fn appid_from_flags_cases() {
     assert_eq!(appid_from_flags("-applaunch 0"), None);
     assert_eq!(appid_from_flags("-applaunch 73x"), None);
     assert_eq!(appid_from_flags("-bigpicture -applaunch"), None);
+    assert_eq!(appid_from_flags("-applaunch 0730"), None);
+    assert_eq!(appid_from_flags("-applaunch 730 -applaunch 730"), None);
+    assert_eq!(appid_from_flags("-applaunch 730 -applaunch 620"), None);
+    // ASCII whitespace only, as the agent and the launcher split it.
+    assert_eq!(appid_from_flags("x\u{2003}-applaunch 730"), None);
+    assert_eq!(appid_from_flags("-applaunch\u{2003}730"), None);
     assert_eq!(appid_from_flags("-applaunch 730"), Some(730));
+    assert_eq!(appid_from_flags("  -applaunch\t730  "), Some(730));
     assert_eq!(
         appid_from_flags("-bigpicture -applaunch 730 -silent extra"),
         Some(730)
@@ -534,6 +541,33 @@ fn steam_needs_user_is_once_per_reason_while_it_holds() {
         rig.watcher.poll(),
         vec![Report::GameWindow { on_screen: true }]
     );
+}
+
+#[test]
+fn a_games_own_setup_or_login_window_is_not_steam_needing_the_user() {
+    let mut rig = Rig::new();
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::Starting)]
+    );
+    for title in [
+        "Setup",
+        "Installing shaders",
+        "Install",
+        "Login",
+        "Log in to continue",
+        "Sign in",
+        "Sign-in required",
+    ] {
+        for steam_game in [None, Some(769)] {
+            rig.windows.set(vec![WindowInfo {
+                steam_game,
+                wm_class: "game game".into(),
+                title: title.into(),
+            }]);
+            assert_eq!(rig.watcher.poll(), vec![], "{title} ({steam_game:?})");
+        }
+    }
 }
 
 const REAPER: &[&str] = &[
