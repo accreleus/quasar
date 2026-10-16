@@ -146,17 +146,27 @@ struct X11Windows {
     x11: Option<X11>,
 }
 
-impl Windows for X11Windows {
-    fn mapped(&mut self) -> std::io::Result<Vec<WindowInfo>> {
+impl X11Windows {
+    fn read<T>(&mut self, read: impl FnOnce(&X11) -> std::io::Result<T>) -> std::io::Result<T> {
         let x11 = match &self.x11 {
             Some(x11) => x11,
             None => self.x11.insert(X11::connect()?),
         };
-        let windows = x11.mapped();
-        if windows.is_err() {
+        let result = read(x11);
+        if result.is_err() {
             self.x11 = None;
         }
-        windows
+        result
+    }
+}
+
+impl Windows for X11Windows {
+    fn mapped(&mut self) -> std::io::Result<Vec<WindowInfo>> {
+        self.read(X11::mapped)
+    }
+
+    fn focused_app(&mut self) -> std::io::Result<Option<u32>> {
+        self.read(X11::focused_app)
     }
 }
 
@@ -164,6 +174,7 @@ struct X11 {
     conn: RustConnection,
     root: Window,
     steam_game: Atom,
+    focused_app: Atom,
     net_wm_name: Atom,
     utf8_string: Atom,
 }
@@ -182,8 +193,9 @@ impl X11 {
                 .ok_or_else(|| std::io::Error::other("InternAtom refused"))?
                 .atom)
         };
-        let (steam_game, net_wm_name, utf8_string) = (
+        let (steam_game, focused_app, net_wm_name, utf8_string) = (
             atom(b"STEAM_GAME")?,
+            atom(b"GAMESCOPE_FOCUSED_APP")?,
             atom(b"_NET_WM_NAME")?,
             atom(b"UTF8_STRING")?,
         );
@@ -191,9 +203,17 @@ impl X11 {
             conn,
             root,
             steam_game,
+            focused_app,
             net_wm_name,
             utf8_string,
         })
+    }
+
+    /// The appid gamescope published as focused on the root window; `None` while unset.
+    fn focused_app(&self) -> std::io::Result<Option<u32>> {
+        Ok(self
+            .property(self.root, self.focused_app, AtomEnum::CARDINAL.into())?
+            .and_then(|p| p.value32().and_then(|mut v| v.next())))
     }
 
     /// Mapped top-level windows. A window gone mid-pass is skipped; a lost connection
@@ -268,6 +288,103 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
+
+    /// Against a real X server on `DISPLAY` (Xvfb), not gamescope: run with `-- --ignored`.
+    /// gamescope's and Steam's atoms are set here by hand, the way they publish them.
+    #[test]
+    #[ignore = "needs an X server on DISPLAY"]
+    fn reads_the_windows_and_the_focused_app_from_x() {
+        use x11rb::protocol::xproto::{CreateWindowAux, PropMode, WindowClass};
+        use x11rb::wrapper::ConnectionExt as _;
+        let (conn, screen) = x11rb::connect(None).unwrap();
+        let root = conn.setup().roots[screen].root;
+        let atom = |name: &[u8]| conn.intern_atom(false, name).unwrap().reply().unwrap().atom;
+        let (steam_game, focused, net_wm_name, utf8) = (
+            atom(b"STEAM_GAME"),
+            atom(b"GAMESCOPE_FOCUSED_APP"),
+            atom(b"_NET_WM_NAME"),
+            atom(b"UTF8_STRING"),
+        );
+        let window = |appid: u32, class: &[u8], name: (Atom, &str), mapped: bool| {
+            let w = conn.generate_id().unwrap();
+            conn.create_window(
+                0,
+                w,
+                root,
+                0,
+                0,
+                64,
+                64,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new(),
+            )
+            .unwrap();
+            conn.change_property32(
+                PropMode::REPLACE,
+                w,
+                steam_game,
+                AtomEnum::CARDINAL,
+                &[appid],
+            )
+            .unwrap();
+            conn.change_property8(
+                PropMode::REPLACE,
+                w,
+                AtomEnum::WM_CLASS,
+                AtomEnum::STRING,
+                class,
+            )
+            .unwrap();
+            let type_ = if name.0 == net_wm_name {
+                utf8
+            } else {
+                AtomEnum::STRING.into()
+            };
+            conn.change_property8(PropMode::REPLACE, w, name.0, type_, name.1.as_bytes())
+                .unwrap();
+            if mapped {
+                conn.map_window(w).unwrap();
+            }
+        };
+        window(
+            769,
+            b"steamwebhelper\0steam\0",
+            (net_wm_name, "Sign in to Steam"),
+            true,
+        );
+        window(
+            620,
+            b"portal2_linux\0portal2_linux\0",
+            (AtomEnum::WM_NAME.into(), "Portal 2"),
+            true,
+        );
+        window(620, b"hidden\0hidden\0", (net_wm_name, "not mapped"), false);
+        conn.sync().unwrap();
+
+        let mut x = X11Windows::default();
+        assert_eq!(x.focused_app().unwrap(), None, "unset");
+        assert_eq!(
+            x.mapped().unwrap(),
+            [
+                WindowInfo {
+                    steam_game: Some(769),
+                    wm_class: "steamwebhelper steam".into(),
+                    title: "Sign in to Steam".into(),
+                },
+                WindowInfo {
+                    steam_game: Some(620),
+                    wm_class: "portal2_linux portal2_linux".into(),
+                    title: "Portal 2".into(),
+                },
+            ]
+        );
+        conn.change_property32(PropMode::REPLACE, root, focused, AtomEnum::CARDINAL, &[620])
+            .unwrap();
+        conn.sync().unwrap();
+        assert_eq!(x.focused_app().unwrap(), Some(620));
+    }
 
     #[test]
     fn each_report_is_one_line_of_the_wire() {
