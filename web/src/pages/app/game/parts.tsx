@@ -8,6 +8,7 @@ import { Link } from "react-router-dom";
 import type { App } from "../../../api/types";
 import { Chip } from "../../../components/Chip";
 import { IconChevronLeft, IconHeart, IconPlayGlyph } from "../../../components/icons";
+import { artSrcSet, sizedArt } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
 import { BandNotes } from "../home/BandNotes";
 import { LaunchOptions } from "../home/LaunchOptions";
@@ -281,7 +282,9 @@ export function TileRow({ apps, coverClassById, label }: { apps: App[]; coverCla
               {a.cover_url && (
                 <img
                   className="cover-img"
-                  src={a.cover_url}
+                  src={sizedArt(a.cover_url, 320)}
+                  srcSet={artSrcSet(a.cover_url)}
+                  sizes="160px" /* .gp-tiles minmax(140px, 1fr) */
                   alt=""
                   loading="lazy"
                   decoding="async"

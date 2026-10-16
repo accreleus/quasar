@@ -29,11 +29,17 @@ type AppDetails struct {
 	enabled  bool
 }
 
-// Both fields come from one response; a second call per id to split them would double the
+// Every field comes from one response; a second call per id to split them would double the
 // rate-limited third-party traffic this type exists to bound.
 type AppDetail struct {
 	IsGame           bool
 	ShortDescription string
+	// Store details (control-api.md amendment 38); "" / nil = the store gave none.
+	Genres            []string
+	Developer         string
+	Publisher         string
+	ReleaseDate       string
+	ControllerSupport string // "full", "partial" or ""
 }
 
 // NewAppDetails: a disabled instance is not nil, it answers "not consulted" for everything,
@@ -99,7 +105,9 @@ func (a *AppDetails) fetchOne(ctx context.Context, id string) (AppDetail, bool) 
 	if !validAppID(id) {
 		return AppDetail{}, false
 	}
-	url := fmt.Sprintf("%s?appids=%s&filters=basic", a.endpoint, id)
+	// `basic` carries type, short_description and controller_support but not the other
+	// store details (testdata/appdetails/620_basic.json); l=english fixes the genre language.
+	url := fmt.Sprintf("%s?appids=%s&filters=basic,genres,developers,publishers,release_date&l=english", a.endpoint, id)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return AppDetail{}, false
@@ -114,12 +122,13 @@ func (a *AppDetails) fetchOne(ctx context.Context, id string) (AppDetail, bool) 
 		a.log.Info("library: appdetails lookup non-200", "appid", id, "status", resp.StatusCode)
 		return AppDetail{}, false
 	}
-	// wire shape: {"<appid>": {"success": bool, "data": {"type", "short_description"}}}
+	// wire shape: {"<appid>": {"success": bool, "data": {"type", "short_description", ...}}}
 	var body map[string]struct {
 		Success bool `json:"success"`
 		Data    struct {
 			Type             string `json:"type"`
 			ShortDescription string `json:"short_description"`
+			storeDetailsWire
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
@@ -131,8 +140,89 @@ func (a *AppDetails) fetchOne(ctx context.Context, id string) (AppDetail, bool) 
 		// just non-games. Treat as not consulted, never as "not a game" (§8.3).
 		return AppDetail{}, false
 	}
-	return AppDetail{
-		IsGame:           strings.EqualFold(entry.Data.Type, "game"),
-		ShortDescription: strings.TrimSpace(entry.Data.ShortDescription),
-	}, true
+	det := entry.Data.storeDetailsWire.parse()
+	det.IsGame = strings.EqualFold(entry.Data.Type, "game")
+	det.ShortDescription = strings.TrimSpace(storableText(entry.Data.ShortDescription))
+	return det, true
+}
+
+// storeDetailsWire is kept raw so a store-details field of an unexpected shape is dropped on
+// its own and never fails the decode the suppression rung's `type` depends on.
+type storeDetailsWire struct {
+	Genres            json.RawMessage `json:"genres"`
+	Developers        json.RawMessage `json:"developers"`
+	Publishers        json.RawMessage `json:"publishers"`
+	ReleaseDate       json.RawMessage `json:"release_date"`
+	ControllerSupport json.RawMessage `json:"controller_support"`
+}
+
+// Bounds on third-party text before it is stored and served.
+const (
+	maxGenres     = 16
+	maxGenreLen   = 64
+	maxCreditsLen = 256
+	maxReleaseLen = 64
+)
+
+func (w storeDetailsWire) parse() AppDetail {
+	var d AppDetail
+	var genres []struct {
+		Description string `json:"description"`
+	}
+	if json.Unmarshal(w.Genres, &genres) == nil {
+		seen := map[string]bool{}
+		for _, g := range genres {
+			name := clipText(g.Description, maxGenreLen)
+			if name == "" || seen[name] || len(d.Genres) == maxGenres {
+				continue
+			}
+			seen[name] = true
+			d.Genres = append(d.Genres, name)
+		}
+	}
+	d.Developer = joinCredits(w.Developers)
+	d.Publisher = joinCredits(w.Publishers)
+	var release struct {
+		Date string `json:"date"`
+	}
+	if json.Unmarshal(w.ReleaseDate, &release) == nil {
+		d.ReleaseDate = clipText(release.Date, maxReleaseLen)
+	}
+	var cs string
+	if json.Unmarshal(w.ControllerSupport, &cs) == nil {
+		if cs = strings.ToLower(strings.TrimSpace(storableText(cs))); cs == "full" || cs == "partial" {
+			d.ControllerSupport = cs
+		}
+	}
+	return d
+}
+
+// joinCredits renders the store's developers or publishers list as one ", "-joined line.
+func joinCredits(raw json.RawMessage) string {
+	var names []string
+	if json.Unmarshal(raw, &names) != nil {
+		return ""
+	}
+	kept := names[:0]
+	for _, n := range names {
+		if n = strings.TrimSpace(n); n != "" {
+			kept = append(kept, n)
+		}
+	}
+	return clipText(strings.Join(kept, ", "), maxCreditsLen)
+}
+
+// storableText drops what Postgres TEXT refuses, NUL and invalid UTF-8: one such
+// string from Valve would otherwise fail the scan's transaction on every scan.
+func storableText(s string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(s, ""), "\x00", "")
+}
+
+// clipText makes s storable, trims it and cuts it to at most n runes.
+func clipText(s string, n int) string {
+	s = strings.TrimSpace(storableText(s))
+	if r := []rune(s); len(r) > n {
+		s = strings.TrimSpace(string(r[:n]))
+	}
+	return s
 }

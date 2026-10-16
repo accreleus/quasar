@@ -241,7 +241,11 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 			h.log.Warn("library: could not compute backfill candidates", "scan_id", req.ScanID, "err", err)
 			backfillIDs = nil
 		}
-		if merged := mergeIDs(publishIDs, backfillIDs); len(merged) > 0 {
+		existing, err := h.store.ExistingTileIDs(r.Context(), parent, publishIDs)
+		if err != nil {
+			h.log.Warn("library: could not read existing tiles", "scan_id", req.ScanID, "err", err)
+		}
+		if merged := lookupOrder(publishIDs, backfillIDs, existing); len(merged) > 0 {
 			details = h.details.Fetch(r.Context(), merged)
 		}
 	}
@@ -297,6 +301,22 @@ func (h *Handler) resolveCreatedArtwork(ctx context.Context, scanID string, appI
 }
 
 // mergeIDs unions a and b, deduplicated, a's order then any of b's not already in a.
+// lookupOrder is the order Fetch spends its per-scan cap in: titles with no tile yet (the
+// suppression rung and their first details), then tiles still missing details, then the
+// re-check of tiles that already exist. Publishable ids alone would refill the cap with the
+// same first ids of every report, and no tile past them would ever be backfilled.
+func lookupOrder(publish, backfill []string, existing map[string]bool) []string {
+	var fresh, known []string
+	for _, id := range publish {
+		if existing[id] {
+			known = append(known, id)
+		} else {
+			fresh = append(fresh, id)
+		}
+	}
+	return mergeIDs(mergeIDs(fresh, backfill), known)
+}
+
 func mergeIDs(a, b []string) []string {
 	if len(b) == 0 {
 		return a

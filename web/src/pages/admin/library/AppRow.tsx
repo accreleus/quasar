@@ -6,6 +6,7 @@ import { Link } from "react-router-dom";
 import type { AdminApp } from "../../../api/types";
 import { ActionsMenu, type ActionsMenuItem } from "../../../components/ActionsMenu";
 import { Chip } from "../../../components/Chip";
+import { sizedArt } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
 import { isSteamSourced } from "./appsFilters";
 
@@ -59,7 +60,7 @@ export function AppRow({
             style={{ width: 26, height: 26 }}
           >
             {app.cover_url ? (
-              <img src={app.cover_url} alt="" className="cover-img" loading="lazy" decoding="async" />
+              <img src={sizedArt(app.cover_url, 96)} alt="" className="cover-img" loading="lazy" decoding="async" />
             ) : (
               <span className="glyph">
                 {appGlyph(app.name)}

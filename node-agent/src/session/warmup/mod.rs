@@ -170,9 +170,9 @@ pub trait WarmupHost: Send + Sync {
     fn container_home(&self, image: &str) -> Option<String>;
 
     /// §3.3 step 5: launch an ordinary session-shaped run — same compositor,
-    /// same `SessionRunner` path, the image's default `CMD` (i.e. `-bigpicture`,
-    /// per §1.4.4), the scratch home bind-mounted at the resolved container home
-    /// path.
+    /// same `SessionRunner` path, Big Picture set by the warm-up itself
+    /// (`STEAM_STARTUP_FLAGS`, per §1.4.4), the scratch home bind-mounted at the
+    /// resolved container home path.
     fn launch(&self, req: &WarmupLaunch) -> Result<Box<dyn WarmupSession>, String>;
 }
 
