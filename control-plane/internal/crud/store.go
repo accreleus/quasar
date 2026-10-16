@@ -68,8 +68,24 @@ func (s *store) readinessGate() *readinessgate.Gate {
 	return s.gate
 }
 
+// TitleFacts are an app's read-only per-title facts (control-api.md amendment 38),
+// selected as titleFactsCols and scanned in the same order.
+type TitleFacts struct {
+	Genres            []string `json:"genres"`
+	Developer         *string  `json:"developer"`
+	Publisher         *string  `json:"publisher"`
+	ReleaseDate       *string  `json:"release_date"`
+	ControllerSupport *string  `json:"controller_support"`
+	LogoURL           *string  `json:"logo_url"`
+	IconURL           *string  `json:"icon_url"`
+}
+
+const titleFactsCols = `apps.genres, apps.developer, apps.publisher, apps.release_date,
+		       apps.controller_support, apps.logo_url, apps.icon_url`
+
 // App is the domain view of an app/library entry (public + admin views use the same shape).
 type App struct {
+	TitleFacts
 	ID          string  `json:"id"`
 	Name        string  `json:"name"`
 	Description string  `json:"description"`
@@ -351,7 +367,7 @@ func (s *store) listApps(ctx context.Context, callerID, cursor string, limit int
 		       COALESCE(dp.height, default_height),
 		       COALESCE(dp.fps, default_fps),
 		       COALESCE(dp.nominal_bitrate_kbps, default_bitrate_kbps),
-		       apps.created_at, apps.updated_at,
+		       apps.created_at, apps.updated_at, `+titleFactsCols+`,
 		       (fav.app_id IS NOT NULL)
 		FROM apps
 		-- display_stream (UI-P4): resolve the app's effective LAUNCH PROFILE, then
@@ -392,7 +408,9 @@ func (s *store) listApps(ctx context.Context, callerID, cursor string, limit int
 			&a.DefaultWidth, &a.DefaultHeight, &a.DefaultFPS, &a.DefaultBitratekbps,
 			&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy,
 			&a.DisplayWidth, &a.DisplayHeight, &a.DisplayFPS, &a.DisplayBitratekbps,
-			&a.CreatedAt, &a.UpdatedAt, &a.Favourite); err != nil {
+			&a.CreatedAt, &a.UpdatedAt,
+			&a.Genres, &a.Developer, &a.Publisher, &a.ReleaseDate, &a.ControllerSupport, &a.LogoURL, &a.IconURL,
+			&a.Favourite); err != nil {
 			return nil, "", fmt.Errorf("scan app: %w", err)
 		}
 		apps = append(apps, a)
@@ -444,7 +462,7 @@ func (s *store) getApp(ctx context.Context, callerID, id string) (App, error) {
 		       COALESCE(dp.height, default_height),
 		       COALESCE(dp.fps, default_fps),
 		       COALESCE(dp.nominal_bitrate_kbps, default_bitrate_kbps),
-		       apps.created_at, apps.updated_at,
+		       apps.created_at, apps.updated_at, `+titleFactsCols+`,
 		       (fav.app_id IS NOT NULL)
 		FROM apps
 		-- display_stream (UI-P4): resolve the app's effective LAUNCH PROFILE, then
@@ -477,7 +495,9 @@ func (s *store) getApp(ctx context.Context, callerID, id string) (App, error) {
 		&a.DefaultWidth, &a.DefaultHeight, &a.DefaultFPS, &a.DefaultBitratekbps,
 		&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy,
 		&a.DisplayWidth, &a.DisplayHeight, &a.DisplayFPS, &a.DisplayBitratekbps,
-		&a.CreatedAt, &a.UpdatedAt, &a.Favourite)
+		&a.CreatedAt, &a.UpdatedAt,
+		&a.Genres, &a.Developer, &a.Publisher, &a.ReleaseDate, &a.ControllerSupport, &a.LogoURL, &a.IconURL,
+		&a.Favourite)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return App{}, ErrNotFound
 	}
@@ -948,7 +968,7 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 	          default_vram_mb, default_encode_slots,
 	          default_width, default_height, default_fps, default_bitrate_kbps,
 	          enabled, default_profile_id, profile_policy, runtime_spec, managed_home, home_container_path,
-	          runtime_preset_id::text, created_at, updated_at`
+	          runtime_preset_id::text, created_at, updated_at, ` + titleFactsCols
 
 	args = append(args, id)
 	var a App
@@ -992,7 +1012,8 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 			&a.DefaultVramMB, &a.DefaultEncodeSlots,
 			&a.DefaultWidth, &a.DefaultHeight, &a.DefaultFPS, &a.DefaultBitratekbps,
 			&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath,
-			&a.RuntimePresetID, &a.CreatedAt, &a.UpdatedAt)
+			&a.RuntimePresetID, &a.CreatedAt, &a.UpdatedAt,
+			&a.Genres, &a.Developer, &a.Publisher, &a.ReleaseDate, &a.ControllerSupport, &a.LogoURL, &a.IconURL)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return App{}, ErrNotFound
 	}
@@ -1206,7 +1227,7 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 		       COALESCE(dp.height, default_height),
 		       COALESCE(dp.fps, default_fps),
 		       COALESCE(dp.nominal_bitrate_kbps, default_bitrate_kbps),
-		       apps.created_at, apps.updated_at,
+		       apps.created_at, apps.updated_at, `+titleFactsCols+`,
 		       (fav.app_id IS NOT NULL),
 		       -- sessions_30d (UI v3 amendment): every state counts, failures
 		       -- included — a launch that failed is still a launch someone
@@ -1259,7 +1280,9 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 			&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath,
 			&a.RuntimePresetID, &a.LaunchableProfileIDs,
 			&a.DisplayWidth, &a.DisplayHeight, &a.DisplayFPS, &a.DisplayBitratekbps,
-			&a.CreatedAt, &a.UpdatedAt, &a.Favourite, &a.Sessions30d); err != nil {
+			&a.CreatedAt, &a.UpdatedAt,
+			&a.Genres, &a.Developer, &a.Publisher, &a.ReleaseDate, &a.ControllerSupport, &a.LogoURL, &a.IconURL,
+			&a.Favourite, &a.Sessions30d); err != nil {
 			return nil, "", fmt.Errorf("scan app: %w", err)
 		}
 		apps = append(apps, a)
@@ -1300,7 +1323,7 @@ func (s *store) getAppFull(ctx context.Context, callerID, id string) (App, error
 		       COALESCE(dp.height, default_height),
 		       COALESCE(dp.fps, default_fps),
 		       COALESCE(dp.nominal_bitrate_kbps, default_bitrate_kbps),
-		       apps.created_at, apps.updated_at,
+		       apps.created_at, apps.updated_at, `+titleFactsCols+`,
 		       (fav.app_id IS NOT NULL)
 		FROM apps
 		-- display_stream (UI-P4): resolve the app's effective LAUNCH PROFILE, then
@@ -1329,7 +1352,9 @@ func (s *store) getAppFull(ctx context.Context, callerID, id string) (App, error
 		&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath,
 		&a.RuntimePresetID, &a.LaunchableProfileIDs,
 		&a.DisplayWidth, &a.DisplayHeight, &a.DisplayFPS, &a.DisplayBitratekbps,
-		&a.CreatedAt, &a.UpdatedAt, &a.Favourite)
+		&a.CreatedAt, &a.UpdatedAt,
+		&a.Genres, &a.Developer, &a.Publisher, &a.ReleaseDate, &a.ControllerSupport, &a.LogoURL, &a.IconURL,
+		&a.Favourite)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return App{}, ErrNotFound
 	}

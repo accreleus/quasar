@@ -297,6 +297,10 @@ func TestMigration0043BackfillIsNeutralPerUser(t *testing.T) {
 		if err != nil {
 			t.Fatalf("post-migration list for %s: %v", u, err)
 		}
+		// The pre-0043 query cannot read amendment 38's columns (0104); they are not the filter.
+		for i := range got {
+			got[i].TitleFacts = TitleFacts{}
+		}
 		if after := snapshotJSON(t, got); after != before[u] {
 			t.Errorf("BACKFILL NOT NEUTRAL for user %s.\n before: %s\n  after: %s", u, before[u], after)
 		}

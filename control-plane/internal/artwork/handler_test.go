@@ -52,6 +52,20 @@ type fakeProvider struct {
 	searchErr     error
 	artErr        error
 	externalErr   error
+	// logoIcon maps "<source>:<ref>" (source "" for a provider ref) to a
+	// {logo, icon} URL pair; an absent key is a title with neither.
+	logoIcon      map[string][2]string
+	logoIconErr   error
+	logoIconCalls int
+}
+
+func (f *fakeProvider) LogoIcon(_ context.Context, source, ref string) (string, string, error) {
+	f.logoIconCalls++
+	if f.logoIconErr != nil {
+		return "", "", f.logoIconErr
+	}
+	li := f.logoIcon[source+":"+ref]
+	return li[0], li[1], nil
 }
 
 func (f *fakeProvider) Name() string { return "fake" }

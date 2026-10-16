@@ -27,6 +27,22 @@ type Record struct {
 	Attribution string    `json:"attribution"`
 	Locked      bool      `json:"locked"`
 	UpdatedAt   time.Time `json:"updated_at"`
+	// Amendment 38. Not on the admin artwork read. LogoIconChecked: the provider
+	// answered for this record's logo and icon (migration 0104).
+	LogoAsset       string `json:"-"`
+	IconAsset       string `json:"-"`
+	LogoIconChecked bool   `json:"-"`
+}
+
+// recordCols is the column list every Record read scans, in recordDests order.
+const recordCols = `app_id::text, source, provider, provider_ref, matched_name,
+		       tile_asset, hero_asset, attribution, locked, updated_at,
+		       logo_asset, icon_asset, logo_icon_checked`
+
+func (r *Record) dests() []any {
+	return []any{&r.AppID, &r.Source, &r.Provider, &r.ProviderRef, &r.MatchedName,
+		&r.TileAsset, &r.HeroAsset, &r.Attribution, &r.Locked, &r.UpdatedAt,
+		&r.LogoAsset, &r.IconAsset, &r.LogoIconChecked}
 }
 
 // Source values. 'none' is a negative cache, not an error (see migration 0039).
@@ -76,12 +92,8 @@ func (s *Store) App(ctx context.Context, appID string) (appRef, error) {
 // nil) — "no artwork yet" is an ordinary state, not an error.
 func (s *Store) Get(ctx context.Context, appID string) (Record, bool, error) {
 	var r Record
-	err := s.pool.QueryRow(ctx, `
-		SELECT app_id::text, source, provider, provider_ref, matched_name,
-		       tile_asset, hero_asset, attribution, locked, updated_at
-		FROM app_artwork WHERE app_id::text = $1
-	`, appID).Scan(&r.AppID, &r.Source, &r.Provider, &r.ProviderRef, &r.MatchedName,
-		&r.TileAsset, &r.HeroAsset, &r.Attribution, &r.Locked, &r.UpdatedAt)
+	err := s.pool.QueryRow(ctx, `SELECT `+recordCols+` FROM app_artwork WHERE app_id::text = $1`, appID).
+		Scan(r.dests()...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Record{}, false, nil
 	}
@@ -108,8 +120,9 @@ func (s *Store) Save(ctx context.Context, r Record) error {
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO app_artwork (app_id, source, provider, provider_ref, matched_name,
-		                         tile_asset, hero_asset, attribution, locked, updated_at)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, now())
+		                         tile_asset, hero_asset, attribution, locked, updated_at,
+		                         logo_asset, icon_asset, logo_icon_checked)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12)
 		ON CONFLICT (app_id) DO UPDATE SET
 			source = EXCLUDED.source,
 			provider = EXCLUDED.provider,
@@ -119,16 +132,21 @@ func (s *Store) Save(ctx context.Context, r Record) error {
 			hero_asset = EXCLUDED.hero_asset,
 			attribution = EXCLUDED.attribution,
 			locked = EXCLUDED.locked,
-			updated_at = now()
+			updated_at = now(),
+			logo_asset = EXCLUDED.logo_asset,
+			icon_asset = EXCLUDED.icon_asset,
+			logo_icon_checked = EXCLUDED.logo_icon_checked
 	`, r.AppID, r.Source, r.Provider, r.ProviderRef, r.MatchedName,
-		r.TileAsset, r.HeroAsset, r.Attribution, r.Locked); err != nil {
+		r.TileAsset, r.HeroAsset, r.Attribution, r.Locked,
+		r.LogoAsset, r.IconAsset, r.LogoIconChecked); err != nil {
 		return fmt.Errorf("artwork: upsert: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `
-		UPDATE apps SET cover_url = $2, hero_url = $3, updated_at = now()
+		UPDATE apps SET cover_url = $2, hero_url = $3, logo_url = $4, icon_url = $5, updated_at = now()
 		WHERE id::text = $1
-	`, r.AppID, assetURLOrNil(r.TileAsset), assetURLOrNil(r.HeroAsset)); err != nil {
+	`, r.AppID, assetURLOrNil(r.TileAsset), assetURLOrNil(r.HeroAsset),
+		assetURLOrNil(r.LogoAsset), assetURLOrNil(r.IconAsset)); err != nil {
 		return fmt.Errorf("artwork: update app urls: %w", err)
 	}
 	return tx.Commit(ctx)
@@ -148,7 +166,7 @@ func (s *Store) Clear(ctx context.Context, appID string) error {
 		return fmt.Errorf("artwork: delete: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE apps SET cover_url = NULL, hero_url = NULL, updated_at = now()
+		UPDATE apps SET cover_url = NULL, hero_url = NULL, logo_url = NULL, icon_url = NULL, updated_at = now()
 		WHERE id::text = $1
 	`, appID); err != nil {
 		return fmt.Errorf("artwork: clear app urls: %w", err)
@@ -216,26 +234,64 @@ func (s *Store) AllApps(ctx context.Context) ([]appRef, error) {
 // RecordsWithAssets lists every artwork row that names a cached image — the
 // sweep's check that each named file still exists (#441).
 func (s *Store) RecordsWithAssets(ctx context.Context) ([]Record, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT app_id::text, source, provider, provider_ref, matched_name,
-		       tile_asset, hero_asset, attribution, locked, updated_at
+	return s.records(ctx, `SELECT `+recordCols+`
 		FROM app_artwork WHERE tile_asset <> '' OR hero_asset <> ''
+		ORDER BY updated_at`)
+}
+
+// LogoIconPending lists unlocked provider records whose logo and icon were never
+// fetched (amendment 38) — the sweep's backfill queue. Oldest updated_at first;
+// SaveLogoIcon bumps it, so a record that keeps failing moves to the back.
+func (s *Store) LogoIconPending(ctx context.Context, limit int) ([]Record, error) {
+	return s.records(ctx, `SELECT `+recordCols+`
+		FROM app_artwork
+		WHERE source = '`+SourceProvider+`' AND NOT locked AND NOT logo_icon_checked
 		ORDER BY updated_at
-	`)
+		LIMIT $1`, limit)
+}
+
+func (s *Store) records(ctx context.Context, query string, args ...any) ([]Record, error) {
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("artwork: records with assets: %w", err)
+		return nil, fmt.Errorf("artwork: list records: %w", err)
 	}
 	defer rows.Close()
 	var out []Record
 	for rows.Next() {
 		var r Record
-		if err := rows.Scan(&r.AppID, &r.Source, &r.Provider, &r.ProviderRef, &r.MatchedName,
-			&r.TileAsset, &r.HeroAsset, &r.Attribution, &r.Locked, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(r.dests()...); err != nil {
 			return nil, fmt.Errorf("artwork: scan record: %w", err)
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// SaveLogoIcon writes a backfilled logo and icon onto rec's row and the app's
+// URLs, only while the row is still the unlocked provider match that was read: an
+// admin override that landed meanwhile wins. It always bumps updated_at.
+func (s *Store) SaveLogoIcon(ctx context.Context, rec Record) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("artwork: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE app_artwork SET logo_asset = $3, icon_asset = $4, logo_icon_checked = $5, updated_at = now()
+		WHERE app_id::text = $1 AND provider_ref = $2 AND source = '`+SourceProvider+`' AND NOT locked
+	`, rec.AppID, rec.ProviderRef, rec.LogoAsset, rec.IconAsset, rec.LogoIconChecked)
+	if err != nil {
+		return fmt.Errorf("artwork: save logo and icon: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE apps SET logo_url = $2, icon_url = $3, updated_at = now() WHERE id::text = $1`,
+		rec.AppID, assetURLOrNil(rec.LogoAsset), assetURLOrNil(rec.IconAsset)); err != nil {
+		return fmt.Errorf("artwork: update app logo and icon urls: %w", err)
+	}
+	return tx.Commit(ctx)
 }
 
 // ReferencedAssets returns every blob name still named by an artwork row —
@@ -245,6 +301,10 @@ func (s *Store) ReferencedAssets(ctx context.Context) (map[string]struct{}, erro
 		SELECT tile_asset FROM app_artwork WHERE tile_asset <> ''
 		UNION
 		SELECT hero_asset FROM app_artwork WHERE hero_asset <> ''
+		UNION
+		SELECT logo_asset FROM app_artwork WHERE logo_asset <> ''
+		UNION
+		SELECT icon_asset FROM app_artwork WHERE icon_asset <> ''
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("artwork: referenced: %w", err)

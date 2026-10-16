@@ -11,11 +11,14 @@
  * `setApps` is here because the favourite toggle is optimistic: it rewrites one
  * row before the PATCH lands. `useResource.setData` also discards any GET
  * already in flight, so a list read that predates the toggle cannot stomp it.
+ *
+ * The caller's play history (`GET /v1/me/play-history`) loads beside it and is
+ * reloaded with it; `useLibraryExtras` joins the two.
  */
 
 import { createContext, useContext, useMemo, type ReactNode } from "react";
 import * as libraryApi from "../../api/library";
-import type { App } from "../../api/types";
+import type { App, PlayHistoryItem } from "../../api/types";
 import { useResource } from "../../lib/resource/react";
 
 export interface LibraryCatalogValue {
@@ -27,6 +30,8 @@ export interface LibraryCatalogValue {
   error: string | null;
   reload: () => void;
   setApps: (updater: (apps: App[]) => App[]) => void;
+  /** Null while it loads or after it failed (an older control plane has no such route). */
+  playHistory: PlayHistoryItem[] | null;
 }
 
 const LibraryCatalogCtx = createContext<LibraryCatalogValue | null>(null);
@@ -38,6 +43,11 @@ export function LibraryCatalogProvider({ children }: { children: ReactNode }) {
     initialData: [] as App[],
     fetch: async (ctx) => (await libraryApi.listApps(ctx.token)).items,
   });
+  const history = useResource({
+    label: "play history",
+    fetch: async (ctx) => (await libraryApi.getPlayHistory(ctx.token)).items,
+  });
+  const playHistory = history.status === "ready" || history.status === "refreshing" ? history.data : null;
 
   const value = useMemo<LibraryCatalogValue>(
     () => ({
@@ -45,13 +55,22 @@ export function LibraryCatalogProvider({ children }: { children: ReactNode }) {
       loading: res.loading,
       settled: res.status !== "idle" && res.status !== "loading",
       error: res.errorMessage,
-      reload: () => void res.refresh(),
+      reload: () => {
+        void res.refresh();
+        void history.refresh();
+      },
       setApps: res.setData,
+      playHistory,
     }),
-    [res.data, res.loading, res.status, res.errorMessage, res.refresh, res.setData],
+    [res.data, res.loading, res.status, res.errorMessage, res.refresh, res.setData, history.refresh, playHistory],
   );
 
   return <LibraryCatalogCtx.Provider value={value}>{children}</LibraryCatalogCtx.Provider>;
+}
+
+/** Null outside a provider: the command palette also mounts in areas that have none. */
+export function useOptionalLibraryCatalog(): LibraryCatalogValue | null {
+  return useContext(LibraryCatalogCtx);
 }
 
 export function useLibraryCatalog(): LibraryCatalogValue {
