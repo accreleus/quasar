@@ -144,6 +144,8 @@ export function useGamePage(app: App) {
   const oneClick = planned?.plan.oneClick ?? false;
 
   const [optionsOpen, setOptionsOpen] = useState(false);
+  /** The user chose something in the open sheet, even the row it opened on. */
+  const [picked, setPicked] = useState(false);
   const selection = useLaunchDraft(model, app, optionsOpen);
   const { commit } = selection;
 
@@ -151,7 +153,7 @@ export function useGamePage(app: App) {
   // unless this game's own settings hold it. Nothing else is ever committed. A pick
   // the user made in the open sheet is theirs: the commit (which the draft follows) waits.
   const committed = selection.committed;
-  const edited = optionsOpen && Boolean(selection.draft && committed && !sameDraft(selection.draft, committed));
+  const edited = optionsOpen && picked;
   useEffect(() => {
     if (model && !remembered && !edited && committed && !sameDraft(committed, model.seed)) commit(model.seed);
   }, [model, remembered, edited]); // not on `committed`: only a seed change moves it
@@ -311,6 +313,11 @@ export function useGamePage(app: App) {
     requestAnimationFrame(() => playRef.current?.focus());
   }, [locked, optionsOpen]);
 
+  const pick: typeof selection.edit = (patch, column) => {
+    setPicked(true);
+    selection.edit(patch, column);
+  };
+
   // ── Favourite (optimistic, as the home page does it) ────────────────────
   const toggleFavourite = useCallback(async () => {
     if (!token) return;
@@ -401,8 +408,10 @@ export function useGamePage(app: App) {
     checking: prefsBusy,
     openOptions: () => {
       setOptionsOpen(true);
+      setPicked(false);
       loadPrefs();
     },
+    pick,
     retryPrefs,
     closeOptions,
     changeRef,

@@ -459,6 +459,26 @@ describe("game page", () => {
     await waitFor(() => expect(checked(sheet, "Resolution")).toMatch(/720p/));
   });
 
+  it("a late re-read keeps a pick back to the row the sheet opened on", async () => {
+    mocked.getProfiles.mockResolvedValue(
+      response("p-1440", ...profiles.profiles, launchProfile("p-1080", [rung("1080-h264", "h264", 1080, 60, 10000)])) as never,
+    );
+    await ready();
+    const settle = deferPrefs();
+    const sheet = await openChange(true);
+    fireEvent.click(within(sheet).getByRole("radio", { name: /720p/ }));
+    await settle({ default_profile_id: "p-1080" });
+    const playNow = within(sheet).getByRole("button", { name: "Play now" });
+    await waitFor(() => expect(playNow).toBeEnabled());
+    expect(checked(sheet, "Resolution")).toMatch(/720p/);
+    fireEvent.click(within(sheet).getByRole("radio", { name: /1440p/ }));
+    await act(async () => {});
+    expect(checked(sheet, "Resolution")).toMatch(/1440p/);
+    fireEvent.click(playNow);
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent()).toEqual({ app_id: "a1", mic: true, profile_id: "p-1440" });
+  });
+
   it("a re-read that turns overrides off closes the sheet, puts focus on Play, and Play sends no profile", async () => {
     await ready();
     const settle = deferPrefs();

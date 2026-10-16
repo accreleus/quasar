@@ -146,9 +146,9 @@ export function OptionsSheet({ g }: { g: GamePage }) {
           waitingForSlot={g.waitingForSlot}
           waitingReason={g.waitingReason}
           closeRef={closeRef}
-          onSelectCodec={(codec) => selection.edit({ codec }, "codec")}
-          onSelectFps={(fps) => selection.edit({ fps }, "fps")}
-          onSelectHeight={(height) => selection.edit({ height }, "resolution")}
+          onSelectCodec={(codec) => g.pick({ codec }, "codec")}
+          onSelectFps={(fps) => g.pick({ fps }, "fps")}
+          onSelectHeight={(height) => g.pick({ height }, "resolution")}
           onCancel={g.closeOptions}
           onPlay={() => g.play(selection.draft)}
         />
