@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,6 +52,7 @@ func newBlobs(t *testing.T) *BlobStore {
 	if err != nil {
 		t.Fatalf("NewBlobStore: %v", err)
 	}
+	b.log = slog.New(slog.DiscardHandler)
 	return b
 }
 
@@ -68,8 +70,8 @@ func TestPutIsContentAddressed(t *testing.T) {
 	if want := sha(onePixelPNG) + ".png"; name != want {
 		t.Fatalf("name: want %q, got %q", want, name)
 	}
-	if !b.Has(name) {
-		t.Fatal("Has: blob should exist after Put")
+	if ok, err := b.Has(name); !ok || err != nil {
+		t.Fatalf("Has: blob should exist after Put (err %v)", err)
 	}
 	data, ct, err := b.Open(name)
 	if err != nil {
@@ -184,8 +186,8 @@ func TestOpenRejectsTraversalAndJunk(t *testing.T) {
 		if _, _, err := b.Open(name); !errors.Is(err, ErrBadAsset) {
 			t.Errorf("Open(%q): want ErrBadAsset, got %v", name, err)
 		}
-		if b.Has(name) {
-			t.Errorf("Has(%q): want false", name)
+		if ok, err := b.Has(name); ok || err != nil {
+			t.Errorf("Has(%q): want false, nil; got %v, %v", name, ok, err)
 		}
 	}
 }
@@ -197,6 +199,20 @@ func TestOpenMissingBlob(t *testing.T) {
 	_, _, err := b.Open(sha([]byte("nope")) + ".png")
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("want os.ErrNotExist, got %v", err)
+	}
+}
+
+// Only a not-exist stat error means missing. A shard path that is a file makes
+// stat fail with ENOTDIR (also as root, unlike a chmod), which must come back
+// as an error, not as "missing".
+func TestHasReturnsAStatErrorThatIsNotNotExist(t *testing.T) {
+	b := newBlobs(t)
+	name := sha([]byte("x")) + ".png"
+	if err := os.WriteFile(filepath.Join(b.Root(), name[:2]), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := b.Has(name); ok || err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Has = %v, %v; want false and a non-not-exist error", ok, err)
 	}
 }
 
@@ -225,10 +241,10 @@ func TestPruneOrphans(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("removed: want 1, got %d", n)
 	}
-	if !b.Has(keepName) {
+	if ok, _ := b.Has(keepName); !ok {
 		t.Error("referenced blob was deleted")
 	}
-	if b.Has(dropName) {
+	if ok, _ := b.Has(dropName); ok {
 		t.Error("orphan blob survived")
 	}
 	if _, err := os.Stat(foreign); err != nil {

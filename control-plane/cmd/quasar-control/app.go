@@ -710,6 +710,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 					"artwork_resolved": res.ArtworkResolved,
 					"no_match":         res.NoMatch,
 					"artwork_repaired": res.ArtworkRepaired,
+					"logo_icon_filled": res.LogoIconFilled,
 				}), nil
 			},
 		})

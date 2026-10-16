@@ -394,6 +394,8 @@ func TestReconcileBackfillNeverOverwritesANonEmptyDescription(t *testing.T) {
 	ctx := context.Background()
 
 	tileID := f.seedDiscoveredTile(t, "517710", "An operator wrote this.")
+	// Store details already written, so description is the only field in play.
+	must(t, execT(ctx, pool, `UPDATE apps SET store_details_at = now() WHERE id::text = $1`, tileID))
 
 	scan := f.claimedScan(t, f.user)
 	res, err := f.store.Reconcile(ctx, scan, f.host,

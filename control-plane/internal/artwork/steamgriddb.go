@@ -206,6 +206,46 @@ func (c *SteamGridDBClient) ArtByExternalRef(ctx context.Context, source, id str
 
 // steamAppIDPattern is the appid grammar shared with migration 0042's
 // apps_external_id_ck and crud's write gate: a bare positive integer.
+// LogoIcon fetches the best logo (`/logos/<sel>`) and icon (`/icons/<sel>`) for a
+// title, by the same selector Art or ArtByExternalRef would use.
+func (c *SteamGridDBClient) LogoIcon(ctx context.Context, source, ref string) (logo, icon string, err error) {
+	ref = strings.TrimSpace(ref)
+	var sel string
+	switch {
+	case source == ExternalSourceSteam && steamAppIDPattern.MatchString(ref):
+		sel = "steam/" + url.PathEscape(ref)
+	case source == ExternalSourceSteam:
+		return "", "", fmt.Errorf("artwork: %q is not a steam appid", ref)
+	case source != "":
+		return "", "", fmt.Errorf("%w: steamgriddb cannot resolve %q references", ErrUnsupportedExternalSource, source)
+	case ref == "":
+		return "", "", fmt.Errorf("artwork: empty provider ref")
+	default:
+		sel = "game/" + url.PathEscape(ref)
+	}
+	var logos, icons sgdbEnvelope[[]sgdbImage]
+	if err := c.do(ctx, "/logos/"+sel+"?"+sgdbLogoFilter, &logos); err != nil && !errors.Is(err, ErrArtNotFound) {
+		return "", "", err
+	}
+	if err := c.do(ctx, "/icons/"+sel+"?"+sgdbIconFilter, &icons); err != nil && !errors.Is(err, ErrArtNotFound) {
+		return "", "", err
+	}
+	if best, ok := pickBest(logos.Data, 0); ok {
+		logo = best.URL
+	}
+	if best, ok := pickBest(icons.Data, 1); ok {
+		icon = best.URL
+	}
+	return logo, icon, nil
+}
+
+// Static PNG/WebP only: the blob store keeps only what sniffs as JPEG/PNG/WebP, so an
+// .ico icon or an animated logo would fail the fetch every sweep.
+const (
+	sgdbLogoFilter = "types=static&mimes=image/png,image/webp&nsfw=false&humor=false"
+	sgdbIconFilter = "types=static&mimes=image/png&nsfw=false&humor=false"
+)
+
 var steamAppIDPattern = regexp.MustCompile(`^[1-9][0-9]{0,9}$`)
 
 // sgdbGridFilter is the portrait-grid query shared by crops() and

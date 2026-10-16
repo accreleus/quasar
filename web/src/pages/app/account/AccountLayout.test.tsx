@@ -13,6 +13,7 @@ vi.mock("../../../api/me", () => ({
 vi.mock("../libraryCatalog", () => ({
   LibraryCatalogProvider: ({ children }: { children: React.ReactNode }) => children,
   useLibraryCatalog: () => ({ apps: [] }),
+  useOptionalLibraryCatalog: () => null,
 }));
 vi.mock("./onepage/OneSettingsPage", () => ({ OneSettingsPage: () => <p>one page</p> }));
 
