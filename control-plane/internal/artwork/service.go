@@ -226,7 +226,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 	// in scheduling, admission, placement or discovery may branch on kind
 	// (spec §4.5.3).
 	if artworklessKinds[app.Kind] {
-		return s.store.Save(ctx, Record{
+		return s.save(ctx, Record{
 			AppID:       app.ID,
 			Source:      SourceNone,
 			MatchedName: "",
@@ -243,7 +243,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 		return fmt.Errorf("artwork: search %q: %w", app.Name, err)
 	}
 	if len(candidates) == 0 {
-		return s.store.Save(ctx, Record{AppID: app.ID, Source: SourceNone})
+		return s.save(ctx, Record{AppID: app.ID, Source: SourceNone})
 	}
 
 	// Only an exact normalised title match is accepted (spec §12.1): no
@@ -255,7 +255,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 		// No ProviderRef and no MatchedName — nothing was matched, and a
 		// stored MatchedName would read in the admin UI as "we matched this
 		// title", the false claim §12.1 exists to stop.
-		return s.store.Save(ctx, Record{AppID: app.ID, Source: SourceNone})
+		return s.save(ctx, Record{AppID: app.ID, Source: SourceNone})
 	}
 	art, err := provider.Art(ctx, best.Ref)
 	if err != nil {
@@ -264,7 +264,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 	if art.TileURL == "" && art.HeroURL == "" {
 		// A matched title with no usable asset is still a decision: nothing to
 		// fetch now, and asking again next sweep would not change that.
-		return s.store.Save(ctx, Record{
+		return s.save(ctx, Record{
 			AppID:       app.ID,
 			Source:      SourceNone,
 			Provider:    provider.Name(),
@@ -278,7 +278,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 		return err
 	}
 	logo, icon, checked := s.fetchLogoIcon(ctx, provider, "", best.Ref)
-	return s.store.Save(ctx, Record{
+	return s.save(ctx, Record{
 		AppID:           app.ID,
 		Source:          SourceProvider,
 		Provider:        provider.Name(),
@@ -313,7 +313,7 @@ func (s *Service) resolveByExternalRef(ctx context.Context, app appRef) error {
 	// actually resolved the art. matched_name is whatever the provider
 	// volunteered; "" is honest, nothing was matched by title.
 	if err != nil || (art.TileURL == "" && art.HeroURL == "") {
-		return s.store.Save(ctx, Record{
+		return s.save(ctx, Record{
 			AppID:       app.ID,
 			Source:      SourceNone,
 			Provider:    provider.Name(),
@@ -327,7 +327,7 @@ func (s *Service) resolveByExternalRef(ctx context.Context, app appRef) error {
 		return err
 	}
 	logo, icon, checked := s.fetchLogoIcon(ctx, provider, app.ExternalSource, app.ExternalID)
-	return s.store.Save(ctx, Record{
+	return s.save(ctx, Record{
 		AppID:           app.ID,
 		Source:          SourceProvider,
 		Provider:        provider.Name(),
@@ -529,7 +529,7 @@ func (s *Service) ApplyCandidate(ctx context.Context, appID, ref string) (Record
 		IconAsset:       icon,
 		LogoIconChecked: checked,
 	}
-	if err := s.store.Save(ctx, rec); err != nil {
+	if err := s.save(ctx, rec); err != nil {
 		return Record{}, err
 	}
 	return s.reload(ctx, appID)
@@ -566,7 +566,7 @@ func (s *Service) ApplyURLs(ctx context.Context, appID, tileURL, heroURL string)
 		IconAsset:       prev.IconAsset,
 		LogoIconChecked: prev.LogoIconChecked,
 	}
-	if err := s.store.Save(ctx, rec); err != nil {
+	if err := s.save(ctx, rec); err != nil {
 		return Record{}, err
 	}
 	return s.reload(ctx, appID)
@@ -610,7 +610,7 @@ func (s *Service) Upload(ctx context.Context, appID, crop, declaredType string, 
 	} else {
 		rec.HeroAsset = name
 	}
-	if err := s.store.Save(ctx, rec); err != nil {
+	if err := s.save(ctx, rec); err != nil {
 		return Record{}, err
 	}
 	return s.reload(ctx, appID)
@@ -789,18 +789,18 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 			continue
 		}
 		if logoMissing || iconMissing {
-			// Never serve a URL to a missing file, whatever the lock; only the lost crop goes.
-			if err := s.store.DropLogoIcon(ctx, rec.AppID, logoMissing, iconMissing); err != nil {
+			// Never serve a URL to a missing file, whatever the lock, and only the lost
+			// crop. An unlocked provider record is re-queued for the backfill; a locked
+			// one keeps the name, so this check finds it again until a repair succeeds.
+			unname := rec.Source == SourceProvider && !rec.Locked
+			if err := s.store.DropLogoIcon(ctx, rec.AppID, nameIf(logoMissing, rec.LogoAsset), nameIf(iconMissing, rec.IconAsset), unname); err != nil {
 				s.log.Warn("artwork: could not clear a missing logo or icon", "app_id", rec.AppID, "err", err)
 				continue
 			}
-			if logoMissing {
-				rec.LogoAsset = ""
+			if unname {
+				rec.LogoAsset, rec.IconAsset = nameIf(!logoMissing, rec.LogoAsset), nameIf(!iconMissing, rec.IconAsset)
+				rec.LogoIconChecked = false
 			}
-			if iconMissing {
-				rec.IconAsset = ""
-			}
-			rec.LogoIconChecked = false
 		}
 		if !tileMissing && !heroMissing && !logoMissing && !iconMissing {
 			continue
@@ -821,18 +821,21 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 		}
 		attempts++
 		repaired := false
-		if logoMissing || iconMissing {
-			// On failure an unlocked provider record is still on backfillLogoIcon's queue.
-			if err := s.repairLogoIcon(ctx, provider, &rec, logoMissing, iconMissing); err != nil {
-				s.log.Info("artwork: could not fetch a missing logo or icon again", "app_id", rec.AppID, "err", err)
-			} else {
-				repaired = true
-			}
-		}
+		// Tile and hero first: repairOne saves the whole record, which must not
+		// overwrite a logo or icon repaired just before it.
 		if tileMissing || heroMissing {
 			if err := s.repairOne(ctx, provider, rec, tileMissing, heroMissing); err != nil {
 				s.log.Info("artwork: could not fetch a missing cached image again; the next sweep retries",
 					"app_id", rec.AppID, "err", err)
+			} else {
+				repaired = true
+			}
+		}
+		if logoMissing || iconMissing {
+			// A crop not fetched stays pending: unlocked on backfillLogoIcon's queue,
+			// locked by its kept name.
+			if err := s.repairLogoIcon(ctx, provider, rec, logoMissing, iconMissing); err != nil {
+				s.log.Info("artwork: could not fetch a missing logo or icon again", "app_id", rec.AppID, "err", err)
 			} else {
 				repaired = true
 			}
@@ -844,9 +847,9 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 }
 
 // repairLogoIcon fetches a record's lost logo or icon again from its own
-// reference, locked or not, as repairOne does for the tile and hero. The crop
-// still on disk is kept.
-func (s *Service) repairLogoIcon(ctx context.Context, provider Provider, rec *Record, logoMissing, iconMissing bool) error {
+// reference, locked or not, as repairOne does for the tile and hero. Each crop
+// fetched is written on its own; the crop still on disk is untouched.
+func (s *Service) repairLogoIcon(ctx context.Context, provider Provider, rec Record, logoMissing, iconMissing bool) error {
 	app, err := s.store.App(ctx, rec.AppID)
 	if err != nil {
 		return err
@@ -855,23 +858,37 @@ func (s *Service) repairLogoIcon(ctx context.Context, provider Provider, rec *Re
 	if err != nil {
 		return err
 	}
-	next := *rec
-	if logoMissing {
-		if next.LogoAsset, err = s.cacheOne(ctx, logoURL); err != nil {
-			return fmt.Errorf("logo: %w", err)
+	type fetched struct{ crop, stale, fresh string }
+	var done []fetched
+	var errs []error
+	for _, c := range []struct {
+		crop, stale, url string
+		lost             bool
+	}{{"logo", rec.LogoAsset, logoURL, logoMissing}, {"icon", rec.IconAsset, iconURL, iconMissing}} {
+		if !c.lost {
+			continue
+		}
+		fresh, err := s.cacheOne(ctx, c.url)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", c.crop, err))
+			continue
+		}
+		done = append(done, fetched{c.crop, c.stale, fresh})
+	}
+	for _, f := range done {
+		if err := s.store.RepairCrop(ctx, rec.AppID, rec.ProviderRef, f.crop, f.stale, f.fresh, len(errs) == 0); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	if iconMissing {
-		if next.IconAsset, err = s.cacheOne(ctx, iconURL); err != nil {
-			return fmt.Errorf("icon: %w", err)
-		}
+	return errors.Join(errs...)
+}
+
+// nameIf is name when cond holds, else "".
+func nameIf(cond bool, name string) string {
+	if cond {
+		return name
 	}
-	next.LogoIconChecked = true
-	if err := s.store.RepairLogoIcon(ctx, next); err != nil {
-		return err
-	}
-	*rec = next
-	return nil
+	return ""
 }
 
 // refSource is the external source to resolve ref by: the app's own when ref is
@@ -881,6 +898,15 @@ func refSource(app appRef, ref string) string {
 		return app.ExternalSource
 	}
 	return ""
+}
+
+// save is Store.Save with LogoLost/IconLost set from the cache, so a record re-saved
+// with a kept name whose file is gone (a locked record awaiting repair) never
+// serves it again.
+func (s *Service) save(ctx context.Context, rec Record) error {
+	rec.LogoLost, _ = s.missing(rec.LogoAsset)
+	rec.IconLost, _ = s.missing(rec.IconAsset)
+	return s.store.Save(ctx, rec)
 }
 
 // missing reports whether a recorded asset's file is gone; "" was never stored.
@@ -923,7 +949,7 @@ func (s *Service) repairOne(ctx context.Context, provider Provider, rec Record, 
 	}
 	rec.TileAsset = firstNonEmpty(tile, rec.TileAsset)
 	rec.HeroAsset = firstNonEmpty(hero, rec.HeroAsset)
-	if err := s.store.Save(ctx, rec); err != nil {
+	if err := s.save(ctx, rec); err != nil {
 		return err
 	}
 	s.unrepairable.Delete(rec.AppID)

@@ -32,6 +32,10 @@ type Record struct {
 	LogoAsset       string `json:"-"`
 	IconAsset       string `json:"-"`
 	LogoIconChecked bool   `json:"-"`
+	// LogoLost/IconLost are not stored: the named file is gone, so Save does not
+	// serve it. A locked record keeps the name until a repair fetches it again.
+	LogoLost bool `json:"-"`
+	IconLost bool `json:"-"`
 }
 
 // recordCols is the column list every Record read scans, in recordDests order.
@@ -146,7 +150,7 @@ func (s *Store) Save(ctx context.Context, r Record) error {
 		UPDATE apps SET cover_url = $2, hero_url = $3, logo_url = $4, icon_url = $5, updated_at = now()
 		WHERE id::text = $1
 	`, r.AppID, assetURLOrNil(r.TileAsset), assetURLOrNil(r.HeroAsset),
-		assetURLOrNil(r.LogoAsset), assetURLOrNil(r.IconAsset)); err != nil {
+		servedURL(r.LogoAsset, r.LogoLost), servedURL(r.IconAsset, r.IconLost)); err != nil {
 		return fmt.Errorf("artwork: update app urls: %w", err)
 	}
 	return tx.Commit(ctx)
@@ -271,16 +275,6 @@ func (s *Store) records(ctx context.Context, query string, args ...any) ([]Recor
 // URLs, only while the row is still the unlocked provider match that was read: an
 // admin override that landed meanwhile wins. It always bumps updated_at.
 func (s *Store) SaveLogoIcon(ctx context.Context, rec Record) error {
-	return s.setLogoIcon(ctx, rec, ` AND source = '`+SourceProvider+`' AND NOT locked`)
-}
-
-// RepairLogoIcon writes a lost logo or icon fetched again, locked record or not,
-// while the row still names the provider reference it was fetched by.
-func (s *Store) RepairLogoIcon(ctx context.Context, rec Record) error {
-	return s.setLogoIcon(ctx, rec, "")
-}
-
-func (s *Store) setLogoIcon(ctx context.Context, rec Record, guard string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("artwork: begin: %w", err)
@@ -289,7 +283,7 @@ func (s *Store) setLogoIcon(ctx context.Context, rec Record, guard string) error
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE app_artwork SET logo_asset = $3, icon_asset = $4, logo_icon_checked = $5, updated_at = now()
-		WHERE app_id::text = $1 AND provider_ref = $2`+guard,
+		WHERE app_id::text = $1 AND provider_ref = $2 AND source = '`+SourceProvider+`' AND NOT locked`,
 		rec.AppID, rec.ProviderRef, rec.LogoAsset, rec.IconAsset, rec.LogoIconChecked)
 	if err != nil {
 		return fmt.Errorf("artwork: save logo and icon: %w", err)
@@ -304,26 +298,70 @@ func (s *Store) setLogoIcon(ctx context.Context, rec Record, guard string) error
 	return tx.Commit(ctx)
 }
 
-// DropLogoIcon un-names a logo or icon whose file is gone, on any record, so no
-// URL points at a missing file. updated_at is left alone: an unlocked provider
-// record re-queued here keeps its place in LogoIconPending's oldest-first order.
-func (s *Store) DropLogoIcon(ctx context.Context, appID string, logo, icon bool) error {
+// DropLogoIcon stops serving lostLogo / lostIcon ("" = that crop is fine), the
+// names of files that are gone, and with unname also clears the names and
+// re-queues the record for the backfill. A locked record keeps the names, so
+// every sweep's repair retries them (#441). Each crop is touched only while the
+// row still names that file, so an admin re-pick in between is never wiped.
+// updated_at is left alone: a re-queued record keeps its place in
+// LogoIconPending's oldest-first order.
+func (s *Store) DropLogoIcon(ctx context.Context, appID, lostLogo, lostIcon string, unname bool) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("artwork: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `
-		UPDATE app_artwork SET logo_asset = CASE WHEN $2 THEN '' ELSE logo_asset END,
-		       icon_asset = CASE WHEN $3 THEN '' ELSE icon_asset END, logo_icon_checked = false
-		WHERE app_id::text = $1`, appID, logo, icon); err != nil {
-		return fmt.Errorf("artwork: drop logo or icon: %w", err)
+	if unname {
+		if _, err := tx.Exec(ctx, `
+			UPDATE app_artwork SET
+			       logo_asset = CASE WHEN $2 <> '' AND logo_asset = $2 THEN '' ELSE logo_asset END,
+			       icon_asset = CASE WHEN $3 <> '' AND icon_asset = $3 THEN '' ELSE icon_asset END,
+			       logo_icon_checked = CASE WHEN ($2 <> '' AND logo_asset = $2) OR ($3 <> '' AND icon_asset = $3)
+			                                THEN false ELSE logo_icon_checked END
+			WHERE app_id::text = $1`, appID, lostLogo, lostIcon); err != nil {
+			return fmt.Errorf("artwork: drop logo or icon: %w", err)
+		}
 	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE apps SET logo_url = CASE WHEN $2 THEN NULL ELSE logo_url END,
-		       icon_url = CASE WHEN $3 THEN NULL ELSE icon_url END
-		WHERE id::text = $1`, appID, logo, icon); err != nil {
-		return fmt.Errorf("artwork: drop logo or icon url: %w", err)
+		UPDATE apps SET logo_url = CASE WHEN $2 <> '' AND logo_url = $4 THEN NULL ELSE logo_url END,
+		       icon_url = CASE WHEN $3 <> '' AND icon_url = $5 THEN NULL ELSE icon_url END
+		WHERE id::text = $1`, appID, lostLogo, lostIcon, AssetURL(lostLogo), AssetURL(lostIcon)); err != nil {
+		return fmt.Errorf("artwork: stop serving logo or icon: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// Crop columns RepairCrop may write; a fixed set, never caller text.
+var logoIconCols = map[string][2]string{
+	"logo": {"logo_asset", "logo_url"},
+	"icon": {"icon_asset", "icon_url"},
+}
+
+// RepairCrop names a re-fetched logo or icon ("" = the provider has none now) and
+// serves it, locked record or not, only while the row still names stale ("" for a
+// dropped crop) under ref: an admin change in between wins. checked also marks the
+// record's logo and icon answered.
+func (s *Store) RepairCrop(ctx context.Context, appID, ref, crop, stale, fresh string, checked bool) error {
+	cols, ok := logoIconCols[crop]
+	if !ok {
+		return fmt.Errorf("artwork: no crop %q", crop)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("artwork: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `
+		UPDATE app_artwork SET `+cols[0]+` = $4, logo_icon_checked = logo_icon_checked OR $5, updated_at = now()
+		WHERE app_id::text = $1 AND provider_ref = $2 AND `+cols[0]+` = $3`, appID, ref, stale, fresh, checked)
+	if err != nil {
+		return fmt.Errorf("artwork: repair %s: %w", crop, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE apps SET `+cols[1]+` = $2 WHERE id::text = $1`, appID, assetURLOrNil(fresh)); err != nil {
+		return fmt.Errorf("artwork: serve repaired %s: %w", crop, err)
 	}
 	return tx.Commit(ctx)
 }
@@ -353,6 +391,14 @@ func (s *Store) ReferencedAssets(ctx context.Context) (map[string]struct{}, erro
 		out[name] = struct{}{}
 	}
 	return out, rows.Err()
+}
+
+// servedURL is assetURLOrNil, except NULL for a name whose file is gone.
+func servedURL(asset string, lost bool) any {
+	if lost {
+		return nil
+	}
+	return assetURLOrNil(asset)
 }
 
 // assetURLOrNil maps a blob name to the served URL, or NULL for "no crop".
