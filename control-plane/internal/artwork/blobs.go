@@ -206,13 +206,18 @@ func (b *BlobStore) Open(name string) (data []byte, contentType string, err erro
 	return nil, "", ErrBadAsset
 }
 
-// Has reports whether a blob exists (and has a valid name).
-func (b *BlobStore) Has(name string) bool {
+// Has reports whether a blob exists (and has a valid name). Only a not-exist
+// stat error means it does not; any other is returned, and must never make a
+// caller delete or fetch again.
+func (b *BlobStore) Has(name string) (bool, error) {
 	if !assetName.MatchString(name) {
-		return false
+		return false, nil
 	}
 	_, err := os.Stat(b.pathFor(name))
-	return err == nil
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // PruneOrphans deletes every cached blob that `referenced` does not name.

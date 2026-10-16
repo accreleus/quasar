@@ -209,7 +209,9 @@ func (b *BlobStore) resize(ctx context.Context, name, width string, scale float6
 	}
 	// A prune that removed the source meanwhile has walked past this file. A
 	// prune racing this check can still leave it, until the next prune.
-	if !b.Has(name) {
+	if ok, err := b.Has(name); err != nil {
+		b.log.Warn("artwork: could not check the source of a sized copy", "asset", name, "err", err)
+	} else if !ok {
 		_ = os.Remove(path)
 		return variant{}, os.ErrNotExist
 	}

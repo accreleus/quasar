@@ -708,8 +708,12 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 		if ctx.Err() != nil || attempts >= s.sweepBatch {
 			return
 		}
-		tileMissing := rec.TileAsset != "" && !s.blobs.Has(rec.TileAsset)
-		heroMissing := rec.HeroAsset != "" && !s.blobs.Has(rec.HeroAsset)
+		tileMissing, tileErr := s.missing(rec.TileAsset)
+		heroMissing, heroErr := s.missing(rec.HeroAsset)
+		if err := errors.Join(tileErr, heroErr); err != nil {
+			s.log.Warn("artwork: could not check a cached image; it is not fetched again", "app_id", rec.AppID, "err", err)
+			continue
+		}
 		if !tileMissing && !heroMissing {
 			continue
 		}
@@ -728,6 +732,15 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 		}
 		res.ArtworkRepaired++
 	}
+}
+
+// missing reports whether a recorded asset's file is gone; "" was never stored.
+func (s *Service) missing(asset string) (bool, error) {
+	if asset == "" {
+		return false, nil
+	}
+	ok, err := s.blobs.Has(asset)
+	return !ok && err == nil, err
 }
 
 func (s *Service) repairOne(ctx context.Context, provider Provider, rec Record, tileMissing, heroMissing bool) error {
