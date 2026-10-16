@@ -8,18 +8,25 @@
 //! means "skip this pass".
 //!
 //! Three sources, in precedence order:
-//! - the `reaper SteamLaunch AppId=<id> -- …` process tree under a `/proc`
-//!   root (Steam's per-game lifecycle root, also through Proton and launcher
-//!   shims) — the primary game signal;
-//! - `console_log.txt` in Steam's log directory, read incrementally — the
-//!   second source, which may move the state earlier than the tree and may
-//!   end it when the tree is unreadable;
+//! - a `reaper SteamLaunch AppId=<id> -- …` process under a `/proc` root —
+//!   the primary game signal. The reaper's own existence is the rule: it is a
+//!   subreaper that outlives everything Steam launched through it (also
+//!   through Proton and launcher shims), so no ancestry walk is needed;
+//! - `console_log.txt` in Steam's log directory, read incrementally from the
+//!   end of whatever a previous session left behind — the second source,
+//!   which may move the state earlier than the reaper and may end it when
+//!   the reaper scan is unreadable;
 //! - a caller-supplied window list, classified here; the core makes no X11
 //!   call. `registry.vdf` `RunningAppID` is never read (it stays 0 on Linux).
 
-use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+
+// Bounds on input the game (same user, same container) controls.
+const MAX_CMDLINE_BYTES: u64 = 4 * 1024;
+const MAX_LOG_BYTES_PER_PASS: u64 = 1024 * 1024;
+const MAX_LOG_LINE_BYTES: usize = 64 * 1024;
 
 /// Mirrors agent-api `session_metrics.app_launch_state`; serialises to the same strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -74,9 +81,17 @@ pub fn appid_from_flags(flags: &str) -> Option<u32> {
     let mut tokens = flags.split_whitespace();
     while let Some(token) = tokens.next() {
         if token == "-applaunch" {
-            // A trailing `-applaunch` with nothing after it, or a non-integer
-            // next token, is not a launch: refuse rather than guess.
-            return tokens.next().and_then(|next| next.parse::<u32>().ok());
+            // A trailing `-applaunch` with nothing after it, or a next token
+            // that is not a plain non-zero integer, is not a launch: refuse
+            // rather than guess. Digits only, because `u32::from_str` would
+            // otherwise accept a leading `+`.
+            return tokens.next().and_then(|next| {
+                if !next.is_empty() && next.bytes().all(|b| b.is_ascii_digit()) {
+                    next.parse::<u32>().ok().filter(|id| *id != 0)
+                } else {
+                    None
+                }
+            });
         }
     }
     None
@@ -89,9 +104,10 @@ pub struct Watcher {
     state: LaunchState,
     log_offset: u64,
     log_file_id: Option<u64>,
+    log_seen: bool,
     log_pending: Vec<u8>,
     log_game: Option<bool>,
-    log_cloud_hold: bool,
+    log_waiting_needs: Option<NeedsUser>,
     running_via_reaper: bool,
     last_game_window: bool,
     active_needs: Option<NeedsUser>,
@@ -106,9 +122,10 @@ impl Watcher {
             state: LaunchState::Starting,
             log_offset: 0,
             log_file_id: None,
+            log_seen: false,
             log_pending: Vec::new(),
             log_game: None,
-            log_cloud_hold: false,
+            log_waiting_needs: None,
             running_via_reaper: false,
             last_game_window: false,
             active_needs: None,
@@ -145,29 +162,20 @@ impl Watcher {
                     self.last_game_window = on_screen;
                     reports.push(Report::GameWindow { on_screen });
                 }
-                let desired =
-                    classify_windows(&windows, self.cfg.appid).or_else(|| self.log_cloud_needs());
+                let desired = classify_windows(&windows, self.cfg.appid).or(self.log_waiting_needs);
                 self.update_needs(desired, &mut reports);
             }
             Err(_) => {
                 // The window source is skipped for this pass: neither the
                 // on-screen flag nor a window-derived reason changes, but a
-                // log-derived cloud conflict can still be reported.
-                if self.log_cloud_hold {
-                    self.update_needs(Some(NeedsUser::CloudConflict), &mut reports);
+                // log-derived wait-for-user can still be reported.
+                if let Some(reason) = self.log_waiting_needs {
+                    self.update_needs(Some(reason), &mut reports);
                 }
             }
         }
 
         reports
-    }
-
-    fn log_cloud_needs(&self) -> Option<NeedsUser> {
-        if self.log_cloud_hold {
-            Some(NeedsUser::CloudConflict)
-        } else {
-            None
-        }
     }
 
     fn update_needs(&mut self, desired: Option<NeedsUser>, reports: &mut Vec<Report>) {
@@ -222,20 +230,22 @@ impl Watcher {
         let Ok(metadata) = std::fs::metadata(&path) else {
             return;
         };
+        let file_id = metadata.ino();
 
-        // A replaced file (rotation) restarts at 0, as does a truncated one;
-        // lines replayed from the start rebuild the log-derived state.
-        #[cfg(unix)]
-        let file_id = {
-            use std::os::unix::fs::MetadataExt;
-            Some(metadata.ino())
-        };
-        #[cfg(not(unix))]
-        let file_id = None;
-        if self.log_file_id.is_some() && self.log_file_id != file_id {
-            self.reset_log();
+        // The home persists between sessions and the helper starts before
+        // Steam, so whatever the file already holds on first sight predates
+        // this session: start at its current end. Only a new file (rotation,
+        // a different inode) or a shorter one (truncation) restarts at 0.
+        if !self.log_seen {
+            self.log_seen = true;
+            self.log_file_id = Some(file_id);
+            self.log_offset = metadata.len();
+            return;
         }
-        self.log_file_id = file_id;
+        if self.log_file_id != Some(file_id) {
+            self.reset_log();
+            self.log_file_id = Some(file_id);
+        }
         if metadata.len() < self.log_offset {
             self.reset_log();
         }
@@ -249,8 +259,13 @@ impl Watcher {
         if file.seek(SeekFrom::Start(self.log_offset)).is_err() {
             return;
         }
+        // A bounded slice per pass; the rest is read on the next pass.
         let mut bytes = Vec::new();
-        if file.read_to_end(&mut bytes).is_err() {
+        if file
+            .take(MAX_LOG_BYTES_PER_PASS)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
             return;
         }
         self.log_offset += bytes.len() as u64;
@@ -258,8 +273,15 @@ impl Watcher {
 
         while let Some(newline) = self.log_pending.iter().position(|b| *b == b'\n') {
             let raw: Vec<u8> = self.log_pending.drain(..=newline).collect();
-            let line = String::from_utf8_lossy(&raw);
-            self.parse_log_line(line.trim_end());
+            if raw.len() <= MAX_LOG_LINE_BYTES {
+                let line = String::from_utf8_lossy(&raw);
+                self.parse_log_line(line.trim_end());
+            }
+        }
+        // A partial line that grows past the cap is dropped, not buffered
+        // forever on input the game controls.
+        if self.log_pending.len() > MAX_LOG_LINE_BYTES {
+            self.log_pending.clear();
         }
     }
 
@@ -267,7 +289,7 @@ impl Watcher {
         self.log_offset = 0;
         self.log_pending.clear();
         self.log_game = None;
-        self.log_cloud_hold = false;
+        self.log_waiting_needs = None;
     }
 
     fn parse_log_line(&mut self, line: &str) {
@@ -284,27 +306,29 @@ impl Watcher {
                 self.log_game = Some(false);
             }
         } else if line.contains("GameAction") {
-            let Some(task_at) = line.find("LaunchApp changed task to") else {
-                return;
-            };
             if extract_appid(line) != Some(self.cfg.appid) {
                 return;
             }
-            let task = line[task_at + "LaunchApp changed task to".len()..]
-                .split_whitespace()
-                .next()
-                .unwrap_or("");
-            // SynchronizingCloud held at LaunchApp, and any CloudConflict-like
-            // task, are the cheap cloud-conflict signal; any later task for
-            // this app clears the hold.
-            self.log_cloud_hold = task == "SynchronizingCloud" || is_cloud_conflict_task(task);
+            if let Some(task_at) = line.find("LaunchApp waiting for user response to") {
+                // The one log line that means Steam is actually stopped for
+                // the user. A bare `changed task to SynchronizingCloud` is a
+                // routine step of every cloud-save launch and means nothing.
+                let task = line[task_at + "LaunchApp waiting for user response to".len()..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                self.log_waiting_needs = Some(if task == "SynchronizingCloud" {
+                    NeedsUser::CloudConflict
+                } else {
+                    NeedsUser::Other
+                });
+            } else if line.contains("LaunchApp continues with user response")
+                || line.contains("LaunchApp changed task to")
+            {
+                self.log_waiting_needs = None;
+            }
         }
     }
-}
-
-fn is_cloud_conflict_task(task: &str) -> bool {
-    let lower = task.to_lowercase();
-    lower.contains("cloudconflict") || (lower.contains("cloud") && lower.contains("conflict"))
 }
 
 fn extract_appid(line: &str) -> Option<u32> {
@@ -326,11 +350,6 @@ struct ProcScan {
     steam_client: bool,
 }
 
-struct ProcInfo {
-    ppid: u32,
-    args: Vec<String>,
-}
-
 fn scan_proc(proc_root: &std::path::Path, appid: u32) -> ProcScan {
     let unreadable = ProcScan {
         readable: false,
@@ -341,64 +360,61 @@ fn scan_proc(proc_root: &std::path::Path, appid: u32) -> ProcScan {
         return unreadable;
     };
 
-    let mut procs: HashMap<u32, ProcInfo> = HashMap::new();
+    // Each cmdline is checked as it is read and nothing is kept: an argv can
+    // be several MB, and the reaper's identity is in its first three args.
+    let mut scan = ProcScan {
+        readable: true,
+        reaper_alive: false,
+        steam_client: false,
+    };
     for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
+        let Ok(entry) = entry else {
+            return unreadable;
         };
-        // A pid that vanishes mid-read is skipped, never fatal to the pass.
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
             continue;
+        }
+        let cmdline = match read_cmdline(&entry.path().join("cmdline")) {
+            Ok(Some(cmdline)) => cmdline,
+            // NotFound/ESRCH: the pid vanished mid-read, skip it alone.
+            Ok(None) => continue,
+            // Anything else means this pass cannot be trusted to say the
+            // reaper is gone, so it must never produce GameExited.
+            Err(()) => return unreadable,
         };
         let args: Vec<String> = cmdline
             .split(|b| *b == 0)
             .map(|part| String::from_utf8_lossy(part).into_owned())
             .filter(|arg| !arg.is_empty())
             .collect();
-        let ppid = read_ppid(&entry.path()).unwrap_or(0);
-        procs.insert(pid, ProcInfo { ppid, args });
-    }
-
-    let reaper_pids: Vec<u32> = procs
-        .iter()
-        .filter(|(_, info)| is_reaper_for(&info.args, appid))
-        .map(|(pid, _)| *pid)
-        .collect();
-    let reaper_alive = reaper_pids.iter().any(|reaper| {
-        procs
-            .keys()
-            .any(|pid| ancestry_reaches(&procs, *pid, *reaper))
-    });
-    let steam_client = procs.values().any(|info| {
-        info.args
+        if is_reaper_for(&args, appid) {
+            scan.reaper_alive = true;
+        }
+        if args
             .first()
             .is_some_and(|first| basename(first).to_lowercase().starts_with("steam"))
-    });
-
-    ProcScan {
-        readable: true,
-        reaper_alive,
-        steam_client,
+        {
+            scan.steam_client = true;
+        }
     }
+    scan
 }
 
-fn ancestry_reaches(procs: &HashMap<u32, ProcInfo>, mut pid: u32, reaper: u32) -> bool {
-    let mut visited = HashSet::new();
-    loop {
-        if pid == reaper {
-            return true;
-        }
-        if !visited.insert(pid) {
-            return false;
-        }
-        let Some(info) = procs.get(&pid) else {
-            return false;
-        };
-        if info.ppid == 0 {
-            return false;
-        }
-        pid = info.ppid;
+/// Ok(Some(bytes)) read, Ok(None) the pid vanished, Err anything else.
+fn read_cmdline(path: &std::path::Path) -> Result<Option<Vec<u8>>, ()> {
+    let vanished = |e: &std::io::Error| {
+        e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3)
+    };
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if vanished(&e) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let mut bytes = Vec::new();
+    match file.take(MAX_CMDLINE_BYTES).read_to_end(&mut bytes) {
+        Ok(_) => Ok(Some(bytes)),
+        Err(e) if vanished(&e) => Ok(None),
+        Err(_) => Err(()),
     }
 }
 
@@ -411,25 +427,6 @@ fn is_reaper_for(args: &[String], appid: u32) -> bool {
 
 fn basename(arg: &str) -> &str {
     arg.rsplit(['/', '\\']).next().unwrap_or(arg)
-}
-
-fn read_ppid(pid_dir: &std::path::Path) -> Option<u32> {
-    if let Ok(status) = std::fs::read_to_string(pid_dir.join("status")) {
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("PPid:") {
-                if let Ok(ppid) = rest.trim().parse::<u32>() {
-                    return Some(ppid);
-                }
-            }
-        }
-    }
-    // stat's comm is parenthesised and may itself contain spaces or parens,
-    // so the fields are counted from the last ')'.
-    let stat = std::fs::read_to_string(pid_dir.join("stat")).ok()?;
-    let after_comm = stat.rsplit_once(')')?.1;
-    let mut fields = after_comm.split_whitespace();
-    let _state = fields.next()?;
-    fields.next()?.parse::<u32>().ok()
 }
 
 // --- window classification --------------------------------------------------
@@ -455,7 +452,7 @@ fn classify_windows(windows: &[WindowInfo], appid: u32) -> Option<NeedsUser> {
 /// The one place window strings are matched. Sources: the research notes for
 /// #645 (old VGUI titles such as "Steam Guard - Computer Authorization
 /// Required" and "Steam - Self Updater", carried in maintained window-manager
-/// lists) and the `GameAction … SynchronizingCloud` log line. The current CEF
+/// lists). The current CEF
 /// client's titles are not authoritatively documented anywhere, so this table
 /// is deliberately small and the lab spike (#723) will correct it.
 fn classify_window(window: &WindowInfo, appid: u32) -> Option<NeedsUser> {

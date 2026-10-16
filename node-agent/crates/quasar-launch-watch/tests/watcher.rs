@@ -57,6 +57,8 @@ impl Rig {
         let log_dir = temp.path().join("logs");
         std::fs::create_dir_all(&proc_root).unwrap();
         std::fs::create_dir_all(&log_dir).unwrap();
+        // Present from the start, as a persisted home's log would be (empty here).
+        std::fs::write(log_dir.join("console_log.txt"), "").unwrap();
         let windows = FakeWindows::default();
         let watcher = Watcher::new(
             WatchConfig {
@@ -89,7 +91,8 @@ impl Rig {
     }
 }
 
-fn write_proc(proc_root: &Path, pid: u32, name: &str, ppid: u32, args: &[&str]) {
+fn write_proc(proc_root: &Path, pid: u32, _name: &str, _ppid: u32, args: &[&str]) {
+    // Only cmdline: it is the one file the watcher reads per pid.
     let dir = proc_root.join(pid.to_string());
     std::fs::create_dir_all(&dir).unwrap();
     let mut cmdline = Vec::new();
@@ -98,18 +101,6 @@ fn write_proc(proc_root: &Path, pid: u32, name: &str, ppid: u32, args: &[&str]) 
         cmdline.push(0);
     }
     std::fs::write(dir.join("cmdline"), cmdline).unwrap();
-    std::fs::write(
-        dir.join("status"),
-        format!("Name:\t{name}\nPid:\t{pid}\nPPid:\t{ppid}\n"),
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("stat"),
-        format!(
-            "{pid} ({name}) S {ppid} {pid} {pid} 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 100\n"
-        ),
-    )
-    .unwrap();
 }
 
 fn remove_proc(proc_root: &Path, pid: u32) {
@@ -157,6 +148,8 @@ fn appid_from_flags_cases() {
     assert_eq!(appid_from_flags("-bigpicture"), None);
     assert_eq!(appid_from_flags("junk"), None);
     assert_eq!(appid_from_flags("-applaunch abc"), None);
+    assert_eq!(appid_from_flags("-applaunch +730"), None);
+    assert_eq!(appid_from_flags("-applaunch 0"), None);
     assert_eq!(appid_from_flags("-applaunch 73x"), None);
     assert_eq!(appid_from_flags("-bigpicture -applaunch"), None);
     assert_eq!(appid_from_flags("-applaunch 730"), Some(730));
@@ -227,7 +220,7 @@ fn fixture_trees_run_and_exit() {
 }
 
 #[test]
-fn launcher_shim_counts_as_running_while_anything_under_the_reaper_lives() {
+fn launcher_shim_reaper_alone_is_running_until_it_goes() {
     let mut rig = Rig::new();
     copy_dir(&fixture("launcher-shim").join("proc"), &rig.proc_root);
     assert_eq!(
@@ -238,11 +231,12 @@ fn launcher_shim_counts_as_running_while_anything_under_the_reaper_lives() {
         ]
     );
 
-    // The shim's child goes, the shim itself stays under the reaper: running.
+    // Every descendant goes; the reaper alone still counts (it is a
+    // subreaper that outlives them), so the shim title is still running.
     remove_proc(&rig.proc_root, 402);
+    remove_proc(&rig.proc_root, 401);
     assert_eq!(rig.watcher.poll(), vec![]);
 
-    remove_proc(&rig.proc_root, 401);
     remove_proc(&rig.proc_root, 400);
     assert_eq!(
         rig.watcher.poll(),
@@ -257,15 +251,17 @@ fn fixture_console_log_drives_transitions_line_by_line() {
     let log = std::fs::read_to_string(fixture("console_log.txt")).unwrap();
     let mut lines = log.lines();
 
-    rig.append_log(lines.next().unwrap());
     assert_eq!(
         rig.watcher.poll(),
         vec![
             Report::LaunchState(LaunchState::Starting),
             Report::LaunchState(LaunchState::ClientOnly),
-            Report::SteamNeedsUser(NeedsUser::CloudConflict),
         ]
     );
+
+    // A routine SynchronizingCloud step reports nothing.
+    rig.append_log(lines.next().unwrap());
+    assert_eq!(rig.watcher.poll(), vec![]);
 
     // The log alone moves ClientOnly to GameRunning, before any reaper.
     rig.append_log(lines.next().unwrap());
@@ -326,15 +322,19 @@ fn log_removal_ends_the_game_when_the_tree_is_unreadable() {
 fn truncated_log_restarts_at_zero() {
     let mut rig = Rig::new();
     write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
     rig.append_log(&format!(
         "Game process added : AppID {APPID} \"/a/rather/long/game/command/line --with-many-arguments\", ProcID 201, IP 0.0.0.0:0"
     ));
     assert_eq!(
         rig.watcher.poll(),
-        vec![
-            Report::LaunchState(LaunchState::Starting),
-            Report::LaunchState(LaunchState::GameRunning),
-        ]
+        vec![Report::LaunchState(LaunchState::GameRunning)]
     );
 
     // A truncate to empty restarts the offset without inventing an exit.
@@ -357,14 +357,11 @@ fn a_vanished_pid_mid_read_is_skipped() {
     let mut rig = Rig::new();
     copy_dir(&fixture("native").join("proc"), &rig.proc_root);
 
-    // A pid whose cmdline cannot be read (here: a directory in its place),
-    // and one with a cmdline but nothing readable for its parent.
-    std::fs::create_dir_all(rig.proc_root.join("999/cmdline")).unwrap();
-    let partial = rig.proc_root.join("998");
-    std::fs::create_dir_all(&partial).unwrap();
-    std::fs::write(partial.join("cmdline"), b"/mystery\0").unwrap();
-    std::fs::create_dir_all(partial.join("status")).unwrap();
-    std::fs::create_dir_all(partial.join("stat")).unwrap();
+    // A pid that vanished mid-read: its cmdline is a dangling symlink, so
+    // the open fails NotFound and only that pid is skipped.
+    let gone = rig.proc_root.join("999");
+    std::fs::create_dir_all(&gone).unwrap();
+    std::os::unix::fs::symlink("/nonexistent-vanished-pid", gone.join("cmdline")).unwrap();
 
     assert_eq!(
         rig.watcher.poll(),
@@ -461,5 +458,269 @@ fn steam_needs_user_is_once_per_reason_while_it_holds() {
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::GameWindow { on_screen: true }]
+    );
+}
+
+const REAPER: &[&str] = &[
+    "/home/gamer/.local/share/Steam/ubuntu12_32/reaper",
+    "SteamLaunch",
+    "AppId=730",
+    "--",
+    "/games/Game/Game.exe",
+];
+
+#[test]
+fn stale_log_from_the_previous_session_is_not_replayed() {
+    let mut rig = Rig::new();
+    // Left by the previous session, before this watcher ever polled.
+    std::fs::write(
+        rig.log_path(),
+        format!("Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0\n"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::Starting)]
+    );
+
+    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::ClientOnly)]
+    );
+}
+
+#[test]
+fn routine_cloud_sync_is_not_needs_user() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+
+    for task in ["SynchronizingCloud", "SynchronizingControllerConfig"] {
+        rig.append_log(&format!(
+            "GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to {task}"
+        ));
+        assert_eq!(rig.watcher.poll(), vec![], "{task}");
+    }
+}
+
+#[test]
+fn waiting_for_user_response_reports_once_and_clears() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
+    ));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::CloudConflict)]
+    );
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    // Cleared by the continues line; a later wait reports again.
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp continues with user response \"SynchronizingCloud\""
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to CreatingProcess \"\""
+    ));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::Other)]
+    );
+
+    // Cleared by the next changed-task line for the app.
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to WaitingGameWindow"
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to CreatingProcess \"\""
+    ));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::Other)]
+    );
+}
+
+#[test]
+fn reaper_seen_then_gone_on_a_readable_tree_exits_despite_a_stale_added_line() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 200, "reaper", 100, REAPER);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::GameRunning),
+        ]
+    );
+
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    remove_proc(&rig.proc_root, 200);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameExited)]
+    );
+}
+
+#[test]
+fn a_removed_log_line_while_the_reaper_lives_keeps_running() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 200, "reaper", 100, REAPER);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::GameRunning),
+        ]
+    );
+
+    rig.append_log(&format!(
+        "Game process removed: AppID {APPID} \"game\", ProcID 201"
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn an_appid_sharing_leading_digits_is_ignored() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(
+        &rig.proc_root,
+        200,
+        "reaper",
+        100,
+        &[
+            "/home/gamer/.local/share/Steam/ubuntu12_32/reaper",
+            "SteamLaunch",
+            "AppId=7300",
+            "--",
+            "/games/Other/Other.exe",
+        ],
+    );
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+
+    rig.append_log("Game process added : AppID 7300 \"other\", ProcID 201, IP 0.0.0.0:0");
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn rotation_is_read_from_zero() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+    rig.append_log("GameAction [AppID 730, ActionID 1] : LaunchApp changed task to Completed");
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    // Rename + a longer new file: read from 0, not from the old offset.
+    let rotated = rig.log_dir.join("console_log.old");
+    std::fs::rename(rig.log_path(), rotated).unwrap();
+    std::fs::write(
+        rig.log_path(),
+        format!(
+            "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0\n# a padding line that makes the new file longer than the old offset was -- plenty of bytes here\n"
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)]
+    );
+}
+
+#[test]
+fn a_partial_log_line_past_the_cap_is_dropped() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
+    ));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)]
+    );
+
+    // 70 KiB with no newline: dropped, and the next line still parses.
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(rig.log_path())
+            .unwrap();
+        file.write_all(&vec![b'x'; 70 * 1024]).unwrap();
+    }
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.append_log(&format!(
+        "\nGame process removed: AppID {APPID} \"game\", ProcID 201"
+    ));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameExited)]
+    );
+}
+
+#[test]
+fn a_non_notfound_cmdline_error_marks_the_pass_unreadable() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, "steam", 1, STEAM);
+    write_proc(&rig.proc_root, 200, "reaper", 100, REAPER);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::GameRunning),
+        ]
+    );
+
+    // A directory where cmdline should be: the read fails with EISDIR, not
+    // NotFound, so this pass cannot say the reaper is gone.
+    std::fs::create_dir_all(rig.proc_root.join("999/cmdline")).unwrap();
+    remove_proc(&rig.proc_root, 200);
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    std::fs::remove_dir_all(rig.proc_root.join("999")).unwrap();
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameExited)]
     );
 }
