@@ -33,7 +33,7 @@ mock back in.
 | 3 | Opens a game in an inline detail band under its tile | Operator-approved redesign from the UX lab (2026-10-16, #714): a game opens its own page, `/app/game/:id` (`web/src/pages/app/game/`), with Play, a stream line that says what Play asks for, and history below the fold. The band stays for Classic layout. | `useNewDesign()`; `GamePage.test.tsx` |
 | 4 | Has no shelves above the library grid | Operator-approved redesign from the UX lab (2026-10-16, #714): Home shows a Favourites shelf and a Jump back in shelf (`web/src/pages/app/home/Shelves.tsx`). | `useNewDesign()`; `AppHomeNext.newDesign.test.tsx` |
 | 5 | Shows favourite and Play only on hover, and no title under the art | Operator-approved redesign from the UX lab (2026-10-16, #714): every grid tile has a resting favourite heart and a one-line title strip; `F` on a focused grid tile toggles the favourite (`TileHeart.tsx`). | `useNewDesign()`; `LibraryTile.test.tsx` |
-| 6 | Has no route from search to a game | Operator-approved redesign from the UX lab (2026-10-16, #714): choosing a game in the top-bar search or the command palette opens its page, and the top-bar search stays on that page (`searchToPage.ts`). | `useNewDesign()`; `searchToPage.test.ts` |
+| 6 | Has no route from search to a game | Operator-approved redesign from the UX lab (2026-10-16, #714): choosing a game in the top-bar search or the command palette opens its page with focus on Play, and the top-bar search stays on that page (`searchToPage.ts`). | `useNewDesign()`; `AppLayout.test.tsx` |
 
 *Owner to add: the unpolished v3 elements already identified. Each needs the mock
 behaviour, the replacement rule, and whether a lint rule can enforce it.*

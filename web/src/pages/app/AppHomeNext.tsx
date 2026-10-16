@@ -364,7 +364,7 @@ export function AppHomeNext() {
   const wanted = wantedId ? appById.get(wantedId) : undefined;
   const { reveal } = detail;
   useEffect(() => {
-    if (wantedId && newDesign) navigate(`/app/game/${wantedId}`, { replace: true });
+    if (wantedId && newDesign) navigate(`/app/game/${wantedId}`, { replace: true, state: { from: "home" } });
     else if (wanted) {
       reveal(wanted, false);
       navigate("/app", { replace: true, state: null });

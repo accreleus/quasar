@@ -3,7 +3,7 @@
 // controls) so the page reads as the band grown to a page, not a new world.
 
 import { useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { ReactNode, RefObject } from "react";
 import { Link } from "react-router-dom";
 import type { App } from "../../../api/types";
 import { Chip } from "../../../components/Chip";
@@ -38,7 +38,15 @@ export function HeroArt({ app, hero, coverClass }: { app: App; hero: HeroArtStat
  * The game's name as its logo when the logo reads on the scrim, else as text.
  * Either way it is one h1 named after the game (the logo's alt is the name).
  */
-export function GameTitle({ name, logoUrl }: { name: string; logoUrl: string | null }) {
+export function GameTitle({
+  name,
+  logoUrl,
+  titleRef,
+}: {
+  name: string;
+  logoUrl: string | null;
+  titleRef?: RefObject<HTMLHeadingElement | null>;
+}) {
   const [state, setState] = useState<"checking" | "logo" | "text">(logoUrl ? "checking" : "text");
   const imgRef = useRef<HTMLImageElement>(null);
   useEffect(() => setState(logoUrl ? "checking" : "text"), [logoUrl]);
@@ -49,10 +57,12 @@ export function GameTitle({ name, logoUrl }: { name: string; logoUrl: string | n
   }, [state]);
   if (state === "text" || !logoUrl)
     return (
-      <h1 className="gp-title">{name}</h1>
+      <h1 ref={titleRef} tabIndex={-1} className="gp-title">
+        {name}
+      </h1>
     );
   return (
-    <h1 className="gp-title gp-title-logo" data-state={state}>
+    <h1 ref={titleRef} tabIndex={-1} className="gp-title gp-title-logo" data-state={state}>
       <img
         ref={imgRef}
         src={logoUrl}
@@ -81,6 +91,7 @@ export function LaunchBlock({ g }: { g: GamePage }) {
     <div className="gp-launch">
       <div className="d-actions gp-actions">
         <button
+          ref={g.playRef}
           type="button"
           className="btn btn-primary btn-lg gp-play"
           disabled={g.playDisabled}

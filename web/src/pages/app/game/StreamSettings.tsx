@@ -1,7 +1,6 @@
-// The stream line is labelled, names only what Play sends (a size or a codec the
-// server may not pick is never promised), and wraps only between groups; a
-// game's own settings get a "This game" marker and a one-press way back to the
-// device recommendation.
+// The stream line is labelled, names only what Play asks for (with no profile
+// sent it names nothing), and wraps only between groups; a game's own settings
+// get a "This game" marker and a one-press way back to the device recommendation.
 
 import { Fragment } from "react";
 import { Chip } from "../../../components/Chip";
@@ -41,7 +40,7 @@ export function StreamSettings({ g }: { g: GamePage }) {
                 )}
               </>
             ) : (
-              <span className="gp-skel">Checking this device…</span>
+              <span className="gp-skel">{g.profilesError ? "Not available" : "Checking this device…"}</span>
             )}
           </p>
         </div>
@@ -54,7 +53,7 @@ export function StreamSettings({ g }: { g: GamePage }) {
             type="button"
             ref={g.changeRef}
             className="btn btn-sm"
-            disabled={!g.model}
+            disabled={!g.model || g.locked}
             aria-haspopup="dialog"
             aria-expanded={g.optionsOpen}
             onClick={g.openOptions}

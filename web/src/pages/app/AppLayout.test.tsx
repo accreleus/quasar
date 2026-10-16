@@ -16,7 +16,7 @@
 //     which is now a real page in the account rail.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { App } from "../../App";
 import { buildUserNav, SEARCHABLE_ROUTES } from "./AppLayout";
@@ -102,6 +102,7 @@ beforeEach(() => {
   } as never);
   mockedLibrary.getMySessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mockedLibrary.getHighlights.mockResolvedValue({ items: [] } as never);
+  mockedLibrary.getProfilePreferences.mockResolvedValue({ user_overrides_allowed: true } as never);
   mockedStorage.getMyStorage.mockResolvedValue({ items: [] } as never);
 });
 
@@ -391,6 +392,49 @@ describe("new design (no Classic layout pin)", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Portal 2" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent("/app/library"));
+  });
+
+  describe("a pick hands focus to Play, so P launches rather than typing into the search", () => {
+    beforeEach(() => {
+      const rung = { id: "r", display_name: "r", codec: "h264", width: 1920, height: 1080, fps: 60, nominal_bitrate_kbps: 8000, position: 1, eligibility: "eligible", reasons: [] };
+      mockedLibrary.getProfiles.mockResolvedValue({
+        recommended_id: "p",
+        confidence: "high",
+        notes: [],
+        profiles: [{ id: "p", display_name: "p", description: "", nominal: { width: 1920, height: 1080, fps: 60, bitrate_kbps: 8000 }, eligibility: "eligible", reasons: [], rungs: [rung] }],
+      } as never);
+      mockedLibrary.launchSession.mockRejectedValue(new Error("not here"));
+    });
+    async function playHasFocusAndPLaunches() {
+      const play = await screen.findByRole("button", { name: "Play" });
+      await waitFor(() => expect(document.activeElement).toBe(play));
+      const input = await box();
+      expect(input).toHaveAttribute("aria-expanded", "false");
+      fireEvent.keyDown(play, { key: "p" });
+      await waitFor(() => expect(mockedLibrary.launchSession).toHaveBeenCalledTimes(1));
+      expect(mockedLibrary.launchSession.mock.calls[0][1]).toEqual({ app_id: "a1", mic: true });
+      expect(input).toHaveValue("Portal");
+    }
+
+    it("from the top-bar search", async () => {
+      renderApp("/app/library");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "Portal" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await playHasFocusAndPLaunches();
+    });
+
+    it("from the palette, which hands focus back to the search field it was opened from", async () => {
+      renderApp("/app/library?q=Portal");
+      const input = await box();
+      act(() => input.focus());
+      fireEvent.keyDown(input, { key: "k", ctrlKey: true });
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByRole("combobox"), { target: { value: "Portal" } });
+      fireEvent.click(await within(dialog).findByRole("option", { name: /Portal 2/ }));
+      await playHasFocusAndPLaunches();
+    });
   });
 
   describe("a pick always opens the chosen game's page", () => {

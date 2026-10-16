@@ -76,12 +76,14 @@ export function useHomeKeys({
         e.preventDefault();
         const app = apps.find((a) => a.id === activeEl.getAttribute("data-app-id"));
         if (!app) return;
-        // An unfavourite under the Favourites filter drops the tile; keep focus in its row.
+        // An unfavourite under the Favourites filter drops the tile; keep focus in its row,
+        // or, for the last one, on the first tile of the grid that replaces it.
         const row = [...(tile.parentElement?.querySelectorAll<HTMLElement>(".lib-tile-surface") ?? [])];
         const at = row.indexOf(activeEl);
         onFavourite(app);
         requestAnimationFrame(() => {
-          if (!activeEl.isConnected) (row[at + 1] ?? row[at - 1])?.focus();
+          if (activeEl.isConnected) return;
+          (row[at + 1] ?? row[at - 1] ?? gridsRef.current?.querySelector<HTMLElement>(".lib-tile-surface"))?.focus();
         });
         return;
       }

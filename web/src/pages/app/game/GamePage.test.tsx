@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { GamePageRoute } from "./GamePage";
+import { DetailBand } from "../home/DetailBand";
 import { AuthContext, type AuthContextValue } from "../../../auth/context";
 import { LibraryCatalogProvider } from "../libraryCatalog";
 import { ToastProvider } from "../../../components/Toast";
@@ -128,6 +129,21 @@ function renderAt(path: string) {
 
 const playButton = () => screen.getByRole("button", { name: /^(Play|Resume session)$/ });
 const line = () => document.querySelector(".gp-stream-line")?.textContent ?? "";
+const recLine = () => document.querySelector(".gp-rec")?.textContent ?? "";
+const policy = (over: Record<string, unknown>) =>
+  mocked.getProfilePreferences.mockResolvedValue({ ...prefsBase, ...over } as never);
+const prefsBase = { default_profile_id: null, global_default_profile_id: null, user_overrides_allowed: true };
+/** The radio checked in one of the sheet's columns. */
+const checked = (sheet: HTMLElement, column: string) =>
+  within(within(sheet).getByRole("radiogroup", { name: column }))
+    .getAllByRole("radio")
+    .find((r) => r.getAttribute("aria-checked") === "true")?.textContent ?? "";
+const riskyRecommendation = () =>
+  response(
+    "p-1440",
+    launchProfile("p-1440", [rung("1440-h264", "h264", 1440, 60, 20000)], "risky", [{ code: "bandwidth_too_low", message: "" }]),
+    launchProfile("p-720", [rung("720-h264", "h264", 720, 60, 5000)]),
+  );
 const sent = (i = 0) => mocked.launchSession.mock.calls[i][1];
 
 /** Render the page and wait until Play is live. */
@@ -155,6 +171,7 @@ beforeEach(() => {
   mocked.listApps.mockResolvedValue({ items: [game] } as never);
   mocked.getMySessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.getProfiles.mockResolvedValue(profiles as never);
+  policy({});
   mocked.favouriteApp.mockResolvedValue(undefined as never);
   mocked.launchSession.mockResolvedValue(launched as never);
 });
@@ -168,6 +185,8 @@ describe("game page", () => {
     await ready();
     expect(screen.getByRole("heading", { level: 1, name: "Portal 2" })).toBeVisible();
     expect(line()).toBe("Default settings (chosen by the server at launch)");
+    // Names no selection under a line that says the server picks.
+    expect(recLine()).toBe("The recommendation here is 1440p at 60 fps.");
     expect(screen.getByText("A puzzle game.")).toBeTruthy();
   });
 
@@ -206,21 +225,80 @@ describe("game page", () => {
     expect(mocked.launchSession).toHaveBeenCalledTimes(1);
   });
 
-  it("with overrides off, Play still launches and a Change the server refuses says so", async () => {
-    mocked.launchSession.mockImplementation((async (_t: string, req: libraryApi.LaunchRequest) => {
-      if (req.profile_id) throw new ApiError(409, "conflict", "profile overrides are disabled for this launch");
-      return launched;
-    }) as never);
+  it("with overrides off, offers no Change and Play sends no profile, even for a risky recommendation", async () => {
+    policy({ user_overrides_allowed: false });
+    mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
+    await ready();
+    expect(screen.getByRole("button", { name: /Change/ })).toBeDisabled();
+    expect(line()).toBe("Default settings (chosen by the server at launch)");
+    expect(recLine()).toBe("An admin has disabled user profile overrides.");
+    fireEvent.click(playButton());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent()).toEqual({ app_id: "a1", mic: true });
+
+    cleanup();
+    mocked.launchSession.mockClear();
+    mocked.getProfiles.mockResolvedValue(riskyRecommendation() as never);
+    await ready();
+    expect(screen.getByRole("button", { name: /Change/ })).toBeDisabled();
+    fireEvent.click(playButton());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent()).toEqual({ app_id: "a1", mic: true });
+  });
+
+  it("a Change that changes nothing launches what Play launches", async () => {
+    await ready();
+    const sheet = await openChange();
+    fireEvent.click(within(sheet).getByRole("radio", { name: /720p/ }));
+    fireEvent.click(within(sheet).getByRole("radio", { name: /1440p/ }));
+    fireEvent.click(within(sheet).getByRole("button", { name: "Play now" }));
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent()).toEqual({ app_id: "a1", mic: true });
+  });
+
+  it("after a Change whose launch fails, Play still sends what it sent before", async () => {
+    mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
     await ready();
     const sheet = await openChange();
     fireEvent.click(within(sheet).getByRole("radio", { name: /720p/ }));
     fireEvent.click(within(sheet).getByRole("button", { name: "Play now" }));
-    expect(await screen.findByText("profile overrides are disabled for this launch")).toBeTruthy();
-    expect(sent()).toEqual({ app_id: "a1", mic: true, profile_id: "p-720" });
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent(0)).toEqual({ app_id: "a1", mic: true, profile_id: "p-720" });
+    await waitFor(() => expect(within(sheet).getByRole("button", { name: "Play now" })).toBeEnabled());
+    fireEvent.click(within(sheet).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
-    // The page now shows, and sends, the choice; nothing on it claims a codec.
-    await waitFor(() => expect(playButton()).toBeEnabled());
-    expect(line()).toBe("720p · 60 fps · 5 Mbps (codec chosen by the server)");
+    expect(line()).toBe("Default settings (chosen by the server at launch)");
+    fireEvent.click(playButton());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(2));
+    expect(sent(1)).toEqual({ app_id: "a1", mic: true });
+  });
+
+  it("a preferred app opens Change on its pin: unchanged sends no profile, a change sends the pick", async () => {
+    mocked.listApps.mockResolvedValue({ items: [{ ...game, profile_policy: "prefer", default_profile_id: "p-720" }] } as never);
+    mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
+    await ready();
+    let sheet = await openChange();
+    expect(checked(sheet, "Resolution")).toMatch(/720p/);
+    fireEvent.click(within(sheet).getByRole("button", { name: "Play now" }));
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent(0)).toEqual({ app_id: "a1", mic: true });
+
+    await waitFor(() => expect(within(sheet).getByRole("button", { name: "Play now" })).toBeEnabled());
+    fireEvent.click(within(sheet).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    sheet = await openChange();
+    fireEvent.click(within(sheet).getByRole("radio", { name: /1440p/ }));
+    fireEvent.click(within(sheet).getByRole("button", { name: "Play now" }));
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(2));
+    expect(sent(1)).toEqual({ app_id: "a1", mic: true, profile_id: "p-1440" });
+  });
+
+  it("opens Change on the account default, which is what Play without a profile starts", async () => {
+    policy({ default_profile_id: "p-720" });
+    await ready();
+    const sheet = await openChange();
+    expect(checked(sheet, "Resolution")).toMatch(/720p/);
   });
 
   it("a Change with a codec sends the profile and the codec, as the band does", async () => {
@@ -235,31 +313,54 @@ describe("game page", () => {
     await waitFor(() => expect(mocked.launchSession).toHaveBeenCalled());
     const wire = codec.textContent?.includes("HEVC") ? "h265" : "h264";
     expect(sent()).toMatchObject({ app_id: "a1", profile_id: expect.any(String), stream: { codec: wire } });
-    await waitFor(() => expect(playButton()).toBeEnabled());
-    expect(line()).toContain(wire === "h265" ? "HEVC" : "H.264");
-    expect(line()).not.toContain("chosen by the server");
   });
 
-  it("a risky recommendation is launched as the band launches it, and the line names it", async () => {
-    mocked.getProfiles.mockResolvedValue(
-      response(
-        "p-1440",
-        launchProfile("p-1440", [rung("1440-h264", "h264", 1440, 60, 20000)], "risky", [
-          { code: "bandwidth_too_low", message: "" },
-        ]),
-      ) as never,
-    );
+  it("a risky recommendation is launched as the band's Play launches it, and the line names it", async () => {
+    mocked.getProfiles.mockResolvedValue(riskyRecommendation() as never);
     await ready();
     expect(line()).toBe("1440p · 60 fps · 20 Mbps (codec chosen by the server)");
     fireEvent.click(playButton());
     await waitFor(() => expect(mocked.launchSession).toHaveBeenCalled());
     expect(sent()).toEqual({ app_id: "a1", mic: true, profile_id: "p-1440" });
+
+    // The Classic band's Play, on the same profiles.
+    cleanup();
+    const confirm = vi.fn();
+    render(
+      <MemoryRouter>
+        <AuthContext.Provider value={auth}>
+          <DetailBand
+            app={game}
+            codecCaps={{ ...caps, vp9: false }}
+            launching={false}
+            profiles={riskyRecommendation() as never}
+            optionsOpen={false}
+            optionsToggleRef={{ current: null }}
+            onToggleOptions={vi.fn()}
+            onCloseOptions={vi.fn()}
+            onRetryProfiles={vi.fn()}
+            onClose={vi.fn()}
+            onConfirmProfile={confirm}
+            onToggleFavourite={vi.fn()}
+            isBlocked={false}
+            blockedByName={null}
+            liveSessionId={null}
+            isLive={false}
+            onResume={vi.fn()}
+          />
+        </AuthContext.Provider>
+      </MemoryRouter>,
+    );
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    expect(confirm).toHaveBeenCalledWith("p-1440", undefined);
   });
 
-  it("a forced app launches on its pin: no profile by default, the pin from Change", async () => {
+  it("a forced app launches on its pin: no profile by default or from an unchanged Change, the pin with a codec", async () => {
     mocked.listApps.mockResolvedValue({ items: [{ ...game, profile_policy: "force", default_profile_id: "p-720" }] } as never);
     mocked.launchSession.mockRejectedValue(new ApiError(503, "unavailable", "try later"));
     await ready();
+    expect(recLine()).toBe("The recommendation here is 1440p at 60 fps.");
     fireEvent.click(playButton());
     await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
     expect(sent(0)).toEqual({ app_id: "a1", mic: true });
@@ -267,9 +368,31 @@ describe("game page", () => {
     await waitFor(() => expect(playButton()).toBeEnabled());
     const sheet = await openChange();
     expect(sheet.textContent).toContain("Fixed by this app, it always launches at its own setting.");
-    fireEvent.click(within(sheet).getByRole("button", { name: "Play now" }));
+    const playNow = () => within(sheet).getByRole("button", { name: "Play now" });
+    fireEvent.click(playNow());
     await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(2));
-    expect(sent(1)).toEqual({ app_id: "a1", mic: true, profile_id: "p-720" });
+    expect(sent(1)).toEqual({ app_id: "a1", mic: true });
+
+    await waitFor(() => expect(playNow()).toBeEnabled());
+    fireEvent.click(within(sheet).getByRole("radio", { name: /H\.264/ }));
+    fireEvent.click(playNow());
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(3));
+    expect(sent(2)).toEqual({ app_id: "a1", mic: true, profile_id: "p-720", stream: { codec: "h264" } });
+  });
+
+  it("blocks Play while a game sharing this one's home is running", async () => {
+    mocked.listApps.mockResolvedValue({
+      items: [game, { ...game, id: "a2", name: "Portal 2 Workshop", parent_app_id: "a1" }],
+    } as never);
+    mocked.getMySessions.mockResolvedValue({ items: [{ id: "s1", app_id: "a2", state: "running" }], next_cursor: null } as never);
+    renderAt("/app/game/a1");
+    expect(await screen.findByText(/is already running/)).toBeTruthy();
+    await act(async () => {});
+    expect(document.querySelector(".gp-launch .note.warn b")?.textContent).toBe("Portal 2");
+    expect(screen.getByRole("link", { name: "Go to your session" }).getAttribute("href")).toBe("/app/session/s1");
+    expect(playButton()).toBeDisabled();
+    fireEvent.keyDown(window, { key: "p" });
+    expect(mocked.launchSession).not.toHaveBeenCalled();
   });
 
   it("resumes the live session instead of launching", async () => {
@@ -306,6 +429,7 @@ describe("game page", () => {
     mocked.getProfiles.mockRejectedValueOnce(new ApiError(500, "internal", "boom"));
     renderAt("/app/game/a1");
     expect(await screen.findByText("Could not load stream profiles.")).toBeTruthy();
+    expect(line()).toBe("Not available");
     expect(screen.getByRole("button", { name: "Play" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(playButton()).toBeEnabled());

@@ -3,21 +3,21 @@
 // over optionsFor's model, and a launch goes through useLaunch.launchApp.
 // Play sends what Home's one-click Play sends (no profile: the server picks the
 // app's pin, the account default or the recommendation). Wherever one-click
-// would open the band instead, and after a Play from Change, it sends what the
-// band sends.
-// Only the per-game memory of the last launch and the play history come from
-// gameData.ts.
+// would open the band instead it sends what the band sends, and a Play from
+// Change sends a profile only for a selection that differs from Play's.
+// Only the per-game memory of the last launch comes from gameData.ts.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import * as libraryApi from "../../../api/library";
 import { ApiError } from "../../../api/client";
-import type { App, ProfilesResponse, Session } from "../../../api/types";
+import type { App, ProfilePreferencesResponse, ProfilesResponse, Session } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { useToast } from "../../../components/Toast";
 import { probeCodecs } from "../../../webrtc/capability";
 import {
   blockingReasons,
+  defaultDraft,
   isRecommendationEligible,
   optionsFor,
   resolveSelection,
@@ -42,10 +42,13 @@ function isTypingTarget(t: EventTarget | null): boolean {
 /** Wire codec (game-settings) → the panel's catalog vocabulary. */
 const fromWire = (c: GameSettings["codec"]): DraftCodec => (c === "h265" ? "hevc" : c ?? "auto");
 
+const sameDraft = (a: LaunchDraft, b: LaunchDraft) => a.codec === b.codec && a.fps === b.fps && a.height === b.height;
+
 export function useGamePage(app: App) {
   const { token, isAdmin } = useAuth();
   const navigate = useNavigate();
-  const location = useLocation() as { state: { from?: string } | null };
+  const location = useLocation();
+  const from = (location.state as { from?: string } | null)?.from;
   const { addToast } = useToast();
   const { apps, setApps } = useLibraryCatalog();
   const extrasMap = useLibraryExtras();
@@ -90,6 +93,20 @@ export function useGamePage(app: App) {
     void fetchProfiles({ id: appId });
   }, [fetchProfiles, appId]);
 
+  /** undefined = still loading; null = unavailable, read as overrides allowed and no defaults. */
+  const [prefs, setPrefs] = useState<ProfilePreferencesResponse | null | undefined>(undefined);
+  useEffect(() => {
+    if (!token) return;
+    let live = true;
+    libraryApi
+      .getProfilePreferences(token)
+      .then((p) => live && setPrefs(p))
+      .catch(() => live && setPrefs(null));
+    return () => {
+      live = false;
+    };
+  }, [token]);
+
   /** undefined = still loading; null = nothing remembered. */
   const [saved, setSaved] = useState<GameSettings | null | undefined>(undefined);
   useEffect(() => {
@@ -103,10 +120,20 @@ export function useGamePage(app: App) {
 
   const loaded = typeof profiles === "object" && profiles !== null ? profiles : null;
   const profilesError = typeof profiles === "string" ? profiles : null;
-  const model = useMemo(
-    () => (loaded ? optionsFor({ app, data: loaded, caps: codecCaps, isAdmin }) : null),
-    [loaded, app, codecCaps, isAdmin],
-  );
+  const model = useMemo(() => {
+    if (!loaded || prefs === undefined) return null;
+    const m = optionsFor({ app, data: loaded, caps: codecCaps, isAdmin });
+    // Open on what a Play with no profile launches: the server's pick, in
+    // ResolveDefaultProfile's order (profile_preferences.go).
+    const auto = m.space.entriesByCodec.get("auto") ?? [];
+    const pick = [app.profile_policy === "inherit" ? null : app.default_profile_id, prefs?.default_profile_id, prefs?.global_default_profile_id]
+      .find((id) => id && auto.some((e) => e.profileId === id));
+    const usable = auto.some((e) => e.profileId === pick && e.eligibility !== "ineligible");
+    return pick && usable ? { ...m, seed: defaultDraft(m.space, pick) } : m;
+  }, [loaded, prefs, app, codecCaps, isAdmin]);
+  /** Policy leaves the choice to the server, which refuses any other profile (launcher.go): Play sends none, Change is off. */
+  const locked =
+    !isAdmin && !model?.pinnedProfileId && (app.profile_policy === "force" || prefs?.user_overrides_allowed === false);
 
   const [optionsOpen, setOptionsOpen] = useState(false);
   const selection = useLaunchDraft(model, app, optionsOpen);
@@ -118,7 +145,7 @@ export function useGamePage(app: App) {
   useEffect(() => {
     if (!model || saved === undefined || appliedRef.current) return;
     appliedRef.current = true;
-    if (!saved || model.pinnedProfileId) return;
+    if (!saved || model.pinnedProfileId || locked) return;
     const codec = fromWire(saved.codec);
     const e = (model.space.entriesByCodec.get(codec) ?? []).find(
       (x) => x.profileId === saved.profile_id && x.eligibility !== "ineligible",
@@ -126,7 +153,7 @@ export function useGamePage(app: App) {
     if (!e) return;
     commit({ codec, fps: e.fps, height: e.height });
     setRemembered(true);
-  }, [model, saved, commit]);
+  }, [model, saved, commit, locked]);
 
   const ready = Boolean(model || profilesError);
   const resolved = selection.resolved;
@@ -142,16 +169,17 @@ export function useGamePage(app: App) {
   const isRecommendation = selection.committed?.codec === "auto" && Boolean(resolved?.recommended);
   /** This game's own remembered settings are what Play will use. */
   const perGame = remembered && !isRecommendation && rec.tone === "ok";
+  /** Play sends no profile and no codec, as quickLaunch does. */
+  const oneClick = locked || (!remembered && codecCaps.h264 && loaded !== null && isRecommendationEligible(loaded));
+  const recLabel = recommended ? `${resolutionLabel(recommended.height)} at ${recommended.fps} fps` : null;
+  // With no profile sent the stream line says the server picks, so this line names no selection.
+  const oneClickText = locked ? "An admin has disabled user profile overrides." : recLabel && `The recommendation here is ${recLabel}.`;
   const recText =
     remembered && !isRecommendation && rec.tone === "ok"
-      ? `Your last settings for this game.${recommended ? ` Recommended here: ${resolutionLabel(recommended.height)} at ${recommended.fps} fps.` : ""}`
-      : rec.text;
-
-  /** A Play from Change sends its selection from then on. */
-  const [changed, setChanged] = useState(false);
-  /** Play sends no profile and no codec, as quickLaunch does. */
-  const oneClick =
-    !changed && !remembered && codecCaps.h264 && loaded !== null && isRecommendationEligible(loaded);
+      ? `Your last settings for this game.${recLabel ? ` Recommended here: ${recLabel}.` : ""}`
+      : oneClick && rec.tone === "ok" && oneClickText
+        ? oneClickText
+        : rec.text;
 
   // ── Launch ────────────────────────────────────────────────────────────────
   const launch = useLaunch({
@@ -165,15 +193,17 @@ export function useGamePage(app: App) {
 
   const play = useCallback(
     (next?: LaunchDraft | null) => {
-      const chosen = next ?? selection.committed;
-      if (!model || !chosen) return;
+      const current = selection.committed;
+      if (!model || !current) return;
+      // A Play from Change that changed nothing is Play. A change is never
+      // committed: a launch that works leaves the page, one that fails leaves Play as it was.
+      const change = !locked && next && !sameDraft(next, current) ? next : null;
+      const chosen = change ?? current;
       const r = resolveSelection(model.space, chosen);
       if (!r) return;
-      commit(chosen);
-      if (next) setChanged(true);
       const wireCodec = chosen.codec === "auto" || r.codec === null ? undefined : toWireCodec(r.codec);
       const profileId = model.pinnedProfileId ?? r.profileId;
-      // Remember what was launched, unless it is just the device's recommendation.
+      // Remember what was launched, unless it is just the default selection.
       const seed = model.seed;
       const isSeed = chosen.codec === seed.codec && chosen.fps === seed.fps && chosen.height === seed.height;
       if (token) {
@@ -184,13 +214,13 @@ export function useGamePage(app: App) {
           : putGameSettings(token, app.id, { profile_id: profileId, codec: wireCodec, source: "remembered" });
         void write?.catch(() => {});
       }
-      if (oneClick && !next) void launch.launchApp(app);
+      if (oneClick && !change) void launch.launchApp(app);
       else void launch.launchApp(app, profileId, wireCodec);
     },
-    [model, selection.committed, commit, token, saved, app, launch, oneClick],
+    [model, selection.committed, locked, token, saved, app, launch, oneClick],
   );
 
-  /** Back to the device recommendation, and forget this game's own settings. */
+  /** Back to the default selection, and forget this game's own settings. */
   const resetToRecommended = useCallback(() => {
     if (!model) return;
     commit(model.seed);
@@ -223,6 +253,25 @@ export function useGamePage(app: App) {
         ? "Launching…"
         : "Play";
   const onPlay = isLive ? resume : () => play();
+
+  // A pick in the top-bar search or the palette leaves focus in the field (the
+  // palette hands it back there), where P would type: move it to Play, or to the
+  // title until Play is live.
+  const playRef = useRef<HTMLButtonElement>(null);
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  const handOffRef = useRef(false);
+  useEffect(() => {
+    if (from === "search" || from === "palette") handOffRef.current = true;
+  }, [from, location.key]);
+  useEffect(() => {
+    if (!handOffRef.current) return;
+    if (playDisabled) {
+      titleRef.current?.focus();
+      return;
+    }
+    handOffRef.current = false;
+    if (document.activeElement === titleRef.current) playRef.current?.focus();
+  }, [playDisabled, location.key]);
 
   // ── Options sheet ─────────────────────────────────────────────────────────
   const changeRef = useRef<HTMLButtonElement>(null);
@@ -271,9 +320,9 @@ export function useGamePage(app: App) {
   }, [app.id]);
 
   const back = useCallback(() => {
-    if (location.state?.from) navigate(-1);
+    if (from) navigate(-1);
     else navigate("/app/library");
-  }, [location.state, navigate]);
+  }, [from, navigate]);
 
   // Cover gradient keyed to name order, so a game's fallback matches its tile.
   const coverClassById = useMemo(() => {
@@ -310,6 +359,7 @@ export function useGamePage(app: App) {
     profilesError,
     selection,
     oneClick,
+    locked,
     rec: { tone: rec.tone, text: recText },
     perGame,
     recommended,
@@ -322,6 +372,8 @@ export function useGamePage(app: App) {
     // launch
     play,
     onPlay,
+    playRef,
+    titleRef,
     playDisabled,
     playLabel,
     launching: launch.launching,

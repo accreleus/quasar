@@ -68,7 +68,11 @@ const auth: AuthContextValue = {
 
 function Probe() {
   const loc = useLocation();
-  return <span data-testid="path">{loc.pathname}</span>;
+  return (
+    <span data-testid="path" data-from={(loc.state as { from?: string } | null)?.from}>
+      {loc.pathname}
+    </span>
+  );
 }
 
 function renderHome(state?: unknown) {
@@ -184,6 +188,54 @@ describe("Home, new design", () => {
     await waitFor(() => expect(document.activeElement?.getAttribute("aria-label")).toBe("Portal 2"));
   });
 
+  it("moves focus to the first tile of the whole grid when F drops the last favourite", async () => {
+    renderHome();
+    await waitForGrid();
+    fireEvent.click(screen.getByRole("tab", { name: "Favourites" }));
+    await waitFor(() => expect(grid().querySelectorAll(".lib-tile")).toHaveLength(1));
+    const hades = within(grid()).getByRole("button", { name: "Hades" });
+    act(() => hades.focus());
+    fireEvent.keyDown(hades, { key: "f" });
+    await waitFor(() => expect(mocked.unfavouriteApp).toHaveBeenCalledWith("tok", "a2"));
+    await waitForGrid();
+    await waitFor(() => expect(document.activeElement).toBe(grid().querySelector(".lib-tile-surface")));
+  });
+
+  it("P on a tile resumes its live session, and launches another tile one-click", async () => {
+    mocked.getMySessions.mockResolvedValue({ items: [{ id: "s1", app_id: "a1", state: "running" }], next_cursor: null } as never);
+    mocked.getProfiles.mockResolvedValue({
+      recommended_id: "p",
+      confidence: "high",
+      notes: [],
+      profiles: [
+        {
+          id: "p",
+          display_name: "p",
+          description: "",
+          nominal: { width: 1920, height: 1080, fps: 60, bitrate_kbps: 8000 },
+          eligibility: "eligible",
+          reasons: [],
+          rungs: [{ id: "r", display_name: "r", codec: "h264", width: 1920, height: 1080, fps: 60, nominal_bitrate_kbps: 8000, position: 1, eligibility: "eligible", reasons: [] }],
+        },
+      ],
+    } as never);
+    mocked.launchSession.mockRejectedValue(new Error("not here"));
+    renderHome();
+    await waitForGrid();
+    await act(async () => {});
+    const celeste = within(grid()).getByRole("button", { name: "Celeste" });
+    act(() => celeste.focus());
+    fireEvent.keyDown(celeste, { key: "p" });
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(mocked.launchSession.mock.calls[0][1]).toEqual({ app_id: "a3", mic: true });
+
+    const portal = within(grid()).getByRole("button", { name: "Portal 2" });
+    act(() => portal.focus());
+    fireEvent.keyDown(portal, { key: "p" });
+    await waitFor(() => expect(screen.getByTestId("path").textContent).toBe("/app/session/s1"));
+    expect(mocked.launchSession).toHaveBeenCalledTimes(1);
+  });
+
   it("opens the game's page, not the band, where one-click Play cannot launch", async () => {
     renderHome();
     await waitForGrid();
@@ -196,6 +248,7 @@ describe("Home, new design", () => {
   it("gives a Classic redirect back to the game page when the switch has flipped", async () => {
     renderHome({ openApp: "a3" });
     await waitFor(() => expect(screen.getByTestId("path").textContent).toBe("/app/game/a3"));
+    expect(screen.getByTestId("path").dataset.from).toBe("home");
     expect(document.querySelector(".detail")).toBeNull();
   });
 });

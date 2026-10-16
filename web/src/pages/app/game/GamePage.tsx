@@ -96,7 +96,7 @@ function LaunchFirst({ app }: { app: App }) {
           <div className="d-inner gp-hero-inner">
             <BackButton onBack={g.back} />
             <div className="gp-hero-body">
-              <GameTitle name={app.name} logoUrl={x?.logo_url ?? null} />
+              <GameTitle name={app.name} logoUrl={x?.logo_url ?? null} titleRef={g.titleRef} />
               {meta && <p className="gp-meta">{meta}</p>}
               <LaunchBlock g={g} />
               {history && <p className="gp-history">{history}</p>}
