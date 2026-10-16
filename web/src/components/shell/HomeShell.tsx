@@ -30,6 +30,7 @@ import { useLibraryCatalog } from "../../pages/app/libraryCatalog";
 import { buildUserNav, SEARCHABLE_ROUTES } from "../../pages/app/navItems";
 import { useLibrarySearch } from "../../pages/app/librarySearchContext";
 import { searchOnGamePage } from "../../pages/app/game/searchToPage";
+import { FuzzySearch } from "../../pages/app/search/FuzzySearch";
 import { useNewDesign } from "../../settings/OverlayPreferencesContext";
 
 export function HomeShell({ children }: { children: ReactNode }) {
@@ -75,7 +76,15 @@ export function HomeShell({ children }: { children: ReactNode }) {
 
         <div className="spacer" />
 
-        {searchable && (
+        {searchable && newDesign && (
+          <FuzzySearch
+            query={query}
+            setQuery={setQuery}
+            apps={apps}
+            onChoose={(app) => navigate(`/app/game/${app.id}`, { state: { from: "search" } })}
+          />
+        )}
+        {searchable && !newDesign && (
           <div className="search">
             <IconSearch className="ic" />
             <input

@@ -1,7 +1,7 @@
 // Related titles for a game page, from the game extras (genres, developer, rank).
 
 import type { App } from "../../../api/types";
-import type { ExtrasMap } from "./gameData";
+import type { ExtrasMap } from "../library/libraryExtras";
 
 // Genres that say little about what a game is like.
 const BROAD = new Set(["Indie", "Free To Play", "Early Access", "Casual", "Massively Multiplayer"]);

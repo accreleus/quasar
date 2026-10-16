@@ -6,7 +6,7 @@ import { useMemo } from "react";
 import type { ReactNode } from "react";
 import type { App } from "../../../api/types";
 import { LibraryTile } from "./LibraryTile";
-import { hoursLabel, relativeDay, useGameExtras } from "../game/gameData";
+import { hoursLabel, relativeDay, useLibraryExtras } from "../library/libraryExtras";
 import "./shelves.css";
 
 export interface ShelfTiles {
@@ -74,7 +74,7 @@ export function FavouritesShelf({ apps, tile }: { apps: App[]; tile: ShelfTiles 
 }
 
 export function JumpBackShelf({ apps, tile }: { apps: App[]; tile: ShelfTiles }) {
-  const extras = useGameExtras();
+  const extras = useLibraryExtras();
   const recent = useMemo(() => {
     if (!extras) return [];
     return apps

@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { App } from "../../../api/types";
-import type { ExtrasMap, GameExtras } from "./gameData";
+import type { ExtrasMap, LibraryExtras } from "../library/libraryExtras";
 import { moreLikeThis } from "./related";
 
 const app = (id: string) => ({ id, name: id, kind: "game" }) as App;
-const ex = (rank: number, genres: string[], developer: string | null = null) => ({ rank, genres, developer }) as GameExtras;
+const ex = (rank: number, genres: string[], developer: string | null = null) => ({ rank, genres, developer }) as LibraryExtras;
 
 describe("related", () => {
   const apps = ["a", "b", "c", "d"].map(app);

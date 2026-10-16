@@ -52,7 +52,7 @@ export interface LibraryTileProps {
   /** The detail band, when this tile is the last one in the opened row. Kept
    *  as a sibling of the tile so it is always the next grid child. */
   detail?: ReactNode;
-  /** A caption inside the surface button. */
+  /** New design: a caption inside the surface button. */
   meta?: ReactNode;
   /** New design: a resting heart and a one-line title strip, and `F` favourites. */
   onFavourite?: () => void;

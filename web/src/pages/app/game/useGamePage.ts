@@ -30,13 +30,8 @@ import { useLibraryCatalog } from "../libraryCatalog";
 import { recommendation, resolutionLabel } from "../home/launchOptionRules";
 import { useLaunch } from "../home/useLaunch";
 import { useLaunchDraft } from "../home/useLaunchDraft";
-import {
-  clearGameSettings,
-  getGameSettings,
-  putGameSettings,
-  useGameExtras,
-  type GameSettings,
-} from "./gameData";
+import { useLibraryExtras } from "../library/libraryExtras";
+import { clearGameSettings, getGameSettings, putGameSettings, type GameSettings } from "./gameData";
 
 function isTypingTarget(t: EventTarget | null): boolean {
   const el = t as HTMLElement | null;
@@ -53,7 +48,7 @@ export function useGamePage(app: App) {
   const location = useLocation() as { state: { from?: string } | null };
   const { addToast } = useToast();
   const { apps, setApps } = useLibraryCatalog();
-  const extrasMap = useGameExtras();
+  const extrasMap = useLibraryExtras();
   const extras = extrasMap?.[app.id] ?? null;
   const codecCaps = useMemo(() => probeCodecs(), []);
 

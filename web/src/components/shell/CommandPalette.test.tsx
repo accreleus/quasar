@@ -14,6 +14,9 @@ import { CommandPalette } from "./CommandPalette";
 import { AuthContext, type AuthContextValue } from "../../auth/context";
 import { ThemeProvider } from "../../settings/ThemeContext";
 
+// These pin the shipped palette; the new design's game search is in paletteGames.test.ts.
+vi.mock("../../settings/OverlayPreferencesContext", () => ({ useNewDesign: () => false }));
+
 const apps = [{ id: "a1", name: "Blender", kind: "desktop" }];
 const hosts = [{ id: "h1", node_name: "quasar-node-1", status: "online" }];
 
@@ -256,37 +259,5 @@ describe("CommandPalette result semantics", () => {
     for (const option of screen.getAllByRole("option")) {
       expect(option.parentElement).toHaveAttribute("role", "group");
     }
-  });
-});
-
-describe("CommandPalette for a player, new design", () => {
-  it("opens a game's page with where it came from, so the page's Back returns there", async () => {
-    function State() {
-      return <span data-testid="state">{JSON.stringify(useLocation().state)}</span>;
-    }
-    function PlayerHarness() {
-      const [open, setOpen] = useState(true);
-      return (
-        <>
-          <CommandPalette open={open} onOpenChange={setOpen} apps={apps} />
-          <Routes>
-            <Route path="*" element={<><Where /><State /></>} />
-          </Routes>
-        </>
-      );
-    }
-    render(
-      <MemoryRouter initialEntries={["/app"]}>
-        <AuthContext.Provider value={{ ...auth, isAdmin: false, user: { ...auth.user!, role: "user" } }}>
-          <ThemeProvider>
-            <PlayerHarness />
-          </ThemeProvider>
-        </AuthContext.Provider>
-      </MemoryRouter>,
-    );
-    fireEvent.change(input(), { target: { value: "blender" } });
-    fireEvent.click(screen.getByRole("option", { name: /Blender/ }));
-    expect(await screen.findByTestId("where")).toHaveTextContent("/app/game/a1");
-    expect(screen.getByTestId("state")).toHaveTextContent('{"from":"palette"}');
   });
 });

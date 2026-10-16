@@ -17,7 +17,7 @@
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { App } from "../../App";
 import { buildUserNav, SEARCHABLE_ROUTES } from "./AppLayout";
 import { buildUserTabs } from "./userTabs";
@@ -31,11 +31,6 @@ import * as storageApi from "../../api/storage";
 import * as setupApi from "../../api/setup";
 
 vi.mock("../../api/library");
-// This suite drives the detail band, which is the Classic layout.
-vi.mock("../../settings/OverlayPreferencesContext", async (orig) => ({
-  ...(await orig<typeof import("../../settings/OverlayPreferencesContext")>()),
-  useNewDesign: () => false,
-}));
 vi.mock("../../api/storage");
 // App.tsx wraps every route in RequireClaimedInstance, which reads this —
 // an already-claimed, fully-set-up instance is the case these /app tests
@@ -60,6 +55,10 @@ const auth: AuthContextValue = {
   logout: vi.fn(),
 };
 
+function Path() {
+  return <span data-testid="path">{useLocation().pathname}</span>;
+}
+
 function renderApp(path: string) {
   return render(
     <MemoryRouter initialEntries={[path]}>
@@ -68,6 +67,7 @@ function renderApp(path: string) {
           <SetupStatusProvider>
             <ToastProvider>
               <App />
+              <Path />
             </ToastProvider>
           </SetupStatusProvider>
         </AuthContext.Provider>
@@ -80,6 +80,8 @@ beforeEach(() => {
   vi.resetAllMocks();
   mockedSetup.getSetupStatus.mockResolvedValue({ admin_exists: true, setup_completed: true });
   localStorage.clear();
+  // These pin the shipped layout; the redesign has its own tests.
+  localStorage.setItem("quasar.ui.classic.u1", "1");
   document.body.removeAttribute("data-rail");
   mockedLibrary.listApps.mockResolvedValue({
     items: [
@@ -327,6 +329,131 @@ describe("topbar search box", () => {
     expect(box).toHaveValue("zzz");
     await waitFor(() => {
       expect(document.querySelectorAll(".lib-tile").length).toBe(0);
+    });
+  });
+
+  it("a palette hit routes into the library with the name in the box", async () => {
+    renderApp("/app");
+    await screen.findByRole("textbox", { name: "Search library" });
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    const palette = within(await screen.findByRole("dialog")).getByRole("combobox");
+    fireEvent.change(palette, { target: { value: "Portal" } });
+    fireEvent.click(await screen.findByRole("option", { name: /Portal 2/ }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Search library" })).toHaveValue("Portal 2"));
+    expect(screen.getByTestId("path")).toHaveTextContent("/app/library");
+  });
+});
+
+// ── The same four, in the new design (the default) ───────────────────────────
+//
+// The box is a combobox there (a results popover under it), so these query that
+// role; what they pin is the same shell behaviour.
+
+describe("new design (no Classic layout pin)", () => {
+  beforeEach(() => {
+    localStorage.removeItem("quasar.ui.classic.u1");
+  });
+  const box = () => screen.findByRole("combobox", { name: "Search library" });
+
+  it("the search box appears on /app and on /app/library", async () => {
+    const { unmount } = renderApp("/app");
+    expect(await box()).toBeInTheDocument();
+    unmount();
+    renderApp("/app/library");
+    expect(await box()).toBeInTheDocument();
+  });
+
+  it("is seeded from ?q= and typing then filters", async () => {
+    renderApp("/app/library?q=Portal");
+    const input = await box();
+    expect(input).toHaveValue("Portal");
+    await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(1));
+    fireEvent.change(input, { target: { value: "zzz" } });
+    expect(input).toHaveValue("zzz");
+    await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(0));
+  });
+
+  it("a palette hit opens the game's page", async () => {
+    renderApp("/app");
+    await box();
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    const palette = within(await screen.findByRole("dialog")).getByRole("combobox");
+    fireEvent.change(palette, { target: { value: "Portal" } });
+    fireEvent.click(await screen.findByRole("option", { name: /Portal 2/ }));
+    await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent("/app/game/"));
+    expect(await screen.findByRole("heading", { level: 1, name: "Portal 2" })).toBeInTheDocument();
+  });
+
+  it("a top-bar result opens the game's page, and Back returns to the library", async () => {
+    renderApp("/app/library");
+    fireEvent.change(await box(), { target: { value: "Portal" } });
+    fireEvent.click(await screen.findByRole("option", { name: "Portal 2" }));
+    expect(await screen.findByRole("heading", { level: 1, name: "Portal 2" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent("/app/library"));
+  });
+
+  describe("a pick always opens the chosen game's page", () => {
+    const game = (id: string, name: string) => ({ ...mockedAppBase, id, name });
+    const mockedAppBase = {
+      description: "",
+      kind: "game",
+      cover_url: null,
+      hero_url: null,
+      parent_app_id: null,
+      external_source: "steam",
+      external_id: "",
+      favourite: false,
+      enabled: true,
+    };
+    async function pick(name: string, option = 0) {
+      fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByRole("combobox"), { target: { value: name } });
+      fireEvent.click((await within(dialog).findAllByRole("option", { name: new RegExp(name) }))[option]);
+    }
+    const page = async (id: string, name: string) => {
+      await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent(`/app/game/${id}`));
+      expect(await screen.findByRole("heading", { level: 1, name })).toBeInTheDocument();
+    };
+    const nav = (name: string) => within(screen.getAllByRole("navigation")[0]).getByRole("link", { name });
+    const twoGames = () =>
+      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Portal 2"), game("a2", "Celeste")] } as never);
+
+    it("again after going Home, from its own page, and for a different game", async () => {
+      twoGames();
+      renderApp("/app");
+      await box();
+      await pick("Portal 2");
+      await page("a1", "Portal 2");
+      fireEvent.click(nav("Home"));
+      await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent(/^\/app$/));
+      await pick("Portal 2");
+      await page("a1", "Portal 2");
+      await pick("Celeste");
+      await page("a2", "Celeste");
+      await pick("Celeste");
+      await page("a2", "Celeste");
+    });
+
+    it("when the kind filter hides it", async () => {
+      mockedLibrary.listApps.mockResolvedValue({
+        items: [game("a1", "Portal 2"), { ...game("a2", "Weston Terminal"), kind: "desktop" }],
+      } as never);
+      renderApp("/app/library");
+      await box();
+      const tabs = await screen.findByRole("tablist", { name: "Filter by kind" });
+      fireEvent.click(within(tabs).getByRole("tab", { name: "Desktops" }));
+      await pick("Portal 2");
+      await page("a1", "Portal 2");
+    });
+
+    it("two games with the same name: the chosen id opens", async () => {
+      mockedLibrary.listApps.mockResolvedValue({ items: [game("a1", "Twin"), game("a2", "Twin")] } as never);
+      renderApp("/app/library");
+      await box();
+      await pick("Twin", 1);
+      await page("a2", "Twin");
     });
   });
 });

@@ -23,9 +23,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../../auth/context";
-import { useNewDesign } from "../../settings/OverlayPreferencesContext";
 import { useTheme } from "../../settings/ThemeContext";
-import { paletteGameHref } from "../../pages/app/game/searchToPage";
 import { IconSearch, ShellIcon } from "../icons";
 import {
   palettePlaceholder,
@@ -37,6 +35,9 @@ import {
   type PaletteSession,
   type PaletteUser,
 } from "./paletteSearch";
+import { searchPaletteFuzzy } from "./paletteGames";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
+import { useLibraryExtras } from "../../pages/app/library/libraryExtras";
 
 /** One frozen empty list for every absent source, so an omitted prop does not
  *  churn the search memo on each render. */
@@ -73,7 +74,6 @@ export function CommandPalette({
   users?: readonly PaletteUser[];
 }) {
   const { isAdmin } = useAuth();
-  const newDesign = useNewDesign();
   const { toggleTheme } = useTheme();
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
@@ -83,16 +83,18 @@ export function CommandPalette({
   /** Whatever had focus when the palette opened, owed it back on close. */
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
+  const newDesign = useNewDesign();
+  const extras = useLibraryExtras();
   const groups = useMemo(
     () =>
-      searchPalette(query, {
+      (newDesign ? (q: string, s: Parameters<typeof searchPalette>[1]) => searchPaletteFuzzy(q, s, extras) : searchPalette)(query, {
         hosts: hosts ?? NONE,
         sessions: sessions ?? NONE,
         apps: apps ?? NONE,
         users: users ?? NONE,
         isAdmin,
       }),
-    [query, hosts, sessions, apps, users, isAdmin],
+    [query, hosts, sessions, apps, users, isAdmin, newDesign, extras],
   );
   // Derived from the sources actually handed down, not from the role alone —
   // see paletteScope. The account area gets the same palette with a shorter
@@ -152,12 +154,12 @@ export function CommandPalette({
     (item: PaletteItem | undefined) => {
       if (!item) return;
       onOpenChange(false);
-      const gameHref = paletteGameHref(item, isAdmin, newDesign);
-      const to = gameHref ?? item.to;
+      const to = item.to;
       if (item.action === "toggle-appearance") toggleTheme();
-      else if (to) navigate(to, gameHref ? { state: { from: "palette" } } : undefined);
+      // `from` lets the game page's Back return here.
+      else if (to) navigate(to, to.startsWith("/app/game/") ? { state: { from: "palette" } } : undefined);
     },
-    [navigate, onOpenChange, toggleTheme, isAdmin, newDesign],
+    [navigate, onOpenChange, toggleTheme],
   );
 
   /** Cycle focus inside the panel. Tab is handled outright rather than only

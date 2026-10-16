@@ -13,7 +13,7 @@ import { BandNotes } from "../home/BandNotes";
 import { LaunchOptions } from "../home/LaunchOptions";
 import type { HeroArt as HeroArtState } from "../home/useHeroPalette";
 import { formatBitrate } from "../home/launchOptionRules";
-import { hoursLabel, relativeDay, type GameExtras, type GameSessionStats } from "./gameData";
+import { hoursLabel, relativeDay, type GameSessionStats, type LibraryExtras } from "../library/libraryExtras";
 import { StreamSettings } from "./StreamSettings";
 import { imageLogoReadable } from "./logoInk";
 import type { GamePage } from "./useGamePage";
@@ -146,7 +146,7 @@ export function OptionsSheet({ g }: { g: GamePage }) {
 }
 
 /** "Last played last week · 42 h", or nothing for a game never played. */
-export function historyLine(extras: GameExtras | null): string | null {
+export function historyLine(extras: LibraryExtras | null): string | null {
   const p = extras?.play;
   if (!p) return null;
   return `Last played ${relativeDay(p.last_played_at)} · ${hoursLabel(p.total_seconds)}`;
@@ -161,7 +161,7 @@ export function Section({ title, children, className }: { title: ReactNode; chil
   );
 }
 
-export function HistoryStats({ extras }: { extras: GameExtras }) {
+export function HistoryStats({ extras }: { extras: LibraryExtras }) {
   const p = extras.play;
   if (!p) return null;
   return (
@@ -237,7 +237,7 @@ export function GenreChips({ genres }: { genres: string[] }) {
 }
 
 /** Developer / publisher / release, only the ones known. */
-export function Credits({ extras }: { extras: GameExtras }) {
+export function Credits({ extras }: { extras: LibraryExtras }) {
   const rows = [
     ["Developer", extras.developer],
     ["Publisher", extras.publisher !== extras.developer ? extras.publisher : null],

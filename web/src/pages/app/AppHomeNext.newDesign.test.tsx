@@ -22,11 +22,11 @@ vi.mock("../../settings/OverlayPreferencesContext", async (orig) => ({
 vi.mock("../../webrtc/capability", () => ({
   probeCodecs: () => ({ h264: true, hevc: true, av1: true }),
 }));
-vi.mock("./game/gameData", async (orig) => ({
-  ...(await orig<typeof import("./game/gameData")>()),
-  useGameExtras: () => ({
-    a1: { play: { last_played_at: "2026-01-01T00:00:00Z", total_seconds: 7200, sessions: 3, last_session: null } },
-    a3: { play: { last_played_at: "2026-03-01T00:00:00Z", total_seconds: 1800, sessions: 1, last_session: null } },
+vi.mock("./library/libraryExtras", async (orig) => ({
+  ...(await orig<typeof import("./library/libraryExtras")>()),
+  useLibraryExtras: () => ({
+    a1: { genres: [], added_at: null, play: { last_played_at: "2026-01-01T00:00:00Z", total_seconds: 7200 } },
+    a3: { genres: [], added_at: null, play: { last_played_at: "2026-03-01T00:00:00Z", total_seconds: 1800 } },
   }),
 }));
 
