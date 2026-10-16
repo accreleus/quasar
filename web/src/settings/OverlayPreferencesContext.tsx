@@ -188,6 +188,16 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
     [token, user?.id],
   );
 
+  // Styles that only the new design uses scope themselves under
+  // html[data-design="new"], so switching back to classic needs no reload.
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.design = classicLayout ? "classic" : "new";
+    return () => {
+      delete root.dataset.design;
+    };
+  }, [classicLayout]);
+
   return (
     <Ctx.Provider value={{ prefs, loaded, save, error, classicLayout, setClassicLayout }}>
       {children}

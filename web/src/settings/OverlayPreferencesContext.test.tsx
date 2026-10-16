@@ -221,6 +221,15 @@ describe("OverlayPreferencesProvider", () => {
       await waitFor(() => expect(screen.getByTestId("nd").textContent).toBe("false"));
     });
 
+    it("marks the page root with the design so scoped styles follow the switch", async () => {
+      getUIPreferences.mockResolvedValue({ session_overlay: {}, classic_layout: true });
+      const { unmount } = mount();
+      expect(document.documentElement.dataset.design).toBe("new");
+      await waitFor(() => expect(document.documentElement.dataset.design).toBe("classic"));
+      unmount();
+      expect(document.documentElement.dataset.design).toBeUndefined();
+    });
+
     it("starts from this device's mirror so a classic user sees no flip", () => {
       localStorage.setItem("quasar.ui.classic.u1", "1");
       getUIPreferences.mockReturnValue(new Promise(() => {}));
