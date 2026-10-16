@@ -1,6 +1,10 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { OverlayPreferencesProvider, useOverlayPreferences } from "./OverlayPreferencesContext";
+import {
+  OverlayPreferencesProvider,
+  useNewDesign,
+  useOverlayPreferences,
+} from "./OverlayPreferencesContext";
 import { DEFAULT_OVERLAY_PREFERENCES } from "./overlayPreferences";
 
 const getUIPreferences = vi.fn();
@@ -185,5 +189,43 @@ describe("OverlayPreferencesProvider", () => {
       </OverlayPreferencesProvider>,
     );
     expect(screen.getByTestId("pos").textContent).toBe("top");
+  });
+
+  describe("useNewDesign", () => {
+    function Design() {
+      return <span data-testid="nd">{String(useNewDesign())}</span>;
+    }
+    const mount = () =>
+      render(
+        <OverlayPreferencesProvider>
+          <Design />
+        </OverlayPreferencesProvider>,
+      );
+
+    it("is the new design by default, before and after the load", async () => {
+      getUIPreferences.mockResolvedValue({ session_overlay: {} });
+      mount();
+      expect(screen.getByTestId("nd").textContent).toBe("true");
+      await waitFor(() => expect(getUIPreferences).toHaveBeenCalled());
+      expect(screen.getByTestId("nd").textContent).toBe("true");
+    });
+
+    it("is the new design outside a provider", () => {
+      render(<Design />);
+      expect(screen.getByTestId("nd").textContent).toBe("true");
+    });
+
+    it("reads classic_layout: true from the server", async () => {
+      getUIPreferences.mockResolvedValue({ session_overlay: {}, classic_layout: true });
+      mount();
+      await waitFor(() => expect(screen.getByTestId("nd").textContent).toBe("false"));
+    });
+
+    it("starts from this device's mirror so a classic user sees no flip", () => {
+      localStorage.setItem("quasar.ui.classic.u1", "1");
+      getUIPreferences.mockReturnValue(new Promise(() => {}));
+      mount();
+      expect(screen.getByTestId("nd").textContent).toBe("false");
+    });
   });
 });

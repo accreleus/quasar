@@ -39,6 +39,7 @@ export const ACCOUNT_TABS: Record<AccountSectionKey, SectionTab[]> = {
   prefs: [
     { id: "overlay", label: "In-session overlay", to: "/app/account/overlay" },
     { id: "streaming", label: "Stream quality", to: "/app/account/streaming" },
+    { id: "appearance", label: "Appearance", to: "/app/account/appearance" },
   ],
   usage: [
     { id: "storage", label: "Storage", to: "/app/account/storage" },

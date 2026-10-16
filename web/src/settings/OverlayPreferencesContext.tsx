@@ -27,6 +27,12 @@ interface OverlayPreferencesValue {
   loaded: boolean;
   save: (next: SessionOverlayPreferences) => Promise<void>;
   error: string | null;
+  /** The user opted back into the previous layout (`classic_layout`). Read it
+   *  through `useNewDesign()`, not directly. */
+  classicLayout: boolean;
+  /** Optimistic; on a failed PATCH it reverts and REJECTS, so the caller can
+   *  show its own toast. */
+  setClassicLayout: (next: boolean) => Promise<void>;
 }
 
 const Ctx = createContext<OverlayPreferencesValue | null>(null);
@@ -46,6 +52,29 @@ function readCache(userId: string | undefined): SessionOverlayPreferences {
   }
 }
 
+// Same mirror idea for the layout choice, kept apart from the overlay entry so
+// the overlay cache stays exactly the wire shape it was.
+const classicKey = (userId: string | undefined) => (userId ? `quasar.ui.classic.${userId}` : null);
+
+function readClassicCache(userId: string | undefined): boolean {
+  const key = classicKey(userId);
+  try {
+    return key !== null && localStorage.getItem(key) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeClassicCache(userId: string | undefined, classic: boolean): void {
+  const key = classicKey(userId);
+  if (!key) return;
+  try {
+    localStorage.setItem(key, classic ? "1" : "0");
+  } catch {
+    // Same as writeCache: an optimisation, nothing to report.
+  }
+}
+
 function writeCache(userId: string | undefined, prefs: SessionOverlayPreferences): void {
   const key = cacheKey(userId);
   if (!key) return;
@@ -61,6 +90,14 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
   const { token, user } = useAuth();
   const [prefs, setPrefs] = useState<SessionOverlayPreferences>(() => readCache(user?.id));
   const [loaded, setLoaded] = useState(false);
+  // Load-time behaviour: the new design is the default, so before the server
+  // answers we render whatever this device last saw for this user (mirror),
+  // else the new design. A user who has never chosen classic therefore never
+  // sees the classic UI flash in. A classic user sees no flip on a device that
+  // has already loaded once; on their very first load on a new device the new
+  // design shows until the answer arrives, then it switches to classic.
+  const [classicLayout, setClassicState] = useState(() => readClassicCache(user?.id));
+  const classicRef = useRef(classicLayout);
   const [error, setError] = useState<string | null>(null);
 
   // Mirrors `prefs`, but updated SYNCHRONOUSLY at the call site of every
@@ -89,6 +126,9 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
         const next = fromWire(wire.session_overlay);
         applyPrefs(next);
         writeCache(user?.id, next);
+        classicRef.current = wire.classic_layout === true;
+        setClassicState(classicRef.current);
+        writeClassicCache(user?.id, classicRef.current);
       } catch {
         // Keep whatever the cache gave us. A preferences read failing must not
         // block the library or a live session.
@@ -125,7 +165,34 @@ export function OverlayPreferencesProvider({ children }: { children: ReactNode }
     [token, user?.id, applyPrefs],
   );
 
-  return <Ctx.Provider value={{ prefs, loaded, save, error }}>{children}</Ctx.Provider>;
+  const setClassicLayout = useCallback(
+    async (next: boolean) => {
+      if (!token) return;
+      const previous = classicRef.current;
+      classicRef.current = next;
+      setClassicState(next);
+      writeClassicCache(user?.id, next);
+      try {
+        // Only this key: the server merges at the top level, so session_overlay
+        // and any other key are left alone.
+        await patchUIPreferences(token, { classic_layout: next });
+      } catch (e: unknown) {
+        if (classicRef.current === next) {
+          classicRef.current = previous;
+          setClassicState(previous);
+          writeClassicCache(user?.id, previous);
+        }
+        throw e;
+      }
+    },
+    [token, user?.id],
+  );
+
+  return (
+    <Ctx.Provider value={{ prefs, loaded, save, error, classicLayout, setClassicLayout }}>
+      {children}
+    </Ctx.Provider>
+  );
 }
 
 /** Outside a provider this returns defaults rather than throwing: the overlay
@@ -139,7 +206,16 @@ export function useOverlayPreferences(): OverlayPreferencesValue {
     loaded: true,
     save: async () => {},
     error: null,
+    classicLayout: false,
+    setClassicLayout: async () => {},
   };
+}
+
+/** True when the redesigned library, game page and account pages should render
+ *  (the default); false when the user chose "Classic layout". Outside the
+ *  provider (signed-out pages, admin, bare test harnesses) it is true. */
+export function useNewDesign(): boolean {
+  return !useOverlayPreferences().classicLayout;
 }
 
 /** Layout-route wrapper: mounts the provider once for every authenticated

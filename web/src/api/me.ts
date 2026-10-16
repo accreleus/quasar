@@ -9,7 +9,13 @@ import { apiFetch } from "./client";
 import type { components } from "./schema";
 
 export type SessionOverlayWire = components["schemas"]["SessionOverlayPreferences"];
-export type UIPreferencesWire = components["schemas"]["UIPreferences"];
+/** `classic_layout` is a top-level key outside the generated schema: the server
+ *  preserves unrecognised top-level keys verbatim (control-api.md
+ *  §GET / PATCH /v1/me/ui-preferences), so it needs no contract change.
+ *  `true` = the user opted back into the previous layout; absent = new design. */
+export type UIPreferencesWire = components["schemas"]["UIPreferences"] & {
+  classic_layout?: boolean;
+};
 
 /** `GET /v1/me/ui-preferences` — the caller's own preferences. Never another user's. */
 export function getUIPreferences(token: string): Promise<UIPreferencesWire> {

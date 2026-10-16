@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **Account ▸ Preferences ▸ Appearance has a Classic layout switch (#714).** Off by default. It is the switch for the redesigned library, game page and account pages, which arrive in following changes; turning it on keeps the previous layout. The choice is saved with your account, so it follows you to every device. Nothing changes on screen yet.
+
 ### Changed
 - **The media host check now fails on a picture whose pixels were moved, not only on one whose colours were damaged (#289).** `media_probe_gpu<N>` used to encode a black field, on which a displaced block looks the same as the block it replaced. The compositor now has a test picture, a fixed grid of four colours shown only while no app is on screen, and the check compares its own decoded output with it. Nothing to configure: the check id, what it blocks and its wording are unchanged, and a session never shows the picture.
 - **The compositor pin carries follow-ups to the #267 and #570 fixes (#575).** The gst-wayland-display fork pin moves `69438183` → `5910a1ac`. A test now fails on any Vulkan device table built the way that caused the #267 crash, the loader race test says whether it ran, and the EGL display handle kept for #570 is checked to be `Send` at compile time. Keeping the EGL display for the life of the agent was tried and dropped: on the NVIDIA lab host the next session found it terminated and failed to start.

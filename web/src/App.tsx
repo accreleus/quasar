@@ -28,6 +28,7 @@ import { AccountProfile } from "./pages/app/account/AccountProfile";
 import { AccountDevices } from "./pages/app/account/AccountDevices";
 import { AccountSessions } from "./pages/app/account/AccountSessions";
 import { AccountStreaming } from "./pages/app/account/AccountStreaming";
+import { AccountAppearance } from "./pages/app/account/AccountAppearance";
 import { AppHomeNext } from "./pages/app/AppHomeNext";
 import { AppLayout } from "./pages/app/AppLayout";
 import { AccountStorage } from "./pages/app/account/AccountStorage";
@@ -221,6 +222,7 @@ export function App() {
           <Route element={<PreferencesSection />}>
             <Route path="overlay" element={<AccountOverlay />} />
             <Route path="streaming" element={<AccountStreaming />} />
+            <Route path="appearance" element={<AccountAppearance />} />
           </Route>
           <Route element={<UsageSection />}>
             <Route path="storage" element={<AccountStorage />} />
