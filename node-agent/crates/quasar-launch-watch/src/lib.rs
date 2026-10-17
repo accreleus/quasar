@@ -38,7 +38,11 @@ const MAX_LOG_LINE_BYTES: usize = 64 * 1024;
 const USER_WAIT: Duration = Duration::from_secs(2);
 /// Waits that never need the user: the first two always continued at once (#723), and the
 /// shader cache clears itself (up to 17.4 s measured).
-const ROUTINE_WAITS: [&str; 3] = ["CreatingProcess", "ShowInterstitials", "ProcessingShaderCache"];
+const ROUTINE_WAITS: [&str; 3] = [
+    "CreatingProcess",
+    "ShowInterstitials",
+    "ProcessingShaderCache",
+];
 
 /// Mirrors agent-api `session_metrics.app_launch_state`; serialises to the same strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

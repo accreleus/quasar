@@ -2808,7 +2808,12 @@ pub fn run_blocking(
                 // Only gen 0's tile waits: after a swap its helper reports nothing.
                 let held = res.launch().filter(|_| gen == 0 && !reveal_cap.is_zero());
                 if app_drawn_at.is_none()
-                    && gen0_app_presented(true, commits, frames, &mut app_boot_frames_at_first_commit)
+                    && gen0_app_presented(
+                        true,
+                        commits,
+                        frames,
+                        &mut app_boot_frames_at_first_commit,
+                    )
                 {
                     app_drawn_at = Some(Instant::now());
                     if held.is_some() {
