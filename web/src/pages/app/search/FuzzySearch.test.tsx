@@ -65,7 +65,10 @@ describe("FuzzySearch icon", () => {
     try {
       render(<Box onChoose={vi.fn()} />);
       fireEvent.change(screen.getByRole("combobox"), { target: { value: "portl" } });
-      expect(screen.getByRole("option", { name: "Portal 2" }).querySelector("img")).toHaveAttribute("src", `${icon}?w=96`);
+      const img = screen.getByRole("option", { name: "Portal 2" }).querySelector("img");
+      expect(img).toHaveAttribute("src", `${icon}?w=96`);
+      expect(img).toHaveAttribute("sizes", "36px");
+      expect(img).toHaveAttribute("srcset", expect.stringContaining(`${icon}?w=320 320w`));
     } finally {
       extras.map = null;
     }

@@ -42,6 +42,17 @@ describe("GamesPane", () => {
     expect(screen.getByRole("button", { name: /Bench: Ball/ })).toHaveProperty("disabled", true);
   });
 
+  it("asks for the 320 px cover, with a srcset for the rail's 172 px tile", async () => {
+    const cover = `/v1/artwork/${"b".repeat(64)}.jpg`;
+    listApps.mockResolvedValue({ items: [{ id: "a2", name: "Purple App", cover_url: cover }] });
+    render(<GamesPane sessionId="s1" currentAppId="a1" swapPending={false} onSwapStart={vi.fn()} onSwapRejected={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("Purple App")).toBeTruthy());
+    const img = document.querySelector<HTMLImageElement>(".qs .cv img");
+    expect(img).toHaveAttribute("src", `${cover}?w=320`);
+    expect(img).toHaveAttribute("sizes", "172px");
+    expect(img).toHaveAttribute("srcset", expect.stringContaining(`${cover}?w=480 480w`));
+  });
+
   // This component's job stops at the REQUEST now (see the file header):
   // onSwapStart fires the instant a tile is clicked, carrying the id AND name
   // of the app the user asked for — before the request is even sent, and
