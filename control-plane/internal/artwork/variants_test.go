@@ -2,10 +2,12 @@ package artwork
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -565,6 +567,363 @@ func TestPruneOrphansRemovesVariants(t *testing.T) {
 	}
 	if _, err := os.Stat(stray); !os.IsNotExist(err) {
 		t.Error("an orphan variant survived")
+	}
+}
+
+// --- #713: EXIF orientation -------------------------------------------------
+
+// appSegment is one JPEG APPn segment: marker, declared length, payload.
+func appSegment(marker byte, payload []byte) []byte {
+	seg := []byte{0xFF, marker, byte((len(payload) + 2) >> 8), byte((len(payload) + 2) & 0xFF)}
+	return append(seg, payload...)
+}
+
+// jpegWithSegments encodes img as a JPEG and splices one segment per payload,
+// all carrying marker, right after SOI — the position a real camera file's
+// Exif and profile segments hold.
+func jpegWithSegments(t *testing.T, marker byte, img image.Image, payloads [][]byte) []byte {
+	t.Helper()
+	var base bytes.Buffer
+	if err := jpeg.Encode(&base, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	out := []byte{0xFF, 0xD8}
+	for _, p := range payloads {
+		if len(p)+2 > 0xFFFF {
+			t.Fatal("the test segment does not fit a length word")
+		}
+		out = append(out, appSegment(marker, p)...)
+	}
+	return append(out, base.Bytes()[2:]...)
+}
+
+// exifPayload is a well-formed Exif APP1 payload for the given orientation:
+// the segment id, the alignment pad, and a little-endian TIFF header holding
+// one IFD0 entry.
+func exifPayload(o uint16) []byte {
+	tiff := []byte{
+		'I', 'I', 42, 0, // byte order and magic
+		8, 0, 0, 0, // IFD0 starts right after the header
+		1, 0, // one entry
+		0x12, 0x01, 3, 0, 1, 0, 0, 0, // tag 0x0112, SHORT, one value
+		byte(o), byte(o >> 8), 0, 0,
+		0, 0, 0, 0, // no next IFD
+	}
+	return append([]byte("Exif\x00\x00\x00"), tiff...)
+}
+
+// TestJpegOrientation pins the parser itself: the eight values, the shapes
+// that must fall back to 1, and finding the Exif segment behind another APP1.
+func TestJpegOrientation(t *testing.T) {
+	// A big-endian TIFF holding orientation o.
+	mm := func(o uint16) []byte {
+		tiff := []byte{'M', 'M', 0, 42, 0, 0, 0, 8, 0, 1,
+			0x01, 0x12, 0, 3, 0, 0, 0, 1, byte(o >> 8), byte(o), 0, 0, 0, 0, 0, 0}
+		return append([]byte("Exif\x00\x00\x00"), tiff...)
+	}
+	wrap := func(payload ...[]byte) []byte {
+		out := []byte{0xFF, 0xD8}
+		for _, p := range payload {
+			out = append(out, appSegment(0xE1, p)...)
+		}
+		return append(out, onePixelJPEG[2:]...)
+	}
+	for name, c := range map[string]struct {
+		raw  []byte
+		want int
+	}{
+		"empty":                 {nil, 1},
+		"not a jpeg":            {[]byte("RIFF\x00\x00\x00\x00WEBPVP8 "), 1},
+		"orientation 1":         {wrap(exifPayload(1)), 1},
+		"orientation 6":         {wrap(exifPayload(6)), 6},
+		"orientation 8, MM":     {wrap(mm(8)), 8},
+		"after a jfif segment":  {wrap(append(append([]byte{}, []byte("JFIF\x00x")...), 0), exifPayload(2)), 2},
+		"behind a foreign APP1": {wrap([]byte("http://ns.adobe.com/xap"), exifPayload(4)), 4},
+		"bad byte order":        {wrap([]byte("Exif\x00\x00\x00XX\x2a\x00\x08\x00\x00\x00\x01\x00")), 1},
+		"header alone":          {wrap([]byte("Exif\x00\x00\x00" + "II\x2a\x00\x08\x00\x00\x00")), 1},
+		"ifd offset off the end": {wrap([]byte("Exif\x00\x00\x00" +
+			"II\x2a\x00\xff\xff\x00\x00\x01\x00")), 1},
+		"count over the data": {wrap([]byte("Exif\x00\x00\x00" +
+			"II\x2a\x00\x08\x00\x00\x00\x05\x00\x00\x00\x00\x00")), 1},
+		"other tags only": {wrap([]byte("Exif\x00\x00\x00" +
+			"II\x2a\x00\x08\x00\x00\x00\x01\x00\x99\x01\x03\x00\x01\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00")), 1},
+		"orientation 0": {wrap(exifPayload(0)), 1},
+		"orientation 9": {wrap(exifPayload(9)), 1},
+	} {
+		if got := jpegOrientation(c.raw); got != c.want {
+			t.Errorf("%s: jpegOrientation = %d, want %d", name, got, c.want)
+		}
+	}
+}
+
+// Orientation 1, and any value the tag cannot carry, mean the pixels are
+// already upright: oriented must answer the very image it was given, not a
+// copy of it.
+func TestOrientedLeavesAlreadyUprightPixelsAlone(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 3, 2))
+	for i := range src.Pix {
+		src.Pix[i] = uint8(i*37 + 11)
+	}
+	for _, o := range []int{-1, 0, 1, 9, 12} {
+		if got := oriented(src, o); got != src {
+			t.Errorf("orientation %d: the pixels were copied", o)
+		}
+	}
+	// And a moving orientation still transforms: 4 mirrors vertically.
+	if got := oriented(src, 4); got == src || got.At(0, 0) != src.At(0, 1) {
+		t.Error("orientation 4: the mirror did not run")
+	}
+}
+
+// bands is an opaque image whose left third is light and the rest dark, so an
+// uprightness check survives the JPEG encoder's lossy 4:2:0 subsampling: it
+// only moves chroma.
+func bands(w, h int) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for x := 0; x < w; x++ {
+		v := uint8(30)
+		if x < w/3 {
+			v = 220
+		}
+		for y := 0; y < h; y++ {
+			img.SetNRGBA(x, y, color.NRGBA{v, v, v, 255})
+		}
+	}
+	return img
+}
+
+// A source whose EXIF says it is stored sideways comes out upright, rotated
+// first, and the copy is sized against the rotated shape.
+func TestOpenVariantAppliesEXIFOrientation(t *testing.T) {
+	b := newBlobs(t)
+	raw := jpegWithSegments(t, 0xE1, bands(600, 900), [][]byte{exifPayload(6)})
+	name, err := b.Put("image/jpeg", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, ct, immutable, err := b.OpenVariant(t.Context(), name, "320")
+	if err != nil || ct != "image/jpeg" || !immutable {
+		t.Fatalf("want the JPEG copy, immutable, got %s, %v, %v", ct, immutable, err)
+	}
+	// coverScale reads 900x600 rotated, so the copy is 720x480 and covers
+	// 320x480 — not the unrotated 320x480 that would still fit but show tall.
+	if w, h := decodeSize(t, data); w != 720 || h != 480 {
+		t.Fatalf("size: want 720x480 upright and swapped, got %dx%d", w, h)
+	}
+	// Row y of the upright copy comes from column y of the stored pixels, so
+	// the light third lands at the top instead of the left.
+	src, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("decode copy: %v", err)
+	}
+	if r, _, _, _ := src.At(300, 150).RGBA(); r>>8 < 205 { // 220 minus encoder slop
+		t.Errorf("the copy is not upright: pixel (300,150) is %d", r>>8)
+	}
+	if r, _, _, _ := src.At(300, 450).RGBA(); r>>8 > 45 { // 30 plus encoder slop
+		t.Errorf("the copy is rotated twice: pixel (300,450) is %d", r>>8)
+	}
+	// The EXIF segment must NOT travel with the copy: its orientation would
+	// rotate the already-upright pixels a second time.
+	if bytes.Contains(data, []byte("Exif")) {
+		t.Error("the copy carries the source's EXIF segment")
+	}
+}
+
+// A malformed EXIF segment means orientation 1: the copy is sized and made as
+// if the image were stored upright, never an error and never a panic.
+func TestOpenVariantTreatsMalformedEXIFAsNormal(t *testing.T) {
+	b := newBlobs(t)
+	raw := jpegWithSegments(t, 0xE1, gradient(600, 900, 255), [][]byte{exifPayload(9)}) // 9 is out of range
+	name, err := b.Put("image/jpeg", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, ct, _, err := b.OpenVariant(t.Context(), name, "320"); err != nil || ct != "image/jpeg" {
+		t.Fatalf("want the JPEG copy, got %s, %v", ct, err)
+	} else if w, h := decodeSize(t, data); w != 320 || h != 480 {
+		t.Errorf("size: the copy followed a broken orientation tag: %dx%d", w, h)
+	}
+}
+
+// --- #713: colour profiles --------------------------------------------------
+
+// TestOpenVariantCarriesTheJPEGColourProfile: a profile the source split
+// across two APP2 segments travels with the copy, raw, and the copy decodes.
+func TestOpenVariantCarriesTheJPEGColourProfile(t *testing.T) {
+	b := newBlobs(t)
+	profile := make([]byte, 3072) // two segments' worth
+	for i := range profile {
+		profile[i] = byte(i * 7)
+	}
+	copy(profile[16:20], "RGB ") // the header's data colour space
+	id := []byte(iccProfileTag)
+	raw := jpegWithSegments(t, 0xE2, gradient(600, 900, 255), [][]byte{
+		append(append(append([]byte{}, id...), 1, 2), profile[:2048]...),
+		append(append(append([]byte{}, id...), 2, 2), profile[2048:]...),
+	})
+	name, err := b.Put("image/jpeg", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, ct, _, err := b.OpenVariant(t.Context(), name, "320")
+	if err != nil || ct != "image/jpeg" {
+		t.Fatalf("want the JPEG copy, got %s, %v", ct, err)
+	}
+	var chunks []byte
+	walkJPEGHead(data, func(marker byte, seg []byte) bool {
+		if marker == 0xE2 && bytes.HasPrefix(seg[4:], id) {
+			chunks = append(chunks, seg[4+14:]...) // past ICC_PROFILE\0 and seq/count
+		}
+		return true
+	})
+	if !bytes.Equal(chunks, profile) {
+		t.Errorf("the copy does not carry the profile: %d of %d bytes", len(chunks), len(profile))
+	}
+	if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
+		t.Fatalf("the copy with a profile does not decode: %v", err)
+	}
+}
+
+// pngWithICC returns img encoded as a PNG with an iCCP chunk carrying
+// profile (compressed, as the chunk format demands) inserted after IHDR.
+func pngWithICC(t *testing.T, img image.Image, profile []byte) []byte {
+	t.Helper()
+	var z bytes.Buffer
+	zw := zlib.NewWriter(&z)
+	if _, err := zw.Write(profile); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data := append([]byte("ICC\x00\x00"), z.Bytes()...)
+	base := encodePNG(t, img)
+	chunk := make([]byte, 12+len(data))
+	binary.BigEndian.PutUint32(chunk[:4], uint32(len(data)))
+	copy(chunk[4:8], "iCCP")
+	copy(chunk[8:], data)
+	binary.BigEndian.PutUint32(chunk[8+len(data):], crc32.ChecksumIEEE(chunk[4:8+len(data)]))
+	out := append([]byte{}, base[:33]...) // signature plus the 13-byte IHDR chunk
+	return append(append(out, chunk...), base[33:]...)
+}
+
+// An opaque PNG source that carries a profile keeps PNG output — the profile
+// needs a chunk to live in — and the chunk travels with the copy raw.
+func TestOpenVariantCarriesThePNGColourProfile(t *testing.T) {
+	b := newBlobs(t)
+	profile := make([]byte, 1024)
+	for i := range profile {
+		profile[i] = byte(i * 13)
+	}
+	copy(profile[16:20], "RGB ") // the header's data colour space
+	raw := pngWithICC(t, gradient(600, 900, 255), profile)
+	name, err := b.Put("image/png", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, ct, _, err := b.OpenVariant(t.Context(), name, "96")
+	if err != nil || ct != "image/png" {
+		t.Fatalf("want the PNG copy, got %s, %v", ct, err)
+	}
+	if chunk := iccPNGChunk(data); !bytes.Equal(chunk, iccPNGChunk(raw)) {
+		t.Errorf("the copy does not carry the source's profile: %d vs %d bytes",
+			len(iccPNGChunk(data)), len(iccPNGChunk(raw)))
+	}
+	if _, err := png.Decode(bytes.NewReader(data)); err != nil {
+		t.Fatalf("the copy with a profile does not decode: %v", err)
+	}
+}
+
+// A profile whose data colour space is not RGB does not travel. A copy holds
+// RGBA pixels whatever the source decoded to, so a CMYK or GRAY header would
+// mis-describe the data it rides with; the source is copied with no profile
+// at all, exactly as before profiles travelled — an opaque PNG goes to JPEG
+// again, one with transparency stays PNG.
+func TestOpenVariantDropsANonRGBColourProfile(t *testing.T) {
+	b := newBlobs(t)
+
+	// A JPEG whose profile declares CMYK: the copy is still JPEG, without the
+	// APP2 segments.
+	jpegProfile := make([]byte, 128)
+	copy(jpegProfile[16:20], "CMYK")
+	jraw := jpegWithSegments(t, 0xE2, gradient(600, 900, 255), [][]byte{
+		append(append(append([]byte{}, iccProfileTag...), 1, 1), jpegProfile...)})
+	jname, err := b.Put("image/jpeg", jraw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, ct, _, err := b.OpenVariant(t.Context(), jname, "320")
+	if err != nil || ct != "image/jpeg" {
+		t.Fatalf("want the JPEG copy, got %s, %v", ct, err)
+	}
+	id := []byte(iccProfileTag)
+	walkJPEGHead(data, func(marker byte, seg []byte) bool {
+		if marker == 0xE2 && bytes.HasPrefix(seg[4:], id) {
+			t.Error("the copy carries the source's CMYK profile")
+			return false
+		}
+		return true
+	})
+	if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
+		t.Fatalf("the copy without a profile does not decode: %v", err)
+	}
+
+	// A grayscale-tagged profile on a PNG: the copy carries no chunk, and the
+	// opaque one loses the stay-PNG rule along with the profile.
+	pngProfile := make([]byte, 128)
+	copy(pngProfile[16:20], "GRAY")
+	for name, tc := range map[string]struct {
+		raw  []byte
+		want string
+	}{
+		"opaque png":            {pngWithICC(t, gradient(600, 900, 255), pngProfile), "image/jpeg"},
+		"png with transparency": {pngWithICC(t, gradient(600, 900, 128), pngProfile), "image/png"},
+	} {
+		pname, err := b.Put("image/png", tc.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, ct, _, err := b.OpenVariant(t.Context(), pname, "320")
+		if err != nil || ct != tc.want {
+			t.Errorf("%s: want a %s copy, got %s, %v", name, tc.want, ct, err)
+			continue
+		}
+		if iccPNGChunk(data) != nil {
+			t.Errorf("%s: the copy carries the source's GRAY profile", name)
+		}
+	}
+}
+
+// --- #734: the resize's source check ----------------------------------------
+
+// A stat error other than not-exist keeps the cached copy: only a definite
+// "source gone" may remove one.
+func TestResizeKeepsTheCopyWhenTheSourceCannotBeChecked(t *testing.T) {
+	b := newBlobs(t)
+	name, err := b.Put("image/png", encodePNG(t, gradient(600, 900, 255)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasBlob = func(*BlobStore, string) (bool, error) { return false, errors.New("stat broke") }
+	t.Cleanup(func() { hasBlob = (*BlobStore).Has })
+	if _, _, immutable, err := b.OpenVariant(t.Context(), name, "96"); err != nil || !immutable {
+		t.Fatalf("want the copy served anyway, immutable, got %v, %v", immutable, err)
+	}
+	if _, err := os.Stat(b.variantPath(name, "96", "jpg")); err != nil {
+		t.Fatalf("the copy was not kept after a stat error: %v", err)
+	}
+
+	// A definite "source gone" removes the file and answers not-exist. Drop
+	// the cached copy first so the resize (and with it the check) happens.
+	hasBlob = func(*BlobStore, string) (bool, error) { return false, nil }
+	if err := os.Remove(b.variantPath(name, "96", "jpg")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := b.OpenVariant(t.Context(), name, "96"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("want not-exist when the source is gone, got %v", err)
+	}
+	if _, err := os.Stat(b.variantPath(name, "96", "jpg")); !os.IsNotExist(err) {
+		t.Errorf("a removed source's copy survived: %v", err)
 	}
 }
 
