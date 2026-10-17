@@ -284,7 +284,7 @@ export function TileRow({ apps, coverClassById, label }: { apps: App[]; coverCla
                   className="cover-img"
                   src={sizedArt(a.cover_url, 320)}
                   srcSet={artSrcSet(a.cover_url)}
-                  sizes="160px" /* .gp-tiles minmax(140px, 1fr) */
+                  sizes="(max-width: 900px) 160px, 172px" /* widest .gp-tiles track (game.css): 156 phone, 172 desktop */
                   alt=""
                   loading="lazy"
                   decoding="async"
