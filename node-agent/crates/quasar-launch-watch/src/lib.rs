@@ -15,7 +15,8 @@
 //! - `console_log.txt` in Steam's log directory, read incrementally from the
 //!   end of whatever a previous session left behind — the second source,
 //!   which may move the state earlier than the reaper and may end it when
-//!   the reaper scan is unreadable;
+//!   the reaper scan is unreadable; `steamui_login.txt` beside it says when
+//!   Steam waits for a sign-in;
 //! - a caller-supplied window list and gamescope's published focus,
 //!   classified here; the core makes no X11 call. "Game window on screen" is
 //!   that focus (`GAMESCOPE_FOCUSED_APP` == the appid, amendment 1 from the
@@ -24,13 +25,25 @@
 //!   never read (it stays 0 on Linux).
 
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 // Bounds on input the game (same user, same container) controls.
 const MAX_CMDLINE_BYTES: u64 = 4 * 1024;
 const MAX_LOG_BYTES_PER_PASS: u64 = 1024 * 1024;
 const MAX_LOG_LINE_BYTES: usize = 64 * 1024;
+
+/// A `waiting for user response` means Steam needs the user only when no next task follows
+/// within this. Measured by the #723 spike: routine waits continued within 0.11 s (70/70).
+const USER_WAIT: Duration = Duration::from_secs(2);
+/// Waits that never need the user: the first two always continued at once (#723), and the
+/// shader cache clears itself (up to 17.4 s measured).
+const ROUTINE_WAITS: [&str; 3] = [
+    "CreatingProcess",
+    "ShowInterstitials",
+    "ProcessingShaderCache",
+];
 
 /// Mirrors agent-api `session_metrics.app_launch_state`; serialises to the same strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -114,9 +127,10 @@ pub struct Watcher {
     log_seen: bool,
     log_pending: Vec<u8>,
     log_game: Option<bool>,
-    log_waiting_needs: Option<NeedsUser>,
-    log_waiting_fresh: bool,
+    /// A wait for the user read from the log, and when it was read.
+    log_waiting: Option<(NeedsUser, Instant)>,
     log_discarding: bool,
+    login: LoginLog,
     running_via_reaper: bool,
     last_game_window: bool,
     active_needs: Option<NeedsUser>,
@@ -134,9 +148,9 @@ impl Watcher {
             log_seen: false,
             log_pending: Vec::new(),
             log_game: None,
-            log_waiting_needs: None,
-            log_waiting_fresh: false,
+            log_waiting: None,
             log_discarding: false,
+            login: LoginLog::default(),
             running_via_reaper: false,
             last_game_window: false,
             active_needs: None,
@@ -159,6 +173,7 @@ impl Watcher {
             self.running_via_reaper = true;
         }
         self.read_log_tail();
+        self.read_login_state();
 
         let next = self.next_launch_state(&scan);
         if next != self.state {
@@ -198,17 +213,58 @@ impl Watcher {
             }
         }
 
-        // A wait read this pass only becomes reportable if it is still in
-        // force on a later poll (see parse_log_line).
-        self.log_waiting_fresh = false;
         reports
     }
 
     fn held_log_needs(&self) -> Option<NeedsUser> {
-        if self.log_waiting_fresh {
-            None
-        } else {
-            self.log_waiting_needs
+        let wait = self
+            .log_waiting
+            .filter(|(_, since)| since.elapsed() >= USER_WAIT)
+            .map(|(reason, _)| reason);
+        [wait, self.login.needs]
+            .into_iter()
+            .flatten()
+            .min_by_key(|reason| needs_rank(*reason))
+    }
+
+    /// Steam waiting for credentials is its sign-in screen, which under Big Picture has no
+    /// window of its own; any later login state clears it. #723: 75 of 76 signed-out starts
+    /// logged `SetLoginState: WaitingForCredentials`, none of 38 signed-in ones. Started at
+    /// the first poll's end like `console_log.txt`; a rotated tail is not chased.
+    fn read_login_state(&mut self) {
+        let path = self.cfg.steam_log_dir.join("steamui_login.txt");
+        let metadata = std::fs::metadata(&path);
+        if !self.login.seen {
+            self.login.seen = true;
+            if let Ok(seen) = &metadata {
+                self.login.file_id = Some(seen.ino());
+                self.login.offset = seen.len();
+            }
+            return;
+        }
+        let Ok(metadata) = metadata else {
+            return;
+        };
+        if self.login.file_id != Some(metadata.ino()) || metadata.len() < self.login.offset {
+            self.login.file_id = Some(metadata.ino());
+            self.login.offset = 0;
+        }
+        let Some(bytes) = read_slice(&path, self.login.offset) else {
+            return;
+        };
+        // Whole lines only: a partial one is read again next pass, unless it fills the slice.
+        let end = match bytes.iter().rposition(|b| *b == b'\n') {
+            Some(newline) => newline + 1,
+            None if bytes.len() as u64 == MAX_LOG_BYTES_PER_PASS => bytes.len(),
+            None => return,
+        };
+        self.login.offset += end as u64;
+        for line in String::from_utf8_lossy(&bytes[..end]).lines() {
+            if let Some(at) = line.find("SetLoginState: ") {
+                self.login.needs = line[at + "SetLoginState: ".len()..]
+                    .starts_with("WaitingForCredentials")
+                    .then_some(NeedsUser::SignIn);
+            }
         }
     }
 
@@ -261,6 +317,7 @@ impl Watcher {
 
     fn read_log_tail(&mut self) {
         let path = self.cfg.steam_log_dir.join("console_log.txt");
+        let previous = self.cfg.steam_log_dir.join("console_log.txt.previous");
         let metadata = std::fs::metadata(&path);
 
         // Decided on the first poll, not the first sighting: the home
@@ -270,6 +327,9 @@ impl Watcher {
         // session's and is read from 0 (the inode check below sees
         // None != Some(new inode) and restarts it). Only a new file
         // (rotation) or a shorter one (truncation) restarts at 0 after that.
+        // Steam rotates by size to `console_log.txt.previous` (#723): the
+        // rest of the file being read is finished there first, keeping what
+        // was learnt from it.
         if !self.log_seen {
             self.log_seen = true;
             if let Ok(seen) = &metadata {
@@ -283,7 +343,22 @@ impl Watcher {
         };
         let file_id = metadata.ino();
         if self.log_file_id != Some(file_id) {
-            self.reset_log();
+            match std::fs::metadata(&previous) {
+                Ok(old) if self.log_file_id == Some(old.ino()) => {
+                    let unread = old.len() > self.log_offset;
+                    if unread && self.read_log_from(&previous) {
+                        return;
+                    }
+                    // A tail that cannot be read is abandoned, with what it might have
+                    // changed, so the new file is never held back behind it.
+                    if unread {
+                        self.reset_log();
+                    } else {
+                        self.restart_log();
+                    }
+                }
+                _ => self.reset_log(),
+            }
             self.log_file_id = Some(file_id);
         }
         if metadata.len() < self.log_offset {
@@ -292,22 +367,15 @@ impl Watcher {
         if metadata.len() == self.log_offset {
             return;
         }
+        self.read_log_from(&path);
+    }
 
-        let Ok(mut file) = std::fs::File::open(&path) else {
-            return;
+    /// One bounded slice of `path` from the current offset, parsed line by line; the rest
+    /// is read on the next pass. `false` when nothing could be read.
+    fn read_log_from(&mut self, path: &Path) -> bool {
+        let Some(bytes) = read_slice(path, self.log_offset).filter(|b| !b.is_empty()) else {
+            return false;
         };
-        if file.seek(SeekFrom::Start(self.log_offset)).is_err() {
-            return;
-        }
-        // A bounded slice per pass; the rest is read on the next pass.
-        let mut bytes = Vec::new();
-        if file
-            .take(MAX_LOG_BYTES_PER_PASS)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
-            return;
-        }
         self.log_offset += bytes.len() as u64;
         self.log_pending.extend_from_slice(&bytes);
 
@@ -334,14 +402,19 @@ impl Watcher {
             self.log_pending.clear();
             self.log_discarding = true;
         }
+        true
     }
 
+    /// A truncated or unknown file: what was learnt from the old one no longer holds.
     fn reset_log(&mut self) {
+        self.restart_log();
+        self.log_game = None;
+        self.log_waiting = None;
+    }
+
+    fn restart_log(&mut self) {
         self.log_offset = 0;
         self.log_pending.clear();
-        self.log_game = None;
-        self.log_waiting_needs = None;
-        self.log_waiting_fresh = false;
         self.log_discarding = false;
     }
 
@@ -355,13 +428,16 @@ impl Watcher {
         // their added/removed lines must neither start nor end it.
         let is_install_script =
             line.contains("Install=1") || line.to_lowercase().contains("iscriptevaluator");
+        // The game starting or going is the step after any wait for the user: it ends it.
         if line.contains("Game process added") {
             if !is_install_script && extract_appid(line) == Some(self.cfg.appid) {
                 self.log_game = Some(true);
+                self.log_waiting = None;
             }
         } else if line.contains("Game process removed") {
             if !is_install_script && extract_appid(line) == Some(self.cfg.appid) {
                 self.log_game = Some(false);
+                self.log_waiting = None;
             }
         } else if line.contains("GameAction") {
             if extract_appid(line) != Some(self.cfg.appid) {
@@ -375,26 +451,52 @@ impl Watcher {
                     .split_whitespace()
                     .next()
                     .unwrap_or("");
-                // CreatingProcess waits on every ordinary launch, so it is
-                // never armed. Any other wait is armed fresh: it is only
-                // reported if still in force on a later poll, because a
-                // wait+continue pair written together is routine too, while
-                // a real hold (a cloud conflict) survives a poll.
-                if task != "CreatingProcess" {
-                    self.log_waiting_needs = Some(if task == "SynchronizingCloud" {
+                // Reported only if no next task follows within USER_WAIT
+                // (held_log_needs); a routine wait is never armed.
+                self.log_waiting = (!ROUTINE_WAITS.contains(&task)).then(|| {
+                    let reason = if task == "SynchronizingCloud" {
                         NeedsUser::CloudConflict
                     } else {
                         NeedsUser::Other
-                    });
-                    self.log_waiting_fresh = true;
-                }
+                    };
+                    (reason, Instant::now())
+                });
             } else if line.contains("LaunchApp continues with user response")
                 || line.contains("LaunchApp changed task to")
             {
-                self.log_waiting_needs = None;
+                self.log_waiting = None;
             }
         }
     }
+}
+
+/// Up to [`MAX_LOG_BYTES_PER_PASS`] of `path` from `offset`, or `None` when it cannot be read
+/// or is not a regular file. Opened non-blocking: a fifo the game puts there must never
+/// stall a poll.
+fn read_slice(path: &Path, offset: u64) -> Option<Vec<u8>> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LOG_BYTES_PER_PASS)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
+/// Where `steamui_login.txt` is read from, and the sign-in its last state means.
+#[derive(Default)]
+struct LoginLog {
+    seen: bool,
+    file_id: Option<u64>,
+    offset: u64,
+    needs: Option<NeedsUser>,
 }
 
 fn extract_appid(line: &str) -> Option<u32> {

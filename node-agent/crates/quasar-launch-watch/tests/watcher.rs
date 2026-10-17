@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const APPID: u32 = 730;
+/// Past the core's two seconds for a wait for the user to stand.
+const PAST_USER_WAIT: std::time::Duration = std::time::Duration::from_millis(2100);
 const STEAM: &[&str] = &[
     "/home/gamer/.local/share/Steam/ubuntu12_64/steam",
     "-bigpicture",
@@ -98,12 +100,23 @@ impl Rig {
     }
 
     fn append_log(&self, line: &str) {
+        self.append("console_log.txt", &format!("{line}\n"));
+    }
+
+    fn append(&self, file: &str, text: &str) {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.log_path())
+            .open(self.log_dir.join(file))
             .unwrap();
-        writeln!(file, "{line}").unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn login_state(&self, state: &str) {
+        self.append(
+            "steamui_login.txt",
+            &format!("[2026-10-16 09:37:10] [ None ] SetLoginState: {state} - OK\n"),
+        );
     }
 }
 
@@ -286,8 +299,7 @@ fn fixture_console_log_drives_transitions_line_by_line() {
     rig.append_log(lines.next().unwrap());
     assert_eq!(rig.watcher.poll(), vec![]);
 
-    // A wait read and cleared between polls never reports (see the
-    // held-for-a-poll rule in waiting_for_user_response_reports_once_and_clears).
+    // A wait answered within two seconds never reports.
     rig.append_log(lines.next().unwrap());
     assert_eq!(rig.watcher.poll(), vec![]);
     rig.append_log(lines.next().unwrap());
@@ -692,11 +704,13 @@ fn waiting_for_user_response_reports_once_and_clears() {
         ]
     );
 
-    // Read on this poll: not yet reported. Still held on the next: reported.
+    // Not reported until no next task has followed for two seconds, then once.
     rig.append_log(&format!(
         "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
+    assert_eq!(rig.watcher.poll(), vec![]);
+    std::thread::sleep(PAST_USER_WAIT);
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::SteamNeedsUser(NeedsUser::CloudConflict)]
@@ -712,20 +726,7 @@ fn waiting_for_user_response_reports_once_and_clears() {
         "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SiteLicenseSeatCheckout \"\""
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
-    assert_eq!(
-        rig.watcher.poll(),
-        vec![Report::SteamNeedsUser(NeedsUser::Other)]
-    );
-
-    // Cleared by the next changed-task line for the app.
-    rig.append_log(&format!(
-        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to WaitingGameWindow"
-    ));
-    assert_eq!(rig.watcher.poll(), vec![]);
-    rig.append_log(&format!(
-        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SiteLicenseSeatCheckout \"\""
-    ));
-    assert_eq!(rig.watcher.poll(), vec![]);
+    std::thread::sleep(PAST_USER_WAIT);
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::SteamNeedsUser(NeedsUser::Other)]
@@ -733,22 +734,79 @@ fn waiting_for_user_response_reports_once_and_clears() {
 }
 
 #[test]
-fn creating_process_wait_alone_reports_nothing() {
+fn a_wait_answered_within_two_seconds_reports_nothing_across_polls() {
     let mut rig = Rig::new();
     write_proc(&rig.proc_root, 100, STEAM);
-    assert_eq!(
-        rig.watcher.poll(),
-        vec![
-            Report::LaunchState(LaunchState::Starting),
-            Report::LaunchState(LaunchState::ClientOnly),
-        ]
-    );
+    rig.watcher.poll();
 
     rig.append_log(&format!(
-        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to CreatingProcess \"\""
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
+    ));
+    for _ in 0..4 {
+        assert_eq!(rig.watcher.poll(), vec![]);
+    }
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to WaitingGameWindow"
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
+    std::thread::sleep(PAST_USER_WAIT);
     assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn the_game_starting_or_going_ends_a_wait_for_the_user() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    let wait = format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
+    );
+
+    rig.append_log(&wait);
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
+    ));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)]
+    );
+    std::thread::sleep(PAST_USER_WAIT);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![],
+        "the game starting ended the wait"
+    );
+    rig.append_log(&wait);
+    rig.append_log(&format!(
+        "Game process removed: AppID {APPID} \"game\", ProcID 201"
+    ));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameExited)]
+    );
+    std::thread::sleep(PAST_USER_WAIT);
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn routine_waits_never_report_however_long_they_stand() {
+    let mut rigs: Vec<Rig> = ["CreatingProcess", "ShowInterstitials", "ProcessingShaderCache"]
+        .into_iter()
+        .map(|task| {
+            let mut rig = Rig::new();
+            write_proc(&rig.proc_root, 100, STEAM);
+            rig.watcher.poll();
+            rig.append_log(&format!(
+                "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to {task} \"\""
+            ));
+            assert_eq!(rig.watcher.poll(), vec![], "{task}");
+            rig
+        })
+        .collect();
+    std::thread::sleep(PAST_USER_WAIT);
+    for rig in &mut rigs {
+        assert_eq!(rig.watcher.poll(), vec![]);
+    }
 }
 
 #[test]
@@ -871,6 +929,205 @@ fn rotation_is_read_from_zero() {
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::LaunchState(LaunchState::GameRunning)]
+    );
+}
+
+#[test]
+fn rotation_finishes_the_previous_file_from_its_offset_then_reads_the_new_one_from_zero() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    rig.append_log("GameAction [AppID 730, ActionID 1] : LaunchApp changed task to Completed");
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    // Written to the old file after the last pass, then Steam rotates it by size.
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
+    ));
+    let previous = rig.log_dir.join("console_log.txt.previous");
+    std::fs::rename(rig.log_path(), &previous).unwrap();
+    rig.append_log(&format!(
+        "Game process removed: AppID {APPID} \"game\", ProcID 201"
+    ));
+
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)],
+        "the old file's tail first"
+    );
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameExited)],
+        "then the new file from 0"
+    );
+}
+
+/// Rotates the log with a wait parsed and more lines unread, makes the old file unreadable
+/// (`.previous` itself, or the file a `.previous` symlink points at), and checks the new
+/// file is still read and the wait does not outlive its abandoned file.
+fn an_unreadable_previous_is_abandoned(through_a_symlink: bool) {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.append_log("# unread when Steam rotates");
+
+    let previous = rig.log_dir.join("console_log.txt.previous");
+    let old = if through_a_symlink {
+        rig.log_dir.join("console_log.old")
+    } else {
+        previous.clone()
+    };
+    std::fs::rename(rig.log_path(), &old).unwrap();
+    if through_a_symlink {
+        std::os::unix::fs::symlink(&old, &previous).unwrap();
+    }
+    std::fs::set_permissions(&old, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&old).is_ok() {
+        eprintln!("SKIP: a mode 000 file is still readable here (root)");
+        return;
+    }
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
+    ));
+
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)],
+        "the new file is read in the same pass"
+    );
+    std::thread::sleep(PAST_USER_WAIT);
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn an_unreadable_previous_file_is_abandoned_for_the_new_one() {
+    an_unreadable_previous_is_abandoned(false);
+}
+
+#[test]
+fn a_previous_symlink_to_an_unreadable_file_is_abandoned_for_the_new_one() {
+    an_unreadable_previous_is_abandoned(true);
+}
+
+#[test]
+fn a_fifo_in_place_of_a_log_never_blocks_a_poll() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    for name in ["steamui_login.txt", "console_log.txt.previous"] {
+        let status = std::process::Command::new("mkfifo")
+            .arg(rig.log_dir.join(name))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    std::fs::remove_file(rig.log_path()).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(rig.log_path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let (done, polled) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reports = rig.watcher.poll();
+        let _ = done.send(reports);
+    });
+    assert_eq!(
+        polled
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("poll blocked on a fifo"),
+        vec![]
+    );
+}
+
+#[test]
+fn a_previous_file_that_is_not_the_one_being_read_is_ignored() {
+    let mut rig = Rig::new();
+    let previous = rig.log_dir.join("console_log.txt.previous");
+    std::fs::write(
+        &previous,
+        format!("Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0\n"),
+    )
+    .unwrap();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+
+    // Replaced without a rotation: the stale `.previous` is not this file's tail.
+    std::fs::remove_file(rig.log_path()).unwrap();
+    rig.append_log("GameAction [AppID 730, ActionID 1] : LaunchApp changed task to Completed");
+    assert_eq!(rig.watcher.poll(), vec![]);
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn steam_waiting_for_credentials_needs_a_sign_in_until_a_later_state() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.login_state("WaitingForServerResponse");
+    assert_eq!(rig.watcher.poll(), vec![]);
+    // Signed out again (a wrong password, say): reported again.
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+}
+
+#[test]
+fn a_signed_in_start_never_needs_a_sign_in() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    for state in [
+        "WaitingForNetwork",
+        "WaitingForServerResponse",
+        "WaitingForLibraryReady",
+        "Success",
+    ] {
+        rig.login_state(state);
+        assert_eq!(rig.watcher.poll(), vec![], "{state}");
+    }
+}
+
+#[test]
+fn a_sign_in_wait_left_by_an_earlier_session_is_not_replayed() {
+    let mut rig = Rig::new();
+    rig.login_state("WaitingForCredentials");
+    write_proc(&rig.proc_root, 100, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn a_login_line_is_read_once_its_newline_is_written() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    rig.append("steamui_login.txt", "[ None ] SetLoginState: WaitingFor");
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.append("steamui_login.txt", "Credentials - OK\n");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
     );
 }
 
