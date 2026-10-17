@@ -182,7 +182,7 @@ function renderPage(strict = false) {
         <ToastProvider>
           <Routes>
             <Route path="/app/session/:id" element={<SessionPage />} />
-            <Route path="/app" element={null} />
+            <Route path="/app" element={<div data-testid="library" />} />
           </Routes>
         </ToastProvider>
       </ThemeProvider>
@@ -278,6 +278,56 @@ describe("SessionPage — a session that is over for this page releases the mic 
     expect(detachMicTrack).toHaveBeenCalled();
   });
 
+  it("game exited: the page goes back to the library, no recovery banner (#726)", async () => {
+    await streamingWithMicAndCapture();
+    expect(screen.queryByTestId("library")).toBeNull();
+    currentSession = makeSession({ state: "stopped", state_detail: "game exited" });
+    await advance(5_500);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  it("game exited, found through the dropped connection's poll instead of the health tick", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopped", state_detail: "game exited" });
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  // The agent says why on `stopping`, before the container stop finishes, and that is the
+  // row a poll sees while the stream is dropping.
+  it("game exited, read while the agent is still stopping: the health tick goes to the library", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
+    await advance(5_500);
+    expect(screen.getByTestId("library")).not.toBeNull();
+  });
+
+  it("game exited, read while the agent is still stopping: the dropped connection's poll goes to the library", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  it("game exited before the reveal: an earlier stopping read does not hold the loader's card", async () => {
+    currentSession = makeSession({ state_detail: "app booting" });
+    renderPage();
+    await advance(1_000);
+    currentSession = makeSession({ state: "stopping", state_detail: "tearing down" });
+    await advance(1_500);
+    expect(screen.getByText("The session ended before it started")).not.toBeNull();
+    expect(screen.queryByTestId("library")).toBeNull();
+    currentSession = makeSession({ state: "stopped", state_detail: "game exited" });
+    await advance(1_500);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("The session ended before it started")).toBeNull();
+  });
+
   it("host lost", async () => {
     await streamingWithMicAndCapture();
     currentSession = makeSession({ state: "failed", state_detail: "host_lost" });
@@ -328,6 +378,19 @@ describe("SessionPage — a session that is over for this page releases the mic 
     expect(micIndicator()).toBeNull();
     expect(attachMicTrack).not.toHaveBeenCalled();
     expect(screen.queryByText("Microphone failed")).toBeNull();
+  });
+});
+
+describe("SessionPage — an ordinary stop is not a game exit (#726)", () => {
+  it("any other stop keeps the recovery banner and stays on the page (#726)", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopped", state_detail: "peer disconnected: WebRTC data channel closed" });
+    await advance(5_500);
+    refused();
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    expect(screen.queryByTestId("library")).toBeNull();
   });
 });
 
