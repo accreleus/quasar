@@ -161,6 +161,11 @@ impl Watcher {
     /// Returns only CHANGES since the last call, in order. Never panics on odd input;
     /// an unreadable source is skipped for that pass.
     pub fn poll(&mut self) -> Vec<Report> {
+        self.poll_at(Instant::now())
+    }
+
+    /// `poll` with the clock passed in, so a test can step past [`USER_WAIT`] without sleeping.
+    pub fn poll_at(&mut self, now: Instant) -> Vec<Report> {
         let mut reports = Vec::new();
 
         if self.first_poll {
@@ -172,7 +177,7 @@ impl Watcher {
         if scan.reaper_alive {
             self.running_via_reaper = true;
         }
-        self.read_console_log();
+        self.read_console_log(now);
         self.read_login_state();
 
         let next = self.next_launch_state(&scan);
@@ -196,7 +201,7 @@ impl Watcher {
                 // The higher-ranked of the window and log reasons wins.
                 let desired = [
                     classify_windows(&windows, self.cfg.appid),
-                    self.held_log_needs(),
+                    self.held_log_needs(now),
                 ]
                 .into_iter()
                 .flatten()
@@ -207,7 +212,7 @@ impl Watcher {
                 // The mapped list is skipped for this pass: no window-derived
                 // reason changes, but a log-derived wait-for-user can still
                 // be reported.
-                if let Some(reason) = self.held_log_needs() {
+                if let Some(reason) = self.held_log_needs(now) {
                     self.update_needs(Some(reason), &mut reports);
                 }
             }
@@ -216,10 +221,10 @@ impl Watcher {
         reports
     }
 
-    fn held_log_needs(&self) -> Option<NeedsUser> {
+    fn held_log_needs(&self, now: Instant) -> Option<NeedsUser> {
         let wait = self
             .log_waiting
-            .filter(|(_, since)| since.elapsed() >= USER_WAIT)
+            .filter(|(_, since)| now.saturating_duration_since(*since) >= USER_WAIT)
             .map(|(reason, _)| reason);
         [wait, self.login.needs]
             .into_iter()
@@ -288,18 +293,18 @@ impl Watcher {
         }
     }
 
-    fn read_console_log(&mut self) {
+    fn read_console_log(&mut self, now: Instant) {
         let (lines, forgot) = self.console.read();
         if forgot {
             self.log_game = None;
             self.log_waiting = None;
         }
         for line in lines {
-            self.parse_log_line(&line);
+            self.parse_log_line(&line, now);
         }
     }
 
-    fn parse_log_line(&mut self, line: &str) {
+    fn parse_log_line(&mut self, line: &str, now: Instant) {
         // Exact spacing varies by client build (`Game process added : AppID`
         // beside `Game process removed: AppID` in the research notes), so the
         // phrases are matched without their colon and the id is taken from
@@ -340,7 +345,7 @@ impl Watcher {
                     } else {
                         NeedsUser::Other
                     };
-                    (reason, Instant::now())
+                    (reason, now)
                 });
             } else if line.contains("LaunchApp continues with user response")
                 || line.contains("LaunchApp changed task to")
