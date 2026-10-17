@@ -770,6 +770,12 @@ fn the_game_starting_or_going_ends_a_wait_for_the_user() {
         rig.watcher.poll(),
         vec![Report::LaunchState(LaunchState::GameRunning)]
     );
+    std::thread::sleep(PAST_USER_WAIT);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![],
+        "the game starting ended the wait"
+    );
     rig.append_log(&wait);
     rig.append_log(&format!(
         "Game process removed: AppID {APPID} \"game\", ProcID 201"

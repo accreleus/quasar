@@ -1621,6 +1621,8 @@ struct AppBootGate {
     budget: Option<Duration>,
     frames_at_first_commit: Option<u64>,
     drawn_at: Option<Instant>,
+    /// Presented, or ended by a swap: nothing more to decide.
+    done: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1642,19 +1644,18 @@ impl AppBootGate {
             budget,
             frames_at_first_commit: None,
             drawn_at: None,
+            done: false,
         }
     }
 
-    /// A swap stops or replaces the app: no draw from before it may present it or disarm
-    /// the watchdog. A rollback's relaunch is held again from its own first draw.
-    fn swap_started(&mut self) {
-        self.frames_at_first_commit = None;
-        self.drawn_at = None;
+    /// A swap ends the wait: the swap presents what it launches, and the web client reveals
+    /// on a swap anyway. `true` when the wait was still running.
+    fn end_for_swap(&mut self) -> bool {
+        !std::mem::replace(&mut self.done, true)
     }
 
-    /// One tick. `commits` are the live app's since its launch, sampled before `frames`
-    /// (`swap_source_ready`). `held` is the tile's reports while its helper is armed
-    /// (`LaunchSocket::armed_reports`), `None` for any other app.
+    /// One tick. `commits` are sampled before `frames` (`swap_source_ready`). `held` is the
+    /// derived tile's reports when it has a launch helper, `None` for any other app.
     fn tick(
         &mut self,
         now: Instant,
@@ -1663,6 +1664,9 @@ impl AppBootGate {
         frames: u64,
         held: Option<super::launch_helper::LaunchReports>,
     ) -> AppBootStep {
+        if self.done {
+            return AppBootStep::Wait;
+        }
         let drew = self.drawn_at.is_none()
             && gen0_app_presented(true, commits, frames, &mut self.frames_at_first_commit);
         if drew {
@@ -1680,7 +1684,10 @@ impl AppBootGate {
         let held = held.filter(|_| !self.cap.is_zero());
         match super::launch_helper::reveal(held, now.saturating_duration_since(drawn_at), self.cap)
         {
-            Some(reveal) => AppBootStep::Present(reveal),
+            Some(reveal) => {
+                self.done = true;
+                AppBootStep::Present(reveal)
+            }
             None if drew => AppBootStep::Held,
             None => AppBootStep::Wait,
         }
@@ -2667,7 +2674,14 @@ pub fn run_blocking(
         while let Ok(req) = swap_rx.try_recv() {
             gen += 1;
             emit(SessionEvent::Swapping);
-            app_boot.swap_started();
+            if app_boot_started_at.is_some() && app_boot.end_for_swap() {
+                app_presented_at = Some(Instant::now());
+                tracing::info!(
+                    session_id = %session_id,
+                    "app boot: a swap started before the app was revealed; the boot wait \
+                     ends here and the stream is shown"
+                );
+            }
             let from_image = cfg.container.as_ref().map(|c| c.image.clone());
             let to_image = req.container.as_ref().map(|c| c.image.clone());
             match perform_swap(
@@ -2866,7 +2880,7 @@ pub fn run_blocking(
         if let Some(boot_started) = app_boot_started_at {
             if app_presented_at.is_none() {
                 // Order matters: commits first, then frames — see `swap_source_ready`.
-                let commits = current_source.app_commits_since_launch();
+                let commits = current_source.app_surface_commits();
                 let frames = current_source.sink_frames();
                 if commits.is_none() && !app_boot_counter_warned {
                     app_boot_counter_warned = true;
@@ -2880,7 +2894,7 @@ pub fn run_blocking(
                 }
                 let held = res
                     .launch()
-                    .and_then(super::launch_helper::LaunchSocket::armed_reports);
+                    .map(super::launch_helper::LaunchSocket::reports);
                 match app_boot.tick(Instant::now(), boot_started, commits, frames, held) {
                     AppBootStep::Held => tracing::info!(
                         session_id = %session_id,
@@ -4599,44 +4613,44 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_during_the_hold_holds_a_rolled_back_tile_from_its_own_draw() {
+    fn a_swap_ends_the_wait_and_the_gate_never_presents_again() {
         use crate::session::launch_helper::LaunchReports;
         let boot = Instant::now();
         let at = |secs: u64| boot + Duration::from_secs(secs);
         let waiting = Some(LaunchReports::default());
-        let mut gate = AppBootGate::new(Duration::from_secs(90), Some(Duration::from_secs(300)));
-        assert_eq!(draw(&mut gate, at(5), boot, waiting), AppBootStep::Held);
+        let on_screen = Some(LaunchReports {
+            game_window_on_screen: Some(true),
+            ..Default::default()
+        });
+        let gate = AppBootGate::new(Duration::from_secs(90), Some(Duration::from_secs(300)));
 
-        // The swap rolls back and relaunches the tile, whose commits count from 0 again.
-        gate.swap_started();
+        let mut held = gate.clone();
+        assert_eq!(draw(&mut held, at(5), boot, waiting), AppBootStep::Held);
+        assert!(held.end_for_swap(), "the hold was running");
+        assert!(!held.end_for_swap(), "once");
+        for (t, reports) in [(20, on_screen), (200, waiting), (400, waiting)] {
+            assert_eq!(
+                held.tick(at(t), boot, Some(9), 500, reports),
+                AppBootStep::Wait
+            );
+        }
+
+        let mut undrawn = gate.clone();
+        assert!(undrawn.end_for_swap(), "nothing drawn yet");
         assert_eq!(
-            gate.tick(at(40), boot, Some(0), 150, waiting),
-            AppBootStep::Wait
-        );
-        let mut never_drew = gate.clone();
-        assert_eq!(
-            never_drew.tick(at(300), boot, Some(0), 400, waiting),
-            AppBootStep::NeverPresented,
-            "the draw before the swap does not disarm the watchdog"
-        );
-        assert_eq!(draw(&mut gate, at(50), boot, waiting), AppBootStep::Held);
-        assert_eq!(
-            gate.tick(at(140), boot, Some(9), 300, waiting),
-            AppBootStep::Wait
-        );
-        assert_eq!(
-            gate.tick(at(141), boot, Some(9), 301, waiting),
-            AppBootStep::Present("reveal cap reached"),
-            "the cap counts from the relaunched tile's draw"
+            undrawn.tick(at(400), boot, Some(0), 9, None),
+            AppBootStep::Wait,
+            "no watchdog after a swap"
         );
 
-        // A swap that lands on another app disarms the tile's reports: its own draw shows.
-        let mut swapped = AppBootGate::new(Duration::from_secs(90), Some(Duration::from_secs(300)));
-        assert_eq!(draw(&mut swapped, at(5), boot, waiting), AppBootStep::Held);
-        swapped.swap_started();
+        let mut shown = gate.clone();
         assert_eq!(
-            draw(&mut swapped, at(30), boot, None),
+            draw(&mut shown, at(5), boot, None),
             AppBootStep::Present("first frame")
+        );
+        assert!(
+            !shown.end_for_swap(),
+            "a swap after the reveal changes nothing"
         );
     }
 

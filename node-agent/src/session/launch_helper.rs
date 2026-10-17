@@ -268,10 +268,16 @@ pub fn reveal_cap(raw: Option<String>, boot_budget: Option<Duration>) -> Duratio
     ));
     let cap = Duration::from_secs(secs);
     if cap > ceiling {
+        let limit = match boot_budget {
+            Some(_) => format!("the app boot watchdog's {}s", ceiling.as_secs()),
+            None => format!(
+                "the {}s ceiling (the app boot watchdog is off)",
+                ceiling.as_secs()
+            ),
+        };
         tracing::warn!(
             token = "knob-steam-reveal-cap-clamped",
-            "QUASAR_STEAM_REVEAL_CAP_SECS={secs} is above the app boot watchdog's {}s; using that",
-            ceiling.as_secs()
+            "QUASAR_STEAM_REVEAL_CAP_SECS={secs} is above {limit}; using that"
         );
         return ceiling;
     }
@@ -279,9 +285,8 @@ pub fn reveal_cap(raw: Option<String>, boot_budget: Option<Duration>) -> Duratio
 }
 
 /// Why a first frame drawn `held_for` ago may be shown now, or `None` to hold it (#727).
-/// `held` is the tile's reports while its helper is armed ([`LaunchSocket::armed_reports`]);
-/// only then does the reveal wait: for the game on screen or Steam needing the user, at most
-/// `cap`. The reports are hints: a false one reveals the session's own stream early, and
+/// `held` is the derived tile's reports when its helper waits on the reveal; only then does
+/// the reveal wait: for the game on screen or Steam needing the user, at most `cap`. The reports are hints: a false one reveals the session's own stream early, and
 /// nothing they say holds it past `cap`.
 pub fn reveal(
     held: Option<LaunchReports>,
@@ -525,17 +530,6 @@ impl LaunchSocket {
 
     pub fn reports(&self) -> LaunchReports {
         *self.mount.shared.reports()
-    }
-
-    /// [`Self::reports`] while the live app is this session's derived tile; `None` after a
-    /// swap to another app, until a swap or a rollback launches the tile again.
-    pub fn armed_reports(&self) -> Option<LaunchReports> {
-        let reports = self.mount.shared.reports();
-        self.mount
-            .shared
-            .active
-            .load(Ordering::Relaxed)
-            .then_some(*reports)
     }
 }
 
@@ -1389,7 +1383,7 @@ mod tests {
     #[test]
     fn the_first_frame_is_held_until_the_game_is_on_screen() {
         let s = Session::open(620);
-        let held = |s: &Session| reveal(s.socket().armed_reports(), Duration::ZERO, CAP);
+        let held = |s: &Session| reveal(Some(s.socket().reports()), Duration::ZERO, CAP);
         assert_eq!(held(&s), None, "nothing reported yet");
         let mut helper = s.connect();
         helper.write_all(CLIENT_ONLY).unwrap();
@@ -1411,7 +1405,7 @@ mod tests {
             .unwrap();
         s.wait_for(|r| r.needs_user.is_some());
         assert_eq!(
-            reveal(s.socket().armed_reports(), Duration::ZERO, CAP),
+            reveal(Some(s.socket().reports()), Duration::ZERO, CAP),
             Some("Steam needs the user")
         );
     }
@@ -1423,13 +1417,13 @@ mod tests {
             let s = Session::open(620);
             let _helper = connects.then(|| s.connect());
             let drawn = Instant::now();
-            while reveal(s.socket().armed_reports(), drawn.elapsed(), cap).is_none() {
+            while reveal(Some(s.socket().reports()), drawn.elapsed(), cap).is_none() {
                 assert!(drawn.elapsed() < cap * 2, "held past the cap");
                 std::thread::sleep(Duration::from_millis(10));
             }
             assert!(drawn.elapsed() >= cap, "connects={connects}");
             assert_eq!(
-                reveal(s.socket().armed_reports(), drawn.elapsed(), cap),
+                reveal(Some(s.socket().reports()), drawn.elapsed(), cap),
                 Some("reveal cap reached")
             );
         }
@@ -1438,17 +1432,6 @@ mod tests {
     #[test]
     fn with_no_helper_the_first_frame_is_shown() {
         assert_eq!(reveal(None, Duration::ZERO, CAP), Some("first frame"));
-    }
-
-    #[test]
-    fn the_reports_are_armed_only_while_the_live_app_is_the_tile() {
-        let s = Session::open(620);
-        let mount = s.socket().mount().clone();
-        assert!(s.socket().armed_reports().is_some(), "armed from the start");
-        assert!(mount.for_app(&env("-applaunch 730")).is_none());
-        assert_eq!(s.socket().armed_reports(), None, "swapped to another app");
-        assert!(mount.for_app(&env("-bigpicture -applaunch 620")).is_some());
-        assert!(s.socket().armed_reports().is_some(), "the tile is back");
     }
 
     #[test]

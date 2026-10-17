@@ -63,20 +63,15 @@ use crate::messages::AppExitPolicy;
 /// of that container's launch; `now` is the live reading. Pure so the relaunch case is
 /// testable without a compositor.
 fn app_presented_since_launch(baseline: Option<u64>, now: u64) -> bool {
-    app_commits_since(baseline, now) > 0
-}
-
-/// The commits `now` holds since `baseline`, the reading at the current container's launch.
-fn app_commits_since(baseline: Option<u64>, now: u64) -> u64 {
     match baseline {
         // No launch recorded, or no counter at launch time: all that is left to ask is
-        // what has been drawn at all.
-        None => now,
+        // whether anything has been drawn at all.
+        None => now > 0,
         // The counter went BACKWARDS, so the compositor element was replaced and the
         // baseline describes something gone. Fall back to the absolute reading rather
         // than reporting "never drew" for a compositor that plainly has.
-        Some(base) if now < base => now,
-        Some(base) => now - base,
+        Some(base) if now < base => now > 0,
+        Some(base) => now > base,
     }
 }
 
@@ -927,13 +922,6 @@ impl AppSource {
         let source = self.pipeline.by_name("video-source")?;
         source.find_property(APP_SURFACE_COMMITS)?;
         Some(source.property::<u64>(APP_SURFACE_COMMITS))
-    }
-
-    /// [`Self::app_surface_commits`] counted from the current container's launch, so a
-    /// rollback's relaunch draws its own first frame (#727).
-    pub fn app_commits_since_launch(&self) -> Option<u64> {
-        let now = self.app_surface_commits()?;
-        Some(app_commits_since(self.app_commits_at_launch, now))
     }
 
     /// Whether this generation launches an app container at all. `false` for a bare
