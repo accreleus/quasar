@@ -284,31 +284,19 @@ pub fn reveal_cap(raw: Option<String>, boot_budget: Option<Duration>) -> Duratio
     cap
 }
 
-/// Why a first frame drawn `held_for` ago may be shown now, or `None` to hold it (#727).
-/// `held` is the derived tile's reports when its helper waits on the reveal; only then does
-/// the reveal wait: for the game on screen or Steam needing the user, at most `cap`. The
-/// reports are hints: a false one reveals the session's own stream early, and nothing they
-/// say holds it past `cap`.
-pub fn reveal(
-    held: Option<LaunchReports>,
-    held_for: Duration,
-    cap: Duration,
-) -> Option<&'static str> {
-    let Some(reports) = held else {
-        return Some("first frame");
-    };
-    if reports.game_window_on_screen == Some(true) {
-        Some("game window on screen")
-    } else if reports.needs_user.is_some() {
-        Some("Steam needs the user")
-    } else if held_for >= cap {
-        Some("reveal cap reached")
-    } else {
-        None
-    }
-}
-
 impl LaunchReports {
+    /// Why a held first frame may be shown now (#727): the game is on screen, or Steam needs
+    /// the user. A hint: a false one reveals the session's own stream early, nothing more.
+    pub fn reveal_reason(&self) -> Option<&'static str> {
+        if self.game_window_on_screen == Some(true) {
+            Some("game window on screen")
+        } else if self.needs_user.is_some() {
+            Some("Steam needs the user")
+        } else {
+            None
+        }
+    }
+
     /// The game ran and has now exited (#726). `seen_running` is checked here as well as
     /// in `forward`: the reports are untrusted hints, and the end of a session is not
     /// something to take on a single field.
@@ -1445,60 +1433,27 @@ mod tests {
         assert_eq!(s.socket().mount().appid, 620);
     }
 
-    const CAP: Duration = Duration::from_secs(90);
-
     #[test]
-    fn the_first_frame_is_held_until_the_game_is_on_screen() {
-        let s = Session::open(620);
-        let held = |s: &Session| reveal(Some(s.socket().reports()), Duration::ZERO, CAP);
-        assert_eq!(held(&s), None, "nothing reported yet");
-        let mut helper = s.connect();
-        helper.write_all(CLIENT_ONLY).unwrap();
-        helper
-            .write_all(b"{\"type\":\"game_window\",\"v\":1,\"on_screen\":false}\n")
-            .unwrap();
-        s.wait_for(|r| r.game_window_on_screen.is_some());
-        assert_eq!(held(&s), None, "Steam on screen is not the game");
-        helper.write_all(GAME_WINDOW).unwrap();
-        s.wait_for(|r| r.game_window_on_screen == Some(true));
-        assert_eq!(held(&s), Some("game window on screen"));
-    }
-
-    #[test]
-    fn steam_needing_the_user_reveals_steam() {
-        let s = Session::open(620);
-        s.connect()
-            .write_all(b"{\"type\":\"steam_needs_user\",\"v\":1,\"reason\":\"sign_in\"}\n")
-            .unwrap();
-        s.wait_for(|r| r.needs_user.is_some());
+    fn the_reports_reveal_on_the_game_on_screen_or_steam_needing_the_user() {
+        let reports = |on_screen, needs_user| LaunchReports {
+            game_window_on_screen: on_screen,
+            needs_user,
+            ..LaunchReports::default()
+        };
+        assert_eq!(reports(None, None).reveal_reason(), None);
         assert_eq!(
-            reveal(Some(s.socket().reports()), Duration::ZERO, CAP),
+            reports(Some(false), None).reveal_reason(),
+            None,
+            "Steam on screen is not the game"
+        );
+        assert_eq!(
+            reports(Some(true), None).reveal_reason(),
+            Some("game window on screen")
+        );
+        assert_eq!(
+            reports(None, Some(NeedsUser::SignIn)).reveal_reason(),
             Some("Steam needs the user")
         );
-    }
-
-    #[test]
-    fn a_silent_or_absent_helper_is_revealed_at_the_cap_and_not_later() {
-        let cap = Duration::from_millis(300);
-        for connects in [false, true] {
-            let s = Session::open(620);
-            let _helper = connects.then(|| s.connect());
-            let drawn = Instant::now();
-            while reveal(Some(s.socket().reports()), drawn.elapsed(), cap).is_none() {
-                assert!(drawn.elapsed() < cap * 2, "held past the cap");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert!(drawn.elapsed() >= cap, "connects={connects}");
-            assert_eq!(
-                reveal(Some(s.socket().reports()), drawn.elapsed(), cap),
-                Some("reveal cap reached")
-            );
-        }
-    }
-
-    #[test]
-    fn with_no_helper_the_first_frame_is_shown() {
-        assert_eq!(reveal(None, Duration::ZERO, CAP), Some("first frame"));
     }
 
     #[test]

@@ -1592,39 +1592,12 @@ const SWAP_POLL: Duration = Duration::from_millis(20);
 /// How often the boot watcher logs that it is still waiting.
 const APP_BOOT_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(15);
 
-/// The gen-0 (session launch) app-presented gate, pure so the latch is unit tested (#484).
-///
-/// `booting` means "this generation launched an app container and has not presented yet";
-/// false for a generation with no app container and for one that already latched, so
-/// `AppPresented` is emitted at most once per generation.
-///
-/// The gate is `swap_source_ready` verbatim: the raw `app-surface-commits` counter also
-/// counts commits from unmapped `pending_windows` surfaces (#487), so it can advance
-/// before anything is visible. Requiring a compositor frame observed after the first
-/// commit is the mitigation; fixing #487 upstream would let both gates simplify.
-fn gen0_app_presented(
-    booting: bool,
-    app_commits: Option<u64>,
-    sink_frames: u64,
-    frames_at_first_commit: &mut Option<u64>,
-) -> bool {
-    booting && swap_source_ready(true, app_commits, sink_frames, frames_at_first_commit)
-}
-
-/// Has the app-boot watchdog expired? Pure so the policy is unit tested. `budget = None`
-/// never fires, nor does a session that has already presented.
-fn app_boot_watchdog_fires(budget: Option<Duration>, elapsed: Duration, presented: bool) -> bool {
-    match budget {
-        Some(b) if !presented => elapsed >= b,
-        _ => false,
-    }
-}
-
-/// The session-start reveal (#484, #727): latches the live app's first genuine draw, then
-/// holds `AppPresented` for a derived tile's game. Pure apart from the `now` it is given.
+/// The session-start reveal (#484, #727): latches the app's first genuine draw, then holds
+/// `AppPresented` for a derived tile's game. Pure apart from the `now` it is given.
 #[derive(Clone)]
 struct AppBootGate {
-    cap: Duration,
+    /// How long a draw may be held for the game; `None` holds nothing.
+    cap: Option<Duration>,
     budget: Option<Duration>,
     frames_at_first_commit: Option<u64>,
     drawn_at: Option<Instant>,
@@ -1645,9 +1618,10 @@ enum AppBootStep {
 }
 
 impl AppBootGate {
-    fn new(cap: Duration, budget: Option<Duration>) -> Self {
+    /// `cap` is `Some` only for a derived tile with a launch helper; a cap of 0 holds nothing.
+    fn new(cap: Option<Duration>, budget: Option<Duration>) -> Self {
         Self {
-            cap,
+            cap: cap.filter(|cap| !cap.is_zero()),
             budget,
             frames_at_first_commit: None,
             drawn_at: None,
@@ -1661,36 +1635,42 @@ impl AppBootGate {
         !std::mem::replace(&mut self.done, true)
     }
 
-    /// One tick. `commits` are sampled before `frames` (`swap_source_ready`). `held` is the
-    /// derived tile's reports when it has a launch helper, `None` for any other app.
+    /// One tick. `commits` are sampled before `frames` (`swap_source_ready`); `reports` are
+    /// the launch helper's, read only while a draw is held.
     fn tick(
         &mut self,
         now: Instant,
         boot_started: Instant,
         commits: Option<u64>,
         frames: u64,
-        held: Option<super::launch_helper::LaunchReports>,
+        reports: super::launch_helper::LaunchReports,
     ) -> AppBootStep {
         if self.done {
             return AppBootStep::Wait;
         }
+        // `swap_source_ready`'s gate: the counter also counts unmapped surfaces (#487).
         let drew = self.drawn_at.is_none()
-            && gen0_app_presented(true, commits, frames, &mut self.frames_at_first_commit);
+            && swap_source_ready(true, commits, frames, &mut self.frames_at_first_commit);
         if drew {
             self.drawn_at = Some(now);
         }
         let Some(drawn_at) = self.drawn_at else {
             let booting_for = now.saturating_duration_since(boot_started);
-            return if app_boot_watchdog_fires(self.budget, booting_for, false) {
+            return if self.budget.is_some_and(|budget| booting_for >= budget) {
                 AppBootStep::NeverPresented
             } else {
                 AppBootStep::Wait
             };
         };
         // Drawn: the cap, not the watchdog, bounds the hold.
-        let held = held.filter(|_| !self.cap.is_zero());
-        match super::launch_helper::reveal(held, now.saturating_duration_since(drawn_at), self.cap)
-        {
+        let reveal = match self.cap {
+            None => Some("first frame"),
+            Some(cap) => reports
+                .reveal_reason()
+                .or((now.saturating_duration_since(drawn_at) >= cap)
+                    .then_some("reveal cap reached")),
+        };
+        match reveal {
             Some(reveal) => {
                 self.done = true;
                 AppBootStep::Present(reveal)
@@ -2283,7 +2263,7 @@ pub fn run_blocking(
     let app_boot_budget = cfg.app_boot_timeout;
     let mut app_boot_started_at: Option<Instant> = None;
     let mut app_presented_at: Option<Instant> = None;
-    let reveal_cap = res.launch().map_or(Duration::ZERO, |_| {
+    let reveal_cap = res.launch().map(|_| {
         super::launch_helper::reveal_cap(
             std::env::var("QUASAR_STEAM_REVEAL_CAP_SECS").ok(),
             app_boot_budget,
@@ -2902,8 +2882,8 @@ pub fn run_blocking(
             return;
         }
 
-        // #484 gen-0 app-presented watcher, reusing the swap path's gate verbatim
-        // (`gen0_app_presented`). `app_has_presented()` alone will NOT do: #487.
+        // #484 gen-0 app-presented watcher (`AppBootGate`, the swap path's gate).
+        // `app_has_presented()` alone will NOT do: #487.
         if let Some(boot_started) = app_boot_started_at {
             if app_presented_at.is_none() {
                 // Order matters: commits first, then frames — see `swap_source_ready`.
@@ -2919,16 +2899,17 @@ pub fn run_blocking(
                          gst-wayland-display fork)"
                     );
                 }
-                let held = res
+                let reports = res
                     .launch()
-                    .map(super::launch_helper::LaunchSocket::reports);
-                match app_boot.tick(Instant::now(), boot_started, commits, frames, held) {
+                    .map(super::launch_helper::LaunchSocket::reports)
+                    .unwrap_or_default();
+                match app_boot.tick(Instant::now(), boot_started, commits, frames, reports) {
                     AppBootStep::Held => tracing::info!(
                         session_id = %session_id,
                         "app boot: first frame after {} ms; holding the reveal for the game \
                          (cap {}s)",
                         boot_started.elapsed().as_millis(),
-                        reveal_cap.as_secs()
+                        reveal_cap.unwrap_or_default().as_secs()
                     ),
                     AppBootStep::Present(reveal) => {
                         let elapsed = boot_started.elapsed();
@@ -3590,12 +3571,12 @@ fn roll_back_stopped_app(
 #[cfg(test)]
 mod tests {
     use super::{
-        app_boot_watchdog_fires, app_exit_event, audio_path_label, context_object_identity,
-        effective_encoder_device_path, fold_display_update, gen0_app_presented, idle_reap_reason,
-        is_sctp_association_error, mic_state_label, stop_requested_for_transport_error,
-        swap_source_ready, validate_display_update, AppBootGate, AppBootStep, AppExitStatus,
-        AudioPipelineGuard, DiagnosticEventTx, DisplayUpdateRequest, Negotiation, SessionEvent,
-        TraceEvent, VulkanContextBridge, REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
+        app_exit_event, audio_path_label, context_object_identity, effective_encoder_device_path,
+        fold_display_update, idle_reap_reason, is_sctp_association_error, mic_state_label,
+        stop_requested_for_transport_error, swap_source_ready, validate_display_update,
+        AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard, DiagnosticEventTx,
+        DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent, VulkanContextBridge,
+        REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
     };
     use gstreamer::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4542,64 +4523,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_generation_with_no_app_container_never_reports_boot_events() {
-        // `booting` is false, so the watcher can never latch.
-        let mut baseline = None;
-        assert!(!gen0_app_presented(false, None, 0, &mut baseline));
-        assert!(!gen0_app_presented(false, None, 600, &mut baseline));
-        assert!(!gen0_app_presented(false, Some(5), 600, &mut baseline));
-    }
-
-    #[test]
-    fn a_compositor_without_the_commit_counter_reveals_immediately() {
-        // Fail-open: without the vendored patch there is no counter, so the first
-        // compositor frame reveals. A stuck loader must be impossible.
-        let mut baseline = None;
-        assert!(gen0_app_presented(true, None, 1, &mut baseline));
-    }
-
-    #[test]
-    fn gen0_reveals_only_on_a_frame_produced_after_the_first_app_commit() {
-        // #487: the counter also counts unmapped `pending_windows` commits, so a bare
-        // `app_has_presented()` test can fire before anything is visible.
-        let mut baseline = None;
-        assert!(!gen0_app_presented(true, Some(0), 600, &mut baseline));
-        assert!(!gen0_app_presented(true, Some(1), 600, &mut baseline));
-        assert_eq!(baseline, Some(600));
-        assert!(gen0_app_presented(true, Some(1), 601, &mut baseline));
-    }
-
-    #[test]
-    fn gen0_app_presented_latches_and_never_re_emits() {
-        let mut baseline = None;
-        assert!(!gen0_app_presented(true, Some(1), 10, &mut baseline));
-        assert!(gen0_app_presented(true, Some(1), 11, &mut baseline));
-        // Once latched the caller passes `booting = false`, so exactly one AppBooting and
-        // one AppPresented are emitted.
-        assert!(!gen0_app_presented(false, Some(2), 12, &mut baseline));
-        assert!(!gen0_app_presented(false, Some(99), 9999, &mut baseline));
-    }
-
     /// Ticks for an app that commits its first surface at `t` and has a frame after it at
-    /// `t + 1`, the shape `gen0_app_presented` latches on.
+    /// `t + 1`, the shape `swap_source_ready` latches on.
     fn draw(
         gate: &mut AppBootGate,
         t: Instant,
         boot: Instant,
-        held: Option<crate::session::launch_helper::LaunchReports>,
+        reports: crate::session::launch_helper::LaunchReports,
     ) -> AppBootStep {
-        assert_eq!(gate.tick(t, boot, Some(1), 100, held), AppBootStep::Wait);
-        gate.tick(t + Duration::from_secs(1), boot, Some(1), 101, held)
+        assert_eq!(gate.tick(t, boot, Some(1), 100, reports), AppBootStep::Wait);
+        gate.tick(t + Duration::from_secs(1), boot, Some(1), 101, reports)
     }
+
+    const CAP: Option<Duration> = Some(Duration::from_secs(90));
+    const BUDGET: Option<Duration> = Some(Duration::from_secs(300));
 
     #[test]
     fn the_boot_gate_holds_a_tile_until_its_game_or_steam_needing_the_user_or_the_cap() {
-        use crate::session::launch_helper::LaunchReports;
+        use crate::session::launch_helper::{LaunchReports, NeedsUser};
         let boot = Instant::now();
         let at = |secs: u64| boot + Duration::from_secs(secs);
-        let waiting = Some(LaunchReports::default());
-        let gate = AppBootGate::new(Duration::from_secs(90), Some(Duration::from_secs(300)));
+        let waiting = LaunchReports::default();
+        let gate = AppBootGate::new(CAP, BUDGET);
 
         let mut cap = gate.clone();
         assert_eq!(draw(&mut cap, at(5), boot, waiting), AppBootStep::Held);
@@ -4615,20 +4560,20 @@ mod tests {
 
         let mut game = gate.clone();
         assert_eq!(draw(&mut game, at(5), boot, waiting), AppBootStep::Held);
-        let on_screen = Some(LaunchReports {
+        let on_screen = LaunchReports {
             game_window_on_screen: Some(true),
             ..Default::default()
-        });
+        };
         assert_eq!(
             game.tick(at(20), boot, Some(9), 200, on_screen),
             AppBootStep::Present("game window on screen")
         );
 
         let mut steam = gate.clone();
-        let needs_user = Some(LaunchReports {
-            needs_user: Some(crate::session::launch_helper::NeedsUser::SignIn),
+        let needs_user = LaunchReports {
+            needs_user: Some(NeedsUser::SignIn),
             ..Default::default()
-        });
+        };
         assert_eq!(
             draw(&mut steam, at(5), boot, needs_user),
             AppBootStep::Present("Steam needs the user")
@@ -4640,26 +4585,46 @@ mod tests {
         use crate::session::launch_helper::LaunchReports;
         let boot = Instant::now();
         let at = |secs: u64| boot + Duration::from_secs(secs);
-        let budget = Some(Duration::from_secs(300));
-        let mut other = AppBootGate::new(Duration::from_secs(90), budget);
+        let reports = LaunchReports::default();
+        let mut other = AppBootGate::new(None, BUDGET);
         assert_eq!(
-            draw(&mut other, at(5), boot, None),
+            draw(&mut other, at(5), boot, reports),
             AppBootStep::Present("first frame")
         );
-        let mut no_cap = AppBootGate::new(Duration::ZERO, budget);
+        let mut no_cap = AppBootGate::new(Some(Duration::ZERO), BUDGET);
         assert_eq!(
-            draw(&mut no_cap, at(5), boot, Some(LaunchReports::default())),
+            draw(&mut no_cap, at(5), boot, reports),
             AppBootStep::Present("first frame"),
             "a cap of 0 holds nothing"
         );
-        let mut never = AppBootGate::new(Duration::from_secs(90), budget);
+        let mut never = AppBootGate::new(None, BUDGET);
         assert_eq!(
-            never.tick(at(299), boot, Some(0), 9, None),
+            never.tick(at(299), boot, Some(0), 9, reports),
             AppBootStep::Wait
         );
         assert_eq!(
-            never.tick(at(300), boot, Some(0), 10, None),
+            never.tick(at(300), boot, Some(0), 10, reports),
             AppBootStep::NeverPresented
+        );
+        let mut no_watchdog = AppBootGate::new(None, None);
+        assert_eq!(
+            no_watchdog.tick(at(9999), boot, Some(0), 9, reports),
+            AppBootStep::Wait,
+            "QUASAR_APP_BOOT_TIMEOUT_SECS=0 turns the watchdog off"
+        );
+    }
+
+    #[test]
+    fn without_a_commit_counter_the_first_compositor_frame_reveals() {
+        // Fail-open: an image without the vendored patch has no counter, and a stuck loader
+        // must be impossible.
+        let boot = Instant::now();
+        let reports = crate::session::launch_helper::LaunchReports::default();
+        let mut gate = AppBootGate::new(None, BUDGET);
+        assert_eq!(gate.tick(boot, boot, None, 0, reports), AppBootStep::Wait);
+        assert_eq!(
+            gate.tick(boot, boot, None, 1, reports),
+            AppBootStep::Present("first frame")
         );
     }
 
@@ -4668,14 +4633,13 @@ mod tests {
         use crate::session::launch_helper::LaunchReports;
         let boot = Instant::now();
         let at = |secs: u64| boot + Duration::from_secs(secs);
-        let waiting = Some(LaunchReports::default());
-        let on_screen = Some(LaunchReports {
+        let waiting = LaunchReports::default();
+        let on_screen = LaunchReports {
             game_window_on_screen: Some(true),
             ..Default::default()
-        });
-        let gate = AppBootGate::new(Duration::from_secs(90), Some(Duration::from_secs(300)));
+        };
 
-        let mut held = gate.clone();
+        let mut held = AppBootGate::new(CAP, BUDGET);
         assert_eq!(draw(&mut held, at(5), boot, waiting), AppBootStep::Held);
         assert!(held.end_for_swap(), "the hold was running");
         assert!(!held.end_for_swap(), "once");
@@ -4686,60 +4650,23 @@ mod tests {
             );
         }
 
-        let mut undrawn = gate.clone();
+        let mut undrawn = AppBootGate::new(CAP, BUDGET);
         assert!(undrawn.end_for_swap(), "nothing drawn yet");
         assert_eq!(
-            undrawn.tick(at(400), boot, Some(0), 9, None),
+            undrawn.tick(at(400), boot, Some(0), 9, waiting),
             AppBootStep::Wait,
             "no watchdog after a swap"
         );
 
-        let mut shown = gate.clone();
+        let mut shown = AppBootGate::new(None, BUDGET);
         assert_eq!(
-            draw(&mut shown, at(5), boot, None),
+            draw(&mut shown, at(5), boot, waiting),
             AppBootStep::Present("first frame")
         );
         assert!(
             !shown.end_for_swap(),
             "a swap after the reveal changes nothing"
         );
-    }
-
-    #[test]
-    fn app_boot_watchdog_fires_only_past_the_budget_and_only_while_unpresented() {
-        let budget = Some(Duration::from_secs(300));
-        assert!(!app_boot_watchdog_fires(
-            budget,
-            Duration::from_secs(0),
-            false
-        ));
-        assert!(!app_boot_watchdog_fires(
-            budget,
-            Duration::from_secs(299),
-            false
-        ));
-        assert!(app_boot_watchdog_fires(
-            budget,
-            Duration::from_secs(300),
-            false
-        ));
-        assert!(app_boot_watchdog_fires(
-            budget,
-            Duration::from_secs(9999),
-            false
-        ));
-        // A presented app is never a watchdog candidate, however long it ran.
-        assert!(!app_boot_watchdog_fires(
-            budget,
-            Duration::from_secs(9999),
-            true
-        ));
-        // QUASAR_APP_BOOT_TIMEOUT_SECS=0 turns the watchdog off.
-        assert!(!app_boot_watchdog_fires(
-            None,
-            Duration::from_secs(9999),
-            false
-        ));
     }
 
     // ---- #408: audio pipeline guard ----
