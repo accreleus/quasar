@@ -37,8 +37,8 @@ var variantName = regexp.MustCompile(`^([0-9a-f]{64}\.(?:jpg|png|webp))\.[0-9]+\
 // copy: about 0.4 GiB a slot. A request waiting for a slot holds none of it.
 const maxConcurrentResizes = 2
 
-// exifScanLen bounds the header scans in walkJPEGHead and iccPNGChunk. EXIF
-// and colour-profile data live in the segments right after SOI; an image
+// exifScanLen bounds the header scans jpegOrientation and iccPNGChunk do.
+// EXIF and colour-profile data live in the segments right after SOI; an image
 // whose 64th KiB still holds no image data has none we act on.
 const exifScanLen = 64 << 10
 
@@ -158,8 +158,10 @@ func (b *BlobStore) coverScale(name string, w int) (float64, error) {
 }
 
 // readOrientation re-reads a blob's opening bytes for its EXIF Orientation
-// tag. Any failure to read or parse means 1: the tag is an optimisation, and
-// an unreadable one must not fail a copy that would otherwise be made.
+// tag. Any failure to read or parse means 1: an unreadable tag still falls
+// back to upright rather than failing a copy that would otherwise be made,
+// but a readable one is correctness, not an optimisation — the copy must come
+// out with the same shape of frame the browser sees (#713).
 func readOrientation(f *os.File) int {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return 1
@@ -177,32 +179,38 @@ func readOrientation(f *os.File) int {
 const exifHeaderID = "Exif\x00\x00"
 const iccProfileTag = "ICC_PROFILE\x00"
 
-// walkJPEGHead calls see for each segment at the head of a JPEG, stopping at
-// the first one it declines, at SOS (image data follows), or where the bytes
-// stop being a well-formed segment stream. seg is the whole segment (marker,
-// length and payload). Every stop is silent: these scans read an optional tag
-// or profile, so a malformed or truncated head means only that nothing is
-// found, never an error.
-func walkJPEGHead(raw []byte, see func(marker byte, seg []byte) bool) {
+// walkJPEGHead calls see for each segment at the head of a JPEG's segment
+// stream, stopping at the first one it declines, at SOS (image data follows),
+// or where the bytes stop being a well-formed segment stream; at most limit
+// bytes are walked. seg is the whole segment (marker, length and payload):
+// stand-alone markers, which carry no length, are skipped without calling
+// see. Any number of 0xFF fill bytes before a marker is skipped (the JPEG
+// spec allows them); a 0xFF followed by 0x00 is a stuffed byte out of entropy
+// data the walk should never have reached, so it stops. Every stop is silent:
+// these scans read an optional tag or profile, so a malformed or truncated
+// head means only that nothing is found, never an error.
+func walkJPEGHead(raw []byte, limit int, see func(marker byte, seg []byte) bool) {
 	head := raw
-	if len(head) > exifScanLen {
-		head = head[:exifScanLen]
+	if limit < len(head) {
+		head = head[:limit]
 	}
 	p := 2 // past SOI
 	for p+2 <= len(head) && head[p] == 0xFF {
 		m := head[p+1]
-		if m == 0x00 || m == 0xFF { // a stuffed byte or padding, not a marker
+		if m == 0xFF { // fill bytes, any number, before the marker
+			p++
+			continue
+		}
+		if m == 0x00 { // a stuffed byte, not a marker
 			return
 		}
-		// Stand-alone markers carry no length; EOI ends everything and SOS is
-		// followed by entropy-coded data no walk should touch.
+		// EOI ends everything and SOS is followed by entropy-coded data no
+		// walk should touch. Stand-alone markers carry no length; the walk
+		// skips rather than pass a 2-byte seg on.
 		if m == 0xDA || m == 0xD9 {
 			return
 		}
 		if m == 0x01 || (m >= 0xD0 && m <= 0xD7) {
-			if !see(m, head[p:p+2]) {
-				return
-			}
 			p += 2
 			continue
 		}
@@ -221,20 +229,21 @@ func walkJPEGHead(raw []byte, see func(marker byte, seg []byte) bool) {
 }
 
 // jpegOrientation reads the EXIF Orientation tag (IFD0 tag 0x0112) from a
-// JPEG's APP1 "Exif\0\0" segment. Anything absent, malformed, short or out of
-// range means 1, never an error and never a panic (#713).
+// JPEG's APP1 "Exif\0\0" segment: the id, whose second NUL is the alignment
+// pad, is followed at once by the TIFF header. Anything absent, malformed,
+// short or out of range means 1, never an error and never a panic (#713).
 func jpegOrientation(raw []byte) int {
 	orientation := 1
-	walkJPEGHead(raw, func(marker byte, seg []byte) bool {
-		payload := seg[4:]
-		if marker != 0xE1 || len(payload) < len(exifHeaderID)+8 ||
-			!bytes.HasPrefix(payload, []byte(exifHeaderID)) {
+	walkJPEGHead(raw, exifScanLen, func(marker byte, seg []byte) bool {
+		if marker != 0xE1 || len(seg) < 4 {
 			return true // the first APP1 need not be the Exif one; keep looking
 		}
-		tiff := payload[len(exifHeaderID):]
-		if tiff[0] == 0 { // the standard one-byte alignment pad
-			tiff = tiff[1:]
+		payload := seg[4:]
+		if len(payload) < len(exifHeaderID)+8 ||
+			!bytes.HasPrefix(payload, []byte(exifHeaderID)) {
+			return true
 		}
+		tiff := payload[len(exifHeaderID):]
 		orientation = tiffOrientation(tiff)
 		return false
 	})
@@ -256,15 +265,19 @@ func tiffOrientation(tiff []byte) int {
 	default:
 		return 1
 	}
-	off := int(read32(tiff[4:8]))
-	if off < 8 || off+3 > len(tiff) {
+	// The offset and the entry count are hostile bytes: compare them in int64
+	// so a 32-bit build cannot wrap the sum into a pass, and bound off before
+	// it becomes an index.
+	off := int64(read32(tiff[4:8]))
+	if off < 8 || off+3 > int64(len(tiff)) {
 		return 1
 	}
-	n := int(read16(tiff[off:]))
-	if n == 0 || off+2+12*n > len(tiff) {
+	o := int(off) // fits: the check above bounds it by len(tiff)
+	n := int(read16(tiff[o:]))
+	if n == 0 || o+2+12*n > len(tiff) {
 		return 1
 	}
-	e := tiff[off+2:]
+	e := tiff[o+2:]
 	for i := 0; i < n; i++ {
 		if read16(e[12*i:]) != 0x0112 {
 			continue
@@ -364,36 +377,48 @@ func (b *BlobStore) resize(ctx context.Context, name, width string, scale float6
 		max(1, int(math.Round(float64(sb.Dx())*scale))), max(1, int(math.Round(float64(sb.Dy())*scale)))))
 	draw.CatmullRom.Scale(dst, dst.Bounds(), src, sb, draw.Src, nil)
 
+	// The copy goes out as JPEG when the source has no transparency and PNG
+	// when it does: JPEG cannot hold an alpha channel.
+	opaque := true
+	if op, ok := src.(interface{ Opaque() bool }); ok {
+		opaque = op.Opaque()
+	}
+
 	// Carrying the source's colour profile keeps the copy's colours the
-	// source's (#713): a JPEG copy takes the profile's APP2 segments, a PNG
-	// copy its raw iCCP chunk, both untouched — and only an RGB profile
+	// source's (#713): a JPEG copy takes the profile's APP2 segments, a
+	// transparent PNG copy its raw iCCP chunk — and only an RGB profile
 	// travels. The copy holds RGBA pixels whatever the source decoded to, and
 	// a profile declaring another data colour space (a CMYK JPEG, a grayscale
 	// image) mis-describes those bytes, so such a source is copied with no
-	// profile, as before profiles travelled at all. The EXIF segment is NOT
-	// carried: the copy is already upright, and an orientation tag of its own
-	// would rotate it twice. An opaque PNG source whose profile carries stays
-	// PNG, so the profile has a chunk to live in.
+	// profile, as before profiles travelled at all. An opaque PNG's copy is
+	// JPEG, which has no PNG chunk to hold an iCCP: its profile is inflated
+	// out of the chunk and rewritten as fresh APP2 segments. The EXIF segment
+	// is NOT carried: the copy is already upright, and an orientation tag of
+	// its own would rotate it twice.
 	var jpegICC [][]byte
 	var pngICC []byte
-	if bytes.HasPrefix(raw, []byte{0xFF, 0xD8}) {
+	switch {
+	case bytes.HasPrefix(raw, []byte{0xFF, 0xD8}):
 		if segs := iccJPEGSegments(raw); iccJPEGColorSpace(segs) == iccColorSpaceRGB {
 			jpegICC = segs
 		}
-	} else if bytes.HasPrefix(raw, pngSignature) {
+	case bytes.HasPrefix(raw, pngSignature):
 		if chunk := iccPNGChunk(raw); iccPNGColorSpace(chunk) == iccColorSpaceRGB {
-			pngICC = chunk
+			if opaque {
+				if profile := inflateICCPProfile(chunk); profile != nil {
+					jpegICC = jpegICCSegments(profile)
+				}
+			} else {
+				pngICC = chunk
+			}
 		}
 	}
 	var buf bytes.Buffer
 	ct := "image/png"
-	if pngICC == nil {
-		if op, ok := src.(interface{ Opaque() bool }); ok && op.Opaque() {
-			ct = "image/jpeg"
-			err = jpeg.Encode(&buf, oriented(dst, orientation), &jpeg.Options{Quality: 80})
-		}
-	}
-	if ct == "image/png" {
+	if opaque {
+		ct = "image/jpeg"
+		err = jpeg.Encode(&buf, oriented(dst, orientation), &jpeg.Options{Quality: 80})
+	} else {
 		err = png.Encode(&buf, oriented(dst, orientation))
 	}
 	if err != nil {
@@ -433,16 +458,36 @@ var hasBlob = (*BlobStore).Has
 var pngSignature = []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
 
 // iccJPEGSegments collects the raw APP2 "ICC_PROFILE\0" segments of a JPEG's
-// leading segment stream, in order — a profile of one segment each, or the
-// pieces of a profile split across several.
+// segment stream ahead of SOS, in order — a profile of one segment each, or
+// the pieces of a profile split across several, which may sit anywhere before
+// the image data. The answer is nil unless sequence numbers 1..count are all
+// here, exactly once each, naming the same count: a split profile is carried
+// whole or not at all (#713).
 func iccJPEGSegments(raw []byte) [][]byte {
 	var segs [][]byte
-	walkJPEGHead(raw, func(marker byte, seg []byte) bool {
-		if marker == 0xE2 && bytes.HasPrefix(seg[4:], []byte(iccProfileTag)) {
+	walkJPEGHead(raw, len(raw), func(marker byte, seg []byte) bool {
+		if marker == 0xE2 && len(seg) >= 4 && bytes.HasPrefix(seg[4:], []byte(iccProfileTag)) {
 			segs = append(segs, seg)
 		}
 		return true
 	})
+	count := 0
+	var seen [256]bool
+	for _, seg := range segs {
+		payload := seg[4:]
+		if len(payload) < 14 {
+			return nil
+		}
+		seq, c := payload[12], payload[13]
+		if c == 0 || seq == 0 || seq > c || (count != 0 && count != int(c)) || seen[seq] {
+			return nil
+		}
+		count = int(c)
+		seen[seq] = true
+	}
+	if count != len(segs) {
+		return nil
+	}
 	return segs
 }
 
@@ -472,7 +517,8 @@ func spliceJPEGSegments(out []byte, segs [][]byte) []byte {
 }
 
 // iccPNGChunk returns the raw iCCP chunk of a PNG byte stream (length, type,
-// data and CRC) when one precedes the image data.
+// data and CRC) when one precedes the image data — which, per the PNG spec's
+// chunk ordering, means before PLTE as well as before IDAT.
 func iccPNGChunk(raw []byte) []byte {
 	head := raw
 	if len(head) > exifScanLen {
@@ -487,8 +533,8 @@ func iccPNGChunk(raw []byte) []byte {
 		if bytes.Equal(typ, []byte("iCCP")) {
 			return head[p : p+12+chunkLen]
 		}
-		if bytes.Equal(typ, []byte("IDAT")) {
-			return nil // image data begins: every ancillary chunk must be past
+		if bytes.Equal(typ, []byte("IDAT")) || bytes.Equal(typ, []byte("PLTE")) {
+			return nil // the image data nears: every ancillary chunk must be past
 		}
 		p += 12 + chunkLen
 	}
@@ -523,21 +569,16 @@ func iccJPEGColorSpace(segs [][]byte) string {
 }
 
 // iccPNGColorSpace reads the data colour space of an iCCP chunk's profile.
-// The chunk data is a profile name, a NUL, a compression method byte (0) and
-// a zlib stream; only enough of the stream is inflated to reach the header's
-// colour-space bytes. Any shape failure — no name NUL, a compression method
-// that is not 0, a stream that will not give up even its first 20 bytes —
-// answers "" and the profile is not carried.
+// Only the first bytes of its zlib stream are inflated, which is where the
+// header's colour-space bytes live. Any shape failure — no name NUL, a
+// compression method that is not 0, a stream that will not give up even its
+// first 20 bytes — answers "" and the profile is not carried.
 func iccPNGColorSpace(chunk []byte) string {
-	if len(chunk) < 12 { // length, type and CRC around an empty data field
+	stream := iccpStream(chunk)
+	if stream == nil {
 		return ""
 	}
-	data := chunk[8 : len(chunk)-4]
-	name := bytes.IndexByte(data, 0)
-	if name < 0 || name+2 > len(data) || data[name+1] != 0 {
-		return ""
-	}
-	zr, err := zlib.NewReader(bytes.NewReader(data[name+2:]))
+	zr, err := zlib.NewReader(bytes.NewReader(stream))
 	if err != nil {
 		return ""
 	}
@@ -547,6 +588,72 @@ func iccPNGColorSpace(chunk []byte) string {
 		return ""
 	}
 	return string(head[16:20])
+}
+
+// iccpStream returns the zlib byte stream inside an iCCP chunk: everything
+// past the profile name, its NUL and the compression-method byte. nil when
+// the chunk is too short for the framing, the NUL is missing or the
+// compression method is not 0 (the only one the spec defines).
+func iccpStream(chunk []byte) []byte {
+	if len(chunk) < 12 { // length, type and CRC around an empty data field
+		return nil
+	}
+	data := chunk[8 : len(chunk)-4]
+	name := bytes.IndexByte(data, 0)
+	if name < 0 || name+1 >= len(data) || data[name+1] != 0 {
+		return nil
+	}
+	return data[name+2:]
+}
+
+// maxCarriedProfile caps how far inflateICCPProfile will inflate an iCCP
+// chunk's zlib stream: real profiles come far under it, and a corrupt or
+// hostile stream must not be given free rein to decompress.
+const maxCarriedProfile = 4 << 20
+
+// inflateICCPProfile inflates an iCCP chunk's zlib stream to the whole raw
+// profile, for rewriting as JPEG APP2 segments. nil when the stream is shaped
+// wrong, errors, or runs past maxCarriedProfile: a profile carried half is
+// worse than none.
+func inflateICCPProfile(chunk []byte) []byte {
+	stream := iccpStream(chunk)
+	if stream == nil {
+		return nil
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(stream))
+	if err != nil {
+		return nil
+	}
+	defer zr.Close()
+	profile, err := io.ReadAll(io.LimitReader(zr, maxCarriedProfile+1))
+	if err != nil || len(profile) > maxCarriedProfile || len(profile) == 0 {
+		return nil
+	}
+	return profile
+}
+
+// jpegICCSegmentDataLen is the most profile bytes one APP2 segment can carry:
+// a segment's length field holds 65535 at most, of which 2 are the field
+// itself and 14 are the ICC_PROFILE\0 tag and the sequence and count bytes.
+const jpegICCSegmentDataLen = 65519
+
+// jpegICCSegments rewrites a raw ICC profile as APP2 "ICC_PROFILE\0"
+// segments: each payload is the tag, the segment's one-based sequence number,
+// the count of segments, and its slice of the profile, whose bytes come back
+// joined when an ICC-aware reader reassembles them.
+func jpegICCSegments(profile []byte) [][]byte {
+	count := (len(profile) + jpegICCSegmentDataLen - 1) / jpegICCSegmentDataLen
+	segs := make([][]byte, count)
+	for seq := range count {
+		lo := seq * jpegICCSegmentDataLen
+		hi := min(len(profile), lo+jpegICCSegmentDataLen)
+		payload := make([]byte, 0, 14+hi-lo)
+		payload = append(payload, iccProfileTag...)
+		payload = append(payload, byte(seq+1), byte(count))
+		payload = append(payload, profile[lo:hi]...)
+		segs[seq] = append([]byte{0xFF, 0xE2, byte((len(payload) + 2) >> 8), byte(len(payload) + 2)}, payload...)
+	}
+	return segs
 }
 
 // splicePNGChunks inserts raw PNG chunks right after the IHDR chunk, where

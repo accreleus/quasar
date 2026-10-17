@@ -256,8 +256,13 @@ func TestPruneOrphansSweepsStaleTempFiles(t *testing.T) {
 // An entry whose age cannot be read at all is left alone, like a fresh one:
 // this sweep deletes only what it is certain about. Removing the shard's
 // search permission lets the walk list its names but makes the lstat behind
-// d.Info() fail for every one of them.
+// d.Info() fail for every one of them. The file's mtime is made stale first,
+// so that surviving can only be down to the unreadable age, and as root the
+// permission means nothing: the case cannot be tested there.
 func TestPruneOrphansLeavesTempFilesItCannotDate(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads through the permission the test removes")
+	}
 	b := newBlobs(t)
 	shard := filepath.Join(b.Root(), "ab")
 	if err := os.MkdirAll(shard, 0o755); err != nil {
@@ -265,6 +270,10 @@ func TestPruneOrphansLeavesTempFilesItCannotDate(t *testing.T) {
 	}
 	left := filepath.Join(shard, ".tmp-crashleft")
 	if err := os.WriteFile(left, []byte("half-written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-2 * tmpFileMaxAge)
+	if err := os.Chtimes(left, stale, stale); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(shard, 0o444); err != nil {

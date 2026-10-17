@@ -597,9 +597,10 @@ func jpegWithSegments(t *testing.T, marker byte, img image.Image, payloads [][]b
 	return append(out, base.Bytes()[2:]...)
 }
 
-// exifPayload is a well-formed Exif APP1 payload for the given orientation:
-// the segment id, the alignment pad, and a little-endian TIFF header holding
-// one IFD0 entry.
+// exifPayload is a well-formed Exif APP1 payload for the given orientation, in
+// a camera's layout: the segment id "Exif\0\0", whose second NUL is the
+// alignment pad, followed at once by a little-endian TIFF header holding one
+// IFD0 entry. No extra pad byte sits between the id and the header.
 func exifPayload(o uint16) []byte {
 	tiff := []byte{
 		'I', 'I', 42, 0, // byte order and magic
@@ -609,17 +610,18 @@ func exifPayload(o uint16) []byte {
 		byte(o), byte(o >> 8), 0, 0,
 		0, 0, 0, 0, // no next IFD
 	}
-	return append([]byte("Exif\x00\x00\x00"), tiff...)
+	return append([]byte("Exif\x00\x00"), tiff...)
 }
 
 // TestJpegOrientation pins the parser itself: the eight values, the shapes
 // that must fall back to 1, and finding the Exif segment behind another APP1.
 func TestJpegOrientation(t *testing.T) {
-	// A big-endian TIFF holding orientation o.
+	// A big-endian TIFF holding orientation o, in a camera's layout ("Exif\0\0"
+	// directly before the header).
 	mm := func(o uint16) []byte {
 		tiff := []byte{'M', 'M', 0, 42, 0, 0, 0, 8, 0, 1,
 			0x01, 0x12, 0, 3, 0, 0, 0, 1, byte(o >> 8), byte(o), 0, 0, 0, 0, 0, 0}
-		return append([]byte("Exif\x00\x00\x00"), tiff...)
+		return append([]byte("Exif\x00\x00"), tiff...)
 	}
 	wrap := func(payload ...[]byte) []byte {
 		out := []byte{0xFF, 0xD8}
@@ -639,14 +641,26 @@ func TestJpegOrientation(t *testing.T) {
 		"orientation 8, MM":     {wrap(mm(8)), 8},
 		"after a jfif segment":  {wrap(append(append([]byte{}, []byte("JFIF\x00x")...), 0), exifPayload(2)), 2},
 		"behind a foreign APP1": {wrap([]byte("http://ns.adobe.com/xap"), exifPayload(4)), 4},
-		"bad byte order":        {wrap([]byte("Exif\x00\x00\x00XX\x2a\x00\x08\x00\x00\x00\x01\x00")), 1},
-		"header alone":          {wrap([]byte("Exif\x00\x00\x00" + "II\x2a\x00\x08\x00\x00\x00")), 1},
-		"ifd offset off the end": {wrap([]byte("Exif\x00\x00\x00" +
+		"bad byte order":        {wrap([]byte("Exif\x00\x00XX\x2a\x00\x08\x00\x00\x00\x01\x00")), 1},
+		"header alone":          {wrap([]byte("Exif\x00\x00" + "II\x2a\x00\x08\x00\x00\x00")), 1},
+		"ifd offset off the end": {wrap([]byte("Exif\x00\x00" +
 			"II\x2a\x00\xff\xff\x00\x00\x01\x00")), 1},
-		"count over the data": {wrap([]byte("Exif\x00\x00\x00" +
+		"count over the data": {wrap([]byte("Exif\x00\x00" +
 			"II\x2a\x00\x08\x00\x00\x00\x05\x00\x00\x00\x00\x00")), 1},
-		"other tags only": {wrap([]byte("Exif\x00\x00\x00" +
+		"other tags only": {wrap([]byte("Exif\x00\x00" +
 			"II\x2a\x00\x08\x00\x00\x00\x01\x00\x99\x01\x03\x00\x01\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00")), 1},
+		// A 32-bit build wraps off+3 into the negative: the offset must be
+		// compared in int64.
+		"ifd offset 0x7fffffff": {wrap(append(append([]byte{}, []byte("Exif\x00\x00")...),
+			[]byte("II\x2a\x00\xff\xff\xff\x7f\x00\x00")...)), 1},
+		// A stand-alone marker among the segments: it carries no length and
+		// must never reach a callback slicing past it (the request goroutine
+		// panicked here once).
+		"after a stand-alone marker": {append(append([]byte{}, 0xFF, 0xD8, 0xFF, 0xD0),
+			onePixelJPEG[2:]...), 1},
+		// The spec allows any number of 0xFF fill bytes before a marker.
+		"after fill bytes": {append(append([]byte{}, 0xFF, 0xD8, 0xFF, 0xFF, 0xFF),
+			append(appSegment(0xE1, exifPayload(6)), onePixelJPEG[2:]...)...), 6},
 		"orientation 0": {wrap(exifPayload(0)), 1},
 		"orientation 9": {wrap(exifPayload(9)), 1},
 	} {
@@ -729,6 +743,69 @@ func TestOpenVariantAppliesEXIFOrientation(t *testing.T) {
 	}
 }
 
+// quadrantPattern is an opaque square whose four quadrants are distinct shades
+// of grey, so every orientation's corner map is told apart by pixels: JPEG's
+// 4:2:0 subsampling moves chroma only.
+func quadrantPattern() *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, 600, 600))
+	for y := 0; y < 600; y++ {
+		for x := 0; x < 600; x++ {
+			v := uint32(40) // bottom right
+			if x < 300 && y < 300 {
+				v = 220 // top left
+			} else if x >= 300 && y < 300 {
+				v = 170 // top right
+			} else if x < 300 {
+				v = 120 // bottom left
+			}
+			img.SetNRGBA(x, y, color.NRGBA{uint8(v), uint8(v), uint8(v), 255})
+		}
+	}
+	return img
+}
+
+// Every orientation 2..8 is checked by pixels: the copy's four corner values.
+// With a distinct value in each source quadrant, the eight transforms all map
+// the corners differently — in particular 5 vs 6 and 7 vs 8, which share no
+// corner — so a transposed orientation standing in for its rotation fails.
+func TestOpenVariantAppliesEveryOrientation(t *testing.T) {
+	b := newBlobs(t)
+	// Output corners, top left / top right / bottom left / bottom right, the
+	// four source quadrants' values each transform puts there (220/170/120/40).
+	want := map[int][4]int{
+		2: {170, 220, 40, 120}, // mirror horizontal
+		3: {40, 120, 170, 220}, // rotate 180
+		4: {120, 40, 220, 170}, // mirror vertical
+		5: {220, 120, 170, 40}, // transpose
+		6: {120, 220, 40, 170}, // rotate 90 clockwise
+		7: {40, 170, 120, 220}, // transverse
+		8: {170, 40, 220, 120}, // rotate 90 counter-clockwise
+	}
+	for o, corners := range want {
+		raw := jpegWithSegments(t, 0xE1, quadrantPattern(), [][]byte{exifPayload(uint16(o))})
+		name, err := b.Put("image/jpeg", raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, ct, _, err := b.OpenVariant(t.Context(), name, "320")
+		if err != nil || ct != "image/jpeg" {
+			t.Fatalf("orientation %d: want the JPEG copy, got %s, %v", o, ct, err)
+		}
+		// pattern is 600x600, so the cover is 480x480: sample each quadrant's
+		// middle, clear of the seams and the encoder's block edges.
+		src, err := jpeg.Decode(bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("orientation %d: decode copy: %v", o, err)
+		}
+		for i, at := range []struct{ x, y int }{{120, 120}, {360, 120}, {120, 360}, {360, 360}} {
+			r, _, _, _ := src.At(at.x, at.y).RGBA()
+			if d := int(r>>8) - corners[i]; d < -12 || d > 12 {
+				t.Errorf("orientation %d: corner %d is %d, want %d", o, i, r>>8, corners[i])
+			}
+		}
+	}
+}
+
 // A malformed EXIF segment means orientation 1: the copy is sized and made as
 // if the image were stored upright, never an error and never a panic.
 func TestOpenVariantTreatsMalformedEXIFAsNormal(t *testing.T) {
@@ -742,6 +819,34 @@ func TestOpenVariantTreatsMalformedEXIFAsNormal(t *testing.T) {
 		t.Fatalf("want the JPEG copy, got %s, %v", ct, err)
 	} else if w, h := decodeSize(t, data); w != 320 || h != 480 {
 		t.Errorf("size: the copy followed a broken orientation tag: %dx%d", w, h)
+	}
+}
+
+// A JPEG whose segments include a stand-alone marker (here a restart-interval
+// one, right after SOI) used to hand the walk's callbacks a 2-byte seg to
+// slice seg[4:] from, which panicked on the request goroutine — coverScale
+// runs outside the resize's recover. Now the walk skips such markers, the
+// orientation is 1, and a copy is still made.
+func TestOpenVariantSurvivesStandAloneMarkers(t *testing.T) {
+	b := newBlobs(t)
+	var body bytes.Buffer
+	if err := jpeg.Encode(&body, gradient(600, 900, 255), nil); err != nil {
+		t.Fatal(err)
+	}
+	raw := append(append([]byte{}, 0xFF, 0xD8, 0xFF, 0xD0), body.Bytes()[2:]...)
+	name, err := b.Put("image/jpeg", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := jpegOrientation(raw); got != 1 {
+		t.Errorf("jpegOrientation: want 1, got %d", got)
+	}
+	data, ct, immutable, err := b.OpenVariant(t.Context(), name, "320")
+	if err != nil || ct != "image/jpeg" || !immutable {
+		t.Fatalf("want the JPEG copy, immutable, got %s, %v, %v", ct, immutable, err)
+	}
+	if w, h := decodeSize(t, data); w != 320 || h != 480 {
+		t.Errorf("size: want 320x480, got %dx%d", w, h)
 	}
 }
 
@@ -770,7 +875,7 @@ func TestOpenVariantCarriesTheJPEGColourProfile(t *testing.T) {
 		t.Fatalf("want the JPEG copy, got %s, %v", ct, err)
 	}
 	var chunks []byte
-	walkJPEGHead(data, func(marker byte, seg []byte) bool {
+	walkJPEGHead(data, len(data), func(marker byte, seg []byte) bool {
 		if marker == 0xE2 && bytes.HasPrefix(seg[4:], id) {
 			chunks = append(chunks, seg[4+14:]...) // past ICC_PROFILE\0 and seq/count
 		}
@@ -781,6 +886,91 @@ func TestOpenVariantCarriesTheJPEGColourProfile(t *testing.T) {
 	}
 	if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
 		t.Fatalf("the copy with a profile does not decode: %v", err)
+	}
+}
+
+// iccPayload builds the payload of one APP2 ICC_PROFILE segment: the tag, its
+// one-based sequence number, the count of segments and slice of the profile.
+func iccPayload(seq, count byte, data []byte) []byte {
+	return append(append(append([]byte{}, []byte(iccProfileTag)...), seq, count), data...)
+}
+
+// collectICC gathers the ICC_PROFILE\0 payloads of a JPEG byte stream, along
+// with their sequence and count bytes.
+func collectICC(t *testing.T, data []byte) [][]byte {
+	t.Helper()
+	var got [][]byte
+	walkJPEGHead(data, len(data), func(marker byte, seg []byte) bool {
+		if marker == 0xE2 && len(seg) >= 4 && bytes.HasPrefix(seg[4:], []byte(iccProfileTag)) {
+			got = append(got, seg[4:])
+		}
+		return true
+	})
+	return got
+}
+
+// A split profile is carried only whole: a count of 3 with a piece missing (or
+// a piece doubled) means none of it travels, because a browser handed half a
+// profile could judge the copy's colours with the wrong one.
+func TestOpenVariantCarriesTheJPEGColourProfileOnlyWhenComplete(t *testing.T) {
+	b := newBlobs(t)
+	profile := make([]byte, 3*60_000) // three full segments' worth
+	for i := range profile {
+		profile[i] = byte(i * 5)
+	}
+	copy(profile[16:20], "RGB ")
+
+	complete := jpegWithSegments(t, 0xE2, gradient(600, 900, 255), [][]byte{
+		iccPayload(1, 3, profile[:60_000]),
+		iccPayload(2, 3, profile[60_000:120_000]),
+		iccPayload(3, 3, profile[120_000:]),
+	})
+	name, err := b.Put("image/jpeg", complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _, _, err := b.OpenVariant(t.Context(), name, "320")
+	if err != nil {
+		t.Fatal(err)
+	}
+	segs := collectICC(t, data)
+	if len(segs) != 3 {
+		t.Fatalf("a complete 3-segment profile: %d segments carried", len(segs))
+	}
+	var joined []byte
+	for i, p := range segs {
+		if p[12] != byte(i+1) || p[13] != 3 {
+			t.Errorf("segment %d carries seq %d, count %d", i, p[12], p[13])
+		}
+		joined = append(joined, p[14:]...)
+	}
+	if !bytes.Equal(joined, profile) {
+		t.Errorf("the reassembled profile is not the source's: %d of %d bytes", len(joined), len(profile))
+	}
+
+	for name, raw := range map[string][]byte{
+		// The same profile missing its middle segment: nothing travels.
+		"missing middle": jpegWithSegments(t, 0xE2, gradient(600, 900, 255), [][]byte{
+			iccPayload(1, 3, profile[:60_000]),
+			iccPayload(3, 3, profile[120_000:]),
+		}),
+		// Sequence 1 twice with count 1: nothing travels, either.
+		"seq doubled": jpegWithSegments(t, 0xE2, gradient(600, 900, 255), [][]byte{
+			iccPayload(1, 1, profile[:1000]),
+			iccPayload(1, 1, profile[1000:2000]),
+		}),
+	} {
+		name2, err := b.Put("image/jpeg", raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _, _, err := b.OpenVariant(t.Context(), name2, "320")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if segs := collectICC(t, data); len(segs) != 0 {
+			t.Errorf("%s: %d ICC segments carried where none may be", name, len(segs))
+		}
 	}
 }
 
@@ -807,8 +997,9 @@ func pngWithICC(t *testing.T, img image.Image, profile []byte) []byte {
 	return append(append(out, chunk...), base[33:]...)
 }
 
-// An opaque PNG source that carries a profile keeps PNG output — the profile
-// needs a chunk to live in — and the chunk travels with the copy raw.
+// A transparent PNG source that carries an RGB profile keeps PNG output —
+// JPEG cannot hold the transparency — and the raw iCCP chunk travels with the
+// copy.
 func TestOpenVariantCarriesThePNGColourProfile(t *testing.T) {
 	b := newBlobs(t)
 	profile := make([]byte, 1024)
@@ -816,7 +1007,7 @@ func TestOpenVariantCarriesThePNGColourProfile(t *testing.T) {
 		profile[i] = byte(i * 13)
 	}
 	copy(profile[16:20], "RGB ") // the header's data colour space
-	raw := pngWithICC(t, gradient(600, 900, 255), profile)
+	raw := pngWithICC(t, gradient(600, 900, 128), profile)
 	name, err := b.Put("image/png", raw)
 	if err != nil {
 		t.Fatal(err)
@@ -834,11 +1025,119 @@ func TestOpenVariantCarriesThePNGColourProfile(t *testing.T) {
 	}
 }
 
+// chunk builds one PNG chunk: length, type, data and CRC.
+func chunk(typ string, data []byte) []byte {
+	out := make([]byte, 12+len(data))
+	binary.BigEndian.PutUint32(out[:4], uint32(len(data)))
+	copy(out[4:8], typ)
+	copy(out[8:], data)
+	binary.BigEndian.PutUint32(out[8+len(data):], crc32.ChecksumIEEE(out[4:8+len(data)]))
+	return out
+}
+
+// A PNG's chunks come in an order the spec fixes: iCCP belongs before PLTE
+// and IDAT, and a stream that has reached PLTE — the palette going into the
+// image — has no profile ahead of it.
+func TestIccPNGChunkStopsAtPLTE(t *testing.T) {
+	iccp := chunk("iCCP", append(append([]byte{}, []byte("name\x00\x00")...), "zlibstream"...))
+	plte := chunk("PLTE", make([]byte, 3))
+	idat := chunk("IDAT", []byte("data"))
+	start := append(append([]byte{}, pngSignature...), chunk("IHDR", make([]byte, 13))...)
+	before := append(append(start, iccp...), plte...)
+	after := append(append(start, plte...), iccp...)
+	if got := iccPNGChunk(before); !bytes.Equal(got, iccp) {
+		t.Errorf("iCCP before PLTE: want the chunk, got %d bytes", len(got))
+	}
+	if got := iccPNGChunk(append(after, idat...)); got != nil {
+		t.Errorf("iCCP after PLTE: want nil, got %d bytes", len(got))
+	}
+}
+
+// An opaque PNG's copy is JPEG, and JPEG has no iCCP chunk to carry a profile
+// in: the profile is inflated out of the source's chunk and rewritten as APP2
+// segments the copy carries whole. This one spans two segments.
+func TestOpenVariantInflatesAnOpaquePNGProfileIntoJPEGSegments(t *testing.T) {
+	b := newBlobs(t)
+	profile := make([]byte, 80_000) // more than one segment's 65519 bytes
+	for i := range profile {
+		profile[i] = byte(i * 11)
+	}
+	copy(profile[16:20], "RGB ") // the header's data colour space
+	raw := pngWithICC(t, gradient(600, 900, 255), profile)
+	name, err := b.Put("image/png", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, ct, immutable, err := b.OpenVariant(t.Context(), name, "320")
+	if err != nil || ct != "image/jpeg" || !immutable {
+		t.Fatalf("want the JPEG copy, immutable, got %s, %v, %v", ct, immutable, err)
+	}
+	var got [2][]byte
+	var seen [3]bool
+	for _, p := range collectICC(t, data) {
+		if p[12] == 0 || p[12] > 2 {
+			t.Fatalf("sequence number %d, want 1 or 2", p[12])
+		}
+		if seen[p[12]] {
+			t.Fatalf("sequence number %d twice", p[12])
+		}
+		seen[p[12]] = true
+		if p[13] != 2 {
+			t.Errorf("segment %d says count %d, want 2", p[12], p[13])
+		}
+		got[p[12]-1] = p[14:]
+	}
+	if !seen[1] || !seen[2] {
+		t.Fatalf("want segments 1 and 2, saw %v", seen)
+	}
+	inflated := append(append([]byte{}, got[0]...), got[1]...)
+	if !bytes.Equal(inflated, profile) {
+		t.Errorf("the copy does not carry the inflated profile: %d of %d bytes", len(inflated), len(profile))
+	}
+	if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
+		t.Fatalf("the copy with a profile does not decode: %v", err)
+	}
+}
+
+// A profile too big to inflate under the cap, or a zlib stream that will not
+// open at all, is dropped like any other the copy cannot carry honestly: the
+// copy is still JPEG, made without a profile.
+func TestOpenVariantDropsAPNGProfileItCannotInflate(t *testing.T) {
+	b := newBlobs(t)
+	huge := make([]byte, maxCarriedProfile+1024) // over the 4 MiB cap
+	copy(huge[16:20], "RGB ")
+	broken := pngWithICC(t, gradient(600, 900, 255), make([]byte, 64))
+	// The iCCP chunk is the second chunk (after the 13-byte IHDR): its zlib
+	// stream starts five bytes in, and Go's PNG decoder verifies chunk CRCs,
+	// so the CRC is repaired after mangling the stream's first byte and the
+	// source still decodes.
+	if !bytes.HasPrefix(broken[33+4:], []byte("iCCP")) {
+		t.Fatal("no iCCP chunk where the IHDR ends")
+	}
+	broken[33+8+5] ^= 0xFF // the stream's zlib header, unreadable now
+	iend := 33 + 8 + binary.BigEndian.Uint32(broken[33:33+4])
+	binary.BigEndian.PutUint32(broken[iend:], crc32.ChecksumIEEE(broken[33+4:iend]))
+	for name, raw := range map[string][]byte{"over the cap": pngWithICC(t, gradient(600, 900, 255), huge), "bad stream": broken} {
+		name2, err := b.Put("image/png", raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, ct, _, err := b.OpenVariant(t.Context(), name2, "320")
+		if err != nil || ct != "image/jpeg" {
+			t.Errorf("%s: want the JPEG copy, got %s, %v", name, ct, err)
+			continue
+		}
+		if segs := collectICC(t, data); len(segs) != 0 {
+			t.Errorf("%s: %d ICC segments carried where none may be", name, len(segs))
+		}
+	}
+}
+
 // A profile whose data colour space is not RGB does not travel. A copy holds
 // RGBA pixels whatever the source decoded to, so a CMYK or GRAY header would
 // mis-describe the data it rides with; the source is copied with no profile
 // at all, exactly as before profiles travelled — an opaque PNG goes to JPEG
-// again, one with transparency stays PNG.
+// as every opaque source does, one with transparency stays PNG.
 func TestOpenVariantDropsANonRGBColourProfile(t *testing.T) {
 	b := newBlobs(t)
 
@@ -857,7 +1156,7 @@ func TestOpenVariantDropsANonRGBColourProfile(t *testing.T) {
 		t.Fatalf("want the JPEG copy, got %s, %v", ct, err)
 	}
 	id := []byte(iccProfileTag)
-	walkJPEGHead(data, func(marker byte, seg []byte) bool {
+	walkJPEGHead(data, len(data), func(marker byte, seg []byte) bool {
 		if marker == 0xE2 && bytes.HasPrefix(seg[4:], id) {
 			t.Error("the copy carries the source's CMYK profile")
 			return false
