@@ -25,8 +25,8 @@
 //!   never read (it stays 0 on Linux).
 
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // Bounds on input the game (same user, same container) controls.
@@ -249,18 +249,9 @@ impl Watcher {
             self.login.file_id = Some(metadata.ino());
             self.login.offset = 0;
         }
-        let Ok(mut file) = std::fs::File::open(&path) else {
+        let Some(bytes) = read_slice(&path, self.login.offset) else {
             return;
         };
-        let mut bytes = Vec::new();
-        if file.seek(SeekFrom::Start(self.login.offset)).is_err()
-            || file
-                .take(MAX_LOG_BYTES_PER_PASS)
-                .read_to_end(&mut bytes)
-                .is_err()
-        {
-            return;
-        }
         // Whole lines only: a partial one is read again next pass, unless it fills the slice.
         let end = match bytes.iter().rposition(|b| *b == b'\n') {
             Some(newline) => newline + 1,
@@ -354,11 +345,17 @@ impl Watcher {
         if self.log_file_id != Some(file_id) {
             match std::fs::metadata(&previous) {
                 Ok(old) if self.log_file_id == Some(old.ino()) => {
-                    if old.len() > self.log_offset {
-                        self.read_log_from(&previous);
+                    let unread = old.len() > self.log_offset;
+                    if unread && self.read_log_from(&previous) {
                         return;
                     }
-                    self.restart_log();
+                    // A tail that cannot be read is abandoned, with what it might have
+                    // changed, so the new file is never held back behind it.
+                    if unread {
+                        self.reset_log();
+                    } else {
+                        self.restart_log();
+                    }
                 }
                 _ => self.reset_log(),
             }
@@ -373,23 +370,12 @@ impl Watcher {
         self.read_log_from(&path);
     }
 
-    /// One bounded slice of `path` from the current offset, parsed line by line.
-    fn read_log_from(&mut self, path: &std::path::Path) {
-        let Ok(mut file) = std::fs::File::open(path) else {
-            return;
+    /// One bounded slice of `path` from the current offset, parsed line by line; the rest
+    /// is read on the next pass. `false` when nothing could be read.
+    fn read_log_from(&mut self, path: &Path) -> bool {
+        let Some(bytes) = read_slice(path, self.log_offset).filter(|b| !b.is_empty()) else {
+            return false;
         };
-        if file.seek(SeekFrom::Start(self.log_offset)).is_err() {
-            return;
-        }
-        // A bounded slice per pass; the rest is read on the next pass.
-        let mut bytes = Vec::new();
-        if file
-            .take(MAX_LOG_BYTES_PER_PASS)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
-            return;
-        }
         self.log_offset += bytes.len() as u64;
         self.log_pending.extend_from_slice(&bytes);
 
@@ -416,6 +402,7 @@ impl Watcher {
             self.log_pending.clear();
             self.log_discarding = true;
         }
+        true
     }
 
     /// A truncated or unknown file: what was learnt from the old one no longer holds.
@@ -441,13 +428,16 @@ impl Watcher {
         // their added/removed lines must neither start nor end it.
         let is_install_script =
             line.contains("Install=1") || line.to_lowercase().contains("iscriptevaluator");
+        // The game starting or going is the step after any wait for the user: it ends it.
         if line.contains("Game process added") {
             if !is_install_script && extract_appid(line) == Some(self.cfg.appid) {
                 self.log_game = Some(true);
+                self.log_waiting = None;
             }
         } else if line.contains("Game process removed") {
             if !is_install_script && extract_appid(line) == Some(self.cfg.appid) {
                 self.log_game = Some(false);
+                self.log_waiting = None;
             }
         } else if line.contains("GameAction") {
             if extract_appid(line) != Some(self.cfg.appid) {
@@ -478,6 +468,26 @@ impl Watcher {
             }
         }
     }
+}
+
+/// Up to [`MAX_LOG_BYTES_PER_PASS`] of `path` from `offset`, or `None` when it cannot be read
+/// or is not a regular file. Opened non-blocking: a fifo the game puts there must never
+/// stall a poll.
+fn read_slice(path: &Path, offset: u64) -> Option<Vec<u8>> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LOG_BYTES_PER_PASS)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
 }
 
 /// Where `steamui_login.txt` is read from, and the sign-in its last state means.

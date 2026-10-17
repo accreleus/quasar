@@ -15,6 +15,7 @@ description = "Steam launch detection core for the in-container launch helper, w
 # single workspace Cargo.lock resolves both to the same version and nothing
 # is bumped.
 [dependencies]
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

@@ -754,6 +754,35 @@ fn a_wait_answered_within_two_seconds_reports_nothing_across_polls() {
 }
 
 #[test]
+fn the_game_starting_or_going_ends_a_wait_for_the_user() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    let wait = format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
+    );
+
+    rig.append_log(&wait);
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
+    ));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)]
+    );
+    rig.append_log(&wait);
+    rig.append_log(&format!(
+        "Game process removed: AppID {APPID} \"game\", ProcID 201"
+    ));
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameExited)]
+    );
+    std::thread::sleep(PAST_USER_WAIT);
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
 fn routine_waits_never_report_however_long_they_stand() {
     let mut rigs: Vec<Rig> = ["CreatingProcess", "ShowInterstitials", "ProcessingShaderCache"]
         .into_iter()
@@ -924,6 +953,89 @@ fn rotation_finishes_the_previous_file_from_its_offset_then_reads_the_new_one_fr
         rig.watcher.poll(),
         vec![Report::LaunchState(LaunchState::GameExited)],
         "then the new file from 0"
+    );
+}
+
+/// Rotates the log with a wait parsed and more lines unread, makes the old file unreadable
+/// (`.previous` itself, or the file a `.previous` symlink points at), and checks the new
+/// file is still read and the wait does not outlive its abandoned file.
+fn an_unreadable_previous_is_abandoned(through_a_symlink: bool) {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.append_log("# unread when Steam rotates");
+
+    let previous = rig.log_dir.join("console_log.txt.previous");
+    let old = if through_a_symlink {
+        rig.log_dir.join("console_log.old")
+    } else {
+        previous.clone()
+    };
+    std::fs::rename(rig.log_path(), &old).unwrap();
+    if through_a_symlink {
+        std::os::unix::fs::symlink(&old, &previous).unwrap();
+    }
+    std::fs::set_permissions(&old, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&old).is_ok() {
+        eprintln!("SKIP: a mode 000 file is still readable here (root)");
+        return;
+    }
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
+    ));
+
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)],
+        "the new file is read in the same pass"
+    );
+    std::thread::sleep(PAST_USER_WAIT);
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn an_unreadable_previous_file_is_abandoned_for_the_new_one() {
+    an_unreadable_previous_is_abandoned(false);
+}
+
+#[test]
+fn a_previous_symlink_to_an_unreadable_file_is_abandoned_for_the_new_one() {
+    an_unreadable_previous_is_abandoned(true);
+}
+
+#[test]
+fn a_fifo_in_place_of_a_log_never_blocks_a_poll() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    for name in ["steamui_login.txt", "console_log.txt.previous"] {
+        let status = std::process::Command::new("mkfifo")
+            .arg(rig.log_dir.join(name))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    std::fs::remove_file(rig.log_path()).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(rig.log_path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let (done, polled) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reports = rig.watcher.poll();
+        let _ = done.send(reports);
+    });
+    assert_eq!(
+        polled
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("poll blocked on a fifo"),
+        vec![]
     );
 }
 
