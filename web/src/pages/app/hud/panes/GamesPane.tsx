@@ -155,7 +155,7 @@ export function GamesPane({
                   <img
                     src={sizedArt(tileArt, 320)}
                     srcSet={artSrcSet(tileArt)}
-                    sizes="172px" /* .qs flex: 0 0 172px (hud.css) */
+                    sizes="204px" /* widest dock: the side shelf (236px minus padding, hud.css); the bottom dock is 172px */
                     alt=""
                     className="cover-img"
                     loading="lazy"

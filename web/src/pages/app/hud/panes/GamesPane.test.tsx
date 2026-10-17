@@ -49,7 +49,7 @@ describe("GamesPane", () => {
     await waitFor(() => expect(screen.getByText("Purple App")).toBeTruthy());
     const img = document.querySelector<HTMLImageElement>(".qs .cv img");
     expect(img).toHaveAttribute("src", `${cover}?w=320`);
-    expect(img).toHaveAttribute("sizes", "172px");
+    expect(img).toHaveAttribute("sizes", "204px");
     expect(img).toHaveAttribute("srcset", expect.stringContaining(`${cover}?w=480 480w`));
   });
 
