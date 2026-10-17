@@ -199,6 +199,18 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #738: agent-supplied free text is untrusted bytes. Postgres refuses U+0000
+	// and invalid UTF-8 in `text`, so a manifest name (or a scan error message)
+	// carrying one fails the scan's transaction on this report and fails it again
+	// on every later scan of the same home. Clean at the parse boundary, the same
+	// repair the Steam store texts get (storableText, #736). Nothing else about
+	// validation changes: a name that cleans to "" still falls back to the appid
+	// (tileName) exactly as an empty name always did.
+	req.Error = storableText(req.Error)
+	for i := range req.Entries {
+		req.Entries[i].Name = storableText(req.Entries[i].Name)
+	}
+
 	if !req.OK {
 		// A failed scan changes nothing but its own row (§7.7 step 1): reconciling whatever
 		// entries did arrive would make a partial walk indistinguishable from an uninstall.
