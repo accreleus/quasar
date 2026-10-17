@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -52,9 +53,8 @@ func TestScanReportCleansAgentReportedTitleNames(t *testing.T) {
 	}
 
 	// The observation stores the clean name: the NUL is gone (the case #738 is
-	// about), and the raw \xff the body carried was already normalised to U+FFFD
-	// by the JSON decoder before the handler saw it — valid UTF-8 Postgres
-	// accepts, so it survives. Reconcile's own TrimSpace is untouched.
+	// about). The \xff never reaches the wire: the test client's json.Marshal
+	// already sends it as U+FFFD, valid UTF-8 Postgres accepts, so it survives. Reconcile's own TrimSpace is untouched.
 	var obsName string
 	must(t, pool.QueryRow(context.Background(),
 		`SELECT name FROM library_observations
@@ -120,7 +120,7 @@ func TestScanFailureMessageIsCleanedToo(t *testing.T) {
 	}
 
 	resp = agentReq(t, http.MethodPost, srv.URL+"/v1/agent/library/scan-report", f.nodeName, f.secret,
-		ScanReport{ScanID: pending.Scans[0].ScanID, OK: false, Error: "walk failed \x00bad\xff UTF8"})
+		ScanReport{ScanID: pending.Scans[0].ScanID, OK: false, Error: strings.Repeat("a", 508) + "\x00bad\u00e9 tail"})
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("scan-report = %d, want 200: a dirty failure message must not fail MarkFailed", resp.StatusCode)
@@ -133,8 +133,9 @@ func TestScanFailureMessageIsCleanedToo(t *testing.T) {
 	if state != "failed" {
 		t.Fatalf("scan state = %q, want failed", state)
 	}
-	// As above: the \xff arrived as U+FFFD (JSON decode), the NUL is stripped.
-	if stored != "walk failed bad\uFFFD UTF8" {
-		t.Fatalf("stored error = %q, want %q", stored, "walk failed bad\uFFFD UTF8")
+	// The NUL is stripped, then the 512-byte cap falls inside the two-byte é: the
+	// half rune is dropped, not stored (Postgres refuses invalid UTF-8).
+	if want := strings.Repeat("a", 508) + "bad"; stored != want {
+		t.Fatalf("stored error = %q, want %q", stored, want)
 	}
 }

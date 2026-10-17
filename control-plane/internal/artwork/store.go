@@ -169,13 +169,13 @@ func (s *Store) Save(ctx context.Context, r Record) error {
 // SaveIfAbsent is Save for the FIRST-TIME path only (#739): the provenance row
 // AND the app's render URLs are written in ONE transaction, but the insert is
 // ON CONFLICT (app_id) DO NOTHING and the app's URLs are touched only when the
-// row was actually inserted. "No row yet" reads as an answer, not a fact: an
-// admin pick or upload that lands while a resolve is fetching from the provider
+// row was actually inserted. Resolve's "no row yet" is a snapshot, not a
+// guarantee: an admin pick or upload that lands while a resolve is fetching from the provider
 // must win, so a resolve that loses the race discards its record and keeps
 // its hands off the app row. Returns whether it inserted.
 //
-// The upsert (Save) stays for every write that means to overwrite: the admin
-// paths, and SweepWrite's guarded writes to a row already read.
+// Save (the upsert) stays for the admin paths, which mean to overwrite;
+// SweepWrite keeps its own guarded update.
 func (s *Store) SaveIfAbsent(ctx context.Context, r Record) (bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

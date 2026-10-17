@@ -202,7 +202,7 @@ func resolveScan(ctx context.Context, q pgx.Tx, scanID, hostID string) (scanTarg
 // observations from a failed scan would let one bad pass mass-revoke a fleet's libraries.
 func (s *Store) MarkFailed(ctx context.Context, scanID, hostID, msg string) error {
 	if len(msg) > 512 {
-		msg = msg[:512]
+		msg = strings.ToValidUTF8(msg[:512], "") // a byte cut can split a rune; Postgres refuses the half (#738)
 	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE library_scans
