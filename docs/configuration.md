@@ -1112,6 +1112,13 @@ cookie), and `PULSE_SINK=quasar_output` (the session's baked-in null-sink, so a
 client picking a sink by name routes to it). `PULSE_SINK` is only defaulted when
 the app's catalog `runtime_spec.env` does not already set one.
 
+A derived Steam game tile (its `STEAM_STARTUP_FLAGS` carry `-applaunch <appid>`) also
+gets `QUASAR_LAUNCH_HELPER` and `QUASAR_LAUNCH_SOCKET`: the launch helper the agent
+copies into its runtime directory at start-up, and a per-session socket, both mounted
+read-only. The helper reports the game's launch state there, which the agent puts on
+`session_metrics.app_launch_state` and the `app.launch_state` trace event. No other app
+gets either, and neither is an operator knob.
+
 ---
 
 ## Node agent — console

@@ -84,23 +84,24 @@ pub struct WatchConfig {
 
 /// `-applaunch <id>` out of `STEAM_STARTUP_FLAGS`; None for anything else (plain Steam app).
 pub fn appid_from_flags(flags: &str) -> Option<u32> {
-    let mut tokens = flags.split_whitespace();
+    // The agent's rule (`node-agent/src/session/launch_helper.rs` `appid_from_env`): one
+    // `-applaunch`, then a bare positive integer with no sign or leading zero. Anything
+    // else is not a launch: refuse rather than guess.
+    let mut tokens = flags.split_ascii_whitespace();
+    let mut appid = None;
     while let Some(token) = tokens.next() {
         if token == "-applaunch" {
-            // A trailing `-applaunch` with nothing after it, or a next token
-            // that is not a plain non-zero integer, is not a launch: refuse
-            // rather than guess. Digits only, because `u32::from_str` would
-            // otherwise accept a leading `+`.
-            return tokens.next().and_then(|next| {
-                if !next.is_empty() && next.bytes().all(|b| b.is_ascii_digit()) {
-                    next.parse::<u32>().ok().filter(|id| *id != 0)
-                } else {
-                    None
-                }
-            });
+            let value = tokens.next()?;
+            if appid.is_some()
+                || value.starts_with('0')
+                || !value.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            appid = Some(value.parse().ok()?);
         }
     }
-    None
+    appid
 }
 
 pub struct Watcher {
@@ -517,6 +518,9 @@ fn needs_rank(reason: NeedsUser) -> u8 {
     }
 }
 
+/// The `STEAM_GAME` of Steam's own client windows (measured by the #723 spike).
+const STEAM_CLIENT_APPID: u32 = 769;
+
 fn classify_windows(windows: &[WindowInfo], appid: u32) -> Option<NeedsUser> {
     windows
         .iter()
@@ -537,6 +541,11 @@ fn classify_window(window: &WindowInfo, appid: u32) -> Option<NeedsUser> {
     }
     let title = window.title.to_lowercase();
     let class = window.wm_class.to_lowercase();
+    // Only Steam's own windows may use the generic words; a game's "Setup" or "Log in"
+    // never counts. Proton names a game's windows `steam_app_<id>`, which is not Steam.
+    let steams_own = window.steam_game == Some(STEAM_CLIENT_APPID)
+        || (class.contains("steam") && !class.contains("steam_app_"));
+    let generic = |words: &[&str]| steams_own && words.iter().any(|w| title.contains(w));
 
     if title.contains("steam guard") {
         Some(NeedsUser::SteamGuard)
@@ -551,15 +560,11 @@ fn classify_window(window: &WindowInfo, appid: u32) -> Option<NeedsUser> {
         Some(NeedsUser::Eula)
     } else if title.contains("self updater")
         || title.contains("updating steam")
-        || title.contains("install")
-        || title.contains("setup")
+        || generic(&["install", "setup"])
     {
         Some(NeedsUser::Install)
     } else if title.contains("sign in to steam")
-        || title.contains("sign in")
-        || title.contains("sign-in")
-        || title.contains("log in")
-        || title.contains("login")
+        || generic(&["sign in", "sign-in", "log in", "login"])
     {
         Some(NeedsUser::SignIn)
     } else if class.contains("steam") && (title.contains("dialog") || title.contains("prompt")) {

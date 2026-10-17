@@ -1214,6 +1214,9 @@ impl ContainerRuntime {
         if direct.is_none() {
             args.extend(wayland_mount_args(params));
         }
+        if let Some(helper) = params.launch_helper {
+            args.extend(helper.args());
+        }
 
         // ── GPU passthrough ───────────────────────────────────────────────────
         if spec.gpu {
@@ -1622,6 +1625,9 @@ pub struct LaunchParams<'a> {
     /// nested launch. With it, no Wayland socket, virtual devices or stream mode are
     /// handed in.
     pub direct_display: Option<super::console_plan::DirectDisplay>,
+    /// #731: the launch helper and its session socket; `None` unless the app is the
+    /// session's derived Steam tile.
+    pub launch_helper: Option<&'a super::launch_helper::LaunchMount>,
 }
 
 const APP_WAYLAND_RUNTIME_DIR: &str = "/run/quasar-wayland";
@@ -3823,6 +3829,7 @@ mod tests {
                 fps: 60,
             },
             direct_display: None,
+            launch_helper: None,
         };
 
         let args = wayland_mount_args(&params);

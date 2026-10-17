@@ -650,6 +650,20 @@
       "why": "Who owns the external size \u2014 'auto' (the ladder) or 'pinned' (a user/admin PATCH). Rides the size echo, so it is present only while the size is off the launch size."
     },
     {
+      "key": "app_launch_state",
+      "source": "agent",
+      "taxonomy": null,
+      "unit": "string",
+      "clock": "none",
+      "window": "snapshot",
+      "estimator": "last",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "#731",
+      "why": "The in-container launch helper's last report for a derived Steam tile ('starting' | 'client_only' | 'game_running' | 'game_exited'): present in every window once reported, absent on every other session, and absence means unknown. A hint, never a session-state authority (agent-api.md). On the wire but NOT stored: buildAgentMetrics does not keep it, and the control plane has no ingest for it yet.",
+      "stored": false
+    },
+    {
       "key": "fps",
       "source": "browser",
       "taxonomy": "client.fps",
@@ -1864,7 +1878,7 @@
         "appid"
       ],
       "clock": "host_wall",
-      "why": "Declared by agent-api.md as the event-driven counterpart of the app_launch_state sample key. Contract-defined; no node-agent emitter today."
+      "why": "The in-container launch helper reported a new app_launch_state for a derived Steam tile; appid is the tile's Steam appid as a string. One event per transition, capped per session; the event-driven counterpart of the app_launch_state sample key."
     },
     {
       "type": "diag.pipeline_dot",

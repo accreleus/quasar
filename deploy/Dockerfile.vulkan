@@ -750,6 +750,18 @@ RUN cd /src/node-agent \
         $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda ) \
     && install -Dm0755 target/release/quasar-node-agent /opt/agent/quasar-node-agent
 
+# ══ Launch helper (#731) ══════════════════════════════════════════════════════
+# The in-container Steam launch helper runs inside the Steam app image, whatever its
+# libc, so it is a static musl binary, built like deploy/Dockerfile.recovery on the same
+# digest-pinned rust:1.94.0-alpine. The runtime stage ships it beside the agent, which
+# copies it into its runtime dir for sessions to mount.
+FROM rust@sha256:ff0adc35894eb79586ce752a1b5a9eadc88b938c56d8f2b4b537b6258ff3fa10 AS launch-helper
+RUN apk add --no-cache musl-dev
+COPY node-agent /src/node-agent
+RUN cd /src/node-agent \
+    && cargo build --release --locked -p quasar-launch-helper \
+    && install -Dm0755 target/release/quasar-launch-helper /out/quasar-launch-helper
+
 # ══ Runtime stage (target: runtime → quasar-node-agent:latest) ════════════════════
 # The VA/Vulkan node-agent image, unchanged from the VK-01 image. NOT the default build result:
 # the #367 dev/nv targets live below this stage, and Docker builds the LAST stage (`nv`) when no
@@ -1001,6 +1013,7 @@ RUN printf '%s\n' \
 # list short and cheap: a COPY, a gst-inspect sweep, an rm. Anything expensive that
 # does not read the binary belongs above the line.
 COPY --from=build /opt/agent/quasar-node-agent /usr/local/bin/quasar-node-agent
+COPY --from=launch-helper /out/quasar-launch-helper /usr/local/bin/quasar-launch-helper
 
 # Build-time verification: device-FREE elements only. vulkanh264enc and vah264enc are registered
 # per-GPU at plugin-scan time (the "stale-registry trap", CLAUDE.md GStreamer gotchas) — this build

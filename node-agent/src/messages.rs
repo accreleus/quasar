@@ -356,6 +356,10 @@ pub enum AgentMsg {
         /// changes mode). Absent on a streamed session.
         #[serde(skip_serializing_if = "Option::is_none")]
         console_mode: Option<ConsoleModeSelection>,
+        /// #731: `app_launch_state` (agent-api.md), from the in-container launch helper.
+        /// Absent when the session has none or it has not reported yet.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        app_launch_state: Option<&'static str>,
     },
     /// Image-management P2: pull/remove progress for a managed catalog image on
     /// this host (agent-api.md `image_state`). Fire-and-forget like
@@ -478,6 +482,7 @@ impl AgentMsg {
                     refresh_millihz,
                 }
             }),
+            app_launch_state: w.app_launch_state,
         }
     }
 }
@@ -1449,6 +1454,7 @@ mod tests {
             ladder_fps: None,
             external_owner: None,
             console_mode: None,
+            app_launch_state: None,
         }
     }
 
@@ -2386,6 +2392,7 @@ mod tests {
             ladder_res_rung: Some(1),
             ladder_fps: Some(60),
             external_owner: Some("auto"),
+            app_launch_state: Some("game_running"),
             probe_capture_to_enc_in_p50_ms: Some(1.0),
             probe_capture_to_enc_in_p95_ms: Some(2.0),
             probe_enc_out_to_send_p50_ms: Some(3.0),
@@ -2406,6 +2413,7 @@ mod tests {
                 "abr_mode",
                 "abr_setpoint_kbps",
                 "adaptation_state",
+                "app_launch_state",
                 "bitrate_kbps",
                 "compositor_fps",
                 "compositor_pts_delta_p50_ms",
@@ -2466,6 +2474,7 @@ mod tests {
         assert_eq!(v["ladder_res_rung"], 1);
         assert_eq!(v["ladder_fps"], 60);
         assert_eq!(v["external_owner"], "auto");
+        assert_eq!(v["app_launch_state"], "game_running");
     }
 
     /// Amendment 19 (#455): the control plane sends the six-field console_config. It

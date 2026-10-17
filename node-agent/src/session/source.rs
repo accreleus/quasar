@@ -220,6 +220,9 @@ pub struct SessionResources {
     /// host for days; the only evidence was one WARN line, and they all reported
     /// `running`.
     audio_degraded: Option<String>,
+    /// #731: the launch helper's socket, when the session's first app is a derived
+    /// Steam tile. Dropped with the session, after its sources.
+    launch: Option<super::launch_helper::LaunchSocket>,
 }
 
 impl SessionResources {
@@ -330,9 +333,20 @@ impl SessionResources {
                 shared,
                 runtime_dir: cfg.runtime_dir.clone(),
                 audio_degraded,
+                launch: None,
             },
             pulse_server,
         ))
+    }
+
+    /// Give every source generation built after this the launch helper's mount.
+    pub fn set_launch(&mut self, socket: Option<super::launch_helper::LaunchSocket>) {
+        self.launch = socket;
+    }
+
+    /// What the launch helper has reported, for a session that has one.
+    pub fn launch(&self) -> Option<&super::launch_helper::LaunchSocket> {
+        self.launch.as_ref()
     }
 
     /// Why this session has no PulseAudio sidecar despite wanting one. See the field doc.
@@ -386,6 +400,7 @@ impl SessionResources {
             )),
             runtime_dir: String::new(),
             audio_degraded: None,
+            launch: None,
         }
     }
 }
@@ -530,6 +545,7 @@ pub struct AppSource {
     display: AppDisplayMode,
     device_nodes: Vec<PathBuf>,
     pulse: Option<(String, String)>,
+    launch: Option<super::launch_helper::LaunchMount>,
     container: Option<RunningContainer>,
     launched: bool,
     first_frame: Arc<AtomicBool>,
@@ -632,6 +648,7 @@ impl AppSource {
             },
             device_nodes: res.device_nodes(),
             pulse: res.pulse_mount(),
+            launch: res.launch.as_ref().map(|l| l.mount().clone()),
             container: None,
             launched: false,
             first_frame,
@@ -1142,6 +1159,11 @@ impl AppSource {
             nvidia_lib32_path: &self.nvidia_lib32_path,
             display: self.display,
             direct_display: None,
+            // A swap to another app gets no helper: the socket reports one appid.
+            launch_helper: self
+                .launch
+                .as_ref()
+                .and_then(|mount| mount.for_app(&effective_spec.env)),
         };
         // Snapshot the commit counter BEFORE the container exists, so anything counted
         // from here on can only have been drawn by the container about to start. Read

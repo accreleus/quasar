@@ -344,6 +344,18 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
                             "boot udev-export reconciliation: {summary:?}"
                         );
                     }
+                    let launch_summary = crate::session::launch_helper::retire_all_owned(
+                        &crate::session::default_runtime_dir(),
+                        &owner,
+                    );
+                    if launch_summary.errors > 0 {
+                        warn!(
+                            token = "launch-socket-reconcile-errors",
+                            "boot launch-helper socket reconciliation: {launch_summary:?}"
+                        );
+                    } else if launch_summary.removed > 0 {
+                        info!("boot launch-helper socket reconciliation: {launch_summary:?}");
+                    }
                     let media_summary = crate::host_probe::media_probe_dir::retire_all_owned(
                         &crate::host_probe::media_probe_dir::probe_parent_dir(),
                         &owner,
@@ -367,7 +379,7 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
                     }
                 }
                 Err(error) => warn!(token = "owned-entry-retire-no-owner", %error,
-                    "no owner token at boot; skipping udev-export and media-probe-dir reconciliation"),
+                    "no owner token at boot; skipping udev-export, launch-socket and media-probe-dir reconciliation"),
             }
         },
         || crate::agent::legacy_container_sweep(client),

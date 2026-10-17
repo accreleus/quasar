@@ -419,7 +419,7 @@ fn effective_encoder_device_path(
 }
 
 /// Wall-clock milliseconds for a trace event's `ts_unix_ms`.
-fn now_unix_ms() -> i64 {
+pub(crate) fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1867,7 +1867,7 @@ pub fn run_blocking(
 
     // Session-level resources (input devices + PulseAudio sidecar) shared across
     // swaps. Dropping `res` releases the sidecar; each AppSource borrows its nodes.
-    let (res, pulse_server) = match SessionResources::prepare(&session_id, &cfg) {
+    let (mut res, pulse_server) = match SessionResources::prepare(&session_id, &cfg) {
         Ok(pair) => pair,
         Err(e) => {
             tracing::error!(
@@ -1884,6 +1884,13 @@ pub fn run_blocking(
     if let Some(outcome) = res.home_seed {
         emit(SessionEvent::HomeSeed(outcome));
     }
+    res.set_launch(super::launch_helper::LaunchSocket::open(
+        &cfg.runtime_dir,
+        &session_id,
+        cfg.container.as_ref().map(|c| &c.env),
+        session_metrics.clone(),
+        diagnostic_tx.clone(),
+    ));
     cfg.pulse_server = pulse_server;
     if cfg.pulse_server.is_none() && !cfg.use_test_audio {
         // The sidecar was wanted and is not there: this session will stream SILENCE. A
