@@ -166,6 +166,51 @@ func (s *Store) Save(ctx context.Context, r Record) error {
 	return tx.Commit(ctx)
 }
 
+// SaveIfAbsent is Save for the FIRST-TIME path only (#739): the provenance row
+// AND the app's render URLs are written in ONE transaction, but the insert is
+// ON CONFLICT (app_id) DO NOTHING and the app's URLs are touched only when the
+// row was actually inserted. Resolve's "no row yet" is a snapshot, not a
+// guarantee: an admin pick or upload that lands while a resolve is fetching from the provider
+// must win, so a resolve that loses the race discards its record and keeps
+// its hands off the app row. Returns whether it inserted.
+//
+// Save (the upsert) stays for the admin paths, which mean to overwrite;
+// SweepWrite keeps its own guarded update.
+func (s *Store) SaveIfAbsent(ctx context.Context, r Record) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("artwork: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO app_artwork (app_id, source, provider, provider_ref, matched_name,
+		                         tile_asset, hero_asset, attribution, locked, updated_at,
+		                         logo_asset, icon_asset, logo_icon_checked)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12)
+		ON CONFLICT (app_id) DO NOTHING
+	`, r.AppID, r.Source, r.Provider, r.ProviderRef, r.MatchedName,
+		r.TileAsset, r.HeroAsset, r.Attribution, r.Locked,
+		r.LogoAsset, r.IconAsset, r.LogoIconChecked)
+	if err != nil {
+		return false, fmt.Errorf("artwork: insert: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// A concurrent writer won. Their record stands; touching the app's URLs
+		// here would overwrite it out from under that row.
+		return false, tx.Commit(ctx)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE apps SET cover_url = $2, hero_url = $3, logo_url = $4, icon_url = $5, updated_at = now()
+		WHERE id::text = $1
+	`, r.AppID, assetURLOrNil(r.TileAsset), assetURLOrNil(r.HeroAsset),
+		servedURL(r.LogoAsset, r.LogoLost), servedURL(r.IconAsset, r.IconLost)); err != nil {
+		return false, fmt.Errorf("artwork: update app urls: %w", err)
+	}
+	return true, tx.Commit(ctx)
+}
+
 // Clear removes the provenance row and NULLs the app's render URLs, returning
 // the app to the gradient tile. Deliberately does not delete the blobs — they
 // are content-addressed and possibly shared; PruneOrphans reclaims them.

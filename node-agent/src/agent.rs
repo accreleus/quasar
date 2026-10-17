@@ -4972,6 +4972,7 @@ impl SessionManager {
                 ("running", Some(format!("not displaying: {why}")), None)
             }
             SessionEvent::Stopping => ("stopping", Some("tearing down".to_string()), None),
+            SessionEvent::StoppingWith(why) => ("stopping", Some(why.to_string()), None),
             // A clean stop never carries an `error_message`. `detail` carries a reason
             // on a peer disconnect, recorded as `state_detail`, so operators see why it
             // ended without the row being classified `failed`.

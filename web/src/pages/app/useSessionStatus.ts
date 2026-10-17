@@ -11,7 +11,7 @@ import { getSession } from "../../api/library";
 import type { Session } from "../../api/types";
 import { reportBestEffortFailure } from "../../lib/reportBestEffortFailure";
 import { healthBanner, type HealthBanner } from "./streamHealth";
-import { accessRevokedFailure, launchFailureFromSession, settleFailure, showsAfterReveal, type LaunchFailure } from "./sessionFailure";
+import { accessRevokedFailure, gameExitedFailure, launchFailureFromSession, settleFailure, showsAfterReveal, type LaunchFailure } from "./sessionFailure";
 
 /** #484 §3.3: cap on how long the loader waits for "app presented" after
  * "app booting" before revealing anyway. Build-time constant — the design
@@ -158,6 +158,8 @@ export function useSessionStatus(
         }
         const revoked = accessRevokedFailure(session);
         if (revoked) noteFailure(revoked);
+        const exited = gameExitedFailure(session);
+        if (exited) noteFailure(exited);
         notePlacement(session as Session);
         // #484 §3.2: suppress the non-critical banners while the app hasn't
         // presented — healthBanner() itself decides which kinds that covers.

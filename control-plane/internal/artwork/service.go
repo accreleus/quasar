@@ -226,7 +226,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 	// in scheduling, admission, placement or discovery may branch on kind
 	// (spec §4.5.3).
 	if artworklessKinds[app.Kind] {
-		return s.save(ctx, Record{
+		return s.saveResolved(ctx, Record{
 			AppID:       app.ID,
 			Source:      SourceNone,
 			MatchedName: "",
@@ -243,7 +243,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 		return fmt.Errorf("artwork: search %q: %w", app.Name, err)
 	}
 	if len(candidates) == 0 {
-		return s.save(ctx, Record{AppID: app.ID, Source: SourceNone})
+		return s.saveResolved(ctx, Record{AppID: app.ID, Source: SourceNone})
 	}
 
 	// Only an exact normalised title match is accepted (spec §12.1): no
@@ -255,7 +255,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 		// No ProviderRef and no MatchedName — nothing was matched, and a
 		// stored MatchedName would read in the admin UI as "we matched this
 		// title", the false claim §12.1 exists to stop.
-		return s.save(ctx, Record{AppID: app.ID, Source: SourceNone})
+		return s.saveResolved(ctx, Record{AppID: app.ID, Source: SourceNone})
 	}
 	art, err := provider.Art(ctx, best.Ref)
 	if err != nil {
@@ -264,7 +264,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 	if art.TileURL == "" && art.HeroURL == "" {
 		// A matched title with no usable asset is still a decision: nothing to
 		// fetch now, and asking again next sweep would not change that.
-		return s.save(ctx, Record{
+		return s.saveResolved(ctx, Record{
 			AppID:       app.ID,
 			Source:      SourceNone,
 			Provider:    provider.Name(),
@@ -278,7 +278,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 		return err
 	}
 	logo, icon, checked := s.fetchLogoIcon(ctx, provider, "", best.Ref)
-	return s.save(ctx, Record{
+	return s.saveResolved(ctx, Record{
 		AppID:           app.ID,
 		Source:          SourceProvider,
 		Provider:        provider.Name(),
@@ -313,7 +313,7 @@ func (s *Service) resolveByExternalRef(ctx context.Context, app appRef) error {
 	// actually resolved the art. matched_name is whatever the provider
 	// volunteered; "" is honest, nothing was matched by title.
 	if err != nil || (art.TileURL == "" && art.HeroURL == "") {
-		return s.save(ctx, Record{
+		return s.saveResolved(ctx, Record{
 			AppID:       app.ID,
 			Source:      SourceNone,
 			Provider:    provider.Name(),
@@ -327,7 +327,7 @@ func (s *Service) resolveByExternalRef(ctx context.Context, app appRef) error {
 		return err
 	}
 	logo, icon, checked := s.fetchLogoIcon(ctx, provider, app.ExternalSource, app.ExternalID)
-	return s.save(ctx, Record{
+	return s.saveResolved(ctx, Record{
 		AppID:           app.ID,
 		Source:          SourceProvider,
 		Provider:        provider.Name(),
@@ -782,9 +782,15 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 		return
 	}
 	attempts := 0
+	// A stat that fails for a reason other than not-exist (a restore with the
+	// wrong owner) fails the same way for every app one sweep touches, so the
+	// warning answers once, with a count, not once per app (#734). The first
+	// error is kept verbatim; the per-app skip below is unchanged.
+	var checkErr error
+	checkApps := 0
 	for _, rec := range recs {
 		if ctx.Err() != nil {
-			return
+			break
 		}
 		// A logo or icon is served only when its file is known to be there. One that
 		// is gone is fetched again below; an unlocked provider record also forgets it,
@@ -807,7 +813,10 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 		tileMissing, tileErr := s.missing(rec.TileAsset)
 		heroMissing, heroErr := s.missing(rec.HeroAsset)
 		if err := errors.Join(tileErr, heroErr); err != nil {
-			s.log.Warn("artwork: could not check a cached image; it is not fetched again", "app_id", rec.AppID, "err", err)
+			checkApps++
+			if checkErr == nil {
+				checkErr = fmt.Errorf("app %s: %w", rec.AppID, err)
+			}
 			continue
 		}
 		if !tileMissing && !heroMissing && !logoGone && !iconGone {
@@ -839,6 +848,10 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 			s.log.Info("artwork: fetched a missing cached image again", "app_id", rec.AppID, "source", rec.Source)
 			res.ArtworkRepaired++
 		}
+	}
+	if checkErr != nil {
+		s.log.Warn("artwork: could not check cached images; they are not fetched again",
+			"apps", checkApps, "err", checkErr)
 	}
 }
 
@@ -963,6 +976,25 @@ func refSource(app appRef, ref string) string {
 func (s *Service) save(ctx context.Context, rec Record) error {
 	rec.LogoLost, rec.IconLost = !s.onDisk(rec.LogoAsset), !s.onDisk(rec.IconAsset)
 	return s.store.Save(ctx, rec)
+}
+
+// saveResolved is the write of a first-time Resolve's decision (#739): as save,
+// but insert-only. ok=false means a concurrent writer (an admin pick or upload,
+// or another resolve racing the same app) created the row between Resolve's
+// initial Get and this write: the concurrent writer's record stands, this
+// resolve's is discarded and nothing the app row says is touched. Any blobs this
+// resolve cached but the winning row does not reference are left for
+// PruneOrphans, which already reclaims every unreferenced blob.
+func (s *Service) saveResolved(ctx context.Context, rec Record) error {
+	rec.LogoLost, rec.IconLost = !s.onDisk(rec.LogoAsset), !s.onDisk(rec.IconAsset)
+	ok, err := s.store.SaveIfAbsent(ctx, rec)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		s.log.Debug("artwork: concurrent artwork write won over resolve", "app_id", rec.AppID, "source", rec.Source)
+	}
+	return nil
 }
 
 // onDisk is Has with an error read as "not known to be there".

@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -228,6 +229,13 @@ func (b *BlobStore) Has(name string) (bool, error) {
 // is also what cleans up after a re-match, where the old blob simply stops
 // being referenced by anything.
 //
+// A write left mid-flight by a killed process — between writeAtomic's create
+// and its rename — otherwise stays forever, so a `.tmp-*` file older than
+// tmpFileMaxAge goes too. A fresh one is left alone: its writer may still be
+// running, and the rename turns it into a file this sweep keeps. So is one
+// whose age cannot be read at all: this sweep deletes only what it is
+// certain it created.
+//
 // It returns the number of blobs removed; their sized variants (variants.go)
 // go with them uncounted. A file it cannot parse as an asset or variant name is
 // left alone: this function deletes only things it is certain it created.
@@ -241,6 +249,15 @@ func (b *BlobStore) PruneOrphans(referenced map[string]struct{}) (int, error) {
 			return nil
 		}
 		name, source := d.Name(), d.Name()
+		if strings.HasPrefix(name, ".tmp-") { // writeAtomic/Put's temp names
+			if fi, err := d.Info(); err != nil || time.Since(fi.ModTime()) < tmpFileMaxAge {
+				return nil // one whose age cannot be read is left alone, like a fresh one
+			}
+			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			return nil
+		}
 		if m := variantName.FindStringSubmatch(name); m != nil {
 			source = m[1] // a sized copy goes with its source
 		} else if !assetName.MatchString(name) {
@@ -263,6 +280,11 @@ func (b *BlobStore) PruneOrphans(referenced map[string]struct{}) (int, error) {
 	}
 	return removed, nil
 }
+
+// tmpFileMaxAge is how stale a `.tmp-*` file may get before a prune removes
+// it. A write in progress completes in far less, and never keeps its temp
+// file through a rename anyway; a killed process leaves the temp for good.
+const tmpFileMaxAge = 10 * time.Minute
 
 // normalizeMediaType strips parameters and casing from a media type
 // ("image/jpeg; charset=utf-8" → "image/jpeg").
