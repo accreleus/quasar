@@ -15,7 +15,8 @@
 //! - `console_log.txt` in Steam's log directory, read incrementally from the
 //!   end of whatever a previous session left behind — the second source,
 //!   which may move the state earlier than the reaper and may end it when
-//!   the reaper scan is unreadable;
+//!   the reaper scan is unreadable; `steamui_login.txt` beside it says when
+//!   Steam waits for a sign-in;
 //! - a caller-supplied window list and gamescope's published focus,
 //!   classified here; the core makes no X11 call. "Game window on screen" is
 //!   that focus (`GAMESCOPE_FOCUSED_APP` == the appid, amendment 1 from the
@@ -129,6 +130,7 @@ pub struct Watcher {
     /// A wait for the user read from the log, and when it was read.
     log_waiting: Option<(NeedsUser, Instant)>,
     log_discarding: bool,
+    login: LoginLog,
     running_via_reaper: bool,
     last_game_window: bool,
     active_needs: Option<NeedsUser>,
@@ -148,6 +150,7 @@ impl Watcher {
             log_game: None,
             log_waiting: None,
             log_discarding: false,
+            login: LoginLog::default(),
             running_via_reaper: false,
             last_game_window: false,
             active_needs: None,
@@ -170,6 +173,7 @@ impl Watcher {
             self.running_via_reaper = true;
         }
         self.read_log_tail();
+        self.read_login_state();
 
         let next = self.next_launch_state(&scan);
         if next != self.state {
@@ -213,9 +217,64 @@ impl Watcher {
     }
 
     fn held_log_needs(&self) -> Option<NeedsUser> {
-        self.log_waiting
+        let wait = self
+            .log_waiting
             .filter(|(_, since)| since.elapsed() >= USER_WAIT)
-            .map(|(reason, _)| reason)
+            .map(|(reason, _)| reason);
+        [wait, self.login.needs]
+            .into_iter()
+            .flatten()
+            .min_by_key(|reason| needs_rank(*reason))
+    }
+
+    /// Steam waiting for credentials is its sign-in screen, which under Big Picture has no
+    /// window of its own; any later login state clears it. #723: 75 of 76 signed-out starts
+    /// logged `SetLoginState: WaitingForCredentials`, none of 38 signed-in ones. Started at
+    /// the first poll's end like `console_log.txt`; a rotated tail is not chased.
+    fn read_login_state(&mut self) {
+        let path = self.cfg.steam_log_dir.join("steamui_login.txt");
+        let metadata = std::fs::metadata(&path);
+        if !self.login.seen {
+            self.login.seen = true;
+            if let Ok(seen) = &metadata {
+                self.login.file_id = Some(seen.ino());
+                self.login.offset = seen.len();
+            }
+            return;
+        }
+        let Ok(metadata) = metadata else {
+            return;
+        };
+        if self.login.file_id != Some(metadata.ino()) || metadata.len() < self.login.offset {
+            self.login.file_id = Some(metadata.ino());
+            self.login.offset = 0;
+        }
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return;
+        };
+        let mut bytes = Vec::new();
+        if file.seek(SeekFrom::Start(self.login.offset)).is_err()
+            || file
+                .take(MAX_LOG_BYTES_PER_PASS)
+                .read_to_end(&mut bytes)
+                .is_err()
+        {
+            return;
+        }
+        // Whole lines only: a partial one is read again next pass, unless it fills the slice.
+        let end = match bytes.iter().rposition(|b| *b == b'\n') {
+            Some(newline) => newline + 1,
+            None if bytes.len() as u64 == MAX_LOG_BYTES_PER_PASS => bytes.len(),
+            None => return,
+        };
+        self.login.offset += end as u64;
+        for line in String::from_utf8_lossy(&bytes[..end]).lines() {
+            if let Some(at) = line.find("SetLoginState: ") {
+                self.login.needs = line[at + "SetLoginState: ".len()..]
+                    .starts_with("WaitingForCredentials")
+                    .then_some(NeedsUser::SignIn);
+            }
+        }
     }
 
     fn update_needs(&mut self, desired: Option<NeedsUser>, reports: &mut Vec<Report>) {
@@ -419,6 +478,15 @@ impl Watcher {
             }
         }
     }
+}
+
+/// Where `steamui_login.txt` is read from, and the sign-in its last state means.
+#[derive(Default)]
+struct LoginLog {
+    seen: bool,
+    file_id: Option<u64>,
+    offset: u64,
+    needs: Option<NeedsUser>,
 }
 
 fn extract_appid(line: &str) -> Option<u32> {

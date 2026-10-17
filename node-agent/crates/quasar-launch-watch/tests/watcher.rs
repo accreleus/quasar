@@ -100,12 +100,23 @@ impl Rig {
     }
 
     fn append_log(&self, line: &str) {
+        self.append("console_log.txt", &format!("{line}\n"));
+    }
+
+    fn append(&self, file: &str, text: &str) {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.log_path())
+            .open(self.log_dir.join(file))
             .unwrap();
-        writeln!(file, "{line}").unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn login_state(&self, state: &str) {
+        self.append(
+            "steamui_login.txt",
+            &format!("[2026-10-16 09:37:10] [ None ] SetLoginState: {state} - OK\n"),
+        );
     }
 }
 
@@ -933,6 +944,73 @@ fn a_previous_file_that_is_not_the_one_being_read_is_ignored() {
     rig.append_log("GameAction [AppID 730, ActionID 1] : LaunchApp changed task to Completed");
     assert_eq!(rig.watcher.poll(), vec![]);
     assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn steam_waiting_for_credentials_needs_a_sign_in_until_a_later_state() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.login_state("WaitingForServerResponse");
+    assert_eq!(rig.watcher.poll(), vec![]);
+    // Signed out again (a wrong password, say): reported again.
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+}
+
+#[test]
+fn a_signed_in_start_never_needs_a_sign_in() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    for state in [
+        "WaitingForNetwork",
+        "WaitingForServerResponse",
+        "WaitingForLibraryReady",
+        "Success",
+    ] {
+        rig.login_state(state);
+        assert_eq!(rig.watcher.poll(), vec![], "{state}");
+    }
+}
+
+#[test]
+fn a_sign_in_wait_left_by_an_earlier_session_is_not_replayed() {
+    let mut rig = Rig::new();
+    rig.login_state("WaitingForCredentials");
+    write_proc(&rig.proc_root, 100, STEAM);
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![
+            Report::LaunchState(LaunchState::Starting),
+            Report::LaunchState(LaunchState::ClientOnly),
+        ]
+    );
+    assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn a_login_line_is_read_once_its_newline_is_written() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    rig.append("steamui_login.txt", "[ None ] SetLoginState: WaitingFor");
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.append("steamui_login.txt", "Credentials - OK\n");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
 }
 
 #[test]
