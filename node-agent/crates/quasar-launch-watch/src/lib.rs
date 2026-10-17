@@ -26,11 +26,19 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 // Bounds on input the game (same user, same container) controls.
 const MAX_CMDLINE_BYTES: u64 = 4 * 1024;
 const MAX_LOG_BYTES_PER_PASS: u64 = 1024 * 1024;
 const MAX_LOG_LINE_BYTES: usize = 64 * 1024;
+
+/// A `waiting for user response` means Steam needs the user only when no next task follows
+/// within this. Measured by the #723 spike: routine waits continued within 0.11 s (70/70).
+const USER_WAIT: Duration = Duration::from_secs(2);
+/// Waits that never need the user: the first two always continued at once (#723), and the
+/// shader cache clears itself (up to 17.4 s measured).
+const ROUTINE_WAITS: [&str; 3] = ["CreatingProcess", "ShowInterstitials", "ProcessingShaderCache"];
 
 /// Mirrors agent-api `session_metrics.app_launch_state`; serialises to the same strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -114,8 +122,8 @@ pub struct Watcher {
     log_seen: bool,
     log_pending: Vec<u8>,
     log_game: Option<bool>,
-    log_waiting_needs: Option<NeedsUser>,
-    log_waiting_fresh: bool,
+    /// A wait for the user read from the log, and when it was read.
+    log_waiting: Option<(NeedsUser, Instant)>,
     log_discarding: bool,
     running_via_reaper: bool,
     last_game_window: bool,
@@ -134,8 +142,7 @@ impl Watcher {
             log_seen: false,
             log_pending: Vec::new(),
             log_game: None,
-            log_waiting_needs: None,
-            log_waiting_fresh: false,
+            log_waiting: None,
             log_discarding: false,
             running_via_reaper: false,
             last_game_window: false,
@@ -198,18 +205,13 @@ impl Watcher {
             }
         }
 
-        // A wait read this pass only becomes reportable if it is still in
-        // force on a later poll (see parse_log_line).
-        self.log_waiting_fresh = false;
         reports
     }
 
     fn held_log_needs(&self) -> Option<NeedsUser> {
-        if self.log_waiting_fresh {
-            None
-        } else {
-            self.log_waiting_needs
-        }
+        self.log_waiting
+            .filter(|(_, since)| since.elapsed() >= USER_WAIT)
+            .map(|(reason, _)| reason)
     }
 
     fn update_needs(&mut self, desired: Option<NeedsUser>, reports: &mut Vec<Report>) {
@@ -261,6 +263,7 @@ impl Watcher {
 
     fn read_log_tail(&mut self) {
         let path = self.cfg.steam_log_dir.join("console_log.txt");
+        let previous = self.cfg.steam_log_dir.join("console_log.txt.previous");
         let metadata = std::fs::metadata(&path);
 
         // Decided on the first poll, not the first sighting: the home
@@ -270,6 +273,9 @@ impl Watcher {
         // session's and is read from 0 (the inode check below sees
         // None != Some(new inode) and restarts it). Only a new file
         // (rotation) or a shorter one (truncation) restarts at 0 after that.
+        // Steam rotates by size to `console_log.txt.previous` (#723): the
+        // rest of the file being read is finished there first, keeping what
+        // was learnt from it.
         if !self.log_seen {
             self.log_seen = true;
             if let Ok(seen) = &metadata {
@@ -283,7 +289,16 @@ impl Watcher {
         };
         let file_id = metadata.ino();
         if self.log_file_id != Some(file_id) {
-            self.reset_log();
+            match std::fs::metadata(&previous) {
+                Ok(old) if self.log_file_id == Some(old.ino()) => {
+                    if old.len() > self.log_offset {
+                        self.read_log_from(&previous);
+                        return;
+                    }
+                    self.restart_log();
+                }
+                _ => self.reset_log(),
+            }
             self.log_file_id = Some(file_id);
         }
         if metadata.len() < self.log_offset {
@@ -292,8 +307,12 @@ impl Watcher {
         if metadata.len() == self.log_offset {
             return;
         }
+        self.read_log_from(&path);
+    }
 
-        let Ok(mut file) = std::fs::File::open(&path) else {
+    /// One bounded slice of `path` from the current offset, parsed line by line.
+    fn read_log_from(&mut self, path: &std::path::Path) {
+        let Ok(mut file) = std::fs::File::open(path) else {
             return;
         };
         if file.seek(SeekFrom::Start(self.log_offset)).is_err() {
@@ -336,12 +355,16 @@ impl Watcher {
         }
     }
 
+    /// A truncated or unknown file: what was learnt from the old one no longer holds.
     fn reset_log(&mut self) {
+        self.restart_log();
+        self.log_game = None;
+        self.log_waiting = None;
+    }
+
+    fn restart_log(&mut self) {
         self.log_offset = 0;
         self.log_pending.clear();
-        self.log_game = None;
-        self.log_waiting_needs = None;
-        self.log_waiting_fresh = false;
         self.log_discarding = false;
     }
 
@@ -375,23 +398,20 @@ impl Watcher {
                     .split_whitespace()
                     .next()
                     .unwrap_or("");
-                // CreatingProcess waits on every ordinary launch, so it is
-                // never armed. Any other wait is armed fresh: it is only
-                // reported if still in force on a later poll, because a
-                // wait+continue pair written together is routine too, while
-                // a real hold (a cloud conflict) survives a poll.
-                if task != "CreatingProcess" {
-                    self.log_waiting_needs = Some(if task == "SynchronizingCloud" {
+                // Reported only if no next task follows within USER_WAIT
+                // (held_log_needs); a routine wait is never armed.
+                self.log_waiting = (!ROUTINE_WAITS.contains(&task)).then(|| {
+                    let reason = if task == "SynchronizingCloud" {
                         NeedsUser::CloudConflict
                     } else {
                         NeedsUser::Other
-                    });
-                    self.log_waiting_fresh = true;
-                }
+                    };
+                    (reason, Instant::now())
+                });
             } else if line.contains("LaunchApp continues with user response")
                 || line.contains("LaunchApp changed task to")
             {
-                self.log_waiting_needs = None;
+                self.log_waiting = None;
             }
         }
     }

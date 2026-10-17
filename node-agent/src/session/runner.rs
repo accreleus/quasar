@@ -2195,6 +2195,14 @@ pub fn run_blocking(
     let app_boot_budget = cfg.app_boot_timeout;
     let mut app_boot_started_at: Option<Instant> = None;
     let mut app_presented_at: Option<Instant> = None;
+    // #727: a derived tile's first genuine draw, and how long its reveal may wait after it.
+    let mut app_drawn_at: Option<Instant> = None;
+    let reveal_cap = res.launch().map_or(Duration::ZERO, |_| {
+        super::launch_helper::reveal_cap(
+            std::env::var("QUASAR_STEAM_REVEAL_CAP_SECS").ok(),
+            app_boot_budget,
+        )
+    });
     let mut app_boot_counter_warned = false;
     let mut app_boot_frames_at_first_commit: Option<u64> = None;
     let mut app_boot_last_wait_log = Instant::now();
@@ -2797,18 +2805,42 @@ pub fn run_blocking(
                          gst-wayland-display fork)"
                     );
                 }
-                if gen0_app_presented(true, commits, frames, &mut app_boot_frames_at_first_commit) {
+                // Only gen 0's tile waits: after a swap its helper reports nothing.
+                let held = res.launch().filter(|_| gen == 0 && !reveal_cap.is_zero());
+                if app_drawn_at.is_none()
+                    && gen0_app_presented(true, commits, frames, &mut app_boot_frames_at_first_commit)
+                {
+                    app_drawn_at = Some(Instant::now());
+                    if held.is_some() {
+                        tracing::info!(
+                            session_id = %session_id,
+                            "app boot: first frame after {} ms; holding the reveal for the game \
+                             (cap {}s)",
+                            boot_started.elapsed().as_millis(),
+                            reveal_cap.as_secs()
+                        );
+                    }
+                }
+                let reveal = app_drawn_at.and_then(|drawn| {
+                    super::launch_helper::reveal(held, drawn.elapsed(), reveal_cap)
+                });
+                if let Some(reveal) = reveal {
                     let elapsed = boot_started.elapsed();
                     app_presented_at = Some(Instant::now());
                     emit(SessionEvent::AppPresented);
                     tracing::info!(
                         session_id = %session_id,
+                        reveal,
                         "app boot: app presented its first frame after {} ms \
                          (app_surface_commits={}, sink_frames={frames}, gen={gen})",
                         elapsed.as_millis(),
                         commits.unwrap_or(0)
                     );
-                } else if app_boot_watchdog_fires(app_boot_budget, boot_started.elapsed(), false) {
+                } else if app_boot_watchdog_fires(
+                    app_boot_budget,
+                    boot_started.elapsed(),
+                    app_drawn_at.is_some(),
+                ) {
                     // Bounded, so the reaper exemption above can never become an unkillable
                     // session, and the verdict names the app instead of a mute idle reap.
                     let budget_secs = app_boot_budget.map(|b| b.as_secs()).unwrap_or(0);
@@ -2829,7 +2861,9 @@ pub fn run_blocking(
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     return;
-                } else if app_boot_last_wait_log.elapsed() >= APP_BOOT_WAIT_LOG_INTERVAL {
+                } else if app_drawn_at.is_none()
+                    && app_boot_last_wait_log.elapsed() >= APP_BOOT_WAIT_LOG_INTERVAL
+                {
                     app_boot_last_wait_log = Instant::now();
                     tracing::info!(
                         session_id = %session_id,

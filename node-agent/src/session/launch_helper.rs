@@ -46,6 +46,8 @@ const POLL: Duration = Duration::from_millis(100);
 /// cannot keep the helper out; the helper reconnects when its next line fails.
 pub const IDLE: Duration = Duration::from_secs(1);
 const LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// About twice the slowest launch the #723 spike measured (43.9 s).
+pub const REVEAL_CAP_DEFAULT_SECS: u64 = 90;
 
 /// Copy the helper shipped beside the agent binary into the runtime dir, the one path the
 /// host shares 1:1 with the agent's container, so sessions can bind-mount it. Any older
@@ -245,6 +247,57 @@ pub struct LaunchReports {
     /// A `game_running` was taken since the reader was last armed, which is what makes
     /// a later `game_exited` legal.
     pub seen_running: bool,
+}
+
+/// `QUASAR_STEAM_REVEAL_CAP_SECS`, no higher than the app boot watchdog's budget.
+pub fn reveal_cap(raw: Option<String>, boot_budget: Option<Duration>) -> Duration {
+    let secs = match raw {
+        Some(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(
+                token = "knob-invalid-steam-reveal-cap",
+                "QUASAR_STEAM_REVEAL_CAP_SECS={v:?} is not a number; \
+                 using the default {REVEAL_CAP_DEFAULT_SECS}s"
+            );
+            REVEAL_CAP_DEFAULT_SECS
+        }),
+        None => REVEAL_CAP_DEFAULT_SECS,
+    };
+    let cap = Duration::from_secs(secs);
+    match boot_budget {
+        Some(budget) if cap > budget => {
+            tracing::warn!(
+                token = "knob-steam-reveal-cap-clamped",
+                "QUASAR_STEAM_REVEAL_CAP_SECS={secs} is above the app boot watchdog's {}s; using that",
+                budget.as_secs()
+            );
+            budget
+        }
+        _ => cap,
+    }
+}
+
+/// Why a first frame drawn `held_for` ago may be shown now, or `None` to hold it (#727).
+/// Only a derived tile with a helper waits: for its game on screen or Steam needing the user,
+/// at most `cap`. The reports are hints: a false one reveals the session's own stream early,
+/// and nothing they say holds it past `cap`.
+pub fn reveal(
+    launch: Option<&LaunchSocket>,
+    held_for: Duration,
+    cap: Duration,
+) -> Option<&'static str> {
+    let Some(launch) = launch else {
+        return Some("first frame");
+    };
+    let reports = launch.reports();
+    if reports.game_window_on_screen == Some(true) {
+        Some("game window on screen")
+    } else if reports.needs_user.is_some() {
+        Some("Steam needs the user")
+    } else if held_for >= cap {
+        Some("reveal cap reached")
+    } else {
+        None
+    }
 }
 
 /// Launch states move forward (#725 amendment 2): `game_exited` only once `game_running`
@@ -1316,6 +1369,74 @@ mod tests {
         assert_eq!(mode(&dir), 0o755);
         assert_eq!(mode(&dir.join(SOCKET_FILE)), 0o666);
         assert_eq!(s.socket().mount().appid, 620);
+    }
+
+    const CAP: Duration = Duration::from_secs(90);
+
+    #[test]
+    fn the_first_frame_is_held_until_the_game_is_on_screen() {
+        let s = Session::open(620);
+        let held = |s: &Session| reveal(s.socket.as_ref(), Duration::ZERO, CAP);
+        assert_eq!(held(&s), None, "nothing reported yet");
+        let mut helper = s.connect();
+        helper.write_all(CLIENT_ONLY).unwrap();
+        helper
+            .write_all(b"{\"type\":\"game_window\",\"v\":1,\"on_screen\":false}\n")
+            .unwrap();
+        s.wait_for(|r| r.game_window_on_screen.is_some());
+        assert_eq!(held(&s), None, "Steam on screen is not the game");
+        helper.write_all(GAME_WINDOW).unwrap();
+        s.wait_for(|r| r.game_window_on_screen == Some(true));
+        assert_eq!(held(&s), Some("game window on screen"));
+    }
+
+    #[test]
+    fn steam_needing_the_user_reveals_steam() {
+        let s = Session::open(620);
+        s.connect()
+            .write_all(b"{\"type\":\"steam_needs_user\",\"v\":1,\"reason\":\"sign_in\"}\n")
+            .unwrap();
+        s.wait_for(|r| r.needs_user.is_some());
+        assert_eq!(
+            reveal(s.socket.as_ref(), Duration::ZERO, CAP),
+            Some("Steam needs the user")
+        );
+    }
+
+    #[test]
+    fn a_silent_or_absent_helper_is_revealed_at_the_cap_and_not_later() {
+        let cap = Duration::from_millis(300);
+        for connects in [false, true] {
+            let s = Session::open(620);
+            let _helper = connects.then(|| s.connect());
+            let drawn = Instant::now();
+            while reveal(s.socket.as_ref(), drawn.elapsed(), cap).is_none() {
+                assert!(drawn.elapsed() < cap * 2, "held past the cap");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(drawn.elapsed() >= cap, "connects={connects}");
+            assert_eq!(
+                reveal(s.socket.as_ref(), drawn.elapsed(), cap),
+                Some("reveal cap reached")
+            );
+        }
+    }
+
+    #[test]
+    fn with_no_helper_the_first_frame_is_shown() {
+        assert_eq!(reveal(None, Duration::ZERO, CAP), Some("first frame"));
+    }
+
+    #[test]
+    fn the_reveal_cap_defaults_to_90_s_and_stays_within_the_boot_watchdog() {
+        let budget = Some(Duration::from_secs(300));
+        let secs = |raw: Option<&str>, budget| reveal_cap(raw.map(String::from), budget).as_secs();
+        assert_eq!(secs(None, budget), 90);
+        assert_eq!(secs(Some("0"), budget), 0, "0 holds nothing");
+        assert_eq!(secs(Some(" 45 "), budget), 45);
+        assert_eq!(secs(Some("soon"), budget), 90);
+        assert_eq!(secs(Some("400"), budget), 300, "clamped to the watchdog");
+        assert_eq!(secs(Some("400"), None), 400, "no watchdog, no clamp");
     }
 
     #[test]

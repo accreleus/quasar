@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const APPID: u32 = 730;
+/// Past the core's two seconds for a wait for the user to stand.
+const PAST_USER_WAIT: std::time::Duration = std::time::Duration::from_millis(2100);
 const STEAM: &[&str] = &[
     "/home/gamer/.local/share/Steam/ubuntu12_64/steam",
     "-bigpicture",
@@ -286,8 +288,7 @@ fn fixture_console_log_drives_transitions_line_by_line() {
     rig.append_log(lines.next().unwrap());
     assert_eq!(rig.watcher.poll(), vec![]);
 
-    // A wait read and cleared between polls never reports (see the
-    // held-for-a-poll rule in waiting_for_user_response_reports_once_and_clears).
+    // A wait answered within two seconds never reports.
     rig.append_log(lines.next().unwrap());
     assert_eq!(rig.watcher.poll(), vec![]);
     rig.append_log(lines.next().unwrap());
@@ -692,11 +693,13 @@ fn waiting_for_user_response_reports_once_and_clears() {
         ]
     );
 
-    // Read on this poll: not yet reported. Still held on the next: reported.
+    // Not reported until no next task has followed for two seconds, then once.
     rig.append_log(&format!(
         "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
+    assert_eq!(rig.watcher.poll(), vec![]);
+    std::thread::sleep(PAST_USER_WAIT);
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::SteamNeedsUser(NeedsUser::CloudConflict)]
@@ -712,20 +715,7 @@ fn waiting_for_user_response_reports_once_and_clears() {
         "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SiteLicenseSeatCheckout \"\""
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
-    assert_eq!(
-        rig.watcher.poll(),
-        vec![Report::SteamNeedsUser(NeedsUser::Other)]
-    );
-
-    // Cleared by the next changed-task line for the app.
-    rig.append_log(&format!(
-        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to WaitingGameWindow"
-    ));
-    assert_eq!(rig.watcher.poll(), vec![]);
-    rig.append_log(&format!(
-        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SiteLicenseSeatCheckout \"\""
-    ));
-    assert_eq!(rig.watcher.poll(), vec![]);
+    std::thread::sleep(PAST_USER_WAIT);
     assert_eq!(
         rig.watcher.poll(),
         vec![Report::SteamNeedsUser(NeedsUser::Other)]
@@ -733,22 +723,44 @@ fn waiting_for_user_response_reports_once_and_clears() {
 }
 
 #[test]
-fn creating_process_wait_alone_reports_nothing() {
+fn a_wait_answered_within_two_seconds_reports_nothing_across_polls() {
     let mut rig = Rig::new();
     write_proc(&rig.proc_root, 100, STEAM);
-    assert_eq!(
-        rig.watcher.poll(),
-        vec![
-            Report::LaunchState(LaunchState::Starting),
-            Report::LaunchState(LaunchState::ClientOnly),
-        ]
-    );
+    rig.watcher.poll();
 
     rig.append_log(&format!(
-        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to CreatingProcess \"\""
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""
+    ));
+    for _ in 0..4 {
+        assert_eq!(rig.watcher.poll(), vec![]);
+    }
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to WaitingGameWindow"
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
+    std::thread::sleep(PAST_USER_WAIT);
     assert_eq!(rig.watcher.poll(), vec![]);
+}
+
+#[test]
+fn routine_waits_never_report_however_long_they_stand() {
+    let mut rigs: Vec<Rig> = ["CreatingProcess", "ShowInterstitials", "ProcessingShaderCache"]
+        .into_iter()
+        .map(|task| {
+            let mut rig = Rig::new();
+            write_proc(&rig.proc_root, 100, STEAM);
+            rig.watcher.poll();
+            rig.append_log(&format!(
+                "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to {task} \"\""
+            ));
+            assert_eq!(rig.watcher.poll(), vec![], "{task}");
+            rig
+        })
+        .collect();
+    std::thread::sleep(PAST_USER_WAIT);
+    for rig in &mut rigs {
+        assert_eq!(rig.watcher.poll(), vec![]);
+    }
 }
 
 #[test]
@@ -872,6 +884,55 @@ fn rotation_is_read_from_zero() {
         rig.watcher.poll(),
         vec![Report::LaunchState(LaunchState::GameRunning)]
     );
+}
+
+#[test]
+fn rotation_finishes_the_previous_file_from_its_offset_then_reads_the_new_one_from_zero() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    rig.append_log("GameAction [AppID 730, ActionID 1] : LaunchApp changed task to Completed");
+    assert_eq!(rig.watcher.poll(), vec![]);
+
+    // Written to the old file after the last pass, then Steam rotates it by size.
+    rig.append_log(&format!(
+        "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
+    ));
+    let previous = rig.log_dir.join("console_log.txt.previous");
+    std::fs::rename(rig.log_path(), &previous).unwrap();
+    rig.append_log(&format!(
+        "Game process removed: AppID {APPID} \"game\", ProcID 201"
+    ));
+
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameRunning)],
+        "the old file's tail first"
+    );
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::LaunchState(LaunchState::GameExited)],
+        "then the new file from 0"
+    );
+}
+
+#[test]
+fn a_previous_file_that_is_not_the_one_being_read_is_ignored() {
+    let mut rig = Rig::new();
+    let previous = rig.log_dir.join("console_log.txt.previous");
+    std::fs::write(
+        &previous,
+        format!("Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0\n"),
+    )
+    .unwrap();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+
+    // Replaced without a rotation: the stale `.previous` is not this file's tail.
+    std::fs::remove_file(rig.log_path()).unwrap();
+    rig.append_log("GameAction [AppID 730, ActionID 1] : LaunchApp changed task to Completed");
+    assert_eq!(rig.watcher.poll(), vec![]);
+    assert_eq!(rig.watcher.poll(), vec![]);
 }
 
 #[test]
