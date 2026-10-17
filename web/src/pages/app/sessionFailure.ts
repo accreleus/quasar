@@ -205,7 +205,11 @@ export function accessRevokedFailure(s: StopReasonInput): LaunchFailure | null {
  * the page navigates to the library. The detail is advisory text, so this only picks where
  * the user lands, nothing depends on it for correctness. */
 export function gameExitedFailure(s: Pick<Session, "state" | "state_detail">): LaunchFailure | null {
-  if (s.state !== "stopped" || s.state_detail !== GAME_EXITED_DETAIL) return null;
+  // `stopping` too: the agent says why before the container stop finishes, and that is
+  // the row the browser's first poll after the stream drops usually reads.
+  if ((s.state !== "stopped" && s.state !== "stopping") || s.state_detail !== GAME_EXITED_DETAIL) {
+    return null;
+  }
   return { kind: "game_exited", title: "Game closed", message: "The game was closed." };
 }
 
@@ -215,7 +219,8 @@ export function isBannerVerdict(f: LaunchFailure): boolean {
 }
 
 /** What the page can still show after the loader's reveal has begun: a banner
- * verdict, or its own "unreachable" guess (the recovery banner covers that one).
+ * verdict, a game exit (the page leaves for the library), or its own "unreachable"
+ * guess (the recovery banner covers that one).
  * Anything else is loader copy, and the loader is inert by then.
  * Invariant: once the reveal has begun, the page holds no verdict it cannot show.
  * The write gate (`noteFailure`) keeps one in out; the reveal gate (`revealReady`)
@@ -226,9 +231,11 @@ export function showsAfterReveal(f: LaunchFailure): boolean {
 
 /** The one precedence rule for the page's sticky verdict: the browser's own
  * guess ("unreachable") yields to anything the control plane says about the
- * session's end, a revoked access beats every other verdict, and otherwise the
- * first verdict stands. */
+ * session's end, a revoked access beats every other verdict, a game exit beats the rest
+ * (a `stopping` / "tearing down" read before it must not hold the page back), and otherwise
+ * the first verdict stands. */
 export function settleFailure(prev: LaunchFailure | null, next: LaunchFailure): LaunchFailure {
-  const rank = (f: LaunchFailure) => (f.kind === "unreachable" ? 0 : f.kind === "access_revoked" ? 2 : 1);
+  const rank = (f: LaunchFailure) =>
+    f.kind === "unreachable" ? 0 : f.kind === "access_revoked" ? 3 : f.kind === "game_exited" ? 2 : 1;
   return prev && rank(prev) >= rank(next) ? prev : next;
 }
