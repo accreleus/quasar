@@ -56,6 +56,10 @@ fn is_sctp_association_error(message: &str) -> bool {
 /// agent fault).
 const PEER_DISCONNECT_DETAIL: &str = "peer disconnected: WebRTC data channel closed";
 
+/// `stopped` detail for a Steam game the player quit (#726): the browser returns to the
+/// library. The text is matched by the web client; `control-api.md` specifies it.
+const GAME_EXITED_DETAIL: &str = "game exited";
+
 /// The browser can close its peer connection before the Stop command finishes
 /// traversing control-plane -> agent WS, so the SCTP error can arrive before the stop
 /// flag. Wait out the grace period only for this signature; every other pipeline error
@@ -2234,6 +2238,26 @@ pub fn run_blocking(
             return;
         }
 
+        // The player quit the Steam game (#726): a normal end, not a container exit (Steam
+        // keeps running). One mutex read per 100 ms tick, so the end follows the helper's
+        // 250 ms poll by at most one tick.
+        if res.launch().is_some_and(|l| l.reports().game_exited()) {
+            tracing::info!(
+                token = "launch-game-exited",
+                session_id = %session_id,
+                "the Steam game exited; ending the session"
+            );
+            emit(SessionEvent::Stopping);
+            stop_source(&mut current_source, &transports);
+            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
+            transports.audio_pipeline.finish();
+            emit(SessionEvent::Stopped {
+                bytes_used: compute_bytes_used(&cfg),
+                detail: Some(GAME_EXITED_DETAIL),
+            });
+            return;
+        }
+
         // Outbound signaling (offer/ICE) to the control-plane relay; the first offer means
         // live. The running-transition is single-shot via the `!running` guard, and
         // `AppSource::first_frame` is an idempotent `AtomicBool` store rather than a
@@ -3222,6 +3246,12 @@ fn perform_swap(
         contexts.assert_source(&new_source).map_err(|e| {
             SwapFailure::rolled_back(format!("verify replacement Vulkan context identity: {e:#}"))
         })?;
+    }
+
+    // Past here the outgoing game closes because we closed it, not because the player
+    // quit: stop reading the helper (#726). A rollback relaunch re-arms it.
+    if let Some(launch) = res.launch() {
+        launch.mount().mute();
     }
 
     // ── Step 2: stop the outgoing app and WAIT for it to exit ────────────────

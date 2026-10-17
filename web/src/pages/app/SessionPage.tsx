@@ -461,6 +461,12 @@ function SessionPageBody() {
     (launchFailure != null && (launchFailure.kind !== "unreachable" || !channelOpen)) ||
     (recovery?.phase === "failed" && !channelOpen);
 
+  // #726: the player quit the game; the session ended normally, so go back to the library.
+  const gameExited = launchFailure?.kind === "game_exited";
+  useEffect(() => {
+    if (gameExited) navigate("/app", { replace: true });
+  }, [gameExited, navigate]);
+
   // Release what leaving the page releases, without destroying the transport:
   // a destroy would say `bye` to a session another tab now owns.
   useEffect(() => {

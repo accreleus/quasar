@@ -21,7 +21,9 @@ export type LaunchFailureKind =
   /** #526 — another tab/window/device attached to this session and won. */
   | "taken_over"
   /** #516 — the control plane stopped the session: its owner lost access to the app. */
-  | "access_revoked";
+  | "access_revoked"
+  /** #726 — the player quit the Steam game; the page returns to the library. */
+  | "game_exited";
 
 export interface LaunchFailure {
   kind: LaunchFailureKind;
@@ -57,6 +59,9 @@ const FAILURE_CODE_GENERIC_MESSAGE: Partial<Record<string, string>> = {
   app_never_presented:
     "The app produced no video within the boot time limit. Nothing is running, so it is safe to launch again.",
 };
+
+/** The agent's `stopped` detail for a quit Steam game (node-agent `GAME_EXITED_DETAIL`). */
+const GAME_EXITED_DETAIL = "game exited";
 
 // Defensive fallback ONLY, for a session whose reason arrives embedded in
 // error_message text instead of the structured fields above (e.g. a
@@ -142,6 +147,8 @@ export function launchFailureFromSession(s: SessionVerdictInput): LaunchFailure 
       detail: s.error_message ?? s.state_detail ?? undefined,
     };
   }
+  const exited = gameExitedFailure(s);
+  if (exited) return exited;
   if (s.state === "stopping" || s.state === "stopped") {
     return {
       kind: "ended",
@@ -193,6 +200,15 @@ export function accessRevokedFailure(s: StopReasonInput): LaunchFailure | null {
   };
 }
 
+/** #726 — a normal end the player asked for by quitting the game (`control-api.md`
+ * `state_detail` "game exited"); null for any other end. Not a failure and not a banner:
+ * the page navigates to the library. The detail is advisory text, so this only picks where
+ * the user lands, nothing depends on it for correctness. */
+export function gameExitedFailure(s: Pick<Session, "state" | "state_detail">): LaunchFailure | null {
+  if (s.state !== "stopped" || s.state_detail !== GAME_EXITED_DETAIL) return null;
+  return { kind: "game_exited", title: "Game closed", message: "The game was closed." };
+}
+
 /** The kinds that have a banner once the loader is gone. */
 export function isBannerVerdict(f: LaunchFailure): boolean {
   return f.kind === "access_revoked" || f.kind === "taken_over";
@@ -205,7 +221,7 @@ export function isBannerVerdict(f: LaunchFailure): boolean {
  * The write gate (`noteFailure`) keeps one in out; the reveal gate (`revealReady`)
  * keeps the reveal from beginning while one is held. */
 export function showsAfterReveal(f: LaunchFailure): boolean {
-  return isBannerVerdict(f) || f.kind === "unreachable";
+  return isBannerVerdict(f) || f.kind === "unreachable" || f.kind === "game_exited";
 }
 
 /** The one precedence rule for the page's sticky verdict: the browser's own

@@ -182,7 +182,7 @@ function renderPage(strict = false) {
         <ToastProvider>
           <Routes>
             <Route path="/app/session/:id" element={<SessionPage />} />
-            <Route path="/app" element={null} />
+            <Route path="/app" element={<div data-testid="library" />} />
           </Routes>
         </ToastProvider>
       </ThemeProvider>
@@ -278,6 +278,24 @@ describe("SessionPage — a session that is over for this page releases the mic 
     expect(detachMicTrack).toHaveBeenCalled();
   });
 
+  it("game exited: the page goes back to the library, no recovery banner (#726)", async () => {
+    await streamingWithMicAndCapture();
+    expect(screen.queryByTestId("library")).toBeNull();
+    currentSession = makeSession({ state: "stopped", state_detail: "game exited" });
+    await advance(5_500);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  it("game exited, found through the dropped connection's poll instead of the health tick", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopped", state_detail: "game exited" });
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
   it("host lost", async () => {
     await streamingWithMicAndCapture();
     currentSession = makeSession({ state: "failed", state_detail: "host_lost" });
@@ -328,6 +346,22 @@ describe("SessionPage — a session that is over for this page releases the mic 
     expect(micIndicator()).toBeNull();
     expect(attachMicTrack).not.toHaveBeenCalled();
     expect(screen.queryByText("Microphone failed")).toBeNull();
+  });
+});
+
+describe("SessionPage — an ordinary stop is not a game exit (#726)", () => {
+  it("any other stop keeps the recovery banner and stays on the page (#726)", async () => {
+    currentSession = makeSession({ state: "stopped", state_detail: "peer disconnected: WebRTC data channel closed" });
+    renderPage();
+    await advance(1_000);
+    await act(async () => lastOnChannel?.({ readyState: "open", onclose: null, send() {}, bufferedAmount: 0 }));
+    await advance(3_000);
+    refused();
+    const rc = new RecoveryController({ onRetry: () => {}, onState: (st) => lastOnRecovery?.(st as never) });
+    await act(async () => rc.terminal("signaling: session not found or already ended"));
+    await advance(100);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    expect(screen.queryByTestId("library")).toBeNull();
   });
 });
 
