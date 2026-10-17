@@ -44,6 +44,7 @@ own; the two do not move together, and that is deliberate.
 - **The vendored bench client is re-vendored to quasar-bench 1.10.0 (`bench.py` and `qbench`, from the same commit).** It was 1.7.0, so `bench post` warned that the server had a newer client. Only the vendored copy changes; the harness code that calls it is untouched.
 
 - **The golden-home warm-up sets Steam's Big Picture flag itself (#724).** Steam's UI mode is moving out of the Steam image, so the warm-up no longer relies on the image's default; it starts Big Picture the same way as before.
+- **The in-stream game switcher, the search icon and the game page's related tiles ask for the artwork size they draw (#734).** The switcher's covers were full size on every screen; they now download a 320 to 560 px copy by screen density, and the search icon and related tiles pick a size for their box and pixel density. Layout is unchanged.
 
 ### Fixed
 - **A library scan no longer fails forever over a game name with bad bytes in it (#738).** A Steam manifest name containing a NUL byte made the scan's database write fail, which rolled the whole scan back and failed every later scan the same way, so the library never updated. The reported text is cleaned at the scan report's edge — the same repair the app-details store texts get — and a name left empty still falls back to the app ID. A scan's own failure message is cleaned too, and cut to its length cap without splitting a character.
