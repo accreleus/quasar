@@ -924,6 +924,17 @@ impl AppSource {
         Some(source.property::<u64>(APP_SURFACE_COMMITS))
     }
 
+    /// [`Self::app_surface_commits`] counted from the current container's launch, so a
+    /// rollback's relaunch draws its own first frame (#727). Same fallback as
+    /// [`Self::app_has_presented`] when the counter went backwards.
+    pub fn app_commits_since_launch(&self) -> Option<u64> {
+        let now = self.app_surface_commits()?;
+        Some(match self.app_commits_at_launch {
+            Some(base) if now >= base => now - base,
+            _ => now,
+        })
+    }
+
     /// Whether this generation launches an app container at all. `false` for a bare
     /// compositor and for `use_test_src`: neither can ever report an app-surface commit,
     /// so the swap gate must not wait for one.

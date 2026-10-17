@@ -249,7 +249,8 @@ pub struct LaunchReports {
     pub seen_running: bool,
 }
 
-/// `QUASAR_STEAM_REVEAL_CAP_SECS`, no higher than the app boot watchdog's budget.
+/// `QUASAR_STEAM_REVEAL_CAP_SECS`, no higher than the app boot watchdog's budget, or than
+/// that budget's default when the watchdog is off.
 pub fn reveal_cap(raw: Option<String>, boot_budget: Option<Duration>) -> Duration {
     let secs = match raw {
         Some(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
@@ -262,33 +263,34 @@ pub fn reveal_cap(raw: Option<String>, boot_budget: Option<Duration>) -> Duratio
         }),
         None => REVEAL_CAP_DEFAULT_SECS,
     };
+    let ceiling = boot_budget.unwrap_or(Duration::from_secs(
+        crate::session::settings::APP_BOOT_TIMEOUT_DEFAULT_SECS,
+    ));
     let cap = Duration::from_secs(secs);
-    match boot_budget {
-        Some(budget) if cap > budget => {
-            tracing::warn!(
-                token = "knob-steam-reveal-cap-clamped",
-                "QUASAR_STEAM_REVEAL_CAP_SECS={secs} is above the app boot watchdog's {}s; using that",
-                budget.as_secs()
-            );
-            budget
-        }
-        _ => cap,
+    if cap > ceiling {
+        tracing::warn!(
+            token = "knob-steam-reveal-cap-clamped",
+            "QUASAR_STEAM_REVEAL_CAP_SECS={secs} is above the app boot watchdog's {}s; using that",
+            ceiling.as_secs()
+        );
+        return ceiling;
     }
+    cap
 }
 
 /// Why a first frame drawn `held_for` ago may be shown now, or `None` to hold it (#727).
-/// Only a derived tile with a helper waits: for its game on screen or Steam needing the user,
-/// at most `cap`. The reports are hints: a false one reveals the session's own stream early,
-/// and nothing they say holds it past `cap`.
+/// `held` is the tile's reports while its helper is armed ([`LaunchSocket::armed_reports`]);
+/// only then does the reveal wait: for the game on screen or Steam needing the user, at most
+/// `cap`. The reports are hints: a false one reveals the session's own stream early, and
+/// nothing they say holds it past `cap`.
 pub fn reveal(
-    launch: Option<&LaunchSocket>,
+    held: Option<LaunchReports>,
     held_for: Duration,
     cap: Duration,
 ) -> Option<&'static str> {
-    let Some(launch) = launch else {
+    let Some(reports) = held else {
         return Some("first frame");
     };
-    let reports = launch.reports();
     if reports.game_window_on_screen == Some(true) {
         Some("game window on screen")
     } else if reports.needs_user.is_some() {
@@ -523,6 +525,17 @@ impl LaunchSocket {
 
     pub fn reports(&self) -> LaunchReports {
         *self.mount.shared.reports()
+    }
+
+    /// [`Self::reports`] while the live app is this session's derived tile; `None` after a
+    /// swap to another app, until a swap or a rollback launches the tile again.
+    pub fn armed_reports(&self) -> Option<LaunchReports> {
+        let reports = self.mount.shared.reports();
+        self.mount
+            .shared
+            .active
+            .load(Ordering::Relaxed)
+            .then_some(*reports)
     }
 }
 
@@ -1376,7 +1389,7 @@ mod tests {
     #[test]
     fn the_first_frame_is_held_until_the_game_is_on_screen() {
         let s = Session::open(620);
-        let held = |s: &Session| reveal(s.socket.as_ref(), Duration::ZERO, CAP);
+        let held = |s: &Session| reveal(s.socket().armed_reports(), Duration::ZERO, CAP);
         assert_eq!(held(&s), None, "nothing reported yet");
         let mut helper = s.connect();
         helper.write_all(CLIENT_ONLY).unwrap();
@@ -1398,7 +1411,7 @@ mod tests {
             .unwrap();
         s.wait_for(|r| r.needs_user.is_some());
         assert_eq!(
-            reveal(s.socket.as_ref(), Duration::ZERO, CAP),
+            reveal(s.socket().armed_reports(), Duration::ZERO, CAP),
             Some("Steam needs the user")
         );
     }
@@ -1410,13 +1423,13 @@ mod tests {
             let s = Session::open(620);
             let _helper = connects.then(|| s.connect());
             let drawn = Instant::now();
-            while reveal(s.socket.as_ref(), drawn.elapsed(), cap).is_none() {
+            while reveal(s.socket().armed_reports(), drawn.elapsed(), cap).is_none() {
                 assert!(drawn.elapsed() < cap * 2, "held past the cap");
                 std::thread::sleep(Duration::from_millis(10));
             }
             assert!(drawn.elapsed() >= cap, "connects={connects}");
             assert_eq!(
-                reveal(s.socket.as_ref(), drawn.elapsed(), cap),
+                reveal(s.socket().armed_reports(), drawn.elapsed(), cap),
                 Some("reveal cap reached")
             );
         }
@@ -1428,6 +1441,17 @@ mod tests {
     }
 
     #[test]
+    fn the_reports_are_armed_only_while_the_live_app_is_the_tile() {
+        let s = Session::open(620);
+        let mount = s.socket().mount().clone();
+        assert!(s.socket().armed_reports().is_some(), "armed from the start");
+        assert!(mount.for_app(&env("-applaunch 730")).is_none());
+        assert_eq!(s.socket().armed_reports(), None, "swapped to another app");
+        assert!(mount.for_app(&env("-bigpicture -applaunch 620")).is_some());
+        assert!(s.socket().armed_reports().is_some(), "the tile is back");
+    }
+
+    #[test]
     fn the_reveal_cap_defaults_to_90_s_and_stays_within_the_boot_watchdog() {
         let budget = Some(Duration::from_secs(300));
         let secs = |raw: Option<&str>, budget| reveal_cap(raw.map(String::from), budget).as_secs();
@@ -1435,8 +1459,16 @@ mod tests {
         assert_eq!(secs(Some("0"), budget), 0, "0 holds nothing");
         assert_eq!(secs(Some(" 45 "), budget), 45);
         assert_eq!(secs(Some("soon"), budget), 90);
-        assert_eq!(secs(Some("400"), budget), 300, "clamped to the watchdog");
-        assert_eq!(secs(Some("400"), None), 400, "no watchdog, no clamp");
+        assert_eq!(
+            secs(Some("200"), Some(Duration::from_secs(120))),
+            120,
+            "clamped to the watchdog"
+        );
+        assert_eq!(
+            secs(Some("400"), None),
+            300,
+            "the watchdog's default with it off"
+        );
     }
 
     #[test]
