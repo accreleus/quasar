@@ -782,9 +782,15 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 		return
 	}
 	attempts := 0
+	// A stat that fails for a reason other than not-exist (a restore with the
+	// wrong owner) fails the same way for every app one sweep touches, so the
+	// warning answers once, with a count, not once per app (#734). The first
+	// error is kept verbatim; the per-app skip below is unchanged.
+	var checkErr error
+	checkApps := 0
 	for _, rec := range recs {
 		if ctx.Err() != nil {
-			return
+			break
 		}
 		// A logo or icon is served only when its file is known to be there. One that
 		// is gone is fetched again below; an unlocked provider record also forgets it,
@@ -807,7 +813,10 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 		tileMissing, tileErr := s.missing(rec.TileAsset)
 		heroMissing, heroErr := s.missing(rec.HeroAsset)
 		if err := errors.Join(tileErr, heroErr); err != nil {
-			s.log.Warn("artwork: could not check a cached image; it is not fetched again", "app_id", rec.AppID, "err", err)
+			checkApps++
+			if checkErr == nil {
+				checkErr = fmt.Errorf("app %s: %w", rec.AppID, err)
+			}
 			continue
 		}
 		if !tileMissing && !heroMissing && !logoGone && !iconGone {
@@ -839,6 +848,10 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 			s.log.Info("artwork: fetched a missing cached image again", "app_id", rec.AppID, "source", rec.Source)
 			res.ArtworkRepaired++
 		}
+	}
+	if checkErr != nil {
+		s.log.Warn("artwork: could not check cached images; they are not fetched again",
+			"apps", checkApps, "err", checkErr)
 	}
 }
 
