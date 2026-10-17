@@ -56,6 +56,10 @@ fn is_sctp_association_error(message: &str) -> bool {
 /// agent fault).
 const PEER_DISCONNECT_DETAIL: &str = "peer disconnected: WebRTC data channel closed";
 
+/// `stopped` detail for a Steam game the player quit (#726): the browser returns to the
+/// library. The text is matched by the web client; `control-api.md` specifies it.
+const GAME_EXITED_DETAIL: &str = "game exited";
+
 /// The browser can close its peer connection before the Stop command finishes
 /// traversing control-plane -> agent WS, so the SCTP error can arrive before the stop
 /// flag. Wait out the grace period only for this signature; every other pipeline error
@@ -305,6 +309,9 @@ pub enum SessionEvent {
     /// A running console session's desktop stopped displaying; the session goes on.
     NotDisplaying(String),
     Stopping,
+    /// `Stopping` with the reason as its `state_detail` (the game exit, #726): the browser
+    /// must learn why while the container stop is still running, not after it.
+    StoppingWith(&'static str),
     /// Session stopped cleanly. `bytes_used` is the post-session du measurement when
     /// `QUASAR_HOME_ROOT` is set, else `None`. `detail` is the terminal `stopped` row's
     /// `state_detail`: `None` for an ordinary stop, `Some(PEER_DISCONNECT_DETAIL)` when
@@ -2321,6 +2328,26 @@ pub fn run_blocking(
             return;
         }
 
+        // The player quit the Steam game (#726): a normal end, not a container exit (Steam
+        // keeps running). One mutex read per 100 ms tick, so the end follows the helper's
+        // 250 ms poll by at most one tick.
+        if res.launch().is_some_and(|l| l.reports().game_exited()) {
+            tracing::info!(
+                token = "launch-game-exited",
+                session_id = %session_id,
+                "the Steam game exited; ending the session"
+            );
+            emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
+            stop_source(&mut current_source, &transports);
+            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
+            transports.audio_pipeline.finish();
+            emit(SessionEvent::Stopped {
+                bytes_used: compute_bytes_used(&cfg),
+                detail: Some(GAME_EXITED_DETAIL),
+            });
+            return;
+        }
+
         // Outbound signaling (offer/ICE) to the control-plane relay; the first offer means
         // live. The running-transition is single-shot via the `!running` guard, and
         // `AppSource::first_frame` is an idempotent `AtomicBool` store rather than a
@@ -3340,6 +3367,12 @@ fn perform_swap(
         })?;
     }
 
+    // Past here the outgoing game closes because we closed it, not because the player
+    // quit: stop reading the helper (#726). A rollback relaunch re-arms it.
+    if let Some(launch) = res.launch() {
+        launch.mount().mute();
+    }
+
     // ── Step 2: stop the outgoing app and WAIT for it to exit ────────────────
     // Past this line a failure costs the previous app's process state, so everything
     // cheaply validatable must already have been validated above.
@@ -4326,6 +4359,24 @@ mod tests {
                     Some("peer disconnected: WebRTC data channel closed")
                 )
             }
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+    }
+
+    /// A game exit tells the browser why on the `stopping` row too, before the container
+    /// stop finishes, and keeps it on `stopped` (#726). The web client matches this text.
+    #[test]
+    fn game_exit_carries_its_detail_on_stopping_and_stopped() {
+        assert_eq!(super::GAME_EXITED_DETAIL, "game exited");
+        match SessionEvent::StoppingWith(super::GAME_EXITED_DETAIL) {
+            SessionEvent::StoppingWith(detail) => assert_eq!(detail, "game exited"),
+            other => panic!("expected StoppingWith, got {other:?}"),
+        }
+        match (SessionEvent::Stopped {
+            bytes_used: None,
+            detail: Some(super::GAME_EXITED_DETAIL),
+        }) {
+            SessionEvent::Stopped { detail, .. } => assert_eq!(detail, Some("game exited")),
             other => panic!("expected Stopped, got {other:?}"),
         }
     }

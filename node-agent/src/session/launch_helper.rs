@@ -286,8 +286,9 @@ pub fn reveal_cap(raw: Option<String>, boot_budget: Option<Duration>) -> Duratio
 
 /// Why a first frame drawn `held_for` ago may be shown now, or `None` to hold it (#727).
 /// `held` is the derived tile's reports when its helper waits on the reveal; only then does
-/// the reveal wait: for the game on screen or Steam needing the user, at most `cap`. The reports are hints: a false one reveals the session's own stream early, and
-/// nothing they say holds it past `cap`.
+/// the reveal wait: for the game on screen or Steam needing the user, at most `cap`. The
+/// reports are hints: a false one reveals the session's own stream early, and nothing they
+/// say holds it past `cap`.
 pub fn reveal(
     held: Option<LaunchReports>,
     held_for: Duration,
@@ -304,6 +305,15 @@ pub fn reveal(
         Some("reveal cap reached")
     } else {
         None
+    }
+}
+
+impl LaunchReports {
+    /// The game ran and has now exited (#726). `seen_running` is checked here as well as
+    /// in `forward`: the reports are untrusted hints, and the end of a session is not
+    /// something to take on a single field.
+    pub fn game_exited(&self) -> bool {
+        self.seen_running && self.launch_state == Some(LaunchState::GameExited)
     }
 }
 
@@ -353,13 +363,24 @@ impl LaunchMount {
     /// The socket stays, so a rollback to the tile finds its bind source.
     pub fn for_app(&self, env: &BTreeMap<String, String>) -> Option<&Self> {
         let ours = appid_from_env(env) == Some(self.appid);
+        self.set_active(ours);
+        ours.then_some(self)
+    }
+
+    /// The session's app is about to be stopped by a swap: stop listening before the game
+    /// closes under the helper, so that exit is not read as the player quitting (#726). A
+    /// rollback to the tile re-arms through `for_app`.
+    pub fn mute(&self) {
+        self.set_active(false);
+    }
+
+    fn set_active(&self, active: bool) {
         let mut reports = self.shared.reports();
-        self.shared.active.store(ours, Ordering::Relaxed);
-        if !ours {
+        self.shared.active.store(active, Ordering::Relaxed);
+        if !active {
             *reports = LaunchReports::default();
             self.shared.metrics.set_app_launch_state(None);
         }
-        ours.then_some(self)
     }
 
     /// Container args, in the bind shape `container::application_request_from_args` takes.
@@ -1301,6 +1322,52 @@ mod tests {
         helper.write_all(CLIENT_ONLY).unwrap();
         s.wait_for(|r| r.launch_state == Some(LaunchState::ClientOnly));
         assert_eq!(s.wire_state().as_deref(), Some("client_only"));
+    }
+
+    #[test]
+    fn a_game_exit_counts_only_after_a_running_game() {
+        let s = Session::open(620);
+        let mut helper = s.connect();
+        assert!(!s.socket().reports().game_exited(), "no helper report yet");
+        helper.write_all(&state_line("game_exited")).unwrap();
+        helper
+            .write_all(b"{\"type\":\"launch_state\",\"v\":1,\"state\"\n")
+            .unwrap();
+        helper.write_all(&state_line("client_only")).unwrap();
+        s.wait_for(|r| r.launch_state == Some(LaunchState::ClientOnly));
+        assert!(!s.socket().reports().game_exited());
+        helper.write_all(&state_line("game_running")).unwrap();
+        s.wait_for(|r| r.launch_state == Some(LaunchState::GameRunning));
+        assert!(!s.socket().reports().game_exited());
+        helper.write_all(&state_line("game_exited")).unwrap();
+        s.wait_for(|r| r.game_exited());
+        // A forged report state that skips the forward rule is still not an exit.
+        let forged = LaunchReports {
+            launch_state: Some(LaunchState::GameExited),
+            ..LaunchReports::default()
+        };
+        assert!(!forged.game_exited());
+    }
+
+    #[test]
+    fn muting_for_a_swap_drops_the_old_games_exit_and_a_rollback_starts_clean() {
+        let s = Session::open(620);
+        let mount = s.socket().mount().clone();
+        let mut helper = s.connect();
+        helper.write_all(&state_line("game_running")).unwrap();
+        s.wait_for(|r| r.launch_state.is_some());
+        mount.mute();
+        // Steam closes the game the swap is stopping; the helper reports it.
+        helper.write_all(&state_line("game_exited")).unwrap();
+        std::thread::sleep(POLL * 3);
+        assert!(!s.socket().reports().game_exited());
+        assert_eq!(s.socket().reports(), LaunchReports::default());
+        // The rolled-back relaunch of the tile arms a reader that has not seen it run.
+        assert!(mount.for_app(&env("-bigpicture -applaunch 620")).is_some());
+        helper.write_all(&state_line("game_exited")).unwrap();
+        helper.write_all(CLIENT_ONLY).unwrap();
+        s.wait_for(|r| r.launch_state == Some(LaunchState::ClientOnly));
+        assert!(!s.socket().reports().game_exited());
     }
 
     #[test]

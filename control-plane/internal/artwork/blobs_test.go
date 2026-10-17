@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- fixtures ---------------------------------------------------------------
@@ -217,6 +218,78 @@ func TestHasReturnsAStatErrorThatIsNotNotExist(t *testing.T) {
 }
 
 // --- orphan pruning ---------------------------------------------------------
+
+// A kill between writeAtomic's create and its rename leaves a `.tmp-*` file
+// forever otherwise. A prune removes ones older than the window; a fresh one
+// is left alone, since its writer may still be running (and the rename will
+// turn it into a file the sweep keeps).
+func TestPruneOrphansSweepsStaleTempFiles(t *testing.T) {
+	b := newBlobs(t)
+	name, err := b.Put("image/png", onePixelPNG)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	shard := filepath.Join(b.Root(), name[:2])
+	stale := filepath.Join(shard, ".tmp-crashleft")
+	if err := os.WriteFile(stale, []byte("half-written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * tmpFileMaxAge)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	fresh := filepath.Join(shard, ".tmp-writenow")
+	if err := os.WriteFile(fresh, []byte("in flight"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.PruneOrphans(map[string]struct{}{name: {}}); err != nil {
+		t.Fatalf("PruneOrphans: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Error("a stale temp file survived the prune")
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("a fresh temp file was pruned: %v", err)
+	}
+}
+
+// An entry whose age cannot be read at all is left alone, like a fresh one:
+// this sweep deletes only what it is certain about. Removing the shard's
+// search permission lets the walk list its names but makes the lstat behind
+// d.Info() fail for every one of them. The file's mtime is made stale first,
+// so that surviving can only be down to the unreadable age, and as root the
+// permission means nothing: the case cannot be tested there.
+func TestPruneOrphansLeavesTempFilesItCannotDate(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads through the permission the test removes")
+	}
+	b := newBlobs(t)
+	shard := filepath.Join(b.Root(), "ab")
+	if err := os.MkdirAll(shard, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	left := filepath.Join(shard, ".tmp-crashleft")
+	if err := os.WriteFile(left, []byte("half-written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-2 * tmpFileMaxAge)
+	if err := os.Chtimes(left, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shard, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(shard, 0o700) }) // so the temp dir can go again
+	if _, err := b.PruneOrphans(nil); err != nil {
+		t.Fatalf("PruneOrphans: %v", err)
+	}
+	if err := os.Chmod(shard, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(left); err != nil {
+		t.Errorf("a temp file the prune could not date was removed: %v", err)
+	}
+}
 
 func TestPruneOrphans(t *testing.T) {
 	b := newBlobs(t)
