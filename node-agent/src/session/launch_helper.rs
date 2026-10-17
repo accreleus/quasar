@@ -324,6 +324,7 @@ fn forward(from: Option<LaunchState>, to: LaunchState, seen_running: bool) -> bo
     }
 }
 
+/// `active` and the reports share one lock, so a report cannot land after `set_active(false)`.
 #[derive(Default)]
 struct State {
     /// False while the session's app is not its derived tile (after a swap away).
@@ -755,7 +756,7 @@ impl Reader {
                 }
                 reports.launch_state = Some(state);
                 reports.seen_running |= state == LaunchState::GameRunning;
-                // Under the reports lock, so a swap's reset cannot land in between.
+                // Under the state lock, so a swap's reset cannot land in between.
                 self.shared
                     .metrics
                     .set_app_launch_state(Some(state.as_str()));

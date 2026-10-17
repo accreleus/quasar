@@ -300,7 +300,7 @@ impl Watcher {
             self.log_waiting = None;
         }
         for line in lines {
-            self.parse_log_line(&line, now);
+            self.parse_log_line(line.trim_end(), now);
         }
     }
 
@@ -382,7 +382,10 @@ struct LoginLog {
     needs: Option<NeedsUser>,
 }
 
-/// An incremental reader of one Steam log: whole lines out, the rest kept for the next pass.
+/// An incremental reader of one Steam log: whole lines out (line ending stripped, nothing
+/// else), the rest kept for the next pass. Lines over 64 KiB are dropped for every log it
+/// reads. A rewrite in place of bytes already consumed (same inode, not shorter) is not
+/// detected.
 struct LogTail {
     path: PathBuf,
     /// Where Steam rotates this log to; its unread rest is finished before the new file.
@@ -495,7 +498,9 @@ impl LogTail {
                 continue;
             }
             if raw.len() <= MAX_LOG_LINE_BYTES {
-                lines.push(String::from_utf8_lossy(&raw).trim_end().to_owned());
+                let line = String::from_utf8_lossy(&raw);
+                let line = line.strip_suffix('\n').unwrap_or(&line);
+                lines.push(line.strip_suffix('\r').unwrap_or(line).to_owned());
             }
         }
         if self.discarding {

@@ -1088,6 +1088,46 @@ fn steam_waiting_for_credentials_needs_a_sign_in_until_a_later_state() {
 }
 
 #[test]
+fn a_login_state_with_nothing_after_it_clears_the_sign_in() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+    // Trailing space, nothing after: a state that is not WaitingForCredentials.
+    rig.append("steamui_login.txt", "[ None ] SetLoginState: \n");
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+}
+
+#[test]
+fn a_login_line_over_64_kib_is_dropped_and_the_next_one_is_read() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+
+    let long = format!(
+        "SetLoginState: WaitingForCredentials {}\n",
+        "x".repeat(70 * 1024)
+    );
+    rig.append("steamui_login.txt", &long);
+    assert_eq!(rig.watcher.poll(), vec![], "the long line is not parsed");
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+}
+
+#[test]
 fn a_signed_in_start_never_needs_a_sign_in() {
     let mut rig = Rig::new();
     write_proc(&rig.proc_root, 100, STEAM);

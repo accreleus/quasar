@@ -90,15 +90,15 @@ starts the helper) and "watcher" (the helper's detection core).
 
 **Launch state** — where the tile's game is in its start: `starting`,
 `client_only` (Steam is up, the game is not), `game_running`, `game_exited`.
-Moves forward only, and `game_exited` is terminal for one arming of the reader;
-it is what ends the session as a normal stop. Reported as
-`session_metrics.app_launch_state`. _Avoid_: "app state" (the container's).
+Moves forward only, except that a new helper may report `starting` again, and
+`game_exited` is terminal for one arming of the reader; it is what ends the
+session as a normal stop. Reported as `session_metrics.app_launch_state`. _Avoid_: "app state" (the container's).
 
 **Reveal** — showing the stream to the user, as against the loader. For a derived
 Steam tile it waits for the game: the agent emits `AppPresented`, the event that
 allows the reveal, when the game window is on screen or Steam needs the user. Any
 other app reveals on its first frame. _Avoid_: using "reveal" and "app presented"
-for different things; the first is the act, the second the event.
+interchangeably; the first is the act, the second the event.
 
 **Reveal cap** — the longest a tile's reveal waits for the game after the app's
 first frame (`QUASAR_STEAM_REVEAL_CAP_SECS`), so a game that never shows a window
