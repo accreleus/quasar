@@ -3553,7 +3553,7 @@ mod tests {
     use gstreamer::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const WINDOW: Duration = Duration::from_secs(120);
 
