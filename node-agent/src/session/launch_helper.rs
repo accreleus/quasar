@@ -247,6 +247,9 @@ pub struct LaunchReports {
     /// A `game_running` was taken since the reader was last armed, which is what makes
     /// a later `game_exited` legal.
     pub seen_running: bool,
+    /// The helper connected since the reader was last armed. An image whose launcher does
+    /// not start it never does, and its first frame is shown as before (#727).
+    pub helper_connected: bool,
 }
 
 /// `QUASAR_STEAM_REVEAL_CAP_SECS`, no higher than the app boot watchdog's budget, or than
@@ -595,7 +598,14 @@ impl Reader {
     fn serve(&mut self, listener: &UnixListener) {
         while !self.stopped() {
             match listener.accept() {
-                Ok((stream, _)) => self.read_connection(stream),
+                Ok((stream, _)) => {
+                    let mut reports = self.shared.reports();
+                    if self.shared.active.load(Ordering::Relaxed) {
+                        reports.helper_connected = true;
+                    }
+                    drop(reports);
+                    self.read_connection(stream)
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
                 Err(error) => {
                     if let Some(suppressed) = self.dropped.ready() {
@@ -1050,6 +1060,7 @@ mod tests {
                 game_window_on_screen: Some(true),
                 needs_user: Some(NeedsUser::CloudConflict),
                 seen_running: true,
+                helper_connected: true,
             }
         );
         assert_eq!(s.wire_state().as_deref(), Some("game_running"));
@@ -1407,6 +1418,15 @@ mod tests {
             "the next line says how many it held back"
         );
         assert_eq!(limiter.ready(), None);
+    }
+
+    #[test]
+    fn a_connection_marks_the_helper_connected_and_no_connection_does_not() {
+        let s = Session::open(620);
+        std::thread::sleep(POLL * 2);
+        assert!(!s.socket().reports().helper_connected, "nobody connected");
+        let _helper = s.connect();
+        s.wait_for(|r| r.helper_connected);
     }
 
     #[test]

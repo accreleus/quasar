@@ -1665,6 +1665,8 @@ impl AppBootGate {
         // Drawn: the cap, not the watchdog, bounds the hold.
         let reveal = match self.cap {
             None => Some("first frame"),
+            // An image whose launcher never started the helper: shown as before.
+            Some(_) if !reports.helper_connected => Some("no launch helper"),
             Some(cap) => reports
                 .reveal_reason()
                 .or((now.saturating_duration_since(drawn_at) >= cap)
@@ -4543,7 +4545,10 @@ mod tests {
         use crate::session::launch_helper::{LaunchReports, NeedsUser};
         let boot = Instant::now();
         let at = |secs: u64| boot + Duration::from_secs(secs);
-        let waiting = LaunchReports::default();
+        let waiting = LaunchReports {
+            helper_connected: true,
+            ..Default::default()
+        };
         let gate = AppBootGate::new(CAP, BUDGET);
 
         let mut cap = gate.clone();
@@ -4562,7 +4567,7 @@ mod tests {
         assert_eq!(draw(&mut game, at(5), boot, waiting), AppBootStep::Held);
         let on_screen = LaunchReports {
             game_window_on_screen: Some(true),
-            ..Default::default()
+            ..waiting
         };
         assert_eq!(
             game.tick(at(20), boot, Some(9), 200, on_screen),
@@ -4572,7 +4577,7 @@ mod tests {
         let mut steam = gate.clone();
         let needs_user = LaunchReports {
             needs_user: Some(NeedsUser::SignIn),
-            ..Default::default()
+            ..waiting
         };
         assert_eq!(
             draw(&mut steam, at(5), boot, needs_user),
@@ -4606,6 +4611,12 @@ mod tests {
             never.tick(at(300), boot, Some(0), 10, reports),
             AppBootStep::NeverPresented
         );
+        let mut no_helper = AppBootGate::new(CAP, BUDGET);
+        assert_eq!(
+            draw(&mut no_helper, at(5), boot, reports),
+            AppBootStep::Present("no launch helper"),
+            "an image that never started the helper is shown as before"
+        );
         let mut no_watchdog = AppBootGate::new(None, None);
         assert_eq!(
             no_watchdog.tick(at(9999), boot, Some(0), 9, reports),
@@ -4633,10 +4644,13 @@ mod tests {
         use crate::session::launch_helper::LaunchReports;
         let boot = Instant::now();
         let at = |secs: u64| boot + Duration::from_secs(secs);
-        let waiting = LaunchReports::default();
+        let waiting = LaunchReports {
+            helper_connected: true,
+            ..Default::default()
+        };
         let on_screen = LaunchReports {
             game_window_on_screen: Some(true),
-            ..Default::default()
+            ..waiting
         };
 
         let mut held = AppBootGate::new(CAP, BUDGET);
