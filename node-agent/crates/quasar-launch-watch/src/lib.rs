@@ -299,9 +299,9 @@ impl Watcher {
     fn notice_held(&self, now: Instant) -> bool {
         self.answers_notice
             && self.interstitial_since.is_some()
-            && !self
+            && self
                 .notice_pressed
-                .is_some_and(|at| now.saturating_duration_since(at) >= USER_WAIT)
+                .is_none_or(|at| now.saturating_duration_since(at) < USER_WAIT)
     }
 
     fn held_log_needs(&self, now: Instant) -> Option<NeedsUser> {
