@@ -1803,13 +1803,14 @@ impl AppBootGate {
                 self.shader = Some((percent, now));
             }
         }
-        let rising = self
-            .shader
-            .is_some_and(|(_, at)| now.saturating_duration_since(at) < SHADER_PAUSE);
-        let tick = now.saturating_duration_since(self.last_tick.unwrap_or(now));
-        self.last_tick = Some(now);
-        if self.drawn_at.is_some() && !rising {
-            self.held_for += tick;
+        let last = self.last_tick.replace(now).unwrap_or(now);
+        // The cap's clock stands still until SHADER_PAUSE after the figure last rose.
+        let from = match self.shader {
+            Some((_, rose)) => last.max(rose + SHADER_PAUSE),
+            None => last,
+        };
+        if self.drawn_at.is_some() {
+            self.held_for += now.saturating_duration_since(from);
         }
         // `swap_source_ready`'s gate: the counter also counts unmapped surfaces (#487).
         let drew = self.drawn_at.is_none()
@@ -3980,6 +3981,10 @@ mod tests {
         DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent, VulkanContextBridge,
         REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
     };
+    use super::{
+        in_place_plan, InPlaceAction, InPlaceStep, ProgressThrottle, SwapRequest,
+        IN_PLACE_LAUNCH_BOUND, IN_PLACE_QUIT_BOUND,
+    };
     use gstreamer::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -5036,6 +5041,251 @@ mod tests {
         assert_eq!(
             gate.tick(boot, boot, None, 1, reports),
             AppBootStep::Present("first frame")
+        );
+    }
+
+    #[test]
+    fn the_reveal_cap_waits_while_steams_shader_percentage_rises() {
+        use crate::session::launch_helper::LaunchReports;
+        let boot = Instant::now();
+        let at = |secs: u64| boot + Duration::from_secs(secs);
+        let shaders = |percent: Option<u8>| LaunchReports {
+            helper_connected: true,
+            shader_percent: percent,
+            ..Default::default()
+        };
+        let mut gate = AppBootGate::new(CAP, BUDGET);
+        assert_eq!(
+            draw(&mut gate, at(5), boot, shaders(None)),
+            AppBootStep::Held
+        );
+        // 60 s of the 90 s cap held, then the figure rises every 20 s: the cap waits.
+        assert_eq!(
+            gate.tick(at(66), boot, Some(9), 200, shaders(None)),
+            AppBootStep::Wait
+        );
+        for (t, percent) in [(86, 15), (106, 20), (126, 50), (146, 60), (166, 100)] {
+            assert_eq!(
+                gate.tick(at(t), boot, Some(9), 200, shaders(Some(percent))),
+                AppBootStep::Wait,
+                "rising at {t}s"
+            );
+        }
+        // A drop (Steam's next stage) is no rise; 30 s after the last rise the cap resumes.
+        assert_eq!(
+            gate.tick(at(190), boot, Some(9), 200, shaders(Some(50))),
+            AppBootStep::Wait
+        );
+        assert_eq!(
+            gate.tick(at(196), boot, Some(9), 200, shaders(Some(50))),
+            AppBootStep::Wait
+        );
+        assert_eq!(
+            gate.tick(at(225), boot, Some(9), 200, shaders(Some(50))),
+            AppBootStep::Wait
+        );
+        assert_eq!(
+            gate.tick(at(226), boot, Some(9), 200, shaders(Some(50))),
+            AppBootStep::Present("reveal cap reached"),
+            "60 s before the rises and 30 s after them"
+        );
+    }
+
+    #[test]
+    fn launch_progress_goes_out_on_change_at_most_once_a_second() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut throttle = ProgressThrottle::default();
+        assert_eq!(throttle.next(t0, None), None);
+        assert_eq!(throttle.next(t0, Some(10)), Some(10));
+        assert_eq!(throttle.next(ms(100), Some(10)), None, "no change");
+        assert_eq!(throttle.next(ms(500), Some(20)), None, "too soon");
+        assert_eq!(throttle.next(ms(1000), Some(20)), Some(20));
+        assert_eq!(throttle.next(ms(3000), Some(20)), None);
+        assert_eq!(
+            throttle.next(ms(3000), Some(5)),
+            Some(5),
+            "a change either way"
+        );
+    }
+
+    fn steam_app(flags: &str) -> crate::session::container::ContainerSpec {
+        crate::session::container::ContainerSpec {
+            image: "steam".into(),
+            env: std::collections::BTreeMap::from([
+                ("STEAM_STARTUP_FLAGS".to_string(), flags.to_string()),
+                ("QUASAR_STREAM_FPS".to_string(), "60".to_string()),
+            ]),
+            mounts: vec!["/homes/u1:/home/quasar".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_in_place_swap_needs_the_helper_and_the_same_app_but_its_flags() {
+        use crate::session::launch_helper::LaunchReports;
+        let connected = Some(LaunchReports {
+            helper_connected: true,
+            ..Default::default()
+        });
+        let req = |app: Option<crate::session::container::ContainerSpec>, in_place| SwapRequest {
+            container: app,
+            in_place,
+        };
+        let mut running = steam_app("-silent -applaunch 620");
+        // Launch policy set on the running container is not part of the app.
+        running.require_local_image = true;
+        let to_730 = req(Some(steam_app("-silent -applaunch 730")), true);
+        assert_eq!(
+            in_place_plan(Some(&running), &to_730, connected),
+            Some((620, 730))
+        );
+
+        let other_image = crate::session::container::ContainerSpec {
+            image: "other".into(),
+            ..steam_app("-applaunch 730")
+        };
+        let other_home = crate::session::container::ContainerSpec {
+            mounts: vec!["/homes/u2:/home/quasar".into()],
+            ..steam_app("-applaunch 730")
+        };
+        let mut other_env = steam_app("-applaunch 730");
+        other_env
+            .env
+            .insert("QUASAR_STREAM_FPS".into(), "120".into());
+        for (why, current, swap, reports) in [
+            (
+                "not asked",
+                Some(&running),
+                req(Some(steam_app("-applaunch 730")), false),
+                connected,
+            ),
+            (
+                "no helper",
+                Some(&running),
+                req(Some(steam_app("-applaunch 730")), true),
+                None,
+            ),
+            (
+                "helper never connected",
+                Some(&running),
+                req(Some(steam_app("-applaunch 730")), true),
+                Some(LaunchReports::default()),
+            ),
+            (
+                "another image",
+                Some(&running),
+                req(Some(other_image), true),
+                connected,
+            ),
+            (
+                "another home",
+                Some(&running),
+                req(Some(other_home), true),
+                connected,
+            ),
+            (
+                "another env",
+                Some(&running),
+                req(Some(other_env), true),
+                connected,
+            ),
+            (
+                "no game to switch to",
+                Some(&running),
+                req(Some(steam_app("-bigpicture")), true),
+                connected,
+            ),
+            (
+                "no app now",
+                None,
+                req(Some(steam_app("-applaunch 730")), true),
+                connected,
+            ),
+            ("to no app", Some(&running), req(None, true), connected),
+        ] {
+            assert_eq!(in_place_plan(current, &swap, reports), None, "{why}");
+        }
+        let plain = steam_app("-bigpicture");
+        assert_eq!(
+            in_place_plan(Some(&plain), &to_730, connected),
+            None,
+            "nothing named to quit"
+        );
+    }
+
+    #[test]
+    fn an_in_place_swap_quits_then_launches_within_its_bounds() {
+        use crate::session::launch_helper::{CommandDone, HelperCommand, LaunchReports};
+        let t0 = Instant::now();
+        let secs = |n: u64| t0 + Duration::from_secs(n);
+        let reports = |done: Option<CommandDone>| LaunchReports {
+            last_command: done,
+            ..Default::default()
+        };
+        let quit = |ok| {
+            Some(CommandDone {
+                command: HelperCommand::Quit(620),
+                ok,
+                cloud_synced: Some(true),
+            })
+        };
+        let launch = |appid, ok| {
+            Some(CommandDone {
+                command: HelperCommand::Launch(appid),
+                ok,
+                cloud_synced: None,
+            })
+        };
+        let quitting = InPlaceStep::Quitting {
+            from: 620,
+            to: 730,
+            since: t0,
+        };
+
+        let mut step = quitting;
+        assert_eq!(step.advance(t0, reports(None)), InPlaceAction::Wait);
+        assert_eq!(
+            step.advance(t0, reports(launch(620, true))),
+            InPlaceAction::Wait,
+            "another command's result is a replay"
+        );
+        assert_eq!(
+            step.advance(secs(4), reports(quit(true))),
+            InPlaceAction::Launch(730)
+        );
+        assert_eq!(step.advance(secs(4), reports(None)), InPlaceAction::Wait);
+        assert_eq!(
+            step.advance(secs(4), reports(launch(620, true))),
+            InPlaceAction::Wait
+        );
+        assert_eq!(
+            step.advance(secs(5), reports(launch(730, true))),
+            InPlaceAction::Done
+        );
+
+        for (mut step, at, done) in [
+            (quitting, t0, quit(false)),
+            (quitting, t0 + IN_PLACE_QUIT_BOUND, None),
+            (
+                InPlaceStep::Launching { to: 730, since: t0 },
+                t0,
+                launch(730, false),
+            ),
+            (
+                InPlaceStep::Launching { to: 730, since: t0 },
+                t0 + IN_PLACE_LAUNCH_BOUND,
+                None,
+            ),
+        ] {
+            assert!(
+                matches!(step.advance(at, reports(done)), InPlaceAction::Fail(_)),
+                "{step:?}"
+            );
+        }
+        assert!(
+            IN_PLACE_QUIT_BOUND + IN_PLACE_LAUNCH_BOUND <= Duration::from_secs(100),
+            "the swap resolves within 100 s of the ack"
         );
     }
 

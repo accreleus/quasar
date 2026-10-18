@@ -355,9 +355,10 @@ fn a_game_that_closes_ends_the_quit_at_its_exit_sync() {
 #[test]
 fn a_sync_that_never_ends_is_waited_for_sixty_seconds() {
     let d = dirs();
+    reaper(&d.proc_root, 20);
     let t0 = Instant::now();
     let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
-    // No reaper at all: already gone.
+    gone(&d.proc_root, 20);
     assert_eq!(quit.poll(t0), None);
     append(
         &d.logs.join("cloud_log.txt"),
@@ -371,6 +372,19 @@ fn a_sync_that_never_ends_is_waited_for_sixty_seconds() {
         quit.poll(t0 + QUIT_CLOUD_WAIT),
         Some(QuitAction::Done(None))
     );
+}
+
+#[test]
+fn a_quit_for_a_game_that_is_not_running_is_done_at_once() {
+    let d = dirs();
+    let t0 = Instant::now();
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
+    assert_eq!(
+        quit.poll(t0),
+        Some(QuitAction::Done(None)),
+        "no sync to wait for"
+    );
+    assert_eq!(quit.poll(t0 + QUIT_CLOUD_WAIT), None);
 }
 
 #[test]

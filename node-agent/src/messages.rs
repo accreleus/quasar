@@ -2587,4 +2587,93 @@ mod tests {
         assert_eq!(json["connectors"], serde_json::json!(["DP-4"]));
         assert_eq!(json["input_devices"][0]["path"], "/dev/input/event4");
     }
+
+    /// Amendment 39: `kind`, `adopt_session_id`, `in_place` and the new stop reasons parse;
+    /// a control plane that predates it sends none of them.
+    #[test]
+    fn warm_steam_fields_parse_and_default_to_absent() {
+        let stream = serde_json::json!({"width": 1920, "height": 1080, "fps": 60,
+            "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"});
+        let assign = |extra: serde_json::Value| {
+            let mut msg = serde_json::json!({"type": "session_assign", "id": "c1",
+                "session_id": "p1", "stream": stream});
+            msg.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            match serde_json::from_value(msg).unwrap() {
+                ControlMsg::SessionAssign {
+                    kind,
+                    adopt_session_id,
+                    ..
+                } => (kind, adopt_session_id),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(assign(serde_json::json!({})), (None, None));
+        assert_eq!(
+            assign(serde_json::json!({"kind": "play", "adopt_session_id": "k1"})),
+            (Some(SessionKind::Play), Some("k1".to_string()))
+        );
+        assert_eq!(
+            assign(serde_json::json!({"kind": "parked"})).0,
+            Some(SessionKind::Parked)
+        );
+        assert_eq!(
+            assign(serde_json::json!({"kind": "later"})).0,
+            Some(SessionKind::Unknown)
+        );
+
+        let swap = |extra: serde_json::Value| {
+            let mut msg =
+                serde_json::json!({"type": "session_swap_app", "id": "c2", "session_id": "p1"});
+            msg.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            match serde_json::from_value(msg).unwrap() {
+                ControlMsg::SessionSwapApp { in_place, .. } => in_place,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(!swap(serde_json::json!({})));
+        assert!(swap(serde_json::json!({"in_place": true})));
+
+        for reason in ["parked_expired", "parked_evicted", "parked_superseded"] {
+            let stop: ControlMsg = serde_json::from_value(serde_json::json!({
+                "type": "session_stop", "id": "c3", "session_id": "k1", "reason": reason}))
+            .unwrap();
+            assert!(
+                matches!(stop, ControlMsg::SessionStop { reason: ref r, .. } if r == reason),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_held_and_launch_progress_are_absent_unless_set() {
+        let state = |runtime_held, launch_progress| {
+            serde_json::to_value(AgentMsg::SessionState {
+                session_id: "p1".into(),
+                state: "stopped".into(),
+                detail: Some("game exited".into()),
+                error: None,
+                reason_code: None,
+                app_log_tail: None,
+                home_seed: None,
+                runtime_held,
+                launch_progress,
+            })
+            .unwrap()
+        };
+        let plain = state(None, None);
+        assert!(plain.get("runtime_held").is_none());
+        assert!(plain.get("launch_progress").is_none());
+        let held = state(Some(true), None);
+        assert_eq!(held["runtime_held"], true);
+        let progress = state(None, Some(LaunchProgress::shaders(42)));
+        assert_eq!(
+            progress["launch_progress"],
+            serde_json::json!({"step": "shaders", "percent": 42})
+        );
+        assert_eq!(LaunchProgress::shaders(250).percent, 100);
+    }
 }

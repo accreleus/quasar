@@ -548,6 +548,12 @@ fn malformed_id(id: &str) -> bool {
     crate::session::udev_export::malformed_session_id(id)
 }
 
+/// Where a session's helper socket is, for a test that plays the helper.
+#[cfg(test)]
+pub(crate) fn socket_path(runtime_dir: &str, session_id: &str) -> PathBuf {
+    owned_entry::entry_dir(runtime_dir, PREFIX, session_id).join(SOCKET_FILE)
+}
+
 /// Boot-only: retire every socket directory this owner left behind. Same rule as
 /// `udev_export::retire_all_owned`: only where "ours" implies "dead".
 pub fn retire_all_owned(runtime_dir: &str, owner: &str) -> owned_entry::Summary {

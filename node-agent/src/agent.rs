@@ -10516,4 +10516,506 @@ mod tests {
         );
         assert!(json.get("reason_code").is_none(), "{json}");
     }
+
+    // ── amendment 39: parked sessions, adoption, held runtimes (#759) ─────────
+
+    #[test]
+    fn register_advertises_parked_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
+        let register = register_message(
+            &cfg,
+            false,
+            Vec::new(),
+            &crate::buildinfo::InstallFacts::default(),
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(register).unwrap()["parked_sessions_v1"],
+            true
+        );
+    }
+
+    /// What the fake runtimes below were told.
+    struct Warm {
+        started: std::sync::mpsc::Receiver<(String, Option<SessionKind>)>,
+        adopted: std::sync::mpsc::Receiver<(String, AdoptRequest)>,
+        swaps: std::sync::mpsc::Receiver<(String, SwapRequest)>,
+        evt_tx: mpsc::Sender<(String, SessionEvent)>,
+        _evt_rx: mpsc::Receiver<(String, SessionEvent)>,
+    }
+
+    /// A manager whose runners stand in for a runtime: alive until stopped, forwarding what
+    /// they are sent.
+    fn warm_manager() -> (SessionManager, Warm) {
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (adopted_tx, adopted) = std::sync::mpsc::channel();
+        let (swaps_tx, swaps) = std::sync::mpsc::channel();
+        let runner: RunnerFn = Arc::new(
+            move |sid,
+                  cfg,
+                  _evt,
+                  _diag,
+                  stop,
+                  _sig,
+                  swap_rx,
+                  _display,
+                  _capture,
+                  _metrics,
+                  adopt_rx| {
+                let _ = started_tx.send((sid.clone(), cfg.kind));
+                while !stop.load(Ordering::Relaxed) {
+                    while let Ok(req) = adopt_rx.try_recv() {
+                        let _ = adopted_tx.send((sid.clone(), req));
+                    }
+                    while let Ok(req) = swap_rx.try_recv() {
+                        let _ = swaps_tx.send((sid.clone(), req));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            },
+        );
+        let (mgr, _refs) = manager_with_runner(runner);
+        let (evt_tx, _evt_rx) = mpsc::channel(64);
+        (
+            mgr,
+            Warm {
+                started,
+                adopted,
+                swaps,
+                evt_tx,
+                _evt_rx,
+            },
+        )
+    }
+
+    fn steam_cfg(kind: SessionKind, flags: &str, size: (i32, i32)) -> SessionConfig {
+        let mut cfg = assignment_config(EncoderChoice::Openh264, "software");
+        cfg.kind = Some(kind);
+        (cfg.stream.width, cfg.stream.height) = size;
+        cfg.container = Some(ContainerSpec {
+            image: "steam".into(),
+            env: BTreeMap::from([("STEAM_STARTUP_FLAGS".to_string(), flags.to_string())]),
+            mounts: vec!["/homes/u1:/home/quasar".into()],
+            ..Default::default()
+        });
+        cfg
+    }
+
+    fn start(
+        mgr: &mut SessionManager,
+        warm: &Warm,
+        id: &str,
+        cfg: SessionConfig,
+        adopt: Option<&str>,
+    ) -> Option<AgentMsg> {
+        mgr.pending.insert(
+            id.to_string(),
+            PendingAssignment {
+                cfg,
+                assigned_at: Instant::now(),
+                preparation: None,
+                gpu_index: 0,
+                adopt: adopt.map(str::to_string),
+            },
+        );
+        mgr.handle_control(
+            ControlMsg::SessionStart {
+                id: format!("start-{id}"),
+                session_id: id.to_string(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        )
+    }
+
+    fn acked(reply: Option<AgentMsg>) -> bool {
+        matches!(reply, Some(AgentMsg::Ack { ok: true, .. }))
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// A parked session that has reached `running`.
+    fn parked(mgr: &mut SessionManager, warm: &Warm, id: &str, size: (i32, i32)) {
+        assert!(acked(start(
+            mgr,
+            warm,
+            id,
+            steam_cfg(SessionKind::Parked, "-silent", size),
+            None
+        )));
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap(),
+            (id.into(), Some(SessionKind::Parked))
+        );
+        mgr.on_event(id, SessionEvent::Running);
+    }
+
+    /// A play session whose game exited with its runtime held.
+    fn held(mgr: &mut SessionManager, warm: &Warm, id: &str) -> serde_json::Value {
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        assert!(acked(start(mgr, warm, id, cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event(id, SessionEvent::Running);
+        serde_json::to_value(mgr.on_event(id, SessionEvent::Held)).unwrap()
+    }
+
+    #[test]
+    fn a_held_runtime_reports_stopped_and_leaves_the_heartbeat_but_not_the_host() {
+        let (mut mgr, warm) = warm_manager();
+        let stopped = held(&mut mgr, &warm, "p0");
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(stopped["detail"], "game exited");
+        assert_eq!(stopped["runtime_held"], true);
+        assert!(stopped.get("launch_progress").is_none());
+        assert!(mgr.running.contains_key("p0"), "the runtime is kept");
+        assert!(mgr.running_ids().is_empty(), "not a session any more");
+        assert!(mgr.drain_metrics(0).is_empty());
+        // Nothing addresses it as a session.
+        let swap = mgr.handle_control(
+            ControlMsg::SessionSwapApp {
+                id: "swap".into(),
+                session_id: "p0".into(),
+                app: AppSpec::default(),
+                in_place: true,
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(swap, Some(AgentMsg::Ack { ok: false, .. })));
+        assert!(warm.swaps.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_stop_for_the_ended_id_releases_its_held_runtime() {
+        let (mut mgr, warm) = warm_manager();
+        held(&mut mgr, &warm, "p0");
+        let reply = mgr.handle_control(
+            ControlMsg::SessionStop {
+                id: "stop".into(),
+                session_id: "p0".into(),
+                reason: "parked_superseded".into(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(acked(reply));
+        let h = &mgr.running["p0"];
+        assert!(h.stop.load(Ordering::Relaxed));
+        assert!(h.held.is_some_and(|held| held.released));
+        // The runner's end is the release: nothing more goes out without RH05 proof owed.
+        let thread = mgr.running.get_mut("p0").unwrap().thread.take().unwrap();
+        thread.join().unwrap();
+        assert!(mgr.release_terminal("p0").is_none());
+        assert!(!mgr.running.contains_key("p0"));
+    }
+
+    #[test]
+    fn a_held_runtime_nobody_adopts_is_released_after_30_s() {
+        let (mut mgr, warm) = warm_manager();
+        held(&mut mgr, &warm, "p0");
+        let since = mgr.running["p0"].held.unwrap().since;
+        mgr.reconcile(
+            since + Duration::from_secs(29),
+            RUNNER_REAP_GRACE,
+            PENDING_ASSIGNMENT_TTL,
+        );
+        assert!(!mgr.running["p0"].stop.load(Ordering::Relaxed));
+        mgr.reconcile(
+            since + HELD_RUNTIME_TTL,
+            RUNNER_REAP_GRACE,
+            PENDING_ASSIGNMENT_TTL,
+        );
+        assert!(mgr.running["p0"].stop.load(Ordering::Relaxed));
+        assert!(mgr.running["p0"].held.unwrap().released);
+    }
+
+    #[test]
+    fn an_adoption_relabels_the_runtime_and_hands_it_the_play_app() {
+        let (mut mgr, warm) = warm_manager();
+        parked(&mut mgr, &warm, "k1", (1920, 1080));
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1280, 720));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+
+        let (runner, req) = warm.adopted.recv_timeout(WAIT).unwrap();
+        assert_eq!(runner, "k1", "the parked runtime's runner, not a new one");
+        assert_eq!(req.kind, SessionKind::Play);
+        assert_eq!(
+            req.container.unwrap().env["STEAM_STARTUP_FLAGS"],
+            "-applaunch 730"
+        );
+        assert!(warm.started.try_recv().is_err(), "nothing was built");
+        assert_eq!(mgr.running_ids(), vec!["p1".to_string()]);
+        assert_eq!(mgr.label("k1"), "p1", "its reports go out under the new id");
+        let h = &mgr.running["p1"];
+        assert_eq!(h.runtime_id, "k1");
+        assert_eq!(h.adopted, vec!["k1".to_string()]);
+        assert_eq!(h.kind, Some(SessionKind::Play));
+        assert!(h.live());
+        // The claim's smaller size moved both the render and the stream size.
+        assert_eq!(h.display_state.external, (1280, 720));
+        assert_eq!(h.display_state.render, Some((1280, 720)));
+        mgr.drop_running("p1");
+        assert_eq!(mgr.label("k1"), "k1");
+    }
+
+    #[test]
+    fn a_park_on_exit_adopts_the_held_runtime_as_a_parked_session() {
+        let (mut mgr, warm) = warm_manager();
+        held(&mut mgr, &warm, "p0");
+        let cfg = steam_cfg(SessionKind::Parked, "-silent", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "k2", cfg, Some("p0"))));
+        let (runner, req) = warm.adopted.recv_timeout(WAIT).unwrap();
+        assert_eq!((runner.as_str(), req.kind), ("p0", SessionKind::Parked));
+        assert_eq!(mgr.running_ids(), vec!["k2".to_string()]);
+        assert!(mgr.running["k2"].held.is_none());
+    }
+
+    #[test]
+    fn an_adoption_with_no_runtime_here_builds_fresh() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("lost"))));
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap(),
+            ("p1".into(), Some(SessionKind::Play))
+        );
+        assert!(warm.adopted.try_recv().is_err());
+        assert_eq!(mgr.running["p1"].runtime_id, "p1");
+    }
+
+    #[test]
+    fn a_runtime_that_does_not_match_is_torn_down_and_the_session_built_after_it() {
+        let (mut mgr, warm) = warm_manager();
+        parked(&mut mgr, &warm, "k1", (1280, 720));
+        let exited = mgr.running["k1"].exited.clone();
+        // Larger than the runtime's launch size: the agent's backstop refuses it.
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
+        assert!(
+            !mgr.running["k1"].live(),
+            "its reports from here are the release"
+        );
+        let (built, _) = warm.started.recv_timeout(WAIT).unwrap();
+        assert_eq!(built, "p1");
+        assert!(
+            exited.load(Ordering::Relaxed),
+            "built only once the old runtime was gone"
+        );
+        assert!(warm.adopted.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_adoption_checks_the_stream_the_runtime_encodes() {
+        let (mut mgr, warm) = warm_manager();
+        parked(&mut mgr, &warm, "k1", (1920, 1080));
+        let h = &mgr.running["k1"];
+        let base = h.stream.clone();
+        assert!(h.encodes(&base));
+        let smaller = StreamParams {
+            width: 1280,
+            height: 720,
+            ..base.clone()
+        };
+        assert!(h.encodes(&smaller));
+        for other in [
+            StreamParams {
+                codec: crate::session::Codec::H265,
+                ..base.clone()
+            },
+            StreamParams {
+                fps: 30,
+                ..base.clone()
+            },
+            StreamParams {
+                h264_profile: "high".into(),
+                ..base.clone()
+            },
+            StreamParams {
+                mic: true,
+                ..base.clone()
+            },
+            StreamParams {
+                width: 2560,
+                ..base.clone()
+            },
+        ] {
+            assert!(!h.encodes(&other), "{other:?}");
+        }
+        // Another GPU is no adoption either.
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        cfg.stream = base;
+        mgr.pending.insert(
+            "p1".into(),
+            PendingAssignment {
+                cfg,
+                assigned_at: Instant::now(),
+                preparation: None,
+                gpu_index: 1,
+                adopt: Some("k1".into()),
+            },
+        );
+        assert!(acked(mgr.handle_control(
+            ControlMsg::SessionStart {
+                id: "start".into(),
+                session_id: "p1".into(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        )));
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
+        assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p1");
+    }
+
+    #[test]
+    fn an_in_place_swap_reaches_the_runner() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        let reply = mgr.handle_control(
+            ControlMsg::SessionSwapApp {
+                id: "swap".into(),
+                session_id: "p1".into(),
+                app: AppSpec::default(),
+                in_place: true,
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(acked(reply));
+        let (_, req) = warm.swaps.recv_timeout(WAIT).unwrap();
+        assert!(req.in_place);
+    }
+
+    /// The runner thread is done, as the terminal proof requires; it stays in its handle.
+    fn wait_finished(mgr: &SessionManager, id: &str) {
+        let deadline = Instant::now() + WAIT;
+        while !mgr.running[id]
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the runner of {id} never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_runtimes_cleanup_proof_covers_the_sessions_it_served() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut mgr, warm) = warm_manager();
+        let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+            directory.path().join("ledger"),
+        )
+        .unwrap();
+        for id in ["p0", "p1"] {
+            ledger.record_active(id).unwrap();
+        }
+        mgr.home_cleanup = Some(ledger);
+        let retired = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = retired.clone();
+        mgr.home_source_retire = Some(Arc::new(move |id: &str| {
+            seen.lock().unwrap().push(id.to_string());
+            true
+        }));
+        held(&mut mgr, &warm, "p0");
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("p0"))));
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        mgr.running["p1"].stop.store(true, Ordering::Relaxed);
+        wait_finished(&mgr, "p1");
+        let proof = mgr.prove_home_terminal(
+            "p1",
+            SessionEvent::Stopped {
+                bytes_used: None,
+                detail: None,
+            },
+        );
+        assert!(
+            matches!(proof, Some(AgentMsg::SessionState { ref state, ref session_id, .. })
+            if state == "stopped" && session_id == "p1")
+        );
+        assert_eq!(
+            *retired.lock().unwrap(),
+            ["p0"],
+            "the containers carry the runtime's id"
+        );
+        let ledger = mgr.home_cleanup.as_ref().unwrap();
+        for id in ["p0", "p1"] {
+            assert_eq!(
+                ledger.state(id),
+                Some(crate::home_cleanup::TerminalKind::Stopped)
+            );
+        }
+    }
+
+    #[test]
+    fn a_released_runtime_owes_rh05_proof_once_its_cleanup_is_verified() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut mgr, warm) = warm_manager();
+        let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+            directory.path().join("ledger"),
+        )
+        .unwrap();
+        ledger.record_active("p0").unwrap();
+        mgr.home_cleanup = Some(ledger);
+        mgr.home_source_retire = Some(Arc::new(|_: &str| true));
+        held(&mut mgr, &warm, "p0");
+        assert_eq!(
+            mgr.home_cleanup.as_ref().unwrap().state("p0"),
+            None,
+            "held is no proof"
+        );
+        mgr.running["p0"].stop.store(true, Ordering::Relaxed);
+        wait_finished(&mgr, "p0");
+        let proof = serde_json::to_value(mgr.release_terminal("p0").unwrap()).unwrap();
+        assert_eq!(proof["state"], "stopped");
+        assert!(proof.get("runtime_held").is_none());
+        assert_eq!(
+            mgr.home_cleanup.as_ref().unwrap().state("p0"),
+            Some(crate::home_cleanup::TerminalKind::Stopped)
+        );
+    }
+
+    #[test]
+    fn launch_progress_rides_on_app_booting() {
+        let (mut mgr, _warm) = warm_manager();
+        let msg =
+            serde_json::to_value(mgr.on_event("p1", SessionEvent::LaunchProgress(42))).unwrap();
+        assert_eq!(msg["state"], "running");
+        assert_eq!(msg["detail"], "app booting");
+        assert_eq!(
+            msg["launch_progress"],
+            serde_json::json!({"step":"shaders","percent":42})
+        );
+        let plain = serde_json::to_value(mgr.on_event("p1", SessionEvent::AppBooting)).unwrap();
+        assert!(plain.get("launch_progress").is_none());
+    }
+
+    #[test]
+    fn an_unknown_session_kind_is_refused() {
+        let (mut mgr, warm) = warm_manager();
+        let assign: ControlMsg = serde_json::from_value(serde_json::json!({
+            "type": "session_assign", "id": "c1", "session_id": "s1", "gpu_index": 0,
+            "kind": "lurking",
+            "stream": {"width": 1920, "height": 1080, "fps": 60,
+                "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+        }))
+        .unwrap();
+        let reply = mgr.handle_control(assign, &warm.evt_tx, &diagnostic_sender());
+        assert!(
+            matches!(reply, Some(AgentMsg::Ack { ok: false, error: Some(ref e), .. })
+            if e == "unknown session kind")
+        );
+        assert!(mgr.pending.is_empty());
+    }
 }

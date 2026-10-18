@@ -961,6 +961,8 @@ pub struct Quit {
 
 #[derive(Debug, Clone, Copy)]
 enum QuitStep {
+    /// The game was not running when the quit began: nothing to close or sync.
+    NotRunning,
     Closing(Instant),
     Terminating(Instant),
     Killing(Instant),
@@ -988,11 +990,15 @@ pub const QUIT_CLOUD_WAIT: Duration = Duration::from_secs(60);
 impl Quit {
     /// Made right after the close request went out, so the cloud log is read from then.
     pub fn new(proc_root: &Path, steam_log_dir: &Path, appid: u32, now: Instant) -> Self {
+        let step = match game_running(proc_root, appid) {
+            Some(false) => QuitStep::NotRunning,
+            _ => QuitStep::Closing(now),
+        };
         Self {
             appid,
             proc_root: proc_root.to_owned(),
             cloud: CloudSync::new(steam_log_dir, appid),
-            step: QuitStep::Closing(now),
+            step,
         }
     }
 
@@ -1003,6 +1009,10 @@ impl Quit {
     pub fn poll(&mut self, now: Instant) -> Option<QuitAction> {
         let since = |at: Instant| now.saturating_duration_since(at);
         match self.step {
+            QuitStep::NotRunning => {
+                self.step = QuitStep::Over;
+                Some(QuitAction::Done(None))
+            }
             QuitStep::Closing(at) | QuitStep::Terminating(at) | QuitStep::Killing(at) => {
                 if game_running(&self.proc_root, self.appid) == Some(false) {
                     self.step = QuitStep::Syncing(now);
