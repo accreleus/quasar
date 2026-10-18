@@ -851,17 +851,16 @@ describe("SessionPage — #484 app-boot loader gate", () => {
     await act(async () => {
       openChannel();
     });
-    // The reveal has begun, but the loader's lock animation is opaque until LOCK_TO_STREAM_MS.
-    for (let t = 0; t < 1_000; t += 100) {
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(100);
-      });
-    }
+    // The reveal has begun, but the loader's lock animation is opaque until LOCK_TO_STREAM_MS
+    // (1180 ms). Checked at 300 ms: the suite's clock also moves with real time.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
     expect(document.querySelector(".sl-root")).not.toBeNull();
     expect(audio()?.muted).toBe(true);
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(300);
+      await vi.advanceTimersByTimeAsync(1_000);
     });
     expect(audio()?.muted).toBe(false);
     play.mockRestore();
