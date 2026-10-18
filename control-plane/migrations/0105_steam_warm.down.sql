@@ -1,8 +1,11 @@
 -- Refuses while a parked session is live: turn steam_warm_enabled off and wait
--- for the next session.parked_expire run (60 s), which stops them. The terminal
--- parked rows are deleted (metrics, trace, clock and token rows cascade):
--- dropping `kind` without that would bring each one back as a play in the
--- user's history, highlights and quota.
+-- for the next session.parked_expire run (60 s), which stops them.
+-- Recovery after a refusal: golang-migrate leaves schema_migrations dirty at
+-- 105. Once the parked sessions have stopped, run `migrate ... force 105`, then
+-- the down again.
+-- The terminal parked rows are deleted (metrics, trace, clock and token rows
+-- cascade): dropping `kind` without that would bring each one back as a play in
+-- the user's history, highlights and quota.
 BEGIN;
 
 DO $$

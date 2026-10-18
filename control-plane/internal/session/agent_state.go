@@ -46,7 +46,9 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		return
 	}
 	// A held runtime still mounts the home, so this `stopped` is no cleanup
-	// proof: it parks the runtime or releases it (amendment 39).
+	// proof (agent-api.md §session_state, runtime_held): it parks the runtime or
+	// releases it, and a release keeps the claim and holds until the agent's
+	// qualified `stopped` for the id, which takes the path below.
 	if to == StateStopped && m.RuntimeHeld {
 		c.endHeldRuntime(ctx, hostID, m)
 		return

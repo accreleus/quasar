@@ -667,6 +667,56 @@ func TestParkOnExitReleasesWhenARuleSaysNo(t *testing.T) {
 	}
 }
 
+// A released runtime keeps the ended row's hold until the agent's qualified
+// `stopped` for it (agent-api.md §session_state, runtime_held): a same-home
+// relaunch waits on that hold, then proceeds.
+func TestReleasedHeldRuntimeHoldsTheHomeUntilTheQualifiedStop(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	ctx := context.Background()
+	play := f.runningTile(t)
+	setWarm(t, f.pool, false, "library_open", 10) // a release, not a park
+
+	f.coord.AgentState(ctx, f.hostID, heldStop(play))
+	holder := func() string {
+		var h *string
+		must(t, f.pool.QueryRow(ctx, `SELECT pending_home_session_id::text FROM managed_home_claims`).Scan(&h))
+		return deref(h)
+	}
+	if got := holder(); got != play {
+		t.Fatalf("hold = %q after the runtime_held stop, want it kept on %s", got, play)
+	}
+
+	type result struct {
+		res LaunchResult
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+		done <- result{res, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("relaunch returned before the cleanup proof: %+v", r)
+	case <-time.After(700 * time.Millisecond):
+	}
+
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: play, State: "stopped",
+		Detail: "stopped", HomeCleanupQualified: true})
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("relaunch after the cleanup proof: %v", r.err)
+		}
+		f.disp.assignFor(t, r.res.Session.ID)
+		if got := holder(); got != r.res.Session.ID {
+			t.Errorf("hold = %q, want the relaunched session %s", got, r.res.Session.ID)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("relaunch still waiting after the qualified stopped")
+	}
+}
+
 // --- eviction, supersede and suppression ------------------------------------------
 
 func TestEvictionStopsOnlyTheOldestEligibleParkedSession(t *testing.T) {
