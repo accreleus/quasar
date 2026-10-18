@@ -147,14 +147,18 @@ impl Helper {
     }
 
     fn watch(&mut self, appid: u32, launched: bool) {
-        self.watcher = Some(Watcher::new(
+        let mut watcher = Watcher::new(
             WatchConfig {
                 proc_root: self.proc_root.clone(),
                 steam_log_dir: self.log_dir.clone(),
                 appid,
             },
             Box::<X11Windows>::default(),
-        ));
+        );
+        if self.dismiss {
+            watcher.answer_notice();
+        }
+        self.watcher = Some(watcher);
         self.launched = launched;
         self.needs_user = false;
         self.notice = Notice::Waiting;
@@ -271,6 +275,10 @@ impl Helper {
                     ),
                 }
                 self.notice = Notice::Answered;
+                // Still standing 2 s after the press, the notice is shown to the user.
+                if let Some(watcher) = &mut self.watcher {
+                    watcher.notice_pressed(now);
+                }
             }
             Notice::Answered => {}
         }
@@ -1255,6 +1263,56 @@ mod tests {
         );
         helper.needs_user = true;
         assert_eq!(helper.wanted_pin(), Some(Pin::Game(620)), "the game wins");
+    }
+
+    /// A helper watching 620 from its flags, with the controller notice standing since `t0`.
+    fn notice(dismiss: bool) -> (tempfile::TempDir, Helper, Agent, Instant) {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("console_log.txt"), "").unwrap();
+        let mut helper = Helper::new(dir.path().join("proc"), logs.clone(), dismiss);
+        helper.watch(620, false);
+        let mut agent = Agent::new(dir.path().join("none.sock"));
+        let t0 = Instant::now();
+        helper.pass(t0, &mut agent);
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(logs.join("console_log.txt"))
+            .unwrap();
+        writeln!(log, "GameAction [AppID 620, ActionID 1] : LaunchApp waiting for user response to ShowInterstitials \"\"").unwrap();
+        helper.pass(t0, &mut agent);
+        (dir, helper, agent, t0)
+    }
+
+    const NEEDS: usize = 2;
+
+    #[test]
+    fn under_show_the_notice_is_revealed_at_the_grace_and_never_answered() {
+        let (_dir, mut helper, mut agent, t0) = notice(false);
+        helper.pass(t0 + Duration::from_millis(2100), &mut agent);
+        assert!(agent.latest[NEEDS]
+            .as_deref()
+            .is_some_and(|l| l.contains("\"reason\":\"other\"")));
+        assert_eq!(helper.notice, Notice::Waiting, "show: never pressed");
+    }
+
+    #[test]
+    fn under_dismiss_safe_the_notice_is_pressed_first_and_revealed_only_if_it_stands() {
+        let (_dir, mut helper, mut agent, t0) = notice(true);
+        let pressed = t0 + Duration::from_millis(2100);
+        helper.pass(pressed, &mut agent);
+        assert_eq!(helper.notice, Notice::Answered, "pressed at the grace");
+        assert!(agent.latest[NEEDS].is_none(), "not revealed at the grace");
+        helper.pass(pressed + Duration::from_millis(1900), &mut agent);
+        assert!(agent.latest[NEEDS].is_none());
+        helper.pass(pressed + Duration::from_millis(2100), &mut agent);
+        assert!(
+            agent.latest[NEEDS]
+                .as_deref()
+                .is_some_and(|l| l.contains("\"reason\":\"other\"")),
+            "still the wait 2 s after the press"
+        );
     }
 
     #[test]

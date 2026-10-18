@@ -2,9 +2,9 @@
 //! cloud sync and the quit sequence, against fixture `/proc` trees and Steam logs.
 
 use quasar_launch_watch::{
-    game_running, game_tree, parse_command, CloudEnd, CloudSync, Command, Quit, QuitAction, Report,
-    WatchConfig, Watcher, WindowInfo, Windows, QUIT_CLOSE_GRACE, QUIT_CLOUD_WAIT, QUIT_KILL_GRACE,
-    QUIT_TERM_GRACE,
+    game_running, game_tree, parse_command, CloudEnd, CloudSync, Command, NeedsUser, Quit,
+    QuitAction, Report, WatchConfig, Watcher, WindowInfo, Windows, QUIT_CLOSE_GRACE,
+    QUIT_CLOUD_WAIT, QUIT_KILL_GRACE, QUIT_TERM_GRACE,
 };
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -159,54 +159,40 @@ fn shader(reports: Vec<Report>) -> Vec<u8> {
 }
 
 #[test]
-fn shader_progress_is_steams_figure_for_the_target_on_change_only() {
+fn shader_progress_follows_the_counters_and_only_rises() {
     let d = dirs();
     let mut w = watcher(&d);
     // A line already in the log belongs to an earlier session.
     assert_eq!(shader(w.poll()), Vec::<u8>::new());
     let log = d.logs.join("shader_log.txt");
-    append(
-        &log,
-        "[2026-10-18 12:59:25] Starting replay of FOZ databases for AppID 1145360 with x in:",
-    );
-    append(
-        &log,
-        "[2026-10-18 12:59:25] Still replaying 1145360 (50%, 0/13339).",
-    );
-    assert_eq!(shader(w.poll()), vec![50]);
-    // The same figure again, another app's, malformed ones: no report.
-    append(
-        &log,
-        "[2026-10-18 12:59:30] Still replaying 1145360 (50%, 982/13339).",
-    );
-    append(
-        &log,
-        "[2026-10-18 12:59:31] Still replaying 2344520 (70%, 0/140815).",
-    );
-    append(
-        &log,
-        "[2026-10-18 12:59:31] Still replaying 1145360 (101%, 0/1).",
-    );
-    append(
-        &log,
-        "[2026-10-18 12:59:31] Still replaying 1145360 (-5%, 0/1).",
-    );
-    append(&log, "Still replaying 1145360 (60%, 0/1).");
-    append(
-        &log,
-        "[2026-10-18 12:59:31] Still replaying 11453600 (60%, 0/1).",
-    );
+    let line = |text: &str| append(&log, &format!("[2026-10-18 13:04:15] {text}"));
+    line("Starting replay of FOZ databases for AppID 1145360 with x in:");
+    // The #759 S0 series: Steam's NN% stood at 50 while the counters moved.
+    line("Still replaying 1145360 (50%, 0/140815).");
+    assert_eq!(shader(w.poll()), vec![0]);
+    line("Still replaying 1145360 (50%, 982/143848).");
+    assert_eq!(shader(w.poll()), Vec::<u8>::new(), "0.68% is still 0");
+    line("Still replaying 1145360 (50%, 2474/143847).");
+    assert_eq!(shader(w.poll()), vec![1]);
+    line("Still replaying 1145360 (51%, 3082/144982).");
+    assert_eq!(shader(w.poll()), vec![2]);
+    // Lower readings never go back; other apps', malformed and counter-less near misses.
+    line("Still replaying 1145360 (50%, 10/13339).");
+    line("Still replaying 2344520 (70%, 9000/10000).");
+    line("Still replaying 1145360 (99%, 5/0).");
+    line("Still replaying 1145360 (99%, x/100).");
+    line("Still replaying 1145360 (99%, -5/100).");
+    line("Still replaying 1145360 (99%, 5/100)");
+    line("Still replaying 11453600 (60%, 60/100).");
+    append(&log, "Still replaying 1145360 (60%, 60/100).");
     assert_eq!(shader(w.poll()), Vec::<u8>::new());
-    // Two in one pass: the latest is what is reported.
-    append(
-        &log,
-        "[2026-10-18 12:59:34] Still replaying 1145360 (75%, 1000/1378).",
-    );
-    append(
-        &log,
-        "[2026-10-18 12:59:35] Still replaying 1145360 (100%, 1378/1378).",
-    );
-    assert_eq!(shader(w.poll()), vec![100]);
+    // A line with no counters carries Steam's figure, up to 100; counters past the total read 100.
+    line("Still replaying 1145360 (40%).");
+    line("Still replaying 1145360 (101%).");
+    assert_eq!(shader(w.poll()), vec![40]);
+    line("Still replaying 1145360 (75%, 1000/1378).");
+    line("Still replaying 1145360 (100%, 1500/1378).");
+    assert_eq!(shader(w.poll()), vec![100], "two in one pass: the highest");
 }
 
 #[test]
@@ -255,6 +241,97 @@ fn a_standing_controller_notice_is_told_from_a_quick_one() {
     );
     w.poll_at(t1);
     assert!(!w.interstitial_standing(t1 + PAST_USER_WAIT));
+}
+
+fn needs(reports: Vec<Report>) -> Vec<NeedsUser> {
+    reports
+        .into_iter()
+        .filter_map(|r| match r {
+            Report::SteamNeedsUser(reason) => Some(reason),
+            _ => None,
+        })
+        .collect()
+}
+
+fn notice_wait() -> String {
+    format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to ShowInterstitials \"\""
+    )
+}
+
+#[test]
+fn under_show_the_controller_notice_is_reported_after_the_grace() {
+    let d = dirs();
+    let mut w = watcher(&d);
+    w.poll();
+    let t0 = Instant::now();
+    append(&d.logs.join("console_log.txt"), &notice_wait());
+    assert_eq!(needs(w.poll_at(t0)), vec![]);
+    assert_eq!(
+        needs(w.poll_at(t0 + PAST_USER_WAIT)),
+        vec![NeedsUser::Other]
+    );
+}
+
+#[test]
+fn under_dismiss_safe_the_notice_is_reported_only_if_it_outlives_the_press() {
+    let d = dirs();
+    let mut w = watcher(&d);
+    w.answer_notice();
+    w.poll();
+    let log = d.logs.join("console_log.txt");
+    let t0 = Instant::now();
+    append(&log, &notice_wait());
+    assert_eq!(needs(w.poll_at(t0)), vec![]);
+    assert_eq!(
+        needs(w.poll_at(t0 + PAST_USER_WAIT)),
+        vec![],
+        "not before the press"
+    );
+    let pressed = t0 + PAST_USER_WAIT;
+    w.notice_pressed(pressed);
+    assert_eq!(
+        needs(w.poll_at(pressed + Duration::from_millis(1900))),
+        vec![]
+    );
+    assert_eq!(
+        needs(w.poll_at(pressed + PAST_USER_WAIT)),
+        vec![NeedsUser::Other],
+        "still the wait 2 s after the press: the user is shown it"
+    );
+
+    // Answered by the press: nothing is reported.
+    let d = dirs();
+    let mut w = watcher(&d);
+    w.answer_notice();
+    w.poll();
+    let log = d.logs.join("console_log.txt");
+    append(&log, &notice_wait());
+    w.poll_at(t0);
+    w.notice_pressed(pressed);
+    append(
+        &log,
+        &format!("GameAction [AppID {APPID}, ActionID 1] : LaunchApp continues with user response \"ShowInterstitials\""),
+    );
+    assert_eq!(needs(w.poll_at(pressed + PAST_USER_WAIT * 3)), vec![]);
+}
+
+#[test]
+fn under_dismiss_safe_other_waits_are_reported_as_before() {
+    let d = dirs();
+    let mut w = watcher(&d);
+    w.answer_notice();
+    w.poll();
+    let t0 = Instant::now();
+    append(
+        &d.logs.join("console_log.txt"),
+        &format!("GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"\""),
+    );
+    w.poll_at(t0);
+    assert_eq!(
+        needs(w.poll_at(t0 + PAST_USER_WAIT)),
+        vec![NeedsUser::CloudConflict]
+    );
 }
 
 fn cloud_line(appid: u32, what: &str) -> String {

@@ -72,7 +72,7 @@ pub enum Report {
         on_screen: bool,
     },
     SteamNeedsUser(NeedsUser),
-    /// Steam's own percentage from `Still replaying <appid> (NN%, a/b).` (#759).
+    /// The target's shader progress from `Still replaying <appid> (NN%, a/b).` (#759).
     ShaderProgress(u8),
 }
 
@@ -136,6 +136,10 @@ pub struct Watcher {
     last_shader: Option<u8>,
     /// When Steam started waiting on its controller notice (`ShowInterstitials`).
     interstitial_since: Option<Instant>,
+    /// `QUASAR_STEAM_DIALOGS=dismiss_safe`: the caller answers the notice, so it is reported
+    /// only if it still stands [`USER_WAIT`] after the caller's key press.
+    answers_notice: bool,
+    notice_pressed: Option<Instant>,
     /// The last window list read, for the helper's pin.
     last_windows: Vec<WindowInfo>,
 }
@@ -166,6 +170,8 @@ impl Watcher {
             shader,
             last_shader: None,
             interstitial_since: None,
+            answers_notice: false,
+            notice_pressed: None,
             last_windows: Vec::new(),
         }
     }
@@ -260,22 +266,49 @@ impl Watcher {
 
     /// The target's latest shader percentage, when it changed this pass. Lines for other
     /// apps (background processing) are ignored.
+    /// The figure only rises: a later line that reads lower (Steam's next stage, a recount)
+    /// is not reported.
     fn read_shader_log(&mut self) -> Option<u8> {
-        let mut latest = None;
+        let mut rose = false;
         for line in self.shader.read().0 {
             if let Some(percent) = shader_percent(&line, self.cfg.appid) {
-                latest = Some(percent);
+                if self.last_shader.is_none_or(|last| percent > last) {
+                    self.last_shader = Some(percent);
+                    rose = true;
+                }
             }
         }
-        let percent = latest.filter(|p| Some(*p) != self.last_shader)?;
-        self.last_shader = Some(percent);
-        Some(percent)
+        if rose {
+            self.last_shader
+        } else {
+            None
+        }
+    }
+
+    /// The caller answers Steam's controller notice itself (`dismiss_safe`, #759).
+    pub fn answer_notice(&mut self) {
+        self.answers_notice = true;
+    }
+
+    /// The caller pressed its answer to the notice at `now`.
+    pub fn notice_pressed(&mut self, now: Instant) {
+        self.notice_pressed.get_or_insert(now);
+    }
+
+    /// The notice stands, and an answering caller has not yet given its press time to work.
+    fn notice_held(&self, now: Instant) -> bool {
+        self.answers_notice
+            && self.interstitial_since.is_some()
+            && !self
+                .notice_pressed
+                .is_some_and(|at| now.saturating_duration_since(at) >= USER_WAIT)
     }
 
     fn held_log_needs(&self, now: Instant) -> Option<NeedsUser> {
         let wait = self
             .log_waiting
             .filter(|(_, since)| now.saturating_duration_since(*since) >= USER_WAIT)
+            .filter(|_| !self.notice_held(now))
             .map(|(reason, _)| reason);
         [wait, self.login.needs]
             .into_iter()
@@ -393,6 +426,8 @@ impl Watcher {
                     .unwrap_or("");
                 if task == "ShowInterstitials" {
                     self.interstitial_since.get_or_insert(now);
+                } else {
+                    self.interstitial_since = None;
                 }
                 // Reported only if no next task follows within USER_WAIT
                 // (held_log_needs); a routine wait is never armed.
@@ -798,19 +833,32 @@ fn cfg_shader_log(steam_log_dir: &Path) -> PathBuf {
     steam_log_dir.join("shader_log.txt")
 }
 
-/// `NN` from `[stamp] Still replaying <appid> (NN%, a/b).` for `appid`; `None` for any other
-/// line or app, or a figure over 100.
+/// The progress of `[stamp] Still replaying <appid> (NN%, a/b).` for `appid`: `100 * a / b`,
+/// rounded down and at most 100, since Steam's own `NN` reads as a stage (it stood at 50% while
+/// `a` went 0 to 3082 of ~144k, #759 S0). `NN` only for a line with no counters, `(NN%).`.
+/// `None` for any other line or app.
 fn shader_percent(line: &str, appid: u32) -> Option<u8> {
     let rest = after_timestamp(line)?.strip_prefix("Still replaying ")?;
     let (id, rest) = rest.split_once(' ')?;
     if id.parse::<u32>().ok()? != appid {
         return None;
     }
-    let (percent, _) = rest.strip_prefix('(')?.split_once("%,")?;
-    if percent.is_empty() || percent.len() > 3 || !percent.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+    let inside = rest.strip_prefix('(')?.strip_suffix(").")?;
+    let number = |s: &str| {
+        (!s.is_empty() && s.len() <= 12 && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    match inside.split_once("%, ") {
+        Some((_, counters)) => {
+            let (done, total) = counters.split_once('/')?;
+            let (done, total) = (number(done)?, number(total)?);
+            (total > 0).then(|| (done.saturating_mul(100) / total).min(100) as u8)
+        }
+        None => number(inside.strip_suffix('%')?)
+            .filter(|p| *p <= 100)
+            .map(|p| p as u8),
     }
-    percent.parse::<u8>().ok().filter(|p| *p <= 100)
 }
 
 /// What follows Steam's `[YYYY-MM-DD HH:MM:SS] ` prefix, or `None` when the line has none.
