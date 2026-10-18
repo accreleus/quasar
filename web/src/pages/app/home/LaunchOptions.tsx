@@ -9,6 +9,7 @@ import { useCallback, useRef } from "react";
 import type { RefObject } from "react";
 import { Button } from "../../../components/Button";
 import { IconClose, IconPlayGlyph } from "../../../components/icons";
+import { waitingPlayLabel } from "../capacityRetry";
 import type { DraftCodec } from "../launchOptions";
 import type { LaunchSpec, OptionColumns, OptionRow, Verdict } from "./launchOptionRules";
 import type { WaitingReason } from "./useLaunch";
@@ -56,9 +57,7 @@ export function LaunchOptions({
   closeRef,
 }: LaunchOptionsProps) {
   const playLabel = waitingForSlot
-    ? waitingReason === "host"
-      ? "Waiting for a host…"
-      : "Waiting for a slot…"
+    ? waitingPlayLabel(waitingReason)
     : launching
       ? "Launching…"
       : checking
