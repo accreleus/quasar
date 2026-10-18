@@ -25,6 +25,7 @@ import {
 } from "../launchOptions";
 import { LIVE_STATES, blockedFamilyIds, coverClassAt, familyRootApp } from "../libraryGrid";
 import { useLibraryCatalog } from "../libraryCatalog";
+import { waitingPlayLabel } from "../capacityRetry";
 import { recommendation, resolutionLabel } from "../home/launchOptionRules";
 import { useLaunch } from "../home/useLaunch";
 import { useLaunchDraft } from "../home/useLaunchDraft";
@@ -268,9 +269,7 @@ export function useGamePage(app: App) {
   const playLabel = isLive
     ? "Resume session"
     : launch.waitingForSlot
-      ? launch.waitingReason === "host"
-        ? "Waiting for a host…"
-        : "Waiting for a slot…"
+      ? waitingPlayLabel(launch.waitingReason)
       : launch.launching
         ? "Launching…"
         : "Play";
