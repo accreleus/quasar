@@ -113,12 +113,13 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) e
 	var state State
 	var host *string
 	var connected, recent bool
+	var kind string
 	err := tx.QueryRow(ctx, `SELECT s.state, s.host_id::text,
 		COALESCE(h.status IN ('online','draining'), false),
-		COALESCE(s.ended_at, s.updated_at) > now() - ($2::int * interval '1 second')
+		COALESCE(s.ended_at, s.updated_at) > now() - ($2::int * interval '1 second'), s.kind
 		FROM sessions s LEFT JOIN hosts h ON h.id=s.host_id
 		WHERE s.id=$1::uuid`, holder, int(homeHoldSettleWindow/time.Second)).
-		Scan(&state, &host, &connected, &recent)
+		Scan(&state, &host, &connected, &recent, &kind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrHomeConflict
 	}
@@ -127,6 +128,9 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) e
 	}
 	switch {
 	case !state.IsTerminal():
+		if kind == KindParked {
+			holder = "" // never named (control-api.md §Warm Steam)
+		}
 		return &HomeInUseError{SessionID: holder, Stopping: state == StateStopping}
 	case host != nil && *host == claimHost && connected && recent:
 		return &homeHoldSettlingError{holder: holder}
@@ -406,7 +410,7 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE sessions SET state_detail=$2 WHERE id=$1::uuid`,
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET state_detail=$2, launch_progress=NULL WHERE id=$1::uuid`,
 		sessionID, swapDetailInProgress); err != nil {
 		return nil, fmt.Errorf("persist pending swap guard: %w", err)
 	}

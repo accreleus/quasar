@@ -39,6 +39,7 @@ func (s *store) listPlayHistory(ctx context.Context, callerID string) ([]playHis
 			           interval '0') AS dur
 		) d
 		WHERE s.user_id = $1::uuid
+		  AND s.kind = 'play'
 		  AND s.started_at IS NOT NULL
 		  AND s.state <> 'failed'
 		  AND apps.enabled = true

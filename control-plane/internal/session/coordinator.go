@@ -189,8 +189,18 @@ func (c *Coordinator) stopInGrace(sessionID string) bool {
 	return ok && time.Since(at) < stopAckTimeout
 }
 
+// Swap also supersedes the owner's parked session when the target is outside
+// its Steam family (control-api.md §Warm Steam, "Non-Steam apps").
 func (c *Coordinator) Swap(ctx context.Context, sessionID, newAppID string) (Session, error) {
-	return c.swapper.Swap(ctx, sessionID, newAppID)
+	sess, err := c.swapper.Swap(ctx, sessionID, newAppID)
+	if err == nil {
+		keep := ""
+		if app, err := c.store.GetLaunchApp(ctx, newAppID); err == nil && app.SteamFamily {
+			keep = homeAppID(app)
+		}
+		c.supersedeParked(ctx, sess.UserID, keep, "")
+	}
+	return sess, err
 }
 
 func (c *Coordinator) EvaluateClientHealth(ctx context.Context, sessionID string, sample ClientHealthSample) {

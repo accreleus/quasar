@@ -19,7 +19,12 @@ type ProfilePolicySettings struct {
 
 type UserProfilePreferences struct {
 	DefaultProfileID *string `json:"default_profile_id"`
+	// "show" (the default) or "dismiss_safe" (amendment 39, migration 0105).
+	SteamDialogs string `json:"steam_dialogs"`
 }
+
+// ValidSteamDialogs mirrors the user_profile_preferences CHECK.
+func ValidSteamDialogs(v string) bool { return v == "show" || v == steamDialogsDismiss }
 
 func (s *Store) GetProfilePolicy(ctx context.Context) (ProfilePolicySettings, error) {
 	var p ProfilePolicySettings
@@ -61,6 +66,9 @@ func (s *Store) UpdateProfilePolicy(ctx context.Context, globalDefaultProfileID 
 	return p, nil
 }
 
+// GetUserProfilePreferences reads default_profile_id only; SteamDialogs is
+// GetSteamDialogs. The launch path calls this, and must not read columns newer
+// than the profile (TestMigration0036BehaviourNeutrality runs it on an old schema).
 func (s *Store) GetUserProfilePreferences(ctx context.Context, userID string) (UserProfilePreferences, error) {
 	var prefs UserProfilePreferences
 	err := s.pool.QueryRow(ctx, `
@@ -98,6 +106,32 @@ func (s *Store) UpdateUserProfilePreferences(ctx context.Context, userID string,
 	`, userID, strOrEmpty(defaultProfileID)).Scan(&prefs.DefaultProfileID)
 	if err != nil {
 		return UserProfilePreferences{}, fmt.Errorf("update user profile preferences: %w", err)
+	}
+	return prefs, nil
+}
+
+// GetSteamDialogs is the user's steam_dialogs; no row reads "show".
+func (s *Store) GetSteamDialogs(ctx context.Context, userID string) (string, error) {
+	v := "show"
+	err := s.pool.QueryRow(ctx, `SELECT steam_dialogs FROM user_profile_preferences WHERE user_id::text = $1`,
+		userID).Scan(&v)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("get steam dialogs: %w", err)
+	}
+	return v, nil
+}
+
+// SetSteamDialogs writes steam_dialogs alone, leaving the profile unchanged.
+// The caller has checked ValidSteamDialogs.
+func (s *Store) SetSteamDialogs(ctx context.Context, userID, value string) (UserProfilePreferences, error) {
+	var prefs UserProfilePreferences
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO user_profile_preferences (user_id, steam_dialogs) VALUES ($1::uuid, $2)
+		ON CONFLICT (user_id) DO UPDATE SET steam_dialogs = EXCLUDED.steam_dialogs
+		RETURNING default_profile_id, steam_dialogs
+	`, userID, value).Scan(&prefs.DefaultProfileID, &prefs.SteamDialogs)
+	if err != nil {
+		return UserProfilePreferences{}, fmt.Errorf("set steam dialogs: %w", err)
 	}
 	return prefs, nil
 }

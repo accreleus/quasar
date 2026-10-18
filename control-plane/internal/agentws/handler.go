@@ -852,7 +852,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 
 	// Step 1 — register
 	registerCtx, cancelRegister := context.WithTimeout(bg, handshakeTimeout)
-	hostID, registeredAt, regImages, regCommit, terminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, err := h.handleRegister(registerCtx, conn, clientIP)
+	hostID, registeredAt, regImages, regCommit, caps, policyTyped, acceptedGroups, connectionID, cleanupRegister, err := h.handleRegister(registerCtx, conn, clientIP)
 	cancelRegister()
 	h.failures.Release(clientIP)
 	if err != nil {
@@ -877,7 +877,8 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	// skips the local-display leg. Queuing config_update first guarantees it
 	// precedes any assign on the single writer.
 	ac := newConn(hostID, conn)
-	ac.terminalHomeCleanupV1 = terminalHomeCleanupV1
+	ac.terminalHomeCleanupV1 = caps.TerminalHomeCleanupV1
+	ac.parkedSessionsV1 = caps.ParkedSessionsV1
 	ac.policyTyped = policyTyped
 	ac.policyAccepted = acceptedGroups
 	ac.policyIdle = slices.Contains(acceptedGroups, "hardware")
@@ -1116,6 +1117,9 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			stateCtx, stateCancel := context.WithTimeout(bg, agentDBCallTimeout)
 			h.registry.withCurrent(ac, func() {
 				m.HomeCleanupQualified = ac.terminalHomeCleanupV1
+				if !ac.parkedSessionsV1 {
+					m.RuntimeHeld, m.LaunchProgress = false, nil
+				}
 				h.events.AgentState(stateCtx, hostID, m)
 			})
 			stateCancel()
@@ -1496,6 +1500,13 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	}
 }
 
+// registerCaps are the capability assertions bound to one authenticated
+// connection epoch.
+type registerCaps struct {
+	TerminalHomeCleanupV1 bool
+	ParkedSessionsV1      bool
+}
+
 // handleRegister performs the register handshake and returns the resolved host
 // id, the last_registered_at it wrote (markOffline's key), and the agent's optional
 // image-management P2 `images` snapshot (nil when the agent sent no such field — see
@@ -1503,10 +1514,10 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 // The fourth return value is the identity commit the agent reported (nil when it
 // reported none or one this build refused), which the caller hands to the
 // platform-apply success-evidence hook.
-func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, time.Time, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
-	fail := func(err error) (string, time.Time, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
+func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, time.Time, []RegisterImage, *string, registerCaps, bool, []string, string, ImageCleanupRegister, error) {
+	fail := func(err error) (string, time.Time, []RegisterImage, *string, registerCaps, bool, []string, string, ImageCleanupRegister, error) {
 		h.failures.Failure(clientIP)
-		return "", time.Time{}, nil, nil, false, false, nil, "", ImageCleanupRegister{}, err
+		return "", time.Time{}, nil, nil, registerCaps{}, false, nil, "", ImageCleanupRegister{}, err
 	}
 	conn.SetReadDeadline(time.Now().Add(registerReadTimeout))
 	raw, err := readTextMessage(conn)
@@ -1639,7 +1650,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	if err := conn.WriteJSON(resp); err != nil {
-		return "", time.Time{}, nil, nil, false, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
+		return "", time.Time{}, nil, nil, registerCaps{}, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
 	}
 	cleanupRegister := ImageCleanupRegister{Capable: reg.ImageCleanupV1}
 	if reg.ImageCleanupV1 {
@@ -1649,7 +1660,9 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			cleanupRegister.Versions = versions
 		}
 	}
-	return result.HostID, result.RegisteredAt, reg.Images, identity.SourceCommit, reg.TerminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
+	return result.HostID, result.RegisteredAt, reg.Images, identity.SourceCommit,
+		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1},
+		policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }
 
 func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, ac *conn) error {

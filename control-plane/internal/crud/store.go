@@ -1257,7 +1257,7 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 		-- sessions_app_created_idx (migration 0070).
 		LEFT JOIN (
 		    SELECT app_id, count(*) AS n FROM sessions
-		    WHERE created_at >= now() - interval '30 days'
+		    WHERE created_at >= now() - interval '30 days' AND kind = 'play'
 		    GROUP BY app_id
 		) s30 ON s30.app_id = apps.id
 		ORDER BY apps.created_at DESC

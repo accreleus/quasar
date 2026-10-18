@@ -69,6 +69,10 @@ func (c *Coordinator) DrainHost(ctx context.Context, hostID string, force bool) 
 			return Host{}, err
 		}
 	} else {
+		// Parked sessions are nobody's to wait for (control-api.md §Warm Steam).
+		if err := c.StopParkedOnHost(ctx, hostID); err != nil {
+			return Host{}, err
+		}
 		c.log.Info("drained host (graceful)", "host_id", hostID)
 	}
 	return h, nil
