@@ -1063,6 +1063,11 @@ describe("snapshot notification dedupe (#78)", () => {
 
 describe("session sound", () => {
   const audioEl = () => document.body.querySelector("audio");
+  let play: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  });
+  afterEach(() => play.mockRestore());
 
   it("stays muted until the reveal releases it, then follows the runtime's life", () => {
     const h = harness();
@@ -1073,6 +1078,8 @@ describe("session sound", () => {
 
     h.runtime.releaseAudio();
     expect(audioEl()?.muted).toBe(false);
+    // A muted autoplay the browser blocked is started again, not just unmuted.
+    expect(play).toHaveBeenCalled();
 
     h.runtime.destroy();
     expect(audioEl()).toBeNull();
@@ -1085,5 +1092,15 @@ describe("session sound", () => {
     h.transport.onAudioTrack?.({} as MediaStream);
     expect(audioEl()?.muted).toBe(false);
     h.runtime.destroy();
+  });
+
+  it("replaces the element when the audio track arrives again", () => {
+    const h = harness();
+    h.runtime.start();
+    h.transport.onAudioTrack?.({} as MediaStream);
+    h.transport.onAudioTrack?.({} as MediaStream);
+    expect(document.body.querySelectorAll("audio")).toHaveLength(1);
+    h.runtime.destroy();
+    expect(audioEl()).toBeNull();
   });
 });

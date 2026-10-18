@@ -112,6 +112,8 @@ let lastOnChannel: ((ch: { readyState: string; onclose: (() => void) | null }) =
 /** The runtime's recovery sink, same capture: a test plays the transport's
  *  verdict (e.g. the 4404 close) without a WebSocket. */
 let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
+/** The last transport, so a test can hand the runtime an audio track. */
+let lastTransport: { onAudioTrack: unknown } | null = null;
 vi.mock("../../webrtc/session", () => ({
   QuasarSession: class {
     videoReceiver = null;
@@ -128,6 +130,7 @@ vi.mock("../../webrtc/session", () => ({
     ) {
       lastOnChannel = onChannel;
       lastOnRecovery = onRecoveryState ?? null;
+      lastTransport = this;
     }
     close() {}
     // As QuasarSession does: abandoning the reconnect terminalises recovery.
@@ -828,6 +831,31 @@ describe("SessionPage — #484 app-boot loader gate", () => {
     });
 
     await waitFor(() => expect(document.querySelector(".sl-root")).toBeNull());
+  });
+
+  it("keeps the session's sound muted until the reveal", async () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    currentSession = makeSession({ state: "running", state_detail: "app booting" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      openChannel();
+      (lastTransport?.onAudioTrack as (s: MediaStream) => void)({} as MediaStream);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    // Steam's startup sound plays under the loader; the player must not hear it.
+    expect(document.body.querySelector("audio")?.muted).toBe(true);
+
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await waitFor(() => expect(document.body.querySelector("audio")?.muted).toBe(false));
+    play.mockRestore();
   });
 
   it("unmounts on the reveal-cap timer when 'app presented' never arrives", async () => {

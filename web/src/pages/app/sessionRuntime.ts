@@ -871,6 +871,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       // <audio> element so it plays without coupling the video PC's jitter
       // buffer — the whole point of the split.
       transport.onAudioTrack = (stream) => {
+        audioCleanup?.(); // a renegotiated track replaces the old element, not stacks on it
         const audio = document.createElement("audio");
         audio.autoplay = true;
         audio.muted = audioHeld;
@@ -910,7 +911,13 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
 
     releaseAudio() {
       audioHeld = false;
-      if (audioEl) audioEl.muted = false;
+      if (!audioEl) return;
+      audioEl.muted = false;
+      if (!audioEl.paused) return;
+      // A blocked muted autoplay leaves the element paused; unmuting alone would stay silent.
+      audioEl
+        .play()
+        ?.catch((err) => reportBestEffortFailure("silent-debug", "session: play audio at reveal", err));
     },
 
     engage: () => captureEngage?.() ?? null,
