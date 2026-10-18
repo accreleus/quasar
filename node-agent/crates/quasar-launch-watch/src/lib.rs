@@ -144,7 +144,7 @@ impl Watcher {
     pub fn new(cfg: WatchConfig, windows: Box<dyn Windows + Send>) -> Self {
         let console = LogTail::new(
             cfg.steam_log_dir.join("console_log.txt"),
-            Some(cfg.steam_log_dir.join("console_log.txt.previous")),
+            Some(cfg.steam_log_dir.join("console_log.previous.txt")),
         );
         let shader = LogTail::new(cfg_shader_log(&cfg.steam_log_dir), None);
         let login = LoginLog {
@@ -488,9 +488,10 @@ impl LogTail {
         // session's and is read from 0 (the inode check below sees
         // None != Some(new inode) and restarts it). Only a new file
         // (rotation) or a shorter one (truncation) restarts at 0 after that.
-        // Steam rotates by size to `console_log.txt.previous` (#723): the
-        // rest of the file being read is finished there first, keeping what
-        // was learnt from it.
+        // Steam rotates by size to `console_log.previous.txt` (every listing
+        // of the logs dir in the #759 S0 spike; no `.txt.previous`): the rest
+        // of the file being read is finished there first, keeping what was
+        // learnt from it.
         if !self.seen {
             self.seen = true;
             if let Ok(seen) = &metadata {

@@ -1016,7 +1016,7 @@ fn rotation_finishes_the_previous_file_from_its_offset_then_reads_the_new_one_fr
     rig.append_log(&format!(
         "Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"
     ));
-    let previous = rig.log_dir.join("console_log.txt.previous");
+    let previous = rig.log_dir.join("console_log.previous.txt");
     std::fs::rename(rig.log_path(), &previous).unwrap();
     rig.append_log(&format!(
         "Game process removed: AppID {APPID} \"game\", ProcID 201"
@@ -1047,7 +1047,7 @@ fn an_unreadable_previous_is_abandoned(through_a_symlink: bool) {
     assert_eq!(rig.watcher.poll(), vec![]);
     rig.append_log("# unread when Steam rotates");
 
-    let previous = rig.log_dir.join("console_log.txt.previous");
+    let previous = rig.log_dir.join("console_log.previous.txt");
     let old = if through_a_symlink {
         rig.log_dir.join("console_log.old")
     } else {
@@ -1090,7 +1090,7 @@ fn a_fifo_in_place_of_a_log_never_blocks_a_poll() {
     let mut rig = Rig::new();
     write_proc(&rig.proc_root, 100, STEAM);
     rig.watcher.poll();
-    for name in ["steamui_login.txt", "console_log.txt.previous"] {
+    for name in ["steamui_login.txt", "console_log.previous.txt"] {
         let status = std::process::Command::new("mkfifo")
             .arg(rig.log_dir.join(name))
             .status()
@@ -1120,7 +1120,7 @@ fn a_fifo_in_place_of_a_log_never_blocks_a_poll() {
 #[test]
 fn a_previous_file_that_is_not_the_one_being_read_is_ignored() {
     let mut rig = Rig::new();
-    let previous = rig.log_dir.join("console_log.txt.previous");
+    let previous = rig.log_dir.join("console_log.previous.txt");
     std::fs::write(
         &previous,
         format!("Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0\n"),
