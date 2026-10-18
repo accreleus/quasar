@@ -333,6 +333,7 @@ function SessionPageBody() {
     setExternalResizeSupported,
     externalOwner,
     launchDetail,
+    shaderPercent,
     launchFailure,
     noteFailure,
     appPresented,
@@ -1024,6 +1025,7 @@ function SessionPageBody() {
           // The poll's "app booting" is the control plane's app_launch_state
           // "starting" (#484 §3.2): the app is up, it has not presented.
           appLaunchState={launchDetail === "app booting" ? "starting" : undefined}
+          shaderPercent={shaderPercent}
           // #482: without these the loader falls back to "finding a host" for
           // anything the status string doesn't recognise.
           hostAssigned={hostAssigned}

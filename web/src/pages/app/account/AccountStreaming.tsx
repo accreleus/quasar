@@ -14,6 +14,7 @@ import { SelectField } from "../../../components/TextField";
 import { useToast } from "../../../components/Toast";
 import { useResource } from "../../../lib/resource/react";
 import { useSectionHead } from "../../../components/shell/sectionHead";
+import { SteamDialogsField } from "./SteamDialogsField";
 
 interface StreamPrefs {
   profiles: { id: string; name: string }[];
@@ -100,6 +101,10 @@ export function AccountStreaming() {
       {prefs && !overridesAllowed && (
         <p className="muted mt3">An admin has disabled user profile overrides.</p>
       )}
+
+      <div className="grid g2 ac-narrow mt5">
+        <SteamDialogsField />
+      </div>
 
       <p className="note mt5">
         Your device is measured at sign-in, and a launch never exceeds what it can decode.

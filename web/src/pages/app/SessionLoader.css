@@ -220,6 +220,13 @@
   transform: translateY(0.4rem);
 }
 
+/* Small print under the phase word, like the stall copy below it. */
+.sl-shaders {
+  margin: var(--s2) 0 0;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+}
+
 .sl-status-foot {
   display: flex;
   justify-content: center;

@@ -56,6 +56,8 @@ interface SessionLoaderProps {
   /** Control-plane `state` / `app_launch_state` for this session. */
   sessionState?: string;
   appLaunchState?: string;
+  /** Steam is processing the game's shaders (0-100). Null/absent = today's copy. */
+  shaderPercent?: number | null;
   // The four transport signals the phase machine walks (sessionRuntime.ts).
   wsOpen?: boolean;
   pcConnected?: boolean;
@@ -75,6 +77,7 @@ export function SessionLoader({
   iceState = null,
   sessionState,
   appLaunchState,
+  shaderPercent = null,
   wsOpen = false,
   pcConnected = false,
   firstFrame = false,
@@ -283,6 +286,7 @@ export function SessionLoader({
               <span className="sl-verb">{visible.verb}</span>
               <span className={changing ? "sl-stage changing" : "sl-stage"}>{visible.word}</span>
             </h1>
+            {shaderPercent !== null && <p className="sl-shaders">Processing shaders — {shaderPercent}%</p>}
             <div className="sl-status-foot">
               <GlyphRail step={visible.step} />
             </div>

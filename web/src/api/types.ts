@@ -74,6 +74,7 @@ export type SettingsResponse = Schemas["SettingsEnvelope"];
 
 // ── Platform releases (#104/#110, control-api.md §Platform releases) ─────────
 
+export type SteamWarmRewarm = NonNullable<InstanceSettings["steam_warm_rewarm"]>;
 export type ReleaseChannel = NonNullable<InstanceSettings["release_channel"]>;
 
 /** GET /v1/admin/platform/releases — the whole Releases page in one read. */
@@ -261,6 +262,8 @@ export type ProfilesResponse = Schemas["ProfilesResponse"];
 
 // Req-massaged: these two schemas still lack a `required:` array.
 export type ProfilePreferencesResponse = Req<Schemas["ProfilePreferencesResponse"]>;
+
+export type SteamDialogs = NonNullable<Schemas["ProfilePreferencesResponse"]["steam_dialogs"]>;
 
 export type ProfilePolicyResponse = Req<Schemas["ProfilePolicyResponse"]>;
 
