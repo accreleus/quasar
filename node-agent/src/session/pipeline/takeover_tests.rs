@@ -2152,6 +2152,7 @@ impl Session {
         let (swap, swap_rx) = std::sync::mpsc::channel();
         let (display, display_rx) = std::sync::mpsc::channel();
         let (_, capture_rx) = std::sync::mpsc::channel();
+        let (_, adopt_rx) = std::sync::mpsc::channel();
         let metrics = Arc::new(SessionMetrics::new("smooth", cfg.stream.fps as u32));
         let (id, flag) = (format!("takeover-{tag}"), stop.clone());
         let thread = std::thread::spawn(move || {
@@ -2166,6 +2167,7 @@ impl Session {
                 display_rx,
                 capture_rx,
                 metrics,
+                adopt_rx,
             )
         });
         Session {
@@ -2508,7 +2510,10 @@ impl Session {
         self.pump(&mut nobody, Duration::from_secs(1), |_, _| false);
 
         self.swap
-            .send(SwapRequest { container: None })
+            .send(SwapRequest {
+                container: None,
+                in_place: false,
+            })
             .expect("swap lane");
         let swapped = self.pump(&mut nobody, Duration::from_secs(10), |s, _| s.swapped);
         assert!(swapped, "the swap never completed");

@@ -54,6 +54,33 @@ impl LatencyProbeStages {
     }
 }
 
+/// `session_assign.kind` (amendment 39). An unknown value refuses the assign rather than
+/// guess.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Play,
+    Parked,
+    #[serde(other)]
+    Unknown,
+}
+
+/// `session_state.launch_progress` (amendment 39): `step` is always `"shaders"`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchProgress {
+    pub step: &'static str,
+    pub percent: u8,
+}
+
+impl LaunchProgress {
+    pub fn shaders(percent: u8) -> Self {
+        LaunchProgress {
+            step: "shaders",
+            percent: percent.min(100),
+        }
+    }
+}
+
 /// Messages sent from the node agent to the control plane.
 // AgentMsg derives Serialize only, so several fields (e.g. `error` on
 // Ack/SessionState) are written for the wire but never read back by Rust,
@@ -112,6 +139,10 @@ pub enum AgentMsg {
         config_policy_groups: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         terminal_home_cleanup_v1: Option<bool>,
+        /// Amendment 39 (#759): parked sessions, adoption, held runtimes, shader progress and
+        /// the in-place swap.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parked_sessions_v1: Option<bool>,
     },
     ConfigPolicyState {
         attempt_id: String,
@@ -225,6 +256,12 @@ pub enum AgentMsg {
         /// Actual initial Steam managed-home provisioning outcome, when known.
         #[serde(skip_serializing_if = "Option::is_none")]
         home_seed: Option<crate::session::home::HomeSeedOutcome>,
+        /// Amendment 39: on the `stopped` of a game exit whose runtime the agent keeps.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_held: Option<bool>,
+        /// Amendment 39: Steam's shader progress, on `running` / `app booting` only.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        launch_progress: Option<LaunchProgress>,
     },
     /// P1-7 signaling relay: wrap a Phase 0 inner message (offer/ice/…) for the
     /// control-plane relay, which unwraps and forwards it to the browser.
@@ -1072,6 +1109,12 @@ pub enum ControlMsg {
         session_id: String,
         #[serde(default)]
         gpu_index: i32,
+        /// Amendment 39: absent from a control plane that predates it.
+        #[serde(default)]
+        kind: Option<SessionKind>,
+        /// Amendment 39: the held or parked runtime this session takes over.
+        #[serde(default)]
+        adopt_session_id: Option<String>,
         /// The app image + runtime spec to launch (P1-5 container launch).
         #[serde(default)]
         app: AppSpec,
@@ -1102,6 +1145,9 @@ pub enum ControlMsg {
         session_id: String,
         #[serde(default)]
         app: AppSpec,
+        /// Amendment 39: switch games inside the running Steam when the agent can.
+        #[serde(default)]
+        in_place: bool,
     },
     /// Change a running session's compositor-side `wl_output` mode and/or
     /// `preferred_scale` without touching the encode/stream path. Partial: an
@@ -1777,6 +1823,8 @@ mod tests {
             reason_code: None,
             app_log_tail: None,
             home_seed: None,
+            runtime_held: None,
+            launch_progress: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         let obj = json.as_object().unwrap();
@@ -1799,6 +1847,8 @@ mod tests {
                 mode: "copy",
                 reason: "seeded",
             }),
+            runtime_held: None,
+            launch_progress: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -1817,6 +1867,8 @@ mod tests {
             reason_code: Some("app_exited_early".to_string()),
             app_log_tail: Some("Steam needs to be online to update\nexiting".to_string()),
             home_seed: None,
+            runtime_held: None,
+            launch_progress: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["reason_code"], "app_exited_early");
@@ -2050,6 +2102,7 @@ mod tests {
             config_policy_versions: None,
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
+            parked_sessions_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Enrollment {
@@ -2084,6 +2137,7 @@ mod tests {
             config_policy_versions: None,
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
+            parked_sessions_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -2125,6 +2179,7 @@ mod tests {
             config_policy_versions: None,
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
+            parked_sessions_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -2163,6 +2218,7 @@ mod tests {
             config_policy_versions: None,
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
+            parked_sessions_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {

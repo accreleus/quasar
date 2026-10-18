@@ -23,7 +23,8 @@ use crate::health::HealthState;
 use crate::host_probe;
 use crate::images::ImageManager;
 use crate::messages::{
-    AgentMsg, AppSpec, Auth, CodecThroughput, ControlMsg, StreamSpec, VideoTopology,
+    AgentMsg, AppSpec, Auth, CodecThroughput, ControlMsg, LaunchProgress, SessionKind, StreamSpec,
+    VideoTopology,
 };
 use crate::release::ReleaseManager;
 use crate::session::capture::{self, CaptureRequest, CaptureSlot};
@@ -34,8 +35,8 @@ use crate::session::library_scan::LibraryScanClient;
 use crate::session::metrics::SessionMetrics;
 use crate::session::mount_policy::MountPolicy;
 use crate::session::runner::{
-    run_blocking, validate_display_update, DiagnosticEventTx, DisplayUpdateRequest, SessionEvent,
-    SwapRequest,
+    run_blocking, validate_display_update, AdoptRequest, DiagnosticEventTx, DisplayUpdateRequest,
+    SessionEvent, SwapRequest,
 };
 use crate::session::signaling::SignalMsg;
 use crate::session::vulkan_fault::{self, GpuGlobalFaultDetector};
@@ -70,6 +71,7 @@ type RunnerFn = Arc<
             std::sync::mpsc::Receiver<DisplayUpdateRequest>,
             std::sync::mpsc::Receiver<CaptureRequest>,
             Arc<SessionMetrics>,
+            std::sync::mpsc::Receiver<AdoptRequest>,
         ) + Send
         + Sync,
 >;
@@ -86,7 +88,8 @@ fn default_runner() -> RunnerFn {
          swap_rx,
          display_rx,
          capture_rx,
-         metrics| {
+         metrics,
+         adopt_rx| {
             run_blocking(
                 session_id,
                 cfg,
@@ -98,6 +101,7 @@ fn default_runner() -> RunnerFn {
                 display_rx,
                 capture_rx,
                 metrics,
+                adopt_rx,
             );
         },
     )
@@ -1684,6 +1688,7 @@ fn register_message(
         config_policy_groups: policy_available.then(|| crate::policy::PolicyAgent::advertised_groups(
             &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)))),
         terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
+        parked_sessions_v1: Some(true),
         node_name: cfg.node_name.clone(),
         agent_version: crate::buildinfo::version().to_string(),
         auth: choose_auth(cfg, prefer_enrollment_token)?,
@@ -2728,6 +2733,24 @@ async fn connect_and_run(
                     *evt_rx = None;
                     continue;
                 };
+                let session_id = mgr.label(&session_id);
+                // A held runtime's session has ended: its runner's own reports stop here,
+                // and its end is the release (amendment 39).
+                if mgr.running.get(&session_id).is_some_and(|h| !h.live()) {
+                    if matches!(
+                        event,
+                        SessionEvent::Stopped { .. }
+                            | SessionEvent::Failed(_)
+                            | SessionEvent::AppFailed { .. }
+                    ) {
+                        flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx, &mgr.labels).await?;
+                        if let Some(msg) = mgr.release_terminal(&session_id) {
+                            send(&mut tx, &msg).await?;
+                        }
+                        send_fresh_capacity(&mut tx, &mut *mgr).await?;
+                    }
+                    continue;
+                }
                 {
                     match event {
                         SessionEvent::Signaling(sig_msg) => {
@@ -2762,7 +2785,7 @@ async fn connect_and_run(
                             }
                             // #503: get pending trace events out before the terminal
                             // state — the control plane drops them afterwards.
-                            flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
+                            flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx, &mgr.labels).await?;
                             if let Some(msg) = mgr.prove_home_terminal(
                                 &session_id,
                                 SessionEvent::Stopped { bytes_used, detail },
@@ -2842,8 +2865,10 @@ async fn connect_and_run(
                             // #503: same pre-terminal flush as the `Stopped` arm —
                             // `webrtc.remote_description_failed` is emitted by the
                             // runner immediately before this very event.
-                            if terminal {
-                                flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
+                            // The held `stopped` goes out like any terminal report.
+                            let pre_terminal = terminal || matches!(&other, SessionEvent::Held);
+                            if pre_terminal {
+                                flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx, &mgr.labels).await?;
                             }
                             let msg = if terminal {
                                 mgr.prove_home_terminal(&session_id, other)
@@ -2906,7 +2931,7 @@ async fn connect_and_run(
                     continue;
                 };
                 let msg = AgentMsg::SessionTraceEvent {
-                    session_id,
+                    session_id: mgr.label(&session_id),
                     ts_unix_ms: te.ts_unix_ms,
                     event: te.event.to_string(),
                     payload: te.payload,
@@ -2997,6 +3022,8 @@ async fn flush_pending_diagnostics<S>(
     // `None` when the `select!` arm already disabled itself: then there is nothing
     // pending and this is a no-op.
     diagnostic_rx: &mut Option<mpsc::Receiver<(String, crate::session::runner::TraceEvent)>>,
+    // Amendment 39: runtime id → the session that adopted it.
+    labels: &HashMap<String, String>,
 ) -> anyhow::Result<()>
 where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
@@ -3006,7 +3033,7 @@ where
     };
     while let Ok((session_id, te)) = rx.try_recv() {
         let msg = AgentMsg::SessionTraceEvent {
-            session_id,
+            session_id: labels.get(&session_id).cloned().unwrap_or(session_id),
             ts_unix_ms: te.ts_unix_ms,
             event: te.event.to_string(),
             payload: te.payload,
@@ -3157,7 +3184,12 @@ struct SessionManager {
     /// Assigned but not yet started. Aged out by the heartbeat sweep — see
     /// [`PENDING_ASSIGNMENT_TTL`].
     pending: HashMap<String, PendingAssignment>,
+    /// Keyed by the session id the control plane addresses, held runtimes included.
     running: HashMap<String, RunningHandle>,
+    /// Amendment 39: a runner reports under its runtime's first session id
+    /// ([`RunningHandle::runtime_id`]); an adopted runtime's reports go out under the id
+    /// that adopted it. Only re-labelled runtimes are listed.
+    labels: HashMap<String, String>,
     /// Agent-local runtime knobs, starting at the env baseline and overlaid by
     /// `config_update` pushes. Read when building each session's SessionConfig.
     runtime_settings: crate::session::settings::RuntimeSettings,
@@ -3276,6 +3308,32 @@ struct PendingAssignment {
     /// probe might be running on, and a `session_start` cannot re-derive it (the wire
     /// message carries no `gpu_index`).
     gpu_index: i32,
+    /// `session_assign.adopt_session_id` (amendment 39), decided at `session_start`.
+    adopt: Option<String>,
+}
+
+/// How long a held runtime waits for a `session_assign` that adopts it (amendment 39).
+const HELD_RUNTIME_TTL: Duration = Duration::from_secs(30);
+
+/// How long a fresh build waits for the runtime it did not adopt to finish its teardown,
+/// which includes the Steam container's stop window.
+const ADOPT_RELEASE_WAIT: Duration = Duration::from_secs(90);
+
+/// What `session_start` does with an `adopt_session_id`.
+enum Adoption {
+    Adopted,
+    /// Build the session fresh, once `after` (the not-adopted runtime's runner) has exited.
+    Fresh {
+        after: Option<Arc<AtomicBool>>,
+    },
+}
+
+/// A held runtime (amendment 39): its session has ended `stopped` with `runtime_held`.
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    since: Instant,
+    /// Asked to stop: the runtime is going and can no longer be adopted.
+    released: bool,
 }
 
 /// How long a launch keeps asking for its image preparation after the runtime
@@ -3363,6 +3421,39 @@ struct RunningHandle {
     /// A runner-reported terminal waits here until its thread has exited and
     /// every source generation has been retired and verified absent.
     pending_home_terminal: Option<SessionEvent>,
+    /// Amendment 39: the adoption channel into the runner.
+    adopt: std::sync::mpsc::Sender<AdoptRequest>,
+    kind: Option<SessionKind>,
+    /// `Some` while this entry is a held runtime rather than a session.
+    held: Option<Held>,
+    /// The session id the runtime was built under: its containers, sockets and runner
+    /// events carry it whatever id now owns the runtime.
+    runtime_id: String,
+    /// Earlier owners of this runtime, retired with it once its cleanup is proven.
+    adopted: Vec<String>,
+    /// What the runtime encodes, for an adoption's match check.
+    stream: StreamParams,
+    /// Set once the runner thread has returned, for a fresh build that must wait for it.
+    exited: Arc<AtomicBool>,
+}
+
+impl RunningHandle {
+    /// A session, not a held runtime: what the control plane may address.
+    fn live(&self) -> bool {
+        self.held.is_none()
+    }
+
+    /// Whether `stream` may run on this runtime (amendment 39 `adopt_session_id`): the same
+    /// codec, fps, H.264 profile and mic, and no larger than its launch size.
+    fn encodes(&self, stream: &StreamParams) -> bool {
+        let have = &self.stream;
+        have.codec == stream.codec
+            && have.fps == stream.fps
+            && have.h264_profile == stream.h264_profile
+            && have.mic == stream.mic
+            && stream.width <= have.width
+            && stream.height <= have.height
+    }
 }
 
 impl SessionManager {
@@ -3405,6 +3496,7 @@ impl SessionManager {
         SessionManager {
             pending: HashMap::new(),
             running: HashMap::new(),
+            labels: HashMap::new(),
             runtime_settings,
             deployment_baseline,
             policy_agent: None,
@@ -3650,7 +3742,19 @@ impl SessionManager {
 
     /// Session ids the agent currently considers live. Reported in heartbeats.
     fn running_ids(&self) -> Vec<String> {
-        self.running.keys().cloned().collect()
+        self.running
+            .iter()
+            .filter(|(_, h)| h.live())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// The session id a runner's report goes out under (amendment 39 re-labelling).
+    fn label(&self, runtime_id: &str) -> String {
+        self.labels
+            .get(runtime_id)
+            .cloned()
+            .unwrap_or_else(|| runtime_id.to_string())
     }
 
     /// Drain each running session's telemetry window into a `session_metrics` message
@@ -3660,7 +3764,7 @@ impl SessionManager {
     fn drain_metrics(&self, ts_unix_ms: i64) -> Vec<AgentMsg> {
         let now = std::time::Instant::now();
         let mut out = Vec::with_capacity(self.running.len() * 2);
-        for (sid, h) in &self.running {
+        for (sid, h) in self.running.iter().filter(|(_, h)| h.live()) {
             let w = h.metrics.drain_window(now);
             if w.frames_dropped > 0 {
                 out.push(AgentMsg::SessionTraceEvent {
@@ -3745,11 +3849,20 @@ impl SessionManager {
                 id,
                 session_id,
                 gpu_index,
+                kind,
+                adopt_session_id,
                 app,
                 stream,
                 resources,
                 video_topology,
             } => {
+                if kind == Some(SessionKind::Unknown) {
+                    warn!(
+                        token = "session-assign-rejected",
+                        "session {session_id} assignment rejected: unknown session kind"
+                    );
+                    return Some(ack(id, false, Some("unknown session kind".to_string())));
+                }
                 if !self.policy_session_ready {
                     return Some(ack(
                         id,
@@ -3878,6 +3991,7 @@ impl SessionManager {
                 }
                 cfg.console_config = self.console_config.clone();
                 cfg.video_topology = video_topology;
+                cfg.kind = kind;
                 // The wire carries no image_id on AppSpec, so resolve it from the
                 // launch ref via the ImageManager's map. `None` on either side means
                 // no seeding for this session, never an assignment failure.
@@ -3938,6 +4052,7 @@ impl SessionManager {
                         assigned_at: Instant::now(),
                         preparation,
                         gpu_index,
+                        adopt: adopt_session_id,
                     },
                 );
                 self.note_session_count();
@@ -3948,6 +4063,7 @@ impl SessionManager {
                     mut cfg,
                     preparation,
                     gpu_index,
+                    adopt,
                     ..
                 }) => {
                     // The assign already raised this, but a `session_start` for an
@@ -3956,7 +4072,20 @@ impl SessionManager {
                     if let Some(handle) = &self.probe_handle {
                         handle.launch_arrived(gpu_index);
                     }
+                    // Amendment 39: take the runtime over, or build fresh once it is gone.
+                    let mut after: Option<Arc<AtomicBool>> = None;
+                    if let Some(from) = adopt {
+                        match self.adopt_runtime(&session_id, &from, gpu_index, &cfg) {
+                            Adoption::Adopted => return Some(ack(id, true, None)),
+                            Adoption::Fresh { after: exited } => after = exited,
+                        }
+                    }
                     let stop = Arc::new(AtomicBool::new(false));
+                    let (adopt_tx, adopt_rx) = std::sync::mpsc::channel::<AdoptRequest>();
+                    let exited = Arc::new(AtomicBool::new(false));
+                    let exited_flag = exited.clone();
+                    let runtime_stream = cfg.stream.clone();
+                    let kind = cfg.kind;
                     let (sig_in_tx, sig_in_rx) = std::sync::mpsc::channel::<SignalMsg>();
                     let (swap_tx, swap_rx) = std::sync::mpsc::channel::<SwapRequest>();
                     let (display_tx, display_rx) =
@@ -4002,6 +4131,23 @@ impl SessionManager {
                         .spawn(move || {
                         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
+                                // The runtime it was to adopt shares its managed home: it
+                                // must be gone before this session's container starts.
+                                if let Some(after) = after {
+                                    let deadline = Instant::now() + ADOPT_RELEASE_WAIT;
+                                    while !after.load(Ordering::Relaxed) {
+                                        let event = if stop.load(Ordering::Relaxed) {
+                                            SessionEvent::Stopped { bytes_used: None, detail: None }
+                                        } else if Instant::now() >= deadline {
+                                            SessionEvent::Failed("the runtime it was to adopt did not shut down".to_string())
+                                        } else {
+                                            std::thread::sleep(Duration::from_millis(100));
+                                            continue;
+                                        };
+                                        let _ = evt_tx2.try_send((panic_sid.clone(), event));
+                                        return;
+                                    }
+                                }
                                 if let Some(preparation) = preparation {
                                     let image = cfg
                                         .container
@@ -4061,9 +4207,11 @@ impl SessionManager {
                                     display_rx,
                                     capture_rx,
                                     metrics,
+                                    adopt_rx,
                                 );
                             },
                         ));
+                        exited_flag.store(true, Ordering::Relaxed);
                         if let Err(payload) = outcome {
                             let text = panic_payload_text(payload.as_ref());
                             error!(
@@ -4106,6 +4254,13 @@ impl SessionManager {
                             codec,
                             reached_running: false,
                             pending_home_terminal: None,
+                            adopt: adopt_tx,
+                            kind,
+                            held: None,
+                            runtime_id: session_id.clone(),
+                            adopted: Vec::new(),
+                            stream: runtime_stream,
+                            exited,
                         },
                     );
                     self.health.set_sessions(self.running.len());
@@ -4166,9 +4321,15 @@ impl SessionManager {
                 if self.pending.remove(&session_id).is_some() {
                     self.note_session_count();
                 }
-                if let Some(h) = self.running.get(&session_id) {
+                if let Some(h) = self.running.get_mut(&session_id) {
                     h.stop.store(true, Ordering::Relaxed);
-                    info!("session {session_id} stop requested (reason={reason})");
+                    if let Some(held) = h.held.as_mut() {
+                        // Amendment 39: a stop for an ended session releases its runtime.
+                        held.released = true;
+                        info!("session {session_id}: held runtime released (reason={reason})");
+                    } else {
+                        info!("session {session_id} stop requested (reason={reason})");
+                    }
                 }
                 Some(ack(id, true, None))
             }
@@ -4176,6 +4337,7 @@ impl SessionManager {
                 id,
                 session_id,
                 app,
+                in_place,
             } => {
                 if self.home_cleanup.as_ref().is_some_and(|ledger| {
                     ledger.state(&session_id).is_some() || !ledger.has_record(&session_id)
@@ -4195,7 +4357,7 @@ impl SessionManager {
                         return Some(ack(id, false, Some(error.to_string())));
                     }
                 };
-                match self.running.get_mut(&session_id) {
+                match self.running.get_mut(&session_id).filter(|h| h.live()) {
                     Some(h) => {
                         // #175: refs accumulate and are only removed at teardown, so a
                         // swapped-away home just waits to become reapable — the reaper
@@ -4214,7 +4376,10 @@ impl SessionManager {
                                 h.home_refs.push(r.clone());
                             }
                         }
-                        match h.swap.send(SwapRequest { container }) {
+                        match h.swap.send(SwapRequest {
+                            container,
+                            in_place,
+                        }) {
                             Ok(()) => {
                                 if let Ok(mut g) = self.live_refs.lock() {
                                     for r in &new_refs {
@@ -4280,7 +4445,7 @@ impl SessionManager {
                     ui_scale,
                     stream,
                 };
-                match self.running.get_mut(&session_id) {
+                match self.running.get_mut(&session_id).filter(|h| h.live()) {
                     Some(h) => {
                         // Render and external are independent axes, each bounded only by
                         // the launch size — see `validate_display_update`.
@@ -4342,7 +4507,7 @@ impl SessionManager {
                 // A rejected capture is a pure no-op: it never touches the pipeline and
                 // can never fail the session (#270 — the old host-side deep probe could
                 // crash a stream; nothing on this surface can).
-                let Some(handle) = self.running.get(&session_id) else {
+                let Some(handle) = self.running.get(&session_id).filter(|h| h.live()) else {
                     warn!(
                         token = "capture-session-not-running",
                         "session_capture for a session that is not running: {session_id}"
@@ -4392,7 +4557,7 @@ impl SessionManager {
                 }
             }
             ControlMsg::Signaling { session_id, msg } => {
-                if let Some(h) = self.running.get(&session_id) {
+                if let Some(h) = self.running.get(&session_id).filter(|h| h.live()) {
                     let raw = serde_json::to_string(&msg).unwrap_or_default();
                     match SignalMsg::from_json(&raw) {
                         Ok(sig) => {
@@ -4741,6 +4906,17 @@ impl SessionManager {
     ) -> Vec<AgentMsg> {
         let mut abandoned: Vec<String> = Vec::new();
         for (sid, h) in self.running.iter_mut() {
+            if let Some(held) = h.held.as_mut().filter(|held| {
+                !held.released && now.saturating_duration_since(held.since) >= HELD_RUNTIME_TTL
+            }) {
+                held.released = true;
+                h.stop.store(true, Ordering::Relaxed);
+                info!(
+                    token = "held-runtime-released",
+                    "session {sid}: no session adopted its held runtime within {}s; releasing it",
+                    HELD_RUNTIME_TTL.as_secs()
+                );
+            }
             let finished = h.thread.as_ref().map(|t| t.is_finished()).unwrap_or(false);
             if !finished {
                 // A thread cannot un-finish, but clearing keeps the field honest.
@@ -4796,6 +4972,8 @@ impl SessionManager {
                 reason_code: None,
                 app_log_tail: None,
                 home_seed: None,
+                runtime_held: None,
+                launch_progress: None,
             });
         }
         self.health.set_sessions(self.running.len());
@@ -4835,10 +5013,142 @@ impl SessionManager {
         out
     }
 
+    /// Amendment 39 `adopt_session_id`: hand `from`'s held or parked runtime to
+    /// `session_id`, or say why it is built fresh. A runtime held here that is not adopted
+    /// is released, and the fresh build waits for it: the two share a managed home.
+    fn adopt_runtime(
+        &mut self,
+        session_id: &str,
+        from: &str,
+        gpu_index: i32,
+        cfg: &SessionConfig,
+    ) -> Adoption {
+        let Some(h) = self.running.get_mut(from) else {
+            info!(
+                token = "runtime-adopt-none",
+                "session {session_id}: no runtime of {from} is held here; building it fresh"
+            );
+            return Adoption::Fresh { after: None };
+        };
+        let adoptable = !h.stop.load(Ordering::Relaxed)
+            && match h.held {
+                Some(held) => !held.released,
+                None => h.kind == Some(SessionKind::Parked) && h.reached_running,
+            };
+        let declined = if !adoptable {
+            Some("it is neither held nor a running parked session")
+        } else if h.gpu_index != gpu_index {
+            Some("it is on another GPU")
+        } else if h.video_topology != VideoTopology::StreamOnly {
+            Some("it is not a streamed session")
+        } else if !h.encodes(&cfg.stream) {
+            Some("it encodes another stream, or a smaller one")
+        } else {
+            None
+        };
+        let request = AdoptRequest {
+            kind: cfg.kind.unwrap_or(SessionKind::Play),
+            container: cfg.container.clone(),
+            idle_timeout: cfg.idle_timeout,
+            app_boot_timeout: cfg.app_boot_timeout,
+        };
+        let refused = match declined {
+            Some(why) => Some(why),
+            None => h
+                .adopt
+                .send(request)
+                .is_err()
+                .then_some("its runner is gone"),
+        };
+        if let Some(why) = refused {
+            info!(
+                token = "runtime-adopt-declined",
+                "session {session_id}: not adopting the runtime of {from} ({why}); it is torn \
+                 down and the session is built fresh"
+            );
+            h.stop.store(true, Ordering::Relaxed);
+            // Its id has ended at the control plane: what it reports from here is the
+            // release, as for a held runtime.
+            h.held = Some(Held {
+                since: h.held.map_or_else(Instant::now, |held| held.since),
+                released: true,
+            });
+            return Adoption::Fresh {
+                after: Some(h.exited.clone()),
+            };
+        }
+        let Some(mut h) = self.running.remove(from) else {
+            return Adoption::Fresh { after: None };
+        };
+        h.metrics.drain_window(Instant::now());
+        h.held = None;
+        h.kind = cfg.kind;
+        h.reached_running = false;
+        h.adopted.push(from.to_string());
+        for r in Self::home_refs_of(cfg) {
+            if !h.home_refs.contains(&r) {
+                self.add_live_refs(std::slice::from_ref(&r));
+                h.home_refs.push(r);
+            }
+        }
+        let size = (cfg.stream.width, cfg.stream.height);
+        if size != h.display_state.external {
+            let both = DisplayUpdateRequest {
+                render_width: Some(size.0),
+                render_height: Some(size.1),
+                ui_scale: None,
+                stream: Some(size),
+            };
+            let render_only = DisplayUpdateRequest {
+                stream: None,
+                ..both
+            };
+            // An encoder that cannot resize live keeps the held stream size.
+            let update = validate_display_update(&both, &h.display_state)
+                .or_else(|_| validate_display_update(&render_only, &h.display_state));
+            match update {
+                Ok(eff) if h.display.send(eff).is_ok() => h.display_state.apply(&eff),
+                Ok(_) => {}
+                Err(why) => warn!(
+                    token = "runtime-adopt-resize-rejected",
+                    "session {session_id}: the adopted runtime keeps its size: {why}"
+                ),
+            }
+        }
+        info!(
+            token = "runtime-adopted",
+            "session {session_id} adopted the runtime of {from} (built as {})", h.runtime_id
+        );
+        self.labels
+            .insert(h.runtime_id.clone(), session_id.to_string());
+        self.running.insert(session_id.to_string(), h);
+        self.health.set_sessions(self.running.len());
+        self.note_session_count();
+        Adoption::Adopted
+    }
+
+    /// The terminal report of a held runtime's runner: the release (amendment 39). Its
+    /// session already ended `stopped`, so only an agent that owes RH05 terminal proof
+    /// sends anything, and only once the cleanup is verified.
+    fn release_terminal(&mut self, session_id: &str) -> Option<AgentMsg> {
+        if self.home_cleanup.is_some() {
+            return self.prove_home_terminal(
+                session_id,
+                SessionEvent::Stopped {
+                    bytes_used: None,
+                    detail: None,
+                },
+            );
+        }
+        self.drop_running(session_id);
+        None
+    }
+
     /// Remove a terminal session from `running` and free its home refs from the
     /// shared live set (#175), so the GC reaper may reap a now-tombstoned home.
     fn drop_running(&mut self, session_id: &str) {
         if let Some(h) = self.running.remove(session_id) {
+            self.labels.remove(&h.runtime_id);
             self.remove_live_refs(&h.home_refs);
             self.health.set_sessions(self.running.len());
             self.note_session_count();
@@ -4866,13 +5176,15 @@ impl SessionManager {
             handle.pending_home_terminal = Some(event);
             return None;
         }
+        // Every container the runtime made carries the id it was built under.
+        let runtime_id = handle.runtime_id.clone();
         let cleaned = self.home_source_retire.as_ref().map_or_else(
             || {
                 crate::runtime::configured()
-                    .and_then(|runtime| runtime.retire_session_applications(session_id).wait())
+                    .and_then(|runtime| runtime.retire_session_applications(&runtime_id).wait())
                     .is_ok()
             },
-            |retire| retire(session_id),
+            |retire| retire(&runtime_id),
         );
         if !cleaned {
             handle.pending_home_terminal = Some(event);
@@ -4889,13 +5201,14 @@ impl SessionManager {
             }
             _ => return None,
         };
-        if self
-            .home_cleanup
-            .as_mut()
-            .unwrap()
-            .retire(session_id, terminal)
-            .is_err()
-        {
+        let ledger = self.home_cleanup.as_mut().unwrap();
+        // The runtime's earlier owners ended long ago; their record goes with it.
+        let earlier = handle.adopted.iter().all(|id| {
+            ledger
+                .retire(id, crate::home_cleanup::TerminalKind::Stopped)
+                .is_ok()
+        });
+        if !earlier || ledger.retire(session_id, terminal).is_err() {
             handle.pending_home_terminal = Some(event);
             warn!(
                 token = "home-terminal-retirement-unavailable",
@@ -4930,6 +5243,8 @@ impl SessionManager {
                 // log panel that reads as a broken feature rather than a silent app.
                 app_log_tail: (!app_log_tail.is_empty()).then(|| app_log_tail.join("\n")),
                 home_seed: None,
+                runtime_held: None,
+                launch_progress: None,
             };
         }
         let home_seed = if let SessionEvent::HomeSeed(outcome) = &event {
@@ -4937,8 +5252,30 @@ impl SessionManager {
         } else {
             None
         };
+        let mut runtime_held = None;
+        let mut launch_progress = None;
         let (state, detail, error) = match event {
             SessionEvent::Starting => ("starting", Some("building pipeline".to_string()), None),
+            // The session ends; its runtime stays, and stops being a session (amendment 39).
+            SessionEvent::Held => {
+                if let Some(handle) = self.running.get_mut(session_id) {
+                    handle.held = Some(Held {
+                        since: Instant::now(),
+                        released: false,
+                    });
+                }
+                runtime_held = Some(true);
+                self.note_session_count();
+                (
+                    "stopped",
+                    Some(crate::session::runner::GAME_EXITED_DETAIL.to_string()),
+                    None,
+                )
+            }
+            SessionEvent::LaunchProgress(percent) => {
+                launch_progress = Some(LaunchProgress::shaders(percent));
+                ("running", Some("app booting".to_string()), None)
+            }
             SessionEvent::HomeSeed(_) => ("starting", None, None),
             SessionEvent::Progress(detail) => ("starting", Some(detail.to_string()), None),
             SessionEvent::Running => {
@@ -5016,6 +5353,8 @@ impl SessionManager {
             reason_code: None,
             app_log_tail: None,
             home_seed,
+            runtime_held,
+            launch_progress,
         }
     }
 }
@@ -5130,6 +5469,8 @@ fn qualified_home_terminal(
         reason_code: None,
         app_log_tail: None,
         home_seed: None,
+        runtime_held: None,
+        launch_progress: None,
     }
 }
 
@@ -8329,6 +8670,13 @@ mod tests {
                 codec: crate::session::Codec::H264,
                 reached_running: true,
                 pending_home_terminal: None,
+                adopt: std::sync::mpsc::channel().0,
+                kind: None,
+                held: None,
+                runtime_id: String::new(),
+                adopted: Vec::new(),
+                stream: StreamParams::default(),
+                exited: Arc::new(AtomicBool::new(false)),
             },
             stop,
         )
@@ -8380,6 +8728,13 @@ mod tests {
                 codec: crate::session::Codec::H264,
                 reached_running: true,
                 pending_home_terminal: None,
+                adopt: std::sync::mpsc::channel().0,
+                kind: None,
+                held: None,
+                runtime_id: String::new(),
+                adopted: Vec::new(),
+                stream: StreamParams::default(),
+                exited: Arc::new(AtomicBool::new(false)),
             },
             display_rx,
         )
@@ -8790,6 +9145,7 @@ mod tests {
                 assigned_at: Instant::now(),
                 preparation: None,
                 gpu_index: 0,
+                adopt: None,
             },
         );
         mgr.handle_control(
@@ -8841,7 +9197,8 @@ mod tests {
     #[test]
     fn capable_terminal_waits_for_source_absence_and_preserves_home_refs() {
         let directory = tempfile::tempdir().unwrap();
-        let (mut mgr, live_refs) = manager_with_runner(Arc::new(|_, _, _, _, _, _, _, _, _, _| {}));
+        let (mut mgr, live_refs) =
+            manager_with_runner(Arc::new(|_, _, _, _, _, _, _, _, _, _, _| {}));
         let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
             directory.path().join("ledger"),
         )
@@ -8973,7 +9330,7 @@ mod tests {
         let observed = Arc::new(AtomicBool::new(false));
         let result = observed.clone();
         let (mut mgr, _refs) =
-            manager_with_runner(Arc::new(move |_, cfg, _, _, _, _, _, _, _, _| {
+            manager_with_runner(Arc::new(move |_, cfg, _, _, _, _, _, _, _, _, _| {
                 result.store(cfg.container.unwrap().require_local_image, Ordering::SeqCst);
             }));
         let mut cfg = assignment_config(EncoderChoice::Openh264, "software");
@@ -8988,6 +9345,7 @@ mod tests {
                 assigned_at: Instant::now(),
                 preparation: Some(runtime.ensure_image("test", Duration::from_secs(2))),
                 gpu_index: 0,
+                adopt: None,
             },
         );
         let (tx, _rx) = mpsc::channel(8);
@@ -9131,7 +9489,7 @@ mod tests {
         let called = Arc::new(AtomicBool::new(false));
         let observed = called.clone();
         let (mut mgr, _refs) =
-            manager_with_runner(Arc::new(move |_, _, _, _, _, _, _, _, _, _| {
+            manager_with_runner(Arc::new(move |_, _, _, _, _, _, _, _, _, _, _| {
                 observed.store(true, Ordering::SeqCst);
             }));
         let directory = tempfile::tempdir().unwrap();
@@ -9146,6 +9504,7 @@ mod tests {
                 assigned_at: Instant::now(),
                 preparation: Some(runtime.ensure_image("test", Duration::from_secs(2))),
                 gpu_index: 0,
+                adopt: None,
             },
         );
         let (tx, mut rx) = mpsc::channel(8);
@@ -9172,7 +9531,17 @@ mod tests {
         let (name_tx, name_rx) = std::sync::mpsc::channel();
         let name_tx = Mutex::new(name_tx);
         let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
-            move |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {
+            move |_sid,
+                  _cfg,
+                  _evt,
+                  _diag,
+                  _stop,
+                  _sig,
+                  _swap,
+                  _display,
+                  _capture,
+                  _metrics,
+                  _adopt| {
                 let name = std::thread::current().name().map(str::to_string);
                 let _ = name_tx.lock().unwrap().send(name);
             },
@@ -9191,7 +9560,7 @@ mod tests {
     fn no_encoder_is_preloaded_while_a_session_is_held() {
         gstreamer::init().unwrap();
         let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
-            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {},
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics, _adopt| {},
         ));
         let idle = mgr.encoders_to_preload(EncoderChoice::Openh264, &[], true);
         if gstreamer::ElementFactory::find("openh264enc").is_some() {
@@ -9226,7 +9595,7 @@ mod tests {
         // agent's exclusive container-ownership lease with it, which fails an
         // unrelated test.
         let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
-            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {},
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics, _adopt| {},
         ));
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(8);
         start_seam_session(&mut mgr, "survivor", &evt_tx);
@@ -9240,6 +9609,7 @@ mod tests {
                 assigned_at: Instant::now(),
                 preparation: None,
                 gpu_index: 0,
+                adopt: None,
             },
         );
         assert_eq!(mgr.pending.len(), 1, "setup: one pending assignment");
@@ -9285,7 +9655,7 @@ mod tests {
     #[test]
     fn panicking_runner_emits_failed_with_the_panic_payload() {
         let (mut mgr, live_refs) = manager_with_runner(Arc::new(
-            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics, _adopt| {
                 panic!("set_property on an absent element property")
             },
         ));
@@ -9327,7 +9697,7 @@ mod tests {
     #[test]
     fn reconcile_reaps_a_runner_that_ended_without_a_terminal_event() {
         let (mut mgr, live_refs) = manager_with_runner(Arc::new(
-            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {},
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics, _adopt| {},
         ));
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(8);
         start_seam_session(&mut mgr, "ghost-sess", &evt_tx);
@@ -9372,7 +9742,17 @@ mod tests {
         let hold = Arc::new(AtomicBool::new(false));
         let hold2 = hold.clone();
         let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
-            move |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {
+            move |_sid,
+                  _cfg,
+                  _evt,
+                  _diag,
+                  _stop,
+                  _sig,
+                  _swap,
+                  _display,
+                  _capture,
+                  _metrics,
+                  _adopt| {
                 while !hold2.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -9402,6 +9782,7 @@ mod tests {
                 assigned_at: Instant::now(),
                 preparation: None,
                 gpu_index: 0,
+                adopt: None,
             },
         );
         mgr.reconcile(Instant::now(), RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL);
@@ -9443,6 +9824,13 @@ mod tests {
                 codec: crate::session::Codec::H264,
                 reached_running: true,
                 pending_home_terminal: None,
+                adopt: std::sync::mpsc::channel().0,
+                kind: None,
+                held: None,
+                runtime_id: String::new(),
+                adopted: Vec::new(),
+                stream: StreamParams::default(),
+                exited: Arc::new(AtomicBool::new(false)),
             },
             capture_rx,
         )

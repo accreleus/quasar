@@ -1,11 +1,11 @@
 //! The agent's half of the in-container Steam launch helper (#731).
 //!
-//! For a derived Steam tile (`STEAM_STARTUP_FLAGS` carries `-applaunch <appid>`) the app
-//! container gets the helper binary this agent installed under its runtime dir and a
-//! per-session socket directory, both bind-mounted read-only. The helper reports what the
-//! target game is doing; the agent puts the launch state on
-//! `session_metrics.app_launch_state` and the `app.launch_state` trace
-//! (`protocol/agent-api.md`). The agent never writes to the socket.
+//! For a derived Steam tile (`STEAM_STARTUP_FLAGS` carries `-applaunch <appid>`), and for a
+//! parked Steam (amendment 39, #759), the app container gets the helper binary this agent
+//! installed under its runtime dir and a per-session socket directory, both bind-mounted
+//! read-only. The helper reports what the target game is doing; the agent puts the launch
+//! state on `session_metrics.app_launch_state` and the `app.launch_state` trace
+//! (`protocol/agent-api.md`). The agent writes only [`HelperCommand`] lines back.
 //!
 //! The helper shares its container with untrusted game code, so every byte on the socket
 //! is hostile input. Lines over [`MAX_LINE`] bytes and anything that is not the wire shape
@@ -14,8 +14,8 @@
 //! after [`IDLE`] without a line, launch states only move forward, and nothing here can
 //! end, fail or block the session.
 
-use std::collections::BTreeMap;
-use std::io::Read;
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -48,6 +48,11 @@ const IDLE: Duration = Duration::from_secs(1);
 const LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// About twice the slowest launch the #723 spike measured (43.9 s).
 const REVEAL_CAP_DEFAULT_SECS: u64 = 90;
+/// Commands are serialised by the runner; more waiting than this is a helper not reading.
+const MAX_OUTBOX: usize = 4;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+/// The `STEAM_GAME` of Steam's own windows, Big Picture's included (#759 S0).
+pub const STEAM_CLIENT_APPID: u32 = 769;
 
 /// Copy the helper shipped beside the agent binary into the runtime dir, the one path the
 /// host shares 1:1 with the agent's container, so sessions can bind-mount it. Any older
@@ -88,7 +93,7 @@ pub fn install() {
 /// The target appid of a derived Steam tile: the integer after the single `-applaunch` in
 /// `STEAM_STARTUP_FLAGS`, as the control plane's `composeSteamFlags` writes it. `None` for
 /// anything else, which is every app that is not a derived Steam tile.
-fn appid_from_env(env: &BTreeMap<String, String>) -> Option<u32> {
+pub fn appid_from_env(env: &BTreeMap<String, String>) -> Option<u32> {
     let mut tokens = env.get("STEAM_STARTUP_FLAGS")?.split_ascii_whitespace();
     let mut appid = None;
     while let Some(token) = tokens.next() {
@@ -175,12 +180,41 @@ impl NeedsUser {
     }
 }
 
+/// A command for the helper (#759): the closed set its reader parses, and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperCommand {
+    Launch(u32),
+    BigPicture,
+    Quit(u32),
+}
+
+impl HelperCommand {
+    fn line(self) -> String {
+        match self {
+            HelperCommand::Launch(appid) => format!("launch {appid}\n"),
+            HelperCommand::BigPicture => "bigpicture\n".to_string(),
+            HelperCommand::Quit(appid) => format!("quit {appid}\n"),
+        }
+    }
+}
+
+/// The helper's word that it carried out a command. `cloud_synced` comes with a quit: Steam's
+/// exit cloud sync for the game was seen to end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandDone {
+    pub command: HelperCommand,
+    pub ok: bool,
+    pub cloud_synced: Option<bool>,
+}
+
 /// One accepted helper line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Report {
     LaunchState(LaunchState),
     GameWindow { on_screen: bool },
     SteamNeedsUser(NeedsUser),
+    ShaderProgress(u8),
+    CommandDone(CommandDone),
 }
 
 /// The wire, kept apart from `quasar-launch-watch`'s types: the agent links neither helper
@@ -188,9 +222,31 @@ enum Report {
 #[derive(serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Wire {
-    LaunchState { v: u32, state: String },
-    GameWindow { v: u32, on_screen: bool },
-    SteamNeedsUser { v: u32, reason: String },
+    LaunchState {
+        v: u32,
+        state: String,
+    },
+    GameWindow {
+        v: u32,
+        on_screen: bool,
+    },
+    SteamNeedsUser {
+        v: u32,
+        reason: String,
+    },
+    ShaderProgress {
+        v: u32,
+        percent: u8,
+    },
+    CommandDone {
+        v: u32,
+        command: String,
+        #[serde(default)]
+        appid: Option<u32>,
+        ok: bool,
+        #[serde(default)]
+        cloud_synced: Option<bool>,
+    },
 }
 
 /// Why a line was dropped. Logged by name only: the line itself is the attacker's text.
@@ -227,6 +283,30 @@ fn parse(line: &[u8]) -> Result<Report, Rejected> {
         Wire::SteamNeedsUser { v, reason } => {
             (v, NeedsUser::parse(&reason).map(Report::SteamNeedsUser))
         }
+        Wire::ShaderProgress { v, percent } => (
+            v,
+            (percent <= 100).then_some(Report::ShaderProgress(percent)),
+        ),
+        Wire::CommandDone {
+            v,
+            command,
+            appid,
+            ok,
+            cloud_synced,
+        } => {
+            let command = match (command.as_str(), appid, cloud_synced) {
+                ("launch", Some(appid), None) => Some(HelperCommand::Launch(appid)),
+                ("bigpicture", None, None) => Some(HelperCommand::BigPicture),
+                ("quit", Some(appid), Some(_)) => Some(HelperCommand::Quit(appid)),
+                _ => None,
+            };
+            let done = command.map(|command| CommandDone {
+                command,
+                ok,
+                cloud_synced,
+            });
+            (v, done.map(Report::CommandDone))
+        }
     };
     if v != 1 {
         return Err(Rejected::UnknownVersion);
@@ -250,6 +330,10 @@ pub struct LaunchReports {
     /// The helper connected since the reader was last armed. An image whose launcher does
     /// not start it never does, and its first frame is shown as before (#727).
     pub helper_connected: bool,
+    /// Steam's latest shader percentage for the target (#759).
+    pub shader_percent: Option<u8>,
+    /// The helper's word on the last command sent, cleared when the next one is sent.
+    pub last_command: Option<CommandDone>,
 }
 
 /// `QUASAR_STEAM_REVEAL_CAP_SECS`, no higher than the app boot watchdog's budget, or than
@@ -329,7 +413,11 @@ fn forward(from: Option<LaunchState>, to: LaunchState, seen_running: bool) -> bo
 struct State {
     /// False while the session's app is not its derived tile (after a swap away).
     active: bool,
+    /// The appid the helper watches; `None` in watch-only mode, which takes no game report.
+    target: Option<u32>,
     reports: LaunchReports,
+    /// Command lines waiting for the helper's connection.
+    outbox: VecDeque<String>,
 }
 
 /// The reader's state, shared with every generation's mount.
@@ -344,24 +432,66 @@ impl Shared {
     }
 }
 
-/// What a generation's app container is given when it is the session's derived tile.
+/// What a generation's app container is given when it runs the app the socket was opened for.
 #[derive(Clone)]
 pub struct LaunchMount {
-    pub appid: u32,
+    /// The tile's appid, or `None` for a parked Steam, opened on these flags.
+    opened_for: Option<u32>,
+    opened_flags: Option<String>,
     helper: PathBuf,
     socket_dir: PathBuf,
     shared: Arc<Shared>,
 }
 
 impl LaunchMount {
-    /// The mount for a generation that runs `env`: the session's own tile gets it and
-    /// re-arms the reader. Any other app gets none, the reports go back to unknown and the
-    /// reader drops lines (a dead helper's may still be queued) until the tile is back.
-    /// The socket stays, so a rollback to the tile finds its bind source.
+    /// The mount for a generation that runs `env`: the app the socket was opened for gets it
+    /// and re-arms the reader on what its flags launch. Any other app gets none, the reports
+    /// go back to unknown and the reader drops lines (a dead helper's may still be queued)
+    /// until that app is back. The socket stays, so a rollback finds its bind source.
     pub fn for_app(&self, env: &BTreeMap<String, String>) -> Option<&Self> {
-        let ours = appid_from_env(env) == Some(self.appid);
-        self.set_active(ours);
+        let ours = match self.opened_for {
+            Some(appid) => appid_from_env(env) == Some(appid),
+            None => env.get("STEAM_STARTUP_FLAGS") == self.opened_flags.as_ref(),
+        };
+        if ours {
+            self.arm(self.opened_for);
+        } else {
+            self.set_active(false);
+        }
         ours.then_some(self)
+    }
+
+    /// Follow `target` from now on (`None`: watch-only), with the reports back to unknown:
+    /// a launch, an adoption or an in-place swap starts a new game in the same container.
+    pub fn arm(&self, target: Option<u32>) {
+        let mut state = self.shared.state();
+        state.active = true;
+        state.target = target;
+        state.reports = LaunchReports {
+            helper_connected: state.reports.helper_connected,
+            ..LaunchReports::default()
+        };
+        self.shared.metrics.set_app_launch_state(None);
+    }
+
+    /// The appid the reports are about, if any.
+    pub fn target(&self) -> Option<u32> {
+        self.shared.state().target
+    }
+
+    /// Queue `command` for the helper. Its last result is cleared, so the next one read is
+    /// this command's (or a replay the caller tells apart by the command it names).
+    pub fn send(&self, command: HelperCommand) {
+        let mut state = self.shared.state();
+        state.reports.last_command = None;
+        if state.outbox.len() >= MAX_OUTBOX {
+            state.outbox.pop_front();
+            tracing::warn!(
+                token = "launch-helper-outbox-full",
+                "the launch helper is not reading its commands; dropped the oldest"
+            );
+        }
+        state.outbox.push_back(command.line());
     }
 
     /// The session's app is about to be stopped by a swap: stop listening before the game
@@ -376,6 +506,7 @@ impl LaunchMount {
         state.active = active;
         if !active {
             state.reports = LaunchReports::default();
+            state.outbox.clear();
             self.shared.metrics.set_app_launch_state(None);
         }
     }
@@ -433,16 +564,23 @@ pub struct LaunchSocket {
 
 impl LaunchSocket {
     /// Listen for this session's helper. `None`, and the session launches as it would
-    /// without one, unless the first app is a derived Steam tile and this agent installed
-    /// the helper; a setup error is logged and also gives `None`.
+    /// without one, unless the first app is a derived Steam tile, or `parked` (a warm Steam,
+    /// whose helper starts watch-only), and this agent installed the helper; a setup error is
+    /// logged and also gives `None`.
     pub fn open(
         runtime_dir: &str,
         session_id: &str,
         env: Option<&BTreeMap<String, String>>,
+        parked: bool,
         metrics: Arc<SessionMetrics>,
         trace: DiagnosticEventTx,
     ) -> Option<Self> {
-        let appid = env.and_then(appid_from_env)?;
+        let env = env?;
+        let appid = appid_from_env(env);
+        if appid.is_none() && !parked {
+            return None;
+        }
+        let what = appid.map_or_else(|| "the parked Steam".to_string(), |id| format!("app {id}"));
         let helper = Path::new(runtime_dir).join(HELPER_FILE);
         if !helper.is_file() {
             return None;
@@ -451,7 +589,7 @@ impl LaunchSocket {
             Ok(owner) => owner,
             Err(error) => {
                 tracing::warn!(token = "launch-helper-no-owner", %error,
-                    "no owner token; app {appid} launches without a launch helper");
+                    "no owner token; {what} launches without a launch helper");
                 return None;
             }
         };
@@ -459,7 +597,7 @@ impl LaunchSocket {
             runtime_dir,
             session_id,
             &owner,
-            appid,
+            (appid, env.get("STEAM_STARTUP_FLAGS").cloned()),
             helper,
             metrics,
             trace,
@@ -468,7 +606,7 @@ impl LaunchSocket {
             Err(error) => {
                 tracing::warn!(token = "launch-helper-socket-failed",
                     error = %format_args!("{error:#}"),
-                    "app {appid} launches without a launch helper");
+                    "{what} launches without a launch helper");
                 None
             }
         }
@@ -478,7 +616,7 @@ impl LaunchSocket {
         runtime_dir: &str,
         session_id: &str,
         owner: &str,
-        appid: u32,
+        (appid, flags): (Option<u32>, Option<String>),
         helper: PathBuf,
         metrics: Arc<SessionMetrics>,
         trace: DiagnosticEventTx,
@@ -493,12 +631,14 @@ impl LaunchSocket {
         )?;
         let socket = LaunchSocket {
             mount: LaunchMount {
-                appid,
+                opened_for: appid,
+                opened_flags: flags,
                 helper,
                 socket_dir: owned_entry::entry_dir(runtime_dir, PREFIX, session_id),
                 shared: Arc::new(Shared {
                     state: Mutex::new(State {
                         active: true,
+                        target: appid,
                         ..State::default()
                     }),
                     metrics,
@@ -521,7 +661,6 @@ impl LaunchSocket {
         let mut reader = Reader {
             stop: socket.stop.clone(),
             shared: socket.mount.shared.clone(),
-            appid,
             session_id: session_id.to_string(),
             trace,
             window: (Instant::now(), 0),
@@ -537,10 +676,13 @@ impl LaunchSocket {
                 let _log_span = log_span.enter();
                 reader.serve(&listener);
             })?;
-        tracing::info!(
-            appid,
-            "listening for the launch helper of Steam app {appid}"
-        );
+        match appid {
+            Some(appid) => tracing::info!(
+                appid,
+                "listening for the launch helper of Steam app {appid}"
+            ),
+            None => tracing::info!("listening for the launch helper of the parked Steam"),
+        }
         Ok(socket)
     }
 
@@ -586,7 +728,6 @@ impl Limiter {
 struct Reader {
     stop: Arc<AtomicBool>,
     shared: Arc<Shared>,
-    appid: u32,
     session_id: String,
     trace: DiagnosticEventTx,
     /// Start of the current one-second window and the lines read in it.
@@ -629,7 +770,10 @@ impl Reader {
     /// One connection until it closes. Every complete line, and every [`MAX_LINE`] bytes
     /// of an oversize one, spends one unit of the per-second budget.
     fn read_connection(&mut self, mut stream: UnixStream) {
-        if stream.set_nonblocking(false).is_err() || stream.set_read_timeout(Some(POLL)).is_err() {
+        if stream.set_nonblocking(false).is_err()
+            || stream.set_read_timeout(Some(POLL)).is_err()
+            || stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err()
+        {
             return;
         }
         let mut buf = [0u8; MAX_LINE];
@@ -650,6 +794,9 @@ impl Reader {
                     self.idle
                 );
                 closing = true;
+            }
+            if !closing && !self.write_commands(&mut stream) {
+                return;
             }
             match stream.read(&mut buf[len..]) {
                 Ok(0) => return,
@@ -677,6 +824,10 @@ impl Reader {
                 if !self.spend() {
                     return;
                 }
+                // The helper's keepalive.
+                if line.is_empty() {
+                    continue;
+                }
                 match parse(&buf[line]) {
                     Ok(report) => self.apply(report),
                     Err(reason) => self.drop_line(reason),
@@ -694,6 +845,25 @@ impl Reader {
                     return;
                 }
             }
+        }
+    }
+
+    /// Write every queued command. `false` when the connection is gone; the command that
+    /// failed goes back to the front, for the helper's next connection.
+    fn write_commands(&mut self, stream: &mut UnixStream) -> bool {
+        loop {
+            let Some(line) = self.shared.state().outbox.pop_front() else {
+                return true;
+            };
+            if stream.write_all(line.as_bytes()).is_err() {
+                self.shared.state().outbox.push_front(line);
+                return false;
+            }
+            tracing::info!(
+                command = line.trim_end(),
+                "sent the launch helper `{}`",
+                line.trim_end()
+            );
         }
     }
 
@@ -747,6 +917,12 @@ impl Reader {
         if !guard.active {
             return;
         }
+        let Some(appid) = guard.target.or_else(|| {
+            // Watch-only: a command's result is all there is to take.
+            matches!(report, Report::CommandDone(_)).then_some(0)
+        }) else {
+            return;
+        };
         let reports = &mut guard.reports;
         match report {
             Report::LaunchState(state) if reports.launch_state != Some(state) => {
@@ -764,9 +940,8 @@ impl Reader {
                 if self.notable() {
                     tracing::info!(
                         state = state.as_str(),
-                        appid = self.appid,
-                        "Steam app {} is {}",
-                        self.appid,
+                        appid,
+                        "Steam app {appid} is {}",
                         state.as_str()
                     );
                     self.trace.try_emit(
@@ -776,7 +951,7 @@ impl Reader {
                             event: "app.launch_state",
                             payload: serde_json::json!({
                                 "state": state.as_str(),
-                                "appid": self.appid.to_string(),
+                                "appid": appid.to_string(),
                             }),
                         },
                     );
@@ -797,6 +972,21 @@ impl Reader {
                         "launch helper: Steam needs the user"
                     );
                 }
+            }
+            Report::ShaderProgress(percent) if reports.shader_percent != Some(percent) => {
+                reports.shader_percent = Some(percent);
+                tracing::debug!(percent, "launch helper: Steam is processing shaders");
+            }
+            Report::CommandDone(done) => {
+                reports.last_command = Some(done);
+                drop(guard);
+                tracing::info!(
+                    ok = done.ok,
+                    cloud_synced = ?done.cloud_synced,
+                    "launch helper: {:?} done (ok={})",
+                    done.command,
+                    done.ok
+                );
             }
             _ => {}
         }
@@ -903,15 +1093,83 @@ mod tests {
                 br#"{"type":"steam_needs_user","v":1,"reason":"x"}"#,
                 Rejected::UnknownValue,
             ),
+            (
+                br#"{"type":"shader_progress","v":1,"percent":101}"#,
+                Rejected::UnknownValue,
+            ),
+            (
+                br#"{"type":"shader_progress","v":1,"percent":-1}"#,
+                Rejected::Malformed,
+            ),
+            (
+                br#"{"type":"shader_progress","v":1,"percent":4.5}"#,
+                Rejected::Malformed,
+            ),
+            (
+                br#"{"type":"command_done","v":1,"command":"launch","ok":true}"#,
+                Rejected::UnknownValue,
+            ),
+            (
+                br#"{"type":"command_done","v":1,"command":"bigpicture","appid":620,"ok":true}"#,
+                Rejected::UnknownValue,
+            ),
+            (
+                br#"{"type":"command_done","v":1,"command":"quit","appid":620,"ok":true}"#,
+                Rejected::UnknownValue,
+            ),
+            (
+                br#"{"type":"command_done","v":1,"command":"exec","appid":620,"ok":true}"#,
+                Rejected::UnknownValue,
+            ),
+            (
+                br#"{"type":"command_done","v":1,"command":"launch","appid":620,"ok":"yes"}"#,
+                Rejected::Malformed,
+            ),
         ] {
             assert_eq!(parse(line), Err(why), "{}", String::from_utf8_lossy(line));
         }
     }
 
     #[test]
+    fn the_warm_steam_lines_parse() {
+        assert_eq!(
+            parse(br#"{"type":"shader_progress","v":1,"percent":42}"#),
+            Ok(Report::ShaderProgress(42))
+        );
+        assert_eq!(
+            parse(br#"{"type":"command_done","v":1,"command":"launch","appid":620,"ok":true}"#),
+            Ok(Report::CommandDone(CommandDone {
+                command: HelperCommand::Launch(620),
+                ok: true,
+                cloud_synced: None,
+            }))
+        );
+        assert_eq!(
+            parse(br#"{"type":"command_done","v":1,"command":"bigpicture","ok":false}"#),
+            Ok(Report::CommandDone(CommandDone {
+                command: HelperCommand::BigPicture,
+                ok: false,
+                cloud_synced: None,
+            }))
+        );
+        assert_eq!(
+            parse(br#"{"type":"command_done","v":1,"command":"quit","appid":620,"ok":true,"cloud_synced":false}"#),
+            Ok(Report::CommandDone(CommandDone {
+                command: HelperCommand::Quit(620),
+                ok: true,
+                cloud_synced: Some(false),
+            }))
+        );
+        assert_eq!(HelperCommand::Launch(620).line(), "launch 620\n");
+        assert_eq!(HelperCommand::BigPicture.line(), "bigpicture\n");
+        assert_eq!(HelperCommand::Quit(4294967295).line(), "quit 4294967295\n");
+    }
+
+    #[test]
     fn the_mount_fits_the_runtime_bind_shape() {
         let mount = LaunchMount {
-            appid: 620,
+            opened_for: Some(620),
+            opened_flags: Some("-applaunch 620".into()),
             helper: "/run/quasar-agent/quasar-launch-helper".into(),
             socket_dir: "/run/quasar-agent/launch-s1".into(),
             shared: Arc::new(Shared {
@@ -975,6 +1233,15 @@ mod tests {
 
     impl Session {
         fn open(appid: u32) -> Self {
+            Self::open_for(Some(appid), &format!("-applaunch {appid}"))
+        }
+
+        /// A parked Steam's socket: watch-only until armed.
+        fn open_parked() -> Self {
+            Self::open_for(None, "-silent")
+        }
+
+        fn open_for(appid: Option<u32>, flags: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let runtime_dir = dir.path().to_str().unwrap().to_string();
             let metrics = Arc::new(SessionMetrics::new("off", 60));
@@ -988,7 +1255,7 @@ mod tests {
                 &runtime_dir,
                 "s1",
                 "owner-a",
-                appid,
+                (appid, Some(flags.to_string())),
                 dir.path().join(HELPER_FILE),
                 metrics.clone(),
                 trace,
@@ -1072,6 +1339,7 @@ mod tests {
                 needs_user: Some(NeedsUser::CloudConflict),
                 seen_running: true,
                 helper_connected: true,
+                ..LaunchReports::default()
             }
         );
         assert_eq!(s.wire_state().as_deref(), Some("game_running"));
@@ -1390,10 +1658,10 @@ mod tests {
             metrics: Arc::new(SessionMetrics::new("off", 60)),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        shared.state().target = Some(620);
         let mut reader = Reader {
             stop: Arc::default(),
             shared: shared.clone(),
-            appid: 620,
             session_id: "s1".into(),
             trace: DiagnosticEventTx::new(tx, Arc::default(), Arc::default()),
             window: (Instant::now(), 0),
@@ -1463,7 +1731,7 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o755);
         assert_eq!(mode(&dir.join(SOCKET_FILE)), 0o666);
-        assert_eq!(s.socket().mount().appid, 620);
+        assert_eq!(s.socket().mount().target(), Some(620));
     }
 
     #[test]
@@ -1509,6 +1777,122 @@ mod tests {
         );
     }
 
+    fn read_line(stream: &mut UnixStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while byte[0] != b'\n' {
+            stream.read_exact(&mut byte).unwrap();
+            line.push(byte[0]);
+        }
+        String::from_utf8(line).unwrap()
+    }
+
+    #[test]
+    fn a_command_waits_for_the_helper_and_goes_out_on_its_connection() {
+        let s = Session::open_parked();
+        let mount = s.socket().mount().clone();
+        mount.send(HelperCommand::Launch(620));
+        let mut helper = s.connect();
+        assert_eq!(read_line(&mut helper), "launch 620\n");
+        mount.send(HelperCommand::Quit(620));
+        assert_eq!(read_line(&mut helper), "quit 620\n");
+        // Its result, and a new command clearing it.
+        helper
+            .write_all(br#"{"type":"command_done","v":1,"command":"quit","appid":620,"ok":true,"cloud_synced":true}"#)
+            .unwrap();
+        helper.write_all(b"\n").unwrap();
+        s.wait_for(|r| r.last_command.is_some());
+        assert_eq!(
+            s.socket().reports().last_command,
+            Some(CommandDone {
+                command: HelperCommand::Quit(620),
+                ok: true,
+                cloud_synced: Some(true),
+            })
+        );
+        mount.send(HelperCommand::BigPicture);
+        assert_eq!(s.socket().reports().last_command, None);
+        assert_eq!(read_line(&mut helper), "bigpicture\n");
+    }
+
+    #[test]
+    fn a_helper_sending_keepalives_keeps_its_connection() {
+        let s = Session::open_parked();
+        let mount = s.socket().mount().clone();
+        let mut helper = s.connect();
+        let until = Instant::now() + IDLE * 2;
+        while Instant::now() < until {
+            helper.write_all(b"\n").unwrap();
+            std::thread::sleep(IDLE / 4);
+        }
+        mount.send(HelperCommand::Launch(730));
+        assert_eq!(
+            read_line(&mut helper),
+            "launch 730\n",
+            "still the served connection"
+        );
+    }
+
+    #[test]
+    fn a_parked_socket_takes_no_game_report_until_armed_and_then_follows_its_target() {
+        let mut s = Session::open_parked();
+        let mount = s.socket().mount().clone();
+        assert_eq!(mount.target(), None);
+        let mut helper = s.connect();
+        helper.write_all(GAME_WINDOW).unwrap();
+        helper.write_all(&state_line("game_running")).unwrap();
+        helper
+            .write_all(b"{\"type\":\"shader_progress\",\"v\":1,\"percent\":5}\n")
+            .unwrap();
+        s.wait_for(|r| r.helper_connected);
+        std::thread::sleep(POLL * 3);
+        assert_eq!(
+            s.socket().reports().game_window_on_screen,
+            None,
+            "watch-only"
+        );
+        assert_eq!(s.socket().reports().launch_state, None);
+        assert!(s.traces().is_empty());
+
+        mount.arm(Some(620));
+        helper.write_all(&state_line("game_running")).unwrap();
+        helper
+            .write_all(b"{\"type\":\"shader_progress\",\"v\":1,\"percent\":40}\n")
+            .unwrap();
+        s.wait_for(|r| r.shader_percent == Some(40));
+        assert!(
+            s.socket().reports().helper_connected,
+            "arming keeps the connection's word"
+        );
+        let traces = s.traces();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0]["appid"], "620");
+
+        // A new target starts from nothing: the old game's running and window go.
+        mount.arm(Some(730));
+        assert_eq!(s.socket().reports().launch_state, None);
+        assert_eq!(s.socket().reports().shader_percent, None);
+        assert!(!s.socket().reports().game_exited());
+    }
+
+    #[test]
+    fn a_parked_mount_is_for_its_own_flags_only() {
+        let s = Session::open_parked();
+        let mount = s.socket().mount().clone();
+        assert!(mount.for_app(&env("-silent")).is_some());
+        for other in [env("-applaunch 620"), env("-bigpicture"), BTreeMap::new()] {
+            assert!(mount.for_app(&other).is_none());
+        }
+        assert!(
+            mount.for_app(&env("-silent")).is_some(),
+            "a rollback re-arms it"
+        );
+        assert_eq!(mount.target(), None);
+    }
+
     #[test]
     fn open_mounts_nothing_without_an_appid_or_an_installed_helper() {
         let dir = tempfile::tempdir().unwrap();
@@ -1519,6 +1903,10 @@ mod tests {
                 runtime_dir,
                 "s1",
                 flags,
+                flags.is_some_and(|env| {
+                    env.get("STEAM_STARTUP_FLAGS")
+                        .is_some_and(|f| f == "-silent")
+                }),
                 Arc::new(SessionMetrics::new("off", 60)),
                 DiagnosticEventTx::new(tx, Arc::default(), Arc::default()),
             )
@@ -1527,6 +1915,7 @@ mod tests {
         assert!(!open(None), "no app");
         assert!(!open(Some(&env("-bigpicture"))), "the plain Steam app");
         assert!(!open(Some(&env("-applaunch 620"))), "no helper installed");
+        assert!(!open(Some(&env("-silent"))), "parked, no helper installed");
         assert!(std::fs::read_dir(runtime_dir).unwrap().next().is_none());
     }
 }

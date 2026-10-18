@@ -211,6 +211,8 @@ impl WarmupHost for AgentWarmupHost {
         // ever address a capture at it.
         let (_display_tx, display_rx) = std::sync::mpsc::channel::<DisplayUpdateRequest>();
         let (_capture_tx, capture_rx) = std::sync::mpsc::channel::<CaptureRequest>();
+        // Nor is a warm-up ever adopted.
+        let (_adopt_tx, adopt_rx) = std::sync::mpsc::channel();
         let metrics = Arc::new(SessionMetrics::new(
             cfg.abr_mode.as_str(),
             cfg.stream.fps.max(1) as u32,
@@ -235,6 +237,7 @@ impl WarmupHost for AgentWarmupHost {
                         display_rx,
                         capture_rx,
                         metrics,
+                        adopt_rx,
                     );
                 }));
                 if outcome.is_err() {

@@ -27,7 +27,8 @@ use super::vulkan_fault;
 use super::{pipeline, SessionConfig};
 
 mod direct_display;
-use crate::messages::{AppExitPolicy, VideoTopology};
+use super::launch_helper::{HelperCommand, LaunchReports, STEAM_CLIENT_APPID};
+use crate::messages::{AppExitPolicy, SessionKind, VideoTopology};
 
 const SCTP_STOP_RACE_GRACE: Duration = Duration::from_secs(1);
 
@@ -58,7 +59,7 @@ const PEER_DISCONNECT_DETAIL: &str = "peer disconnected: WebRTC data channel clo
 
 /// `stopped` detail for a Steam game the player quit (#726): the browser returns to the
 /// library. The text is matched by the web client; `control-api.md` specifies it.
-const GAME_EXITED_DETAIL: &str = "game exited";
+pub(crate) const GAME_EXITED_DETAIL: &str = "game exited";
 
 /// The browser can close its peer connection before the Stop command finishes
 /// traversing control-plane -> agent WS, so the SCTP error can arrive before the stop
@@ -312,6 +313,13 @@ pub enum SessionEvent {
     /// `Stopping` with the reason as its `state_detail` (the game exit, #726): the browser
     /// must learn why while the container stop is still running, not after it.
     StoppingWith(&'static str),
+    /// A play session's Steam game exited and the runtime is kept for adoption (amendment
+    /// 39): `session_state{stopped, detail:"game exited", runtime_held:true}`. The runner
+    /// lives on, quiet, until the agent adopts or releases it.
+    Held,
+    /// Steam's shader percentage while the app boots: `session_state{running,
+    /// detail:"app booting", launch_progress}` (amendment 39).
+    LaunchProgress(u8),
     /// Session stopped cleanly. `bytes_used` is the post-session du measurement when
     /// `QUASAR_HOME_ROOT` is set, else `None`. `detail` is the terminal `stopped` row's
     /// `state_detail`: `None` for an ordinary stop, `Some(PEER_DISCONNECT_DETAIL)` when
@@ -773,6 +781,137 @@ impl DiagnosticEventTx {
 pub struct SwapRequest {
     /// The new app container to launch, or `None` for a bare compositor.
     pub container: Option<super::container::ContainerSpec>,
+    /// Amendment 39: switch Steam games in the running container when this runner can.
+    pub in_place: bool,
+}
+
+/// A `session_assign` that adopts this runner's runtime (amendment 39, `adopt_session_id`).
+/// The agent has already checked that it may, and re-labels the runtime's reports.
+#[derive(Debug, Clone)]
+pub struct AdoptRequest {
+    /// `Play` or `Parked`.
+    pub kind: SessionKind,
+    /// The adopting session's app: what a play session launches, and what an in-place swap
+    /// is compared against from now on.
+    pub container: Option<super::container::ContainerSpec>,
+    pub idle_timeout: Duration,
+    pub app_boot_timeout: Option<Duration>,
+}
+
+/// `to` runs in `from`'s container with only `STEAM_STARTUP_FLAGS` changed (amendment 39).
+/// `require_local_image` is launch policy, not part of the app.
+fn same_container_but_flags(
+    from: &super::container::ContainerSpec,
+    to: &super::container::ContainerSpec,
+) -> bool {
+    let strip = |spec: &super::container::ContainerSpec| {
+        let mut spec = spec.clone();
+        spec.env.remove("STEAM_STARTUP_FLAGS");
+        spec.require_local_image = false;
+        spec
+    };
+    strip(from) == strip(to)
+}
+
+/// The games an in-place swap moves between, `(A, B)`, or `None` for today's container
+/// swap: it needs the session's launch helper connected, and the two apps differing in
+/// `STEAM_STARTUP_FLAGS` alone, each naming its game (amendment 39).
+fn in_place_plan(
+    current: Option<&super::container::ContainerSpec>,
+    req: &SwapRequest,
+    reports: Option<LaunchReports>,
+) -> Option<(u32, u32)> {
+    let (current, next) = (current?, req.container.as_ref()?);
+    if !req.in_place
+        || !reports.is_some_and(|r| r.helper_connected)
+        || !same_container_but_flags(current, next)
+    {
+        return None;
+    }
+    let appid = super::launch_helper::appid_from_env;
+    Some((appid(&current.env)?, appid(&next.env)?))
+}
+
+/// How long each half of an in-place swap may take: `swap complete` or the session's end
+/// follows the ack within 100 s (amendment 39). The quit half covers the helper's 20 s close,
+/// 10 s SIGTERM and SIGKILL, and its 60 s wait for Steam's exit cloud sync.
+const IN_PLACE_QUIT_BOUND: Duration = Duration::from_secs(94);
+const IN_PLACE_LAUNCH_BOUND: Duration = Duration::from_secs(5);
+
+/// An in-place swap in progress, advanced on the runner's tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InPlaceStep {
+    Quitting { from: u32, to: u32, since: Instant },
+    Launching { to: u32, since: Instant },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InPlaceAction {
+    Wait,
+    /// A has quit: arm the reader on B and send `launch B`.
+    Launch(u32),
+    /// The helper ran `launch B`.
+    Done,
+    /// B cannot be started; A is gone, so the session ends.
+    Fail(&'static str),
+}
+
+impl InPlaceStep {
+    /// Pure: what the helper's latest result means at `now`. A result for another command is
+    /// a replay, not this one's.
+    fn advance(&mut self, now: Instant, reports: LaunchReports) -> InPlaceAction {
+        let done = reports.last_command;
+        match *self {
+            InPlaceStep::Quitting { from, to, since } => match done {
+                Some(d) if d.command == HelperCommand::Quit(from) && d.ok => {
+                    tracing::info!(
+                        token = "swap-in-place-quit",
+                        cloud_synced = ?d.cloud_synced,
+                        "in-place swap: Steam app {from} quit; launching {to}"
+                    );
+                    *self = InPlaceStep::Launching { to, since: now };
+                    InPlaceAction::Launch(to)
+                }
+                Some(d) if d.command == HelperCommand::Quit(from) => {
+                    InPlaceAction::Fail("the game it switched from would not quit")
+                }
+                _ if now.saturating_duration_since(since) >= IN_PLACE_QUIT_BOUND => {
+                    InPlaceAction::Fail("the game it switched from did not quit in time")
+                }
+                _ => InPlaceAction::Wait,
+            },
+            InPlaceStep::Launching { to, since } => match done {
+                Some(d) if d.command == HelperCommand::Launch(to) && d.ok => InPlaceAction::Done,
+                Some(d) if d.command == HelperCommand::Launch(to) => {
+                    InPlaceAction::Fail("Steam could not be asked to launch the game")
+                }
+                _ if now.saturating_duration_since(since) >= IN_PLACE_LAUNCH_BOUND => {
+                    InPlaceAction::Fail("the launch helper did not launch the game")
+                }
+                _ => InPlaceAction::Wait,
+            },
+        }
+    }
+}
+
+/// `launch_progress` while an app boots (amendment 39): on change, at most once a second.
+#[derive(Default)]
+struct ProgressThrottle {
+    sent: Option<(u8, Instant)>,
+}
+
+impl ProgressThrottle {
+    fn next(&mut self, now: Instant, percent: Option<u8>) -> Option<u8> {
+        let percent = percent?;
+        match self.sent {
+            Some((last, _)) if last == percent => None,
+            Some((_, at)) if now.saturating_duration_since(at) < Duration::from_secs(1) => None,
+            _ => {
+                self.sent = Some((percent, now));
+                Some(percent)
+            }
+        }
+    }
 }
 
 /// `protocol/agent-api.md` `session_display_update`. Partial: `None` means "leave as is".
@@ -1603,7 +1742,15 @@ struct AppBootGate {
     drawn_at: Option<Instant>,
     /// Presented, or ended by a swap: nothing more to decide.
     done: bool,
+    /// The cap's clock: time held since the draw, less any time Steam's shader percentage
+    /// was rising (amendment 39, spec #759 "Shader progress").
+    held_for: Duration,
+    last_tick: Option<Instant>,
+    shader: Option<(u8, Instant)>,
 }
+
+/// The reveal cap resumes this long after Steam's shader percentage last rose.
+const SHADER_PAUSE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, PartialEq, Eq)]
 enum AppBootStep {
@@ -1626,6 +1773,9 @@ impl AppBootGate {
             frames_at_first_commit: None,
             drawn_at: None,
             done: false,
+            held_for: Duration::ZERO,
+            last_tick: None,
+            shader: None,
         }
     }
 
@@ -1648,20 +1798,33 @@ impl AppBootGate {
         if self.done {
             return AppBootStep::Wait;
         }
+        if let Some(percent) = reports.shader_percent {
+            if self.shader.is_none_or(|(last, _)| percent > last) {
+                self.shader = Some((percent, now));
+            }
+        }
+        let rising = self
+            .shader
+            .is_some_and(|(_, at)| now.saturating_duration_since(at) < SHADER_PAUSE);
+        let tick = now.saturating_duration_since(self.last_tick.unwrap_or(now));
+        self.last_tick = Some(now);
+        if self.drawn_at.is_some() && !rising {
+            self.held_for += tick;
+        }
         // `swap_source_ready`'s gate: the counter also counts unmapped surfaces (#487).
         let drew = self.drawn_at.is_none()
             && swap_source_ready(true, commits, frames, &mut self.frames_at_first_commit);
         if drew {
             self.drawn_at = Some(now);
         }
-        let Some(drawn_at) = self.drawn_at else {
+        if self.drawn_at.is_none() {
             let booting_for = now.saturating_duration_since(boot_started);
             return if self.budget.is_some_and(|budget| booting_for >= budget) {
                 AppBootStep::NeverPresented
             } else {
                 AppBootStep::Wait
             };
-        };
+        }
         // Drawn: the cap, not the watchdog, bounds the hold.
         let reveal = match self.cap {
             None => Some("first frame"),
@@ -1669,8 +1832,7 @@ impl AppBootGate {
             Some(_) if !reports.helper_connected => Some("no launch helper"),
             Some(cap) => reports
                 .reveal_reason()
-                .or((now.saturating_duration_since(drawn_at) >= cap)
-                    .then_some("reveal cap reached")),
+                .or((self.held_for >= cap).then_some("reveal cap reached")),
         };
         match reveal {
             Some(reveal) => {
@@ -1853,6 +2015,9 @@ pub fn run_blocking(
     // reserved its single-flight slot.
     capture_rx: std::sync::mpsc::Receiver<CaptureRequest>,
     session_metrics: Arc<SessionMetrics>,
+    // A `session_assign` adopting this runtime (amendment 39). The runner's `session_id` stays
+    // the runtime's own name (its containers, sockets and events); the agent re-labels it.
+    adopt_rx: std::sync::mpsc::Receiver<AdoptRequest>,
 ) {
     // Everything this thread logs belongs to one session, so name it once here rather
     // than threading `session_id` through every call site. Spawned threads re-enter a
@@ -1958,6 +2123,7 @@ pub fn run_blocking(
         &cfg.runtime_dir,
         &session_id,
         cfg.container.as_ref().map(|c| &c.env),
+        cfg.kind == Some(SessionKind::Parked),
         session_metrics.clone(),
         diagnostic_tx.clone(),
     ));
@@ -2262,16 +2428,29 @@ pub fn run_blocking(
     // #484 gen-0 app-boot gate. `AppBooting` follows `Running` for any generation that
     // launches an app container; `AppPresented` latches the first genuine draw. Both are
     // single-shot.
-    let app_boot_budget = cfg.app_boot_timeout;
+    let mut app_boot_budget = cfg.app_boot_timeout;
     let mut app_boot_started_at: Option<Instant> = None;
     let mut app_presented_at: Option<Instant> = None;
-    let reveal_cap = res.launch().map(|_| {
-        super::launch_helper::reveal_cap(
-            std::env::var("QUASAR_STEAM_REVEAL_CAP_SECS").ok(),
-            app_boot_budget,
-        )
-    });
+    let cap_for = |budget: Option<Duration>| {
+        res.launch().map(|_| {
+            super::launch_helper::reveal_cap(
+                std::env::var("QUASAR_STEAM_REVEAL_CAP_SECS").ok(),
+                budget,
+            )
+        })
+    };
+    let mut reveal_cap = cap_for(app_boot_budget);
     let mut app_boot = AppBootGate::new(reveal_cap, app_boot_budget);
+    // Amendment 39 (#759): what this runtime is now and what it is doing.
+    let mut kind = cfg.kind;
+    let mut current_app = cfg.container.clone();
+    // A play session's game exited and the session ended; the runtime waits for adoption.
+    let mut held_since: Option<Instant> = None;
+    // The video transport last served a viewer who left. Its SCTP association dying is
+    // not this session's peer leaving, until a new peer's answer replaces it.
+    let mut stale_transport = false;
+    let mut in_place: Option<(InPlaceStep, Option<super::container::ContainerSpec>)> = None;
+    let mut progress = ProgressThrottle::default();
     let mut app_boot_counter_warned = false;
     let mut app_boot_last_wait_log = Instant::now();
     // #503: a `set-remote-description` webrtcbin refuses (e.g. the peer rejected the video
@@ -2312,8 +2491,27 @@ pub fn run_blocking(
 
         // The player quit the Steam game (#726): a normal end, not a container exit (Steam
         // keeps running). One mutex read per 100 ms tick, so the end follows the helper's
-        // 250 ms poll by at most one tick.
-        if res.launch().is_some_and(|l| l.reports().game_exited()) {
+        // 250 ms poll by at most one tick. With a `kind` on the assign the runtime is kept
+        // for adoption (amendment 39); the viewer is told at once either way.
+        let game_exited = in_place.is_none()
+            && held_since.is_none()
+            && res.launch().is_some_and(|l| l.reports().game_exited());
+        if game_exited && kind.is_some() {
+            tracing::info!(
+                token = "launch-game-exited-held",
+                "the Steam game exited; ending the session and keeping its runtime for adoption"
+            );
+            emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
+            emit(SessionEvent::Signaling(SignalMsg::Bye));
+            emit(SessionEvent::Held);
+            held_since = Some(Instant::now());
+            stale_transport = true;
+            app_boot_started_at = None;
+            app_presented_at = None;
+            if let Some(launch) = res.launch() {
+                launch.mount().arm(None);
+            }
+        } else if game_exited {
             tracing::info!(
                 token = "launch-game-exited",
                 session_id = %session_id,
@@ -2330,6 +2528,86 @@ pub fn run_blocking(
             return;
         }
 
+        while let Ok(req) = adopt_rx.try_recv() {
+            let now = Instant::now();
+            held_since = None;
+            kind = Some(req.kind);
+            cfg.idle_timeout = req.idle_timeout;
+            cfg.app_boot_timeout = req.app_boot_timeout;
+            app_boot_budget = req.app_boot_timeout;
+            reveal_cap = cap_for(app_boot_budget);
+            current_app = req.container;
+            tracing::info!(
+                token = "runtime-adopted",
+                "runtime adopted by a {:?} session",
+                req.kind
+            );
+            // The adopting session starts here: its reports, its clocks, its first offer.
+            emit(SessionEvent::Starting);
+            emit(SessionEvent::Running);
+            emit(SessionEvent::EffectiveMedia(effective_media_snapshot(
+                &cfg,
+                &encode_pipe,
+                &interpipesrc,
+            )));
+            running_since = Some(now);
+            ever_connected = false;
+            unhealthy_since = None;
+            transport_since = Some(now);
+            app_boot_started_at = None;
+            app_presented_at = None;
+            let mount = res.launch().map(|l| l.mount().clone());
+            if req.kind == SessionKind::Parked {
+                if let Some(mount) = mount {
+                    mount.arm(None);
+                }
+                continue;
+            }
+            let Some(mount) = mount else {
+                let reason = "the adopted runtime has no launch helper to start the game";
+                tracing::error!(token = "runtime-adopted-without-helper", "{reason}");
+                emit(SessionEvent::Failed(reason.to_string()));
+                stop_source(&mut current_source, &transports);
+                super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
+                transports.audio_pipeline.finish();
+                return;
+            };
+            match current_app
+                .as_ref()
+                .and_then(|app| super::launch_helper::appid_from_env(&app.env))
+            {
+                Some(appid) => {
+                    mount.arm(Some(appid));
+                    mount.send(HelperCommand::Launch(appid));
+                }
+                None => {
+                    mount.arm(Some(STEAM_CLIENT_APPID));
+                    mount.send(HelperCommand::BigPicture);
+                }
+            }
+            app_boot_started_at = Some(now);
+            app_boot_last_wait_log = now;
+            app_boot = AppBootGate::new(reveal_cap, app_boot_budget);
+            progress = ProgressThrottle::default();
+            emit(SessionEvent::AppBooting);
+            // A fresh offer per PC for the new viewer, as `restart_ice` gets; a transport that
+            // negotiated with the ended session's viewer is replaced on the answer (#535).
+            for pc in [PcId::Video, PcId::Audio] {
+                if pc == PcId::Audio && transports.audio_webrtc.is_none() {
+                    continue;
+                }
+                let restart = SignalMsg::RestartIce { pc: Some(pc) };
+                if let Err(e) =
+                    transports.inbound(restart, &sig_tx, Some(&srd_fail_tx), Some(&srd_ok_tx))
+                {
+                    tracing::warn!(
+                        token = "runtime-adopted-offer-failed",
+                        "{pc} PC: no fresh offer for the adopting session: {e:#}"
+                    );
+                }
+            }
+        }
+
         // Outbound signaling (offer/ICE) to the control-plane relay; the first offer means
         // live. The running-transition is single-shot via the `!running` guard, and
         // `AppSource::first_frame` is an idempotent `AtomicBool` store rather than a
@@ -2342,7 +2620,8 @@ pub fn run_blocking(
                 // Ordering is load-bearing: `AppBooting` is a detail on a `running`
                 // session, so it must follow `Running` on the same ordered lane. Only a
                 // generation that launches an app container can report a surface commit.
-                if current_source.expects_app_container() {
+                // A parked Steam draws nothing and is never revealed (amendment 39).
+                if current_source.expects_app_container() && kind != Some(SessionKind::Parked) {
                     app_boot_started_at = Some(Instant::now());
                     app_boot_last_wait_log = Instant::now();
                     emit(SessionEvent::AppBooting);
@@ -2532,8 +2811,12 @@ pub fn run_blocking(
             }
         }
 
-        // Inbound relay signaling (answer/ICE from the browser).
+        // Inbound relay signaling (answer/ICE from the browser). A held runtime has no
+        // viewer: what its old one still sends is dropped.
         while let Ok(msg) = sig_in_rx.try_recv() {
+            if held_since.is_some() {
+                continue;
+            }
             match transports.inbound(msg, &sig_tx, Some(&srd_fail_tx), Some(&srd_ok_tx)) {
                 Ok(None) => {}
                 // The idle reap watches the new video transport, which has yet to connect.
@@ -2541,6 +2824,7 @@ pub fn run_blocking(
                     ever_connected = false;
                     unhealthy_since = None;
                     transport_since = Some(Instant::now());
+                    stale_transport = false;
                 }
                 Ok(Some(PcId::Audio)) => {}
                 Err(e) => {
@@ -2616,6 +2900,9 @@ pub fn run_blocking(
         // failing on it killed every `qses matrix` reconnect. Drained in a loop, not once
         // per tick, so a duplicate cannot queue the second PC's event behind it.
         while let Ok(failure) = srd_fail_rx.try_recv() {
+            if held_since.is_some() {
+                continue;
+            }
             // Emit the trace event BEFORE any terminal state: the control plane drops an
             // `agent_trace_event` for a session no longer running on this host. The lanes
             // differ, so this ordering is only real via the agent loop's pre-terminal
@@ -2681,6 +2968,46 @@ pub fn run_blocking(
         // never starved and never renegotiate. `SwapDone` is not emitted until the new app
         // is on screen (`perform_swap`), which is the client's reveal signal.
         while let Ok(req) = swap_rx.try_recv() {
+            if in_place.is_some() {
+                tracing::warn!(
+                    token = "swap-during-in-place-swap",
+                    "a swap arrived while an in-place swap is running; it is dropped"
+                );
+                continue;
+            }
+            let reports = res
+                .launch()
+                .map(super::launch_helper::LaunchSocket::reports);
+            if let Some((from, to)) = in_place_plan(current_app.as_ref(), &req, reports) {
+                emit(SessionEvent::Swapping);
+                if app_boot_started_at.is_some() && app_boot.end_for_swap() {
+                    app_presented_at = Some(Instant::now());
+                }
+                if let Some(launch) = res.launch() {
+                    launch.mount().send(HelperCommand::Quit(from));
+                }
+                tracing::info!(
+                    token = "swap-in-place",
+                    "in-place swap: quitting Steam app {from} for {to}"
+                );
+                in_place = Some((
+                    InPlaceStep::Quitting {
+                        from,
+                        to,
+                        since: Instant::now(),
+                    },
+                    req.container,
+                ));
+                continue;
+            }
+            if req.in_place {
+                tracing::info!(
+                    token = "swap-in-place-declined",
+                    "in-place swap not possible (no connected launch helper, or the apps \
+                     differ beyond STEAM_STARTUP_FLAGS); swapping the container"
+                );
+            }
+            let next_app = req.container.clone();
             gen += 1;
             emit(SessionEvent::Swapping);
             if app_boot_started_at.is_some() && app_boot.end_for_swap() {
@@ -2712,6 +3039,7 @@ pub fn run_blocking(
             ) {
                 Ok(()) => {
                     emit(SessionEvent::SwapDone);
+                    current_app = next_app;
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
@@ -2762,8 +3090,62 @@ pub fn run_blocking(
             }
         }
 
-        // Idle reap: watch the live transport on the encode webrtcbin.
-        if let Some(since) = running_since {
+        if let Some((step, _)) = in_place.as_mut() {
+            let reports = res
+                .launch()
+                .map(super::launch_helper::LaunchSocket::reports)
+                .unwrap_or_default();
+            match step.advance(Instant::now(), reports) {
+                InPlaceAction::Wait => {}
+                InPlaceAction::Launch(to) => {
+                    if let Some(launch) = res.launch() {
+                        launch.mount().arm(Some(to));
+                        launch.mount().send(HelperCommand::Launch(to));
+                    }
+                }
+                InPlaceAction::Done => {
+                    current_app = in_place.take().and_then(|(_, app)| app);
+                    emit(SessionEvent::SwapDone);
+                    diagnostic_tx.try_emit(
+                        session_id.clone(),
+                        TraceEvent {
+                            ts_unix_ms: now_unix_ms(),
+                            event: "pipeline.source_swapped",
+                            payload: serde_json::json!({ "in_place": true }),
+                        },
+                    );
+                    let now = Instant::now();
+                    app_boot_started_at = Some(now);
+                    app_presented_at = None;
+                    app_boot_last_wait_log = now;
+                    app_boot = AppBootGate::new(reveal_cap, app_boot_budget);
+                    progress = ProgressThrottle::default();
+                    emit(SessionEvent::AppBooting);
+                }
+                InPlaceAction::Fail(reason) => {
+                    tracing::error!(
+                        token = "swap-in-place-failed",
+                        reason,
+                        "in-place swap failed: {reason}; the session ends"
+                    );
+                    emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
+                    emit(SessionEvent::Signaling(SignalMsg::Bye));
+                    stop_source(&mut current_source, &transports);
+                    super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
+                    transports.audio_pipeline.finish();
+                    emit(SessionEvent::Stopped {
+                        bytes_used: compute_bytes_used(&cfg),
+                        detail: Some(GAME_EXITED_DETAIL),
+                    });
+                    return;
+                }
+            }
+        }
+
+        // Idle reap: watch the live transport on the encode webrtcbin. A parked or held
+        // runtime has no viewer to wait for.
+        let watched = held_since.is_none() && kind != Some(SessionKind::Parked);
+        if let Some(since) = running_since.filter(|_| watched) {
             let ice = transports
                 .video
                 .webrtc
@@ -2905,6 +3287,9 @@ pub fn run_blocking(
                     .launch()
                     .map(super::launch_helper::LaunchSocket::reports)
                     .unwrap_or_default();
+                if let Some(percent) = progress.next(Instant::now(), reports.shader_percent) {
+                    emit(SessionEvent::LaunchProgress(percent));
+                }
                 match app_boot.tick(Instant::now(), boot_started, commits, frames, reports) {
                     AppBootStep::Held => tracing::info!(
                         session_id = %session_id,
@@ -3038,6 +3423,21 @@ pub fn run_blocking(
         // Pump the encode bus (the transport); this paces the loop at ~POLL ms.
         if let Some(m) = encode_bus.timed_pop(gst::ClockTime::from_mseconds(POLL)) {
             match m.view() {
+                // The viewer of an ended session left (amendment 39): its association dying
+                // ends nothing.
+                gst::MessageView::Error(err)
+                    if (held_since.is_some() || stale_transport)
+                        && is_sctp_association_error(&format!(
+                            "{} {:?}",
+                            err.error(),
+                            err.debug()
+                        )) =>
+                {
+                    tracing::info!(
+                        token = "peer-transport-gone-left-viewer",
+                        "the transport of a viewer who left closed; nothing ends"
+                    );
+                }
                 // A transport retired for a new peer may have posted before it left the
                 // pipeline. Its SCTP association dying is not this session's peer leaving.
                 gst::MessageView::Error(err) if !posted_by_live_graph(&m, &encode_pipe) => {
