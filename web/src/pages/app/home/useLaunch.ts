@@ -162,6 +162,7 @@ export function useLaunch({
       // if the reason changes mid-wait.
       let firstBounceAt: number | null = null;
       let firstClosingAt: number | null = null;
+      let lastClosingName = "your previous game";
       let waitingToastId: string | null = null;
       let waitingToastReason: WaitingReason | null = null;
       const dismissWaitingToast = () => {
@@ -199,7 +200,9 @@ export function useLaunch({
           return;
         } catch (err) {
           // #754: home_in_use naming a `stopping` session ends by itself (Steam's
-          // cloud upload); any other answer, or a failed lookup, is the ordinary refusal.
+          // cloud upload). The server never names a terminal holder, so one read
+          // here means it finished since the 409: retry. Once waiting, a failed
+          // lookup keeps waiting; any other answer is the ordinary refusal.
           let closingName: string | null = null;
           if (err instanceof ApiError && err.code === "home_in_use" && err.sessionId) {
             const prev = await libraryApi
@@ -207,8 +210,13 @@ export function useLaunch({
               .then((r) => r.session)
               .catch(() => null);
             if (!mountedRef.current) return;
-            if (prev?.state === "stopping") {
-              closingName = apps.find((a) => a.id === prev.app_id)?.name ?? "your previous game";
+            const finished = prev?.state === "stopped" || prev?.state === "failed";
+            if (prev?.state === "stopping" || finished || (prev === null && firstClosingAt !== null)) {
+              if (prev) {
+                closingName = apps.find((a) => a.id === prev.app_id)?.name ?? "your previous game";
+              }
+              closingName ??= lastClosingName;
+              lastClosingName = closingName;
             }
           }
           if (
@@ -274,7 +282,10 @@ export function useLaunch({
                 // abort only ever comes from the unmount cleanup), so the check
                 // right below returns before touching state.
               }
-              if (!mountedRef.current) return;
+              if (!mountedRef.current) {
+                dismissWaitingToast();
+                return;
+              }
               continue; // one more attempt, still inside the loop
             }
             // Gave up after the reason's own budget — fall through to the ordinary

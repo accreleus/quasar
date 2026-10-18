@@ -126,7 +126,7 @@ describe("useLaunch while the previous session is stopping (#754)", () => {
     expect(navigate).toHaveBeenCalledWith("/app/session/new-1", expect.anything());
   });
 
-  it("ends in an explained failure when the stop never finishes", async () => {
+  it("ends in an explained failure when the stop never finishes, at the 45 s budget", async () => {
     vi.useFakeTimers();
     vi.mocked(libraryApi.launchSession).mockRejectedValue(homeInUse());
     vi.mocked(libraryApi.getSession).mockResolvedValue(prior("stopping"));
@@ -134,11 +134,83 @@ describe("useLaunch while the previous session is stopping (#754)", () => {
 
     await act(async () => {
       void result.current.launchApp(app);
-      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(44_500);
+    });
+    expect(result.current.waitingReason).toBe("closing");
+    expect(screen.queryByText("Steam is taking too long to close")).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
     });
     expect(screen.getByText("Steam is taking too long to close")).toBeTruthy();
     expect(result.current.launching).toBe(false);
     expect(result.current.waitingReason).toBeNull();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("retries when the holder finished between the 409 and the lookup", async () => {
+    vi.useFakeTimers();
+    vi.mocked(libraryApi.launchSession).mockRejectedValueOnce(homeInUse()).mockResolvedValue(launched);
+    vi.mocked(libraryApi.getSession).mockResolvedValue(prior("stopped"));
+    const { result } = renderWithPrevious();
+
+    await act(async () => {
+      void result.current.launchApp(app);
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(libraryApi.launchSession).toHaveBeenCalledTimes(2);
+    expect(navigate).toHaveBeenCalledWith("/app/session/new-1", expect.anything());
+    expect(screen.queryByText("Portal is already running")).toBeNull();
+  });
+
+  it("keeps waiting through a failed lookup once the wait has started", async () => {
+    vi.useFakeTimers();
+    vi.mocked(libraryApi.launchSession)
+      .mockRejectedValueOnce(homeInUse())
+      .mockRejectedValueOnce(homeInUse())
+      .mockResolvedValue(launched);
+    vi.mocked(libraryApi.getSession)
+      .mockResolvedValueOnce(prior("stopping"))
+      .mockRejectedValueOnce(new ApiError(500, "internal", "boom"));
+    const { result } = renderWithPrevious();
+
+    await act(async () => {
+      void result.current.launchApp(app);
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(libraryApi.launchSession).toHaveBeenCalledTimes(3);
+    expect(navigate).toHaveBeenCalledWith("/app/session/new-1", expect.anything());
+    expect(screen.queryByText("Portal is already running")).toBeNull();
+  });
+
+  it("refuses when the very first lookup fails", async () => {
+    vi.mocked(libraryApi.launchSession).mockRejectedValue(homeInUse());
+    vi.mocked(libraryApi.getSession).mockRejectedValue(new ApiError(500, "internal", "boom"));
+    const { result } = renderWithPrevious();
+
+    await act(async () => {
+      await result.current.launchApp(app);
+    });
+    expect(libraryApi.launchSession).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Portal is already running")).toBeTruthy();
+  });
+
+  it("stops quietly when the page goes away mid-wait", async () => {
+    vi.useFakeTimers();
+    vi.mocked(libraryApi.launchSession).mockRejectedValue(homeInUse());
+    vi.mocked(libraryApi.getSession).mockResolvedValue(prior("stopping"));
+    const { result, unmount } = renderWithPrevious();
+
+    await act(async () => {
+      void result.current.launchApp(app);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("Closing Steam…")).toBeTruthy();
+    unmount();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(libraryApi.launchSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Steam is taking too long to close")).toBeNull();
     expect(navigate).not.toHaveBeenCalled();
   });
 
