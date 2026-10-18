@@ -29,25 +29,25 @@ use crate::session::metrics::SessionMetrics;
 use crate::session::runner::{DiagnosticEventTx, TraceEvent};
 
 /// The helper's file name, beside the agent binary in the image and in the runtime dir.
-pub const HELPER_FILE: &str = "quasar-launch-helper";
+const HELPER_FILE: &str = "quasar-launch-helper";
 const CONTAINER_HELPER: &str = "/run/quasar-launch-helper";
 const CONTAINER_SOCKET_DIR: &str = "/run/quasar-launch";
 const SOCKET_FILE: &str = "launch.sock";
 const PREFIX: &str = "launch-";
 
 /// Wire cap on one line, newline included (#725 shared interface).
-pub const MAX_LINE: usize = 1024;
+const MAX_LINE: usize = 1024;
 /// The helper sends changes only, a handful per session.
-pub const MAX_LINES_PER_SEC: u32 = 10;
+const MAX_LINES_PER_SEC: u32 = 10;
 /// Trace events and info lines one session's helper may cause; the metric keeps updating.
 const MAX_NOTABLE: u32 = 32;
 const POLL: Duration = Duration::from_millis(100);
 /// A served connection with no complete line for this long is dropped, so a silent holder
 /// cannot keep the helper out; the helper reconnects when its next line fails.
-pub const IDLE: Duration = Duration::from_secs(1);
+const IDLE: Duration = Duration::from_secs(1);
 const LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// About twice the slowest launch the #723 spike measured (43.9 s).
-pub const REVEAL_CAP_DEFAULT_SECS: u64 = 90;
+const REVEAL_CAP_DEFAULT_SECS: u64 = 90;
 
 /// Copy the helper shipped beside the agent binary into the runtime dir, the one path the
 /// host shares 1:1 with the agent's container, so sessions can bind-mount it. Any older
@@ -88,7 +88,7 @@ pub fn install() {
 /// The target appid of a derived Steam tile: the integer after the single `-applaunch` in
 /// `STEAM_STARTUP_FLAGS`, as the control plane's `composeSteamFlags` writes it. `None` for
 /// anything else, which is every app that is not a derived Steam tile.
-pub fn appid_from_env(env: &BTreeMap<String, String>) -> Option<u32> {
+fn appid_from_env(env: &BTreeMap<String, String>) -> Option<u32> {
     let mut tokens = env.get("STEAM_STARTUP_FLAGS")?.split_ascii_whitespace();
     let mut appid = None;
     while let Some(token) = tokens.next() {
@@ -117,7 +117,7 @@ pub enum LaunchState {
 }
 
 impl LaunchState {
-    pub fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             LaunchState::Starting => "starting",
             LaunchState::ClientOnly => "client_only",
@@ -150,7 +150,7 @@ pub enum NeedsUser {
 }
 
 impl NeedsUser {
-    pub fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             NeedsUser::SignIn => "sign_in",
             NeedsUser::SteamGuard => "steam_guard",
@@ -177,7 +177,7 @@ impl NeedsUser {
 
 /// One accepted helper line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Report {
+enum Report {
     LaunchState(LaunchState),
     GameWindow { on_screen: bool },
     SteamNeedsUser(NeedsUser),
@@ -195,7 +195,7 @@ enum Wire {
 
 /// Why a line was dropped. Logged by name only: the line itself is the attacker's text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Rejected {
+enum Rejected {
     Oversize,
     NotUtf8,
     Malformed,
@@ -219,7 +219,7 @@ impl Rejected {
 }
 
 /// Parse one line, its newline already stripped.
-pub fn parse(line: &[u8]) -> Result<Report, Rejected> {
+fn parse(line: &[u8]) -> Result<Report, Rejected> {
     let text = std::str::from_utf8(line).map_err(|_| Rejected::NotUtf8)?;
     let (v, report) = match serde_json::from_str(text).map_err(|_| Rejected::Malformed)? {
         Wire::LaunchState { v, state } => (v, LaunchState::parse(&state).map(Report::LaunchState)),
@@ -324,17 +324,23 @@ fn forward(from: Option<LaunchState>, to: LaunchState, seen_running: bool) -> bo
     }
 }
 
+/// `active` and the reports share one lock, so a report cannot land after `set_active(false)`.
+#[derive(Default)]
+struct State {
+    /// False while the session's app is not its derived tile (after a swap away).
+    active: bool,
+    reports: LaunchReports,
+}
+
 /// The reader's state, shared with every generation's mount.
 struct Shared {
-    /// False while the session's app is not its derived tile (after a swap away).
-    active: AtomicBool,
-    reports: Mutex<LaunchReports>,
+    state: Mutex<State>,
     metrics: Arc<SessionMetrics>,
 }
 
 impl Shared {
-    fn reports(&self) -> std::sync::MutexGuard<'_, LaunchReports> {
-        self.reports.lock().unwrap_or_else(PoisonError::into_inner)
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -366,10 +372,10 @@ impl LaunchMount {
     }
 
     fn set_active(&self, active: bool) {
-        let mut reports = self.shared.reports();
-        self.shared.active.store(active, Ordering::Relaxed);
+        let mut state = self.shared.state();
+        state.active = active;
         if !active {
-            *reports = LaunchReports::default();
+            state.reports = LaunchReports::default();
             self.shared.metrics.set_app_launch_state(None);
         }
     }
@@ -491,8 +497,10 @@ impl LaunchSocket {
                 helper,
                 socket_dir: owned_entry::entry_dir(runtime_dir, PREFIX, session_id),
                 shared: Arc::new(Shared {
-                    active: AtomicBool::new(true),
-                    reports: Mutex::default(),
+                    state: Mutex::new(State {
+                        active: true,
+                        ..State::default()
+                    }),
                     metrics,
                 }),
             },
@@ -541,7 +549,7 @@ impl LaunchSocket {
     }
 
     pub fn reports(&self) -> LaunchReports {
-        *self.mount.shared.reports()
+        self.mount.shared.state().reports
     }
 }
 
@@ -599,11 +607,11 @@ impl Reader {
         while !self.stopped() {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let mut reports = self.shared.reports();
-                    if self.shared.active.load(Ordering::Relaxed) {
-                        reports.helper_connected = true;
+                    let mut state = self.shared.state();
+                    if state.active {
+                        state.reports.helper_connected = true;
                     }
-                    drop(reports);
+                    drop(state);
                     self.read_connection(stream)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
@@ -735,23 +743,24 @@ impl Reader {
     }
 
     fn apply(&mut self, report: Report) {
-        let mut reports = self.shared.reports();
-        if !self.shared.active.load(Ordering::Relaxed) {
+        let mut guard = self.shared.state();
+        if !guard.active {
             return;
         }
+        let reports = &mut guard.reports;
         match report {
             Report::LaunchState(state) if reports.launch_state != Some(state) => {
                 if !forward(reports.launch_state, state, reports.seen_running) {
-                    drop(reports);
+                    drop(guard);
                     return self.drop_line(Rejected::OutOfOrder);
                 }
                 reports.launch_state = Some(state);
                 reports.seen_running |= state == LaunchState::GameRunning;
-                // Under the reports lock, so a swap's reset cannot land in between.
+                // Under the state lock, so a swap's reset cannot land in between.
                 self.shared
                     .metrics
                     .set_app_launch_state(Some(state.as_str()));
-                drop(reports);
+                drop(guard);
                 if self.notable() {
                     tracing::info!(
                         state = state.as_str(),
@@ -781,7 +790,7 @@ impl Reader {
             }
             Report::SteamNeedsUser(reason) if reports.needs_user != Some(reason) => {
                 reports.needs_user = Some(reason);
-                drop(reports);
+                drop(guard);
                 if self.notable() {
                     tracing::info!(
                         reason = reason.as_str(),
@@ -906,8 +915,10 @@ mod tests {
             helper: "/run/quasar-agent/quasar-launch-helper".into(),
             socket_dir: "/run/quasar-agent/launch-s1".into(),
             shared: Arc::new(Shared {
-                active: AtomicBool::new(true),
-                reports: Mutex::default(),
+                state: Mutex::new(State {
+                    active: true,
+                    ..State::default()
+                }),
                 metrics: Arc::new(SessionMetrics::new("off", 60)),
             }),
         };
@@ -1372,8 +1383,10 @@ mod tests {
     #[test]
     fn a_line_queued_as_a_quiet_connection_closes_is_still_read() {
         let shared = Arc::new(Shared {
-            active: AtomicBool::new(true),
-            reports: Mutex::default(),
+            state: Mutex::new(State {
+                active: true,
+                ..State::default()
+            }),
             metrics: Arc::new(SessionMetrics::new("off", 60)),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -1394,7 +1407,7 @@ mod tests {
         helper.write_all(CLIENT_ONLY).unwrap();
         reader.read_connection(ours);
         assert_eq!(
-            shared.reports().launch_state,
+            shared.state().reports.launch_state,
             Some(LaunchState::ClientOnly),
             "the line the helper wrote before the close was read"
         );

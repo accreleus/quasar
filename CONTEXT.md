@@ -80,6 +80,35 @@ tile discovered inside a parent app's library. It inherits the parent's
 runtime, image, and resource demand; a handful of fields (default profile,
 profile policy) stay on the tile.
 
+**Launch helper** — the small report-only process a derived Steam tile's
+container runs beside Steam (`quasar-launch-helper`). It watches for the tile's
+game and sends the agent changes of *launch state*, whether the game is on screen,
+and whether Steam needs the user, over a per-session socket the agent owns. Its
+reports are hints: a malformed one is dropped, never fatal. An image that does
+not start it behaves as before. _Avoid_: "launcher" (the image's entrypoint that
+starts the helper) and "watcher" (the helper's detection core).
+
+**Launch state** — where the tile's game is in its start: `starting`,
+`client_only` (Steam is up, the game is not), `game_running`, `game_exited`.
+Moves forward only, except that a new helper may report `starting` again, and
+`game_exited` is terminal for one arming of the reader; it is what ends the
+session as a normal stop. Reported as `session_metrics.app_launch_state`. _Avoid_: "app state" (the container's).
+
+**Reveal** — showing the stream to the user, as against the loader. For a derived
+Steam tile it waits for the game: the agent emits `AppPresented`, the event that
+allows the reveal, when the game window is on screen or Steam needs the user. Any
+other app reveals on its first frame. _Avoid_: using "reveal" and "app presented"
+interchangeably; the first is the act, the second the event.
+
+**Reveal cap** — the longest a tile's reveal waits for the game after the app's
+first frame (`QUASAR_STEAM_REVEAL_CAP_SECS`), so a game that never shows a window
+still reaches the user. Never above the app boot watchdog's budget.
+
+**Hold** — the app's first frame has been drawn and the reveal is being kept
+back for the game: from that frame to the game's window, Steam needing the user,
+or the reveal cap, whichever comes first. A session with no helper, or a cap of
+zero, holds nothing.
+
 **Missing** — the state of a library observation (one game a scan saw installed
 for one user on one host) that the last complete scan of that home did not
 list. A missing game still counts as installed: its tile, entitlement and any
