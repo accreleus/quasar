@@ -487,6 +487,8 @@ function SessionPageBody() {
     // Unmute on user gesture (browsers require it for audio autoplay).
     videoRef.current.muted = false;
     void videoRef.current.play();
+    // The session's sound too, once revealed: a reload with no click has no activation to unmute it.
+    if (revealStartedRef.current) runtimeRef.current?.releaseAudio();
 
     // Synchronous truth, not last-rendered state — a gesture handler must not
     // read a stale render (sessionRuntime.isCaptured).
@@ -792,6 +794,12 @@ function SessionPageBody() {
       ];
     }
   }, [revealReady]);
+  // The sound flips with the picture: the loader turns see-through at `loaderInert`, not at
+  // `revealReady` (its lock animation is opaque). `runtimeSnap` re-runs this for a runtime
+  // built after the reveal (a replacement transport).
+  useEffect(() => {
+    if (loaderInert) runtimeRef.current?.releaseAudio();
+  }, [loaderInert, runtimeSnap]);
   useEffect(
     () => () => {
       loaderTimersRef.current?.forEach(clearTimeout);
