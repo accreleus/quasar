@@ -128,6 +128,12 @@ fn after(log: &[SessionEvent], from: usize, what: impl Fn(&SessionEvent) -> bool
         .map(|(i, _)| i)
 }
 
+fn byes(log: &[SessionEvent]) -> usize {
+    log.iter()
+        .filter(|e| matches!(e, SessionEvent::Signaling(SignalMsg::Bye)))
+        .count()
+}
+
 fn end(mut session: Session, peer: &mut Peer) {
     session.stop.store(true, Ordering::SeqCst);
     let ended = session.pump(peer, Duration::from_secs(20), |s, _| s.ended.is_some());
@@ -199,6 +205,7 @@ fn a_game_exit_holds_the_runtime_and_an_adoption_launches_the_next_game_for_a_ne
     })
     .expect("bye after stopping");
     after(&session.log, bye, |e| matches!(e, SessionEvent::Held)).expect("held after bye");
+    assert_eq!(byes(&session.log), 1, "one bye for the ended session");
 
     // The old viewer goes; nothing ends while the runtime waits.
     drop(a);
@@ -267,6 +274,7 @@ fn a_game_exit_holds_the_runtime_and_an_adoption_launches_the_next_game_for_a_ne
             .any(|e| matches!(e, SessionEvent::AppPresented))
     });
     assert!(shown, "the game on screen did not reveal it");
+    assert_eq!(byes(&session.log), 1, "the adoption says no bye");
     end(session, &mut b);
 }
 
@@ -385,10 +393,7 @@ fn an_in_place_swap_whose_next_game_cannot_launch_ends_the_session() {
         .log
         .iter()
         .any(|e| matches!(e, SessionEvent::SwapRolledBack(_))));
-    assert!(session
-        .log
-        .iter()
-        .any(|e| matches!(e, SessionEvent::Signaling(SignalMsg::Bye))));
+    assert_eq!(byes(&session.log), 1);
     session.thread.take().unwrap().join().unwrap();
 }
 

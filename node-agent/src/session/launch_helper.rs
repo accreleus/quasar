@@ -330,7 +330,7 @@ pub struct LaunchReports {
     /// The helper connected since the reader was last armed. An image whose launcher does
     /// not start it never does, and its first frame is shown as before (#727).
     pub helper_connected: bool,
-    /// Steam's latest shader percentage for the target (#759).
+    /// The target's shader progress, 0 to 100, rising only (#759).
     pub shader_percent: Option<u8>,
     /// The helper's word on the last command sent, cleared when the next one is sent.
     pub last_command: Option<CommandDone>,

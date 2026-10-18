@@ -2734,19 +2734,9 @@ async fn connect_and_run(
                     continue;
                 };
                 let session_id = mgr.label(&session_id);
-                // A held runtime's session has ended: its runner's own reports stop here,
-                // and its end is the release (amendment 39).
-                if mgr.running.get(&session_id).is_some_and(|h| !h.live()) {
-                    if matches!(
-                        event,
-                        SessionEvent::Stopped { .. }
-                            | SessionEvent::Failed(_)
-                            | SessionEvent::AppFailed { .. }
-                    ) {
-                        flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx, &mgr.labels).await?;
-                        if let Some(msg) = mgr.release_terminal(&session_id) {
-                            send(&mut tx, &msg).await?;
-                        }
+                if let Some(release) = mgr.held_report(&session_id, &event) {
+                    if let Some(msg) = release {
+                        send(&mut tx, &msg).await?;
                         send_fresh_capacity(&mut tx, &mut *mgr).await?;
                     }
                     continue;
@@ -5127,9 +5117,27 @@ impl SessionManager {
         Adoption::Adopted
     }
 
-    /// The terminal report of a held runtime's runner: the release (amendment 39). Its
-    /// session already ended `stopped`, so only an agent that owes RH05 terminal proof
-    /// sends anything, and only once the cleanup is verified.
+    /// A report from a held runtime's runner (amendment 39), or `None` when `session_id` is a
+    /// session. Its session has ended, so the runner's own reports stop here; its end is the
+    /// release, `Some(proof)` when RH05 terminal proof is due now.
+    fn held_report(&mut self, session_id: &str, event: &SessionEvent) -> Option<Option<AgentMsg>> {
+        if self.running.get(session_id).is_none_or(|h| h.live()) {
+            return None;
+        }
+        let terminal = matches!(
+            event,
+            SessionEvent::Stopped { .. } | SessionEvent::Failed(_) | SessionEvent::AppFailed { .. }
+        );
+        Some(
+            terminal
+                .then(|| self.release_terminal(session_id))
+                .flatten(),
+        )
+    }
+
+    /// The end of a held runtime's runner: the release. Its session already ended
+    /// `stopped`, so only an agent that owes RH05 terminal proof sends anything, and only
+    /// once the cleanup is verified (a pending proof is retried by [`Self::reconcile`]).
     fn release_terminal(&mut self, session_id: &str) -> Option<AgentMsg> {
         if self.home_cleanup.is_some() {
             return self.prove_home_terminal(
@@ -10958,8 +10966,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_released_runtime_owes_rh05_proof_once_its_cleanup_is_verified() {
+    /// A held `p0` is released by `release`; its runner's way out is routed as the event loop
+    /// routes it. Exactly one cleanup-proven `stopped` goes out, once the container is gone, and
+    /// a recovery stop for the id afterwards is answered the same way.
+    fn released_with_proof(release: impl FnOnce(&mut SessionManager, &Warm, Instant)) {
         let directory = tempfile::tempdir().unwrap();
         let (mut mgr, warm) = warm_manager();
         let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
@@ -10968,21 +10978,146 @@ mod tests {
         .unwrap();
         ledger.record_active("p0").unwrap();
         mgr.home_cleanup = Some(ledger);
-        mgr.home_source_retire = Some(Arc::new(|_: &str| true));
+        let gone = Arc::new(AtomicBool::new(false));
+        let container_gone = gone.clone();
+        mgr.home_source_retire = Some(Arc::new(move |_: &str| {
+            container_gone.load(Ordering::Relaxed)
+        }));
         held(&mut mgr, &warm, "p0");
         assert_eq!(
             mgr.home_cleanup.as_ref().unwrap().state("p0"),
             None,
             "held is no proof"
         );
-        mgr.running["p0"].stop.store(true, Ordering::Relaxed);
+        let since = mgr.running["p0"].held.unwrap().since;
+        release(&mut mgr, &warm, since);
+        assert!(mgr.running["p0"].stop.load(Ordering::Relaxed));
+        assert!(mgr.running["p0"].held.unwrap().released);
+
+        let stopped = SessionEvent::Stopped {
+            bytes_used: None,
+            detail: None,
+        };
+        assert!(matches!(
+            mgr.held_report("p0", &SessionEvent::Stopping),
+            Some(None)
+        ));
         wait_finished(&mgr, "p0");
-        let proof = serde_json::to_value(mgr.release_terminal("p0").unwrap()).unwrap();
-        assert_eq!(proof["state"], "stopped");
-        assert!(proof.get("runtime_held").is_none());
+        assert!(
+            matches!(mgr.held_report("p0", &stopped), Some(None)),
+            "no proof while the container is still there"
+        );
+        let later = since + HELD_RUNTIME_TTL + Duration::from_secs(1);
+        assert!(mgr
+            .reconcile(later, RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL)
+            .is_empty());
+        // A recovery stop meanwhile changes nothing and reports nothing.
+        let reply = mgr.handle_control(
+            ControlMsg::SessionStop {
+                id: "again".into(),
+                session_id: "p0".into(),
+                reason: "error".into(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(acked(reply));
+        assert!(mgr.home_cleanup_reports.is_empty());
+
+        gone.store(true, Ordering::Relaxed);
+        let proofs: Vec<serde_json::Value> = mgr
+            .reconcile(later, RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL)
+            .into_iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(proofs.len(), 1, "{proofs:?}");
+        assert_eq!(proofs[0]["type"], "session_state");
+        assert_eq!(proofs[0]["session_id"], "p0");
+        assert_eq!(proofs[0]["state"], "stopped");
+        assert!(proofs[0].get("runtime_held").is_none());
+        assert!(mgr
+            .reconcile(later, RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL)
+            .is_empty());
+        assert!(!mgr.running.contains_key("p0"));
         assert_eq!(
             mgr.home_cleanup.as_ref().unwrap().state("p0"),
             Some(crate::home_cleanup::TerminalKind::Stopped)
+        );
+
+        let reply = mgr.handle_control(
+            ControlMsg::SessionStop {
+                id: "recovery".into(),
+                session_id: "p0".into(),
+                reason: "error".into(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(acked(reply));
+        let answers: Vec<serde_json::Value> = mgr
+            .home_cleanup_reports
+            .drain(..)
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0]["session_id"], "p0");
+        assert_eq!(answers[0]["state"], "stopped");
+    }
+
+    #[test]
+    fn a_runtime_released_by_a_stop_sends_one_proven_stopped_once_its_container_is_gone() {
+        released_with_proof(|mgr, warm, _| {
+            let reply = mgr.handle_control(
+                ControlMsg::SessionStop {
+                    id: "release".into(),
+                    session_id: "p0".into(),
+                    reason: "parked_superseded".into(),
+                },
+                &warm.evt_tx,
+                &diagnostic_sender(),
+            );
+            assert!(acked(reply));
+            assert!(
+                mgr.home_cleanup_reports.is_empty(),
+                "nothing before the cleanup"
+            );
+        });
+    }
+
+    #[test]
+    fn a_runtime_released_after_30_s_sends_one_proven_stopped_once_its_container_is_gone() {
+        released_with_proof(|mgr, _, since| {
+            assert!(mgr
+                .reconcile(
+                    since + HELD_RUNTIME_TTL,
+                    RUNNER_REAP_GRACE,
+                    PENDING_ASSIGNMENT_TTL
+                )
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn without_rh05_a_released_runtime_sends_nothing() {
+        let (mut mgr, warm) = warm_manager();
+        held(&mut mgr, &warm, "p0");
+        mgr.running["p0"].stop.store(true, Ordering::Relaxed);
+        mgr.running
+            .get_mut("p0")
+            .unwrap()
+            .held
+            .as_mut()
+            .unwrap()
+            .released = true;
+        let stopped = SessionEvent::Stopped {
+            bytes_used: None,
+            detail: None,
+        };
+        assert!(matches!(mgr.held_report("p0", &stopped), Some(None)));
+        assert!(!mgr.running.contains_key("p0"));
+        assert!(
+            mgr.held_report("p1", &stopped).is_none(),
+            "a session is not routed here"
         );
     }
 

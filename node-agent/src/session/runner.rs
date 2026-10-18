@@ -3142,9 +3142,7 @@ pub fn run_blocking(
                         reason,
                         "in-place swap failed: {reason}; the session ends"
                     );
-                    emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
-                    emit(SessionEvent::Signaling(SignalMsg::Bye));
-                    stop_source(&mut current_source, &transports);
+                    stop_for_game_exit(&emit, &mut current_source, &transports);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     emit(SessionEvent::Stopped {
