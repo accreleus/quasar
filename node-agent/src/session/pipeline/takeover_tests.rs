@@ -1728,7 +1728,11 @@ fn a_game_exit_says_bye_and_drops_the_video_before_the_source_stops() {
     crate::session::runner::stop_for_game_exit(&emit, &mut source, &host.transports);
 
     let at_stop = *at_stop.lock().unwrap();
-    assert_eq!(at_stop, Some((true, gst::State::Null)), "(bye sent, video state) at the source stop");
+    assert_eq!(
+        at_stop,
+        Some((true, gst::State::Null)),
+        "(bye sent, video state) at the source stop"
+    );
     let emitted = emitted.lock().unwrap();
     assert!(
         matches!(
