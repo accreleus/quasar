@@ -57,12 +57,14 @@ let telemetryListener: ((snap: Record<string, unknown>) => void) | null = null;
 type Channel = { readyState: string; onclose: (() => void) | null; send: () => void; bufferedAmount: number };
 let lastOnChannel: ((ch: Channel) => void) | null = null;
 let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
+let lastTransport: { onHostBye?: (() => void) | null } | null = null;
 const attachMicTrack = vi.fn((_track: unknown) => Promise.resolve());
 const detachMicTrack = vi.fn(() => Promise.resolve());
 let constructed = 0;
 vi.mock("../../webrtc/session", () => ({
   QuasarSession: class {
     videoReceiver = null;
+    onHostBye: (() => void) | null = null;
     constructor(
       _url: string,
       _token: string,
@@ -73,6 +75,7 @@ vi.mock("../../webrtc/session", () => ({
       onRecoveryState?: (state: Record<string, unknown>) => void,
     ) {
       constructed++;
+      lastTransport = this;
       lastOnChannel = onChannel;
       lastOnRecovery = onRecoveryState ?? null;
     }
@@ -246,6 +249,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
+  lastTransport = null;
   telemetryListener = null;
   constructed = 0;
   hud = {};
@@ -312,6 +316,18 @@ describe("SessionPage — a session that is over for this page releases the mic 
     await advance(100);
     expect(screen.getByTestId("library")).not.toBeNull();
     expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  // #753: the agent says `bye` right after the `stopping` row, long before the stream stalls.
+  it("game exited, the host's bye: the library at once, before the health tick and with no banner", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
+    const polls = getSession.mock.calls.length;
+    await act(async () => lastTransport?.onHostBye?.());
+    await advance(50);
+    expect(getSession.mock.calls.length).toBe(polls + 1);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Recovering connection")).toBeNull();
   });
 
   it("game exited before the reveal: an earlier stopping read does not hold the loader's card", async () => {
@@ -391,6 +407,14 @@ describe("SessionPage — an ordinary stop is not a game exit (#726)", () => {
     await advance(100);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     expect(screen.queryByTestId("library")).toBeNull();
+  });
+
+  it("a bye from a session that still reads running leaves the page as it is (#753)", async () => {
+    await streamingWithMicAndCapture();
+    await act(async () => lastTransport?.onHostBye?.());
+    await advance(50);
+    expect(screen.queryByTestId("library")).toBeNull();
+    stillLive();
   });
 });
 

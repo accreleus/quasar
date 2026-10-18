@@ -1649,6 +1649,20 @@ pub(crate) fn stop_source(source: &mut AppSource, transports: &SessionTransports
     source.teardown();
 }
 
+/// [`stop_source`] for a game the player quit (#726). The source stop waits on Steam's own
+/// exit and cloud upload (#742), so the browser is told first (#753): `bye` must follow the
+/// `stopping` row on this ordered lane, because the control plane commits that row before it
+/// relays the next frame, and the web client answers `bye` by reading the row.
+pub(crate) fn stop_for_game_exit(
+    emit: &dyn Fn(SessionEvent),
+    source: &mut AppSource,
+    transports: &SessionTransports,
+) {
+    emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
+    emit(SessionEvent::Signaling(SignalMsg::Bye));
+    stop_source(source, transports);
+}
+
 /// Should an idle `running` session be reaped? `Some(reason)` to reap. Pure so the policy
 /// is unit tested. `window` is the idle timeout; `Duration::ZERO` disables reaping.
 ///
@@ -2518,8 +2532,7 @@ pub fn run_blocking(
                 session_id = %session_id,
                 "the Steam game exited; ending the session"
             );
-            emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
-            stop_source(&mut current_source, &transports);
+            stop_for_game_exit(&emit, &mut current_source, &transports);
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             emit(SessionEvent::Stopped {
