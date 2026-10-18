@@ -19,6 +19,13 @@ func (c *Coordinator) AgentSignalingFailure(ctx context.Context, hostID, session
 	if err != nil || hs.HostID == nil || *hs.HostID != hostID || hs.State.IsTerminal() {
 		return
 	}
+	// Already ending, and its agent reports `stopped` itself: a stop or a fail here would
+	// end the row before the app has stopped (#753: a game exit's `bye` to a stuck socket).
+	if hs.State == StateStopping {
+		c.log.Info("signaling relay failed on a stopping session; frame dropped",
+			"session_id", sessionID, "reason", reason)
+		return
+	}
 	cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sessionID, Reason: "signaling_relay_failed"}
 	if err := c.dispatcher.Send(hostID, cmd); err != nil {
 		c.log.Warn("signaling-failure stop dispatch failed", "session_id", sessionID, "err", err)

@@ -12,8 +12,12 @@ import type { App, ProfilesResponse, Session } from "../../../api/types";
 import { useToast } from "../../../components/Toast";
 import { playoutOverride } from "../../../webrtc/playout";
 import {
+  CLOSING_RETRY_DELAY_MS,
+  MAX_CLOSING_RETRY_WAIT_MS,
   MAX_NO_HOST_RETRY_WAIT_MS,
   NO_HOST_RETRY_DELAY_MS,
+  closingGaveUpCopy,
+  closingToastCopy,
   decideCapacityRetry,
   waitingToastCopy,
 } from "../capacityRetry";
@@ -51,9 +55,10 @@ function abortableSleep(
   });
 }
 
-/** Which bounce a waiting launch is retrying: "slot" (capacity_exhausted) or
- *  "host" (no_host_available). */
-export type WaitingReason = "slot" | "host";
+/** Which bounce a waiting launch is retrying: "slot" (capacity_exhausted),
+ *  "host" (no_host_available) or "closing" (home_in_use while the player's own
+ *  previous session is still `stopping`, #754). */
+export type WaitingReason = "slot" | "host" | "closing";
 
 export interface UseLaunchOptions {
   token: string | null;
@@ -156,6 +161,8 @@ export function useLaunch({
       // (tile, rail) with no detail panel open, and let the toast be replaced
       // if the reason changes mid-wait.
       let firstBounceAt: number | null = null;
+      let firstClosingAt: number | null = null;
+      let lastClosingName = "your previous game";
       let waitingToastId: string | null = null;
       let waitingToastReason: WaitingReason | null = null;
       const dismissWaitingToast = () => {
@@ -192,24 +199,61 @@ export function useLaunch({
           });
           return;
         } catch (err) {
+          // #754: home_in_use naming a `stopping` session ends by itself (Steam's
+          // cloud upload). The server never names a terminal holder, so one read
+          // here means it finished since the 409: retry. Once waiting, a failed
+          // lookup keeps waiting; any other answer is the ordinary refusal.
+          let closingName: string | null = null;
+          if (err instanceof ApiError && err.code === "home_in_use" && err.sessionId) {
+            const prev = await libraryApi
+              .getSession(token, err.sessionId)
+              .then((r) => r.session)
+              .catch(() => null);
+            if (!mountedRef.current) return;
+            const finished = prev?.state === "stopped" || prev?.state === "failed";
+            if (prev?.state === "stopping" || finished || (prev === null && firstClosingAt !== null)) {
+              if (prev) {
+                closingName = apps.find((a) => a.id === prev.app_id)?.name ?? "your previous game";
+              }
+              closingName ??= lastClosingName;
+              lastClosingName = closingName;
+            }
+          }
           if (
-            err instanceof ApiError &&
-            (err.code === "capacity_exhausted" || err.code === "no_host_available")
+            closingName !== null ||
+            (err instanceof ApiError &&
+              (err.code === "capacity_exhausted" || err.code === "no_host_available"))
           ) {
-            const reason: WaitingReason = err.code === "no_host_available" ? "host" : "slot";
+            const reason: WaitingReason =
+              closingName !== null
+                ? "closing"
+                : (err as ApiError).code === "no_host_available"
+                  ? "host"
+                  : "slot";
             const now = Date.now();
             // One anchor for the whole wait, even across a code flip: a
             // no_host_available bounce that turns into capacity_exhausted (or
-            // vice versa) must not reset the elapsed clock.
-            if (firstBounceAt === null) firstBounceAt = now;
-            const decision = decideCapacityRetry(
-              {
-                elapsedMs: now - firstBounceAt,
-                retryAfterSeconds: err.retryAfterSeconds,
-              },
-              reason === "host" ? MAX_NO_HOST_RETRY_WAIT_MS : undefined,
-              reason === "host" ? NO_HOST_RETRY_DELAY_MS : undefined,
-            );
+            // vice versa) must not reset the elapsed clock. The closing wait keeps
+            // its own so a stop that lands does not spend a following host wait.
+            let decision;
+            if (reason === "closing") {
+              if (firstClosingAt === null) firstClosingAt = now;
+              decision = decideCapacityRetry(
+                { elapsedMs: now - firstClosingAt },
+                MAX_CLOSING_RETRY_WAIT_MS,
+                CLOSING_RETRY_DELAY_MS,
+              );
+            } else {
+              if (firstBounceAt === null) firstBounceAt = now;
+              decision = decideCapacityRetry(
+                {
+                  elapsedMs: now - firstBounceAt,
+                  retryAfterSeconds: (err as ApiError).retryAfterSeconds,
+                },
+                reason === "host" ? MAX_NO_HOST_RETRY_WAIT_MS : undefined,
+                reason === "host" ? NO_HOST_RETRY_DELAY_MS : undefined,
+              );
+            }
             if (decision.kind === "retry") {
               if (!mountedRef.current) return;
               setWaitingForSlot(true);
@@ -224,7 +268,9 @@ export function useLaunch({
               if (waitingToastId === null) {
                 waitingToastId = addToast({
                   variant: "info",
-                  ...waitingToastCopy(reason, app.name, streamCodec),
+                  ...(closingName !== null
+                    ? closingToastCopy(closingName, app.name)
+                    : waitingToastCopy(reason as "slot" | "host", app.name, streamCodec)),
                 });
                 waitingToastReason = reason;
               }
@@ -236,7 +282,10 @@ export function useLaunch({
                 // abort only ever comes from the unmount cleanup), so the check
                 // right below returns before touching state.
               }
-              if (!mountedRef.current) return;
+              if (!mountedRef.current) {
+                dismissWaitingToast();
+                return;
+              }
               continue; // one more attempt, still inside the loop
             }
             // Gave up after the reason's own budget — fall through to the ordinary
@@ -245,7 +294,10 @@ export function useLaunch({
           dismissWaitingToast();
           launchAbortRef.current = null;
           if (!mountedRef.current) return;
-          if (err instanceof ApiError) {
+          if (closingName !== null) {
+            // The previous session never finished stopping inside the budget.
+            addToast({ variant: "danger", ...closingGaveUpCopy(closingName) });
+          } else if (err instanceof ApiError) {
             const presented = presentLaunchError(apps, app, err.code, err.message, err.sessionId);
             addToast({
               variant: presented.variant,

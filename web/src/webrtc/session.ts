@@ -355,6 +355,7 @@ export class QuasarSession {
         this.onStatus(`host error: ${msg.message ?? ""}`);
       } else if (msg.type === "bye") {
         this.onStatus("host ended the session");
+        this.onHostBye?.();
       }
     };
   }
@@ -486,6 +487,9 @@ export class QuasarSession {
   /** Signalling socket opened. Assigned after construction, like the handlers
    *  above; `ws.onopen` cannot fire before the constructor returns. */
   onSignalingOpen: (() => void) | null = null;
+
+  /** The host said `bye`: the session is ending, ask the control plane why (#753). */
+  onHostBye: (() => void) | null = null;
 
   private wsSend(obj: unknown): void {
     if (this.ws.readyState === WebSocket.OPEN) {
