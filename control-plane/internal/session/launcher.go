@@ -302,13 +302,20 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
 	var refused *ParkedClaimRefusedError
-	if p.claim != nil && errors.Is(err, ErrCapacityExhausted) {
+	var inUse *HomeInUseError
+	switch {
+	case !lp.parked && errors.As(err, &inUse) && inUse.parkedID != "":
+		// The caller's own parked Steam still holds this home: retryable like a
+		// refused claim, never a 409 the client does not retry.
+		c.supersedeParkedClaim(ctx, userID, inUse.parkedID)
+		err = &ParkedClaimRefusedError{ParkedID: inUse.parkedID}
+	case p.claim != nil && errors.Is(err, ErrCapacityExhausted):
 		// The parked session stops and the client's retry launches cold.
 		c.supersedeParkedClaim(ctx, userID, p.claim.id)
 		if !errors.As(err, &refused) {
 			err = &ParkedClaimRefusedError{ParkedID: p.claim.id}
 		}
-	} else if !lp.parked && errors.Is(err, ErrCapacityExhausted) {
+	case !lp.parked && errors.Is(err, ErrCapacityExhausted):
 		c.evictParkedFor(ctx, p)
 	}
 	if err != nil {

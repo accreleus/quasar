@@ -924,6 +924,15 @@ func TestHomeInUseNeverNamesAParkedHolder(t *testing.T) {
 	if conflict.SessionID != "" || !conflict.Stopping {
 		t.Errorf("conflict = %+v, want no session id and stopping", conflict)
 	}
+
+	// The launch guard names it to LaunchByProfile only, which answers the 503.
+	p := launchParams(f.seedIDs)
+	p.AppID, p.HomeAppID, p.ManagedHome, p.NeedEncodeSlots = f.steam, f.steam, true, 2
+	_, err = f.store.ScheduleAndCreate(context.Background(), p)
+	var inUse *HomeInUseError
+	if !errors.As(err, &inUse) || inUse.SessionID != "" || inUse.parkedID != k {
+		t.Fatalf("launch guard err = %v (%+v), want an unnamed holder carrying the parked id", err, inUse)
+	}
 }
 
 // --- shader progress -----------------------------------------------------------------

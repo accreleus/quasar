@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/storage"
 )
@@ -158,6 +159,30 @@ func TestRefusedClaimAnswersCapacityWithRetryAfter2(t *testing.T) {
 	}
 	if _, named := errObj["session_id"]; named {
 		t.Error("the refusal names a session")
+	}
+	if got := readRow(t, w.pool, k); got.State != "stopping" {
+		t.Fatalf("parked row %+v, want stopping for its stop window", got)
+	}
+
+	// The client's retry while that Steam is still stopping: the same 503, never a 409.
+	resp, body = w.do(t, http.MethodPost, "/v1/sessions", w.token, map[string]any{"app_id": w.steam, "mic": true})
+	errObj, _ = body["error"].(map[string]any)
+	if resp.StatusCode != http.StatusServiceUnavailable || errObj["code"] != "capacity_exhausted" ||
+		resp.Header.Get("Retry-After") != "2" {
+		t.Fatalf("retry while stopping = %d %v Retry-After=%q, want 503 capacity_exhausted with 2",
+			resp.StatusCode, errObj, resp.Header.Get("Retry-After"))
+	}
+
+	// Once the parked session has stopped with its cleanup proof, the launch runs cold.
+	w.coord.AgentState(context.Background(), w.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped",
+		HomeCleanupQualified: true})
+	resp, body = w.do(t, http.MethodPost, "/v1/sessions", w.token, map[string]any{"app_id": w.steam, "mic": true})
+	sess, _ := body["session"].(map[string]any)
+	if resp.StatusCode != http.StatusCreated || sess == nil {
+		t.Fatalf("launch after the stop = %d %v, want 201", resp.StatusCode, body)
+	}
+	if a := w.disp.assignFor(t, sess["id"].(string)); a.AdoptSessionID != "" {
+		t.Errorf("assign adopts %q, want a cold launch", a.AdoptSessionID)
 	}
 }
 
