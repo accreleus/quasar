@@ -4,9 +4,10 @@ use quasar_launch_watch::{
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const APPID: u32 = 730;
-/// Past the core's two seconds for a wait for the user to stand.
+/// Past the core's two seconds for a wait for the user to stand; tests step the clock, not sleep.
 const PAST_USER_WAIT: std::time::Duration = std::time::Duration::from_millis(2100);
 const STEAM: &[&str] = &[
     "/home/gamer/.local/share/Steam/ubuntu12_64/steam",
@@ -710,9 +711,9 @@ fn waiting_for_user_response_reports_once_and_clears() {
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
     assert_eq!(rig.watcher.poll(), vec![]);
-    std::thread::sleep(PAST_USER_WAIT);
+    let later = Instant::now() + PAST_USER_WAIT;
     assert_eq!(
-        rig.watcher.poll(),
+        rig.watcher.poll_at(later),
         vec![Report::SteamNeedsUser(NeedsUser::CloudConflict)]
     );
     assert_eq!(rig.watcher.poll(), vec![]);
@@ -726,9 +727,9 @@ fn waiting_for_user_response_reports_once_and_clears() {
         "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to SiteLicenseSeatCheckout \"\""
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
-    std::thread::sleep(PAST_USER_WAIT);
+    let later = Instant::now() + PAST_USER_WAIT;
     assert_eq!(
-        rig.watcher.poll(),
+        rig.watcher.poll_at(later),
         vec![Report::SteamNeedsUser(NeedsUser::Other)]
     );
 }
@@ -749,8 +750,8 @@ fn a_wait_answered_within_two_seconds_reports_nothing_across_polls() {
         "GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to WaitingGameWindow"
     ));
     assert_eq!(rig.watcher.poll(), vec![]);
-    std::thread::sleep(PAST_USER_WAIT);
-    assert_eq!(rig.watcher.poll(), vec![]);
+    let later = Instant::now() + PAST_USER_WAIT;
+    assert_eq!(rig.watcher.poll_at(later), vec![]);
 }
 
 #[test]
@@ -770,9 +771,9 @@ fn the_game_starting_or_going_ends_a_wait_for_the_user() {
         rig.watcher.poll(),
         vec![Report::LaunchState(LaunchState::GameRunning)]
     );
-    std::thread::sleep(PAST_USER_WAIT);
+    let later = Instant::now() + PAST_USER_WAIT;
     assert_eq!(
-        rig.watcher.poll(),
+        rig.watcher.poll_at(later),
         vec![],
         "the game starting ended the wait"
     );
@@ -784,8 +785,8 @@ fn the_game_starting_or_going_ends_a_wait_for_the_user() {
         rig.watcher.poll(),
         vec![Report::LaunchState(LaunchState::GameExited)]
     );
-    std::thread::sleep(PAST_USER_WAIT);
-    assert_eq!(rig.watcher.poll(), vec![]);
+    let later = Instant::now() + PAST_USER_WAIT;
+    assert_eq!(rig.watcher.poll_at(later), vec![]);
 }
 
 #[test]
@@ -803,9 +804,9 @@ fn routine_waits_never_report_however_long_they_stand() {
             rig
         })
         .collect();
-    std::thread::sleep(PAST_USER_WAIT);
+    let later = Instant::now() + PAST_USER_WAIT;
     for rig in &mut rigs {
-        assert_eq!(rig.watcher.poll(), vec![]);
+        assert_eq!(rig.watcher.poll_at(later), vec![]);
     }
 }
 
@@ -999,8 +1000,8 @@ fn an_unreadable_previous_is_abandoned(through_a_symlink: bool) {
         vec![Report::LaunchState(LaunchState::GameRunning)],
         "the new file is read in the same pass"
     );
-    std::thread::sleep(PAST_USER_WAIT);
-    assert_eq!(rig.watcher.poll(), vec![]);
+    let later = Instant::now() + PAST_USER_WAIT;
+    assert_eq!(rig.watcher.poll_at(later), vec![]);
 }
 
 #[test]
@@ -1079,6 +1080,46 @@ fn steam_waiting_for_credentials_needs_a_sign_in_until_a_later_state() {
     rig.login_state("WaitingForServerResponse");
     assert_eq!(rig.watcher.poll(), vec![]);
     // Signed out again (a wrong password, say): reported again.
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+}
+
+#[test]
+fn a_login_state_with_nothing_after_it_clears_the_sign_in() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+    // Trailing space, nothing after: a state that is not WaitingForCredentials.
+    rig.append("steamui_login.txt", "[ None ] SetLoginState: \n");
+    assert_eq!(rig.watcher.poll(), vec![]);
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+}
+
+#[test]
+fn a_login_line_over_64_kib_is_dropped_and_the_next_one_is_read() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+
+    let long = format!(
+        "SetLoginState: WaitingForCredentials {}\n",
+        "x".repeat(70 * 1024)
+    );
+    rig.append("steamui_login.txt", &long);
+    assert_eq!(rig.watcher.poll(), vec![], "the long line is not parsed");
     rig.login_state("WaitingForCredentials");
     assert_eq!(
         rig.watcher.poll(),

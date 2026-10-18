@@ -122,14 +122,10 @@ pub struct Watcher {
     windows: Box<dyn Windows + Send>,
     first_poll: bool,
     state: LaunchState,
-    log_offset: u64,
-    log_file_id: Option<u64>,
-    log_seen: bool,
-    log_pending: Vec<u8>,
+    console: LogTail,
     log_game: Option<bool>,
     /// A wait for the user read from the log, and when it was read.
     log_waiting: Option<(NeedsUser, Instant)>,
-    log_discarding: bool,
     login: LoginLog,
     running_via_reaper: bool,
     last_game_window: bool,
@@ -138,19 +134,23 @@ pub struct Watcher {
 
 impl Watcher {
     pub fn new(cfg: WatchConfig, windows: Box<dyn Windows + Send>) -> Self {
+        let console = LogTail::new(
+            cfg.steam_log_dir.join("console_log.txt"),
+            Some(cfg.steam_log_dir.join("console_log.txt.previous")),
+        );
+        let login = LoginLog {
+            tail: LogTail::new(cfg.steam_log_dir.join("steamui_login.txt"), None),
+            needs: None,
+        };
         Self {
             cfg,
             windows,
             first_poll: true,
             state: LaunchState::Starting,
-            log_offset: 0,
-            log_file_id: None,
-            log_seen: false,
-            log_pending: Vec::new(),
+            console,
             log_game: None,
             log_waiting: None,
-            log_discarding: false,
-            login: LoginLog::default(),
+            login,
             running_via_reaper: false,
             last_game_window: false,
             active_needs: None,
@@ -161,6 +161,11 @@ impl Watcher {
     /// Returns only CHANGES since the last call, in order. Never panics on odd input;
     /// an unreadable source is skipped for that pass.
     pub fn poll(&mut self) -> Vec<Report> {
+        self.poll_at(Instant::now())
+    }
+
+    /// `poll` with the clock passed in, so a test can step past [`USER_WAIT`] without sleeping.
+    pub fn poll_at(&mut self, now: Instant) -> Vec<Report> {
         let mut reports = Vec::new();
 
         if self.first_poll {
@@ -172,7 +177,7 @@ impl Watcher {
         if scan.reaper_alive {
             self.running_via_reaper = true;
         }
-        self.read_log_tail();
+        self.read_console_log(now);
         self.read_login_state();
 
         let next = self.next_launch_state(&scan);
@@ -196,7 +201,7 @@ impl Watcher {
                 // The higher-ranked of the window and log reasons wins.
                 let desired = [
                     classify_windows(&windows, self.cfg.appid),
-                    self.held_log_needs(),
+                    self.held_log_needs(now),
                 ]
                 .into_iter()
                 .flatten()
@@ -207,7 +212,7 @@ impl Watcher {
                 // The mapped list is skipped for this pass: no window-derived
                 // reason changes, but a log-derived wait-for-user can still
                 // be reported.
-                if let Some(reason) = self.held_log_needs() {
+                if let Some(reason) = self.held_log_needs(now) {
                     self.update_needs(Some(reason), &mut reports);
                 }
             }
@@ -216,10 +221,10 @@ impl Watcher {
         reports
     }
 
-    fn held_log_needs(&self) -> Option<NeedsUser> {
+    fn held_log_needs(&self, now: Instant) -> Option<NeedsUser> {
         let wait = self
             .log_waiting
-            .filter(|(_, since)| since.elapsed() >= USER_WAIT)
+            .filter(|(_, since)| now.saturating_duration_since(*since) >= USER_WAIT)
             .map(|(reason, _)| reason);
         [wait, self.login.needs]
             .into_iter()
@@ -229,37 +234,10 @@ impl Watcher {
 
     /// Steam waiting for credentials is its sign-in screen, which under Big Picture has no
     /// window of its own; any later login state clears it. #723: 75 of 76 signed-out starts
-    /// logged `SetLoginState: WaitingForCredentials`, none of 38 signed-in ones. Started at
-    /// the first poll's end like `console_log.txt`; a rotated tail is not chased.
+    /// logged `SetLoginState: WaitingForCredentials`, none of 38 signed-in ones. Tailed like
+    /// `console_log.txt`, but a rotated tail is not chased.
     fn read_login_state(&mut self) {
-        let path = self.cfg.steam_log_dir.join("steamui_login.txt");
-        let metadata = std::fs::metadata(&path);
-        if !self.login.seen {
-            self.login.seen = true;
-            if let Ok(seen) = &metadata {
-                self.login.file_id = Some(seen.ino());
-                self.login.offset = seen.len();
-            }
-            return;
-        }
-        let Ok(metadata) = metadata else {
-            return;
-        };
-        if self.login.file_id != Some(metadata.ino()) || metadata.len() < self.login.offset {
-            self.login.file_id = Some(metadata.ino());
-            self.login.offset = 0;
-        }
-        let Some(bytes) = read_slice(&path, self.login.offset) else {
-            return;
-        };
-        // Whole lines only: a partial one is read again next pass, unless it fills the slice.
-        let end = match bytes.iter().rposition(|b| *b == b'\n') {
-            Some(newline) => newline + 1,
-            None if bytes.len() as u64 == MAX_LOG_BYTES_PER_PASS => bytes.len(),
-            None => return,
-        };
-        self.login.offset += end as u64;
-        for line in String::from_utf8_lossy(&bytes[..end]).lines() {
+        for line in self.login.tail.read().0 {
             if let Some(at) = line.find("SetLoginState: ") {
                 self.login.needs = line[at + "SetLoginState: ".len()..]
                     .starts_with("WaitingForCredentials")
@@ -315,110 +293,18 @@ impl Watcher {
         }
     }
 
-    fn read_log_tail(&mut self) {
-        let path = self.cfg.steam_log_dir.join("console_log.txt");
-        let previous = self.cfg.steam_log_dir.join("console_log.txt.previous");
-        let metadata = std::fs::metadata(&path);
-
-        // Decided on the first poll, not the first sighting: the home
-        // persists between sessions and the helper polls before Steam
-        // starts, so a file already present at the first poll predates this
-        // session and starts at its end; a file created later is this
-        // session's and is read from 0 (the inode check below sees
-        // None != Some(new inode) and restarts it). Only a new file
-        // (rotation) or a shorter one (truncation) restarts at 0 after that.
-        // Steam rotates by size to `console_log.txt.previous` (#723): the
-        // rest of the file being read is finished there first, keeping what
-        // was learnt from it.
-        if !self.log_seen {
-            self.log_seen = true;
-            if let Ok(seen) = &metadata {
-                self.log_file_id = Some(seen.ino());
-                self.log_offset = seen.len();
-            }
-            return;
+    fn read_console_log(&mut self, now: Instant) {
+        let (lines, forgot) = self.console.read();
+        if forgot {
+            self.log_game = None;
+            self.log_waiting = None;
         }
-        let Ok(metadata) = metadata else {
-            return;
-        };
-        let file_id = metadata.ino();
-        if self.log_file_id != Some(file_id) {
-            match std::fs::metadata(&previous) {
-                Ok(old) if self.log_file_id == Some(old.ino()) => {
-                    let unread = old.len() > self.log_offset;
-                    if unread && self.read_log_from(&previous) {
-                        return;
-                    }
-                    // A tail that cannot be read is abandoned, with what it might have
-                    // changed, so the new file is never held back behind it.
-                    if unread {
-                        self.reset_log();
-                    } else {
-                        self.restart_log();
-                    }
-                }
-                _ => self.reset_log(),
-            }
-            self.log_file_id = Some(file_id);
+        for line in lines {
+            self.parse_log_line(line.trim_end(), now);
         }
-        if metadata.len() < self.log_offset {
-            self.reset_log();
-        }
-        if metadata.len() == self.log_offset {
-            return;
-        }
-        self.read_log_from(&path);
     }
 
-    /// One bounded slice of `path` from the current offset, parsed line by line; the rest
-    /// is read on the next pass. `false` when nothing could be read.
-    fn read_log_from(&mut self, path: &Path) -> bool {
-        let Some(bytes) = read_slice(path, self.log_offset).filter(|b| !b.is_empty()) else {
-            return false;
-        };
-        self.log_offset += bytes.len() as u64;
-        self.log_pending.extend_from_slice(&bytes);
-
-        while let Some(newline) = self.log_pending.iter().position(|b| *b == b'\n') {
-            let raw: Vec<u8> = self.log_pending.drain(..=newline).collect();
-            if self.log_discarding {
-                // The tail of a dropped over-long line ends here.
-                self.log_discarding = false;
-                continue;
-            }
-            if raw.len() <= MAX_LOG_LINE_BYTES {
-                let line = String::from_utf8_lossy(&raw);
-                self.parse_log_line(line.trim_end());
-            }
-        }
-        if self.log_discarding {
-            // Still inside the dropped line: drop what arrived, keep waiting
-            // for its newline.
-            self.log_pending.clear();
-        } else if self.log_pending.len() > MAX_LOG_LINE_BYTES {
-            // A partial line that grows past the cap is dropped, not buffered
-            // forever on input the game controls, and its tail is ignored
-            // up to and including its newline.
-            self.log_pending.clear();
-            self.log_discarding = true;
-        }
-        true
-    }
-
-    /// A truncated or unknown file: what was learnt from the old one no longer holds.
-    fn reset_log(&mut self) {
-        self.restart_log();
-        self.log_game = None;
-        self.log_waiting = None;
-    }
-
-    fn restart_log(&mut self) {
-        self.log_offset = 0;
-        self.log_pending.clear();
-        self.log_discarding = false;
-    }
-
-    fn parse_log_line(&mut self, line: &str) {
+    fn parse_log_line(&mut self, line: &str, now: Instant) {
         // Exact spacing varies by client build (`Game process added : AppID`
         // beside `Game process removed: AppID` in the research notes), so the
         // phrases are matched without their colon and the id is taken from
@@ -459,7 +345,7 @@ impl Watcher {
                     } else {
                         NeedsUser::Other
                     };
-                    (reason, Instant::now())
+                    (reason, now)
                 });
             } else if line.contains("LaunchApp continues with user response")
                 || line.contains("LaunchApp changed task to")
@@ -490,13 +376,157 @@ fn read_slice(path: &Path, offset: u64) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Where `steamui_login.txt` is read from, and the sign-in its last state means.
-#[derive(Default)]
+/// `steamui_login.txt` and the sign-in its last state means.
 struct LoginLog {
-    seen: bool,
-    file_id: Option<u64>,
-    offset: u64,
+    tail: LogTail,
     needs: Option<NeedsUser>,
+}
+
+/// An incremental reader of one Steam log: whole lines out (line ending stripped, nothing
+/// else), the rest kept for the next pass. Lines over 64 KiB are dropped for every log it
+/// reads. A rewrite in place of bytes already consumed (same inode, not shorter) is not
+/// detected.
+struct LogTail {
+    path: PathBuf,
+    /// Where Steam rotates this log to; its unread rest is finished before the new file.
+    previous: Option<PathBuf>,
+    seen: bool,
+    offset: u64,
+    file_id: Option<u64>,
+    pending: Vec<u8>,
+    discarding: bool,
+}
+
+impl LogTail {
+    fn new(path: PathBuf, previous: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            previous,
+            seen: false,
+            offset: 0,
+            file_id: None,
+            pending: Vec::new(),
+            discarding: false,
+        }
+    }
+
+    /// The lines that arrived since the last call, and whether the tail followed a file it
+    /// cannot connect to the one before (truncated or unknown): whatever the caller learnt
+    /// from the old one no longer holds. `forgot` is decided before any line of the pass.
+    fn read(&mut self) -> (Vec<String>, bool) {
+        let mut lines = Vec::new();
+        let mut forgot = false;
+        self.read_pass(&mut lines, &mut forgot);
+        (lines, forgot)
+    }
+
+    fn read_pass(&mut self, lines: &mut Vec<String>, forgot: &mut bool) {
+        let metadata = std::fs::metadata(&self.path);
+
+        // Decided on the first poll, not the first sighting: the home
+        // persists between sessions and the helper polls before Steam
+        // starts, so a file already present at the first poll predates this
+        // session and starts at its end; a file created later is this
+        // session's and is read from 0 (the inode check below sees
+        // None != Some(new inode) and restarts it). Only a new file
+        // (rotation) or a shorter one (truncation) restarts at 0 after that.
+        // Steam rotates by size to `console_log.txt.previous` (#723): the
+        // rest of the file being read is finished there first, keeping what
+        // was learnt from it.
+        if !self.seen {
+            self.seen = true;
+            if let Ok(seen) = &metadata {
+                self.file_id = Some(seen.ino());
+                self.offset = seen.len();
+            }
+            return;
+        }
+        let Ok(metadata) = metadata else {
+            return;
+        };
+        let file_id = metadata.ino();
+        if self.file_id != Some(file_id) {
+            let old = self
+                .previous
+                .as_ref()
+                .and_then(|previous| std::fs::metadata(previous).ok());
+            match old {
+                Some(old) if self.file_id == Some(old.ino()) => {
+                    let unread = old.len() > self.offset;
+                    if unread && self.read_from(true, lines) {
+                        return;
+                    }
+                    // A tail that cannot be read is abandoned, with what it might have
+                    // changed, so the new file is never held back behind it.
+                    if unread {
+                        self.reset(forgot);
+                    } else {
+                        self.restart();
+                    }
+                }
+                _ => self.reset(forgot),
+            }
+            self.file_id = Some(file_id);
+        }
+        if metadata.len() < self.offset {
+            self.reset(forgot);
+        }
+        if metadata.len() == self.offset {
+            return;
+        }
+        self.read_from(false, lines);
+    }
+
+    /// One bounded slice of the log (or of `previous`) from the current offset, split into
+    /// lines; the rest is read on the next pass. `false` when nothing could be read.
+    fn read_from(&mut self, previous: bool, lines: &mut Vec<String>) -> bool {
+        let path = match (&self.previous, previous) {
+            (Some(previous), true) => previous,
+            _ => &self.path,
+        };
+        let Some(bytes) = read_slice(path, self.offset).filter(|b| !b.is_empty()) else {
+            return false;
+        };
+        self.offset += bytes.len() as u64;
+        self.pending.extend_from_slice(&bytes);
+
+        while let Some(newline) = self.pending.iter().position(|b| *b == b'\n') {
+            let raw: Vec<u8> = self.pending.drain(..=newline).collect();
+            if self.discarding {
+                // The tail of a dropped over-long line ends here.
+                self.discarding = false;
+                continue;
+            }
+            if raw.len() <= MAX_LOG_LINE_BYTES {
+                let line = String::from_utf8_lossy(&raw);
+                let line = line.strip_suffix('\n').unwrap_or(&line);
+                lines.push(line.strip_suffix('\r').unwrap_or(line).to_owned());
+            }
+        }
+        if self.discarding {
+            // Still inside the dropped line: drop what arrived, keep waiting
+            // for its newline.
+            self.pending.clear();
+        } else if self.pending.len() > MAX_LOG_LINE_BYTES {
+            // A partial line that grows past the cap is dropped, not buffered
+            // forever on input the game controls, and its tail is ignored
+            // up to and including its newline.
+            self.pending.clear();
+            self.discarding = true;
+        }
+        true
+    }
+
+    fn reset(&mut self, forgot: &mut bool) {
+        self.restart();
+        *forgot = true;
+    }
+
+    fn restart(&mut self) {
+        self.offset = 0;
+        self.pending.clear();
+        self.discarding = false;
+    }
 }
 
 fn extract_appid(line: &str) -> Option<u32> {
