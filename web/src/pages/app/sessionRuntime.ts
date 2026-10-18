@@ -187,6 +187,8 @@ export interface TransportLike {
   onAudioTrack: ((stream: MediaStream) => void) | null;
   /** The signalling WebSocket opened. Optional so a fake need not carry it. */
   onSignalingOpen?: (() => void) | null;
+  /** The host's `bye`. Optional so a fake need not carry it. */
+  onHostBye?: (() => void) | null;
   onWebRtcStateChange:
     | ((kind: "ice" | "connection", from: string, to: string) => void)
     | null;
@@ -854,6 +856,8 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       });
 
       transport.onSignalingOpen = () => set({ wsOpen: true });
+      // #753: a game exit says `bye` seconds before media stalling would tell us.
+      transport.onHostBye = () => cfg.callbacks.onDisconnectSuspected();
 
       transport.onWebRtcStateChange = (kind, from, to) => {
         tracer?.emitWebRtcStateChanged(kind, from, to);

@@ -366,3 +366,17 @@ describe("QuasarSession offers for one pc (#535)", () => {
     expect(video.calls.filter((c) => c.startsWith("setRemote"))).toEqual(["setRemote A"]);
   });
 });
+
+describe("QuasarSession — the host's bye (#753)", () => {
+  it("reports it once, and nothing else does", async () => {
+    const { session, ws, video } = startSession();
+    const bye = vi.fn();
+    session.onHostBye = bye;
+    ws.deliver(offer("A"));
+    ws.deliver({ type: "error", message: "x" });
+    await video.drain();
+    expect(bye).not.toHaveBeenCalled();
+    ws.deliver({ type: "bye" });
+    expect(bye).toHaveBeenCalledTimes(1);
+  });
+});

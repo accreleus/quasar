@@ -118,7 +118,9 @@ export function BandNotes({
           <div>
             {waitingReason === "host"
               ? "No host is available right now, waiting for one to come online…"
-              : "All capacity is in use right now, waiting for a slot to free up…"}
+              : waitingReason === "closing"
+                ? "Your previous game is still closing and saving, launching as soon as it has finished…"
+                : "All capacity is in use right now, waiting for a slot to free up…"}
           </div>
         </div>
       )}
