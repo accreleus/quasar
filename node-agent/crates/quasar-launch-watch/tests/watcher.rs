@@ -790,23 +790,91 @@ fn the_game_starting_or_going_ends_a_wait_for_the_user() {
 }
 
 #[test]
-fn routine_waits_never_report_however_long_they_stand() {
-    let mut rigs: Vec<Rig> = ["CreatingProcess", "ShowInterstitials", "ProcessingShaderCache"]
-        .into_iter()
-        .map(|task| {
-            let mut rig = Rig::new();
-            write_proc(&rig.proc_root, 100, STEAM);
-            rig.watcher.poll();
-            rig.append_log(&format!(
-                "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to {task} \"\""
-            ));
-            assert_eq!(rig.watcher.poll(), vec![], "{task}");
-            rig
-        })
-        .collect();
+fn a_creating_process_wait_never_reports_however_long_it_stands() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to CreatingProcess \"\""
+    ));
+    assert_eq!(rig.watcher.poll(), vec![]);
     let later = Instant::now() + PAST_USER_WAIT;
-    for rig in &mut rigs {
-        assert_eq!(rig.watcher.poll_at(later), vec![]);
+    assert_eq!(rig.watcher.poll_at(later), vec![]);
+}
+
+/// #755: Steam's own controller notice (`ShowInterstitials`) and shader dialog
+/// (`ProcessingShaderCache`) stand unanswered for minutes. Replays the lines of that launch
+/// (appid and times as measured) onto a persistent home's log with an earlier session in it.
+#[test]
+fn steams_own_notice_and_shader_waits_reveal_after_the_grace() {
+    let wait = |task: &str| {
+        format!(
+            "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to {task} \"\""
+        )
+    };
+    let changed = |task: &str| {
+        format!("GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to {task} \"\"")
+    };
+    let mut rig = Rig::new();
+    // An earlier session of the same home: its Steam answered both waits and the game ran.
+    std::fs::write(
+        rig.log_path(),
+        [
+            wait("ShowInterstitials"),
+            format!("GameAction [AppID {APPID}, ActionID 1] : LaunchApp continues with user response \"ShowInterstitials\""),
+            wait("ProcessingShaderCache"),
+            format!("Game process added : AppID {APPID} \"game\", ProcID 201, IP 0.0.0.0:0"),
+            format!("Game process removed: AppID {APPID} \"game\", ProcID 201"),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    rig.watcher.poll();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.watcher.poll();
+
+    let t0 = Instant::now();
+    rig.append_log(&changed("SynchronizingStats"));
+    rig.append_log(&changed("ShowInterstitials"));
+    rig.append_log(&wait("ShowInterstitials"));
+    assert_eq!(rig.watcher.poll_at(t0), vec![]);
+    // The user has had two seconds and Steam has not moved on: it is the notice.
+    assert_eq!(
+        rig.watcher.poll_at(t0 + PAST_USER_WAIT),
+        vec![Report::SteamNeedsUser(NeedsUser::Other)]
+    );
+    assert_eq!(rig.watcher.poll_at(t0 + PAST_USER_WAIT * 40), vec![]);
+
+    // Answered: the next wait is a new one and reports again.
+    let t1 = t0 + PAST_USER_WAIT * 41;
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 1] : LaunchApp continues with user response \"ShowInterstitials\""
+    ));
+    rig.append_log(&changed("ProcessingShaderCache"));
+    rig.append_log(&wait("ProcessingShaderCache"));
+    assert_eq!(rig.watcher.poll_at(t1), vec![]);
+    assert_eq!(
+        rig.watcher.poll_at(t1 + PAST_USER_WAIT),
+        vec![Report::SteamNeedsUser(NeedsUser::Other)]
+    );
+}
+
+#[test]
+fn a_notice_or_shader_wait_that_continues_at_once_reports_nothing() {
+    for task in ["ShowInterstitials", "ProcessingShaderCache"] {
+        let mut rig = Rig::new();
+        write_proc(&rig.proc_root, 100, STEAM);
+        rig.watcher.poll();
+        let t0 = Instant::now();
+        rig.append_log(&format!(
+            "GameAction [AppID {APPID}, ActionID 1] : LaunchApp waiting for user response to {task} \"\""
+        ));
+        assert_eq!(rig.watcher.poll_at(t0), vec![], "{task}");
+        rig.append_log(&format!(
+            "GameAction [AppID {APPID}, ActionID 1] : LaunchApp continues with user response \"{task}\""
+        ));
+        assert_eq!(rig.watcher.poll_at(t0 + PAST_USER_WAIT), vec![], "{task}");
     }
 }
 
