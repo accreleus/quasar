@@ -774,9 +774,12 @@ function SessionPageBody() {
   const revealReady =
     channelOpen && appPresented && (!launchFailure || showsAfterReveal(launchFailure));
   // Layout, not passive: set synchronously at commit, before any network callback can run.
+  // The sound flips with the picture; a runtime built after the reveal (a replacement
+  // transport) is released here too, since `runtimeSnap` changes when it is.
   useLayoutEffect(() => {
     if (revealReady) revealStartedRef.current = true;
-  }, [revealReady]);
+    if (revealStartedRef.current) runtimeRef.current?.releaseAudio();
+  }, [revealReady, runtimeSnap]);
   const [loaderInert, setLoaderInert] = useState(false);
   const [loaderDone, setLoaderDone] = useState(false);
   const loaderTimersRef = useRef<ReturnType<typeof setTimeout>[] | null>(null);

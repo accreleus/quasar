@@ -1060,3 +1060,30 @@ describe("snapshot notification dedupe (#78)", () => {
     expect(h.runtime.getSnapshot().displayRefreshHz).toBe(59);
   });
 });
+
+describe("session sound", () => {
+  const audioEl = () => document.body.querySelector("audio");
+
+  it("stays muted until the reveal releases it, then follows the runtime's life", () => {
+    const h = harness();
+    h.runtime.start();
+    h.transport.onAudioTrack?.({} as MediaStream);
+    // Steam's startup sound plays under the loading screen; it must not be heard.
+    expect(audioEl()?.muted).toBe(true);
+
+    h.runtime.releaseAudio();
+    expect(audioEl()?.muted).toBe(false);
+
+    h.runtime.destroy();
+    expect(audioEl()).toBeNull();
+  });
+
+  it("plays a track that arrives after the reveal at once", () => {
+    const h = harness();
+    h.runtime.start();
+    h.runtime.releaseAudio();
+    h.transport.onAudioTrack?.({} as MediaStream);
+    expect(audioEl()?.muted).toBe(false);
+    h.runtime.destroy();
+  });
+});
