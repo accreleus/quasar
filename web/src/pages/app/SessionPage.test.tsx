@@ -833,28 +833,37 @@ describe("SessionPage — #484 app-boot loader gate", () => {
     await waitFor(() => expect(document.querySelector(".sl-root")).toBeNull());
   });
 
-  it("keeps the session's sound muted until the reveal", async () => {
+  it("keeps the session's sound muted until the loader turns see-through", async () => {
     const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
-    currentSession = makeSession({ state: "running", state_detail: "app booting" });
+    const audio = () => document.body.querySelector("audio");
+    // As intoTheReveal below: the app has presented, so the channel opening starts the reveal.
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
     renderPage();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
     await act(async () => {
-      openChannel();
       (lastTransport?.onAudioTrack as (s: MediaStream) => void)({} as MediaStream);
     });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1_000);
-    });
     // Steam's startup sound plays under the loader; the player must not hear it.
-    expect(document.body.querySelector("audio")?.muted).toBe(true);
+    expect(audio()?.muted).toBe(true);
 
-    currentSession = makeSession({ state: "running", state_detail: "app presented" });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(1_000);
+      openChannel();
     });
-    await waitFor(() => expect(document.body.querySelector("audio")?.muted).toBe(false));
+    // The reveal has begun, but the loader's lock animation is opaque until LOCK_TO_STREAM_MS.
+    for (let t = 0; t < 1_000; t += 100) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+    }
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    expect(audio()?.muted).toBe(true);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(audio()?.muted).toBe(false);
     play.mockRestore();
   });
 

@@ -487,6 +487,8 @@ function SessionPageBody() {
     // Unmute on user gesture (browsers require it for audio autoplay).
     videoRef.current.muted = false;
     void videoRef.current.play();
+    // The session's sound too, once revealed: a reload with no click has no activation to unmute it.
+    if (revealStartedRef.current) runtimeRef.current?.releaseAudio();
 
     // Synchronous truth, not last-rendered state — a gesture handler must not
     // read a stale render (sessionRuntime.isCaptured).
@@ -774,12 +776,9 @@ function SessionPageBody() {
   const revealReady =
     channelOpen && appPresented && (!launchFailure || showsAfterReveal(launchFailure));
   // Layout, not passive: set synchronously at commit, before any network callback can run.
-  // The sound flips with the picture; a runtime built after the reveal (a replacement
-  // transport) is released here too, since `runtimeSnap` changes when it is.
   useLayoutEffect(() => {
     if (revealReady) revealStartedRef.current = true;
-    if (revealStartedRef.current) runtimeRef.current?.releaseAudio();
-  }, [revealReady, runtimeSnap]);
+  }, [revealReady]);
   const [loaderInert, setLoaderInert] = useState(false);
   const [loaderDone, setLoaderDone] = useState(false);
   const loaderTimersRef = useRef<ReturnType<typeof setTimeout>[] | null>(null);
@@ -795,6 +794,12 @@ function SessionPageBody() {
       ];
     }
   }, [revealReady]);
+  // The sound flips with the picture: the loader turns see-through at `loaderInert`, not at
+  // `revealReady` (its lock animation is opaque). `runtimeSnap` re-runs this for a runtime
+  // built after the reveal (a replacement transport).
+  useEffect(() => {
+    if (loaderInert) runtimeRef.current?.releaseAudio();
+  }, [loaderInert, runtimeSnap]);
   useEffect(
     () => () => {
       loaderTimersRef.current?.forEach(clearTimeout);
