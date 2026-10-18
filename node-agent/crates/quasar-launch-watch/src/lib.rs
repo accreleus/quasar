@@ -37,11 +37,11 @@ const MAX_LOG_LINE_BYTES: usize = 64 * 1024;
 /// A `waiting for user response` means Steam needs the user only when no next task follows
 /// within this. Measured by the #723 spike: routine waits continued within 0.11 s (70/70).
 const USER_WAIT: Duration = Duration::from_secs(2);
-/// The one wait that never needs the user. `ShowInterstitials` (Steam's controller notice) and
-/// `ProcessingShaderCache` (its shader dialog, with progress and a Skip button) continue at
-/// once when there is nothing to show and stand for minutes when there is (#755): USER_WAIT
-/// tells the two apart, so they are not listed here.
-const ROUTINE_WAITS: [&str; 1] = ["CreatingProcess"];
+/// Waits that never need the user. `CreatingProcess` always continued at once (#723); the shader
+/// cache clears itself, 0.16 to 17.4 s measured (#723), so Steam's shader dialog is not shown for
+/// it (the reveal cap still ends a long run). `ShowInterstitials`, Steam's controller notice,
+/// stands until answered (#755), so it is not listed: USER_WAIT tells it from a quick one.
+const ROUTINE_WAITS: [&str; 2] = ["CreatingProcess", "ProcessingShaderCache"];
 
 /// Mirrors agent-api `session_metrics.app_launch_state`; serialises to the same strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
