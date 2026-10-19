@@ -165,7 +165,9 @@ describe("HostSettings", () => {
     } as never);
     renderPage();
     expect(await screen.findByText(/The legacy writer remains active/)).toBeTruthy();
-    expect(screen.getByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeTruthy();
+    // The legacy row appears one render AFTER the remedy: the panel reports
+    // ownership from an effect and the page re-renders on it.
+    expect(await screen.findByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Save next-session settings" })).toBeNull();
   });
 
