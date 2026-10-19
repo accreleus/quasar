@@ -177,6 +177,40 @@ describe("useSwapTransition", () => {
     expect(onToast).not.toHaveBeenCalled();
   });
 
+  it("a GET still in flight from swap 1 changes nothing once swap 2 has started", async () => {
+    let release: (v: unknown) => void = () => {};
+    let calls = 0;
+    getSession.mockImplementation(() => {
+      calls++;
+      // Swap 1's second GET hangs, then resolves as a commit once swap 2 is under way.
+      return calls === 2 ? new Promise((r) => (release = r)) : Promise.resolve(session("running", "swapping"));
+    });
+    const onCommitted = vi.fn();
+    const onToast = vi.fn();
+    const { result } = renderHook(() =>
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted, onToast }),
+    );
+
+    act(() => result.current.startSwap({ id: "a2", name: "First App" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(calls).toBe(2);
+    act(() => result.current.startSwap({ id: "a3", name: "Second App" }));
+    await act(async () => {});
+
+    await act(async () => release(session("running", "swap complete", "a2")));
+    expect(onCommitted).not.toHaveBeenCalled();
+    expect(onToast).not.toHaveBeenCalled();
+    expect(result.current.transition).toEqual({ phase: "switching", appName: "Second App" });
+
+    const before = calls;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(calls).toBeGreaterThan(before); // swap 2 is still being polled
+  });
+
   it("commits and clears at once when the first confirmation is 'app presented'", async () => {
     getSession
       .mockResolvedValueOnce(session("running", "swapping"))

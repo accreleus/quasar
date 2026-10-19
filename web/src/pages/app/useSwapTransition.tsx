@@ -73,15 +73,16 @@ export function useSwapTransition({
 }: UseSwapTransitionArgs): UseSwapTransitionResult {
   const [transition, setTransition] = useState<SwapTransitionState | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Guards a tick whose GET outlives clearInterval when superseded/torn down.
-  const activeRef = useRef(false);
+  // The live swap's token. A tick whose GET outlives its swap (superseded, torn
+  // down) compares against its own token, so it cannot act on a later swap.
+  const activeRef = useRef<object | null>(null);
 
   const stopPolling = useCallback(() => {
     if (intervalRef.current != null) {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
-    activeRef.current = false;
+    activeRef.current = null;
   }, []);
 
   // Must not let a late tick setState after unmount, nor leave an interval running.
@@ -92,7 +93,8 @@ export function useSwapTransition({
       // Supersede any stray previous poll — the rail disables every tile while
       // one swap is in flight, so this is defensive, not a normal path.
       stopPolling();
-      activeRef.current = true;
+      const me = {};
+      activeRef.current = me;
       setTransition({ phase: "switching", appName: target.name });
 
       const deadline = Date.now() + CLIENT_SWAP_TIMEOUT_MS;
@@ -123,7 +125,7 @@ export function useSwapTransition({
       );
 
       const tick = async () => {
-        if (!activeRef.current) return;
+        if (activeRef.current !== me) return;
         if (!authToken || !sessionId) {
           stopPolling();
           return;
@@ -146,7 +148,7 @@ export function useSwapTransition({
         }
         try {
           const { session } = await getSession(authToken, sessionId);
-          if (!activeRef.current) return; // cancelled/superseded while this GET was in flight
+          if (activeRef.current !== me) return; // cancelled/superseded while this GET was in flight
           if (committed) {
             // Anything but booting (presented, ended, odd detail) lets the stream show.
             if (session.state === "running" && session.state_detail === "app booting") {
