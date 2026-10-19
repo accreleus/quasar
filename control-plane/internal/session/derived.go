@@ -76,6 +76,12 @@ func composeSteamFlags(externalID string) (string, error) {
 // It touches `env` and nothing else, and only ever runs for a derived app, so
 // the byte-identical guarantee in runtime_preset.go is unaffected.
 func injectSteamFlags(runtimeSpec []byte, flags string) ([]byte, error) {
+	return setSpecEnv(runtimeSpec, steamStartupFlagsKey, &flags)
+}
+
+// setSpecEnv sets one `env` key, or deletes it when value is nil. Every other
+// field is preserved semantically.
+func setSpecEnv(runtimeSpec []byte, key string, value *string) ([]byte, error) {
 	spec := map[string]any{}
 	if len(runtimeSpec) > 0 {
 		if err := json.Unmarshal(runtimeSpec, &spec); err != nil {
@@ -90,7 +96,11 @@ func injectSteamFlags(runtimeSpec []byte, flags string) ([]byte, error) {
 	for k, v := range env {
 		merged[k] = v
 	}
-	merged[steamStartupFlagsKey] = flags
+	if value != nil {
+		merged[key] = *value
+	} else {
+		delete(merged, key)
+	}
 	spec["env"] = merged
 
 	out, err := json.Marshal(spec)

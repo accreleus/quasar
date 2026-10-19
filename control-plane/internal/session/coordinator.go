@@ -189,8 +189,18 @@ func (c *Coordinator) stopInGrace(sessionID string) bool {
 	return ok && time.Since(at) < stopAckTimeout
 }
 
+// Swap also supersedes the owner's parked session when the target is outside
+// its Steam family (control-api.md §Warm Steam, "Non-Steam apps").
 func (c *Coordinator) Swap(ctx context.Context, sessionID, newAppID string) (Session, error) {
-	return c.swapper.Swap(ctx, sessionID, newAppID)
+	sess, err := c.swapper.Swap(ctx, sessionID, newAppID)
+	if err == nil {
+		keep := ""
+		if app, err := c.store.GetLaunchApp(ctx, newAppID); err == nil && app.SteamFamily {
+			keep = homeAppID(app)
+		}
+		c.supersedeParked(ctx, sess.UserID, keep, "")
+	}
+	return sess, err
 }
 
 func (c *Coordinator) EvaluateClientHealth(ctx context.Context, sessionID string, sample ClientHealthSample) {
@@ -369,6 +379,11 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 			// this same serialized read loop, so a running row would have been in
 			// cpRunning. Explicit anyway -- falling through to a stop is the wrong
 			// default for a live session if that ever changes.
+			continue
+		case hs.State == StateStopped && c.store.adoptedByLive(ctx, sid):
+			// A claimed parked session: the agent lists it until the claim's start
+			// adopts it, and a stop now would cold-start the play session. Once the
+			// claim ends unadopted it is an orphan again.
 			continue
 		case hs.HostID != nil && *hs.HostID != hostID:
 			c.log.Warn("agent reports another host's session; stopping its copy",

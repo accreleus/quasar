@@ -104,7 +104,7 @@ describe("launchPlan", () => {
     const data = menu(r.rec ?? "p-rec");
     const model = optionsFor({ app, data, caps: { h264, hevc: true, av1: false, vp9: false }, isAdmin: r.admin ?? false });
     const prefs = r.prefs
-      ? { default_profile_id: r.prefs.def ?? null, global_default_profile_id: r.prefs.global ?? null, user_overrides_allowed: r.prefs.overrides ?? true }
+      ? { default_profile_id: r.prefs.def ?? null, steam_dialogs: "show" as const, global_default_profile_id: r.prefs.global ?? null, user_overrides_allowed: r.prefs.overrides ?? true }
       : null;
     const got = launchPlan({ app, model, recommendedId: data.recommended_id, prefs, isAdmin: r.admin ?? false, h264, remembered: r.remembered ?? false });
     expect(got).toEqual(r.want);

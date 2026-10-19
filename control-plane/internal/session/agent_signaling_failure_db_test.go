@@ -28,7 +28,7 @@ func TestSignalingRelayFailureLeavesAStoppingSessionToFinish(t *testing.T) {
 	ctx := context.Background()
 	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: id, State: "stopping", Detail: "game exited"})
 
-	coord.AgentSignalingFailure(ctx, s.hostID, id, "relay browser queue blocked")
+	coord.AgentSignalingFailure(ctx, s.hostID, id, true, "relay browser queue blocked")
 
 	got, _ := store.Get(ctx, id)
 	if got.State != StateStopping || got.StateDetail == nil || *got.StateDetail != "game exited" || got.ErrorMessage != nil {
@@ -49,7 +49,7 @@ func TestSignalingRelayFailureStillFailsARunningSession(t *testing.T) {
 	store, disp, coord, s, id := relayFailureCase(t)
 	ctx := context.Background()
 
-	coord.AgentSignalingFailure(ctx, s.hostID, id, "relay browser queue blocked")
+	coord.AgentSignalingFailure(ctx, s.hostID, id, false, "relay browser queue blocked")
 
 	if r := disp.stopReason(id); r != "signaling_relay_failed" {
 		t.Fatalf("stop reason %q, want signaling_relay_failed", r)
@@ -57,5 +57,22 @@ func TestSignalingRelayFailureStillFailsARunningSession(t *testing.T) {
 	got, _ := store.Get(ctx, id)
 	if got.State != StateFailed || got.ErrorMessage == nil || *got.ErrorMessage != "signaling relay failed: relay browser queue blocked" {
 		t.Fatalf("after the relay failure: %s %v, want failed with the relay error", got.State, got.ErrorMessage)
+	}
+}
+
+// A held game exit sends its `bye` on a row that is still running (no stopping
+// first, agent-api.md §session_state). Losing that bye ends nothing: the agent's
+// own report follows.
+func TestSignalingRelayFailureOnTheAgentsByeLeavesTheSession(t *testing.T) {
+	store, disp, coord, s, id := relayFailureCase(t)
+	ctx := context.Background()
+
+	coord.AgentSignalingFailure(ctx, s.hostID, id, true, "relay browser queue blocked")
+
+	if r := disp.stopReason(id); r != "" {
+		t.Fatalf("stop reason %q, want no stop for a lost bye", r)
+	}
+	if got, _ := store.Get(ctx, id); got.State != StateRunning || got.ErrorMessage != nil {
+		t.Fatalf("after the lost bye: %s %v, want still running with no error", got.State, got.ErrorMessage)
 	}
 }

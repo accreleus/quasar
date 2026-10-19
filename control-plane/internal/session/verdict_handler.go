@@ -98,7 +98,7 @@ func (h *Handler) handleSessionVerdict(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	sess, err := h.store.Get(r.Context(), id)
-	if errors.Is(err, ErrNotFound) {
+	if errors.Is(err, ErrNotFound) || (err == nil && parkedHidden(user, sess, false)) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
 		return
 	}

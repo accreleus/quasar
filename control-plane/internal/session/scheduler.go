@@ -84,6 +84,29 @@ type CreateParams struct {
 	// in the candidate query only: never a filter, never in the re-check, the
 	// totals probe or a diagnostic. Empty renders nothing.
 	CodecPreference []string
+	// Kind is KindParked for a warm Steam (amendment 39); "" is a play.
+	Kind string
+	// claim adopts the caller's parked session (control-api.md §Warm Steam,
+	// "Claim"). The stream fields above are then what the launch resolved on the
+	// parked session's GPU.
+	claim *parkedClaim
+}
+
+// parkedClaim names the parked session a launch tries to adopt. hostParks is
+// the in-memory parked_sessions_v1 answer for its host, read before the
+// transaction.
+type parkedClaim struct {
+	id        string
+	hostParks bool
+}
+
+// sameHolder is the session whose home hold a launch may pass: the parked
+// session it claims.
+func (p CreateParams) sameHolder() []string {
+	if p.claim == nil {
+		return nil
+	}
+	return []string{p.claim.id}
 }
 
 // homeAppID is the storage key for this launch. Every storage-keyed site on this
@@ -296,7 +319,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		}
 	}
 	if p.ManagedHome {
-		owner, err := homeClaimOwner(ctx, tx, p)
+		owner, err := homeClaimOwner(ctx, tx, p, p.sameHolder()...)
 		if err != nil {
 			return Session{}, false, err
 		}
@@ -333,13 +356,30 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 	if err := tx.QueryRow(ctx, `
 		SELECT COUNT(*) FROM sessions
-		WHERE user_id = $1::uuid
+		WHERE user_id = $1::uuid AND kind = 'play'
 		  AND state IN ('pending','assigned','starting','running')
 	`, p.UserID).Scan(&activeCount); err != nil {
 		return Session{}, false, fmt.Errorf("count active sessions: %w", err)
 	}
 	if activeCount >= userLimit {
 		return Session{}, false, ErrSessionQuotaExceeded
+	}
+
+	// (2a) Warm Steam, under the user lock so a heartbeat cannot race a launch
+	// or another heartbeat into a second live session.
+	var parkedMinutes int32
+	if p.Kind == KindParked {
+		if parkedMinutes, err = parkAllowed(ctx, tx, p.UserID); err != nil {
+			return Session{}, false, err
+		}
+	}
+	var claimed *claimedParked
+	if p.claim != nil {
+		if claimed, err = claimParked(ctx, tx, p); err != nil {
+			return Session{}, false, err
+		}
+		// The adopted runtime is already on that GPU, so its memory is not new.
+		p.PinHostID, p.PinGPUIndex, p.SkipVramVeto = claimed.hostID, &claimed.gpuIndex, true
 	}
 
 	// (2b) Per-(user, home) single-writer guard for managed-home apps (P5-04),
@@ -350,22 +390,15 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	// collide. Two Steam clients on one steamapps tree is the corruption at stake.
 	//
 	// excludeID is "": a launch excludes nothing, unlike the swap path.
+	// The 409 body carries the live session's id so the client can link to it
+	// (§2.1). A holder already stopping only needs a moment (#434).
 	if p.ManagedHome {
-		var conflictID string
-		err := tx.QueryRow(ctx, liveHomeSessionSQL, p.UserID, p.homeAppID(), "").Scan(&conflictID)
-		switch {
-		case err == nil:
-			// The 409 body must carry the live session's id so the client can link
-			// to it (§2.1). A holder already stopping only needs a moment (#434).
-			var stopping bool
-			if err := tx.QueryRow(ctx, `SELECT state='stopping' FROM sessions WHERE id=$1::uuid`,
-				conflictID).Scan(&stopping); err != nil {
-				return Session{}, false, fmt.Errorf("read same-home session state: %w", err)
-			}
-			return Session{}, false, &HomeInUseError{SessionID: conflictID, Stopping: stopping}
-		case errors.Is(err, pgx.ErrNoRows):
-		default:
+		conflict, err := homeInUse(ctx, tx, p.UserID, p.homeAppID(), "")
+		if err != nil {
 			return Session{}, false, fmt.Errorf("count same-home sessions: %w", err)
+		}
+		if conflict != nil {
+			return Session{}, false, conflict
 		}
 	}
 
@@ -382,6 +415,9 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	var gpuIndex int32
 	err = tx.QueryRow(ctx, candidateSQL, candidateArgs...).Scan(&gpuID, &hostID, &gpuIndex)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if claimed != nil {
+			return Session{}, false, &ParkedClaimRefusedError{HolderID: p.claim.id} // check 5
+		}
 		return Session{}, false, classifyReject(ctx, tx, cand)
 	}
 	if err != nil {
@@ -431,7 +467,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	if !imageAvailable {
 		return Session{}, true, nil
 	}
-	if err := claimSelectedHome(ctx, tx, p, hostID); err != nil {
+	if err := claimSelectedHome(ctx, tx, p, hostID, p.sameHolder()...); err != nil {
 		return Session{}, false, err
 	}
 
@@ -459,7 +495,8 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    signaling_token_hash, signaling_token_expires_at,
 		    mic,
 		    device_id,
-		    assigned_at
+		    assigned_at,
+		    kind, parked_until
 		) VALUES (
 		    $1, $2, $3, $4, 'assigned',
 		    $5, $6, $7, $8, $9,
@@ -470,7 +507,9 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    NULLIF($12, ''), $13,
 		    $16,
 		    NULLIF($17, '')::uuid,
-		    now()
+		    now(),
+		    COALESCE(NULLIF($18, ''), 'play'),
+		    CASE WHEN $18 = 'parked' THEN now() + make_interval(mins => $19::int) END
 		)
 		RETURNING `+sessionCols,
 		p.UserID, p.AppID, hostID, gpuID,
@@ -482,9 +521,19 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		p.Codec,
 		p.Mic,
 		deviceID,
+		p.Kind, parkedMinutes,
 	))
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.ConstraintName == "sessions_one_parked_per_user" {
+		return Session{}, false, errParkRefused
+	}
 	if err != nil {
 		return Session{}, false, fmt.Errorf("insert session: %w", err)
+	}
+	if claimed != nil {
+		if err := adoptRuntime(ctx, tx, claimed.id, sess.ID); err != nil {
+			return Session{}, false, err
+		}
 	}
 	// Internal launches omit browser signaling; only persist a minted token.
 	if p.TokenHash != "" {
