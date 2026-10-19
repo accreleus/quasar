@@ -585,12 +585,12 @@ func (c *Coordinator) endHeldRuntime(ctx context.Context, hostID string, m agent
 func (c *Coordinator) dispatchParked(k Session) {
 	app, err := c.store.GetLaunchApp(c.ctx, k.AppID)
 	if err != nil || k.HostID == nil {
-		c.failSession(k.ID, fmt.Sprintf("parked session app: %v", err))
+		c.failBeforeAgent(k.ID, k.AdoptSessionID, k.HostID, fmt.Sprintf("parked session app: %v", err))
 		return
 	}
 	spec, err := c.parkedSpec(c.ctx, app, k.UserID, *k.HostID)
 	if err != nil {
-		c.failSession(k.ID, fmt.Sprintf("home mount: %v", err))
+		c.failBeforeAgent(k.ID, k.AdoptSessionID, k.HostID, fmt.Sprintf("home mount: %v", err))
 		return
 	}
 	expected := expectedHomeDispatch(app)
@@ -715,14 +715,67 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 // releaseHeld marks the ended row runtime_released, so a relaunch onto its
 // still-held home answers 503 until the cleanup proof, then commits.
 func releaseHeld(ctx context.Context, tx pgx.Tx, sessionID string) error {
-	if _, err := tx.Exec(ctx, `UPDATE sessions SET stop_reason = COALESCE(stop_reason, $2)
-		WHERE id = $1::uuid`, sessionID, stopReasonRuntimeReleased); err != nil {
-		return fmt.Errorf("mark released runtime: %w", err)
+	if err := markReleased(ctx, tx, sessionID); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit held stop: %w", err)
 	}
 	return nil
+}
+
+// markReleased writes runtime_released over any earlier reason but the served
+// entitlement_revoked: a user stop racing the game exit must not lose the marker
+// (schema.md, sessions.stop_reason).
+func markReleased(ctx context.Context, tx pgx.Tx, sessionID string) error {
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET stop_reason = CASE
+		    WHEN stop_reason = $3 THEN stop_reason ELSE $2 END
+		WHERE id = $1::uuid`, sessionID, stopReasonRuntimeReleased, StopReasonEntitlementRevoked); err != nil {
+		return fmt.Errorf("mark released runtime: %w", err)
+	}
+	return nil
+}
+
+// returnAdoption hands the home binding and hold from a row whose assign the
+// agent never took back to the runtime it would have adopted, which the agent
+// still runs under its own id, and marks that row released. One transaction.
+func (s *Store) returnAdoption(ctx context.Context, fromID, adoptedID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin adoption return: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := moveHome(ctx, tx, fromID, adoptedID); err != nil {
+		return err
+	}
+	if err := markReleased(ctx, tx, adoptedID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit adoption return: %w", err)
+	}
+	return nil
+}
+
+// failBeforeAgent fails a session whose assign the agent never took. If it
+// carried an adoption, the hold goes back to the adopted id first (otherwise
+// RH05's instant proof for the never-seen id would clear it while that runtime
+// still mounts the home), and the adopted runtime is stopped, so only its own
+// cleanup proof clears the hold. Not for a queued assign whose ack was lost.
+func (c *Coordinator) failBeforeAgent(sessionID, adoptID string, hostID *string, reason string) {
+	if adoptID != "" {
+		if err := c.store.returnAdoption(c.ctx, sessionID, adoptID); err != nil {
+			c.log.Error("returning an unadopted runtime's home hold failed", "session_id", sessionID,
+				"adopt_session_id", adoptID, "err", err)
+		}
+		if hostID != nil {
+			cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: adoptID, Reason: "error"}
+			if err := c.dispatcher.Send(*hostID, cmd); err != nil {
+				c.log.Warn("stopping an unadopted runtime failed", "session_id", adoptID, "err", err)
+			}
+		}
+	}
+	c.failSession(sessionID, reason)
 }
 
 // --- shader progress ------------------------------------------------------------

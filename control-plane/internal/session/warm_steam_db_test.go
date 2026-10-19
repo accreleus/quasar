@@ -24,6 +24,7 @@ import (
 type warmDispatcher struct {
 	mu      sync.Mutex
 	parks   bool
+	noEpoch bool // the agent's socket is gone: no command epoch to send on
 	assigns []agentws.SessionAssignCmd
 	stops   []agentws.SessionStopCmd
 	swaps   []agentws.SessionSwapAppCmd
@@ -74,7 +75,18 @@ func (d *warmDispatcher) Send(_ string, v any) error { d.record(v); return nil }
 // CurrentHomeCommandEpoch makes every managed-home dispatch take the
 // cleanup-capable path, so holds are created and moved as in production.
 func (d *warmDispatcher) CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.noEpoch {
+		return nil, false
+	}
 	return warmEpoch{d}, true
+}
+
+func (d *warmDispatcher) dropEpoch() {
+	d.mu.Lock()
+	d.noEpoch = true
+	d.mu.Unlock()
 }
 
 type warmEpoch struct{ d *warmDispatcher }

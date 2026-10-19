@@ -316,10 +316,12 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	case !lp.parked && errors.As(err, &inUse) && (inUse.parkedID != "" || inUse.releasedID != ""):
 		// The caller's own warm-Steam runtime still holds this home: retryable
 		// like a refused claim, never a 409 the client does not retry.
+		holder := inUse.releasedID
 		if inUse.parkedID != "" {
+			holder = inUse.parkedID
 			c.supersedeParkedHolder(ctx, userID, inUse.parkedID)
 		}
-		err = &ParkedClaimRefusedError{HolderID: inUse.parkedID + inUse.releasedID}
+		err = &ParkedClaimRefusedError{HolderID: holder}
 	case p.claim != nil && errors.As(err, &refused) && refused.Warming:
 		// Left to finish warming; the client's retry claims it once running.
 	case p.claim != nil && errors.Is(err, ErrCapacityExhausted):
@@ -362,7 +364,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// The codec constraint pre-empts both codec refusals; this stays the
 		// backstop. Fail the session, releasing its reservation, rather than
 		// dispatching a doomed assignment.
-		c.failSession(sess.ID, fmt.Sprintf("rung resolution failed: %v", err))
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("rung resolution failed: %v", err))
 		return LaunchResult{}, err
 	}
 
@@ -376,7 +378,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	// only because §5's pin refuses such a tile first.
 	if app.ManagedHome || app.IsDerived() {
 		if sess.HostID == nil {
-			c.failSession(sess.ID, "app scheduled without a host")
+			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, "app scheduled without a host")
 			return LaunchResult{}, fmt.Errorf("app scheduled without a host")
 		}
 		dispatchSpec, err = c.resolveHomeSpec(ctx, app, userID, *sess.HostID)
@@ -384,7 +386,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 			dispatchSpec, err = injectSteamFlags(dispatchSpec, parkedSteamFlags)
 		}
 		if err != nil {
-			c.failSession(sess.ID, fmt.Sprintf("home mount: %v", err))
+			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("home mount: %v", err))
 			return LaunchResult{}, fmt.Errorf("home mount: %w", err)
 		}
 	}
@@ -405,7 +407,7 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 		err := c.store.pool.QueryRow(c.ctx, `SELECT EXISTS(SELECT 1 FROM installed_images
 			WHERE lazy AND registry_ref = '' AND local_tag = $1)`, imageRef).Scan(&lazyTemplate)
 		if err != nil || lazyTemplate {
-			c.failSession(sess.ID, "image preparation unavailable for lazy template")
+			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, "image preparation unavailable for lazy template")
 			return
 		}
 	}
@@ -439,7 +441,7 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 			// A stop or reconnect reap that ended the wait already owns the
 			// session's outcome; only a still-assigned launch fails here.
 			if current, getErr := c.store.Get(c.ctx, sess.ID); getErr == nil && current.State == StateAssigned {
-				c.failSession(sess.ID, fmt.Sprintf("image preparation failed: %v", err))
+				c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("image preparation failed: %v", err))
 			}
 			return
 		}
@@ -934,7 +936,7 @@ func (c *Coordinator) dispatchAssignStart(sess Session, runtimeSpec []byte, expe
 
 func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec []byte, videoTopology string, expected *homeDispatchExpectation) {
 	if sess.HostID == nil || sess.GPUIndex == nil {
-		c.failSession(sess.ID, "session missing host/gpu placement")
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, "session missing host/gpu placement")
 		return
 	}
 	hostID := *sess.HostID
@@ -1007,27 +1009,21 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 			var ok bool
 			epoch, ok = provider.CurrentHomeCommandEpoch(hostID)
 			if !ok {
-				c.failSession(sessionID, "assign dispatch failed: agent not connected")
+				c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "assign dispatch failed: agent not connected")
 				return false
 			}
 		}
 		wire, ok := wireAssign(assign, c.epochParks(hostID, epoch), c.warmOn())
 		if !ok {
-			c.failSession(sessionID, "assign dispatch failed: the agent connection cannot take a parked session or an adoption")
-			if assign.AdoptSessionID != "" {
-				// The runtime the claim or park ended would otherwise stay up on the home.
-				cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: assign.AdoptSessionID, Reason: "error"}
-				if err := c.dispatcher.Send(hostID, cmd); err != nil {
-					c.log.Warn("stopping an unadoptable runtime failed", "session_id", assign.AdoptSessionID, "err", err)
-				}
-			}
+			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID,
+				"assign dispatch failed: the agent connection cannot take a parked session or an adoption")
 			return false
 		}
 		capable := epoch != nil && epoch.SupportsHomeCleanup()
 		hold, err := c.store.bindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable, expected)
 		if err != nil {
 			c.log.Error("managed home dispatch binding failed", "session_id", sessionID, "err", err)
-			c.failSession(sessionID, "managed home dispatch binding failed")
+			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "managed home dispatch binding failed")
 			return false
 		}
 		if epoch == nil {
@@ -1048,16 +1044,18 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 			if clearErr := c.store.ClearNewHomeHold(c.ctx, hold); clearErr != nil {
 				c.log.Error("rejected home hold release failed", "err", clearErr)
 			}
-			c.failSession(sessionID, fmt.Sprintf("agent rejected assign: %s", res.Error))
+			// A rejected assign caused no home side effect, so nothing was adopted.
+			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, fmt.Sprintf("agent rejected assign: %s", res.Error))
 			return false
 		}
 		if sendErr != nil {
+			// Queued with no ack: the agent may have adopted, so the hold stays.
 			c.failSession(sessionID, fmt.Sprintf("assign dispatch failed: %v", sendErr))
 			return false
 		}
 		return true
 	}
-	c.failSession(sessionID, "assign dispatch failed: connection changed")
+	c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "assign dispatch failed: connection changed")
 	return false
 }
 
