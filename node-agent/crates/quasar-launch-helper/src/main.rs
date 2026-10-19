@@ -1196,6 +1196,15 @@ mod tests {
     }
 
     /// A stand-in `steam` that writes its argv to `argv.txt` beside it.
+    /// Tests that write a script and run it take this: a fork in another test thread while
+    /// the script is still open for writing inherits that descriptor, and the exec then fails
+    /// with ETXTBSY.
+    static SCRIPTS: Mutex<()> = Mutex::new(());
+
+    fn scripts() -> std::sync::MutexGuard<'static, ()> {
+        SCRIPTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn fake_steam(dir: &std::path::Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let steam = dir.join("steam");
@@ -1223,6 +1232,7 @@ mod tests {
 
     #[test]
     fn a_launch_runs_steam_with_fixed_argv_and_arms_the_watch() {
+        let _scripts = scripts();
         let dir = tempfile::tempdir().unwrap();
         let mut helper = Helper::new(dir.path().join("proc"), dir.path().join("logs"), false);
         helper.steam = fake_steam(dir.path());
@@ -1239,6 +1249,7 @@ mod tests {
 
     #[test]
     fn big_picture_runs_steams_own_url_and_pins_nothing() {
+        let _scripts = scripts();
         let dir = tempfile::tempdir().unwrap();
         let mut helper = Helper::new(dir.path().join("proc"), dir.path().join("logs"), false);
         helper.steam = fake_steam(dir.path());
@@ -1255,6 +1266,7 @@ mod tests {
 
     #[test]
     fn a_launch_that_cannot_run_steam_says_so_and_watches_nothing_new() {
+        let _scripts = scripts();
         let dir = tempfile::tempdir().unwrap();
         let mut helper = Helper::new(dir.path().join("proc"), dir.path().join("logs"), false);
         helper.steam = dir.path().join("missing");
@@ -1269,6 +1281,7 @@ mod tests {
 
     #[test]
     fn at_most_eight_steam_commands_run_at_once() {
+        let _scripts = scripts();
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let steam = dir.path().join("steam");
