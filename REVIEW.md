@@ -27,10 +27,14 @@ holds you to it.
    control plane, client and server) is tested against the other side's real order, read from its code.
 5. **Contract.** No documented behaviour changes without its contract sentence. Quote the sentence.
 6. **Size.** Every added line is needed. Name anything speculative.
-7. **Public hygiene.** No hostname, address, ssh alias or operator path anywhere; role names only. The changelog line
+7. **Bench.** A streaming-path change (encoder, capture, ABR, transport, what the client presents) has its bench
+   check for the head, or the landing says why not (see `AGENTS.md`, "Performance evidence").
+8. **Public hygiene.** No hostname, address, ssh alias or operator path anywhere; role names only. The changelog line
    is present and true.
 
 ## Report
 - First line: `APPROVE`, `APPROVE WITH NITS` or `REQUEST CHANGES`, at the exact commit SHA.
 - Then a findings table: id, must / should / nit, `file:line`, one line each.
-- Then details only for the musts. Keep the whole report short. CI is the test gate: run only the tests the change adds.
+- Then details only for the musts. Keep the whole report short.
+- The reviewer runs only the tests the change adds; CI and the writer's gates (`AGENTS.md`, "Verification levels") are
+  the full test gate.
