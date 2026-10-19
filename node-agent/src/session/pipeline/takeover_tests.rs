@@ -1669,6 +1669,83 @@ fn a_sound_server_lost_under_a_live_session_is_still_reported() {
     );
 }
 
+/// The last thing a source stop does is stop its sound server, after the app container
+/// (`AppSource::teardown`); this one notes what the session end had done by then.
+struct SourceStopWitness {
+    emitted: Arc<Mutex<Vec<SessionEvent>>>,
+    video: gst::Element,
+    /// `(bye already emitted, the video transport's state)`.
+    at_stop: Arc<Mutex<Option<(bool, gst::State)>>>,
+}
+
+impl crate::session::teardown::Sidecar for SourceStopWitness {
+    fn server_uri(&self) -> String {
+        "unix:/nonexistent/native".into()
+    }
+    fn socket_dir(&self) -> std::path::PathBuf {
+        "/nonexistent".into()
+    }
+    fn adopt_budget(&mut self, _: crate::session::teardown::RetryBudget) {}
+    fn stop(&mut self) {
+        let said_bye = self
+            .emitted
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Signaling(SignalMsg::Bye)));
+        self.at_stop
+            .lock()
+            .unwrap()
+            .get_or_insert((said_bye, self.video.current_state()));
+    }
+}
+
+/// #753: on a game exit the browser hears `bye`, after the `stopping` row it reads, and the
+/// video transport is gone before the source stop, which waits on Steam's exit.
+#[test]
+fn a_game_exit_says_bye_and_drops_the_video_before_the_source_stops() {
+    use crate::session::source::{AppSource, SessionResources};
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("game-exit");
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let at_stop = Arc::new(Mutex::new(None));
+    let res = SessionResources::with_sidecar(
+        "takeover-game-exit",
+        Box::new(SourceStopWitness {
+            emitted: emitted.clone(),
+            video: host.transports.video.webrtc.clone(),
+            at_stop: at_stop.clone(),
+        }),
+    );
+    let sink = format!("takeover-game-exit-app-{}", std::process::id());
+    let mut source = AppSource::new(&host.cfg, "takeover-game-exit", &sink, &sink, &res, None)
+        .expect("app source");
+
+    let emit = |e: SessionEvent| emitted.lock().unwrap().push(e);
+    crate::session::runner::stop_for_game_exit(&emit, &mut source, &host.transports);
+
+    let at_stop = *at_stop.lock().unwrap();
+    assert_eq!(
+        at_stop,
+        Some((true, gst::State::Null)),
+        "(bye sent, video state) at the source stop"
+    );
+    let emitted = emitted.lock().unwrap();
+    assert!(
+        matches!(
+            emitted.as_slice(),
+            [
+                SessionEvent::StoppingWith("game exited"),
+                SessionEvent::Signaling(SignalMsg::Bye)
+            ]
+        ),
+        "emitted {emitted:?}"
+    );
+}
+
 /// A sound server with nothing to stop.
 struct NoSoundServer;
 

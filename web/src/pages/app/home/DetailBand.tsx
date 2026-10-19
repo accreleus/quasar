@@ -20,6 +20,7 @@ import {
   type LaunchDraft,
 } from "../launchOptions";
 import { BandNotes } from "./BandNotes";
+import { waitingPlayLabel } from "../capacityRetry";
 import { LaunchOptions } from "./LaunchOptions";
 import { recommendation } from "./launchOptionRules";
 import { useHeroPalette } from "./useHeroPalette";
@@ -161,9 +162,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
   const playLabel = isLive
     ? "Resume session"
     : waitingForSlot
-      ? waitingReason === "host"
-        ? "Waiting for a host…"
-        : "Waiting for a slot…"
+      ? waitingPlayLabel(waitingReason)
       : launching
         ? "Launching…"
         : "Play";

@@ -269,7 +269,9 @@ type claimedParked struct {
 
 // claimParked locks the parked row and runs claim checks 1–4; on success it
 // moves the row to stopped "claimed", releasing its reservation, so check 5 is
-// the pinned placement that follows in the same transaction.
+// the pinned placement that follows in the same transaction. The checks do not
+// read steam_warm_enabled: with the switch off a claim still adopts, and the
+// expiry job stops whatever is left within 60 s.
 func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked, error) {
 	k := claimedParked{id: p.claim.id}
 	var ok bool
@@ -485,8 +487,10 @@ func (c *Coordinator) evictParkedFor(ctx context.Context, p CreateParams) {
 // --- park on exit ---------------------------------------------------------------
 
 // endHeldRuntime handles a `stopped` report with runtime_held: it ends the play
-// session and, in the same transaction, parks its runtime or releases it.
-// Runs on the agent's read loop, so it sends without waiting for acks.
+// session and, in the same transaction, parks its runtime or releases it. A
+// release leaves the hold on the ended row; only the agent's later qualified
+// `stopped` clears it. Runs on the agent's read loop, so it sends without
+// waiting for acks.
 func (c *Coordinator) endHeldRuntime(ctx context.Context, hostID string, m agentws.SessionStateMsg) {
 	var detail *string
 	if m.Detail != "" {

@@ -74,6 +74,9 @@ type HomeInUseError struct {
 	// SessionID is empty when the holder may not be named: a parked session
 	// (control-api.md §Warm Steam). writeHomeInUse then omits it.
 	SessionID string
+	// parkedID is that unnamed parked holder, for the launch path's 503
+	// (LaunchByProfile). Never serialized.
+	parkedID string
 	// Stopping: the session is already tearing down, so the caller only has to
 	// retry in a moment (#434). It changes the message, never the code.
 	Stopping bool
@@ -1178,7 +1181,7 @@ func homeInUse(ctx context.Context, q rowQuerier, userID, homeAppID, excludeID s
 		return nil, err
 	}
 	if kind == KindParked {
-		id = ""
+		return &HomeInUseError{Stopping: stopping, parkedID: id}, nil
 	}
 	return &HomeInUseError{SessionID: id, Stopping: stopping}, nil
 }

@@ -128,8 +128,8 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) e
 	}
 	switch {
 	case !state.IsTerminal():
-		if kind == KindParked {
-			holder = "" // never named (control-api.md §Warm Steam)
+		if kind == KindParked { // never named (control-api.md §Warm Steam)
+			return &HomeInUseError{Stopping: state == StateStopping, parkedID: holder}
 		}
 		return &HomeInUseError{SessionID: holder, Stopping: state == StateStopping}
 	case host != nil && *host == claimHost && connected && recent:

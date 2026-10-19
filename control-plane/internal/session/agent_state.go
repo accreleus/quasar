@@ -19,6 +19,13 @@ func (c *Coordinator) AgentSignalingFailure(ctx context.Context, hostID, session
 	if err != nil || hs.HostID == nil || *hs.HostID != hostID || hs.State.IsTerminal() {
 		return
 	}
+	// Already ending, and its agent reports `stopped` itself: a stop or a fail here would
+	// end the row before the app has stopped (#753: a game exit's `bye` to a stuck socket).
+	if hs.State == StateStopping {
+		c.log.Info("signaling relay failed on a stopping session; frame dropped",
+			"session_id", sessionID, "reason", reason)
+		return
+	}
 	cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sessionID, Reason: "signaling_relay_failed"}
 	if err := c.dispatcher.Send(hostID, cmd); err != nil {
 		c.log.Warn("signaling-failure stop dispatch failed", "session_id", sessionID, "err", err)
@@ -39,7 +46,9 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		return
 	}
 	// A held runtime still mounts the home, so this `stopped` is no cleanup
-	// proof: it parks the runtime or releases it (amendment 39).
+	// proof (agent-api.md §session_state, runtime_held): it parks the runtime or
+	// releases it, and a release keeps the claim and holds until the agent's
+	// qualified `stopped` for the id, which takes the path below.
 	if to == StateStopped && m.RuntimeHeld {
 		c.endHeldRuntime(ctx, hostID, m)
 		return
