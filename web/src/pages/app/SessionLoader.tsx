@@ -16,6 +16,7 @@ import { CollapsibleLogTail } from "../../components/SessionFailureDetail";
 import { isBannerVerdict, type LaunchFailure } from "./sessionFailure";
 import { AccretionVisual } from "./AccretionVisual";
 import { GlyphRail } from "./GlyphRail";
+import { useBootLine } from "./gettingReady";
 import { derivePhase, stallPhaseForStep } from "./loaderPhases";
 import {
   resolveStall,
@@ -83,6 +84,7 @@ export function SessionLoader({
   firstFrame = false,
   inputOpen = false,
 }: SessionLoaderProps) {
+  const bootLine = useBootLine(appLaunchState === "starting", shaderPercent);
   const { step, word, verb } = derivePhase({
     state: sessionState,
     wsOpen,
@@ -287,7 +289,7 @@ export function SessionLoader({
               <span className={changing ? "sl-stage changing" : "sl-stage"}>{visible.word}</span>
             </h1>
             {/* Always in the layout so the title does not jump when the line appears. */}
-            <p className="sl-shaders">{shaderPercent !== null && `Processing shaders — ${shaderPercent}%`}</p>
+            <p className="sl-shaders" aria-live="off" aria-hidden={bootLine.decorative || undefined}>{bootLine.text}</p>
             <div className="sl-status-foot">
               <GlyphRail step={visible.step} />
             </div>

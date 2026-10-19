@@ -11,6 +11,7 @@
 // No focusable content by design; doesn't touch SessionDrawer's
 // aria-hidden/focus logic.
 import { useEffect, useState } from "react";
+import { useBootLine } from "./gettingReady";
 import { QuasarMark } from "../../components/QuasarMark";
 import type { SwapTransitionState } from "./useSwapTransition";
 
@@ -27,6 +28,7 @@ export function SessionSwapTransition({ transition }: SessionSwapTransitionProps
   // is only in the document while a swap is in flight or fading out, so an idle
   // session's page text carries none of it.
   const [held, setHeld] = useState(transition);
+  const bootLine = useBootLine(held?.phase === "booting", held?.phase === "booting" ? held.shaderPercent : null);
   if (transition && transition !== held) setHeld(transition);
   useEffect(() => {
     if (transition) return;
@@ -57,8 +59,8 @@ export function SessionSwapTransition({ transition }: SessionSwapTransitionProps
             <div className="sw-sub">
               Starting…
               {/* Always in the layout, so nothing above it moves when progress starts. */}
-              <span className="sw-shaders">
-                {held.phase === "booting" && held.shaderPercent !== null && `Processing shaders — ${held.shaderPercent}%`}
+              <span className="sw-shaders" aria-live="off" aria-hidden={bootLine.decorative || undefined}>
+                {bootLine.text}
               </span>
             </div>
           )}

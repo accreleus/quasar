@@ -9,7 +9,7 @@
 //
 // So the wiring is ONE component, imported once — guarded by
 // swapWiring.test.tsx, which renders THIS component and drives a real click.
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { GamesPane } from "./hud/panes/GamesPane";
 import { SessionSwapTransition } from "./SessionSwapTransition";
 import { useSwapTransition } from "./useSwapTransition";
@@ -33,6 +33,9 @@ export interface SessionSwapControllerProps {
    *  start a swap) nor the overlay (it must not cover the banner). The hook
    *  keeps running, so a swap in flight survives a verdict that clears. */
   sessionOver?: boolean;
+  /** Tells the page whether the switching screen is up (`switching` or `booting`),
+   *  so it can hold the session's sound under it. False on every other exit. */
+  onScreenChange?: (up: boolean) => void;
   /** Render prop: caller gets only the two derived values its children need
    *  (the Games pane, the bar's swappingTo). The transition screen is rendered here,
    *  so no second call site can render it with a stale `transition` value. */
@@ -47,6 +50,7 @@ export function SessionSwapController({
   onToast,
   onSwapStart,
   sessionOver = false,
+  onScreenChange,
   children,
 }: SessionSwapControllerProps) {
   const { transition, startSwap, rejectSwap } = useSwapTransition({
@@ -55,6 +59,12 @@ export function SessionSwapController({
     onCommitted,
     onToast,
   });
+
+  const screenUp = transition?.phase === "switching" || transition?.phase === "booting";
+  useEffect(() => {
+    onScreenChange?.(screenUp);
+    return () => onScreenChange?.(false);
+  }, [screenUp, onScreenChange]);
 
   const quickSwitch =
     sessionId && currentApp.id ? (

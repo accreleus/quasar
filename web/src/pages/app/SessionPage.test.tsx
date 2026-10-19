@@ -154,12 +154,19 @@ vi.mock("../../webrtc/session", () => ({
   },
 }));
 
+/** The page's callback for the swap screen going up or down, so a test can play the controller. */
+let lastScreenChange: ((up: boolean) => void) | undefined;
 vi.mock("./SessionSwapController", () => ({
   SessionSwapController: ({
     children,
+    onScreenChange,
   }: {
     children: (p: { quickSwitch: null; swappingTo: null }) => React.ReactNode;
-  }) => children({ quickSwitch: null, swappingTo: null }),
+    onScreenChange?: (up: boolean) => void;
+  }) => {
+    lastScreenChange = onScreenChange;
+    return children({ quickSwitch: null, swappingTo: null });
+  },
 }));
 // Captures the HUD's props so the display-PATCH debounce/revert can be driven
 // through the real handlers without rendering the HUD (its own rendering is
@@ -862,6 +869,33 @@ describe("SessionPage — #484 app-boot loader gate", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
+    expect(audio()?.muted).toBe(false);
+    play.mockRestore();
+  });
+
+  it("holds the sound under the quick-switch screen and releases it when the screen clears", async () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    const audio = () => document.body.querySelector("audio");
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      (lastTransport?.onAudioTrack as (s: MediaStream) => void)({} as MediaStream);
+    });
+    await act(async () => {
+      openChannel();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(audio()?.muted).toBe(false); // revealed, sound on
+
+    await act(async () => lastScreenChange?.(true));
+    expect(audio()?.muted).toBe(true);
+
+    await act(async () => lastScreenChange?.(false));
     expect(audio()?.muted).toBe(false);
     play.mockRestore();
   });

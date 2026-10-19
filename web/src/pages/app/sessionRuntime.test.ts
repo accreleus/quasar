@@ -1085,6 +1085,36 @@ describe("session sound", () => {
     expect(audioEl()).toBeNull();
   });
 
+  it("holds the sound again under the quick-switch screen, and releases it after", () => {
+    const h = harness();
+    h.runtime.start();
+    h.transport.onAudioTrack?.({} as MediaStream);
+    h.runtime.releaseAudio();
+    expect(audioEl()?.muted).toBe(false);
+
+    h.runtime.holdAudio();
+    expect(audioEl()?.muted).toBe(true);
+    h.runtime.holdAudio(); // idempotent
+    expect(audioEl()?.muted).toBe(true);
+
+    h.runtime.releaseAudio();
+    expect(audioEl()?.muted).toBe(false);
+    h.runtime.destroy();
+  });
+
+  it("keeps a replaced audio track muted while held", () => {
+    const h = harness();
+    h.runtime.start();
+    h.runtime.releaseAudio();
+    h.runtime.holdAudio();
+    h.transport.onAudioTrack?.({} as MediaStream);
+    expect(document.body.querySelectorAll("audio")).toHaveLength(1);
+    expect(audioEl()?.muted).toBe(true);
+    h.runtime.releaseAudio();
+    expect(audioEl()?.muted).toBe(false);
+    h.runtime.destroy();
+  });
+
   it("plays a track that arrives after the reveal at once", () => {
     const h = harness();
     h.runtime.start();
