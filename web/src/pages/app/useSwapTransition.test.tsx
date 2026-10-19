@@ -136,9 +136,10 @@ describe("useSwapTransition", () => {
     });
     detail = "app booting";
     await advanceUntil(() => result.current.transition?.phase === "booting");
-    for (let s = 0; s < 10; s++) {
+    // 500 ms steps: the 3.5 s dismiss timer and the next 1 s poll's rebuild must not share one act().
+    for (let s = 0; s < 20; s++) {
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
+        await vi.advanceTimersByTimeAsync(500);
       });
       expect(result.current.transition?.phase).toBe("booting");
     }
@@ -147,6 +148,33 @@ describe("useSwapTransition", () => {
     detail = "app presented";
     await advanceUntil(() => result.current.transition === null);
     expect(onToast).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets go after 180 s when 'app presented' never comes, without a 'Now playing' toast", async () => {
+    let detail = "swapping";
+    getSession.mockImplementation(async () => session("running", detail, "a2"));
+    const onToast = vi.fn();
+    const { result } = renderHook(() =>
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted: vi.fn(), onToast }),
+    );
+
+    act(() => result.current.startSwap({ id: "a2", name: "Purple App" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    detail = "app booting";
+    await advanceUntil(() => result.current.transition?.phase === "booting");
+    const committedAt = Date.now();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(179_000 - (Date.now() - committedAt));
+    });
+    expect(result.current.transition?.phase).toBe("booting");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(result.current.transition).toBeNull();
+    expect(onToast).not.toHaveBeenCalled();
   });
 
   it("commits and clears at once when the first confirmation is 'app presented'", async () => {
