@@ -202,13 +202,63 @@ func TestProfilePreferencesSteamDialogs(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || body["steam_dialogs"] != "dismiss_safe" || body["default_profile_id"] != "720p60" {
 		t.Fatalf("dialogs PATCH = %d %v, want dismiss_safe with the profile kept", resp.StatusCode, body)
 	}
-	if resp, _ := w.do(t, http.MethodPatch, "/v1/me/profile-preferences", w.token,
-		map[string]any{"steam_dialogs": "always"}); resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("bad steam_dialogs = %d, want 400", resp.StatusCode)
+	for _, bad := range []any{"always", nil, 3} {
+		if resp, _ := w.do(t, http.MethodPatch, "/v1/me/profile-preferences", w.token,
+			map[string]any{"steam_dialogs": bad}); resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("steam_dialogs %v = %d, want 400", bad, resp.StatusCode)
+		}
+	}
+	_, body = w.do(t, http.MethodGet, "/v1/me/profile-preferences", w.token, nil)
+	if body["default_profile_id"] != "720p60" || body["steam_dialogs"] != "dismiss_safe" {
+		t.Fatalf("refused PATCHes changed the preferences: %v", body)
 	}
 	// Without steam_dialogs, today's rule: absent default_profile_id clears it; dialogs stay.
 	_, body = w.do(t, http.MethodPatch, "/v1/me/profile-preferences", w.token, map[string]any{})
 	if body["default_profile_id"] != nil || body["steam_dialogs"] != "dismiss_safe" {
 		t.Errorf("empty PATCH = %v, want the profile cleared and dismiss_safe kept", body)
 	}
+}
+
+// Both warm-Steam waits answer the web client's retryable 503 with Retry-After 2:
+// a parked session still starting (left running), and a released held runtime
+// whose cleanup proof is owed (then admitted once it arrives).
+func TestWarmSteamWaitsAnswer503WithRetryAfter2(t *testing.T) {
+	launch := func(w *warmServer) (*http.Response, map[string]any) {
+		return w.do(t, http.MethodPost, "/v1/sessions", w.token, map[string]any{"app_id": w.steam, "mic": true})
+	}
+	want503 := func(t *testing.T, resp *http.Response, body map[string]any) {
+		t.Helper()
+		errObj, _ := body["error"].(map[string]any)
+		if resp.StatusCode != http.StatusServiceUnavailable || errObj["code"] != "capacity_exhausted" ||
+			resp.Header.Get("Retry-After") != "2" {
+			t.Fatalf("launch = %d %v Retry-After=%q, want 503 capacity_exhausted with 2",
+				resp.StatusCode, errObj, resp.Header.Get("Retry-After"))
+		}
+	}
+
+	t.Run("warming parked session", func(t *testing.T) {
+		w := newWarmServer(t)
+		w.coord.SteamWarmHeartbeat(context.Background(), w.userID, false, w.deviceID)
+		k := w.parkedID(t)
+		w.disp.waitFor(t, "start")
+		resp, body := launch(w)
+		want503(t, resp, body)
+		if got := readRow(t, w.pool, k); got.State != "assigned" || w.disp.stopReason(k) != "" {
+			t.Errorf("parked row %+v stop=%q, want left to finish warming", got, w.disp.stopReason(k))
+		}
+	})
+
+	t.Run("released held runtime", func(t *testing.T) {
+		w := newWarmServer(t)
+		play := w.runningTile(t)
+		setWarm(t, w.pool, false, "library_open", 10)
+		w.coord.AgentState(context.Background(), w.hostID, heldStop(play))
+		resp, body := launch(w)
+		want503(t, resp, body)
+		w.coord.AgentState(context.Background(), w.hostID, agentws.SessionStateMsg{SessionID: play, State: "stopped",
+			HomeCleanupQualified: true})
+		if resp, body := launch(w); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("launch after the proof = %d %v, want 201", resp.StatusCode, body)
+		}
+	})
 }

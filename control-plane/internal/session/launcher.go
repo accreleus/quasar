@@ -290,45 +290,62 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		if owner == "" || !c.hostParks(owner) {
 			return LaunchResult{}, errParkRefused
 		}
-		p.Kind, p.PinHostID = KindParked, owner
+		// A heartbeat never waits on a settling hold: it simply parks nothing.
+		p.Kind, p.PinHostID, p.NoHomeSettleWait = KindParked, owner, true
 	} else if parked, err = c.store.liveParked(ctx, userID); err != nil {
 		c.log.Warn("warm steam: parked session read failed, launching without a claim", "user_id", userID, "err", err)
 	} else if parked.ID != "" && parked.AppID == homeAppID(app) && parked.HostID != "" {
 		claimStream, err = c.claimCandidate(ctx, &p, parked, launchProfile, lp, ov, env, source)
+		if errors.Is(err, ErrCodecUnsupportedByHost) {
+			// The parked GPU cannot encode the launch's codec: a failed check 4.
+			c.supersedeParkedHolder(ctx, userID, parked.ID)
+			return LaunchResult{}, &ParkedClaimRefusedError{HolderID: parked.ID}
+		}
 		if err != nil {
 			return LaunchResult{}, err
 		}
+	}
+	if afterParkedRead != nil {
+		afterParkedRead()
 	}
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
 	var refused *ParkedClaimRefusedError
 	var inUse *HomeInUseError
 	switch {
-	case !lp.parked && errors.As(err, &inUse) && inUse.parkedID != "":
-		// The caller's own parked Steam still holds this home: retryable like a
-		// refused claim, never a 409 the client does not retry.
-		c.supersedeParkedClaim(ctx, userID, inUse.parkedID)
-		err = &ParkedClaimRefusedError{ParkedID: inUse.parkedID}
+	case !lp.parked && errors.As(err, &inUse) && (inUse.parkedID != "" || inUse.releasedID != ""):
+		// The caller's own warm-Steam runtime still holds this home: retryable
+		// like a refused claim, never a 409 the client does not retry.
+		if inUse.parkedID != "" {
+			c.supersedeParkedHolder(ctx, userID, inUse.parkedID)
+		}
+		err = &ParkedClaimRefusedError{HolderID: inUse.parkedID + inUse.releasedID}
+	case p.claim != nil && errors.As(err, &refused) && refused.Warming:
+		// Left to finish warming; the client's retry claims it once running.
 	case p.claim != nil && errors.Is(err, ErrCapacityExhausted):
-		// The parked session stops and the client's retry launches cold.
-		c.supersedeParkedClaim(ctx, userID, p.claim.id)
+		// The parked session stops and the client's retry launches cold. This
+		// includes a claim that ran out of placement retries under contention,
+		// which is rare enough not to tell apart.
+		c.supersedeParkedHolder(ctx, userID, p.claim.id)
 		if !errors.As(err, &refused) {
-			err = &ParkedClaimRefusedError{ParkedID: p.claim.id}
+			err = &ParkedClaimRefusedError{HolderID: p.claim.id}
 		}
 	case !lp.parked && errors.Is(err, ErrCapacityExhausted):
 		c.evictParkedFor(ctx, p)
 	}
 	if err != nil {
-		c.logVramVetoRejection(userID, app.ID, err)
-		c.logHostNotReadyRejection(userID, app.ID, err)
-		c.logNoHostRejection(userID, app.ID, err)
+		if !lp.parked { // a refused heartbeat is logged by the heartbeat, at Debug
+			c.logVramVetoRejection(userID, app.ID, err)
+			c.logHostNotReadyRejection(userID, app.ID, err)
+			c.logNoHostRejection(userID, app.ID, err)
+		}
 		return LaunchResult{}, err
 	}
 	if p.claim != nil {
 		sess.AdoptSessionID = p.claim.id
 	}
 	if !lp.parked {
-		c.afterLaunchAdmitted(ctx, userID, app, parked.ID != "")
+		c.afterLaunchAdmitted(ctx, userID, app)
 	}
 	c.log.Info("session assigned", "session_id", sess.ID, "host_id", deref(sess.HostID), "gpu_index", derefI32(sess.GPUIndex),
 		"reserved_encode_slots", sess.ReservedSlots,
@@ -532,14 +549,19 @@ func (c *Coordinator) persistPlacedStream(ctx context.Context, sess *Session, ps
 	ps.applyTo(sess)
 }
 
+// afterParkedRead runs between the launch's parked-session read and its
+// scheduling transaction. Test-only; nil in production.
+var afterParkedRead func()
+
 // claimCandidate resolves the launch's stream on the parked session's GPU and
 // sets p up to claim it (claim check 4 compares the result in the scheduling
 // transaction).
 func (c *Coordinator) claimCandidate(ctx context.Context, p *CreateParams, k parkedRef,
 	launchProfile profile.LaunchProfile, lp LaunchParams, ov StreamOverride, env ProbeEnvelope, source string,
 ) (placedStream, error) {
+	// Logged under the parked id the stream is matched against.
 	prov := Session{
-		UserID: p.UserID, AppID: p.AppID, HostID: &k.HostID, GPUIndex: &k.GPUIndex,
+		ID: k.ID, UserID: p.UserID, AppID: p.AppID, HostID: &k.HostID, GPUIndex: &k.GPUIndex,
 		Width: p.Width, Height: p.Height, FPS: p.FPS, BitrateKbps: p.BitrateKbps,
 		H264Profile: p.H264Profile, Codec: wireCodecH264, Playout0Ms: p.Playout0Ms,
 	}
@@ -557,9 +579,10 @@ func (c *Coordinator) claimCandidate(ctx context.Context, p *CreateParams, k par
 	return ps, nil
 }
 
-// supersedeParkedClaim stops the parked session a claim could not adopt. No
-// suppression: the launch is inside its family.
-func (c *Coordinator) supersedeParkedClaim(ctx context.Context, userID, parkedID string) {
+// supersedeParkedHolder stops the caller's parked session that a launch inside
+// its family could not adopt or must not wait behind. No suppression: the
+// launch is inside the family.
+func (c *Coordinator) supersedeParkedHolder(ctx context.Context, userID, parkedID string) {
 	if _, err := c.stopParked(ctx, StopReasonParkedSuperseded, parkedFilter{UserID: userID, ID: parkedID}); err != nil {
 		c.log.Warn("warm steam: stopping an unclaimable parked session failed", "session_id", parkedID, "err", err)
 	}
@@ -988,9 +1011,16 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 				return false
 			}
 		}
-		wire, ok := wireAssign(assign, c.epochParks(hostID, epoch))
+		wire, ok := wireAssign(assign, c.epochParks(hostID, epoch), c.warmOn())
 		if !ok {
-			c.failSession(sessionID, "assign dispatch failed: the agent does not support parked sessions")
+			c.failSession(sessionID, "assign dispatch failed: the agent connection cannot take a parked session or an adoption")
+			if assign.AdoptSessionID != "" {
+				// The runtime the claim or park ended would otherwise stay up on the home.
+				cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: assign.AdoptSessionID, Reason: "error"}
+				if err := c.dispatcher.Send(hostID, cmd); err != nil {
+					c.log.Warn("stopping an unadoptable runtime failed", "session_id", assign.AdoptSessionID, "err", err)
+				}
+			}
 			return false
 		}
 		capable := epoch != nil && epoch.SupportsHomeCleanup()

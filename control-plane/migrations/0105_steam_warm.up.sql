@@ -3,6 +3,9 @@
 -- `users`, `user_profile_preferences` and the 0105 migration line. Every
 -- existing session is a play and the switch defaults off, so nothing changes
 -- on upgrade.
+-- Locks: the CHECK-validating ADD COLUMN and the non-concurrent unique index
+-- scan `sessions` under ACCESS EXCLUSIVE / SHARE inside this transaction. Fine at
+-- today's row counts; a large history table makes this a short write outage.
 BEGIN;
 
 ALTER TABLE sessions

@@ -99,6 +99,15 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
 	var settling *homeHoldSettlingError
+	var inUse *HomeInUseError
+	if errors.As(err, &inUse) && (inUse.parkedID != "" || inUse.releasedID != "") {
+		// A console launch never claims: it is direct-display, a parked session
+		// stream_only. Stop the parked holder; its terminal report re-runs auto-start.
+		if inUse.parkedID != "" {
+			c.supersedeParkedHolder(ctx, userID, inUse.parkedID)
+		}
+		return "", fmt.Errorf("console auto-start: schedule: %w (a warm-Steam runtime is stopping)", ErrConsoleHomeSettling)
+	}
 	if errors.As(err, &settling) {
 		return "", fmt.Errorf("console auto-start: schedule: %w (session %s)", ErrConsoleHomeSettling, settling.holder)
 	}
@@ -107,6 +116,7 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	}
 	c.log.Info("console auto-start: session scheduled",
 		"session_id", sess.ID, "host_id", hostID, "user_id", userID, "app_id", appID)
+	c.afterLaunchAdmitted(ctx, userID, app)
 
 	// Resolve the dispatchable spec: the per-(user, app) home mount for a
 	// managed-home app, plus the tile's STEAM_STARTUP_FLAGS for a derived tile.

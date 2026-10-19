@@ -74,9 +74,10 @@ type HomeInUseError struct {
 	// SessionID is empty when the holder may not be named: a parked session
 	// (control-api.md §Warm Steam). writeHomeInUse then omits it.
 	SessionID string
-	// parkedID is that unnamed parked holder, for the launch path's 503
-	// (LaunchByProfile). Never serialized.
-	parkedID string
+	// parkedID / releasedID is that unnamed holder, a parked session or a
+	// released held runtime, for the launch path's 503 (LaunchByProfile). Never
+	// serialized.
+	parkedID, releasedID string
 	// Stopping: the session is already tearing down, so the caller only has to
 	// retry in a moment (#434). It changes the message, never the code.
 	Stopping bool

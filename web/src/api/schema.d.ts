@@ -1011,7 +1011,7 @@ export interface paths {
          *     it ALWAYS answers 204 with no body, whatever it did: it starts a parked session when
          *     every rule allows one, and sets the caller's parked session's deadline to now plus
          *     steam_warm_idle_minutes. The web client calls it every 60 s while the library page is
-         *     open.
+         *     open. Like every bearer route it may answer 426 client_too_old first (x-global-responses).
          */
         put: {
             parameters: {
@@ -2803,7 +2803,13 @@ export interface paths {
         put?: never;
         /**
          * Launch a session; returns signaling coordinates.
-         * @description UI-P5 adds ONE NEW FAILURE MODE on this existing endpoint: a profile_id outside the
+         * @description AMENDMENT 39 (#759): a launch of a Steam parent or derived tile by a caller who holds a
+         *     parked session may adopt it (control-api.md §Warm Steam, "Claim"); request and 201
+         *     unchanged. When the claim is refused, or the caller's parked session or released runtime
+         *     still holds the home, the answer is 503 capacity_exhausted with Retry-After: 2, never
+         *     409 home_in_use.
+         *
+         *     UI-P5 adds ONE NEW FAILURE MODE on this existing endpoint: a profile_id outside the
          *     app's launchable allow-list is 409 profile_not_launchable_for_app, and no session row
          *     persists.
          *
@@ -8208,7 +8214,7 @@ export interface components {
             live_sessions?: number;
             /**
              * Format: uuid
-             * @description Steam library discovery Phase 3, ADDITIVE: present on home_in_use when the guard could name the CONFLICTING live session - the one already holding the home. It is here so the client can offer "go to your running session" with a link instead of a dead-end toast. OMITTED rather than empty when the conflict is known but the session is not, so a client branches on presence and never renders a link to nowhere. Load-bearing once derived tiles exist: the lock is held by the PARENT's home, so a user who clicks a game tile can be refused because a DIFFERENT app (the Steam launcher, or another game from the same install) is running, and without the session id the refusal reads as a bug. See control-api.md §Derived tiles.
+             * @description Steam library discovery Phase 3, ADDITIVE: present on home_in_use when the guard could name the CONFLICTING live session - the one already holding the home. It is here so the client can offer "go to your running session" with a link instead of a dead-end toast. OMITTED rather than empty when the conflict is known but the session is not, so a client branches on presence and never renders a link to nowhere. Also omitted when the holder is the caller's parked session or released runtime (amendment 39). Load-bearing once derived tiles exist: the lock is held by the PARENT's home, so a user who clicks a game tile can be refused because a DIFFERENT app (the Steam launcher, or another game from the same install) is running, and without the session id the refusal reads as a bug. See control-api.md §Derived tiles.
              */
             session_id?: string;
             /** @description Steam library discovery Phase 3, ADDITIVE: present on the 409 conflict from DELETE /v1/apps/{id} when the app has derived tiles and ?delete_derived=true was not sent. A LIST, not a count - the point of the confirmation is that the admin sees what they are about to destroy. Capped; an empty array means the tiles could not be listed, never that there are none. */
@@ -11860,6 +11866,8 @@ export interface components {
         /** @description no_host_available / capacity_exhausted / host_not_ready (amendment 11: a failing evidence-based readiness check is the only reason no host qualified) — well-formed but cannot be placed now (retryable). Amendment 12 (#296): an explicit stream.codec is a codec constraint applied at placement; when a GPU that can encode it exists but none is free the answer is capacity_exhausted, and when no online usable GPU can encode it the answer is no_host_available, both with a message naming the codec. No new code. */
         Unavailable: {
             headers: {
+                /** @description delta-seconds; MAY accompany capacity_exhausted (control-api.md §Admission control, (4)); 2 on a refused warm-Steam claim (amendment 39). */
+                "Retry-After"?: number;
                 [name: string]: unknown;
             };
             content: {

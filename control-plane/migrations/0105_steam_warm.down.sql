@@ -3,6 +3,8 @@
 -- Recovery after a refusal: golang-migrate leaves schema_migrations dirty at
 -- 105. Once the parked sessions have stopped, run `migrate ... force 105`, then
 -- the down again.
+-- Roll the control-plane binary back only after this down migration: an older
+-- binary reads a live parked row as an ordinary session.
 -- The terminal parked rows are deleted (metrics, trace, clock and token rows
 -- cascade): dropping `kind` without that would bring each one back as a play in
 -- the user's history, highlights and quota.
