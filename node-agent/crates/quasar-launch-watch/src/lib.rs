@@ -140,6 +140,8 @@ pub struct Watcher {
     /// only if it still stands [`USER_WAIT`] after the caller's key press.
     answers_notice: bool,
     notice_pressed: Option<Instant>,
+    /// gamescope's focused app as last read.
+    focused: Option<u32>,
     /// The last window list read, for the helper's pin.
     last_windows: Vec<WindowInfo>,
 }
@@ -172,6 +174,7 @@ impl Watcher {
             interstitial_since: None,
             answers_notice: false,
             notice_pressed: None,
+            focused: None,
             last_windows: Vec::new(),
         }
     }
@@ -227,6 +230,7 @@ impl Watcher {
         // On screen is gamescope's published focus alone; an error skips
         // the check for this pass, leaving the last reported value standing.
         if let Ok(focused) = self.windows.focused_app() {
+            self.focused = focused;
             let on_screen = focused == Some(self.cfg.appid);
             if on_screen != self.last_game_window {
                 self.last_game_window = on_screen;
@@ -293,6 +297,22 @@ impl Watcher {
     /// The caller pressed its answer to the notice at `now`.
     pub fn notice_pressed(&mut self, now: Instant) {
         self.notice_pressed.get_or_insert(now);
+    }
+
+    /// The caller will not answer the notice: report it as any wait for the user.
+    pub fn reveal_notice(&mut self) {
+        self.answers_notice = false;
+    }
+
+    /// The notice has stood [`USER_WAIT`] and nothing else of Steam's needs the user: no
+    /// sign-in, no other wait in the log, no dialog window. The one state a key press may answer.
+    pub fn notice_alone(&self, now: Instant) -> bool {
+        self.interstitial_standing(now) && self.login.needs.is_none() && self.active_needs.is_none()
+    }
+
+    /// gamescope's `GAMESCOPE_FOCUSED_APP` as last read; `None` while unset or unread.
+    pub fn focused(&self) -> Option<u32> {
+        self.focused
     }
 
     /// The notice stands, and an answering caller has not yet given its press time to work.
@@ -1038,6 +1058,8 @@ impl Quit {
     /// Made right after the close request went out, so the cloud log is read from then.
     pub fn new(proc_root: &Path, steam_log_dir: &Path, appid: u32, now: Instant) -> Self {
         let step = match game_running(proc_root, appid) {
+            // ponytail: a game that exited just before the quit may still be syncing; its sync
+            // is not waited for (Steam keeps running, so it finishes anyway).
             Some(false) => QuitStep::NotRunning,
             _ => QuitStep::Closing(now),
         };

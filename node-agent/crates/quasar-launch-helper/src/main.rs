@@ -16,7 +16,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,7 @@ const RECONNECT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// An empty line this often keeps the agent from dropping a quiet connection, so a command
 /// finds the helper connected.
-const KEEPALIVE: Duration = Duration::from_millis(500);
+const KEEPALIVE: Duration = Duration::from_millis(250);
 /// The longest command is `launch 4294967295`.
 const MAX_COMMAND: usize = 64;
 /// `steam` hands a command to the running client and exits; more than this many still
@@ -52,6 +52,7 @@ const MAX_CHILDREN: usize = 8;
 const MAX_WINDOWS: usize = 256;
 /// Longest property read, in 32-bit units.
 const MAX_PROPERTY: u32 = 256;
+const STEAM: &str = "/usr/bin/steam";
 /// X keysym `Return`.
 const XK_RETURN: u32 = 0xff0d;
 
@@ -72,6 +73,9 @@ fn main() {
             eprintln!("quasar-launch-helper: watching Steam app {appid}");
             helper.watch(appid, false);
         }
+        // ponytail: a helper the launcher restarts (a crash, or a game killing it) forgets a
+        // target armed by `launch` and comes back watch-only or on the flags' game; observe in
+        // S7, and add a `watch <appid>` command if it matters.
         None => eprintln!("quasar-launch-helper: no game in the flags; waiting for a launch"),
     }
     if helper.dismiss {
@@ -116,7 +120,7 @@ struct Helper {
     notice: Notice,
     quit: Option<Quit>,
     children: Vec<Child>,
-    x11: X11Windows,
+    screen: Box<dyn Screen>,
     /// `steam` from `PATH`; a test points it at a stand-in.
     steam: PathBuf,
 }
@@ -124,9 +128,16 @@ struct Helper {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Notice {
     Waiting,
-    Pinned,
+    /// Steam's window was pinned at this instant; the press waits for its focus.
+    Pinned(Instant),
     Answered,
+    /// Something else was showing, or Steam's window never took focus: the user answers.
+    Refused,
 }
+
+/// How long the press waits for Steam's window to take focus after its pin. S0 measured the
+/// focus moving within 1.2 s of a pin.
+const NOTICE_FOCUS_WAIT: Duration = Duration::from_secs(2);
 
 impl Helper {
     fn new(proc_root: PathBuf, log_dir: PathBuf, dismiss: bool) -> Self {
@@ -141,19 +152,29 @@ impl Helper {
             notice: Notice::Waiting,
             quit: None,
             children: Vec::new(),
-            x11: X11Windows::default(),
-            steam: "steam".into(),
+            screen: Box::<X11Windows>::default(),
+            // The image's `steam` RPM puts it here; `PATH` only for an image without it.
+            steam: if Path::new(STEAM).is_file() {
+                STEAM
+            } else {
+                "steam"
+            }
+            .into(),
         }
     }
 
     fn watch(&mut self, appid: u32, launched: bool) {
+        self.watch_with(appid, launched, Box::<X11Windows>::default());
+    }
+
+    fn watch_with(&mut self, appid: u32, launched: bool, windows: Box<dyn Windows + Send>) {
         let mut watcher = Watcher::new(
             WatchConfig {
                 proc_root: self.proc_root.clone(),
                 steam_log_dir: self.log_dir.clone(),
                 appid,
             },
-            Box::<X11Windows>::default(),
+            windows,
         );
         if self.dismiss {
             watcher.answer_notice();
@@ -192,7 +213,7 @@ impl Helper {
                     );
                     return;
                 }
-                match self.x11.close(appid) {
+                match self.screen.close(appid) {
                     Ok(sent) => eprintln!(
                         "quasar-launch-helper: asked {sent} window(s) of Steam app {appid} to close"
                     ),
@@ -253,44 +274,73 @@ impl Helper {
         self.step_quit(now, agent);
     }
 
+    /// `dismiss_safe`: answer Steam's controller notice with one Return, and only when nothing
+    /// else can take the key: the notice is the one standing wait, nothing else of Steam's
+    /// needs the user, Steam's window was pinned a pass before and gamescope reports it
+    /// focused. Otherwise the notice is shown to the user and nothing is pressed.
     fn answer_notice(&mut self, now: Instant) {
-        let standing = self
-            .watcher
-            .as_ref()
-            .is_some_and(|w| w.interstitial_standing(now));
-        if !self.dismiss || !standing {
+        if !self.dismiss || matches!(self.notice, Notice::Answered | Notice::Refused) {
             return;
         }
-        match self.notice {
-            // A `-silent` Steam shows the notice only with its window pinned; the key press
-            // goes to the focused window a pass later.
-            Notice::Waiting if self.launched => self.notice = Notice::Pinned,
-            Notice::Waiting | Notice::Pinned => {
-                match self.x11.press_return() {
-                    Ok(()) => eprintln!(
-                        "quasar-launch-helper: answered Steam's controller notice with Return (dismiss_safe)"
-                    ),
-                    Err(error) => eprintln!(
-                        "quasar-launch-helper: could not answer Steam's controller notice: {error}"
-                    ),
+        let Some(watcher) = self.watcher.as_mut() else {
+            return;
+        };
+        if !watcher.interstitial_standing(now) {
+            return;
+        }
+        let refusal = if self.needs_user || !watcher.notice_alone(now) {
+            Some("Steam shows something else too")
+        } else {
+            match self.notice {
+                Notice::Waiting => {
+                    self.notice = Notice::Pinned(now);
+                    None
                 }
-                self.notice = Notice::Answered;
-                // Still standing 2 s after the press, the notice is shown to the user.
-                if let Some(watcher) = &mut self.watcher {
+                Notice::Pinned(_) if self.pinned != Some(Pin::Steam) => {
+                    Some("Steam's window could not be pinned")
+                }
+                Notice::Pinned(_) if watcher.focused() == Some(STEAM_CLIENT_APPID) => {
+                    match self.screen.press_return() {
+                        Ok(()) => eprintln!(
+                            "quasar-launch-helper: answered Steam's controller notice with Return (dismiss_safe)"
+                        ),
+                        Err(error) => eprintln!(
+                            "quasar-launch-helper: could not answer Steam's controller notice: {error}"
+                        ),
+                    }
+                    self.notice = Notice::Answered;
+                    // Still standing 2 s after the press, the notice is shown to the user.
                     watcher.notice_pressed(now);
+                    None
                 }
+                Notice::Pinned(at) if now.saturating_duration_since(at) >= NOTICE_FOCUS_WAIT => {
+                    Some("Steam's window never took focus")
+                }
+                _ => None,
             }
-            Notice::Answered => {}
+        };
+        if let Some(why) = refusal {
+            eprintln!(
+                "quasar-launch-helper: not answering Steam's controller notice: {why}; it is shown"
+            );
+            watcher.reveal_notice();
+            self.notice = Notice::Refused;
         }
     }
 
     /// The pin a launched game wants: the game once its window exists, else Steam's window
     /// while Steam needs the user or its notice is being answered.
     fn wanted_pin(&self) -> Option<Pin> {
-        let watcher = self.watcher.as_ref().filter(|_| self.launched)?;
+        let watcher = self.watcher.as_ref()?;
+        let answering = matches!(self.notice, Notice::Pinned(_));
+        // A tile launched from its flags is pinned only once the helper has pinned it for the
+        // notice; from then on the game must be pinned back too.
+        if !(self.launched || answering || self.pinned.is_some()) {
+            return None;
+        }
         if watcher.has_window(watcher.appid()) {
             Some(Pin::Game(watcher.appid()))
-        } else if self.needs_user || self.notice == Notice::Pinned {
+        } else if answering || (self.launched && self.needs_user) {
             Some(Pin::Steam)
         } else {
             None
@@ -305,7 +355,7 @@ impl Helper {
             Pin::Game(appid) => appid,
             Pin::Steam => STEAM_CLIENT_APPID,
         };
-        match self.x11.pin(appid) {
+        match self.screen.pin(appid) {
             Ok(()) => {
                 eprintln!("quasar-launch-helper: pinned the baselayer to {appid}");
                 self.pinned = Some(pin);
@@ -353,6 +403,8 @@ impl Helper {
     }
 }
 
+// ponytail: a pid that exits between the `/proc` scan and kill(2) can be reused by another of
+// this user's processes in the container, which then gets the signal; the window is one pass.
 fn signal(pids: &[u32], signal: libc::c_int) {
     for &pid in pids {
         let Ok(pid) = libc::pid_t::try_from(pid) else {
@@ -626,21 +678,28 @@ impl X11Windows {
     }
 }
 
-impl X11Windows {
+/// What the helper does on gamescope's display; a test stands in for it.
+trait Screen {
     /// Pin gamescope's baselayer to `appid`'s windows: gamescope re-reads the root
     /// `GAMESCOPECTRL_BASELAYER_APPID` on any change and focuses the first listed appid with
     /// a window (#723 spike).
+    fn pin(&mut self, appid: u32) -> std::io::Result<()>;
+    /// `WM_DELETE_WINDOW` to every viewable top-level window of `appid` that lists it in
+    /// `WM_PROTOCOLS`, as a player closing it would. How many were asked.
+    fn close(&mut self, appid: u32) -> std::io::Result<usize>;
+    /// One XTEST Return press and release, to whatever window has the input focus.
+    fn press_return(&mut self) -> std::io::Result<()>;
+}
+
+impl Screen for X11Windows {
     fn pin(&mut self, appid: u32) -> std::io::Result<()> {
         self.read(|x| x.pin(appid))
     }
 
-    /// `WM_DELETE_WINDOW` to every viewable top-level window of `appid` that lists it in
-    /// `WM_PROTOCOLS`, as a player closing it would. How many were asked.
     fn close(&mut self, appid: u32) -> std::io::Result<usize> {
         self.read(|x| x.close(appid))
     }
 
-    /// One XTEST Return press and release, to whatever window has the input focus.
     fn press_return(&mut self) -> std::io::Result<()> {
         self.read(X11::press_return)
     }
@@ -863,6 +922,7 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
 
     /// Against a real X server on `DISPLAY` (Xvfb), not gamescope: run with `-- --ignored`.
     /// gamescope's and Steam's atoms are set here by hand, the way they publish them.
@@ -1207,6 +1267,36 @@ mod tests {
             .contains("\"ok\":false"));
     }
 
+    #[test]
+    fn at_most_eight_steam_commands_run_at_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let steam = dir.path().join("steam");
+        std::fs::write(&steam, "#!/bin/sh\nexec sleep 5\n").unwrap();
+        std::fs::set_permissions(&steam, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut helper = Helper::new(dir.path().join("proc"), dir.path().join("logs"), false);
+        helper.steam = steam;
+        for n in 0..MAX_CHILDREN {
+            assert!(helper.run_steam(&["-applaunch", "620"]), "command {n}");
+        }
+        assert!(
+            !helper.run_steam(&["-applaunch", "620"]),
+            "the ninth is refused"
+        );
+        for mut child in std::mem::take(&mut helper.children) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            helper.run_steam(&["-applaunch", "620"]),
+            "room again once they are gone"
+        );
+        for mut child in std::mem::take(&mut helper.children) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     struct Fake(Vec<WindowInfo>);
 
     impl Windows for Fake {
@@ -1243,13 +1333,19 @@ mod tests {
         helper.needs_user = true;
         assert_eq!(helper.wanted_pin(), Some(Pin::Steam));
         helper.needs_user = false;
-        helper.notice = Notice::Pinned;
+        helper.notice = Notice::Pinned(Instant::now());
         assert_eq!(helper.wanted_pin(), Some(Pin::Steam));
         helper.launched = false;
         assert_eq!(
             helper.wanted_pin(),
+            Some(Pin::Steam),
+            "answering the notice pins a tile Steam launched from its flags too"
+        );
+        helper.notice = Notice::Waiting;
+        assert_eq!(
+            helper.wanted_pin(),
             None,
-            "a game Steam launched from its flags is not ours to pin"
+            "otherwise a game Steam launched from its flags is not ours to pin"
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -1265,54 +1361,256 @@ mod tests {
         assert_eq!(helper.wanted_pin(), Some(Pin::Game(620)), "the game wins");
     }
 
-    /// A helper watching 620 from its flags, with the controller notice standing since `t0`.
-    fn notice(dismiss: bool) -> (tempfile::TempDir, Helper, Agent, Instant) {
-        let dir = tempfile::tempdir().unwrap();
-        let logs = dir.path().join("logs");
-        std::fs::create_dir_all(&logs).unwrap();
-        std::fs::write(logs.join("console_log.txt"), "").unwrap();
-        let mut helper = Helper::new(dir.path().join("proc"), logs.clone(), dismiss);
-        helper.watch(620, false);
-        let mut agent = Agent::new(dir.path().join("none.sock"));
-        let t0 = Instant::now();
-        helper.pass(t0, &mut agent);
-        let mut log = std::fs::OpenOptions::new()
-            .append(true)
-            .open(logs.join("console_log.txt"))
-            .unwrap();
-        writeln!(log, "GameAction [AppID 620, ActionID 1] : LaunchApp waiting for user response to ShowInterstitials \"\"").unwrap();
-        helper.pass(t0, &mut agent);
-        (dir, helper, agent, t0)
+    /// gamescope as a test sets it: its windows and focus, and what the helper did to it.
+    #[derive(Clone, Default)]
+    struct Scene {
+        windows: Arc<Mutex<Vec<WindowInfo>>>,
+        focus: Arc<Mutex<Option<u32>>>,
+        actions: Arc<Mutex<Vec<String>>>,
+        pin_fails: bool,
+    }
+
+    impl Windows for Scene {
+        fn mapped(&mut self) -> std::io::Result<Vec<WindowInfo>> {
+            Ok(self.windows.lock().unwrap().clone())
+        }
+        fn focused_app(&mut self) -> std::io::Result<Option<u32>> {
+            Ok(*self.focus.lock().unwrap())
+        }
+    }
+
+    impl Screen for Scene {
+        fn pin(&mut self, appid: u32) -> std::io::Result<()> {
+            if self.pin_fails {
+                return Err(std::io::Error::other("no display"));
+            }
+            self.actions.lock().unwrap().push(format!("pin {appid}"));
+            Ok(())
+        }
+        fn close(&mut self, appid: u32) -> std::io::Result<usize> {
+            self.actions.lock().unwrap().push(format!("close {appid}"));
+            Ok(0)
+        }
+        fn press_return(&mut self) -> std::io::Result<()> {
+            self.actions.lock().unwrap().push("return".into());
+            Ok(())
+        }
+    }
+
+    impl Scene {
+        fn did(&self) -> Vec<String> {
+            self.actions.lock().unwrap().clone()
+        }
+        fn focus(&self, appid: Option<u32>) {
+            *self.focus.lock().unwrap() = appid;
+        }
+    }
+
+    struct Notice620 {
+        _dir: tempfile::TempDir,
+        logs: PathBuf,
+        helper: Helper,
+        agent: Agent,
+        scene: Scene,
+        t0: Instant,
+    }
+
+    impl Notice620 {
+        fn pass(&mut self, after: Duration) {
+            self.helper.pass(self.t0 + after, &mut self.agent);
+        }
+        fn log(&self, file: &str, line: &str) {
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.logs.join(file))
+                .unwrap();
+            writeln!(log, "{line}").unwrap();
+        }
+        /// The notice reported to the agent, by the reason the helper sent.
+        fn reported(&self) -> Option<String> {
+            self.agent.latest[NEEDS].clone()
+        }
     }
 
     const NEEDS: usize = 2;
+    const GRACE: Duration = Duration::from_millis(2100);
+    const PASS: Duration = Duration::from_millis(250);
 
-    #[test]
-    fn under_show_the_notice_is_revealed_at_the_grace_and_never_answered() {
-        let (_dir, mut helper, mut agent, t0) = notice(false);
-        helper.pass(t0 + Duration::from_millis(2100), &mut agent);
-        assert!(agent.latest[NEEDS]
-            .as_deref()
-            .is_some_and(|l| l.contains("\"reason\":\"other\"")));
-        assert_eq!(helper.notice, Notice::Waiting, "show: never pressed");
+    /// A helper watching 620 (`launched`: from a `launch` command, else from the tile's
+    /// flags), with Steam's controller notice standing since `t0`.
+    fn notice(dismiss: bool, launched: bool, scene: Scene) -> Notice620 {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        for file in ["console_log.txt", "steamui_login.txt"] {
+            std::fs::write(logs.join(file), "").unwrap();
+        }
+        let mut helper = Helper::new(dir.path().join("proc"), logs.clone(), dismiss);
+        helper.watch_with(620, launched, Box::new(scene.clone()));
+        helper.screen = Box::new(scene.clone());
+        let mut n = Notice620 {
+            _dir: dir,
+            logs,
+            helper,
+            agent: Agent::new("/nonexistent/launch.sock".into()),
+            scene,
+            t0: Instant::now(),
+        };
+        n.pass(Duration::ZERO);
+        n.log(
+            "console_log.txt",
+            "GameAction [AppID 620, ActionID 1] : LaunchApp waiting for user response to ShowInterstitials \"\"",
+        );
+        n.pass(Duration::ZERO);
+        n
     }
 
     #[test]
-    fn under_dismiss_safe_the_notice_is_pressed_first_and_revealed_only_if_it_stands() {
-        let (_dir, mut helper, mut agent, t0) = notice(true);
-        let pressed = t0 + Duration::from_millis(2100);
-        helper.pass(pressed, &mut agent);
-        assert_eq!(helper.notice, Notice::Answered, "pressed at the grace");
-        assert!(agent.latest[NEEDS].is_none(), "not revealed at the grace");
-        helper.pass(pressed + Duration::from_millis(1900), &mut agent);
-        assert!(agent.latest[NEEDS].is_none());
-        helper.pass(pressed + Duration::from_millis(2100), &mut agent);
+    fn under_show_the_notice_is_revealed_at_the_grace_and_never_answered() {
+        let mut n = notice(false, false, Scene::default());
+        n.pass(GRACE);
+        assert!(n
+            .reported()
+            .is_some_and(|l| l.contains("\"reason\":\"other\"")));
+        assert_eq!(n.helper.notice, Notice::Waiting);
         assert!(
-            agent.latest[NEEDS]
-                .as_deref()
-                .is_some_and(|l| l.contains("\"reason\":\"other\"")),
-            "still the wait 2 s after the press"
+            n.scene.did().is_empty(),
+            "show: nothing is pinned or pressed"
         );
+    }
+
+    #[test]
+    fn under_dismiss_safe_steams_window_is_pinned_then_answered_once_it_has_focus() {
+        for launched in [false, true] {
+            let mut n = notice(true, launched, Scene::default());
+            n.pass(GRACE);
+            assert_eq!(n.scene.did(), ["pin 769"], "pinned first ({launched})");
+            assert!(n.reported().is_none(), "not revealed while answering");
+            n.pass(GRACE + PASS);
+            assert_eq!(
+                n.scene.did(),
+                ["pin 769"],
+                "no press before Steam has focus"
+            );
+            n.scene.focus(Some(STEAM_CLIENT_APPID));
+            let pressed = GRACE + PASS * 2;
+            n.pass(pressed);
+            assert_eq!(n.scene.did(), ["pin 769", "return"]);
+            assert_eq!(n.helper.notice, Notice::Answered);
+            n.pass(pressed + Duration::from_millis(1900));
+            assert!(n.reported().is_none());
+            n.pass(pressed + GRACE);
+            assert!(
+                n.reported()
+                    .is_some_and(|l| l.contains("\"reason\":\"other\"")),
+                "still the wait 2 s after the press: shown"
+            );
+            // The game's window then takes the pin back, launched from its flags or not.
+            n.scene.windows.lock().unwrap().push(WindowInfo {
+                steam_game: Some(620),
+                wm_class: "portal2_linux".into(),
+                title: "Portal 2".into(),
+            });
+            n.pass(pressed + GRACE + PASS);
+            assert_eq!(n.scene.did(), ["pin 769", "return", "pin 620"]);
+        }
+    }
+
+    /// The press is refused: the notice is shown, and nothing gets the key.
+    fn assert_refused(n: &mut Notice620, at: Duration) {
+        assert_eq!(n.helper.notice, Notice::Refused, "refused");
+        n.pass(at + PASS);
+        assert!(
+            n.reported().is_some(),
+            "the notice, or what refused it, is shown"
+        );
+        assert!(
+            !n.scene.did().contains(&"return".to_string()),
+            "{:?}",
+            n.scene.did()
+        );
+    }
+
+    #[test]
+    fn under_dismiss_safe_nothing_is_pressed_while_steam_shows_anything_else() {
+        let dialog = |title: &str| WindowInfo {
+            steam_game: Some(STEAM_CLIENT_APPID),
+            wm_class: "steamwebhelper steam".into(),
+            title: title.into(),
+        };
+        for (why, window, login) in [
+            (
+                "a cloud conflict",
+                Some(dialog("Steam Cloud Conflict")),
+                None,
+            ),
+            (
+                "Steam Guard",
+                Some(dialog("Steam Guard - Computer Authorization Required")),
+                None,
+            ),
+            ("an EULA", Some(dialog("End User License Agreement")), None),
+            (
+                "a sign-in",
+                None,
+                Some("[2026-10-16 09:37:10] [ None ] SetLoginState: WaitingForCredentials - OK"),
+            ),
+        ] {
+            let scene = Scene::default();
+            scene.focus(Some(STEAM_CLIENT_APPID));
+            if let Some(window) = window {
+                scene.windows.lock().unwrap().push(window);
+            }
+            let mut n = notice(true, true, scene);
+            if let Some(line) = login {
+                n.log("steamui_login.txt", line);
+            }
+            n.pass(GRACE);
+            assert_refused(&mut n, GRACE);
+            assert!(n.helper.needs_user, "{why}");
+        }
+    }
+
+    #[test]
+    fn under_dismiss_safe_an_earlier_needs_user_report_refuses_the_press() {
+        let scene = Scene::default();
+        scene.focus(Some(STEAM_CLIENT_APPID));
+        let mut n = notice(true, true, scene);
+        // Steam needed the user for something this launch already.
+        n.helper.needs_user = true;
+        n.pass(GRACE);
+        assert_refused(&mut n, GRACE);
+    }
+
+    #[test]
+    fn under_dismiss_safe_a_window_that_never_takes_focus_is_not_pressed() {
+        for focus in [None, Some(620), Some(413091)] {
+            let mut n = notice(true, false, Scene::default());
+            n.scene.focus(focus);
+            n.pass(GRACE);
+            assert_eq!(n.scene.did(), ["pin 769"]);
+            n.pass(GRACE + Duration::from_millis(1900));
+            assert!(
+                matches!(n.helper.notice, Notice::Pinned(_)),
+                "still waiting for focus"
+            );
+            n.pass(GRACE + NOTICE_FOCUS_WAIT);
+            assert_refused(&mut n, GRACE + NOTICE_FOCUS_WAIT);
+        }
+    }
+
+    #[test]
+    fn under_dismiss_safe_a_pin_that_fails_is_not_pressed() {
+        let scene = Scene {
+            pin_fails: true,
+            ..Scene::default()
+        };
+        scene.focus(Some(STEAM_CLIENT_APPID));
+        let mut n = notice(true, false, scene);
+        n.pass(GRACE);
+        n.pass(GRACE + PASS);
+        assert_refused(&mut n, GRACE + PASS);
     }
 
     #[test]
