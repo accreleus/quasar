@@ -324,3 +324,120 @@ func TestHeartbeatNeverWaitsOnASettlingHold(t *testing.T) {
 		t.Error("heartbeat parked onto a settling hold")
 	}
 }
+
+// --- round 3: an assign the agent never took --------------------------------------
+
+// waitState polls until id reaches state.
+func waitState(t *testing.T, f *warmFixture, id, state string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if readRow(t, f.pool, id).State == state {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("session %s never reached %s (%+v)", id, state, readRow(t, f.pool, id))
+}
+
+func (f *warmFixture) holder(t *testing.T) string {
+	t.Helper()
+	var h *string
+	must(t, f.pool.QueryRow(context.Background(), `SELECT pending_home_session_id::text FROM managed_home_claims`).Scan(&h))
+	return deref(h)
+}
+
+// A claim whose assign never reaches the agent hands the home hold back to the
+// parked runtime the agent still runs. The agent's instant RH05 proof for the
+// never-seen play id, and the reconcile that asks for it, must not clear the
+// hold; only the parked runtime's own proof does.
+func TestAClaimTheAgentNeverSawReturnsTheHoldToTheParkedRuntime(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	k := f.park(t)
+	f.disp.dropEpoch()
+
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	q := res.Session.ID
+	waitState(t, f, q, "failed")
+	if got := f.holder(t); got != k {
+		t.Fatalf("hold = %q after the failed dispatch, want it back on the parked runtime %s", got, k)
+	}
+	if got := readRow(t, f.pool, k); got.StopReason != stopReasonRuntimeReleased {
+		t.Errorf("parked row %+v, want runtime_released", got)
+	}
+	if f.disp.stopReason(k) == "" {
+		t.Error("the parked runtime the claim could not hand over was not stopped")
+	}
+
+	// The agent proves the never-seen play id at once; reconcile asks again.
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: q, State: "stopped", HomeCleanupQualified: true})
+	f.coord.ReconcilePendingHomes(ctx, f.hostID, warmEpoch{f.disp})
+	if got := f.holder(t); got != k {
+		t.Fatalf("hold = %q after the play id's proof and the reconcile, want it kept on %s", got, k)
+	}
+	_, err = f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+	var refused *ParkedClaimRefusedError
+	if !errors.As(err, &refused) || refused.HolderID != k {
+		t.Fatalf("relaunch while the parked runtime stops = %v, want the 503 refusal", err)
+	}
+
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	if got := f.holder(t); got != "" {
+		t.Errorf("hold = %q after the parked runtime's proof, want cleared", got)
+	}
+}
+
+// The park side: a park whose assign never reaches the agent hands the hold back
+// to the ended play row whose runtime the agent still holds, and releases it.
+func TestAParkTheAgentNeverSawReturnsTheHoldToTheHeldRuntime(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	play := f.runningTile(t)
+	f.disp.dropEpoch()
+
+	f.coord.AgentState(ctx, f.hostID, heldStop(play))
+	k := ""
+	must(t, f.pool.QueryRow(ctx, `SELECT id::text FROM sessions WHERE kind = 'parked'`).Scan(&k))
+	waitState(t, f, k, "failed")
+	if got := f.holder(t); got != play {
+		t.Fatalf("hold = %q, want it back on the held play runtime %s", got, play)
+	}
+	if got := readRow(t, f.pool, play); got.StopReason != stopReasonRuntimeReleased {
+		t.Errorf("play row %+v, want runtime_released", got)
+	}
+	if f.disp.stopReason(play) == "" {
+		t.Error("the held runtime was not released")
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	if got := f.holder(t); got != play {
+		t.Errorf("hold = %q after the parked id's proof, want it kept on %s", got, play)
+	}
+}
+
+// The released marker overwrites any earlier reason but the served one.
+func TestMarkReleasedKeepsOnlyEntitlementRevoked(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	for reason, want := range map[string]string{
+		"user_requested":             stopReasonRuntimeReleased,
+		StopReasonEntitlementRevoked: StopReasonEntitlementRevoked,
+		"":                           stopReasonRuntimeReleased,
+	} {
+		sess, err := f.store.ScheduleAndCreate(ctx, launchParams(f.seedIDs))
+		if err != nil {
+			t.Fatalf("session: %v", err)
+		}
+		must(t, exec(t, f.pool, `UPDATE sessions SET state = 'stopped', stop_reason = NULLIF($2, '') WHERE id = $1::uuid`, sess.ID, reason))
+		tx, err := f.pool.Begin(ctx)
+		must(t, err)
+		must(t, markReleased(ctx, tx, sess.ID))
+		must(t, tx.Commit(ctx))
+		if got := readRow(t, f.pool, sess.ID).StopReason; got != want {
+			t.Errorf("after %q: stop_reason = %q, want %q", reason, got, want)
+		}
+	}
+}

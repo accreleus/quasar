@@ -248,6 +248,20 @@ func TestWarmSteamWaitsAnswer503WithRetryAfter2(t *testing.T) {
 		}
 	})
 
+	t.Run("user stop racing the held exit", func(t *testing.T) {
+		w := newWarmServer(t)
+		play := w.runningTile(t)
+		if _, err := w.coord.Stop(context.Background(), play, "user_requested"); err != nil {
+			t.Fatalf("stop: %v", err)
+		}
+		w.coord.AgentState(context.Background(), w.hostID, heldStop(play))
+		if got := readRow(t, w.pool, play); got.StopReason != stopReasonRuntimeReleased {
+			t.Fatalf("raced row %+v, want the released marker over user_requested", got)
+		}
+		resp, body := launch(w)
+		want503(t, resp, body)
+	})
+
 	t.Run("released held runtime", func(t *testing.T) {
 		w := newWarmServer(t)
 		play := w.runningTile(t)
