@@ -4307,7 +4307,7 @@ impl SessionManager {
                 match self.running.get_mut(&session_id).filter(|h| h.live()) {
                     Some(h) if h.swapping => {
                         warn!(
-                            token = "session-swap-rejected",
+                            token = "session-swap-busy",
                             "session {session_id} swap rejected: a swap is already running"
                         );
                         Some(ack(
