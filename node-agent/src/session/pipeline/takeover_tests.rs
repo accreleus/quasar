@@ -28,7 +28,7 @@ use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 /// that returns early counts as passed, so the skip is written past libtest's capture,
 /// once, and `scripts/verify/agent.sh` restates it. With `QUASAR_REQUIRE_LIVE_WEBRTC`
 /// set the skip is a failure (#571).
-fn live_webrtc_available() -> bool {
+pub(crate) fn live_webrtc_available() -> bool {
     gst::init().unwrap();
     let missing: Vec<&str> = [
         "interpipesink",
@@ -2210,13 +2210,27 @@ struct Session {
     swapped: bool,
     swap: std::sync::mpsc::Sender<crate::session::runner::SwapRequest>,
     display: std::sync::mpsc::Sender<crate::session::runner::DisplayUpdateRequest>,
+    adopt: std::sync::mpsc::Sender<crate::session::runner::AdoptRequest>,
+    /// The runner's id.
+    id: String,
+    /// Every event the runner sent, in order.
+    log: Vec<SessionEvent>,
 }
 
 impl Session {
     fn start(tag: &str, idle_timeout: Duration) -> Session {
+        Session::start_with(tag, idle_timeout, |_| {})
+    }
+
+    fn start_with(
+        tag: &str,
+        idle_timeout: Duration,
+        edit: impl FnOnce(&mut SessionConfig),
+    ) -> Session {
         trace_to_stderr();
         let mut cfg = host_cfg(false);
         cfg.idle_timeout = idle_timeout;
+        edit(&mut cfg);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (evt_tx, events) = mpsc::channel(256);
         let (diag_tx, _) = mpsc::channel(1);
@@ -2229,8 +2243,10 @@ impl Session {
         let (swap, swap_rx) = std::sync::mpsc::channel();
         let (display, display_rx) = std::sync::mpsc::channel();
         let (_, capture_rx) = std::sync::mpsc::channel();
+        let (adopt, adopt_rx) = std::sync::mpsc::channel();
         let metrics = Arc::new(SessionMetrics::new("smooth", cfg.stream.fps as u32));
         let (id, flag) = (format!("takeover-{tag}"), stop.clone());
+        let session_id = id.clone();
         let thread = std::thread::spawn(move || {
             crate::session::runner::run_blocking(
                 id,
@@ -2243,6 +2259,7 @@ impl Session {
                 display_rx,
                 capture_rx,
                 metrics,
+                adopt_rx,
             )
         });
         Session {
@@ -2257,6 +2274,9 @@ impl Session {
             swapped: false,
             swap,
             display,
+            adopt,
+            id: session_id,
+            log: Vec::new(),
         }
     }
 
@@ -2270,6 +2290,7 @@ impl Session {
         let deadline = Instant::now() + within;
         loop {
             while let Ok((_, event)) = self.events.try_recv() {
+                self.log.push(event.clone());
                 match event {
                     SessionEvent::Signaling(msg) => {
                         let pc = match &msg {
@@ -2585,7 +2606,10 @@ impl Session {
         self.pump(&mut nobody, Duration::from_secs(1), |_, _| false);
 
         self.swap
-            .send(SwapRequest { container: None })
+            .send(SwapRequest {
+                container: None,
+                in_place: false,
+            })
             .expect("swap lane");
         let swapped = self.pump(&mut nobody, Duration::from_secs(10), |s, _| s.swapped);
         assert!(swapped, "the swap never completed");
@@ -2898,3 +2922,6 @@ fn browser_host() {
 
 /// What the host hands `webrtcbin` per transport, and whether it is given back.
 mod aux_senders;
+
+/// Amendment 39 (#759): parked, held, adopted and in-place-swapped runtimes.
+mod warm_steam;

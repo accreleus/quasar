@@ -4,17 +4,18 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "Report-only Steam launch helper that runs inside the Steam app container"
+description = "Steam launch helper that runs inside the Steam app container"
 
 # Runs inside the Steam app container, beside untrusted game code, whatever that
 # image's libc: deploy/Dockerfile.vulkan builds it static against musl. Nothing here
 # may pull in GStreamer, glib or CUDA.
 [dependencies]
 quasar-launch-watch = { path = "../quasar-launch-watch" }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Pure-Rust X11 client: no libxcb, so the static build links no C library.
-x11rb = { version = "0.14", default-features = false }
+x11rb = { version = "0.14", default-features = false, features = ["xtest"] }
 
 [dev-dependencies]
 tempfile = "3"

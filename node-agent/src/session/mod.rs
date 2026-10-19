@@ -523,6 +523,9 @@ pub struct SessionConfig {
     /// own 200 ms default dominates the ~250 ms round-trip on the mic loopback test.
     /// Knob: `QUASAR_MIC_JITTER_MS` (default 60, target 50-75 ms).
     pub mic_jitter_ms: u32,
+    /// `session_assign.kind` (amendment 39); `None` from a control plane that predates it,
+    /// whose sessions are never held or parked.
+    pub kind: Option<crate::messages::SessionKind>,
 }
 
 /// Default `XDG_RUNTIME_DIR` for the Wayland socket. Matches the deploy run scripts.
@@ -603,6 +606,7 @@ impl SessionConfig {
             source_policy: None,
             image_id: None,
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
+            kind: None,
         }
     }
 
@@ -853,6 +857,7 @@ impl SessionConfig {
             source_policy: None,
             image_id: None,
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
+            kind: None,
         }
     }
 
