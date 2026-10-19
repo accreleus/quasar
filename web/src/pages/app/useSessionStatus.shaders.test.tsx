@@ -29,6 +29,19 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe("useSessionStatus — shaderPercent", () => {
+  it("returns to null when Steam finishes its shaders while the app is still booting", async () => {
+    let now = session("app booting", { step: "shaders", percent: 42 });
+    getSession.mockImplementation(async () => now);
+    const { result } = renderHook(() => useSessionStatus("tok", "s1", false, { current: false }));
+    await act(async () => {});
+    expect(result.current.shaderPercent).toBe(42);
+    now = session("app booting", null);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(result.current.shaderPercent).toBeNull();
+  });
+
   it("surfaces the shaders step while the app boots", async () => {
     expect(await read(session("app booting", { step: "shaders", percent: 42 }))).toBe(42);
   });

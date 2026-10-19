@@ -222,6 +222,7 @@
 
 /* Small print under the phase word, like the stall copy below it. */
 .sl-shaders {
+  min-height: 1.5em;
   margin: var(--s2) 0 0;
   color: var(--text-3);
   font-size: var(--t-sm);

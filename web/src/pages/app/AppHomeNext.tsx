@@ -46,7 +46,6 @@ import {
 import { useLibraryCatalog } from "./libraryCatalog";
 import { useLibrarySearch } from "./librarySearchContext";
 import { useNewDesign } from "../../settings/OverlayPreferencesContext";
-import { useSteamWarmHeartbeat } from "./useSteamWarmHeartbeat";
 import { LetterIndex } from "./library/LetterIndex";
 import { sectioned, tileMeta } from "./library/LetterSections";
 import { LibraryToolbar } from "./library/LibraryToolbar";
@@ -95,9 +94,6 @@ export function AppHomeNext() {
   // The hooks below run in both designs (hooks cannot branch); only the new
   // design reads their results.
   const newDesign = useNewDesign();
-  // Both layouts mount here, and so does nothing else on /app: the one place
-  // "the library page is open" is true.
-  useSteamWarmHeartbeat();
   const organised = useOrganised();
   const fuzzyFilter = useFuzzyFilter();
   const e01 = newDesign ? organised : null;

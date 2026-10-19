@@ -6,6 +6,7 @@
 // hook, by useDisplayPatch.ts on ack/revert (same PATCH endpoint the poll
 // below reads) — their setters are returned raw for that hook to call
 // directly.
+import { shaderPercent as shaderPercentOf } from "./launchProgress";
 import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { getSession } from "../../api/library";
 import type { Session } from "../../api/types";
@@ -232,8 +233,7 @@ export function useSessionStatus(
           return;
         }
         notePlacement(session);
-        const progress = session.state_detail === "app booting" ? session.launch_progress : null;
-        setShaderPercent(progress?.step === "shaders" ? progress.percent : null);
+        setShaderPercent(shaderPercentOf(session));
         if (session.state === "assigned") setLaunchDetail("scheduling host");
         else if (session.state === "starting") setLaunchDetail(session.state_detail ?? "building pipeline");
         else if (session.state === "running" && session.state_detail === "app booting") setLaunchDetail("app booting");

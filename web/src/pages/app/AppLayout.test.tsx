@@ -636,3 +636,25 @@ describe("account area, new design (no Classic layout pin)", () => {
     expect(await screen.findByRole("option", { name: /Classic layout/ })).toBeInTheDocument();
   });
 });
+
+// ── The warm-Steam heartbeat ─────────────────────────────────────────────────
+
+describe("library heartbeat", () => {
+  const beats = () => mockedLibrary.putSteamWarm.mock.calls.length;
+
+  it.each(["/app", "/app/library"])("beats once on %s", async (path) => {
+    renderApp(path);
+    await waitFor(() => expect(beats()).toBe(1));
+  });
+
+  it("beats on the game page, where the Play button is", async () => {
+    renderApp("/app/game/a1");
+    await waitFor(() => expect(beats()).toBe(1));
+  });
+
+  it("does not beat in the account area", async () => {
+    renderApp("/app/account/profile");
+    await screen.findByRole("navigation", { name: "Account sections" });
+    expect(beats()).toBe(0);
+  });
+});

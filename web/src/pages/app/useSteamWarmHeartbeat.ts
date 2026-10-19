@@ -9,8 +9,8 @@ import { useResource } from "../../lib/resource/react";
 
 export const STEAM_WARM_BEAT_MS = 60_000;
 
-export function useSteamWarmHeartbeat(): void {
-  useResource<void>(
+export function useSteamWarmHeartbeat(): { pause: () => void; resume: () => void } {
+  const { pause, resume } = useResource<void>(
     {
       label: "Steam warm heartbeat",
       // async so the call settles to a promise whatever putSteamWarm returns.
@@ -21,4 +21,5 @@ export function useSteamWarmHeartbeat(): void {
     },
     [],
   );
+  return { pause, resume };
 }

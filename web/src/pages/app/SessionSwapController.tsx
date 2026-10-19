@@ -61,7 +61,7 @@ export function SessionSwapController({
       <GamesPane
         sessionId={sessionId}
         currentAppId={currentApp.id}
-        swapPending={transition?.phase === "switching"}
+        swapPending={transition?.phase === "switching" || transition?.phase === "booting"}
         onSwapStart={(target) => {
           onSwapStart?.();
           startSwap(target);
@@ -70,7 +70,8 @@ export function SessionSwapController({
       />
     ) : null;
 
-  const swappingTo = transition?.phase === "switching" ? transition.appName : null;
+  const swappingTo =
+    transition?.phase === "switching" || transition?.phase === "booting" ? transition.appName : null;
 
   return (
     <>

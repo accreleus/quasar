@@ -286,7 +286,8 @@ export function SessionLoader({
               <span className="sl-verb">{visible.verb}</span>
               <span className={changing ? "sl-stage changing" : "sl-stage"}>{visible.word}</span>
             </h1>
-            {shaderPercent !== null && <p className="sl-shaders">Processing shaders — {shaderPercent}%</p>}
+            {/* Always in the layout so the title does not jump when the line appears. */}
+            <p className="sl-shaders">{shaderPercent !== null && `Processing shaders — ${shaderPercent}%`}</p>
             <div className="sl-status-foot">
               <GlyphRail step={visible.step} />
             </div>

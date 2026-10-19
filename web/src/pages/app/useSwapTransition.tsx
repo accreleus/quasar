@@ -1,8 +1,9 @@
 // Quick-switch swap-completion state machine (see SessionSwapTransition.tsx for
 // the screen, swapOutcome.ts for the pure poll classifier this wraps in a timer).
 //
-// Held from the moment the user picks an app until the SERVER reports
-// state_detail "swap complete" — never on the swap POST's 200, which only
+// Held from the moment the user picks an app until the SERVER confirms the
+// commit ("swap complete", or "app booting"/"app presented" after "swapping")
+// and, if the new app is still booting, until it presents. Never on the swap POST's 200, which only
 // means the control plane accepted the request (state_detail "swapping",
 // control-plane/internal/session/swapper.go `Swap`). Outcome arrives async via
 // the agent's session_state callback, hence this poll.
@@ -13,10 +14,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { getSession } from "../../api/library";
 import { reportBestEffortFailure } from "../../lib/reportBestEffortFailure";
+import { shaderPercent } from "./launchProgress";
 import { swapOutcome } from "./swapOutcome";
 
 export type SwapTransitionState =
   | { phase: "switching"; appName: string }
+  // Committed, the new app is booting: held until `app presented` (control-api.md
+  // §Warm Steam, "Quick switch"), with Steam's shader progress when it reports one.
+  | { phase: "booting"; appName: string; shaderPercent: number | null }
   | { phase: "error"; appName: string; message: string }
   | { phase: "timeout"; appName: string };
 
@@ -24,15 +29,14 @@ export type SwapTransitionState =
  *  against an operation measured at 7.2s end to end on the reference host. */
 const SWAP_POLL_MS = 1_000;
 
-/** Client give-up bound. Node-agent's own swap budget (node-agent/src/session/
- * runner.rs) is SWAP_COMPOSITOR_TIMEOUT (20s fixed) + swap_app_ready_timeout
- * (45s default, `QUASAR_SWAP_APP_READY_TIMEOUT_MS`) = 65s before the agent
- * itself rolls back. 75s adds ~10s slack for control-plane dispatch/ack + poll
- * round-trip, so this should never fire before the server answers — pure
- * escape hatch for a dropped poll / unreachable control plane. A host raising
- * `QUASAR_SWAP_APP_READY_TIMEOUT_MS` above default can still hit this on a
- * slow title even though the agent would have succeeded — known limitation. */
-const CLIENT_SWAP_TIMEOUT_MS = 75_000;
+/** Client give-up bound, above the agent's longest swap: an in-place one is
+ *  IN_PLACE_QUIT_BOUND 94 s (covers Steam's 60 s exit cloud sync) +
+ *  IN_PLACE_LAUNCH_BOUND 5 s = 99 s (node-agent/src/session/runner.rs). The rest
+ *  is slack for dispatch and a poll round-trip. Escape hatch only. */
+const CLIENT_SWAP_TIMEOUT_MS = 110_000;
+
+/** Most the screen stays up after the commit waiting for `app presented`. Fail-open. */
+const BOOT_HOLD_MAX_MS = 180_000;
 
 /** How long a terminal transition stays on screen before auto-clearing to
  *  reveal the actual session — long enough to read, short enough not to trap
@@ -108,6 +112,9 @@ export function useSwapTransition({
       // from the previous swap. Scoped to this closure so it resets on every
       // startSwap call.
       let armed = false;
+      // After the commit the poll only waits for `app presented`.
+      let committed = false;
+      let holdDeadline = 0;
 
       const tick = async () => {
         if (!activeRef.current) return;
@@ -115,7 +122,12 @@ export function useSwapTransition({
           stopPolling();
           return;
         }
-        if (Date.now() >= deadline) {
+        if (committed && Date.now() >= holdDeadline) {
+          stopPolling();
+          setTransition(null);
+          return;
+        }
+        if (!committed && Date.now() >= deadline) {
           stopPolling();
           setTransition({ phase: "timeout", appName: target.name });
           onToast(
@@ -129,20 +141,42 @@ export function useSwapTransition({
         try {
           const { session } = await getSession(authToken, sessionId);
           if (!activeRef.current) return; // cancelled/superseded while this GET was in flight
+          if (committed) {
+            // Anything but booting (presented, ended, odd detail) lets the stream show.
+            if (session.state === "running" && session.state_detail === "app booting") {
+              const pct = shaderPercent(session);
+              setTransition((prev) =>
+                prev?.phase === "booting" && prev.shaderPercent === pct
+                  ? prev
+                  : { phase: "booting", appName: target.name, shaderPercent: pct },
+              );
+            } else {
+              stopPolling();
+              setTransition(null);
+            }
+            return;
+          }
           if (session.state === "running" && session.state_detail === "swapping") armed = true;
-          const outcome = swapOutcome(session);
+          const outcome = swapOutcome(session, armed);
           if (outcome.kind === "pending") return; // keep polling
           if (!armed) return; // terminal-looking, but from the PREVIOUS swap — see above; keep polling
-          stopPolling();
           if (outcome.kind === "success") {
             onCommitted(session.app_id, target.name);
-            setTransition(null);
+            if (session.state_detail === "app booting") {
+              committed = true;
+              holdDeadline = Date.now() + BOOT_HOLD_MAX_MS;
+              setTransition({ phase: "booting", appName: target.name, shaderPercent: shaderPercent(session) });
+            } else {
+              stopPolling();
+              setTransition(null);
+            }
             onToast(
               <>
                 <b>Now playing {target.name}.</b> Stream quality unchanged.
               </>,
             );
           } else {
+            stopPolling();
             setTransition({ phase: "error", appName: target.name, message: outcome.message });
             onToast(<>{outcome.message}</>);
           }

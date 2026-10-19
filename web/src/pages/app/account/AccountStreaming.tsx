@@ -102,10 +102,6 @@ export function AccountStreaming() {
         <p className="muted mt3">An admin has disabled user profile overrides.</p>
       )}
 
-      <div className="grid g2 ac-narrow mt5">
-        <SteamDialogsField />
-      </div>
-
       <p className="note mt5">
         Your device is measured at sign-in, and a launch never exceeds what it can decode.
         A profile you pick here is the ceiling, not a guarantee. See{" "}
@@ -122,6 +118,10 @@ export function AccountStreaming() {
         >
           {saving ? "Saving…" : "Save stream default"}
         </Button>
+      </div>
+
+      <div className="grid g2 ac-narrow mt5">
+        <SteamDialogsField />
       </div>
     </div>
   );

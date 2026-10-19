@@ -4,6 +4,7 @@
 // phases, which are this screen's job.
 // Pure render — see useSwapTransition.ts for the state machine. `transition`:
 //   "switching" — swap accepted, waiting on the server's confirmation
+//   "booting"   — committed; the new app is starting, held until it presents
 //   "error"     — the swap failed; the previous app is (still) running
 //   "timeout"   — the client gave up waiting for a server answer
 //
@@ -53,7 +54,12 @@ export function SessionSwapTransition({ transition }: SessionSwapTransitionProps
                 : held.message}
             </div>
           ) : (
-            <div className="sw-sub">Starting…</div>
+            <>
+              <div className="sw-sub">Starting…</div>
+              {held.phase === "booting" && held.shaderPercent !== null && (
+                <div className="sw-sub">Processing shaders — {held.shaderPercent}%</div>
+              )}
+            </>
           )}
         </>
       )}

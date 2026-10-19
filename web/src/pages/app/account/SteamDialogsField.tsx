@@ -1,6 +1,8 @@
 // "Steam dialogs" (amendment 39): whether the launch helper may answer Steam's
 // controller notice for you. Shared by both account layouts. Saves on change;
 // the PATCH names only `steam_dialogs`, so the default profile is left alone.
+// The select stays enabled while a save runs (a second change is ignored in
+// save()), so keyboard focus is never dropped.
 
 import { useState } from "react";
 import * as libraryApi from "../../../api/library";
@@ -16,16 +18,19 @@ export function SteamDialogsField() {
   });
   const [picked, setPicked] = useState<SteamDialogs | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
 
   const save = async (next: SteamDialogs) => {
     if (picked !== null) return;
     setPicked(next);
     setError(null);
+    setSaved(false);
     try {
       await res.mutate(
         ({ token }) => libraryApi.updateSteamDialogs(token, next),
         (_d, r) => r.steam_dialogs,
       );
+      setSaved(true);
     } catch (e: unknown) {
       setError(e instanceof ApiError ? e.message : "Could not save the Steam dialogs setting.");
     } finally {
@@ -38,7 +43,7 @@ export function SteamDialogsField() {
       <SelectField
         label="Steam dialogs"
         value={picked ?? res.data ?? "show"}
-        disabled={!res.data || picked !== null}
+        disabled={!res.data}
         onChange={(e) => void save(e.target.value as SteamDialogs)}
         hint="Answers only Steam's controller notice. Sign-in, Steam Guard, cloud conflicts and installs are always shown. A change takes effect at the next Steam start."
       >
@@ -46,6 +51,7 @@ export function SteamDialogsField() {
         <option value="dismiss_safe">Dismiss safe ones automatically</option>
       </SelectField>
       {(error ?? res.errorMessage) && <p className="form-error mt3" role="alert">{error ?? res.errorMessage}</p>}
+      <p className="muted mt3" aria-live="polite">{saved ? "Saved. It applies at the next Steam start." : ""}</p>
     </div>
   );
 }
