@@ -364,14 +364,14 @@ struct Certificate {
 impl Certificate {
     fn mint() -> Certificate {
         use sha2::Digest;
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["peer".to_string()]).expect("certificate");
         let digest: Vec<String> = sha2::Sha256::digest(cert.der())
             .iter()
             .map(|byte| format!("{byte:02X}"))
             .collect();
         Certificate {
-            pem: cert.pem() + &key_pair.serialize_pem(),
+            pem: cert.pem() + &signing_key.serialize_pem(),
             fingerprint: format!("sha-256 {}", digest.join(":")),
         }
     }
