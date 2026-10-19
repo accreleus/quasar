@@ -70,8 +70,9 @@ func (c *Coordinator) DrainHost(ctx context.Context, hostID string, force bool) 
 		}
 	} else {
 		// Parked sessions are nobody's to wait for (control-api.md §Warm Steam).
+		// Best-effort: the host is already draining, and expiry stops them too.
 		if err := c.StopParkedOnHost(ctx, hostID); err != nil {
-			return Host{}, err
+			c.log.Warn("graceful drain: stopping parked sessions failed", "host_id", hostID, "err", err)
 		}
 		c.log.Info("drained host (graceful)", "host_id", hostID)
 	}

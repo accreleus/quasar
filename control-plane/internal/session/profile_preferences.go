@@ -124,14 +124,34 @@ func (s *Store) GetSteamDialogs(ctx context.Context, userID string) (string, err
 // SetSteamDialogs writes steam_dialogs alone, leaving the profile unchanged.
 // The caller has checked ValidSteamDialogs.
 func (s *Store) SetSteamDialogs(ctx context.Context, userID, value string) (UserProfilePreferences, error) {
+	return s.SaveProfilePreferences(ctx, userID, nil, false, &value)
+}
+
+// SaveProfilePreferences is the PATCH write, both fields in one statement:
+// default_profile_id when setProfile (nil clears it), steam_dialogs when
+// non-nil. The caller has checked ValidSteamDialogs.
+func (s *Store) SaveProfilePreferences(ctx context.Context, userID string, defaultProfileID *string, setProfile bool, steamDialogs *string) (UserProfilePreferences, error) {
+	if setProfile && defaultProfileID != nil && *defaultProfileID != "" {
+		ok, err := s.LaunchProfileExists(ctx, *defaultProfileID)
+		if err != nil {
+			return UserProfilePreferences{}, err
+		}
+		if !ok {
+			return UserProfilePreferences{}, ErrProfileUnknown
+		}
+	}
 	var prefs UserProfilePreferences
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO user_profile_preferences (user_id, steam_dialogs) VALUES ($1::uuid, $2)
-		ON CONFLICT (user_id) DO UPDATE SET steam_dialogs = EXCLUDED.steam_dialogs
+		INSERT INTO user_profile_preferences (user_id, default_profile_id, steam_dialogs)
+		VALUES ($1::uuid, CASE WHEN $3::boolean THEN NULLIF($2, '') END, COALESCE($4::text, 'show'))
+		ON CONFLICT (user_id) DO UPDATE SET
+		    default_profile_id = CASE WHEN $3::boolean THEN EXCLUDED.default_profile_id
+		                              ELSE user_profile_preferences.default_profile_id END,
+		    steam_dialogs = COALESCE($4::text, user_profile_preferences.steam_dialogs)
 		RETURNING default_profile_id, steam_dialogs
-	`, userID, value).Scan(&prefs.DefaultProfileID, &prefs.SteamDialogs)
+	`, userID, strOrEmpty(defaultProfileID), setProfile, steamDialogs).Scan(&prefs.DefaultProfileID, &prefs.SteamDialogs)
 	if err != nil {
-		return UserProfilePreferences{}, fmt.Errorf("set steam dialogs: %w", err)
+		return UserProfilePreferences{}, fmt.Errorf("save user profile preferences: %w", err)
 	}
 	return prefs, nil
 }

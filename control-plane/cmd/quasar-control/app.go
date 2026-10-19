@@ -1064,7 +1064,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			if _, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply"); err != nil {
 				return err
 			}
-			return coordinator.StopParkedOnHost(ctx, hostID)
+			// Best-effort: expiry and the apply's own drain stop parked sessions too.
+			if err := coordinator.StopParkedOnHost(ctx, hostID); err != nil {
+				log.Warn("platform apply: stopping parked sessions failed", "host_id", hostID, "err", err)
+			}
+			return nil
 		},
 		ReleaseOwned: func(ctx context.Context, attemptID, hostID string) error {
 			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, agentRegistry.IsConnected(hostID))
@@ -1161,7 +1165,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			if _, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, "Platform apply"); err != nil {
 				return err
 			}
-			return coordinator.StopParkedOnHost(ctx, hostID)
+			// Best-effort: expiry and the apply's own drain stop parked sessions too.
+			if err := coordinator.StopParkedOnHost(ctx, hostID); err != nil {
+				log.Warn("platform apply: stopping parked sessions failed", "host_id", hostID, "err", err)
+			}
+			return nil
 		},
 		ReleaseOwned: func(ctx context.Context, runID, hostID string) error {
 			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, agentRegistry.IsConnected(hostID))

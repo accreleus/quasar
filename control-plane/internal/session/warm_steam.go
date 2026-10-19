@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -23,6 +24,12 @@ const (
 	StopReasonParkedExpired    = "parked_expired"
 	StopReasonParkedEvicted    = "parked_evicted"
 	StopReasonParkedSuperseded = "parked_superseded"
+	// stopReasonRuntimeReleased marks a play row whose held runtime the control
+	// plane released; the launch path reads it while the cleanup proof is owed.
+	stopReasonRuntimeReleased = "runtime_released"
+	// parkCooldown keeps a heartbeat from re-parking into room an eviction freed
+	// for a refused launch's retry.
+	parkCooldown = "5 minutes"
 
 	rewarmNextSteamLaunch = "next_steam_launch"
 	parkedSteamFlags      = "-silent"
@@ -37,14 +44,22 @@ const (
 // errParkRefused: a rule refused a parked session. The heartbeat swallows it.
 var errParkRefused = errors.New("no parked session allowed now")
 
-// ParkedClaimRefusedError is a launch whose parked session could not be
-// adopted. That session is being stopped and still holds the home, so the
-// launch answers capacity_exhausted rather than home_in_use naming a session
-// the caller cannot see.
-type ParkedClaimRefusedError struct{ ParkedID string }
+// ParkedClaimRefusedError is a launch that must wait for a warm-Steam runtime:
+// a parked session it could not adopt (being stopped, or still warming), or a
+// released held runtime whose cleanup proof is owed. That runtime holds the
+// home, so the launch answers capacity_exhausted with Retry-After: 2 rather than
+// home_in_use naming a session the caller cannot see.
+type ParkedClaimRefusedError struct {
+	HolderID string
+	// Warming: the parked session is not yet running and is left to finish.
+	Warming bool
+}
 
 func (e *ParkedClaimRefusedError) Error() string {
-	return "parked session could not be claimed; it is stopping"
+	if e.Warming {
+		return "parked session is still starting"
+	}
+	return "a warm-Steam runtime still holds the home; it is stopping"
 }
 
 func (e *ParkedClaimRefusedError) Unwrap() error { return ErrCapacityExhausted }
@@ -88,20 +103,33 @@ func (c *Coordinator) epochParks(hostID string, epoch agentws.HomeCommandEpoch) 
 	return dispatcherParks(c.dispatcher, hostID, epoch)
 }
 
-// wireAssign fits an assign to its connection: kind always, and adoption,
-// only where parked_sessions_v1 was advertised. False means a parked session
-// cannot go there at all.
-func wireAssign(a agentws.SessionAssignCmd, parks bool) (agentws.SessionAssignCmd, bool) {
-	if parks {
-		if a.Kind == "" {
-			a.Kind = KindPlay
-		}
-		return a, true
+// warmOn is steam_warm_enabled for a dispatch; a failed read is off.
+func (c *Coordinator) warmOn() bool {
+	w, err := readWarmSteam(c.ctx, c.store.pool)
+	if err != nil {
+		c.log.Warn("warm steam: settings read failed at dispatch; sending no kind", "err", err)
 	}
-	if a.Kind == KindParked {
+	return err == nil && w.Enabled
+}
+
+// wireAssign fits an assign to its connection. kind goes only where
+// parked_sessions_v1 was advertised and only while warm Steam is on (with it
+// off no runtime is held); adoption only where advertised. False means the
+// assign cannot be sent: a parked session, or an adoption, to a connection
+// that cannot take it, failing closed rather than orphaning the runtime.
+func wireAssign(a agentws.SessionAssignCmd, parks, warmOn bool) (agentws.SessionAssignCmd, bool) {
+	if !parks && a.AdoptSessionID != "" {
 		return a, false
 	}
-	a.Kind, a.AdoptSessionID = "", ""
+	if a.Kind == KindParked && (!parks || !warmOn) {
+		return a, false
+	}
+	switch {
+	case !parks || !warmOn:
+		a.Kind = ""
+	case a.Kind == "":
+		a.Kind = KindPlay
+	}
 	return a, true
 }
 
@@ -129,6 +157,10 @@ func (c *Coordinator) SteamWarmHeartbeat(ctx context.Context, userID string, isA
 				c.log.Debug("warm steam: no parked session", "user_id", userID, "err", err)
 			}
 		}
+	}
+	// Extend only a parked session that still qualifies; stop the rest.
+	if _, err := c.stopParked(ctx, StopReasonParkedSuperseded, parkedFilter{UserID: userID, Unqualified: true}); err != nil {
+		c.log.Warn("warm steam: stopping an unqualified parked session failed", "user_id", userID, "err", err)
 	}
 	if _, err := c.store.pool.Exec(ctx, `UPDATE sessions
 		SET parked_until = now() + make_interval(mins => $2::int)
@@ -184,13 +216,16 @@ func parkAllowed(ctx context.Context, tx pgx.Tx, userID string) (int32, error) {
 	if err != nil {
 		return 0, err
 	}
-	var busy, suppressed bool
+	var busy, suppressed, evicted bool
 	if err := tx.QueryRow(ctx, `SELECT
 		EXISTS (SELECT 1 FROM sessions WHERE user_id = $1::uuid AND state NOT IN ('stopped','failed')),
-		steam_warm_suppressed FROM users WHERE id = $1::uuid`, userID).Scan(&busy, &suppressed); err != nil {
+		steam_warm_suppressed,
+		EXISTS (SELECT 1 FROM sessions WHERE user_id = $1::uuid AND kind = 'parked'
+		        AND stop_reason = 'parked_evicted' AND COALESCE(ended_at, now()) > now() - $2::interval)
+		FROM users WHERE id = $1::uuid`, userID, parkCooldown).Scan(&busy, &suppressed, &evicted); err != nil {
 		return 0, fmt.Errorf("recheck warm steam: %w", err)
 	}
-	if !w.Enabled || busy || suppressed {
+	if !w.Enabled || busy || suppressed || evicted {
 		return 0, errParkRefused
 	}
 	return int32(w.IdleMinutes), nil
@@ -274,11 +309,11 @@ type claimedParked struct {
 // expiry job stops whatever is left within 60 s.
 func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked, error) {
 	k := claimedParked{id: p.claim.id}
-	var ok bool
+	var state State
+	var others, inDeadline bool
 	err := tx.QueryRow(ctx, `
-		SELECT k.host_id::text, g.index,
+		SELECT k.host_id::text, g.index, k.state, k.parked_until > now(),
 		       k.user_id = $2::uuid AND k.app_id = $3::uuid AND k.kind = 'parked'
-		       AND k.state = 'running' AND k.parked_until > now()
 		       AND h.status = 'online' AND h.agent_disconnected_at IS NULL
 		       AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = h.id)
 		       AND k.codec = COALESCE(NULLIF($4, ''), 'h264') AND k.fps = $5 AND k.bitrate_kbps = $6
@@ -287,18 +322,35 @@ func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked
 		WHERE k.id = $1::uuid
 		FOR UPDATE OF k`,
 		k.id, p.UserID, p.homeAppID(), p.Codec, p.FPS, p.BitrateKbps, p.H264Profile, p.Mic, p.Width, p.Height).
-		Scan(&k.hostID, &k.gpuIndex, &ok)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !(ok && p.claim.hostParks)) {
-		return nil, &ParkedClaimRefusedError{ParkedID: k.id}
+		Scan(&k.hostID, &k.gpuIndex, &state, &inDeadline, &others)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, &ParkedClaimRefusedError{HolderID: k.id}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("lock parked session: %w", err)
+	}
+	others = others && p.claim.hostParks
+	// Only check 2 failing on a session still warming leaves it to finish.
+	if others && inDeadline && (state == StatePending || state == StateAssigned || state == StateStarting) {
+		return nil, &ParkedClaimRefusedError{HolderID: k.id, Warming: true}
+	}
+	if !(others && inDeadline && state == StateRunning) {
+		return nil, &ParkedClaimRefusedError{HolderID: k.id}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE sessions SET state = 'stopped', state_detail = $2,
 		ended_at = now(), launch_progress = NULL WHERE id = $1::uuid`, k.id, claimedDetail); err != nil {
 		return nil, fmt.Errorf("claim parked session: %w", err)
 	}
 	return &k, nil
+}
+
+// claimedWithin reports whether id is a parked row claimed less than grace ago.
+func (s *Store) claimedWithin(ctx context.Context, id string, grace time.Duration) bool {
+	var ok bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sessions WHERE id = $1::uuid
+		AND kind = 'parked' AND state = 'stopped' AND state_detail = $2
+		AND ended_at > now() - make_interval(secs => $3))`, id, claimedDetail, grace.Seconds()).Scan(&ok)
+	return err == nil && ok
 }
 
 // moveHome hands a runtime's managed-home binding, and any hold naming it, to
@@ -325,7 +377,11 @@ type parkedStop struct{ id, hostID, userID string }
 type parkedFilter struct {
 	ID, HostID, UserID string
 	ExceptApp          string // keep this Steam family
-	PastDeadline       bool   // only rows whose parked_until has passed
+	// Expired: parked_until has passed, or the Steam parent is disabled.
+	Expired bool
+	// Unqualified: the parent is no longer enabled and visible to the user, or
+	// the user's quota is 0.
+	Unqualified bool
 }
 
 // orNil turns "" into SQL NULL, the "no filter" of stopParked.
@@ -346,9 +402,16 @@ func (s *Store) stopParkedWhere(ctx context.Context, reason string, f parkedFilt
 		  AND ($3::uuid IS NULL OR host_id = $3::uuid)
 		  AND ($4::uuid IS NULL OR user_id = $4::uuid)
 		  AND ($5::uuid IS NULL OR app_id <> $5::uuid)
-		  AND (NOT $6::boolean OR parked_until <= now())
+		  AND (NOT $6::boolean OR parked_until <= now()
+		       OR NOT EXISTS (SELECT 1 FROM apps a WHERE a.id = sessions.app_id AND a.enabled))
+		  AND (NOT $7::boolean OR NOT EXISTS (
+		        SELECT 1 FROM apps a JOIN users u ON u.id = sessions.user_id
+		        WHERE a.id = sessions.app_id AND a.enabled AND a.library_provider = 'steam'
+		          AND u.max_concurrent_sessions > 0
+		          AND EXISTS (SELECT 1 FROM entitlements e WHERE e.app_id = a.id
+		                AND (e.subject_type = 'all' OR (e.subject_type = 'user' AND e.subject_id = sessions.user_id)))))
 		RETURNING id::text, COALESCE(host_id::text, ''), user_id::text`,
-		reason, orNil(f.ID), orNil(f.HostID), orNil(f.UserID), orNil(f.ExceptApp), f.PastDeadline)
+		reason, orNil(f.ID), orNil(f.HostID), orNil(f.UserID), orNil(f.ExceptApp), f.Expired, f.Unqualified)
 	if err != nil {
 		return nil, fmt.Errorf("stop parked sessions: %w", err)
 	}
@@ -390,13 +453,14 @@ func (c *Coordinator) stopParked(ctx context.Context, reason string, f parkedFil
 }
 
 // ExpireParked is the session.parked_expire job: stop every parked session
-// past parked_until, and every one while the switch is off.
+// past parked_until or whose Steam parent is disabled, and every one while the
+// switch is off.
 func (c *Coordinator) ExpireParked(ctx context.Context) (int, error) {
 	w, err := readWarmSteam(ctx, c.store.pool)
 	if err != nil {
 		return 0, err
 	}
-	return c.stopParked(ctx, StopReasonParkedExpired, parkedFilter{PastDeadline: w.Enabled})
+	return c.stopParked(ctx, StopReasonParkedExpired, parkedFilter{Expired: w.Enabled})
 }
 
 // StopParkedOnHost stops a host's parked sessions as a drain or an apply
@@ -437,10 +501,9 @@ func (c *Coordinator) supersedeParked(ctx context.Context, userID, keepHomeApp, 
 
 // afterLaunchAdmitted applies the two warm-Steam side effects of an admitted
 // launch into app: a Steam launch clears suppression, and anything outside the
-// parked session's family supersedes it. hadParked is the launch's earlier read;
-// no parked session can appear after it, because the heartbeat refuses while
-// this launch's session is live.
-func (c *Coordinator) afterLaunchAdmitted(ctx context.Context, userID string, app LaunchApp, hadParked bool) {
+// parked session's family supersedes it. Always run: the launch's earlier
+// parked-session read is outside the user lock and can be stale.
+func (c *Coordinator) afterLaunchAdmitted(ctx context.Context, userID string, app LaunchApp) {
 	keep := ""
 	if app.SteamFamily {
 		keep = homeAppID(app)
@@ -449,9 +512,7 @@ func (c *Coordinator) afterLaunchAdmitted(ctx context.Context, userID string, ap
 			c.log.Warn("warm steam: suppression clear failed", "user_id", userID, "err", err)
 		}
 	}
-	if hadParked {
-		c.supersedeParked(ctx, userID, keep, "")
-	}
+	c.supersedeParked(ctx, userID, keep, "")
 }
 
 // --- eviction -----------------------------------------------------------------
@@ -508,6 +569,7 @@ func (c *Coordinator) endHeldRuntime(ctx context.Context, hostID string, m agent
 		c.afterTerminal(*ended, "agent")
 	}
 	if parked == nil {
+		// "user_requested": the user's game exit ended it; the reason is informational.
 		cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: m.SessionID, Reason: "user_requested"}
 		if err := c.dispatcher.Send(hostID, cmd); err != nil {
 			c.log.Warn("held runtime release dispatch failed", "session_id", m.SessionID, "err", err)
@@ -586,8 +648,13 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 	if err != nil {
 		return nil, nil, err
 	}
+	// A stopping row was stopped by the control plane: never parked. The agent
+	// sends no stopping before a held stop (agent-api.md §session_state).
 	if !(w.Enabled && hostParks && cur == StateRunning && kind == KindPlay) {
-		return &end, nil, tx.Commit(ctx)
+		if err := releaseHeld(ctx, tx, sessionID); err != nil {
+			return nil, nil, err
+		}
+		return &end, nil, nil
 	}
 	// A savepoint, so a failed park still stores the stop. The parent must be a
 	// visible Steam parent, the user must hold nothing else live, and the host
@@ -613,7 +680,8 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 		WHERE p.id = $1::uuid
 		  AND root.enabled AND root.library_provider = 'steam'
 		  AND EXISTS (SELECT 1 FROM entitlements e WHERE e.app_id = root.id
-		        AND (e.subject_type = 'all' OR (e.subject_type = 'user' AND e.subject_id = p.user_id)))
+		        AND (e.subject_type = 'all' OR (e.subject_type = 'user' AND e.subject_id = p.user_id))
+		        FOR SHARE)
 		  AND NOT EXISTS (SELECT 1 FROM sessions o WHERE o.user_id = p.user_id AND o.id <> p.id
 		        AND o.state NOT IN ('stopped','failed'))
 		  AND h.status = 'online' AND h.agent_disconnected_at IS NULL
@@ -628,17 +696,33 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 	if err == nil {
 		err = sp.Commit(ctx)
 	}
-	var park *Session
 	if err == nil {
-		park = &k
-	} else if !errors.Is(err, ErrNotFound) {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, nil, fmt.Errorf("commit held stop: %w", err)
+		}
+		return &end, &k, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
 		_ = sp.Rollback(ctx)
 		slog.Warn("park on exit failed; releasing the runtime", "session_id", sessionID, "err", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, nil, fmt.Errorf("commit held stop: %w", err)
+	if err := releaseHeld(ctx, tx, sessionID); err != nil {
+		return nil, nil, err
 	}
-	return &end, park, nil
+	return &end, nil, nil
+}
+
+// releaseHeld marks the ended row runtime_released, so a relaunch onto its
+// still-held home answers 503 until the cleanup proof, then commits.
+func releaseHeld(ctx context.Context, tx pgx.Tx, sessionID string) error {
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET stop_reason = COALESCE(stop_reason, $2)
+		WHERE id = $1::uuid`, sessionID, stopReasonRuntimeReleased); err != nil {
+		return fmt.Errorf("mark released runtime: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit held stop: %w", err)
+	}
+	return nil
 }
 
 // --- shader progress ------------------------------------------------------------

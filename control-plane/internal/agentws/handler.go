@@ -1492,7 +1492,8 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			}
 			if err := h.relay.Deliver(env.SessionID, env.Msg); err != nil {
 				h.log.Error("reliable signaling relay failed", "host_id", hostID, "session_id", env.SessionID, "err", err)
-				h.events.AgentSignalingFailure(bg, hostID, env.SessionID, err.Error())
+				msgType, _ := peekType(env.Msg)
+				h.events.AgentSignalingFailure(bg, hostID, env.SessionID, msgType == "bye", err.Error())
 			}
 		default:
 			h.log.Warn("unknown agent message", "type", msgType, "host_id", hostID)

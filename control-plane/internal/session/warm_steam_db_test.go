@@ -668,9 +668,10 @@ func TestParkOnExitReleasesWhenARuleSaysNo(t *testing.T) {
 }
 
 // A released runtime keeps the ended row's hold until the agent's qualified
-// `stopped` for it (agent-api.md §session_state, runtime_held): a same-home
-// relaunch waits on that hold, then proceeds.
-func TestReleasedHeldRuntimeHoldsTheHomeUntilTheQualifiedStop(t *testing.T) {
+// `stopped` for it (agent-api.md §session_state, runtime_held), and a same-home
+// relaunch meanwhile gets the retryable 503, never home_conflict; after the
+// proof it is admitted.
+func TestReleasedHeldRuntimeAnswers503UntilTheQualifiedStop(t *testing.T) {
 	f := newWarmFixture(t, 8)
 	ctx := context.Background()
 	play := f.runningTile(t)
@@ -685,35 +686,29 @@ func TestReleasedHeldRuntimeHoldsTheHomeUntilTheQualifiedStop(t *testing.T) {
 	if got := holder(); got != play {
 		t.Fatalf("hold = %q after the runtime_held stop, want it kept on %s", got, play)
 	}
-
-	type result struct {
-		res LaunchResult
-		err error
+	if got := readRow(t, f.pool, play); got.StopReason != stopReasonRuntimeReleased {
+		t.Fatalf("released row %+v, want stop_reason runtime_released", got)
 	}
-	done := make(chan result, 1)
-	go func() {
-		res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
-		done <- result{res, err}
-	}()
-	select {
-	case r := <-done:
-		t.Fatalf("relaunch returned before the cleanup proof: %+v", r)
-	case <-time.After(700 * time.Millisecond):
+
+	start := time.Now()
+	_, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+	var refused *ParkedClaimRefusedError
+	if !errors.As(err, &refused) || refused.Warming || refused.HolderID != play {
+		t.Fatalf("relaunch while released = %v, want the 503 refusal naming the held row privately", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("relaunch waited %v on the hold, want an immediate 503", time.Since(start))
 	}
 
 	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: play, State: "stopped",
 		Detail: "stopped", HomeCleanupQualified: true})
-	select {
-	case r := <-done:
-		if r.err != nil {
-			t.Fatalf("relaunch after the cleanup proof: %v", r.err)
-		}
-		f.disp.assignFor(t, r.res.Session.ID)
-		if got := holder(); got != r.res.Session.ID {
-			t.Errorf("hold = %q, want the relaunched session %s", got, r.res.Session.ID)
-		}
-	case <-time.After(8 * time.Second):
-		t.Fatal("relaunch still waiting after the qualified stopped")
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+	if err != nil {
+		t.Fatalf("relaunch after the cleanup proof: %v", err)
+	}
+	f.disp.assignFor(t, res.Session.ID)
+	if got := holder(); got != res.Session.ID {
+		t.Errorf("hold = %q, want the relaunched session %s", got, res.Session.ID)
 	}
 }
 

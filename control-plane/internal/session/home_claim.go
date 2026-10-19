@@ -114,12 +114,14 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) e
 	var host *string
 	var connected, recent bool
 	var kind string
+	var released bool
 	err := tx.QueryRow(ctx, `SELECT s.state, s.host_id::text,
 		COALESCE(h.status IN ('online','draining'), false),
-		COALESCE(s.ended_at, s.updated_at) > now() - ($2::int * interval '1 second'), s.kind
+		COALESCE(s.ended_at, s.updated_at) > now() - ($2::int * interval '1 second'), s.kind,
+		COALESCE(s.stop_reason = $3, false)
 		FROM sessions s LEFT JOIN hosts h ON h.id=s.host_id
-		WHERE s.id=$1::uuid`, holder, int(homeHoldSettleWindow/time.Second)).
-		Scan(&state, &host, &connected, &recent, &kind)
+		WHERE s.id=$1::uuid`, holder, int(homeHoldSettleWindow/time.Second), stopReasonRuntimeReleased).
+		Scan(&state, &host, &connected, &recent, &kind, &released)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrHomeConflict
 	}
@@ -132,6 +134,10 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) e
 			return &HomeInUseError{Stopping: state == StateStopping, parkedID: holder}
 		}
 		return &HomeInUseError{SessionID: holder, Stopping: state == StateStopping}
+	case host != nil && *host == claimHost && connected && recent && released:
+		// A released held runtime: Steam is shutting down (control-api.md §Warm
+		// Steam, "Park on exit"), so the launch path answers 503, never a conflict.
+		return &HomeInUseError{Stopping: true, releasedID: holder}
 	case host != nil && *host == claimHost && connected && recent:
 		return &homeHoldSettlingError{holder: holder}
 	default:

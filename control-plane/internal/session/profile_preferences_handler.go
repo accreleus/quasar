@@ -51,7 +51,7 @@ func (h *Handler) handlePatchProfilePreferences(w http.ResponseWriter, r *http.R
 	// default_profile_id is raw so an absent key is told apart from null.
 	var req struct {
 		DefaultProfileID json.RawMessage `json:"default_profile_id"`
-		SteamDialogs     *string         `json:"steam_dialogs"`
+		SteamDialogs     json.RawMessage `json:"steam_dialogs"`
 
 		GlobalDefaultProfileID *string `json:"global_default_profile_id"`
 		UserOverridesAllowed   *bool   `json:"user_overrides_allowed"`
@@ -64,22 +64,20 @@ func (h *Handler) handlePatchProfilePreferences(w http.ResponseWriter, r *http.R
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "default_profile_id must be a string or null")
 		return
 	}
-	if req.SteamDialogs != nil && !ValidSteamDialogs(*req.SteamDialogs) {
-		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "steam_dialogs must be show or dismiss_safe")
-		return
+	// Raw, so `null` is refused rather than read as absent.
+	var dialogs *string
+	if len(req.SteamDialogs) > 0 {
+		var v string
+		if json.Unmarshal(req.SteamDialogs, &v) != nil || !ValidSteamDialogs(v) {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "steam_dialogs must be show or dismiss_safe")
+			return
+		}
+		dialogs = &v
 	}
 	// semantics: control-api.md §Warm Steam, "steam_dialogs": naming only
-	// steam_dialogs leaves the profile; otherwise today's rule (absent clears).
-	var prefs UserProfilePreferences
-	var err error
-	if req.SteamDialogs == nil || len(req.DefaultProfileID) > 0 {
-		prefs, err = h.store.UpdateUserProfilePreferences(r.Context(), user.ID, profileID)
-	}
-	if err == nil && req.SteamDialogs != nil {
-		prefs, err = h.store.SetSteamDialogs(r.Context(), user.ID, *req.SteamDialogs)
-	} else if err == nil {
-		prefs.SteamDialogs, err = h.store.GetSteamDialogs(r.Context(), user.ID)
-	}
+	// steam_dialogs leaves the profile; otherwise absent or null clears it.
+	setProfile := dialogs == nil || len(req.DefaultProfileID) > 0
+	prefs, err := h.store.SaveProfilePreferences(r.Context(), user.ID, profileID, setProfile, dialogs)
 	if errors.Is(err, ErrProfileUnknown) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "default_profile_id must be a user-facing stream profile")
 		return

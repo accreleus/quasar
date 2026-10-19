@@ -380,6 +380,11 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 			// cpRunning. Explicit anyway -- falling through to a stop is the wrong
 			// default for a live session if that ever changes.
 			continue
+		case hs.State == StateStopped && c.store.claimedWithin(ctx, sid, stopAckTimeout):
+			// A just-claimed parked session: the agent lists it until the adopting
+			// assign lands. A stop now would cold-start the play session. Past the
+			// grace it is an orphan again (the adopting assign failed).
+			continue
 		case hs.HostID != nil && *hs.HostID != hostID:
 			c.log.Warn("agent reports another host's session; stopping its copy",
 				"host_id", hostID, "session_id", sid)

@@ -14,7 +14,7 @@ import (
 // AgentSignalingFailure scopes a saturated agent-to-browser relay to its session.
 // Stop the remote runner best-effort, then fail the authoritative row so its GPU
 // reservation is released. A forged cross-host session id is ignored.
-func (c *Coordinator) AgentSignalingFailure(ctx context.Context, hostID, sessionID, reason string) {
+func (c *Coordinator) AgentSignalingFailure(ctx context.Context, hostID, sessionID string, bye bool, reason string) {
 	hs, err := c.store.GetSessionHostState(ctx, sessionID)
 	if err != nil || hs.HostID == nil || *hs.HostID != hostID || hs.State.IsTerminal() {
 		return
@@ -23,6 +23,14 @@ func (c *Coordinator) AgentSignalingFailure(ctx context.Context, hostID, session
 	// end the row before the app has stopped (#753: a game exit's `bye` to a stuck socket).
 	if hs.State == StateStopping {
 		c.log.Info("signaling relay failed on a stopping session; frame dropped",
+			"session_id", sessionID, "reason", reason)
+		return
+	}
+	// A `bye` is the agent ending the session itself, and its report follows: a
+	// held game exit sends no `stopping` first (agent-api.md §session_state), so
+	// this row is still running.
+	if bye {
+		c.log.Info("signaling relay failed on the agent's bye; frame dropped",
 			"session_id", sessionID, "reason", reason)
 		return
 	}

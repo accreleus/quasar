@@ -416,7 +416,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	err = tx.QueryRow(ctx, candidateSQL, candidateArgs...).Scan(&gpuID, &hostID, &gpuIndex)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if claimed != nil {
-			return Session{}, false, &ParkedClaimRefusedError{ParkedID: p.claim.id} // check 5
+			return Session{}, false, &ParkedClaimRefusedError{HolderID: p.claim.id} // check 5
 		}
 		return Session{}, false, classifyReject(ctx, tx, cand)
 	}
