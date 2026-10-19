@@ -68,8 +68,12 @@ pub enum NeedsUser {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Report {
     LaunchState(LaunchState),
-    GameWindow { on_screen: bool },
+    GameWindow {
+        on_screen: bool,
+    },
     SteamNeedsUser(NeedsUser),
+    /// The target's shader progress from `Still replaying <appid> (NN%, a/b).` (#759).
+    ShaderProgress(u8),
 }
 
 /// One mapped top-level window on gamescope's X display. The helper fills it from X11;
@@ -128,14 +132,29 @@ pub struct Watcher {
     running_via_reaper: bool,
     last_game_window: bool,
     active_needs: Option<NeedsUser>,
+    shader: LogTail,
+    last_shader: Option<u8>,
+    /// When Steam started waiting on its controller notice (`ShowInterstitials`).
+    interstitial_since: Option<Instant>,
+    /// `QUASAR_STEAM_DIALOGS=dismiss_safe`: the caller answers the notice, so it is reported
+    /// only if it still stands [`USER_WAIT`] after the caller's key press.
+    answers_notice: bool,
+    notice_pressed: Option<Instant>,
+    /// gamescope's focused app as read this pass; `None` when unset or the read failed.
+    focused: Option<u32>,
+    /// This pass read the window list.
+    windows_read: bool,
+    /// The last window list read, for the helper's pin.
+    last_windows: Vec<WindowInfo>,
 }
 
 impl Watcher {
     pub fn new(cfg: WatchConfig, windows: Box<dyn Windows + Send>) -> Self {
         let console = LogTail::new(
             cfg.steam_log_dir.join("console_log.txt"),
-            Some(cfg.steam_log_dir.join("console_log.txt.previous")),
+            Some(cfg.steam_log_dir.join("console_log.previous.txt")),
         );
+        let shader = LogTail::new(cfg_shader_log(&cfg.steam_log_dir), None);
         let login = LoginLog {
             tail: LogTail::new(cfg.steam_log_dir.join("steamui_login.txt"), None),
             needs: None,
@@ -152,7 +171,34 @@ impl Watcher {
             running_via_reaper: false,
             last_game_window: false,
             active_needs: None,
+            shader,
+            last_shader: None,
+            interstitial_since: None,
+            answers_notice: false,
+            notice_pressed: None,
+            focused: None,
+            windows_read: false,
+            last_windows: Vec::new(),
         }
+    }
+
+    /// The appid this watcher follows.
+    pub fn appid(&self) -> u32 {
+        self.cfg.appid
+    }
+
+    /// A viewable window with `STEAM_GAME` = `appid` was in the last pass's list.
+    pub fn has_window(&self, appid: u32) -> bool {
+        self.last_windows
+            .iter()
+            .any(|window| window.steam_game == Some(appid))
+    }
+
+    /// Steam has waited on its controller notice for the target since at least [`USER_WAIT`]
+    /// before `now`: the one wait `QUASAR_STEAM_DIALOGS=dismiss_safe` answers (#759).
+    pub fn interstitial_standing(&self, now: Instant) -> bool {
+        self.interstitial_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= USER_WAIT)
     }
 
     /// One observation pass: /proc, the new tail of console_log.txt, the window list.
@@ -186,15 +232,26 @@ impl Watcher {
 
         // On screen is gamescope's published focus alone; an error skips
         // the check for this pass, leaving the last reported value standing.
-        if let Ok(focused) = self.windows.focused_app() {
-            let on_screen = focused == Some(self.cfg.appid);
-            if on_screen != self.last_game_window {
-                self.last_game_window = on_screen;
-                reports.push(Report::GameWindow { on_screen });
+        match self.windows.focused_app() {
+            Ok(focused) => {
+                self.focused = focused;
+                let on_screen = focused == Some(self.cfg.appid);
+                if on_screen != self.last_game_window {
+                    self.last_game_window = on_screen;
+                    reports.push(Report::GameWindow { on_screen });
+                }
             }
+            // Unknown, not what it was: the notice's key press must not trust an old read.
+            Err(_) => self.focused = None,
         }
 
-        match self.windows.mapped() {
+        if let Some(percent) = self.read_shader_log() {
+            reports.push(Report::ShaderProgress(percent));
+        }
+
+        let mapped = self.windows.mapped();
+        self.windows_read = mapped.is_ok();
+        match mapped {
             Ok(windows) => {
                 // The higher-ranked of the window and log reasons wins.
                 let desired = [
@@ -205,6 +262,7 @@ impl Watcher {
                 .flatten()
                 .min_by_key(|reason| needs_rank(*reason));
                 self.update_needs(desired, &mut reports);
+                self.last_windows = windows;
             }
             Err(_) => {
                 // The mapped list is skipped for this pass: no window-derived
@@ -219,10 +277,73 @@ impl Watcher {
         reports
     }
 
+    /// The target's latest shader percentage, when it changed this pass. Lines for other
+    /// apps (background processing) are ignored.
+    /// The figure only rises: a later line that reads lower (Steam's next stage, a recount)
+    /// is not reported.
+    fn read_shader_log(&mut self) -> Option<u8> {
+        let mut rose = false;
+        for line in self.shader.read().0 {
+            if let Some(percent) = shader_percent(&line, self.cfg.appid) {
+                if self.last_shader.is_none_or(|last| percent > last) {
+                    self.last_shader = Some(percent);
+                    rose = true;
+                }
+            }
+        }
+        if rose {
+            self.last_shader
+        } else {
+            None
+        }
+    }
+
+    /// The caller answers Steam's controller notice itself (`dismiss_safe`, #759).
+    pub fn answer_notice(&mut self) {
+        self.answers_notice = true;
+    }
+
+    /// The caller pressed its answer to the notice at `now`.
+    pub fn notice_pressed(&mut self, now: Instant) {
+        self.notice_pressed.get_or_insert(now);
+    }
+
+    /// The caller will not answer the notice: report it as any wait for the user.
+    pub fn reveal_notice(&mut self) {
+        self.answers_notice = false;
+    }
+
+    /// The notice has stood [`USER_WAIT`] and nothing else of Steam's needs the user: no
+    /// sign-in, no other wait in the log, no dialog window. The one state a key press may answer.
+    pub fn notice_alone(&self, now: Instant) -> bool {
+        self.interstitial_standing(now) && self.login.needs.is_none() && self.active_needs.is_none()
+    }
+
+    /// gamescope's `GAMESCOPE_FOCUSED_APP` as read this pass; `None` while unset, or when the
+    /// read failed.
+    pub fn focused(&self) -> Option<u32> {
+        self.focused
+    }
+
+    /// This pass read the window list, so what it says about Steam's dialogs is current.
+    pub fn windows_read(&self) -> bool {
+        self.windows_read
+    }
+
+    /// The notice stands, and an answering caller has not yet given its press time to work.
+    fn notice_held(&self, now: Instant) -> bool {
+        self.answers_notice
+            && self.interstitial_since.is_some()
+            && self
+                .notice_pressed
+                .is_none_or(|at| now.saturating_duration_since(at) < USER_WAIT)
+    }
+
     fn held_log_needs(&self, now: Instant) -> Option<NeedsUser> {
         let wait = self
             .log_waiting
             .filter(|(_, since)| now.saturating_duration_since(*since) >= USER_WAIT)
+            .filter(|_| !self.notice_held(now))
             .map(|(reason, _)| reason);
         [wait, self.login.needs]
             .into_iter()
@@ -296,6 +417,7 @@ impl Watcher {
         if forgot {
             self.log_game = None;
             self.log_waiting = None;
+            self.interstitial_since = None;
         }
         for line in lines {
             self.parse_log_line(line.trim_end(), now);
@@ -317,11 +439,13 @@ impl Watcher {
             if !is_install_script && extract_appid(line) == Some(self.cfg.appid) {
                 self.log_game = Some(true);
                 self.log_waiting = None;
+                self.interstitial_since = None;
             }
         } else if line.contains("Game process removed") {
             if !is_install_script && extract_appid(line) == Some(self.cfg.appid) {
                 self.log_game = Some(false);
                 self.log_waiting = None;
+                self.interstitial_since = None;
             }
         } else if line.contains("GameAction") {
             if extract_appid(line) != Some(self.cfg.appid) {
@@ -335,6 +459,11 @@ impl Watcher {
                     .split_whitespace()
                     .next()
                     .unwrap_or("");
+                if task == "ShowInterstitials" {
+                    self.interstitial_since.get_or_insert(now);
+                } else {
+                    self.interstitial_since = None;
+                }
                 // Reported only if no next task follows within USER_WAIT
                 // (held_log_needs); a routine wait is never armed.
                 self.log_waiting = (!ROUTINE_WAITS.contains(&task)).then(|| {
@@ -349,6 +478,7 @@ impl Watcher {
                 || line.contains("LaunchApp changed task to")
             {
                 self.log_waiting = None;
+                self.interstitial_since = None;
             }
         }
     }
@@ -428,9 +558,10 @@ impl LogTail {
         // session's and is read from 0 (the inode check below sees
         // None != Some(new inode) and restarts it). Only a new file
         // (rotation) or a shorter one (truncation) restarts at 0 after that.
-        // Steam rotates by size to `console_log.txt.previous` (#723): the
-        // rest of the file being read is finished there first, keeping what
-        // was learnt from it.
+        // Steam rotates by size to `console_log.previous.txt` (every listing
+        // of the logs dir in the #759 S0 spike; no `.txt.previous`): the rest
+        // of the file being read is finished there first, keeping what was
+        // learnt from it.
         if !self.seen {
             self.seen = true;
             if let Ok(seen) = &metadata {
@@ -648,8 +779,8 @@ fn needs_rank(reason: NeedsUser) -> u8 {
     }
 }
 
-/// The `STEAM_GAME` of Steam's own client windows (measured by the #723 spike).
-const STEAM_CLIENT_APPID: u32 = 769;
+/// The `STEAM_GAME` of Steam's own client windows, Big Picture included (#723, #759 spike).
+pub const STEAM_CLIENT_APPID: u32 = 769;
 
 fn classify_windows(windows: &[WindowInfo], appid: u32) -> Option<NeedsUser> {
     windows
@@ -702,5 +833,303 @@ fn classify_window(window: &WindowInfo, appid: u32) -> Option<NeedsUser> {
         Some(NeedsUser::Other)
     } else {
         None
+    }
+}
+
+// --- the agent's commands and what follows them (#759) ------------------------
+
+/// One command of the agent's closed set, as it arrives on the socket (`launch <appid>`,
+/// `bigpicture`, `quit <appid>`). Anything else is not a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    Launch(u32),
+    BigPicture,
+    Quit(u32),
+}
+
+/// One line, its line ending stripped. `None` for anything outside the closed set: an appid
+/// is `^[1-9][0-9]{0,9}$` and must fit a `u32`.
+pub fn parse_command(line: &str) -> Option<Command> {
+    let appid = |id: &str| {
+        let digits = id.len() <= 10
+            && id.bytes().all(|b| b.is_ascii_digit())
+            && id.bytes().next().is_some_and(|b| b != b'0');
+        digits.then(|| id.parse().ok()).flatten()
+    };
+    match line.split_once(' ') {
+        None if line == "bigpicture" => Some(Command::BigPicture),
+        Some(("launch", id)) => appid(id).map(Command::Launch),
+        Some(("quit", id)) => appid(id).map(Command::Quit),
+        _ => None,
+    }
+}
+
+fn cfg_shader_log(steam_log_dir: &Path) -> PathBuf {
+    steam_log_dir.join("shader_log.txt")
+}
+
+/// The progress of `[stamp] Still replaying <appid> (NN%, a/b).` for `appid`: `100 * a / b`,
+/// rounded down and at most 100, since Steam's own `NN` reads as a stage (it stood at 50% while
+/// `a` went 0 to 3082 of ~144k, #759 S0). `NN` only for a line with no counters, `(NN%).`.
+/// `None` for any other line or app.
+fn shader_percent(line: &str, appid: u32) -> Option<u8> {
+    let rest = after_timestamp(line)?.strip_prefix("Still replaying ")?;
+    let (id, rest) = rest.split_once(' ')?;
+    if id.parse::<u32>().ok()? != appid {
+        return None;
+    }
+    let inside = rest.strip_prefix('(')?.strip_suffix(").")?;
+    let number = |s: &str| {
+        (!s.is_empty() && s.len() <= 12 && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    match inside.split_once("%, ") {
+        Some((_, counters)) => {
+            let (done, total) = counters.split_once('/')?;
+            let (done, total) = (number(done)?, number(total)?);
+            (total > 0).then(|| (done.saturating_mul(100) / total).min(100) as u8)
+        }
+        None => number(inside.strip_suffix('%')?)
+            .filter(|p| *p <= 100)
+            .map(|p| p as u8),
+    }
+}
+
+/// What follows Steam's `[YYYY-MM-DD HH:MM:SS] ` prefix, or `None` when the line has none.
+fn after_timestamp(line: &str) -> Option<&str> {
+    let (stamp, rest) = line.strip_prefix('[')?.split_once("] ")?;
+    let (date, time) = stamp.split_once(' ')?;
+    let all =
+        |s: &str, extra: u8| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == extra);
+    (all(date, b'-') && all(time, b':')).then_some(rest)
+}
+
+/// How Steam's exit cloud sync for an app ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloudEnd {
+    /// `Upload complete in build list`: nothing to upload.
+    NothingToUpload,
+    /// `Upload complete, result <word>`: `OK`, or the failure word.
+    Uploaded(String),
+}
+
+/// Steam's exit cloud sync for one app in `cloud_log.txt`, read from where the log stood
+/// when this was made. The end counts only after `Starting sync (up,AC Exit,)` for that app,
+/// and the read follows Steam's rotation to `cloud_log.previous.txt` mid-sync (#759 spike).
+pub struct CloudSync {
+    tail: LogTail,
+    appid: u32,
+    started: bool,
+}
+
+impl CloudSync {
+    pub fn new(steam_log_dir: &Path, appid: u32) -> Self {
+        let mut tail = LogTail::new(
+            steam_log_dir.join("cloud_log.txt"),
+            Some(steam_log_dir.join("cloud_log.previous.txt")),
+        );
+        // The first read only marks where the log ends now.
+        tail.read();
+        Self {
+            tail,
+            appid,
+            started: false,
+        }
+    }
+
+    /// The end of the sync, once it is in the log.
+    pub fn poll(&mut self) -> Option<CloudEnd> {
+        let start = format!("[AppID {}] Starting sync (up,AC Exit,)", self.appid);
+        let end = format!("[AppID {}] Upload complete", self.appid);
+        for line in self.tail.read().0 {
+            let Some(rest) = after_timestamp(&line) else {
+                continue;
+            };
+            if rest == start {
+                self.started = true;
+                continue;
+            }
+            if !self.started {
+                continue;
+            }
+            match rest.strip_prefix(&end) {
+                Some(" in build list") => return Some(CloudEnd::NothingToUpload),
+                Some(tail) => {
+                    if let Some(word) = tail.strip_prefix(", result ").filter(|w| {
+                        !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    }) {
+                        return Some(CloudEnd::Uploaded(word.to_owned()));
+                    }
+                }
+                None => {}
+            }
+        }
+        None
+    }
+}
+
+/// Whether `appid`'s launch reaper is alive under `proc_root`; `None` when `/proc` could not
+/// be read in full, which never counts as gone.
+pub fn game_running(proc_root: &Path, appid: u32) -> Option<bool> {
+    let scan = scan_proc(proc_root, appid);
+    scan.readable.then_some(scan.reaper_alive)
+}
+
+/// The pids of `appid`'s launch reaper and every process under it, at most 4096. Parents
+/// come from `/proc/<pid>/stat`; a pid that vanishes mid-read is skipped.
+pub fn game_tree(proc_root: &Path, appid: u32) -> Vec<u32> {
+    const MAX_TREE: usize = 4096;
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    let mut parent_of = Vec::new();
+    let mut tree = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if let Ok(Some(cmdline)) = read_cmdline(&entry.path().join("cmdline")) {
+            let args: Vec<String> = cmdline
+                .split(|b| *b == 0)
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .filter(|arg| !arg.is_empty())
+                .collect();
+            if is_reaper_for(&args, appid) {
+                tree.push(pid);
+            }
+        }
+        if let Some(ppid) = read_ppid(&entry.path().join("stat")) {
+            parent_of.push((pid, ppid));
+        }
+    }
+    let mut next = 0;
+    while next < tree.len() && tree.len() < MAX_TREE {
+        let parent = tree[next];
+        for (pid, _) in parent_of.iter().filter(|(_, ppid)| *ppid == parent) {
+            if !tree.contains(pid) && tree.len() < MAX_TREE {
+                tree.push(*pid);
+            }
+        }
+        next += 1;
+    }
+    tree
+}
+
+/// The fourth field of `/proc/<pid>/stat`, read after the last `)`: the command name in
+/// between is the process's own text and may hold spaces and parentheses.
+fn read_ppid(path: &Path) -> Option<u32> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_CMDLINE_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let (_, rest) = text.rsplit_once(')')?;
+    rest.split_ascii_whitespace().nth(1)?.parse().ok()
+}
+
+/// Quitting a game the way a player would (#759): `WM_DELETE_WINDOW` first, then SIGTERM to
+/// its process tree 20 s later, then SIGKILL 10 s after that, then Steam's exit cloud sync
+/// for it, up to 60 s. Pure apart from the `/proc` and log reads: the caller does the X call
+/// and the signals this hands back.
+pub struct Quit {
+    appid: u32,
+    proc_root: PathBuf,
+    cloud: CloudSync,
+    step: QuitStep,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum QuitStep {
+    /// The game was not running when the quit began: nothing to close or sync.
+    NotRunning,
+    Closing(Instant),
+    Terminating(Instant),
+    Killing(Instant),
+    Syncing(Instant),
+    Over,
+}
+
+/// What a [`Quit`] pass asks the caller to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuitAction {
+    Terminate(Vec<u32>),
+    Kill(Vec<u32>),
+    /// The game is gone; whether its exit sync was seen to end, and how.
+    Done(Option<CloudEnd>),
+    /// The game outlived SIGKILL.
+    Failed,
+}
+
+pub const QUIT_CLOSE_GRACE: Duration = Duration::from_secs(20);
+pub const QUIT_TERM_GRACE: Duration = Duration::from_secs(10);
+/// After SIGKILL the reaper should be gone within a pass or two.
+pub const QUIT_KILL_GRACE: Duration = Duration::from_secs(3);
+pub const QUIT_CLOUD_WAIT: Duration = Duration::from_secs(60);
+
+impl Quit {
+    /// Made right after the close request went out, so the cloud log is read from then.
+    pub fn new(proc_root: &Path, steam_log_dir: &Path, appid: u32, now: Instant) -> Self {
+        let step = match game_running(proc_root, appid) {
+            // ponytail: a game that exited just before the quit may still be syncing; its sync
+            // is not waited for (Steam keeps running, so it finishes anyway).
+            Some(false) => QuitStep::NotRunning,
+            _ => QuitStep::Closing(now),
+        };
+        Self {
+            appid,
+            proc_root: proc_root.to_owned(),
+            cloud: CloudSync::new(steam_log_dir, appid),
+            step,
+        }
+    }
+
+    pub fn appid(&self) -> u32 {
+        self.appid
+    }
+
+    pub fn poll(&mut self, now: Instant) -> Option<QuitAction> {
+        let since = |at: Instant| now.saturating_duration_since(at);
+        match self.step {
+            QuitStep::NotRunning => {
+                self.step = QuitStep::Over;
+                Some(QuitAction::Done(None))
+            }
+            QuitStep::Closing(at) | QuitStep::Terminating(at) | QuitStep::Killing(at) => {
+                if game_running(&self.proc_root, self.appid) == Some(false) {
+                    self.step = QuitStep::Syncing(now);
+                    return self.poll(now);
+                }
+                match self.step {
+                    QuitStep::Closing(_) if since(at) >= QUIT_CLOSE_GRACE => {
+                        self.step = QuitStep::Terminating(now);
+                        Some(QuitAction::Terminate(game_tree(
+                            &self.proc_root,
+                            self.appid,
+                        )))
+                    }
+                    QuitStep::Terminating(_) if since(at) >= QUIT_TERM_GRACE => {
+                        self.step = QuitStep::Killing(now);
+                        Some(QuitAction::Kill(game_tree(&self.proc_root, self.appid)))
+                    }
+                    QuitStep::Killing(_) if since(at) >= QUIT_KILL_GRACE => {
+                        self.step = QuitStep::Over;
+                        Some(QuitAction::Failed)
+                    }
+                    _ => None,
+                }
+            }
+            QuitStep::Syncing(at) => {
+                let end = self.cloud.poll();
+                if end.is_some() || since(at) >= QUIT_CLOUD_WAIT {
+                    self.step = QuitStep::Over;
+                    return Some(QuitAction::Done(end));
+                }
+                None
+            }
+            QuitStep::Over => None,
+        }
     }
 }

@@ -348,6 +348,9 @@ export interface SessionRuntime {
   /** Unmutes the session's sound. It starts muted so nothing the app plays before the
    *  reveal (Steam's startup sound under the loading screen) is heard; idempotent. */
   releaseAudio(): void;
+  /** The mirror of releaseAudio: mutes the sound again, and keeps a replaced audio
+   *  track muted, until the next releaseAudio. Idempotent. */
+  holdAudio(): void;
 }
 
 export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime {
@@ -911,6 +914,11 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       // leaving the host session and its app alive; an ordinary unmount says bye.
       transport?.close(!handoff);
       transport = null;
+    },
+
+    holdAudio() {
+      audioHeld = true;
+      if (audioEl) audioEl.muted = true;
     },
 
     releaseAudio() {

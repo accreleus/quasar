@@ -16,6 +16,13 @@ describe("settings search", () => {
     expect(labels("auto-hide")[0]).toBe("Auto-hide");
   });
 
+  it("finds Steam dialogs, and the warm-Steam admin rows under Library sources", () => {
+    expect(labels("steam dialogs")[0]).toBe("Steam dialogs");
+    expect(labels("controller notice")).toContain("Steam dialogs");
+    expect(searchSettings("warm", ADMIN_SETTINGS).map((e) => e.label)).toContain("Sources");
+    expect(searchSettings("preparation", ADMIN_SETTINGS).map((e) => e.label)).toContain("Sources");
+  });
+
   it("ranks a label match above a keyword match", () => {
     expect(labels("overlay")[0]).toBe("In-session overlay");
     expect(labels("password")[0]).toBe("Password");

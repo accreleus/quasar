@@ -25,6 +25,7 @@ func peekType(raw []byte) (string, error) {
 type RegisterMsg struct {
 	SourcePolicyVersions  map[string]int  `json:"source_policy_versions,omitempty"`
 	TerminalHomeCleanupV1 bool            `json:"terminal_home_cleanup_v1,omitempty"`
+	ParkedSessionsV1      bool            `json:"parked_sessions_v1,omitempty"`
 	ConfigPolicyVersions  map[string]int  `json:"config_policy_versions,omitempty"`
 	ConfigPolicyGroups    []string        `json:"config_policy_groups"`
 	Type                  string          `json:"type"`

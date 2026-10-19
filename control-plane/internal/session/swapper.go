@@ -125,12 +125,12 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 				return Session{}, ErrSessionNotSwappable
 			}
 		}
-		conflictID, err := s.store.HasLiveUserAppSession(ctx, sess.UserID, homeAppID(app), sessionID)
+		conflict, err := s.store.HasLiveUserAppSession(ctx, sess.UserID, homeAppID(app), sessionID)
 		if err != nil {
 			return Session{}, fmt.Errorf("home in use check: %w", err)
 		}
-		if conflictID != "" {
-			return Session{}, &HomeInUseError{SessionID: conflictID}
+		if conflict != nil {
+			return Session{}, conflict
 		}
 		s.noteSwapStart(sessionID)
 		hold, err := s.store.GuardHomeForSwapWithHold(ctx, sessionID, sess.UserID, app,
@@ -140,6 +140,15 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 		}
 		homeEpoch = epoch
 		homeHold = hold
+	}
+
+	// Two tiles of one Steam parent can switch games inside the running Steam
+	// (control-api.md §Warm Steam, "Quick switch"); the agent decides whether it
+	// can, and the connection whether to ask.
+	inPlace := false
+	if app.IsDerived() && app.SteamFamily && app.ID != sess.AppID {
+		cur, err := s.store.GetLaunchApp(ctx, sess.AppID)
+		inPlace = err == nil && cur.ParentAppID == app.ParentAppID
 	}
 
 	// A managed-home swap target gets its home injected exactly like a launch.
@@ -166,7 +175,7 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	s.pendingSwaps[sessionID] = newAppID
 	s.mu.Unlock()
 
-	go s.dispatchSwap(*sess.HostID, sessionID, dispatchSpec, app.ManagedHome,
+	go s.dispatchSwap(*sess.HostID, sessionID, dispatchSpec, app.ManagedHome, inPlace,
 		sess.UserID, homeAppID(app), homeEpoch, homeHold)
 
 	sess.StateDetail = strptr(swapDetailInProgress)
@@ -181,7 +190,7 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 // "swap complete" must still be able to commit app_id. A swap it never ran is
 // ended by the sweep (swapUnresolvedAfter). On accept, progress arrives via
 // AgentState.
-func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, managedHome bool,
+func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, managedHome, inPlace bool,
 	userID, canonicalAppID string, epoch agentws.HomeCommandEpoch, hold *HomeHoldDecision) {
 	app := runtimeSpec
 	if len(app) == 0 {
@@ -204,6 +213,7 @@ func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, man
 	var err error
 	var queued bool
 	for attempt := 0; attempt < 3; attempt++ {
+		cmd.InPlace = inPlace && dispatcherParks(s.dispatcher, hostID, epoch)
 		ctx, cancel := context.WithTimeout(context.Background(), swapAckTimeout)
 		switch {
 		case epoch != nil:

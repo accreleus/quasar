@@ -6,7 +6,7 @@
 //! `abs-capture-time` RTP header extension, not here.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -279,6 +279,9 @@ pub struct SessionMetrics {
     /// #445: the console session's physical display mode; see `MetricsWindow::console_mode`.
     console_mode: Mutex<Option<(u16, u16, u32)>>,
     app_launch_state: Mutex<Option<&'static str>>,
+    /// The session's launch helper has connected at least once (amendment 39): what makes a
+    /// held or parked runtime one a play session can adopt. Not on the wire.
+    launch_helper_connected: AtomicBool,
     /// SPT-03: the frame rate the classifier should expect, seeded from the launch fps.
     /// Drives the per-frame encode budget (`1000 / target_fps`) so the saturation trip
     /// scales with the tier instead of assuming 60.
@@ -438,6 +441,7 @@ impl SessionMetrics {
             display: LiveEcho::default(),
             console_mode: Mutex::new(None),
             app_launch_state: Mutex::new(None),
+            launch_helper_connected: AtomicBool::new(false),
             target_fps: AtomicU64::new(target_fps as u64),
             last_setpoint_kbps: Mutex::new(0),
             last_encode_in_ms: AtomicU64::new(0),
@@ -848,6 +852,14 @@ impl SessionMetrics {
     /// window from now on. Written whenever the desktop is displaying at a new mode.
     pub fn set_console_mode(&self, mode: Option<(u16, u16, u32)>) {
         *self.console_mode.lock().unwrap() = mode;
+    }
+
+    pub fn set_launch_helper_connected(&self) {
+        self.launch_helper_connected.store(true, Ordering::Relaxed);
+    }
+
+    pub fn launch_helper_connected(&self) -> bool {
+        self.launch_helper_connected.load(Ordering::Relaxed)
     }
 
     /// See `MetricsWindow::app_launch_state`.

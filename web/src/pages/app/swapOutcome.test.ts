@@ -20,6 +20,16 @@ describe("swapOutcome", () => {
     expect(swapOutcome(running("swap complete"))).toEqual({ kind: "success" });
   });
 
+  it("counts 'app booting' and 'app presented' as success once armed (an in-place swap overwrites 'swap complete')", () => {
+    expect(swapOutcome(running("app booting"), true)).toEqual({ kind: "success" });
+    expect(swapOutcome(running("app presented"), true)).toEqual({ kind: "success" });
+  });
+
+  it("does not count them before the poll has seen 'swapping' — they may be the previous app's", () => {
+    expect(swapOutcome(running("app booting"))).toEqual({ kind: "pending" });
+    expect(swapOutcome(running("app presented"), false)).toEqual({ kind: "pending" });
+  });
+
   it("extracts the reason from the agent's 'swap failed; rolled back: <reason>' detail", () => {
     expect(swapOutcome(running("swap failed; rolled back: new source container launch failed: boom"))).toEqual({
       kind: "error",

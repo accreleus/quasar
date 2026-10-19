@@ -28,6 +28,7 @@ import { AccountAppearance } from "../AccountAppearance";
 import { AccountOverlay } from "../AccountOverlay";
 import { AccountSessions } from "../AccountSessions";
 import { AccountStorage } from "../AccountStorage";
+import { SteamDialogsField } from "../SteamDialogsField";
 import { PasswordCard } from "../PasswordCard";
 import { buildCapChips, deviceLabel } from "../DeviceCard";
 import { ONE_PAGE_SECTIONS, sectionForPath, type OneSectionId } from "./sections";
@@ -193,6 +194,9 @@ function StreamSection() {
       <p className={status && !status.ok ? "form-error mt3" : "muted mt3"} role="status">
         {status?.text ?? (prefs ? `Now: ${current}. Saved as you pick. A launch never exceeds what your device can decode.` : "Loading…")}
       </p>
+      <div className="os-field mt5">
+        <SteamDialogsField />
+      </div>
     </div>
   );
 }

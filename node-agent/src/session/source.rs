@@ -1088,6 +1088,14 @@ impl AppSource {
         }
     }
 
+    /// The app this generation's container runs now: an adoption or an in-place swap changes it
+    /// with no new container (amendment 39), and a rollback must relaunch that app.
+    pub fn set_app_spec(&mut self, spec: ContainerSpec) {
+        if self.container_spec.is_some() {
+            self.container_spec = Some(spec);
+        }
+    }
+
     /// Relaunch this generation's app container into its still-live compositor: the
     /// rollback for a serialised swap that failed AFTER the outgoing app was stopped. The
     /// app restarts from scratch (its process state is gone, the cost of stopping it
@@ -1118,15 +1126,10 @@ impl AppSource {
         }
     }
 
-    fn launch(&mut self, wl_display: &str) {
-        let Some(spec) = self.container_spec.clone() else {
-            tracing::info!(
-                "source '{}': no app image configured (bare compositor)",
-                self.sink_name
-            );
-            return;
-        };
-        let mut effective_spec = spec;
+    /// What the next launch hands the engine, a rollback's relaunch included: the app's spec
+    /// with the session's sound server added.
+    pub(crate) fn launch_spec(&self) -> Option<ContainerSpec> {
+        let mut effective_spec = self.container_spec.clone()?;
         if let Some((server_uri, dir)) = &self.pulse {
             effective_spec
                 .env
@@ -1150,6 +1153,17 @@ impl AppSource {
                 .or_insert_with(|| super::audio::QUASAR_MIC_SOURCE_NAME.to_string());
             effective_spec.mounts.push(format!("{dir}:{dir}"));
         }
+        Some(effective_spec)
+    }
+
+    fn launch(&mut self, wl_display: &str) {
+        let Some(effective_spec) = self.launch_spec() else {
+            tracing::info!(
+                "source '{}': no app image configured (bare compositor)",
+                self.sink_name
+            );
+            return;
+        };
         let params = LaunchParams {
             session_id: &self.session_id,
             wayland_display: wl_display,

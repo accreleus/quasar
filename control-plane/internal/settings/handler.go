@@ -108,6 +108,10 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		// being configured first — with nothing to apply it simply applies
 		// nothing, and says so in the detection run's summary.
 		PlatformAutoApply *bool `json:"platform_auto_apply"`
+		// Warm Steam (control-api.md §Warm Steam, "Admin settings").
+		SteamWarmEnabled     *bool   `json:"steam_warm_enabled"`
+		SteamWarmRewarm      *string `json:"steam_warm_rewarm"`
+		SteamWarmIdleMinutes *int    `json:"steam_warm_idle_minutes"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -151,6 +155,16 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	if req.ImageUpdatePolicy != nil && !ValidImageUpdatePolicy(*req.ImageUpdatePolicy) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
 			"image_update_policy must be manual, notify, or auto")
+		return
+	}
+	if req.SteamWarmRewarm != nil && !ValidSteamWarmRewarm(*req.SteamWarmRewarm) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+			"steam_warm_rewarm must be library_open or next_steam_launch")
+		return
+	}
+	if req.SteamWarmIdleMinutes != nil && !ValidSteamWarmIdleMinutes(*req.SteamWarmIdleMinutes) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+			"steam_warm_idle_minutes must be between 1 and 60")
 		return
 	}
 	if req.ReleaseChannel != nil && !ValidReleaseChannel(*req.ReleaseChannel) {
@@ -207,6 +221,9 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		ReleaseWebhookEnabled:             req.ReleaseWebhookEnabled,
 		ReleaseWebhookURL:                 req.ReleaseWebhookURL,
 		PlatformAutoApply:                 req.PlatformAutoApply,
+		SteamWarmEnabled:                  req.SteamWarmEnabled,
+		SteamWarmRewarm:                   req.SteamWarmRewarm,
+		SteamWarmIdleMinutes:              req.SteamWarmIdleMinutes,
 	}
 	// Clearing the URL disables the webhook in the same write: "enabled, with
 	// nowhere to send" is a state no admin asked for and nothing can act on.

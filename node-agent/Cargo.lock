@@ -1565,6 +1565,7 @@ dependencies = [
 name = "quasar-launch-helper"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "quasar-launch-watch",
  "serde",
  "serde_json",

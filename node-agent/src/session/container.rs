@@ -1436,7 +1436,7 @@ fn short_id(id: &str) -> String {
 
 /// The container spec mirrored from the assign's `app` object (`apps.runtime_spec`,
 /// `agent-api.md`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContainerSpec {
     pub image: String,
     /// Internal launch policy after verified API preparation: the control plane's

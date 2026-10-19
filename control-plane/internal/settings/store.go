@@ -133,8 +133,32 @@ type Settings struct {
 	// pass, so the detection job's own schedule is the window.
 	PlatformAutoApply bool `json:"platform_auto_apply"`
 
+	// Warm Steam (amendment 39, migration 0105), read per request by the
+	// session package. Default off: a parked session holds a full reservation.
+	SteamWarmEnabled     bool   `json:"steam_warm_enabled"`
+	SteamWarmRewarm      string `json:"steam_warm_rewarm"`
+	SteamWarmIdleMinutes int    `json:"steam_warm_idle_minutes"`
+
 	UpdatedBy *string   `json:"updated_by"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Warm Steam settings (schema.md instance_settings, migration 0105). The
+// validators mirror the CHECKs so PATCH answers 400, not a database error.
+const (
+	SteamWarmRewarmLibraryOpen     = "library_open"
+	SteamWarmRewarmNextSteamLaunch = "next_steam_launch"
+	DefaultSteamWarmIdleMinutes    = 10
+	MinSteamWarmIdleMinutes        = 1
+	MaxSteamWarmIdleMinutes        = 60
+)
+
+func ValidSteamWarmRewarm(v string) bool {
+	return v == SteamWarmRewarmLibraryOpen || v == SteamWarmRewarmNextSteamLaunch
+}
+
+func ValidSteamWarmIdleMinutes(n int) bool {
+	return n >= MinSteamWarmIdleMinutes && n <= MaxSteamWarmIdleMinutes
 }
 
 // Library discovery interval bounds (protocol/openapi.yaml SettingsPatch):
@@ -266,6 +290,8 @@ func (s *Store) Get(ctx context.Context) (Settings, error) {
 			ReleaseWebhookEnabled: false,
 			ReleaseWebhookURL:     "",
 			PlatformAutoApply:     false,
+			SteamWarmRewarm:       SteamWarmRewarmLibraryOpen,
+			SteamWarmIdleMinutes:  DefaultSteamWarmIdleMinutes,
 			UpdatedAt:             time.Now().UTC(),
 		}, nil
 	}
@@ -428,7 +454,8 @@ const settingsColumns = `registration_mode, storage_provider, library_discovery_
 	mic_capture_enabled, image_update_policy, allowed_origins,
 	release_channel, release_edge_branch,
 	release_webhook_enabled, release_webhook_url, platform_auto_apply,
-	steam_preparation_enabled, steam_preparation_revision::text, updated_by::text, updated_at`
+	steam_preparation_enabled, steam_preparation_revision::text,
+	steam_warm_enabled, steam_warm_rewarm, steam_warm_idle_minutes, updated_by::text, updated_at`
 
 // scanner is the shared surface of pgx.Row and pgx.Rows.
 type scanner interface{ Scan(dest ...any) error }
@@ -440,7 +467,8 @@ func scanSettings(row scanner) (Settings, error) {
 		&st.MicCaptureEnabled, &st.ImageUpdatePolicy, &st.AllowedOrigins,
 		&st.ReleaseChannel, &st.ReleaseEdgeBranch,
 		&st.ReleaseWebhookEnabled, &st.ReleaseWebhookURL, &st.PlatformAutoApply,
-		&st.SteamPreparationEnabled, &st.SteamPreparationRevision, &st.UpdatedBy, &st.UpdatedAt)
+		&st.SteamPreparationEnabled, &st.SteamPreparationRevision,
+		&st.SteamWarmEnabled, &st.SteamWarmRewarm, &st.SteamWarmIdleMinutes, &st.UpdatedBy, &st.UpdatedAt)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -469,8 +497,11 @@ type Patch struct {
 	ReleaseWebhookEnabled             *bool
 	// A pointer to a string, and "" is the CLEAR — unlike release_edge_branch,
 	// which is never cleared. "No webhook configured" has to be expressible.
-	ReleaseWebhookURL *string
-	PlatformAutoApply *bool
+	ReleaseWebhookURL    *string
+	PlatformAutoApply    *bool
+	SteamWarmEnabled     *bool
+	SteamWarmRewarm      *string
+	SteamWarmIdleMinutes *int
 }
 
 // ChangedKeys lists the fields this patch sets, for the audit row. Names only —
@@ -495,6 +526,9 @@ func (p Patch) ChangedKeys() []string {
 		{"release_webhook_enabled", p.ReleaseWebhookEnabled != nil},
 		{"release_webhook_url", p.ReleaseWebhookURL != nil},
 		{"platform_auto_apply", p.PlatformAutoApply != nil},
+		{"steam_warm_enabled", p.SteamWarmEnabled != nil},
+		{"steam_warm_rewarm", p.SteamWarmRewarm != nil},
+		{"steam_warm_idle_minutes", p.SteamWarmIdleMinutes != nil},
 	} {
 		if f.set {
 			keys = append(keys, f.name)
@@ -510,7 +544,8 @@ func (p Patch) Empty() bool {
 		p.MicCaptureEnabled == nil && p.ImageUpdatePolicy == nil && p.AllowedOrigins == nil &&
 		p.ReleaseChannel == nil && p.ReleaseEdgeBranch == nil &&
 		p.ReleaseWebhookEnabled == nil && p.ReleaseWebhookURL == nil &&
-		p.PlatformAutoApply == nil
+		p.PlatformAutoApply == nil &&
+		p.SteamWarmEnabled == nil && p.SteamWarmRewarm == nil && p.SteamWarmIdleMinutes == nil
 }
 
 // Apply writes every provided field in one statement inside one transaction —
@@ -570,6 +605,9 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		    release_webhook_enabled              = COALESCE($13::boolean, s.release_webhook_enabled),
 		    release_webhook_url                  = COALESCE($14::text,    s.release_webhook_url),
 		    platform_auto_apply                  = COALESCE($15::boolean, s.platform_auto_apply),
+		    steam_warm_enabled                   = COALESCE($16::boolean, s.steam_warm_enabled),
+		    steam_warm_rewarm                    = COALESCE($17::text,    s.steam_warm_rewarm),
+		    steam_warm_idle_minutes              = COALESCE($18::int,     s.steam_warm_idle_minutes),
 		    steam_preparation_enabled = COALESCE($12::boolean, s.steam_preparation_enabled),
  steam_preparation_revision = s.steam_preparation_revision + CASE WHEN $12::boolean IS NOT NULL AND $12::boolean IS DISTINCT FROM s.steam_preparation_enabled THEN 1 ELSE 0 END,
  updated_by                           = $11::uuid
@@ -579,7 +617,8 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		p.LibraryDiscoveryIntervalMinutes, p.LibraryDiscoveryAppDetailsEnabled,
 		p.MicCaptureEnabled, p.ImageUpdatePolicy, origins,
 		p.ReleaseChannel, p.ReleaseEdgeBranch, updatedBy, p.SteamPreparationEnabled,
-		p.ReleaseWebhookEnabled, p.ReleaseWebhookURL, p.PlatformAutoApply))
+		p.ReleaseWebhookEnabled, p.ReleaseWebhookURL, p.PlatformAutoApply,
+		p.SteamWarmEnabled, p.SteamWarmRewarm, p.SteamWarmIdleMinutes))
 	if err != nil {
 		return Settings{}, false, fmt.Errorf("update instance_settings: %w", err)
 	}

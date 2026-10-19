@@ -113,12 +113,20 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) e
 	var state State
 	var host *string
 	var connected, recent bool
-	err := tx.QueryRow(ctx, `SELECT s.state, s.host_id::text,
+	var kind string
+	var released bool
+	// A hold on a runtime that a row adopts answers as that row while it lives.
+	// Once it ended unadopted the runtime is being released, timed from its end.
+	err := tx.QueryRow(ctx, `SELECT s.id::text, s.state, s.host_id::text,
 		COALESCE(h.status IN ('online','draining'), false),
-		COALESCE(s.ended_at, s.updated_at) > now() - ($2::int * interval '1 second')
-		FROM sessions s LEFT JOIN hosts h ON h.id=s.host_id
-		WHERE s.id=$1::uuid`, holder, int(homeHoldSettleWindow/time.Second)).
-		Scan(&state, &host, &connected, &recent)
+		COALESCE(a.ended_at, k.ended_at, k.updated_at) > now() - ($2::int * interval '1 second'), s.kind,
+		COALESCE(k.stop_reason = $3, false) OR a.id IS NOT NULL
+		FROM sessions k
+		LEFT JOIN sessions a ON a.adopt_session_id = k.id
+		JOIN sessions s ON s.id = CASE WHEN a.state NOT IN ('stopped','failed') THEN a.id ELSE k.id END
+		LEFT JOIN hosts h ON h.id=s.host_id
+		WHERE k.id=$1::uuid`, holder, int(homeHoldSettleWindow/time.Second), stopReasonRuntimeReleased).
+		Scan(&holder, &state, &host, &connected, &recent, &kind, &released)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrHomeConflict
 	}
@@ -127,7 +135,14 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) e
 	}
 	switch {
 	case !state.IsTerminal():
+		if kind == KindParked { // never named (control-api.md §Warm Steam)
+			return &HomeInUseError{Stopping: state == StateStopping, parkedID: holder}
+		}
 		return &HomeInUseError{SessionID: holder, Stopping: state == StateStopping}
+	case host != nil && *host == claimHost && connected && recent && released:
+		// A released held runtime: Steam is shutting down (control-api.md §Warm
+		// Steam, "Park on exit"), so the launch path answers 503, never a conflict.
+		return &HomeInUseError{Stopping: true, releasedID: holder}
 	case host != nil && *host == claimHost && connected && recent:
 		return &homeHoldSettlingError{holder: holder}
 	default:
@@ -406,7 +421,7 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE sessions SET state_detail=$2 WHERE id=$1::uuid`,
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET state_detail=$2, launch_progress=NULL WHERE id=$1::uuid`,
 		sessionID, swapDetailInProgress); err != nil {
 		return nil, fmt.Errorf("persist pending swap guard: %w", err)
 	}

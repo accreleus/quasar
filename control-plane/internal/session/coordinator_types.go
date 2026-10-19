@@ -58,6 +58,9 @@ type LaunchParams struct {
 	// the instance setting to resolve what is dispatched and persisted
 	// (Session.Mic). A request against a disabled instance proceeds with no mic.
 	Mic bool
+	// parked is the library heartbeat's warm start (control-api.md §Warm Steam):
+	// no signaling token, Steam -silent, kind parked, and never an eviction.
+	parked bool
 }
 
 // isNativeClient is lenient: only the exact string "native" counts, anything

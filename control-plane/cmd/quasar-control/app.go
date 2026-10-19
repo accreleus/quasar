@@ -582,6 +582,23 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		"grace_secs", cfg.SessionGraceSecs, "booted_at", bootedAt.Format(time.RFC3339))
 	go coordinator.RunEntitlementSweep(janitorCtx)
 
+	jobRegistry.MustRegister(jobs.Definition{
+		ID:          "session.parked_expire",
+		Name:        "Warm Steam expiry",
+		Description: "Stops every parked session past its idle deadline, and every one while warm Steam is off.",
+		Plane:       jobs.PlaneControl,
+		Scope:       jobs.ScopeInstance,
+		Managed:     true,
+		Default:     jobs.Schedule{Kind: jobs.KindInterval, IntervalSecs: 60},
+		Run: func(ctx context.Context, rc jobs.RunContext) (jobs.Outcome, error) {
+			n, err := coordinator.ExpireParked(ctx)
+			if err != nil {
+				return jobs.Outcome{}, err
+			}
+			return jobs.Succeeded(jobs.Summary{"stopped": n}), nil
+		},
+	})
+
 	authHandler := auth.NewHandler(authSvc, auditStore).
 		WithVersionPolicy(cfg.MinClientVersion, cfg.LatestClientVersion).
 		WithTrustedProxies(cfg.TrustedProxies).
@@ -1044,8 +1061,14 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	applyRunner := platform.NewRunner(platformStore, platform.ApplyDeps{
 		DeveloperCommit: developerImages.Commit,
 		AcquireOwned: func(ctx context.Context, attemptID, hostID string) error {
-			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply")
-			return err
+			if _, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply"); err != nil {
+				return err
+			}
+			// Best-effort: expiry and the apply's own drain stop parked sessions too.
+			if err := coordinator.StopParkedOnHost(ctx, hostID); err != nil {
+				log.Warn("platform apply: stopping parked sessions failed", "host_id", hostID, "err", err)
+			}
+			return nil
 		},
 		ReleaseOwned: func(ctx context.Context, attemptID, hostID string) error {
 			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, agentRegistry.IsConnected(hostID))
@@ -1139,8 +1162,14 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// also DRAINS is a per-release decision (#153) that lives in the sequencer.
 	fleetCordons := platform.FleetCordons{
 		AcquireOwned: func(ctx context.Context, runID, hostID string) error {
-			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, "Platform apply")
-			return err
+			if _, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, "Platform apply"); err != nil {
+				return err
+			}
+			// Best-effort: expiry and the apply's own drain stop parked sessions too.
+			if err := coordinator.StopParkedOnHost(ctx, hostID); err != nil {
+				log.Warn("platform apply: stopping parked sessions failed", "host_id", hostID, "err", err)
+			}
+			return nil
 		},
 		ReleaseOwned: func(ctx context.Context, runID, hostID string) error {
 			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, agentRegistry.IsConnected(hostID))

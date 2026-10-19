@@ -45,6 +45,14 @@ func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID s
 	if err == nil && (owner == nil || *owner != hostID) {
 		return 0, nil
 	}
+	// The runtime has ended, but a live row adopting it may already be building
+	// fresh on the home: the hold passes to that row rather than lapsing.
+	var adopter *string
+	err = tx.QueryRow(ctx, `SELECT id::text FROM sessions WHERE adopt_session_id=$1::uuid
+		AND state NOT IN ('stopped','failed') AND host_id=$2::uuid FOR UPDATE`, sessionID, hostID).Scan(&adopter)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("lock adopting session: %w", err)
+	}
 	rows, err := tx.Query(ctx, `SELECT user_id::text,canonical_app_id::text
 		FROM managed_home_claims WHERE pending_home_session_id=$1::uuid
 		ORDER BY user_id,canonical_app_id FOR UPDATE`, sessionID)
@@ -68,6 +76,15 @@ func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID s
 	rows.Close()
 	cleared := 0
 	for _, k := range keys {
+		if adopter != nil {
+			if _, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=$3::uuid
+				WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid
+				  AND pending_home_session_id=$4::uuid AND host_id=$5::uuid`,
+				k.user, k.app, *adopter, sessionID, hostID); err != nil {
+				return 0, fmt.Errorf("pass home hold to adopter: %w", err)
+			}
+			continue
+		}
 		tag, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
 			pending_home_token=NULL,pending_home_started_at=NULL
 			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid
@@ -87,12 +104,16 @@ func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID s
 // HeldTerminalSessionIDsOnHost is the recovery scan after a capable register
 // and on each capped retry tick. A lost terminal may have been followed by
 // heartbeat reaping on the same connection, so this cannot be register-only.
+// A runtime a live row is adopting is skipped: stopping it would cold-start
+// that row.
 func (s *Store) HeldTerminalSessionIDsOnHost(ctx context.Context, hostID string) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `SELECT DISTINCT c.pending_home_session_id::text
 		FROM managed_home_claims c
 		LEFT JOIN sessions s ON s.id=c.pending_home_session_id
 		WHERE c.host_id=$1::uuid AND c.pending_home_session_id IS NOT NULL
 		  AND (s.id IS NULL OR s.state IN ('stopped','failed'))
+		  AND NOT EXISTS (SELECT 1 FROM sessions a WHERE a.adopt_session_id=c.pending_home_session_id
+		        AND a.state NOT IN ('stopped','failed'))
 		ORDER BY c.pending_home_session_id::text`, hostID)
 	if err != nil {
 		return nil, fmt.Errorf("scan pending home cleanup: %w", err)

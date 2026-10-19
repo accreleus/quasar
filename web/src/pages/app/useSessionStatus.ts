@@ -6,6 +6,7 @@
 // hook, by useDisplayPatch.ts on ack/revert (same PATCH endpoint the poll
 // below reads) — their setters are returned raw for that hook to call
 // directly.
+import { shaderPercent as shaderPercentOf } from "./launchProgress";
 import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { getSession } from "../../api/library";
 import type { Session } from "../../api/types";
@@ -43,6 +44,8 @@ export interface SessionStatus {
   externalOwner: "auto" | "pinned" | undefined;
   /** UX assessment §2.2: the loader's substage copy while a launch is still in progress. */
   launchDetail: string | null;
+  /** Steam's shader progress (0-100) while the app boots; null when the read carries none. */
+  shaderPercent: number | null;
   /** UX assessment §2.2: the loader's terminal verdict. Sticky once set. */
   launchFailure: LaunchFailure | null;
   /** The only way the sticky verdict is written — also called by SessionPage's WebRTC callbacks. */
@@ -76,6 +79,9 @@ export function useSessionStatus(
   // (fail-open rule 1: a stuck loader must be impossible; costs at most one
   // extra ~1s poll tick, matching the design's "≤1s" reveal-latency bound).
   const [appPresented, setAppPresented] = useState(false);
+  // Steam's shader progress while the app boots (amendment 39): a display hint,
+  // never a state input. Null whenever the read does not carry a known step.
+  const [shaderPercent, setShaderPercent] = useState<number | null>(null);
   const [hostLost, setHostLost] = useState(false);
   const [health, setHealth] = useState<HealthBanner | null>(null);
   // Not carried in router state (a fresh launch's started_at is still null
@@ -227,6 +233,7 @@ export function useSessionStatus(
           return;
         }
         notePlacement(session);
+        setShaderPercent(shaderPercentOf(session));
         if (session.state === "assigned") setLaunchDetail("scheduling host");
         else if (session.state === "starting") setLaunchDetail(session.state_detail ?? "building pipeline");
         else if (session.state === "running" && session.state_detail === "app booting") setLaunchDetail("app booting");
@@ -290,6 +297,7 @@ export function useSessionStatus(
     setExternalResizeSupported,
     externalOwner,
     launchDetail,
+    shaderPercent,
     launchFailure,
     noteFailure,
     appPresented,

@@ -16,6 +16,7 @@ import { CollapsibleLogTail } from "../../components/SessionFailureDetail";
 import { isBannerVerdict, type LaunchFailure } from "./sessionFailure";
 import { AccretionVisual } from "./AccretionVisual";
 import { GlyphRail } from "./GlyphRail";
+import { useBootLine } from "./gettingReady";
 import { derivePhase, stallPhaseForStep } from "./loaderPhases";
 import {
   resolveStall,
@@ -56,6 +57,8 @@ interface SessionLoaderProps {
   /** Control-plane `state` / `app_launch_state` for this session. */
   sessionState?: string;
   appLaunchState?: string;
+  /** Steam is processing the game's shaders (0-100). Null/absent = today's copy. */
+  shaderPercent?: number | null;
   // The four transport signals the phase machine walks (sessionRuntime.ts).
   wsOpen?: boolean;
   pcConnected?: boolean;
@@ -75,11 +78,13 @@ export function SessionLoader({
   iceState = null,
   sessionState,
   appLaunchState,
+  shaderPercent = null,
   wsOpen = false,
   pcConnected = false,
   firstFrame = false,
   inputOpen = false,
 }: SessionLoaderProps) {
+  const bootLine = useBootLine(appLaunchState === "starting", shaderPercent);
   const { step, word, verb } = derivePhase({
     state: sessionState,
     wsOpen,
@@ -283,6 +288,8 @@ export function SessionLoader({
               <span className="sl-verb">{visible.verb}</span>
               <span className={changing ? "sl-stage changing" : "sl-stage"}>{visible.word}</span>
             </h1>
+            {/* Always in the layout so the title does not jump when the line appears. */}
+            <p className="sl-shaders" aria-live="off" aria-hidden={bootLine.decorative || undefined}>{bootLine.text}</p>
             <div className="sl-status-foot">
               <GlyphRail step={visible.step} />
             </div>

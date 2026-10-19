@@ -23,6 +23,7 @@ import {
 } from "../capacityRetry";
 import { isRecommendationEligible } from "../launchOptions";
 import { presentLaunchError } from "../libraryGrid";
+import { useReportLaunching } from "../SteamWarmHeartbeat";
 
 /** #494's retry-wait timeout, abortable and observable. `timeoutRef` is cleared
  *  on settle so an unmount cleanup can `clearTimeout` it directly; the abort
@@ -108,6 +109,8 @@ export function useLaunch({
   const [waitingForSlot, setWaitingForSlot] = useState(false);
   const [waitingReason, setWaitingReason] = useState<WaitingReason | null>(null);
   const [resolvingId, setResolvingId] = useState<string | null>(null);
+  // A launch holds the library heartbeat (SteamWarmHeartbeat.tsx).
+  useReportLaunching(launching);
 
   // #494's retry loop schedules a setTimeout outliving a single render; this
   // stops it touching state after navigation. Reset to true on every effect run
