@@ -1,11 +1,12 @@
-// Steam's shader progress on the launch screen (amendment 39): shown only when
-// the poll hands the loader a percentage, otherwise today's copy.
+// The boot line on the launch screen: Steam's figure when it is above 0, a
+// rotating phrase while the app boots otherwise, nothing when it is not booting.
 
-import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen } from "@testing-library/react";
 import { SessionLoader } from "./SessionLoader";
+import { GETTING_READY_MS, GETTING_READY_PHRASES } from "./gettingReady";
 
-const boot = (shaderPercent?: number | null) =>
+const load = (shaderPercent?: number | null, booting = true) =>
   render(
     <SessionLoader
       statusMsg="app booting"
@@ -13,7 +14,7 @@ const boot = (shaderPercent?: number | null) =>
       onExit={vi.fn()}
       appName="Portal 2"
       sessionState="running"
-      appLaunchState="starting"
+      appLaunchState={booting ? "starting" : undefined}
       wsOpen
       pcConnected
       firstFrame
@@ -21,22 +22,41 @@ const boot = (shaderPercent?: number | null) =>
       shaderPercent={shaderPercent}
     />,
   );
+const line = (c: HTMLElement) => c.querySelector(".sl-shaders") as HTMLElement;
 
-describe("SessionLoader — shader line", () => {
-  it("shows the percentage while Steam processes shaders", () => {
-    boot(42);
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => vi.useRealTimers());
+
+describe("SessionLoader — boot line", () => {
+  it("shows the percentage when Steam reports one above 0", () => {
+    const { container } = load(42);
     expect(screen.getByText("Processing shaders — 42%")).toBeInTheDocument();
-    expect(screen.getByText("Portal 2")).toBeInTheDocument();
+    expect(line(container)).not.toHaveAttribute("aria-hidden");
+    expect(line(container)).toHaveAttribute("aria-live", "off");
   });
 
-  it("shows 0%", () => {
-    boot(0);
-    expect(screen.getByText("Processing shaders — 0%")).toBeInTheDocument();
-  });
-
-  it.each([undefined, null])("shows today's copy when progress is %s", (v) => {
-    boot(v);
+  it.each([0, null, undefined])("shows a phrase, hidden from assistive tech, when progress is %s", (v) => {
+    const { container } = load(v);
     expect(screen.queryByText(/Processing shaders/)).toBeNull();
-    expect(screen.getByText("Portal 2")).toBeInTheDocument();
+    expect(GETTING_READY_PHRASES).toContain(line(container).textContent);
+    expect(line(container)).toHaveAttribute("aria-hidden", "true");
+    expect(line(container)).toHaveAttribute("aria-live", "off");
+  });
+
+  it("changes the phrase on a timer", () => {
+    const { container } = load(null);
+    const seen = new Set([line(container).textContent]);
+    for (let i = 0; i < 12; i++) {
+      act(() => {
+        vi.advanceTimersByTime(GETTING_READY_MS);
+      });
+      seen.add(line(container).textContent);
+    }
+    expect(seen.size).toBeGreaterThan(1);
+  });
+
+  it("keeps the line's slot but shows nothing when the app is not booting", () => {
+    const { container } = load(42, false);
+    expect(line(container)).toBeEmptyDOMElement();
   });
 });

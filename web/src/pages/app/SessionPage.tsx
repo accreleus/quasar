@@ -489,7 +489,7 @@ function SessionPageBody() {
     videoRef.current.muted = false;
     void videoRef.current.play();
     // The session's sound too, once revealed: a reload with no click has no activation to unmute it.
-    if (revealStartedRef.current) runtimeRef.current?.releaseAudio();
+    if (revealStartedRef.current && !swapScreenUpRef.current) runtimeRef.current?.releaseAudio();
 
     // Synchronous truth, not last-rendered state — a gesture handler must not
     // read a stale render (sessionRuntime.isCaptured).
@@ -783,6 +783,9 @@ function SessionPageBody() {
   const [loaderInert, setLoaderInert] = useState(false);
   const [loaderDone, setLoaderDone] = useState(false);
   const loaderTimersRef = useRef<ReturnType<typeof setTimeout>[] | null>(null);
+  const [swapScreenUp, setSwapScreenUp] = useState(false);
+  const swapScreenUpRef = useRef(false);
+  swapScreenUpRef.current = swapScreenUp;
   // Latched, like SessionLoader's own handoff: the gate can retract (the channel
   // closes inside the reveal), and the loader is transparent and inert by then
   // either way. A removal cancelled on the retract never happened again, and
@@ -798,9 +801,12 @@ function SessionPageBody() {
   // The sound flips with the picture: the loader turns see-through at `loaderInert`, not at
   // `revealReady` (its lock animation is opaque). `runtimeSnap` re-runs this for a runtime
   // built after the reveal (a replacement transport).
+  // The quick-switch screen is opaque too, and an in-place swap keeps the stream, so Steam's
+  // and the new game's sound is held under it as the launch loader holds it.
   useEffect(() => {
-    if (loaderInert) runtimeRef.current?.releaseAudio();
-  }, [loaderInert, runtimeSnap]);
+    if (swapScreenUp) runtimeRef.current?.holdAudio();
+    else if (loaderInert) runtimeRef.current?.releaseAudio();
+  }, [loaderInert, swapScreenUp, runtimeSnap]);
   useEffect(
     () => () => {
       loaderTimersRef.current?.forEach(clearTimeout);
@@ -1053,6 +1059,7 @@ function SessionPageBody() {
         onCommitted={(appId, appName) => setCurrentApp({ id: appId, name: appName })}
         onToast={pushToast}
         onSwapStart={() => hudRef.current?.close()}
+        onScreenChange={setSwapScreenUp}
       >
         {({ quickSwitch, swappingTo }) => (
           <Hud

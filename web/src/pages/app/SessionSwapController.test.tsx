@@ -335,3 +335,32 @@ describe("SessionSwapController — sessionOver", () => {
     expect(listApps).not.toHaveBeenCalled();
   });
 });
+
+describe("SessionSwapController — onScreenChange", () => {
+  it("reports the screen up while switching and down when it clears", async () => {
+    swapSession.mockResolvedValue({ session: { id: "s1", app_id: "a1" } });
+    getSession
+      .mockResolvedValueOnce(session("running", "swapping"))
+      .mockResolvedValue(session("running", "swap complete", "a2"));
+    const onScreenChange = vi.fn();
+    renderController({ onScreenChange });
+    expect(onScreenChange).toHaveBeenLastCalledWith(false);
+    await waitFor(() => expect(screen.getByText("Redout: Enhanced Edition")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /Redout: Enhanced Edition/ }));
+    expect(onScreenChange).toHaveBeenLastCalledWith(true);
+    await waitFor(() => expect(onScreenChange).toHaveBeenLastCalledWith(false), { timeout: 5000 });
+  });
+
+  it("reports it down when the swap fails", async () => {
+    swapSession.mockResolvedValue({ session: { id: "s1", app_id: "a1" } });
+    getSession.mockResolvedValue(session("running", "swapping"));
+    const onScreenChange = vi.fn();
+    renderController({ onScreenChange });
+    await waitFor(() => expect(screen.getByText("Redout: Enhanced Edition")).toBeTruthy());
+    swapSession.mockRejectedValue(new Error("no"));
+
+    fireEvent.click(screen.getByRole("button", { name: /Redout: Enhanced Edition/ }));
+    await waitFor(() => expect(onScreenChange).toHaveBeenLastCalledWith(false));
+  });
+});
