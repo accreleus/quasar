@@ -115,13 +115,18 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) e
 	var connected, recent bool
 	var kind string
 	var released bool
-	err := tx.QueryRow(ctx, `SELECT s.state, s.host_id::text,
+	// A hold on a runtime that a row adopts answers as that row while it lives.
+	// Once it ended unadopted the runtime is being released, timed from its end.
+	err := tx.QueryRow(ctx, `SELECT s.id::text, s.state, s.host_id::text,
 		COALESCE(h.status IN ('online','draining'), false),
-		COALESCE(s.ended_at, s.updated_at) > now() - ($2::int * interval '1 second'), s.kind,
-		COALESCE(s.stop_reason = $3, false)
-		FROM sessions s LEFT JOIN hosts h ON h.id=s.host_id
-		WHERE s.id=$1::uuid`, holder, int(homeHoldSettleWindow/time.Second), stopReasonRuntimeReleased).
-		Scan(&state, &host, &connected, &recent, &kind, &released)
+		COALESCE(a.ended_at, k.ended_at, k.updated_at) > now() - ($2::int * interval '1 second'), s.kind,
+		COALESCE(k.stop_reason = $3, false) OR a.id IS NOT NULL
+		FROM sessions k
+		LEFT JOIN sessions a ON a.adopt_session_id = k.id
+		JOIN sessions s ON s.id = CASE WHEN a.state NOT IN ('stopped','failed') THEN a.id ELSE k.id END
+		LEFT JOIN hosts h ON h.id=s.host_id
+		WHERE k.id=$1::uuid`, holder, int(homeHoldSettleWindow/time.Second), stopReasonRuntimeReleased).
+		Scan(&holder, &state, &host, &connected, &recent, &kind, &released)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrHomeConflict
 	}

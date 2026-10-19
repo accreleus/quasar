@@ -25,6 +25,9 @@ type warmDispatcher struct {
 	mu      sync.Mutex
 	parks   bool
 	noEpoch bool // the agent's socket is gone: no command epoch to send on
+	// reject answers one command kind: "assign" or "start" refused, or
+	// "assign-ack" queued with its ack lost.
+	reject  string
 	assigns []agentws.SessionAssignCmd
 	stops   []agentws.SessionStopCmd
 	swaps   []agentws.SessionSwapAppCmd
@@ -96,12 +99,35 @@ func (e warmEpoch) SupportsParkedSessions() bool { return e.d.SupportsParkedSess
 func (e warmEpoch) Send(v any) (bool, error)     { e.d.record(v); return true, nil }
 func (e warmEpoch) SendWithAck(_ context.Context, _ string, v any) (agentws.AckResult, bool, error) {
 	e.d.record(v)
+	if _, ok := v.(agentws.SessionAssignCmd); ok {
+		switch e.d.rejecting() {
+		case "assign":
+			return agentws.AckResult{OK: false, Error: "refused"}, true, nil
+		case "assign-ack":
+			return agentws.AckResult{}, true, errors.New("ack timeout")
+		}
+	}
 	return agentws.AckResult{OK: true}, true, nil
 }
 
 func (d *warmDispatcher) SendWithAck(_ context.Context, _, _ string, v any) (agentws.AckResult, error) {
 	d.record(v)
+	if _, ok := v.(agentws.SessionStartCmd); ok && d.rejecting() == "start" {
+		return agentws.AckResult{OK: false, Error: "refused"}, nil
+	}
 	return agentws.AckResult{OK: true}, nil
+}
+
+func (d *warmDispatcher) rejecting() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.reject
+}
+
+func (d *warmDispatcher) setReject(kind string) {
+	d.mu.Lock()
+	d.reject = kind
+	d.mu.Unlock()
 }
 
 func (d *warmDispatcher) waitFor(t *testing.T, kind string) {
@@ -135,6 +161,18 @@ func (d *warmDispatcher) assignFor(t *testing.T, sessionID string) agentws.Sessi
 	}
 	t.Fatalf("no assign for session %s", sessionID)
 	return agentws.SessionAssignCmd{}
+}
+
+func (d *warmDispatcher) stopsFor(sessionID string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := 0
+	for _, s := range d.stops {
+		if s.SessionID == sessionID {
+			n++
+		}
+	}
+	return n
 }
 
 func (d *warmDispatcher) stopReason(sessionID string) string {
@@ -446,12 +484,18 @@ func TestClaimAdoptsTheParkedSessionInOneTransaction(t *testing.T) {
 	if a.Kind != KindPlay || a.AdoptSessionID != k {
 		t.Errorf("assign kind=%q adopt=%q, want play adopting %s", a.Kind, a.AdoptSessionID, k)
 	}
-	var playHome, parkedHome string
-	must(t, f.pool.QueryRow(ctx, `SELECT pending_home_session_id::text FROM managed_home_claims`).Scan(&holder))
-	must(t, f.pool.QueryRow(ctx, `SELECT COALESCE(p.managed_home_id::text, ''), COALESCE(k.managed_home_id::text, '')
-		FROM sessions p, sessions k WHERE p.id = $1::uuid AND k.id = $2::uuid`, play.ID, k).Scan(&playHome, &parkedHome))
-	if holder != play.ID || playHome == "" || playHome != parkedHome {
-		t.Errorf("hold=%s play home=%q parked home=%q, want the hold and binding moved to the play session", holder, playHome, parkedHome)
+	var playHome, parkedHome, adopts string
+	must(t, f.pool.QueryRow(ctx, `SELECT COALESCE(p.managed_home_id::text, ''), COALESCE(k.managed_home_id::text, ''),
+		COALESCE(p.adopt_session_id::text, '')
+		FROM sessions p, sessions k WHERE p.id = $1::uuid AND k.id = $2::uuid`, play.ID, k).Scan(&playHome, &parkedHome, &adopts))
+	if got := f.holder(t); got != k || playHome == "" || playHome != parkedHome || adopts != k {
+		t.Errorf("hold=%s play home=%q parked home=%q adopts=%q, want the binding copied and the hold left on %s until the agent adopts",
+			got, playHome, parkedHome, adopts, k)
+	}
+	// The play session's first report is the agent's adoption: the hold moves with it.
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: play.ID, State: "starting"})
+	if got := f.holder(t); got != play.ID {
+		t.Errorf("hold = %s after the play session's first report, want %s", got, play.ID)
 	}
 	var reserved int32
 	must(t, f.pool.QueryRow(ctx, `SELECT COALESCE(SUM(reserved_encode_slots), 0) FROM sessions
@@ -631,16 +675,20 @@ func TestParkOnExitParksTheHeldRuntime(t *testing.T) {
 	if got.State != "assigned" || got.GPUID != before.GPUID || got.Slots != before.Slots {
 		t.Errorf("parked row %+v, want assigned on gpu %s holding %d slots", got, before.GPUID, before.Slots)
 	}
-	var app, holder string
+	var app string
 	must(t, f.pool.QueryRow(ctx, `SELECT app_id::text FROM sessions WHERE id = $1::uuid`, k).Scan(&app))
-	must(t, f.pool.QueryRow(ctx, `SELECT pending_home_session_id::text FROM managed_home_claims`).Scan(&holder))
-	if app != f.steam || holder != k {
-		t.Errorf("parked app=%s hold=%s, want the Steam parent and the hold moved (not cleared as cleanup proof)", app, holder)
+	if got := f.holder(t); app != f.steam || got != play {
+		t.Errorf("parked app=%s hold=%s, want the Steam parent and the hold kept on %s (not cleared as cleanup proof)", app, got, play)
 	}
 	a := f.disp.assignFor(t, k)
 	if a.Kind != KindParked || a.AdoptSessionID != play || envOf(t, a.App)["STEAM_STARTUP_FLAGS"] != "-silent" {
 		t.Errorf("assign kind=%q adopt=%q flags=%q, want parked adopting %s with -silent",
 			a.Kind, a.AdoptSessionID, envOf(t, a.App)["STEAM_STARTUP_FLAGS"], play)
+	}
+	f.disp.waitFor(t, "start")
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "starting"})
+	if got := f.holder(t); got != k {
+		t.Errorf("hold = %s after the parked session's first report, want %s", got, k)
 	}
 }
 

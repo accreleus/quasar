@@ -20,6 +20,7 @@ END $$;
 
 DELETE FROM sessions WHERE kind = 'parked';
 
+DROP INDEX IF EXISTS sessions_one_adopter;
 DROP INDEX IF EXISTS sessions_one_parked_per_user;
 ALTER TABLE user_profile_preferences DROP COLUMN IF EXISTS steam_dialogs;
 ALTER TABLE users DROP COLUMN IF EXISTS steam_warm_suppressed;
@@ -28,6 +29,7 @@ ALTER TABLE instance_settings
 	DROP COLUMN IF EXISTS steam_warm_rewarm,
 	DROP COLUMN IF EXISTS steam_warm_enabled;
 ALTER TABLE sessions
+	DROP COLUMN IF EXISTS adopt_session_id,
 	DROP COLUMN IF EXISTS launch_progress,
 	DROP COLUMN IF EXISTS parked_until,
 	DROP COLUMN IF EXISTS kind;

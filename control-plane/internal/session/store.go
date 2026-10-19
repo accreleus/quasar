@@ -700,10 +700,11 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, only ro
 	var curDetail *string
 	var assignedHost *string
 	var sessionUser, sessionApp string
-	var boundHome, boundDigest *string
+	var boundHome, boundDigest, adopts *string
 	err = tx.QueryRow(ctx, `SELECT state,state_detail,host_id::text,user_id::text,app_id::text,
-		managed_home_id::text,managed_home_mount_sha256 FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).
-		Scan(&cur, &curDetail, &assignedHost, &sessionUser, &sessionApp, &boundHome, &boundDigest)
+		managed_home_id::text,managed_home_mount_sha256,adopt_session_id::text
+		FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).
+		Scan(&cur, &curDetail, &assignedHost, &sessionUser, &sessionApp, &boundHome, &boundDigest, &adopts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}
@@ -766,6 +767,15 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, only ro
 		`, id, string(to), detail, errMsg, stopReason)
 		if err != nil {
 			return Session{}, fmt.Errorf("update state: %w", err)
+		}
+	}
+	// The agent reports under an adopting id only once the runtime is adopted
+	// or the old one has exited, so the hold moves here and not at the assign
+	// (control-api.md §Warm Steam). A terminal first report proves neither.
+	if reportHostID != "" && adopts != nil && !to.IsTerminal() {
+		if _, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id = $1::uuid
+			WHERE pending_home_session_id = $2::uuid AND host_id = $3::uuid`, id, *adopts, reportHostID); err != nil {
+			return Session{}, fmt.Errorf("move adopted home hold: %w", err)
 		}
 	}
 	if reportHostID != "" && cur != StateRunning && to == StateRunning {

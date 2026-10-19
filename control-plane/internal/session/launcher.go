@@ -411,7 +411,8 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 			return
 		}
 	}
-	if c.lazyImages != nil && sess.HostID != nil {
+	// A claim adopts a runtime its parked session already built the image for.
+	if c.lazyImages != nil && sess.HostID != nil && sess.AdoptSessionID == "" {
 		// A template build may take minutes. It is owned by the coordinator's
 		// lifecycle, not the HTTP request which has already returned 201.
 		ctx, cancel := context.WithCancel(c.ctx)
@@ -1049,8 +1050,8 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 			return false
 		}
 		if sendErr != nil {
-			// Queued with no ack: the agent may have adopted, so the hold stays.
-			c.failSession(sessionID, fmt.Sprintf("assign dispatch failed: %v", sendErr))
+			// Queued with no ack. No start follows, so nothing was adopted.
+			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, fmt.Sprintf("assign dispatch failed: %v", sendErr))
 			return false
 		}
 		return true

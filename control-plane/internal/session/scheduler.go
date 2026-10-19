@@ -531,7 +531,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		return Session{}, false, fmt.Errorf("insert session: %w", err)
 	}
 	if claimed != nil {
-		if err := moveHome(ctx, tx, claimed.id, sess.ID); err != nil {
+		if err := adoptRuntime(ctx, tx, claimed.id, sess.ID); err != nil {
 			return Session{}, false, err
 		}
 	}

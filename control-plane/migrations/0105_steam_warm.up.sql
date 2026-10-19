@@ -12,7 +12,14 @@ ALTER TABLE sessions
 	ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'play'
 		CHECK (kind IN ('play', 'parked')),
 	ADD COLUMN IF NOT EXISTS parked_until TIMESTAMPTZ,
-	ADD COLUMN IF NOT EXISTS launch_progress JSONB;
+	ADD COLUMN IF NOT EXISTS launch_progress JSONB,
+	ADD COLUMN IF NOT EXISTS adopt_session_id UUID;
+
+-- The runtime a claim or park adopts. The managed-home hold stays on that id
+-- until the adopter's first agent report (control-api.md §Warm Steam). At most
+-- one row adopts a runtime; the index also serves the adopter lookups.
+CREATE UNIQUE INDEX IF NOT EXISTS sessions_one_adopter ON sessions (adopt_session_id)
+	WHERE adopt_session_id IS NOT NULL;
 
 -- At most one live parked session per user. Includes stopping: a parked Steam
 -- that is shutting down still holds the user's home.

@@ -2,17 +2,20 @@ package session
 
 // warm_steam_r2_db_test.go — amendment 39 review round 1 behaviour: kind only
 // while the switch is on, the agent's real held-exit order, the stale-read
-// supersede, a warming claim, the claimed-row grace, a codec the parked GPU
-// cannot encode, console auto-start, the heartbeat's qualification stop, the
-// post-eviction cooldown, a stripped adoption, and a claimed id never stopped.
+// supersede, a warming claim, the live-claim heartbeat skip, a codec the parked
+// GPU cannot encode, console auto-start, the heartbeat's qualification stop,
+// the post-eviction cooldown, a stripped adoption, a claimed id never stopped,
+// and the home hold that waits for the agent's adoption.
 
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
+	"github.com/accreleus/quasar/control-plane/internal/storage"
 )
 
 func TestKindIsSentOnlyWhileWarmSteamIsOn(t *testing.T) {
@@ -130,9 +133,10 @@ func TestClaimOnAWarmingParkedSessionWaitsWithoutStoppingIt(t *testing.T) {
 	}
 }
 
-// The agent lists a just-claimed parked id until the adopting assign lands; the
-// heartbeat reconcile must not stop it inside the grace, and does after.
-func TestAgentHeartbeatSparesAJustClaimedParkedSession(t *testing.T) {
+// The agent lists a claimed parked id until the claim's start adopts it; the
+// heartbeat reconcile must not stop it while the claim lives, and does once the
+// claim has ended unadopted.
+func TestAgentHeartbeatSparesAParkedSessionALiveClaimAdopts(t *testing.T) {
 	f := newWarmFixture(t, 4)
 	ctx := context.Background()
 	k := f.park(t)
@@ -144,12 +148,12 @@ func TestAgentHeartbeatSparesAJustClaimedParkedSession(t *testing.T) {
 
 	f.coord.AgentHeartbeat(ctx, f.hostID, []string{k})
 	if r := f.disp.stopReason(k); r != "" {
-		t.Fatalf("heartbeat stopped the just-claimed id (%q); the play session would cold-start", r)
+		t.Fatalf("heartbeat stopped the claimed id (%q); the play session would cold-start", r)
 	}
-	must(t, exec(t, f.pool, `UPDATE sessions SET ended_at = now() - interval '1 minute' WHERE id = $1::uuid`, k))
+	f.coord.failSession(res.Session.ID, "test: the claim ended unadopted")
 	f.coord.AgentHeartbeat(ctx, f.hostID, []string{k})
 	if f.disp.stopReason(k) == "" {
-		t.Error("past the grace the still-listed claimed id is an orphan and must be stopped")
+		t.Error("with the claim ended the still-listed claimed id is an orphan and must be stopped")
 	}
 }
 
@@ -347,53 +351,114 @@ func (f *warmFixture) holder(t *testing.T) string {
 	return deref(h)
 }
 
-// A claim whose assign never reaches the agent hands the home hold back to the
-// parked runtime the agent still runs. The agent's instant RH05 proof for the
-// never-seen play id, and the reconcile that asks for it, must not clear the
-// hold; only the parked runtime's own proof does.
-func TestAClaimTheAgentNeverSawReturnsTheHoldToTheParkedRuntime(t *testing.T) {
+// unadoptedClaim parks a running Steam, claims it, and ends the claim before
+// the agent adopts, in each way a row can. The agent proves the play id at
+// once, as RH05 does for an id it never ran.
+func unadoptedClaim(t *testing.T, how string) (f *warmFixture, k, q string) {
+	t.Helper()
+	f = newWarmFixture(t, 4)
+	ctx := context.Background()
+	k = f.park(t)
+	switch how {
+	case "lost assign":
+		f.disp.dropEpoch()
+	case "rejected assign":
+		f.disp.setReject("assign")
+	case "queued assign, ack lost":
+		f.disp.setReject("assign-ack")
+	case "refused start":
+		f.disp.setReject("start")
+	}
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	q = res.Session.ID
+	switch how {
+	case "user stop":
+		f.disp.waitFor(t, "start")
+		if _, err := f.coord.Stop(ctx, q, "user_requested"); err != nil {
+			t.Fatalf("stop the assigned claim: %v", err)
+		}
+	case "reconnect reap":
+		f.disp.waitFor(t, "start")
+		f.coord.AgentReconnected(ctx, f.hostID)
+	case "control-plane restart":
+		f.disp.waitFor(t, "start")
+		fresh := newTestCoordinator(t, f.store, f.disp, testLogger(), WithHomeProvider(storage.NewLocal(f.pool, testHomeRoot)))
+		fresh.AgentReconnected(ctx, f.hostID)
+		f.coord = fresh
+	default:
+		waitState(t, f, q, "failed")
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: q, State: "stopped", HomeCleanupQualified: true})
+	return f, k, q
+}
+
+// A claim that ends before the agent adopts leaves the hold on the parked
+// runtime, which the agent may still run on the home: the play id's proof and
+// the reconcile clear nothing, a relaunch waits with the 503, and only the
+// parked runtime's own proof clears it (control-api.md §Warm Steam, Claim).
+func TestAClaimEndedBeforeAdoptionKeepsTheHoldOnTheParkedRuntime(t *testing.T) {
+	for _, how := range []string{"lost assign", "rejected assign", "queued assign, ack lost",
+		"refused start", "user stop", "reconnect reap", "control-plane restart"} {
+		t.Run(how, func(t *testing.T) {
+			f, k, _ := unadoptedClaim(t, how)
+			ctx := context.Background()
+			if got := f.holder(t); got != k {
+				t.Fatalf("hold = %q after the play id's proof, want it kept on the parked runtime %s", got, k)
+			}
+			before := f.disp.stopsFor(k)
+			f.coord.ReconcilePendingHomes(ctx, f.hostID, warmEpoch{f.disp})
+			if got := f.holder(t); got != k {
+				t.Fatalf("hold = %q after the reconcile, want it kept on %s", got, k)
+			}
+			if f.disp.stopsFor(k) != before+1 {
+				t.Error("the reconcile sent no session_stop for the parked runtime nobody adopts")
+			}
+			_, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+			var refused *ParkedClaimRefusedError
+			if !errors.As(err, &refused) || refused.Warming || refused.HolderID != k {
+				t.Fatalf("relaunch while the parked runtime stops = %v, want the 503 refusal", err)
+			}
+			f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+			if got := f.holder(t); got != "" {
+				t.Errorf("hold = %q after the parked runtime's proof, want cleared", got)
+			}
+		})
+	}
+}
+
+// The agent's declined or fresh path: the parked runtime exits first and its
+// proof arrives while the claim waits to build fresh. The hold passes to the
+// claim and is never free in between.
+func TestTheParkedRuntimesProofHandsTheHoldToALiveClaim(t *testing.T) {
 	f := newWarmFixture(t, 4)
 	ctx := context.Background()
 	k := f.park(t)
-	f.disp.dropEpoch()
-
 	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	q := res.Session.ID
-	waitState(t, f, q, "failed")
-	if got := f.holder(t); got != k {
-		t.Fatalf("hold = %q after the failed dispatch, want it back on the parked runtime %s", got, k)
-	}
-	if got := readRow(t, f.pool, k); got.StopReason != stopReasonRuntimeReleased {
-		t.Errorf("parked row %+v, want runtime_released", got)
-	}
-	if f.disp.stopReason(k) == "" {
-		t.Error("the parked runtime the claim could not hand over was not stopped")
-	}
-
-	// The agent proves the never-seen play id at once; reconcile asks again.
-	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: q, State: "stopped", HomeCleanupQualified: true})
+	f.disp.waitFor(t, "start")
 	f.coord.ReconcilePendingHomes(ctx, f.hostID, warmEpoch{f.disp})
-	if got := f.holder(t); got != k {
-		t.Fatalf("hold = %q after the play id's proof and the reconcile, want it kept on %s", got, k)
+	if r := f.disp.stopReason(k); r != "" {
+		t.Fatalf("reconcile stopped the runtime a live claim adopts (%q)", r)
 	}
-	_, err = f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
-	var refused *ParkedClaimRefusedError
-	if !errors.As(err, &refused) || refused.HolderID != k {
-		t.Fatalf("relaunch while the parked runtime stops = %v, want the 503 refusal", err)
-	}
-
 	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
-	if got := f.holder(t); got != "" {
-		t.Errorf("hold = %q after the parked runtime's proof, want cleared", got)
+	if got := f.holder(t); got != q {
+		t.Fatalf("hold = %q after the parked runtime's proof, want it passed to the live claim %s", got, q)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: q, State: "starting"})
+	if got := f.holder(t); got != q {
+		t.Errorf("hold = %q once the claim starts, want %s", got, q)
 	}
 }
 
-// The park side: a park whose assign never reaches the agent hands the hold back
-// to the ended play row whose runtime the agent still holds, and releases it.
-func TestAParkTheAgentNeverSawReturnsTheHoldToTheHeldRuntime(t *testing.T) {
+// The park side: a park the agent never took leaves the hold on the ended play
+// row whose runtime the agent still holds, and releases that runtime.
+func TestAParkEndedBeforeAdoptionKeepsTheHoldOnTheHeldRuntime(t *testing.T) {
 	f := newWarmFixture(t, 4)
 	ctx := context.Background()
 	play := f.runningTile(t)
@@ -403,18 +468,55 @@ func TestAParkTheAgentNeverSawReturnsTheHoldToTheHeldRuntime(t *testing.T) {
 	k := ""
 	must(t, f.pool.QueryRow(ctx, `SELECT id::text FROM sessions WHERE kind = 'parked'`).Scan(&k))
 	waitState(t, f, k, "failed")
-	if got := f.holder(t); got != play {
-		t.Fatalf("hold = %q, want it back on the held play runtime %s", got, play)
-	}
-	if got := readRow(t, f.pool, play); got.StopReason != stopReasonRuntimeReleased {
-		t.Errorf("play row %+v, want runtime_released", got)
-	}
 	if f.disp.stopReason(play) == "" {
 		t.Error("the held runtime was not released")
 	}
 	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	f.coord.ReconcilePendingHomes(ctx, f.hostID, warmEpoch{f.disp})
 	if got := f.holder(t); got != play {
-		t.Errorf("hold = %q after the parked id's proof, want it kept on %s", got, play)
+		t.Fatalf("hold = %q after the parked id's proof and the reconcile, want it kept on %s", got, play)
+	}
+	_, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+	var refused *ParkedClaimRefusedError
+	if !errors.As(err, &refused) || refused.HolderID != play {
+		t.Fatalf("relaunch while the held runtime stops = %v, want the 503 refusal", err)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: play, State: "stopped", HomeCleanupQualified: true})
+	if got := f.holder(t); got != "" {
+		t.Errorf("hold = %q after the held runtime's proof, want cleared", got)
+	}
+}
+
+// countingPreparer counts lazy image preparations.
+type countingPreparer struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (p *countingPreparer) PrepareLazyImage(context.Context, string, string) error {
+	p.mu.Lock()
+	p.n++
+	p.mu.Unlock()
+	return nil
+}
+
+// A claim adopts a runtime whose image its parked session already prepared, so
+// no image preparation can sit between the claim and its assign.
+func TestAClaimSkipsLazyImagePreparation(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.park(t)
+	prep := &countingPreparer{}
+	f.coord.SetLazyImagePreparer(prep)
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	f.disp.assignFor(t, res.Session.ID)
+	prep.mu.Lock()
+	defer prep.mu.Unlock()
+	if prep.n != 0 {
+		t.Errorf("lazy preparations = %d for a claim, want 0", prep.n)
 	}
 }
 

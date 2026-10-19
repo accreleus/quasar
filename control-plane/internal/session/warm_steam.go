@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -344,27 +343,24 @@ func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked
 	return &k, nil
 }
 
-// claimedWithin reports whether id is a parked row claimed less than grace ago.
-func (s *Store) claimedWithin(ctx context.Context, id string, grace time.Duration) bool {
+// adoptedByLive reports whether a non-terminal row adopts id's runtime. Until
+// it ends, id is neither an orphan nor a hold to reconcile.
+func (s *Store) adoptedByLive(ctx context.Context, id string) bool {
 	var ok bool
-	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sessions WHERE id = $1::uuid
-		AND kind = 'parked' AND state = 'stopped' AND state_detail = $2
-		AND ended_at > now() - make_interval(secs => $3))`, id, claimedDetail, grace.Seconds()).Scan(&ok)
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sessions WHERE adopt_session_id = $1::uuid
+		AND state NOT IN ('stopped','failed'))`, id).Scan(&ok)
 	return err == nil && ok
 }
 
-// moveHome hands a runtime's managed-home binding, and any hold naming it, to
-// the session that takes the runtime over, in the caller's transaction.
-func moveHome(ctx context.Context, tx pgx.Tx, from, to string) error {
-	if _, err := tx.Exec(ctx, `UPDATE sessions t
-		SET managed_home_id = f.managed_home_id, managed_home_mount_sha256 = f.managed_home_mount_sha256
-		FROM sessions f WHERE f.id = $1::uuid AND t.id = $2::uuid AND f.managed_home_id IS NOT NULL`,
-		from, to); err != nil {
-		return fmt.Errorf("move home binding: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id = $2::uuid
-		WHERE pending_home_session_id = $1::uuid`, from, to); err != nil {
-		return fmt.Errorf("move home hold: %w", err)
+// adoptRuntime records that row `to` adopts the runtime of `from` and copies
+// its managed-home binding, in the caller's transaction. The hold stays on
+// `from` until `to`'s first agent report (transition) or `from`'s cleanup
+// proof (clearQualifiedHomeHolds): an assign alone adopts nothing.
+func adoptRuntime(ctx context.Context, tx pgx.Tx, from, to string) error {
+	if _, err := tx.Exec(ctx, `UPDATE sessions t SET adopt_session_id = f.id,
+		    managed_home_id = f.managed_home_id, managed_home_mount_sha256 = f.managed_home_mount_sha256
+		FROM sessions f WHERE f.id = $1::uuid AND t.id = $2::uuid`, from, to); err != nil {
+		return fmt.Errorf("record adoption: %w", err)
 	}
 	return nil
 }
@@ -599,8 +595,9 @@ func (c *Coordinator) dispatchParked(k Session) {
 
 // endHeldPlay stores the play session's `stopped` and decides the park in one
 // transaction: a parked row for the Steam parent on the same GPU, taking the
-// ended session's reservation, home binding and hold. ended is nil when the
-// row was already terminal; parked is nil for a release.
+// ended session's reservation and home binding (the hold follows at its first
+// report, adoptRuntime). ended is nil when the row was already terminal;
+// parked is nil for a release.
 func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detail *string, hostParks bool) (ended, parked *Session, err error) {
 	if !isValidUUID(sessionID) {
 		return nil, nil, ErrNotFound
@@ -688,7 +685,7 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 		  AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = h.id)
 		RETURNING `+sessionCols, sessionID, w.IdleMinutes))
 	if err == nil {
-		err = moveHome(ctx, sp, sessionID, k.ID)
+		err = adoptRuntime(ctx, sp, sessionID, k.ID)
 	}
 	if err == nil {
 		err = sp.QueryRow(ctx, `SELECT index FROM gpus WHERE id = $1::uuid`, deref(k.GPUID)).Scan(&k.GPUIndex)
@@ -736,46 +733,19 @@ func markReleased(ctx context.Context, tx pgx.Tx, sessionID string) error {
 	return nil
 }
 
-// returnAdoption hands the home binding and hold from a row whose assign the
-// agent never took back to the runtime it would have adopted, which the agent
-// still runs under its own id, and marks that row released. One transaction.
-func (s *Store) returnAdoption(ctx context.Context, fromID, adoptedID string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin adoption return: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	if err := moveHome(ctx, tx, fromID, adoptedID); err != nil {
-		return err
-	}
-	if err := markReleased(ctx, tx, adoptedID); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit adoption return: %w", err)
-	}
-	return nil
-}
-
-// failBeforeAgent fails a session whose assign the agent never took. If it
-// carried an adoption, the hold goes back to the adopted id first (otherwise
-// RH05's instant proof for the never-seen id would clear it while that runtime
-// still mounts the home), and the adopted runtime is stopped, so only its own
-// cleanup proof clears the hold. Not for a queued assign whose ack was lost.
+// failBeforeAgent fails a session before the agent adopted anything for it.
+// The hold is still on the runtime it was to adopt, which only that runtime's
+// own cleanup proof clears; the stop here is a best-effort hurry, and the
+// heartbeat and ReconcilePendingHomes repeat it once no live row adopts it.
 func (c *Coordinator) failBeforeAgent(sessionID, adoptID string, hostID *string, reason string) {
-	if adoptID != "" {
-		if err := c.store.returnAdoption(c.ctx, sessionID, adoptID); err != nil {
-			c.log.Error("returning an unadopted runtime's home hold failed", "session_id", sessionID,
-				"adopt_session_id", adoptID, "err", err)
-		}
-		if hostID != nil {
-			cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: adoptID, Reason: "error"}
-			if err := c.dispatcher.Send(*hostID, cmd); err != nil {
-				c.log.Warn("stopping an unadopted runtime failed", "session_id", adoptID, "err", err)
-			}
-		}
-	}
 	c.failSession(sessionID, reason)
+	if adoptID == "" || hostID == nil {
+		return
+	}
+	cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: adoptID, Reason: "error"}
+	if err := c.dispatcher.Send(*hostID, cmd); err != nil {
+		c.log.Warn("stopping an unadopted runtime failed", "session_id", adoptID, "err", err)
+	}
 }
 
 // --- shader progress ------------------------------------------------------------
