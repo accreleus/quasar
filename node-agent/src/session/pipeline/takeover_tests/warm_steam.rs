@@ -198,11 +198,15 @@ fn a_parked_session_is_never_reaped_or_revealed_and_a_claim_streams_on_it() {
 
 /// Hand the runtime to a play session for `flags`; where its reports start in the log.
 fn adopt(session: &mut Session, flags: &str) -> usize {
+    adopt_as(session, flags, Some(SessionKind::Play))
+}
+
+fn adopt_as(session: &mut Session, flags: &str, kind: Option<SessionKind>) -> usize {
     let at = session.log.len();
     session
         .adopt
         .send(AdoptRequest {
-            kind: SessionKind::Play,
+            kind,
             container: Some(app(flags)),
             idle_timeout: Duration::from_secs(60),
             app_boot_timeout: Some(Duration::from_secs(300)),
@@ -503,4 +507,110 @@ fn an_in_place_swap_without_a_connected_helper_swaps_the_container() {
     assert!(resolved, "the container swap never resolved");
     assert!(session.ended.is_none());
     end(session, &mut a);
+}
+
+/// The switch off: the control plane claims the parked runtime with no `kind`. That session's
+/// game exit ends it as before #759 (#758's stopping, bye, stopped), and nothing is held.
+#[test]
+fn a_claim_without_kind_ends_on_its_game_exit_as_before() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (runtime, mut session) = steam_session(
+        "kindless",
+        SessionKind::Parked,
+        "-silent",
+        Duration::from_secs(60),
+    );
+    session.mute = true;
+    let mut nobody = Peer::new();
+    session.pump(&mut nobody, Duration::from_secs(2), |s, _| {
+        s.log.iter().any(|e| matches!(e, SessionEvent::Running))
+    });
+    let mut helper = FakeHelper::connect(runtime.path(), &session.id);
+    session.mute = false;
+    let adopted_at = adopt_as(&mut session, "-applaunch 730", None);
+    let mut b = Peer::new();
+    assert_eq!(helper.command(&mut session, &mut b), "launch 730");
+    assert!(session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p)));
+    helper.launch_state("game_running");
+    helper.launch_state("game_exited");
+    let ended = session.pump(&mut b, Duration::from_secs(20), |s, _| s.ended.is_some());
+    assert!(ended, "the game exit did not end the session");
+    assert!(
+        matches!(
+            session.ended,
+            Some(SessionEvent::Stopped {
+                detail: Some("game exited"),
+                ..
+            })
+        ),
+        "{:?}",
+        session.ended
+    );
+    let stopping = after(&session.log, adopted_at, |e| {
+        matches!(e, SessionEvent::StoppingWith("game exited"))
+    })
+    .expect("stopping / game exited");
+    assert!(
+        matches!(
+            session.log.get(stopping + 1),
+            Some(SessionEvent::Signaling(SignalMsg::Bye))
+        ),
+        "bye right after the stopping: {:?}",
+        &session.log[stopping..]
+    );
+    assert!(!session.log.iter().any(|e| matches!(e, SessionEvent::Held)));
+    assert_eq!(byes(&session.log), 1);
+    session.thread.take().unwrap().join().unwrap();
+}
+
+struct NoSound;
+
+impl crate::session::teardown::Sidecar for NoSound {
+    fn server_uri(&self) -> String {
+        "unix:/nonexistent/native".into()
+    }
+    fn socket_dir(&self) -> std::path::PathBuf {
+        "/nonexistent".into()
+    }
+    fn adopt_budget(&mut self, _: crate::session::teardown::RetryBudget) {}
+    fn stop(&mut self) {}
+}
+
+/// After an adoption or an in-place swap the container runs another app; a rollback's
+/// relaunch must hand the engine that app, not the one the container was built for.
+#[test]
+fn a_relaunch_after_set_app_spec_launches_the_app_the_container_now_runs() {
+    use crate::session::source::{AppSource, SessionResources};
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let cfg = super::host_cfg(false);
+    let res = SessionResources::with_sidecar("set-app-spec", Box::new(NoSound));
+    let sink = format!("set-app-spec-{}", std::process::id());
+    let mut source = AppSource::new(
+        &cfg,
+        "set-app-spec",
+        &sink,
+        &sink,
+        &res,
+        Some(app("-silent")),
+    )
+    .expect("app source");
+    let flags = |source: &AppSource| {
+        source
+            .launch_spec()
+            .map(|spec| spec.env["STEAM_STARTUP_FLAGS"].clone())
+    };
+    assert_eq!(flags(&source).as_deref(), Some("-silent"));
+    source.set_app_spec(app("-applaunch 730"));
+    assert_eq!(flags(&source).as_deref(), Some("-applaunch 730"));
+
+    // A source with no app stays one.
+    let mut bare = AppSource::new(&cfg, "set-app-spec", &sink, &sink, &res, None).expect("bare");
+    bare.set_app_spec(app("-applaunch 730"));
+    assert!(bare.launch_spec().is_none());
 }

@@ -299,7 +299,10 @@ impl Helper {
                 Notice::Pinned(_) if self.pinned != Some(Pin::Steam) => {
                     Some("Steam's window could not be pinned")
                 }
-                Notice::Pinned(_) if watcher.focused() == Some(STEAM_CLIENT_APPID) => {
+                // Only on facts read this pass: a failed window read waits for the next.
+                Notice::Pinned(_)
+                    if watcher.windows_read() && watcher.focused() == Some(STEAM_CLIENT_APPID) =>
+                {
                     match self.screen.press_return() {
                         Ok(()) => eprintln!(
                             "quasar-launch-helper: answered Steam's controller notice with Return (dismiss_safe)"
@@ -1381,13 +1384,21 @@ mod tests {
         focus: Arc<Mutex<Option<u32>>>,
         actions: Arc<Mutex<Vec<String>>>,
         pin_fails: bool,
+        /// (the focus read fails, the window read fails)
+        reads_fail: Arc<Mutex<(bool, bool)>>,
     }
 
     impl Windows for Scene {
         fn mapped(&mut self) -> std::io::Result<Vec<WindowInfo>> {
+            if self.reads_fail.lock().unwrap().1 {
+                return Err(std::io::Error::other("X went away"));
+            }
             Ok(self.windows.lock().unwrap().clone())
         }
         fn focused_app(&mut self) -> std::io::Result<Option<u32>> {
+            if self.reads_fail.lock().unwrap().0 {
+                return Err(std::io::Error::other("X went away"));
+            }
             Ok(*self.focus.lock().unwrap())
         }
     }
@@ -1610,6 +1621,32 @@ mod tests {
             );
             n.pass(GRACE + NOTICE_FOCUS_WAIT);
             assert_refused(&mut n, GRACE + NOTICE_FOCUS_WAIT);
+        }
+    }
+
+    #[test]
+    fn under_dismiss_safe_a_pass_whose_x_read_failed_does_not_press() {
+        for (focus_fails, mapped_fails) in [(true, false), (false, true)] {
+            let mut n = notice(true, false, Scene::default());
+            n.pass(GRACE);
+            assert_eq!(n.scene.did(), ["pin 769"]);
+            // Steam's window took focus, then the next pass reads X with an error.
+            n.scene.focus(Some(STEAM_CLIENT_APPID));
+            *n.scene.reads_fail.lock().unwrap() = (focus_fails, mapped_fails);
+            n.pass(GRACE + PASS);
+            assert_eq!(
+                n.scene.did(),
+                ["pin 769"],
+                "no press on stale facts ({focus_fails}, {mapped_fails})"
+            );
+            assert!(matches!(n.helper.notice, Notice::Pinned(_)), "it waits");
+            *n.scene.reads_fail.lock().unwrap() = (false, false);
+            n.pass(GRACE + PASS * 2);
+            assert_eq!(
+                n.scene.did(),
+                ["pin 769", "return"],
+                "pressed once read again"
+            );
         }
     }
 

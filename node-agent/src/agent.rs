@@ -5025,7 +5025,7 @@ impl SessionManager {
             None
         };
         let request = AdoptRequest {
-            kind: cfg.kind.unwrap_or(SessionKind::Play),
+            kind: cfg.kind,
             container: cfg.container.clone(),
             idle_timeout: cfg.idle_timeout,
             app_boot_timeout: cfg.app_boot_timeout,
@@ -10847,7 +10847,7 @@ mod tests {
 
         let (runner, req) = warm.adopted.recv_timeout(WAIT).unwrap();
         assert_eq!(runner, "k1", "the parked runtime's runner, not a new one");
-        assert_eq!(req.kind, SessionKind::Play);
+        assert_eq!(req.kind, Some(SessionKind::Play));
         assert_eq!(
             req.container.unwrap().env["STEAM_STARTUP_FLAGS"],
             "-applaunch 730"
@@ -10874,7 +10874,10 @@ mod tests {
         let cfg = steam_cfg(SessionKind::Parked, "-silent", (1920, 1080));
         assert!(acked(start(&mut mgr, &warm, "k2", cfg, Some("p0"))));
         let (runner, req) = warm.adopted.recv_timeout(WAIT).unwrap();
-        assert_eq!((runner.as_str(), req.kind), ("p0", SessionKind::Parked));
+        assert_eq!(
+            (runner.as_str(), req.kind),
+            ("p0", Some(SessionKind::Parked))
+        );
         assert_eq!(mgr.running_ids(), vec!["k2".to_string()]);
         assert!(mgr.running["k2"].held.is_none());
     }
@@ -11321,7 +11324,7 @@ mod tests {
         assert!(acked(start(&mut mgr, &warm, "k2", cfg, Some("p0"))));
         assert_eq!(
             warm.adopted.recv_timeout(WAIT).unwrap().1.kind,
-            SessionKind::Parked
+            Some(SessionKind::Parked)
         );
     }
 
@@ -11583,5 +11586,19 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), bye + 2, "the release sent nothing: {seen:#?}");
+    }
+
+    /// With `steam_warm_enabled` off the control plane still claims a parked runtime but sends
+    /// no `kind`: the runner is handed none, so the session is never held.
+    #[test]
+    fn a_claim_without_kind_hands_the_runner_no_kind() {
+        let (mut mgr, warm) = warm_manager();
+        parked(&mut mgr, &warm, "k1", (1920, 1080));
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        cfg.kind = None;
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+        let (runner, req) = warm.adopted.recv_timeout(WAIT).unwrap();
+        assert_eq!((runner.as_str(), req.kind), ("k1", None));
+        assert_eq!(mgr.running["p1"].kind, None);
     }
 }

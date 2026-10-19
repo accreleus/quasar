@@ -529,3 +529,56 @@ fn an_unreadable_proc_never_reads_as_gone() {
         Some(QuitAction::Terminate(_))
     ));
 }
+
+/// gamescope as a test sets it, failing reads included.
+#[derive(Clone, Default)]
+struct Flaky {
+    focus: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
+    focus_fails: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mapped_fails: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Windows for Flaky {
+    fn mapped(&mut self) -> std::io::Result<Vec<WindowInfo>> {
+        if self.mapped_fails.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("X went away"));
+        }
+        Ok(Vec::new())
+    }
+    fn focused_app(&mut self) -> std::io::Result<Option<u32>> {
+        if self.focus_fails.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("X went away"));
+        }
+        Ok(*self.focus.lock().unwrap())
+    }
+}
+
+#[test]
+fn a_failed_read_leaves_no_stale_focus_and_says_the_windows_were_not_read() {
+    use std::sync::atomic::Ordering;
+    let d = dirs();
+    std::fs::write(d.logs.join("console_log.txt"), "").unwrap();
+    let x = Flaky::default();
+    let mut w = Watcher::new(
+        WatchConfig {
+            proc_root: d.proc_root.clone(),
+            steam_log_dir: d.logs.clone(),
+            appid: APPID,
+        },
+        Box::new(x.clone()),
+    );
+    *x.focus.lock().unwrap() = Some(769);
+    w.poll();
+    assert_eq!(w.focused(), Some(769));
+    assert!(w.windows_read());
+    x.focus_fails.store(true, Ordering::Relaxed);
+    x.mapped_fails.store(true, Ordering::Relaxed);
+    w.poll();
+    assert_eq!(w.focused(), None, "unknown, not 769");
+    assert!(!w.windows_read());
+    x.focus_fails.store(false, Ordering::Relaxed);
+    x.mapped_fails.store(false, Ordering::Relaxed);
+    w.poll();
+    assert_eq!(w.focused(), Some(769));
+    assert!(w.windows_read());
+}

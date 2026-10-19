@@ -789,8 +789,9 @@ pub struct SwapRequest {
 /// The agent has already checked that it may, and re-labels the runtime's reports.
 #[derive(Debug, Clone)]
 pub struct AdoptRequest {
-    /// `Play` or `Parked`.
-    pub kind: SessionKind,
+    /// As on the adopting assign: `Play`, `Parked`, or `None` from a control plane that sends
+    /// no `kind` (the switch off), whose session is then never held.
+    pub kind: Option<SessionKind>,
     /// The adopting session's app: what a play session launches, and what an in-place swap
     /// is compared against from now on.
     pub container: Option<super::container::ContainerSpec>,
@@ -2558,7 +2559,7 @@ pub fn run_blocking(
                     "an in-place swap was still pending on the adopted runtime; dropped"
                 );
             }
-            kind = Some(req.kind);
+            kind = req.kind;
             cfg.idle_timeout = req.idle_timeout;
             cfg.app_boot_timeout = req.app_boot_timeout;
             app_boot_budget = req.app_boot_timeout;
@@ -2567,8 +2568,8 @@ pub fn run_blocking(
             follow_app(&mut current_source, &res, current_app.as_ref());
             tracing::info!(
                 token = "runtime-adopted",
-                "runtime adopted by a {:?} session",
-                req.kind
+                kind = ?req.kind,
+                "runtime adopted by a new session"
             );
             // The adopting session starts here: its reports, its clocks, its first offer.
             emit(SessionEvent::Starting);
@@ -2588,7 +2589,7 @@ pub fn run_blocking(
             app_boot_started_at = None;
             app_presented_at = None;
             let mount = res.launch().map(|l| l.mount().clone());
-            if req.kind == SessionKind::Parked {
+            if req.kind == Some(SessionKind::Parked) {
                 if let Some(mount) = mount {
                     mount.arm(None);
                 }

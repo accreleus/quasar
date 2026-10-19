@@ -140,8 +140,10 @@ pub struct Watcher {
     /// only if it still stands [`USER_WAIT`] after the caller's key press.
     answers_notice: bool,
     notice_pressed: Option<Instant>,
-    /// gamescope's focused app as last read.
+    /// gamescope's focused app as read this pass; `None` when unset or the read failed.
     focused: Option<u32>,
+    /// This pass read the window list.
+    windows_read: bool,
     /// The last window list read, for the helper's pin.
     last_windows: Vec<WindowInfo>,
 }
@@ -175,6 +177,7 @@ impl Watcher {
             answers_notice: false,
             notice_pressed: None,
             focused: None,
+            windows_read: false,
             last_windows: Vec::new(),
         }
     }
@@ -229,20 +232,26 @@ impl Watcher {
 
         // On screen is gamescope's published focus alone; an error skips
         // the check for this pass, leaving the last reported value standing.
-        if let Ok(focused) = self.windows.focused_app() {
-            self.focused = focused;
-            let on_screen = focused == Some(self.cfg.appid);
-            if on_screen != self.last_game_window {
-                self.last_game_window = on_screen;
-                reports.push(Report::GameWindow { on_screen });
+        match self.windows.focused_app() {
+            Ok(focused) => {
+                self.focused = focused;
+                let on_screen = focused == Some(self.cfg.appid);
+                if on_screen != self.last_game_window {
+                    self.last_game_window = on_screen;
+                    reports.push(Report::GameWindow { on_screen });
+                }
             }
+            // Unknown, not what it was: the notice's key press must not trust an old read.
+            Err(_) => self.focused = None,
         }
 
         if let Some(percent) = self.read_shader_log() {
             reports.push(Report::ShaderProgress(percent));
         }
 
-        match self.windows.mapped() {
+        let mapped = self.windows.mapped();
+        self.windows_read = mapped.is_ok();
+        match mapped {
             Ok(windows) => {
                 // The higher-ranked of the window and log reasons wins.
                 let desired = [
@@ -310,9 +319,15 @@ impl Watcher {
         self.interstitial_standing(now) && self.login.needs.is_none() && self.active_needs.is_none()
     }
 
-    /// gamescope's `GAMESCOPE_FOCUSED_APP` as last read; `None` while unset or unread.
+    /// gamescope's `GAMESCOPE_FOCUSED_APP` as read this pass; `None` while unset, or when the
+    /// read failed.
     pub fn focused(&self) -> Option<u32> {
         self.focused
+    }
+
+    /// This pass read the window list, so what it says about Steam's dialogs is current.
+    pub fn windows_read(&self) -> bool {
+        self.windows_read
     }
 
     /// The notice stands, and an answering caller has not yet given its press time to work.
