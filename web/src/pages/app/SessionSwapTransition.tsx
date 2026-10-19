@@ -54,12 +54,13 @@ export function SessionSwapTransition({ transition }: SessionSwapTransitionProps
                 : held.message}
             </div>
           ) : (
-            <>
-              <div className="sw-sub">Starting…</div>
-              {held.phase === "booting" && held.shaderPercent !== null && (
-                <div className="sw-sub">Processing shaders — {held.shaderPercent}%</div>
-              )}
-            </>
+            <div className="sw-sub">
+              Starting…
+              {/* Always in the layout, so nothing above it moves when progress starts. */}
+              <span className="sw-shaders">
+                {held.phase === "booting" && held.shaderPercent !== null && `Processing shaders — ${held.shaderPercent}%`}
+              </span>
+            </div>
           )}
         </>
       )}

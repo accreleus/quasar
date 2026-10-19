@@ -114,10 +114,39 @@ describe("useSwapTransition", () => {
     expect(onCommitted).toHaveBeenCalledTimes(1);
     expect(onCommitted).toHaveBeenCalledWith("a2", "Purple App");
     expect(result.current.transition).toEqual({ phase: "booting", appName: "Purple App", shaderPercent: null });
+    expect(onToast).not.toHaveBeenCalled(); // the hold screen would cover it
 
     await advanceUntil(() => result.current.transition?.phase === "booting" && result.current.transition.shaderPercent === 42);
     await advanceUntil(() => result.current.transition === null);
     expect(onCommitted).toHaveBeenCalledTimes(1);
+    expect(onToast).toHaveBeenCalledTimes(1); // "Now playing", when the screen clears
+  });
+
+  it("keeps the hold for the whole boot, past the terminal auto-dismiss, then clears on 'app presented'", async () => {
+    let detail = "swapping";
+    getSession.mockImplementation(async () => session("running", detail, "a2"));
+    const onToast = vi.fn();
+    const { result } = renderHook(() =>
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted: vi.fn(), onToast }),
+    );
+
+    act(() => result.current.startSwap({ id: "a2", name: "Purple App" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    detail = "app booting";
+    await advanceUntil(() => result.current.transition?.phase === "booting");
+    for (let s = 0; s < 10; s++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(result.current.transition?.phase).toBe("booting");
+    }
+    expect(onToast).not.toHaveBeenCalled();
+
+    detail = "app presented";
+    await advanceUntil(() => result.current.transition === null);
+    expect(onToast).toHaveBeenCalledTimes(1);
   });
 
   it("commits and clears at once when the first confirmation is 'app presented'", async () => {
@@ -155,13 +184,15 @@ describe("useSwapTransition", () => {
       .mockResolvedValueOnce(session("running", "swapping"))
       .mockResolvedValueOnce(session("running", "app booting", "a2"))
       .mockResolvedValue(session("stopped", "game exited", "a2"));
+    const onToast = vi.fn();
     const { result } = renderHook(() =>
-      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted: vi.fn(), onToast: vi.fn() }),
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted: vi.fn(), onToast }),
     );
 
     act(() => result.current.startSwap({ id: "a2", name: "Purple App" }));
     await advanceUntil(() => result.current.transition?.phase === "booting");
     await advanceUntil(() => result.current.transition === null);
+    expect(onToast).not.toHaveBeenCalled();
   });
 
   it("surfaces the rollback reason on failure and never calls onCommitted", async () => {

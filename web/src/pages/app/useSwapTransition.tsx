@@ -8,8 +8,8 @@
 // control-plane/internal/session/swapper.go `Swap`). Outcome arrives async via
 // the agent's session_state callback, hence this poll.
 //
-// #139: poll only exists while phase === "switching"; started by startSwap,
-// torn down by itself/unmount/terminal outcome — never a standing timer.
+// #139: the poll only exists from startSwap until the screen clears (phases
+// "switching" and "booting"); torn down by itself/unmount/outcome, never a standing timer.
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { getSession } from "../../api/library";
@@ -115,6 +115,12 @@ export function useSwapTransition({
       // After the commit the poll only waits for `app presented`.
       let committed = false;
       let holdDeadline = 0;
+      // Shown when the screen clears, not at the commit: the hold screen covers the toast.
+      const nowPlaying = (
+        <>
+          <b>Now playing {target.name}.</b> Stream quality unchanged.
+        </>
+      );
 
       const tick = async () => {
         if (!activeRef.current) return;
@@ -153,6 +159,7 @@ export function useSwapTransition({
             } else {
               stopPolling();
               setTransition(null);
+              if (session.state === "running" && session.state_detail === "app presented") onToast(nowPlaying);
             }
             return;
           }
@@ -169,12 +176,8 @@ export function useSwapTransition({
             } else {
               stopPolling();
               setTransition(null);
+              onToast(nowPlaying);
             }
-            onToast(
-              <>
-                <b>Now playing {target.name}.</b> Stream quality unchanged.
-              </>,
-            );
           } else {
             stopPolling();
             setTransition({ phase: "error", appName: target.name, message: outcome.message });
@@ -203,7 +206,8 @@ export function useSwapTransition({
 
   // Auto-dismiss a terminal transition after a readable pause.
   useEffect(() => {
-    if (!transition || transition.phase === "switching") return;
+    // The poll ends the other two phases itself.
+    if (!transition || transition.phase === "switching" || transition.phase === "booting") return;
     const t = setTimeout(() => setTransition(null), DISMISS_AFTER_MS);
     return () => clearTimeout(t);
   }, [transition]);
