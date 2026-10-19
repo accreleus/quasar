@@ -964,7 +964,7 @@ pub(crate) fn interpipe_available() -> bool {
 }
 
 #[cfg(test)]
-mod takeover_tests;
+pub(crate) mod takeover_tests;
 
 #[cfg(test)]
 mod source_interpipe_tests {

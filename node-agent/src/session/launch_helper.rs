@@ -54,6 +54,14 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// The `STEAM_GAME` of Steam's own windows, Big Picture's included (#759 S0).
 pub const STEAM_CLIENT_APPID: u32 = 769;
 
+/// Set once [`install`] put the helper in place: without it a parked Steam could not start a
+/// game, so the agent does not advertise warm Steam (amendment 39 `parked_sessions_v1`).
+pub(crate) static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn installed() -> bool {
+    INSTALLED.load(Ordering::Relaxed)
+}
+
 /// Copy the helper shipped beside the agent binary into the runtime dir, the one path the
 /// host shares 1:1 with the agent's container, so sessions can bind-mount it. Any older
 /// copy goes first: a session mounts the helper only when this agent put it there.
@@ -77,7 +85,10 @@ pub fn install() {
         .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)))
         .and_then(|()| std::fs::rename(&tmp, &dest));
     match result {
-        Ok(()) => tracing::info!("launch helper installed at {}", dest.display()),
+        Ok(()) => {
+            INSTALLED.store(true, Ordering::Relaxed);
+            tracing::info!("launch helper installed at {}", dest.display());
+        }
         Err(error) => {
             let _ = std::fs::remove_file(&tmp);
             tracing::warn!(
@@ -415,6 +426,8 @@ struct State {
     active: bool,
     /// The appid the helper watches; `None` in watch-only mode, which takes no game report.
     target: Option<u32>,
+    /// The app the container runs: its tile's appid (`None` for a parked Steam) and flags.
+    app: (Option<u32>, Option<String>),
     reports: LaunchReports,
     /// Command lines waiting for the helper's connection.
     outbox: VecDeque<String>,
@@ -432,12 +445,9 @@ impl Shared {
     }
 }
 
-/// What a generation's app container is given when it runs the app the socket was opened for.
+/// What a generation's app container is given when it runs the session's app.
 #[derive(Clone)]
 pub struct LaunchMount {
-    /// The tile's appid, or `None` for a parked Steam, opened on these flags.
-    opened_for: Option<u32>,
-    opened_flags: Option<String>,
     helper: PathBuf,
     socket_dir: PathBuf,
     shared: Arc<Shared>,
@@ -449,16 +459,23 @@ impl LaunchMount {
     /// go back to unknown and the reader drops lines (a dead helper's may still be queued)
     /// until that app is back. The socket stays, so a rollback finds its bind source.
     pub fn for_app(&self, env: &BTreeMap<String, String>) -> Option<&Self> {
-        let ours = match self.opened_for {
+        let (appid, flags) = self.shared.state().app.clone();
+        let ours = match appid {
             Some(appid) => appid_from_env(env) == Some(appid),
-            None => env.get("STEAM_STARTUP_FLAGS") == self.opened_flags.as_ref(),
+            None => env.get("STEAM_STARTUP_FLAGS") == flags.as_ref(),
         };
         if ours {
-            self.arm(self.opened_for);
+            self.arm(appid);
         } else {
             self.set_active(false);
         }
         ours.then_some(self)
+    }
+
+    /// The container now runs `env`'s app without a new container (an adoption or an
+    /// in-place swap): a rollback that relaunches it gets the helper on that app.
+    pub fn rebase(&self, env: &BTreeMap<String, String>) {
+        self.shared.state().app = (appid_from_env(env), env.get("STEAM_STARTUP_FLAGS").cloned());
     }
 
     /// Follow `target` from now on (`None`: watch-only), with the reports back to unknown:
@@ -637,14 +654,13 @@ impl LaunchSocket {
         )?;
         let socket = LaunchSocket {
             mount: LaunchMount {
-                opened_for: appid,
-                opened_flags: flags,
                 helper,
                 socket_dir: owned_entry::entry_dir(runtime_dir, PREFIX, session_id),
                 shared: Arc::new(Shared {
                     state: Mutex::new(State {
                         active: true,
                         target: appid,
+                        app: (appid, flags),
                         ..State::default()
                     }),
                     metrics,
@@ -759,6 +775,7 @@ impl Reader {
                         state.reports.helper_connected = true;
                     }
                     drop(state);
+                    self.shared.metrics.set_launch_helper_connected();
                     self.read_connection(stream)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
@@ -979,7 +996,10 @@ impl Reader {
                     );
                 }
             }
-            Report::ShaderProgress(percent) if reports.shader_percent != Some(percent) => {
+            // Rises only, until the next arm: a restarted helper may read lower.
+            Report::ShaderProgress(percent)
+                if reports.shader_percent.is_none_or(|last| percent > last) =>
+            {
                 reports.shader_percent = Some(percent);
                 tracing::debug!(percent, "launch helper: Steam is processing shaders");
             }
@@ -1174,8 +1194,6 @@ mod tests {
     #[test]
     fn the_mount_fits_the_runtime_bind_shape() {
         let mount = LaunchMount {
-            opened_for: Some(620),
-            opened_flags: Some("-applaunch 620".into()),
             helper: "/run/quasar-agent/quasar-launch-helper".into(),
             socket_dir: "/run/quasar-agent/launch-s1".into(),
             shared: Arc::new(Shared {
@@ -1897,6 +1915,43 @@ mod tests {
             "a rollback re-arms it"
         );
         assert_eq!(mount.target(), None);
+    }
+
+    #[test]
+    fn a_rebased_mount_is_for_the_app_the_container_now_runs() {
+        let s = Session::open_parked();
+        let mount = s.socket().mount().clone();
+        // Adopted by a play session for 730: a rollback relaunches 730, with the helper on it.
+        mount.rebase(&env("-applaunch 730"));
+        assert!(mount.for_app(&env("-applaunch 730")).is_some());
+        assert_eq!(mount.target(), Some(730));
+        assert!(mount.for_app(&env("-silent")).is_none());
+        // An in-place swap to 440, then back to a parked Steam.
+        mount.rebase(&env("-silent -applaunch 440"));
+        assert!(mount.for_app(&env("-applaunch 730")).is_none());
+        assert!(mount.for_app(&env("-silent -applaunch 440")).is_some());
+        assert_eq!(mount.target(), Some(440));
+        mount.rebase(&env("-silent"));
+        assert!(mount.for_app(&env("-silent")).is_some());
+        assert_eq!(mount.target(), None);
+    }
+
+    #[test]
+    fn the_shader_figure_only_rises_until_the_next_arm() {
+        let s = Session::open(620);
+        let mount = s.socket().mount().clone();
+        let mut helper = s.connect();
+        let progress =
+            |p: u8| format!("{{\"type\":\"shader_progress\",\"v\":1,\"percent\":{p}}}\n");
+        helper.write_all(progress(40).as_bytes()).unwrap();
+        s.wait_for(|r| r.shader_percent == Some(40));
+        helper.write_all(progress(10).as_bytes()).unwrap();
+        helper.write_all(progress(41).as_bytes()).unwrap();
+        s.wait_for(|r| r.shader_percent == Some(41));
+        mount.arm(Some(620));
+        helper.write_all(progress(5).as_bytes()).unwrap();
+        s.wait_for(|r| r.shader_percent == Some(5));
+        assert!(s.metrics.launch_helper_connected());
     }
 
     #[test]

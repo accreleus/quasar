@@ -28,7 +28,7 @@ use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 /// that returns early counts as passed, so the skip is written past libtest's capture,
 /// once, and `scripts/verify/agent.sh` restates it. With `QUASAR_REQUIRE_LIVE_WEBRTC`
 /// set the skip is a failure (#571).
-fn live_webrtc_available() -> bool {
+pub(crate) fn live_webrtc_available() -> bool {
     gst::init().unwrap();
     let missing: Vec<&str> = [
         "interpipesink",

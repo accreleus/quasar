@@ -1096,6 +1096,14 @@ impl AppSource {
     /// `Ok(())` when there is nothing to relaunch or the relaunch succeeded. `Err` means
     /// the session is now a live compositor with no app in it — the caller must treat
     /// that as fatal rather than report a rollback that did not happen.
+    /// The app this generation's container runs now: an adoption or an in-place swap changes it
+    /// with no new container (amendment 39), and a rollback must relaunch that app.
+    pub fn set_app_spec(&mut self, spec: ContainerSpec) {
+        if self.container_spec.is_some() {
+            self.container_spec = Some(spec);
+        }
+    }
+
     pub fn relaunch_app(&mut self) -> Result<(), String> {
         if self.container.is_some() {
             return Ok(());

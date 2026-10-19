@@ -142,12 +142,12 @@ fn end(mut session: Session, peer: &mut Peer) {
 }
 
 #[test]
-fn a_parked_session_is_never_reaped_or_revealed() {
+fn a_parked_session_is_never_reaped_or_revealed_and_a_claim_streams_on_it() {
     if !live_webrtc_available() {
         return;
     }
     let _serial = serial();
-    let (_runtime, mut session) = steam_session(
+    let (runtime, mut session) = steam_session(
         "parked",
         SessionKind::Parked,
         "-silent",
@@ -171,7 +171,66 @@ fn a_parked_session_is_never_reaped_or_revealed() {
         .log
         .iter()
         .any(|e| matches!(e, SessionEvent::AppBooting | SessionEvent::AppPresented)));
-    end(session, &mut nobody);
+
+    // The library claim: the parked transport offered and was never answered; the claim's
+    // viewer is the first peer it ever has.
+    let mut helper = FakeHelper::connect(runtime.path(), &session.id);
+    session.mute = false;
+    let adopted_at = adopt(&mut session, "-applaunch 730");
+    let mut b = Peer::new();
+    assert_eq!(helper.command(&mut session, &mut b), "launch 730");
+    let up = session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p));
+    assert!(
+        up,
+        "the claim's viewer never streamed on the parked runtime"
+    );
+    assert_one_session_start(&session.log, adopted_at);
+    helper.say(r#"{"type":"game_window","v":1,"on_screen":true}"#);
+    let shown = session.pump(&mut b, Duration::from_secs(5), |s, _| {
+        s.log
+            .iter()
+            .skip(adopted_at)
+            .any(|e| matches!(e, SessionEvent::AppPresented))
+    });
+    assert!(shown, "the game on screen did not reveal it");
+    end(session, &mut b);
+}
+
+/// Hand the runtime to a play session for `flags`; where its reports start in the log.
+fn adopt(session: &mut Session, flags: &str) -> usize {
+    let at = session.log.len();
+    session
+        .adopt
+        .send(AdoptRequest {
+            kind: SessionKind::Play,
+            container: Some(app(flags)),
+            idle_timeout: Duration::from_secs(60),
+            app_boot_timeout: Some(Duration::from_secs(300)),
+        })
+        .unwrap();
+    at
+}
+
+/// One `running`, one `app booting` and one `effective_media` for the adopting session, the
+/// restart offers notwithstanding.
+fn assert_one_session_start(log: &[SessionEvent], from: usize) {
+    let count = |what: fn(&SessionEvent) -> bool| log.iter().skip(from).filter(|e| what(e)).count();
+    assert_eq!(
+        count(|e| matches!(e, SessionEvent::Starting)),
+        1,
+        "starting"
+    );
+    assert_eq!(count(|e| matches!(e, SessionEvent::Running)), 1, "running");
+    assert_eq!(
+        count(|e| matches!(e, SessionEvent::AppBooting)),
+        1,
+        "app booting"
+    );
+    assert_eq!(
+        count(|e| matches!(e, SessionEvent::EffectiveMedia(_))),
+        1,
+        "effective media"
+    );
 }
 
 #[test]
@@ -196,15 +255,21 @@ fn a_game_exit_holds_the_runtime_and_an_adoption_launches_the_next_game_for_a_ne
         s.log.iter().any(|e| matches!(e, SessionEvent::Held))
     });
     assert!(held, "the game exit did not hold the runtime");
-    let stopping = after(&session.log, 0, |e| {
-        matches!(e, SessionEvent::StoppingWith("game exited"))
-    })
-    .expect("stopping / game exited");
-    let bye = after(&session.log, stopping, |e| {
+    // The control plane parks only a session still `running`: bye, then the held stop, and
+    // no `stopping` of any kind before it.
+    let bye = after(&session.log, 0, |e| {
         matches!(e, SessionEvent::Signaling(SignalMsg::Bye))
     })
-    .expect("bye after stopping");
-    after(&session.log, bye, |e| matches!(e, SessionEvent::Held)).expect("held after bye");
+    .expect("bye");
+    assert!(
+        matches!(session.log.get(bye + 1), Some(SessionEvent::Held)),
+        "the held stop right after the bye: {:?}",
+        &session.log[bye..]
+    );
+    assert!(!session
+        .log
+        .iter()
+        .any(|e| matches!(e, SessionEvent::Stopping | SessionEvent::StoppingWith(_))));
     assert_eq!(byes(&session.log), 1, "one bye for the ended session");
 
     // The old viewer goes; nothing ends while the runtime waits.
@@ -215,17 +280,27 @@ fn a_game_exit_holds_the_runtime_and_an_adoption_launches_the_next_game_for_a_ne
     assert!(session.ended.is_none(), "{:?}", session.ended);
     session.mute = false;
 
-    let adopted_at = session.log.len();
-    let offers = session.offers;
+    // A swap that reaches the runner after the game exit goes nowhere.
+    let before_swap = session.log.len();
     session
-        .adopt
-        .send(AdoptRequest {
-            kind: SessionKind::Play,
-            container: Some(app("-applaunch 730")),
-            idle_timeout: Duration::from_secs(60),
-            app_boot_timeout: Some(Duration::from_secs(300)),
+        .swap
+        .send(SwapRequest {
+            container: Some(app("-applaunch 440")),
+            in_place: true,
         })
         .unwrap();
+    session.pump(&mut quiet, Duration::from_secs(1), |_, _| false);
+    assert!(
+        !session
+            .log
+            .iter()
+            .skip(before_swap)
+            .any(|e| matches!(e, SessionEvent::Swapping)),
+        "a held runtime takes no swap"
+    );
+
+    let offers = session.offers;
+    let adopted_at = adopt(&mut session, "-applaunch 730");
     let mut b = Peer::new();
     assert_eq!(helper.command(&mut session, &mut b), "launch 730");
     let up = session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p));
@@ -236,6 +311,7 @@ fn a_game_exit_holds_the_runtime_and_an_adoption_launches_the_next_game_for_a_ne
         offers,
         session.offers
     );
+    assert_one_session_start(&session.log, adopted_at);
     let starting = after(&session.log, adopted_at, |e| {
         matches!(e, SessionEvent::Starting)
     })

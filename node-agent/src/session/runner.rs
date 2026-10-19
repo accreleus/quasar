@@ -950,6 +950,8 @@ pub struct SessionDisplayState {
     pub external: (i32, i32),
     /// The live render size; `None` is the launch size.
     pub render: Option<(i32, i32)>,
+    /// The live UI scale; `None` is the compositor's default (1.0).
+    pub ui_scale: Option<f64>,
     /// `pipeline::external_resize_supported`. A `stream_*` request is rejected when
     /// false, never silently ignored.
     pub external_resize_supported: bool,
@@ -962,6 +964,7 @@ impl SessionDisplayState {
             launch,
             external: launch,
             render: None,
+            ui_scale: None,
             external_resize_supported,
         }
     }
@@ -976,6 +979,9 @@ impl SessionDisplayState {
         }
         if let (Some(w), Some(h)) = (eff.render_width, eff.render_height) {
             fold_render_size(&mut self.render, (w, h), self.launch);
+        }
+        if let Some(scale) = eff.ui_scale {
+            self.ui_scale = (scale != UI_SCALE_MIN).then_some(scale);
         }
     }
 }
@@ -2511,12 +2517,13 @@ pub fn run_blocking(
         let game_exited = in_place.is_none()
             && held_since.is_none()
             && res.launch().is_some_and(|l| l.reports().game_exited());
-        if game_exited && kind.is_some() {
+        if game_exited && kind.is_some() && cfg.video_topology == VideoTopology::StreamOnly {
             tracing::info!(
                 token = "launch-game-exited-held",
                 "the Steam game exited; ending the session and keeping its runtime for adoption"
             );
-            emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
+            // No `stopping` first: the control plane parks only a session still `running` when
+            // the held report arrives (agent-api.md §session_state `runtime_held`).
             emit(SessionEvent::Signaling(SignalMsg::Bye));
             emit(SessionEvent::Held);
             held_since = Some(Instant::now());
@@ -2545,12 +2552,19 @@ pub fn run_blocking(
         while let Ok(req) = adopt_rx.try_recv() {
             let now = Instant::now();
             held_since = None;
+            if in_place.take().is_some() {
+                tracing::info!(
+                    token = "runtime-adopted-swap-dropped",
+                    "an in-place swap was still pending on the adopted runtime; dropped"
+                );
+            }
             kind = Some(req.kind);
             cfg.idle_timeout = req.idle_timeout;
             cfg.app_boot_timeout = req.app_boot_timeout;
             app_boot_budget = req.app_boot_timeout;
             reveal_cap = cap_for(app_boot_budget);
             current_app = req.container;
+            follow_app(&mut current_source, &res, current_app.as_ref());
             tracing::info!(
                 token = "runtime-adopted",
                 "runtime adopted by a {:?} session",
@@ -2564,6 +2578,9 @@ pub fn run_blocking(
                 &encode_pipe,
                 &interpipesrc,
             )));
+            // Already reported for this session: the restart offer below must not again.
+            running = true;
+            effective_media_sent = true;
             running_since = Some(now);
             ever_connected = false;
             unhealthy_since = None;
@@ -2982,6 +2999,14 @@ pub fn run_blocking(
         // never starved and never renegotiate. `SwapDone` is not emitted until the new app
         // is on screen (`perform_swap`), which is the client's reveal signal.
         while let Ok(req) = swap_rx.try_recv() {
+            // The session has ended; the control plane's unresolved-swap limit answers it.
+            if held_since.is_some() {
+                tracing::info!(
+                    token = "swap-on-held-runtime-dropped",
+                    "a swap reached a runtime whose session just ended; dropped"
+                );
+                continue;
+            }
             if in_place.is_some() {
                 tracing::warn!(
                     token = "swap-during-in-place-swap",
@@ -3119,6 +3144,7 @@ pub fn run_blocking(
                 }
                 InPlaceAction::Done => {
                     current_app = in_place.take().and_then(|(_, app)| app);
+                    follow_app(&mut current_source, &res, current_app.as_ref());
                     emit(SessionEvent::SwapDone);
                     diagnostic_tx.try_emit(
                         session_id.clone(),
@@ -3569,6 +3595,22 @@ pub fn run_blocking(
                 _ => {}
             }
         }
+    }
+}
+
+/// The container now runs `app` (an adoption or an in-place swap): a rollback relaunches it,
+/// with the launch helper on it.
+fn follow_app(
+    source: &mut AppSource,
+    res: &SessionResources,
+    app: Option<&super::container::ContainerSpec>,
+) {
+    let Some(app) = app else {
+        return;
+    };
+    source.set_app_spec(app.clone());
+    if let Some(launch) = res.launch() {
+        launch.mount().rebase(&app.env);
     }
 }
 
