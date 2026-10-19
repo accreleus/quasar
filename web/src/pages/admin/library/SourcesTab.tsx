@@ -19,6 +19,7 @@ import { useToast } from "../../../components/Toast";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { ScanHealth } from "./ScanHealth";
 import { SteamPreparation } from "./SteamPreparation";
+import { SteamWarm } from "./SteamWarm";
 import { SourceRow } from "./SourceRow";
 import { inertReasonCopy, lastScanText, scanResultToast } from "./sourcesDerived";
 import { STEAM_PROVIDER_LABEL, useSourcesData } from "./useSourcesData";
@@ -121,6 +122,7 @@ export function SourcesTab() {
               switchLabel="Steam discovery"
             >
               <SteamPreparation settings={data.settings} />
+              <SteamWarm settings={data.settings} />
               {ls.inert_reason && (
                 <div className="note warn mt3">
                   <div>{inertReasonCopy(ls.inert_reason)}</div>

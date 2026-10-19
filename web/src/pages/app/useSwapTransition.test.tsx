@@ -7,8 +7,8 @@ vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
 }));
 
-const session = (state: string, state_detail: string | null, app_id = "a1") => ({
-  session: { id: "s1", app_id, state, state_detail, error_message: null },
+const session = (state: string, state_detail: string | null, app_id = "a1", launch_progress: unknown = null) => ({
+  session: { id: "s1", app_id, state, state_detail, error_message: null, launch_progress },
 });
 
 beforeEach(() => {
@@ -92,6 +92,169 @@ describe("useSwapTransition", () => {
 
     expect(result.current.transition).toBeNull();
     expect(onToast).toHaveBeenCalled();
+  });
+
+  it("commits on 'app booting' after 'swapping' (an in-place swap overwrites 'swap complete'), holds until 'app presented'", async () => {
+    getSession
+      .mockResolvedValueOnce(session("running", "swapping"))
+      .mockResolvedValueOnce(session("running", "app booting", "a2"))
+      .mockResolvedValueOnce(session("running", "app booting", "a2", { step: "shaders", percent: 42 }))
+      .mockResolvedValue(session("running", "app presented", "a2"));
+    const onCommitted = vi.fn();
+    const onToast = vi.fn();
+    const { result } = renderHook(() =>
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted, onToast }),
+    );
+
+    act(() => result.current.startSwap({ id: "a2", name: "Purple App" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await advanceUntil(() => onCommitted.mock.calls.length > 0);
+    expect(onCommitted).toHaveBeenCalledTimes(1);
+    expect(onCommitted).toHaveBeenCalledWith("a2", "Purple App");
+    expect(result.current.transition).toEqual({ phase: "booting", appName: "Purple App", shaderPercent: null });
+    expect(onToast).not.toHaveBeenCalled(); // the hold screen would cover it
+
+    await advanceUntil(() => result.current.transition?.phase === "booting" && result.current.transition.shaderPercent === 42);
+    await advanceUntil(() => result.current.transition === null);
+    expect(onCommitted).toHaveBeenCalledTimes(1);
+    expect(onToast).toHaveBeenCalledTimes(1); // "Now playing", when the screen clears
+  });
+
+  it("keeps the hold for the whole boot, past the terminal auto-dismiss, then clears on 'app presented'", async () => {
+    let detail = "swapping";
+    getSession.mockImplementation(async () => session("running", detail, "a2"));
+    const onToast = vi.fn();
+    const { result } = renderHook(() =>
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted: vi.fn(), onToast }),
+    );
+
+    act(() => result.current.startSwap({ id: "a2", name: "Purple App" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    detail = "app booting";
+    await advanceUntil(() => result.current.transition?.phase === "booting");
+    // 500 ms steps: the 3.5 s dismiss timer and the next 1 s poll's rebuild must not share one act().
+    for (let s = 0; s < 20; s++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      expect(result.current.transition?.phase).toBe("booting");
+    }
+    expect(onToast).not.toHaveBeenCalled();
+
+    detail = "app presented";
+    await advanceUntil(() => result.current.transition === null);
+    expect(onToast).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets go after 180 s when 'app presented' never comes, without a 'Now playing' toast", async () => {
+    let detail = "swapping";
+    getSession.mockImplementation(async () => session("running", detail, "a2"));
+    const onToast = vi.fn();
+    const { result } = renderHook(() =>
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted: vi.fn(), onToast }),
+    );
+
+    act(() => result.current.startSwap({ id: "a2", name: "Purple App" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    detail = "app booting";
+    await advanceUntil(() => result.current.transition?.phase === "booting");
+    const committedAt = Date.now();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(179_000 - (Date.now() - committedAt));
+    });
+    expect(result.current.transition?.phase).toBe("booting");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(result.current.transition).toBeNull();
+    expect(onToast).not.toHaveBeenCalled();
+  });
+
+  it("a GET still in flight from swap 1 changes nothing once swap 2 has started", async () => {
+    let release: (v: unknown) => void = () => {};
+    let calls = 0;
+    getSession.mockImplementation(() => {
+      calls++;
+      // Swap 1's second GET hangs, then resolves as a commit once swap 2 is under way.
+      return calls === 2 ? new Promise((r) => (release = r)) : Promise.resolve(session("running", "swapping"));
+    });
+    const onCommitted = vi.fn();
+    const onToast = vi.fn();
+    const { result } = renderHook(() =>
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted, onToast }),
+    );
+
+    act(() => result.current.startSwap({ id: "a2", name: "First App" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(calls).toBe(2);
+    act(() => result.current.startSwap({ id: "a3", name: "Second App" }));
+    await act(async () => {});
+
+    await act(async () => release(session("running", "swap complete", "a2")));
+    expect(onCommitted).not.toHaveBeenCalled();
+    expect(onToast).not.toHaveBeenCalled();
+    expect(result.current.transition).toEqual({ phase: "switching", appName: "Second App" });
+
+    const before = calls;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(calls).toBeGreaterThan(before); // swap 2 is still being polled
+  });
+
+  it("commits and clears at once when the first confirmation is 'app presented'", async () => {
+    getSession
+      .mockResolvedValueOnce(session("running", "swapping"))
+      .mockResolvedValue(session("running", "app presented", "a2"));
+    const onCommitted = vi.fn();
+    const { result } = renderHook(() =>
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted, onToast: vi.fn() }),
+    );
+
+    act(() => result.current.startSwap({ id: "a2", name: "Purple App" }));
+    await advanceUntil(() => onCommitted.mock.calls.length > 0);
+    expect(onCommitted).toHaveBeenCalledWith("a2", "Purple App");
+    expect(result.current.transition).toBeNull();
+  });
+
+  it("ignores a stale 'app booting' from before this swap's own 'swapping'", async () => {
+    getSession.mockResolvedValue(session("running", "app booting"));
+    const onCommitted = vi.fn();
+    const { result } = renderHook(() =>
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted, onToast: vi.fn() }),
+    );
+
+    act(() => result.current.startSwap({ id: "a2", name: "Purple App" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(onCommitted).not.toHaveBeenCalled();
+    expect(result.current.transition).toEqual({ phase: "switching", appName: "Purple App" });
+  });
+
+  it("lets the stream show when the session ends while the new app boots", async () => {
+    getSession
+      .mockResolvedValueOnce(session("running", "swapping"))
+      .mockResolvedValueOnce(session("running", "app booting", "a2"))
+      .mockResolvedValue(session("stopped", "game exited", "a2"));
+    const onToast = vi.fn();
+    const { result } = renderHook(() =>
+      useSwapTransition({ authToken: "t", sessionId: "s1", onCommitted: vi.fn(), onToast }),
+    );
+
+    act(() => result.current.startSwap({ id: "a2", name: "Purple App" }));
+    await advanceUntil(() => result.current.transition?.phase === "booting");
+    await advanceUntil(() => result.current.transition === null);
+    expect(onToast).not.toHaveBeenCalled();
   });
 
   it("surfaces the rollback reason on failure and never calls onCommitted", async () => {
@@ -221,8 +384,13 @@ describe("useSwapTransition", () => {
     );
 
     act(() => result.current.startSwap({ id: "a2", name: "Purple App" }));
+    // The agent's longest in-place swap is 99 s: still waiting at 100 s.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(75_001);
+      await vi.advanceTimersByTimeAsync(100_000);
+    });
+    expect(result.current.transition).toEqual({ phase: "switching", appName: "Purple App" });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_001);
     });
 
     expect(result.current.transition).toEqual({ phase: "timeout", appName: "Purple App" });

@@ -33,6 +33,17 @@ describe("SessionSwapTransition", () => {
     expect(container.textContent).toBe("");
   });
 
+  it("shows Steam's shader progress under 'Starting…' while the committed app boots", () => {
+    const { container, rerender } = render(
+      <SessionSwapTransition transition={{ phase: "booting", appName: "Purple App", shaderPercent: 42 }} />,
+    );
+    expect(container.textContent).toContain("Starting…");
+    expect(screen.getByText("Processing shaders — 42%")).toBeInTheDocument();
+
+    rerender(<SessionSwapTransition transition={{ phase: "booting", appName: "Purple App", shaderPercent: null }} />);
+    expect(screen.queryByText(/Processing shaders/)).toBeNull();
+  });
+
   it("shows the target app name and 'Starting…' while switching", () => {
     const { container } = render(
       <SessionSwapTransition transition={{ phase: "switching", appName: "Purple App" }} />,

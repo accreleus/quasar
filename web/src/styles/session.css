@@ -92,7 +92,8 @@
   50% { transform: scale(1.08); opacity: 1; }
 }
 .switcher .sw-nm { font-family: var(--font-display); font-weight: 600; font-size: var(--t-h3); color: var(--text); }
-.switcher .sw-sub { font-size: var(--t-sm); color: var(--text-3); }
+.switcher .sw-sub { font-size: var(--t-sm); color: var(--text-3); text-align: center; }
+.switcher .sw-sub .sw-shaders { display: block; min-height: 1.5em; margin-top: var(--s2); }
 .switcher .sw-err { font-size: var(--t-sm); color: var(--danger-text); max-width: 420px; text-align: center; line-height: 1.5; }
 
 @media (prefers-reduced-motion: reduce) {
