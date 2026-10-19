@@ -51,8 +51,11 @@ describe("useBootLine", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("keeps every phrase short", () => {
-    expect(GETTING_READY_PHRASES).toHaveLength(20);
-    for (const p of GETTING_READY_PHRASES) expect(p.length).toBeLessThanOrEqual(32);
+  it("reads the phrase file, and keeps every phrase short", () => {
+    expect(GETTING_READY_PHRASES.length).toBeGreaterThanOrEqual(20);
+    for (const p of GETTING_READY_PHRASES) {
+      expect(p.length).toBeLessThanOrEqual(32);
+      expect(p.endsWith("…")).toBe(true);
+    }
   });
 });

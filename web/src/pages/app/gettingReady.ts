@@ -4,28 +4,13 @@
 // Otherwise a short retro-game nod rotates, picked at random.
 import { useEffect, useState } from "react";
 
-export const GETTING_READY_PHRASES = [
-  "Blowing on the cartridge…",
-  "Inserting coin…",
-  "Warping to world 8…",
-  "Pressing start…",
-  "Saving the princess…",
-  "Collecting rings…",
-  "Rolling a barrel…",
-  "Finding the secret level…",
-  "Loading the next stage…",
-  "Charging the buster…",
-  "Stomping goombas…",
-  "Eating power pellets…",
-  "Dodging space invaders…",
-  "Warming up the arcade…",
-  "Rewinding the tape…",
-  "Checking the high scores…",
-  "Collecting 100 coins…",
-  "Taking the warp pipe…",
-  "Finding the last star…",
-  "Stacking the falling blocks…",
-] as const;
+import phraseFile from "./getting-ready-phrases.txt?raw";
+
+/** The phrases, from getting-ready-phrases.txt (one per line; # comments). */
+export const GETTING_READY_PHRASES: readonly string[] = phraseFile
+  .split("\n")
+  .map((l) => l.trim())
+  .filter((l) => l !== "" && !l.startsWith("#"));
 
 export const GETTING_READY_MS = 3_000;
 
