@@ -4,7 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as libraryApi from "../../../api/library";
 import { ApiError } from "../../../api/client";
-import type { App } from "../../../api/types";
+import type { App, ProfilesResponse } from "../../../api/types";
 import { ToastProvider } from "../../../components/Toast";
 import { useLaunch } from "./useLaunch";
 
@@ -337,6 +337,35 @@ describe("useLaunch full screen on Play (#647)", () => {
     unmount();
     await act(async () => {});
     expect(document.exitFullscreen).toHaveBeenCalled();
+  });
+
+  it("leaves full screen when the page unmounts during the profile check", async () => {
+    // An eligible answer: without the guard, the unmounted page would go on to launch.
+    const eligible = { recommended_id: "p", profiles: [{ id: "p", eligibility: "eligible" }] } as unknown as ProfilesResponse;
+    let answer!: (v: ProfilesResponse) => void;
+    document.documentElement.requestFullscreen = vi.fn(() => {
+      fsEl = document.documentElement;
+      return Promise.resolve();
+    });
+    const { result, unmount } = renderHook(
+      () =>
+        useLaunch({
+          token: "tok",
+          apps: [app],
+          liveSession: null,
+          canDecodeH264: true,
+          fetchProfiles: () => new Promise((r) => (answer = r)),
+          revealDetail: () => {},
+        }),
+      { wrapper },
+    );
+    act(() => {
+      void result.current.quickLaunch(app);
+    });
+    unmount();
+    await act(async () => answer(eligible));
+    expect(document.exitFullscreen).toHaveBeenCalledTimes(1);
+    expect(libraryApi.launchSession).not.toHaveBeenCalled();
   });
 
   it("setting off: no full screen", () => {

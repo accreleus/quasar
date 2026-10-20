@@ -359,6 +359,11 @@ export function useLaunch({
       enterLaunchFullscreen();
       setResolvingId(app.id);
       const data = await fetchProfiles(app);
+      // Left the page during the check: the click's full screen is not this launch's any more.
+      if (!mountedRef.current) {
+        leaveLaunchFullscreen();
+        return;
+      }
       setResolvingId(null);
       if (!data || !isRecommendationEligible(data)) {
         leaveLaunchFullscreen();
