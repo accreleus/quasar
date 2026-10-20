@@ -36,6 +36,8 @@ export interface InputPaneProps {
   /** keyboard.lock() was observed refused this session — the API still reads as
    *  supported, yet Esc quits. */
   escLockRefused?: boolean;
+  /** Ctrl+Alt+Shift+E sends Esc to the game here (Firefox, summonCombo.ts). */
+  escCombo?: boolean;
   /** False on a browser with no Element.requestPointerLock — no mouse look. */
   pointerLockAvailable: boolean;
   /** True where touch gestures are the mouse (touchscreen + no Pointer Lock). */
@@ -120,6 +122,8 @@ export interface ReleaseInputs {
   lockRefused: boolean;
   /** Certificate bypassed rather than trusted: Esc capture is unreliable. */
   certUntrusted: boolean;
+  /** Ctrl+Alt+Shift+E sends Esc to the game (Firefox). */
+  escCombo: boolean;
 }
 
 /** Whether Esc is browser-owned (or ours) and releases capture. Without Pointer
@@ -133,7 +137,11 @@ export function escReleases(i: ReleaseInputs): boolean {
  *  release actions that work here. */
 export function releaseHint(i: ReleaseInputs): string {
   if (i.touchLook) return "Tap the session-menu button to release input";
-  if (escReleases(i)) return "Esc releases input";
+  if (escReleases(i)) {
+    return i.escCombo && i.pointerLockAvailable
+      ? "Esc releases input · Ctrl+Alt+Shift+E sends Esc to the game"
+      : "Esc releases input";
+  }
   if (i.certUntrusted) return "Ctrl+Alt+Shift+Z releases input · Ctrl+Alt+Shift+Q opens the menu";
   return "Ctrl+Alt+Shift+Z releases input · Ctrl+Alt+Shift+Q opens the menu · hold Esc to leave full screen";
 }
@@ -154,6 +162,12 @@ function escNote(props: InputPaneProps): string {
       "mouse look isn’t possible here — but capture still sends your keyboard, controller, " +
       "clicks and scrolling to the game. Press Esc, use the release combo, or tap the " +
       "session-menu button to stop."
+    );
+  }
+  if (props.escCombo) {
+    return (
+      "Firefox keeps Esc for itself, so Esc releases capture and leaves fullscreen. " +
+      "Press Ctrl+Alt+Shift+E to send Esc to the game."
     );
   }
   if (props.escCertUntrusted) {

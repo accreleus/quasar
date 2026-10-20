@@ -102,6 +102,12 @@ describe("InputPane keys", () => {
     expect(screen.queryByText(/insecure origin/i)).toBeNull();
   });
 
+  it("on Firefox, names the send-Esc combo instead of blaming HTTPS (#647)", () => {
+    render(<InputPane {...base} inputCaptured escReleases escInsecureContext escCombo />);
+    expect(screen.getByText(/Ctrl\+Alt\+Shift\+E to send Esc to the game/)).toBeTruthy();
+    expect(screen.queryByText(/insecure origin/i)).toBeNull();
+  });
+
   it("explains an observed lock refusal even though the API reads as supported", () => {
     render(<InputPane {...base} inputCaptured escReleases escLockRefused />);
     expect(screen.getByText(/browser refused to hand Esc to the game/i)).toBeTruthy();

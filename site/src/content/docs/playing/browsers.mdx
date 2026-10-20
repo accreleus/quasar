@@ -9,6 +9,16 @@ is the tested client; Firefox and Safari remain untested.
 Keyboard Lock and controller support are tested with Chrome. Use HTTPS to enable
 these features and microphone capture.
 
+## Firefox
+
+Firefox streams and captures input, with two limits:
+
+- **Escape always leaves.** Firefox keeps Escape, with any modifier, for itself:
+  it releases input and leaves fullscreen. It has no Keyboard Lock. Press
+  **Ctrl+Alt+Shift+E** to send Escape to the game instead.
+- **One extra click.** Firefox won't capture the mouse without a fresh click, so
+  after Play the stream shows **Click to play**.
+
 ## HTTPS is not optional
 
 | Feature | Without HTTPS |

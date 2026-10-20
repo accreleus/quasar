@@ -29,7 +29,7 @@
 // (matched by pointerId, so chrome taps are never seen here).
 
 import { EVDEV, MB_MAP } from "./evdev";
-import { isSummonCombo } from "./summonCombo";
+import { isSendEscCombo, isSummonCombo, sendEscComboEnabled } from "./summonCombo";
 
 // InputMsg matches the JSON shapes in protocol/input.md.
 type InputMsg = Record<string, unknown>;
@@ -750,6 +750,10 @@ export function setupCapture({
 
   // ── Keyboard ──────────────────────────────────────────────────────────────
 
+  // #647: Firefox's stand-in for Esc (summonCombo.ts). Esc goes up when the E does.
+  const sendEscCombo = sendEscComboEnabled();
+  let escFromCombo = false;
+
   const onKeyDown = (e: KeyboardEvent) => {
     if (!captured || e.repeat) return;
     // Escape release, fallback mode only: under Pointer Lock the browser owns
@@ -778,6 +782,16 @@ export function setupCapture({
       release();
       return;
     }
+    if (sendEscCombo && isSendEscCombo(e)) {
+      e.preventDefault();
+      // The chord's modifiers are already down on the host: lift them, or the
+      // game sees Ctrl+Alt+Shift+Esc.
+      flushHeldKeys();
+      send({ t: "k", code: EVDEV.Escape, pressed: true });
+      heldKeys.add(EVDEV.Escape);
+      escFromCombo = true;
+      return;
+    }
     e.preventDefault();
     const code = EVDEV[e.code];
     if (code !== undefined) {
@@ -789,6 +803,14 @@ export function setupCapture({
   const onKeyUp = (e: KeyboardEvent) => {
     if (!captured) return;
     e.preventDefault();
+    // A release in between already lifted the Esc: then this is an ordinary E.
+    if (escFromCombo && e.code === "KeyE") {
+      escFromCombo = false;
+      if (heldKeys.delete(EVDEV.Escape)) {
+        send({ t: "k", code: EVDEV.Escape, pressed: false });
+        return;
+      }
+    }
     const code = EVDEV[e.code];
     if (code !== undefined) {
       send({ t: "k", code, pressed: false });

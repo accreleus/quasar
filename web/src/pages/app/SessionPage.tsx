@@ -58,6 +58,7 @@ import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
 import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../input/launchFullscreen";
+import { sendEscComboEnabled } from "../../input/summonCombo";
 import {
   launchImmersive,
   loadDisplayPreferences,
@@ -891,6 +892,7 @@ function SessionPageBody() {
     keyboardLockAvailable: keyboardLockSupported(),
     lockRefused: kbLockRefused,
     certUntrusted: certTrust === "untrusted-cert",
+    escCombo: sendEscComboEnabled(),
   };
 
   // Host-lost overlay: replaces the normal session UI when the host crashed.
@@ -1158,6 +1160,7 @@ function SessionPageBody() {
             // API "supported" while Esc quits.
             escCertUntrusted={certTrust === "untrusted-cert"}
             escLockRefused={kbLockRefused}
+            escCombo={releaseInputs.escCombo}
             micGranted={state?.micGranted === true}
             micOn={micOn}
             micBusy={micBusy}
