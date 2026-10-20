@@ -268,7 +268,7 @@ describe("useLaunch full screen on Play (#647)", () => {
     localStorage.removeItem(PREFS);
   });
 
-  it("asks for full screen and Keyboard Lock in the click, before the launch request", () => {
+  it("asks for full screen in the click, before the launch request", () => {
     vi.mocked(libraryApi.launchSession).mockImplementation(() => {
       order.push("launch-request");
       return new Promise(() => {});
@@ -277,7 +277,7 @@ describe("useLaunch full screen on Play (#647)", () => {
     act(() => {
       void result.current.launchApp(app);
     });
-    expect(order).toEqual(["fullscreen", "keyboard-lock", "launch-request"]);
+    expect(order).toEqual(["fullscreen", "launch-request"]);
   });
 
   it("quick launch spends the click before awaiting the profiles", () => {
@@ -300,7 +300,7 @@ describe("useLaunch full screen on Play (#647)", () => {
     act(() => {
       void result.current.quickLaunch(app);
     });
-    expect(profilesCalledAfter).toEqual(["fullscreen", "keyboard-lock"]);
+    expect(profilesCalledAfter).toEqual(["fullscreen"]);
   });
 
   it("leaves full screen when the launch fails", async () => {
@@ -315,7 +315,31 @@ describe("useLaunch full screen on Play (#647)", () => {
     expect(document.exitFullscreen).toHaveBeenCalled();
   });
 
-  it("setting off: no full screen, no Keyboard Lock", () => {
+  it("never takes Keyboard Lock at the click: capture owns it (#647 review)", () => {
+    vi.mocked(libraryApi.launchSession).mockImplementation(() => new Promise(() => {}));
+    const { result } = renderLaunch();
+    act(() => {
+      void result.current.launchApp(app);
+    });
+    expect(order).not.toContain("keyboard-lock");
+  });
+
+  it("leaves full screen when the page unmounts mid-launch", async () => {
+    vi.mocked(libraryApi.launchSession).mockImplementation(() => new Promise(() => {}));
+    document.documentElement.requestFullscreen = vi.fn(() => {
+      fsEl = document.documentElement;
+      return Promise.resolve();
+    });
+    const { result, unmount } = renderLaunch();
+    act(() => {
+      void result.current.launchApp(app);
+    });
+    unmount();
+    await act(async () => {});
+    expect(document.exitFullscreen).toHaveBeenCalled();
+  });
+
+  it("setting off: no full screen", () => {
     localStorage.setItem(PREFS, JSON.stringify({ scalingMode: "contain", launchImmersive: false }));
     vi.mocked(libraryApi.launchSession).mockImplementation(() => new Promise(() => {}));
     const { result } = renderLaunch();

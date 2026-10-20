@@ -57,7 +57,7 @@ import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailu
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
-import { enterLaunchFullscreen } from "../../input/launchFullscreen";
+import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../input/launchFullscreen";
 import {
   launchImmersive,
   loadDisplayPreferences,
@@ -863,12 +863,15 @@ function SessionPageBody() {
   useEffect(() => {
     if (inputCaptured) setClickToPlay(false);
   }, [inputCaptured]);
-  // A fresh gesture: full screen again if it was left, then the usual grab.
+  // A fresh gesture: the grab first (requestFullscreen consumes the activation
+  // in Firefox and Safari), then full screen again if it was left.
   const handleClickToPlay = useCallback(() => {
     setClickToPlay(false);
-    enterLaunchFullscreen();
     handleGrab();
+    enterLaunchFullscreen();
   }, [handleGrab]);
+  // Leaving the session leaves the full screen Play entered (a quick switch stays on this page).
+  useEffect(() => () => leaveLaunchFullscreen(), []);
 
   // #434: hold a screen wake lock while the session is LIVE. Liveness is the
   // page's existing notion — the input DataChannel being open is what every

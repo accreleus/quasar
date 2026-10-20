@@ -2,7 +2,7 @@
 // (or offers one "Click to play" layer). Harness copied from SessionPage.test.tsx;
 // the capture mock's engage is a spy and the HUD double exposes its props.
 
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionPage } from "./SessionPage";
@@ -279,7 +279,7 @@ describe("SessionPage — #647 straight-in capture", () => {
     expect(engageSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("shows Click to play, without engaging, when not full screen; the click goes full screen then engages", async () => {
+  it("shows Click to play, without engaging, when not full screen; the click engages and goes full screen", async () => {
     await reveal();
     expect(engageSpy).not.toHaveBeenCalled();
     expect(playLayer()).not.toBeNull();
@@ -290,6 +290,32 @@ describe("SessionPage — #647 straight-in capture", () => {
     expect(requestFullscreen).toHaveBeenCalledTimes(1);
     expect(engageSpy).toHaveBeenCalledTimes(1);
     expect(playLayer()).toBeNull();
+  });
+
+  it("Click to play captures before it asks for full screen (Firefox/Safari spend the click on full screen)", async () => {
+    const order: string[] = [];
+    engageSpy.mockImplementation(() => (order.push("engage"), Promise.resolve({ mode: "pointer-lock" })));
+    requestFullscreen.mockImplementation(() => (order.push("fullscreen"), Promise.resolve()));
+    await reveal();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Click to play"));
+    });
+    expect(order).toEqual(["engage", "fullscreen"]);
+  });
+
+  it("leaving the session leaves the full screen Click to play entered", async () => {
+    requestFullscreen.mockImplementation(() => {
+      fsEl = document.documentElement;
+      return Promise.resolve();
+    });
+    document.exitFullscreen = vi.fn(() => Promise.resolve());
+    await reveal();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Click to play"));
+    });
+    cleanup(); // unmounts the page: the player left the session
+    await advance(10);
+    expect(document.exitFullscreen).toHaveBeenCalledTimes(1);
   });
 
   it("shows Click to play when engage reports failed, and never retries by itself", async () => {

@@ -132,6 +132,8 @@ export function useLaunch({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      // A launch abandoned mid-flight (success clears both refs before navigating).
+      if (launchAbortRef.current || retryTimeoutRef.current !== null) leaveLaunchFullscreen();
       if (retryTimeoutRef.current !== null) {
         clearTimeout(retryTimeoutRef.current);
         retryTimeoutRef.current = null;
@@ -144,7 +146,7 @@ export function useLaunch({
     async (app: App, profileId?: string, streamCodec?: "h264" | "h265" | "av1") => {
       if (!token || launching || inFlightRef.current) return;
       // #647: before the first await, while the click still counts.
-      const immersive = enterLaunchFullscreen();
+      enterLaunchFullscreen();
       inFlightRef.current = true;
       setLaunching(true);
       setWaitingForSlot(false); // clear any stale copy from a previous attempt
@@ -300,7 +302,7 @@ export function useLaunch({
           dismissWaitingToast();
           launchAbortRef.current = null;
           if (!mountedRef.current) return;
-          if (immersive) leaveLaunchFullscreen();
+          leaveLaunchFullscreen();
           if (closingName !== null) {
             // The previous session never finished stopping inside the budget.
             addToast({ variant: "danger", ...closingGaveUpCopy(closingName) });
@@ -354,12 +356,12 @@ export function useLaunch({
         return;
       }
       // #647: the profile fetch below is an await; spend the click first.
-      const immersive = enterLaunchFullscreen();
+      enterLaunchFullscreen();
       setResolvingId(app.id);
       const data = await fetchProfiles(app);
       setResolvingId(null);
       if (!data || !isRecommendationEligible(data)) {
-        if (immersive) leaveLaunchFullscreen();
+        leaveLaunchFullscreen();
         revealDetail(app, false);
         return;
       }
