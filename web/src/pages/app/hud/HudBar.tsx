@@ -27,6 +27,8 @@ export type TelemetryRegistrar = (fn: (snap: TelemetrySnapshot) => void) => () =
 
 export interface HudBarProps {
   barRef: Ref<HTMLDivElement>;
+  /** #647: the timed release line, or null. */
+  releaseHint?: string | null;
   items: HudItems;
   register: TelemetryRegistrar;
   channelOpen: boolean;
@@ -212,6 +214,11 @@ export function HudBar(props: HudBarProps) {
           {items.title && (
             <span className="title" title="Now playing">
               {props.appName}
+            </span>
+          )}
+          {props.releaseHint && (
+            <span className="hud-hint" role="status">
+              {props.releaseHint}
             </span>
           )}
           {items.hint && (

@@ -15,6 +15,7 @@ import { useToast } from "../../../components/Toast";
 import { useResource } from "../../../lib/resource/react";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { SteamDialogsField } from "./SteamDialogsField";
+import { LaunchFullscreenField } from "./LaunchFullscreenField";
 
 interface StreamPrefs {
   profiles: { id: string; name: string }[];
@@ -122,6 +123,10 @@ export function AccountStreaming() {
 
       <div className="grid g2 ac-narrow mt5">
         <SteamDialogsField />
+      </div>
+
+      <div className="mt5">
+        <LaunchFullscreenField />
       </div>
     </div>
   );

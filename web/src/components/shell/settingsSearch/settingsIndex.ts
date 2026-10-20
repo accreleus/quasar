@@ -54,6 +54,11 @@ export const ACCOUNT_SETTINGS: readonly SettingEntry[] = [
     keywords: "steam dialogs controller notice popup dismiss",
     target: { sel: "#steam-dialogs", up: ".field" },
   },
+  {
+    id: "acct-launch-fullscreen", label: "Launch in full screen", where: "Stream quality", icon: "streaming", to: `${A}/streaming`,
+    keywords: "full screen fullscreen capture input mouse lock play launch immersive",
+    target: { sel: "#launch-fullscreen", up: ".ac-sw" },
+  },
   sec("overlay", "In-session overlay", "overlay", "overlay", "hud strip overlay stats"),
   {
     id: "acct-overlay-preset", label: "Overlay content", where: "Overlay", icon: "overlay", to: `${A}/overlay`,

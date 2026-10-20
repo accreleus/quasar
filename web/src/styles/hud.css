@@ -219,6 +219,18 @@
   margin-left: var(--s1);
 }
 
+/* #647 release hint (DESIGN.md override 9): one line in the bar for a few
+   seconds after capture, in the menu hint's type one step brighter. A 39px
+   vertical bar has no room for it. A top-docked strip steps down out of
+   Chromium's top-centre Esc bubble, by the error banner's offset. */
+.hud .hud-hint {
+  font-size: var(--t-xs);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.hud-root[data-axis="v"] .hud-hint { display: none; }
+.hud-root[data-pos="top"][data-hint="true"] .hud { top: 74px; }
+
 /* ---- right cluster: tabs + direct actions ------------------------------ */
 .hud-ctl {
   margin-left: auto;

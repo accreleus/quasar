@@ -29,6 +29,7 @@ import { AccountOverlay } from "../AccountOverlay";
 import { AccountSessions } from "../AccountSessions";
 import { AccountStorage } from "../AccountStorage";
 import { SteamDialogsField } from "../SteamDialogsField";
+import { LaunchFullscreenField } from "../LaunchFullscreenField";
 import { PasswordCard } from "../PasswordCard";
 import { buildCapChips, deviceLabel } from "../DeviceCard";
 import { ONE_PAGE_SECTIONS, sectionForPath, type OneSectionId } from "./sections";
@@ -196,6 +197,9 @@ function StreamSection() {
       </p>
       <div className="os-field mt5">
         <SteamDialogsField />
+      </div>
+      <div className="os-field mt5">
+        <LaunchFullscreenField />
       </div>
     </div>
   );

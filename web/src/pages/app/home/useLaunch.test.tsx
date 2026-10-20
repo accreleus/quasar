@@ -1,7 +1,7 @@
 import { act, renderHook, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as libraryApi from "../../../api/library";
 import { ApiError } from "../../../api/client";
 import type { App } from "../../../api/types";
@@ -240,5 +240,89 @@ describe("useLaunch while the previous session is stopping (#754)", () => {
     });
     expect(libraryApi.launchSession).toHaveBeenCalledTimes(1);
     unmount();
+  });
+});
+
+describe("useLaunch full screen on Play (#647)", () => {
+  const PREFS = "quasar.display.preferences";
+  let order: string[];
+  let fsEl: Element | null;
+
+  beforeEach(() => {
+    order = [];
+    fsEl = null;
+    localStorage.removeItem(PREFS);
+    Object.defineProperty(document, "fullscreenElement", { configurable: true, get: () => fsEl });
+    document.documentElement.requestFullscreen = vi.fn(() => {
+      order.push("fullscreen");
+      return Promise.resolve();
+    });
+    document.exitFullscreen = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "keyboard", {
+      configurable: true,
+      value: { lock: vi.fn(() => (order.push("keyboard-lock"), Promise.resolve())), unlock: vi.fn() },
+    });
+  });
+  afterEach(() => {
+    vi.resetAllMocks();
+    localStorage.removeItem(PREFS);
+  });
+
+  it("asks for full screen and Keyboard Lock in the click, before the launch request", () => {
+    vi.mocked(libraryApi.launchSession).mockImplementation(() => {
+      order.push("launch-request");
+      return new Promise(() => {});
+    });
+    const { result } = renderLaunch();
+    act(() => {
+      void result.current.launchApp(app);
+    });
+    expect(order).toEqual(["fullscreen", "keyboard-lock", "launch-request"]);
+  });
+
+  it("quick launch spends the click before awaiting the profiles", () => {
+    let profilesCalledAfter: string[] = [];
+    const { result } = renderHook(
+      () =>
+        useLaunch({
+          token: "tok",
+          apps: [app],
+          liveSession: null,
+          canDecodeH264: true,
+          fetchProfiles: () => {
+            profilesCalledAfter = [...order];
+            return new Promise(() => {});
+          },
+          revealDetail: () => {},
+        }),
+      { wrapper },
+    );
+    act(() => {
+      void result.current.quickLaunch(app);
+    });
+    expect(profilesCalledAfter).toEqual(["fullscreen", "keyboard-lock"]);
+  });
+
+  it("leaves full screen when the launch fails", async () => {
+    vi.mocked(libraryApi.launchSession).mockImplementation(async () => {
+      fsEl = document.documentElement;
+      throw new ApiError(500, "internal", "boom");
+    });
+    const { result } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app);
+    });
+    expect(document.exitFullscreen).toHaveBeenCalled();
+  });
+
+  it("setting off: no full screen, no Keyboard Lock", () => {
+    localStorage.setItem(PREFS, JSON.stringify({ scalingMode: "contain", launchImmersive: false }));
+    vi.mocked(libraryApi.launchSession).mockImplementation(() => new Promise(() => {}));
+    const { result } = renderLaunch();
+    act(() => {
+      void result.current.launchApp(app);
+    });
+    expect(document.documentElement.requestFullscreen).not.toHaveBeenCalled();
+    expect(order).toEqual([]);
   });
 });

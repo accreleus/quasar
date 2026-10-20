@@ -8,7 +8,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRef } from "react";
-import { Hud, type HudHandle } from "./Hud";
+import { Hud, RELEASE_HINT_MS, type HudHandle } from "./Hud";
 import { EMPTY_SNAPSHOT, type TelemetrySnapshot } from "../../../webrtc/telemetry";
 import { AuthContext, type AuthContextValue } from "../../../auth/context";
 import {
@@ -611,5 +611,34 @@ describe("Hud pill measurement", () => {
     });
 
     expect(bar.reads() - before).toBe(1);
+  });
+});
+
+describe("Hud release hint (#647)", () => {
+  const HINT = "Esc releases input";
+
+  it("shows the hint when capture engages and drops it after about 5 s", () => {
+    vi.useFakeTimers();
+    const view = renderHud({ releaseHint: HINT, inputCaptured: false });
+    expect(screen.queryByText(HINT)).toBeNull();
+    view.rerender(
+      <AuthContext.Provider value={authValue}>
+        <Hud register={view.register} {...base} releaseHint={HINT} inputCaptured />
+      </AuthContext.Provider>,
+    );
+    expect(screen.getByText(HINT)).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(RELEASE_HINT_MS - 1);
+    });
+    expect(screen.getByText(HINT)).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(2);
+    });
+    expect(screen.queryByText(HINT)).toBeNull();
+  });
+
+  it("shows nothing when no hint is given (the setting is off)", () => {
+    renderHud({ releaseHint: null, inputCaptured: true });
+    expect(document.querySelector(".hud-hint")).toBeNull();
   });
 });

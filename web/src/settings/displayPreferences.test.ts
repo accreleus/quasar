@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  launchImmersive,
   loadDisplayPreferences,
   saveDisplayPreferences,
   type DisplayPreferences,
@@ -103,5 +104,17 @@ describe("saveDisplayPreferences", () => {
     saveDisplayPreferences({ scalingMode: "cover" });
     saveDisplayPreferences({ scalingMode: "integer" });
     expect(loadDisplayPreferences().scalingMode).toBe("integer");
+  });
+});
+
+describe("launchImmersive (#647)", () => {
+  it("defaults on, and reads back a stored off", () => {
+    localStorage.removeItem("quasar.display.preferences");
+    expect(launchImmersive()).toBe(true);
+    saveDisplayPreferences({ launchImmersive: false });
+    expect(launchImmersive()).toBe(false);
+    expect(loadDisplayPreferences().scalingMode).toBe("contain");
+    saveDisplayPreferences({ launchImmersive: true });
+    expect(launchImmersive()).toBe(true);
   });
 });
