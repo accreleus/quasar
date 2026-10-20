@@ -246,6 +246,9 @@ const refused = () =>
 const failed = { phase: "failed", attempt: 0, maxAttempts: 3, message: "signaling: session not found or already ended" };
 
 beforeEach(() => {
+  // These tests capture by hand (onGrab); #647's auto-capture at the reveal is off here and
+  // covered in SessionPage.immersive.test.tsx.
+  localStorage.setItem("quasar.display.preferences", JSON.stringify({ scalingMode: "contain", launchImmersive: false }));
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;

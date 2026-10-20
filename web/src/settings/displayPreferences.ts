@@ -18,6 +18,9 @@ export interface DisplayPreferences {
    * persisted (every session starts mic-off).
    */
   preferredMicDeviceId?: string;
+  /** #647: Play goes full screen and the reveal captures input. Per device (a
+   *  phone and a desktop want different things); absent means on. */
+  launchImmersive?: boolean;
 }
 
 const DEFAULT_PREFS: DisplayPreferences = {
@@ -39,7 +42,11 @@ export function loadDisplayPreferences(): DisplayPreferences {
       typeof parsed.preferredMicDeviceId === "string" && parsed.preferredMicDeviceId !== ""
         ? parsed.preferredMicDeviceId
         : undefined;
-    return preferredMicDeviceId ? { scalingMode, preferredMicDeviceId } : { scalingMode };
+    return {
+      scalingMode,
+      ...(preferredMicDeviceId ? { preferredMicDeviceId } : {}),
+      ...(parsed.launchImmersive === false ? { launchImmersive: false } : {}),
+    };
   } catch {
     return { ...DEFAULT_PREFS };
   }
@@ -56,4 +63,9 @@ export function loadDisplayPreferences(): DisplayPreferences {
 export function saveDisplayPreferences(prefs: Partial<DisplayPreferences>): void {
   const merged = { ...loadDisplayPreferences(), ...prefs };
   localStorage.setItem(PREFS_KEY, JSON.stringify(merged));
+}
+
+/** #647: whether a launch goes full screen and captures input on this device. */
+export function launchImmersive(): boolean {
+  return loadDisplayPreferences().launchImmersive !== false;
 }

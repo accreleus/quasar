@@ -37,7 +37,13 @@ import { playoutOverride } from "../../webrtc/playout";
 import type { TelemetrySnapshot } from "../../webrtc/telemetry";
 import { Button } from "../../components/Button";
 import { Hud, type HudHandle } from "./hud/Hud";
-import { NON_STANDARD_PAD_ADVICE, shortGamepadLabel } from "./hud/panes/InputPane";
+import {
+  NON_STANDARD_PAD_ADVICE,
+  escReleases,
+  releaseHint,
+  shortGamepadLabel,
+  type ReleaseInputs,
+} from "./hud/panes/InputPane";
 import { fallbackStreamRungs } from "./StreamResolutionControl";
 import { SessionSwapController } from "./SessionSwapController";
 import {
@@ -51,7 +57,9 @@ import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailu
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
+import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../input/launchFullscreen";
 import {
+  launchImmersive,
   loadDisplayPreferences,
   saveDisplayPreferences,
   type ScalingMode,
@@ -483,13 +491,18 @@ function SessionPageBody() {
 
   // Must toggle, not just request: the drawer's row relabels to "Release
   // input" while captured, and in fallback mode it's a primary way out.
-  const handleGrab = useCallback(() => {
+  const unmute = useCallback(() => {
     if (!videoRef.current) return;
     // Unmute on user gesture (browsers require it for audio autoplay).
     videoRef.current.muted = false;
     void videoRef.current.play();
     // The session's sound too, once revealed: a reload with no click has no activation to unmute it.
     if (revealStartedRef.current && !swapScreenUpRef.current) runtimeRef.current?.releaseAudio();
+  }, []);
+
+  const handleGrab = useCallback(() => {
+    if (!videoRef.current) return;
+    unmute();
 
     // Synchronous truth, not last-rendered state — a gesture handler must not
     // read a stale render (sessionRuntime.isCaptured).
@@ -539,7 +552,7 @@ function SessionPageBody() {
 
     // The HUD collapses itself when capture engages (Hud.tsx): the picture is
     // the point of capturing, and a shelf over it is not.
-  }, [addToast, sessionOver]);
+  }, [addToast, sessionOver, unmute]);
 
   // Mic spec §3.4: enable runs from the button click and is the only path
   // that calls getUserMedia; disable detaches the sender track and stops the device.
@@ -743,7 +756,8 @@ function SessionPageBody() {
   }, []);
 
   // Tracks fullscreen state for the drawer's fullscreen/exit-fullscreen button.
-  const [fullscreen, setFullscreen] = useState(false);
+  // #647: a launch arrives already full screen (the Play click did it).
+  const [fullscreen, setFullscreen] = useState(() => !!document.fullscreenElement);
 
   // AS10-14: on fullscreen exit, release pointer lock if held (correct order per spec:
   // fullscreen is released first by the browser, then we clean up pointer lock).
@@ -815,6 +829,50 @@ function SessionPageBody() {
     [],
   );
 
+  // #647: Play went full screen; capture once the picture shows, with no second
+  // click. Chromium grants Pointer Lock with no fresh gesture while full screen.
+  // Anything else (refused, Esc during the loader, a resume or takeover that
+  // never went full screen) gets one "Click to play" layer, never a retry loop.
+  // Armed again by a quick switch, which spends its own click the same way.
+  const [immersive] = useState(launchImmersive);
+  const autoArmedRef = useRef(immersive);
+  const [clickToPlay, setClickToPlay] = useState(false);
+  useEffect(() => {
+    if (!autoArmedRef.current || !loaderInert || swapScreenUp || sessionOver) return;
+    const rt = runtimeRef.current;
+    if (!rt || !videoRef.current) return; // stays armed for the runtime to arrive
+    autoArmedRef.current = false;
+    if (rt.isCaptured()) return;
+    // No Pointer Lock (touch, gesture mode): engaging needs no gesture at all.
+    if (pointerLockSupported() && !document.fullscreenElement) {
+      setClickToPlay(true);
+      return;
+    }
+    // Sticky activation from the Play click; without one, play() would pause the video.
+    const ua = (navigator as Navigator & { userActivation?: { hasBeenActive: boolean } }).userActivation;
+    if (ua?.hasBeenActive) unmute();
+    const engaging = rt.engage();
+    if (!engaging) {
+      setClickToPlay(true);
+      return;
+    }
+    void engaging.then((result) => {
+      if (result.mode === "failed") setClickToPlay(true);
+    });
+  }, [loaderInert, swapScreenUp, sessionOver, runtimeSnap, unmute]);
+  useEffect(() => {
+    if (inputCaptured) setClickToPlay(false);
+  }, [inputCaptured]);
+  // A fresh gesture: the grab first (requestFullscreen consumes the activation
+  // in Firefox and Safari), then full screen again if it was left.
+  const handleClickToPlay = useCallback(() => {
+    setClickToPlay(false);
+    handleGrab();
+    enterLaunchFullscreen();
+  }, [handleGrab]);
+  // Leaving the session leaves the full screen Play entered (a quick switch stays on this page).
+  useEffect(() => () => leaveLaunchFullscreen(), []);
+
   // #434: hold a screen wake lock while the session is LIVE. Liveness is the
   // page's existing notion — the input DataChannel being open is what every
   // other "we are streaming" decision here keys off (SessionStrip's
@@ -824,6 +882,16 @@ function SessionPageBody() {
   // MUST stay above the hostLost early-return below: hooks cannot be
   // conditional. (A dead host also flips `hostLost`, which drops it anyway.)
   useScreenWakeLock(channelOpen && !stopping && !hostLost);
+
+  // One set of inputs for the Input pane's Esc row and the release hint (#647).
+  const releaseInputs: ReleaseInputs = {
+    pointerLockAvailable: pointerLockSupported(),
+    touchLook: touchLookSupported(),
+    fullscreen,
+    keyboardLockAvailable: keyboardLockSupported(),
+    lockRefused: kbLockRefused,
+    certUntrusted: certTrust === "untrusted-cert",
+  };
 
   // Host-lost overlay: replaces the normal session UI when the host crashed.
   if (hostLost) {
@@ -1058,7 +1126,11 @@ function SessionPageBody() {
         currentApp={currentApp}
         onCommitted={(appId, appName) => setCurrentApp({ id: appId, name: appName })}
         onToast={pushToast}
-        onSwapStart={() => hudRef.current?.close()}
+        onSwapStart={() => {
+          hudRef.current?.close();
+          // #647: the tile click is a gesture; spend it like Play does.
+          if (immersive && enterLaunchFullscreen()) autoArmedRef.current = true;
+        }}
         onScreenChange={setSwapScreenUp}
       >
         {({ quickSwitch, swappingTo }) => (
@@ -1076,11 +1148,8 @@ function SessionPageBody() {
             onRelease={handleRelease}
             pointerLockAvailable={pointerLockSupported()}
             touchLook={touchLookSupported()}
-            // Without Pointer Lock, Esc is capture.ts's own release gesture and
-            // is never forwarded — so it always releases, fullscreen or not.
-            escReleases={
-              !pointerLockSupported() || !fullscreen || !keyboardLockSupported() || kbLockRefused
-            }
+            escReleases={escReleases(releaseInputs)}
+            releaseHint={immersive ? releaseHint(releaseInputs) : null}
             escInsecureContext={pointerLockSupported() && !keyboardLockSupported()}
             // API presence alone cannot see these two, and both used to render
             // the cheerful fullscreen hint exactly where it was wrong: on a
@@ -1124,6 +1193,16 @@ function SessionPageBody() {
           />
         )}
       </SessionSwapController>
+
+      {/* #647: auto-capture was refused or never possible. Under the HUD (z 20),
+          so Exit and the menu stay reachable. */}
+      {clickToPlay && !sessionOver && (
+        <div className="session-play" onClick={handleClickToPlay}>
+          <Button variant="primary" size="lg">
+            Click to play
+          </Button>
+        </div>
+      )}
 
       {/* Touch route into the shelf (UX assessment §2.3): the Ctrl+Alt+Shift+Q
           chord bootstrap can't be pressed on a phone. Shown only on a

@@ -109,6 +109,35 @@ const Gamepads = memo(function Gamepads({ register }: { register: TelemetryRegis
   );
 });
 
+/** What decides how input is released on this device. One set of inputs for the
+ *  Esc row here and the release hint after capture (#647), so they cannot disagree. */
+export interface ReleaseInputs {
+  pointerLockAvailable: boolean;
+  touchLook: boolean;
+  fullscreen: boolean;
+  keyboardLockAvailable: boolean;
+  /** keyboard.lock() was observed refused this session. */
+  lockRefused: boolean;
+  /** Certificate bypassed rather than trusted: Esc capture is unreliable. */
+  certUntrusted: boolean;
+}
+
+/** Whether Esc is browser-owned (or ours) and releases capture. Without Pointer
+ *  Lock, Esc is capture.ts's own release gesture and is never forwarded — so it
+ *  always releases, fullscreen or not. */
+export function escReleases(i: ReleaseInputs): boolean {
+  return !i.pointerLockAvailable || !i.fullscreen || !i.keyboardLockAvailable || i.lockRefused;
+}
+
+/** The one line the HUD shows for a few seconds after capture engages: only
+ *  release actions that work here. */
+export function releaseHint(i: ReleaseInputs): string {
+  if (i.touchLook) return "Tap the session-menu button to release input";
+  if (escReleases(i)) return "Esc releases input";
+  if (i.certUntrusted) return "Ctrl+Alt+Shift+Z releases input · Ctrl+Alt+Shift+Q opens the menu";
+  return "Ctrl+Alt+Shift+Z releases input · Ctrl+Alt+Shift+Q opens the menu · hold Esc to leave full screen";
+}
+
 /** The one sentence that explains what Esc does here, and why. */
 function escNote(props: InputPaneProps): string {
   if (props.touchLook) {

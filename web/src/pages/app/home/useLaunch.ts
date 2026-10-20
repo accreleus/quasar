@@ -24,6 +24,7 @@ import {
 import { isRecommendationEligible } from "../launchOptions";
 import { presentLaunchError } from "../libraryGrid";
 import { useReportLaunching } from "../SteamWarmHeartbeat";
+import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../../input/launchFullscreen";
 
 /** #494's retry-wait timeout, abortable and observable. `timeoutRef` is cleared
  *  on settle so an unmount cleanup can `clearTimeout` it directly; the abort
@@ -131,6 +132,8 @@ export function useLaunch({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      // A launch abandoned mid-flight (success clears both refs before navigating).
+      if (launchAbortRef.current || retryTimeoutRef.current !== null) leaveLaunchFullscreen();
       if (retryTimeoutRef.current !== null) {
         clearTimeout(retryTimeoutRef.current);
         retryTimeoutRef.current = null;
@@ -142,6 +145,8 @@ export function useLaunch({
   const launchApp = useCallback(
     async (app: App, profileId?: string, streamCodec?: "h264" | "h265" | "av1") => {
       if (!token || launching || inFlightRef.current) return;
+      // #647: before the first await, while the click still counts.
+      enterLaunchFullscreen();
       inFlightRef.current = true;
       setLaunching(true);
       setWaitingForSlot(false); // clear any stale copy from a previous attempt
@@ -297,6 +302,7 @@ export function useLaunch({
           dismissWaitingToast();
           launchAbortRef.current = null;
           if (!mountedRef.current) return;
+          leaveLaunchFullscreen();
           if (closingName !== null) {
             // The previous session never finished stopping inside the budget.
             addToast({ variant: "danger", ...closingGaveUpCopy(closingName) });
@@ -340,6 +346,7 @@ export function useLaunch({
       // home are `blockedFamilyIds` and must never resume into a different
       // app's session.
       if (liveSession && liveSession.app_id === app.id) {
+        enterLaunchFullscreen();
         navigate(`/app/session/${liveSession.id}`);
         return;
       }
@@ -348,10 +355,18 @@ export function useLaunch({
         revealDetail(app, false);
         return;
       }
+      // #647: the profile fetch below is an await; spend the click first.
+      enterLaunchFullscreen();
       setResolvingId(app.id);
       const data = await fetchProfiles(app);
+      // Left the page during the check: the click's full screen is not this launch's any more.
+      if (!mountedRef.current) {
+        leaveLaunchFullscreen();
+        return;
+      }
       setResolvingId(null);
       if (!data || !isRecommendationEligible(data)) {
+        leaveLaunchFullscreen();
         revealDetail(app, false);
         return;
       }

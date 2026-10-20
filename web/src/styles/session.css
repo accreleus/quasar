@@ -51,6 +51,18 @@
 .session-summon:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .session-summon:active { background: var(--ink-3); }
 
+/* #647 "Click to play": auto-capture was refused or never possible. Under the
+ * HUD (z 20) so the menu and Exit stay reachable; the whole stage is the target. */
+.session-play {
+  position: fixed;
+  inset: 0;
+  z-index: 19;
+  display: grid;
+  place-items: center;
+  background: var(--modal-scrim);
+  cursor: pointer;
+}
+
 @media (hover: none) and (pointer: coarse) {
   /* Display-gated rather than React-gated so it is `display: none` — and
      therefore absent from the tab order and the accessibility tree — on every

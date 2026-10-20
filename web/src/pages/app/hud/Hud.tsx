@@ -25,6 +25,9 @@ import { InputPane } from "./panes/InputPane";
 import { StatsPane } from "./panes/StatsPane";
 import { DisplayPane } from "./panes/DisplayPane";
 
+/** About 5 s: the strip's 4 s idle grace plus its fade (#647). */
+export const RELEASE_HINT_MS = HUD_IDLE_HIDE_MS + 1000;
+
 /** What SessionPage can ask the HUD to do from outside: the summon chord that
  *  capture.ts answers while the pointer is locked, and the stage click. */
 export interface HudHandle {
@@ -57,6 +60,9 @@ export interface HudProps {
   escLockRefused?: boolean;
   pointerLockAvailable: boolean;
   touchLook: boolean;
+  /** #647: the release line shown in the bar for a few seconds after each
+   *  capture (InputPane `releaseHint`). Null shows nothing. */
+  releaseHint?: string | null;
 
   micGranted: boolean;
   micOn: boolean;
@@ -190,6 +196,20 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
     }),
     [inputCaptured, onRelease, tab, closeShelf],
   );
+
+  // #647: the release hint rides the strip's own post-capture visibility, and
+  // outlives its 4 s by a second so it fades out with the strip, not before it.
+  const hintOn = !!props.releaseHint && !props.preview;
+  const [hinting, setHinting] = useState(false);
+  useEffect(() => {
+    if (!inputCaptured || !hintOn) return;
+    setHinting(true);
+    const timer = setTimeout(() => setHinting(false), RELEASE_HINT_MS);
+    return () => {
+      clearTimeout(timer);
+      setHinting(false);
+    };
+  }, [inputCaptured, hintOn]);
 
   // Capture engaging closes the shelf — the mock's `setCapture(true)` rule.
   // The picture is the point of capturing; a menu over it is not.
@@ -415,6 +435,7 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
       data-open={open ? "true" : "false"}
       data-shelf={tab}
       data-swapping={swapping ? "true" : undefined}
+      data-hint={hinting ? "true" : undefined}
     >
       <div
         className={`hud${hidden ? " hidden" : ""}`}
@@ -452,6 +473,7 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
           swappingTo={props.swappingTo}
           externalSize={props.badgeExternalSize}
           streamAdapting={props.streamAdapting}
+          releaseHint={hinting ? props.releaseHint ?? null : null}
         />
         <Shelf tab={tab} open={open} shelfRef={shelfRef}>
           {open ? pane() : null}
