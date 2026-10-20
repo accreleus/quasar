@@ -58,6 +58,8 @@ export interface HudProps {
   escCertUntrusted?: boolean;
   /** keyboard.lock() was observed refused this session. */
   escLockRefused?: boolean;
+  /** Ctrl+Alt+Shift+E sends Esc to the game (Firefox). */
+  escCombo?: boolean;
   pointerLockAvailable: boolean;
   touchLook: boolean;
   /** #647: the release line shown in the bar for a few seconds after each
@@ -389,6 +391,7 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             escInsecureContext={props.escInsecureContext}
             escCertUntrusted={props.escCertUntrusted}
             escLockRefused={props.escLockRefused}
+            escCombo={props.escCombo}
             pointerLockAvailable={props.pointerLockAvailable}
             touchLook={props.touchLook}
             scalingMode={props.scalingMode}

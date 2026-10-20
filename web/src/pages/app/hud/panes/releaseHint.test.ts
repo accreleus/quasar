@@ -16,12 +16,19 @@ const desktop: ReleaseInputs = {
   keyboardLockAvailable: true,
   lockRefused: false,
   certUntrusted: false,
+  escCombo: false,
 };
 const touch: ReleaseInputs = { ...desktop, pointerLockAvailable: false, touchLook: true, keyboardLockAvailable: false };
 
 const rows: [string, ReleaseInputs, boolean, string][] = [
   ["Chrome / Edge desktop, full screen with Keyboard Lock", desktop, false, CHROME_COMBOS],
-  ["Firefox desktop (no Keyboard Lock)", { ...desktop, keyboardLockAvailable: false }, true, ESC],
+  [
+    "Firefox desktop (no Keyboard Lock; the send-Esc combo)",
+    { ...desktop, keyboardLockAvailable: false, escCombo: true },
+    true,
+    "Esc releases input · Ctrl+Alt+Shift+E sends Esc to the game",
+  ],
+  ["Firefox for Android (touch)", { ...touch, escCombo: true }, true, TOUCH],
   ["Safari macOS (no Keyboard Lock)", { ...desktop, keyboardLockAvailable: false }, true, ESC],
   ["iPadOS Safari (no Pointer Lock, touch)", { ...touch, fullscreen: false }, true, TOUCH],
   ["iPhone Safari (no element full screen, touch)", { ...touch, fullscreen: false }, true, TOUCH],

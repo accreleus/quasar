@@ -1712,3 +1712,57 @@ describe("a Pointer Lock grant that lands after cleanup() (#527)", () => {
     b.cleanup();
   });
 });
+
+describe("Firefox send-Esc combo, Ctrl+Alt+Shift+E (#647)", () => {
+  const FIREFOX = "Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0";
+  const CHROME = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+
+  function captured(ua: string) {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(ua);
+    const video = makeVideo();
+    const send = vi.fn();
+    const cap = setupCapture({ videoEl: video, sendInput: send, onCaptureChange: vi.fn(), channel: makeChannel() });
+    lockPointer(video);
+    return { send, video, cleanup: () => { cap.cleanup(); unlockPointer(); } };
+  }
+
+  it("on Firefox: lifts the held modifiers, holds Esc until the E comes up, never forwards E", () => {
+    const { send, cleanup } = captured(FIREFOX);
+    dispatchKeyDown("ControlLeft", { ctrlKey: true });
+    dispatchKeyDown("AltLeft", { ctrlKey: true, altKey: true });
+    dispatchKeyDown("ShiftLeft", { ctrlKey: true, altKey: true, shiftKey: true });
+    send.mockClear();
+    dispatchKeyDown("KeyE", { ctrlKey: true, altKey: true, shiftKey: true });
+    // evdev: ControlLeft=29, AltLeft=56, ShiftLeft=42, Escape=1, KeyE=18.
+    expect(send.mock.calls.map((c) => c[0])).toEqual([
+      { t: "k", code: 29, pressed: false },
+      { t: "k", code: 56, pressed: false },
+      { t: "k", code: 42, pressed: false },
+      { t: "k", code: 1, pressed: true },
+    ]);
+    send.mockClear();
+    dispatchKeyUp("KeyE");
+    expect(send.mock.calls.map((c) => c[0])).toEqual([{ t: "k", code: 1, pressed: false }]);
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ code: 18 }));
+    cleanup();
+  });
+
+  it("on Chrome: the chord is ordinary keys (Esc already reaches the game there)", () => {
+    const { send, cleanup } = captured(CHROME);
+    dispatchKeyDown("KeyE", { ctrlKey: true, altKey: true, shiftKey: true });
+    expect(send).toHaveBeenCalledWith({ t: "k", code: 18, pressed: true });
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ code: 1 }));
+    cleanup();
+  });
+
+  it("a plain E on Firefox is just an E", () => {
+    const { send, cleanup } = captured(FIREFOX);
+    dispatchKeyDown("KeyE");
+    dispatchKeyUp("KeyE");
+    expect(send.mock.calls.map((c) => c[0])).toEqual([
+      { t: "k", code: 18, pressed: true },
+      { t: "k", code: 18, pressed: false },
+    ]);
+    cleanup();
+  });
+});
