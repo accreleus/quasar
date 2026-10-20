@@ -217,7 +217,7 @@ export function HudBar(props: HudBarProps) {
             </span>
           )}
           {props.releaseHint && (
-            <span className="hud-hint" role="status">
+            <span className="hud-hint" role="status" title={props.releaseHint}>
               {props.releaseHint}
             </span>
           )}

@@ -1145,8 +1145,6 @@ function SessionPageBody() {
             onRelease={handleRelease}
             pointerLockAvailable={pointerLockSupported()}
             touchLook={touchLookSupported()}
-            // Without Pointer Lock, Esc is capture.ts's own release gesture and
-            // is never forwarded — so it always releases, fullscreen or not.
             escReleases={escReleases(releaseInputs)}
             releaseHint={immersive ? releaseHint(releaseInputs) : null}
             escInsecureContext={pointerLockSupported() && !keyboardLockSupported()}

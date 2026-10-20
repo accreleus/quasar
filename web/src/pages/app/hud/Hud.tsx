@@ -17,9 +17,6 @@ import { useOverlayPreferences } from "../../../settings/OverlayPreferencesConte
 import type { ScalingMode } from "../../../settings/displayPreferences";
 import { dockLayout, hudShellPin } from "./hudDock";
 import { HUD_IDLE_HIDE_MS, hudVisible } from "./hudAutoHide";
-
-/** About 5 s: the strip's 4 s idle grace plus its fade. */
-export const RELEASE_HINT_MS = HUD_IDLE_HIDE_MS + 1000;
 import { hudKeyAction, stepTab, type HudKeyAction, type HudTab } from "./hudKeys";
 import { hudItems } from "./hudItems";
 import { HudBar, type TelemetryRegistrar } from "./HudBar";
@@ -27,6 +24,9 @@ import { Shelf } from "./Shelf";
 import { InputPane } from "./panes/InputPane";
 import { StatsPane } from "./panes/StatsPane";
 import { DisplayPane } from "./panes/DisplayPane";
+
+/** About 5 s: the strip's 4 s idle grace plus its fade (#647). */
+export const RELEASE_HINT_MS = HUD_IDLE_HIDE_MS + 1000;
 
 /** What SessionPage can ask the HUD to do from outside: the summon chord that
  *  capture.ts answers while the pointer is locked, and the stage click. */

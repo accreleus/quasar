@@ -227,6 +227,11 @@
   font-size: var(--t-xs);
   color: var(--text-2);
   white-space: nowrap;
+  /* A narrow screen cuts the line, never the controls (the title's rule). */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 0 1 auto;
 }
 .hud-root[data-axis="v"] .hud-hint { display: none; }
 .hud-root[data-pos="top"][data-hint="true"] .hud { top: 74px; }
