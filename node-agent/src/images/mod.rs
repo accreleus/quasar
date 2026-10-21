@@ -2042,20 +2042,17 @@ impl ImageManager {
             self.emit_terminal(image_id);
             return;
         }
-        // An admission refusal reached no engine and removed nothing: ask again.
-        let result = loop {
-            let result = crate::runtime::configured().and_then(|runtime| {
-                runtime
-                    .remove_image(&registry_ref, Duration::from_secs(60))
-                    .wait()
-            });
-            match result {
-                Err(e) if e.kind == crate::runtime::ErrorKind::Busy => {
-                    std::thread::sleep(crate::session::teardown::STOP_PAUSE)
-                }
-                other => break other,
-            }
-        };
+        let timeout = Duration::from_secs(60);
+        let result =
+            match self.submit_until_admitted(image_id, generation, Instant::now() + timeout, || {
+                crate::runtime::configured()
+                    .and_then(|runtime| runtime.remove_image(&registry_ref, timeout).wait())
+            }) {
+                // Superseded while waiting for a slot: nothing was removed and nothing failed.
+                Ok(None) => return,
+                Ok(Some(())) => Ok(()),
+                Err(error) => Err(error),
+            };
         match result {
             Ok(()) => {
                 self.commit(image_id, generation, |rec| rec.mark_absent());
@@ -2129,31 +2126,47 @@ impl ImageManager {
     ) -> Result<Option<u64>, String> {
         let runtime = crate::runtime::configured().map_err(errors::map_runtime_error)?;
         let mut throttle = ProgressThrottle::new();
-        loop {
-            let result = runtime
+        self.submit_until_admitted(image_id, generation, Instant::now() + PULL_TIMEOUT, || {
+            runtime
                 .ensure_image(registry_ref, PULL_TIMEOUT)
                 .wait(|sample| {
                     if throttle.should_emit(Instant::now(), sample.percent) {
                         self.set_pulling(image_id, generation, sample.percent, sample.bytes);
                         self.emit(image_id);
                     }
-                });
-            match result {
+                })
+        })
+        .map(|info| info.map(|info| info.bytes))
+        .map_err(errors::map_runtime_error)
+    }
+
+    /// Submit a runtime call until the client admits it, this op is superseded, or `deadline`
+    /// passes. An admission `Busy` reached no engine and wrote nothing, so it must never end an
+    /// op `failed` (the control plane counts that as one of its attempts): every image op goes
+    /// through here, and the client frees every slot within `permit_hold`.
+    /// `Ok(None)`: a queued op replaced this one while it waited.
+    fn submit_until_admitted<T>(
+        &self,
+        image_id: &str,
+        generation: u64,
+        deadline: Instant,
+        mut call: impl FnMut() -> Result<T, crate::runtime::RuntimeError>,
+    ) -> Result<Option<T>, crate::runtime::RuntimeError> {
+        loop {
+            match call() {
                 Err(e) if e.kind == crate::runtime::ErrorKind::Busy => {
                     std::thread::sleep(crate::session::teardown::STOP_PAUSE);
                     // A resubmitted pull is detached and ignores cancellation, so ask only
-                    // while this op is still the latest intent. A refusal reached no engine,
-                    // so it never ends the pull `failed` (the control plane counts that as an
-                    // attempt); the client frees every slot within `permit_hold`.
+                    // while this op is still the latest intent. Checked before the deadline
+                    // so a queued op is never reported as a busy failure.
                     if !self.is_latest_intent(image_id, generation) {
                         return Ok(None);
                     }
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
                 }
-                other => {
-                    return other
-                        .map(|info| Some(info.bytes))
-                        .map_err(errors::map_runtime_error)
-                }
+                other => return other.map(Some),
             }
         }
     }
@@ -2202,7 +2215,9 @@ impl ImageManager {
             build_args,
             deadline,
         ) {
-            Ok(bytes) => {
+            // Superseded while waiting for a slot: nothing was built and nothing failed.
+            Ok(None) => return,
+            Ok(Some(bytes)) => {
                 self.commit(image_id, generation, |rec| rec.mark_ready(bytes));
                 info!("image {image_id} ({local_tag}) built: ready ({bytes} bytes), version {version}");
                 self.notify_ready(image_id, local_tag, version);
@@ -2232,7 +2247,7 @@ impl ImageManager {
         dockerfile: &str,
         build_args: &BTreeMap<String, String>,
         deadline: Instant,
-    ) -> Result<u64, String> {
+    ) -> Result<Option<u64>, String> {
         let scratch = self.build_scratch_dir(image_id, generation);
         // Clear any stale dir from a crashed prior build.
         let _ = std::fs::remove_dir_all(&scratch);
@@ -2307,19 +2322,24 @@ impl ImageManager {
         generation: u64,
         request: crate::runtime::BuildRequest,
         deadline: Instant,
-    ) -> Result<u64, String> {
+    ) -> Result<Option<u64>, String> {
         let runtime = crate::runtime::configured().map_err(errors::map_runtime_error)?;
         let mut throttle = ProgressThrottle::new();
-        runtime
-            .build_image(request, deadline.saturating_duration_since(Instant::now()))
-            .wait(|sample| {
-                if throttle.should_emit(Instant::now(), sample.percent) {
-                    self.set_building(image_id, generation, Some(sample.percent));
-                    self.emit(image_id);
-                }
-            })
-            .map(|image| image.bytes)
-            .map_err(errors::map_runtime_error)
+        self.submit_until_admitted(image_id, generation, deadline, || {
+            runtime
+                .build_image(
+                    request.clone(),
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .wait(|sample| {
+                    if throttle.should_emit(Instant::now(), sample.percent) {
+                        self.set_building(image_id, generation, Some(sample.percent));
+                        self.emit(image_id);
+                    }
+                })
+        })
+        .map(|image| image.map(|image| image.bytes))
+        .map_err(errors::map_runtime_error)
     }
 
     /// Apply a transition only if this worker still owns the slot at its generation.
@@ -2512,7 +2532,7 @@ impl ImageManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn mgr() -> Arc<ImageManager> {
@@ -3828,7 +3848,7 @@ mod tests {
     /// (running `test`, `mode` in `QUASAR_IMAGES_ENGINE_CHILD`) pointed at a socket this
     /// process serves: `/version`, then `image` (after `delay`) for every other request:
     /// 404, 500, or never answered. Returns how many such requests the child made.
-    fn run_against_fake_engine(
+    pub(crate) fn run_against_fake_engine(
         test: &str,
         mode: &str,
         image: Option<(u16, &str)>,
@@ -3902,7 +3922,7 @@ mod tests {
         inspects
     }
 
-    fn engine_child_mode() -> Option<String> {
+    pub(crate) fn engine_child_mode() -> Option<String> {
         std::env::var("QUASAR_IMAGES_ENGINE_CHILD").ok()
     }
 
@@ -4112,6 +4132,55 @@ mod tests {
         let reply = Some((404, r#"{"message":"No such image"}"#));
         let served = run_against_fake_engine(THIS, "remove-busy", reply, Duration::ZERO);
         assert!(served >= 5, "four held inspects, then the remove: {served}");
+    }
+
+    /// #691: a build refused a slot asks again instead of ending `failed` "runtime busy", which
+    /// the control plane counts as an attempt although no engine was reached.
+    #[test]
+    fn a_build_refused_a_slot_waits_for_one() {
+        const THIS: &str = "images::tests::a_build_refused_a_slot_waits_for_one";
+        if engine_child_mode().is_some() {
+            let runtime = crate::runtime::configured().unwrap();
+            let _held: Vec<_> = (0..4)
+                .map(|i| {
+                    runtime
+                        .image_present_within(format!("ghcr.io/x/hang:{i}"), Duration::from_secs(1))
+                })
+                .collect();
+            let context = tempfile::tempdir().unwrap();
+            std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+            let m = ImageManager::empty_for_test();
+            m.ops.lock().unwrap().insert(
+                "steam".into(),
+                OpSlot {
+                    running: ImageOp::Remove,
+                    generation: 1,
+                    pending: None,
+                },
+            );
+            let request = crate::runtime::BuildRequest {
+                tag: "quasar/steam:test".into(),
+                context_dir: context.path().to_path_buf(),
+                dockerfile: "Dockerfile".into(),
+                build_args: BTreeMap::new(),
+            };
+            let outcome = m.build_with_progress(
+                "steam",
+                1,
+                request,
+                Instant::now() + Duration::from_secs(30),
+            );
+            assert_ne!(
+                outcome,
+                Err(errors::map_runtime_error(
+                    crate::runtime::ErrorKind::Busy.into()
+                ))
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = run_against_fake_engine(THIS, "build-busy", reply, Duration::ZERO);
+        assert!(served >= 4, "four held inspects, then the build: {served}");
     }
 
     /// #691: the `absent` of a demotion with the op map full is retried on the heartbeat

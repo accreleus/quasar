@@ -1,5 +1,6 @@
 //! Engine facade specifications at the crate's public boundary.
 use super::*;
+use crate::LAUNCH_BUSY_BUDGET;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -598,6 +599,24 @@ fn a_hung_call_frees_its_slot_after_the_hold_and_keeps_running() {
     assert!(admitted.recv_timeout(Duration::from_millis(100)).is_err());
     // The hung call itself is untouched by the release.
     assert!(hung.recv_timeout(Duration::from_millis(50)).is_err());
+}
+
+/// #691: a zero hold turns admission off; a hold at or past the launch's wait lets a waiter
+/// give up before a slot frees.
+#[test]
+fn a_permit_hold_outside_zero_to_the_launch_wait_is_refused() {
+    for hold in [Duration::ZERO, LAUNCH_BUSY_BUDGET, LAUNCH_BUSY_BUDGET * 2] {
+        let mut config = RuntimeConfig::unix("/run/quasar-test.sock");
+        config.permit_hold = hold;
+        assert_eq!(
+            RuntimeClient::new(config).err().map(|e| e.kind),
+            Some(ErrorKind::InvalidConfiguration),
+            "{hold:?}"
+        );
+    }
+    let mut config = RuntimeConfig::unix("/run/quasar-test.sock");
+    config.permit_hold = LAUNCH_BUSY_BUDGET - Duration::from_millis(1);
+    assert!(RuntimeClient::new(config).is_ok());
 }
 
 #[test]

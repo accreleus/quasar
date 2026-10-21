@@ -170,6 +170,28 @@ impl RetryBudget {
     }
 }
 
+/// Ask `call` again while the runtime client refuses it a slot, until `budget` is spent. An
+/// admission `Busy` reached no engine and wrote nothing, so a launch step that meets one waits
+/// like the launch's image preparation does (`LAUNCH_BUSY_BUDGET`) instead of failing the session.
+pub fn retry_busy<T>(
+    budget: &RetryBudget,
+    pause: Duration,
+    mut call: impl FnMut() -> Result<T, crate::runtime::RuntimeError>,
+) -> Result<T, crate::runtime::RuntimeError> {
+    loop {
+        match call() {
+            Err(error) if error.kind == ErrorKind::Busy && budget.live() => {
+                tracing::warn!(
+                    token = "launch-container-busy",
+                    "a container step was refused a runtime slot; asking again"
+                );
+                std::thread::sleep(pause);
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Outcome of one attempt to stop the app container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopAttempt {
@@ -598,6 +620,46 @@ mod tests {
         assert_eq!(got, StopAttempt::Retryable);
         assert_eq!(calls, 1, "the engine is still asked once");
         assert_eq!(pauses, 0, "but nothing waits on a spent budget");
+    }
+
+    #[test]
+    fn a_launch_step_refused_a_slot_waits_for_one() {
+        let budget = RetryBudget::new(Duration::from_secs(5));
+        let mut refusals = 2;
+        let got = retry_busy(&budget, Duration::ZERO, || {
+            if refusals > 0 {
+                refusals -= 1;
+                return Err(ErrorKind::Busy.into());
+            }
+            Ok(7)
+        });
+        assert_eq!(got.unwrap(), 7);
+    }
+
+    #[test]
+    fn a_launch_step_never_admitted_fails_with_the_refusal_after_its_budget() {
+        let now = Arc::new(Mutex::new(Duration::ZERO));
+        let budget = RetryBudget::fake(Duration::from_secs(5), now.clone());
+        let mut calls = 0;
+        let got: Result<(), _> = retry_busy(&budget, Duration::ZERO, || {
+            calls += 1;
+            *now.lock().unwrap() += Duration::from_secs(1);
+            Err(ErrorKind::Busy.into())
+        });
+        assert_eq!(got.unwrap_err().kind, ErrorKind::Busy);
+        assert_eq!(calls, 6, "the budget armed at the first refusal, then 5 s");
+    }
+
+    #[test]
+    fn a_launch_step_does_not_retry_an_answer_from_the_engine() {
+        let budget = RetryBudget::new(Duration::from_secs(5));
+        let mut calls = 0;
+        let got: Result<(), _> = retry_busy(&budget, Duration::ZERO, || {
+            calls += 1;
+            Err(ErrorKind::Unavailable.into())
+        });
+        assert_eq!(got.unwrap_err().kind, ErrorKind::Unavailable);
+        assert_eq!(calls, 1);
     }
 
     #[test]

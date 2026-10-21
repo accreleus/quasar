@@ -128,6 +128,8 @@ impl RuntimeClient {
             || config.deadline.is_zero()
             || config.max_in_flight == 0
             || config.max_in_flight > Semaphore::MAX_PERMITS
+            || config.permit_hold.is_zero()
+            || config.permit_hold >= crate::LAUNCH_BUSY_BUDGET
             || std::time::Instant::now()
                 .checked_add(config.deadline)
                 .is_none()

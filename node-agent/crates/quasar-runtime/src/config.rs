@@ -6,6 +6,12 @@ use std::{path::PathBuf, time::Duration};
 /// Docker's default engine socket, and the endpoint when nothing else is found.
 pub const DOCKER_DEFAULT_SOCKET: &str = "/var/run/docker.sock";
 
+/// How long a launch keeps asking after the client refused it a slot (`Busy`). It is the
+/// shortest wait of any caller, so `RuntimeConfig::permit_hold` must stay below it: a slot
+/// frees within one hold, and a waiter that gives up first would fail on a refusal that
+/// reached no engine (#691). `RuntimeClient::new` refuses a hold that is not below it.
+pub const LAUNCH_BUSY_BUDGET: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub socket: PathBuf,

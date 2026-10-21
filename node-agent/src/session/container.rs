@@ -62,6 +62,30 @@ use anyhow::{anyhow, Context, Result};
 use crate::messages::AppExitPolicy;
 use crate::nvidia_volume::VolumeInfo;
 use crate::runtime::{ApplicationId, ApplicationMount, ApplicationRequest};
+use crate::session::teardown::{retry_busy, RetryBudget, STOP_PAUSE};
+
+/// The launch's image step, waiting out an admission refusal within `budget`.
+fn ensure_launch_image(
+    runtime: &crate::runtime::RuntimeClient,
+    request: &ApplicationRequest,
+    budget: &RetryBudget,
+) -> Result<()> {
+    if request.pull_never {
+        anyhow::ensure!(
+            retry_busy(budget, STOP_PAUSE, || runtime
+                .image_present(&request.image)
+                .wait())?,
+            "required local application image is missing"
+        );
+    } else {
+        retry_busy(budget, STOP_PAUSE, || {
+            runtime
+                .ensure_image(request.image.clone(), Duration::from_secs(300))
+                .wait(|_| {})
+        })?;
+    }
+    Ok(())
+}
 
 /// A launch whose response or retirement is uncertain. The operation is the only
 /// identity allowed to reconcile it. Writable bind sources are retained as well as the
@@ -1346,32 +1370,31 @@ impl ContainerRuntime {
         let mut request = application_request_from_args(&args, operation.clone())?;
         request.unmount_nvidia_params = systempaths_unconfined;
         let runtime = crate::runtime::configured().map_err(|error| anyhow!(error))?;
+        // One allowance for the whole launch step: a refusal reached no engine, so it waits
+        // for a slot as the launch's image preparation does instead of failing the session.
+        let budget = RetryBudget::new(crate::runtime::LAUNCH_BUSY_BUDGET);
         // Do not mint this attempt until every older writer for this name or
         // normalized managed-home source has been explicitly retired. RuntimeClient
         // reconciles only the recorded stable operation.
         retire_matching_pending_applications(&name, &request, |operation| {
-            runtime
-                .abandon_application(operation.to_owned())
-                .wait()
-                .map_err(|error| anyhow!(error))
+            retry_busy(&budget, STOP_PAUSE, || {
+                runtime.abandon_application(operation.to_owned()).wait()
+            })
+            .map_err(|error| anyhow!(error))
         })?;
-        if request.pull_never {
-            anyhow::ensure!(
-                runtime.image_present(&request.image).wait()?,
-                "required local application image is missing"
-            );
-        } else {
-            runtime
-                .ensure_image(request.image.clone(), Duration::from_secs(300))
-                .wait(|_| {})?;
-        }
-        let application = match runtime.start_application(request.clone()).wait() {
+        ensure_launch_image(runtime, &request, &budget)?;
+        let application = match retry_busy(&budget, STOP_PAUSE, || {
+            runtime.start_application(request.clone()).wait()
+        }) {
             Ok(application) => application,
             Err(error) => {
                 // Start may have created or started the exact operation before
                 // its reply was lost. Persist retirement by operation rather
                 // than removing by name, which could hit somebody else's container.
-                let abandon = runtime.abandon_application(operation.clone()).wait().err();
+                let abandon = retry_busy(&budget, STOP_PAUSE, || {
+                    runtime.abandon_application(operation.clone()).wait()
+                })
+                .err();
                 if abandon.is_some() {
                     retain_pending_application(name.clone(), &request, operation);
                 }
@@ -2454,6 +2477,54 @@ mod tests {
             vec!["seccomp={\"defaultAction\":\"SCMP_ACT_ERRNO\"}"]
         );
         assert_eq!(request.command, vec!["--arg"]);
+    }
+
+    /// #574: the launch's image step, refused a slot by four calls that have no answer yet,
+    /// waits for one and reads the engine's answer instead of failing the session "busy".
+    #[test]
+    fn a_launch_image_step_refused_a_slot_waits_for_one() {
+        const THIS: &str =
+            "session::container::tests::a_launch_image_step_refused_a_slot_waits_for_one";
+        if crate::images::tests::engine_child_mode().is_some() {
+            let runtime = crate::runtime::configured().unwrap();
+            let _held: Vec<_> = (0..4)
+                .map(|i| {
+                    runtime
+                        .image_present_within(format!("ghcr.io/x/hang:{i}"), Duration::from_secs(1))
+                })
+                .collect();
+            let args: Vec<String> = [
+                "run",
+                "-d",
+                "--name",
+                "quasar-sess-s1",
+                "--pull=never",
+                "image:test",
+            ]
+            .map(String::from)
+            .into();
+            let request = application_request_from_args(&args, "application-s1".into()).unwrap();
+            assert!(request.pull_never);
+            let error =
+                ensure_launch_image(runtime, &request, &RetryBudget::new(Duration::from_secs(5)))
+                    .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "required local application image is missing"
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = crate::images::tests::run_against_fake_engine(
+            THIS,
+            "launch-busy",
+            reply,
+            Duration::ZERO,
+        );
+        assert!(
+            served >= 5,
+            "four held inspects, then the launch's: {served}"
+        );
     }
 
     #[test]
