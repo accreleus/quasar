@@ -4120,8 +4120,9 @@ mod tests {
     fn a_dropped_absent_from_a_demotion_is_delivered_later() {
         let m = ready_manager();
         let (tx, mut rx) = mpsc::channel(1);
+        let _guard = m.attach_upstream(tx.clone());
+        while rx.try_recv().is_ok() {}
         tx.try_send(ack("filler".into(), true, None)).unwrap();
-        let _guard = m.attach_upstream(tx);
         for i in 0..MAX_CONCURRENT_OPS {
             m.ops.lock().unwrap().insert(
                 format!("other{i}"),
