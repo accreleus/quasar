@@ -75,6 +75,9 @@ static CONSOLE_ENABLED: AtomicBool = AtomicBool::new(false);
 /// `powered_connectors`).
 static CONSOLE_CONFIG_SEEN: AtomicBool = AtomicBool::new(false);
 
+/// Whether the "no console settings yet" line has been logged (once per process).
+static CONFIG_WAIT_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// `QUASAR_CONSOLE_INPUT_SOURCE`, parsed once.
 static INPUT_PIN: OnceLock<Option<u8>> = OnceLock::new();
 
@@ -233,6 +236,13 @@ pub(crate) fn powered_connectors(connected: Vec<String>) -> Vec<String> {
     // config_update follows register on every connection; the hotplug poll then
     // reports the display if it is on.
     if !CONSOLE_CONFIG_SEEN.load(Ordering::Relaxed) {
+        if !connected.is_empty() && !CONFIG_WAIT_LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                token = "console-display-awaits-config",
+                "console: no console settings from the control plane yet; reporting no \
+                 display until they arrive"
+            );
+        }
         return Vec::new();
     }
     // #411: console gate first — with console mode off nothing consumes the

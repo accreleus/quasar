@@ -135,8 +135,8 @@ func (h *Handler) WithTrustedProxies(nets []*net.IPNet) *Handler {
 // crash-loop backoff. In-memory only — a control-plane restart just makes the
 // next capacity report a fresh baseline.
 //
-// Accepted growth (#406): lastConnectors and backoff are never deleted (one
-// small entry per host ever enrolled). No eviction on disconnect, on purpose:
+// Accepted growth (#406): lastConnectors, lastReportAt, lastEndAt and backoff
+// are never deleted (one small entry per host ever enrolled). No eviction on disconnect, on purpose:
 // console state must survive a reconnect, and clearing the crash-loop counter
 // there would let a hot-looping host reset its backoff by reconnecting. The
 // bound is distinct-hosts-per-process-lifetime, fleet-sized.
@@ -1904,6 +1904,8 @@ func (h *Handler) ConsoleSessionTerminated(ctx context.Context, hostID, sessionI
 	// there: while a console session drives the display the agent skips the
 	// monitor-power read (#458), so it reads "present" even with the monitor off.
 	// The agent reports afresh as soon as a session ends; that report decides.
+	// lastReportAt is this process's clock and endedAt the database's; a skew
+	// can only delay a relaunch to the next report, never add one.
 	endedAt, userStopped := h.events.ConsoleSessionEnded(ctx, sessionID)
 
 	h.consoleAuto.mu.Lock()

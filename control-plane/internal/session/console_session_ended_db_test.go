@@ -43,7 +43,8 @@ func TestConsoleSessionEndedHoldsOnlyAUserStoppedConsoleSession(t *testing.T) {
 			t.Errorf("%s: no end time", c.name)
 		}
 	}
-	if endedAt, held := coord.ConsoleSessionEnded(ctx, "00000000-0000-0000-0000-000000000000"); held || !endedAt.IsZero() {
-		t.Errorf("unknown session: endedAt=%v held=%v, want zero and false", endedAt, held)
+	// A failed read fails closed: "ended now", so no report from before it counts.
+	if endedAt, held := coord.ConsoleSessionEnded(ctx, "00000000-0000-0000-0000-000000000000"); held || endedAt.IsZero() {
+		t.Errorf("unknown session: endedAt=%v held=%v, want a time and false", endedAt, held)
 	}
 }

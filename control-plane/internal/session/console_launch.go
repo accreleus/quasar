@@ -190,7 +190,10 @@ func (c *Coordinator) ConsoleSessionActive(ctx context.Context, sessionID string
 func (c *Coordinator) ConsoleSessionEnded(ctx context.Context, sessionID string) (time.Time, bool) {
 	sess, err := c.store.Get(ctx, sessionID)
 	if err != nil {
-		return time.Time{}, false
+		// Fail closed: "ended now" makes self-heal wait for the agent's next
+		// report (at most 15 s) rather than relaunch from one that may be stale.
+		c.log.Warn("console self-heal: read the ended session failed", "session_id", sessionID, "err", err)
+		return time.Now(), false
 	}
 	var endedAt time.Time
 	if sess.EndedAt != nil {
