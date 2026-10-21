@@ -2140,3 +2140,143 @@ fn each_socket_answers_status_only_for_attempts_submitted_on_it() {
     assert_eq!(mine(read("agent/agent.sock", &by_id)), None);
     assert_eq!(mine(read("agent/agent.sock", "")), None);
 }
+
+/// `seed.json` cannot be written: a directory sits where its temporary file goes.
+fn block_seed_file(lab: &Lab) {
+    std::fs::create_dir(lab.dir.path().join("seed.json.tmp")).unwrap();
+}
+
+fn unblock_seed_file(lab: &Lab) {
+    let _ = std::fs::remove_dir(lab.dir.path().join("seed.json.tmp"));
+}
+
+/// The journal as a successor on a newer release left it: `component` at a recipe revision
+/// no actor of the old image carries.
+fn journal_a_revision_the_old_actor_lacks(lab: &Lab, component: &str) {
+    let path = lab.dir.path().join("journal").join(format!("{ID}.json"));
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for step in journal["steps"].as_array_mut().unwrap() {
+        if step["name"] == component {
+            step["revision"] = 99.into();
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+}
+
+#[test]
+fn a_stale_seed_json_never_lets_an_older_actor_continue_a_step_it_cannot_render() {
+    for phase in [
+        Phase::OldKept,
+        Phase::Created,
+        Phase::Started,
+        Phase::Verifying,
+    ] {
+        let at = format!("every actor removed during the agent's {phase:?}");
+        let lab = Lab::new();
+        let agent = lab.container(names::NODE_AGENT);
+        block_seed_file(&lab);
+        let mut fired = false;
+        lab.on(move |lab, who, component, p| {
+            if fired || who != Who::New || component != "node-agent" || p != phase {
+                return false;
+            }
+            fired = true;
+            journal_a_revision_the_old_actor_lacks(lab, "node-agent");
+            lab.remove_every_actor();
+            true
+        });
+        lab.submit(request(vec![actor_component(), agent_component()]))
+            .unwrap();
+        lab.wait_until(&at, |lab| {
+            lab.actors().is_empty() && lab.procs.lock().unwrap().is_empty()
+        });
+        // The hand-over verified, and the write that should have said so failed.
+        assert_eq!(
+            lab.seed_file().recovery_actor_image.reference(),
+            ACTOR_IMAGE,
+            "{at}"
+        );
+        assert!(
+            matches!(lab.seed_step(), seed::Outcome::Created { .. }),
+            "{at}"
+        );
+        let result = lab.outcome(&at);
+        assert_eq!(result.state, State::Failed, "{at}: {result:?}");
+        assert_eq!(result.reason, Some(Reason::RecipeUnsupported), "{at}");
+        assert!(result.restored, "{at}: {result:?}");
+        // The actor the seed made runs what the file names, and the agent it cannot
+        // render is the one it had before the attempt.
+        lab.assert_one_actor(ACTOR_IMAGE, &at);
+        let now = lab.container(names::NODE_AGENT);
+        assert_eq!(now.id, agent.id, "{at}");
+        assert_eq!(now.status, "running", "{at}");
+        assert_eq!(
+            lab.engine.state().containers.len(),
+            3,
+            "{at}: no new agent is left"
+        );
+    }
+}
+
+#[test]
+fn a_verified_successor_writes_seed_json_when_its_attempt_ends_so_a_removal_then_is_harmless() {
+    let lab = Lab::new();
+    block_seed_file(&lab);
+    let mut fired = false;
+    lab.on(move |lab, who, component, phase| {
+        if !fired && who == Who::New && component == "node-agent" && phase == Phase::Pulling {
+            fired = true;
+            // The disk is writable again by the time the next component runs.
+            unblock_seed_file(lab);
+        }
+        false
+    });
+    lab.submit(request(vec![actor_component(), agent_component()]))
+        .unwrap();
+    let result = lab.outcome("healed at the end of the attempt");
+    // `assert_succeeded` includes: seed.json names the successor.
+    assert_succeeded(&lab, &result, "healed at the end of the attempt");
+
+    lab.remove_every_actor();
+    assert!(matches!(lab.seed_step(), seed::Outcome::Created { .. }));
+    let result = lab.outcome("removed after the attempt");
+    assert_succeeded(&lab, &result, "removed after the attempt");
+    assert_eq!(lab.container(names::NODE_AGENT).spec.image, NEW_AGENT);
+}
+
+#[test]
+fn a_verified_successor_that_could_not_write_seed_json_writes_it_at_its_next_start() {
+    let lab = Lab::new();
+    block_seed_file(&lab);
+    hand_over(&lab);
+    let result = lab.outcome("stale at the end");
+    assert_eq!(result.state, State::Succeeded, "{result:?}");
+    assert_eq!(
+        lab.seed_file().recovery_actor_image.reference(),
+        ACTOR_IMAGE,
+        "the write was still blocked"
+    );
+    unblock_seed_file(&lab);
+    lab.restart_daemon();
+    lab.wait_until("seed.json healed at the start", |lab| {
+        lab.seed_file().recovery_actor_image.reference() == NEW_ACTOR
+    });
+}
+
+#[test]
+fn an_actor_no_attempt_shows_verified_leaves_seed_json_alone() {
+    let lab = Lab::new();
+    // The actor the seed made runs what the file names; a file that names another image
+    // is not rewritten by it.
+    let mut file = lab.seed_file();
+    file.recovery_actor_image = file::ActorImage::parse(NEW_ACTOR).unwrap();
+    std::fs::write(
+        lab.dir.path().join("seed.json"),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+    lab.restart_daemon();
+    lab.wait_until("the actor started again", |lab| lab.serving().is_some());
+    assert_eq!(lab.seed_file(), file);
+}

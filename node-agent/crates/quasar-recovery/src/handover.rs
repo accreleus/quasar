@@ -925,7 +925,7 @@ impl Actor {
             ),
             Err(e) => warn!(
                 token = "actor-seed-file-not-updated",
-                "seed.json could not be updated ({e}); a seed would re-create the previous verified actor"
+                "seed.json could not be updated ({e}); a seed would re-create the previous verified actor until this actor writes it again, at the end of the attempt or at its next start"
             ),
         }
     }
