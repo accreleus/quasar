@@ -853,7 +853,7 @@ with the daemon's advertised range. Missing/malformed version facts or an empty
 intersection fail explicitly. This range is a protocol requirement, not a claim
 that every engine configuration was tested. Read operations have a 30-second total
 deadline; one process-owned executor admits at most four simultaneous operations
-and reports busy rather than accumulating an unbounded queue. Assignment pulls
+and reports busy rather than accumulating an unbounded queue; an operation stops counting against those four after three seconds (it keeps running under its own deadline), so an engine that never answers cannot hold a caller out for longer. Assignment pulls
 have a ten-minute budget, catalog pulls thirty minutes and removals one minute.
 The existing catalog queue still admits two simultaneous pulls/builds, serializes
 each image ID and retains only its latest pending replacement.

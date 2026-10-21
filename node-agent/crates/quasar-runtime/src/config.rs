@@ -11,6 +11,10 @@ pub struct RuntimeConfig {
     pub socket: PathBuf,
     pub deadline: Duration,
     pub max_in_flight: usize,
+    /// How long one operation counts against `max_in_flight`. A call still running after it
+    /// (a pull, or an engine that accepted and never answers) goes on under its own deadline
+    /// but frees its slot, so a hung call never keeps a waiting caller out for longer than this.
+    pub permit_hold: Duration,
     /// Directory for the durable operation state of adapters layered on the client
     /// (image, application and helper journals). `None` refuses those operations.
     pub image_state_path: Option<PathBuf>,
@@ -26,6 +30,7 @@ impl RuntimeConfig {
             socket: socket.into(),
             deadline: Duration::from_secs(30),
             max_in_flight: 4,
+            permit_hold: Duration::from_secs(3),
             image_state_path: None,
             registry_config_path: None,
             #[cfg(feature = "test-support")]

@@ -575,6 +575,31 @@ fn a_docker_stop_is_read_back_and_repeated_only_while_it_runs() {
     assert!(result.is_ok(), "{result:?}");
 }
 
+/// #691: an engine that accepts and never answers must not keep a slot from a caller that is
+/// waiting for one, whatever the budget of the call that hangs.
+#[test]
+fn a_hung_call_frees_its_slot_after_the_hold_and_keeps_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silent.sock");
+    let _listener = UnixListener::bind(&path).unwrap();
+    let mut config = RuntimeConfig::unix(path);
+    config.max_in_flight = 1;
+    config.permit_hold = Duration::from_millis(100);
+    let runtime = RuntimeClient::new(config).unwrap();
+    let hung = runtime.submit_owned(
+        std::future::pending::<Result<(), RuntimeError>>(),
+        Duration::from_secs(30),
+        true,
+    );
+    assert_eq!(runtime.discover().wait().unwrap_err().kind, ErrorKind::Busy);
+    std::thread::sleep(Duration::from_millis(300));
+    let admitted = runtime.discover();
+    // Admitted (still waiting on the silent engine), not refused.
+    assert!(admitted.recv_timeout(Duration::from_millis(100)).is_err());
+    // The hung call itself is untouched by the release.
+    assert!(hung.recv_timeout(Duration::from_millis(50)).is_err());
+}
+
 #[test]
 fn clients_on_a_shared_handle_keep_their_own_admission_and_validation() {
     let shared = tokio::runtime::Builder::new_multi_thread()
