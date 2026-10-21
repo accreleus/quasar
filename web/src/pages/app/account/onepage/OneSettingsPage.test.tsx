@@ -137,6 +137,26 @@ describe("stream default", () => {
     expect(select().value).toBe("");
     expect(select()).not.toBeDisabled();
   });
+
+  it("says the admin's default, not the stored one, while overrides are off (#721)", async () => {
+    api.getProfilePreferences.mockResolvedValue({
+      default_profile_id: "p-sharp",
+      global_default_profile_id: "p-fast",
+      user_overrides_allowed: false,
+    });
+    renderPage();
+    await waitFor(() => expect(status()).toHaveTextContent("Now: Fast."));
+  });
+
+  it("says the stored default while overrides are on", async () => {
+    api.getProfilePreferences.mockResolvedValue({
+      default_profile_id: "p-sharp",
+      global_default_profile_id: "p-fast",
+      user_overrides_allowed: true,
+    });
+    renderPage();
+    await waitFor(() => expect(status()).toHaveTextContent("Now: Sharp."));
+  });
 });
 
 describe("devices", () => {
