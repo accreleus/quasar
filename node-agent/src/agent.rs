@@ -242,7 +242,11 @@ pub async fn run(cfg: Config) {
     // identity-unknown (agent-api.md §register).
     let runtime = {
         let (runtime, facts) = offload_probe(move || {
-            let facts = crate::buildinfo::discover(&runtime);
+            let facts = crate::buildinfo::discover(
+                &runtime,
+                crate::buildinfo::owned_socket().as_deref(),
+                crate::buildinfo::ACTOR_REGISTER_BUDGET,
+            );
             (runtime, facts)
         })
         .await;
@@ -1890,7 +1894,11 @@ async fn diagnostic_connection(
     let images = crate::images::register_images_from_state(&cfg.image_state_path());
     let install = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover(&runtime)
+        crate::buildinfo::discover(
+            &runtime,
+            crate::buildinfo::owned_socket().as_deref(),
+            crate::buildinfo::ACTOR_REGISTER_BUDGET,
+        )
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
@@ -2015,10 +2023,18 @@ async fn connect_and_run(
 
     // Re-discovered per connection, not once at boot: an updater that starts
     // after the agent must not leave the host reporting updater_present=false
-    // forever. Offloaded because it shells out to docker.
-    let install = offload_probe(|| {
+    // forever. Offloaded because it shells out to docker. The recovery actor gets
+    // `ACTOR_REGISTER_BUDGET` in all (here and in the console read below): a dark one
+    // never holds the dial, and the readiness refresh reports it once it answers.
+    let actor_deadline = Instant::now() + crate::buildinfo::ACTOR_REGISTER_BUDGET;
+    let actor_socket = release_mgr.actor_socket().map(std::path::Path::to_path_buf);
+    let install = offload_probe(move || {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover(&runtime)
+        crate::buildinfo::discover(
+            &runtime,
+            actor_socket.as_deref(),
+            crate::buildinfo::ACTOR_REGISTER_BUDGET,
+        )
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
@@ -2027,14 +2043,39 @@ async fn connect_and_run(
     console_access.set_engine_mode(install.engine.engine_mode.as_deref());
     crate::ddc::set_rootless(install.engine.engine_mode.as_deref() == Some("rootless"));
     let mut console_access_rx = console_access.owned().then(|| console_access.subscribe());
-    {
+    // A read that outlasts the budget finishes on its own thread; its change wakes
+    // `console_access_rx`, which re-sends `capacity`.
+    let console_read = {
         let ca = console_access.clone();
-        offload_probe(move || ca.refresh()).await;
+        tokio::task::spawn_blocking(move || {
+            ca.refresh();
+            ca.watch_if_applying();
+        })
+    };
+    if let Ok(Err(e)) = tokio::time::timeout_at(actor_deadline.into(), console_read).await {
+        if e.is_panic() {
+            std::panic::resume_unwind(e.into_panic());
+        }
     }
-    console_access.watch_if_applying();
 
+    let actor_dark = install.install_mode == Some(crate::buildinfo::InstallMode::Owned)
+        && install.updater_present != Some(true);
+    if actor_dark {
+        warn!(
+            token = "register-actor-dark",
+            "the recovery actor did not answer within {:?}: registering without it \
+             (updater_present=false); it is reported once it answers",
+            crate::buildinfo::ACTOR_REGISTER_BUDGET
+        );
+    }
     let prep = prep_started.elapsed();
-    if register_prep_over_budget(prep) {
+    // The actor's share is bounded by its budget and has its own warning above.
+    let runtime_prep = if actor_dark {
+        prep.saturating_sub(crate::buildinfo::ACTOR_REGISTER_BUDGET)
+    } else {
+        prep
+    };
+    if register_prep_over_budget(runtime_prep) {
         warn!(
             token = "register-prep-slow",
             elapsed_ms = prep.as_millis() as u64,
@@ -7857,6 +7898,104 @@ mod tests {
         assert!(
             ack_after < Duration::from_secs(3),
             "the assign was acked {ack_after:?} after it was sent"
+        );
+    }
+
+    /// #687: register preparation waits for a recovery actor that never answers (a paused
+    /// one) only `ACTOR_REGISTER_BUDGET`, in all: the install probe and the console read
+    /// both ask it, and each used to wait its own 8 s and 10 s before the dial. The fake
+    /// control plane follows agentws's order: `register`, `registered`, then the agent's
+    /// `capacity`, after which it assigns a session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dark_recovery_actor_does_not_hold_the_dial() {
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let actor = dir.path().join("actor.sock");
+        let _actor = std::os::unix::net::UnixListener::bind(&actor).unwrap();
+        let release_mgr = ReleaseManager::owned(&actor);
+
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret = dir.path().join("secret");
+        let cfg = Config {
+            control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let started = Instant::now();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            fn next_text(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> String {
+                loop {
+                    if let Message::Text(t) = ws.read().expect("the agent stays connected") {
+                        return t.to_string();
+                    }
+                }
+            }
+            let (stream, _) = cp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let register = next_text(&mut ws);
+            let registered_after = started.elapsed();
+            ws.send(Message::Text(
+                r#"{"type":"registered","host_id":"h1","node_secret":null,"heartbeat_interval_ms":5000}"#
+                    .into(),
+            ))
+            .unwrap();
+            while !next_text(&mut ws).contains(r#""type":"capacity""#) {}
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "session_assign", "id": "assign-1", "session_id": "s1",
+                    "gpu_index": 0,
+                    "stream": {"width": 1920, "height": 1080, "fps": 60,
+                        "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+            loop {
+                let frame = next_text(&mut ws);
+                if frame.contains(r#""type":"ack""#) && frame.contains(r#""id":"assign-1""#) {
+                    break;
+                }
+            }
+            let _ = seen_tx.send((register, registered_after));
+        });
+
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        sessions.mgr.console_access =
+            crate::release::console::ConsoleAccessManager::owned_for_test(&actor, false);
+        let attempt = connect_and_run(
+            &cfg,
+            &health,
+            "",
+            "test",
+            &image_mgr,
+            &release_mgr,
+            &mut sessions,
+            false,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(60), attempt).await;
+        let (register, after) = seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake control plane saw register and the assign's ack");
+        assert!(
+            after < Duration::from_secs(5),
+            "register reached the control plane {after:?} after the attempt began"
+        );
+        assert!(register.contains(r#""install_mode":"owned""#), "{register}");
+        assert!(
+            register.contains(r#""updater_present":false"#),
+            "{register}"
         );
     }
 

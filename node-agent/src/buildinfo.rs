@@ -150,6 +150,11 @@ pub use quasar_runtime::owned_install::AGENT_SOCKET_ENV as RECOVERY_SOCKET_ENV;
 /// Well inside the actor's own status deadline plus one engine round trip.
 const ACTOR_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// How long the work before `register` waits for the recovery actor, in all. A dark actor
+/// never holds the dial: the agent registers without it and the readiness refresh reports
+/// it once it answers ([`owned_identity_changed`]).
+pub const ACTOR_REGISTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The part of the actor's `GET /v1/status` answer the agent reads; everything else is
 /// ignored, since the actor moves first and may be a release ahead
 /// (`testdata/recovery/socket/README.md`).
@@ -189,24 +194,21 @@ pub fn actor_version_shape(v: &str) -> bool {
     RE.is_match(v)
 }
 
-/// This host's install facts: the recovery actor's answer on an owned install (the
-/// actor put [`RECOVERY_SOCKET_ENV`] in this container's environment), else what the
-/// agent's own container image says, with no recovery actor.
-pub fn discover(runtime: &ContainerRuntime) -> InstallFacts {
-    let mut facts = discover_install_mode(runtime);
+/// This host's install facts: the recovery actor's answer on an owned install (`socket`,
+/// which the actor put in this container's environment as [`RECOVERY_SOCKET_ENV`]), waiting
+/// at most `actor_timeout` for it, else what the agent's own container image says, with
+/// no recovery actor.
+pub fn discover(
+    runtime: &ContainerRuntime,
+    socket: Option<&std::path::Path>,
+    actor_timeout: std::time::Duration,
+) -> InstallFacts {
+    let mut facts = match socket {
+        Some(socket) => observe_owned_within(socket, actor_timeout).0,
+        None => discover_install(&DockerFacts::new(runtime)),
+    };
     facts.engine = EngineIdentity::observe();
     facts
-}
-
-fn discover_install_mode(runtime: &ContainerRuntime) -> InstallFacts {
-    match std::env::var(RECOVERY_SOCKET_ENV)
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-    {
-        Some(socket) => discover_owned(std::path::Path::new(&socket)),
-        None => discover_install(&DockerFacts::new(runtime)),
-    }
 }
 
 /// An owned install asks its recovery actor over the agent socket. `updater_present` is
@@ -220,14 +222,20 @@ pub fn discover_owned(socket: &std::path::Path) -> InstallFacts {
 pub fn observe_owned(
     socket: &std::path::Path,
 ) -> (InstallFacts, crate::readiness::owner_conflict::Observed) {
+    observe_owned_within(socket, ACTOR_STATUS_TIMEOUT)
+}
+
+fn observe_owned_within(
+    socket: &std::path::Path,
+    timeout: std::time::Duration,
+) -> (InstallFacts, crate::readiness::owner_conflict::Observed) {
     let mut conflicts = None;
     let mut out = InstallFacts {
         install_mode: Some(InstallMode::Owned),
         updater_present: Some(false),
         ..Default::default()
     };
-    let answer =
-        crate::release::unix_http::request(socket, "GET", "/v1/status", None, ACTOR_STATUS_TIMEOUT);
+    let answer = crate::release::unix_http::request(socket, "GET", "/v1/status", None, timeout);
     match answer {
         Ok(reply) if reply.status == 200 => match serde_json::from_str::<ActorStatus>(&reply.body)
         {
@@ -729,6 +737,30 @@ mod tests {
         let fixture: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         fixture["body"].to_string()
+    }
+
+    /// A paused actor accepts the connection and never answers: discovery gives up at its
+    /// budget, as an owned install whose actor does not answer, and the actor's answer
+    /// reaching the control plane later is `owned_identity_changed` (two refreshes in a row).
+    #[test]
+    fn a_dark_actor_costs_discovery_its_budget_and_is_reported_when_it_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dark.sock");
+        let _dark = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let started = std::time::Instant::now();
+        let (registered, _) = observe_owned_within(&socket, std::time::Duration::from_millis(300));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(registered.install_mode, Some(InstallMode::Owned));
+        assert_eq!(registered.updater_present, Some(false));
+
+        let _facts = INSTALL_FACTS_TEST_LOCK.blocking_lock();
+        set_install_facts(registered);
+        let (_d, answering) = actor_answering(200, socket_fixture("status-gpu-host-applying.json"));
+        let (seen, _) = observe_owned(&answering);
+        note_observed(&seen);
+        assert!(!owned_identity_changed(), "one answer is not yet a change");
+        note_observed(&seen);
+        assert!(owned_identity_changed());
     }
 
     #[test]

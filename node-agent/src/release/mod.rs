@@ -178,6 +178,11 @@ impl ReleaseManager {
                 || now.recovery_actor_version != registered.recovery_actor_version)
     }
 
+    /// The recovery actor's agent socket; `None` on a host with no actor.
+    pub fn actor_socket(&self) -> Option<&Path> {
+        self.socket.as_deref()
+    }
+
     pub fn from_env() -> Arc<Self> {
         match crate::buildinfo::owned_socket() {
             Some(socket) => Self::owned(socket),
