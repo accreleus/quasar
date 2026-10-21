@@ -14,6 +14,7 @@ import {
   getOrCreateDeviceKey,
   markDeviceProbePosted,
   probeCapabilities,
+  probeH264Decodable,
 } from "../webrtc/capability";
 import { reportBestEffortFailure } from "../lib/reportBestEffortFailure";
 
@@ -55,14 +56,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // load, so it is gated on the freshness window in capability.ts —
         // unthrottled it rate-limited /v1/me/devices (429). Best-effort:
         // failures are silent (same posture as the login path).
-        if (deviceProbeIsFresh(fresh.id)) return;
+        // A changed H.264 verdict (plugin installed) posts at once (#688).
         const tok = persisted.token;
         void (async () => {
           try {
+            if (deviceProbeIsFresh(fresh.id, await probeH264Decodable())) return;
             const deviceKey = getOrCreateDeviceKey();
             const caps = await probeCapabilities();
             await authApi.postDevice(tok, deviceKey, caps);
-            markDeviceProbePosted(fresh.id);
+            markDeviceProbePosted(fresh.id, caps.codecs.h264);
           } catch (err) {
             reportBestEffortFailure("silent-debug", "auth: rehydrate device capability post", err);
           }
@@ -126,7 +128,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const deviceKey = getOrCreateDeviceKey();
         const caps = await probeCapabilities();
         await authApi.postDevice(tok, deviceKey, caps);
-        markDeviceProbePosted(res.user.id);
+        markDeviceProbePosted(res.user.id, caps.codecs.h264);
       } catch (err) {
         // Intentionally silent — capability data is best-effort and must never
         // degrade the login experience (P4-08: "failures silent/logged, not fatal").
@@ -157,7 +159,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         try {
           const caps = await probeCapabilities();
           await authApi.postDevice(tok, deviceKey, caps);
-          markDeviceProbePosted(res.user.id);
+          markDeviceProbePosted(res.user.id, caps.codecs.h264);
         } catch (err) {
           reportBestEffortFailure("silent-debug", "auth: claim device capability post", err);
         }
