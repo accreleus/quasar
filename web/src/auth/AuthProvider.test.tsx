@@ -28,7 +28,7 @@ vi.mock("../webrtc/capability", () => ({
 }));
 
 import * as authApi from "../api/auth";
-import { deviceProbeIsFresh, markDeviceProbePosted, probeH264Decodable } from "../webrtc/capability";
+import { deviceProbeIsFresh, markDeviceProbePosted, probeCapabilities, probeH264Decodable } from "../webrtc/capability";
 
 const TOKEN_KEY = "quasar.auth.token";
 
@@ -118,27 +118,36 @@ describe("AuthProvider device capability re-post", () => {
 
   // #688: the real stamp logic, the probes mocked.
   describe("when the H.264 verdict changes", () => {
+    let actual: typeof import("../webrtc/capability");
     beforeEach(async () => {
-      const actual = await vi.importActual<typeof import("../webrtc/capability")>("../webrtc/capability");
+      actual = await vi.importActual<typeof import("../webrtc/capability")>("../webrtc/capability");
       vi.mocked(deviceProbeIsFresh).mockImplementation(actual.deviceProbeIsFresh);
       vi.mocked(markDeviceProbePosted).mockImplementation(actual.markDeviceProbePosted);
       saveSession(stored, { remember: true });
     });
 
     it("posts once when the last-posted verdict was false and the probe now says true", async () => {
-      vi.mocked(markDeviceProbePosted).getMockImplementation()!("u1", false);
+      actual.markDeviceProbePosted("u1", false);
       vi.mocked(probeH264Decodable).mockResolvedValue(true);
       render(<AuthProvider><Probe /></AuthProvider>);
       await waitFor(() => expect(authApi.postDevice).toHaveBeenCalledTimes(1));
     });
 
     it("does not post again when the verdict is the one last posted", async () => {
-      vi.mocked(markDeviceProbePosted).getMockImplementation()!("u1", true);
+      actual.markDeviceProbePosted("u1", true);
       vi.mocked(probeH264Decodable).mockResolvedValue(true);
       render(<AuthProvider><Probe /></AuthProvider>);
       await waitFor(() => expect(screen.getByText("hi ab-fresh")).toBeInTheDocument());
       await waitFor(() => expect(probeH264Decodable).toHaveBeenCalled());
       expect(authApi.postDevice).not.toHaveBeenCalled();
+    });
+
+    it("stamps the verdict the posted record carries, so the next load does not post again", async () => {
+      vi.mocked(probeH264Decodable).mockResolvedValue(false);
+      vi.mocked(probeCapabilities).mockResolvedValueOnce({ codecs: { h264: false } } as never);
+      render(<AuthProvider><Probe /></AuthProvider>);
+      await waitFor(() => expect(authApi.postDevice).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(actual.deviceProbeIsFresh("u1", false)).toBe(true));
     });
   });
 });
