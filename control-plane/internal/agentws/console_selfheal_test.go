@@ -414,6 +414,9 @@ func TestConsoleSelfHealUserStopHoldsUntilTheDisplayGoesAway(t *testing.T) {
 
 	h.handleConsoleAutoStart(context.Background(), hostID, present)
 	sessionID := trackedSession(h, hostID)
+	h.consoleAuto.mu.Lock()
+	h.consoleAuto.backoffFor(hostID).lastLaunchAt = time.Time{} // ran for hours
+	h.consoleAuto.mu.Unlock()
 	ev.mu.Lock()
 	ev.userStopped = true
 	ev.mu.Unlock()
@@ -449,5 +452,50 @@ func TestConsoleUserStopHoldsWhenTheReportBeatsTheTerminalHook(t *testing.T) {
 	h.handleConsoleAutoStart(context.Background(), hostID, present)
 	if got := ev.count(); got != 1 {
 		t.Fatalf("auto-start overrode the user's stop: launch count = %d", got)
+	}
+}
+
+// A console session this process did not start (it outlived a control-plane
+// restart) is held after its user's stop too.
+func TestConsoleUserStopHoldsForAnUntrackedSession(t *testing.T) {
+	h, pool, ev := selfHealHandler(t)
+	hostID := seedEligibleConsoleHost(t, h, pool)
+	present := []string{"DP-3"}
+	ev.mu.Lock()
+	ev.userStopped = true
+	ev.mu.Unlock()
+
+	h.ConsoleSessionTerminated(context.Background(), hostID, "sess-from-before-the-restart")
+	h.handleConsoleAutoStart(context.Background(), hostID, present)
+	if got := ev.count(); got != 0 {
+		t.Fatalf("auto-start overrode the user's stop: launch count = %d", got)
+	}
+	h.handleConsoleAutoStart(context.Background(), hostID, nil)
+	h.handleConsoleAutoStart(context.Background(), hostID, present)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("no launch after the display went away and came back: launch count = %d", got)
+	}
+}
+
+// The crash-loop retry timer follows the same rule as the terminal hook: no
+// relaunch from a report made before the session ended.
+func TestConsoleBackoffRetryWaitsForAReportAfterTheEnd(t *testing.T) {
+	origBase, origMax := consoleBackoffBase, consoleBackoffMax
+	consoleBackoffBase, consoleBackoffMax = 5*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { consoleBackoffBase, consoleBackoffMax = origBase, origMax })
+
+	h, pool, ev := selfHealHandler(t)
+	hostID := seedEligibleConsoleHost(t, h, pool)
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-3"})
+	sessionID := trackedSession(h, hostID)
+	ev.mu.Lock()
+	ev.endedAt = time.Now().Add(time.Second)
+	ev.mu.Unlock()
+
+	// A fast crash arms the retry timer; with no report since the end it must not launch.
+	h.ConsoleSessionTerminated(context.Background(), hostID, sessionID)
+	time.Sleep(100 * time.Millisecond)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("retry timer relaunched from a report older than the end: launch count = %d", got)
 	}
 }

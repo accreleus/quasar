@@ -142,8 +142,9 @@ If the monitor is shared with another machine, set `QUASAR_CONSOLE_INPUT_SOURCE`
 agent to the input this host is cabled to (`ddcutil getvcp 60` shows it, as `sl=0x10` for
 example). The monitor then counts as on only while it shows this host.
 
-Stopping an auto-started session holds: it does not start again until the monitor
-goes off and comes back on, or you turn **Auto-start on display** off and on.
+Stopping a console session holds: it does not start again until the monitor reads
+off (which needs DDC; otherwise unplug it) and comes back, or you turn **Auto-start on
+display** off and on. A restart of the agent or the control plane also lets it start again.
 
 A monitor switching off doesn't end the auto-started session: some monitors
 drop their DisplayPort link when powered off, indistinguishable from an unplug

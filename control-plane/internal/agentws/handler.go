@@ -148,8 +148,10 @@ type consoleAutoState struct {
 	lastReportAt   map[string]time.Time       // hostID → when lastConnectors arrived
 	lastEndAt      map[string]time.Time       // hostID → when its last tracked session ended
 	backoff        map[string]*consoleBackoff // hostID → crash-loop backoff state
-	// hostID → its user stopped the auto-started console session. No auto-start
-	// until the display is reported absent or auto-start is switched off.
+	// hostID → its user stopped a console session. No auto-start until the display
+	// is reported absent or auto-start is switched off. In memory like the rest of
+	// this tracker: a control-plane restart forgets it, and so does an agent
+	// restart, whose first report lists no display (a fresh start).
 	userStopped map[string]bool
 	// hostID → the running session's connector has been absent since; at most one
 	// grace timer per host. Cleared when the connector is back or the session ends.
@@ -1909,6 +1911,11 @@ func (h *Handler) ConsoleSessionTerminated(ctx context.Context, hostID, sessionI
 	fresh := endedAt.IsZero() || h.consoleAuto.lastReportAt[hostID].After(endedAt)
 	if !tracked || recordedID != sessionID {
 		untrackedConnectors := h.consoleAuto.lastConnectors[hostID]
+		// A console session this process did not start (it outlived a control-plane
+		// restart, #128) is held after its user's stop all the same.
+		if userStopped {
+			h.consoleAuto.userStopped[hostID] = true
+		}
 		h.consoleAuto.mu.Unlock()
 		// #128: a console session can now outlive the control-plane process that
 		// started it, so after a restart this tracker is empty while the session
