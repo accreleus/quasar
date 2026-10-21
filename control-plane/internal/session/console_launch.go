@@ -12,9 +12,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/console"
 )
+
+// stopReasonUserRequested is the stop reason of a user's (or admin's) DELETE.
+const stopReasonUserRequested = "user_requested"
 
 // ErrConsoleAppNotDirect: the console's default app does not declare
 // runtime_spec.direct_display, so it cannot run as a console session. No
@@ -175,4 +179,20 @@ func (c *Coordinator) ConsoleSessionActive(ctx context.Context, sessionID string
 		return false
 	}
 	return hs.State == StatePending || hs.State.HoldsReservation()
+}
+
+// ConsoleSessionEnded reads when a session ended (zero if unknown or still live)
+// and whether its user stopped it, for console self-heal: a relaunch never acts
+// on a display report older than the end, and a user's stop holds. Satisfies
+// agentws.Events.
+func (c *Coordinator) ConsoleSessionEnded(ctx context.Context, sessionID string) (time.Time, bool) {
+	sess, err := c.store.Get(ctx, sessionID)
+	if err != nil {
+		return time.Time{}, false
+	}
+	var endedAt time.Time
+	if sess.EndedAt != nil {
+		endedAt = *sess.EndedAt
+	}
+	return endedAt, sess.StopReason != nil && *sess.StopReason == stopReasonUserRequested
 }

@@ -24,6 +24,17 @@ type selfHealEvents struct {
 	launchErr   error
 	// lastMode is the width/height/fps of the latest launch (#422).
 	lastMode [3]int32
+	// endedAt and userStopped answer ConsoleSessionEnded; inactive makes
+	// ConsoleSessionActive report the tracked session as ended.
+	endedAt     time.Time
+	userStopped bool
+	inactive    bool
+}
+
+func (e *selfHealEvents) ConsoleSessionEnded(context.Context, string) (time.Time, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.endedAt, e.userStopped
 }
 
 func (e *selfHealEvents) LaunchConsoleSession(_ context.Context, _, _, _, _ string, width, height, fps int32) (string, error) {
@@ -47,7 +58,11 @@ func (e *selfHealEvents) count() int {
 // terminal hook already knows its session ended; the stale-entry check in
 // reevalConsole only applies to the capacity path re-checking a session it
 // still believes is tracked) but is wired for completeness.
-func (e *selfHealEvents) ConsoleSessionActive(context.Context, string) bool { return true }
+func (e *selfHealEvents) ConsoleSessionActive(context.Context, string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return !e.inactive
+}
 
 func selfHealHandler(t *testing.T) (*Handler, *pgxpool.Pool, *selfHealEvents) {
 	t.Helper()
@@ -350,5 +365,89 @@ func TestConsoleBackoffDelaySchedule(t *testing.T) {
 		if got := consoleBackoffDelay(tc.failures); got != tc.want {
 			t.Errorf("consoleBackoffDelay(%d) = %v, want %v", tc.failures, got, tc.want)
 		}
+	}
+}
+
+// A report made before the console session ended reads "present" even with the
+// monitor off (the agent skips the power read while the console drives the
+// display), so the terminal hook must not relaunch from it. The agent's next
+// report decides.
+func TestConsoleSelfHealWaitsForAReportAfterTheEnd(t *testing.T) {
+	h, pool, ev := selfHealHandler(t)
+	hostID := seedEligibleConsoleHost(t, h, pool)
+
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-3"})
+	sessionID := trackedSession(h, hostID)
+	if sessionID == "" {
+		t.Fatal("no initial launch")
+	}
+	h.consoleAuto.mu.Lock()
+	h.consoleAuto.backoffFor(hostID).lastLaunchAt = time.Time{} // a clean end, not a crash
+	h.consoleAuto.mu.Unlock()
+	ev.mu.Lock()
+	ev.endedAt = time.Now().Add(time.Second) // ended after the last report
+	ev.mu.Unlock()
+
+	h.ConsoleSessionTerminated(context.Background(), hostID, sessionID)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("relaunched from a report older than the end: launch count = %d", got)
+	}
+
+	// The fresh report says the monitor is off: still nothing.
+	h.handleConsoleAutoStart(context.Background(), hostID, nil)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("launched with no display: launch count = %d", got)
+	}
+	// The monitor comes on: launch.
+	h.handleConsoleAutoStart(context.Background(), hostID, []string{"DP-3"})
+	if got := ev.count(); got != 2 {
+		t.Fatalf("no launch when the display came back: launch count = %d", got)
+	}
+}
+
+// A user's stop holds while the display stays present, and auto-start resumes
+// once the display has gone away and come back.
+func TestConsoleSelfHealUserStopHoldsUntilTheDisplayGoesAway(t *testing.T) {
+	h, pool, ev := selfHealHandler(t)
+	hostID := seedEligibleConsoleHost(t, h, pool)
+	present := []string{"DP-3"}
+
+	h.handleConsoleAutoStart(context.Background(), hostID, present)
+	sessionID := trackedSession(h, hostID)
+	ev.mu.Lock()
+	ev.userStopped = true
+	ev.mu.Unlock()
+
+	h.ConsoleSessionTerminated(context.Background(), hostID, sessionID)
+	h.handleConsoleAutoStart(context.Background(), hostID, present)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("auto-start overrode the user's stop: launch count = %d", got)
+	}
+
+	h.handleConsoleAutoStart(context.Background(), hostID, nil)
+	h.handleConsoleAutoStart(context.Background(), hostID, present)
+	if got := ev.count(); got != 2 {
+		t.Fatalf("no launch after the display went away and came back: launch count = %d", got)
+	}
+}
+
+// The agent's fresh report can reach the capacity path before the terminal hook
+// runs; the user's stop must hold on that path too.
+func TestConsoleUserStopHoldsWhenTheReportBeatsTheTerminalHook(t *testing.T) {
+	h, pool, ev := selfHealHandler(t)
+	hostID := seedEligibleConsoleHost(t, h, pool)
+	present := []string{"DP-3"}
+
+	h.handleConsoleAutoStart(context.Background(), hostID, present)
+	sessionID := trackedSession(h, hostID)
+	ev.mu.Lock()
+	ev.userStopped, ev.inactive = true, true
+	ev.mu.Unlock()
+
+	h.handleConsoleAutoStart(context.Background(), hostID, present)
+	h.ConsoleSessionTerminated(context.Background(), hostID, sessionID)
+	h.handleConsoleAutoStart(context.Background(), hostID, present)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("auto-start overrode the user's stop: launch count = %d", got)
 	}
 }

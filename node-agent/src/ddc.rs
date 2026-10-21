@@ -46,6 +46,9 @@ const I2C_MAJOR: u32 = 89;
 enum Power {
     On,
     Off,
+    /// Powered, but showing an input other than `QUASAR_CONSOLE_INPUT_SOURCE`: off as
+    /// far as this host is concerned.
+    OtherInput,
     /// ddcutil missing / bus unknown / read failed → treated as powered (not gated).
     Unknown,
 }
@@ -67,6 +70,14 @@ static NODES_READY: OnceLock<bool> = OnceLock::new();
 /// before the first `config_update` arrives.
 static CONSOLE_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Whether a `config_update` has said if console mode is on. Until then the power
+/// read cannot be trusted to have run, so no display is reported (see
+/// `powered_connectors`).
+static CONSOLE_CONFIG_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// `QUASAR_CONSOLE_INPUT_SOURCE`, parsed once.
+static INPUT_PIN: OnceLock<Option<u8>> = OnceLock::new();
+
 /// #407: whether this agent runs on a rootless container engine (`register`'s
 /// `engine_mode`). A user namespace cannot `mknod`, so on rootless the recovery actor
 /// passes each host `/dev/i2c-N` it found as a device instead of this module creating
@@ -82,6 +93,7 @@ static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// handler; idempotent and lock-free (read on the hotplug watcher thread).
 pub(crate) fn set_console_enabled(enabled: bool) {
     CONSOLE_ENABLED.store(enabled, Ordering::Relaxed);
+    CONSOLE_CONFIG_SEEN.store(true, Ordering::Relaxed);
 }
 
 fn console_enabled() -> bool {
@@ -120,6 +132,38 @@ fn enabled() -> bool {
         std::env::var("QUASAR_CONSOLE_DDC").ok().as_deref(),
         Some("0")
     )
+}
+
+/// `QUASAR_CONSOLE_INPUT_SOURCE`: the monitor input (VCP `0x60` value) this host is
+/// cabled to, for a monitor shared between machines. When set, a powered monitor
+/// showing another input counts as off. Unset: power alone decides.
+fn input_source_pin() -> Option<u8> {
+    *INPUT_PIN.get_or_init(|| {
+        parse_input_source(std::env::var("QUASAR_CONSOLE_INPUT_SOURCE").ok().as_deref())
+    })
+}
+
+/// `"0x10"` or `"16"` → `0x10`; empty → `None`; anything else warns and is `None`.
+fn parse_input_source(value: Option<&str>) -> Option<u8> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let parsed = match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        Some(hex) => u8::from_str_radix(hex, 16).ok(),
+        None => value.parse::<u8>().ok(),
+    };
+    if parsed.is_none() {
+        tracing::warn!(
+            token = "console-input-source-invalid",
+            value,
+            "QUASAR_CONSOLE_INPUT_SOURCE is not a VCP 0x60 value (like 0x10 or 16); ignored"
+        );
+    }
+    parsed
 }
 
 /// Whether `ddcutil` can be invoked (cached). A missing binary silently degrades
@@ -183,6 +227,14 @@ fn ensure_i2c_nodes() {
 /// connector with power `On` or `Unknown` is kept. No-op (identity) when gating
 /// is disabled, `ddcutil` is unavailable, or the input is empty.
 pub(crate) fn powered_connectors(connected: Vec<String>) -> Vec<String> {
+    // Before the first config_update the agent does not know whether to read the
+    // monitor's power, and an unread monitor must not look on: a report made then
+    // started console mode on a switched-off monitor after an agent restart.
+    // config_update follows register on every connection; the hotplug poll then
+    // reports the display if it is on.
+    if !CONSOLE_CONFIG_SEEN.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     // #411: console gate first — with console mode off nothing consumes the
     // reading, so no ddcutil fork is justified; return the raw connected list.
     if connected.is_empty() || !console_enabled() || !enabled() || !ddcutil_available() {
@@ -245,7 +297,7 @@ pub(crate) fn powered_connectors(connected: Vec<String>) -> Vec<String> {
         .filter(|conn| !fresh.contains_key(*conn))
         .map(|conn| {
             let power = match bus_map.get(conn) {
-                Some(&bus) => read_power(bus),
+                Some(&bus) => read_display(bus, input_source_pin()),
                 None => Power::Unknown,
             };
             (conn.clone(), power)
@@ -257,7 +309,13 @@ pub(crate) fn powered_connectors(connected: Vec<String>) -> Vec<String> {
         let at = Instant::now();
         let mut cache = cache().lock().unwrap();
         for (conn, power) in &reads {
-            cache.power.insert(conn.clone(), (*power, at));
+            let before = cache
+                .power
+                .insert(conn.clone(), (*power, at))
+                .map(|(p, _)| p);
+            if before != Some(*power) {
+                tracing::info!(connector = %conn, power = ?power, before = ?before, "DDC: monitor state changed");
+            }
         }
     }
 
@@ -274,8 +332,8 @@ pub(crate) fn powered_connectors(connected: Vec<String>) -> Vec<String> {
                         .map(|(_, power)| *power)
                 })
                 .unwrap_or(Power::Unknown);
-            if power == Power::Off {
-                tracing::debug!(connector = %conn, "DDC: monitor power Off — connector gated out");
+            if matches!(power, Power::Off | Power::OtherInput) {
+                tracing::debug!(connector = %conn, ?power, "DDC: monitor off for this host — connector gated out");
                 false
             } else {
                 true
@@ -309,7 +367,11 @@ pub(crate) fn summary() -> DdcSummary {
         available,
         bus_mapped: !cache.bus_map.is_empty(),
         any_read,
-        all_off: any_read && cache.power.values().all(|(p, _)| *p == Power::Off),
+        all_off: any_read
+            && cache
+                .power
+                .values()
+                .all(|(p, _)| matches!(p, Power::Off | Power::OtherInput)),
     }
 }
 
@@ -338,35 +400,57 @@ fn detect_bus_map() -> Option<HashMap<String, u32>> {
     Some(map)
 }
 
-/// Read VCP `0xd6` on a bus. `sl=0x01` → On; any other value → Off; a non-zero
-/// exit or unparseable output → `Unknown` (not gated).
-fn read_power(bus: u32) -> Power {
+/// The monitor's state on a bus: power from VCP `0xd6`, then, when an input is
+/// pinned and the monitor is on, its input from VCP `0x60`.
+fn read_display(bus: u32, pin: Option<u8>) -> Power {
+    display_state(read_vcp_sl(bus, "d6"), pin, || read_vcp_sl(bus, "60"))
+}
+
+/// `0xd6` `sl=0x01` → On; any other value → Off; no reading → `Unknown` (not
+/// gated). An On monitor whose `0x60` input is not the pin → `OtherInput`; an
+/// input that cannot be read leaves it On (the same graceful downgrade).
+fn display_state(
+    power_sl: Option<u8>,
+    pin: Option<u8>,
+    input: impl FnOnce() -> Option<u8>,
+) -> Power {
+    match power_sl {
+        Some(0x01) => match pin {
+            Some(pin) => match input() {
+                Some(shown) if shown != pin => {
+                    tracing::debug!(shown, pin, "DDC: monitor on, showing another input");
+                    Power::OtherInput
+                }
+                _ => Power::On,
+            },
+            None => Power::On,
+        },
+        Some(_) => Power::Off,
+        None => Power::Unknown,
+    }
+}
+
+/// Read one VCP feature's `sl` byte on a bus; a failed run or unparseable output
+/// is `None`.
+fn read_vcp_sl(bus: u32, code: &str) -> Option<u8> {
     // --sleep-multiplier 2: a bare read is flaky on this hardware ("DDC
     // communication failed" ~1-in-3), which would otherwise spuriously read Unknown.
     PROBE_CALLS.fetch_add(1, Ordering::Relaxed);
-    let out = match Command::new("ddcutil")
+    let out = Command::new("ddcutil")
         .args([
             "getvcp",
-            "d6",
+            code,
             "--bus",
             &bus.to_string(),
             "--sleep-multiplier",
             "2",
         ])
         .output()
-    {
-        Ok(o) => o,
-        Err(_) => return Power::Unknown,
-    };
+        .ok()?;
     if !out.status.success() {
-        return Power::Unknown;
+        return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    match parse_sl(&text) {
-        Some(0x01) => Power::On,
-        Some(_) => Power::Off,
-        None => Power::Unknown,
-    }
+    parse_sl(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Extract the `sl=0xNN` byte from a `ddcutil getvcp` line.
@@ -412,6 +496,13 @@ mod tests {
         let _ = AVAILABLE.set(true);
         let forced_available = *AVAILABLE.get().unwrap();
 
+        // No config_update yet: no display reported and no probe, whatever is
+        // plugged in (an agent restart must not start console mode on its own).
+        CONSOLE_CONFIG_SEEN.store(false, Ordering::Relaxed);
+        let before_config = probe_calls();
+        assert!(powered_connectors(vec!["DP-9".to_string()]).is_empty());
+        assert_eq!(probe_calls(), before_config);
+
         set_console_enabled(false);
         let before = probe_calls();
         let input = vec!["DP-9".to_string(), "HDMI-A-9".to_string()];
@@ -435,6 +526,35 @@ mod tests {
         // A failed/absent read is `Unknown` → connector kept (graceful downgrade).
         assert_eq!(kept, vec!["DP-8".to_string()]);
         set_console_enabled(false);
+    }
+
+    #[test]
+    fn input_source_parses_hex_and_decimal() {
+        assert_eq!(parse_input_source(Some("0x10")), Some(0x10));
+        assert_eq!(parse_input_source(Some(" 0X0f ")), Some(0x0f));
+        assert_eq!(parse_input_source(Some("17")), Some(17));
+        assert_eq!(parse_input_source(Some("")), None);
+        assert_eq!(parse_input_source(None), None);
+        assert_eq!(parse_input_source(Some("DisplayPort-2")), None);
+        assert_eq!(parse_input_source(Some("0x100")), None);
+    }
+
+    #[test]
+    fn a_monitor_counts_only_when_on_and_showing_the_pinned_input() {
+        let never = || -> Option<u8> { panic!("input read without a pin or while off") };
+        assert_eq!(display_state(Some(0x01), None, never), Power::On);
+        assert_eq!(display_state(Some(0x04), Some(0x10), never), Power::Off);
+        assert_eq!(display_state(None, Some(0x10), never), Power::Unknown);
+        assert_eq!(
+            display_state(Some(0x01), Some(0x10), || Some(0x10)),
+            Power::On
+        );
+        assert_eq!(
+            display_state(Some(0x01), Some(0x10), || Some(0x0f)),
+            Power::OtherInput
+        );
+        // An unreadable input keeps the monitor on, like an unreadable power state.
+        assert_eq!(display_state(Some(0x01), Some(0x10), || None), Power::On);
     }
 
     /// #411: the TTL must exceed the console hotplug watcher's poll interval, or
