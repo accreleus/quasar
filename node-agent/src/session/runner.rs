@@ -2438,6 +2438,8 @@ pub fn run_blocking(
         .or_else(|| encode_pipe.by_name(pipeline::VULKAN_ENCODER_NAME));
     let mut running_since: Option<Instant> = None;
     let mut ever_connected = false;
+    // The session has streamed on some transport; `ever_connected` is the current one's.
+    let mut streamed = false;
     let mut unhealthy_since: Option<Instant> = None;
     // When the video transport was last replaced for a new peer (#535).
     let mut transport_since: Option<Instant> = None;
@@ -3191,6 +3193,7 @@ pub fn run_blocking(
                 .property::<gstreamer_webrtc::WebRTCICEConnectionState>("ice-connection-state");
             if ice_is_connected(ice) {
                 ever_connected = true;
+                streamed = true;
                 unhealthy_since = None;
             } else if ice_is_dead(ice) {
                 unhealthy_since.get_or_insert_with(Instant::now);
@@ -3217,8 +3220,8 @@ pub fn run_blocking(
                 tracing::warn!(
                     token = "session-teardown-summary",
                     session_id = %session_id,
-                    "session teardown: reason={reason} ever_connected={ever_connected} \
-                     running_for={}s app_presented={}",
+                    "session teardown: reason={reason} ever_connected={streamed} \
+                     transport_connected={ever_connected} running_for={}s app_presented={}",
                     running_for.as_secs(),
                     app_presented_at.is_some()
                 );
@@ -3229,7 +3232,8 @@ pub fn run_blocking(
                 tracing::error!(
                     token = "runner-idle-reap-failed",
                     reason = %reason,
-                    "session failed via idle reap"
+                    "session ended via idle reap (it {} streamed)",
+                    if streamed { "had" } else { "never" }
                 );
                 emit(SessionEvent::Failed(reason.to_string()));
                 return;

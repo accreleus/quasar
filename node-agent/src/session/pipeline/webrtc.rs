@@ -1197,7 +1197,8 @@ pub(crate) fn apply_remote_description(
                     "set-remote-description on the {pc} PeerConnection was a duplicate \
                      answer, ignored: {message}"
                 );
-            } else {
+            } else if on_failure.is_none() {
+                // With a receiver, it decides what the refusal costs and says so.
                 tracing::error!(
                     token = "webrtc-set-remote-failed",
                     "set-remote-description failed on the {pc} PeerConnection: {message}"
