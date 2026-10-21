@@ -465,6 +465,38 @@ func TestUserPreferenceAgainstNewLaunchProfile(t *testing.T) {
 	}
 }
 
+// TestUserDefaultProfileIsHonouredOnlyWhileOverridesAllowed (#721): the user's
+// stored default is skipped by a no-profile launch while user_overrides_allowed
+// is false, falling to the global default; it stays stored and applies again
+// once overrides are back on.
+func TestUserDefaultProfileIsHonouredOnlyWhileOverridesAllowed(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+
+	if _, err := store.UpdateUserProfilePreferences(ctx, s.userID, strptr("720p60")); err != nil {
+		t.Fatalf("store user default: %v", err)
+	}
+	resolve := func(overrides bool) string {
+		t.Helper()
+		if _, err := store.UpdateProfilePolicy(ctx, strptr("1440p60"), overrides, s.userID); err != nil {
+			t.Fatalf("set policy: %v", err)
+		}
+		got, err := store.ResolveDefaultProfile(ctx, s.userID, LaunchApp{}, "4k60", AppProfileRestriction{})
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		return got
+	}
+	if got := resolve(false); got != "1440p60" {
+		t.Fatalf("overrides off: resolved %q, want the global default 1440p60", got)
+	}
+	if got := resolve(true); got != "720p60" {
+		t.Fatalf("overrides on: resolved %q, want the user's stored default 720p60", got)
+	}
+}
+
 // TestLaunchProfileRungOrderIsPreference asserts the write path assigns
 // `position` from the ORDER of the id array — a client never sends positions —
 // and that a re-write replaces the whole chain (that is how a drag-reorder

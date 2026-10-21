@@ -32,9 +32,10 @@ export function launchPlan(i: {
   const row = (id: string | null | undefined) => (id ? auto.find((e) => e.profileId === id) : undefined);
 
   // The pin is never skipped; a default outside the app's menu (its allow-list) is.
-  // Eligibility is not checked, and the account default wins even with overrides off (#721).
+  // Eligibility is not checked. With overrides off the account default is not honoured, for anyone (#721).
   const pin = app.profile_policy !== "inherit" ? app.default_profile_id || null : null;
-  const serverPick = pin ?? [prefs.default_profile_id, prefs.global_default_profile_id].find((id) => row(id)) ?? null;
+  const accountDefault = prefs.user_overrides_allowed === false ? null : prefs.default_profile_id;
+  const serverPick = pin ?? [accountDefault, prefs.global_default_profile_id].find((id) => row(id)) ?? null;
   const pick = row(serverPick);
 
   const overridesOff = !isAdmin && prefs.user_overrides_allowed === false;
