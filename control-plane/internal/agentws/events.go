@@ -57,8 +57,9 @@ type Events interface {
 	// is still non-terminal (CM-06). The auto-start tracker uses it to detect a
 	// self-terminated console session and relaunch it (level-triggered always-on).
 	ConsoleSessionActive(ctx context.Context, sessionID string) bool
-	// ConsoleSessionEnded reads how an ended session ended: when (zero if unknown)
-	// and whether it was a console session its user stopped. Console self-heal
+	// ConsoleSessionEnded reads how an ended session ended: when (zero only while
+	// it is still live; a failed read answers now) and whether it was a console
+	// session its user stopped. Console self-heal
 	// uses both.
 	ConsoleSessionEnded(ctx context.Context, sessionID string) (endedAt time.Time, userStopped bool)
 }

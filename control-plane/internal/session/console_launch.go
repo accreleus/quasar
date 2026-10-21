@@ -181,7 +181,8 @@ func (c *Coordinator) ConsoleSessionActive(ctx context.Context, sessionID string
 	return hs.State == StatePending || hs.State.HoldsReservation()
 }
 
-// ConsoleSessionEnded reads when a session ended (zero if unknown or still live)
+// ConsoleSessionEnded reads when a session ended (zero while still live; a failed
+// read fails closed to now)
 // and whether it was a console session its user stopped, for console self-heal: a
 // relaunch never acts on a display report older than the end, and a user's stop
 // holds. A console session is the only play session that reserves no encode slot
