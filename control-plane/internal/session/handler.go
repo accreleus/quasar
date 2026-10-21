@@ -687,7 +687,7 @@ func (h *Handler) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wasTerminal := sess.State.IsTerminal()
-	sess, err = h.coord.Stop(r.Context(), id, "user_requested")
+	sess, err = h.coord.Stop(r.Context(), id, stopReasonUserRequested)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not stop session")
 		return

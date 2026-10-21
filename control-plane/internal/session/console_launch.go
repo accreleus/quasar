@@ -12,9 +12,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/console"
 )
+
+// stopReasonUserRequested is the stop reason of a user's (or admin's) DELETE.
+const stopReasonUserRequested = "user_requested"
 
 // ErrConsoleAppNotDirect: the console's default app does not declare
 // runtime_spec.direct_display, so it cannot run as a console session. No
@@ -175,4 +179,27 @@ func (c *Coordinator) ConsoleSessionActive(ctx context.Context, sessionID string
 		return false
 	}
 	return hs.State == StatePending || hs.State.HoldsReservation()
+}
+
+// ConsoleSessionEnded reads when a session ended (zero while still live; a failed
+// read fails closed to now)
+// and whether it was a console session its user stopped, for console self-heal: a
+// relaunch never acts on a display report older than the end, and a user's stop
+// holds. A console session is the only play session that reserves no encode slot
+// (local_only: nothing is encoded); a user stopping a streamed session must not
+// hold the console back. Satisfies agentws.Events.
+func (c *Coordinator) ConsoleSessionEnded(ctx context.Context, sessionID string) (time.Time, bool) {
+	sess, err := c.store.Get(ctx, sessionID)
+	if err != nil {
+		// Fail closed: "ended now" makes self-heal wait for the agent's next
+		// report (at most 15 s) rather than relaunch from one that may be stale.
+		c.log.Warn("console self-heal: read the ended session failed", "session_id", sessionID, "err", err)
+		return time.Now(), false
+	}
+	var endedAt time.Time
+	if sess.EndedAt != nil {
+		endedAt = *sess.EndedAt
+	}
+	console := sess.Kind == KindPlay && sess.ReservedSlots == 0
+	return endedAt, console && sess.StopReason != nil && *sess.StopReason == stopReasonUserRequested
 }

@@ -138,6 +138,15 @@ the console device rules on rootless) and a monitor that answers DDC. Without th
 connected display counts as on. Set `QUASAR_CONSOLE_DDC=0` on the agent to turn
 the power reading off.
 
+If the monitor is shared with another machine, set `QUASAR_CONSOLE_INPUT_SOURCE` on the
+agent to the input this host is cabled to (`ddcutil getvcp 60` shows it, as `sl=0x10` for
+example). The monitor then counts as on only while it shows this host.
+
+Stopping a console session holds: it does not start again until the monitor reads
+off (which needs DDC; otherwise unplug it) and comes back, or you turn **Auto-start on
+display** off and on. A restart of the agent or the control plane is a fresh start, and
+lets it start again.
+
 A monitor switching off doesn't end the auto-started session: some monitors
 drop their DisplayPort link when powered off, indistinguishable from an unplug
 to the connector. To stop the session once that state has lasted a while, set

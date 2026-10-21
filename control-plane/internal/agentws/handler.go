@@ -135,8 +135,8 @@ func (h *Handler) WithTrustedProxies(nets []*net.IPNet) *Handler {
 // crash-loop backoff. In-memory only — a control-plane restart just makes the
 // next capacity report a fresh baseline.
 //
-// Accepted growth (#406): lastConnectors and backoff are never deleted (one
-// small entry per host ever enrolled). No eviction on disconnect, on purpose:
+// Accepted growth (#406): lastConnectors, lastReportAt, lastEndAt and backoff
+// are never deleted (one small entry per host ever enrolled). No eviction on disconnect, on purpose:
 // console state must survive a reconnect, and clearing the crash-loop counter
 // there would let a hot-looping host reset its backoff by reconnecting. The
 // bound is distinct-hosts-per-process-lifetime, fleet-sized.
@@ -145,7 +145,14 @@ type consoleAutoState struct {
 	sessions       map[string]string          // hostID → auto-started console session id
 	launching      map[string]bool            // hostID → launch currently being scheduled
 	lastConnectors map[string][]string        // hostID → last-reported connector list
+	lastReportAt   map[string]time.Time       // hostID → when lastConnectors arrived
+	lastEndAt      map[string]time.Time       // hostID → when its last tracked session ended
 	backoff        map[string]*consoleBackoff // hostID → crash-loop backoff state
+	// hostID → its user stopped a console session. No auto-start until the display
+	// is reported absent or auto-start is switched off. In memory like the rest of
+	// this tracker: a control-plane restart forgets it, and so does an agent
+	// restart, whose first report lists no display (a fresh start).
+	userStopped map[string]bool
 	// hostID → the running session's connector has been absent since; at most one
 	// grace timer per host. Cleared when the connector is back or the session ends.
 	absent map[string]*consoleAbsence
@@ -166,6 +173,9 @@ func newConsoleAutoState() *consoleAutoState {
 		sessions:       make(map[string]string),
 		launching:      make(map[string]bool),
 		lastConnectors: make(map[string][]string),
+		lastReportAt:   make(map[string]time.Time),
+		lastEndAt:      make(map[string]time.Time),
+		userStopped:    make(map[string]bool),
 		backoff:        make(map[string]*consoleBackoff),
 		absent:         make(map[string]*consoleAbsence),
 	}
@@ -1873,6 +1883,7 @@ func (h *Handler) handleConsoleAutoStart(ctx context.Context, hostID string, con
 	// a static display never produces one.
 	h.consoleAuto.mu.Lock()
 	h.consoleAuto.lastConnectors[hostID] = connectors
+	h.consoleAuto.lastReportAt[hostID] = time.Now()
 	h.consoleAuto.mu.Unlock()
 
 	h.reevalConsole(ctx, hostID, connectors, true)
@@ -1880,18 +1891,33 @@ func (h *Handler) handleConsoleAutoStart(ctx context.Context, hostID string, con
 
 // ConsoleSessionTerminated is the CM-09 session-terminal re-eval hook, wired
 // to Coordinator.ConsoleReeval (the callback inversion that keeps session from
-// importing agentws). Without it, a console session crashing under a static
-// display would wait forever for a capacity re-send that never comes. A
-// session this handler did not auto-start (or a stale sessionID) is a no-op.
+// importing agentws). It keeps the crash-loop backoff and records a user's
+// stop. It relaunches only from a display report made after the session ended:
+// the agent sends one as soon as a session ends, and an older one was made while
+// the console owned the display, when the agent does not read the monitor's power.
 func (h *Handler) ConsoleSessionTerminated(ctx context.Context, hostID, sessionID string) {
 	if h.consoleStore == nil {
 		return
 	}
 
+	// A report from before the session ended is no evidence the display is still
+	// there: while a console session drives the display the agent skips the
+	// monitor-power read (#458), so it reads "present" even with the monitor off.
+	// The agent reports afresh as soon as a session ends; that report decides.
+	// lastReportAt is this process's clock and endedAt the database's; a skew
+	// can only delay a relaunch to the next report, never add one.
+	endedAt, userStopped := h.events.ConsoleSessionEnded(ctx, sessionID)
+
 	h.consoleAuto.mu.Lock()
 	recordedID, tracked := h.consoleAuto.sessions[hostID]
+	fresh := endedAt.IsZero() || h.consoleAuto.lastReportAt[hostID].After(endedAt)
 	if !tracked || recordedID != sessionID {
 		untrackedConnectors := h.consoleAuto.lastConnectors[hostID]
+		// A console session this process did not start (it outlived a control-plane
+		// restart, #128) is held after its user's stop all the same.
+		if userStopped {
+			h.consoleAuto.userStopped[hostID] = true
+		}
 		h.consoleAuto.mu.Unlock()
 		// #128: a console session can now outlive the control-plane process that
 		// started it, so after a restart this tracker is empty while the session
@@ -1900,13 +1926,17 @@ func (h *Handler) ConsoleSessionTerminated(ctx context.Context, hostID, sessionI
 		// hotplug. Re-evaluate instead of returning: reevalConsole is
 		// level-triggered, so it relaunches only if the display is still present
 		// and nothing is running, and its own backoff paces the retries.
-		if len(untrackedConnectors) > 0 {
+		if len(untrackedConnectors) > 0 && fresh {
 			h.reevalConsole(ctx, hostID, untrackedConnectors, false)
 		}
 		return
 	}
 	delete(h.consoleAuto.sessions, hostID)
 	h.clearConsoleAbsenceLocked(hostID)
+	if userStopped {
+		h.consoleAuto.userStopped[hostID] = true
+	}
+	h.consoleAuto.lastEndAt[hostID] = endedAt
 	connectors := h.consoleAuto.lastConnectors[hostID]
 	bo := h.consoleAuto.backoffFor(hostID)
 	now := time.Now()
@@ -1917,9 +1947,9 @@ func (h *Handler) ConsoleSessionTerminated(ctx context.Context, hostID, sessionI
 	}
 	var retryDelay time.Duration
 	armRetry := false
-	if bo.lastLaunchAt.IsZero() || now.Sub(bo.lastLaunchAt) >= consoleStabilityWindow {
-		// Survived the stability window (or no recorded launch time, e.g.
-		// after a control-plane restart) — clean end, reset the guard.
+	if userStopped || bo.lastLaunchAt.IsZero() || now.Sub(bo.lastLaunchAt) >= consoleStabilityWindow {
+		// Stopped by its user, survived the stability window, or no recorded
+		// launch time (e.g. after a control-plane restart) — clean end, reset the guard.
 		bo.consecutiveFailures = 0
 		bo.gaveUp = false
 	} else {
@@ -1950,11 +1980,18 @@ func (h *Handler) ConsoleSessionTerminated(ctx context.Context, hostID, sessionI
 	}
 	h.consoleAuto.mu.Unlock()
 
+	if userStopped {
+		h.log.Info("console self-heal: session stopped by its user, no auto-start until the display goes away",
+			"host_id", hostID, "session_id", sessionID)
+		return
+	}
+	if !fresh {
+		h.log.Info("console self-heal: tracked session terminated, waiting for the agent's next display report",
+			"host_id", hostID, "session_id", sessionID)
+		return
+	}
 	h.log.Info("console self-heal: tracked session terminated, re-evaluating",
 		"host_id", hostID, "session_id", sessionID)
-	// connectors is the last-reported list and can be stale (a real unplug
-	// racing a crash). Tolerated: a launch on stale "present" data is
-	// self-correcting — the next capacity report triggers the auto-stop path.
 	h.reevalConsole(ctx, hostID, connectors, false)
 }
 
@@ -1967,8 +2004,14 @@ func (h *Handler) retryConsoleAfterBackoff(hostID string) {
 		bo.pendingTimer = nil
 	}
 	connectors := h.consoleAuto.lastConnectors[hostID]
+	endedAt := h.consoleAuto.lastEndAt[hostID]
+	fresh := endedAt.IsZero() || h.consoleAuto.lastReportAt[hostID].After(endedAt)
 	h.consoleAuto.mu.Unlock()
 
+	// Same rule as the terminal hook: only a report from after the end counts.
+	if !fresh {
+		return
+	}
 	h.reevalConsole(context.Background(), hostID, connectors, false)
 }
 
@@ -2002,9 +2045,15 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 	// auto-stop). Checked before the eligibility gate so a stale entry never
 	// triggers a spurious teardown-on-disable stop.
 	if alreadyLaunched && !h.events.ConsoleSessionActive(ctx, recordedID) {
+		// The capacity path can see the end before the terminal hook does; the
+		// user's stop must hold either way.
+		_, userStopped := h.events.ConsoleSessionEnded(ctx, recordedID)
 		h.consoleAuto.mu.Lock()
 		delete(h.consoleAuto.sessions, hostID)
 		h.clearConsoleAbsenceLocked(hostID)
+		if userStopped {
+			h.consoleAuto.userStopped[hostID] = true
+		}
 		h.consoleAuto.mu.Unlock()
 		alreadyLaunched = false
 		h.log.Info("console auto-start: prior session terminated, will relaunch",
@@ -2016,6 +2065,9 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 		// stopped when console mode is disabled (the agent re-sends capacity
 		// after every config_update, which re-runs this path). It is invisible
 		// to the session API, so there is no other lever.
+		h.consoleAuto.mu.Lock()
+		delete(h.consoleAuto.userStopped, hostID)
+		h.consoleAuto.mu.Unlock()
 		if !alreadyLaunched {
 			return
 		}
@@ -2043,6 +2095,12 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 	// A pinned connector missing from the report is simply not-present — never a
 	// silent fallback to a different monitor.
 	nowPresent := connectorPresent(connectors, cfg.PinnedConnector())
+	h.consoleAuto.mu.Lock()
+	if !nowPresent {
+		delete(h.consoleAuto.userStopped, hostID)
+	}
+	heldByUser := h.consoleAuto.userStopped[hostID]
+	h.consoleAuto.mu.Unlock()
 	if nowPresent {
 		h.consoleAuto.mu.Lock()
 		wasAbsent := h.clearConsoleAbsenceLocked(hostID)
@@ -2054,6 +2112,8 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 	}
 
 	switch {
+	case nowPresent && !alreadyLaunched && heldByUser:
+		h.log.Debug("console auto-start: stopped by its user, waiting for the display to go away", "host_id", hostID)
 	case nowPresent && !alreadyLaunched:
 		// A default app that cannot run direct fails console_default_app: no
 		// launch, and no failure for the backoff to count.
