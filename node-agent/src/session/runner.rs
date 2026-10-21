@@ -1491,6 +1491,14 @@ impl SessionTransports {
                 }
                 return Ok(None);
             }
+            server::Inbound::Refused => {
+                tracing::warn!(
+                    token = "signaling-answer-names-no-peer",
+                    "{pc} PC: dropped an answer with no ICE ufrag or no DTLS fingerprint; \
+                     the transport already has a peer and keeps it"
+                );
+                return Ok(None);
+            }
             server::Inbound::NewPeer(pc) => {
                 // Not applied either: it would rebind the current peer's transport.
                 if over_budget(&mut self.budget[i]) {

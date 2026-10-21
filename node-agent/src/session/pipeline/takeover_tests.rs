@@ -2527,6 +2527,69 @@ fn a_first_answer_that_cannot_be_applied_still_fails_the_launch() {
     );
 }
 
+/// `sdp` as a client that writes its own SDP might send it: no `a=fingerprint`.
+fn without_fingerprint(sdp: &str) -> String {
+    sdp.lines()
+        .filter(|l| !l.starts_with("a=fingerprint:"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n"
+}
+
+/// A second client sends `restart_ice` and then an answer that names no peer, while the
+/// first streams on the launch transport (#591). The answer is refused; the first keeps
+/// its stream and the session its life.
+#[test]
+fn an_answer_naming_no_peer_from_a_second_client_leaves_the_streaming_peer_alone() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("peerless", Duration::from_secs(600));
+    let mut a = Peer::new();
+    let up = session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p));
+    assert!(up, "the first peer never streamed: {}", describe(&a));
+    let answer = session.answers[PcId::Video as usize].clone().unwrap();
+
+    // The first peer answers nothing more; the second one's offer is the transport's.
+    session.mute = true;
+    let _ = session.to_host.send(SignalMsg::RestartIce {
+        pc: Some(PcId::Video),
+    });
+    let reoffered = session.pump(&mut a, Duration::from_secs(10), |s, _| s.offers[0] == 2);
+    assert!(reoffered, "offers per PC: {:?}", session.offers);
+    assert!(
+        session.ended.is_none(),
+        "ended on the re-offer: {:?}",
+        session.ended
+    );
+
+    let sdp = without_fingerprint(&with_other_ice(&answer));
+    let _ = session.to_host.send(SignalMsg::Answer {
+        sdp,
+        pc: Some(PcId::Video),
+    });
+    let before = rtp(&a.video);
+    session.pump(&mut a, Duration::from_secs(3), |s, _| s.ended.is_some());
+    assert!(
+        session.ended.is_none(),
+        "an answer that names no peer ended the session: {:?}",
+        session.ended
+    );
+    assert!(
+        rtp(&a.video) > before + 30,
+        "the first peer stopped receiving: {}",
+        describe(&a)
+    );
+
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.ends_within(Duration::from_secs(10));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the session did not stop: {ended:?}"
+    );
+}
+
 /// The page that took the session over went away before answering. The operator's stop
 /// must still end the session: terminal event, and the runner off its thread.
 #[test]
