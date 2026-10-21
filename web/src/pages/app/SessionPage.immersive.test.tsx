@@ -351,6 +351,21 @@ describe("SessionPage — #647 straight-in capture", () => {
     expect(playLayer()).toBeNull();
   });
 
+  it.each([
+    [true, false, true],
+    [false, true, false],
+  ])("secure=%s: insecure wording %s, no-Keyboard-Lock wording %s (#631)", async (secure, insecure, noLock) => {
+    Object.defineProperty(window, "isSecureContext", { value: secure, configurable: true });
+    try {
+      fsEl = document.documentElement;
+      await reveal();
+      expect(lastDrawerProps?.escInsecureContext).toBe(insecure);
+      expect(lastDrawerProps?.escNoKeyboardLock).toBe(noLock);
+    } finally {
+      Reflect.deleteProperty(window, "isSecureContext");
+    }
+  });
+
   it("with the setting on, hands the HUD a release hint", async () => {
     fsEl = document.documentElement;
     await reveal();
