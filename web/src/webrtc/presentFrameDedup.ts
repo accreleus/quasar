@@ -60,3 +60,17 @@ export function feedPresentedFrame(
     },
   };
 }
+
+/**
+ * The frame identity for feedPresentedFrame. The spec lets `mediaTime` be 0 for WebRTC
+ * and Firefox always reports 0, which would drop every frame as a duplicate; the RTP
+ * timestamp is per frame there. Any non-zero `mediaTime` is used as before.
+ */
+export function presentedFrameKey(
+  metadata: Pick<VideoFrameCallbackMetadata, "mediaTime" | "rtpTimestamp"> | undefined,
+): number | undefined {
+  if (metadata?.mediaTime === 0 && typeof metadata.rtpTimestamp === "number") {
+    return metadata.rtpTimestamp;
+  }
+  return metadata?.mediaTime;
+}

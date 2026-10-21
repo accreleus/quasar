@@ -299,6 +299,42 @@ describe("SessionTelemetry posted client_health on a Firefox-shaped report (#610
     expect(sample["client_health"]).toBe("decode_degrading");
   });
 
+  // #686: Firefox's frame callbacks carry mediaTime 0 and a per-frame rtpTimestamp.
+  async function sampleAfterFrames(gapsMs: number[]) {
+    const tm = telemetryWithStats(async () => firefoxReport(0.05));
+    const t = tm as unknown as {
+      overlayRunning: boolean;
+      onDisplayedFrame(m: VideoFrameCallbackMetadata): void;
+      pendingSamples: Array<Record<string, unknown>>;
+    };
+    t.overlayRunning = true;
+    let nowMs = 1000;
+    let rtp = 1347462624;
+    const now = vi.spyOn(performance, "now");
+    for (const gap of [0, ...gapsMs]) {
+      nowMs += gap;
+      rtp += Math.round(gap * 90);
+      now.mockReturnValue(nowMs);
+      t.onDisplayedFrame(metadata({ mediaTime: 0, rtpTimestamp: rtp }));
+    }
+    await pollOnce(tm);
+    now.mockRestore();
+    return t.pendingSamples[0]!;
+  }
+
+  it("posts smooth for a Firefox stream that presents evenly", async () => {
+    const sample = await sampleAfterFrames(Array(30).fill(33));
+    expect((sample["metrics"] as Record<string, number>)["present_n"]).toBe(30);
+    expect(sample["client_health"]).toBe("smooth");
+  });
+
+  it("posts presentation_degrading for a Firefox stream that stalls", async () => {
+    const gaps = Array(30).fill(33);
+    gaps.splice(10, 0, 400, 400, 400);
+    const sample = await sampleAfterFrames(gaps);
+    expect(sample["client_health"]).toBe("presentation_degrading");
+  });
+
   it("posts smooth once the report carries a freezeCount", async () => {
     const report = statsReport([
       {
