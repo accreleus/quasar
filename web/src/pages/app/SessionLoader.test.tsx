@@ -246,6 +246,32 @@ describe("SessionLoader — status block and rail", () => {
     expect(container.querySelector(".sl-quasar")).toBeNull();
   });
 
+  it.each([
+    ["takeover_abandoned", /can't take over the session/i],
+    ["takeover_rate_limited", /too many takeovers just now/i],
+  ] as const)("shows the %s copy at once, in place of any stall, with a way out", (code, title) => {
+    const onExit = vi.fn();
+    render(
+      <SessionLoader
+        statusMsg="answer sent"
+        streaming={false}
+        onExit={onExit}
+        sessionState="running"
+        hostAssigned
+        sessionRunning
+        iceState="failed"
+        wsOpen
+        takeoverRefused={code}
+      />,
+    );
+    expect(screen.getByText(title)).toBeInTheDocument();
+    expect(screen.queryByText(/the host is ready, but the video path is not/i)).not.toBeInTheDocument();
+    // Waiting brings no media, and leaving does not stop a running session.
+    expect(screen.queryByRole("button", { name: /keep waiting/i })).not.toBeInTheDocument();
+    screen.getByRole("button", { name: /back to library/i }).click();
+    expect(onExit).toHaveBeenCalledTimes(1);
+  });
+
   it("still offers a way out on an unreachable transport", () => {
     render(
       <SessionLoader

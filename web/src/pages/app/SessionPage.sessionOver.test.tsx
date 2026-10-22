@@ -57,7 +57,10 @@ let telemetryListener: ((snap: Record<string, unknown>) => void) | null = null;
 type Channel = { readyState: string; onclose: (() => void) | null; send: () => void; bufferedAmount: number };
 let lastOnChannel: ((ch: Channel) => void) | null = null;
 let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
-let lastTransport: { onHostBye?: (() => void) | null } | null = null;
+let lastTransport: {
+  onHostBye?: (() => void) | null;
+  onTakeoverRefused?: ((refusal: string) => void) | null;
+} | null = null;
 const attachMicTrack = vi.fn((_track: unknown) => Promise.resolve());
 const detachMicTrack = vi.fn(() => Promise.resolve());
 let constructed = 0;
@@ -1206,5 +1209,20 @@ describe("SessionPage — the loader's card is the notice until the lock, the ba
     expect(document.querySelector(".sl-root")).toBeNull();
     expect(exposedAlerts()).toEqual([expect.stringContaining(TAKEN)]);
     expect(screen.queryByTestId("hud")).toBeNull();
+  });
+});
+
+// Amendment 42: the host refused this page's takeover; the session runs on.
+describe("SessionPage — a refused takeover", () => {
+  it("shows the host's reason on the launch screen and leaves without stopping the session", async () => {
+    currentSession = makeSession({ state_detail: "app presented" });
+    renderPage();
+    await advance(1_000);
+    await act(async () => lastTransport?.onTakeoverRefused?.("takeover_rate_limited"));
+    expect(screen.getByText("Too many takeovers just now")).not.toBeNull();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /back to library/i })));
+    await advance(50);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(stopSession).not.toHaveBeenCalled();
   });
 });

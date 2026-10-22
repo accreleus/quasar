@@ -1,3 +1,5 @@
+import type { TakeoverRefusal } from "../../webrtc/session";
+
 // What a stalled launch is allowed to blame (#482). A scheduling reason may only
 // be shown while the session is genuinely unplaced; once it is running with no
 // ICE path, the transport is the suspect (`statusPhase` falls back to "host" for
@@ -92,6 +94,21 @@ export const TRANSPORT_STALL_COPY = {
     "This session is running on the host, but your browser and the host could not establish a media connection. The usual causes are that this device and the host are on different networks, that a firewall is blocking UDP, or that no STUN or TURN server is configured. Without one, media only works on a shared LAN or VPN; see the deployment guide's networking notes.",
 } as const;
 
+/** Why the host sends this page no media (amendment 42). The session is still running,
+ *  so neither verdict offers to stop it. */
+export const TAKEOVER_REFUSED_COPY: Record<TakeoverRefusal, { title: string; message: string }> = {
+  takeover_abandoned: {
+    title: "This browser can't take over the session",
+    message:
+      "The session is still running, but this browser could not accept its stream. It may not be able to decode the video format the session uses. Open the session on another device or browser.",
+  },
+  takeover_rate_limited: {
+    title: "Too many takeovers just now",
+    message:
+      "This session has moved between devices several times in the last minute, so the host is not accepting another yet. It is still playing where it was. Wait a minute, then open it again.",
+  },
+};
+
 /** The ICE connection states the decision reads. Mirrors RTCIceConnectionState. */
 export type TransportState =
   | "new"
@@ -133,7 +150,7 @@ export interface StallInputs {
 
 export interface StallVerdict {
   /** `"transport"` verdicts are about the media path, never about scheduling. */
-  kind: "phase" | "transport" | "signaling";
+  kind: "phase" | "transport" | "signaling" | "takeover";
   title: string;
   message: string;
 }
