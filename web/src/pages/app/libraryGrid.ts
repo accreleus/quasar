@@ -5,6 +5,7 @@
 // count is responsive — tiles sharing a row share one offsetTop regardless of count.
 
 import type { AppKind, SessionState } from "../../api/types";
+import { HOME_HOST_UNAVAILABLE } from "./capacityRetry";
 
 /** Whether a session state counts as "active / live". Lives here (not a .tsx page)
  *  so homeData's DOM-free rail logic can import it too. */
@@ -209,6 +210,7 @@ export function presentLaunchError<T extends HomeApp & { name: string }>(
   code: string,
   message: string,
   sessionId?: string,
+  reason?: string,
 ): LaunchErrorPresentation {
   const rootName = familyRootApp(apps, app)?.name ?? app.name;
   if (code === "home_in_use") {
@@ -238,6 +240,15 @@ export function presentLaunchError<T extends HomeApp & { name: string }>(
       variant: "danger",
       title: "Launch failed",
       body: "No host available right now — try again shortly.",
+    };
+  }
+  // Not retried (capacityRetry.ts): only an admin brings the host back, so say that.
+  // Names no host (amendment 40, #602).
+  if (code === "no_host_available" && reason === HOME_HOST_UNAVAILABLE) {
+    return {
+      variant: "info",
+      title: "Your saves are on an offline host",
+      body: "The host that holds your saves for this game is offline or no longer in the fleet. Ask your admin to bring it back, then try again.",
     };
   }
   // Reached only once the client's own no_host_available retry budget

@@ -23,7 +23,8 @@ export class ApiError extends Error {
   /** Seconds from the `Retry-After` response HEADER, not the JSON envelope, and
    *  only on `503 capacity_exhausted`. Undefined otherwise. */
   readonly retryAfterSeconds?: number;
-  /** The top-level `reason` beside `409 host_not_eligible`. */
+  /** The top-level `reason` beside `409 host_not_eligible`, or `error.reason`
+   *  (`503 no_host_available`, amendment 40). */
   readonly reason?: string;
 
   constructor(
@@ -71,6 +72,7 @@ async function parseError(res: Response): Promise<ApiError> {
     if (typeof data?.error?.live_sessions === "number") liveSessions = data.error.live_sessions;
     if (typeof data?.error?.session_id === "string") sessionId = data.error.session_id;
     if (typeof data?.reason === "string") reason = data.reason;
+    else if (typeof data?.error?.reason === "string") reason = data.error.reason;
   } catch {
     // Non-JSON error body (e.g. a proxy 502) — keep the status-derived defaults.
   }

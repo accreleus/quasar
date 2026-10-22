@@ -348,6 +348,21 @@ describe("presentLaunchError", () => {
     );
   });
 
+  it("no_host_available with reason home_host_unavailable gets its own copy and names no host (#602)", () => {
+    const result = presentLaunchError(family, gameA, "no_host_available", "raw message", undefined, "home_host_unavailable");
+    expect(result.variant).toBe("info");
+    expect(result.title).toBe("Your saves are on an offline host");
+    expect(result.body).toBe(
+      "The host that holds your saves for this game is offline or no longer in the fleet. Ask your admin to bring it back, then try again.",
+    );
+  });
+
+  it("no_host_available with a reason it does not know keeps the plain copy (#602)", () => {
+    const result = presentLaunchError(family, gameA, "no_host_available", "raw message", undefined, "something_new");
+    expect(result.title).toBe("Launch failed");
+    expect(result.body).toContain("No host is available right now");
+  });
+
   it("host_not_ready returns the standard title and body", () => {
     const result = presentLaunchError(family, gameA, "host_not_ready", "any message");
     expect(result.variant).toBe("info");

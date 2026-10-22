@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   decideCapacityRetry,
   DEFAULT_RETRY_DELAY_MS,
+  isCapacityRetryable,
   MAX_CAPACITY_RETRY_WAIT_MS,
   MAX_NO_HOST_RETRY_WAIT_MS,
   MIN_RETRY_DELAY_MS,
@@ -163,5 +164,21 @@ describe("decideCapacityRetry", () => {
       });
       expect(capacityDecision).toEqual({ kind: "retry", delayMs: DEFAULT_RETRY_DELAY_MS });
     });
+  });
+});
+
+describe("isCapacityRetryable (#602)", () => {
+  it("retries capacity_exhausted and a plain no_host_available", () => {
+    expect(isCapacityRetryable({ code: "capacity_exhausted" })).toBe(true);
+    expect(isCapacityRetryable({ code: "no_host_available" })).toBe(true);
+    expect(isCapacityRetryable({ code: "no_host_available", reason: "something_new" })).toBe(true);
+  });
+
+  it("does not retry a home on a host that is offline or gone", () => {
+    expect(isCapacityRetryable({ code: "no_host_available", reason: "home_host_unavailable" })).toBe(false);
+  });
+
+  it("retries nothing else", () => {
+    expect(isCapacityRetryable({ code: "host_not_ready" })).toBe(false);
   });
 });
