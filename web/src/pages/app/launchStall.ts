@@ -100,7 +100,7 @@ export const TAKEOVER_REFUSED_COPY: Record<TakeoverRefusal, { title: string; mes
   takeover_abandoned: {
     title: "This browser can't take over the session",
     message:
-      "The session is still running, but this browser could not accept its stream. It may not be able to decode the video format the session uses. Open the session on another device or browser; it ends in about 2 minutes if no device opens it.",
+      "The session is still running, but this browser could not accept its stream. It may not be able to decode the video format the session uses. Open the session on another device or browser; it ends shortly if no device opens it.",
   },
   takeover_rate_limited: {
     title: "Too many takeovers just now",
