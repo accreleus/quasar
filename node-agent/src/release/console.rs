@@ -31,7 +31,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -62,6 +62,13 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 /// While the actor has never answered, the wait between reads doubles from [`POLL_APPLYING`]
 /// this many times, up to [`POLL_UNSUPPORTED`].
 const UNREAD_BACKOFF_DOUBLINGS: u32 = 4;
+
+/// How long after this process started an actor that has never answered is reported
+/// `applying`. A replacement this process is part of is bounded by the actor's own
+/// verification deadline (`ReplaceTiming::verify_timeout` in `quasar-recovery`, 300 s;
+/// pinned by `the_unread_window_is_the_actors_verification_deadline`), so past it
+/// `applying` could not still be true (agent-api.md, `console_capabilities.access`).
+const UNREAD_WINDOW: Duration = Duration::from_secs(300);
 
 /// The `release_state` failure identifier for a put-back attempt the actor recorded no
 /// reason for (it was never journalled, so the actor restarted before it began).
@@ -163,6 +170,8 @@ pub struct ConsoleAccessManager {
     inner: Mutex<Inner>,
     /// Serialises the read-decide-submit sequence.
     op: Mutex<()>,
+    /// When this process started: the start of the [`UNREAD_WINDOW`].
+    started: Instant,
     /// The connection's wake-up to re-send `capacity`.
     upstream: Mutex<Option<mpsc::Sender<()>>>,
     /// The worker that runs requests and polls an applying attempt.
@@ -219,6 +228,17 @@ impl ConsoleAccessManager {
         )
     }
 
+    /// Polls so rarely that only an explicit hand-off to the worker can make it act.
+    #[cfg(test)]
+    pub fn owned_for_test_idle(socket: impl Into<PathBuf>, marker: bool) -> Arc<Self> {
+        Self::build(
+            Some(socket.into()),
+            marker,
+            false,
+            Duration::from_secs(3600),
+        )
+    }
+
     #[cfg(test)]
     pub fn owned_for_test_publishing(socket: impl Into<PathBuf>, marker: bool) -> Arc<Self> {
         Self::build(Some(socket.into()), marker, true, Duration::from_millis(20))
@@ -231,6 +251,7 @@ impl ConsoleAccessManager {
             engine_mode: AtomicU8::new(MODE_UNKNOWN),
             inner: Mutex::new(Inner::default()),
             op: Mutex::new(()),
+            started: Instant::now(),
             upstream: Mutex::new(None),
             worker: Mutex::new(None),
             publish,
@@ -268,7 +289,7 @@ impl ConsoleAccessManager {
             inner
                 .report
                 .clone()
-                .unwrap_or_else(|| self.derive_known(&inner)),
+                .unwrap_or_else(|| self.derive_known(&inner, Instant::now())),
         )
     }
 
@@ -307,7 +328,8 @@ impl ConsoleAccessManager {
 
     /// Publish the report derived from what is known, without waiting on the actor, for a
     /// connection whose read has not finished. The read's own `recompute` then re-sends.
-    /// Until this process has read the actor once that report is `applying`.
+    /// Until this process has read the actor once, and for the [`UNREAD_WINDOW`], that
+    /// report is `applying`.
     pub fn publish_known(&self) {
         if self.owned() {
             self.recompute();
@@ -347,9 +369,15 @@ impl ConsoleAccessManager {
     /// Start the worker if the actor's answer is still expected to change (an attempt is
     /// applying, the actor said unsupported, or a trigger waits for it), so it is read
     /// again until it settles.
+    ///
+    /// A trigger left waiting by a read that missed is handed to the worker at once, so it
+    /// is reconciled as soon as the read just made has landed, not after the worker's wait.
     pub fn watch_if_applying(self: &Arc<Self>) {
         if self.recheck().is_some() {
-            let _ = self.worker_tx();
+            let tx = self.worker_tx();
+            if let Some(want) = self.pending_retry() {
+                let _ = tx.send(want);
+            }
         }
     }
 
@@ -541,22 +569,29 @@ impl ConsoleAccessManager {
         }
     }
 
-    /// The report for what is known. Until the actor has answered once, a replacement may
+    /// The report for what is known. While the actor has never answered, a replacement may
     /// be under way that this process cannot see, and a settled `on`/`off` would lift the
-    /// control plane's placement hold on it: say `applying`.
-    fn derive_known(&self, inner: &Inner) -> ConsoleAccess {
+    /// control plane's placement hold on it: say `applying`, but only for the
+    /// [`UNREAD_WINDOW`] after this process started. Past it no replacement can still be
+    /// pending, and the report is the one from how this agent was created.
+    fn derive_known(&self, inner: &Inner, now: Instant) -> ConsoleAccess {
         match &inner.actor {
             Some(actor) => derive(self.marker, self.rootless(), actor),
-            None => unread(),
+            None if now.saturating_duration_since(self.started) < UNREAD_WINDOW => unread(),
+            None => derive(self.marker, self.rootless(), &unknown(self.marker)),
         }
     }
 
     /// Recompute the report from what is known, and publish and wake the connection
     /// when it changed.
     fn recompute(&self) {
+        self.recompute_at(Instant::now());
+    }
+
+    fn recompute_at(&self, now: Instant) {
         let changed = {
             let mut inner = self.inner.lock().unwrap();
-            let next = self.derive_known(&inner);
+            let next = self.derive_known(&inner, now);
             if inner.report.as_ref() == Some(&next) {
                 None
             } else {
@@ -646,8 +681,8 @@ fn unread() -> ConsoleAccess {
     }
 }
 
-/// A console status with nothing in flight and nothing settled: the base the tests build on.
-#[cfg(test)]
+/// A console status with nothing in flight and nothing settled: what an actor past the
+/// [`UNREAD_WINDOW`] that never answered is taken to have said, and the base the tests build on.
 fn unknown(marker: bool) -> ActorConsole {
     ActorConsole {
         enabled: marker,
@@ -858,6 +893,53 @@ mod tests_derive {
             assert_eq!(mgr.pending_retry(), Some(!marker), "the trigger is kept");
             forget_published();
         }
+    }
+
+    /// `applying` for an unread actor is bounded by the actor's own verification deadline,
+    /// counted from this process's start; past it the report is the marker-derived one, the
+    /// reads go on, and an answer that lands at any time settles it.
+    #[test]
+    fn an_unread_actor_is_applying_only_for_the_verification_window() {
+        let ms = Duration::from_millis(1);
+        let dir = tempfile::tempdir().unwrap();
+        for marker in [false, true] {
+            let settled = if marker {
+                ConsoleAccessState::On
+            } else {
+                ConsoleAccessState::Off
+            };
+            let mgr = ConsoleAccessManager::owned_for_test(dir.path().join("none.sock"), marker);
+            let start = mgr.started;
+            let state = |mgr: &ConsoleAccessManager| mgr.report().unwrap().state;
+
+            mgr.recompute_at(start + UNREAD_WINDOW - ms);
+            assert_eq!(state(&mgr), ConsoleAccessState::Applying);
+            mgr.recompute_at(start + UNREAD_WINDOW);
+            assert_eq!(state(&mgr), settled, "marker={marker}");
+            assert_eq!(mgr.report().unwrap().target, None);
+            assert!(mgr.recheck().is_some(), "an unread actor is read for ever");
+
+            // A read that lands inside the window, or after it, settles on the actor's word.
+            for at in [UNREAD_WINDOW - ms, UNREAD_WINDOW + ms] {
+                mgr.inner.lock().unwrap().actor = Some(status(
+                    marker,
+                    Some(last(!marker, "put_back", Some("unhealthy"))),
+                ));
+                mgr.recompute_at(start + at);
+                assert_eq!(state(&mgr), ConsoleAccessState::Restored, "at {at:?}");
+                mgr.inner.lock().unwrap().actor = None;
+            }
+        }
+    }
+
+    /// The window is the actor's `ReplaceTiming::verify_timeout` default, which this crate
+    /// cannot import outside tests.
+    #[test]
+    fn the_unread_window_is_the_actors_verification_deadline() {
+        assert_eq!(
+            UNREAD_WINDOW,
+            quasar_recovery::actor::ReplaceTiming::default().verify_timeout
+        );
     }
 
     #[test]

@@ -2028,9 +2028,9 @@ async fn connect_and_run(
     // never holds the dial, and the readiness refresh reports it once it answers.
     let actor_deadline = Instant::now() + crate::buildinfo::ACTOR_REGISTER_BUDGET;
     let actor_socket = release_mgr.actor_socket().map(std::path::Path::to_path_buf);
-    let install = offload_probe(move || {
+    let (install, actor_dark) = offload_probe(move || {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover(
+        crate::buildinfo::discover_observed(
             &runtime,
             actor_socket.as_deref(),
             crate::buildinfo::ACTOR_REGISTER_BUDGET,
@@ -2069,13 +2069,11 @@ async fn connect_and_run(
         console_access.publish_known();
     }
 
-    let actor_dark = install.install_mode == Some(crate::buildinfo::InstallMode::Owned)
-        && install.updater_present != Some(true);
     if actor_dark {
         warn!(
             token = "register-actor-dark",
-            "the recovery actor gave no usable status within {:?}: registering without it \
-             (updater_present=false); it is reported once it answers",
+            "the recovery actor gave no usable status within {:?}: registering without \
+             waiting for it; it is reported once it answers",
             crate::buildinfo::ACTOR_REGISTER_BUDGET
         );
     }

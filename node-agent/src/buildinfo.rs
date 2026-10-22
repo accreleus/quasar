@@ -205,21 +205,33 @@ pub fn discover(
     socket: Option<&std::path::Path>,
     actor_timeout: std::time::Duration,
 ) -> InstallFacts {
+    discover_observed(runtime, socket, actor_timeout).0
+}
+
+/// [`discover`], plus whether the recovery actor's own read missed (`false` with no
+/// actor): the facts may still carry an older answer of its in place of that read.
+pub fn discover_observed(
+    runtime: &ContainerRuntime,
+    socket: Option<&std::path::Path>,
+    actor_timeout: std::time::Duration,
+) -> (InstallFacts, bool) {
+    let mut actor_missed = false;
     let mut facts = match socket {
         Some(socket) => {
             let (read, _) = observe_owned_within(socket, actor_timeout);
+            actor_missed = read.updater_present != Some(true);
             // A register read that missed must not be less informed than the refresh that
             // corrects it only because it waited less: that refresh would find the
             // registered facts different on every dial and re-dial for ever.
             match last_answer() {
-                Some(seen) if read.updater_present != Some(true) => seen,
+                Some(seen) if actor_missed => seen,
                 _ => read,
             }
         }
         None => discover_install(&DockerFacts::new(runtime)),
     };
     facts.engine = EngineIdentity::observe();
-    facts
+    (facts, actor_missed)
 }
 
 /// An owned install asks its recovery actor over the agent socket. `updater_present` is
@@ -888,6 +900,12 @@ mod tests {
             discover(&runtime, Some(&dark), budget).updater_present,
             Some(true)
         );
+        // The facts carry the fresh observation, but this read missed and says so.
+        let (facts, missed) = discover_observed(&runtime, Some(&dark), budget);
+        assert_eq!(facts.updater_present, Some(true));
+        assert!(missed, "a dark actor is dark whatever the fallback holds");
+        let (_, missed) = discover_observed(&runtime, Some(&answering), budget);
+        assert!(!missed);
         forget_observed();
         let old = std::time::Instant::now()
             .checked_sub(INTERVAL + second)
