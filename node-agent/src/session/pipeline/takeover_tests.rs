@@ -2701,8 +2701,8 @@ fn a_takeover_answer_that_refuses_video_is_told_it_is_abandoned() {
         return;
     }
     let _serial = serial();
-    let shapes: [(&str, fn(&str) -> String); 2] = [
-        ("inactive-video", video_inactive),
+    let shapes = [
+        ("inactive-video", video_inactive as fn(&str) -> String),
         ("port0-video", video_at_port_zero),
     ];
     for (tag, refuse) in shapes {
