@@ -315,7 +315,7 @@ fn handle_inbound(
             // untagged (session="").
             pipeline::restart_ice(target, out_tx.clone(), pc, String::new());
         }
-        SignalMsg::Error { message } => tracing::warn!(
+        SignalMsg::Error { message, .. } => tracing::warn!(
             token = "signaling-peer-error",
             "peer signaled error: {message}"
         ),
@@ -383,6 +383,9 @@ pub(crate) enum Inbound {
     /// From a negotiation that is over: an answer from a peer whose transport was
     /// retired, or a candidate sent before the answer to a replaced transport's offer.
     Stale,
+    /// An answer that names no peer, on a transport that has one (#591): refused, not
+    /// applied.
+    Refused,
 }
 
 /// Classify `msg` for one PC.
@@ -416,6 +419,7 @@ pub(crate) fn classify_inbound(
             match from(sdp) {
                 AnswerFrom::NewPeer => Inbound::NewPeer(pc.unwrap_or_default()),
                 AnswerFrom::ThisPeerCorrecting => Inbound::Reoffer(pc.unwrap_or_default()),
+                AnswerFrom::NoPeer => Inbound::Refused,
                 AnswerFrom::ThisPeer => {
                     *unanswered = false;
                     Inbound::Apply

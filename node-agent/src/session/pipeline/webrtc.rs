@@ -999,6 +999,9 @@ pub(crate) enum AnswerFrom {
     ThisPeerCorrecting,
     /// A peer this transport cannot serve: its DTLS and SCTP associations are another's.
     NewPeer,
+    /// Not an answer a peer wrote, and the transport has a peer: applying it would be
+    /// rejected on whatever state that peer's transport is in (#591).
+    NoPeer,
 }
 
 /// This host never changes a transport's ICE credentials (webrtcbin ignores
@@ -1024,10 +1027,8 @@ pub(crate) fn answer_from(
     let Some(negotiated) = negotiated else {
         return AnswerFrom::ThisPeer; // nobody has answered on this transport yet
     };
-    // Not something a peer wrote. Applying it is what reports that; it must not cost the
-    // negotiated peer its transport.
     if !names_a_peer(answer) {
-        return AnswerFrom::ThisPeer;
+        return AnswerFrom::NoPeer;
     }
     let (was_ufrag, was_fingerprint) = peer_identity(negotiated);
     let (ufrag, fingerprint) = peer_identity(answer);
@@ -1197,7 +1198,8 @@ pub(crate) fn apply_remote_description(
                     "set-remote-description on the {pc} PeerConnection was a duplicate \
                      answer, ignored: {message}"
                 );
-            } else {
+            } else if on_failure.is_none() {
+                // With a receiver, it decides what the refusal costs and says so.
                 tracing::error!(
                     token = "webrtc-set-remote-failed",
                     "set-remote-description failed on the {pc} PeerConnection: {message}"
@@ -1411,16 +1413,21 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_that_names_no_peer_is_never_a_new_one() {
+    fn an_answer_that_names_no_peer_is_refused_once_the_transport_has_one() {
         let first = answer("aaaa", "AA:01");
         for malformed in ["", "not sdp", "v=0\r\na=ice-ufrag:bbbb\r\n"] {
             for (dtls, pending) in [(false, false), (false, true), (true, false), (true, true)] {
                 assert_eq!(
                     answer_from(Some(&first), malformed, dtls, pending),
-                    AnswerFrom::ThisPeer,
+                    AnswerFrom::NoPeer,
                     "{malformed:?}"
                 );
             }
+            // The first answer a transport gets is applied, whatever it says.
+            assert_eq!(
+                answer_from(None, malformed, false, false),
+                AnswerFrom::ThisPeer
+            );
         }
     }
 

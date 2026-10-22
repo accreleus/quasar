@@ -368,6 +368,7 @@ function SessionPageBody() {
     wsOpen,
     pcConnected,
     firstFrame,
+    takeoverRefused,
   } = runtimeSnap;
 
   useEffect(() => {
@@ -1107,11 +1108,17 @@ function SessionPageBody() {
           hostAssigned={hostAssigned}
           sessionRunning={sessionRunning}
           iceState={iceState}
+          takeoverRefused={takeoverRefused}
           // handleStop tears the session down server-side so "Back to
           // library" from a dead launch never orphans a session. Not for a
           // takeover: the other tab owns the session, and stopping it ends its stream.
-          // Nor a revoke: the control plane already stopped it.
-          onExit={() => (launchFailure && isBannerVerdict(launchFailure) ? navigate("/app") : void handleStop())}
+          // Nor a revoke: the control plane already stopped it. Nor a refused
+          // takeover: the session keeps running (amendment 42).
+          onExit={() =>
+            takeoverRefused || (launchFailure && isBannerVerdict(launchFailure))
+              ? navigate("/app")
+              : void handleStop()
+          }
         />
       )}
 

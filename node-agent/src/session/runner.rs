@@ -21,7 +21,7 @@ use super::encoder_stall;
 use super::metrics::SessionMetrics;
 use super::pipeline::{RemoteDescriptionApplied, RemoteDescriptionFailure};
 use super::server;
-use super::signaling::{PcId, SignalMsg};
+use super::signaling::{self, PcId, SignalMsg};
 use super::source::{AppSource, SessionResources};
 use super::vulkan_fault;
 use super::{pipeline, SessionConfig};
@@ -1474,7 +1474,8 @@ impl SessionTransports {
                         "{pc} PC: {MAX_REPLACEMENTS_PER_WINDOW} transport replacements or \
                          re-offers in {} s — an answer that asks for another is ignored \
                          until the window clears. The peer already connected keeps the \
-                         stream; the newer one gets no offer and no error",
+                         stream; the newer one gets no offer, only a takeover_rate_limited \
+                         error",
                         REPLACEMENT_WINDOW.as_secs()
                     );
                 }
@@ -1491,9 +1492,24 @@ impl SessionTransports {
                 }
                 return Ok(None);
             }
+            server::Inbound::Refused => {
+                tracing::warn!(
+                    token = "signaling-answer-names-no-peer",
+                    "{pc} PC: dropped an answer with no ICE ufrag or no DTLS fingerprint; \
+                     the transport already has a peer and keeps it"
+                );
+                return Ok(None);
+            }
             server::Inbound::NewPeer(pc) => {
                 // Not applied either: it would rebind the current peer's transport.
                 if over_budget(&mut self.budget[i]) {
+                    // To this answer's sender only; the streaming peer's late answers
+                    // classify `ThisPeer` (same ufrag) and are told nothing (amendment 42).
+                    let _ = out_tx.send(SignalMsg::takeover_error(
+                        signaling::TAKEOVER_RATE_LIMITED,
+                        pc,
+                        "too many takeovers of this session in the last minute; try again shortly",
+                    ));
                     return Ok(None);
                 }
                 tracing::info!(
@@ -1579,6 +1595,15 @@ impl SessionTransports {
         }
         Ok(None)
     }
+}
+
+/// Tell the client holding signaling that its takeover on `pc` gets no media (amendment 42).
+fn abandon_takeover(out_tx: &pipeline::OutTx, pc: PcId) {
+    let _ = out_tx.send(SignalMsg::takeover_error(
+        signaling::TAKEOVER_ABANDONED,
+        pc,
+        "this device cannot take the session over; the session keeps running",
+    ));
 }
 
 /// Take `old` to NULL and build the audio PC for a new peer on a thread of their own,
@@ -2438,6 +2463,8 @@ pub fn run_blocking(
         .or_else(|| encode_pipe.by_name(pipeline::VULKAN_ENCODER_NAME));
     let mut running_since: Option<Instant> = None;
     let mut ever_connected = false;
+    // The session has streamed on some transport; `ever_connected` is the current one's.
+    let mut streamed = false;
     let mut unhealthy_since: Option<Instant> = None;
     // When the video transport was last replaced for a new peer (#535).
     let mut transport_since: Option<Instant> = None;
@@ -2908,6 +2935,21 @@ pub fn run_blocking(
             if let Some(changed) = ufrag_changed {
                 payload["ice_ufrag_changed"] = serde_json::Value::Bool(changed);
             }
+            if applied.pc == PcId::Video
+                && transports.is_replacement(PcId::Video)
+                && answer
+                    .m_lines
+                    .iter()
+                    .any(|m| m.kind == "video" && m.rejected)
+            {
+                tracing::warn!(
+                    token = "transport-replacement-video-refused",
+                    session_id = %session_id,
+                    "the peer taking the session over refused the video m-line; that \
+                     takeover is abandoned and the session keeps running"
+                );
+                abandon_takeover(&sig_tx, PcId::Video);
+            }
             if rejected > 0 {
                 // Names the codec: "an m-line was rejected" is the symptom, "the peer will
                 // not take h265" is the cause.
@@ -2978,6 +3020,7 @@ pub fn run_blocking(
                      apply; that takeover is abandoned and the session keeps running: \
                      {reason}"
                 );
+                abandon_takeover(&sig_tx, failure.pc);
                 continue;
             }
             tracing::error!(
@@ -3191,6 +3234,7 @@ pub fn run_blocking(
                 .property::<gstreamer_webrtc::WebRTCICEConnectionState>("ice-connection-state");
             if ice_is_connected(ice) {
                 ever_connected = true;
+                streamed = true;
                 unhealthy_since = None;
             } else if ice_is_dead(ice) {
                 unhealthy_since.get_or_insert_with(Instant::now);
@@ -3217,8 +3261,8 @@ pub fn run_blocking(
                 tracing::warn!(
                     token = "session-teardown-summary",
                     session_id = %session_id,
-                    "session teardown: reason={reason} ever_connected={ever_connected} \
-                     running_for={}s app_presented={}",
+                    "session teardown: reason={reason} ever_connected={streamed} \
+                     transport_connected={ever_connected} running_for={}s app_presented={}",
                     running_for.as_secs(),
                     app_presented_at.is_some()
                 );
@@ -3226,11 +3270,21 @@ pub fn run_blocking(
                 stop_source(&mut current_source, &transports);
                 super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                 transports.audio_pipeline.finish();
-                tracing::error!(
-                    token = "runner-idle-reap-failed",
-                    reason = %reason,
-                    "session failed via idle reap"
-                );
+                // A session that streamed and then went idle is an ended session (the
+                // takeover-abandoned path leaves it to this reap), not a fault.
+                if streamed {
+                    tracing::warn!(
+                        token = "runner-idle-reap-after-stream",
+                        reason = %reason,
+                        "session ended via idle reap (it had streamed)"
+                    );
+                } else {
+                    tracing::error!(
+                        token = "runner-idle-reap-failed",
+                        reason = %reason,
+                        "session ended via idle reap (it never streamed)"
+                    );
+                }
                 emit(SessionEvent::Failed(reason.to_string()));
                 return;
             }
