@@ -172,10 +172,16 @@ impl ReleaseManager {
             return false;
         }
         let now = crate::buildinfo::discover_owned(socket);
+        crate::buildinfo::note_observed(&now);
         let registered = crate::buildinfo::install_facts();
         now.updater_present == Some(true)
             && (now.recovery_actor_source_commit != registered.recovery_actor_source_commit
                 || now.recovery_actor_version != registered.recovery_actor_version)
+    }
+
+    /// The recovery actor's agent socket; `None` on a host with no actor.
+    pub fn actor_socket(&self) -> Option<&Path> {
+        self.socket.as_deref()
     }
 
     pub fn from_env() -> Arc<Self> {

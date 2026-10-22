@@ -242,7 +242,11 @@ pub async fn run(cfg: Config) {
     // identity-unknown (agent-api.md §register).
     let runtime = {
         let (runtime, facts) = offload_probe(move || {
-            let facts = crate::buildinfo::discover(&runtime);
+            let facts = crate::buildinfo::discover(
+                &runtime,
+                crate::buildinfo::owned_socket().as_deref(),
+                crate::buildinfo::ACTOR_REGISTER_BUDGET,
+            );
             (runtime, facts)
         })
         .await;
@@ -1890,7 +1894,11 @@ async fn diagnostic_connection(
     let images = crate::images::register_images_from_state(&cfg.image_state_path());
     let install = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover(&runtime)
+        crate::buildinfo::discover(
+            &runtime,
+            crate::buildinfo::owned_socket().as_deref(),
+            crate::buildinfo::ACTOR_REGISTER_BUDGET,
+        )
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
@@ -2015,10 +2023,18 @@ async fn connect_and_run(
 
     // Re-discovered per connection, not once at boot: an updater that starts
     // after the agent must not leave the host reporting updater_present=false
-    // forever. Offloaded because it shells out to docker.
-    let install = offload_probe(|| {
+    // forever. Offloaded because it shells out to docker. The recovery actor gets
+    // `ACTOR_REGISTER_BUDGET` in all (here and in the console read below): a dark one
+    // never holds the dial, and the readiness refresh reports it once it answers.
+    let actor_deadline = Instant::now() + crate::buildinfo::ACTOR_REGISTER_BUDGET;
+    let actor_socket = release_mgr.actor_socket().map(std::path::Path::to_path_buf);
+    let (install, actor_dark) = offload_probe(move || {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover(&runtime)
+        crate::buildinfo::discover_observed(
+            &runtime,
+            actor_socket.as_deref(),
+            crate::buildinfo::ACTOR_REGISTER_BUDGET,
+        )
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
@@ -2027,19 +2043,55 @@ async fn connect_and_run(
     console_access.set_engine_mode(install.engine.engine_mode.as_deref());
     crate::ddc::set_rootless(install.engine.engine_mode.as_deref() == Some("rootless"));
     let mut console_access_rx = console_access.owned().then(|| console_access.subscribe());
-    {
+    // A read that outlasts the budget finishes on its own thread; its change wakes
+    // `console_access_rx`, which re-sends `capacity`.
+    let console_read = {
         let ca = console_access.clone();
-        offload_probe(move || ca.refresh()).await;
+        tokio::spawn(async move {
+            let read = tokio::task::spawn_blocking(move || {
+                ca.refresh();
+                ca.watch_if_applying();
+            });
+            if let Err(e) = read.await {
+                warn!(
+                    token = "register-console-read-failed",
+                    "the console access read failed: {e}"
+                );
+            }
+        })
+    };
+    if tokio::time::timeout_at(actor_deadline.into(), console_read)
+        .await
+        .is_err()
+    {
+        // `capacity` carries `access`, and an absent one clears the control plane's stored
+        // state (agent-api.md): say what is known until the read lands.
+        console_access.publish_known();
     }
-    console_access.watch_if_applying();
 
+    if actor_dark {
+        warn!(
+            token = "register-actor-dark",
+            "the recovery actor gave no usable status within {:?}: registering without \
+             waiting for it; it is reported once it answers",
+            crate::buildinfo::ACTOR_REGISTER_BUDGET
+        );
+    }
     let prep = prep_started.elapsed();
-    if register_prep_over_budget(prep) {
+    // Only a dark actor's share is taken out: one that answers `/v1/status` but is slow on
+    // `/v1/console` leaves up to the budget of its wait in here, so `register-prep-slow` can
+    // still name the runtime for it.
+    let runtime_prep = if actor_dark {
+        prep.saturating_sub(crate::buildinfo::ACTOR_REGISTER_BUDGET)
+    } else {
+        prep
+    };
+    if register_prep_over_budget(runtime_prep) {
         warn!(
             token = "register-prep-slow",
-            elapsed_ms = prep.as_millis() as u64,
+            elapsed_ms = runtime_prep.as_millis() as u64,
             "register preparation (image reconcile + install probe against the container \
-             runtime) took {prep:?} — the container runtime is answering slowly; \
+             runtime) took {runtime_prep:?} — the container runtime is answering slowly; \
              registration still proceeds, but sessions on this host will feel it"
         );
     }
@@ -7854,6 +7906,221 @@ mod tests {
             ack_after < Duration::from_secs(3),
             "the assign was acked {ack_after:?} after it was sent"
         );
+    }
+
+    /// #687: register preparation waits for a recovery actor that never answers (a paused
+    /// one) only `ACTOR_REGISTER_BUDGET`, in all: the install probe and the console read
+    /// both ask it, and each used to wait its own 8 s and 10 s before the dial. The fake
+    /// control plane follows agentws's order: `register`, `registered`, then the agent's
+    /// `capacity`, after which it assigns a session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dark_recovery_actor_does_not_hold_the_dial() {
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        crate::buildinfo::forget_observed();
+        let dir = tempfile::tempdir().unwrap();
+        let actor = dir.path().join("actor.sock");
+        let _actor = std::os::unix::net::UnixListener::bind(&actor).unwrap();
+        let release_mgr = ReleaseManager::owned(&actor);
+
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret = dir.path().join("secret");
+        let cfg = Config {
+            control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let started = Instant::now();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            fn next_text(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> String {
+                loop {
+                    if let Message::Text(t) = ws.read().expect("the agent stays connected") {
+                        return t.to_string();
+                    }
+                }
+            }
+            let (stream, _) = cp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let register = next_text(&mut ws);
+            let registered_after = started.elapsed();
+            ws.send(Message::Text(
+                r#"{"type":"registered","host_id":"h1","node_secret":null,"heartbeat_interval_ms":5000}"#
+                    .into(),
+            ))
+            .unwrap();
+            while !next_text(&mut ws).contains(r#""type":"capacity""#) {}
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "session_assign", "id": "assign-1", "session_id": "s1",
+                    "gpu_index": 0,
+                    "stream": {"width": 1920, "height": 1080, "fps": 60,
+                        "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+            loop {
+                let frame = next_text(&mut ws);
+                if frame.contains(r#""type":"ack""#) && frame.contains(r#""id":"assign-1""#) {
+                    break;
+                }
+            }
+            let _ = seen_tx.send((register, registered_after));
+        });
+
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        sessions.mgr.console_access =
+            crate::release::console::ConsoleAccessManager::owned_for_test(&actor, false);
+        let attempt = connect_and_run(
+            &cfg,
+            &health,
+            "",
+            "test",
+            &image_mgr,
+            &release_mgr,
+            &mut sessions,
+            false,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(60), attempt).await;
+        let (register, after) = seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake control plane saw register and the assign's ack");
+        assert!(
+            after < Duration::from_secs(8),
+            "register reached the control plane {after:?} after the attempt began"
+        );
+        assert!(register.contains(r#""install_mode":"owned""#), "{register}");
+        assert!(
+            register.contains(r#""updater_present":false"#),
+            "{register}"
+        );
+    }
+
+    /// #687: a console read that outlasts the register budget leaves the first `capacity`
+    /// carrying `access` as `applying` (an absent one clears the control plane's stored
+    /// state, agent-api.md, and a settled `on`/`off` lifts its placement hold on a
+    /// replacement this process cannot see), and the late read then sends the actor's answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_console_read_is_published_before_the_dial_and_re_sent_when_it_lands() {
+        use std::io::{Read, Write};
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        crate::buildinfo::forget_observed();
+        crate::release::console::forget_published();
+        let dir = tempfile::tempdir().unwrap();
+        let actor = dir.path().join("actor.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&actor).unwrap();
+        // /v1/status never answers; /v1/console answers 3 s after it is asked.
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                std::thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && conn.read(&mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                    }
+                    if String::from_utf8_lossy(&head).contains("/v1/status") {
+                        std::thread::sleep(Duration::from_secs(60));
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(3));
+                    let body = r#"{"enabled":false,"supported":true}"#;
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let release_mgr = ReleaseManager::owned(&actor);
+
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret = dir.path().join("secret");
+        let cfg = Config {
+            control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = cp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let mut capacities = Vec::new();
+            let mut registered = false;
+            while !capacities
+                .last()
+                .is_some_and(|c: &String| c.contains(r#""access":{"state":"off""#))
+            {
+                let Ok(Message::Text(t)) = ws.read() else {
+                    continue;
+                };
+                let t = t.to_string();
+                if t.contains(r#""type":"register""#) && !registered {
+                    registered = true;
+                    ws.send(Message::Text(
+                        r#"{"type":"registered","host_id":"h1","node_secret":null,"heartbeat_interval_ms":5000}"#
+                            .into(),
+                    ))
+                    .unwrap();
+                } else if t.contains(r#""type":"capacity""#) {
+                    capacities.push(t);
+                }
+            }
+            let _ = seen_tx.send(capacities);
+        });
+
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        sessions.mgr.console_access =
+            crate::release::console::ConsoleAccessManager::owned_for_test_publishing(&actor, false);
+        let attempt = connect_and_run(
+            &cfg,
+            &health,
+            "",
+            "test",
+            &image_mgr,
+            &release_mgr,
+            &mut sessions,
+            false,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(25), attempt).await;
+        let capacities = seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a capacity carried the late console read");
+        assert!(
+            capacities[0].contains(r#""access":{"state":"applying""#),
+            "before any actor answer the first capacity must say applying: {}",
+            capacities[0]
+        );
+        for early in &capacities[..capacities.len() - 1] {
+            assert!(
+                !early.contains(r#""access":{"state":"off""#)
+                    && !early.contains(r#""access":{"state":"on""#),
+                "a settled state was published before the actor answered: {early}"
+            );
+        }
+        crate::release::console::forget_published();
     }
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`

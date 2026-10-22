@@ -31,7 +31,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -58,6 +58,19 @@ const POLL_RETRY: Duration = Duration::from_secs(5);
 
 /// How long one request to the actor may take.
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// While the actor has never answered, the wait between reads doubles from [`POLL_APPLYING`]
+/// this many times, up to [`POLL_UNSUPPORTED`].
+const UNREAD_BACKOFF_DOUBLINGS: u32 = 4;
+
+/// How long after this process started an actor that has never answered is reported
+/// `applying`. A replacement this process is part of is bounded by the actor's own
+/// verification deadline (`ReplaceTiming::verify_timeout` in `quasar-recovery`, 300 s;
+/// pinned by `the_unread_window_is_the_actors_verification_deadline`), so an actor that has
+/// answered no read for that long is not serving, and a verify it resumes later is read on
+/// the next poll (agent-api.md, `console_capabilities.access`). The report changes on the
+/// first worker read past the window, up to one backoff wait plus one read later.
+const UNREAD_WINDOW: Duration = Duration::from_secs(300);
 
 /// The `release_state` failure identifier for a put-back attempt the actor recorded no
 /// reason for (it was never journalled, so the actor restarted before it began).
@@ -145,6 +158,9 @@ struct Inner {
     /// A received `enabled` the trigger wanted but the actor could not take yet (busy,
     /// silent, unsupported): reconciled again as the actor is re-read.
     retry: Option<bool>,
+    /// Reads of the actor that failed since this process started, while it has not answered
+    /// once: they stretch the wait before the next one.
+    unread_misses: u32,
 }
 
 pub struct ConsoleAccessManager {
@@ -156,6 +172,8 @@ pub struct ConsoleAccessManager {
     inner: Mutex<Inner>,
     /// Serialises the read-decide-submit sequence.
     op: Mutex<()>,
+    /// When this process started: the start of the [`UNREAD_WINDOW`].
+    started: Instant,
     /// The connection's wake-up to re-send `capacity`.
     upstream: Mutex<Option<mpsc::Sender<()>>>,
     /// The worker that runs requests and polls an applying attempt.
@@ -171,6 +189,11 @@ pub struct ConsoleAccessManager {
 
 /// The process-wide manager's current report, for every `capacity` the agent sends.
 static PUBLISHED: RwLock<Option<ConsoleAccess>> = RwLock::new(None);
+
+#[cfg(test)]
+pub fn forget_published() {
+    *PUBLISHED.write().unwrap() = None;
+}
 
 /// The current `console_capabilities.access`; `None` on a host with no recovery actor.
 pub fn published() -> Option<ConsoleAccess> {
@@ -207,6 +230,22 @@ impl ConsoleAccessManager {
         )
     }
 
+    /// Polls so rarely that only an explicit hand-off to the worker can make it act.
+    #[cfg(test)]
+    pub fn owned_for_test_idle(socket: impl Into<PathBuf>, marker: bool) -> Arc<Self> {
+        Self::build(
+            Some(socket.into()),
+            marker,
+            false,
+            Duration::from_secs(3600),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn owned_for_test_publishing(socket: impl Into<PathBuf>, marker: bool) -> Arc<Self> {
+        Self::build(Some(socket.into()), marker, true, Duration::from_millis(20))
+    }
+
     fn build(socket: Option<PathBuf>, marker: bool, publish: bool, poll: Duration) -> Arc<Self> {
         Arc::new(ConsoleAccessManager {
             socket,
@@ -214,6 +253,7 @@ impl ConsoleAccessManager {
             engine_mode: AtomicU8::new(MODE_UNKNOWN),
             inner: Mutex::new(Inner::default()),
             op: Mutex::new(()),
+            started: Instant::now(),
             upstream: Mutex::new(None),
             worker: Mutex::new(None),
             publish,
@@ -247,13 +287,12 @@ impl ConsoleAccessManager {
     pub fn report(&self) -> Option<ConsoleAccess> {
         self.socket.as_ref()?;
         let inner = self.inner.lock().unwrap();
-        Some(inner.report.clone().unwrap_or_else(|| {
-            derive(
-                self.marker,
-                self.rootless(),
-                inner.actor.as_ref().unwrap_or(&unknown(self.marker)),
-            )
-        }))
+        Some(
+            inner
+                .report
+                .clone()
+                .unwrap_or_else(|| self.derive_known(&inner, Instant::now())),
+        )
     }
 
     /// This connection's wake-up: one message whenever `access` changes, so the
@@ -289,6 +328,16 @@ impl ConsoleAccessManager {
         self.recompute();
     }
 
+    /// Publish the report derived from what is known, without waiting on the actor, for a
+    /// connection whose read has not finished. The read's own `recompute` then re-sends.
+    /// Until this process has read the actor once, and for the [`UNREAD_WINDOW`], that
+    /// report is `applying`.
+    pub fn publish_known(&self) {
+        if self.owned() {
+            self.recompute();
+        }
+    }
+
     /// A `config_update` carried `console_config`: reconcile toward its `enabled` on the
     /// worker. Returns at once.
     pub fn request(self: &Arc<Self>, enabled: bool) {
@@ -322,14 +371,31 @@ impl ConsoleAccessManager {
     /// Start the worker if the actor's answer is still expected to change (an attempt is
     /// applying, the actor said unsupported, or a trigger waits for it), so it is read
     /// again until it settles.
+    ///
+    /// A trigger left waiting by a read that missed is handed to the worker at once, so it
+    /// is reconciled as soon as the read just made has landed, not after the worker's wait.
     pub fn watch_if_applying(self: &Arc<Self>) {
         if self.recheck().is_some() {
-            let _ = self.worker_tx();
+            let tx = self.worker_tx();
+            if let Some(want) = self.pending_retry() {
+                let _ = tx.send(want);
+            }
         }
     }
 
     /// How soon the actor's status should be read again, if at all.
     fn recheck(&self) -> Option<Duration> {
+        if self.owned() {
+            let inner = self.inner.lock().unwrap();
+            if inner.actor.is_none() {
+                let widen = 1u32 << inner.unread_misses.min(UNREAD_BACKOFF_DOUBLINGS);
+                return Some(
+                    self.poll
+                        .saturating_mul(widen)
+                        .min(self.poll_unsupported.max(self.poll)),
+                );
+            }
+        }
         if self.applying() {
             return Some(self.poll);
         }
@@ -371,6 +437,12 @@ impl ConsoleAccessManager {
         self.recompute();
         let (report, suppressed) = {
             let mut inner = self.inner.lock().unwrap();
+            // The actor still has not answered, so nothing here can be decided: keep the
+            // trigger for when a read gets through.
+            if inner.actor.is_none() {
+                inner.retry = Some(want);
+                return;
+            }
             // Receiving an `enabled` that differs from a put-back or refused target lifts
             // the hold on asking for that target again.
             if let Some(last) = inner.actor.as_ref().and_then(|a| a.last.clone()) {
@@ -485,19 +557,43 @@ impl ConsoleAccessManager {
         let Some(socket) = self.socket.as_deref() else {
             return;
         };
-        if let Some(status) = get_status(socket) {
-            self.inner.lock().unwrap().actor = Some(status);
+        let status = get_status(socket);
+        let mut inner = self.inner.lock().unwrap();
+        match status {
+            Some(status) => {
+                inner.actor = Some(status);
+                inner.unread_misses = 0;
+            }
+            None if inner.actor.is_none() => {
+                inner.unread_misses = inner.unread_misses.saturating_add(1);
+            }
+            None => {}
+        }
+    }
+
+    /// The report for what is known. While the actor has never answered, a replacement may
+    /// be under way that this process cannot see, and a settled `on`/`off` would lift the
+    /// control plane's placement hold on it: say `applying`, but only for the
+    /// [`UNREAD_WINDOW`] after this process started. Past it the report is the one from how
+    /// this agent was created, until a read lands.
+    fn derive_known(&self, inner: &Inner, now: Instant) -> ConsoleAccess {
+        match &inner.actor {
+            Some(actor) => derive(self.marker, self.rootless(), actor),
+            None if now.saturating_duration_since(self.started) < UNREAD_WINDOW => unread(),
+            None => derive(self.marker, self.rootless(), &unknown(self.marker)),
         }
     }
 
     /// Recompute the report from what is known, and publish and wake the connection
     /// when it changed.
     fn recompute(&self) {
-        let rootless = self.rootless();
+        self.recompute_at(Instant::now());
+    }
+
+    fn recompute_at(&self, now: Instant) {
         let changed = {
             let mut inner = self.inner.lock().unwrap();
-            let actor = inner.actor.clone().unwrap_or_else(|| unknown(self.marker));
-            let next = derive(self.marker, rootless, &actor);
+            let next = self.derive_known(&inner, now);
             if inner.report.as_ref() == Some(&next) {
                 None
             } else {
@@ -572,7 +668,23 @@ fn get_status(socket: &Path) -> Option<ActorConsole> {
         .ok()
 }
 
-/// What is assumed before the actor first answers: the access this agent was created with.
+/// The report before the actor has answered once: unknown, so not a settled state.
+fn unread() -> ConsoleAccess {
+    ConsoleAccess {
+        state: ConsoleAccessState::Applying,
+        target: None,
+        request_id: None,
+        reason: None,
+        started_at: None,
+        finished_at: None,
+        summary: "The node agent has not yet read the recovery actor's console status, so it \
+                  cannot say whether console mode is being changed."
+            .into(),
+    }
+}
+
+/// A console status with nothing in flight and nothing settled: what an actor past the
+/// [`UNREAD_WINDOW`] that never answered is taken to have said, and the base the tests build on.
 fn unknown(marker: bool) -> ActorConsole {
     ActorConsole {
         enabled: marker,
@@ -748,6 +860,88 @@ mod tests_derive {
             last,
             ..unknown(enabled)
         }
+    }
+
+    /// An actor that has never answered: a settled `on`/`off` would lift the control plane's
+    /// placement hold on a replacement this process cannot see, so the report is `applying`
+    /// until a read says otherwise, and the reads go on, ever less often.
+    #[test]
+    fn an_actor_never_read_is_applying_and_is_read_again_with_backoff() {
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        for marker in [false, true] {
+            let mgr = ConsoleAccessManager::owned_for_test_publishing(
+                dir.path().join("none.sock"),
+                marker,
+            );
+            forget_published();
+            mgr.publish_known();
+            assert_eq!(published().unwrap().state, ConsoleAccessState::Applying);
+            assert_eq!(mgr.report().unwrap().state, ConsoleAccessState::Applying);
+
+            let poll = mgr.poll;
+            let mut waits = Vec::new();
+            for _ in 0..6 {
+                mgr.refresh();
+                assert_eq!(mgr.report().unwrap().state, ConsoleAccessState::Applying);
+                waits.push(mgr.recheck().expect("an unread actor is read again"));
+            }
+            assert_eq!(waits[0], poll * 2);
+            assert_eq!(waits[2], poll * 8);
+            assert!(waits[5] <= poll * 16, "the wait is bounded: {waits:?}");
+            assert!(waits.windows(2).all(|w| w[0] <= w[1]), "{waits:?}");
+
+            mgr.reconcile(!marker);
+            assert_eq!(mgr.pending_retry(), Some(!marker), "the trigger is kept");
+            forget_published();
+        }
+    }
+
+    /// `applying` for an unread actor is bounded by the actor's own verification deadline,
+    /// counted from this process's start; past it the report is the marker-derived one, the
+    /// reads go on, and an answer that lands at any time settles it.
+    #[test]
+    fn an_unread_actor_is_applying_only_for_the_verification_window() {
+        let ms = Duration::from_millis(1);
+        let dir = tempfile::tempdir().unwrap();
+        for marker in [false, true] {
+            let settled = if marker {
+                ConsoleAccessState::On
+            } else {
+                ConsoleAccessState::Off
+            };
+            let mgr = ConsoleAccessManager::owned_for_test(dir.path().join("none.sock"), marker);
+            let start = mgr.started;
+            let state = |mgr: &ConsoleAccessManager| mgr.report().unwrap().state;
+
+            mgr.recompute_at(start + UNREAD_WINDOW - ms);
+            assert_eq!(state(&mgr), ConsoleAccessState::Applying);
+            mgr.recompute_at(start + UNREAD_WINDOW);
+            assert_eq!(state(&mgr), settled, "marker={marker}");
+            assert_eq!(mgr.report().unwrap().target, None);
+            assert!(mgr.recheck().is_some(), "an unread actor is read for ever");
+
+            // A read that lands inside the window, or after it, settles on the actor's word.
+            for at in [UNREAD_WINDOW - ms, UNREAD_WINDOW + ms] {
+                mgr.inner.lock().unwrap().actor = Some(status(
+                    marker,
+                    Some(last(!marker, "put_back", Some("unhealthy"))),
+                ));
+                mgr.recompute_at(start + at);
+                assert_eq!(state(&mgr), ConsoleAccessState::Restored, "at {at:?}");
+                mgr.inner.lock().unwrap().actor = None;
+            }
+        }
+    }
+
+    /// The window is the actor's `ReplaceTiming::verify_timeout` default, which this crate
+    /// cannot import outside tests.
+    #[test]
+    fn the_unread_window_is_the_actors_verification_deadline() {
+        assert_eq!(
+            UNREAD_WINDOW,
+            quasar_recovery::actor::ReplaceTiming::default().verify_timeout
+        );
     }
 
     #[test]
