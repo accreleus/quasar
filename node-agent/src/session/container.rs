@@ -62,23 +62,20 @@ use anyhow::{anyhow, Context, Result};
 use crate::messages::AppExitPolicy;
 use crate::nvidia_volume::VolumeInfo;
 use crate::runtime::{ApplicationId, ApplicationMount, ApplicationRequest};
-use crate::session::teardown::{retry_busy, RetryBudget, STOP_PAUSE};
+use crate::session::teardown::{retry_busy, STOP_PAUSE};
 
-/// The launch's image step, waiting out an admission refusal within `budget`.
+/// The launch's image step, waiting out an admission refusal.
 fn ensure_launch_image(
     runtime: &crate::runtime::RuntimeClient,
     request: &ApplicationRequest,
-    budget: &RetryBudget,
 ) -> Result<()> {
     if request.pull_never {
         anyhow::ensure!(
-            retry_busy(budget, STOP_PAUSE, || runtime
-                .image_present(&request.image)
-                .wait())?,
+            retry_busy(STOP_PAUSE, || runtime.image_present(&request.image).wait())?,
             "required local application image is missing"
         );
     } else {
-        retry_busy(budget, STOP_PAUSE, || {
+        retry_busy(STOP_PAUSE, || {
             runtime
                 .ensure_image(request.image.clone(), Duration::from_secs(300))
                 .wait(|_| {})
@@ -1370,20 +1367,17 @@ impl ContainerRuntime {
         let mut request = application_request_from_args(&args, operation.clone())?;
         request.unmount_nvidia_params = systempaths_unconfined;
         let runtime = crate::runtime::configured().map_err(|error| anyhow!(error))?;
-        // One allowance for the whole launch step: a refusal reached no engine, so it waits
-        // for a slot as the launch's image preparation does instead of failing the session.
-        let budget = RetryBudget::new(crate::runtime::LAUNCH_BUSY_BUDGET);
         // Do not mint this attempt until every older writer for this name or
         // normalized managed-home source has been explicitly retired. RuntimeClient
         // reconciles only the recorded stable operation.
         retire_matching_pending_applications(&name, &request, |operation| {
-            retry_busy(&budget, STOP_PAUSE, || {
+            retry_busy(STOP_PAUSE, || {
                 runtime.abandon_application(operation.to_owned()).wait()
             })
             .map_err(|error| anyhow!(error))
         })?;
-        ensure_launch_image(runtime, &request, &budget)?;
-        let application = match retry_busy(&budget, STOP_PAUSE, || {
+        ensure_launch_image(runtime, &request)?;
+        let application = match retry_busy(STOP_PAUSE, || {
             runtime.start_application(request.clone()).wait()
         }) {
             Ok(application) => application,
@@ -1391,7 +1385,7 @@ impl ContainerRuntime {
                 // Start may have created or started the exact operation before
                 // its reply was lost. Persist retirement by operation rather
                 // than removing by name, which could hit somebody else's container.
-                let abandon = retry_busy(&budget, STOP_PAUSE, || {
+                let abandon = retry_busy(STOP_PAUSE, || {
                     runtime.abandon_application(operation.clone()).wait()
                 })
                 .err();
@@ -2505,9 +2499,7 @@ mod tests {
             .into();
             let request = application_request_from_args(&args, "application-s1".into()).unwrap();
             assert!(request.pull_never);
-            let error =
-                ensure_launch_image(runtime, &request, &RetryBudget::new(Duration::from_secs(5)))
-                    .unwrap_err();
+            let error = ensure_launch_image(runtime, &request).unwrap_err();
             assert_eq!(
                 error.to_string(),
                 "required local application image is missing"

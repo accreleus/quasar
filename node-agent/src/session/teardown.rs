@@ -170,26 +170,44 @@ impl RetryBudget {
     }
 }
 
-/// Ask `call` again while the runtime client refuses it a slot, until `budget` is spent. An
-/// admission `Busy` reached no engine and wrote nothing, so a launch step that meets one waits
-/// like the launch's image preparation does (`LAUNCH_BUSY_BUDGET`) instead of failing the session.
+/// Ask `call` again while the runtime client refuses it a slot, for up to `LAUNCH_BUSY_BUDGET`
+/// from the first refusal, as the launch's image preparation does instead of failing the
+/// session. Each call gets its own allowance: a shared one is armed by the first refusal of any
+/// step and would already be spent when a later step is refused. A `Busy` is retried for every
+/// step, including `abandon_application`, whose engine-side `Busy` ("still running after stop")
+/// is safe to ask again because abandon is pinned to its durable operation.
 pub fn retry_busy<T>(
-    budget: &RetryBudget,
     pause: Duration,
     mut call: impl FnMut() -> Result<T, crate::runtime::RuntimeError>,
 ) -> Result<T, crate::runtime::RuntimeError> {
+    let budget = launch_budget();
     loop {
         match call() {
             Err(error) if error.kind == ErrorKind::Busy && budget.live() => {
                 tracing::warn!(
                     token = "launch-container-busy",
-                    "a container step was refused a runtime slot; asking again"
+                    "a container step was refused (no runtime slot, or the engine reports the container still running); asking again"
                 );
                 std::thread::sleep(pause);
             }
             result => return result,
         }
     }
+}
+
+fn launch_budget() -> RetryBudget {
+    #[cfg(test)]
+    if let Some(now) = FAKE_NOW.with(|now| now.borrow().clone()) {
+        return RetryBudget::fake(crate::runtime::LAUNCH_BUSY_BUDGET, now);
+    }
+    RetryBudget::new(crate::runtime::LAUNCH_BUSY_BUDGET)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The clock `retry_busy`'s budgets read on this thread, when a test sets one.
+    static FAKE_NOW: std::cell::RefCell<Option<Arc<Mutex<Duration>>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Outcome of one attempt to stop the app container.
@@ -622,11 +640,17 @@ mod tests {
         assert_eq!(pauses, 0, "but nothing waits on a spent budget");
     }
 
+    fn fake_clock() -> Arc<Mutex<Duration>> {
+        let now = Arc::new(Mutex::new(Duration::ZERO));
+        FAKE_NOW.with(|slot| *slot.borrow_mut() = Some(now.clone()));
+        now
+    }
+
     #[test]
     fn a_launch_step_refused_a_slot_waits_for_one() {
-        let budget = RetryBudget::new(Duration::from_secs(5));
+        fake_clock();
         let mut refusals = 2;
-        let got = retry_busy(&budget, Duration::ZERO, || {
+        let got = retry_busy(Duration::ZERO, || {
             if refusals > 0 {
                 refusals -= 1;
                 return Err(ErrorKind::Busy.into());
@@ -638,10 +662,9 @@ mod tests {
 
     #[test]
     fn a_launch_step_never_admitted_fails_with_the_refusal_after_its_budget() {
-        let now = Arc::new(Mutex::new(Duration::ZERO));
-        let budget = RetryBudget::fake(Duration::from_secs(5), now.clone());
+        let now = fake_clock();
         let mut calls = 0;
-        let got: Result<(), _> = retry_busy(&budget, Duration::ZERO, || {
+        let got: Result<(), _> = retry_busy(Duration::ZERO, || {
             calls += 1;
             *now.lock().unwrap() += Duration::from_secs(1);
             Err(ErrorKind::Busy.into())
@@ -651,10 +674,34 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_step_does_not_retry_an_answer_from_the_engine() {
-        let budget = RetryBudget::new(Duration::from_secs(5));
+    fn a_later_step_has_its_own_wait_after_an_early_refusal_and_a_long_step() {
+        let now = fake_clock();
+        let mut early = 1;
+        retry_busy(Duration::ZERO, || {
+            if early > 0 {
+                early -= 1;
+                return Err(ErrorKind::Busy.into());
+            }
+            Ok(())
+        })
+        .unwrap();
+        // The image pull between the two steps: longer than the allowance, no refusal.
+        *now.lock().unwrap() += crate::runtime::LAUNCH_BUSY_BUDGET * 2;
+        let mut late = 1;
+        let got = retry_busy(Duration::ZERO, || {
+            if late > 0 {
+                late -= 1;
+                return Err(ErrorKind::Busy.into());
+            }
+            Ok(9)
+        });
+        assert_eq!(got.unwrap(), 9, "the later refusal still waits for a slot");
+    }
+
+    #[test]
+    fn a_launch_step_does_not_retry_an_error_that_is_not_busy() {
         let mut calls = 0;
-        let got: Result<(), _> = retry_busy(&budget, Duration::ZERO, || {
+        let got: Result<(), _> = retry_busy(Duration::ZERO, || {
             calls += 1;
             Err(ErrorKind::Unavailable.into())
         });

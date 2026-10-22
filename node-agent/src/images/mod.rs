@@ -4153,7 +4153,14 @@ pub(crate) mod tests {
             m.ops.lock().unwrap().insert(
                 "steam".into(),
                 OpSlot {
-                    running: ImageOp::Remove,
+                    running: ImageOp::Build {
+                        version: "v1".into(),
+                        local_tag: "quasar/steam:test".into(),
+                        context_url: String::new(),
+                        context_subdir: String::new(),
+                        dockerfile: "Dockerfile".into(),
+                        build_args: BTreeMap::new(),
+                    },
                     generation: 1,
                     pending: None,
                 },
