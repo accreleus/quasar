@@ -817,7 +817,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "THE READING. fps from the MEDIAN RVFC interval \u2014 the fps a viewer perceives, unmoved by an occasional doubled frame. Its input intervals are display-refresh independent since #263 (2026-08-24): RVFC ticks are deduped by metadata.mediaTime before summarising, so a display whose refresh rate is not an integer multiple of the source fps (e.g. 98 Hz) no longer pollutes the samples with vsync ticks that carry no new frame \u2014 a healthy 60 fps stream on such a display previously read ~43-49."
+      "why": "THE READING. fps from the MEDIAN RVFC interval \u2014 the fps a viewer perceives, unmoved by an occasional doubled frame. Its input intervals are display-refresh independent since #263 (2026-08-24): RVFC ticks are deduped by the frame's identity before summarising (metadata.mediaTime, or its rtpTimestamp where a browser reports mediaTime 0 for WebRTC, as Firefox does: #686), so a display whose refresh rate is not an integer multiple of the source fps (e.g. 98 Hz) no longer pollutes the samples with vsync ticks that carry no new frame \u2014 a healthy 60 fps stream on such a display previously read ~43-49."
     },
     {
       "key": "present_interval_median_ms",

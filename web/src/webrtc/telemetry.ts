@@ -14,6 +14,7 @@ import { CLOCK_REPOST_DELTA_MS, CLOCK_REPOST_INTERVAL_S, PRESENT_MIN_SAMPLES } f
 import { summarizePresentWindow, type PresentCadence } from "./presentCadence";
 import {
   feedPresentedFrame,
+  presentedFrameKey,
   INITIAL_FRAME_DEDUP_STATE,
   type FrameDedupState,
 } from "./presentFrameDedup";
@@ -813,13 +814,13 @@ export class SessionTelemetry {
     // pollStats drains this array every second, so at any plausible refresh
     // rate it holds a couple hundred entries at most — no bound needed.
     //
-    // #263: dedup by metadata.mediaTime (presentFrameDedup.ts) before
+    // #263: dedup by the frame's identity (presentedFrameKey) before
     // accumulating, so intervals reflect distinct presented frames regardless
     // of display Hz. metadata is undefined on the rAF fallback path (no RVFC),
     // where every callback is treated as distinct.
     const { intervalMs, nextState } = feedPresentedFrame(
       this.frameDedupState,
-      metadata?.mediaTime,
+      presentedFrameKey(metadata),
       now,
     );
     this.frameDedupState = nextState;
