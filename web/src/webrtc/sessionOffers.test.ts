@@ -392,7 +392,18 @@ describe("QuasarSession — a refused takeover (amendment 42)", () => {
     await video.drain();
     expect(refused).not.toHaveBeenCalled();
     ws.deliver({ type: "error", pc: "video", code: "takeover_abandoned", message: "x" });
-    ws.deliver({ type: "error", pc: "audio", code: "takeover_rate_limited", message: "x" });
+    ws.deliver({ type: "error", code: "takeover_rate_limited", message: "x" });
     expect(refused.mock.calls).toEqual([["takeover_abandoned"], ["takeover_rate_limited"]]);
+  });
+
+  it("ignores a refusal that names the audio pc: video is still streaming", async () => {
+    const { session, ws, video } = startSession();
+    const refused = vi.fn();
+    session.onTakeoverRefused = refused;
+    ws.deliver(offer("A"));
+    await video.drain();
+    ws.deliver({ type: "error", pc: "audio", code: "takeover_abandoned", message: "x" });
+    ws.deliver({ type: "error", pc: "audio", code: "takeover_rate_limited", message: "x" });
+    expect(refused).not.toHaveBeenCalled();
   });
 });

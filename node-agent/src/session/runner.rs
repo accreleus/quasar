@@ -1504,7 +1504,7 @@ impl SessionTransports {
                 // Not applied either: it would rebind the current peer's transport.
                 if over_budget(&mut self.budget[i]) {
                     // To this answer's sender only; the streaming peer's late answers
-                    // take the `Reoffer` arm and are told nothing (amendment 42).
+                    // classify `ThisPeer` (same ufrag) and are told nothing (amendment 42).
                     let _ = out_tx.send(SignalMsg::takeover_error(
                         signaling::TAKEOVER_RATE_LIMITED,
                         pc,
@@ -3270,12 +3270,21 @@ pub fn run_blocking(
                 stop_source(&mut current_source, &transports);
                 super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                 transports.audio_pipeline.finish();
-                tracing::error!(
-                    token = "runner-idle-reap-failed",
-                    reason = %reason,
-                    "session ended via idle reap (it {} streamed)",
-                    if streamed { "had" } else { "never" }
-                );
+                // A session that streamed and then went idle is an ended session (the
+                // takeover-abandoned path leaves it to this reap), not a fault.
+                if streamed {
+                    tracing::warn!(
+                        token = "runner-idle-reap-after-stream",
+                        reason = %reason,
+                        "session ended via idle reap (it had streamed)"
+                    );
+                } else {
+                    tracing::error!(
+                        token = "runner-idle-reap-failed",
+                        reason = %reason,
+                        "session ended via idle reap (it never streamed)"
+                    );
+                }
                 emit(SessionEvent::Failed(reason.to_string()));
                 return;
             }

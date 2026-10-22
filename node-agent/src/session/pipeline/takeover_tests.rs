@@ -2548,7 +2548,8 @@ fn a_takeover_whose_audio_answer_cannot_be_applied_leaves_the_session_running() 
 }
 
 /// The same answer from the first peer a session ever had still fails the launch, as it
-/// does on `develop`: there is no stream to keep, and the page is told why.
+/// does on `develop`: there is no stream to keep. The rejection is the session's failure
+/// reason; no takeover `error` is sent.
 #[test]
 fn a_first_answer_that_cannot_be_applied_still_fails_the_launch() {
     if !live_webrtc_available() {

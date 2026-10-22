@@ -52,3 +52,35 @@ func TestRelayNormalDualPCPrebrowserBurstDrainsLosslessly(t *testing.T) {
 		}
 	}
 }
+
+func TestRelayCodedErrorWithNoBrowserIsNotFlushedToTheNextAttach(t *testing.T) {
+	bus := NewRelayBus(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	coded := `{"type":"error","pc":"video","code":"takeover_rate_limited","message":"x"}`
+	plain := `{"type":"error","message":"y"}`
+	for _, f := range []string{coded, plain} {
+		if err := bus.Deliver("session", []byte(f)); err != nil {
+			t.Fatalf("deliver %s: %v", f, err)
+		}
+	}
+	ch := make(chan []byte, relayBufMax)
+	bus.Register("session", ch)
+	if len(ch) != 1 {
+		t.Fatalf("flushed %d frames to the next attach, want only the plain error", len(ch))
+	}
+	if got := string(<-ch); got != plain {
+		t.Fatalf("flushed %q, want the plain error %q", got, plain)
+	}
+}
+
+func TestRelayCodedErrorReachesARegisteredBrowser(t *testing.T) {
+	bus := NewRelayBus(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ch := make(chan []byte, 1)
+	bus.Register("session", ch)
+	coded := `{"type":"error","code":"takeover_abandoned","message":"x"}`
+	if err := bus.Deliver("session", []byte(coded)); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(<-ch); got != coded {
+		t.Fatalf("got %q", got)
+	}
+}

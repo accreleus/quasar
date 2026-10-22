@@ -362,7 +362,8 @@ export class QuasarSession {
         });
       } else if (msg.type === "error") {
         this.onStatus(`host error: ${msg.message ?? ""}`);
-        const refusal = takeoverRefusal(msg.code);
+        // Amendment 42: the refusal is for the pc it names; a failed audio answer leaves video streaming.
+        const refusal = (msg.pc ?? "video") === "video" ? takeoverRefusal(msg.code) : undefined;
         if (refusal) this.onTakeoverRefused?.(refusal);
       } else if (msg.type === "bye") {
         this.onStatus("host ended the session");
