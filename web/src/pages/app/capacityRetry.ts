@@ -36,6 +36,20 @@ export const MIN_RETRY_DELAY_MS = 1_000;
  *  default — floored at {@link MIN_RETRY_DELAY_MS}. */
 export const NO_HOST_RETRY_DELAY_MS = MIN_RETRY_DELAY_MS;
 
+/** `error.reason` on a `no_host_available` whose cause is the caller's home being on
+ *  a host that is offline or gone (amendment 40, #602). Only an admin clears it. */
+export const HOME_HOST_UNAVAILABLE = "home_host_unavailable";
+
+/** Whether a launch refusal is worth the quiet retry: `capacity_exhausted` and
+ *  `no_host_available`, except a home on a host that is offline or gone — no
+ *  amount of waiting brings that host back. */
+export function isCapacityRetryable(err: { code: string; reason?: string }): boolean {
+  return (
+    err.code === "capacity_exhausted" ||
+    (err.code === "no_host_available" && err.reason !== HOME_HOST_UNAVAILABLE)
+  );
+}
+
 export interface CapacityRetryState {
   /** Elapsed since the FIRST retryable response for the current wait, not the
    *  most recent — the budget covers the whole wait, not a per-attempt window. */

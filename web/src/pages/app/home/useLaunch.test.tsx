@@ -74,6 +74,25 @@ describe("useLaunch waiting toast", () => {
   });
 });
 
+describe("useLaunch when the home is on an offline host (#602)", () => {
+  afterEach(() => vi.resetAllMocks());
+
+  it("shows its own toast on the first refusal and does not retry", async () => {
+    vi.mocked(libraryApi.launchSession).mockRejectedValue(
+      new ApiError(503, "no_host_available", "raw", undefined, undefined, undefined, "home_host_unavailable"),
+    );
+    const { result } = renderLaunch();
+
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60");
+    });
+
+    expect(screen.getByText("Your saves are on an offline host")).toBeTruthy();
+    expect(libraryApi.launchSession).toHaveBeenCalledTimes(1);
+    expect(result.current.waitingForSlot).toBe(false);
+  });
+});
+
 describe("useLaunch while the previous session is stopping (#754)", () => {
   const previous = { id: "prev-1", app_id: "app-0" };
   const homeInUse = () => new ApiError(409, "home_in_use", "still shutting down", undefined, "prev-1");
