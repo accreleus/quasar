@@ -128,6 +128,8 @@ impl RuntimeClient {
             || config.deadline.is_zero()
             || config.max_in_flight == 0
             || config.max_in_flight > Semaphore::MAX_PERMITS
+            || config.permit_hold.is_zero()
+            || config.permit_hold >= crate::LAUNCH_BUSY_BUDGET
             || std::time::Instant::now()
                 .checked_add(config.deadline)
                 .is_none()
@@ -194,16 +196,25 @@ impl RuntimeClient {
             }
             Ok(permit) => {
                 let deadline = tokio::time::Instant::now() + budget;
+                let hold = self.config.permit_hold;
                 let owner = detached.then(|| self.executor.clone());
                 self.executor
                     .handle
                     .spawn(async move {
                         let _owner = owner;
-                        let result = tokio::select! {
-                            biased;
-                            _ = cancelled.changed(), if !detached => Err(ErrorKind::Cancelled.into()),
-                            result = tokio::time::timeout_at(deadline, work) =>
-                                result.unwrap_or_else(|_| Err(if detached { ErrorKind::UnknownOutcome } else { ErrorKind::Timeout }.into())),
+                        let timed = tokio::time::timeout_at(deadline, work);
+                        tokio::pin!(timed);
+                        let release = tokio::time::sleep(hold);
+                        tokio::pin!(release);
+                        let mut permit = Some(permit);
+                        let result = loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancelled.changed(), if !detached => break Err(ErrorKind::Cancelled.into()),
+                                result = &mut timed =>
+                                    break result.unwrap_or_else(|_| Err(if detached { ErrorKind::UnknownOutcome } else { ErrorKind::Timeout }.into())),
+                                _ = &mut release, if permit.is_some() => permit = None,
+                            }
                         };
                         // Free the slot before the caller can see the result: it may start its
                         // next operation the instant `wait` returns.
