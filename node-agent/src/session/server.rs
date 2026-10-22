@@ -315,7 +315,7 @@ fn handle_inbound(
             // untagged (session="").
             pipeline::restart_ice(target, out_tx.clone(), pc, String::new());
         }
-        SignalMsg::Error { message } => tracing::warn!(
+        SignalMsg::Error { message, .. } => tracing::warn!(
             token = "signaling-peer-error",
             "peer signaled error: {message}"
         ),

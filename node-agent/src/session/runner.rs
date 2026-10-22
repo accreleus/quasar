@@ -21,7 +21,7 @@ use super::encoder_stall;
 use super::metrics::SessionMetrics;
 use super::pipeline::{RemoteDescriptionApplied, RemoteDescriptionFailure};
 use super::server;
-use super::signaling::{PcId, SignalMsg};
+use super::signaling::{self, PcId, SignalMsg};
 use super::source::{AppSource, SessionResources};
 use super::vulkan_fault;
 use super::{pipeline, SessionConfig};
@@ -1474,7 +1474,8 @@ impl SessionTransports {
                         "{pc} PC: {MAX_REPLACEMENTS_PER_WINDOW} transport replacements or \
                          re-offers in {} s — an answer that asks for another is ignored \
                          until the window clears. The peer already connected keeps the \
-                         stream; the newer one gets no offer and no error",
+                         stream; the newer one gets no offer, only a takeover_rate_limited \
+                         error",
                         REPLACEMENT_WINDOW.as_secs()
                     );
                 }
@@ -1502,6 +1503,13 @@ impl SessionTransports {
             server::Inbound::NewPeer(pc) => {
                 // Not applied either: it would rebind the current peer's transport.
                 if over_budget(&mut self.budget[i]) {
+                    // To this answer's sender only; the streaming peer's late answers
+                    // take the `Reoffer` arm and are told nothing (amendment 42).
+                    let _ = out_tx.send(SignalMsg::takeover_error(
+                        signaling::TAKEOVER_RATE_LIMITED,
+                        pc,
+                        "too many takeovers of this session in the last minute; try again shortly",
+                    ));
                     return Ok(None);
                 }
                 tracing::info!(
@@ -1587,6 +1595,15 @@ impl SessionTransports {
         }
         Ok(None)
     }
+}
+
+/// Tell the client holding signaling that its takeover on `pc` gets no media (amendment 42).
+fn abandon_takeover(out_tx: &pipeline::OutTx, pc: PcId) {
+    let _ = out_tx.send(SignalMsg::takeover_error(
+        signaling::TAKEOVER_ABANDONED,
+        pc,
+        "this device cannot take the session over; the session keeps running",
+    ));
 }
 
 /// Take `old` to NULL and build the audio PC for a new peer on a thread of their own,
@@ -2918,6 +2935,21 @@ pub fn run_blocking(
             if let Some(changed) = ufrag_changed {
                 payload["ice_ufrag_changed"] = serde_json::Value::Bool(changed);
             }
+            if applied.pc == PcId::Video
+                && transports.is_replacement(PcId::Video)
+                && answer
+                    .m_lines
+                    .iter()
+                    .any(|m| m.kind == "video" && m.rejected)
+            {
+                tracing::warn!(
+                    token = "transport-replacement-video-refused",
+                    session_id = %session_id,
+                    "the peer taking the session over refused the video m-line; that \
+                     takeover is abandoned and the session keeps running"
+                );
+                abandon_takeover(&sig_tx, PcId::Video);
+            }
             if rejected > 0 {
                 // Names the codec: "an m-line was rejected" is the symptom, "the peer will
                 // not take h265" is the cause.
@@ -2988,6 +3020,7 @@ pub fn run_blocking(
                      apply; that takeover is abandoned and the session keeps running: \
                      {reason}"
                 );
+                abandon_takeover(&sig_tx, failure.pc);
                 continue;
             }
             tracing::error!(

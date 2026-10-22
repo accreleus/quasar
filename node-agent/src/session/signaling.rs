@@ -6,6 +6,7 @@
 //!   Client -> host:   {"type":"answer","sdp":"..."}
 //!                     {"type":"ice","candidate":{...}}
 //!   Either direction: {"type":"error","message":"..."}
+//!                     (host -> client may add "code" and "pc", amendment 42)
 //!                     {"type":"bye"}
 //!
 //! The control plane relays this exact inner `msg` over the agent-API WebSocket
@@ -87,13 +88,33 @@ pub enum SignalMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pc: Option<PcId>,
     },
-    /// Either direction (diagnostics).
-    Error { message: String },
+    /// Either direction (diagnostics). From the host, `code` says why a taking client gets
+    /// no media (signaling.md, amendment 42); `pc` absent means video.
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pc: Option<PcId>,
+    },
     /// Either direction (diagnostics).
     Bye,
 }
 
+/// Amendment 42 `code`s.
+pub const TAKEOVER_ABANDONED: &str = "takeover_abandoned";
+pub const TAKEOVER_RATE_LIMITED: &str = "takeover_rate_limited";
+
 impl SignalMsg {
+    /// The `error` that tells the client holding signaling why it gets no media on `pc`.
+    pub fn takeover_error(code: &str, pc: PcId, message: &str) -> Self {
+        SignalMsg::Error {
+            message: message.to_string(),
+            code: Some(code.to_string()),
+            pc: Some(pc),
+        }
+    }
+
     /// Serialize to a compact JSON string for one WebSocket text frame.
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
@@ -199,6 +220,26 @@ mod tests {
             m.to_json().unwrap(),
             r#"{"type":"restart_ice","pc":"video"}"#
         );
+    }
+
+    #[test]
+    fn a_takeover_error_matches_amendment_42_and_a_plain_one_is_unchanged() {
+        let m = SignalMsg::takeover_error(TAKEOVER_RATE_LIMITED, PcId::Video, "busy");
+        assert_eq!(
+            m.to_json().unwrap(),
+            r#"{"type":"error","message":"busy","code":"takeover_rate_limited","pc":"video"}"#
+        );
+        let plain = r#"{"type":"error","message":"x"}"#;
+        let parsed = SignalMsg::from_json(plain).unwrap();
+        assert!(matches!(
+            &parsed,
+            SignalMsg::Error {
+                code: None,
+                pc: None,
+                ..
+            }
+        ));
+        assert_eq!(parsed.to_json().unwrap(), plain);
     }
 
     #[test]
