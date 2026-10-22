@@ -283,31 +283,40 @@ describe("device capability post freshness", () => {
 
   it("is stale with nothing recorded", () => {
     localStorage.clear();
-    expect(deviceProbeIsFresh("u1")).toBe(false);
+    expect(deviceProbeIsFresh("u1", true)).toBe(false);
   });
 
   it("stays fresh for a day and goes stale after it", () => {
     localStorage.clear();
-    markDeviceProbePosted("u1", 1_000_000);
-    expect(deviceProbeIsFresh("u1", 1_000_000)).toBe(true);
-    expect(deviceProbeIsFresh("u1", 1_000_000 + DAY - 1)).toBe(true);
-    expect(deviceProbeIsFresh("u1", 1_000_000 + DAY)).toBe(false);
+    markDeviceProbePosted("u1", true, 1_000_000);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(true);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000 + DAY - 1)).toBe(true);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000 + DAY)).toBe(false);
+  });
+
+  it("is stale once the H.264 verdict differs from the posted one, and for a stamp without one (#688)", () => {
+    localStorage.clear();
+    markDeviceProbePosted("u1", false, 1_000_000);
+    expect(deviceProbeIsFresh("u1", false, 1_000_000)).toBe(true);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
+    localStorage.setItem("quasar_device_posted_v2", JSON.stringify({ user: "u1", at: 1_000_000 }));
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
   });
 
   it("is per user, so a second account on the browser still posts", () => {
     localStorage.clear();
-    markDeviceProbePosted("u1", 1_000_000);
-    expect(deviceProbeIsFresh("u2", 1_000_000)).toBe(false);
+    markDeviceProbePosted("u1", true, 1_000_000);
+    expect(deviceProbeIsFresh("u2", true, 1_000_000)).toBe(false);
   });
 
   it("treats unreadable storage as stale rather than throwing", () => {
     localStorage.setItem("quasar_device_posted_v2", "not json");
-    expect(deviceProbeIsFresh("u1")).toBe(false);
+    expect(deviceProbeIsFresh("u1", true)).toBe(false);
   });
 
   it("ignores a stamp from before the Safari refresh change, so that probe is posted again (#632)", () => {
     localStorage.clear();
     localStorage.setItem("quasar_device_posted", JSON.stringify({ user: "u1", at: 1_000_000 }));
-    expect(deviceProbeIsFresh("u1", 1_000_000)).toBe(false);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
   });
 });
