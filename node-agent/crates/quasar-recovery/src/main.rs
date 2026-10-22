@@ -61,7 +61,9 @@ commands:
 /// In the seed's own container only: what its last look came to, for the health check.
 const SEED_STATUS_FILE: &str = "/tmp/quasar-seed.status";
 
-/// A status answer must come back well inside the agent's own socket timeout.
+/// A status answer must come back well inside the agent's own socket timeout. The agent's
+/// register-time wait (`ACTOR_REGISTER_BUDGET`, 5 s) must stay above this plus the rest of
+/// the answer, or a healthy actor with a slow engine registers as absent.
 const STATUS_ENGINE_DEADLINE: Duration = Duration::from_secs(3);
 
 fn env(key: &str) -> Option<String> {

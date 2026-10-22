@@ -2047,15 +2047,26 @@ async fn connect_and_run(
     // `console_access_rx`, which re-sends `capacity`.
     let console_read = {
         let ca = console_access.clone();
-        tokio::task::spawn_blocking(move || {
-            ca.refresh();
-            ca.watch_if_applying();
+        tokio::spawn(async move {
+            let read = tokio::task::spawn_blocking(move || {
+                ca.refresh();
+                ca.watch_if_applying();
+            });
+            if let Err(e) = read.await {
+                warn!(
+                    token = "register-console-read-failed",
+                    "the console access read failed: {e}"
+                );
+            }
         })
     };
-    if let Ok(Err(e)) = tokio::time::timeout_at(actor_deadline.into(), console_read).await {
-        if e.is_panic() {
-            std::panic::resume_unwind(e.into_panic());
-        }
+    if tokio::time::timeout_at(actor_deadline.into(), console_read)
+        .await
+        .is_err()
+    {
+        // `capacity` carries `access`, and an absent one clears the control plane's stored
+        // state (agent-api.md): say what is known until the read lands.
+        console_access.publish_known();
     }
 
     let actor_dark = install.install_mode == Some(crate::buildinfo::InstallMode::Owned)
@@ -2063,7 +2074,7 @@ async fn connect_and_run(
     if actor_dark {
         warn!(
             token = "register-actor-dark",
-            "the recovery actor did not answer within {:?}: registering without it \
+            "the recovery actor gave no usable status within {:?}: registering without it \
              (updater_present=false); it is reported once it answers",
             crate::buildinfo::ACTOR_REGISTER_BUDGET
         );
@@ -2078,9 +2089,9 @@ async fn connect_and_run(
     if register_prep_over_budget(runtime_prep) {
         warn!(
             token = "register-prep-slow",
-            elapsed_ms = prep.as_millis() as u64,
+            elapsed_ms = runtime_prep.as_millis() as u64,
             "register preparation (image reconcile + install probe against the container \
-             runtime) took {prep:?} — the container runtime is answering slowly; \
+             runtime) took {runtime_prep:?} — the container runtime is answering slowly; \
              registration still proceeds, but sessions on this host will feel it"
         );
     }
@@ -7909,6 +7920,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dark_recovery_actor_does_not_hold_the_dial() {
         let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        crate::buildinfo::forget_observed();
         let dir = tempfile::tempdir().unwrap();
         let actor = dir.path().join("actor.sock");
         let _actor = std::os::unix::net::UnixListener::bind(&actor).unwrap();
@@ -7989,7 +8001,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the fake control plane saw register and the assign's ack");
         assert!(
-            after < Duration::from_secs(5),
+            after < Duration::from_secs(8),
             "register reached the control plane {after:?} after the attempt began"
         );
         assert!(register.contains(r#""install_mode":"owned""#), "{register}");
@@ -7997,6 +8009,118 @@ mod tests {
             register.contains(r#""updater_present":false"#),
             "{register}"
         );
+    }
+
+    /// #687: a console read that outlasts the register budget leaves the first `capacity`
+    /// carrying the access derived from what is known (an absent one clears the control
+    /// plane's stored state, agent-api.md), and the late read then sends a second.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_console_read_is_published_before_the_dial_and_re_sent_when_it_lands() {
+        use std::io::{Read, Write};
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        crate::buildinfo::forget_observed();
+        crate::release::console::forget_published();
+        let dir = tempfile::tempdir().unwrap();
+        let actor = dir.path().join("actor.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&actor).unwrap();
+        // /v1/status never answers; /v1/console answers 1.5 s after it is asked.
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                std::thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && conn.read(&mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                    }
+                    if String::from_utf8_lossy(&head).contains("/v1/status") {
+                        std::thread::sleep(Duration::from_secs(60));
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1500));
+                    let body = r#"{"enabled":false,"supported":false,"why":"a late answer"}"#;
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let release_mgr = ReleaseManager::owned(&actor);
+
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret = dir.path().join("secret");
+        let cfg = Config {
+            control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = cp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let mut capacities = Vec::new();
+            let mut registered = false;
+            while !capacities
+                .last()
+                .is_some_and(|c: &String| c.contains("a late answer"))
+            {
+                let Ok(Message::Text(t)) = ws.read() else {
+                    continue;
+                };
+                let t = t.to_string();
+                if t.contains(r#""type":"register""#) && !registered {
+                    registered = true;
+                    ws.send(Message::Text(
+                        r#"{"type":"registered","host_id":"h1","node_secret":null,"heartbeat_interval_ms":5000}"#
+                            .into(),
+                    ))
+                    .unwrap();
+                } else if t.contains(r#""type":"capacity""#) {
+                    capacities.push(t);
+                }
+            }
+            let _ = seen_tx.send(capacities);
+        });
+
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        sessions.mgr.console_access =
+            crate::release::console::ConsoleAccessManager::owned_for_test_publishing(&actor);
+        let attempt = connect_and_run(
+            &cfg,
+            &health,
+            "",
+            "test",
+            &image_mgr,
+            &release_mgr,
+            &mut sessions,
+            false,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(25), attempt).await;
+        let capacities = seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a capacity carried the late console read");
+        assert!(
+            capacities[0].contains(r#""access":"#),
+            "the first capacity has no console access: {}",
+            capacities[0]
+        );
+        assert!(
+            !capacities[0].contains("a late answer"),
+            "the late read was already in the first capacity"
+        );
+        crate::release::console::forget_published();
     }
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`

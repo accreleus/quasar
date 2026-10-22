@@ -172,6 +172,11 @@ pub struct ConsoleAccessManager {
 /// The process-wide manager's current report, for every `capacity` the agent sends.
 static PUBLISHED: RwLock<Option<ConsoleAccess>> = RwLock::new(None);
 
+#[cfg(test)]
+pub fn forget_published() {
+    *PUBLISHED.write().unwrap() = None;
+}
+
 /// The current `console_capabilities.access`; `None` on a host with no recovery actor.
 pub fn published() -> Option<ConsoleAccess> {
     PUBLISHED.read().ok().and_then(|slot| slot.clone())
@@ -205,6 +210,11 @@ impl ConsoleAccessManager {
             false,
             Duration::from_millis(20),
         )
+    }
+
+    #[cfg(test)]
+    pub fn owned_for_test_publishing(socket: impl Into<PathBuf>) -> Arc<Self> {
+        Self::build(Some(socket.into()), false, true, Duration::from_millis(20))
     }
 
     fn build(socket: Option<PathBuf>, marker: bool, publish: bool, poll: Duration) -> Arc<Self> {
@@ -287,6 +297,14 @@ impl ConsoleAccessManager {
         let _op = self.op.lock().unwrap();
         self.read_actor();
         self.recompute();
+    }
+
+    /// Publish the report derived from what is known, without waiting on the actor, for a
+    /// connection whose read has not finished. The read's own `recompute` then re-sends.
+    pub fn publish_known(&self) {
+        if self.owned() {
+            self.recompute();
+        }
     }
 
     /// A `config_update` carried `console_config`: reconcile toward its `enabled` on the

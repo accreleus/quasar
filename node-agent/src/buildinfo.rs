@@ -152,8 +152,10 @@ const ACTOR_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 /// How long the work before `register` waits for the recovery actor, in all. A dark actor
 /// never holds the dial: the agent registers without it and the readiness refresh reports
-/// it once it answers ([`owned_identity_changed`]).
-pub const ACTOR_REGISTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+/// it once it answers ([`owned_identity_changed`]). Clearly above the actor's own engine
+/// deadline (`STATUS_ENGINE_DEADLINE` in `quasar-recovery`, 3 s), so a healthy actor with a
+/// slow engine still answers inside it; the control plane's register window is 11 s.
+pub const ACTOR_REGISTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The part of the actor's `GET /v1/status` answer the agent reads; everything else is
 /// ignored, since the actor moves first and may be a release ahead
@@ -204,7 +206,16 @@ pub fn discover(
     actor_timeout: std::time::Duration,
 ) -> InstallFacts {
     let mut facts = match socket {
-        Some(socket) => observe_owned_within(socket, actor_timeout).0,
+        Some(socket) => {
+            let (read, _) = observe_owned_within(socket, actor_timeout);
+            // A register read that missed must not be less informed than the refresh that
+            // corrects it only because it waited less: that refresh would find the
+            // registered facts different on every dial and re-dial for ever.
+            match last_answer() {
+                Some(seen) if read.updater_present != Some(true) => seen,
+                _ => read,
+            }
+        }
         None => discover_install(&DockerFacts::new(runtime)),
     };
     facts.engine = EngineIdentity::observe();
@@ -284,6 +295,18 @@ pub fn owned_socket() -> Option<std::path::PathBuf> {
 /// The last owned-install facts a readiness refresh read, and how many refreshes in a row
 /// read them.
 static OBSERVED: std::sync::Mutex<Option<(InstallFacts, u32)>> = std::sync::Mutex::new(None);
+
+/// What the last readiness refresh read, when the actor answered it.
+fn last_answer() -> Option<InstallFacts> {
+    let slot = OBSERVED.lock().ok()?;
+    let (seen, _) = slot.as_ref()?;
+    (seen.updater_present == Some(true)).then(|| seen.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn forget_observed() {
+    *OBSERVED.lock().unwrap() = None;
+}
 
 /// Records what a refresh read from the recovery actor.
 pub fn note_observed(facts: &InstallFacts) {
@@ -754,6 +777,7 @@ mod tests {
         assert_eq!(registered.updater_present, Some(false));
 
         let _facts = INSTALL_FACTS_TEST_LOCK.blocking_lock();
+        forget_observed();
         set_install_facts(registered);
         let (_d, answering) = actor_answering(200, socket_fixture("status-gpu-host-applying.json"));
         let (seen, _) = observe_owned(&answering);
@@ -761,6 +785,59 @@ mod tests {
         assert!(!owned_identity_changed(), "one answer is not yet a change");
         note_observed(&seen);
         assert!(owned_identity_changed());
+    }
+
+    /// An actor that answers after the register budget but inside the refresh's wait: the
+    /// first dial registers it absent, the refresh sees it twice and the agent re-dials
+    /// once; that dial carries what the refresh saw, so nothing differs and it stays put.
+    #[test]
+    fn an_actor_slower_than_the_register_budget_costs_one_redial_not_a_loop() {
+        use std::io::{Read, Write};
+        let _facts = INSTALL_FACTS_TEST_LOCK.blocking_lock();
+        forget_observed();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slow.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let body = socket_fixture("status-gpu-host-applying.json");
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && conn.read(&mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let budget = std::time::Duration::from_millis(100);
+        let runtime = ContainerRuntime::from_env();
+
+        set_install_facts(discover(&runtime, Some(&socket), budget));
+        assert_eq!(install_facts().updater_present, Some(false));
+        for _ in 0..2 {
+            note_observed(&observe_owned(&socket).0);
+        }
+        assert!(
+            owned_identity_changed(),
+            "the refresh sees what register missed"
+        );
+
+        set_install_facts(discover(&runtime, Some(&socket), budget));
+        assert_eq!(install_facts().updater_present, Some(true));
+        assert!(
+            !owned_identity_changed(),
+            "the re-dial registers what the refresh saw, so it is not a change again"
+        );
+        forget_observed();
     }
 
     #[test]
