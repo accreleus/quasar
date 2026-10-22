@@ -3312,10 +3312,6 @@ struct Held {
     released: bool,
 }
 
-/// How long a launch keeps asking for its image preparation after the runtime
-/// client refused it for lack of a free slot.
-const LAUNCH_BUSY_BUDGET: Duration = Duration::from_secs(5);
-
 /// Wait for a launch's image preparation. An admission `Busy` never reached the
 /// engine and wrote nothing, so the preparation is submitted again until `budget`
 /// is spent or the launch is stopped; any other error ends the wait as it is.
@@ -4158,7 +4154,7 @@ impl SessionManager {
                                         },
                                         &stop,
                                         &crate::session::teardown::RetryBudget::new(
-                                            LAUNCH_BUSY_BUDGET,
+                                            crate::runtime::LAUNCH_BUSY_BUDGET,
                                         ),
                                         crate::session::teardown::STOP_PAUSE,
                                     ) {

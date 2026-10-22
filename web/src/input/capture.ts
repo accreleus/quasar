@@ -251,10 +251,13 @@ export function setupCapture({
   } else if (!keyboardLockSupported()) {
     // Without this, "Esc still exits capture" on plain HTTP looks like a client
     // bug (quasar#376). Gated on lockSupported: telling an iPad user "use
-    // HTTPS" would change nothing.
+    // HTTPS" would change nothing; nor does it on a secure page (Safari).
     console.info(
-      "input: Keyboard Lock API unavailable (secure context required) — " +
-        "Esc stays browser-owned and will release capture; use HTTPS to enable in-game Esc.",
+      "input: Keyboard Lock API unavailable — Esc stays browser-owned and will release " +
+        "capture" +
+        (window.isSecureContext === false
+          ? "; use HTTPS to enable in-game Esc."
+          : "; this browser has no Keyboard Lock (Chrome or Edge can pass Esc to the game)."),
     );
   }
 
