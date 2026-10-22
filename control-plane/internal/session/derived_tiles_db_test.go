@@ -808,7 +808,8 @@ func TestNonDerivedRuntimeSpecIsByteIdentical(t *testing.T) {
 // A discovered tile is created by a background job (Phase 4), which is precisely
 // the shape that incident took — omitted create fields zeroing the column. So
 // the test does not check "the number came from the parent", it checks the
-// consequence: a FULL host must still refuse the tile.
+// consequence: a host with fewer free slots than the parent needs must still refuse
+// the tile, even when it has room for the tile's own value.
 func TestDerivedTileAdmissionUsesTheParentsResources(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
@@ -838,7 +839,7 @@ func TestDerivedTileAdmissionUsesTheParentsResources(t *testing.T) {
 			"cb97bfb is the live incident of exactly this.")
 	}
 	if !errors.Is(err, ErrCapacityExhausted) && !errors.Is(err, ErrNoHostAvailable) {
-		t.Fatalf("launch on a full GPU: err = %v, want a capacity rejection", err)
+		t.Fatalf("launch on a GPU short of the parent's slots: err = %v, want a capacity rejection", err)
 	}
 
 	// And the positive control: the SAME tile is admitted once the GPU is free, so
