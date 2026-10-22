@@ -2080,7 +2080,9 @@ async fn connect_and_run(
         );
     }
     let prep = prep_started.elapsed();
-    // The actor's share is bounded by its budget and has its own warning above.
+    // Only a dark actor's share is taken out: one that answers `/v1/status` but is slow on
+    // `/v1/console` leaves up to the budget of its wait in here, so `register-prep-slow` can
+    // still name the runtime for it.
     let runtime_prep = if actor_dark {
         prep.saturating_sub(crate::buildinfo::ACTOR_REGISTER_BUDGET)
     } else {
@@ -8012,8 +8014,9 @@ mod tests {
     }
 
     /// #687: a console read that outlasts the register budget leaves the first `capacity`
-    /// carrying the access derived from what is known (an absent one clears the control
-    /// plane's stored state, agent-api.md), and the late read then sends a second.
+    /// carrying `access` as `applying` (an absent one clears the control plane's stored
+    /// state, agent-api.md, and a settled `on`/`off` lifts its placement hold on a
+    /// replacement this process cannot see), and the late read then sends the actor's answer.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_late_console_read_is_published_before_the_dial_and_re_sent_when_it_lands() {
         use std::io::{Read, Write};
@@ -8023,7 +8026,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let actor = dir.path().join("actor.sock");
         let listener = std::os::unix::net::UnixListener::bind(&actor).unwrap();
-        // /v1/status never answers; /v1/console answers 1.5 s after it is asked.
+        // /v1/status never answers; /v1/console answers 3 s after it is asked.
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut conn) = conn else { return };
@@ -8037,8 +8040,8 @@ mod tests {
                         std::thread::sleep(Duration::from_secs(60));
                         return;
                     }
-                    std::thread::sleep(Duration::from_millis(1500));
-                    let body = r#"{"enabled":false,"supported":false,"why":"a late answer"}"#;
+                    std::thread::sleep(Duration::from_secs(3));
+                    let body = r#"{"enabled":false,"supported":true}"#;
                     let _ = write!(
                         conn,
                         "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -8066,7 +8069,7 @@ mod tests {
             let mut registered = false;
             while !capacities
                 .last()
-                .is_some_and(|c: &String| c.contains("a late answer"))
+                .is_some_and(|c: &String| c.contains(r#""access":{"state":"off""#))
             {
                 let Ok(Message::Text(t)) = ws.read() else {
                     continue;
@@ -8096,7 +8099,7 @@ mod tests {
             release_mgr.clone(),
         );
         sessions.mgr.console_access =
-            crate::release::console::ConsoleAccessManager::owned_for_test_publishing(&actor);
+            crate::release::console::ConsoleAccessManager::owned_for_test_publishing(&actor, false);
         let attempt = connect_and_run(
             &cfg,
             &health,
@@ -8112,14 +8115,17 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("a capacity carried the late console read");
         assert!(
-            capacities[0].contains(r#""access":"#),
-            "the first capacity has no console access: {}",
+            capacities[0].contains(r#""access":{"state":"applying""#),
+            "before any actor answer the first capacity must say applying: {}",
             capacities[0]
         );
-        assert!(
-            !capacities[0].contains("a late answer"),
-            "the late read was already in the first capacity"
-        );
+        for early in &capacities[..capacities.len() - 1] {
+            assert!(
+                !early.contains(r#""access":{"state":"off""#)
+                    && !early.contains(r#""access":{"state":"on""#),
+                "a settled state was published before the actor answered: {early}"
+            );
+        }
         crate::release::console::forget_published();
     }
 
