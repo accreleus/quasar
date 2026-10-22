@@ -324,8 +324,9 @@ revision it does not carry continues it, or fails every start with
 the one the actor cannot render. That case is tracked in #794. Until then, on a GPU host apply
 the release again from Fleet ▸ Releases: its first step moves the actor, which rewrites
 `seed.json`. Then `docker exec quasar-recovery quasar-recovery status` shows the new digest.
-On the control plane's own machine, combined or control-only, the console offers no apply once
-the control plane reads up to date, and that is also tracked in #794. On either machine,
+On the control plane's own machine, combined or control-only, the console offers no apply that
+moves the actor: the control plane reads up to date, and that machine's host step never sends
+the actor. That is also tracked in #794. On either machine,
 removing the actor container does not help, the seed re-creates the old one.
 
 **An owner conflict** is a container that looks like a Quasar service but lacks this

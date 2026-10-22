@@ -2311,6 +2311,9 @@ fn an_attempt_whose_successor_never_started_does_not_verify_the_actor() {
     )
     .unwrap();
     lab.restart_daemon();
+    // Another test's actor logs the same token unguarded, so the line alone does not show this
+    // lab's daemon got past its seed check; serving does.
+    lab.wait_until("the actor started again", |lab| lab.serving().is_some());
     lab.wait_until("named as unverified", |_| {
         logged("actor-seed-file-differs") >= 1
     });
