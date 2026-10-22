@@ -76,9 +76,17 @@ type errorEnvelope struct {
 }
 
 type errorBody struct {
-	Code    string `json:"code"`
+	Code string `json:"code"`
+	// Reason is a machine-readable cause under Code, omitted when there is none.
+	// semantics: control-api.md §Admission control (amendment 40)
+	Reason  string `json:"reason,omitempty"`
 	Message string `json:"message"`
 }
+
+// ReasonHomeHostUnavailable is the `reason` on a 503 no_host_available whose
+// cause is that the caller's home is on a host that is offline or gone. Only an
+// admin clears it, so a client does not auto-retry it.
+const ReasonHomeHostUnavailable = "home_host_unavailable"
 
 // WriteJSON serializes v as JSON with the given status code.
 func WriteJSON(w http.ResponseWriter, status int, v any) {
@@ -95,5 +103,10 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 
 // WriteError emits the uniform error envelope with the given status and code.
 func WriteError(w http.ResponseWriter, status int, code, message string) {
-	WriteJSON(w, status, errorEnvelope{Error: errorBody{Code: code, Message: message}})
+	WriteErrorReason(w, status, code, "", message)
+}
+
+// WriteErrorReason is WriteError with a machine-readable reason under code.
+func WriteErrorReason(w http.ResponseWriter, status int, code, reason, message string) {
+	WriteJSON(w, status, errorEnvelope{Error: errorBody{Code: code, Reason: reason, Message: message}})
 }

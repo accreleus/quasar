@@ -527,9 +527,7 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	// A codec-constrained refusal names the codec, and nothing else.
 	// semantics: control-api.md §Admission control
 	case errors.Is(err, ErrNoHostAvailable):
-		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
-			refusalMessage(err, noHostMessage(err),
-				"no host has a GPU that can encode %s"))
+		writeNoHostAvailable(w, err)
 		return
 	// Names no check, scope, GPU or host: readiness detail is admin-only and
 	// lives on the host body. No Retry-After — an admin, not time, clears it.
@@ -876,6 +874,22 @@ func writeHomeInUse(w http.ResponseWriter, err error, message string) {
 		body["session_id"] = id
 	}
 	httpx.WriteJSON(w, http.StatusConflict, map[string]any{"error": body})
+}
+
+// writeNoHostAvailable emits the launch 503 no_host_available. A home on an
+// offline or gone host carries reason home_host_unavailable and its own message,
+// with or without a codec constraint: no codec would help, and only an admin
+// clears it. Every other refusal omits the reason.
+// semantics: control-api.md §Admission control (amendment 40)
+func writeNoHostAvailable(w http.ResponseWriter, err error) {
+	var off *HomeHostOfflineRejection
+	if errors.As(err, &off) {
+		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
+			httpx.ReasonHomeHostUnavailable, noHostMessage(err))
+		return
+	}
+	httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
+		refusalMessage(err, noHostMessage(err), "no host has a GPU that can encode %s"))
 }
 
 // homeInUseMessage keeps the live-session wording unless the session in the
