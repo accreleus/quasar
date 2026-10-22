@@ -139,7 +139,8 @@ func (b *RelayBus) Forget(sessionID string) {
 
 // Deliver routes a raw inner-message frame (the Phase 0 signaling JSON) to the
 // browser. If no browser is registered yet the frame is buffered up to
-// relayBufMax; frames beyond that are dropped with a warning.
+// relayBufMax, except a coded `error`, which is dropped; frames beyond the
+// buffer are rejected with an error.
 func (b *RelayBus) Deliver(sessionID string, frame []byte) error {
 	b.mu.Lock()
 	if reg, ok := b.browsers[sessionID]; ok {
@@ -151,6 +152,14 @@ func (b *RelayBus) Deliver(sessionID string, frame []byte) error {
 			return fmt.Errorf("relay browser queue blocked for session %s", sessionID)
 		}
 	}
+	// No browser: a coded host error (amendment 42) is about the socket that was
+	// answering, which is gone. Buffered, it would be flushed to the next attach, and
+	// photon closes signaling on any error.
+	if isCodedError(frame) {
+		b.mu.Unlock()
+		b.log.Info("relay-coded-error-dropped", "session_id", sessionID)
+		return nil
+	}
 	// No browser yet — buffer.
 	if len(b.pending[sessionID]) >= relayBufMax {
 		b.mu.Unlock()
@@ -161,6 +170,16 @@ func (b *RelayBus) Deliver(sessionID string, frame []byte) error {
 	b.pending[sessionID] = append(b.pending[sessionID], cp)
 	b.mu.Unlock()
 	return nil
+}
+
+// isCodedError reports whether frame is a host `error` carrying a `code`; the relay
+// reads nothing else of the message.
+func isCodedError(frame []byte) bool {
+	var m struct {
+		Type string `json:"type"`
+		Code string `json:"code"`
+	}
+	return json.Unmarshal(frame, &m) == nil && m.Type == "error" && m.Code != ""
 }
 
 // SendSignaling wraps innerMsg (raw Phase 0 JSON) in a signaling envelope and
