@@ -66,8 +66,10 @@ const UNREAD_BACKOFF_DOUBLINGS: u32 = 4;
 /// How long after this process started an actor that has never answered is reported
 /// `applying`. A replacement this process is part of is bounded by the actor's own
 /// verification deadline (`ReplaceTiming::verify_timeout` in `quasar-recovery`, 300 s;
-/// pinned by `the_unread_window_is_the_actors_verification_deadline`), so past it
-/// `applying` could not still be true (agent-api.md, `console_capabilities.access`).
+/// pinned by `the_unread_window_is_the_actors_verification_deadline`), so an actor that has
+/// answered no read for that long is not serving, and a verify it resumes later is read on
+/// the next poll (agent-api.md, `console_capabilities.access`). The report changes on the
+/// first worker read past the window, up to one backoff wait plus one read later.
 const UNREAD_WINDOW: Duration = Duration::from_secs(300);
 
 /// The `release_state` failure identifier for a put-back attempt the actor recorded no
@@ -572,8 +574,8 @@ impl ConsoleAccessManager {
     /// The report for what is known. While the actor has never answered, a replacement may
     /// be under way that this process cannot see, and a settled `on`/`off` would lift the
     /// control plane's placement hold on it: say `applying`, but only for the
-    /// [`UNREAD_WINDOW`] after this process started. Past it no replacement can still be
-    /// pending, and the report is the one from how this agent was created.
+    /// [`UNREAD_WINDOW`] after this process started. Past it the report is the one from how
+    /// this agent was created, until a read lands.
     fn derive_known(&self, inner: &Inner, now: Instant) -> ConsoleAccess {
         match &inner.actor {
             Some(actor) => derive(self.marker, self.rootless(), actor),
