@@ -148,7 +148,11 @@ function StreamSection() {
   const hadFocus = useRef(false);
   const prefs = res.data;
   const recommended = `Recommended (${prefs?.recommendedName ?? "for this device"})`;
-  const current = prefs?.defaultId ? (prefs.profiles.find((p) => p.id === prefs.defaultId)?.name ?? prefs.defaultId) : recommended;
+  // With overrides off the stored default is not what a launch starts (#721): say the admin's default.
+  const current =
+    prefs?.defaultId && prefs.overridesAllowed
+      ? (prefs.profiles.find((p) => p.id === prefs.defaultId)?.name ?? prefs.defaultId)
+      : (prefs?.adminDefaultName ?? recommended);
 
   // Saves on change: the select is labelled and the result is said back at once.
   const save = async (id: string) => {
