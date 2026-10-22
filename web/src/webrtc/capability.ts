@@ -48,26 +48,28 @@ export function getOrCreateDeviceKey(): string {
  * server's staleness horizon is 30 days (probeMaxAgeDays), so a day is ample.
  * Keyed by user id: two accounts sharing a browser each need their own row.
  * Bump the key's version when the probe changes in a way the server must see
- * at once: a stamp under an old key forces one post (#632).
+ * at once: a stamp under an old key forces one post (#632). The stamp also holds the
+ * H.264 verdict it posted: the server refuses H.264 rungs for a device whose record
+ * says no, so a changed verdict (plugin installed) is posted at once, not tomorrow (#688).
  */
 const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v2";
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
 
-export function deviceProbeIsFresh(userId: string, now: number = Date.now()): boolean {
+export function deviceProbeIsFresh(userId: string, h264: boolean, now: number = Date.now()): boolean {
   try {
     const raw = localStorage.getItem(DEVICE_POST_STORAGE_KEY);
     if (!raw) return false;
-    const { user, at } = JSON.parse(raw) as { user?: string; at?: number };
-    if (user !== userId || typeof at !== "number") return false;
+    const { user, at, h264: posted } = JSON.parse(raw) as { user?: string; at?: number; h264?: boolean };
+    if (user !== userId || typeof at !== "number" || posted !== h264) return false;
     return now - at >= 0 && now - at < DEVICE_POST_TTL_MS;
   } catch {
     return false;
   }
 }
 
-export function markDeviceProbePosted(userId: string, now: number = Date.now()): void {
+export function markDeviceProbePosted(userId: string, h264: boolean, now: number = Date.now()): void {
   try {
-    localStorage.setItem(DEVICE_POST_STORAGE_KEY, JSON.stringify({ user: userId, at: now }));
+    localStorage.setItem(DEVICE_POST_STORAGE_KEY, JSON.stringify({ user: userId, at: now, h264 }));
   } catch {
     /* Storage full or blocked: the only cost is posting again next load. */
   }
