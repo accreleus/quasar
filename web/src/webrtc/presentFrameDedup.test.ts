@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { summarizePresentWindow } from "./presentCadence";
 import {
   feedPresentedFrame,
+  presentedFrameKey,
   INITIAL_FRAME_DEDUP_STATE,
   type FrameDedupState,
 } from "./presentFrameDedup";
@@ -133,5 +135,80 @@ describe("feedPresentedFrame", () => {
     const intervals = runSequence(seq);
     expect(intervals).toEqual([33.34]);
     expect(1000 / intervals[0]!).toBeLessThan(31); // reads as ~30fps, the real drop
+  });
+});
+
+// #686: Firefox reports mediaTime 0 on every WebRTC frame (the spec allows it) and
+// carries the frame's identity in rtpTimestamp. Traces are shaped like Firefox 142 and
+// Chrome 14x loopback captures (320x240, 30 fps source).
+describe("presentedFrameKey", () => {
+  type Frame = { mediaTime: number; rtpTimestamp?: number; nowMs: number };
+  const run = (frames: Frame[], key: (f: Frame) => number | undefined): number[] => {
+    let state: FrameDedupState = INITIAL_FRAME_DEDUP_STATE;
+    const out: number[] = [];
+    for (const f of frames) {
+      const r = feedPresentedFrame(state, key(f), f.nowMs);
+      state = r.nextState;
+      if (r.intervalMs != null) out.push(r.intervalMs);
+    }
+    return out;
+  };
+  const viaKey = (f: Frame) => presentedFrameKey(f);
+  const viaMediaTime = (f: Frame) => f.mediaTime;
+
+  const firefox = (gapsMs: number[]): Frame[] => {
+    let nowMs = 0;
+    let rtp = 1347462624;
+    return [0, ...gapsMs].map((gap) => {
+      nowMs += gap;
+      rtp += Math.round(gap * 90);
+      return { mediaTime: 0, rtpTimestamp: rtp, nowMs };
+    });
+  };
+
+  it("Firefox: a constant mediaTime 0 no longer empties the window", () => {
+    const frames = firefox(Array(40).fill(33));
+    expect(run(frames, viaMediaTime)).toEqual([]); // the pre-fix behaviour
+    const intervals = run(frames, viaKey);
+    expect(intervals).toHaveLength(40);
+    const c = summarizePresentWindow(intervals, null, null);
+    expect(c.n).toBe(40);
+    expect(c.fpsFromMedian).toBeCloseTo(1000 / 33, 5);
+    expect(c.sdMs).toBe(0);
+  });
+
+  it("Firefox: a stalled stream shows as long frames", () => {
+    const gaps = Array(30).fill(33);
+    gaps.splice(10, 0, 400, 400, 400);
+    const c = summarizePresentWindow(run(firefox(gaps), viaKey), null, null);
+    expect(c.longFrames).toBe(3);
+    expect(c.sdMs).toBeGreaterThan(60);
+  });
+
+  it("Firefox: a repeated tick for the same RTP frame is still dropped", () => {
+    const frames = firefox([33, 33]);
+    frames.splice(2, 0, { ...frames[1]!, nowMs: 50 });
+    expect(run(frames, viaKey)).toEqual([33, 33]);
+  });
+
+  it("Chrome: the same trace gives the same intervals as keying on mediaTime alone", () => {
+    // First frame mediaTime 0, vsync duplicates of a frame, one stalled frame.
+    const rtp = 1595657622;
+    const chrome: Frame[] = [
+      { mediaTime: 0, rtpTimestamp: rtp, nowMs: 0 },
+      { mediaTime: 0, rtpTimestamp: rtp, nowMs: 10 },
+      { mediaTime: 0.0167, rtpTimestamp: rtp + 1503, nowMs: 17 },
+      { mediaTime: 0.0167, rtpTimestamp: rtp + 1503, nowMs: 27 },
+      { mediaTime: 0.0333, rtpTimestamp: rtp + 3000, nowMs: 34 },
+      { mediaTime: 0.0667, rtpTimestamp: rtp + 6003, nowMs: 67 },
+    ];
+    expect(run(chrome, viaKey)).toEqual([17, 17, 33]);
+    expect(run(chrome, viaKey)).toEqual(run(chrome, viaMediaTime));
+  });
+
+  it("passes mediaTime through when there is no rtpTimestamp or no metadata", () => {
+    expect(presentedFrameKey({ mediaTime: 0 })).toBe(0);
+    expect(presentedFrameKey({ mediaTime: 0.5, rtpTimestamp: 9 })).toBe(0.5);
+    expect(presentedFrameKey(undefined)).toBeUndefined();
   });
 });
