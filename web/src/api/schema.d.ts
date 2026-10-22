@@ -8223,6 +8223,8 @@ export interface components {
                 id: string;
                 name: string;
             }[];
+            /** @description Amendment 40 (#602), ADDITIVE: a machine-readable cause under code. Present only on 503 no_host_available, as home_host_unavailable, when the launch is pinned to the host that holds the caller's home for this app and that host is offline or no longer enrolled. Only an admin clears it, so a client does not spend its automatic retry on it. Names no host. Open string: a client treats an unknown value as absent. */
+            reason?: string;
         };
         ErrorEnvelope: {
             error: components["schemas"]["Error"];
@@ -11863,7 +11865,7 @@ export interface components {
                 "application/json": components["schemas"]["ClientTooOldError"];
             };
         };
-        /** @description no_host_available / capacity_exhausted / host_not_ready (amendment 11: a failing evidence-based readiness check is the only reason no host qualified) — well-formed but cannot be placed now (retryable). Amendment 12 (#296): an explicit stream.codec is a codec constraint applied at placement; when a GPU that can encode it exists but none is free the answer is capacity_exhausted, and when no online usable GPU can encode it the answer is no_host_available, both with a message naming the codec. No new code. */
+        /** @description no_host_available / capacity_exhausted / host_not_ready (amendment 11: a failing evidence-based readiness check is the only reason no host qualified) — well-formed but cannot be placed now (retryable). Amendment 12 (#296): an explicit stream.codec is a codec constraint applied at placement; when a GPU that can encode it exists but none is free the answer is capacity_exhausted, and when no online usable GPU can encode it the answer is no_host_available, both with a message naming the codec. No new code. Amendment 40 (#602): no_host_available MAY carry error.reason home_host_unavailable (the caller's home is on a host that is offline or no longer enrolled); a client does not auto-retry it. */
         Unavailable: {
             headers: {
                 /** @description delta-seconds; MAY accompany capacity_exhausted (control-api.md §Admission control, (4)); 2 on a refused warm-Steam claim (amendment 39). */

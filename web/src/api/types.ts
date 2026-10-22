@@ -45,6 +45,9 @@ export interface ApiErrorBody {
     /** On `home_in_use`: omitted, never empty, when the conflict is known but
      *  the session is not (steam-library-discovery spec §2.2). */
     session_id?: string;
+    /** On `503 no_host_available`: `home_host_unavailable` when the caller's home
+     *  is on a host that is offline or gone (amendment 40). An open string. */
+    reason?: string;
   };
   /** On `409 host_not_eligible`: the host's `EligibilityReason`, a top-level
    *  sibling of `error` (control-api.md §"Platform-release apply"). */

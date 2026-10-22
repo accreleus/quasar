@@ -19,6 +19,7 @@ import {
   closingGaveUpCopy,
   closingToastCopy,
   decideCapacityRetry,
+  isCapacityRetryable,
   waitingToastCopy,
 } from "../capacityRetry";
 import { isRecommendationEligible } from "../launchOptions";
@@ -229,8 +230,7 @@ export function useLaunch({
           }
           if (
             closingName !== null ||
-            (err instanceof ApiError &&
-              (err.code === "capacity_exhausted" || err.code === "no_host_available"))
+            (err instanceof ApiError && isCapacityRetryable(err))
           ) {
             const reason: WaitingReason =
               closingName !== null
@@ -307,7 +307,7 @@ export function useLaunch({
             // The previous session never finished stopping inside the budget.
             addToast({ variant: "danger", ...closingGaveUpCopy(closingName) });
           } else if (err instanceof ApiError) {
-            const presented = presentLaunchError(apps, app, err.code, err.message, err.sessionId);
+            const presented = presentLaunchError(apps, app, err.code, err.message, err.sessionId, err.reason);
             addToast({
               variant: presented.variant,
               title: presented.title,
