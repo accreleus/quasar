@@ -98,6 +98,16 @@ describe("apiFetch — errors still surface as ApiError", () => {
   });
 });
 
+describe("apiFetch — error.reason (#602)", () => {
+  it("reads error.reason into ApiError.reason", async () => {
+    mock().mockResolvedValueOnce(
+      respond(503, JSON.stringify({ error: { code: "no_host_available", reason: "home_host_unavailable", message: "m" } })),
+    );
+    const err = await apiFetch("/sessions", { method: "POST", token: "t" }).catch((e: unknown) => e);
+    expect((err as ApiError).reason).toBe("home_host_unavailable");
+  });
+});
+
 // #494 — 503 capacity_exhausted carries Retry-After so a client can retry on
 // the server's own timing instead of guessing (see AppHomeNext.tsx launchApp
 // / capacityRetry.ts for what consumes this).
