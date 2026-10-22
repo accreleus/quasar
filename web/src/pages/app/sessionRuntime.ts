@@ -36,7 +36,7 @@ import { mintSignalingToken } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer } from "../../api/types";
 import { setupCapture, type GamepadIdentity } from "../../input/capture";
-import { QuasarSession, type RebindOutcome } from "../../webrtc/session";
+import { QuasarSession, type RebindOutcome, type TakeoverRefusal } from "../../webrtc/session";
 import type { RecoveryState } from "../../webrtc/recovery";
 import { PlayoutController, resolveInitialPlayoutMs } from "../../webrtc/playout";
 import {
@@ -79,6 +79,8 @@ export interface SessionRuntimeSnapshot {
   wsOpen: boolean;
   pcConnected: boolean;
   firstFrame: boolean;
+  /** The host refused this page's takeover; it will get no media (amendment 42). */
+  takeoverRefused: TakeoverRefusal | null;
 }
 
 const IDLE_SNAPSHOT: SessionRuntimeSnapshot = {
@@ -93,6 +95,7 @@ const IDLE_SNAPSHOT: SessionRuntimeSnapshot = {
   wsOpen: false,
   pcConnected: false,
   firstFrame: false,
+  takeoverRefused: null,
 };
 
 export { IDLE_SNAPSHOT };
@@ -189,6 +192,7 @@ export interface TransportLike {
   onSignalingOpen?: (() => void) | null;
   /** The host's `bye`. Optional so a fake need not carry it. */
   onHostBye?: (() => void) | null;
+  onTakeoverRefused?: ((refusal: TakeoverRefusal) => void) | null;
   onWebRtcStateChange:
     | ((kind: "ice" | "connection", from: string, to: string) => void)
     | null;
@@ -861,6 +865,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       transport.onSignalingOpen = () => set({ wsOpen: true });
       // #753: a game exit says `bye` seconds before media stalling would tell us.
       transport.onHostBye = () => cfg.callbacks.onDisconnectSuspected();
+      transport.onTakeoverRefused = (refusal) => set({ takeoverRefused: refusal });
 
       transport.onWebRtcStateChange = (kind, from, to) => {
         tracer?.emitWebRtcStateChanged(kind, from, to);

@@ -20,7 +20,7 @@ use super::{
 };
 use crate::session::metrics::SessionMetrics;
 use crate::session::runner::{DiagnosticEventTx, SessionEvent, SessionTransports};
-use crate::session::signaling::{PcId, SignalMsg};
+use crate::session::signaling::{PcId, SignalMsg, TAKEOVER_ABANDONED, TAKEOVER_RATE_LIMITED};
 use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 
 /// The dev/runtime image has libnice, gst-interpipe and openh264; the devtools image
@@ -112,6 +112,8 @@ struct Host {
     munge_answer: Option<fn(String) -> String>,
     sig_tx: OutTx,
     sig_rx: mpsc::UnboundedReceiver<SignalMsg>,
+    /// Every `error` the host sent the client, in order.
+    errors: Vec<SignalMsg>,
     bus: gst::Bus,
     /// Every error the encode bus posted, message and debug text joined.
     bus_errors: Vec<String>,
@@ -228,6 +230,7 @@ impl Host {
             munge_answer: None,
             sig_tx,
             sig_rx,
+            errors: Vec::new(),
             bus,
             bus_errors: Vec::new(),
             encoder,
@@ -595,6 +598,10 @@ fn pump_with(
     let deadline = Instant::now() + within;
     loop {
         while let Ok(msg) = host.sig_rx.try_recv() {
+            if matches!(msg, SignalMsg::Error { .. }) {
+                host.errors.push(msg);
+                continue;
+            }
             let pc = match &msg {
                 SignalMsg::Offer { pc, sdp } => {
                     host.wire
@@ -784,6 +791,19 @@ fn describe(peer: &Peer) -> String {
         peer.video.ice_state(),
         peer.video.dtls_state()
     )
+}
+
+/// The amendment-42 `code` and `pc` of each `error` the host sent.
+fn codes(errors: &[SignalMsg]) -> Vec<(String, PcId)> {
+    errors
+        .iter()
+        .map(|e| match e {
+            SignalMsg::Error { code, pc, .. } => {
+                (code.clone().unwrap_or_default(), pc.unwrap_or_default())
+            }
+            other => panic!("not an error: {other:?}"),
+        })
+        .collect()
 }
 
 /// Does the host answer this peer's input channel?
@@ -1157,6 +1177,7 @@ fn past_the_replacement_budget_the_current_peer_keeps_the_transport() {
     let _a = first_attach(&mut host);
     let mut b = attach(&mut host);
     let transport = host.transports.video.webrtc.clone();
+    assert_eq!(codes(&host.errors), [], "a takeover within the budget");
 
     let mut c = Peer::new();
     request_offers(&mut host);
@@ -1170,6 +1191,19 @@ fn past_the_replacement_budget_the_current_peer_keeps_the_transport() {
         rtp(&b.video) > b_video + 30,
         "the current peer lost its stream"
     );
+    assert!(input_reaches_host(&mut host, &mut b));
+    // Amendment 42: one error per refused answer, to the peer it refused.
+    let mut refused = codes(&host.errors);
+    refused.sort_by_key(|(_, pc)| *pc as usize);
+    let limited = TAKEOVER_RATE_LIMITED.to_string();
+    assert_eq!(
+        refused,
+        [(limited.clone(), PcId::Video), (limited, PcId::Audio)]
+    );
+    // The peer streaming answers again, still past the budget: it is told nothing.
+    request_offers(&mut host);
+    pump(&mut host, &mut b, Duration::from_secs(3), |_, _| false);
+    assert_eq!(host.errors.len(), 2, "{:?}", codes(&host.errors));
     assert!(input_reaches_host(&mut host, &mut b));
 
     // The window clears: the refused peer's next request is served like any other.
@@ -2204,6 +2238,8 @@ struct Session {
     answers: [Option<String>; 2],
     /// The runner's last word: `Stopped` or `Failed`.
     ended: Option<SessionEvent>,
+    /// Every `error` the host sent the client, in order.
+    errors: Vec<SignalMsg>,
     /// Nothing the peer says reaches the host.
     mute: bool,
     /// The runner reported `SwapDone`.
@@ -2270,6 +2306,7 @@ impl Session {
             offers: [0; 2],
             answers: [None, None],
             ended: None,
+            errors: Vec::new(),
             mute: false,
             swapped: false,
             swap,
@@ -2293,6 +2330,10 @@ impl Session {
                 self.log.push(event.clone());
                 match event {
                     SessionEvent::Signaling(msg) => {
+                        if matches!(msg, SignalMsg::Error { .. }) {
+                            self.errors.push(msg);
+                            continue;
+                        }
                         let pc = match &msg {
                             SignalMsg::Offer { pc, .. } => {
                                 self.offers[pc.unwrap_or_default() as usize] += 1;
@@ -2427,6 +2468,11 @@ impl Session {
     /// A page streams. A second browser takes the session over, and its answer to the new
     /// `refused` transport's offer is one webrtcbin cannot apply.
     fn with_a_takeover_that_cannot_be_applied(tag: &str, refused: PcId) -> Session {
+        Session::with_a_takeover_answering(tag, refused, refusing_its_first_m_line)
+    }
+
+    /// The same, with the second browser's answer on `pc` made by `answer`.
+    fn with_a_takeover_answering(tag: &str, refused: PcId, answer: fn(&str) -> String) -> Session {
         let mut session = Session::start(tag, Duration::from_secs(600));
         let mut a = Peer::new();
         let up = session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p));
@@ -2442,9 +2488,7 @@ impl Session {
         let replaced = session.pump(&mut a, Duration::from_secs(10), |s, _| s.offers == [2, 2]);
         assert!(replaced, "offers per PC: {:?}", session.offers);
 
-        let sdp = as_b(&refusing_its_first_m_line(
-            answers[refused as usize].as_ref().unwrap(),
-        ));
+        let sdp = as_b(&answer(answers[refused as usize].as_ref().unwrap()));
         let _ = session.to_host.send(SignalMsg::Answer {
             sdp,
             pc: Some(refused),
@@ -2486,6 +2530,8 @@ fn a_takeover_whose_video_answer_cannot_be_applied_leaves_the_session_running() 
     }
     let _serial = serial();
     let mut session = Session::with_a_takeover_that_cannot_be_applied("refused-video", PcId::Video);
+    let abandoned = TAKEOVER_ABANDONED.to_string();
+    assert_eq!(codes(&session.errors), [(abandoned, PcId::Video)]);
     session.serves_the_next_peer_and_stops();
 }
 
@@ -2496,11 +2542,14 @@ fn a_takeover_whose_audio_answer_cannot_be_applied_leaves_the_session_running() 
     }
     let _serial = serial();
     let mut session = Session::with_a_takeover_that_cannot_be_applied("refused-audio", PcId::Audio);
+    let abandoned = TAKEOVER_ABANDONED.to_string();
+    assert_eq!(codes(&session.errors), [(abandoned, PcId::Audio)]);
     session.serves_the_next_peer_and_stops();
 }
 
 /// The same answer from the first peer a session ever had still fails the launch, as it
-/// does on `develop`: there is no stream to keep, and the page is told why.
+/// does on `develop`: there is no stream to keep. The rejection is the session's failure
+/// reason; no takeover `error` is sent.
 #[test]
 fn a_first_answer_that_cannot_be_applied_still_fails_the_launch() {
     if !live_webrtc_available() {
@@ -2524,6 +2573,205 @@ fn a_first_answer_that_cannot_be_applied_still_fails_the_launch() {
     assert!(
         matches!(&ended, Some(SessionEvent::Failed(reason)) if reason.contains("rejected the remote answer")),
         "the launch did not fail: {ended:?}"
+    );
+    assert_eq!(
+        codes(&session.errors),
+        [],
+        "a launch transport is no takeover"
+    );
+}
+
+/// `sdp` as a client that writes its own SDP might send it: no `a=fingerprint`.
+fn without_fingerprint(sdp: &str) -> String {
+    sdp.lines()
+        .filter(|l| !l.starts_with("a=fingerprint:"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n"
+}
+
+/// A second client sends `restart_ice` and then an answer that names no peer, while the
+/// first streams on the launch transport (#591). The answer is refused; the first keeps
+/// its stream and the session its life.
+#[test]
+fn an_answer_naming_no_peer_from_a_second_client_leaves_the_streaming_peer_alone() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("peerless", Duration::from_secs(600));
+    let mut a = Peer::new();
+    let up = session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p));
+    assert!(up, "the first peer never streamed: {}", describe(&a));
+    let answer = session.answers[PcId::Video as usize].clone().unwrap();
+
+    // The first peer answers nothing more; the second one's offer is the transport's.
+    session.mute = true;
+    let _ = session.to_host.send(SignalMsg::RestartIce {
+        pc: Some(PcId::Video),
+    });
+    let reoffered = session.pump(&mut a, Duration::from_secs(10), |s, _| s.offers[0] == 2);
+    assert!(reoffered, "offers per PC: {:?}", session.offers);
+    assert!(
+        session.ended.is_none(),
+        "ended on the re-offer: {:?}",
+        session.ended
+    );
+
+    let sdp = without_fingerprint(&with_other_ice(&answer));
+    let _ = session.to_host.send(SignalMsg::Answer {
+        sdp,
+        pc: Some(PcId::Video),
+    });
+    let before = rtp(&a.video);
+    session.pump(&mut a, Duration::from_secs(3), |s, _| s.ended.is_some());
+    assert!(
+        session.ended.is_none(),
+        "an answer that names no peer ended the session: {:?}",
+        session.ended
+    );
+    assert!(
+        rtp(&a.video) > before + 30,
+        "the first peer stopped receiving: {}",
+        describe(&a)
+    );
+    assert_eq!(
+        codes(&session.errors),
+        [],
+        "amendment 43: the client is sent nothing"
+    );
+
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.ends_within(Duration::from_secs(10));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the session did not stop: {ended:?}"
+    );
+}
+
+/// `answer` with its video m-line refused in a way that leaves ICE, DTLS and BUNDLE
+/// alone: `a=inactive`, or port 0.
+fn refusing_video(answer: &str, port_zero: bool) -> String {
+    let mut section = 0;
+    let out = answer
+        .lines()
+        .map(|line| {
+            if line.starts_with("m=") {
+                section += 1;
+            }
+            match (section, line.strip_prefix("m=")) {
+                (1, Some(rest)) if port_zero => {
+                    let mut parts: Vec<&str> = rest.split(' ').collect();
+                    parts[1] = "0";
+                    format!("m={}", parts.join(" "))
+                }
+                (1, None) if !port_zero && ["a=recvonly", "a=sendrecv"].contains(&line) => {
+                    "a=inactive".to_string()
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n";
+    let video = crate::session::sdp_answer::parse_answer(&out);
+    assert!(
+        video
+            .m_lines
+            .first()
+            .is_some_and(|m| m.kind == "video" && m.rejected),
+        "the video m-line is not refused: {out}"
+    );
+    out
+}
+
+fn video_inactive(answer: &str) -> String {
+    refusing_video(answer, false)
+}
+
+fn video_at_port_zero(answer: &str) -> String {
+    refusing_video(answer, true)
+}
+
+/// A taking browser refuses the video m-line in an answer that keeps its ICE and DTLS
+/// attributes. The host applies it, and amendment 42 tells the browser the takeover is
+/// abandoned; the session keeps running.
+#[test]
+fn a_takeover_answer_that_refuses_video_is_told_it_is_abandoned() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let shapes = [
+        ("inactive-video", video_inactive as fn(&str) -> String),
+        ("port0-video", video_at_port_zero),
+    ];
+    for (tag, refuse) in shapes {
+        let mut session = Session::with_a_takeover_answering(tag, PcId::Video, refuse);
+        let applied = session.log.iter().any(|e| {
+            matches!(e, SessionEvent::Trace { event: "sdp.answer_applied", payload }
+                if payload["pc"] == "video" && payload["rejected_count"].as_u64() > Some(0))
+        });
+        // Measured on 1.28.8: webrtcbin applies both shapes; only the parsed answer tells.
+        assert!(applied, "{tag}: the host did not apply the refusing answer");
+        let abandoned = TAKEOVER_ABANDONED.to_string();
+        assert_eq!(codes(&session.errors), [(abandoned, PcId::Video)], "{tag}");
+        session.serves_the_next_peer_and_stops();
+    }
+}
+
+/// Amendments 42 and 43 together: a peer-less answer on a transport that replaced another
+/// and has a peer is dropped without a word, not reported as an abandoned takeover.
+#[test]
+fn a_peerless_answer_on_a_taken_over_transport_is_dropped_without_an_error() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("peerless-taken", Duration::from_secs(600));
+    let mut a = Peer::new();
+    let up = session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p));
+    assert!(up, "the first peer never streamed: {}", describe(&a));
+    for pc in [PcId::Video, PcId::Audio] {
+        let _ = session.to_host.send(SignalMsg::RestartIce { pc: Some(pc) });
+    }
+    let mut b = Peer::new();
+    let up = session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p));
+    assert!(up, "the taking peer never streamed: {}", describe(&b));
+    let answer = session.answers[PcId::Video as usize].clone().unwrap();
+    let offers = session.offers[PcId::Video as usize];
+
+    session.mute = true;
+    let _ = session.to_host.send(SignalMsg::RestartIce {
+        pc: Some(PcId::Video),
+    });
+    let reoffered = session.pump(&mut b, Duration::from_secs(10), |s, _| {
+        s.offers[PcId::Video as usize] > offers
+    });
+    assert!(reoffered, "offers per PC: {:?}", session.offers);
+    let _ = session.to_host.send(SignalMsg::Answer {
+        sdp: without_fingerprint(&with_other_ice(&answer)),
+        pc: Some(PcId::Video),
+    });
+    let before = rtp(&b.video);
+    session.pump(&mut b, Duration::from_secs(3), |s, _| s.ended.is_some());
+    assert!(session.ended.is_none(), "ended: {:?}", session.ended);
+    assert!(
+        rtp(&b.video) > before + 30,
+        "the taking peer stopped receiving: {}",
+        describe(&b)
+    );
+    assert_eq!(
+        codes(&session.errors),
+        [],
+        "amendment 43: the client is sent nothing"
+    );
+
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.ends_within(Duration::from_secs(10));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the session did not stop: {ended:?}"
     );
 }
 
