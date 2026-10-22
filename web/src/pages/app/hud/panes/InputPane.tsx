@@ -27,8 +27,10 @@ export interface InputPaneProps {
   onGrab: () => void;
   /** True when Esc is browser-owned (or ours) and releases capture. */
   escReleases: boolean;
-  /** True when that is specifically because Keyboard Lock is unavailable. */
+  /** True when that is because the page is not a secure context (plain HTTP). */
   escInsecureContext: boolean;
+  /** A secure page in a browser with no Keyboard Lock (Safari): HTTPS would change nothing. */
+  escNoKeyboardLock?: boolean;
   /** Certificate bypassed rather than trusted (lib/certTrust.ts). Takes wording
    *  precedence over the other Esc explanations: "use HTTPS" is wrong advice on
    *  an origin that already IS https. */
@@ -187,6 +189,12 @@ function escNote(props: InputPaneProps): string {
     return (
       "In-game Esc capture needs the HTTPS address — Keyboard Lock is unavailable on this " +
       "insecure origin, so the browser keeps Esc and it releases capture."
+    );
+  }
+  if (props.escNoKeyboardLock) {
+    return (
+      "This browser doesn’t support Keyboard Lock, so it keeps Esc and Esc releases " +
+      "capture. Chrome or Edge can pass Esc to the game."
     );
   }
   return (

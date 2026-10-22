@@ -171,7 +171,8 @@ func (s *Store) ProfileOverrideAllowed(ctx context.Context, app LaunchApp, isAdm
 }
 
 // ResolveDefaultProfile picks the launch profile a no-profile_id launch uses:
-// app pin (prefer/force) -> user preference -> global default -> recommendation.
+// app pin (prefer/force) -> user preference (only while user overrides are
+// allowed) -> global default -> recommendation.
 // `restriction` is the app's launchable allow-list; a user preference or global
 // default outside it is skipped, falling through to the next source (ultimately
 // recommendedID, computed over the filtered catalogue) rather than launching an
@@ -181,16 +182,20 @@ func (s *Store) ResolveDefaultProfile(ctx context.Context, userID string, app La
 	if (app.ProfilePolicy == "prefer" || app.ProfilePolicy == "force") && app.DefaultProfileID != nil && *app.DefaultProfileID != "" {
 		return *app.DefaultProfileID, nil
 	}
-	prefs, err := s.GetUserProfilePreferences(ctx, userID)
-	if err != nil {
-		return "", err
-	}
-	if prefs.DefaultProfileID != nil && *prefs.DefaultProfileID != "" && restriction.Permits(*prefs.DefaultProfileID) {
-		return *prefs.DefaultProfileID, nil
-	}
 	policy, err := s.GetProfilePolicy(ctx)
 	if err != nil {
 		return "", err
+	}
+	// The stored default is honoured only while overrides are allowed
+	// (control-api.md); it is kept, not cleared, so it applies again when they are.
+	if policy.UserOverridesAllowed {
+		prefs, err := s.GetUserProfilePreferences(ctx, userID)
+		if err != nil {
+			return "", err
+		}
+		if prefs.DefaultProfileID != nil && *prefs.DefaultProfileID != "" && restriction.Permits(*prefs.DefaultProfileID) {
+			return *prefs.DefaultProfileID, nil
+		}
 	}
 	if policy.GlobalDefaultProfileID != nil && *policy.GlobalDefaultProfileID != "" && restriction.Permits(*policy.GlobalDefaultProfileID) {
 		return *policy.GlobalDefaultProfileID, nil

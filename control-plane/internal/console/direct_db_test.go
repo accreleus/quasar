@@ -28,7 +28,7 @@ func seedConsoleTestTile(t *testing.T, pool *pgxpool.Pool, parentID, name, appid
 	var id string
 	if err := pool.QueryRow(context.Background(), `INSERT INTO apps
 		(name, parent_app_id, external_source, external_id, origin, kind, default_vram_mb, default_encode_slots)
-		VALUES ($1, $2::uuid, 'steam', $3, 'discovered', 'game', 0, 0) RETURNING id::text`,
+		VALUES ($1, $2::uuid, 'steam', $3, 'discovered', 'game', 0, 1) RETURNING id::text`,
 		"console-test-"+name, parentID, appid).Scan(&id); err != nil {
 		t.Fatalf("seed tile %s: %v", name, err)
 	}

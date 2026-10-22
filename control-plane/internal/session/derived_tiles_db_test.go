@@ -53,15 +53,16 @@ func seedSteamApp(t *testing.T, pool *pgxpool.Pool, spec string) string {
 
 // seedTile inserts a derived tile of parentID. Every column
 // apps_derived_shape_ck constrains is left at its tile-shaped value — in
-// particular the resource columns are ZERO, which is the cb97bfb shape and is
-// what TestDerivedTileAdmissionUsesTheParentsResources relies on.
+// particular the tile's own slots (1) differ from the parent's (2), which is what
+// TestDerivedTileAdmissionUsesTheParentsResources relies on. Slots can no longer
+// be 0 (apps_default_encode_slots_ck, 0106), the cb97bfb shape.
 func seedTile(t *testing.T, pool *pgxpool.Pool, parentID, name, appid string) string {
 	t.Helper()
 	var id string
 	must(t, pool.QueryRow(context.Background(), `INSERT INTO apps
 		(name, parent_app_id, external_source, external_id, origin, kind,
 		 default_vram_mb, default_encode_slots)
-		VALUES ($1, $2::uuid, 'steam', $3, 'discovered', 'game', 0, 0)
+		VALUES ($1, $2::uuid, 'steam', $3, 'discovered', 'game', 0, 1)
 		RETURNING id::text`, name, parentID, appid).Scan(&id))
 	entitleAll(t, pool, id)
 	return id
@@ -799,14 +800,16 @@ func TestNonDerivedRuntimeSpecIsByteIdentical(t *testing.T) {
 // --- admission (§1.2) ---------------------------------------------------------
 
 // TestDerivedTileAdmissionUsesTheParentsResources is the cb97bfb assertion, and
-// it is deliberately the STRONG form: the tile's own default_encode_slots is 0,
-// which under the incident's failure mode makes an app admissible on a GPU with
-// no free encode slot at all.
+// it is deliberately the STRONG form: the tile's own default_encode_slots (1)
+// is less than the parent's (2), so admitting on the tile's own value would fit
+// a GPU with one free slot where the parent's value must refuse. (The incident's
+// 0 is now refused by apps_default_encode_slots_ck.)
 //
 // A discovered tile is created by a background job (Phase 4), which is precisely
 // the shape that incident took — omitted create fields zeroing the column. So
 // the test does not check "the number came from the parent", it checks the
-// consequence: a FULL host must still refuse the tile.
+// consequence: a host with fewer free slots than the parent needs must still refuse
+// the tile, even when it has room for the tile's own value.
 func TestDerivedTileAdmissionUsesTheParentsResources(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
@@ -816,7 +819,7 @@ func TestDerivedTileAdmissionUsesTheParentsResources(t *testing.T) {
 	provisionHome(t, pool, s.userID, parent, s.hostID)
 	ctx := context.Background()
 
-	// Fill the GPU: one other user's session holding both encode slots.
+	// Leave one of the GPU's two slots free: enough for the tile's own 1, not the parent's 2.
 	var other string
 	must(t, pool.QueryRow(ctx, `INSERT INTO users (email, username, password_hash)
 		VALUES ('filler@test.local','filler','x') RETURNING id::text`).Scan(&other))
@@ -824,19 +827,19 @@ func TestDerivedTileAdmissionUsesTheParentsResources(t *testing.T) {
 		(user_id, app_id, host_id, gpu_id, state, width, height, fps, bitrate_kbps,
 		 h264_profile, reserved_vram_mb, reserved_encode_slots)
 		VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'running', 1280, 720, 30, 2000,
-		        'constrained-baseline', 0, 2)`, other, s.appID, s.hostID, s.gpuID))
+		        'constrained-baseline', 0, 1)`, other, s.appID, s.hostID, s.gpuID))
 
 	disp := newCapturingDispatcher()
 	coord := newTestCoordinator(t, store, disp, testLogger(), WithHomeProvider(storage.NewLocal(pool, testHomeRoot)))
 
 	_, err := coord.Launch(ctx, s.userID, hades, StreamOverride{})
 	if err == nil {
-		t.Fatal("a derived tile with default_encode_slots = 0 was ADMITTED onto a full GPU.\n" +
+		t.Fatal("a derived tile was ADMITTED onto a GPU with fewer free slots than its parent needs.\n" +
 			"§1.2: the tile's own resource columns are never read; admission resolves from the parent. " +
 			"cb97bfb is the live incident of exactly this.")
 	}
 	if !errors.Is(err, ErrCapacityExhausted) && !errors.Is(err, ErrNoHostAvailable) {
-		t.Fatalf("launch on a full GPU: err = %v, want a capacity rejection", err)
+		t.Fatalf("launch on a GPU short of the parent's slots: err = %v, want a capacity rejection", err)
 	}
 
 	// And the positive control: the SAME tile is admitted once the GPU is free, so
