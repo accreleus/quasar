@@ -1990,7 +1990,10 @@ to a socket that is still dark (a daemon restart can start it first), keeps aski
 else counts: the image's healthcheck and an operator's `quasar-recovery status` mark their
 requests as the actor's own and name no attempt. An agent that is down leaves the successor
 unverified. Only then is `.kept` removed and `seed.json` rewritten to name the new image
-(`token="actor-seed-file-updated"`). A successor that never becomes ready, never takes the
+(`token="actor-seed-file-updated"`). A write that fails is only a warning, and the verified
+actor writes it again at every later start, while its attempt journal is kept
+(`token="actor-seed-file-healed"`; `actor-seed-file-stale` while it still fails,
+`actor-seed-file-differs` for an actor no journal shows verified). A successor that never becomes ready, never takes the
 lease, fails to verify, or is started three times without verifying is removed and the
 previous actor runs again: `failed`, `restored: true`. Every restart point settles to a
 stated outcome, and throughout at least one container carries the actor's two seed

@@ -827,11 +827,11 @@ impl Actor {
     }
 
     /// Records this actor's image in `seed.json` when no actor has yet, so a seed can
-    /// re-create it. An existing file is left alone: only a verified hand-over rewrites the
-    /// image, and only an uninstall the state (ADR 0007).
+    /// re-create it. An existing file keeps its image unless this actor is a verified
+    /// successor ([`Actor::heal_seed_file`]); only an uninstall changes the state (ADR 0007).
     fn ensure_seed_file(&self, machine: &Machine) -> Result<(), ResumeError> {
         match self.dir.load_seed_file() {
-            Ok(Some(_)) => return Ok(()),
+            Ok(Some(_)) => return Ok(self.heal_seed_file()?),
             Ok(None) => {}
             Err(e) => {
                 warn!(
@@ -859,6 +859,87 @@ impl Actor {
         };
         self.dir.store_seed_file(&file)?;
         info!(image = %file.recovery_actor_image.reference(), "seed.json records this recovery actor");
+        Ok(())
+    }
+
+    /// `seed.json` names the last verified actor (ADR 0007), but a hand-over that verified
+    /// its successor only warns when the write fails, so the file can stay on the previous
+    /// image and a seed would re-create an actor older than the services it manages. A
+    /// successor whose attempt journal shows it verified writes its own image at every
+    /// start. The journal must still be on disk (the last 16 finished attempts are kept):
+    /// after that a stale file only gets the `actor-seed-file-differs` warning.
+    fn heal_seed_file(&self) -> Result<(), EngineError> {
+        let Ok(Some(file)) = self.dir.load_seed_file() else {
+            return Ok(());
+        };
+        if file.state != seed::file::SeedState::Active {
+            return Ok(());
+        }
+        // Only a crashed engine stops the start: the file is not needed to run.
+        let own = match self.own_container().and_then(|me| match me {
+            Some(me) => Ok(try_own_image(self.engine.as_ref(), &me)?.map(|image| (me, image))),
+            None => Ok(None),
+        }) {
+            Ok(Some(own)) => own,
+            Ok(None) => return Ok(()),
+            Err(EngineError::Crashed) => return Err(EngineError::Crashed),
+            Err(e) => {
+                warn!(
+                    token = "actor-seed-file-unchecked",
+                    "could not read this actor from the engine ({e}); seed.json is not checked at this start"
+                );
+                return Ok(());
+            }
+        };
+        let (me, image) = own;
+        let named = file.recovery_actor_image.clone();
+        if named == image {
+            return Ok(());
+        }
+        let verified = me
+            .labels
+            .get(crate::replace::ATTEMPT_LABEL)
+            .and_then(|id| self.journals.load(id).ok().flatten())
+            .is_some_and(|j| {
+                j.steps.iter().any(|s| {
+                    s.name == crate::settle::RECOVERY_ACTOR
+                        && s.phase == crate::journal::Phase::Done
+                        && s.failure.is_none()
+                        // An interrupted attempt is finished `Failed` with every step
+                        // `Done` and no failure; only a successor that took the lease
+                        // (`HandingOver` on) can have verified.
+                        && s.successor_starts > 0
+                        && s.image.digest == image.digest
+                })
+            });
+        if !verified {
+            warn!(
+                token = "actor-seed-file-differs",
+                "seed.json names {} but this actor runs {}, and no attempt journal shows it verified; a seed would re-create {}",
+                named.reference(),
+                image.reference(),
+                named.reference()
+            );
+            return Ok(());
+        }
+        let healed = seed::file::SeedFile {
+            recovery_actor_image: image.clone(),
+            ..file
+        };
+        match self.dir.store_seed_file(&healed) {
+            Ok(()) => info!(
+                token = "actor-seed-file-healed",
+                image = %image.reference(),
+                "seed.json named {}, the actor this one replaced; it now names the verified recovery actor",
+                named.reference()
+            ),
+            Err(e) => warn!(
+                token = "actor-seed-file-stale",
+                "seed.json names {}, not this verified actor {}, and could not be updated ({e}); a seed would re-create the previous actor, which may not render what is running now. It is tried again at the next start",
+                named.reference(),
+                image.reference()
+            ),
+        }
         Ok(())
     }
 
@@ -1517,13 +1598,23 @@ pub(crate) fn own_image(
     engine: &dyn PlatformEngine,
     me: &Container,
 ) -> Option<seed::file::ActorImage> {
+    try_own_image(engine, me).ok().flatten()
+}
+
+/// [`own_image`], keeping the engine's error for a caller that must tell a crash apart.
+fn try_own_image(
+    engine: &dyn PlatformEngine,
+    me: &Container,
+) -> Result<Option<seed::file::ActorImage>, EngineError> {
     if let Some(pinned) = seed::file::ActorImage::parse(&me.image) {
-        return Some(pinned);
+        return Ok(Some(pinned));
     }
     let repository = repository_of(&me.image);
-    let image = engine.inspect_image(&me.image_id).ok()??;
-    let digest = digest_for(&image, &repository)?;
-    seed::file::ActorImage::parse(&format!("{repository}@{digest}"))
+    let Some(image) = engine.inspect_image(&me.image_id)? else {
+        return Ok(None);
+    };
+    Ok(digest_for(&image, &repository)
+        .and_then(|digest| seed::file::ActorImage::parse(&format!("{repository}@{digest}"))))
 }
 
 fn digest_for(image: &crate::engine::Image, repository: &str) -> Option<String> {
