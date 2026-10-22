@@ -1159,7 +1159,12 @@ function SessionPageBody() {
             touchLook={touchLookSupported()}
             escReleases={escReleases(releaseInputs)}
             releaseHint={immersive ? releaseHint(releaseInputs) : null}
-            escInsecureContext={pointerLockSupported() && !keyboardLockSupported()}
+            escInsecureContext={
+              pointerLockSupported() && !keyboardLockSupported() && window.isSecureContext === false
+            }
+            escNoKeyboardLock={
+              pointerLockSupported() && !keyboardLockSupported() && window.isSecureContext !== false
+            }
             // API presence alone cannot see these two, and both used to render
             // the cheerful fullscreen hint exactly where it was wrong: on a
             // bypassed-certificate origin the Keyboard Lock API exists

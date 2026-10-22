@@ -78,15 +78,15 @@ const rows: Row[] = [
   { name: "prefer pin outside the menu (never skipped)", policy: "prefer", pin: "p-gone", prefs: L("p-ok"), want: plan("p-gone", false, null, null) },
   { name: "admin, account default ineligible", admin: true, prefs: L("p-bad"), want: plan("p-bad", false, null, null) },
 
-  // Overrides off: Play lets the server pick, even where that 409s (#721 for the account default).
+  // Overrides off: the account default is not honoured, so Play lets the server pick (global default, then recommendation) (#721).
   { name: "overrides off, none, risky recommendation", prefs: Loff(), rec: "p-risky", want: plan(null, true, "overrides", null) },
-  { name: "overrides off, account default eligible", prefs: Loff("p-ok"), want: plan("p-ok", true, "overrides", "p-ok") },
-  { name: "overrides off, account default ineligible", prefs: Loff("p-bad"), want: plan("p-bad", true, "overrides", null) },
+  { name: "overrides off, account default ignored", prefs: Loff("p-ok"), want: plan(null, true, "overrides", null) },
+  { name: "overrides off, account default ignored for the global default", prefs: Loff("p-ok", "p-bad"), want: plan("p-bad", true, "overrides", null) },
   { name: "overrides off, prefer pin", policy: "prefer", pin: "p-ok", prefs: Loff(), want: plan("p-ok", true, "overrides", "p-ok") },
   { name: "overrides off, remembered", prefs: Loff(), remembered: true, want: plan(null, true, "overrides", null) },
   // A force pin the menu offers keeps Change (its codec), and Play still sends nothing.
   { name: "overrides off, force pin risky", policy: "force", pin: "p-risky", prefs: Loff(), want: plan("p-risky", true, null, "p-risky") },
-  { name: "overrides off, admin, account default ineligible", admin: true, prefs: Loff("p-bad"), want: plan("p-bad", false, null, null) },
+  { name: "overrides off, admin, account default ignored", admin: true, prefs: Loff("p-bad"), want: plan(null, true, null, null) },
 
   // A force pin the menu cannot offer: per-game lock.
   { name: "force pin, ineligible", policy: "force", pin: "p-bad", prefs: L(), want: plan("p-bad", true, "forced", null) },
