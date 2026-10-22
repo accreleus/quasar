@@ -14,7 +14,8 @@
 
 /** Running state threaded through successive feedPresentedFrame() calls. */
 export interface FrameDedupState {
-  /** mediaTime (seconds) of the last DISTINCT frame observed, or null before the first. */
+  /** Key of the last DISTINCT frame observed (presentedFrameKey: mediaTime in seconds, or an RTP
+   *  timestamp; compared for equality only), or null before the first. */
   lastMediaTime: number | null;
   /** performance.now() (ms) at which the last DISTINCT frame was observed, or null before the first. */
   lastNow: number | null;
@@ -35,8 +36,8 @@ export interface FrameDedupResult {
 
 /**
  * Fold one requestVideoFrameCallback tick into the running dedup state.
- * `mediaTime` null/undefined (no VideoFrameCallbackMetadata, rAF fallback) treats
- * every callback as distinct.
+ * `mediaTime` is the frame key from presentedFrameKey(). null/undefined (no
+ * VideoFrameCallbackMetadata, rAF fallback) treats every callback as distinct.
  */
 export function feedPresentedFrame(
   state: FrameDedupState,
@@ -59,4 +60,19 @@ export function feedPresentedFrame(
       lastNow: nowMs,
     },
   };
+}
+
+/**
+ * The frame identity for feedPresentedFrame. The spec lets `mediaTime` be 0 for WebRTC
+ * and Firefox always reports 0, which would drop every frame as a duplicate; the RTP
+ * timestamp is per frame there. Any non-zero `mediaTime` is used as before. A callback
+ * with `mediaTime` 0 and no RTP timestamp keys as 0 (the pre-#686 behaviour).
+ */
+export function presentedFrameKey(
+  metadata: Pick<VideoFrameCallbackMetadata, "mediaTime" | "rtpTimestamp"> | undefined,
+): number | undefined {
+  if (metadata?.mediaTime === 0 && typeof metadata.rtpTimestamp === "number") {
+    return metadata.rtpTimestamp;
+  }
+  return metadata?.mediaTime;
 }
