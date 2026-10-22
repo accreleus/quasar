@@ -905,6 +905,10 @@ impl Actor {
                     s.name == crate::settle::RECOVERY_ACTOR
                         && s.phase == crate::journal::Phase::Done
                         && s.failure.is_none()
+                        // An interrupted attempt is finished `Failed` with every step
+                        // `Done` and no failure; only a successor that took the lease
+                        // (`HandingOver` on) can have verified.
+                        && s.successor_starts > 0
                         && s.image.digest == image.digest
                 })
             });

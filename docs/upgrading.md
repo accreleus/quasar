@@ -321,10 +321,12 @@ gets the `actor-seed-file-differs` warning.
 What this does not fix: an older actor that finds an update step journalled at a recipe
 revision it does not carry continues it, or fails every start with
 `actor-resume-failed … recipe_unsupported`. The services keep running; the install pass stops at
-the one the actor cannot render. That case is tracked in #794. Until then, apply the release
-again from Fleet ▸ Releases: its first step moves the actor, which rewrites `seed.json`.
-Removing the actor container does not help, the seed re-creates the old one. Then
-`docker exec quasar-recovery quasar-recovery status` shows the new digest.
+the one the actor cannot render. That case is tracked in #794. Until then, on a GPU host apply
+the release again from Fleet ▸ Releases: its first step moves the actor, which rewrites
+`seed.json`. Then `docker exec quasar-recovery quasar-recovery status` shows the new digest.
+On the control plane's own machine, combined or control-only, the console offers no apply once
+the control plane reads up to date, and that is also tracked in #794. On either machine,
+removing the actor container does not help, the seed re-creates the old one.
 
 **An owner conflict** is a container that looks like a Quasar service but lacks this
 installation's labels: a leftover Compose stack, or a definition a stack manager still holds. The

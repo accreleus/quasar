@@ -2141,13 +2141,16 @@ fn each_socket_answers_status_only_for_attempts_submitted_on_it() {
     assert_eq!(mine(read("agent/agent.sock", "")), None);
 }
 
-/// `seed.json` cannot be written: a directory sits where its temporary file goes. The
-/// guard keeps the tests that read the log for `actor-seed-file-stale` from sharing it.
-fn block_seed_file(lab: &Lab) -> std::sync::MutexGuard<'static, ()> {
+/// The tests that block `seed.json` or read the log for `actor-seed-file-stale` take this
+/// first, before their lab, so the lab's threads stop before the next test starts.
+fn one_seed_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `seed.json` cannot be written: a directory sits where its temporary file goes.
+fn block_seed_file(lab: &Lab) {
     std::fs::create_dir(lab.dir.path().join("seed.json.tmp")).unwrap();
-    guard
 }
 
 fn unblock_seed_file(lab: &Lab) {
@@ -2156,8 +2159,9 @@ fn unblock_seed_file(lab: &Lab) {
 
 #[test]
 fn a_verified_successor_whose_first_seed_json_write_failed_leaves_a_removal_harmless() {
+    let _one_at_a_time = one_seed_test_at_a_time();
     let lab = Lab::new();
-    let _blocked = block_seed_file(&lab);
+    block_seed_file(&lab);
     let mut fired = false;
     lab.on(move |lab, who, component, phase| {
         if !fired && who == Who::New && component == "node-agent" && phase == Phase::Pulling {
@@ -2182,8 +2186,9 @@ fn a_verified_successor_whose_first_seed_json_write_failed_leaves_a_removal_harm
 
 #[test]
 fn a_verified_successor_that_could_not_write_seed_json_writes_it_at_its_next_start() {
+    let _one_at_a_time = one_seed_test_at_a_time();
     let lab = Lab::new();
-    let _blocked = block_seed_file(&lab);
+    block_seed_file(&lab);
     hand_over(&lab);
     let result = lab.outcome("stale at the end");
     assert_eq!(result.state, State::Succeeded, "{result:?}");
@@ -2234,8 +2239,9 @@ impl std::io::Write for Logged {
     }
 }
 
-#[test]
-fn a_seed_json_that_stays_stale_is_named_at_every_start() {
+/// Installs the log capture once for the binary and empties it. Take
+/// `one_seed_test_at_a_time` first.
+fn capture_logs() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         tracing::subscriber::set_global_default(
@@ -2246,21 +2252,67 @@ fn a_seed_json_that_stays_stale_is_named_at_every_start() {
         )
         .expect("no other subscriber in this test binary");
     });
+    LOGGED.lock().unwrap().clear();
+}
+
+fn logged(token: &str) -> usize {
+    LOGGED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains(token))
+        .count()
+}
+
+#[test]
+fn a_seed_json_that_stays_stale_is_named_at_every_start() {
+    let _one_at_a_time = one_seed_test_at_a_time();
+    capture_logs();
     let lab = Lab::new();
-    let _blocked = block_seed_file(&lab);
+    block_seed_file(&lab);
     hand_over(&lab);
     let result = lab.outcome("stale at the end");
     assert_eq!(result.state, State::Succeeded, "{result:?}");
-    let stale = || {
-        LOGGED
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|l| l.contains("actor-seed-file-stale"))
-            .count()
-    };
+    let stale = || logged("actor-seed-file-stale");
     lab.wait_until("named at the successor's first start", |_| stale() >= 1);
     let first = stale();
     lab.restart_daemon();
     lab.wait_until("named again at the next start", |_| stale() > first);
+}
+
+#[test]
+fn an_attempt_whose_successor_never_started_does_not_verify_the_actor() {
+    let _one_at_a_time = one_seed_test_at_a_time();
+    capture_logs();
+    let lab = Lab::new();
+    hand_over(&lab);
+    let result = lab.outcome("handed over");
+    assert_succeeded(&lab, &result, "handed over");
+    // An interrupted attempt is finished `Failed` with every step `Done` and no failure
+    // recorded; what tells it from a verified one is that no successor ever took the lease.
+    let path = lab.dir.path().join("journal").join(format!("{ID}.json"));
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let step = journal["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["name"] == "recovery-actor")
+        .expect("the actor step");
+    assert_eq!(step["phase"], "done");
+    assert!(step["failure"].is_null(), "{step}");
+    step.as_object_mut().unwrap().remove("successor_starts");
+    std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let mut file = lab.seed_file();
+    file.recovery_actor_image = file::ActorImage::parse(ACTOR_IMAGE).unwrap();
+    std::fs::write(
+        lab.dir.path().join("seed.json"),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+    lab.restart_daemon();
+    lab.wait_until("named as unverified", |_| {
+        logged("actor-seed-file-differs") >= 1
+    });
+    assert_eq!(lab.seed_file(), file, "the file was healed");
 }
