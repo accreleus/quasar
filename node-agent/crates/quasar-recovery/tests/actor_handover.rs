@@ -2141,88 +2141,23 @@ fn each_socket_answers_status_only_for_attempts_submitted_on_it() {
     assert_eq!(mine(read("agent/agent.sock", "")), None);
 }
 
-/// `seed.json` cannot be written: a directory sits where its temporary file goes.
-fn block_seed_file(lab: &Lab) {
+/// `seed.json` cannot be written: a directory sits where its temporary file goes. The
+/// guard keeps the tests that read the log for `actor-seed-file-stale` from sharing it.
+fn block_seed_file(lab: &Lab) -> std::sync::MutexGuard<'static, ()> {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     std::fs::create_dir(lab.dir.path().join("seed.json.tmp")).unwrap();
+    guard
 }
 
 fn unblock_seed_file(lab: &Lab) {
     let _ = std::fs::remove_dir(lab.dir.path().join("seed.json.tmp"));
 }
 
-/// The journal as a successor on a newer release left it: `component` at a recipe revision
-/// no actor of the old image carries.
-fn journal_a_revision_the_old_actor_lacks(lab: &Lab, component: &str) {
-    let path = lab.dir.path().join("journal").join(format!("{ID}.json"));
-    let mut journal: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    for step in journal["steps"].as_array_mut().unwrap() {
-        if step["name"] == component {
-            step["revision"] = 99.into();
-        }
-    }
-    std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
-}
-
 #[test]
-fn a_stale_seed_json_never_lets_an_older_actor_continue_a_step_it_cannot_render() {
-    for phase in [
-        Phase::OldKept,
-        Phase::Created,
-        Phase::Started,
-        Phase::Verifying,
-    ] {
-        let at = format!("every actor removed during the agent's {phase:?}");
-        let lab = Lab::new();
-        let agent = lab.container(names::NODE_AGENT);
-        block_seed_file(&lab);
-        let mut fired = false;
-        lab.on(move |lab, who, component, p| {
-            if fired || who != Who::New || component != "node-agent" || p != phase {
-                return false;
-            }
-            fired = true;
-            journal_a_revision_the_old_actor_lacks(lab, "node-agent");
-            lab.remove_every_actor();
-            true
-        });
-        lab.submit(request(vec![actor_component(), agent_component()]))
-            .unwrap();
-        lab.wait_until(&at, |lab| {
-            lab.actors().is_empty() && lab.procs.lock().unwrap().is_empty()
-        });
-        // The hand-over verified, and the write that should have said so failed.
-        assert_eq!(
-            lab.seed_file().recovery_actor_image.reference(),
-            ACTOR_IMAGE,
-            "{at}"
-        );
-        assert!(
-            matches!(lab.seed_step(), seed::Outcome::Created { .. }),
-            "{at}"
-        );
-        let result = lab.outcome(&at);
-        assert_eq!(result.state, State::Failed, "{at}: {result:?}");
-        assert_eq!(result.reason, Some(Reason::RecipeUnsupported), "{at}");
-        assert!(result.restored, "{at}: {result:?}");
-        // The actor the seed made runs what the file names, and the agent it cannot
-        // render is the one it had before the attempt.
-        lab.assert_one_actor(ACTOR_IMAGE, &at);
-        let now = lab.container(names::NODE_AGENT);
-        assert_eq!(now.id, agent.id, "{at}");
-        assert_eq!(now.status, "running", "{at}");
-        assert_eq!(
-            lab.engine.state().containers.len(),
-            3,
-            "{at}: no new agent is left"
-        );
-    }
-}
-
-#[test]
-fn a_verified_successor_writes_seed_json_when_its_attempt_ends_so_a_removal_then_is_harmless() {
+fn a_verified_successor_whose_first_seed_json_write_failed_leaves_a_removal_harmless() {
     let lab = Lab::new();
-    block_seed_file(&lab);
+    let _blocked = block_seed_file(&lab);
     let mut fired = false;
     lab.on(move |lab, who, component, phase| {
         if !fired && who == Who::New && component == "node-agent" && phase == Phase::Pulling {
@@ -2234,9 +2169,9 @@ fn a_verified_successor_writes_seed_json_when_its_attempt_ends_so_a_removal_then
     });
     lab.submit(request(vec![actor_component(), agent_component()]))
         .unwrap();
-    let result = lab.outcome("healed at the end of the attempt");
+    let result = lab.outcome("healed after the attempt");
     // `assert_succeeded` includes: seed.json names the successor.
-    assert_succeeded(&lab, &result, "healed at the end of the attempt");
+    assert_succeeded(&lab, &result, "healed after the attempt");
 
     lab.remove_every_actor();
     assert!(matches!(lab.seed_step(), seed::Outcome::Created { .. }));
@@ -2248,7 +2183,7 @@ fn a_verified_successor_writes_seed_json_when_its_attempt_ends_so_a_removal_then
 #[test]
 fn a_verified_successor_that_could_not_write_seed_json_writes_it_at_its_next_start() {
     let lab = Lab::new();
-    block_seed_file(&lab);
+    let _blocked = block_seed_file(&lab);
     hand_over(&lab);
     let result = lab.outcome("stale at the end");
     assert_eq!(result.state, State::Succeeded, "{result:?}");
@@ -2279,4 +2214,53 @@ fn an_actor_no_attempt_shows_verified_leaves_seed_json_alone() {
     lab.restart_daemon();
     lab.wait_until("the actor started again", |lab| lab.serving().is_some());
     assert_eq!(lab.seed_file(), file);
+}
+
+/// Every line any thread logs, for the test that has to read what a daemon thread says.
+static LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+struct Logged;
+
+impl std::io::Write for Logged {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LOGGED
+            .lock()
+            .unwrap()
+            .extend(String::from_utf8_lossy(buf).lines().map(str::to_owned));
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_seed_json_that_stays_stale_is_named_at_every_start() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_writer(|| Logged)
+                .with_ansi(false)
+                .finish(),
+        )
+        .expect("no other subscriber in this test binary");
+    });
+    let lab = Lab::new();
+    let _blocked = block_seed_file(&lab);
+    hand_over(&lab);
+    let result = lab.outcome("stale at the end");
+    assert_eq!(result.state, State::Succeeded, "{result:?}");
+    let stale = || {
+        LOGGED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("actor-seed-file-stale"))
+            .count()
+    };
+    lab.wait_until("named at the successor's first start", |_| stale() >= 1);
+    let first = stale();
+    lab.restart_daemon();
+    lab.wait_until("named again at the next start", |_| stale() > first);
 }

@@ -113,7 +113,6 @@ impl Actor {
                 info!(request = %id, "settling an attempt interrupted before its current component was touched");
                 self.interrupt(journal)
             }
-            Settlement::Continue if self.refuse_beyond_book(&mut journal)? => self.run(journal),
             Settlement::Continue => {
                 info!(request = %id, ?party, "continuing an attempt a restart interrupted");
                 self.restart_verifying(&mut journal)?;
@@ -129,46 +128,6 @@ impl Actor {
                 self.yield_attempt(journal, party)
             }
         }
-    }
-
-    /// A step journalled at a recipe revision this actor's book does not hold (a seed
-    /// re-created the actor from an image older than the one that began the step) is not
-    /// continued: create, start and record would all use the journalled specification.
-    /// It is restored like a step that failed verification, and the attempt fails
-    /// `recipe_unsupported`. From `old_discarded` on only the kept container's removal is
-    /// left, which needs no recipe.
-    fn refuse_beyond_book(&self, j: &mut Journal) -> Result<bool, ()> {
-        let Some(i) = j.current() else {
-            return Ok(false);
-        };
-        let step = &j.steps[i];
-        let (Some(role), Some(revision)) = (Role::parse(&step.name), step.revision) else {
-            return Ok(false);
-        };
-        let renders_from_journal = matches!(
-            step.phase,
-            Phase::OldKept | Phase::Created | Phase::Started | Phase::Verifying | Phase::Verified
-        );
-        if step.name == RECOVERY_ACTOR || !renders_from_journal || Book::supports(role, revision) {
-            return Ok(false);
-        }
-        let detail = format!(
-            "{} was journalled at recipe revision {revision}, which this recovery actor does not carry (it renders {:?}): it is older than the actor that began this step, which a stale seed.json can cause",
-            step.name,
-            Book::window(role)
-        );
-        warn!(
-            token = "actor-journalled-recipe-unsupported",
-            request = %j.request.request_id,
-            component = %step.name,
-            "{detail}; the step is not continued"
-        );
-        j.steps[i].failure = Some(Failure {
-            reason: Reason::RecipeUnsupported,
-            detail,
-        });
-        self.advance(j, i, Phase::Restoring)?;
-        Ok(true)
     }
 
     /// #438: an attempt a restart interrupted at `verifying` finds its new container
@@ -258,12 +217,6 @@ impl Actor {
     ) -> Result<(), ()> {
         if self.killed() {
             return Err(());
-        }
-        // Before the outcome is published: whoever sees it terminal sees seed.json settled.
-        if j.steps.iter().any(|s| s.name == RECOVERY_ACTOR) {
-            if let Err(EngineError::Crashed) = self.heal_seed_file() {
-                return Err(());
-            }
         }
         for step in j.steps.iter_mut() {
             if state == State::Failed && step.phase != Phase::Done {

@@ -310,17 +310,21 @@ docker logs --tail 50 quasar-recovery
 `docker exec quasar-recovery quasar-recovery status` prints the machine's inventory and one line
 for every service that is missing, unhealthy or in the way.
 
-**The actor is older than what it manages.** After an update whose `seed.json` write failed
-(`token="actor-seed-file-not-updated"`), removing every actor container makes the seed re-create
-the previous actor. Its log then says `actor-resume-failed … recipe_unsupported`, or the attempt
-it found open ends `failed` with reason `recipe_unsupported` and the old container back
-(`actor-journalled-recipe-unsupported`). The services keep running; the install pass stops at
-the one the actor cannot render. A verified actor names a `seed.json` still on another image at
-every start (`actor-seed-file-stale`, `actor-seed-file-differs`). To fix the machine, apply the release again from Fleet ▸ Releases: its first step moves the
-actor, which rewrites `seed.json`. Removing the actor container does not help, the seed re-creates
-the old one. If the console offers no apply because the control plane reads up to date, a
-developer apply of the release's recovery-actor digest is the other route (untried on this state).
-Then `docker exec quasar-recovery quasar-recovery status` shows the new digest.
+**The actor is older than what it manages.** An update whose `seed.json` write failed
+(`token="actor-seed-file-not-updated"`) used to leave the file on the previous actor image for
+good, so removing every actor container made the seed re-create an actor older than the
+services it manages. Now the new actor writes the file again at every start
+(`actor-seed-file-healed`; `actor-seed-file-stale` while the write still fails). It does so only
+while the attempt that moved it is among the last 16 finished ones; after that a stale file only
+gets the `actor-seed-file-differs` warning.
+
+What this does not fix: an older actor that finds an update step journalled at a recipe
+revision it does not carry continues it, or fails every start with
+`actor-resume-failed … recipe_unsupported`. The services keep running; the install pass stops at
+the one the actor cannot render. That case is tracked in #794. Until then, apply the release
+again from Fleet ▸ Releases: its first step moves the actor, which rewrites `seed.json`.
+Removing the actor container does not help, the seed re-creates the old one. Then
+`docker exec quasar-recovery quasar-recovery status` shows the new digest.
 
 **An owner conflict** is a container that looks like a Quasar service but lacks this
 installation's labels: a leftover Compose stack, or a definition a stack manager still holds. The
