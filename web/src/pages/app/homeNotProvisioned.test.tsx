@@ -115,13 +115,15 @@ function renderAt(path: string) {
 const where = () => screen.getByTestId("where").textContent;
 
 /** The toast says what to do and offers the Steam app; the launch was asked once. */
-async function expectGuidance() {
+async function expectGuidance(classic = false) {
   expect(await screen.findByText("Start Steam once first")).toBeTruthy();
   expect(screen.getByText(/Start Steam once, then press Play again/)).toBeTruthy();
   expect(screen.queryByText(/Waiting for/)).toBeNull();
   expect(mocked.launchSession).toHaveBeenCalledTimes(1);
   fireEvent.click(screen.getByRole("button", { name: "Open Steam" }));
-  await waitFor(() => expect(where()).toBe("/app/game/steam"));
+  // Classic has no game page: /app/game/:id bounces to /app and opens that app's detail band.
+  if (classic) await waitFor(() => expect(document.querySelector(".detail")?.textContent).toContain("Steam"));
+  else await waitFor(() => expect(where()).toBe("/app/game/steam"));
 }
 
 beforeEach(() => {
@@ -149,7 +151,7 @@ describe("home_not_provisioned on Play", () => {
     await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(2));
     const tile = screen.getByRole("button", { name: "Hades" }).closest(".lib-tile") as HTMLElement;
     fireEvent.click(tile.querySelector(".lib-tile-play") as HTMLButtonElement);
-    await expectGuidance();
+    await expectGuidance(true);
   });
 
   it("Classic detail band Play", async () => {
@@ -158,8 +160,10 @@ describe("home_not_provisioned on Play", () => {
     await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(2));
     fireEvent.click(screen.getByRole("button", { name: "Hades" }));
     await waitFor(() => expect(document.querySelector(".detail")).toBeTruthy());
-    fireEvent.click(await screen.findByRole("button", { name: /^Play$/ }));
-    await expectGuidance();
+    const play = await screen.findByRole("button", { name: /^Play$/ });
+    await waitFor(() => expect(play).toBeEnabled());
+    fireEvent.click(play);
+    await expectGuidance(true);
   });
 
   it("game page Play", async () => {
