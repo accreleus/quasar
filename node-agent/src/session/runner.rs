@@ -2475,7 +2475,7 @@ pub fn run_blocking(
     // App-liveness is cadence-gated, never on the 100 ms POLL tick, to keep it off the hot
     // path.
     let mut liveness_cadence_at = Instant::now();
-    // #484 gen-0 app-boot gate. `AppBooting` follows `Running` for any generation that
+    // #484 gen-0 app-boot gate. `AppBooting` is the `running` report of any generation that
     // launches an app container; `AppPresented` latches the first genuine draw. Both are
     // single-shot.
     let mut app_boot_budget = cfg.app_boot_timeout;
@@ -2603,11 +2603,13 @@ pub fn run_blocking(
             emit(SessionEvent::Starting);
             let mount = res.launch().map(|l| l.mount().clone());
             // #749: a launch that goes on to boot an app reports `running` AS `app booting`.
-            emit(if req.kind != Some(SessionKind::Parked) && mount.is_some() {
-                SessionEvent::AppBooting
-            } else {
-                SessionEvent::Running
-            });
+            emit(
+                if req.kind != Some(SessionKind::Parked) && mount.is_some() {
+                    SessionEvent::AppBooting
+                } else {
+                    SessionEvent::Running
+                },
+            );
             emit(SessionEvent::EffectiveMedia(effective_media_snapshot(
                 &cfg,
                 &encode_pipe,
