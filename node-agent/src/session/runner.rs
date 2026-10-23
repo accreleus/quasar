@@ -839,6 +839,56 @@ fn in_place_plan(
 const IN_PLACE_QUIT_BOUND: Duration = Duration::from_secs(94);
 const IN_PLACE_LAUNCH_BOUND: Duration = Duration::from_secs(5);
 
+/// How long a session end waits for a running Steam game to quit and its exit cloud sync to
+/// end before the container stop (#742). The #759 spike measured close + sync at 2.8–9.3 s,
+/// uploads 1–3 s; 30 s also covers the helper's 20 s close grace and its SIGTERM. With the
+/// 10 s container stop it stays inside the web's 45 s "Closing <game>…" wait (#754).
+const END_QUIT_BOUND: Duration = Duration::from_secs(30);
+
+/// A user stop, a control-plane stop or the idle reap of a session whose Steam game still
+/// runs (#742): quit the game the in-place swap's way and wait for Steam's cloud sync, at
+/// most [`END_QUIT_BOUND`]. The session is already `stopping`; no helper or no running game
+/// returns at once.
+fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
+    use super::launch_helper::EndQuit;
+    let Some(launch) = launch else {
+        return;
+    };
+    let started = Instant::now();
+    let (appid, why) = match launch.quit_running_game(END_QUIT_BOUND) {
+        EndQuit::NoGame => return,
+        EndQuit::Done {
+            appid,
+            ok: true,
+            cloud_synced: true,
+        } => {
+            tracing::info!(
+                token = "session-end-cloud-synced",
+                appid,
+                "session end: Steam app {appid} quit and its cloud sync ended in {:?}",
+                started.elapsed()
+            );
+            return;
+        }
+        EndQuit::Done {
+            appid, ok: true, ..
+        } => (appid, "quit, but no end of its cloud sync was seen".to_string()),
+        EndQuit::Done { appid, .. } => (appid, "would not quit".to_string()),
+        EndQuit::TimedOut { appid } => (
+            appid,
+            format!(
+                "did not quit and sync within {}s",
+                END_QUIT_BOUND.as_secs()
+            ),
+        ),
+    };
+    tracing::warn!(
+        token = "session-end-cloud-sync-unfinished",
+        appid,
+        "session end: Steam app {appid} {why}; tearing down"
+    );
+}
+
 /// An in-place swap in progress, advanced on the runner's tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InPlaceStep {
@@ -2528,6 +2578,7 @@ pub fn run_blocking(
     loop {
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
+            quit_game_for_end(res.launch());
             stop_source(&mut current_source, &transports); // remove the app container before media
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
@@ -3267,6 +3318,7 @@ pub fn run_blocking(
                     app_presented_at.is_some()
                 );
                 emit(SessionEvent::Stopping);
+                quit_game_for_end(res.launch());
                 stop_source(&mut current_source, &transports);
                 super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                 transports.audio_pipeline.finish();

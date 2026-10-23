@@ -405,6 +405,44 @@ fn on_620(tag: &str) -> (tempfile::TempDir, Session, Peer, FakeHelper) {
     (runtime, session, a, helper)
 }
 
+/// #742: a stop of a session whose game runs quits the game and waits for Steam's exit cloud
+/// sync, staying `stopping`, before the container goes.
+#[test]
+fn a_stop_with_the_game_running_quits_it_and_waits_for_its_cloud_sync() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (runtime, mut session) = steam_session(
+        "end-quit",
+        SessionKind::Play,
+        "-applaunch 620",
+        Duration::from_secs(60),
+    );
+    let mut a = Peer::new();
+    assert!(session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p)));
+    let mut helper = FakeHelper::connect(runtime.path(), &session.id);
+    helper.launch_state("game_running");
+    session.pump(&mut a, Duration::from_millis(300), |_, _| false);
+    session.stop.store(true, Ordering::SeqCst);
+    assert_eq!(helper.command(&mut session, &mut a), "quit 620");
+    session.pump(&mut a, Duration::from_secs(1), |s, _| s.ended.is_some());
+    assert!(session.ended.is_none(), "ended before the sync: {:?}", session.ended);
+    assert!(session.log.iter().any(|e| matches!(e, SessionEvent::Stopping)));
+    helper.launch_state("game_exited");
+    helper.say(
+        r#"{"type":"command_done","v":1,"command":"quit","appid":620,"ok":true,"cloud_synced":true}"#,
+    );
+    let ended = session.pump(&mut a, Duration::from_secs(20), |s, _| s.ended.is_some());
+    assert!(ended, "the runner never ended after the sync");
+    assert!(
+        matches!(session.ended, Some(SessionEvent::Stopped { detail: None, .. })),
+        "a user stop, not a game exit: {:?}",
+        session.ended
+    );
+    session.thread.take().unwrap().join().unwrap();
+}
+
 #[test]
 fn an_in_place_swap_quits_the_game_waits_for_its_sync_and_launches_the_next() {
     if !live_webrtc_available() {
