@@ -379,9 +379,10 @@ pub enum SessionEvent {
     SwapRolledBack(String),
     /// #484: app container up but not drawn yet.
     /// `session_state{running, detail:"app booting"}` — top-level state stays `running`
-    /// because the transport is live. Once per generation, always after `Running` (the
-    /// control plane rejects a detail for a not-yet-running session), and only for a
-    /// generation that launches an app container.
+    /// because the transport is live. Once per generation, and only for a generation that
+    /// launches an app container. It is that generation's FIRST `running` report: `Running`
+    /// is not emitted before it, because a client that reads `running` with any other
+    /// detail takes the launch for booted (#749). Later boots (a swap) follow `Running`.
     AppBooting,
     /// The app committed its first mapped top-level surface AND a compositor frame
     /// followed it (`swap_source_ready`, the #487 mitigation).
@@ -2600,7 +2601,13 @@ pub fn run_blocking(
             );
             // The adopting session starts here: its reports, its clocks, its first offer.
             emit(SessionEvent::Starting);
-            emit(SessionEvent::Running);
+            let mount = res.launch().map(|l| l.mount().clone());
+            // #749: a launch that goes on to boot an app reports `running` AS `app booting`.
+            emit(if req.kind != Some(SessionKind::Parked) && mount.is_some() {
+                SessionEvent::AppBooting
+            } else {
+                SessionEvent::Running
+            });
             emit(SessionEvent::EffectiveMedia(effective_media_snapshot(
                 &cfg,
                 &encode_pipe,
@@ -2615,7 +2622,6 @@ pub fn run_blocking(
             transport_since = Some(now);
             app_boot_started_at = None;
             app_presented_at = None;
-            let mount = res.launch().map(|l| l.mount().clone());
             if req.kind == Some(SessionKind::Parked) {
                 if let Some(mount) = mount {
                     mount.arm(None);
@@ -2648,7 +2654,6 @@ pub fn run_blocking(
             app_boot_last_wait_log = now;
             app_boot = AppBootGate::new(reveal_cap, app_boot_budget);
             progress = ProgressThrottle::default();
-            emit(SessionEvent::AppBooting);
             // A fresh offer per PC for the new viewer, as `restart_ice` gets; a transport that
             // negotiated with the ended session's viewer is replaced on the answer (#535).
             for pc in [PcId::Video, PcId::Audio] {
@@ -2675,11 +2680,12 @@ pub fn run_blocking(
             if matches!(msg, SignalMsg::Offer { .. }) && !running {
                 running = true;
                 running_since = Some(Instant::now());
-                emit(SessionEvent::Running);
-                // Ordering is load-bearing: `AppBooting` is a detail on a `running`
-                // session, so it must follow `Running` on the same ordered lane. Only a
-                // generation that launches an app container can report a surface commit.
-                // A parked Steam draws nothing and is never revealed (amendment 39).
+                // #749: `AppBooting` IS a `running` report (detail `app booting`), so a
+                // launch that boots an app never shows `running` without it: a client
+                // that reads in between would reveal a stream the app has not drawn on.
+                // Only a generation that launches an app container can report a surface
+                // commit. A parked Steam draws nothing and is never revealed
+                // (amendment 39).
                 if current_source.expects_app_container() && kind != Some(SessionKind::Parked) {
                     app_boot_started_at = Some(Instant::now());
                     app_boot_last_wait_log = Instant::now();
@@ -2689,6 +2695,8 @@ pub fn run_blocking(
                         "app boot: container {} started; waiting for its first presented frame (gen {gen})",
                         app_container_name(&session_id, gen)
                     );
+                } else {
+                    emit(SessionEvent::Running);
                 }
                 if !effective_media_sent {
                     emit(SessionEvent::EffectiveMedia(effective_media_snapshot(

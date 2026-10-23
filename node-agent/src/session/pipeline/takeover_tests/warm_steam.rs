@@ -215,8 +215,9 @@ fn adopt_as(session: &mut Session, flags: &str, kind: Option<SessionKind>) -> us
     at
 }
 
-/// One `running`, one `app booting` and one `effective_media` for the adopting session, the
-/// restart offers notwithstanding.
+/// One `app booting` (the adopting session's `running`: a `running` report without it would
+/// let a client reveal a stream the game has not drawn on, #749) and one `effective_media`
+/// for the adopting session, the restart offers notwithstanding.
 fn assert_one_session_start(log: &[SessionEvent], from: usize) {
     let count = |what: fn(&SessionEvent) -> bool| log.iter().skip(from).filter(|e| what(e)).count();
     assert_eq!(
@@ -224,7 +225,7 @@ fn assert_one_session_start(log: &[SessionEvent], from: usize) {
         1,
         "starting"
     );
-    assert_eq!(count(|e| matches!(e, SessionEvent::Running)), 1, "running");
+    assert_eq!(count(|e| matches!(e, SessionEvent::Running)), 0, "running");
     assert_eq!(
         count(|e| matches!(e, SessionEvent::AppBooting)),
         1,
@@ -320,11 +321,7 @@ fn a_game_exit_holds_the_runtime_and_an_adoption_launches_the_next_game_for_a_ne
         matches!(e, SessionEvent::Starting)
     })
     .expect("starting");
-    let running = after(&session.log, starting, |e| {
-        matches!(e, SessionEvent::Running)
-    })
-    .expect("running");
-    let booting = after(&session.log, running, |e| {
+    let booting = after(&session.log, starting, |e| {
         matches!(e, SessionEvent::AppBooting)
     })
     .expect("app booting");
