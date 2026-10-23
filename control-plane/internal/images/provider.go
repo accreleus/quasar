@@ -8,10 +8,10 @@ import (
 )
 
 // Library-provider auto-ensure (protocol/control-api.md §"P5 side effect").
-// Enabling library discovery must guarantee the provider's canonical image and
-// runtime preset are present rather than failing later at launch;
-// EnsureProviders installs (via the install path — adopt + ensure-everywhere
-// + preset materialization) every catalog image declaring a library_provider
+// Enabling library discovery adopts the provider's canonical image and its
+// runtime preset; hosts prepare the image later, once the provider app uses it.
+// EnsureProviders installs (via the install path — adopt + preset
+// materialization) every catalog image declaring a library_provider
 // in the local allowlist that isn't already installed.
 
 // defaultLibraryProvider is the sole provider auto-installed when

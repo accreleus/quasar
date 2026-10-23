@@ -80,7 +80,7 @@ func adoptedImageRef(registryRef, tag string) string {
 	return registryRef
 }
 
-// Install adopts a catalog image and, unless lazy, kicks ensure-everywhere.
+// Install adopts a catalog image and, unless lazy, prepares it on each host an enabled app using it is placed on.
 // Returns the refreshed catalog entry (the 201 body).
 //
 // A prebuilt entry adopts the catalog's digest form (never the mutable tag —
@@ -270,7 +270,7 @@ func (s *Store) SetPinned(ctx context.Context, id string, pinned bool) error {
 	return nil
 }
 
-// Update re-adopts the catalog's current version and re-ensures everywhere.
+// Update re-adopts the catalog's current version and prepares it exactly as Install does.
 // applied is false with a nil error when the adoption already names the
 // catalog version — a no-op is not a failure.
 //
