@@ -11510,12 +11510,11 @@ mod tests {
         assert!(plain.get("launch_progress").is_none());
     }
 
-    /// #749: the runner's own order for a fresh app launch is `AppBooting` then
-    /// `EffectiveMedia` (`Running` is not emitted: `AppBooting` is the `running` report).
-    /// The control plane must never be told "pipeline live; offer ready" for it, or a
-    /// client polling in the gap reveals a stream the app has not drawn on.
+    /// #749: `AppBooting` is a fresh app launch's first `running` report: it carries detail
+    /// `app booting` and ends the launch's quiet period. The runner's order (no plain
+    /// `Running`) is pinned by `takeover_tests::warm_steam`.
     #[test]
-    fn an_app_launch_is_never_running_without_app_booting() {
+    fn app_booting_is_the_first_running_report_and_ends_the_launch() {
         let (mut mgr, warm) = warm_manager();
         let cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
         assert!(acked(start(&mut mgr, &warm, "p0", cfg, None)));
@@ -11529,10 +11528,6 @@ mod tests {
             mgr.running["p0"].reached_running,
             "app booting is the launch's running report"
         );
-        let media = as_wire(mgr.relay("p0", SessionEvent::EffectiveMedia(serde_json::json!({}))));
-        assert!(media
-            .iter()
-            .all(|m| m["detail"] != "pipeline live; offer ready"));
     }
 
     #[test]

@@ -42,6 +42,18 @@ const SCTP_STOP_RACE_POLL: Duration = Duration::from_millis(20);
 /// See `.claude/rules/webrtc-testing.md`.
 const SCTP_ASSOCIATION_SIGNATURES: &[&str] = &["sctp association", "sctpenc", "sctpdec"];
 
+/// A session's first `running` report (#749). A launch that boots an app reports `running`
+/// AS `app booting`, so a client never sees `running` before the app has started booting
+/// and reveals a stream the app has not drawn on. A bare compositor and a parked Steam
+/// (it draws nothing and is never revealed, amendment 39) report a plain `running`.
+fn running_report(boots_app: bool, kind: Option<SessionKind>) -> SessionEvent {
+    if boots_app && kind != Some(SessionKind::Parked) {
+        SessionEvent::AppBooting
+    } else {
+        SessionEvent::Running
+    }
+}
+
 /// True iff `text` (`error` + `debug` concatenated) carries an SCTP association
 /// failure. These elements exist only in `webrtcbin`'s data-channel path, so a match
 /// means the browser's peer connection is gone, not that the encoder or GPU broke.
@@ -2602,14 +2614,10 @@ pub fn run_blocking(
             // The adopting session starts here: its reports, its clocks, its first offer.
             emit(SessionEvent::Starting);
             let mount = res.launch().map(|l| l.mount().clone());
-            // #749: a launch that goes on to boot an app reports `running` AS `app booting`.
-            emit(
-                if req.kind != Some(SessionKind::Parked) && mount.is_some() {
-                    SessionEvent::AppBooting
-                } else {
-                    SessionEvent::Running
-                },
-            );
+            // The first offer decides on `expects_app_container()`, this on the launch
+            // helper: an adopted runtime boots its app only through the helper, which
+            // exists only for a generation with a container spec (`LaunchSocket::open`).
+            emit(running_report(mount.is_some(), req.kind));
             emit(SessionEvent::EffectiveMedia(effective_media_snapshot(
                 &cfg,
                 &encode_pipe,
@@ -2682,24 +2690,17 @@ pub fn run_blocking(
             if matches!(msg, SignalMsg::Offer { .. }) && !running {
                 running = true;
                 running_since = Some(Instant::now());
-                // #749: `AppBooting` IS a `running` report (detail `app booting`), so a
-                // launch that boots an app never shows `running` without it: a client
-                // that reads in between would reveal a stream the app has not drawn on.
-                // Only a generation that launches an app container can report a surface
-                // commit. A parked Steam draws nothing and is never revealed
-                // (amendment 39).
-                if current_source.expects_app_container() && kind != Some(SessionKind::Parked) {
+                let report = running_report(current_source.expects_app_container(), kind);
+                if matches!(report, SessionEvent::AppBooting) {
                     app_boot_started_at = Some(Instant::now());
                     app_boot_last_wait_log = Instant::now();
-                    emit(SessionEvent::AppBooting);
                     tracing::info!(
                         session_id = %session_id,
                         "app boot: container {} started; waiting for its first presented frame (gen {gen})",
                         app_container_name(&session_id, gen)
                     );
-                } else {
-                    emit(SessionEvent::Running);
                 }
+                emit(report);
                 if !effective_media_sent {
                     emit(SessionEvent::EffectiveMedia(effective_media_snapshot(
                         &cfg,
@@ -4094,10 +4095,10 @@ mod tests {
     use super::{
         app_exit_event, audio_path_label, context_object_identity, effective_encoder_device_path,
         fold_display_update, idle_reap_reason, is_sctp_association_error, mic_state_label,
-        stop_requested_for_transport_error, swap_source_ready, validate_display_update,
-        AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard, DiagnosticEventTx,
-        DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent, VulkanContextBridge,
-        REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
+        running_report, stop_requested_for_transport_error, swap_source_ready,
+        validate_display_update, AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard,
+        DiagnosticEventTx, DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent,
+        VulkanContextBridge, REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
     };
     use super::{
         in_place_plan, InPlaceAction, InPlaceStep, ProgressThrottle, SwapRequest,
@@ -4555,6 +4556,24 @@ mod tests {
     // ── app-exit-before-frames classification (#463) ──────────────────────────
     // An app container exiting before producing a frame surfaced only as "media path
     // interrupted", and the decisive log lines died with the --rm container.
+
+    /// #749: a launch that boots an app never reports a plain `running` first.
+    #[test]
+    fn a_launch_that_boots_an_app_reports_running_as_app_booting() {
+        use crate::messages::SessionKind;
+        for kind in [None, Some(SessionKind::Play)] {
+            assert!(matches!(
+                running_report(true, kind),
+                SessionEvent::AppBooting
+            ));
+            assert!(matches!(running_report(false, kind), SessionEvent::Running));
+        }
+        // A parked Steam draws nothing: plain `running` even with a container.
+        assert!(matches!(
+            running_report(true, Some(SessionKind::Parked)),
+            SessionEvent::Running
+        ));
+    }
 
     #[test]
     fn an_app_that_never_presented_is_classified_early_with_its_log_tail() {

@@ -253,6 +253,27 @@ fn a_game_exit_holds_the_runtime_and_an_adoption_launches_the_next_game_for_a_ne
     let mut a = Peer::new();
     let up = session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p));
     assert!(up, "the first viewer never streamed");
+    // #749: a fresh launch that boots an app reports `running` AS `app booting`, before its
+    // first `effective_media`; a plain `Running` would let a client reveal an undrawn stream.
+    assert!(
+        !session
+            .log
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Running)),
+        "a fresh app launch reported a plain running: {:?}",
+        session.log
+    );
+    let booting = after(&session.log, 0, |e| matches!(e, SessionEvent::AppBooting))
+        .expect("the fresh launch's app booting");
+    assert!(
+        after(&session.log, 0, |e| matches!(
+            e,
+            SessionEvent::EffectiveMedia(_)
+        ))
+        .is_some_and(|media| media > booting),
+        "effective media before app booting: {:?}",
+        session.log
+    );
     let mut helper = FakeHelper::connect(runtime.path(), &session.id);
     helper.launch_state("game_running");
     helper.launch_state("game_exited");
