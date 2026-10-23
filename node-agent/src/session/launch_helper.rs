@@ -210,12 +210,14 @@ impl HelperCommand {
 }
 
 /// The helper's word that it carried out a command. `cloud_synced` comes with a quit: Steam's
-/// exit cloud sync for the game was seen to end.
+/// exit cloud sync for the game was seen to end. `cloud_sync_started` is `Some(false)` when
+/// no exit sync started; a helper that predates it never sends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandDone {
     pub command: HelperCommand,
     pub ok: bool,
     pub cloud_synced: Option<bool>,
+    pub cloud_sync_started: Option<bool>,
 }
 
 /// One accepted helper line.
@@ -257,6 +259,8 @@ enum Wire {
         ok: bool,
         #[serde(default)]
         cloud_synced: Option<bool>,
+        #[serde(default)]
+        cloud_sync_started: Option<bool>,
     },
 }
 
@@ -304,17 +308,19 @@ fn parse(line: &[u8]) -> Result<Report, Rejected> {
             appid,
             ok,
             cloud_synced,
+            cloud_sync_started,
         } => {
-            let command = match (command.as_str(), appid, cloud_synced) {
-                ("launch", Some(appid), None) => Some(HelperCommand::Launch(appid)),
-                ("bigpicture", None, None) => Some(HelperCommand::BigPicture),
-                ("quit", Some(appid), Some(_)) => Some(HelperCommand::Quit(appid)),
+            let command = match (command.as_str(), appid, cloud_synced, cloud_sync_started) {
+                ("launch", Some(appid), None, None) => Some(HelperCommand::Launch(appid)),
+                ("bigpicture", None, None, None) => Some(HelperCommand::BigPicture),
+                ("quit", Some(appid), Some(_), _) => Some(HelperCommand::Quit(appid)),
                 _ => None,
             };
             let done = command.map(|command| CommandDone {
                 command,
                 ok,
                 cloud_synced,
+                cloud_sync_started,
             });
             (v, done.map(Report::CommandDone))
         }
@@ -742,6 +748,7 @@ impl LaunchSocket {
                     appid,
                     ok: done.ok,
                     cloud_synced: done.cloud_synced == Some(true),
+                    cloud_sync_started: done.cloud_sync_started != Some(false),
                 };
             }
             if Instant::now() >= until {
@@ -762,6 +769,7 @@ pub enum EndQuit {
         appid: u32,
         ok: bool,
         cloud_synced: bool,
+        cloud_sync_started: bool,
     },
     /// No answer within the bound.
     TimedOut { appid: u32 },
@@ -1059,6 +1067,7 @@ impl Reader {
                 tracing::info!(
                     ok = done.ok,
                     cloud_synced = ?done.cloud_synced,
+                    cloud_sync_started = ?done.cloud_sync_started,
                     "launch helper: {:?} done (ok={})",
                     done.command,
                     done.ok
@@ -1194,6 +1203,10 @@ mod tests {
                 Rejected::UnknownValue,
             ),
             (
+                br#"{"type":"command_done","v":1,"command":"launch","appid":620,"ok":true,"cloud_sync_started":false}"#,
+                Rejected::UnknownValue,
+            ),
+            (
                 br#"{"type":"command_done","v":1,"command":"exec","appid":620,"ok":true}"#,
                 Rejected::UnknownValue,
             ),
@@ -1218,6 +1231,7 @@ mod tests {
                 command: HelperCommand::Launch(620),
                 ok: true,
                 cloud_synced: None,
+                cloud_sync_started: None,
             }))
         );
         assert_eq!(
@@ -1226,6 +1240,7 @@ mod tests {
                 command: HelperCommand::BigPicture,
                 ok: false,
                 cloud_synced: None,
+                cloud_sync_started: None,
             }))
         );
         assert_eq!(
@@ -1234,6 +1249,16 @@ mod tests {
                 command: HelperCommand::Quit(620),
                 ok: true,
                 cloud_synced: Some(false),
+                cloud_sync_started: None,
+            }))
+        );
+        assert_eq!(
+            parse(br#"{"type":"command_done","v":1,"command":"quit","appid":620,"ok":true,"cloud_synced":false,"cloud_sync_started":false}"#),
+            Ok(Report::CommandDone(CommandDone {
+                command: HelperCommand::Quit(620),
+                ok: true,
+                cloud_synced: Some(false),
+                cloud_sync_started: Some(false),
             }))
         );
         assert_eq!(HelperCommand::Launch(620).line(), "launch 620\n");
@@ -1885,6 +1910,7 @@ mod tests {
                 command: HelperCommand::Quit(620),
                 ok: true,
                 cloud_synced: Some(true),
+                cloud_sync_started: None,
             })
         );
         mount.send(HelperCommand::BigPicture);
@@ -1923,7 +1949,8 @@ mod tests {
             EndQuit::Done {
                 appid: 620,
                 ok: true,
-                cloud_synced: true
+                cloud_synced: true,
+                cloud_sync_started: true,
             }
         );
         assert!(started.elapsed() >= Duration::from_millis(500), "it waited");

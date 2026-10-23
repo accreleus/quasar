@@ -835,7 +835,7 @@ fn in_place_plan(
 
 /// How long each half of an in-place swap may take: `swap complete` or the session's end
 /// follows the ack within 100 s (amendment 39). The quit half covers the helper's 20 s close,
-/// 10 s SIGTERM and SIGKILL, and its 60 s wait for Steam's exit cloud sync.
+/// 10 s SIGTERM and SIGKILL, and its 60 s wait for a started exit cloud sync.
 const IN_PLACE_QUIT_BOUND: Duration = Duration::from_secs(94);
 const IN_PLACE_LAUNCH_BOUND: Duration = Duration::from_secs(5);
 
@@ -862,11 +862,26 @@ fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
             appid,
             ok: true,
             cloud_synced: true,
+            ..
         } => {
             tracing::info!(
                 token = "session-end-cloud-synced",
                 appid,
                 "session end: Steam app {appid} quit and its cloud sync ended in {:?}",
+                started.elapsed()
+            );
+            return;
+        }
+        EndQuit::Done {
+            appid,
+            ok: true,
+            cloud_sync_started: false,
+            ..
+        } => {
+            tracing::info!(
+                token = "session-end-no-cloud-sync",
+                appid,
+                "session end: Steam app {appid} quit with no exit cloud sync in {:?}",
                 started.elapsed()
             );
             return;
@@ -919,6 +934,7 @@ impl InPlaceStep {
                     tracing::info!(
                         token = "swap-in-place-quit",
                         cloud_synced = ?d.cloud_synced,
+                        cloud_sync_started = ?d.cloud_sync_started,
                         "in-place swap: Steam app {from} quit; launching {to}"
                     );
                     *self = InPlaceStep::Launching { to, since: now };
@@ -1744,10 +1760,11 @@ pub(crate) fn stop_source(
     source.teardown();
 }
 
-/// [`stop_source`] for a game the player quit (#726). The source stop waits on Steam's own
-/// exit and cloud upload (#742), so the browser is told first (#753): `bye` must follow the
-/// `stopping` row on this ordered lane, because the control plane commits that row before it
-/// relays the next frame, and the web client answers `bye` by reading the row.
+/// [`stop_source`] for a game the player quit (#726). The source stop can take seconds, so the
+/// browser is told first (#753). It does not wait for the game's exit cloud upload, which the
+/// container stop can cut (#810). `bye` must follow the `stopping` row on this ordered lane,
+/// because the control plane commits that row before it relays the next frame, and the web
+/// client answers `bye` by reading the row.
 pub(crate) fn stop_for_game_exit(
     emit: &dyn Fn(SessionEvent),
     source: &mut AppSource,
@@ -2591,7 +2608,7 @@ pub fn run_blocking(
     loop {
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
-            stop_source(&mut current_source, &transports, res.launch()); // remove the app container before media
+            stop_source(&mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             emit(SessionEvent::Stopped {
@@ -5403,6 +5420,7 @@ mod tests {
                 command: HelperCommand::Quit(620),
                 ok,
                 cloud_synced: Some(true),
+                cloud_sync_started: None,
             })
         };
         let launch = |appid, ok| {
@@ -5410,6 +5428,7 @@ mod tests {
                 command: HelperCommand::Launch(appid),
                 ok,
                 cloud_synced: None,
+                cloud_sync_started: None,
             })
         };
         let quitting = InPlaceStep::Quitting {
