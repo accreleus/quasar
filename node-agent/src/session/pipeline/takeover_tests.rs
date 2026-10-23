@@ -6,7 +6,7 @@
 //! carries it: host frames reach only the attached peer. What a browser adds (an SCTP
 //! abort when the page goes) is `scripts/harness/run-takeover-peers.sh`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -524,6 +524,49 @@ impl PeerPc {
     fn stop(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+
+    /// Replace this PC's next outbound SCTP packet with an ABORT, as a browser's `pc.close()`
+    /// sends one (a webrtcbin peer going to NULL sends nothing), and ping so one goes out.
+    /// True once it has.
+    fn abort_sctp(&self) -> Arc<AtomicBool> {
+        let sent = Arc::new(AtomicBool::new(false));
+        let enc = self
+            .webrtc
+            .downcast_ref::<gst::Bin>()
+            .unwrap()
+            .iterate_recurse()
+            .into_iter()
+            .flatten()
+            .find(|e| e.factory().is_some_and(|f| f.name() == "sctpenc"))
+            .expect("the peer has an SCTP association");
+        let done = sent.clone();
+        enc.static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                // The common header's ports and verification tag, then one ABORT chunk.
+                let mut packet = buffer.map_readable().unwrap()[..8].to_vec();
+                packet.extend_from_slice(&[0, 0, 0, 0, 6, 0, 0, 4]);
+                let crc = crc32c(&packet).to_le_bytes();
+                packet[8..12].copy_from_slice(&crc);
+                *buffer = gst::Buffer::from_mut_slice(packet);
+                done.store(true, Ordering::SeqCst);
+                gst::PadProbeReturn::Remove
+            });
+        self.ping();
+        sent
+    }
+}
+
+/// SCTP's checksum (RFC 9260 appendix A).
+fn crc32c(bytes: &[u8]) -> u32 {
+    !bytes.iter().fold(!0u32, |crc, &b| {
+        (0..8).fold(crc ^ u32::from(b), |c, _| {
+            (c >> 1) ^ (0x82F6_3B78 & (c & 1).wrapping_neg())
+        })
+    })
 }
 
 impl Drop for PeerPc {
@@ -1662,7 +1705,7 @@ fn a_session_end_does_not_report_its_sound_server_stopping() {
     let mut source = AppSource::new(&host.cfg, "takeover-audio-end", &sink, &sink, &res, None)
         .expect("app source");
 
-    let log = logged(|| crate::session::runner::stop_source(&mut source, &host.transports));
+    let log = logged(|| crate::session::runner::stop_source(&mut source, &host.transports, None));
 
     // Read out first: a failed assertion that held this lock would poison it for the
     // stops the session's destructors still make.
@@ -1875,7 +1918,7 @@ fn a_takeover_does_not_hold_the_runner_on_an_audio_pipeline_that_will_not_stop()
     let mut source = AppSource::new(&host.cfg, "takeover-audio-held", &sink, &sink, &res, None)
         .expect("app source");
     let stopping = Instant::now();
-    crate::session::runner::stop_source(&mut source, &host.transports);
+    crate::session::runner::stop_source(&mut source, &host.transports, None);
     assert!(
         stopping.elapsed() < Duration::from_secs(3),
         "the stop took {:?}",
@@ -2251,6 +2294,7 @@ struct Session {
     id: String,
     /// Every event the runner sent, in order.
     log: Vec<SessionEvent>,
+    metrics: Arc<SessionMetrics>,
 }
 
 impl Session {
@@ -2283,6 +2327,7 @@ impl Session {
         let metrics = Arc::new(SessionMetrics::new("smooth", cfg.stream.fps as u32));
         let (id, flag) = (format!("takeover-{tag}"), stop.clone());
         let session_id = id.clone();
+        let runner_metrics = metrics.clone();
         let thread = std::thread::spawn(move || {
             crate::session::runner::run_blocking(
                 id,
@@ -2294,7 +2339,7 @@ impl Session {
                 swap_rx,
                 display_rx,
                 capture_rx,
-                metrics,
+                runner_metrics,
                 adopt_rx,
             )
         });
@@ -2314,6 +2359,7 @@ impl Session {
             adopt,
             id: session_id,
             log: Vec::new(),
+            metrics,
         }
     }
 

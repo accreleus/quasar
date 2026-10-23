@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{live_webrtc_available, serial, streaming, Peer, Session};
+use super::{live_webrtc_available, rtp, serial, streaming, Peer, Session};
 use crate::messages::SessionKind;
 use crate::session::container::ContainerSpec;
 use crate::session::runner::{AdoptRequest, SessionEvent, SwapRequest};
@@ -401,7 +401,7 @@ fn a_held_runtime_stopped_before_anyone_adopts_it_ends_with_its_runner() {
 }
 
 /// A session on game 620 with its helper connected and the game running.
-fn on_620(tag: &str) -> (tempfile::TempDir, Session, Peer, FakeHelper) {
+fn running_620(tag: &str) -> (tempfile::TempDir, Session, Peer, FakeHelper) {
     let (runtime, mut session) = steam_session(
         tag,
         SessionKind::Play,
@@ -413,6 +413,12 @@ fn on_620(tag: &str) -> (tempfile::TempDir, Session, Peer, FakeHelper) {
     let helper = FakeHelper::connect(runtime.path(), &session.id);
     helper.launch_state("game_running");
     session.pump(&mut a, Duration::from_millis(300), |_, _| false);
+    (runtime, session, a, helper)
+}
+
+/// [`running_620`] with an in-place swap to 730 sent.
+fn on_620(tag: &str) -> (tempfile::TempDir, Session, Peer, FakeHelper) {
+    let (runtime, session, a, helper) = running_620(tag);
     session
         .swap
         .send(SwapRequest {
@@ -421,6 +427,121 @@ fn on_620(tag: &str) -> (tempfile::TempDir, Session, Peer, FakeHelper) {
         })
         .unwrap();
     (runtime, session, a, helper)
+}
+
+/// The helper's answer once the game closed and Steam's exit sync ended; the session then
+/// ends as `detail` says.
+fn synced_then_ended(
+    mut session: Session,
+    peer: &mut Peer,
+    helper: &FakeHelper,
+    detail: Option<&str>,
+) {
+    helper.launch_state("game_exited");
+    helper.say(
+        r#"{"type":"command_done","v":1,"command":"quit","appid":620,"ok":true,"cloud_synced":true}"#,
+    );
+    let ended = session.pump(peer, Duration::from_secs(20), |s, _| s.ended.is_some());
+    assert!(ended, "the runner never ended after the sync");
+    assert!(
+        matches!(session.ended, Some(SessionEvent::Stopped { detail: d, .. }) if d == detail),
+        "want stopped with {detail:?}: {:?}",
+        session.ended
+    );
+    session.thread.take().unwrap().join().unwrap();
+}
+
+/// #742: a stop with the game running (a revoke reaches the runner this way, the peer still
+/// connected) ends the client's media and input first, then quits the game and waits for
+/// Steam's exit sync with the source still feeding the encoder, so the game can close.
+#[test]
+fn a_stop_with_the_game_running_ends_media_first_and_waits_for_the_cloud_sync() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut a, mut helper) = running_620("end-quit");
+    session.stop.store(true, Ordering::SeqCst);
+    assert_eq!(helper.command(&mut session, &mut a), "quit 620");
+    // What was in flight when the transports went lands now.
+    session.pump(&mut a, Duration::from_millis(200), |_, _| false);
+    let (video, audio) = (rtp(&a.video), rtp(&a.audio));
+    let pongs = a.video.pongs.load(Ordering::Relaxed);
+    a.video.ping();
+    for _ in 0..2 {
+        session.pump(&mut a, Duration::from_millis(500), |s, _| s.ended.is_some());
+        let (into_encoder, _) = session.metrics.encode_flow(Instant::now());
+        assert!(
+            into_encoder.is_some_and(|quiet| quiet < Duration::from_millis(250)),
+            "the source stopped feeding the encoder during the wait: {into_encoder:?}"
+        );
+    }
+    assert!(
+        session.ended.is_none(),
+        "ended before the sync: {:?}",
+        session.ended
+    );
+    assert_eq!(
+        (rtp(&a.video), rtp(&a.audio)),
+        (video, audio),
+        "media still reached the client during the wait"
+    );
+    assert_eq!(
+        a.video.pongs.load(Ordering::Relaxed),
+        pongs,
+        "input still reached the host during the wait"
+    );
+    assert!(session
+        .log
+        .iter()
+        .any(|e| matches!(e, SessionEvent::Stopping)));
+    synced_then_ended(session, &mut a, &helper, None);
+}
+
+/// `pc.close()` in a browser: an SCTP ABORT, then the peer connections go.
+fn close_as_a_browser(session: &mut Session, peer: &mut Peer) {
+    let sent = peer.video.abort_sctp();
+    let out = session.pump(peer, Duration::from_secs(2), |_, _| {
+        sent.load(Ordering::SeqCst)
+    });
+    assert!(out, "the ABORT never left the peer");
+    peer.stop();
+}
+
+/// The web client's Stop: `bye` and its peer connections closed, then the HTTP stop, which
+/// reaches the runner inside `SCTP_STOP_RACE_GRACE` after the association died.
+#[test]
+fn a_browser_stop_closes_its_peer_first_and_the_game_still_quits() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut a, mut helper) = running_620("end-quit-browser");
+    let _ = session.to_host.send(SignalMsg::Bye);
+    close_as_a_browser(&mut session, &mut a);
+    session.pump(&mut a, Duration::from_millis(300), |_, _| false);
+    session.stop.store(true, Ordering::SeqCst);
+    assert_eq!(helper.command(&mut session, &mut a), "quit 620");
+    synced_then_ended(session, &mut a, &helper, None);
+}
+
+/// The peer goes and no stop follows (a closed tab): the session ends, and the game is quit
+/// for it like any other end.
+#[test]
+fn a_peer_that_leaves_with_no_stop_still_has_its_game_quit() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut a, mut helper) = running_620("end-quit-gone");
+    close_as_a_browser(&mut session, &mut a);
+    assert_eq!(helper.command(&mut session, &mut a), "quit 620");
+    synced_then_ended(
+        session,
+        &mut a,
+        &helper,
+        Some("peer disconnected: WebRTC data channel closed"),
+    );
 }
 
 #[test]

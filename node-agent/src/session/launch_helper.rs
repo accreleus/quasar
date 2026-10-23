@@ -210,12 +210,14 @@ impl HelperCommand {
 }
 
 /// The helper's word that it carried out a command. `cloud_synced` comes with a quit: Steam's
-/// exit cloud sync for the game was seen to end.
+/// exit cloud sync for the game was seen to end. `cloud_sync_started` is `Some(false)` when
+/// no exit sync started; a helper that predates it never sends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandDone {
     pub command: HelperCommand,
     pub ok: bool,
     pub cloud_synced: Option<bool>,
+    pub cloud_sync_started: Option<bool>,
 }
 
 /// One accepted helper line.
@@ -257,6 +259,8 @@ enum Wire {
         ok: bool,
         #[serde(default)]
         cloud_synced: Option<bool>,
+        #[serde(default)]
+        cloud_sync_started: Option<bool>,
     },
 }
 
@@ -304,17 +308,19 @@ fn parse(line: &[u8]) -> Result<Report, Rejected> {
             appid,
             ok,
             cloud_synced,
+            cloud_sync_started,
         } => {
-            let command = match (command.as_str(), appid, cloud_synced) {
-                ("launch", Some(appid), None) => Some(HelperCommand::Launch(appid)),
-                ("bigpicture", None, None) => Some(HelperCommand::BigPicture),
-                ("quit", Some(appid), Some(_)) => Some(HelperCommand::Quit(appid)),
+            let command = match (command.as_str(), appid, cloud_synced, cloud_sync_started) {
+                ("launch", Some(appid), None, None) => Some(HelperCommand::Launch(appid)),
+                ("bigpicture", None, None, None) => Some(HelperCommand::BigPicture),
+                ("quit", Some(appid), Some(_), _) => Some(HelperCommand::Quit(appid)),
                 _ => None,
             };
             let done = command.map(|command| CommandDone {
                 command,
                 ok,
                 cloud_synced,
+                cloud_sync_started,
             });
             (v, done.map(Report::CommandDone))
         }
@@ -715,6 +721,58 @@ impl LaunchSocket {
     pub fn reports(&self) -> LaunchReports {
         self.mount.shared.state().reports
     }
+
+    /// The session is ending with its game running (#742): send the in-place swap's
+    /// `quit <appid>` (close request, SIGTERM and SIGKILL fallbacks, then Steam's exit cloud
+    /// sync) and block up to `bound` for the helper's answer, so the container stop that
+    /// follows does not cut the upload. Nothing is sent when no game is running.
+    pub fn quit_running_game(&self, bound: Duration) -> EndQuit {
+        let appid = {
+            let state = self.mount.shared.state();
+            match state.target {
+                Some(appid) if state.reports.launch_state == Some(LaunchState::GameRunning) => {
+                    appid
+                }
+                _ => return EndQuit::NoGame,
+            }
+        };
+        self.mount.send(HelperCommand::Quit(appid));
+        let until = Instant::now() + bound;
+        loop {
+            if let Some(done) = self
+                .reports()
+                .last_command
+                .filter(|d| d.command == HelperCommand::Quit(appid))
+            {
+                return EndQuit::Done {
+                    appid,
+                    ok: done.ok,
+                    cloud_synced: done.cloud_synced == Some(true),
+                    cloud_sync_started: done.cloud_sync_started != Some(false),
+                };
+            }
+            if Instant::now() >= until {
+                return EndQuit::TimedOut { appid };
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+/// What [`LaunchSocket::quit_running_game`] came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndQuit {
+    /// No game running: nothing was sent.
+    NoGame,
+    /// The helper answered: `ok` false is a game that outlived SIGKILL.
+    Done {
+        appid: u32,
+        ok: bool,
+        cloud_synced: bool,
+        cloud_sync_started: bool,
+    },
+    /// No answer within the bound.
+    TimedOut { appid: u32 },
 }
 
 impl Drop for LaunchSocket {
@@ -1009,6 +1067,7 @@ impl Reader {
                 tracing::info!(
                     ok = done.ok,
                     cloud_synced = ?done.cloud_synced,
+                    cloud_sync_started = ?done.cloud_sync_started,
                     "launch helper: {:?} done (ok={})",
                     done.command,
                     done.ok
@@ -1144,6 +1203,10 @@ mod tests {
                 Rejected::UnknownValue,
             ),
             (
+                br#"{"type":"command_done","v":1,"command":"launch","appid":620,"ok":true,"cloud_sync_started":false}"#,
+                Rejected::UnknownValue,
+            ),
+            (
                 br#"{"type":"command_done","v":1,"command":"exec","appid":620,"ok":true}"#,
                 Rejected::UnknownValue,
             ),
@@ -1168,6 +1231,7 @@ mod tests {
                 command: HelperCommand::Launch(620),
                 ok: true,
                 cloud_synced: None,
+                cloud_sync_started: None,
             }))
         );
         assert_eq!(
@@ -1176,6 +1240,7 @@ mod tests {
                 command: HelperCommand::BigPicture,
                 ok: false,
                 cloud_synced: None,
+                cloud_sync_started: None,
             }))
         );
         assert_eq!(
@@ -1184,6 +1249,16 @@ mod tests {
                 command: HelperCommand::Quit(620),
                 ok: true,
                 cloud_synced: Some(false),
+                cloud_sync_started: None,
+            }))
+        );
+        assert_eq!(
+            parse(br#"{"type":"command_done","v":1,"command":"quit","appid":620,"ok":true,"cloud_synced":false,"cloud_sync_started":false}"#),
+            Ok(Report::CommandDone(CommandDone {
+                command: HelperCommand::Quit(620),
+                ok: true,
+                cloud_synced: Some(false),
+                cloud_sync_started: Some(false),
             }))
         );
         assert_eq!(HelperCommand::Launch(620).line(), "launch 620\n");
@@ -1835,11 +1910,98 @@ mod tests {
                 command: HelperCommand::Quit(620),
                 ok: true,
                 cloud_synced: Some(true),
+                cloud_sync_started: None,
             })
         );
         mount.send(HelperCommand::BigPicture);
         assert_eq!(s.socket().reports().last_command, None);
         assert_eq!(read_line(&mut helper), "bigpicture\n");
+    }
+
+    /// A session on game 620 with its helper connected and the game running.
+    fn running_620() -> (Session, UnixStream) {
+        let s = Session::open(620);
+        let mut helper = s.connect();
+        helper.write_all(&state_line("game_running")).unwrap();
+        s.wait_for(|r| r.launch_state == Some(LaunchState::GameRunning));
+        (s, helper)
+    }
+
+    #[test]
+    fn a_session_end_quits_a_running_game_and_waits_for_its_sync() {
+        let (s, mut helper) = running_620();
+        let answer = std::thread::spawn(move || {
+            let command = read_line(&mut helper);
+            // A keepalive, as the real helper sends, so the reader's IDLE close cannot win.
+            helper.write_all(b"\n").unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            helper
+                .write_all(b"{\"type\":\"command_done\",\"v\":1,\"command\":\"quit\",\"appid\":620,\"ok\":true,\"cloud_synced\":true}\n")
+                .unwrap();
+            (command, helper)
+        });
+        let started = Instant::now();
+        let end = s.socket().quit_running_game(Duration::from_secs(5));
+        let (command, _helper) = answer.join().unwrap();
+        assert_eq!(command, "quit 620\n");
+        assert_eq!(
+            end,
+            EndQuit::Done {
+                appid: 620,
+                ok: true,
+                cloud_synced: true,
+                cloud_sync_started: true,
+            }
+        );
+        assert!(started.elapsed() >= Duration::from_millis(500), "it waited");
+    }
+
+    #[test]
+    fn a_session_end_whose_sync_never_ends_stops_waiting_at_the_bound() {
+        let (s, _helper) = running_620();
+        let bound = Duration::from_millis(400);
+        let started = Instant::now();
+        assert_eq!(
+            s.socket().quit_running_game(bound),
+            EndQuit::TimedOut { appid: 620 }
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= bound && waited < bound + Duration::from_secs(1),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_end_with_no_running_game_sends_nothing() {
+        let bound = Duration::from_secs(5);
+        let quick = |s: &Session| {
+            let started = Instant::now();
+            assert_eq!(s.socket().quit_running_game(bound), EndQuit::NoGame);
+            assert!(started.elapsed() < POLL, "no wait");
+            assert!(
+                s.socket().mount.shared.state().outbox.is_empty(),
+                "no quit queued"
+            );
+        };
+        // The helper never connected; a parked Steam with no game.
+        quick(&Session::open(620));
+        quick(&Session::open_parked());
+        // Steam up, no game yet; and a game the player already quit.
+        let s = Session::open(620);
+        let mut helper = s.connect();
+        helper.write_all(CLIENT_ONLY).unwrap();
+        s.wait_for(|r| r.launch_state == Some(LaunchState::ClientOnly));
+        quick(&s);
+        for state in ["game_running", "game_exited"] {
+            helper.write_all(&state_line(state)).unwrap();
+        }
+        s.wait_for(|r| r.launch_state == Some(LaunchState::GameExited));
+        quick(&s);
+        // The container (and the helper in it) exited with the game last seen running.
+        let (s, _helper) = running_620();
+        s.socket().mount().mute();
+        quick(&s);
     }
 
     #[test]
