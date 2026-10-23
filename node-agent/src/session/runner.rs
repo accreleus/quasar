@@ -841,14 +841,15 @@ const IN_PLACE_LAUNCH_BOUND: Duration = Duration::from_secs(5);
 
 /// How long a session end waits for a running Steam game to quit and its exit cloud sync to
 /// end before the container stop (#742). The #759 spike measured close + sync at 2.8–9.3 s,
-/// uploads 1–3 s; 30 s also covers the helper's 20 s close grace and its SIGTERM. With the
-/// 10 s container stop it stays inside the web's 45 s "Closing <game>…" wait (#754).
+/// uploads 1–3 s. Raise neither number alone: this bound, the 10 s container stop and the
+/// teardown after it must fit the web's 45 s closing wait (`MAX_CLOSING_RETRY_WAIT_MS`,
+/// `web/src/pages/app/capacityRetry.ts`), and it must cover the helper's timeline for a game
+/// that ignores the close (`QUIT_CLOSE_GRACE` 20 s, then SIGTERM: about 21–24 s to the sync).
 const END_QUIT_BOUND: Duration = Duration::from_secs(30);
 
-/// A user stop, a control-plane stop or the idle reap of a session whose Steam game still
-/// runs (#742): quit the game the in-place swap's way and wait for Steam's cloud sync, at
-/// most [`END_QUIT_BOUND`]. The session is already `stopping`; no helper or no running game
-/// returns at once.
+/// Any session end whose Steam game still runs (#742): quit the game the in-place swap's way
+/// and wait for Steam's cloud sync, at most [`END_QUIT_BOUND`]. No helper or no running game
+/// (held, parked, the game already exited) returns at once.
 fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
     use super::launch_helper::EndQuit;
     let Some(launch) = launch else {
@@ -1721,13 +1722,25 @@ fn replace_audio(
 ///
 /// Session ends only: the audio pipeline reports nothing after this
 /// (`AudioPipelineGuard::stop_reporting`), so a caller must never keep the session.
-pub(crate) fn stop_source(source: &mut AppSource, transports: &SessionTransports) {
+///
+/// A Steam game still running is quit and its cloud sync waited for (#742) once the
+/// client's media and input have ended and before the container goes. The source keeps
+/// running meanwhile, so the game can draw its way out.
+pub(crate) fn stop_source(
+    source: &mut AppSource,
+    transports: &SessionTransports,
+    launch: Option<&super::launch_helper::LaunchSocket>,
+) {
     transports.video.release();
+    if let Some(audio) = &transports.audio_webrtc {
+        let _ = audio.set_state(gst::State::Null);
+    }
     tracing::info!(
         token = "session-transport-released",
         "video transport released ahead of the source teardown"
     );
     transports.audio_pipeline.stop_reporting();
+    quit_game_for_end(launch);
     source.teardown();
 }
 
@@ -1742,7 +1755,7 @@ pub(crate) fn stop_for_game_exit(
 ) {
     emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
     emit(SessionEvent::Signaling(SignalMsg::Bye));
-    stop_source(source, transports);
+    stop_source(source, transports, None);
 }
 
 /// Should an idle `running` session be reaped? `Some(reason)` to reap. Pure so the policy
@@ -2437,7 +2450,7 @@ pub fn run_blocking(
                 "encode pipeline READY transition (Vulkan device verification) failed"
             );
             emit(SessionEvent::Failed(reason));
-            stop_source(&mut current_source, &transports);
+            stop_source(&mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             return;
         }
@@ -2452,7 +2465,7 @@ pub fn run_blocking(
                 "verify Vulkan context identity failed"
             );
             emit(SessionEvent::Failed(reason));
-            stop_source(&mut current_source, &transports);
+            stop_source(&mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             return;
         }
@@ -2465,7 +2478,7 @@ pub fn run_blocking(
             "encode pipeline PLAYING transition failed"
         );
         emit(SessionEvent::Failed(format!("encode set PLAYING: {e}")));
-        stop_source(&mut current_source, &transports);
+        stop_source(&mut current_source, &transports, res.launch());
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         return;
     }
@@ -2496,7 +2509,7 @@ pub fn run_blocking(
             "encode pipeline has no bus"
         );
         emit(SessionEvent::Failed("encode pipeline has no bus".into()));
-        stop_source(&mut current_source, &transports);
+        stop_source(&mut current_source, &transports, res.launch());
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         transports.audio_pipeline.finish();
         return;
@@ -2578,8 +2591,7 @@ pub fn run_blocking(
     loop {
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
-            quit_game_for_end(res.launch());
-            stop_source(&mut current_source, &transports); // remove the app container before media
+            stop_source(&mut current_source, &transports, res.launch()); // remove the app container before media
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             emit(SessionEvent::Stopped {
@@ -2677,7 +2689,7 @@ pub fn run_blocking(
                 let reason = "the adopted runtime has no launch helper to start the game";
                 tracing::error!(token = "runtime-adopted-without-helper", "{reason}");
                 emit(SessionEvent::Failed(reason.to_string()));
-                stop_source(&mut current_source, &transports);
+                stop_source(&mut current_source, &transports, res.launch());
                 super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                 transports.audio_pipeline.finish();
                 return;
@@ -2945,7 +2957,7 @@ pub fn run_blocking(
                         "video transport replacement failed"
                     );
                     emit(SessionEvent::Failed(reason));
-                    stop_source(&mut current_source, &transports);
+                    stop_source(&mut current_source, &transports, res.launch());
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     return;
@@ -3081,7 +3093,7 @@ pub fn run_blocking(
                 "webrtc: set-remote-description failed — failing session: {reason}"
             );
             emit(SessionEvent::Failed(reason));
-            stop_source(&mut current_source, &transports);
+            stop_source(&mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             return;
@@ -3215,7 +3227,7 @@ pub fn run_blocking(
                         "swap failed fatally; ending session"
                     );
                     emit(SessionEvent::Failed(failure.reason));
-                    stop_source(&mut current_source, &transports);
+                    stop_source(&mut current_source, &transports, res.launch());
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     return;
@@ -3318,8 +3330,7 @@ pub fn run_blocking(
                     app_presented_at.is_some()
                 );
                 emit(SessionEvent::Stopping);
-                quit_game_for_end(res.launch());
-                stop_source(&mut current_source, &transports);
+                stop_source(&mut current_source, &transports, res.launch());
                 super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                 transports.audio_pipeline.finish();
                 // A session that streamed and then went idle is an ended session (the
@@ -3368,7 +3379,7 @@ pub fn run_blocking(
                             "source pipeline bus error"
                         );
                         emit(SessionEvent::Failed(reason));
-                        stop_source(&mut current_source, &transports);
+                        stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         return;
@@ -3383,7 +3394,7 @@ pub fn run_blocking(
                                 "renderer degraded; failing session"
                             );
                             emit(SessionEvent::Failed(reason));
-                            stop_source(&mut current_source, &transports);
+                            stop_source(&mut current_source, &transports, res.launch());
                             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                             transports.audio_pipeline.finish();
                             return;
@@ -3405,7 +3416,7 @@ pub fn run_blocking(
             emit(SessionEvent::Failed(format!(
                 "container launch failed: {err}"
             )));
-            stop_source(&mut current_source, &transports);
+            stop_source(&mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             return;
@@ -3474,7 +3485,7 @@ pub fn run_blocking(
                             reason_code: REASON_APP_NEVER_PRESENTED,
                             app_log_tail: current_source.app_log_tail(),
                         });
-                        stop_source(&mut current_source, &transports);
+                        stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         return;
@@ -3501,6 +3512,10 @@ pub fn run_blocking(
         if liveness_cadence_at.elapsed() >= Duration::from_secs(5) {
             liveness_cadence_at = Instant::now();
             if let Some(status) = current_source.take_container_exit() {
+                // Its helper went with it: a stale `game_running` must not hold the end (#742).
+                if let Some(launch) = res.launch() {
+                    launch.mount().mute();
+                }
                 let policy = current_source.exit_policy();
                 // Read BOTH before any teardown: the app-surface counter lives on the
                 // compositor element and the log ring is filled by threads whose streams
@@ -3543,7 +3558,7 @@ pub fn run_blocking(
                             "app container exited; unrecognized disposition treated as fail"
                         );
                         emit(app_exit_event(status, presented, app_log_tail));
-                        stop_source(&mut current_source, &transports);
+                        stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         return;
@@ -3556,7 +3571,7 @@ pub fn run_blocking(
                             "app container exited; on_app_exit=fail"
                         );
                         emit(app_exit_event(status, presented, app_log_tail));
-                        stop_source(&mut current_source, &transports);
+                        stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         return;
@@ -3610,7 +3625,7 @@ pub fn run_blocking(
                             err.debug()
                         );
                         emit(SessionEvent::Stopping);
-                        stop_source(&mut current_source, &transports);
+                        stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         emit(SessionEvent::Stopped {
@@ -3650,7 +3665,7 @@ pub fn run_blocking(
                             },
                         );
                         emit(SessionEvent::Stopping);
-                        stop_source(&mut current_source, &transports);
+                        stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
                         emit(SessionEvent::Stopped {
@@ -3675,7 +3690,7 @@ pub fn run_blocking(
                         "encode pipeline bus error"
                     );
                     emit(SessionEvent::Failed(reason));
-                    stop_source(&mut current_source, &transports);
+                    stop_source(&mut current_source, &transports, res.launch());
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     return;
@@ -3690,7 +3705,7 @@ pub fn run_blocking(
                     }
                 }
                 gst::MessageView::Eos(_) => {
-                    stop_source(&mut current_source, &transports);
+                    stop_source(&mut current_source, &transports, res.launch());
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     emit(SessionEvent::Stopped {

@@ -1971,6 +1971,10 @@ mod tests {
         }
         s.wait_for(|r| r.launch_state == Some(LaunchState::GameExited));
         quick(&s);
+        // The container (and the helper in it) exited with the game last seen running.
+        let (s, _helper) = running_620();
+        s.socket().mount().mute();
+        quick(&s);
     }
 
     #[test]
