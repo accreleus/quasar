@@ -122,8 +122,8 @@ func ValidateSessionOverlay(v map[string]any) error {
 }
 
 // getUIPreferencesRaw returns the whole stored object including keys this
-// server does not recognise. Used by PatchUIPreferences to merge without loss,
-// and by tests to assert that forward-compatibility holds.
+// server does not recognise. Used by GetUIPreferences and by tests to assert
+// that forward-compatibility holds (PatchUIPreferences merges in the database).
 func (s *store) getUIPreferencesRaw(ctx context.Context, userID string) (map[string]any, error) {
 	var buf []byte
 	err := s.pool.QueryRow(ctx, `
@@ -170,6 +170,11 @@ func uiPreferencesFromRaw(raw map[string]any) UIPreferences {
 // returns the result. Top-level keys the server does not recognise survive
 // untouched, so an older control plane cannot delete a newer client's state.
 func (s *store) PatchUIPreferences(ctx context.Context, userID string, patch map[string]any) (UIPreferences, error) {
+	// A JSON `null` body decodes to a nil map; it must stay a no-op, and
+	// json.Marshal(nil map) is `null`, which jsonb `||` would array-wrap.
+	if patch == nil {
+		patch = map[string]any{}
+	}
 	if overlay, ok := patch["session_overlay"]; ok {
 		m, ok := overlay.(map[string]any)
 		if !ok {
@@ -180,36 +185,36 @@ func (s *store) PatchUIPreferences(ctx context.Context, userID string, patch map
 		}
 	}
 
-	current, err := s.getUIPreferencesRaw(ctx, userID)
-	if err != nil {
-		return UIPreferences{}, err
-	}
-	for k, v := range patch {
-		// One level deep: a known object surface merges field-by-field, anything
-		// else replaces. Only session_overlay is a merge surface today.
-		if k == "session_overlay" {
-			existing, _ := current[k].(map[string]any)
-			if existing == nil {
-				existing = map[string]any{}
-			}
-			maps.Copy(existing, v.(map[string]any))
-			current[k] = existing
-			continue
-		}
-		current[k] = v
-	}
-
-	buf, err := json.Marshal(current)
+	buf, err := json.Marshal(patch)
 	if err != nil {
 		return UIPreferences{}, fmt.Errorf("encode ui preferences: %w", err)
 	}
+	// The merge runs in the database, in one statement, so two overlapping
+	// PATCHes serialise on the row lock and neither can overwrite the other's
+	// keys (#716). One level deep: top-level patch keys replace; session_overlay
+	// merges field-by-field onto the stored object (a missing or non-object
+	// stored value counts as empty).
+	//
+	// Invariant: the stored document is always a JSON object. jsonb `||` turns
+	// a non-object operand into an array, so the stored row is used only when
+	// jsonb_typeof says object. A legacy non-object row (a scalar, an array, a
+	// JSON null) therefore becomes {} merged with the patch: the old code
+	// failed to decode it on every call and left it broken, and nothing ever
+	// wrote one, so the unreadable value is replaced rather than preserved.
 	var stored []byte
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO user_ui_preferences (user_id, session_overlay)
+		INSERT INTO user_ui_preferences AS u (user_id, session_overlay)
 		VALUES ($1::uuid, $2::jsonb)
 		ON CONFLICT (user_id) DO UPDATE
-		SET session_overlay = EXCLUDED.session_overlay
-		RETURNING session_overlay
+		SET session_overlay = (CASE WHEN jsonb_typeof(u.session_overlay) = 'object'
+				THEN u.session_overlay ELSE '{}'::jsonb END || $2::jsonb) || CASE
+			WHEN jsonb_typeof($2::jsonb -> 'session_overlay') = 'object' THEN jsonb_build_object(
+				'session_overlay',
+				CASE WHEN jsonb_typeof(u.session_overlay -> 'session_overlay') = 'object'
+					THEN u.session_overlay -> 'session_overlay' ELSE '{}'::jsonb END
+				|| ($2::jsonb -> 'session_overlay'))
+			ELSE '{}'::jsonb END
+		RETURNING u.session_overlay
 	`, userID, buf).Scan(&stored)
 	if err != nil {
 		return UIPreferences{}, fmt.Errorf("update ui preferences: %w", err)

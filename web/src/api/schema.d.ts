@@ -3890,7 +3890,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Re-adopt the catalog's current version/digest and re-ensure everywhere (200 applied or no-op).
+         * Re-adopt the catalog's current version/digest and prepare it where its apps are placed, as an install does (200 applied or no-op).
          * @description The notify policy's action and manual's escape hatch. applied:false (still 200) when installed_version already equals the catalog version. 409 conflict when the image is pinned.
          */
         post: {
@@ -8384,7 +8384,7 @@ export interface components {
             installed_version?: string | null;
             /** @description P3: real. A pinned image is never auto-updated under any policy (auto sync or explicit .../update, both 409 while pinned). */
             pinned?: boolean;
-            /** @description P3. True when installed without dispatching ensure-everywhere; hosts pull this image on first launch placement instead. */
+            /** @description P3. True when installed without preparing it on any host; hosts pull this image on first launch placement instead. */
             lazy?: boolean;
             /**
              * Format: uuid
@@ -8398,7 +8398,7 @@ export interface components {
         /** @description P3. Optional body; an omitted body or {} installs eagerly (lazy defaults false). */
         ImageInstallRequest: {
             /**
-             * @description P3. When true, seeds the installed_images adoption row without dispatching ensure-everywhere; hosts pull on first launch placement instead.
+             * @description P3. When true, seeds the installed_images adoption row and prepares it on no host; hosts pull on first launch placement instead.
              * @default false
              */
             lazy: boolean;
