@@ -84,6 +84,10 @@ export function parseTierSize(tier: string | undefined): { w: number; h: number 
   return w > 0 && h > 0 ? { w, h } : null;
 }
 
+/** #748: recovery phases that paint the banner, and how long it is held. */
+const RECOVERY_PHASES = ["degraded", "reconnecting", "failed", "signaling-lost"];
+const RECOVERY_BANNER_GRACE_MS = 500;
+
 /**
  * #524: session states no fresh signaling envelope can rescue; these bounce to
  * the library instead of minting. `stopping` included: mint would likely 409.
@@ -477,6 +481,18 @@ function SessionPageBody() {
   useEffect(() => {
     if (gameExited) navigate("/app", { replace: true });
   }, [gameExited, navigate]);
+
+  // #748: a stall can fire a beat before the end-reason read lands. Hold the recovery banner
+  // for a short grace so a session already ending (or ended by this page) never paints it.
+  const recoveryActive = recovery != null && RECOVERY_PHASES.includes(recovery.phase);
+  const [recoveryGraceDone, setRecoveryGraceDone] = useState(false);
+  useEffect(() => {
+    setRecoveryGraceDone(false);
+    if (!recoveryActive) return;
+    const t = setTimeout(() => setRecoveryGraceDone(true), RECOVERY_BANNER_GRACE_MS);
+    return () => clearTimeout(t);
+  }, [recoveryActive]);
+  const recoveryShown = recoveryActive && recoveryGraceDone && !gameExited && !stopping;
 
   // Release what leaving the page releases, without destroying the transport:
   // a destroy would say `bye` to a session another tab now owns.
@@ -948,8 +964,7 @@ function SessionPageBody() {
     (!bannerVerdict &&
       (health != null ||
         clientUnsupported ||
-        (recovery != null &&
-          ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase))));
+        recoveryShown));
 
   // Same shape, for the mic "hot" pill vs the toast host (`.session-root.mic-on`).
   const rootClassName =
@@ -1046,7 +1061,7 @@ function SessionPageBody() {
 
           {!bannerVerdict &&
             recovery &&
-            ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase) && (
+            recoveryShown && (
               <SessionBanner
                 variant={recovery.phase === "failed" ? "critical" : "warning"}
                 title={
