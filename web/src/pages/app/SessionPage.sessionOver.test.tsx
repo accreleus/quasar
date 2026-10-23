@@ -337,14 +337,15 @@ describe("SessionPage — a session that is over for this page releases the mic 
   });
 
   // #748: the stall fires first, the end-reason read lands a few ms later; the banner must
-  // never paint in between. Real order: `stopping` row, then `bye`; the stall races both.
+  // never paint in between.
   it("game exit: a stall just before the end read paints no banner", async () => {
     await streamingWithMicAndCapture();
-    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
     await act(async () => lastOnRecovery?.({ ...failed, phase: "reconnecting", message: "Reconnecting (1/3)…" }));
     await advance(30);
     expect(screen.queryByText("Recovering connection")).toBeNull();
-    await advance(1_000);
+    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
+    await act(async () => lastTransport?.onHostBye?.());
+    await advance(50);
     expect(screen.getByTestId("library")).not.toBeNull();
     expect(screen.queryByText("Recovering connection")).toBeNull();
   });
@@ -432,7 +433,7 @@ describe("SessionPage — an ordinary stop is not a game exit (#726)", () => {
     await advance(5_500);
     refused();
     await act(async () => lastOnRecovery?.(failed));
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     expect(screen.queryByTestId("library")).toBeNull();
   });
@@ -451,7 +452,7 @@ describe("SessionPage — a session that may still be streaming keeps the mic an
     const ch = await streamingWithMicAndCapture();
     refused();
     await act(async () => lastOnRecovery?.(failed));
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     stillLive();
 
@@ -643,7 +644,7 @@ describe("SessionPage — a session that is over for this page draws no HUD (#52
     refused();
     const rc = new RecoveryController({ onRetry: () => {}, onState: (st) => lastOnRecovery?.(st as never) });
     await act(async () => rc.terminal("signaling: session not found or already ended"));
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     present();
 
@@ -663,7 +664,7 @@ describe("SessionPage — a session that is over for this page draws no HUD (#52
     await advance(3_000);
     refused();
     await act(async () => lastOnRecovery?.(failed));
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     present();
   });
@@ -681,7 +682,7 @@ describe("SessionPage — a late takeover (#527)", () => {
     refused();
     const rc = controller();
     await act(async () => rc.terminal("signaling: session not found or already ended"));
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     stillLive();
 
@@ -723,7 +724,7 @@ describe("SessionPage — a late takeover (#527)", () => {
     refused();
     const rc = controller();
     await act(async () => rc.terminal("Peer connection failed (DTLS)"));
-    await advance(100);
+    await advance(600);
     expect(banners().length).toBe(1);
     await act(async () => rc.superseded("opened in another tab"));
     await advance(100);
@@ -790,7 +791,7 @@ describe("SessionPage — a held verdict is the only banner (#529)", () => {
       ch.onclose?.();
       lastOnRecovery?.(failed);
     });
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     expect(screen.getByText(DECODER)).not.toBeNull();
     expect(screen.getAllByRole("button", { name: "Stop" }).length).toBeGreaterThan(0);
@@ -941,7 +942,7 @@ describe("SessionPage — a launch verdict is held only until the loader's revea
     const ch = await streamingWithMicAndCapture();
     if (name.includes("channel closed")) await act(async () => ch.onclose?.());
     await reach();
-    await advance(100);
+    await advance(600);
 
     expect(keyReachesBrowser("Tab")).toBe(true);
     expect(document.querySelectorAll(".banner button").length).toBeGreaterThan(0);

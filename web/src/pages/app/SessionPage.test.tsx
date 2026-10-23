@@ -985,6 +985,10 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
       });
       await vi.advanceTimersByTimeAsync(100);
     });
+    // #748: the recovery banner is held 500 ms; the grace timer starts once the state renders.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
   }
 
   it("says the access was removed, not that recovery stopped", async () => {
