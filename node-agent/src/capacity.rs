@@ -160,7 +160,7 @@ pub(crate) fn detect_console_capabilities() -> ConsoleCapabilities {
         connectors: if typed_connectors.is_empty() {
             detect_drm_connectors()
         } else if ddc_probe_allowed(claimed) {
-            crate::console_idle::reset();
+            reset_claimed_watch();
             crate::ddc::powered_connectors(typed_connectors)
         } else {
             claimed_connectors(typed_connectors)
@@ -221,7 +221,7 @@ pub(crate) fn claim_display(card: &str) -> DisplayClaim {
 }
 
 fn claim_display_with(card: &str, outputs: Vec<DrmOutputCapability>) -> DisplayClaim {
-    crate::console_idle::reset();
+    reset_claimed_watch();
     static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     claimed_cards()
@@ -270,26 +270,38 @@ fn ddc_probe_allowed(display_claimed: bool) -> bool {
 /// absent, and the control plane stops it.
 const CONSOLE_QUIET_BEFORE_DDC: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const CLAIMED_DDC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Input after a read found a monitor off reads again this soon: someone may have switched
+/// it back on, and the session must not be stopped under them.
+const CLAIMED_DDC_OFF_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Default)]
 struct ClaimedDdc {
     last_read: Option<std::time::Instant>,
     /// Connectors the last read found off (or showing another input).
     off: Vec<String>,
+    /// Why the input watch last could not run, logged once per reason.
+    no_watch: Option<&'static str>,
 }
 
 impl ClaimedDdc {
-    /// Whether to read the monitors now. Input forgets the last reading: the monitor
-    /// counts as on again while someone uses the console.
+    /// Whether to read the monitors now. Input alone never brings a connector back: only
+    /// the next read does, or the claim ending (a stop's teardown keeps the display
+    /// claimed a while, and a key pressed then must not relaunch onto an off monitor).
     fn due(&mut self, idle: Option<std::time::Duration>, now: std::time::Instant) -> bool {
-        if idle.is_none_or(|idle| idle < CONSOLE_QUIET_BEFORE_DDC) {
+        let Some(idle) = idle else {
+            // Input the agent cannot see may be someone playing.
             self.off.clear();
             return false;
-        }
-        if self
-            .last_read
-            .is_some_and(|at| now.saturating_duration_since(at) < CLAIMED_DDC_INTERVAL)
-        {
+        };
+        let since_read = self.last_read.map(|at| now.saturating_duration_since(at));
+        let wait = if idle >= CONSOLE_QUIET_BEFORE_DDC {
+            CLAIMED_DDC_INTERVAL
+        } else if !self.off.is_empty() && since_read.is_some_and(|since| idle < since) {
+            CLAIMED_DDC_OFF_RECHECK
+        } else {
+            return false;
+        };
+        if since_read.is_some_and(|since| since < wait) {
             return false;
         }
         self.last_read = Some(now);
@@ -300,41 +312,79 @@ impl ClaimedDdc {
         connectors.retain(|c| !self.off.contains(c));
         connectors
     }
+
+    fn note_no_watch(&mut self, why: &'static str) {
+        if self.no_watch != Some(why) {
+            self.no_watch = Some(why);
+            tracing::info!(
+                token = "console-ddc-idle-unwatched",
+                reason = why,
+                "console: not reading the monitor's power while the console desktop runs"
+            );
+        }
+    }
 }
 
-fn claimed_ddc() -> std::sync::MutexGuard<'static, ClaimedDdc> {
-    static STATE: std::sync::OnceLock<std::sync::Mutex<ClaimedDdc>> = std::sync::OnceLock::new();
-    STATE
-        .get_or_init(Default::default)
+static CLAIMED_DDC: std::sync::Mutex<ClaimedDdc> = std::sync::Mutex::new(ClaimedDdc {
+    last_read: None,
+    off: Vec::new(),
+    no_watch: None,
+});
+
+fn lock_ddc(state: &std::sync::Mutex<ClaimedDdc>) -> std::sync::MutexGuard<'_, ClaimedDdc> {
+    state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The connected connectors of a claimed display, less those a quiet-console read found off.
+/// Forgets the claimed-display readings and closes the input watch.
+fn reset_claimed_watch() {
+    *lock_ddc(&CLAIMED_DDC) = ClaimedDdc::default();
+    crate::console_idle::reset();
+}
+
+/// The connected connectors of a claimed display, less those a quiet-console read found
+/// off. The input watch runs only while such a read could happen.
 fn claimed_connectors(connected: Vec<String>) -> Vec<String> {
+    if let Some(why) = crate::ddc::known_bus_read_blocked(&connected) {
+        crate::console_idle::reset();
+        let mut state = lock_ddc(&CLAIMED_DDC);
+        state.off.clear();
+        state.note_no_watch(why);
+        return connected;
+    }
+    let idle = match crate::console_idle::idle_for(std::path::Path::new("/dev/input")) {
+        Ok(idle) => Some(idle),
+        Err(why) => {
+            lock_ddc(&CLAIMED_DDC).note_no_watch(why);
+            None
+        }
+    };
     claimed_connectors_with(
+        &CLAIMED_DDC,
         connected,
-        crate::console_idle::idle_for(std::path::Path::new("/dev/input")),
+        idle,
         crate::ddc::powered_connectors_on_known_bus,
     )
 }
 
 fn claimed_connectors_with(
+    state: &std::sync::Mutex<ClaimedDdc>,
     connected: Vec<String>,
     idle: Option<std::time::Duration>,
     read: impl FnOnce(Vec<String>) -> Vec<String>,
 ) -> Vec<String> {
-    if !claimed_ddc().due(idle, std::time::Instant::now()) {
-        return claimed_ddc().present(connected);
+    if !lock_ddc(state).due(idle, std::time::Instant::now()) {
+        return lock_ddc(state).present(connected);
     }
     tracing::info!(
         token = "console-ddc-idle-read",
         idle_s = idle.map_or(0, |idle| idle.as_secs()),
-        "console: no local input for a while, reading the monitor's power"
+        "console: reading the monitor's power while the console desktop runs"
     );
     // Unlocked: the read is over a second of i2c.
     let powered = read(connected.clone());
-    let mut state = claimed_ddc();
+    let mut state = lock_ddc(state);
     state.off = connected
         .iter()
         .filter(|c| !powered.contains(c))
@@ -1508,7 +1558,7 @@ mod tests {
     }
 
     /// While a console desktop owns the display, the power read waits for a quiet
-    /// console, then runs once per interval; input forgets an off reading.
+    /// console, then runs once per interval.
     #[test]
     fn claimed_ddc_reads_only_after_the_quiet_period_and_slowly() {
         use std::time::{Duration, Instant};
@@ -1518,12 +1568,43 @@ mod tests {
         assert!(!st.due(None, t0), "unseen input may be play");
         assert!(!st.due(Some(CONSOLE_QUIET_BEFORE_DDC - Duration::from_secs(1)), t0));
         assert!(st.due(quiet, t0));
-        st.off = vec!["DP-4".into()];
         assert!(!st.due(quiet, t0 + CLAIMED_DDC_INTERVAL - Duration::from_secs(1)));
-        assert_eq!(st.present(vec!["DP-4".into()]), Vec::<String>::new());
         assert!(st.due(quiet, t0 + CLAIMED_DDC_INTERVAL));
-        assert!(!st.due(Some(Duration::ZERO), t0 + CLAIMED_DDC_INTERVAL));
-        assert_eq!(st.present(vec!["DP-4".into()]), vec!["DP-4".to_string()]);
+        // With the monitor read on, input never brings a read.
+        let t1 = t0 + CLAIMED_DDC_INTERVAL + Duration::from_secs(60);
+        assert!(!st.due(Some(Duration::ZERO), t1));
+    }
+
+    /// Input after an off reading keeps the connector out until a read finds it on; the
+    /// read comes soon. Unseen input, or the claim ending, brings it back.
+    #[test]
+    fn input_alone_never_brings_an_off_monitor_back() {
+        use std::time::{Duration, Instant};
+        let dp4 = || vec!["DP-4".to_string()];
+        let t0 = Instant::now();
+        let mut st = ClaimedDdc::default();
+        assert!(st.due(Some(CONSOLE_QUIET_BEFORE_DDC), t0));
+        st.off = dp4();
+
+        let t1 = t0 + Duration::from_secs(2);
+        assert!(
+            !st.due(Some(Duration::ZERO), t1),
+            "a recheck waits its spacing"
+        );
+        assert_eq!(st.present(dp4()), Vec::<String>::new(), "input alone");
+        let t2 = t0 + CLAIMED_DDC_OFF_RECHECK;
+        assert!(
+            !st.due(Some(CLAIMED_DDC_OFF_RECHECK), t2),
+            "no input since the read"
+        );
+        assert!(
+            st.due(Some(Duration::from_secs(1)), t2),
+            "input after the read"
+        );
+        assert_eq!(st.present(dp4()), Vec::<String>::new());
+
+        assert!(!st.due(None, t2));
+        assert_eq!(st.present(dp4()), dp4(), "unseen input may be play");
     }
 
     #[test]
@@ -1531,40 +1612,46 @@ mod tests {
         let dp4 = || vec!["DP-4".to_string()];
         let never = |_: Vec<String>| -> Vec<String> { panic!("DDC read while input is recent") };
         let quiet = Some(CONSOLE_QUIET_BEFORE_DDC);
+        let st = std::sync::Mutex::new(ClaimedDdc::default());
 
         assert_eq!(
-            claimed_connectors_with(dp4(), Some(std::time::Duration::from_secs(60)), never),
+            claimed_connectors_with(&st, dp4(), Some(std::time::Duration::from_secs(60)), never),
             dp4()
         );
-        assert_eq!(claimed_connectors_with(dp4(), None, never), dp4());
+        assert_eq!(claimed_connectors_with(&st, dp4(), None, never), dp4());
 
         let mut reads = 0;
-        let off = claimed_connectors_with(dp4(), quiet, |c| {
+        let off = claimed_connectors_with(&st, dp4(), quiet, |c| {
             reads += 1;
             assert_eq!(c, dp4());
             Vec::new()
         });
         assert_eq!((off, reads), (Vec::<String>::new(), 1));
-        // The next polls inside the interval keep the reading without reading again.
+        // The next polls inside the interval keep the reading without reading again,
+        // input included.
         assert_eq!(
-            claimed_connectors_with(dp4(), quiet, never),
+            claimed_connectors_with(&st, dp4(), quiet, never),
             Vec::<String>::new()
         );
-        // Input brings the connector back at once.
         assert_eq!(
-            claimed_connectors_with(dp4(), Some(std::time::Duration::ZERO), never),
-            dp4()
+            claimed_connectors_with(&st, dp4(), Some(std::time::Duration::ZERO), never),
+            Vec::<String>::new()
         );
     }
 
-    /// The monitor-power read is the agent talking to the panel over the display link; it
-    /// never happens while a desktop owns that display.
+    /// The full monitor-power read (with `ddcutil detect`) never runs while a desktop owns
+    /// the display; the quiet-console read is `claimed_connectors`.
     #[test]
-    fn ddc_is_not_read_while_a_display_is_claimed() {
+    fn the_full_ddc_read_never_runs_while_a_display_is_claimed() {
         assert!(ddc_probe_allowed(false));
         assert!(!ddc_probe_allowed(true));
+        lock_ddc(&CLAIMED_DDC).off = vec!["DP-4".to_string()];
         let claim = claim_display_with("card93", Vec::new());
         assert!(display_claimed("card93"));
+        assert!(
+            lock_ddc(&CLAIMED_DDC).off.is_empty(),
+            "an off reading outlived its claim"
+        );
         drop(claim);
         assert!(!display_claimed("card93"));
     }

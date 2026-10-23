@@ -188,6 +188,25 @@ func (s *Store) Upsert(ctx context.Context, hostID string, config map[string]any
 	return nil
 }
 
+// LiveConsoleSession returns the id of the host's live console session, or "" when it
+// has none. A console session is a play session that reserves no encode slot, the same
+// predicate as session.Coordinator.ConsoleSessionEnded; live is ConsoleSessionActive's.
+func (s *Store) LiveConsoleSession(ctx context.Context, hostID string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `
+		SELECT id::text FROM sessions
+		WHERE host_id = $1::uuid AND kind = 'play' AND reserved_encode_slots = 0
+		  AND state IN ('pending', 'assigned', 'starting', 'running', 'stopping')
+		ORDER BY created_at DESC LIMIT 1`, hostID).Scan(&id)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("query live console session: %w", err)
+	}
+	return id, nil
+}
+
 // GetCapabilities returns the host's latest reported console capabilities
 // (empty arrays if the agent has never reported / is offline).
 func (s *Store) GetCapabilities(ctx context.Context, hostID string) (Capabilities, error) {

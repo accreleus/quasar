@@ -3,6 +3,9 @@ package agentws
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -241,7 +244,7 @@ func consoleReport(t *testing.T, h *Handler, hostID, raw string) {
 	if err := json.Unmarshal([]byte(raw), &caps); err != nil {
 		t.Fatalf("decode console_capabilities: %v", err)
 	}
-	h.handleConsoleReport(context.Background(), hostID, caps)
+	h.handleConsoleReport(context.Background(), hostID, caps, true)
 }
 
 // With no disconnect grace configured, a monitor the agent read as powered off (its
@@ -313,5 +316,208 @@ func TestConsolePoweredOffMonitorBackWithinTheGraceKeepsTheSession(t *testing.T)
 	time.Sleep(grace + 500*time.Millisecond)
 	if got := stopEv.reasons(); len(got) != 0 {
 		t.Fatalf("stops = %v, want none once the monitor is back on", got)
+	}
+}
+
+// seedLiveConsoleSession inserts a running console session (play, no encode slot) on
+// hostID, as one that outlived a control-plane restart leaves it.
+func seedLiveConsoleSession(t *testing.T, h *Handler, pool *pgxpool.Pool, hostID string) string {
+	t.Helper()
+	ctx := context.Background()
+	cfg, err := h.consoleStore.Get(ctx, hostID)
+	if err != nil {
+		t.Fatalf("read console config: %v", err)
+	}
+	var userID, sessionID string
+	if err := pool.QueryRow(ctx, `INSERT INTO users(email,username,password_hash)
+		VALUES (gen_random_uuid()::text || '@test', gen_random_uuid()::text, 'x') RETURNING id::text`).Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO sessions(user_id,app_id,host_id,state,width,height,fps,bitrate_kbps)
+		VALUES ($1,$2,$3,'running',1920,1080,60,0) RETURNING id::text`,
+		userID, cfg["default_app"], hostID).Scan(&sessionID); err != nil {
+		t.Fatalf("seed live console session: %v", err)
+	}
+	return sessionID
+}
+
+// A console session that outlived a control-plane restart is adopted from the database
+// on the first report: a monitor read off then stops it after the grace.
+func TestConsolePoweredOffStopsASessionFromBeforeARestart(t *testing.T) {
+	const grace = 800 * time.Millisecond
+	h, pool, _ := selfHealHandler(t)
+	h.consoleAuto.powerOffGrace = grace
+	stopEv := &teardownEvents{active: true}
+	h.events = stopEv
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	sessionID := seedLiveConsoleSession(t, h, pool, hostID)
+
+	consoleReport(t, h, hostID, `{"connectors":[],"input_devices":[],
+		"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":true,"active_mode":null,"modes":[]}]}`)
+	deadline := time.Now().Add(grace + 3*time.Second)
+	for len(stopEv.reasons()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	stopEv.mu.Lock()
+	defer stopEv.mu.Unlock()
+	if len(stopEv.stopped) != 1 || stopEv.stopped[0] != sessionID || stopEv.stopReasons[0] != "console_display_disconnected" {
+		t.Fatalf("stops = %v %v, want %s stopped once with console_display_disconnected", stopEv.stopped, stopEv.stopReasons, sessionID)
+	}
+}
+
+// With the monitor on, a console session from before a restart is tracked, not
+// launched beside.
+func TestConsoleReportAdoptsASessionFromBeforeARestart(t *testing.T) {
+	h, pool, ev := selfHealHandler(t)
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	sessionID := seedLiveConsoleSession(t, h, pool, hostID)
+
+	consoleReport(t, h, hostID, `{"connectors":["DP-4"],"input_devices":[],
+		"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":true,"active_mode":null,"modes":[]}]}`)
+	if got := ev.count(); got != 0 {
+		t.Fatalf("launch count = %d, want 0 beside a live console session", got)
+	}
+	if got := trackedSession(h, hostID); got != sessionID {
+		t.Fatalf("tracked session = %q, want the live one %q", got, sessionID)
+	}
+}
+
+// countingEvents counts reevaluations of a tracked session (each asks whether it is
+// still active).
+type countingEvents struct {
+	teardownEvents
+	actives atomic.Int32
+}
+
+func (e *countingEvents) ConsoleSessionActive(context.Context, string) bool {
+	e.actives.Add(1)
+	return true
+}
+
+// A monitor read off and then unplugged keeps the session when the grace ends (an
+// unplug is not a stop), with no timer left and no hot loop of re-evaluations.
+func TestConsolePoweredOffThenUnpluggedLeavesNoTimerAndNoHotLoop(t *testing.T) {
+	h, pool, ev := selfHealHandler(t)
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	output := func(connected bool) string {
+		return fmt.Sprintf(`"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":%t,"active_mode":null,"modes":[]}]`, connected)
+	}
+	consoleReport(t, h, hostID, `{"connectors":["DP-4"],"input_devices":[],`+output(true)+`}`)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("launch count = %d, want 1", got)
+	}
+	cev := &countingEvents{}
+	h.events = cev
+	t.Cleanup(func() {
+		h.consoleAuto.mu.Lock()
+		h.clearConsoleAbsenceLocked(hostID)
+		h.consoleAuto.mu.Unlock()
+	})
+
+	consoleReport(t, h, hostID, `{"connectors":[],"input_devices":[],`+output(true)+`}`)
+	consoleReport(t, h, hostID, `{"connectors":[],"input_devices":[],`+output(false)+`}`)
+	before := cev.actives.Load()
+	h.consoleGraceEnded(hostID) // the power-off grace has ended
+	time.Sleep(300 * time.Millisecond)
+	if got := cev.actives.Load() - before; got > 2 {
+		t.Fatalf("%d reevaluations in 300 ms after the grace: the timer re-arms in a hot loop", got)
+	}
+	if got := cev.reasons(); len(got) != 0 {
+		t.Fatalf("stops = %v, want none for an unplugged connector", got)
+	}
+	h.consoleAuto.mu.Lock()
+	var timer *time.Timer
+	if a := h.consoleAuto.absent[hostID]; a != nil {
+		timer = a.timer
+	}
+	h.consoleAuto.mu.Unlock()
+	if timer != nil && timer.Stop() {
+		t.Fatal("a kept unplugged connector left a grace timer armed")
+	}
+}
+
+const (
+	dp4On        = `{"connectors":["DP-4"],"input_devices":[],"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":true,"active_mode":null,"modes":[]}]}`
+	dp4Off       = `{"connectors":[],"input_devices":[],"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":true,"active_mode":null,"modes":[]}]}`
+	dp4Unplugged = `{"connectors":[],"input_devices":[],"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":false,"active_mode":null,"modes":[]}]}`
+)
+
+// Unplugged time kept with no disconnect grace is not power-off time: a monitor that
+// reads off after a long unplug gets the whole powerOffGrace from that report.
+func TestConsoleUnpluggedTimeDoesNotCountTowardThePowerOffGrace(t *testing.T) {
+	const grace = 800 * time.Millisecond
+	h, pool, ev := selfHealHandler(t)
+	h.consoleAuto.powerOffGrace = grace
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	consoleReport(t, h, hostID, dp4On)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("launch count = %d, want 1", got)
+	}
+	stopEv := &teardownEvents{active: true}
+	h.events = stopEv
+
+	consoleReport(t, h, hostID, dp4Unplugged)
+	time.Sleep(grace + 300*time.Millisecond)
+	consoleReport(t, h, hostID, dp4Off)
+	if got := stopEv.reasons(); len(got) != 0 {
+		t.Fatalf("stops = %v on the first off report after an unplug longer than the grace", got)
+	}
+	time.Sleep(grace / 2)
+	if got := stopEv.reasons(); len(got) != 0 {
+		t.Fatalf("stops = %v before a fresh grace ended", got)
+	}
+	deadline := time.Now().Add(grace + 3*time.Second)
+	for len(stopEv.reasons()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if got := stopEv.reasons(); len(got) != 1 || got[0] != "console_display_disconnected" {
+		t.Fatalf("stops = %v, want one console_display_disconnected after a fresh grace", got)
+	}
+}
+
+// A connection's first report can precede the agent's console configuration, when it
+// lists no connectors with the output connected. That never reads as a monitor off; the
+// report the agent re-sends after config_update does. Fed in the agent's connect order
+// (register, capacity, then capacity again after config_update) through processCapacity.
+func TestConsoleFirstReportOfAConnectionIsNeverAMonitorOff(t *testing.T) {
+	const grace = 500 * time.Millisecond
+	h, pool, ev := selfHealHandler(t)
+	h.consoleAuto.powerOffGrace = grace
+	h.registry = NewRegistry(slog.Default())
+	h.store = &agentStore{pool: pool, isAgentConnected: h.registry.IsConnected}
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	capacity := func(ac *conn, raw string) {
+		t.Helper()
+		var caps console.Capabilities
+		if err := json.Unmarshal([]byte(raw), &caps); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.processCapacity(context.Background(), ac, capacityRaw(t, CapacityMsg{ConsoleCapabilities: &caps})); err != nil {
+			t.Fatalf("process capacity: %v", err)
+		}
+	}
+	first := &conn{hostID: hostID}
+	capacity(first, dp4On)
+	capacity(first, dp4On)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("launch count = %d, want 1", got)
+	}
+	stopEv := &teardownEvents{active: true}
+	h.events = stopEv
+
+	// The agent restarted: its first report on the new connection is pre-config.
+	second := &conn{hostID: hostID}
+	capacity(second, dp4Off)
+	time.Sleep(grace + 400*time.Millisecond)
+	if got := stopEv.reasons(); len(got) != 0 {
+		t.Fatalf("stops = %v, want none from a report made before the agent had its config", got)
+	}
+	capacity(second, dp4Off)
+	deadline := time.Now().Add(grace + 3*time.Second)
+	for len(stopEv.reasons()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if got := stopEv.reasons(); len(got) != 1 || got[0] != "console_display_disconnected" {
+		t.Fatalf("stops = %v, want one console_display_disconnected once the agent has its config", got)
 	}
 }
