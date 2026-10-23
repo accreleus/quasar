@@ -390,6 +390,7 @@ impl Helper {
                     appid,
                     ok: true,
                     cloud_synced: synced,
+                    cloud_sync_started: end.is_some(),
                 });
                 self.quit = None;
             }
@@ -399,6 +400,7 @@ impl Helper {
                     appid,
                     ok: false,
                     cloud_synced: false,
+                    cloud_sync_started: true,
                 });
                 self.quit = None;
             }
@@ -435,6 +437,7 @@ enum Done {
         appid: u32,
         ok: bool,
         cloud_synced: bool,
+        cloud_sync_started: bool,
     },
 }
 
@@ -466,6 +469,10 @@ enum Wire {
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         cloud_synced: Option<bool>,
+        /// Sent only as `false` (no exit sync started): an agent that predates it rejects the
+        /// line and waits out its bound, as it did before.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cloud_sync_started: Option<bool>,
     },
 }
 
@@ -485,14 +492,21 @@ fn line(report: Report) -> (usize, String) {
 }
 
 fn done_line(done: Done) -> String {
-    let (command, appid, ok, cloud_synced) = match done {
-        Done::Launch { appid, ok } => ("launch", Some(appid), ok, None),
-        Done::BigPicture { ok } => ("bigpicture", None, ok, None),
+    let (command, appid, ok, cloud_synced, cloud_sync_started) = match done {
+        Done::Launch { appid, ok } => ("launch", Some(appid), ok, None, None),
+        Done::BigPicture { ok } => ("bigpicture", None, ok, None, None),
         Done::Quit {
             appid,
             ok,
             cloud_synced,
-        } => ("quit", Some(appid), ok, Some(cloud_synced)),
+            cloud_sync_started,
+        } => (
+            "quit",
+            Some(appid),
+            ok,
+            Some(cloud_synced),
+            (!cloud_sync_started).then_some(false),
+        ),
     };
     to_line(&Wire::CommandDone {
         v: 1,
@@ -500,6 +514,7 @@ fn done_line(done: Done) -> String {
         appid,
         ok,
         cloud_synced,
+        cloud_sync_started,
     })
 }
 
@@ -1102,8 +1117,12 @@ mod tests {
             "{\"type\":\"command_done\",\"v\":1,\"command\":\"bigpicture\",\"ok\":false}\n"
         );
         assert_eq!(
-            done_line(Done::Quit { appid: 620, ok: true, cloud_synced: false }),
+            done_line(Done::Quit { appid: 620, ok: true, cloud_synced: false, cloud_sync_started: true }),
             "{\"type\":\"command_done\",\"v\":1,\"command\":\"quit\",\"appid\":620,\"ok\":true,\"cloud_synced\":false}\n"
+        );
+        assert_eq!(
+            done_line(Done::Quit { appid: 620, ok: true, cloud_synced: false, cloud_sync_started: false }),
+            "{\"type\":\"command_done\",\"v\":1,\"command\":\"quit\",\"appid\":620,\"ok\":true,\"cloud_synced\":false,\"cloud_sync_started\":false}\n"
         );
     }
 
@@ -1192,6 +1211,7 @@ mod tests {
             appid: 620,
             ok: true,
             cloud_synced: true,
+            cloud_sync_started: true,
         });
         agent.forget_game();
         assert!(agent.latest[..COMMAND_DONE].iter().all(Option::is_none));

@@ -4,7 +4,7 @@
 use quasar_launch_watch::{
     game_running, game_tree, parse_command, CloudEnd, CloudSync, Command, NeedsUser, Quit,
     QuitAction, Report, WatchConfig, Watcher, WindowInfo, Windows, QUIT_CLOSE_GRACE,
-    QUIT_CLOUD_WAIT, QUIT_KILL_GRACE, QUIT_TERM_GRACE,
+    QUIT_CLOUD_WAIT, QUIT_KILL_GRACE, QUIT_SYNC_START_GRACE, QUIT_TERM_GRACE,
 };
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -447,7 +447,55 @@ fn a_sync_that_never_ends_is_waited_for_sixty_seconds() {
     );
     assert_eq!(
         quit.poll(t0 + QUIT_CLOUD_WAIT),
-        Some(QuitAction::Done(None))
+        Some(QuitAction::Done(Some(CloudEnd::Unfinished)))
+    );
+}
+
+#[test]
+fn a_game_with_no_exit_sync_is_done_at_the_start_grace() {
+    let d = dirs();
+    reaper(&d.proc_root, 20);
+    let t0 = Instant::now();
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
+    gone(&d.proc_root, 20);
+    assert_eq!(quit.poll(t0), None);
+    // Another app's sync is not this game's.
+    append(
+        &d.logs.join("cloud_log.txt"),
+        &cloud_line(241100, "Starting sync (up,AC Exit,)"),
+    );
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE - Duration::from_millis(1)),
+        None
+    );
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE),
+        Some(QuitAction::Done(None)),
+        "no sync started"
+    );
+    assert_eq!(quit.poll(t0 + QUIT_CLOUD_WAIT), None, "once");
+}
+
+#[test]
+fn a_sync_started_inside_the_grace_is_waited_for_past_it() {
+    let d = dirs();
+    reaper(&d.proc_root, 20);
+    let log = d.logs.join("cloud_log.txt");
+    let t0 = Instant::now();
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
+    gone(&d.proc_root, 20);
+    assert_eq!(quit.poll(t0), None);
+    append(&log, &cloud_line(APPID, "Starting sync (up,AC Exit,)"));
+    assert_eq!(quit.poll(t0 + Duration::from_secs(1)), None);
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE * 3),
+        None,
+        "a started sync is not cut at the grace"
+    );
+    append(&log, &cloud_line(APPID, "Upload complete, result OK"));
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE * 3 + Duration::from_secs(1)),
+        Some(QuitAction::Done(Some(CloudEnd::Uploaded("OK".into()))))
     );
 }
 

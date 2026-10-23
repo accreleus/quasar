@@ -912,6 +912,8 @@ pub enum CloudEnd {
     NothingToUpload,
     /// `Upload complete, result <word>`: `OK`, or the failure word.
     Uploaded(String),
+    /// Started, with no end within [`QUIT_CLOUD_WAIT`]. Only a [`Quit`] reports this.
+    Unfinished,
 }
 
 /// Steam's exit cloud sync for one app in `cloud_log.txt`, read from where the log stood
@@ -1032,8 +1034,8 @@ fn read_ppid(path: &Path) -> Option<u32> {
 
 /// Quitting a game the way a player would (#759): `WM_DELETE_WINDOW` first, then SIGTERM to
 /// its process tree 20 s later, then SIGKILL 10 s after that, then Steam's exit cloud sync
-/// for it, up to 60 s. Pure apart from the `/proc` and log reads: the caller does the X call
-/// and the signals this hands back.
+/// for it, up to 60 s once it has started. Pure apart from the `/proc` and log reads: the
+/// caller does the X call and the signals this hands back.
 pub struct Quit {
     appid: u32,
     proc_root: PathBuf,
@@ -1057,7 +1059,7 @@ enum QuitStep {
 pub enum QuitAction {
     Terminate(Vec<u32>),
     Kill(Vec<u32>),
-    /// The game is gone; whether its exit sync was seen to end, and how.
+    /// The game is gone; how its exit sync ended, or `None` when none started.
     Done(Option<CloudEnd>),
     /// The game outlived SIGKILL.
     Failed,
@@ -1068,6 +1070,9 @@ pub const QUIT_TERM_GRACE: Duration = Duration::from_secs(10);
 /// After SIGKILL the reaper should be gone within a pass or two.
 pub const QUIT_KILL_GRACE: Duration = Duration::from_secs(3);
 pub const QUIT_CLOUD_WAIT: Duration = Duration::from_secs(60);
+/// No `Starting sync (up,AC Exit,)` this long after the exit means no sync is coming (cloud
+/// off). The #759 spike measured it at 0-0.05 s after the reaper went, over six quits.
+pub const QUIT_SYNC_START_GRACE: Duration = Duration::from_secs(5);
 
 impl Quit {
     /// Made right after the close request went out, so the cloud log is read from then.
@@ -1122,12 +1127,14 @@ impl Quit {
                 }
             }
             QuitStep::Syncing(at) => {
-                let end = self.cloud.poll();
-                if end.is_some() || since(at) >= QUIT_CLOUD_WAIT {
-                    self.step = QuitStep::Over;
-                    return Some(QuitAction::Done(end));
-                }
-                None
+                let end = match self.cloud.poll() {
+                    Some(end) => Some(end),
+                    None if !self.cloud.started && since(at) >= QUIT_SYNC_START_GRACE => None,
+                    None if since(at) >= QUIT_CLOUD_WAIT => Some(CloudEnd::Unfinished),
+                    None => return None,
+                };
+                self.step = QuitStep::Over;
+                Some(QuitAction::Done(end))
             }
             QuitStep::Over => None,
         }
