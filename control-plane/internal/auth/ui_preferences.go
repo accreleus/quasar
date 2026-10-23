@@ -180,36 +180,28 @@ func (s *store) PatchUIPreferences(ctx context.Context, userID string, patch map
 		}
 	}
 
-	current, err := s.getUIPreferencesRaw(ctx, userID)
-	if err != nil {
-		return UIPreferences{}, err
-	}
-	for k, v := range patch {
-		// One level deep: a known object surface merges field-by-field, anything
-		// else replaces. Only session_overlay is a merge surface today.
-		if k == "session_overlay" {
-			existing, _ := current[k].(map[string]any)
-			if existing == nil {
-				existing = map[string]any{}
-			}
-			maps.Copy(existing, v.(map[string]any))
-			current[k] = existing
-			continue
-		}
-		current[k] = v
-	}
-
-	buf, err := json.Marshal(current)
+	buf, err := json.Marshal(patch)
 	if err != nil {
 		return UIPreferences{}, fmt.Errorf("encode ui preferences: %w", err)
 	}
+	// The merge runs in the database, in one statement, so two overlapping
+	// PATCHes serialise on the row lock and neither can overwrite the other's
+	// keys (#716). One level deep: top-level patch keys replace; session_overlay
+	// merges field-by-field onto the stored object (a missing or non-object
+	// stored value counts as empty).
 	var stored []byte
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO user_ui_preferences (user_id, session_overlay)
+		INSERT INTO user_ui_preferences AS u (user_id, session_overlay)
 		VALUES ($1::uuid, $2::jsonb)
 		ON CONFLICT (user_id) DO UPDATE
-		SET session_overlay = EXCLUDED.session_overlay
-		RETURNING session_overlay
+		SET session_overlay = (u.session_overlay || $2::jsonb) || CASE
+			WHEN $2::jsonb -> 'session_overlay' IS NOT NULL THEN jsonb_build_object(
+				'session_overlay',
+				CASE WHEN jsonb_typeof(u.session_overlay -> 'session_overlay') = 'object'
+					THEN u.session_overlay -> 'session_overlay' ELSE '{}'::jsonb END
+				|| ($2::jsonb -> 'session_overlay'))
+			ELSE '{}'::jsonb END
+		RETURNING u.session_overlay
 	`, userID, buf).Scan(&stored)
 	if err != nil {
 		return UIPreferences{}, fmt.Errorf("update ui preferences: %w", err)

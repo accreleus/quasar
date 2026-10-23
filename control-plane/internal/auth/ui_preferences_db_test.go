@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -177,5 +178,51 @@ func TestUIPreferencesExtraRoundTripsThroughExportedAPI(t *testing.T) {
 	}
 	if _, nested := doc["extra"]; nested {
 		t.Fatalf("unknown key must not be nested under an \"extra\" wrapper: %s", buf)
+	}
+}
+
+// TestUIPreferencesConcurrentPatchesKeepBothKeys covers #716: two overlapping
+// PATCHes touching different keys must both survive. The merge used to be a
+// read-modify-write in Go, so the later write erased the earlier one's key.
+func TestUIPreferencesConcurrentPatchesKeepBothKeys(t *testing.T) {
+	pool := testDB(t)
+	s := &store{pool: pool}
+	ctx := context.Background()
+	userID := seedUIPrefsUser(t, s, "ui-race@example.com", "uirace")
+
+	for i := range 200 {
+		if _, err := pool.Exec(ctx, `DELETE FROM user_ui_preferences WHERE user_id = $1::uuid`, userID); err != nil {
+			t.Fatalf("reset: %v", err)
+		}
+		patches := []map[string]any{
+			{"session_overlay": map[string]any{"strip_position": "top"}},
+			{"session_overlay": map[string]any{"strip_auto_hide": "never_visible"}},
+			{"library_density": "compact"},
+			{"classic_layout": true},
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for _, p := range patches {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if _, err := s.PatchUIPreferences(ctx, userID, p); err != nil {
+					t.Errorf("PatchUIPreferences: %v", err)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		raw, err := s.getUIPreferencesRaw(ctx, userID)
+		if err != nil {
+			t.Fatalf("getUIPreferencesRaw: %v", err)
+		}
+		overlay, _ := raw["session_overlay"].(map[string]any)
+		if overlay["strip_position"] != "top" || overlay["strip_auto_hide"] != "never_visible" ||
+			raw["library_density"] != "compact" || raw["classic_layout"] != true {
+			t.Fatalf("iteration %d lost a key: %v", i, raw)
+		}
 	}
 }
