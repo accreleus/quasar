@@ -312,13 +312,18 @@ export function useLaunch({
               variant: presented.variant,
               title: presented.title,
               body: presented.body,
-              duration: presented.sessionId ? 10000 : undefined,
+              duration: presented.sessionId || presented.openApp ? 10000 : undefined,
               action: presented.sessionId
                 ? {
                     label: "Go to session",
                     onClick: () => navigate(`/app/session/${presented.sessionId}`),
                   }
-                : undefined,
+                : presented.openApp
+                  ? {
+                      label: `Open ${presented.openApp.name}`,
+                      onClick: () => navigate(`/app/game/${presented.openApp!.id}`),
+                    }
+                  : undefined,
             });
           } else {
             addToast({ variant: "danger", title: "Launch failed", body: "Launch failed." });
