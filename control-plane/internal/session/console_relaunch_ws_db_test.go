@@ -85,11 +85,15 @@ func TestConsoleRelaunchFollowsTheHomeProofOnTheSameSocket(t *testing.T) {
 		"enabled": true, "auto_start_on_display": true, "default_app": appID, "default_user": userID,
 	}, nil))
 
-	must(t, ws.WriteJSON(map[string]any{
-		"type": "capacity", "host": map[string]any{"cpu_cores": 8, "mem_mb": 32000},
-		"gpus":                 []map[string]any{{"index": 0, "vendor": "nvidia", "model": "test", "vram_mb_total": 16384, "encode_slots_total": 2}},
-		"console_capabilities": map[string]any{"connectors": []string{"DP-1"}, "input_devices": []any{}},
-	}))
+	// The handshake capacity, then the one the agent re-sends after config_update: a
+	// connection's first console report is ignored.
+	for range 2 {
+		must(t, ws.WriteJSON(map[string]any{
+			"type": "capacity", "host": map[string]any{"cpu_cores": 8, "mem_mb": 32000},
+			"gpus":                 []map[string]any{{"index": 0, "vendor": "nvidia", "model": "test", "vram_mb_total": 16384, "encode_slots_total": 2}},
+			"console_capabilities": map[string]any{"connectors": []string{"DP-1"}, "input_devices": []any{}},
+		}))
+	}
 
 	// The control plane asks the agent to prove the held session's cleanup.
 	for {
@@ -99,7 +103,7 @@ func TestConsoleRelaunchFollowsTheHomeProofOnTheSameSocket(t *testing.T) {
 		}
 	}
 	if !logs.contains(ErrConsoleHomeSettling.Error()) {
-		t.Fatal("the handshake capacity's auto-start was not refused as a settling hold")
+		t.Fatal("the capacity's auto-start was not refused as a settling hold")
 	}
 	if n := otherSessions(t, pool, userID, holder); n != 0 {
 		t.Fatalf("%d session(s) launched over the held home", n)

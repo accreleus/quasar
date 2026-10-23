@@ -68,6 +68,7 @@ type conn struct {
 	terminalHomeCleanupV1     bool
 	parkedSessionsV1          bool
 	policyTyped               bool
+	consoleReports            atomic.Int32 // capacity reports carrying console_capabilities
 	policyIdle                bool
 	policyAccepted            []string
 	policyAcknowledged        atomic.Bool
