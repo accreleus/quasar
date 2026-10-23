@@ -230,6 +230,17 @@ fn ensure_i2c_nodes() {
 /// connector with power `On` or `Unknown` is kept. No-op (identity) when gating
 /// is disabled, `ddcutil` is unavailable, or the input is empty.
 pub(crate) fn powered_connectors(connected: Vec<String>) -> Vec<String> {
+    powered(connected, true)
+}
+
+/// [`powered_connectors`] without `ddcutil detect`, which probes every bus: only the
+/// connectors whose bus is already mapped are read, the rest count as powered. For a
+/// read while a console desktop owns the display.
+pub(crate) fn powered_connectors_on_known_bus(connected: Vec<String>) -> Vec<String> {
+    powered(connected, false)
+}
+
+fn powered(connected: Vec<String>, detect: bool) -> Vec<String> {
     // Before the first config_update the agent does not know whether to read the
     // monitor's power, and an unread monitor must not look on: a report made then
     // started console mode on a switched-off monitor after an agent restart.
@@ -279,7 +290,7 @@ pub(crate) fn powered_connectors(connected: Vec<String>) -> Vec<String> {
                     .map(|(p, _)| (conn.clone(), *p))
             })
             .collect();
-        (stale || missing, fresh)
+        (detect && (stale || missing), fresh)
     };
 
     // Phase 2 (unlocked): the `ddcutil detect` fork.

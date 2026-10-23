@@ -2,6 +2,7 @@ package agentws
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -229,5 +230,88 @@ func TestConsoleDisableMidGraceStopsOnceForDisable(t *testing.T) {
 	time.Sleep(700 * time.Millisecond)
 	if got := stopEv.reasons(); len(got) != 1 || got[0] != "console_disabled" {
 		t.Fatalf("stops = %v, want exactly one console_disabled (the grace timer must be disarmed)", got)
+	}
+}
+
+// consoleReport decodes a console_capabilities object in the agent's wire shape and feeds
+// it through the capacity path's console entry.
+func consoleReport(t *testing.T, h *Handler, hostID, raw string) {
+	t.Helper()
+	var caps console.Capabilities
+	if err := json.Unmarshal([]byte(raw), &caps); err != nil {
+		t.Fatalf("decode console_capabilities: %v", err)
+	}
+	h.handleConsoleReport(context.Background(), hostID, caps)
+}
+
+// With no disconnect grace configured, a monitor the agent read as powered off (its
+// output still connected, its connector gone from `connectors`) stops the session once
+// powerOffGrace has passed. An unplugged connector (output disconnected) is still kept.
+func TestConsolePoweredOffMonitorStopsTheSessionByDefault(t *testing.T) {
+	const grace = 1500 * time.Millisecond
+	const on = `{"connectors":["DP-4"],"input_devices":[],
+		"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":true,"active_mode":null,"modes":[]}]}`
+	const off = `{"connectors":[],"input_devices":[],
+		"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":true,"active_mode":null,"modes":[]}]}`
+	const unplugged = `{"connectors":[],"input_devices":[],
+		"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":false,"active_mode":null,"modes":[]}]}`
+
+	for _, pin := range []string{"card0:DP-4", ""} {
+		h, pool, ev := selfHealHandler(t)
+		h.consoleAuto.powerOffGrace = grace
+		var hostID string
+		if pin == "" {
+			hostID = seedEligibleConsoleHost(t, h, pool)
+		} else {
+			hostID = seedEligibleConsolePinnedHost(t, h, pool, pin)
+		}
+		consoleReport(t, h, hostID, on)
+		if got := ev.count(); got != 1 {
+			t.Fatalf("pin %q: launch count = %d, want 1", pin, got)
+		}
+		stopEv := &teardownEvents{active: true}
+		h.events = stopEv
+
+		consoleReport(t, h, hostID, unplugged)
+		time.Sleep(grace + 500*time.Millisecond)
+		if got := stopEv.reasons(); len(got) != 0 {
+			t.Fatalf("pin %q: stops = %v, want none for an unplugged connector", pin, got)
+		}
+		consoleReport(t, h, hostID, on)
+
+		consoleReport(t, h, hostID, off)
+		time.Sleep(grace / 2)
+		if got := stopEv.reasons(); len(got) != 0 {
+			t.Fatalf("pin %q: stops = %v before the grace ended", pin, got)
+		}
+		deadline := time.Now().Add(grace + 3*time.Second)
+		for len(stopEv.reasons()) == 0 && time.Now().Before(deadline) {
+			time.Sleep(25 * time.Millisecond)
+		}
+		if got := stopEv.reasons(); len(got) != 1 || got[0] != "console_display_disconnected" {
+			t.Fatalf("pin %q: stops = %v, want one console_display_disconnected after the grace", pin, got)
+		}
+	}
+}
+
+// A monitor read off and then on again within the grace (the user is back) keeps the
+// session and disarms the timer.
+func TestConsolePoweredOffMonitorBackWithinTheGraceKeepsTheSession(t *testing.T) {
+	const grace = 800 * time.Millisecond
+	h, pool, ev := selfHealHandler(t)
+	h.consoleAuto.powerOffGrace = grace
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	output := `"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":true,"active_mode":null,"modes":[]}]`
+	consoleReport(t, h, hostID, `{"connectors":["DP-4"],"input_devices":[],`+output+`}`)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("launch count = %d, want 1", got)
+	}
+	stopEv := &teardownEvents{active: true}
+	h.events = stopEv
+	consoleReport(t, h, hostID, `{"connectors":[],"input_devices":[],`+output+`}`)
+	consoleReport(t, h, hostID, `{"connectors":["DP-4"],"input_devices":[],`+output+`}`)
+	time.Sleep(grace + 500*time.Millisecond)
+	if got := stopEv.reasons(); len(got) != 0 {
+		t.Fatalf("stops = %v, want none once the monitor is back on", got)
 	}
 }
