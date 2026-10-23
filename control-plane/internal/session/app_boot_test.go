@@ -70,6 +70,45 @@ func TestAppBootDetailPassesThroughGenZero(t *testing.T) {
 	}
 }
 
+// TestAppBootIsTheFirstRunningReport replays the agent's first report for a fresh app
+// launch (#749): `starting`, then `running` with detail "app booting" and no plain
+// `running` before it. The session must reach running with that detail and a start time.
+func TestAppBootIsTheFirstRunningReport(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	res, err := coord.Launch(ctx, s.userID, s.appID, StreamOverride{})
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	waitFor(t, func() bool { return len(disp.types()) == 2 })
+	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: res.Session.ID, State: "starting"})
+	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{
+		SessionID: res.Session.ID, State: "running", Detail: appDetailBooting,
+	})
+
+	got, err := store.Get(ctx, res.Session.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.State != StateRunning {
+		t.Fatalf("state: %s want running", got.State)
+	}
+	if got.StateDetail == nil || *got.StateDetail != appDetailBooting {
+		t.Fatalf("state_detail: got %v want %q", got.StateDetail, appDetailBooting)
+	}
+	if got.StartedAt == nil {
+		t.Fatal("started_at not set by the first running report")
+	}
+	if got.AppID != res.Session.AppID {
+		t.Fatalf("app_id moved: %s -> %s", res.Session.AppID, got.AppID)
+	}
+}
+
 // TestAppPresentedNotMistakenForSwapCommit: the load-bearing assertion the
 // design demands. While a swap IS pending (the only state in which
 // handleSwapCallback's switch is even reached), an "app presented" detail
