@@ -139,7 +139,7 @@ export const ADMIN_SETTINGS: readonly SettingEntry[] = [
   page("library", "apps", "Apps", "Library", "/admin/library/apps", "library", "games catalog catalogue titles enable disable artwork"),
   page("library", "presets", "Runtime presets", "Library", "/admin/library/presets", "library", "runtime preset proton wine environment"),
   page("library", "images", "Images", "Library", "/admin/library/images", "image", "container docker image build failed"),
-  page("library", "sources", "Sources", "Library", "/admin/library/sources", "library", "steam provider import discovered library sources warm preparation"),
+  page("library", "sources", "Sources", "Library", "/admin/library/sources", "library", "steam provider import discovered library sources warm hot loading preparation"),
   page("streaming", "launch", "Launch profiles", "Streaming", "/admin/streaming/launch", "streaming", "resolution 4k 2160p 1440p 1080p 720p fps 60 120 quality default ladder rung"),
   page("streaming", "profiles", "Stream profiles", "Streaming", "/admin/streaming/profiles", "streaming", "bitrate codec h264 hevc h265 av1 abr encoder quality"),
   page("people", "users", "Users", "People", "/admin/people/users", "people", "accounts people admins roles members"),
