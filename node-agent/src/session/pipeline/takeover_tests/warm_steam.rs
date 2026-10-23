@@ -427,8 +427,15 @@ fn a_stop_with_the_game_running_quits_it_and_waits_for_its_cloud_sync() {
     session.stop.store(true, Ordering::SeqCst);
     assert_eq!(helper.command(&mut session, &mut a), "quit 620");
     session.pump(&mut a, Duration::from_secs(1), |s, _| s.ended.is_some());
-    assert!(session.ended.is_none(), "ended before the sync: {:?}", session.ended);
-    assert!(session.log.iter().any(|e| matches!(e, SessionEvent::Stopping)));
+    assert!(
+        session.ended.is_none(),
+        "ended before the sync: {:?}",
+        session.ended
+    );
+    assert!(session
+        .log
+        .iter()
+        .any(|e| matches!(e, SessionEvent::Stopping)));
     helper.launch_state("game_exited");
     helper.say(
         r#"{"type":"command_done","v":1,"command":"quit","appid":620,"ok":true,"cloud_synced":true}"#,
@@ -436,7 +443,10 @@ fn a_stop_with_the_game_running_quits_it_and_waits_for_its_cloud_sync() {
     let ended = session.pump(&mut a, Duration::from_secs(20), |s, _| s.ended.is_some());
     assert!(ended, "the runner never ended after the sync");
     assert!(
-        matches!(session.ended, Some(SessionEvent::Stopped { detail: None, .. })),
+        matches!(
+            session.ended,
+            Some(SessionEvent::Stopped { detail: None, .. })
+        ),
         "a user stop, not a game exit: {:?}",
         session.ended
     );

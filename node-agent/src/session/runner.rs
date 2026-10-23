@@ -872,14 +872,14 @@ fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
         }
         EndQuit::Done {
             appid, ok: true, ..
-        } => (appid, "quit, but no end of its cloud sync was seen".to_string()),
+        } => (
+            appid,
+            "quit, but no end of its cloud sync was seen".to_string(),
+        ),
         EndQuit::Done { appid, .. } => (appid, "would not quit".to_string()),
         EndQuit::TimedOut { appid } => (
             appid,
-            format!(
-                "did not quit and sync within {}s",
-                END_QUIT_BOUND.as_secs()
-            ),
+            format!("did not quit and sync within {}s", END_QUIT_BOUND.as_secs()),
         ),
     };
     tracing::warn!(

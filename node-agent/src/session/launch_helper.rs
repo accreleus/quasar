@@ -1906,6 +1906,8 @@ mod tests {
         let (s, mut helper) = running_620();
         let answer = std::thread::spawn(move || {
             let command = read_line(&mut helper);
+            // A keepalive, as the real helper sends, so the reader's IDLE close cannot win.
+            helper.write_all(b"\n").unwrap();
             std::thread::sleep(Duration::from_millis(500));
             helper
                 .write_all(b"{\"type\":\"command_done\",\"v\":1,\"command\":\"quit\",\"appid\":620,\"ok\":true,\"cloud_synced\":true}\n")
@@ -1937,7 +1939,10 @@ mod tests {
             EndQuit::TimedOut { appid: 620 }
         );
         let waited = started.elapsed();
-        assert!(waited >= bound && waited < bound + Duration::from_secs(1), "{waited:?}");
+        assert!(
+            waited >= bound && waited < bound + Duration::from_secs(1),
+            "{waited:?}"
+        );
     }
 
     #[test]
@@ -1947,7 +1952,10 @@ mod tests {
             let started = Instant::now();
             assert_eq!(s.socket().quit_running_game(bound), EndQuit::NoGame);
             assert!(started.elapsed() < POLL, "no wait");
-            assert!(s.socket().mount.shared.state().outbox.is_empty(), "no quit queued");
+            assert!(
+                s.socket().mount.shared.state().outbox.is_empty(),
+                "no quit queued"
+            );
         };
         // The helper never connected; a parked Steam with no game.
         quick(&Session::open(620));
