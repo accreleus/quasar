@@ -336,6 +336,28 @@ describe("SessionPage — a session that is over for this page releases the mic 
     expect(screen.queryByText("Recovering connection")).toBeNull();
   });
 
+  // #748: the stall fires first, the end-reason read lands a few ms later; the banner must
+  // never paint in between. Real order: `stopping` row, then `bye`; the stall races both.
+  it("game exit: a stall just before the end read paints no banner", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "reconnecting", message: "Reconnecting (1/3)…" }));
+    await advance(30);
+    expect(screen.queryByText("Recovering connection")).toBeNull();
+    await advance(1_000);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Recovering connection")).toBeNull();
+  });
+
+  it("a real stall still shows the banner, after the grace", async () => {
+    await streamingWithMicAndCapture();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "reconnecting", message: "Reconnecting (1/3)…" }));
+    await advance(100);
+    expect(screen.queryByText("Recovering connection")).toBeNull();
+    await advance(600);
+    expect(screen.getByText("Recovering connection")).not.toBeNull();
+  });
+
   it("game exited before the reveal: an earlier stopping read does not hold the loader's card", async () => {
     currentSession = makeSession({ state_detail: "app booting" });
     renderPage();
