@@ -226,3 +226,98 @@ func TestUIPreferencesConcurrentPatchesKeepBothKeys(t *testing.T) {
 		}
 	}
 }
+
+// storedUIPrefsType reads the stored document's jsonb type straight from the
+// table, so a test sees an array even when Go would fail to decode it.
+func storedUIPrefsType(t *testing.T, s *store, userID string) string {
+	t.Helper()
+	var typ string
+	if err := s.pool.QueryRow(context.Background(),
+		`SELECT jsonb_typeof(session_overlay) FROM user_ui_preferences WHERE user_id = $1::uuid`,
+		userID).Scan(&typ); err != nil {
+		t.Fatalf("read stored type: %v", err)
+	}
+	return typ
+}
+
+// TestUIPreferencesNilPatchIsNoOp: a PATCH body of literal `null` decodes to a
+// nil map. It must leave the stored object alone and not poison later writes
+// (jsonb `||` would otherwise array-wrap the null).
+func TestUIPreferencesNilPatchIsNoOp(t *testing.T) {
+	pool := testDB(t)
+	s := &store{pool: pool}
+	ctx := context.Background()
+
+	t.Run("existing row", func(t *testing.T) {
+		userID := seedUIPrefsUser(t, s, "ui-nil-row@example.com", "uinilrow")
+		if _, err := s.PatchUIPreferences(ctx, userID, map[string]any{"library_density": "compact"}); err != nil {
+			t.Fatalf("seed patch: %v", err)
+		}
+		got, err := s.PatchUIPreferences(ctx, userID, nil)
+		if err != nil {
+			t.Fatalf("nil patch: %v", err)
+		}
+		if got.Extra["library_density"] != "compact" {
+			t.Fatalf("nil patch returned %v, want the stored keys", got.Extra)
+		}
+		raw, err := s.getUIPreferencesRaw(ctx, userID)
+		if err != nil || raw["library_density"] != "compact" {
+			t.Fatalf("re-read after nil patch = %v, %v", raw, err)
+		}
+		got, err = s.PatchUIPreferences(ctx, userID, map[string]any{"classic_layout": true})
+		if err != nil {
+			t.Fatalf("patch after nil patch: %v", err)
+		}
+		if got.Extra["library_density"] != "compact" || got.Extra["classic_layout"] != true {
+			t.Fatalf("later patch did not merge: %v", got.Extra)
+		}
+	})
+
+	t.Run("no row", func(t *testing.T) {
+		userID := seedUIPrefsUser(t, s, "ui-nil-none@example.com", "uinilnone")
+		if _, err := s.PatchUIPreferences(ctx, userID, nil); err != nil {
+			t.Fatalf("nil patch, no row: %v", err)
+		}
+		if typ := storedUIPrefsType(t, s, userID); typ != "object" {
+			t.Fatalf("stored type after nil patch = %s, want object", typ)
+		}
+		got, err := s.PatchUIPreferences(ctx, userID, map[string]any{"classic_layout": true})
+		if err != nil || got.Extra["classic_layout"] != true {
+			t.Fatalf("later patch = %v, %v", got.Extra, err)
+		}
+	})
+}
+
+// TestUIPreferencesNonObjectStoredRowBecomesObject: the stored document is
+// always a JSON object. A legacy scalar/array/null row is treated as {} and
+// merged with the patch, never array-wrapped by jsonb `||`.
+func TestUIPreferencesNonObjectStoredRowBecomesObject(t *testing.T) {
+	pool := testDB(t)
+	s := &store{pool: pool}
+	ctx := context.Background()
+
+	for i, legacy := range []string{`'"legacy"'`, `'[1]'`, `'null'`} {
+		t.Run(legacy, func(t *testing.T) {
+			n := string(rune('a' + i))
+			userID := seedUIPrefsUser(t, s, "ui-legacy-"+n+"@example.com", "uilegacy"+n)
+			if _, err := pool.Exec(ctx,
+				`INSERT INTO user_ui_preferences (user_id, session_overlay) VALUES ($1::uuid, `+legacy+`::jsonb)`,
+				userID); err != nil {
+				t.Fatalf("seed legacy row: %v", err)
+			}
+			got, err := s.PatchUIPreferences(ctx, userID, map[string]any{
+				"classic_layout":  true,
+				"session_overlay": map[string]any{"strip_position": "top"},
+			})
+			if err != nil {
+				t.Fatalf("patch over %s: %v", legacy, err)
+			}
+			if typ := storedUIPrefsType(t, s, userID); typ != "object" {
+				t.Fatalf("stored type = %s, want object", typ)
+			}
+			if got.Extra["classic_layout"] != true || got.SessionOverlay["strip_position"] != "top" {
+				t.Fatalf("patch not applied: extra=%v overlay=%v", got.Extra, got.SessionOverlay)
+			}
+		})
+	}
+}
