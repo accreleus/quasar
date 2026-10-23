@@ -188,14 +188,19 @@ func (s *Store) Upsert(ctx context.Context, hostID string, config map[string]any
 	return nil
 }
 
+// SessionSQL selects the sessions rows that are console sessions: a play session that
+// reserves no encode slot and was minted no signaling token. A streamed launch always
+// mints one, and a streamed row from before migration 0106 can still reserve 0 slots.
+// Shared with session.Coordinator.ConsoleSessionEnded.
+const SessionSQL = `(kind = 'play' AND reserved_encode_slots = 0 AND signaling_token_hash IS NULL)`
+
 // LiveConsoleSession returns the id of the host's live console session, or "" when it
-// has none. A console session is a play session that reserves no encode slot, the same
-// predicate as session.Coordinator.ConsoleSessionEnded; live is ConsoleSessionActive's.
+// has none. Live is session.Coordinator.ConsoleSessionActive's set.
 func (s *Store) LiveConsoleSession(ctx context.Context, hostID string) (string, error) {
 	var id string
 	err := s.pool.QueryRow(ctx, `
 		SELECT id::text FROM sessions
-		WHERE host_id = $1::uuid AND kind = 'play' AND reserved_encode_slots = 0
+		WHERE host_id = $1::uuid AND `+SessionSQL+`
 		  AND state IN ('pending', 'assigned', 'starting', 'running', 'stopping')
 		ORDER BY created_at DESC LIMIT 1`, hostID).Scan(&id)
 	if err == pgx.ErrNoRows {

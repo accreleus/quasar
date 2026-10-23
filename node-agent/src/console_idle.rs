@@ -4,10 +4,12 @@
 //!
 //! Every `/dev/input/event*` node is opened read-only and drained on each poll; only the
 //! time of the last user input is kept. User input is a key or button, relative motion,
-//! or an absolute axis moving past its dead zone. Sync and misc events and accelerometer
-//! devices never count, so a device that reports on its own cannot keep the console busy.
+//! or an absolute axis moving past the dead zone around its resting value and away from
+//! where it last counted. Sync and misc events and accelerometer devices never count, so a
+//! device that reports on its own cannot keep the console busy.
 //!
 //! Blind spots, each a read during play (a hitch, never a stop: the monitor reads on):
+//! an axis pushed again to where it last counted, or moved within its dead zone, is quiet;
 //! a device another program holds with `EVIOCGRAB` delivers nothing to this reader, and
 //! evdev cannot tell a grab apart without grabbing, which would take the holder's events;
 //! input that reaches the session only over hidraw is not seen either.
@@ -21,15 +23,43 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use input_linux::sys::{input_event, EV_ABS, EV_KEY, EV_REL};
-use input_linux::{AbsoluteAxis, EvdevHandle, InputProperty};
+use input_linux::{EvdevHandle, InputProperty};
 
 /// One event node; `None` for a device that never counts (an accelerometer).
 type Node = Option<Device>;
 
 struct Device {
     handle: EvdevHandle<File>,
-    /// Per absolute axis: the value last counted as input, and the dead zone around it.
-    axes: HashMap<u16, (i32, i32)>,
+    axes: HashMap<u16, Axis>,
+}
+
+/// An absolute axis: its value at open (rest), its dead zone, and the value it last
+/// counted at. Rest never moves, so noise wider than the zone cannot drag the zone along.
+struct Axis {
+    rest: i32,
+    dead: i32,
+    last: i32,
+}
+
+impl Axis {
+    fn new(rest: i32, dead: i32) -> Self {
+        Axis {
+            rest,
+            dead,
+            last: rest,
+        }
+    }
+
+    /// Noise inside the zone around rest is idle, and so is a value away from rest within
+    /// a zone of where it last counted: a held or jittering deflection counts once.
+    fn moved(&mut self, value: i32) -> bool {
+        let far = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs() > i64::from(self.dead);
+        if !far(value, self.rest) || !far(value, self.last) {
+            return false;
+        }
+        self.last = value;
+        true
+    }
 }
 
 struct Watch {
@@ -74,10 +104,14 @@ impl Device {
         {
             return Ok(None);
         }
-        Ok(Some(Device {
-            handle,
-            axes: HashMap::new(),
-        }))
+        let mut axes = HashMap::new();
+        for axis in handle.absolute_bits().iter().flat_map(|bits| bits.iter()) {
+            if let Ok(info) = handle.absolute_info(axis) {
+                let dead = dead_zone(info.minimum, info.maximum, info.flat, info.fuzz);
+                axes.insert(axis as u16, Axis::new(info.value, dead));
+            }
+        }
+        Ok(Some(Device { handle, axes }))
     }
 
     /// Drains the device; `None` once it is gone, else whether it had user input.
@@ -112,25 +146,12 @@ impl Device {
     fn is_input(&mut self, ev: &input_event) -> bool {
         match i32::from(ev.type_) {
             EV_KEY | EV_REL => true,
-            EV_ABS => {
-                let handle = &self.handle;
-                let (anchor, dead) = self.axes.entry(ev.code).or_insert_with(|| {
-                    AbsoluteAxis::from_code(ev.code)
-                        .ok()
-                        .and_then(|axis| handle.absolute_info(axis).ok())
-                        .map_or((ev.value, 0), |info| {
-                            (
-                                info.value,
-                                dead_zone(info.minimum, info.maximum, info.flat, info.fuzz),
-                            )
-                        })
-                });
-                if (i64::from(ev.value) - i64::from(*anchor)).abs() <= i64::from(*dead) {
-                    return false;
-                }
-                *anchor = ev.value;
-                true
-            }
+            // An axis open did not describe (a test FIFO) rests at its first value.
+            EV_ABS => self
+                .axes
+                .entry(ev.code)
+                .or_insert_with(|| Axis::new(ev.value, 0))
+                .moved(ev.value),
             _ => false,
         }
     }
@@ -278,6 +299,51 @@ mod tests {
         pad.write_all(&event(EV_REL, 0, 1)).unwrap();
         let t2 = t + Duration::from_secs(9);
         assert_eq!(watch.poll(dir.path(), t2), quiet(0), "relative motion");
+    }
+
+    /// Noise wider than the dead zone, around rest or around a held deflection, keeps
+    /// counting no longer than its first step; real motion still counts.
+    #[test]
+    fn an_axis_counts_motion_not_noise() {
+        let mut trigger = Axis::new(3, dead_zone(0, 255, 0, 0));
+        let busy: Vec<bool> = [3, 12, 2, 13, 1, 12, 3, 13]
+            .iter()
+            .map(|&v| trigger.moved(v))
+            .collect();
+        assert_eq!(busy.iter().filter(|&&b| b).count(), 1, "{busy:?}");
+        assert!(trigger.moved(200), "a pull");
+        assert!(!trigger.moved(195), "held");
+        assert!(trigger.moved(120), "eased off");
+
+        let mut hat = Axis::new(0, dead_zone(-1, 1, 0, 0));
+        assert!(
+            hat.moved(-1) && !hat.moved(0) && hat.moved(1),
+            "any hat step"
+        );
+    }
+
+    /// An axis that bounces across its zone for longer than the quiet window lets the
+    /// quiet period grow.
+    #[test]
+    fn a_jittering_axis_goes_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pad = fifo(dir.path(), "event6");
+        let start = Instant::now();
+        let mut watch = Watch::new(start);
+        // A FIFO answers no EVIOCGABS: rest is the first value, dead zone 0.
+        pad.write_all(&event(EV_ABS, 2, 0)).unwrap();
+        assert_eq!(watch.poll(dir.path(), start), Ok(Duration::ZERO));
+        let mut t = start;
+        for step in 1..=700u64 {
+            t = start + Duration::from_secs(step);
+            let value = if step % 2 == 0 { 0 } else { 9 };
+            pad.write_all(&event(EV_ABS, 2, value)).unwrap();
+            watch.poll(dir.path(), t).unwrap();
+        }
+        assert!(
+            watch.poll(dir.path(), t).unwrap() >= Duration::from_secs(600),
+            "a bouncing axis kept the console busy"
+        );
     }
 
     #[test]

@@ -182,24 +182,27 @@ func (c *Coordinator) ConsoleSessionActive(ctx context.Context, sessionID string
 }
 
 // ConsoleSessionEnded reads when a session ended (zero while still live; a failed
-// read fails closed to now)
-// and whether it was a console session its user stopped, for console self-heal: a
-// relaunch never acts on a display report older than the end, and a user's stop
-// holds. A console session is the only play session that reserves no encode slot
-// (local_only: nothing is encoded); a user stopping a streamed session must not
-// hold the console back. Satisfies agentws.Events.
+// read fails closed to now) and whether it was a console session (console.SessionSQL)
+// its user stopped, for console self-heal: a relaunch never acts on a display report
+// older than the end, and a user's stop holds. A user stopping a streamed session must
+// not hold the console back. Satisfies agentws.Events.
 func (c *Coordinator) ConsoleSessionEnded(ctx context.Context, sessionID string) (time.Time, bool) {
-	sess, err := c.store.Get(ctx, sessionID)
+	var endedAt *time.Time
+	var held bool
+	err := ErrNotFound
+	if isValidUUID(sessionID) {
+		err = c.store.pool.QueryRow(ctx, `
+			SELECT ended_at, `+console.SessionSQL+` AND stop_reason IS NOT DISTINCT FROM $2
+			FROM sessions WHERE id = $1::uuid`, sessionID, stopReasonUserRequested).Scan(&endedAt, &held)
+	}
 	if err != nil {
 		// Fail closed: "ended now" makes self-heal wait for the agent's next
 		// report (at most 15 s) rather than relaunch from one that may be stale.
 		c.log.Warn("console self-heal: read the ended session failed", "session_id", sessionID, "err", err)
 		return time.Now(), false
 	}
-	var endedAt time.Time
-	if sess.EndedAt != nil {
-		endedAt = *sess.EndedAt
+	if endedAt == nil {
+		return time.Time{}, held
 	}
-	console := sess.Kind == KindPlay && sess.ReservedSlots == 0
-	return endedAt, console && sess.StopReason != nil && *sess.StopReason == stopReasonUserRequested
+	return *endedAt, held
 }

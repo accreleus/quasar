@@ -270,8 +270,9 @@ fn ddc_probe_allowed(display_claimed: bool) -> bool {
 /// absent, and the control plane stops it.
 const CONSOLE_QUIET_BEFORE_DDC: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const CLAIMED_DDC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// Input after a read found a monitor off reads again this soon: someone may have switched
-/// it back on, and the session must not be stopped under them.
+/// After a read found a monitor off, input reads again this long after it, and again at
+/// this spacing while input goes on and the monitor still reads off: someone may be
+/// switching it back on, and the control plane's grace must not end on one early look.
 const CLAIMED_DDC_OFF_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Default)]
@@ -279,6 +280,8 @@ struct ClaimedDdc {
     last_read: Option<std::time::Instant>,
     /// Connectors the last read found off (or showing another input).
     off: Vec<String>,
+    /// When input was first seen after a read that found a monitor off.
+    woke_at: Option<std::time::Instant>,
     /// Why the input watch last could not run, logged once per reason.
     no_watch: Option<&'static str>,
 }
@@ -291,20 +294,31 @@ impl ClaimedDdc {
         let Some(idle) = idle else {
             // Input the agent cannot see may be someone playing.
             self.off.clear();
+            self.woke_at = None;
             return false;
         };
         let since_read = self.last_read.map(|at| now.saturating_duration_since(at));
-        let wait = if idle >= CONSOLE_QUIET_BEFORE_DDC {
-            CLAIMED_DDC_INTERVAL
-        } else if !self.off.is_empty() && since_read.is_some_and(|since| idle < since) {
-            CLAIMED_DDC_OFF_RECHECK
+        if idle >= CONSOLE_QUIET_BEFORE_DDC {
+            if since_read.is_some_and(|since| since < CLAIMED_DDC_INTERVAL) {
+                return false;
+            }
         } else {
-            return false;
-        };
-        if since_read.is_some_and(|since| since < wait) {
-            return false;
+            if self.off.is_empty() {
+                return false;
+            }
+            if self.woke_at.is_none() && since_read.is_some_and(|since| idle < since) {
+                self.woke_at = Some(now - idle);
+            }
+            let Some(woke) = self.woke_at else {
+                return false;
+            };
+            if now.saturating_duration_since(woke) < CLAIMED_DDC_OFF_RECHECK {
+                return false;
+            }
         }
         self.last_read = Some(now);
+        // Input still going on at a read is input since it, should that read find it off.
+        self.woke_at = (idle < CLAIMED_DDC_OFF_RECHECK).then_some(now);
         true
     }
 
@@ -328,6 +342,7 @@ impl ClaimedDdc {
 static CLAIMED_DDC: std::sync::Mutex<ClaimedDdc> = std::sync::Mutex::new(ClaimedDdc {
     last_read: None,
     off: Vec::new(),
+    woke_at: None,
     no_watch: None,
 });
 
@@ -1575,35 +1590,47 @@ mod tests {
         assert!(!st.due(Some(Duration::ZERO), t1));
     }
 
-    /// Input after an off reading keeps the connector out until a read finds it on; the
-    /// read comes soon. Unseen input, or the claim ending, brings it back.
+    /// Input after an off reading keeps the connector out until a read finds it on. The
+    /// read comes 10 s after the input and repeats every 10 s while input goes on and the
+    /// monitor still reads off. Unseen input brings it back.
     #[test]
     fn input_alone_never_brings_an_off_monitor_back() {
         use std::time::{Duration, Instant};
         let dp4 = || vec!["DP-4".to_string()];
+        let none = Vec::<String>::new;
+        let secs = Duration::from_secs;
         let t0 = Instant::now();
         let mut st = ClaimedDdc::default();
         assert!(st.due(Some(CONSOLE_QUIET_BEFORE_DDC), t0));
         st.off = dp4();
 
-        let t1 = t0 + Duration::from_secs(2);
         assert!(
-            !st.due(Some(Duration::ZERO), t1),
-            "a recheck waits its spacing"
-        );
-        assert_eq!(st.present(dp4()), Vec::<String>::new(), "input alone");
-        let t2 = t0 + CLAIMED_DDC_OFF_RECHECK;
-        assert!(
-            !st.due(Some(CLAIMED_DDC_OFF_RECHECK), t2),
+            !st.due(Some(secs(120)), t0 + secs(120)),
             "no input since the read"
         );
+        let back = t0 + secs(120);
+        assert!(!st.due(Some(Duration::ZERO), back), "input is back");
+        assert!(!st.due(Some(secs(2)), back + secs(2)));
+        assert_eq!(st.present(dp4()), none(), "input alone");
         assert!(
-            st.due(Some(Duration::from_secs(1)), t2),
-            "input after the read"
+            st.due(Some(secs(1)), back + secs(10)),
+            "10 s after the input"
         );
-        assert_eq!(st.present(dp4()), Vec::<String>::new());
+        // That read still finds the monitor off; input goes on.
+        st.off = dp4();
+        for s in [12, 14, 16, 18] {
+            assert!(!st.due(Some(secs(1)), back + secs(s)), "inside the spacing");
+            assert_eq!(st.present(dp4()), none());
+        }
+        assert!(
+            st.due(Some(secs(1)), back + secs(20)),
+            "the next look, 10 s on"
+        );
+        st.off = Vec::new(); // the read says on
+        assert_eq!(st.present(dp4()), dp4());
 
-        assert!(!st.due(None, t2));
+        st.off = dp4();
+        assert!(!st.due(None, back + secs(22)));
         assert_eq!(st.present(dp4()), dp4(), "unseen input may be play");
     }
 

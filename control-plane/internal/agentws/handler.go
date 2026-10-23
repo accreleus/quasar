@@ -1891,12 +1891,16 @@ func sanitizeCapacityReason(reason string) string {
 // recording which typed outputs read connected (consoleAutoState.lastConnected).
 // configured is false for a connection's first report, which can precede the agent's
 // config_update: it then lists no connectors with outputs connected (agent-api.md,
-// amendment 47), which must never read as a monitor off. The agent re-sends capacity
-// after every config_update.
+// amendment 47). Such a report is ignored: it must neither read as a monitor off nor
+// clear a power-off grace the previous connection started. The agent re-sends capacity
+// after every config_update, and that report decides.
 func (h *Handler) handleConsoleReport(ctx context.Context, hostID string, caps console.Capabilities, configured bool) {
+	if !configured {
+		return
+	}
 	var connected []string
 	for _, o := range caps.Outputs {
-		if o.Connected && configured {
+		if o.Connected {
 			connected = append(connected, o.Connector)
 		}
 	}

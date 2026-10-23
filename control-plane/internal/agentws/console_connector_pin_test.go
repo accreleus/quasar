@@ -319,9 +319,17 @@ func TestConsolePoweredOffMonitorBackWithinTheGraceKeepsTheSession(t *testing.T)
 	}
 }
 
-// seedLiveConsoleSession inserts a running console session (play, no encode slot) on
-// hostID, as one that outlived a control-plane restart leaves it.
+// seedLiveConsoleSession inserts a running console session (play, no encode slot, no
+// signaling token) on hostID, as one that outlived a control-plane restart leaves it.
 func seedLiveConsoleSession(t *testing.T, h *Handler, pool *pgxpool.Pool, hostID string) string {
+	t.Helper()
+	return seedPlaySession(t, h, pool, hostID, "running", "", "", 0)
+}
+
+// seedPlaySession inserts a play session on hostID reserving no encode slot, running the
+// host's console default app, created age ago. token non-empty mints it a signaling
+// token, as every streamed launch does.
+func seedPlaySession(t *testing.T, h *Handler, pool *pgxpool.Pool, hostID, state, token, stopReason string, age time.Duration) string {
 	t.Helper()
 	ctx := context.Background()
 	cfg, err := h.consoleStore.Get(ctx, hostID)
@@ -333,12 +341,91 @@ func seedLiveConsoleSession(t *testing.T, h *Handler, pool *pgxpool.Pool, hostID
 		VALUES (gen_random_uuid()::text || '@test', gen_random_uuid()::text, 'x') RETURNING id::text`).Scan(&userID); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO sessions(user_id,app_id,host_id,state,width,height,fps,bitrate_kbps)
-		VALUES ($1,$2,$3,'running',1920,1080,60,0) RETURNING id::text`,
-		userID, cfg["default_app"], hostID).Scan(&sessionID); err != nil {
-		t.Fatalf("seed live console session: %v", err)
+	if err := pool.QueryRow(ctx, `INSERT INTO sessions(user_id,app_id,host_id,state,width,height,fps,bitrate_kbps,
+		    reserved_encode_slots,signaling_token_hash,stop_reason,created_at)
+		VALUES ($1,$2,$3,$4,1920,1080,60,0,0,NULLIF($5,''),NULLIF($6,''),now() - make_interval(secs => $7))
+		RETURNING id::text`,
+		userID, cfg["default_app"], hostID, state, token, stopReason, age.Seconds()).Scan(&sessionID); err != nil {
+		t.Fatalf("seed play session: %v", err)
 	}
 	return sessionID
+}
+
+// Adoption takes only a console session: not a streamed session that reserves 0 slots
+// (one launched before migration 0106) even when it is newer, and not another host's.
+// A monitor read off then stops the console session alone.
+func TestConsoleAdoptsOnlyAConsoleSession(t *testing.T) {
+	const grace = 500 * time.Millisecond
+	h, pool, ev := selfHealHandler(t)
+	h.consoleAuto.powerOffGrace = grace
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	var otherHost string
+	if err := pool.QueryRow(context.Background(),
+		`INSERT INTO hosts (node_name, status) VALUES ('h2', 'online') RETURNING id::text`).Scan(&otherHost); err != nil {
+		t.Fatalf("seed other host: %v", err)
+	}
+	cfg, err := h.consoleStore.Get(context.Background(), hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.consoleStore.Upsert(context.Background(), otherHost, cfg, nil); err != nil {
+		t.Fatal(err)
+	}
+	consoleID := seedPlaySession(t, h, pool, hostID, "running", "", "", 2*time.Minute)
+	streamID := seedPlaySession(t, h, pool, hostID, "running", "tok-"+hostID, "", time.Minute)
+	seedPlaySession(t, h, pool, otherHost, "running", "", "", 0)
+
+	consoleReport(t, h, hostID, dp4On)
+	if got := ev.count(); got != 0 {
+		t.Fatalf("launch count = %d, want 0 beside a live console session", got)
+	}
+	if got := trackedSession(h, hostID); got != consoleID {
+		t.Fatalf("tracked session = %q, want the console session %q (stream %q)", got, consoleID, streamID)
+	}
+
+	stopEv := &teardownEvents{active: true}
+	h.events = stopEv
+	consoleReport(t, h, hostID, dp4Off)
+	deadline := time.Now().Add(grace + 3*time.Second)
+	for len(stopEv.reasons()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	stopEv.mu.Lock()
+	defer stopEv.mu.Unlock()
+	if len(stopEv.stopped) != 1 || stopEv.stopped[0] != consoleID {
+		t.Fatalf("stopped = %v, want only the console session %s", stopEv.stopped, consoleID)
+	}
+}
+
+// A console session its user is stopping is adopted and not relaunched while it ends;
+// once it has ended the user's stop holds auto-start back.
+func TestConsoleAdoptedStoppingSessionHoldsAfterTheUserStop(t *testing.T) {
+	h, pool, ev := selfHealHandler(t)
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	id := seedPlaySession(t, h, pool, hostID, "stopping", "", "user_requested", 0)
+
+	consoleReport(t, h, hostID, dp4On)
+	if got := ev.count(); got != 0 {
+		t.Fatalf("launch count = %d, want 0 while the stopping session is live", got)
+	}
+	if got := trackedSession(h, hostID); got != id {
+		t.Fatalf("tracked session = %q, want the stopping console session %q", got, id)
+	}
+
+	if _, err := pool.Exec(context.Background(), `UPDATE sessions SET state='stopped', ended_at=now() WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	ev.mu.Lock()
+	ev.userStopped, ev.endedAt, ev.inactive = true, time.Now(), true
+	ev.mu.Unlock()
+	h.ConsoleSessionTerminated(context.Background(), hostID, id)
+	consoleReport(t, h, hostID, dp4On)
+	h.consoleAuto.mu.Lock()
+	held := h.consoleAuto.userStopped[hostID]
+	h.consoleAuto.mu.Unlock()
+	if !held || ev.count() != 0 {
+		t.Fatalf("held=%v launches=%d, want the user's stop held and no relaunch", held, ev.count())
+	}
 }
 
 // A console session that outlived a control-plane restart is adopted from the database
@@ -475,6 +562,19 @@ func TestConsoleUnpluggedTimeDoesNotCountTowardThePowerOffGrace(t *testing.T) {
 	}
 }
 
+// processConsoleCapacity feeds a console_capabilities object in the agent's wire shape
+// through processCapacity on ac, as the agent's connection sends it.
+func processConsoleCapacity(t *testing.T, h *Handler, ac *conn, raw string) {
+	t.Helper()
+	var caps console.Capabilities
+	if err := json.Unmarshal([]byte(raw), &caps); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.processCapacity(context.Background(), ac, capacityRaw(t, CapacityMsg{ConsoleCapabilities: &caps})); err != nil {
+		t.Fatalf("process capacity: %v", err)
+	}
+}
+
 // A connection's first report can precede the agent's console configuration, when it
 // lists no connectors with the output connected. That never reads as a monitor off; the
 // report the agent re-sends after config_update does. Fed in the agent's connect order
@@ -486,16 +586,7 @@ func TestConsoleFirstReportOfAConnectionIsNeverAMonitorOff(t *testing.T) {
 	h.registry = NewRegistry(slog.Default())
 	h.store = &agentStore{pool: pool, isAgentConnected: h.registry.IsConnected}
 	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
-	capacity := func(ac *conn, raw string) {
-		t.Helper()
-		var caps console.Capabilities
-		if err := json.Unmarshal([]byte(raw), &caps); err != nil {
-			t.Fatal(err)
-		}
-		if err := h.processCapacity(context.Background(), ac, capacityRaw(t, CapacityMsg{ConsoleCapabilities: &caps})); err != nil {
-			t.Fatalf("process capacity: %v", err)
-		}
-	}
+	capacity := func(ac *conn, raw string) { processConsoleCapacity(t, h, ac, raw) }
 	first := &conn{hostID: hostID}
 	capacity(first, dp4On)
 	capacity(first, dp4On)
@@ -519,5 +610,54 @@ func TestConsoleFirstReportOfAConnectionIsNeverAMonitorOff(t *testing.T) {
 	}
 	if got := stopEv.reasons(); len(got) != 1 || got[0] != "console_display_disconnected" {
 		t.Fatalf("stops = %v, want one console_display_disconnected once the agent has its config", got)
+	}
+}
+
+// A reconnect inside a running power-off grace neither stops the session on the new
+// connection's first report nor restarts the grace: the timer the off read armed still
+// ends it on time.
+func TestConsoleReconnectInsideThePowerOffGraceKeepsItsClock(t *testing.T) {
+	const grace = 1200 * time.Millisecond
+	h, pool, ev := selfHealHandler(t)
+	h.consoleAuto.powerOffGrace = grace
+	h.registry = NewRegistry(slog.Default())
+	h.store = &agentStore{pool: pool, isAgentConnected: h.registry.IsConnected}
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	first := &conn{hostID: hostID}
+	processConsoleCapacity(t, h, first, dp4On)
+	processConsoleCapacity(t, h, first, dp4On)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("launch count = %d, want 1", got)
+	}
+	stopEv := &teardownEvents{active: true}
+	h.events = stopEv
+	processConsoleCapacity(t, h, first, dp4Off)
+	since := func() (time.Time, bool) {
+		h.consoleAuto.mu.Lock()
+		defer h.consoleAuto.mu.Unlock()
+		a := h.consoleAuto.absent[hostID]
+		if a == nil {
+			return time.Time{}, false
+		}
+		return a.since, a.timer != nil
+	}
+	armedAt, _ := since()
+	time.Sleep(grace * 3 / 4)
+
+	second := &conn{hostID: hostID}
+	processConsoleCapacity(t, h, second, dp4Off) // first report: before config_update
+	if got, armed := since(); got != armedAt || !armed || len(stopEv.reasons()) != 0 {
+		t.Fatalf("since=%v armed=%v stops=%v, want the clock from %v still armed and no stop", got, armed, stopEv.reasons(), armedAt)
+	}
+	processConsoleCapacity(t, h, second, dp4Off)
+	if got, _ := since(); got != armedAt {
+		t.Fatalf("since = %v after the configured report, want %v kept", got, armedAt)
+	}
+	deadline := armedAt.Add(grace + 300*time.Millisecond)
+	for len(stopEv.reasons()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if got := stopEv.reasons(); len(got) != 1 || got[0] != "console_display_disconnected" {
+		t.Fatalf("stops = %v by the original grace's end, want one console_display_disconnected", got)
 	}
 }
