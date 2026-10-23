@@ -18,7 +18,7 @@ const settingsWith = (over: Partial<InstanceSettings> = {}): UseSettingsResult =
 beforeEach(() => patch.mockReset().mockResolvedValue(true));
 
 const typeMinutes = (v: string) =>
-  fireEvent.change(screen.getByLabelText("Keep Hot Loading for (minutes)"), { target: { value: v } });
+  fireEvent.change(screen.getByLabelText("Keep the hidden Steam for (minutes)"), { target: { value: v } });
 
 describe("parseIdleMinutes", () => {
   it.each([["0", null], ["61", null], ["1.5", null], ["", null], ["abc", null], ["1", 1], ["60", 60], ["10", 10]])(

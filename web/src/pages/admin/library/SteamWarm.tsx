@@ -54,7 +54,7 @@ export function SteamWarm({ settings }: { settings: UseSettingsResult }) {
         </select>
       </div>
       <div className="rowflex">
-        <label htmlFor="steam-warm-idle" className="label">Keep Hot Loading for (minutes)</label>
+        <label htmlFor="steam-warm-idle" className="label">Keep the hidden Steam for (minutes)</label>
         <input id="steam-warm-idle" className="input" type="number" min={MIN_IDLE_MINUTES} max={MAX_IDLE_MINUTES}
           value={idleValue} style={{ width: 110 }} disabled={settings.pending === "steam_warm_idle_minutes"}
           onChange={(e) => { setIdleText(e.target.value); setIdleError(null); }} />
