@@ -316,8 +316,15 @@ describe("presentLaunchError", () => {
   it("home_not_provisioned is rendered as guidance, not a failure", () => {
     const result = presentLaunchError(family, gameA, "home_not_provisioned", "no home");
     expect(result.variant).toBe("info");
-    expect(result.body).toContain("Steam");
+    expect(result.title).toBe("Start Steam once first");
+    expect(result.body).toContain("Start Steam once");
     expect(result.body).not.toContain("failed");
+    expect(result.openApp?.name).toBe("Steam");
+  });
+
+  it("home_not_provisioned offers no Steam link when the library has no Steam app", () => {
+    const result = presentLaunchError([gameA], gameA, "home_not_provisioned", "no home");
+    expect(result.openApp).toBeUndefined();
   });
 
   it("home_conflict asks for operator repair without disclosing locations", () => {

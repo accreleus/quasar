@@ -200,6 +200,8 @@ export interface LaunchErrorPresentation {
   body: string;
   /** Present only for `home_in_use` with a nameable conflicting session (spec §2.2). */
   sessionId?: string;
+  /** Present only for `home_not_provisioned` when the family's Steam app is in the library. */
+  openApp?: { id: string; name: string };
 }
 
 /** Renders a failed launch for the toast. Covers the two 409s spec §2.2 names
@@ -222,10 +224,12 @@ export function presentLaunchError<T extends HomeApp & { name: string }>(
     };
   }
   if (code === "home_not_provisioned") {
+    const root = familyRootApp(apps, app);
     return {
       variant: "info",
-      title: "Library not set up yet",
-      body: `Launch ${rootName} once on a host to set up your library, then try again.`,
+      title: `Start ${rootName} once first`,
+      body: `${app.name} needs the library ${rootName} sets up. Start ${rootName} once, then press Play again.`,
+      openApp: root && root.id !== app.id ? { id: root.id, name: root.name } : undefined,
     };
   }
   if (code === "home_conflict") {
