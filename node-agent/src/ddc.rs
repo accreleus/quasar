@@ -230,6 +230,39 @@ fn ensure_i2c_nodes() {
 /// connector with power `On` or `Unknown` is kept. No-op (identity) when gating
 /// is disabled, `ddcutil` is unavailable, or the input is empty.
 pub(crate) fn powered_connectors(connected: Vec<String>) -> Vec<String> {
+    powered(connected, true)
+}
+
+/// [`powered_connectors`] without `ddcutil detect`, which probes every bus: only the
+/// connectors whose bus is already mapped are read, the rest count as powered. For a
+/// read while a console desktop owns the display.
+pub(crate) fn powered_connectors_on_known_bus(connected: Vec<String>) -> Vec<String> {
+    powered(connected, false)
+}
+
+/// Why [`powered_connectors_on_known_bus`] could not read any of `connected`, or `None`
+/// when it can. Forks nothing beyond the one `ddcutil --version` check.
+pub(crate) fn known_bus_read_blocked(connected: &[String]) -> Option<&'static str> {
+    if !CONSOLE_CONFIG_SEEN.load(Ordering::Relaxed) {
+        return Some("no console settings yet");
+    }
+    if !console_enabled() {
+        return Some("console mode is off");
+    }
+    if !enabled() {
+        return Some("QUASAR_CONSOLE_DDC=0");
+    }
+    if !ddcutil_available() {
+        return Some("ddcutil is not available");
+    }
+    let cache = cache().lock().unwrap();
+    if !connected.iter().any(|c| cache.bus_map.contains_key(c)) {
+        return Some("no i2c bus is mapped for the display");
+    }
+    None
+}
+
+fn powered(connected: Vec<String>, detect: bool) -> Vec<String> {
     // Before the first config_update the agent does not know whether to read the
     // monitor's power, and an unread monitor must not look on: a report made then
     // started console mode on a switched-off monitor after an agent restart.
@@ -279,7 +312,7 @@ pub(crate) fn powered_connectors(connected: Vec<String>) -> Vec<String> {
                     .map(|(p, _)| (conn.clone(), *p))
             })
             .collect();
-        (stale || missing, fresh)
+        (detect && (stale || missing), fresh)
     };
 
     // Phase 2 (unlocked): the `ddcutil detect` fork.
@@ -535,7 +568,31 @@ mod tests {
         }
         // A failed/absent read is `Unknown` → connector kept (graceful downgrade).
         assert_eq!(kept, vec!["DP-8".to_string()]);
+
+        // The read while a console desktop owns the display never runs `ddcutil
+        // detect`: an unmapped connector is kept, with no fork at all.
+        cache().lock().unwrap().bus_map.remove("DP-7");
+        let before_known = probe_calls();
+        assert_eq!(
+            powered_connectors_on_known_bus(vec!["DP-7".to_string()]),
+            vec!["DP-7".to_string()]
+        );
+        assert_eq!(
+            probe_calls(),
+            before_known,
+            "ddcutil detect on the known-bus read"
+        );
+        if forced_available && enabled() {
+            assert_eq!(
+                known_bus_read_blocked(&["DP-7".to_string()]),
+                Some("no i2c bus is mapped for the display")
+            );
+        }
         set_console_enabled(false);
+        assert_eq!(
+            known_bus_read_blocked(&["DP-7".to_string()]),
+            Some("console mode is off")
+        );
     }
 
     #[test]

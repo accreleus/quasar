@@ -132,11 +132,12 @@ func (h *Handler) WithTrustedProxies(nets []*net.IPNet) *Handler {
 
 // consoleAutoState is the CM-06/CM-09 in-memory state for console auto-start:
 // per host, the auto-launched session, the last-reported connector list, and
-// crash-loop backoff. In-memory only — a control-plane restart just makes the
-// next capacity report a fresh baseline.
+// crash-loop backoff. In-memory only: a control-plane restart makes the next
+// capacity report a fresh baseline, which adopts a live console session from the
+// database (adoptLiveConsoleSession).
 //
-// Accepted growth (#406): lastConnectors, lastReportAt, lastEndAt and backoff
-// are never deleted (one small entry per host ever enrolled). No eviction on disconnect, on purpose:
+// Accepted growth (#406): lastConnectors, lastConnected, lastReportAt, lastEndAt
+// and backoff are never deleted (one small entry per host ever enrolled). No eviction on disconnect, on purpose:
 // console state must survive a reconnect, and clearing the crash-loop counter
 // there would let a hot-looping host reset its backoff by reconnecting. The
 // bound is distinct-hosts-per-process-lifetime, fleet-sized.
@@ -161,10 +162,23 @@ type consoleAutoState struct {
 	// as unplugged, so the default is never.
 	disconnectStops bool
 	disconnectGrace time.Duration
+	// hostID → connectors whose typed output (`console_capabilities.outputs`) reads
+	// connected. One of these missing from `connectors` is a monitor the agent read as
+	// powered off over DDC, not an unplug (agent-api.md, amendment 47).
+	lastConnected map[string][]string
+	// How long a powered-off monitor's absence lasts before the session is stopped when
+	// no disconnect grace is configured. The agent reads the power of a monitor a console
+	// desktop drives only after its local input has been quiet for a while, so a monitor
+	// switched off mid-play never reads off.
+	powerOffGrace time.Duration
 }
+
+// consolePowerOffGrace is consoleAutoState.powerOffGrace's default.
+const consolePowerOffGrace = 10 * time.Minute
 
 type consoleAbsence struct {
 	since time.Time
+	grace time.Duration
 	timer *time.Timer
 }
 
@@ -178,6 +192,8 @@ func newConsoleAutoState() *consoleAutoState {
 		userStopped:    make(map[string]bool),
 		backoff:        make(map[string]*consoleBackoff),
 		absent:         make(map[string]*consoleAbsence),
+		lastConnected:  make(map[string][]string),
+		powerOffGrace:  consolePowerOffGrace,
 	}
 }
 
@@ -1816,7 +1832,7 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 			if err := h.consoleStore.UpsertCapabilities(ctx, hostID, *cap.ConsoleCapabilities); err != nil {
 				h.log.Warn("console capabilities upsert failed", "host_id", hostID, "err", err)
 			}
-			h.handleConsoleAutoStart(ctx, hostID, cap.ConsoleCapabilities.Connectors)
+			h.handleConsoleReport(ctx, hostID, *cap.ConsoleCapabilities, ac.consoleReports.Add(1) > 1)
 			if access := cap.ConsoleCapabilities.Access; access != nil {
 				h.applyConsoleAccessReport(ctx, hostID, *access)
 			}
@@ -1871,6 +1887,29 @@ func sanitizeCapacityReason(reason string) string {
 	return reason
 }
 
+// handleConsoleReport runs console auto-start from a capacity report, first
+// recording which typed outputs read connected (consoleAutoState.lastConnected).
+// configured is false for a connection's first report, which can precede the agent's
+// config_update: it then lists no connectors with outputs connected (agent-api.md,
+// amendment 47). Such a report is ignored: it must neither read as a monitor off nor
+// clear a power-off grace the previous connection started. The agent re-sends capacity
+// after every config_update, and that report decides.
+func (h *Handler) handleConsoleReport(ctx context.Context, hostID string, caps console.Capabilities, configured bool) {
+	if !configured {
+		return
+	}
+	var connected []string
+	for _, o := range caps.Outputs {
+		if o.Connected {
+			connected = append(connected, o.Connector)
+		}
+	}
+	h.consoleAuto.mu.Lock()
+	h.consoleAuto.lastConnected[hostID] = connected
+	h.consoleAuto.mu.Unlock()
+	h.handleConsoleAutoStart(ctx, hostID, caps.Connectors)
+}
+
 // handleConsoleAutoStart is the capacity-report entry to console auto-start
 // (see reevalConsole for the mechanism and design-doc pointer).
 func (h *Handler) handleConsoleAutoStart(ctx context.Context, hostID string, connectors []string) {
@@ -1894,15 +1933,17 @@ func (h *Handler) handleConsoleAutoStart(ctx context.Context, hostID string, con
 // importing agentws). It keeps the crash-loop backoff and records a user's
 // stop. It relaunches only from a display report made after the session ended:
 // the agent sends one as soon as a session ends, and an older one was made while
-// the console owned the display, when the agent does not read the monitor's power.
+// the console owned the display, when the agent reads the monitor's power only
+// after 10 minutes with no local input.
 func (h *Handler) ConsoleSessionTerminated(ctx context.Context, hostID, sessionID string) {
 	if h.consoleStore == nil {
 		return
 	}
 
 	// A report from before the session ended is no evidence the display is still
-	// there: while a console session drives the display the agent skips the
-	// monitor-power read (#458), so it reads "present" even with the monitor off.
+	// there: while a console session drives the display the agent reads the
+	// monitor's power only once local input has been quiet for 10 minutes (#458),
+	// so it can read "present" with the monitor off.
 	// The agent reports afresh as soon as a session ends; that report decides.
 	// lastReportAt is this process's clock and endedAt the database's; a skew
 	// can only delay a relaunch to the next report, never add one.
@@ -2023,12 +2064,15 @@ func (h *Handler) retryConsoleAfterBackoff(hostID string) {
 //
 // isCapacityPath: only a fresh capacity report re-primes a host that gave up
 // after consoleBackoffMaxRetries; the terminal hook never does. Both callers
-// respect the time-based backoff window. State is in-memory only — a restart
-// resets the baseline and forgets the launched-session record (consoleAutoState).
+// respect the time-based backoff window. State is in-memory only; the capacity
+// path adopts a live console session a restart forgot (adoptLiveConsoleSession).
 func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors []string, isCapacityPath bool) {
 	h.consoleAuto.mu.Lock()
 	recordedID, alreadyLaunched := h.consoleAuto.sessions[hostID]
 	h.consoleAuto.mu.Unlock()
+	if isCapacityPath && !alreadyLaunched {
+		recordedID, alreadyLaunched = h.adoptLiveConsoleSession(ctx, hostID)
+	}
 
 	sparse, err := h.consoleStore.Get(ctx, hostID)
 	if err != nil {
@@ -2130,7 +2174,8 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 		h.attemptConsoleLaunch(ctx, hostID, cfg, isCapacityPath)
 	case !nowPresent && alreadyLaunched:
 		h.consoleAuto.mu.Lock()
-		stopNow := h.consoleConnectorAbsentLocked(hostID)
+		poweredOff := connectorPresent(h.consoleAuto.lastConnected[hostID], cfg.PinnedConnector())
+		stopNow := h.consoleConnectorAbsentLocked(hostID, poweredOff)
 		var sessionID string
 		ok := false
 		if stopNow {
@@ -2162,31 +2207,75 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 	}
 }
 
+// adoptLiveConsoleSession keeps the invariant that a live console session is always
+// tracked: one that outlived a control-plane restart (#128) is read from the database,
+// so it can still be stopped and no second one is launched beside it.
+func (h *Handler) adoptLiveConsoleSession(ctx context.Context, hostID string) (string, bool) {
+	id, err := h.consoleStore.LiveConsoleSession(ctx, hostID)
+	if err != nil {
+		h.log.Warn("console auto-start: read the live console session failed", "host_id", hostID, "err", err)
+		return "", false
+	}
+	if id == "" {
+		return "", false
+	}
+	h.consoleAuto.mu.Lock()
+	defer h.consoleAuto.mu.Unlock()
+	if cur, tracked := h.consoleAuto.sessions[hostID]; tracked {
+		return cur, true
+	}
+	if h.consoleAuto.launching[hostID] {
+		return "", false
+	}
+	h.consoleAuto.sessions[hostID] = id
+	h.log.Info("console auto-start: tracking a live console session this process did not launch",
+		"host_id", hostID, "session_id", id)
+	return id, true
+}
+
 // consoleConnectorAbsentLocked records that the running session's connector is
 // absent and answers whether the session is stopped now. The first absence arms
-// the grace timer, which re-evaluates the host when the grace ends; a monitor that
-// drops its link on power-off is kept this way. Caller holds consoleAuto.mu.
-func (h *Handler) consoleConnectorAbsentLocked(hostID string) bool {
+// the grace timer, which re-evaluates the host when the grace ends. Without a
+// configured grace only a powered-off monitor (poweredOff, still connected) is
+// stopped, after powerOffGrace; a monitor that drops its link on power-off reads as
+// unplugged and is kept. Caller holds consoleAuto.mu.
+func (h *Handler) consoleConnectorAbsentLocked(hostID string, poweredOff bool) bool {
 	st := h.consoleAuto
-	if !st.disconnectStops {
-		if _, noted := st.absent[hostID]; !noted {
-			st.absent[hostID] = &consoleAbsence{since: time.Now()}
+	stops, grace := st.disconnectStops, st.disconnectGrace
+	if !stops && poweredOff {
+		stops, grace = true, st.powerOffGrace
+	}
+	a, noted := st.absent[hostID]
+	if !noted {
+		a = &consoleAbsence{}
+		st.absent[hostID] = a
+	}
+	if !stops {
+		// A keep leaves no clock: unplugged time never counts toward powerOffGrace.
+		if a.timer != nil {
+			a.timer.Stop()
+			a.timer = nil
+		}
+		a.since = time.Time{}
+		if !noted {
 			h.log.Info("console auto-stop: connector absent, session kept (no disconnect grace configured)",
 				"host_id", hostID)
 		}
 		return false
 	}
-	if st.disconnectGrace <= 0 {
+	if a.since.IsZero() {
+		a.since = time.Now()
+	}
+	waited := time.Since(a.since)
+	if waited >= grace {
 		return true
 	}
-	if a, waiting := st.absent[hostID]; waiting {
-		return time.Since(a.since) >= st.disconnectGrace
+	if a.timer == nil {
+		a.grace = grace
+		a.timer = time.AfterFunc(grace-waited, func() { h.consoleGraceEnded(hostID) })
+		h.log.Info("console auto-stop: connector absent, waiting out the grace",
+			"host_id", hostID, "grace", grace.String(), "monitor_powered_off", poweredOff)
 	}
-	a := &consoleAbsence{since: time.Now()}
-	a.timer = time.AfterFunc(st.disconnectGrace, func() { h.consoleGraceEnded(hostID) })
-	st.absent[hostID] = a
-	h.log.Info("console auto-stop: connector absent, waiting out the disconnect grace",
-		"host_id", hostID, "grace", st.disconnectGrace.String())
 	return false
 }
 
@@ -2205,9 +2294,9 @@ func (h *Handler) consoleGraceEnded(hostID string) {
 	h.reevalConsole(context.Background(), hostID, connectors, false)
 	h.consoleAuto.mu.Lock()
 	defer h.consoleAuto.mu.Unlock()
-	if cur, still := h.consoleAuto.absent[hostID]; still && cur == a {
+	if cur, still := h.consoleAuto.absent[hostID]; still && cur == a && !a.since.IsZero() {
 		if _, tracked := h.consoleAuto.sessions[hostID]; tracked {
-			a.timer = time.AfterFunc(min(h.consoleAuto.disconnectGrace, consoleBackoffMax),
+			a.timer = time.AfterFunc(min(a.grace, consoleBackoffMax),
 				func() { h.consoleGraceEnded(hostID) })
 		}
 	}

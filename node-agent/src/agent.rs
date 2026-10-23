@@ -3385,7 +3385,7 @@ struct RunningHandle {
     /// The assigned codec, before any `QUASAR_CODEC` diagnostic override (the runner
     /// applies that later): a launch failure on it selects that GPU's codec probe.
     codec: crate::session::Codec,
-    /// Set by `SessionEvent::Running`. Until then the launch is in flight and no host
+    /// Set by the first `running` report (`Running`, `AppBooting`, `Displaying`). Until then the launch is in flight and no host
     /// probe starts.
     reached_running: bool,
     /// A runner-reported terminal waits here until its thread has exited and
@@ -5358,6 +5358,14 @@ impl SessionManager {
         Some(self.on_event(session_id, event))
     }
 
+    /// The session's launch is over: no host-wide quiet period is owed for it any more.
+    fn reached_running(&mut self, session_id: &str) {
+        if let Some(handle) = self.running.get_mut(session_id) {
+            handle.reached_running = true;
+        }
+        self.note_session_count();
+    }
+
     /// Map a runner lifecycle event onto a session_state message.
     fn on_event(&mut self, session_id: &str, event: SessionEvent) -> AgentMsg {
         // Handled ahead of the generic mapping so `reason_code`/`app_log_tail` need not
@@ -5415,10 +5423,7 @@ impl SessionManager {
             SessionEvent::HomeSeed(_) => ("starting", None, None),
             SessionEvent::Progress(detail) => ("starting", Some(detail.to_string()), None),
             SessionEvent::Running => {
-                if let Some(handle) = self.running.get_mut(session_id) {
-                    handle.reached_running = true;
-                }
-                self.note_session_count();
+                self.reached_running(session_id);
                 (
                     "running",
                     Some("pipeline live; offer ready".to_string()),
@@ -5426,10 +5431,7 @@ impl SessionManager {
                 )
             }
             SessionEvent::Displaying(mode) => {
-                if let Some(handle) = self.running.get_mut(session_id) {
-                    handle.reached_running = true;
-                }
-                self.note_session_count();
+                self.reached_running(session_id);
                 let detail = match mode {
                     Some(m) => format!(
                         "displaying {}×{} @ {} Hz",
@@ -5476,7 +5478,13 @@ impl SessionManager {
             // Same trick as the swap details: the transport IS live, so only `detail`
             // moves. These two strings are the client's loading-screen contract — hold
             // the loader through "app booting", reveal on "app presented".
-            SessionEvent::AppBooting => ("running", Some("app booting".to_string()), None),
+            // The first report of a launch that boots an app is this one, not `Running`: a
+            // `running` session whose detail is anything but `app booting` is, to a client,
+            // one that has nothing left to wait for (#749).
+            SessionEvent::AppBooting => {
+                self.reached_running(session_id);
+                ("running", Some("app booting".to_string()), None)
+            }
             SessionEvent::AppPresented => ("running", Some("app presented".to_string()), None),
             SessionEvent::Signaling(_) => unreachable!("Signaling handled in event loop"),
             SessionEvent::EffectiveMedia(_) => {
@@ -11500,6 +11508,26 @@ mod tests {
         );
         let plain = serde_json::to_value(mgr.on_event("p1", SessionEvent::AppBooting)).unwrap();
         assert!(plain.get("launch_progress").is_none());
+    }
+
+    /// #749: `AppBooting` is a fresh app launch's first `running` report: it carries detail
+    /// `app booting` and ends the launch's quiet period. The runner's order (no plain
+    /// `Running`) is pinned by `takeover_tests::warm_steam`.
+    #[test]
+    fn app_booting_is_the_first_running_report_and_ends_the_launch() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p0", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        assert!(!mgr.running["p0"].reached_running);
+        let seen = as_wire(mgr.relay("p0", SessionEvent::AppBooting));
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0]["state"], "running");
+        assert_eq!(seen[0]["detail"], "app booting");
+        assert!(
+            mgr.running["p0"].reached_running,
+            "app booting is the launch's running report"
+        );
     }
 
     #[test]

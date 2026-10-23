@@ -11,6 +11,7 @@ pub mod artifact;
 pub mod buildinfo;
 pub mod capacity;
 pub mod config;
+pub(crate) mod console_idle;
 mod container_ownership;
 pub mod cp_http;
 pub mod cp_tls;
