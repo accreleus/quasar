@@ -42,7 +42,7 @@ export function SteamWarm({ settings }: { settings: UseSettingsResult }) {
           onChange={(next) => void settings.patch("steam_warm_enabled", next)} />
       </div>
       <p className="hint m0">
-        Hot Loading keeps a hidden Steam running while its user browses the library, which holds a GPU slot, so it is off by default.
+        Hot Loading keeps a hidden Steam running while its user browses the library. That Steam holds a GPU slot, so Hot Loading is off by default.
       </p>
       <div className="rowflex">
         <label htmlFor="steam-warm-rewarm" className="label">Start Hot Loading again</label>

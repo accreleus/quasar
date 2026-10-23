@@ -109,7 +109,7 @@ back for the game: from that frame to the game's window, Steam needing the user,
 or the reveal cap, whichever comes first. A session with no helper, or a cap of
 zero, holds nothing.
 
-**Parked session** — a warm Steam: a session row with `kind = 'parked'` running
+**Parked session** — a hot-loaded Steam (users and admins see the feature as Hot Loading for Steam Apps; code and the API call it warm Steam): a session row with `kind = 'parked'` running
 the user's Steam parent app started `-silent`, with no viewer, while the user
 browses the library. It holds a normal GPU reservation and the user's Steam home,
 and at most one exists per user. A Steam launch in its family *claims* it (the
