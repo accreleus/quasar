@@ -18,7 +18,7 @@ const settingsWith = (over: Partial<InstanceSettings> = {}): UseSettingsResult =
 beforeEach(() => patch.mockReset().mockResolvedValue(true));
 
 const typeMinutes = (v: string) =>
-  fireEvent.change(screen.getByLabelText("Keep a warm Steam for (minutes)"), { target: { value: v } });
+  fireEvent.change(screen.getByLabelText("Keep Hot Loading for (minutes)"), { target: { value: v } });
 
 describe("parseIdleMinutes", () => {
   it.each([["0", null], ["61", null], ["1.5", null], ["", null], ["abc", null], ["1", 1], ["60", 60], ["10", 10]])(
@@ -35,16 +35,16 @@ describe("SteamWarm", () => {
 
   it("patches the switch and the re-warm choice, one key each", () => {
     render(<SteamWarm settings={settingsWith()} />);
-    fireEvent.click(screen.getByLabelText("Keep Steam warm while a user browses"));
+    fireEvent.click(screen.getByLabelText("Hot Loading for Steam Apps"));
     expect(patch).toHaveBeenCalledWith("steam_warm_enabled", true);
-    fireEvent.change(screen.getByLabelText("Warm Steam again"), { target: { value: "next_steam_launch" } });
+    fireEvent.change(screen.getByLabelText("Start Hot Loading again"), { target: { value: "next_steam_launch" } });
     expect(patch).toHaveBeenCalledWith("steam_warm_rewarm", "next_steam_launch");
   });
 
   it.each(["0", "61", "1.5", ""])("rejects %j client-side and sends nothing", (v) => {
     render(<SteamWarm settings={settingsWith()} />);
     typeMinutes(v);
-    fireEvent.click(screen.getByRole("button", { name: "Save warm Steam minutes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save Hot Loading minutes" }));
     expect(screen.getByRole("alert")).toHaveTextContent("between 1 and 60");
     expect(patch).not.toHaveBeenCalled();
   });
@@ -52,7 +52,7 @@ describe("SteamWarm", () => {
   it("saves a valid number as an integer", () => {
     render(<SteamWarm settings={settingsWith()} />);
     typeMinutes("25");
-    fireEvent.click(screen.getByRole("button", { name: "Save warm Steam minutes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save Hot Loading minutes" }));
     expect(patch).toHaveBeenCalledWith("steam_warm_idle_minutes", 25);
   });
 });

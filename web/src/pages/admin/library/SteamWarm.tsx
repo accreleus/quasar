@@ -36,16 +36,16 @@ export function SteamWarm({ settings }: { settings: UseSettingsResult }) {
   return (
     <div className="col gap3 mt4">
       <div className="rowflex">
-        <label htmlFor="steam-warm-enabled" className="label">Keep Steam warm while a user browses</label>
-        <Switch id="steam-warm-enabled" aria-label="Keep Steam warm while a user browses"
+        <label htmlFor="steam-warm-enabled" className="label">Hot Loading for Steam Apps</label>
+        <Switch id="steam-warm-enabled" aria-label="Hot Loading for Steam Apps"
           checked={s.steam_warm_enabled} disabled={settings.pending === "steam_warm_enabled"}
           onChange={(next) => void settings.patch("steam_warm_enabled", next)} />
       </div>
       <p className="hint m0">
-        A warm Steam holds a GPU slot while its user browses the library, so it is off by default.
+        Hot Loading keeps a hidden Steam running while its user browses the library, which holds a GPU slot, so it is off by default.
       </p>
       <div className="rowflex">
-        <label htmlFor="steam-warm-rewarm" className="label">Warm Steam again</label>
+        <label htmlFor="steam-warm-rewarm" className="label">Start Hot Loading again</label>
         <select id="steam-warm-rewarm" className="select" style={{ width: 260 }} value={s.steam_warm_rewarm ?? "library_open"}
           disabled={settings.pending === "steam_warm_rewarm"}
           onChange={(e) => void settings.patch("steam_warm_rewarm", e.target.value as SteamWarmRewarm)}>
@@ -54,11 +54,11 @@ export function SteamWarm({ settings }: { settings: UseSettingsResult }) {
         </select>
       </div>
       <div className="rowflex">
-        <label htmlFor="steam-warm-idle" className="label">Keep a warm Steam for (minutes)</label>
+        <label htmlFor="steam-warm-idle" className="label">Keep Hot Loading for (minutes)</label>
         <input id="steam-warm-idle" className="input" type="number" min={MIN_IDLE_MINUTES} max={MAX_IDLE_MINUTES}
           value={idleValue} style={{ width: 110 }} disabled={settings.pending === "steam_warm_idle_minutes"}
           onChange={(e) => { setIdleText(e.target.value); setIdleError(null); }} />
-        <Button size="sm" aria-label="Save warm Steam minutes" onClick={() => void saveIdle()}
+        <Button size="sm" aria-label="Save Hot Loading minutes" onClick={() => void saveIdle()}
           disabled={settings.pending === "steam_warm_idle_minutes"}>Save</Button>
       </div>
       {idleError && <p className="form-error" role="alert">{idleError}</p>}
