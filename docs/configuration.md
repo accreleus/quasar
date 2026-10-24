@@ -1218,9 +1218,10 @@ it closes the card after its reads, so it never opens a card a console session h
 | `console_ddc` | `ddcutil`, a mapped i2c bus, a power reading. `skip` when the image has no `ddcutil` or the host was not prepared (no `/dev/i2c-*` in the agent) |
 
 While the session lives, the agent never opens that card node for its inventory (the console
-output list is the last reading, with `connected` refreshed from sysfs) and never reads the
-monitor's power state over DDC: that read is over a second of i2c traffic on the display link,
-felt as a hitch by a running game. The session is `running`
+output list is the last reading, with `connected` refreshed from sysfs). It reads the
+monitor's power state over DDC only once the console's local input has been quiet for 10
+minutes, then at most every 5 minutes: that read is over a second of i2c traffic on the
+display link, felt as a hitch by a running game. The session is `running`
 once it is **displaying**: the container is alive, a client holds DRM master on the card and a
 framebuffer is on the connector. The connector's mode is reported as the session's console mode.
 A desktop that does not display within the session's app boot timeout (120 s without one) fails

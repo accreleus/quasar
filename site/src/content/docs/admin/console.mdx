@@ -154,7 +154,8 @@ monitor only once the console has had no keyboard, mouse or controller input for
 Some monitors drop their DisplayPort link when powered off, which looks like an
 unplug and is not stopped. To stop the session once its display has been gone a
 while, set `QUASAR_CONSOLE_DISCONNECT_GRACE` (a Go duration; `0` stops at once) on
-the control plane.
+the control plane. When it is set, it is the wait for a monitor read as off too,
+in place of the 10 minutes.
 
 ## Readiness
 
