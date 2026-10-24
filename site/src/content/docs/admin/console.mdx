@@ -147,10 +147,14 @@ off (which needs DDC; otherwise unplug it) and comes back, or you turn **Auto-st
 display** off and on. A restart of the agent or the control plane is a fresh start, and
 lets it start again.
 
-A monitor switching off doesn't end the auto-started session: some monitors
-drop their DisplayPort link when powered off, indistinguishable from an unplug
-to the connector. To stop the session once that state has lasted a while, set
-`QUASAR_CONSOLE_DISCONNECT_GRACE` (a Go duration; `0` stops at once) on the control plane.
+A monitor switched off stops the auto-started session 10 minutes after the agent
+reads it as off over DDC/CI. While the console desktop runs, the agent reads the
+monitor only once the console has had no keyboard, mouse or controller input for
+10 minutes, then every 5 minutes, so a game with recent input never sees the read.
+Some monitors drop their DisplayPort link when powered off, which looks like an
+unplug and is not stopped. To stop the session once its display has been gone a
+while, set `QUASAR_CONSOLE_DISCONNECT_GRACE` (a Go duration; `0` stops at once) on
+the control plane.
 
 ## Readiness
 

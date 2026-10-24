@@ -216,7 +216,7 @@ About fifteen more tuning settings exist; leave them unless you've measured a pr
 | `QUASAR_APP_PGID` | unset | Run apps as this group ID. |
 | `QUASAR_APP_PIDS_LIMIT` | `8192` | Process limit. |
 | `QUASAR_IDLE_TIMEOUT_SECS` | `120` | End idle sessions after this long. |
-| `QUASAR_CONSOLE_DISCONNECT_GRACE` | unset (never) | Control plane. Stop an auto-started console session once its display connector has been absent this long (a Go duration; `0` stops at once); unset never stops it. |
+| `QUASAR_CONSOLE_DISCONNECT_GRACE` | unset (never; 10 min for a monitor read as off) | Control plane. Stop an auto-started console session once its display connector has been absent this long (a Go duration; `0` stops at once). Unset, an absent connector never stops it, but a monitor still connected that the agent reads as off over DDC/CI stops it after 10 minutes. |
 
 ## Audio and microphone
 
