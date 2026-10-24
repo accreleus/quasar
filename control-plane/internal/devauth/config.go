@@ -12,7 +12,9 @@
 //  2. Flag set while QUASAR_ENV=production ⇒ the process refuses to boot.
 //  3. The key is per-boot and random. Nothing persists it across boots.
 //  4. Every enabled boot emits a WARN banner naming the flag.
-//  5. Wrong or missing key ⇒ 401 with no message or timing distinction.
+//  5. Plain HTTP is refused before the key is looked at, unless the peer is
+//     loopback or QUASAR_DEV_AGENT_INSECURE_HTTP=1 (#594).
+//  6. Wrong or missing key ⇒ 401 with no message or timing distinction.
 //
 // The endpoint is provisioning, not a bypass: it creates a real users row and a
 // real token, and RequireAuth → RequireAdmin is untouched.
@@ -30,6 +32,11 @@ const (
 	EnvFlag    = "QUASAR_DEV_AGENT_AUTH" // "1" enables; anything else leaves the route unregistered
 	EnvName    = "QUASAR_ENV"            // "production" makes the flag fatal
 	EnvKeyPath = "QUASAR_DEV_AGENT_KEY_PATH"
+	// "1" serves the route over plain HTTP to any peer. Only for a stack whose
+	// HTTP port is published on the machine's loopback: a published port reaches
+	// the container from the engine's bridge gateway, never from loopback, so
+	// the route cannot tell the machine's own tooling from the network.
+	EnvInsecureHTTP = "QUASAR_DEV_AGENT_INSECURE_HTTP"
 )
 
 // DefaultKeyPath is where the per-boot key is written for host-side tooling
@@ -62,14 +69,17 @@ type Config struct {
 	Env string
 	// KeyPath is where the per-boot key file is written.
 	KeyPath string
+	// InsecureHTTP is EnvInsecureHTTP.
+	InsecureHTTP bool
 }
 
 // LoadConfig reads the environment. It performs no validation — call Validate.
 func LoadConfig() Config {
 	return Config{
-		Enabled: strings.TrimSpace(os.Getenv(EnvFlag)) == "1",
-		Env:     strings.TrimSpace(os.Getenv(EnvName)),
-		KeyPath: envOr(EnvKeyPath, DefaultKeyPath),
+		Enabled:      strings.TrimSpace(os.Getenv(EnvFlag)) == "1",
+		Env:          strings.TrimSpace(os.Getenv(EnvName)),
+		KeyPath:      envOr(EnvKeyPath, DefaultKeyPath),
+		InsecureHTTP: strings.TrimSpace(os.Getenv(EnvInsecureHTTP)) == "1",
 	}
 }
 

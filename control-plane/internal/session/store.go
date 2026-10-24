@@ -71,9 +71,13 @@ var (
 // tile family 409s and a user who clicked a game would otherwise see only a
 // generic failure.
 type HomeInUseError struct {
-	// SessionID is never empty when this type is returned; a guard that cannot
-	// name the conflict returns plain ErrHomeInUse.
+	// SessionID is empty when the holder may not be named: a parked session
+	// (control-api.md §Warm Steam). writeHomeInUse then omits it.
 	SessionID string
+	// parkedID / releasedID is that unnamed holder, a parked session or a
+	// released held runtime, for the launch path's 503 (LaunchByProfile). Never
+	// serialized.
+	parkedID, releasedID string
 	// Stopping: the session is already tearing down, so the caller only has to
 	// retry in a moment (#434). It changes the message, never the code.
 	Stopping bool
@@ -195,6 +199,9 @@ type LaunchApp struct {
 	// everything itself (the byte-identical path). Logging only: the fields above
 	// are already the merged effective values when GetLaunchApp returns.
 	RuntimePresetID *string
+	// SteamFamily: the effective runtime app is the Steam library provider, so
+	// this is the Steam parent app or one of its tiles (amendment 39).
+	SteamFamily bool
 }
 
 // Session is the domain view of a sessions row (the fields the lifecycle and the
@@ -219,13 +226,22 @@ type Session struct {
 	// StopReason (migration 0101) is the session_stop reason recorded with the
 	// move to `stopping`, nil when the control plane never stopped the session.
 	// Not client-safe as is: see clientStopReason.
-	StopReason  *string
-	HomeSeed    json.RawMessage
-	Width       int32
-	Height      int32
-	FPS         int32
-	BitrateKbps int32
-	H264Profile string
+	StopReason *string
+	HomeSeed   json.RawMessage
+	// Kind is "play" or "parked" (amendment 39, migration 0105); every
+	// user-facing read and count leaves parked rows out.
+	Kind string
+	// LaunchProgress is the agent's last accepted shader progress, nil
+	// otherwise. Display only, never a lifecycle input.
+	LaunchProgress json.RawMessage
+	// AdoptSessionID is the runtime a dispatch asks the agent to adopt (a claim
+	// or a park on exit). Not persisted.
+	AdoptSessionID string
+	Width          int32
+	Height         int32
+	FPS            int32
+	BitrateKbps    int32
+	H264Profile    string
 	// Codec is the session's resolved video codec (wire vocabulary), default
 	// "h264". H264Profile applies to h264 only; the agent ignores it otherwise.
 	Codec string
@@ -379,7 +395,8 @@ func (s *Store) GetLaunchApp(ctx context.Context, appID string) (LaunchApp, erro
 		       -- every per-tile edit.
 		       apps.default_profile_id, apps.profile_policy,
 		       rp.id::text, rp.image, rp.args, rp.env, rp.mounts, rp.managed_home, rp.home_container_path,
-		       rp.network
+		       rp.network,
+		       COALESCE(parent.library_provider, apps.library_provider) = 'steam'
 		FROM apps
 		-- The effective runtime app. Self-join, LEFT so an ordinary app is unchanged.
 		LEFT JOIN apps parent ON parent.id = apps.parent_app_id
@@ -395,7 +412,7 @@ func (s *Store) GetLaunchApp(ctx context.Context, appID string) (LaunchApp, erro
 		&a.DefaultWidth, &a.DefaultHeight, &a.DefaultFPS, &a.DefaultBitrateKbps,
 		&a.ManagedHome, &a.HomeContainerPath, &a.DefaultProfileID, &a.ProfilePolicy,
 		&presetID, &presetImage, &presetArgs, &presetEnv, &presetMounts, &presetHome, &presetPath,
-		&presetNetwork)
+		&presetNetwork, &a.SteamFamily)
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.logIfDiscoverySuspended(ctx, appID)
 		return LaunchApp{}, ErrNotFound
@@ -480,7 +497,7 @@ func (s *Store) ListByUser(ctx context.Context, userID, cursor string, limit int
 	}
 
 	rows, err := s.pool.Query(ctx, selectSessionSQL+`
-		WHERE user_id = $1::uuid
+		WHERE user_id = $1::uuid AND kind = 'play'
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3
 	`, userID, limit+1, offset)
@@ -683,10 +700,11 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, only ro
 	var curDetail *string
 	var assignedHost *string
 	var sessionUser, sessionApp string
-	var boundHome, boundDigest *string
+	var boundHome, boundDigest, adopts *string
 	err = tx.QueryRow(ctx, `SELECT state,state_detail,host_id::text,user_id::text,app_id::text,
-		managed_home_id::text,managed_home_mount_sha256 FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).
-		Scan(&cur, &curDetail, &assignedHost, &sessionUser, &sessionApp, &boundHome, &boundDigest)
+		managed_home_id::text,managed_home_mount_sha256,adopt_session_id::text
+		FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).
+		Scan(&cur, &curDetail, &assignedHost, &sessionUser, &sessionApp, &boundHome, &boundDigest, &adopts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}
@@ -727,7 +745,10 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, only ro
 	// Same-state reports update detail without churning lifecycle timestamps,
 	// carrying launch sub-stages while the state stays `starting`.
 	if cur == to && detail != nil {
-		_, err = tx.Exec(ctx, `UPDATE sessions SET state_detail = $2 WHERE id = $1::uuid`, id, detail)
+		// launch_progress lives only while the detail is `app booting`.
+		_, err = tx.Exec(ctx, `UPDATE sessions SET state_detail = $2,
+			launch_progress = CASE WHEN $2 = 'app booting' THEN launch_progress END
+			WHERE id = $1::uuid`, id, detail)
 		if err != nil {
 			return Session{}, fmt.Errorf("update state detail: %w", err)
 		}
@@ -738,12 +759,23 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, only ro
 			    state_detail  = COALESCE($3, state_detail),
 			    error_message = CASE WHEN $2 = 'failed' THEN $4 ELSE error_message END,
 			    stop_reason   = COALESCE(stop_reason, $5),
+			    launch_progress = CASE WHEN $2 = 'running' AND COALESCE($3, state_detail) = 'app booting'
+			                           THEN launch_progress END,
 			    started_at    = CASE WHEN $2 = 'running' AND started_at IS NULL THEN now() ELSE started_at END,
 			    ended_at      = CASE WHEN $2 IN ('stopped','failed') AND ended_at IS NULL THEN now() ELSE ended_at END
 			WHERE id = $1::uuid
 		`, id, string(to), detail, errMsg, stopReason)
 		if err != nil {
 			return Session{}, fmt.Errorf("update state: %w", err)
+		}
+	}
+	// The agent reports under an adopting id only once the runtime is adopted
+	// or the old one has exited, so the hold moves here and not at the assign
+	// (control-api.md §Warm Steam). A terminal first report proves neither.
+	if reportHostID != "" && adopts != nil && !to.IsTerminal() {
+		if _, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id = $1::uuid
+			WHERE pending_home_session_id = $2::uuid AND host_id = $3::uuid`, id, *adopts, reportHostID); err != nil {
+			return Session{}, fmt.Errorf("move adopted home hold: %w", err)
 		}
 	}
 	if reportHostID != "" && cur != StateRunning && to == StateRunning {
@@ -797,7 +829,8 @@ func (s *Store) SetStateDetail(ctx context.Context, id, detail string) error {
 		return nil // no such row to update; mirrors the 0-rows-affected no-op below
 	}
 	_, err := s.pool.Exec(ctx, `
-		UPDATE sessions SET state_detail = $2
+		UPDATE sessions SET state_detail = $2,
+		    launch_progress = CASE WHEN $2 = 'app booting' THEN launch_progress END
 		WHERE id = $1::uuid AND state NOT IN ('stopped','failed')
 	`, id, detail)
 	if err != nil {
@@ -813,7 +846,7 @@ func (s *Store) CommitSwappedApp(ctx context.Context, id, newAppID, detail strin
 		return nil // no such row to update; mirrors the 0-rows-affected no-op below
 	}
 	_, err := s.pool.Exec(ctx, `
-		UPDATE sessions SET app_id = $2::uuid, state_detail = $3
+		UPDATE sessions SET app_id = $2::uuid, state_detail = $3, launch_progress = NULL
 		WHERE id = $1::uuid AND state = 'running'
 	`, id, newAppID, detail)
 	if err != nil {
@@ -837,7 +870,8 @@ func (s *Store) ReapHost(ctx context.Context, hostID, reason string) (int64, err
 		    state         = 'failed',
 		    state_detail  = 'host_lost',
 		    error_message = $2,
-		    ended_at      = now()
+		    ended_at      = now(),
+		    launch_progress = NULL
 		WHERE host_id = $1::uuid
 		  AND state NOT IN ('stopped','failed')
 	`, hostID, reason)
@@ -872,7 +906,8 @@ func (s *Store) ReapHostExceptRunning(ctx context.Context, hostID, reason string
 		    state         = 'failed',
 		    state_detail  = 'host_lost',
 		    error_message = $2,
-		    ended_at      = now()
+		    ended_at      = now(),
+		    launch_progress = NULL
 		WHERE host_id = $1::uuid
 		  AND state NOT IN ('stopped','failed','running')
 		RETURNING id::text
@@ -909,7 +944,8 @@ func (s *Store) ReapHeartbeatMissing(ctx context.Context, hostID string, running
 		    state = CASE WHEN state = 'stopping' THEN 'stopped' ELSE 'failed' END,
 		    state_detail = 'host_lost',
 		    error_message = CASE WHEN state = 'stopping' THEN NULL ELSE 'agent no longer running this session' END,
-		    ended_at = now()
+		    ended_at = now(),
+		    launch_progress = NULL
 		WHERE host_id = $1::uuid
 		  AND (state = 'running' OR (state = 'stopping' AND started_at IS NOT NULL))
 		  AND NOT (id::text = ANY($2::text[]))
@@ -1097,11 +1133,12 @@ func (s *Store) NonTerminalSessionIDsOnHost(ctx context.Context, hostID string) 
 //     as tile-vs-parent does. `s.app_id = $2` would catch only the parent.
 //
 // It returns the conflicting SESSION ID, not a count (§2.1's 409 body carries
-// it). $3 (excludeID) is "" at the launch call site, so the exclusion must stay
-// a short-circuited text comparison: an unconditional `::uuid` cast would error
-// on the empty string instead of being the always-true no-op that path needs.
+// it), with its kind and whether it is stopping (homeInUse). $3 (excludeID) is
+// "" at the launch call site, so the exclusion must stay a short-circuited text
+// comparison: an unconditional `::uuid` cast would error on the empty string
+// instead of being the always-true no-op that path needs.
 const liveHomeSessionSQL = `
-	SELECT s.id::text
+	SELECT s.id::text, s.kind, s.state = 'stopping'
 	FROM sessions s
 	JOIN apps a ON a.id = s.app_id
 	WHERE s.user_id = $1::uuid
@@ -1110,39 +1147,59 @@ const liveHomeSessionSQL = `
 	  AND s.state IN ('pending','assigned','starting','running','stopping')
 	LIMIT 1`
 
-// HasLiveUserAppSession is the swap-path single-writer guard (P5-04): the id of
-// an active session the user already has ON THE SAME HOME as homeAppID, other
-// than excludeID, or "". excludeID is the session being swapped, so a same-app
-// swap of the only session is never blocked. Keyed on the home-owning app (see
-// liveHomeSessionSQL), so a swap into a tile collides with its parent and its
-// siblings.
-func (s *Store) HasLiveUserAppSession(ctx context.Context, userID, homeAppID, excludeID string) (string, error) {
+// HasLiveUserAppSession is the swap-path single-writer guard (P5-04): the
+// conflict with an active session the user already has ON THE SAME HOME as
+// homeAppID, other than excludeID, or nil. excludeID is the session being
+// swapped, so a same-app swap of the only session is never blocked. Keyed on the
+// home-owning app (see liveHomeSessionSQL), so a swap into a tile collides with
+// its parent and its siblings.
+func (s *Store) HasLiveUserAppSession(ctx context.Context, userID, homeAppID, excludeID string) (*HomeInUseError, error) {
 	// The same per-user advisory lock the scheduler holds for launches. Without
 	// it, a swap-into-C racing a launch-of-C could both pass and produce two home
 	// writers. Xact-scoped, so this serializes against any in-flight
 	// scheduleAttempt for the user.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return "", fmt.Errorf("begin swap-guard tx: %w", err)
+		return nil, fmt.Errorf("begin swap-guard tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
 
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock($1, hashtext($2::text))`, lockNamespaceUser, userID); err != nil {
-		return "", fmt.Errorf("swap-guard lock: %w", err)
+		return nil, fmt.Errorf("swap-guard lock: %w", err)
 	}
 
-	var conflictID string
-	err = tx.QueryRow(ctx, liveHomeSessionSQL, userID, homeAppID, excludeID).Scan(&conflictID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		conflictID = ""
-	} else if err != nil {
-		return "", fmt.Errorf("has live user app session: %w", err)
+	conflict, err := homeInUse(ctx, tx, userID, homeAppID, excludeID)
+	if err != nil {
+		return nil, fmt.Errorf("has live user app session: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return "", fmt.Errorf("commit swap-guard tx: %w", err)
+		return nil, fmt.Errorf("commit swap-guard tx: %w", err)
 	}
-	return conflictID, nil
+	return conflict, nil
+}
+
+// homeInUse runs liveHomeSessionSQL: nil when no live session holds the home. A
+// parked holder is never named (control-api.md §Warm Steam, "Claim").
+func homeInUse(ctx context.Context, q rowQuerier, userID, homeAppID, excludeID string) (*HomeInUseError, error) {
+	var id, kind string
+	var stopping bool
+	err := q.QueryRow(ctx, liveHomeSessionSQL, userID, homeAppID, excludeID).Scan(&id, &kind, &stopping)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if kind == KindParked {
+		return &HomeInUseError{Stopping: stopping, parkedID: id}, nil
+	}
+	return &HomeInUseError{SessionID: id, Stopping: stopping}, nil
+}
+
+// rowQuerier is the QueryRow half of a pool or a transaction.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // HomeHostForApp returns the canonical owner for the pre-schedule tile pin, or
@@ -1204,6 +1261,7 @@ type DeviceProbe struct {
 	RTTMs            int32
 	MaxDecodeHeight  int32
 	DisplayRefreshHz float64
+	BrowserName      string // capabilities.browser.name; feeds profile eligibility only
 	// ClientType is the native-client identity tag (capabilities.client_type),
 	// "" for the web probe. Never an eligibility gate for the tier ladder; read
 	// only by nativeHighEligible.
@@ -1216,6 +1274,9 @@ type DeviceProbe struct {
 	// hard-gates those codecs on them being true (clamps 2+3).
 	HEVC bool
 	AV1  bool
+	// H264Refused is a boolean false in capabilities.codecs.h264, the one value
+	// that refuses H.264 (control-api.md §Codec resolution, amendment 35).
+	H264Refused bool
 }
 
 // parseDeviceProbe projects user_devices.capabilities onto DeviceProbe. Missing,
@@ -1230,6 +1291,8 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 		Display         struct {
 			RefreshHz *float64 `json:"refresh_hz"`
 		} `json:"display"`
+		// any, so a browser of the wrong shape loses its name, not the whole probe.
+		Browser any `json:"browser"`
 		// Optional native-client fields; the web probe omits them. Parsed
 		// leniently: any absent or odd shape yields the zero value, not an error.
 		ClientType string `json:"client_type"`
@@ -1243,6 +1306,8 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 		Codecs struct {
 			HEVC bool `json:"hevc"`
 			AV1  bool `json:"av1"`
+			// any, so a non-boolean h264 accepts H.264 instead of losing the whole probe.
+			H264 any `json:"h264"`
 		} `json:"codecs"`
 	}
 	if err := json.Unmarshal(rawCaps, &caps); err != nil {
@@ -1283,10 +1348,14 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 	}
 	// client_type and the H.264 decode profiles, for native-high eligibility only.
 	// Never affects freshness or the tier gate above.
+	if b, ok := caps.Browser.(map[string]any); ok {
+		p.BrowserName, _ = b["name"].(string)
+	}
 	p.ClientType = caps.ClientType
 	p.H264DecodeProfiles = caps.Decode.H264.Profiles
 	p.HEVC = caps.Codecs.HEVC
 	p.AV1 = caps.Codecs.AV1
+	p.H264Refused = caps.Codecs.H264 == false
 	return p
 }
 
@@ -1466,6 +1535,7 @@ func (s *Store) UpdateSessionNegotiatedCodec(ctx context.Context, id, codec stri
 const sessionCols = `id::text, user_id::text, app_id::text, host_id::text, gpu_id::text,
 	state, state_detail, error_message,
 	failure_code, app_log_tail, stop_reason, home_seed,
+	kind, launch_progress,
 	width, height, fps, bitrate_kbps, h264_profile,
 	codec,
 	profile_id,
@@ -1523,6 +1593,7 @@ func scanSessionRow(r row, extra ...any) (Session, error) {
 		&s.ID, &s.UserID, &s.AppID, &s.HostID, &s.GPUID,
 		&st, &s.StateDetail, &s.ErrorMessage,
 		&s.FailureCode, &s.AppLogTail, &s.StopReason, &s.HomeSeed,
+		&s.Kind, &s.LaunchProgress,
 		&s.Width, &s.Height, &s.FPS, &s.BitrateKbps, &s.H264Profile,
 		&s.Codec,
 		&s.ProfileID,

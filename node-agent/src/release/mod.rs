@@ -172,10 +172,16 @@ impl ReleaseManager {
             return false;
         }
         let now = crate::buildinfo::discover_owned(socket);
+        crate::buildinfo::note_observed(&now);
         let registered = crate::buildinfo::install_facts();
         now.updater_present == Some(true)
             && (now.recovery_actor_source_commit != registered.recovery_actor_source_commit
                 || now.recovery_actor_version != registered.recovery_actor_version)
+    }
+
+    /// The recovery actor's agent socket; `None` on a host with no actor.
+    pub fn actor_socket(&self) -> Option<&Path> {
+        self.socket.as_deref()
     }
 
     pub fn from_env() -> Arc<Self> {
@@ -202,16 +208,20 @@ impl ReleaseManager {
     /// automatic restore (ADR 0004) the restored agent normally connects while
     /// the actor is still verifying that restore. Without a watcher the attempt
     /// would sit `verifying` on the control plane for ever.
+    ///
+    /// The status read runs on its own thread: it may take its whole 10 s, and the
+    /// caller is the only reader of the control-plane socket (#627).
     pub fn attach_upstream(self: &Arc<Self>, tx: mpsc::Sender<AgentMsg>) -> UpstreamGuard {
         *self.upstream.write().unwrap() = Some(tx);
-        match self.replayable_results() {
+        let mgr = self.clone();
+        std::thread::spawn(move || match mgr.replayable_results() {
             Some(results) => {
                 for res in results {
-                    self.replay(res);
+                    mgr.replay(res);
                 }
             }
-            None => self.adopt_when_answered(),
-        }
+            None => mgr.adopt_when_answered(),
+        });
         UpstreamGuard { mgr: self.clone() }
     }
 

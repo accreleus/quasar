@@ -714,8 +714,10 @@ pub fn check_ddc(v: &ConsoleView) -> ReadinessCheck {
     if d.all_off {
         return super::warn_check(
             CHECK_DDC,
-            "every mapped monitor currently reads DDC power off/standby".into(),
-            "Turn the monitor on.".into(),
+            "every mapped monitor reads DDC power off/standby, or is showing another \
+             input than QUASAR_CONSOLE_INPUT_SOURCE"
+                .into(),
+            "Turn the monitor on and switch it to this host's input.".into(),
         );
     }
     super::pass(

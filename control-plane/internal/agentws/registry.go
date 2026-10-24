@@ -66,7 +66,9 @@ func NewRegistry(log *slog.Logger) *Registry {
 type conn struct {
 	hostID                    string
 	terminalHomeCleanupV1     bool
+	parkedSessionsV1          bool
 	policyTyped               bool
+	consoleReports            atomic.Int32 // capacity reports carrying console_capabilities
 	policyIdle                bool
 	policyAccepted            []string
 	policyAcknowledged        atomic.Bool
@@ -324,6 +326,16 @@ type homeCommandEpoch struct {
 }
 
 func (e *homeCommandEpoch) SupportsHomeCleanup() bool { return e.conn.terminalHomeCleanupV1 }
+
+// SupportsParkedSessions is this exact connection's parked_sessions_v1.
+func (e *homeCommandEpoch) SupportsParkedSessions() bool { return e.conn.parkedSessionsV1 }
+
+// SupportsParkedSessions reports parked_sessions_v1 for the host's current
+// connection; a disconnected host has none.
+func (r *Registry) SupportsParkedSessions(hostID string) bool {
+	c, ok := r.get(hostID)
+	return ok && c.parkedSessionsV1
+}
 
 func (r *Registry) CurrentHomeCommandEpoch(hostID string) (HomeCommandEpoch, bool) {
 	c, ok := r.get(hostID)

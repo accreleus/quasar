@@ -39,6 +39,7 @@ function mount() {
       token: "tok",
       visibleLists: LISTS,
       onClearFilter: () => {},
+      viewKey: "",
       smoothScroll: false,
     }),
   );

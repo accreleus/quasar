@@ -95,7 +95,6 @@ continues to verification. Nothing is retried on its own.
   length of the replacement. The control plane writes the request down before it asks, and the
   build that boots reads the actor's verdict back. A new control plane that never becomes
   healthy is put back automatically, unless the release changes the database (below).
-
 ### Applying from the console
 
 Admin › Fleet › Releases lists every target and, for an eligible host, offers **Apply**. The
@@ -238,6 +237,10 @@ on the path users run. It is never offered and never unattended. Setup and rules
 
 ---
 
+## App-image updates and the Steam preset
+
+App images (Admin ▸ Library ▸ Images) update separately from platform releases, on every kind of install. If your Steam app uses a runtime preset you made yourself, rather than the one the Steam image installed, add `STEAM_STARTUP_FLAGS=-bigpicture` to it to keep Big Picture on the plain Steam app.
+
 ## Back up the database
 
 **Quasar's own database** lives in the `quasar-postgres-data` volume. The recovery actor dumps it
@@ -306,6 +309,26 @@ docker logs --tail 50 quasar-recovery
 
 `docker exec quasar-recovery quasar-recovery status` prints the machine's inventory and one line
 for every service that is missing, unhealthy or in the way.
+
+**The actor is older than what it manages.** An update whose `seed.json` write failed
+(`token="actor-seed-file-not-updated"`) used to leave the file on the previous actor image for
+good, so removing every actor container made the seed re-create an actor older than the
+services it manages. Now the new actor writes the file again at every start
+(`actor-seed-file-healed`; `actor-seed-file-stale` while the write still fails). It does so only
+while the attempt that moved it is among the last 16 finished ones; after that a stale file only
+gets the `actor-seed-file-differs` warning.
+
+What this does not fix: an older actor that finds an update step journalled at a recipe
+revision it does not carry continues it, or fails every start with
+`actor-resume-failed … recipe_unsupported`. The services keep running; the install pass stops at
+the one the actor cannot render. That case is tracked in #794. Until then, on a GPU host apply
+the release again from Fleet ▸ Releases: its first step moves the actor, which rewrites
+`seed.json`. Then `docker exec quasar-recovery quasar-recovery status` shows the new digest.
+On the control plane's own machine, combined or control-only, no release apply moves the actor:
+the control plane reads up to date, and on a combined machine the host step never sends the
+actor. Developer apply (Fleet ▸ Releases) can move it there, naming the new actor digest
+together with the control plane's current one. That is also tracked in #794. On either machine,
+removing the actor container does not help, the seed re-creates the old one.
 
 **An owner conflict** is a container that looks like a Quasar service but lacks this
 installation's labels: a leftover Compose stack, or a definition a stack manager still holds. The

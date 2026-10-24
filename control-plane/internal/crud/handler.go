@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -163,15 +164,19 @@ func (h *Handler) Register(mux httpx.Router, requireAuth, requireAdmin func(http
 	// Home rail (2026-08-05): auth only, no admin variant — resolved entirely from
 	// the bearer identity, so an admin's home page is their own. See highlights.go.
 	mux.Handle("GET /v1/me/highlights", requireAuth(http.HandlerFunc(h.handleHighlights)))
+	mux.Handle("GET /v1/me/play-history", requireAuth(http.HandlerFunc(h.handlePlayHistory)))
 }
 
 // --- DTOs (response shapes match schema columns) ---
 
 type appResp struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Description string  `json:"description"`
-	CoverURL    *string `json:"cover_url"`
+	// Amendment 38: always serialized; genres is [] when unknown, never null.
+	TitleFacts
+	AddedAt     time.Time `json:"added_at"`
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	CoverURL    *string   `json:"cover_url"`
 	// HeroURL (UI-P7): wide hero/detail crop. Null = gradient-tile default.
 	HeroURL *string `json:"hero_url"`
 	// Kind: presentation-only, always serialized.
@@ -259,7 +264,13 @@ type hostResp struct {
 }
 
 func appToResp(a App) appResp {
+	facts := a.TitleFacts
+	if facts.Genres == nil {
+		facts.Genres = []string{}
+	}
 	return appResp{
+		TitleFacts:         facts,
+		AddedAt:            a.CreatedAt,
 		ID:                 a.ID,
 		Name:               a.Name,
 		Description:        a.Description,

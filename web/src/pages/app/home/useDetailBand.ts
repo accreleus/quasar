@@ -3,7 +3,7 @@
 // profiles being evaluated for it. DetailBand renders it; this owns when it
 // opens, where it opens, and what it is fed.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as libraryApi from "../../../api/library";
 import { ApiError } from "../../../api/client";
 import type { App, ProfilesResponse } from "../../../api/types";
@@ -24,6 +24,10 @@ export interface UseDetailBandOptions {
   /** Clears the kind filter so a rail card for a filtered-out app can still be
    *  revealed. */
   onClearFilter: () => void;
+  /** Identifies the filter, search and view the grids were built from. The
+   *  band closes when this changes after it opened, not when it changes in the
+   *  same commit that opens it (a rail card clears the filter and opens). */
+  viewKey: string;
   /** Whether to animate the scroll that brings the band into view. */
   smoothScroll: boolean;
 }
@@ -32,6 +36,7 @@ export function useDetailBand({
   token,
   visibleLists,
   onClearFilter,
+  viewKey,
   smoothScroll,
 }: UseDetailBandOptions) {
   const [openId, setOpenId] = useState<string | null>(null);
@@ -44,6 +49,7 @@ export function useDetailBand({
   const detailRef = useRef<HTMLDivElement>(null);
   const optionsToggleRef = useRef<HTMLButtonElement>(null);
   const profilesForRef = useRef<string | null>(null);
+  const openedUnderRef = useRef(viewKey);
 
   const fetchProfiles = useCallback(
     async (app: App): Promise<ProfilesResponse | null> => {
@@ -80,36 +86,62 @@ export function useDetailBand({
     profilesForRef.current = null;
   }, [openId]);
 
-  /** Drops the band without moving focus — for a filter or view change, where
-   *  the anchor row may no longer exist and nothing was dismissed by hand. */
-  const reset = useCallback(() => {
+  // A filter or view change drops the band without moving focus: its anchor
+  // row may no longer exist and nothing was dismissed by hand. `open` records
+  // the key of the render that made it, so a band the reveal effect opens in
+  // the same commit as the key change is not closed again.
+  useEffect(() => {
+    if (openedUnderRef.current === viewKey) return;
+    openedUnderRef.current = viewKey;
     setOpenId(null);
     setInsertAfterId(null);
+  }, [viewKey]);
+
+  /** The last tile in `id`'s row, by measured `offsetTop` (libraryGrid.lastIndexInRow:
+   *  column-count agnostic), or null while `id` has no box: a tile the windowed
+   *  grid has not mounted yet. Unmounted tiles must not be measured as a row. */
+  const rowEndOf = useCallback((list: readonly App[], id: string): string | null => {
+    const ids = list.map((a) => a.id);
+    const index = ids.indexOf(id);
+    if (index < 0) return id;
+    if (!tileBoxOf(tileRefs.current.get(id))) return null;
+    const offsetTops = ids.map((i) => tileBoxOf(tileRefs.current.get(i))?.offsetTop ?? -1);
+    return ids[lastIndexInRow(offsetTops, index)] ?? id;
   }, []);
 
   /**
-   * Opens `app`'s band anchored after the last tile in its row. `list` must be
-   * the grid the tile actually lives in (the source group in Library view).
-   * Row detection is by measured `offsetTop` (libraryGrid.lastIndexInRow) —
-   * column-count agnostic.
+   * Shows `app`'s band anchored after the last tile in its row, even if it is
+   * already open. `list` must be the grid the tile actually lives in (the source group in Library view). A tile outside
+   * the windowed grid's mounted rows (rail card, gated launch) is pinned by
+   * `openId` first; the anchor is found once its row exists (below).
    */
-  const open = useCallback(
+  const show = useCallback(
     (app: App, list: readonly App[]) => {
-      if (openId === app.id) {
-        close();
-        return;
-      }
-      const ids = list.map((a) => a.id);
-      const index = ids.indexOf(app.id);
-      const offsetTops = ids.map((id) => tileBoxOf(tileRefs.current.get(id))?.offsetTop ?? 0);
-      const lastIdx = index >= 0 ? lastIndexInRow(offsetTops, index) : -1;
+      openedUnderRef.current = viewKey;
       setOpenId(app.id);
-      setInsertAfterId(ids[lastIdx] ?? app.id);
+      setInsertAfterId(rowEndOf(list, app.id));
       setOptionsOpen(false);
       ensureProfiles(app);
     },
-    [openId, close, ensureProfiles],
+    [viewKey, ensureProfiles, rowEndOf],
   );
+
+  /** A tile click: opens the band, or closes it when it is already open. */
+  const open = useCallback(
+    (app: App, list: readonly App[]) => {
+      if (openId === app.id) close();
+      else show(app, list);
+    },
+    [openId, close, show],
+  );
+
+  // A band opened for an unmounted tile has no anchor yet: its row mounted with
+  // the render that set `openId`, so measure it before paint.
+  useLayoutEffect(() => {
+    if (!openId || insertAfterId) return;
+    const list = visibleLists.find((l) => l.some((a) => a.id === openId));
+    setInsertAfterId((list && rowEndOf(list, openId)) ?? openId);
+  }, [openId, insertAfterId, visibleLists, rowEndOf]);
 
   /** Find the currently-rendered list that contains `id`, or null. */
   const listContaining = useCallback(
@@ -127,14 +159,14 @@ export function useDetailBand({
     (app: App, expandOptions: boolean) => {
       const list = listContaining(app.id);
       if (list) {
-        if (openId !== app.id) open(app, list);
+        show(app, list);
         if (expandOptions) setOptionsOpen(true);
         return;
       }
       onClearFilter();
       setPendingOptions({ id: app.id, expand: expandOptions });
     },
-    [listContaining, openId, open, onClearFilter],
+    [listContaining, show, onClearFilter],
   );
 
   useEffect(() => {
@@ -144,9 +176,9 @@ export function useDetailBand({
     const expand = pendingOptions.expand;
     setPendingOptions(null);
     if (!list || !app) return;
-    if (openId !== app.id) open(app, list);
+    show(app, list);
     if (expand) setOptionsOpen(true);
-  }, [pendingOptions, listContaining, openId, open]);
+  }, [pendingOptions, listContaining, show]);
 
   // The band is anchored after the last tile of its row, and a resize
   // recomposes the rows: without this the band sits mid-row until the next
@@ -161,10 +193,7 @@ export function useDetailBand({
         timer = null;
         const list = visibleLists.find((l) => l.some((a) => a.id === openId));
         if (!list) return;
-        const ids = list.map((a) => a.id);
-        const index = ids.indexOf(openId);
-        const offsetTops = ids.map((id) => tileBoxOf(tileRefs.current.get(id))?.offsetTop ?? 0);
-        setInsertAfterId(ids[lastIndexInRow(offsetTops, index)] ?? openId);
+        setInsertAfterId(rowEndOf(list, openId) ?? openId);
       }, 150);
     };
     window.addEventListener("resize", onResize);
@@ -172,7 +201,7 @@ export function useDetailBand({
       if (timer !== null) clearTimeout(timer);
       window.removeEventListener("resize", onResize);
     };
-  }, [openId, visibleLists]);
+  }, [openId, visibleLists, rowEndOf]);
 
   useEffect(() => {
     if (!openId) return;
@@ -213,7 +242,6 @@ export function useDetailBand({
       fetchProfiles,
       open,
       close,
-      reset,
       reveal,
     }),
     [
@@ -226,7 +254,6 @@ export function useDetailBand({
       fetchProfiles,
       open,
       close,
-      reset,
       reveal,
     ],
   );

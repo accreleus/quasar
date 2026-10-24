@@ -58,10 +58,12 @@
           "curl", "gst-inspect-1.0", "gst-launch-1.0",
           "pipewire", "wireplumber", "pactl",
           "avahi-daemon",
-          "quasar-node-agent", "quasar-node-agent-entrypoint"
+          "quasar-node-agent", "quasar-node-agent-entrypoint",
+          "quasar-launch-helper"
         ],
         "_required_notes": {
-          "quasar-node-agent": "The BAKED binary. Its presence is what lets the deployment stop compiling the agent inside the container."
+          "quasar-node-agent": "The BAKED binary. Its presence is what lets the deployment stop compiling the agent inside the container.",
+          "quasar-launch-helper": "#731: the in-container Steam launch helper. The agent copies it into its runtime dir at start-up and mounts it into derived Steam tiles; without it those sessions report no app_launch_state."
         },
         "forbidden": ["cargo", "rustc", "rustup", "cc", "gcc", "meson", "ninja", "docker", "podman", "weston", "seatd"],
         "_forbidden_notes": {
@@ -78,6 +80,7 @@
           "/opt/gst/lib64/gstreamer-1.0/libgstnvcodec.so",
           "/usr/local/bin/quasar-node-agent",
           "/usr/local/bin/quasar-node-agent-entrypoint",
+          "/usr/local/bin/quasar-launch-helper",
           "/etc/ld.so.conf.d/gst-vulkan.conf",
           "/etc/pipewire/quasar-session.conf",
           "/etc/pipewire/quasar-session-pulse.conf",
@@ -153,6 +156,13 @@
         "_notes": "Verified 2026-07-26 on the live CUDA-built binary: readelf -d shows DT_NEEDED for glib/gst/asound/libc only. libgstcuda-1.0.so itself carries no libcuda DT_NEEDED -- it dlopens. So a --features cuda binary links and starts cleanly on a driver-less host, which is what lets ONE binary serve both vendors. must_start accepts the config-validation exit ('CONTROL_PLANE_URL is required') as success: reaching config validation proves process start and dynamic linking both succeeded."
       },
 
+      "commands": {
+        "must_succeed": {
+          "ldd /usr/local/bin/quasar-launch-helper | grep -q 'statically linked'": "#731: the launch helper runs inside the Steam app image, not this one, so it may need no libc from either; a dynamic build would load this image's glibc and break on another distribution.",
+          "env -i /usr/local/bin/quasar-launch-helper": "#731: the helper starts, and with no -applaunch appid it exits 0, as it must for every app that is not a derived Steam tile."
+        }
+      },
+
       "image_config": {
         "entrypoint_or_cmd_contains": "quasar-node-agent",
         "healthcheck_required": true,
@@ -163,13 +173,14 @@
         "required": [
           "org.quasar.image.role",
           "org.quasar.pins.gwd",
-          "org.quasar.pins.gst",
+          "org.quasar.pins.gst>=1.28.6",
           "org.quasar.pins.plugins-rs",
           "org.quasar.pins.base",
           "org.quasar.source.commit",
           "org.quasar.built.at",
           "org.quasar.recipe"
         ],
+        "_gst_floor_note": "The agent returns its request-aux-sender elements as plain handles, which webrtcbin sinks correctly only from GStreamer 1.28.6 (upstream 23da5cc); under an older one every transport leaks an element. A GST_VERSION rollback below 1.28.6 needs that workaround back in node-agent first (takeover_tests::aux_senders is red there).",
         "_recipe_note": "org.quasar.recipe (ADR 0008): the recipe revision this agent image needs, stamped by build-images.sh from node-agent/src/recipe.rs. A recovery actor refuses to install an image without it (recipe_unsupported).",
         "_notes": "Provenance. Without these, an image pulled from GHCR or built on another box is opaque and `qimg status` cannot say which pins produced it — which is how the lab host and the aux host drifted under one tag undetected (2026-07-26). The build report is the richer local record; these labels are what make ANY image self-describing."
       }
@@ -179,8 +190,8 @@
 
     "dev": {
       "_role": "Build/test environment ONLY. Never deployed as a node-agent. Carries the full toolchain by design.",
-      "size_max_mb": 11500,
-      "_size_note": "Measured 8.73GB on the lab host 2026-07-26 when built with CUDA_ENABLE=0. Once the builder is always CUDA-enabled (spec 4.3) this stage inherits the CUDA toolkit too, so the ceiling allows for that. Re-measure on the first build-images.sh run and tighten.",
+      "size_max_mb": 5500,
+      "_size_note": "Measured 4487MB (4,705,129,522 bytes) on 2026-10-13, built CUDA-on by build-images.sh: about 2.7GB under /usr (the CUDA toolkit is 1.1GB of it), 0.6GB each for /opt/cargo and /opt/rustup, 0.12GB for /opt/gst. It was 8978MB while the toolchain stage used dnf builddep and kept the unpacked crate sources and the GStreamer clone in its layers (#198). 5500MB leaves about 1GB; if the ceiling breaks, find out what grew before raising it in a commit that says why.",
       "packages": {
         "required": ["gcc", "cmake", "meson", "ninja-build", "clang", "weston"],
         "forbidden": []

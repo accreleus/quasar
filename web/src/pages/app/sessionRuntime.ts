@@ -36,7 +36,7 @@ import { mintSignalingToken } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer } from "../../api/types";
 import { setupCapture, type GamepadIdentity } from "../../input/capture";
-import { QuasarSession, type RebindOutcome } from "../../webrtc/session";
+import { QuasarSession, type RebindOutcome, type TakeoverRefusal } from "../../webrtc/session";
 import type { RecoveryState } from "../../webrtc/recovery";
 import { PlayoutController, resolveInitialPlayoutMs } from "../../webrtc/playout";
 import {
@@ -79,6 +79,8 @@ export interface SessionRuntimeSnapshot {
   wsOpen: boolean;
   pcConnected: boolean;
   firstFrame: boolean;
+  /** The host refused this page's takeover; it will get no media (amendment 42). */
+  takeoverRefused: TakeoverRefusal | null;
 }
 
 const IDLE_SNAPSHOT: SessionRuntimeSnapshot = {
@@ -93,6 +95,7 @@ const IDLE_SNAPSHOT: SessionRuntimeSnapshot = {
   wsOpen: false,
   pcConnected: false,
   firstFrame: false,
+  takeoverRefused: null,
 };
 
 export { IDLE_SNAPSHOT };
@@ -187,6 +190,9 @@ export interface TransportLike {
   onAudioTrack: ((stream: MediaStream) => void) | null;
   /** The signalling WebSocket opened. Optional so a fake need not carry it. */
   onSignalingOpen?: (() => void) | null;
+  /** The host's `bye`. Optional so a fake need not carry it. */
+  onHostBye?: (() => void) | null;
+  onTakeoverRefused?: ((refusal: TakeoverRefusal) => void) | null;
   onWebRtcStateChange:
     | ((kind: "ice" | "connection", from: string, to: string) => void)
     | null;
@@ -343,6 +349,12 @@ export interface SessionRuntime {
    *  transition, keeping the video/input subtree off the 1 Hz telemetry path. */
   registerTelemetry(fn: (snap: TelemetrySnapshot) => void): () => void;
   summary(): SessionSummaryAccumulator;
+  /** Unmutes the session's sound. It starts muted so nothing the app plays before the
+   *  reveal (Steam's startup sound under the loading screen) is heard; idempotent. */
+  releaseAudio(): void;
+  /** The mirror of releaseAudio: mutes the sound again, and keeps a replaced audio
+   *  track muted, until the next releaseAudio. Idempotent. */
+  holdAudio(): void;
 }
 
 export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime {
@@ -361,6 +373,8 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
   let captureEngage: ReturnType<typeof setupCapture>["engage"] | null = null;
   let captureRelease: (() => void) | null = null;
   let audioCleanup: (() => void) | null = null;
+  let audioEl: HTMLAudioElement | null = null;
+  let audioHeld = true;
   let firstFrameCleanup: (() => void) | null = null;
   let captured = false;
 
@@ -849,6 +863,9 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       });
 
       transport.onSignalingOpen = () => set({ wsOpen: true });
+      // #753: a game exit says `bye` seconds before media stalling would tell us.
+      transport.onHostBye = () => cfg.callbacks.onDisconnectSuspected();
+      transport.onTakeoverRefused = (refusal) => set({ takeoverRefused: refusal });
 
       transport.onWebRtcStateChange = (kind, from, to) => {
         tracer?.emitWebRtcStateChanged(kind, from, to);
@@ -866,14 +883,18 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       // <audio> element so it plays without coupling the video PC's jitter
       // buffer — the whole point of the split.
       transport.onAudioTrack = (stream) => {
+        audioCleanup?.(); // a renegotiated track replaces the old element, not stacks on it
         const audio = document.createElement("audio");
         audio.autoplay = true;
+        audio.muted = audioHeld;
         audio.srcObject = stream;
         audio.style.display = "none";
         document.body.appendChild(audio);
+        audioEl = audio;
         audioCleanup = () => {
           audio.srcObject = null;
           audio.remove();
+          audioEl = null;
         };
       };
     },
@@ -898,6 +919,22 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       // leaving the host session and its app alive; an ordinary unmount says bye.
       transport?.close(!handoff);
       transport = null;
+    },
+
+    holdAudio() {
+      audioHeld = true;
+      if (audioEl) audioEl.muted = true;
+    },
+
+    releaseAudio() {
+      audioHeld = false;
+      if (!audioEl) return;
+      audioEl.muted = false;
+      if (!audioEl.paused) return;
+      // A blocked muted autoplay leaves the element paused; unmuting alone would stay silent.
+      audioEl
+        .play()
+        ?.catch((err) => reportBestEffortFailure("silent-debug", "session: play audio at reveal", err));
     },
 
     engage: () => captureEngage?.() ?? null,

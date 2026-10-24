@@ -45,6 +45,9 @@ export interface ApiErrorBody {
     /** On `home_in_use`: omitted, never empty, when the conflict is known but
      *  the session is not (steam-library-discovery spec §2.2). */
     session_id?: string;
+    /** On `503 no_host_available`: `home_host_unavailable` when the caller's home
+     *  is on a host that is offline or gone (amendment 40). An open string. */
+    reason?: string;
   };
   /** On `409 host_not_eligible`: the host's `EligibilityReason`, a top-level
    *  sibling of `error` (control-api.md §"Platform-release apply"). */
@@ -74,6 +77,7 @@ export type SettingsResponse = Schemas["SettingsEnvelope"];
 
 // ── Platform releases (#104/#110, control-api.md §Platform releases) ─────────
 
+export type SteamWarmRewarm = NonNullable<InstanceSettings["steam_warm_rewarm"]>;
 export type ReleaseChannel = NonNullable<InstanceSettings["release_channel"]>;
 
 /** GET /v1/admin/platform/releases — the whole Releases page in one read. */
@@ -188,6 +192,9 @@ export type Highlight = Schemas["Highlight"];
 /** The server owns the ranking — `items` is never re-sorted client-side. */
 export type HighlightsResponse = Schemas["HighlightList"];
 
+export type PlayHistoryItem = Schemas["PlayHistoryItem"];
+export type PlayHistoryResponse = Schemas["PlayHistoryList"];
+
 /** Kept local: the OpenAPI `Stream` schema types playout0_ms/h264_profile as
  *  optional, but a session's stream always carries both. */
 export interface StreamParams {
@@ -258,6 +265,8 @@ export type ProfilesResponse = Schemas["ProfilesResponse"];
 
 // Req-massaged: these two schemas still lack a `required:` array.
 export type ProfilePreferencesResponse = Req<Schemas["ProfilePreferencesResponse"]>;
+
+export type SteamDialogs = NonNullable<Schemas["ProfilePreferencesResponse"]["steam_dialogs"]>;
 
 export type ProfilePolicyResponse = Req<Schemas["ProfilePolicyResponse"]>;
 

@@ -586,6 +586,7 @@ func (s *Store) LastTerminalRun(ctx context.Context, jobID, hostID string) (Run,
 		WHERE job_id = $1
 		  AND COALESCE(host_id, '`+zeroUUID+`'::uuid) = COALESCE(NULLIF($2, '')::uuid, '`+zeroUUID+`'::uuid)
 		  AND state NOT IN ('pending', 'running')
+		-- PruneRuns keeps this exact row; change the order there too.
 		ORDER BY finished_at DESC NULLS LAST, created_at DESC
 		LIMIT 1`, jobID, hostID))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -950,7 +951,10 @@ func (s *Store) ReclaimHostRuns(ctx context.Context, hostID, reason string) ([]R
 // Deliberately NOT the prune-inline-per-write pattern PruneSessionMetrics uses:
 // job runs are low-volume (tens per day, fleet-wide), so a periodic prune keeps
 // the write path trivial. Only terminal rows are eligible — pruning a pending
-// row would delete the next run.
+// row would delete the next run. The newest terminal run of each (job, target)
+// is never pruned, whatever its age: it is the interval's anchor
+// (LastTerminalRun), and an interval longer than the retention window would
+// otherwise rerun at once. The ordering here must match LastTerminalRun.
 func (s *Store) PruneRuns(ctx context.Context, maxAgeDays int) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `
 		WITH ranked AS (
@@ -959,6 +963,10 @@ func (s *Store) PruneRuns(ctx context.Context, maxAgeDays int) (int64, error) {
 			           PARTITION BY r.job_id, COALESCE(r.host_id, '`+zeroUUID+`'::uuid)
 			           ORDER BY r.created_at DESC, r.id DESC
 			       ) AS rn,
+			       row_number() OVER (
+			           PARTITION BY r.job_id, COALESCE(r.host_id, '`+zeroUUID+`'::uuid)
+			           ORDER BY r.finished_at DESC NULLS LAST, r.created_at DESC, r.id DESC
+			       ) AS anchor,
 			       j.history_limit,
 			       r.created_at
 			FROM job_runs r
@@ -968,8 +976,9 @@ func (s *Store) PruneRuns(ctx context.Context, maxAgeDays int) (int64, error) {
 		DELETE FROM job_runs
 		WHERE id IN (
 			SELECT id FROM ranked
-			WHERE rn > history_limit
-			   OR ($1 > 0 AND created_at < now() - make_interval(days => $1))
+			WHERE anchor > 1
+			  AND (rn > history_limit
+			       OR ($1 > 0 AND created_at < now() - make_interval(days => $1)))
 		)`, maxAgeDays)
 	if err != nil {
 		return 0, fmt.Errorf("prune job runs: %w", err)

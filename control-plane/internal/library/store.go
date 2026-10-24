@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -201,7 +202,7 @@ func resolveScan(ctx context.Context, q pgx.Tx, scanID, hostID string) (scanTarg
 // observations from a failed scan would let one bad pass mass-revoke a fleet's libraries.
 func (s *Store) MarkFailed(ctx context.Context, scanID, hostID, msg string) error {
 	if len(msg) > 512 {
-		msg = msg[:512]
+		msg = strings.ToValidUTF8(msg[:512], "") // a byte cut can split a rune; Postgres refuses the half (#738)
 	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE library_scans
@@ -555,29 +556,57 @@ func (s *Store) Reconcile(ctx context.Context, scanID, hostID string, entries []
 	res.Revoked += int(revoked.RowsAffected())
 
 	// --- STEP 6: backfill -----------------------------------------------------
-	// Existing discovered tiles with description still '' whose external_id this scan
-	// observed — not filtered to `publish`, since a suppressed appid can carry a tile
-	// published before an Ignore. Recomputed here from `order` (step 1's validated/deduped
-	// set) rather than a pre-transaction read, so nothing is missed or double-counted.
+	// Existing discovered tiles with description still '' or no store details yet
+	// (store_details_at NULL, amendment 38) whose external_id this scan observed — not
+	// filtered to `publish`, since a suppressed appid can carry a tile published before an
+	// Ignore. Recomputed here from `order` (step 1's validated/deduped set) rather than a
+	// pre-transaction read, so nothing is missed or double-counted. Covers this scan's new
+	// tiles too: step 3 creates them blank.
 	//
-	// Fill-blanks-only is enforced by the UPDATE itself (`AND description = ''`), the same
-	// durability guarantee step 3's ON CONFLICT DO NOTHING gives `enabled`.
+	// Fill-blanks-only is enforced by the UPDATE itself (each CASE and the WHERE), the same
+	// durability guarantee step 3's ON CONFLICT DO NOTHING gives `enabled`; store details are
+	// written once, keyed on store_details_at.
 	candidates, err := backfillCandidates(ctx, tx, target.ParentID, order)
 	if err != nil {
 		return res, err
 	}
 	for _, id := range candidates {
 		det, ok := appDetails[id]
-		if !ok || det.ShortDescription == "" {
+		if !ok {
 			continue
 		}
-		tag, err := tx.Exec(ctx, `
-			UPDATE apps SET description = $4
-			 WHERE parent_app_id = $1::uuid AND external_source = $2 AND external_id = $3
-			   AND description = ''
-		`, target.ParentID, SourceSteam, id, det.ShortDescription)
+		genres := det.Genres
+		if genres == nil {
+			genres = []string{}
+		}
+		// A savepoint per tile: a value Postgres refuses skips this tile, never the scan.
+		sp, err := tx.Begin(ctx)
 		if err != nil {
-			return res, fmt.Errorf("backfill tile description: %w", err)
+			return res, fmt.Errorf("backfill savepoint: %w", err)
+		}
+		tag, err := sp.Exec(ctx, `
+			UPDATE apps SET
+			       description = CASE WHEN description = '' THEN $4 ELSE description END,
+			       genres = CASE WHEN store_details_at IS NULL THEN $5::text[] ELSE genres END,
+			       developer = CASE WHEN store_details_at IS NULL THEN $6::text ELSE developer END,
+			       publisher = CASE WHEN store_details_at IS NULL THEN $7::text ELSE publisher END,
+			       release_date = CASE WHEN store_details_at IS NULL THEN $8::text ELSE release_date END,
+			       controller_support = CASE WHEN store_details_at IS NULL THEN $9::text ELSE controller_support END,
+			       store_details_at = COALESCE(store_details_at, now())
+			 WHERE parent_app_id = $1::uuid AND external_source = $2 AND external_id = $3
+			   AND ((description = '' AND $4 <> '') OR store_details_at IS NULL)
+		`, target.ParentID, SourceSteam, id, det.ShortDescription, genres,
+			nullIfEmpty(det.Developer), nullIfEmpty(det.Publisher),
+			nullIfEmpty(det.ReleaseDate), nullIfEmpty(det.ControllerSupport))
+		if err != nil {
+			if rbErr := sp.Rollback(ctx); rbErr != nil {
+				return res, fmt.Errorf("backfill tile %s: %w (rollback: %v)", id, err, rbErr)
+			}
+			slog.Warn("library: a store value could not be stored; the tile is left as it was", "external_id", id, "err", err)
+			continue
+		}
+		if err := sp.Commit(ctx); err != nil {
+			return res, fmt.Errorf("backfill savepoint release: %w", err)
 		}
 		res.Backfilled += int(tag.RowsAffected())
 	}
@@ -1228,10 +1257,11 @@ type pgxQueryer interface {
 }
 
 // backfillCandidates returns external_ids of this parent's existing discovered tiles with a
-// blank description among ids (the scan's validated, deduplicated appids). origin='discovered'
-// scopes to reconciler-created tiles (§7.7 step 3), belt-and-braces alongside the
-// (parent_app_id, external_source, external_id) uniqueness that already makes that shape
-// exclusive.
+// blank description or no store details among ids (the scan's validated, deduplicated
+// appids). origin='discovered' scopes to reconciler-created tiles (§7.7 step 3),
+// belt-and-braces alongside the (parent_app_id, external_source, external_id) uniqueness that
+// already makes that shape exclusive. Random order so the handler's lookup cap cannot be held
+// by titles the store never answers for.
 func backfillCandidates(ctx context.Context, q pgxQueryer, parentID string, ids []string) ([]string, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -1239,7 +1269,8 @@ func backfillCandidates(ctx context.Context, q pgxQueryer, parentID string, ids 
 	rows, err := q.Query(ctx, `
 		SELECT external_id FROM apps
 		 WHERE parent_app_id = $1::uuid AND external_source = $2 AND origin = 'discovered'
-		   AND description = '' AND external_id = ANY($3::text[])
+		   AND (description = '' OR store_details_at IS NULL) AND external_id = ANY($3::text[])
+		 ORDER BY random()
 	`, parentID, SourceSteam, ids)
 	if err != nil {
 		return nil, fmt.Errorf("read backfill candidates: %w", err)
@@ -1271,6 +1302,38 @@ func (s *Store) BackfillCandidates(ctx context.Context, parentID string, entries
 		ids = append(ids, id)
 	}
 	return backfillCandidates(ctx, s.pool, parentID, ids)
+}
+
+// ExistingTileIDs returns which of ids already have a tile under parentID, so the handler can
+// spend the per-scan appdetails cap on new titles first.
+func (s *Store) ExistingTileIDs(ctx context.Context, parentID string, ids []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT external_id FROM apps
+		 WHERE parent_app_id = $1::uuid AND external_source = $2 AND external_id = ANY($3::text[])
+	`, parentID, SourceSteam, ids)
+	if err != nil {
+		return nil, fmt.Errorf("read existing tiles: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan existing tile: %w", err)
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // ScanParent resolves the provider app of a claimed scan on hostID, for the

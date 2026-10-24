@@ -275,6 +275,8 @@ does not agree with; do the same in anything else that writes host settings.
 
 ## Verification levels — what "done" requires
 
+Review is governed by `REVIEW.md`: who reviews what, the 3-round budget, and what a reviewer checks.
+
 | Change | Required |
 |---|---|
 | Any change | `make verify` (fmt/lint/build all components + shellcheck + DX self-tests) |

@@ -23,6 +23,10 @@ export const MAX_CAPACITY_RETRY_WAIT_MS = 60_000;
  *  lands inside that window), so 20s covers the cap plus one extra retry. */
 export const MAX_NO_HOST_RETRY_WAIT_MS = 20_000;
 
+/** Total time a launch may wait for the player's previous session to finish
+ *  `stopping` (#754). Steam's shutdown plus cloud upload took 6.5-12 s (#740). */
+export const MAX_CLOSING_RETRY_WAIT_MS = 45_000;
+
 /** Floor between attempts — a `Retry-After: 0` or near-zero remainder must never
  *  become a busy loop against a host that is still full. */
 export const MIN_RETRY_DELAY_MS = 1_000;
@@ -31,6 +35,20 @@ export const MIN_RETRY_DELAY_MS = 1_000;
  *  window is usually under 3s, so retry sooner than capacity_exhausted's 5s
  *  default — floored at {@link MIN_RETRY_DELAY_MS}. */
 export const NO_HOST_RETRY_DELAY_MS = MIN_RETRY_DELAY_MS;
+
+/** `error.reason` on a `no_host_available` whose cause is the caller's home being on
+ *  a host that is offline or gone (amendment 40, #602). Only an admin clears it. */
+export const HOME_HOST_UNAVAILABLE = "home_host_unavailable";
+
+/** Whether a launch refusal is worth the quiet retry: `capacity_exhausted` and
+ *  `no_host_available`, except a home on a host that is offline or gone — no
+ *  amount of waiting brings that host back. */
+export function isCapacityRetryable(err: { code: string; reason?: string }): boolean {
+  return (
+    err.code === "capacity_exhausted" ||
+    (err.code === "no_host_available" && err.reason !== HOME_HOST_UNAVAILABLE)
+  );
+}
 
 export interface CapacityRetryState {
   /** Elapsed since the FIRST retryable response for the current wait, not the
@@ -74,6 +92,35 @@ export function decideCapacityRetry(
     return { kind: "give-up" };
   }
   return { kind: "retry", delayMs };
+}
+
+/** Each attempt is the launch itself, so this is also how soon the new game
+ *  starts once the stop lands. */
+export const CLOSING_RETRY_DELAY_MS = MIN_RETRY_DELAY_MS;
+
+/** The play button's label while a launch waits, whatever it waits for. */
+export function waitingPlayLabel(reason: "slot" | "host" | "closing" | null | undefined): string {
+  return reason === "host"
+    ? "Waiting for a host…"
+    : reason === "closing"
+      ? "Closing previous game…"
+      : "Waiting for a slot…";
+}
+
+/** The toast for a launch waiting on the player's own previous session (#754). */
+export function closingToastCopy(previousName: string, appName: string): { title: string; body: string } {
+  return {
+    title: `Closing ${previousName}…`,
+    body: `${appName} will launch as soon as it has finished saving.`,
+  };
+}
+
+/** The toast when the previous session never finished stopping inside the budget. */
+export function closingGaveUpCopy(previousName: string): { title: string; body: string } {
+  return {
+    title: `${previousName} is taking too long to close`,
+    body: "It is still shutting down. Try again in a moment, or ask an operator if this keeps happening.",
+  };
 }
 
 /** The toast a quietly retrying launch shows. A hand-picked codec is a

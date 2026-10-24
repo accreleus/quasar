@@ -93,7 +93,7 @@ func (s *Store) NextIdleOffer(ctx context.Context, hostID, bootID, connectionID 
 				return nil, err
 			}
 			if !held && hostStatus == "draining" {
-				if _, err := tx.Exec(ctx, `UPDATE hosts SET status='online' WHERE id=$1::uuid`, hostID); err != nil {
+				if _, err := tx.Exec(ctx, `UPDATE hosts SET status=`+releasedStatusSQL+` WHERE id=$1::uuid`, hostID); err != nil {
 					return nil, err
 				}
 			}

@@ -62,6 +62,27 @@ use anyhow::{anyhow, Context, Result};
 use crate::messages::AppExitPolicy;
 use crate::nvidia_volume::VolumeInfo;
 use crate::runtime::{ApplicationId, ApplicationMount, ApplicationRequest};
+use crate::session::teardown::{retry_busy, STOP_PAUSE};
+
+/// The launch's image step, waiting out an admission refusal.
+fn ensure_launch_image(
+    runtime: &crate::runtime::RuntimeClient,
+    request: &ApplicationRequest,
+) -> Result<()> {
+    if request.pull_never {
+        anyhow::ensure!(
+            retry_busy(STOP_PAUSE, || runtime.image_present(&request.image).wait())?,
+            "required local application image is missing"
+        );
+    } else {
+        retry_busy(STOP_PAUSE, || {
+            runtime
+                .ensure_image(request.image.clone(), Duration::from_secs(300))
+                .wait(|_| {})
+        })?;
+    }
+    Ok(())
+}
 
 /// A launch whose response or retirement is uncertain. The operation is the only
 /// identity allowed to reconcile it. Writable bind sources are retained as well as the
@@ -1214,6 +1235,9 @@ impl ContainerRuntime {
         if direct.is_none() {
             args.extend(wayland_mount_args(params));
         }
+        if let Some(helper) = params.launch_helper {
+            args.extend(helper.args());
+        }
 
         // ── GPU passthrough ───────────────────────────────────────────────────
         if spec.gpu {
@@ -1347,28 +1371,24 @@ impl ContainerRuntime {
         // normalized managed-home source has been explicitly retired. RuntimeClient
         // reconciles only the recorded stable operation.
         retire_matching_pending_applications(&name, &request, |operation| {
-            runtime
-                .abandon_application(operation.to_owned())
-                .wait()
-                .map_err(|error| anyhow!(error))
+            retry_busy(STOP_PAUSE, || {
+                runtime.abandon_application(operation.to_owned()).wait()
+            })
+            .map_err(|error| anyhow!(error))
         })?;
-        if request.pull_never {
-            anyhow::ensure!(
-                runtime.image_present(&request.image).wait()?,
-                "required local application image is missing"
-            );
-        } else {
-            runtime
-                .ensure_image(request.image.clone(), Duration::from_secs(300))
-                .wait(|_| {})?;
-        }
-        let application = match runtime.start_application(request.clone()).wait() {
+        ensure_launch_image(runtime, &request)?;
+        let application = match retry_busy(STOP_PAUSE, || {
+            runtime.start_application(request.clone()).wait()
+        }) {
             Ok(application) => application,
             Err(error) => {
                 // Start may have created or started the exact operation before
                 // its reply was lost. Persist retirement by operation rather
                 // than removing by name, which could hit somebody else's container.
-                let abandon = runtime.abandon_application(operation.clone()).wait().err();
+                let abandon = retry_busy(STOP_PAUSE, || {
+                    runtime.abandon_application(operation.clone()).wait()
+                })
+                .err();
                 if abandon.is_some() {
                     retain_pending_application(name.clone(), &request, operation);
                 }
@@ -1433,7 +1453,7 @@ fn short_id(id: &str) -> String {
 
 /// The container spec mirrored from the assign's `app` object (`apps.runtime_spec`,
 /// `agent-api.md`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContainerSpec {
     pub image: String,
     /// Internal launch policy after verified API preparation: the control plane's
@@ -1622,6 +1642,9 @@ pub struct LaunchParams<'a> {
     /// nested launch. With it, no Wayland socket, virtual devices or stream mode are
     /// handed in.
     pub direct_display: Option<super::console_plan::DirectDisplay>,
+    /// #731: the launch helper and its session socket; `None` unless the app is the
+    /// session's derived Steam tile.
+    pub launch_helper: Option<&'a super::launch_helper::LaunchMount>,
 }
 
 const APP_WAYLAND_RUNTIME_DIR: &str = "/run/quasar-wayland";
@@ -2448,6 +2471,52 @@ mod tests {
             vec!["seccomp={\"defaultAction\":\"SCMP_ACT_ERRNO\"}"]
         );
         assert_eq!(request.command, vec!["--arg"]);
+    }
+
+    /// #574: the launch's image step, refused a slot by four calls that have no answer yet,
+    /// waits for one and reads the engine's answer instead of failing the session "busy".
+    #[test]
+    fn a_launch_image_step_refused_a_slot_waits_for_one() {
+        const THIS: &str =
+            "session::container::tests::a_launch_image_step_refused_a_slot_waits_for_one";
+        if crate::images::tests::engine_child_mode().is_some() {
+            let runtime = crate::runtime::configured().unwrap();
+            let _held: Vec<_> = (0..4)
+                .map(|i| {
+                    runtime
+                        .image_present_within(format!("ghcr.io/x/hang:{i}"), Duration::from_secs(1))
+                })
+                .collect();
+            let args: Vec<String> = [
+                "run",
+                "-d",
+                "--name",
+                "quasar-sess-s1",
+                "--pull=never",
+                "image:test",
+            ]
+            .map(String::from)
+            .into();
+            let request = application_request_from_args(&args, "application-s1".into()).unwrap();
+            assert!(request.pull_never);
+            let error = ensure_launch_image(runtime, &request).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "required local application image is missing"
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = crate::images::tests::run_against_fake_engine(
+            THIS,
+            "launch-busy",
+            reply,
+            Duration::ZERO,
+        );
+        assert!(
+            served >= 5,
+            "four held inspects, then the launch's: {served}"
+        );
     }
 
     #[test]
@@ -3823,6 +3892,7 @@ mod tests {
                 fps: 60,
             },
             direct_display: None,
+            launch_helper: None,
         };
 
         let args = wayland_mount_args(&params);

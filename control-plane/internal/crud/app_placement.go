@@ -100,7 +100,8 @@ func (h *Handler) appPlacementView(ctx context.Context, id string) (appPlacement
 
 	// All enrolled hosts are shown, including offline ones. Preparation is
 	// unknown for unmanaged images and absent reports; readiness is a distinct
-	// current host observation, never inferred from selection alone.
+	// current host observation, never inferred from selection alone. Its
+	// liveness is placement's (session liveHostSQL).
 	rows, err = h.store.pool.Query(ctx, `
 		SELECT h.id::text,
 		       CASE WHEN ii.image_id IS NULL OR hi.state IS NULL THEN NULL::boolean
@@ -109,7 +110,7 @@ func (h *Handler) appPlacementView(ctx context.Context, id string) (appPlacement
 		              OR h.readiness_reported_at < now()-make_interval(secs => $1::int)
 		            THEN NULL::boolean
 		            WHEN h.status='offline' THEN false
-		            WHEN h.status='online' AND h.capacity_detection='ok'
+		            WHEN h.status='online' AND h.agent_disconnected_at IS NULL AND h.capacity_detection='ok'
 		              AND NOT h.readiness_block_host AND NOT h.readiness_block_homes
 		              AND h.config_policy_gate_connection IS NULL THEN true
 		            ELSE false END,
@@ -204,7 +205,7 @@ func (h *Handler) handlePatchAppPlacement(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var p placementPatch
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	decodeErr := decoder.Decode(&p)
 	var extra any

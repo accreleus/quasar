@@ -215,3 +215,50 @@ describe("railContentLeft", () => {
     expect(railContentLeft(track, rect(600, 280)).contentLeft).toBe(600);
   });
 });
+
+// Letter sections: one list on screen, a region each in the model. Columns (4)
+// divide neither section (6 and 7 tiles), so a flat index stride lands wrong.
+describe("nextRovingPos across letter sections", () => {
+  const section = (count: number, top: number): RovingRegion => ({
+    ...grid(count, 4),
+    offsetTops: grid(count, 4).offsetTops.map((t) => t + top),
+    flow: true,
+  });
+  const A = section(6, 0); // rows: 0–3 / 4–5
+  const B = section(7, 700); // rows: 0–3 / 4–6
+  const regions = [A, B];
+  const move = (region: number, index: number, dir: "up" | "down" | "left" | "right") =>
+    nextRovingPos(regions, { region, index }, dir);
+
+  it("down from the first row goes to the short second row, nearest column", () => {
+    expect(move(0, 1, "down")).toEqual({ region: 0, index: 5 });
+    // Column 3 has nothing below it: the nearest tile in that row, not a skip into B.
+    expect(move(0, 3, "down")).toEqual({ region: 0, index: 5 });
+  });
+
+  it("down from the last row of a section lands under it in the next section", () => {
+    expect(move(0, 4, "down")).toEqual({ region: 1, index: 0 });
+    expect(move(0, 5, "down")).toEqual({ region: 1, index: 1 });
+  });
+
+  it("up from a section's first row lands on the previous section's last row, nearest column", () => {
+    expect(move(1, 3, "up")).toEqual({ region: 0, index: 5 });
+    expect(move(1, 0, "up")).toEqual({ region: 0, index: 4 });
+  });
+
+  it("stays put at the very top and bottom", () => {
+    expect(move(0, 2, "up")).toBeNull();
+    expect(move(1, 6, "down")).toBeNull();
+  });
+
+  it("left and right continue from one section into the next", () => {
+    expect(move(0, 5, "right")).toEqual({ region: 1, index: 0 });
+    expect(move(1, 0, "left")).toEqual({ region: 0, index: 5 });
+    expect(move(1, 2, "right")).toEqual({ region: 1, index: 3 });
+  });
+
+  it("does not let a flow region's horizontal move enter the rail", () => {
+    expect(nextRovingPos([rail(3), A], { region: 1, index: 0 }, "left")).toBeNull();
+    expect(nextRovingPos([rail(3), A], { region: 1, index: 1 }, "up")).toEqual({ region: 0, index: 1 });
+  });
+});

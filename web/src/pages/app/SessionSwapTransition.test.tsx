@@ -1,5 +1,6 @@
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { GETTING_READY_MS, GETTING_READY_PHRASES } from "./gettingReady";
 import { SessionSwapTransition } from "./SessionSwapTransition";
 
 describe("SessionSwapTransition", () => {
@@ -31,6 +32,37 @@ describe("SessionSwapTransition", () => {
       vi.advanceTimersByTime(400);
     });
     expect(container.textContent).toBe("");
+  });
+
+  it("shows Steam's shader figure under 'Starting…' only when it is above 0", () => {
+    const { container, rerender } = render(
+      <SessionSwapTransition transition={{ phase: "booting", appName: "Purple App", shaderPercent: 42 }} />,
+    );
+    expect(container.textContent).toContain("Starting…");
+    expect(screen.getByText("Processing shaders — 42%")).toBeInTheDocument();
+
+    rerender(<SessionSwapTransition transition={{ phase: "booting", appName: "Purple App", shaderPercent: 0 }} />);
+    expect(screen.queryByText(/Processing shaders/)).toBeNull();
+    expect(GETTING_READY_PHRASES).toContain(container.querySelector(".sw-shaders")?.textContent);
+    expect(container.querySelector(".sw-shaders")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("rotates the phrase while booting, and shows no line before the commit", () => {
+    vi.useFakeTimers();
+    const { container, rerender } = render(
+      <SessionSwapTransition transition={{ phase: "switching", appName: "Purple App" }} />,
+    );
+    expect(container.querySelector(".sw-shaders")).toBeEmptyDOMElement();
+
+    rerender(<SessionSwapTransition transition={{ phase: "booting", appName: "Purple App", shaderPercent: null }} />);
+    const seen = new Set([container.querySelector(".sw-shaders")?.textContent]);
+    for (let i = 0; i < 12; i++) {
+      act(() => {
+        vi.advanceTimersByTime(GETTING_READY_MS);
+      });
+      seen.add(container.querySelector(".sw-shaders")?.textContent);
+    }
+    expect(seen.size).toBeGreaterThan(1);
   });
 
   it("shows the target app name and 'Starting…' while switching", () => {

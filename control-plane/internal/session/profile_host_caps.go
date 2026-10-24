@@ -72,7 +72,7 @@ func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (prof
 	}
 	rows, err := s.pool.Query(ctx, `SELECT `+gpuCodecSetSQL("g", "h", true)+`
 		FROM gpus g JOIN hosts h ON h.id = g.host_id
-		WHERE h.status = 'online' AND h.capacity_detection = 'ok'
+		WHERE h.status = 'online'`+liveHostSQL+` AND h.capacity_detection = 'ok'
 		AND g.reported AND g.encode_slots_total >= $`+fmt.Sprint(slotsIdx)+schedulableBindingSQL+pin+image+gate+placement, a.args()...)
 	if err != nil {
 		return profile.HostCaps{}, fmt.Errorf("query profile host codecs: %w", err)

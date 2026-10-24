@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -44,6 +45,10 @@ type Handler struct {
 	// direct peer" (today's behaviour). Set via WithTrustedProxies.
 	trustedProxies []*net.IPNet
 
+	// plaintext bounds the credential-route-plaintext WARN per source (#604).
+	plaintext *ratelimit.FailureLimiter
+	log       *slog.Logger
+
 	// auditor records the admin user-management mutations; nil in tests.
 	auditor audit.Recorder
 }
@@ -52,7 +57,12 @@ type Handler struct {
 func NewHandler(svc *Service, auditors ...audit.Recorder) *Handler {
 	// 10 quick attempts, then ~1 every 5s per IP — generous for humans,
 	// useless for credential stuffing.
-	h := &Handler{svc: svc, limiter: newLoginLimiter(10, 5*time.Second)}
+	h := &Handler{
+		svc:       svc,
+		limiter:   newLoginLimiter(10, 5*time.Second),
+		plaintext: ratelimit.NewFailureLimiter(10, time.Minute, 4096),
+		log:       slog.Default(),
+	}
 	if len(auditors) > 0 {
 		h.auditor = auditors[0]
 	}
@@ -66,6 +76,26 @@ func NewHandler(svc *Service, auditors ...audit.Recorder) *Handler {
 func (h *Handler) WithTrustedProxies(nets []*net.IPNet) *Handler {
 	h.trustedProxies = nets
 	return h
+}
+
+// WithLogger sets the logger for the plain-HTTP credential warning.
+func (h *Handler) WithLogger(log *slog.Logger) *Handler {
+	h.log = log
+	return h
+}
+
+// warnPlaintext logs one bounded WARN when a password-bearing route is served
+// over a transport the #593 rule would refuse. The request is served either way.
+func (h *Handler) warnPlaintext(r *http.Request, route string) {
+	if httpx.SecureTransport(r, h.trustedProxies, false) {
+		return
+	}
+	ip := ratelimit.ClientIP(r, h.trustedProxies)
+	if h.plaintext.Allow(ip) {
+		h.plaintext.Failure(ip)
+		h.log.Warn("credential-route-plaintext", "route", route, "remote_addr", ip,
+			"note", "a later release refuses this over plain HTTP: use the HTTPS port or name the proxy in QUASAR_TRUSTED_PROXIES")
+	}
 }
 
 // WithVersionPolicy configures the native-client version handshake (P9-08):
@@ -130,6 +160,7 @@ func toBrief(u User) userBrief {
 // --- handlers ----------------------------------------------------------------
 
 func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
+	h.warnPlaintext(r, "POST /v1/auth/register")
 	if !h.limiter.allow(ratelimit.ClientIP(r, h.trustedProxies)) {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited,
 			"too many attempts; try again later")
@@ -172,6 +203,7 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
+	h.warnPlaintext(r, "POST /v1/auth/login")
 	if !h.limiter.allow(ratelimit.ClientIP(r, h.trustedProxies)) {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited,
 			"too many attempts; try again later")
@@ -257,6 +289,7 @@ func (h *Handler) handleMe(w http.ResponseWriter, r *http.Request) {
 //   - 401 invalid_credentials when current_password is wrong
 //   - 400 validation_failed when new_password is too short/long
 func (h *Handler) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	h.warnPlaintext(r, "POST /v1/me/password")
 	user, ok := UserFromContext(r.Context())
 	if !ok {
 		httpx.WriteError(w, http.StatusUnauthorized, httpx.CodeUnauthorized, "authentication required")
@@ -310,7 +343,7 @@ func (h *Handler) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		Disabled              *bool   `json:"disabled"`
 		MaxConcurrentSessions *int32  `json:"max_concurrent_sessions"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "malformed JSON body")
 		return
 	}
@@ -318,7 +351,7 @@ func (h *Handler) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "role must be user or admin")
 		return
 	}
-	u, err := h.svc.UpdateUser(r.Context(), id, req.Role, req.Disabled, req.MaxConcurrentSessions)
+	u, changed, err := h.svc.UpdateUser(r.Context(), id, req.Role, req.Disabled, req.MaxConcurrentSessions)
 	if err != nil {
 		if errors.Is(err, ErrUserNotFound) {
 			httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "user not found")
@@ -333,7 +366,7 @@ func (h *Handler) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	// After the error switch, like handleDeleteUser: the feed records what
 	// happened, so a refused change must leave no row.
-	h.recordUserUpdate(r, id, req.Role, req.Disabled, req.MaxConcurrentSessions)
+	h.recordUserUpdate(r, id, req.Role, req.Disabled, req.MaxConcurrentSessions, changed)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"user": toAdminUserResp(u)})
 }
 
@@ -375,21 +408,22 @@ func (h *Handler) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 // disable switch are separate operator intentions with separate severities, and
 // collapsing them into one "user.updated" row would lose which one happened.
 // Values only where the value is the point (the new role, the new quota); never
-// a password, never an email.
-func (h *Handler) recordUserUpdate(r *http.Request, id string, role *string, disabled *bool, quota *int32) {
+// a password, never an email. A field carried with the value the row already
+// held records nothing (#624): the feed shows what changed, not what was sent.
+func (h *Handler) recordUserUpdate(r *http.Request, id string, role *string, disabled *bool, quota *int32, changed UserChanges) {
 	caller, _ := UserFromContext(r.Context())
-	if role != nil {
+	if changed.Role {
 		audit.TryRecord(r.Context(), h.auditor, caller.ID, "user.role_changed", "user", id,
 			map[string]any{"role": *role})
 	}
-	if disabled != nil {
+	if changed.Disabled {
 		action := "user.enabled"
 		if *disabled {
 			action = "user.disabled"
 		}
 		audit.TryRecord(r.Context(), h.auditor, caller.ID, action, "user", id, nil)
 	}
-	if quota != nil {
+	if changed.Quota {
 		audit.TryRecord(r.Context(), h.auditor, caller.ID, "user.quota_changed", "user", id,
 			map[string]any{"max_concurrent_sessions": *quota})
 	}

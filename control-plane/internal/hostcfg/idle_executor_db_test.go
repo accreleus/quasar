@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/jobs"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // The operator sees a waiting approval until both durable inventories are
@@ -626,9 +628,10 @@ func TestIdleExecutorReconstructsLostAcceptedReportFromAuthenticatedInventory(t 
 	}
 }
 
-func TestHistoricalAppliedInventoryCannotClaimAChangedActiveSnapshot(t *testing.T) {
-	pool := testPool(t)
-	store := NewStore(pool)
+// offeredHardwareAttempt offers one idle hardware attempt on the journal
+// connection ...338; its approval holds admission.
+func offeredHardwareAttempt(t *testing.T, pool *pgxpool.Pool, store *Store) (string, string, *PolicyOffer) {
+	t.Helper()
 	hostID := seedHost(t, pool)
 	confirmPolicyGroups(t, pool, hostID, "hardware")
 	ctx := context.Background()
@@ -644,8 +647,7 @@ func TestHistoricalAppliedInventoryCannotClaimAChangedActiveSnapshot(t *testing.
 	if err != nil || preview == nil || !preview.Available {
 		t.Fatalf("preview: %+v %v", preview, err)
 	}
-	approved, err := store.ApproveIdleApply(ctx, hostID, "hardware", reviewedIdleApply(preview))
-	if err != nil {
+	if _, err := store.ApproveIdleApply(ctx, hostID, "hardware", reviewedIdleApply(preview)); err != nil {
 		t.Fatal(err)
 	}
 	first := "00000000-0000-4000-8000-000000000338"
@@ -660,13 +662,28 @@ func TestHistoricalAppliedInventoryCannotClaimAChangedActiveSnapshot(t *testing.
 	if err != nil || offer == nil {
 		t.Fatalf("offer: %+v %v", offer, err)
 	}
+	return hostID, boot, offer
+}
+
+func restartInventoryEntry(hostID, boot string, offer *PolicyOffer, phase, sequence string) JournalInventoryEntry {
+	return JournalInventoryEntry{AttemptID: offer.AttemptID, HostID: hostID, Group: "hardware", Digest: offer.ContentSHA256,
+		Scope: "restart", Phase: phase, Sequence: sequence, Revision: offer.Revision, GrantBoot: boot,
+		GrantConnection: "00000000-0000-4000-8000-000000000338"}
+}
+
+// An applied entry keeps its hold until an active snapshot proves it (#620).
+func TestHistoricalAppliedInventoryCannotClaimAChangedActiveSnapshot(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID, boot, offer := offeredHardwareAttempt(t, pool, store)
+	ctx := context.Background()
 	second := "00000000-0000-4000-8000-000000000339"
 	if err := store.BeginJournalReconciliation(ctx, hostID, second); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	entry := JournalInventoryEntry{AttemptID: offer.AttemptID, HostID: hostID, Group: "hardware", Digest: offer.ContentSHA256,
-		Scope: "restart", Phase: "applied", Sequence: "4", Revision: offer.Revision, GrantBoot: boot, GrantConnection: first, VerifiedAt: &now}
+	entry := restartInventoryEntry(hostID, boot, offer, "applied", "4")
+	entry.VerifiedAt = &now
 	active := map[string]PolicySnapshot{"hardware": {Kind: "verified", Digest: strings.Repeat("a", 64)}}
 	if active["hardware"].Digest == offer.ContentSHA256 {
 		t.Fatal("fixture must differ from candidate")
@@ -674,12 +691,240 @@ func TestHistoricalAppliedInventoryCannotClaimAChangedActiveSnapshot(t *testing.
 	if err := store.CompleteJournalReconciliation(ctx, hostID, second, []JournalInventoryEntry{entry}, active); err != nil {
 		t.Fatal(err)
 	}
-	status, err := store.GetIdleApply(ctx, hostID, approved.AttemptID)
-	if err != nil || status.Phase != "applied" || status.AdmissionRestricted {
-		t.Fatalf("historical attempt: %+v %v", status, err)
+	status, err := store.GetIdleApply(ctx, hostID, offer.AttemptID)
+	if err != nil || status.Phase != "applied" || !status.AdmissionRestricted {
+		t.Fatalf("applied entry without active proof released admission: %+v %v", status, err)
 	}
 	view, err := store.GetPolicy(ctx, hostID)
 	if err != nil || view.Groups["hardware"].Status == "applied" {
 		t.Fatalf("historical record falsely claimed current application: %+v %v", view.Groups["hardware"], err)
+	}
+	third := "00000000-0000-4000-8000-000000000340"
+	if err := store.BeginJournalReconciliation(ctx, hostID, third); err != nil {
+		t.Fatal(err)
+	}
+	active["hardware"] = PolicySnapshot{Kind: "verified", Digest: offer.ContentSHA256}
+	if err := store.CompleteJournalReconciliation(ctx, hostID, third, []JournalInventoryEntry{entry}, active); err != nil {
+		t.Fatal(err)
+	}
+	status, err = store.GetIdleApply(ctx, hostID, offer.AttemptID)
+	if err != nil || status.Phase != "applied" || status.AdmissionRestricted {
+		t.Fatalf("matching active proof kept admission held: %+v %v", status, err)
+	}
+	if view, err = store.GetPolicy(ctx, hostID); err != nil || view.Groups["hardware"].Status != "applied" {
+		t.Fatalf("matching active proof did not apply the group: %+v %v", view.Groups["hardware"], err)
+	}
+	var hostStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid`, hostID).Scan(&hostStatus); err != nil || hostStatus != "online" {
+		t.Fatalf("released host did not return online: %s %v", hostStatus, err)
+	}
+}
+
+// A retry can apply the revision an earlier attempt recovered from. The agent
+// reports every record in attempt-id order, so the recovered one may follow.
+func TestRecoveredReplayKeepsALaterAppliedGroup(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID, boot, first := offeredHardwareAttempt(t, pool, store)
+	ctx := context.Background()
+	recovered := restartInventoryEntry(hostID, boot, first, "recovered", "6")
+	recovered.ErrorCode = "candidate_startup_failed"
+	seeded := map[string]PolicySnapshot{"hardware": {Kind: "seeded", Digest: strings.Repeat("a", 64)}}
+	second := "00000000-0000-4000-8000-000000000339"
+	if err := store.BeginJournalReconciliation(ctx, hostID, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteJournalReconciliation(ctx, hostID, second, []JournalInventoryEntry{recovered}, seeded); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, second,
+		json.RawMessage(`{"encoder":"openh264","render_node":"","cuda_device":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := store.PreviewIdleApply(ctx, hostID, "hardware")
+	if err != nil || preview == nil || !preview.Available {
+		t.Fatalf("retry preview: %+v %v", preview, err)
+	}
+	if _, err := store.ApproveIdleApply(ctx, hostID, "hardware", reviewedIdleApply(preview)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveIdleHeartbeat(ctx, hostID, second, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET source_preparation_reported_at=now(),last_registered_at=now()-interval '1 minute' WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := store.NextIdleOffer(ctx, hostID, boot, second)
+	if err != nil || retry == nil {
+		t.Fatalf("retry offer: %+v %v", retry, err)
+	}
+	if retry.Revision != first.Revision || retry.ContentSHA256 != first.ContentSHA256 {
+		t.Fatal("fixture must retry the same revision and digest")
+	}
+	// A leftover hold of the recovered attempt is still released on replay.
+	if _, err := pool.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+		VALUES($1::uuid,'idle_apply',$2::uuid,'idle_configuration')`, hostID, first.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	applied := restartInventoryEntry(hostID, boot, retry, "applied", "4")
+	applied.GrantConnection = second
+	applied.VerifiedAt = &now
+	third := "00000000-0000-4000-8000-000000000340"
+	if err := store.BeginJournalReconciliation(ctx, hostID, third); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteJournalReconciliation(ctx, hostID, third, []JournalInventoryEntry{applied, recovered},
+		map[string]PolicySnapshot{"hardware": {Kind: "verified", Digest: retry.ContentSHA256}}); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.GetPolicy(ctx, hostID)
+	if err != nil || view.Groups["hardware"].Status != "applied" {
+		t.Fatalf("recovered replay overwrote the applied retry: %+v %v", view.Groups["hardware"], err)
+	}
+	var leftover int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_id=$2::uuid`,
+		hostID, first.AttemptID).Scan(&leftover); err != nil || leftover != 0 {
+		t.Fatalf("recovered replay kept its hold: %d %v", leftover, err)
+	}
+}
+
+// Two entries for one attempt each pass validation against the same row; the
+// second must not move holds after the first has made the row terminal.
+func TestJournalInventoryWithTwoPhasesForOneAttemptQuarantines(t *testing.T) {
+	for _, tc := range []struct {
+		name, second string
+		proven       bool
+		heldByFirst  int
+	}{
+		{name: "recovered after unproven applied", second: "recovered", proven: false, heldByFirst: 1},
+		{name: "uncertain after proven applied", second: "uncertain", proven: true, heldByFirst: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := testPool(t)
+			store := NewStore(pool)
+			hostID, boot, offer := offeredHardwareAttempt(t, pool, store)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			applied := restartInventoryEntry(hostID, boot, offer, "applied", "4")
+			applied.VerifiedAt = &now
+			later := restartInventoryEntry(hostID, boot, offer, tc.second, "5")
+			active := map[string]PolicySnapshot{"hardware": {Kind: "verified", Digest: strings.Repeat("a", 64)}}
+			if tc.proven {
+				active["hardware"] = PolicySnapshot{Kind: "verified", Digest: offer.ContentSHA256}
+			}
+			holds := func(db interface {
+				QueryRow(context.Context, string, ...any) pgx.Row
+			}) (idle, recovery int) {
+				if err := db.QueryRow(ctx, `SELECT count(*) FILTER (WHERE owner_kind='idle_apply'),count(*) FILTER (WHERE owner_kind='recovery')
+					FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_id=$2::uuid`, hostID, offer.AttemptID).Scan(&idle, &recovery); err != nil {
+					t.Fatal(err)
+				}
+				return idle, recovery
+			}
+			second := "00000000-0000-4000-8000-000000000339"
+			if err := store.BeginJournalReconciliation(ctx, hostID, second); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CompleteJournalReconciliation(ctx, hostID, second, []JournalInventoryEntry{applied, later}, active); err != nil {
+				t.Fatal(err)
+			}
+			if gate, err := store.JournalGate(ctx, hostID); err != nil || gate != "quarantined" {
+				t.Fatalf("two phases for one attempt did not quarantine: gate=%s err=%v", gate, err)
+			}
+			if idle, recovery := holds(pool); idle != 1 || recovery != 0 {
+				t.Fatalf("quarantined inventory moved holds: idle_apply=%d recovery=%d", idle, recovery)
+			}
+			// Each entry on its own: the second no longer lands, so it moves nothing.
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx) //nolint:errcheck
+			for _, entry := range []JournalInventoryEntry{applied, later} {
+				if err := applyRestartInventoryEntry(ctx, tx, hostID, second, entry, tc.proven); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if idle, recovery := holds(tx); idle != tc.heldByFirst || recovery != 0 {
+				t.Fatalf("entry that did not land moved holds: idle_apply=%d recovery=%d", idle, recovery)
+			}
+		})
+	}
+}
+
+func TestJournalInventoryCannotReopenATerminalAttempt(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID, boot, offer := offeredHardwareAttempt(t, pool, store)
+	ctx := context.Background()
+	second := "00000000-0000-4000-8000-000000000339"
+	if err := store.BeginJournalReconciliation(ctx, hostID, second); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	applied := restartInventoryEntry(hostID, boot, offer, "applied", "4")
+	applied.VerifiedAt = &now
+	active := map[string]PolicySnapshot{"hardware": {Kind: "verified", Digest: offer.ContentSHA256}}
+	if err := store.CompleteJournalReconciliation(ctx, hostID, second, []JournalInventoryEntry{applied}, active); err != nil {
+		t.Fatal(err)
+	}
+	third := "00000000-0000-4000-8000-000000000340"
+	if err := store.BeginJournalReconciliation(ctx, hostID, third); err != nil {
+		t.Fatal(err)
+	}
+	reopened := restartInventoryEntry(hostID, boot, offer, "activating", "5")
+	if err := store.CompleteJournalReconciliation(ctx, hostID, third, []JournalInventoryEntry{reopened}, active); err != nil {
+		t.Fatal(err)
+	}
+	if gate, err := store.JournalGate(ctx, hostID); err != nil || gate != "quarantined" {
+		t.Fatalf("later entry on a terminal attempt did not quarantine: gate=%s err=%v", gate, err)
+	}
+	const terminalPhase = `SELECT phase FROM host_config_attempts WHERE id=$1::uuid AND terminal_at IS NOT NULL`
+	var phase string
+	if err := pool.QueryRow(ctx, terminalPhase, offer.AttemptID).Scan(&phase); err != nil || phase != "applied" {
+		t.Fatalf("terminal attempt reopened: phase=%s err=%v", phase, err)
+	}
+	// The upsert predicate refuses on its own, without the validator.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := applyRestartInventoryEntry(ctx, tx, hostID, third, reopened, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow(ctx, terminalPhase, offer.AttemptID).Scan(&phase); err != nil || phase != "applied" {
+		t.Fatalf("upsert reopened terminal attempt: phase=%s err=%v", phase, err)
+	}
+}
+
+func TestUncertainInventoryRestoresAMissingRecoveryHold(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID, boot, offer := offeredHardwareAttempt(t, pool, store)
+	ctx := context.Background()
+	entry := restartInventoryEntry(hostID, boot, offer, "uncertain", "3")
+	entry.ErrorCode = "recovery_verification_failed"
+	// A restored ledger can keep the attempt but not its restriction: first on
+	// the open row, then on the already terminal uncertain row (an exact replay).
+	for i, connection := range []string{"00000000-0000-4000-8000-000000000339", "00000000-0000-4000-8000-000000000340"} {
+		if _, err := pool.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind IN ('idle_apply','recovery')`, hostID); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.BeginJournalReconciliation(ctx, hostID, connection); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CompleteJournalReconciliation(ctx, hostID, connection, []JournalInventoryEntry{entry}); err != nil {
+			t.Fatal(err)
+		}
+		var recoveryHolds int
+		var hostStatus string
+		if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM host_admission_restrictions WHERE host_id=$1::uuid
+			AND owner_kind='recovery' AND owner_id=$2::uuid AND reason='configuration_recovery'),
+			(SELECT status FROM hosts WHERE id=$1::uuid)`, hostID, offer.AttemptID).Scan(&recoveryHolds, &hostStatus); err != nil ||
+			recoveryHolds != 1 || hostStatus != "draining" {
+			t.Fatalf("reconciliation %d left the uncertain attempt open: holds=%d status=%s err=%v", i+1, recoveryHolds, hostStatus, err)
+		}
 	}
 }

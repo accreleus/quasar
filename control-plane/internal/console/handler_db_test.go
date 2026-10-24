@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -196,3 +198,27 @@ func TestPatchHostWithNoAccessReportIsUnaffected(t *testing.T) {
 		t.Fatal("a host with no access report must never be held")
 	}
 }
+
+// PATCH console-config stops reading an oversized body at 1 MiB (#622).
+func TestPatchBodyIsBounded(t *testing.T) {
+	pool := testPool(t)
+	hostID := seedTestHost(t, pool, "console-test-body-bound")
+	h := NewHandler(NewStore(pool), &fakeDispatcher{})
+	const huge = 8 << 20
+	read := 0
+	body := io.TeeReader(strings.NewReader(`{"output_id":"`+strings.Repeat("a", huge)+`"}`), writerFunc(func(p []byte) { read += len(p) }))
+	req := httptest.NewRequest(http.MethodPatch, "/v1/admin/hosts/"+hostID+"/console-config", body)
+	req.SetPathValue("id", hostID)
+	rec := httptest.NewRecorder()
+	h.handlePatch(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if read > 2<<20 {
+		t.Fatalf("handler read %d bytes of an %d-byte body; want it capped near 1 MiB", read, huge)
+	}
+}
+
+type writerFunc func([]byte)
+
+func (f writerFunc) Write(p []byte) (int, error) { f(p); return len(p), nil }

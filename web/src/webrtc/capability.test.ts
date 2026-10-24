@@ -6,6 +6,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   deviceProbeIsFresh,
+  displayRefreshToReport,
   markDeviceProbePosted,
   probeCapabilities,
   probeFeatures,
@@ -19,6 +20,8 @@ afterEach(() => {
   vi.clearAllMocks();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  // A per-test userAgent override must not reach the next test (#632).
+  delete (navigator as unknown as { userAgent?: unknown }).userAgent;
   // Remove any navigator props defined per-test (jsdom lacks getGamepads).
   delete (navigator as unknown as { getGamepads?: unknown }).getGamepads;
   // Multi-codec spec §6.1: jsdom lacks mediaCapabilities; remove the per-test stub
@@ -64,6 +67,32 @@ describe("probeFeatures", () => {
     expect(f.jitter_buffer_target).toBe(false);
     expect(f.playout_delay_hint).toBe(false);
     expect(f.coalesced_pointer_events).toBe(false);
+  });
+});
+
+// #632 — Safari holds requestAnimationFrame near 60 Hz on every screen, so a ~60
+// there is its cap, not the display's rate.
+describe("displayRefreshToReport", () => {
+  it("leaves out a ~60 measured in Safari (the rAF cap, rate unknown)", () => {
+    for (const hz of [55, 59, 60, 61, 65]) expect(displayRefreshToReport(hz, "Safari")).toBeNull();
+  });
+
+  it("still reports a Safari rate that is not near the cap", () => {
+    expect(displayRefreshToReport(120, "Safari")).toBe(120);
+    expect(displayRefreshToReport(48, "Safari")).toBe(48);
+    expect(displayRefreshToReport(66, "Safari")).toBe(66);
+  });
+
+  it("reports a real 60 Hz in every other browser: Chrome and Firefox read the display", () => {
+    for (const name of ["Chrome", "Edge", "Firefox", "Opera"]) {
+      expect(displayRefreshToReport(60, name)).toBe(60);
+    }
+    expect(displayRefreshToReport(120, "Firefox")).toBe(120);
+  });
+
+  it("keeps an unusable sample unknown", () => {
+    expect(displayRefreshToReport(null, "Safari")).toBeNull();
+    expect(displayRefreshToReport(null, "Chrome")).toBeNull();
   });
 });
 
@@ -160,6 +189,39 @@ describe("probeCapabilities", () => {
     expect(native.metrics?.glass_to_glass_ms_p95).toBe(104);
   });
 
+  // The rAF stub above ticks at ~60 Hz. Same page, two browsers: Chrome's number
+  // is the display's, Safari's is its cap and must not reach the control plane.
+  it("reports the measured ~60 Hz in Chrome and omits refresh_hz in Safari (#632)", async () => {
+    stubEnv({ uaData: undefined });
+    Object.defineProperty(navigator, "userAgent", {
+      value: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+      configurable: true,
+    });
+    const chrome = await probeCapabilities();
+    expect(chrome.display.refresh_hz).toBe(60);
+
+    Object.defineProperty(navigator, "userAgent", {
+      value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+      configurable: true,
+    });
+    const safari = await probeCapabilities();
+    expect(safari.browser.name).toBe("Safari");
+    expect(safari.display).not.toHaveProperty("refresh_hz");
+  });
+
+  // iOS browsers are WebKit and their UA carries Safari/: Chrome on iOS
+  // (CriOS) shares Safari's rAF cap, so it must be treated as Safari (#632).
+  it("omits refresh_hz for Chrome on iOS, which is WebKit and reports as Safari (#632)", async () => {
+    stubEnv({ uaData: undefined });
+    Object.defineProperty(navigator, "userAgent", {
+      value: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/130.0.6723.37 Mobile/15E148 Safari/604.1",
+      configurable: true,
+    });
+    const caps = await probeCapabilities();
+    expect(caps.browser.name).toBe("Safari");
+    expect(caps.display).not.toHaveProperty("refresh_hz");
+  });
+
   it("falls back to UA-string sniffing when UA-CH is absent", async () => {
     stubEnv({ uaData: undefined });
     Object.defineProperty(navigator, "userAgent", {
@@ -221,25 +283,40 @@ describe("device capability post freshness", () => {
 
   it("is stale with nothing recorded", () => {
     localStorage.clear();
-    expect(deviceProbeIsFresh("u1")).toBe(false);
+    expect(deviceProbeIsFresh("u1", true)).toBe(false);
   });
 
   it("stays fresh for a day and goes stale after it", () => {
     localStorage.clear();
-    markDeviceProbePosted("u1", 1_000_000);
-    expect(deviceProbeIsFresh("u1", 1_000_000)).toBe(true);
-    expect(deviceProbeIsFresh("u1", 1_000_000 + DAY - 1)).toBe(true);
-    expect(deviceProbeIsFresh("u1", 1_000_000 + DAY)).toBe(false);
+    markDeviceProbePosted("u1", true, 1_000_000);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(true);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000 + DAY - 1)).toBe(true);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000 + DAY)).toBe(false);
+  });
+
+  it("is stale once the H.264 verdict differs from the posted one, and for a stamp without one (#688)", () => {
+    localStorage.clear();
+    markDeviceProbePosted("u1", false, 1_000_000);
+    expect(deviceProbeIsFresh("u1", false, 1_000_000)).toBe(true);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
+    localStorage.setItem("quasar_device_posted_v2", JSON.stringify({ user: "u1", at: 1_000_000 }));
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
   });
 
   it("is per user, so a second account on the browser still posts", () => {
     localStorage.clear();
-    markDeviceProbePosted("u1", 1_000_000);
-    expect(deviceProbeIsFresh("u2", 1_000_000)).toBe(false);
+    markDeviceProbePosted("u1", true, 1_000_000);
+    expect(deviceProbeIsFresh("u2", true, 1_000_000)).toBe(false);
   });
 
   it("treats unreadable storage as stale rather than throwing", () => {
-    localStorage.setItem("quasar_device_posted", "not json");
-    expect(deviceProbeIsFresh("u1")).toBe(false);
+    localStorage.setItem("quasar_device_posted_v2", "not json");
+    expect(deviceProbeIsFresh("u1", true)).toBe(false);
+  });
+
+  it("ignores a stamp from before the Safari refresh change, so that probe is posted again (#632)", () => {
+    localStorage.clear();
+    localStorage.setItem("quasar_device_posted", JSON.stringify({ user: "u1", at: 1_000_000 }));
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
   });
 });

@@ -1,7 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  ABS_CAPTURE_TIME_URI,
-  hasAbsCaptureTimeExtension,
   rvfcCaptureTimeSample,
   SessionTelemetry,
 } from "./telemetry";
@@ -44,19 +42,6 @@ describe("rvfcCaptureTimeSample", () => {
   it("does not manufacture a sample when captureTime is missing", () => {
     expect(rvfcCaptureTimeSample(metadata({ captureTime: undefined })))
       .toEqual({ sampleMs: null });
-  });
-});
-
-describe("hasAbsCaptureTimeExtension", () => {
-  it("accepts only the negotiated absolute-capture-time URI", () => {
-    expect(hasAbsCaptureTimeExtension([
-      { uri: "urn:ietf:params:rtp-hdrext:transport-wide-cc-02" },
-      { uri: ABS_CAPTURE_TIME_URI },
-    ])).toBe(true);
-    expect(hasAbsCaptureTimeExtension([
-      { uri: "urn:ietf:params:rtp-hdrext:transport-wide-cc-02" },
-    ])).toBe(false);
-    expect(hasAbsCaptureTimeExtension(undefined)).toBe(false);
   });
 });
 
@@ -281,5 +266,85 @@ describe("SessionTelemetry.setDecodeFailed (multi-codec spec §6.1)", () => {
     tm.setDecodeFailed(true);
     await pollOnce(tm);
     expect(tm.getSnapshot().clientHealth).toBe("client_unsupported");
+  });
+});
+
+// #610: Firefox reports no freezeCount, and a window with too few presented frames has
+// no σ. A sample for such a window must not claim `smooth`: 30 s of it records a pass
+// that clears the profile's rung failures.
+describe("SessionTelemetry posted client_health on a Firefox-shaped report (#610)", () => {
+  const firefoxReport = (totalDecodeTime: number) =>
+    statsReport([
+      { id: "codec-1", type: "codec", mimeType: "video/H264" },
+      {
+        id: "rtp-1", type: "inbound-rtp", kind: "video", codecId: "codec-1",
+        framesDecoded: 10, totalDecodeTime, bytesReceived: 5000, framesPerSecond: 30,
+      },
+    ]);
+
+  async function queuedSample(totalDecodeTime: number) {
+    const tm = telemetryWithStats(async () => firefoxReport(totalDecodeTime));
+    await pollOnce(tm);
+    return (tm as unknown as { pendingSamples: Array<Record<string, unknown>> }).pendingSamples[0]!;
+  }
+
+  it("omits client_health when the window is unmeasured and would read smooth", async () => {
+    const sample = await queuedSample(0.05);
+    expect(sample).not.toHaveProperty("client_health");
+    expect(sample).not.toHaveProperty("client_health_reason");
+  });
+
+  it("still posts decode_degrading when decode is over budget", async () => {
+    const sample = await queuedSample(10);
+    expect(sample["client_health"]).toBe("decode_degrading");
+  });
+
+  // #686: Firefox's frame callbacks carry mediaTime 0 and a per-frame rtpTimestamp.
+  async function sampleAfterFrames(gapsMs: number[]) {
+    const tm = telemetryWithStats(async () => firefoxReport(0.05));
+    const t = tm as unknown as {
+      overlayRunning: boolean;
+      onDisplayedFrame(m: VideoFrameCallbackMetadata): void;
+      pendingSamples: Array<Record<string, unknown>>;
+    };
+    t.overlayRunning = true;
+    let nowMs = 1000;
+    let rtp = 1347462624;
+    const now = vi.spyOn(performance, "now");
+    for (const gap of [0, ...gapsMs]) {
+      nowMs += gap;
+      rtp += Math.round(gap * 90);
+      now.mockReturnValue(nowMs);
+      t.onDisplayedFrame(metadata({ mediaTime: 0, rtpTimestamp: rtp }));
+    }
+    await pollOnce(tm);
+    now.mockRestore();
+    return t.pendingSamples[0]!;
+  }
+
+  it("posts smooth for a Firefox stream that presents evenly", async () => {
+    const sample = await sampleAfterFrames(Array(30).fill(33));
+    expect((sample["metrics"] as Record<string, number>)["present_n"]).toBe(30);
+    expect(sample["client_health"]).toBe("smooth");
+  });
+
+  it("posts presentation_degrading for a Firefox stream that stalls", async () => {
+    const gaps = Array(30).fill(33);
+    gaps.splice(10, 0, 400, 400, 400);
+    const sample = await sampleAfterFrames(gaps);
+    expect(sample["client_health"]).toBe("presentation_degrading");
+  });
+
+  it("posts smooth once the report carries a freezeCount", async () => {
+    const report = statsReport([
+      {
+        id: "rtp-1", type: "inbound-rtp", kind: "video", freezeCount: 0,
+        framesDecoded: 10, totalDecodeTime: 0.05, bytesReceived: 5000, framesPerSecond: 30,
+      },
+    ]);
+    const tm = telemetryWithStats(async () => report);
+    await pollOnce(tm);
+    const sample = (tm as unknown as { pendingSamples: Array<Record<string, unknown>> }).pendingSamples[0]!;
+    expect(sample["client_health"]).toBe("smooth");
   });
 });

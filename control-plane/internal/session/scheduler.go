@@ -69,6 +69,9 @@ type CreateParams struct {
 	// PinHostID restricts the scheduler to one host's GPUs. Placement policy and
 	// capacity within it are unchanged.
 	PinHostID string
+	// homePinned: PinHostID is the host that already holds this user's managed
+	// home (scheduleAttempt), not a caller's pin. Set by the scheduler only.
+	homePinned bool
 	// PinGPUIndex narrows PinHostID to one GPU (the cert bench); ignored without
 	// a host pin, since an index is per host.
 	PinGPUIndex *int32
@@ -81,6 +84,29 @@ type CreateParams struct {
 	// in the candidate query only: never a filter, never in the re-check, the
 	// totals probe or a diagnostic. Empty renders nothing.
 	CodecPreference []string
+	// Kind is KindParked for a warm Steam (amendment 39); "" is a play.
+	Kind string
+	// claim adopts the caller's parked session (control-api.md §Warm Steam,
+	// "Claim"). The stream fields above are then what the launch resolved on the
+	// parked session's GPU.
+	claim *parkedClaim
+}
+
+// parkedClaim names the parked session a launch tries to adopt. hostParks is
+// the in-memory parked_sessions_v1 answer for its host, read before the
+// transaction.
+type parkedClaim struct {
+	id        string
+	hostParks bool
+}
+
+// sameHolder is the session whose home hold a launch may pass: the parked
+// session it claims.
+func (p CreateParams) sameHolder() []string {
+	if p.claim == nil {
+		return nil
+	}
+	return []string{p.claim.id}
 }
 
 // homeAppID is the storage key for this launch. Every storage-keyed site on this
@@ -293,7 +319,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		}
 	}
 	if p.ManagedHome {
-		owner, err := homeClaimOwner(ctx, tx, p)
+		owner, err := homeClaimOwner(ctx, tx, p, p.sameHolder()...)
 		if err != nil {
 			return Session{}, false, err
 		}
@@ -315,6 +341,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 				return Session{}, false, ErrHomeConflict
 			}
 			p.PinHostID = owner
+			p.homePinned = true
 		}
 	}
 
@@ -329,13 +356,30 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 	if err := tx.QueryRow(ctx, `
 		SELECT COUNT(*) FROM sessions
-		WHERE user_id = $1::uuid
+		WHERE user_id = $1::uuid AND kind = 'play'
 		  AND state IN ('pending','assigned','starting','running')
 	`, p.UserID).Scan(&activeCount); err != nil {
 		return Session{}, false, fmt.Errorf("count active sessions: %w", err)
 	}
 	if activeCount >= userLimit {
 		return Session{}, false, ErrSessionQuotaExceeded
+	}
+
+	// (2a) Warm Steam, under the user lock so a heartbeat cannot race a launch
+	// or another heartbeat into a second live session.
+	var parkedMinutes int32
+	if p.Kind == KindParked {
+		if parkedMinutes, err = parkAllowed(ctx, tx, p.UserID); err != nil {
+			return Session{}, false, err
+		}
+	}
+	var claimed *claimedParked
+	if p.claim != nil {
+		if claimed, err = claimParked(ctx, tx, p); err != nil {
+			return Session{}, false, err
+		}
+		// The adopted runtime is already on that GPU, so its memory is not new.
+		p.PinHostID, p.PinGPUIndex, p.SkipVramVeto = claimed.hostID, &claimed.gpuIndex, true
 	}
 
 	// (2b) Per-(user, home) single-writer guard for managed-home apps (P5-04),
@@ -346,22 +390,15 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	// collide. Two Steam clients on one steamapps tree is the corruption at stake.
 	//
 	// excludeID is "": a launch excludes nothing, unlike the swap path.
+	// The 409 body carries the live session's id so the client can link to it
+	// (§2.1). A holder already stopping only needs a moment (#434).
 	if p.ManagedHome {
-		var conflictID string
-		err := tx.QueryRow(ctx, liveHomeSessionSQL, p.UserID, p.homeAppID(), "").Scan(&conflictID)
-		switch {
-		case err == nil:
-			// The 409 body must carry the live session's id so the client can link
-			// to it (§2.1). A holder already stopping only needs a moment (#434).
-			var stopping bool
-			if err := tx.QueryRow(ctx, `SELECT state='stopping' FROM sessions WHERE id=$1::uuid`,
-				conflictID).Scan(&stopping); err != nil {
-				return Session{}, false, fmt.Errorf("read same-home session state: %w", err)
-			}
-			return Session{}, false, &HomeInUseError{SessionID: conflictID, Stopping: stopping}
-		case errors.Is(err, pgx.ErrNoRows):
-		default:
+		conflict, err := homeInUse(ctx, tx, p.UserID, p.homeAppID(), "")
+		if err != nil {
 			return Session{}, false, fmt.Errorf("count same-home sessions: %w", err)
+		}
+		if conflict != nil {
+			return Session{}, false, conflict
 		}
 	}
 
@@ -378,6 +415,9 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	var gpuIndex int32
 	err = tx.QueryRow(ctx, candidateSQL, candidateArgs...).Scan(&gpuID, &hostID, &gpuIndex)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if claimed != nil {
+			return Session{}, false, &ParkedClaimRefusedError{HolderID: p.claim.id} // check 5
+		}
 		return Session{}, false, classifyReject(ctx, tx, cand)
 	}
 	if err != nil {
@@ -427,7 +467,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	if !imageAvailable {
 		return Session{}, true, nil
 	}
-	if err := claimSelectedHome(ctx, tx, p, hostID); err != nil {
+	if err := claimSelectedHome(ctx, tx, p, hostID, p.sameHolder()...); err != nil {
 		return Session{}, false, err
 	}
 
@@ -455,7 +495,8 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    signaling_token_hash, signaling_token_expires_at,
 		    mic,
 		    device_id,
-		    assigned_at
+		    assigned_at,
+		    kind, parked_until
 		) VALUES (
 		    $1, $2, $3, $4, 'assigned',
 		    $5, $6, $7, $8, $9,
@@ -466,7 +507,9 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    NULLIF($12, ''), $13,
 		    $16,
 		    NULLIF($17, '')::uuid,
-		    now()
+		    now(),
+		    COALESCE(NULLIF($18, ''), 'play'),
+		    CASE WHEN $18 = 'parked' THEN now() + make_interval(mins => $19::int) END
 		)
 		RETURNING `+sessionCols,
 		p.UserID, p.AppID, hostID, gpuID,
@@ -478,9 +521,19 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		p.Codec,
 		p.Mic,
 		deviceID,
+		p.Kind, parkedMinutes,
 	))
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.ConstraintName == "sessions_one_parked_per_user" {
+		return Session{}, false, errParkRefused
+	}
 	if err != nil {
 		return Session{}, false, fmt.Errorf("insert session: %w", err)
+	}
+	if claimed != nil {
+		if err := adoptRuntime(ctx, tx, claimed.id, sess.ID); err != nil {
+			return Session{}, false, err
+		}
 	}
 	// Internal launches omit browser signaling; only persist a minted token.
 	if p.TokenHash != "" {
@@ -560,7 +613,18 @@ func classifyRejectPlain(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 		return fmt.Errorf("classify rejection: %w", err)
 	}
 	if !totalsFit {
-		return noHostRejection(ctx, tx, cand.p.AppImage)
+		rej := noHostRejection(ctx, tx, cand.p.AppImage)
+		if cand.p.homePinned {
+			// Only a host that is gone or offline: a draining one is connected and
+			// comes back by itself, so it keeps the generic text.
+			var connected bool
+			err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM hosts WHERE id = $1::uuid AND status <> 'offline')`,
+				cand.p.PinHostID).Scan(&connected)
+			if err == nil && !connected {
+				return &HomeHostOfflineRejection{err: rej}
+			}
+		}
+		return rej
 	}
 	// Readiness is diagnosed here, in the position of the veto diagnostic and
 	// never inside totalsQuery, and only claims the refusal when it is the sole
@@ -618,23 +682,37 @@ func (e *NoHostRejection) Error() string {
 
 func (e *NoHostRejection) Unwrap() error { return e.err }
 
+// HomeHostOfflineRejection marks a no_host_available refusal whose cause is that
+// the user's managed home is claimed by a host that is offline or gone (a host that
+// was never enrolled again after a restore reads the same). It unwraps to the
+// plain rejection, so errors.Is and the fleet-count log are unchanged; only the
+// response text differs. It names no host.
+type HomeHostOfflineRejection struct{ err error }
+
+func (e *HomeHostOfflineRejection) Error() string {
+	return fmt.Sprintf("%v (the host that holds the user's home is not online)", e.err)
+}
+
+func (e *HomeHostOfflineRejection) Unwrap() error { return e.err }
+
 // noHostRejection attaches fleet counts to ErrNoHostAvailable so the launcher
 // can log why nothing fit. Fail-open on its own query failure: a wrong log
 // beats a wrong refusal, so a query error falls back to the plain error.
+// "Online" is placement's: status online and no recorded disconnect (liveHostSQL).
 func noHostRejection(ctx context.Context, tx pgx.Tx, appImage string) error {
 	rej := &NoHostRejection{err: ErrNoHostAvailable}
 	err := tx.QueryRow(ctx, `
 		SELECT
-			(SELECT COUNT(*) FROM hosts WHERE status = 'online'),
-			(SELECT COUNT(*) FROM hosts WHERE status = 'online' AND capacity_detection != 'ok'),
+			(SELECT COUNT(*) FROM hosts h WHERE h.status = 'online'`+liveHostSQL+`),
+			(SELECT COUNT(*) FROM hosts h WHERE h.status = 'online'`+liveHostSQL+` AND h.capacity_detection != 'ok'),
 			(SELECT COUNT(*) FROM gpus g JOIN hosts h ON h.id = g.host_id
-			  WHERE h.status = 'online' AND NOT g.reported),
-			(SELECT COUNT(*) FROM hosts
-			  WHERE status = 'online' AND last_registered_at > now() - interval '15 seconds'),
+			  WHERE h.status = 'online'`+liveHostSQL+` AND NOT g.reported),
+			(SELECT COUNT(*) FROM hosts h
+			  WHERE h.status = 'online'`+liveHostSQL+` AND h.last_registered_at > now() - interval '15 seconds'),
 			(SELECT COUNT(DISTINCT hi.host_id) FROM host_images hi
 			   JOIN installed_images ii ON ii.image_id = hi.image_id
 			   JOIN hosts h ON h.id = hi.host_id
-			  WHERE h.status = 'online' AND hi.state = 'failed'
+			  WHERE h.status = 'online'`+liveHostSQL+` AND hi.state = 'failed'
 			    AND $1::text <> '' AND (ii.registry_ref = $1::text OR ii.local_tag = $1::text))
 	`, appImage).Scan(&rej.OnlineHosts, &rej.HostsCapacityNotOK, &rej.GPUsUnreported, &rej.HostsRecentlyRegistered, &rej.HostsImageFailed)
 	if err != nil {

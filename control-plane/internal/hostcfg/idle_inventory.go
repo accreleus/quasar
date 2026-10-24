@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 )
 
 // ErrIdleInventoryStale refuses a heartbeat from a socket that no longer owns
@@ -295,8 +297,8 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var boot, status string
-	var deliveryGate bool
-	if err := tx.QueryRow(ctx, `SELECT status,config_policy_gate_connection IS NOT NULL FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status, &deliveryGate); err != nil {
+	var deliveryGate, live bool
+	if err := tx.QueryRow(ctx, `SELECT status,config_policy_gate_connection IS NOT NULL,`+admission.HostIsLiveSQL+` FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status, &deliveryGate, &live); err != nil {
 		return err
 	}
 	if !deliveryGate {
@@ -319,9 +321,15 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 		return tx.Commit(ctx)
 	}
 	quarantine := false
-	seen := make(map[string]bool, len(restartEntries))
+	seen := make(map[string]JournalInventoryEntry, len(restartEntries))
 	for _, entry := range restartEntries {
-		seen[entry.AttemptID] = true
+		// Every entry validates against the pre-apply row, so two for one
+		// attempt must be the same report.
+		if prior, ok := seen[entry.AttemptID]; ok && (prior.Sequence != entry.Sequence || prior.Phase != entry.Phase) {
+			quarantine = true
+			break
+		}
+		seen[entry.AttemptID] = entry
 		if entry.HostID != hostID || entry.Scope != "restart" || !validPolicyDigest(entry.Digest) || entry.AttemptID == "" || entry.Group == "" || entry.Phase == "" || entry.Sequence == "" {
 			quarantine = true
 			break
@@ -344,7 +352,7 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 			knownAccepted.Close()
 			return err
 		}
-		if !seen[id] {
+		if _, ok := seen[id]; !ok {
 			quarantine = true
 		}
 	}
@@ -375,7 +383,7 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 			pending.Close()
 			return err
 		}
-		if seen[id] {
+		if _, ok := seen[id]; ok {
 			// Durable acceptance won the race with cancellation. Reconstruct it
 			// below; cancellation cannot revoke execution after fsync.
 		} else {
@@ -453,7 +461,10 @@ func (s *Store) CompleteJournalReconciliation(ctx context.Context, hostID, conne
 	if held && status == "online" {
 		status = "draining"
 	} else if !held && status == "draining" {
-		status = "online"
+		status = "offline"
+		if live {
+			status = "online"
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE hosts SET status=$2 WHERE id=$1::uuid`, hostID, status); err != nil {
 		return err
@@ -504,10 +515,10 @@ func validateRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID string
 		WHERE host_id=$1::uuid AND id=$2::uuid`, hostID, entry.AttemptID).
 		Scan(&group, &digest, &oldRevision, &grantBoot, &grantConnection, &phase, &oldSeq, &terminalAt)
 	if err == nil {
-		if phase == "revoked_unstarted" && terminalAt != nil {
-			// An absent complete journal closed this attempt. A later started
-			// entry contradicts that proof; quarantine rather than resurrect it
-			// under a still-terminal row with an already released hold.
+		if terminalAt != nil && (seq != oldSeq || phase != entry.Phase) {
+			// terminal_at is never cleared, so only an exact replay of the
+			// terminal entry passes; anything later quarantines rather than
+			// resurrect the attempt under an already released hold.
 			return false, nil
 		}
 		return group == entry.Group && digest == entry.Digest && oldRevision == revision && grantBoot == entry.GrantBoot &&
@@ -545,7 +556,7 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 	revision, _ := strconv.ParseInt(entry.Revision, 10, 64)
 	terminal := entry.Phase == "applied" || entry.Phase == "recovered" || entry.Phase == "uncertain" ||
 		entry.Phase == "revoked_unstarted" || entry.Phase == "failed" && seq == 0
-	if _, err := tx.Exec(ctx, `INSERT INTO host_config_attempts
+	upsert, err := tx.Exec(ctx, `INSERT INTO host_config_attempts
 		(id,host_id,group_key,approved_digest,approved_revision,scope,boot_incarnation,grant_connection,phase,journal_sequence,started_at,terminal_at,recovery_attempted,error_code)
 		VALUES($1::uuid,$2::uuid,$3,$4,$5,'restart',$6::uuid,$7::uuid,$8,$9,
 			CASE WHEN $9::bigint>0 THEN now() ELSE NULL END,CASE WHEN $10::boolean THEN now() ELSE NULL END,
@@ -555,8 +566,9 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			terminal_at=COALESCE(host_config_attempts.terminal_at,excluded.terminal_at),
 			recovery_attempted=host_config_attempts.recovery_attempted OR excluded.recovery_attempted,
 			error_code=COALESCE(excluded.error_code,host_config_attempts.error_code)
-		WHERE host_config_attempts.journal_sequence IS NULL OR host_config_attempts.journal_sequence<$9::bigint`,
-		entry.AttemptID, hostID, entry.Group, entry.Digest, revision, entry.GrantBoot, entry.GrantConnection, entry.Phase, seq, terminal, safeIdleErrorCode(entry.ErrorCode)); err != nil {
+		WHERE host_config_attempts.terminal_at IS NULL AND (host_config_attempts.journal_sequence IS NULL OR host_config_attempts.journal_sequence<$9::bigint)`,
+		entry.AttemptID, hostID, entry.Group, entry.Digest, revision, entry.GrantBoot, entry.GrantConnection, entry.Phase, seq, terminal, safeIdleErrorCode(entry.ErrorCode))
+	if err != nil {
 		return err
 	}
 	if seq > 0 {
@@ -584,6 +596,16 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			return err
 		}
 	}
+	// Holds and group status follow the phase the row now holds: an exact replay
+	// repairs them, a phase that did not land on the row changes neither.
+	var stored string
+	if err := tx.QueryRow(ctx, `SELECT phase FROM host_config_attempts WHERE host_id=$1::uuid AND id=$2::uuid`,
+		hostID, entry.AttemptID).Scan(&stored); err != nil {
+		return err
+	}
+	if stored != entry.Phase {
+		return nil
+	}
 	if entry.Phase == "applied" && active {
 		if _, err := tx.Exec(ctx, `UPDATE host_setting_groups SET applied_revision=$3,applied_digest=$4,status='applied',
 			evidence_connection=$5::uuid,evidence_at=$6 WHERE host_id=$1::uuid AND group_key=$2
@@ -591,7 +613,9 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			return err
 		}
 	}
-	if entry.Phase == "recovered" || entry.Phase == "uncertain" || entry.Phase == "failed" {
+	// Only the report that moves the row marks the group failed: a replay would
+	// overwrite a later attempt that applied the same revision.
+	if upsert.RowsAffected() > 0 && (entry.Phase == "recovered" || entry.Phase == "uncertain" || entry.Phase == "failed") {
 		status := "failed"
 		if entry.Phase == "uncertain" {
 			status = "uncertain"
@@ -606,8 +630,22 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
-	} else if terminal {
+		// A restored ledger can hold the attempt without its restriction.
+		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+			VALUES($1::uuid,'recovery',$2::uuid,'configuration_recovery') ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
+			return err
+		}
+	} else if terminal && (entry.Phase != "applied" || active) {
+		// An applied entry releases its hold only with the matching verified active snapshot.
 		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
+			return err
+		}
+	} else if !terminal {
+		// A restored ledger can omit both an unfinished attempt and its
+		// restriction (agent-api.md); the rebuilt attempt holds admission again.
+		// failed with a sequence is unfinished: recovery follows it.
+		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+			VALUES($1::uuid,'idle_apply',$2::uuid,'idle_configuration') ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
 	}

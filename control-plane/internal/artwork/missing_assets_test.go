@@ -6,10 +6,14 @@ package artwork
 // handler_test.go's harness and fakeProvider.
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -35,8 +39,8 @@ func (h *harness) assetsPresent(t *testing.T, appID string) Record {
 		t.Fatalf("get %s: ok=%v err=%v", appID, ok, err)
 	}
 	for _, a := range []string{rec.TileAsset, rec.HeroAsset} {
-		if a != "" && !h.svc.blobs.Has(a) {
-			t.Fatalf("asset %s of %s is still missing", a, appID)
+		if ok, err := h.svc.blobs.Has(a); a != "" && !ok {
+			t.Fatalf("asset %s of %s is still missing (err %v)", a, appID, err)
 		}
 	}
 	return rec
@@ -179,4 +183,63 @@ func TestSweepRepairIsRetriedAfterAProviderError(t *testing.T) {
 		t.Fatalf("result = %+v, want the repair on the next sweep", res)
 	}
 	h.assetsPresent(t, appID)
+}
+
+// A file that cannot be checked is not a missing file: the sweep must not fetch
+// it again or rewrite the row on a stat error other than not-exist.
+func TestSweepDoesNotRefetchAFileItCannotCheck(t *testing.T) {
+	pool := testDB(t)
+	fp := &fakeProvider{artByExternal: map[string]Candidate{}}
+	h := newHarness(t, pool, fp)
+	fp.artByExternal["steam:620"] = Candidate{TileURL: h.artSrv.URL + "/grid.png"}
+	appID := h.seedExternalApp(t, "Portal 2", "game", "steam", "620")
+	h.svc.SweepOnce(context.Background())
+	before := h.assetsPresent(t, appID)
+	h.emptyCache(t)
+	// The shard path as a file: stat of the tile fails with ENOTDIR.
+	if err := os.WriteFile(filepath.Join(h.svc.blobs.Root(), before.TileAsset[:2]), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if res := h.svc.SweepOnce(context.Background()); res.ArtworkRepaired != 0 || fp.externalCalls != 1 {
+		t.Fatalf("result = %+v, external calls %d; want no repair and no fetch", res, fp.externalCalls)
+	}
+	if rec, _, _ := h.svc.store.Get(context.Background(), appID); rec.TileAsset != before.TileAsset {
+		t.Fatalf("the row changed: %+v -> %+v", before, rec)
+	}
+}
+
+// A stat that fails for a reason other than not-exist (below: the shard path
+// is a plain file, so every look fails with ENOTDIR) warns ONCE per sweep —
+// one warning for all the apps it touches, not one per app (#734).
+func TestSweepLogsUncheckableFilesOnce(t *testing.T) {
+	pool := testDB(t)
+	fp := &fakeProvider{artByExternal: map[string]Candidate{}}
+	h := newHarness(t, pool, fp)
+	fp.artByExternal["steam:620"] = Candidate{TileURL: h.artSrv.URL + "/grid.png", HeroURL: h.artSrv.URL + "/hero.jpg"}
+	for range 3 {
+		h.seedExternalApp(t, "Portal 2", "game", "steam", "620")
+	}
+	h.svc.SweepOnce(context.Background())
+
+	var buf bytes.Buffer
+	h.svc.log = slog.New(slog.NewTextHandler(&buf, nil))
+	h.svc.blobs.log = h.svc.log
+	h.emptyCache(t)
+	// The three apps share one content-addressed tile and hero, so two plain
+	// files stand in front of every stat the sweep can make.
+	for _, asset := range []string{sha(onePixelPNG) + ".png", sha(onePixelJPEG) + ".jpg"} {
+		if err := os.WriteFile(filepath.Join(h.svc.blobs.Root(), asset[:2]), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if res := h.svc.SweepOnce(context.Background()); res.ArtworkRepaired != 0 {
+		t.Fatalf("result = %+v, want nothing repaired when nothing can be checked", res)
+	}
+	if n := strings.Count(buf.String(), "could not check cached images"); n != 1 {
+		t.Fatalf("want one warning for the sweep, got %d:\n%s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "apps=3") {
+		t.Errorf("the warning does not carry the number of apps:\n%s", buf.String())
+	}
 }

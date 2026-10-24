@@ -19,7 +19,12 @@ type ProfilePolicySettings struct {
 
 type UserProfilePreferences struct {
 	DefaultProfileID *string `json:"default_profile_id"`
+	// "show" (the default) or "dismiss_safe" (amendment 39, migration 0105).
+	SteamDialogs string `json:"steam_dialogs"`
 }
+
+// ValidSteamDialogs mirrors the user_profile_preferences CHECK.
+func ValidSteamDialogs(v string) bool { return v == "show" || v == steamDialogsDismiss }
 
 func (s *Store) GetProfilePolicy(ctx context.Context) (ProfilePolicySettings, error) {
 	var p ProfilePolicySettings
@@ -61,6 +66,9 @@ func (s *Store) UpdateProfilePolicy(ctx context.Context, globalDefaultProfileID 
 	return p, nil
 }
 
+// GetUserProfilePreferences reads default_profile_id only; SteamDialogs is
+// GetSteamDialogs. The launch path calls this, and must not read columns newer
+// than the profile (TestMigration0036BehaviourNeutrality runs it on an old schema).
 func (s *Store) GetUserProfilePreferences(ctx context.Context, userID string) (UserProfilePreferences, error) {
 	var prefs UserProfilePreferences
 	err := s.pool.QueryRow(ctx, `
@@ -102,6 +110,52 @@ func (s *Store) UpdateUserProfilePreferences(ctx context.Context, userID string,
 	return prefs, nil
 }
 
+// GetSteamDialogs is the user's steam_dialogs; no row reads "show".
+func (s *Store) GetSteamDialogs(ctx context.Context, userID string) (string, error) {
+	v := "show"
+	err := s.pool.QueryRow(ctx, `SELECT steam_dialogs FROM user_profile_preferences WHERE user_id::text = $1`,
+		userID).Scan(&v)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("get steam dialogs: %w", err)
+	}
+	return v, nil
+}
+
+// SetSteamDialogs writes steam_dialogs alone, leaving the profile unchanged.
+// The caller has checked ValidSteamDialogs.
+func (s *Store) SetSteamDialogs(ctx context.Context, userID, value string) (UserProfilePreferences, error) {
+	return s.SaveProfilePreferences(ctx, userID, nil, false, &value)
+}
+
+// SaveProfilePreferences is the PATCH write, both fields in one statement:
+// default_profile_id when setProfile (nil clears it), steam_dialogs when
+// non-nil. The caller has checked ValidSteamDialogs.
+func (s *Store) SaveProfilePreferences(ctx context.Context, userID string, defaultProfileID *string, setProfile bool, steamDialogs *string) (UserProfilePreferences, error) {
+	if setProfile && defaultProfileID != nil && *defaultProfileID != "" {
+		ok, err := s.LaunchProfileExists(ctx, *defaultProfileID)
+		if err != nil {
+			return UserProfilePreferences{}, err
+		}
+		if !ok {
+			return UserProfilePreferences{}, ErrProfileUnknown
+		}
+	}
+	var prefs UserProfilePreferences
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO user_profile_preferences (user_id, default_profile_id, steam_dialogs)
+		VALUES ($1::uuid, CASE WHEN $3::boolean THEN NULLIF($2, '') END, COALESCE($4::text, 'show'))
+		ON CONFLICT (user_id) DO UPDATE SET
+		    default_profile_id = CASE WHEN $3::boolean THEN EXCLUDED.default_profile_id
+		                              ELSE user_profile_preferences.default_profile_id END,
+		    steam_dialogs = COALESCE($4::text, user_profile_preferences.steam_dialogs)
+		RETURNING default_profile_id, steam_dialogs
+	`, userID, strOrEmpty(defaultProfileID), setProfile, steamDialogs).Scan(&prefs.DefaultProfileID, &prefs.SteamDialogs)
+	if err != nil {
+		return UserProfilePreferences{}, fmt.Errorf("save user profile preferences: %w", err)
+	}
+	return prefs, nil
+}
+
 func (s *Store) ProfileOverrideAllowed(ctx context.Context, app LaunchApp, isAdmin bool) (bool, error) {
 	if isAdmin {
 		return true, nil
@@ -117,7 +171,8 @@ func (s *Store) ProfileOverrideAllowed(ctx context.Context, app LaunchApp, isAdm
 }
 
 // ResolveDefaultProfile picks the launch profile a no-profile_id launch uses:
-// app pin (prefer/force) -> user preference -> global default -> recommendation.
+// app pin (prefer/force) -> user preference (only while user overrides are
+// allowed) -> global default -> recommendation.
 // `restriction` is the app's launchable allow-list; a user preference or global
 // default outside it is skipped, falling through to the next source (ultimately
 // recommendedID, computed over the filtered catalogue) rather than launching an
@@ -127,16 +182,20 @@ func (s *Store) ResolveDefaultProfile(ctx context.Context, userID string, app La
 	if (app.ProfilePolicy == "prefer" || app.ProfilePolicy == "force") && app.DefaultProfileID != nil && *app.DefaultProfileID != "" {
 		return *app.DefaultProfileID, nil
 	}
-	prefs, err := s.GetUserProfilePreferences(ctx, userID)
-	if err != nil {
-		return "", err
-	}
-	if prefs.DefaultProfileID != nil && *prefs.DefaultProfileID != "" && restriction.Permits(*prefs.DefaultProfileID) {
-		return *prefs.DefaultProfileID, nil
-	}
 	policy, err := s.GetProfilePolicy(ctx)
 	if err != nil {
 		return "", err
+	}
+	// The stored default is honoured only while overrides are allowed
+	// (control-api.md); it is kept, not cleared, so it applies again when they are.
+	if policy.UserOverridesAllowed {
+		prefs, err := s.GetUserProfilePreferences(ctx, userID)
+		if err != nil {
+			return "", err
+		}
+		if prefs.DefaultProfileID != nil && *prefs.DefaultProfileID != "" && restriction.Permits(*prefs.DefaultProfileID) {
+			return *prefs.DefaultProfileID, nil
+		}
 	}
 	if policy.GlobalDefaultProfileID != nil && *policy.GlobalDefaultProfileID != "" && restriction.Permits(*policy.GlobalDefaultProfileID) {
 		return *policy.GlobalDefaultProfileID, nil

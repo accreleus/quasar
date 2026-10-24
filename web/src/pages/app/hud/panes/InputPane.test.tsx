@@ -89,6 +89,19 @@ describe("InputPane keys", () => {
     ).toBeTruthy();
   });
 
+  it("on a secure page without Keyboard Lock (Safari), gives no HTTPS advice (#631)", () => {
+    render(<InputPane {...base} inputCaptured escReleases escNoKeyboardLock />);
+    expect(screen.getByText(/doesn’t support Keyboard Lock/i)).toBeTruthy();
+    expect(screen.getByText(/Chrome or Edge can pass Esc/i)).toBeTruthy();
+    expect(screen.queryByText(/HTTPS|insecure/i)).toBeNull();
+  });
+
+  it("on Firefox the combo line wins over the no-Keyboard-Lock line", () => {
+    render(<InputPane {...base} inputCaptured escReleases escNoKeyboardLock escCombo />);
+    expect(screen.getByText(/Ctrl\+Alt\+Shift\+E to send Esc to the game/)).toBeTruthy();
+    expect(screen.queryByText(/Chrome or Edge/i)).toBeNull();
+  });
+
   it("names the untrusted certificate — 'use HTTPS' is wrong advice on an origin that already is https", () => {
     render(<InputPane {...base} inputCaptured escReleases escCertUntrusted />);
     expect(screen.getByText(/certificate your device doesn’t trust/i)).toBeTruthy();
@@ -99,6 +112,12 @@ describe("InputPane keys", () => {
   it("cert wording wins over the API-presence wording when both apply", () => {
     render(<InputPane {...base} inputCaptured escReleases escInsecureContext escCertUntrusted />);
     expect(screen.getByText(/certificate your device doesn’t trust/i)).toBeTruthy();
+    expect(screen.queryByText(/insecure origin/i)).toBeNull();
+  });
+
+  it("on Firefox, names the send-Esc combo instead of blaming HTTPS (#647)", () => {
+    render(<InputPane {...base} inputCaptured escReleases escInsecureContext escCombo />);
+    expect(screen.getByText(/Ctrl\+Alt\+Shift\+E to send Esc to the game/)).toBeTruthy();
     expect(screen.queryByText(/insecure origin/i)).toBeNull();
   });
 

@@ -49,6 +49,7 @@ case "$1" in
       *Healthcheck*) echo '{"Test":["CMD","true"]}' ;;
       *.Config.User*) echo 'quasar' ;;
       *Entrypoint*)  echo '["/usr/local/bin/quasar-control"] null' ;;
+      *Labels*)      printf '%s\n' "${MOCK_LABELS:-}" ;;
       *)             echo '' ;;   # Env / Labels sweeps: nothing declared
     esac
     exit 0 ;;
@@ -116,5 +117,15 @@ if grep -q '^pull ' "$tmp/nopull.log"; then fail "pulled without --pull"; fi
 refused pullfail env MOCK_PULL_OK=0 bash "$script" --image "$image" --role control \
   --pull --no-gpu
 grep -q 'could not pull' "$tmp/pullfail.out" || fail "wrong diagnostic: $(cat "$tmp/pullfail.out")"
+
+# ── 7. A `name>=version` label floor passes only a bare version at or above it ──
+floor() { # floor <gst label value> <PASS|FAIL>
+  local out; out="$(PATH="$tmp/bin:$PATH" MOCK_DOCKER_LOG="$tmp/floor.log" \
+    MOCK_LABELS="org.quasar.pins.gst=$1" bash "$script" --image "$image" --role runtime --no-gpu 2>&1 || true)"
+  printf '%s\n' "$out" | grep -Eq "^ *$2 +label\.org\.quasar\.pins\.gst( |$)" \
+    || fail "gst label '$1': expected $2: $(printf '%s\n' "$out" | grep 'pins.gst' || echo '<no line>')"
+}
+floor 1.28.6 PASS; floor 1.28.8 PASS; floor 1.30.0 PASS
+for v in 1.28.5 1.9 dev 1.28.6-rc1 gst1.28.8 ''; do floor "$v" FAIL; done
 
 echo 'validate-image.sh reference handling: PASS'

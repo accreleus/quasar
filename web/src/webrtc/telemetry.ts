@@ -10,10 +10,11 @@ import { classifyClientHealth, type ClientHealth } from "./clientHealth";
 import { getOrCreateDeviceKey } from "./capability";
 import type { ClockEstimate, PostedClock } from "./clockOffset";
 import { estimateClockOffset, shouldPostClock } from "./clockOffset";
-import { CLOCK_REPOST_DELTA_MS, CLOCK_REPOST_INTERVAL_S } from "./thresholds";
+import { CLOCK_REPOST_DELTA_MS, CLOCK_REPOST_INTERVAL_S, PRESENT_MIN_SAMPLES } from "./thresholds";
 import { summarizePresentWindow, type PresentCadence } from "./presentCadence";
 import {
   feedPresentedFrame,
+  presentedFrameKey,
   INITIAL_FRAME_DEDUP_STATE,
   type FrameDedupState,
 } from "./presentFrameDedup";
@@ -27,16 +28,6 @@ export type AbsCaptureTimeNegotiation = "pending" | "negotiated" | "unavailable"
 
 /** The URI Chrome exposes through RTCRtpReceiver.getParameters(). */
 export const ABS_CAPTURE_TIME_URI = "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time";
-
-/**
- * Distinct from RVFC's optional captureTime field: negotiated wire timing does
- * not guarantee a browser build surfaces frame-correlated capture timestamps.
- */
-export function hasAbsCaptureTimeExtension(
-  headerExtensions: ReadonlyArray<{ uri?: string }> | undefined,
-): boolean {
-  return headerExtensions?.some((extension) => extension.uri === ABS_CAPTURE_TIME_URI) ?? false;
-}
 
 export interface RvfcCaptureTimeSampleResult {
   sampleMs: number | null;
@@ -568,11 +559,16 @@ export class SessionTelemetry {
     // Calls the capture getter exactly once, updating lastInputMetrics for buildMetrics().
     const snap = this.getSnapshot();
 
+    // Firefox reports no freezeCount, and a thin present window has no σ: "smooth" there
+    // is unmeasured, and a posted one would record a pass. An absent class is a server no-op.
+    const unmeasured =
+      ch.health === "smooth" &&
+      typeof rtp["freezeCount"] !== "number" &&
+      this.presentCadence.n < PRESENT_MIN_SAMPLES;
     const sample: StatSample = {
       ts_unix_ms: Date.now(),
       metrics: { ...this.buildMetrics(), is_hidden: isHidden ? 1 : 0 },
-      client_health: ch.health,
-      client_health_reason: ch.reason,
+      ...(unmeasured ? {} : { client_health: ch.health, client_health_reason: ch.reason }),
       device_key: this.deviceKey,
       ...(this.negotiatedCodec ? { codec_mime_type: this.negotiatedCodec } : {}),
     };
@@ -818,13 +814,13 @@ export class SessionTelemetry {
     // pollStats drains this array every second, so at any plausible refresh
     // rate it holds a couple hundred entries at most — no bound needed.
     //
-    // #263: dedup by metadata.mediaTime (presentFrameDedup.ts) before
+    // #263: dedup by the frame's identity (presentedFrameKey) before
     // accumulating, so intervals reflect distinct presented frames regardless
     // of display Hz. metadata is undefined on the rAF fallback path (no RVFC),
     // where every callback is treated as distinct.
     const { intervalMs, nextState } = feedPresentedFrame(
       this.frameDedupState,
-      metadata?.mediaTime,
+      presentedFrameKey(metadata),
       now,
     );
     this.frameDedupState = nextState;

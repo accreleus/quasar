@@ -20,6 +20,7 @@ import {
   type LaunchDraft,
 } from "../launchOptions";
 import { BandNotes } from "./BandNotes";
+import { waitingPlayLabel } from "../capacityRetry";
 import { LaunchOptions } from "./LaunchOptions";
 import { recommendation } from "./launchOptionRules";
 import { useHeroPalette } from "./useHeroPalette";
@@ -148,15 +149,20 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
       (model?.space.entriesByCodec.get("auto") ?? []).find((e) => e.recommended) ?? null,
   });
 
+  // Auto (codec null) refused for its codec on a browser without H.264.
+  const noH264 =
+    !codecCaps.h264 &&
+    resolved?.codec === null &&
+    resolved.eligibility === "ineligible" &&
+    resolved.reasons.some((r) => r.code === "codec_not_supported");
+
   const playDisabled = isLive
     ? false
-    : launching || isBlocked || !codecCaps.h264 || !resolved || isDeadEnd;
+    : launching || isBlocked || !resolved || isDeadEnd;
   const playLabel = isLive
     ? "Resume session"
     : waitingForSlot
-      ? waitingReason === "host"
-        ? "Waiting for a host…"
-        : "Waiting for a slot…"
+      ? waitingPlayLabel(waitingReason)
       : launching
         ? "Launching…"
         : "Play";
@@ -230,7 +236,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
           appName={app.name}
           risky={resolved?.eligibility === "risky"}
           riskyReasons={resolved?.reasons ?? []}
-          deadEnd={isDeadEnd}
+          deadEnd={isDeadEnd && !noH264}
           deadEndReasons={
             resolved?.reasons?.length ? resolved.reasons : loaded ? blockingReasons(loaded) : []
           }
@@ -238,7 +244,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
           isBlocked={isBlocked}
           blockedByName={blockedByName}
           liveSessionId={liveSessionId}
-          canDecodeH264={codecCaps.h264}
+          noH264={noH264}
           waitingForSlot={waitingForSlot}
           waitingReason={waitingReason}
           onRetryProfiles={onRetryProfiles}

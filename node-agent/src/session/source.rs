@@ -220,6 +220,9 @@ pub struct SessionResources {
     /// host for days; the only evidence was one WARN line, and they all reported
     /// `running`.
     audio_degraded: Option<String>,
+    /// #731: the launch helper's socket, when the session's first app is a derived
+    /// Steam tile. Dropped with the session, after its sources.
+    launch: Option<super::launch_helper::LaunchSocket>,
 }
 
 impl SessionResources {
@@ -330,9 +333,20 @@ impl SessionResources {
                 shared,
                 runtime_dir: cfg.runtime_dir.clone(),
                 audio_degraded,
+                launch: None,
             },
             pulse_server,
         ))
+    }
+
+    /// Give every source generation built after this the launch helper's mount.
+    pub fn set_launch(&mut self, socket: Option<super::launch_helper::LaunchSocket>) {
+        self.launch = socket;
+    }
+
+    /// What the launch helper has reported, for a session that has one.
+    pub fn launch(&self) -> Option<&super::launch_helper::LaunchSocket> {
+        self.launch.as_ref()
     }
 
     /// Why this session has no PulseAudio sidecar despite wanting one. See the field doc.
@@ -367,6 +381,27 @@ impl SessionResources {
                     p.socket_dir().to_string_lossy().into_owned(),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+impl SessionResources {
+    /// A session with no input devices whose sound server is `sidecar`.
+    pub(crate) fn with_sidecar(session_id: &str, sidecar: Box<dyn teardown::Sidecar>) -> Self {
+        SessionResources {
+            home_seed: None,
+            devices: None,
+            input_state: Arc::new(InputState::new()),
+            shared: Arc::new(SharedSessionRuntime::new(
+                session_id,
+                Some(sidecar),
+                None,
+                teardown::RetryBudget::spent(),
+            )),
+            runtime_dir: String::new(),
+            audio_degraded: None,
+            launch: None,
+        }
     }
 }
 
@@ -510,6 +545,7 @@ pub struct AppSource {
     display: AppDisplayMode,
     device_nodes: Vec<PathBuf>,
     pulse: Option<(String, String)>,
+    launch: Option<super::launch_helper::LaunchMount>,
     container: Option<RunningContainer>,
     launched: bool,
     first_frame: Arc<AtomicBool>,
@@ -612,6 +648,7 @@ impl AppSource {
             },
             device_nodes: res.device_nodes(),
             pulse: res.pulse_mount(),
+            launch: res.launch.as_ref().map(|l| l.mount().clone()),
             container: None,
             launched: false,
             first_frame,
@@ -1051,6 +1088,14 @@ impl AppSource {
         }
     }
 
+    /// The app this generation's container runs now: an adoption or an in-place swap changes it
+    /// with no new container (amendment 39), and a rollback must relaunch that app.
+    pub fn set_app_spec(&mut self, spec: ContainerSpec) {
+        if self.container_spec.is_some() {
+            self.container_spec = Some(spec);
+        }
+    }
+
     /// Relaunch this generation's app container into its still-live compositor: the
     /// rollback for a serialised swap that failed AFTER the outgoing app was stopped. The
     /// app restarts from scratch (its process state is gone, the cost of stopping it
@@ -1081,15 +1126,10 @@ impl AppSource {
         }
     }
 
-    fn launch(&mut self, wl_display: &str) {
-        let Some(spec) = self.container_spec.clone() else {
-            tracing::info!(
-                "source '{}': no app image configured (bare compositor)",
-                self.sink_name
-            );
-            return;
-        };
-        let mut effective_spec = spec;
+    /// What the next launch hands the engine, a rollback's relaunch included: the app's spec
+    /// with the session's sound server added.
+    pub(crate) fn launch_spec(&self) -> Option<ContainerSpec> {
+        let mut effective_spec = self.container_spec.clone()?;
         if let Some((server_uri, dir)) = &self.pulse {
             effective_spec
                 .env
@@ -1113,6 +1153,17 @@ impl AppSource {
                 .or_insert_with(|| super::audio::QUASAR_MIC_SOURCE_NAME.to_string());
             effective_spec.mounts.push(format!("{dir}:{dir}"));
         }
+        Some(effective_spec)
+    }
+
+    fn launch(&mut self, wl_display: &str) {
+        let Some(effective_spec) = self.launch_spec() else {
+            tracing::info!(
+                "source '{}': no app image configured (bare compositor)",
+                self.sink_name
+            );
+            return;
+        };
         let params = LaunchParams {
             session_id: &self.session_id,
             wayland_display: wl_display,
@@ -1122,6 +1173,11 @@ impl AppSource {
             nvidia_lib32_path: &self.nvidia_lib32_path,
             display: self.display,
             direct_display: None,
+            // A swap to another app gets no helper: the socket reports one appid.
+            launch_helper: self
+                .launch
+                .as_ref()
+                .and_then(|mount| mount.for_app(&effective_spec.env)),
         };
         // Snapshot the commit counter BEFORE the container exists, so anything counted
         // from here on can only have been drawn by the container about to start. Read

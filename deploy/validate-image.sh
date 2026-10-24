@@ -476,11 +476,19 @@ done < <(collect '.entrypoint_env_guards.unset_when_empty')
 IMAGE_LABELS="$(docker image inspect --format '{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' "$IMAGE")"
 while IFS= read -r spec; do
   [ -n "$spec" ] || continue
-  name="${spec%%=*}"
+  name="${spec%%[>=]*}"
   actual="$(printf '%s\n' "$IMAGE_LABELS" | grep -m1 "^${name}=" | cut -d= -f2- || true)"
   if [ "$name" = "$spec" ]; then
     if [ -n "$actual" ]; then hemit PASS "label.$name" "$actual"
     else hemit FAIL "label.$name" "not declared on the image"; fi
+  elif [ "${spec#"$name>="}" != "$spec" ]; then
+    # name>=version: a floor, compared as versions. Both must be bare dotted numbers: sort -V
+    # ranks `dev` or `1.28.6-rc1` above 1.28.6.
+    want="${spec#"$name>="}"
+    num='^[0-9]+(\.[0-9]+)*$'
+    if [[ $actual =~ $num && $want =~ $num ]] && [ "$(printf '%s\n%s\n' "$want" "$actual" | sort -V | head -n1)" = "$want" ]; then
+      hemit PASS "label.$name" "$actual >= $want"
+    else hemit FAIL "label.$name" "image declares '${actual:-<unset>}', contract wants at least '$want'"; fi
   else
     want="${spec#*=}"
     if [ "$actual" = "$want" ]; then hemit PASS "label.$name" "$actual"

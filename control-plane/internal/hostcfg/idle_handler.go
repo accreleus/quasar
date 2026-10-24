@@ -17,14 +17,13 @@ func (h *Handler) handleIdleApply(w http.ResponseWriter, r *http.Request) {
 		Group string `json:"group"`
 		ApprovalReview
 	}
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid idle approval")
 		return
 	}
-	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid idle approval")
 		return
 	}
@@ -73,11 +72,7 @@ func (h *Handler) handleCancelIdleApply(w http.ResponseWriter, r *http.Request) 
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid attempt ID")
 		return
 	}
-	connected := false
-	if registry, ok := h.dispatcher.(interface{ IsConnected(string) bool }); ok {
-		connected = registry.IsConnected(r.PathValue("id"))
-	}
-	attempt, err := h.store.CancelIdleApply(r.Context(), r.PathValue("id"), r.PathValue("attempt_id"), connected)
+	attempt, err := h.store.CancelIdleApply(r.Context(), r.PathValue("id"), r.PathValue("attempt_id"))
 	switch {
 	case err == nil && attempt.Phase == "cancel_pending":
 		httpx.WriteJSON(w, http.StatusAccepted, attempt)

@@ -60,6 +60,7 @@ func (c *Coordinator) probeEvalInput(ctx context.Context, userID, deviceID strin
 			RTTMs:            dp.RTTMs,
 			MaxDecodeHeight:  dp.MaxDecodeHeight,
 			DisplayRefreshHz: dp.DisplayRefreshHz,
+			BrowserName:      dp.BrowserName,
 		}
 	}
 	return in

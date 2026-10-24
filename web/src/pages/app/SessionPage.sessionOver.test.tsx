@@ -57,12 +57,17 @@ let telemetryListener: ((snap: Record<string, unknown>) => void) | null = null;
 type Channel = { readyState: string; onclose: (() => void) | null; send: () => void; bufferedAmount: number };
 let lastOnChannel: ((ch: Channel) => void) | null = null;
 let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
+let lastTransport: {
+  onHostBye?: (() => void) | null;
+  onTakeoverRefused?: ((refusal: string) => void) | null;
+} | null = null;
 const attachMicTrack = vi.fn((_track: unknown) => Promise.resolve());
 const detachMicTrack = vi.fn(() => Promise.resolve());
 let constructed = 0;
 vi.mock("../../webrtc/session", () => ({
   QuasarSession: class {
     videoReceiver = null;
+    onHostBye: (() => void) | null = null;
     constructor(
       _url: string,
       _token: string,
@@ -73,6 +78,7 @@ vi.mock("../../webrtc/session", () => ({
       onRecoveryState?: (state: Record<string, unknown>) => void,
     ) {
       constructed++;
+      lastTransport = this;
       lastOnChannel = onChannel;
       lastOnRecovery = onRecoveryState ?? null;
     }
@@ -182,7 +188,7 @@ function renderPage(strict = false) {
         <ToastProvider>
           <Routes>
             <Route path="/app/session/:id" element={<SessionPage />} />
-            <Route path="/app" element={null} />
+            <Route path="/app" element={<div data-testid="library" />} />
           </Routes>
         </ToastProvider>
       </ThemeProvider>
@@ -243,9 +249,13 @@ const refused = () =>
 const failed = { phase: "failed", attempt: 0, maxAttempts: 3, message: "signaling: session not found or already ended" };
 
 beforeEach(() => {
+  // These tests capture by hand (onGrab); #647's auto-capture at the reveal is off here and
+  // covered in SessionPage.immersive.test.tsx.
+  localStorage.setItem("quasar.display.preferences", JSON.stringify({ scalingMode: "contain", launchImmersive: false }));
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
+  lastTransport = null;
   telemetryListener = null;
   constructed = 0;
   hud = {};
@@ -276,6 +286,91 @@ describe("SessionPage — a session that is over for this page releases the mic 
     expect(screen.getByText("Your access to this app was removed")).not.toBeNull();
     releasedAfterVerdict();
     expect(detachMicTrack).toHaveBeenCalled();
+  });
+
+  it("game exited: the page goes back to the library, no recovery banner (#726)", async () => {
+    await streamingWithMicAndCapture();
+    expect(screen.queryByTestId("library")).toBeNull();
+    currentSession = makeSession({ state: "stopped", state_detail: "game exited" });
+    await advance(5_500);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  it("game exited, found through the dropped connection's poll instead of the health tick", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopped", state_detail: "game exited" });
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  // The agent says why on `stopping`, before the container stop finishes, and that is the
+  // row a poll sees while the stream is dropping.
+  it("game exited, read while the agent is still stopping: the health tick goes to the library", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
+    await advance(5_500);
+    expect(screen.getByTestId("library")).not.toBeNull();
+  });
+
+  it("game exited, read while the agent is still stopping: the dropped connection's poll goes to the library", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  // #753: the agent says `bye` right after the `stopping` row, long before the stream stalls.
+  it("game exited, the host's bye: the library at once, before the health tick and with no banner", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
+    const polls = getSession.mock.calls.length;
+    await act(async () => lastTransport?.onHostBye?.());
+    await advance(50);
+    expect(getSession.mock.calls.length).toBe(polls + 1);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Recovering connection")).toBeNull();
+  });
+
+  // #748: the stall fires first, the end-reason read lands a few ms later; the banner must
+  // never paint in between.
+  it("game exit: a stall just before the end read paints no banner", async () => {
+    await streamingWithMicAndCapture();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "reconnecting", message: "Reconnecting (1/3)…" }));
+    await advance(30);
+    expect(screen.queryByText("Recovering connection")).toBeNull();
+    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
+    await act(async () => lastTransport?.onHostBye?.());
+    await advance(50);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Recovering connection")).toBeNull();
+  });
+
+  it("a real stall still shows the banner, after the grace", async () => {
+    await streamingWithMicAndCapture();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "reconnecting", message: "Reconnecting (1/3)…" }));
+    await advance(100);
+    expect(screen.queryByText("Recovering connection")).toBeNull();
+    await advance(600);
+    expect(screen.getByText("Recovering connection")).not.toBeNull();
+  });
+
+  it("game exited before the reveal: an earlier stopping read does not hold the loader's card", async () => {
+    currentSession = makeSession({ state_detail: "app booting" });
+    renderPage();
+    await advance(1_000);
+    currentSession = makeSession({ state: "stopping", state_detail: "tearing down" });
+    await advance(1_500);
+    expect(screen.getByText("The session ended before it started")).not.toBeNull();
+    expect(screen.queryByTestId("library")).toBeNull();
+    currentSession = makeSession({ state: "stopped", state_detail: "game exited" });
+    await advance(1_500);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("The session ended before it started")).toBeNull();
   });
 
   it("host lost", async () => {
@@ -331,12 +426,33 @@ describe("SessionPage — a session that is over for this page releases the mic 
   });
 });
 
+describe("SessionPage — an ordinary stop is not a game exit (#726)", () => {
+  it("any other stop keeps the recovery banner and stays on the page (#726)", async () => {
+    await streamingWithMicAndCapture();
+    currentSession = makeSession({ state: "stopped", state_detail: "peer disconnected: WebRTC data channel closed" });
+    await advance(5_500);
+    refused();
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(600);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    expect(screen.queryByTestId("library")).toBeNull();
+  });
+
+  it("a bye from a session that still reads running leaves the page as it is (#753)", async () => {
+    await streamingWithMicAndCapture();
+    await act(async () => lastTransport?.onHostBye?.());
+    await advance(50);
+    expect(screen.queryByTestId("library")).toBeNull();
+    stillLive();
+  });
+});
+
 describe("SessionPage — a session that may still be streaming keeps the mic and input (#524)", () => {
   it("signalling gave up (unreachable, recovery failed) with the input channel open", async () => {
     const ch = await streamingWithMicAndCapture();
     refused();
     await act(async () => lastOnRecovery?.(failed));
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     stillLive();
 
@@ -528,7 +644,7 @@ describe("SessionPage — a session that is over for this page draws no HUD (#52
     refused();
     const rc = new RecoveryController({ onRetry: () => {}, onState: (st) => lastOnRecovery?.(st as never) });
     await act(async () => rc.terminal("signaling: session not found or already ended"));
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     present();
 
@@ -548,7 +664,7 @@ describe("SessionPage — a session that is over for this page draws no HUD (#52
     await advance(3_000);
     refused();
     await act(async () => lastOnRecovery?.(failed));
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     present();
   });
@@ -566,7 +682,7 @@ describe("SessionPage — a late takeover (#527)", () => {
     refused();
     const rc = controller();
     await act(async () => rc.terminal("signaling: session not found or already ended"));
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     stillLive();
 
@@ -608,7 +724,7 @@ describe("SessionPage — a late takeover (#527)", () => {
     refused();
     const rc = controller();
     await act(async () => rc.terminal("Peer connection failed (DTLS)"));
-    await advance(100);
+    await advance(600);
     expect(banners().length).toBe(1);
     await act(async () => rc.superseded("opened in another tab"));
     await advance(100);
@@ -675,7 +791,7 @@ describe("SessionPage — a held verdict is the only banner (#529)", () => {
       ch.onclose?.();
       lastOnRecovery?.(failed);
     });
-    await advance(100);
+    await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     expect(screen.getByText(DECODER)).not.toBeNull();
     expect(screen.getAllByRole("button", { name: "Stop" }).length).toBeGreaterThan(0);
@@ -826,7 +942,7 @@ describe("SessionPage — a launch verdict is held only until the loader's revea
     const ch = await streamingWithMicAndCapture();
     if (name.includes("channel closed")) await act(async () => ch.onclose?.());
     await reach();
-    await advance(100);
+    await advance(600);
 
     expect(keyReachesBrowser("Tab")).toBe(true);
     expect(document.querySelectorAll(".banner button").length).toBeGreaterThan(0);
@@ -1116,5 +1232,20 @@ describe("SessionPage — the loader's card is the notice until the lock, the ba
     expect(document.querySelector(".sl-root")).toBeNull();
     expect(exposedAlerts()).toEqual([expect.stringContaining(TAKEN)]);
     expect(screen.queryByTestId("hud")).toBeNull();
+  });
+});
+
+// Amendment 42: the host refused this page's takeover; the session runs on.
+describe("SessionPage — a refused takeover", () => {
+  it("shows the host's reason on the launch screen and leaves without stopping the session", async () => {
+    currentSession = makeSession({ state_detail: "app presented" });
+    renderPage();
+    await advance(1_000);
+    await act(async () => lastTransport?.onTakeoverRefused?.("takeover_rate_limited"));
+    expect(screen.getByText("Too many takeovers just now")).not.toBeNull();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /back to library/i })));
+    await advance(50);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(stopSession).not.toHaveBeenCalled();
   });
 });

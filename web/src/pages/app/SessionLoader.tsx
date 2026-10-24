@@ -16,13 +16,16 @@ import { CollapsibleLogTail } from "../../components/SessionFailureDetail";
 import { isBannerVerdict, type LaunchFailure } from "./sessionFailure";
 import { AccretionVisual } from "./AccretionVisual";
 import { GlyphRail } from "./GlyphRail";
+import { useBootLine } from "./gettingReady";
 import { derivePhase, stallPhaseForStep } from "./loaderPhases";
 import {
   resolveStall,
   statusPhase,
+  TAKEOVER_REFUSED_COPY,
   type LaunchPhase,
   type TransportState,
 } from "./launchStall";
+import type { TakeoverRefusal } from "../../webrtc/session";
 
 // Stall vocabulary/decision lives in launchStall.ts; re-exported here (original home).
 export { PHASE_STALL_COPY, PHASE_STALL_MS, TRANSPORT_STALL_MS } from "./launchStall";
@@ -56,11 +59,15 @@ interface SessionLoaderProps {
   /** Control-plane `state` / `app_launch_state` for this session. */
   sessionState?: string;
   appLaunchState?: string;
+  /** Steam is processing the game's shaders (0-100). Null/absent = today's copy. */
+  shaderPercent?: number | null;
   // The four transport signals the phase machine walks (sessionRuntime.ts).
   wsOpen?: boolean;
   pcConnected?: boolean;
   firstFrame?: boolean;
   inputOpen?: boolean;
+  /** The host refused this page's takeover: its copy replaces any stall, at once. */
+  takeoverRefused?: TakeoverRefusal | null;
 }
 
 export function SessionLoader({
@@ -75,11 +82,14 @@ export function SessionLoader({
   iceState = null,
   sessionState,
   appLaunchState,
+  shaderPercent = null,
   wsOpen = false,
   pcConnected = false,
   firstFrame = false,
   inputOpen = false,
+  takeoverRefused = null,
 }: SessionLoaderProps) {
+  const bootLine = useBootLine(appLaunchState === "starting", shaderPercent);
   const { step, word, verb } = derivePhase({
     state: sessionState,
     wsOpen,
@@ -182,6 +192,8 @@ export function SessionLoader({
   const verdict =
     handoffReady || failure
       ? null
+      : takeoverRefused
+      ? { kind: "takeover" as const, ...TAKEOVER_REFUSED_COPY[takeoverRefused] }
       : resolveStall({
           phase: launchPhase,
           wsOpen,
@@ -209,7 +221,9 @@ export function SessionLoader({
 
   // "Keep waiting" can't help a `failed` ICE path (resolveStall reports it on
   // sight, so the wait would end instantly) — cancel is the only honest choice.
-  const canKeepWaiting = !(verdict?.kind === "transport" && iceState === "failed");
+  // Nor a refused takeover: the host sends this page nothing more.
+  const canKeepWaiting =
+    !(verdict?.kind === "transport" && iceState === "failed") && verdict?.kind !== "takeover";
 
   const keepWaiting = useCallback(() => setWaitAgain((n) => n + 1), []);
 
@@ -283,6 +297,8 @@ export function SessionLoader({
               <span className="sl-verb">{visible.verb}</span>
               <span className={changing ? "sl-stage changing" : "sl-stage"}>{visible.word}</span>
             </h1>
+            {/* Always in the layout so the title does not jump when the line appears. */}
+            <p className="sl-shaders" aria-live="off" aria-hidden={bootLine.decorative || undefined}>{bootLine.text}</p>
             <div className="sl-status-foot">
               <GlyphRail step={visible.step} />
             </div>
@@ -294,7 +310,7 @@ export function SessionLoader({
                 <p className="sl-stall-msg">{verdict.message}</p>
                 <div className="sl-actions">
                   <Button variant="primary" autoFocus={focusStallExit} onClick={onExit}>
-                    Cancel and go back
+                    {verdict.kind === "takeover" ? "Back to library" : "Cancel and go back"}
                   </Button>
                   {canKeepWaiting && (
                     <Button variant="ghost" onClick={keepWaiting}>

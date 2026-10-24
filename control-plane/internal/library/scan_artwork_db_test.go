@@ -207,6 +207,10 @@ func (p *countingProvider) ArtByExternalRef(_ context.Context, source, id string
 	return artwork.Candidate{}, artwork.ErrArtNotFound // a stored "no match"
 }
 
+func (p *countingProvider) LogoIcon(context.Context, string, string) (string, string, error) {
+	return "", "", nil
+}
+
 func newArtworkService(t *testing.T, pool *pgxpool.Pool, src artwork.ProviderSource) *artwork.Service {
 	t.Helper()
 	svc, err := artwork.New(artwork.NewStore(pool), t.TempDir(),

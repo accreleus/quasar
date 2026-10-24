@@ -24,7 +24,7 @@ import { useToast } from "../../components/Toast";
 import { useFleetContext } from "../../lib/fleet/FleetContext";
 import { useResource } from "../../lib/resource/react";
 import { SteamPreparationStatus } from "./library/SteamPreparationStatus";
-import { hostImageState, imgRollout, POLICY_COPY } from "./library/imageRollout";
+import { hostImageState, imageFailure, imgRollout, knownFleetIds, POLICY_COPY } from "./library/imageRollout";
 import { ImageCleanupModal } from "./library/ImageCleanupModal";
 import { dominantInFlightState, HOST_STATE_COPY } from "./library/imageStatus";
 
@@ -97,7 +97,7 @@ export function ImageDetail() {
   const data = resource.data;
   const img = useMemo(() => data?.images.find((i) => i.id === id), [data, id]);
   // Off the fleet poll above this page (lib/fleet), not a read of its own.
-  const { hosts } = useFleetContext();
+  const { hosts, loading: fleetLoading, errors: fleetErrors } = useFleetContext();
 
   const roll = img ? imgRollout(img, hosts) : null;
 
@@ -203,7 +203,7 @@ export function ImageDetail() {
           header: "State",
           render: (h) => {
             const st = hostImageState(img, h.id);
-            const tone = st === "stale" ? "tone-warning" : st === "absent" ? "img-faint" : undefined;
+            const tone = st === "stale" ? "tone-warning" : st === "failed" ? "tone-danger" : st === "absent" ? "img-faint" : undefined;
             return <span className={tone}>{HOST_STATE_LABEL[st]}</span>;
           },
         },
@@ -213,7 +213,7 @@ export function ImageDetail() {
           align: "right",
           render: (h) => {
             const st = hostImageState(img, h.id);
-            if (st === "absent" || st === "pulling") return <span className="num">—</span>;
+            if (st === "absent" || st === "pulling" || st === "failed") return <span className="num">—</span>;
             // A stale host is running its own reported version, not the
             // image's installed_version (that is the version everyone else
             // converged to, which is exactly what "stale" means it isn't).
@@ -253,6 +253,7 @@ export function ImageDetail() {
   // Wire-derived, not local `pending` — a background pull (e.g. a provider
   // auto-ensure) is in flight whether or not this tab is the one that started it.
   const inFlight = img ? dominantInFlightState(img) : null;
+  const failed = img ? imageFailure(img, knownFleetIds(hosts, fleetLoading, fleetErrors.hosts)) : null;
 
   return (
     <section className="page image-detail-page">
@@ -393,14 +394,15 @@ export function ImageDetail() {
                 <div className="ae-facts mt4">
                   <div className="ae-fact">
                     <span>State</span>
-                    <span className={inFlight ? "tone-info" : img.update_available ? "tone-warning" : undefined}>
-                      {inFlight
-                        ? HOST_STATE_COPY[inFlight].label
-                        : img.update_available
-                          ? "update available"
-                          : img.installed
-                            ? "up to date"
-                            : "not installed"}
+                    <span className={failed ? "tone-danger" : inFlight ? "tone-info" : img.update_available ? "tone-warning" : undefined}>
+                      {(failed && inFlight ? `${failed} · ${HOST_STATE_COPY[inFlight].label}` : failed) ??
+                        (inFlight
+                          ? HOST_STATE_COPY[inFlight].label
+                          : img.update_available
+                            ? "update available"
+                            : img.installed
+                              ? "up to date"
+                              : "not installed")}
                     </span>
                   </div>
                   <div className="ae-fact"><span>Version pinned</span><span>{img.pinned ? "yes" : "no"}</span></div>

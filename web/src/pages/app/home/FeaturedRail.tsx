@@ -24,7 +24,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { RefObject } from "react";
 import type { App } from "../../../api/types";
 import { IconChevronLeft, IconChevronRight, IconPlayGlyph } from "../../../components/icons";
-import { artFor } from "../../../lib/appArtwork";
+import { artFor, artSrcSet, sizedArt } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
 import type { RailCard } from "../homeData";
 import { coverClassAt } from "../libraryGrid";
@@ -193,12 +193,14 @@ function FeaturedCard({
           <span className="glyph">{appGlyph(app.name)}</span>
           {art && (
             <img
-              src={art}
+              src={sizedArt(art, 320)}
+              srcSet={artSrcSet(art)}
+              sizes="280px" /* the widest --home-feat-w */
               alt=""
               className="cover-img"
               decoding="async"
               onError={() => setArtFailed(true)}
-              {...(priority ? { fetchpriority: "high" } : { loading: "lazy" as const })}
+              {...(priority ? { fetchPriority: "high" as const } : { loading: "lazy" as const })}
             />
           )}
         </span>

@@ -66,6 +66,7 @@ fn register() -> AgentMsg {
         config_policy_versions: None,
         config_policy_groups: None,
         terminal_home_cleanup_v1: None,
+        parked_sessions_v1: None,
         node_name: "fixture".into(),
         agent_version: "test".into(),
         auth: crate::messages::Auth::Reconnect {

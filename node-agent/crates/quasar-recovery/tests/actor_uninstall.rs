@@ -685,16 +685,61 @@ fn uninstall_removes_the_services_keeps_data_and_the_seed_idles() {
 }
 
 #[test]
-fn uninstall_refuses_to_run_inside_the_recovery_actor() {
-    let (engine, dir, actor_id) = seeded_gpu_host();
-    let mut run = uninstaller(&engine, dir.path());
-    run.self_container = Some(actor_id);
-    let refused = run.run(&Options::default()).expect_err("inside the actor");
-    assert!(
-        matches!(&refused, UninstallError::Refused(why) if why.contains("docker run --rm")),
-        "{refused:?}"
-    );
-    assert!(!dir.path().join("uninstalled.json").exists());
+fn uninstall_refuses_to_run_inside_the_recovery_actor_and_names_a_command_that_works() {
+    use quasar_runtime::EngineKind::{Docker, Podman};
+    let cases = [
+        (Docker, "/var/run/docker.sock", "docker run --rm -it --security-opt label=disable -v /var/run/docker.sock:/var/run/docker.sock "),
+        (Docker, "/run/user/1001/docker.sock", "docker run --rm -it --security-opt label=disable -v /run/user/1001/docker.sock:/var/run/docker.sock "),
+        (Podman, "/run/user/1001/podman/podman.sock", "podman run --rm -it --security-opt label=disable -v /run/user/1001/podman/podman.sock:/var/run/docker.sock "),
+    ];
+    for (kind, socket, start) in cases {
+        let (engine, dir, actor_id) = seeded_gpu_host();
+        let machine_dir = quasar_recovery::machine::MachineDir::new(dir.path());
+        let mut machine = machine_dir.load_machine().unwrap().unwrap();
+        machine.inputs.docker_socket = socket.into();
+        machine_dir.machine().store(&machine).unwrap();
+        engine.with_state(|s| s.host.kind = kind);
+        let mut run = uninstaller(&engine, dir.path());
+        run.self_container = Some(actor_id);
+        let refused = run.run(&Options::default()).expect_err("inside the actor");
+        assert!(
+            matches!(&refused, UninstallError::Refused(why) if why.contains(start) && why.ends_with(" uninstall")),
+            "{refused:?}"
+        );
+        assert!(!dir.path().join("uninstalled.json").exists());
+    }
+}
+
+#[test]
+fn the_seed_refusal_removes_a_seed_the_way_it_was_started_a_podman_unit_first() {
+    use quasar_runtime::EngineKind::{Docker, Podman};
+    for (kind, offered, later) in [
+        (Docker, "docker rm -f quasar-seed", None),
+        (
+            Podman,
+            "systemctl stop quasar-seed",
+            Some("podman rm -f quasar-seed"),
+        ),
+    ] {
+        let (engine, dir, _) = seeded_gpu_host();
+        engine.with_state(|s| s.host.kind = kind);
+        let err = uninstaller(&engine, dir.path())
+            .run(&Options {
+                purge: true,
+                confirm: Some("gpu-host-01".into()),
+                dump_to: None,
+            })
+            .expect_err("a seed is running");
+        let UninstallError::Refused(why) = &err else {
+            panic!("{err:?}")
+        };
+        let first = why.find(offered).unwrap_or_else(|| panic!("{why}"));
+        // A hand-run Podman seed has no unit, so `rm -f` may follow, never lead.
+        assert!(
+            later.and_then(|l| why.find(l)).is_none_or(|rm| first < rm),
+            "{why}"
+        );
+    }
 }
 
 #[test]

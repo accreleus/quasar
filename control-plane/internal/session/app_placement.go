@@ -58,7 +58,7 @@ func (s *Store) GuardPlacementForSwap(ctx context.Context, sessionID, canonicalA
 	if !selected {
 		return ErrNoHostAvailable
 	}
-	if _, err := tx.Exec(ctx, `UPDATE sessions SET state_detail=$2 WHERE id=$1::uuid`, sessionID, swapDetailInProgress); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET state_detail=$2, launch_progress=NULL WHERE id=$1::uuid`, sessionID, swapDetailInProgress); err != nil {
 		return fmt.Errorf("persist pending swap: %w", err)
 	}
 	return tx.Commit(ctx)

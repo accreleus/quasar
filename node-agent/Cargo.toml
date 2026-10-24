@@ -10,7 +10,12 @@ license = "MIT"
 # here still builds only the agent (plus the crate as its dependency), and every
 # fmt/clippy/test gate passes `--workspace` / `--all` explicitly.
 [workspace]
-members = ["crates/quasar-runtime", "crates/quasar-recovery"]
+members = [
+    "crates/quasar-runtime",
+    "crates/quasar-recovery",
+    "crates/quasar-launch-watch",
+    "crates/quasar-launch-helper",
+]
 
 [dependencies]
 # #355: the engine facade, ownership labels and durable-state primitives.
@@ -133,7 +138,7 @@ criterion = "0.8"
 tokio = { version = "1", features = ["test-util"] }
 # A test peer's own DTLS certificate (`takeover_tests`): GStreamer generates one per
 # process and exposes no key, and the dev image has no `openssl` binary.
-rcgen = "0.13"
+rcgen = "0.14"
 
 [[bench]]
 name = "encode_metrics"

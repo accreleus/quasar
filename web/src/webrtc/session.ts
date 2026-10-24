@@ -15,6 +15,14 @@ import { applyPlayout, resolveInitialPlayoutMs } from "./playout";
 import { RecoveryController, type RecoveryState } from "./recovery";
 
 export type StatusHandler = (msg: string) => void;
+
+/** The host's reasons a taking client gets no media (signaling.md, amendment 42). */
+export type TakeoverRefusal = "takeover_abandoned" | "takeover_rate_limited";
+
+/** An `error`'s `code` as a {@link TakeoverRefusal}; null for none or one we do not know. */
+export function takeoverRefusal(code: unknown): TakeoverRefusal | null {
+  return code === "takeover_abandoned" || code === "takeover_rate_limited" ? code : null;
+}
 export type TrackHandler = (stream: MediaStream) => void;
 export type ChannelHandler = (ch: RTCDataChannel) => void;
 
@@ -327,6 +335,7 @@ export class QuasarSession {
         sdp?: string;
         candidate?: RTCIceCandidateInit;
         message?: string;
+        code?: string;
         pc?: PcId;
       };
       try {
@@ -353,8 +362,12 @@ export class QuasarSession {
         });
       } else if (msg.type === "error") {
         this.onStatus(`host error: ${msg.message ?? ""}`);
+        // Amendment 42: the refusal is for the pc it names; a failed audio answer leaves video streaming.
+        const refusal = (msg.pc ?? "video") === "video" ? takeoverRefusal(msg.code) : undefined;
+        if (refusal) this.onTakeoverRefused?.(refusal);
       } else if (msg.type === "bye") {
         this.onStatus("host ended the session");
+        this.onHostBye?.();
       }
     };
   }
@@ -487,6 +500,12 @@ export class QuasarSession {
    *  above; `ws.onopen` cannot fire before the constructor returns. */
   onSignalingOpen: (() => void) | null = null;
 
+  /** The host said `bye`: the session is ending, ask the control plane why (#753). */
+  onHostBye: (() => void) | null = null;
+
+  /** The host will send this page no media: its takeover was refused (amendment 42). */
+  onTakeoverRefused: ((refusal: TakeoverRefusal) => void) | null = null;
+
   private wsSend(obj: unknown): void {
     if (this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(obj));
@@ -504,8 +523,8 @@ export class QuasarSession {
       .getReceivers()
       .find((receiver) => receiver.track?.kind === "video")
       ?.getParameters()
-      .headerExtensions
-      .some((extension) => extension.uri === uri) ?? false;
+      // Firefox omits headerExtensions here; a throw would end every telemetry poll (#610).
+      ?.headerExtensions?.some((extension) => extension.uri === uri) ?? false;
   }
 
   /**
