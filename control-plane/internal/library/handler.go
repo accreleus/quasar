@@ -199,6 +199,18 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #738: agent-supplied free text is untrusted bytes. Postgres refuses U+0000
+	// and invalid UTF-8 in `text`, so a manifest name (or a scan error message)
+	// carrying one fails the scan's transaction on this report and fails it again
+	// on every later scan of the same home. Clean at the parse boundary, the same
+	// repair the Steam store texts get (storableText, #736). Nothing else about
+	// validation changes: a name that cleans to "" still falls back to the appid
+	// (tileName) exactly as an empty name always did.
+	req.Error = storableText(req.Error)
+	for i := range req.Entries {
+		req.Entries[i].Name = storableText(req.Entries[i].Name)
+	}
+
 	if !req.OK {
 		// A failed scan changes nothing but its own row (§7.7 step 1): reconciling whatever
 		// entries did arrive would make a partial walk indistinguishable from an uninstall.
@@ -241,7 +253,11 @@ func (h *Handler) handleScanReport(w http.ResponseWriter, r *http.Request) {
 			h.log.Warn("library: could not compute backfill candidates", "scan_id", req.ScanID, "err", err)
 			backfillIDs = nil
 		}
-		if merged := mergeIDs(publishIDs, backfillIDs); len(merged) > 0 {
+		existing, err := h.store.ExistingTileIDs(r.Context(), parent, publishIDs)
+		if err != nil {
+			h.log.Warn("library: could not read existing tiles", "scan_id", req.ScanID, "err", err)
+		}
+		if merged := lookupOrder(publishIDs, backfillIDs, existing); len(merged) > 0 {
 			details = h.details.Fetch(r.Context(), merged)
 		}
 	}
@@ -297,6 +313,22 @@ func (h *Handler) resolveCreatedArtwork(ctx context.Context, scanID string, appI
 }
 
 // mergeIDs unions a and b, deduplicated, a's order then any of b's not already in a.
+// lookupOrder is the order Fetch spends its per-scan cap in: titles with no tile yet (the
+// suppression rung and their first details), then tiles still missing details, then the
+// re-check of tiles that already exist. Publishable ids alone would refill the cap with the
+// same first ids of every report, and no tile past them would ever be backfilled.
+func lookupOrder(publish, backfill []string, existing map[string]bool) []string {
+	var fresh, known []string
+	for _, id := range publish {
+		if existing[id] {
+			known = append(known, id)
+		} else {
+			fresh = append(fresh, id)
+		}
+	}
+	return mergeIDs(mergeIDs(fresh, backfill), known)
+}
+
 func mergeIDs(a, b []string) []string {
 	if len(b) == 0 {
 		return a

@@ -86,6 +86,7 @@ var wantedManagedJobIDs = []string{
 	"devauth.reaper",
 	"telemetry.retain",
 	"platform.release_detect",
+	"session.parked_expire",
 }
 
 // wantedAgentJobIDs is the WP5/WP6 adoption list: managed jobs whose SCHEDULE

@@ -632,7 +632,7 @@ func (s *Store) savePolicy(ctx context.Context, hostID, expected string, changes
 			return empty, err
 		}
 	}
-	if _, err := tx.Exec(ctx, `UPDATE hosts SET status='online' WHERE id=$1::uuid AND status='draining'
+	if _, err := tx.Exec(ctx, `UPDATE hosts SET status=`+releasedStatusSQL+` WHERE id=$1::uuid AND status='draining'
 		AND NOT EXISTS(SELECT 1 FROM host_admission_restrictions WHERE host_id=$1::uuid)`, hostID); err != nil {
 		return empty, err
 	}

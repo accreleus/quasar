@@ -1,6 +1,9 @@
 package agentws
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Events is the callback surface the agent WS handler invokes on upstream
 // activity. The session coordinator (package session) implements it. Defining it
@@ -41,7 +44,8 @@ type Events interface {
 	AgentTraceEvent(ctx context.Context, hostID string, m SessionTraceEventMsg)
 	// AgentSignalingFailure terminates only the affected session when its reliable
 	// agent-to-browser relay cannot make progress. It must not disconnect the host.
-	AgentSignalingFailure(ctx context.Context, hostID, sessionID, reason string)
+	// bye: the frame that could not be delivered was the agent's `bye`.
+	AgentSignalingFailure(ctx context.Context, hostID, sessionID string, bye bool, reason string)
 	// LaunchConsoleSession launches a pinned console-mode session on hostID,
 	// owned by userID, running appID (CM-06 auto-start on display hotplug).
 	// Returns the launched session id.
@@ -53,20 +57,28 @@ type Events interface {
 	// is still non-terminal (CM-06). The auto-start tracker uses it to detect a
 	// self-terminated console session and relaunch it (level-triggered always-on).
 	ConsoleSessionActive(ctx context.Context, sessionID string) bool
+	// ConsoleSessionEnded reads how an ended session ended: when (zero only while
+	// it is still live; a failed read answers now) and whether it was a console
+	// session its user stopped. Console self-heal
+	// uses both.
+	ConsoleSessionEnded(ctx context.Context, sessionID string) (endedAt time.Time, userStopped bool)
 }
 
 // noopEvents is used when no coordinator is wired (e.g. focused tests).
 type noopEvents struct{}
 
-func (noopEvents) AgentState(context.Context, string, SessionStateMsg)           {}
-func (noopEvents) HostDisconnected(context.Context, string)                      {}
-func (noopEvents) AgentHeartbeat(context.Context, string, []string)              {}
-func (noopEvents) AgentReconnected(context.Context, string)                      {}
-func (noopEvents) AgentMetrics(context.Context, string, SessionMetricsMsg)       {}
-func (noopEvents) AgentTraceEvent(context.Context, string, SessionTraceEventMsg) {}
-func (noopEvents) AgentSignalingFailure(context.Context, string, string, string) {}
+func (noopEvents) AgentState(context.Context, string, SessionStateMsg)                 {}
+func (noopEvents) HostDisconnected(context.Context, string)                            {}
+func (noopEvents) AgentHeartbeat(context.Context, string, []string)                    {}
+func (noopEvents) AgentReconnected(context.Context, string)                            {}
+func (noopEvents) AgentMetrics(context.Context, string, SessionMetricsMsg)             {}
+func (noopEvents) AgentTraceEvent(context.Context, string, SessionTraceEventMsg)       {}
+func (noopEvents) AgentSignalingFailure(context.Context, string, string, bool, string) {}
 func (noopEvents) LaunchConsoleSession(context.Context, string, string, string, string, int32, int32, int32) (string, error) {
 	return "", nil
 }
 func (noopEvents) StopConsoleSession(context.Context, string, string) error { return nil }
 func (noopEvents) ConsoleSessionActive(context.Context, string) bool        { return false }
+func (noopEvents) ConsoleSessionEnded(context.Context, string) (time.Time, bool) {
+	return time.Time{}, false
+}

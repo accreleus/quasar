@@ -26,6 +26,11 @@ import { ApiError } from "../../../api/client";
 import type { App } from "../../../api/types";
 
 vi.mock("../../../api/library");
+// This suite drives the detail band, which is the Classic layout.
+vi.mock("../../../settings/OverlayPreferencesContext", async (orig) => ({
+  ...(await orig<typeof import("../../../settings/OverlayPreferencesContext")>()),
+  useNewDesign: () => false,
+}));
 
 // jsdom answers nothing for the decode probe; pin it so the codec segment and
 // the rung grid exist at all.

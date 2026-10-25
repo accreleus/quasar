@@ -89,3 +89,15 @@ func fieldCarried(fv reflect.Value) bool {
 		return false
 	}
 }
+
+// TruncateBytes cuts s to at most n BYTES (the CHECK counts bytes), stepping
+// back off a partial UTF-8 sequence so the result is still valid JSON text.
+func TruncateBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && s[n]&0xC0 == 0x80 {
+		n--
+	}
+	return s[:n]
+}

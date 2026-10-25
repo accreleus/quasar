@@ -307,6 +307,270 @@ fn interrupted_build_reconciles_the_same_operation_after_restart() {
     );
 }
 
+fn cut(mut reply: Reply) -> Reply {
+    reply.incomplete = true;
+    reply
+}
+fn build_requests(requests: &[Observed]) -> usize {
+    requests
+        .iter()
+        .filter(|r| r.query.contains_key("version"))
+        .count()
+}
+fn records(config: &RuntimeConfig) -> usize {
+    std::fs::read_dir(config.image_state_path.as_ref().unwrap())
+        .map(|entries| {
+            entries
+                .filter(|e| e.as_ref().unwrap().path().extension().is_none())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// An agent that dies at an engine call leaves what a reply cut short there leaves:
+/// the record as written so far, and the lease free (#505).
+#[test]
+fn a_build_cut_off_at_any_engine_call_is_settled_by_the_next_start() {
+    // (engine call cut short, whether the engine finished the build anyway, builds sent)
+    for (at, landed, builds) in [
+        (0, false, 1),
+        (1, false, 1),
+        (2, false, 2),
+        (2, true, 1),
+        (3, false, 2),
+        (3, true, 1),
+    ] {
+        let after = || if landed { built() } else { absent() };
+        let mut replies = vec![version(), absent(), post(""), after()];
+        replies.truncate(at + 1);
+        let last = replies.pop().unwrap();
+        replies.push(cut(last));
+        replies.extend([version(), after()]);
+        if !landed {
+            replies.extend([post(""), built()]);
+        }
+        let (_dir, config, request, server) = engine(replies);
+        let first = RuntimeClient::new(config.clone())
+            .unwrap()
+            .build_image(request.clone(), Duration::from_secs(3))
+            .wait(|_| {})
+            .unwrap_err();
+        assert_eq!(
+            (first.kind == ErrorKind::UnknownOutcome, records(&config)),
+            (at >= 2, usize::from(at >= 2)),
+            "cut at {at}: {first}"
+        );
+        let result = RuntimeClient::new(config.clone())
+            .unwrap()
+            .build_image(request, Duration::from_secs(3))
+            .wait(|_| {});
+        assert_eq!(
+            result.map(|image| image.id).map_err(|e| e.kind),
+            Ok("sha256:built".into()),
+            "cut at {at}, landed {landed}"
+        );
+        assert_eq!(records(&config), 0, "cut at {at}, landed {landed}");
+        assert_eq!(
+            build_requests(&server.join().unwrap()),
+            builds,
+            "cut at {at}, landed {landed}"
+        );
+    }
+}
+
+#[test]
+fn a_build_that_fails_after_an_interrupted_one_reports_its_own_failure() {
+    let refused = "pull access denied for fixture-base, repository does not exist";
+    let (_dir, config, request, server) = engine(vec![
+        version(),
+        absent(),
+        cut(post("")),
+        version(),
+        absent(),
+        post(format!(
+            "{}\n",
+            serde_json::json!({"errorDetail":{"message":refused},"error":refused})
+        )),
+    ]);
+    let build = || {
+        RuntimeClient::new(config.clone())
+            .unwrap()
+            .build_image(request.clone(), Duration::from_secs(3))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind
+    };
+    assert_eq!(build(), ErrorKind::UnknownOutcome);
+    assert_eq!(build(), ErrorKind::RegistryDenied);
+    assert_eq!(records(&config), 0);
+    server.join().unwrap();
+}
+
+/// The record a replaced agent leaves when it dies mid-build (#505).
+fn strand_build_record(
+    config: &RuntimeConfig,
+    image: &str,
+    socket: &std::path::Path,
+    fingerprint: Option<&str>,
+) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let root = config.image_state_path.clone().unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let key: String = Sha256::digest(image.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = root.join(key);
+    let record = serde_json::json!({
+        "image": image,
+        "socket": socket,
+        "remove_id": null,
+        "build_id": "previous-agent",
+        "build_fingerprint": fingerprint,
+    });
+    std::fs::write(&path, record.to_string()).unwrap();
+    path
+}
+
+#[test]
+fn a_build_record_from_another_engine_socket_is_retired_and_built_again() {
+    let (_dir, config, request, server) = engine(vec![version(), absent(), post(""), built()]);
+    let record = strand_build_record(
+        &config,
+        &request.tag,
+        std::path::Path::new("/another-engine.sock"),
+        Some("previous-context"),
+    );
+    assert_eq!(
+        RuntimeClient::new(config)
+            .unwrap()
+            .build_image(request, Duration::from_secs(3))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:built"
+    );
+    assert!(!record.exists());
+    assert_eq!(build_requests(&server.join().unwrap()), 1);
+}
+
+#[test]
+fn an_unparsable_record_is_retired_and_built_again() {
+    let (_dir, config, request, server) = engine(vec![version(), absent(), post(""), built()]);
+    let record = strand_build_record(&config, &request.tag, &config.socket, None);
+    std::fs::write(&record, "").unwrap();
+    assert_eq!(
+        RuntimeClient::new(config)
+            .unwrap()
+            .build_image(request, Duration::from_secs(3))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:built"
+    );
+    assert!(!record.exists());
+    assert_eq!(build_requests(&server.join().unwrap()), 1);
+}
+
+#[test]
+fn an_unparsable_record_is_left_alone_while_its_lease_is_held() {
+    use std::os::fd::AsRawFd;
+    let (_dir, config, request, server) = engine(vec![version()]);
+    let record = strand_build_record(&config, &request.tag, &config.socket, None);
+    std::fs::write(&record, "").unwrap();
+    let lease = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(record.with_extension("lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert_eq!(
+        RuntimeClient::new(config)
+            .unwrap()
+            .build_image(request, Duration::from_secs(1))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert!(record.exists());
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn a_finished_build_whose_record_has_no_fingerprint_is_built_again() {
+    let finished = response(
+        "GET",
+        IMAGE_PATH,
+        200,
+        r#"{"Id":"sha256:earlier","Size":1,"Config":{"Labels":{"io.quasar.build-operation":"previous-agent"}}}"#,
+    );
+    let (_dir, config, request, server) = engine(vec![version(), finished, post(""), built()]);
+    let record = strand_build_record(&config, &request.tag, &config.socket, None);
+    assert_eq!(
+        RuntimeClient::new(config)
+            .unwrap()
+            .build_image(request, Duration::from_secs(3))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:built"
+    );
+    assert!(!record.exists());
+    assert_eq!(build_requests(&server.join().unwrap()), 1);
+}
+
+#[test]
+fn a_build_record_is_left_alone_while_its_lease_is_held() {
+    use std::os::fd::AsRawFd;
+    let (_dir, config, request, server) =
+        engine(vec![version(), version(), absent(), post(""), built()]);
+    let record = strand_build_record(
+        &config,
+        &request.tag,
+        &config.socket,
+        Some("previous-context"),
+    );
+    // A held lease is a build still running, in this process or a replaced agent.
+    let lease = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(record.with_extension("lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let runtime = RuntimeClient::new(config).unwrap();
+    // Waits on the lease for its whole budget: an inspection or a build sent here
+    // would meet the fixture's second discovery reply and fail it.
+    assert_eq!(
+        runtime
+            .build_image(request.clone(), Duration::from_secs(1))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert!(record.exists());
+    drop(lease);
+    assert_eq!(
+        runtime
+            .build_image(request, Duration::from_secs(3))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:built"
+    );
+    assert!(!record.exists());
+    assert_eq!(build_requests(&server.join().unwrap()), 1);
+}
+
 #[test]
 fn build_supplies_existing_registry_logins_without_exposing_them_to_callers() {
     use base64::Engine;
@@ -363,8 +627,15 @@ fn fragmented_and_verbose_build_output_still_reports_progress() {
 fn build_deadline_does_not_depend_on_output_or_claim_rollback() {
     let mut silent = post("{\"stream\":\"eventually\"}\n");
     silent.hold = Duration::from_secs(2);
-    let (_dir, config, request, server) =
-        engine(vec![version(), absent(), silent, version(), absent()]);
+    let (_dir, config, request, server) = engine(vec![
+        version(),
+        absent(),
+        silent,
+        version(),
+        absent(),
+        post(""),
+        built(),
+    ]);
     let runtime = RuntimeClient::new(config).unwrap();
     let start = std::time::Instant::now();
     assert_eq!(
@@ -376,34 +647,49 @@ fn build_deadline_does_not_depend_on_output_or_claim_rollback() {
         ErrorKind::UnknownOutcome
     );
     assert!(start.elapsed() < Duration::from_millis(1500));
+    // The deadline dropped the build and its lease with it, so the next one builds.
     assert_eq!(
         runtime
             .build_image(request, Duration::from_secs(4))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:built"
+    );
+    assert_eq!(server.join().unwrap().len(), 7);
+}
+
+#[test]
+fn old_image_is_not_proof_of_a_successful_build_and_the_next_build_replaces_it() {
+    let old = || response("GET", IMAGE_PATH, 200, r#"{"Id":"sha256:old","Size":1}"#);
+    let (_dir, config, request, server) = engine(vec![
+        version(),
+        old(),
+        post(""),
+        old(),
+        version(),
+        old(),
+        post(""),
+        built(),
+    ]);
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime
+            .build_image(request.clone(), Duration::from_secs(2))
             .wait(|_| {})
             .unwrap_err()
             .kind,
         ErrorKind::UnknownOutcome
     );
-    assert_eq!(server.join().unwrap().len(), 5);
-}
-
-#[test]
-fn old_image_is_not_proof_of_a_successful_build_and_does_not_allow_retry() {
-    let old = || response("GET", IMAGE_PATH, 200, r#"{"Id":"sha256:old","Size":1}"#);
-    let (_dir, config, request, server) =
-        engine(vec![version(), old(), post(""), old(), version(), old()]);
-    let runtime = RuntimeClient::new(config).unwrap();
-    for _ in 0..2 {
-        assert_eq!(
-            runtime
-                .build_image(request.clone(), Duration::from_secs(2))
-                .wait(|_| {})
-                .unwrap_err()
-                .kind,
-            ErrorKind::UnknownOutcome
-        );
-    }
-    assert_eq!(server.join().unwrap().len(), 6);
+    assert_eq!(
+        runtime
+            .build_image(request, Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:built"
+    );
+    assert_eq!(build_requests(&server.join().unwrap()), 2);
 }
 
 #[test]

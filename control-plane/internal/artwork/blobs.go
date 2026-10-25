@@ -1,17 +1,27 @@
 package artwork
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/jpeg" // registers the JPEG header reader for image.DecodeConfig
+	_ "image/png"  // registers the PNG header reader for image.DecodeConfig
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // The only image types we will ever store or serve. Anything else is rejected
@@ -53,6 +63,14 @@ var ErrUnsupportedType = errors.New("artwork: unsupported image type")
 // persistent volume.
 type BlobStore struct {
 	root string
+	log  *slog.Logger
+
+	resizes     singleflight.Group
+	resizeSlots chan struct{}
+	// undecodable holds the names of stored blobs whose bytes cannot be
+	// resized, so they are not decoded again on every `?w=`. Only a blob that
+	// was read is added and PruneOrphans removes it, so it never outgrows the store.
+	undecodable sync.Map
 }
 
 // NewBlobStore creates (or adopts) the cache directory at root.
@@ -63,7 +81,7 @@ func NewBlobStore(root string) (*BlobStore, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("artwork: create cache dir: %w", err)
 	}
-	return &BlobStore{root: filepath.Clean(root)}, nil
+	return &BlobStore{root: filepath.Clean(root), log: slog.Default(), resizeSlots: make(chan struct{}, maxConcurrentResizes)}, nil
 }
 
 // Root reports the cache directory (used by tests and diagnostics).
@@ -100,6 +118,9 @@ func (b *BlobStore) Put(declaredType string, data []byte) (string, error) {
 	if declared := normalizeMediaType(declaredType); declared != "" && declared != sniffed {
 		return "", fmt.Errorf("%w: declared %q but bytes are %q", ErrUnsupportedType, declared, sniffed)
 	}
+	if err := checkDimensions(sniffed, data); err != nil {
+		return "", err
+	}
 
 	sum := sha256.Sum256(data)
 	name := hex.EncodeToString(sum[:]) + "." + ext
@@ -114,28 +135,57 @@ func (b *BlobStore) Put(declaredType string, data []byte) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", fmt.Errorf("artwork: create shard dir: %w", err)
 	}
-	// Write to a temp file in the same directory then rename: a reader can only
-	// ever observe a complete blob, never a half-written one.
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".tmp-*")
-	if err != nil {
-		return "", fmt.Errorf("artwork: temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once the rename succeeded
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return "", fmt.Errorf("artwork: write blob: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("artwork: close blob: %w", err)
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return "", fmt.Errorf("artwork: chmod blob: %w", err)
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		return "", fmt.Errorf("artwork: publish blob: %w", err)
+	if err := writeAtomic(dst, data); err != nil {
+		return "", err
 	}
 	return name, nil
+}
+
+// maxImagePixels caps width x height of a stored image. Byte size is no bound
+// on decoded size (a tiny PNG can declare a billion pixels), and the browser
+// decodes every tile it shows. 16 MP is about 3.5x the largest crop the
+// provider queries ask for (3840x1240) and holds a 4K upload (3840x2160).
+const maxImagePixels = 16 << 20
+
+// checkDimensions reads only the image header and refuses an image whose
+// declared size is unreadable, empty or over maxImagePixels.
+func checkDimensions(mediaType string, data []byte) error {
+	var w, h int
+	if mediaType == "image/webp" {
+		w, h = webpSize(data)
+	} else if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		w, h = cfg.Width, cfg.Height
+	}
+	if w <= 0 || h <= 0 {
+		return fmt.Errorf("%w: unreadable image header", ErrUnsupportedType)
+	}
+	if int64(w)*int64(h) > maxImagePixels {
+		return fmt.Errorf("%w: image is %dx%d, over the %d pixel limit", ErrInvalidRequest, w, h, maxImagePixels)
+	}
+	return nil
+}
+
+// webpSize reads the canvas size from a WebP header. 0, 0 means unreadable.
+func webpSize(d []byte) (w, h int) {
+	if len(d) < 30 || string(d[0:4]) != "RIFF" || string(d[8:12]) != "WEBP" {
+		return 0, 0
+	}
+	switch string(d[12:16]) {
+	case "VP8 ": // lossy: 14-bit sizes after the 9d 01 2a start code
+		if d[23] != 0x9d || d[24] != 0x01 || d[25] != 0x2a {
+			return 0, 0
+		}
+		return int(binary.LittleEndian.Uint16(d[26:]) & 0x3fff), int(binary.LittleEndian.Uint16(d[28:]) & 0x3fff)
+	case "VP8L": // lossless: signature 0x2f, then two 14-bit (size-1) fields
+		if d[20] != 0x2f {
+			return 0, 0
+		}
+		bits := binary.LittleEndian.Uint32(d[21:])
+		return int(bits&0x3fff) + 1, int(bits>>14&0x3fff) + 1
+	case "VP8X": // extended: two 24-bit (size-1) fields
+		return (int(d[24]) | int(d[25])<<8 | int(d[26])<<16) + 1, (int(d[27]) | int(d[28])<<8 | int(d[29])<<16) + 1
+	}
+	return 0, 0
 }
 
 // Open returns a blob's bytes and its content type. An invalid name is
@@ -157,13 +207,18 @@ func (b *BlobStore) Open(name string) (data []byte, contentType string, err erro
 	return nil, "", ErrBadAsset
 }
 
-// Has reports whether a blob exists (and has a valid name).
-func (b *BlobStore) Has(name string) bool {
+// Has reports whether a blob exists (and has a valid name). Only a not-exist
+// stat error means it does not; any other is returned, and must never make a
+// caller delete or fetch again.
+func (b *BlobStore) Has(name string) (bool, error) {
 	if !assetName.MatchString(name) {
-		return false
+		return false, nil
 	}
 	_, err := os.Stat(b.pathFor(name))
-	return err == nil
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // PruneOrphans deletes every cached blob that `referenced` does not name.
@@ -174,7 +229,15 @@ func (b *BlobStore) Has(name string) bool {
 // is also what cleans up after a re-match, where the old blob simply stops
 // being referenced by anything.
 //
-// It returns the number removed. A file it cannot parse as an asset name is
+// A write left mid-flight by a killed process — between writeAtomic's create
+// and its rename — otherwise stays forever, so a `.tmp-*` file older than
+// tmpFileMaxAge goes too. A fresh one is left alone: its writer may still be
+// running, and the rename turns it into a file this sweep keeps. So is one
+// whose age cannot be read at all: this sweep deletes only what it is
+// certain it created.
+//
+// It returns the number of blobs removed; their sized variants (variants.go)
+// go with them uncounted. A file it cannot parse as an asset or variant name is
 // left alone: this function deletes only things it is certain it created.
 func (b *BlobStore) PruneOrphans(referenced map[string]struct{}) (int, error) {
 	removed := 0
@@ -185,17 +248,31 @@ func (b *BlobStore) PruneOrphans(referenced map[string]struct{}) (int, error) {
 		if d.IsDir() {
 			return nil
 		}
-		name := d.Name()
-		if !assetName.MatchString(name) {
+		name, source := d.Name(), d.Name()
+		if strings.HasPrefix(name, ".tmp-") { // writeAtomic/Put's temp names
+			if fi, err := d.Info(); err != nil || time.Since(fi.ModTime()) < tmpFileMaxAge {
+				return nil // one whose age cannot be read is left alone, like a fresh one
+			}
+			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			return nil
+		}
+		if m := variantName.FindStringSubmatch(name); m != nil {
+			source = m[1] // a sized copy goes with its source
+		} else if !assetName.MatchString(name) {
 			return nil // not ours — leave it
 		}
-		if _, keep := referenced[name]; keep {
+		if _, keep := referenced[source]; keep {
 			return nil
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
-		removed++
+		if name == source {
+			removed++
+			b.undecodable.Delete(name)
+		}
 		return nil
 	})
 	if err != nil {
@@ -203,6 +280,11 @@ func (b *BlobStore) PruneOrphans(referenced map[string]struct{}) (int, error) {
 	}
 	return removed, nil
 }
+
+// tmpFileMaxAge is how stale a `.tmp-*` file may get before a prune removes
+// it. A write in progress completes in far less, and never keeps its temp
+// file through a rename anyway; a killed process leaves the temp for good.
+const tmpFileMaxAge = 10 * time.Minute
 
 // normalizeMediaType strips parameters and casing from a media type
 // ("image/jpeg; charset=utf-8" → "image/jpeg").

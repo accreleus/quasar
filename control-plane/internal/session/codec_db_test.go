@@ -76,9 +76,14 @@ func setHostCodecs(t *testing.T, pool *pgxpool.Pool, hostID, codecsJSON string) 
 // upsertCodecProbe inserts a fresh probe advertising the given decode codecs.
 func upsertCodecProbe(t *testing.T, pool *pgxpool.Pool, userID string, hevc, av1 bool) {
 	t.Helper()
+	upsertProbeCodecs(t, pool, userID, `{"h264":true,"hevc":`+boolJSON(hevc)+`,"av1":`+boolJSON(av1)+`}`)
+}
+
+// upsertProbeCodecs inserts a fresh probe whose capabilities.codecs is codecsJSON.
+func upsertProbeCodecs(t *testing.T, pool *pgxpool.Pool, userID, codecsJSON string) {
+	t.Helper()
 	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
-		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true,"hevc":` +
-		boolJSON(hevc) + `,"av1":` + boolJSON(av1) + `}}`
+		time.Now().UTC().Format(time.RFC3339) + `","codecs":` + codecsJSON + `}`
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO user_devices (user_id, device_key, capabilities)
 		VALUES ($1::uuid, 'codec-device', $2::jsonb)
@@ -207,6 +212,26 @@ func TestSessionCodecDeviceClamp(t *testing.T) {
 	}
 	if res.Session.Codec != "h264" {
 		t.Errorf("session codec: got %q, want h264 (device clamp)", res.Session.Codec)
+	}
+}
+
+// TestSessionCodecH264RefusedMovesToAV1 (#605): a fresh h264:false probe on a
+// chain that lists h264 first launches the av1 rung the device decodes.
+func TestSessionCodecH264RefusedMovesToAV1(t *testing.T) {
+	pool := testDB(t)
+	userID, appID, hostID := seed1080pApp(t, pool)
+	coord := newTestCoordinator(t, NewStore(pool), newFakeDispatcher(true), testLogger())
+
+	enableChainCodecs(t, pool, "1080p60", "h264", "av1")
+	setHostCodecs(t, pool, hostID, `["h264","av1"]`)
+	upsertProbeCodecs(t, pool, userID, `{"h264":false,"hevc":false,"av1":true}`)
+
+	res, err := coord.LaunchByProfile(context.Background(), userID, LaunchParams{AppID: appID, ProfileID: "1080p60", IsAdmin: true})
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	if res.Session.Codec != "av1" {
+		t.Errorf("session codec: got %q, want av1 (h264 refused by the probe)", res.Session.Codec)
 	}
 }
 

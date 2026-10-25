@@ -76,6 +76,10 @@ type Provider interface {
 	// (a normal "no art" outcome), and ErrUnsupportedExternalSource when it
 	// cannot answer for that source at all. Every other error is transient.
 	ArtByExternalRef(ctx context.Context, source, id string) (Candidate, error)
+	// LogoIcon returns the logo and icon URLs (amendment 38) of the title Art(ref)
+	// names, or ArtByExternalRef(source, ref) when source is set; "" where it has
+	// none. A provider with no entry is not an error. Every error is transient.
+	LogoIcon(ctx context.Context, source, ref string) (logo, icon string, err error)
 }
 
 // Where the provider credential in effect came from. These are the values of

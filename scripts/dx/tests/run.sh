@@ -1247,6 +1247,34 @@ else
   warn "soak:observe-report" "scripts/dx/testdata/soak-observe-*.jsonl missing — SKIPPED"
 fi
 
+# The admin bearer must reach the host on stdin only, never in the remote command
+# text (argv is visible in `ps` on both ends). A recording ssh stub keeps the
+# remote command (its last argument) and the stdin it is fed: the token may appear
+# only as stdin's first line, and the driver must follow it unchanged.
+SOAK_TOK_DIR="$WORK/soak-token"
+mkdir -p "$SOAK_TOK_DIR/bin" "$SOAK_TOK_DIR/hostdir"
+SOAK_TOKEN_VALUE="soaktok.SENTINEL-7f3a9c"
+printf '{"_schema":"quasar-skills/hosts@2","roles":{"gpu-test":"fakebox"},"hosts":{"fakebox":{"ssh_alias":"ignored","dir":"%s","api":"http://127.0.0.1:1","api_external":"http://127.0.0.1:1"}}}\n' \
+  "$SOAK_TOK_DIR/hostdir" > "$SOAK_TOK_DIR/hosts.json"
+cat > "$SOAK_TOK_DIR/bin/ssh" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\${*: -1}" > "$SOAK_TOK_DIR/remote-cmd.txt"
+cat > "$SOAK_TOK_DIR/stdin.txt"
+exit 0
+STUB
+chmod +x "$SOAK_TOK_DIR/bin/ssh"
+env PATH="$SOAK_TOK_DIR/bin:$PATH" DX_HOSTS_JSON="$SOAK_TOK_DIR/hosts.json" HOST=gpu-test \
+  QUASAR_ADMIN_TOKEN="$SOAK_TOKEN_VALUE" DX_DIAG_DIR="$SOAK_TOK_DIR/diag" \
+  bash "$DX/session_soak.sh" latest --duration 4 --profile observe >/dev/null 2>&1 || true
+if [ -s "$SOAK_TOK_DIR/remote-cmd.txt" ] \
+   && ! grep -qF "$SOAK_TOKEN_VALUE" "$SOAK_TOK_DIR/remote-cmd.txt" \
+   && [ "$(head -n 1 "$SOAK_TOK_DIR/stdin.txt")" = "$SOAK_TOKEN_VALUE" ] \
+   && tail -n +2 "$SOAK_TOK_DIR/stdin.txt" | cmp -s - "$DX/session_soak_driver.py"; then
+  pass "soak:token-off-command-line" "remote command has no token; token is stdin line 1, driver follows"
+else
+  fail "soak:token-off-command-line" "remote cmd: $(tr '\n' '|' < "$SOAK_TOK_DIR/remote-cmd.txt" 2>/dev/null); stdin line 1: $(head -n 1 "$SOAK_TOK_DIR/stdin.txt" 2>/dev/null)"
+fi
+
 printf '\n== abr ladder netem ==\n'
 rc_of 0 "ladder:help" -- bash "$DX/abr_ladder_netem.sh" --help
 rc_of 2 "ladder:guard-no-session" -- env -u HOST bash "$DX/abr_ladder_netem.sh" --duration 240

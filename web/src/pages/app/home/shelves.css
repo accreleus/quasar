@@ -1,0 +1,126 @@
+/* Favourites shelf: the library's group head, then the house tile at shelf size
+   in one row that scrolls sideways. */
+
+.shelf-fav {
+  position: relative;
+  z-index: 1;
+  max-width: var(--home-max);
+  margin: 0 auto;
+  padding: 0 var(--page-pad);
+}
+.shelf-fav .src-head {
+  margin: var(--s2) 0 var(--s2);
+}
+.shelf-fav h2 {
+  font-size: var(--t-h3);
+}
+
+/* Room above for the tile's hover lift, which the scroller would clip. */
+.shelf-fav-track {
+  display: flex;
+  gap: var(--s3);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scroll-snap-type: x proximity;
+  padding: var(--s2) 0 var(--s3);
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-3) transparent;
+}
+.shelf-fav-track .lib-tile {
+  flex: 0 0 96px;
+  scroll-snap-align: start;
+}
+.shelf-fav-track .lib-tile .glyph {
+  font-size: var(--t-h3);
+}
+.shelf-fav-track .lib-tile .fnm {
+  font-size: var(--t-xs);
+}
+/* Every tile here is a favourite; the heart would repeat the heading. */
+.shelf-fav-track .lib-tile .fav-marker {
+  display: none;
+}
+.shelf-fav-track .lib-tile-play {
+  width: 44px;
+  height: 44px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shelf-fav-track {
+    scroll-snap-type: none;
+  }
+}
+/* Jump back in shelf: as the favourites shelf, with a two-line caption under the
+   art: when it was last played, and for how long. */
+
+.shelf-jump {
+  position: relative;
+  z-index: 1;
+  max-width: var(--home-max);
+  margin: 0 auto;
+  padding: 0 var(--page-pad);
+}
+.shelf-jump .src-head {
+  margin: var(--s2) 0 var(--s2);
+}
+.shelf-jump h2 {
+  font-size: var(--t-h3);
+}
+
+/* Room above for the tile's hover lift, which the scroller would clip. */
+.shelf-jump-track {
+  display: flex;
+  gap: var(--s3);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  padding: var(--s2) 0 var(--s3);
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-3) transparent;
+}
+
+/* The cover goes back into flow at 2:3 and the caption sits in the tile's own
+   padding, inside the surface button, so pressing the caption opens the game. */
+.shelf-jump-track .lib-tile {
+  flex: 0 0 96px;
+  aspect-ratio: auto;
+  padding-bottom: calc(var(--t-xs) * 2.8 + 2 * var(--s2));
+}
+.shelf-jump-track .lib-tile > .cover {
+  position: relative;
+  display: block;
+  aspect-ratio: 2 / 3;
+}
+.shelf-jump-track .lib-tile .glyph {
+  font-size: var(--t-h3);
+}
+.shelf-jump-track .lib-tile .fnm {
+  font-size: var(--t-xs);
+}
+.shelf-jump-track .lib-tile-play {
+  top: calc(50% - var(--s6));
+  width: 44px;
+  height: 44px;
+}
+.shelf-jump-meta {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  padding: var(--s2);
+  font-size: var(--t-xs);
+  line-height: 1.4;
+  text-align: left;
+  white-space: nowrap;
+}
+.shelf-jump-meta > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.shelf-jump-meta .when {
+  color: var(--text-2);
+}
+.shelf-jump-meta .hours {
+  color: var(--text-3);
+}

@@ -32,7 +32,8 @@ pub use quasar_runtime::{
     agent_path_for_daemon_path, daemon_path_for_agent_path, ApiVersion, CdiFacts,
     ContainerInspection, DaemonHostPath, DaemonImage, EngineFacts, EngineInfo, EngineKind,
     EngineMode, EngineStorage, ErrorKind, GpuInjection, ImageMetadata, Mount, MountKind, Operation,
-    RuntimeConfig, RuntimeError, API_FLOOR, ENGINE_INSPECTION_BUDGET, NVIDIA_CDI_DEVICE,
+    RuntimeConfig, RuntimeError, API_FLOOR, ENGINE_INSPECTION_BUDGET, LAUNCH_BUSY_BUDGET,
+    NVIDIA_CDI_DEVICE,
 };
 
 /// How long ONE owned GPU probe may take end to end — recover, create and start, wait,
@@ -131,6 +132,23 @@ impl RuntimeClient {
         let config = self.config().clone();
         let image = image.into();
         self.submit(async move { docker::inspect_image(&config, &image).await })
+    }
+
+    /// [`Self::image_present`] under `budget` (capped by the client deadline): the image
+    /// manager's background check of a `ready` record bounds each inspect by it (#675).
+    pub fn image_present_within(
+        &self,
+        image: impl Into<String>,
+        budget: Duration,
+    ) -> Operation<bool> {
+        let config = self.config().clone();
+        let image = image.into();
+        let budget = std::cmp::min(config.deadline, budget);
+        self.submit_owned(
+            async move { docker::inspect_image(&config, &image).await },
+            budget,
+            false,
+        )
     }
 
     /// Retire pull intents left by a previous agent; returns the image refs retired.

@@ -22,6 +22,7 @@ import { HomeShell } from "../../components/shell/HomeShell";
 import { LibraryCatalogProvider } from "./libraryCatalog";
 import { LibrarySearchContext } from "./librarySearchContext";
 import { buildUserNav, SEARCHABLE_ROUTES } from "./navItems";
+import { LaunchActivityContext, SteamWarmHeartbeat } from "./SteamWarmHeartbeat";
 
 export { buildUserNav, SEARCHABLE_ROUTES };
 
@@ -37,12 +38,20 @@ export function AppLayout() {
     if (q) setQuery(q);
   }, [q]);
 
+  // Whether a launch from this layout is in flight; it holds the heartbeat.
+  const [launching, setLaunching] = useState(false);
+
   return (
     <LibrarySearchContext.Provider value={{ query, setQuery }}>
       <LibraryCatalogProvider>
-        <HomeShell>
-          <Outlet />
-        </HomeShell>
+        <LaunchActivityContext.Provider value={setLaunching}>
+          {/* The layout wraps exactly /app, /app/library and /app/game/:id: the
+              places "the library is open" is true. Session, account and admin sit outside it. */}
+          <SteamWarmHeartbeat paused={launching} />
+          <HomeShell>
+            <Outlet />
+          </HomeShell>
+        </LaunchActivityContext.Provider>
       </LibraryCatalogProvider>
     </LibrarySearchContext.Provider>
   );

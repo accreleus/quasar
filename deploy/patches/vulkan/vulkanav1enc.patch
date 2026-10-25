@@ -35,7 +35,8 @@
 # reset-free live retarget). gstreamer-vulkan-rc-retarget-no-reset.patch was
 # listed here until it was removed at the GStreamer 1.28.8 bump (2026-10-12);
 # this element never called what it changed and applies the same without it.
-# Applies last in the chain.
+# Seventh of the thirteen GStreamer patches: the `git apply` list in
+# deploy/Dockerfile.vulkan is what runs, and is the order of record.
 #
 # Live-pipeline fix folded in 2026-08-21: input VulkanImage buffers are
 # released at encode completion (references need only the DPB reconstruction,

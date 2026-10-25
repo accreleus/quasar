@@ -45,3 +45,14 @@ func codecConstraint(chain profile.LaunchProfile, ov StreamOverride) (string, er
 	}
 	return "", fmt.Errorf("%w: %s (launch profile %q)", ErrRungCodecNotAvailable, codec, chain.ID)
 }
+
+// noHostMessage is the plain no_host_available text: the generic one, or, when the
+// user's saves live on a host that is not online, the one fact they and their
+// administrator can act on. It names no host.
+func noHostMessage(err error) string {
+	var off *HomeHostOfflineRejection
+	if errors.As(err, &off) {
+		return "the host that holds your saves for this game is not online, or is no longer enrolled; ask your administrator to bring it back, or to forget that host and then release the claim on your saves (you then start with empty saves)"
+	}
+	return "no host is available to serve this launch"
+}

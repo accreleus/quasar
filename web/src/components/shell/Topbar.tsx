@@ -23,6 +23,7 @@ import { UserMenu } from "./UserMenu";
 export function Topbar({
   onOpenPalette,
   searchLabel,
+  searchShort,
   onToggleRail,
   railOpen,
 }: {
@@ -30,6 +31,8 @@ export function Topbar({
   /** What the palette can actually find here (components/shell/paletteSearch
    *  `paletteTriggerLabel`). */
   searchLabel: string;
+  /** New design: a short form of the label for phones. */
+  searchShort?: string;
   /** Present only when the shell has a rail to slide over. */
   onToggleRail?: () => void;
   railOpen?: boolean;
@@ -56,9 +59,16 @@ export function Topbar({
         </Link>
       </div>
 
-      <button type="button" className="cmdk" onClick={onOpenPalette}>
+      <button type="button" className="cmdk" onClick={onOpenPalette} aria-label={searchShort ? searchLabel : undefined}>
         <IconSearch />
-        {searchLabel}
+        {searchShort ? (
+          <>
+            <span className="ss-long">{searchLabel}</span>
+            <span className="ss-short">{searchShort}</span>
+          </>
+        ) : (
+          searchLabel
+        )}
         <kbd>⌘K</kbd>
       </button>
 

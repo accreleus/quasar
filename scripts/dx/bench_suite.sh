@@ -254,12 +254,14 @@ dx_sanitize_admin_token "$TARGET"
 
 host_api() { # host_api <METHOD> <path> [json-body]
   local method="$1" path="$2" body="${3:-}"
-  local args="-fsSk -m 25 -X $method '$API_BASE$path' -H 'Authorization: Bearer $QSES_ADMIN_TOKEN'"
+  local args="-fsSk -m 25 -X $method '$API_BASE$path'"
   [ -n "$body" ] && args="$args -H 'Content-Type: application/json' -d '$body'"
   if [ "$DX_HOST" = local ]; then
-    eval "curl $args"
+    eval "curl $args -H 'Authorization: Bearer $QSES_ADMIN_TOKEN'"
   else
-    dx_ssh_remote "curl $args"
+    # Remote: the bearer rides stdin as a curl config line (curl -K -), never argv.
+    printf 'header = "Authorization: Bearer %s"\n' "$QSES_ADMIN_TOKEN" \
+      | dx_ssh_remote "curl -K - $args"
   fi
 }
 

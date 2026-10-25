@@ -1,0 +1,106 @@
+/* Art plus a one-line title strip inside the same border, so `.lib-tile` stays
+   the box the windowed grid measures and every tile is one height. */
+.lib-tile.tile-titled {
+  --tile-strip: var(--s7);
+  aspect-ratio: auto;
+  display: flex;
+  flex-direction: column;
+}
+.lib-tile.tile-titled > .cover {
+  position: relative;
+  inset: auto;
+  flex: none;
+  aspect-ratio: 2 / 3;
+}
+/* The strip carries the name, so the fallback does not print it twice (the
+   monogram and the name collided on small tiles). */
+.lib-tile.tile-titled .fnm {
+  display: none;
+}
+/* Scrim and Play belong to the art, not the strip. */
+.lib-tile.tile-titled::before {
+  bottom: var(--tile-strip);
+}
+.lib-tile.tile-titled .lib-tile-play {
+  top: calc(50% - var(--tile-strip) / 2);
+}
+
+/* The title strip is the tile's ::after (data-title); the `/ ""` alt text keeps
+   it out of the accessibility tree, since the surface button already carries
+   the name. `::after` is otherwise only the detail band's caret, which never
+   opens on a tile that goes to the game page. */
+.lib-tile.tile-titled::after {
+  content: attr(data-title) / "";
+  display: block;
+  height: var(--tile-strip);
+  padding: 0 var(--s3);
+  overflow: hidden;
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  font-weight: 500;
+  line-height: var(--tile-strip);
+  color: var(--text-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lib-tile.tile-titled:hover::after,
+.lib-tile.tile-titled:focus-within::after {
+  color: var(--text);
+}
+
+/* 44px hit area in the corner the shipped favourite marker used; the glyph
+   sits where the marker's did. Above the surface (4) and Play (5). */
+.tile-heart {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 6;
+  display: grid;
+  place-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-lg);
+  background: none;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+/* A scrim disc (::before) under IconHeart's path as a mask (::after): no extra
+   elements, and no per-tile filter (a drop-shadow on every tile cost ~40 long
+   frames in the scroll soak). */
+.tile-heart::before,
+.tile-heart::after {
+  content: "";
+  grid-area: 1 / 1;
+  place-self: center;
+}
+.tile-heart::before {
+  width: var(--s7);
+  height: var(--s7);
+  border-radius: 50%;
+  background: var(--home-scrim);
+}
+.tile-heart::after {
+  width: 18px;
+  height: 18px;
+  background: currentColor;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 13.5S2.2 10.2 2.2 6.4A3 3 0 0 1 8 5.1a3 3 0 0 1 5.8 1.3c0 3.8-5.8 7.1-5.8 7.1z' fill='none' stroke='%23000' stroke-width='1.5' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+.tile-heart[aria-pressed="true"]::after {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 13.5S2.2 10.2 2.2 6.4A3 3 0 0 1 8 5.1a3 3 0 0 1 5.8 1.3c0 3.8-5.8 7.1-5.8 7.1z' fill='%23000' stroke='%23000' stroke-width='1.5' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+.tile-heart:hover,
+.tile-heart[aria-pressed="true"] {
+  color: var(--lavender);
+}
+.tile-heart:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: -6px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tile-heart {
+    transition: none;
+  }
+}

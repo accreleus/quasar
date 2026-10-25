@@ -5,6 +5,11 @@
 //   "swapping"      in progress
 //   "swap complete" agent's new app presented a frame; app_id now committed
 //   "swap rejected" agent ack'd false / unreachable — no-op, previous app kept
+//   "app booting" / "app presented"
+//                   an in-place swap reports "swap complete" and "app booting" in
+//                   one tick, so the poll almost never sees the first. The control
+//                   plane does not record either while a swap is pending, so
+//                   seeing one after "swapping" proves the commit. Needs `armed`.
 //   "rolled back"   SUBSTRING match on the agent's own detail string
 //                   "swap failed; rolled back: <reason>" (node-agent/src/agent.rs)
 //
@@ -20,8 +25,10 @@ export type SwapOutcome =
 
 const ROLLED_BACK_MARKER = "rolled back:";
 
+/** `armed`: this swap's poll has already seen "swapping" (see useSwapTransition). */
 export function swapOutcome(
   session: Pick<Session, "state" | "state_detail" | "error_message">,
+  armed = false,
 ): SwapOutcome {
   if (session.state !== "running") {
     return {
@@ -33,6 +40,7 @@ export function swapOutcome(
   const detail = session.state_detail ?? "";
 
   if (detail === "swap complete") return { kind: "success" };
+  if (armed && (detail === "app booting" || detail === "app presented")) return { kind: "success" };
 
   if (detail.includes("rolled back")) {
     // Surface just the reason; fall back to raw detail if the marker is absent.

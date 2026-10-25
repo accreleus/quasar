@@ -1,8 +1,11 @@
 package session
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -157,5 +160,60 @@ func TestRefusalMessage(t *testing.T) {
 	}
 	if got := refusalMessage(ErrCapacityExhausted, "plain", "no free GPU can encode %s"); got != "plain" {
 		t.Errorf("unconstrained: %q", got)
+	}
+}
+
+// #589: only a home on an offline host changes the plain no_host_available text.
+func TestNoHostMessageNamesAnOfflineHomeHostOnly(t *testing.T) {
+	plain := noHostMessage(&NoHostRejection{err: ErrNoHostAvailable})
+	if plain != "no host is available to serve this launch" {
+		t.Fatalf("plain refusal text changed: %q", plain)
+	}
+	home := noHostMessage(&HomeHostOfflineRejection{err: &NoHostRejection{err: ErrNoHostAvailable}})
+	if home == plain || !strings.Contains(home, "holds your saves") {
+		t.Fatalf("home-host refusal text: %q", home)
+	}
+}
+
+// #602 (amendment 40): only a home on an offline or gone host carries
+// reason home_host_unavailable, with or without a codec constraint, and then the
+// home message wins over the codec one. Every other no_host_available omits it.
+func TestWriteNoHostAvailableReasonOnlyForAnOfflineHomeHost(t *testing.T) {
+	home := &HomeHostOfflineRejection{err: &NoHostRejection{err: ErrNoHostAvailable}}
+	plain := &NoHostRejection{err: ErrNoHostAvailable}
+	av1 := CreateParams{RequireCodec: "av1"}
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantReason string
+		wantMsg    string
+	}{
+		{"home host offline", home, "home_host_unavailable", noHostMessage(home)},
+		{"home host offline, codec constrained", withCodecConstraint(av1, home), "home_host_unavailable", noHostMessage(home)},
+		{"plain", plain, "", "no host is available to serve this launch"},
+		{"codec constrained", withCodecConstraint(av1, plain), "", "no host has a GPU that can encode av1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			writeNoHostAvailable(rec, tc.err)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status %d, want 503", rec.Code)
+			}
+			var body map[string]map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			e := body["error"]
+			if e["code"] != "no_host_available" || e["message"] != tc.wantMsg {
+				t.Fatalf("error = %v, want code no_host_available, message %q", e, tc.wantMsg)
+			}
+			reason, present := e["reason"]
+			if tc.wantReason == "" && present {
+				t.Fatalf("reason %v present on a refusal that must omit it", reason)
+			}
+			if tc.wantReason != "" && reason != tc.wantReason {
+				t.Fatalf("reason = %v, want %q", reason, tc.wantReason)
+			}
+		})
 	}
 }

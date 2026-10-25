@@ -37,7 +37,13 @@ import { playoutOverride } from "../../webrtc/playout";
 import type { TelemetrySnapshot } from "../../webrtc/telemetry";
 import { Button } from "../../components/Button";
 import { Hud, type HudHandle } from "./hud/Hud";
-import { NON_STANDARD_PAD_ADVICE, shortGamepadLabel } from "./hud/panes/InputPane";
+import {
+  NON_STANDARD_PAD_ADVICE,
+  escReleases,
+  releaseHint,
+  shortGamepadLabel,
+  type ReleaseInputs,
+} from "./hud/panes/InputPane";
 import { fallbackStreamRungs } from "./StreamResolutionControl";
 import { SessionSwapController } from "./SessionSwapController";
 import {
@@ -51,7 +57,10 @@ import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailu
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
+import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../input/launchFullscreen";
+import { sendEscComboEnabled } from "../../input/summonCombo";
 import {
+  launchImmersive,
   loadDisplayPreferences,
   saveDisplayPreferences,
   type ScalingMode,
@@ -74,6 +83,10 @@ export function parseTierSize(tier: string | undefined): { w: number; h: number 
   const h = parseInt(m[2], 10);
   return w > 0 && h > 0 ? { w, h } : null;
 }
+
+/** #748: recovery phases that paint the banner, and how long it is held. */
+const RECOVERY_PHASES = ["degraded", "reconnecting", "failed", "signaling-lost"];
+const RECOVERY_BANNER_GRACE_MS = 500;
 
 /**
  * #524: session states no fresh signaling envelope can rescue; these bounce to
@@ -106,7 +119,14 @@ interface SessionState {
   playoutOverride?: number | null;
 }
 
+// Keyed on the id so a route change between two sessions (a toast's "Go to
+// session", back/forward) starts the next one with fresh state (#560).
 export function SessionPage() {
+  const { id } = useParams<{ id: string }>();
+  return <SessionPageBody key={id} />;
+}
+
+function SessionPageBody() {
   const { id: sessionId } = useParams<{ id: string }>();
   const { state } = useLocation() as { state: SessionState | null };
   const { token: authToken } = useAuth();
@@ -326,6 +346,7 @@ export function SessionPage() {
     setExternalResizeSupported,
     externalOwner,
     launchDetail,
+    shaderPercent,
     launchFailure,
     noteFailure,
     appPresented,
@@ -351,6 +372,7 @@ export function SessionPage() {
     wsOpen,
     pcConnected,
     firstFrame,
+    takeoverRefused,
   } = runtimeSnap;
 
   useEffect(() => {
@@ -454,6 +476,24 @@ export function SessionPage() {
     (launchFailure != null && (launchFailure.kind !== "unreachable" || !channelOpen)) ||
     (recovery?.phase === "failed" && !channelOpen);
 
+  // #726: the player quit the game; the session ended normally, so go back to the library.
+  const gameExited = launchFailure?.kind === "game_exited";
+  useEffect(() => {
+    if (gameExited) navigate("/app", { replace: true });
+  }, [gameExited, navigate]);
+
+  // #748: a stall can fire a beat before the end-reason read lands. Hold the recovery banner
+  // for a short grace so a session already ending (or ended by this page) never paints it.
+  const recoveryActive = recovery != null && RECOVERY_PHASES.includes(recovery.phase);
+  const [recoveryGraceDone, setRecoveryGraceDone] = useState(false);
+  useEffect(() => {
+    setRecoveryGraceDone(false);
+    if (!recoveryActive) return;
+    const t = setTimeout(() => setRecoveryGraceDone(true), RECOVERY_BANNER_GRACE_MS);
+    return () => clearTimeout(t);
+  }, [recoveryActive]);
+  const recoveryShown = recoveryActive && recoveryGraceDone && !gameExited && !stopping;
+
   // Release what leaving the page releases, without destroying the transport:
   // a destroy would say `bye` to a session another tab now owns.
   useEffect(() => {
@@ -469,11 +509,18 @@ export function SessionPage() {
 
   // Must toggle, not just request: the drawer's row relabels to "Release
   // input" while captured, and in fallback mode it's a primary way out.
-  const handleGrab = useCallback(() => {
+  const unmute = useCallback(() => {
     if (!videoRef.current) return;
     // Unmute on user gesture (browsers require it for audio autoplay).
     videoRef.current.muted = false;
     void videoRef.current.play();
+    // The session's sound too, once revealed: a reload with no click has no activation to unmute it.
+    if (revealStartedRef.current && !swapScreenUpRef.current) runtimeRef.current?.releaseAudio();
+  }, []);
+
+  const handleGrab = useCallback(() => {
+    if (!videoRef.current) return;
+    unmute();
 
     // Synchronous truth, not last-rendered state — a gesture handler must not
     // read a stale render (sessionRuntime.isCaptured).
@@ -523,7 +570,7 @@ export function SessionPage() {
 
     // The HUD collapses itself when capture engages (Hud.tsx): the picture is
     // the point of capturing, and a shelf over it is not.
-  }, [addToast, sessionOver]);
+  }, [addToast, sessionOver, unmute]);
 
   // Mic spec §3.4: enable runs from the button click and is the only path
   // that calls getUserMedia; disable detaches the sender track and stops the device.
@@ -727,7 +774,8 @@ export function SessionPage() {
   }, []);
 
   // Tracks fullscreen state for the drawer's fullscreen/exit-fullscreen button.
-  const [fullscreen, setFullscreen] = useState(false);
+  // #647: a launch arrives already full screen (the Play click did it).
+  const [fullscreen, setFullscreen] = useState(() => !!document.fullscreenElement);
 
   // AS10-14: on fullscreen exit, release pointer lock if held (correct order per spec:
   // fullscreen is released first by the browser, then we clean up pointer lock).
@@ -767,6 +815,9 @@ export function SessionPage() {
   const [loaderInert, setLoaderInert] = useState(false);
   const [loaderDone, setLoaderDone] = useState(false);
   const loaderTimersRef = useRef<ReturnType<typeof setTimeout>[] | null>(null);
+  const [swapScreenUp, setSwapScreenUp] = useState(false);
+  const swapScreenUpRef = useRef(false);
+  swapScreenUpRef.current = swapScreenUp;
   // Latched, like SessionLoader's own handoff: the gate can retract (the channel
   // closes inside the reveal), and the loader is transparent and inert by then
   // either way. A removal cancelled on the retract never happened again, and
@@ -779,6 +830,15 @@ export function SessionPage() {
       ];
     }
   }, [revealReady]);
+  // The sound flips with the picture: the loader turns see-through at `loaderInert`, not at
+  // `revealReady` (its lock animation is opaque). `runtimeSnap` re-runs this for a runtime
+  // built after the reveal (a replacement transport).
+  // The quick-switch screen is opaque too, and an in-place swap keeps the stream, so Steam's
+  // and the new game's sound is held under it as the launch loader holds it.
+  useEffect(() => {
+    if (swapScreenUp) runtimeRef.current?.holdAudio();
+    else if (loaderInert) runtimeRef.current?.releaseAudio();
+  }, [loaderInert, swapScreenUp, runtimeSnap]);
   useEffect(
     () => () => {
       loaderTimersRef.current?.forEach(clearTimeout);
@@ -786,6 +846,50 @@ export function SessionPage() {
     },
     [],
   );
+
+  // #647: Play went full screen; capture once the picture shows, with no second
+  // click. Chromium grants Pointer Lock with no fresh gesture while full screen.
+  // Anything else (refused, Esc during the loader, a resume or takeover that
+  // never went full screen) gets one "Click to play" layer, never a retry loop.
+  // Armed again by a quick switch, which spends its own click the same way.
+  const [immersive] = useState(launchImmersive);
+  const autoArmedRef = useRef(immersive);
+  const [clickToPlay, setClickToPlay] = useState(false);
+  useEffect(() => {
+    if (!autoArmedRef.current || !loaderInert || swapScreenUp || sessionOver) return;
+    const rt = runtimeRef.current;
+    if (!rt || !videoRef.current) return; // stays armed for the runtime to arrive
+    autoArmedRef.current = false;
+    if (rt.isCaptured()) return;
+    // No Pointer Lock (touch, gesture mode): engaging needs no gesture at all.
+    if (pointerLockSupported() && !document.fullscreenElement) {
+      setClickToPlay(true);
+      return;
+    }
+    // Sticky activation from the Play click; without one, play() would pause the video.
+    const ua = (navigator as Navigator & { userActivation?: { hasBeenActive: boolean } }).userActivation;
+    if (ua?.hasBeenActive) unmute();
+    const engaging = rt.engage();
+    if (!engaging) {
+      setClickToPlay(true);
+      return;
+    }
+    void engaging.then((result) => {
+      if (result.mode === "failed") setClickToPlay(true);
+    });
+  }, [loaderInert, swapScreenUp, sessionOver, runtimeSnap, unmute]);
+  useEffect(() => {
+    if (inputCaptured) setClickToPlay(false);
+  }, [inputCaptured]);
+  // A fresh gesture: the grab first (requestFullscreen consumes the activation
+  // in Firefox and Safari), then full screen again if it was left.
+  const handleClickToPlay = useCallback(() => {
+    setClickToPlay(false);
+    handleGrab();
+    enterLaunchFullscreen();
+  }, [handleGrab]);
+  // Leaving the session leaves the full screen Play entered (a quick switch stays on this page).
+  useEffect(() => () => leaveLaunchFullscreen(), []);
 
   // #434: hold a screen wake lock while the session is LIVE. Liveness is the
   // page's existing notion — the input DataChannel being open is what every
@@ -796,6 +900,17 @@ export function SessionPage() {
   // MUST stay above the hostLost early-return below: hooks cannot be
   // conditional. (A dead host also flips `hostLost`, which drops it anyway.)
   useScreenWakeLock(channelOpen && !stopping && !hostLost);
+
+  // One set of inputs for the Input pane's Esc row and the release hint (#647).
+  const releaseInputs: ReleaseInputs = {
+    pointerLockAvailable: pointerLockSupported(),
+    touchLook: touchLookSupported(),
+    fullscreen,
+    keyboardLockAvailable: keyboardLockSupported(),
+    lockRefused: kbLockRefused,
+    certUntrusted: certTrust === "untrusted-cert",
+    escCombo: sendEscComboEnabled(),
+  };
 
   // Host-lost overlay: replaces the normal session UI when the host crashed.
   if (hostLost) {
@@ -849,8 +964,7 @@ export function SessionPage() {
     (!bannerVerdict &&
       (health != null ||
         clientUnsupported ||
-        (recovery != null &&
-          ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase))));
+        recoveryShown));
 
   // Same shape, for the mic "hot" pill vs the toast host (`.session-root.mic-on`).
   const rootClassName =
@@ -947,7 +1061,7 @@ export function SessionPage() {
 
           {!bannerVerdict &&
             recovery &&
-            ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase) && (
+            recoveryShown && (
               <SessionBanner
                 variant={recovery.phase === "failed" ? "critical" : "warning"}
                 title={
@@ -1003,16 +1117,23 @@ export function SessionPage() {
           // The poll's "app booting" is the control plane's app_launch_state
           // "starting" (#484 §3.2): the app is up, it has not presented.
           appLaunchState={launchDetail === "app booting" ? "starting" : undefined}
+          shaderPercent={shaderPercent}
           // #482: without these the loader falls back to "finding a host" for
           // anything the status string doesn't recognise.
           hostAssigned={hostAssigned}
           sessionRunning={sessionRunning}
           iceState={iceState}
+          takeoverRefused={takeoverRefused}
           // handleStop tears the session down server-side so "Back to
           // library" from a dead launch never orphans a session. Not for a
           // takeover: the other tab owns the session, and stopping it ends its stream.
-          // Nor a revoke: the control plane already stopped it.
-          onExit={() => (launchFailure && isBannerVerdict(launchFailure) ? navigate("/app") : void handleStop())}
+          // Nor a revoke: the control plane already stopped it. Nor a refused
+          // takeover: the session keeps running (amendment 42).
+          onExit={() =>
+            takeoverRefused || (launchFailure && isBannerVerdict(launchFailure))
+              ? navigate("/app")
+              : void handleStop()
+          }
         />
       )}
 
@@ -1029,7 +1150,12 @@ export function SessionPage() {
         currentApp={currentApp}
         onCommitted={(appId, appName) => setCurrentApp({ id: appId, name: appName })}
         onToast={pushToast}
-        onSwapStart={() => hudRef.current?.close()}
+        onSwapStart={() => {
+          hudRef.current?.close();
+          // #647: the tile click is a gesture; spend it like Play does.
+          if (immersive && enterLaunchFullscreen()) autoArmedRef.current = true;
+        }}
+        onScreenChange={setSwapScreenUp}
       >
         {({ quickSwitch, swappingTo }) => (
           <Hud
@@ -1046,12 +1172,14 @@ export function SessionPage() {
             onRelease={handleRelease}
             pointerLockAvailable={pointerLockSupported()}
             touchLook={touchLookSupported()}
-            // Without Pointer Lock, Esc is capture.ts's own release gesture and
-            // is never forwarded — so it always releases, fullscreen or not.
-            escReleases={
-              !pointerLockSupported() || !fullscreen || !keyboardLockSupported() || kbLockRefused
+            escReleases={escReleases(releaseInputs)}
+            releaseHint={immersive ? releaseHint(releaseInputs) : null}
+            escInsecureContext={
+              pointerLockSupported() && !keyboardLockSupported() && window.isSecureContext === false
             }
-            escInsecureContext={pointerLockSupported() && !keyboardLockSupported()}
+            escNoKeyboardLock={
+              pointerLockSupported() && !keyboardLockSupported() && window.isSecureContext !== false
+            }
             // API presence alone cannot see these two, and both used to render
             // the cheerful fullscreen hint exactly where it was wrong: on a
             // bypassed-certificate origin the Keyboard Lock API exists
@@ -1059,6 +1187,7 @@ export function SessionPage() {
             // API "supported" while Esc quits.
             escCertUntrusted={certTrust === "untrusted-cert"}
             escLockRefused={kbLockRefused}
+            escCombo={releaseInputs.escCombo}
             micGranted={state?.micGranted === true}
             micOn={micOn}
             micBusy={micBusy}
@@ -1094,6 +1223,16 @@ export function SessionPage() {
           />
         )}
       </SessionSwapController>
+
+      {/* #647: auto-capture was refused or never possible. Under the HUD (z 20),
+          so Exit and the menu stay reachable. */}
+      {clickToPlay && !sessionOver && (
+        <div className="session-play" onClick={handleClickToPlay}>
+          <Button variant="primary" size="lg">
+            Click to play
+          </Button>
+        </div>
+      )}
 
       {/* Touch route into the shelf (UX assessment §2.3): the Ctrl+Alt+Shift+Q
           chord bootstrap can't be pressed on a phone. Shown only on a

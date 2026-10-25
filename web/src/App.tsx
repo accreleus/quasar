@@ -28,7 +28,9 @@ import { AccountProfile } from "./pages/app/account/AccountProfile";
 import { AccountDevices } from "./pages/app/account/AccountDevices";
 import { AccountSessions } from "./pages/app/account/AccountSessions";
 import { AccountStreaming } from "./pages/app/account/AccountStreaming";
+import { AccountAppearance } from "./pages/app/account/AccountAppearance";
 import { AppHomeNext } from "./pages/app/AppHomeNext";
+import { GamePageRoute } from "./pages/app/game/GamePage";
 import { AppLayout } from "./pages/app/AppLayout";
 import { AccountStorage } from "./pages/app/account/AccountStorage";
 import { SessionPage } from "./pages/app/SessionPage";
@@ -199,6 +201,7 @@ export function App() {
               back/forward works. Same component — AppHomeNext reads the route
               to choose its view. */}
           <Route path="library" element={<AppIndexPage />} />
+          <Route path="game/:id" element={<GamePageRoute />} />
           {/* Storage moved into the account area (2026-08-05). Kept as a
               redirect, not deleted — existing bookmarks and any link still in
               the wild must land on the page, not a 404. */}
@@ -221,6 +224,7 @@ export function App() {
           <Route element={<PreferencesSection />}>
             <Route path="overlay" element={<AccountOverlay />} />
             <Route path="streaming" element={<AccountStreaming />} />
+            <Route path="appearance" element={<AccountAppearance />} />
           </Route>
           <Route element={<UsageSection />}>
             <Route path="storage" element={<AccountStorage />} />

@@ -154,6 +154,19 @@ func TestResolveRungMatrix(t *testing.T) {
 			wantWalk: []string{"1440p60-av1:av1!client_decode", "1440p60-hevc:h265!client_decode", "1080p60-h264:h264"},
 		},
 		{
+			name:  "clamp 2/3 codec: a fresh h264:false moves an h264-first chain onto av1 (#605)",
+			rungs: []profile.Profile{r("1080p60-h264", profile.CodecH264, 1080), r("1080p60-av1", profile.CodecAV1, 1080)},
+			host:  []string{"h264", "av1"}, probe: &DeviceProbe{AV1: true, H264Refused: true},
+			wantRung: "1080p60-av1", wantWire: "av1",
+			wantWalk: []string{"1080p60-h264:h264!client_decode", "1080p60-av1:av1"},
+		},
+		{
+			name:  "clamp 2/3 codec: h264:false with nothing else decodable still dispatches the h264 floor",
+			rungs: high, host: []string{"h264", "h265", "av1"}, probe: &DeviceProbe{H264Refused: true},
+			wantRung: "1080p60-h264", wantWire: "h264", wantFloor: true,
+			wantWalk: []string{"1440p60-av1:av1!client_decode", "1440p60-hevc:h265!client_decode", "1080p60-h264:h264!client_decode"},
+		},
+		{
 			name: "clamp 2/3 DECODE HEIGHT (new): a 1080-capped decoder skips both 1440p rungs",
 			// The codecs are fully supported — only the RESOLUTION disqualifies them.
 			// A codec-only clamp chain cannot express this, which is why the rung

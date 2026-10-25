@@ -12,13 +12,20 @@ import type { App, ProfilesResponse, Session } from "../../../api/types";
 import { useToast } from "../../../components/Toast";
 import { playoutOverride } from "../../../webrtc/playout";
 import {
+  CLOSING_RETRY_DELAY_MS,
+  MAX_CLOSING_RETRY_WAIT_MS,
   MAX_NO_HOST_RETRY_WAIT_MS,
   NO_HOST_RETRY_DELAY_MS,
+  closingGaveUpCopy,
+  closingToastCopy,
   decideCapacityRetry,
+  isCapacityRetryable,
   waitingToastCopy,
 } from "../capacityRetry";
 import { isRecommendationEligible } from "../launchOptions";
 import { presentLaunchError } from "../libraryGrid";
+import { useReportLaunching } from "../SteamWarmHeartbeat";
+import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../../input/launchFullscreen";
 
 /** #494's retry-wait timeout, abortable and observable. `timeoutRef` is cleared
  *  on settle so an unmount cleanup can `clearTimeout` it directly; the abort
@@ -51,17 +58,18 @@ function abortableSleep(
   });
 }
 
-/** Which bounce a waiting launch is retrying: "slot" (capacity_exhausted) or
- *  "host" (no_host_available). */
-export type WaitingReason = "slot" | "host";
+/** Which bounce a waiting launch is retrying: "slot" (capacity_exhausted),
+ *  "host" (no_host_available) or "closing" (home_in_use while the player's own
+ *  previous session is still `stopping`, #754). */
+export type WaitingReason = "slot" | "host" | "closing";
 
 export interface UseLaunchOptions {
   token: string | null;
   apps: readonly App[];
   /** The caller's live session, if any — resume beats launch (see quickLaunch). */
   liveSession: Session | null;
-  /** Whether this browser can decode h264 at all; without it, one-click has
-   *  nothing to offer and the band explains why. */
+  /** Whether this browser can decode h264 at all. Without it one-click opens the
+   *  band instead: the server's recommendation assumes H.264 always decodes. */
   canDecodeH264: boolean;
   /** Evaluates launch profiles for `app`; the detail band owns the state, so
    *  the result lands there as well as here. */
@@ -103,6 +111,8 @@ export function useLaunch({
   const [waitingForSlot, setWaitingForSlot] = useState(false);
   const [waitingReason, setWaitingReason] = useState<WaitingReason | null>(null);
   const [resolvingId, setResolvingId] = useState<string | null>(null);
+  // A launch holds the library heartbeat (SteamWarmHeartbeat.tsx).
+  useReportLaunching(launching);
 
   // #494's retry loop schedules a setTimeout outliving a single render; this
   // stops it touching state after navigation. Reset to true on every effect run
@@ -117,10 +127,14 @@ export function useLaunch({
   // POST /v1/sessions can still land server-side with nobody left waiting.
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const launchAbortRef = useRef<AbortController | null>(null);
+  // `launching` mirrored synchronously: two clicks in one turn both read the state as false.
+  const inFlightRef = useRef(false);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      // A launch abandoned mid-flight (success clears both refs before navigating).
+      if (launchAbortRef.current || retryTimeoutRef.current !== null) leaveLaunchFullscreen();
       if (retryTimeoutRef.current !== null) {
         clearTimeout(retryTimeoutRef.current);
         retryTimeoutRef.current = null;
@@ -131,7 +145,10 @@ export function useLaunch({
 
   const launchApp = useCallback(
     async (app: App, profileId?: string, streamCodec?: "h264" | "h265" | "av1") => {
-      if (!token || launching) return;
+      if (!token || launching || inFlightRef.current) return;
+      // #647: before the first await, while the click still counts.
+      enterLaunchFullscreen();
+      inFlightRef.current = true;
       setLaunching(true);
       setWaitingForSlot(false); // clear any stale copy from a previous attempt
       setWaitingReason(null);
@@ -153,6 +170,8 @@ export function useLaunch({
       // (tile, rail) with no detail panel open, and let the toast be replaced
       // if the reason changes mid-wait.
       let firstBounceAt: number | null = null;
+      let firstClosingAt: number | null = null;
+      let lastClosingName = "your previous game";
       let waitingToastId: string | null = null;
       let waitingToastReason: WaitingReason | null = null;
       const dismissWaitingToast = () => {
@@ -189,24 +208,60 @@ export function useLaunch({
           });
           return;
         } catch (err) {
+          // #754: home_in_use naming a `stopping` session ends by itself (Steam's
+          // cloud upload). The server never names a terminal holder, so one read
+          // here means it finished since the 409: retry. Once waiting, a failed
+          // lookup keeps waiting; any other answer is the ordinary refusal.
+          let closingName: string | null = null;
+          if (err instanceof ApiError && err.code === "home_in_use" && err.sessionId) {
+            const prev = await libraryApi
+              .getSession(token, err.sessionId)
+              .then((r) => r.session)
+              .catch(() => null);
+            if (!mountedRef.current) return;
+            const finished = prev?.state === "stopped" || prev?.state === "failed";
+            if (prev?.state === "stopping" || finished || (prev === null && firstClosingAt !== null)) {
+              if (prev) {
+                closingName = apps.find((a) => a.id === prev.app_id)?.name ?? "your previous game";
+              }
+              closingName ??= lastClosingName;
+              lastClosingName = closingName;
+            }
+          }
           if (
-            err instanceof ApiError &&
-            (err.code === "capacity_exhausted" || err.code === "no_host_available")
+            closingName !== null ||
+            (err instanceof ApiError && isCapacityRetryable(err))
           ) {
-            const reason: WaitingReason = err.code === "no_host_available" ? "host" : "slot";
+            const reason: WaitingReason =
+              closingName !== null
+                ? "closing"
+                : (err as ApiError).code === "no_host_available"
+                  ? "host"
+                  : "slot";
             const now = Date.now();
             // One anchor for the whole wait, even across a code flip: a
             // no_host_available bounce that turns into capacity_exhausted (or
-            // vice versa) must not reset the elapsed clock.
-            if (firstBounceAt === null) firstBounceAt = now;
-            const decision = decideCapacityRetry(
-              {
-                elapsedMs: now - firstBounceAt,
-                retryAfterSeconds: err.retryAfterSeconds,
-              },
-              reason === "host" ? MAX_NO_HOST_RETRY_WAIT_MS : undefined,
-              reason === "host" ? NO_HOST_RETRY_DELAY_MS : undefined,
-            );
+            // vice versa) must not reset the elapsed clock. The closing wait keeps
+            // its own so a stop that lands does not spend a following host wait.
+            let decision;
+            if (reason === "closing") {
+              if (firstClosingAt === null) firstClosingAt = now;
+              decision = decideCapacityRetry(
+                { elapsedMs: now - firstClosingAt },
+                MAX_CLOSING_RETRY_WAIT_MS,
+                CLOSING_RETRY_DELAY_MS,
+              );
+            } else {
+              if (firstBounceAt === null) firstBounceAt = now;
+              decision = decideCapacityRetry(
+                {
+                  elapsedMs: now - firstBounceAt,
+                  retryAfterSeconds: (err as ApiError).retryAfterSeconds,
+                },
+                reason === "host" ? MAX_NO_HOST_RETRY_WAIT_MS : undefined,
+                reason === "host" ? NO_HOST_RETRY_DELAY_MS : undefined,
+              );
+            }
             if (decision.kind === "retry") {
               if (!mountedRef.current) return;
               setWaitingForSlot(true);
@@ -221,7 +276,9 @@ export function useLaunch({
               if (waitingToastId === null) {
                 waitingToastId = addToast({
                   variant: "info",
-                  ...waitingToastCopy(reason, app.name, streamCodec),
+                  ...(closingName !== null
+                    ? closingToastCopy(closingName, app.name)
+                    : waitingToastCopy(reason as "slot" | "host", app.name, streamCodec)),
                 });
                 waitingToastReason = reason;
               }
@@ -233,7 +290,10 @@ export function useLaunch({
                 // abort only ever comes from the unmount cleanup), so the check
                 // right below returns before touching state.
               }
-              if (!mountedRef.current) return;
+              if (!mountedRef.current) {
+                dismissWaitingToast();
+                return;
+              }
               continue; // one more attempt, still inside the loop
             }
             // Gave up after the reason's own budget — fall through to the ordinary
@@ -242,23 +302,33 @@ export function useLaunch({
           dismissWaitingToast();
           launchAbortRef.current = null;
           if (!mountedRef.current) return;
-          if (err instanceof ApiError) {
-            const presented = presentLaunchError(apps, app, err.code, err.message, err.sessionId);
+          leaveLaunchFullscreen();
+          if (closingName !== null) {
+            // The previous session never finished stopping inside the budget.
+            addToast({ variant: "danger", ...closingGaveUpCopy(closingName) });
+          } else if (err instanceof ApiError) {
+            const presented = presentLaunchError(apps, app, err.code, err.message, err.sessionId, err.reason);
             addToast({
               variant: presented.variant,
               title: presented.title,
               body: presented.body,
-              duration: presented.sessionId ? 10000 : undefined,
+              duration: presented.sessionId || presented.openApp ? 10000 : undefined,
               action: presented.sessionId
                 ? {
                     label: "Go to session",
                     onClick: () => navigate(`/app/session/${presented.sessionId}`),
                   }
-                : undefined,
+                : presented.openApp
+                  ? {
+                      label: `Open ${presented.openApp.name}`,
+                      onClick: () => navigate(`/app/game/${presented.openApp!.id}`),
+                    }
+                  : undefined,
             });
           } else {
             addToast({ variant: "danger", title: "Launch failed", body: "Launch failed." });
           }
+          inFlightRef.current = false;
           setLaunching(false);
           setWaitingForSlot(false);
           setWaitingReason(null);
@@ -281,6 +351,7 @@ export function useLaunch({
       // home are `blockedFamilyIds` and must never resume into a different
       // app's session.
       if (liveSession && liveSession.app_id === app.id) {
+        enterLaunchFullscreen();
         navigate(`/app/session/${liveSession.id}`);
         return;
       }
@@ -289,10 +360,18 @@ export function useLaunch({
         revealDetail(app, false);
         return;
       }
+      // #647: the profile fetch below is an await; spend the click first.
+      enterLaunchFullscreen();
       setResolvingId(app.id);
       const data = await fetchProfiles(app);
+      // Left the page during the check: the click's full screen is not this launch's any more.
+      if (!mountedRef.current) {
+        leaveLaunchFullscreen();
+        return;
+      }
       setResolvingId(null);
       if (!data || !isRecommendationEligible(data)) {
+        leaveLaunchFullscreen();
         revealDetail(app, false);
         return;
       }

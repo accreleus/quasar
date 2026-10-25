@@ -189,8 +189,18 @@ func (c *Coordinator) stopInGrace(sessionID string) bool {
 	return ok && time.Since(at) < stopAckTimeout
 }
 
+// Swap also supersedes the owner's parked session when the target is outside
+// its Steam family (control-api.md §Warm Steam, "Non-Steam apps").
 func (c *Coordinator) Swap(ctx context.Context, sessionID, newAppID string) (Session, error) {
-	return c.swapper.Swap(ctx, sessionID, newAppID)
+	sess, err := c.swapper.Swap(ctx, sessionID, newAppID)
+	if err == nil {
+		keep := ""
+		if app, err := c.store.GetLaunchApp(ctx, newAppID); err == nil && app.SteamFamily {
+			keep = homeAppID(app)
+		}
+		c.supersedeParked(ctx, sess.UserID, keep, "")
+	}
+	return sess, err
 }
 
 func (c *Coordinator) EvaluateClientHealth(ctx context.Context, sessionID string, sample ClientHealthSample) {
@@ -370,6 +380,11 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 			// cpRunning. Explicit anyway -- falling through to a stop is the wrong
 			// default for a live session if that ever changes.
 			continue
+		case hs.State == StateStopped && c.store.adoptedByLive(ctx, sid):
+			// A claimed parked session: the agent lists it until the claim's start
+			// adopts it, and a stop now would cold-start the play session. Once the
+			// claim ends unadopted it is an orphan again.
+			continue
 		case hs.HostID != nil && *hs.HostID != hostID:
 			c.log.Warn("agent reports another host's session; stopping its copy",
 				"host_id", hostID, "session_id", sid)
@@ -448,18 +463,6 @@ const (
 	maxAuditReason      = 200
 )
 
-// truncateBytes cuts s to at most n BYTES (the CHECK counts bytes), stepping
-// back off a partial UTF-8 sequence so the result is still valid JSON text.
-func truncateBytes(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && s[n]&0xC0 == 0x80 {
-		n--
-	}
-	return s[:n]
-}
-
 // recordSessionFailed writes the one audit row with NO acting admin — a failure
 // is the instance's own event, which is what actor_user_id's nullability is for.
 //
@@ -480,13 +483,13 @@ func (c *Coordinator) recordSessionFailed(ctx context.Context, sess Session, sou
 		details["host_id"] = *sess.HostID
 	}
 	if sess.StateDetail != nil {
-		details["state_detail"] = truncateBytes(*sess.StateDetail, maxAuditStateDetail)
+		details["state_detail"] = audit.TruncateBytes(*sess.StateDetail, maxAuditStateDetail)
 	}
 	if failureCode != nil {
-		details["failure_code"] = truncateBytes(*failureCode, maxAuditStateDetail)
+		details["failure_code"] = audit.TruncateBytes(*failureCode, maxAuditStateDetail)
 	}
 	if reason != "" {
-		details["reason"] = truncateBytes(reason, maxAuditReason)
+		details["reason"] = audit.TruncateBytes(reason, maxAuditReason)
 	}
 	audit.TryRecord(ctx, c.auditor, "", "session.failed", "session", sess.ID, details)
 }

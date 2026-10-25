@@ -316,3 +316,28 @@ here because two of them were corrections of substance, not polish.
 Where it was not followed: item 7 only. Everything it claimed about this repository's code was
 re-read and confirmed before being acted on, and the one claim it could not check itself (the
 compositor's clear colour, which lives in the fork) was verified here.
+
+## 13. #289: the test picture replaces the flat field (2026-10-13)
+
+§1's limit ("a displaced block on a flat field is identical to the block it replaced") is
+closed. The probe turns on the compositor's `test-picture` property: a fixed 16x9 grid of four
+solid colours, drawn only while no client surface is mapped (gst-wayland-display,
+`comp/test_picture.rs`). What changed in this design:
+
+- **Reference (§2).** No absolute reference and no range rule. The encode paths do not share
+  one RGB to YUV matrix (the Vulkan converter is BT.601, `videoconvert` BT.709), so each plane
+  is scored against itself: a sample is off when it is further than `TOL_SAMPLE` from the
+  median of its own class, and a plane whose four class medians are not in the palette's order,
+  at least `MIN_GAP` (15) apart, is wholly off. The palette's smallest gap is 30 code values on
+  Y, Cb and Cr under BT.601 and BT.709, limited or full range, and the order is the same under
+  all four. Cb and Cr order differently, so swapped chroma planes fail.
+- **What is scored (§3).** The inner 80% of each cell on each axis. At 1280x720 a cell is 80x80,
+  on macroblock and chroma-sample boundaries, so its interior is still DC-predicted.
+- **Thresholds (§4).** `TOL_SAMPLE` 8, `OFF_FLOOR` 0.01, `SKIP_FRAMES` and `MIN_SCORED` are
+  unchanged. The verdict rules, the exit codes, the check id and its `blocks` are unchanged.
+- **Older compositor.** Without the property the pixel check is `NotRun`, so the run is
+  indeterminate, never a fail.
+
+Measured on the software path (llvmpipe compositor, `openh264enc`, 25 scored frames): healthy
+0.0003, two 64-column bands swapped on the way into the encoder 0.1097 (`y,u,v`). The hardware
+encoders and the ten-restart certification on both vendors are still owed.

@@ -42,7 +42,7 @@ pub mod platform;
 pub mod self_inspection;
 
 pub use client::{Operation, RuntimeClient, ENGINE_INSPECTION_BUDGET};
-pub use config::{RuntimeConfig, DOCKER_DEFAULT_SOCKET};
+pub use config::{RuntimeConfig, DOCKER_DEFAULT_SOCKET, LAUNCH_BUSY_BUDGET};
 pub use durable::{DurableFile, LeaseError, StateLease};
 pub use engine::{
     ApiVersion, CdiFacts, EngineFacts, EngineInfo, EngineKind, EngineMode, GpuInjection, API_FLOOR,

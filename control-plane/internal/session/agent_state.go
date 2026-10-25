@@ -14,9 +14,24 @@ import (
 // AgentSignalingFailure scopes a saturated agent-to-browser relay to its session.
 // Stop the remote runner best-effort, then fail the authoritative row so its GPU
 // reservation is released. A forged cross-host session id is ignored.
-func (c *Coordinator) AgentSignalingFailure(ctx context.Context, hostID, sessionID, reason string) {
+func (c *Coordinator) AgentSignalingFailure(ctx context.Context, hostID, sessionID string, bye bool, reason string) {
 	hs, err := c.store.GetSessionHostState(ctx, sessionID)
 	if err != nil || hs.HostID == nil || *hs.HostID != hostID || hs.State.IsTerminal() {
+		return
+	}
+	// Already ending, and its agent reports `stopped` itself: a stop or a fail here would
+	// end the row before the app has stopped (#753: a game exit's `bye` to a stuck socket).
+	if hs.State == StateStopping {
+		c.log.Info("signaling relay failed on a stopping session; frame dropped",
+			"session_id", sessionID, "reason", reason)
+		return
+	}
+	// A `bye` is the agent ending the session itself, and its report follows: a
+	// held game exit sends no `stopping` first (agent-api.md §session_state), so
+	// this row is still running.
+	if bye {
+		c.log.Info("signaling relay failed on the agent's bye; frame dropped",
+			"session_id", sessionID, "reason", reason)
 		return
 	}
 	cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sessionID, Reason: "signaling_relay_failed"}
@@ -36,6 +51,14 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		// ok
 	default:
 		c.log.Warn("ignoring unknown agent session state", "state", m.State, "session_id", m.SessionID)
+		return
+	}
+	// A held runtime still mounts the home, so this `stopped` is no cleanup
+	// proof (agent-api.md §session_state, runtime_held): it parks the runtime or
+	// releases it, and a release keeps the claim and holds until the agent's
+	// qualified `stopped` for the id, which takes the path below.
+	if to == StateStopped && m.RuntimeHeld {
+		c.endHeldRuntime(ctx, hostID, m)
 		return
 	}
 	cleared := 0
@@ -100,6 +123,13 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		return
 	}
 	c.log.Info("session state", "session_id", sess.ID, "state", sess.State)
+	if len(m.LaunchProgress) != 0 && sess.State == StateRunning && deref(sess.StateDetail) == appDetailBooting {
+		if progress, ok := validLaunchProgress(m.LaunchProgress); !ok {
+			c.log.Warn("invalid_launch_progress", "session_id", sess.ID)
+		} else if err := c.store.SetLaunchProgress(ctx, sess.ID, hostID, progress); err != nil {
+			c.log.Warn("launch progress write failed", "session_id", sess.ID, "err", err)
+		}
+	}
 	if sess.State == StateStopping {
 		// The agent's own teardown (idle timeout): without this it has no record
 		// and AgentHeartbeat would repeat an `error` stop over it at once.
@@ -130,38 +160,42 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 	}
 
 	if sess.State.IsTerminal() {
-		// reason_source is always "agent" here: every terminal transition reaching
-		// this function was agent-reported (§3.4). The line exists so an operator
-		// can grep for how and why a session ended, state_detail included.
-		c.log.Info("session ended",
-			"session_id", sess.ID,
-			"state", sess.State,
-			"state_detail", deref(sess.StateDetail),
-			"reason_source", "agent",
-		)
-		// No telemetry prune: terminal FREEZES telemetry for the post-mortem
-		// retention (internal/telemetry) and the janitor sweeps it.
-		//
-		// Drop every per-session in-memory map, or a normally-completed session
-		// leaks an entry in each.
-		c.health.forget(sess.ID)
-		c.display.forget(sess.ID)
-		c.swapper.forget(sess.ID) // #405: any orphaned pending swap
-		// #402: a headless session never registers a browser, so the relay's
-		// signaling buffer has no other eviction path.
-		c.forgetTerminalSession(sess.ID)
-		// Re-eval console auto-start now rather than at the next capacity report:
-		// a static display never produces one on its own.
-		c.fireConsoleReeval(sess.HostID, sess.ID)
-		// Stamp the home's last_used_at. Best-effort, a no-op for a non-managed app.
-		if c.homes != nil && sess.HostID != nil {
-			uid, aid, hid := sess.UserID, sess.AppID, *sess.HostID
-			go func() {
-				if err := c.homes.TouchUsed(context.Background(), uid, aid, hid); err != nil {
-					c.log.Warn("home touch failed", "session_id", sess.ID, "err", err)
-				}
-			}()
-		}
+		c.afterTerminal(sess, "agent")
+	}
+}
+
+// afterTerminal is the bookkeeping for an agent-reported terminal transition.
+func (c *Coordinator) afterTerminal(sess Session, reasonSource string) {
+	// Every caller is agent-reported (§3.4). The line exists so an operator can
+	// grep for how and why a session ended, state_detail included.
+	c.log.Info("session ended",
+		"session_id", sess.ID,
+		"state", sess.State,
+		"state_detail", deref(sess.StateDetail),
+		"reason_source", reasonSource,
+	)
+	// No telemetry prune: terminal FREEZES telemetry for the post-mortem
+	// retention (internal/telemetry) and the janitor sweeps it.
+	//
+	// Drop every per-session in-memory map, or a normally-completed session
+	// leaks an entry in each.
+	c.health.forget(sess.ID)
+	c.display.forget(sess.ID)
+	c.swapper.forget(sess.ID) // #405: any orphaned pending swap
+	// #402: a headless session never registers a browser, so the relay's
+	// signaling buffer has no other eviction path.
+	c.forgetTerminalSession(sess.ID)
+	// Re-eval console auto-start now rather than at the next capacity report:
+	// a static display never produces one on its own.
+	c.fireConsoleReeval(sess.HostID, sess.ID)
+	// Stamp the home's last_used_at. Best-effort, a no-op for a non-managed app.
+	if c.homes != nil && sess.HostID != nil {
+		uid, aid, hid := sess.UserID, sess.AppID, *sess.HostID
+		go func() {
+			if err := c.homes.TouchUsed(context.Background(), uid, aid, hid); err != nil {
+				c.log.Warn("home touch failed", "session_id", sess.ID, "err", err)
+			}
+		}()
 	}
 }
 

@@ -46,7 +46,7 @@ func (h *Handler) handlePostTraceEvents(w http.ResponseWriter, r *http.Request) 
 	// Ownership precedes everything, and the 404 must precede the 403: otherwise
 	// a non-owner can probe which session ids exist.
 	sess, err := h.store.Get(r.Context(), id)
-	if errors.Is(err, ErrNotFound) {
+	if errors.Is(err, ErrNotFound) || (err == nil && parkedHidden(user, sess, false)) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
 		return
 	}
@@ -150,7 +150,7 @@ func (h *Handler) handlePostTraceClock(w http.ResponseWriter, r *http.Request) {
 
 	// 404 before 403, as in handlePostTraceEvents.
 	sess, err := h.store.Get(r.Context(), id)
-	if errors.Is(err, ErrNotFound) {
+	if errors.Is(err, ErrNotFound) || (err == nil && parkedHidden(user, sess, false)) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
 		return
 	}

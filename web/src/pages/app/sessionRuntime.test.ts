@@ -1060,3 +1060,77 @@ describe("snapshot notification dedupe (#78)", () => {
     expect(h.runtime.getSnapshot().displayRefreshHz).toBe(59);
   });
 });
+
+describe("session sound", () => {
+  const audioEl = () => document.body.querySelector("audio");
+  let play: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  });
+  afterEach(() => play.mockRestore());
+
+  it("stays muted until the reveal releases it, then follows the runtime's life", () => {
+    const h = harness();
+    h.runtime.start();
+    h.transport.onAudioTrack?.({} as MediaStream);
+    // Steam's startup sound plays under the loading screen; it must not be heard.
+    expect(audioEl()?.muted).toBe(true);
+
+    h.runtime.releaseAudio();
+    expect(audioEl()?.muted).toBe(false);
+    // A muted autoplay the browser blocked is started again, not just unmuted.
+    expect(play).toHaveBeenCalled();
+
+    h.runtime.destroy();
+    expect(audioEl()).toBeNull();
+  });
+
+  it("holds the sound again under the quick-switch screen, and releases it after", () => {
+    const h = harness();
+    h.runtime.start();
+    h.transport.onAudioTrack?.({} as MediaStream);
+    h.runtime.releaseAudio();
+    expect(audioEl()?.muted).toBe(false);
+
+    h.runtime.holdAudio();
+    expect(audioEl()?.muted).toBe(true);
+    h.runtime.holdAudio(); // idempotent
+    expect(audioEl()?.muted).toBe(true);
+
+    h.runtime.releaseAudio();
+    expect(audioEl()?.muted).toBe(false);
+    h.runtime.destroy();
+  });
+
+  it("keeps a replaced audio track muted while held", () => {
+    const h = harness();
+    h.runtime.start();
+    h.runtime.releaseAudio();
+    h.runtime.holdAudio();
+    h.transport.onAudioTrack?.({} as MediaStream);
+    expect(document.body.querySelectorAll("audio")).toHaveLength(1);
+    expect(audioEl()?.muted).toBe(true);
+    h.runtime.releaseAudio();
+    expect(audioEl()?.muted).toBe(false);
+    h.runtime.destroy();
+  });
+
+  it("plays a track that arrives after the reveal at once", () => {
+    const h = harness();
+    h.runtime.start();
+    h.runtime.releaseAudio();
+    h.transport.onAudioTrack?.({} as MediaStream);
+    expect(audioEl()?.muted).toBe(false);
+    h.runtime.destroy();
+  });
+
+  it("replaces the element when the audio track arrives again", () => {
+    const h = harness();
+    h.runtime.start();
+    h.transport.onAudioTrack?.({} as MediaStream);
+    h.transport.onAudioTrack?.({} as MediaStream);
+    expect(document.body.querySelectorAll("audio")).toHaveLength(1);
+    h.runtime.destroy();
+    expect(audioEl()).toBeNull();
+  });
+});

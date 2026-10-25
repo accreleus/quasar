@@ -140,6 +140,12 @@ func (c *Coordinator) resolveHomeSpec(ctx context.Context, app LaunchApp, userID
 			return nil, err
 		}
 	}
+	if app.SteamFamily {
+		var err error
+		if spec, err = c.applySteamDialogs(ctx, spec, userID); err != nil {
+			return nil, err
+		}
+	}
 
 	if !app.ManagedHome {
 		return spec, nil

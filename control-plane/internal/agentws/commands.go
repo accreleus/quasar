@@ -33,6 +33,10 @@ type SessionAssignCmd struct {
 	// VideoTopology is the explicit output plan for this session. Older agents
 	// default an omitted value to stream_only.
 	VideoTopology string `json:"video_topology,omitempty"`
+	// Amendment 39 (#759): sent only on a connection that advertised
+	// parked_sessions_v1, which always gets Kind.
+	Kind           string `json:"kind,omitempty"`
+	AdoptSessionID string `json:"adopt_session_id,omitempty"`
 }
 
 // StreamSpec is the per-session pipeline parameterization (P1-5 StreamParams).
@@ -75,7 +79,7 @@ type SessionStopCmd struct {
 	Type      string `json:"type"` // "session_stop"
 	ID        string `json:"id"`
 	SessionID string `json:"session_id"`
-	Reason    string `json:"reason"` // user_requested|idle_timeout|host_draining|admin|error|entitlement_revoked
+	Reason    string `json:"reason"` // user_requested|idle_timeout|host_draining|admin|error|entitlement_revoked|parked_*
 }
 
 // SessionSwapAppCmd swaps a running session's source app behind its interpipe
@@ -87,6 +91,9 @@ type SessionSwapAppCmd struct {
 	ID        string          `json:"id"`
 	SessionID string          `json:"session_id"`
 	App       json.RawMessage `json:"app"`
+	// Amendment 39: switch games inside the running Steam. Only to a
+	// parked_sessions_v1 connection.
+	InPlace bool `json:"in_place,omitempty"`
 }
 
 // SessionDisplayUpdateCmd changes a running session's app-facing compositor
@@ -206,4 +213,8 @@ type SessionStateMsg struct {
 	// RawMessage isolates optional seed evidence from lifecycle decoding. A
 	// malformed seed field cannot drop an otherwise valid session_state.
 	HomeSeed json.RawMessage `json:"home_seed"`
+	// Amendment 39. The handler clears both unless the reporting connection
+	// advertised parked_sessions_v1. LaunchProgress is untrusted display input.
+	RuntimeHeld    bool            `json:"runtime_held"`
+	LaunchProgress json.RawMessage `json:"launch_progress"`
 }

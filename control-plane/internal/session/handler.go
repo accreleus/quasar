@@ -113,6 +113,7 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	mux.Handle("GET /v1/me/profiles", requireAuth(http.HandlerFunc(h.handleListProfiles)))
 	mux.Handle("GET /v1/me/profile-preferences", requireAuth(http.HandlerFunc(h.handleGetProfilePreferences)))
 	mux.Handle("PATCH /v1/me/profile-preferences", requireAuth(http.HandlerFunc(h.handlePatchProfilePreferences)))
+	mux.Handle("PUT /v1/me/steam-warm", requireAuth(http.HandlerFunc(h.handleSteamWarm)))
 
 	// Admin: GPU availability and the all-sessions view.
 	if len(requireAdmin) > 0 && requireAdmin[0] != nil {
@@ -229,6 +230,10 @@ type sessionResp struct {
 	// every other end. Semantics: control-api.md amendment 24.
 	StopReason *string         `json:"stop_reason"`
 	HomeSeed   json.RawMessage `json:"home_seed"`
+	// semantics: control-api.md §Warm Steam ("kind on the session read",
+	// "Shader progress"). Both always serialized.
+	Kind           string          `json:"kind"`
+	LaunchProgress json.RawMessage `json:"launch_progress"`
 	// The launch profile the session came from, null for a legacy/tier/override
 	// launch. Resolved values are in Stream; metadata at GET /v1/me/profiles.
 	ProfileID *string `json:"profile_id"`
@@ -345,6 +350,8 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		AppLogTail:      s.AppLogTail,
 		StopReason:      clientStopReason(s.State, s.StopReason),
 		HomeSeed:        s.HomeSeed,
+		Kind:            s.Kind,
+		LaunchProgress:  s.LaunchProgress,
 		ProfileID:       s.ProfileID,
 		StreamProfileID: s.StreamProfileID,
 		CodecDecision:   s.CodecDecision,
@@ -520,9 +527,7 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	// A codec-constrained refusal names the codec, and nothing else.
 	// semantics: control-api.md §Admission control
 	case errors.Is(err, ErrNoHostAvailable):
-		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
-			refusalMessage(err, "no host is available to serve this launch",
-				"no host has a GPU that can encode %s"))
+		writeNoHostAvailable(w, err)
 		return
 	// Names no check, scope, GPU or host: readiness detail is admin-only and
 	// lives on the host body. No Retry-After — an admin, not time, clears it.
@@ -535,7 +540,12 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		// prevention; never shorten it to make this header smaller), so a relaunch
 		// right after a peer's DELETE bounces here for the ~15 s that teardown
 		// takes. Retry-After lets a polling client wait rather than error (#494).
-		w.Header().Set("Retry-After", capacityExhaustedRetryAfterSeconds)
+		retryAfter := capacityExhaustedRetryAfterSeconds
+		var claim *ParkedClaimRefusedError
+		if errors.As(err, &claim) {
+			retryAfter = parkedClaimRetryAfterSeconds
+		}
+		w.Header().Set("Retry-After", retryAfter)
 		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted,
 			refusalMessage(err, "all capacity is in use; try again shortly",
 				"no free GPU can encode %s; try again shortly"))
@@ -560,10 +570,23 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSteamWarm is the library heartbeat. Once authenticated it always
+// answers 204 with no body; a body is ignored (control-api.md §Warm Steam).
+func (h *Handler) handleSteamWarm(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, httpx.CodeUnauthorized, "authentication required")
+		return
+	}
+	deviceID, _ := auth.TokenDeviceIDFromContext(r.Context())
+	h.coord.SteamWarmHeartbeat(r.Context(), user.ID, user.Role == auth.RoleAdmin, deviceID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	sess, err := h.store.Get(r.Context(), r.PathValue("id"))
-	if errors.Is(err, ErrNotFound) {
+	if errors.Is(err, ErrNotFound) || (err == nil && parkedHidden(user, sess, true)) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
 		return
 	}
@@ -583,7 +606,7 @@ func (h *Handler) handleSignalingToken(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	sess, err := h.store.Get(r.Context(), id)
 	// Owner only, never admin: a token attaches to the live stream and input (#496).
-	if errors.Is(err, ErrNotFound) || (err == nil && sess.UserID != user.ID) {
+	if errors.Is(err, ErrNotFound) || (err == nil && (sess.UserID != user.ID || parkedHidden(user, sess, false))) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
 		return
 	}
@@ -648,7 +671,7 @@ func (h *Handler) handleStop(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	sess, err := h.store.Get(r.Context(), id)
-	if errors.Is(err, ErrNotFound) {
+	if errors.Is(err, ErrNotFound) || (err == nil && parkedHidden(user, sess, true)) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
 		return
 	}
@@ -662,7 +685,7 @@ func (h *Handler) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wasTerminal := sess.State.IsTerminal()
-	sess, err = h.coord.Stop(r.Context(), id, "user_requested")
+	sess, err = h.coord.Stop(r.Context(), id, stopReasonUserRequested)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not stop session")
 		return
@@ -701,7 +724,7 @@ func (h *Handler) handleSwap(w http.ResponseWriter, r *http.Request) {
 	// Ownership: the session must exist and belong to the caller (or admin). The
 	// 403/404 precede the swap so a non-owner can't probe swappability.
 	sess, err := h.store.Get(r.Context(), id)
-	if errors.Is(err, ErrNotFound) {
+	if errors.Is(err, ErrNotFound) || (err == nil && parkedHidden(user, sess, false)) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
 		return
 	}
@@ -785,7 +808,7 @@ func (h *Handler) handleDisplayUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sess, err := h.store.Get(r.Context(), id)
-	if errors.Is(err, ErrNotFound) {
+	if errors.Is(err, ErrNotFound) || (err == nil && parkedHidden(user, sess, false)) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
 		return
 	}
@@ -853,6 +876,22 @@ func writeHomeInUse(w http.ResponseWriter, err error, message string) {
 	httpx.WriteJSON(w, http.StatusConflict, map[string]any{"error": body})
 }
 
+// writeNoHostAvailable emits the launch 503 no_host_available. A home on an
+// offline or gone host carries reason home_host_unavailable and its own message,
+// with or without a codec constraint: no codec would help, and only an admin
+// clears it. Every other refusal omits the reason.
+// semantics: control-api.md §Admission control (amendment 40)
+func writeNoHostAvailable(w http.ResponseWriter, err error) {
+	var off *HomeHostOfflineRejection
+	if errors.As(err, &off) {
+		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
+			httpx.ReasonHomeHostUnavailable, noHostMessage(err))
+		return
+	}
+	httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
+		refusalMessage(err, noHostMessage(err), "no host has a GPU that can encode %s"))
+}
+
 // homeInUseMessage keeps the live-session wording unless the session in the
 // way is already stopping (#434), when there is nothing to stop or go to: the
 // user only has to retry in a moment. The code and session_id are unchanged.
@@ -884,6 +923,12 @@ func writeParentDisabled(w http.ResponseWriter, err error) {
 		msg = fmt.Sprintf("this game is launched through %q, and that app is currently disabled — ask an operator to re-enable it", name)
 	}
 	httpx.WriteError(w, http.StatusConflict, httpx.CodeParentAppDisabled, msg)
+}
+
+// parkedHidden: a parked session answers 404 on every /v1/sessions/{id} route,
+// except an admin's GET and DELETE (adminRoute) (control-api.md §Warm Steam).
+func parkedHidden(u auth.User, s Session, adminRoute bool) bool {
+	return s.Kind == KindParked && !(adminRoute && u.Role == auth.RoleAdmin)
 }
 
 // canAccess: the owner or an admin may read/stop a session.

@@ -1,13 +1,19 @@
 package artwork
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"image"
+	"image/jpeg"
+	"image/png"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- fixtures ---------------------------------------------------------------
@@ -26,12 +32,15 @@ var onePixelPNG = []byte{
 	0x00, 0x00, 'I', 'E', 'N', 'D', 0xae, 0x42, 0x60, 0x82,
 }
 
-// onePixelJPEG is a real minimal JPEG (SOI + APP0/JFIF + EOI is enough for the
-// sniffer, which keys on the FFD8FF prefix).
-var onePixelJPEG = append([]byte{
-	0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00,
-	0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
-}, 0xff, 0xd9)
+// onePixelJPEG is a real 1x1 JPEG: the pixel check reads the frame header, so
+// a bare SOI/APP0/EOI that the sniffer accepts is no longer enough.
+var onePixelJPEG = func() []byte {
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, image.NewGray(image.Rect(0, 0, 1, 1)), nil); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}()
 
 func sha(data []byte) string {
 	sum := sha256.Sum256(data)
@@ -44,6 +53,7 @@ func newBlobs(t *testing.T) *BlobStore {
 	if err != nil {
 		t.Fatalf("NewBlobStore: %v", err)
 	}
+	b.log = slog.New(slog.DiscardHandler)
 	return b
 }
 
@@ -61,8 +71,8 @@ func TestPutIsContentAddressed(t *testing.T) {
 	if want := sha(onePixelPNG) + ".png"; name != want {
 		t.Fatalf("name: want %q, got %q", want, name)
 	}
-	if !b.Has(name) {
-		t.Fatal("Has: blob should exist after Put")
+	if ok, err := b.Has(name); !ok || err != nil {
+		t.Fatalf("Has: blob should exist after Put (err %v)", err)
 	}
 	data, ct, err := b.Open(name)
 	if err != nil {
@@ -177,8 +187,8 @@ func TestOpenRejectsTraversalAndJunk(t *testing.T) {
 		if _, _, err := b.Open(name); !errors.Is(err, ErrBadAsset) {
 			t.Errorf("Open(%q): want ErrBadAsset, got %v", name, err)
 		}
-		if b.Has(name) {
-			t.Errorf("Has(%q): want false", name)
+		if ok, err := b.Has(name); ok || err != nil {
+			t.Errorf("Has(%q): want false, nil; got %v, %v", name, ok, err)
 		}
 	}
 }
@@ -193,7 +203,93 @@ func TestOpenMissingBlob(t *testing.T) {
 	}
 }
 
+// Only a not-exist stat error means missing. A shard path that is a file makes
+// stat fail with ENOTDIR (also as root, unlike a chmod), which must come back
+// as an error, not as "missing".
+func TestHasReturnsAStatErrorThatIsNotNotExist(t *testing.T) {
+	b := newBlobs(t)
+	name := sha([]byte("x")) + ".png"
+	if err := os.WriteFile(filepath.Join(b.Root(), name[:2]), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := b.Has(name); ok || err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Has = %v, %v; want false and a non-not-exist error", ok, err)
+	}
+}
+
 // --- orphan pruning ---------------------------------------------------------
+
+// A kill between writeAtomic's create and its rename leaves a `.tmp-*` file
+// forever otherwise. A prune removes ones older than the window; a fresh one
+// is left alone, since its writer may still be running (and the rename will
+// turn it into a file the sweep keeps).
+func TestPruneOrphansSweepsStaleTempFiles(t *testing.T) {
+	b := newBlobs(t)
+	name, err := b.Put("image/png", onePixelPNG)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	shard := filepath.Join(b.Root(), name[:2])
+	stale := filepath.Join(shard, ".tmp-crashleft")
+	if err := os.WriteFile(stale, []byte("half-written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * tmpFileMaxAge)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	fresh := filepath.Join(shard, ".tmp-writenow")
+	if err := os.WriteFile(fresh, []byte("in flight"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.PruneOrphans(map[string]struct{}{name: {}}); err != nil {
+		t.Fatalf("PruneOrphans: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Error("a stale temp file survived the prune")
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("a fresh temp file was pruned: %v", err)
+	}
+}
+
+// An entry whose age cannot be read at all is left alone, like a fresh one:
+// this sweep deletes only what it is certain about. Removing the shard's
+// search permission lets the walk list its names but makes the lstat behind
+// d.Info() fail for every one of them. The file's mtime is made stale first,
+// so that surviving can only be down to the unreadable age, and as root the
+// permission means nothing: the case cannot be tested there.
+func TestPruneOrphansLeavesTempFilesItCannotDate(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads through the permission the test removes")
+	}
+	b := newBlobs(t)
+	shard := filepath.Join(b.Root(), "ab")
+	if err := os.MkdirAll(shard, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	left := filepath.Join(shard, ".tmp-crashleft")
+	if err := os.WriteFile(left, []byte("half-written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-2 * tmpFileMaxAge)
+	if err := os.Chtimes(left, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shard, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(shard, 0o700) }) // so the temp dir can go again
+	if _, err := b.PruneOrphans(nil); err != nil {
+		t.Fatalf("PruneOrphans: %v", err)
+	}
+	if err := os.Chmod(shard, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(left); err != nil {
+		t.Errorf("a temp file the prune could not date was removed: %v", err)
+	}
+}
 
 func TestPruneOrphans(t *testing.T) {
 	b := newBlobs(t)
@@ -218,10 +314,10 @@ func TestPruneOrphans(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("removed: want 1, got %d", n)
 	}
-	if !b.Has(keepName) {
+	if ok, _ := b.Has(keepName); !ok {
 		t.Error("referenced blob was deleted")
 	}
-	if b.Has(dropName) {
+	if ok, _ := b.Has(dropName); ok {
 		t.Error("orphan blob survived")
 	}
 	if _, err := os.Stat(foreign); err != nil {
@@ -246,5 +342,60 @@ func TestCopyLimited(t *testing.T) {
 func TestNewBlobStoreRejectsEmptyRoot(t *testing.T) {
 	if _, err := NewBlobStore("  "); err == nil {
 		t.Fatal("want an error for an empty root")
+	}
+}
+
+// --- #623: decoded-size limit -----------------------------------------------
+
+// A few KB of zeros compress to almost nothing, so this passes the byte cap
+// while declaring 25 MP — the shape of a decompression bomb.
+func TestPutRejectsImagesOverThePixelLimit(t *testing.T) {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewGray(image.Rect(0, 0, 5000, 5000))); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() > int(DefaultMaxImageBytes) {
+		t.Fatalf("fixture is %d bytes; it must fit the byte cap to prove the pixel cap", buf.Len())
+	}
+	b, _ := NewBlobStore(t.TempDir())
+	if _, err := b.Put("image/png", buf.Bytes()); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("want ErrInvalidRequest for a 25 MP PNG, got %v", err)
+	}
+}
+
+func TestPutRejectsAnUnreadableHeader(t *testing.T) {
+	b, _ := NewBlobStore(t.TempDir())
+	// Right magic, no header behind it.
+	if _, err := b.Put("image/png", onePixelPNG[:12]); !errors.Is(err, ErrUnsupportedType) {
+		t.Fatalf("want ErrUnsupportedType for a truncated PNG, got %v", err)
+	}
+}
+
+func TestWebPSize(t *testing.T) {
+	head := func(chunk string, body []byte) []byte {
+		d := append([]byte("RIFF\x00\x00\x00\x00WEBP"+chunk+"\x00\x00\x00\x00"), body...)
+		return append(d, make([]byte, 30)...)
+	}
+	vp8x := head("VP8X", append([]byte{0, 0, 0, 0}, 0x0f, 0x27, 0, 0xe7, 0x03, 0)) // 10000 x 1000
+	vp8l := head("VP8L", []byte{0x2f, 0x63, 0x00, 0x00, 0x00})                     // 100 x 1: 14-bit size-1 fields
+	vp8 := head("VP8 ", []byte{0, 0, 0, 0x9d, 0x01, 0x2a, 0x58, 0x02, 0x20, 0x03}) // 600 x 800
+	for name, c := range map[string]struct {
+		in   []byte
+		w, h int
+	}{
+		"vp8x":      {vp8x, 10000, 1000},
+		"vp8l":      {vp8l, 100, 1},
+		"vp8":       {vp8, 600, 800},
+		"short":     {[]byte("RIFF\x00\x00\x00\x00WEBPVP8X"), 0, 0},
+		"bad start": {head("VP8 ", []byte{0, 0, 0, 1, 2, 3, 0, 0, 0, 0}), 0, 0},
+	} {
+		if w, h := webpSize(c.in); w != c.w || h != c.h {
+			t.Errorf("%s: webpSize = %dx%d, want %dx%d", name, w, h, c.w, c.h)
+		}
+	}
+	b, _ := NewBlobStore(t.TempDir())
+	huge := head("VP8X", append([]byte{0, 0, 0, 0}, 0xff, 0xff, 0, 0xff, 0xff, 0)) // 65536 x 65536
+	if _, err := b.Put("image/webp", huge); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("want ErrInvalidRequest for a 4 GP WebP, got %v", err)
 	}
 }

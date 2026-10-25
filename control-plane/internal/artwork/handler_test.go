@@ -52,6 +52,31 @@ type fakeProvider struct {
 	searchErr     error
 	artErr        error
 	externalErr   error
+	// logoIcon maps "<source>:<ref>" (source "" for a provider ref) to a
+	// {logo, icon} URL pair; an absent key is a title with neither.
+	logoIcon      map[string][2]string
+	logoIconErr   error
+	logoIconCalls int
+	// onLogoIcon runs at the start of LogoIcon: a test lands an admin action in
+	// the middle of a sweep with it. Clear it inside to run once.
+	onLogoIcon func()
+	// onArt runs at the start of Art, and onExternal at the start of
+	// ArtByExternalRef: a test lands a competing artwork write between Resolve's
+	// initial Get and its save with these. Clear it inside to run once (#739).
+	onArt      func()
+	onExternal func()
+}
+
+func (f *fakeProvider) LogoIcon(_ context.Context, source, ref string) (string, string, error) {
+	f.logoIconCalls++
+	if f.onLogoIcon != nil {
+		f.onLogoIcon()
+	}
+	if f.logoIconErr != nil {
+		return "", "", f.logoIconErr
+	}
+	li := f.logoIcon[source+":"+ref]
+	return li[0], li[1], nil
 }
 
 func (f *fakeProvider) Name() string { return "fake" }
@@ -66,6 +91,9 @@ func (f *fakeProvider) Search(_ context.Context, query string) ([]Candidate, err
 
 func (f *fakeProvider) Art(_ context.Context, ref string) (Candidate, error) {
 	f.artCalls++
+	if f.onArt != nil {
+		f.onArt()
+	}
 	if f.artErr != nil {
 		return Candidate{}, f.artErr
 	}
@@ -78,6 +106,9 @@ func (f *fakeProvider) Art(_ context.Context, ref string) (Candidate, error) {
 
 func (f *fakeProvider) ArtByExternalRef(_ context.Context, source, id string) (Candidate, error) {
 	f.externalCalls++
+	if f.onExternal != nil {
+		f.onExternal()
+	}
 	if source != ExternalSourceSteam {
 		return Candidate{}, fmt.Errorf("%w: fake only knows steam", ErrUnsupportedExternalSource)
 	}

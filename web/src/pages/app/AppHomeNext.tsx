@@ -45,18 +45,28 @@ import {
 } from "./libraryGrid";
 import { useLibraryCatalog } from "./libraryCatalog";
 import { useLibrarySearch } from "./librarySearchContext";
+import { useNewDesign } from "../../settings/OverlayPreferencesContext";
+import { LetterIndex } from "./library/LetterIndex";
+import { sectioned, tileMeta } from "./library/LetterSections";
+import { LibraryToolbar } from "./library/LibraryToolbar";
+import { useOrganised } from "./library/useOrganised";
+import { useFuzzyFilter } from "./search/useFuzzy";
 import type { SessionSummary } from "./sessionSummary";
 import { DetailBand } from "./home/DetailBand";
 import { Hero } from "./home/Hero";
 import { FeaturedRail } from "./home/FeaturedRail";
 import { LibraryGrid } from "./home/LibraryGrid";
 import { LibraryTile } from "./home/LibraryTile";
+import { WindowedGrid } from "./home/WindowedGrid";
 import { groupBySource } from "./home/librarySources";
 import { LibraryStates, SessionSummaryCard, StopSessionModal } from "./home/panels";
 import { useDetailBand } from "./home/useDetailBand";
 import { useHomeKeys } from "./home/useHomeKeys";
 import { useLaunch } from "./home/useLaunch";
+import { FavouritesShelf, JumpBackShelf } from "./home/Shelves";
+import type { OpenBandState } from "./game/GamePage";
 import "../../styles/home.css";
+import "../../styles/library-new.css";
 
 type HomeView = "home" | "library";
 
@@ -73,7 +83,7 @@ export function AppHomeNext() {
   const navigate = useNavigate();
   const location = useLocation() as {
     pathname: string;
-    state: { sessionSummary?: SessionSummary } | null;
+    state: ({ sessionSummary?: SessionSummary } & OpenBandState) | null;
   };
   const summary = location.state?.sessionSummary;
   // Home vs Library is derived from the URL — see the header. `startsWith` so a
@@ -81,6 +91,12 @@ export function AppHomeNext() {
   const view: HomeView = location.pathname.startsWith("/app/library") ? "library" : "home";
   const { addToast } = useToast();
   const { query: search } = useLibrarySearch();
+  // The hooks below run in both designs (hooks cannot branch); only the new
+  // design reads their results.
+  const newDesign = useNewDesign();
+  const organised = useOrganised();
+  const fuzzyFilter = useFuzzyFilter();
+  const e01 = newDesign ? organised : null;
 
   // Catalogue, loading and error come from the layout's one read (see
   // ./libraryCatalog) — the command palette in the shell above renders the same
@@ -163,10 +179,17 @@ export function AppHomeNext() {
   }, [appsByName]);
 
   const sortedApps = useMemo(() => sortLibraryApps(appsByName), [appsByName]);
-  const filteredApps = useMemo(
-    () => filterLibraryApps(sortedApps, kindFilter, search),
-    [sortedApps, kindFilter, search],
+  // Kind + search, before the genre filter (the toolbar counts each genre over it).
+  const kindApps = useMemo(
+    () =>
+      newDesign
+        ? fuzzyFilter(filterLibraryApps(sortedApps, kindFilter, ""), search)
+        : filterLibraryApps(sortedApps, kindFilter, search),
+    [sortedApps, kindFilter, search, newDesign, fuzzyFilter],
   );
+  const arrange = e01?.arrange;
+  const metaFor = e01?.metaFor;
+  const filteredApps = useMemo(() => (arrange ? arrange(kindApps) : kindApps), [kindApps, arrange]);
 
   /** The grids currently on screen, in DOM order. Home view is one flat grid;
    *  Library view is one grid per source group. */
@@ -180,24 +203,33 @@ export function AppHomeNext() {
     token,
     visibleLists,
     onClearFilter: () => setKindFilter("all"),
+    viewKey: `${view}|${kindFilter}|${search}`,
     smoothScroll: !prefersReducedMotion(),
   });
+  // New design opens a game's page; the band stays for Classic layout.
+  const openGamePage = useCallback(
+    (app: App) => navigate(`/app/game/${app.id}`, { state: { from: "home" } }),
+    [navigate],
+  );
+  // A new search replaces the list under a viewport that may be scrolled far
+  // down it (a letter jump): bring the library head back so the results show.
+  // The grid keeps its A–Z order; the ranked order is the popover's.
+  const searched = useRef(search);
+  useEffect(() => {
+    if (searched.current === search) return;
+    searched.current = search;
+    const lib = newDesign ? gridsRef.current?.closest<HTMLElement>(".home-lib") : null;
+    if (lib && lib.getBoundingClientRect().top < 0) lib.scrollIntoView({ block: "start" });
+  }, [search, newDesign]);
   const launch = useLaunch({
     token,
     apps,
     liveSession,
     canDecodeH264: codecCaps.h264,
     fetchProfiles: detail.fetchProfiles,
-    revealDetail: detail.reveal,
+    revealDetail: newDesign ? openGamePage : detail.reveal,
   });
   const busy = launch.launching || launch.resolvingId !== null;
-
-  // Filtering or switching view closes any open band — its anchor row may no
-  // longer exist.
-  const resetBand = detail.reset;
-  useEffect(() => {
-    resetBand();
-  }, [kindFilter, search, view, resetBand]);
 
   // ── Featured rail ─────────────────────────────────────────────────────────
   // `highlights` arrives ranked and labelled; this is a join + copy layer
@@ -321,9 +353,23 @@ export function AppHomeNext() {
     onCloseBand: closeDetail,
     onLaunch: launchFromKey,
     onResume: resumeFromKey,
+    onFavourite: newDesign ? toggleFavourite : undefined,
   });
 
   const openApp = openId ? appById.get(openId) ?? null : null;
+
+  // A game-page URL under Classic layout lands here asking for that game's band;
+  // if the switch has flipped back meanwhile, the page gets the URL back.
+  const wantedId = location.state?.openApp;
+  const wanted = wantedId ? appById.get(wantedId) : undefined;
+  const { reveal } = detail;
+  useEffect(() => {
+    if (wantedId && newDesign) navigate(`/app/game/${wantedId}`, { replace: true, state: { from: "home" } });
+    else if (wanted) {
+      reveal(wanted, false);
+      navigate("/app", { replace: true, state: null });
+    }
+  }, [wantedId, wanted, newDesign, reveal, navigate]);
 
   const renderDetail = useCallback(
     (app: App): ReactNode =>
@@ -377,9 +423,12 @@ export function AppHomeNext() {
   );
 
   const renderGrid = useCallback(
-    (list: App[], key: string) => (
-      <div className="lib-grid" key={key}>
-        {list.map((app) => (
+    (list: readonly App[], key: string) => (
+      <WindowedGrid
+        key={key}
+        list={list}
+        pinIds={[openId, detail.insertAfterId]}
+        tile={(app) => (
           <LibraryTile
             key={app.id}
             app={app}
@@ -390,12 +439,15 @@ export function AppHomeNext() {
             isBusy={busy}
             coverClass={coverClassById.get(app.id) ?? coverClassAt(0)}
             tileRef={detail.setTileRef(app.id)}
-            onOpen={() => detail.open(app, list)}
+            onOpen={() => (newDesign ? openGamePage(app) : detail.open(app, list))}
             onPlay={() => void quickLaunch(app)}
             detail={renderDetail(app)}
+            meta={metaFor && tileMeta(metaFor, app)}
+            opensPage={newDesign}
+            onFavourite={newDesign ? () => void toggleFavourite(app) : undefined}
           />
-        ))}
-      </div>
+        )}
+      />
     ),
     [
       liveSession,
@@ -407,8 +459,22 @@ export function AppHomeNext() {
       detail,
       quickLaunch,
       renderDetail,
+      metaFor,
+      newDesign,
+      openGamePage,
+      toggleFavourite,
     ],
   );
+
+  const shelfTile = {
+    busy,
+    liveAppId: liveSession?.app_id ?? null,
+    blockedIds,
+    blockedByName,
+    coverClass: (a: App) => coverClassById.get(a.id) ?? coverClassAt(0),
+    onOpen: openGamePage,
+    onPlay: (a: App) => void quickLaunch(a),
+  };
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -434,7 +500,7 @@ export function AppHomeNext() {
                 coverClassById={coverClassById}
                 busy={busy}
                 blockedIds={blockedIds}
-                onOpen={(app) => detail.reveal(app, false)}
+                onOpen={(app) => (newDesign ? openGamePage(app) : detail.reveal(app, false))}
                 onPlay={(card, app) => {
                   if (card.sessionId) navigate(`/app/session/${card.sessionId}`);
                   else void quickLaunch(app);
@@ -442,6 +508,13 @@ export function AppHomeNext() {
               />
             )}
           </Hero>
+        )}
+
+        {newDesign && view === "home" && !error && (
+          <>
+            <JumpBackShelf apps={apps} tile={shelfTile} />
+            <FavouritesShelf apps={filterLibraryApps(sortedApps, "favourite", "")} tile={shelfTile} />
+          </>
         )}
 
         <LibraryGrid
@@ -460,8 +533,10 @@ export function AppHomeNext() {
           }
           groups={view === "library" ? sourceGroups : null}
           apps={filteredApps}
-          renderGrid={renderGrid}
+          renderGrid={e01 ? sectioned(e01.sort, filteredApps.length, renderGrid) : renderGrid}
           gridsRef={gridsRef}
+          headExtra={e01 && !error && <LibraryToolbar o={e01} apps={kindApps} />}
+          index={e01 && !error && <LetterIndex o={e01} apps={filteredApps} />}
         >
           <LibraryStates
             loading={loading}

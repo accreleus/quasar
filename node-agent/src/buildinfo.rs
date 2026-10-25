@@ -150,6 +150,13 @@ pub use quasar_runtime::owned_install::AGENT_SOCKET_ENV as RECOVERY_SOCKET_ENV;
 /// Well inside the actor's own status deadline plus one engine round trip.
 const ACTOR_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// How long the work before `register` waits for the recovery actor, in all. A dark actor
+/// never holds the dial: the agent registers without it and the readiness refresh reports
+/// it once it answers ([`owned_identity_changed`]). Clearly above the actor's own engine
+/// deadline (`STATUS_ENGINE_DEADLINE` in `quasar-recovery`, 3 s), so a healthy actor with a
+/// slow engine still answers inside it.
+pub const ACTOR_REGISTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The part of the actor's `GET /v1/status` answer the agent reads; everything else is
 /// ignored, since the actor moves first and may be a release ahead
 /// (`testdata/recovery/socket/README.md`).
@@ -189,24 +196,42 @@ pub fn actor_version_shape(v: &str) -> bool {
     RE.is_match(v)
 }
 
-/// This host's install facts: the recovery actor's answer on an owned install (the
-/// actor put [`RECOVERY_SOCKET_ENV`] in this container's environment), else what the
-/// agent's own container image says, with no recovery actor.
-pub fn discover(runtime: &ContainerRuntime) -> InstallFacts {
-    let mut facts = discover_install_mode(runtime);
-    facts.engine = EngineIdentity::observe();
-    facts
+/// This host's install facts: the recovery actor's answer on an owned install (`socket`,
+/// which the actor put in this container's environment as [`RECOVERY_SOCKET_ENV`]), waiting
+/// at most `actor_timeout` for it, else what the agent's own container image says, with
+/// no recovery actor.
+pub fn discover(
+    runtime: &ContainerRuntime,
+    socket: Option<&std::path::Path>,
+    actor_timeout: std::time::Duration,
+) -> InstallFacts {
+    discover_observed(runtime, socket, actor_timeout).0
 }
 
-fn discover_install_mode(runtime: &ContainerRuntime) -> InstallFacts {
-    match std::env::var(RECOVERY_SOCKET_ENV)
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-    {
-        Some(socket) => discover_owned(std::path::Path::new(&socket)),
+/// [`discover`], plus whether the recovery actor's own read missed (`false` with no
+/// actor): the facts may still carry an older answer of its in place of that read.
+pub fn discover_observed(
+    runtime: &ContainerRuntime,
+    socket: Option<&std::path::Path>,
+    actor_timeout: std::time::Duration,
+) -> (InstallFacts, bool) {
+    let mut actor_missed = false;
+    let mut facts = match socket {
+        Some(socket) => {
+            let (read, _) = observe_owned_within(socket, actor_timeout);
+            actor_missed = read.updater_present != Some(true);
+            // A register read that missed must not be less informed than the refresh that
+            // corrects it only because it waited less: that refresh would find the
+            // registered facts different on every dial and re-dial for ever.
+            match last_answer() {
+                Some(seen) if actor_missed => seen,
+                _ => read,
+            }
+        }
         None => discover_install(&DockerFacts::new(runtime)),
-    }
+    };
+    facts.engine = EngineIdentity::observe();
+    (facts, actor_missed)
 }
 
 /// An owned install asks its recovery actor over the agent socket. `updater_present` is
@@ -220,14 +245,20 @@ pub fn discover_owned(socket: &std::path::Path) -> InstallFacts {
 pub fn observe_owned(
     socket: &std::path::Path,
 ) -> (InstallFacts, crate::readiness::owner_conflict::Observed) {
+    observe_owned_within(socket, ACTOR_STATUS_TIMEOUT)
+}
+
+fn observe_owned_within(
+    socket: &std::path::Path,
+    timeout: std::time::Duration,
+) -> (InstallFacts, crate::readiness::owner_conflict::Observed) {
     let mut conflicts = None;
     let mut out = InstallFacts {
         install_mode: Some(InstallMode::Owned),
         updater_present: Some(false),
         ..Default::default()
     };
-    let answer =
-        crate::release::unix_http::request(socket, "GET", "/v1/status", None, ACTOR_STATUS_TIMEOUT);
+    let answer = crate::release::unix_http::request(socket, "GET", "/v1/status", None, timeout);
     match answer {
         Ok(reply) if reply.status == 200 => match serde_json::from_str::<ActorStatus>(&reply.body)
         {
@@ -273,16 +304,43 @@ pub fn owned_socket() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// The last owned-install facts a readiness refresh read, and how many refreshes in a row
-/// read them.
-static OBSERVED: std::sync::Mutex<Option<(InstallFacts, u32)>> = std::sync::Mutex::new(None);
+/// The last owned-install facts a readiness refresh read, how many refreshes in a row read
+/// them, and when the latest of those reads happened.
+static OBSERVED: std::sync::Mutex<Option<(InstallFacts, u32, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
 
-/// Records what a refresh read from the recovery actor.
+/// What the last readiness refresh read, when the actor answered it and that was no longer
+/// ago than one refresh interval. Older, the process cannot say the actor is still there:
+/// the refresh stops with the connection, and a reconnect would otherwise register a dead or
+/// replaced actor as present at its old version and commit.
+fn last_answer() -> Option<InstallFacts> {
+    last_answer_at(std::time::Instant::now())
+}
+
+fn last_answer_at(now: std::time::Instant) -> Option<InstallFacts> {
+    let slot = OBSERVED.lock().ok()?;
+    let (seen, _, at) = slot.as_ref()?;
+    (seen.updater_present == Some(true)
+        && now.saturating_duration_since(*at) < crate::agent::READINESS_REFRESH_INTERVAL)
+        .then(|| seen.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn forget_observed() {
+    *OBSERVED.lock().unwrap() = None;
+}
+
+/// Records what a refresh read from the recovery actor. A run of equal reads keeps the
+/// first one's facts and counts up; every read stamps the time.
 pub fn note_observed(facts: &InstallFacts) {
+    note_observed_at(facts, std::time::Instant::now());
+}
+
+fn note_observed_at(facts: &InstallFacts, at: std::time::Instant) {
     if let Ok(mut slot) = OBSERVED.lock() {
         *slot = match slot.take() {
-            Some((last, n)) if !actor_identity_differs(&last, facts) => Some((last, n + 1)),
-            _ => Some((facts.clone(), 1)),
+            Some((last, n, _)) if !actor_identity_differs(&last, facts) => Some((last, n + 1, at)),
+            _ => Some((facts.clone(), 1, at)),
         };
     }
 }
@@ -301,7 +359,7 @@ pub fn owned_identity_changed() -> bool {
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
-        .is_some_and(|(seen, n)| n >= 2 && actor_identity_differs(&seen, &registered))
+        .is_some_and(|(seen, n, _)| n >= 2 && actor_identity_differs(&seen, &registered))
 }
 
 /// Whether the recovery actor's part of two install observations differs: the fields a
@@ -428,6 +486,12 @@ pub fn discover_install(facts: &dyn ContainerFacts) -> InstallFacts {
 /// as "nothing discovered", the correct answer for the standalone session
 /// subcommands that never register.
 static INSTALL_FACTS: std::sync::RwLock<Option<InstallFacts>> = std::sync::RwLock::new(None);
+
+/// Held by every test that writes [`INSTALL_FACTS`] and then reads it back, so two
+/// such tests never interleave.
+#[cfg(test)]
+pub(crate) static INSTALL_FACTS_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Record this process's discovered install facts, replacing any earlier answer.
 pub fn set_install_facts(facts: InstallFacts) {
@@ -723,6 +787,134 @@ mod tests {
         let fixture: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         fixture["body"].to_string()
+    }
+
+    /// A paused actor accepts the connection and never answers: discovery gives up at its
+    /// budget, as an owned install whose actor does not answer, and the actor's answer
+    /// reaching the control plane later is `owned_identity_changed` (two refreshes in a row).
+    #[test]
+    fn a_dark_actor_costs_discovery_its_budget_and_is_reported_when_it_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dark.sock");
+        let _dark = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let started = std::time::Instant::now();
+        let (registered, _) = observe_owned_within(&socket, std::time::Duration::from_millis(300));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(registered.install_mode, Some(InstallMode::Owned));
+        assert_eq!(registered.updater_present, Some(false));
+
+        let _facts = INSTALL_FACTS_TEST_LOCK.blocking_lock();
+        forget_observed();
+        set_install_facts(registered);
+        let (_d, answering) = actor_answering(200, socket_fixture("status-gpu-host-applying.json"));
+        let (seen, _) = observe_owned(&answering);
+        note_observed(&seen);
+        assert!(!owned_identity_changed(), "one answer is not yet a change");
+        note_observed(&seen);
+        assert!(owned_identity_changed());
+    }
+
+    /// An actor that answers after the register budget but inside the refresh's wait: the
+    /// first dial registers it absent, the refresh sees it twice and the agent re-dials
+    /// once; that dial carries what the refresh saw, so nothing differs and it stays put.
+    #[test]
+    fn an_actor_slower_than_the_register_budget_costs_one_redial_not_a_loop() {
+        use std::io::{Read, Write};
+        let _facts = INSTALL_FACTS_TEST_LOCK.blocking_lock();
+        forget_observed();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slow.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let body = socket_fixture("status-gpu-host-applying.json");
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && conn.read(&mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let budget = std::time::Duration::from_millis(100);
+        let runtime = ContainerRuntime::from_env();
+
+        set_install_facts(discover(&runtime, Some(&socket), budget));
+        assert_eq!(install_facts().updater_present, Some(false));
+        for _ in 0..2 {
+            note_observed(&observe_owned(&socket).0);
+        }
+        assert!(
+            owned_identity_changed(),
+            "the refresh sees what register missed"
+        );
+
+        set_install_facts(discover(&runtime, Some(&socket), budget));
+        assert_eq!(install_facts().updater_present, Some(true));
+        assert!(
+            !owned_identity_changed(),
+            "the re-dial registers what the refresh saw, so it is not a change again"
+        );
+        forget_observed();
+    }
+
+    /// A reconnect of a long-lived process must not register an actor nobody has seen lately.
+    #[test]
+    fn an_observation_older_than_a_refresh_interval_is_not_reused() {
+        use crate::agent::READINESS_REFRESH_INTERVAL as INTERVAL;
+        let second = std::time::Duration::from_secs(1);
+        let _facts = INSTALL_FACTS_TEST_LOCK.blocking_lock();
+        forget_observed();
+        let (_d, answering) = actor_answering(200, socket_fixture("status-gpu-host-applying.json"));
+        let (seen, _) = observe_owned(&answering);
+
+        let t0 = std::time::Instant::now();
+        note_observed_at(&seen, t0);
+        assert_eq!(last_answer_at(t0 + second), Some(seen.clone()));
+        assert_eq!(last_answer_at(t0 + INTERVAL + second), None);
+
+        // A matching streak keeps its first facts and count, and every read re-stamps.
+        note_observed_at(&seen, t0 + INTERVAL);
+        assert_eq!(last_answer_at(t0 + INTERVAL + second), Some(seen.clone()));
+        assert_eq!(last_answer_at(t0 + INTERVAL * 2 + second), None);
+        assert!(OBSERVED.lock().unwrap().as_ref().is_some_and(|o| o.1 == 2));
+
+        // The same through `discover`: an actor that misses its dial is registered absent
+        // once the snapshot has aged out, and as the snapshot while it is fresh.
+        let dir = tempfile::tempdir().unwrap();
+        let dark = dir.path().join("gone.sock");
+        let runtime = ContainerRuntime::from_env();
+        let budget = std::time::Duration::from_millis(100);
+        forget_observed();
+        note_observed(&seen);
+        assert_eq!(
+            discover(&runtime, Some(&dark), budget).updater_present,
+            Some(true)
+        );
+        // The facts carry the fresh observation, but this read missed and says so.
+        let (facts, missed) = discover_observed(&runtime, Some(&dark), budget);
+        assert_eq!(facts.updater_present, Some(true));
+        assert!(missed, "a dark actor is dark whatever the fallback holds");
+        let (_, missed) = discover_observed(&runtime, Some(&answering), budget);
+        assert!(!missed);
+        forget_observed();
+        let old = std::time::Instant::now()
+            .checked_sub(INTERVAL + second)
+            .expect("the monotonic clock is older than a refresh interval");
+        note_observed_at(&seen, old);
+        let registered = discover(&runtime, Some(&dark), budget);
+        assert_eq!(registered.updater_present, Some(false));
+        assert_eq!(registered.recovery_actor_source_commit, None);
+        forget_observed();
     }
 
     #[test]

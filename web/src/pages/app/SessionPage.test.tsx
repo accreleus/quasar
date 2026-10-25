@@ -17,7 +17,7 @@
 //      all (fail-open rule 1 — an older agent, or no app container)
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionPage, parseTierSize } from "./SessionPage";
 import { ApiError } from "../../api/client";
@@ -112,6 +112,8 @@ let lastOnChannel: ((ch: { readyState: string; onclose: (() => void) | null }) =
 /** The runtime's recovery sink, same capture: a test plays the transport's
  *  verdict (e.g. the 4404 close) without a WebSocket. */
 let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
+/** The last transport, so a test can hand the runtime an audio track. */
+let lastTransport: { onAudioTrack: unknown } | null = null;
 vi.mock("../../webrtc/session", () => ({
   QuasarSession: class {
     videoReceiver = null;
@@ -128,6 +130,7 @@ vi.mock("../../webrtc/session", () => ({
     ) {
       lastOnChannel = onChannel;
       lastOnRecovery = onRecoveryState ?? null;
+      lastTransport = this;
     }
     close() {}
     // As QuasarSession does: abandoning the reconnect terminalises recovery.
@@ -151,12 +154,19 @@ vi.mock("../../webrtc/session", () => ({
   },
 }));
 
+/** The page's callback for the swap screen going up or down, so a test can play the controller. */
+let lastScreenChange: ((up: boolean) => void) | undefined;
 vi.mock("./SessionSwapController", () => ({
   SessionSwapController: ({
     children,
+    onScreenChange,
   }: {
     children: (p: { quickSwitch: null; swappingTo: null }) => React.ReactNode;
-  }) => children({ quickSwitch: null, swappingTo: null }),
+    onScreenChange?: (up: boolean) => void;
+  }) => {
+    lastScreenChange = onScreenChange;
+    return children({ quickSwitch: null, swappingTo: null });
+  },
 }));
 // Captures the HUD's props so the display-PATCH debounce/revert can be driven
 // through the real handlers without rendering the HUD (its own rendering is
@@ -830,6 +840,66 @@ describe("SessionPage — #484 app-boot loader gate", () => {
     await waitFor(() => expect(document.querySelector(".sl-root")).toBeNull());
   });
 
+  it("keeps the session's sound muted until the loader turns see-through", async () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    const audio = () => document.body.querySelector("audio");
+    // As intoTheReveal below: the app has presented, so the channel opening starts the reveal.
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      (lastTransport?.onAudioTrack as (s: MediaStream) => void)({} as MediaStream);
+    });
+    // Steam's startup sound plays under the loader; the player must not hear it.
+    expect(audio()?.muted).toBe(true);
+
+    await act(async () => {
+      openChannel();
+    });
+    // The reveal has begun, but the loader's lock animation is opaque until LOCK_TO_STREAM_MS
+    // (1180 ms). Checked at 300 ms: the suite's clock also moves with real time.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    expect(audio()?.muted).toBe(true);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(audio()?.muted).toBe(false);
+    play.mockRestore();
+  });
+
+  it("holds the sound under the quick-switch screen and releases it when the screen clears", async () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    const audio = () => document.body.querySelector("audio");
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      (lastTransport?.onAudioTrack as (s: MediaStream) => void)({} as MediaStream);
+    });
+    await act(async () => {
+      openChannel();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(audio()?.muted).toBe(false); // revealed, sound on
+
+    await act(async () => lastScreenChange?.(true));
+    expect(audio()?.muted).toBe(true);
+
+    await act(async () => lastScreenChange?.(false));
+    expect(audio()?.muted).toBe(false);
+    play.mockRestore();
+  });
+
   it("unmounts on the reveal-cap timer when 'app presented' never arrives", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     currentSession = makeSession({ state: "running", state_detail: "app booting" });
@@ -914,6 +984,10 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
         message: "signaling: session not found or already ended",
       });
       await vi.advanceTimersByTimeAsync(100);
+    });
+    // #748: the recovery banner is held 500 ms; the grace timer starts once the state renders.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
     });
   }
 
@@ -1083,6 +1157,56 @@ describe("SessionPage — a session the control plane stopped (#516)", () => {
     await settleTheReveal();
     expect(document.querySelector(".sl-root")).toBeNull();
     expect(alerts()).toEqual([expect.stringContaining("This session moved to another tab")]);
+  });
+});
+
+describe("SessionPage — a new session id is a new page (#560)", () => {
+  // "Go to session" on a refused-launch toast moves the mounted page from one
+  // session to another without unmounting it; the first session's verdict and
+  // loader latches must not follow.
+  function GoToSecond() {
+    const navigate = useNavigate();
+    return <button onClick={() => navigate("/app/session/s2", { state: { signalingUrl: "wss://host/v1/signal", signalingToken: "tok" } })}>go</button>;
+  }
+
+  it("shows the launch loader and holds no earlier verdict after the id changes", async () => {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    render(
+      <MemoryRouter initialEntries={[{ pathname: "/app/session/s1", state: { signalingUrl: "wss://host/v1/signal", signalingToken: "tok" } }]}>
+        <ThemeProvider>
+          <ToastProvider>
+            <GoToSecond />
+            <Routes>
+              <Route path="/app/session/:id" element={<SessionPage />} />
+            </Routes>
+          </ToastProvider>
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      openChannel();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    await act(async () => {
+      lastOnRecovery?.({ phase: "superseded", attempt: 0, maxAttempts: 3, message: "opened in another tab" });
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(document.querySelector(".sl-root")).toBeNull();
+    expect(screen.getByText("This session moved to another tab")).not.toBeNull();
+
+    currentSession = makeSession({ id: "s2" });
+    await act(async () => {
+      fireEvent.click(screen.getByText("go"));
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    expect(document.querySelector(".sl-root")).not.toBeNull();
+    expect(screen.queryByText("This session moved to another tab")).toBeNull();
   });
 });
 

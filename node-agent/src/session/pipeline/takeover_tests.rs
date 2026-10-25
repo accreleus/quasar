@@ -6,7 +6,7 @@
 //! carries it: host frames reach only the attached peer. What a browser adds (an SCTP
 //! abort when the page goes) is `scripts/harness/run-takeover-peers.sh`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use super::{
 };
 use crate::session::metrics::SessionMetrics;
 use crate::session::runner::{DiagnosticEventTx, SessionEvent, SessionTransports};
-use crate::session::signaling::{PcId, SignalMsg};
+use crate::session::signaling::{PcId, SignalMsg, TAKEOVER_ABANDONED, TAKEOVER_RATE_LIMITED};
 use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 
 /// The dev/runtime image has libnice, gst-interpipe and openh264; the devtools image
@@ -28,7 +28,7 @@ use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 /// that returns early counts as passed, so the skip is written past libtest's capture,
 /// once, and `scripts/verify/agent.sh` restates it. With `QUASAR_REQUIRE_LIVE_WEBRTC`
 /// set the skip is a failure (#571).
-fn live_webrtc_available() -> bool {
+pub(crate) fn live_webrtc_available() -> bool {
     gst::init().unwrap();
     let missing: Vec<&str> = [
         "interpipesink",
@@ -106,10 +106,14 @@ struct Host {
     replaced: Vec<PcId>,
     /// Every offer the host sent and every answer it was handed, in order.
     wire: Vec<(&'static str, PcId, String)>,
+    /// The longest the runner's inbound dispatch took over one message.
+    slowest_inbound: Duration,
     /// Rewrites an answer before the host sees it.
     munge_answer: Option<fn(String) -> String>,
     sig_tx: OutTx,
     sig_rx: mpsc::UnboundedReceiver<SignalMsg>,
+    /// Every `error` the host sent the client, in order.
+    errors: Vec<SignalMsg>,
     bus: gst::Bus,
     /// Every error the encode bus posted, message and debug text joined.
     bus_errors: Vec<String>,
@@ -137,6 +141,7 @@ impl Host {
     }
 
     fn start_cfg(tag: &str, mut cfg: SessionConfig) -> Host {
+        trace_to_stderr();
         let resolved = resolve_effective_encoder(&mut cfg).expect("resolve encoder");
         let sink = format!("takeover-{tag}-{}", std::process::id());
         let source = build_source_pipeline(&cfg, None, &sink).expect("source pipeline");
@@ -221,9 +226,11 @@ impl Host {
             transports,
             replaced: Vec::new(),
             wire: Vec::new(),
+            slowest_inbound: Duration::ZERO,
             munge_answer: None,
             sig_tx,
             sig_rx,
+            errors: Vec::new(),
             bus,
             bus_errors: Vec::new(),
             encoder,
@@ -249,10 +256,12 @@ impl Host {
             self.wire
                 .push(("answer", pc.unwrap_or_default(), sdp.clone()));
         }
+        let started = Instant::now();
         let replaced = self
             .transports
             .inbound(msg, &self.sig_tx, None, None)
             .expect("replace the video transport");
+        self.slowest_inbound = self.slowest_inbound.max(started.elapsed());
         self.replaced.extend(replaced);
     }
 
@@ -358,14 +367,14 @@ struct Certificate {
 impl Certificate {
     fn mint() -> Certificate {
         use sha2::Digest;
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["peer".to_string()]).expect("certificate");
         let digest: Vec<String> = sha2::Sha256::digest(cert.der())
             .iter()
             .map(|byte| format!("{byte:02X}"))
             .collect();
         Certificate {
-            pem: cert.pem() + &key_pair.serialize_pem(),
+            pem: cert.pem() + &signing_key.serialize_pem(),
             fingerprint: format!("sha-256 {}", digest.join(":")),
         }
     }
@@ -515,6 +524,49 @@ impl PeerPc {
     fn stop(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+
+    /// Replace this PC's next outbound SCTP packet with an ABORT, as a browser's `pc.close()`
+    /// sends one (a webrtcbin peer going to NULL sends nothing), and ping so one goes out.
+    /// True once it has.
+    fn abort_sctp(&self) -> Arc<AtomicBool> {
+        let sent = Arc::new(AtomicBool::new(false));
+        let enc = self
+            .webrtc
+            .downcast_ref::<gst::Bin>()
+            .unwrap()
+            .iterate_recurse()
+            .into_iter()
+            .flatten()
+            .find(|e| e.factory().is_some_and(|f| f.name() == "sctpenc"))
+            .expect("the peer has an SCTP association");
+        let done = sent.clone();
+        enc.static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                // The common header's ports and verification tag, then one ABORT chunk.
+                let mut packet = buffer.map_readable().unwrap()[..8].to_vec();
+                packet.extend_from_slice(&[0, 0, 0, 0, 6, 0, 0, 4]);
+                let crc = crc32c(&packet).to_le_bytes();
+                packet[8..12].copy_from_slice(&crc);
+                *buffer = gst::Buffer::from_mut_slice(packet);
+                done.store(true, Ordering::SeqCst);
+                gst::PadProbeReturn::Remove
+            });
+        self.ping();
+        sent
+    }
+}
+
+/// SCTP's checksum (RFC 9260 appendix A).
+fn crc32c(bytes: &[u8]) -> u32 {
+    !bytes.iter().fold(!0u32, |crc, &b| {
+        (0..8).fold(crc ^ u32::from(b), |c, _| {
+            (c >> 1) ^ (0x82F6_3B78 & (c & 1).wrapping_neg())
+        })
+    })
 }
 
 impl Drop for PeerPc {
@@ -589,6 +641,10 @@ fn pump_with(
     let deadline = Instant::now() + within;
     loop {
         while let Ok(msg) = host.sig_rx.try_recv() {
+            if matches!(msg, SignalMsg::Error { .. }) {
+                host.errors.push(msg);
+                continue;
+            }
             let pc = match &msg {
                 SignalMsg::Offer { pc, sdp } => {
                     host.wire
@@ -625,12 +681,58 @@ fn pump_with(
     }
 }
 
-/// Agent log lines on stderr, for the browser host.
+/// Every WARN and ERROR line this process logged, as `field=value ` pairs.
+static WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+struct WarningLog;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningLog {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Line(String);
+        impl tracing::field::Visit for Line {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0 += &format!("{}={value:?} ", field.name());
+            }
+        }
+        if *event.metadata().level() <= tracing::Level::WARN {
+            let mut line = Line(String::new());
+            event.record(&mut line);
+            WARNINGS.lock().unwrap().push(line.0);
+        }
+    }
+}
+
+/// Agent log lines on stderr, for the browser host, and its warnings kept in
+/// [`WARNINGS`]. Process-wide: `webrtcbin`'s threads carry no span, so a subscriber set
+/// for the test's thread never sees what they log.
 fn trace_to_stderr() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_env_filter("quasar_node_agent=info")
+    use tracing_subscriber::prelude::*;
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_test_writer()
+                .with_filter(tracing_subscriber::EnvFilter::new("quasar_node_agent=info")),
+        )
+        .with(WarningLog)
         .try_init();
+}
+
+/// The PCs of session `tag` that warned their peer failed the fingerprint check, one
+/// entry per line logged.
+fn fingerprint_warnings(tag: &str) -> Vec<&'static str> {
+    let session = format!("session_id=takeover-{tag} ");
+    let lines = WARNINGS.lock().unwrap();
+    let said = |pc: &str| {
+        lines
+            .iter()
+            .filter(|l| l.contains(r#"token="transport-peer-fingerprint-mismatch""#))
+            .filter(|l| l.contains(&session) && l.contains(&format!("{pc} PC:")))
+            .count()
+    };
+    ["video", "audio"]
+        .into_iter()
+        .flat_map(|pc| std::iter::repeat_n(pc, said(pc)))
+        .collect()
 }
 
 /// The first value of an SDP attribute or line prefix.
@@ -734,6 +836,19 @@ fn describe(peer: &Peer) -> String {
     )
 }
 
+/// The amendment-42 `code` and `pc` of each `error` the host sent.
+fn codes(errors: &[SignalMsg]) -> Vec<(String, PcId)> {
+    errors
+        .iter()
+        .map(|e| match e {
+            SignalMsg::Error { code, pc, .. } => {
+                (code.clone().unwrap_or_default(), pc.unwrap_or_default())
+            }
+            other => panic!("not an error: {other:?}"),
+        })
+        .collect()
+}
+
 /// Does the host answer this peer's input channel?
 fn input_reaches_host(host: &mut Host, peer: &mut Peer) -> bool {
     let before = peer.video.pongs.load(Ordering::Relaxed);
@@ -813,6 +928,11 @@ fn a_takeover_mid_stream_moves_the_stream_to_the_new_peer() {
         "the stream stopped when the displaced peer left"
     );
     assert_eq!(host.bus_errors, Vec::<String>::new());
+    assert_eq!(
+        fingerprint_warnings("midstream"),
+        Vec::<&str>::new(),
+        "neither honest peer failed the fingerprint check"
+    );
 }
 
 /// The first page answered but its transport never connected (its loader is still up),
@@ -1100,6 +1220,7 @@ fn past_the_replacement_budget_the_current_peer_keeps_the_transport() {
     let _a = first_attach(&mut host);
     let mut b = attach(&mut host);
     let transport = host.transports.video.webrtc.clone();
+    assert_eq!(codes(&host.errors), [], "a takeover within the budget");
 
     let mut c = Peer::new();
     request_offers(&mut host);
@@ -1113,6 +1234,19 @@ fn past_the_replacement_budget_the_current_peer_keeps_the_transport() {
         rtp(&b.video) > b_video + 30,
         "the current peer lost its stream"
     );
+    assert!(input_reaches_host(&mut host, &mut b));
+    // Amendment 42: one error per refused answer, to the peer it refused.
+    let mut refused = codes(&host.errors);
+    refused.sort_by_key(|(_, pc)| *pc as usize);
+    let limited = TAKEOVER_RATE_LIMITED.to_string();
+    assert_eq!(
+        refused,
+        [(limited.clone(), PcId::Video), (limited, PcId::Audio)]
+    );
+    // The peer streaming answers again, still past the budget: it is told nothing.
+    request_offers(&mut host);
+    pump(&mut host, &mut b, Duration::from_secs(3), |_, _| false);
+    assert_eq!(host.errors.len(), 2, "{:?}", codes(&host.errors));
     assert!(input_reaches_host(&mut host, &mut b));
 
     // The window clears: the refused peer's next request is served like any other.
@@ -1272,6 +1406,7 @@ fn a_takeover_by_a_peer_with_its_own_certificate_reaches_the_host() {
         "a peer with a certificate of its own, truthfully advertised, is not heard"
     );
     assert_eq!(host.bus_errors, Vec::<String>::new());
+    assert_eq!(fingerprint_warnings("own-cert"), Vec::<&str>::new());
 }
 
 /// The host checks an answer's `a=fingerprint` against the certificate the peer presents
@@ -1295,6 +1430,10 @@ fn a_peer_whose_fingerprint_is_not_its_certificates_gets_video_and_no_input_chan
         "outbound media must not wait on the fingerprint: {}",
         describe(&peer)
     );
+    let reported = pump(&mut host, &mut peer, Duration::from_secs(20), |_, _| {
+        fingerprint_warnings("forged").len() >= 2
+    });
+    assert!(reported, "no warning: {}", describe(&peer));
     assert!(
         !input_reaches_host(&mut host, &mut peer),
         "the host heard a peer whose answer names a certificate it did not present"
@@ -1303,6 +1442,42 @@ fn a_peer_whose_fingerprint_is_not_its_certificates_gets_video_and_no_input_chan
         peer.video.channel.lock().unwrap().is_none(),
         "the input channel opened to a peer whose answer names a certificate it did not present"
     );
+    assert_eq!(
+        fingerprint_warnings("forged"),
+        ["video", "audio"],
+        "each transport says once that its peer failed the check"
+    );
+}
+
+/// A transport built for a takeover reports a failed check as the launch one does, and
+/// the honest peer it displaced was never reported (#577).
+#[test]
+fn a_takeover_by_a_peer_that_fails_the_fingerprint_check_is_reported() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("forged-takeover");
+    let _a = first_attach(&mut host);
+
+    host.munge_answer = Some(with_another_certificate);
+    request_offers(&mut host);
+    let mut b = Peer::new();
+    let reported = pump(&mut host, &mut b, Duration::from_secs(20), |_, _| {
+        fingerprint_warnings("forged-takeover").len() >= 2
+    });
+    assert!(reported, "no warning: {}", describe(&b));
+    pump(&mut host, &mut b, Duration::from_secs(1), |_, _| false);
+
+    let mut replaced = host.replaced.clone();
+    replaced.sort_by_key(|pc| *pc as usize);
+    assert_eq!(replaced, [PcId::Video, PcId::Audio]);
+    assert_eq!(
+        fingerprint_warnings("forged-takeover"),
+        ["video", "audio"],
+        "each replacement transport says once that its peer failed the check"
+    );
+    assert_eq!(host.bus_errors, Vec::<String>::new());
 }
 
 /// An answer naming a certificate nobody holds. With no peer behind it, it stands for
@@ -1414,6 +1589,364 @@ fn a_new_transport_nobody_answers_does_not_hold_the_source() {
     assert!(
         stops_within(&host.source, Duration::from_secs(2)),
         "the source did not stop behind a transport nobody answered"
+    );
+}
+
+/// The session's audio capture, once it runs.
+fn audio_capture(host: &Host) -> gst::Element {
+    let capture = host
+        .transports
+        .audio_pipeline
+        .as_ref()
+        .expect("audio pipeline")
+        .iterate_elements()
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|e| e.factory().is_some_and(|f| f.name() == "audiotestsrc"))
+        .expect("the audio capture");
+    let (_, state, _) = capture.state(gst::ClockTime::from_seconds(5));
+    assert_eq!(state, gst::State::Playing, "the audio capture never ran");
+    capture
+}
+
+/// What `pulsesrc` posts when its server goes away under it.
+fn sound_server_lost(capture: &gst::Element) {
+    gst::element_error!(
+        capture,
+        gst::ResourceError::Failed,
+        ("Disconnected: Connection terminated")
+    );
+}
+
+/// What `f` logs on this thread. The audio bus handler logs on the thread that posts.
+fn logged(f: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Lines(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let lines = Lines::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = lines.0.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The session's sound server as its end sees it. Nothing here can count on a
+/// PulseAudio-protocol server, so this one keeps what it found when it was stopped, and a
+/// capture still running then reports the loss as `pulsesrc` does.
+struct SoundServer {
+    capture: gst::Element,
+    /// The capture's state, and whether the audio bus still took a message.
+    at_stop: Arc<Mutex<Option<(gst::State, bool)>>>,
+}
+
+impl crate::session::teardown::Sidecar for SoundServer {
+    fn server_uri(&self) -> String {
+        "unix:/nonexistent/native".into()
+    }
+    fn socket_dir(&self) -> std::path::PathBuf {
+        "/nonexistent".into()
+    }
+    fn adopt_budget(&mut self, _: crate::session::teardown::RetryBudget) {}
+    fn stop(&mut self) {
+        let mut seen = self.at_stop.lock().unwrap();
+        if seen.is_some() {
+            return;
+        }
+        let state = self.capture.current_state();
+        // A flushing bus refuses a post. This message is no warning or error, so the
+        // handler drops it unlogged: its 60 s rate limit, which can hide the error below
+        // on a bus that does report, has no part in the answer.
+        let probe = gst::message::Application::new(gst::Structure::new_empty("probe"));
+        let reporting = self
+            .capture
+            .parent()
+            .and_downcast::<gst::Pipeline>()
+            .and_then(|audio| audio.bus())
+            .is_some_and(|bus| bus.post(probe).is_ok());
+        *seen = Some((state, reporting));
+        if matches!(state, gst::State::Paused | gst::State::Playing) {
+            sound_server_lost(&self.capture);
+        }
+    }
+}
+
+/// #588: every session end stops the sound server under a capture that is still PLAYING
+/// (`session::teardown`, "Audio ordering"), and the capture's report of that read as an
+/// audio fault.
+#[test]
+fn a_session_end_does_not_report_its_sound_server_stopping() {
+    use crate::session::source::{AppSource, SessionResources};
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("audio-end");
+    let at_stop = Arc::new(Mutex::new(None));
+    let res = SessionResources::with_sidecar(
+        "takeover-audio-end",
+        Box::new(SoundServer {
+            capture: audio_capture(&host),
+            at_stop: at_stop.clone(),
+        }),
+    );
+    let sink = format!("takeover-audio-end-app-{}", std::process::id());
+    let mut source = AppSource::new(&host.cfg, "takeover-audio-end", &sink, &sink, &res, None)
+        .expect("app source");
+
+    let log = logged(|| crate::session::runner::stop_source(&mut source, &host.transports, None));
+
+    // Read out first: a failed assertion that held this lock would poison it for the
+    // stops the session's destructors still make.
+    let at_stop = *at_stop.lock().unwrap();
+    assert!(
+        !log.contains("audio-pipeline-message"),
+        "the session end logged an audio fault:\n{log}"
+    );
+    // The log alone could be quiet for another reason: the handler's rate limit, had
+    // this pipeline logged anything in the minute before.
+    assert_eq!(
+        at_stop,
+        Some((gst::State::Playing, false)),
+        "when the sound server was stopped (capture state, audio bus still reporting): \
+         the capture is still up, because taking it down first waits on that server, and \
+         its bus reports nothing any more"
+    );
+}
+
+/// The report itself is as it was: a sound server lost under a live session (#392, #351)
+/// still reads as one.
+#[test]
+fn a_sound_server_lost_under_a_live_session_is_still_reported() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("audio-lost");
+    let capture = audio_capture(&host);
+
+    let log = logged(|| sound_server_lost(&capture));
+
+    assert!(
+        log.contains("WARN")
+            && log.contains("audio-pipeline-message")
+            && log.contains("Disconnected: Connection terminated"),
+        "a sound server lost under a live session was not reported:\n{log}"
+    );
+}
+
+/// The last thing a source stop does is stop its sound server, after the app container
+/// (`AppSource::teardown`); this one notes what the session end had done by then.
+struct SourceStopWitness {
+    emitted: Arc<Mutex<Vec<SessionEvent>>>,
+    video: gst::Element,
+    /// `(bye already emitted, the video transport's state)`.
+    at_stop: Arc<Mutex<Option<(bool, gst::State)>>>,
+}
+
+impl crate::session::teardown::Sidecar for SourceStopWitness {
+    fn server_uri(&self) -> String {
+        "unix:/nonexistent/native".into()
+    }
+    fn socket_dir(&self) -> std::path::PathBuf {
+        "/nonexistent".into()
+    }
+    fn adopt_budget(&mut self, _: crate::session::teardown::RetryBudget) {}
+    fn stop(&mut self) {
+        let said_bye = self
+            .emitted
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Signaling(SignalMsg::Bye)));
+        self.at_stop
+            .lock()
+            .unwrap()
+            .get_or_insert((said_bye, self.video.current_state()));
+    }
+}
+
+/// #753: on a game exit the browser hears `bye`, after the `stopping` row it reads, and the
+/// video transport is gone before the source stop, which waits on Steam's exit.
+#[test]
+fn a_game_exit_says_bye_and_drops_the_video_before_the_source_stops() {
+    use crate::session::source::{AppSource, SessionResources};
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("game-exit");
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let at_stop = Arc::new(Mutex::new(None));
+    let res = SessionResources::with_sidecar(
+        "takeover-game-exit",
+        Box::new(SourceStopWitness {
+            emitted: emitted.clone(),
+            video: host.transports.video.webrtc.clone(),
+            at_stop: at_stop.clone(),
+        }),
+    );
+    let sink = format!("takeover-game-exit-app-{}", std::process::id());
+    let mut source = AppSource::new(&host.cfg, "takeover-game-exit", &sink, &sink, &res, None)
+        .expect("app source");
+
+    let emit = |e: SessionEvent| emitted.lock().unwrap().push(e);
+    crate::session::runner::stop_for_game_exit(&emit, &mut source, &host.transports);
+
+    let at_stop = *at_stop.lock().unwrap();
+    assert_eq!(
+        at_stop,
+        Some((true, gst::State::Null)),
+        "(bye sent, video state) at the source stop"
+    );
+    let emitted = emitted.lock().unwrap();
+    assert!(
+        matches!(
+            emitted.as_slice(),
+            [
+                SessionEvent::StoppingWith("game exited"),
+                SessionEvent::Signaling(SignalMsg::Bye)
+            ]
+        ),
+        "emitted {emitted:?}"
+    );
+}
+
+/// A sound server with nothing to stop.
+struct NoSoundServer;
+
+impl crate::session::teardown::Sidecar for NoSoundServer {
+    fn server_uri(&self) -> String {
+        "unix:/nonexistent/native".into()
+    }
+    fn socket_dir(&self) -> std::path::PathBuf {
+        "/nonexistent".into()
+    }
+    fn adopt_budget(&mut self, _: crate::session::teardown::RetryBudget) {}
+    fn stop(&mut self) {}
+}
+
+/// Is the thread that replaces the audio transport (`runner::replace_audio`) alive?
+fn audio_replacement_running() -> bool {
+    std::fs::read_dir("/proc/self/task").is_ok_and(|tasks| {
+        tasks.filter_map(Result::ok).any(|task| {
+            std::fs::read_to_string(task.path().join("comm"))
+                .is_ok_and(|name| name.trim_end() == "quasar-aud-repl")
+        })
+    })
+}
+
+/// #613: a takeover takes the old audio pipeline to NULL, and `pulsesrc` waits on its
+/// sound server on the way: 30 s when that server is frozen. The runner must not wait
+/// with it, so a stop is still served; and the stop the worker sees must neither be
+/// reported (#588) nor be followed by another build.
+#[test]
+fn a_takeover_does_not_hold_the_runner_on_an_audio_pipeline_that_will_not_stop() {
+    use crate::session::source::{AppSource, SessionResources};
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut host = Host::start("audio-held");
+    let _first = first_attach(&mut host);
+    // Parks the capture's streaming thread, so its pipeline cannot reach NULL until
+    // `release` drops: after 10 s at most, so a runner that waits fails and does not hang.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (parked_tx, parked) = std::sync::mpsc::channel::<()>();
+    let probe = Mutex::new((held, parked_tx));
+    audio_capture(&host).static_pad("src").unwrap().add_probe(
+        gst::PadProbeType::BUFFER,
+        move |_, _| {
+            let probe = probe.lock().unwrap();
+            let _ = probe.1.send(());
+            let _ = probe.0.recv_timeout(Duration::from_secs(10));
+            gst::PadProbeReturn::Ok
+        },
+    );
+    parked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the audio capture never reached the probe");
+    let old_bus = host
+        .transports
+        .audio_pipeline
+        .as_ref()
+        .unwrap()
+        .bus()
+        .unwrap();
+
+    request_offers(&mut host);
+    let mut next = Peer::new();
+    let up = pump(&mut host, &mut next, Duration::from_secs(20), |h, p| {
+        rtp(&p.video) > 30 && h.replaced.contains(&PcId::Audio)
+    });
+    assert!(
+        up,
+        "the peer that took over never got video, or its audio transport was not \
+         replaced: {} (host replaced {:?})",
+        describe(&next),
+        host.replaced
+    );
+    assert!(
+        host.slowest_inbound < Duration::from_secs(3),
+        "the takeover held the runner {:?} on the old audio pipeline",
+        host.slowest_inbound
+    );
+    assert!(
+        host.transports.audio_webrtc.is_none(),
+        "past the bound the new peer gets no audio"
+    );
+    let probe = gst::message::Application::new(gst::Structure::new_empty("probe"));
+    assert!(
+        old_bus.post(probe).is_err(),
+        "the old audio pipeline still reports while it stops: a session end would log the \
+         sound server's stop as a fault (#588)"
+    );
+
+    let res = SessionResources::with_sidecar("takeover-audio-held", Box::new(NoSoundServer));
+    let sink = format!("takeover-audio-held-app-{}", std::process::id());
+    let mut source = AppSource::new(&host.cfg, "takeover-audio-held", &sink, &sink, &res, None)
+        .expect("app source");
+    let stopping = Instant::now();
+    crate::session::runner::stop_source(&mut source, &host.transports, None);
+    assert!(
+        stopping.elapsed() < Duration::from_secs(3),
+        "the stop took {:?}",
+        stopping.elapsed()
+    );
+    assert!(
+        audio_replacement_running(),
+        "the old audio pipeline was not held through the stop"
+    );
+    let builds = || {
+        let all = super::transport::AUDIO_BUILDS.lock().unwrap();
+        all.iter().filter(|id| *id == "takeover-audio-held").count()
+    };
+    let built_before_release = builds();
+
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while audio_replacement_running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !audio_replacement_running(),
+        "the old audio pipeline never stopped once released"
+    );
+    assert_eq!(
+        builds(),
+        built_before_release,
+        "the takeover's worker built an audio pipeline after the session stopped"
     );
 }
 
@@ -1748,19 +2281,36 @@ struct Session {
     answers: [Option<String>; 2],
     /// The runner's last word: `Stopped` or `Failed`.
     ended: Option<SessionEvent>,
+    /// Every `error` the host sent the client, in order.
+    errors: Vec<SignalMsg>,
     /// Nothing the peer says reaches the host.
     mute: bool,
     /// The runner reported `SwapDone`.
     swapped: bool,
     swap: std::sync::mpsc::Sender<crate::session::runner::SwapRequest>,
     display: std::sync::mpsc::Sender<crate::session::runner::DisplayUpdateRequest>,
+    adopt: std::sync::mpsc::Sender<crate::session::runner::AdoptRequest>,
+    /// The runner's id.
+    id: String,
+    /// Every event the runner sent, in order.
+    log: Vec<SessionEvent>,
+    metrics: Arc<SessionMetrics>,
 }
 
 impl Session {
     fn start(tag: &str, idle_timeout: Duration) -> Session {
+        Session::start_with(tag, idle_timeout, |_| {})
+    }
+
+    fn start_with(
+        tag: &str,
+        idle_timeout: Duration,
+        edit: impl FnOnce(&mut SessionConfig),
+    ) -> Session {
         trace_to_stderr();
         let mut cfg = host_cfg(false);
         cfg.idle_timeout = idle_timeout;
+        edit(&mut cfg);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (evt_tx, events) = mpsc::channel(256);
         let (diag_tx, _) = mpsc::channel(1);
@@ -1773,8 +2323,11 @@ impl Session {
         let (swap, swap_rx) = std::sync::mpsc::channel();
         let (display, display_rx) = std::sync::mpsc::channel();
         let (_, capture_rx) = std::sync::mpsc::channel();
+        let (adopt, adopt_rx) = std::sync::mpsc::channel();
         let metrics = Arc::new(SessionMetrics::new("smooth", cfg.stream.fps as u32));
         let (id, flag) = (format!("takeover-{tag}"), stop.clone());
+        let session_id = id.clone();
+        let runner_metrics = metrics.clone();
         let thread = std::thread::spawn(move || {
             crate::session::runner::run_blocking(
                 id,
@@ -1786,7 +2339,8 @@ impl Session {
                 swap_rx,
                 display_rx,
                 capture_rx,
-                metrics,
+                runner_metrics,
+                adopt_rx,
             )
         });
         Session {
@@ -1797,10 +2351,15 @@ impl Session {
             offers: [0; 2],
             answers: [None, None],
             ended: None,
+            errors: Vec::new(),
             mute: false,
             swapped: false,
             swap,
             display,
+            adopt,
+            id: session_id,
+            log: Vec::new(),
+            metrics,
         }
     }
 
@@ -1814,8 +2373,13 @@ impl Session {
         let deadline = Instant::now() + within;
         loop {
             while let Ok((_, event)) = self.events.try_recv() {
+                self.log.push(event.clone());
                 match event {
                     SessionEvent::Signaling(msg) => {
+                        if matches!(msg, SignalMsg::Error { .. }) {
+                            self.errors.push(msg);
+                            continue;
+                        }
                         let pc = match &msg {
                             SignalMsg::Offer { pc, .. } => {
                                 self.offers[pc.unwrap_or_default() as usize] += 1;
@@ -1950,6 +2514,11 @@ impl Session {
     /// A page streams. A second browser takes the session over, and its answer to the new
     /// `refused` transport's offer is one webrtcbin cannot apply.
     fn with_a_takeover_that_cannot_be_applied(tag: &str, refused: PcId) -> Session {
+        Session::with_a_takeover_answering(tag, refused, refusing_its_first_m_line)
+    }
+
+    /// The same, with the second browser's answer on `pc` made by `answer`.
+    fn with_a_takeover_answering(tag: &str, refused: PcId, answer: fn(&str) -> String) -> Session {
         let mut session = Session::start(tag, Duration::from_secs(600));
         let mut a = Peer::new();
         let up = session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p));
@@ -1965,9 +2534,7 @@ impl Session {
         let replaced = session.pump(&mut a, Duration::from_secs(10), |s, _| s.offers == [2, 2]);
         assert!(replaced, "offers per PC: {:?}", session.offers);
 
-        let sdp = as_b(&refusing_its_first_m_line(
-            answers[refused as usize].as_ref().unwrap(),
-        ));
+        let sdp = as_b(&answer(answers[refused as usize].as_ref().unwrap()));
         let _ = session.to_host.send(SignalMsg::Answer {
             sdp,
             pc: Some(refused),
@@ -2009,6 +2576,8 @@ fn a_takeover_whose_video_answer_cannot_be_applied_leaves_the_session_running() 
     }
     let _serial = serial();
     let mut session = Session::with_a_takeover_that_cannot_be_applied("refused-video", PcId::Video);
+    let abandoned = TAKEOVER_ABANDONED.to_string();
+    assert_eq!(codes(&session.errors), [(abandoned, PcId::Video)]);
     session.serves_the_next_peer_and_stops();
 }
 
@@ -2019,11 +2588,14 @@ fn a_takeover_whose_audio_answer_cannot_be_applied_leaves_the_session_running() 
     }
     let _serial = serial();
     let mut session = Session::with_a_takeover_that_cannot_be_applied("refused-audio", PcId::Audio);
+    let abandoned = TAKEOVER_ABANDONED.to_string();
+    assert_eq!(codes(&session.errors), [(abandoned, PcId::Audio)]);
     session.serves_the_next_peer_and_stops();
 }
 
 /// The same answer from the first peer a session ever had still fails the launch, as it
-/// does on `develop`: there is no stream to keep, and the page is told why.
+/// does on `develop`: there is no stream to keep. The rejection is the session's failure
+/// reason; no takeover `error` is sent.
 #[test]
 fn a_first_answer_that_cannot_be_applied_still_fails_the_launch() {
     if !live_webrtc_available() {
@@ -2047,6 +2619,205 @@ fn a_first_answer_that_cannot_be_applied_still_fails_the_launch() {
     assert!(
         matches!(&ended, Some(SessionEvent::Failed(reason)) if reason.contains("rejected the remote answer")),
         "the launch did not fail: {ended:?}"
+    );
+    assert_eq!(
+        codes(&session.errors),
+        [],
+        "a launch transport is no takeover"
+    );
+}
+
+/// `sdp` as a client that writes its own SDP might send it: no `a=fingerprint`.
+fn without_fingerprint(sdp: &str) -> String {
+    sdp.lines()
+        .filter(|l| !l.starts_with("a=fingerprint:"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n"
+}
+
+/// A second client sends `restart_ice` and then an answer that names no peer, while the
+/// first streams on the launch transport (#591). The answer is refused; the first keeps
+/// its stream and the session its life.
+#[test]
+fn an_answer_naming_no_peer_from_a_second_client_leaves_the_streaming_peer_alone() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("peerless", Duration::from_secs(600));
+    let mut a = Peer::new();
+    let up = session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p));
+    assert!(up, "the first peer never streamed: {}", describe(&a));
+    let answer = session.answers[PcId::Video as usize].clone().unwrap();
+
+    // The first peer answers nothing more; the second one's offer is the transport's.
+    session.mute = true;
+    let _ = session.to_host.send(SignalMsg::RestartIce {
+        pc: Some(PcId::Video),
+    });
+    let reoffered = session.pump(&mut a, Duration::from_secs(10), |s, _| s.offers[0] == 2);
+    assert!(reoffered, "offers per PC: {:?}", session.offers);
+    assert!(
+        session.ended.is_none(),
+        "ended on the re-offer: {:?}",
+        session.ended
+    );
+
+    let sdp = without_fingerprint(&with_other_ice(&answer));
+    let _ = session.to_host.send(SignalMsg::Answer {
+        sdp,
+        pc: Some(PcId::Video),
+    });
+    let before = rtp(&a.video);
+    session.pump(&mut a, Duration::from_secs(3), |s, _| s.ended.is_some());
+    assert!(
+        session.ended.is_none(),
+        "an answer that names no peer ended the session: {:?}",
+        session.ended
+    );
+    assert!(
+        rtp(&a.video) > before + 30,
+        "the first peer stopped receiving: {}",
+        describe(&a)
+    );
+    assert_eq!(
+        codes(&session.errors),
+        [],
+        "amendment 43: the client is sent nothing"
+    );
+
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.ends_within(Duration::from_secs(10));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the session did not stop: {ended:?}"
+    );
+}
+
+/// `answer` with its video m-line refused in a way that leaves ICE, DTLS and BUNDLE
+/// alone: `a=inactive`, or port 0.
+fn refusing_video(answer: &str, port_zero: bool) -> String {
+    let mut section = 0;
+    let out = answer
+        .lines()
+        .map(|line| {
+            if line.starts_with("m=") {
+                section += 1;
+            }
+            match (section, line.strip_prefix("m=")) {
+                (1, Some(rest)) if port_zero => {
+                    let mut parts: Vec<&str> = rest.split(' ').collect();
+                    parts[1] = "0";
+                    format!("m={}", parts.join(" "))
+                }
+                (1, None) if !port_zero && ["a=recvonly", "a=sendrecv"].contains(&line) => {
+                    "a=inactive".to_string()
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n";
+    let video = crate::session::sdp_answer::parse_answer(&out);
+    assert!(
+        video
+            .m_lines
+            .first()
+            .is_some_and(|m| m.kind == "video" && m.rejected),
+        "the video m-line is not refused: {out}"
+    );
+    out
+}
+
+fn video_inactive(answer: &str) -> String {
+    refusing_video(answer, false)
+}
+
+fn video_at_port_zero(answer: &str) -> String {
+    refusing_video(answer, true)
+}
+
+/// A taking browser refuses the video m-line in an answer that keeps its ICE and DTLS
+/// attributes. The host applies it, and amendment 42 tells the browser the takeover is
+/// abandoned; the session keeps running.
+#[test]
+fn a_takeover_answer_that_refuses_video_is_told_it_is_abandoned() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let shapes = [
+        ("inactive-video", video_inactive as fn(&str) -> String),
+        ("port0-video", video_at_port_zero),
+    ];
+    for (tag, refuse) in shapes {
+        let mut session = Session::with_a_takeover_answering(tag, PcId::Video, refuse);
+        let applied = session.log.iter().any(|e| {
+            matches!(e, SessionEvent::Trace { event: "sdp.answer_applied", payload }
+                if payload["pc"] == "video" && payload["rejected_count"].as_u64() > Some(0))
+        });
+        // Measured on 1.28.8: webrtcbin applies both shapes; only the parsed answer tells.
+        assert!(applied, "{tag}: the host did not apply the refusing answer");
+        let abandoned = TAKEOVER_ABANDONED.to_string();
+        assert_eq!(codes(&session.errors), [(abandoned, PcId::Video)], "{tag}");
+        session.serves_the_next_peer_and_stops();
+    }
+}
+
+/// Amendments 42 and 43 together: a peer-less answer on a transport that replaced another
+/// and has a peer is dropped without a word, not reported as an abandoned takeover.
+#[test]
+fn a_peerless_answer_on_a_taken_over_transport_is_dropped_without_an_error() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("peerless-taken", Duration::from_secs(600));
+    let mut a = Peer::new();
+    let up = session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p));
+    assert!(up, "the first peer never streamed: {}", describe(&a));
+    for pc in [PcId::Video, PcId::Audio] {
+        let _ = session.to_host.send(SignalMsg::RestartIce { pc: Some(pc) });
+    }
+    let mut b = Peer::new();
+    let up = session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p));
+    assert!(up, "the taking peer never streamed: {}", describe(&b));
+    let answer = session.answers[PcId::Video as usize].clone().unwrap();
+    let offers = session.offers[PcId::Video as usize];
+
+    session.mute = true;
+    let _ = session.to_host.send(SignalMsg::RestartIce {
+        pc: Some(PcId::Video),
+    });
+    let reoffered = session.pump(&mut b, Duration::from_secs(10), |s, _| {
+        s.offers[PcId::Video as usize] > offers
+    });
+    assert!(reoffered, "offers per PC: {:?}", session.offers);
+    let _ = session.to_host.send(SignalMsg::Answer {
+        sdp: without_fingerprint(&with_other_ice(&answer)),
+        pc: Some(PcId::Video),
+    });
+    let before = rtp(&b.video);
+    session.pump(&mut b, Duration::from_secs(3), |s, _| s.ended.is_some());
+    assert!(session.ended.is_none(), "ended: {:?}", session.ended);
+    assert!(
+        rtp(&b.video) > before + 30,
+        "the taking peer stopped receiving: {}",
+        describe(&b)
+    );
+    assert_eq!(
+        codes(&session.errors),
+        [],
+        "amendment 43: the client is sent nothing"
+    );
+
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.ends_within(Duration::from_secs(10));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the session did not stop: {ended:?}"
     );
 }
 
@@ -2129,7 +2900,10 @@ impl Session {
         self.pump(&mut nobody, Duration::from_secs(1), |_, _| false);
 
         self.swap
-            .send(SwapRequest { container: None })
+            .send(SwapRequest {
+                container: None,
+                in_place: false,
+            })
             .expect("swap lane");
         let swapped = self.pump(&mut nobody, Duration::from_secs(10), |s, _| s.swapped);
         assert!(swapped, "the swap never completed");
@@ -2442,3 +3216,6 @@ fn browser_host() {
 
 /// What the host hands `webrtcbin` per transport, and whether it is given back.
 mod aux_senders;
+
+/// Amendment 39 (#759): parked, held, adopted and in-place-swapped runtimes.
+mod warm_steam;

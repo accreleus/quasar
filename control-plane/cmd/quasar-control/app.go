@@ -419,6 +419,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		log.Warn("FIRST-RUN SETUP: no admin exists — claim the instance at POST /v1/setup/claim with header X-Quasar-Setup-Token",
 			"token_file", setupTokenPath,
 			"note", "read the token from the file (e.g. docker exec <control-plane> cat "+setupTokenPath+"); it is per-boot — a restart before claim rotates it")
+		if !cfg.TLSEnabled() && len(cfg.TrustedProxies) == 0 {
+			log.Warn("FIRST-RUN SETUP cannot be claimed as configured: the claim is refused over plain HTTP, and QUASAR_TLS=off with no QUASAR_TRUSTED_PROXIES leaves no other way in",
+				"fix", "turn QUASAR_TLS back on, or name the TLS-terminating reverse proxy in QUASAR_TRUSTED_PROXIES, or provision the admin with BOOTSTRAP_ADMIN_*")
+		}
 	}
 	setupHandler := setup.NewService(authSvc, settingsStore, setupSecret, log).
 		WithTrustedProxies(cfg.TrustedProxies)
@@ -578,9 +582,31 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		"grace_secs", cfg.SessionGraceSecs, "booted_at", bootedAt.Format(time.RFC3339))
 	go coordinator.RunEntitlementSweep(janitorCtx)
 
+	jobRegistry.MustRegister(jobs.Definition{
+		ID:          "session.parked_expire",
+		Name:        "Warm Steam expiry",
+		Description: "Stops every parked session past its idle deadline, and every one while warm Steam is off.",
+		Plane:       jobs.PlaneControl,
+		Scope:       jobs.ScopeInstance,
+		Managed:     true,
+		Default:     jobs.Schedule{Kind: jobs.KindInterval, IntervalSecs: 60},
+		Run: func(ctx context.Context, rc jobs.RunContext) (jobs.Outcome, error) {
+			n, err := coordinator.ExpireParked(ctx)
+			if err != nil {
+				return jobs.Outcome{}, err
+			}
+			return jobs.Succeeded(jobs.Summary{"stopped": n}), nil
+		},
+	})
+
 	authHandler := auth.NewHandler(authSvc, auditStore).
 		WithVersionPolicy(cfg.MinClientVersion, cfg.LatestClientVersion).
-		WithTrustedProxies(cfg.TrustedProxies)
+		WithTrustedProxies(cfg.TrustedProxies).
+		WithLogger(log)
+	if !cfg.TLSEnabled() && len(cfg.TrustedProxies) == 0 {
+		log.Warn("sign-in over plain HTTP: QUASAR_TLS=off with no QUASAR_TRUSTED_PROXIES; the next release refuses sign-in, registration and password change over plain HTTP",
+			"fix", "turn QUASAR_TLS back on, or name the TLS-terminating reverse proxy in QUASAR_TRUSTED_PROXIES")
+	}
 	crudHandler := crud.NewHandler(pool, auditStore)
 	crudHandler.SetRegistry(agentRegistry) // lets DELETE /v1/hosts/{id} check live connectivity
 	crudHandler.SetReadinessStaleSecs(int(cfg.ReadinessStaleSecs))
@@ -701,6 +727,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 					"artwork_resolved": res.ArtworkResolved,
 					"no_match":         res.NoMatch,
 					"artwork_repaired": res.ArtworkRepaired,
+					"logo_icon_filled": res.LogoIconFilled,
 				}), nil
 			},
 		})
@@ -1034,8 +1061,14 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	applyRunner := platform.NewRunner(platformStore, platform.ApplyDeps{
 		DeveloperCommit: developerImages.Commit,
 		AcquireOwned: func(ctx context.Context, attemptID, hostID string) error {
-			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply")
-			return err
+			if _, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply"); err != nil {
+				return err
+			}
+			// Best-effort: expiry and the apply's own drain stop parked sessions too.
+			if err := coordinator.StopParkedOnHost(ctx, hostID); err != nil {
+				log.Warn("platform apply: stopping parked sessions failed", "host_id", hostID, "err", err)
+			}
+			return nil
 		},
 		ReleaseOwned: func(ctx context.Context, attemptID, hostID string) error {
 			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, agentRegistry.IsConnected(hostID))
@@ -1129,8 +1162,14 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// also DRAINS is a per-release decision (#153) that lives in the sequencer.
 	fleetCordons := platform.FleetCordons{
 		AcquireOwned: func(ctx context.Context, runID, hostID string) error {
-			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, "Platform apply")
-			return err
+			if _, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, "Platform apply"); err != nil {
+				return err
+			}
+			// Best-effort: expiry and the apply's own drain stop parked sessions too.
+			if err := coordinator.StopParkedOnHost(ctx, hostID); err != nil {
+				log.Warn("platform apply: stopping parked sessions failed", "host_id", hostID, "err", err)
+			}
+			return nil
 		},
 		ReleaseOwned: func(ctx context.Context, runID, hostID string) error {
 			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, agentRegistry.IsConnected(hostID))

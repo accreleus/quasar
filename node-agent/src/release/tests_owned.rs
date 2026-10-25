@@ -381,14 +381,17 @@ fn an_owned_manager_with_no_actor_socket_is_absent() {
 /// re-dials only when the actor answering now is not the one it registered.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_apply_naming_the_actor_redials_only_when_another_actor_answers() {
+    let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
     for (registered_as_now, want) in [(true, false), (false, true)] {
         let m = machine(Behaviour::default());
         let mgr = ReleaseManager::owned(&m.socket);
         let mut registered = crate::buildinfo::discover_owned(&m.socket);
+        let now = registered.clone();
         if !registered_as_now {
             registered.recovery_actor_version = Some("0.0.1".into());
         }
         crate::buildinfo::set_install_facts(registered);
+        crate::buildinfo::forget_observed();
         let (tx, mut rx) = mpsc::channel(32);
         let _guard = mgr.attach_upstream(tx);
         // The successor's image is not in the registry: the attempt fails at the pull.
@@ -411,6 +414,27 @@ async fn an_apply_naming_the_actor_redials_only_when_another_actor_answers() {
             "registered as now: {registered_as_now}"
         );
         assert!(!mgr.take_redial(), "consumed");
+        // The read that decided it is what the redial's own `register` falls back on when
+        // the new actor is slower than the register budget: the actor serving now, not
+        // whichever one an earlier refresh saw.
+        let dark = m.socket.with_file_name("not-serving.sock");
+        let fallback = crate::buildinfo::discover(
+            &crate::session::container::ContainerRuntime::from_env(),
+            Some(&dark),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            (
+                fallback.updater_present,
+                fallback.recovery_actor_version,
+                fallback.recovery_actor_source_commit
+            ),
+            (
+                now.updater_present,
+                now.recovery_actor_version.clone(),
+                now.recovery_actor_source_commit.clone()
+            )
+        );
     }
 }
 

@@ -442,7 +442,7 @@ func TestCancellingOneRestartGroupRotatesOtherGroupReviewFence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CancelIdleApply(ctx, hostID, approved.AttemptID, true); err != nil {
+	if _, err := store.CancelIdleApply(ctx, hostID, approved.AttemptID); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT review_id::text FROM host_approval_review_tokens
@@ -815,7 +815,7 @@ func TestCancelWaitingIdleApplyKeepsOtherHoldAndFreshReviewCanReapprove(t *testi
 	if _, err := manual.Acquire(ctx, hostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
 		t.Fatal(err)
 	}
-	cancelled, err := store.CancelIdleApply(ctx, hostID, first.AttemptID, true)
+	cancelled, err := store.CancelIdleApply(ctx, hostID, first.AttemptID)
 	if err != nil || cancelled.Phase != "revoked_unstarted" || cancelled.AdmissionRestricted {
 		t.Fatalf("cancelled: %+v %v", cancelled, err)
 	}
@@ -834,7 +834,7 @@ func TestCancelWaitingIdleApplyKeepsOtherHoldAndFreshReviewCanReapprove(t *testi
 	if err != nil || second.AttemptID == first.AttemptID {
 		t.Fatalf("fresh approval: %+v %v", second, err)
 	}
-	if _, err := store.CancelIdleApply(ctx, hostID, second.AttemptID, true); err != nil {
+	if _, err := store.CancelIdleApply(ctx, hostID, second.AttemptID); err != nil {
 		t.Fatal(err)
 	}
 	thirdView, err := store.GetPolicy(ctx, hostID)
@@ -917,7 +917,7 @@ func TestOfferedApprovalBootAndCancelKeepProtectionUntilJournalProof(t *testing.
 		current.Remedy == nil || !strings.Contains(*current.Remedy, "authenticated agent journal") {
 		t.Fatalf("offered boot must protect: %+v %v", current, err)
 	}
-	repeat, err := store.CancelIdleApply(ctx, hostID, approved.AttemptID, true)
+	repeat, err := store.CancelIdleApply(ctx, hostID, approved.AttemptID)
 	if err != nil || repeat.Phase != "cancel_pending" || !repeat.AdmissionRestricted {
 		t.Fatalf("uncertain cancel released hold: %+v %v", repeat, err)
 	}
@@ -1136,5 +1136,51 @@ func TestForeignBootReclaimLocksHostsInIDOrder(t *testing.T) {
 	}
 	if err := <-adopted; err != nil {
 		t.Fatalf("the re-fence did not finish once the hosts were free: %v", err)
+	}
+}
+
+// The cancel reads liveness under the host lock: an agent that disconnects after
+// the handler's registry read must not leave its host online (#626).
+func TestIdleCancelProjectsTheHostFromItsRecordedDisconnect(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "hardware")
+	ctx := context.Background()
+	if _, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{"encoder": {Source: "explicit", Value: "openh264"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completeEmptyHostJournal(t, store, hostID)
+	for _, tc := range []struct {
+		disconnected bool
+		want         string
+	}{{false, "online"}, {true, "offline"}} {
+		view, err := store.GetPolicy(ctx, hostID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		approved, err := store.ApproveIdleApply(ctx, hostID, "hardware", reviewedIdleApply(view.Groups["hardware"].ApprovalPreview.(*ApprovalPreview)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.disconnected {
+			// What markOffline writes while the idle-apply restriction holds.
+			if _, err := pool.Exec(ctx, `UPDATE hosts SET agent_disconnected_at=now() WHERE id=$1::uuid`, hostID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := store.CancelIdleApply(ctx, hostID, approved.AttemptID); err != nil {
+			t.Fatal(err)
+		}
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid`, hostID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != tc.want {
+			t.Fatalf("disconnected=%v: cancel left the host %s, want %s", tc.disconnected, status, tc.want)
+		}
 	}
 }

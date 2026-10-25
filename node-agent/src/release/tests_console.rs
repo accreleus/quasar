@@ -320,6 +320,25 @@ fn an_agent_starting_with_console_enabled_asks_once_the_actor_can_take_it() {
     assert_eq!(state(&on), ConsoleAccessState::On);
 }
 
+/// A trigger the actor could not take yet waits for the worker's own timer; the connection
+/// that has just re-read the actor hands it over at once, so a console PATCH's hold is not
+/// left open for the backoff. The manager's timers are an hour here: only the hand-off acts.
+#[test]
+fn a_waiting_trigger_is_reconciled_as_soon_as_the_connection_has_read_the_actor() {
+    let m = console_machine(Behaviour::default());
+    m.actor.acquire_lease().unwrap();
+    let a = ConsoleAccessManager::owned_for_test_idle(&m.socket, false);
+    a.set_engine_mode(Some("rootful"));
+    a.refresh();
+    a.reconcile(true);
+    assert_eq!(last_attempt(&m), None, "busy: kept for later");
+
+    m.actor.resume().unwrap();
+    a.watch_if_applying();
+    wait_settled(&m);
+    assert!(node_agent_marker(&m), "the trigger was asked for");
+}
+
 /// The same startup trigger through the worker when the attempt it asks for is put back:
 /// one attempt, then the put-back hold, never a retry loop.
 #[test]

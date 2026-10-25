@@ -32,6 +32,11 @@ import { ApiError } from "../../api/client";
 import type { App, Session } from "../../api/types";
 
 vi.mock("../../api/library");
+// This suite drives the detail band, which is the Classic layout.
+vi.mock("../../settings/OverlayPreferencesContext", async (orig) => ({
+  ...(await orig<typeof import("../../settings/OverlayPreferencesContext")>()),
+  useNewDesign: () => false,
+}));
 
 const mocked = vi.mocked(libraryApi);
 
@@ -376,6 +381,66 @@ describe("featured rail", () => {
     await waitFor(() => {
       expect(document.querySelector(".detail")).not.toBeNull();
     });
+  });
+
+  it("keeps the band open when the rail card of the open app is clicked", async () => {
+    mocked.listApps.mockResolvedValue({
+      items: [app("a1", "Portal 2"), app("a9", "Filler")],
+    } as never);
+    mocked.getHighlights.mockResolvedValue({
+      items: [highlight("a1", "recently_added")],
+    } as never);
+
+    renderHome();
+    await waitForGrid(2);
+    fireEvent.click(screen.getByRole("button", { name: "Portal 2" }));
+    await waitFor(() => expect(document.querySelector(".detail")).not.toBeNull());
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Portal 2, Newly added\. Show details/ }),
+    );
+    await waitFor(() => expect(document.querySelector(".detail h2")?.textContent).toBe("Portal 2"));
+  });
+
+  it("clears the kind filter and opens the band under the app's own row for a filtered-out app", async () => {
+    mocked.listApps.mockResolvedValue({
+      items: [app("a1", "Portal 2"), app("a2", "Weston Terminal", { kind: "desktop" })],
+    } as never);
+    mocked.getHighlights.mockResolvedValue({
+      items: [highlight("a1", "recently_added")],
+    } as never);
+
+    renderHome();
+    await waitForGrid(2);
+    const kindTabs = screen.getByRole("tablist", { name: "Filter by kind" });
+    fireEvent.click(within(kindTabs).getByRole("tab", { name: "Desktops" }));
+    await waitForGrid(1);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Portal 2, Newly added\. Show details/ }),
+    );
+
+    await waitFor(() => {
+      expect(within(kindTabs).getByRole("tab", { name: "All" })).toHaveAttribute("aria-selected", "true");
+      expect(document.querySelector(".detail h2")?.textContent).toBe("Portal 2");
+    });
+    // Same row in a two-tile grid: the band follows the last tile of the row.
+    expect(document.querySelector(".detail")?.previousElementSibling?.textContent).toContain("Weston Terminal");
+  });
+
+  it("still closes an open band when the kind filter is changed by hand", async () => {
+    mocked.listApps.mockResolvedValue({
+      items: [app("a1", "Portal 2"), app("a2", "Weston Terminal", { kind: "desktop" })],
+    } as never);
+    mocked.getHighlights.mockResolvedValue({ items: [] } as never);
+
+    renderHome();
+    await waitForGrid(2);
+    fireEvent.click(screen.getByRole("button", { name: "Portal 2" }));
+    await waitFor(() => expect(document.querySelector(".detail")).not.toBeNull());
+
+    const kindTabs = screen.getByRole("tablist", { name: "Filter by kind" });
+    fireEvent.click(within(kindTabs).getByRole("tab", { name: "Desktops" }));
+    await waitFor(() => expect(document.querySelector(".detail")).toBeNull());
   });
 });
 

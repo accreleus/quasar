@@ -27,8 +27,10 @@ export interface InputPaneProps {
   onGrab: () => void;
   /** True when Esc is browser-owned (or ours) and releases capture. */
   escReleases: boolean;
-  /** True when that is specifically because Keyboard Lock is unavailable. */
+  /** True when that is because the page is not a secure context (plain HTTP). */
   escInsecureContext: boolean;
+  /** A secure page in a browser with no Keyboard Lock (Safari): HTTPS would change nothing. */
+  escNoKeyboardLock?: boolean;
   /** Certificate bypassed rather than trusted (lib/certTrust.ts). Takes wording
    *  precedence over the other Esc explanations: "use HTTPS" is wrong advice on
    *  an origin that already IS https. */
@@ -36,6 +38,8 @@ export interface InputPaneProps {
   /** keyboard.lock() was observed refused this session — the API still reads as
    *  supported, yet Esc quits. */
   escLockRefused?: boolean;
+  /** Ctrl+Alt+Shift+E sends Esc to the game here (Firefox, summonCombo.ts). */
+  escCombo?: boolean;
   /** False on a browser with no Element.requestPointerLock — no mouse look. */
   pointerLockAvailable: boolean;
   /** True where touch gestures are the mouse (touchscreen + no Pointer Lock). */
@@ -109,6 +113,41 @@ const Gamepads = memo(function Gamepads({ register }: { register: TelemetryRegis
   );
 });
 
+/** What decides how input is released on this device. One set of inputs for the
+ *  Esc row here and the release hint after capture (#647), so they cannot disagree. */
+export interface ReleaseInputs {
+  pointerLockAvailable: boolean;
+  touchLook: boolean;
+  fullscreen: boolean;
+  keyboardLockAvailable: boolean;
+  /** keyboard.lock() was observed refused this session. */
+  lockRefused: boolean;
+  /** Certificate bypassed rather than trusted: Esc capture is unreliable. */
+  certUntrusted: boolean;
+  /** Ctrl+Alt+Shift+E sends Esc to the game (Firefox). */
+  escCombo: boolean;
+}
+
+/** Whether Esc is browser-owned (or ours) and releases capture. Without Pointer
+ *  Lock, Esc is capture.ts's own release gesture and is never forwarded — so it
+ *  always releases, fullscreen or not. */
+export function escReleases(i: ReleaseInputs): boolean {
+  return !i.pointerLockAvailable || !i.fullscreen || !i.keyboardLockAvailable || i.lockRefused;
+}
+
+/** The one line the HUD shows for a few seconds after capture engages: only
+ *  release actions that work here. */
+export function releaseHint(i: ReleaseInputs): string {
+  if (i.touchLook) return "Tap the session-menu button to release input";
+  if (escReleases(i)) {
+    return i.escCombo && i.pointerLockAvailable
+      ? "Esc releases input · Ctrl+Alt+Shift+E sends Esc to the game"
+      : "Esc releases input";
+  }
+  if (i.certUntrusted) return "Ctrl+Alt+Shift+Z releases input · Ctrl+Alt+Shift+Q opens the menu";
+  return "Ctrl+Alt+Shift+Z releases input · Ctrl+Alt+Shift+Q opens the menu · hold Esc to leave full screen";
+}
+
 /** The one sentence that explains what Esc does here, and why. */
 function escNote(props: InputPaneProps): string {
   if (props.touchLook) {
@@ -125,6 +164,12 @@ function escNote(props: InputPaneProps): string {
       "mouse look isn’t possible here — but capture still sends your keyboard, controller, " +
       "clicks and scrolling to the game. Press Esc, use the release combo, or tap the " +
       "session-menu button to stop."
+    );
+  }
+  if (props.escCombo) {
+    return (
+      "Firefox keeps Esc for itself, so Esc releases capture and leaves fullscreen. " +
+      "Press Ctrl+Alt+Shift+E to send Esc to the game."
     );
   }
   if (props.escCertUntrusted) {
@@ -144,6 +189,12 @@ function escNote(props: InputPaneProps): string {
     return (
       "In-game Esc capture needs the HTTPS address — Keyboard Lock is unavailable on this " +
       "insecure origin, so the browser keeps Esc and it releases capture."
+    );
+  }
+  if (props.escNoKeyboardLock) {
+    return (
+      "This browser doesn’t support Keyboard Lock, so it keeps Esc and Esc releases " +
+      "capture. Chrome or Edge can pass Esc to the game."
     );
   }
   return (

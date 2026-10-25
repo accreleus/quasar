@@ -284,6 +284,86 @@ describe("StepLibraries", () => {
     expect(onNext).toHaveBeenCalled();
   });
 
+  it("an image that failed on one host reads failed even though the catalog says installed (#705)", async () => {
+    vi.mocked(adminApi.listImages)
+      .mockResolvedValueOnce(syncedCatalog([steamImage()]))
+      .mockResolvedValue(
+        syncedCatalog([
+          steamImage({
+            installed: true,
+            hosts: [
+              { host_id: "h1", state: "ready" },
+              { host_id: "h2", state: "failed", error: "no space left on device" },
+            ],
+          }),
+        ]),
+      );
+    vi.mocked(adminApi.updateSettings).mockResolvedValue({} as never);
+    renderStep();
+
+    await waitFor(() => expect(screen.getByText("Steam")).toBeInTheDocument());
+    fireEvent.click(screen.getByLabelText(/^enable$/i));
+    fireEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+
+    await waitFor(() => expect(screen.getByText("Failed")).toBeInTheDocument());
+    expect(screen.getByText("Failed on 1 host")).toBeInTheDocument();
+    expect(screen.queryByText("Ready")).not.toBeInTheDocument();
+  });
+
+  it("keeps polling after Failed: a retried build that turns ready replaces the failure (#705)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(adminApi.listImages)
+        .mockResolvedValueOnce(syncedCatalog([steamImage()]))
+        .mockResolvedValueOnce(
+          syncedCatalog([steamImage({ installed: false, hosts: [{ host_id: "h1", state: "failed", error: "x" }] })]),
+        )
+        .mockResolvedValue(
+          syncedCatalog([steamImage({ installed: true, hosts: [{ host_id: "h1", state: "ready" }] })]),
+        );
+      vi.mocked(adminApi.updateSettings).mockResolvedValue({} as never);
+      renderStep();
+
+      await waitFor(() => expect(screen.getByText("Steam")).toBeInTheDocument());
+      fireEvent.click(screen.getByLabelText(/^enable$/i));
+      fireEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+      await waitFor(() => expect(screen.getByText("Failed")).toBeInTheDocument());
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      await waitFor(() => expect(screen.getByText("Ready")).toBeInTheDocument());
+      expect(screen.queryByText("Failed")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows the failure line beside the in-flight chip when one host failed and another is building (#705)", async () => {
+    vi.mocked(adminApi.listImages)
+      .mockResolvedValueOnce(syncedCatalog([steamImage()]))
+      .mockResolvedValue(
+        syncedCatalog([
+          steamImage({
+            installed: false,
+            hosts: [
+              { host_id: "h1", state: "failed", error: "x" },
+              { host_id: "h2", state: "building" },
+            ],
+          }),
+        ]),
+      );
+    vi.mocked(adminApi.updateSettings).mockResolvedValue({} as never);
+    renderStep();
+
+    await waitFor(() => expect(screen.getByText("Steam")).toBeInTheDocument());
+    fireEvent.click(screen.getByLabelText(/^enable$/i));
+    fireEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+
+    await waitFor(() => expect(screen.getByText(/building…/i)).toBeInTheDocument());
+    expect(screen.getByText("Failed on 1 host")).toBeInTheDocument();
+  });
+
   it("a PATCH failure surfaces an inline error but still reaches the progress view", async () => {
     vi.mocked(adminApi.listImages).mockResolvedValue(syncedCatalog([steamImage()]));
     vi.mocked(adminApi.updateSettings).mockRejectedValue(new ApiError(500, "internal", "could not save settings"));

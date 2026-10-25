@@ -12,9 +12,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/console"
 )
+
+// stopReasonUserRequested is the stop reason of a user's (or admin's) DELETE.
+const stopReasonUserRequested = "user_requested"
 
 // ErrConsoleAppNotDirect: the console's default app does not declare
 // runtime_spec.direct_display, so it cannot run as a console session. No
@@ -99,6 +103,15 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
 	var settling *homeHoldSettlingError
+	var inUse *HomeInUseError
+	if errors.As(err, &inUse) && (inUse.parkedID != "" || inUse.releasedID != "") {
+		// A console launch never claims: it is direct-display, a parked session
+		// stream_only. Stop the parked holder; its terminal report re-runs auto-start.
+		if inUse.parkedID != "" {
+			c.supersedeParkedHolder(ctx, userID, inUse.parkedID)
+		}
+		return "", fmt.Errorf("console auto-start: schedule: %w (a warm-Steam runtime is stopping)", ErrConsoleHomeSettling)
+	}
 	if errors.As(err, &settling) {
 		return "", fmt.Errorf("console auto-start: schedule: %w (session %s)", ErrConsoleHomeSettling, settling.holder)
 	}
@@ -107,6 +120,7 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	}
 	c.log.Info("console auto-start: session scheduled",
 		"session_id", sess.ID, "host_id", hostID, "user_id", userID, "app_id", appID)
+	c.afterLaunchAdmitted(ctx, userID, app)
 
 	// Resolve the dispatchable spec: the per-(user, app) home mount for a
 	// managed-home app, plus the tile's STEAM_STARTUP_FLAGS for a derived tile.
@@ -165,4 +179,30 @@ func (c *Coordinator) ConsoleSessionActive(ctx context.Context, sessionID string
 		return false
 	}
 	return hs.State == StatePending || hs.State.HoldsReservation()
+}
+
+// ConsoleSessionEnded reads when a session ended (zero while still live; a failed
+// read fails closed to now) and whether it was a console session (console.SessionSQL)
+// its user stopped, for console self-heal: a relaunch never acts on a display report
+// older than the end, and a user's stop holds. A user stopping a streamed session must
+// not hold the console back. Satisfies agentws.Events.
+func (c *Coordinator) ConsoleSessionEnded(ctx context.Context, sessionID string) (time.Time, bool) {
+	var endedAt *time.Time
+	var held bool
+	err := ErrNotFound
+	if isValidUUID(sessionID) {
+		err = c.store.pool.QueryRow(ctx, `
+			SELECT ended_at, `+console.SessionSQL+` AND stop_reason IS NOT DISTINCT FROM $2
+			FROM sessions WHERE id = $1::uuid`, sessionID, stopReasonUserRequested).Scan(&endedAt, &held)
+	}
+	if err != nil {
+		// Fail closed: "ended now" makes self-heal wait for the agent's next
+		// report (at most 15 s) rather than relaunch from one that may be stale.
+		c.log.Warn("console self-heal: read the ended session failed", "session_id", sessionID, "err", err)
+		return time.Now(), false
+	}
+	if endedAt == nil {
+		return time.Time{}, held
+	}
+	return *endedAt, held
 }

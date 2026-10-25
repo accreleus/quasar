@@ -21,7 +21,10 @@ import { Outlet } from "react-router-dom";
 import "../../../styles/account.css";
 import { ConsoleShell } from "../../../components/shell/ConsoleShell";
 import { LibraryCatalogProvider, useLibraryCatalog } from "../libraryCatalog";
+import { useNewDesign } from "../../../settings/OverlayPreferencesContext";
 import { buildAccountSections } from "./accountNav";
+import { OneSettingsPage } from "./onepage/OneSettingsPage";
+import { onePageRail } from "./onepage/sections";
 
 export function AccountLayout() {
   // The catalogue is the only thing this area can hand the command palette:
@@ -37,15 +40,18 @@ export function AccountLayout() {
 
 function AccountConsoleShell() {
   const { apps } = useLibraryCatalog();
+  // New design: one scrolling page whose rail rows scroll to a section. Classic
+  // keeps the tabbed pages.
+  const newDesign = useNewDesign();
   return (
     <ConsoleShell
-      sections={buildAccountSections()}
+      sections={newDesign ? onePageRail() : buildAccountSections()}
       railLabel="Account sections"
       pageClassName="ac-page"
       palette={{ apps }}
       showTabBar
     >
-      <Outlet />
+      {newDesign ? <OneSettingsPage /> : <Outlet />}
     </ConsoleShell>
   );
 }

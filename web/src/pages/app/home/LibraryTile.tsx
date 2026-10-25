@@ -24,8 +24,9 @@ import type { ReactNode } from "react";
 import type { App } from "../../../api/types";
 import { Chip } from "../../../components/Chip";
 import { IconHeart, IconPlayGlyph } from "../../../components/icons";
-import { artFor } from "../../../lib/appArtwork";
+import { artFor, artSrcSet, sizedArt } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
+import { TileHeart } from "./TileHeart";
 
 /** The `.lib-tile` box a surface button belongs to. The surface button is
  * absolutely positioned and inset:0, so its own `offsetTop` is always 0 —
@@ -51,6 +52,14 @@ export interface LibraryTileProps {
   /** The detail band, when this tile is the last one in the opened row. Kept
    *  as a sibling of the tile so it is always the next grid child. */
   detail?: ReactNode;
+  /** New design: a caption inside the surface button. */
+  meta?: ReactNode;
+  /** New design: a resting heart and a one-line title strip, and `F` favourites. */
+  onFavourite?: () => void;
+  /** New design: a press opens the game's page, not the band. */
+  opensPage?: boolean;
+  /** The tile's rendered CSS width, for the art's `sizes`. */
+  artSizes?: string;
 }
 
 export function LibraryTile({
@@ -65,6 +74,10 @@ export function LibraryTile({
   onOpen,
   onPlay,
   detail = null,
+  meta,
+  onFavourite,
+  opensPage,
+  artSizes = "176px",
 }: LibraryTileProps) {
   // The mock's `onerror="this.remove()"`: the gradient + glyph underneath is a
   // design, not a broken state, so a 404 cover falls back to it instead of
@@ -74,7 +87,11 @@ export function LibraryTile({
   const detailId = `lib-detail-${app.id}`;
   return (
     <>
-      <div className="lib-tile" data-open={isOpen ? "true" : undefined}>
+      <div
+        className={onFavourite ? "lib-tile tile-titled" : "lib-tile"}
+        data-open={isOpen ? "true" : undefined}
+        data-title={onFavourite ? app.name : undefined}
+      >
         {/* The fallback is always rendered and the cover sits on top of it —
             that is what makes the name visible on the product's default,
             artwork-less catalogue without a hover. */}
@@ -88,9 +105,12 @@ export function LibraryTile({
                in-viewport image and shrinks its prefetch margin on a slow link,
                adapting better than a hardcoded row count. No width/height
                needed: `.cover` is `aspect-ratio: 2/3` with `.cover-img`
-               `position:absolute; inset:0`, so layout cannot shift. */
+               `position:absolute; inset:0`, so layout cannot shift. The default
+               `sizes` is the measured grid tile width (`.lib-grid` minmax(160px, 1fr)). */
             <img
-              src={art}
+              src={sizedArt(art, 320)}
+              srcSet={artSrcSet(art)}
+              sizes={artSizes}
               alt=""
               className="cover-img"
               loading="lazy"
@@ -111,7 +131,8 @@ export function LibraryTile({
             <Chip variant="warning" title={`${blockedByName} is already running`}>In use</Chip>
           </span>
         )}
-        {app.favourite && (
+        {onFavourite && <TileHeart name={app.name} on={!!app.favourite} onToggle={onFavourite} />}
+        {!onFavourite && app.favourite && (
           <span className="fav-marker">
             <IconHeart filled />
             <span className="sr-only">Favourite</span>
@@ -142,11 +163,14 @@ export function LibraryTile({
           className="lib-tile-surface"
           data-app-id={app.id}
           aria-label={app.name}
-          aria-expanded={isOpen}
-          aria-controls={detailId}
+          aria-expanded={opensPage ? undefined : isOpen}
+          aria-controls={opensPage ? undefined : detailId}
+          aria-keyshortcuts={onFavourite ? "F" : undefined}
           onClick={onOpen}
           ref={tileRef}
-        />
+        >
+          {meta}
+        </button>
       </div>
       {detail}
     </>

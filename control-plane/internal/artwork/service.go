@@ -93,6 +93,7 @@ func New(store *Store, blobRoot string, opts Options, log *slog.Logger) (*Servic
 	if err != nil {
 		return nil, err
 	}
+	blobs.log = log
 	if opts.MaxImageBytes <= 0 {
 		opts.MaxImageBytes = DefaultMaxImageBytes
 	}
@@ -225,7 +226,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 	// in scheduling, admission, placement or discovery may branch on kind
 	// (spec §4.5.3).
 	if artworklessKinds[app.Kind] {
-		return s.store.Save(ctx, Record{
+		return s.saveResolved(ctx, Record{
 			AppID:       app.ID,
 			Source:      SourceNone,
 			MatchedName: "",
@@ -242,7 +243,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 		return fmt.Errorf("artwork: search %q: %w", app.Name, err)
 	}
 	if len(candidates) == 0 {
-		return s.store.Save(ctx, Record{AppID: app.ID, Source: SourceNone})
+		return s.saveResolved(ctx, Record{AppID: app.ID, Source: SourceNone})
 	}
 
 	// Only an exact normalised title match is accepted (spec §12.1): no
@@ -254,7 +255,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 		// No ProviderRef and no MatchedName — nothing was matched, and a
 		// stored MatchedName would read in the admin UI as "we matched this
 		// title", the false claim §12.1 exists to stop.
-		return s.store.Save(ctx, Record{AppID: app.ID, Source: SourceNone})
+		return s.saveResolved(ctx, Record{AppID: app.ID, Source: SourceNone})
 	}
 	art, err := provider.Art(ctx, best.Ref)
 	if err != nil {
@@ -263,7 +264,7 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 	if art.TileURL == "" && art.HeroURL == "" {
 		// A matched title with no usable asset is still a decision: nothing to
 		// fetch now, and asking again next sweep would not change that.
-		return s.store.Save(ctx, Record{
+		return s.saveResolved(ctx, Record{
 			AppID:       app.ID,
 			Source:      SourceNone,
 			Provider:    provider.Name(),
@@ -276,16 +277,20 @@ func (s *Service) Resolve(ctx context.Context, app appRef) error {
 	if err != nil {
 		return err
 	}
-	return s.store.Save(ctx, Record{
-		AppID:       app.ID,
-		Source:      SourceProvider,
-		Provider:    provider.Name(),
-		ProviderRef: best.Ref,
-		MatchedName: best.Name,
-		TileAsset:   tile,
-		HeroAsset:   hero,
-		Attribution: firstNonEmpty(art.Attribution, best.Attribution),
-		Locked:      false,
+	logo, icon, checked := s.fetchLogoIcon(ctx, provider, "", best.Ref)
+	return s.saveResolved(ctx, Record{
+		AppID:           app.ID,
+		Source:          SourceProvider,
+		Provider:        provider.Name(),
+		ProviderRef:     best.Ref,
+		MatchedName:     best.Name,
+		TileAsset:       tile,
+		HeroAsset:       hero,
+		Attribution:     firstNonEmpty(art.Attribution, best.Attribution),
+		Locked:          false,
+		LogoAsset:       logo,
+		IconAsset:       icon,
+		LogoIconChecked: checked,
 	})
 }
 
@@ -308,7 +313,7 @@ func (s *Service) resolveByExternalRef(ctx context.Context, app appRef) error {
 	// actually resolved the art. matched_name is whatever the provider
 	// volunteered; "" is honest, nothing was matched by title.
 	if err != nil || (art.TileURL == "" && art.HeroURL == "") {
-		return s.store.Save(ctx, Record{
+		return s.saveResolved(ctx, Record{
 			AppID:       app.ID,
 			Source:      SourceNone,
 			Provider:    provider.Name(),
@@ -321,16 +326,20 @@ func (s *Service) resolveByExternalRef(ctx context.Context, app appRef) error {
 	if err != nil {
 		return err
 	}
-	return s.store.Save(ctx, Record{
-		AppID:       app.ID,
-		Source:      SourceProvider,
-		Provider:    provider.Name(),
-		ProviderRef: app.ExternalID,
-		MatchedName: art.Name,
-		TileAsset:   tile,
-		HeroAsset:   hero,
-		Attribution: art.Attribution,
-		Locked:      false,
+	logo, icon, checked := s.fetchLogoIcon(ctx, provider, app.ExternalSource, app.ExternalID)
+	return s.saveResolved(ctx, Record{
+		AppID:           app.ID,
+		Source:          SourceProvider,
+		Provider:        provider.Name(),
+		ProviderRef:     app.ExternalID,
+		MatchedName:     art.Name,
+		TileAsset:       tile,
+		HeroAsset:       hero,
+		Attribution:     art.Attribution,
+		Locked:          false,
+		LogoAsset:       logo,
+		IconAsset:       icon,
+		LogoIconChecked: checked,
 	})
 }
 
@@ -505,18 +514,22 @@ func (s *Service) ApplyCandidate(ctx context.Context, appID, ref string) (Record
 	if err != nil {
 		return Record{}, err
 	}
+	logo, icon, checked := s.fetchLogoIcon(ctx, provider, "", ref)
 	rec := Record{
-		AppID:       appID,
-		Source:      SourceManual,
-		Provider:    provider.Name(),
-		ProviderRef: ref,
-		MatchedName: art.Name,
-		TileAsset:   tile,
-		HeroAsset:   hero,
-		Attribution: art.Attribution,
-		Locked:      true,
+		AppID:           appID,
+		Source:          SourceManual,
+		Provider:        provider.Name(),
+		ProviderRef:     ref,
+		MatchedName:     art.Name,
+		TileAsset:       tile,
+		HeroAsset:       hero,
+		Attribution:     art.Attribution,
+		Locked:          true,
+		LogoAsset:       logo,
+		IconAsset:       icon,
+		LogoIconChecked: checked,
 	}
-	if err := s.store.Save(ctx, rec); err != nil {
+	if err := s.save(ctx, rec); err != nil {
 		return Record{}, err
 	}
 	return s.reload(ctx, appID)
@@ -543,14 +556,17 @@ func (s *Service) ApplyURLs(ctx context.Context, appID, tileURL, heroURL string)
 		return Record{}, err
 	}
 	rec := Record{
-		AppID:       appID,
-		Source:      SourceManual,
-		TileAsset:   firstNonEmpty(tile, prev.TileAsset),
-		HeroAsset:   firstNonEmpty(hero, prev.HeroAsset),
-		Attribution: prev.Attribution,
-		Locked:      true,
+		AppID:           appID,
+		Source:          SourceManual,
+		TileAsset:       firstNonEmpty(tile, prev.TileAsset),
+		HeroAsset:       firstNonEmpty(hero, prev.HeroAsset),
+		Attribution:     prev.Attribution,
+		Locked:          true,
+		LogoAsset:       prev.LogoAsset,
+		IconAsset:       prev.IconAsset,
+		LogoIconChecked: prev.LogoIconChecked,
 	}
-	if err := s.store.Save(ctx, rec); err != nil {
+	if err := s.save(ctx, rec); err != nil {
 		return Record{}, err
 	}
 	return s.reload(ctx, appID)
@@ -579,19 +595,22 @@ func (s *Service) Upload(ctx context.Context, appID, crop, declaredType string, 
 		return Record{}, err
 	}
 	rec := Record{
-		AppID:       appID,
-		Source:      SourceManual,
-		TileAsset:   prev.TileAsset,
-		HeroAsset:   prev.HeroAsset,
-		Attribution: prev.Attribution,
-		Locked:      true,
+		AppID:           appID,
+		Source:          SourceManual,
+		TileAsset:       prev.TileAsset,
+		HeroAsset:       prev.HeroAsset,
+		Attribution:     prev.Attribution,
+		Locked:          true,
+		LogoAsset:       prev.LogoAsset,
+		IconAsset:       prev.IconAsset,
+		LogoIconChecked: prev.LogoIconChecked,
 	}
 	if crop == CropTile {
 		rec.TileAsset = name
 	} else {
 		rec.HeroAsset = name
 	}
-	if err := s.store.Save(ctx, rec); err != nil {
+	if err := s.save(ctx, rec); err != nil {
 		return Record{}, err
 	}
 	return s.reload(ctx, appID)
@@ -610,25 +629,42 @@ func (s *Service) Clear(ctx context.Context, appID string) error {
 // asked for art and got half of it with no message would have no way to tell a
 // missing hero from a rejected one.
 func (s *Service) cacheCrops(ctx context.Context, tileURL, heroURL string) (tile, hero string, err error) {
-	if strings.TrimSpace(tileURL) != "" {
-		data, ct, err := s.fetcher.Get(ctx, tileURL)
-		if err != nil {
-			return "", "", fmt.Errorf("tile: %w", err)
-		}
-		if tile, err = s.blobs.Put(ct, data); err != nil {
-			return "", "", fmt.Errorf("tile: %w", err)
-		}
+	if tile, err = s.cacheOne(ctx, tileURL); err != nil {
+		return "", "", fmt.Errorf("tile: %w", err)
 	}
-	if strings.TrimSpace(heroURL) != "" {
-		data, ct, err := s.fetcher.Get(ctx, heroURL)
-		if err != nil {
-			return "", "", fmt.Errorf("hero: %w", err)
-		}
-		if hero, err = s.blobs.Put(ct, data); err != nil {
-			return "", "", fmt.Errorf("hero: %w", err)
-		}
+	if hero, err = s.cacheOne(ctx, heroURL); err != nil {
+		return "", "", fmt.Errorf("hero: %w", err)
 	}
 	return tile, hero, nil
+}
+
+// cacheOne fetches and stores one image; "" for an empty URL.
+func (s *Service) cacheOne(ctx context.Context, rawURL string) (string, error) {
+	if strings.TrimSpace(rawURL) == "" {
+		return "", nil
+	}
+	data, ct, err := s.fetcher.Get(ctx, rawURL)
+	if err != nil {
+		return "", err
+	}
+	return s.blobs.Put(ct, data)
+}
+
+// fetchLogoIcon caches a matched title's logo and icon (amendment 38). checked is
+// false on any failure, which never holds back the tile and hero: the record is
+// saved without them and backfillLogoIcon asks again.
+func (s *Service) fetchLogoIcon(ctx context.Context, provider Provider, source, ref string) (logo, icon string, checked bool) {
+	logoURL, iconURL, err := provider.LogoIcon(ctx, source, ref)
+	if err == nil {
+		if logo, err = s.cacheOne(ctx, logoURL); err == nil {
+			icon, err = s.cacheOne(ctx, iconURL)
+		}
+	}
+	if err != nil {
+		s.log.Info("artwork: could not fetch a logo or icon; a later sweep retries", "ref", ref, "err", err)
+		return "", "", false
+	}
+	return logo, icon, true
 }
 
 func (s *Service) reload(ctx context.Context, appID string) (Record, error) {
@@ -654,6 +690,8 @@ type SweepResult struct {
 	// ArtworkRepaired counts rows whose missing cached image was fetched again
 	// (#441). Only SweepOnce repairs; ResolveApps leaves it zero.
 	ArtworkRepaired int
+	// LogoIconFilled counts records the logo and icon backfill answered for. SweepOnce only.
+	LogoIconFilled int
 }
 
 // SweepOnce resolves up to sweepBatch apps that have no artwork row. Exported
@@ -680,22 +718,63 @@ func (s *Service) SweepOnce(ctx context.Context) SweepResult {
 	}
 	s.resolveEach(ctx, apps, &res)
 	s.repairMissing(ctx, provider, &res)
+	s.backfillLogoIcon(ctx, provider, &res)
 	return res
 }
 
-// repairMissing fetches again the cached images a row names but the cache no
-// longer holds (#441): a database restored into a fresh install, a lost volume,
-// a hand-cleaned cache. "Has a row" is PendingApps' whole predicate, so without
+// backfillLogoIcon fetches the logo and icon of unlocked provider records that
+// never got them (made before amendment 38, or whose fetch failed), at most
+// sweepBatch per pass. Like a repair it is not a re-match: the record's own
+// reference is used, and only the logo and icon change.
+func (s *Service) backfillLogoIcon(ctx context.Context, provider Provider, res *SweepResult) {
+	recs, err := s.store.LogoIconPending(ctx, s.sweepBatch)
+	if err != nil {
+		s.log.Warn("artwork: could not list records missing a logo and icon", "err", err)
+		return
+	}
+	for _, rec := range recs {
+		if ctx.Err() != nil {
+			return
+		}
+		want := rec
+		// A crop still on disk (the other half of a re-queued record) is kept unless replaced.
+		if rec.Provider == provider.Name() && rec.ProviderRef != "" {
+			app, err := s.store.App(ctx, rec.AppID)
+			if err != nil {
+				continue
+			}
+			logo, icon, ok := s.fetchLogoIcon(ctx, provider, refSource(app, rec.ProviderRef), rec.ProviderRef)
+			want.LogoAsset, want.IconAsset, want.LogoIconChecked = firstNonEmpty(logo, rec.LogoAsset), firstNonEmpty(icon, rec.IconAsset), ok
+		}
+		want.LogoLost, want.IconLost = !s.onDisk(want.LogoAsset), !s.onDisk(want.IconAsset)
+		// Written even when nothing was fetched: the bumped updated_at moves an
+		// unanswered record to the back of the queue.
+		if _, err := s.store.SweepWrite(ctx, want); err != nil {
+			s.logSweepWrite(rec.AppID, err)
+			continue
+		}
+		if want.LogoIconChecked {
+			res.LogoIconFilled++
+		}
+	}
+}
+
+// repairMissing keeps every row's cached images and served URLs true to the
+// cache (#441): a database restored into a fresh install, a lost volume, a
+// hand-cleaned cache. "Has a row" is PendingApps' whole predicate, so without
 // this such an app keeps a broken cover forever.
 //
 // A repair is not a re-match. The row's own provider reference is used (the
 // appid for an appid match, the provider ref otherwise), no title is searched,
 // and source, lock and attribution are kept, so an admin's correction stays
-// theirs. Only the missing crops are fetched. A row with no provider reference
-// (an upload or a pasted URL) cannot be fetched again and is reported once.
-// A provider error changes nothing and the next sweep tries again. Repairs
-// share the sweep's batch, so one pass makes at most sweepBatch provider calls
-// for them.
+// theirs; a locked record is repaired too. Only the missing crops are fetched.
+// A row with no provider reference (an upload or a pasted URL) cannot be fetched
+// again and is reported once. A provider error changes nothing and the next
+// sweep tries again. Repairs share the sweep's batch, so one pass makes at most
+// sweepBatch provider calls for them.
+//
+// Every write is SweepWrite, guarded on the row as read: an admin action in
+// between wins, and the sweep retries the row next pass from fresh data.
 func (s *Service) repairMissing(ctx context.Context, provider Provider, res *SweepResult) {
 	recs, err := s.store.RecordsWithAssets(ctx)
 	if err != nil {
@@ -703,69 +782,234 @@ func (s *Service) repairMissing(ctx context.Context, provider Provider, res *Swe
 		return
 	}
 	attempts := 0
+	// A stat that fails for a reason other than not-exist (a restore with the
+	// wrong owner) fails the same way for every app one sweep touches, so the
+	// warning answers once, with a count, not once per app (#734). The first
+	// error is kept verbatim; the per-app skip below is unchanged.
+	var checkErr error
+	checkApps := 0
 	for _, rec := range recs {
-		if ctx.Err() != nil || attempts >= s.sweepBatch {
-			return
+		if ctx.Err() != nil {
+			break
 		}
-		tileMissing := rec.TileAsset != "" && !s.blobs.Has(rec.TileAsset)
-		heroMissing := rec.HeroAsset != "" && !s.blobs.Has(rec.HeroAsset)
-		if !tileMissing && !heroMissing {
+		// A logo or icon is served only when its file is known to be there. One that
+		// is gone is fetched again below; an unlocked provider record also forgets it,
+		// which puts it back on backfillLogoIcon's queue. A locked record keeps the
+		// name, so this check finds it again until a repair succeeds. A file that
+		// cannot be checked is only not served.
+		logoGone, logoErr := s.missing(rec.LogoAsset)
+		iconGone, iconErr := s.missing(rec.IconAsset)
+		want := rec
+		want.LogoLost, want.IconLost = logoGone || logoErr != nil, iconGone || iconErr != nil
+		if rec.Source == SourceProvider && !rec.Locked && (logoGone || iconGone) {
+			want.LogoAsset, want.IconAsset = nameIf(!logoGone, rec.LogoAsset), nameIf(!iconGone, rec.IconAsset)
+			want.LogoIconChecked = false
+		}
+		var ok bool
+		if rec, ok = s.sweepWrite(ctx, rec, want); !ok {
+			continue
+		}
+
+		tileMissing, tileErr := s.missing(rec.TileAsset)
+		heroMissing, heroErr := s.missing(rec.HeroAsset)
+		if err := errors.Join(tileErr, heroErr); err != nil {
+			checkApps++
+			if checkErr == nil {
+				checkErr = fmt.Errorf("app %s: %w", rec.AppID, err)
+			}
+			continue
+		}
+		if !tileMissing && !heroMissing && !logoGone && !iconGone {
 			continue
 		}
 		if rec.ProviderRef == "" || rec.Provider != provider.Name() {
+			if !tileMissing && !heroMissing {
+				continue // a lost logo or icon with nothing to fetch it from stays unserved
+			}
 			if _, seen := s.unrepairable.LoadOrStore(rec.AppID, struct{}{}); !seen {
 				s.log.Warn("artwork: a cached image is missing and has no provider reference to fetch it again from; upload or set it again",
 					"token", "artwork-image-unrecoverable", "app_id", rec.AppID, "source", rec.Source)
 			}
 			continue
 		}
-		attempts++
-		if err := s.repairOne(ctx, provider, rec, tileMissing, heroMissing); err != nil {
-			s.log.Info("artwork: could not fetch a missing cached image again; the next sweep retries",
-				"app_id", rec.AppID, "err", err)
+		if attempts >= s.sweepBatch {
 			continue
 		}
-		res.ArtworkRepaired++
+		attempts++
+		want, got, err := s.refetch(ctx, provider, rec, tileMissing, heroMissing, logoGone, iconGone)
+		if err != nil {
+			s.log.Info("artwork: could not fetch a missing cached image again; the next sweep retries",
+				"app_id", rec.AppID, "err", err)
+		}
+		// A file fetched again often has its old content-addressed name: the row
+		// may not change, the repair still counts.
+		if _, ok := s.sweepWrite(ctx, rec, want); ok && got {
+			s.unrepairable.Delete(rec.AppID)
+			s.log.Info("artwork: fetched a missing cached image again", "app_id", rec.AppID, "source", rec.Source)
+			res.ArtworkRepaired++
+		}
+	}
+	if checkErr != nil {
+		s.log.Warn("artwork: could not check cached images; they are not fetched again",
+			"apps", checkApps, "err", checkErr)
 	}
 }
 
-func (s *Service) repairOne(ctx context.Context, provider Provider, rec Record, tileMissing, heroMissing bool) error {
+// refetch fetches rec's missing crops from its own reference and returns rec
+// with every crop that arrived (got: at least one did). One that failed stays
+// as it was, and the error says which; logo_icon_checked is set only once every
+// lost logo or icon is back or the provider says it has none, and no logo or
+// icon is left empty unasked.
+func (s *Service) refetch(ctx context.Context, provider Provider, rec Record, tileMissing, heroMissing, logoGone, iconGone bool) (_ Record, got bool, _ error) {
 	app, err := s.store.App(ctx, rec.AppID)
 	if err != nil {
-		return err
+		return rec, false, err
 	}
-	var art Candidate
-	if app.ExternalSource != "" && app.ExternalID == rec.ProviderRef {
-		art, err = provider.ArtByExternalRef(ctx, app.ExternalSource, app.ExternalID)
-	} else {
-		art, err = provider.Art(ctx, rec.ProviderRef)
+	source := refSource(app, rec.ProviderRef)
+	var errs []error
+	if tileMissing || heroMissing {
+		var art Candidate
+		if source != "" {
+			art, err = provider.ArtByExternalRef(ctx, source, rec.ProviderRef)
+		} else {
+			art, err = provider.Art(ctx, rec.ProviderRef)
+		}
+		switch {
+		case err != nil:
+			errs = append(errs, err)
+		case tileMissing && art.TileURL == "":
+			errs = append(errs, errors.New("the provider no longer offers a tile image"))
+		case heroMissing && art.HeroURL == "":
+			errs = append(errs, errors.New("the provider no longer offers a hero image"))
+		default:
+			tile, hero, err := s.cacheCrops(ctx, nameIf(tileMissing, art.TileURL), nameIf(heroMissing, art.HeroURL))
+			if err != nil {
+				errs = append(errs, err)
+			} else {
+				rec.TileAsset, rec.HeroAsset = firstNonEmpty(tile, rec.TileAsset), firstNonEmpty(hero, rec.HeroAsset)
+				got = true
+			}
+		}
 	}
+	if logoGone || iconGone {
+		logoURL, iconURL, err := provider.LogoIcon(ctx, source, rec.ProviderRef)
+		if err != nil {
+			return rec, got, errors.Join(append(errs, err)...)
+		}
+		pre, answered := rec, true
+		for _, c := range []struct {
+			gone  bool
+			url   string
+			asset *string
+			lost  *bool
+			crop  string
+		}{{logoGone, logoURL, &rec.LogoAsset, &rec.LogoLost, "logo"}, {iconGone, iconURL, &rec.IconAsset, &rec.IconLost, "icon"}} {
+			if !c.gone {
+				continue
+			}
+			fresh, err := s.cacheOne(ctx, c.url)
+			if err != nil {
+				answered = false
+				errs = append(errs, fmt.Errorf("%s: %w", c.crop, err))
+				continue
+			}
+			*c.asset, *c.lost, got = fresh, false, true
+		}
+		// A crop left empty by an earlier failed download was not asked for here:
+		// the flag stays as it was, so the backfill asks for both.
+		if answered && (logoGone || pre.LogoAsset != "") && (iconGone || pre.IconAsset != "") {
+			rec.LogoIconChecked = true
+		}
+	}
+	return rec, got, errors.Join(errs...)
+}
+
+// sweepWrite writes want over rec, the row as the sweep holds it, when they
+// differ. false: the write was refused (an admin action changed the row since)
+// or failed; the row is retried next pass from fresh data.
+func (s *Service) sweepWrite(ctx context.Context, rec, want Record) (Record, bool) {
+	if want.TileAsset == rec.TileAsset && want.HeroAsset == rec.HeroAsset &&
+		want.LogoAsset == rec.LogoAsset && want.IconAsset == rec.IconAsset &&
+		want.LogoIconChecked == rec.LogoIconChecked &&
+		samePtr(servedPtr(want.LogoAsset, want.LogoLost), rec.LogoURL) &&
+		samePtr(servedPtr(want.IconAsset, want.IconLost), rec.IconURL) {
+		return want, true // nothing to write; want still carries what was decided about the files
+	}
+	next, err := s.store.SweepWrite(ctx, want)
+	if err != nil {
+		s.logSweepWrite(rec.AppID, err)
+		return rec, false
+	}
+	return next, true
+}
+
+func (s *Service) logSweepWrite(appID string, err error) {
+	if errors.Is(err, ErrRowChanged) {
+		s.log.Debug("artwork: the record changed during the sweep; the next sweep retries it", "app_id", appID)
+		return
+	}
+	s.log.Warn("artwork: could not write a swept record", "app_id", appID, "err", err)
+}
+
+func samePtr(a, b *string) bool { return (a == nil && b == nil) || (a != nil && b != nil && *a == *b) }
+
+// nameIf is name when cond holds, else "".
+func nameIf(cond bool, name string) string {
+	if cond {
+		return name
+	}
+	return ""
+}
+
+// refSource is the external source to resolve ref by: the app's own when ref is
+// its external id (an appid match), else "" for the provider's own reference.
+func refSource(app appRef, ref string) string {
+	if app.ExternalSource != "" && app.ExternalID == ref {
+		return app.ExternalSource
+	}
+	return ""
+}
+
+// save is Store.Save serving a logo or icon only when its file is known to be on
+// disk, so an admin re-save of a record with a kept name whose file is gone (a
+// locked record awaiting repair) never serves it.
+func (s *Service) save(ctx context.Context, rec Record) error {
+	rec.LogoLost, rec.IconLost = !s.onDisk(rec.LogoAsset), !s.onDisk(rec.IconAsset)
+	return s.store.Save(ctx, rec)
+}
+
+// saveResolved is the write of a first-time Resolve's decision (#739): as save,
+// but insert-only. ok=false means a concurrent writer (an admin pick or upload,
+// or another resolve racing the same app) created the row between Resolve's
+// initial Get and this write: the concurrent writer's record stands, this
+// resolve's is discarded and nothing the app row says is touched. Any blobs this
+// resolve cached but the winning row does not reference are left for
+// PruneOrphans, which already reclaims every unreferenced blob.
+func (s *Service) saveResolved(ctx context.Context, rec Record) error {
+	rec.LogoLost, rec.IconLost = !s.onDisk(rec.LogoAsset), !s.onDisk(rec.IconAsset)
+	ok, err := s.store.SaveIfAbsent(ctx, rec)
 	if err != nil {
 		return err
 	}
-	var tileURL, heroURL string
-	if tileMissing {
-		if tileURL = art.TileURL; tileURL == "" {
-			return errors.New("the provider no longer offers a tile image")
-		}
+	if !ok {
+		s.log.Debug("artwork: concurrent artwork write won over resolve", "app_id", rec.AppID, "source", rec.Source)
 	}
-	if heroMissing {
-		if heroURL = art.HeroURL; heroURL == "" {
-			return errors.New("the provider no longer offers a hero image")
-		}
-	}
-	tile, hero, err := s.cacheCrops(ctx, tileURL, heroURL)
-	if err != nil {
-		return err
-	}
-	rec.TileAsset = firstNonEmpty(tile, rec.TileAsset)
-	rec.HeroAsset = firstNonEmpty(hero, rec.HeroAsset)
-	if err := s.store.Save(ctx, rec); err != nil {
-		return err
-	}
-	s.unrepairable.Delete(rec.AppID)
-	s.log.Info("artwork: fetched a missing cached image again", "app_id", rec.AppID, "source", rec.Source)
 	return nil
+}
+
+// onDisk is Has with an error read as "not known to be there".
+func (s *Service) onDisk(asset string) bool {
+	ok, err := s.blobs.Has(asset)
+	return ok && err == nil
+}
+
+// missing reports whether a recorded asset's file is gone; "" was never stored.
+func (s *Service) missing(asset string) (bool, error) {
+	if asset == "" {
+		return false, nil
+	}
+	ok, err := s.blobs.Has(asset)
+	return !ok && err == nil, err
 }
 
 // ResolveApps resolves exactly the named apps now, under the sweep's rules —

@@ -706,11 +706,11 @@ func envCIDRs(key string) ([]*net.IPNet, []string, error) {
 		}
 		ones, bits := n.Mask.Size()
 		if ones == 0 {
-			return nil, nil, fmt.Errorf("%s %q: a /0 trusts every address there is, which disables the rate limiters entirely — name the proxy's own network instead", key, field)
+			return nil, nil, fmt.Errorf("%s %q: a /0 trusts every address there is, which disables the rate limiters and lets any peer say its request came over HTTPS — name the proxy's own network instead", key, field)
 		}
 		if ones < 8 {
 			warnings = append(warnings, fmt.Sprintf(
-				"%s entry %q is a /%d of a %d-bit address space — anyone inside it can choose their own rate-limit key; name only the network your proxy runs on",
+				"%s entry %q is a /%d of a %d-bit address space — anyone inside it can choose their own rate-limit key and say a request came over HTTPS; name only the network your proxy runs on",
 				key, n.String(), ones, bits))
 		}
 		out = append(out, n)

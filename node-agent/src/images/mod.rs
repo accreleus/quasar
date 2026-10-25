@@ -141,6 +141,13 @@ pub fn cleanup_attempt(
 /// (agent-api.md).
 const MAX_CONCURRENT_PULLS: usize = 2;
 
+/// How long a background `ready` check keeps retrying a `Busy` engine client: one inspection
+/// budget, enough for a healthy burst to drain (an inspect is milliseconds). On a hung
+/// engine every inspect times out and nothing demotes, so a longer retry would only keep
+/// all four runtime permits taken from launches and readiness. Past it the record is kept
+/// and the next ensure tries again.
+const READY_CHECK_DEADLINE: Duration = crate::runtime::ENGINE_INSPECTION_BUDGET;
+
 /// Wall-clock bound after a catalog pull acquires its shared pull/build permit.
 /// Assignment preparation uses a shorter ten-minute budget.
 const PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -191,6 +198,16 @@ enum ImageOp {
         build_args: BTreeMap<String, String>,
     },
     Remove,
+}
+
+/// Frees an image id's slot in `ready_checks` when its background check ends, even by panic.
+struct ReadyCheck(Arc<ImageManager>, String);
+impl Drop for ReadyCheck {
+    fn drop(&mut self) {
+        if let Ok(mut checks) = self.0.ready_checks.lock() {
+            checks.remove(&self.1);
+        }
+    }
 }
 
 /// What is running now (generation stamped on its worker) and the one queued follow-up.
@@ -430,6 +447,8 @@ pub struct ImageManager {
     inventory_refresh_busy: AtomicBool,
     inventory_last_refresh: Mutex<Instant>,
     warmup_controls: Mutex<Vec<Weak<crate::session::warmup::WarmupControl>>>,
+    /// Image ids with a background `ready` check running (#675): one per image.
+    ready_checks: Mutex<HashSet<String>>,
 }
 
 /// Detaches the upstream sender on every connection-end path, `?` included, so pull
@@ -538,6 +557,7 @@ impl ImageManager {
             inventory_refresh_busy: AtomicBool::new(false),
             inventory_last_refresh: Mutex::new(Instant::now()),
             warmup_controls: Mutex::new(Vec::new()),
+            ready_checks: Mutex::new(HashSet::new()),
         });
         manager.recover_cleanup();
         manager
@@ -1040,6 +1060,19 @@ impl ImageManager {
         }
         if self.plan_ensure(&image_id, &registry_ref, &version) {
             self.spawn_worker(image_id);
+        } else if let Some(recorded) = self.ready_ref(&image_id, &version) {
+            // #675: the ack must not wait on the engine, so the check runs off this task,
+            // one at a time per image.
+            if self.ready_checks.lock().unwrap().insert(image_id.clone()) {
+                let check = ReadyCheck(self.clone(), image_id.clone());
+                let mgr = self.clone();
+                std::thread::spawn(move || {
+                    let _check = check;
+                    if mgr.demote_ready_if_gone(&image_id, &recorded, &registry_ref, &version) {
+                        mgr.spawn_worker(image_id);
+                    }
+                });
+            }
         }
         ack(id, true, None)
     }
@@ -1047,9 +1080,42 @@ impl ImageManager {
     /// Decision + bookkeeping half of [`Self::handle_ensure`] (no thread, no docker);
     /// `true` when a fresh worker must be started.
     fn plan_ensure(self: &Arc<Self>, image_id: &str, registry_ref: &str, version: &str) -> bool {
+        self.plan_ensure_demoting(image_id, registry_ref, version, None)
+    }
+
+    /// [`Self::plan_ensure`], optionally first demoting an idle `ready` record to absent
+    /// (`demote_from`: the recorded ref the engine no longer has). The re-check, the
+    /// demotion and the op start share one lock hold, so a newer ensure or a remove
+    /// cannot slip in between. A demotion with no room for another op still lands:
+    /// the record goes absent and says so, and the next ensure pulls.
+    fn plan_ensure_demoting(
+        self: &Arc<Self>,
+        image_id: &str,
+        registry_ref: &str,
+        version: &str,
+        demote_from: Option<&str>,
+    ) -> bool {
+        let mut demoted = false;
         let started = {
             let mut ops = self.ops.lock().unwrap();
             let mut records = self.records.lock().unwrap();
+            if let Some(recorded) = demote_from {
+                match records.get_mut(image_id) {
+                    Some(rec)
+                        if !ops.contains_key(image_id)
+                            && rec.state == ImageState::Ready
+                            && rec.registry_ref == recorded
+                            && rec.version == version =>
+                    {
+                        rec.mark_absent();
+                        demoted = true;
+                        info!(
+                            "image {image_id}: ready -> Absent, {recorded} is gone from the engine"
+                        );
+                    }
+                    _ => return false,
+                }
+            }
             let slot = ops.get(image_id);
             let decision = decide_ensure(
                 records.get(image_id),
@@ -1059,6 +1125,7 @@ impl ImageManager {
                 registry_ref,
             );
             match decision {
+                OpDecision::Start(_) if demoted && ops.len() >= MAX_CONCURRENT_OPS => false,
                 OpDecision::ReAck | OpDecision::AbsentUnknown => false,
                 OpDecision::Queue(op) => {
                     if let Some(slot) = ops.get_mut(image_id) {
@@ -1085,11 +1152,67 @@ impl ImageManager {
                 }
             }
         };
-        if started {
+        if started || demoted {
             self.persist();
         }
-        self.emit(image_id);
+        // A demotion's `absent` must reach the control plane, which still holds `ready`.
+        if demoted {
+            self.emit_terminal(image_id);
+        } else {
+            self.emit(image_id);
+        }
         started
+    }
+
+    /// The recorded ref of an idle `ready` record at `version`, i.e. what
+    /// [`decide_ensure`] would re-ack.
+    fn ready_ref(&self, image_id: &str, version: &str) -> Option<String> {
+        let ops = self.ops.lock().unwrap();
+        let records = self.records.lock().unwrap();
+        let rec = records.get(image_id)?;
+        (!ops.contains_key(image_id) && rec.state == ImageState::Ready && rec.version == version)
+            .then(|| rec.registry_ref.clone())
+    }
+
+    /// #675: a `ready` record the engine no longer has (removed behind the agent's back)
+    /// would be re-acked as ready until a restart. Blocking, so never on the connection
+    /// task: one inspect of the recorded tag, bounded by `ENGINE_INSPECTION_BUDGET`. If
+    /// the engine definitively says it is gone the record goes absent and the ensure is
+    /// planned again (`true`: the caller starts the worker), the same path an ensure of
+    /// an absent image takes. An engine error or timeout keeps the record, as at startup.
+    /// A `Busy` client (its few slots are all in flight, as in a reconcile burst) is
+    /// retried until `READY_CHECK_DEADLINE` rather than skipped.
+    /// Tests that run an ensure on a `ready` record reach `configured()`'s engine.
+    fn demote_ready_if_gone(
+        self: &Arc<Self>,
+        image_id: &str,
+        recorded_ref: &str,
+        registry_ref: &str,
+        version: &str,
+    ) -> bool {
+        let give_up = Instant::now() + READY_CHECK_DEADLINE;
+        let present = loop {
+            let result = crate::runtime::configured().and_then(|runtime| {
+                runtime
+                    .image_present_within(recorded_ref, crate::runtime::ENGINE_INSPECTION_BUDGET)
+                    .wait()
+            });
+            match result {
+                Err(e) if e.kind == crate::runtime::ErrorKind::Busy => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    // Past the deadline no more submits: a hung wave would refill the permits.
+                    if Instant::now() >= give_up {
+                        break Err(e);
+                    }
+                }
+                other => break other,
+            }
+        };
+        if !matches!(present, Ok(false)) {
+            return false;
+        }
+        let _admission = self.admission.read().unwrap();
+        self.plan_ensure_demoting(image_id, registry_ref, version, Some(recorded_ref))
     }
 
     /// `image_build` (agent-api.md). Acks immediately; download + `docker build` run
@@ -1806,8 +1929,11 @@ impl ImageManager {
 
     /// An id already holding a slot always may (it only re-acks or replaces pending);
     /// a new id only under [`MAX_CONCURRENT_OPS`]. Checked before planning because a
-    /// refusal is an `ack{ok:false}`, not a state transition. The single connection
-    /// task dispatches sequentially, so the check-then-act gap cannot be raced.
+    /// refusal is an `ack{ok:false}`, not a state transition. Advisory, not atomic with
+    /// the insert: the connection task and the diagnostic socket each dispatch sequentially
+    /// but not against each other, and a background `ready` check also starts ops
+    /// (re-checking the cap itself, under the lock), so the cap can be overshot by two at
+    /// most.
     fn has_op_capacity(&self, image_id: &str) -> bool {
         let ops = self.ops.lock().unwrap();
         ops.contains_key(image_id) || ops.len() < MAX_CONCURRENT_OPS
@@ -1916,11 +2042,17 @@ impl ImageManager {
             self.emit_terminal(image_id);
             return;
         }
-        let result = crate::runtime::configured().and_then(|runtime| {
-            runtime
-                .remove_image(&registry_ref, Duration::from_secs(60))
-                .wait()
-        });
+        let timeout = Duration::from_secs(60);
+        let result =
+            match self.submit_until_admitted(image_id, generation, Instant::now() + timeout, || {
+                crate::runtime::configured()
+                    .and_then(|runtime| runtime.remove_image(&registry_ref, timeout).wait())
+            }) {
+                // Superseded while waiting for a slot: nothing was removed and nothing failed.
+                Ok(None) => return,
+                Ok(Some(())) => Ok(()),
+                Err(error) => Err(error),
+            };
         match result {
             Ok(()) => {
                 self.commit(image_id, generation, |rec| rec.mark_absent());
@@ -1955,7 +2087,10 @@ impl ImageManager {
         self.emit(image_id);
 
         match self.pull_with_progress(image_id, generation, registry_ref) {
-            Ok(bytes) => {
+            // Superseded while waiting for a slot: nothing was pulled and nothing failed.
+            // Leave the record as staged; the worker promotes the queued op.
+            Ok(None) => return,
+            Ok(Some(bytes)) => {
                 self.commit(image_id, generation, |rec| rec.mark_ready(bytes));
                 info!("image {image_id} ({registry_ref}) pulled: ready ({bytes} bytes), version {version}");
                 // The one choke-point where an image becomes usable on this host, so
@@ -1974,25 +2109,66 @@ impl ImageManager {
         self.emit_terminal(image_id);
     }
 
+    /// `generation`'s op still owns the slot and nothing newer is queued behind it.
+    fn is_latest_intent(&self, image_id: &str, generation: u64) -> bool {
+        let ops = self.ops.lock().unwrap();
+        ops.get(image_id)
+            .is_some_and(|slot| slot.generation == generation && slot.pending.is_none())
+    }
+
     /// Observe coalesced API progress; engine work outlives control-plane reconnects.
+    /// `Ok(None)`: a queued op replaced this pull while it waited out `Busy`.
     fn pull_with_progress(
         &self,
         image_id: &str,
         generation: u64,
         registry_ref: &str,
-    ) -> Result<u64, String> {
+    ) -> Result<Option<u64>, String> {
         let runtime = crate::runtime::configured().map_err(errors::map_runtime_error)?;
         let mut throttle = ProgressThrottle::new();
-        runtime
-            .ensure_image(registry_ref, PULL_TIMEOUT)
-            .wait(|sample| {
-                if throttle.should_emit(Instant::now(), sample.percent) {
-                    self.set_pulling(image_id, generation, sample.percent, sample.bytes);
-                    self.emit(image_id);
+        self.submit_until_admitted(image_id, generation, Instant::now() + PULL_TIMEOUT, || {
+            runtime
+                .ensure_image(registry_ref, PULL_TIMEOUT)
+                .wait(|sample| {
+                    if throttle.should_emit(Instant::now(), sample.percent) {
+                        self.set_pulling(image_id, generation, sample.percent, sample.bytes);
+                        self.emit(image_id);
+                    }
+                })
+        })
+        .map(|info| info.map(|info| info.bytes))
+        .map_err(errors::map_runtime_error)
+    }
+
+    /// Submit a runtime call until the client admits it, this op is superseded, or `deadline`
+    /// passes. An admission `Busy` reached no engine and wrote nothing, so it must never end an
+    /// op `failed` (the control plane counts that as one of its attempts): every image op goes
+    /// through here, and the client frees every slot within `permit_hold`.
+    /// `Ok(None)`: a queued op replaced this one while it waited.
+    fn submit_until_admitted<T>(
+        &self,
+        image_id: &str,
+        generation: u64,
+        deadline: Instant,
+        mut call: impl FnMut() -> Result<T, crate::runtime::RuntimeError>,
+    ) -> Result<Option<T>, crate::runtime::RuntimeError> {
+        loop {
+            match call() {
+                Err(e) if e.kind == crate::runtime::ErrorKind::Busy => {
+                    std::thread::sleep(crate::session::teardown::STOP_PAUSE);
+                    // A resubmitted pull is detached and ignores cancellation, so ask only
+                    // while this op is still the latest intent. Checked before the deadline
+                    // so a queued op is never reported as a busy failure.
+                    if !self.is_latest_intent(image_id, generation) {
+                        return Ok(None);
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
                 }
-            })
-            .map(|info| info.bytes)
-            .map_err(errors::map_runtime_error)
+                other => return other.map(Some),
+            }
+        }
     }
 
     /// Run a template build: take a shared pull/build permit, disk-guard, download +
@@ -2039,7 +2215,9 @@ impl ImageManager {
             build_args,
             deadline,
         ) {
-            Ok(bytes) => {
+            // Superseded while waiting for a slot: nothing was built and nothing failed.
+            Ok(None) => return,
+            Ok(Some(bytes)) => {
                 self.commit(image_id, generation, |rec| rec.mark_ready(bytes));
                 info!("image {image_id} ({local_tag}) built: ready ({bytes} bytes), version {version}");
                 self.notify_ready(image_id, local_tag, version);
@@ -2069,7 +2247,7 @@ impl ImageManager {
         dockerfile: &str,
         build_args: &BTreeMap<String, String>,
         deadline: Instant,
-    ) -> Result<u64, String> {
+    ) -> Result<Option<u64>, String> {
         let scratch = self.build_scratch_dir(image_id, generation);
         // Clear any stale dir from a crashed prior build.
         let _ = std::fs::remove_dir_all(&scratch);
@@ -2144,19 +2322,24 @@ impl ImageManager {
         generation: u64,
         request: crate::runtime::BuildRequest,
         deadline: Instant,
-    ) -> Result<u64, String> {
+    ) -> Result<Option<u64>, String> {
         let runtime = crate::runtime::configured().map_err(errors::map_runtime_error)?;
         let mut throttle = ProgressThrottle::new();
-        runtime
-            .build_image(request, deadline.saturating_duration_since(Instant::now()))
-            .wait(|sample| {
-                if throttle.should_emit(Instant::now(), sample.percent) {
-                    self.set_building(image_id, generation, Some(sample.percent));
-                    self.emit(image_id);
-                }
-            })
-            .map(|image| image.bytes)
-            .map_err(errors::map_runtime_error)
+        self.submit_until_admitted(image_id, generation, deadline, || {
+            runtime
+                .build_image(
+                    request.clone(),
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .wait(|sample| {
+                    if throttle.should_emit(Instant::now(), sample.percent) {
+                        self.set_building(image_id, generation, Some(sample.percent));
+                        self.emit(image_id);
+                    }
+                })
+        })
+        .map(|image| image.map(|image| image.bytes))
+        .map_err(errors::map_runtime_error)
     }
 
     /// Apply a transition only if this worker still owns the slot at its generation.
@@ -2329,6 +2512,7 @@ impl ImageManager {
             inventory_refresh_busy: AtomicBool::new(false),
             inventory_last_refresh: Mutex::new(Instant::now()),
             warmup_controls: Mutex::new(Vec::new()),
+            ready_checks: Mutex::new(HashSet::new()),
         })
     }
 
@@ -2348,7 +2532,7 @@ impl ImageManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn mgr() -> Arc<ImageManager> {
@@ -2369,6 +2553,7 @@ mod tests {
             inventory_refresh_busy: AtomicBool::new(false),
             inventory_last_refresh: Mutex::new(Instant::now()),
             warmup_controls: Mutex::new(Vec::new()),
+            ready_checks: Mutex::new(HashSet::new()),
         })
     }
 
@@ -3659,6 +3844,573 @@ mod tests {
 
     // serialization bookkeeping (no threads, no docker)
 
+    /// #675. `configured()` is process-wide, so the engine is faked in a child process
+    /// (running `test`, `mode` in `QUASAR_IMAGES_ENGINE_CHILD`) pointed at a socket this
+    /// process serves: `/version`, then `image` (after `delay`) for every other request:
+    /// 404, 500, or never answered. Returns how many such requests the child made.
+    pub(crate) fn run_against_fake_engine(
+        test: &str,
+        mode: &str,
+        image: Option<(u16, &str)>,
+        delay: Duration,
+    ) -> usize {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let no_context = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test])
+            .env("QUASAR_IMAGES_ENGINE_CHILD", mode)
+            .env("DOCKER_HOST", format!("unix://{}", socket.display()))
+            .env("DOCKER_CONFIG", no_context.path())
+            .env_remove("CONTAINER_HOST")
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_TLS")
+            .env_remove("DOCKER_TLS_VERIFY")
+            .env_remove("DOCKER_API_VERSION")
+            .spawn()
+            .unwrap();
+        let (give_up, mut inspects, mut held) = (Instant::now(), 0, Vec::new());
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if give_up.elapsed() > Duration::from_secs(60) {
+                let _ = child.kill();
+                panic!("child did not finish");
+            }
+            let Ok((mut conn, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            conn.set_nonblocking(false).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                conn.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            let (code, body) = if request.contains("/version") {
+                (
+                    200,
+                    r#"{"Platform":{"Name":"Docker Engine - Community"},"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.24"}"#,
+                )
+            } else {
+                inspects += 1;
+                match image {
+                    // A ref containing "hang" is accepted and never answered, whatever `image` says.
+                    Some(reply) if !request.contains("hang") => reply,
+                    _ => {
+                        held.push(conn);
+                        continue;
+                    }
+                }
+            };
+            // Answered on its own thread, so a delay holds the client's slot without
+            // serialising the other requests.
+            let body = body.to_owned();
+            std::thread::spawn(move || {
+                std::thread::sleep(if code == 200 { Duration::ZERO } else { delay });
+                let _ = write!(conn, "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            });
+        };
+        assert!(status.success());
+        inspects
+    }
+
+    pub(crate) fn engine_child_mode() -> Option<String> {
+        std::env::var("QUASAR_IMAGES_ENGINE_CHILD").ok()
+    }
+
+    fn ready_manager() -> Arc<ImageManager> {
+        let m = ImageManager::empty_for_test();
+        m.set_ready_for_test("steam", REF1, "v1");
+        m
+    }
+
+    #[test]
+    fn ensure_of_a_ready_image_the_engine_lost_takes_the_pull_path() {
+        const THIS: &str =
+            "images::tests::ensure_of_a_ready_image_the_engine_lost_takes_the_pull_path";
+        if engine_child_mode().is_some() {
+            let m = ready_manager();
+            assert!(
+                m.demote_ready_if_gone("steam", REF1, REF1, "v1"),
+                "a lost tag must start a pull"
+            );
+            assert_eq!(
+                m.records.lock().unwrap()["steam"].state,
+                ImageState::Pulling
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        assert_eq!(
+            run_against_fake_engine(THIS, "lost", reply, Duration::ZERO),
+            1
+        );
+    }
+
+    /// End to end through `handle_ensure`: acked as ready, then the background check
+    /// finds the tag gone and a worker runs the normal pull op to its end (the fake
+    /// engine fails it): the record leaves `ready`, the op slot empties, and the engine
+    /// saw the inspect and then the pull.
+    #[test]
+    fn a_lost_tag_found_after_the_ack_starts_a_pull() {
+        const THIS: &str = "images::tests::a_lost_tag_found_after_the_ack_starts_a_pull";
+        if engine_child_mode().is_some() {
+            let m = ready_manager();
+            match m.handle_ensure("e".into(), "steam".into(), REF1.into(), "v1".into()) {
+                AgentMsg::Ack { ok, .. } => assert!(ok),
+                other => panic!("expected Ack, got {other:?}"),
+            }
+            let give_up = Instant::now();
+            while m.records.lock().unwrap()["steam"].state == ImageState::Ready {
+                assert!(give_up.elapsed() < Duration::from_secs(10), "still ready");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            while m.ops.lock().unwrap().contains_key("steam") {
+                assert!(
+                    give_up.elapsed() < Duration::from_secs(10),
+                    "no worker ran the op"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = run_against_fake_engine(THIS, "e2e", reply, Duration::ZERO);
+        assert!(served >= 2, "inspect, then a pull: {served}");
+    }
+
+    /// More ready images (8) than the engine client has slots (4), against an engine that
+    /// answers 404 after a short delay: the surplus gets `Busy` and must retry, not give
+    /// up, and each re-pull a 404 starts must reach the engine rather than fail `Busy`
+    /// against the sibling checks still retrying. A pull that reached the engine ends in
+    /// the engine's own error (the fake 404s the pull too), never "runtime busy".
+    #[test]
+    fn a_burst_of_more_ready_images_than_engine_slots_is_all_repulled() {
+        const THIS: &str =
+            "images::tests::a_burst_of_more_ready_images_than_engine_slots_is_all_repulled";
+        const IDS: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        if engine_child_mode().is_some() {
+            let m = ImageManager::empty_for_test();
+            for id in IDS {
+                m.set_ready_for_test(id, REF1, "v1");
+            }
+            for id in IDS {
+                m.handle_ensure("e".into(), id.into(), REF1.into(), "v1".into());
+            }
+            let give_up = Instant::now();
+            while IDS.iter().any(|id| {
+                m.records.lock().unwrap()[*id].state != ImageState::Failed
+                    || m.ops.lock().unwrap().contains_key(*id)
+            }) {
+                assert!(
+                    give_up.elapsed() < Duration::from_secs(60),
+                    "an image was not inspected and pulled"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            for id in IDS {
+                let error = m.records.lock().unwrap()[id].error.clone();
+                assert_ne!(
+                    error,
+                    errors::map_runtime_error(crate::runtime::ErrorKind::Busy.into()),
+                    "{id}"
+                );
+            }
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = run_against_fake_engine(THIS, "slots", reply, Duration::from_millis(300));
+        assert!(served >= 2 * IDS.len(), "{served}");
+    }
+
+    /// A pull refused an engine slot (`Busy`) waits for one rather than ending `failed`:
+    /// with all four slots held by unanswered inspects (released after 1 s) the pull still
+    /// reaches the engine.
+    #[test]
+    fn a_pull_refused_a_slot_waits_for_one_instead_of_failing_busy() {
+        const THIS: &str =
+            "images::tests::a_pull_refused_a_slot_waits_for_one_instead_of_failing_busy";
+        if engine_child_mode().is_some() {
+            let runtime = crate::runtime::configured().unwrap();
+            let _held: Vec<_> = (0..4)
+                .map(|i| {
+                    runtime
+                        .image_present_within(format!("ghcr.io/x/hang:{i}"), Duration::from_secs(1))
+                })
+                .collect();
+            let m = ImageManager::empty_for_test();
+            m.ops.lock().unwrap().insert(
+                "steam".into(),
+                OpSlot {
+                    running: ensure("v1", REF1),
+                    generation: 1,
+                    pending: None,
+                },
+            );
+            let error = m.pull_with_progress("steam", 1, REF1).unwrap_err();
+            assert_ne!(
+                error,
+                errors::map_runtime_error(crate::runtime::ErrorKind::Busy.into())
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = run_against_fake_engine(THIS, "pull-busy", reply, Duration::ZERO);
+        assert!(served >= 6, "four held inspects, then the pull: {served}");
+    }
+
+    /// #691: all four slots held by inspects that never get an answer (5 s budget each): the
+    /// client frees them after its hold, and a pull reaches the engine instead of ending
+    /// `failed` "runtime busy", which the control plane counts as an attempt.
+    #[test]
+    fn a_pull_behind_a_hung_inspect_wave_reaches_the_engine() {
+        const THIS: &str = "images::tests::a_pull_behind_a_hung_inspect_wave_reaches_the_engine";
+        if engine_child_mode().is_some() {
+            let runtime = crate::runtime::configured().unwrap();
+            let _held: Vec<_> = (0..4)
+                .map(|i| {
+                    runtime.image_present_within(
+                        format!("ghcr.io/x/hang:{i}"),
+                        crate::runtime::ENGINE_INSPECTION_BUDGET,
+                    )
+                })
+                .collect();
+            let m = ImageManager::empty_for_test();
+            m.ops.lock().unwrap().insert(
+                "steam".into(),
+                OpSlot {
+                    running: ensure("v1", REF1),
+                    generation: 1,
+                    pending: None,
+                },
+            );
+            let error = m.pull_with_progress("steam", 1, REF1).unwrap_err();
+            assert_ne!(
+                error,
+                errors::map_runtime_error(crate::runtime::ErrorKind::Busy.into())
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = run_against_fake_engine(THIS, "pull-wave", reply, Duration::ZERO);
+        assert!(served >= 6, "four held inspects, then the pull: {served}");
+    }
+
+    /// #691: a remove refused a slot asks again instead of leaving the image on the daemon.
+    #[test]
+    fn a_remove_refused_a_slot_waits_for_one() {
+        const THIS: &str = "images::tests::a_remove_refused_a_slot_waits_for_one";
+        if engine_child_mode().is_some() {
+            let runtime = crate::runtime::configured().unwrap();
+            let _held: Vec<_> = (0..4)
+                .map(|i| {
+                    runtime
+                        .image_present_within(format!("ghcr.io/x/hang:{i}"), Duration::from_secs(1))
+                })
+                .collect();
+            let m = ready_manager();
+            m.ops.lock().unwrap().insert(
+                "steam".into(),
+                OpSlot {
+                    running: ImageOp::Remove,
+                    generation: 1,
+                    pending: None,
+                },
+            );
+            m.run_remove("steam", 1);
+            assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Absent);
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = run_against_fake_engine(THIS, "remove-busy", reply, Duration::ZERO);
+        assert!(served >= 5, "four held inspects, then the remove: {served}");
+    }
+
+    /// #691: a build refused a slot asks again instead of ending `failed` "runtime busy", which
+    /// the control plane counts as an attempt although no engine was reached.
+    #[test]
+    fn a_build_refused_a_slot_waits_for_one() {
+        const THIS: &str = "images::tests::a_build_refused_a_slot_waits_for_one";
+        if engine_child_mode().is_some() {
+            let runtime = crate::runtime::configured().unwrap();
+            let _held: Vec<_> = (0..4)
+                .map(|i| {
+                    runtime
+                        .image_present_within(format!("ghcr.io/x/hang:{i}"), Duration::from_secs(1))
+                })
+                .collect();
+            let context = tempfile::tempdir().unwrap();
+            std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+            let m = ImageManager::empty_for_test();
+            m.ops.lock().unwrap().insert(
+                "steam".into(),
+                OpSlot {
+                    running: ImageOp::Build {
+                        version: "v1".into(),
+                        local_tag: "quasar/steam:test".into(),
+                        context_url: String::new(),
+                        context_subdir: String::new(),
+                        dockerfile: "Dockerfile".into(),
+                        build_args: BTreeMap::new(),
+                    },
+                    generation: 1,
+                    pending: None,
+                },
+            );
+            let request = crate::runtime::BuildRequest {
+                tag: "quasar/steam:test".into(),
+                context_dir: context.path().to_path_buf(),
+                dockerfile: "Dockerfile".into(),
+                build_args: BTreeMap::new(),
+            };
+            let outcome = m.build_with_progress(
+                "steam",
+                1,
+                request,
+                Instant::now() + Duration::from_secs(30),
+            );
+            assert_ne!(
+                outcome,
+                Err(errors::map_runtime_error(
+                    crate::runtime::ErrorKind::Busy.into()
+                ))
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = run_against_fake_engine(THIS, "build-busy", reply, Duration::ZERO);
+        assert!(served >= 4, "four held inspects, then the build: {served}");
+    }
+
+    /// #691: the `absent` of a demotion with the op map full is retried on the heartbeat
+    /// when the first send is dropped, so the control plane does not keep `ready`.
+    #[test]
+    fn a_dropped_absent_from_a_demotion_is_delivered_later() {
+        let m = ready_manager();
+        let (tx, mut rx) = mpsc::channel(1);
+        let _guard = m.attach_upstream(tx.clone());
+        while rx.try_recv().is_ok() {}
+        tx.try_send(ack("filler".into(), true, None)).unwrap();
+        for i in 0..MAX_CONCURRENT_OPS {
+            m.ops.lock().unwrap().insert(
+                format!("other{i}"),
+                OpSlot {
+                    running: ensure("v1", REF2),
+                    generation: 1,
+                    pending: None,
+                },
+            );
+        }
+        assert!(!m.plan_ensure_demoting("steam", REF1, "v1", Some(REF1)));
+        while rx.try_recv().is_ok() {}
+        m.flush_terminal_states();
+        match rx.try_recv() {
+            Ok(AgentMsg::ImageState { state, .. }) => assert_eq!(state, "absent"),
+            other => panic!("expected the absent state, got {other:?}"),
+        }
+    }
+
+    /// A first pull (no `registry_ref` yet) waiting out `Busy` with all four engine slots held
+    /// is replaced by a remove queued meanwhile. Driven through the worker: no
+    /// `ensure_image` reaches the engine, no `failed` state is emitted or committed, and
+    /// the record ends `absent`.
+    #[test]
+    fn a_queued_remove_supersedes_a_pull_waiting_out_busy_without_a_failed_state() {
+        const THIS: &str =
+            "images::tests::a_queued_remove_supersedes_a_pull_waiting_out_busy_without_a_failed_state";
+        if engine_child_mode().is_some() {
+            let runtime = crate::runtime::configured().unwrap();
+            let _held: Vec<_> = (0..4)
+                .map(|i| {
+                    runtime.image_present_within(
+                        format!("ghcr.io/x/hang:{i}"),
+                        crate::runtime::ENGINE_INSPECTION_BUDGET,
+                    )
+                })
+                .collect();
+            let m = ImageManager::empty_for_test();
+            let (tx, mut rx) = mpsc::channel(64);
+            let _guard = m.attach_upstream(tx);
+            match m.handle_ensure("e".into(), "steam".into(), REF1.into(), "v1".into()) {
+                AgentMsg::Ack { ok, .. } => assert!(ok),
+                other => panic!("expected Ack, got {other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            m.handle_remove("r".into(), "steam".into());
+            let give_up = Instant::now();
+            while m.ops.lock().unwrap().contains_key("steam") {
+                assert!(
+                    give_up.elapsed() < Duration::from_secs(10),
+                    "worker never finished"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Absent);
+            let mut states = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                if let AgentMsg::ImageState { state, .. } = msg {
+                    states.push(state);
+                }
+            }
+            assert!(!states.iter().any(|s| s == "failed"), "{states:?}");
+            assert_eq!(
+                states.last().map(String::as_str),
+                Some("absent"),
+                "{states:?}"
+            );
+            return;
+        }
+        let reply = Some((404, r#"{"message":"No such image"}"#));
+        let served = run_against_fake_engine(THIS, "superseded", reply, Duration::ZERO);
+        assert_eq!(served, 4, "only the held inspects reach the engine");
+    }
+
+    /// A repeated ensure for an image whose check is already running spawns no second
+    /// inspect.
+    #[test]
+    fn a_repeated_ready_ensure_runs_one_check() {
+        const THIS: &str = "images::tests::a_repeated_ready_ensure_runs_one_check";
+        if engine_child_mode().is_some() {
+            let m = ready_manager();
+            for _ in 0..3 {
+                m.handle_ensure("e".into(), "steam".into(), REF1.into(), "v1".into());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            return;
+        }
+        assert_eq!(
+            run_against_fake_engine(THIS, "once", None, Duration::ZERO),
+            1
+        );
+    }
+
+    /// The demotion re-checks under the same lock hold as the op start: a record that
+    /// moved to another version (or has an op) since the check began is left alone.
+    #[test]
+    fn a_demotion_for_a_stale_version_or_a_busy_image_is_dropped() {
+        let m = ready_manager();
+        assert!(!m.plan_ensure_demoting("steam", REF1, "v0", Some(REF1)));
+        assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Ready);
+        assert!(!m.plan_ensure_demoting("steam", REF1, "v1", Some(REF2)));
+        assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Ready);
+        m.ops.lock().unwrap().insert(
+            "steam".into(),
+            OpSlot {
+                running: ensure("v2", REF2),
+                generation: 1,
+                pending: None,
+            },
+        );
+        assert!(!m.plan_ensure_demoting("steam", REF1, "v1", Some(REF1)));
+        assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Ready);
+    }
+
+    /// A definitive miss demotes even with the op map full: the record goes absent and
+    /// says so, and no op starts.
+    #[test]
+    fn a_demotion_with_a_full_op_map_still_reports_absent() {
+        let m = ready_manager();
+        let (tx, mut rx) = mpsc::channel(8);
+        let _guard = m.attach_upstream(tx);
+        for i in 0..MAX_CONCURRENT_OPS {
+            m.ops.lock().unwrap().insert(
+                format!("other{i}"),
+                OpSlot {
+                    running: ensure("v1", REF2),
+                    generation: 1,
+                    pending: None,
+                },
+            );
+        }
+        assert!(!m.plan_ensure_demoting("steam", REF1, "v1", Some(REF1)));
+        assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Absent);
+        assert!(!m.ops.lock().unwrap().contains_key("steam"));
+        let mut last = None;
+        while let Ok(AgentMsg::ImageState { state, .. }) = rx.try_recv() {
+            last = Some(state);
+        }
+        assert_eq!(last.as_deref(), Some("absent"));
+    }
+
+    #[test]
+    fn an_engine_error_on_the_inspect_keeps_the_ready_record() {
+        const THIS: &str = "images::tests::an_engine_error_on_the_inspect_keeps_the_ready_record";
+        if engine_child_mode().is_some() {
+            let m = ready_manager();
+            assert!(!m.demote_ready_if_gone("steam", REF1, REF1, "v1"));
+            assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Ready);
+            return;
+        }
+        let reply = Some((500, r#"{"message":"boom"}"#));
+        assert_eq!(
+            run_against_fake_engine(THIS, "error", reply, Duration::ZERO),
+            1
+        );
+    }
+
+    /// A hung engine is bounded by `ENGINE_INSPECTION_BUDGET` and keeps the record.
+    #[test]
+    fn a_hung_engine_inspect_is_bounded_and_keeps_the_ready_record() {
+        const THIS: &str =
+            "images::tests::a_hung_engine_inspect_is_bounded_and_keeps_the_ready_record";
+        if engine_child_mode().is_some() {
+            let m = ready_manager();
+            let started = Instant::now();
+            assert!(!m.demote_ready_if_gone("steam", REF1, REF1, "v1"));
+            assert!(
+                started.elapsed()
+                    < crate::runtime::ENGINE_INSPECTION_BUDGET + Duration::from_secs(3),
+                "blocked {:?}",
+                started.elapsed()
+            );
+            assert_eq!(m.records.lock().unwrap()["steam"].state, ImageState::Ready);
+            return;
+        }
+        assert_eq!(
+            run_against_fake_engine(THIS, "hung", None, Duration::ZERO),
+            1
+        );
+    }
+
+    /// The ack never waits on the engine: a burst of ready ensures against an engine
+    /// that never answers is acked at once (the control plane's ack timeout is 15 s).
+    #[test]
+    fn a_burst_of_ready_ensures_is_acked_without_waiting_for_a_hung_engine() {
+        const THIS: &str =
+            "images::tests::a_burst_of_ready_ensures_is_acked_without_waiting_for_a_hung_engine";
+        if engine_child_mode().is_some() {
+            let m = ImageManager::empty_for_test();
+            for id in ["a", "b", "c"] {
+                m.set_ready_for_test(id, REF1, "v1");
+            }
+            let started = Instant::now();
+            for id in ["a", "b", "c"] {
+                match m.handle_ensure("e".into(), id.into(), REF1.into(), "v1".into()) {
+                    AgentMsg::Ack { ok, .. } => assert!(ok),
+                    other => panic!("expected Ack, got {other:?}"),
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+            for id in ["a", "b", "c"] {
+                assert_eq!(m.records.lock().unwrap()[id].state, ImageState::Ready);
+            }
+            return;
+        }
+        run_against_fake_engine(THIS, "burst", None, Duration::ZERO);
+    }
+
     #[test]
     fn plan_ensure_stages_a_pulling_record_synchronously_so_reack_can_emit() {
         let m = mgr();
@@ -3801,6 +4553,7 @@ mod tests {
             config_policy_versions: None,
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
+            parked_sessions_v1: None,
             node_name: "n".to_string(),
             agent_version: "v".to_string(),
             auth: crate::messages::Auth::Enrollment {

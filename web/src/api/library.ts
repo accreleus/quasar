@@ -6,10 +6,12 @@ import type {
   AppsResponse,
   HighlightsResponse,
   LaunchResponse,
+  PlayHistoryResponse,
   ProfilePreferencesResponse,
   ProfilesResponse,
   SessionResponse,
   SignalingCoords,
+  SteamDialogs,
 } from "./types";
 
 export interface MySessionsResponse {
@@ -31,6 +33,11 @@ export function listApps(token: string): Promise<AppsResponse> {
  *  re-derive or re-sort it, or two rankers drift apart. Empty is a normal 200. */
 export function getHighlights(token: string): Promise<HighlightsResponse> {
   return apiFetch<HighlightsResponse>("/me/highlights", { token });
+}
+
+/** The caller's own play history, one item per app played (control-api.md amendment 38). */
+export function getPlayHistory(token: string): Promise<PlayHistoryResponse> {
+  return apiFetch<PlayHistoryResponse>("/me/play-history", { token });
 }
 
 export function favouriteApp(token: string, appId: string): Promise<void> {
@@ -84,6 +91,24 @@ export function updateProfilePreferences(
     body: { default_profile_id: defaultProfileId },
     token,
   });
+}
+
+/** PATCH with ONLY `steam_dialogs`: the server then leaves the default profile
+ *  alone (control-api.md §Warm Steam, "steam_dialogs"). */
+export function updateSteamDialogs(
+  token: string,
+  steamDialogs: SteamDialogs,
+): Promise<ProfilePreferencesResponse> {
+  return apiFetch<ProfilePreferencesResponse>("/me/profile-preferences", {
+    method: "PATCH",
+    body: { steam_dialogs: steamDialogs },
+    token,
+  });
+}
+
+/** The library heartbeat (control-api.md §Warm Steam): always 204, no body. */
+export function putSteamWarm(token: string, signal?: AbortSignal): Promise<void> {
+  return apiFetch<void>("/me/steam-warm", { method: "PUT", token, signal });
 }
 
 /** Pass `signal` to abort on unmount: a request that outlives its component

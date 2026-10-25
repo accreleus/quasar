@@ -12,7 +12,15 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 
 import { CommandPalette } from "./CommandPalette";
 import { AuthContext, type AuthContextValue } from "../../auth/context";
+import { OverlayPreferencesProvider } from "../../settings/OverlayPreferencesContext";
 import { ThemeProvider } from "../../settings/ThemeContext";
+
+// The provider reads the layout choice from here; a failed read keeps the
+// device's cached choice, which is how each test picks classic or new.
+vi.mock("../../api/me", () => ({
+  getUIPreferences: vi.fn().mockRejectedValue(new Error("offline")),
+  patchUIPreferences: vi.fn().mockResolvedValue({}),
+}));
 
 const apps = [{ id: "a1", name: "Blender", kind: "desktop" }];
 const hosts = [{ id: "h1", node_name: "quasar-node-1", status: "online" }];
@@ -49,13 +57,18 @@ function Harness() {
   );
 }
 
-function renderPalette() {
+/** Classic by default: every test below is about the palette as it shipped.
+ *  The new design's settings results are tested at the end. */
+function renderPalette(path = "/admin", classic = true) {
+  localStorage.setItem("quasar.ui.classic.u1", classic ? "1" : "0");
   return render(
-    <MemoryRouter initialEntries={["/admin"]}>
+    <MemoryRouter initialEntries={[path]}>
       <AuthContext.Provider value={auth}>
-        <ThemeProvider>
-          <Harness />
-        </ThemeProvider>
+        <OverlayPreferencesProvider>
+          <ThemeProvider>
+            <Harness />
+          </ThemeProvider>
+        </OverlayPreferencesProvider>
       </AuthContext.Provider>
     </MemoryRouter>,
   );
@@ -256,5 +269,56 @@ describe("CommandPalette result semantics", () => {
     for (const option of screen.getAllByRole("option")) {
       expect(option.parentElement).toHaveAttribute("role", "group");
     }
+  });
+});
+
+describe("CommandPalette settings results (new design)", () => {
+  const type = (q: string) => {
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    fireEvent.change(input(), { target: { value: q } });
+  };
+
+  it("classic layout finds no settings and keeps the shipped placeholder", () => {
+    renderPalette("/app/account/profile", true);
+    type("classic");
+    expect(screen.queryByText("Classic layout")).toBeNull();
+    expect(input()).toHaveAttribute("placeholder", expect.stringContaining("hosts"));
+  });
+
+  it("new design finds the Classic layout switch from the account area", () => {
+    renderPalette("/app/account/profile", false);
+    type("old design");
+    expect(screen.getByRole("option", { name: /Classic layout/ })).toBeInTheDocument();
+    expect(input()).toHaveAttribute("placeholder", "Search settings and games");
+  });
+
+  it("choosing a setting goes to its page", () => {
+    renderPalette("/app/library", false);
+    type("classic");
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect(screen.getByTestId("where")).toHaveTextContent("/app/account/appearance");
+  });
+
+  it("lists this admin area's pages in the admin console", () => {
+    renderPalette("/admin/fleet/hosts", false);
+    type("releases");
+    expect(screen.getByRole("option", { name: /Releases/ })).toBeInTheDocument();
+  });
+
+  it("classic layout on /admin keeps the shipped palette exactly", () => {
+    renderPalette("/admin/fleet/hosts", true);
+    type("releases");
+    expect(screen.queryByText("Elsewhere in the console")).toBeNull();
+    expect(screen.queryByRole("option", { name: /Releases/ })).toBeNull();
+    expect(input()).toHaveAttribute("placeholder", expect.stringContaining("hosts"));
+  });
+
+  it("new design in the console still finds the Go to jumps by their name", () => {
+    renderPalette("/admin/sessions", false);
+    type("go to fleet");
+    expect(screen.getByRole("option", { name: /Go to Fleet/ })).toBeInTheDocument();
+    type("go to");
+    expect(screen.getAllByRole("option").length).toBeGreaterThan(1);
+    expect(screen.getByRole("option", { name: /Go to Fleet/ })).toBeInTheDocument();
   });
 });

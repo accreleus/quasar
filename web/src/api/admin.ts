@@ -47,6 +47,7 @@ import type {
   PlatformReleaseView,
   PlatformWebhookTestResponse,
   ReleaseChannel,
+  SteamWarmRewarm,
   RegistrationMode,
   StorageProvider,
   InvitesResponse,
@@ -195,6 +196,11 @@ export function updateSettings(
     /** Unattended automatic apply (#122). Refuses nothing: with nothing to
      *  apply it applies nothing and records why in the detection run. */
     platform_auto_apply?: boolean;
+    /** Warm Steam (amendment 39). Off stops new parked sessions. */
+    steam_warm_enabled?: boolean;
+    steam_warm_rewarm?: SteamWarmRewarm;
+    /** Rejected with 400 outside 1-60. */
+    steam_warm_idle_minutes?: number;
   },
 ): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>("/admin/settings", {

@@ -99,9 +99,12 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		lp.ProfileID = resolved
 	}
 
-	tok, err := newSignalingToken(time.Now())
-	if err != nil {
-		return LaunchResult{}, err
+	// A parked session has no viewer, so no signaling token.
+	var tok signalingToken
+	if !lp.parked {
+		if tok, err = newSignalingToken(time.Now()); err != nil {
+			return LaunchResult{}, err
+		}
 	}
 
 	ov := lp.Override
@@ -274,12 +277,77 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		p.PinHostID = homeHost
 	}
 
+	// Warm Steam (control-api.md §Warm Steam). A parked session goes only to
+	// its home's host, and only when that connection advertised parked
+	// sessions. A family launch with a parked session tries to claim it.
+	var claimStream placedStream
+	var parked parkedRef
+	if lp.parked {
+		owner, err := c.store.HomeHostForApp(ctx, userID, homeAppID(app))
+		if err != nil {
+			return LaunchResult{}, err
+		}
+		if owner == "" || !c.hostParks(owner) {
+			return LaunchResult{}, errParkRefused
+		}
+		// A heartbeat never waits on a settling hold: it simply parks nothing.
+		p.Kind, p.PinHostID, p.NoHomeSettleWait = KindParked, owner, true
+	} else if parked, err = c.store.liveParked(ctx, userID); err != nil {
+		c.log.Warn("warm steam: parked session read failed, launching without a claim", "user_id", userID, "err", err)
+	} else if parked.ID != "" && parked.AppID == homeAppID(app) && parked.HostID != "" {
+		claimStream, err = c.claimCandidate(ctx, &p, parked, launchProfile, lp, ov, env, source)
+		if errors.Is(err, ErrCodecUnsupportedByHost) {
+			// The parked GPU cannot encode the launch's codec: a failed check 4.
+			c.supersedeParkedHolder(ctx, userID, parked.ID)
+			return LaunchResult{}, &ParkedClaimRefusedError{HolderID: parked.ID}
+		}
+		if err != nil {
+			return LaunchResult{}, err
+		}
+	}
+	if afterParkedRead != nil {
+		afterParkedRead()
+	}
+
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
+	var refused *ParkedClaimRefusedError
+	var inUse *HomeInUseError
+	switch {
+	case !lp.parked && errors.As(err, &inUse) && (inUse.parkedID != "" || inUse.releasedID != ""):
+		// The caller's own warm-Steam runtime still holds this home: retryable
+		// like a refused claim, never a 409 the client does not retry.
+		holder := inUse.releasedID
+		if inUse.parkedID != "" {
+			holder = inUse.parkedID
+			c.supersedeParkedHolder(ctx, userID, inUse.parkedID)
+		}
+		err = &ParkedClaimRefusedError{HolderID: holder}
+	case p.claim != nil && errors.As(err, &refused) && refused.Warming:
+		// Left to finish warming; the client's retry claims it once running.
+	case p.claim != nil && errors.Is(err, ErrCapacityExhausted):
+		// The parked session stops and the client's retry launches cold. This
+		// includes a claim that ran out of placement retries under contention,
+		// which is rare enough not to tell apart.
+		c.supersedeParkedHolder(ctx, userID, p.claim.id)
+		if !errors.As(err, &refused) {
+			err = &ParkedClaimRefusedError{HolderID: p.claim.id}
+		}
+	case !lp.parked && errors.Is(err, ErrCapacityExhausted):
+		c.evictParkedFor(ctx, p)
+	}
 	if err != nil {
-		c.logVramVetoRejection(userID, app.ID, err)
-		c.logHostNotReadyRejection(userID, app.ID, err)
-		c.logNoHostRejection(userID, app.ID, err)
+		if !lp.parked { // a refused heartbeat is logged by the heartbeat, at Debug
+			c.logVramVetoRejection(userID, app.ID, err)
+			c.logHostNotReadyRejection(userID, app.ID, err)
+			c.logNoHostRejection(userID, app.ID, err)
+		}
 		return LaunchResult{}, err
+	}
+	if p.claim != nil {
+		sess.AdoptSessionID = p.claim.id
+	}
+	if !lp.parked {
+		c.afterLaunchAdmitted(ctx, userID, app)
 	}
 	c.log.Info("session assigned", "session_id", sess.ID, "host_id", deref(sess.HostID), "gpu_index", derefI32(sess.GPUIndex),
 		"reserved_encode_slots", sess.ReservedSlots,
@@ -288,12 +356,15 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	c.health.logGPUUtilization(ctx, deref(sess.HostID), deref(sess.GPUID))
 
 	// Post-placement: rung resolution, cert cap, re-resolve, one write. Placement
-	// picks the GPU, not the rung, so the rung resolves here, where the GPU is known.
-	if err := c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {
+	// picks the GPU, not the rung, so the rung resolves here, where the GPU is
+	// known. A claim resolved it on the parked session's GPU before placement.
+	if p.claim != nil {
+		c.persistPlacedStream(ctx, &sess, claimStream)
+	} else if err := c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {
 		// The codec constraint pre-empts both codec refusals; this stays the
 		// backstop. Fail the session, releasing its reservation, rather than
 		// dispatching a doomed assignment.
-		c.failSession(sess.ID, fmt.Sprintf("rung resolution failed: %v", err))
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("rung resolution failed: %v", err))
 		return LaunchResult{}, err
 	}
 
@@ -307,12 +378,15 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	// only because §5's pin refuses such a tile first.
 	if app.ManagedHome || app.IsDerived() {
 		if sess.HostID == nil {
-			c.failSession(sess.ID, "app scheduled without a host")
+			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, "app scheduled without a host")
 			return LaunchResult{}, fmt.Errorf("app scheduled without a host")
 		}
 		dispatchSpec, err = c.resolveHomeSpec(ctx, app, userID, *sess.HostID)
+		if err == nil && lp.parked {
+			dispatchSpec, err = injectSteamFlags(dispatchSpec, parkedSteamFlags)
+		}
 		if err != nil {
-			c.failSession(sess.ID, fmt.Sprintf("home mount: %v", err))
+			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("home mount: %v", err))
 			return LaunchResult{}, fmt.Errorf("home mount: %w", err)
 		}
 	}
@@ -333,11 +407,12 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 		err := c.store.pool.QueryRow(c.ctx, `SELECT EXISTS(SELECT 1 FROM installed_images
 			WHERE lazy AND registry_ref = '' AND local_tag = $1)`, imageRef).Scan(&lazyTemplate)
 		if err != nil || lazyTemplate {
-			c.failSession(sess.ID, "image preparation unavailable for lazy template")
+			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, "image preparation unavailable for lazy template")
 			return
 		}
 	}
-	if c.lazyImages != nil && sess.HostID != nil {
+	// A claim adopts a runtime its parked session already built the image for.
+	if c.lazyImages != nil && sess.HostID != nil && sess.AdoptSessionID == "" {
 		// A template build may take minutes. It is owned by the coordinator's
 		// lifecycle, not the HTTP request which has already returned 201.
 		ctx, cancel := context.WithCancel(c.ctx)
@@ -367,7 +442,7 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 			// A stop or reconnect reap that ended the wait already owns the
 			// session's outcome; only a still-assigned launch fails here.
 			if current, getErr := c.store.Get(c.ctx, sess.ID); getErr == nil && current.State == StateAssigned {
-				c.failSession(sess.ID, fmt.Sprintf("image preparation failed: %v", err))
+				c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("image preparation failed: %v", err))
 			}
 			return
 		}
@@ -380,17 +455,25 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 	c.dispatchAssignStart(sess, runtimeSpec, expected)
 }
 
+// placedStream is the post-placement decision for one GPU before it is
+// written: a rung plan, or on the legacy/tier path only a codec.
+type placedStream struct {
+	plan  *StreamPlan
+	codec string // legacy path: the codec override, "" for unchanged
+}
+
+// applyTo is placedStream's effect on a session in memory.
+func (ps placedStream) applyTo(sess *Session) {
+	if ps.plan != nil {
+		ps.plan.applyTo(sess)
+	} else if ps.codec != "" {
+		sess.Codec = ps.codec
+	}
+}
+
 // applyPostPlacement resolves which rung a placed session starts at and writes
 // it back in ONE update, mutating sess in place so the dispatched assignment and
 // the persisted row agree.
-//
-// Gather, plan, apply: reads first (gatherStreamInputs), a pure decision
-// (planStream, stream_plan.go), then log, write once, apply. Hoisting the reads
-// is load-bearing — when the cert cap fires the decision walks a second chain,
-// and re-reading would let one launch's two walks see different probe rows.
-//
-// On the legacy/tier path there are no rungs; only a codec override can change
-// anything, handled with the host clamp alone.
 func (c *Coordinator) applyPostPlacement(
 	ctx context.Context,
 	sess *Session,
@@ -400,8 +483,37 @@ func (c *Coordinator) applyPostPlacement(
 	env ProbeEnvelope,
 	source string,
 ) error {
+	ps, err := c.planPostPlacement(ctx, sess, launchProfile, lp, ov, env, source)
+	if err != nil {
+		return err
+	}
+	c.persistPlacedStream(ctx, sess, ps)
+	return nil
+}
+
+// planPostPlacement is applyPostPlacement's decision with no write: the rung
+// for sess's host and GPU. A claim runs it on the parked session's GPU before
+// placement.
+//
+// Gather, plan, apply: reads first (gatherStreamInputs), a pure decision
+// (planStream, stream_plan.go), then log, write once, apply. Hoisting the reads
+// is load-bearing — when the cert cap fires the decision walks a second chain,
+// and re-reading would let one launch's two walks see different probe rows.
+//
+// On the legacy/tier path there are no rungs; only a codec override can change
+// anything, handled with the host clamp alone.
+func (c *Coordinator) planPostPlacement(
+	ctx context.Context,
+	sess *Session,
+	launchProfile profile.LaunchProfile,
+	lp LaunchParams,
+	ov StreamOverride,
+	env ProbeEnvelope,
+	source string,
+) (placedStream, error) {
 	if launchProfile.ID == "" {
-		return c.applyLegacyCodecOverride(ctx, sess, ov.codecOverride(), source)
+		codec, err := c.legacyCodecOverride(ctx, sess, ov.codecOverride(), source)
+		return placedStream{codec: codec}, err
 	}
 
 	in := c.gatherStreamInputs(ctx, sess, launchProfile, lp, ov, env, source)
@@ -411,21 +523,72 @@ func (c *Coordinator) applyPostPlacement(
 		// Wrap ErrRungCodecNotAvailable with profile context so the handler can
 		// report it back with the profile name in the message.
 		if errors.Is(err, ErrRungCodecNotAvailable) {
-			return fmt.Errorf("%w (launch profile %q)", err, launchProfile.ID)
+			return placedStream{}, fmt.Errorf("%w (launch profile %q)", err, launchProfile.ID)
 		}
-		return err
+		return placedStream{}, err
 	}
+	return placedStream{plan: &plan}, nil
+}
 
-	if err := c.store.UpdateSessionStream(ctx, sess.ID, plan.Update); err != nil {
-		// Non-fatal: the session keeps the pre-schedule top-rung values it was
-		// admitted against and the h264 floor it was inserted with. sess must NOT
-		// be mutated here, or the dispatched spec and the persisted row diverge.
-		c.log.Warn("post-placement stream update failed, dispatching the pre-schedule values",
-			"session_id", sess.ID, "launch_profile", plan.ChainID, "rung", plan.RungID, "err", err)
-		return nil
+// persistPlacedStream writes a placed stream and applies it to sess. A failed
+// write is non-fatal: the session keeps the values it was inserted with, and
+// sess must NOT be mutated, or the dispatched spec and the persisted row diverge.
+func (c *Coordinator) persistPlacedStream(ctx context.Context, sess *Session, ps placedStream) {
+	if ps.plan != nil {
+		if err := c.store.UpdateSessionStream(ctx, sess.ID, ps.plan.Update); err != nil {
+			c.log.Warn("post-placement stream update failed, dispatching the pre-schedule values",
+				"session_id", sess.ID, "launch_profile", ps.plan.ChainID, "rung", ps.plan.RungID, "err", err)
+			return
+		}
+	} else if ps.codec != "" && ps.codec != sess.Codec {
+		if err := c.store.UpdateSessionCodec(ctx, sess.ID, ps.codec); err != nil {
+			// Keep the persisted h264 floor, so sessions.codec and the dispatched
+			// stream spec stay consistent.
+			c.log.Warn("codec persist failed, keeping h264 floor",
+				"session_id", sess.ID, "resolved_codec", ps.codec, "err", err)
+			return
+		}
 	}
-	plan.applyTo(sess)
-	return nil
+	ps.applyTo(sess)
+}
+
+// afterParkedRead runs between the launch's parked-session read and its
+// scheduling transaction. Test-only; nil in production.
+var afterParkedRead func()
+
+// claimCandidate resolves the launch's stream on the parked session's GPU and
+// sets p up to claim it (claim check 4 compares the result in the scheduling
+// transaction).
+func (c *Coordinator) claimCandidate(ctx context.Context, p *CreateParams, k parkedRef,
+	launchProfile profile.LaunchProfile, lp LaunchParams, ov StreamOverride, env ProbeEnvelope, source string,
+) (placedStream, error) {
+	// Logged under the parked id the stream is matched against.
+	prov := Session{
+		ID: k.ID, UserID: p.UserID, AppID: p.AppID, HostID: &k.HostID, GPUIndex: &k.GPUIndex,
+		Width: p.Width, Height: p.Height, FPS: p.FPS, BitrateKbps: p.BitrateKbps,
+		H264Profile: p.H264Profile, Codec: wireCodecH264, Playout0Ms: p.Playout0Ms,
+	}
+	if lp.DeviceID != "" {
+		prov.DeviceID = &lp.DeviceID
+	}
+	ps, err := c.planPostPlacement(ctx, &prov, launchProfile, lp, ov, env, source)
+	if err != nil {
+		return placedStream{}, err
+	}
+	ps.applyTo(&prov)
+	p.Width, p.Height, p.FPS, p.BitrateKbps = prov.Width, prov.Height, prov.FPS, prov.BitrateKbps
+	p.Codec, p.Playout0Ms = prov.Codec, prov.Playout0Ms
+	p.claim = &parkedClaim{id: k.ID, hostParks: c.hostParks(k.HostID)}
+	return ps, nil
+}
+
+// supersedeParkedHolder stops the caller's parked session that a launch inside
+// its family could not adopt or must not wait behind. No suppression: the
+// launch is inside the family.
+func (c *Coordinator) supersedeParkedHolder(ctx context.Context, userID, parkedID string) {
+	if _, err := c.stopParked(ctx, StopReasonParkedSuperseded, parkedFilter{UserID: userID, ID: parkedID}); err != nil {
+		c.log.Warn("warm steam: stopping an unclaimable parked session failed", "session_id", parkedID, "err", err)
+	}
 }
 
 // launchCodecPreference reads the device scope for an Auto launch's codec
@@ -659,12 +822,12 @@ func (c *Coordinator) logStreamPlan(in StreamInputs, plan StreamPlan) {
 	}
 }
 
-// applyLegacyCodecOverride handles the profile-less path, where there are no
-// rungs. Without an override the codec stays at the inserted h264 floor; with
-// one, the host-encoder clamp still applies — that is never overridable.
-func (c *Coordinator) applyLegacyCodecOverride(ctx context.Context, sess *Session, override, source string) error {
+// legacyCodecOverride handles the profile-less path, where there are no rungs.
+// Without an override the codec stays at the inserted h264 floor; with one, the
+// host-encoder clamp still applies — that is never overridable.
+func (c *Coordinator) legacyCodecOverride(ctx context.Context, sess *Session, override, source string) (string, error) {
 	if override == "" || override == sess.Codec {
-		return nil
+		return "", nil
 	}
 	gpuCodecs := []string{wireCodecH264}
 	if sess.HostID != nil && sess.GPUIndex != nil {
@@ -676,18 +839,10 @@ func (c *Coordinator) applyLegacyCodecOverride(ctx context.Context, sess *Sessio
 		}
 	}
 	if !codecSet(gpuCodecs)[override] {
-		return ErrCodecUnsupportedByHost
+		return "", ErrCodecUnsupportedByHost
 	}
 	c.log.Info("codec resolved", "session_source", source, "override", override, "result", override)
-	if err := c.store.UpdateSessionCodec(ctx, sess.ID, override); err != nil {
-		// Keep the persisted h264 floor, leaving sess.Codec unchanged, so
-		// sessions.codec and the dispatched stream spec stay consistent.
-		c.log.Warn("codec persist failed, keeping h264 floor",
-			"session_id", sess.ID, "resolved_codec", override, "err", err)
-		return nil
-	}
-	sess.Codec = override
-	return nil
+	return override, nil
 }
 
 // logVramVetoRejection makes a veto visible (#383 §4.4): one line per refused
@@ -782,7 +937,7 @@ func (c *Coordinator) dispatchAssignStart(sess Session, runtimeSpec []byte, expe
 
 func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec []byte, videoTopology string, expected *homeDispatchExpectation) {
 	if sess.HostID == nil || sess.GPUIndex == nil {
-		c.failSession(sess.ID, "session missing host/gpu placement")
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, "session missing host/gpu placement")
 		return
 	}
 	hostID := *sess.HostID
@@ -822,8 +977,10 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 			// keeps the wire byte-identical for every non-mic session.
 			Mic: sess.Mic,
 		},
-		Resources:     agentws.ResourceSpec{VRAMMB: sess.ReservedVram, EncodeSlots: sess.ReservedSlots},
-		VideoTopology: videoTopology,
+		Resources:      agentws.ResourceSpec{VRAMMB: sess.ReservedVram, EncodeSlots: sess.ReservedSlots},
+		VideoTopology:  videoTopology,
+		Kind:           sess.Kind,
+		AdoptSessionID: sess.AdoptSessionID,
 	}
 	if !c.sendHomeBoundAssign(hostID, sess.ID, app, assign, expected) {
 		return
@@ -853,22 +1010,28 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 			var ok bool
 			epoch, ok = provider.CurrentHomeCommandEpoch(hostID)
 			if !ok {
-				c.failSession(sessionID, "assign dispatch failed: agent not connected")
+				c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "assign dispatch failed: agent not connected")
 				return false
 			}
+		}
+		wire, ok := wireAssign(assign, c.epochParks(hostID, epoch), c.warmOn())
+		if !ok {
+			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID,
+				"assign dispatch failed: the agent connection cannot take a parked session or an adoption")
+			return false
 		}
 		capable := epoch != nil && epoch.SupportsHomeCleanup()
 		hold, err := c.store.bindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable, expected)
 		if err != nil {
 			c.log.Error("managed home dispatch binding failed", "session_id", sessionID, "err", err)
-			c.failSession(sessionID, "managed home dispatch binding failed")
+			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "managed home dispatch binding failed")
 			return false
 		}
 		if epoch == nil {
-			return c.commandOK(hostID, assign.ID, assign, assignAckTimeout, sessionID, "assign")
+			return c.commandOK(hostID, wire.ID, wire, assignAckTimeout, sessionID, "assign")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), assignAckTimeout)
-		res, queued, sendErr := epoch.SendWithAck(ctx, assign.ID, assign)
+		res, queued, sendErr := epoch.SendWithAck(ctx, wire.ID, wire)
 		cancel()
 		if sendErr != nil && !queued {
 			if clearErr := c.store.ClearNewHomeHold(c.ctx, hold); clearErr != nil {
@@ -882,16 +1045,18 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 			if clearErr := c.store.ClearNewHomeHold(c.ctx, hold); clearErr != nil {
 				c.log.Error("rejected home hold release failed", "err", clearErr)
 			}
-			c.failSession(sessionID, fmt.Sprintf("agent rejected assign: %s", res.Error))
+			// A rejected assign caused no home side effect, so nothing was adopted.
+			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, fmt.Sprintf("agent rejected assign: %s", res.Error))
 			return false
 		}
 		if sendErr != nil {
-			c.failSession(sessionID, fmt.Sprintf("assign dispatch failed: %v", sendErr))
+			// Queued with no ack. No start follows, so nothing was adopted.
+			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, fmt.Sprintf("assign dispatch failed: %v", sendErr))
 			return false
 		}
 		return true
 	}
-	c.failSession(sessionID, "assign dispatch failed: connection changed")
+	c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "assign dispatch failed: connection changed")
 	return false
 }
 

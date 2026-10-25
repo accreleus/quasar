@@ -237,6 +237,10 @@ export interface paths {
          *     client path works unchanged. The minted identity is a REAL user row with a
          *     real token — server-side role enforcement is untouched — and is deleted
          *     (with its sessions and device bindings) when its TTL lapses.
+         *     Amendment 33: served only over TLS (the HTTPS listener, or a proxy named in
+         *     QUASAR_TRUSTED_PROXIES that forwards X-Forwarded-Proto: https) or to a loopback peer,
+         *     unless QUASAR_DEV_AGENT_INSECURE_HTTP=1. Any other request → 401 unauthorized before the
+         *     key is compared.
          */
         post: {
             parameters: {
@@ -333,6 +337,9 @@ export interface paths {
          *     under the same advisory lock as BOOTSTRAP_ADMIN_* provisioning, so the two
          *     paths can never both create an admin). Response is login-shaped so the
          *     operator is signed in as their new admin.
+         *     Amendment 33: served only over TLS (the HTTPS listener, or a proxy named in
+         *     QUASAR_TRUSTED_PROXIES that forwards X-Forwarded-Proto: https). Any other request → 401
+         *     unauthorized before the token is compared, the same for a right, wrong or missing token.
          */
         post: {
             parameters: {
@@ -930,6 +937,101 @@ export interface paths {
             };
         };
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/play-history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The calling user's own play history, one item per app played (amendment 38).
+         * @description Per-caller, from the bearer identity only: no user_id parameter, no query parameters,
+         *     no admin variant. See control-api.md §GET /v1/me/play-history.
+         *
+         *     COUNTED SESSIONS: the caller's sessions that reached running (started_at set) and did
+         *     not end failed, a live one included. One session's duration is started_at to ended_at,
+         *     or to the request time while it has not ended, bounded to 0-24 h (the highlights
+         *     clamp).
+         *
+         *     ENTITLEMENT-FILTERED like /v1/me/highlights: the same enabled + entitled predicate as
+         *     GET /v1/apps, so a revoked title's history is hidden, not shown.
+         *
+         *     Ordered by last_played_at descending, then app_id. Unpaginated; empty for a user who
+         *     has never played, which is a normal 200.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlayHistoryList"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/steam-warm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * The library heartbeat - keep or start the caller's warm Steam (amendment 39).
+         * @description Per-caller, from the bearer identity only: no body (one that is sent is ignored), no
+         *     query parameters, no admin variant. See control-api.md §Warm Steam. Once authenticated
+         *     it ALWAYS answers 204 with no body, whatever it did: it starts a parked session when
+         *     every rule allows one, and sets the caller's parked session's deadline to now plus
+         *     steam_warm_idle_minutes. The web client calls it every 60 s while the library page is
+         *     open. Like every bearer route it may answer 426 client_too_old first (x-global-responses).
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Done */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                401: components["responses"]["Unauthorized"];
+            };
+        };
         post?: never;
         delete?: never;
         options?: never;
@@ -2119,7 +2221,10 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description Amendment 37 (#707): a copy for a tile this many pixels wide. Aspect ratio kept; the smallest copy that still covers a w x 1.5w (2:3) box, so a wider image stays wider than w. Any other value (empty, repeated, or non-canonical such as 0320) is 404, as is a query that names w but does not parse (w=320;x, w=%zz). A query that names no w is ignored, as before. The original bytes are served when the image is no wider than w or no taller than 1.5w, and when the copy would not be smaller in bytes: a response is never larger than the original. Content-Type names the bytes served: a scaled copy is image/jpeg when opaque and image/png when it has transparency, whatever the stored type. Unauthenticated and nosniff as the original, and immutable except for the original served after a failed resize, which has a short max-age. */
+                    w?: "96" | "320" | "480" | "560";
+                };
                 header?: never;
                 path: {
                     /** @description The cached blob's CONTENT-ADDRESSED name: the lowercase hex SHA-256 of the image bytes plus an extension derived from the sniffed type. Nothing a remote supplies influences it, so path traversal is impossible by construction; anything not matching the pattern is 404, never 500. */
@@ -2129,7 +2234,7 @@ export interface paths {
             };
             requestBody?: never;
             responses: {
-                /** @description The image. */
+                /** @description The image, or its sized variant when w is given. */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -2698,7 +2803,13 @@ export interface paths {
         put?: never;
         /**
          * Launch a session; returns signaling coordinates.
-         * @description UI-P5 adds ONE NEW FAILURE MODE on this existing endpoint: a profile_id outside the
+         * @description AMENDMENT 39 (#759): a launch of a Steam parent or derived tile by a caller who holds a
+         *     parked session may adopt it (control-api.md §Warm Steam, "Claim"); request and 201
+         *     unchanged. When the claim is refused, or the caller's parked session or released runtime
+         *     still holds the home, the answer is 503 capacity_exhausted with Retry-After: 2, never
+         *     409 home_in_use.
+         *
+         *     UI-P5 adds ONE NEW FAILURE MODE on this existing endpoint: a profile_id outside the
          *     app's launchable allow-list is 409 profile_not_launchable_for_app, and no session row
          *     persists.
          *
@@ -3641,8 +3752,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Install a catalog image (adopt + ensure-everywhere unless lazy).
-         * @description P3. Seeds installed_images with the catalog's current (version, registry_digest) and, unless lazy:true, dispatches ensure-everywhere immediately. A lazy install seeds the adoption row only; hosts pull on first launch placement.
+         * Install a catalog image (adopt; unless lazy, prepared on the hosts its enabled apps are placed on).
+         * @description P3. Seeds installed_images with the catalog's current (version, registry_digest) and, unless lazy:true, prepares the image on each host an enabled app using it is placed on (nothing until such an app exists). A lazy install seeds the adoption row only; hosts pull on first launch placement.
          */
         post: {
             parameters: {
@@ -3674,7 +3785,7 @@ export interface paths {
                 409: components["responses"]["Conflict"];
             };
         };
-        /** Uninstall (best-effort image_remove to every host that has it, then drop the adoption row). */
+        /** Uninstall (drop the adoption row; each host keeps the image until RH05 host image cleanup removes it). */
         delete: {
             parameters: {
                 query?: never;
@@ -3779,7 +3890,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Re-adopt the catalog's current version/digest and re-ensure everywhere (200 applied or no-op).
+         * Re-adopt the catalog's current version/digest and prepare it where its apps are placed, as an install does (200 applied or no-op).
          * @description The notify policy's action and manual's escape hatch. applied:false (still 200) when installed_version already equals the catalog version. 409 conflict when the image is pinned.
          */
         post: {
@@ -4080,6 +4191,15 @@ export interface paths {
                         release_webhook_url?: string;
                         /** @description Unattended automatic apply, ADDITIVE (amendment 8, #122, migration 0081). Whether a detected platform release is applied WITHOUT a click. Absent = unchanged. Default false, so an instance that never opts in behaves exactly as before. It depends on nothing else being configured first, so unlike release_webhook_enabled there is no companion 400: with nothing to apply it applies nothing and records why. NO WINDOW FIELD ACCOMPANIES IT, deliberately - an unattended pass runs on a successful platform.release_detect job, so that job's own schedule IS the window, and it is already editable in the Jobs tab. */
                         platform_auto_apply?: boolean;
+                        /** @description Warm Steam master switch, ADDITIVE (amendment 39, #759, migration 0105). Absent = unchanged. Off stops creating parked sessions, and the session.parked_expire job stops the existing ones at its next run. */
+                        steam_warm_enabled?: boolean;
+                        /**
+                         * @description Amendment 39. What a non-Steam launch that stopped a parked session leaves behind (control-api.md §Warm Steam, "Non-Steam apps"). Absent = unchanged; any other value is 400 validation_failed.
+                         * @enum {string}
+                         */
+                        steam_warm_rewarm?: "library_open" | "next_steam_launch";
+                        /** @description Amendment 39. Each heartbeat, and a park on exit, sets a parked session's deadline to now plus this many minutes. Absent = unchanged; outside 1-60 is 400 validation_failed. */
+                        steam_warm_idle_minutes?: number;
                     };
                 };
             };
@@ -4992,8 +5112,10 @@ export interface paths {
          *
          *     FORWARDED HEADERS SOFTEN ADVICE AND NOTHING ELSE. They are trivially spoofable by any
          *     client; the worst a hostile one achieves is making an admin-gated diagnostics page tell
-         *     THEM that their own certificate is not in use. No access decision, on this route or any
-         *     other, reads them.
+         *     THEM that their own certificate is not in use. No access decision on this route reads
+         *     them. Amendment 33, the one exception on any route: POST /v1/setup/claim and the dev-only
+         *     POST /v1/dev/agent-session believe X-Forwarded-Proto from a peer named in
+         *     QUASAR_TRUSTED_PROXIES, and from no other peer.
          *
          *     Admin-gated by the existing RequireAuth -> RequireAdmin middleware. It reflects the Host
          *     and Origin headers, so both are LENGTH-CAPPED (256 chars) and are only ever rendered as
@@ -8092,7 +8214,7 @@ export interface components {
             live_sessions?: number;
             /**
              * Format: uuid
-             * @description Steam library discovery Phase 3, ADDITIVE: present on home_in_use when the guard could name the CONFLICTING live session - the one already holding the home. It is here so the client can offer "go to your running session" with a link instead of a dead-end toast. OMITTED rather than empty when the conflict is known but the session is not, so a client branches on presence and never renders a link to nowhere. Load-bearing once derived tiles exist: the lock is held by the PARENT's home, so a user who clicks a game tile can be refused because a DIFFERENT app (the Steam launcher, or another game from the same install) is running, and without the session id the refusal reads as a bug. See control-api.md §Derived tiles.
+             * @description Steam library discovery Phase 3, ADDITIVE: present on home_in_use when the guard could name the CONFLICTING live session - the one already holding the home. It is here so the client can offer "go to your running session" with a link instead of a dead-end toast. OMITTED rather than empty when the conflict is known but the session is not, so a client branches on presence and never renders a link to nowhere. Also omitted when the holder is the caller's parked session or released runtime (amendment 39). Load-bearing once derived tiles exist: the lock is held by the PARENT's home, so a user who clicks a game tile can be refused because a DIFFERENT app (the Steam launcher, or another game from the same install) is running, and without the session id the refusal reads as a bug. See control-api.md §Derived tiles.
              */
             session_id?: string;
             /** @description Steam library discovery Phase 3, ADDITIVE: present on the 409 conflict from DELETE /v1/apps/{id} when the app has derived tiles and ?delete_derived=true was not sent. A LIST, not a count - the point of the confirmation is that the admin sees what they are about to destroy. Capped; an empty array means the tiles could not be listed, never that there are none. */
@@ -8101,6 +8223,8 @@ export interface components {
                 id: string;
                 name: string;
             }[];
+            /** @description Amendment 40 (#602), ADDITIVE: a machine-readable cause under code. Present only on 503 no_host_available, as home_host_unavailable, when the launch is pinned to the host that holds the caller's home for this app and that host is offline or no longer enrolled. Only an admin clears it, so a client does not spend its automatic retry on it. Names no host. Open string: a client treats an unknown value as absent. */
+            reason?: string;
         };
         ErrorEnvelope: {
             error: components["schemas"]["Error"];
@@ -8260,7 +8384,7 @@ export interface components {
             installed_version?: string | null;
             /** @description P3: real. A pinned image is never auto-updated under any policy (auto sync or explicit .../update, both 409 while pinned). */
             pinned?: boolean;
-            /** @description P3. True when installed without dispatching ensure-everywhere; hosts pull this image on first launch placement instead. */
+            /** @description P3. True when installed without preparing it on any host; hosts pull this image on first launch placement instead. */
             lazy?: boolean;
             /**
              * Format: uuid
@@ -8274,7 +8398,7 @@ export interface components {
         /** @description P3. Optional body; an omitted body or {} installs eagerly (lazy defaults false). */
         ImageInstallRequest: {
             /**
-             * @description P3. When true, seeds the installed_images adoption row without dispatching ensure-everywhere; hosts pull on first launch placement instead.
+             * @description P3. When true, seeds the installed_images adoption row and prepares it on no host; hosts pull on first launch placement instead.
              * @default false
              */
             lazy: boolean;
@@ -8406,6 +8530,28 @@ export interface components {
             /** @description The stream advertised in the library. UI-P4: resolved through the launch profile's TOP rung (position 1), falling back to the app's default_* columns when no launch profile resolves. Advertised, not resolved - a launch may fall through to a lower rung and stream at a different resolution; the session's own `stream` block is the truth. */
             display_stream?: components["schemas"]["Stream"];
             enabled: boolean;
+            /**
+             * Format: date-time
+             * @description Amendment 38: apps.created_at - when an admin created the app or, for a discovered tile, when the first library scan to find the title created it. The value GET /v1/apps is ordered by and highlights' recently_added uses. Not when the caller was entitled.
+             */
+            added_at?: string;
+            /** @description Amendment 38: the Steam store's genre names (appdetails), in English and store order, without duplicates. [] when unknown: the opt-in appdetails lookup is off, no scan has observed the tile yet, or the app is not a discovered Steam title. */
+            genres?: string[];
+            /** @description Amendment 38: the store's developers joined with ", "; null when unknown (see genres). */
+            developer?: string | null;
+            /** @description Amendment 38: the store's publishers joined with ", "; null when unknown (see genres). */
+            publisher?: string | null;
+            /** @description Amendment 38: the store's release-date text as given (e.g. "9 Jul, 2013"), for display. Valve's format; not a parseable date. Null when unknown (see genres). */
+            release_date?: string | null;
+            /**
+             * @description Amendment 38: the store's controller support; null when unknown or any other value.
+             * @enum {string|null}
+             */
+            controller_support?: "full" | "partial" | null;
+            /** @description Amendment 38: the LOGO crop - the title's logo on a transparent background, drawn over the hero in place of the text title. A local /v1/artwork/ path (takes ?w=), written only by the artwork service, never hotlinked. Null when there is none. */
+            logo_url?: string | null;
+            /** @description Amendment 38: the ICON crop - a small square title icon for lists. Same rules as logo_url. */
+            icon_url?: string | null;
         };
         AppList: {
             items: components["schemas"]["AppListItem"][];
@@ -8577,6 +8723,13 @@ export interface components {
             stop_reason: "entitlement_revoked" | null;
             /** @description RH05 #344. Actual initial managed-home seeding outcome. Null means no authenticated evidence, including an older agent, a non-managed home or failure before provisioning. No inference of cold or storage savings from null. Swaps do not change the initial outcome. Never contains paths or free-form diagnostics. */
             home_seed: null | components["schemas"]["HomeSeedOutcome"];
+            /**
+             * @description Amendment 39 (#759). "parked" is a warm Steam that nobody watches (control-api.md §Warm Steam). A user-facing read never returns a parked session, so it only ever shows "play"; GET /v1/admin/sessions returns parked rows too. Always serialized.
+             * @enum {string}
+             */
+            kind: "play" | "parked";
+            /** @description Amendment 39 (#759). Steam's shader-processing progress while the app boots, null otherwise. A hint from inside the app container: display only, never a session-state authority. Always serialized. */
+            launch_progress: null | components["schemas"]["LaunchProgress"];
             /** @description The profile the session was launched from; null for a legacy/tier/override launch. UI-P4: this is now a LAUNCH PROFILE id, i.e. the USER'S PICK. The rung it resolved to is stream_profile_id. */
             profile_id: string | null;
             /** @description UI-P4: the RUNG this launch resolved to (e.g. "1080p60-h264"). Always serialized; null for every pre-UI-P4 session and for any legacy/tier/override/console launch. profile_id answers "what did the user pick", this answers "what did they get" - and because a rung carries its own resolution, the two can legitimately disagree about width/height/fps/ bitrate. The `stream` block below is always the truth for the running session. */
@@ -8604,6 +8757,11 @@ export interface components {
             started_at: string | null;
             /** Format: date-time */
             ended_at: string | null;
+        };
+        LaunchProgress: {
+            /** @enum {string} */
+            step: "shaders";
+            percent: number;
         };
         SessionEnvelope: {
             session: components["schemas"]["Session"];
@@ -9198,6 +9356,15 @@ export interface components {
                 release_webhook_url?: string;
                 /** @description Unattended automatic apply, ADDITIVE (amendment 8, #122, migration 0081). Whether a detected platform release is applied without a click. Default false. Optional in the envelope so a pre-#122 server stays conformant; a client reads absent as false. */
                 platform_auto_apply?: boolean;
+                /** @description Warm Steam, ADDITIVE (amendment 39, #759, migration 0105). Default false. Optional in the envelope so a pre-amendment server stays conformant; absent reads as false. */
+                steam_warm_enabled?: boolean;
+                /**
+                 * @description Amendment 39. Default library_open.
+                 * @enum {string}
+                 */
+                steam_warm_rewarm?: "library_open" | "next_steam_launch";
+                /** @description Amendment 39. Default 10. */
+                steam_warm_idle_minutes?: number;
                 /** Format: uuid */
                 updated_by: string | null;
                 /** Format: date-time */
@@ -10275,6 +10442,11 @@ export interface components {
         ProfilePreferencesResponse: {
             /** @description UI-P4: the caller's preferred LAUNCH PROFILE; honoured only while user_overrides_allowed is true. */
             default_profile_id?: string | null;
+            /**
+             * @description Amendment 39 (#759). Whether the Steam launch helper may answer a fixed list of Steam's waits for this user (control-api.md §Warm Steam, "steam_dialogs"). Default show. Always returned by GET and PATCH. On PATCH, absent leaves it unchanged; a PATCH that names it but not default_profile_id leaves the profile unchanged. Not gated by user_overrides_allowed.
+             * @enum {string}
+             */
+            steam_dialogs?: "show" | "dismiss_safe";
             global_default_profile_id?: string | null;
             user_overrides_allowed?: boolean;
         };
@@ -10344,6 +10516,25 @@ export interface components {
              * @description MAX(ended_at) over the user's non-failed sessions for this app. Null when the app has never been played to completion - which is the state of every app for a user whose only session is the currently-live one.
              */
             last_played_at: string | null;
+        };
+        PlayHistoryList: {
+            items: components["schemas"]["PlayHistoryItem"][];
+        };
+        PlayHistoryItem: {
+            /**
+             * Format: uuid
+             * @description The app; the client joins it to the AppListItem it already holds.
+             */
+            app_id: string;
+            /**
+             * Format: date-time
+             * @description The latest end of a counted session, a session ending at started_at plus its bounded duration. The request time while a session is live. Never null.
+             */
+            last_played_at: string;
+            /** @description Sum of the counted sessions' bounded durations, whole seconds rounded down, all time. */
+            total_seconds: number;
+            /** @description How many sessions counted. */
+            sessions: number;
         };
         /** @description User record from GET /v1/users (admin). */
         AdminUser: {
@@ -11674,9 +11865,11 @@ export interface components {
                 "application/json": components["schemas"]["ClientTooOldError"];
             };
         };
-        /** @description no_host_available / capacity_exhausted / host_not_ready (amendment 11: a failing evidence-based readiness check is the only reason no host qualified) — well-formed but cannot be placed now (retryable). Amendment 12 (#296): an explicit stream.codec is a codec constraint applied at placement; when a GPU that can encode it exists but none is free the answer is capacity_exhausted, and when no online usable GPU can encode it the answer is no_host_available, both with a message naming the codec. No new code. */
+        /** @description no_host_available / capacity_exhausted / host_not_ready (amendment 11: a failing evidence-based readiness check is the only reason no host qualified) — well-formed but cannot be placed now (retryable). Amendment 12 (#296): an explicit stream.codec is a codec constraint applied at placement; when a GPU that can encode it exists but none is free the answer is capacity_exhausted, and when no online usable GPU can encode it the answer is no_host_available, both with a message naming the codec. No new code. Amendment 40 (#602): no_host_available MAY carry error.reason home_host_unavailable (the caller's home is on a host that is offline or no longer enrolled); a client does not auto-retry it. */
         Unavailable: {
             headers: {
+                /** @description delta-seconds; MAY accompany capacity_exhausted (control-api.md §Admission control, (4)); 2 on a refused warm-Steam claim (amendment 39). */
+                "Retry-After"?: number;
                 [name: string]: unknown;
             };
             content: {

@@ -51,6 +51,16 @@ export function ConsoleAccessNote({
   }
 
   if (access.state === "applying") {
+    // No attempt yet (`target` null): the agent has not read its recovery
+    // actor's console status, so nothing is being replaced — say what it says.
+    if (access.target == null) {
+      return (
+        <div className="note" role="status">
+          <strong>Waiting to hear from the recovery actor.</strong>{" "}
+          {access.summary || "New sessions on this host wait until it answers."}
+        </div>
+      );
+    }
     const started = access.started_at ? ` (started ${clockTime(access.started_at, { seconds: false })})` : "";
     return (
       <div className="note" role="status">

@@ -118,7 +118,7 @@ func (s *Store) List(ctx context.Context, userID, currentDeviceID string) ([]Ite
 		SELECT d.id::text, d.device_key, d.name, d.trusted, d.first_seen_at, d.last_seen_at,
 		       d.capabilities,
 		       (SELECT sess.id::text FROM sessions sess
-		         WHERE sess.device_id = d.id
+		         WHERE sess.device_id = d.id AND sess.kind = 'play'
 		           AND sess.state IN `+activeSessionStates+`
 		         ORDER BY sess.created_at DESC LIMIT 1) AS active_session_id
 		FROM user_devices d
@@ -158,7 +158,7 @@ func (s *Store) getOne(ctx context.Context, userID, deviceID, currentDeviceID st
 		SELECT d.id::text, d.device_key, d.name, d.trusted, d.first_seen_at, d.last_seen_at,
 		       d.capabilities,
 		       (SELECT sess.id::text FROM sessions sess
-		         WHERE sess.device_id = d.id
+		         WHERE sess.device_id = d.id AND sess.kind = 'play'
 		           AND sess.state IN `+activeSessionStates+`
 		         ORDER BY sess.created_at DESC LIMIT 1) AS active_session_id
 		FROM user_devices d
@@ -235,6 +235,8 @@ func (s *Store) Revoke(ctx context.Context, userID, deviceID string) ([]string, 
 		return nil, fmt.Errorf("verify device owner: %w", err)
 	}
 
+	// Parked sessions included: revoking a device stops a warm Steam launched
+	// from it too (control-api.md §Warm Steam).
 	rows, err := tx.Query(ctx, `
 		SELECT id::text FROM sessions
 		WHERE device_id = $1::uuid AND state IN `+activeSessionStates+`

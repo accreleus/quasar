@@ -99,23 +99,33 @@ export function AccountSessions() {
       key: "actions",
       header: "",
       width: "170px",
-      render: (s) => (
-        <div className="cell-actions">
-          {s.state === "running" && (
-            <Button variant="ghost" size="sm" onClick={() => navigate(`/app/session/${s.id}`)}>
-              Resume
+      render: (s) => {
+        const name = appNames.get(s.app_id) ?? s.app_id.slice(0, 8);
+        const endLabel = ending.has(s.id) ? "Ending…" : "End";
+        return (
+          <div className="cell-actions">
+            {s.state === "running" && (
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={`Resume ${name}`}
+                onClick={() => navigate(`/app/session/${s.id}`)}
+              >
+                Resume
+              </Button>
+            )}
+            <Button
+              variant="danger"
+              size="sm"
+              aria-label={`${endLabel} ${name}`}
+              disabled={ending.has(s.id)}
+              onClick={() => void handleEnd(s.id)}
+            >
+              {endLabel}
             </Button>
-          )}
-          <Button
-            variant="danger"
-            size="sm"
-            disabled={ending.has(s.id)}
-            onClick={() => void handleEnd(s.id)}
-          >
-            {ending.has(s.id) ? "Ending…" : "End"}
-          </Button>
-        </div>
-      ),
+          </div>
+        );
+      },
     },
   ];
 

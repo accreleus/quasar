@@ -23,7 +23,8 @@ use crate::health::HealthState;
 use crate::host_probe;
 use crate::images::ImageManager;
 use crate::messages::{
-    AgentMsg, AppSpec, Auth, CodecThroughput, ControlMsg, StreamSpec, VideoTopology,
+    AgentMsg, AppSpec, Auth, CodecThroughput, ControlMsg, LaunchProgress, SessionKind, StreamSpec,
+    VideoTopology,
 };
 use crate::release::ReleaseManager;
 use crate::session::capture::{self, CaptureRequest, CaptureSlot};
@@ -34,8 +35,8 @@ use crate::session::library_scan::LibraryScanClient;
 use crate::session::metrics::SessionMetrics;
 use crate::session::mount_policy::MountPolicy;
 use crate::session::runner::{
-    run_blocking, validate_display_update, DiagnosticEventTx, DisplayUpdateRequest, SessionEvent,
-    SwapRequest,
+    run_blocking, validate_display_update, AdoptRequest, DiagnosticEventTx, DisplayUpdateRequest,
+    SessionEvent, SwapRequest,
 };
 use crate::session::signaling::SignalMsg;
 use crate::session::vulkan_fault::{self, GpuGlobalFaultDetector};
@@ -70,6 +71,7 @@ type RunnerFn = Arc<
             std::sync::mpsc::Receiver<DisplayUpdateRequest>,
             std::sync::mpsc::Receiver<CaptureRequest>,
             Arc<SessionMetrics>,
+            std::sync::mpsc::Receiver<AdoptRequest>,
         ) + Send
         + Sync,
 >;
@@ -86,7 +88,8 @@ fn default_runner() -> RunnerFn {
          swap_rx,
          display_rx,
          capture_rx,
-         metrics| {
+         metrics,
+         adopt_rx| {
             run_blocking(
                 session_id,
                 cfg,
@@ -98,6 +101,7 @@ fn default_runner() -> RunnerFn {
                 display_rx,
                 capture_rx,
                 metrics,
+                adopt_rx,
             );
         },
     )
@@ -238,7 +242,11 @@ pub async fn run(cfg: Config) {
     // identity-unknown (agent-api.md §register).
     let runtime = {
         let (runtime, facts) = offload_probe(move || {
-            let facts = crate::buildinfo::discover(&runtime);
+            let facts = crate::buildinfo::discover(
+                &runtime,
+                crate::buildinfo::owned_socket().as_deref(),
+                crate::buildinfo::ACTOR_REGISTER_BUDGET,
+            );
             (runtime, facts)
         })
         .await;
@@ -1049,10 +1057,10 @@ pub(crate) fn advertised_codec_throughput(
 
 /// How long register preparation may take before the agent says so. Register
 /// preparation (the image reconcile and the install probe, both against the
-/// container runtime) runs before the socket is dialled, so it can no longer eat the
-/// control plane's handshake window — but the window is 15 s (agentws
-/// `handshakeTimeout`), and a runtime slow enough to approach it deserves a log line
-/// naming it rather than a slow, mysterious reconnect (#191).
+/// container runtime) runs before the socket is dialled, so it never eats the
+/// control plane's register window (agentws `registerReadTimeout`); a runtime
+/// this slow still deserves a log line naming it rather than a slow, mysterious
+/// reconnect (#191).
 const REGISTER_PREP_BUDGET: Duration = Duration::from_secs(10);
 
 fn register_prep_over_budget(elapsed: Duration) -> bool {
@@ -1684,6 +1692,7 @@ fn register_message(
         config_policy_groups: policy_available.then(|| crate::policy::PolicyAgent::advertised_groups(
             &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)))),
         terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
+        parked_sessions_v1: crate::session::launch_helper::installed().then_some(true),
         node_name: cfg.node_name.clone(),
         agent_version: crate::buildinfo::version().to_string(),
         auth: choose_auth(cfg, prefer_enrollment_token)?,
@@ -1885,7 +1894,11 @@ async fn diagnostic_connection(
     let images = crate::images::register_images_from_state(&cfg.image_state_path());
     let install = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover(&runtime)
+        crate::buildinfo::discover(
+            &runtime,
+            crate::buildinfo::owned_socket().as_deref(),
+            crate::buildinfo::ACTOR_REGISTER_BUDGET,
+        )
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
@@ -1990,7 +2003,7 @@ async fn connect_and_run(
 
     // Everything `register` needs from the container runtime is gathered BEFORE the
     // socket is opened (#191). The control plane gives a fresh connection its
-    // handshake window (agentws `handshakeTimeout`, 15 s) to send `register`; these
+    // register window (agentws `registerReadTimeout`) to send `register`; these
     // two probes used to run after the dial, and on a host whose docker daemon
     // answers `inspect` slowly (each is bounded at 30 s) they pushed `register` past
     // that deadline. The control plane closed the socket without a close frame, the
@@ -2010,10 +2023,18 @@ async fn connect_and_run(
 
     // Re-discovered per connection, not once at boot: an updater that starts
     // after the agent must not leave the host reporting updater_present=false
-    // forever. Offloaded because it shells out to docker.
-    let install = offload_probe(|| {
+    // forever. Offloaded because it shells out to docker. The recovery actor gets
+    // `ACTOR_REGISTER_BUDGET` in all (here and in the console read below): a dark one
+    // never holds the dial, and the readiness refresh reports it once it answers.
+    let actor_deadline = Instant::now() + crate::buildinfo::ACTOR_REGISTER_BUDGET;
+    let actor_socket = release_mgr.actor_socket().map(std::path::Path::to_path_buf);
+    let (install, actor_dark) = offload_probe(move || {
         let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover(&runtime)
+        crate::buildinfo::discover_observed(
+            &runtime,
+            actor_socket.as_deref(),
+            crate::buildinfo::ACTOR_REGISTER_BUDGET,
+        )
     })
     .await;
     crate::buildinfo::set_install_facts(install.clone());
@@ -2022,19 +2043,55 @@ async fn connect_and_run(
     console_access.set_engine_mode(install.engine.engine_mode.as_deref());
     crate::ddc::set_rootless(install.engine.engine_mode.as_deref() == Some("rootless"));
     let mut console_access_rx = console_access.owned().then(|| console_access.subscribe());
-    {
+    // A read that outlasts the budget finishes on its own thread; its change wakes
+    // `console_access_rx`, which re-sends `capacity`.
+    let console_read = {
         let ca = console_access.clone();
-        offload_probe(move || ca.refresh()).await;
+        tokio::spawn(async move {
+            let read = tokio::task::spawn_blocking(move || {
+                ca.refresh();
+                ca.watch_if_applying();
+            });
+            if let Err(e) = read.await {
+                warn!(
+                    token = "register-console-read-failed",
+                    "the console access read failed: {e}"
+                );
+            }
+        })
+    };
+    if tokio::time::timeout_at(actor_deadline.into(), console_read)
+        .await
+        .is_err()
+    {
+        // `capacity` carries `access`, and an absent one clears the control plane's stored
+        // state (agent-api.md): say what is known until the read lands.
+        console_access.publish_known();
     }
-    console_access.watch_if_applying();
 
+    if actor_dark {
+        warn!(
+            token = "register-actor-dark",
+            "the recovery actor gave no usable status within {:?}: registering without \
+             waiting for it; it is reported once it answers",
+            crate::buildinfo::ACTOR_REGISTER_BUDGET
+        );
+    }
     let prep = prep_started.elapsed();
-    if register_prep_over_budget(prep) {
+    // Only a dark actor's share is taken out: one that answers `/v1/status` but is slow on
+    // `/v1/console` leaves up to the budget of its wait in here, so `register-prep-slow` can
+    // still name the runtime for it.
+    let runtime_prep = if actor_dark {
+        prep.saturating_sub(crate::buildinfo::ACTOR_REGISTER_BUDGET)
+    } else {
+        prep
+    };
+    if register_prep_over_budget(runtime_prep) {
         warn!(
             token = "register-prep-slow",
-            elapsed_ms = prep.as_millis() as u64,
+            elapsed_ms = runtime_prep.as_millis() as u64,
             "register preparation (image reconcile + install probe against the container \
-             runtime) took {prep:?} — the container runtime is answering slowly; \
+             runtime) took {runtime_prep:?} — the container runtime is answering slowly; \
              registration still proceeds, but sessions on this host will feel it"
         );
     }
@@ -2728,170 +2785,87 @@ async fn connect_and_run(
                     *evt_rx = None;
                     continue;
                 };
+                let session_id = mgr.label(&session_id);
+                let terminal = matches!(
+                    &event,
+                    SessionEvent::Stopped { .. }
+                        | SessionEvent::Failed(_)
+                        | SessionEvent::AppFailed { .. }
+                );
+                // A held runtime's end is its release, not a session failure.
+                let live = mgr.running.get(&session_id).is_none_or(|h| h.live());
+                // Classify for the GPU-global detector BEFORE `relay` consumes the event. A
+                // pre-session device-open failure is GPU-global at once; a DEVICE_LOST only
+                // once ≥2 land in the window.
+                let gpu_global = live
+                    && match &event {
+                        SessionEvent::Failed(reason)
+                            if vulkan_fault::reason_is_device_open_failed(reason) =>
+                        {
+                            true
+                        }
+                        SessionEvent::Failed(reason)
+                            if vulkan_fault::reason_is_device_lost(reason) =>
+                        {
+                            gpu_fault.record_device_lost(Instant::now())
+                        }
+                        _ => false,
+                    };
+                // Which host probes could explain this, and the GPU it ran on — captured
+                // before `relay` drops the `running` entry.
+                let launch_failure = match &event {
+                    SessionEvent::Failed(reason) if live => Some((reason.clone(), false)),
+                    SessionEvent::AppFailed { reason, .. } if live => Some((reason.clone(), true)),
+                    _ => None,
+                };
+                let failed_on = mgr
+                    .running
+                    .get(&session_id)
+                    .map(|h| (h.gpu_index, h.codec));
+                // #503: get pending trace events out before the terminal state — the control
+                // plane drops them afterwards. The held `stopped` is terminal for the session.
+                if terminal || matches!(&event, SessionEvent::Held) {
+                    let routes = mgr.trace_routes();
+                    flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx, &routes).await?;
+                }
+                let msgs = mgr.relay(&session_id, event);
+                for msg in &msgs {
+                    send(&mut tx, msg).await?;
+                }
+                if terminal && msgs.iter().any(|m| matches!(m, AgentMsg::SessionState { .. })) {
+                    // Console auto-start is level-triggered by capacity.
+                    send_fresh_capacity(&mut tx, &mut *mgr).await?;
+                    info!("re-sent capacity after a session ended, for console reconciliation");
+                }
+                if let (Some((reason, app_failed)), Some((gpu, codec))) =
+                    (launch_failure, failed_on)
                 {
-                    match event {
-                        SessionEvent::Signaling(sig_msg) => {
-                            let v = serde_json::to_value(&sig_msg)
-                                .unwrap_or(serde_json::Value::Null);
-                            let relay = AgentMsg::Signaling {
-                                session_id,
-                                msg: v,
-                            };
-                            send(&mut tx, &relay).await?;
-                        }
-                        // P5-03: pre-terminal bytes_used must arrive BEFORE
-                        // session_state{stopped} so the control plane still sees
-                        // the session as running when it processes the metric.
-                        SessionEvent::Stopped { bytes_used, detail } => {
-                            if let Some(bu) = bytes_used {
-                                if let Some(h) = mgr.running.get(&session_id) {
-                                    let ts = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis() as i64;
-                                    let now = std::time::Instant::now();
-                                    let w = h.metrics.drain_window(now);
-                                    let pre_terminal = AgentMsg::session_metrics(
-                                        session_id.clone(),
-                                        ts,
-                                        &w,
-                                        Some(bu),
-                                    );
-                                    send(&mut tx, &pre_terminal).await?;
-                                }
-                            }
-                            // #503: get pending trace events out before the terminal
-                            // state — the control plane drops them afterwards.
-                            flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
-                            if let Some(msg) = mgr.prove_home_terminal(
-                                &session_id,
-                                SessionEvent::Stopped { bytes_used, detail },
-                            ) {
-                                send(&mut tx, &msg).await?;
-                                // Console auto-start is level-triggered by capacity.
-                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
-                                info!("re-sent capacity after session stopped for console reconciliation");
-                            }
-                        }
-                        SessionEvent::EffectiveMedia(payload) => {
-                            let ts_unix_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64;
-                            let msg = AgentMsg::SessionTraceEvent {
-                                session_id,
-                                ts_unix_ms,
-                                event: "session.effective_media".to_string(),
-                                payload,
-                            };
-                            send(&mut tx, &msg).await?;
-                        }
-                        // The reliable ORDERED lifecycle lane, so these are already
-                        // sequenced before this session's terminal `session_state` —
-                        // the ordering `flush_pending_diagnostics` manufactures for the
-                        // droppable lane comes free here.
-                        SessionEvent::Capture { event, payload }
-                        | SessionEvent::Trace { event, payload } => {
-                            let ts_unix_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64;
-                            let msg = AgentMsg::SessionTraceEvent {
-                                session_id,
-                                ts_unix_ms,
-                                event: event.to_string(),
-                                payload,
-                            };
-                            send(&mut tx, &msg).await?;
-                        }
-                        other => {
-                            let terminal = matches!(
-                                &other,
-                                SessionEvent::Failed(_) | SessionEvent::AppFailed { .. }
-                            );
-                            // Classify for the GPU-global detector BEFORE `on_event`
-                            // consumes the event. A pre-session device-open failure is
-                            // GPU-global at once; a DEVICE_LOST only once ≥2 land in
-                            // the window.
-                            let gpu_global = match &other {
-                                SessionEvent::Failed(reason)
-                                    if vulkan_fault::reason_is_device_open_failed(reason) =>
-                                {
-                                    true
-                                }
-                                SessionEvent::Failed(reason)
-                                    if vulkan_fault::reason_is_device_lost(reason) =>
-                                {
-                                    gpu_fault.record_device_lost(Instant::now())
-                                }
-                                _ => false,
-                            };
-                            // Which host probes could explain this, and the GPU it ran
-                            // on — captured before `on_event` drops the `running` entry.
-                            let launch_failure = match &other {
-                                SessionEvent::Failed(reason) => Some((reason.clone(), false)),
-                                SessionEvent::AppFailed { reason, .. } => {
-                                    Some((reason.clone(), true))
-                                }
-                                _ => None,
-                            };
-                            let failed_on = mgr
-                                .running
-                                .get(&session_id)
-                                .map(|h| (h.gpu_index, h.codec));
-                            // #503: same pre-terminal flush as the `Stopped` arm —
-                            // `webrtc.remote_description_failed` is emitted by the
-                            // runner immediately before this very event.
-                            if terminal {
-                                flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
-                            }
-                            let msg = if terminal {
-                                mgr.prove_home_terminal(&session_id, other)
-                            } else {
-                                Some(mgr.on_event(&session_id, other))
-                            };
-                            if let Some(msg) = msg {
-                                send(&mut tx, &msg).await?;
-                                if terminal {
-                                    send_fresh_capacity(&mut tx, &mut *mgr).await?;
-                                    info!("re-sent capacity after session failure for console reconciliation");
-                                }
-                            }
-                            if let (Some((reason, app_failed)), Some((gpu, codec))) =
-                                (launch_failure, failed_on)
-                            {
-                                let explains =
-                                    host_probe::launch_failure::explains(&reason, app_failed);
-                                if !explains.is_empty() {
-                                    if let Some(handle) = &mgr.probe_handle {
-                                        handle.launch_failed(gpu, explains, codec);
-                                    }
-                                }
-                            }
-                            if gpu_global && !mgr.draining {
-                                error!(
-                                    token = "gpu-fault-drain-started",
-                                    "GPU-global Vulkan fault detected (session {session_id}); \
-                                     draining sessions and restarting agent for a clean gst reset"
-                                );
-                                // The restart is the clean reset: `gst::init` is a
-                                // process-wide `Once`.
-                                mgr.begin_drain();
-                                // Guarded restart: let in-flight sessions unwind for a
-                                // bounded window, then exit(0) and let the container
-                                // restart policy bring the agent back. Never an exit
-                                // from a `Drop` — that remains banned.
-                                tokio::spawn(async move {
-                                    sleep(vulkan_fault::GPU_GLOBAL_DRAIN_TIMEOUT).await;
-                                    error!(
-                                        token = "gpu-fault-restart-now",
-                                        "GPU-global drain window elapsed; restarting agent process now"
-                                    );
-                                    crate::restart::exit_now(0);
-                                });
-                            }
+                    let explains = host_probe::launch_failure::explains(&reason, app_failed);
+                    if !explains.is_empty() {
+                        if let Some(handle) = &mgr.probe_handle {
+                            handle.launch_failed(gpu, explains, codec);
                         }
                     }
+                }
+                if gpu_global && !mgr.draining {
+                    error!(
+                        token = "gpu-fault-drain-started",
+                        "GPU-global Vulkan fault detected (session {session_id}); \
+                         draining sessions and restarting agent for a clean gst reset"
+                    );
+                    // The restart is the clean reset: `gst::init` is a process-wide `Once`.
+                    mgr.begin_drain();
+                    // Guarded restart: let in-flight sessions unwind for a bounded window, then
+                    // exit(0) and let the container restart policy bring the agent back. Never
+                    // an exit from a `Drop` — that remains banned.
+                    tokio::spawn(async move {
+                        sleep(vulkan_fault::GPU_GLOBAL_DRAIN_TIMEOUT).await;
+                        error!(
+                            token = "gpu-fault-restart-now",
+                            "GPU-global drain window elapsed; restarting agent process now"
+                        );
+                        crate::restart::exit_now(0);
+                    });
                 }
             }
             diagnostic = recv_or_disabled(&mut *diagnostic_rx) => {
@@ -2903,6 +2877,10 @@ async fn connect_and_run(
                          trace forwarding for the rest of this connection"
                     );
                     *diagnostic_rx = None;
+                    continue;
+                };
+                // A held runtime's session has ended: its traces stop here.
+                let Some(session_id) = mgr.trace_label(&session_id) else {
                     continue;
                 };
                 let msg = AgentMsg::SessionTraceEvent {
@@ -2985,6 +2963,24 @@ async fn connect_and_run(
     }
 }
 
+/// Where trace events go (amendment 39): runtime id → session, and the held sessions whose
+/// traces are dropped.
+struct TraceRoutes {
+    labels: HashMap<String, String>,
+    held: HashSet<String>,
+}
+
+impl TraceRoutes {
+    fn label(&self, runtime_id: &str) -> Option<String> {
+        let id = self
+            .labels
+            .get(runtime_id)
+            .cloned()
+            .unwrap_or_else(|| runtime_id.to_string());
+        (!self.held.contains(&id)).then_some(id)
+    }
+}
+
 /// Drain every pending diagnostic trace event so it reaches the control plane BEFORE
 /// a terminal `session_state` for the same session (#503).
 ///
@@ -2997,6 +2993,8 @@ async fn flush_pending_diagnostics<S>(
     // `None` when the `select!` arm already disabled itself: then there is nothing
     // pending and this is a no-op.
     diagnostic_rx: &mut Option<mpsc::Receiver<(String, crate::session::runner::TraceEvent)>>,
+    // Amendment 39: the session a runtime's trace goes out under, if any.
+    routes: &TraceRoutes,
 ) -> anyhow::Result<()>
 where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
@@ -3005,6 +3003,9 @@ where
         return Ok(());
     };
     while let Ok((session_id, te)) = rx.try_recv() {
+        let Some(session_id) = routes.label(&session_id) else {
+            continue;
+        };
         let msg = AgentMsg::SessionTraceEvent {
             session_id,
             ts_unix_ms: te.ts_unix_ms,
@@ -3157,7 +3158,12 @@ struct SessionManager {
     /// Assigned but not yet started. Aged out by the heartbeat sweep — see
     /// [`PENDING_ASSIGNMENT_TTL`].
     pending: HashMap<String, PendingAssignment>,
+    /// Keyed by the session id the control plane addresses, held runtimes included.
     running: HashMap<String, RunningHandle>,
+    /// Amendment 39: a runner reports under its runtime's first session id
+    /// ([`RunningHandle::runtime_id`]); an adopted runtime's reports go out under the id
+    /// that adopted it. Only re-labelled runtimes are listed.
+    labels: HashMap<String, String>,
     /// Agent-local runtime knobs, starting at the env baseline and overlaid by
     /// `config_update` pushes. Read when building each session's SessionConfig.
     runtime_settings: crate::session::settings::RuntimeSettings,
@@ -3276,6 +3282,68 @@ struct PendingAssignment {
     /// probe might be running on, and a `session_start` cannot re-derive it (the wire
     /// message carries no `gpu_index`).
     gpu_index: i32,
+    /// `session_assign.adopt_session_id` (amendment 39), decided at `session_start`.
+    adopt: Option<String>,
+}
+
+/// How long a held runtime waits for a `session_assign` that adopts it (amendment 39).
+const HELD_RUNTIME_TTL: Duration = Duration::from_secs(30);
+
+/// How long a fresh build waits for the runtime it did not adopt to finish its teardown,
+/// which includes the Steam container's stop window.
+const ADOPT_RELEASE_WAIT: Duration = Duration::from_secs(90);
+
+/// What `session_start` does with an `adopt_session_id`.
+enum Adoption {
+    Adopted,
+    /// Build the session fresh, once `after` (the not-adopted runtime's runner) has exited.
+    Fresh {
+        after: Option<Arc<AtomicBool>>,
+    },
+}
+
+/// A held runtime (amendment 39): its session has ended `stopped` with `runtime_held`.
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    since: Instant,
+    /// Asked to stop: the runtime is going and can no longer be adopted.
+    released: bool,
+}
+
+/// Wait for a launch's image preparation. An admission `Busy` never reached the
+/// engine and wrote nothing, so the preparation is submitted again until `budget`
+/// is spent or the launch is stopped; any other error ends the wait as it is.
+fn await_image_preparation(
+    session: &str,
+    first: crate::runtime::ImageOperation<crate::runtime::ImageInfo>,
+    mut resubmit: impl FnMut() -> Result<
+        crate::runtime::ImageOperation<crate::runtime::ImageInfo>,
+        crate::runtime::RuntimeError,
+    >,
+    stop: &AtomicBool,
+    budget: &crate::session::teardown::RetryBudget,
+    pause: Duration,
+) -> Result<crate::runtime::ImageInfo, crate::runtime::RuntimeError> {
+    use crate::runtime::ErrorKind;
+    let mut operation = first;
+    loop {
+        match operation.wait_with_cancel(|_| {}, || stop.load(Ordering::Relaxed)) {
+            Err(error) if error.kind == ErrorKind::Busy && budget.live() => {
+                warn!(
+                    token = "launch-image-busy",
+                    session_id = %session,
+                    "image preparation was refused a runtime slot; asking again"
+                );
+                std::thread::sleep(pause);
+                // A resubmitted pull ignores cancellation, so ask only while still wanted.
+                if stop.load(Ordering::Relaxed) {
+                    return Err(ErrorKind::Cancelled.into());
+                }
+                operation = resubmit()?;
+            }
+            result => return result,
+        }
+    }
 }
 
 /// The per-running-session handles the agent loop holds.
@@ -3317,12 +3385,49 @@ struct RunningHandle {
     /// The assigned codec, before any `QUASAR_CODEC` diagnostic override (the runner
     /// applies that later): a launch failure on it selects that GPU's codec probe.
     codec: crate::session::Codec,
-    /// Set by `SessionEvent::Running`. Until then the launch is in flight and no host
+    /// Set by the first `running` report (`Running`, `AppBooting`, `Displaying`). Until then the launch is in flight and no host
     /// probe starts.
     reached_running: bool,
     /// A runner-reported terminal waits here until its thread has exited and
     /// every source generation has been retired and verified absent.
     pending_home_terminal: Option<SessionEvent>,
+    /// Amendment 39: the adoption channel into the runner.
+    adopt: std::sync::mpsc::Sender<AdoptRequest>,
+    kind: Option<SessionKind>,
+    /// `Some` while this entry is a held runtime rather than a session.
+    held: Option<Held>,
+    /// The session id the runtime was built under: its containers, sockets and runner
+    /// events carry it whatever id now owns the runtime.
+    runtime_id: String,
+    /// Earlier owners of this runtime, retired with it once its cleanup is proven.
+    adopted: Vec<String>,
+    /// A swap was handed to the runner and has not resolved: another is declined (an
+    /// in-place swap takes up to 100 s, amendment 39).
+    swapping: bool,
+    /// What the runtime encodes, for an adoption's match check.
+    stream: StreamParams,
+    /// Set once the runner thread has returned, for a fresh build that must wait for it.
+    exited: Arc<AtomicBool>,
+}
+
+impl RunningHandle {
+    /// A session, not a held runtime: what the control plane may address.
+    fn live(&self) -> bool {
+        self.held.is_none()
+    }
+
+    /// Whether `stream` may run on this runtime (amendment 39 `adopt_session_id`): the same
+    /// codec, fps, bitrate, H.264 profile and mic, and no larger than its launch size.
+    fn encodes(&self, stream: &StreamParams) -> bool {
+        let have = &self.stream;
+        have.codec == stream.codec
+            && have.fps == stream.fps
+            && have.bitrate_kbps == stream.bitrate_kbps
+            && have.h264_profile == stream.h264_profile
+            && have.mic == stream.mic
+            && stream.width <= have.width
+            && stream.height <= have.height
+    }
 }
 
 impl SessionManager {
@@ -3365,6 +3470,7 @@ impl SessionManager {
         SessionManager {
             pending: HashMap::new(),
             running: HashMap::new(),
+            labels: HashMap::new(),
             runtime_settings,
             deployment_baseline,
             policy_agent: None,
@@ -3610,7 +3716,32 @@ impl SessionManager {
 
     /// Session ids the agent currently considers live. Reported in heartbeats.
     fn running_ids(&self) -> Vec<String> {
-        self.running.keys().cloned().collect()
+        self.running
+            .iter()
+            .filter(|(_, h)| h.live())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn swap_resolved(&mut self, session_id: &str) {
+        if let Some(handle) = self.running.get_mut(session_id) {
+            handle.swapping = false;
+        }
+    }
+
+    /// `id` ended by handing its runtime to a session that still runs it.
+    fn adopted_by_another(&self, id: &str) -> bool {
+        self.running
+            .values()
+            .any(|h| h.adopted.iter().any(|a| a == id))
+    }
+
+    /// The session id a runner's report goes out under (amendment 39 re-labelling).
+    fn label(&self, runtime_id: &str) -> String {
+        self.labels
+            .get(runtime_id)
+            .cloned()
+            .unwrap_or_else(|| runtime_id.to_string())
     }
 
     /// Drain each running session's telemetry window into a `session_metrics` message
@@ -3620,7 +3751,7 @@ impl SessionManager {
     fn drain_metrics(&self, ts_unix_ms: i64) -> Vec<AgentMsg> {
         let now = std::time::Instant::now();
         let mut out = Vec::with_capacity(self.running.len() * 2);
-        for (sid, h) in &self.running {
+        for (sid, h) in self.running.iter().filter(|(_, h)| h.live()) {
             let w = h.metrics.drain_window(now);
             if w.frames_dropped > 0 {
                 out.push(AgentMsg::SessionTraceEvent {
@@ -3705,11 +3836,20 @@ impl SessionManager {
                 id,
                 session_id,
                 gpu_index,
+                kind,
+                adopt_session_id,
                 app,
                 stream,
                 resources,
                 video_topology,
             } => {
+                if kind == Some(SessionKind::Unknown) {
+                    warn!(
+                        token = "session-assign-rejected",
+                        "session {session_id} assignment rejected: unknown session kind"
+                    );
+                    return Some(ack(id, false, Some("unknown session kind".to_string())));
+                }
                 if !self.policy_session_ready {
                     return Some(ack(
                         id,
@@ -3838,6 +3978,7 @@ impl SessionManager {
                 }
                 cfg.console_config = self.console_config.clone();
                 cfg.video_topology = video_topology;
+                cfg.kind = kind;
                 // The wire carries no image_id on AppSpec, so resolve it from the
                 // launch ref via the ImageManager's map. `None` on either side means
                 // no seeding for this session, never an assignment failure.
@@ -3898,6 +4039,7 @@ impl SessionManager {
                         assigned_at: Instant::now(),
                         preparation,
                         gpu_index,
+                        adopt: adopt_session_id,
                     },
                 );
                 self.note_session_count();
@@ -3908,6 +4050,7 @@ impl SessionManager {
                     mut cfg,
                     preparation,
                     gpu_index,
+                    adopt,
                     ..
                 }) => {
                     // The assign already raised this, but a `session_start` for an
@@ -3916,7 +4059,20 @@ impl SessionManager {
                     if let Some(handle) = &self.probe_handle {
                         handle.launch_arrived(gpu_index);
                     }
+                    // Amendment 39: take the runtime over, or build fresh once it is gone.
+                    let mut after: Option<Arc<AtomicBool>> = None;
+                    if let Some(from) = adopt {
+                        match self.adopt_runtime(&session_id, &from, gpu_index, &cfg) {
+                            Adoption::Adopted => return Some(ack(id, true, None)),
+                            Adoption::Fresh { after: exited } => after = exited,
+                        }
+                    }
                     let stop = Arc::new(AtomicBool::new(false));
+                    let (adopt_tx, adopt_rx) = std::sync::mpsc::channel::<AdoptRequest>();
+                    let exited = Arc::new(AtomicBool::new(false));
+                    let exited_flag = exited.clone();
+                    let runtime_stream = cfg.stream.clone();
+                    let kind = cfg.kind;
                     let (sig_in_tx, sig_in_rx) = std::sync::mpsc::channel::<SignalMsg>();
                     let (swap_tx, swap_rx) = std::sync::mpsc::channel::<SwapRequest>();
                     let (display_tx, display_rx) =
@@ -3962,10 +4118,44 @@ impl SessionManager {
                         .spawn(move || {
                         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
+                                // The runtime it was to adopt shares its managed home: it
+                                // must be gone before this session's container starts.
+                                if let Some(after) = after {
+                                    let deadline = Instant::now() + ADOPT_RELEASE_WAIT;
+                                    while !after.load(Ordering::Relaxed) {
+                                        let event = if stop.load(Ordering::Relaxed) {
+                                            SessionEvent::Stopped { bytes_used: None, detail: None }
+                                        } else if Instant::now() >= deadline {
+                                            SessionEvent::Failed("the runtime it was to adopt did not shut down".to_string())
+                                        } else {
+                                            std::thread::sleep(Duration::from_millis(100));
+                                            continue;
+                                        };
+                                        let _ = evt_tx2.try_send((panic_sid.clone(), event));
+                                        return;
+                                    }
+                                }
                                 if let Some(preparation) = preparation {
-                                    if let Err(error) = preparation
-                                        .wait_with_cancel(|_| {}, || stop.load(Ordering::Relaxed))
-                                    {
+                                    let image = cfg
+                                        .container
+                                        .as_ref()
+                                        .map(|c| c.image.clone())
+                                        .unwrap_or_default();
+                                    if let Err(error) = await_image_preparation(
+                                        &panic_sid,
+                                        preparation,
+                                        || {
+                                            crate::runtime::configured().map(|runtime| {
+                                                runtime
+                                                    .ensure_image(image.clone(), Duration::from_secs(600))
+                                            })
+                                        },
+                                        &stop,
+                                        &crate::session::teardown::RetryBudget::new(
+                                            crate::runtime::LAUNCH_BUSY_BUDGET,
+                                        ),
+                                        crate::session::teardown::STOP_PAUSE,
+                                    ) {
                                         let event = if error.kind
                                             == crate::runtime::ErrorKind::Cancelled
                                         {
@@ -4004,9 +4194,11 @@ impl SessionManager {
                                     display_rx,
                                     capture_rx,
                                     metrics,
+                                    adopt_rx,
                                 );
                             },
                         ));
+                        exited_flag.store(true, Ordering::Relaxed);
                         if let Err(payload) = outcome {
                             let text = panic_payload_text(payload.as_ref());
                             error!(
@@ -4049,6 +4241,14 @@ impl SessionManager {
                             codec,
                             reached_running: false,
                             pending_home_terminal: None,
+                            adopt: adopt_tx,
+                            kind,
+                            held: None,
+                            runtime_id: session_id.clone(),
+                            adopted: Vec::new(),
+                            swapping: false,
+                            stream: runtime_stream,
+                            exited,
                         },
                     );
                     self.health.set_sessions(self.running.len());
@@ -4076,10 +4276,17 @@ impl SessionManager {
                 session_id,
                 reason,
             } => {
+                let adopted_away = self.adopted_by_another(&session_id);
                 if let Some(ledger) = self.home_cleanup.as_mut() {
                     if let Some(terminal) = ledger.state(&session_id) {
                         self.home_cleanup_reports
                             .push(qualified_home_terminal(&session_id, terminal));
+                        return Some(ack(id, true, None));
+                    }
+                    if adopted_away {
+                        // Its runtime lives on under the session that adopted it (amendment
+                        // 39): there is nothing of its own to stop, and no proof yet.
+                        info!("session {session_id}: stop for an adopted runtime's old id; nothing to do");
                         return Some(ack(id, true, None));
                     }
                     if !self.running.contains_key(&session_id) {
@@ -4109,9 +4316,15 @@ impl SessionManager {
                 if self.pending.remove(&session_id).is_some() {
                     self.note_session_count();
                 }
-                if let Some(h) = self.running.get(&session_id) {
+                if let Some(h) = self.running.get_mut(&session_id) {
                     h.stop.store(true, Ordering::Relaxed);
-                    info!("session {session_id} stop requested (reason={reason})");
+                    if let Some(held) = h.held.as_mut() {
+                        // Amendment 39: a stop for an ended session releases its runtime.
+                        held.released = true;
+                        info!("session {session_id}: held runtime released (reason={reason})");
+                    } else {
+                        info!("session {session_id} stop requested (reason={reason})");
+                    }
                 }
                 Some(ack(id, true, None))
             }
@@ -4119,6 +4332,7 @@ impl SessionManager {
                 id,
                 session_id,
                 app,
+                in_place,
             } => {
                 if self.home_cleanup.as_ref().is_some_and(|ledger| {
                     ledger.state(&session_id).is_some() || !ledger.has_record(&session_id)
@@ -4138,7 +4352,18 @@ impl SessionManager {
                         return Some(ack(id, false, Some(error.to_string())));
                     }
                 };
-                match self.running.get_mut(&session_id) {
+                match self.running.get_mut(&session_id).filter(|h| h.live()) {
+                    Some(h) if h.swapping => {
+                        warn!(
+                            token = "session-swap-busy",
+                            "session {session_id} swap rejected: a swap is already running"
+                        );
+                        Some(ack(
+                            id,
+                            false,
+                            Some("a swap is already running".to_string()),
+                        ))
+                    }
                     Some(h) => {
                         // #175: refs accumulate and are only removed at teardown, so a
                         // swapped-away home just waits to become reapable — the reaper
@@ -4157,8 +4382,12 @@ impl SessionManager {
                                 h.home_refs.push(r.clone());
                             }
                         }
-                        match h.swap.send(SwapRequest { container }) {
+                        match h.swap.send(SwapRequest {
+                            container,
+                            in_place,
+                        }) {
                             Ok(()) => {
+                                h.swapping = true;
                                 if let Ok(mut g) = self.live_refs.lock() {
                                     for r in &new_refs {
                                         g.insert(r.clone());
@@ -4223,7 +4452,7 @@ impl SessionManager {
                     ui_scale,
                     stream,
                 };
-                match self.running.get_mut(&session_id) {
+                match self.running.get_mut(&session_id).filter(|h| h.live()) {
                     Some(h) => {
                         // Render and external are independent axes, each bounded only by
                         // the launch size — see `validate_display_update`.
@@ -4285,7 +4514,7 @@ impl SessionManager {
                 // A rejected capture is a pure no-op: it never touches the pipeline and
                 // can never fail the session (#270 — the old host-side deep probe could
                 // crash a stream; nothing on this surface can).
-                let Some(handle) = self.running.get(&session_id) else {
+                let Some(handle) = self.running.get(&session_id).filter(|h| h.live()) else {
                     warn!(
                         token = "capture-session-not-running",
                         "session_capture for a session that is not running: {session_id}"
@@ -4335,7 +4564,7 @@ impl SessionManager {
                 }
             }
             ControlMsg::Signaling { session_id, msg } => {
-                if let Some(h) = self.running.get(&session_id) {
+                if let Some(h) = self.running.get(&session_id).filter(|h| h.live()) {
                     let raw = serde_json::to_string(&msg).unwrap_or_default();
                     match SignalMsg::from_json(&raw) {
                         Ok(sig) => {
@@ -4684,6 +4913,17 @@ impl SessionManager {
     ) -> Vec<AgentMsg> {
         let mut abandoned: Vec<String> = Vec::new();
         for (sid, h) in self.running.iter_mut() {
+            if let Some(held) = h.held.as_mut().filter(|held| {
+                !held.released && now.saturating_duration_since(held.since) >= HELD_RUNTIME_TTL
+            }) {
+                held.released = true;
+                h.stop.store(true, Ordering::Relaxed);
+                info!(
+                    token = "held-runtime-released",
+                    "session {sid}: no session adopted its held runtime within {}s; releasing it",
+                    HELD_RUNTIME_TTL.as_secs()
+                );
+            }
             let finished = h.thread.as_ref().map(|t| t.is_finished()).unwrap_or(false);
             if !finished {
                 // A thread cannot un-finish, but clearing keeps the field honest.
@@ -4705,15 +4945,31 @@ impl SessionManager {
         }
         let mut out = Vec::with_capacity(abandoned.len());
         for sid in abandoned {
+            // A held runtime's session already ended `stopped`: its runner's end is the
+            // release, never a failure (amendment 39).
+            let held = self.running.get(&sid).is_some_and(|h| !h.live());
+            if held && self.home_cleanup.is_none() {
+                info!("session {sid}: the held runtime's runner ended; released");
+                self.drop_running(&sid);
+                continue;
+            }
             if self.home_cleanup.is_some() {
                 let event = self
                     .running
                     .get_mut(&sid)
                     .and_then(|h| h.pending_home_terminal.take())
                     .unwrap_or_else(|| {
-                        SessionEvent::Failed(
-                            "runner thread ended without reporting a terminal state".to_string(),
-                        )
+                        if held {
+                            SessionEvent::Stopped {
+                                bytes_used: None,
+                                detail: None,
+                            }
+                        } else {
+                            SessionEvent::Failed(
+                                "runner thread ended without reporting a terminal state"
+                                    .to_string(),
+                            )
+                        }
                     });
                 if let Some(message) = self.prove_home_terminal(&sid, event) {
                     out.push(message);
@@ -4739,6 +4995,8 @@ impl SessionManager {
                 reason_code: None,
                 app_log_tail: None,
                 home_seed: None,
+                runtime_held: None,
+                launch_progress: None,
             });
         }
         self.health.set_sessions(self.running.len());
@@ -4778,10 +5036,255 @@ impl SessionManager {
         out
     }
 
+    /// Amendment 39 `adopt_session_id`: hand `from`'s held or parked runtime to
+    /// `session_id`, or say why it is built fresh. A runtime held here that is not adopted
+    /// is released, and the fresh build waits for it: the two share a managed home.
+    fn adopt_runtime(
+        &mut self,
+        session_id: &str,
+        from: &str,
+        gpu_index: i32,
+        cfg: &SessionConfig,
+    ) -> Adoption {
+        let Some(h) = self.running.get_mut(from) else {
+            info!(
+                token = "runtime-adopt-none",
+                "session {session_id}: no runtime of {from} is held here; building it fresh"
+            );
+            return Adoption::Fresh { after: None };
+        };
+        let adoptable = !h.stop.load(Ordering::Relaxed)
+            && match h.held {
+                Some(held) => !held.released,
+                None => h.kind == Some(SessionKind::Parked) && h.reached_running,
+            };
+        let declined = if !adoptable {
+            Some("it is neither held nor a running parked session")
+        } else if h.gpu_index != gpu_index {
+            Some("it is on another GPU")
+        } else if h.video_topology != VideoTopology::StreamOnly {
+            Some("it is not a streamed session")
+        } else if !h.encodes(&cfg.stream) {
+            Some("it encodes another stream, or a smaller one")
+        } else if cfg.kind != Some(SessionKind::Parked) && !h.metrics.launch_helper_connected() {
+            // A runtime whose helper never connected cannot start the game.
+            Some("its launch helper never connected")
+        } else {
+            None
+        };
+        let request = AdoptRequest {
+            kind: cfg.kind,
+            container: cfg.container.clone(),
+            idle_timeout: cfg.idle_timeout,
+            app_boot_timeout: cfg.app_boot_timeout,
+        };
+        let refused = match declined {
+            Some(why) => Some(why),
+            None => h
+                .adopt
+                .send(request)
+                .is_err()
+                .then_some("its runner is gone"),
+        };
+        if let Some(why) = refused {
+            info!(
+                token = "runtime-adopt-declined",
+                "session {session_id}: not adopting the runtime of {from} ({why}); it is torn \
+                 down and the session is built fresh"
+            );
+            h.stop.store(true, Ordering::Relaxed);
+            // Its id has ended at the control plane: what it reports from here is the
+            // release, as for a held runtime.
+            h.held = Some(Held {
+                since: h.held.map_or_else(Instant::now, |held| held.since),
+                released: true,
+            });
+            return Adoption::Fresh {
+                after: Some(h.exited.clone()),
+            };
+        }
+        let Some(mut h) = self.running.remove(from) else {
+            return Adoption::Fresh { after: None };
+        };
+        h.metrics.drain_window(Instant::now());
+        h.held = None;
+        h.swapping = false;
+        h.kind = cfg.kind;
+        h.reached_running = false;
+        h.adopted.push(from.to_string());
+        for r in Self::home_refs_of(cfg) {
+            if !h.home_refs.contains(&r) {
+                self.add_live_refs(std::slice::from_ref(&r));
+                h.home_refs.push(r);
+            }
+        }
+        // A new session gets new display defaults: the claim's size for both the render and
+        // the stream, whatever the old viewer chose, and the default UI scale.
+        let size = (cfg.stream.width, cfg.stream.height);
+        let state = h.display_state;
+        if size != state.external
+            || state.render.unwrap_or(state.launch) != size
+            || state.ui_scale.is_some()
+        {
+            let both = DisplayUpdateRequest {
+                render_width: Some(size.0),
+                render_height: Some(size.1),
+                ui_scale: state.ui_scale.map(|_| 1.0),
+                stream: (size != state.external).then_some(size),
+            };
+            let render_only = DisplayUpdateRequest {
+                stream: None,
+                ..both
+            };
+            // An encoder that cannot resize live keeps the held stream size.
+            let update = validate_display_update(&both, &h.display_state)
+                .or_else(|_| validate_display_update(&render_only, &h.display_state));
+            match update {
+                Ok(eff) if h.display.send(eff).is_ok() => h.display_state.apply(&eff),
+                Ok(_) => {}
+                Err(why) => warn!(
+                    token = "runtime-adopt-resize-rejected",
+                    "session {session_id}: the adopted runtime keeps its size: {why}"
+                ),
+            }
+        }
+        info!(
+            token = "runtime-adopted",
+            "session {session_id} adopted the runtime of {from} (built as {})", h.runtime_id
+        );
+        self.labels
+            .insert(h.runtime_id.clone(), session_id.to_string());
+        self.running.insert(session_id.to_string(), h);
+        self.health.set_sessions(self.running.len());
+        self.note_session_count();
+        Adoption::Adopted
+    }
+
+    /// What the control plane is sent for one runner report, in order. The event loop
+    /// flushes the diagnostic lane before a terminal report and re-sends capacity after one;
+    /// nothing else goes out for it.
+    fn relay(&mut self, session_id: &str, event: SessionEvent) -> Vec<AgentMsg> {
+        if let Some(release) = self.held_report(session_id, &event) {
+            return release.into_iter().collect();
+        }
+        let now_ms = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64
+        };
+        let trace = |event: &str, payload| AgentMsg::SessionTraceEvent {
+            session_id: session_id.to_string(),
+            ts_unix_ms: now_ms(),
+            event: event.to_string(),
+            payload,
+        };
+        match event {
+            SessionEvent::Signaling(sig_msg) => vec![AgentMsg::Signaling {
+                session_id: session_id.to_string(),
+                msg: serde_json::to_value(&sig_msg).unwrap_or(serde_json::Value::Null),
+            }],
+            // P5-03: pre-terminal bytes_used must arrive BEFORE session_state{stopped} so the
+            // control plane still sees the session as running when it processes the metric.
+            SessionEvent::Stopped { bytes_used, detail } => {
+                let mut out = Vec::new();
+                if let (Some(bu), Some(h)) = (bytes_used, self.running.get(session_id)) {
+                    let w = h.metrics.drain_window(std::time::Instant::now());
+                    out.push(AgentMsg::session_metrics(
+                        session_id.to_string(),
+                        now_ms(),
+                        &w,
+                        Some(bu),
+                    ));
+                }
+                out.extend(
+                    self.prove_home_terminal(
+                        session_id,
+                        SessionEvent::Stopped { bytes_used, detail },
+                    ),
+                );
+                out
+            }
+            SessionEvent::EffectiveMedia(payload) => {
+                vec![trace("session.effective_media", payload)]
+            }
+            // The reliable ORDERED lifecycle lane, so these are already sequenced before this
+            // session's terminal `session_state` — the ordering `flush_pending_diagnostics`
+            // manufactures for the droppable lane comes free here.
+            SessionEvent::Capture { event, payload } | SessionEvent::Trace { event, payload } => {
+                vec![trace(event, payload)]
+            }
+            other @ (SessionEvent::Failed(_) | SessionEvent::AppFailed { .. }) => self
+                .prove_home_terminal(session_id, other)
+                .into_iter()
+                .collect(),
+            other => vec![self.on_event(session_id, other)],
+        }
+    }
+
+    /// The session a runtime's trace event goes out under, or `None` while the runtime is
+    /// held: its session has ended (amendment 39).
+    fn trace_label(&self, runtime_id: &str) -> Option<String> {
+        let session_id = self.label(runtime_id);
+        self.running
+            .get(&session_id)
+            .is_none_or(|h| h.live())
+            .then_some(session_id)
+    }
+
+    /// [`Self::trace_label`] as owned data, for a flush across awaits.
+    fn trace_routes(&self) -> TraceRoutes {
+        TraceRoutes {
+            labels: self.labels.clone(),
+            held: self
+                .running
+                .iter()
+                .filter(|(_, h)| !h.live())
+                .map(|(id, _)| id.clone())
+                .collect(),
+        }
+    }
+
+    /// A report from a held runtime's runner (amendment 39), or `None` when `session_id` is a
+    /// session. Its session has ended, so the runner's own reports stop here; its end is the
+    /// release, `Some(proof)` when RH05 terminal proof is due now.
+    fn held_report(&mut self, session_id: &str, event: &SessionEvent) -> Option<Option<AgentMsg>> {
+        if self.running.get(session_id).is_none_or(|h| h.live()) {
+            return None;
+        }
+        let terminal = matches!(
+            event,
+            SessionEvent::Stopped { .. } | SessionEvent::Failed(_) | SessionEvent::AppFailed { .. }
+        );
+        Some(
+            terminal
+                .then(|| self.release_terminal(session_id))
+                .flatten(),
+        )
+    }
+
+    /// The end of a held runtime's runner: the release. Its session already ended
+    /// `stopped`, so only an agent that owes RH05 terminal proof sends anything, and only
+    /// once the cleanup is verified (a pending proof is retried by [`Self::reconcile`]).
+    fn release_terminal(&mut self, session_id: &str) -> Option<AgentMsg> {
+        if self.home_cleanup.is_some() {
+            return self.prove_home_terminal(
+                session_id,
+                SessionEvent::Stopped {
+                    bytes_used: None,
+                    detail: None,
+                },
+            );
+        }
+        self.drop_running(session_id);
+        None
+    }
+
     /// Remove a terminal session from `running` and free its home refs from the
     /// shared live set (#175), so the GC reaper may reap a now-tombstoned home.
     fn drop_running(&mut self, session_id: &str) {
         if let Some(h) = self.running.remove(session_id) {
+            self.labels.remove(&h.runtime_id);
             self.remove_live_refs(&h.home_refs);
             self.health.set_sessions(self.running.len());
             self.note_session_count();
@@ -4809,13 +5312,15 @@ impl SessionManager {
             handle.pending_home_terminal = Some(event);
             return None;
         }
+        // Every container the runtime made carries the id it was built under.
+        let runtime_id = handle.runtime_id.clone();
         let cleaned = self.home_source_retire.as_ref().map_or_else(
             || {
                 crate::runtime::configured()
-                    .and_then(|runtime| runtime.retire_session_applications(session_id).wait())
+                    .and_then(|runtime| runtime.retire_session_applications(&runtime_id).wait())
                     .is_ok()
             },
-            |retire| retire(session_id),
+            |retire| retire(&runtime_id),
         );
         if !cleaned {
             handle.pending_home_terminal = Some(event);
@@ -4832,13 +5337,14 @@ impl SessionManager {
             }
             _ => return None,
         };
-        if self
-            .home_cleanup
-            .as_mut()
-            .unwrap()
-            .retire(session_id, terminal)
-            .is_err()
-        {
+        let ledger = self.home_cleanup.as_mut().unwrap();
+        // The runtime's earlier owners ended long ago; their record goes with it.
+        let earlier = handle.adopted.iter().all(|id| {
+            ledger
+                .retire(id, crate::home_cleanup::TerminalKind::Stopped)
+                .is_ok()
+        });
+        if !earlier || ledger.retire(session_id, terminal).is_err() {
             handle.pending_home_terminal = Some(event);
             warn!(
                 token = "home-terminal-retirement-unavailable",
@@ -4850,6 +5356,14 @@ impl SessionManager {
             let _ = thread.join();
         }
         Some(self.on_event(session_id, event))
+    }
+
+    /// The session's launch is over: no host-wide quiet period is owed for it any more.
+    fn reached_running(&mut self, session_id: &str) {
+        if let Some(handle) = self.running.get_mut(session_id) {
+            handle.reached_running = true;
+        }
+        self.note_session_count();
     }
 
     /// Map a runner lifecycle event onto a session_state message.
@@ -4873,6 +5387,8 @@ impl SessionManager {
                 // log panel that reads as a broken feature rather than a silent app.
                 app_log_tail: (!app_log_tail.is_empty()).then(|| app_log_tail.join("\n")),
                 home_seed: None,
+                runtime_held: None,
+                launch_progress: None,
             };
         }
         let home_seed = if let SessionEvent::HomeSeed(outcome) = &event {
@@ -4880,15 +5396,34 @@ impl SessionManager {
         } else {
             None
         };
+        let mut runtime_held = None;
+        let mut launch_progress = None;
         let (state, detail, error) = match event {
             SessionEvent::Starting => ("starting", Some("building pipeline".to_string()), None),
+            // The session ends; its runtime stays, and stops being a session (amendment 39).
+            SessionEvent::Held => {
+                if let Some(handle) = self.running.get_mut(session_id) {
+                    handle.held = Some(Held {
+                        since: Instant::now(),
+                        released: false,
+                    });
+                }
+                runtime_held = Some(true);
+                self.note_session_count();
+                (
+                    "stopped",
+                    Some(crate::session::runner::GAME_EXITED_DETAIL.to_string()),
+                    None,
+                )
+            }
+            SessionEvent::LaunchProgress(percent) => {
+                launch_progress = Some(LaunchProgress::shaders(percent));
+                ("running", Some("app booting".to_string()), None)
+            }
             SessionEvent::HomeSeed(_) => ("starting", None, None),
             SessionEvent::Progress(detail) => ("starting", Some(detail.to_string()), None),
             SessionEvent::Running => {
-                if let Some(handle) = self.running.get_mut(session_id) {
-                    handle.reached_running = true;
-                }
-                self.note_session_count();
+                self.reached_running(session_id);
                 (
                     "running",
                     Some("pipeline live; offer ready".to_string()),
@@ -4896,10 +5431,7 @@ impl SessionManager {
                 )
             }
             SessionEvent::Displaying(mode) => {
-                if let Some(handle) = self.running.get_mut(session_id) {
-                    handle.reached_running = true;
-                }
-                self.note_session_count();
+                self.reached_running(session_id);
                 let detail = match mode {
                     Some(m) => format!(
                         "displaying {}×{} @ {} Hz",
@@ -4915,6 +5447,7 @@ impl SessionManager {
                 ("running", Some(format!("not displaying: {why}")), None)
             }
             SessionEvent::Stopping => ("stopping", Some("tearing down".to_string()), None),
+            SessionEvent::StoppingWith(why) => ("stopping", Some(why.to_string()), None),
             // A clean stop never carries an `error_message`. `detail` carries a reason
             // on a peer disconnect, recorded as `state_detail`, so operators see why it
             // ended without the row being classified `failed`.
@@ -4930,16 +5463,28 @@ impl SessionManager {
             // progress. The control plane maps these onto state_detail and commits the
             // new app_id on SwapDone (agent-api.md).
             SessionEvent::Swapping => ("running", Some("swapping".to_string()), None),
-            SessionEvent::SwapDone => ("running", Some("swap complete".to_string()), None),
-            SessionEvent::SwapRolledBack(reason) => (
-                "running",
-                Some(format!("swap failed; rolled back: {reason}")),
-                None,
-            ),
+            SessionEvent::SwapDone => {
+                self.swap_resolved(session_id);
+                ("running", Some("swap complete".to_string()), None)
+            }
+            SessionEvent::SwapRolledBack(reason) => {
+                self.swap_resolved(session_id);
+                (
+                    "running",
+                    Some(format!("swap failed; rolled back: {reason}")),
+                    None,
+                )
+            }
             // Same trick as the swap details: the transport IS live, so only `detail`
             // moves. These two strings are the client's loading-screen contract — hold
             // the loader through "app booting", reveal on "app presented".
-            SessionEvent::AppBooting => ("running", Some("app booting".to_string()), None),
+            // The first report of a launch that boots an app is this one, not `Running`: a
+            // `running` session whose detail is anything but `app booting` is, to a client,
+            // one that has nothing left to wait for (#749).
+            SessionEvent::AppBooting => {
+                self.reached_running(session_id);
+                ("running", Some("app booting".to_string()), None)
+            }
             SessionEvent::AppPresented => ("running", Some("app presented".to_string()), None),
             SessionEvent::Signaling(_) => unreachable!("Signaling handled in event loop"),
             SessionEvent::EffectiveMedia(_) => {
@@ -4958,6 +5503,8 @@ impl SessionManager {
             reason_code: None,
             app_log_tail: None,
             home_seed,
+            runtime_held,
+            launch_progress,
         }
     }
 }
@@ -5072,6 +5619,8 @@ fn qualified_home_terminal(
         reason_code: None,
         app_log_tail: None,
         home_seed: None,
+        runtime_held: None,
+        launch_progress: None,
     }
 }
 
@@ -7261,14 +7810,325 @@ mod tests {
     // ---- #191: register preparation runs before the dial ----
 
     #[test]
-    fn register_prep_budget_sits_inside_the_control_plane_handshake_window() {
-        // agentws handshakeTimeout is 15 s. The budget exists to NAME a slow runtime,
-        // so it must trip before the peer would have given up on a same-window dial.
-        assert!(REGISTER_PREP_BUDGET < Duration::from_secs(15));
+    fn register_prep_budget_names_a_slow_runtime() {
         assert!(!register_prep_over_budget(Duration::from_millis(800)));
         assert!(register_prep_over_budget(Duration::from_secs(11)));
         // The field case: one 30 s inspect timeout.
         assert!(register_prep_over_budget(Duration::from_secs(30)));
+    }
+
+    /// #627: a recovery actor that never answers must not hold the connection's only
+    /// reader. `register` has to beat agentws `registerReadTimeout`, and the ack of an
+    /// assign sent right after `capacity` (the console auto-start) has to beat the control
+    /// plane's 10 s `assignAckTimeout`, the same 10 s the actor's status read may take.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_recovery_actor_delays_neither_register_nor_an_ack() {
+        // `connect_and_run` records the install facts it discovers.
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        // Never accepts: a status request connects through the backlog, then waits.
+        let actor = dir.path().join("actor.sock");
+        let _actor = std::os::unix::net::UnixListener::bind(&actor).unwrap();
+        let release_mgr = ReleaseManager::owned(&actor);
+
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret = dir.path().join("secret");
+        let cfg = Config {
+            control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let (timings_tx, timings_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            fn next_text(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> String {
+                loop {
+                    if let Message::Text(t) = ws.read().expect("the agent stays connected") {
+                        return t.to_string();
+                    }
+                }
+            }
+            let (stream, _) = cp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let opened = Instant::now();
+            let register = next_text(&mut ws);
+            let register_after = opened.elapsed();
+            assert!(register.contains(r#""type":"register""#), "{register}");
+            ws.send(Message::Text(
+                r#"{"type":"registered","host_id":"h1","node_secret":null,"heartbeat_interval_ms":5000}"#
+                    .into(),
+            ))
+            .unwrap();
+            while !next_text(&mut ws).contains(r#""type":"capacity""#) {}
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "session_assign", "id": "assign-1", "session_id": "s1",
+                    "gpu_index": 0,
+                    "stream": {"width": 1920, "height": 1080, "fps": 60,
+                        "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+            let assigned = Instant::now();
+            loop {
+                let frame = next_text(&mut ws);
+                if frame.contains(r#""type":"ack""#) && frame.contains(r#""id":"assign-1""#) {
+                    break;
+                }
+            }
+            let _ = timings_tx.send((register_after, assigned.elapsed()));
+            // Dropping `ws` closes the socket, which ends the attempt.
+        });
+
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        let attempt = connect_and_run(
+            &cfg,
+            &health,
+            "",
+            "test",
+            &image_mgr,
+            &release_mgr,
+            &mut sessions,
+            false,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(90), attempt).await;
+        let (register_after, ack_after) = timings_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake control plane saw register and the assign's ack");
+        assert!(
+            register_after < Duration::from_secs(1),
+            "register reached the control plane {register_after:?} after the upgrade"
+        );
+        assert!(
+            ack_after < Duration::from_secs(3),
+            "the assign was acked {ack_after:?} after it was sent"
+        );
+    }
+
+    /// #687: register preparation waits for a recovery actor that never answers (a paused
+    /// one) only `ACTOR_REGISTER_BUDGET`, in all: the install probe and the console read
+    /// both ask it, and each used to wait its own 8 s and 10 s before the dial. The fake
+    /// control plane follows agentws's order: `register`, `registered`, then the agent's
+    /// `capacity`, after which it assigns a session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dark_recovery_actor_does_not_hold_the_dial() {
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        crate::buildinfo::forget_observed();
+        let dir = tempfile::tempdir().unwrap();
+        let actor = dir.path().join("actor.sock");
+        let _actor = std::os::unix::net::UnixListener::bind(&actor).unwrap();
+        let release_mgr = ReleaseManager::owned(&actor);
+
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret = dir.path().join("secret");
+        let cfg = Config {
+            control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let started = Instant::now();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            fn next_text(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> String {
+                loop {
+                    if let Message::Text(t) = ws.read().expect("the agent stays connected") {
+                        return t.to_string();
+                    }
+                }
+            }
+            let (stream, _) = cp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let register = next_text(&mut ws);
+            let registered_after = started.elapsed();
+            ws.send(Message::Text(
+                r#"{"type":"registered","host_id":"h1","node_secret":null,"heartbeat_interval_ms":5000}"#
+                    .into(),
+            ))
+            .unwrap();
+            while !next_text(&mut ws).contains(r#""type":"capacity""#) {}
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "session_assign", "id": "assign-1", "session_id": "s1",
+                    "gpu_index": 0,
+                    "stream": {"width": 1920, "height": 1080, "fps": 60,
+                        "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+            loop {
+                let frame = next_text(&mut ws);
+                if frame.contains(r#""type":"ack""#) && frame.contains(r#""id":"assign-1""#) {
+                    break;
+                }
+            }
+            let _ = seen_tx.send((register, registered_after));
+        });
+
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        sessions.mgr.console_access =
+            crate::release::console::ConsoleAccessManager::owned_for_test(&actor, false);
+        let attempt = connect_and_run(
+            &cfg,
+            &health,
+            "",
+            "test",
+            &image_mgr,
+            &release_mgr,
+            &mut sessions,
+            false,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(60), attempt).await;
+        let (register, after) = seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake control plane saw register and the assign's ack");
+        assert!(
+            after < Duration::from_secs(8),
+            "register reached the control plane {after:?} after the attempt began"
+        );
+        assert!(register.contains(r#""install_mode":"owned""#), "{register}");
+        assert!(
+            register.contains(r#""updater_present":false"#),
+            "{register}"
+        );
+    }
+
+    /// #687: a console read that outlasts the register budget leaves the first `capacity`
+    /// carrying `access` as `applying` (an absent one clears the control plane's stored
+    /// state, agent-api.md, and a settled `on`/`off` lifts its placement hold on a
+    /// replacement this process cannot see), and the late read then sends the actor's answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_console_read_is_published_before_the_dial_and_re_sent_when_it_lands() {
+        use std::io::{Read, Write};
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        crate::buildinfo::forget_observed();
+        crate::release::console::forget_published();
+        let dir = tempfile::tempdir().unwrap();
+        let actor = dir.path().join("actor.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&actor).unwrap();
+        // /v1/status never answers; /v1/console answers 3 s after it is asked.
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                std::thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && conn.read(&mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                    }
+                    if String::from_utf8_lossy(&head).contains("/v1/status") {
+                        std::thread::sleep(Duration::from_secs(60));
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(3));
+                    let body = r#"{"enabled":false,"supported":true}"#;
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let release_mgr = ReleaseManager::owned(&actor);
+
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret = dir.path().join("secret");
+        let cfg = Config {
+            control_plane_url: format!("ws://{}", cp.local_addr().unwrap()),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = cp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let mut capacities = Vec::new();
+            let mut registered = false;
+            while !capacities
+                .last()
+                .is_some_and(|c: &String| c.contains(r#""access":{"state":"off""#))
+            {
+                let Ok(Message::Text(t)) = ws.read() else {
+                    continue;
+                };
+                let t = t.to_string();
+                if t.contains(r#""type":"register""#) && !registered {
+                    registered = true;
+                    ws.send(Message::Text(
+                        r#"{"type":"registered","host_id":"h1","node_secret":null,"heartbeat_interval_ms":5000}"#
+                            .into(),
+                    ))
+                    .unwrap();
+                } else if t.contains(r#""type":"capacity""#) {
+                    capacities.push(t);
+                }
+            }
+            let _ = seen_tx.send(capacities);
+        });
+
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        sessions.mgr.console_access =
+            crate::release::console::ConsoleAccessManager::owned_for_test_publishing(&actor, false);
+        let attempt = connect_and_run(
+            &cfg,
+            &health,
+            "",
+            "test",
+            &image_mgr,
+            &release_mgr,
+            &mut sessions,
+            false,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(25), attempt).await;
+        let capacities = seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a capacity carried the late console read");
+        assert!(
+            capacities[0].contains(r#""access":{"state":"applying""#),
+            "before any actor answer the first capacity must say applying: {}",
+            capacities[0]
+        );
+        for early in &capacities[..capacities.len() - 1] {
+            assert!(
+                !early.contains(r#""access":{"state":"off""#)
+                    && !early.contains(r#""access":{"state":"on""#),
+                "a settled state was published before the actor answered: {early}"
+            );
+        }
+        crate::release::console::forget_published();
     }
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`
@@ -8175,6 +9035,14 @@ mod tests {
                 codec: crate::session::Codec::H264,
                 reached_running: true,
                 pending_home_terminal: None,
+                adopt: std::sync::mpsc::channel().0,
+                kind: None,
+                held: None,
+                runtime_id: String::new(),
+                adopted: Vec::new(),
+                swapping: false,
+                stream: StreamParams::default(),
+                exited: Arc::new(AtomicBool::new(false)),
             },
             stop,
         )
@@ -8226,6 +9094,14 @@ mod tests {
                 codec: crate::session::Codec::H264,
                 reached_running: true,
                 pending_home_terminal: None,
+                adopt: std::sync::mpsc::channel().0,
+                kind: None,
+                held: None,
+                runtime_id: String::new(),
+                adopted: Vec::new(),
+                swapping: false,
+                stream: StreamParams::default(),
+                exited: Arc::new(AtomicBool::new(false)),
             },
             display_rx,
         )
@@ -8636,6 +9512,7 @@ mod tests {
                 assigned_at: Instant::now(),
                 preparation: None,
                 gpu_index: 0,
+                adopt: None,
             },
         );
         mgr.handle_control(
@@ -8687,7 +9564,8 @@ mod tests {
     #[test]
     fn capable_terminal_waits_for_source_absence_and_preserves_home_refs() {
         let directory = tempfile::tempdir().unwrap();
-        let (mut mgr, live_refs) = manager_with_runner(Arc::new(|_, _, _, _, _, _, _, _, _, _| {}));
+        let (mut mgr, live_refs) =
+            manager_with_runner(Arc::new(|_, _, _, _, _, _, _, _, _, _, _| {}));
         let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
             directory.path().join("ledger"),
         )
@@ -8819,7 +9697,7 @@ mod tests {
         let observed = Arc::new(AtomicBool::new(false));
         let result = observed.clone();
         let (mut mgr, _refs) =
-            manager_with_runner(Arc::new(move |_, cfg, _, _, _, _, _, _, _, _| {
+            manager_with_runner(Arc::new(move |_, cfg, _, _, _, _, _, _, _, _, _| {
                 result.store(cfg.container.unwrap().require_local_image, Ordering::SeqCst);
             }));
         let mut cfg = assignment_config(EncoderChoice::Openh264, "software");
@@ -8834,6 +9712,7 @@ mod tests {
                 assigned_at: Instant::now(),
                 preparation: Some(runtime.ensure_image("test", Duration::from_secs(2))),
                 gpu_index: 0,
+                adopt: None,
             },
         );
         let (tx, _rx) = mpsc::channel(8);
@@ -8853,12 +9732,131 @@ mod tests {
         );
     }
 
+    /// A runtime client with one slot, held for `hold`, and an engine that has the
+    /// image: what a launch sees when its preparation is refused for lack of a slot.
+    fn one_slot_runtime(
+        hold: Duration,
+    ) -> (
+        tempfile::TempDir,
+        crate::runtime::RuntimeClient,
+        crate::runtime::Operation<()>,
+    ) {
+        use std::io::{Read, Write};
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::thread::spawn(move || {
+            // Every request is answered; the client's own calls decide how many arrive.
+            while let Ok((mut socket, _)) = listener.accept() {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    if socket.read_exact(&mut byte).is_err() {
+                        break;
+                    }
+                    request.push(byte[0]);
+                }
+                let body = if String::from_utf8_lossy(&request).contains("/version") {
+                    r#"{"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.40"}"#
+                } else {
+                    r#"{"Id":"sha256:fixture","Size":100}"#
+                };
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let mut config = crate::runtime::RuntimeConfig::unix(socket_path);
+        config.image_state_path = Some(directory.path().join("operations"));
+        config.max_in_flight = 1;
+        let runtime = crate::runtime::RuntimeClient::new(config).unwrap();
+        let holder = runtime.submit_owned(
+            async move {
+                tokio::time::sleep(hold).await;
+                Ok(())
+            },
+            Duration::from_secs(60),
+            false,
+        );
+        (directory, runtime, holder)
+    }
+
+    #[test]
+    fn a_launch_refused_a_slot_waits_for_one_and_prepares_its_image() {
+        let (_dir, runtime, _holder) = one_slot_runtime(Duration::from_millis(300));
+        let first = runtime.ensure_image("test", Duration::from_secs(5));
+        let mut resubmitted = 0;
+        let image = await_image_preparation(
+            "s",
+            first,
+            || {
+                resubmitted += 1;
+                Ok(runtime.ensure_image("test", Duration::from_secs(5)))
+            },
+            &AtomicBool::new(false),
+            &crate::session::teardown::RetryBudget::new(Duration::from_secs(5)),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(image.id, "sha256:fixture");
+        assert!(resubmitted >= 1);
+    }
+
+    #[test]
+    fn a_launch_that_is_never_given_a_slot_fails_busy_when_the_budget_is_spent() {
+        let (_dir, runtime, _holder) = one_slot_runtime(Duration::from_secs(60));
+        let first = runtime.ensure_image("test", Duration::from_secs(5));
+        let mut resubmitted = 0;
+        let started = Instant::now();
+        let error = await_image_preparation(
+            "s",
+            first,
+            || {
+                resubmitted += 1;
+                Ok(runtime.ensure_image("test", Duration::from_secs(5)))
+            },
+            &AtomicBool::new(false),
+            &crate::session::teardown::RetryBudget::new(Duration::from_millis(300)),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, crate::runtime::ErrorKind::Busy);
+        assert!(resubmitted >= 2, "resubmitted {resubmitted} times");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_cancelled_launch_stops_waiting_for_a_slot_at_once() {
+        let (_dir, runtime, _holder) = one_slot_runtime(Duration::from_secs(60));
+        let first = runtime.ensure_image("test", Duration::from_secs(5));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stopper.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let error = await_image_preparation(
+            "s",
+            first,
+            || Ok(runtime.ensure_image("test", Duration::from_secs(5))),
+            &stop,
+            &crate::session::teardown::RetryBudget::new(Duration::from_secs(30)),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, crate::runtime::ErrorKind::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn image_preparation_failure_prevents_the_session_runner_from_launching() {
         let called = Arc::new(AtomicBool::new(false));
         let observed = called.clone();
         let (mut mgr, _refs) =
-            manager_with_runner(Arc::new(move |_, _, _, _, _, _, _, _, _, _| {
+            manager_with_runner(Arc::new(move |_, _, _, _, _, _, _, _, _, _, _| {
                 observed.store(true, Ordering::SeqCst);
             }));
         let directory = tempfile::tempdir().unwrap();
@@ -8873,6 +9871,7 @@ mod tests {
                 assigned_at: Instant::now(),
                 preparation: Some(runtime.ensure_image("test", Duration::from_secs(2))),
                 gpu_index: 0,
+                adopt: None,
             },
         );
         let (tx, mut rx) = mpsc::channel(8);
@@ -8899,7 +9898,17 @@ mod tests {
         let (name_tx, name_rx) = std::sync::mpsc::channel();
         let name_tx = Mutex::new(name_tx);
         let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
-            move |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {
+            move |_sid,
+                  _cfg,
+                  _evt,
+                  _diag,
+                  _stop,
+                  _sig,
+                  _swap,
+                  _display,
+                  _capture,
+                  _metrics,
+                  _adopt| {
                 let name = std::thread::current().name().map(str::to_string);
                 let _ = name_tx.lock().unwrap().send(name);
             },
@@ -8918,7 +9927,7 @@ mod tests {
     fn no_encoder_is_preloaded_while_a_session_is_held() {
         gstreamer::init().unwrap();
         let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
-            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {},
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics, _adopt| {},
         ));
         let idle = mgr.encoders_to_preload(EncoderChoice::Openh264, &[], true);
         if gstreamer::ElementFactory::find("openh264enc").is_some() {
@@ -8953,7 +9962,7 @@ mod tests {
         // agent's exclusive container-ownership lease with it, which fails an
         // unrelated test.
         let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
-            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {},
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics, _adopt| {},
         ));
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(8);
         start_seam_session(&mut mgr, "survivor", &evt_tx);
@@ -8967,6 +9976,7 @@ mod tests {
                 assigned_at: Instant::now(),
                 preparation: None,
                 gpu_index: 0,
+                adopt: None,
             },
         );
         assert_eq!(mgr.pending.len(), 1, "setup: one pending assignment");
@@ -9012,7 +10022,7 @@ mod tests {
     #[test]
     fn panicking_runner_emits_failed_with_the_panic_payload() {
         let (mut mgr, live_refs) = manager_with_runner(Arc::new(
-            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics, _adopt| {
                 panic!("set_property on an absent element property")
             },
         ));
@@ -9054,7 +10064,7 @@ mod tests {
     #[test]
     fn reconcile_reaps_a_runner_that_ended_without_a_terminal_event() {
         let (mut mgr, live_refs) = manager_with_runner(Arc::new(
-            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {},
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics, _adopt| {},
         ));
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(8);
         start_seam_session(&mut mgr, "ghost-sess", &evt_tx);
@@ -9099,7 +10109,17 @@ mod tests {
         let hold = Arc::new(AtomicBool::new(false));
         let hold2 = hold.clone();
         let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
-            move |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {
+            move |_sid,
+                  _cfg,
+                  _evt,
+                  _diag,
+                  _stop,
+                  _sig,
+                  _swap,
+                  _display,
+                  _capture,
+                  _metrics,
+                  _adopt| {
                 while !hold2.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -9129,6 +10149,7 @@ mod tests {
                 assigned_at: Instant::now(),
                 preparation: None,
                 gpu_index: 0,
+                adopt: None,
             },
         );
         mgr.reconcile(Instant::now(), RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL);
@@ -9170,6 +10191,14 @@ mod tests {
                 codec: crate::session::Codec::H264,
                 reached_running: true,
                 pending_home_terminal: None,
+                adopt: std::sync::mpsc::channel().0,
+                kind: None,
+                held: None,
+                runtime_id: String::new(),
+                adopted: Vec::new(),
+                swapping: false,
+                stream: StreamParams::default(),
+                exited: Arc::new(AtomicBool::new(false)),
             },
             capture_rx,
         )
@@ -9854,5 +10883,1013 @@ mod tests {
             "{json}"
         );
         assert!(json.get("reason_code").is_none(), "{json}");
+    }
+
+    // ── amendment 39: parked sessions, adoption, held runtimes (#759) ─────────
+
+    #[test]
+    fn register_advertises_parked_sessions_only_with_an_installed_helper() {
+        use crate::session::launch_helper::INSTALLED;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
+        let parked = || {
+            let register = register_message(
+                &cfg,
+                false,
+                Vec::new(),
+                &crate::buildinfo::InstallFacts::default(),
+                true,
+                true,
+                None,
+            )
+            .unwrap();
+            serde_json::to_value(register).unwrap()["parked_sessions_v1"].clone()
+        };
+        INSTALLED.store(false, Ordering::Relaxed);
+        assert_eq!(parked(), serde_json::Value::Null, "no helper: absent");
+        INSTALLED.store(true, Ordering::Relaxed);
+        assert_eq!(parked(), true);
+        INSTALLED.store(false, Ordering::Relaxed);
+    }
+
+    /// What the fake runtimes below were told.
+    struct Warm {
+        started: std::sync::mpsc::Receiver<(String, Option<SessionKind>)>,
+        adopted: std::sync::mpsc::Receiver<(String, AdoptRequest)>,
+        swaps: std::sync::mpsc::Receiver<(String, SwapRequest)>,
+        evt_tx: mpsc::Sender<(String, SessionEvent)>,
+        _evt_rx: mpsc::Receiver<(String, SessionEvent)>,
+    }
+
+    /// A manager whose runners stand in for a runtime: alive until stopped, forwarding what
+    /// they are sent.
+    fn warm_manager() -> (SessionManager, Warm) {
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (adopted_tx, adopted) = std::sync::mpsc::channel();
+        let (swaps_tx, swaps) = std::sync::mpsc::channel();
+        let runner: RunnerFn = Arc::new(
+            move |sid,
+                  cfg,
+                  _evt,
+                  _diag,
+                  stop,
+                  _sig,
+                  swap_rx,
+                  _display,
+                  _capture,
+                  _metrics,
+                  adopt_rx| {
+                let _ = started_tx.send((sid.clone(), cfg.kind));
+                while !stop.load(Ordering::Relaxed) {
+                    while let Ok(req) = adopt_rx.try_recv() {
+                        let _ = adopted_tx.send((sid.clone(), req));
+                    }
+                    while let Ok(req) = swap_rx.try_recv() {
+                        let _ = swaps_tx.send((sid.clone(), req));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            },
+        );
+        let (mgr, _refs) = manager_with_runner(runner);
+        let (evt_tx, _evt_rx) = mpsc::channel(64);
+        (
+            mgr,
+            Warm {
+                started,
+                adopted,
+                swaps,
+                evt_tx,
+                _evt_rx,
+            },
+        )
+    }
+
+    fn steam_cfg(kind: SessionKind, flags: &str, size: (i32, i32)) -> SessionConfig {
+        let mut cfg = assignment_config(EncoderChoice::Openh264, "software");
+        cfg.kind = Some(kind);
+        (cfg.stream.width, cfg.stream.height) = size;
+        cfg.container = Some(ContainerSpec {
+            image: "steam".into(),
+            env: BTreeMap::from([("STEAM_STARTUP_FLAGS".to_string(), flags.to_string())]),
+            mounts: vec!["/homes/u1:/home/quasar".into()],
+            ..Default::default()
+        });
+        cfg
+    }
+
+    fn start(
+        mgr: &mut SessionManager,
+        warm: &Warm,
+        id: &str,
+        cfg: SessionConfig,
+        adopt: Option<&str>,
+    ) -> Option<AgentMsg> {
+        mgr.pending.insert(
+            id.to_string(),
+            PendingAssignment {
+                cfg,
+                assigned_at: Instant::now(),
+                preparation: None,
+                gpu_index: 0,
+                adopt: adopt.map(str::to_string),
+            },
+        );
+        mgr.handle_control(
+            ControlMsg::SessionStart {
+                id: format!("start-{id}"),
+                session_id: id.to_string(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        )
+    }
+
+    fn acked(reply: Option<AgentMsg>) -> bool {
+        matches!(reply, Some(AgentMsg::Ack { ok: true, .. }))
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// A parked session that has reached `running`.
+    fn parked(mgr: &mut SessionManager, warm: &Warm, id: &str, size: (i32, i32)) {
+        assert!(acked(start(
+            mgr,
+            warm,
+            id,
+            steam_cfg(SessionKind::Parked, "-silent", size),
+            None
+        )));
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap(),
+            (id.into(), Some(SessionKind::Parked))
+        );
+        mgr.on_event(id, SessionEvent::Running);
+        mgr.running[id].metrics.set_launch_helper_connected();
+    }
+
+    /// A play session whose game exited with its runtime held.
+    fn held(mgr: &mut SessionManager, warm: &Warm, id: &str) -> serde_json::Value {
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        assert!(acked(start(mgr, warm, id, cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event(id, SessionEvent::Running);
+        mgr.running[id].metrics.set_launch_helper_connected();
+        serde_json::to_value(mgr.on_event(id, SessionEvent::Held)).unwrap()
+    }
+
+    #[test]
+    fn a_held_runtime_reports_stopped_and_leaves_the_heartbeat_but_not_the_host() {
+        let (mut mgr, warm) = warm_manager();
+        let stopped = held(&mut mgr, &warm, "p0");
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(stopped["detail"], "game exited");
+        assert_eq!(stopped["runtime_held"], true);
+        assert!(stopped.get("launch_progress").is_none());
+        assert!(mgr.running.contains_key("p0"), "the runtime is kept");
+        assert!(mgr.running_ids().is_empty(), "not a session any more");
+        assert!(mgr.drain_metrics(0).is_empty());
+        // Nothing addresses it as a session.
+        let swap = mgr.handle_control(
+            ControlMsg::SessionSwapApp {
+                id: "swap".into(),
+                session_id: "p0".into(),
+                app: AppSpec::default(),
+                in_place: true,
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(swap, Some(AgentMsg::Ack { ok: false, .. })));
+        assert!(warm.swaps.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_stop_for_the_ended_id_releases_its_held_runtime() {
+        let (mut mgr, warm) = warm_manager();
+        held(&mut mgr, &warm, "p0");
+        let reply = mgr.handle_control(
+            ControlMsg::SessionStop {
+                id: "stop".into(),
+                session_id: "p0".into(),
+                reason: "parked_superseded".into(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(acked(reply));
+        let h = &mgr.running["p0"];
+        assert!(h.stop.load(Ordering::Relaxed));
+        assert!(h.held.is_some_and(|held| held.released));
+        // The runner's end is the release: nothing more goes out without RH05 proof owed.
+        let thread = mgr.running.get_mut("p0").unwrap().thread.take().unwrap();
+        thread.join().unwrap();
+        assert!(mgr.release_terminal("p0").is_none());
+        assert!(!mgr.running.contains_key("p0"));
+    }
+
+    #[test]
+    fn a_held_runtime_nobody_adopts_is_released_after_30_s() {
+        let (mut mgr, warm) = warm_manager();
+        held(&mut mgr, &warm, "p0");
+        let since = mgr.running["p0"].held.unwrap().since;
+        mgr.reconcile(
+            since + Duration::from_secs(29),
+            RUNNER_REAP_GRACE,
+            PENDING_ASSIGNMENT_TTL,
+        );
+        assert!(!mgr.running["p0"].stop.load(Ordering::Relaxed));
+        mgr.reconcile(
+            since + HELD_RUNTIME_TTL,
+            RUNNER_REAP_GRACE,
+            PENDING_ASSIGNMENT_TTL,
+        );
+        assert!(mgr.running["p0"].stop.load(Ordering::Relaxed));
+        assert!(mgr.running["p0"].held.unwrap().released);
+    }
+
+    #[test]
+    fn an_adoption_relabels_the_runtime_and_hands_it_the_play_app() {
+        let (mut mgr, warm) = warm_manager();
+        parked(&mut mgr, &warm, "k1", (1920, 1080));
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1280, 720));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+
+        let (runner, req) = warm.adopted.recv_timeout(WAIT).unwrap();
+        assert_eq!(runner, "k1", "the parked runtime's runner, not a new one");
+        assert_eq!(req.kind, Some(SessionKind::Play));
+        assert_eq!(
+            req.container.unwrap().env["STEAM_STARTUP_FLAGS"],
+            "-applaunch 730"
+        );
+        assert!(warm.started.try_recv().is_err(), "nothing was built");
+        assert_eq!(mgr.running_ids(), vec!["p1".to_string()]);
+        assert_eq!(mgr.label("k1"), "p1", "its reports go out under the new id");
+        let h = &mgr.running["p1"];
+        assert_eq!(h.runtime_id, "k1");
+        assert_eq!(h.adopted, vec!["k1".to_string()]);
+        assert_eq!(h.kind, Some(SessionKind::Play));
+        assert!(h.live());
+        // The claim's smaller size moved both the render and the stream size.
+        assert_eq!(h.display_state.external, (1280, 720));
+        assert_eq!(h.display_state.render, Some((1280, 720)));
+        mgr.drop_running("p1");
+        assert_eq!(mgr.label("k1"), "k1");
+    }
+
+    #[test]
+    fn a_park_on_exit_adopts_the_held_runtime_as_a_parked_session() {
+        let (mut mgr, warm) = warm_manager();
+        held(&mut mgr, &warm, "p0");
+        let cfg = steam_cfg(SessionKind::Parked, "-silent", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "k2", cfg, Some("p0"))));
+        let (runner, req) = warm.adopted.recv_timeout(WAIT).unwrap();
+        assert_eq!(
+            (runner.as_str(), req.kind),
+            ("p0", Some(SessionKind::Parked))
+        );
+        assert_eq!(mgr.running_ids(), vec!["k2".to_string()]);
+        assert!(mgr.running["k2"].held.is_none());
+    }
+
+    #[test]
+    fn an_adoption_with_no_runtime_here_builds_fresh() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("lost"))));
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap(),
+            ("p1".into(), Some(SessionKind::Play))
+        );
+        assert!(warm.adopted.try_recv().is_err());
+        assert_eq!(mgr.running["p1"].runtime_id, "p1");
+    }
+
+    #[test]
+    fn a_runtime_that_does_not_match_is_torn_down_and_the_session_built_after_it() {
+        let (mut mgr, warm) = warm_manager();
+        parked(&mut mgr, &warm, "k1", (1280, 720));
+        let exited = mgr.running["k1"].exited.clone();
+        // Larger than the runtime's launch size: the agent's backstop refuses it.
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
+        assert!(
+            !mgr.running["k1"].live(),
+            "its reports from here are the release"
+        );
+        let (built, _) = warm.started.recv_timeout(WAIT).unwrap();
+        assert_eq!(built, "p1");
+        assert!(
+            exited.load(Ordering::Relaxed),
+            "built only once the old runtime was gone"
+        );
+        assert!(warm.adopted.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_adoption_checks_the_stream_the_runtime_encodes() {
+        let (mut mgr, warm) = warm_manager();
+        parked(&mut mgr, &warm, "k1", (1920, 1080));
+        let h = &mgr.running["k1"];
+        let base = h.stream.clone();
+        assert!(h.encodes(&base));
+        let smaller = StreamParams {
+            width: 1280,
+            height: 720,
+            ..base.clone()
+        };
+        assert!(h.encodes(&smaller));
+        for other in [
+            StreamParams {
+                codec: crate::session::Codec::H265,
+                ..base.clone()
+            },
+            StreamParams {
+                fps: 30,
+                ..base.clone()
+            },
+            StreamParams {
+                h264_profile: "high".into(),
+                ..base.clone()
+            },
+            StreamParams {
+                mic: true,
+                ..base.clone()
+            },
+            StreamParams {
+                bitrate_kbps: base.bitrate_kbps / 2,
+                ..base.clone()
+            },
+            StreamParams {
+                width: 2560,
+                ..base.clone()
+            },
+        ] {
+            assert!(!h.encodes(&other), "{other:?}");
+        }
+        // Another GPU is no adoption either.
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        cfg.stream = base;
+        mgr.pending.insert(
+            "p1".into(),
+            PendingAssignment {
+                cfg,
+                assigned_at: Instant::now(),
+                preparation: None,
+                gpu_index: 1,
+                adopt: Some("k1".into()),
+            },
+        );
+        assert!(acked(mgr.handle_control(
+            ControlMsg::SessionStart {
+                id: "start".into(),
+                session_id: "p1".into(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        )));
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
+        assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p1");
+    }
+
+    #[test]
+    fn an_in_place_swap_reaches_the_runner() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        let reply = mgr.handle_control(
+            ControlMsg::SessionSwapApp {
+                id: "swap".into(),
+                session_id: "p1".into(),
+                app: AppSpec::default(),
+                in_place: true,
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(acked(reply));
+        let (_, req) = warm.swaps.recv_timeout(WAIT).unwrap();
+        assert!(req.in_place);
+    }
+
+    /// The runner thread is done, as the terminal proof requires; it stays in its handle.
+    fn wait_finished(mgr: &SessionManager, id: &str) {
+        let deadline = Instant::now() + WAIT;
+        while !mgr.running[id]
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the runner of {id} never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_runtimes_cleanup_proof_covers_the_sessions_it_served() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut mgr, warm) = warm_manager();
+        let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+            directory.path().join("ledger"),
+        )
+        .unwrap();
+        for id in ["p0", "p1"] {
+            ledger.record_active(id).unwrap();
+        }
+        mgr.home_cleanup = Some(ledger);
+        let retired = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = retired.clone();
+        mgr.home_source_retire = Some(Arc::new(move |id: &str| {
+            seen.lock().unwrap().push(id.to_string());
+            true
+        }));
+        held(&mut mgr, &warm, "p0");
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("p0"))));
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        mgr.running["p1"].stop.store(true, Ordering::Relaxed);
+        wait_finished(&mgr, "p1");
+        let proof = mgr.prove_home_terminal(
+            "p1",
+            SessionEvent::Stopped {
+                bytes_used: None,
+                detail: None,
+            },
+        );
+        assert!(
+            matches!(proof, Some(AgentMsg::SessionState { ref state, ref session_id, .. })
+            if state == "stopped" && session_id == "p1")
+        );
+        assert_eq!(
+            *retired.lock().unwrap(),
+            ["p0"],
+            "the containers carry the runtime's id"
+        );
+        let ledger = mgr.home_cleanup.as_ref().unwrap();
+        for id in ["p0", "p1"] {
+            assert_eq!(
+                ledger.state(id),
+                Some(crate::home_cleanup::TerminalKind::Stopped)
+            );
+        }
+    }
+
+    /// A held `p0` is released by `release`; its runner's way out is routed as the event loop
+    /// routes it. Exactly one cleanup-proven `stopped` goes out, once the container is gone, and
+    /// a recovery stop for the id afterwards is answered the same way.
+    fn released_with_proof(release: impl FnOnce(&mut SessionManager, &Warm, Instant)) {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut mgr, warm) = warm_manager();
+        let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+            directory.path().join("ledger"),
+        )
+        .unwrap();
+        ledger.record_active("p0").unwrap();
+        mgr.home_cleanup = Some(ledger);
+        let gone = Arc::new(AtomicBool::new(false));
+        let container_gone = gone.clone();
+        mgr.home_source_retire = Some(Arc::new(move |_: &str| {
+            container_gone.load(Ordering::Relaxed)
+        }));
+        held(&mut mgr, &warm, "p0");
+        assert_eq!(
+            mgr.home_cleanup.as_ref().unwrap().state("p0"),
+            None,
+            "held is no proof"
+        );
+        let since = mgr.running["p0"].held.unwrap().since;
+        release(&mut mgr, &warm, since);
+        assert!(mgr.running["p0"].stop.load(Ordering::Relaxed));
+        assert!(mgr.running["p0"].held.unwrap().released);
+
+        let stopped = SessionEvent::Stopped {
+            bytes_used: None,
+            detail: None,
+        };
+        assert!(matches!(
+            mgr.held_report("p0", &SessionEvent::Stopping),
+            Some(None)
+        ));
+        wait_finished(&mgr, "p0");
+        assert!(
+            matches!(mgr.held_report("p0", &stopped), Some(None)),
+            "no proof while the container is still there"
+        );
+        let later = since + HELD_RUNTIME_TTL + Duration::from_secs(1);
+        assert!(mgr
+            .reconcile(later, RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL)
+            .is_empty());
+        // A recovery stop meanwhile changes nothing and reports nothing.
+        let reply = mgr.handle_control(
+            ControlMsg::SessionStop {
+                id: "again".into(),
+                session_id: "p0".into(),
+                reason: "error".into(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(acked(reply));
+        assert!(mgr.home_cleanup_reports.is_empty());
+
+        gone.store(true, Ordering::Relaxed);
+        let proofs: Vec<serde_json::Value> = mgr
+            .reconcile(later, RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL)
+            .into_iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(proofs.len(), 1, "{proofs:?}");
+        assert_eq!(proofs[0]["type"], "session_state");
+        assert_eq!(proofs[0]["session_id"], "p0");
+        assert_eq!(proofs[0]["state"], "stopped");
+        assert!(proofs[0].get("runtime_held").is_none());
+        assert!(mgr
+            .reconcile(later, RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL)
+            .is_empty());
+        assert!(!mgr.running.contains_key("p0"));
+        assert_eq!(
+            mgr.home_cleanup.as_ref().unwrap().state("p0"),
+            Some(crate::home_cleanup::TerminalKind::Stopped)
+        );
+
+        let reply = mgr.handle_control(
+            ControlMsg::SessionStop {
+                id: "recovery".into(),
+                session_id: "p0".into(),
+                reason: "error".into(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(acked(reply));
+        let answers: Vec<serde_json::Value> = mgr
+            .home_cleanup_reports
+            .drain(..)
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0]["session_id"], "p0");
+        assert_eq!(answers[0]["state"], "stopped");
+    }
+
+    #[test]
+    fn a_runtime_released_by_a_stop_sends_one_proven_stopped_once_its_container_is_gone() {
+        released_with_proof(|mgr, warm, _| {
+            let reply = mgr.handle_control(
+                ControlMsg::SessionStop {
+                    id: "release".into(),
+                    session_id: "p0".into(),
+                    reason: "parked_superseded".into(),
+                },
+                &warm.evt_tx,
+                &diagnostic_sender(),
+            );
+            assert!(acked(reply));
+            assert!(
+                mgr.home_cleanup_reports.is_empty(),
+                "nothing before the cleanup"
+            );
+        });
+    }
+
+    #[test]
+    fn a_runtime_released_after_30_s_sends_one_proven_stopped_once_its_container_is_gone() {
+        released_with_proof(|mgr, _, since| {
+            assert!(mgr
+                .reconcile(
+                    since + HELD_RUNTIME_TTL,
+                    RUNNER_REAP_GRACE,
+                    PENDING_ASSIGNMENT_TTL
+                )
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn without_rh05_a_released_runtime_sends_nothing() {
+        let (mut mgr, warm) = warm_manager();
+        held(&mut mgr, &warm, "p0");
+        mgr.running["p0"].stop.store(true, Ordering::Relaxed);
+        mgr.running
+            .get_mut("p0")
+            .unwrap()
+            .held
+            .as_mut()
+            .unwrap()
+            .released = true;
+        let stopped = SessionEvent::Stopped {
+            bytes_used: None,
+            detail: None,
+        };
+        assert!(matches!(mgr.held_report("p0", &stopped), Some(None)));
+        assert!(!mgr.running.contains_key("p0"));
+        assert!(
+            mgr.held_report("p1", &stopped).is_none(),
+            "a session is not routed here"
+        );
+    }
+
+    #[test]
+    fn launch_progress_rides_on_app_booting() {
+        let (mut mgr, _warm) = warm_manager();
+        let msg =
+            serde_json::to_value(mgr.on_event("p1", SessionEvent::LaunchProgress(42))).unwrap();
+        assert_eq!(msg["state"], "running");
+        assert_eq!(msg["detail"], "app booting");
+        assert_eq!(
+            msg["launch_progress"],
+            serde_json::json!({"step":"shaders","percent":42})
+        );
+        let plain = serde_json::to_value(mgr.on_event("p1", SessionEvent::AppBooting)).unwrap();
+        assert!(plain.get("launch_progress").is_none());
+    }
+
+    /// #749: `AppBooting` is a fresh app launch's first `running` report: it carries detail
+    /// `app booting` and ends the launch's quiet period. The runner's order (no plain
+    /// `Running`) is pinned by `takeover_tests::warm_steam`.
+    #[test]
+    fn app_booting_is_the_first_running_report_and_ends_the_launch() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p0", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        assert!(!mgr.running["p0"].reached_running);
+        let seen = as_wire(mgr.relay("p0", SessionEvent::AppBooting));
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0]["state"], "running");
+        assert_eq!(seen[0]["detail"], "app booting");
+        assert!(
+            mgr.running["p0"].reached_running,
+            "app booting is the launch's running report"
+        );
+    }
+
+    #[test]
+    fn an_unknown_session_kind_is_refused() {
+        let (mut mgr, warm) = warm_manager();
+        let assign: ControlMsg = serde_json::from_value(serde_json::json!({
+            "type": "session_assign", "id": "c1", "session_id": "s1", "gpu_index": 0,
+            "kind": "lurking",
+            "stream": {"width": 1920, "height": 1080, "fps": 60,
+                "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+        }))
+        .unwrap();
+        let reply = mgr.handle_control(assign, &warm.evt_tx, &diagnostic_sender());
+        assert!(
+            matches!(reply, Some(AgentMsg::Ack { ok: false, error: Some(ref e), .. })
+            if e == "unknown session kind")
+        );
+        assert!(mgr.pending.is_empty());
+    }
+
+    fn as_wire(msgs: Vec<AgentMsg>) -> Vec<serde_json::Value> {
+        msgs.into_iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect()
+    }
+
+    /// What the control plane receives for the runner's held exit, in order: the old
+    /// viewer's bye, then the held stop, and no `stopping` (a `stopping` row is never parked).
+    #[test]
+    fn a_held_game_exit_reaches_the_control_plane_as_bye_then_the_held_stop() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p0", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.relay("p0", SessionEvent::Running);
+        let mut seen = Vec::new();
+        for event in [
+            SessionEvent::Signaling(crate::session::signaling::SignalMsg::Bye),
+            SessionEvent::Held,
+        ] {
+            seen.extend(as_wire(mgr.relay("p0", event)));
+        }
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0]["type"], "signaling");
+        assert_eq!(seen[0]["session_id"], "p0");
+        assert_eq!(seen[0]["msg"], serde_json::json!({"type": "bye"}));
+        assert_eq!(seen[1]["type"], "session_state");
+        assert_eq!(seen[1]["state"], "stopped");
+        assert_eq!(seen[1]["detail"], "game exited");
+        assert_eq!(seen[1]["runtime_held"], true);
+        // The runner's own end afterwards is the release, not another report.
+        assert!(mgr.relay("p0", SessionEvent::Stopping).is_empty());
+    }
+
+    #[test]
+    fn a_play_claim_does_not_adopt_a_runtime_whose_helper_never_connected() {
+        let (mut mgr, warm) = warm_manager();
+        assert!(acked(start(
+            &mut mgr,
+            &warm,
+            "k1",
+            steam_cfg(SessionKind::Parked, "-silent", (1920, 1080)),
+            None
+        )));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("k1", SessionEvent::Running);
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed), "torn down");
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap().0,
+            "p1",
+            "built fresh"
+        );
+        assert!(warm.adopted.try_recv().is_err());
+
+        // A parked session needs no helper of its own to take a held runtime over.
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p0", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("p0", SessionEvent::Running);
+        mgr.on_event("p0", SessionEvent::Held);
+        let cfg = steam_cfg(SessionKind::Parked, "-silent", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "k2", cfg, Some("p0"))));
+        assert_eq!(
+            warm.adopted.recv_timeout(WAIT).unwrap().1.kind,
+            Some(SessionKind::Parked)
+        );
+    }
+
+    #[test]
+    fn an_adoption_resets_the_old_viewers_render_size_and_ui_scale() {
+        let (mut mgr, warm) = warm_manager();
+        parked(&mut mgr, &warm, "k1", (1920, 1080));
+        // The ended viewer chose 1280x720 rendering and a 1.5 UI scale; the stream is unchanged.
+        let h = mgr.running.get_mut("k1").unwrap();
+        h.display_state.render = Some((1280, 720));
+        h.display_state.ui_scale = Some(1.5);
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+        let state = mgr.running["p1"].display_state;
+        assert_eq!(state.render, None, "back to the launch size");
+        assert_eq!(state.ui_scale, None, "back to the default");
+        assert_eq!(state.external, (1920, 1080));
+    }
+
+    #[test]
+    fn a_second_swap_is_declined_until_the_first_resolves() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        let swap = |mgr: &mut SessionManager| {
+            mgr.handle_control(
+                ControlMsg::SessionSwapApp {
+                    id: "swap".into(),
+                    session_id: "p1".into(),
+                    app: AppSpec::default(),
+                    in_place: true,
+                },
+                &warm.evt_tx,
+                &diagnostic_sender(),
+            )
+        };
+        assert!(acked(swap(&mut mgr)));
+        let second = swap(&mut mgr);
+        assert!(
+            matches!(second, Some(AgentMsg::Ack { ok: false, error: Some(ref e), .. })
+                if e == "a swap is already running"),
+            "{second:?}"
+        );
+        warm.swaps.recv_timeout(WAIT).unwrap();
+        assert!(
+            warm.swaps.try_recv().is_err(),
+            "the second never reached the runner"
+        );
+        mgr.relay("p1", SessionEvent::SwapDone);
+        assert!(acked(swap(&mut mgr)), "accepted once the first completed");
+        mgr.relay("p1", SessionEvent::SwapRolledBack("x".into()));
+        assert!(acked(swap(&mut mgr)), "and once one rolled back");
+    }
+
+    #[test]
+    fn a_held_runtime_whose_runner_ends_without_a_report_is_released_not_failed() {
+        let (mut mgr, warm) = warm_manager();
+        held(&mut mgr, &warm, "p0");
+        mgr.running["p0"].stop.store(true, Ordering::Relaxed);
+        wait_finished(&mgr, "p0");
+        let now = Instant::now();
+        let mut out = mgr.reconcile(now, RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL);
+        out.extend(mgr.reconcile(
+            now + RUNNER_REAP_GRACE,
+            RUNNER_REAP_GRACE,
+            PENDING_ASSIGNMENT_TTL,
+        ));
+        assert!(
+            out.is_empty(),
+            "no failed for an ended session: {:?}",
+            as_wire(out)
+        );
+        assert!(!mgr.running.contains_key("p0"));
+
+        // Owing RH05 proof, it is the release's one qualified stopped.
+        let directory = tempfile::tempdir().unwrap();
+        let (mut mgr, warm) = warm_manager();
+        let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+            directory.path().join("ledger"),
+        )
+        .unwrap();
+        ledger.record_active("p0").unwrap();
+        mgr.home_cleanup = Some(ledger);
+        mgr.home_source_retire = Some(Arc::new(|_: &str| true));
+        held(&mut mgr, &warm, "p0");
+        mgr.running["p0"].stop.store(true, Ordering::Relaxed);
+        wait_finished(&mgr, "p0");
+        // After the usual reap grace for a runner that ended without a word.
+        let now = Instant::now();
+        let mut out = as_wire(mgr.reconcile(now, RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL));
+        out.extend(as_wire(mgr.reconcile(
+            now + RUNNER_REAP_GRACE,
+            RUNNER_REAP_GRACE,
+            PENDING_ASSIGNMENT_TTL,
+        )));
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0]["state"], "stopped");
+    }
+
+    #[test]
+    fn a_stop_for_an_adopted_runtimes_old_id_stops_nothing_and_proves_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut mgr, warm) = warm_manager();
+        let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+            directory.path().join("ledger"),
+        )
+        .unwrap();
+        for id in ["k1", "p1"] {
+            ledger.record_active(id).unwrap();
+        }
+        mgr.home_cleanup = Some(ledger);
+        parked(&mut mgr, &warm, "k1", (1920, 1080));
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        let reply = mgr.handle_control(
+            ControlMsg::SessionStop {
+                id: "late".into(),
+                session_id: "k1".into(),
+                reason: "parked_expired".into(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(acked(reply));
+        assert!(
+            mgr.home_cleanup_reports.is_empty(),
+            "its containers run on under p1"
+        );
+        assert!(!mgr.running["p1"].stop.load(Ordering::Relaxed));
+        assert_eq!(mgr.home_cleanup.as_ref().unwrap().state("k1"), None);
+    }
+
+    #[test]
+    fn a_held_runtimes_traces_are_dropped_and_an_adopted_ones_relabelled() {
+        let (mut mgr, warm) = warm_manager();
+        held(&mut mgr, &warm, "p0");
+        assert_eq!(mgr.trace_label("p0"), None);
+        assert!(mgr.trace_routes().label("p0").is_none());
+        let cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("p0"))));
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        assert_eq!(mgr.trace_label("p0").as_deref(), Some("p1"));
+        assert_eq!(mgr.trace_routes().label("p0").as_deref(), Some("p1"));
+        assert_eq!(mgr.trace_label("other").as_deref(), Some("other"));
+    }
+
+    /// The real runner's held game exit, through the agent's own relay: the exact order of
+    /// what the control plane receives (amendment 39, park on exit).
+    #[test]
+    fn a_real_runners_held_game_exit_reaches_the_wire_as_bye_then_the_held_stop() {
+        use std::io::Write as _;
+        if !crate::session::pipeline::takeover_tests::live_webrtc_available() {
+            return;
+        }
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::write(runtime.path().join("quasar-launch-helper"), b"").unwrap();
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (320, 240));
+        cfg.stream.fps = 30;
+        cfg.stream.bitrate_kbps = 2000;
+        cfg.use_test_src = true;
+        cfg.use_test_audio = true;
+        cfg.gop = 3600;
+        cfg.runtime_dir = runtime.path().to_str().unwrap().to_string();
+        if let Some(app) = cfg.container.as_mut() {
+            app.mounts.clear();
+        }
+        let (mut mgr, _refs) = manager_with_runner(default_runner());
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        mgr.pending.insert(
+            "real".into(),
+            PendingAssignment {
+                cfg,
+                assigned_at: Instant::now(),
+                preparation: None,
+                gpu_index: 0,
+                adopt: None,
+            },
+        );
+        assert!(acked(mgr.handle_control(
+            ControlMsg::SessionStart {
+                id: "start".into(),
+                session_id: "real".into(),
+            },
+            &evt_tx,
+            &diagnostic_sender(),
+        )));
+        let mut seen: Vec<serde_json::Value> = Vec::new();
+        let mut pump = |mgr: &mut SessionManager,
+                        seen: &mut Vec<serde_json::Value>,
+                        done: &dyn Fn(&[serde_json::Value]) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !done(seen) {
+                assert!(Instant::now() < deadline, "{seen:#?}");
+                match evt_rx.try_recv() {
+                    Ok((runtime_id, event)) => {
+                        let id = mgr.label(&runtime_id);
+                        seen.extend(as_wire(mgr.relay(&id, event)));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        };
+        let state = |m: &serde_json::Value, state: &str| {
+            m["type"] == "session_state" && m["state"] == state
+        };
+        pump(&mut mgr, &mut seen, &|w| {
+            w.iter().any(|m| state(m, "running"))
+        });
+        let socket =
+            crate::session::launch_helper::socket_path(runtime.path().to_str().unwrap(), "real");
+        let mut helper = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        for line in [
+            r#"{"type":"launch_state","v":1,"state":"game_running"}"#,
+            r#"{"type":"launch_state","v":1,"state":"game_exited"}"#,
+        ] {
+            writeln!(helper, "{line}").unwrap();
+        }
+        pump(&mut mgr, &mut seen, &|w| {
+            w.iter().any(|m| m["runtime_held"] == true)
+        });
+        let bye = seen
+            .iter()
+            .position(|m| m["type"] == "signaling" && m["msg"]["type"] == "bye")
+            .expect("the bye");
+        assert_eq!(seen[bye]["session_id"], "real");
+        let held = &seen[bye + 1];
+        assert!(
+            state(held, "stopped"),
+            "the held stop right after the bye: {held}"
+        );
+        assert_eq!(held["detail"], "game exited");
+        assert_eq!(held["runtime_held"], true);
+        assert!(
+            !seen.iter().any(|m| state(m, "stopping")),
+            "no stopping before the held stop: {seen:#?}"
+        );
+        assert_eq!(seen.len(), bye + 2, "nothing after the held stop");
+
+        // Its release says nothing more without RH05 proof owed.
+        assert!(acked(mgr.handle_control(
+            ControlMsg::SessionStop {
+                id: "stop".into(),
+                session_id: "real".into(),
+                reason: "parked_superseded".into(),
+            },
+            &evt_tx,
+            &diagnostic_sender(),
+        )));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while mgr.running.contains_key("real") {
+            assert!(Instant::now() < deadline, "the held runtime never went");
+            if let Ok((runtime_id, event)) = evt_rx.try_recv() {
+                let id = mgr.label(&runtime_id);
+                seen.extend(as_wire(mgr.relay(&id, event)));
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(seen.len(), bye + 2, "the release sent nothing: {seen:#?}");
+    }
+
+    /// With `steam_warm_enabled` off the control plane still claims a parked runtime but sends
+    /// no `kind`: the runner is handed none, so the session is never held.
+    #[test]
+    fn a_claim_without_kind_hands_the_runner_no_kind() {
+        let (mut mgr, warm) = warm_manager();
+        parked(&mut mgr, &warm, "k1", (1920, 1080));
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        cfg.kind = None;
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+        let (runner, req) = warm.adopted.recv_timeout(WAIT).unwrap();
+        assert_eq!((runner.as_str(), req.kind), ("k1", None));
+        assert_eq!(mgr.running["p1"].kind, None);
     }
 }

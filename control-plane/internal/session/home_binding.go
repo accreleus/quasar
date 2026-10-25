@@ -122,9 +122,11 @@ func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 	var state State
 	var oldHome *string
 	var oldDigest *string
+	var adopts *string
 	err = tx.QueryRow(ctx, `SELECT user_id::text,app_id::text,host_id::text,state,
-		managed_home_id::text,managed_home_mount_sha256 FROM sessions WHERE id=$1::uuid FOR UPDATE`, sessionID).
-		Scan(&userID, &appID, &hostID, &state, &oldHome, &oldDigest)
+		managed_home_id::text,managed_home_mount_sha256,adopt_session_id::text
+		FROM sessions WHERE id=$1::uuid FOR UPDATE`, sessionID).
+		Scan(&userID, &appID, &hostID, &state, &oldHome, &oldDigest, &adopts)
 	if err != nil {
 		return nil, fmt.Errorf("lock session for home binding: %w", err)
 	}
@@ -151,8 +153,10 @@ func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 	if err != nil {
 		return nil, fmt.Errorf("lock dispatch home claim: %w", err)
 	}
+	// An adopting row reuses the hold on the runtime it adopts; it stays there
+	// until this row's first agent report (transition).
 	if claimState == "conflict" || claimHost == nil || *claimHost != *hostID ||
-		(pendingSession != nil && *pendingSession != sessionID) {
+		(pendingSession != nil && *pendingSession != sessionID && (adopts == nil || *pendingSession != *adopts)) {
 		return nil, ErrHomeConflict
 	}
 	var homeID, provider, ref string

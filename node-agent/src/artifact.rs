@@ -727,7 +727,11 @@ mod tests {
         let held = Lock::acquire(&path, "recovery").unwrap();
         assert!(Lock::acquire(&path, "competitor").is_err());
         drop(held);
-        assert!(Lock::acquire(&path, "next").is_ok());
+        crate::test_lease::reacquire(
+            &path.with_extension("guard"),
+            || Lock::acquire(&path, "next"),
+            |e| e.to_string().contains("waiting for its kernel lock"),
+        );
     }
 
     #[test]

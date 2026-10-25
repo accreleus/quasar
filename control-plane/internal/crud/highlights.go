@@ -98,7 +98,7 @@ func (s *store) listHighlights(ctx context.Context, callerID string, windowDays 
 			SELECT s.id, s.app_id, s.state, s.started_at, s.ended_at, s.created_at
 			FROM sessions s
 			JOIN entitled e ON e.app_id = s.app_id
-			WHERE s.user_id = $1::uuid
+			WHERE s.user_id = $1::uuid AND s.kind = 'play' -- a parked session is not play
 		),
 		live AS (
 			-- One live session per app (DISTINCT ON), newest first. A user can hold

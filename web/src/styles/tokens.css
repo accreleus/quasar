@@ -312,6 +312,8 @@
   --d-ink-strong: oklch(0.99 0.004 268);
   --d-ink-2: oklch(0.86 0.012 268);
   --d-ink-3: oklch(0.74 0.02 268);
+  /* Danger ink for the band: the dark theme's --danger-text, pinned in both themes. */
+  --d-danger: oklch(0.82 0.12 27);
   --d-glass: oklch(1 0 0 / 0.1);
   --d-glass-hover: oklch(1 0 0 / 0.17);
   --d-glass-line: oklch(1 0 0 / 0.18);

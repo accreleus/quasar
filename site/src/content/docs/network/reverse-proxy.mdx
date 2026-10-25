@@ -22,7 +22,9 @@ not 8443. The examples below use `quasar.example.com` and a control plane at
   first-run setup through the public address saves it for you. There is no
   environment override on an owned install.
 - **Set `QUASAR_TRUSTED_PROXIES`** (a seed input) to your proxy's address or CIDR.
-  To change it later, on the first machine:
+  Until it is set, first-run setup through the proxy is refused. An owned install
+  always serves HTTPS, so claim on its HTTPS port (8443) instead. To change it
+  later, on the first machine:
 
   ```bash
   docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_TRUSTED_PROXIES=<address or CIDR>
@@ -86,14 +88,20 @@ Gates the signaling WebSocket. Unset uses the list in **Admin ▸ Settings**; se
 ### QUASAR_TRUSTED_PROXIES
 
 The proxy's address or network, and nothing broader. With the bundled Caddy, use
-that Compose project's bridge subnet. Empty is safe: forwarded addresses are ignored.
+that Compose project's bridge subnet. Empty is safe: forwarded headers are ignored.
+That includes `X-Forwarded-Proto`, so first-run setup through the proxy is refused
+until this is set. The way round it depends on the stack:
+
+- Default Compose stack: claim directly on the HTTPS port (8443).
+- Hardened overlay (no published control-plane port) or `QUASAR_TLS=off` (no
+  HTTPS port): create the admin with `BOOTSTRAP_ADMIN_*`.
 
 ## Proxy requirements
 
 - Forward WebSocket upgrades on `/v1/signal` and `/agent/ws`.
 - No buffering on those paths.
 - A long read timeout (a 60-second idle timeout cuts sessions).
-- Send `X-Forwarded-Proto`.
+- Send `X-Forwarded-Proto: https`, set by the proxy, not passed through from the client.
 
 ## What not to proxy
 

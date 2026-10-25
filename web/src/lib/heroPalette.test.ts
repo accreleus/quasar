@@ -13,17 +13,7 @@ function pixels(rgbs: Array<[number, number, number]>): Uint8ClampedArray {
   return data;
 }
 
-describe("computePalette — luminance branch", () => {
-  it("classifies a near-black art sample as dark (darkArt=true)", () => {
-    const p = computePalette(pixels([[10, 10, 10], [12, 8, 14], [9, 11, 13]]));
-    expect(p.darkArt).toBe(true);
-  });
-
-  it("classifies a near-white art sample as bright (darkArt=false)", () => {
-    const p = computePalette(pixels([[240, 240, 240], [230, 235, 238], [250, 248, 245]]));
-    expect(p.darkArt).toBe(false);
-  });
-
+describe("computePalette — scrim", () => {
   it("mixes the scrim toward black for dark art", () => {
     // Average colour (50,50,50), mixed 80% toward black (pole 0):
     // round(50*0.2) = 10 per channel.
@@ -31,21 +21,12 @@ describe("computePalette — luminance branch", () => {
     expect(p.scrimRgb).toBe("10,10,10");
   });
 
-  it("mixes the scrim toward white for bright art", () => {
-    // Average colour (200,200,200), mixed 80% toward white (pole 255):
-    // round(200*0.2 + 255*0.8) = round(244) = 244 per channel.
+  it("mixes the scrim toward black for bright art too (the band's ink is light)", () => {
+    // Average colour (200,200,200), mixed 80% toward black: round(200*0.2) = 40.
     const p = computePalette(pixels([[200, 200, 200], [200, 200, 200]]));
-    expect(p.scrimRgb).toBe("244,244,244");
-  });
-
-  it("sits exactly at the threshold boundary as dark (lum < 140 is strict)", () => {
-    // Luminance of (140,140,140) via Rec.709 weights sums to exactly 140,
-    // which is NOT < 140 -> bright.
-    const bright = computePalette(pixels([[140, 140, 140]]));
-    expect(bright.darkArt).toBe(false);
-    // One below crosses into dark.
-    const dark = computePalette(pixels([[139, 139, 139]]));
-    expect(dark.darkArt).toBe(true);
+    expect(p.scrimRgb).toBe("40,40,40");
+    // Worst case, pure white art: 51, which keeps white ink above WCAG AA (>= 4.5:1).
+    expect(computePalette(pixels([[255, 255, 255]])).scrimRgb).toBe("51,51,51");
   });
 });
 
