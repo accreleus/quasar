@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.5.0 — 2026-10-25
+
 ### Upgrading
 - **This release changes the database (migrations 0104, 0105 and 0106), so there is no going back below it.** Once applied, an older control plane will not start. For Quasar's own database the way back is a restore of the dump the update takes first (`docs/upgrading.md`, "The one-way migration rule"); on your own database, back up first. Fleet ▸ Releases ▸ Update Quasar waits for live sessions to end before it replaces the control plane (or tick "Update now" to end them), and automatic updates never install a release that changes the database.
 - **Then update the Steam image.** In Library ▸ Images, Sync catalog, then **Update to `2026.10.23`** on Steam. Hot Loading for Steam Apps, the loader that stays up until the game is on screen, and quitting a game back to the library need it, and Steam signs in 10–20 s sooner with it; on the older image Steam tiles launch as before. Leave Hot Loading off until the image is updated.
