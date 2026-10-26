@@ -58,9 +58,10 @@ name: Images
 # runner's docker daemon on top of the build cache is what makes these lanes run
 # out of space; pushing by digest and pulling only in the (separate, cheap)
 # validate job keeps each job's footprint to one copy of one image. The node-agent
-# build still frees the preinstalled toolchains up front — its `build` stage
-# (patched GStreamer + CUDA toolkit + Rust) needs the headroom even with the
-# toolchain image doing the heavy lifting.
+# build frees the preinstalled toolchains up front ONLY when the runner has under 50 GB
+# free — its `build` stage (patched GStreamer + CUDA toolkit + Rust) needs the headroom
+# even with the toolchain image doing the heavy lifting, but a current runner has 86 GB
+# without touching anything and the cleanup costs ~85 s (#865).
 #
 # UNTAGGED VERSIONS ARE NOT CLEANED UP. A failed candidate stays in GHCR as an
 # untagged package version. GITHUB_TOKEN cannot be granted `delete:packages`
@@ -341,6 +342,12 @@ jobs:
       base_pinned: ${{ steps.resolve.outputs.base_pinned }}
       built_at: ${{ steps.resolve.outputs.built_at }}
       release_candidate: ${{ steps.resolve.outputs.release_candidate }}
+      # The gst toolchain, decided here so `build-node-agent` never waits on a job that
+      # has nothing to do. `toolchain_build` is 'true' only when its content-hash tag is
+      # not in the registry; otherwise `toolchain_ref` is the digest reference to use.
+      toolchain_build: ${{ steps.toolchain.outputs.build }}
+      toolchain_image: ${{ steps.toolchain.outputs.image }}
+      toolchain_ref: ${{ steps.toolchain.outputs.ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -398,6 +405,40 @@ jobs:
             echo "| base resolved | \`$base_ref\` |"
             echo "| release candidate | \`$release_candidate\` |"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve the gst toolchain (reuse it by digest, or say it must be built)
+        id: toolchain
+        env:
+          BASE_REF: ${{ steps.resolve.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          # toolchain-hash.sh mixes QUASAR_BASE_DIGEST into the hash when it is set.
+          QUASAR_BASE_DIGEST="${BASE_REF##*@}"
+          case "$QUASAR_BASE_DIGEST" in sha256:*) ;; *) QUASAR_BASE_DIGEST="" ;; esac
+          export QUASAR_BASE_DIGEST
+          echo "base image: $BASE_REF"
+
+          tag="$(bash deploy/toolchain-hash.sh)"
+          image="$REGISTRY_NS/quasar-gst-toolchain:${tag}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          bash deploy/toolchain-hash.sh --explain
+
+          if ! docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "BUILDING $image -- a pin, a patch, the toolchain stage or the base changed."
+            echo "| toolchain | \`$image\` (to be built) |" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Reused. The node-agent build compiles against an immutable input (the digest
+          # read now), not against whatever the content-hash tag points at when it starts,
+          # and release preflight can see the whole input set pinned.
+          d="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image")"
+          case "$d" in sha256:*) ;; *) echo "::error::unexpected digest for $image: $d"; exit 1 ;; esac
+          echo "build=false" >> "$GITHUB_OUTPUT"
+          echo "ref=${image%:*}@${d}" >> "$GITHUB_OUTPUT"
+          echo "REUSING $image -- pins, patches, the toolchain stage and the base are unchanged."
+          echo "Skipping a ~40 minute GStreamer build: ${image%:*}@${d}"
+          echo "| toolchain | \`${image%:*}@${d}\` (reused) |" >> "$GITHUB_STEP_SUMMARY"
 
   # ── The patched GStreamer toolchain, built once per pin bump ───────────────
   #
@@ -415,6 +456,10 @@ jobs:
   toolchain:
     name: quasar-gst-toolchain (patched GStreamer, pin-keyed)
     needs: inputs
+    # Runs only when the content-hash tag is not in the registry (decided in `inputs`).
+    # A skipped job finishes at once, so a reused toolchain costs the agent build no wait
+    # and no runner (#865).
+    if: needs.inputs.outputs.toolchain_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -422,12 +467,8 @@ jobs:
       packages: write
     outputs:
       # `ref` is the DIGEST form and is what the agent build and the preflight both
-      # consume. `image` (the content-hash tag) stays an output because it is the
-      # human-readable identity in logs and in the GHCR UI.
+      # consume.
       ref: ${{ steps.digest.outputs.ref }}
-      image: ${{ steps.resolve.outputs.image }}
-      tag: ${{ steps.resolve.outputs.tag }}
-      built: ${{ steps.resolve.outputs.built }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Free runner disk space
@@ -442,46 +483,17 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Resolve the toolchain tag, and build it only if it is missing
-        id: resolve
-        env:
-          BASE_REF: ${{ needs.inputs.outputs.base_ref }}
-        run: |
-          set -euo pipefail
-          # toolchain-hash.sh mixes QUASAR_BASE_DIGEST into the hash when it is set.
-          QUASAR_BASE_DIGEST="${BASE_REF##*@}"
-          case "$QUASAR_BASE_DIGEST" in sha256:*) ;; *) QUASAR_BASE_DIGEST="" ;; esac
-          export QUASAR_BASE_DIGEST
-          echo "base image: $BASE_REF"
-
-          tag="$(bash deploy/toolchain-hash.sh)"
-          image="$REGISTRY_NS/quasar-gst-toolchain:${tag}"
-          echo "tag=$tag"     >> "$GITHUB_OUTPUT"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          bash deploy/toolchain-hash.sh --explain
-
-          if docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo "built=false" >> "$GITHUB_OUTPUT"
-            echo "REUSING $image -- pins, patches, the toolchain stage and the base are unchanged."
-            echo "Skipping a ~40 minute GStreamer build."
-            exit 0
-          fi
-
-          # No legacy-adoption path. It existed to re-point the new package name at an
-          # artefact published under the pre-rename name, and that package belongs to a
-          # repository this token cannot read. Falling through to a rebuild is correct.
-
-          echo "built=true" >> "$GITHUB_OUTPUT"
-          echo "BUILDING $image -- a pin, a patch, the toolchain stage or the base changed."
+      # No legacy-adoption path. It existed to re-point the new package name at an
+      # artefact published under the pre-rename name, and that package belongs to a
+      # repository this token cannot read. Falling through to a rebuild is correct.
       - name: Build and publish the toolchain
-        if: steps.resolve.outputs.built == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/Dockerfile.vulkan
           target: toolchain
           push: true
-          tags: ${{ steps.resolve.outputs.image }}
+          tags: ${{ needs.inputs.outputs.toolchain_image }}
           # Plain manifests, no attestations — same reasoning as the artifact lanes,
           # and it also keeps the label read above on its single-platform path.
           provenance: false
@@ -493,15 +505,12 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain-cache:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain-cache:buildcache,mode=max
 
-      # Whether it was reused, adopted or freshly built, the toolchain leaves this
-      # job as a DIGEST. The agent build then compiles against an immutable input
-      # rather than against whatever the content-hash tag happens to point at when
-      # the next job starts — the same reason the artifacts themselves are carried
-      # by digest — and release preflight can see the whole input set pinned.
+      # Freshly built, the toolchain leaves this job as a DIGEST, for the same reason
+      # `inputs` reads one for a reused toolchain.
       - name: Resolve the toolchain to a digest
         id: digest
         env:
-          IMAGE: ${{ steps.resolve.outputs.image }}
+          IMAGE: ${{ needs.inputs.outputs.toolchain_image }}
         run: |
           set -euo pipefail
           d="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE")"
@@ -586,7 +595,11 @@ jobs:
 
   build-node-agent:
     name: build quasar-node-agent (digest only)
+    # `toolchain` is skipped when the toolchain is reused, and a job whose need was skipped
+    # is skipped itself unless it says otherwise: run on success or skipped, never on
+    # failure or cancel. A toolchain that has to be built is still built first.
     needs: [inputs, toolchain]
+    if: ${{ !cancelled() && needs.inputs.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.toolchain.result) }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -594,18 +607,25 @@ jobs:
       packages: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      # The toolchain digest this image was built against, for preflight to check.
+      toolchain_ref: ${{ needs.toolchain.outputs.ref || needs.inputs.outputs.toolchain_ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Free runner disk space
-        # ubuntu-latest ships with ~25-30 GB free after the OS/tooling preinstalls, and
-        # this lane's `build` stage (CUDA toolkit + Rust, on top of the toolchain image)
-        # plus the `runtime` image exceeds that headroom. Preinstalled bloat this
-        # workflow never uses (dotnet, Android SDK, GHC, CodeQL, boost) is removed up
-        # front rather than via a third-party disk-cleanup action, to avoid pulling in an
-        # extra unpinned supply-chain dependency for something `rm -rf` does directly.
+      - name: Free runner disk space (only when the runner is short)
+        # This lane's `build` stage (CUDA toolkit + Rust, on top of the toolchain image)
+        # plus the `runtime` image exceeds ~25-30 GB. Runners now have 86 GB free before
+        # any cleanup (measured, 2026-10-26), and the cleanup costs ~85 s, so it runs only
+        # under 50 GB. Preinstalled bloat this workflow never uses (dotnet, Android SDK,
+        # GHC, CodeQL, boost) is removed with `rm -rf` rather than via a third-party
+        # disk-cleanup action, to avoid an extra unpinned supply-chain dependency.
         run: |
           echo "Disk space before cleanup:"
           df -h /
+          avail_gb="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+          if [ "$avail_gb" -ge 50 ]; then
+            echo "${avail_gb} GB free: no cleanup needed."
+            exit 0
+          fi
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost
           echo "Disk space after cleanup:"
@@ -649,7 +669,7 @@ jobs:
           # The ~40 min GStreamer tree comes from the toolchain job's artefact, so
           # this build compiles the node-agent and nothing else.
           build-args: |
-            TOOLCHAIN_IMAGE=${{ needs.toolchain.outputs.ref }}
+            TOOLCHAIN_IMAGE=${{ needs.toolchain.outputs.ref || needs.inputs.outputs.toolchain_ref }}
             QUASAR_BASE_IMAGE=${{ needs.inputs.outputs.base_ref }}
             SOURCE_COMMIT=${{ github.sha }}
             BUILT_AT=${{ needs.inputs.outputs.built_at }}
@@ -861,7 +881,7 @@ jobs:
   # `contents: read` only. No registry credential reaches this job at all.
   preflight:
     name: release preflight (candidate inputs)
-    needs: [inputs, toolchain, build-control-plane, build-node-agent, build-recovery-actor]
+    needs: [inputs, build-control-plane, build-node-agent, build-recovery-actor]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -879,7 +899,7 @@ jobs:
           # --build-arg`), so the pin_status it reports is the pin_status the builds
           # actually used — not the committed :latest dev convenience.
           QUASAR_BASE_IMAGE: ${{ needs.inputs.outputs.base_ref }}
-          TOOLCHAIN_IMAGE: ${{ needs.toolchain.outputs.ref }}
+          TOOLCHAIN_IMAGE: ${{ needs.build-node-agent.outputs.toolchain_ref }}
           QUASAR_CONTROL_IMAGE: ${{ env.REGISTRY_NS }}/quasar-control-plane@${{ needs.build-control-plane.outputs.digest }}
           QUASAR_AGENT_IMAGE: ${{ env.REGISTRY_NS }}/quasar-node-agent@${{ needs.build-node-agent.outputs.digest }}
           QUASAR_RECOVERY_IMAGE: ${{ env.REGISTRY_NS }}/quasar-recovery@${{ needs.build-recovery-actor.outputs.digest }}
