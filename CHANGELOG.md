@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Security
+- **The add-a-host page says to keep the agent address on `wss://` (#823).** Agent enrollment over `ws://` sends the enrollment token and node secret in clear, and the page said nothing about it. No code or behaviour change.
+
 ## 0.5.0 — 2026-10-25
 
 ### Upgrading
