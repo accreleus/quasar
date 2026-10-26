@@ -422,7 +422,10 @@ jobs:
           echo "image=$image" >> "$GITHUB_OUTPUT"
           bash deploy/toolchain-hash.sh --explain
 
-          if ! docker manifest inspect "$image" >/dev/null 2>&1; then
+          # One retry: a registry hiccup must not read as "absent" and cost a 40-minute rebuild.
+          if ! docker manifest inspect "$image" >/dev/null 2>&1 \
+             && { sleep 5; ! docker manifest inspect "$image" >/dev/null 2>&1; }; then
+            echo "::warning::manifest inspect of $image failed; building it"
             echo "build=true" >> "$GITHUB_OUTPUT"
             echo "BUILDING $image -- a pin, a patch, the toolchain stage or the base changed."
             echo "| toolchain | \`$image\` (to be built) |" >> "$GITHUB_STEP_SUMMARY"
@@ -474,7 +477,9 @@ jobs:
     steps:
       - name: Reused, nothing to build
         if: needs.inputs.outputs.toolchain_build != 'true'
-        run: echo "reusing ${{ needs.inputs.outputs.toolchain_ref }}"
+        env:
+          REF: ${{ needs.inputs.outputs.toolchain_ref }}
+        run: echo "reusing $REF"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.inputs.outputs.toolchain_build == 'true'
       - name: Free runner disk space
@@ -628,6 +633,7 @@ jobs:
           echo "Disk space before cleanup:"
           df -h /
           avail_gb="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+          case "$avail_gb" in ''|*[!0-9]*) avail_gb=0 ;; esac
           if [ "$avail_gb" -ge 50 ]; then
             echo "${avail_gb} GB free: no cleanup needed."
             exit 0
@@ -690,6 +696,9 @@ jobs:
           # shared with the dev boxes.
           cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent-cache:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent-cache:buildcache,mode=max
+      - name: Disk after the build (records the real peak behind the 50 GB threshold)
+        if: always()
+        run: df -h /
 
   build-recovery-actor:
     name: build quasar-recovery (digest only)
