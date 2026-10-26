@@ -27,6 +27,9 @@ own; the two do not move together, and that is deliberate.
 ### Security
 - **The control plane's HTTPS listener now sends `Strict-Transport-Security: max-age=31536000` (#820).** A browser that has reached it over HTTPS stays on HTTPS for a year. Only the control plane's own HTTPS listener sends it: the plain HTTP port and `QUASAR_TLS=off` do not, and it names no subdomains. Nothing to configure.
 
+### Internal
+- **Region and Input settings mock (#844).** `design_handoff_v3/screens/region-input-v3.html` shows the account page's new Region section (timezone list and world map, language, region format) and Input section (keyboard layout, mouse speed and sensitivity, raw input, scroll direction, Nintendo gamepad layout), plus the admin install-wide defaults. `DESIGN.md` gains the rules for its new controls.
+
 ## 0.5.0 — 2026-10-25
 
 ### Upgrading
