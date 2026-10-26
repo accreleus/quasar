@@ -447,9 +447,19 @@ export function recommendedProfile(data: ProfilesResponse): LaunchProfileEvaluat
   return data.profiles.find((p) => p.id === data.recommended_id) ?? null;
 }
 
-/** True only when the resolved recommendation is outright `eligible`. */
+// A top rung ineligible for these alone is one the launch walk steps past.
+const FALL_THROUGH_CODES = new Set(["host_encoder_not_supported", "codec_not_supported"]);
+
+/** True when the recommendation is `eligible`, or `risky` only because its top rung's
+ * codec is missing and the first rung below the top that is not ineligible is `eligible`.
+ * The server's walk enforces codec, decode and encoder clamps, not bandwidth, RTT or display. */
 export function isRecommendationEligible(data: ProfilesResponse): boolean {
-  return recommendedProfile(data)?.eligibility === "eligible";
+  const p = recommendedProfile(data);
+  if (!p) return false;
+  if (p.eligibility === "eligible") return true;
+  if (p.eligibility !== "risky" || !p.reasons.every((r) => FALL_THROUGH_CODES.has(r.code))) return false;
+  const [top, ...below] = orderedRungs(p);
+  return top?.eligibility === "ineligible" && below.find((r) => r.eligibility !== "ineligible")?.eligibility === "eligible";
 }
 
 // ── One call for the whole panel (home/DetailBand + home/LaunchOptions) ──────
