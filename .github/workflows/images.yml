@@ -786,6 +786,10 @@ jobs:
   validate-node-agent:
     name: contract - quasar-node-agent
     needs: build-node-agent
+    # A skipped `toolchain` (reused) would skip everything below `build-node-agent` through
+    # the implicit success() check, which looks at every ancestor. Replace it with the same
+    # rule over the DIRECT needs: nothing failed, nothing was skipped (#865).
+    if: ${{ !cancelled() && needs.build-node-agent.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -882,6 +886,10 @@ jobs:
   preflight:
     name: release preflight (candidate inputs)
     needs: [inputs, build-control-plane, build-node-agent, build-recovery-actor]
+    # A skipped `toolchain` (reused) would skip everything below `build-node-agent` through
+    # the implicit success() check, which looks at every ancestor. Replace it with the same
+    # rule over the DIRECT needs: nothing failed, nothing was skipped (#865).
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -938,6 +946,10 @@ jobs:
       - validate-node-agent
       - validate-recovery-actor
       - preflight
+    # A skipped `toolchain` (reused) would skip everything below `build-node-agent` through
+    # the implicit success() check, which looks at every ancestor. Replace it with the same
+    # rule over the DIRECT needs: nothing failed, nothing was skipped (#865).
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1272,7 +1284,8 @@ jobs:
   release:
     name: publish the GitHub Release
     needs: [release-gate, inputs, build-control-plane, build-node-agent, build-recovery-actor, promote]
-    if: needs.release-gate.outputs.is_release == 'true'
+    # Same rule as `promote` (a skipped `toolchain` sits above it), plus the tag-only gate.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'skipped') && needs.release-gate.outputs.is_release == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
