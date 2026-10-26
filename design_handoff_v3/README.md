@@ -40,6 +40,7 @@ design_handoff_v3/
     ├── rh06/                    ← its screenshots (one per surface and state) + README (state list, surface → ticket table, open questions)
     ├── rh07-v3.html             ← RH-07 additions (approved, #394). The quick start's engine step, profile badges, host preparation and Quadlet / docker run output (drawn in the docs site's own Starlight style), console mode on an owned host, and the readiness card's engine facts and "skipped, and why" rows; uses console-v3.css + ui.js + pages-rh06.js + pages-rh07.js
     ├── rh07/                    ← RH-07 additions (approved, #394). Its screenshots (one per surface and state) + README (state list, surface → ticket table, open questions)
+    ├── region-input-v3.html     ← Region and Input settings (approved direction, #844): the account page's two new sections and the admin install-wide defaults; links the shipped web/src/styles sheets, so open it from a checkout; region-input-v3.png is its render
     └── assets/
         ├── console-v3.css       ← v3 token contract + console/HUD component styles (source of truth)
         ├── home-v3.css          ← v3 reskin layered over quasar.css for the home page
