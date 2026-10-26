@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <!--
-  Region and Input settings (#844, part of #838). Owner-approved direction, 2026-10-26.
+  Region and Input settings (#844, part of #838). Direction approved by the owner, 2026-10-26.
   Frame 1: the account page's new Region and Input sections. Frame 2: the admin install-wide defaults.
   Styles are the shipped web/ stylesheets, linked so this page cannot drift from them; open it from a
   checkout. base.css's @fontsource imports do not resolve outside the web build; the Google Fonts import
@@ -337,7 +337,7 @@ html.mk-only-account #frame-admin, html.mk-only-account .admin-frame { display: 
           </div>
           <div class="field mt5 os-field">
             <label class="label" for="sens">Sensitivity</label>
-            <div class="rg-range"><div class="rg-track"><input id="sens" type="range" min="-2" max="2" step="0.125" value="0" aria-valuetext="1×"><div class="rg-ticks" aria-hidden="true"><span>0.25×</span><span>1×</span><span>4×</span></div></div><span class="rg-val num" id="sens-v">1.00×</span></div>
+            <div class="rg-range"><div class="rg-track"><input id="sens" type="range" min="-2" max="2" step="0.125" value="0" aria-valuetext="1×"><div class="rg-ticks" aria-hidden="true"><span>0.25×</span><span>1×</span><span>4×</span></div></div><span class="rg-val num" id="sens-v">1×</span></div>
           </div>
           <div class="mt4">
             <div class="ac-sw"><label class="switch-row"><label class="switch"><input id="raw" type="checkbox" aria-describedby="raw-hint"><span class="track"></span><span class="thumb"></span></label><span class="switch-label">Raw mouse input (no acceleration)</span></label></div>
@@ -439,12 +439,12 @@ html.mk-only-account #frame-admin, html.mk-only-account .admin-frame { display: 
               <div class="setting-row-control ad-pair"><select class="select" id="ad-kb" aria-label="Default keyboard layout"></select><select class="select" id="ad-kbv" aria-label="Default keyboard variant"></select></div>
             </div>
             <div class="rowflex between gap6 setting-row">
-              <div><div class="label">Match cursor to the window</div><div class="hint">Auto is on for desktops, off for games</div></div>
-              <div class="setting-row-control"><div class="segmented" role="tablist" aria-label="Match cursor to the window"><button type="button" role="tab" aria-selected="true">Auto</button><button type="button" role="tab" aria-selected="false">Always on</button><button type="button" role="tab" aria-selected="false">Off</button></div></div>
+              <div><div class="label">Match cursor to my window</div><div class="hint">Auto is on for desktops, off for games</div></div>
+              <div class="setting-row-control"><div class="segmented" role="tablist" aria-label="Match cursor to my window"><button type="button" role="tab" aria-selected="true">Auto</button><button type="button" role="tab" aria-selected="false">Always on</button><button type="button" role="tab" aria-selected="false">Off</button></div></div>
             </div>
             <div class="rowflex between gap6 setting-row">
               <div><div class="label">Mouse sensitivity</div><div class="hint">0.25× to 4×</div></div>
-              <div class="setting-row-control ad-ctl"><div class="rg-range"><div class="rg-track"><input id="ad-sens" type="range" min="-2" max="2" step="0.125" value="0" aria-label="Default mouse sensitivity" aria-valuetext="1×"></div><span class="rg-val num" id="ad-sens-v">1.00×</span></div></div>
+              <div class="setting-row-control ad-ctl"><div class="rg-range"><div class="rg-track"><input id="ad-sens" type="range" min="-2" max="2" step="0.125" value="0" aria-label="Default mouse sensitivity" aria-valuetext="1×"></div><span class="rg-val num" id="ad-sens-v">1×</span></div></div>
             </div>
             <div class="rowflex between gap6 setting-row">
               <div><div class="label">Raw mouse input</div><div class="hint">No acceleration. Chrome and Edge only; other browsers ignore it</div></div>
@@ -655,7 +655,7 @@ match.addEventListener("keydown", (e) => {
 setMatch("auto");
 function wireRange(input, out, status) {
   const paint = () => {
-    const v = 2 ** +input.value, t = `${v.toFixed(2)}×`;
+    const v = 2 ** +input.value, t = `${Number.isInteger(v) ? v : v.toFixed(2)}×`;
     out.textContent = t; input.setAttribute("aria-valuetext", t);
     input.style.setProperty("--fill", `${(+input.value + 2) / 4 * 100}%`);
   };

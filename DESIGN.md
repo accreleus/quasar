@@ -149,7 +149,7 @@ there as well as on the page it targets.
 
 ## Region and Input settings (#844)
 
-No v3 mock covered these. The owner-approved composition is
+No v3 mock covered these. The composition, with its direction approved by the owner, is
 `design_handoff_v3/screens/region-input-v3.html` (account sections, then the admin
 defaults). Rules:
 
@@ -162,7 +162,7 @@ defaults). Rules:
 | Range slider | New: track `--surf-inset` with a `--line-3` border, filled in `--accent` to the value (`--fill` custom property), `--text` thumb with `--shadow-sm`, `--glow-accent` on focus, 44px hit area. Mono value readout on the right; mono end and centre ticks underneath. Sensitivity is log-scaled so 1× sits at the centre. |
 | Unavailable toggle | A `Switch` disabled with its hint saying why ("Not available in this browser"), never hidden. |
 | Rail icons | Region is a globe, Input a keyboard, drawn in the shell glyph style (16px box, 1.5 stroke, round caps). |
-| "Applies from your next launch" | Said once per section, in the section's sub-line, not under every field. The status line under the card confirms each save, and says when idle Steam was closed to pick the change up. |
+| "Applies from your next launch" | Said once per section, in the section's sub-line, not under every field. The status line under the card confirms each save, and says when idle Steam was closed to pick the change up (never a session in use). |
 
 Admin defaults use the Settings page's `SettingRow`s; the admin timezone default is a
 grouped `<select>`, not the map.
