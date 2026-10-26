@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Security
+- **The control plane warns when a reverse proxy it does not trust talks to its plain HTTP port (#821).** A request carrying `X-Forwarded-*` from a peer outside `QUASAR_TRUSTED_PROXIES` logs `forwarded-from-unlisted-peer` with that peer's address, once per peer every 10 minutes. Nothing is refused. Name that proxy in `QUASAR_TRUSTED_PROXIES` before the release that refuses sign-in over plain HTTP (#604).
+
 ## 0.5.0 — 2026-10-25
 
 ### Upgrading

@@ -90,7 +90,9 @@ Gates the signaling WebSocket. Unset uses the list in **Admin ▸ Settings**; se
 The proxy's address or network, and nothing broader. With the bundled Caddy, use
 that Compose project's bridge subnet. Empty is safe: forwarded headers are ignored.
 That includes `X-Forwarded-Proto`, so first-run setup through the proxy is refused
-until this is set. The way round it depends on the stack:
+until this is set. A proxy that is not listed shows up in the control plane's log as
+`forwarded-from-unlisted-peer` with its address (once per 10 minutes): put that
+address here. The way round it depends on the stack:
 
 - Default Compose stack: claim directly on the HTTPS port (8443).
 - Hardened overlay (no published control-plane port) or `QUASAR_TLS=off` (no
