@@ -32,7 +32,9 @@ curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll
 ```
 
 The enrollment string contains the instance address, certificate pin and single-use
-token. It is private; the token is not embedded in the URL.
+token. It is private; the token is not embedded in the URL. The address in it is
+always `wss://`. A host set up over `ws://` instead needs `QUASAR_ALLOW_PLAINTEXT_AGENT=1`
+and sends the token and node secret in cleartext.
 
 ## 3. Inspect the script
 
