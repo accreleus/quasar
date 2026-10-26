@@ -47,4 +47,20 @@ func TestWarnUnlistedProxy(t *testing.T) {
 	if warns() != 2 {
 		t.Fatalf("a second peer gets its own WARN: %q", logged.String())
 	}
+
+	// IPv6: one WARN per /64, naming the first address, not the /64.
+	send("[2001:db8:1:2::5]:1", "X-Forwarded-For")
+	send("[2001:db8:1:2:aaaa::9]:1", "X-Forwarded-For")
+	if warns() != 3 || !strings.Contains(logged.String(), "peer=2001:db8:1:2::5") || strings.Contains(logged.String(), "/64") {
+		t.Fatalf("want one WARN for the /64 naming the first address: %q", logged.String())
+	}
+
+	// Header names are matched canonically.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "198.51.100.3:1"
+	req.Header.Set("x-forwarded-for", "203.0.113.9")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if warns() != 4 {
+		t.Fatalf("a lower-case x-forwarded-for must warn: %q", logged.String())
+	}
 }
