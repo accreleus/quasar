@@ -737,8 +737,8 @@ fn a_game_exit_with_no_cloud_sync_ends_as_soon_as_the_helper_says_so() {
     let started = Instant::now();
     assert!(session.pump(&mut b, Duration::from_secs(20), |s, _| s.ended.is_some()));
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "{:?}",
+        started.elapsed() < Duration::from_secs(3),
+        "waited for the bound: {:?}",
         started.elapsed()
     );
     assert!(matches!(

@@ -1778,7 +1778,8 @@ impl crate::session::teardown::Sidecar for SourceStopWitness {
 }
 
 /// #753: on a game exit the browser hears `bye`, after the `stopping` row it reads, and the
-/// video transport is gone before the source stop, which waits on Steam's exit.
+/// video transport is gone before the source stop. No helper is passed: the sync wait is
+/// `warm_steam`'s (#810).
 #[test]
 fn a_game_exit_says_bye_and_drops_the_video_before_the_source_stops() {
     use crate::session::source::{AppSource, SessionResources};

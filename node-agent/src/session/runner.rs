@@ -852,17 +852,17 @@ fn in_place_plan(
 const IN_PLACE_QUIT_BOUND: Duration = Duration::from_secs(94);
 const IN_PLACE_LAUNCH_BOUND: Duration = Duration::from_secs(5);
 
-/// How long a session end waits for a running Steam game to quit and its exit cloud sync to
-/// end before the container stop (#742). The #759 spike measured close + sync at 2.8–9.3 s,
-/// uploads 1–3 s. Raise neither number alone: this bound, the 10 s container stop and the
+/// How long a session end waits for a Steam game to quit and its exit cloud sync to end before
+/// the container stop (#742); a game the player already quit has only the sync left (#810). The
+/// #759 spike measured close + sync at 2.8–9.3 s, uploads 1–3 s. Raise neither number alone: this bound, the 10 s container stop and the
 /// teardown after it must fit the web's 45 s closing wait (`MAX_CLOSING_RETRY_WAIT_MS`,
 /// `web/src/pages/app/capacityRetry.ts`), and it must cover the helper's timeline for a game
 /// that ignores the close (`QUIT_CLOSE_GRACE` 20 s, then SIGTERM: about 21–24 s to the sync).
 const END_QUIT_BOUND: Duration = Duration::from_secs(30);
 
-/// Any session end whose Steam game still runs (#742): quit the game the in-place swap's way
-/// and wait for Steam's cloud sync, at most [`END_QUIT_BOUND`]. No helper or no running game
-/// (held, parked, the game already exited) returns at once.
+/// Any session end with a Steam game that runs, or that the player just quit (#742, #810): quit
+/// the game the in-place swap's way and wait for Steam's cloud sync, at most [`END_QUIT_BOUND`].
+/// No helper, or no target game (held, parked), returns at once.
 fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
     use super::launch_helper::EndQuit;
     let Some(launch) = launch else {
@@ -1752,8 +1752,8 @@ fn replace_audio(
 /// Session ends only: the audio pipeline reports nothing after this
 /// (`AudioPipelineGuard::stop_reporting`), so a caller must never keep the session.
 ///
-/// A Steam game still running is quit and its cloud sync waited for (#742) once the
-/// client's media and input have ended and before the container goes. The source keeps
+/// A Steam game that runs, or that the player just quit, has its cloud sync waited for (#742,
+/// #810) once the client's media and input have ended and before the container goes. The source keeps
 /// running meanwhile, so the game can draw its way out.
 pub(crate) fn stop_source(
     source: &mut AppSource,

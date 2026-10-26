@@ -723,10 +723,13 @@ impl LaunchSocket {
     }
 
     /// The session is ending with its game running (#742), or just quit by the player (#810;
-    /// the helper then waits on the exit sync it has been tailing since the watch began): send the in-place swap's
-    /// `quit <appid>` (close request, SIGTERM and SIGKILL fallbacks, then Steam's exit cloud
+    /// the helper then waits on the exit sync it has tailed since its watch began): send the
+    /// in-place swap's `quit <appid>` (close request, SIGTERM and SIGKILL fallbacks, then Steam's exit cloud
     /// sync) and block up to `bound` for the helper's answer, so the container stop that
     /// follows does not cut the upload. Nothing is sent when no game is running.
+    ///
+    /// No liveness signal reaches here: a helper that died after `game_exited` is waited for up
+    /// to `bound`, like a slow sync.
     pub fn quit_running_game(&self, bound: Duration) -> EndQuit {
         let appid = {
             let state = self.mount.shared.state();

@@ -559,6 +559,33 @@ fn a_quit_after_the_game_exited_with_no_sync_is_done_at_the_start_grace() {
     );
 }
 
+/// An unreadable `/proc` never reads as gone, but the exit the caller saw still holds: the
+/// earlier tail is kept, so the start line written before the quit is not lost.
+#[test]
+fn a_quit_after_the_game_exited_keeps_its_earlier_sync_when_proc_cannot_be_read() {
+    let d = dirs();
+    let earlier = CloudSync::new(&d.logs, APPID);
+    let log = d.logs.join("cloud_log.txt");
+    append(&log, &cloud_line(APPID, "Starting sync (up,AC Exit,)"));
+    let proc_root = d.proc_root.join("not-yet");
+    let t0 = Instant::now();
+    let mut quit = Quit::new(&proc_root, &d.logs, APPID, t0, Some(earlier));
+    assert_eq!(quit.poll(t0 + Duration::from_secs(1)), None);
+    // /proc reads again, and the game is gone.
+    std::fs::create_dir_all(&proc_root).unwrap();
+    assert_eq!(quit.poll(t0 + Duration::from_secs(2)), None, "sync started");
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE + Duration::from_secs(10)),
+        None,
+        "a started sync is waited for past the start grace"
+    );
+    append(&log, &cloud_line(APPID, "Upload complete, result OK"));
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE + Duration::from_secs(11)),
+        Some(QuitAction::Done(Some(CloudEnd::Uploaded("OK".into()))))
+    );
+}
+
 #[test]
 fn a_game_that_will_not_close_is_terminated_then_killed() {
     let d = dirs();

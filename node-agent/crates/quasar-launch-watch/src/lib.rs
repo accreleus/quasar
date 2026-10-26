@@ -1076,9 +1076,9 @@ pub const QUIT_SYNC_START_GRACE: Duration = Duration::from_secs(5);
 
 impl Quit {
     /// Made right after the close request went out, so the cloud log is read from then.
-    /// `earlier` is a [`CloudSync`] made before the game could exit: a game that is already
-    /// gone has written its exit sync's start line by now, which a log read from here on
-    /// would miss, so the quit waits on `earlier` instead of returning at once (#810).
+    /// `earlier` is a [`CloudSync`] made before the game could exit, and the caller passes it
+    /// only when its watch saw this game exit: that game has written its exit sync's start line
+    /// by now, which a log read from here on would miss (#810). Any other quit passes `None`.
     pub fn new(
         proc_root: &Path,
         steam_log_dir: &Path,
@@ -1086,10 +1086,13 @@ impl Quit {
         now: Instant,
         earlier: Option<CloudSync>,
     ) -> Self {
+        let fresh = || CloudSync::new(steam_log_dir, appid);
         let (step, cloud) = match (game_running(proc_root, appid), earlier) {
             (Some(false), Some(cloud)) => (QuitStep::Syncing(now), cloud),
-            (Some(false), None) => (QuitStep::NotRunning, CloudSync::new(steam_log_dir, appid)),
-            _ => (QuitStep::Closing(now), CloudSync::new(steam_log_dir, appid)),
+            (Some(false), None) => (QuitStep::NotRunning, fresh()),
+            // An unreadable /proc never reads as gone; the exit the caller saw still holds.
+            (None, Some(cloud)) => (QuitStep::Closing(now), cloud),
+            _ => (QuitStep::Closing(now), fresh()),
         };
         Self {
             appid,
