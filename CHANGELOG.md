@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+- **Classic layout is deprecated (#855).** Settings > Appearance now says the switch back to the previous player layout will be removed in a later release. Nothing is removed yet.
+
 ### Fixed
 - Pressing Play on a game tile launches it when the recommended quality only needs to step down from a codec the host lacks (for example AV1 on an AMD GPU), instead of opening the detail panel with "No host that can encode this quality is available" (#817).
 
