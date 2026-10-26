@@ -1,0 +1,7 @@
+# The engine suite links the agent crate, which needs the same headers as the rust job.
+libgstreamer1.0-dev
+libgstreamer-plugins-base1.0-dev
+libgstreamer-plugins-bad1.0-dev
+libglib2.0-dev
+libssl-dev
+libasound2-dev
