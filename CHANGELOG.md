@@ -28,7 +28,7 @@ own; the two do not move together, and that is deliberate.
 - Pressing Play on a game tile launches it when the recommended quality only needs to step down from a codec the host lacks (for example AV1 on an AMD GPU), instead of opening the detail panel with "No host that can encode this quality is available" (#817).
 
 ### Security
-- **The control plane's HTTPS listener now sends `Strict-Transport-Security: max-age=31536000` (#820).** A browser that has reached it over HTTPS stays on HTTPS for a year. Only the control plane's own HTTPS listener sends it: the plain HTTP port and `QUASAR_TLS=off` do not, and it names no subdomains. Nothing to configure.
+- **The control plane can send HSTS on its HTTPS listener, off by default (#820).** Set `QUASAR_HSTS_MAX_AGE` (seconds) on a Compose or source install to send `Strict-Transport-Security: max-age=<n>` there; the plain HTTP port never sends it, and it names no subdomains. It is off because HSTS pins the whole host name on every port: once your browser trusts the certificate, any other `http://` service on that name becomes unreachable for the max-age. Owned installs cannot set it yet (#874).
 - **The add-a-host page says to keep the agent address on `wss://` (#823).** Agent enrollment over `ws://` sends the enrollment token and receives the node secret in cleartext, and the page said nothing about it. No code or behaviour change.
 
 ### Internal

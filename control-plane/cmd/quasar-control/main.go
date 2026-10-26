@@ -172,7 +172,7 @@ func run() error {
 			"key_file_written", wrote)
 	}
 
-	handler := httpx.SecurityHeaders(mux)
+	handler := httpx.HSTS(httpx.SecurityHeaders(mux), cfg.HSTSMaxAge)
 	// Compress before logging wraps it, so the logged bytes_out is the real
 	// on-the-wire size (#386). Compress skips WebSocket upgrades entirely and
 	// both wrappers forward Hijack, so the agent WS and signaling relay are
