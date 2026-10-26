@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-design="new">
+<head>
+<meta charset="utf-8">
+<!--
+  Region and Input settings (#844, part of #838). Owner-approved direction, 2026-10-26.
+  Frame 1: the account page's new Region and Input sections. Frame 2: the admin install-wide defaults.
+  Styles are the shipped web/ stylesheets, linked so this page cannot drift from them; open it from a
+  checkout. base.css's @fontsource imports do not resolve outside the web build; the Google Fonts import
+  below stands in, as in console-v3.css. The <style> block holds only what no shipped class covers (timezone list, world map,
+  sensitivity slider) and mock-only scaffolding. Map: Natural Earth 1:50m land (public domain);
+  zone points: tz database zone.tab (public domain).
+-->
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quasar · Region and Input settings · mock (#844)</title>
+<link rel="stylesheet" href="../../web/src/styles/tokens.css">
+<link rel="stylesheet" href="../../web/src/styles/base.css">
+<link rel="stylesheet" href="../../web/src/styles/primitives.css">
+<link rel="stylesheet" href="../../web/src/styles/shell.css">
+<link rel="stylesheet" href="../../web/src/styles.css">
+<link rel="stylesheet" href="../../web/src/styles/components.css">
+<link rel="stylesheet" href="../../web/src/styles/account.css">
+<link rel="stylesheet" href="../../web/src/styles/account-onepage.css">
+<link rel="stylesheet" href="../../web/src/styles/settings-search.css">
+<link rel="stylesheet" href="../../web/src/styles/admin.css">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Michroma&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+/* ================================================================
+   NEW for #844. Everything below is the mock's own CSS: the surfaces no
+   shipped class covers (timezone list, world map, sensitivity slider), plus
+   mock-only scaffolding (frame captions, variant boxes) marked as such.
+   Token values only.
+   ================================================================ */
+
+/* ---- timezone picker: list beside map, map below the list on a phone ---- */
+.tz-pick {
+  display: grid;
+  grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+  gap: var(--s4);
+  align-items: start;
+}
+.tz-side { display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
+.tz-side .search { min-width: 0; }
+.tz-list {
+  list-style: none;
+  margin: 0;
+  padding: var(--s1);
+  height: 236px;
+  overflow-y: auto;
+  position: relative; /* offsetParent for scrolling the pick into view */
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-control);
+  background-color: color-mix(in oklch, var(--surf-inset) 76%, transparent);
+}
+.tz-list:focus-visible { outline: none; border-color: var(--accent); box-shadow: var(--glow-accent); }
+.tz-opt {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-height: 44px;
+  padding: var(--s1) var(--s3);
+  border-radius: var(--r-control);
+  cursor: pointer;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+.tz-opt:hover, .tz-opt.is-active { background: var(--row-hover); color: var(--text); }
+.tz-opt[aria-selected="true"] { background: var(--accent-soft); color: var(--text); box-shadow: inset 0 0 0 1px var(--accent); }
+.tz-opt .tz-t { min-width: 0; flex: 1 1 auto; }
+.tz-opt .tz-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tz-opt .tz-sub { display: block; color: var(--text-3); font-size: var(--t-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tz-opt .tz-off { flex: none; font-family: var(--font-mono); font-size: var(--t-xs); color: var(--text-3); }
+.tz-opt.tz-follow { margin-bottom: var(--s1); }
+.tz-sep { height: 1px; margin: 0 var(--s2) var(--s1); background: var(--line-2); }
+.tz-empty { padding: var(--s3); color: var(--text-3); font-size: var(--t-sm); }
+
+.tz-map {
+  position: relative;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-panel);
+  background: color-mix(in oklch, var(--surf-inset) 76%, transparent);
+  padding: var(--s3);
+  min-width: 0;
+}
+.tz-map svg { display: block; width: 100%; height: auto; cursor: crosshair; touch-action: manipulation; }
+.tz-map .land { stroke: var(--line-3); stroke-width: 4.2; stroke-linecap: round; fill: none; transition: stroke .12s ease; }
+.tz-map .land.is-hover { stroke: var(--text-2); }
+.tz-map .land.is-sel { stroke: var(--accent); }
+.tz-map .city { fill: var(--text); }
+.tz-map .mk-ring { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+.tz-map .mk-dot { fill: var(--text); stroke: var(--accent); stroke-width: 3.5; }
+.tz-map .mk-lbl rect { fill: var(--pop-bg); stroke: var(--glass-border); }
+.tz-map .mk-lbl text { fill: var(--text); font: 600 22px var(--font-ui); }
+.tz-tip {
+  position: absolute;
+  pointer-events: none;
+  padding: var(--s1) var(--s2);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-control);
+  background: var(--pop-bg);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  font-size: var(--t-xs);
+  white-space: nowrap;
+  transform: translate(-50%, calc(-100% - var(--s3)));
+}
+.tz-tip .num { color: var(--text-3); margin-left: var(--s2); }
+.tz-map-cap { display: flex; justify-content: space-between; gap: var(--s3); margin-top: var(--s2); color: var(--text-4); font-size: var(--t-xs); }
+
+/* ---- sensitivity slider (no shipped range control) ---- */
+.rg-range { display: flex; align-items: flex-start; gap: var(--s3); }
+.rg-track { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.rg-range input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 44px; /* hit area; the track is drawn by the pseudo-elements */
+  margin: 0;
+  background: none;
+  cursor: pointer;
+}
+.rg-range input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-pill);
+  background: linear-gradient(to right, var(--accent) 0 var(--fill), color-mix(in oklch, var(--surf-inset) 76%, transparent) var(--fill) 100%);
+}
+.rg-range input[type="range"]::-moz-range-track {
+  height: 6px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-pill);
+  background: linear-gradient(to right, var(--accent) 0 var(--fill), color-mix(in oklch, var(--surf-inset) 76%, transparent) var(--fill) 100%);
+}
+.rg-range input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 17px;
+  height: 17px;
+  margin-top: -7px; /* design-lint-allow spacing-scale: centres the 17px thumb on the 6px track */
+  border: 1px solid var(--glass-border);
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+.rg-range input[type="range"]::-moz-range-thumb {
+  width: 17px;
+  height: 17px;
+  border: 1px solid var(--glass-border);
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+.rg-range input[type="range"]:focus-visible { outline: none; }
+.rg-range input[type="range"]:focus-visible::-webkit-slider-thumb { box-shadow: var(--glow-accent); }
+.rg-range input[type="range"]:focus-visible::-moz-range-thumb { box-shadow: var(--glow-accent); }
+.rg-val { flex: none; min-width: 52px; line-height: 44px; text-align: right; font-family: var(--font-mono); font-size: var(--t-sm); color: var(--text); }
+.rg-ticks { display: flex; justify-content: space-between; margin-top: calc(-1 * var(--s2)); color: var(--text-4); font-family: var(--font-mono); font-size: var(--t-xs); }
+.rg-ticks span:nth-child(2) { color: var(--text-3); }
+
+.os-field-wide { max-width: 560px; }
+.os-sec .field .segmented { align-self: flex-start; }
+.os-sub-h { margin-top: var(--s6); }
+.os-sec .card > .eyebrow:first-child, .os-sub-h:first-child { margin-top: 0; }
+.os-sec .hint.mt3 + .ac-sw { margin-top: var(--s2); }
+.rg-ex { display: block; margin-top: var(--s1); font-family: var(--font-mono); color: var(--text-2); }
+.os-sec .muted.mt5 { color: var(--text-3); font-size: var(--t-sm); }
+
+/* admin rows */
+.ad-pair { display: flex; gap: var(--s2); }
+.ad-pair .select { width: 180px; }
+.ad-ctl .select { width: 280px; }
+.ad-ctl .rg-range { width: 280px; }
+
+/* ---- mock-only scaffolding ---- */
+.mk-cap {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s3) var(--s5);
+  padding: var(--s4) var(--page-pad);
+  border-top: 1px dashed var(--line-3);
+  border-bottom: 1px dashed var(--line-3);
+  background: var(--surf-inset);
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  position: relative;
+  z-index: 2;
+}
+.mk-cap b { color: var(--text); font-weight: 600; }
+.mk-cap .ml-auto { margin-left: auto; }
+.mk-variant { margin-top: var(--s3); padding: 0 var(--s3) var(--s3); border: 1px dashed var(--line-3); border-radius: var(--r-panel); }
+.mk-variant > .eyebrow { display: block; padding-top: var(--s3); }
+/* The real console scrolls .main inside a 100vh grid; the mock lets the page grow so a full-page capture shows everything. */
+.app { height: auto; min-height: 100vh; }
+.main { overflow: visible; }
+@media (max-width: 820px) {
+  .tabbar { position: static; grid-column: 1 / -1; }
+}
+html.mk-only-account #frame-admin, html.mk-only-account .admin-frame { display: none; }
+
+@media (max-width: 1100px) {
+  .tz-pick { grid-template-columns: 1fr; }
+  .tz-list { height: 200px; }
+}
+/* Phones (account-onepage.css's 600px step): list only, the map is too small to aim at. */
+@media (max-width: 600px) {
+  .grid.g2 { grid-template-columns: 1fr; }
+  .tz-map { display: none; }
+  .tz-list { height: 264px; }
+}
+</style>
+</head>
+<body data-density="comfortable" data-rail="expanded">
+
+<!-- ===================== FRAME 1 · ACCOUNT ===================== -->
+<div class="mk-cap" id="mock-controls">
+  <span><b>Mock #844, frame 1.</b> The account page: the Region and Input sections sit between Stream quality and In-session overlay. Mock-only bar, not part of the design.</span>
+  <span class="ml-auto row gap3 wrap">
+    <span class="segmented" role="tablist" aria-label="Theme (mock)">
+      <button type="button" role="tab" aria-selected="true" data-theme-set="dark">Dark</button>
+      <button type="button" role="tab" aria-selected="false" data-theme-set="light">Light</button>
+    </span>
+    <span class="segmented" role="tablist" aria-label="Density (mock)">
+      <button type="button" role="tab" aria-selected="true" data-density-set="comfortable">Comfortable</button>
+      <button type="button" role="tab" aria-selected="false" data-density-set="dense">Dense</button>
+    </span>
+  </span>
+</div>
+
+<div class="app">
+  <header class="topbar">
+    <div class="tb-left">
+      <button type="button" class="icon-btn rail-btn" aria-label="Sections" aria-expanded="false">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12" stroke-linecap="round"/></svg>
+      </button>
+      <a href="#" class="brand" aria-label="Quasar home"><svg class="mark" viewBox="0 0 32 32" fill="none" width="24" height="24" aria-hidden="true"><defs><linearGradient id="qg-1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6A45F5"/><stop offset=".5" stop-color="#5B6BFF"/><stop offset="1" stop-color="#00C0FF"/></linearGradient></defs><ellipse cx="16" cy="16" rx="14.2" ry="5.4" transform="rotate(-30 16 16)" stroke="url(#qg-1)" stroke-width="1.6" opacity=".75"/><circle cx="16" cy="16" r="6.2" fill="url(#qg-1)"/><circle cx="16" cy="16" r="2.1" fill="#fff"/></svg><span class="wordmark">Quasar</span></a>
+    </div>
+    <button type="button" class="cmdk" aria-label="Search settings and games…">
+      <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4L14 14" stroke-linecap="round"/></svg>
+      <span class="ss-long">Search settings and games…</span><span class="ss-short">Search settings…</span>
+      <kbd>⌘K</kbd>
+    </button>
+    <div class="tb-right">
+      <div class="usermenu"><button type="button" class="user-btn"><span class="u-ava">AL</span><span class="u-nm">alex</span>
+        <svg class="ic u-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
+    </div>
+  </header>
+
+  <nav class="rail" aria-label="Account sections">
+    <a href="#set-profile" title="Profile" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="5.6" r="2.6"/><path d="M2.8 13.5a5.2 5.2 0 0 1 10.4 0" stroke-linecap="round"/></svg><span class="lbl">Profile</span></a><a href="#set-streaming" title="Stream quality" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 11.5V8a6 6 0 0 1 12 0v3.5"/><rect x="1.5" y="9.5" width="3" height="4.5" rx="1.2"/><rect x="11.5" y="9.5" width="3" height="4.5" rx="1.2"/></svg><span class="lbl">Stream quality</span></a><a href="#set-region" title="Region" class="rail-item active" aria-current="page"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c-2.2 2.4-2.2 9.6 0 12M8 2c2.2 2.4 2.2 9.6 0 12" stroke-linecap="round"/></svg><span class="lbl">Region</span></a><a href="#set-input" title="Input" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="1.5" y="4" width="13" height="8" rx="1.5"/><path d="M4 6.6h.01M6.7 6.6h.01M9.3 6.6h.01M12 6.6h.01M5 9.4h6" stroke-linecap="round"/></svg><span class="lbl">Input</span></a><a href="#set-overlay" title="In-session overlay" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2" y="2.5" width="12" height="8.5" rx="1.5"/><rect x="8.5" y="4.3" width="4" height="2.6" rx=".6"/></svg><span class="lbl">In-session overlay</span></a><a href="#set-appearance" title="Appearance" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2" y="2.5" width="12" height="8.5" rx="1.5"/><rect x="8.5" y="4.3" width="4" height="2.6" rx=".6"/></svg><span class="lbl">Appearance</span></a><a href="#set-devices" title="Devices" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="1.8" y="3" width="9" height="6.2" rx="1"/><path d="M1.3 11h10" stroke-linecap="round"/><rect x="10.5" y="5.3" width="4.2" height="7.4" rx="1"/></svg><span class="lbl">Devices</span></a><a href="#set-password" title="Password" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3.2" y="7.3" width="9.6" height="6.2" rx="1.3"/><path d="M5.3 7.3V5.2a2.7 2.7 0 0 1 5.4 0v2.1" stroke-linecap="round"/></svg><span class="lbl">Password</span></a><a href="#set-storage" title="Storage" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><ellipse cx="8" cy="4" rx="5.5" ry="2.2"/><path d="M2.5 4v8c0 1.2 2.5 2.2 5.5 2.2s5.5-1 5.5-2.2V4"/><path d="M2.5 8c0 1.2 2.5 2.2 5.5 2.2s5.5-1 5.5-2.2"/></svg><span class="lbl">Storage</span></a><a href="#set-sessions" title="My sessions" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M1.5 8h3l2-4.5L9 12.5l1.8-4.5h3.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="lbl">My sessions</span></a>
+    <div class="rail-foot">
+      <button type="button" class="rail-item rail-collapse" aria-expanded="true" title="Collapse sidebar">
+        <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M9.5 4L5.5 8l4 4" stroke-linecap="round" stroke-linejoin="round"/><path d="M13 3v10" stroke-linecap="round"/></svg>
+        <span class="lbl">Collapse</span>
+      </button>
+    </div>
+  </nav>
+
+  <main class="main">
+    <div class="page ac-page">
+      <div class="page-head"><div><h1>Account</h1><p class="sub">All your settings on one page. Pick a section, or search for any setting from the top bar.</p></div></div>
+
+      <div class="os-bar">
+        <nav class="os-links" aria-label="Settings sections"><a href="#set-profile" class="os-link">Profile</a><a href="#set-streaming" class="os-link">Stream quality</a><a href="#set-region" class="os-link active">Region</a><a href="#set-input" class="os-link">Input</a><a href="#set-overlay" class="os-link">In-session overlay</a><a href="#set-appearance" class="os-link">Appearance</a><a href="#set-devices" class="os-link">Devices</a><a href="#set-password" class="os-link">Password</a><a href="#set-storage" class="os-link">Storage</a><a href="#set-sessions" class="os-link">My sessions</a></nav>
+      </div>
+
+      <!-- existing section, unchanged, shown for sibling comparison -->
+      <section id="set-streaming" class="os-sec os-sec-streaming" aria-labelledby="set-streaming-h">
+        <div class="os-head"><h2 id="set-streaming-h">Stream quality</h2><p class="sub">What a launch from the library asks for.</p></div>
+        <div class="card sec-card">
+          <div class="os-field">
+            <div class="field"><label class="label" for="stream-default">Stream default</label>
+              <select id="stream-default" class="select"><option>Recommended (1080p · 60 fps)</option></select></div>
+          </div>
+          <p class="muted mt3" role="status">Now: Recommended (1080p · 60 fps). Saved as you pick. A launch never exceeds what your device can decode.</p>
+        </div>
+      </section>
+
+      <!-- NEW: Region -->
+      <section id="set-region" class="os-sec os-sec-region" aria-labelledby="set-region-h">
+        <div class="os-head"><h2 id="set-region-h">Region</h2>
+          <p class="sub">The clock, language and formats your games and desktops start with. Follows you to every device and applies from your next launch.</p></div>
+        <div class="card sec-card">
+          <div class="field">
+            <span class="label" id="tz-label">Timezone</span>
+            <div class="tz-pick">
+              <div class="tz-side">
+                <div class="search">
+                  <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4L14 14" stroke-linecap="round"/></svg>
+                  <input id="tz-q" type="search" placeholder="Search a city, country or zone" aria-label="Search timezones" aria-controls="tz-list" autocomplete="off">
+                </div>
+                <ul class="tz-list" id="tz-list" role="listbox" aria-labelledby="tz-label" tabindex="0"></ul>
+              </div>
+              <div class="tz-map" id="tz-map">
+                <svg id="tz-svg" role="img" aria-label="World map. Click your area to pick its timezone; the list does the same."></svg>
+                <div class="tz-tip" id="tz-tip" hidden></div>
+                <div class="tz-map-cap"><span>Click your area on the map, or pick from the list.</span><span>Highlighted: places on the same clock</span></div>
+              </div>
+            </div>
+            <p class="muted mt3" id="tz-now"></p>
+          </div>
+
+          <div class="grid g2 mt5 os-field-wide">
+            <div class="field"><label class="label" for="lang">Language</label>
+              <select id="lang" class="select"></select>
+              <span class="field-hint">Games and Steam start in this language where they have it.</span></div>
+            <div class="field"><label class="label" for="fmt">Region format</label>
+              <select id="fmt" class="select"></select>
+              <span class="field-hint">For dates, numbers and time, like <span class="rg-ex" id="fmt-ex"></span></span></div>
+          </div>
+          <p class="muted mt3" role="status" id="region-status">Saved as you pick.</p>
+        </div>
+      </section>
+
+      <!-- NEW: Input -->
+      <section id="set-input" class="os-sec os-sec-input" aria-labelledby="set-input-h">
+        <div class="os-head"><h2 id="set-input-h">Input</h2>
+          <p class="sub">Keyboard, mouse and controller. Follows you to every device and applies from your next launch.</p></div>
+        <div class="card sec-card">
+          <div class="eyebrow ac-group">Keyboard</div>
+          <div class="grid g2 os-field-wide">
+            <div class="field"><label class="label" for="kb">Layout</label><select id="kb" class="select"></select></div>
+            <div class="field"><label class="label" for="kbv">Variant</label><select id="kbv" class="select"></select></div>
+          </div>
+          <p class="hint mt3">Desktops are set to this layout at every launch, over their own keyboard setting.</p>
+
+          <div class="eyebrow ac-group os-sub-h">Mouse</div>
+          <div class="field">
+            <span class="label" id="match-l">Match cursor to my window</span>
+            <div class="segmented" role="tablist" aria-labelledby="match-l" id="match">
+              <button type="button" role="tab" aria-selected="true" data-v="auto">Auto</button>
+              <button type="button" role="tab" aria-selected="false" data-v="on" tabindex="-1">Always on</button>
+              <button type="button" role="tab" aria-selected="false" data-v="off" tabindex="-1">Off</button>
+            </div>
+            <p class="hint" id="match-hint"></p>
+          </div>
+          <div class="field mt5 os-field">
+            <label class="label" for="sens">Sensitivity</label>
+            <div class="rg-range"><div class="rg-track"><input id="sens" type="range" min="-2" max="2" step="0.125" value="0" aria-valuetext="1×"><div class="rg-ticks" aria-hidden="true"><span>0.25×</span><span>1×</span><span>4×</span></div></div><span class="rg-val num" id="sens-v">1.00×</span></div>
+          </div>
+          <div class="mt4">
+            <div class="ac-sw"><label class="switch-row"><label class="switch"><input id="raw" type="checkbox" aria-describedby="raw-hint"><span class="track"></span><span class="thumb"></span></label><span class="switch-label">Raw mouse input (no acceleration)</span></label></div>
+            <p class="hint mt3" id="raw-hint">Moves the cursor exactly as your mouse does, with your system's acceleration off. Works in Chrome and Edge.</p>
+            <div class="mk-variant">
+              <span class="eyebrow">Variant · in Firefox or Safari</span>
+              <div class="ac-sw"><label class="switch-row is-disabled"><label class="switch"><input type="checkbox" disabled aria-describedby="raw-hint-ff"><span class="track"></span><span class="thumb"></span></label><span class="switch-label">Raw mouse input (no acceleration)</span></label></div>
+              <p class="hint mt3" id="raw-hint-ff">Not available in this browser. Use Chrome or Edge for raw input.</p>
+            </div>
+            <div class="ac-sw mt3"><label class="switch-row"><label class="switch"><input id="flip" type="checkbox"><span class="track"></span><span class="thumb"></span></label><span class="switch-label">Flip scroll direction</span></label></div>
+          </div>
+
+          <div class="eyebrow ac-group os-sub-h">Gamepad</div>
+          <div class="ac-sw"><label class="switch-row"><label class="switch"><input id="nin" type="checkbox" aria-describedby="nin-hint"><span class="track"></span><span class="thumb"></span></label><span class="switch-label">Nintendo layout (swap A/B and X/Y)</span></label></div>
+          <p class="hint mt3" id="nin-hint">For Switch-style controllers: the button printed A acts as A in games.</p>
+
+          <p class="muted mt5" role="status" id="input-status">Saved as you pick.</p>
+        </div>
+      </section>
+
+      <!-- existing section, heading only, to show what follows -->
+      <section class="os-sec" aria-labelledby="set-overlay-h">
+        <div class="os-head"><h2 id="set-overlay-h">In-session overlay</h2><p class="sub">The strip over a running session. Follows you to every device.</p></div>
+        <div class="card sec-card"><p class="muted os-small">(Unchanged. The rest of the page is as today.)</p></div>
+      </section>
+    </div>
+  </main>
+
+  <nav class="tabbar" aria-label="Primary navigation (small screens)">
+    <a href="#"><span class="tb-ic" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 8.4 10 3l7 5.4V16a1 1 0 0 1-1 1h-3v-5H7v5H4a1 1 0 0 1-1-1z" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="tb-lbl">Home</span></a>
+    <a href="#"><span class="tb-ic" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2.75" y="2.75" width="6" height="6" rx="1.4"/><rect x="11.25" y="2.75" width="6" height="6" rx="1.4"/><rect x="2.75" y="11.25" width="6" height="6" rx="1.4"/><rect x="11.25" y="11.25" width="6" height="6" rx="1.4"/></svg></span><span class="tb-lbl">Library</span></a>
+    <a href="#" class="active"><span class="tb-ic" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="10" cy="6.75" r="3.25"/><path d="M3.5 16.5c0-3.6 2.9-5.9 6.5-5.9s6.5 2.3 6.5 5.9" stroke-linecap="round"/></svg></span><span class="tb-lbl">Account</span></a>
+  </nav>
+</div>
+
+<!-- ===================== FRAME 2 · ADMIN DEFAULTS ===================== -->
+<div class="mk-cap" id="frame-admin">
+  <span><b>Mock #844, frame 2.</b> Admin ▸ Settings: install-wide defaults, added below the existing Instance card. Users can change every one; nothing is locked.</span>
+</div>
+
+<div class="app admin-frame">
+  <header class="topbar">
+    <div class="tb-left">
+      <button type="button" class="icon-btn rail-btn" aria-label="Sections" aria-expanded="false">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12" stroke-linecap="round"/></svg>
+      </button>
+      <a href="#" class="brand" aria-label="Quasar home"><svg class="mark" viewBox="0 0 32 32" fill="none" width="24" height="24" aria-hidden="true"><defs><linearGradient id="qg-2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6A45F5"/><stop offset=".5" stop-color="#5B6BFF"/><stop offset="1" stop-color="#00C0FF"/></linearGradient></defs><ellipse cx="16" cy="16" rx="14.2" ry="5.4" transform="rotate(-30 16 16)" stroke="url(#qg-2)" stroke-width="1.6" opacity=".75"/><circle cx="16" cy="16" r="6.2" fill="url(#qg-2)"/><circle cx="16" cy="16" r="2.1" fill="#fff"/></svg><span class="wordmark">Quasar</span></a>
+    </div>
+    <button type="button" class="cmdk" aria-label="Search hosts, sessions, apps, users, settings…">
+      <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4L14 14" stroke-linecap="round"/></svg>
+      <span class="ss-long">Search hosts, sessions, apps, users, settings…</span><span class="ss-short">Search the console…</span>
+      <kbd>⌘K</kbd>
+    </button>
+    <div class="tb-right">
+      <div class="usermenu"><button type="button" class="user-btn"><span class="u-ava">AL</span><span class="u-nm">alex</span>
+        <svg class="ic u-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
+    </div>
+  </header>
+  <nav class="rail" aria-label="Admin sections"><a href="#frame-admin" title="Overview" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.5 3.5h5v4h-5zM2.5 10h5v3h-5zM9.5 3.5h4v3h-4zM9.5 9h4v4h-4z"/></svg><span class="lbl">Overview</span></a><a href="#frame-admin" title="Sessions" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M1.5 8h3l2-4.5L9 12.5l1.8-4.5h3.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="lbl">Sessions</span></a><a href="#frame-admin" title="Fleet" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2" y="2.5" width="12" height="4.5" rx="1.2"/><rect x="2" y="9" width="12" height="4.5" rx="1.2"/><path d="M4.6 4.75h.01M4.6 11.25h.01" stroke-linecap="round"/></svg><span class="lbl">Fleet</span></a><a href="#frame-admin" title="Library" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2" y="2.5" width="5" height="5" rx="1"/><rect x="9" y="2.5" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg><span class="lbl">Library</span></a><a href="#frame-admin" title="Streaming" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 11.5V8a6 6 0 0 1 12 0v3.5"/><rect x="1.5" y="9.5" width="3" height="4.5" rx="1.2"/><rect x="11.5" y="9.5" width="3" height="4.5" rx="1.2"/></svg><span class="lbl">Streaming</span></a><a href="#frame-admin" title="People" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="6.2" cy="5.6" r="2.4"/><path d="M1.8 13.2a4.4 4.4 0 0 1 8.8 0" stroke-linecap="round"/><path d="M10.8 3.6a2.4 2.4 0 0 1 0 4.6M11.6 13.2a4.4 4.4 0 0 0-1.1-2.9" stroke-linecap="round"/></svg><span class="lbl">People</span></a><a href="#frame-admin" title="Audit log" class="rail-item"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="1.8" width="10" height="12.4" rx="1.6"/><path d="M5.6 5.4h4.8M5.6 8h4.8M5.6 10.6h2.8" stroke-linecap="round"/></svg><span class="lbl">Audit log</span></a><a href="#frame-admin" title="Settings" class="rail-item active"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.6M8 12.8v1.6M1.6 8h1.6M12.8 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M12.5 3.5l-1.1 1.1M4.6 11.4l-1.1 1.1" stroke-linecap="round"/></svg><span class="lbl">Settings</span></a></nav>
+  <main class="main">
+    <div class="page">
+      <div class="page" style="max-width: 880px">
+        <div class="page-head"><div><h1>Settings</h1><p class="sub">Instance-wide configuration</p></div></div>
+
+        <div class="card">
+          <div class="panel-head"><div><span class="panel-title">Instance</span><div class="hint mt1">Identity and access for this Quasar deployment</div></div></div>
+          <div class="card-pad">
+            <div class="rowflex between gap6 setting-row">
+              <div><div class="label">Registration</div><div class="hint">Who can create an account</div></div>
+              <div class="setting-row-control"><div class="segmented" role="tablist" aria-label="Registration"><button type="button" role="tab" aria-selected="false">Closed</button><button type="button" role="tab" aria-selected="true">Invite only</button><button type="button" role="tab" aria-selected="false">Open</button></div></div>
+            </div>
+            <p class="muted mt3">(Rest of the Instance card unchanged.)</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="panel-head"><div><span class="panel-title">Region defaults</span><div class="hint mt1">What a user starts with until they pick their own. Applies from each user's next launch.</div></div></div>
+          <div class="card-pad">
+            <div class="rowflex between gap6 setting-row">
+              <div><div class="label">Timezone</div><div class="hint">Used when a user's browser does not report one. Users on "Follow my browser" keep their browser's zone.</div></div>
+              <div class="setting-row-control ad-ctl"><select class="select" id="ad-tz" aria-label="Default timezone"></select></div>
+            </div>
+            <div class="rowflex between gap6 setting-row">
+              <div><div class="label">Language</div><div class="hint">Games and Steam start in it where they have it</div></div>
+              <div class="setting-row-control ad-ctl"><select class="select" id="ad-lang" aria-label="Default language"></select></div>
+            </div>
+            <div class="rowflex between gap6 setting-row">
+              <div><div class="label">Region format</div><div class="hint">Dates, numbers and time: <span class="rg-ex" id="ad-fmt-ex"></span></div></div>
+              <div class="setting-row-control ad-ctl"><select class="select" id="ad-fmt" aria-label="Default region format"></select></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="panel-head"><div><span class="panel-title">Input defaults</span><div class="hint mt1">What a user starts with until they pick their own. Applies from each user's next launch.</div></div></div>
+          <div class="card-pad">
+            <div class="rowflex between gap6 setting-row">
+              <div><div class="label">Keyboard layout</div><div class="hint">Layout and variant</div></div>
+              <div class="setting-row-control ad-pair"><select class="select" id="ad-kb" aria-label="Default keyboard layout"></select><select class="select" id="ad-kbv" aria-label="Default keyboard variant"></select></div>
+            </div>
+            <div class="rowflex between gap6 setting-row">
+              <div><div class="label">Match cursor to the window</div><div class="hint">Auto is on for desktops, off for games</div></div>
+              <div class="setting-row-control"><div class="segmented" role="tablist" aria-label="Match cursor to the window"><button type="button" role="tab" aria-selected="true">Auto</button><button type="button" role="tab" aria-selected="false">Always on</button><button type="button" role="tab" aria-selected="false">Off</button></div></div>
+            </div>
+            <div class="rowflex between gap6 setting-row">
+              <div><div class="label">Mouse sensitivity</div><div class="hint">0.25× to 4×</div></div>
+              <div class="setting-row-control ad-ctl"><div class="rg-range"><div class="rg-track"><input id="ad-sens" type="range" min="-2" max="2" step="0.125" value="0" aria-label="Default mouse sensitivity" aria-valuetext="1×"></div><span class="rg-val num" id="ad-sens-v">1.00×</span></div></div>
+            </div>
+            <div class="rowflex between gap6 setting-row">
+              <div><div class="label">Raw mouse input</div><div class="hint">No acceleration. Chrome and Edge only; other browsers ignore it</div></div>
+              <div class="setting-row-control"><label class="switch"><input type="checkbox" aria-label="Raw mouse input by default"><span class="track"></span><span class="thumb"></span></label></div>
+            </div>
+            <div class="rowflex between gap6 setting-row">
+              <div><div class="label">Flip scroll direction</div></div>
+              <div class="setting-row-control"><label class="switch"><input type="checkbox" aria-label="Flip scroll direction by default"><span class="track"></span><span class="thumb"></span></label></div>
+            </div>
+            <div class="rowflex between gap6 setting-row">
+              <div><div class="label">Gamepad Nintendo layout</div><div class="hint">Swap A/B and X/Y</div></div>
+              <div class="setting-row-control"><label class="switch"><input type="checkbox" aria-label="Gamepad Nintendo layout by default"><span class="track"></span><span class="thumb"></span></label></div>
+            </div>
+            <p class="muted mt3">Saved as you change them. A user who set their own value keeps it.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+const MAP={"step": 2, "top": 82, "rows": ["000000000000000000000000000000000000000000000111111111111111111111111111111111111111000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000", "000000000000000000000000000000000000000011111111111111110111111111111111111111111100000000000001111111110000000001010001100000000000000111110000000000000000000000000000000000000000", "000000000000000000000000000000001010011111101111111110111111111111111111111111111000000000000001111111000000000000000000000000000000000000011110000000000000000000000000000000000000", "000000000000000000000000000011111111101110111111111000001111111111111111111111111000000000000000000000000000000000000001111100000000001111111111111000000000000111000000000000000000", "000000000000000000000000000011110100010110111011111000000000001111111111111111110000000000000000000000000000000000000111000001000011111111111111111110001100000011000000000000000000", "011111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111", "000000001111111111111011111111011111111101111011111111111000001111111111111111100000000000000000000111111100000000100001110111111111111111111111111111111111111111111111110111111110", "011111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000011111110110000000110000000000000000000000000000000000000000001000000000", "110011111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100001100001111100000000000000000000000000000000000000000000000000000000000000000000", "000100011111111111111111111111111111111111111111110111111100000011111100000000111110000000000011111111111111111111111111111111111111111111111111111111111111111111111111111111111111", "000000011111111111111111111111111111111111110000101111011000000001111000000000000000000000001111111011111111111111111111111111111111111111111111111111111111111111111111111111111111", "000000111111111111111111111111111111111111100000000111100100000000011000000000000000000000001111111101111111111111111111111111111111111111111111111111111111111111111111001111110000", "000000000111110000000111111111111111111111110000000111111110000000000000000000000000001110000111111001111111111111111111111111111111111111111111111111111111111110000000111000000000", "000000000110000000000001111111111111111111111110000111111111000000000000000000000000000110000010110011111111111111111111111111111111111111111111111111111111111000000000111100000000", "000000000000000000000001111111111111111111111111101111111111110000000000000000000000011011000011111111111111111111111111111111111111111111111111111111111111111111000000111000000000", "000000000000000000000000011111111111111111111111111111111111110000000000000000000000011111101111111111111111111111111111111111111111111111111111111111111111111111000000100000000011", "000000000000000000000000001111111111111111111111111111111111010000000000000000000000000000111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000", "000000000000000000000000000111111111111111111111111111111100111100000000000000000000000111111111111111111111111111111111111111111111111111111111111111111111111101000000000000000000", "000000000000000000000000000011111111111111111111111111111111000000000000000000000000000001111111111111111111011111101111111111111111111111111111111111111111111011000000000000000000", "000000000000000000000000000011111111111111111111111111110100000000000000000000000000001111111111111111111000011111011111111111111111111111111111111111111111110001100000000000000000", "000000000000000000000000000011111111111111111111111111100000000000000000000000000000011111110010110111110011000111101111111111111111111111111111111111111110000011000000000000000000", "000000000000000000000000000011111111111111111111111110000000000000000000000000000000011111010010011111011111111111101111111111111111111111111111111111011110000010000000000000000000", "000000000000000000000000000011111111111111111111111110000000000000000000000000000000011111000000110011011111111111100111111111111111111111111111111111101110001110000000000000000000", "000000000000000000000000000001111111111111111111111100000000000000000000000000000000000101111111000001100010111111111111111111111111111111111111111111100110111110000000000000000000", "000000000000000000000000000000111111111111111111111000000000000000000000000000000000001111111111000000000011111111111111111111111111111111111111111111000101110000000000000000000000", "000000000000000000000000000000011111111111111111110000000000000000000000000000000000011111111111110011110101111111111111111111111111111111111111111111100001000000000000000000000000", "000000000000000000000000000000001111111111111111110000000000000000000000000000000000011111111111111111111111111111111111111111111111111111111111111111100001000000000000000000000000", "000000000000000000000000000000000111111111000000110000000000000000000000000000000011111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000", "000000000000000000000000000000000111111111000000010000000000000000000000000000000011111111111111111111111110111111110011111111111111111111111111111111000000000000000000000000000000", "000000000000000000000000000000000010111110000000000100000000000000000000000000000011111111111111111111111111011111111110000111111111111111111111111110100000000000000000000000000000", "000000000010000000000000000000000000011110000011111100000000000000000000000000000111111111111111111111111111111111111111000011111111111011111111111000000000000000000000000000000000", "000000000000100000000000000000000000011111001110000110100000000000000000000000000011111111111111111111111111101111111110000000111111100011111110110000000000000000000000000000000000", "000000000000000000000000000000000000001111111100000100111000000000000000000000000011111111111111111111111111110111111100000000111111000001111111100000100000000000000000000000000000", "000000000000000000000000000000000000000011111111000000000000000000000000000000000111111111111111111111111111110111110000000000111110000001011111000000100000000000000000000000000000", "000000000000000000000000000000000000000000001111100000000001000000000000000000000111111111111111111111111111111111100000000000011100000010011111100000110000000000000000000000000000", "000000000000000000000000000000000000000000000011000001110000000000000000000000000011111111111111111111111111111100010000000000011100000010010111100000111000000000000000000000000000", "000000000000000000000000000000000000000000000001101011111111000000000000000000000001111111111111111111111111111111110000000000001100000000010011000000011000000000000000000000000000", "000000000000000000000000000000000000000000000000111111111111100000000000000000000001111111111111111111111111111111100000000000001010000000010000000010011100000000000000000000000000", "000000000000000000000000000000000000000000000000000111111111111100000000000000000000111111111111111111111111111111100000000000000010000000001100000011101000000000000000000000000000", "000000000000000000000000000000000000000000000000000111111111111110000000000000000000001000000111111111111111111111000000000000000000000000111100000110000000000000000000000000000000", "000000000000000000000000000000000000000000000000001111111111111110000000000000000000000000000001111111111111111110000000000000000000000000011100111110001000000000000000000000000000", "000000000000000000000000000000000000000000001000001111111111111111000000000000000000000000000011111111111111111100000000000000000000000000001100111110110000100000000000000000000000", "000000000000000000000000000000000000000000000000011111111111111111111000000000000000000000000011111111111111111000000000000000000000000000011110011111110001101100010000000000000000", "000000000000000000000000000000000000000000000000011111111111111111111110000000000000000000000001111111111111110000000000000000000000000000000110000101110100111111100010000000000000", "000000000000000000000000000000000000000000000000011111111111111111111111100000000000000000000000111111111111110000000000000000000000000000000011010000000000010111111101000000000000", "000000000000000000000000000000000000000000000000001111111111111111111111100000000000000000000000111111111111110000000000000000000000000000000001111111100100000111110000110000000000", "000000000000000000000000000000000000000000000000000111111111111111111111000000000000000000000000111111111111110000000000000000000000000000000000000000111000000000001100000000000000", "000000000000000000000000000000000000000000000000000111111111111111111110000000000000000000000000011111111111111000100000000000000000000000000000000000000001111001000000000000000000", "000010000000000000000000000000000000000000000000000011111111111111111110000000000000000000000000111111111111111000100000000000000000000000000000000000000101110011000000000000000000", "000000000000000000000000000000000000000000000000000011111111111111111110000000000000000000000000111111111111110011100000000000000000000000000000000000011111111011100000000001000001", "000000000000000000000000000000000000000000000000000000111111111111111110000000000000000000000000111111111111100011100000000000000000000000000000000000011111111111100000000000000011", "000000000000000000000000000000000000000000000000000000011111111111111100000000000000000000000000111111111111000011100010000000000000000000000000000001111111111111110000000000000000", "000000000000000000000000000000000000000000000000000000011111111111111100000000000000000000000000011111111111000111000000000000000000000000000000000111111111111111111000000001000000", "000000000000000000000000000000000000000000000000000000111111111111110000000000000000000000000000011111111111000011000000000000000000000000000000001111111111111111111100000000000000", "000000000000000000000000000000000000000000000000000000111111111111000000000000000000000000000000011111111110000010000000000000000000000000000000001111111111111111111110000000000000", "000000000000000000000000000000000000000000000000000000111111111111000000000000000000000000000000001111111110000000000000000000000000000000000000000111111111111111111110000000000000", "000000000000000000000000000000000000000000000000000000111111111110000000000000000000000000000000001111111100000000000000000000000000000000000000000111111111111111111110000000000000", "000000000000000000000000000000000000000000000000000000111111111100000000000000000000000000000000000111111000000000000000000000000000000000000000000011111111111111111110000000000000", "000000000000000000000000000000000000000000000000000000111111111100000000000000000000000000000000000111110000000000000000000000000000000000000000000111110000011111111100000000001000", "000000000000000000000000000000000000000000000000000001111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001111111000000000000100", "000000000000000000000000000000000000000000000000000001111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000011111000000000000110", "000000000000000000000000000000000000000000000000000001111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000110", "000000000000000000000000000000000000000000000000000001111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000110000000000011100", "010000000000000000000000000000000000000000000000000001111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000110000", "000000000000000000000000000000000000000000000000000011111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001100000", "000000000000000000000000000000000000000000000000000011111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "000000000000000000000000000000000000000000000000000011110000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000", "000000000000000000000000000000000000000000000000000011110001100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "000000000000000000000000000000000000000000000000000000111000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"]};
+const ZONES=[["Europe/Andorra","AD",42.5,1.52],["Asia/Dubai","AE",25.3,55.3],["Asia/Kabul","AF",34.52,69.2],["America/Antigua","AG",17.05,-61.8],["America/Anguilla","AI",18.2,-63.07],["Europe/Tirane","AL",41.33,19.83],["Asia/Yerevan","AM",40.18,44.5],["Africa/Luanda","AO",-8.8,13.23],["America/Argentina/Buenos_Aires","AR",-34.6,-58.45],["America/Argentina/Cordoba","AR",-31.4,-64.18],["America/Argentina/Salta","AR",-24.78,-65.42],["America/Argentina/Jujuy","AR",-24.18,-65.3],["America/Argentina/Tucuman","AR",-26.82,-65.22],["America/Argentina/Catamarca","AR",-28.47,-65.78],["America/Argentina/La_Rioja","AR",-29.43,-66.85],["America/Argentina/San_Juan","AR",-31.53,-68.52],["America/Argentina/Mendoza","AR",-32.88,-68.82],["America/Argentina/San_Luis","AR",-33.32,-66.35],["America/Argentina/Rio_Gallegos","AR",-51.63,-69.22],["America/Argentina/Ushuaia","AR",-54.8,-68.3],["Pacific/Pago_Pago","AS",-14.27,-170.7],["Europe/Vienna","AT",48.22,16.33],["Australia/Lord_Howe","AU",-31.55,159.08],["Australia/Hobart","AU",-42.88,147.32],["Australia/Melbourne","AU",-37.82,144.97],["Australia/Sydney","AU",-33.87,151.22],["Australia/Broken_Hill","AU",-31.95,141.45],["Australia/Brisbane","AU",-27.47,153.03],["Australia/Lindeman","AU",-20.27,149.0],["Australia/Adelaide","AU",-34.92,138.58],["Australia/Darwin","AU",-12.47,130.83],["Australia/Perth","AU",-31.95,115.85],["Australia/Eucla","AU",-31.72,128.87],["America/Aruba","AW",12.5,-69.97],["Europe/Mariehamn","AX",60.1,19.95],["Asia/Baku","AZ",40.38,49.85],["Europe/Sarajevo","BA",43.87,18.42],["America/Barbados","BB",13.1,-59.62],["Asia/Dhaka","BD",23.72,90.42],["Europe/Brussels","BE",50.83,4.33],["Africa/Ouagadougou","BF",12.37,-1.52],["Europe/Sofia","BG",42.68,23.32],["Asia/Bahrain","BH",26.38,50.58],["Africa/Bujumbura","BI",-3.38,29.37],["Africa/Porto-Novo","BJ",6.48,2.62],["America/St_Barthelemy","BL",17.88,-62.85],["Atlantic/Bermuda","BM",32.28,-64.77],["Asia/Brunei","BN",4.93,114.92],["America/La_Paz","BO",-16.5,-68.15],["America/Kralendijk","BQ",12.15,-68.28],["America/Noronha","BR",-3.85,-32.42],["America/Belem","BR",-1.45,-48.48],["America/Fortaleza","BR",-3.72,-38.5],["America/Recife","BR",-8.05,-34.9],["America/Araguaina","BR",-7.2,-48.2],["America/Maceio","BR",-9.67,-35.72],["America/Bahia","BR",-12.98,-38.52],["America/Sao_Paulo","BR",-23.53,-46.62],["America/Campo_Grande","BR",-20.45,-54.62],["America/Cuiaba","BR",-15.58,-56.08],["America/Santarem","BR",-2.43,-54.87],["America/Porto_Velho","BR",-8.77,-63.9],["America/Boa_Vista","BR",2.82,-60.67],["America/Manaus","BR",-3.13,-60.02],["America/Eirunepe","BR",-6.67,-69.87],["America/Rio_Branco","BR",-9.97,-67.8],["America/Nassau","BS",25.08,-77.35],["Asia/Thimphu","BT",27.47,89.65],["Africa/Gaborone","BW",-24.65,25.92],["Europe/Minsk","BY",53.9,27.57],["America/Belize","BZ",17.5,-88.2],["America/St_Johns","CA",47.57,-52.72],["America/Halifax","CA",44.65,-63.6],["America/Glace_Bay","CA",46.2,-59.95],["America/Moncton","CA",46.1,-64.78],["America/Goose_Bay","CA",53.33,-60.42],["America/Blanc-Sablon","CA",51.42,-57.12],["America/Toronto","CA",43.65,-79.38],["America/Iqaluit","CA",63.73,-68.47],["America/Atikokan","CA",48.76,-91.62],["America/Winnipeg","CA",49.88,-97.15],["America/Resolute","CA",74.7,-94.83],["America/Rankin_Inlet","CA",62.82,-92.08],["America/Regina","CA",50.4,-104.65],["America/Swift_Current","CA",50.28,-107.83],["America/Edmonton","CA",53.55,-113.47],["America/Cambridge_Bay","CA",69.11,-105.05],["America/Inuvik","CA",68.35,-133.72],["America/Vancouver","CA",49.27,-123.12],["America/Creston","CA",49.1,-116.52],["America/Dawson_Creek","CA",55.77,-120.23],["America/Fort_Nelson","CA",58.8,-122.7],["America/Whitehorse","CA",60.72,-135.05],["America/Dawson","CA",64.07,-139.42],["Indian/Cocos","CC",-12.17,96.92],["Africa/Kinshasa","CD",-4.3,15.3],["Africa/Lubumbashi","CD",-11.67,27.47],["Africa/Bangui","CF",4.37,18.58],["Africa/Brazzaville","CG",-4.27,15.28],["Europe/Zurich","CH",47.38,8.53],["Africa/Abidjan","CI",5.32,-4.03],["Pacific/Rarotonga","CK",-21.23,-159.77],["America/Santiago","CL",-33.45,-70.67],["America/Coyhaique","CL",-45.57,-72.07],["America/Punta_Arenas","CL",-53.15,-70.92],["Pacific/Easter","CL",-27.15,-109.43],["Africa/Douala","CM",4.05,9.7],["Asia/Shanghai","CN",31.23,121.47],["Asia/Urumqi","CN",43.8,87.58],["America/Bogota","CO",4.6,-74.08],["America/Costa_Rica","CR",9.93,-84.08],["America/Havana","CU",23.13,-82.37],["Atlantic/Cape_Verde","CV",14.92,-23.52],["America/Curacao","CW",12.18,-69.0],["Indian/Christmas","CX",-10.42,105.72],["Asia/Nicosia","CY",35.17,33.37],["Asia/Famagusta","CY",35.12,33.95],["Europe/Prague","CZ",50.08,14.43],["Europe/Berlin","DE",52.5,13.37],["Europe/Busingen","DE",47.7,8.68],["Africa/Djibouti","DJ",11.6,43.15],["Europe/Copenhagen","DK",55.67,12.58],["America/Dominica","DM",15.3,-61.4],["America/Santo_Domingo","DO",18.47,-69.9],["Africa/Algiers","DZ",36.78,3.05],["America/Guayaquil","EC",-2.17,-79.83],["Pacific/Galapagos","EC",-0.9,-89.6],["Europe/Tallinn","EE",59.42,24.75],["Africa/Cairo","EG",30.05,31.25],["Africa/El_Aaiun","EH",27.15,-13.2],["Africa/Asmara","ER",15.33,38.88],["Europe/Madrid","ES",40.4,-3.68],["Africa/Ceuta","ES",35.88,-5.32],["Atlantic/Canary","ES",28.1,-15.4],["Africa/Addis_Ababa","ET",9.03,38.7],["Europe/Helsinki","FI",60.17,24.97],["Pacific/Fiji","FJ",-18.13,178.42],["Atlantic/Stanley","FK",-51.7,-57.85],["Pacific/Chuuk","FM",7.42,151.78],["Pacific/Pohnpei","FM",6.97,158.22],["Pacific/Kosrae","FM",5.32,162.98],["Atlantic/Faroe","FO",62.02,-6.77],["Europe/Paris","FR",48.87,2.33],["Africa/Libreville","GA",0.38,9.45],["Europe/London","GB",51.51,-0.13],["America/Grenada","GD",12.05,-61.75],["Asia/Tbilisi","GE",41.72,44.82],["America/Cayenne","GF",4.93,-52.33],["Europe/Guernsey","GG",49.45,-2.54],["Africa/Accra","GH",5.55,-0.22],["Europe/Gibraltar","GI",36.13,-5.35],["America/Nuuk","GL",64.18,-51.73],["America/Danmarkshavn","GL",76.77,-18.67],["America/Scoresbysund","GL",70.48,-21.97],["America/Thule","GL",76.57,-68.78],["Africa/Banjul","GM",13.47,-16.65],["Africa/Conakry","GN",9.52,-13.72],["America/Guadeloupe","GP",16.23,-61.53],["Africa/Malabo","GQ",3.75,8.78],["Europe/Athens","GR",37.97,23.72],["Atlantic/South_Georgia","GS",-54.27,-36.53],["America/Guatemala","GT",14.63,-90.52],["Pacific/Guam","GU",13.47,144.75],["Africa/Bissau","GW",11.85,-15.58],["America/Guyana","GY",6.8,-58.17],["Asia/Hong_Kong","HK",22.28,114.15],["America/Tegucigalpa","HN",14.1,-87.22],["Europe/Zagreb","HR",45.8,15.97],["America/Port-au-Prince","HT",18.53,-72.33],["Europe/Budapest","HU",47.5,19.08],["Asia/Jakarta","ID",-6.17,106.8],["Asia/Pontianak","ID",-0.03,109.33],["Asia/Makassar","ID",-5.12,119.4],["Asia/Jayapura","ID",-2.53,140.7],["Europe/Dublin","IE",53.33,-6.25],["Asia/Jerusalem","IL",31.78,35.22],["Europe/Isle_of_Man","IM",54.15,-4.47],["Asia/Kolkata","IN",22.53,88.37],["Indian/Chagos","IO",-7.33,72.42],["Asia/Baghdad","IQ",33.35,44.42],["Asia/Tehran","IR",35.67,51.43],["Atlantic/Reykjavik","IS",64.15,-21.85],["Europe/Rome","IT",41.9,12.48],["Europe/Jersey","JE",49.18,-2.11],["America/Jamaica","JM",17.97,-76.79],["Asia/Amman","JO",31.95,35.93],["Asia/Tokyo","JP",35.65,139.74],["Africa/Nairobi","KE",-1.28,36.82],["Asia/Bishkek","KG",42.9,74.6],["Asia/Phnom_Penh","KH",11.55,104.92],["Pacific/Tarawa","KI",1.42,173.0],["Pacific/Kanton","KI",-2.78,-171.72],["Pacific/Kiritimati","KI",1.87,-157.33],["Indian/Comoro","KM",-11.68,43.27],["America/St_Kitts","KN",17.3,-62.72],["Asia/Pyongyang","KP",39.02,125.75],["Asia/Seoul","KR",37.55,126.97],["Asia/Kuwait","KW",29.33,47.98],["America/Cayman","KY",19.3,-81.38],["Asia/Almaty","KZ",43.25,76.95],["Asia/Qyzylorda","KZ",44.8,65.47],["Asia/Qostanay","KZ",53.2,63.62],["Asia/Aqtobe","KZ",50.28,57.17],["Asia/Aqtau","KZ",44.52,50.27],["Asia/Atyrau","KZ",47.12,51.93],["Asia/Oral","KZ",51.22,51.35],["Asia/Vientiane","LA",17.97,102.6],["Asia/Beirut","LB",33.88,35.5],["America/St_Lucia","LC",14.02,-61.0],["Europe/Vaduz","LI",47.15,9.52],["Asia/Colombo","LK",6.93,79.85],["Africa/Monrovia","LR",6.3,-10.78],["Africa/Maseru","LS",-29.47,27.5],["Europe/Vilnius","LT",54.68,25.32],["Europe/Luxembourg","LU",49.6,6.15],["Europe/Riga","LV",56.95,24.1],["Africa/Tripoli","LY",32.9,13.18],["Africa/Casablanca","MA",33.65,-7.58],["Europe/Monaco","MC",43.7,7.38],["Europe/Chisinau","MD",47.0,28.83],["Europe/Podgorica","ME",42.43,19.27],["America/Marigot","MF",18.07,-63.08],["Indian/Antananarivo","MG",-18.92,47.52],["Pacific/Majuro","MH",7.15,171.2],["Pacific/Kwajalein","MH",9.08,167.33],["Europe/Skopje","MK",41.98,21.43],["Africa/Bamako","ML",12.65,-8.0],["Asia/Yangon","MM",16.78,96.17],["Asia/Ulaanbaatar","MN",47.92,106.88],["Asia/Hovd","MN",48.02,91.65],["Asia/Macau","MO",22.2,113.54],["Pacific/Saipan","MP",15.2,145.75],["America/Martinique","MQ",14.6,-61.08],["Africa/Nouakchott","MR",18.1,-15.95],["America/Montserrat","MS",16.72,-62.22],["Europe/Malta","MT",35.9,14.52],["Indian/Mauritius","MU",-20.17,57.5],["Indian/Maldives","MV",4.17,73.5],["Africa/Blantyre","MW",-15.78,35.0],["America/Mexico_City","MX",19.4,-99.15],["America/Cancun","MX",21.08,-86.77],["America/Merida","MX",20.97,-89.62],["America/Monterrey","MX",25.67,-100.32],["America/Matamoros","MX",25.83,-97.5],["America/Chihuahua","MX",28.63,-106.08],["America/Ciudad_Juarez","MX",31.73,-106.48],["America/Ojinaga","MX",29.57,-104.42],["America/Mazatlan","MX",23.22,-106.42],["America/Bahia_Banderas","MX",20.8,-105.25],["America/Hermosillo","MX",29.07,-110.97],["America/Tijuana","MX",32.53,-117.02],["Asia/Kuala_Lumpur","MY",3.17,101.7],["Asia/Kuching","MY",1.55,110.33],["Africa/Maputo","MZ",-25.97,32.58],["Africa/Windhoek","NA",-22.57,17.1],["Pacific/Noumea","NC",-22.27,166.45],["Africa/Niamey","NE",13.52,2.12],["Pacific/Norfolk","NF",-29.05,167.97],["Africa/Lagos","NG",6.45,3.4],["America/Managua","NI",12.15,-86.28],["Europe/Amsterdam","NL",52.37,4.9],["Europe/Oslo","NO",59.92,10.75],["Asia/Kathmandu","NP",27.72,85.32],["Pacific/Nauru","NR",-0.52,166.92],["Pacific/Niue","NU",-19.02,-169.92],["Pacific/Auckland","NZ",-36.87,174.77],["Pacific/Chatham","NZ",-43.95,-176.55],["Asia/Muscat","OM",23.6,58.58],["America/Panama","PA",8.97,-79.53],["America/Lima","PE",-12.05,-77.05],["Pacific/Tahiti","PF",-17.53,-149.57],["Pacific/Marquesas","PF",-9.0,-139.5],["Pacific/Gambier","PF",-23.13,-134.95],["Pacific/Port_Moresby","PG",-9.5,147.17],["Pacific/Bougainville","PG",-6.22,155.57],["Asia/Manila","PH",14.59,120.97],["Asia/Karachi","PK",24.87,67.05],["Europe/Warsaw","PL",52.25,21.0],["America/Miquelon","PM",47.05,-56.33],["Pacific/Pitcairn","PN",-25.07,-130.08],["America/Puerto_Rico","PR",18.47,-66.11],["Asia/Gaza","PS",31.5,34.47],["Asia/Hebron","PS",31.53,35.09],["Europe/Lisbon","PT",38.72,-9.13],["Atlantic/Madeira","PT",32.63,-16.9],["Atlantic/Azores","PT",37.73,-25.67],["Pacific/Palau","PW",7.33,134.48],["America/Asuncion","PY",-25.27,-57.67],["Asia/Qatar","QA",25.28,51.53],["Indian/Reunion","RE",-20.87,55.47],["Europe/Bucharest","RO",44.43,26.1],["Europe/Belgrade","RS",44.83,20.5],["Europe/Kaliningrad","RU",54.72,20.5],["Europe/Moscow","RU",55.76,37.62],["Europe/Simferopol","UA",44.95,34.1],["Europe/Kirov","RU",58.6,49.65],["Europe/Volgograd","RU",48.73,44.42],["Europe/Astrakhan","RU",46.35,48.05],["Europe/Saratov","RU",51.57,46.03],["Europe/Ulyanovsk","RU",54.33,48.4],["Europe/Samara","RU",53.2,50.15],["Asia/Yekaterinburg","RU",56.85,60.6],["Asia/Omsk","RU",55.0,73.4],["Asia/Novosibirsk","RU",55.03,82.92],["Asia/Barnaul","RU",53.37,83.75],["Asia/Tomsk","RU",56.5,84.97],["Asia/Novokuznetsk","RU",53.75,87.12],["Asia/Krasnoyarsk","RU",56.02,92.83],["Asia/Irkutsk","RU",52.27,104.33],["Asia/Chita","RU",52.05,113.47],["Asia/Yakutsk","RU",62.0,129.67],["Asia/Khandyga","RU",62.66,135.55],["Asia/Vladivostok","RU",43.17,131.93],["Asia/Ust-Nera","RU",64.56,143.23],["Asia/Magadan","RU",59.57,150.8],["Asia/Sakhalin","RU",46.97,142.7],["Asia/Srednekolymsk","RU",67.47,153.72],["Asia/Kamchatka","RU",53.02,158.65],["Asia/Anadyr","RU",64.75,177.48],["Africa/Kigali","RW",-1.95,30.07],["Asia/Riyadh","SA",24.63,46.72],["Pacific/Guadalcanal","SB",-9.53,160.2],["Indian/Mahe","SC",-4.67,55.47],["Africa/Khartoum","SD",15.6,32.53],["Europe/Stockholm","SE",59.33,18.05],["Asia/Singapore","SG",1.28,103.85],["Atlantic/St_Helena","SH",-15.92,-5.7],["Europe/Ljubljana","SI",46.05,14.52],["Arctic/Longyearbyen","SJ",78.0,16.0],["Europe/Bratislava","SK",48.15,17.12],["Africa/Freetown","SL",8.5,-13.25],["Europe/San_Marino","SM",43.92,12.47],["Africa/Dakar","SN",14.67,-17.43],["Africa/Mogadishu","SO",2.07,45.37],["America/Paramaribo","SR",5.83,-55.17],["Africa/Juba","SS",4.85,31.62],["Africa/Sao_Tome","ST",0.33,6.73],["America/El_Salvador","SV",13.7,-89.2],["America/Lower_Princes","SX",18.05,-63.05],["Asia/Damascus","SY",33.5,36.3],["Africa/Mbabane","SZ",-26.3,31.1],["America/Grand_Turk","TC",21.47,-71.13],["Africa/Ndjamena","TD",12.12,15.05],["Indian/Kerguelen","TF",-49.35,70.22],["Africa/Lome","TG",6.13,1.22],["Asia/Bangkok","TH",13.75,100.52],["Asia/Dushanbe","TJ",38.58,68.8],["Pacific/Fakaofo","TK",-9.37,-171.23],["Asia/Dili","TL",-8.55,125.58],["Asia/Ashgabat","TM",37.95,58.38],["Africa/Tunis","TN",36.8,10.18],["Pacific/Tongatapu","TO",-21.13,-175.2],["Europe/Istanbul","TR",41.02,28.97],["America/Port_of_Spain","TT",10.65,-61.52],["Pacific/Funafuti","TV",-8.52,179.22],["Asia/Taipei","TW",25.05,121.5],["Africa/Dar_es_Salaam","TZ",-6.8,39.28],["Europe/Kyiv","UA",50.43,30.52],["Africa/Kampala","UG",0.32,32.42],["Pacific/Midway","UM",28.22,-177.37],["Pacific/Wake","UM",19.28,166.62],["America/New_York","US",40.71,-74.01],["America/Detroit","US",42.33,-83.05],["America/Kentucky/Louisville","US",38.25,-85.76],["America/Kentucky/Monticello","US",36.83,-84.85],["America/Indiana/Indianapolis","US",39.77,-86.16],["America/Indiana/Vincennes","US",38.68,-87.53],["America/Indiana/Winamac","US",41.05,-86.6],["America/Indiana/Marengo","US",38.38,-86.34],["America/Indiana/Petersburg","US",38.49,-87.28],["America/Indiana/Vevay","US",38.75,-85.07],["America/Chicago","US",41.85,-87.65],["America/Indiana/Tell_City","US",37.95,-86.76],["America/Indiana/Knox","US",41.3,-86.62],["America/Menominee","US",45.11,-87.61],["America/North_Dakota/Center","US",47.12,-101.3],["America/North_Dakota/New_Salem","US",46.84,-101.41],["America/North_Dakota/Beulah","US",47.26,-101.78],["America/Denver","US",39.74,-104.98],["America/Boise","US",43.61,-116.2],["America/Phoenix","US",33.45,-112.07],["America/Los_Angeles","US",34.05,-118.24],["America/Anchorage","US",61.22,-149.9],["America/Juneau","US",58.3,-134.42],["America/Sitka","US",57.18,-135.3],["America/Metlakatla","US",55.13,-131.58],["America/Yakutat","US",59.55,-139.73],["America/Nome","US",64.5,-165.41],["America/Adak","US",51.88,-176.66],["Pacific/Honolulu","US",21.31,-157.86],["America/Montevideo","UY",-34.91,-56.21],["Asia/Samarkand","UZ",39.67,66.8],["Asia/Tashkent","UZ",41.33,69.3],["Europe/Vatican","VA",41.9,12.45],["America/St_Vincent","VC",13.15,-61.23],["America/Caracas","VE",10.5,-66.93],["America/Tortola","VG",18.45,-64.62],["America/St_Thomas","VI",18.35,-64.93],["Asia/Ho_Chi_Minh","VN",10.75,106.67],["Pacific/Efate","VU",-17.67,168.42],["Pacific/Wallis","WF",-13.3,-176.17],["Pacific/Apia","WS",-13.83,-171.73],["Asia/Aden","YE",12.75,45.2],["Indian/Mayotte","YT",-12.78,45.23],["Africa/Johannesburg","ZA",-26.25,28.0],["Africa/Lusaka","ZM",-15.42,28.28],["Africa/Harare","ZW",-17.83,31.05]];
+// Land grid derived from Natural Earth 1:50m land (public domain); zone points from the tz database's zone.tab (public domain).
+(() => {
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const NOW = new Date("2026-10-26T14:05:00Z"); // fixed so captures are reproducible
+const BROWSER_TZ = "Europe/London";
+const CELL = 6, COLS = MAP.rows[0].length, ROWS = MAP.rows.length, W = COLS * CELL, H = ROWS * CELL;
+const X = (lon) => (lon + 180) / MAP.step * CELL;
+const Y = (lat) => (MAP.top - lat) / MAP.step * CELL + CELL / 2;
+
+const regionName = new Intl.DisplayNames(["en"], { type: "region" });
+const offMin = (tz) => {
+  const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "shortOffset" }).formatToParts(NOW).find((x) => x.type === "timeZoneName").value;
+  const m = p.match(/GMT([+-])(\d+)(?::(\d+))?/);
+  return m ? (m[1] === "-" ? -1 : 1) * (+m[2] * 60 + +(m[3] || 0)) : 0;
+};
+const fmtOff = (m) => `UTC${m < 0 ? "−" : "+"}${String(Math.floor(Math.abs(m) / 60)).padStart(2, "0")}:${String(Math.abs(m) % 60).padStart(2, "0")}`;
+const city = (tz) => tz.split("/").pop().replace(/_/g, " ");
+const clock = (tz, loc = "en-GB") => new Intl.DateTimeFormat(loc, { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(NOW);
+
+const validTz = (tz) => { try { new Intl.DateTimeFormat("en", { timeZone: tz }); return true; } catch { return false; } };
+const Z = ZONES.filter(([tz]) => validTz(tz)).map(([tz, cc, lat, lon]) => {
+  let country = cc; try { country = regionName.of(cc); } catch {}
+  const off = offMin(tz);
+  return { tz, cc, lat, lon, country, off, city: city(tz), key: `${city(tz)} ${country} ${tz} ${fmtOff(off)}`.toLowerCase() };
+}).sort((a, b) => a.city.localeCompare(b.city));
+const byTz = new Map(Z.map((z) => [z.tz, z]));
+const MAJOR = "America/Los_Angeles America/Denver America/Chicago America/New_York America/Mexico_City America/Bogota America/Lima America/Sao_Paulo America/Argentina/Buenos_Aires America/Santiago America/Anchorage America/Halifax America/St_Johns Pacific/Honolulu Atlantic/Reykjavik Europe/London Europe/Lisbon Europe/Paris Europe/Berlin Europe/Madrid Europe/Rome Europe/Stockholm Europe/Athens Europe/Helsinki Europe/Istanbul Europe/Moscow Africa/Lagos Africa/Cairo Africa/Nairobi Africa/Johannesburg Asia/Dubai Asia/Tehran Asia/Karachi Asia/Kolkata Asia/Dhaka Asia/Bangkok Asia/Singapore Asia/Shanghai Asia/Seoul Asia/Tokyo Asia/Jakarta Asia/Manila Australia/Perth Australia/Adelaide Australia/Sydney Pacific/Auckland Asia/Yekaterinburg Asia/Novosibirsk Asia/Vladivostok".split(" ").map((t) => byTz.get(t)).filter(Boolean);
+
+function nearest(lon, lat) {
+  let best = null, bd = Infinity; const c = Math.cos(lat * Math.PI / 180);
+  for (const z of Z) { let dl = Math.abs(z.lon - lon); if (dl > 180) dl = 360 - dl; const d = (dl * c) ** 2 + (z.lat - lat) ** 2; if (d < bd) { bd = d; best = z; } }
+  return best;
+}
+
+// ---- map: one path per UTC offset, built once ----
+const svg = $("#tz-svg"); svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+const NS = "http://www.w3.org/2000/svg";
+const el = (n, a = {}, p = svg) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); p.appendChild(e); return e; };
+const groups = new Map();
+MAP.rows.forEach((row, r) => { for (let c = 0; c < COLS; c++) if (row[c] === "1") {
+  const lon = -180 + MAP.step / 2 + c * MAP.step, lat = MAP.top - r * MAP.step;
+  const off = nearest(lon, lat).off;
+  if (!groups.has(off)) groups.set(off, []);
+  groups.get(off).push(`M${c * CELL + CELL / 2} ${r * CELL + CELL / 2}h0`);
+}});
+const paths = new Map();
+for (const [off, d] of groups) paths.set(off, el("path", { class: "land", d: d.join("") }));
+for (const z of MAJOR) el("circle", { class: "city", cx: X(z.lon).toFixed(1), cy: Y(z.lat).toFixed(1), r: 3 });
+const mk = el("g", { class: "mk" });
+const ring = el("circle", { class: "mk-ring", r: 16 }, mk);
+const dot = el("circle", { class: "mk-dot", r: 7 }, mk);
+const lbl = el("g", { class: "mk-lbl" }, mk);
+const lblRect = el("rect", { rx: 6, height: 36, y: -18 }, lbl);
+const lblText = el("text", { y: 8 }, lbl);
+
+// ---- state ----
+let sel = { follow: true, tz: BROWSER_TZ };
+const tzOf = () => byTz.get(sel.tz);
+
+function paintMap() {
+  const z = tzOf();
+  for (const [off, p] of paths) p.classList.toggle("is-sel", off === z.off);
+  const x = X(z.lon), y = Y(z.lat);
+  mk.setAttribute("transform", `translate(${x.toFixed(1)} ${y.toFixed(1)})`);
+  lblText.textContent = `${z.city} · ${clock(z.tz)}`;
+  const w = lblText.getComputedTextLength() + 24, left = x + 24 + w > W;
+  lblRect.setAttribute("width", w); lblRect.setAttribute("x", left ? -24 - w : 24);
+  lblText.setAttribute("x", left ? -12 - w : 36);
+}
+
+// ---- list ----
+const list = $("#tz-list"), q = $("#tz-q");
+function opt(z, follow) {
+  const li = document.createElement("li");
+  li.className = "tz-opt" + (follow ? " tz-follow" : "");
+  li.setAttribute("role", "option");
+  li.id = follow ? "tz-o-follow" : `tz-o-${z.tz.replace(/\W/g, "_")}`;
+  li.dataset.tz = follow ? "" : z.tz;
+  const on = follow ? sel.follow : !sel.follow && sel.tz === z.tz;
+  li.setAttribute("aria-selected", String(on));
+  li.innerHTML = follow
+    ? `<span class="tz-t"><span class="tz-name">Follow my browser</span><span class="tz-sub">Now ${z.city} (${z.tz})</span></span><span class="tz-off">${fmtOff(z.off)}</span>`
+    : `<span class="tz-t"><span class="tz-name">${z.city}</span><span class="tz-sub">${z.country} · ${z.tz}</span></span><span class="tz-off">${fmtOff(z.off)}</span>`;
+  return li;
+}
+function renderList(scroll) {
+  const term = q.value.trim().toLowerCase();
+  list.replaceChildren(opt(byTz.get(BROWSER_TZ), true));
+  const sep = document.createElement("li"); sep.className = "tz-sep"; sep.setAttribute("role", "presentation"); list.appendChild(sep);
+  const hits = term ? Z.filter((z) => term.split(/\s+/).every((t) => z.key.includes(t))) : Z;
+  for (const z of hits) list.appendChild(opt(z, false));
+  if (!hits.length) { const e = document.createElement("li"); e.className = "tz-empty"; e.setAttribute("role", "presentation"); e.textContent = "No timezone matches. Try a city or country name."; list.appendChild(e); }
+  const cur = list.querySelector('[aria-selected="true"]');
+  if (cur) { list.setAttribute("aria-activedescendant", cur.id); if (scroll) list.scrollTop = cur.offsetTop - list.clientHeight / 2 + cur.offsetHeight / 2; }
+}
+function paintNow() {
+  const z = tzOf();
+  $("#tz-now").textContent = sel.follow
+    ? `Now: ${z.city} (${z.tz}), following your browser · ${clock(z.tz)} · ${fmtOff(z.off)}`
+    : `Now: ${z.city} (${z.tz}) · ${clock(z.tz)} · ${fmtOff(z.off)}`;
+}
+function choose(next, from) {
+  sel = next;
+  renderList(from !== "list"); paintMap(); paintNow(); paintFmt();
+  const z = tzOf();
+  $("#region-status").textContent = sel.follow
+    ? "Saved. Your next launch follows your browser's timezone."
+    : `Saved. Your next launch starts at ${z.city} time. Your idle Steam was closed so it picks this up.`;
+}
+list.addEventListener("click", (e) => { const li = e.target.closest(".tz-opt"); if (li) choose(li.dataset.tz ? { follow: false, tz: li.dataset.tz } : { follow: true, tz: BROWSER_TZ }, "list"); });
+list.addEventListener("keydown", (e) => {
+  const opts = [...list.querySelectorAll(".tz-opt")]; let i = opts.findIndex((o) => o.getAttribute("aria-selected") === "true");
+  if (e.key === "ArrowDown") i = Math.min(opts.length - 1, i + 1); else if (e.key === "ArrowUp") i = Math.max(0, i - 1); else return;
+  e.preventDefault(); opts[i].click(); opts[i].scrollIntoView({ block: "nearest" });
+});
+q.addEventListener("input", () => renderList(false));
+
+// ---- map pointer ----
+const tip = $("#tz-tip"), mapBox = $("#tz-map");
+let hoverOff = null;
+function at(e) {
+  const r = svg.getBoundingClientRect();
+  const sx = (e.clientX - r.left) / r.width * W, sy = (e.clientY - r.top) / r.height * H;
+  return { lon: sx / CELL * MAP.step - 180, lat: MAP.top - (sy - CELL / 2) / CELL * MAP.step, r };
+}
+svg.addEventListener("pointermove", (e) => {
+  const { lon, lat } = at(e); const z = nearest(lon, lat);
+  if (hoverOff !== z.off) { paths.get(hoverOff)?.classList.remove("is-hover"); hoverOff = z.off; paths.get(z.off)?.classList.add("is-hover"); }
+  const b = mapBox.getBoundingClientRect();
+  tip.hidden = false; tip.style.left = `${e.clientX - b.left}px`; tip.style.top = `${e.clientY - b.top}px`;
+  tip.innerHTML = `${z.city}, ${z.country}<span class="num">${fmtOff(z.off)}</span>`;
+});
+svg.addEventListener("pointerleave", () => { tip.hidden = true; paths.get(hoverOff)?.classList.remove("is-hover"); hoverOff = null; });
+svg.addEventListener("click", (e) => { const { lon, lat } = at(e); choose({ follow: false, tz: nearest(lon, lat).tz }, "map"); });
+
+// ---- language and region format ----
+const LANGS = [["en-GB", "English (UK)"], ["en-US", "English (US)"], ["de-DE", "Deutsch"], ["fr-FR", "Français"], ["es-ES", "Español"], ["it-IT", "Italiano"], ["nl-NL", "Nederlands"], ["pl-PL", "Polski"], ["pt-BR", "Português (Brasil)"], ["sv-SE", "Svenska"], ["ru-RU", "Русский"], ["ja-JP", "日本語"], ["ko-KR", "한국어"], ["zh-CN", "简体中文"]];
+const FMTS = [["en-GB", "English (United Kingdom)"], ["en-US", "English (United States)"], ["en-AU", "English (Australia)"], ["de-DE", "Deutsch (Deutschland)"], ["fr-FR", "Français (France)"], ["es-ES", "Español (España)"], ["nl-NL", "Nederlands (Nederland)"], ["sv-SE", "Svenska (Sverige)"], ["ja-JP", "日本語 (日本)"]];
+const fill = (s, items, first) => { s.innerHTML = (first ? `<option value="">${first}</option>` : "") + items.map(([v, l]) => `<option value="${v}">${l}</option>`).join(""); };
+const example = (loc, tz) => [
+  new Intl.DateTimeFormat(loc, { timeZone: tz, day: "2-digit", month: "2-digit", year: "numeric" }).format(NOW),
+  new Intl.NumberFormat(loc, { minimumFractionDigits: 2 }).format(1234.56),
+  clock(tz, loc)].join(" · ");
+const lang = $("#lang"), fmt = $("#fmt");
+const BROWSER_LANG = "en-GB";
+const langName = (v) => LANGS.find(([x]) => x === v)[1];
+fill(lang, LANGS, `Follow my browser (${langName(BROWSER_LANG)})`); lang.value = "";
+const langOf = () => lang.value || BROWSER_LANG;
+function paintFmt() {
+  const name = langName(langOf());
+  const keep = fmt.value; fill(fmt, FMTS, `Same as language (${name})`); fmt.value = keep;
+  $("#fmt-ex").textContent = example(fmt.value || langOf(), tzOf().tz);
+}
+lang.addEventListener("change", () => { paintFmt(); $("#region-status").textContent = (lang.value ? `Saved. Your next launch starts in ${langName(lang.value)}.` : "Saved. Your next launch follows your browser's language.") + " Your idle Steam was closed so it picks this up."; });
+fmt.addEventListener("change", () => { paintFmt(); $("#region-status").textContent = "Saved. Applies from your next launch."; });
+
+// ---- keyboard ----
+const KB = { "English (UK)": ["Default", "Extended (Windows keys)", "Dvorak", "Colemak"], "English (US)": ["Default", "International (dead keys)", "Dvorak", "Colemak"], "German": ["Default", "No dead keys", "Dvorak", "Neo 2"], "French": ["Default (AZERTY)", "BÉPO", "AFNOR"], "Spanish": ["Default", "Latin American"], "Italian": ["Default"], "Swedish": ["Default", "Dvorak"], "Japanese": ["Default (106 keys)"] };
+function wireKb(kb, kbv, status) {
+  kb.innerHTML = Object.keys(KB).map((k) => `<option>${k}</option>`).join("");
+  const sync = () => { kbv.innerHTML = KB[kb.value].map((v) => `<option>${v}</option>`).join(""); };
+  kb.addEventListener("change", () => { sync(); status && (status.textContent = `Saved. Your next launch uses ${kb.value}, ${kbv.value}.`); });
+  kbv.addEventListener("change", () => { status && (status.textContent = `Saved. Your next launch uses ${kb.value}, ${kbv.value}.`); });
+  sync();
+}
+const inputStatus = $("#input-status");
+wireKb($("#kb"), $("#kbv"), inputStatus);
+
+// ---- mouse ----
+const HINT = { auto: "Auto turns this on for desktops and off for games. On, the cursor stays under your pointer when the stream is bigger or smaller than your window.", on: "On for every launch, games included. Some games that lock the cursor feel slower with it on.", off: "Off for every launch. The stream gets your mouse movement as it is, so the cursor can run ahead of your pointer when the stream is bigger than your window." };
+const match = $("#match");
+function setMatch(v, save) {
+  match.querySelectorAll("button").forEach((b) => { const on = b.dataset.v === v; b.setAttribute("aria-selected", on); b.tabIndex = on ? 0 : -1; });
+  $("#match-hint").textContent = HINT[v];
+  if (save) inputStatus.textContent = "Saved. Applies from your next launch.";
+}
+match.addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) setMatch(b.dataset.v, true); });
+match.addEventListener("keydown", (e) => {
+  const bs = [...match.querySelectorAll("button")]; let i = bs.findIndex((b) => b.getAttribute("aria-selected") === "true");
+  if (e.key === "ArrowRight") i = (i + 1) % bs.length; else if (e.key === "ArrowLeft") i = (i + bs.length - 1) % bs.length; else return;
+  e.preventDefault(); setMatch(bs[i].dataset.v, true); bs[i].focus();
+});
+setMatch("auto");
+function wireRange(input, out, status) {
+  const paint = () => {
+    const v = 2 ** +input.value, t = `${v.toFixed(2)}×`;
+    out.textContent = t; input.setAttribute("aria-valuetext", t);
+    input.style.setProperty("--fill", `${(+input.value + 2) / 4 * 100}%`);
+  };
+  input.addEventListener("input", paint);
+  input.addEventListener("change", () => status && (status.textContent = `Saved. Your next launch uses ${out.textContent} sensitivity.`));
+  paint();
+}
+wireRange($("#sens"), $("#sens-v"), inputStatus);
+for (const id of ["raw", "flip", "nin"]) $("#" + id).addEventListener("change", () => { inputStatus.textContent = "Saved. Applies from your next launch."; });
+
+// ---- admin frame ----
+const adTz = $("#ad-tz");
+const groupsByRegion = {};
+for (const z of Z) (groupsByRegion[z.tz.split("/")[0]] ||= []).push(z);
+adTz.innerHTML = `<option value="UTC">UTC (built-in fallback)</option>` + Object.keys(groupsByRegion).sort().map((g) => `<optgroup label="${g}">` + groupsByRegion[g].map((z) => `<option value="${z.tz}">${z.city}, ${z.country} · ${fmtOff(z.off)}</option>`).join("") + "</optgroup>").join("");
+adTz.value = "Europe/London";
+fill($("#ad-lang"), LANGS); $("#ad-lang").value = "en-GB";
+const adFmt = $("#ad-fmt");
+const adPaint = () => { const n = $("#ad-lang").selectedOptions[0].text; const k = adFmt.value; fill(adFmt, FMTS, `Same as language (${n})`); adFmt.value = k; $("#ad-fmt-ex").textContent = example(adFmt.value || $("#ad-lang").value, adTz.value); };
+for (const s of [adTz, $("#ad-lang"), adFmt]) s.addEventListener("change", adPaint);
+adPaint();
+wireKb($("#ad-kb"), $("#ad-kbv"), null);
+wireRange($("#ad-sens"), $("#ad-sens-v"), null);
+
+// ---- mock-only controls ----
+$("#mock-controls").addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  const seg = b.parentElement; seg.querySelectorAll("button").forEach((x) => x.setAttribute("aria-selected", x === b));
+  if (b.dataset.themeSet) document.documentElement.dataset.theme = b.dataset.themeSet;
+  if (b.dataset.densitySet) document.body.dataset.density = b.dataset.densitySet;
+});
+// URL hooks for captures: ?theme=light&density=dense&tz=Asia/Tokyo
+const P = new URLSearchParams(location.search);
+if (P.get("theme")) $(`[data-theme-set="${P.get("theme")}"]`)?.click();
+if (P.get("frame") === "account") document.documentElement.classList.add("mk-only-account");
+if (P.get("density")) $(`[data-density-set="${P.get("density")}"]`)?.click();
+
+renderList(true); paintMap(); paintNow(); paintFmt();
+if (P.get("tz")) choose({ follow: false, tz: P.get("tz") }, "map");
+})();
+</script>
+</body>
+</html>
