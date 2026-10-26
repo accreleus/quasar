@@ -28,7 +28,7 @@ own; the two do not move together, and that is deliberate.
 - **The add-a-host page says to keep the agent address on `wss://` (#823).** Agent enrollment over `ws://` sends the enrollment token and receives the node secret in cleartext, and the page said nothing about it. No code or behaviour change.
 
 ### Internal
-- **The Images workflow no longer spends time on a toolchain it reuses (#865).** The `inputs` job reads the gst toolchain's digest (or says it must be built), the toolchain job is skipped when it is reused, `build-node-agent` stops waiting on it, and the node-agent runner cleanup runs only under 50 GB free instead of on every run.
+- **The Images workflow no longer spends time on a toolchain it reuses (#865).** The `inputs` job reads the gst toolchain's digest (or says it must be built), the toolchain job does nothing when it is reused so `build-node-agent` starts seconds after it instead of waiting out a disk cleanup, and the node-agent runner cleanup runs only under 50 GB free instead of on every run.
 - **Region and Input settings mock (#844).** `design_handoff_v3/screens/region-input-v3.html` shows the account page's new Region section (timezone list and world map, language, region format) and Input section (keyboard layout, mouse speed and sensitivity, raw input, scroll direction, Nintendo gamepad layout), plus the admin install-wide defaults. `DESIGN.md` gains the rules for its new controls.
 
 ## 0.5.0 — 2026-10-25
