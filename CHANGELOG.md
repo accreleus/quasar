@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Security
+- **The control plane's HTTPS listener now sends `Strict-Transport-Security: max-age=31536000` (#820).** A browser that has reached it over HTTPS stays on HTTPS for a year. Only the control plane's own HTTPS listener sends it: the plain HTTP port and `QUASAR_TLS=off` do not, and it names no subdomains. Nothing to configure.
+
 ## 0.5.0 — 2026-10-25
 
 ### Upgrading

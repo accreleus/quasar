@@ -3,7 +3,9 @@ package httpx
 import "net/http"
 
 // SecurityHeaders applies browser hardening to every API and SPA response.
-// TLS/HSTS is terminated by the hardened reverse-proxy deployment profile.
+// HSTS is sent only on a connection this process terminated itself (r.TLS set,
+// i.e. the HTTPS listener): the plain HTTP listener, including a proxied request,
+// carries none, and QUASAR_TLS=off has no HTTPS listener to send it from.
 func SecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -19,6 +21,11 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		// audio call reject NotAllowedError regardless of user consent.
 		h.Set("Permissions-Policy", "camera=(), geolocation=(), microphone=(self), payment=(), usb=()")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		if r.TLS != nil {
+			// One year, no includeSubDomains/preload: the operator's other
+			// subdomains are not ours to pin.
+			h.Set("Strict-Transport-Security", "max-age=31536000")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
