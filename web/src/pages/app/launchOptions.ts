@@ -447,9 +447,19 @@ export function recommendedProfile(data: ProfilesResponse): LaunchProfileEvaluat
   return data.profiles.find((p) => p.id === data.recommended_id) ?? null;
 }
 
-/** True only when the resolved recommendation is outright `eligible`. */
+// A chain risky for these alone has a top rung the launch walks past silently.
+const FALL_THROUGH_CODES = new Set(["host_encoder_not_supported", "codec_not_supported"]);
+
+/** True when the resolved recommendation is `eligible`, or `risky` only because
+ * its top rung's codec is missing and the rung the walk lands on is `eligible`
+ * (no probe, or no eligible chain, recommends such a chain). */
 export function isRecommendationEligible(data: ProfilesResponse): boolean {
-  return recommendedProfile(data)?.eligibility === "eligible";
+  const p = recommendedProfile(data);
+  if (!p) return false;
+  if (p.eligibility === "eligible") return true;
+  if (p.eligibility !== "risky" || !p.reasons.every((r) => FALL_THROUGH_CODES.has(r.code))) return false;
+  const [top, ...below] = orderedRungs(p);
+  return top?.eligibility === "ineligible" && below.find((r) => r.eligibility !== "ineligible")?.eligibility === "eligible";
 }
 
 // ── One call for the whole panel (home/DetailBand + home/LaunchOptions) ──────
