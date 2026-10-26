@@ -25,7 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Security
-- **The add-a-host page says to keep the agent address on `wss://` (#823).** Agent enrollment over `ws://` sends the enrollment token and node secret in clear, and the page said nothing about it. No code or behaviour change.
+- **The add-a-host page says to keep the agent address on `wss://` (#823).** Agent enrollment over `ws://` sends the enrollment token and receives the node secret in cleartext, and the page said nothing about it. No code or behaviour change.
 
 ### Internal
 - **Region and Input settings mock (#844).** `design_handoff_v3/screens/region-input-v3.html` shows the account page's new Region section (timezone list and world map, language, region format) and Input section (keyboard layout, mouse speed and sensitivity, raw input, scroll direction, Nintendo gamepad layout), plus the admin install-wide defaults. `DESIGN.md` gains the rules for its new controls.
