@@ -21,8 +21,8 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use quasar_launch_watch::{
-    appid_from_flags, parse_command, CloudEnd, Command, LaunchState, NeedsUser, Quit, QuitAction,
-    Report, WatchConfig, Watcher, WindowInfo, Windows, STEAM_CLIENT_APPID,
+    appid_from_flags, parse_command, CloudEnd, CloudSync, Command, LaunchState, NeedsUser, Quit,
+    QuitAction, Report, WatchConfig, Watcher, WindowInfo, Windows, STEAM_CLIENT_APPID,
 };
 use x11rb::connection::Connection;
 use x11rb::cookie::Cookie;
@@ -119,6 +119,9 @@ struct Helper {
     /// The controller notice: pinned to Steam's window, then answered, at most once a launch.
     notice: Notice,
     quit: Option<Quit>,
+    /// The watched game's cloud log, read from when the watch began: a quit that finds the game
+    /// already gone waits on it for the exit sync (#810).
+    exit_sync: Option<(u32, CloudSync)>,
     children: Vec<Child>,
     screen: Box<dyn Screen>,
     /// `steam` from `PATH`; a test points it at a stand-in.
@@ -151,6 +154,7 @@ impl Helper {
             needs_user: false,
             notice: Notice::Waiting,
             quit: None,
+            exit_sync: None,
             children: Vec::new(),
             screen: Box::<X11Windows>::default(),
             // The image's `steam` RPM puts it here; `PATH` only for an image without it.
@@ -180,6 +184,7 @@ impl Helper {
             watcher.answer_notice();
         }
         self.watcher = Some(watcher);
+        self.exit_sync = Some((appid, CloudSync::new(&self.log_dir, appid)));
         self.launched = launched;
         self.needs_user = false;
         self.notice = Notice::Waiting;
@@ -227,6 +232,9 @@ impl Helper {
                     &self.log_dir,
                     appid,
                     Instant::now(),
+                    self.exit_sync
+                        .take_if(|(watched, _)| *watched == appid)
+                        .map(|(_, cloud)| cloud),
                 ));
             }
         }
@@ -1200,6 +1208,42 @@ mod tests {
             lines,
             [r#"{"type":"launch_state","v":1,"state":"client_only"}"#]
         );
+    }
+
+    /// #810: a `quit` for a game that already exited waits on the exit sync tailed since the
+    /// watch began, whose start line was written before the command arrived.
+    #[test]
+    fn a_quit_after_the_game_exited_waits_on_the_sync_tailed_since_the_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proc, logs) = (dir.path().join("proc"), dir.path().join("logs"));
+        std::fs::create_dir_all(&proc).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        let mut helper = Helper::new(proc, logs.clone(), false);
+        helper.watch_with(620, true, Box::new(Fake(vec![])));
+        helper.screen = Box::new(Scene::default());
+        let mut agent = Agent::new("/nonexistent/launch.sock".into());
+        let log = logs.join("cloud_log.txt");
+        let append = |what: &str| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+                .unwrap();
+            writeln!(file, "[2026-10-26 12:00:00] [AppID 620] {what}").unwrap();
+        };
+        append("Starting sync (up,AC Exit,)");
+        helper.command(Command::Quit(620), &mut agent);
+        let t = Instant::now();
+        helper.step_quit(t + Duration::from_secs(1), &mut agent);
+        assert!(
+            agent.latest[COMMAND_DONE].is_none(),
+            "the upload is awaited"
+        );
+        append("Upload complete in build list");
+        helper.step_quit(t + Duration::from_secs(2), &mut agent);
+        let line = agent.latest[COMMAND_DONE].clone().expect("quit answered");
+        assert!(line.contains("\"cloud_synced\":true"), "{line}");
     }
 
     #[test]

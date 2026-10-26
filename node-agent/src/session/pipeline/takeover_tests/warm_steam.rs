@@ -648,20 +648,10 @@ fn an_in_place_swap_without_a_connected_helper_swaps_the_container() {
     end(session, &mut a);
 }
 
-/// The switch off: the control plane claims the parked runtime with no `kind`. That session's
-/// game exit ends it as before #759 (#758's stopping, bye, stopped), and nothing is held.
-#[test]
-fn a_claim_without_kind_ends_on_its_game_exit_as_before() {
-    if !live_webrtc_available() {
-        return;
-    }
-    let _serial = serial();
-    let (runtime, mut session) = steam_session(
-        "kindless",
-        SessionKind::Parked,
-        "-silent",
-        Duration::from_secs(60),
-    );
+/// A claim with no `kind` (the switch off) on game 730, the game running.
+fn kindless_730(tag: &str) -> (tempfile::TempDir, Session, Peer, FakeHelper, usize) {
+    let (runtime, mut session) =
+        steam_session(tag, SessionKind::Parked, "-silent", Duration::from_secs(60));
     session.mute = true;
     let mut nobody = Peer::new();
     session.pump(&mut nobody, Duration::from_secs(2), |s, _| {
@@ -674,7 +664,44 @@ fn a_claim_without_kind_ends_on_its_game_exit_as_before() {
     assert_eq!(helper.command(&mut session, &mut b), "launch 730");
     assert!(session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p)));
     helper.launch_state("game_running");
+    (runtime, session, b, helper, adopted_at)
+}
+
+/// The switch off: the control plane claims the parked runtime with no `kind`. That session's
+/// game exit ends it as before #759 (#758's stopping, bye, stopped), and nothing is held.
+/// #810: the stop waits for the game's exit cloud sync first. The player already quit, so the
+/// helper is asked to `quit` only to wait on the sync it has been tailing; the container goes
+/// after its answer, not before.
+#[test]
+fn a_claim_without_kind_ends_on_its_game_exit_after_the_cloud_sync() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut b, mut helper, adopted_at) = kindless_730("kindless");
     helper.launch_state("game_exited");
+    assert_eq!(helper.command(&mut session, &mut b), "quit 730");
+    // The helper is still waiting on Steam's upload: the source has not been stopped.
+    assert!(
+        !session.pump(&mut b, Duration::from_secs(2), |s, _| s.ended.is_some()),
+        "ended before the cloud sync: {:?}",
+        session.ended
+    );
+    let stopping = after(&session.log, adopted_at, |e| {
+        matches!(e, SessionEvent::StoppingWith("game exited"))
+    })
+    .expect("stopping / game exited");
+    assert!(
+        matches!(
+            session.log.get(stopping + 1),
+            Some(SessionEvent::Signaling(SignalMsg::Bye))
+        ),
+        "bye right after the stopping, before the wait: {:?}",
+        &session.log[stopping..]
+    );
+    helper.say(
+        r#"{"type":"command_done","v":1,"command":"quit","appid":730,"ok":true,"cloud_synced":true}"#,
+    );
     let ended = session.pump(&mut b, Duration::from_secs(20), |s, _| s.ended.is_some());
     assert!(ended, "the game exit did not end the session");
     assert!(
@@ -688,20 +715,39 @@ fn a_claim_without_kind_ends_on_its_game_exit_as_before() {
         "{:?}",
         session.ended
     );
-    let stopping = after(&session.log, adopted_at, |e| {
-        matches!(e, SessionEvent::StoppingWith("game exited"))
-    })
-    .expect("stopping / game exited");
-    assert!(
-        matches!(
-            session.log.get(stopping + 1),
-            Some(SessionEvent::Signaling(SignalMsg::Bye))
-        ),
-        "bye right after the stopping: {:?}",
-        &session.log[stopping..]
-    );
     assert!(!session.log.iter().any(|e| matches!(e, SessionEvent::Held)));
     assert_eq!(byes(&session.log), 1);
+    session.thread.take().unwrap().join().unwrap();
+}
+
+/// #810: a title with Steam Cloud off writes no exit sync; the helper says so, and the end
+/// does not wait for the bound.
+#[test]
+fn a_game_exit_with_no_cloud_sync_ends_as_soon_as_the_helper_says_so() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut b, mut helper, _) = kindless_730("kindless-nocloud");
+    helper.launch_state("game_exited");
+    assert_eq!(helper.command(&mut session, &mut b), "quit 730");
+    helper.say(
+        r#"{"type":"command_done","v":1,"command":"quit","appid":730,"ok":true,"cloud_synced":false,"cloud_sync_started":false}"#,
+    );
+    let started = Instant::now();
+    assert!(session.pump(&mut b, Duration::from_secs(20), |s, _| s.ended.is_some()));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(matches!(
+        session.ended,
+        Some(SessionEvent::Stopped {
+            detail: Some("game exited"),
+            ..
+        })
+    ));
     session.thread.take().unwrap().join().unwrap();
 }
 

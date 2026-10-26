@@ -1076,17 +1076,25 @@ pub const QUIT_SYNC_START_GRACE: Duration = Duration::from_secs(5);
 
 impl Quit {
     /// Made right after the close request went out, so the cloud log is read from then.
-    pub fn new(proc_root: &Path, steam_log_dir: &Path, appid: u32, now: Instant) -> Self {
-        let step = match game_running(proc_root, appid) {
-            // ponytail: a game that exited just before the quit may still be syncing; its sync
-            // is not waited for (Steam keeps running, so it finishes anyway).
-            Some(false) => QuitStep::NotRunning,
-            _ => QuitStep::Closing(now),
+    /// `earlier` is a [`CloudSync`] made before the game could exit: a game that is already
+    /// gone has written its exit sync's start line by now, which a log read from here on
+    /// would miss, so the quit waits on `earlier` instead of returning at once (#810).
+    pub fn new(
+        proc_root: &Path,
+        steam_log_dir: &Path,
+        appid: u32,
+        now: Instant,
+        earlier: Option<CloudSync>,
+    ) -> Self {
+        let (step, cloud) = match (game_running(proc_root, appid), earlier) {
+            (Some(false), Some(cloud)) => (QuitStep::Syncing(now), cloud),
+            (Some(false), None) => (QuitStep::NotRunning, CloudSync::new(steam_log_dir, appid)),
+            _ => (QuitStep::Closing(now), CloudSync::new(steam_log_dir, appid)),
         };
         Self {
             appid,
             proc_root: proc_root.to_owned(),
-            cloud: CloudSync::new(steam_log_dir, appid),
+            cloud,
             step,
         }
     }

@@ -1774,18 +1774,20 @@ pub(crate) fn stop_source(
 }
 
 /// [`stop_source`] for a game the player quit (#726). The source stop can take seconds, so the
-/// browser is told first (#753). It does not wait for the game's exit cloud upload, which the
-/// container stop can cut (#810). `bye` must follow the `stopping` row on this ordered lane,
+/// browser is told first (#753). `launch` is the game's helper: the exit cloud sync is waited
+/// for before the container goes (#810); `None` where the game's sync was already waited for.
+/// `bye` must follow the `stopping` row on this ordered lane,
 /// because the control plane commits that row before it relays the next frame, and the web
 /// client answers `bye` by reading the row.
 pub(crate) fn stop_for_game_exit(
     emit: &dyn Fn(SessionEvent),
     source: &mut AppSource,
     transports: &SessionTransports,
+    launch: Option<&super::launch_helper::LaunchSocket>,
 ) {
     emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
     emit(SessionEvent::Signaling(SignalMsg::Bye));
-    stop_source(source, transports, None);
+    stop_source(source, transports, launch);
 }
 
 /// Should an idle `running` session be reaped? `Some(reason)` to reap. Pure so the policy
@@ -2660,7 +2662,7 @@ pub fn run_blocking(
                 session_id = %session_id,
                 "the Steam game exited; ending the session"
             );
-            stop_for_game_exit(&emit, &mut current_source, &transports);
+            stop_for_game_exit(&emit, &mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             emit(SessionEvent::Stopped {
@@ -3303,7 +3305,7 @@ pub fn run_blocking(
                         reason,
                         "in-place swap failed: {reason}; the session ends"
                     );
-                    stop_for_game_exit(&emit, &mut current_source, &transports);
+                    stop_for_game_exit(&emit, &mut current_source, &transports, None);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     emit(SessionEvent::Stopped {

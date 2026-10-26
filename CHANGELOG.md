@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- **Quitting a Steam game from inside the session no longer cuts the game's cloud save (#810).** The container used to be stopped as soon as the game's process was gone, which is before Steam uploads the save, so the next launch of the title could stop on "Cloud Out of Date". The session now ends the stream as before, then waits for Steam's exit sync to finish (up to 30 s) before the container goes. A game whose exit starts no sync within 5 s is not waited for, and the agent logs `session-end-no-cloud-sync`.
+
 ## 0.5.0 — 2026-10-25
 
 ### Upgrading

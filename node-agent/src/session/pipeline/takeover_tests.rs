@@ -1802,7 +1802,7 @@ fn a_game_exit_says_bye_and_drops_the_video_before_the_source_stops() {
         .expect("app source");
 
     let emit = |e: SessionEvent| emitted.lock().unwrap().push(e);
-    crate::session::runner::stop_for_game_exit(&emit, &mut source, &host.transports);
+    crate::session::runner::stop_for_game_exit(&emit, &mut source, &host.transports, None);
 
     let at_stop = *at_stop.lock().unwrap();
     assert_eq!(
