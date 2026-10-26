@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- Pressing Play on a game tile launches it when the recommended quality only needs to step down from a codec the host lacks (for example AV1 on an AMD GPU), instead of opening the detail panel with "No host that can encode this quality is available" (#817).
+
 ### Security
 - **The control plane's HTTPS listener now sends `Strict-Transport-Security: max-age=31536000` (#820).** A browser that has reached it over HTTPS stays on HTTPS for a year. Only the control plane's own HTTPS listener sends it: the plain HTTP port and `QUASAR_TLS=off` do not, and it names no subdomains. Nothing to configure.
 - **The add-a-host page says to keep the agent address on `wss://` (#823).** Agent enrollment over `ws://` sends the enrollment token and receives the node secret in cleartext, and the page said nothing about it. No code or behaviour change.
