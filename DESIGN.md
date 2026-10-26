@@ -147,6 +147,26 @@ above.
 `/styleguide` (public route) renders the live tokens and components. Check a change
 there as well as on the page it targets.
 
+## Region and Input settings (#844)
+
+No v3 mock covered these. The composition, with its direction approved by the owner, is
+`design_handoff_v3/screens/region-input-v3.html` (account sections, then the admin
+defaults). Rules:
+
+| Control | Rule |
+|---|---|
+| Timezone | A search field over a listbox (`role="listbox"`, 44px rows, inset well like `.input`). The first row is pinned: "Follow my browser" with the detected zone, and it is the default. The selected row is `--accent-soft` with an accent inset ring. A "Now: zone · time · offset" line sits under the field. |
+| World map | Beside the list, below it under 1100px, absent at 600px and below (phones get the list only). Inline SVG dot map on an inset well; land dots `--line-3`, the zones sharing the hovered offset `--text-2`, the selected offset `--accent`; city dots `--text`; the pick is a `--text` dot ringed in `--accent` with a `--pop-bg` label. Pointer only: the list is the accessible path. Map data is public domain (Natural Earth land, tz `zone.tab`). |
+| Language | `SelectField`; default "Follow my browser (<detected>)". Region format defaults to "Same as language (<language>)" and its hint shows a live mono example. |
+| 3-way choice | "Match cursor to my window" (Auto / Always on / Off) is the existing `SegmentedControl`, as wide as its options, with a hint that changes with the choice. |
+| Range slider | New: track `--surf-inset` with a `--line-3` border, filled in `--accent` to the value (`--fill` custom property), `--text` thumb with `--shadow-sm`, `--glow-accent` on focus, 44px hit area. Mono value readout on the right; mono end and centre ticks underneath. Sensitivity is log-scaled so 1× sits at the centre. |
+| Unavailable toggle | A `Switch` disabled with its hint saying why ("Not available in this browser"), never hidden. |
+| Rail icons | Region is a globe, Input a keyboard, drawn in the shell glyph style (16px box, 1.5 stroke, round caps). |
+| "Applies from your next launch" | Said once per section, in the section's sub-line, not under every field. The status line under the card confirms each save, and says when idle Steam was closed to pick the change up (never a session in use). |
+
+Admin defaults use the Settings page's `SettingRow`s; the admin timezone default is a
+grouped `<select>`, not the map.
+
 ## Motion and behaviour
 
 - Transitions `.12s`–`.24s ease`. Buttons lift `-.5px` on hover and settle `+.5px` when
