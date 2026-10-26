@@ -26,6 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Security
 - **The control plane warns when a reverse proxy it does not trust talks to its plain HTTP port (#821).** A request carrying `X-Forwarded-*` from a peer outside `QUASAR_TRUSTED_PROXIES` logs `forwarded-from-unlisted-peer` with that peer's address, once per peer every 10 minutes. Nothing is refused. Name that proxy in `QUASAR_TRUSTED_PROXIES` before the release that refuses sign-in over plain HTTP (#604).
+- **The add-a-host page says to keep the agent address on `wss://` (#823).** Agent enrollment over `ws://` sends the enrollment token and receives the node secret in cleartext, and the page said nothing about it. No code or behaviour change.
 
 ### Internal
 - **Region and Input settings mock (#844).** `design_handoff_v3/screens/region-input-v3.html` shows the account page's new Region section (timezone list and world map, language, region format) and Input section (keyboard layout, mouse speed and sensitivity, raw input, scroll direction, Nintendo gamepad layout), plus the admin install-wide defaults. `DESIGN.md` gains the rules for its new controls.
