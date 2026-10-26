@@ -369,4 +369,45 @@ describe("recommendedProfile / isRecommendationEligible", () => {
     risky[2] = { ...risky[2], eligibility: "risky" };
     expect(isRecommendationEligible(profilesResponse({ profiles: risky }))).toBe(false);
   });
+
+  describe("a recommendation that only falls through a codec the host lacks", () => {
+    const noAv1 = [{ code: "host_encoder_not_supported", message: "no available host advertises this rung's codec" }];
+    const chain = (landing: ProfileEvaluation["eligibility"], reasons: ProfileReason[] = noAv1) =>
+      profile(
+        "1080p60",
+        [
+          rung("1080p60-av1", "av1", 1920, 1080, 60, 1, 6500, "ineligible", noAv1),
+          rung("1080p60-hevc", "hevc", 1920, 1080, 60, 2, 7500, landing),
+          rung("1080p60-h264", "h264", 1920, 1080, 60, 3, 11500),
+        ],
+        "risky",
+        reasons,
+      );
+    const data = (p: LaunchProfileEvaluation) =>
+      profilesResponse({ recommended_id: "1080p60", confidence: "low", profiles: [p] });
+
+    it("launches from the tile when the rung it lands on is eligible", () => {
+      expect(isRecommendationEligible(data(chain("eligible")))).toBe(true);
+    });
+
+    it("launches from the tile when the browser cannot decode the top rung", () => {
+      const noDecode = [{ code: "codec_not_supported", message: "client does not accept this rung's codec" }];
+      const p = profile(
+        "1080p60",
+        [
+          rung("1080p60-av1", "av1", 1920, 1080, 60, 1, 6500, "ineligible", noDecode),
+          rung("1080p60-h264", "h264", 1920, 1080, 60, 2, 11500),
+        ],
+        "risky",
+        noDecode,
+      );
+      expect(isRecommendationEligible(data(p))).toBe(true);
+    });
+
+    it("still opens the panel when it lands on a risky rung or carries another concern", () => {
+      expect(isRecommendationEligible(data(chain("risky")))).toBe(false);
+      const slow = [...noAv1, { code: "bandwidth_too_low", message: "" }];
+      expect(isRecommendationEligible(data(chain("eligible", slow)))).toBe(false);
+    });
+  });
 });
