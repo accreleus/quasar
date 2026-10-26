@@ -447,12 +447,12 @@ export function recommendedProfile(data: ProfilesResponse): LaunchProfileEvaluat
   return data.profiles.find((p) => p.id === data.recommended_id) ?? null;
 }
 
-// A chain risky for these alone has a top rung the launch walks past silently.
+// A top rung ineligible for these alone is one the launch walk steps past.
 const FALL_THROUGH_CODES = new Set(["host_encoder_not_supported", "codec_not_supported"]);
 
-/** True when the resolved recommendation is `eligible`, or `risky` only because
- * its top rung's codec is missing and the rung the walk lands on is `eligible`
- * (no probe, or no eligible chain, recommends such a chain). */
+/** True when the recommendation is `eligible`, or `risky` only because its top rung's
+ * codec is missing and the first rung below the top that is not ineligible is `eligible`.
+ * The server's walk enforces codec, decode and encoder clamps, not bandwidth, RTT or display. */
 export function isRecommendationEligible(data: ProfilesResponse): boolean {
   const p = recommendedProfile(data);
   if (!p) return false;
