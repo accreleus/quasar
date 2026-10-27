@@ -165,6 +165,36 @@ The `release` job of `.github/workflows/images.yml`, on a `v*` tag push:
 The generator and validator run offline, need no Docker, and are covered by
 `scripts/release/test-platform-release-manifest.sh`.
 
+## The preview manifest
+
+Every push to `develop` that builds images also publishes a **preview manifest**
+(`protocol/control-api.md` "Platform-release preview channel"): format 2 with
+`version` `null`, `prerelease` `false`, and an optional `commits` list. It is not a
+release asset. It is the one layer of an OCI image manifest at
+`ghcr.io/accreleus/quasar/quasar-release-manifest:preview`, and the control plane
+on the `preview` channel reads that tag. The shape is
+`testdata/release/platform-release-manifest.preview.json` (the Go tests read it too;
+`fixtures/manifests/valid-preview.json` is a copy).
+
+The `preview` job of `.github/workflows/images.yml` runs after `promote`:
+
+1. `generate-platform-release-manifest.sh --preview` writes it (no `--version`;
+   no `commits` yet), and `validate-platform-release-manifest.sh --preview` checks
+   it against the three build digests. Without `--preview` the validator still
+   refuses a null version and a `commits` key, so a release asset cannot carry them.
+2. Each component image is read back by digest, and its `org.quasar.source.commit`
+   label must be the run's commit: one commit for every image.
+3. `publish-preview-manifest.sh` pushes the document and moves the tag, then reads
+   the tag back and checks the manifest digest and the layer bytes.
+
+A run that builds no image publishes no new preview, so the tag stays on the last
+build. A dispatch with `preview` ticked publishes to a test tag,
+`preview-<branch>`, never `preview`.
+
+**Once, after the first push:** GHCR creates the `quasar-release-manifest` package
+private. An org owner makes it public (the package's settings ▸ Change visibility);
+until then every install reads the preview tag as not published.
+
 ## The release-time check
 
 `scripts/release/check-release-compatibility.sh` is ADR 0008's "release-time

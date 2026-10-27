@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Offline dependency-graph regression: a release must not be published before every
-# image its manifest names has passed validation and been promoted.
+# Offline dependency-graph regression: a release, and the preview manifest (#839),
+# must not be published before every image its manifest names has passed validation
+# and been promoted.
 set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 python3 - "$repo/.github/workflows/images.yml" <<'PY'
@@ -23,7 +24,7 @@ for job, body in blocks.items():
     value = match.group(1)
     graph[job] = set(re.findall(r'[a-z][a-z0-9-]*', value))
 
-def validate(dependencies):
+def validate(dependencies, target='release'):
     seen = set()
     def visit(job):
         if job in seen:
@@ -32,26 +33,29 @@ def validate(dependencies):
         seen.add(job)
         for prerequisite in dependencies[job]:
             visit(prerequisite)
-    visit('release')
+    visit(target)
     required = {'release-gate', 'preflight', 'promote',
                 'validate-control-plane', 'validate-node-agent', 'validate-recovery-actor'}
     assert required <= seen, f'publication bypasses required gates: {sorted(required - seen)}'
-    for job in required | {'release'}:
+    for job in required | {target}:
         assert not re.search(r'^    (?:if:.*(?:always\(|failure\(|cancelled\()|continue-on-error:\s*true)', blocks[job], re.M), f'{job} bypasses successful prerequisites'
 
 validate(graph)
+validate(graph, 'preview')
 # Prove the guard catches the actual pre-fix publication race and its validation
 # equivalent, rather than merely reading a keyword somewhere in the workflow.
-for job, edge in [('release', 'promote'), ('promote', 'validate-node-agent'),
-                  ('promote', 'validate-recovery-actor')]:
+for target, job, edge in [('release', 'release', 'promote'),
+                          ('release', 'promote', 'validate-node-agent'),
+                          ('release', 'promote', 'validate-recovery-actor'),
+                          ('preview', 'preview', 'promote')]:
     changed = copy.deepcopy(graph)
     changed[job].discard(edge)
     try:
-        validate(changed)
+        validate(changed, target)
     except AssertionError:
         continue
     raise AssertionError(f'guard failed to reject removed dependency {job} -> {edge}')
-print('PASS release publication waits for every validated, promoted runtime image')
+print('PASS release and preview publication wait for every validated, promoted runtime image')
 # The Compose updater retired with #367; its lane must not come back.
 assert not any(j.endswith('-updater') for j in graph), 'an updater lane is back in images.yml'
 
