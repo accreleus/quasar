@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
+use crate::session::container::ContainerSpec;
 use crate::session::virtual_input::VirtualDevices;
 use crate::session::{EncoderChoice, SessionConfig};
 
@@ -83,6 +84,20 @@ pub(crate) fn build_video_source(
             tracing::info!(
                 "VK-05: waylanddisplaysrc vulkan=true (emit memory:VulkanImage NV12 for vulkanh264enc)"
             );
+        }
+        if let Some((layout, variant)) = keyboard_layout(cfg.container.as_ref()) {
+            // A compositor without the properties keeps US rather than failing the session.
+            if el.find_property("keyboard-layout").is_some() {
+                el.set_property("keyboard-layout", layout);
+                el.set_property("keyboard-variant", variant);
+                tracing::info!(layout, variant, "compositor keyboard layout");
+            } else {
+                tracing::warn!(
+                    token = "compositor-keyboard-layout-unsupported",
+                    layout,
+                    "waylanddisplaysrc has no keyboard-layout property; the session keeps the US keymap"
+                );
+            }
         }
         // libinput's path backend opens these directly (no udev/seat). The gamepad
         // reaches the app through the container's mounted device node instead.
@@ -235,9 +250,43 @@ pub(crate) fn build_gpu_convert_stage(
     Ok(super::scale_stage::build_scale_stage(cfg, va_ctx)?.elements)
 }
 
+/// The session's keyboard layout and variant from the app's env (amendment 49), or `None`
+/// for the compositor's US keymap. The compositor falls back to US on a pair that does not
+/// compile.
+pub(crate) fn keyboard_layout(container: Option<&ContainerSpec>) -> Option<(&str, &str)> {
+    let env = &container?.env;
+    let layout = env.get("XKB_DEFAULT_LAYOUT").filter(|l| !l.is_empty())?;
+    let variant = env.get("XKB_DEFAULT_VARIANT").map_or("", String::as_str);
+    Some((layout, variant))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::va_postproc_candidates;
+    use super::{keyboard_layout, va_postproc_candidates};
+    use crate::session::container::ContainerSpec;
+
+    #[test]
+    fn keyboard_layout_comes_from_the_app_env() {
+        let spec = |pairs: &[(&str, &str)]| ContainerSpec {
+            env: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let de = spec(&[
+            ("XKB_DEFAULT_LAYOUT", "de"),
+            ("XKB_DEFAULT_VARIANT", "nodeadkeys"),
+        ]);
+        assert_eq!(keyboard_layout(Some(&de)), Some(("de", "nodeadkeys")));
+        let no_variant = spec(&[("XKB_DEFAULT_LAYOUT", "fr")]);
+        assert_eq!(keyboard_layout(Some(&no_variant)), Some(("fr", "")));
+        // Unset or empty: the compositor's US keymap, as before amendment 49.
+        let empty = spec(&[("XKB_DEFAULT_LAYOUT", ""), ("XKB_DEFAULT_VARIANT", "x")]);
+        assert_eq!(keyboard_layout(Some(&empty)), None);
+        assert_eq!(keyboard_layout(Some(&spec(&[]))), None);
+        assert_eq!(keyboard_layout(None), None);
+    }
 
     // SO-07: device-pinned to the assigned render node, generic as the single-GPU fallback.
     #[test]

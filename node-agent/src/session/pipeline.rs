@@ -67,7 +67,7 @@ pub(crate) const VIDEO_ENCODER_NAME: &str = "quasar-video-encoder";
 /// caps the payloader actually agreed, and `by_name` is the only way to reach it from
 /// the runner without threading a handle through every builder.
 pub(crate) const VIDEO_PAYLOADER_NAME: &str = "quasar-video-payloader";
-mod source_branch;
+pub(crate) mod source_branch;
 // Also the media host probe's source + convert stage (`session::probe_media`): the probe
 // must build the compositor arm production builds, not a stand-in.
 pub(crate) use source_branch::{
