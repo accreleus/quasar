@@ -321,9 +321,16 @@ func validateFloor(floor []ManifestFloor, release *semver.Full) error {
 	return nil
 }
 
+// unsafeSubjectRune: a control character, a line or paragraph separator (U+2028,
+// U+2029) or a bidi control (U+202E and the rest) cannot sit in a one-line subject
+// a client prints as plain text. The producer strips the same set (#886).
+func unsafeSubjectRune(r rune) bool {
+	return unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp, unicode.Bidi_Control)
+}
+
 // parseManifestCommits validates a preview manifest's `commits`: at most 500
 // entries, each exactly a full commit and a one-line subject of at most 200
-// characters with no control character. Markup stays: the client renders plain text.
+// characters with no control, separator or bidi character. Markup stays: the client renders plain text.
 func parseManifestCommits(raw json.RawMessage) ([]ManifestCommit, error) {
 	if string(raw) == "null" {
 		return nil, fmt.Errorf("manifest commits is null; leave the key out instead")
@@ -348,7 +355,7 @@ func parseManifestCommits(raw json.RawMessage) ([]ManifestCommit, error) {
 		if e.Subject == nil {
 			return nil, fmt.Errorf("manifest commits[%d] has no subject", i)
 		}
-		if strings.IndexFunc(*e.Subject, unicode.IsControl) >= 0 || utf8.RuneCountInString(*e.Subject) > maxManifestSubjectRunes {
+		if strings.IndexFunc(*e.Subject, unsafeSubjectRune) >= 0 || utf8.RuneCountInString(*e.Subject) > maxManifestSubjectRunes {
 			return nil, fmt.Errorf("manifest commits[%d].subject is not one line of at most %d characters", i, maxManifestSubjectRunes)
 		}
 		out = append(out, ManifestCommit{Commit: e.Commit, Subject: *e.Subject})

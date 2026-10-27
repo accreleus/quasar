@@ -601,6 +601,22 @@
 .rel-e > summary:hover {
   background: var(--ink-4);
 }
+/* A preview build's commit list: the same row, without a disclosure. */
+.rel-commits-head {
+  margin: 0;
+  padding: var(--s2) var(--card-pad);
+}
+.rel-commits {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.rel-commits > .rel-e {
+  display: flex;
+  gap: var(--s3);
+  align-items: baseline;
+  padding: var(--s2) var(--card-pad);
+}
 .rel-c {
   font-size: 10px;
   font-weight: 700;
