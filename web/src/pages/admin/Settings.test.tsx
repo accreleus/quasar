@@ -176,6 +176,40 @@ describe("Settings — Instance card", () => {
   });
 });
 
+describe("Settings — Region defaults card", () => {
+  it("shows the saved default timezone, grouped by area", async () => {
+    mocked.getSettings.mockResolvedValue(settingsResponse({ default_timezone: "Europe/Berlin" }));
+    renderPage();
+    const select = (await screen.findByLabelText("Default timezone")) as HTMLSelectElement;
+    expect(select.value).toBe("Europe/Berlin");
+    expect(select.querySelector('optgroup[label="Europe"]')).toBeTruthy();
+  });
+
+  it("PATCHes only default_timezone when changed", async () => {
+    mocked.updateSettings.mockResolvedValue(settingsResponse({ default_timezone: "Asia/Tokyo" }));
+    renderPage();
+    const select = await screen.findByLabelText("Default timezone");
+    fireEvent.change(select, { target: { value: "Asia/Tokyo" } });
+    await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { default_timezone: "Asia/Tokyo" }));
+  });
+
+  it("keeps a saved zone the list does not carry, and defaults to UTC for an older server", async () => {
+    mocked.getSettings.mockResolvedValue(settingsResponse({ default_timezone: "Asia/Calcutta" }));
+    const { unmount } = renderPage();
+    expect(((await screen.findByLabelText("Default timezone")) as HTMLSelectElement).value).toBe("Asia/Calcutta");
+    unmount();
+    mocked.getSettings.mockResolvedValue(settingsResponse());
+    renderPage();
+    expect(((await screen.findByLabelText("Default timezone")) as HTMLSelectElement).value).toBe("UTC");
+  });
+
+  it("renders a saved default this browser's Intl does not know", async () => {
+    mocked.getSettings.mockResolvedValue(settingsResponse({ default_timezone: "Not/AZone" }));
+    renderPage();
+    expect(((await screen.findByLabelText("Default timezone")) as HTMLSelectElement).value).toBe("Not/AZone");
+  });
+});
+
 describe("Settings — Libraries card", () => {
   it("renders the discovery hint and PATCHes library_discovery_enabled when the switch flips", async () => {
     mocked.updateSettings.mockResolvedValue(settingsResponse({ library_discovery_enabled: true }));

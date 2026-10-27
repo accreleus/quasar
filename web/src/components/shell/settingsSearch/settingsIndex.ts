@@ -59,6 +59,12 @@ export const ACCOUNT_SETTINGS: readonly SettingEntry[] = [
     keywords: "full screen fullscreen capture input mouse lock play launch immersive",
     target: { sel: "#launch-fullscreen", up: ".ac-sw" },
   },
+  sec("region", "Region", "region", "globe", "region clock time language locale format"),
+  {
+    id: "acct-timezone", label: "Timezone", where: "Region", icon: "globe", to: `${A}/region`,
+    keywords: "time zone clock city country utc gmt offset follow my browser tz",
+    target: { sel: "#tz-label", up: ".field" },
+  },
   sec("overlay", "In-session overlay", "overlay", "overlay", "hud strip overlay stats"),
   {
     id: "acct-overlay-preset", label: "Overlay content", where: "Overlay", icon: "overlay", to: `${A}/overlay`,
@@ -149,6 +155,8 @@ export const ADMIN_SETTINGS: readonly SettingEntry[] = [
   adminSection("Instance", "identity access"),
   adminRow("Registration", "Instance", "sign up signup open closed invite only register"),
   adminRow("Allowed origins", "Instance", "cors origin domain url"),
+  adminSection("Region defaults", "timezone language locale format clock"),
+  adminRow("Timezone", "Region defaults", "time zone clock city utc gmt offset default users"),
   adminSection("Libraries", "discovery scan steam"),
   adminRow("Library discovery", "Libraries", "steam scan discover installed"),
   adminRow("Scan interval", "Libraries", "minutes scan frequency how often"),
