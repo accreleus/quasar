@@ -153,6 +153,8 @@ services:
       # these networks only. Must be passed here: an .env entry with no passthrough is
       # silently inert. Asserted by scripts/dev/test-compose-overlays.sh.
       QUASAR_TRUSTED_PROXIES: ${QUASAR_TRUSTED_PROXIES:-}
+      # Opt-in HSTS on the HTTPS listener, seconds; empty/0 sends none (docs/configuration.md).
+      QUASAR_HSTS_MAX_AGE: ${QUASAR_HSTS_MAX_AGE:-}
       # STUN/TURN servers handed to the browser with every session's signaling
       # coordinates (#509). UNSET (the default) means none, so the browser
       # gathers host candidates only — correct for the LAN/VPN deployments this

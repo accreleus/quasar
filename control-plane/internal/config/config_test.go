@@ -929,3 +929,33 @@ func TestLoadEnrollPinsTakeOnlyADigest(t *testing.T) {
 		t.Fatalf("a tag must fail startup naming the variable, got %v", err)
 	}
 }
+
+func TestLoadHSTSMaxAge(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		want    int32
+		wantErr bool
+	}{
+		{"", 0, false},
+		{"0", 0, false},
+		{"86400", 86400, false},
+		{"-1", 0, true},
+		{"1y", 0, true},
+		{"1.5", 0, true},
+	} {
+		t.Run(tc.in, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://test")
+			t.Setenv("QUASAR_HSTS_MAX_AGE", tc.in)
+			c, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("QUASAR_HSTS_MAX_AGE=%q: want a config error", tc.in)
+				}
+				return
+			}
+			if err != nil || c.HSTSMaxAge != tc.want {
+				t.Fatalf("QUASAR_HSTS_MAX_AGE=%q -> %d, %v; want %d", tc.in, c.HSTSMaxAge, err, tc.want)
+			}
+		})
+	}
+}
