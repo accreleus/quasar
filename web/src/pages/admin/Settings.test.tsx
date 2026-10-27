@@ -5,7 +5,7 @@
 // caption (review), so they are located by their `id`, not by label text.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { Settings } from "./Settings";
 import { ToastProvider } from "../../components/Toast";
 import { ThemeProvider } from "../../settings/ThemeContext";
@@ -319,6 +319,58 @@ describe("Settings — Region and Input defaults", () => {
     await waitFor(() => expect(flip.checked).toBe(true));
     expect(raw.checked).toBe(true);
     expect(raw.disabled).toBe(false);
+  });
+
+  describe("one PATCH at a time across the whole page", () => {
+    // Each answer is the envelope as the server held it when it handled that write, and
+    // answers are delivered newest first: the order that lets a stale one land last.
+    let server: InstanceSettings;
+    let answers: (() => void)[];
+    beforeEach(() => {
+      server = settings();
+      answers = [];
+      mocked.updateSettings.mockImplementation((_t, body) => {
+        server = { ...server, ...body } as InstanceSettings;
+        const snapshot = settingsResponse(server);
+        return new Promise((resolve) => answers.push(() => resolve(snapshot)));
+      });
+    });
+    const settle = async () => {
+      for (let quiet = 0; quiet < 3; ) {
+        const answer = answers.pop();
+        if (answer) {
+          quiet = 0;
+          await act(async () => answer());
+        } else quiet++;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    };
+
+    it("a Region save and an Input save do not race: the layout is not reverted by the language answer", async () => {
+      renderPage();
+      fireEvent.change(await screen.findByLabelText("Default language"), { target: { value: "ja-JP" } });
+      fireEvent.change(screen.getByLabelText("Default keyboard layout"), { target: { value: "de" } });
+      await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledTimes(1));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(mocked.updateSettings).toHaveBeenCalledTimes(1);
+      await settle();
+      expect((screen.getByLabelText("Default keyboard layout") as HTMLSelectElement).value).toBe("de");
+      fireEvent.change(screen.getByLabelText("Default keyboard variant"), { target: { value: "dvorak" } });
+      await waitFor(() => expect(mocked.updateSettings).toHaveBeenLastCalledWith("tok", { default_keyboard: { layout: "de", variant: "dvorak" } }));
+    });
+
+    it("a page-level setting waits behind an inline save", async () => {
+      renderPage();
+      fireEvent.change(await screen.findByLabelText("Default language"), { target: { value: "ja-JP" } });
+      await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledTimes(1));
+      fireEvent.click(document.getElementById("mic-capture-enabled")!);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(mocked.updateSettings).toHaveBeenCalledTimes(1);
+      await settle();
+      expect(mocked.updateSettings).toHaveBeenCalledTimes(2);
+      expect(mocked.updateSettings).toHaveBeenLastCalledWith("tok", { mic_capture_enabled: true });
+      expect((screen.getByLabelText("Default language") as HTMLSelectElement).value).toBe("ja-JP");
+    });
   });
 
   it("keeps one row's error when another row saves", async () => {
