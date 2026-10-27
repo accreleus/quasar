@@ -206,6 +206,23 @@ reads as not published on every install. The first test publish (2026-10-27) was
 already readable anonymously, linked to this repository by the
 `org.opencontainers.image.source` annotation.
 
+**When a develop build refuses to move the preview.** Both checks fail closed on
+purpose; each case has one way out:
+
+- **develop was rewritten** (force-push): the tag names a commit that is no longer in
+  develop's history, so every later develop push stops at the gate ("was the branch
+  rewritten?"). Delete the `preview` tag in the `quasar-release-manifest` package's
+  versions. The next push to develop then reads "no preview is published yet", builds
+  every image and publishes a new `preview`.
+- **the package was deleted or cannot be read**: the gate's read fails on every develop
+  push. Dispatch Images on develop once with `preview` ticked: it recreates the package
+  under a test tag, and the next push to develop builds and publishes `preview`.
+- **an older run moved the tag** (the narrow window between the publish's read and its
+  write, or "Re-run failed jobs" on an older run whose promote moved `o2-develop`
+  back): re-run the newest develop run, or wait for the next landing; both move
+  `preview` and `o2-develop` forward again. Only the `preview` tag is refused when it
+  would go backwards; `o2-develop` is not.
+
 ## The release-time check
 
 `scripts/release/check-release-compatibility.sh` is ADR 0008's "release-time
