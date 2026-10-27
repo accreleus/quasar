@@ -1388,9 +1388,10 @@ jobs:
   # writes the tag after the blobs, in one request), and re-running this job is
   # safe: the generator and the push are idempotent.
   #
-  # The package is created by this job's first push and starts PRIVATE; a human
-  # makes it public once (scripts/release/platform-release-manifest.md, "The preview
-  # manifest"). Until then an install reads the tag as not published.
+  # The package is created by this job's first push. It must be PUBLIC (an install
+  # reads it anonymously); a human checks that once after the first push and changes
+  # it if not (scripts/release/platform-release-manifest.md, "The preview manifest").
+  # A private package reads as not published.
   #
   # `commits` is not written yet (#843).
   preview:

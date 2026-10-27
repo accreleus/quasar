@@ -191,9 +191,12 @@ A run that builds no image publishes no new preview, so the tag stays on the las
 build. A dispatch with `preview` ticked publishes to a test tag,
 `preview-<branch>`, never `preview`.
 
-**Once, after the first push:** GHCR creates the `quasar-release-manifest` package
-private. An org owner makes it public (the package's settings ▸ Change visibility);
-until then every install reads the preview tag as not published.
+**Once, after the first push:** the `quasar-release-manifest` package must be
+public, because installs read it anonymously. An org owner checks its visibility
+(the package's settings) and changes it to public if it is not. A private package
+reads as not published on every install. The first test publish (2026-10-27) was
+already readable anonymously, linked to this repository by the
+`org.opencontainers.image.source` annotation.
 
 ## The release-time check
 
