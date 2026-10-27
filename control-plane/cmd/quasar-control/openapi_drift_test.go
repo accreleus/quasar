@@ -247,6 +247,15 @@ var allowedUnimplemented = map[string]struct{}{
 	"GET /v1/sessions/{}/events": {}, // parked session-events SSE amendment
 }
 
+// pendingImplementation lists operations the pinned spec documents before the
+// server serves them (the spec carries no x-unimplemented marker for these).
+// Remove each entry in the change that registers the route; a registered entry
+// fails the test so none outlives its handler.
+var pendingImplementation = map[string]string{
+	"GET /v1/me/region-input":   "#846",
+	"PATCH /v1/me/region-input": "#846",
+}
+
 // unimplementedOperation reports whether an OpenAPI operation carries
 // `x-unimplemented: true` — a documented shape the server does not yet serve.
 func unimplementedOperation(t *testing.T, op yaml.Node) bool {
@@ -298,7 +307,15 @@ func TestOpenAPIDrift(t *testing.T) {
 			missingFromSpec = append(missingFromSpec, r)
 		}
 	}
+	for r, issue := range pendingImplementation {
+		if _, ok := registered[r]; ok {
+			t.Errorf("%s is registered; remove it from pendingImplementation (%s)", r, issue)
+		}
+	}
 	for r := range documented {
+		if _, pending := pendingImplementation[r]; pending {
+			continue
+		}
 		if _, ok := registered[r]; !ok {
 			extraInSpec = append(extraInSpec, r)
 		}
