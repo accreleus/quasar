@@ -585,6 +585,103 @@ fn an_in_place_swap_quits_the_game_waits_for_its_sync_and_launches_the_next() {
     end(session, &mut a);
 }
 
+/// #809: a swap to an app in another container (not the in-place quick switch) quits the
+/// running game and waits for Steam's exit sync before the outgoing container is stopped; the
+/// exit the quit makes the helper report is not read as the player quitting.
+#[test]
+fn a_container_swap_quits_the_running_game_and_waits_for_its_sync_before_stopping_it() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut a, mut helper) = running_620("swap-quit");
+    // No container for the incoming generation: the test source has no Wayland socket for an
+    // app container's compositor to announce, so a swap to one would only roll back at the
+    // compositor wait, before the stop under test.
+    session
+        .swap
+        .send(SwapRequest {
+            container: None,
+            in_place: false,
+        })
+        .unwrap();
+    assert_eq!(helper.command(&mut session, &mut a), "quit 620");
+    let resolved = |s: &Session| {
+        s.swapped
+            || s.log
+                .iter()
+                .any(|e| matches!(e, SessionEvent::SwapRolledBack(_)))
+    };
+    // The sync runs: the swap must not get past the container stop.
+    assert!(!session.pump(&mut a, Duration::from_millis(1500), |s, _| resolved(s)));
+    helper.launch_state("game_exited");
+    helper.say(
+        r#"{"type":"command_done","v":1,"command":"quit","appid":620,"ok":true,"cloud_synced":true}"#,
+    );
+    assert!(
+        session.pump(&mut a, Duration::from_secs(30), |s, _| resolved(s)),
+        "the swap never resolved after the sync"
+    );
+    session.pump(&mut a, Duration::from_millis(500), |_, _| false);
+    assert!(session.ended.is_none(), "ended: {:?}", session.ended);
+    assert!(!session
+        .log
+        .iter()
+        .any(|e| matches!(e, SessionEvent::StoppingWith(_) | SessionEvent::Held)));
+    end(session, &mut a);
+}
+
+/// #809: nothing is quit before the replacement's compositor is up, so a swap that rolls back
+/// there (this harness's test source never announces an app container's Wayland socket, so
+/// the wait times out) costs the running game nothing.
+#[test]
+fn a_container_swap_that_rolls_back_at_the_compositor_wait_quits_nothing() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut a, mut helper) = running_620("swap-rollback");
+    session
+        .swap
+        .send(SwapRequest {
+            container: Some(app("-applaunch 730")),
+            in_place: false,
+        })
+        .unwrap();
+    let no_command = |helper: &mut FakeHelper| {
+        let mut line = String::new();
+        !matches!(helper.reader.read_line(&mut line), Ok(n) if n > 0)
+    };
+    // The compositor wait is under way; a quit sent now would reach the helper at once.
+    session.pump(&mut a, Duration::from_secs(2), |_, _| false);
+    assert!(
+        no_command(&mut helper),
+        "a command reached the helper before the new compositor was up"
+    );
+    let rolled_back = session.pump(&mut a, Duration::from_secs(40), |s, _| {
+        s.log
+            .iter()
+            .any(|e| matches!(e, SessionEvent::SwapRolledBack(_)))
+    });
+    assert!(rolled_back, "the swap never rolled back");
+    assert!(
+        no_command(&mut helper),
+        "a command reached the helper in the rolled-back swap"
+    );
+    assert!(!session.swapped);
+    let video = rtp(&a.video);
+    session.pump(&mut a, Duration::from_secs(1), |_, _| false);
+    assert!(
+        rtp(&a.video) > video,
+        "the stream stopped after the rollback"
+    );
+    assert!(session.ended.is_none(), "ended: {:?}", session.ended);
+    // The game still runs, so the session's own end is the first thing to quit it.
+    session.stop.store(true, Ordering::SeqCst);
+    assert_eq!(helper.command(&mut session, &mut a), "quit 620");
+    synced_then_ended(session, &mut a, &helper, None);
+}
+
 #[test]
 fn an_in_place_swap_whose_next_game_cannot_launch_ends_the_session() {
     if !live_webrtc_available() {
