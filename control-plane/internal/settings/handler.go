@@ -99,6 +99,9 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		// read SELECTS, and "check now" stays the jobs run-now action.
 		ReleaseChannel    *string `json:"release_channel"`
 		ReleaseEdgeBranch *string `json:"release_edge_branch"`
+		// "daily" | "weekly" | null; absent leaves it alone, null follows the
+		// channel again, so the raw message tells the two apart.
+		ReleaseCheck json.RawMessage `json:"release_check"`
 		// "" clears the URL; every other value must pass
 		// ValidReleaseWebhookURL (#123).
 		ReleaseWebhookEnabled *bool   `json:"release_webhook_enabled"`
@@ -172,6 +175,16 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 			"release_channel must be stable, beta, edge, or preview")
 		return
 	}
+	var releaseCheck *string
+	if len(req.ReleaseCheck) > 0 && string(req.ReleaseCheck) != "null" {
+		var v string
+		if json.Unmarshal(req.ReleaseCheck, &v) != nil || !ValidReleaseCheck(v) {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+				"release_check must be daily, weekly, or null")
+			return
+		}
+		releaseCheck = &v
+	}
 	if req.ReleaseEdgeBranch != nil && !ValidReleaseEdgeBranch(*req.ReleaseEdgeBranch) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
 			"release_edge_branch must be a git ref name: 1-255 characters, no whitespace, no \"..\", no leading \"-\"")
@@ -218,6 +231,8 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		ImageUpdatePolicy:                 req.ImageUpdatePolicy,
 		ReleaseChannel:                    req.ReleaseChannel,
 		ReleaseEdgeBranch:                 req.ReleaseEdgeBranch,
+		ReleaseCheckSet:                   len(req.ReleaseCheck) > 0,
+		ReleaseCheck:                      releaseCheck,
 		ReleaseWebhookEnabled:             req.ReleaseWebhookEnabled,
 		ReleaseWebhookURL:                 req.ReleaseWebhookURL,
 		PlatformAutoApply:                 req.PlatformAutoApply,

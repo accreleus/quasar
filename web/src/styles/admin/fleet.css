@@ -533,6 +533,11 @@
   gap: var(--s4);
 }
 
+/* Five channels do not fit one row in the rail's width; the pill wraps. */
+.rel-channels .segmented {
+  flex-wrap: wrap;
+}
+
 .rel-update {
   display: flex;
   gap: var(--s6);

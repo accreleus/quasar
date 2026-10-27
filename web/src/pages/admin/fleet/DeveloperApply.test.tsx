@@ -104,6 +104,7 @@ beforeEach(() => {
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
   mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [] });
   mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
+  mocked.getSettings.mockResolvedValue({ settings: { release_check: null } } as never);
 });
 
 describe("Developer apply", () => {
