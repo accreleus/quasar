@@ -29,6 +29,7 @@ own; the two do not move together, and that is deliberate.
 - Pressing Play on a game tile launches it when the recommended quality only needs to step down from a codec the host lacks (for example AV1 on an AMD GPU), instead of opening the detail panel with "No host that can encode this quality is available" (#817).
 
 ### Security
+- **The control plane warns when a reverse proxy it does not trust talks to its plain HTTP port (#821).** A request carrying `X-Forwarded-*` from a peer outside `QUASAR_TRUSTED_PROXIES` logs `forwarded-from-unlisted-peer` with that peer's address, once per peer every 10 minutes. Nothing is refused. Name that proxy in `QUASAR_TRUSTED_PROXIES` before the release that refuses sign-in over plain HTTP (#604).
 - **The add-a-host page says to keep the agent address on `wss://` (#823).** Agent enrollment over `ws://` sends the enrollment token and receives the node secret in cleartext, and the page said nothing about it. No code or behaviour change.
 
 ### Internal
