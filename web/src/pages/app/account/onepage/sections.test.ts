@@ -15,6 +15,12 @@ describe("one-page account sections", () => {
     expect(sectionForPath("/app/account/appearance")).toBe("appearance");
   });
 
+  it("puts Region after Stream quality, on its own path", () => {
+    const ids = ONE_PAGE_SECTIONS.map((s) => s.id);
+    expect(ids.indexOf("region")).toBe(ids.indexOf("streaming") + 1);
+    expect(sectionForPath("/app/account/region")).toBe("region");
+  });
+
   it("the rail lights the profile row on the bare account path", () => {
     const profile = onePageRail()[0].items.find((i) => i.id === "profile");
     expect(profile?.match?.("/app/account")).toBe(true);

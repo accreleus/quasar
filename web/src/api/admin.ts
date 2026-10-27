@@ -204,6 +204,20 @@ export function updateSettings(
     steam_warm_rewarm?: SteamWarmRewarm;
     /** Rejected with 400 outside 1-60. */
     steam_warm_idle_minutes?: number;
+    /** An IANA zone; Region and Input defaults (amendment 49). */
+    default_timezone?: string;
+    /** `xx-XX`, e.g. de-DE. */
+    default_language?: string;
+    /** As the language; `null` follows the language again. */
+    default_region_format?: string | null;
+    /** xkeyboard-config names; both keys are always sent ("" = the basic variant). */
+    default_keyboard?: { layout: string; variant: string };
+    default_match_cursor?: "auto" | "on" | "off";
+    /** 0.25 to 4. */
+    default_mouse_sensitivity?: number;
+    default_raw_mouse?: boolean;
+    default_flip_scroll?: boolean;
+    default_nintendo_layout?: boolean;
   },
 ): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>("/admin/settings", {

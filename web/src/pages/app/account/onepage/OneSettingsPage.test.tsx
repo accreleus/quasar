@@ -29,6 +29,7 @@ vi.mock("../../../../api/library", () => ({
   updateProfilePreferences: api.updateProfilePreferences,
 }));
 vi.mock("../../../../api/storage", () => ({ getMyStorage: api.getMyStorage }));
+vi.mock("./RegionSection", () => ({ RegionSection: () => <p>region stub</p> }));
 vi.mock("../AccountOverlay", () => ({ AccountOverlay: () => <p>overlay stub</p> }));
 vi.mock("../AccountAppearance", () => ({ AccountAppearance: () => <p>appearance stub</p> }));
 vi.mock("../AccountSessions", () => ({ AccountSessions: () => <p>sessions stub</p> }));
