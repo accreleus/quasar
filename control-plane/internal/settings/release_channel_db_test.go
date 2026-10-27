@@ -4,8 +4,10 @@
 package settings
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReleaseChannelDefaultsToStableOnDevelop(t *testing.T) {
@@ -80,12 +82,91 @@ func TestPatchReleaseChannelBeta(t *testing.T) {
 	}
 }
 
+// Preview (amendment 48) is a fourth value the migration-0107 CHECK must accept;
+// the branch it never uses survives, and a switch away and back round-trips.
+func TestPatchReleaseChannelPreview(t *testing.T) {
+	pool := testDB(t)
+	patch, get := newSettingsHarness(t, pool)
+
+	if code, _ := patch(t, `{"release_edge_branch":"feat/x"}`); code != 200 {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	for _, channel := range []string{ReleaseChannelPreview, ReleaseChannelEdge, ReleaseChannelPreview, ReleaseChannelStable} {
+		code, env := patch(t, `{"release_channel":"`+channel+`"}`)
+		if code != 200 {
+			t.Fatalf("switch to %s: status = %d, want 200", channel, code)
+		}
+		if env.Settings.ReleaseChannel != channel || env.Settings.ReleaseEdgeBranch != "feat/x" {
+			t.Fatalf("settings = %+v, want %s / feat/x", env.Settings, channel)
+		}
+		if got := get(t).Settings.ReleaseChannel; got != channel {
+			t.Fatalf("the switch to %s did not persist: %s", channel, got)
+		}
+	}
+}
+
+// release_check NULL follows the channel; a stored value wins over it, and a
+// channel switch never changes the stored value.
+func TestReleaseCheckPeriodFollowsTheChannel(t *testing.T) {
+	pool := testDB(t)
+	patch, _ := newSettingsHarness(t, pool)
+	store := NewStore(pool)
+	ctx := context.Background()
+	const day, week = 24 * time.Hour, 7 * 24 * time.Hour
+
+	cases := []struct {
+		channel string
+		check   *string
+		want    time.Duration
+	}{
+		{ReleaseChannelStable, nil, week},
+		{ReleaseChannelBeta, nil, week},
+		{ReleaseChannelEdge, nil, week},
+		{ReleaseChannelPreview, nil, day},
+		{ReleaseChannelPreview, strPtr(ReleaseCheckWeekly), week},
+		{ReleaseChannelStable, strPtr(ReleaseCheckDaily), day},
+	}
+	for _, c := range cases {
+		if _, err := pool.Exec(ctx, `UPDATE instance_settings SET release_check = $1`, c.check); err != nil {
+			t.Fatalf("set release_check: %v", err)
+		}
+		if code, _ := patch(t, `{"release_channel":"`+c.channel+`"}`); code != 200 {
+			t.Fatalf("switch to %s: %d", c.channel, code)
+		}
+		got, err := store.ReleaseCheckPeriod(ctx)
+		if err != nil {
+			t.Fatalf("read period: %v", err)
+		}
+		if got != c.want {
+			t.Errorf("%s with release_check %v: period %v, want %v", c.channel, deref(c.check), got, c.want)
+		}
+		st, _ := store.Get(ctx)
+		if deref(st.ReleaseCheck) != deref(c.check) {
+			t.Errorf("the switch to %s changed release_check to %v", c.channel, deref(st.ReleaseCheck))
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE instance_settings SET release_check = 'hourly'`); err == nil {
+		t.Error("the release_check CHECK accepted 'hourly'")
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+func deref(s *string) string {
+	if s == nil {
+		return "<null>"
+	}
+	return *s
+}
+
 func TestPatchReleaseValidationFailures(t *testing.T) {
 	pool := testDB(t)
 	patch, get := newSettingsHarness(t, pool)
 
 	bad := []string{
 		`{"release_channel":"nightly"}`,
+		`{"release_channel":"Preview"}`,
+		`{"release_channel":"preview "}`,
 		`{"release_edge_branch":""}`,
 		`{"release_edge_branch":"has space"}`,
 		`{"release_edge_branch":"a..b"}`,

@@ -119,6 +119,9 @@ type Settings struct {
 	// cannot express a git ref name — and is never cleared by a channel switch.
 	ReleaseChannel    string `json:"release_channel"`
 	ReleaseEdgeBranch string `json:"release_edge_branch"`
+	// How often release detection runs; nil follows the channel (ReleaseCheckPeriod).
+	// Not on the envelope yet: the API field is #842.
+	ReleaseCheck *string `json:"-"`
 
 	// Where a detected platform release is announced outside the console
 	// (migration 0080, #123). The URL is operator-supplied and https-only; the
@@ -180,9 +183,10 @@ func ValidLibraryDiscoveryIntervalMinutes(n int) bool {
 // Platform-release channel + edge branch (schema.md instance_settings,
 // migration 0074; semantics: control-api.md §Platform releases).
 const (
-	ReleaseChannelStable = "stable"
-	ReleaseChannelEdge   = "edge"
-	ReleaseChannelBeta   = "beta"
+	ReleaseChannelStable  = "stable"
+	ReleaseChannelEdge    = "edge"
+	ReleaseChannelBeta    = "beta"
+	ReleaseChannelPreview = "preview"
 
 	DefaultReleaseEdgeBranch = "develop"
 
@@ -193,7 +197,27 @@ const (
 // ValidReleaseChannel mirrors the instance_settings CHECK so the PATCH handler
 // answers 400 validation_failed instead of a database error.
 func ValidReleaseChannel(c string) bool {
-	return c == ReleaseChannelStable || c == ReleaseChannelEdge || c == ReleaseChannelBeta
+	return c == ReleaseChannelStable || c == ReleaseChannelEdge || c == ReleaseChannelBeta ||
+		c == ReleaseChannelPreview
+}
+
+// release_check values (schema.md instance_settings, migration 0107).
+const (
+	ReleaseCheckDaily  = "daily"
+	ReleaseCheckWeekly = "weekly"
+)
+
+// ReleaseCheckPeriod is platform.release_detect's period: release_check, or when
+// it is NULL the channel's default, daily on preview and weekly otherwise.
+func ReleaseCheckPeriod(check *string, channel string) time.Duration {
+	daily := channel == ReleaseChannelPreview
+	if check != nil {
+		daily = *check == ReleaseCheckDaily
+	}
+	if daily {
+		return 24 * time.Hour
+	}
+	return 7 * 24 * time.Hour
 }
 
 // The column is TEXT with no CHECK; this is the contract's bound.
@@ -428,6 +452,15 @@ func (s *Store) ReleaseChannel(ctx context.Context) (channel, edgeBranch string,
 	return st.ReleaseChannel, st.ReleaseEdgeBranch, nil
 }
 
+// ReleaseCheckPeriod is the detection job's period, read at every scheduling decision.
+func (s *Store) ReleaseCheckPeriod(ctx context.Context) (time.Duration, error) {
+	st, err := s.Get(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return ReleaseCheckPeriod(st.ReleaseCheck, st.ReleaseChannel), nil
+}
+
 // ReleaseWebhook is the notifier's per-pass read (#123): never cached at boot,
 // so disabling it stops delivery with no restart. A read error reports disabled
 // alongside the error, so a caller that ignores it still fails closed.
@@ -456,7 +489,7 @@ func (s *Store) PlatformAutoApply(ctx context.Context) (bool, error) {
 const settingsColumns = `registration_mode, storage_provider, library_discovery_enabled,
 	library_discovery_interval_minutes, library_discovery_appdetails_enabled,
 	mic_capture_enabled, image_update_policy, allowed_origins,
-	release_channel, release_edge_branch,
+	release_channel, release_edge_branch, release_check,
 	release_webhook_enabled, release_webhook_url, platform_auto_apply,
 	steam_preparation_enabled, steam_preparation_revision::text,
 	steam_warm_enabled, steam_warm_rewarm, steam_warm_idle_minutes,
@@ -470,7 +503,7 @@ func scanSettings(row scanner) (Settings, error) {
 	dest := []any{&st.RegistrationMode, &st.StorageProvider, &st.LibraryDiscoveryEnabled,
 		&st.LibraryDiscoveryIntervalMinutes, &st.LibraryDiscoveryAppDetailsEnabled,
 		&st.MicCaptureEnabled, &st.ImageUpdatePolicy, &st.AllowedOrigins,
-		&st.ReleaseChannel, &st.ReleaseEdgeBranch,
+		&st.ReleaseChannel, &st.ReleaseEdgeBranch, &st.ReleaseCheck,
 		&st.ReleaseWebhookEnabled, &st.ReleaseWebhookURL, &st.PlatformAutoApply,
 		&st.SteamPreparationEnabled, &st.SteamPreparationRevision,
 		&st.SteamWarmEnabled, &st.SteamWarmRewarm, &st.SteamWarmIdleMinutes}

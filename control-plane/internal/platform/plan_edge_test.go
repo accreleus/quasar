@@ -129,6 +129,8 @@ func TestOlderEdgeBuildIsListedButCannotBeApplied(t *testing.T) {
 		{"equal timestamps", ChannelEdge, 76, at(2), str(at(2).Format(time.RFC3339)), false},
 		{"newer schema takes precedence", ChannelEdge, 77, at(1), str(at(2).Format(time.RFC3339)), false},
 		{"stable unchanged", ChannelStable, 76, at(1), str(at(2).Format(time.RFC3339)), false},
+		{"older preview", ChannelPreview, 76, at(1), str(at(2).Format(time.RFC3339)), true},
+		{"newer preview", ChannelPreview, 76, at(3), str(at(2).Format(time.RFC3339)), false},
 		{"missing installed time", ChannelEdge, 76, at(1), nil, false},
 		{"invalid installed time", ChannelEdge, 76, at(1), str("invalid"), false},
 		{"missing candidate time", ChannelEdge, 76, time.Time{}, str(at(2).Format(time.RFC3339)), false},

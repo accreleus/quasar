@@ -253,6 +253,10 @@ func (d *Dispatcher) materializeDue(ctx context.Context) {
 			continue
 		}
 
+		if def.DailyOpensEveryDay && def.IntervalSource != nil && lockedBy == def.IntervalOwner && interval <= 24*time.Hour {
+			j.Schedule.WindowDays = nil
+		}
+
 		targets := []string{""}
 		if j.Scope == ScopeHost {
 			if hosts == nil {

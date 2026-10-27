@@ -22,14 +22,23 @@ const (
 	// no rows of its own: detection already caches every published release,
 	// prerelease or not, as a `stable` row carrying its `prerelease` flag, and
 	// stable declines to list the flagged ones. `platform_releases.channel`
-	// therefore stays CHECK IN ('stable','edge'), and switching to or from beta
+	// therefore has no 'beta', and switching to or from beta
 	// re-detects and writes nothing.
 	ChannelBeta = "beta"
+
+	// Preview offers every build of develop, read from the preview manifest
+	// (amendment 48); every edge rule holds for it (branchChannel).
+	ChannelPreview = "preview"
 )
 
-// ValidChannel reports whether c is one of the three channels.
+// ValidChannel reports whether c is one of the four channels.
 func ValidChannel(c string) bool {
-	return c == ChannelStable || c == ChannelEdge || c == ChannelBeta
+	return c == ChannelStable || c == ChannelEdge || c == ChannelBeta || c == ChannelPreview
+}
+
+// branchChannel: a row of a channel whose builds are commits, not versions.
+func branchChannel(c string) bool {
+	return c == ChannelEdge || c == ChannelPreview
 }
 
 // rowChannel maps a channel to the `platform_releases.channel` value whose rows
