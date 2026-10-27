@@ -44,17 +44,23 @@ export function InputSection() {
   });
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
 
-  const save = async (patch: Partial<Input>, saved: string = SAVED) => {
-    setStatus(null);
-    try {
-      await res.mutate(
-        ({ token }) => patchRegionInput(token, { input: patch }),
-        (_, r) => r,
-      );
-      setStatus({ ok: true, text: saved });
-    } catch (e) {
-      setStatus({ ok: false, text: e instanceof ApiError ? e.message : "Could not save your input settings." });
-    }
+  // One PATCH at a time: each response carries the whole resource, so a late one from an earlier save would revert a later field.
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const save = (patch: Partial<Input>, saved: string = SAVED): Promise<void> => {
+    const run = queue.current.then(async () => {
+      setStatus(null);
+      try {
+        await res.mutate(
+          ({ token }) => patchRegionInput(token, { input: patch }),
+          (_, r) => r,
+        );
+        setStatus({ ok: true, text: saved });
+      } catch (e) {
+        setStatus({ ok: false, text: e instanceof ApiError ? e.message : "Could not save your input settings." });
+      }
+    });
+    queue.current = run;
+    return run;
   };
 
   const data = res.data;

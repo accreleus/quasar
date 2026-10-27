@@ -105,6 +105,32 @@ describe("mouse speed in setupCapture", () => {
     cap.cleanup();
   });
 
+  it("follows a stream-size change (an ABR step): the video resize event", () => {
+    const el = video(1920, 960);
+    const { cap, sent } = start(el, MATCH);
+    Object.defineProperty(el, "videoWidth", { value: 960, configurable: true });
+    Object.defineProperty(el, "videoHeight", { value: 540, configurable: true });
+    el.dispatchEvent(new Event("resize"));
+    move(5);
+    expect(sent).toEqual([{ dx: 5, dy: 0 }]);
+    cap.cleanup();
+  });
+
+  it("follows a scaling-mode change, which keeps the box the same size", async () => {
+    // 1920x1080 in a 1440x900 box: contain draws at 0.75, cover at 0.8333.
+    const el = video(1920, 1440, 1080, 900);
+    const { cap, sent } = start(el, MATCH);
+    move(100);
+    el.dataset.scalingMode = "cover";
+    await new Promise((r) => setTimeout(r));
+    move(100);
+    el.dataset.scalingMode = "stretch";
+    await new Promise((r) => setTimeout(r));
+    move(100, 100);
+    expect(sent).toEqual([{ dx: 133, dy: 0 }, { dx: 120, dy: 0 }, { dx: 133, dy: 120 }]);
+    cap.cleanup();
+  });
+
   it("setMouse changes the speed of the running capture", () => {
     const { cap, sent } = start(video(1920, 960), { match: false, sensitivity: 1 });
     cap.setMouse(MATCH);

@@ -41,7 +41,7 @@ export interface ShownGeometry {
   /** The video element's box in CSS pixels. */
   boxW: number;
   boxH: number;
-  /** The session view's scaling mode (`data-scaling-mode`): contain, cover or fill. */
+  /** The session view's scaling mode (`data-scaling-mode`): contain, cover or stretch; `integer` draws as contain. */
   fit?: string;
 }
 

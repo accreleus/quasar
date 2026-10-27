@@ -52,6 +52,12 @@ describe("mouseGain", () => {
     expect(streamPerShown({ ...stream, boxW: 960, boxH: 1080, fit: "stretch" })).toEqual([2, 1]);
   });
 
+  it("integer scaling is drawn as contain", () => {
+    expect(streamPerShown({ ...stream, boxW: 960, boxH: 800, fit: "integer" })).toEqual(
+      streamPerShown({ ...stream, boxW: 960, boxH: 800, fit: "contain" }),
+    );
+  });
+
   it("matching off leaves only the sensitivity", () => {
     expect(mouseGain({ match: false, sensitivity: 1.5 }, { ...stream, boxW: 960, boxH: 540 })).toEqual([1.5, 1.5]);
   });

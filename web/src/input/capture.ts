@@ -293,6 +293,10 @@ export function setupCapture({
     videoEl.addEventListener("resize", updateGain);
     videoEl.addEventListener("loadedmetadata", updateGain);
   }
+  // The HUD's scaling mode is CSS only (object-fit): the box keeps its size, so nothing above fires.
+  const modeObserver =
+    videoEl instanceof Node && typeof MutationObserver === "function" ? new MutationObserver(updateGain) : null;
+  modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode"] });
 
   // Gamepad state for delta-only sends.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
@@ -957,6 +961,7 @@ export function setupCapture({
     document.removeEventListener("keydown", onKeyDown);
     document.removeEventListener("keyup", onKeyUp);
     sizeObserver?.disconnect();
+    modeObserver?.disconnect();
     if (canWatchSize) {
       videoEl.removeEventListener("resize", updateGain);
       videoEl.removeEventListener("loadedmetadata", updateGain);

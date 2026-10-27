@@ -117,3 +117,30 @@ describe("Input section: sensitivity", () => {
     expect(screen.getByLabelText("Sensitivity")).toBeDisabled();
   });
 });
+
+describe("Input section: saves", () => {
+  it("one PATCH at a time, so a late response cannot revert the other field", async () => {
+    // A server that merges each PATCH when it arrives and answers with the resource as it was then.
+    let server: Record<string, unknown> = {};
+    const replies: (() => void)[] = [];
+    patchRegionInput.mockImplementation((_t: string, p: { input: object }) => {
+      server = { ...server, ...p.input };
+      const snapshot = { ...server };
+      return new Promise((resolve) => replies.push(() => resolve(body(snapshot))));
+    });
+    render(<InputSection />);
+    const tab = await screen.findByRole("tab", { name: "Always on" });
+    await waitFor(() => expect(tab).toBeEnabled());
+    fireEvent.click(tab);
+    fireEvent.change(await slider(), { target: { value: "1" } });
+    await new Promise((r) => setTimeout(r, 700));
+    // Answer newest first: the first PATCH, if it is still out, then resolves last.
+    for (let i = 0; i < 5; i++) {
+      while (replies.length) replies.pop()?.();
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await waitFor(() => expect(patchRegionInput).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByLabelText("Sensitivity")).toHaveAttribute("aria-valuetext", "2×"));
+    expect(selected()).toBe("Always on");
+  });
+});

@@ -47,6 +47,7 @@
 .rg-range input[type="range"]:focus-visible::-moz-range-thumb { border-color: var(--accent); box-shadow: var(--glow-accent); }
 .rg-val { flex: none; min-width: 52px; line-height: 44px; text-align: right; font-family: var(--font-mono); font-size: var(--t-sm); color: var(--text); }
 /* Three labels: the middle one is centred on the track, so it sits under the thumb at the midpoint. */
-.rg-ticks { display: grid; grid-template-columns: 1fr auto 1fr; margin-top: calc(-1 * var(--s2)); color: var(--text-3); font-family: var(--font-mono); font-size: var(--t-xs); }
+.rg-ticks { display: grid; grid-template-columns: 1fr auto 1fr; margin-top: calc(-1 * var(--s2)); color: var(--text-4); font-family: var(--font-mono); font-size: var(--t-xs); }
 .rg-ticks span:first-child { justify-self: start; }
 .rg-ticks span:last-child { justify-self: end; }
+.rg-ticks span:nth-child(2) { color: var(--text-3); }
