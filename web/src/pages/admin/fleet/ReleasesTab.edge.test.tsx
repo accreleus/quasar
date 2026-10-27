@@ -80,6 +80,7 @@ beforeEach(() => {
   mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [] });
   // The head's "next check" fragment reads the detection job's schedule.
   mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
+  mocked.getSettings.mockResolvedValue({ settings: { release_check: null } } as never);
 });
 
 describe("ReleasesTab on edge", () => {
@@ -95,8 +96,8 @@ describe("ReleasesTab on edge", () => {
     expect(screen.queryByRole("button", { name: /apply update/i })).not.toBeInTheDocument();
   });
 
-  it("shows the commit and the compare link in place of a version and notes", async () => {
-    mocked.getPlatformReleases.mockResolvedValue(edgeView());
+  it.each(["edge", "preview"] as const)("shows the commit and the compare link in place of a version and notes on %s", async (channel) => {
+    mocked.getPlatformReleases.mockResolvedValue(edgeView({ channel }));
     const { container } = renderTab();
 
     // The card's title IS the commit, and so is the commit line beside it.

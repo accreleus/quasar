@@ -197,4 +197,55 @@ func TestReleaseKeysAreAudited(t *testing.T) {
 	if p.Empty() {
 		t.Fatal("a patch naming only the release keys must not read as empty")
 	}
+	// An explicit null (Set with no value) is a change, and is audited by name.
+	null := Patch{ReleaseCheckSet: true}
+	if null.Empty() || strings.Join(null.ChangedKeys(), ",") != "release_check" {
+		t.Fatalf("a null release_check: empty=%v keys=%v", null.Empty(), null.ChangedKeys())
+	}
+}
+
+// release_check (amendment 48): absent leaves it alone, null follows the channel
+// again, "daily"/"weekly" store, anything else is 400, and a channel switch
+// never touches it. Every change is audited under instance.settings.updated.
+func TestPatchReleaseCheck(t *testing.T) {
+	pool := testDB(t)
+	patch, get := newSettingsHarness(t, pool)
+
+	if st := get(t).Settings; st.ReleaseCheck != nil {
+		t.Fatalf("release_check = %v on a fresh instance, want null", *st.ReleaseCheck)
+	}
+	code, env := patch(t, `{"release_check":"weekly"}`)
+	if code != 200 || deref(env.Settings.ReleaseCheck) != ReleaseCheckWeekly {
+		t.Fatalf("set weekly: %d %v", code, deref(env.Settings.ReleaseCheck))
+	}
+
+	// Absent is unchanged, and so is a channel switch to the channel whose
+	// default is the other period.
+	for _, body := range []string{`{"registration_mode":"open"}`, `{"release_channel":"preview"}`} {
+		if code, env = patch(t, body); code != 200 || deref(env.Settings.ReleaseCheck) != ReleaseCheckWeekly {
+			t.Fatalf("%s changed release_check: %d %v", body, code, deref(env.Settings.ReleaseCheck))
+		}
+	}
+	if period, err := NewStore(pool).ReleaseCheckPeriod(context.Background()); err != nil || period != 7*24*time.Hour {
+		t.Fatalf("weekly on preview: period %v, %v", period, err)
+	}
+
+	// Explicit null follows the channel again: daily on preview.
+	if code, env = patch(t, `{"release_check":null}`); code != 200 || env.Settings.ReleaseCheck != nil {
+		t.Fatalf("explicit null: %d %v", code, deref(env.Settings.ReleaseCheck))
+	}
+	if period, _ := NewStore(pool).ReleaseCheckPeriod(context.Background()); period != 24*time.Hour {
+		t.Fatalf("null on preview: period %v, want a day", period)
+	}
+
+	// A bad value is refused whole: nothing else in the body applies.
+	for _, bad := range []string{`"hourly"`, `"Daily"`, `""`, `7`, `true`} {
+		code, _ := patch(t, `{"release_check":`+bad+`,"registration_mode":"closed"}`)
+		if code != 400 {
+			t.Errorf("release_check %s: status %d, want 400", bad, code)
+		}
+	}
+	if st := get(t).Settings; st.RegistrationMode == "closed" || st.ReleaseCheck != nil {
+		t.Fatalf("a refused PATCH applied part of its body: %+v", st)
+	}
 }

@@ -17,6 +17,8 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import * as adminApi from "../../../api/admin";
 import type {
+  InstanceSettings,
+  Job,
   JobsResponse,
   PlatformApplyAttempt,
   PlatformApplyAttemptsResponse,
@@ -25,6 +27,7 @@ import type {
   PlatformReleaseTarget,
   PlatformReleaseView,
   ReleaseChannel,
+  SettingsResponse,
 } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { Bar } from "../../../components/Bar";
@@ -95,8 +98,19 @@ const DETECT_JOB_ID = "platform.release_detect";
 const CHANNEL_OPTIONS: { value: ReleaseChannel; label: string }[] = [
   { value: "stable", label: "Stable" },
   { value: "beta", label: "Beta" },
-  { value: "edge", label: "Edge" },
+  { value: "preview", label: "Preview" },
+  { value: "edge", label: "Edge (test builds)" },
 ];
+
+type ReleaseCheck = NonNullable<InstanceSettings["release_check"]>;
+const CHECK_OPTIONS: { value: ReleaseCheck; label: string }[] = [
+  { value: "daily", label: "Daily" },
+  { value: "weekly", label: "Weekly" },
+];
+const DAY_SECS = 86400;
+/** The setting that owns the detection period (amendment 48); a job locked by
+ *  anything else is under an environment override the choice cannot beat. */
+const CHECK_OWNER = "instance_settings.release_check";
 
 function when(iso: string | null | undefined): string {
   return iso ? relativeTime(iso) : "—";
@@ -116,17 +130,16 @@ function nextCheckLabel(iso: string): string | null {
   return `${day} ${time} UTC`;
 }
 
-/** The head's "next check" fragment, or null. Read from the jobs list because
- *  the release view carries no schedule; a failed or empty read simply omits
- *  the fragment rather than inventing a cadence. */
-function useNextCheck(): string | null {
+/** The detection job, read from the jobs list because the release view carries
+ *  no schedule: it feeds the head's "next check" fragment and the check
+ *  choice's effective value. A failed or empty read yields no job and each
+ *  caller omits its part rather than inventing a cadence. */
+function useDetectJob() {
   const res = useResource<JobsResponse>({
     label: "jobs",
     fetch: ({ token, signal }) => adminApi.listJobs(token, signal),
   });
-  const job = res.data?.items?.find((j) => j.id === DETECT_JOB_ID);
-  if (!job?.enabled || !job.next_run_at) return null;
-  return nextCheckLabel(job.next_run_at);
+  return { job: res.data?.items?.find((j) => j.id === DETECT_JOB_ID), refresh: res.refresh };
 }
 
 function gh(repo: string, path: string): string | null {
@@ -162,7 +175,8 @@ export function ReleasesTab() {
     pollMs: (view) => (view.active_apply ? 3000 : undefined),
   });
   const view = res.data;
-  const nextCheck = useNextCheck();
+  const { job, refresh: refreshJob } = useDetectJob();
+  const nextCheck = job?.enabled && job.next_run_at ? nextCheckLabel(job.next_run_at) : null;
   // Bumped on every apply, so the history reloads without polling it too.
   const [applied, setApplied] = useState(0);
   // The apply history, read once here: the rail lists it, and the banner reads its newest
@@ -272,7 +286,14 @@ export function ReleasesTab() {
                   void res.refresh();
                 }}
               />
-              <ChannelCard view={view} onSaved={() => void res.refresh()} />
+              <ChannelCard
+                view={view}
+                job={job}
+                onSaved={() => {
+                  void res.refresh();
+                  void refreshJob();
+                }}
+              />
               <NotificationsCard view={view} onSaved={() => void res.refresh()} />
               <RailCard title="Apply history">
                 <ApplyHistory
@@ -467,9 +488,10 @@ function ReleaseCard({
   older: boolean;
   installed: boolean;
 }) {
-  // An edge build has no version and no notes: the title IS the commit, and the
-  // compare link stands in for the notes (control-api.md §Platform releases).
-  const edge = release.channel === "edge";
+  // An edge or preview build has no version and no notes: the title IS the
+  // commit, and the compare link stands in for the notes (control-api.md
+  // §Platform releases, amendment 48).
+  const edge = release.channel === "edge" || release.channel === "preview";
   const { entries, counts } = parseReleaseNotes(release.notes, repo);
   const countsLine = releaseCountsLine(counts);
   const commitUrl = gh(repo, `commit/${release.source_commit}`);
@@ -652,20 +674,44 @@ export function InstalledCard({
   );
 }
 
-function ChannelCard({ view, onSaved }: { view: PlatformReleaseView; onSaved: () => void }) {
+function ChannelCard({
+  view,
+  job,
+  onSaved,
+}: {
+  view: PlatformReleaseView;
+  job: Job | undefined;
+  onSaved: () => void;
+}) {
   const { token } = useAuth();
   // A draft, so a half-typed branch is never a save.
   const [draft, setDraft] = useState<string | null>(null);
   const branch = draft ?? view.edge_branch;
+  // The stored choice: null follows the channel. The job's interval is what
+  // detection actually runs on, so it is what the control shows.
+  const stored = useResource<SettingsResponse>({
+    label: "release check",
+    fetch: ({ token: t, signal }) => adminApi.getSettings(t, signal),
+  });
+  const picked = stored.data?.settings?.release_check ?? null;
+  const secs = job?.schedule.interval_secs;
+  const check: ReleaseCheck | null =
+    secs == null ? picked : secs === DAY_SECS ? "daily" : secs === 7 * DAY_SECS ? "weekly" : null;
+  const lockedBy = job?.schedule.locked ? job.schedule.locked_by : null;
+  const envLocked = lockedBy != null && lockedBy !== CHECK_OWNER;
 
   const save = useAdminAction(
-    async (patch: { release_channel?: ReleaseChannel; release_edge_branch?: string }) =>
-      adminApi.updateSettings(token ?? "", patch),
+    async (patch: {
+      release_channel?: ReleaseChannel;
+      release_edge_branch?: string;
+      release_check?: ReleaseCheck | null;
+    }) => adminApi.updateSettings(token ?? "", patch),
     {
       success: "Release settings saved.",
       failure: "Could not save the release settings.",
       onSuccess: () => {
         setDraft(null);
+        void stored.refresh();
         onSaved();
       },
     },
@@ -682,9 +728,9 @@ function ChannelCard({ view, onSaved }: { view: PlatformReleaseView; onSaved: ()
         onChange={(value) => void save.run({ release_channel: value })}
       />
       <p className="hint mt2">
-        Stable follows tagged releases with notes; beta adds the pre-releases among them; edge
-        follows a branch. Switching changes what is listed, never what is installed, and never
-        starts a check.
+        Stable follows tagged releases with notes; beta adds the pre-releases among them; preview
+        offers every build of develop; edge follows a branch. Switching changes what is listed,
+        never what is installed, and never starts a check.
       </p>
       {view.channel === "beta" && (
         <p className="hint mt2">
@@ -692,6 +738,34 @@ function ChannelCard({ view, onSaved }: { view: PlatformReleaseView; onSaved: ()
           release passes it.
         </p>
       )}
+      <div className="mt3">
+        <div className="label mb3">Check for releases</div>
+        <SegmentedControl<ReleaseCheck>
+          options={CHECK_OPTIONS}
+          value={check}
+          activation="manual"
+          aria-label="Release check"
+          disabled={save.pending != null || envLocked}
+          onChange={(value) => void save.run({ release_check: value })}
+        />
+        <p className="hint mt2">
+          {envLocked
+            ? `Set by ${lockedBy} on this install; this choice is ignored while it is set.`
+            : picked
+              ? "Your choice. Switching channel does not change it."
+              : "Follows the channel: daily on Preview, weekly on the others."}
+        </p>
+        {picked && !envLocked && (
+          <Button
+            variant="ghost"
+            className="mt2"
+            disabled={save.pending != null}
+            onClick={() => void save.run({ release_check: null })}
+          >
+            Follow the channel
+          </Button>
+        )}
+      </div>
       <div className="mt3" style={{ opacity: view.channel === "edge" ? 1 : 0.6 }}>
         <TextField
           label="Edge branch"

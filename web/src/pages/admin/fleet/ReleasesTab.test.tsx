@@ -167,6 +167,7 @@ beforeEach(() => {
   mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [] });
   // The head's "next check" fragment reads the detection job's schedule.
   mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
+  mocked.getSettings.mockResolvedValue({ settings: { release_check: null } } as never);
 });
 
 describe("ReleasesTab", () => {
@@ -442,7 +443,7 @@ describe("ReleasesTab", () => {
     mocked.updateSettings.mockResolvedValue({ settings: {} } as never);
     renderTab();
 
-    (await screen.findByRole("tab", { name: "Edge" })).click();
+    (await screen.findByRole("tab", { name: "Edge (test builds)" })).click();
 
     await waitFor(() =>
       expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_channel: "edge" }),
@@ -460,6 +461,72 @@ describe("ReleasesTab", () => {
     await waitFor(() =>
       expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_channel: "beta" }),
     );
+  });
+
+  it("offers preview and PATCHes it", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view());
+    mocked.updateSettings.mockResolvedValue({ settings: {} } as never);
+    renderTab();
+
+    (await screen.findByRole("tab", { name: "Preview" })).click();
+
+    await waitFor(() =>
+      expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_channel: "preview" }),
+    );
+  });
+
+  describe("check frequency", () => {
+    const detectJob = (interval_secs: number, locked_by = "instance_settings.release_check") =>
+      ({
+        id: "platform.release_detect",
+        enabled: true,
+        next_run_at: null,
+        schedule: { interval_secs, locked: true, locked_by },
+      }) as never;
+
+    it("shows the job's period, says it follows the channel, and saves a pick", async () => {
+      mocked.getPlatformReleases.mockResolvedValue(view());
+      mocked.listJobs.mockResolvedValue({ items: [detectJob(7 * 86400)], next_cursor: null } as never);
+      mocked.updateSettings.mockResolvedValue({ settings: {} } as never);
+      renderTab();
+
+      expect(await screen.findByRole("tab", { name: "Weekly" })).toHaveAttribute("aria-selected", "true");
+      expect(screen.getByText(/Follows the channel/)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Follow the channel" })).not.toBeInTheDocument();
+
+      screen.getByRole("tab", { name: "Daily" }).click();
+      await waitFor(() =>
+        expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_check: "daily" }),
+      );
+      // The job's period changes with it, so the tab reads it again.
+      await waitFor(() => expect(mocked.listJobs).toHaveBeenCalledTimes(2));
+    });
+
+    it("an explicit choice says so and goes back to following the channel with a null", async () => {
+      mocked.getPlatformReleases.mockResolvedValue(view());
+      mocked.getSettings.mockResolvedValue({ settings: { release_check: "daily" } } as never);
+      mocked.listJobs.mockResolvedValue({ items: [detectJob(86400)], next_cursor: null } as never);
+      mocked.updateSettings.mockResolvedValue({ settings: {} } as never);
+      renderTab();
+
+      expect(await screen.findByRole("tab", { name: "Daily" })).toHaveAttribute("aria-selected", "true");
+      (await screen.findByRole("button", { name: "Follow the channel" })).click();
+      await waitFor(() =>
+        expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_check: null }),
+      );
+    });
+
+    it("is read-only while an environment variable owns the period", async () => {
+      mocked.getPlatformReleases.mockResolvedValue(view());
+      mocked.listJobs.mockResolvedValue({
+        items: [detectJob(86400, "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL")],
+        next_cursor: null,
+      } as never);
+      renderTab();
+
+      expect(await screen.findByText(/Set by QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL/)).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: "Weekly" })).toBeDisabled();
+    });
   });
 
   it("Check now runs the detection job rather than the page's own read", async () => {
@@ -482,6 +549,7 @@ describe("ReleasesTab", () => {
           id: "platform.release_detect",
           enabled: true,
           next_run_at: "2026-09-07T02:00:00Z",
+          schedule: { interval_secs: 604800, locked: true, locked_by: "instance_settings.release_check" },
         },
       ],
       next_cursor: null,
