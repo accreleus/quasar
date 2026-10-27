@@ -7,7 +7,10 @@
 # Dispatches on `format_version`: 1 (platform-release-manifest.json, two
 # components; already-published releases carry it) or 2
 # (platform-release-manifest.v2.json, three components and a floor;
-# protocol/control-api.md "Release manifest format 2").
+# protocol/control-api.md "Release manifest format 2"). With --preview it validates
+# the preview manifest instead (format 2 with `version` null, `prerelease` false and
+# an optional `commits`; control-api.md "Platform-release preview channel"); without
+# it a null version and a `commits` key stay invalid, as on every release asset.
 #
 # Run twice on every release: once by the generator on its own output, once by
 # the `release` job in .github/workflows/images.yml (with the --expect-* flags,
@@ -26,13 +29,14 @@ expect_version=""
 expect_control=""
 expect_agent=""
 expect_recovery=""
+preview=0
 
 usage() {
   cat <<'EOF'
 usage: scripts/release/validate-platform-release-manifest.sh PATH \
          [--expect-format N] [--expect-version V] \
          [--expect-control-digest D] [--expect-agent-digest D] \
-         [--expect-recovery-digest D]
+         [--expect-recovery-digest D] [--preview]
 
 Validates a platform release manifest, format 1 (platform-release-manifest.json)
 or format 2 (platform-release-manifest.v2.json), by its format_version. The
@@ -41,6 +45,11 @@ knows (the workflow passes the format, the tag's version and the three
 build-job digests), which is what proves the manifest describes THIS run's
 artifacts and not a stale file. --expect-recovery-digest on a format-1 manifest
 is an error: format 1 has no recovery-actor component.
+
+--preview validates the preview manifest (the document at the `preview` tag of
+quasar-release-manifest): format 2, `version` null, `prerelease` false, and an
+optional `commits` list. It cannot be combined with --expect-version or
+--expect-format 1. Without --preview a null version or a `commits` key is invalid.
 
 Prints every error on stderr and exits 1; prints PASS and exits 0 when valid.
 Schema: scripts/release/platform-release-manifest.md
@@ -54,6 +63,7 @@ while (($#)); do
     --expect-control-digest) expect_control=${2:?--expect-control-digest needs a value}; shift 2 ;;
     --expect-agent-digest) expect_agent=${2:?--expect-agent-digest needs a value}; shift 2 ;;
     --expect-recovery-digest) expect_recovery=${2:?--expect-recovery-digest needs a value}; shift 2 ;;
+    --preview) preview=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) usage >&2; exit 2 ;;
     *)
@@ -68,9 +78,13 @@ case "$expect_format" in
   *) echo "validate-platform-release-manifest: --expect-format must be 1 or 2, got '$expect_format'" >&2
      exit 2 ;;
 esac
+if ((preview)) && [[ -n "$expect_version" || "$expect_format" == 1 ]]; then
+  echo "validate-platform-release-manifest: --preview has no version and is format 2" >&2
+  exit 2
+fi
 
 python3 - "$path" "$expect_format" "$expect_version" "$expect_control" "$expect_agent" \
-  "$expect_recovery" <<'PY'
+  "$expect_recovery" "$preview" <<'PY'
 import datetime as dt
 import json
 import re
@@ -80,6 +94,7 @@ from pathlib import Path
 path = Path(sys.argv[1])
 (expect_format, expect_version, expect_control, expect_agent,
  expect_recovery) = sys.argv[2:7]
+preview = sys.argv[7] == "1"
 errors = []
 
 # Per format, in order: component name and the last path element of its image.
@@ -105,6 +120,10 @@ COMPONENT_KEYS = ["name", "image", "digest"]
 # Format 2's floor entries, in order.
 FLOOR = ("node-agent", "recovery-actor")
 FLOOR_KEYS = ["name", "version"]
+# The preview manifest's optional commit list (amendment 48).
+COMMIT_KEYS = ["commit", "subject"]
+MAX_COMMITS = 500
+MAX_SUBJECT = 200
 
 # semver.org 2.0.0, prerelease part optional, build metadata deliberately NOT
 # accepted: `+` is not a legal character in a Docker tag, so a version carrying
@@ -183,14 +202,21 @@ if expect_format and format_version != int(expect_format):
 for key in TOP_KEYS[fmt]:
     if key not in doc:
         errors.append(f"missing top-level key: {key}")
+if preview and fmt != 2:
+    errors.append("the preview manifest is format_version 2")
 for key in doc:
+    if key == "commits" and preview:
+        continue
     if key not in TOP_KEYS[fmt]:
         errors.append(f"unknown top-level key: {key} "
                       "(adding a key is a format_version bump, not a new key)")
 
 version = doc.get("version")
 parsed = None
-if not isinstance(version, str):
+if preview:
+    if version is not None:
+        errors.append(f"the preview manifest's version must be null, got {version!r}")
+elif not isinstance(version, str):
     errors.append(f"version must be a string, got {version!r}")
 elif "+" in version:
     errors.append(f"version must not carry semver build metadata: {version!r}")
@@ -200,6 +226,8 @@ elif not (parsed := SEMVER.fullmatch(version)):
 prerelease = doc.get("prerelease")
 if not isinstance(prerelease, bool):
     errors.append(f"prerelease must be a boolean, got {prerelease!r}")
+elif preview and prerelease:
+    errors.append("the preview manifest's prerelease must be false")
 elif parsed is not None and prerelease != bool(parsed.group("pre")):
     errors.append(
         f"prerelease is {prerelease} but version {version!r} "
@@ -313,6 +341,30 @@ if fmt == 2 and "floor" in doc:
                     f"{where}.version {floor_version!r} orders above the release version "
                     f"{version!r} (a floor may not be newer than the release declaring it)"
                 )
+
+# `commits`: only the preview manifest may carry it (the key loop above refuses it
+# on a release asset). Same bounds as the control plane's ParsePreviewManifest: a
+# control character (C0, DEL, C1) in a subject makes the whole document invalid.
+if preview and "commits" in doc:
+    commits = doc["commits"]
+    if not isinstance(commits, list):
+        errors.append(f"commits must be an array, got {commits!r}")
+    elif len(commits) > MAX_COMMITS:
+        errors.append(f"commits holds {len(commits)} entries, at most {MAX_COMMITS}")
+    else:
+        for index, entry in enumerate(commits):
+            where = f"commits[{index}]"
+            if not isinstance(entry, dict) or sorted(entry) != sorted(COMMIT_KEYS):
+                errors.append(f"{where} must be exactly {{commit, subject}}, got {entry!r}")
+                continue
+            if not isinstance(entry["commit"], str) or not COMMIT.fullmatch(entry["commit"]):
+                errors.append(f"{where}.commit must be 40 lowercase hex characters, "
+                              f"got {entry['commit']!r}")
+            subject = entry["subject"]
+            if (not isinstance(subject, str) or len(subject) > MAX_SUBJECT
+                    or any(ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f for c in subject)):
+                errors.append(f"{where}.subject must be one line of at most {MAX_SUBJECT} "
+                              f"characters with no control character, got {subject!r}")
 
 # The --expect-* assertions: the caller already knows these, so a mismatch means
 # the manifest describes something other than what this run built.

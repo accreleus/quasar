@@ -131,6 +131,55 @@ PY
 reject "$validate" "unknown top-level key: floor" "$work/v1-with-floor.json"
 reject "$validate" "must be 1 or 2" "$fixtures/valid-v2.json" --expect-format 3
 
+# ── The preview manifest (--preview, amendment 48) ───────────────────────────
+# valid-preview.json is a copy of the fixture the Go tests read (ParsePreviewManifest).
+shared_preview="$repo/testdata/release/platform-release-manifest.preview.json"
+cmp -s "$shared_preview" "$fixtures/valid-preview.json" || fail "valid-preview.json differs from $shared_preview"
+"$validate" "$shared_preview" --preview --expect-format 2 \
+  --expect-control-digest "$control_digest" --expect-agent-digest "$agent_digest" \
+  --expect-recovery-digest "$recovery_digest" >/dev/null || fail "valid preview manifest rejected"
+# A release asset stays as strict as before: no null version, no commits.
+reject "$validate" "version must be a string" "$shared_preview"
+reject "$validate" "unknown top-level key: commits" "$shared_preview"
+for flags in "--expect-version 0.4.0" "--expect-format 1"; do
+  rc=0
+  # shellcheck disable=SC2086 # two words on purpose
+  "$validate" "$shared_preview" --preview $flags >/dev/null 2>&1 || rc=$?
+  [[ $rc -eq 2 ]] || fail "--preview with $flags must be a usage error, got $rc"
+done
+preview_variant() { # preview_variant <name> <python statement over d> -> prints the path
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+exec(sys.argv[3])
+open(sys.argv[2], "w").write(json.dumps(d))' "$shared_preview" "$work/$1.json" "$2"
+  printf '%s' "$work/$1.json"
+}
+"$validate" "$(preview_variant p-no-commits 'del d["commits"]')" --preview >/dev/null \
+  || fail "a preview manifest without commits is valid"
+"$validate" "$(preview_variant p-200 'd["commits"][0]["subject"] = "é" * 200')" --preview >/dev/null \
+  || fail "a 200-character subject is valid"
+"$validate" "$(preview_variant p-500 'd["commits"] = d["commits"][:1] * 500')" --preview >/dev/null \
+  || fail "500 commits are valid"
+"$validate" "$(preview_variant p-floor-high 'd["floor"][0]["version"] = "99.0.0"')" --preview >/dev/null \
+  || fail "a preview floor has no version to order against"
+reject "$validate" "version must be null" "$(preview_variant p-version 'd["version"] = "0.4.0"')" --preview
+reject "$validate" "missing top-level key: version" "$(preview_variant p-no-version 'del d["version"]')" --preview
+reject "$validate" "prerelease must be false" "$(preview_variant p-pre 'd["prerelease"] = True')" --preview
+reject "$validate" "is format_version 2" \
+  "$(preview_variant p-f1 'd["format_version"] = 1; del d["floor"]; del d["components"][2]')" --preview
+reject "$validate" "unknown top-level key: notes" "$(preview_variant p-key 'd["notes"] = ""')" --preview
+reject "$validate" "at most 500" "$(preview_variant p-501 'd["commits"] = d["commits"][:1] * 501')" --preview
+reject "$validate" "commits must be an array" "$(preview_variant p-null 'd["commits"] = None')" --preview
+reject "$validate" "commits[1] must be exactly" "$(preview_variant p-extra 'd["commits"][1]["url"] = "x"')" --preview
+reject "$validate" "commits[0].commit" "$(preview_variant p-short 'd["commits"][0]["commit"] = "c" * 7')" --preview
+reject "$validate" "commits[0].subject" "$(preview_variant p-201 'd["commits"][0]["subject"] = "x" * 201')" --preview
+# C0 (tab, newline), DEL and C1: the control plane refuses the whole document for any.
+for ch in '\t' '\n' '\x7f' '\x85'; do
+  reject "$validate" "commits[1].subject" \
+    "$(preview_variant p-ctl "d['commits'][1]['subject'] += '$ch'")" --preview
+done
+
 # Every error is reported, not just the first: a maintainer fixing one field at a
 # time per CI run is the failure mode this avoids.
 two="$("$validate" "$fixtures/two-errors.json" 2>&1 || true)"
@@ -252,6 +301,32 @@ want_actor_floor="$(sed -n -E 's/^const FloorRecoveryActor = "([^"]*)"$/\1/p' "$
 [[ -n "$want_agent_floor" && -n "$want_actor_floor" ]] || fail "floor.go no longer has the two floor lines"
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["floor"] == [{"name": "node-agent", "version": sys.argv[2]}, {"name": "recovery-actor", "version": sys.argv[3]}], d["floor"]' \
   "$gen_default" "$want_agent_floor" "$want_actor_floor"
+
+# --preview writes the preview manifest: the shared fixture's shape without commits.
+gen_preview() { "$generate" "${gen_base[@]}" --preview --output "$1" "${@:2}"; }
+gen_preview "$work/preview.json" >/dev/null || fail "generator failed in --preview mode"
+"$validate" "$work/preview.json" --preview --expect-format 2 \
+  --expect-control-digest "$control_digest" --expect-agent-digest "$agent_digest" \
+  --expect-recovery-digest "$recovery_digest" >/dev/null || fail "generated preview manifest failed validation"
+python3 - "$fixtures/valid-preview.json" "$work/preview.json" <<'PY'
+import json
+import sys
+
+want, got = (json.load(open(p)) for p in sys.argv[1:])
+del want["commits"]
+want.pop("schema_version")
+assert got.pop("schema_version") == 12
+assert json.dumps(want) == json.dumps(got), f"generated preview manifest differs from the documented shape: {got}"
+PY
+floor_fixture "$work/floor-high.go" 99.0.0 0.4.0-0
+gen_preview "$work/preview-floor.json" --floor-source "$work/floor-high.go" >/dev/null \
+  || fail "a preview floor was compared with a version it does not have"
+rc=0
+gen_preview "$work/preview-both.json" --version 0.4.0 >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 2 ]] || fail "generator with --preview and --version must exit 2, got $rc"
+reject "$generate" "digest" "${gen_base[@]}" --preview --control-digest sha256:abcd \
+  --output "$work/preview-bad.json"
+test ! -e "$work/preview-bad.json" || fail "generator wrote a preview manifest for a bad digest"
 
 # A missing --recovery-digest is a usage error, like every other required flag.
 missing_rc=0
