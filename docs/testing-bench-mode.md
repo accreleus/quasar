@@ -290,6 +290,18 @@ run's whole-hold number against another's observe-window number will invent a
 regression or hide one. Scope explicitly, and say which scope a quoted number
 used.
 
+## A held peer longer than 5 minutes: Steam's screensaver
+
+Steam replaces its own picture with a static game-art slideshow (dark at times) about 310 s
+after the last input (#819). The peer is held `settle + observe + 60 s` (360 s at the
+defaults), so with no input its picture and luma end on a slide that no longer describes the
+stream, whatever the image's screensaver setting is. `peer-driver.mjs` therefore taps Left
+Shift over the raw input channel once at decode and then every `IDLE_NUDGE_EVERY_S` seconds
+(default 250, `0` = off; empty or non-numeric warns and uses 250), in both normal and
+`--hold` mode. A modifier-only key resets Steam's idle clock and changes nothing on screen,
+but Left Shift is a key some games bind (sprint, walk), and a tap that overlaps a bench pulse
+arrives as Shift+Space; the result's `idle_nudges` counts the taps that went out.
+
 ## Cost, and the observer effect
 
 Bench mode reads back pixels every displayed frame. Steady state is cheap: once
