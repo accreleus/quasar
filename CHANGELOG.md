@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **Control plane: a Preview release channel, checked daily (#841).** `release_channel` accepts `preview`: every build of `develop`, read from the `quasar-release-manifest:preview` image in the platform registry (no GitHub call for it) and otherwise handled as an edge build. Release detection now takes its period from the channel: daily on Preview, weekly on every other channel, still inside the Jobs tab's window. An interval set by hand on the detection job is ignored from now on; `QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL` still wins when set. The picker option and the Daily/Weekly choice come with #842. Migration 0107.
+
 ### Changed
 - **Classic layout is deprecated (#855).** Account ▸ Appearance now says the switch back to the previous player layout will be removed in a later release. Nothing is removed yet.
 
@@ -38,6 +41,7 @@ own; the two do not move together, and that is deliberate.
 - **The control plane warns when a reverse proxy it does not trust talks to its plain HTTP port (#821).** A request carrying `X-Forwarded-*` from a peer outside `QUASAR_TRUSTED_PROXIES` logs `forwarded-from-unlisted-peer` with that peer's address, once per peer every 10 minutes. Nothing is refused. Name that proxy in `QUASAR_TRUSTED_PROXIES` before the release that refuses sign-in over plain HTTP (#604).
 
 ### Internal
+- **Contract: amendment 49 pinned (#845).** Per-user Region and Input settings; behaviour lands with #846–#854.
 - **Contract: amendment 48 pinned (#840).** Adds the preview release channel, its commit list and the daily/weekly release check; behaviour lands with #839 and #841–#843.
 - **Region and Input settings mock (#844).** `design_handoff_v3/screens/region-input-v3.html` shows the account page's new Region section (timezone list and world map, language, region format) and Input section (keyboard layout, mouse speed and sensitivity, raw input, scroll direction, Nintendo gamepad layout), plus the admin install-wide defaults. `DESIGN.md` gains the rules for its new controls.
 - **CI no longer stalls on the GStreamer apt install (#864).** The node-agent and engine-suite jobs download packages with a 20 s idle timeout, 3 retries and a restart of any download that runs past 3 minutes, restore the `.deb` set from an `actions/cache` keyed on the package list and runner image, and carry `timeout-minutes` (30 and 20) where there was none.

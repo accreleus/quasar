@@ -41,6 +41,9 @@ changes what is *listed*; it never installs anything and never starts a check.
   under the `o2-<branch>` image tags and no longer move `<branch>`, so a control plane from
   before owned installs, on `edge`, stays on the last build it could run and is never offered
   one it cannot.
+- **`preview`** — every build of `develop`, read from one manifest image in the registry
+  (`quasar-release-manifest:preview`). Like `edge`: no version, no notes. Checked **daily**; every
+  other channel is checked weekly.
 
 A tagged release publishes `platform-release-manifest.v2.json`: the control plane, node agent
 and recovery actor by digest, and the **floor**, the oldest node agent and recovery actor the

@@ -204,6 +204,10 @@ type Definition struct {
 	IntervalSource    func(ctx context.Context) (d time.Duration, overriddenByEnv bool, err error)
 	IntervalOwner     string
 	IntervalOwnerHint string
+	// DailyOpensEveryDay: while IntervalOwner sets a period of a day or less, the
+	// window opens every day whatever WindowDays holds (amendment 48,
+	// platform.release_detect).
+	DailyOpensEveryDay bool
 	// Control-plane implementation; nil for PlaneAgent and unmanaged jobs.
 	Run RunFunc
 	// Supplies run params for a manual trigger on a job that is meaningless

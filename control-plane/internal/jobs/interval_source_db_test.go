@@ -26,7 +26,7 @@ type sourcedJob struct {
 	execs  atomic.Int32
 }
 
-func newSourcedJob(t *testing.T, period time.Duration) *sourcedJob {
+func newSourcedJob(t *testing.T, period time.Duration, opts ...func(*Definition)) *sourcedJob {
 	t.Helper()
 	pool := testDB(t)
 	s := &sourcedJob{}
@@ -45,6 +45,9 @@ func newSourcedJob(t *testing.T, period time.Duration) *sourcedJob {
 	def.Run = func(context.Context, RunContext) (Outcome, error) {
 		s.execs.Add(1)
 		return Succeeded(nil), nil
+	}
+	for _, o := range opts {
+		o(&def)
 	}
 	reg := NewRegistry()
 	if err := reg.Register(def); err != nil {
@@ -295,5 +298,37 @@ func TestAPendingRunWithNoFinishedRunKeepsItsDate(t *testing.T) {
 	s.tick(t)
 	if got := s.next(t).ScheduledFor; !got.Equal(before) || s.execs.Load() != 1 {
 		t.Fatalf("scheduled_for %v -> %v, execs %d: a pending run with no finished run to measure from moved", before, got, s.execs.Load())
+	}
+}
+
+// Amendment 48: platform.release_detect's window opens every day while its setting
+// says daily, whatever window_days holds; an env-set period keeps the days.
+func TestDailyOpensTheWindowEveryDay(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		flag, byEnv  bool
+		everyDayOpen bool
+	}{
+		{"daily from the setting", true, false, true},
+		{"a job without the rule", false, false, false},
+		{"daily from the environment", true, true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := newSourcedJob(t, 24*time.Hour, func(d *Definition) { d.DailyOpensEveryDay = c.flag })
+			s.byEnv.Store(c.byEnv)
+			finished, _ := s.firstPassAndSuccessor(t)
+			day := int(finished.UTC().AddDate(0, 0, 3).Weekday())
+			if _, err := s.store.pool.Exec(context.Background(),
+				`UPDATE jobs SET window_days = ARRAY[$1]::smallint[] WHERE id = 'library.discovery'`, day); err != nil {
+				t.Fatal(err)
+			}
+			s.tick(t)
+			got := s.next(t).ScheduledFor.Sub(finished)
+			if c.everyDayOpen {
+				near(t, "next run on daily", got, 24*time.Hour)
+			} else if got < 48*time.Hour {
+				t.Fatalf("next run in %s, want it held to the window day three days out", got)
+			}
+		})
 	}
 }

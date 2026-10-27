@@ -52,6 +52,10 @@ var ErrDigestMismatch = errors.New("registry content does not match its digest")
 // not this: an outage never reads as "not published".
 var ErrRegistryNotFound = errors.New("not found at the registry")
 
+// ErrRegistryDenied: the registry refused anonymous access (a 4xx token answer,
+// or 401/403 on a GET). GHCR answers a package that does not exist this way too.
+var ErrRegistryDenied = errors.New("access denied by the registry")
+
 // ImageInspector is what a caller depends on; RegistryResolver implements it.
 type ImageInspector interface {
 	InspectConfig(ctx context.Context, ref string) (ImageConfig, error)
@@ -84,26 +88,14 @@ type configBlob struct {
 // InspectConfig resolves ref (tag or digest) to its config labels and the
 // manifest digest. An error means the identity is unknown: skip, never guess.
 func (r *RegistryResolver) InspectConfig(ctx context.Context, ref string) (ImageConfig, error) {
-	if strings.Contains(ref, "://") {
-		return ImageConfig{}, fmt.Errorf("image ref %q must not carry a URL scheme (https is implied)", ref)
-	}
-	p, err := parseRef(ref)
+	p, err := r.allowedRef(ref)
 	if err != nil {
 		return ImageConfig{}, err
-	}
-	// Same containment as Resolve: the allowlist is checked on the parsed ref
-	// before any request is built.
-	if !r.hostAllowed(p.Registry) {
-		return ImageConfig{}, fmt.Errorf("registry host %q is not in the allowlist (QUASAR_IMAGE_REGISTRY_HOSTS)", p.Registry)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, inspectTimeout)
 	defer cancel()
-
-	token := ""
-	if p.apiHost() == "ghcr.io" {
-		token, _ = r.fetchToken(ctx, "https://ghcr.io/token", "ghcr.io", p.scope())
-	}
+	token := r.anonymousToken(ctx, p)
 
 	reference := p.Tag
 	if p.Digest != "" {
@@ -165,6 +157,94 @@ func (r *RegistryResolver) InspectConfig(ctx context.Context, ref string) (Image
 		labels = map[string]string{}
 	}
 	return ImageConfig{ManifestDigest: digest, Labels: labels}, nil
+}
+
+// allowedRef parses ref under Resolve's containment: the allowlist is checked on
+// the parsed ref before any request is built.
+func (r *RegistryResolver) allowedRef(ref string) (parsedRef, error) {
+	if strings.Contains(ref, "://") {
+		return parsedRef{}, fmt.Errorf("image ref %q must not carry a URL scheme (https is implied)", ref)
+	}
+	p, err := parseRef(ref)
+	if err != nil {
+		return parsedRef{}, err
+	}
+	if !r.hostAllowed(p.Registry) {
+		return parsedRef{}, fmt.Errorf("registry host %q is not in the allowlist (QUASAR_IMAGE_REGISTRY_HOSTS)", p.Registry)
+	}
+	return p, nil
+}
+
+// anonymousToken is GHCR's anonymous pull token, "" elsewhere (a challenge then asks).
+func (r *RegistryResolver) anonymousToken(ctx context.Context, p parsedRef) string {
+	if p.apiHost() != "ghcr.io" {
+		return ""
+	}
+	token, _ := r.fetchToken(ctx, "https://ghcr.io/token", "ghcr.io", p.scope())
+	return token
+}
+
+const ociImageManifest = "application/vnd.oci.image.manifest.v1+json"
+
+// ErrArtifactShape: the tag names a manifest that is not one single-layer artifact.
+var ErrArtifactShape = errors.New("not a single-layer OCI artifact")
+
+// FetchArtifact returns the one layer of the OCI image manifest at ref (a tag), as
+// the preview release manifest is published (control-api.md §"Platform-release
+// preview channel"). ErrRegistryNotFound only when the tag itself is absent; a
+// missing layer is a broken publish, never "not published".
+func (r *RegistryResolver) FetchArtifact(ctx context.Context, ref string) ([]byte, error) {
+	p, err := r.allowedRef(ref)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, inspectTimeout)
+	defer cancel()
+	token := r.anonymousToken(ctx, p)
+
+	reference := p.Tag
+	if p.Digest != "" {
+		reference = p.Digest
+	}
+	body, digest, err := r.getManifest(ctx, p, reference, &token)
+	if errors.Is(err, ErrRegistryDenied) {
+		// Anonymously GHCR cannot tell an unpublished package from a private one.
+		return nil, fmt.Errorf("%w: %s is not published, or the package is not public: %v", ErrRegistryNotFound, ref, err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if p.Digest != "" && digest != p.Digest {
+		return nil, fmt.Errorf("%w: %s answered a manifest whose digest is %s", ErrDigestMismatch, ref, digest)
+	}
+	var doc struct {
+		MediaType string       `json:"mediaType"`
+		Manifests []descriptor `json:"manifests"`
+		Layers    []descriptor `json:"layers"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("%w: %s: manifest does not decode: %v", ErrArtifactShape, ref, err)
+	}
+	if doc.MediaType != ociImageManifest {
+		return nil, fmt.Errorf("%w: %s has media type %q, want %s", ErrArtifactShape, ref, doc.MediaType, ociImageManifest)
+	}
+	if len(doc.Manifests) > 0 || len(doc.Layers) != 1 {
+		return nil, fmt.Errorf("%w: %s carries %d layers and %d child manifests, want exactly one layer",
+			ErrArtifactShape, ref, len(doc.Layers), len(doc.Manifests))
+	}
+	layer := doc.Layers[0].Digest
+	if !digestRe.MatchString(layer) {
+		return nil, fmt.Errorf("%w: %s: layer digest %q is not sha256:<64 hex>", ErrArtifactShape, ref, layer)
+	}
+	blob, err := r.getBlob(ctx, p, layer, &token)
+	if err != nil {
+		// %v, not %w: a 404 here must not read as an unpublished tag.
+		return nil, fmt.Errorf("%s: layer %s: %v", ref, layer, err)
+	}
+	if sum := sha256.Sum256(blob); "sha256:"+hex.EncodeToString(sum[:]) != layer {
+		return nil, fmt.Errorf("%w: %s: layer does not hash to %s", ErrDigestMismatch, ref, layer)
+	}
+	return blob, nil
 }
 
 // pickManifest takes the linux/amd64 entry, or the only candidate. An
@@ -238,7 +318,7 @@ func (r *RegistryResolver) registryGet(ctx context.Context, p parsedRef, url, ac
 		return nil, err
 	}
 	if challenge != "" {
-		return nil, fmt.Errorf("get %s: unauthorized after a token fetch", url)
+		return nil, fmt.Errorf("get %s: unauthorized after a token fetch: %w", url, ErrRegistryDenied)
 	}
 	return body, nil
 }
@@ -268,7 +348,10 @@ func (r *RegistryResolver) tryGet(ctx context.Context, url, accept, token string
 		if ch := resp.Header.Get("WWW-Authenticate"); ch != "" && token == "" {
 			return nil, ch, nil
 		}
-		return nil, "", fmt.Errorf("get %s: unauthorized", url)
+		return nil, "", fmt.Errorf("get %s: unauthorized: %w", url, ErrRegistryDenied)
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		return nil, "", fmt.Errorf("get %s: status 403: %w", url, ErrRegistryDenied)
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, "", fmt.Errorf("get %s: status 404: %w", url, ErrRegistryNotFound)

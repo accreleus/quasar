@@ -881,6 +881,75 @@ export interface paths {
         };
         trace?: never;
     };
+    "/v1/me/region-input": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the caller's Region and Input settings, with the install defaults (amendment 49, #845).
+         * @description See control-api.md §Region and Input settings. Self only: no admin variant. A user who has saved nothing reads every field null.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RegionInputSettings"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Update the caller's Region and Input settings (amendment 49, #845).
+         * @description Partial merge one level deep: an absent field is unchanged, null clears it, keyboard is replaced whole, defaults and parked_session_stopped are ignored. Any other key or an invalid value is 400 validation_failed and nothing is written. A change to timezone, language, region_format or keyboard stops the caller's parked session (warm Steam), never a session in use; the response says so in parked_session_stopped.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["RegionInputSettings"];
+                };
+            };
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RegionInputSettings"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+            };
+        };
+        trace?: never;
+    };
     "/v1/me/highlights": {
         parameters: {
             query?: never;
@@ -4205,6 +4274,26 @@ export interface paths {
                         steam_warm_rewarm?: "library_open" | "next_steam_launch";
                         /** @description Amendment 39. Each heartbeat, and a park on exit, sets a parked session's deadline to now plus this many minutes. Absent = unchanged; outside 1-60 is 400 validation_failed. */
                         steam_warm_idle_minutes?: number;
+                        /** @description Amendment 49 (#845). As RegionSettings.timezone. Default UTC. Absent = unchanged. */
+                        default_timezone?: string;
+                        /** @description Amendment 49. Default en-US. Absent = unchanged. */
+                        default_language?: string;
+                        /** @description Amendment 49. null = the same as the language (the default). Absent = unchanged. */
+                        default_region_format?: string | null;
+                        default_keyboard?: components["schemas"]["KeyboardLayout"];
+                        /**
+                         * @description Amendment 49. Default auto.
+                         * @enum {string}
+                         */
+                        default_match_cursor?: "auto" | "on" | "off";
+                        /** @description Amendment 49. Default 1. */
+                        default_mouse_sensitivity?: number;
+                        /** @description Amendment 49. Default false. */
+                        default_raw_mouse?: boolean;
+                        /** @description Amendment 49. Default false. */
+                        default_flip_scroll?: boolean;
+                        /** @description Amendment 49. Default false. */
+                        default_nintendo_layout?: boolean;
                     };
                 };
             };
@@ -9375,6 +9464,19 @@ export interface components {
                 steam_warm_rewarm?: "library_open" | "next_steam_launch";
                 /** @description Amendment 39. Default 10. */
                 steam_warm_idle_minutes?: number;
+                /** @description Amendment 49 (#845). Default UTC. Optional in the envelope so a pre-amendment server stays conformant. */
+                default_timezone?: string;
+                /** @description Amendment 49. Default en-US. */
+                default_language?: string;
+                /** @description Amendment 49. null = the same as the language. */
+                default_region_format?: string | null;
+                default_keyboard?: components["schemas"]["KeyboardLayout"];
+                /** @enum {string} */
+                default_match_cursor?: "auto" | "on" | "off";
+                default_mouse_sensitivity?: number;
+                default_raw_mouse?: boolean;
+                default_flip_scroll?: boolean;
+                default_nintendo_layout?: boolean;
                 /** Format: uuid */
                 updated_by: string | null;
                 /** Format: date-time */
@@ -10522,6 +10624,48 @@ export interface components {
         /** @description Per-user client presentation preferences, synced across that user's devices. One key per client surface so a new surface needs no new endpoint. Unknown top-level keys are preserved through a PATCH. */
         UIPreferences: {
             session_overlay?: components["schemas"]["SessionOverlayPreferences"];
+        };
+        KeyboardLayout: {
+            /** @description One xkeyboard-config layout name, e.g. gb. */
+            layout: string;
+            /** @description One variant of that layout, e.g. extd; empty for the basic variant. */
+            variant: string;
+        };
+        RegionSettings: {
+            /** @description An IANA zone name the control plane's tz database knows, backward-compatible links included, other than Local. Reaches the container as TZ. */
+            timezone?: string | null;
+            /** @description A language and region, e.g. de-DE. Reaches the container as LANG=de_DE.UTF-8. */
+            language?: string | null;
+            /** @description As language; reaches the container as LC_TIME, LC_NUMERIC, LC_MONETARY, LC_MEASUREMENT and LC_PAPER. null in defaults = the same as the language. */
+            region_format?: string | null;
+        };
+        InputSettings: {
+            /** @description Reaches the container as XKB_DEFAULT_LAYOUT / XKB_DEFAULT_VARIANT and the session's keymap. */
+            keyboard?: components["schemas"]["KeyboardLayout"] | null;
+            /**
+             * @description Client only. auto = on for an app of kind desktop, off for every other kind.
+             * @enum {string|null}
+             */
+            match_cursor?: "auto" | "on" | "off" | null;
+            /** @description Client only. Multiplies relative mouse movement. */
+            mouse_sensitivity?: number | null;
+            /** @description Client only. Pointer lock with unadjustedMovement where the browser has it. */
+            raw_mouse?: boolean | null;
+            /** @description Client only. Reverses the wheel direction before sending. */
+            flip_scroll?: boolean | null;
+            /** @description Client only. Swaps gamepad A with B and X with Y before sending. */
+            nintendo_layout?: boolean | null;
+        };
+        RegionInputSettings: {
+            region?: components["schemas"]["RegionSettings"];
+            input?: components["schemas"]["InputSettings"];
+            /** @description The install defaults (GET /v1/admin/settings default_*). Every field has a value except region.region_format. */
+            readonly defaults?: {
+                region?: components["schemas"]["RegionSettings"];
+                input?: components["schemas"]["InputSettings"];
+            };
+            /** @description PATCH response only: true when this change stopped the caller's parked session. */
+            readonly parked_session_stopped?: boolean;
         };
         HighlightList: {
             items: components["schemas"]["Highlight"][];
