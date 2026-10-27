@@ -270,15 +270,16 @@ export function shortCommit(commit: string | null | undefined): string {
   return commit.slice(0, 12);
 }
 
-/** Display counterpart of the server's same-schema edge ordering. Unknown
- * build metadata never proves that the candidate is older. */
+/** Display counterpart of the server's same-schema edge ordering, which holds for
+ * preview builds too (platform edgeOlderThanInstalled). Unknown build metadata
+ * never proves that the candidate is older. */
 export function olderEdgeCandidate(
   view: { installed: { control_plane: { schema_version?: number; built_at?: string | null } } },
   release: PlatformRelease | undefined,
 ): boolean {
   const installed = view.installed.control_plane;
   return installed.built_at != null && installed.schema_version !== undefined &&
-    release?.channel === "edge" && release.schema_version === installed.schema_version &&
+    (release?.channel === "edge" || release?.channel === "preview") && release.schema_version === installed.schema_version &&
     Date.parse(release.built_at) < Date.parse(installed.built_at);
 }
 

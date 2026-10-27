@@ -1009,9 +1009,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		Default: jobs.Schedule{Kind: jobs.KindInterval, IntervalSecs: 6 * 3600},
 	})
 
-	// Platform-release detection (#104/#110). Weekly, in a one-hour window that
-	// opens 02:00 Monday UTC: a self-hosted instance learns about a release on
-	// the operator's quiet hour, not on ours. "Check now" is this job's run-now
+	// Platform-release detection (#104/#110). Weekly in a one-hour window that
+	// opens 02:00 Monday UTC, or daily at 02:00 UTC (release_check, amendment 48):
+	// a self-hosted instance learns about a release on the operator's quiet hour. "Check now" is this job's run-now
 	// action and bypasses the window, as it does for every job.
 	platformStore := platform.NewStore(pool)
 	releaseRepo := platform.ConfiguredReleaseRepo()
@@ -1031,11 +1031,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		// client rather than the GitHub one. The platform registry is added to
 		// the image allowlist here so repointing it takes one knob, not two.
 		platformRegistry := platform.ConfiguredPlatformRegistry()
+		platformImages := images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platformRegistry))
 		releaseDetector = releaseDetector.WithEdge(
-			platform.NewRegistryEdgeSource(
-				images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platformRegistry)),
-				platformRegistry, releaseRepo),
-			settingsStore.ReleaseChannel)
+			platform.NewRegistryEdgeSource(platformImages, platformRegistry, releaseRepo),
+			settingsStore.ReleaseChannel).
+			WithPreview(platform.NewRegistryPreviewSource(platformImages, platformRegistry, releaseRepo))
 	}
 	// Platform-release APPLY (#116, amendment 2). The runner is the per-host
 	// state machine; its three effects are wired here because internal/platform
@@ -1292,6 +1292,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		},
 	}, log)
 
+	const detectIntervalEnv = "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL"
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          platform.DetectJobID,
 		Name:        "Platform release detection",
@@ -1307,7 +1308,19 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			WindowDays:   []int{int(time.Monday)},
 			Timezone:     "UTC",
 		},
-		EnvOverride: "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL",
+		EnvOverride: detectIntervalEnv,
+		// Amendment 48: the period is release_check (daily on preview, weekly
+		// otherwise); the window stays the Jobs tab's and opens every day on daily.
+		IntervalSource: func(ctx context.Context) (time.Duration, bool, error) {
+			if d, byEnv, _ := jobs.EffectiveInterval(jobs.Job{}, detectIntervalEnv, nil); byEnv {
+				return d, true, nil
+			}
+			d, err := settingsStore.ReleaseCheckPeriod(ctx)
+			return d, false, err
+		},
+		IntervalOwner:      "instance_settings.release_check",
+		IntervalOwnerHint:  "Fleet, Releases",
+		DailyOpensEveryDay: true,
 		Run: func(ctx context.Context, rc jobs.RunContext) (jobs.Outcome, error) {
 			if releaseDetector == nil {
 				return jobs.Skipped("no platform release repository configured (QUASAR_PLATFORM_RELEASE_REPO)"), nil
