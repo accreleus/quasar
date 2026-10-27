@@ -47,6 +47,12 @@ describe("AccountAppearance", () => {
     );
   });
 
+  it("says Classic layout is deprecated, in the switch's description", () => {
+    renderPage();
+    const hint = document.getElementById(screen.getByLabelText("Classic layout").getAttribute("aria-describedby")!);
+    expect(hint?.textContent).toContain("Classic layout will be removed in a later release.");
+  });
+
   it("shows the stored choice", async () => {
     getUIPreferences.mockResolvedValue({ session_overlay: {}, classic_layout: true });
     renderPage();
