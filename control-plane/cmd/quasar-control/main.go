@@ -229,7 +229,7 @@ func run() error {
 		httpHandler = httpx.RedirectToHTTPS(handler, cfg.TLSRedirectPort)
 		log.Info("http→https redirect enabled", "redirect_port", cfg.TLSRedirectPort)
 	}
-	srv := newServer(cfg.ListenAddr, httpHandler)
+	srv := newServer(cfg.ListenAddr, httpx.WarnUnlistedProxy(httpHandler, log, cfg.TrustedProxies))
 
 	// Optional HTTPS listener (#376): the same handler over TLS so the browser
 	// gets a secure context. Fatal on misconfiguration when QUASAR_TLS != off.
