@@ -460,6 +460,7 @@ const COMPOSE_ONLY_KNOBS: &[&str] = &[
     "QUASAR_PLATFORM_WEBHOOK_HOSTS",
     "QUASAR_PLATFORM_REGISTRY",
     "QUASAR_IMAGE_REGISTRY_HOSTS",
+    "QUASAR_HSTS_MAX_AGE",
 ];
 
 /// A combined machine's control plane at `revision`, and the inputs it was rendered from.
