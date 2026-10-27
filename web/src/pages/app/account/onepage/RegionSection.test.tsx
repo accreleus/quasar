@@ -167,6 +167,17 @@ describe("Region section", () => {
     expect(api.patchRegionInput).toHaveBeenCalledWith("t0k3n", { region: { timezone: "Asia/Tokyo" } });
   });
 
+  it("Enter does nothing on a saved zone outside the list when nothing is searched", async () => {
+    api.getRegionInput.mockResolvedValue(body("Asia/Calcutta"));
+    renderSection();
+    const box = await list();
+    expect(box.hasAttribute("aria-activedescendant")).toBe(false);
+    expect(box.querySelector(".tz-opt.is-active")).toBeNull();
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.keyDown(box, { key: " " });
+    expect(api.patchRegionInput).not.toHaveBeenCalled();
+  });
+
   it("Enter does nothing when the search matches nothing and the saved zone is hidden", async () => {
     api.getRegionInput.mockResolvedValue(body("Europe/Paris"));
     renderSection();

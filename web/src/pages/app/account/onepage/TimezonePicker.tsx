@@ -29,7 +29,7 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
   const hits = options.length - 1;
   // Enter and Space pick the highlight, so it must be one the user can see: the saved row, the
   // first match when a search has filtered the saved row out, and nothing when nothing matches.
-  const active = activeIdx !== null ? Math.min(activeIdx, hits) : selectedIdx >= 0 ? selectedIdx : hits > 0 ? 1 : -1;
+  const active = activeIdx !== null ? Math.min(activeIdx, hits) : selectedIdx >= 0 ? selectedIdx : hits > 0 && term.trim() !== "" ? 1 : -1;
   const highlightDrawn = activeIdx !== null || selectedIdx < 0;
 
   // Open the list on the saved zone; scrollIntoView would move the page too.
@@ -72,43 +72,45 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
           }}
         />
       </div>
-      <ul
-        id="tz-list"
-        ref={listRef}
-        className="tz-list"
-        role="listbox"
-        aria-labelledby="tz-label"
-        aria-busy={disabled}
-        aria-activedescendant={active >= 0 ? optionId(options[active] ?? null) : undefined}
-        tabIndex={0}
-        onKeyDown={disabled ? undefined : onKeyDown}
-      >
-        {options.map((z, i) => {
-          const zone = z ?? followed;
-          const sub = z ? `${z.country ? `${z.country} · ` : ""}${z.tz}` : `Now ${followed.city} (${followed.tz})`;
-          const classes = ["tz-opt", z ? "" : "tz-follow", i === active && highlightDrawn ? "is-active" : ""];
-          return (
-            <Fragment key={z?.tz ?? "follow"}>
-              <li
-                id={optionId(z)}
-                role="option"
-                aria-selected={z ? z.tz === value : value === null}
-                className={classes.filter(Boolean).join(" ")}
-                onClick={disabled ? undefined : () => onPick(z?.tz ?? null)}
-              >
-                <span className="tz-t">
-                  <span className="tz-name">{z ? z.city : "Follow my browser"}</span>
-                  <span className="tz-sub" title={sub}>{sub}</span>
-                </span>
-                <span className="tz-off">{offsetLabel(zone)}</span>
-              </li>
-              {!z && <li className="tz-sep" role="presentation" />}
-            </Fragment>
-          );
-        })}
-      </ul>
+      <div className="tz-box">
+        <ul
+          id="tz-list"
+          ref={listRef}
+          className="tz-list"
+          role="listbox"
+          aria-labelledby="tz-label"
+          aria-busy={disabled}
+          aria-activedescendant={active >= 0 ? optionId(options[active] ?? null) : undefined}
+          tabIndex={0}
+          onKeyDown={disabled ? undefined : onKeyDown}
+        >
+          {options.map((z, i) => {
+            const zone = z ?? followed;
+            const sub = z ? `${z.country ? `${z.country} · ` : ""}${z.tz}` : `Now ${followed.city} (${followed.tz})`;
+            const classes = ["tz-opt", z ? "" : "tz-follow", i === active && highlightDrawn ? "is-active" : ""];
+            return (
+              <Fragment key={z?.tz ?? "follow"}>
+                <li
+                  id={optionId(z)}
+                  role="option"
+                  aria-selected={z ? z.tz === value : value === null}
+                  className={classes.filter(Boolean).join(" ")}
+                  onClick={disabled ? undefined : () => onPick(z?.tz ?? null)}
+                >
+                  <span className="tz-t">
+                    <span className="tz-name">{z ? z.city : "Follow my browser"}</span>
+                    <span className="tz-sub" title={sub}>{sub}</span>
+                  </span>
+                  <span className="tz-off">{offsetLabel(zone)}</span>
+                </li>
+                {!z && <li className="tz-sep" role="presentation" />}
+              </Fragment>
+            );
+          })}
+        </ul>
+        {hits === 0 && <p className="tz-empty" aria-hidden="true">{NO_MATCH}</p>}
+      </div>
       <p className="sr-only" aria-live="polite">{hits === 0 ? NO_MATCH : ""}</p>
-      {hits === 0 && <p className="tz-empty" aria-hidden="true">{NO_MATCH}</p>}
     </div>
   );
 }
