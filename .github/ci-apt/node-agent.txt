@@ -1,0 +1,15 @@
+# Dev headers for the sys crates, PLUS the runtime plugin packages — gst-backed
+# tests construct real elements (webrtcbin lives in gstreamer1.0-plugins-bad,
+# not in any -dev package).
+# libasound2-dev supplies alsa.pc: without it the `alsa` crate's alsa-sys build
+# script panics, and cargo reports it as a failed Clippy step rather than a lint.
+libgstreamer1.0-dev
+libgstreamer-plugins-base1.0-dev
+libgstreamer-plugins-bad1.0-dev
+gstreamer1.0-plugins-base
+gstreamer1.0-plugins-good
+gstreamer1.0-plugins-bad
+gstreamer1.0-nice
+libglib2.0-dev
+libssl-dev
+libasound2-dev
