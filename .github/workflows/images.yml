@@ -1418,7 +1418,9 @@ jobs:
   # it if not (scripts/release/platform-release-manifest.md, "The preview manifest").
   # A private package reads as not published.
   #
-  # `commits` is not written yet (#843).
+  # `commits` (#843) is the first-parent history of this commit back to the newest
+  # stable release tag, read by the generator from this checkout: fetch-depth 0 brings
+  # the history and every tag, and a shallow or untagged checkout fails the job.
   preview:
     name: publish the preview manifest
     needs: [inputs, build-control-plane, build-node-agent, build-recovery-actor, promote]

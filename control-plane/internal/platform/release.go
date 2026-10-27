@@ -72,6 +72,11 @@ type Release struct {
 	// plane's own schema version is in hand; a Release read straight from the
 	// store and never served leaves it false.
 	Migrates bool `json:"migrates"`
+	// NewCommitCount (amendment 48): on a preview release whose manifest carries
+	// `commits`, how many leading entries the installed control plane does not run;
+	// nil everywhere else, serialized as null. Derived and served like Migrates, in
+	// `offerable`, so a client shows the first N entries and cannot disagree.
+	NewCommitCount *int `json:"new_commit_count"`
 	// The asset verbatim: raw so a field this build does not read still reaches
 	// a client. nil marshals to `null` — the answer on edge.
 	Manifest     json.RawMessage `json:"manifest"`
