@@ -42,6 +42,7 @@ own; the two do not move together, and that is deliberate.
 - **CI no longer stalls on the GStreamer apt install (#864).** The node-agent and engine-suite jobs download packages with a 20 s idle timeout, 3 retries and a restart of any download that runs past 3 minutes, restore the `.deb` set from an `actions/cache` keyed on the package list and runner image, and carry `timeout-minutes` (30 and 20) where there was none.
 - **The bench peer no longer ends a long hold on Steam's screensaver (#835).** A held peer longer than about 5 minutes ended on the static slideshow Steam draws after ~310 s without input; `scripts/harness/peer-driver.mjs` now taps Left Shift at decode and then every 250 s (`IDLE_NUDGE_EVERY_S`, `0` = off), so a soak passes or fails on stream health alone (#819).
 - **The Images workflow no longer spends time on a toolchain it reuses (#865).** The `inputs` job reads the gst toolchain's digest (or says it must be built), the toolchain job does nothing when it is reused so `build-node-agent` starts seconds after it instead of waiting out a disk cleanup, and the node-agent runner cleanup runs only under 50 GB free instead of on every run.
+- **Rebuilding the agent image of an unchanged tree reuses the cached compile (#866).** The agent's build time no longer goes into `cargo build`: the image sets it as the `QUASAR_BUILT_AT` ENV beside the `org.quasar.built.at` label, and the agent reads it at run time. The `built_at` it reports on `register` is the same value as before.
 
 ## 0.5.0 — 2026-10-25
 
