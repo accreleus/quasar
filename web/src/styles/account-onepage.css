@@ -203,10 +203,20 @@
   background: var(--line-2);
 }
 
+.tz-box {
+  position: relative;
+}
+
+/* Reads inside the list box, under the Follow row (list padding, 44px row, its margin, rule and margin). */
 .tz-empty {
+  position: absolute;
+  top: calc(var(--s1) * 3 + 44px + 1px);
+  left: var(--s1);
+  right: var(--s1);
   padding: var(--s3);
   color: var(--text-3);
   font-size: var(--t-sm);
+  pointer-events: none;
 }
 
 @media (max-width: 1100px) {

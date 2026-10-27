@@ -4,7 +4,7 @@
 
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { IconSearch } from "../../../../components/icons";
-import { formatOffset, searchZones, type Zone } from "../../../../lib/region/zones";
+import { offsetLabel, searchZones, type Zone } from "../../../../lib/region/zones";
 
 export interface TimezonePickerProps {
   zones: readonly Zone[];
@@ -16,6 +16,7 @@ export interface TimezonePickerProps {
   onPick: (tz: string | null) => void;
 }
 
+const NO_MATCH = "No timezone matches. Try a city or country name.";
 const optionId = (z: Zone | null) => (z ? `tz-o-${z.tz.replace(/\W/g, "_")}` : "tz-o-follow");
 
 export function TimezonePicker({ zones, value, followed, disabled, onPick }: TimezonePickerProps) {
@@ -25,7 +26,11 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
 
   const options = useMemo<(Zone | null)[]>(() => [null, ...searchZones(zones, term)], [zones, term]);
   const selectedIdx = options.findIndex((o) => (o ? o.tz === value : value === null));
-  const active = Math.min(activeIdx ?? Math.max(selectedIdx, 0), options.length - 1);
+  const hits = options.length - 1;
+  // Enter and Space pick the highlight, so it must be one the user can see: the saved row, the
+  // first match when a search has filtered the saved row out, and nothing when nothing matches.
+  const active = activeIdx !== null ? Math.min(activeIdx, hits) : selectedIdx >= 0 ? selectedIdx : hits > 0 && term.trim() !== "" ? 1 : -1;
+  const highlightDrawn = activeIdx !== null || selectedIdx < 0;
 
   // Open the list on the saved zone; scrollIntoView would move the page too.
   useEffect(() => {
@@ -39,18 +44,16 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
   }, [activeIdx, active, options]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
-    const last = options.length - 1;
-    const next = { ArrowDown: Math.min(last, active + 1), ArrowUp: Math.max(0, active - 1), Home: 0, End: last }[e.key];
+    const next = { ArrowDown: Math.min(hits, active + 1), ArrowUp: Math.max(0, active - 1), Home: 0, End: hits }[e.key];
     if (next !== undefined) {
       e.preventDefault();
       setActiveIdx(next);
     } else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      onPick(options[active]?.tz ?? null);
+      if (active >= 0) onPick(options[active]?.tz ?? null);
     }
   };
 
-  const hits = options.length - 1;
   return (
     <div className="tz-side">
       <div className="search">
@@ -69,42 +72,45 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
           }}
         />
       </div>
-      <ul
-        id="tz-list"
-        ref={listRef}
-        className="tz-list"
-        role="listbox"
-        aria-labelledby="tz-label"
-        aria-busy={disabled}
-        aria-activedescendant={optionId(options[active] ?? null)}
-        tabIndex={0}
-        onKeyDown={disabled ? undefined : onKeyDown}
-      >
-        {options.map((z, i) => {
-          const zone = z ?? followed;
-          const sub = z ? `${z.country ? `${z.country} · ` : ""}${z.tz}` : `Now ${followed.city} (${followed.tz})`;
-          const classes = ["tz-opt", z ? "" : "tz-follow", i === active && activeIdx !== null ? "is-active" : ""];
-          return (
-            <Fragment key={z?.tz ?? "follow"}>
-              <li
-                id={optionId(z)}
-                role="option"
-                aria-selected={z ? z.tz === value : value === null}
-                className={classes.filter(Boolean).join(" ")}
-                onClick={disabled ? undefined : () => onPick(z?.tz ?? null)}
-              >
-                <span className="tz-t">
-                  <span className="tz-name">{z ? z.city : "Follow my browser"}</span>
-                  <span className="tz-sub" title={sub}>{sub}</span>
-                </span>
-                <span className="tz-off">{formatOffset(zone.offset)}</span>
-              </li>
-              {!z && <li className="tz-sep" role="presentation" />}
-            </Fragment>
-          );
-        })}
-        {hits === 0 && <li className="tz-empty" role="presentation">No timezone matches. Try a city or country name.</li>}
-      </ul>
+      <div className="tz-box">
+        <ul
+          id="tz-list"
+          ref={listRef}
+          className="tz-list"
+          role="listbox"
+          aria-labelledby="tz-label"
+          aria-busy={disabled}
+          aria-activedescendant={active >= 0 ? optionId(options[active] ?? null) : undefined}
+          tabIndex={0}
+          onKeyDown={disabled ? undefined : onKeyDown}
+        >
+          {options.map((z, i) => {
+            const zone = z ?? followed;
+            const sub = z ? `${z.country ? `${z.country} · ` : ""}${z.tz}` : `Now ${followed.city} (${followed.tz})`;
+            const classes = ["tz-opt", z ? "" : "tz-follow", i === active && highlightDrawn ? "is-active" : ""];
+            return (
+              <Fragment key={z?.tz ?? "follow"}>
+                <li
+                  id={optionId(z)}
+                  role="option"
+                  aria-selected={z ? z.tz === value : value === null}
+                  className={classes.filter(Boolean).join(" ")}
+                  onClick={disabled ? undefined : () => onPick(z?.tz ?? null)}
+                >
+                  <span className="tz-t">
+                    <span className="tz-name">{z ? z.city : "Follow my browser"}</span>
+                    <span className="tz-sub" title={sub}>{sub}</span>
+                  </span>
+                  <span className="tz-off">{offsetLabel(zone)}</span>
+                </li>
+                {!z && <li className="tz-sep" role="presentation" />}
+              </Fragment>
+            );
+          })}
+        </ul>
+        {hits === 0 && <p className="tz-empty" aria-hidden="true">{NO_MATCH}</p>}
+      </div>
+      <p className="sr-only" aria-live="polite">{hits === 0 ? NO_MATCH : ""}</p>
     </div>
   );
 }

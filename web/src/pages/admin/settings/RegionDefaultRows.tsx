@@ -3,7 +3,7 @@
 
 import { useMemo } from "react";
 import { LANGUAGES, REGION_FORMATS, formatExample } from "../../../lib/region/options";
-import { buildZones, formatOffset, groupZones } from "../../../lib/region/zones";
+import { buildZones, groupZones, offsetLabel } from "../../../lib/region/zones";
 import { SettingRow } from "./SettingRow";
 import { useInlineSave } from "./useInlineSave";
 import type { UseSettingsResult } from "./useSettings";
@@ -45,7 +45,7 @@ export function RegionDefaultRows({ settings }: { settings: UseSettingsResult })
               <optgroup key={area} label={area}>
                 {zs.map((z) => (
                   <option key={z.tz} value={z.tz}>
-                    {z.city}, {z.country} · {formatOffset(z.offset)}
+                    {z.city}, {z.country} · {offsetLabel(z)}
                   </option>
                 ))}
               </optgroup>

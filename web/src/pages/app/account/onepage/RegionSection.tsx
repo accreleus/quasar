@@ -8,7 +8,7 @@ import { ApiError } from "../../../../api/client";
 import { getRegionInput, patchRegionInput, type RegionInputWire } from "../../../../api/me";
 import { ResourceStates } from "../../../../components/ResourceStates";
 import { useResource } from "../../../../lib/resource/react";
-import { browserZone, buildZones, clockIn, formatOffset, offsetMinutes, zoneFor } from "../../../../lib/region/zones";
+import { browserZone, buildZones, clockIn, offsetLabel, zoneFor } from "../../../../lib/region/zones";
 import { TimezonePicker } from "./TimezonePicker";
 
 const CLOCK_TICK_MS = 30_000;
@@ -76,8 +76,8 @@ export function RegionSection() {
               />
             </div>
             <p className="muted mt3">
-              Now: {nowZone.city} ({nowZone.tz}){shown === null ? followNote : ""} · {clockIn(nowZone.tz, now)} ·{" "}
-              {formatOffset(offsetMinutes(nowZone.tz, now) ?? 0)}
+              Now: {nowZone.city} ({nowZone.tz}){shown === null ? followNote : ""}
+              {nowZone.offset !== null && ` · ${clockIn(nowZone.tz, now)} · ${offsetLabel(nowZone)}`}
             </p>
           </div>
           <p className={status && !status.ok ? "form-error mt3" : "muted mt3"} role="status">

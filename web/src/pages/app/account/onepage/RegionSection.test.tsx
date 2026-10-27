@@ -141,8 +141,68 @@ describe("Region section", () => {
     fireEvent.change(box, { target: { value: "america new york" } });
     expect(within(await list()).getByRole("option", { name: /New York/ })).toBeTruthy();
     fireEvent.change(box, { target: { value: "zzzzzz" } });
-    expect(screen.getByText("No timezone matches. Try a city or country name.")).toBeTruthy();
+    expect(screen.getAllByText("No timezone matches. Try a city or country name.")).toHaveLength(2);
     expect(option(/Follow my browser/)).toBeTruthy();
+  });
+
+  it("search then Enter picks the match that is drawn, never the row the search hid", async () => {
+    api.getRegionInput.mockResolvedValue(body("Europe/Paris"));
+    renderSection();
+    const box = await list();
+    fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: "tokyo" } });
+    const drawn = box.querySelector(".tz-opt.is-active");
+    expect(drawn?.textContent).toMatch(/Tokyo/);
+    expect(box.getAttribute("aria-activedescendant")).toBe(drawn?.id);
+    fireEvent.keyDown(box, { key: "Enter" });
+    await waitFor(() => expect(api.patchRegionInput).toHaveBeenCalledWith("t0k3n", { region: { timezone: "Asia/Tokyo" } }));
+  });
+
+  it("search then Space picks the same drawn match", async () => {
+    api.getRegionInput.mockResolvedValue(body("Europe/Paris"));
+    renderSection();
+    const box = await list();
+    fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: "tokyo" } });
+    fireEvent.keyDown(box, { key: " " });
+    await waitFor(() => expect(api.patchRegionInput).toHaveBeenCalledTimes(1));
+    expect(api.patchRegionInput).toHaveBeenCalledWith("t0k3n", { region: { timezone: "Asia/Tokyo" } });
+  });
+
+  it("Enter does nothing on a saved zone outside the list when nothing is searched", async () => {
+    api.getRegionInput.mockResolvedValue(body("Asia/Calcutta"));
+    renderSection();
+    const box = await list();
+    expect(box.hasAttribute("aria-activedescendant")).toBe(false);
+    expect(box.querySelector(".tz-opt.is-active")).toBeNull();
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.keyDown(box, { key: " " });
+    expect(api.patchRegionInput).not.toHaveBeenCalled();
+  });
+
+  it("Enter does nothing when the search matches nothing and the saved zone is hidden", async () => {
+    api.getRegionInput.mockResolvedValue(body("Europe/Paris"));
+    renderSection();
+    const box = await list();
+    fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: "zzzzzz" } });
+    expect(box.hasAttribute("aria-activedescendant")).toBe(false);
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(api.patchRegionInput).not.toHaveBeenCalled();
+  });
+
+  it("says there is no match outside the listbox, in a live region", async () => {
+    renderSection();
+    const box = await list();
+    fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: "zzzzzz" } });
+    expect(within(box).queryByText(/No timezone matches/)).toBeNull();
+    const live = document.querySelector('[aria-live="polite"]');
+    expect(live?.textContent).toBe("No timezone matches. Try a city or country name.");
+  });
+
+  it("shows a saved zone this browser's Intl does not know by name alone, and the page still renders", async () => {
+    api.getRegionInput.mockResolvedValue(body("Not/AZone"));
+    renderSection();
+    await list();
+    expect(screen.getByText(/^Now: AZone \(Not\/AZone\)$/)).toBeTruthy();
+    expect(option(/Follow my browser/).getAttribute("aria-selected")).toBe("false");
   });
 
   it("moves with the arrow keys and saves only on Enter", async () => {

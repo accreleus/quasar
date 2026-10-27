@@ -129,6 +129,7 @@ describe("legacy admin paths", () => {
     ["/admin/activity", "/admin/audit"],
     ["/app/account", "/app/account/profile"],
     ["/app/account/security", "/app/account/profile"],
+    ["/app/account/region", "/app/account/streaming"],
   ])("redirects %s to %s", async (from, to) => {
     renderAt(from);
     await waitFor(() => expect(path).toBe(to));
@@ -151,7 +152,18 @@ describe("the account paths in the new design", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } })));
   });
 
-  it.each(["/app/account", "/app/account/security", "/app/account/devices"])("%s shows the one page and does not redirect", async (entry) => {
+  it.each(["/app/account", "/app/account/security", "/app/account/devices", "/app/account/region"])("%s shows the one page and does not redirect", async (entry) => {
+    renderAt(entry);
+    expect(await screen.findByRole("heading", { name: "Account", level: 1 })).toBeInTheDocument();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(path).toBe(entry);
+  });
+});
+
+describe("a stale Classic mirror", () => {
+  it.each(["/app/account/region", "/app/account/security"])("does not redirect %s once the server says new design", async (entry) => {
+    localStorage.setItem("quasar.ui.classic.u1", "1");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response('{"classic_layout":false}', { status: 200, headers: { "content-type": "application/json" } })));
     renderAt(entry);
     expect(await screen.findByRole("heading", { name: "Account", level: 1 })).toBeInTheDocument();
     await new Promise((r) => setTimeout(r, 50));

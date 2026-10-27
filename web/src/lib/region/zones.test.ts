@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildZones, cityOf, formatOffset, groupZones, offsetMinutes, searchZones, zoneFor } from "./zones";
+import { buildZones, cityOf, clockIn, formatOffset, groupZones, offsetMinutes, searchZones, zoneFor } from "./zones";
 import { ZONE_TABLE } from "./zoneTable";
 
 const WINTER = new Date("2026-01-15T12:00:00Z");
@@ -19,6 +19,12 @@ describe("timezone helpers", () => {
     expect(offsetMinutes("America/Adak", WINTER)).toBe(-600);
     expect(offsetMinutes("America/Adak", SUMMER)).toBe(-540);
     expect(offsetMinutes("Not/AZone", WINTER)).toBeNull();
+  });
+
+  it("has no clock or offset for a zone this browser does not know", () => {
+    expect(clockIn("Not/AZone", WINTER)).toBeNull();
+    expect(clockIn("Asia/Tokyo", WINTER)).toBe("21:00");
+    expect(zoneFor("Not/AZone", buildZones(WINTER), WINTER)).toMatchObject({ tz: "Not/AZone", city: "AZone", offset: null });
   });
 
   it("names the place from the zone", () => {
