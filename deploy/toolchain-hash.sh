@@ -103,6 +103,7 @@ base_image_identity() {
 }
 
 emit_inputs() {
+  printf 'proof ci867\n'
   # 1. toolchain pins, in the fixed order above (not sorted by the shell's
   #    locale, which differs between macOS and Fedora).
   local k v
