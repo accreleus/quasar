@@ -188,6 +188,9 @@ export function updateSettings(
     /** Rejected with 400 unless it is a git ref name: 1-255 characters, no
      *  whitespace, no "..", no leading "-". */
     release_edge_branch?: string;
+    /** How often release detection runs; `null` follows the channel again
+     *  (daily on preview, weekly otherwise). A channel switch never changes it. */
+    release_check?: "daily" | "weekly" | null;
     /** "" clears the URL and disables the webhook in the same write; anything
      *  else must be an absolute https URL with no credentials. */
     release_webhook_url?: string;

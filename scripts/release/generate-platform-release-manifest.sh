@@ -14,6 +14,10 @@
 # `below_floor` against and the floor its release publishes cannot disagree).
 # `prerelease` is derived from the version.
 #
+# --preview, in place of --version, writes the preview manifest instead: `version`
+# null and `prerelease` false (protocol/control-api.md "Platform-release preview
+# channel"). It writes no `commits`.
+#
 # The output is validated by validate-platform-release-manifest.sh before this
 # script exits 0, so a bad input never leaves a published-looking file behind.
 #
@@ -34,11 +38,12 @@ registry_ns=""
 migrations_dir="$root/control-plane/migrations"
 floor_source="$root/control-plane/internal/buildinfo/floor.go"
 output=""
+preview=0
 
 usage() {
   cat <<'EOF'
 usage: scripts/release/generate-platform-release-manifest.sh \
-         --version X.Y.Z[-prerelease] \
+         (--version X.Y.Z[-prerelease] | --preview) \
          --source-commit <40 hex> \
          --built-at YYYY-MM-DDTHH:MM:SSZ \
          --control-digest sha256:<64 hex> \
@@ -58,6 +63,9 @@ and <registry-ns>/quasar-recovery, tag-free — consumers compose image@digest.
 The floor is read from the floor source's two lines
 `const FloorNodeAgent = "<semver>"` and `const FloorRecoveryActor = "<semver>"`.
 
+--preview writes the preview manifest a push to develop publishes: format 2 with
+`version` null and `prerelease` false, validated with the validator's --preview.
+
 Schema and field grammar: scripts/release/platform-release-manifest.md
 EOF
 }
@@ -74,11 +82,17 @@ while (($#)); do
     --migrations-dir) migrations_dir=${2:?--migrations-dir needs a path}; shift 2 ;;
     --floor-source) floor_source=${2:?--floor-source needs a path}; shift 2 ;;
     --output) output=${2:?--output needs a path}; shift 2 ;;
+    --preview) preview=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
 done
 
+if ((preview)) && [[ -n "$version" ]]; then
+  echo "generate-platform-release-manifest: --preview and --version are exclusive" >&2
+  exit 2
+fi
+((preview)) && version=-
 for required in version source_commit built_at control_digest agent_digest recovery_digest \
     registry_ns output; do
   if [[ -z "${!required}" ]]; then
@@ -89,7 +103,7 @@ for required in version source_commit built_at control_digest agent_digest recov
 done
 
 python3 - "$version" "$source_commit" "$built_at" "$control_digest" "$agent_digest" \
-  "$recovery_digest" "$registry_ns" "$migrations_dir" "$floor_source" "$output" <<'PY'
+  "$recovery_digest" "$registry_ns" "$migrations_dir" "$floor_source" "$output" "$preview" <<'PY'
 import json
 import re
 import sys
@@ -97,6 +111,7 @@ from pathlib import Path
 
 (version, source_commit, built_at, control_digest, agent_digest, recovery_digest,
  registry_ns, migrations_dir, floor_source, output) = sys.argv[1:11]
+preview = sys.argv[11] == "1"
 errors = []
 
 SEMVER = re.compile(
@@ -114,7 +129,9 @@ NAMESPACE = re.compile(
 )
 
 parsed = SEMVER.fullmatch(version)
-if "+" in version:
+if preview:
+    pass
+elif "+" in version:
     errors.append(f"--version must not carry semver build metadata: {version!r}")
 elif not parsed:
     errors.append(
@@ -187,8 +204,8 @@ if errors:
 
 manifest = {
     "format_version": 2,
-    "version": version,
-    "prerelease": bool(parsed.group("pre")),
+    "version": None if preview else version,
+    "prerelease": False if preview else bool(parsed.group("pre")),
     "source_commit": source_commit,
     "built_at": built_at,
     "schema_version": schema_version,
@@ -216,9 +233,11 @@ PY
 
 # Never publish an unvalidated manifest, and never leave one behind: the same
 # validator the workflow runs decides whether this file may exist at all.
+mode=(--expect-version "$version")
+((preview)) && mode=(--preview)
 if ! "$validator" "$output" \
     --expect-format 2 \
-    --expect-version "$version" \
+    "${mode[@]}" \
     --expect-control-digest "$control_digest" \
     --expect-agent-digest "$agent_digest" \
     --expect-recovery-digest "$recovery_digest" >/dev/null; then

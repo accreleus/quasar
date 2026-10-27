@@ -1,16 +1,17 @@
 name: Images
 
-# Builds and publishes the production container images. Two ways in, and only
-# two:
+# Builds and publishes the production container images. Three ways in:
 #
 #   * MANUAL DISPATCH for a branch (workflow_dispatch → Actions tab → "Images" →
-#     Run workflow). Unchanged operator directive: during rapid development
-#     images are built locally on the deploy hosts (deploy/redeploy.sh), and
-#     nothing is pushed automatically on merge — a `develop` merge builds nothing.
+#     Run workflow): an edge build, published as `sha-*` and `o2-<branch>`.
+#   * AUTOMATIC on a PUSH TO `develop` (#839): the preview build. It publishes
+#     what a dispatch on `develop` would, and then the preview manifest at
+#     `quasar-release-manifest:preview` (the `preview` job, last). A newer push
+#     cancels an older run still in flight (`concurrency`).
 #   * AUTOMATIC on a `v*` TAG PUSH (#104/#108) — the release lever. See the
 #     trigger note above `on:` at the bottom of this header.
 #
-# A push to a BRANCH never triggers this workflow.
+# A push to any other branch never triggers this workflow.
 #
 # ── BUILD IS SPLIT FROM PROMOTION (2026-08-31) ────────────────────────────────
 #
@@ -45,6 +46,8 @@ name: Images
 #               digest references). Token is `contents: read` only.
 #   promote     `docker buildx imagetools create` the real tag set ONTO the
 #               validated digest. Registry-side, no rebuild, no re-resolution.
+#   preview     on a push to `develop` only: the preview manifest naming the three
+#               promoted digests, as a one-layer OCI artifact at tag `preview`.
 #
 # WHY THE DIGEST CANNOT BE SWAPPED. `build-*` emits `steps.build.outputs.digest`;
 # every later job consumes `needs.build-*.outputs.digest` and composes the
@@ -158,13 +161,16 @@ name: Images
 #   for it — so it is not contract-validated. What it does get is a verified
 #   re-tag: see the toolchain job.
 #
-# NO BRANCH PUSH TRIGGER (operator directive 2026-07-06): the quasar-node-agent
-# lane builds patched GStreamer from source (~85 min cold) and automatic per-push
-# /PR triggers exhausted the account's Actions minutes. A merge to `develop` or
-# `main` still builds NOTHING; publish from a branch by hand, from the Actions
-# tab. That directive stands.
+# ONE BRANCH PUSH TRIGGER, `develop` (#839, owner decision on #837). The
+# 2026-07-06 directive against branch push triggers was about the account's Actions
+# minutes on the private repo; this repository is public. A landing on `develop`
+# builds only when an image input changed (the #867 gate in `inputs`), and the
+# toolchain is reused by its content hash, so most landings cost the gate's seconds
+# or one image build, not the ~85 minute cold GStreamer build. A landing that
+# builds nothing publishes no new preview. `main` and every other branch still
+# build only by hand.
 #
-# The one automatic trigger is a `v*` TAG PUSH (#104/#108), which is the release
+# The other automatic trigger is a `v*` TAG PUSH (#104/#108), which is the release
 # lever: pushing `vX.Y.Z` on `main` publishes a stable platform release — images,
 # the version tag set, a GitHub Release whose body is that version's CHANGELOG
 # section, and the `platform-release-manifest.v2.json` asset the control plane reads
@@ -183,7 +189,13 @@ on:
         description: Build every image even when no image input changed since this branch's last successful run.
         type: boolean
         default: false
+      preview:
+        description: Also publish a TEST preview manifest at quasar-release-manifest:preview-<branch>. Only a push to develop moves the tag `preview`.
+        type: boolean
+        default: false
   push:
+    branches:
+      - develop
     tags:
       - 'v*'
 
@@ -361,6 +373,8 @@ jobs:
       toolchain_ref: ${{ steps.toolchain.outputs.ref }}
       # 'false' = no image input changed: the jobs below are skipped, whole.
       build_any: ${{ steps.gate.outputs.build_any }}
+      # The preview manifest's tag, or '' for no preview (the `preview` job).
+      preview_tag: ${{ steps.preview.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -458,6 +472,21 @@ jobs:
           echo "REUSING $image -- pins, patches, the toolchain stage and the base are unchanged."
           echo "Skipping a ~40 minute GStreamer build: ${image%:*}@${d}"
           echo "| toolchain | \`${image%:*}@${d}\` (reused) |" >> "$GITHUB_STEP_SUMMARY"
+      # `preview` only on a push to develop. A dispatch asked for a preview gets a
+      # branch-scoped test tag, `preview-<branch>`, which no control plane reads.
+      # The rule, and its table test, are scripts/release/preview-rules.sh.
+      - name: Decide the preview tag
+        id: preview
+        env:
+          EVENT: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          BRANCH: ${{ github.ref_name }}
+          WANT_PREVIEW: ${{ inputs.preview }}
+        run: |
+          set -euo pipefail
+          tag="$(bash scripts/release/preview-rules.sh tag "$EVENT" "$GIT_REF" "$BRANCH" "$WANT_PREVIEW")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "preview tag: ${tag:-none}"
       # ── Build only when an image input changed (#867) ──────────────────────
       #
       # Do any image's inputs differ from the last build of this branch? The input
@@ -471,14 +500,22 @@ jobs:
       #   last build held; a diff of two trees is right across merges, reverts and force
       #   pushes, and a run that found nothing to build counts as a success because its
       #   image inputs equal its base's. No previous success, or its commit gone, builds.
+      #   ON A PUSH TO DEVELOP (#839) the base is instead the commit the published
+      #   `preview` manifest names: a dispatch on develop also succeeds on develop but
+      #   moves no preview, and as a base it would make the next landing skip and leave
+      #   the preview behind. No preview published yet builds everything. A run OLDER
+      #   than that commit (a re-run of an earlier landing) fails here, before it builds
+      #   or promotes anything: the preview, and `o2-develop` with it, only move forward
+      #   (scripts/release/preview-rules.sh forward; the preview job checks it again
+      #   right before it moves the tag).
       #   ALWAYS BUILDS: a `v*` tag, a dispatch with `force`, and a run whose toolchain is
       #   not published yet. The toolchain tag is a content hash over the pins, the patches,
       #   the toolchain stage, deploy/toolchain-hash.sh and the resolved base digest, so a
       #   base rebuild or a pin change moves it without touching any image-input path;
       #   it is resolved just above, which is why this step comes after it.
       #   Skipping works by `if:` on the toolchain and build-* jobs: their dependants (the
-      #   validate-* jobs, preflight, promote, release) are skipped with them, so nothing
-      #   is validated or promoted either.
+      #   validate-* jobs, preflight, promote, release, preview) are skipped with them, so
+      #   nothing is validated or promoted either.
       - name: Decide whether any image input changed
         id: gate
         env:
@@ -487,13 +524,29 @@ jobs:
           RELEASE_CANDIDATE: ${{ steps.resolve.outputs.release_candidate }}
           FORCE: ${{ inputs.force }}
           TOOLCHAIN_BUILD: ${{ steps.toolchain.outputs.build }}
+          PREVIEW_TAG: ${{ steps.preview.outputs.tag }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           why=""
           prev=""
+          current=""
+          if [ "$PREVIEW_TAG" = preview ]; then
+            # An unreadable tag fails the step; only a 404 reads as "not published".
+            current="$(bash scripts/release/publish-preview-manifest.sh --current "$REGISTRY_NS/quasar-release-manifest:preview")"
+            echo "the preview names: ${current:-nothing (not published)}"
+            if ! bash scripts/release/preview-rules.sh forward "$current" HEAD; then
+              echo "::error::this run's commit is older than the published preview (${current:0:7}). It would move develop's images and the preview back, so it stops here. Re-run the newest develop run instead."
+              exit 1
+            fi
+          fi
           if [ "$RELEASE_CANDIDATE" = true ]; then why="release tag: builds everything"
           elif [ "$FORCE" = true ]; then why="force: builds everything"
           elif [ "$TOOLCHAIN_BUILD" = true ]; then why="the toolchain for these pins and this base is not published: builds everything"
+          elif [ "$PREVIEW_TAG" = preview ]; then
+            prev="$current"
+            [ -n "$prev" ] || why="no preview is published yet: builds everything"
           else
             prev="$(gh run list --workflow images.yml --branch "$BRANCH" --status success \
                       --limit 1 --json headSha --jq '.[0].headSha // empty' || true)"
@@ -1334,6 +1387,127 @@ jobs:
             echo "\`:X.Y.Z\` on a re-dispatched release tag — re-dispatch to fix that one."
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
+
+  # ── Phase 4b: the preview manifest (a push to develop; #839) ───────────────
+  #
+  # One document naming the three digests this run built and promoted, published
+  # at `quasar-release-manifest:preview` (protocol/control-api.md "Platform-release
+  # preview channel"): an OCI image manifest whose one layer is the document. A
+  # control plane on the preview channel reads that tag and nothing else.
+  #
+  # The tag moves LAST. This job needs `promote`, which needs every validate-* job
+  # and preflight, so by the time it runs every image the document names is
+  # published and has passed its contract; the step below also re-reads each
+  # image's org.quasar.source.commit label, which the control plane checks too. A
+  # run that built nothing skips the build jobs and therefore this one: the tag
+  # stays on the last build.
+  #
+  # THE TAG ONLY MOVES FORWARD. publish-preview-manifest.sh reads the document the
+  # tag names now and refuses unless its source_commit is an ancestor of this run's
+  # commit (or is it), so re-running an OLDER run fails instead of rewinding the
+  # channel; the `inputs` gate refuses such a run earlier still. Re-running the
+  # newest run is safe: the same commit is accepted and the push is idempotent.
+  # A failure before the push's one manifest PUT leaves the tag where it was. A
+  # failure in the read-back after it means the tag HAS moved: look at it before
+  # re-running. The residual: the read and the PUT are two requests, and nothing
+  # but the `concurrency` group (one develop run at a time) keeps a second writer
+  # out between them.
+  #
+  # The package is created by this job's first push. It must be PUBLIC (an install
+  # reads it anonymously); a human checks that once after the first push and changes
+  # it if not (scripts/release/platform-release-manifest.md, "The preview manifest").
+  # A private package reads as not published.
+  #
+  # `commits` is not written yet (#843).
+  preview:
+    name: publish the preview manifest
+    needs: [inputs, build-control-plane, build-node-agent, build-recovery-actor, promote]
+    if: needs.inputs.outputs.preview_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The forward check compares this commit with the one the tag names.
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate and validate the preview manifest
+        id: manifest
+        env:
+          COMMIT: ${{ github.sha }}
+          BUILT_AT: ${{ needs.inputs.outputs.built_at }}
+          CONTROL_DIGEST: ${{ needs.build-control-plane.outputs.digest }}
+          AGENT_DIGEST: ${{ needs.build-node-agent.outputs.digest }}
+          RECOVERY_DIGEST: ${{ needs.build-recovery-actor.outputs.digest }}
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/platform-release-manifest.preview.json"
+          bash scripts/release/generate-platform-release-manifest.sh \
+            --preview \
+            --source-commit "$COMMIT" \
+            --built-at "$BUILT_AT" \
+            --control-digest "$CONTROL_DIGEST" \
+            --agent-digest "$AGENT_DIGEST" \
+            --recovery-digest "$RECOVERY_DIGEST" \
+            --registry-ns "$REGISTRY_NS" \
+            --output "$manifest"
+          # Again from the job, as the release job does: the push below never depends
+          # on the generator's internals to have tied the file to THIS run's digests.
+          bash scripts/release/validate-platform-release-manifest.sh "$manifest" \
+            --preview \
+            --expect-format 2 \
+            --expect-control-digest "$CONTROL_DIGEST" \
+            --expect-agent-digest "$AGENT_DIGEST" \
+            --expect-recovery-digest "$RECOVERY_DIGEST"
+          echo "path=$manifest" >> "$GITHUB_OUTPUT"
+          cat "$manifest"
+
+      # One commit for every image: each component must carry this run's commit.
+      - name: Check every component was built from this commit
+        env:
+          COMMIT: ${{ github.sha }}
+          MANIFEST: ${{ steps.manifest.outputs.path }}
+        run: |
+          set -euo pipefail
+          while read -r name ref; do
+            got="$(docker buildx imagetools inspect --format '{{index .Image.Config.Labels "org.quasar.source.commit"}}' "$ref")"
+            if [ "$got" != "$COMMIT" ]; then
+              echo "::error::$name $ref carries org.quasar.source.commit '$got', not $COMMIT"
+              exit 1
+            fi
+            echo "  $name $ref <- $COMMIT"
+          done < <(jq -r '.components[] | "\(.name) \(.image)@\(.digest)"' "$MANIFEST")
+
+      - name: Publish the preview manifest
+        id: publish
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANIFEST: ${{ steps.manifest.outputs.path }}
+          TAG: ${{ needs.inputs.outputs.preview_tag }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ref="$REGISTRY_NS/quasar-release-manifest:$TAG"
+          digest="$(bash scripts/release/publish-preview-manifest.sh "$MANIFEST" "$ref" --source-url "$SOURCE_URL")"
+          {
+            echo "### Preview manifest"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| tag | \`$ref\` |"
+            echo "| manifest | \`$digest\` |"
+            echo "| source_commit | \`$(jq -r .source_commit "$MANIFEST")\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Phase 5: publish the release itself (tag pushes only) ──────────────────
   #
