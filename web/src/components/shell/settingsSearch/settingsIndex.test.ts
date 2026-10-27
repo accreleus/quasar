@@ -50,6 +50,15 @@ describe("settings search", () => {
     });
   });
 
+  it("finds the Region section and its timezone setting", () => {
+    expect(labels("timezone")[0]).toBe("Timezone");
+    expect(labels("clock")).toEqual(expect.arrayContaining(["Region", "Timezone"]));
+    expect(searchSettings("timezone", ACCOUNT_SETTINGS)[0]).toMatchObject({ to: "/app/account/region", target: { sel: "#tz-label" } });
+    expect(labels("timezone", ADMIN_SETTINGS)).toContain("Timezone");
+    expect(labels("dvorak", ADMIN_SETTINGS)).toContain("Keyboard layout");
+    expect(labels("nintendo", ADMIN_SETTINGS)).toContain("Gamepad Nintendo layout");
+  });
+
   it("finds admin pages, tabs and settings rows", () => {
     expect(labels("releases", ADMIN_SETTINGS)[0]).toBe("Releases");
     expect(labels("1080p", ADMIN_SETTINGS)).toContain("Launch profiles");
@@ -71,7 +80,7 @@ describe("palette order: the current place first", () => {
   it("account with no query lists the sections first", () => {
     const g = arrangeWithSettings(searchPalette("", sources), "", placeOf("/app/account", ADMIN));
     expect(titles(g)).toEqual(["Settings", "Actions"]);
-    expect(g[0].items.map((i) => i.label)).toEqual(["Profile", "Stream quality", "In-session overlay", "Appearance", "Devices", "Password", "Storage", "My sessions"]);
+    expect(g[0].items.map((i) => i.label)).toEqual(["Profile", "Stream quality", "Region", "In-session overlay", "Appearance", "Devices", "Password", "Storage", "My sessions"]);
   });
 
   it("home: games, then Settings", () => {

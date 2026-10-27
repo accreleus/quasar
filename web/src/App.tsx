@@ -36,7 +36,7 @@ import { AccountStorage } from "./pages/app/account/AccountStorage";
 import { SessionPage } from "./pages/app/SessionPage";
 import { StyleguidePage } from "./pages/StyleguidePage";
 import { RouteErrorBoundary, RouteSkeleton } from "./components/RouteBoundary";
-import { OverlayPreferencesRoute } from "./settings/OverlayPreferencesContext";
+import { OverlayPreferencesRoute, useOverlayPreferences } from "./settings/OverlayPreferencesContext";
 
 // Admin area — lazy-loaded. Vite splits this into a separate chunk automatically
 // because of the dynamic import boundary. The Suspense fallback is intentionally
@@ -152,6 +152,13 @@ const adminPages = {
   ),
 };
 
+/** A Classic-only redirect: the new design renders one page for these paths. Waits for the
+ *  saved layout, so a stale local mirror cannot redirect a new-design user. */
+function ClassicRedirect({ to }: { to: string }) {
+  const { loaded, newDesign } = useOverlayPreferences();
+  return loaded && !newDesign ? <Navigate to={to} replace /> : null;
+}
+
 /**
  * A legacy path kept alive. Substitutes the matched route params into `to`
  * (`/admin/fleet/hosts/:id/console` -> `/admin/fleet/hosts/:id/console`) and carries
@@ -224,6 +231,7 @@ export function App() {
           <Route element={<PreferencesSection />}>
             <Route path="overlay" element={<AccountOverlay />} />
             <Route path="streaming" element={<AccountStreaming />} />
+            <Route path="region" element={<ClassicRedirect to="/app/account/streaming" />} />
             <Route path="appearance" element={<AccountAppearance />} />
           </Route>
           <Route element={<UsageSection />}>
@@ -232,7 +240,7 @@ export function App() {
           </Route>
           {/* The password card merges into Profile in v3 (spec §3.3), so
               /security is a redirect, not a page. */}
-          <Route path="security" element={<Navigate to="/app/account/profile" replace />} />
+          <Route path="security" element={<ClassicRedirect to="/app/account/profile" />} />
         </Route>
         {/* Full-screen session view — outside AppLayout (no shell nav). */}
         <Route path="/app/session/:id" element={<SessionPage />} />
