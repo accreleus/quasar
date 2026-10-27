@@ -251,10 +251,7 @@ var allowedUnimplemented = map[string]struct{}{
 // server serves them (the spec carries no x-unimplemented marker for these).
 // Remove each entry in the change that registers the route; a registered entry
 // fails the test so none outlives its handler.
-var pendingImplementation = map[string]string{
-	"GET /v1/me/region-input":   "#846",
-	"PATCH /v1/me/region-input": "#846",
-}
+var pendingImplementation = map[string]string{}
 
 // unimplementedOperation reports whether an OpenAPI operation carries
 // `x-unimplemented: true` — a documented shape the server does not yet serve.

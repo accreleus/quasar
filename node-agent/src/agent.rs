@@ -3406,6 +3406,10 @@ struct RunningHandle {
     swapping: bool,
     /// What the runtime encodes, for an adoption's match check.
     stream: StreamParams,
+    /// The Region and Input keys its container was started with (amendment 49), for the
+    /// same check, and those of a swap the runner has not yet completed.
+    region_env: BTreeMap<String, String>,
+    swap_region_env: Option<BTreeMap<String, String>>,
     /// Set once the runner thread has returned, for a fresh build that must wait for it.
     exited: Arc<AtomicBool>,
 }
@@ -3723,9 +3727,13 @@ impl SessionManager {
             .collect()
     }
 
-    fn swap_resolved(&mut self, session_id: &str) {
+    /// A completed swap's container now holds the runtime's Region and Input values.
+    fn swap_resolved(&mut self, session_id: &str, done: bool) {
         if let Some(handle) = self.running.get_mut(session_id) {
             handle.swapping = false;
+            if let Some(env) = handle.swap_region_env.take().filter(|_| done) {
+                handle.region_env = env;
+            }
         }
     }
 
@@ -4072,6 +4080,7 @@ impl SessionManager {
                     let exited = Arc::new(AtomicBool::new(false));
                     let exited_flag = exited.clone();
                     let runtime_stream = cfg.stream.clone();
+                    let runtime_region_env = region_env(cfg.container.as_ref());
                     let kind = cfg.kind;
                     let (sig_in_tx, sig_in_rx) = std::sync::mpsc::channel::<SignalMsg>();
                     let (swap_tx, swap_rx) = std::sync::mpsc::channel::<SwapRequest>();
@@ -4248,6 +4257,8 @@ impl SessionManager {
                             adopted: Vec::new(),
                             swapping: false,
                             stream: runtime_stream,
+                            region_env: runtime_region_env,
+                            swap_region_env: None,
                             exited,
                         },
                     );
@@ -4382,12 +4393,14 @@ impl SessionManager {
                                 h.home_refs.push(r.clone());
                             }
                         }
+                        let swap_region_env = region_env(container.as_ref());
                         match h.swap.send(SwapRequest {
                             container,
                             in_place,
                         }) {
                             Ok(()) => {
                                 h.swapping = true;
+                                h.swap_region_env = Some(swap_region_env);
                                 if let Ok(mut g) = self.live_refs.lock() {
                                     for r in &new_refs {
                                         g.insert(r.clone());
@@ -5066,6 +5079,8 @@ impl SessionManager {
             Some("it is not a streamed session")
         } else if !h.encodes(&cfg.stream) {
             Some("it encodes another stream, or a smaller one")
+        } else if h.region_env != region_env(cfg.container.as_ref()) {
+            Some("its container was started with other Region and Input values")
         } else if cfg.kind != Some(SessionKind::Parked) && !h.metrics.launch_helper_connected() {
             // A runtime whose helper never connected cannot start the game.
             Some("its launch helper never connected")
@@ -5464,11 +5479,11 @@ impl SessionManager {
             // new app_id on SwapDone (agent-api.md).
             SessionEvent::Swapping => ("running", Some("swapping".to_string()), None),
             SessionEvent::SwapDone => {
-                self.swap_resolved(session_id);
+                self.swap_resolved(session_id, true);
                 ("running", Some("swap complete".to_string()), None)
             }
             SessionEvent::SwapRolledBack(reason) => {
-                self.swap_resolved(session_id);
+                self.swap_resolved(session_id, false);
                 (
                     "running",
                     Some(format!("swap failed; rolled back: {reason}")),
@@ -5547,6 +5562,33 @@ fn probe_inputs(mgr: &SessionManager) -> crate::host_probe::decision::ProbeInput
 /// [`MountPolicy`] runs. Mounts the agent itself appends later (the Wayland socket,
 /// the pulse runtime dir) are agent-authored and deliberately not re-checked.
 /// A rejection fails the assign or the swap; nothing is spawned.
+/// The env keys the control plane sets from a user's Region and Input settings
+/// (`agent-api.md` amendment 49).
+const REGION_INPUT_ENV_KEYS: [&str; 9] = [
+    "TZ",
+    "LANG",
+    "LC_TIME",
+    "LC_NUMERIC",
+    "LC_MONETARY",
+    "LC_MEASUREMENT",
+    "LC_PAPER",
+    "XKB_DEFAULT_LAYOUT",
+    "XKB_DEFAULT_VARIANT",
+];
+
+/// The Region and Input keys of an app's env; a runtime is adopted only by an app whose
+/// keys are equal (a key absent from both is equal).
+fn region_env(container: Option<&ContainerSpec>) -> BTreeMap<String, String> {
+    container
+        .map(|c| {
+            REGION_INPUT_ENV_KEYS
+                .iter()
+                .filter_map(|k| c.env.get(*k).map(|v| (k.to_string(), v.clone())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn app_to_container(app: AppSpec, mounts: &MountPolicy) -> anyhow::Result<Option<ContainerSpec>> {
     if app.image.is_empty() {
         return Ok(None);
@@ -9042,6 +9084,8 @@ mod tests {
                 adopted: Vec::new(),
                 swapping: false,
                 stream: StreamParams::default(),
+                region_env: BTreeMap::new(),
+                swap_region_env: None,
                 exited: Arc::new(AtomicBool::new(false)),
             },
             stop,
@@ -9101,6 +9145,8 @@ mod tests {
                 adopted: Vec::new(),
                 swapping: false,
                 stream: StreamParams::default(),
+                region_env: BTreeMap::new(),
+                swap_region_env: None,
                 exited: Arc::new(AtomicBool::new(false)),
             },
             display_rx,
@@ -10198,6 +10244,8 @@ mod tests {
                 adopted: Vec::new(),
                 swapping: false,
                 stream: StreamParams::default(),
+                region_env: BTreeMap::new(),
+                swap_region_env: None,
                 exited: Arc::new(AtomicBool::new(false)),
             },
             capture_rx,
@@ -11616,6 +11664,97 @@ mod tests {
         assert_eq!(
             warm.adopted.recv_timeout(WAIT).unwrap().1.kind,
             Some(SessionKind::Parked)
+        );
+    }
+
+    /// A Steam config whose app is what the control plane sends (amendment 49): its
+    /// `session_assign` app with the nine Region and Input keys over the runtime spec's env.
+    fn steam_cfg_from_wire(kind: SessionKind, flags: &str, tz: &str) -> SessionConfig {
+        let assign: ControlMsg = serde_json::from_value(serde_json::json!({
+            "type": "session_assign", "id": "c1", "session_id": "s1", "gpu_index": 0,
+            "kind": if kind == SessionKind::Parked { "parked" } else { "play" },
+            "app": {"image": "steam", "env": {
+                "STEAM_STARTUP_FLAGS": flags, "TZ": tz, "LANG": "de_DE.UTF-8",
+                "LC_TIME": "de_DE.UTF-8", "LC_NUMERIC": "de_DE.UTF-8",
+                "LC_MONETARY": "de_DE.UTF-8", "LC_MEASUREMENT": "de_DE.UTF-8",
+                "LC_PAPER": "de_DE.UTF-8", "XKB_DEFAULT_LAYOUT": "de",
+                "XKB_DEFAULT_VARIANT": ""}},
+            "stream": {"width": 1920, "height": 1080, "fps": 60,
+                "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+        }))
+        .unwrap();
+        let ControlMsg::SessionAssign { app, .. } = assign else {
+            unreachable!()
+        };
+        let mut cfg = steam_cfg(kind, flags, (1920, 1080));
+        cfg.container = app_to_container(app, &MountPolicy::default()).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn an_adoption_needs_the_region_and_input_values_the_runtime_started_with() {
+        // The control plane's order: the parked assign and start, its running report,
+        // then the claim's assign naming it and the claim's start.
+        let park = |mgr: &mut SessionManager, warm: &Warm| {
+            let cfg = steam_cfg_from_wire(SessionKind::Parked, "-silent", "Europe/Berlin");
+            assert!(acked(start(mgr, warm, "k1", cfg, None)));
+            warm.started.recv_timeout(WAIT).unwrap();
+            mgr.on_event("k1", SessionEvent::Running);
+            mgr.running["k1"].metrics.set_launch_helper_connected();
+        };
+
+        let (mut mgr, warm) = warm_manager();
+        park(&mut mgr, &warm);
+        let same = steam_cfg_from_wire(SessionKind::Play, "-applaunch 730", "Europe/Berlin");
+        assert!(acked(start(&mut mgr, &warm, "p1", same, Some("k1"))));
+        assert_eq!(warm.adopted.recv_timeout(WAIT).unwrap().0, "k1", "adopted");
+
+        let (mut mgr, warm) = warm_manager();
+        park(&mut mgr, &warm);
+        let moved = steam_cfg_from_wire(SessionKind::Play, "-applaunch 730", "Europe/London");
+        assert!(acked(start(&mut mgr, &warm, "p1", moved, Some("k1"))));
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed), "torn down");
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap().0,
+            "p1",
+            "built fresh"
+        );
+        assert!(warm.adopted.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_completed_swap_carries_its_region_and_input_values_to_the_runtime() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg_from_wire(SessionKind::Play, "-applaunch 620", "Europe/Berlin");
+        assert!(acked(start(&mut mgr, &warm, "p0", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("p0", SessionEvent::Running);
+        let swap = |mgr: &mut SessionManager, tz: &str| {
+            let app = AppSpec {
+                image: "steam".into(),
+                env: BTreeMap::from([("TZ".to_string(), tz.to_string())]),
+                ..Default::default()
+            };
+            let ctrl = ControlMsg::SessionSwapApp {
+                id: "swap".into(),
+                session_id: "p0".into(),
+                app,
+                in_place: false,
+            };
+            assert!(acked(mgr.handle_control(
+                ctrl,
+                &warm.evt_tx,
+                &diagnostic_sender()
+            )));
+        };
+        swap(&mut mgr, "Asia/Tokyo");
+        mgr.relay("p0", SessionEvent::SwapRolledBack("x".into()));
+        assert_eq!(mgr.running["p0"].region_env["TZ"], "Europe/Berlin");
+        swap(&mut mgr, "Asia/Tokyo");
+        mgr.relay("p0", SessionEvent::SwapDone);
+        assert_eq!(
+            mgr.running["p0"].region_env,
+            BTreeMap::from([("TZ".to_string(), "Asia/Tokyo".to_string())])
         );
     }
 

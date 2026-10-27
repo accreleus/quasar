@@ -182,8 +182,8 @@ func TestNonManagedSpecUntouched(t *testing.T) {
 	disp.mu.Lock()
 	got := string(disp.assigns[0])
 	disp.mu.Unlock()
-	if got != string(app.RuntimeSpec) {
-		t.Errorf("non-managed spec was modified:\n got: %s\nwant: %s", got, string(app.RuntimeSpec))
+	if g, want := withoutRegionInput(t, got), canonicalJSON(t, string(app.RuntimeSpec)); g != want {
+		t.Errorf("non-managed spec was modified beyond the region keys:\n got: %s\nwant: %s", g, want)
 	}
 	// And the unknown field survived end-to-end.
 	if !strings.Contains(got, "extra_unknown") {

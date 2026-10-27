@@ -142,6 +142,9 @@ type Settings struct {
 	SteamWarmRewarm      string `json:"steam_warm_rewarm"`
 	SteamWarmIdleMinutes int    `json:"steam_warm_idle_minutes"`
 
+	// Region and Input install defaults (amendment 49, migration 0108).
+	RegionInputDefaults
+
 	UpdatedBy *string   `json:"updated_by"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -321,6 +324,7 @@ func (s *Store) Get(ctx context.Context) (Settings, error) {
 			PlatformAutoApply:     false,
 			SteamWarmRewarm:       SteamWarmRewarmLibraryOpen,
 			SteamWarmIdleMinutes:  DefaultSteamWarmIdleMinutes,
+			RegionInputDefaults:   BuiltInRegionInputDefaults,
 			UpdatedAt:             time.Now().UTC(),
 		}, nil
 	}
@@ -493,20 +497,23 @@ const settingsColumns = `registration_mode, storage_provider, library_discovery_
 	release_channel, release_edge_branch, release_check,
 	release_webhook_enabled, release_webhook_url, platform_auto_apply,
 	steam_preparation_enabled, steam_preparation_revision::text,
-	steam_warm_enabled, steam_warm_rewarm, steam_warm_idle_minutes, updated_by::text, updated_at`
+	steam_warm_enabled, steam_warm_rewarm, steam_warm_idle_minutes,
+	` + RegionInputDefaultsColumns + `, updated_by::text, updated_at`
 
 // scanner is the shared surface of pgx.Row and pgx.Rows.
 type scanner interface{ Scan(dest ...any) error }
 
 func scanSettings(row scanner) (Settings, error) {
 	var st Settings
-	err := row.Scan(&st.RegistrationMode, &st.StorageProvider, &st.LibraryDiscoveryEnabled,
+	dest := []any{&st.RegistrationMode, &st.StorageProvider, &st.LibraryDiscoveryEnabled,
 		&st.LibraryDiscoveryIntervalMinutes, &st.LibraryDiscoveryAppDetailsEnabled,
 		&st.MicCaptureEnabled, &st.ImageUpdatePolicy, &st.AllowedOrigins,
 		&st.ReleaseChannel, &st.ReleaseEdgeBranch, &st.ReleaseCheck,
 		&st.ReleaseWebhookEnabled, &st.ReleaseWebhookURL, &st.PlatformAutoApply,
 		&st.SteamPreparationEnabled, &st.SteamPreparationRevision,
-		&st.SteamWarmEnabled, &st.SteamWarmRewarm, &st.SteamWarmIdleMinutes, &st.UpdatedBy, &st.UpdatedAt)
+		&st.SteamWarmEnabled, &st.SteamWarmRewarm, &st.SteamWarmIdleMinutes}
+	dest = append(dest, regionInputDefaultsDest(&st.RegionInputDefaults)...)
+	err := row.Scan(append(dest, &st.UpdatedBy, &st.UpdatedAt)...)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -545,6 +552,7 @@ type Patch struct {
 	SteamWarmEnabled     *bool
 	SteamWarmRewarm      *string
 	SteamWarmIdleMinutes *int
+	RegionInput          RegionInputPatch
 }
 
 // ChangedKeys lists the fields this patch sets, for the audit row. Names only —
@@ -578,7 +586,7 @@ func (p Patch) ChangedKeys() []string {
 			keys = append(keys, f.name)
 		}
 	}
-	return keys
+	return append(keys, p.RegionInput.changedKeys()...)
 }
 
 // Empty reports whether the patch names no known field.
@@ -589,7 +597,8 @@ func (p Patch) Empty() bool {
 		p.ReleaseChannel == nil && p.ReleaseEdgeBranch == nil &&
 		p.ReleaseWebhookEnabled == nil && p.ReleaseWebhookURL == nil && !p.ReleaseCheckSet &&
 		p.PlatformAutoApply == nil &&
-		p.SteamWarmEnabled == nil && p.SteamWarmRewarm == nil && p.SteamWarmIdleMinutes == nil
+		p.SteamWarmEnabled == nil && p.SteamWarmRewarm == nil && p.SteamWarmIdleMinutes == nil &&
+		p.RegionInput.empty()
 }
 
 // Apply writes every provided field in one statement inside one transaction —
@@ -634,6 +643,11 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		origins = list
 	}
 
+	ri := p.RegionInput
+	var kbLayout, kbVariant *string
+	if ri.Keyboard != nil {
+		kbLayout, kbVariant = &ri.Keyboard.Layout, &ri.Keyboard.Variant
+	}
 	st, err = scanSettings(tx.QueryRow(ctx, `
 		UPDATE instance_settings AS s SET
 		    registration_mode                    = COALESCE($1::text,    s.registration_mode),
@@ -653,6 +667,16 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		    steam_warm_enabled                   = COALESCE($16::boolean, s.steam_warm_enabled),
 		    steam_warm_rewarm                    = COALESCE($17::text,    s.steam_warm_rewarm),
 		    steam_warm_idle_minutes              = COALESCE($18::int,     s.steam_warm_idle_minutes),
+		    default_timezone          = COALESCE($21::text,    s.default_timezone),
+		    default_language          = COALESCE($22::text,    s.default_language),
+		    default_region_format     = CASE WHEN $23::boolean THEN $24::text ELSE s.default_region_format END,
+		    default_keyboard_layout   = COALESCE($25::text,    s.default_keyboard_layout),
+		    default_keyboard_variant  = COALESCE($26::text,    s.default_keyboard_variant),
+		    default_match_cursor      = COALESCE($27::text,    s.default_match_cursor),
+		    default_mouse_sensitivity = COALESCE($28::float8,  s.default_mouse_sensitivity),
+		    default_raw_mouse         = COALESCE($29::boolean, s.default_raw_mouse),
+		    default_flip_scroll       = COALESCE($30::boolean, s.default_flip_scroll),
+		    default_nintendo_layout   = COALESCE($31::boolean, s.default_nintendo_layout),
 		    steam_preparation_enabled = COALESCE($12::boolean, s.steam_preparation_enabled),
  steam_preparation_revision = s.steam_preparation_revision + CASE WHEN $12::boolean IS NOT NULL AND $12::boolean IS DISTINCT FROM s.steam_preparation_enabled THEN 1 ELSE 0 END,
  updated_by                           = $11::uuid
@@ -664,7 +688,9 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		p.ReleaseChannel, p.ReleaseEdgeBranch, updatedBy, p.SteamPreparationEnabled,
 		p.ReleaseWebhookEnabled, p.ReleaseWebhookURL, p.PlatformAutoApply,
 		p.SteamWarmEnabled, p.SteamWarmRewarm, p.SteamWarmIdleMinutes,
-		p.ReleaseCheckSet, p.ReleaseCheck))
+		p.ReleaseCheckSet, p.ReleaseCheck,
+		ri.Timezone, ri.Language, ri.RegionFormatSet, ri.RegionFormat, kbLayout, kbVariant,
+		ri.MatchCursor, ri.MouseSensitivity, ri.RawMouse, ri.FlipScroll, ri.NintendoLayout))
 	if err != nil {
 		return Settings{}, false, fmt.Errorf("update instance_settings: %w", err)
 	}

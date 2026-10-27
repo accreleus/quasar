@@ -762,7 +762,7 @@ func TestNonDerivedRuntimeSpecIsByteIdentical(t *testing.T) {
 	ctx := context.Background()
 
 	// Key ordering and an unknown field are what a re-marshal would disturb.
-	const raw = `{"zeta": 1, "image": "plain:1", "alpha": {"nested": [1,2,3]}, "extra_unknown": true}`
+	const raw = `{"zeta": 1, "image": "plain:1", "alpha": {"nested": [1,2,3]}, "extra_unknown": true, "big": 9007199254740993}`
 	must(t, exec(t, pool, `UPDATE apps SET runtime_spec = $1 WHERE id::text = $2`, raw, s.appID))
 
 	// The stored bytes, straight from Postgres…
@@ -782,7 +782,7 @@ func TestNonDerivedRuntimeSpecIsByteIdentical(t *testing.T) {
 		t.Errorf("ParentAppID = %q, want empty for an ordinary app", app.ParentAppID)
 	}
 
-	// And the dispatch path passes those same bytes through untouched.
+	// And dispatch changes nothing but the amendment 49 env keys.
 	disp := newCapturingDispatcher()
 	coord := newTestCoordinator(t, store, disp, testLogger(), WithHomeProvider(storage.NewLocal(pool, testHomeRoot)))
 	if _, err := coord.Launch(ctx, s.userID, s.appID, StreamOverride{}); err != nil {
@@ -792,9 +792,45 @@ func TestNonDerivedRuntimeSpecIsByteIdentical(t *testing.T) {
 	disp.mu.Lock()
 	dispatched := string(disp.assigns[0])
 	disp.mu.Unlock()
-	if dispatched != stored {
-		t.Errorf("dispatched spec differs from the stored bytes:\n got: %s\nwant: %s", dispatched, stored)
+	if got, want := withoutRegionInput(t, dispatched), canonicalJSON(t, stored); got != want {
+		t.Errorf("dispatched spec differs from the stored one beyond the region keys:\n got: %s\nwant: %s", got, want)
 	}
+}
+
+// withoutRegionInput is a dispatched spec with exactly the nine amendment 49
+// keys removed (failing if any is missing), canonicalised for comparison.
+func withoutRegionInput(t *testing.T, raw string) string {
+	t.Helper()
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var spec map[string]any
+	if err := dec.Decode(&spec); err != nil {
+		t.Fatalf("parse dispatched spec: %v", err)
+	}
+	env, _ := spec["env"].(map[string]any)
+	for _, k := range regionInputEnvKeys {
+		if _, ok := env[k]; !ok {
+			t.Errorf("dispatched spec lacks %s: %s", k, raw)
+		}
+		delete(env, k)
+	}
+	if len(env) == 0 {
+		delete(spec, "env")
+	}
+	out, _ := json.Marshal(spec)
+	return string(out)
+}
+
+func canonicalJSON(t *testing.T, raw string) string {
+	t.Helper()
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("parse %s: %v", raw, err)
+	}
+	out, _ := json.Marshal(v)
+	return string(out)
 }
 
 // --- admission (§1.2) ---------------------------------------------------------

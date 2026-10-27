@@ -9,6 +9,7 @@ import {
   displayRefreshToReport,
   markDeviceProbePosted,
   probeCapabilities,
+  probeRegion,
   probeFeatures,
   type DeviceCapabilities,
   type NativeCapabilities,
@@ -278,6 +279,20 @@ describe("probeCapabilities", () => {
   });
 });
 
+describe("probeRegion", () => {
+  it("reports the zone and the language as ll-RR", () => {
+    vi.spyOn(navigator, "language", "get").mockReturnValue("de");
+    const { timezone, language } = probeRegion();
+    expect(timezone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+    expect(language).toBe("de-DE");
+  });
+
+  it("omits a language it cannot put as ll-RR", () => {
+    vi.spyOn(navigator, "language", "get").mockReturnValue("not a tag!");
+    expect(probeRegion().language).toBeUndefined();
+  });
+});
+
 describe("device capability post freshness", () => {
   const DAY = 24 * 60 * 60 * 1000;
 
@@ -312,6 +327,17 @@ describe("device capability post freshness", () => {
   it("treats unreadable storage as stale rather than throwing", () => {
     localStorage.setItem("quasar_device_posted_v2", "not json");
     expect(deviceProbeIsFresh("u1", true)).toBe(false);
+  });
+
+  it("is stale once the browser's zone or language differs from the posted one (amendment 49)", () => {
+    localStorage.clear();
+    markDeviceProbePosted("u1", true, 1_000_000);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(true);
+    const real = Intl.DateTimeFormat;
+    vi.spyOn(Intl, "DateTimeFormat").mockImplementation(
+      () => ({ resolvedOptions: () => ({ ...real().resolvedOptions(), timeZone: "Pacific/Chatham" }) }) as Intl.DateTimeFormat,
+    );
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
   });
 
   it("ignores a stamp from before the Safari refresh change, so that probe is posted again (#632)", () => {

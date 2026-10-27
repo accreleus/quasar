@@ -3,11 +3,14 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/accreleus/quasar/control-plane/internal/settings"
 )
 
 // The decision sites that resolve a scope, one per read, named in the fallback log.
@@ -29,6 +32,8 @@ type DeviceScope struct {
 	DeviceKey string
 	Probe     *DeviceProbe
 	Fallback  bool // answers for the account's latest-seen device, not the caller's
+	// The browser's zone and language (amendment 49); "" when absent or invalid.
+	Timezone, Language string
 }
 
 // ResolveDeviceScope reads the scope a decision applies to. deviceID is the
@@ -78,6 +83,7 @@ func (s *Store) deviceScopeByID(ctx context.Context, userID, deviceID string) (D
 		return DeviceScope{}, false, fmt.Errorf("query device scope: %w", err)
 	}
 	sc.Probe = parseDeviceProbe(rawCaps)
+	sc.Timezone, sc.Language = parseDeviceRegion(rawCaps)
 	return sc, true, nil
 }
 
@@ -98,5 +104,23 @@ func (s *Store) latestDeviceScope(ctx context.Context, userID string) (DeviceSco
 		return DeviceScope{}, fmt.Errorf("query latest device scope: %w", err)
 	}
 	sc.Probe = parseDeviceProbe(rawCaps)
+	sc.Timezone, sc.Language = parseDeviceRegion(rawCaps)
 	return sc, nil
+}
+
+// parseDeviceRegion reads capabilities.timezone and .language, each as absent
+// when it fails the rules of control-api.md §Region and Input settings.
+func parseDeviceRegion(rawCaps []byte) (timezone, language string) {
+	var caps struct {
+		Timezone any `json:"timezone"`
+		Language any `json:"language"`
+	}
+	_ = json.Unmarshal(rawCaps, &caps)
+	if tz, ok := caps.Timezone.(string); ok && settings.ValidTimezone(tz) {
+		timezone = tz
+	}
+	if l, ok := caps.Language.(string); ok && settings.ValidLanguage(l) {
+		language = l
+	}
+	return timezone, language
 }

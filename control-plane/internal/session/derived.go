@@ -22,6 +22,7 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -82,9 +83,17 @@ func injectSteamFlags(runtimeSpec []byte, flags string) ([]byte, error) {
 // setSpecEnv sets one `env` key, or deletes it when value is nil. Every other
 // field is preserved semantically.
 func setSpecEnv(runtimeSpec []byte, key string, value *string) ([]byte, error) {
+	return setSpecEnvs(runtimeSpec, map[string]*string{key: value})
+}
+
+// setSpecEnvs is setSpecEnv for several keys in one pass. Numbers keep their
+// exact text (UseNumber); key order and whitespace do not survive.
+func setSpecEnvs(runtimeSpec []byte, values map[string]*string) ([]byte, error) {
 	spec := map[string]any{}
 	if len(runtimeSpec) > 0 {
-		if err := json.Unmarshal(runtimeSpec, &spec); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(runtimeSpec))
+		dec.UseNumber()
+		if err := dec.Decode(&spec); err != nil {
 			return nil, fmt.Errorf("parse runtime_spec: %w", err)
 		}
 	}
@@ -92,14 +101,16 @@ func setSpecEnv(runtimeSpec []byte, key string, value *string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	merged := make(map[string]any, len(env)+1)
+	merged := make(map[string]any, len(env)+len(values))
 	for k, v := range env {
 		merged[k] = v
 	}
-	if value != nil {
-		merged[key] = *value
-	} else {
-		delete(merged, key)
+	for key, value := range values {
+		if value != nil {
+			merged[key] = *value
+		} else {
+			delete(merged, key)
+		}
 	}
 	spec["env"] = merged
 

@@ -140,7 +140,7 @@ func NewCoordinator(store *Store, dispatcher Dispatcher, log *slog.Logger, opts 
 	for _, o := range opts {
 		o(c)
 	}
-	c.swapper = newSwapper(c.store, c.dispatcher, c.log, c.resolveHomeSpec)
+	c.swapper = newSwapper(c.store, c.dispatcher, c.log, c.swapSpec)
 	c.health = newHealthEvaluator(c.store, c.log, c.failSessionWithDetail)
 	c.display = newDisplayState()
 	c.certRuns = newCertRunManager()
