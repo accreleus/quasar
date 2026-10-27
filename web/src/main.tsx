@@ -54,3 +54,5 @@ createRoot(root).render(
     </BrowserRouter>
   </StrictMode>,
 );
+
+// ci/867 proof: web-only change (reverted in the next commit)
