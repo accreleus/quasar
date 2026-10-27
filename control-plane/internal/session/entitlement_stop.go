@@ -18,8 +18,11 @@ const entitlementSweepInterval = 30 * time.Second
 
 // swapUnresolvedAfter is how long a swap may stay in flight before the sweep
 // stops the session (swapper.unresolved). It must exceed the agent's own swap
-// budget (20 s for the compositor plus QUASAR_SWAP_APP_READY_TIMEOUT_MS, 45 s
-// by default) plus swapAckTimeout, or a slow healthy swap is stopped.
+// budget (20 s for the compositor, up to 30 s quitting a running Steam game, the
+// 10 s container stop, and QUASAR_SWAP_APP_READY_TIMEOUT_MS, 45 s by default) plus
+// swapAckTimeout, or a slow healthy swap is stopped. A swap that then rolls back adds
+// the replacement's own 10 s stop (about 115 s, rare: it needs a compositor
+// at nearly its full 20 s; realistic worst case about 96 s).
 const swapUnresolvedAfter = 4 * entitlementSweepInterval
 
 // RunEntitlementSweep stops unentitled sessions every entitlementSweepInterval

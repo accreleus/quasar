@@ -26,20 +26,23 @@ fn main() {
     }
 }
 
-/// Bake the source commit and build time into the binary as `QUASAR_STAMP_*`
+/// Bake the source commit and release version into the binary as `QUASAR_STAMP_*`
 /// compile-time env vars, read back by `crate::buildinfo`.
 ///
-/// Order: the `QUASAR_SOURCE_COMMIT` / `QUASAR_BUILT_AT` environment (which is
-/// how the image build passes its `SOURCE_COMMIT`/`BUILT_AT` build args — the
-/// build context carries no `.git`), then `git rev-parse HEAD` for a developer
-/// build in a checkout, then `unknown`.
+/// Commit order: the `QUASAR_SOURCE_COMMIT` environment (which is how the image
+/// build passes its `SOURCE_COMMIT` build arg — the build context carries no
+/// `.git`), then `git rev-parse HEAD` for a developer build in a checkout, then
+/// `unknown`.
+///
+/// The build time is NOT stamped here (#866): a wall-clock value in the compile
+/// would make every build of an unchanged tree recompile. `crate::buildinfo`
+/// reads it at run time from the image's `QUASAR_BUILT_AT` ENV.
 ///
 /// `unknown` is never papered over with the Cargo package version: a stale
 /// stamp is worse than an absent one, because the control plane would store it
 /// as this host's identity and offer platform releases against it.
 fn stamp_build_identity() {
     println!("cargo:rerun-if-env-changed=QUASAR_SOURCE_COMMIT");
-    println!("cargo:rerun-if-env-changed=QUASAR_BUILT_AT");
     println!("cargo:rerun-if-env-changed=QUASAR_VERSION");
     let version = std::env::var("QUASAR_VERSION").unwrap_or_default();
     println!("cargo:rustc-env=QUASAR_STAMP_VERSION={}", version.trim());
@@ -50,16 +53,10 @@ fn stamp_build_identity() {
         .or_else(git_head)
         .unwrap_or_else(|| "unknown".to_string());
 
-    let built_at = std::env::var("QUASAR_BUILT_AT")
-        .ok()
-        .filter(|v| !v.trim().is_empty() && v.trim() != "unknown")
-        .unwrap_or_else(|| "unknown".to_string());
-
     println!(
         "cargo:rustc-env=QUASAR_STAMP_SOURCE_COMMIT={}",
         commit.trim()
     );
-    println!("cargo:rustc-env=QUASAR_STAMP_BUILT_AT={}", built_at.trim());
 }
 
 /// `git rev-parse HEAD`, or None when git is absent, this is not a checkout, or
