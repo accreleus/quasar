@@ -216,7 +216,7 @@ export function Settings() {
         {!settings.loading && !settings.error && s && (
           <>
             <InputDefaultRows settings={settings} />
-            <p className="muted mt3">Saved as you change them. A user who set their own value keeps it.</p>
+            <p className="hint mt3">Saved as you change them. A user who set their own value keeps it.</p>
           </>
         )}
       </SettingsSection>

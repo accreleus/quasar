@@ -27,7 +27,7 @@ export function useInlineSave(settings: UseSettingsResult) {
 
   const errorFor = (key: keyof Patch) =>
     error?.key === key ? (
-      <p className="form-error" role="alert">
+      <p className="form-error admin-settings-error" role="alert">
         {error.message}
       </p>
     ) : null;
