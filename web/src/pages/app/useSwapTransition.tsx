@@ -31,8 +31,11 @@ const SWAP_POLL_MS = 1_000;
 
 /** Client give-up bound, above the agent's longest swap: an in-place one is
  *  IN_PLACE_QUIT_BOUND 94 s (covers Steam's 60 s exit cloud sync) +
- *  IN_PLACE_LAUNCH_BOUND 5 s = 99 s (node-agent/src/session/runner.rs). The rest
- *  is slack for dispatch and a poll round-trip. Escape hatch only. */
+ *  IN_PLACE_LAUNCH_BOUND 5 s = 99 s (node-agent/src/session/runner.rs). A container
+ *  swap away from a running Steam game is at most 20 s compositor + END_QUIT_BOUND 30 s
+ *  + 10 s container stop + 45 s app ready = 105 s. The rest is slack for dispatch and a
+ *  poll round-trip. Escape hatch only: past it the screen says the switch is taking
+ *  longer and may still finish. */
 const CLIENT_SWAP_TIMEOUT_MS = 110_000;
 
 /** Most the screen stays up after the commit waiting for `app presented`. Fail-open. */

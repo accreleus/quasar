@@ -860,10 +860,11 @@ const IN_PLACE_LAUNCH_BOUND: Duration = Duration::from_secs(5);
 /// that ignores the close (`QUIT_CLOSE_GRACE` 20 s, then SIGTERM: about 21–24 s to the sync).
 const END_QUIT_BOUND: Duration = Duration::from_secs(30);
 
-/// Any session end with a Steam game that runs, or that the player just quit (#742, #810): quit
-/// the game the in-place swap's way and wait for Steam's cloud sync, at most [`END_QUIT_BOUND`].
-/// No helper, or no target game (held, parked), returns at once.
-fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
+/// Any session end with a Steam game that runs, or that the player just quit (#742, #810), and a
+/// container swap away from one (#809): quit the game the in-place swap's way and wait for
+/// Steam's cloud sync, at most [`END_QUIT_BOUND`]. `when` names the caller in the log lines. No
+/// helper, or no target game (held, parked), returns at once.
+fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>, when: &str) {
     use super::launch_helper::EndQuit;
     let Some(launch) = launch else {
         return;
@@ -880,7 +881,7 @@ fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
             tracing::info!(
                 token = "session-end-cloud-synced",
                 appid,
-                "session end: Steam app {appid} quit and its cloud sync ended in {:?}",
+                "{when}: Steam app {appid} quit and its cloud sync ended in {:?}",
                 started.elapsed()
             );
             return;
@@ -894,7 +895,7 @@ fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
             tracing::info!(
                 token = "session-end-no-cloud-sync",
                 appid,
-                "session end: Steam app {appid} quit with no exit cloud sync in {:?}",
+                "{when}: Steam app {appid} quit with no exit cloud sync in {:?}",
                 started.elapsed()
             );
             return;
@@ -914,7 +915,7 @@ fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
     tracing::warn!(
         token = "session-end-cloud-sync-unfinished",
         appid,
-        "session end: Steam app {appid} {why}; tearing down"
+        "{when}: Steam app {appid} {why}; tearing down"
     );
 }
 
@@ -1769,7 +1770,7 @@ pub(crate) fn stop_source(
         "video transport released ahead of the source teardown"
     );
     transports.audio_pipeline.stop_reporting();
-    quit_game_for_end(launch);
+    quit_game_for_end(launch, "session end");
     source.teardown();
 }
 
@@ -3955,6 +3956,11 @@ fn perform_swap(
             SwapFailure::rolled_back(format!("verify replacement Vulkan context identity: {e:#}"))
         })?;
     }
+
+    // A Steam game the swap leaves behind gets a session end's quit and cloud-sync wait before
+    // its container goes (#809); the switch screen covers it. The mute below clears the exit
+    // this quit makes the helper report.
+    quit_game_for_end(res.launch(), "container swap");
 
     // Past here the outgoing game closes because we closed it, not because the player
     // quit: stop reading the helper (#726). A rollback relaunch re-arms it.
