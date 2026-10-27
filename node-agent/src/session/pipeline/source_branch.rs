@@ -265,13 +265,7 @@ pub(crate) fn keyboard_layout(container: Option<&ContainerSpec>) -> Option<(&str
     let env = &container?.env;
     let layout = env.get("XKB_DEFAULT_LAYOUT").filter(|l| !l.is_empty())?;
     let variant = env.get("XKB_DEFAULT_VARIANT").map_or("", String::as_str);
-    // The control plane's rules (`ValidXKBLayout`/`ValidXKBVariant`): one layout, no comma
-    // list for xkbcommon to compile into many groups.
-    let xkb_name = |v: &str, max: usize| {
-        v.len() <= max
-            && v.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    };
+    use crate::session::keymap::xkb_name;
     if !xkb_name(layout, 32) || !xkb_name(variant, 64) {
         tracing::warn!(
             token = "compositor-keyboard-layout-invalid",
