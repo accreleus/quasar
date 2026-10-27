@@ -239,13 +239,14 @@ func TestPatchReleaseCheck(t *testing.T) {
 	}
 
 	// A bad value is refused whole: nothing else in the body applies.
-	for _, bad := range []string{`"hourly"`, `"Daily"`, `""`, `7`, `true`} {
-		code, _ := patch(t, `{"release_check":`+bad+`,"registration_mode":"closed"}`)
+	for _, bad := range []string{`"hourly"`, `"Daily"`, `""`, `7`, `true`, `{"freq":"daily"}`, `["daily"]`, `"null"`} {
+		// The valid release_channel beside it must not be applied either.
+		code, _ := patch(t, `{"release_check":`+bad+`,"registration_mode":"closed","release_channel":"edge"}`)
 		if code != 400 {
 			t.Errorf("release_check %s: status %d, want 400", bad, code)
 		}
 	}
-	if st := get(t).Settings; st.RegistrationMode == "closed" || st.ReleaseCheck != nil {
+	if st := get(t).Settings; st.RegistrationMode == "closed" || st.ReleaseChannel == ReleaseChannelEdge || st.ReleaseCheck != nil {
 		t.Fatalf("a refused PATCH applied part of its body: %+v", st)
 	}
 }

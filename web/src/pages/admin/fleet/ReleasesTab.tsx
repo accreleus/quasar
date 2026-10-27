@@ -14,7 +14,7 @@
  * are #117/#118; developer apply is #360 (DeveloperApply.tsx).
  */
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import * as adminApi from "../../../api/admin";
 import type {
   InstanceSettings,
@@ -111,6 +111,19 @@ const DAY_SECS = 86400;
 /** The setting that owns the detection period (amendment 48); a job locked by
  *  anything else is under an environment override the choice cannot beat. */
 const CHECK_OWNER = "instance_settings.release_check";
+
+/** A detection period in words: "every day", "every 6 hours". */
+function everyWords(secs: number): string {
+  const [n, unit] =
+    secs % DAY_SECS === 0
+      ? [secs / DAY_SECS, "day"]
+      : secs % 3600 === 0
+        ? [secs / 3600, "hour"]
+        : secs % 60 === 0
+          ? [secs / 60, "minute"]
+          : [secs, "second"];
+  return n === 1 ? `every ${unit}` : `every ${n} ${unit}s`;
+}
 
 function when(iso: string | null | undefined): string {
   return iso ? relativeTime(iso) : "—";
@@ -693,7 +706,11 @@ function ChannelCard({
     label: "release check",
     fetch: ({ token: t, signal }) => adminApi.getSettings(t, signal),
   });
+  // Until the read lands (or if it fails) the stored choice is unknown, and
+  // the hint claims nothing about it.
+  const storedKnown = stored.data != null;
   const picked = stored.data?.settings?.release_check ?? null;
+  const labelId = useId();
   const secs = job?.schedule.interval_secs;
   const check: ReleaseCheck | null =
     secs == null ? picked : secs === DAY_SECS ? "daily" : secs === 7 * DAY_SECS ? "weekly" : null;
@@ -719,14 +736,16 @@ function ChannelCard({
 
   return (
     <RailCard title="Channel">
-      <SegmentedControl<ReleaseChannel>
-        options={CHANNEL_OPTIONS}
-        value={view.channel}
-        activation="manual"
-        aria-label="Release channel"
-        disabled={save.pending != null}
-        onChange={(value) => void save.run({ release_channel: value })}
-      />
+      <div className="rel-channels">
+        <SegmentedControl<ReleaseChannel>
+          options={CHANNEL_OPTIONS}
+          value={view.channel}
+          activation="manual"
+          aria-label="Release channel"
+          disabled={save.pending != null}
+          onChange={(value) => void save.run({ release_channel: value })}
+        />
+      </div>
       <p className="hint mt2">
         Stable follows tagged releases with notes; beta adds the pre-releases among them; preview
         offers every build of develop; edge follows a branch. Switching changes what is listed,
@@ -739,23 +758,28 @@ function ChannelCard({
         </p>
       )}
       <div className="mt3">
-        <div className="label mb3">Check for releases</div>
+        <div id={labelId} className="label mb3">
+          Check for releases
+        </div>
         <SegmentedControl<ReleaseCheck>
           options={CHECK_OPTIONS}
           value={check}
           activation="manual"
-          aria-label="Release check"
+          aria-labelledby={labelId}
           disabled={save.pending != null || envLocked}
           onChange={(value) => void save.run({ release_check: value })}
         />
-        <p className="hint mt2">
-          {envLocked
-            ? `Set by ${lockedBy} on this install; this choice is ignored while it is set.`
-            : picked
-              ? "Your choice. Switching channel does not change it."
-              : "Follows the channel: daily on Preview, weekly on the others."}
-        </p>
-        {picked && !envLocked && (
+        <ResourceStates loading={false} error={stored.errorMessage} />
+        {(envLocked || storedKnown) && (
+          <p className="hint mt2">
+            {envLocked
+              ? `${check == null && secs != null ? `Checks ${everyWords(secs)}, set` : "Set"} by ${lockedBy} on this install; this choice is ignored while it is set.`
+              : picked
+                ? "Your choice. Switching channel does not change it."
+                : "Follows the channel: daily on Preview, weekly on the others."}
+          </p>
+        )}
+        {storedKnown && picked && !envLocked && (
           <Button
             variant="ghost"
             className="mt2"

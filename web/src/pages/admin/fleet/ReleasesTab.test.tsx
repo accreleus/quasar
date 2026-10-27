@@ -483,49 +483,130 @@ describe("ReleasesTab", () => {
         next_run_at: null,
         schedule: { interval_secs, locked: true, locked_by },
       }) as never;
+    const jobs = (job: never) => ({ items: [job], next_cursor: null }) as never;
+    const settings = (release_check: "daily" | "weekly" | null) =>
+      ({ settings: { release_check } }) as never;
+    const selected = (name: string) =>
+      expect(screen.getByRole("tab", { name })).toHaveAttribute("aria-selected", "true");
 
-    it("shows the job's period, says it follows the channel, and saves a pick", async () => {
+    it("shows the job's period, says it follows the channel, and moves to a pick once the job reports it", async () => {
       mocked.getPlatformReleases.mockResolvedValue(view());
-      mocked.listJobs.mockResolvedValue({ items: [detectJob(7 * 86400)], next_cursor: null } as never);
+      mocked.listJobs
+        .mockResolvedValueOnce(jobs(detectJob(7 * 86400)))
+        .mockResolvedValue(jobs(detectJob(86400)));
+      mocked.getSettings
+        .mockResolvedValueOnce(settings(null))
+        .mockResolvedValue(settings("daily"));
       mocked.updateSettings.mockResolvedValue({ settings: {} } as never);
       renderTab();
 
       expect(await screen.findByRole("tab", { name: "Weekly" })).toHaveAttribute("aria-selected", "true");
-      expect(screen.getByText(/Follows the channel/)).toBeInTheDocument();
+      expect(await screen.findByText(/Follows the channel/)).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Follow the channel" })).not.toBeInTheDocument();
 
       screen.getByRole("tab", { name: "Daily" }).click();
       await waitFor(() =>
         expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_check: "daily" }),
       );
-      // The job's period changes with it, so the tab reads it again.
-      await waitFor(() => expect(mocked.listJobs).toHaveBeenCalledTimes(2));
+      // The job's period and the stored choice are read again, and the control
+      // follows them: Daily selected, the hint says it is the admin's pick.
+      await waitFor(() => expect(screen.getByRole("tab", { name: "Daily" })).toHaveAttribute("aria-selected", "true"));
+      expect(screen.getByRole("tab", { name: "Weekly" })).toHaveAttribute("aria-selected", "false");
+      expect(await screen.findByText(/Your choice/)).toBeInTheDocument();
+      expect(screen.queryByText(/Follows the channel/)).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Follow the channel" })).toBeInTheDocument();
     });
 
-    it("an explicit choice says so and goes back to following the channel with a null", async () => {
+    it("an explicit choice goes back to the channel's period with a null once the job reports it", async () => {
       mocked.getPlatformReleases.mockResolvedValue(view());
-      mocked.getSettings.mockResolvedValue({ settings: { release_check: "daily" } } as never);
-      mocked.listJobs.mockResolvedValue({ items: [detectJob(86400)], next_cursor: null } as never);
+      mocked.listJobs
+        .mockResolvedValueOnce(jobs(detectJob(86400)))
+        .mockResolvedValue(jobs(detectJob(7 * 86400)));
+      mocked.getSettings
+        .mockResolvedValueOnce(settings("daily"))
+        .mockResolvedValue(settings(null));
       mocked.updateSettings.mockResolvedValue({ settings: {} } as never);
       renderTab();
 
       expect(await screen.findByRole("tab", { name: "Daily" })).toHaveAttribute("aria-selected", "true");
+      expect(await screen.findByText(/Your choice/)).toBeInTheDocument();
       (await screen.findByRole("button", { name: "Follow the channel" })).click();
       await waitFor(() =>
         expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_check: null }),
       );
+      // Stable's period is weekly again, and the hint says it follows.
+      await waitFor(() => selected("Weekly"));
+      expect(screen.getByRole("tab", { name: "Daily" })).toHaveAttribute("aria-selected", "false");
+      expect(await screen.findByText(/Follows the channel/)).toBeInTheDocument();
+      expect(screen.queryByText(/Your choice/)).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Follow the channel" })).not.toBeInTheDocument();
     });
 
-    it("is read-only while an environment variable owns the period", async () => {
+    it("is read-only as a whole while an environment variable owns the period, and still shows it", async () => {
       mocked.getPlatformReleases.mockResolvedValue(view());
-      mocked.listJobs.mockResolvedValue({
-        items: [detectJob(86400, "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL")],
-        next_cursor: null,
-      } as never);
+      mocked.listJobs.mockResolvedValue(
+        jobs(detectJob(86400, "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL")),
+      );
+      mocked.getSettings.mockResolvedValue(settings("weekly"));
       renderTab();
 
       expect(await screen.findByText(/Set by QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL/)).toBeInTheDocument();
+      // The environment says daily, whatever the stored choice is.
+      selected("Daily");
+      expect(screen.getByRole("tab", { name: "Daily" })).toBeDisabled();
       expect(screen.getByRole("tab", { name: "Weekly" })).toBeDisabled();
+      expect(screen.queryByRole("button", { name: "Follow the channel" })).not.toBeInTheDocument();
+    });
+
+    it("says the period in words when an environment variable sets one that is neither a day nor a week", async () => {
+      mocked.getPlatformReleases.mockResolvedValue(view());
+      mocked.listJobs.mockResolvedValue(
+        jobs(detectJob(6 * 3600, "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL")),
+      );
+      mocked.getSettings.mockResolvedValue(settings(null));
+      renderTab();
+
+      expect(
+        await screen.findByText(/every 6 hours, set by QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL/),
+      ).toBeInTheDocument();
+      for (const name of ["Daily", "Weekly"]) {
+        const tab = screen.getByRole("tab", { name });
+        expect(tab).toHaveAttribute("aria-selected", "false");
+        expect(tab).toBeDisabled();
+      }
+    });
+
+    it("shows the settings error and claims nothing about the stored choice when that read fails", async () => {
+      mocked.getPlatformReleases.mockResolvedValue(view());
+      mocked.listJobs.mockResolvedValue(jobs(detectJob(7 * 86400)));
+      mocked.getSettings.mockRejectedValue(new ApiError(503, "internal", "settings unavailable"));
+      renderTab();
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("settings unavailable");
+      // The job still says what detection runs on.
+      selected("Weekly");
+      expect(screen.queryByText(/Follows the channel/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Your choice/)).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Follow the channel" })).not.toBeInTheDocument();
+    });
+
+    it("claims nothing about the stored choice while the settings read is loading", async () => {
+      mocked.getPlatformReleases.mockResolvedValue(view());
+      mocked.listJobs.mockResolvedValue(jobs(detectJob(7 * 86400)));
+      mocked.getSettings.mockReturnValue(new Promise(() => {}) as never);
+      renderTab();
+
+      expect(await screen.findByRole("tab", { name: "Weekly" })).toHaveAttribute("aria-selected", "true");
+      expect(screen.queryByText(/Follows the channel/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Your choice/)).not.toBeInTheDocument();
+    });
+
+    it("names the picker by its visible label", async () => {
+      mocked.getPlatformReleases.mockResolvedValue(view());
+      renderTab();
+
+      const tab = await screen.findByRole("tab", { name: "Daily" });
+      expect(tab.closest('[role="tablist"]')).toHaveAccessibleName("Check for releases");
     });
   });
 

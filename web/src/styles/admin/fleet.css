@@ -534,7 +534,7 @@
 }
 
 /* Five channels do not fit one row in the rail's width; the pill wraps. */
-.rel-rail .segmented {
+.rel-channels .segmented {
   flex-wrap: wrap;
 }
 
