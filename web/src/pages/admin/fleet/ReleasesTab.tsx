@@ -507,6 +507,7 @@ function ReleaseCard({
   const edge = release.channel === "edge" || release.channel === "preview";
   const { entries, counts } = parseReleaseNotes(release.notes, repo);
   const countsLine = releaseCountsLine(counts);
+  const newCommits = previewNewCommits(release);
   const commitUrl = gh(repo, `commit/${release.source_commit}`);
   const releaseUrl = release.version ? gh(repo, `releases/tag/v${release.version}`) : null;
 
@@ -556,6 +557,8 @@ function ReleaseCard({
       </div>
       {entries.length > 0 ? (
         entries.map((entry, i) => <NoteRow key={`${entry.tag}-${i}`} entry={entry} />)
+      ) : newCommits.length > 0 ? (
+        <NewCommits commits={newCommits} />
       ) : (
         <div className="card-pad">
           <NoNotes release={release} edge={edge} />
@@ -601,6 +604,36 @@ function NoteRow({ entry }: { entry: NoteEntry }) {
         </div>
       )}
     </details>
+  );
+}
+
+/** The commits of a preview offer that the installed build does not run: the
+ *  first `new_commit_count` entries of its manifest's list, which the server
+ *  counts so a client cannot disagree (control-api.md, amendment 48). */
+function previewNewCommits(release: PlatformRelease): { commit: string; subject: string }[] {
+  const manifest = release.manifest;
+  const commits = manifest && "commits" in manifest ? manifest.commits : undefined;
+  return commits?.slice(0, release.new_commit_count ?? 0) ?? [];
+}
+
+/** A preview build's commit list: short commit and subject, one line per
+ *  landing. The subject is upstream text, rendered as plain text. */
+function NewCommits({ commits }: { commits: { commit: string; subject: string }[] }) {
+  return (
+    <>
+      <p className="hint rel-commits-head">
+        {commits.length === 1 ? "1 commit" : `${commits.length} commits`} newer than the installed
+        build
+      </p>
+      <ul className="rel-commits">
+        {commits.map((c) => (
+          <li key={c.commit} className="rel-e">
+            <span className="rel-c">{shortCommit(c.commit)}</span>
+            <span className="rel-t">{c.subject}</span>
+          </li>
+        ))}
+      </ul>
+    </>
   );
 }
 

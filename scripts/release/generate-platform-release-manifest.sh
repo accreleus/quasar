@@ -16,7 +16,14 @@
 #
 # --preview, in place of --version, writes the preview manifest instead: `version`
 # null and `prerelease` false (protocol/control-api.md "Platform-release preview
-# channel"). It writes no `commits`.
+# channel"), plus `commits`: the first-parent history of --source-commit in --repo
+# (default: this checkout, with full history and tags), newest first, back to but
+# not including the newest stable release tag reachable from it, at most 500 lines.
+# One line per landing: `#<number> <title>` for a pull-request merge (the title is
+# the merge commit's body, which is where GitHub writes it) and the subject line for
+# any other commit, with control, line-separator and bidi characters replaced and
+# the line cut to 200 characters. A history it cannot read (shallow, no stable tag,
+# unknown commit) fails instead of publishing a list that looks complete.
 #
 # The output is validated by validate-platform-release-manifest.sh before this
 # script exits 0, so a bad input never leaves a published-looking file behind.
@@ -37,6 +44,7 @@ recovery_digest=""
 registry_ns=""
 migrations_dir="$root/control-plane/migrations"
 floor_source="$root/control-plane/internal/buildinfo/floor.go"
+repo_dir="$root"
 output=""
 preview=0
 
@@ -52,6 +60,7 @@ usage: scripts/release/generate-platform-release-manifest.sh \
          --registry-ns ghcr.io/accreleus/quasar \
          [--migrations-dir control-plane/migrations] \
          [--floor-source control-plane/internal/buildinfo/floor.go] \
+         [--repo DIR] \
          --output PATH
 
 Writes platform-release-manifest.v2.json (format_version 2; this generator never
@@ -64,7 +73,9 @@ The floor is read from the floor source's two lines
 `const FloorNodeAgent = "<semver>"` and `const FloorRecoveryActor = "<semver>"`.
 
 --preview writes the preview manifest a push to develop publishes: format 2 with
-`version` null and `prerelease` false, validated with the validator's --preview.
+`version` null and `prerelease` false and the commit list read from --repo (default
+this checkout; it needs full history and the stable release tags), validated with
+the validator's --preview.
 
 Schema and field grammar: scripts/release/platform-release-manifest.md
 EOF
@@ -81,6 +92,7 @@ while (($#)); do
     --registry-ns) registry_ns=${2:?--registry-ns needs a value}; shift 2 ;;
     --migrations-dir) migrations_dir=${2:?--migrations-dir needs a path}; shift 2 ;;
     --floor-source) floor_source=${2:?--floor-source needs a path}; shift 2 ;;
+    --repo) repo_dir=${2:?--repo needs a path}; shift 2 ;;
     --output) output=${2:?--output needs a path}; shift 2 ;;
     --preview) preview=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -103,15 +115,19 @@ for required in version source_commit built_at control_digest agent_digest recov
 done
 
 python3 - "$version" "$source_commit" "$built_at" "$control_digest" "$agent_digest" \
-  "$recovery_digest" "$registry_ns" "$migrations_dir" "$floor_source" "$output" "$preview" <<'PY'
+  "$recovery_digest" "$registry_ns" "$migrations_dir" "$floor_source" "$output" "$preview" \
+  "$repo_dir" <<'PY'
 import json
 import re
+import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 (version, source_commit, built_at, control_digest, agent_digest, recovery_digest,
  registry_ns, migrations_dir, floor_source, output) = sys.argv[1:11]
 preview = sys.argv[11] == "1"
+repo_dir = sys.argv[12]
 errors = []
 
 SEMVER = re.compile(
@@ -197,6 +213,61 @@ else:
             continue
         floor.append({"name": name, "version": value})
 
+# The preview manifest's commit list (amendment 48). Same bounds as the validator and
+# the control plane's parser: at most 500 entries, a subject of at most 200 characters
+# on one line with no control, separator or bidi character.
+MAX_COMMITS = 500
+MAX_SUBJECT = 200
+# Bidi_Control; python's unicodedata has no property for it. Zl and Zp are U+2028/9.
+BIDI = {0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)}
+MERGE = re.compile(r"Merge pull request #(\d+) from \S+")
+
+
+def git(*args):
+    done = subprocess.run(["git", "-C", repo_dir, *args], capture_output=True)
+    if done.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {done.stderr.decode(errors='replace').strip()}")
+    return done.stdout.decode(errors="replace")
+
+
+def one_line(text):
+    out = "".join(
+        " " if (unicodedata.category(c) in ("Cc", "Zl", "Zp") or ord(c) in BIDI) else c
+        for c in text
+    )
+    return " ".join(out.split())[:MAX_SUBJECT].rstrip()
+
+
+def commit_list():
+    if git("rev-parse", "--is-shallow-repository").strip() == "true":
+        raise RuntimeError("the history is shallow; fetch it in full (fetch-depth: 0) with its tags")
+    git("rev-parse", "--verify", f"{source_commit}^{{commit}}")
+    tags = [t for t in git("tag", "--merged", source_commit, "--list", "v[0-9]*",
+                           "--sort=-v:refname").split() if "-" not in t]
+    if not tags:
+        raise RuntimeError(f"no stable release tag (vX.Y.Z) is reachable from {source_commit}; "
+                           "fetch the tags")
+    log = git("log", "--first-parent", f"--max-count={MAX_COMMITS}",
+              "--format=%H%x1f%s%x1f%b%x1e", f"{tags[0]}..{source_commit}")
+    entries = []
+    for record in log.split("\x1e"):
+        if not record.strip():
+            continue
+        sha, subject, body = record.strip("\n").split("\x1f")
+        merge = MERGE.fullmatch(subject.strip())
+        title = next((line.strip() for line in body.splitlines() if line.strip()), "")
+        line = f"#{merge.group(1)} {title}" if merge and title else subject
+        entries.append({"commit": sha, "subject": one_line(line)})
+    return entries
+
+
+commits = None
+if preview and not errors:
+    try:
+        commits = commit_list()
+    except RuntimeError as exc:
+        errors.append(f"cannot read the commit list: {exc}")
+
 if errors:
     for error in errors:
         print(f"generate-platform-release-manifest: {error}", file=sys.stderr)
@@ -222,6 +293,8 @@ manifest = {
     ],
     "floor": floor,
 }
+if commits is not None:
+    manifest["commits"] = commits
 
 out = Path(output)
 out.parent.mkdir(parents=True, exist_ok=True)

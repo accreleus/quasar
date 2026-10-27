@@ -89,6 +89,7 @@ import datetime as dt
 import json
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 path = Path(sys.argv[1])
@@ -124,6 +125,13 @@ FLOOR_KEYS = ["name", "version"]
 COMMIT_KEYS = ["commit", "subject"]
 MAX_COMMITS = 500
 MAX_SUBJECT = 200
+# What a one-line subject may not hold, as the control plane's parser refuses it:
+# control characters (C0, DEL, C1), U+2028/U+2029 and the Bidi_Control set.
+BIDI = {0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)}
+
+
+def unsafe_subject_char(c):
+    return unicodedata.category(c) in ("Cc", "Zl", "Zp") or ord(c) in BIDI
 
 # semver.org 2.0.0, prerelease part optional, build metadata deliberately NOT
 # accepted: `+` is not a legal character in a Docker tag, so a version carrying
@@ -344,7 +352,7 @@ if fmt == 2 and "floor" in doc:
 
 # `commits`: only the preview manifest may carry it (the key loop above refuses it
 # on a release asset). Same bounds as the control plane's ParsePreviewManifest: a
-# control character (C0, DEL, C1) in a subject makes the whole document invalid.
+# control, separator or bidi character in a subject makes the whole document invalid.
 if preview and "commits" in doc:
     commits = doc["commits"]
     if not isinstance(commits, list):
@@ -362,9 +370,9 @@ if preview and "commits" in doc:
                               f"got {entry['commit']!r}")
             subject = entry["subject"]
             if (not isinstance(subject, str) or len(subject) > MAX_SUBJECT
-                    or any(ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f for c in subject)):
+                    or any(unsafe_subject_char(c) for c in subject)):
                 errors.append(f"{where}.subject must be one line of at most {MAX_SUBJECT} "
-                              f"characters with no control character, got {subject!r}")
+                              f"characters with no control, separator or bidi character, got {subject!r}")
 
 # The --expect-* assertions: the caller already knows these, so a mismatch means
 # the manifest describes something other than what this run built.

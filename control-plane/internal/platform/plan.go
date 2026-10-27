@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -216,9 +217,38 @@ func offerable(rows []Release, channel string, cp buildinfo.Identity) []Release 
 		// Derived here because this is where the control plane's own schema
 		// version is in hand, and every served release comes through this filter.
 		r.Migrates = ReleaseRunsAMigration(r, cp.SchemaVersion)
+		r.NewCommitCount = newCommitCount(r, cp)
 		out = append(out, r)
 	}
 	return sortOfferable(out, channel)
+}
+
+// newCommitCount is amendment 48's `new_commit_count`: the entries of a preview
+// manifest's `commits` before the one that is the installed control plane's
+// source_commit, or all of them when none is (a stable, edge, unstamped or older
+// install). nil when the row is not a preview or its manifest carries no list.
+func newCommitCount(r Release, cp buildinfo.Identity) *int {
+	if r.Channel != ChannelPreview || len(r.Manifest) == 0 {
+		return nil
+	}
+	var doc struct {
+		Commits *[]struct {
+			Commit string `json:"commit"`
+		} `json:"commits"`
+	}
+	// Stored rows passed ParsePreviewManifest at detection; a row that no longer
+	// decodes has no list to count.
+	if json.Unmarshal(r.Manifest, &doc) != nil || doc.Commits == nil {
+		return nil
+	}
+	n := len(*doc.Commits)
+	for i, c := range *doc.Commits {
+		if cp.SourceCommit != nil && c.Commit == *cp.SourceCommit {
+			n = i
+			break
+		}
+	}
+	return &n
 }
 
 // ranked is one row with its precedence key computed ONCE, before the sort.
