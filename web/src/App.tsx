@@ -224,6 +224,7 @@ export function App() {
           <Route element={<PreferencesSection />}>
             <Route path="overlay" element={<AccountOverlay />} />
             <Route path="streaming" element={<AccountStreaming />} />
+            <Route path="region" element={<Navigate to="/app/account/streaming" replace />} />
             <Route path="appearance" element={<AccountAppearance />} />
           </Route>
           <Route element={<UsageSection />}>

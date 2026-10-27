@@ -363,6 +363,7 @@ export type IconName =
   | "overlay"
   | "devices"
   | "lock"
+  | "globe"
   | "collapse"
   | "sun"
   | "moon"
@@ -460,6 +461,12 @@ const SHELL_GLYPHS: Record<IconName, JSX.Element> = {
     <>
       <rect x="3.2" y="7.3" width="9.6" height="6.2" rx="1.3" />
       <path d="M5.3 7.3V5.2a2.7 2.7 0 0 1 5.4 0v2.1" strokeLinecap="round" />
+    </>
+  ),
+  globe: (
+    <>
+      <circle cx="8" cy="8" r="6" />
+      <path d="M2 8h12M8 2c-2.2 2.4-2.2 9.6 0 12M8 2c2.2 2.4 2.2 9.6 0 12" strokeLinecap="round" />
     </>
   ),
   collapse: (

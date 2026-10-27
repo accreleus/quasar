@@ -97,6 +97,134 @@
   max-width: 360px;
 }
 
+/* ---- region: timezone list (the map beside it is #847) ---- */
+.tz-pick {
+  display: grid;
+  grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+  gap: var(--s4);
+  align-items: start;
+}
+
+.tz-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  min-width: 0;
+}
+
+.tz-side .search {
+  min-width: 0;
+}
+
+.tz-list {
+  list-style: none;
+  margin: 0;
+  padding: var(--s1);
+  height: 236px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-3) transparent;
+  position: relative; /* offsetParent for opening on the saved zone */
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-control);
+  background-color: color-mix(in oklch, var(--surf-inset) 76%, transparent);
+}
+
+.tz-list:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--glow-accent);
+}
+
+.tz-list[aria-busy="true"] {
+  opacity: .6;
+}
+
+.tz-opt {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-height: 44px;
+  padding: var(--s1) var(--s3);
+  border-radius: var(--r-control);
+  cursor: pointer;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.tz-opt:hover,
+.tz-opt.is-active {
+  background: var(--row-hover);
+  color: var(--text);
+}
+
+.tz-opt.is-active {
+  box-shadow: inset 0 0 0 1px var(--line-3);
+}
+
+.tz-opt[aria-selected="true"] {
+  background: var(--accent-soft);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.tz-opt .tz-t {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.tz-opt .tz-name,
+.tz-opt .tz-sub {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tz-opt .tz-sub {
+  color: var(--text-3);
+  font-size: var(--t-xs);
+}
+
+.tz-opt .tz-off {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+.tz-opt.tz-follow {
+  margin-bottom: var(--s1);
+}
+
+.tz-sep {
+  height: 1px;
+  margin: 0 var(--s2) var(--s1);
+  background: var(--line-2);
+}
+
+.tz-empty {
+  padding: var(--s3);
+  color: var(--text-3);
+  font-size: var(--t-sm);
+}
+
+@media (max-width: 1100px) {
+  .tz-pick {
+    grid-template-columns: 1fr;
+  }
+
+  .tz-list {
+    height: 200px;
+  }
+}
+
+@media (max-width: 600px) {
+  .tz-list {
+    height: 264px;
+  }
+}
+
 /* ---- devices ---- */
 .os-group + .os-group {
   margin-top: var(--s5);
