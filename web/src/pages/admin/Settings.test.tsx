@@ -5,7 +5,7 @@
 // caption (review), so they are located by their `id`, not by label text.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { Settings } from "./Settings";
 import { ToastProvider } from "../../components/Toast";
 import { ThemeProvider } from "../../settings/ThemeContext";
@@ -210,6 +210,185 @@ describe("Settings — Region defaults card", () => {
   });
 });
 
+describe("Settings — Region and Input defaults", () => {
+  const cursorTab = (name: string) => within(screen.getByRole("tablist", { name: "Match cursor to my window" })).getByRole("tab", { name });
+  const sent = (body: object) => expect(mocked.updateSettings).toHaveBeenCalledWith("tok", body);
+
+  it("shows the saved defaults", async () => {
+    mocked.getSettings.mockResolvedValue(
+      settingsResponse({
+        default_language: "de-DE",
+        default_region_format: "en-GB",
+        default_keyboard: { layout: "fr", variant: "bepo" },
+        default_match_cursor: "on",
+        default_mouse_sensitivity: 2,
+        default_raw_mouse: true,
+      }),
+    );
+    renderPage();
+    expect(((await screen.findByLabelText("Default language")) as HTMLSelectElement).value).toBe("de-DE");
+    expect((screen.getByLabelText("Default region format") as HTMLSelectElement).value).toBe("en-GB");
+    expect((screen.getByLabelText("Default keyboard layout") as HTMLSelectElement).value).toBe("fr");
+    expect((screen.getByLabelText("Default keyboard variant") as HTMLSelectElement).value).toBe("bepo");
+    expect(cursorTab("Always on").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByLabelText("Default mouse sensitivity").getAttribute("aria-valuetext")).toBe("2×");
+    expect((document.getElementById("default-raw-mouse") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("reads an older server's missing fields as the built-in defaults", async () => {
+    renderPage();
+    expect(((await screen.findByLabelText("Default language")) as HTMLSelectElement).value).toBe("en-US");
+    expect((screen.getByLabelText("Default region format") as HTMLSelectElement).value).toBe("");
+    expect(screen.getByRole("option", { name: "Same as language (English (US))" })).toBeTruthy();
+    expect((screen.getByLabelText("Default keyboard layout") as HTMLSelectElement).value).toBe("us");
+    expect(cursorTab("Auto").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByLabelText("Default mouse sensitivity").getAttribute("aria-valuetext")).toBe("1×");
+  });
+
+  it("PATCHes only the changed key for each control", async () => {
+    mocked.updateSettings.mockResolvedValue(settingsResponse());
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Default language"), { target: { value: "ja-JP" } });
+    await waitFor(() => sent({ default_language: "ja-JP" }));
+    fireEvent.change(screen.getByLabelText("Default region format"), { target: { value: "de-DE" } });
+    await waitFor(() => sent({ default_region_format: "de-DE" }));
+    fireEvent.change(screen.getByLabelText("Default region format"), { target: { value: "" } });
+    await waitFor(() => sent({ default_region_format: null }));
+    fireEvent.click(cursorTab("Off"));
+    await waitFor(() => sent({ default_match_cursor: "off" }));
+    fireEvent.click(document.getElementById("default-raw-mouse")!);
+    await waitFor(() => sent({ default_raw_mouse: true }));
+    fireEvent.click(document.getElementById("default-flip-scroll")!);
+    await waitFor(() => sent({ default_flip_scroll: true }));
+    fireEvent.click(document.getElementById("default-nintendo-layout")!);
+    await waitFor(() => sent({ default_nintendo_layout: true }));
+  });
+
+  it("sends the whole keyboard, and the layout's basic variant when the layout changes", async () => {
+    mocked.getSettings.mockResolvedValue(settingsResponse({ default_keyboard: { layout: "de", variant: "neo" } }));
+    mocked.updateSettings.mockResolvedValue(settingsResponse({ default_keyboard: { layout: "de", variant: "neo" } }));
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Default keyboard variant"), { target: { value: "dvorak" } });
+    await waitFor(() => sent({ default_keyboard: { layout: "de", variant: "dvorak" } }));
+    fireEvent.change(screen.getByLabelText("Default keyboard layout"), { target: { value: "fr" } });
+    await waitFor(() => sent({ default_keyboard: { layout: "fr", variant: "" } }));
+  });
+
+  it("saves the sensitivity once the slider rests, on the log scale", async () => {
+    mocked.updateSettings.mockResolvedValue(settingsResponse());
+    renderPage();
+    const slider = await screen.findByLabelText("Default mouse sensitivity");
+    fireEvent.change(slider, { target: { value: "1" } });
+    fireEvent.change(slider, { target: { value: "-1" } });
+    expect(slider.getAttribute("aria-valuetext")).toBe("0.5×");
+    expect(mocked.updateSettings).not.toHaveBeenCalled();
+    await waitFor(() => sent({ default_mouse_sensitivity: 0.5 }));
+    expect(mocked.updateSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["Default language", "default_language", "ja-JP", "en-US"],
+    ["Default timezone", "default_timezone", "Asia/Tokyo", "UTC"],
+  ])("shows the server's refusal under the %s row, not as a toast, and keeps the saved value", async (label, key, pick, saved) => {
+    mocked.updateSettings.mockRejectedValue(new ApiError(400, "validation_failed", `${key} is not an accepted value`));
+    renderPage();
+    const select = (await screen.findByLabelText(label)) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: pick } });
+    const row = select.closest(".setting-row") as HTMLElement;
+    expect((await within(row).findByRole("alert")).textContent).toBe(`${key} is not an accepted value`);
+    expect(select.value).toBe(saved);
+  });
+
+  it("sends one PATCH at a time, so a late response cannot revert a row saved after it", async () => {
+    const answers: ((r: SettingsResponse) => void)[] = [];
+    mocked.updateSettings.mockImplementation(() => new Promise((resolve) => answers.push(resolve)));
+    renderPage();
+    const raw = (await screen.findByLabelText("Raw mouse input by default")) as HTMLInputElement;
+    const flip = screen.getByLabelText("Flip scroll direction by default") as HTMLInputElement;
+    fireEvent.click(raw);
+    fireEvent.click(flip);
+    await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mocked.updateSettings).toHaveBeenCalledTimes(1);
+    expect(raw.disabled).toBe(true);
+    expect(flip.disabled).toBe(true);
+    answers[0](settingsResponse({ default_raw_mouse: true }));
+    await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledTimes(2));
+    expect(mocked.updateSettings).toHaveBeenLastCalledWith("tok", { default_flip_scroll: true });
+    answers[1](settingsResponse({ default_raw_mouse: true, default_flip_scroll: true }));
+    await waitFor(() => expect(flip.checked).toBe(true));
+    expect(raw.checked).toBe(true);
+    expect(raw.disabled).toBe(false);
+  });
+
+  describe("one PATCH at a time across the whole page", () => {
+    // Each answer is the envelope as the server held it when it handled that write, and
+    // answers are delivered newest first: the order that lets a stale one land last.
+    let server: InstanceSettings;
+    let answers: (() => void)[];
+    beforeEach(() => {
+      server = settings();
+      answers = [];
+      mocked.updateSettings.mockImplementation((_t, body) => {
+        server = { ...server, ...body } as InstanceSettings;
+        const snapshot = settingsResponse(server);
+        return new Promise((resolve) => answers.push(() => resolve(snapshot)));
+      });
+    });
+    const settle = async () => {
+      for (let quiet = 0; quiet < 3; ) {
+        const answer = answers.pop();
+        if (answer) {
+          quiet = 0;
+          await act(async () => answer());
+        } else quiet++;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    };
+
+    it("a Region save and an Input save do not race: the layout is not reverted by the language answer", async () => {
+      renderPage();
+      fireEvent.change(await screen.findByLabelText("Default language"), { target: { value: "ja-JP" } });
+      fireEvent.change(screen.getByLabelText("Default keyboard layout"), { target: { value: "de" } });
+      await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledTimes(1));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(mocked.updateSettings).toHaveBeenCalledTimes(1);
+      await settle();
+      expect((screen.getByLabelText("Default keyboard layout") as HTMLSelectElement).value).toBe("de");
+      fireEvent.change(screen.getByLabelText("Default keyboard variant"), { target: { value: "dvorak" } });
+      await waitFor(() => expect(mocked.updateSettings).toHaveBeenLastCalledWith("tok", { default_keyboard: { layout: "de", variant: "dvorak" } }));
+    });
+
+    it("a page-level setting waits behind an inline save", async () => {
+      renderPage();
+      fireEvent.change(await screen.findByLabelText("Default language"), { target: { value: "ja-JP" } });
+      await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledTimes(1));
+      fireEvent.click(document.getElementById("mic-capture-enabled")!);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(mocked.updateSettings).toHaveBeenCalledTimes(1);
+      await settle();
+      expect(mocked.updateSettings).toHaveBeenCalledTimes(2);
+      expect(mocked.updateSettings).toHaveBeenLastCalledWith("tok", { mic_capture_enabled: true });
+      expect((screen.getByLabelText("Default language") as HTMLSelectElement).value).toBe("ja-JP");
+    });
+  });
+
+  it("keeps one row's error when another row saves", async () => {
+    mocked.updateSettings.mockImplementation(async (_t, body) => {
+      if ("default_language" in body) throw new ApiError(400, "validation_failed", "default_language is not an accepted value");
+      return settingsResponse({ default_flip_scroll: true });
+    });
+    renderPage();
+    const select = await screen.findByLabelText("Default language");
+    fireEvent.change(select, { target: { value: "ja-JP" } });
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByLabelText("Flip scroll direction by default"));
+    await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect((screen.getByLabelText("Flip scroll direction by default") as HTMLInputElement).checked).toBe(true));
+    expect(within(select.closest(".setting-row") as HTMLElement).getByRole("alert")).toBeTruthy();
+  });
+});
+
 describe("Settings — Libraries card", () => {
   it("renders the discovery hint and PATCHes library_discovery_enabled when the switch flips", async () => {
     mocked.updateSettings.mockResolvedValue(settingsResponse({ library_discovery_enabled: true }));
@@ -299,7 +478,8 @@ describe("Settings — Images card", () => {
     renderPage();
 
     await screen.findByText(/left alone \(manual\)/);
-    fireEvent.click(await screen.findByRole("tab", { name: "Auto" }));
+    const list = await screen.findByRole("tablist", { name: "Update policy" });
+    fireEvent.click(within(list).getByRole("tab", { name: "Auto" }));
 
     await waitFor(() =>
       expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { image_update_policy: "auto" }),

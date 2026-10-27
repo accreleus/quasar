@@ -5,7 +5,7 @@
 // pointer-decode rule) so two rows saving concurrently cannot clobber
 // each other.
 
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import * as adminApi from "../../../api/admin";
 import type { InstanceSettings } from "../../../api/types";
 import { useAdminAction } from "../../../lib/resource/action";
@@ -38,13 +38,21 @@ export function useSettings(): UseSettingsResult {
     [],
   );
 
+  // One PATCH at a time for the whole page: every response replaces the whole envelope, so a
+  // late answer to an earlier write would revert a row saved after it (and a keyboard row would
+  // then send a stale layout). A failed write rejects to its caller and never wedges the chain.
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
   const patchOrThrow = useCallback(
-    async (body: Partial<SettingsPatch>) => {
-      const { settings } = await resource.mutate(
-        (ctx) => adminApi.updateSettings(ctx.token, body),
-        (_data, result) => result.settings,
-      );
-      return settings;
+    (body: Partial<SettingsPatch>): Promise<InstanceSettings> => {
+      const run = queue.current.then(async () => {
+        const { settings } = await resource.mutate(
+          (ctx) => adminApi.updateSettings(ctx.token, body),
+          (_data, result) => result.settings,
+        );
+        return settings;
+      });
+      queue.current = run.catch(() => undefined);
+      return run;
     },
     [resource],
   );
