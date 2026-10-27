@@ -32,12 +32,33 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
   const active = activeIdx !== null ? Math.min(activeIdx, hits) : selectedIdx >= 0 ? selectedIdx : hits > 0 && term.trim() !== "" ? 1 : -1;
   const highlightDrawn = activeIdx !== null || selectedIdx < 0;
 
-  // Open the list on the saved zone; scrollIntoView would move the page too.
+  // A pick made here keeps the list where the user is; any other change (the map, a failed save
+  // reverting) clears the search and brings the saved row into view. scrollIntoView would move the page too.
+  const pickedHere = useRef(false);
+  const recentre = useRef(true);
+  useEffect(() => {
+    if (pickedHere.current) {
+      pickedHere.current = false;
+      return;
+    }
+    recentre.current = true;
+    if (term !== "") {
+      setTerm("");
+      setActiveIdx(null);
+    }
+  }, [value]);
   useEffect(() => {
     const list = listRef.current;
+    if (!recentre.current || term !== "" || !list) return;
+    recentre.current = false;
     const el = selectedIdx > 0 ? document.getElementById(optionId(options[selectedIdx] ?? null)) : null;
-    if (list && el) list.scrollTop = el.offsetTop - list.clientHeight / 2 + el.offsetHeight / 2;
-  }, []);
+    if (el) list.scrollTop = el.offsetTop - list.clientHeight / 2 + el.offsetHeight / 2;
+  });
+
+  const pick = (tz: string | null) => {
+    pickedHere.current = tz !== value;
+    onPick(tz);
+  };
 
   useEffect(() => {
     if (activeIdx !== null) document.getElementById(optionId(options[active] ?? null))?.scrollIntoView?.({ block: "nearest" });
@@ -50,7 +71,7 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
       setActiveIdx(next);
     } else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      if (active >= 0) onPick(options[active]?.tz ?? null);
+      if (active >= 0) pick(options[active]?.tz ?? null);
     }
   };
 
@@ -95,7 +116,7 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
                   role="option"
                   aria-selected={z ? z.tz === value : value === null}
                   className={classes.filter(Boolean).join(" ")}
-                  onClick={disabled ? undefined : () => onPick(z?.tz ?? null)}
+                  onClick={disabled ? undefined : () => pick(z?.tz ?? null)}
                 >
                   <span className="tz-t">
                     <span className="tz-name">{z ? z.city : "Follow my browser"}</span>

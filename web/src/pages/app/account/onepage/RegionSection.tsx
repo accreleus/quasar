@@ -10,6 +10,7 @@ import { ResourceStates } from "../../../../components/ResourceStates";
 import { useResource } from "../../../../lib/resource/react";
 import { browserZone, buildZones, clockIn, offsetLabel, zoneFor } from "../../../../lib/region/zones";
 import { TimezonePicker } from "./TimezonePicker";
+import { WorldMap } from "./WorldMap";
 
 const CLOCK_TICK_MS = 30_000;
 const IDLE_STEAM_CLOSED = " Your idle Steam was closed so it picks this up.";
@@ -74,6 +75,7 @@ export function RegionSection() {
                 disabled={pending !== null}
                 onPick={(tz) => void save(tz)}
               />
+              <WorldMap zones={zones} selectedTz={nowZone.tz} now={now} disabled={pending !== null} onPick={(tz) => void save(tz)} />
             </div>
             <p className="muted mt3">
               Now: {nowZone.city} ({nowZone.tz}){shown === null ? followNote : ""}
