@@ -59,6 +59,17 @@ export const ACCOUNT_SETTINGS: readonly SettingEntry[] = [
     keywords: "full screen fullscreen capture input mouse lock play launch immersive",
     target: { sel: "#launch-fullscreen", up: ".ac-sw" },
   },
+  sec("input", "Input", "input", "input", "keyboard mouse controller gamepad"),
+  {
+    id: "acct-match-cursor", label: "Match cursor to my window", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse cursor speed fast slow stream bigger window size scale match desktop",
+    target: { sel: "#match-cursor-l", up: ".field" },
+  },
+  {
+    id: "acct-mouse-sensitivity", label: "Mouse sensitivity", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse speed fast slow sensitivity dpi pointer cursor",
+    target: { sel: "#mouse-sensitivity", up: ".field" },
+  },
   sec("overlay", "In-session overlay", "overlay", "overlay", "hud strip overlay stats"),
   {
     id: "acct-overlay-preset", label: "Overlay content", where: "Overlay", icon: "overlay", to: `${A}/overlay`,

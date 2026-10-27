@@ -233,6 +233,8 @@ export function App() {
           {/* The password card merges into Profile in v3 (spec §3.3), so
               /security is a redirect, not a page. */}
           <Route path="security" element={<Navigate to="/app/account/profile" replace />} />
+          {/* New design only (one page, no Outlet); Classic has no such section. */}
+          <Route path="input" element={<Navigate to="/app/account/profile" replace />} />
         </Route>
         {/* Full-screen session view — outside AppLayout (no shell nav). */}
         <Route path="/app/session/:id" element={<SessionPage />} />

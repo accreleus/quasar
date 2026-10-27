@@ -71,7 +71,7 @@ describe("palette order: the current place first", () => {
   it("account with no query lists the sections first", () => {
     const g = arrangeWithSettings(searchPalette("", sources), "", placeOf("/app/account", ADMIN));
     expect(titles(g)).toEqual(["Settings", "Actions"]);
-    expect(g[0].items.map((i) => i.label)).toEqual(["Profile", "Stream quality", "In-session overlay", "Appearance", "Devices", "Password", "Storage", "My sessions"]);
+    expect(g[0].items.map((i) => i.label)).toEqual(["Profile", "Stream quality", "Input", "In-session overlay", "Appearance", "Devices", "Password", "Storage", "My sessions"]);
   });
 
   it("home: games, then Settings", () => {

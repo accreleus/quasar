@@ -55,6 +55,7 @@ import {
 import { LOCK_TO_STREAM_MS, SessionLoader } from "./SessionLoader";
 import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
+import { useMouseSettings } from "./useMouseSettings";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
 import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../input/launchFullscreen";
@@ -375,6 +376,14 @@ function SessionPageBody() {
     takeoverRefused,
   } = runtimeSnap;
 
+  // A quick-switch to another app re-resolves "Auto" for the new app.
+  const mouse = useMouseSettings(currentApp.id);
+  const mouseRef = useRef(mouse);
+  mouseRef.current = mouse;
+  useEffect(() => {
+    runtimeRef.current?.setMouse(mouse);
+  }, [mouse]);
+
   useEffect(() => {
     if (!signalCoords.url || !signalCoords.token || !videoRef.current) return;
 
@@ -439,6 +448,7 @@ function SessionPageBody() {
       },
     });
     runtimeRef.current = rt;
+    rt.setMouse(mouseRef.current);
     // Forwards to the page's stable fan-out set so a child that registered in
     // its own effect (children mount first) is never dropped.
     const unsubscribeTelemetry = rt.registerTelemetry((snap) => {

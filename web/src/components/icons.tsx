@@ -371,11 +371,18 @@ export type IconName =
   | "home"
   | "admin"
   | "signout"
-  | "density";
+  | "density"
+  | "input";
 
 /** Path data only — the <svg> wrapper is shared by <ShellIcon>. */
 const SHELL_GLYPHS: Record<IconName, JSX.Element> = {
   overview: <path d="M2.5 3.5h5v4h-5zM2.5 10h5v3h-5zM9.5 3.5h4v3h-4zM9.5 9h4v4h-4z" />,
+  input: (
+    <>
+      <rect x="1.5" y="4" width="13" height="8" rx="1.5" />
+      <path d="M4 6.6h.01M6.7 6.6h.01M9.3 6.6h.01M12 6.6h.01M5 9.4h6" strokeLinecap="round" />
+    </>
+  ),
   sessions: (
     <path d="M1.5 8h3l2-4.5L9 12.5l1.8-4.5h3.7" strokeLinecap="round" strokeLinejoin="round" />
   ),

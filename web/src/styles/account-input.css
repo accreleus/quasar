@@ -1,0 +1,4 @@
+/* The account page's Input section (mock #844). */
+.os-sec-input .field .segmented { align-self: flex-start; }
+.os-sec-input .os-sub-h { margin-top: var(--s6); }
+.os-sec-input .card > .eyebrow:first-child { margin-top: 0; }
