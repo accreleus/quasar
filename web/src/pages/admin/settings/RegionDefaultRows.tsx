@@ -36,7 +36,7 @@ export function RegionDefaultRows({ settings }: { settings: UseSettingsResult })
             className="select admin-settings-select"
             aria-label="Default timezone"
             value={tz}
-            disabled={busy === "default_timezone"}
+            disabled={busy("default_timezone")}
             onChange={(e) => void save("default_timezone", { default_timezone: e.target.value })}
           >
             <option value="UTC">UTC (built-in fallback)</option>
@@ -60,7 +60,7 @@ export function RegionDefaultRows({ settings }: { settings: UseSettingsResult })
             className="select admin-settings-select"
             aria-label="Default language"
             value={language}
-            disabled={busy === "default_language"}
+            disabled={busy("default_language")}
             onChange={(e) => void save("default_language", { default_language: e.target.value })}
           >
             {languages.map(([v, name]) => (
@@ -84,7 +84,7 @@ export function RegionDefaultRows({ settings }: { settings: UseSettingsResult })
             className="select admin-settings-select"
             aria-label="Default region format"
             value={format}
-            disabled={busy === "default_region_format"}
+            disabled={busy("default_region_format")}
             onChange={(e) => void save("default_region_format", { default_region_format: e.target.value || null })}
           >
             <option value="">Same as language ({languageName})</option>

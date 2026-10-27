@@ -38,7 +38,7 @@ export function InputDefaultRows({ settings }: { settings: UseSettingsResult }) 
   const known = KEYBOARDS.find((k) => k.layout === layout);
   const layouts = known ? KEYBOARDS : [...KEYBOARDS, { layout, label: layout, variants: [] }];
   const variants = known?.variants.some(([v]) => v === variant) ? known.variants : [...(known?.variants ?? []), [variant, variant || "Default"] as const];
-  const keyboardBusy = busy === "default_keyboard";
+  const keyboardBusy = busy("default_keyboard");
 
   const toggle = (key: "default_raw_mouse" | "default_flip_scroll" | "default_nintendo_layout", id: string, label: string, on: boolean) => (
     <Switch
@@ -47,7 +47,7 @@ export function InputDefaultRows({ settings }: { settings: UseSettingsResult }) 
       checked={on}
       onChange={(v) => void save(key, { [key]: v })}
       label={caption(on)}
-      disabled={busy === key}
+      disabled={busy(key)}
     />
   );
 
@@ -88,14 +88,14 @@ export function InputDefaultRows({ settings }: { settings: UseSettingsResult }) 
             aria-label="Match cursor to my window"
             value={s?.default_match_cursor ?? "auto"}
             onChange={(v) => void save("default_match_cursor", { default_match_cursor: v })}
-            disabled={busy === "default_match_cursor"}
+            disabled={busy("default_match_cursor")}
             activation="manual"
             options={MATCH_OPTIONS}
           />
           {errorFor("default_match_cursor")}
         </div>
       </SettingRow>
-      <SettingRow label="Sensitivity" hint="0.25× to 4×">
+      <SettingRow label="Mouse sensitivity" hint="0.25× to 4×">
         <div className="col gap2 admin-settings-end">
           <SensitivitySlider
             value={s?.default_mouse_sensitivity ?? 1}

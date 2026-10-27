@@ -280,13 +280,54 @@ describe("Settings — Region and Input defaults", () => {
     expect(mocked.updateSettings).toHaveBeenCalledTimes(1);
   });
 
-  it("shows the server's refusal under the row and keeps the saved value", async () => {
-    mocked.updateSettings.mockRejectedValue(new ApiError(400, "validation_failed", "default_language is not an accepted value"));
+  it.each([
+    ["Default language", "default_language", "ja-JP", "en-US"],
+    ["Default timezone", "default_timezone", "Asia/Tokyo", "UTC"],
+  ])("shows the server's refusal under the %s row, not as a toast, and keeps the saved value", async (label, key, pick, saved) => {
+    mocked.updateSettings.mockRejectedValue(new ApiError(400, "validation_failed", `${key} is not an accepted value`));
     renderPage();
-    const select = (await screen.findByLabelText("Default language")) as HTMLSelectElement;
+    const select = (await screen.findByLabelText(label)) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: pick } });
+    const row = select.closest(".setting-row") as HTMLElement;
+    expect((await within(row).findByRole("alert")).textContent).toBe(`${key} is not an accepted value`);
+    expect(select.value).toBe(saved);
+  });
+
+  it("sends one PATCH at a time, so a late response cannot revert a row saved after it", async () => {
+    const answers: ((r: SettingsResponse) => void)[] = [];
+    mocked.updateSettings.mockImplementation(() => new Promise((resolve) => answers.push(resolve)));
+    renderPage();
+    const raw = (await screen.findByLabelText("Raw mouse input by default")) as HTMLInputElement;
+    const flip = screen.getByLabelText("Flip scroll direction by default") as HTMLInputElement;
+    fireEvent.click(raw);
+    fireEvent.click(flip);
+    await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mocked.updateSettings).toHaveBeenCalledTimes(1);
+    expect(raw.disabled).toBe(true);
+    expect(flip.disabled).toBe(true);
+    answers[0](settingsResponse({ default_raw_mouse: true }));
+    await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledTimes(2));
+    expect(mocked.updateSettings).toHaveBeenLastCalledWith("tok", { default_flip_scroll: true });
+    answers[1](settingsResponse({ default_raw_mouse: true, default_flip_scroll: true }));
+    await waitFor(() => expect(flip.checked).toBe(true));
+    expect(raw.checked).toBe(true);
+    expect(raw.disabled).toBe(false);
+  });
+
+  it("keeps one row's error when another row saves", async () => {
+    mocked.updateSettings.mockImplementation(async (_t, body) => {
+      if ("default_language" in body) throw new ApiError(400, "validation_failed", "default_language is not an accepted value");
+      return settingsResponse({ default_flip_scroll: true });
+    });
+    renderPage();
+    const select = await screen.findByLabelText("Default language");
     fireEvent.change(select, { target: { value: "ja-JP" } });
-    expect((await screen.findByRole("alert")).textContent).toBe("default_language is not an accepted value");
-    expect(select.value).toBe("en-US");
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByLabelText("Flip scroll direction by default"));
+    await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect((screen.getByLabelText("Flip scroll direction by default") as HTMLInputElement).checked).toBe(true));
+    expect(within(select.closest(".setting-row") as HTMLElement).getByRole("alert")).toBeTruthy();
   });
 });
 
