@@ -220,6 +220,8 @@ MAX_COMMITS = 500
 MAX_SUBJECT = 200
 # Bidi_Control; python's unicodedata has no property for it. Zl and Zp are U+2028/9.
 BIDI = {0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)}
+# A stable release tag is exactly vX.Y.Z: not a prerelease, not v1, not v1.0.0+x.
+STABLE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
 MERGE = re.compile(r"Merge pull request #(\d+) from \S+")
 
 
@@ -243,7 +245,7 @@ def commit_list():
         raise RuntimeError("the history is shallow; fetch it in full (fetch-depth: 0) with its tags")
     git("rev-parse", "--verify", f"{source_commit}^{{commit}}")
     tags = [t for t in git("tag", "--merged", source_commit, "--list", "v[0-9]*",
-                           "--sort=-v:refname").split() if "-" not in t]
+                           "--sort=-v:refname").split() if STABLE_TAG.fullmatch(t)]
     if not tags:
         raise RuntimeError(f"no stable release tag (vX.Y.Z) is reachable from {source_commit}; "
                            "fetch the tags")

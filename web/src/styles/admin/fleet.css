@@ -595,6 +595,12 @@
   cursor: pointer;
   list-style: none;
 }
+.rel-e > summary::-webkit-details-marker {
+  display: none;
+}
+.rel-e > summary:hover {
+  background: var(--ink-4);
+}
 /* A preview build's commit list: the same row, without a disclosure. */
 .rel-commits-head {
   margin: 0;
@@ -610,12 +616,6 @@
   gap: var(--s3);
   align-items: baseline;
   padding: var(--s2) var(--card-pad);
-}
-.rel-e > summary::-webkit-details-marker {
-  display: none;
-}
-.rel-e > summary:hover {
-  background: var(--ink-4);
 }
 .rel-c {
   font-size: 10px;

@@ -473,15 +473,21 @@ function ReleaseFeed({ view }: { view: PlatformReleaseView }) {
         ))
       )}
       <p className="hint rel-notes-src">
-        Notes are sanitised from{" "}
-        {releasesUrl ? (
-          <a href={releasesUrl} target="_blank" rel="noreferrer noopener">
-            GitHub Releases
-          </a>
+        {view.channel === "preview" ? (
+          "Commit lists come from the preview build’s manifest in the image registry. "
         ) : (
-          "GitHub Releases"
+          <>
+            Notes are sanitised from{" "}
+            {releasesUrl ? (
+              <a href={releasesUrl} target="_blank" rel="noreferrer noopener">
+                GitHub Releases
+              </a>
+            ) : (
+              "GitHub Releases"
+            )}
+            {repo && ` on ${repo}`}.{" "}
+          </>
         )}
-        {repo && ` on ${repo}`}.{" "}
         Each machine’s recovery actor applies images by digest, never by tag.
       </p>
     </>
@@ -557,7 +563,7 @@ function ReleaseCard({
       </div>
       {entries.length > 0 ? (
         entries.map((entry, i) => <NoteRow key={`${entry.tag}-${i}`} entry={entry} />)
-      ) : newCommits.length > 0 ? (
+      ) : !older && newCommits.length > 0 ? (
         <NewCommits commits={newCommits} />
       ) : (
         <div className="card-pad">

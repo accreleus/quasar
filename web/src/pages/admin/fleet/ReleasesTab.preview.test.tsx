@@ -27,7 +27,11 @@ const COMMITS = [
   { commit: hex("b"), subject: "#898 Older than installed" },
 ];
 
-function previewView(newCommitCount: number | null, commits: typeof COMMITS | undefined = COMMITS): PlatformReleaseView {
+function previewView(
+  newCommitCount: number | null,
+  commits: typeof COMMITS | undefined = COMMITS,
+  installedBuiltAt = "2026-10-26T09:14:02Z",
+): PlatformReleaseView {
   const release = {
     id: "p1",
     channel: "preview",
@@ -60,7 +64,7 @@ function previewView(newCommitCount: number | null, commits: typeof COMMITS | un
     checked_at: "2026-10-27T12:05:00Z",
     last_error: null,
     installed: {
-      control_plane: { version: "dev", source_commit: hex("c"), built_at: "2026-10-26T09:14:02Z", schema_version: 107 },
+      control_plane: { version: "dev", source_commit: hex("c"), built_at: installedBuiltAt, schema_version: 107 },
       hosts: [],
     },
     available: [release],
@@ -105,6 +109,23 @@ describe("ReleasesTab commit list on preview", () => {
     // Nothing at or below the installed commit.
     expect(screen.queryByText("docs: the installed build")).not.toBeInTheDocument();
     expect(screen.queryByText("#898 Older than installed")).not.toBeInTheDocument();
+  });
+
+  it("shows no list on a preview the card marks Older than installed, whatever the count", async () => {
+    // Installed was built after this preview at the same schema: the card says
+    // Older than installed, so it cannot also list commits "newer than the installed build".
+    mocked.getPlatformReleases.mockResolvedValue(previewView(4, COMMITS, "2026-10-28T09:00:00Z"));
+    const { container } = renderTab();
+    expect((await screen.findAllByText(/Older than installed/)).length).toBeGreaterThan(0);
+    expect(container.querySelector(".rel-commits")).toBeNull();
+    expect(screen.queryByText(/newer than the installed build/)).not.toBeInTheDocument();
+  });
+
+  it("says where a preview's commit list comes from instead of GitHub Releases", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(previewView(2));
+    renderTab();
+    expect(await screen.findByText(/Commit lists come from the preview build’s manifest/)).toBeInTheDocument();
+    expect(screen.queryByText(/Notes are sanitised from/)).not.toBeInTheDocument();
   });
 
   it("says 1 commit for one", async () => {

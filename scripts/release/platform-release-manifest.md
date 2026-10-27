@@ -180,11 +180,12 @@ The `preview` job of `.github/workflows/images.yml` runs after `promote`:
 
 1. `generate-platform-release-manifest.sh --preview` writes it (no `--version`),
    writes `commits` from the checkout's history (first-parent, newest first, back to
-   the newest stable release tag, at most 500; `#<number> <title>` for a pull-request
+   the newest stable release tag (`vX.Y.Z`), at most 500; `#<number> <title>` for a pull-request
    merge, the subject line otherwise; control, line-separator and bidi characters
    replaced, cut to 200 characters; a shallow or untagged checkout fails), and
-   `validate-platform-release-manifest.sh --preview` checks it against the three build digests. Without `--preview` the validator still
-   refuses a null version and a `commits` key, so a release asset cannot carry them.
+   `validate-platform-release-manifest.sh --preview` checks it against the three
+   build digests. Without `--preview` the validator still refuses a null version
+   and a `commits` key, so a release asset cannot carry them.
 2. Each component image is read back by digest, and its `org.quasar.source.commit`
    label must be the run's commit: one commit for every image.
 3. `publish-preview-manifest.sh` reads the document the tag names now and refuses

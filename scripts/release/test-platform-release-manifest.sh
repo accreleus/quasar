@@ -313,6 +313,11 @@ pgit commit -q --allow-empty -m "before the release"
 pgit tag v1.0.0
 pgit commit -q --allow-empty -m "docs: direct commit on develop"
 pgit tag v1.1.0-rc.1
+# Not stable release tags (exactly vX.Y.Z): none of these may be the cut-off.
+pgit tag v1
+pgit tag v1.5
+pgit tag v1.5.0+build
+pgit tag v1.5.0.1
 pgit checkout -q -b side
 pgit commit -q --allow-empty -m "side-branch work that only a merge reaches"
 pgit checkout -q -
