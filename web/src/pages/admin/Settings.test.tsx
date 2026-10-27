@@ -260,7 +260,7 @@ describe("Settings — Region and Input defaults", () => {
 
   it("sends the whole keyboard, and the layout's basic variant when the layout changes", async () => {
     mocked.getSettings.mockResolvedValue(settingsResponse({ default_keyboard: { layout: "de", variant: "neo" } }));
-    mocked.updateSettings.mockResolvedValue(settingsResponse());
+    mocked.updateSettings.mockResolvedValue(settingsResponse({ default_keyboard: { layout: "de", variant: "neo" } }));
     renderPage();
     fireEvent.change(await screen.findByLabelText("Default keyboard variant"), { target: { value: "dvorak" } });
     await waitFor(() => sent({ default_keyboard: { layout: "de", variant: "dvorak" } }));
