@@ -119,8 +119,8 @@ func injectHomeMount(runtimeSpec []byte, mount string) ([]byte, error) {
 // STEAM_STARTUP_FLAGS merged over `env`. Flags first, so injectHomeMount stays
 // the last writer of `mounts`.
 //
-// A non-derived, non-managed app still takes the untouched-bytes path — the
-// byte-identical guarantee in runtime_preset.go.
+// A non-derived, non-managed app is returned untouched; dispatch adds only the
+// amendment 49 env keys (applyRegionInput).
 func (c *Coordinator) resolveHomeSpec(ctx context.Context, app LaunchApp, userID, hostID string) ([]byte, error) {
 	spec := app.RuntimeSpec
 

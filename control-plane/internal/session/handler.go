@@ -114,6 +114,8 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	mux.Handle("GET /v1/me/profile-preferences", requireAuth(http.HandlerFunc(h.handleGetProfilePreferences)))
 	mux.Handle("PATCH /v1/me/profile-preferences", requireAuth(http.HandlerFunc(h.handlePatchProfilePreferences)))
 	mux.Handle("PUT /v1/me/steam-warm", requireAuth(http.HandlerFunc(h.handleSteamWarm)))
+	mux.Handle("GET /v1/me/region-input", requireAuth(http.HandlerFunc(h.handleGetRegionInput)))
+	mux.Handle("PATCH /v1/me/region-input", requireAuth(http.HandlerFunc(h.handlePatchRegionInput)))
 
 	// Admin: GPU availability and the all-sessions view.
 	if len(requireAdmin) > 0 && requireAdmin[0] != nil {

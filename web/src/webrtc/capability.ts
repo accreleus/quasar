@@ -51,6 +51,7 @@ export function getOrCreateDeviceKey(): string {
  * at once: a stamp under an old key forces one post (#632). The stamp also holds the
  * H.264 verdict it posted: the server refuses H.264 rungs for a device whose record
  * says no, so a changed verdict (plugin installed) is posted at once, not tomorrow (#688).
+ * It holds the zone and language too: launches read them from the record (amendment 49).
  */
 const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v2";
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
@@ -59,8 +60,13 @@ export function deviceProbeIsFresh(userId: string, h264: boolean, now: number = 
   try {
     const raw = localStorage.getItem(DEVICE_POST_STORAGE_KEY);
     if (!raw) return false;
-    const { user, at, h264: posted } = JSON.parse(raw) as { user?: string; at?: number; h264?: boolean };
-    if (user !== userId || typeof at !== "number" || posted !== h264) return false;
+    const { user, at, h264: posted, region } = JSON.parse(raw) as {
+      user?: string;
+      at?: number;
+      h264?: boolean;
+      region?: string;
+    };
+    if (user !== userId || typeof at !== "number" || posted !== h264 || region !== regionStamp()) return false;
     return now - at >= 0 && now - at < DEVICE_POST_TTL_MS;
   } catch {
     return false;
@@ -69,10 +75,40 @@ export function deviceProbeIsFresh(userId: string, h264: boolean, now: number = 
 
 export function markDeviceProbePosted(userId: string, h264: boolean, now: number = Date.now()): void {
   try {
-    localStorage.setItem(DEVICE_POST_STORAGE_KEY, JSON.stringify({ user: userId, at: now, h264 }));
+    localStorage.setItem(
+      DEVICE_POST_STORAGE_KEY,
+      JSON.stringify({ user: userId, at: now, h264, region: regionStamp() }),
+    );
   } catch {
     /* Storage full or blocked: the only cost is posting again next load. */
   }
+}
+
+/**
+ * The browser's IANA zone and preferred language as `ll-RR` (control-api.md §Region and
+ * Input settings, "The device record"); a value the browser cannot give is omitted.
+ */
+export function probeRegion(): { timezone?: string; language?: string } {
+  const out: { timezone?: string; language?: string } = {};
+  try {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (zone) out.timezone = zone;
+  } catch {
+    /* No Intl time zone support: the install default applies. */
+  }
+  try {
+    const locale = new Intl.Locale(navigator.language).maximize();
+    const tag = `${locale.language}-${locale.region ?? ""}`;
+    if (/^[a-z]{2,3}-[A-Z]{2}$/.test(tag)) out.language = tag;
+  } catch {
+    /* An unparseable navigator.language: the install default applies. */
+  }
+  return out;
+}
+
+function regionStamp(): string {
+  const { timezone = "", language = "" } = probeRegion();
+  return `${timezone}|${language}`;
 }
 
 /** Codec acceptance map: which of the four codecs the browser will handle. */
@@ -495,6 +531,9 @@ export interface DeviceCapabilities {
   /** Best-effort, not a real throughput test. */
   bandwidth_kbps: number | null;
   rtt_ms: number | null;
+  /** Amendment 49: the browser's zone and language, read at launch. */
+  timezone?: string;
+  language?: string;
 }
 
 // ── Native client capability report (AS10-12) ────────────────────────────────
@@ -611,5 +650,6 @@ export async function probeCapabilities(): Promise<DeviceCapabilities> {
     profiles:          {}, // populated by the AS10-10 playback harness
     bandwidth_kbps:    bandwidthKbps,
     rtt_ms:            rttMs,
+    ...probeRegion(),
   };
 }

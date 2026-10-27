@@ -112,8 +112,15 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		SteamWarmEnabled     *bool   `json:"steam_warm_enabled"`
 		SteamWarmRewarm      *string `json:"steam_warm_rewarm"`
 		SteamWarmIdleMinutes *int    `json:"steam_warm_idle_minutes"`
+		// Region and Input defaults (control-api.md §Region and Input settings).
+		regionInputRequest
 	}
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	regionInput, err := req.regionInputRequest.patch()
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
 		return
 	}
 	var steamPreparation *bool
@@ -224,6 +231,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		SteamWarmEnabled:                  req.SteamWarmEnabled,
 		SteamWarmRewarm:                   req.SteamWarmRewarm,
 		SteamWarmIdleMinutes:              req.SteamWarmIdleMinutes,
+		RegionInput:                       regionInput,
 	}
 	// Clearing the URL disables the webhook in the same write: "enabled, with
 	// nowhere to send" is a state no admin asked for and nothing can act on.

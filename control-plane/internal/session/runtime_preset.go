@@ -11,7 +11,9 @@
 // dispatched before, so mergeRuntimePreset runs only when a preset row was
 // joined; the no-preset path returns the stored JSONB untouched, without even a
 // decode/re-encode round trip (which reorders keys and renormalizes numbers).
-// See GetLaunchApp and TestRuntimeSpecUnchangedWithoutPreset.
+// See GetLaunchApp and TestRuntimeSpecUnchangedWithoutPreset. Dispatch then sets
+// the amendment 49 env keys on every app (applyRegionInput), which re-encodes it
+// with every other field and number kept.
 package session
 
 import (

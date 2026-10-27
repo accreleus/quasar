@@ -941,9 +941,10 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		return
 	}
 	hostID := *sess.HostID
-	app := runtimeSpec
-	if len(app) == 0 {
-		app = []byte("{}")
+	app, err := c.applyRegionInput(c.ctx, runtimeSpec, sess.UserID, sess.DeviceID)
+	if err != nil {
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("region and input values: %v", err))
+		return
 	}
 	// The resolved RUNG's ABR floor, for the agent's in-session governor. It must
 	// read the rung, not the launch profile: a chain has no single floor, and one

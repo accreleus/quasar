@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **Region and Input settings, server side (#888).** Each user's timezone, language, region format, keyboard layout and mouse, scroll and gamepad choices are stored on their account (`GET`/`PATCH /v1/me/region-input`), with nine install defaults on Admin ▸ Settings. Every app now starts with `TZ`, `LANG`, `LC_*` and `XKB_DEFAULT_LAYOUT`/`_VARIANT` from the user's value, then the browser's, then the install default. Saving a changed region or keyboard value ends an idle Hot Loading Steam, and a parked Steam started with other values is never reused. The settings pages come with #846–#854.
+
 ### Changed
 - **Classic layout is deprecated (#855).** Account ▸ Appearance now says the switch back to the previous player layout will be removed in a later release. Nothing is removed yet.
 
