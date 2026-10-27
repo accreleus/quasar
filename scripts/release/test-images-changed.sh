@@ -9,7 +9,7 @@ fail() { echo "images-changed test: $*" >&2; exit 1; }
 # decide <paths...> -> "cp,na,rec" subset, "-" for nothing
 decide() {
   local out
-  out="$(printf '%s\n' "$@" | bash "$gate" ${ALL:+--all})"
+  out="$(printf '%s\n' "$@" | bash "$gate")"
   grep -q '^control_plane=true' <<<"$out" && printf 'cp,'
   grep -q '^node_agent=true' <<<"$out" && printf 'na,'
   grep -q '^recovery=true' <<<"$out" && printf 'rec,'
@@ -42,9 +42,7 @@ expect cp,na,rec .dockerignore
 expect cp,na,rec .github/workflows/images.yml
 expect cp,na,rec web/a.ts node-agent/b.rs
 expect cp,na control-plane/a.go deploy/Dockerfile.vulkan
-ALL=1 expect cp,na,rec        # a tag release, or build_all
-ALL=1 expect cp,na,rec docs/a.md
-bash "$gate" --nonsense </dev/null 2>/dev/null && fail "an unknown flag must be refused"
+bash "$gate" --all </dev/null 2>/dev/null && fail "an unknown flag must be refused"
 
 # Drift guard: every COPY source of an artefact's Dockerfile must reach that artefact.
 covered() { # covered <dockerfile> <want-token>

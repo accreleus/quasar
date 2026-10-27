@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # images-changed.sh — which published images does a change touch? (#867)
 #
-#   git diff --name-only --no-renames <last built tree> HEAD | scripts/release/images-changed.sh [--all]
+#   git diff --name-only --no-renames <last built tree> HEAD | scripts/release/images-changed.sh
 #
 # Reads changed paths on stdin and prints `control_plane=`, `node_agent=` and
-# `recovery=` as true/false. The Images workflow's `inputs` job builds an artefact
-# only when it says true and otherwise carries the previous validated digest.
-# `--all` (a tag release, or a dispatch with build_all) says true to everything.
+# `recovery=` as true/false: does the change feed that image? The Images workflow's
+# `inputs` job builds every image when ANY says true (a build is one commit for every
+# image) and builds nothing when all say false.
 #
 # THE INPUT TABLE. Keep it in step with the Dockerfiles; test-images-changed.sh fails when a
 # COPY source of one of them is not covered here.
@@ -24,17 +24,13 @@
 #                         workflow already uses to reuse or build it.
 #
 # NOT AN INPUT, on purpose: the moving quasar-base image. A base rebuild alone does not
-# rebuild an image carried forward; a tag release always builds everything.
+# trigger a build; a tag release or a `force` dispatch always builds everything
+# (the workflow decides that, not this script).
 set -euo pipefail
 
-all=false
-case "${1:-}" in
-  --all) all=true ;;
-  '') ;;
-  *) echo "usage: images-changed.sh [--all] < changed-paths" >&2; exit 2 ;;
-esac
+[ $# -eq 0 ] || { echo "usage: images-changed.sh < changed-paths" >&2; exit 2; }
 
-control=$all agent=$all recovery=$all
+control=false agent=false recovery=false
 while IFS= read -r p; do
   case "$p" in
     control-plane/*|web/*|deploy/enroll-host.sh|deploy/control-entrypoint.sh|deploy/Dockerfile.control.prod) control=true ;;
