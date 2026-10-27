@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# (ci/867 proof: a comment edit here does not move the hash)
 # deploy/toolchain-hash.sh — compute the content tag for the quasar-gst-toolchain
 # artefact image.
 #
