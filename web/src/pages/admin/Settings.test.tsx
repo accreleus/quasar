@@ -202,6 +202,12 @@ describe("Settings — Region defaults card", () => {
     renderPage();
     expect(((await screen.findByLabelText("Default timezone")) as HTMLSelectElement).value).toBe("UTC");
   });
+
+  it("renders a saved default this browser's Intl does not know", async () => {
+    mocked.getSettings.mockResolvedValue(settingsResponse({ default_timezone: "Not/AZone" }));
+    renderPage();
+    expect(((await screen.findByLabelText("Default timezone")) as HTMLSelectElement).value).toBe("Not/AZone");
+  });
 });
 
 describe("Settings — Libraries card", () => {

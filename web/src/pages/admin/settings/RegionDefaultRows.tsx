@@ -2,7 +2,7 @@
 // frame 2). Language and region format (#848) join the timezone row.
 
 import { useMemo } from "react";
-import { buildZones, formatOffset, groupZones } from "../../../lib/region/zones";
+import { buildZones, groupZones, offsetLabel } from "../../../lib/region/zones";
 import { SettingRow } from "./SettingRow";
 import type { UseSettingsResult } from "./useSettings";
 
@@ -29,7 +29,7 @@ export function RegionDefaultRows({ settings }: { settings: UseSettingsResult })
           <optgroup key={area} label={area}>
             {zs.map((z) => (
               <option key={z.tz} value={z.tz}>
-                {z.city}, {z.country} · {formatOffset(z.offset)}
+                {z.city}, {z.country} · {offsetLabel(z)}
               </option>
             ))}
           </optgroup>
