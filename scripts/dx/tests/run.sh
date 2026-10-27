@@ -3690,6 +3690,9 @@ fi
 # Release publication must wait for every image its manifest names.
 rc_of 0 "release:publication-dependencies" -- bash "$ROOT/scripts/release/test-release-publication-gate.sh"
 
+# Which images a change builds (#867): changed paths -> artefacts, and every Dockerfile COPY source is covered.
+rc_of 0 "release:images-changed" -- bash "$ROOT/scripts/release/test-images-changed.sh"
+
 # The detached release signature: the shell producer must write what the
 # shell verifier accepts, and refuse a tampered manifest or a wrong key.
 rc_of 0 "release:signature-contract" -- bash "$ROOT/scripts/release/test-platform-release-signature.sh"
