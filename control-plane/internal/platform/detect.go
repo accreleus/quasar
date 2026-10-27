@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
+	"github.com/accreleus/quasar/control-plane/internal/images"
 )
 
 // Stable-channel detection: list the configured repository's releases, validate
@@ -46,6 +47,11 @@ type Report struct {
 	// EdgeComponents is `image@digest` per component. The row cannot carry them
 	// (schema.md: manifest is NULL on edge), so the run record does.
 	EdgeComponents []string
+
+	// The preview half (amendment 48), filled only on that channel.
+	PreviewCommit string
+	// PreviewSkipped is why no preview row was written on a pass that succeeded.
+	PreviewSkipped string
 }
 
 // ChannelFunc reads the instance's channel and edge branch. Called per PASS:
@@ -61,6 +67,8 @@ type Detector struct {
 	// Both nil leaves Detect stable-only.
 	edge    EdgeResolver
 	channel ChannelFunc
+	// Read on preview; needs WithEdge's channel func.
+	preview PreviewSource
 }
 
 // NewDetector builds a Detector. log may be nil.
@@ -79,6 +87,13 @@ func (d *Detector) WithEdge(edge EdgeResolver, channel ChannelFunc) *Detector {
 	}
 	d.edge = edge
 	d.channel = channel
+	return d
+}
+
+// WithPreview enables the preview channel (amendment 48): on `preview`, each pass
+// also reads the preview manifest.
+func (d *Detector) WithPreview(p PreviewSource) *Detector {
+	d.preview = p
 	return d
 }
 
@@ -140,27 +155,100 @@ func (d *Detector) Detect(ctx context.Context) (Report, error) {
 		}
 	}
 
-	// The stable pass runs on both channels, so switching back to stable needs
-	// no re-detection (schema.md); only the edge pass is conditional.
-	if err := d.detectEdge(ctx, &rep); err != nil {
+	// The stable pass runs on every channel, so switching back to stable needs
+	// no re-detection (schema.md); only the edge and preview passes are conditional.
+	if err := d.detectBranch(ctx, &rep); err != nil {
 		return rep, err
 	}
 	return rep, nil
 }
 
-// detectEdge records the branch build while the instance is on edge. A returned
-// error fails the run, which is how it reaches the view's `last_error`.
-func (d *Detector) detectEdge(ctx context.Context, rep *Report) error {
-	if d.edge == nil || d.channel == nil {
+// detectBranch records the edge or preview build while the instance is on that
+// channel. A returned error fails the run, which is how it reaches the view's
+// `last_error`.
+func (d *Detector) detectBranch(ctx context.Context, rep *Report) error {
+	if d.channel == nil {
 		return nil
 	}
 	channel, branch, err := d.channel(ctx)
 	if err != nil {
 		return fmt.Errorf("read the release channel: %w", err)
 	}
-	if channel != ChannelEdge {
+	switch {
+	case channel == ChannelEdge && d.edge != nil:
+		return d.detectEdge(ctx, rep, branch)
+	case channel == ChannelPreview && d.preview != nil:
+		return d.detectPreview(ctx, rep)
+	}
+	return nil
+}
+
+// detectPreview records the build at the preview tag. Only the registry is called.
+func (d *Detector) detectPreview(ctx context.Context, rep *Report) error {
+	raw, err := d.preview.FetchPreview(ctx)
+	var m Manifest
+	switch {
+	case errors.Is(err, images.ErrRegistryNotFound):
+		rep.PreviewSkipped = "the preview tag is not published, or the package is not public"
+		return nil
+	case errors.Is(err, images.ErrArtifactShape):
+		// an invalid document: counted below, like a bad manifest
+	case err != nil:
+		return fmt.Errorf("preview manifest: %w", err)
+	default:
+		m, err = ParsePreviewManifest(raw)
+		if err == nil {
+			err = verifyComponentCommits(ctx, d.preview, m)
+			if err != nil && !errors.Is(err, errComponentCommit) {
+				return fmt.Errorf("preview manifest: %w", err)
+			}
+		}
+	}
+	if err != nil {
+		rep.ManifestInvalid++
+		rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", PreviewTag, err))
+		d.log.Warn("preview manifest rejected", "err", err)
 		return nil
 	}
+	rep.PreviewCommit = m.SourceCommit
+	return d.record(ctx, rep, Release{
+		Channel:       ChannelPreview,
+		SourceCommit:  m.SourceCommit,
+		BuiltAt:       m.BuiltAtTime(),
+		SchemaVersion: m.SchemaVersion,
+		CompareURL:    d.compareURL(m.SourceCommit),
+		Manifest:      raw,
+	})
+}
+
+// compareURL is the installed-to-build diff a branch build shows in place of
+// notes; nil on an unstamped build, which has nothing to compare from.
+func (d *Detector) compareURL(commit string) *string {
+	if cp := buildinfo.Get().SourceCommit; cp != nil {
+		if u := d.source.CompareURL(*cp, commit); u != "" {
+			return &u
+		}
+	}
+	return nil
+}
+
+// record upserts one branch-channel row, idempotent on (channel, source_commit).
+func (d *Detector) record(ctx context.Context, rep *Report, rel Release) error {
+	inserted, err := d.store.UpsertRelease(ctx, rel)
+	if err != nil {
+		return err
+	}
+	rep.Seen++
+	if inserted {
+		rep.New++
+	} else {
+		rep.Updated++
+	}
+	return nil
+}
+
+// detectEdge records the branch build.
+func (d *Detector) detectEdge(ctx context.Context, rep *Report, branch string) error {
 	rep.EdgeBranch = branch
 
 	build, err := d.edge.Resolve(ctx, branch)
@@ -184,7 +272,7 @@ func (d *Detector) detectEdge(ctx context.Context, rep *Report) error {
 		rep.EdgeComponents = append(rep.EdgeComponents, c.Image+"@"+c.Digest)
 	}
 
-	rel := Release{
+	return d.record(ctx, rep, Release{
 		Channel:       ChannelEdge,
 		Version:       nil, // an edge build is a commit, never a version
 		SourceCommit:  build.SourceCommit,
@@ -192,27 +280,9 @@ func (d *Detector) detectEdge(ctx context.Context, rep *Report) error {
 		SchemaVersion: build.SchemaVersion,
 		Prerelease:    false,
 		Notes:         "", // no notes on a branch; compare_url stands in
+		CompareURL:    d.compareURL(build.SourceCommit),
 		// Manifest stays nil: NULL on edge (schema.md / openapi.yaml).
-	}
-	// Null on an unstamped build: nothing to compare from.
-	if cp := buildinfo.Get().SourceCommit; cp != nil {
-		if u := d.source.CompareURL(*cp, build.SourceCommit); u != "" {
-			rel.CompareURL = &u
-		}
-	}
-
-	// Idempotent on (edge, source_commit).
-	inserted, err := d.store.UpsertRelease(ctx, rel)
-	if err != nil {
-		return err
-	}
-	rep.Seen++
-	if inserted {
-		rep.New++
-	} else {
-		rep.Updated++
-	}
-	return nil
+	})
 }
 
 // resolve turns one listing into its row. The manifest is the identity: a tag
@@ -289,6 +359,12 @@ func (r Report) Summary() map[string]any {
 		if len(r.EdgeComponents) > 0 {
 			s["edge_components"] = r.EdgeComponents
 		}
+	}
+	if r.PreviewCommit != "" {
+		s["preview_commit"] = r.PreviewCommit
+	}
+	if r.PreviewSkipped != "" {
+		s["preview_skipped"] = r.PreviewSkipped
 	}
 	if len(r.Errors) > 0 {
 		// Bounded: the summary column has a 4096-byte ceiling.

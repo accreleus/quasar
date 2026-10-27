@@ -83,8 +83,9 @@ beforeEach(() => {
 });
 
 describe("ReleasesTab on edge", () => {
-  it("labels an older same-schema edge candidate without suggesting a new update", async () => {
-    const view = edgeView({ built_at: "2026-08-18T09:14:02Z" });
+  // A preview build is a branch build too (amendment 48): the same rule holds.
+  it.each(["edge", "preview"] as const)("labels an older same-schema %s candidate without suggesting a new update", async (channel) => {
+    const view = edgeView({ built_at: "2026-08-18T09:14:02Z", channel });
     view.targets[0] = { ...view.targets[0], eligible: false, reason: "up_to_date", preflight: PF };
     mocked.getPlatformReleases.mockResolvedValue(view);
     renderTab();

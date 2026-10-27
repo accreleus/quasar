@@ -530,7 +530,8 @@ may never be published).
 
 **Channel** — which platform releases an admin is shown. `stable` is a tagged,
 noted release; `beta` is those and the prereleases among them; `edge` is
-whatever was last published from a branch, with no notes. An instance follows
+whatever was last published from a branch, with no notes; `preview` is every
+build of `develop`, read from the preview manifest. An instance follows
 one channel at a time. Beta stores no releases of its own — it lists the ones
 stable hides — so a switch selects differently rather than fetching again.
 _Avoid_: "track", "branch" (edge follows a branch, but a channel is the

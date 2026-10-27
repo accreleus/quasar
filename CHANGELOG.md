@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **Control plane: a Preview release channel, checked daily (#841).** `release_channel` accepts `preview`: every build of `develop`, read from the `quasar-release-manifest:preview` image in the platform registry (no GitHub call for it) and otherwise handled as an edge build. Release detection now takes its period from the channel: daily on Preview, weekly on every other channel, still inside the Jobs tab's window. An interval set by hand on the detection job is ignored from now on; `QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL` still wins when set. The picker option and the Daily/Weekly choice come with #842. Migration 0107.
+
 ### Changed
 - **Classic layout is deprecated (#855).** Account ▸ Appearance now says the switch back to the previous player layout will be removed in a later release. Nothing is removed yet.
 

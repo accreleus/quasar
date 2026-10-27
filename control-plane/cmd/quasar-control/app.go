@@ -1009,9 +1009,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		Default: jobs.Schedule{Kind: jobs.KindInterval, IntervalSecs: 6 * 3600},
 	})
 
-	// Platform-release detection (#104/#110). Weekly, in a one-hour window that
-	// opens 02:00 Monday UTC: a self-hosted instance learns about a release on
-	// the operator's quiet hour, not on ours. "Check now" is this job's run-now
+	// Platform-release detection (#104/#110). Weekly in a one-hour window that
+	// opens 02:00 Monday UTC, or daily at 02:00 UTC (release_check, amendment 48):
+	// a self-hosted instance learns about a release on the operator's quiet hour. "Check now" is this job's run-now
 	// action and bypasses the window, as it does for every job.
 	platformStore := platform.NewStore(pool)
 	releaseRepo := platform.ConfiguredReleaseRepo()
@@ -1031,11 +1031,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		// client rather than the GitHub one. The platform registry is added to
 		// the image allowlist here so repointing it takes one knob, not two.
 		platformRegistry := platform.ConfiguredPlatformRegistry()
+		platformImages := images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platformRegistry))
 		releaseDetector = releaseDetector.WithEdge(
-			platform.NewRegistryEdgeSource(
-				images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platformRegistry)),
-				platformRegistry, releaseRepo),
-			settingsStore.ReleaseChannel)
+			platform.NewRegistryEdgeSource(platformImages, platformRegistry, releaseRepo),
+			settingsStore.ReleaseChannel).
+			WithPreview(platform.NewRegistryPreviewSource(platformImages, platformRegistry, releaseRepo))
 	}
 	// Platform-release APPLY (#116, amendment 2). The runner is the per-host
 	// state machine; its three effects are wired here because internal/platform
@@ -1292,45 +1292,30 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		},
 	}, log)
 
-	jobRegistry.MustRegister(jobs.Definition{
-		ID:          platform.DetectJobID,
-		Name:        "Platform release detection",
-		Description: "Reads the configured repository's releases and records new platform releases and their manifests.",
-		Plane:       jobs.PlaneControl,
-		Scope:       jobs.ScopeInstance,
-		Managed:     true,
-		Default: jobs.Schedule{
-			Kind:         jobs.KindInterval,
-			IntervalSecs: 7 * 24 * 3600,
-			WindowStart:  ptrTimeOfDay(jobs.MustTimeOfDay("02:00")),
-			WindowEnd:    ptrTimeOfDay(jobs.MustTimeOfDay("03:00")),
-			WindowDays:   []int{int(time.Monday)},
-			Timezone:     "UTC",
-		},
-		EnvOverride: "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL",
-		Run: func(ctx context.Context, rc jobs.RunContext) (jobs.Outcome, error) {
-			if releaseDetector == nil {
-				return jobs.Skipped("no platform release repository configured (QUASAR_PLATFORM_RELEASE_REPO)"), nil
-			}
-			refreshPreflight()
-			rep, err := releaseDetector.Detect(ctx)
-			if err != nil {
-				return jobs.Outcome{}, err
-			}
-			summary := rep.Summary()
-			for k, v := range releaseNotifier.Notify(ctx).Summary() {
-				summary[k] = v
-			}
-			// The detection schedule IS the unattended-apply window (#122), so
-			// this is the trigger — it runs only on a pass that succeeded, and it
-			// never fails the job: a release the instance chose not to install is
-			// not a detection failure. Why it did or did not act is in the summary.
-			for k, v := range autoApplier.Consider(ctx).Summary() {
-				summary[k] = v
-			}
-			return jobs.Succeeded(summary), nil
-		},
-	})
+	releaseDetect := releaseDetectDefinition(settingsStore.ReleaseCheckPeriod, os.Getenv, log)
+	releaseDetect.Run = func(ctx context.Context, rc jobs.RunContext) (jobs.Outcome, error) {
+		if releaseDetector == nil {
+			return jobs.Skipped("no platform release repository configured (QUASAR_PLATFORM_RELEASE_REPO)"), nil
+		}
+		refreshPreflight()
+		rep, err := releaseDetector.Detect(ctx)
+		if err != nil {
+			return jobs.Outcome{}, err
+		}
+		summary := rep.Summary()
+		for k, v := range releaseNotifier.Notify(ctx).Summary() {
+			summary[k] = v
+		}
+		// The detection schedule IS the unattended-apply window (#122), so
+		// this is the trigger — it runs only on a pass that succeeded, and it
+		// never fails the job: a release the instance chose not to install is
+		// not a detection failure. Why it did or did not act is in the summary.
+		for k, v := range autoApplier.Consider(ctx).Summary() {
+			summary[k] = v
+		}
+		return jobs.Succeeded(summary), nil
+	}
+	jobRegistry.MustRegister(releaseDetect)
 
 	// Unmanaged legacy jobs (§8.6). Never claimed, never scheduled, "run now"
 	// refuses with job_unmanaged (protocol/openapi.yaml unmanaged_note,
@@ -1594,4 +1579,46 @@ func applyMachineShape(cfg *config.Config) platform.MachineShape {
 		return platform.MachineShape{Role: platform.MachineRoleCombined, NodeName: cfg.LocalEnrollmentNodeName}
 	}
 	return machineShape(cfg)
+}
+
+// detectIntervalEnv is platform.release_detect's EnvOverride (docs/configuration.md).
+const detectIntervalEnv = "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL"
+
+// releaseDetectDefinition is platform.release_detect without its Run. Its period is
+// release_check, daily on preview and weekly otherwise (amendment 48), unless the
+// env override parses; the window stays the Jobs tab's and opens every day on daily.
+func releaseDetectDefinition(period func(context.Context) (time.Duration, error), getenv func(string) string, log *slog.Logger) jobs.Definition {
+	if raw := strings.TrimSpace(getenv(detectIntervalEnv)); raw != "" {
+		if _, byEnv, _ := jobs.EffectiveInterval(jobs.Job{}, detectIntervalEnv, getenv); !byEnv {
+			log.Warn("platform release detection: ignoring a malformed "+detectIntervalEnv+"; the period follows release_check",
+				"value", raw)
+		}
+	}
+	return jobs.Definition{
+		ID:          platform.DetectJobID,
+		Name:        "Platform release detection",
+		Description: "Reads the configured repository's releases and records new platform releases and their manifests.",
+		Plane:       jobs.PlaneControl,
+		Scope:       jobs.ScopeInstance,
+		Managed:     true,
+		Default: jobs.Schedule{
+			Kind:         jobs.KindInterval,
+			IntervalSecs: 7 * 24 * 3600,
+			WindowStart:  ptrTimeOfDay(jobs.MustTimeOfDay("02:00")),
+			WindowEnd:    ptrTimeOfDay(jobs.MustTimeOfDay("03:00")),
+			WindowDays:   []int{int(time.Monday)},
+			Timezone:     "UTC",
+		},
+		EnvOverride: detectIntervalEnv,
+		IntervalSource: func(ctx context.Context) (time.Duration, bool, error) {
+			if d, byEnv, _ := jobs.EffectiveInterval(jobs.Job{}, detectIntervalEnv, getenv); byEnv {
+				return d, true, nil
+			}
+			d, err := period(ctx)
+			return d, false, err
+		},
+		IntervalOwner:      "instance_settings.release_check",
+		IntervalOwnerHint:  "Fleet, Releases",
+		DailyOpensEveryDay: true,
+	}
 }

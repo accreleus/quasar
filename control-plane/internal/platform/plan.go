@@ -418,7 +418,7 @@ func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool
 // stable: there may be no corresponding release row on the edge channel. Missing
 // timestamps preserve legacy advisory behavior, and newer schemas still win.
 func edgeOlderThanInstalled(release Release, cp buildinfo.Identity) bool {
-	if release.Channel != ChannelEdge || release.SchemaVersion != cp.SchemaVersion || cp.BuiltAt == nil {
+	if !branchChannel(release.Channel) || release.SchemaVersion != cp.SchemaVersion || cp.BuiltAt == nil {
 		return false
 	}
 	installedAt, err := time.Parse(time.RFC3339, *cp.BuiltAt)
