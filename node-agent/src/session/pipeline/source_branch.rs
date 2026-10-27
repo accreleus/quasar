@@ -85,9 +85,11 @@ pub(crate) fn build_video_source(
                 "VK-05: waylanddisplaysrc vulkan=true (emit memory:VulkanImage NV12 for vulkanh264enc)"
             );
         }
+        // A swap builds its compositor from this same session cfg, not the new app's spec,
+        // so the session keeps its keymap (amendment 49).
         if let Some((layout, variant)) = keyboard_layout(cfg.container.as_ref()) {
-            // A compositor without the properties keeps US rather than failing the session.
-            if el.find_property("keyboard-layout").is_some() {
+            // A compositor without both properties keeps US rather than failing the session.
+            if keyboard_properties_present(|p| el.find_property(p).is_some()) {
                 el.set_property("keyboard-layout", layout);
                 el.set_property("keyboard-variant", variant);
                 tracing::info!(layout, variant, "compositor keyboard layout");
@@ -95,7 +97,8 @@ pub(crate) fn build_video_source(
                 tracing::warn!(
                     token = "compositor-keyboard-layout-unsupported",
                     layout,
-                    "waylanddisplaysrc has no keyboard-layout property; the session keeps the US keymap"
+                    variant,
+                    "waylanddisplaysrc lacks keyboard-layout or keyboard-variant; the session keeps the US keymap"
                 );
             }
         }
@@ -250,6 +253,11 @@ pub(crate) fn build_gpu_convert_stage(
     Ok(super::scale_stage::build_scale_stage(cfg, va_ctx)?.elements)
 }
 
+/// Both keymap properties are there; a compositor with only one keeps US.
+fn keyboard_properties_present(has: impl Fn(&str) -> bool) -> bool {
+    has("keyboard-layout") && has("keyboard-variant")
+}
+
 /// The session's keyboard layout and variant from the app's env (amendment 49), or `None`
 /// for the compositor's US keymap. The compositor falls back to US on a pair that does not
 /// compile.
@@ -257,12 +265,40 @@ pub(crate) fn keyboard_layout(container: Option<&ContainerSpec>) -> Option<(&str
     let env = &container?.env;
     let layout = env.get("XKB_DEFAULT_LAYOUT").filter(|l| !l.is_empty())?;
     let variant = env.get("XKB_DEFAULT_VARIANT").map_or("", String::as_str);
+    // The control plane's rules (`ValidXKBLayout`/`ValidXKBVariant`): one layout, no comma
+    // list for xkbcommon to compile into many groups.
+    let xkb_name = |v: &str, max: usize| {
+        v.len() <= max
+            && v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    if !xkb_name(layout, 32) || !xkb_name(variant, 64) {
+        tracing::warn!(
+            token = "compositor-keyboard-layout-invalid",
+            layout,
+            variant,
+            "XKB_DEFAULT_LAYOUT or XKB_DEFAULT_VARIANT is not a single XKB name; the session keeps the US keymap"
+        );
+        return None;
+    }
     Some((layout, variant))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{keyboard_layout, va_postproc_candidates};
+    use super::{keyboard_layout, keyboard_properties_present, va_postproc_candidates};
+
+    #[test]
+    fn keyboard_layout_needs_both_compositor_properties() {
+        let with = |names: &'static [&'static str]| move |p: &str| names.contains(&p);
+        assert!(keyboard_properties_present(with(&[
+            "keyboard-layout",
+            "keyboard-variant"
+        ])));
+        assert!(!keyboard_properties_present(with(&["keyboard-layout"])));
+        assert!(!keyboard_properties_present(with(&["keyboard-variant"])));
+        assert!(!keyboard_properties_present(with(&[])));
+    }
     use crate::session::container::ContainerSpec;
 
     #[test]
@@ -286,6 +322,32 @@ mod tests {
         assert_eq!(keyboard_layout(Some(&empty)), None);
         assert_eq!(keyboard_layout(Some(&spec(&[]))), None);
         assert_eq!(keyboard_layout(None), None);
+        // Outside the control plane's rules: US.
+        let list = spec(&[
+            ("XKB_DEFAULT_LAYOUT", "us,de,fr"),
+            ("XKB_DEFAULT_VARIANT", ",,"),
+        ]);
+        assert_eq!(keyboard_layout(Some(&list)), None);
+        let bad_variant = spec(&[("XKB_DEFAULT_LAYOUT", "de"), ("XKB_DEFAULT_VARIANT", ",")]);
+        assert_eq!(keyboard_layout(Some(&bad_variant)), None);
+        let long = "a".repeat(33);
+        assert_eq!(
+            keyboard_layout(Some(&spec(&[("XKB_DEFAULT_LAYOUT", &long)]))),
+            None
+        );
+        let longest = "a".repeat(32);
+        assert_eq!(
+            keyboard_layout(Some(&spec(&[("XKB_DEFAULT_LAYOUT", &longest)]))),
+            Some((longest.as_str(), ""))
+        );
+        let long_variant = "v".repeat(65);
+        assert_eq!(
+            keyboard_layout(Some(&spec(&[
+                ("XKB_DEFAULT_LAYOUT", "de"),
+                ("XKB_DEFAULT_VARIANT", &long_variant)
+            ]))),
+            None
+        );
     }
 
     // SO-07: device-pinned to the assigned render node, generic as the single-GPU fallback.

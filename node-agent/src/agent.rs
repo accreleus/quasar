@@ -11727,7 +11727,7 @@ mod tests {
         // The assign as the control plane writes it (amendment 49): both keys, variant "".
         let cfg = steam_cfg_from_wire(SessionKind::Play, "-applaunch 730", "Europe/Berlin");
         assert_eq!(
-            crate::session::pipeline::source_branch::keyboard_layout(cfg.container.as_ref()),
+            crate::session::pipeline::keyboard_layout(cfg.container.as_ref()),
             Some(("de", ""))
         );
     }
