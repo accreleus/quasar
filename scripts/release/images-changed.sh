@@ -23,9 +23,13 @@
 #   quasar-gst-toolchain  not here: content-hashed by deploy/toolchain-hash.sh, which the
 #                         workflow already uses to reuse or build it.
 #
-# NOT AN INPUT, on purpose: the moving quasar-base image. A base rebuild alone does not
-# trigger a build; a tag release or a `force` dispatch always builds everything
-# (the workflow decides that, not this script).
+# NOT A PATH INPUT, on purpose: the moving quasar-base image and deploy/toolchain-hash.sh.
+# They move the toolchain's content hash instead, and the workflow reads that: a run whose
+# toolchain tag is not published builds everything, as do a tag release and a `force`
+# dispatch. Those decisions are the workflow's, not this script's.
+#
+# Patterns are shell `case` globs, where `*` also matches `/`: `deploy/audio/*` is every
+# file under it, which is what the `**` above means.
 set -euo pipefail
 
 [ $# -eq 0 ] || { echo "usage: images-changed.sh < changed-paths" >&2; exit 2; }

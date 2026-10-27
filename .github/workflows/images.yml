@@ -421,62 +421,6 @@ jobs:
             echo "| base resolved | \`$base_ref\` |"
             echo "| release candidate | \`$release_candidate\` |"
           } >> "$GITHUB_STEP_SUMMARY"
-      # ── Build only when an image input changed (#867) ──────────────────────
-      #
-      # Do any image's inputs differ from the last build of this branch? The input
-      # table (paths -> artefact) lives in scripts/release/images-changed.sh, with its
-      # table test. If none did, this run publishes nothing; if any did, it builds every
-      # image, so a build is one commit for every image (the release identity rules
-      # compare one commit) and no digest is carried from another commit.
-      #
-      #   BASE OF THE DIFF: the commit of this branch's last SUCCESSFUL Images run, not
-      #   HEAD^. Builds are dispatched by hand, so the parent says nothing about what the
-      #   last build held; a diff of two trees is right across merges, reverts and force
-      #   pushes, and a run that found nothing to build counts as a success because its
-      #   image inputs equal its base's. No previous success, or its commit gone, builds.
-      #   ALWAYS BUILDS: a `v*` tag, and a dispatch with `force`.
-      #   Skipping works by `if:` on the toolchain and build-* jobs: their dependants (the
-      #   validate-* jobs, preflight, promote, release) are skipped with them, so nothing
-      #   is validated or promoted either.
-      - name: Decide whether any image input changed
-        id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ github.ref_name }}
-          RELEASE_CANDIDATE: ${{ steps.resolve.outputs.release_candidate }}
-          FORCE: ${{ inputs.force }}
-        run: |
-          set -euo pipefail
-          why=""
-          prev=""
-          if [ "$RELEASE_CANDIDATE" = true ]; then why="release tag: builds everything"
-          elif [ "$FORCE" = true ]; then why="force: builds everything"
-          else
-            prev="$(gh run list --workflow images.yml --branch "$BRANCH" --status success \
-                      --limit 1 --json headSha --jq '.[0].headSha // empty' || true)"
-            if [ -z "$prev" ]; then why="no previous successful run on $BRANCH: builds everything"
-            elif ! git cat-file -e "${prev}^{commit}" 2>/dev/null; then why="previous build commit ${prev:0:7} is not in this checkout: builds everything"
-            fi
-          fi
-
-          if [ -n "$why" ]; then
-            build=true
-          else
-            git diff --name-only --no-renames "$prev" HEAD > "$RUNNER_TEMP/changed"
-            build="$(bash scripts/release/images-changed.sh < "$RUNNER_TEMP/changed" | grep -c '=true' || true)"
-            if [ "$build" -gt 0 ]; then
-              build=true; why="an image input changed since ${prev:0:7}: builds every image"
-            else
-              build=false; why="no image input changed since ${prev:0:7}; nothing built"
-            fi
-          fi
-          echo "build_any=$build" >> "$GITHUB_OUTPUT"
-          echo "$why"
-          {
-            echo "### Images to build"
-            echo ""
-            echo "$why"
-          } >> "$GITHUB_STEP_SUMMARY"
       - name: Resolve the gst toolchain (reuse it by digest, or say it must be built)
         id: toolchain
         env:
@@ -514,6 +458,72 @@ jobs:
           echo "REUSING $image -- pins, patches, the toolchain stage and the base are unchanged."
           echo "Skipping a ~40 minute GStreamer build: ${image%:*}@${d}"
           echo "| toolchain | \`${image%:*}@${d}\` (reused) |" >> "$GITHUB_STEP_SUMMARY"
+      # ── Build only when an image input changed (#867) ──────────────────────
+      #
+      # Do any image's inputs differ from the last build of this branch? The input
+      # table (paths -> artefact) lives in scripts/release/images-changed.sh, with its
+      # table test. If none did, this run publishes nothing; if any did, it builds every
+      # image, so a build is one commit for every image (the release identity rules
+      # compare one commit) and no digest is carried from another commit.
+      #
+      #   BASE OF THE DIFF: the commit of this branch's last SUCCESSFUL Images run, not
+      #   HEAD^. Builds are dispatched by hand, so the parent says nothing about what the
+      #   last build held; a diff of two trees is right across merges, reverts and force
+      #   pushes, and a run that found nothing to build counts as a success because its
+      #   image inputs equal its base's. No previous success, or its commit gone, builds.
+      #   ALWAYS BUILDS: a `v*` tag, a dispatch with `force`, and a run whose toolchain is
+      #   not published yet. The toolchain tag is a content hash over the pins, the patches,
+      #   the toolchain stage, deploy/toolchain-hash.sh and the resolved base digest, so a
+      #   base rebuild or a pin change moves it without touching any image-input path;
+      #   it is resolved just above, which is why this step comes after it.
+      #   Skipping works by `if:` on the toolchain and build-* jobs: their dependants (the
+      #   validate-* jobs, preflight, promote, release) are skipped with them, so nothing
+      #   is validated or promoted either.
+      - name: Decide whether any image input changed
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          RELEASE_CANDIDATE: ${{ steps.resolve.outputs.release_candidate }}
+          FORCE: ${{ inputs.force }}
+          TOOLCHAIN_BUILD: ${{ steps.toolchain.outputs.build }}
+        run: |
+          set -euo pipefail
+          why=""
+          prev=""
+          if [ "$RELEASE_CANDIDATE" = true ]; then why="release tag: builds everything"
+          elif [ "$FORCE" = true ]; then why="force: builds everything"
+          elif [ "$TOOLCHAIN_BUILD" = true ]; then why="the toolchain for these pins and this base is not published: builds everything"
+          else
+            prev="$(gh run list --workflow images.yml --branch "$BRANCH" --status success \
+                      --limit 1 --json headSha --jq '.[0].headSha // empty' || true)"
+            if [ -z "$prev" ]; then why="no previous successful run on $BRANCH: builds everything"
+            elif ! git cat-file -e "${prev}^{commit}" 2>/dev/null; then why="previous build commit ${prev:0:7} is not in this checkout: builds everything"
+            fi
+          fi
+
+          if [ -n "$why" ]; then
+            build=true
+          else
+            git diff --name-only --no-renames "$prev" HEAD > "$RUNNER_TEMP/changed"
+            # Fails closed: an error from the script (or an answer that is not all three
+            # lines) stops the job; it never reads as "nothing changed".
+            out="$(bash scripts/release/images-changed.sh < "$RUNNER_TEMP/changed")"
+            [ "$(grep -c -E '^(control_plane|node_agent|recovery)=(true|false)$' <<<"$out")" -eq 3 ] \
+              || { echo "::error::images-changed.sh gave an unusable answer: $out"; exit 1; }
+            if grep -q '=true' <<<"$out"; then
+              build=true; why="an image input changed since ${prev:0:7}: builds every image"
+            else
+              build=false; why="no image input changed since ${prev:0:7}; nothing built"
+            fi
+          fi
+          echo "build_any=$build" >> "$GITHUB_OUTPUT"
+          echo "$why"
+          {
+            echo "### Images to build"
+            echo ""
+            echo "$why"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── The patched GStreamer toolchain, built once per pin bump ───────────────
   #
@@ -532,12 +542,13 @@ jobs:
     name: quasar-gst-toolchain (patched GStreamer, pin-keyed)
     needs: inputs
     if: needs.inputs.outputs.build_any == 'true'
-    # Always runs, with every step gated on `toolchain_build` (decided in `inputs`): a
-    # SKIPPED job would skip build-node-agent and everything below it through the implicit
-    # success() check over all ancestors, and the publication gate
-    # (scripts/release/test-release-publication-gate.sh) forbids success()-bypassing
-    # conditions on those jobs. A reused toolchain therefore costs one idle runner
-    # start (seconds), not a cleanup and a hash/inspect/digest pass (#865).
+    # Skipped, whole, when no image input changed (`build_any`, #867): nothing is built, so nothing
+    # needs a toolchain, and the build-* jobs and everything below skip with it. When it runs it
+    # runs EVERY time, with each step gated on `toolchain_build` (decided in `inputs`), because a
+    # skipped toolchain job would skip build-node-agent through the implicit success() check over
+    # all ancestors, and the publication gate (scripts/release/test-release-publication-gate.sh)
+    # forbids success()-bypassing conditions on those jobs. A reused toolchain therefore costs one
+    # idle runner start (seconds), not a cleanup and a hash/inspect/digest pass (#865).
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
