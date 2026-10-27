@@ -184,11 +184,19 @@ The `preview` job of `.github/workflows/images.yml` runs after `promote`:
    refuses a null version and a `commits` key, so a release asset cannot carry them.
 2. Each component image is read back by digest, and its `org.quasar.source.commit`
    label must be the run's commit: one commit for every image.
-3. `publish-preview-manifest.sh` pushes the document and moves the tag, then reads
-   the tag back and checks the manifest digest and the layer bytes.
+3. `publish-preview-manifest.sh` reads the document the tag names now and refuses
+   unless its `source_commit` is an ancestor of this one's (or the same): the tag
+   only moves forward, so re-running an older run fails instead of rewinding it.
+   Then it pushes the document, moves the tag, reads the tag back and checks the
+   manifest digest and the layer bytes.
 
 A run that builds no image publishes no new preview, so the tag stays on the last
-build. A dispatch with `preview` ticked publishes to a test tag,
+build. On a push to `develop` the Images gate (#867) diffs against the commit the
+`preview` tag names, not against the branch's last successful run (a dispatch on
+`develop` moves no preview), and stops a run older than that commit before it
+builds. Both rules are `preview-rules.sh` (`tag` and `forward`), tested by
+`test-preview-rules.sh`; `test-publish-preview-manifest.sh` runs the push against a
+local `registry:2` (needs docker). A dispatch with `preview` ticked publishes to a test tag,
 `preview-<branch>`, never `preview`.
 
 **Once, after the first push:** the `quasar-release-manifest` package must be

@@ -59,4 +59,16 @@ print('PASS release and preview publication wait for every validated, promoted r
 # The Compose updater retired with #367; its lane must not come back.
 assert not any(j.endswith('-updater') for j in graph), 'an updater lane is back in images.yml'
 
+# The preview tag only moves forward (#839): the rules live in preview-rules.sh
+# (test-preview-rules.sh); here, only that the workflow still calls them.
+inputs = blocks['inputs']
+assert 'preview-rules.sh tag "$EVENT"' in inputs, 'the preview tag is not decided by preview-rules.sh'
+assert inputs.index('id: preview') < inputs.index('id: gate'), 'the gate needs the preview tag decided first'
+assert 'publish-preview-manifest.sh --current' in inputs and 'preview-rules.sh forward "$current" HEAD' in inputs, \
+    'a develop push no longer refuses a run older than the published preview'
+assert 'prev="$current"' in inputs, 'a develop push no longer diffs against the published preview'
+assert re.search(r'actions/checkout@\S+.*\n\s+with:\n(?:\s+#.*\n)*\s+fetch-depth: 0', blocks['preview']), \
+    'the preview job needs history for the forward check'
+print('PASS the workflow decides the preview tag and its diff base by preview-rules.sh')
+
 PY

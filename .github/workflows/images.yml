@@ -472,6 +472,21 @@ jobs:
           echo "REUSING $image -- pins, patches, the toolchain stage and the base are unchanged."
           echo "Skipping a ~40 minute GStreamer build: ${image%:*}@${d}"
           echo "| toolchain | \`${image%:*}@${d}\` (reused) |" >> "$GITHUB_STEP_SUMMARY"
+      # `preview` only on a push to develop. A dispatch asked for a preview gets a
+      # branch-scoped test tag, `preview-<branch>`, which no control plane reads.
+      # The rule, and its table test, are scripts/release/preview-rules.sh.
+      - name: Decide the preview tag
+        id: preview
+        env:
+          EVENT: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          BRANCH: ${{ github.ref_name }}
+          WANT_PREVIEW: ${{ inputs.preview }}
+        run: |
+          set -euo pipefail
+          tag="$(bash scripts/release/preview-rules.sh tag "$EVENT" "$GIT_REF" "$BRANCH" "$WANT_PREVIEW")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "preview tag: ${tag:-none}"
       # ── Build only when an image input changed (#867) ──────────────────────
       #
       # Do any image's inputs differ from the last build of this branch? The input
@@ -485,14 +500,22 @@ jobs:
       #   last build held; a diff of two trees is right across merges, reverts and force
       #   pushes, and a run that found nothing to build counts as a success because its
       #   image inputs equal its base's. No previous success, or its commit gone, builds.
+      #   ON A PUSH TO DEVELOP (#839) the base is instead the commit the published
+      #   `preview` manifest names: a dispatch on develop also succeeds on develop but
+      #   moves no preview, and as a base it would make the next landing skip and leave
+      #   the preview behind. No preview published yet builds everything. A run OLDER
+      #   than that commit (a re-run of an earlier landing) fails here, before it builds
+      #   or promotes anything: the preview, and `o2-develop` with it, only move forward
+      #   (scripts/release/preview-rules.sh forward; the preview job checks it again
+      #   right before it moves the tag).
       #   ALWAYS BUILDS: a `v*` tag, a dispatch with `force`, and a run whose toolchain is
       #   not published yet. The toolchain tag is a content hash over the pins, the patches,
       #   the toolchain stage, deploy/toolchain-hash.sh and the resolved base digest, so a
       #   base rebuild or a pin change moves it without touching any image-input path;
       #   it is resolved just above, which is why this step comes after it.
       #   Skipping works by `if:` on the toolchain and build-* jobs: their dependants (the
-      #   validate-* jobs, preflight, promote, release) are skipped with them, so nothing
-      #   is validated or promoted either.
+      #   validate-* jobs, preflight, promote, release, preview) are skipped with them, so
+      #   nothing is validated or promoted either.
       - name: Decide whether any image input changed
         id: gate
         env:
@@ -501,13 +524,29 @@ jobs:
           RELEASE_CANDIDATE: ${{ steps.resolve.outputs.release_candidate }}
           FORCE: ${{ inputs.force }}
           TOOLCHAIN_BUILD: ${{ steps.toolchain.outputs.build }}
+          PREVIEW_TAG: ${{ steps.preview.outputs.tag }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           why=""
           prev=""
+          current=""
+          if [ "$PREVIEW_TAG" = preview ]; then
+            # An unreadable tag fails the step; only a 404 reads as "not published".
+            current="$(bash scripts/release/publish-preview-manifest.sh --current "$REGISTRY_NS/quasar-release-manifest:preview")"
+            echo "the preview names: ${current:-nothing (not published)}"
+            if ! bash scripts/release/preview-rules.sh forward "$current" HEAD; then
+              echo "::error::this run's commit is older than the published preview (${current:0:7}). It would move develop's images and the preview back, so it stops here. Re-run the newest develop run instead."
+              exit 1
+            fi
+          fi
           if [ "$RELEASE_CANDIDATE" = true ]; then why="release tag: builds everything"
           elif [ "$FORCE" = true ]; then why="force: builds everything"
           elif [ "$TOOLCHAIN_BUILD" = true ]; then why="the toolchain for these pins and this base is not published: builds everything"
+          elif [ "$PREVIEW_TAG" = preview ]; then
+            prev="$current"
+            [ -n "$prev" ] || why="no preview is published yet: builds everything"
           else
             prev="$(gh run list --workflow images.yml --branch "$BRANCH" --status success \
                       --limit 1 --json headSha --jq '.[0].headSha // empty' || true)"
@@ -538,29 +577,6 @@ jobs:
             echo ""
             echo "$why"
           } >> "$GITHUB_STEP_SUMMARY"
-      # `preview` only on a push to develop. A dispatch asked for a preview gets a
-      # branch-scoped test tag, `preview-<branch>`, which no control plane reads.
-      - name: Decide the preview tag
-        id: preview
-        env:
-          EVENT: ${{ github.event_name }}
-          GIT_REF: ${{ github.ref }}
-          BRANCH: ${{ github.ref_name }}
-          WANT_PREVIEW: ${{ inputs.preview }}
-        run: |
-          set -euo pipefail
-          tag=""
-          if [ "$EVENT" = push ] && [ "$GIT_REF" = refs/heads/develop ]; then
-            tag=preview
-          elif [ "$EVENT" = workflow_dispatch ] && [ "$WANT_PREVIEW" = true ]; then
-            case "$GIT_REF" in
-              refs/heads/*) ;;
-              *) echo "::error::a test preview is published from a branch, not $GIT_REF"; exit 1 ;;
-            esac
-            tag="preview-$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-100)"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "preview tag: ${tag:-none}"
 
   # ── The patched GStreamer toolchain, built once per pin bump ───────────────
   #
@@ -1384,9 +1400,18 @@ jobs:
   # published and has passed its contract; the step below also re-reads each
   # image's org.quasar.source.commit label, which the control plane checks too. A
   # run that built nothing skips the build jobs and therefore this one: the tag
-  # stays on the last build. A failure here leaves the tag where it was (the push
-  # writes the tag after the blobs, in one request), and re-running this job is
-  # safe: the generator and the push are idempotent.
+  # stays on the last build.
+  #
+  # THE TAG ONLY MOVES FORWARD. publish-preview-manifest.sh reads the document the
+  # tag names now and refuses unless its source_commit is an ancestor of this run's
+  # commit (or is it), so re-running an OLDER run fails instead of rewinding the
+  # channel; the `inputs` gate refuses such a run earlier still. Re-running the
+  # newest run is safe: the same commit is accepted and the push is idempotent.
+  # A failure before the push's one manifest PUT leaves the tag where it was. A
+  # failure in the read-back after it means the tag HAS moved: look at it before
+  # re-running. The residual: the read and the PUT are two requests, and nothing
+  # but the `concurrency` group (one develop run at a time) keeps a second writer
+  # out between them.
   #
   # The package is created by this job's first push. It must be PUBLIC (an install
   # reads it anonymously); a human checks that once after the first push and changes
@@ -1404,6 +1429,9 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The forward check compares this commit with the one the tag names.
+          fetch-depth: 0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
