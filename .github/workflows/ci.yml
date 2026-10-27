@@ -135,33 +135,28 @@ jobs:
   rust:
     name: node-agent (fmt + clippy + test)
     runs-on: ubuntu-latest
+    # Measured 2026-10: 5 min median, under 11 min at worst with a slow apt step. 30 leaves room
+    # for a cold rust-cache and fails a stall in half an hour, not the 6-hour default (#864).
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: node-agent
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The .deb set is cached on the package list and the runner image, so a runner upgrade
+      # never installs debs the new image's mirror pins have moved past. A save from a PR run
+      # is visible to that PR only; a run on develop (a dispatch) seeds it for every PR.
+      - name: Runner image
+        id: image
+        run: echo "id=${ImageOS:-}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: apt-debs-${{ steps.image.outputs.id }}-${{ hashFiles('.github/ci-apt/node-agent.txt', 'scripts/verify/ci-apt-install.sh') }}
       # gstreamer-rs 0.23 sys crates need the GStreamer 1.24 dev headers;
       # ubuntu-24.04 (ubuntu-latest) ships gst 1.24. webrtc/sdp live in -bad.
       - name: Install GStreamer dev packages
-        run: |
-          sudo apt-get update
-          # Dev headers for the sys crates, PLUS the runtime plugin packages —
-          # gst-backed tests construct real elements (webrtcbin lives in
-          # gstreamer1.0-plugins-bad, not in any -dev package).
-          # libasound2-dev supplies alsa.pc: without it the `alsa` crate's
-          # alsa-sys build script panics, and cargo reports it as a failed
-          # Clippy step rather than a lint.
-          sudo apt-get install -y --no-install-recommends \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev \
-            gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-bad \
-            gstreamer1.0-nice \
-            libglib2.0-dev \
-            libssl-dev \
-            libasound2-dev
+        run: bash "$GITHUB_WORKSPACE/scripts/verify/ci-apt-install.sh" "$GITHUB_WORKSPACE/.github/ci-apt/node-agent.txt" "$RUNNER_TEMP/apt-debs"
       # This action picks the toolchain from the REF NAME it was used at, so pinning to a
       # sha means `toolchain:` has to be passed explicitly or nothing selects one.
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -194,6 +189,8 @@ jobs:
   engines:
     name: engine suite (${{ matrix.target }})
     runs-on: ubuntu-latest
+    # Measured 2026-10: 2-5 min without a stalled apt step. 20 is headroom for a cold rust-cache (#864).
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -211,16 +208,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The suite links the agent crate, which needs the same headers as the rust job.
+      # The .deb set is cached on the package list and the runner image, so a runner upgrade
+      # never installs debs the new image's mirror pins have moved past. A save from a PR run
+      # is visible to that PR only; a run on develop (a dispatch) seeds it for every PR.
+      - name: Runner image
+        id: image
+        run: echo "id=${ImageOS:-}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: apt-debs-${{ steps.image.outputs.id }}-${{ hashFiles('.github/ci-apt/engines.txt', 'scripts/verify/ci-apt-install.sh') }}
       - name: Install GStreamer dev packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev \
-            libglib2.0-dev \
-            libssl-dev \
-            libasound2-dev
+        run: bash scripts/verify/ci-apt-install.sh .github/ci-apt/engines.txt "$RUNNER_TEMP/apt-debs"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable

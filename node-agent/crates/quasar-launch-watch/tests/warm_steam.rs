@@ -412,7 +412,7 @@ fn a_game_that_closes_ends_the_quit_at_its_exit_sync() {
     reaper(&d.proc_root, 20);
     let log = d.logs.join("cloud_log.txt");
     let t0 = Instant::now();
-    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0, None);
     assert_eq!(quit.poll(t0 + Duration::from_secs(2)), None);
     gone(&d.proc_root, 20);
     assert_eq!(
@@ -434,7 +434,7 @@ fn a_sync_that_never_ends_is_waited_for_sixty_seconds() {
     let d = dirs();
     reaper(&d.proc_root, 20);
     let t0 = Instant::now();
-    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0, None);
     gone(&d.proc_root, 20);
     assert_eq!(quit.poll(t0), None);
     append(
@@ -456,7 +456,7 @@ fn a_game_with_no_exit_sync_is_done_at_the_start_grace() {
     let d = dirs();
     reaper(&d.proc_root, 20);
     let t0 = Instant::now();
-    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0, None);
     gone(&d.proc_root, 20);
     assert_eq!(quit.poll(t0), None);
     // Another app's sync is not this game's.
@@ -482,7 +482,7 @@ fn a_sync_started_inside_the_grace_is_waited_for_past_it() {
     reaper(&d.proc_root, 20);
     let log = d.logs.join("cloud_log.txt");
     let t0 = Instant::now();
-    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0, None);
     gone(&d.proc_root, 20);
     assert_eq!(quit.poll(t0), None);
     append(&log, &cloud_line(APPID, "Starting sync (up,AC Exit,)"));
@@ -503,7 +503,7 @@ fn a_sync_started_inside_the_grace_is_waited_for_past_it() {
 fn a_quit_for_a_game_that_is_not_running_is_done_at_once() {
     let d = dirs();
     let t0 = Instant::now();
-    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0, None);
     assert_eq!(
         quit.poll(t0),
         Some(QuitAction::Done(None)),
@@ -512,13 +512,87 @@ fn a_quit_for_a_game_that_is_not_running_is_done_at_once() {
     assert_eq!(quit.poll(t0 + QUIT_CLOUD_WAIT), None);
 }
 
+/// #810: the player quit the game; its exit sync's start line was written before the quit
+/// command reached the helper. The sync is read from the log as it stood when the watch began.
+#[test]
+fn a_quit_after_the_game_exited_waits_for_the_sync_that_started_before_it() {
+    let d = dirs();
+    reaper(&d.proc_root, 20);
+    let earlier = CloudSync::new(&d.logs, APPID);
+    gone(&d.proc_root, 20);
+    let log = d.logs.join("cloud_log.txt");
+    append(&log, &cloud_line(APPID, "Starting sync (up,AC Exit,)"));
+    let t0 = Instant::now();
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0, Some(earlier));
+    assert_eq!(
+        quit.poll(t0 + Duration::from_secs(1)),
+        None,
+        "started, not ended"
+    );
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE + Duration::from_secs(10)),
+        None,
+        "a started sync is waited for past the start grace"
+    );
+    append(&log, &cloud_line(APPID, "Upload complete, result OK"));
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE + Duration::from_secs(11)),
+        Some(QuitAction::Done(Some(CloudEnd::Uploaded("OK".into()))))
+    );
+}
+
+#[test]
+fn a_quit_after_the_game_exited_with_no_sync_is_done_at_the_start_grace() {
+    let d = dirs();
+    reaper(&d.proc_root, 20);
+    let earlier = CloudSync::new(&d.logs, APPID);
+    gone(&d.proc_root, 20);
+    let t0 = Instant::now();
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0, Some(earlier));
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE - Duration::from_millis(1)),
+        None
+    );
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE),
+        Some(QuitAction::Done(None))
+    );
+}
+
+/// An unreadable `/proc` never reads as gone, but the exit the caller saw still holds: the
+/// earlier tail is kept, so the start line written before the quit is not lost.
+#[test]
+fn a_quit_after_the_game_exited_keeps_its_earlier_sync_when_proc_cannot_be_read() {
+    let d = dirs();
+    let earlier = CloudSync::new(&d.logs, APPID);
+    let log = d.logs.join("cloud_log.txt");
+    append(&log, &cloud_line(APPID, "Starting sync (up,AC Exit,)"));
+    let proc_root = d.proc_root.join("not-yet");
+    let t0 = Instant::now();
+    let mut quit = Quit::new(&proc_root, &d.logs, APPID, t0, Some(earlier));
+    assert_eq!(quit.poll(t0 + Duration::from_secs(1)), None);
+    // /proc reads again, and the game is gone.
+    std::fs::create_dir_all(&proc_root).unwrap();
+    assert_eq!(quit.poll(t0 + Duration::from_secs(2)), None, "sync started");
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE + Duration::from_secs(10)),
+        None,
+        "a started sync is waited for past the start grace"
+    );
+    append(&log, &cloud_line(APPID, "Upload complete, result OK"));
+    assert_eq!(
+        quit.poll(t0 + QUIT_SYNC_START_GRACE + Duration::from_secs(11)),
+        Some(QuitAction::Done(Some(CloudEnd::Uploaded("OK".into()))))
+    );
+}
+
 #[test]
 fn a_game_that_will_not_close_is_terminated_then_killed() {
     let d = dirs();
     reaper(&d.proc_root, 20);
     process(&d.proc_root, 21, 20, &["game.exe"]);
     let t0 = Instant::now();
-    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0, None);
     assert_eq!(
         quit.poll(t0 + QUIT_CLOSE_GRACE - Duration::from_millis(1)),
         None
@@ -544,7 +618,7 @@ fn a_game_gone_after_sigterm_still_waits_for_its_sync() {
     let d = dirs();
     reaper(&d.proc_root, 20);
     let t0 = Instant::now();
-    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0);
+    let mut quit = Quit::new(&d.proc_root, &d.logs, APPID, t0, None);
     assert!(matches!(
         quit.poll(t0 + QUIT_CLOSE_GRACE),
         Some(QuitAction::Terminate(_))
@@ -570,7 +644,7 @@ fn a_game_gone_after_sigterm_still_waits_for_its_sync() {
 fn an_unreadable_proc_never_reads_as_gone() {
     let d = dirs();
     let t0 = Instant::now();
-    let mut quit = Quit::new(&d.proc_root.join("missing"), &d.logs, APPID, t0);
+    let mut quit = Quit::new(&d.proc_root.join("missing"), &d.logs, APPID, t0, None);
     assert_eq!(quit.poll(t0 + Duration::from_secs(5)), None);
     assert!(matches!(
         quit.poll(t0 + QUIT_CLOSE_GRACE),
