@@ -259,22 +259,13 @@ fn keyboard_properties_present(has: impl Fn(&str) -> bool) -> bool {
 }
 
 /// The session's keyboard layout and variant from the app's env (amendment 49), or `None`
-/// for the compositor's US keymap. The compositor falls back to US on a pair that does not
-/// compile.
+/// for the compositor's US keymap. The agent has already settled a pair that is not a real
+/// layout to US (`session::keymap::settle`); the compositor also falls back on one that does
+/// not compile.
 pub(crate) fn keyboard_layout(container: Option<&ContainerSpec>) -> Option<(&str, &str)> {
     let env = &container?.env;
     let layout = env.get("XKB_DEFAULT_LAYOUT").filter(|l| !l.is_empty())?;
     let variant = env.get("XKB_DEFAULT_VARIANT").map_or("", String::as_str);
-    use crate::session::keymap::xkb_name;
-    if !xkb_name(layout, 32) || !xkb_name(variant, 64) {
-        tracing::warn!(
-            token = "compositor-keyboard-layout-invalid",
-            layout,
-            variant,
-            "XKB_DEFAULT_LAYOUT or XKB_DEFAULT_VARIANT is not a single XKB name; the session keeps the US keymap"
-        );
-        return None;
-    }
     Some((layout, variant))
 }
 
@@ -316,32 +307,6 @@ mod tests {
         assert_eq!(keyboard_layout(Some(&empty)), None);
         assert_eq!(keyboard_layout(Some(&spec(&[]))), None);
         assert_eq!(keyboard_layout(None), None);
-        // Outside the control plane's rules: US.
-        let list = spec(&[
-            ("XKB_DEFAULT_LAYOUT", "us,de,fr"),
-            ("XKB_DEFAULT_VARIANT", ",,"),
-        ]);
-        assert_eq!(keyboard_layout(Some(&list)), None);
-        let bad_variant = spec(&[("XKB_DEFAULT_LAYOUT", "de"), ("XKB_DEFAULT_VARIANT", ",")]);
-        assert_eq!(keyboard_layout(Some(&bad_variant)), None);
-        let long = "a".repeat(33);
-        assert_eq!(
-            keyboard_layout(Some(&spec(&[("XKB_DEFAULT_LAYOUT", &long)]))),
-            None
-        );
-        let longest = "a".repeat(32);
-        assert_eq!(
-            keyboard_layout(Some(&spec(&[("XKB_DEFAULT_LAYOUT", &longest)]))),
-            Some((longest.as_str(), ""))
-        );
-        let long_variant = "v".repeat(65);
-        assert_eq!(
-            keyboard_layout(Some(&spec(&[
-                ("XKB_DEFAULT_LAYOUT", "de"),
-                ("XKB_DEFAULT_VARIANT", &long_variant)
-            ]))),
-            None
-        );
     }
 
     // SO-07: device-pinned to the assigned render node, generic as the single-GPU fallback.
