@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -66,5 +67,61 @@ func TestFetchArtifact(t *testing.T) {
 	t.Cleanup(srv.Close)
 	if _, err := newTestResolver(&http.Client{}, srv.URL).FetchArtifact(ctx, ref); !errors.Is(err, ErrRegistryNotFound) {
 		t.Errorf("an unpublished tag: err = %v, want ErrRegistryNotFound", err)
+	}
+}
+
+// What ghcr.io answered anonymously on 2026-10-27 for a package never published
+// (review of #884): the token is DENIED and the manifest GET is a 401 challenge.
+const (
+	ghcrDeniedBody     = `{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}`
+	ghcrChallenge      = `Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:accreleus/quasar/quasar-release-manifest:pull"`
+	ghcrUnauthorized   = `{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}`
+	previewArtifactRef = "ghcr.io/accreleus/quasar/quasar-release-manifest:preview"
+)
+
+func ghcrUnpublished(t *testing.T, manifestStatus int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/token":
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, ghcrDeniedBody)
+		case manifestStatus == http.StatusUnauthorized:
+			w.Header().Set("WWW-Authenticate", ghcrChallenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, ghcrUnauthorized)
+		default:
+			w.WriteHeader(manifestStatus)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// An unpublished (or private) package reads as "not published"; a 5xx does not.
+func TestFetchArtifactGHCRUnpublishedPackage(t *testing.T) {
+	ctx := context.Background()
+	srv := ghcrUnpublished(t, http.StatusUnauthorized)
+	_, err := newTestResolver(&http.Client{}, srv.URL).FetchArtifact(ctx, previewArtifactRef)
+	if !errors.Is(err, ErrRegistryNotFound) {
+		t.Fatalf("GHCR's denied token + 401 challenge: err = %v, want ErrRegistryNotFound", err)
+	}
+
+	srv = ghcrUnpublished(t, http.StatusServiceUnavailable)
+	_, err = newTestResolver(&http.Client{}, srv.URL).FetchArtifact(ctx, previewArtifactRef)
+	if err == nil || errors.Is(err, ErrRegistryNotFound) || !strings.Contains(err.Error(), "status 503") {
+		t.Fatalf("a 503 from the registry: err = %v, want a failure that is not ErrRegistryNotFound", err)
+	}
+}
+
+// The contract names an OCI image manifest; a Docker v2 one is the wrong document.
+func TestFetchArtifactRefusesADockerManifest(t *testing.T) {
+	const doc = `{"format_version":2}`
+	reg := newConfigRegistry(t, `{}`)
+	reg.configBody = doc
+	reg.index = strings.Replace(artifactManifest(digestOf(doc)),
+		"application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json", 1)
+	if _, err := reg.resolver().FetchArtifact(context.Background(), previewArtifactRef); !errors.Is(err, ErrArtifactShape) {
+		t.Fatalf("err = %v, want ErrArtifactShape", err)
 	}
 }

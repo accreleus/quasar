@@ -2,8 +2,12 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -18,11 +22,31 @@ type fakePreview struct {
 	raw   string
 	err   error
 	calls int
+	// The component images: their commit label ("" = the document's source_commit),
+	// or an inspection error.
+	imageCommit string
+	inspectErr  error
 }
 
 func (f *fakePreview) FetchPreview(context.Context) ([]byte, error) {
 	f.calls++
 	return []byte(f.raw), f.err
+}
+
+func (f *fakePreview) InspectConfig(_ context.Context, ref string) (images.ImageConfig, error) {
+	if f.inspectErr != nil {
+		return images.ImageConfig{}, f.inspectErr
+	}
+	commit := f.imageCommit
+	if commit == "" {
+		var doc struct {
+			SourceCommit string `json:"source_commit"`
+		}
+		_ = json.Unmarshal([]byte(f.raw), &doc)
+		commit = doc.SourceCommit
+	}
+	return images.ImageConfig{ManifestDigest: ref[strings.Index(ref, "@")+1:],
+		Labels: map[string]string{LabelSourceCommit: commit}}, nil
 }
 
 func previewDoc(t *testing.T, commit string) string {
@@ -119,6 +143,9 @@ func TestDetectPreviewFailures(t *testing.T) {
 		{"not a single-layer artifact", fakePreview{err: shape}, false, 1, false},
 		{"invalid document", fakePreview{raw: strings.Replace(previewFixture(t), `"version": null`, `"version": "0.5.1"`, 1)}, false, 1, false},
 		{"not JSON", fakePreview{raw: "<html>"}, false, 1, false},
+		{"an image built from another commit", fakePreview{raw: previewFixture(t), imageCommit: commitA}, false, 1, false},
+		{"an image that is not published", fakePreview{raw: previewFixture(t), inspectErr: notFound}, false, 1, false},
+		{"an image the registry cannot be asked about", fakePreview{raw: previewFixture(t), inspectErr: errors.New("dial tcp: i/o timeout")}, true, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := testDB(t)
@@ -139,6 +166,57 @@ func TestDetectPreviewFailures(t *testing.T) {
 			}
 			if rows, _ := store.Releases(ctx, ChannelPreview); len(rows) != 0 {
 				t.Fatalf("a %s stored %d preview rows", tc.name, len(rows))
+			}
+		})
+	}
+}
+
+// GHCR's real answers for a package never published (captured 2026-10-27, review
+// of #884): the token is DENIED and the manifest GET is a 401 challenge. Through
+// the real resolver the run succeeds and lists nothing; a 5xx still fails it.
+func TestDetectPreviewGHCRUnpublishedPackage(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		failsRun bool
+	}{
+		{"never published", http.StatusUnauthorized, false},
+		{"registry down", http.StatusServiceUnavailable, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var srv *httptest.Server
+			srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/token":
+					w.WriteHeader(http.StatusForbidden)
+					fmt.Fprint(w, `{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}`)
+				case tc.status == http.StatusUnauthorized:
+					w.Header().Set("WWW-Authenticate", `Bearer realm="`+srv.URL+`/token",service="ghcr.io",scope="repository:accreleus/quasar/quasar-release-manifest:pull"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					fmt.Fprint(w, `{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}`)
+				default:
+					w.WriteHeader(tc.status)
+				}
+			}))
+			defer srv.Close()
+			host := strings.TrimPrefix(srv.URL, "https://")
+			u, _ := url.Parse(srv.URL)
+			resolver := images.NewRegistryResolverForHosts(srv.Client(), map[string]struct{}{host: {}, u.Hostname(): {}})
+
+			pool := testDB(t)
+			ctx := context.Background()
+			store := NewStore(pool)
+			channel := ChannelPreview
+			rep, err := NewDetector(twoReleaseSource(), store, nil).WithEdge(&fakeEdge{}, channelIs(&channel)).
+				WithPreview(NewRegistryPreviewSource(resolver, host, "accreleus/quasar")).Detect(ctx)
+			if (err != nil) != tc.failsRun || (err != nil && !strings.Contains(err.Error(), "status 503")) {
+				t.Fatalf("err = %v, want failed run = %v", err, tc.failsRun)
+			}
+			if !tc.failsRun && !strings.Contains(rep.PreviewSkipped, "not public") {
+				t.Fatalf("preview_skipped = %q, want it to say the package may not be public", rep.PreviewSkipped)
+			}
+			if rows, _ := store.Releases(ctx, ChannelPreview); len(rows) != 0 {
+				t.Fatalf("stored %d preview rows", len(rows))
 			}
 		})
 	}

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
@@ -321,8 +322,12 @@ func validateFloor(floor []ManifestFloor, release *semver.Full) error {
 }
 
 // parseManifestCommits validates a preview manifest's `commits`: at most 500
-// entries, each exactly a full commit and a one-line subject of at most 200 characters.
+// entries, each exactly a full commit and a one-line subject of at most 200
+// characters with no control character. Markup stays: the client renders plain text.
 func parseManifestCommits(raw json.RawMessage) ([]ManifestCommit, error) {
+	if string(raw) == "null" {
+		return nil, fmt.Errorf("manifest commits is null; leave the key out instead")
+	}
 	var entries []struct {
 		Commit  string  `json:"commit"`
 		Subject *string `json:"subject"`
@@ -343,7 +348,7 @@ func parseManifestCommits(raw json.RawMessage) ([]ManifestCommit, error) {
 		if e.Subject == nil {
 			return nil, fmt.Errorf("manifest commits[%d] has no subject", i)
 		}
-		if strings.ContainsAny(*e.Subject, "\r\n") || utf8.RuneCountInString(*e.Subject) > maxManifestSubjectRunes {
+		if strings.IndexFunc(*e.Subject, unicode.IsControl) >= 0 || utf8.RuneCountInString(*e.Subject) > maxManifestSubjectRunes {
 			return nil, fmt.Errorf("manifest commits[%d].subject is not one line of at most %d characters", i, maxManifestSubjectRunes)
 		}
 		out = append(out, ManifestCommit{Commit: e.Commit, Subject: *e.Subject})

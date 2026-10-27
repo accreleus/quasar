@@ -136,7 +136,7 @@ func (e *RegistryEdgeSource) Resolve(ctx context.Context, branch string) (EdgeBu
 		if err != nil {
 			return EdgeBuild{}, fmt.Errorf("edge image %s: %w", ref, err)
 		}
-		commit := strings.ToLower(cfg.Label(LabelSourceCommit))
+		commit := labelCommit(cfg)
 		if !fullCommitRe.MatchString(commit) {
 			return EdgeBuild{}, fmt.Errorf("edge image %s: %s is %q, not 40 lowercase hex",
 				ref, LabelSourceCommit, cfg.Label(LabelSourceCommit))
@@ -177,7 +177,7 @@ func (e *RegistryEdgeSource) Resolve(ctx context.Context, branch string) (EdgeBu
 	case err != nil:
 		return EdgeBuild{}, fmt.Errorf("edge image %s: %w", ref, err)
 	}
-	if commit := strings.ToLower(cfg.Label(LabelSourceCommit)); commit != build.SourceCommit {
+	if commit := labelCommit(cfg); commit != build.SourceCommit {
 		return EdgeBuild{}, fmt.Errorf("%w: %s is %s while %s is %q (tag %q)",
 			ErrEdgeComponentsDisagree, edgeComponents[0].Name, shortCommit(build.SourceCommit),
 			edgeRecovery.Name, cfg.Label(LabelSourceCommit), tag)
@@ -189,6 +189,11 @@ func (e *RegistryEdgeSource) Resolve(ctx context.Context, branch string) (EdgeBu
 		Name: edgeRecovery.Name, Image: e.ImageName(edgeRecovery.Image), Digest: cfg.ManifestDigest,
 	})
 	return build, nil
+}
+
+// labelCommit is the commit an image says it was built from.
+func labelCommit(cfg images.ImageConfig) string {
+	return strings.ToLower(cfg.Label(LabelSourceCommit))
 }
 
 // parseSchemaLabel: absent and unreadable are the same answer, unknown.

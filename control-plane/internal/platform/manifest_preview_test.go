@@ -105,6 +105,12 @@ func TestParsePreviewManifestRejections(t *testing.T) {
 		{"commit extra key", commit(`{"commit":"` + strings.Repeat("c", 40) + `","subject":"x","author":"a"}`), "unknown field"},
 		{"no subject", commit(`{"commit":"` + strings.Repeat("c", 40) + `"}`), "no subject"},
 		{"two-line subject", commit(`{"commit":"` + strings.Repeat("c", 40) + `","subject":"a\nb"}`), "one line"},
+		{"NUL in a subject", commit(`{"commit":"` + strings.Repeat("c", 40) + `","subject":"a\u0000b"}`), "one line"},
+		{"escape in a subject", commit(`{"commit":"` + strings.Repeat("c", 40) + `","subject":"a\u001b[31mb"}`), "one line"},
+		{"C1 control in a subject", commit(`{"commit":"` + strings.Repeat("c", 40) + `","subject":"a\u0085b"}`), "one line"},
+		{"commits null", func(s string) string {
+			return strings.Replace(s, fixtureCommits, ",\n  \"commits\": null", 1)
+		}, "commits is null"},
 		{"subject over 200", commit(`{"commit":"` + strings.Repeat("c", 40) + `","subject":"` + long + `"}`), "one line"},
 		{"501 commits", commit(many.String()), "at most 500"},
 		{"no floor", func(s string) string {

@@ -189,7 +189,7 @@ func (d *Detector) detectPreview(ctx context.Context, rep *Report) error {
 	var m Manifest
 	switch {
 	case errors.Is(err, images.ErrRegistryNotFound):
-		rep.PreviewSkipped = "the preview tag is not published yet"
+		rep.PreviewSkipped = "the preview tag is not published, or the package is not public"
 		return nil
 	case errors.Is(err, images.ErrArtifactShape):
 		// an invalid document: counted below, like a bad manifest
@@ -197,6 +197,12 @@ func (d *Detector) detectPreview(ctx context.Context, rep *Report) error {
 		return fmt.Errorf("preview manifest: %w", err)
 	default:
 		m, err = ParsePreviewManifest(raw)
+		if err == nil {
+			err = verifyComponentCommits(ctx, d.preview, m)
+			if err != nil && !errors.Is(err, errComponentCommit) {
+				return fmt.Errorf("preview manifest: %w", err)
+			}
+		}
 	}
 	if err != nil {
 		rep.ManifestInvalid++
