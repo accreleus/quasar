@@ -49,7 +49,6 @@ mod version_tests {
 /// Compile-time stamps from `build.rs`. Literally `"unknown"` on a build that
 /// had neither the env vars nor a git checkout.
 const STAMP_SOURCE_COMMIT: &str = env!("QUASAR_STAMP_SOURCE_COMMIT");
-const STAMP_BUILT_AT: &str = env!("QUASAR_STAMP_BUILT_AT");
 
 /// The commit this binary was built from, or None when unstamped.
 /// 7-40 lowercase hex is the wire's accepted shape; anything else is dropped
@@ -62,11 +61,21 @@ pub fn source_commit() -> Option<&'static str> {
     hex.then_some(c)
 }
 
-/// When this binary was built (RFC3339), or None when unstamped. Not parsed:
-/// the build passes through whatever the image build recorded, and the control
-/// plane validates.
+/// When this binary's image was built (RFC3339), or None when unstamped. Read
+/// once from the image's `QUASAR_BUILT_AT` ENV (deploy/Dockerfile.vulkan, runtime
+/// stage), not compiled in: a wall-clock compile stamp made every build of an
+/// unchanged tree recompile the agent (#866). Not parsed: the build passes
+/// through whatever the image build recorded, and the control plane validates.
 pub fn built_at() -> Option<&'static str> {
-    (STAMP_BUILT_AT != "unknown" && !STAMP_BUILT_AT.is_empty()).then_some(STAMP_BUILT_AT)
+    static BUILT_AT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BUILT_AT
+        .get_or_init(|| built_at_from(std::env::var("QUASAR_BUILT_AT").ok()))
+        .as_deref()
+}
+
+fn built_at_from(raw: Option<String>) -> Option<String> {
+    raw.map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v != "unknown")
 }
 
 /// How this host got its platform images (`CONTEXT.md` "Install mode").
@@ -751,8 +760,21 @@ mod tests {
         if STAMP_SOURCE_COMMIT == "unknown" {
             assert_eq!(source_commit(), None);
         }
-        if STAMP_BUILT_AT == "unknown" {
-            assert_eq!(built_at(), None);
+    }
+
+    #[test]
+    fn built_at_comes_from_the_image_env_and_unknown_is_absent() {
+        assert_eq!(
+            built_at_from(Some(" 2026-10-27T10:00:00Z ".into())).as_deref(),
+            Some("2026-10-27T10:00:00Z")
+        );
+        for raw in [
+            None,
+            Some(String::new()),
+            Some(" ".into()),
+            Some("unknown".into()),
+        ] {
+            assert_eq!(built_at_from(raw), None);
         }
     }
 
