@@ -33,7 +33,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Internal
 - **Region and Input settings mock (#844).** `design_handoff_v3/screens/region-input-v3.html` shows the account page's new Region section (timezone list and world map, language, region format) and Input section (keyboard layout, mouse speed and sensitivity, raw input, scroll direction, Nintendo gamepad layout), plus the admin install-wide defaults. `DESIGN.md` gains the rules for its new controls.
-- **The bench peer no longer reads Steam's screensaver as a black stream (#835).** A held peer longer than about 5 minutes ended on the screensaver Steam draws after ~310 s without input; `scripts/harness/peer-driver.mjs` now taps Left Shift every 250 s (`IDLE_NUDGE_EVERY_S`, `0` = off), so a soak passes or fails on stream health alone (#819).
+- **The bench peer no longer ends a long hold on Steam's screensaver (#835).** A held peer longer than about 5 minutes ended on the static slideshow Steam draws after ~310 s without input; `scripts/harness/peer-driver.mjs` now taps Left Shift at decode and then every 250 s (`IDLE_NUDGE_EVERY_S`, `0` = off), so a soak passes or fails on stream health alone (#819).
 - **CI no longer stalls on the GStreamer apt install (#864).** The node-agent and engine-suite jobs download packages with a 20 s idle timeout, 3 retries and a restart of any download that runs past 3 minutes, restore the `.deb` set from an `actions/cache` keyed on the package list and runner image, and carry `timeout-minutes` (30 and 20) where there was none.
 
 ## 0.5.0 — 2026-10-25

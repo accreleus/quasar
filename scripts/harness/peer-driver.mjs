@@ -356,16 +356,24 @@ if (!connected) {
   process.exit(2);
 }
 
-// IDLE_NUDGE_EVERY_S (default 250, 0 = off): Steam's own screensaver blanks the
-// picture about 310 s after the last input (#819), so a held peer longer than that
-// would read its luma as a black stream whatever the image's setting is (#835).
-// Tap a modifier-only key (Left Shift, evdev 42) over the raw input channel, the
-// way INPUT_PROBE does, every N s from decode: it resets the idle clock and
-// changes nothing on screen. Armed before HOLD MODE so both modes get it.
-const IDLE_NUDGE_EVERY_S = parseInt(process.env.IDLE_NUDGE_EVERY_S ?? '250', 10);
+// IDLE_NUDGE_EVERY_S (default 250, 0 = off): Steam's own screensaver replaces the
+// picture with a static slideshow about 310 s after the last input (#819), so a held
+// peer longer than that reads a picture that no longer describes the stream,
+// whatever the image's setting is (#835). Tap a modifier-only key (Left Shift,
+// evdev 42) over the raw input channel, the way INPUT_PROBE does: once as soon as
+// this is armed (so the first gap from Steam's start is only as long as decode took),
+// then every N s. It resets the idle clock and changes nothing on screen. Left Shift
+// is a key some games bind; `idle_nudges` in the result counts the taps sent.
+// Armed before HOLD MODE so both modes get it. Empty or non-numeric: warn, use 250.
+let IDLE_NUDGE_EVERY_S = 250;
+const idleNudgeEnv = process.env.IDLE_NUDGE_EVERY_S;
+if (idleNudgeEnv !== undefined) {
+  if (/^\d+$/.test(idleNudgeEnv.trim())) IDLE_NUDGE_EVERY_S = parseInt(idleNudgeEnv, 10);
+  else console.error(`[peer-driver] IDLE_NUDGE_EVERY_S=${JSON.stringify(idleNudgeEnv)} is not a whole number; using 250`);
+}
 let idleNudges = 0;
 if (IDLE_NUDGE_EVERY_S > 0) {
-  setInterval(async () => {
+  const nudge = async () => {
     try {
       const sent = await page.evaluate(async () => {
         const ch = window.__qInputCh;
@@ -380,7 +388,9 @@ if (IDLE_NUDGE_EVERY_S > 0) {
     } catch (e) {
       console.error(`[peer-driver] idle nudge failed: ${e.message}`);
     }
-  }, IDLE_NUDGE_EVERY_S * 1000).unref();
+  };
+  nudge();
+  setInterval(nudge, IDLE_NUDGE_EVERY_S * 1000).unref();
 }
 
 // HOLD MODE (Task 10 harness): skip the normal single-shot warmup +
