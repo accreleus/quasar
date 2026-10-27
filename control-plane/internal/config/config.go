@@ -157,6 +157,10 @@ type Config struct {
 	// Docker bridge on the box.
 	TrustedProxies []*net.IPNet // QUASAR_TRUSTED_PROXIES (default empty)
 
+	// HSTSMaxAge is QUASAR_HSTS_MAX_AGE in seconds; 0 (default) sends no
+	// Strict-Transport-Security. It pins the whole host name, so it is opt-in.
+	HSTSMaxAge int32
+
 	// Parsed but probably not meant: logged WARN by main once the logger exists
 	// (config runs before it). Never branched on.
 	Warnings []string
@@ -462,6 +466,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	c.AccessLog = accessLog
+
+	c.HSTSMaxAge, err = envInt32("QUASAR_HSTS_MAX_AGE", 0, 0)
+	if err != nil {
+		return nil, err
+	}
 
 	trusted, trustedWarnings, err := envCIDRs("QUASAR_TRUSTED_PROXIES")
 	if err != nil {

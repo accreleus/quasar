@@ -172,7 +172,7 @@ func run() error {
 			"key_file_written", wrote)
 	}
 
-	handler := httpx.SecurityHeaders(mux)
+	handler := httpx.HSTS(httpx.SecurityHeaders(mux), cfg.HSTSMaxAge)
 	// Compress before logging wraps it, so the logged bytes_out is the real
 	// on-the-wire size (#386). Compress skips WebSocket upgrades entirely and
 	// both wrappers forward Hijack, so the agent WS and signaling relay are
@@ -229,7 +229,7 @@ func run() error {
 		httpHandler = httpx.RedirectToHTTPS(handler, cfg.TLSRedirectPort)
 		log.Info("http→https redirect enabled", "redirect_port", cfg.TLSRedirectPort)
 	}
-	srv := newServer(cfg.ListenAddr, httpHandler)
+	srv := newServer(cfg.ListenAddr, httpx.WarnUnlistedProxy(httpHandler, log, cfg.TrustedProxies))
 
 	// Optional HTTPS listener (#376): the same handler over TLS so the browser
 	// gets a secure context. Fatal on misconfiguration when QUASAR_TLS != off.
