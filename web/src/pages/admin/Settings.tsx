@@ -34,6 +34,7 @@ import { Switch } from "../../components/TextField";
 import { useResource } from "../../lib/resource/react";
 import { useTheme, type Density, type Theme } from "../../settings/ThemeContext";
 import { inertReasonCopy } from "./library/sourcesDerived";
+import { InputDefaultRows } from "./settings/InputDefaultRows";
 import { RegionDefaultRows } from "./settings/RegionDefaultRows";
 import { SettingRow } from "./settings/SettingRow";
 import { useSettings } from "./settings/useSettings";
@@ -208,6 +209,16 @@ export function Settings() {
       <SettingsSection title="Region defaults" hint="What a user starts with until they pick their own. Applies from each user's next launch.">
         <ResourceStates loading={settings.loading} error={settings.error} />
         {!settings.loading && !settings.error && s && <RegionDefaultRows settings={settings} />}
+      </SettingsSection>
+
+      <SettingsSection title="Input defaults" hint="What a user starts with until they pick their own. Applies from each user's next launch.">
+        <ResourceStates loading={settings.loading} error={settings.error} />
+        {!settings.loading && !settings.error && s && (
+          <>
+            <InputDefaultRows settings={settings} />
+            <p className="muted mt3">Saved as you change them. A user who set their own value keeps it.</p>
+          </>
+        )}
       </SettingsSection>
 
       <SettingsSection title="Libraries" hint="Discovery of installed titles on your hosts">

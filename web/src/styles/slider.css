@@ -1,0 +1,52 @@
+/* SliderField: a native range input drawn with tokens. The 44px height is the hit area. */
+.rg-range { display: flex; align-items: flex-start; gap: var(--s3); }
+.rg-track { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.rg-range input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  --fill: 50%; /* set inline from the value */
+  width: 100%;
+  height: 44px;
+  margin: 0;
+  background: none;
+  cursor: pointer;
+}
+.rg-range input[type="range"]:disabled { cursor: default; opacity: 0.5; }
+.rg-range input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-pill);
+  background: linear-gradient(to right, var(--accent) 0 var(--fill), color-mix(in oklch, var(--surf-inset) 76%, transparent) var(--fill) 100%);
+}
+.rg-range input[type="range"]::-moz-range-track {
+  height: 6px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-pill);
+  background: linear-gradient(to right, var(--accent) 0 var(--fill), color-mix(in oklch, var(--surf-inset) 76%, transparent) var(--fill) 100%);
+}
+.rg-range input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 17px;
+  height: 17px;
+  margin-top: -7px; /* design-lint-allow spacing-scale: centres the 17px thumb on the 6px track */
+  border: 1px solid var(--glass-border);
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+.rg-range input[type="range"]::-moz-range-thumb {
+  width: 17px;
+  height: 17px;
+  border: 1px solid var(--glass-border);
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+.rg-range input[type="range"]:focus-visible { outline: none; }
+.rg-range input[type="range"]:focus-visible::-webkit-slider-thumb { border-color: var(--accent); box-shadow: var(--glow-accent); }
+.rg-range input[type="range"]:focus-visible::-moz-range-thumb { border-color: var(--accent); box-shadow: var(--glow-accent); }
+.rg-val { flex: none; min-width: 52px; line-height: 44px; text-align: right; font-family: var(--font-mono); font-size: var(--t-sm); color: var(--text); }
+/* Three labels: the middle one is centred on the track, so it sits under the thumb at the midpoint. */
+.rg-ticks { display: grid; grid-template-columns: 1fr auto 1fr; margin-top: calc(-1 * var(--s2)); color: var(--text-3); font-family: var(--font-mono); font-size: var(--t-xs); }
+.rg-ticks span:first-child { justify-self: start; }
+.rg-ticks span:last-child { justify-self: end; }

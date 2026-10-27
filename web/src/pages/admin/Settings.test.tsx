@@ -204,6 +204,92 @@ describe("Settings — Region defaults card", () => {
   });
 });
 
+describe("Settings — Region and Input defaults", () => {
+  const cursorTab = (name: string) => within(screen.getByRole("tablist", { name: "Match cursor to my window" })).getByRole("tab", { name });
+  const sent = (body: object) => expect(mocked.updateSettings).toHaveBeenCalledWith("tok", body);
+
+  it("shows the saved defaults", async () => {
+    mocked.getSettings.mockResolvedValue(
+      settingsResponse({
+        default_language: "de-DE",
+        default_region_format: "en-GB",
+        default_keyboard: { layout: "fr", variant: "bepo" },
+        default_match_cursor: "on",
+        default_mouse_sensitivity: 2,
+        default_raw_mouse: true,
+      }),
+    );
+    renderPage();
+    expect(((await screen.findByLabelText("Default language")) as HTMLSelectElement).value).toBe("de-DE");
+    expect((screen.getByLabelText("Default region format") as HTMLSelectElement).value).toBe("en-GB");
+    expect((screen.getByLabelText("Default keyboard layout") as HTMLSelectElement).value).toBe("fr");
+    expect((screen.getByLabelText("Default keyboard variant") as HTMLSelectElement).value).toBe("bepo");
+    expect(cursorTab("Always on").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByLabelText("Default mouse sensitivity").getAttribute("aria-valuetext")).toBe("2×");
+    expect((document.getElementById("default-raw-mouse") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("reads an older server's missing fields as the built-in defaults", async () => {
+    renderPage();
+    expect(((await screen.findByLabelText("Default language")) as HTMLSelectElement).value).toBe("en-US");
+    expect((screen.getByLabelText("Default region format") as HTMLSelectElement).value).toBe("");
+    expect(screen.getByRole("option", { name: "Same as language (English (US))" })).toBeTruthy();
+    expect((screen.getByLabelText("Default keyboard layout") as HTMLSelectElement).value).toBe("us");
+    expect(cursorTab("Auto").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByLabelText("Default mouse sensitivity").getAttribute("aria-valuetext")).toBe("1×");
+  });
+
+  it("PATCHes only the changed key for each control", async () => {
+    mocked.updateSettings.mockResolvedValue(settingsResponse());
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Default language"), { target: { value: "ja-JP" } });
+    await waitFor(() => sent({ default_language: "ja-JP" }));
+    fireEvent.change(screen.getByLabelText("Default region format"), { target: { value: "de-DE" } });
+    await waitFor(() => sent({ default_region_format: "de-DE" }));
+    fireEvent.change(screen.getByLabelText("Default region format"), { target: { value: "" } });
+    await waitFor(() => sent({ default_region_format: null }));
+    fireEvent.click(cursorTab("Off"));
+    await waitFor(() => sent({ default_match_cursor: "off" }));
+    fireEvent.click(document.getElementById("default-raw-mouse")!);
+    await waitFor(() => sent({ default_raw_mouse: true }));
+    fireEvent.click(document.getElementById("default-flip-scroll")!);
+    await waitFor(() => sent({ default_flip_scroll: true }));
+    fireEvent.click(document.getElementById("default-nintendo-layout")!);
+    await waitFor(() => sent({ default_nintendo_layout: true }));
+  });
+
+  it("sends the whole keyboard, and the layout's basic variant when the layout changes", async () => {
+    mocked.getSettings.mockResolvedValue(settingsResponse({ default_keyboard: { layout: "de", variant: "neo" } }));
+    mocked.updateSettings.mockResolvedValue(settingsResponse());
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Default keyboard variant"), { target: { value: "dvorak" } });
+    await waitFor(() => sent({ default_keyboard: { layout: "de", variant: "dvorak" } }));
+    fireEvent.change(screen.getByLabelText("Default keyboard layout"), { target: { value: "fr" } });
+    await waitFor(() => sent({ default_keyboard: { layout: "fr", variant: "" } }));
+  });
+
+  it("saves the sensitivity once the slider rests, on the log scale", async () => {
+    mocked.updateSettings.mockResolvedValue(settingsResponse());
+    renderPage();
+    const slider = await screen.findByLabelText("Default mouse sensitivity");
+    fireEvent.change(slider, { target: { value: "1" } });
+    fireEvent.change(slider, { target: { value: "-1" } });
+    expect(slider.getAttribute("aria-valuetext")).toBe("0.5×");
+    expect(mocked.updateSettings).not.toHaveBeenCalled();
+    await waitFor(() => sent({ default_mouse_sensitivity: 0.5 }));
+    expect(mocked.updateSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the server's refusal under the row and keeps the saved value", async () => {
+    mocked.updateSettings.mockRejectedValue(new ApiError(400, "validation_failed", "default_language is not an accepted value"));
+    renderPage();
+    const select = (await screen.findByLabelText("Default language")) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "ja-JP" } });
+    expect((await screen.findByRole("alert")).textContent).toBe("default_language is not an accepted value");
+    expect(select.value).toBe("en-US");
+  });
+});
+
 describe("Settings — Libraries card", () => {
   it("renders the discovery hint and PATCHes library_discovery_enabled when the switch flips", async () => {
     mocked.updateSettings.mockResolvedValue(settingsResponse({ library_discovery_enabled: true }));
@@ -293,7 +379,8 @@ describe("Settings — Images card", () => {
     renderPage();
 
     await screen.findByText(/left alone \(manual\)/);
-    fireEvent.click(await screen.findByRole("tab", { name: "Auto" }));
+    const list = await screen.findByRole("tablist", { name: "Update policy" });
+    fireEvent.click(within(list).getByRole("tab", { name: "Auto" }));
 
     await waitFor(() =>
       expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { image_update_policy: "auto" }),
