@@ -852,17 +852,17 @@ fn in_place_plan(
 const IN_PLACE_QUIT_BOUND: Duration = Duration::from_secs(94);
 const IN_PLACE_LAUNCH_BOUND: Duration = Duration::from_secs(5);
 
-/// How long a session end waits for a running Steam game to quit and its exit cloud sync to
-/// end before the container stop (#742). The #759 spike measured close + sync at 2.8–9.3 s,
-/// uploads 1–3 s. Raise neither number alone: this bound, the 10 s container stop and the
+/// How long a session end waits for a Steam game to quit and its exit cloud sync to end before
+/// the container stop (#742); a game the player already quit has only the sync left (#810). The
+/// #759 spike measured close + sync at 2.8–9.3 s, uploads 1–3 s. Raise neither number alone: this bound, the 10 s container stop and the
 /// teardown after it must fit the web's 45 s closing wait (`MAX_CLOSING_RETRY_WAIT_MS`,
 /// `web/src/pages/app/capacityRetry.ts`), and it must cover the helper's timeline for a game
 /// that ignores the close (`QUIT_CLOSE_GRACE` 20 s, then SIGTERM: about 21–24 s to the sync).
 const END_QUIT_BOUND: Duration = Duration::from_secs(30);
 
-/// Any session end whose Steam game still runs (#742): quit the game the in-place swap's way
-/// and wait for Steam's cloud sync, at most [`END_QUIT_BOUND`]. No helper or no running game
-/// (held, parked, the game already exited) returns at once.
+/// Any session end with a Steam game that runs, or that the player just quit (#742, #810): quit
+/// the game the in-place swap's way and wait for Steam's cloud sync, at most [`END_QUIT_BOUND`].
+/// No helper, or no target game (held, parked), returns at once.
 fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
     use super::launch_helper::EndQuit;
     let Some(launch) = launch else {
@@ -1752,8 +1752,8 @@ fn replace_audio(
 /// Session ends only: the audio pipeline reports nothing after this
 /// (`AudioPipelineGuard::stop_reporting`), so a caller must never keep the session.
 ///
-/// A Steam game still running is quit and its cloud sync waited for (#742) once the
-/// client's media and input have ended and before the container goes. The source keeps
+/// A Steam game that runs, or that the player just quit, has its cloud sync waited for (#742,
+/// #810) once the client's media and input have ended and before the container goes. The source keeps
 /// running meanwhile, so the game can draw its way out.
 pub(crate) fn stop_source(
     source: &mut AppSource,
@@ -1774,18 +1774,20 @@ pub(crate) fn stop_source(
 }
 
 /// [`stop_source`] for a game the player quit (#726). The source stop can take seconds, so the
-/// browser is told first (#753). It does not wait for the game's exit cloud upload, which the
-/// container stop can cut (#810). `bye` must follow the `stopping` row on this ordered lane,
+/// browser is told first (#753). `launch` is the game's helper: the exit cloud sync is waited
+/// for before the container goes (#810); `None` where the game's sync was already waited for.
+/// `bye` must follow the `stopping` row on this ordered lane,
 /// because the control plane commits that row before it relays the next frame, and the web
 /// client answers `bye` by reading the row.
 pub(crate) fn stop_for_game_exit(
     emit: &dyn Fn(SessionEvent),
     source: &mut AppSource,
     transports: &SessionTransports,
+    launch: Option<&super::launch_helper::LaunchSocket>,
 ) {
     emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
     emit(SessionEvent::Signaling(SignalMsg::Bye));
-    stop_source(source, transports, None);
+    stop_source(source, transports, launch);
 }
 
 /// Should an idle `running` session be reaped? `Some(reason)` to reap. Pure so the policy
@@ -2660,7 +2662,7 @@ pub fn run_blocking(
                 session_id = %session_id,
                 "the Steam game exited; ending the session"
             );
-            stop_for_game_exit(&emit, &mut current_source, &transports);
+            stop_for_game_exit(&emit, &mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             emit(SessionEvent::Stopped {
@@ -3303,7 +3305,7 @@ pub fn run_blocking(
                         reason,
                         "in-place swap failed: {reason}; the session ends"
                     );
-                    stop_for_game_exit(&emit, &mut current_source, &transports);
+                    stop_for_game_exit(&emit, &mut current_source, &transports, None);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     emit(SessionEvent::Stopped {
