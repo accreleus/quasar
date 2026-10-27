@@ -24,9 +24,12 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+- **Classic layout is deprecated (#855).** Account ▸ Appearance now says the switch back to the previous player layout will be removed in a later release. Nothing is removed yet.
+
 ### Fixed
-- **Quitting a Steam game from inside the session no longer cuts the game's cloud save (#810).** The container used to be stopped as soon as the game's process was gone, which is before Steam uploads the save, so the next launch of the title could stop on "Cloud Out of Date". The session now ends the stream as before, then waits for Steam's exit sync to finish (up to 30 s) before the container goes. A game whose exit starts no sync within 5 s is not waited for, and the agent logs `session-end-no-cloud-sync`.
 - Pressing Play on a game tile launches it when the recommended quality only needs to step down from a codec the host lacks (for example AV1 on an AMD GPU), instead of opening the detail panel with "No host that can encode this quality is available" (#817).
+- **Quitting a Steam game from inside the session no longer cuts the game's cloud save (#810).** The container used to be stopped as soon as the game's process was gone, which is before Steam uploads the save, so the next launch of the title could stop on "Cloud Out of Date". The session now ends the stream as before, then waits for Steam's exit sync to finish (up to 30 s) before the container goes. A game whose exit starts no sync within 5 s is not waited for, and the agent logs `session-end-no-cloud-sync`.
 - **Switching away from a running Steam game to an app in another container no longer cuts the game's cloud save (#809).** The old container was stopped under Steam's exit upload, so the next launch of the title could stop on "Cloud Out of Date". The switch screen now waits while the game quits and Steam's exit sync finishes (up to 30 s) before the old container goes, and the agent logs the same `session-end-*` lines as a session end.
 
 ### Security
@@ -37,6 +40,7 @@ own; the two do not move together, and that is deliberate.
 ### Internal
 - **Region and Input settings mock (#844).** `design_handoff_v3/screens/region-input-v3.html` shows the account page's new Region section (timezone list and world map, language, region format) and Input section (keyboard layout, mouse speed and sensitivity, raw input, scroll direction, Nintendo gamepad layout), plus the admin install-wide defaults. `DESIGN.md` gains the rules for its new controls.
 - **CI no longer stalls on the GStreamer apt install (#864).** The node-agent and engine-suite jobs download packages with a 20 s idle timeout, 3 retries and a restart of any download that runs past 3 minutes, restore the `.deb` set from an `actions/cache` keyed on the package list and runner image, and carry `timeout-minutes` (30 and 20) where there was none.
+- **The Images workflow no longer spends time on a toolchain it reuses (#865).** The `inputs` job reads the gst toolchain's digest (or says it must be built), the toolchain job does nothing when it is reused so `build-node-agent` starts seconds after it instead of waiting out a disk cleanup, and the node-agent runner cleanup runs only under 50 GB free instead of on every run.
 
 ## 0.5.0 — 2026-10-25
 
