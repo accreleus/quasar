@@ -856,7 +856,10 @@ const IN_PLACE_LAUNCH_BOUND: Duration = Duration::from_secs(5);
 /// the container stop (#742); a game the player already quit has only the sync left (#810). The
 /// #759 spike measured close + sync at 2.8–9.3 s, uploads 1–3 s. Raise neither number alone: this bound, the 10 s container stop and the
 /// teardown after it must fit the web's 45 s closing wait (`MAX_CLOSING_RETRY_WAIT_MS`,
-/// `web/src/pages/app/capacityRetry.ts`), and it must cover the helper's timeline for a game
+/// `web/src/pages/app/capacityRetry.ts`). A container swap (#809) also spends it inside the
+/// swap budget: 20 s compositor + this bound + 10 s stop + 45 s app ready must stay under the
+/// web's 110 s (`CLIENT_SWAP_TIMEOUT_MS`) and the control plane's 120 s
+/// (`swapUnresolvedAfter`). It must cover the helper's timeline for a game
 /// that ignores the close (`QUIT_CLOSE_GRACE` 20 s, then SIGTERM: about 21–24 s to the sync).
 const END_QUIT_BOUND: Duration = Duration::from_secs(30);
 
@@ -3848,7 +3851,8 @@ fn app_container_name(session_id: &str, gen: u64) -> String {
 /// Perform one serialised source swap. Step order is load-bearing:
 ///  1. Build + start the new generation's compositor and wait for its Wayland socket. The
 ///     outgoing app is untouched, so any failure up to here is a free rollback.
-///  2. Stop the outgoing app container and WAIT for it to exit. Mandatory, not an
+///  2. Quit a running Steam game and wait, up to `END_QUIT_BOUND`, for its exit cloud sync
+///     (#809), then stop the outgoing app container and WAIT for it to exit. Mandatory, not an
 ///     optimisation: both generations bind-mount the same managed home, and a second
 ///     instance of a home-locking app (Steam) finds the first's lock, hands off and exits
 ///     0 ~1.2 s later, which an overlapping design surfaced as `app exited (0)` right
@@ -3958,8 +3962,9 @@ fn perform_swap(
     }
 
     // A Steam game the swap leaves behind gets a session end's quit and cloud-sync wait before
-    // its container goes (#809); the switch screen covers it. The mute below clears the exit
-    // this quit makes the helper report.
+    // its container goes (#809); the switch screen covers it. The runner loop is paused for up
+    // to the bound: a stop flag or a second swap is handled when this returns. The mute below
+    // clears the exit this quit makes the helper report.
     quit_game_for_end(res.launch(), "container swap");
 
     // Past here the outgoing game closes because we closed it, not because the player
