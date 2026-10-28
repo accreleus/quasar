@@ -35,7 +35,7 @@ const move = (movementX: number, movementY = 0) => {
   document.dispatchEvent(e);
 };
 
-const MATCH = { match: true, sensitivity: 1, raw: false };
+const MATCH = { match: true, sensitivity: 1, raw: false, flip: false };
 
 beforeEach(() => {
   vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1));
@@ -55,7 +55,7 @@ describe("mouse speed in setupCapture", () => {
   });
 
   it("matching off: movement is sent as it came", () => {
-    const { cap, sent } = start(video(1920, 960), { match: false, sensitivity: 1, raw: false });
+    const { cap, sent } = start(video(1920, 960), { match: false, sensitivity: 1, raw: false, flip: false });
     move(5, -3);
     expect(sent).toEqual([{ dx: 5, dy: -3 }]);
     cap.cleanup();
@@ -70,14 +70,14 @@ describe("mouse speed in setupCapture", () => {
   });
 
   it("sensitivity multiplies after matching", () => {
-    const { cap, sent } = start(video(1920, 960), { match: true, sensitivity: 2, raw: false });
+    const { cap, sent } = start(video(1920, 960), { match: true, sensitivity: 2, raw: false, flip: false });
     move(1);
     expect(sent).toEqual([{ dx: 4, dy: 0 }]);
     cap.cleanup();
   });
 
   it("keeps the fractional remainder across events", () => {
-    const { cap, sent } = start(video(1920, 1920), { match: false, sensitivity: 0.25, raw: false });
+    const { cap, sent } = start(video(1920, 1920), { match: false, sensitivity: 0.25, raw: false, flip: false });
     for (let i = 0; i < 8; i++) move(1);
     expect(sent.reduce((a, m) => a + m.dx, 0)).toBe(2);
     cap.cleanup();
@@ -132,10 +132,59 @@ describe("mouse speed in setupCapture", () => {
   });
 
   it("setMouse changes the speed of the running capture", () => {
-    const { cap, sent } = start(video(1920, 960), { match: false, sensitivity: 1, raw: false });
+    const { cap, sent } = start(video(1920, 960), { match: false, sensitivity: 1, raw: false, flip: false });
     cap.setMouse(MATCH);
     move(2);
     expect(sent).toEqual([{ dx: 4, dy: 0 }]);
+    cap.cleanup();
+  });
+});
+
+describe("flip scroll in setupCapture", () => {
+  const NEUTRAL = { match: false, sensitivity: 1, raw: false, flip: false };
+  /** Wire text of every `ms` sent (the message object is reused, so copy at send time). */
+  function startWheel(mouse?: MouseSettings) {
+    const wire: string[] = [];
+    const el = video(1920, 1920);
+    const cap = setupCapture({
+      videoEl: el,
+      sendInput: (m) => {
+        if (m.t === "ms") wire.push(JSON.stringify(m));
+      },
+      onCaptureChange: () => {},
+      mouse,
+    });
+    Object.defineProperty(document, "pointerLockElement", { value: el, configurable: true });
+    document.dispatchEvent(new Event("pointerlockchange"));
+    return { cap, wire };
+  }
+  const wheel = (deltaX: number, deltaY: number) => document.dispatchEvent(new WheelEvent("wheel", { deltaX, deltaY }));
+
+  it("off (and the default): the wheel is sent exactly as it came", () => {
+    for (const mouse of [NEUTRAL, undefined]) {
+      const { cap, wire } = startWheel(mouse);
+      wheel(0, 120);
+      wheel(-40, -3.5);
+      expect(wire).toEqual(['{"t":"ms","dx":0,"dy":120}', '{"t":"ms","dx":-40,"dy":-3.5}']);
+      cap.cleanup();
+    }
+  });
+
+  it("on: both axes change sign", () => {
+    const { cap, wire } = startWheel({ ...NEUTRAL, flip: true });
+    wheel(0, 120);
+    wheel(-40, -3.5);
+    expect(wire).toEqual(['{"t":"ms","dx":0,"dy":-120}', '{"t":"ms","dx":40,"dy":3.5}']);
+    cap.cleanup();
+  });
+
+  it("setMouse flips a running capture and flips it back", () => {
+    const { cap, wire } = startWheel();
+    cap.setMouse({ ...NEUTRAL, flip: true });
+    wheel(0, 100);
+    cap.setMouse(NEUTRAL);
+    wheel(0, 100);
+    expect(wire).toEqual(['{"t":"ms","dx":0,"dy":-100}', '{"t":"ms","dx":0,"dy":100}']);
     cap.cleanup();
   });
 });

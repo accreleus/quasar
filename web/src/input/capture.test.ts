@@ -1335,7 +1335,7 @@ describe("engage() without Pointer Lock — the send gate opens anyway", () => {
 });
 
 describe("engage() with Raw mouse input (control-api.md §Region and Input settings)", () => {
-  const RAW = { match: false, sensitivity: 1, raw: true };
+  const RAW = { match: false, sensitivity: 1, raw: true, flip: false };
   const open = (mouse = RAW) =>
     setupCapture({
       videoEl: document.createElement("video"),
@@ -1359,7 +1359,7 @@ describe("engage() with Raw mouse input (control-api.md §Region and Input setti
   it("off: the request carries no options at all, as before", async () => {
     const lock = vi.fn((_o?: unknown) => Promise.resolve());
     setPointerLockApi(lock);
-    const { cleanup, engage } = open({ ...RAW, raw: false });
+    const { cleanup, engage } = open({ ...RAW, raw: false, flip: false });
     expect(await engage()).toEqual({ mode: "pointer-lock" });
     expect(lock.mock.calls).toEqual([[]]);
     cleanup();
@@ -1448,7 +1448,7 @@ describe("engage() with Raw mouse input (control-api.md §Region and Input setti
   it("setMouse turns it on for the next engage", async () => {
     const lock = vi.fn((_o?: unknown) => Promise.resolve());
     setPointerLockApi(lock);
-    const { cleanup, engage, release, setMouse } = open({ ...RAW, raw: false });
+    const { cleanup, engage, release, setMouse } = open({ ...RAW, raw: false, flip: false });
     setMouse(RAW);
     await engage();
     expect(lock).toHaveBeenCalledWith({ unadjustedMovement: true });

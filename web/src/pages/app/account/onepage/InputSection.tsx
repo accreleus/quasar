@@ -1,7 +1,7 @@
 // The account page's Input section. It owns the one read of `/v1/me/region-input` and the one
 // save path; a field is a function of the loaded settings and a `save` that sends its patch.
-// Mouse speed is the first group; raw input is a switch on the same `save`. Flip scroll and the
-// gamepad layout are more fields on it.
+// Mouse speed is the first group; raw input and flip scroll are switches on the same `save`. The
+// gamepad layout is one more field on it.
 
 import { useEffect, useRef, useState } from "react";
 import { getRegionInput, patchRegionInput, type RegionInputWire } from "../../../../api/me";
@@ -90,6 +90,15 @@ export function InputSection() {
         disabled={!data}
         onChange={(raw_mouse) => void save({ raw_mouse })}
       />
+      <div className="ac-sw mt3">
+        <Switch
+          id="flip-scroll"
+          label="Flip scroll direction"
+          checked={mine?.flip_scroll ?? defaults?.flip_scroll ?? false}
+          onChange={(flip_scroll) => void save({ flip_scroll })}
+          disabled={!data}
+        />
+      </div>
       <p className={status && !status.ok ? "form-error mt5" : "muted mt5"} role="status">
         {status?.text ?? "Saved as you pick."}
       </p>

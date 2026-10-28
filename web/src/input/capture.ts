@@ -618,8 +618,8 @@ export function setupCapture({
     // open while captured, and swallowing its wheel would make it unscrollable
     if (!captured || !aimedAtGame(e)) return;
     e.preventDefault();
-    msMsg.dx = e.deltaX;
-    msMsg.dy = e.deltaY;
+    msMsg.dx = mouseSettings.flip ? -e.deltaX : e.deltaX;
+    msMsg.dy = mouseSettings.flip ? -e.deltaY : e.deltaY;
     send(msMsg);
   };
 
