@@ -82,3 +82,37 @@
   calls back synchronously is read without suspending). It held under React
   19.3 here. A React upgrade should keep a test that a deep link to
   `/app/account` renders without the route skeleton.
+
+## Round 3 (exp 21–30)
+
+- **The first-open cost is gone.** exp 21 adds `lib/preloadable.ts`. A split module
+  is fetched on tile hover or focus (game page), on Play hover or focus (session
+  view), or at idle once the library has rendered. Once in, it renders through a
+  thenable that resolves synchronously, so no Suspense fallback is ever committed.
+  Game page 392 → 91 ms and session view 353 → 60 ms; `dev` is at 91/59. The
+  frozen byte rule cannot see it (+152 B, inside the noise band). It is logged as
+  `guard-fix`, under the lead's done-criterion for this item.
+- **The setup-wizard split works with the preload.** exp 22 = exp 17 plus the
+  `/admin` route preload, which now reaches the `admin-shared` chunk through the
+  admin layout's imports. It saves −16.8 KB for players, and Settings did not slow
+  down (663 → 653 ms).
+- **Two tests guard the mechanism.** `lib/preloadable.test.tsx` fails if the
+  synchronous path is replaced by a promise (checked by mutation).
+  `App.routes.test.tsx` "a deep link to the account area" fails if the account
+  route is not served from the preloaded chunk. Under `act()`, React flushes a
+  microtask-resolved lazy before committing a fallback, so jsdom cannot see the
+  browser's reveal throttle itself. The browser-level guard is the first-open probe.
+- **Admin deep links pay the same throttle** (exp 29): making the admin layout and
+  pages preloadable, and starting the deep-linked section with the entry, took
+  Settings time to usable from 646 to 569 ms. It was discarded only because the
+  frozen keep rule scores `/app` bytes. The patch is in
+  `patches/exp29-admin-deep-link-preload.patch`.
+- **Outside the Region/Input scope, whole-page axe on `/app`, account and Settings**
+  finds: selected kind tab "All" contrast (dark), TabBar labels on light phones,
+  `link-in-text-block` in an admin Settings hint (all visual, DESIGN.md process
+  needed), and `scrollable-region-focusable` on the account Storage table, fixed
+  non-visually by exp 30 (patch kept).
+- **What is left in the player entry** is the library page itself, React, React
+  Router and the API/auth client. The `@font-face` weights are all used. The
+  remaining small moves (settings-search CSS, the modulepreload polyfill) fell
+  inside the 256 B noise band.

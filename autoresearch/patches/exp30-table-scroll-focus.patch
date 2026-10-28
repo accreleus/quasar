@@ -1,0 +1,60 @@
+diff --git a/web/src/components/Table.test.tsx b/web/src/components/Table.test.tsx
+index a4593836..75054f94 100644
+--- a/web/src/components/Table.test.tsx
++++ b/web/src/components/Table.test.tsx
+@@ -21,6 +21,18 @@ const ROWS: Row[] = [
+ ];
+ 
+ describe("Table", () => {
++  it("puts its wrapper in the tab order only while the table scrolls", () => {
++    const { container, unmount } = render(<Table columns={COLS} rows={ROWS} rowKey={(r) => r.id} />);
++    expect(container.querySelector(".table-wrap")).not.toHaveAttribute("tabindex");
++    unmount();
++    const wide = vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockReturnValue(800);
++    const shown = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(400);
++    const scrolling = render(<Table columns={COLS} rows={ROWS} rowKey={(r) => r.id} />);
++    expect(scrolling.container.querySelector(".table-wrap")).toHaveAttribute("tabindex", "0");
++    wide.mockRestore();
++    shown.mockRestore();
++  });
++
+   it("renders column headers", () => {
+     render(<Table columns={COLS} rows={ROWS} rowKey={(r) => r.id} />);
+     expect(screen.getByText("ID")).toBeTruthy();
+diff --git a/web/src/components/Table.tsx b/web/src/components/Table.tsx
+index 914812c2..d3b7f471 100644
+--- a/web/src/components/Table.tsx
++++ b/web/src/components/Table.tsx
+@@ -2,7 +2,7 @@
+  * Table — qtable + table-wrap primitives (UI-04).
+  * Renders a data table using design-system tokens.
+  */
+-import { Fragment } from "react";
++import { Fragment, useLayoutEffect, useRef, useState } from "react";
+ import type { CSSProperties, ReactNode } from "react";
+ 
+ // Chevron used by the optional expand/collapse column. Rotates 90deg when open
+@@ -83,8 +83,22 @@ export function Table<T>({
+   onToggleExpand,
+ }: TableProps<T>) {
+   const expandable = Boolean(renderExpanded);
++  // A wrapper that scrolls must be reachable by keyboard to scroll it (axe
++  // scrollable-region-focusable); one that does not scroll stays out of the tab order.
++  const wrap = useRef<HTMLDivElement>(null);
++  const [scrolls, setScrolls] = useState(false);
++  useLayoutEffect(() => {
++    const el = wrap.current;
++    if (!el) return;
++    const check = () => setScrolls(el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight);
++    check();
++    if (typeof ResizeObserver === "undefined") return;
++    const ro = new ResizeObserver(check);
++    ro.observe(el);
++    return () => ro.disconnect();
++  }, [rows]);
+   return (
+-    <div className="table-wrap">
++    <div className="table-wrap" ref={wrap} tabIndex={scrolls ? 0 : undefined}>
+       <table className="qtable">
+         <thead>
+           <tr>

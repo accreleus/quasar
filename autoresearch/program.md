@@ -139,3 +139,18 @@ experiments on the "try next" list. All 20 are now used. The kept head was re-me
 `k15` first (its build had been cleaned up), and exp 16–20 are interleaved against it.
 `probes/first-open.mjs` is a supplementary measurement outside the harness, never a keep
 criterion.
+
+## Round 3 (lead, after round 2): exp 21–30
+
+- **Baseline.** Started by merging `origin/develop` (`bf609a71`). Round 3 is
+  measured against that merge point (`m3`). The eager baseline is plain develop
+  (`dev`), built in a throwaway worktree and measured with the frozen
+  `measure.mjs`.
+- **New guard:** `probes/guard.sh <label>` runs `probes/first-open.mjs` against
+  `dev`, interleaved. The game page or session view more than 50 ms above `dev`
+  means not kept.
+- **Same harness, keep rule, load gate and noise bands.** `kept` values beyond
+  yes/no:
+  - `infra`: zero-cost infrastructure, no metric moved.
+  - `guard-fix`: exp 21, kept under the lead's done-criterion for its item while
+    the byte primary stayed inside the noise band.

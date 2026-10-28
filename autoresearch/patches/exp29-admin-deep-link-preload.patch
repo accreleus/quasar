@@ -1,0 +1,167 @@
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 08ea593f..91df0e53 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -19,6 +19,7 @@ import { AppLayout } from "./pages/app/AppLayout";
+ import { RouteErrorBoundary, RouteSkeleton } from "./components/RouteBoundary";
+ import { OverlayPreferencesRoute, useOverlayPreferences } from "./settings/OverlayPreferencesContext";
+ import { accountArea, gamePage, loginPage, sessionPage } from "./pages/lazyPages";
++import { preloadable } from "./lib/preloadable";
+ import { loadSession } from "./auth/storage";
+ 
+ // Admin area — lazy-loaded. Vite splits this into a separate chunk automatically
+@@ -81,103 +82,59 @@ const account = {
+ };
+ 
+ // Admin pages table: each entry is a separate lazy() chunk boundary.
++// An admin page whose module can be started ahead of its route (lib/preloadable.ts).
++const adminPage = <M extends object>(load: () => Promise<M>, name: keyof M) => {
++  const p = preloadable(load);
++  return Object.assign(p.component(name), { preload: p.preload });
++};
++
+ const adminPages = {
+-  Fleet: lazyPage(() => import("./pages/admin/Fleet").then((m) => ({ default: m.Fleet }))),
+-  Library: lazyPage(() => import("./pages/admin/Library").then((m) => ({ default: m.Library }))),
+-  Streaming: lazyPage(() =>
+-    import("./pages/admin/Streaming").then((m) => ({ default: m.Streaming }))
+-  ),
+-  People: lazyPage(() => import("./pages/admin/People").then((m) => ({ default: m.People }))),
+-  Layout: lazyPage(() =>
+-    import("./pages/admin/AdminLayout").then((m) => ({ default: m.AdminLayout }))
+-  ),
+-  Overview: lazyPage(() =>
+-    import("./pages/admin/Overview").then((m) => ({ default: m.Overview }))
+-  ),
+-  Apps: lazyPage(() =>
+-    import("./pages/admin/library/AppsTab").then((m) => ({ default: m.AppsTab }))
+-  ),
+-  StreamProfiles: lazyPage(() =>
+-    import("./pages/admin/streaming/ProfilesTab").then((m) => ({
+-      default: m.ProfilesTab,
+-    }))
+-  ),
+-  LaunchProfiles: lazyPage(() =>
+-    import("./pages/admin/streaming/LaunchTab").then((m) => ({
+-      default: m.LaunchTab,
+-    }))
+-  ),
+-  RuntimePresets: lazyPage(() =>
+-    import("./pages/admin/library/PresetsTab").then((m) => ({
+-      default: m.PresetsTab,
+-    }))
+-  ),
+-  Sources: lazyPage(() =>
+-    import("./pages/admin/library/SourcesTab").then((m) => ({
+-      default: m.SourcesTab,
+-    }))
+-  ),
+-  Images: lazyPage(() =>
+-    import("./pages/admin/library/ImagesTab").then((m) => ({ default: m.ImagesTab }))
+-  ),
+-  ImageDetail: lazyPage(() =>
+-    import("./pages/admin/ImageDetail").then((m) => ({ default: m.ImageDetail }))
+-  ),
+-  Jobs: lazyPage(() =>
+-    import("./pages/admin/fleet/JobsTab").then((m) => ({ default: m.JobsTab }))
+-  ),
+-  Releases: lazyPage(() =>
+-    import("./pages/admin/fleet/ReleasesTab").then((m) => ({ default: m.ReleasesTab }))
+-  ),
+-  AppEditor: lazyPage(() =>
+-    import("./pages/admin/AdminApps/AppEditorPage").then((m) => ({
+-      default: m.AppEditorPage,
+-    }))
+-  ),
+-  Hosts: lazyPage(() =>
+-    import("./pages/admin/fleet/HostsTab").then((m) => ({ default: m.HostsTab }))
+-  ),
+-  HostDetail: lazyPage(() =>
+-    import("./pages/admin/HostDetail").then((m) => ({ default: m.HostDetail }))
+-  ),
+-  HostSettings: lazyPage(() =>
+-    import("./pages/admin/fleet/HostSettings").then((m) => ({
+-      default: m.HostSettings,
+-    }))
+-  ),
+-  Console: lazyPage(() =>
+-    import("./pages/admin/fleet/HostConsole").then((m) => ({
+-      default: m.HostConsole,
+-    }))
+-  ),
+-  Sessions: lazyPage(() =>
+-    import("./pages/admin/Sessions").then((m) => ({
+-      default: m.Sessions,
+-    }))
+-  ),
+-  SessionDetail: lazyPage(() =>
+-    import("./pages/admin/SessionDetail").then((m) => ({
+-      default: m.SessionDetail,
+-    }))
+-  ),
+-  Users: lazyPage(() =>
+-    import("./pages/admin/people/UsersTab").then((m) => ({ default: m.UsersTab }))
+-  ),
+-  Invites: lazyPage(() =>
+-    import("./pages/admin/people/InvitesTab").then((m) => ({ default: m.InvitesTab }))
+-  ),
+-  Storage: lazyPage(() =>
+-    import("./pages/admin/fleet/StorageTab").then((m) => ({
+-      default: m.StorageTab,
+-    }))
+-  ),
+-  Audit: lazyPage(() =>
+-    import("./pages/admin/Audit").then((m) => ({ default: m.Audit }))
+-  ),
+-  Settings: lazyPage(() =>
+-    import("./pages/admin/Settings").then((m) => ({ default: m.Settings }))
+-  ),
++  Fleet: adminPage(() => import("./pages/admin/Fleet"), "Fleet"),
++  Library: adminPage(() => import("./pages/admin/Library"), "Library"),
++  Streaming: adminPage(() => import("./pages/admin/Streaming"), "Streaming"),
++  People: adminPage(() => import("./pages/admin/People"), "People"),
++  Layout: adminPage(() => import("./pages/admin/AdminLayout"), "AdminLayout"),
++  Overview: adminPage(() => import("./pages/admin/Overview"), "Overview"),
++  Apps: adminPage(() => import("./pages/admin/library/AppsTab"), "AppsTab"),
++  StreamProfiles: adminPage(() => import("./pages/admin/streaming/ProfilesTab"), "ProfilesTab"),
++  LaunchProfiles: adminPage(() => import("./pages/admin/streaming/LaunchTab"), "LaunchTab"),
++  RuntimePresets: adminPage(() => import("./pages/admin/library/PresetsTab"), "PresetsTab"),
++  Sources: adminPage(() => import("./pages/admin/library/SourcesTab"), "SourcesTab"),
++  Images: adminPage(() => import("./pages/admin/library/ImagesTab"), "ImagesTab"),
++  ImageDetail: adminPage(() => import("./pages/admin/ImageDetail"), "ImageDetail"),
++  Jobs: adminPage(() => import("./pages/admin/fleet/JobsTab"), "JobsTab"),
++  Releases: adminPage(() => import("./pages/admin/fleet/ReleasesTab"), "ReleasesTab"),
++  AppEditor: adminPage(() => import("./pages/admin/AdminApps/AppEditorPage"), "AppEditorPage"),
++  Hosts: adminPage(() => import("./pages/admin/fleet/HostsTab"), "HostsTab"),
++  HostDetail: adminPage(() => import("./pages/admin/HostDetail"), "HostDetail"),
++  HostSettings: adminPage(() => import("./pages/admin/fleet/HostSettings"), "HostSettings"),
++  Console: adminPage(() => import("./pages/admin/fleet/HostConsole"), "HostConsole"),
++  Sessions: adminPage(() => import("./pages/admin/Sessions"), "Sessions"),
++  SessionDetail: adminPage(() => import("./pages/admin/SessionDetail"), "SessionDetail"),
++  Users: adminPage(() => import("./pages/admin/people/UsersTab"), "UsersTab"),
++  Invites: adminPage(() => import("./pages/admin/people/InvitesTab"), "InvitesTab"),
++  Storage: adminPage(() => import("./pages/admin/fleet/StorageTab"), "StorageTab"),
++  Audit: adminPage(() => import("./pages/admin/Audit"), "Audit"),
++  Settings: adminPage(() => import("./pages/admin/Settings"), "Settings"),
++};
++// A deep link into the console starts its layout and its section's landing page with
++// the entry, so the route renders without a fallback once they are in. Drill-down
++// pages (a host, an app) load as before.
++const ADMIN_SECTION_PAGES: Record<string, (keyof typeof adminPages)[]> = {
++  "": ["Overview"],
++  settings: ["Settings"],
++  sessions: ["Sessions"],
++  audit: ["Audit"],
++  fleet: ["Fleet", "Hosts"],
++  library: ["Library", "Apps"],
++  streaming: ["Streaming", "LaunchProfiles"],
++  people: ["People", "Users"],
+ };
++if (typeof location !== "undefined" && /^\/admin(\/|$)/.test(location.pathname)) {
++  adminPages.Layout.preload();
++  for (const page of ADMIN_SECTION_PAGES[location.pathname.split("/")[2] ?? ""] ?? []) adminPages[page].preload();
++}
++
+ 
+ /** A Classic-only redirect: the new design renders one page for these paths. Waits for the
+  *  saved layout, so a stale local mirror cannot redirect a new-design user. */
