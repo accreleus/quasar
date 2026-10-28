@@ -36,6 +36,7 @@ expect go,web web/src/lib/metrics.generated.json
 expect go,web,rust docs/session-trace/metrics.json
 expect web,rust docs/configuration.md
 expect go,rust control-plane/internal/buildinfo/recipe.go
+expect go,rust node-agent/crates/quasar-recovery/src/journal.rs
 expect go,web,rust,site testdata/enroll-host/pins.json
 expect go,web,rust,site deploy/enroll-host.sh
 expect go,web,rust,site .github/workflows/ci.yml

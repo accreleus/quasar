@@ -130,15 +130,17 @@ jobs:
       # Keep only the compiled dependencies, as rust-cache does in ci.yml: the test and
       # binary executables and the workspace crates are rebuilt by every run anyway, and
       # they are most of the 2.9 GB. Inside the image, because its root owns the files.
+      # Only before a save, and only after a passing test: the save step's implicit
+      # success() is what keeps a failed run's target out of the cache.
       - name: Prune the cache to dependencies
-        if: always()
+        if: github.event_name == 'push' && steps.cargo.outputs.cache-hit != 'true'
         env:
           IMAGE: ${{ steps.image.outputs.ref }}
         run: |
           du -sh node-agent/target 2>/dev/null || true
           docker run --rm -v "$PWD/node-agent":/n "$IMAGE" sh -c '
             [ -d /n/target/debug ] || exit 0
-            cd /n/target/debug
+            cd /n/target/debug && [ "$(pwd -P)" = /n/target/debug ] || exit 1
             rm -rf incremental examples
             find . -maxdepth 1 -type f -delete
             find deps -maxdepth 1 -type f -perm -u+x ! -name "*.so" -delete

@@ -345,7 +345,7 @@ func waitLockWait(t *testing.T, pool *pgxpool.Pool, pattern string) {
 		var n int
 		if err := pool.QueryRow(context.Background(), `
 			SELECT count(*) FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND query LIKE $1`, pattern).Scan(&n); err != nil {
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1`, pattern).Scan(&n); err != nil {
 			t.Fatalf("poll pg_stat_activity: %v", err)
 		}
 		if n > 0 {

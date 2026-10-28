@@ -127,7 +127,7 @@ func TestConcurrentFirstEnrollmentDoesNotReplaceTheWinnersSecret(t *testing.T) {
 	waitUntil(t, "the losing enrollment to block on the winner's row", func() bool {
 		var waiting bool
 		_ = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO hosts (node_name, agent_version%')`).Scan(&waiting)
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%INSERT INTO hosts (node_name, agent_version%')`).Scan(&waiting)
 		return waiting
 	})
 	if err := winner.Commit(ctx); err != nil {

@@ -194,7 +194,7 @@ func TestTokenIssueWaitsForAnInFlightPasswordChange(t *testing.T) {
 	for {
 		var waiting bool
 		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO auth_tokens%')`).Scan(&waiting); err != nil {
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%INSERT INTO auth_tokens%')`).Scan(&waiting); err != nil {
 			t.Fatalf("pg_stat_activity: %v", err)
 		}
 		if waiting {

@@ -39,7 +39,7 @@ func tupleWaitedOn(t *testing.T, pool *pgxpool.Pool, stmt string) string {
 		err := pool.QueryRow(context.Background(), `
 			SELECT l.relation::regclass::text
 			FROM pg_stat_activity a JOIN pg_locks l ON l.pid = a.pid
-			WHERE a.wait_event_type = 'Lock' AND a.pid <> pg_backend_pid()
+			WHERE a.datname = current_database() AND a.wait_event_type = 'Lock' AND a.pid <> pg_backend_pid()
 			  AND position($1 in a.query) > 0
 			  AND l.locktype = 'tuple' AND l.granted`, stmt).Scan(&rel)
 		if err == nil {

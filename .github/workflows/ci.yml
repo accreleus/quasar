@@ -29,9 +29,11 @@ on:
     branches: [develop]
   workflow_dispatch:
 
+# A newer push to a pull request cancels its older run. On develop runs queue instead: a
+# dispatch there must not cancel the tip's push run, which carries main's required checks.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Read-only. No job here publishes anything, so nothing may inherit a write scope —
 # including a job added later. Every third-party action below is pinned to a full

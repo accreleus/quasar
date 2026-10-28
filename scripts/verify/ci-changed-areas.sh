@@ -15,6 +15,7 @@
 #         web/index.html  web/src/lib/metrics.generated.json
 #   web   web/**  testdata/**  deploy/**  docs/session-trace/**  docs/configuration.md
 #         docs/upgrading.md
+#   go    also node-agent/crates/quasar-recovery/src/journal.rs (OUTPUT_LIMIT vs migration 0075)
 #   rust  node-agent/**  testdata/**  deploy/**  docs/session-trace/**  docs/configuration.md
 #         control-plane/internal/buildinfo/recipe.go  (rust + the engine suite)
 #   site  site/**  protocol  testdata/**  deploy/**
@@ -38,6 +39,7 @@ while IFS= read -r p; do
     protocol|protocol/*) go=true site=true ;;
     control-plane/internal/buildinfo/recipe.go) go=true rust=true ;;
     control-plane/*) go=true ;;
+    node-agent/crates/quasar-recovery/src/journal.rs) go=true rust=true ;;
     web/index.html|web/src/lib/metrics.generated.json) go=true web=true ;;
     web/*) web=true ;;
     node-agent/*) rust=true ;;

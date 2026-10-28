@@ -1123,7 +1123,8 @@ func TestForeignBootReclaimLocksHostsInIDOrder(t *testing.T) {
 		adopted <- err
 	}()
 	for waiting := 0; waiting == 0; time.Sleep(10 * time.Millisecond) {
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE NOT granted`).Scan(&waiting); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE NOT l.granted AND a.datname = current_database()`).Scan(&waiting); err != nil {
 			t.Fatal(err)
 		}
 	}
