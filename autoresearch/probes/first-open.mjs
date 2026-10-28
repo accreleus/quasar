@@ -9,11 +9,15 @@
 // session: hover the tile's Play button for 150 ms, then client-side navigation to
 //          /app/session/<id> (what a launch does once POST /v1/sessions answers;
 //          the mock does not launch) -> `.session-root` rendered
+// login:   signed out (the harness sign-in hook stripped from index.html), cold load
+//          of /login -> the password field rendered
 // --idle N waits N ms on the usable library page before acting (idle-time preloads).
+// --scenarios a,b picks scenarios (default game,session).
 import { chromium } from "/w/autoresearch/harness/node_modules/playwright/index.mjs";
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i > 0 ? process.argv[i + 1] : d; };
 const A = arg("--a"), B = arg("--b"), RUNS = Number(arg("--runs", 7)), IDLE = Number(arg("--idle", 0));
+const SCENARIOS = arg("--scenarios", "game,session").split(",");
 const NET = { offline: false, latency: 40, downloadThroughput: 20e6 / 8, uploadThroughput: 5e6 / 8 };
 const APP_ID = "00000000-0000-4000-8000-000000000100"; // fixture "Hollow Peak"
 const median = (a) => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
@@ -25,6 +29,19 @@ async function once(browser, base, scenario) {
   await cdp.send("Network.enable");
   await cdp.send("Network.emulateNetworkConditions", NET);
   await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
+  if (scenario === "login") {
+    // Signed out: serve index.html without the harness hook that stores a token.
+    await page.route("**/login", async (route) => {
+      const res = await route.fetch();
+      const body = (await res.text()).replace(/<script>\(function\(\)\{try\{\s*localStorage\.setItem\('quasar\.auth\.token'[\s\S]*?<\/script>/, "");
+      await route.fulfill({ response: res, body });
+    });
+    await page.goto(base + "/login", { waitUntil: "commit" });
+    await page.waitForSelector('input[type="password"]', { timeout: 60000 });
+    const dt = await page.evaluate(() => performance.now()); // from this document's navigation start
+    await ctx.close();
+    return Math.round(dt);
+  }
   await page.goto(base + "/app", { waitUntil: "commit" });
   await page.waitForFunction(() => document.body?.textContent?.includes("Vector Rally"), null, { timeout: 60000, polling: 50 });
   if (IDLE) await page.waitForTimeout(IDLE);
@@ -56,7 +73,7 @@ async function once(browser, base, scenario) {
 
 const browser = await chromium.launch();
 const out = {};
-for (const scenario of ["game", "session"]) {
+for (const scenario of SCENARIOS) {
   const a = [], b = [];
   for (let i = 0; i < RUNS; i++) { a.push(await once(browser, A, scenario)); b.push(await once(browser, B, scenario)); }
   out[scenario] = { a: median(a), b: median(b), a_runs: a, b_runs: b };
