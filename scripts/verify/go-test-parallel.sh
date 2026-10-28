@@ -52,13 +52,17 @@ grep -vE "$alone" "$GTP_LOGS/packages" > "$GTP_LOGS/together" || true
 
 # The packages share one server, so a test that reads the server-wide views
 # (pg_stat_activity, pg_locks) sees the other packages' sessions too and can stop waiting
-# on someone else's lock. Each read must be scoped to its own database or a known
-# backend pid within three lines of the FROM/JOIN.
-unscoped="$(find . -name '*_test.go' -exec awk '
-  FNR == 1 { w = 0 }
-  /(FROM|JOIN)[ \t]+pg_(stat_activity|locks)/ { w = 4; at = FILENAME ":" FNR }
-  w > 0 { if ($0 ~ /current_database\(\)|pid ?= ?\$/) w = 0; else if (--w == 0) print at }
-' {} +)"
+# on someone else's lock. Each read must be scoped, in the rest of its SQL string, to its
+# own database (current_database()) or a known backend (pid = $n). Line comments are
+# dropped first so a comment cannot satisfy the rule.
+unscoped="$(find . -name '*_test.go' -exec perl -0777 -ne '
+  s#//[^\n]*##g;
+  while (/(?:FROM|JOIN)\s+pg_(?:stat_activity|locks)\b(?=([^`"]*))/g) {
+    my $rest = $1;
+    next if $rest =~ /current_database\(\)|\bpid\s*=\s*\$/;
+    my $line = 1 + (substr($_, 0, $-[0]) =~ tr/\n//);
+    print "$ARGV:$line\n";
+  }' {} +)"
 if [ -n "$unscoped" ]; then
   echo "go-test-parallel: these reads of pg_stat_activity/pg_locks are not scoped to current_database():" >&2
   while IFS= read -r u; do echo "  $u" >&2; done <<<"$unscoped"
@@ -90,12 +94,12 @@ run_package() {
 export -f run_package
 
 start=$SECONDS
-# Compile every test binary first, at full parallelism, so the timing-sensitive DB tests
-# below do not run beside four compilers (under that contention a lock-ordering test in
-# agentws missed its 10 s wait). -run '^$' runs no test; a compile error stops here.
+# Compile every test binary first, at full parallelism: a compile error stops here with
+# one message instead of in whichever packages it reaches, and the timed runs below do not
+# share the CPU with compilers. -run '^$' runs no test, only each package's TestMain.
 if ! go test "$@" -run '^$' ./... > "$GTP_LOGS/build.log" 2>&1; then
   cat "$GTP_LOGS/build.log"
-  echo "go-test-parallel: the test binaries did not build" >&2
+  echo "go-test-parallel: the test binaries did not build (or a TestMain failed)" >&2
   exit 1
 fi
 echo "go-test-parallel: test binaries built in $((SECONDS - start)) s"
@@ -103,7 +107,8 @@ xargs -P "$jobs" -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/together
 xargs -P 1 -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/alone" || true
 echo "go-test-parallel: $(wc -l < "$GTP_LOGS/packages") packages, $jobs at a time, $((SECONDS - start)) s"
 # Every package must have been started: a run_package that never ran must not read as green.
-ran="$(sort -u "$GTP_LOGS/ran" 2>/dev/null | wc -l)"
+touch "$GTP_LOGS/ran"
+ran="$(sort -u "$GTP_LOGS/ran" | wc -l)"
 if [ "$ran" -ne "$(wc -l < "$GTP_LOGS/packages")" ]; then
   echo "go-test-parallel: only $ran of $(wc -l < "$GTP_LOGS/packages") packages ran" >&2
   exit 1
