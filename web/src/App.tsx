@@ -20,6 +20,7 @@ import { AppHomeNext } from "./pages/app/AppHomeNext";
 import { AppLayout } from "./pages/app/AppLayout";
 import { RouteErrorBoundary, RouteSkeleton } from "./components/RouteBoundary";
 import { OverlayPreferencesRoute, useOverlayPreferences } from "./settings/OverlayPreferencesContext";
+import { accountArea, gamePage, sessionPage } from "./pages/lazyPages";
 
 // Admin area — lazy-loaded. Vite splits this into a separate chunk automatically
 // because of the dynamic import boundary. The Suspense fallback is intentionally
@@ -36,16 +37,10 @@ const Suspended = ({ children }: { children: ReactNode }) => (
   </RouteErrorBoundary>
 );
 
-// The full-screen session view carries the WebRTC, input and HUD code; nobody
-// needs it to browse the library, so it loads when a session opens.
-const SessionPage = lazyPage(() =>
-  import("./pages/app/SessionPage").then((m) => ({ default: m.SessionPage }))
-);
-
-// The game page (and its stream settings) loads when a game is opened.
-const GamePageRoute = lazyPage(() =>
-  import("./pages/app/game/GamePage").then((m) => ({ default: m.GamePageRoute }))
-);
+// The full-screen session view (WebRTC, input, HUD) and the game page load when
+// first needed; the library preloads them on hover, focus and idle (lazyPages.ts).
+const SessionPage = sessionPage.component("SessionPage");
+const GamePageRoute = gamePage.component("GamePageRoute");
 
 // Routes a signed-in player never visits. Login stays eager (a signed-out
 // visit's first paint), and so does the setup wizard: it shares most of its
@@ -60,20 +55,8 @@ const StyleguidePage = lazyPage(() =>
 // The account area loads as one chunk (pages/app/account/area.ts). A deep link
 // into it preloads that chunk from index.html (routePreloads in vite.config.ts),
 // and App starts the import as soon as it loads on an account URL.
-type AccountArea = typeof import("./pages/app/account/area");
-type Lazy = { default: React.ComponentType<any> };
-let accountArea: AccountArea | undefined;
-const loadAccountArea = () => import("./pages/app/account/area").then((m) => (accountArea = m));
-if (typeof location !== "undefined" && location.pathname.startsWith("/app/account")) void loadAccountArea();
-// Once the chunk is in, hand React.lazy a thenable that resolves synchronously:
-// lazy then renders without suspending, so a deep link shows no fallback and
-// does not wait out React's throttle on revealing suspended content.
-const accountPage = (name: keyof AccountArea) =>
-  lazyPage(() => {
-    const area = accountArea;
-    if (area) return { then: (resolve: (m: Lazy) => void) => resolve({ default: area[name] }) } as unknown as Promise<Lazy>;
-    return loadAccountArea().then((m) => ({ default: m[name] }));
-  });
+if (typeof location !== "undefined" && location.pathname.startsWith("/app/account")) accountArea.preload();
+const accountPage = accountArea.component;
 const account = {
   Layout: accountPage("AccountLayout"),
   AccountSection: accountPage("AccountSection"),

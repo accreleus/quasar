@@ -27,6 +27,7 @@ import { IconHeart, IconPlayGlyph } from "../../../components/icons";
 import { artFor, artSrcSet, sizedArt } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
 import { TileHeart } from "./TileHeart";
+import { gamePage, sessionPage } from "../../lazyPages";
 
 /** The `.lib-tile` box a surface button belongs to. The surface button is
  * absolutely positioned and inset:0, so its own `offsetTop` is always 0 —
@@ -151,6 +152,8 @@ export function LibraryTile({
           disabled={isBlocked || (isBusy && !isRunning)}
           aria-label={isRunning ? `Resume ${app.name}` : `Play ${app.name}`}
           onClick={onPlay}
+          onPointerEnter={sessionPage.preload}
+          onFocus={sessionPage.preload}
         >
           <IconPlayGlyph />
           {/* The mock has no running-tile state for this control; the visible
@@ -167,6 +170,8 @@ export function LibraryTile({
           aria-controls={opensPage ? undefined : detailId}
           aria-keyshortcuts={onFavourite ? "F" : undefined}
           onClick={onOpen}
+          onPointerEnter={gamePage.preload}
+          onFocus={gamePage.preload}
           ref={tileRef}
         >
           {meta}
