@@ -83,9 +83,10 @@ jobs:
             || { echo "::error::ci-changed-areas.sh gave an unusable answer: $out"; exit 1; }
           echo "$out" | tee -a "$GITHUB_OUTPUT"
 
-  # The control-plane tests are two jobs, each with its own Postgres: `session`, the slowest
-  # package (about 130-175 s alone, 250-290 s sharing a runner) followed by `agentws`, and every
-  # other package beside them (#928). `control-plane (build + vet + test)` is the check main requires, so it is the one
+  # The control-plane tests are two jobs, each with its own runner and Postgres (#928): the
+  # packages OWN_RUNNER names (`session`, the slowest: about 140 s alone, about twice that
+  # sharing a runner; then `agentws`, alone, #925), and every other package. Both read the one
+  # regex, so each test package runs in exactly one of them. `control-plane (build + vet + test)` is the check main requires, so it is the one
   # that gathers them.
   go-tests:
     name: control-plane tests (${{ matrix.part }})
@@ -94,18 +95,17 @@ jobs:
     runs-on: ubuntu-latest
     # Measured 2026-10: about 3 min of tests on a cold build cache. 30 fails a stall early.
     timeout-minutes: 30
+    env:
+      OWN_RUNNER: /internal/(session|agentws)$
     strategy:
       fail-fast: false
       matrix:
         include:
           - part: build, vet, most packages
-            skip: /internal/(session|agentws)$
-            only: ''
+            pick: skip
             static: true
-          # agentws runs alone after session (#925); here it uses the time this runner has spare.
           - part: session, agentws
-            skip: ''
-            only: /internal/(session|agentws)$
+            pick: only
             static: false
     defaults:
       run:
@@ -171,8 +171,8 @@ jobs:
       - name: Test (with Postgres)
         env:
           TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/quasar?sslmode=disable
-          GTP_ONLY: ${{ matrix.only }}
-          GTP_SKIP: ${{ matrix.skip }}
+          GTP_ONLY: ${{ matrix.pick == 'only' && env.OWN_RUNNER || '' }}
+          GTP_SKIP: ${{ matrix.pick == 'skip' && env.OWN_RUNNER || '' }}
         run: bash "$GITHUB_WORKSPACE/scripts/verify/go-test-parallel.sh" -count=1
 
   go:

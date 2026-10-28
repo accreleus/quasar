@@ -114,7 +114,7 @@ xargs -P "$jobs" -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/together
 xargs -P 1 -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/alone" || true
 alone_note=""
 [ -s "$GTP_LOGS/alone" ] && alone_note=", then alone: $(tr '\n' ' ' < "$GTP_LOGS/alone")"
-echo "go-test-parallel: $(wc -l < "$GTP_LOGS/together") packages $jobs at a time${alone_note} ($((SECONDS - start)) s)"
+echo "go-test-parallel: $(wc -l < "$GTP_LOGS/together") package(s) $jobs at a time${alone_note} ($((SECONDS - start)) s)"
 # Every package must have been started: a run_package that never ran must not read as green.
 touch "$GTP_LOGS/ran"
 ran="$(sort -u "$GTP_LOGS/ran" | wc -l)"
