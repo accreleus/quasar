@@ -43,6 +43,13 @@ go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{len .TestGoFiles}} {{len .XTes
   awk 'NF == 3 { print $1 + $2, $3 }' | sort -rn | cut -d' ' -f2 > "$GTP_LOGS/packages"
 [ -s "$GTP_LOGS/packages" ] || { echo "go-test-parallel: no test packages found" >&2; exit 2; }
 
+# Packages whose tests wait on wall-clock deadlines tight enough that a shared, busy
+# server makes them miss: they run alone, after the others. agentws timed out twice in
+# its waits (10 s) beside three other packages and never alone (#919, #925).
+alone='/internal/agentws$'
+grep -E "$alone" "$GTP_LOGS/packages" > "$GTP_LOGS/alone" || true
+grep -vE "$alone" "$GTP_LOGS/packages" > "$GTP_LOGS/together" || true
+
 # The packages share one server, so a test that reads the server-wide views
 # (pg_stat_activity, pg_locks) sees the other packages' sessions too and can stop waiting
 # on someone else's lock. Each read must be scoped to its own database or a known
@@ -92,7 +99,8 @@ if ! go test "$@" -run '^$' ./... > "$GTP_LOGS/build.log" 2>&1; then
   exit 1
 fi
 echo "go-test-parallel: test binaries built in $((SECONDS - start)) s"
-xargs -P "$jobs" -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/packages" || true
+xargs -P "$jobs" -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/together" || true
+xargs -P 1 -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/alone" || true
 echo "go-test-parallel: $(wc -l < "$GTP_LOGS/packages") packages, $jobs at a time, $((SECONDS - start)) s"
 # Every package must have been started: a run_package that never ran must not read as green.
 ran="$(sort -u "$GTP_LOGS/ran" 2>/dev/null | wc -l)"
