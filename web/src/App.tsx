@@ -30,7 +30,6 @@ import { AccountSessions } from "./pages/app/account/AccountSessions";
 import { AccountStreaming } from "./pages/app/account/AccountStreaming";
 import { AccountAppearance } from "./pages/app/account/AccountAppearance";
 import { AppHomeNext } from "./pages/app/AppHomeNext";
-import { GamePageRoute } from "./pages/app/game/GamePage";
 import { AppLayout } from "./pages/app/AppLayout";
 import { AccountStorage } from "./pages/app/account/AccountStorage";
 import { StyleguidePage } from "./pages/StyleguidePage";
@@ -56,6 +55,11 @@ const Suspended = ({ children }: { children: ReactNode }) => (
 // needs it to browse the library, so it loads when a session opens.
 const SessionPage = lazyPage(() =>
   import("./pages/app/SessionPage").then((m) => ({ default: m.SessionPage }))
+);
+
+// The game page (and its stream settings) loads when a game is opened.
+const GamePageRoute = lazyPage(() =>
+  import("./pages/app/game/GamePage").then((m) => ({ default: m.GamePageRoute }))
 );
 
 // Admin pages table: each entry is a separate lazy() chunk boundary.
@@ -213,7 +217,14 @@ export function App() {
               back/forward works. Same component — AppHomeNext reads the route
               to choose its view. */}
           <Route path="library" element={<AppIndexPage />} />
-          <Route path="game/:id" element={<GamePageRoute />} />
+          <Route
+            path="game/:id"
+            element={
+              <Suspended>
+                <GamePageRoute />
+              </Suspended>
+            }
+          />
           {/* Storage moved into the account area (2026-08-05). Kept as a
               redirect, not deleted — existing bookmarks and any link still in
               the wild must land on the page, not a 404. */}
