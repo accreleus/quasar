@@ -1,7 +1,7 @@
 // The account page's Input section. It owns the one read of `/v1/me/region-input` and the one
 // save path; a field is a function of the loaded settings and a `save` that sends its patch.
-// Mouse speed is the first group; raw input, flip scroll and the gamepad layout are switches on
-// the same `save`.
+// The keyboard layout and variant come first, then mouse speed; raw input, flip scroll and the
+// gamepad layout are switches on the same `save`.
 
 import { useEffect, useRef, useState } from "react";
 import { getRegionInput, patchRegionInput, type RegionInputWire } from "../../../../api/me";
@@ -9,8 +9,9 @@ import { ApiError } from "../../../../api/client";
 import { ResourceStates } from "../../../../components/ResourceStates";
 import { SegmentedControl } from "../../../../components/SegmentedControl";
 import { SliderField } from "../../../../components/SliderField";
-import { Switch } from "../../../../components/TextField";
+import { SelectField, Switch } from "../../../../components/TextField";
 import { rawMouseSupported } from "../../../../input/capture";
+import { KEYBOARDS } from "../../../../lib/region/options";
 import { useResource } from "../../../../lib/resource/react";
 import { MOUSE_SENSITIVITY_MAX, MOUSE_SENSITIVITY_MIN } from "../../../../input/mouseScale";
 import "../../../../styles/account-input.css";
@@ -31,6 +32,9 @@ const MATCH_HINT: Record<MatchCursor, string> = {
 };
 
 const SAVED = "Saved. Applies from your next launch.";
+// A keyboard change closes an idle Steam (control-api.md §Saving ends an idle Steam).
+const IDLE_STEAM_CLOSED = " Your idle Steam was closed so it picks this up.";
+const BUILT_IN_KEYBOARD = { layout: "us", variant: "" };
 const SENS_STEP = 0.125;
 const SAVE_DELAY_MS = 400;
 
@@ -52,11 +56,11 @@ export function InputSection() {
     const run = queue.current.then(async () => {
       setStatus(null);
       try {
-        await res.mutate(
+        const r = await res.mutate(
           ({ token }) => patchRegionInput(token, { input: patch }),
           (_, r) => r,
         );
-        setStatus({ ok: true, text: saved });
+        setStatus({ ok: true, text: r.parked_session_stopped ? saved + IDLE_STEAM_CLOSED : saved });
       } catch (e) {
         setStatus({ ok: false, text: e instanceof ApiError ? e.message : "Could not save your input settings." });
       }
@@ -72,7 +76,14 @@ export function InputSection() {
   return (
     <div className="card sec-card">
       <ResourceStates loading={res.loading} error={res.errorMessage} />
-      <div className="eyebrow ac-group">Mouse</div>
+      <div className="eyebrow ac-group">Keyboard</div>
+      <KeyboardFields
+        mine={mine?.keyboard ?? null}
+        install={defaults?.keyboard ?? BUILT_IN_KEYBOARD}
+        disabled={!data}
+        onSave={save}
+      />
+      <div className="eyebrow ac-group os-sub-h">Mouse</div>
       <MatchCursorField
         value={mine?.match_cursor ?? defaults?.match_cursor ?? "auto"}
         disabled={!data}
@@ -117,6 +128,64 @@ export function InputSection() {
         {status?.text ?? "Saved as you pick."}
       </p>
     </div>
+  );
+}
+
+type Keyboard = NonNullable<Input["keyboard"]>;
+
+const layoutName = (layout: string) => KEYBOARDS.find((k) => k.layout === layout)?.label ?? layout;
+// The layout's variants, plus the stored one as itself when the list does not carry it.
+const variantsOf = (layout: string, variant: string): readonly (readonly [string, string])[] => {
+  const listed = KEYBOARDS.find((k) => k.layout === layout)?.variants ?? [];
+  return listed.some(([v]) => v === variant) ? listed : [...listed, [variant, variant || "Default"]];
+};
+const variantName = ({ layout, variant }: Keyboard) => variantsOf(layout, variant).find(([v]) => v === variant)?.[1] ?? variant;
+
+// Unset shows the install's keyboard (Variant locked to it) until a layout is picked; the first
+// option puts it back with `keyboard: null`. A layout change resets the variant, as the admin card does.
+function KeyboardFields({ mine, install, disabled, onSave }: {
+  mine: Keyboard | null;
+  install: Keyboard;
+  disabled: boolean;
+  onSave: (patch: Partial<Input>, saved: string) => Promise<void>;
+}) {
+  const shown = mine ?? install;
+  const layouts = !mine || KEYBOARDS.some((k) => k.layout === mine.layout) ? KEYBOARDS : [...KEYBOARDS, { layout: mine.layout, label: mine.layout }];
+  const pick = (keyboard: Keyboard) =>
+    void onSave({ keyboard }, `Saved. Your next launch uses ${layoutName(keyboard.layout)}, ${variantName(keyboard)}.`);
+  return (
+    <>
+      <div className="grid g2 os-field-wide">
+        <SelectField
+          label="Layout"
+          id="keyboard-layout"
+          value={mine?.layout ?? ""}
+          disabled={disabled}
+          onChange={(e) =>
+            e.target.value
+              ? pick({ layout: e.target.value, variant: "" })
+              : void onSave({ keyboard: null }, `Saved. Your next launch uses the install’s keyboard, ${layoutName(install.layout)}, ${variantName(install)}.`)
+          }
+        >
+          <option value="">Same as the install ({layoutName(install.layout)})</option>
+          {layouts.map((k) => (
+            <option key={k.layout} value={k.layout}>{k.label}</option>
+          ))}
+        </SelectField>
+        <SelectField
+          label="Variant"
+          id="keyboard-variant"
+          value={shown.variant}
+          disabled={disabled || !mine}
+          onChange={(e) => pick({ layout: shown.layout, variant: e.target.value })}
+        >
+          {variantsOf(shown.layout, shown.variant).map(([v, name]) => (
+            <option key={v} value={v}>{name}</option>
+          ))}
+        </SelectField>
+      </div>
+      <p className="hint mt3">Desktops are set to this layout at every launch, over their own keyboard setting.</p>
+    </>
   );
 }
 

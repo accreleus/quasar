@@ -283,3 +283,76 @@ describe("Input section: Gamepad Nintendo layout", () => {
     expect(el).not.toBeChecked();
   });
 });
+
+describe("Input section: Keyboard", () => {
+  const layout = async () => {
+    const el = (await screen.findByLabelText("Layout")) as HTMLSelectElement;
+    await waitFor(() => expect(el).toBeEnabled());
+    return el;
+  };
+  const variant = () => screen.getByLabelText("Variant") as HTMLSelectElement;
+
+  it("shows the install keyboard until the user picks, with Variant locked to it", async () => {
+    getRegionInput.mockResolvedValue(body({}, { keyboard: { layout: "de", variant: "nodeadkeys" } }));
+    render(<InputSection />);
+    const el = await layout();
+    expect(el).toHaveValue("");
+    expect(el.options[0]).toHaveTextContent("Same as the install (German)");
+    expect(variant()).toHaveValue("nodeadkeys");
+    expect(variant()).toBeDisabled();
+  });
+
+  it("a layout pick saves the layout with the basic variant", async () => {
+    render(<InputSection />);
+    fireEvent.change(await layout(), { target: { value: "gb" } });
+    await waitFor(() => expect(patchRegionInput).toHaveBeenCalledWith("tok", { input: { keyboard: { layout: "gb", variant: "" } } }));
+    expect(await screen.findByText("Saved. Your next launch uses English (UK), Default.")).toBeInTheDocument();
+    expect(variant()).toBeEnabled();
+  });
+
+  it("a layout change resets the variant, and a variant pick keeps the layout", async () => {
+    getRegionInput.mockResolvedValue(body({ keyboard: { layout: "us", variant: "dvorak" } }));
+    render(<InputSection />);
+    await waitFor(() => expect(variant()).toHaveValue("dvorak"));
+    fireEvent.change(await layout(), { target: { value: "fr" } });
+    await waitFor(() => expect(patchRegionInput).toHaveBeenLastCalledWith("tok", { input: { keyboard: { layout: "fr", variant: "" } } }));
+    await waitFor(() => expect(variant()).toHaveValue(""));
+    fireEvent.change(variant(), { target: { value: "bepo" } });
+    await waitFor(() => expect(patchRegionInput).toHaveBeenLastCalledWith("tok", { input: { keyboard: { layout: "fr", variant: "bepo" } } }));
+    expect(await screen.findByText("Saved. Your next launch uses French, BÉPO.")).toBeInTheDocument();
+  });
+
+  it("'Same as the install' sends null", async () => {
+    getRegionInput.mockResolvedValue(body({ keyboard: { layout: "gb", variant: "" } }, { keyboard: { layout: "us", variant: "" } }));
+    render(<InputSection />);
+    fireEvent.change(await layout(), { target: { value: "" } });
+    await waitFor(() => expect(patchRegionInput).toHaveBeenCalledWith("tok", { input: { keyboard: null } }));
+    expect(await screen.findByText(/uses the install’s keyboard, English \(US\), Default/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText("Layout")).toHaveValue(""));
+  });
+
+  it("shows a stored value outside the list as itself", async () => {
+    getRegionInput.mockResolvedValue(body({ keyboard: { layout: "cz", variant: "qwerty" } }));
+    render(<InputSection />);
+    const el = await layout();
+    await waitFor(() => expect(el).toHaveValue("cz"));
+    expect(el).toHaveDisplayValue("cz");
+    expect(variant()).toHaveDisplayValue("qwerty");
+  });
+
+  it("says an idle Steam was closed when the response says so", async () => {
+    patchRegionInput.mockImplementation(async (_t: string, p: { input: object }) => ({ ...body(p.input), parked_session_stopped: true }));
+    render(<InputSection />);
+    fireEvent.change(await layout(), { target: { value: "us" } });
+    expect(await screen.findByText(/Your idle Steam was closed so it picks this up\./)).toBeInTheDocument();
+  });
+
+  it("says why when the save fails, and goes back to the stored value", async () => {
+    patchRegionInput.mockRejectedValue(new ApiError(400, "validation_failed", "bad layout"));
+    render(<InputSection />);
+    const el = await layout();
+    fireEvent.change(el, { target: { value: "gb" } });
+    expect(await screen.findByText("bad layout")).toBeInTheDocument();
+    expect(el).toHaveValue("");
+  });
+});
