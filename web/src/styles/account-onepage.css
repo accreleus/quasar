@@ -205,6 +205,12 @@
   color: var(--text-3);
 }
 
+/* On the accent-soft selection, muted text drops under 4.5:1 in light: DESIGN.md override #12. */
+.tz-opt[aria-selected="true"] .tz-sub,
+.tz-opt[aria-selected="true"] .tz-off {
+  color: var(--text-2);
+}
+
 .tz-opt.tz-follow {
   margin-bottom: var(--s1);
 }
