@@ -81,6 +81,11 @@ export const ACCOUNT_SETTINGS: readonly SettingEntry[] = [
     keywords: "mouse acceleration raw unadjusted movement pointer lock chrome edge",
     target: { sel: "#raw-mouse", up: ".ac-sw" },
   },
+  {
+    id: "acct-flip-scroll", label: "Flip scroll direction", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse wheel scroll reverse invert natural direction up down",
+    target: { sel: "#flip-scroll", up: ".ac-sw" },
+  },
   sec("overlay", "In-session overlay", "overlay", "overlay", "hud strip overlay stats"),
   {
     id: "acct-overlay-preset", label: "Overlay content", where: "Overlay", icon: "overlay", to: `${A}/overlay`,

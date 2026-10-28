@@ -202,3 +202,43 @@ describe("Input section: Raw mouse input", () => {
     expect(patchRegionInput).not.toHaveBeenCalled();
   });
 });
+
+describe("Input section: Flip scroll direction", () => {
+  const flipSwitch = async () => {
+    const el = (await screen.findByLabelText("Flip scroll direction")) as HTMLInputElement;
+    await waitFor(() => expect(el).toBeEnabled());
+    return el;
+  };
+
+  it("is off until the user or the install default says otherwise", async () => {
+    render(<InputSection />);
+    expect(await flipSwitch()).not.toBeChecked();
+  });
+
+  it("shows the install default until the user picks", async () => {
+    getRegionInput.mockResolvedValue(body({}, { flip_scroll: true }));
+    render(<InputSection />);
+    await waitFor(() => expect(screen.getByLabelText("Flip scroll direction")).toBeChecked());
+  });
+
+  it("on saves true, off saves false, leaving the other fields alone", async () => {
+    render(<InputSection />);
+    const el = await flipSwitch();
+    fireEvent.click(el);
+    await waitFor(() => expect(patchRegionInput).toHaveBeenLastCalledWith("tok", { input: { flip_scroll: true } }));
+    expect(await screen.findByText("Saved. Applies from your next launch.")).toBeInTheDocument();
+    await waitFor(() => expect(el).toBeChecked());
+    fireEvent.click(el);
+    await waitFor(() => expect(patchRegionInput).toHaveBeenLastCalledWith("tok", { input: { flip_scroll: false } }));
+    await waitFor(() => expect(el).not.toBeChecked());
+  });
+
+  it("says why when the save fails, and goes back to the stored value", async () => {
+    patchRegionInput.mockRejectedValue(new ApiError(400, "validation_failed", "bad value"));
+    render(<InputSection />);
+    const el = await flipSwitch();
+    fireEvent.click(el);
+    expect(await screen.findByText("bad value")).toBeInTheDocument();
+    expect(el).not.toBeChecked();
+  });
+});

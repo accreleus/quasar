@@ -15,14 +15,16 @@ export interface MouseSettings {
   sensitivity: number;
   /** `raw_mouse`: ask for pointer lock with `unadjustedMovement`. */
   raw: boolean;
+  /** `flip_scroll`: reverse the wheel direction before it is sent. */
+  flip: boolean;
 }
 
 export const MOUSE_SENSITIVITY_MIN = 0.25;
 export const MOUSE_SENSITIVITY_MAX = 4;
 
-export const NEUTRAL_MOUSE: MouseSettings = { match: false, sensitivity: 1, raw: false };
+export const NEUTRAL_MOUSE: MouseSettings = { match: false, sensitivity: 1, raw: false, flip: false };
 
-/** The user's value, then the install default, then the built-in (`auto`, 1×, raw off);
+/** The user's value, then the install default, then the built-in (`auto`, 1×, raw and flip off);
  *  `auto` is on for a desktop app and off for every other kind. */
 export function resolveMouseSettings(
   s: RegionInputWire | null | undefined,
@@ -34,6 +36,7 @@ export function resolveMouseSettings(
     match: mode === "on" || (mode === "auto" && kind === "desktop"),
     sensitivity: Math.min(MOUSE_SENSITIVITY_MAX, Math.max(MOUSE_SENSITIVITY_MIN, sens)),
     raw: s?.input?.raw_mouse ?? s?.defaults?.input?.raw_mouse ?? false,
+    flip: s?.input?.flip_scroll ?? s?.defaults?.input?.flip_scroll ?? false,
   };
 }
 
