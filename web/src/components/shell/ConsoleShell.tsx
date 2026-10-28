@@ -28,7 +28,7 @@ import {
   type PaletteUser,
 } from "./paletteSearch";
 import { Rail } from "./Rail";
-import { placeOf, settingsShortLabel, settingsTriggerLabel } from "./settingsSearch/settingsIndex";
+import { placeOf, settingsShortLabel, settingsTriggerLabel } from "./settingsSearch/place";
 import type { RailBadgeCounts, RailSection } from "./navTypes";
 import { TabBar } from "./TabBar";
 import { Topbar } from "./Topbar";
