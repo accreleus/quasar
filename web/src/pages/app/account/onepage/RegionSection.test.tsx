@@ -246,7 +246,7 @@ describe("Language and region format", () => {
     expect(fmt().selectedOptions[0].text).toBe("Same as language (English (US))");
   });
 
-  it("follows a browser language the install does not list, and one it cannot read", async () => {
+  it("follows a browser language the install does not list, by its tag", async () => {
     vi.spyOn(window.navigator, "language", "get").mockReturnValue("de-AT");
     renderSection();
     expect((await lang()).selectedOptions[0].text).toBe("Follow my browser (de-AT)");
