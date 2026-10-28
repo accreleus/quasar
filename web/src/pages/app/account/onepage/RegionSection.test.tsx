@@ -35,14 +35,15 @@ const renderSection = () =>
   );
 
 const list = () => screen.findByRole("listbox");
-const option = (name: RegExp) => screen.getByRole("option", { name });
+// The timezone list only: the language and format selects have options of their own.
+const option = (name: RegExp) => within(screen.getByRole("listbox")).getByRole("option", { name });
 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({ timeZone: "Europe/London" } as Intl.ResolvedDateTimeFormatOptions);
   api.getRegionInput.mockResolvedValue(body(null));
-  api.patchRegionInput.mockImplementation(async (_t: string, patch: { region: { timezone: string | null } }) =>
-    body(patch.region.timezone, { parked_session_stopped: false }),
+  api.patchRegionInput.mockImplementation(async (_t: string, patch: { region: Record<string, string | null> }) =>
+    body(null, { region: { timezone: null, language: null, region_format: null, ...patch.region }, parked_session_stopped: false }),
   );
 });
 afterEach(() => vi.restoreAllMocks());
@@ -223,6 +224,136 @@ describe("Region section", () => {
     renderSection();
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(screen.queryByRole("listbox")).toBeNull();
+  });
+});
+
+describe("Language and region format", () => {
+  const lang = () => screen.findByLabelText("Language") as Promise<HTMLSelectElement>;
+  const fmt = () => screen.getByLabelText("Region format") as HTMLSelectElement;
+  const status = () => screen.getByRole("status").textContent;
+  const withRegion = (region: Record<string, string | null>, defaults: Record<string, string | null> = {}) => ({
+    ...body(null),
+    region: { timezone: null, language: null, region_format: null, ...region },
+    defaults: { region: { timezone: "UTC", language: "en-US", region_format: null, ...defaults }, input: {} },
+  });
+
+  it("starts on Follow my browser and Same as language, naming both", async () => {
+    renderSection();
+    const l = await lang();
+    expect(l.value).toBe("");
+    expect(l.selectedOptions[0].text).toBe("Follow my browser (English (US))");
+    expect(fmt().value).toBe("");
+    expect(fmt().selectedOptions[0].text).toBe("Same as language (English (US))");
+  });
+
+  it("follows a browser language the install does not list, by its tag", async () => {
+    vi.spyOn(window.navigator, "language", "get").mockReturnValue("de-AT");
+    renderSection();
+    expect((await lang()).selectedOptions[0].text).toBe("Follow my browser (de-AT)");
+    expect(fmt().selectedOptions[0].text).toBe("Same as language (de-AT)");
+  });
+
+  it("falls back to the install default when the browser reports no language", async () => {
+    vi.spyOn(window.navigator, "language", "get").mockReturnValue("");
+    api.getRegionInput.mockResolvedValue(withRegion({}, { language: "fr-FR" }));
+    renderSection();
+    expect((await lang()).selectedOptions[0].text).toBe("Follow my browser (install default: Français)");
+  });
+
+  it("saves a language at once and says the next launch starts in it", async () => {
+    renderSection();
+    fireEvent.change(await lang(), { target: { value: "de-DE" } });
+    await waitFor(() => expect(api.patchRegionInput).toHaveBeenCalledWith("t0k3n", { region: { language: "de-DE" } }));
+    await waitFor(() => expect(status()).toBe("Saved. Your next launch starts in Deutsch."));
+    expect((await lang()).value).toBe("de-DE");
+    expect(fmt().selectedOptions[0].text).toBe("Same as language (Deutsch)");
+  });
+
+  it("says the idle Steam was closed when the server closed it", async () => {
+    api.patchRegionInput.mockResolvedValue({ ...withRegion({ language: "de-DE" }), parked_session_stopped: true });
+    renderSection();
+    fireEvent.change(await lang(), { target: { value: "de-DE" } });
+    await waitFor(() => expect(status()).toBe("Saved. Your next launch starts in Deutsch. Your idle Steam was closed so it picks this up."));
+  });
+
+  it("Follow my browser clears the saved language", async () => {
+    api.getRegionInput.mockResolvedValue(withRegion({ language: "de-DE" }));
+    renderSection();
+    fireEvent.change(await lang(), { target: { value: "" } });
+    await waitFor(() => expect(api.patchRegionInput).toHaveBeenCalledWith("t0k3n", { region: { language: null } }));
+    await waitFor(() => expect(status()).toBe("Saved. Your next launch follows your browser's language."));
+  });
+
+  it("saves a region format, and Same as language clears it", async () => {
+    renderSection();
+    await lang();
+    fireEvent.change(fmt(), { target: { value: "en-GB" } });
+    await waitFor(() => expect(api.patchRegionInput).toHaveBeenCalledWith("t0k3n", { region: { region_format: "en-GB" } }));
+    await waitFor(() => expect(status()).toBe("Saved. Applies from your next launch."));
+    expect(fmt().value).toBe("en-GB");
+    fireEvent.change(fmt(), { target: { value: "" } });
+    await waitFor(() => expect(api.patchRegionInput).toHaveBeenLastCalledWith("t0k3n", { region: { region_format: null } }));
+  });
+
+  it("shows the format as an example in the hint and follows the pick", async () => {
+    api.getRegionInput.mockResolvedValue(withRegion({ region_format: "en-GB" }));
+    renderSection();
+    await lang();
+    expect(document.querySelector(".rg-ex")?.textContent).toMatch(/^\d{2}\/\d{2}\/\d{4} · 1,234\.56 · \d{2}:\d{2}$/);
+    fireEvent.change(fmt(), { target: { value: "de-DE" } });
+    await waitFor(() => expect(document.querySelector(".rg-ex")?.textContent).toMatch(/^\d{2}\.\d{2}\.\d{4} · 1\.234,56 · \d{2}:\d{2}$/));
+  });
+
+  it("shows a stored value outside the list as itself", async () => {
+    api.getRegionInput.mockResolvedValue(withRegion({ language: "pt-PT", region_format: "en-CA" }));
+    renderSection();
+    const l = await lang();
+    expect(l.value).toBe("pt-PT");
+    expect(l.selectedOptions[0].text).toBe("pt-PT");
+    expect(fmt().value).toBe("en-CA");
+    expect(fmt().selectedOptions[0].text).toBe("en-CA");
+  });
+
+  it("names the install's format when a user with none would get it", async () => {
+    api.getRegionInput.mockResolvedValue(withRegion({}, { region_format: "fr-FR" }));
+    renderSection();
+    await lang();
+    expect(fmt().selectedOptions[0].text).toBe("Install default (Français (France))");
+    expect(document.querySelector(".rg-ex")?.textContent).toMatch(/^\d{2}\/\d{2}\/\d{4} · 1\u202f234,56 · \d{2}:\d{2}$/);
+  });
+
+  it("shows the server's message and keeps the saved language when a save fails", async () => {
+    api.getRegionInput.mockResolvedValue(withRegion({ language: "fr-FR" }));
+    api.patchRegionInput.mockRejectedValue(new ApiError(400, "validation_failed", "region.language: must be a language and region such as de-DE or null"));
+    renderSection();
+    fireEvent.change(await lang(), { target: { value: "de-DE" } });
+    await waitFor(() => expect(status()).toMatch(/^region\.language: must be/));
+    expect(screen.getByRole("status").className).toBe("form-error mt3");
+    expect((await lang()).value).toBe("fr-FR");
+  });
+
+  it("says what failed when the error carries no message", async () => {
+    api.patchRegionInput.mockRejectedValue(new Error("network"));
+    renderSection();
+    fireEvent.change(await lang(), { target: { value: "de-DE" } });
+    await waitFor(() => expect(status()).toBe("Could not save your language."));
+    fireEvent.change(fmt(), { target: { value: "en-GB" } });
+    await waitFor(() => expect(status()).toBe("Could not save your region format."));
+  });
+
+  it("runs one save at a time across the timezone, language and format", async () => {
+    let release: (v: unknown) => void = () => {};
+    api.patchRegionInput.mockReturnValue(new Promise((r) => (release = r)));
+    renderSection();
+    fireEvent.change(await lang(), { target: { value: "de-DE" } });
+    await waitFor(() => expect(status()).toBe("Saving…"));
+    expect((await lang()).value).toBe("de-DE");
+    fireEvent.change(fmt(), { target: { value: "en-GB" } });
+    fireEvent.click(option(/Paris/));
+    expect(api.patchRegionInput).toHaveBeenCalledTimes(1);
+    release(withRegion({ language: "de-DE" }));
+    await waitFor(() => expect(status()).toMatch(/^Saved/));
+    expect(fmt().value).toBe("");
   });
 });
 

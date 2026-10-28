@@ -99,8 +99,14 @@ func TestAdmittedLaunchSupersedesAParkedSessionTheReadMissed(t *testing.T) {
 	}
 	var k string
 	must(t, f.pool.QueryRow(ctx, `SELECT id::text FROM sessions WHERE kind = 'parked'`).Scan(&k))
-	if got := readRow(t, f.pool, k); got.State != "stopping" || got.StopReason != StopReasonParkedSuperseded {
-		t.Errorf("parked row %+v, want stopping / parked_superseded", got)
+	// The heartbeat's own dispatch goroutine may reach the agent handshake after
+	// the supersede: it then refuses to bind the no-longer-assigned row, and the
+	// failure on a stopping row is coerced to a clean stop. Both are a superseded
+	// session; what must hold is that the supersede's reason survives and the row
+	// is not failed.
+	got := readRow(t, f.pool, k)
+	if (got.State != "stopping" && got.State != "stopped") || got.StopReason != StopReasonParkedSuperseded {
+		t.Errorf("parked row %+v, want stopping or stopped / parked_superseded", got)
 	}
 }
 

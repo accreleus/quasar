@@ -97,6 +97,18 @@
   max-width: 360px;
 }
 
+/* ---- region: language and region format ---- */
+.os-field-wide {
+  max-width: 560px;
+}
+
+.rg-ex {
+  display: block;
+  margin-top: var(--s1);
+  font-family: var(--font-mono);
+  color: var(--text-2);
+}
+
 /* ---- region: timezone list and world map ---- */
 .tz-pick {
   display: grid;

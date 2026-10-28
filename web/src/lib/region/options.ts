@@ -18,6 +18,11 @@ export const REGION_FORMATS: readonly (readonly [string, string])[] = [
   ["nl-NL", "Nederlands (Nederland)"], ["sv-SE", "Svenska (Sverige)"], ["ja-JP", "日本語 (日本)"],
 ];
 
+/** The list, plus a saved value the list does not carry as itself (the contract takes any `ll-RR`). */
+export function withSaved(list: readonly (readonly [string, string])[], saved: string) {
+  return list.some(([v]) => v === saved) ? list : [...list, [saved, saved] as const];
+}
+
 export interface KeyboardLayoutOption {
   /** xkeyboard-config layout name. */
   layout: string;

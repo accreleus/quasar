@@ -8,7 +8,7 @@ import { IconSearch } from "./icons";
 
 interface FieldProps {
   label: string;
-  hint?: string;
+  hint?: React.ReactNode;
   id?: string;
   children: React.ReactNode;
 }
@@ -54,7 +54,7 @@ export function TextField({ label, hint, id, mono, className, ...rest }: TextFie
 
 interface SelectFieldProps extends SelectHTMLAttributes<HTMLSelectElement> {
   label: string;
-  hint?: string;
+  hint?: React.ReactNode;
   children: React.ReactNode;
 }
 
