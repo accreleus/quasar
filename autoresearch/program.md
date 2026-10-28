@@ -115,3 +115,13 @@ guards, kept, impeccable_finding` (the last is U only; `-` on P).
 Scope: `web/` and `autoresearch/` only, never `protocol/`, the control plane,
 the agent or a contract. A tiny in-scope bug may be fixed. Anything else goes
 in `findings.md`.
+
+## Harness amendments (logged; no metric or keep rule changed)
+
+1. **After exp 02.** The guard's flake re-run aborted (`set -e` on a `grep`
+   with no match) whenever vitest failed with an unhandled error rather than a
+   failing test, so no verdict was written. It now also re-runs the file an
+   unhandled error "originated in". That class is a timer outliving its test:
+   `settingsSearch/reveal.ts` ticks for up to 4 s after
+   `CommandPalette.design.test.tsx` ends (see findings.md). exp 02 is recorded
+   as a test failure. It was discarded on its time-to-usable guard either way.

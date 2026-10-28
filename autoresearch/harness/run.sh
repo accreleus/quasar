@@ -76,7 +76,10 @@ if [ "$guards" = 1 ]; then
     # A vitest-only failure (this machine is shared; tests time out under load) gets
     # ONE re-run of just the failing files. Typecheck/build/drift failures stay failures.
     log=$(sed 's/\x1b\[[0-9;]*m//g' "$H/out/$label.guards.log")
-    files=$(printf '%s\n' "$log" | grep -oE '^ FAIL  src/[^ ]+' | awk '{print $2}' | sort -u | tr '\n' ' ')
+    # Failing files, plus files an unhandled error "originated in" (a timer that
+    # outlives its test). `|| true`: no match must not abort the script (set -e).
+    files=$({ printf '%s\n' "$log" | grep -oE '^ FAIL  src/[^ ]+' | awk '{print $2}'
+              printf '%s\n' "$log" | grep -oE 'originated in "src/[^"]+"' | cut -d'"' -f2; } | sort -u | tr '\n' ' ' || true)
     if printf '%s\n' "$log" | grep -q '^FAIL — web unit tests$' && [ -n "$files" ] && \
        docker run --rm -v "$PWD":/w -v ar-web-nm:/w/web/node_modules -w /w/web node:22 npx vitest run $files >>"$H/out/$label.guards.log" 2>&1; then
       echo "pass (flake re-run: $files)" >"$H/out/$label.guards"
