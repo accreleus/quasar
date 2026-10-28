@@ -34,7 +34,6 @@ const MATCH_HINT: Record<MatchCursor, string> = {
 const SAVED = "Saved. Applies from your next launch.";
 // A keyboard change closes an idle Steam (control-api.md §Saving ends an idle Steam).
 const IDLE_STEAM_CLOSED = " Your idle Steam was closed so it picks this up.";
-const BUILT_IN_KEYBOARD = { layout: "us", variant: "" };
 const SENS_STEP = 0.125;
 const SAVE_DELAY_MS = 400;
 
@@ -76,13 +75,12 @@ export function InputSection() {
   return (
     <div className="card sec-card">
       <ResourceStates loading={res.loading} error={res.errorMessage} />
-      <div className="eyebrow ac-group">Keyboard</div>
-      <KeyboardFields
-        mine={mine?.keyboard ?? null}
-        install={defaults?.keyboard ?? BUILT_IN_KEYBOARD}
-        disabled={!data}
-        onSave={save}
-      />
+      {defaults?.keyboard && (
+        <>
+          <div className="eyebrow ac-group">Keyboard</div>
+          <KeyboardFields mine={mine?.keyboard ?? null} install={defaults.keyboard} disabled={!data} onSave={save} />
+        </>
+      )}
       <div className="eyebrow ac-group os-sub-h">Mouse</div>
       <MatchCursorField
         value={mine?.match_cursor ?? defaults?.match_cursor ?? "auto"}
@@ -134,38 +132,49 @@ export function InputSection() {
 type Keyboard = NonNullable<Input["keyboard"]>;
 
 const layoutName = (layout: string) => KEYBOARDS.find((k) => k.layout === layout)?.label ?? layout;
-// The layout's variants, plus the stored one as itself when the list does not carry it.
+// The layout's variants (the basic one always first), plus the stored one as itself when the list does not carry it.
 const variantsOf = (layout: string, variant: string): readonly (readonly [string, string])[] => {
-  const listed = KEYBOARDS.find((k) => k.layout === layout)?.variants ?? [];
-  return listed.some(([v]) => v === variant) ? listed : [...listed, [variant, variant || "Default"]];
+  const listed = KEYBOARDS.find((k) => k.layout === layout)?.variants ?? [["", "Default"]];
+  return listed.some(([v]) => v === variant) ? listed : [...listed, [variant, variant]];
 };
 const variantName = ({ layout, variant }: Keyboard) => variantsOf(layout, variant).find(([v]) => v === variant)?.[1] ?? variant;
 
 // Unset shows the install's keyboard (Variant locked to it) until a layout is picked; the first
 // option puts it back with `keyboard: null`. A layout change resets the variant, as the admin card does.
+// The pick is held in a draft until its save settles and holds both selects shut meanwhile (as
+// RegionSection does), so a second pick is always made against the first, never the stored value.
 function KeyboardFields({ mine, install, disabled, onSave }: {
   mine: Keyboard | null;
   install: Keyboard;
   disabled: boolean;
   onSave: (patch: Partial<Input>, saved: string) => Promise<void>;
 }) {
-  const shown = mine ?? install;
-  const layouts = !mine || KEYBOARDS.some((k) => k.layout === mine.layout) ? KEYBOARDS : [...KEYBOARDS, { layout: mine.layout, label: mine.layout }];
-  const pick = (keyboard: Keyboard) =>
-    void onSave({ keyboard }, `Saved. Your next launch uses ${layoutName(keyboard.layout)}, ${variantName(keyboard)}.`);
+  const [draft, setDraft] = useState<{ value: Keyboard | null } | null>(null);
+  const current = draft ? draft.value : mine;
+  const shown = current ?? install;
+  const layouts = !current || KEYBOARDS.some((k) => k.layout === current.layout) ? KEYBOARDS : [...KEYBOARDS, { layout: current.layout, label: current.layout, variants: [] }];
+  const save = async (value: Keyboard | null) => {
+    if (draft) return;
+    setDraft({ value });
+    try {
+      await onSave(
+        { keyboard: value },
+        value ? `Saved. Your next launch uses ${layoutName(value.layout)}, ${variantName(value)}.` : "Saved. Your next launch uses the install’s keyboard.",
+      );
+    } finally {
+      setDraft(null);
+    }
+  };
   return (
     <>
       <div className="grid g2 os-field-wide">
         <SelectField
           label="Layout"
           id="keyboard-layout"
-          value={mine?.layout ?? ""}
-          disabled={disabled}
-          onChange={(e) =>
-            e.target.value
-              ? pick({ layout: e.target.value, variant: "" })
-              : void onSave({ keyboard: null }, `Saved. Your next launch uses the install’s keyboard, ${layoutName(install.layout)}, ${variantName(install)}.`)
-          }
+          value={current?.layout ?? ""}
+          disabled={disabled || draft !== null}
+          aria-describedby="keyboard-hint"
+          onChange={(e) => void save(e.target.value ? { layout: e.target.value, variant: "" } : null)}
         >
           <option value="">Same as the install ({layoutName(install.layout)})</option>
           {layouts.map((k) => (
@@ -176,15 +185,16 @@ function KeyboardFields({ mine, install, disabled, onSave }: {
           label="Variant"
           id="keyboard-variant"
           value={shown.variant}
-          disabled={disabled || !mine}
-          onChange={(e) => pick({ layout: shown.layout, variant: e.target.value })}
+          disabled={disabled || draft !== null || !current}
+          aria-describedby="keyboard-hint"
+          onChange={(e) => void save({ layout: shown.layout, variant: e.target.value })}
         >
           {variantsOf(shown.layout, shown.variant).map(([v, name]) => (
             <option key={v} value={v}>{name}</option>
           ))}
         </SelectField>
       </div>
-      <p className="hint mt3">Desktops are set to this layout at every launch, over their own keyboard setting.</p>
+      <p className="hint mt3" id="keyboard-hint">Desktops are set to this layout at every launch, over their own keyboard setting.</p>
     </>
   );
 }

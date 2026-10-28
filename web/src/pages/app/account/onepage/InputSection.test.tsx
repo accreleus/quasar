@@ -13,7 +13,7 @@ vi.mock("../../../../input/capture", () => ({ rawMouseSupported }));
 const body = (input: object = {}, defaults: object = {}) => ({
   region: {},
   input,
-  defaults: { region: {}, input: { match_cursor: "auto", mouse_sensitivity: 1, ...defaults } },
+  defaults: { region: {}, input: { keyboard: { layout: "us", variant: "" }, match_cursor: "auto", mouse_sensitivity: 1, ...defaults } },
 });
 
 beforeEach(() => {
@@ -327,7 +327,7 @@ describe("Input section: Keyboard", () => {
     render(<InputSection />);
     fireEvent.change(await layout(), { target: { value: "" } });
     await waitFor(() => expect(patchRegionInput).toHaveBeenCalledWith("tok", { input: { keyboard: null } }));
-    expect(await screen.findByText(/uses the install’s keyboard, English \(US\), Default/)).toBeInTheDocument();
+    expect(await screen.findByText("Saved. Your next launch uses the install’s keyboard.")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByLabelText("Layout")).toHaveValue(""));
   });
 
@@ -354,5 +354,60 @@ describe("Input section: Keyboard", () => {
     fireEvent.change(el, { target: { value: "gb" } });
     expect(await screen.findByText("bad layout")).toBeInTheDocument();
     expect(el).toHaveValue("");
+  });
+
+  // The Layout pick is held open (its PATCH has not answered) while the user reaches for Variant.
+  const holdPatch = () => {
+    const sent: { body: { input: { keyboard: unknown } }; answer: () => void }[] = [];
+    patchRegionInput.mockImplementation((_t: string, p: { input: { keyboard: unknown } }) => new Promise((resolve) => sent.push({ body: p, answer: () => resolve(body(p.input)) })));
+    return sent;
+  };
+
+  it("while a layout save is out, both selects show the pick and Variant cannot send the stored layout", async () => {
+    getRegionInput.mockResolvedValue(body({ keyboard: { layout: "us", variant: "" } }));
+    const sent = holdPatch();
+    render(<InputSection />);
+    fireEvent.change(await layout(), { target: { value: "fr" } });
+    await waitFor(() => expect(screen.getByLabelText("Layout")).toHaveValue("fr"));
+    expect(screen.getByLabelText("Layout")).toBeDisabled();
+    expect(variant()).toBeDisabled();
+    expect([...variant().options].map((o) => o.textContent)).toEqual(["Default (AZERTY)", "BÉPO", "AFNOR"]);
+    fireEvent.change(variant(), { target: { value: "bepo" } });
+    expect(sent).toHaveLength(1);
+    sent[0].answer();
+    expect(await screen.findByText("Saved. Your next launch uses French, Default (AZERTY).")).toBeInTheDocument();
+    expect(sent).toHaveLength(1);
+    await waitFor(() => expect(screen.getByLabelText("Layout")).toHaveValue("fr"));
+  });
+
+  it("while 'Same as the install' is out, a Variant pick cannot undo it", async () => {
+    getRegionInput.mockResolvedValue(body({ keyboard: { layout: "gb", variant: "" } }));
+    const sent = holdPatch();
+    render(<InputSection />);
+    fireEvent.change(await layout(), { target: { value: "" } });
+    await waitFor(() => expect(screen.getByLabelText("Layout")).toHaveValue(""));
+    fireEvent.change(variant(), { target: { value: "dvorak" } });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].body).toEqual({ input: { keyboard: null } });
+    sent[0].answer();
+    await screen.findByText("Saved. Your next launch uses the install’s keyboard.");
+    expect(sent).toHaveLength(1);
+  });
+
+  it("a layout outside the list can go back to its basic variant", async () => {
+    getRegionInput.mockResolvedValue(body({ keyboard: { layout: "ru", variant: "winkeys" } }));
+    render(<InputSection />);
+    await waitFor(() => expect(variant()).toHaveValue("winkeys"));
+    expect([...variant().options].map((o) => o.textContent)).toEqual(["Default", "winkeys"]);
+    await waitFor(() => expect(variant()).toBeEnabled());
+    fireEvent.change(variant(), { target: { value: "" } });
+    await waitFor(() => expect(patchRegionInput).toHaveBeenCalledWith("tok", { input: { keyboard: { layout: "ru", variant: "" } } }));
+  });
+
+  it("links the hint to both selects", async () => {
+    render(<InputSection />);
+    await layout();
+    expect(screen.getByLabelText("Layout")).toHaveAccessibleDescription(/Desktops are set to this layout/);
+    expect(variant()).toHaveAccessibleDescription(/Desktops are set to this layout/);
   });
 });
