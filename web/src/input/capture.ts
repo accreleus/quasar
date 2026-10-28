@@ -461,10 +461,27 @@ export function setupCapture({
   /**
    * Engage from a user gesture. A refused lock on a lock-capable device is
    * `failed` and engages nothing — never silently degrade a desktop to
-   * no-mouse-look. Never `await`s before requestPointerLock: that would spend
-   * the user gesture the API requires.
+   * no-mouse-look. Never `await`s before its first requestPointerLock: that would
+   * spend the user gesture the API requires. (Raw mouse's plain retry does wait on the
+   * refusal; the gesture's transient activation, about 5 s, outlasts it.)
+   * With raw mouse on, one request sequence at a time: an engage while the raw-then-plain
+   * sequence is pending returns its result and asks the browser for nothing, so a double tap
+   * cannot interleave the two requests. A release() in between lifts that (a new request is
+   * wanted); with raw off, requests queue as before (#524).
    */
-  const engage = async (): Promise<EngageResult> => {
+  let pendingRaw: Promise<EngageResult> | null = null;
+  const engage = (): Promise<EngageResult> => {
+    if (pendingRaw && wanted) return pendingRaw;
+    const sequence = requestEngage();
+    if (mouseSettings.raw) {
+      pendingRaw = sequence;
+      void sequence.finally(() => {
+        if (pendingRaw === sequence) pendingRaw = null;
+      });
+    }
+    return sequence;
+  };
+  const requestEngage = async (): Promise<EngageResult> => {
     wanted = true;
     if (captured) {
       return { mode: pointerLocked ? "pointer-lock" : "fallback" };
