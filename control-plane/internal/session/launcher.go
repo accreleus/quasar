@@ -1023,6 +1023,11 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 		}
 		capable := epoch != nil && epoch.SupportsHomeCleanup()
 		hold, err := c.store.bindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable, expected)
+		if errors.Is(err, errSessionNotAssigned) {
+			// Whoever took the row owns its outcome and nothing reached the agent; a
+			// failure here would audit a session.failed for a clean stop.
+			return false
+		}
 		if err != nil {
 			c.log.Error("managed home dispatch binding failed", "session_id", sessionID, "err", err)
 			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "managed home dispatch binding failed")

@@ -111,6 +111,9 @@ func expectedHomeDispatch(app LaunchApp) homeDispatchExpectation {
 	return homeDispatchExpectation{canonical: homeAppID(app), managed: app.ManagedHome, target: app.HomeContainerPath}
 }
 
+// errSessionNotAssigned: a stop or reap took the row before its dispatch bound the home.
+var errSessionNotAssigned = errors.New("session is no longer assigned")
+
 func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID string, spec []byte, capable bool, expected *homeDispatchExpectation) (*HomeHoldDecision, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -140,7 +143,10 @@ func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 	if !managed {
 		return nil, nil
 	}
-	if state != StateAssigned || hostID == nil {
+	if state != StateAssigned {
+		return nil, errSessionNotAssigned
+	}
+	if hostID == nil {
 		return nil, errors.New("session is not assigned to a host")
 	}
 	var claimHost *string
