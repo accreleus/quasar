@@ -4,9 +4,10 @@
  * action button, and dismissal.
  */
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode } from "react";
 import { describe, expect, it, vi } from "vitest";
 
-import { ToastProvider, useToast, type ToastVariant } from "./Toast";
+import { ToastHost, ToastProvider, useToast, type ToastVariant } from "./Toast";
 
 function Trigger({ variant, body }: { variant: ToastVariant; body?: string }) {
   const { addToast } = useToast();
@@ -75,5 +76,32 @@ describe("Toast", () => {
     });
     expect(screen.queryByRole("status")).toBeNull();
     vi.useRealTimers();
+  });
+
+  describe("auto-dismiss timer", () => {
+    const toast = { id: "t1", variant: "info" as const, title: "hi" };
+
+    it("does not outlive its toast", () => {
+      vi.useFakeTimers();
+      const onRemove = vi.fn();
+      const { unmount } = render(<ToastHost toasts={[toast]} onRemove={onRemove} />);
+      unmount();
+      vi.advanceTimersByTime(5000);
+      expect(onRemove).not.toHaveBeenCalled();
+      vi.useRealTimers();
+    });
+
+    it("runs once under StrictMode", () => {
+      vi.useFakeTimers();
+      const onRemove = vi.fn();
+      render(
+        <StrictMode>
+          <ToastHost toasts={[toast]} onRemove={onRemove} />
+        </StrictMode>,
+      );
+      vi.advanceTimersByTime(5000);
+      expect(onRemove).toHaveBeenCalledTimes(1);
+      vi.useRealTimers();
+    });
   });
 });
