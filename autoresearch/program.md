@@ -131,3 +131,11 @@ in `findings.md`.
 Stopped after 15 experiments (12 P, 3 U). Track U had nothing left that its metric can see in
 scope: axe was at 0, and the remaining detect hits are the sanctioned hint type role. A
 change aimed at them would be restyling against DESIGN.md. See summary.md.
+
+## Round 2 (lead, after the first report): exp 16–20
+
+The same frozen harness and keep rule, on the same branch, spending the 5 remaining
+experiments on the "try next" list. All 20 are now used. The kept head was re-measured as
+`k15` first (its build had been cleaned up), and exp 16–20 are interleaved against it.
+`probes/first-open.mjs` is a supplementary measurement outside the harness, never a keep
+criterion.

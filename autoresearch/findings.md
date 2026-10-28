@@ -53,3 +53,32 @@
   The styleguide page did it too, rendering a live `CommandPalette`. A
   bundle-size budget for the entry chunk in `make test-web` would catch a
   regression.
+
+## Round 2 (exp 16–20)
+
+- **Lazy routes cost about 300 ms on first open, and most of it is React, not
+  the network.** The probe (`probes/first-open.mjs`, outside the frozen
+  harness) times a click from a usable library page to the page rendered,
+  under the same CPU ×4 / 20 Mbit / 40 ms profile. Baseline (eager) against
+  exp 20: game page **89 → 392 ms**, session view **62 → 351 ms**
+  (`probes/first-open-base-vs-exp20.json`). The cost is flat at about 300 ms,
+  which matches React's throttle on revealing content after a Suspense
+  fallback has shown. This corrects round 1's "one round trip" caveat. The
+  cure is the one exp 20 uses for the account area: start the chunk early
+  (on hover or focus of a tile, or at idle), then hand `React.lazy` a
+  thenable that resolves synchronously once the module is in, so no fallback
+  is ever committed. **Do not land the exp 01/03 splits without it.**
+- **The admin console is the binding constraint on splitting.** Every split
+  that moved code shared with admin pages (exp 02, 04, 10, 16, 17, 18) failed
+  the Settings or account time guard. Route preloads from `index.html` (exp 19)
+  turned Settings from a loss into a win (−55 to −65 ms). The setup-wizard
+  split (exp 17: −18.7 KB for players) is still blocked: Settings +69 ms. It
+  would likely pass with the exp 19/20 preload map extended to
+  `api/admin`'s chunk; that is untested, because the budget ran out.
+- **exp 16's first run was contaminated** (load 43.8 at start; the harness
+  gate gives up after 10 minutes and proceeds anyway). It was re-run at
+  load 2.9. Both runs are logged, and the clean run decided it.
+- **exp 20 relies on a React.lazy implementation detail** (a thenable that
+  calls back synchronously is read without suspending). It held under React
+  19.3 here. A React upgrade should keep a test that a deep link to
+  `/app/account` renders without the route skeleton.
