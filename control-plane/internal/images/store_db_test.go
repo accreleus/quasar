@@ -56,9 +56,9 @@ func (f failingFetcher) Fetch(_ context.Context, _ string) ([]byte, error) {
 	return nil, f.err
 }
 
-// TestCatalogRefDefaultsMainWhenUnseeded — the column default an unseeded
+// TestCatalogRefDefaultsStableWhenUnseeded — the column default an unseeded
 // instance must read (migration 0054).
-func TestCatalogRefDefaultsMainWhenUnseeded(t *testing.T) {
+func TestCatalogRefDefaultsStableWhenUnseeded(t *testing.T) {
 	pool := testDB(t)
 	s := NewStore(pool)
 	ref, err := s.CatalogRef(context.Background())
@@ -66,7 +66,7 @@ func TestCatalogRefDefaultsMainWhenUnseeded(t *testing.T) {
 		t.Fatalf("catalog ref: %v", err)
 	}
 	if ref != "stable" {
-		t.Fatalf("unseeded catalog ref: got %q want main", ref)
+		t.Fatalf("unseeded catalog ref: got %q want stable", ref)
 	}
 }
 
