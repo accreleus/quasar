@@ -11,6 +11,9 @@
 # other's rows and run side by side. TEST_DATABASE_URL names the server and a database
 # the user can connect to; that database is only used to create the others.
 #
+# GTP_ONLY and GTP_SKIP, extended regexes on the import path, choose a subset of the
+# packages, so CI can give a slow package a runner of its own (#928).
+#
 # Needs `psql` and `flock`. -j defaults to the CPU count. Flags after -j go to every
 # `go test`. Exit status is 1 when any package failed; the failed ones are listed last.
 set -euo pipefail
@@ -41,7 +44,9 @@ trap 'rm -rf "$GTP_LOGS"' EXIT
 # start early and do not finish alone at the end.
 go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{len .TestGoFiles}} {{len .XTestGoFiles}} {{.ImportPath}}{{end}}' ./... |
   awk 'NF == 3 { print $1 + $2, $3 }' | sort -rn | cut -d' ' -f2 > "$GTP_LOGS/packages"
-[ -s "$GTP_LOGS/packages" ] || { echo "go-test-parallel: no test packages found" >&2; exit 2; }
+if [ -n "${GTP_ONLY:-}" ]; then grep -E "$GTP_ONLY" "$GTP_LOGS/packages" > "$GTP_LOGS/picked" || true; mv "$GTP_LOGS/picked" "$GTP_LOGS/packages"; fi
+if [ -n "${GTP_SKIP:-}" ]; then grep -vE "$GTP_SKIP" "$GTP_LOGS/packages" > "$GTP_LOGS/picked" || true; mv "$GTP_LOGS/picked" "$GTP_LOGS/packages"; fi
+[ -s "$GTP_LOGS/packages" ] || { echo "go-test-parallel: no test packages found (GTP_ONLY='${GTP_ONLY:-}' GTP_SKIP='${GTP_SKIP:-}')" >&2; exit 2; }
 
 # Packages that run alone, after the others. An entry is a package whose tests missed a
 # wall-clock wait beside other packages on the shared server and never alone; it names its
@@ -98,7 +103,8 @@ start=$SECONDS
 # Compile every test binary first, at full parallelism: a compile error stops here with
 # one message instead of in whichever packages it reaches, and the timed runs below do not
 # share the CPU with compilers. -run '^$' runs no test, only each package's TestMain.
-if ! go test "$@" -run '^$' ./... > "$GTP_LOGS/build.log" 2>&1; then
+mapfile -t picked < "$GTP_LOGS/packages"
+if ! go test "$@" -run '^$' "${picked[@]}" > "$GTP_LOGS/build.log" 2>&1; then
   cat "$GTP_LOGS/build.log"
   echo "go-test-parallel: the test binaries did not build (or a TestMain failed)" >&2
   exit 1
@@ -106,7 +112,9 @@ fi
 echo "go-test-parallel: test binaries built in $((SECONDS - start)) s"
 xargs -P "$jobs" -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/together" || true
 xargs -P 1 -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/alone" || true
-echo "go-test-parallel: $(wc -l < "$GTP_LOGS/together") packages $jobs at a time, then alone: $(tr '\n' ' ' < "$GTP_LOGS/alone")($((SECONDS - start)) s)"
+alone_note=""
+[ -s "$GTP_LOGS/alone" ] && alone_note=", then alone: $(tr '\n' ' ' < "$GTP_LOGS/alone")"
+echo "go-test-parallel: $(wc -l < "$GTP_LOGS/together") packages $jobs at a time${alone_note} ($((SECONDS - start)) s)"
 # Every package must have been started: a run_package that never ran must not read as green.
 touch "$GTP_LOGS/ran"
 ran="$(sort -u "$GTP_LOGS/ran" | wc -l)"

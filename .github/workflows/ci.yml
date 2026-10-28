@@ -83,13 +83,29 @@ jobs:
             || { echo "::error::ci-changed-areas.sh gave an unusable answer: $out"; exit 1; }
           echo "$out" | tee -a "$GITHUB_OUTPUT"
 
-  go:
-    name: control-plane (build + vet + test)
+  # The control-plane tests are two jobs, each with its own Postgres: `session`, the slowest
+  # package (about 175 s alone, 250-290 s sharing a runner), and every other package beside it
+  # (#928). `control-plane (build + vet + test)` is the check main requires, so it is the one
+  # that gathers them.
+  go-tests:
+    name: control-plane tests (${{ matrix.part }})
     needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     # Measured 2026-10: about 3 min of tests on a cold build cache. 30 fails a stall early.
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: build, vet, most packages
+            skip: /internal/session$
+            only: ''
+            static: true
+          - part: session
+            skip: ''
+            only: /internal/session$
+            static: false
     defaults:
       run:
         working-directory: control-plane
@@ -125,14 +141,17 @@ jobs:
           go-version: '1.26.10'
           cache-dependency-path: control-plane/go.sum
       - name: gofmt
+        if: matrix.static
         run: |
           out="$(gofmt -l ./cmd ./internal ./migrations 2>/dev/null || true)"
           if [ -n "$out" ]; then
             echo "gofmt drift in:" && echo "$out" && exit 1
           fi
       - name: Build
+        if: matrix.static
         run: go build ./...
       - name: Vet
+        if: matrix.static
         run: go vet ./...
       # The database is thrown away with the job, so crash safety buys nothing: without
       # fsync the DB-heavy packages run about twice as fast. These settings need only a reload.
@@ -151,7 +170,27 @@ jobs:
       - name: Test (with Postgres)
         env:
           TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/quasar?sslmode=disable
+          GTP_ONLY: ${{ matrix.only }}
+          GTP_SKIP: ${{ matrix.skip }}
         run: bash "$GITHUB_WORKSPACE/scripts/verify/go-test-parallel.sh" -count=1
+
+  go:
+    name: control-plane (build + vet + test)
+    needs: [changes, go-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gather the control-plane jobs
+        env:
+          WANTED: ${{ needs.changes.outputs.go }}
+          CHANGES: ${{ needs.changes.result }}
+          TESTS: ${{ needs.go-tests.result }}
+        run: |
+          echo "changes=$CHANGES go=$WANTED tests=$TESTS"
+          [ "$CHANGES" = success ] || { echo "::error::the changed-areas job did not succeed"; exit 1; }
+          [ "$WANTED" = true ] || { echo "no control-plane change: nothing to gather"; exit 0; }
+          [ "$TESTS" = success ] || { echo "::error::a control-plane job did not pass"; exit 1; }
 
   # The web suite is three jobs so the slow part, vitest (about 4 min in one job, half of
   # it jsdom start-up per file), runs in two halves beside typecheck + build. `web` is the
