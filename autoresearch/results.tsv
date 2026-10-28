@@ -3,3 +3,4 @@ n	track	hypothesis	primary_before	primary_after	guards	kept	impeccable_finding
 02	P	lazy-load the account area (layout, sections, every account page)	260794	235946	tests=fail;ttu=app:577->577/account:750->914/settings:774->834;px_max=0.00000	no	-
 03	P	lazy-load the game page route	260794	254086	tests=pass;ttu=app:627->622/account:797->787/settings:756->749;px_max=0.00000	yes	-
 04	P	lazy-load routes a signed-in player never visits (setup wizard, register, styleguide)	254086	230622	tests=pass;ttu=app:604->578/account:759->755/settings:774->847;px_max=0.00000	no	-
+05	P	lazy-load the command palette (mount it on first open; shortcuts stay eager)	254086	254164	tests=pass;ttu=app:597->594/account:764->763/settings:779->769;px_max=0.00000	no	-
