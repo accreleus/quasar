@@ -320,7 +320,7 @@
   justify-content: space-between;
   gap: var(--s3);
   margin-top: var(--s2);
-  color: var(--text-4);
+  color: var(--text-3);
   font-size: var(--t-xs);
 }
 
