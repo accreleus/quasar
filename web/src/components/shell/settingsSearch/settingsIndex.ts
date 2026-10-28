@@ -76,6 +76,11 @@ export const ACCOUNT_SETTINGS: readonly SettingEntry[] = [
     keywords: "mouse speed fast slow sensitivity dpi pointer cursor",
     target: { sel: "#mouse-sensitivity", up: ".field" },
   },
+  {
+    id: "acct-raw-mouse", label: "Raw mouse input (no acceleration)", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse acceleration raw unadjusted movement pointer lock chrome edge",
+    target: { sel: "#raw-mouse", up: ".ac-sw" },
+  },
   sec("overlay", "In-session overlay", "overlay", "overlay", "hud strip overlay stats"),
   {
     id: "acct-overlay-preset", label: "Overlay content", where: "Overlay", icon: "overlay", to: `${A}/overlay`,
