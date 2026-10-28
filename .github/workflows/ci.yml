@@ -1,21 +1,39 @@
 name: CI
 
-# Runs on every pull request. The 2026-07-06 manual-only directive was a COST
-# decision: automatic triggers exhausted a private account's Actions minutes.
-# Public repositories get them free, and the tradeoff inverted on 2026-08-31 —
-# an open repo where nobody can tell whether an incoming change compiles is the
-# worse failure. These three jobs are the required checks for a merge to main.
+# The 2026-07-06 manual-only directive was a COST decision: automatic triggers exhausted
+# a private account's Actions minutes. Public repositories get them free, and the
+# tradeoff inverted on 2026-08-31: an open repo where nobody can tell whether an incoming
+# change compiles is the worse failure.
 #
-# Not on push: develop takes direct merges by design, and the local gates
-# (make test-db, make test-web, the devtools container) stay the primary signal
-# for work in progress. A dispatch still works for checking a branch by hand.
+# Two automatic triggers (#919):
+#
+#   push to develop        EVERY job. These runs are the checks main's branch protection
+#                          requires: GitHub matches a required check by name on the head
+#                          commit, whatever event made it, so the develop -> main release
+#                          pull request is satisfied by the push run on the same commit and
+#                          does not run CI a second time. They also save the caches every
+#                          pull request restores (a cache saved by a pull request is visible
+#                          to that pull request only).
+#   pull request -> develop only the jobs whose area the change touches
+#                          (scripts/verify/ci-changed-areas.sh, table-tested in `changes`).
+#                          develop requires no checks, and a skipped job counts as passed
+#                          for main's. A wrong "skip" is caught by the push run after landing.
+#
+# A pull request into main from any branch but develop gets no automatic run: dispatch
+# this workflow on its branch (the runs attach to its head commit) before asking for
+# sign-off.
 on:
+  push:
+    branches: [develop]
   pull_request:
+    branches: [develop]
   workflow_dispatch:
 
+# A newer push to a pull request cancels its older run. On develop runs queue instead: a
+# dispatch there must not cancel the tip's push run, which carries main's required checks.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Read-only. No job here publishes anything, so nothing may inherit a write scope —
 # including a job added later. Every third-party action below is pinned to a full
@@ -25,9 +43,53 @@ permissions:
   contents: read
 
 jobs:
+  # Which areas does this pull request touch? Every area on a push or a dispatch.
+  changes:
+    name: changed areas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      go: ${{ steps.areas.outputs.go }}
+      web: ${{ steps.areas.outputs.web }}
+      rust: ${{ steps.areas.outputs.rust }}
+      site: ${{ steps.areas.outputs.site }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/verify
+          persist-credentials: false
+      - name: Table test the area map
+        run: bash scripts/verify/test-ci-changed-areas.sh
+      - name: Decide
+        id: areas
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          all() { printf 'go=true\nweb=true\nrust=true\nsite=true\n' | tee -a "$GITHUB_OUTPUT"; }
+          if [ "$EVENT" != pull_request ]; then echo "$EVENT: every job runs"; all; exit 0; fi
+          # A rename counts on both sides: moving a file out of web/ still concerns web.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)' > "$RUNNER_TEMP/changed"
+          # The files API lists at most 3000; a list that long may be cut short, so run everything.
+          if [ "$(wc -l < "$RUNNER_TEMP/changed")" -ge 3000 ]; then echo "3000+ paths: every job runs"; all; exit 0; fi
+          out="$(bash scripts/verify/ci-changed-areas.sh < "$RUNNER_TEMP/changed")"
+          [ "$(grep -c -E '^(go|web|rust|site)=(true|false)$' <<<"$out")" -eq 4 ] \
+            || { echo "::error::ci-changed-areas.sh gave an unusable answer: $out"; exit 1; }
+          echo "$out" | tee -a "$GITHUB_OUTPUT"
+
   go:
     name: control-plane (build + vet + test)
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    # Measured 2026-10: about 3 min of tests on a cold build cache. 30 fails a stall early.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: control-plane
@@ -55,10 +117,12 @@ jobs:
       # false gofmt-drift failures. Must stay >= go.mod's `go` directive
       # (currently 1.26.0): setup-go v7 runs with GOTOOLCHAIN=local, so an
       # older pin no longer silently auto-downloads the newer toolchain — it
-      # fails the build outright.
+      # fails the build outright. An EXACT patch, never `1.26.x`: `.x` resolves to
+      # whichever patch the runner image carries, the patch is part of the cache key,
+      # and two runner images in rotation meant half the runs missed the cache (#919).
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.26.10'
           cache-dependency-path: control-plane/go.sum
       - name: gofmt
         run: |
@@ -70,17 +134,35 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
-      # -p 1 is mandatory: the DB integration tests share one database and
-      # truncate in setup, so package binaries must not run concurrently
-      # (see CLAUDE.md "Build / test").
+      # The database is thrown away with the job, so crash safety buys nothing: without
+      # fsync the DB-heavy packages run about twice as fast. These settings need only a reload.
+      - name: Postgres without durability
+        env:
+          DB: postgres://postgres:test@localhost:5432/quasar?sslmode=disable
+        run: |
+          for s in fsync synchronous_commit full_page_writes; do
+            psql "$DB" -X -q -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET $s = off"
+          done
+          psql "$DB" -X -q -v ON_ERROR_STOP=1 -c "SELECT pg_reload_conf()"
+      # Every package against its own database, four at a time (#919). `go test -p 1 ./...`
+      # ran them one after another because they shared one database and truncate it.
+      # -count=1: a cached pass must never stand in for a test that reads a file outside
+      # the module, such as protocol/openapi.yaml (#883).
       - name: Test (with Postgres)
         env:
           TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/quasar?sslmode=disable
-        run: go test -p 1 ./...
+        run: bash "$GITHUB_WORKSPACE/scripts/verify/go-test-parallel.sh" -count=1
 
-  web:
-    name: web (typecheck + build + vitest)
+  # The web suite is three jobs so the slow part, vitest (about 4 min in one job, half of
+  # it jsdom start-up per file), runs in two halves beside typecheck + build. `web` is the
+  # check main requires, so it is the one that gathers them: it fails unless both halves
+  # and the build passed (#919).
+  web-build:
+    name: web (typecheck + build)
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: web
@@ -99,8 +181,50 @@ jobs:
         run: npm run typecheck
       - name: Build
         run: npm run build
+
+  web-vitest:
+    name: web vitest (${{ matrix.shard }}/2)
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci
       - name: Unit tests
-        run: npm test -- run
+        run: npm test -- run --shard=${{ matrix.shard }}/2
+
+  web:
+    name: web (typecheck + build + vitest)
+    needs: [changes, web-build, web-vitest]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gather the web jobs
+        env:
+          WANTED: ${{ needs.changes.outputs.web }}
+          CHANGES: ${{ needs.changes.result }}
+          BUILD: ${{ needs.web-build.result }}
+          VITEST: ${{ needs.web-vitest.result }}
+        run: |
+          echo "changes=$CHANGES web=$WANTED build=$BUILD vitest=$VITEST"
+          [ "$CHANGES" = success ] || { echo "::error::the changed-areas job did not succeed"; exit 1; }
+          [ "$WANTED" = true ] || { echo "no web change: nothing to gather"; exit 0; }
+          [ "$BUILD" = success ] && [ "$VITEST" = success ] || { echo "::error::a web job did not pass"; exit 1; }
 
   # site/ generates the operator-facing install artifacts: the quick-start
   # compose file, .env and one-paste script. Its tests are the only thing
@@ -109,7 +233,10 @@ jobs:
   # manually dispatched, so a regression could reach main unnoticed.
   site:
     name: site (install artifacts + docs build)
+    needs: changes
+    if: needs.changes.outputs.site == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: site
@@ -134,6 +261,8 @@ jobs:
 
   rust:
     name: node-agent (fmt + clippy + test)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     # Measured 2026-10: 5 min median, under 11 min at worst with a slow apt step. 30 leaves room
     # for a cold rust-cache and fails a stall in half an hour, not the 6-hour default (#864).
@@ -144,12 +273,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The .deb set is cached on the package list and the runner image, so a runner upgrade
-      # never installs debs the new image's mirror pins have moved past. A save from a PR run
-      # is visible to that PR only; a run on develop (a dispatch) seeds it for every PR.
+      # never installs debs the new image's mirror pins have moved past. Only a push to
+      # develop saves it (a pull request's save is visible to that pull request alone, and
+      # those copies pushed the repository over its 10 GB cache limit, #919).
       - name: Runner image
         id: image
         run: echo "id=${ImageOS:-}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: apt
         with:
           path: ${{ runner.temp }}/apt-debs
           key: apt-debs-${{ steps.image.outputs.id }}-${{ hashFiles('.github/ci-apt/node-agent.txt', 'scripts/verify/ci-apt-install.sh') }}
@@ -157,6 +288,11 @@ jobs:
       # ubuntu-24.04 (ubuntu-latest) ships gst 1.24. webrtc/sdp live in -bad.
       - name: Install GStreamer dev packages
         run: bash "$GITHUB_WORKSPACE/scripts/verify/ci-apt-install.sh" "$GITHUB_WORKSPACE/.github/ci-apt/node-agent.txt" "$RUNNER_TEMP/apt-debs"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push' && steps.apt.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: ${{ steps.apt.outputs.cache-primary-key }}
       # This action picks the toolchain from the REF NAME it was used at, so pinning to a
       # sha means `toolchain:` has to be passed explicitly or nothing selects one.
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -166,6 +302,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: node-agent
+          save-if: ${{ github.event_name == 'push' }}
       - name: rustfmt
         run: cargo fmt --all --check
       - name: Clippy
@@ -177,20 +314,75 @@ jobs:
       # every unit test and fails every session launch. Root is needed for
       # /dev/uinput, the fake-udev mknod and /run/udev/data;
       # QUASAR_REQUIRE_UINPUT turns a missing module into a failure, not a skip.
+      # --workspace selects the same packages, so the same features, as the Test step: the
+      # test binary it built is reused instead of the agent crate compiling again (#919).
       - name: Load uinput
         run: sudo modprobe uinput && ls -l /dev/uinput
       - name: Test against the real uinput
-        run: sudo -E env "PATH=$PATH" QUASAR_REQUIRE_UINPUT=1 cargo test --lib uinput_ -- --ignored --test-threads=1
+        run: sudo -E env "PATH=$PATH" QUASAR_REQUIRE_UINPUT=1 cargo test --workspace --lib uinput_ -- --ignored --test-threads=1
 
   # RH-07 #408: the runtime's behavioural suite against each engine mode a hosted runner
   # can host. One job per mode; the assertions are the same for all of them. What a
   # hosted runner cannot give (a GPU, DRM nodes, a uinput group rule) is declared, so
   # those cases report SKIP with the reason; the lab runs them (docs/testing-engine-suite.md).
+  # The suite is built once and handed to the four modes; it links only libc
+  # (scripts/verify/engine-suite-build.sh), so the mode jobs install no GStreamer (#919).
+  engines-build:
+    name: engine suite (build)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    # Measured 2026-10: 1-3 min without a stalled apt step. 20 is headroom for a cold rust-cache (#864).
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The suite links the agent crate, which needs the same headers as the rust job.
+      - name: Runner image
+        id: image
+        run: echo "id=${ImageOS:-}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: apt
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: apt-debs-${{ steps.image.outputs.id }}-${{ hashFiles('.github/ci-apt/engines.txt', 'scripts/verify/ci-apt-install.sh') }}
+      - name: Install GStreamer dev packages
+        run: bash scripts/verify/ci-apt-install.sh .github/ci-apt/engines.txt "$RUNNER_TEMP/apt-debs"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push' && steps.apt.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: ${{ steps.apt.outputs.cache-primary-key }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: node-agent
+          shared-key: engine-suite
+          save-if: ${{ github.event_name == 'push' }}
+      - name: Build the suite
+        working-directory: node-agent
+        run: |
+          set -euo pipefail
+          exe="$(cargo test -p quasar-node-agent --test engine_suite --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "engine_suite") | .executable // empty')"
+          test -n "$exe"
+          mkdir -p "$RUNNER_TEMP/engine-suite"
+          cp "$exe" "$RUNNER_TEMP/engine-suite/engine-suite"
+          ldd "$RUNNER_TEMP/engine-suite/engine-suite" || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: engine-suite
+          path: ${{ runner.temp }}/engine-suite/engine-suite
+          retention-days: 1
+          if-no-files-found: error
+
   engines:
     name: engine suite (${{ matrix.target }})
+    needs: [changes, engines-build]
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    # Measured 2026-10: 2-5 min without a stalled apt step. 20 is headroom for a cold rust-cache (#864).
-    timeout-minutes: 20
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -207,33 +399,13 @@ jobs:
               podman-rootless:restart=Podman 4.9 has no restart-policy update (Engine) - Quasar needs Podman 5.1 and refuses older (#424)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The suite links the agent crate, which needs the same headers as the rust job.
-      # The .deb set is cached on the package list and the runner image, so a runner upgrade
-      # never installs debs the new image's mirror pins have moved past. A save from a PR run
-      # is visible to that PR only; a run on develop (a dispatch) seeds it for every PR.
-      - name: Runner image
-        id: image
-        run: echo "id=${ImageOS:-}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/apt-debs
-          key: apt-debs-${{ steps.image.outputs.id }}-${{ hashFiles('.github/ci-apt/engines.txt', 'scripts/verify/ci-apt-install.sh') }}
-      - name: Install GStreamer dev packages
-        run: bash scripts/verify/ci-apt-install.sh .github/ci-apt/engines.txt "$RUNNER_TEMP/apt-debs"
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+          sparse-checkout: scripts/verify
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: node-agent
-          shared-key: engine-suite
-      - name: Build the suite
-        working-directory: node-agent
-        run: |
-          cargo test -p quasar-node-agent --test engine_suite --no-run --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "engine_suite") | .executable // empty' \
-            > "$RUNNER_TEMP/engine-suite-path"
-          test -s "$RUNNER_TEMP/engine-suite-path"
+          name: engine-suite
+          path: ${{ runner.temp }}/engine-suite
       - name: Start ${{ matrix.target }}
         run: bash scripts/verify/ci-engine-target.sh "${{ matrix.target }}"
       - name: Run the suite
@@ -244,7 +416,9 @@ jobs:
             dri=a hosted runner has no DRM node;
             uinput=a hosted runner loads no uinput and has no host-preparation group rule for it
         run: |
-          suite="$(cat "$RUNNER_TEMP/engine-suite-path")"
+          suite="$RUNNER_TEMP/engine-suite/engine-suite"
+          # An artifact does not keep the execute bit.
+          chmod 0755 "$suite"
           if [ "${ENGINE_SUITE_AS_ROOT:-}" = 1 ]; then
             sudo --preserve-env=QUASAR_ENGINE_SUITE_TARGETS,QUASAR_ENGINE_SUITE_LACKS,QUASAR_ENGINE_SUITE_KNOWN "$suite"
           else
