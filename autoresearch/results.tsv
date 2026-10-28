@@ -9,3 +9,4 @@ n	track	hypothesis	primary_before	primary_after	guards	kept	impeccable_finding
 08	P	lazy-load the overlay preview (real HUD, telemetry model, hud.css) in Account > In-session overlay	245989	210783	tests=pass;ttu=app:578->556/account:746->722/settings:751->730;px_max=0.00000	yes	-
 09	P	move the pointer-lock/raw-mouse/touch probes out of input/capture.ts so the capture engine leaves the entry	210783	206883	tests=pass;ttu=app:550->545/account:718->718/settings:733->726;px_max=0.00000	yes	-
 10	P	lazy-load the setup wizard with small common chunks inlined (rolldown experimentalInlineCommonChunks)	206883	197325	tests=pass;ttu=app:553->542/account:713->717/settings:728->815;px_max=0.00000	no	-
+11	P	split the trigger place/label helpers out of settingsIndex so the settings-search index leaves the entry	206883	203426	tests=pass;ttu=app:544->540/account:711->712/settings:727->732;px_max=0.00000	yes	-
