@@ -109,7 +109,7 @@
   color: var(--text-2);
 }
 
-/* ---- region: timezone list (the map beside it is #847) ---- */
+/* ---- region: timezone list and world map ---- */
 .tz-pick {
   display: grid;
   grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
@@ -231,6 +231,99 @@
   pointer-events: none;
 }
 
+/* Land dots are zero-length path segments drawn round by the stroke. */
+.tz-map {
+  position: relative;
+  min-width: 0;
+  padding: var(--s3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-panel);
+  background: color-mix(in oklch, var(--surf-inset) 76%, transparent);
+}
+
+.tz-map[aria-busy="true"] {
+  opacity: .6;
+}
+
+.tz-map svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  cursor: crosshair;
+  touch-action: manipulation;
+  user-select: none; /* a double-click picks a zone, not the label text */
+}
+
+.tz-map .land {
+  fill: none;
+  stroke: var(--line-3);
+  stroke-width: 4.2;
+  stroke-linecap: round;
+  transition: stroke .12s ease;
+}
+
+.tz-map .land.is-hover {
+  stroke: var(--text-2);
+}
+
+.tz-map .land.is-sel {
+  stroke: var(--accent);
+}
+
+.tz-map .city {
+  fill: var(--text);
+}
+
+.tz-map .mk-ring {
+  fill: var(--accent-soft);
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.tz-map .mk-dot {
+  fill: var(--text);
+  stroke: var(--accent);
+  stroke-width: 3.5;
+}
+
+.tz-map .mk-lbl rect {
+  fill: var(--pop-bg);
+  stroke: var(--glass-border);
+}
+
+.tz-map .mk-lbl text {
+  fill: var(--text);
+  font: 600 22px var(--font-ui);
+}
+
+.tz-tip {
+  position: absolute;
+  pointer-events: none;
+  padding: var(--s1) var(--s2);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-control);
+  background: var(--pop-bg);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  font-size: var(--t-xs);
+  white-space: nowrap;
+  transform: translate(-50%, calc(-100% - var(--s3)));
+}
+
+.tz-tip .num {
+  margin-left: var(--s2);
+  color: var(--text-3);
+}
+
+.tz-map-cap {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s3);
+  margin-top: var(--s2);
+  color: var(--text-4);
+  font-size: var(--t-xs);
+}
+
 @media (max-width: 1100px) {
   .tz-pick {
     grid-template-columns: 1fr;
@@ -242,6 +335,10 @@
 }
 
 @media (max-width: 600px) {
+  .tz-map {
+    display: none;
+  }
+
   .tz-list {
     height: 264px;
   }

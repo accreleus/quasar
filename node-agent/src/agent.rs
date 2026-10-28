@@ -5593,10 +5593,12 @@ fn app_to_container(app: AppSpec, mounts: &MountPolicy) -> anyhow::Result<Option
     if app.image.is_empty() {
         return Ok(None);
     }
+    let mut env = app.env;
+    crate::session::keymap::settle(&mut env);
     Ok(Some(ContainerSpec {
         image: app.image,
         args: app.args,
-        env: app.env,
+        env,
         mounts: mounts.check_all(&app.mounts)?,
         gpu: app.gpu,
         no_new_privileges: app.no_new_privileges,
@@ -11729,6 +11731,26 @@ mod tests {
         assert_eq!(
             crate::session::pipeline::keyboard_layout(cfg.container.as_ref()),
             Some(("de", ""))
+        );
+    }
+
+    #[test]
+    fn an_unreal_layout_reaches_neither_the_app_nor_the_compositor() {
+        // Without xkeyboard-config the agent cannot tell a real layout from `zz`.
+        if !std::path::Path::new("/usr/share/X11/xkb").is_dir() {
+            return;
+        }
+        let app: AppSpec = serde_json::from_value(serde_json::json!({
+            "image": "steam", "env": {"XKB_DEFAULT_LAYOUT": "zz", "XKB_DEFAULT_VARIANT": ""}
+        }))
+        .unwrap();
+        let container = app_to_container(app, &MountPolicy::default()).unwrap();
+        let env = &container.as_ref().unwrap().env;
+        assert_eq!(env["XKB_DEFAULT_LAYOUT"], "us");
+        assert_eq!(env["XKB_DEFAULT_VARIANT"], "");
+        assert_eq!(
+            crate::session::pipeline::keyboard_layout(container.as_ref()),
+            Some(("us", ""))
         );
     }
 
