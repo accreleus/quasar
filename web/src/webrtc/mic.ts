@@ -10,6 +10,8 @@
 // RELEASE the device (track.stop(), not track.enabled = false) so the OS
 // recording indicator goes off.
 
+import { microphoneSupported } from "./micSupport";
+
 /** Why a mic enable attempt failed. Drives the user-facing message. */
 export type MicErrorKind =
   | "insecure-context"
@@ -30,19 +32,7 @@ export interface MicError {
   message: string;
 }
 
-/**
- * Cheap sync feature detect. getUserMedia is secure-context-only (same
- * constraint gates Keyboard Lock on plain-HTTP LAN deploys, #376), so an
- * insecure origin reports false regardless of browser capability.
- */
-export function microphoneSupported(): boolean {
-  return (
-    typeof navigator !== "undefined" &&
-    typeof navigator.mediaDevices?.getUserMedia === "function" &&
-    typeof window !== "undefined" &&
-    window.isSecureContext === true
-  );
-}
+export { microphoneSupported } from "./micSupport";
 
 /**
  * Maps a getUserMedia rejection to a user-facing message (pure, exported for

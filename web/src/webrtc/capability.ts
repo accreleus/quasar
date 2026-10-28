@@ -8,7 +8,7 @@
 // (DEVICE_KEY_STORAGE_KEY), app-scoped, NOT a hardware fingerprint. Cleared with
 // browser storage; a new UUID on next login is an acceptable new user_devices row.
 
-import { microphoneSupported } from "./mic";
+import { microphoneSupported } from "./micSupport";
 import { pointerLockSupported } from "../input/support";
 
 const DEVICE_KEY_STORAGE_KEY = "quasar_device_key";
