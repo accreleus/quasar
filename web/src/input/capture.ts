@@ -29,6 +29,7 @@
 // (matched by pointerId, so chrome taps are never seen here).
 
 import { EVDEV, MB_MAP } from "./evdev";
+import { createMouseScaler, mouseGain, NEUTRAL_MOUSE, type MouseSettings } from "./mouseScale";
 import { isSendEscCombo, isSummonCombo, sendEscComboEnabled } from "./summonCombo";
 
 // InputMsg matches the JSON shapes in protocol/input.md.
@@ -103,6 +104,8 @@ export interface EngageResult {
   mode: EngageMode;
   /** Present only for `failed` — whatever requestPointerLock threw/rejected. */
   error?: unknown;
+  /** Raw mouse input was asked for and this browser cannot give it: the lock is a normal one. */
+  rawUnavailable?: boolean;
 }
 
 export interface CaptureOptions {
@@ -135,6 +138,8 @@ export interface CaptureOptions {
    *  line up, and cutting it off entirely would be worse — so the page must
    *  tell the user their buttons may be mixed up (quasar#348). */
   onNonStandardGamepad?: (pad: GamepadIdentity) => void;
+  /** Relative mouse speed (mouseScale.ts); absent means unscaled. Change it later with `setMouse`. */
+  mouse?: MouseSettings;
 }
 
 /** bufferedAmount above which we flag backpressure (16 KiB). */
@@ -158,6 +163,14 @@ function keyboardLockApi(): KeyboardLockApi | null {
  *  quasar#376 tracks TLS. */
 export function keyboardLockSupported(): boolean {
   return keyboardLockApi() != null;
+}
+
+/** Raw mouse input (`unadjustedMovement`) is Chromium-only and cannot be probed without a lock
+ *  request, so the account page reads the user agent (Chrome, Edge, Opera and Brave all say
+ *  `Chrome/`; Firefox and Safari do not). Not `userAgentData`: it is absent on plain HTTP, where
+ *  many installs run. A wrong guess costs nothing: engage() still falls back to a normal lock and says so. */
+export function rawMouseSupported(): boolean {
+  return pointerLockSupported() && /\bChrome\//.test(navigator.userAgent);
 }
 
 /** Probed on `Element.prototype`, not `"pointerLockElement" in document` —
@@ -216,12 +229,14 @@ export function setupCapture({
   onKeyboardLockRefused,
   onSummonOverlay,
   onNonStandardGamepad,
+  mouse = NEUTRAL_MOUSE,
 }: CaptureOptions): {
   cleanup: () => void;
   getMetrics: () => CaptureMetrics;
   syncKeyboardLock: () => void;
   engage: () => Promise<EngageResult>;
   release: () => void;
+  setMouse: (settings: MouseSettings) => void;
 } {
   /** Gates `mm` and nothing else. */
   let pointerLocked = false;
@@ -266,6 +281,32 @@ export function setupCapture({
   const msMsg: InputMsg = { t: "ms", dx: 0, dy: 0 };
   // ?itrace=1 mm sequence counter
   let mmSeq = 0;
+
+  // Gain is recomputed when the window, the stream size or the setting changes, never per event.
+  const scaler = createMouseScaler();
+  let mouseSettings = mouse;
+  const updateGain = () => {
+    const [gx, gy] = mouseGain(mouseSettings, {
+      streamW: videoEl.videoWidth,
+      streamH: videoEl.videoHeight,
+      boxW: videoEl.clientWidth,
+      boxH: videoEl.clientHeight,
+      fit: videoEl.dataset?.scalingMode,
+    });
+    scaler.setGain(gx, gy);
+  };
+  updateGain();
+  const canWatchSize = typeof videoEl.addEventListener === "function";
+  const sizeObserver = canWatchSize && typeof ResizeObserver === "function" ? new ResizeObserver(updateGain) : null;
+  sizeObserver?.observe(videoEl);
+  if (canWatchSize) {
+    videoEl.addEventListener("resize", updateGain);
+    videoEl.addEventListener("loadedmetadata", updateGain);
+  }
+  // The HUD's scaling mode is CSS only (object-fit): the box keeps its size, so nothing above fires.
+  const modeObserver =
+    videoEl instanceof Node && typeof MutationObserver === "function" ? new MutationObserver(updateGain) : null;
+  modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode"] });
 
   // Gamepad state for delta-only sends.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
@@ -420,10 +461,27 @@ export function setupCapture({
   /**
    * Engage from a user gesture. A refused lock on a lock-capable device is
    * `failed` and engages nothing — never silently degrade a desktop to
-   * no-mouse-look. Never `await`s before requestPointerLock: that would spend
-   * the user gesture the API requires.
+   * no-mouse-look. Never `await`s before its first requestPointerLock: that would
+   * spend the user gesture the API requires. (Raw mouse's plain retry does wait on the
+   * refusal; the gesture's transient activation, about 5 s, outlasts it.)
+   * With raw mouse on, one request sequence at a time: an engage while the raw-then-plain
+   * sequence is pending returns its result and asks the browser for nothing, so a double tap
+   * cannot interleave the two requests. A release() in between lifts that (a new request is
+   * wanted); with raw off, requests queue as before (#524).
    */
-  const engage = async (): Promise<EngageResult> => {
+  let pendingRaw: Promise<EngageResult> | null = null;
+  const engage = (): Promise<EngageResult> => {
+    if (pendingRaw && wanted) return pendingRaw;
+    const sequence = requestEngage();
+    if (mouseSettings.raw) {
+      pendingRaw = sequence;
+      void sequence.finally(() => {
+        if (pendingRaw === sequence) pendingRaw = null;
+      });
+    }
+    return sequence;
+  };
+  const requestEngage = async (): Promise<EngageResult> => {
     wanted = true;
     if (captured) {
       return { mode: pointerLocked ? "pointer-lock" : "fallback" };
@@ -433,10 +491,13 @@ export function setupCapture({
       setCaptured(true);
       return { mode: "fallback" };
     }
-    try {
+    let rawUnavailable = false;
+    // One request. `raw` asks for `unadjustedMovement`; an engine that hands back no
+    // promise has ignored it, so the lock it grants is a normal one.
+    const request = async (raw: boolean) => {
       // Chrome ≥113 returns a Promise, older engines undefined; handle both
       // plus a synchronous throw.
-      const maybe: unknown = videoEl.requestPointerLock();
+      const maybe: unknown = raw ? videoEl.requestPointerLock({ unadjustedMovement: true }) : videoEl.requestPointerLock();
       if (maybe && typeof (maybe as PromiseLike<void>).then === "function") {
         await (maybe as PromiseLike<void>);
         // The grant outlived cleanup(), so no pointerlockchange handler is left to
@@ -445,8 +506,21 @@ export function setupCapture({
         if (cleanedUp && !liveCapture.has(videoEl) && document.pointerLockElement === videoEl) {
           document.exitPointerLock?.();
         }
+      } else if (raw) {
+        rawUnavailable = true;
       }
-      return { mode: "pointer-lock" };
+    };
+    try {
+      const raw = mouseSettings.raw;
+      try {
+        await request(raw);
+      } catch (error) {
+        if (!raw || !(error instanceof DOMException && error.name === "NotSupportedError")) throw error;
+        // Once, with the plain request: a second refusal is a real one and reports `failed`.
+        rawUnavailable = true;
+        await request(false);
+      }
+      return rawUnavailable ? { mode: "pointer-lock", rawUnavailable } : { mode: "pointer-lock" };
     } catch (error) {
       return { mode: "failed", error };
     }
@@ -507,24 +581,21 @@ export function setupCapture({
     // its full trajectory; each sample is a normal `mm`.
     const coalesced = e.getCoalescedEvents?.();
     if (coalesced && coalesced.length > 1) {
-      let sent = false;
+      let moved = false;
       for (const ce of coalesced) {
-        if (ce.movementX !== 0 || ce.movementY !== 0) {
-          mmMsg.dx = ce.movementX;
-          mmMsg.dy = ce.movementY;
+        if (ce.movementX === 0 && ce.movementY === 0) continue;
+        moved = true;
+        if (scaler.apply(mmMsg, ce.movementX, ce.movementY)) {
           stampMm();
           send(mmMsg);
           coalescedCount++;
-          sent = true;
         }
       }
       // Some engines zero movementX/Y on coalesced events; fall back to the
       // summary event's delta so motion is never silently dropped.
-      if (sent) return;
+      if (moved) return;
     }
-    if (e.movementX !== 0 || e.movementY !== 0) {
-      mmMsg.dx = e.movementX;
-      mmMsg.dy = e.movementY;
+    if (scaler.apply(mmMsg, e.movementX, e.movementY)) {
       stampMm();
       send(mmMsg);
     }
@@ -547,8 +618,8 @@ export function setupCapture({
     // open while captured, and swallowing its wheel would make it unscrollable
     if (!captured || !aimedAtGame(e)) return;
     e.preventDefault();
-    msMsg.dx = e.deltaX;
-    msMsg.dy = e.deltaY;
+    msMsg.dx = mouseSettings.flip ? -e.deltaX : e.deltaX;
+    msMsg.dy = mouseSettings.flip ? -e.deltaY : e.deltaY;
     send(msMsg);
   };
 
@@ -826,6 +897,12 @@ export function setupCapture({
 
   // ── Gamepad (W3C Standard Gamepad — polled in rAF, send on delta only) ───
 
+  function swapButtons(buttons: number[], i: number, j: number) {
+    const t = buttons[i];
+    buttons[i] = buttons[j];
+    buttons[j] = t;
+  }
+
   function pollGamepads() {
     // Gated on `captured`, never `pointerLocked` (see header). The rAF loop
     // keeps running so forwarding resumes on re-capture — gpPrev was cleared on
@@ -835,6 +912,11 @@ export function setupCapture({
       for (const pad of pads) {
         if (!pad) continue;
         const buttons = Array.from(pad.buttons, (b) => b.value);
+        // Standard layout only: on any other pad the indices are the device's own order.
+        if (mouseSettings.nintendo && buttons.length > 3 && isStandardMapping(pad)) {
+          swapButtons(buttons, 0, 1); // A (bottom) with B (right)
+          swapButtons(buttons, 2, 3); // X (left) with Y (top)
+        }
         const axes = Array.from(pad.axes, (a) => Math.round(a * 1000) / 1000);
         const prev = gpPrev[pad.index];
         const changed =
@@ -932,6 +1014,12 @@ export function setupCapture({
     document.removeEventListener("pointercancel", onTouchCancel);
     document.removeEventListener("keydown", onKeyDown);
     document.removeEventListener("keyup", onKeyUp);
+    sizeObserver?.disconnect();
+    modeObserver?.disconnect();
+    if (canWatchSize) {
+      videoEl.removeEventListener("resize", updateGain);
+      videoEl.removeEventListener("loadedmetadata", updateGain);
+    }
     cancelAnimationFrame(rafId);
     // the pointerlockchange listener is gone, so unlock here
     if (keyboardLocked) {
@@ -943,5 +1031,10 @@ export function setupCapture({
     }
   };
 
-  return { cleanup, getMetrics, syncKeyboardLock: updateKeyboardLock, engage, release };
+  const setMouse = (settings: MouseSettings) => {
+    mouseSettings = settings;
+    updateGain();
+  };
+
+  return { cleanup, getMetrics, syncKeyboardLock: updateKeyboardLock, engage, release, setMouse };
 }

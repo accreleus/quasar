@@ -11723,6 +11723,16 @@ mod tests {
     }
 
     #[test]
+    fn the_compositor_keymap_is_the_xkb_pair_the_control_plane_sends() {
+        // The assign as the control plane writes it (amendment 49): both keys, variant "".
+        let cfg = steam_cfg_from_wire(SessionKind::Play, "-applaunch 730", "Europe/Berlin");
+        assert_eq!(
+            crate::session::pipeline::keyboard_layout(cfg.container.as_ref()),
+            Some(("de", ""))
+        );
+    }
+
+    #[test]
     fn a_completed_swap_carries_its_region_and_input_values_to_the_runtime() {
         let (mut mgr, warm) = warm_manager();
         let cfg = steam_cfg_from_wire(SessionKind::Play, "-applaunch 620", "Europe/Berlin");
