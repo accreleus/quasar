@@ -23,7 +23,7 @@ interface Hover {
 
 const LABEL_PAD = 12;
 const LABEL_GAP = 24;
-const GLYPH_WIDTH = 12.5; // fallback where the browser cannot measure text
+const GLYPH_WIDTH = 12.5; // estimate for where text cannot be measured: jsdom, or a hidden svg
 
 export function WorldMap({ zones, selectedTz, now, disabled, onPick }: WorldMapProps) {
   const points = useMemo(() => mapPoints(zones), [zones]);
@@ -38,7 +38,13 @@ export function WorldMap({ zones, selectedTz, now, disabled, onPick }: WorldMapP
   const sel = points.find((p) => p.zone.tz === selectedTz) ?? null;
   const label = sel ? `${sel.zone.city} · ${clockIn(sel.zone.tz, now) ?? ""}` : "";
   useLayoutEffect(() => {
-    setTextWidth(textRef.current?.getComputedTextLength?.() || label.length * GLYPH_WIDTH);
+    let measured = 0;
+    try {
+      measured = textRef.current?.getComputedTextLength?.() ?? 0;
+    } catch {
+      // a hidden svg can throw in some engines; the estimate below stands in
+    }
+    setTextWidth(measured || label.length * GLYPH_WIDTH);
   }, [label]);
 
   const at = (e: React.PointerEvent | React.MouseEvent) => {

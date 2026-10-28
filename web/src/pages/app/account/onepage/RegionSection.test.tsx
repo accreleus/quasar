@@ -307,6 +307,60 @@ describe("Region map (#847)", () => {
     expect(option(/Tokyo/).getAttribute("aria-selected")).toBe("true");
   });
 
+  it("keeps a search typed during a save when that save fails and the pick reverts", async () => {
+    api.getRegionInput.mockResolvedValue(body("Europe/Paris"));
+    api.patchRegionInput.mockRejectedValue(new ApiError(400, "validation_failed", "region.timezone: unknown zone"));
+    renderSection();
+    await list();
+    const box = screen.getByLabelText("Search timezones") as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "tokyo" } });
+    fireEvent.click(option(/Tokyo/));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("region.timezone: unknown zone"));
+    expect(box.value).toBe("tokyo");
+  });
+
+  it("keeps a search typed during a save that fails after a map pick", async () => {
+    api.getRegionInput.mockResolvedValue(body("Europe/Paris"));
+    let fail: (e: unknown) => void = () => {};
+    api.patchRegionInput.mockReturnValue(new Promise((_r, rej) => (fail = rej)));
+    const { container } = renderSection();
+    await list();
+    clickAt(container, 139.7, 35.7);
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Saving…"));
+    const box = screen.getByLabelText("Search timezones") as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "oslo" } });
+    fail(new ApiError(500, "internal", "boom"));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("boom"));
+    expect(box.value).toBe("oslo");
+  });
+
+  it("a map click on the saved zone saves nothing but clears the search so the row shows", async () => {
+    api.getRegionInput.mockResolvedValue(body("Asia/Tokyo"));
+    const { container } = renderSection();
+    await list();
+    const box = screen.getByLabelText("Search timezones") as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "paris" } });
+    expect(screen.queryByRole("option", { name: /Tokyo/ })).toBeNull();
+    clickAt(container, 139.7, 35.7);
+    await waitFor(() => expect(box.value).toBe(""));
+    expect(option(/Tokyo/).getAttribute("aria-selected")).toBe("true");
+    expect(api.patchRegionInput).not.toHaveBeenCalled();
+  });
+
+  it("still draws the label where the browser's text measuring throws", async () => {
+    const proto = SVGElement.prototype as unknown as { getComputedTextLength?: () => number };
+    proto.getComputedTextLength = () => {
+      throw new Error("not rendered");
+    };
+    try {
+      const { container } = renderSection();
+      await list();
+      expect(marker(container)).toMatch(/^London · /);
+    } finally {
+      delete proto.getComputedTextLength;
+    }
+  });
+
   it("leaves the search alone when the pick is made in the list", async () => {
     renderSection();
     await list();
