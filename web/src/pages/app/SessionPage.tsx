@@ -181,6 +181,7 @@ function SessionPageBody() {
   // Ref mirror so the keyboard-lock-refused callback (wired once per runtime
   // generation) reads the live verdict, not the value captured at wiring time.
   const certTrustRef = useRef<CertTrust>("unknown");
+  const rawNoticeRef = useRef(false);
   useEffect(() => {
     let cancelled = false;
     void probeCertificateTrust().then((verdict) => {
@@ -564,6 +565,15 @@ function SessionPageBody() {
               "menu to stop.",
         });
         return;
+      }
+      if (result.rawUnavailable && !rawNoticeRef.current) {
+        // Said once per session view: every re-capture would otherwise repeat it.
+        rawNoticeRef.current = true;
+        addToast({
+          variant: "info",
+          title: "Raw mouse input isn’t available",
+          body: "This browser can’t switch off mouse acceleration, so the mouse works as it normally does.",
+        });
       }
       if (result.mode === "failed") {
         // Must not silently degrade a lock-capable browser: say what happened.

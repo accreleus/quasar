@@ -7,6 +7,8 @@ vi.mock("../../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }
 const getRegionInput = vi.hoisted(() => vi.fn());
 const patchRegionInput = vi.hoisted(() => vi.fn());
 vi.mock("../../../../api/me", () => ({ getRegionInput, patchRegionInput }));
+const rawMouseSupported = vi.hoisted(() => vi.fn(() => true));
+vi.mock("../../../../input/capture", () => ({ rawMouseSupported }));
 
 const body = (input: object = {}, defaults: object = {}) => ({
   region: {},
@@ -16,6 +18,7 @@ const body = (input: object = {}, defaults: object = {}) => ({
 
 beforeEach(() => {
   getRegionInput.mockReset().mockResolvedValue(body());
+  rawMouseSupported.mockReset().mockReturnValue(true);
   patchRegionInput.mockReset().mockImplementation(async (_t: string, p: { input: object }) => body(p.input));
 });
 
@@ -142,5 +145,60 @@ describe("Input section: saves", () => {
     await waitFor(() => expect(patchRegionInput).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByLabelText("Sensitivity")).toHaveAttribute("aria-valuetext", "2×"));
     expect(selected()).toBe("Always on");
+  });
+});
+
+describe("Input section: Raw mouse input", () => {
+  const rawSwitch = async () => {
+    const el = (await screen.findByLabelText("Raw mouse input (no acceleration)")) as HTMLInputElement;
+    return el;
+  };
+
+  it("is off until the user or the install default says otherwise", async () => {
+    render(<InputSection />);
+    const el = await rawSwitch();
+    await waitFor(() => expect(el).toBeEnabled());
+    expect(el).not.toBeChecked();
+  });
+
+  it("shows the install default until the user picks", async () => {
+    getRegionInput.mockResolvedValue(body({}, { raw_mouse: true }));
+    render(<InputSection />);
+    await waitFor(() => expect(screen.getByLabelText("Raw mouse input (no acceleration)")).toBeChecked());
+  });
+
+  it("on saves true, off saves false", async () => {
+    render(<InputSection />);
+    const el = await rawSwitch();
+    await waitFor(() => expect(el).toBeEnabled());
+    fireEvent.click(el);
+    await waitFor(() => expect(patchRegionInput).toHaveBeenLastCalledWith("tok", { input: { raw_mouse: true } }));
+    expect(await screen.findByText("Saved. Applies from your next launch.")).toBeInTheDocument();
+    await waitFor(() => expect(el).toBeChecked());
+    fireEvent.click(el);
+    await waitFor(() => expect(patchRegionInput).toHaveBeenLastCalledWith("tok", { input: { raw_mouse: false } }));
+    await waitFor(() => expect(el).not.toBeChecked());
+  });
+
+  it("says why when the save fails, and goes back to the stored value", async () => {
+    patchRegionInput.mockRejectedValue(new ApiError(400, "validation_failed", "bad value"));
+    render(<InputSection />);
+    const el = await rawSwitch();
+    await waitFor(() => expect(el).toBeEnabled());
+    fireEvent.click(el);
+    expect(await screen.findByText("bad value")).toBeInTheDocument();
+    expect(el).not.toBeChecked();
+  });
+
+  it("is disabled, off and explained in a browser without it, whatever is stored", async () => {
+    rawMouseSupported.mockReturnValue(false);
+    getRegionInput.mockResolvedValue(body({ raw_mouse: true }));
+    render(<InputSection />);
+    const el = await rawSwitch();
+    await screen.findByText("Not available in this browser. Use Chrome or Edge for raw input.");
+    expect(el).toBeDisabled();
+    expect(el).not.toBeChecked();
+    expect(el).toHaveAccessibleDescription(/Not available in this browser/);
+    expect(patchRegionInput).not.toHaveBeenCalled();
   });
 });

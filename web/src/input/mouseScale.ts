@@ -13,14 +13,16 @@ export interface MouseSettings {
   match: boolean;
   /** `mouse_sensitivity`, 0.25 to 4. */
   sensitivity: number;
+  /** `raw_mouse`: ask for pointer lock with `unadjustedMovement`. */
+  raw: boolean;
 }
 
 export const MOUSE_SENSITIVITY_MIN = 0.25;
 export const MOUSE_SENSITIVITY_MAX = 4;
 
-export const NEUTRAL_MOUSE: MouseSettings = { match: false, sensitivity: 1 };
+export const NEUTRAL_MOUSE: MouseSettings = { match: false, sensitivity: 1, raw: false };
 
-/** The user's value, then the install default, then the built-in (`auto`, 1×);
+/** The user's value, then the install default, then the built-in (`auto`, 1×, raw off);
  *  `auto` is on for a desktop app and off for every other kind. */
 export function resolveMouseSettings(
   s: RegionInputWire | null | undefined,
@@ -31,6 +33,7 @@ export function resolveMouseSettings(
   return {
     match: mode === "on" || (mode === "auto" && kind === "desktop"),
     sensitivity: Math.min(MOUSE_SENSITIVITY_MAX, Math.max(MOUSE_SENSITIVITY_MIN, sens)),
+    raw: s?.input?.raw_mouse ?? s?.defaults?.input?.raw_mouse ?? false,
   };
 }
 

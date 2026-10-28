@@ -1,7 +1,7 @@
 // The account page's Input section. It owns the one read of `/v1/me/region-input` and the one
 // save path; a field is a function of the loaded settings and a `save` that sends its patch.
-// Mouse speed is the first group. Raw input, flip scroll and the gamepad layout are more fields
-// on the same `save`.
+// Mouse speed is the first group; raw input is a switch on the same `save`. Flip scroll and the
+// gamepad layout are more fields on it.
 
 import { useEffect, useRef, useState } from "react";
 import { getRegionInput, patchRegionInput, type RegionInputWire } from "../../../../api/me";
@@ -9,6 +9,8 @@ import { ApiError } from "../../../../api/client";
 import { ResourceStates } from "../../../../components/ResourceStates";
 import { SegmentedControl } from "../../../../components/SegmentedControl";
 import { SliderField } from "../../../../components/SliderField";
+import { Switch } from "../../../../components/TextField";
+import { rawMouseSupported } from "../../../../input/capture";
 import { useResource } from "../../../../lib/resource/react";
 import { MOUSE_SENSITIVITY_MAX, MOUSE_SENSITIVITY_MIN } from "../../../../input/mouseScale";
 import "../../../../styles/account-input.css";
@@ -83,6 +85,11 @@ export function InputSection() {
           save({ mouse_sensitivity }, `Saved. Your next launch uses ${showSensitivity(mouse_sensitivity)} sensitivity.`)
         }
       />
+      <RawMouseField
+        checked={mine?.raw_mouse ?? defaults?.raw_mouse ?? false}
+        disabled={!data}
+        onChange={(raw_mouse) => void save({ raw_mouse })}
+      />
       <p className={status && !status.ok ? "form-error mt5" : "muted mt5"} role="status">
         {status?.text ?? "Saved as you pick."}
       </p>
@@ -103,6 +110,30 @@ function MatchCursorField({ value, disabled, onChange }: { value: MatchCursor; d
         disabled={disabled}
       />
       <p className="hint">{MATCH_HINT[value]}</p>
+    </div>
+  );
+}
+
+// Chrome and Edge only: elsewhere the switch stays, disabled, with the reason under it (DESIGN.md "Unavailable toggle").
+function RawMouseField({ checked, disabled, onChange }: { checked: boolean; disabled: boolean; onChange: (v: boolean) => void }) {
+  const supported = rawMouseSupported();
+  return (
+    <div className="mt4">
+      <div className="ac-sw">
+        <Switch
+          id="raw-mouse"
+          label="Raw mouse input (no acceleration)"
+          checked={supported && checked}
+          onChange={onChange}
+          disabled={disabled || !supported}
+          aria-describedby="raw-mouse-hint"
+        />
+      </div>
+      <p className="hint mt3" id="raw-mouse-hint">
+        {supported
+          ? "Moves the cursor exactly as your mouse does, with your system’s acceleration off. Works in Chrome and Edge."
+          : "Not available in this browser. Use Chrome or Edge for raw input."}
+      </p>
     </div>
   );
 }
