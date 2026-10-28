@@ -138,7 +138,7 @@ const baseProvenance: ManifestProvenance = {
 
 const baseCatalog: ImageCatalogEnvelope = {
   manifest_version: 1,
-  catalog_ref: "main",
+  catalog_ref: "stable",
   fetched_at: "2026-08-01T00:00:00Z",
   sync_error: null,
   manifest_provenance: baseProvenance,
