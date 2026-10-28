@@ -125,3 +125,9 @@ in `findings.md`.
    `settingsSearch/reveal.ts` ticks for up to 4 s after
    `CommandPalette.design.test.tsx` ends (see findings.md). exp 02 is recorded
    as a test failure. It was discarded on its time-to-usable guard either way.
+
+## Stop note
+
+Stopped after 15 experiments (12 P, 3 U). Track U had nothing left that its metric can see in
+scope: axe was at 0, and the remaining detect hits are the sanctioned hint type role. A
+change aimed at them would be restyling against DESIGN.md. See summary.md.
