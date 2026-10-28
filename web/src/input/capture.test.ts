@@ -1390,7 +1390,7 @@ describe("gamepad — Nintendo layout (control-api.md §Region and Input setting
     cap.cleanup();
   });
 
-  it("setMouse changes the layout of a running capture and resends the pad in full", () => {
+  it("setMouse changes the layout of a running capture and the changed state goes out", () => {
     const { cap, send, poll } = open(standardPad(), OFF);
     poll();
     send.mockClear();
@@ -1473,6 +1473,48 @@ describe("engage() with Raw mouse input (control-api.md §Region and Input setti
     const { cleanup, engage } = open();
     expect(await engage()).toEqual({ mode: "pointer-lock", rawUnavailable: true });
     expect(lock).toHaveBeenCalledTimes(1);
+    cleanup();
+  });
+
+  it("a second engage while one is pending asks the browser for nothing and shares its result", async () => {
+    let refuse: (e: unknown) => void = () => {};
+    const lock = vi.fn((o?: unknown) => (o ? new Promise<void>((_, rej) => (refuse = rej)) : Promise.resolve()));
+    setPointerLockApi(lock);
+    const { cleanup, engage } = open();
+    const first = engage();
+    const second = engage(); // a double tap before the raw request has settled
+    expect(lock.mock.calls).toEqual([[{ unadjustedMovement: true }]]);
+    refuse(notSupported());
+    expect(await first).toEqual({ mode: "pointer-lock", rawUnavailable: true });
+    expect(await second).toEqual({ mode: "pointer-lock", rawUnavailable: true });
+    expect(lock.mock.calls).toEqual([[{ unadjustedMovement: true }], []]);
+    cleanup();
+  });
+
+  it("raw on: a release between two engages lifts the guard, and raw off never had one", async () => {
+    const lock = vi.fn((_o?: unknown) => new Promise<void>(() => {}));
+    setPointerLockApi(lock);
+    const raw = open();
+    void raw.engage();
+    raw.release();
+    void raw.engage();
+    expect(lock).toHaveBeenCalledTimes(2);
+    raw.cleanup();
+    lock.mockClear();
+    const plain = open({ ...RAW, raw: false });
+    void plain.engage();
+    void plain.engage();
+    expect(lock).toHaveBeenCalledTimes(2);
+    plain.cleanup();
+  });
+
+  it("an engage after the pending one has settled starts a new request", async () => {
+    const lock = vi.fn((_o?: unknown) => Promise.reject(new Error("locked out")));
+    setPointerLockApi(lock);
+    const { cleanup, engage } = open();
+    expect((await engage()).mode).toBe("failed");
+    expect((await engage()).mode).toBe("failed");
+    expect(lock).toHaveBeenCalledTimes(2);
     cleanup();
   });
 
