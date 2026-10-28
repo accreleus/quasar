@@ -2,3 +2,4 @@ n	track	hypothesis	primary_before	primary_after	guards	kept	impeccable_finding
 01	P	lazy-load the session view (SessionPage, WebRTC, input, HUD)	282434	260794	tests=pass;ttu=app:589->573/account:755->739/settings:766->760;px_max=0.00000	yes	-
 02	P	lazy-load the account area (layout, sections, every account page)	260794	235946	tests=fail;ttu=app:577->577/account:750->914/settings:774->834;px_max=0.00000	no	-
 03	P	lazy-load the game page route	260794	254086	tests=pass;ttu=app:627->622/account:797->787/settings:756->749;px_max=0.00000	yes	-
+04	P	lazy-load routes a signed-in player never visits (setup wizard, register, styleguide)	254086	230622	tests=pass;ttu=app:604->578/account:759->755/settings:774->847;px_max=0.00000	no	-
