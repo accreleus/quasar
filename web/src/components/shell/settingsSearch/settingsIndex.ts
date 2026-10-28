@@ -86,6 +86,11 @@ export const ACCOUNT_SETTINGS: readonly SettingEntry[] = [
     keywords: "mouse wheel scroll reverse invert natural direction up down",
     target: { sel: "#flip-scroll", up: ".ac-sw" },
   },
+  {
+    id: "acct-nintendo-layout", label: "Gamepad Nintendo layout", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "controller gamepad nintendo switch pro swap a b x y buttons layout",
+    target: { sel: "#nintendo-layout", up: ".ac-sw" },
+  },
   sec("overlay", "In-session overlay", "overlay", "overlay", "hud strip overlay stats"),
   {
     id: "acct-overlay-preset", label: "Overlay content", where: "Overlay", icon: "overlay", to: `${A}/overlay`,

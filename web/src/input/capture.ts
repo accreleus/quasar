@@ -897,6 +897,12 @@ export function setupCapture({
 
   // ── Gamepad (W3C Standard Gamepad — polled in rAF, send on delta only) ───
 
+  function swapButtons(buttons: number[], i: number, j: number) {
+    const t = buttons[i];
+    buttons[i] = buttons[j];
+    buttons[j] = t;
+  }
+
   function pollGamepads() {
     // Gated on `captured`, never `pointerLocked` (see header). The rAF loop
     // keeps running so forwarding resumes on re-capture — gpPrev was cleared on
@@ -906,6 +912,11 @@ export function setupCapture({
       for (const pad of pads) {
         if (!pad) continue;
         const buttons = Array.from(pad.buttons, (b) => b.value);
+        // Standard layout only: on any other pad the indices are the device's own order.
+        if (mouseSettings.nintendo && buttons.length > 3 && isStandardMapping(pad)) {
+          swapButtons(buttons, 0, 1); // A (bottom) with B (right)
+          swapButtons(buttons, 2, 3); // X (left) with Y (top)
+        }
         const axes = Array.from(pad.axes, (a) => Math.round(a * 1000) / 1000);
         const prev = gpPrev[pad.index];
         const changed =

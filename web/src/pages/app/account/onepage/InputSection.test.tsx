@@ -242,3 +242,44 @@ describe("Input section: Flip scroll direction", () => {
     expect(el).not.toBeChecked();
   });
 });
+
+describe("Input section: Gamepad Nintendo layout", () => {
+  const nin = async () => {
+    const el = (await screen.findByLabelText("Nintendo layout (swap A/B and X/Y)")) as HTMLInputElement;
+    await waitFor(() => expect(el).toBeEnabled());
+    return el;
+  };
+
+  it("is off until the user or the install default says otherwise, and explains itself", async () => {
+    render(<InputSection />);
+    expect(await nin()).not.toBeChecked();
+    expect(screen.getByText(/the button printed A acts as A in games/)).toBeInTheDocument();
+  });
+
+  it("shows the install default until the user picks", async () => {
+    getRegionInput.mockResolvedValue(body({}, { nintendo_layout: true }));
+    render(<InputSection />);
+    await waitFor(() => expect(screen.getByLabelText("Nintendo layout (swap A/B and X/Y)")).toBeChecked());
+  });
+
+  it("on saves true, off saves false, leaving the other fields alone", async () => {
+    render(<InputSection />);
+    const el = await nin();
+    fireEvent.click(el);
+    await waitFor(() => expect(patchRegionInput).toHaveBeenLastCalledWith("tok", { input: { nintendo_layout: true } }));
+    expect(await screen.findByText("Saved. Applies from your next launch.")).toBeInTheDocument();
+    await waitFor(() => expect(el).toBeChecked());
+    fireEvent.click(el);
+    await waitFor(() => expect(patchRegionInput).toHaveBeenLastCalledWith("tok", { input: { nintendo_layout: false } }));
+    await waitFor(() => expect(el).not.toBeChecked());
+  });
+
+  it("says why when the save fails, and goes back to the stored value", async () => {
+    patchRegionInput.mockRejectedValue(new ApiError(400, "validation_failed", "bad value"));
+    render(<InputSection />);
+    const el = await nin();
+    fireEvent.click(el);
+    expect(await screen.findByText("bad value")).toBeInTheDocument();
+    expect(el).not.toBeChecked();
+  });
+});

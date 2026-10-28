@@ -1334,8 +1334,81 @@ describe("engage() without Pointer Lock — the send gate opens anyway", () => {
   });
 });
 
+describe("gamepad — Nintendo layout (control-api.md §Region and Input settings)", () => {
+  const NIN = { match: false, sensitivity: 1, raw: false, flip: false, nintendo: true };
+  const OFF = { ...NIN, nintendo: false };
+  // Button i carries the value i + 1 (12 buttons, standard layout) so every swap is visible.
+  const standardPad = (over: object = {}) => ({
+    index: 0, mapping: "standard", axes: [0.25, -0.5],
+    buttons: Array.from({ length: 12 }, (_, i) => ({ value: i + 1 })), ...over,
+  });
+  const SENT = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  const SWAPPED = [2, 1, 4, 3, 5, 6, 7, 8, 9, 10, 11, 12];
+
+  function open(pad: object, mouse?: typeof NIN) {
+    let poll: ((t: number) => void) | null = null;
+    vi.stubGlobal("requestAnimationFrame", vi.fn((cb: (t: number) => void) => ((poll = cb), 1)));
+    Object.defineProperty(navigator, "getGamepads", { value: () => [pad], configurable: true });
+    const video = makeVideo();
+    const send = vi.fn();
+    const cap = setupCapture({ videoEl: video, sendInput: send, onCaptureChange: vi.fn(), channel: makeChannel(), mouse });
+    lockPointer(video);
+    return { cap, send, poll: (t = 0) => poll?.(t) };
+  }
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    unlockPointer();
+  });
+
+  it("off, and the default: the buttons go out in the pad's own order", () => {
+    for (const mouse of [OFF, undefined]) {
+      const { cap, send, poll } = open(standardPad(), mouse);
+      poll();
+      expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: SENT, axes: [0.25, -0.5] });
+      cap.cleanup();
+    }
+  });
+
+  it("on: A swaps with B and X with Y, nothing else moves", () => {
+    const { cap, send, poll } = open(standardPad(), NIN);
+    poll();
+    expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: SWAPPED, axes: [0.25, -0.5] });
+    cap.cleanup();
+  });
+
+  it("on: a pad that is not the standard layout is forwarded as it is", () => {
+    const { cap, send, poll } = open(standardPad({ mapping: "" }), NIN);
+    poll();
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ t: "gp", buttons: SENT }));
+    cap.cleanup();
+  });
+
+  it("on: a pad with fewer than four buttons is left alone", () => {
+    const { cap, send, poll } = open(standardPad({ buttons: [{ value: 1 }, { value: 1 }] }), NIN);
+    poll();
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ t: "gp", buttons: [1, 1] }));
+    cap.cleanup();
+  });
+
+  it("setMouse changes the layout of a running capture and the changed state goes out", () => {
+    const { cap, send, poll } = open(standardPad(), OFF);
+    poll();
+    send.mockClear();
+    poll(1);
+    expect(send).not.toHaveBeenCalled(); // unchanged state, nothing sent
+    cap.setMouse(NIN);
+    poll(2);
+    expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: SWAPPED, axes: [0.25, -0.5] });
+    send.mockClear();
+    cap.setMouse(OFF);
+    poll(3);
+    expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: SENT, axes: [0.25, -0.5] });
+    cap.cleanup();
+  });
+});
+
 describe("engage() with Raw mouse input (control-api.md §Region and Input settings)", () => {
-  const RAW = { match: false, sensitivity: 1, raw: true, flip: false };
+  const RAW = { match: false, sensitivity: 1, raw: true, flip: false, nintendo: false };
   const open = (mouse = RAW) =>
     setupCapture({
       videoEl: document.createElement("video"),
@@ -1359,7 +1432,7 @@ describe("engage() with Raw mouse input (control-api.md §Region and Input setti
   it("off: the request carries no options at all, as before", async () => {
     const lock = vi.fn((_o?: unknown) => Promise.resolve());
     setPointerLockApi(lock);
-    const { cleanup, engage } = open({ ...RAW, raw: false, flip: false });
+    const { cleanup, engage } = open({ ...RAW, raw: false, flip: false, nintendo: false });
     expect(await engage()).toEqual({ mode: "pointer-lock" });
     expect(lock.mock.calls).toEqual([[]]);
     cleanup();
@@ -1448,7 +1521,7 @@ describe("engage() with Raw mouse input (control-api.md §Region and Input setti
   it("setMouse turns it on for the next engage", async () => {
     const lock = vi.fn((_o?: unknown) => Promise.resolve());
     setPointerLockApi(lock);
-    const { cleanup, engage, release, setMouse } = open({ ...RAW, raw: false, flip: false });
+    const { cleanup, engage, release, setMouse } = open({ ...RAW, raw: false, flip: false, nintendo: false });
     setMouse(RAW);
     await engage();
     expect(lock).toHaveBeenCalledWith({ unadjustedMovement: true });
