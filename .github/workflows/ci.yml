@@ -84,8 +84,8 @@ jobs:
           echo "$out" | tee -a "$GITHUB_OUTPUT"
 
   # The control-plane tests are two jobs, each with its own Postgres: `session`, the slowest
-  # package (about 175 s alone, 250-290 s sharing a runner), and every other package beside it
-  # (#928). `control-plane (build + vet + test)` is the check main requires, so it is the one
+  # package (about 130-175 s alone, 250-290 s sharing a runner) followed by `agentws`, and every
+  # other package beside them (#928). `control-plane (build + vet + test)` is the check main requires, so it is the one
   # that gathers them.
   go-tests:
     name: control-plane tests (${{ matrix.part }})
@@ -99,12 +99,13 @@ jobs:
       matrix:
         include:
           - part: build, vet, most packages
-            skip: /internal/session$
+            skip: /internal/(session|agentws)$
             only: ''
             static: true
-          - part: session
+          # agentws runs alone after session (#925); here it uses the time this runner has spare.
+          - part: session, agentws
             skip: ''
-            only: /internal/session$
+            only: /internal/(session|agentws)$
             static: false
     defaults:
       run:
