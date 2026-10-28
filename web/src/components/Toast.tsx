@@ -7,6 +7,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useId,
   useRef,
   useState,
@@ -75,17 +76,12 @@ interface ToastItemProps {
 }
 
 function ToastItemComponent({ item, onRemove }: ToastItemProps) {
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Start auto-dismiss on mount
-  const startTimer = useCallback(() => {
+  // Auto-dismiss, cleared on unmount so a timer never outlives its toast.
+  useEffect(() => {
     if (item.duration === null) return;
-    const ms = item.duration ?? 4000;
-    timerRef.current = setTimeout(() => onRemove(item.id), ms);
-  }, [item, onRemove]);
-
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useState(() => { startTimer(); });
+    const t = setTimeout(() => onRemove(item.id), item.duration ?? 4000);
+    return () => clearTimeout(t);
+  }, [item.id, item.duration, onRemove]);
 
   return (
     <div
