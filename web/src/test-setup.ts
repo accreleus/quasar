@@ -1,4 +1,13 @@
 import "@testing-library/jest-dom";
+import { afterEach } from "vitest";
+
+import { cancelReveal } from "./components/shell/settingsSearch/reveal";
+
+// A settings-search reveal polls for up to 4 s after a palette pick or the
+// layout switch, outliving a test that did not wait for it: the poll then hit a
+// torn-down jsdom ("document is not defined", an unhandled error while every
+// test passed). Every test ends it.
+afterEach(cancelReveal);
 
 // jsdom implements neither object-URL method. They live here rather than in
 // each test because `lib/download.ts` revokes on a macrotask, which outlives a
