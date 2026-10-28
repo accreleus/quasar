@@ -2,16 +2,11 @@
 // frame 2): timezone, language and region format.
 
 import { useMemo } from "react";
-import { LANGUAGES, REGION_FORMATS, formatExample } from "../../../lib/region/options";
+import { LANGUAGES, REGION_FORMATS, formatExample, withSaved } from "../../../lib/region/options";
 import { buildZones, groupZones, offsetLabel } from "../../../lib/region/zones";
 import { SettingRow } from "./SettingRow";
 import { useInlineSave } from "./useInlineSave";
 import type { UseSettingsResult } from "./useSettings";
-
-/** The list, plus the saved value as itself when the list does not carry it. */
-function withSaved(list: readonly (readonly [string, string])[], saved: string) {
-  return list.some(([v]) => v === saved) ? list : [...list, [saved, saved] as const];
-}
 
 export function RegionDefaultRows({ settings }: { settings: UseSettingsResult }) {
   const { save, busy, errorFor } = useInlineSave(settings);
