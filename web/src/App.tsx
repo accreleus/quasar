@@ -232,6 +232,7 @@ export function App() {
             <Route path="overlay" element={<AccountOverlay />} />
             <Route path="streaming" element={<AccountStreaming />} />
             <Route path="region" element={<ClassicRedirect to="/app/account/streaming" />} />
+            <Route path="input" element={<ClassicRedirect to="/app/account/streaming" />} />
             <Route path="appearance" element={<AccountAppearance />} />
           </Route>
           <Route element={<UsageSection />}>

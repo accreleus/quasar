@@ -29,6 +29,7 @@
 // (matched by pointerId, so chrome taps are never seen here).
 
 import { EVDEV, MB_MAP } from "./evdev";
+import { createMouseScaler, mouseGain, NEUTRAL_MOUSE, type MouseSettings } from "./mouseScale";
 import { isSendEscCombo, isSummonCombo, sendEscComboEnabled } from "./summonCombo";
 
 // InputMsg matches the JSON shapes in protocol/input.md.
@@ -135,6 +136,8 @@ export interface CaptureOptions {
    *  line up, and cutting it off entirely would be worse — so the page must
    *  tell the user their buttons may be mixed up (quasar#348). */
   onNonStandardGamepad?: (pad: GamepadIdentity) => void;
+  /** Relative mouse speed (mouseScale.ts); absent means unscaled. Change it later with `setMouse`. */
+  mouse?: MouseSettings;
 }
 
 /** bufferedAmount above which we flag backpressure (16 KiB). */
@@ -216,12 +219,14 @@ export function setupCapture({
   onKeyboardLockRefused,
   onSummonOverlay,
   onNonStandardGamepad,
+  mouse = NEUTRAL_MOUSE,
 }: CaptureOptions): {
   cleanup: () => void;
   getMetrics: () => CaptureMetrics;
   syncKeyboardLock: () => void;
   engage: () => Promise<EngageResult>;
   release: () => void;
+  setMouse: (settings: MouseSettings) => void;
 } {
   /** Gates `mm` and nothing else. */
   let pointerLocked = false;
@@ -266,6 +271,32 @@ export function setupCapture({
   const msMsg: InputMsg = { t: "ms", dx: 0, dy: 0 };
   // ?itrace=1 mm sequence counter
   let mmSeq = 0;
+
+  // Gain is recomputed when the window, the stream size or the setting changes, never per event.
+  const scaler = createMouseScaler();
+  let mouseSettings = mouse;
+  const updateGain = () => {
+    const [gx, gy] = mouseGain(mouseSettings, {
+      streamW: videoEl.videoWidth,
+      streamH: videoEl.videoHeight,
+      boxW: videoEl.clientWidth,
+      boxH: videoEl.clientHeight,
+      fit: videoEl.dataset?.scalingMode,
+    });
+    scaler.setGain(gx, gy);
+  };
+  updateGain();
+  const canWatchSize = typeof videoEl.addEventListener === "function";
+  const sizeObserver = canWatchSize && typeof ResizeObserver === "function" ? new ResizeObserver(updateGain) : null;
+  sizeObserver?.observe(videoEl);
+  if (canWatchSize) {
+    videoEl.addEventListener("resize", updateGain);
+    videoEl.addEventListener("loadedmetadata", updateGain);
+  }
+  // The HUD's scaling mode is CSS only (object-fit): the box keeps its size, so nothing above fires.
+  const modeObserver =
+    videoEl instanceof Node && typeof MutationObserver === "function" ? new MutationObserver(updateGain) : null;
+  modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode"] });
 
   // Gamepad state for delta-only sends.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
@@ -507,24 +538,21 @@ export function setupCapture({
     // its full trajectory; each sample is a normal `mm`.
     const coalesced = e.getCoalescedEvents?.();
     if (coalesced && coalesced.length > 1) {
-      let sent = false;
+      let moved = false;
       for (const ce of coalesced) {
-        if (ce.movementX !== 0 || ce.movementY !== 0) {
-          mmMsg.dx = ce.movementX;
-          mmMsg.dy = ce.movementY;
+        if (ce.movementX === 0 && ce.movementY === 0) continue;
+        moved = true;
+        if (scaler.apply(mmMsg, ce.movementX, ce.movementY)) {
           stampMm();
           send(mmMsg);
           coalescedCount++;
-          sent = true;
         }
       }
       // Some engines zero movementX/Y on coalesced events; fall back to the
       // summary event's delta so motion is never silently dropped.
-      if (sent) return;
+      if (moved) return;
     }
-    if (e.movementX !== 0 || e.movementY !== 0) {
-      mmMsg.dx = e.movementX;
-      mmMsg.dy = e.movementY;
+    if (scaler.apply(mmMsg, e.movementX, e.movementY)) {
       stampMm();
       send(mmMsg);
     }
@@ -932,6 +960,12 @@ export function setupCapture({
     document.removeEventListener("pointercancel", onTouchCancel);
     document.removeEventListener("keydown", onKeyDown);
     document.removeEventListener("keyup", onKeyUp);
+    sizeObserver?.disconnect();
+    modeObserver?.disconnect();
+    if (canWatchSize) {
+      videoEl.removeEventListener("resize", updateGain);
+      videoEl.removeEventListener("loadedmetadata", updateGain);
+    }
     cancelAnimationFrame(rafId);
     // the pointerlockchange listener is gone, so unlock here
     if (keyboardLocked) {
@@ -943,5 +977,10 @@ export function setupCapture({
     }
   };
 
-  return { cleanup, getMetrics, syncKeyboardLock: updateKeyboardLock, engage, release };
+  const setMouse = (settings: MouseSettings) => {
+    mouseSettings = settings;
+    updateGain();
+  };
+
+  return { cleanup, getMetrics, syncKeyboardLock: updateKeyboardLock, engage, release, setMouse };
 }

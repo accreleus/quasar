@@ -36,6 +36,7 @@ import { mintSignalingToken } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer } from "../../api/types";
 import { setupCapture, type GamepadIdentity } from "../../input/capture";
+import { NEUTRAL_MOUSE, type MouseSettings } from "../../input/mouseScale";
 import { QuasarSession, type RebindOutcome, type TakeoverRefusal } from "../../webrtc/session";
 import type { RecoveryState } from "../../webrtc/recovery";
 import { PlayoutController, resolveInitialPlayoutMs } from "../../webrtc/playout";
@@ -338,6 +339,8 @@ export interface SessionRuntime {
   engage(): ReturnType<ReturnType<typeof setupCapture>["engage"]> | null;
   release(): void;
   syncKeyboardLock(): void;
+  /** Relative mouse speed; held for a channel that opens later. */
+  setMouse(settings: MouseSettings): void;
   /** SYNCHRONOUS truth for gesture handlers, which must not read last-rendered
    *  state. This is why the runtime is an object and not a hook. */
   isCaptured(): boolean;
@@ -372,6 +375,8 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
   let captureKbSync: (() => void) | null = null;
   let captureEngage: ReturnType<typeof setupCapture>["engage"] | null = null;
   let captureRelease: (() => void) | null = null;
+  let captureSetMouse: ((m: MouseSettings) => void) | null = null;
+  let mouse: MouseSettings = NEUTRAL_MOUSE;
   let audioCleanup: (() => void) | null = null;
   let audioEl: HTMLAudioElement | null = null;
   let audioHeld = true;
@@ -466,6 +471,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     captureKbSync = null;
     captureEngage = null;
     captureRelease = null;
+    captureSetMouse = null;
     // Bench stops before telemetry: its final flush reads the clock offset off
     // the telemetry instance. __qBench stays on window for the harness.
     bench?.stop();
@@ -500,7 +506,9 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       onSummonOverlay: () => cfg.callbacks.onSummonOverlay(),
       onKeyboardLockRefused: (error) => cfg.callbacks.onKeyboardLockRefused?.(error),
       onNonStandardGamepad: (pad) => cfg.callbacks.onNonStandardGamepad?.(pad),
+      mouse,
     });
+    captureSetMouse = capture.setMouse;
     captureCleanup = capture.cleanup;
     captureKbSync = capture.syncKeyboardLock;
     captureEngage = capture.engage;
@@ -940,6 +948,10 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     engage: () => captureEngage?.() ?? null,
     release: () => captureRelease?.(),
     syncKeyboardLock: () => captureKbSync?.(),
+    setMouse: (m) => {
+      mouse = m;
+      captureSetMouse?.(m);
+    },
     isCaptured: () => captured,
 
     cancelRecovery: () => transport?.cancelRecovery(),
