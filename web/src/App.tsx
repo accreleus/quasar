@@ -16,21 +16,8 @@ import { LoginPage } from "./pages/LoginPage";
 import { NotFound } from "./pages/NotFound";
 import { SetupWizard } from "./pages/setup/SetupWizard";
 import { RequireClaimedInstance } from "./setup/RequireClaimedInstance";
-import { AccountLayout } from "./pages/app/account/AccountLayout";
-import {
-  AccountSection,
-  PreferencesSection,
-  UsageSection,
-} from "./pages/app/account/AccountSections";
-import { AccountOverlay } from "./pages/app/account/AccountOverlay";
-import { AccountProfile } from "./pages/app/account/AccountProfile";
-import { AccountDevices } from "./pages/app/account/AccountDevices";
-import { AccountSessions } from "./pages/app/account/AccountSessions";
-import { AccountStreaming } from "./pages/app/account/AccountStreaming";
-import { AccountAppearance } from "./pages/app/account/AccountAppearance";
 import { AppHomeNext } from "./pages/app/AppHomeNext";
 import { AppLayout } from "./pages/app/AppLayout";
-import { AccountStorage } from "./pages/app/account/AccountStorage";
 import { RouteErrorBoundary, RouteSkeleton } from "./components/RouteBoundary";
 import { OverlayPreferencesRoute, useOverlayPreferences } from "./settings/OverlayPreferencesContext";
 
@@ -69,6 +56,37 @@ const RegisterPage = lazyPage(() =>
 const StyleguidePage = lazyPage(() =>
   import("./pages/StyleguidePage").then((m) => ({ default: m.StyleguidePage }))
 );
+
+// The account area loads as one chunk (pages/app/account/area.ts). A deep link
+// into it preloads that chunk from index.html (routePreloads in vite.config.ts),
+// and App starts the import as soon as it loads on an account URL.
+type AccountArea = typeof import("./pages/app/account/area");
+type Lazy = { default: React.ComponentType<any> };
+let accountArea: AccountArea | undefined;
+const loadAccountArea = () => import("./pages/app/account/area").then((m) => (accountArea = m));
+if (typeof location !== "undefined" && location.pathname.startsWith("/app/account")) void loadAccountArea();
+// Once the chunk is in, hand React.lazy a thenable that resolves synchronously:
+// lazy then renders without suspending, so a deep link shows no fallback and
+// does not wait out React's throttle on revealing suspended content.
+const accountPage = (name: keyof AccountArea) =>
+  lazyPage(() => {
+    const area = accountArea;
+    if (area) return { then: (resolve: (m: Lazy) => void) => resolve({ default: area[name] }) } as unknown as Promise<Lazy>;
+    return loadAccountArea().then((m) => ({ default: m[name] }));
+  });
+const account = {
+  Layout: accountPage("AccountLayout"),
+  AccountSection: accountPage("AccountSection"),
+  PreferencesSection: accountPage("PreferencesSection"),
+  UsageSection: accountPage("UsageSection"),
+  Overlay: accountPage("AccountOverlay"),
+  Profile: accountPage("AccountProfile"),
+  Devices: accountPage("AccountDevices"),
+  Sessions: accountPage("AccountSessions"),
+  Streaming: accountPage("AccountStreaming"),
+  Appearance: accountPage("AccountAppearance"),
+  Storage: accountPage("AccountStorage"),
+};
 
 // Admin pages table: each entry is a separate lazy() chunk boundary.
 const adminPages = {
@@ -244,24 +262,24 @@ export function App() {
         {/* /app/account moves OUT of AppLayout: AccountLayout supplies its own
             rail shell (mirroring the admin console), which would conflict with
             AppLayout's topbar pill nav. */}
-        <Route path="/app/account" element={<AccountLayout />}>
+        <Route path="/app/account" element={<Suspended><account.Layout /></Suspended>}>
           <Route index element={<Navigate to="/app/account/profile" replace />} />
           {/* Three section containers, each owning one head and its tab row
               (handoff §A.22). The pathless layout routes keep the URLs flat. */}
-          <Route element={<AccountSection />}>
-            <Route path="profile" element={<AccountProfile />} />
-            <Route path="devices" element={<AccountDevices />} />
+          <Route element={<Suspended><account.AccountSection /></Suspended>}>
+            <Route path="profile" element={<Suspended><account.Profile /></Suspended>} />
+            <Route path="devices" element={<Suspended><account.Devices /></Suspended>} />
           </Route>
-          <Route element={<PreferencesSection />}>
-            <Route path="overlay" element={<AccountOverlay />} />
-            <Route path="streaming" element={<AccountStreaming />} />
+          <Route element={<Suspended><account.PreferencesSection /></Suspended>}>
+            <Route path="overlay" element={<Suspended><account.Overlay /></Suspended>} />
+            <Route path="streaming" element={<Suspended><account.Streaming /></Suspended>} />
             <Route path="region" element={<ClassicRedirect to="/app/account/streaming" />} />
             <Route path="input" element={<ClassicRedirect to="/app/account/streaming" />} />
-            <Route path="appearance" element={<AccountAppearance />} />
+            <Route path="appearance" element={<Suspended><account.Appearance /></Suspended>} />
           </Route>
-          <Route element={<UsageSection />}>
-            <Route path="storage" element={<AccountStorage />} />
-            <Route path="sessions" element={<AccountSessions />} />
+          <Route element={<Suspended><account.UsageSection /></Suspended>}>
+            <Route path="storage" element={<Suspended><account.Storage /></Suspended>} />
+            <Route path="sessions" element={<Suspended><account.Sessions /></Suspended>} />
           </Route>
           {/* The password card merges into Profile in v3 (spec §3.3), so
               /security is a redirect, not a page. */}
