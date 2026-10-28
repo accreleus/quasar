@@ -50,6 +50,7 @@ own; the two do not move together, and that is deliberate.
 - **Classic layout is deprecated (#855).** Account ▸ Appearance now says the switch back to the previous player layout will be removed in a later release. Nothing is removed yet.
 
 ### Fixed
+- A toast's auto-dismiss timer no longer outlives the toast (#941). It started during render and was never cleared, so a toast closed early left a timer behind (two per toast in React StrictMode). No visible change.
 - **Steam's idle screensaver is off when Steam runs from the Steam image (#834).** The Steam image sets it to Disabled before Steam starts, unless you chose a timeout yourself, so a long idle stream no longer ends on Steam's slideshow. Ships with the quasar-images `stable` update that comes with this release.
 - **A keyboard layout that is not a real one no longer crashes the app on its first key (#902).** A value like `zz` passes the control plane's format check; the app's own compositor failed to build it and Steam exited seven seconds after the first key. The node agent now checks the layout and variant against its keyboard data before the app starts, and a pair that is not there becomes US for the app and the session's compositor alike, with one warning (`keyboard-layout-unavailable`) in the node agent's log.
 - Pressing Play on a game tile launches it when the recommended quality only needs to step down from a codec the host lacks (for example AV1 on an AMD GPU), instead of opening the detail panel with "No host that can encode this quality is available" (#817).
