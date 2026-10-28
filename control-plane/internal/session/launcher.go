@@ -1026,6 +1026,7 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 		if errors.Is(err, errSessionNotAssigned) {
 			// Whoever took the row owns its outcome and nothing reached the agent; a
 			// failure here would audit a session.failed for a clean stop.
+			c.log.Debug("dispatch abandoned: a stop owns the row", "session_id", sessionID, "err", err)
 			return false
 		}
 		if err != nil {
