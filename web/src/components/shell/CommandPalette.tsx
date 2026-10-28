@@ -36,6 +36,7 @@ import {
   type PaletteUser,
 } from "./paletteSearch";
 import { revealWhenReady, useCancelRevealOnNavigation } from "./settingsSearch/reveal";
+import { isTypingTarget } from "./LazyCommandPalette";
 import {
   arrangeWithSettings,
   placeOf,
@@ -51,14 +52,6 @@ import { useLibraryExtras } from "../../pages/app/library/libraryExtras";
  *  churn the search memo on each render. */
 const NONE: readonly never[] = [];
 
-/** True when a keystroke landed in something that eats plain characters — the
- *  `/` shortcut must not steal a slash the user is typing into a field. */
-function isTypingTarget(target: EventTarget | null): boolean {
-  const el = target as HTMLElement | null;
-  if (!el || !el.tagName) return false;
-  if (/^(input|textarea|select)$/i.test(el.tagName)) return true;
-  return el.isContentEditable === true;
-}
 
 export function CommandPalette({
   open,
