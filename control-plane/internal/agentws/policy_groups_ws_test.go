@@ -81,26 +81,18 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// collectOffers sends heartbeats until every group has one offer. Startup map
-// acknowledgement can also dispatch while the first heartbeat is in flight,
-// so claims observed between polls do not identify one dispatch pass.
-func (a typedAgent) collectOffers(t *testing.T, pool *pgxpool.Pool, want int) map[string]map[string]any {
+// collectOffers reads the offers off the socket, whichever pass claimed them:
+// the startup map acknowledgement can claim some before the first heartbeat, and
+// a claim holds its lease, so counting claims in the database misses those. A
+// heartbeat runs one pass of at most PolicyOffersPerPass groups; the offers of
+// every pass are on the socket before the next message is read, so read up to
+// one pass's worth per heartbeat and ask again.
+func (a typedAgent) collectOffers(t *testing.T, want int) map[string]map[string]any {
 	t.Helper()
 	offers := map[string]map[string]any{}
-	claimed := func() int {
-		var n int
-		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM host_reconcile_obligations WHERE host_id=$1::uuid AND next_attempt_at>now()`, a.hostID).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n
-	}
-	start := claimed()
 	for len(offers) < want {
-		before := start + len(offers)
 		a.send(t, map[string]any{"type": "heartbeat", "running_sessions": []string{}, "ts_unix_ms": time.Now().UnixMilli()})
-		var sent int
-		waitUntil(t, "an offer pass", func() bool { sent = claimed() - before; return sent > 0 })
-		for i := 0; i < sent; i++ {
+		for i := min(hostcfg.PolicyOffersPerPass, want-len(offers)); i > 0; i-- {
 			offer := a.readUntil(t, "config_policy_offer")
 			group := offer["group"].(string)
 			if scope, ok := hostcfg.PolicyGroupScope(group); !ok || scope != "next_session" {
@@ -110,9 +102,6 @@ func (a typedAgent) collectOffers(t *testing.T, pool *pgxpool.Pool, want int) ma
 				t.Fatalf("duplicate offer for group %q", group)
 			}
 			offers[group] = offer
-			if len(offers) > want {
-				t.Fatalf("received %d groups, expected %d", len(offers), want)
-			}
 		}
 	}
 	return offers
@@ -212,7 +201,7 @@ func TestTypedAgentEveryNextSessionGroupReportsIndependently(t *testing.T) {
 	if _, err := store.SavePolicy(ctx, agent.hostID, "0", changes, nil); err != nil {
 		t.Fatal(err)
 	}
-	offers := agent.collectOffers(t, pool, len(groups))
+	offers := agent.collectOffers(t, len(groups))
 	baseline := policyBaseline()
 	for group, offer := range offers {
 		resolved := offer["resolved_settings"].(map[string]any)
@@ -297,7 +286,7 @@ func TestTypedAgentEveryNextSessionGroupReportsIndependently(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE host_reconcile_obligations SET next_attempt_at=now()-interval '1 second' WHERE host_id=$1::uuid`, agent.hostID); err != nil {
 		t.Fatal(err)
 	}
-	retried := agent.collectOffers(t, pool, 2)
+	retried := agent.collectOffers(t, 2)
 	if len(retried) != 2 || retried["slices"] == nil || retried["target_usage"] == nil {
 		t.Fatalf("retry pass offered %v; only the two transient groups may return", keys(retried))
 	}
@@ -382,7 +371,7 @@ func TestLivePolicyReportDoesNotGrowRetainedState(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	// Startup pass can claim the obligation before collectOffers samples its baseline, so read the offer instead of counting claims.
+	// The startup pass can claim the obligation first; read the offer off the socket rather than count claims.
 	agent.send(t, map[string]any{"type": "heartbeat", "running_sessions": []string{}, "ts_unix_ms": time.Now().UnixMilli()})
 	offer := agent.readUntil(t, "config_policy_offer")
 	if offer["group"] != "idle_timeout_secs" {
