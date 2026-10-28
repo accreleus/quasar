@@ -9,10 +9,11 @@
  */
 
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, useLocation, Route, Routes } from "react-router-dom";
 
 import { App, RedirectWithParams } from "./App";
+import { accountArea } from "./pages/lazyPages";
 import { AuthContext, type AuthContextValue } from "./auth/context";
 import { ThemeProvider } from "./settings/ThemeContext";
 import { ToastProvider } from "./components/Toast";
@@ -157,6 +158,36 @@ describe("the account paths in the new design", () => {
     expect(await screen.findByRole("heading", { name: "Account", level: 1 })).toBeInTheDocument();
     await new Promise((r) => setTimeout(r, 50));
     expect(path).toBe(entry);
+  });
+});
+
+describe("a deep link to the account area", () => {
+  beforeEach(() => {
+    localStorage.setItem("quasar.ui.classic.u1", "0");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } })));
+  });
+
+  // index.html preloads the chunk for an account URL; once it is in, the route must be
+  // served from it without the skeleton. Under act() React flushes a microtask-resolved
+  // lazy before committing a fallback, so the synchronous path itself (the ~300 ms
+  // reveal throttle in a browser) is guarded by lib/preloadable.test.tsx, not here.
+  it("renders without the route skeleton once its chunk is in", async () => {
+    accountArea.preload();
+    await act(async () => {
+      await import("./pages/app/account/area");
+    });
+    let skeleton = false;
+    // Read the added nodes, not the DOM: a skeleton can be gone by the time this runs.
+    const seen = new MutationObserver((records) => {
+      for (const r of records)
+        for (const n of r.addedNodes)
+          if (n instanceof Element && (n.matches('[aria-label="Loading page"]') || n.querySelector('[aria-label="Loading page"]'))) skeleton = true;
+    });
+    seen.observe(document.body, { subtree: true, childList: true });
+    renderAt("/app/account/region");
+    expect(await screen.findByRole("heading", { name: "Account", level: 1 })).toBeInTheDocument();
+    seen.disconnect();
+    expect(skeleton).toBe(false);
   });
 });
 
