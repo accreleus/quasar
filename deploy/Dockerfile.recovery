@@ -11,8 +11,25 @@
 # Bases are digest-pinned, as release preflight requires of a release artifact
 # (scripts/release/release-manifest.json). rust:1.94.0-alpine, the RUST_VERSION of
 # deploy/pins.env:
-FROM rust@sha256:ff0adc35894eb79586ce752a1b5a9eadc88b938c56d8f2b4b537b6258ff3fa10 AS build
+FROM rust@sha256:ff0adc35894eb79586ce752a1b5a9eadc88b938c56d8f2b4b537b6258ff3fa10 AS chef
 RUN apk add --no-cache musl-dev
+# cargo-chef (#920): the dependencies compile in a layer keyed only on the manifests and
+# Cargo.lock, so a source change rebuilds the workspace crates alone. Same version as
+# Dockerfile.vulkan's `chef` stage; keep the two in step.
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN cargo install cargo-chef --version "${CARGO_CHEF_VERSION}" --locked \
+    && rm -rf /usr/local/cargo/registry
+
+FROM chef AS recipe
+WORKDIR /src/node-agent
+COPY node-agent /src/node-agent
+RUN cargo chef prepare --recipe-path /recipe.json
+
+FROM chef AS build
+WORKDIR /src/node-agent
+COPY --from=recipe /recipe.json recipe.json
+# Same profile, --locked and -p/--bin selection as the final build below, or it recompiles these.
+RUN cargo chef cook --release --locked --recipe-path recipe.json -p quasar-recovery --bin quasar-recovery
 COPY node-agent /src/node-agent
 ARG SOURCE_COMMIT=unknown
 ARG QUASAR_VERSION=

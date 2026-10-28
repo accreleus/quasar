@@ -48,6 +48,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 - **Classic layout is deprecated (#855).** Account ▸ Appearance now says the switch back to the previous player layout will be removed in a later release. Nothing is removed yet.
+- **Faster image builds: the agent and recovery images compile their Rust dependencies in a separate cached layer (#920).** A change under `node-agent/` now rebuilds only the workspace crates, not every dependency, for the node agent, the Steam launch helper and the recovery actor. The shipped images are unchanged.
 
 ### Fixed
 - **Steam's idle screensaver is off when Steam runs from the Steam image (#834).** The Steam image sets it to Disabled before Steam starts, unless you chose a timeout yourself, so a long idle stream no longer ends on Steam's slideshow. Ships with the quasar-images `stable` update that comes with this release.

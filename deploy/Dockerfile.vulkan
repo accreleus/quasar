@@ -153,6 +153,29 @@ ARG SAMPLY_VERSION=0.13.1
 # one set of bytes. (#545 then removed the second shipped lineage outright.)
 ARG TOOLCHAIN_IMAGE=toolchain
 
+# ══ Dependency cache (#920) ═══════════════════════════════════════════════════
+# cargo-chef splits a Rust build into a layer keyed only on the manifests and Cargo.lock
+# (`recipe.json`) and a layer keyed on the sources, so a change under node-agent/ rebuilds the
+# workspace crates and not the ~5 minutes of dependencies. These stages sit ABOVE the
+# `toolchain` stage on purpose: deploy/toolchain-hash.sh hashes the text from the toolchain
+# FROM line to the next FROM, so nothing here (or in the `build` stage) moves the toolchain
+# tag. cargo-chef itself is built once, on the digest-pinned rust:1.94.0-alpine that
+# `launch-helper` already uses, and its static musl binary is copied into the glibc `build`
+# stage. Dockerfile.recovery carries its own copy of this pair (it shares no stage with this
+# file); keep the two cargo-chef versions in step.
+FROM rust@sha256:ff0adc35894eb79586ce752a1b5a9eadc88b938c56d8f2b4b537b6258ff3fa10 AS chef
+RUN apk add --no-cache musl-dev
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN cargo install cargo-chef --version "${CARGO_CHEF_VERSION}" --locked \
+    && rm -rf /usr/local/cargo/registry
+
+# The recipe: every Cargo.toml + Cargo.lock of the node-agent workspace, source stripped.
+# Byte-identical until a manifest or the lockfile changes, so the cook layers below stay cached.
+FROM chef AS recipe
+WORKDIR /src/node-agent
+COPY node-agent /src/node-agent
+RUN cargo chef prepare --recipe-path /recipe.json
+
 # ══ Toolchain stage (target: toolchain → quasar-gst-toolchain:<pins-hash>) ════════
 # Everything that is expensive and pin-keyed. Produces /opt/gst plus the Rust and
 # CUDA toolchains. Carries NO node-agent source and NO node-agent binary — that
@@ -730,6 +753,18 @@ FROM ${TOOLCHAIN_IMAGE} AS build
 # The feature is safe in the vendor-neutral image: the CUDA symbols are dlopened, not
 # linked (`readelf -d` shows no libcuda/libgstcuda DT_NEEDED), so the same binary starts
 # and runs on an AMD/Intel host.
+#
+# Dependencies first (#920): `cargo chef cook` compiles every dependency from the recipe in a
+# layer that only a manifest or Cargo.lock change invalidates. Its flags (profile, --locked,
+# features) must match the final `cargo build` below exactly, or that build recompiles them
+# anyway. Build identity is NOT passed here: it only reaches the workspace crates' build
+# scripts, which belong to the layer below.
+COPY --from=chef /usr/local/cargo/bin/cargo-chef /usr/local/bin/cargo-chef
+WORKDIR /src/node-agent
+COPY --from=recipe /recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json \
+        $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda )
+
 COPY node-agent /src/node-agent
 
 # Build identity (#107): node-agent/build.rs bakes SOURCE_COMMIT and QUASAR_VERSION
@@ -745,7 +780,7 @@ ARG SOURCE_COMMIT=unknown
 ARG QUASAR_VERSION=
 RUN cd /src/node-agent \
     && QUASAR_SOURCE_COMMIT="${SOURCE_COMMIT}" \
-       QUASAR_VERSION="${QUASAR_VERSION}" cargo build --release \
+       QUASAR_VERSION="${QUASAR_VERSION}" cargo build --release --locked \
         $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda ) \
     && install -Dm0755 target/release/quasar-node-agent /opt/agent/quasar-node-agent
 
@@ -754,8 +789,10 @@ RUN cd /src/node-agent \
 # libc, so it is a static musl binary, built like deploy/Dockerfile.recovery on the same
 # digest-pinned rust:1.94.0-alpine. The runtime stage ships it beside the agent, which
 # copies it into its runtime dir for sessions to mount.
-FROM rust@sha256:ff0adc35894eb79586ce752a1b5a9eadc88b938c56d8f2b4b537b6258ff3fa10 AS launch-helper
-RUN apk add --no-cache musl-dev
+FROM chef AS launch-helper
+WORKDIR /src/node-agent
+COPY --from=recipe /recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json -p quasar-launch-helper
 COPY node-agent /src/node-agent
 RUN cd /src/node-agent \
     && cargo build --release --locked -p quasar-launch-helper \
