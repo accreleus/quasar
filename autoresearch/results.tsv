@@ -11,3 +11,4 @@ n	track	hypothesis	primary_before	primary_after	guards	kept	impeccable_finding
 10	P	lazy-load the setup wizard with small common chunks inlined (rolldown experimentalInlineCommonChunks)	206883	197325	tests=pass;ttu=app:553->542/account:713->717/settings:728->815;px_max=0.00000	no	-
 11	P	split the trigger place/label helpers out of settingsIndex so the settings-search index leaves the entry	206883	203426	tests=pass;ttu=app:544->540/account:711->712/settings:727->732;px_max=0.00000	yes	-
 12	P	split playoutOverride and the palette trigger-label helpers into tiny modules so playout.ts and paletteSearch leave the entry	203426	201630	tests=pass;ttu=app:553->557/account:734->730/settings:720->725;px_max=0.00000	yes	-
+13	U	Switch: inner label.switch becomes a span so the row label names the input	203	183	tests=pass	yes	axe label + label-title-only on #raw-mouse/#flip-scroll/#nintendo-layout (critique A1)
