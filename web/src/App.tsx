@@ -14,7 +14,6 @@ import { RequireAdmin } from "./auth/RequireAdmin";
 import { RequireAuth } from "./auth/RequireAuth";
 import { LoginPage } from "./pages/LoginPage";
 import { NotFound } from "./pages/NotFound";
-import { SetupWizard } from "./pages/setup/SetupWizard";
 import { RequireClaimedInstance } from "./setup/RequireClaimedInstance";
 import { AppHomeNext } from "./pages/app/AppHomeNext";
 import { AppLayout } from "./pages/app/AppLayout";
@@ -47,6 +46,11 @@ const GamePageRoute = gamePage.component("GamePageRoute");
 // code with admin Settings, and splitting it fragments that page's chunks.
 const RegisterPage = lazyPage(() =>
   import("./pages/RegisterPage").then((m) => ({ default: m.RegisterPage }))
+);
+// First-run setup: admin-only and once per install. What it shares with the admin
+// pages is grouped in vite.config.ts (ADMIN_SHARED), preloaded with /admin.
+const SetupWizard = lazyPage(() =>
+  import("./pages/setup/SetupWizard").then((m) => ({ default: m.SetupWizard }))
 );
 const StyleguidePage = lazyPage(() =>
   import("./pages/StyleguidePage").then((m) => ({ default: m.StyleguidePage }))
@@ -214,7 +218,7 @@ export function App() {
           instance here from any other path; this Route makes /setup itself
           resolve once it's there, and lets an authenticated admin reach it
           directly (resume) too. */}
-      <Route path="/setup" element={<SetupWizard />} />
+      <Route path="/setup" element={<Suspended><SetupWizard /></Suspended>} />
 
       {/* User area — any authenticated user. */}
       <Route element={<RequireAuth />}>

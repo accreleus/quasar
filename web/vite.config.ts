@@ -106,6 +106,10 @@ function operatorScripts(): Plugin {
 // library page imports stays with the entry even if it matches here.
 const CONSOLE_SHARED = /\/src\/(components\/(Bar|PageHeader|LoadingState|ResourceStates|Table)\.tsx|components\/shell\/(ConsoleShell|Rail|Topbar|sectionHead)\.tsx|components\/shell\/(sectionTabs|paletteScope|settingsSearch\/place)\.ts|lib\/format\/(bytes|duration|relativeTime)\.ts|lib\/formatLegacy\.ts|lib\/region\/(options|zoneTable|zones)\.ts|input\/mouseScale\.ts|pages\/app\/account\/DeviceCard\.tsx)$/;
 
+// What the lazy setup wizard shares with the admin pages: one chunk instead of
+// several, reached by the /admin route preload through the admin layout's imports.
+const ADMIN_SHARED = /\/src\/(api\/(admin|types)\.ts|components\/(SecretField|ReadinessCard|StatusChip)\.tsx|lib\/(hostStorage|hostCodecs)\.ts|pages\/admin\/library\/(imageStatus|imageRollout)\.tsx?)$/;
+
 // A lazily split area opened by a deep link would wait for the entry to run and
 // render the route before its chunks are even requested. For these path
 // prefixes index.html requests them up front, in parallel with the entry.
@@ -164,6 +168,7 @@ export default defineConfig({
           groups: [
             { name: "web", tags: ["$initial"], priority: 2 },
             { name: "console", test: CONSOLE_SHARED, priority: 1 },
+            { name: "admin-shared", test: ADMIN_SHARED, priority: 1 },
           ],
         },
       },
