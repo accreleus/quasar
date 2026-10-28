@@ -86,7 +86,7 @@ export function RegionSection() {
   const saveLanguage = (next: string | null) =>
     void save(
       { language: next },
-      next ? `Saved. Your next launch starts in ${nameOf(LANGUAGES, next)}.` : "Saved. Your next launch follows your browser's language.",
+      next ? `Saved. Your next launch starts in ${nameOf(languages, next)}.` : "Saved. Your next launch follows your browser's language.",
       "Could not save your language.",
     );
   const saveFormat = (next: string | null) =>

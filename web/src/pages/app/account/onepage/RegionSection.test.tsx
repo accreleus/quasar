@@ -253,6 +253,12 @@ describe("Language and region format", () => {
     expect(fmt().selectedOptions[0].text).toBe("Same as language (de-AT)");
   });
 
+  it("follows the browser's language before an install default that differs", async () => {
+    api.getRegionInput.mockResolvedValue(withRegion({}, { language: "fr-FR" }));
+    renderSection();
+    expect((await lang()).selectedOptions[0].text).toBe("Follow my browser (English (US))");
+  });
+
   it("falls back to the install default when the browser reports no language", async () => {
     vi.spyOn(window.navigator, "language", "get").mockReturnValue("");
     api.getRegionInput.mockResolvedValue(withRegion({}, { language: "fr-FR" }));
