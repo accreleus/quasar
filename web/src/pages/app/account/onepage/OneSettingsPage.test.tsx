@@ -35,6 +35,7 @@ vi.mock("../AccountAppearance", () => ({ AccountAppearance: () => <p>appearance 
 vi.mock("../AccountSessions", () => ({ AccountSessions: () => <p>sessions stub</p> }));
 vi.mock("../AccountStorage", () => ({ AccountStorage: () => <p>storage stub</p> }));
 vi.mock("../PasswordCard", () => ({ PasswordCard: () => <p>password stub</p> }));
+vi.mock("./InputSection", () => ({ InputSection: () => <p>input stub</p> }));
 
 const logout = vi.fn();
 const auth = {

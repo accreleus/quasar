@@ -65,6 +65,32 @@ export const ACCOUNT_SETTINGS: readonly SettingEntry[] = [
     keywords: "time zone clock city country utc gmt offset follow my browser tz",
     target: { sel: "#tz-label", up: ".field" },
   },
+  sec("input", "Input", "input", "input", "keyboard mouse controller gamepad"),
+  {
+    id: "acct-match-cursor", label: "Match cursor to my window", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse cursor speed fast slow stream bigger window size scale match desktop",
+    target: { sel: "#match-cursor-l", up: ".field" },
+  },
+  {
+    id: "acct-mouse-sensitivity", label: "Mouse sensitivity", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse speed fast slow sensitivity dpi pointer cursor",
+    target: { sel: "#mouse-sensitivity", up: ".field" },
+  },
+  {
+    id: "acct-raw-mouse", label: "Raw mouse input (no acceleration)", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse acceleration raw unadjusted movement pointer lock chrome edge",
+    target: { sel: "#raw-mouse", up: ".ac-sw" },
+  },
+  {
+    id: "acct-flip-scroll", label: "Flip scroll direction", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse wheel scroll reverse invert natural direction up down",
+    target: { sel: "#flip-scroll", up: ".ac-sw" },
+  },
+  {
+    id: "acct-nintendo-layout", label: "Gamepad Nintendo layout", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "controller gamepad nintendo switch pro swap a b x y buttons layout",
+    target: { sel: "#nintendo-layout", up: ".ac-sw" },
+  },
   sec("overlay", "In-session overlay", "overlay", "overlay", "hud strip overlay stats"),
   {
     id: "acct-overlay-preset", label: "Overlay content", where: "Overlay", icon: "overlay", to: `${A}/overlay`,

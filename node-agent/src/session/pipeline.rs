@@ -68,6 +68,8 @@ pub(crate) const VIDEO_ENCODER_NAME: &str = "quasar-video-encoder";
 /// the runner without threading a handle through every builder.
 pub(crate) const VIDEO_PAYLOADER_NAME: &str = "quasar-video-payloader";
 mod source_branch;
+#[cfg(test)]
+pub(crate) use source_branch::keyboard_layout;
 // Also the media host probe's source + convert stage (`session::probe_media`): the probe
 // must build the compositor arm production builds, not a stand-in.
 pub(crate) use source_branch::{

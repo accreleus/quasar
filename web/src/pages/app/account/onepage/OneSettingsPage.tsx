@@ -31,6 +31,7 @@ import { AccountStorage } from "../AccountStorage";
 import { SteamDialogsField } from "../SteamDialogsField";
 import { LaunchFullscreenField } from "../LaunchFullscreenField";
 import { PasswordCard } from "../PasswordCard";
+import { InputSection } from "./InputSection";
 import { buildCapChips, deviceLabel } from "../DeviceCard";
 import { RegionSection } from "./RegionSection";
 import { ONE_PAGE_SECTIONS, sectionForPath, type OneSectionId } from "./sections";
@@ -57,6 +58,7 @@ export function OneSettingsPage() {
     profile: <ProfileStrip />,
     streaming: <StreamSection />,
     region: <RegionSection />,
+    input: <InputSection />,
     overlay: <AccountOverlay />,
     appearance: <AccountAppearance />,
     devices: <DevicesSection />,

@@ -20,7 +20,7 @@
 //   real-browser harness concern outside unit-test scope.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { setupCapture, keyboardLockSupported, pointerLockSupported } from "./capture";
+import { setupCapture, keyboardLockSupported, pointerLockSupported, rawMouseSupported } from "./capture";
 import { EVDEV, MB_MAP } from "./evdev";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1331,6 +1331,219 @@ describe("engage() without Pointer Lock — the send gate opens anyway", () => {
     );
 
     cleanup();
+  });
+});
+
+describe("gamepad — Nintendo layout (control-api.md §Region and Input settings)", () => {
+  const NIN = { match: false, sensitivity: 1, raw: false, flip: false, nintendo: true };
+  const OFF = { ...NIN, nintendo: false };
+  // Button i carries the value i + 1 (12 buttons, standard layout) so every swap is visible.
+  const standardPad = (over: object = {}) => ({
+    index: 0, mapping: "standard", axes: [0.25, -0.5],
+    buttons: Array.from({ length: 12 }, (_, i) => ({ value: i + 1 })), ...over,
+  });
+  const SENT = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  const SWAPPED = [2, 1, 4, 3, 5, 6, 7, 8, 9, 10, 11, 12];
+
+  function open(pad: object, mouse?: typeof NIN) {
+    let poll: ((t: number) => void) | null = null;
+    vi.stubGlobal("requestAnimationFrame", vi.fn((cb: (t: number) => void) => ((poll = cb), 1)));
+    Object.defineProperty(navigator, "getGamepads", { value: () => [pad], configurable: true });
+    const video = makeVideo();
+    const send = vi.fn();
+    const cap = setupCapture({ videoEl: video, sendInput: send, onCaptureChange: vi.fn(), channel: makeChannel(), mouse });
+    lockPointer(video);
+    return { cap, send, poll: (t = 0) => poll?.(t) };
+  }
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    unlockPointer();
+  });
+
+  it("off, and the default: the buttons go out in the pad's own order", () => {
+    for (const mouse of [OFF, undefined]) {
+      const { cap, send, poll } = open(standardPad(), mouse);
+      poll();
+      expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: SENT, axes: [0.25, -0.5] });
+      cap.cleanup();
+    }
+  });
+
+  it("on: A swaps with B and X with Y, nothing else moves", () => {
+    const { cap, send, poll } = open(standardPad(), NIN);
+    poll();
+    expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: SWAPPED, axes: [0.25, -0.5] });
+    cap.cleanup();
+  });
+
+  it("on: a pad that is not the standard layout is forwarded as it is", () => {
+    const { cap, send, poll } = open(standardPad({ mapping: "" }), NIN);
+    poll();
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ t: "gp", buttons: SENT }));
+    cap.cleanup();
+  });
+
+  it("on: a pad with fewer than four buttons is left alone", () => {
+    const { cap, send, poll } = open(standardPad({ buttons: [{ value: 1 }, { value: 1 }] }), NIN);
+    poll();
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ t: "gp", buttons: [1, 1] }));
+    cap.cleanup();
+  });
+
+  it("setMouse changes the layout of a running capture and the changed state goes out", () => {
+    const { cap, send, poll } = open(standardPad(), OFF);
+    poll();
+    send.mockClear();
+    poll(1);
+    expect(send).not.toHaveBeenCalled(); // unchanged state, nothing sent
+    cap.setMouse(NIN);
+    poll(2);
+    expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: SWAPPED, axes: [0.25, -0.5] });
+    send.mockClear();
+    cap.setMouse(OFF);
+    poll(3);
+    expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: SENT, axes: [0.25, -0.5] });
+    cap.cleanup();
+  });
+});
+
+describe("engage() with Raw mouse input (control-api.md §Region and Input settings)", () => {
+  const RAW = { match: false, sensitivity: 1, raw: true, flip: false, nintendo: false };
+  const open = (mouse = RAW) =>
+    setupCapture({
+      videoEl: document.createElement("video"),
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+      mouse,
+    });
+  const notSupported = () => new DOMException("not supported", "NotSupportedError");
+
+  it("on: asks for unadjustedMovement and reports a plain pointer-lock", async () => {
+    const lock = vi.fn((_o?: unknown) => Promise.resolve());
+    setPointerLockApi(lock);
+    const { cleanup, engage } = open();
+    expect(await engage()).toEqual({ mode: "pointer-lock" });
+    expect(lock).toHaveBeenCalledTimes(1);
+    expect(lock).toHaveBeenCalledWith({ unadjustedMovement: true });
+    cleanup();
+  });
+
+  it("off: the request carries no options at all, as before", async () => {
+    const lock = vi.fn((_o?: unknown) => Promise.resolve());
+    setPointerLockApi(lock);
+    const { cleanup, engage } = open({ ...RAW, raw: false, flip: false, nintendo: false });
+    expect(await engage()).toEqual({ mode: "pointer-lock" });
+    expect(lock.mock.calls).toEqual([[]]);
+    cleanup();
+  });
+
+  it("NotSupportedError: one plain request, a lock, and rawUnavailable", async () => {
+    const lock = vi.fn((o?: unknown) => (o ? Promise.reject(notSupported()) : Promise.resolve()));
+    setPointerLockApi(lock);
+    const { cleanup, engage } = open();
+    expect(await engage()).toEqual({ mode: "pointer-lock", rawUnavailable: true });
+    expect(lock.mock.calls).toEqual([[{ unadjustedMovement: true }], []]);
+    cleanup();
+  });
+
+  it("NotSupportedError, then a refused plain lock: failed, and no third request", async () => {
+    const lock = vi.fn((o?: unknown) => Promise.reject(o ? notSupported() : new Error("locked out")));
+    setPointerLockApi(lock);
+    const { cleanup, engage, getMetrics } = open();
+    const result = await engage();
+    expect(result.mode).toBe("failed");
+    expect(lock).toHaveBeenCalledTimes(2);
+    expect(getMetrics().captured).toBe(false);
+    cleanup();
+  });
+
+  it("any other refusal of the raw request is a real failure, not retried", async () => {
+    const lock = vi.fn(() => Promise.reject(new Error("locked out")));
+    setPointerLockApi(lock);
+    const { cleanup, engage } = open();
+    expect((await engage()).mode).toBe("failed");
+    expect(lock).toHaveBeenCalledTimes(1);
+    cleanup();
+  });
+
+  it("a requestPointerLock that returns no promise ignored the option: rawUnavailable", async () => {
+    const lock = vi.fn(() => undefined);
+    setPointerLockApi(lock);
+    const { cleanup, engage } = open();
+    expect(await engage()).toEqual({ mode: "pointer-lock", rawUnavailable: true });
+    expect(lock).toHaveBeenCalledTimes(1);
+    cleanup();
+  });
+
+  it("a second engage while one is pending asks the browser for nothing and shares its result", async () => {
+    let refuse: (e: unknown) => void = () => {};
+    const lock = vi.fn((o?: unknown) => (o ? new Promise<void>((_, rej) => (refuse = rej)) : Promise.resolve()));
+    setPointerLockApi(lock);
+    const { cleanup, engage } = open();
+    const first = engage();
+    const second = engage(); // a double tap before the raw request has settled
+    expect(lock.mock.calls).toEqual([[{ unadjustedMovement: true }]]);
+    refuse(notSupported());
+    expect(await first).toEqual({ mode: "pointer-lock", rawUnavailable: true });
+    expect(await second).toEqual({ mode: "pointer-lock", rawUnavailable: true });
+    expect(lock.mock.calls).toEqual([[{ unadjustedMovement: true }], []]);
+    cleanup();
+  });
+
+  it("raw on: a release between two engages lifts the guard, and raw off never had one", async () => {
+    const lock = vi.fn((_o?: unknown) => new Promise<void>(() => {}));
+    setPointerLockApi(lock);
+    const raw = open();
+    void raw.engage();
+    raw.release();
+    void raw.engage();
+    expect(lock).toHaveBeenCalledTimes(2);
+    raw.cleanup();
+    lock.mockClear();
+    const plain = open({ ...RAW, raw: false });
+    void plain.engage();
+    void plain.engage();
+    expect(lock).toHaveBeenCalledTimes(2);
+    plain.cleanup();
+  });
+
+  it("an engage after the pending one has settled starts a new request", async () => {
+    const lock = vi.fn((_o?: unknown) => Promise.reject(new Error("locked out")));
+    setPointerLockApi(lock);
+    const { cleanup, engage } = open();
+    expect((await engage()).mode).toBe("failed");
+    expect((await engage()).mode).toBe("failed");
+    expect(lock).toHaveBeenCalledTimes(2);
+    cleanup();
+  });
+
+  it("setMouse turns it on for the next engage", async () => {
+    const lock = vi.fn((_o?: unknown) => Promise.resolve());
+    setPointerLockApi(lock);
+    const { cleanup, engage, release, setMouse } = open({ ...RAW, raw: false, flip: false, nintendo: false });
+    setMouse(RAW);
+    await engage();
+    expect(lock).toHaveBeenCalledWith({ unadjustedMovement: true });
+    release();
+    cleanup();
+  });
+});
+
+describe("rawMouseSupported", () => {
+  const ua = (v: string) => vi.spyOn(navigator, "userAgent", "get").mockReturnValue(v);
+  afterEach(() => vi.restoreAllMocks());
+  it("needs Pointer Lock and a Chromium browser", () => {
+    setPointerLockApi(() => undefined);
+    ua("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0");
+    expect(rawMouseSupported()).toBe(true);
+    ua("Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0");
+    expect(rawMouseSupported()).toBe(false);
+    ua("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15");
+    expect(rawMouseSupported()).toBe(false);
+    ua("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36");
+    setPointerLockApi(null);
+    expect(rawMouseSupported()).toBe(false);
   });
 });
 
