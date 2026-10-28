@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -159,8 +160,45 @@ function routePreloads(): Plugin {
   };
 }
 
+// What a signed-in player downloads before the library page can run: the entry
+// chunk, its static imports and its CSS, gzipped as the control plane serves them.
+// `make test-web` builds, so growing past this fails the gate. Raise it on purpose,
+// with the reason in the commit, never to make a build green.
+const ENTRY_BUDGET_GZIP_BYTES = 157_000;
+
+function entryBudget(): Plugin {
+  return {
+    name: "quasar-entry-budget",
+    apply: "build",
+    generateBundle(_options, bundle) {
+      const entry = Object.values(bundle).find((c) => c.type === "chunk" && c.isEntry);
+      if (!entry || entry.type !== "chunk") return;
+      const files = new Set<string>();
+      const walk = (file: string) => {
+        if (files.has(file)) return;
+        files.add(file);
+        const c = bundle[file];
+        if (c?.type === "chunk") {
+          for (const i of c.imports) walk(i);
+          for (const css of c.viteMetadata?.importedCss ?? []) files.add(css);
+        }
+      };
+      walk(entry.fileName);
+      let total = 0;
+      for (const f of files) {
+        const out = bundle[f];
+        const source = out.type === "chunk" ? out.code : out.source;
+        total += zlib.gzipSync(source, { level: 6 }).length;
+      }
+      if (total > ENTRY_BUDGET_GZIP_BYTES) {
+        this.error(`quasar-entry-budget: the entry is ${total} B gzip, over the ${ENTRY_BUDGET_GZIP_BYTES} B budget in vite.config.ts.`);
+      }
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), preloadFonts(), operatorScripts(), routePreloads()],
+  plugins: [react(), preloadFonts(), operatorScripts(), routePreloads(), entryBudget()],
   build: {
     rolldownOptions: {
       output: {
