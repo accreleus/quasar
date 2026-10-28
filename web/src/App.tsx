@@ -14,7 +14,6 @@ import { RequireAdmin } from "./auth/RequireAdmin";
 import { RequireAuth } from "./auth/RequireAuth";
 import { LoginPage } from "./pages/LoginPage";
 import { NotFound } from "./pages/NotFound";
-import { RegisterPage } from "./pages/RegisterPage";
 import { SetupWizard } from "./pages/setup/SetupWizard";
 import { RequireClaimedInstance } from "./setup/RequireClaimedInstance";
 import { AccountLayout } from "./pages/app/account/AccountLayout";
@@ -32,7 +31,6 @@ import { AccountAppearance } from "./pages/app/account/AccountAppearance";
 import { AppHomeNext } from "./pages/app/AppHomeNext";
 import { AppLayout } from "./pages/app/AppLayout";
 import { AccountStorage } from "./pages/app/account/AccountStorage";
-import { StyleguidePage } from "./pages/StyleguidePage";
 import { RouteErrorBoundary, RouteSkeleton } from "./components/RouteBoundary";
 import { OverlayPreferencesRoute, useOverlayPreferences } from "./settings/OverlayPreferencesContext";
 
@@ -60,6 +58,16 @@ const SessionPage = lazyPage(() =>
 // The game page (and its stream settings) loads when a game is opened.
 const GamePageRoute = lazyPage(() =>
   import("./pages/app/game/GamePage").then((m) => ({ default: m.GamePageRoute }))
+);
+
+// Routes a signed-in player never visits. Login stays eager (a signed-out
+// visit's first paint), and so does the setup wizard: it shares most of its
+// code with admin Settings, and splitting it fragments that page's chunks.
+const RegisterPage = lazyPage(() =>
+  import("./pages/RegisterPage").then((m) => ({ default: m.RegisterPage }))
+);
+const StyleguidePage = lazyPage(() =>
+  import("./pages/StyleguidePage").then((m) => ({ default: m.StyleguidePage }))
 );
 
 // Admin pages table: each entry is a separate lazy() chunk boundary.
@@ -198,7 +206,7 @@ export function App() {
     <Routes>
       <Route path="/" element={<Navigate to="/app" replace />} />
       <Route path="/login" element={<LoginPage />} />
-      <Route path="/register" element={<RegisterPage />} />
+      <Route path="/register" element={<Suspended><RegisterPage /></Suspended>} />
       {/* First-run wizard (Spec B W1). Unauthenticated shell — must render
           with no session, since a virgin instance has no admin to sign in
           as yet. RequireClaimedInstance (above) is what routes a virgin
@@ -569,7 +577,7 @@ export function App() {
       </Route>
 
       {/* Dev-only: token/component showcase */}
-      <Route path="/styleguide" element={<StyleguidePage />} />
+      <Route path="/styleguide" element={<Suspended><StyleguidePage /></Suspended>} />
 
       <Route path="*" element={<NotFound />} />
     </Routes>
