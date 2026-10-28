@@ -117,6 +117,7 @@ const ADMIN_SHARED = /\/src\/(api\/(admin|types)\.ts|components\/(SecretField|Re
 const ROUTE_PRELOADS: Record<string, string> = {
   "/app/account": "src/pages/app/account/area.ts",
   "/admin": "src/pages/admin/AdminLayout.tsx",
+  "/login": "src/pages/LoginPage.tsx",
 };
 
 function routePreloads(): Plugin {

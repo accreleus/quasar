@@ -12,14 +12,14 @@ import { lazy, Suspense, type ReactNode } from "react";
 import { Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
 import { RequireAdmin } from "./auth/RequireAdmin";
 import { RequireAuth } from "./auth/RequireAuth";
-import { LoginPage } from "./pages/LoginPage";
 import { NotFound } from "./pages/NotFound";
 import { RequireClaimedInstance } from "./setup/RequireClaimedInstance";
 import { AppHomeNext } from "./pages/app/AppHomeNext";
 import { AppLayout } from "./pages/app/AppLayout";
 import { RouteErrorBoundary, RouteSkeleton } from "./components/RouteBoundary";
 import { OverlayPreferencesRoute, useOverlayPreferences } from "./settings/OverlayPreferencesContext";
-import { accountArea, gamePage, sessionPage } from "./pages/lazyPages";
+import { accountArea, gamePage, loginPage, sessionPage } from "./pages/lazyPages";
+import { loadSession } from "./auth/storage";
 
 // Admin area — lazy-loaded. Vite splits this into a separate chunk automatically
 // because of the dynamic import boundary. The Suspense fallback is intentionally
@@ -35,6 +35,11 @@ const Suspended = ({ children }: { children: ReactNode }) => (
     <Suspense fallback={<RouteSkeleton />}>{children}</Suspense>
   </RouteErrorBoundary>
 );
+
+// Sign-in is a signed-out visit's first paint: index.html preloads it on /login, and
+// any visit with no stored session (bound for /login) starts it here.
+if (typeof location !== "undefined" && (location.pathname.startsWith("/login") || !loadSession())) loginPage.preload();
+const LoginPage = loginPage.component("LoginPage");
 
 // The full-screen session view (WebRTC, input, HUD) and the game page load when
 // first needed; the library preloads them on hover, focus and idle (lazyPages.ts).
@@ -210,7 +215,7 @@ export function App() {
     <RequireClaimedInstance>
     <Routes>
       <Route path="/" element={<Navigate to="/app" replace />} />
-      <Route path="/login" element={<LoginPage />} />
+      <Route path="/login" element={<Suspended><LoginPage /></Suspended>} />
       <Route path="/register" element={<Suspended><RegisterPage /></Suspended>} />
       {/* First-run wizard (Spec B W1). Unauthenticated shell — must render
           with no session, since a virgin instance has no admin to sign in
