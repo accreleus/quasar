@@ -76,6 +76,7 @@ own; the two do not move together, and that is deliberate.
 - **A control-plane test no longer reads a state its own dispatch moves past (#916).** `TestAdmittedLaunchSupersedesAParkedSessionTheReadMissed` expected the superseded parked row to still be `stopping`; the heartbeat's dispatch goroutine could refuse the bind after the supersede and end it `stopped` first. It now asserts the real invariant: stopping or stopped, with the supersede's reason kept. No product change.
 - **Two tests name the catalog's default ref `stable` (#931).** `TestCatalogRefDefaultsStableWhenUnseeded` and the Images tab fixture still said `main`. No behaviour change.
 - **A test pins that Account ▸ Region follows the browser's language before an install default that differs (#933).** The status sentence after a language pick now names the language from the same list as the select. No visible change.
+- **The `agentws` policy-offer tests read offers off the socket instead of counting database claims (#925).** `collectOffers` timed out waiting for an offer pass when the startup pass had already claimed the offer, which showed under parallel load. `agentws` still runs alone after the other packages; a second flake there (`TestAClosingConnectionDoesNotReopenAHostAReconnectClaimed`) is not fixed.
 
 ## 0.5.0 — 2026-10-25
 

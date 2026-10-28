@@ -58,7 +58,7 @@ func TestUnissuedNextSessionAttemptIsRefused(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	offer := agent.collectOffers(t, pool, 1)["gop"]
+	offer := agent.collectOffers(t, 1)["gop"]
 	state := func(attemptID, phase string) map[string]any {
 		msg := map[string]any{
 			"type": "config_policy_state", "attempt_id": attemptID, "host_id": agent.hostID,
