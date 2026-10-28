@@ -127,9 +127,23 @@ jobs:
             -v "$RUNNER_TEMP/cargo-registry":/opt/cargo/registry \
             -e CARGO_INCREMENTAL=0 -e CARGO_PROFILE_DEV_DEBUG=line-tables-only \
             -e QUASAR_REQUIRE_LIVE_WEBRTC=1 -e XDG_RUNTIME_DIR=/tmp "$IMAGE" cargo test --workspace
-      - name: Cache size
+      # Keep only the compiled dependencies, as rust-cache does in ci.yml: the test and
+      # binary executables and the workspace crates are rebuilt by every run anyway, and
+      # they are most of the 2.9 GB. Inside the image, because its root owns the files.
+      - name: Prune the cache to dependencies
         if: always()
-        run: du -sh "$RUNNER_TEMP/cargo-registry" node-agent/target 2>/dev/null || true
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          du -sh node-agent/target 2>/dev/null || true
+          docker run --rm -v "$PWD/node-agent":/n "$IMAGE" sh -c '
+            [ -d /n/target/debug ] || exit 0
+            cd /n/target/debug
+            rm -rf incremental examples
+            find . -maxdepth 1 -type f -delete
+            find deps -maxdepth 1 -type f -perm -u+x ! -name "*.so" -delete
+            find deps .fingerprint build -maxdepth 1 -name "*quasar*" -exec rm -rf {} +'
+          du -sh "$RUNNER_TEMP/cargo-registry" node-agent/target 2>/dev/null || true
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: github.event_name == 'push' && steps.cargo.outputs.cache-hit != 'true'
         with:
