@@ -1,0 +1,198 @@
+{
+ "commit_note": "develop a38fac5f + the Toast timer fix (findings.md); harness frozen at this commit",
+ "base1": {
+  "entry_static": 282434,
+  "bytes": {
+   "app": 282434,
+   "account": 282434,
+   "settings": 299977
+  },
+  "ttu": {
+   "app": 596,
+   "account": 770,
+   "settings": 784
+  },
+  "ttu_runs": {
+   "app": [
+    600,
+    596,
+    587,
+    596,
+    598,
+    597,
+    586
+   ],
+   "account": [
+    764,
+    760,
+    759,
+    770,
+    802,
+    825,
+    821
+   ],
+   "settings": [
+    774,
+    777,
+    785,
+    841,
+    804,
+    784,
+    780
+   ]
+  },
+  "axe_total": 28,
+  "axe": {
+   "account.dark.desktop": 7,
+   "account.dark.phone": 5,
+   "account.light.desktop": 9,
+   "account.light.phone": 7,
+   "settings.dark.desktop": 0,
+   "settings.dark.phone": 0,
+   "settings.light.desktop": 0,
+   "settings.light.phone": 0
+  },
+  "axe_rules": {
+   "account.dark.desktop": [
+    "color-contrast:2",
+    "label-title-only:2",
+    "label:3"
+   ],
+   "account.dark.phone": [
+    "label-title-only:2",
+    "label:3"
+   ],
+   "account.light.desktop": [
+    "color-contrast:4",
+    "label-title-only:2",
+    "label:3"
+   ],
+   "account.light.phone": [
+    "color-contrast:2",
+    "label-title-only:2",
+    "label:3"
+   ],
+   "settings.dark.desktop": [],
+   "settings.dark.phone": [],
+   "settings.light.desktop": [],
+   "settings.light.phone": []
+  },
+  "impeccable_total": 175,
+  "impeccable": {
+   "account.dark.1280x900": 17,
+   "account.dark.390x844": 14,
+   "account.light.1280x900": 20,
+   "account.light.390x844": 16,
+   "settings.dark.1280x900": 28,
+   "settings.dark.390x844": 26,
+   "settings.light.1280x900": 28,
+   "settings.light.390x844": 26
+  },
+  "polish_primary": 203
+ },
+ "base2": {
+  "entry_static": 282434,
+  "bytes": {
+   "app": 282434,
+   "account": 282434,
+   "settings": 299977
+  },
+  "ttu": {
+   "app": 604,
+   "account": 775,
+   "settings": 781
+  },
+  "ttu_runs": {
+   "app": [
+    596,
+    604,
+    628,
+    587,
+    603,
+    611,
+    606
+   ],
+   "account": [
+    767,
+    780,
+    789,
+    761,
+    775,
+    778,
+    757
+   ],
+   "settings": [
+    777,
+    789,
+    811,
+    773,
+    781,
+    781,
+    778
+   ]
+  },
+  "ttu_ref": {
+   "app": 599,
+   "account": 762,
+   "settings": 776
+  },
+  "ttu_ref_runs": {
+   "app": [
+    613,
+    609,
+    596,
+    604,
+    599,
+    590,
+    599
+   ],
+   "account": [
+    771,
+    766,
+    756,
+    757,
+    762,
+    761,
+    773
+   ],
+   "settings": [
+    789,
+    772,
+    802,
+    772,
+    776,
+    791,
+    773
+   ]
+  },
+  "axe_total": 28,
+  "impeccable_total": 175,
+  "polish_primary": 203
+ },
+ "assets_app": [
+  "assets/icons-B1fVooUe.js",
+  "assets/index-DRQ5Wkn6.js",
+  "assets/index-DdUdUe8x.css",
+  "assets/jsx-runtime-D3jfb0Ew.js",
+  "assets/useContainerWidth-BAXGmwEU.js"
+ ],
+ "noise": {
+  "bytes": 256,
+  "ttu": {
+   "app": 30,
+   "account": 38,
+   "settings": 39
+  },
+  "polish": 0
+ },
+ "profile": {
+  "cpu_throttle": 4,
+  "network": {
+   "offline": false,
+   "latency": 40,
+   "downloadThroughput": 2500000,
+   "uploadThroughput": 625000
+  },
+  "runs": 7
+ }
+}
