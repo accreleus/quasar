@@ -6,3 +6,4 @@ n	track	hypothesis	primary_before	primary_after	guards	kept	impeccable_finding
 05	P	lazy-load the command palette (mount it on first open; shortcuts stay eager)	254086	254164	tests=pass;ttu=app:597->594/account:764->763/settings:779->769;px_max=0.00000	no	-
 06	P	lazy-load the register and styleguide routes (setup wizard stays eager)	254086	246957	tests=pass;ttu=app:587->578/account:738->743/settings:759->755;px_max=0.00000	yes	-
 07	P	lazy-load the command palette (mount on first open; shortcuts stay eager)	246957	245989	tests=pass;ttu=app:579->567/account:750->741/settings:753->747;px_max=0.00000	yes	-
+08	P	lazy-load the overlay preview (real HUD, telemetry model, hud.css) in Account > In-session overlay	245989	210783	tests=pass;ttu=app:578->556/account:746->722/settings:751->730;px_max=0.00000	yes	-
