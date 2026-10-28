@@ -2,3 +2,5 @@
 .os-sec-input .field .segmented { align-self: flex-start; }
 .os-sec-input .card > .eyebrow:first-child { margin-top: 0; }
 .os-sec-input .muted.mt5 { color: var(--text-3); font-size: var(--t-sm); }
+.os-sec-input .os-sub-h { margin-top: var(--s6); }
+.os-sec-input .hint.mt3 + .ac-sw { margin-top: var(--s2); }

@@ -5,7 +5,7 @@ import { createMouseScaler, mouseGain, resolveMouseSettings, streamPerShown } fr
 const stream = { streamW: 1920, streamH: 1080 };
 
 describe("resolveMouseSettings", () => {
-  const wire = (input: object, defaults: object = { match_cursor: "auto", mouse_sensitivity: 1, raw_mouse: false, flip_scroll: false }) =>
+  const wire = (input: object, defaults: object = { match_cursor: "auto", mouse_sensitivity: 1, raw_mouse: false, flip_scroll: false, nintendo_layout: false }) =>
     ({ region: {}, input, defaults: { region: {}, input: defaults } }) as RegionInputWire;
 
   it("Auto is on for a desktop and off for every other kind", () => {
@@ -23,8 +23,8 @@ describe("resolveMouseSettings", () => {
 
   it("falls back to the install default, then to Auto at 1×", () => {
     const s = wire({ match_cursor: null, mouse_sensitivity: null }, { match_cursor: "on", mouse_sensitivity: 2, raw_mouse: false });
-    expect(resolveMouseSettings(s, "game")).toEqual({ match: true, sensitivity: 2, raw: false, flip: false });
-    expect(resolveMouseSettings(null, "desktop")).toEqual({ match: true, sensitivity: 1, raw: false, flip: false });
+    expect(resolveMouseSettings(s, "game")).toEqual({ match: true, sensitivity: 2, raw: false, flip: false, nintendo: false });
+    expect(resolveMouseSettings(null, "desktop")).toEqual({ match: true, sensitivity: 1, raw: false, flip: false, nintendo: false });
   });
 
   it("raw mouse: the user's value, then the install default, then off", () => {
@@ -43,6 +43,14 @@ describe("resolveMouseSettings", () => {
     expect(resolveMouseSettings(null, "game").flip).toBe(false);
   });
 
+  it("nintendo layout: the user's value, then the install default, then off", () => {
+    expect(resolveMouseSettings(wire({ nintendo_layout: true }), "game").nintendo).toBe(true);
+    expect(resolveMouseSettings(wire({ nintendo_layout: false }, { nintendo_layout: true }), "game").nintendo).toBe(false);
+    expect(resolveMouseSettings(wire({ nintendo_layout: null }, { nintendo_layout: true }), "game").nintendo).toBe(true);
+    expect(resolveMouseSettings(wire({}, {}), "game").nintendo).toBe(false);
+    expect(resolveMouseSettings(null, "game").nintendo).toBe(false);
+  });
+
   it("keeps sensitivity inside 0.25 to 4", () => {
     expect(resolveMouseSettings(wire({ mouse_sensitivity: 40 }), "game").sensitivity).toBe(4);
     expect(resolveMouseSettings(wire({ mouse_sensitivity: 0 }), "game").sensitivity).toBe(0.25);
@@ -51,11 +59,11 @@ describe("resolveMouseSettings", () => {
 
 describe("mouseGain", () => {
   it("is exactly 1 for a window equal to the stream, matching on", () => {
-    expect(mouseGain({ match: true, sensitivity: 1, raw: false, flip: false }, { ...stream, boxW: 1920, boxH: 1080 })).toEqual([1, 1]);
+    expect(mouseGain({ match: true, sensitivity: 1, raw: false, flip: false, nintendo: false }, { ...stream, boxW: 1920, boxH: 1080 })).toEqual([1, 1]);
   });
 
   it("scales by stream size over shown size when the window is smaller", () => {
-    expect(mouseGain({ match: true, sensitivity: 1, raw: false, flip: false }, { ...stream, boxW: 960, boxH: 540 })).toEqual([2, 2]);
+    expect(mouseGain({ match: true, sensitivity: 1, raw: false, flip: false, nintendo: false }, { ...stream, boxW: 960, boxH: 540 })).toEqual([2, 2]);
   });
 
   it("uses the shown picture, not the box, when the stream is letterboxed", () => {
@@ -75,15 +83,15 @@ describe("mouseGain", () => {
   });
 
   it("matching off leaves only the sensitivity", () => {
-    expect(mouseGain({ match: false, sensitivity: 1.5, raw: false, flip: false }, { ...stream, boxW: 960, boxH: 540 })).toEqual([1.5, 1.5]);
+    expect(mouseGain({ match: false, sensitivity: 1.5, raw: false, flip: false, nintendo: false }, { ...stream, boxW: 960, boxH: 540 })).toEqual([1.5, 1.5]);
   });
 
   it("matching comes first, then sensitivity", () => {
-    expect(mouseGain({ match: true, sensitivity: 0.5, raw: false, flip: false }, { ...stream, boxW: 960, boxH: 540 })).toEqual([1, 1]);
+    expect(mouseGain({ match: true, sensitivity: 0.5, raw: false, flip: false, nintendo: false }, { ...stream, boxW: 960, boxH: 540 })).toEqual([1, 1]);
   });
 
   it("does not scale before the stream or window has a size", () => {
-    expect(mouseGain({ match: true, sensitivity: 1, raw: false, flip: false }, { streamW: 0, streamH: 0, boxW: 960, boxH: 540 })).toEqual([1, 1]);
+    expect(mouseGain({ match: true, sensitivity: 1, raw: false, flip: false, nintendo: false }, { streamW: 0, streamH: 0, boxW: 960, boxH: 540 })).toEqual([1, 1]);
   });
 });
 

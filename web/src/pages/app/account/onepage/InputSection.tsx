@@ -1,7 +1,7 @@
 // The account page's Input section. It owns the one read of `/v1/me/region-input` and the one
 // save path; a field is a function of the loaded settings and a `save` that sends its patch.
-// Mouse speed is the first group; raw input and flip scroll are switches on the same `save`. The
-// gamepad layout is one more field on it.
+// Mouse speed is the first group; raw input, flip scroll and the gamepad layout are switches on
+// the same `save`.
 
 import { useEffect, useRef, useState } from "react";
 import { getRegionInput, patchRegionInput, type RegionInputWire } from "../../../../api/me";
@@ -99,6 +99,20 @@ export function InputSection() {
           disabled={!data}
         />
       </div>
+      <div className="eyebrow ac-group os-sub-h">Gamepad</div>
+      <div className="ac-sw">
+        <Switch
+          id="nintendo-layout"
+          label="Nintendo layout (swap A/B and X/Y)"
+          checked={mine?.nintendo_layout ?? defaults?.nintendo_layout ?? false}
+          onChange={(nintendo_layout) => void save({ nintendo_layout })}
+          disabled={!data}
+          aria-describedby="nintendo-layout-hint"
+        />
+      </div>
+      <p className="hint mt3" id="nintendo-layout-hint">
+        For Switch-style controllers: the button printed A acts as A in games.
+      </p>
       <p className={status && !status.ok ? "form-error mt5" : "muted mt5"} role="status">
         {status?.text ?? "Saved as you pick."}
       </p>
