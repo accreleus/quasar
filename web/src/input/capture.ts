@@ -104,6 +104,8 @@ export interface EngageResult {
   mode: EngageMode;
   /** Present only for `failed` — whatever requestPointerLock threw/rejected. */
   error?: unknown;
+  /** Raw mouse input was asked for and this browser cannot give it: the lock is a normal one. */
+  rawUnavailable?: boolean;
 }
 
 export interface CaptureOptions {
@@ -161,6 +163,14 @@ function keyboardLockApi(): KeyboardLockApi | null {
  *  quasar#376 tracks TLS. */
 export function keyboardLockSupported(): boolean {
   return keyboardLockApi() != null;
+}
+
+/** Raw mouse input (`unadjustedMovement`) is Chromium-only and cannot be probed without a lock
+ *  request, so the account page reads the user agent (Chrome, Edge, Opera and Brave all say
+ *  `Chrome/`; Firefox and Safari do not). Not `userAgentData`: it is absent on plain HTTP, where
+ *  many installs run. A wrong guess costs nothing: engage() still falls back to a normal lock and says so. */
+export function rawMouseSupported(): boolean {
+  return pointerLockSupported() && /\bChrome\//.test(navigator.userAgent);
 }
 
 /** Probed on `Element.prototype`, not `"pointerLockElement" in document` —
@@ -451,10 +461,27 @@ export function setupCapture({
   /**
    * Engage from a user gesture. A refused lock on a lock-capable device is
    * `failed` and engages nothing — never silently degrade a desktop to
-   * no-mouse-look. Never `await`s before requestPointerLock: that would spend
-   * the user gesture the API requires.
+   * no-mouse-look. Never `await`s before its first requestPointerLock: that would
+   * spend the user gesture the API requires. (Raw mouse's plain retry does wait on the
+   * refusal; the gesture's transient activation, about 5 s, outlasts it.)
+   * With raw mouse on, one request sequence at a time: an engage while the raw-then-plain
+   * sequence is pending returns its result and asks the browser for nothing, so a double tap
+   * cannot interleave the two requests. A release() in between lifts that (a new request is
+   * wanted); with raw off, requests queue as before (#524).
    */
-  const engage = async (): Promise<EngageResult> => {
+  let pendingRaw: Promise<EngageResult> | null = null;
+  const engage = (): Promise<EngageResult> => {
+    if (pendingRaw && wanted) return pendingRaw;
+    const sequence = requestEngage();
+    if (mouseSettings.raw) {
+      pendingRaw = sequence;
+      void sequence.finally(() => {
+        if (pendingRaw === sequence) pendingRaw = null;
+      });
+    }
+    return sequence;
+  };
+  const requestEngage = async (): Promise<EngageResult> => {
     wanted = true;
     if (captured) {
       return { mode: pointerLocked ? "pointer-lock" : "fallback" };
@@ -464,10 +491,13 @@ export function setupCapture({
       setCaptured(true);
       return { mode: "fallback" };
     }
-    try {
+    let rawUnavailable = false;
+    // One request. `raw` asks for `unadjustedMovement`; an engine that hands back no
+    // promise has ignored it, so the lock it grants is a normal one.
+    const request = async (raw: boolean) => {
       // Chrome ≥113 returns a Promise, older engines undefined; handle both
       // plus a synchronous throw.
-      const maybe: unknown = videoEl.requestPointerLock();
+      const maybe: unknown = raw ? videoEl.requestPointerLock({ unadjustedMovement: true }) : videoEl.requestPointerLock();
       if (maybe && typeof (maybe as PromiseLike<void>).then === "function") {
         await (maybe as PromiseLike<void>);
         // The grant outlived cleanup(), so no pointerlockchange handler is left to
@@ -476,8 +506,21 @@ export function setupCapture({
         if (cleanedUp && !liveCapture.has(videoEl) && document.pointerLockElement === videoEl) {
           document.exitPointerLock?.();
         }
+      } else if (raw) {
+        rawUnavailable = true;
       }
-      return { mode: "pointer-lock" };
+    };
+    try {
+      const raw = mouseSettings.raw;
+      try {
+        await request(raw);
+      } catch (error) {
+        if (!raw || !(error instanceof DOMException && error.name === "NotSupportedError")) throw error;
+        // Once, with the plain request: a second refusal is a real one and reports `failed`.
+        rawUnavailable = true;
+        await request(false);
+      }
+      return rawUnavailable ? { mode: "pointer-lock", rawUnavailable } : { mode: "pointer-lock" };
     } catch (error) {
       return { mode: "failed", error };
     }
