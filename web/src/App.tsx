@@ -33,7 +33,6 @@ import { AppHomeNext } from "./pages/app/AppHomeNext";
 import { GamePageRoute } from "./pages/app/game/GamePage";
 import { AppLayout } from "./pages/app/AppLayout";
 import { AccountStorage } from "./pages/app/account/AccountStorage";
-import { SessionPage } from "./pages/app/SessionPage";
 import { StyleguidePage } from "./pages/StyleguidePage";
 import { RouteErrorBoundary, RouteSkeleton } from "./components/RouteBoundary";
 import { OverlayPreferencesRoute, useOverlayPreferences } from "./settings/OverlayPreferencesContext";
@@ -51,6 +50,12 @@ const Suspended = ({ children }: { children: ReactNode }) => (
   <RouteErrorBoundary>
     <Suspense fallback={<RouteSkeleton />}>{children}</Suspense>
   </RouteErrorBoundary>
+);
+
+// The full-screen session view carries the WebRTC, input and HUD code; nobody
+// needs it to browse the library, so it loads when a session opens.
+const SessionPage = lazyPage(() =>
+  import("./pages/app/SessionPage").then((m) => ({ default: m.SessionPage }))
 );
 
 // Admin pages table: each entry is a separate lazy() chunk boundary.
@@ -244,7 +249,14 @@ export function App() {
           <Route path="security" element={<ClassicRedirect to="/app/account/profile" />} />
         </Route>
         {/* Full-screen session view — outside AppLayout (no shell nav). */}
-        <Route path="/app/session/:id" element={<SessionPage />} />
+        <Route
+          path="/app/session/:id"
+          element={
+            <Suspended>
+              <SessionPage />
+            </Suspended>
+          }
+        />
 
         {/* Admin area — authenticated AND role=admin (UX gate; API enforces).
             Suspense wraps the lazy subtree; RequireAdmin is eagerly loaded.
