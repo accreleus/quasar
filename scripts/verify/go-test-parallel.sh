@@ -43,9 +43,10 @@ go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{len .TestGoFiles}} {{len .XTes
   awk 'NF == 3 { print $1 + $2, $3 }' | sort -rn | cut -d' ' -f2 > "$GTP_LOGS/packages"
 [ -s "$GTP_LOGS/packages" ] || { echo "go-test-parallel: no test packages found" >&2; exit 2; }
 
-# Packages whose tests wait on wall-clock deadlines tight enough that a shared, busy
-# server makes them miss: they run alone, after the others. agentws timed out twice in
-# its waits (10 s) beside three other packages and never alone (#919, #925).
+# Packages that run alone, after the others. An entry is a package whose tests missed a
+# wall-clock wait beside other packages on the shared server and never alone; it names its
+# issue and comes off when that issue is fixed. agentws: two 10 s waits missed (#925).
+# This is a stopgap per package, not a fix: the fix is in the test.
 alone='/internal/agentws$'
 grep -E "$alone" "$GTP_LOGS/packages" > "$GTP_LOGS/alone" || true
 grep -vE "$alone" "$GTP_LOGS/packages" > "$GTP_LOGS/together" || true
@@ -53,10 +54,10 @@ grep -vE "$alone" "$GTP_LOGS/packages" > "$GTP_LOGS/together" || true
 # The packages share one server, so a test that reads the server-wide views
 # (pg_stat_activity, pg_locks) sees the other packages' sessions too and can stop waiting
 # on someone else's lock. Each read must be scoped, in the rest of its SQL string, to its
-# own database (current_database()) or a known backend (pid = $n). Line comments are
-# dropped first so a comment cannot satisfy the rule.
+# own database (current_database()) or a known backend (pid = $n). Go and SQL line
+# comments are dropped first so a comment cannot satisfy the rule.
 unscoped="$(find . -name '*_test.go' -exec perl -0777 -ne '
-  s#//[^\n]*##g;
+  s#//[^\n]*##g; s#--[^\n]*##g;
   while (/(?:FROM|JOIN)\s+pg_(?:stat_activity|locks)\b(?=([^`"]*))/g) {
     my $rest = $1;
     next if $rest =~ /current_database\(\)|\bpid\s*=\s*\$/;
@@ -105,7 +106,7 @@ fi
 echo "go-test-parallel: test binaries built in $((SECONDS - start)) s"
 xargs -P "$jobs" -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/together" || true
 xargs -P 1 -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/alone" || true
-echo "go-test-parallel: $(wc -l < "$GTP_LOGS/packages") packages, $jobs at a time, $((SECONDS - start)) s"
+echo "go-test-parallel: $(wc -l < "$GTP_LOGS/together") packages $jobs at a time, then alone: $(tr '\n' ' ' < "$GTP_LOGS/alone")($((SECONDS - start)) s)"
 # Every package must have been started: a run_package that never ran must not read as green.
 touch "$GTP_LOGS/ran"
 ran="$(sort -u "$GTP_LOGS/ran" | wc -l)"
