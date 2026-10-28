@@ -225,3 +225,149 @@ describe("Region section", () => {
     expect(screen.queryByRole("listbox")).toBeNull();
   });
 });
+
+describe("Region map (#847)", () => {
+  const svg = (c: HTMLElement) => c.querySelector(".tz-map svg")!;
+  const marker = (c: HTMLElement) => c.querySelector(".mk-lbl text")?.textContent;
+  // The svg is drawn 1080 by 420 here, so a pointer pixel is a viewBox unit.
+  const clickAt = (c: HTMLElement, lon: number, lat: number) => {
+    svg(c).getBoundingClientRect = () => ({ left: 0, top: 0, width: 1080, height: 420 }) as DOMRect;
+    fireEvent.click(svg(c), { clientX: ((lon + 180) / 2) * 6, clientY: ((82 - lat) / 2) * 6 + 3 });
+  };
+
+  it("a click near Tokyo saves Asia/Tokyo through the list's save path", async () => {
+    const { container } = renderSection();
+    await list();
+    clickAt(container, 139.7, 35.7);
+    await waitFor(() => expect(api.patchRegionInput).toHaveBeenCalledWith("t0k3n", { region: { timezone: "Asia/Tokyo" } }));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Saved. Your next launch starts at Tokyo time."));
+    expect(option(/Tokyo/).getAttribute("aria-selected")).toBe("true");
+    expect(marker(container)).toMatch(/^Tokyo · /);
+  });
+
+  it("a click in the ocean picks the nearest point", async () => {
+    const { container } = renderSection();
+    await list();
+    clickAt(container, -150, 20);
+    await waitFor(() => expect(api.patchRegionInput).toHaveBeenCalledWith("t0k3n", { region: { timezone: "Pacific/Honolulu" } }));
+  });
+
+  it("marks and lights the clock of the saved zone, and the followed zone when none is saved", async () => {
+    api.getRegionInput.mockResolvedValue(body("Asia/Tokyo"));
+    const { container } = renderSection();
+    await list();
+    expect(marker(container)).toMatch(/^Tokyo · /);
+    expect(container.querySelectorAll(".land.is-sel")).toHaveLength(1);
+  });
+
+  it("follows the browser's zone while none is saved", async () => {
+    const { container } = renderSection();
+    await list();
+    expect(marker(container)).toMatch(/^London · /);
+  });
+
+  it("marks nothing for a saved zone outside the curated list, and does not crash", async () => {
+    api.getRegionInput.mockResolvedValue(body("Asia/Calcutta"));
+    const { container } = renderSection();
+    await list();
+    expect(container.querySelector(".mk")).toBeNull();
+    expect(container.querySelector(".land.is-sel")).toBeNull();
+    clickAt(container, 88.4, 22.6);
+    await waitFor(() => expect(api.patchRegionInput).toHaveBeenCalledWith("t0k3n", { region: { timezone: "Asia/Kolkata" } }));
+  });
+
+  it("lights the hovered clock and says whose it is", async () => {
+    const { container } = renderSection();
+    await list();
+    svg(container).getBoundingClientRect = () => ({ left: 0, top: 0, width: 1080, height: 420 }) as DOMRect;
+    fireEvent.pointerMove(svg(container), { clientX: ((139.7 + 180) / 2) * 6, clientY: ((82 - 35.7) / 2) * 6 + 3 });
+    expect(container.querySelector(".tz-tip")?.textContent).toMatch(/^Tokyo, Japan\s*UTC\+09:00$/);
+    expect(container.querySelectorAll(".land.is-hover")).toHaveLength(1);
+    fireEvent.pointerLeave(svg(container));
+    expect(container.querySelector(".tz-tip")).toBeNull();
+  });
+
+  it("ignores clicks while a save runs", async () => {
+    api.patchRegionInput.mockReturnValue(new Promise(() => {}));
+    const { container } = renderSection();
+    await list();
+    clickAt(container, 139.7, 35.7);
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Saving…"));
+    clickAt(container, 2, 48);
+    expect(api.patchRegionInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears a search so the picked zone shows in the list", async () => {
+    const { container } = renderSection();
+    await list();
+    const box = screen.getByLabelText("Search timezones") as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "paris" } });
+    clickAt(container, 139.7, 35.7);
+    await waitFor(() => expect(box.value).toBe(""));
+    expect(option(/Tokyo/).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("keeps a search typed during a save when that save fails and the pick reverts", async () => {
+    api.getRegionInput.mockResolvedValue(body("Europe/Paris"));
+    api.patchRegionInput.mockRejectedValue(new ApiError(400, "validation_failed", "region.timezone: unknown zone"));
+    renderSection();
+    await list();
+    const box = screen.getByLabelText("Search timezones") as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "tokyo" } });
+    fireEvent.click(option(/Tokyo/));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("region.timezone: unknown zone"));
+    expect(box.value).toBe("tokyo");
+  });
+
+  it("keeps a search typed during a save that fails after a map pick", async () => {
+    api.getRegionInput.mockResolvedValue(body("Europe/Paris"));
+    let fail: (e: unknown) => void = () => {};
+    api.patchRegionInput.mockReturnValue(new Promise((_r, rej) => (fail = rej)));
+    const { container } = renderSection();
+    await list();
+    clickAt(container, 139.7, 35.7);
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Saving…"));
+    const box = screen.getByLabelText("Search timezones") as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "oslo" } });
+    fail(new ApiError(500, "internal", "boom"));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("boom"));
+    expect(box.value).toBe("oslo");
+  });
+
+  it("a map click on the saved zone saves nothing but clears the search so the row shows", async () => {
+    api.getRegionInput.mockResolvedValue(body("Asia/Tokyo"));
+    const { container } = renderSection();
+    await list();
+    const box = screen.getByLabelText("Search timezones") as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "paris" } });
+    expect(screen.queryByRole("option", { name: /Tokyo/ })).toBeNull();
+    clickAt(container, 139.7, 35.7);
+    await waitFor(() => expect(box.value).toBe(""));
+    expect(option(/Tokyo/).getAttribute("aria-selected")).toBe("true");
+    expect(api.patchRegionInput).not.toHaveBeenCalled();
+  });
+
+  it("still draws the label where the browser's text measuring throws", async () => {
+    const proto = SVGElement.prototype as unknown as { getComputedTextLength?: () => number };
+    proto.getComputedTextLength = () => {
+      throw new Error("not rendered");
+    };
+    try {
+      const { container } = renderSection();
+      await list();
+      expect(marker(container)).toMatch(/^London · /);
+    } finally {
+      delete proto.getComputedTextLength;
+    }
+  });
+
+  it("leaves the search alone when the pick is made in the list", async () => {
+    renderSection();
+    await list();
+    const box = screen.getByLabelText("Search timezones") as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "tokyo" } });
+    fireEvent.click(option(/Tokyo/));
+    await waitFor(() => expect(api.patchRegionInput).toHaveBeenCalled());
+    expect(box.value).toBe("tokyo");
+  });
+});

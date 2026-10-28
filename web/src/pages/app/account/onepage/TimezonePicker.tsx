@@ -14,12 +14,14 @@ export interface TimezonePickerProps {
   followed: Zone;
   disabled: boolean;
   onPick: (tz: string | null) => void;
+  /** Bumped when a pick is made outside the list (the map): clear the search and show the saved row. */
+  reveal: number;
 }
 
 const NO_MATCH = "No timezone matches. Try a city or country name.";
 const optionId = (z: Zone | null) => (z ? `tz-o-${z.tz.replace(/\W/g, "_")}` : "tz-o-follow");
 
-export function TimezonePicker({ zones, value, followed, disabled, onPick }: TimezonePickerProps) {
+export function TimezonePicker({ zones, value, followed, disabled, onPick, reveal }: TimezonePickerProps) {
   const [term, setTerm] = useState("");
   const [activeIdx, setActiveIdx] = useState<number | null>(null);
   const listRef = useRef<HTMLUListElement>(null);
@@ -32,12 +34,38 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
   const active = activeIdx !== null ? Math.min(activeIdx, hits) : selectedIdx >= 0 ? selectedIdx : hits > 0 && term.trim() !== "" ? 1 : -1;
   const highlightDrawn = activeIdx !== null || selectedIdx < 0;
 
-  // Open the list on the saved zone; scrollIntoView would move the page too.
+  // A pick made here keeps the list where the user is. A value that moves otherwise (mount, a failed
+  // save reverting) re-centres on the saved row and leaves the search alone; `reveal` also clears it.
+  // scrollIntoView would move the page too.
+  const pickedHere = useRef(false);
+  const recentre = useRef(true);
+  const seenReveal = useRef(reveal);
+  useEffect(() => {
+    if (pickedHere.current) {
+      pickedHere.current = false;
+      return;
+    }
+    recentre.current = term === "";
+  }, [value]);
+  useEffect(() => {
+    if (seenReveal.current === reveal) return;
+    seenReveal.current = reveal;
+    recentre.current = true;
+    setTerm("");
+    setActiveIdx(null);
+  }, [reveal]);
   useEffect(() => {
     const list = listRef.current;
+    if (!recentre.current || term !== "" || !list) return;
+    recentre.current = false;
     const el = selectedIdx > 0 ? document.getElementById(optionId(options[selectedIdx] ?? null)) : null;
-    if (list && el) list.scrollTop = el.offsetTop - list.clientHeight / 2 + el.offsetHeight / 2;
-  }, []);
+    if (el) list.scrollTop = el.offsetTop - list.clientHeight / 2 + el.offsetHeight / 2;
+  });
+
+  const pick = (tz: string | null) => {
+    pickedHere.current = tz !== value;
+    onPick(tz);
+  };
 
   useEffect(() => {
     if (activeIdx !== null) document.getElementById(optionId(options[active] ?? null))?.scrollIntoView?.({ block: "nearest" });
@@ -50,7 +78,7 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
       setActiveIdx(next);
     } else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      if (active >= 0) onPick(options[active]?.tz ?? null);
+      if (active >= 0) pick(options[active]?.tz ?? null);
     }
   };
 
@@ -95,7 +123,7 @@ export function TimezonePicker({ zones, value, followed, disabled, onPick }: Tim
                   role="option"
                   aria-selected={z ? z.tz === value : value === null}
                   className={classes.filter(Boolean).join(" ")}
-                  onClick={disabled ? undefined : () => onPick(z?.tz ?? null)}
+                  onClick={disabled ? undefined : () => pick(z?.tz ?? null)}
                 >
                   <span className="tz-t">
                     <span className="tz-name">{z ? z.city : "Follow my browser"}</span>

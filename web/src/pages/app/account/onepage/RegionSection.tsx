@@ -10,6 +10,7 @@ import { ResourceStates } from "../../../../components/ResourceStates";
 import { useResource } from "../../../../lib/resource/react";
 import { browserZone, buildZones, clockIn, offsetLabel, zoneFor } from "../../../../lib/region/zones";
 import { TimezonePicker } from "./TimezonePicker";
+import { WorldMap } from "./WorldMap";
 
 const CLOCK_TICK_MS = 30_000;
 const IDLE_STEAM_CLOSED = " Your idle Steam was closed so it picks this up.";
@@ -29,6 +30,7 @@ export function RegionSection() {
 
   // The pick, shown at once and held until the save settles; it also holds the list shut, so one save runs at a time.
   const [pending, setPending] = useState<{ tz: string | null } | null>(null);
+  const [reveal, setReveal] = useState(0);
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
 
   const data = res.data;
@@ -73,6 +75,17 @@ export function RegionSection() {
                 followed={zoneFor(followedTz, zones, now)}
                 disabled={pending !== null}
                 onPick={(tz) => void save(tz)}
+                reveal={reveal}
+              />
+              <WorldMap
+                zones={zones}
+                selectedTz={nowZone.tz}
+                now={now}
+                disabled={pending !== null}
+                onPick={(tz) => {
+                  setReveal((n) => n + 1);
+                  void save(tz);
+                }}
               />
             </div>
             <p className="muted mt3">
