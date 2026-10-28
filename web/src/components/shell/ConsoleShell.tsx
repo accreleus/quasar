@@ -19,14 +19,8 @@ import { useLocation } from "react-router-dom";
 import { useAuth } from "../../auth/context";
 import { useNewSearch } from "../../settings/OverlayPreferencesContext";
 import { LazyCommandPalette } from "./LazyCommandPalette";
-import {
-  paletteScope,
-  paletteTriggerLabel,
-  type PaletteApp,
-  type PaletteHost,
-  type PaletteSession,
-  type PaletteUser,
-} from "./paletteSearch";
+import { paletteScope, paletteTriggerLabel } from "./paletteScope";
+import type { PaletteApp, PaletteHost, PaletteSession, PaletteUser } from "./paletteSearch";
 import { Rail } from "./Rail";
 import { placeOf, settingsShortLabel, settingsTriggerLabel } from "./settingsSearch/place";
 import type { RailBadgeCounts, RailSection } from "./navTypes";
