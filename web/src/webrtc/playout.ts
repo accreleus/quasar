@@ -3,6 +3,7 @@
 import * as T from "./thresholds";
 // true median: an even-length σ window averages the middle pair, not leans low
 import { median } from "../lib/stats";
+import { playoutOverride } from "./playoutOverride";
 
 // Receiver playout-buffer control (#108): a near-zero jitter buffer micro-stutters
 // at presentation (invisible to getStats loss/freeze). Single source of truth for
@@ -34,27 +35,7 @@ function parsePlayout(search: string): number {
   return n;
 }
 
-/**
- * Explicit `?playout=` override (ms, ≥0) or null. The controller's off-switch
- * (AS-05): with an override the {@link PlayoutController} must NOT run —
- * `?playout=` is the AS-04/T8 measurement instrument and stays absolute.
- */
-let cachedOverride: number | null | undefined;
-export function playoutOverride(search?: string): number | null {
-  if (search === undefined) {
-    if (cachedOverride === undefined) cachedOverride = parseOverride(location.search);
-    return cachedOverride;
-  }
-  return parseOverride(search);
-}
-
-function parseOverride(search: string): number | null {
-  const raw = new URLSearchParams(search).get("playout");
-  if (raw == null) return null;
-  const n = parseFloat(raw);
-  if (!Number.isFinite(n) || n < 0) return null;
-  return n;
-}
+export { playoutOverride } from "./playoutOverride";
 
 /** Starting target: `?playout=` override, else the tier's `playout0_ms` (AS-02),
  *  else the default. */

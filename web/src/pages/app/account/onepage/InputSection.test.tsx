@@ -8,7 +8,7 @@ const getRegionInput = vi.hoisted(() => vi.fn());
 const patchRegionInput = vi.hoisted(() => vi.fn());
 vi.mock("../../../../api/me", () => ({ getRegionInput, patchRegionInput }));
 const rawMouseSupported = vi.hoisted(() => vi.fn(() => true));
-vi.mock("../../../../input/capture", () => ({ rawMouseSupported }));
+vi.mock("../../../../input/support", () => ({ rawMouseSupported }));
 
 const body = (input: object = {}, defaults: object = {}) => ({
   region: {},

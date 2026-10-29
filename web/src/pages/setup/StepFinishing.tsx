@@ -19,7 +19,7 @@
 // stored secret permanently unreadable.
 //
 // S7 mic toggle (#474), also on Admin → Settings; copy kept consistent with
-// webrtc/mic.ts `microphoneSupported`/`unsupportedMicError`.
+// webrtc/micSupport.ts `microphoneSupported` and webrtc/mic.ts `unsupportedMicError`.
 
 import { useEffect, useRef, useState } from "react";
 import * as adminApi from "../../api/admin";

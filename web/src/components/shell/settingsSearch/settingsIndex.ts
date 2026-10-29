@@ -4,6 +4,7 @@
 
 import type { IconName } from "../../icons";
 import type { PaletteGroup, PaletteItem } from "../paletteSearch";
+import type { Place } from "./place";
 
 /** How to find a setting once its page is up. `text` narrows `sel` to the element
  *  with exactly that text; `up` names the row to highlight around the match. */
@@ -246,33 +247,7 @@ export const toItem = (e: SettingEntry): SettingItem => ({
   id: `ss-${e.id}`, label: e.label, meta: e.where, icon: e.icon, to: e.to, reveal: e.target,
 });
 
-// ── Where we are, and what the trigger promises there ───────────────────────
-
-export type Place = { kind: "account" } | { kind: "home" } | { kind: "admin"; area: string; path: string };
-
-/** The admin place needs an admin: the console index is never searched for anyone else. */
-export function placeOf(pathname: string, isAdmin: boolean): Place {
-  if (isAdmin && pathname.startsWith("/admin")) return { kind: "admin", area: pathname.split("/")[2] || "overview", path: pathname.replace(/\/+$/, "") };
-  if (pathname.startsWith("/app/account")) return { kind: "account" };
-  return { kind: "home" };
-}
-
-export function settingsTriggerLabel(kind: Place["kind"]): string {
-  if (kind === "admin") return "Search hosts, sessions, apps, users, settings…";
-  if (kind === "account") return "Search settings and games…";
-  return "Search games and settings…";
-}
-
-/** The trigger on a phone, where the full label cannot fit on one line. */
-export function settingsShortLabel(kind: Place["kind"]): string {
-  return kind === "admin" ? "Search the console\u2026" : kind === "account" ? "Search settings\u2026" : "Search games\u2026";
-}
-
-export function settingsPlaceholder(kind: Place["kind"]): string {
-  if (kind === "admin") return "Search hosts, sessions, apps, users, pages or settings";
-  if (kind === "account") return "Search settings and games";
-  return "Search games and settings";
-}
+export { placeOf, settingsPlaceholder, settingsShortLabel, settingsTriggerLabel, type Place } from "./place";
 
 // ── Arranging the palette's groups: the current place first ─────────────────
 
