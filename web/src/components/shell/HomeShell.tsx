@@ -23,7 +23,7 @@ import type { ReactNode } from "react";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { QuasarMark } from "../QuasarMark";
 import { IconSearch } from "../icons";
-import { CommandPalette } from "./CommandPalette";
+import { LazyCommandPalette } from "./LazyCommandPalette";
 import { TabBar } from "./TabBar";
 import { UserMenu } from "./UserMenu";
 import { useLibraryCatalog } from "../../pages/app/libraryCatalog";
@@ -103,7 +103,7 @@ export function HomeShell({ children }: { children: ReactNode }) {
 
       <TabBar />
 
-      <CommandPalette
+      <LazyCommandPalette
         open={paletteOpen}
         onOpenChange={setPaletteOpen}
         slashShortcut={false}
