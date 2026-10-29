@@ -1016,6 +1016,18 @@ func (s *Store) StoppingNeverStartedOnHost(ctx context.Context, hostID string) (
 	return ids, nil
 }
 
+// EndUnstartedStop ends a `stopping` row that never reached `running` as
+// `stopped`, keeping its stop reason. ErrNotFound when the row is no longer one.
+func (s *Store) EndUnstartedStop(ctx context.Context, id string) (Session, error) {
+	if !isValidUUID(id) {
+		return Session{}, ErrNotFound
+	}
+	return scanSession(s.pool.QueryRow(ctx, `
+		UPDATE sessions SET state = 'stopped', ended_at = now(), launch_progress = NULL
+		WHERE id = $1::uuid AND state = 'stopping' AND started_at IS NULL
+		RETURNING `+sessionCols, id))
+}
+
 // Host mirrors the schema.md `hosts` columns; the response DTO is built from it.
 type Host struct {
 	ID             string

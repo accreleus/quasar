@@ -51,6 +51,7 @@ own; the two do not move together, and that is deliberate.
 - **Classic layout is deprecated (#855).** Account ▸ Appearance now says the switch back to the previous player layout will be removed in a later release. Nothing is removed yet.
 
 ### Fixed
+- A session stopped before its launch reached the host now ends `stopped` on a node agent without the home-cleanup ledger (an older agent, or one that logs `home-cleanup-ledger-unverified`) (#940). That agent reports nothing for a session it never received, so the session stayed `stopping`, holding its encode slot, VRAM and home, until the agent disconnected. The control plane now ends it when it abandons the launch.
 - **Account ▸ Region: the world-map caption and the selected time zone's details are easier to read (#950).** The map's instruction line was too faint (4.3:1 in dark, 2.9:1 in light) and the selected row's country, zone and offset were 3.95:1 in light; each steps up one text level. Nothing else on the page changes.
 - A toast's auto-dismiss timer no longer outlives the toast (#941). It started during render and was never cleared, so a toast closed early left a timer behind (two per toast in React StrictMode). No visible change.
 - **Steam's idle screensaver is off when Steam runs from the Steam image (#834).** The Steam image sets it to Disabled before Steam starts, unless you chose a timeout yourself, so a long idle stream no longer ends on Steam's slideshow. Ships with the quasar-images `stable` update that comes with this release.

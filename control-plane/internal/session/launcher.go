@@ -443,13 +443,20 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 			// session's outcome; only a still-assigned launch fails here.
 			if current, getErr := c.store.Get(c.ctx, sess.ID); getErr == nil && current.State == StateAssigned {
 				c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("image preparation failed: %v", err))
+			} else if getErr == nil {
+				c.endUnsentStopOnHost(sess.ID, sess.HostID)
 			}
 			return
 		}
 	}
 	// An operator may have stopped the session while preparation was pending.
 	current, err := c.store.Get(c.ctx, sess.ID)
-	if err != nil || current.State != StateAssigned {
+	if err != nil {
+		return
+	}
+	if current.State != StateAssigned {
+		// A no-op unless the row is a never-started `stopping` one (EndUnstartedStop).
+		c.endUnsentStopOnHost(sess.ID, sess.HostID)
 		return
 	}
 	c.dispatchAssignStart(sess, runtimeSpec, expected)
@@ -1027,6 +1034,7 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 			// Whoever took the row owns its outcome and nothing reached the agent; a
 			// failure here would audit a session.failed for a clean stop.
 			c.log.Debug("dispatch abandoned: a stop owns the row", "session_id", sessionID, "err", err)
+			c.endUnsentStop(sessionID, epoch)
 			return false
 		}
 		if err != nil {
@@ -1065,6 +1073,38 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 	}
 	c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "assign dispatch failed: connection changed")
 	return false
+}
+
+// endUnsentStop ends a stopped launch no session command reached, when the
+// agent has no home-cleanup ledger (#940): it acks a stop for an id it never got
+// and reports nothing, so the row would keep its slot and home until the
+// connection drops. An agent with the ledger reports `stopped` itself. Only an
+// abandoned dispatch may call this: with an assign out, a start may follow it.
+func (c *Coordinator) endUnsentStop(sessionID string, epoch agentws.HomeCommandEpoch) {
+	if epoch == nil || epoch.SupportsHomeCleanup() {
+		return
+	}
+	sess, err := c.store.EndUnstartedStop(c.ctx, sessionID)
+	if errors.Is(err, ErrNotFound) {
+		return
+	}
+	if err != nil {
+		c.log.Error("end unsent stop failed", "session_id", sessionID, "err", err)
+		return
+	}
+	c.afterTerminal(sess, "control_plane")
+}
+
+func (c *Coordinator) endUnsentStopOnHost(sessionID string, hostID *string) {
+	provider, ok := c.dispatcher.(interface {
+		CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool)
+	})
+	if !ok || hostID == nil {
+		return
+	}
+	if epoch, connected := provider.CurrentHomeCommandEpoch(*hostID); connected {
+		c.endUnsentStop(sessionID, epoch)
+	}
 }
 
 // watchStartToRunning is the stuck-start watchdog (P2-06). A session still
