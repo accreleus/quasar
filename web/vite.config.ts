@@ -100,8 +100,81 @@ function operatorScripts(): Plugin {
   };
 }
 
+// Code the account area and the admin console both use and the library page does
+// not. Left to the default split it is a dozen tiny chunks every console page
+// waits on; grouped it is one. The `$initial` group outranks it, so a module the
+// library page imports stays with the entry even if it matches here.
+const CONSOLE_SHARED = /\/src\/(components\/(Bar|PageHeader|LoadingState|ResourceStates|Table)\.tsx|components\/shell\/(ConsoleShell|Rail|Topbar|sectionHead)\.tsx|components\/shell\/(sectionTabs|paletteScope|settingsSearch\/place)\.ts|lib\/format\/(bytes|duration|relativeTime)\.ts|lib\/formatLegacy\.ts|lib\/region\/(options|zoneTable|zones)\.ts|input\/mouseScale\.ts|pages\/app\/account\/DeviceCard\.tsx)$/;
+
+// What the lazy setup wizard shares with the admin pages: one chunk instead of
+// several, reached by the /admin route preload through the admin layout's imports.
+const ADMIN_SHARED = /\/src\/(api\/(admin|types)\.ts|components\/(SecretField|ReadinessCard|StatusChip)\.tsx|lib\/(hostStorage|hostCodecs)\.ts|pages\/admin\/library\/(imageStatus|imageRollout)\.tsx?)$/;
+
+// A lazily split area opened by a deep link would wait for the entry to run and
+// render the route before its chunks are even requested. For these path
+// prefixes index.html requests them up front, in parallel with the entry.
+const ROUTE_PRELOADS: Record<string, string> = {
+  "/app/account": "src/pages/app/account/area.ts",
+  "/admin": "src/pages/admin/AdminLayout.tsx",
+  "/login": "src/pages/LoginPage.tsx",
+};
+
+function routePreloads(): Plugin {
+  return {
+    name: "quasar-route-preloads",
+    enforce: "post",
+    apply: "build",
+    transformIndexHtml(html, ctx) {
+      const bundle = ctx.bundle ?? {};
+      const chunks = Object.values(bundle).filter((c) => c.type === "chunk");
+      const entry = chunks.find((c) => c.isEntry);
+      const inEntry = new Set<string>();
+      const walk = (file: string, into: Set<string>) => {
+        if (into.has(file)) return;
+        into.add(file);
+        const c = bundle[file];
+        if (c?.type === "chunk") for (const i of c.imports) walk(i, into);
+      };
+      if (entry) walk(entry.fileName, inEntry);
+      const map: Record<string, string[]> = {};
+      for (const [prefix, src] of Object.entries(ROUTE_PRELOADS)) {
+        const chunk = chunks.find((c) => c.facadeModuleId?.endsWith("/" + src));
+        if (!chunk) throw new Error(`quasar-route-preloads: no chunk for ${src}; update ROUTE_PRELOADS in vite.config.ts`);
+        const files = new Set<string>();
+        walk(chunk.fileName, files);
+        const lazy = [...files].filter((f) => !inEntry.has(f));
+        const css = lazy.flatMap((f) => {
+          const c = bundle[f];
+          return c?.type === "chunk" ? [...(c.viteMetadata?.importedCss ?? [])] : [];
+        });
+        map[prefix] = [...lazy, ...css].map((f) => "/" + f);
+      }
+      const script =
+        "(function(){var p=location.pathname,m=" +
+        JSON.stringify(map) +
+        ";for(var k in m)if(p===k||p.indexOf(k+'/')===0)m[k].forEach(function(f){var l=document.createElement('link');" +
+        "if(/\\.css$/.test(f)){l.rel='preload';l.as='style'}else{l.rel='modulepreload'}" +
+        "l.href=f;l.crossOrigin='';document.head.appendChild(l)})})();";
+      return { html, tags: [{ tag: "script", children: script, injectTo: "head" as const }] };
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), preloadFonts(), operatorScripts()],
+  plugins: [react(), preloadFonts(), operatorScripts(), routePreloads()],
+  build: {
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            { name: "web", tags: ["$initial"], priority: 2 },
+            { name: "console", test: CONSOLE_SHARED, priority: 1 },
+            { name: "admin-shared", test: ADMIN_SHARED, priority: 1 },
+          ],
+        },
+      },
+    },
+  },
   server: {
     proxy: {
       "/v1": { target: controlOrigin, changeOrigin: true, ws: true },

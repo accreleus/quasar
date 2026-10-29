@@ -1,4 +1,5 @@
 import "@testing-library/jest-dom";
+import { configure } from "@testing-library/react";
 import { afterEach } from "vitest";
 
 import { cancelReveal } from "./components/shell/settingsSearch/reveal";
@@ -17,3 +18,8 @@ if (typeof URL.createObjectURL !== "function") URL.createObjectURL = () => "blob
 if (typeof Element.prototype.scrollIntoView !== "function") Element.prototype.scrollIntoView = () => {};
 if (typeof Element.prototype.scrollTo !== "function") Element.prototype.scrollTo = () => {};
 if (typeof URL.revokeObjectURL !== "function") URL.revokeObjectURL = () => {};
+
+// Routes and the command palette are lazy chunks. The first import of one in a
+// worker transforms its whole module graph, which can outlast findBy's default
+// 1 s while the full suite loads every core; a hit only waits longer on a real failure.
+configure({ asyncUtilTimeout: 5000 });
