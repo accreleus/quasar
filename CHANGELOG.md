@@ -47,6 +47,7 @@ own; the two do not move together, and that is deliberate.
 - **Account ▸ Region: pick your language and region format (#848).** Two selects under the timezone list: Language ("Follow my browser" by default) and Region format ("Same as language" by default, with a live example of dates, numbers and time). Each saves at once; a launch starts with them from your next one, and a change closes your idle Hot Loading Steam. The `quasar-base` image no longer hard-sets `LC_ALL`, which had overridden them in every app container (quasar-images).
 
 ### Changed
+- **The player app loads about 45 % less code before the library appears (#948).** The session view, game page, account area, command palette, sign-in, register and setup pages now load when needed, and the library fetches the game page and session view as you hover or focus a tile or Play. Opening a game or a session is as fast as before. Nothing looks different.
 - **Classic layout is deprecated (#855).** Account ▸ Appearance now says the switch back to the previous player layout will be removed in a later release. Nothing is removed yet.
 
 ### Fixed

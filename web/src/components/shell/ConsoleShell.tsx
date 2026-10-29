@@ -18,7 +18,7 @@ import type { ReactNode } from "react";
 import { useLocation } from "react-router-dom";
 import { useAuth } from "../../auth/context";
 import { useNewSearch } from "../../settings/OverlayPreferencesContext";
-import { CommandPalette } from "./CommandPalette";
+import { LazyCommandPalette } from "./LazyCommandPalette";
 import {
   paletteScope,
   paletteTriggerLabel,
@@ -120,7 +120,7 @@ export function ConsoleShell({
 
       {showTabBar && <TabBar />}
 
-      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} {...palette} />
+      <LazyCommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} {...palette} />
     </div>
   );
 }
