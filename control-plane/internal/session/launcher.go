@@ -455,6 +455,7 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 		return
 	}
 	if current.State != StateAssigned {
+		// A no-op unless the row is a never-started `stopping` one (EndUnstartedStop).
 		c.endUnsentStopOnHost(sess.ID, sess.HostID)
 		return
 	}
