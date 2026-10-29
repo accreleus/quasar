@@ -141,11 +141,12 @@ func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 	if expected != nil && (canonical != expected.canonical || managed != expected.managed || target != expected.target) {
 		return nil, errors.New("managed home policy changed before dispatch")
 	}
-	if !managed {
-		return nil, nil
-	}
+	// The one gate before any assign, for every launch kind, managed home or not (#955).
 	if state == StateStopping || state.IsTerminal() {
 		return nil, fmt.Errorf("%w: %s", errSessionNotAssigned, state)
+	}
+	if !managed {
+		return nil, nil
 	}
 	if state != StateAssigned || hostID == nil {
 		return nil, errors.New("session is not assigned to a host")
