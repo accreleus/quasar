@@ -1088,10 +1088,9 @@ impl Quit {
     ) -> Self {
         let fresh = || CloudSync::new(steam_log_dir, appid);
         let (step, cloud) = match (game_running(proc_root, appid), earlier) {
-            (Some(false), Some(cloud)) => (QuitStep::Syncing(now), cloud),
+            // An unreadable /proc never reads as gone, but the exit the caller saw still holds.
+            (Some(false) | None, Some(cloud)) => (QuitStep::Syncing(now), cloud),
             (Some(false), None) => (QuitStep::NotRunning, fresh()),
-            // An unreadable /proc never reads as gone; the exit the caller saw still holds.
-            (None, Some(cloud)) => (QuitStep::Closing(now), cloud),
             _ => (QuitStep::Closing(now), fresh()),
         };
         Self {

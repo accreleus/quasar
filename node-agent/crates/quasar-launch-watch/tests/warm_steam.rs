@@ -586,6 +586,24 @@ fn a_quit_after_the_game_exited_keeps_its_earlier_sync_when_proc_cannot_be_read(
     );
 }
 
+/// #872: `/proc` unreadable for the whole quit. The caller saw the exit, so the earlier tail is
+/// read at once and the upload is reported, not left to the close graces.
+#[test]
+fn a_quit_after_the_game_exited_reports_its_sync_with_proc_never_readable() {
+    let d = dirs();
+    let earlier = CloudSync::new(&d.logs, APPID);
+    let log = d.logs.join("cloud_log.txt");
+    append(&log, &cloud_line(APPID, "Starting sync (up,AC Exit,)"));
+    append(&log, &cloud_line(APPID, "Upload complete, result OK"));
+    let proc_root = d.proc_root.join("never");
+    let t0 = Instant::now();
+    let mut quit = Quit::new(&proc_root, &d.logs, APPID, t0, Some(earlier));
+    assert_eq!(
+        quit.poll(t0 + Duration::from_secs(1)),
+        Some(QuitAction::Done(Some(CloudEnd::Uploaded("OK".into()))))
+    );
+}
+
 #[test]
 fn a_game_that_will_not_close_is_terminated_then_killed() {
     let d = dirs();
