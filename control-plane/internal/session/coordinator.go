@@ -400,8 +400,9 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 	// lists the id, so nothing above sees it, and ReapHeartbeatMissing keeps a
 	// pre-running stop as launch-in-flight. The row would hold its encode slot
 	// and its home for the life of the connection. Ask the agent instead: its
-	// unknown-id path retires the id and reports `stopped`. Never terminal from
-	// here first, or the slot reopens under a session_start still in flight.
+	// unknown-id path retires the id and reports `stopped` (without the ledger it
+	// reports nothing; endUnsentStop ends those rows). Never terminal from here
+	// first, or the slot reopens under a session_start still in flight.
 	unstarted, err := c.store.StoppingNeverStartedOnHost(ctx, hostID)
 	if err != nil {
 		c.log.Warn("heartbeat reconcile: list unstarted stops failed", "host_id", hostID, "err", err)

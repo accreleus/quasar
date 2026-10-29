@@ -164,10 +164,11 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 	}
 }
 
-// afterTerminal is the bookkeeping for an agent-reported terminal transition.
+// afterTerminal is the bookkeeping for a terminal transition the agent reported
+// or, for a launch no command reached, endUnsentStop made.
 func (c *Coordinator) afterTerminal(sess Session, reasonSource string) {
-	// Every caller is agent-reported (§3.4). The line exists so an operator can
-	// grep for how and why a session ended, state_detail included.
+	// The line exists so an operator can grep for how and why a session ended,
+	// state_detail included.
 	c.log.Info("session ended",
 		"session_id", sess.ID,
 		"state", sess.State,

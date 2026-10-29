@@ -48,14 +48,6 @@ if [ -n "${GTP_ONLY:-}" ]; then grep -E "$GTP_ONLY" "$GTP_LOGS/packages" > "$GTP
 if [ -n "${GTP_SKIP:-}" ]; then grep -vE "$GTP_SKIP" "$GTP_LOGS/packages" > "$GTP_LOGS/picked" || true; mv "$GTP_LOGS/picked" "$GTP_LOGS/packages"; fi
 [ -s "$GTP_LOGS/packages" ] || { echo "go-test-parallel: no test packages found (GTP_ONLY='${GTP_ONLY:-}' GTP_SKIP='${GTP_SKIP:-}')" >&2; exit 2; }
 
-# Packages that run alone, after the others. An entry is a package whose tests missed a
-# wall-clock wait beside other packages on the shared server and never alone; it names its
-# issue and comes off when that issue is fixed. agentws: two 10 s waits missed (#925).
-# This is a stopgap per package, not a fix: the fix is in the test.
-alone='/internal/agentws$'
-grep -E "$alone" "$GTP_LOGS/packages" > "$GTP_LOGS/alone" || true
-grep -vE "$alone" "$GTP_LOGS/packages" > "$GTP_LOGS/together" || true
-
 # The packages share one server, so a test that reads the server-wide views
 # (pg_stat_activity, pg_locks) sees the other packages' sessions too and can stop waiting
 # on someone else's lock. Each read must be scoped, in the rest of its SQL string, to its
@@ -110,11 +102,8 @@ if ! go test "$@" -run '^$' "${picked[@]}" > "$GTP_LOGS/build.log" 2>&1; then
   exit 1
 fi
 echo "go-test-parallel: test binaries built in $((SECONDS - start)) s"
-xargs -P "$jobs" -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/together" || true
-xargs -P 1 -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/alone" || true
-alone_note=""
-[ -s "$GTP_LOGS/alone" ] && alone_note=", then alone: $(tr '\n' ' ' < "$GTP_LOGS/alone")"
-echo "go-test-parallel: $(wc -l < "$GTP_LOGS/together") package(s) $jobs at a time${alone_note} ($((SECONDS - start)) s)"
+xargs -P "$jobs" -I{} bash -c 'run_package "$@"' _ {} "$@" < "$GTP_LOGS/packages" || true
+echo "go-test-parallel: $(wc -l < "$GTP_LOGS/packages") package(s) $jobs at a time ($((SECONDS - start)) s)"
 # Every package must have been started: a run_package that never ran must not read as green.
 touch "$GTP_LOGS/ran"
 ran="$(sort -u "$GTP_LOGS/ran" | wc -l)"
