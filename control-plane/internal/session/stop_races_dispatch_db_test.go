@@ -291,8 +291,11 @@ func TestStopBeforeAssignEndsEveryLaunchKind(t *testing.T) {
 				}
 
 				k.dispatch(coord, sess, spec, &expected)
-				// A ledger agent answers the stop for an id it never got with `stopped`.
-				coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: sess.ID, State: "stopped"})
+				// A ledger agent answers the stop for an id it never got with `stopped`;
+				// a ledger-less one sends nothing (agent.rs, unknown-id branch).
+				if capable {
+					coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: sess.ID, State: "stopped"})
+				}
 
 				if got := readRow(t, pool, sess.ID); got.State != string(StateStopped) || strings.Contains(got.Detail, "failed") {
 					t.Errorf("row %+v, want stopped with no failure detail", got)
