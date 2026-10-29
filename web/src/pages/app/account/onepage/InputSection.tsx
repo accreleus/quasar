@@ -10,7 +10,7 @@ import { ResourceStates } from "../../../../components/ResourceStates";
 import { SegmentedControl } from "../../../../components/SegmentedControl";
 import { SliderField } from "../../../../components/SliderField";
 import { SelectField, Switch } from "../../../../components/TextField";
-import { rawMouseSupported } from "../../../../input/capture";
+import { rawMouseSupported } from "../../../../input/support";
 import { KEYBOARDS } from "../../../../lib/region/options";
 import { useResource } from "../../../../lib/resource/react";
 import { MOUSE_SENSITIVITY_MAX, MOUSE_SENSITIVITY_MIN } from "../../../../input/mouseScale";
