@@ -230,6 +230,8 @@ impl Helper {
                          its tree is signalled after the grace"
                     ),
                 }
+                // Commands run before the pass: an exit in this same tick must count as seen (#872).
+                self.poll_watcher(Instant::now(), agent);
                 self.quit = Some(Quit::new(
                     &self.proc_root,
                     &self.log_dir,
@@ -272,20 +274,26 @@ impl Helper {
     fn pass(&mut self, now: Instant, agent: &mut Agent) {
         self.children
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
-        if let Some(watcher) = &mut self.watcher {
-            for report in watcher.poll_at(now) {
-                if matches!(report, Report::SteamNeedsUser(_)) {
-                    self.needs_user = true;
-                }
-                if matches!(report, Report::LaunchState(LaunchState::GameExited)) {
-                    self.game_exited = true;
-                }
-                agent.send(report);
-            }
-        }
+        self.poll_watcher(now, agent);
         self.answer_notice(now);
         self.pin();
         self.step_quit(now, agent);
+    }
+
+    /// Poll the watcher and forward its reports, noting the ones the helper acts on.
+    fn poll_watcher(&mut self, now: Instant, agent: &mut Agent) {
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
+        for report in watcher.poll_at(now) {
+            if matches!(report, Report::SteamNeedsUser(_)) {
+                self.needs_user = true;
+            }
+            if matches!(report, Report::LaunchState(LaunchState::GameExited)) {
+                self.game_exited = true;
+            }
+            agent.send(report);
+        }
     }
 
     /// `dismiss_safe`: answer Steam's controller notice with one Return, and only when nothing
@@ -1273,6 +1281,27 @@ mod tests {
         helper.step_quit(t + Duration::from_secs(2), &mut agent);
         let line = agent.latest[COMMAND_DONE].clone().expect("quit answered");
         assert!(line.contains("\"cloud_synced\":true"), "{line}");
+    }
+
+    /// #872: the game exits and a session end's `quit` arrives before the helper's next pass.
+    /// The command polls the watcher first, so the exit counts as seen and the sync is awaited.
+    #[test]
+    fn a_quit_in_the_same_tick_as_the_game_exit_waits_for_the_exit_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut helper, mut agent, proc, append) = quitting(dir.path());
+        reaper_620(&proc);
+        let t = Instant::now();
+        helper.pass(t, &mut agent);
+        std::fs::remove_dir_all(proc.join("20")).unwrap();
+        append("Starting sync (up,AC Exit,)");
+        assert!(!helper.game_exited, "no pass has run since the exit");
+        helper.command(Command::Quit(620), &mut agent);
+        assert!(helper.game_exited, "the quit polled the watcher");
+        helper.step_quit(Instant::now() + Duration::from_secs(1), &mut agent);
+        assert!(
+            agent.latest[COMMAND_DONE].is_none(),
+            "the upload is awaited"
+        );
     }
 
     /// An in-place swap's `quit` for a title that never reached a reaper (still loading, shader
