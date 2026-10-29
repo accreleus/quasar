@@ -85,7 +85,7 @@ jobs:
 
   # The control-plane tests are two jobs, each with its own runner and Postgres (#928): the
   # packages OWN_RUNNER names (`session`, the slowest: about 140 s alone, about twice that
-  # sharing a runner; then `agentws`, alone, #925), and every other package. Both read the one
+  # sharing a runner), and every other package. Both read the one
   # regex, so each test package runs in exactly one of them. `control-plane (build + vet + test)` is the check main requires, so it is the one
   # that gathers them.
   go-tests:
@@ -96,7 +96,7 @@ jobs:
     # Measured 2026-10: about 3 min of tests on a cold build cache. 30 fails a stall early.
     timeout-minutes: 30
     env:
-      OWN_RUNNER: /internal/(session|agentws)$
+      OWN_RUNNER: /internal/session$
     strategy:
       fail-fast: false
       matrix:
@@ -104,7 +104,7 @@ jobs:
           - part: build, vet, most packages
             pick: skip
             static: true
-          - part: session, agentws
+          - part: session
             pick: only
             static: false
     defaults:

@@ -11,11 +11,11 @@
 // selects "Custom" cannot say which items it would turn on. The switches below
 // are the only way in.
 
+import { lazy, Suspense } from "react";
 import { SegmentedControl } from "../../../components/SegmentedControl";
 import { SelectField, Switch } from "../../../components/TextField";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { useOverlayPreferences } from "../../../settings/OverlayPreferencesContext";
-import { OverlayPreview } from "./OverlayPreview";
 import {
   STRIP_ITEMS,
   applyPreset,
@@ -25,6 +25,10 @@ import {
   type StripItem,
   type StripPosition,
 } from "../../../settings/overlayPreferences";
+
+// The preview embeds the real session HUD (and its telemetry model and CSS);
+// loading it with this section keeps all of that out of the library's bundle.
+const OverlayPreview = lazy(() => import("./OverlayPreview").then((m) => ({ default: m.OverlayPreview })));
 
 const ITEM_LABELS: Record<StripItem, string> = {
   signal: "Connection signal",
@@ -66,7 +70,9 @@ export function AccountOverlay() {
           they describe: both read the same OverlayPreferences context, so it
           updates as the switches move. Its own embedded buttons are made
           inert by OverlayPreview, independent of `loaded`. */}
-      <OverlayPreview />
+      <Suspense fallback={null}>
+        <OverlayPreview />
+      </Suspense>
 
       <fieldset disabled={!loaded} className="ac-fieldset">
         <div className="field mt5">
