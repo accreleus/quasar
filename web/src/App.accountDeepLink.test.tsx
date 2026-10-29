@@ -5,18 +5,20 @@
  * routes this one could no longer see the fallback (measured: a delayed lazy only fails
  * the test when it runs first).
  *
- * index.html preloads the chunk for an account URL; once it is in, the route is served
- * from it without the skeleton. Under act() React flushes a microtask-resolved lazy
- * before committing a fallback, so the synchronous path itself (the ~300 ms reveal
- * throttle in a browser) is guarded by lib/preloadable.test.tsx, not here. This test
- * fails if the account routes stop going through accountArea (lib/preloadable).
+ * A deep link is wired in two places, and both are pinned here: index.html asks for
+ * the chunk (ROUTE_PRELOADS in vite.config.ts) and App starts accountArea.preload() when
+ * it loads on an account URL. The render test then fails if the account routes stop
+ * going through accountArea (lib/preloadable) or its sync path breaks; the ~300 ms
+ * reveal throttle itself only shows in a browser (lib/preloadable.test.tsx).
  */
+
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 import { act, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
-import { App } from "./App";
 import { AuthContext, type AuthContextValue } from "./auth/context";
 import { ToastProvider } from "./components/Toast";
 import { accountArea } from "./pages/lazyPages";
@@ -57,8 +59,17 @@ afterEach(() => {
   localStorage.clear();
 });
 
+it("index.html preloads the account chunk for an account deep link", () => {
+  const config = readFileSync(resolve(__dirname, "../vite.config.ts"), "utf8");
+  expect(config).toMatch(/["']\/app\/account["']:\s*["']src\/pages\/app\/account\/area\.ts["']/);
+});
+
 it("renders /app/account without the route skeleton once its chunk is in", async () => {
-  accountArea.preload();
+  // Load App the way a deep link does: on an account URL, so App itself starts the preload.
+  window.history.replaceState(null, "", "/app/account/region");
+  const preload = vi.spyOn(accountArea, "preload");
+  const { App } = await import("./App");
+  expect(preload).toHaveBeenCalled();
   await act(async () => {
     await import("./pages/app/account/area");
   });

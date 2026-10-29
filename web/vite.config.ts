@@ -194,7 +194,8 @@ function routePreloads(): Plugin {
 // (level 6). `make test-web` builds, so a change that grows it past the budget fails
 // the gate instead of shipping.
 // Measured on develop 1d39b2a5 (after the lazy routes and helper moves): 150,388 B. The
-// budget is that plus 3 % headroom, so routine work does not trip it.
+// budget is that plus 3 % headroom, so routine work does not trip it; lower it when the
+// entry shrinks, or the headroom grows unseen. Node's gzip; Go's level 6 differs by ~0.3 %.
 const ENTRY_BUDGET_GZIP_BYTES = 154_900;
 
 function entryBudget(): Plugin {
@@ -204,8 +205,10 @@ function entryBudget(): Plugin {
     // writeBundle, not generateBundle: Vite finishes the chunks (preload helpers) and
     // minifies the CSS after the generateBundle hooks, so only here are the sizes final.
     writeBundle(_options, bundle) {
-      const entry = Object.values(bundle).find((c) => c.type === "chunk" && c.isEntry);
-      if (!entry || entry.type !== "chunk") throw new Error("quasar-entry-budget: no entry chunk in the bundle");
+      const entries = Object.values(bundle).filter((c) => c.type === "chunk" && c.isEntry);
+      const [entry] = entries;
+      if (entries.length !== 1 || !entry || entry.type !== "chunk")
+        throw new Error(`quasar-entry-budget: expected one entry chunk, found ${entries.length}; say which one the budget is for`);
       const files = new Set<string>();
       const walk = (file: string) => {
         if (files.has(file)) return;
@@ -220,6 +223,7 @@ function entryBudget(): Plugin {
       let total = 0;
       for (const f of files) {
         const out = bundle[f];
+        if (!out) throw new Error(`quasar-entry-budget: ${f} is imported by the entry but not in the bundle`);
         total += zlib.gzipSync(out.type === "chunk" ? out.code : out.source, { level: 6 }).length;
       }
       if (total > ENTRY_BUDGET_GZIP_BYTES) {
