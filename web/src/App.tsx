@@ -43,6 +43,12 @@ const LoginPage = loginPage.component("LoginPage");
 
 // The full-screen session view (WebRTC, input, HUD) and the game page load when
 // first needed; the library preloads them on hover, focus and idle (lazyPages.ts).
+// A reload or shared link straight onto one has no library to do that: index.html
+// requests the chunks (routePreloads in vite.config.ts) and App starts the import.
+if (typeof location !== "undefined") {
+  if (location.pathname.startsWith("/app/session/")) sessionPage.preload();
+  else if (location.pathname.startsWith("/app/game/")) gamePage.preload();
+}
 const SessionPage = sessionPage.component("SessionPage");
 const GamePageRoute = gamePage.component("GamePageRoute");
 
