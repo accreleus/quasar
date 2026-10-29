@@ -126,6 +126,7 @@ const ROUTE_PRELOADS: Record<string, string> = {
 // anti-FOUC scripts, and this one names hashed chunks, so no fixed hash could pin it.
 function routePreloads(): Plugin {
   let scriptFile = "";
+  let map: Record<string, string[]> = {};
   return {
     name: "quasar-route-preloads",
     enforce: "post",
@@ -144,7 +145,7 @@ function routePreloads(): Plugin {
           if (c?.type === "chunk") for (const i of c.imports) walk(i, into);
         };
         if (entry) walk(entry.fileName, inEntry);
-        const map: Record<string, string[]> = {};
+        map = {};
         for (const [prefix, src] of Object.entries(ROUTE_PRELOADS)) {
           const chunk = chunks.find((c) => c.facadeModuleId?.endsWith("/" + src));
           if (!chunk) throw new Error(`quasar-route-preloads: no chunk for ${src}; update ROUTE_PRELOADS in vite.config.ts`);
@@ -155,7 +156,13 @@ function routePreloads(): Plugin {
             const c = bundle[f];
             return c?.type === "chunk" ? [...(c.viteMetadata?.importedCss ?? [])] : [];
           });
-          map[prefix] = [...lazy, ...css].map((f) => "/" + f);
+          // A chunk that only carries a stylesheet is deleted later in generateBundle
+          // (its CSS stays in `css`), so asking for its .js would 404.
+          const js = lazy.filter((f) => {
+            const c = bundle[f];
+            return c?.type !== "chunk" || (c.code.trim() !== "" && !c.moduleIds.every((id) => /\.css($|\?)/.test(id)));
+          });
+          map[prefix] = [...js, ...css].map((f) => "/" + f);
         }
         const source =
           "(function(){var p=location.pathname,m=" +
@@ -170,6 +177,14 @@ function routePreloads(): Plugin {
       if (!scriptFile) throw new Error("quasar-route-preloads: the script was not emitted before index.html");
       return [{ tag: "script", attrs: { src: "/" + scriptFile }, injectTo: "head-prepend" as const }];
     },
+    // generateBundle above runs before Vite drops CSS-only chunks; by now the bundle
+    // is final, so every file the script will request must be in it.
+    writeBundle(_options, bundle) {
+      const missing = Object.entries(map).flatMap(([prefix, files]) =>
+        files.filter((f) => !(f.slice(1) in bundle)).map((f) => `${prefix}: ${f}`),
+      );
+      if (missing.length) throw new Error(`quasar-route-preloads: the preload script names files the build does not emit (each would 404): ${missing.join(", ")}`);
+    },
   };
 }
 
@@ -180,7 +195,8 @@ const inlineScripts = (html: string) => [...html.matchAll(INLINE_SCRIPT)].map((m
 // TestCSPAllowsWebIndexInlineScripts checks the source file against it). A build
 // step that adds another inline script, or edits one, would be blocked in
 // production and only show up there. So the built page may hold exactly the
-// inline scripts the source page does.
+// inline scripts the source page does. It only sees what the transforms before it
+// produced: keep it LAST in `plugins`.
 function pinnedInlineScripts(): Plugin {
   let sourceScripts: string[] = [];
   return {
