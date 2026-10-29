@@ -228,3 +228,87 @@ func TestDispatchOfAnUnexpectedStateStillFailsLoudly(t *testing.T) {
 		t.Errorf("session.failed audit rows = %d, want 1", failures)
 	}
 }
+
+// The bind is the one gate before any assign for every launch kind, not only a
+// managed-home one (#955). A stop that took the row first sends nothing, ends the
+// row `stopped` with no failure audit, on an agent with and without the ledger.
+// Each kind dispatches past prepareAndDispatch's state check, so only the bind stops it.
+func TestStopBeforeAssignEndsEveryLaunchKind(t *testing.T) {
+	kinds := []struct {
+		name     string
+		managed  bool
+		parked   bool
+		dispatch func(c *Coordinator, sess Session, spec []byte, expected *homeDispatchExpectation)
+	}{
+		{"managed", true, false, func(c *Coordinator, s Session, spec []byte, e *homeDispatchExpectation) {
+			c.dispatchAssignStart(s, spec, e)
+		}},
+		{"non-managed", false, false, func(c *Coordinator, s Session, spec []byte, e *homeDispatchExpectation) {
+			c.dispatchAssignStart(s, spec, e)
+		}},
+		{"console", false, false, func(c *Coordinator, s Session, spec []byte, e *homeDispatchExpectation) {
+			c.dispatchAssignStartWithTopology(s, spec, "local_only", e)
+		}},
+		{"cert", false, false, func(c *Coordinator, s Session, spec []byte, _ *homeDispatchExpectation) {
+			c.dispatchAssignStart(s, nil, nil)
+		}},
+		{"parked", false, true, func(c *Coordinator, s Session, spec []byte, e *homeDispatchExpectation) {
+			c.dispatchAssignStart(s, spec, e)
+		}},
+	}
+	for _, capable := range []bool{true, false} {
+		for _, k := range kinds {
+			t.Run(fmt.Sprintf("ledger=%v/%s", capable, k.name), func(t *testing.T) {
+				pool := testDB(t)
+				s := seed(t, pool, 2)
+				store := NewStore(pool)
+				ctx := context.Background()
+				p := launchParams(s)
+				spec := []byte(`{}`)
+				if k.managed {
+					p = managedLaunchParams(s, seedManagedApp(t, pool, `{}`))
+					seedHome(t, pool, s.userID, p.AppID, s.hostID)
+					var ref string
+					must(t, pool.QueryRow(ctx, `SELECT ref FROM user_homes WHERE user_id=$1::uuid AND app_id=$2::uuid`, s.userID, p.AppID).Scan(&ref))
+					spec = []byte(`{"mounts":["` + ref + `:/home/quasar:rw"]}`)
+				}
+				app, err := store.GetLaunchApp(ctx, p.AppID)
+				must(t, err)
+				expected := expectedHomeDispatch(app)
+				p.PinHostID = s.hostID
+				sess, err := store.ScheduleAndCreate(ctx, p)
+				must(t, err)
+
+				d := &homeEpochDispatcher{fakeDispatcher: newFakeDispatcher(true), epochs: []*scriptedHomeEpoch{{capable: capable, queued: true, result: agentws.AckResult{OK: true}}}}
+				coord := newTestCoordinator(t, store, d, testLogger(), WithAuditor(audit.NewStore(pool)))
+				if k.parked {
+					must(t, exec(t, pool, `UPDATE sessions SET kind = 'parked', parked_until = now() + interval '1 hour' WHERE id = $1::uuid`, sess.ID))
+					if n, err := coord.stopParked(ctx, StopReasonParkedSuperseded, parkedFilter{ID: sess.ID}); err != nil || n != 1 {
+						t.Fatalf("stop parked: n=%d err=%v", n, err)
+					}
+				} else if _, err := coord.Stop(ctx, sess.ID, StopReasonParkedSuperseded); err != nil {
+					t.Fatalf("stop: %v", err)
+				}
+
+				k.dispatch(coord, sess, spec, &expected)
+				// A ledger agent answers the stop for an id it never got with `stopped`;
+				// a ledger-less one sends nothing (agent.rs, unknown-id branch).
+				if capable {
+					coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: sess.ID, State: "stopped"})
+				}
+
+				if got := readRow(t, pool, sess.ID); got.State != string(StateStopped) || strings.Contains(got.Detail, "failed") {
+					t.Errorf("row %+v, want stopped with no failure detail", got)
+				}
+				if n := d.epochs[0].sends; n != 0 {
+					t.Errorf("%d commands reached the agent", n)
+				}
+				for _, row := range sessionAuditRows(t, pool) {
+					if row.Action == "session.failed" && row.Target == sess.ID {
+						t.Errorf("session.failed audited for a stop")
+					}
+				}
+			})
+		}
+	}
+}

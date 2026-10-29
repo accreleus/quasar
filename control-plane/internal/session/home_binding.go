@@ -134,6 +134,11 @@ func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 	if err != nil {
 		return nil, fmt.Errorf("lock session for home binding: %w", err)
 	}
+	// The one gate before any assign, for every launch kind, managed home or not, and before the
+	// policy check so a stopped row is never failed for a policy change (#955).
+	if state == StateStopping || state.IsTerminal() {
+		return nil, fmt.Errorf("%w: %s", errSessionNotAssigned, state)
+	}
 	canonical, managed, target, err := resolvedDispatchHome(ctx, tx, appID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve dispatch home app: %w", err)
@@ -143,9 +148,6 @@ func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 	}
 	if !managed {
 		return nil, nil
-	}
-	if state == StateStopping || state.IsTerminal() {
-		return nil, fmt.Errorf("%w: %s", errSessionNotAssigned, state)
 	}
 	if state != StateAssigned || hostID == nil {
 		return nil, errors.New("session is not assigned to a host")
