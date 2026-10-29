@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -188,6 +189,50 @@ function routePreloads(): Plugin {
   };
 }
 
+// What a signed-in player downloads before the library page can run: the entry
+// chunk, its static imports and its CSS, gzipped as the control plane serves them
+// (level 6). `make test-web` builds, so a change that grows it past the budget fails
+// the gate instead of shipping.
+// Measured on develop 1d39b2a5 (after the lazy routes and helper moves): 150,388 B. The
+// budget is that plus 3 % headroom, so routine work does not trip it.
+const ENTRY_BUDGET_GZIP_BYTES = 154_900;
+
+function entryBudget(): Plugin {
+  return {
+    name: "quasar-entry-budget",
+    apply: "build",
+    // writeBundle, not generateBundle: Vite finishes the chunks (preload helpers) and
+    // minifies the CSS after the generateBundle hooks, so only here are the sizes final.
+    writeBundle(_options, bundle) {
+      const entry = Object.values(bundle).find((c) => c.type === "chunk" && c.isEntry);
+      if (!entry || entry.type !== "chunk") throw new Error("quasar-entry-budget: no entry chunk in the bundle");
+      const files = new Set<string>();
+      const walk = (file: string) => {
+        if (files.has(file)) return;
+        files.add(file);
+        const c = bundle[file];
+        if (c?.type === "chunk") {
+          for (const i of c.imports) walk(i);
+          for (const css of c.viteMetadata?.importedCss ?? []) files.add(css);
+        }
+      };
+      walk(entry.fileName);
+      let total = 0;
+      for (const f of files) {
+        const out = bundle[f];
+        total += zlib.gzipSync(out.type === "chunk" ? out.code : out.source, { level: 6 }).length;
+      }
+      if (total > ENTRY_BUDGET_GZIP_BYTES) {
+        throw new Error(
+          `quasar-entry-budget: the /app entry is ${total} B gzip, over the ${ENTRY_BUDGET_GZIP_BYTES} B budget. ` +
+            "Find what the entry now imports (a shared module pulling in a big one is the usual cause) and load it lazily or move the helper out. " +
+            "If the growth is deliberate, raise ENTRY_BUDGET_GZIP_BYTES in web/vite.config.ts and give the reason in the commit.",
+        );
+      }
+    },
+  };
+}
+
 const INLINE_SCRIPT = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g;
 const inlineScripts = (html: string) => [...html.matchAll(INLINE_SCRIPT)].map((m) => m[1]);
 
@@ -222,7 +267,7 @@ function pinnedInlineScripts(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), preloadFonts(), operatorScripts(), routePreloads(), pinnedInlineScripts()],
+  plugins: [react(), preloadFonts(), operatorScripts(), routePreloads(), entryBudget(), pinnedInlineScripts()],
   build: {
     rolldownOptions: {
       output: {
