@@ -193,6 +193,15 @@ func TestAClosingConnectionDoesNotReopenAHostAReconnectClaimed(t *testing.T) {
 		t.Fatalf("first enrollment: %+v", first)
 	}
 	waitUntil(t, "the first connection to be registered", func() bool { return holds(registry, hostID, old) })
+	// The connection is added to the registry before its capacity handshake runs, and the
+	// handshake reads no close until it is done. A handshake still writing the host row
+	// when the reconnect takes its lock waits on that lock, so the close below is never
+	// read and no markOffline waits (#925).
+	waitUntil(t, "the first connection's capacity to be applied", func() bool {
+		var cores *int
+		_ = pool.QueryRow(ctx, `SELECT cpu_cores FROM hosts WHERE id = $1::uuid`, hostID).Scan(&cores)
+		return cores != nil
+	})
 
 	inTx.armed.Store(true)
 	reconnected := make(chan *websocket.Conn, 1)
