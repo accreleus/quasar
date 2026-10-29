@@ -3,7 +3,7 @@
 
 /**
  * Explicit `?playout=` override (ms, ≥0) or null. The controller's off-switch
- * (AS-05): with an override the {@link PlayoutController} must NOT run —
+ * (AS-05): with an override the `PlayoutController` (playout.ts) must NOT run —
  * `?playout=` is the AS-04/T8 measurement instrument and stays absolute.
  */
 let cachedOverride: number | null | undefined;
