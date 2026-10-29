@@ -67,6 +67,7 @@ import { FavouritesShelf, JumpBackShelf } from "./home/Shelves";
 import type { OpenBandState } from "./game/GamePage";
 import "../../styles/home.css";
 import "../../styles/library-new.css";
+import { gamePage, sessionPage } from "../lazyPages";
 
 type HomeView = "home" | "library";
 
@@ -102,6 +103,20 @@ export function AppHomeNext() {
   // ./libraryCatalog) — the command palette in the shell above renders the same
   // list, and two components fetching /v1/apps is two answers to one question.
   const { apps, loading, error, reload: loadApps, setApps } = useLibraryCatalog();
+  // Once the library is up, fetch the pages a tile opens while the browser is idle,
+  // so the first open renders at once (lazyPages.ts). No idle callback (Safari):
+  // hover and focus on a tile still preload.
+  const libraryShown = !loading && apps.length > 0;
+  useEffect(() => {
+    if (!libraryShown) return;
+    const id = window.requestIdleCallback?.(() => {
+      gamePage.preload();
+      sessionPage.preload();
+    });
+    return () => {
+      if (id !== undefined) window.cancelIdleCallback(id);
+    };
+  }, [libraryShown]);
   const [mySessions, setMySessions] = useState<Session[]>([]);
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [stopTarget, setStopTarget] = useState<Session | null>(null);

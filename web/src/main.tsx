@@ -23,11 +23,8 @@ import "./components/layout.css";
 // 165 KB base CSS bundle and admin-only, while the admin JS has been lazily
 // split since #139. It is imported by pages/admin/AdminLayout.tsx instead, so
 // Vite emits it as a separate stylesheet that loads with the admin chunk.
-// The pre-auth surface (login / register / setup) is imported last on purpose:
-// every rule in it is scoped under `.auth-scene`, so it cannot leak, and where
-// a selector ties on specificity with a legacy sheet the later artefact should
-// win. See the header comment in styles/login.css.
-import "./styles/login.css";
+// The pre-auth surface (login / register / setup) loads its sheet with its own
+// lazy chunk (pages/auth/AuthCard.tsx), so it still lands after these sheets.
 
 const root = document.getElementById("root");
 if (!root) throw new Error("#root element not found");

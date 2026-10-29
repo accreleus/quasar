@@ -13,6 +13,10 @@
 import type { ReactNode } from "react";
 import { QuasarMark } from "../../components/QuasarMark";
 import { useDarkLock } from "../../settings/ThemeContext";
+// Every rule is scoped under `.auth-scene` and must load after the base sheets so a
+// specificity tie goes its way; a lazy chunk's CSS is inserted after the entry's.
+// See the header comment in styles/login.css.
+import "../../styles/login.css";
 
 interface AuthCardProps {
   /** Overrides the 24.5rem stack width — the setup wizard runs wider. */

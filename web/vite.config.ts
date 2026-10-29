@@ -100,8 +100,142 @@ function operatorScripts(): Plugin {
   };
 }
 
+// Code the account area and the admin console both use and the library page does
+// not. Left to the default split it is a dozen tiny chunks every console page
+// waits on; grouped it is one. The `$initial` group outranks it, so a module the
+// library page imports stays with the entry even if it matches here.
+const CONSOLE_SHARED = /\/src\/(components\/(Bar|PageHeader|LoadingState|ResourceStates|Table)\.tsx|components\/shell\/(ConsoleShell|Rail|Topbar|sectionHead)\.tsx|components\/shell\/(sectionTabs|paletteScope|settingsSearch\/place)\.ts|lib\/format\/(bytes|duration|relativeTime)\.ts|lib\/formatLegacy\.ts|lib\/region\/(options|zoneTable|zones)\.ts|input\/mouseScale\.ts|pages\/app\/account\/DeviceCard\.tsx)$/;
+
+// What the lazy setup wizard shares with the admin pages: one chunk instead of
+// several, reached by the /admin route preload through the admin layout's imports.
+const ADMIN_SHARED = /\/src\/(api\/(admin|types)\.ts|components\/(SecretField|ReadinessCard|StatusChip)\.tsx|lib\/(hostStorage|hostCodecs)\.ts|pages\/admin\/library\/(imageStatus|imageRollout)\.tsx?)$/;
+
+// A lazily split area opened by a deep link would wait for the entry to run and
+// render the route before its chunks are even requested. For these path
+// prefixes a small script asks for them up front, in parallel with the entry.
+const ROUTE_PRELOADS: Record<string, string> = {
+  "/app/account": "src/pages/app/account/area.ts",
+  "/app/session": "src/pages/app/SessionPage.tsx",
+  "/app/game": "src/pages/app/game/GamePage.tsx",
+  "/admin": "src/pages/admin/AdminLayout.tsx",
+  "/login": "src/pages/LoginPage.tsx",
+};
+
+// The script is emitted as an asset and loaded with <script src>, never inlined:
+// the control plane's CSP allows 'self' plus two hashes for index.html's own
+// anti-FOUC scripts, and this one names hashed chunks, so no fixed hash could pin it.
+function routePreloads(): Plugin {
+  let scriptFile = "";
+  let map: Record<string, string[]> = {};
+  return {
+    name: "quasar-route-preloads",
+    enforce: "post",
+    apply: "build",
+    generateBundle: {
+      // Before vite:build-html writes index.html, which needs the file name.
+      order: "pre",
+      handler(_options, bundle) {
+        const chunks = Object.values(bundle).filter((c) => c.type === "chunk");
+        const entry = chunks.find((c) => c.isEntry);
+        const inEntry = new Set<string>();
+        const walk = (file: string, into: Set<string>) => {
+          if (into.has(file)) return;
+          into.add(file);
+          const c = bundle[file];
+          if (c?.type === "chunk") for (const i of c.imports) walk(i, into);
+        };
+        if (entry) walk(entry.fileName, inEntry);
+        map = {};
+        for (const [prefix, src] of Object.entries(ROUTE_PRELOADS)) {
+          const chunk = chunks.find((c) => c.facadeModuleId?.endsWith("/" + src));
+          if (!chunk) throw new Error(`quasar-route-preloads: no chunk for ${src}; update ROUTE_PRELOADS in vite.config.ts`);
+          const files = new Set<string>();
+          walk(chunk.fileName, files);
+          const lazy = [...files].filter((f) => !inEntry.has(f));
+          const css = lazy.flatMap((f) => {
+            const c = bundle[f];
+            return c?.type === "chunk" ? [...(c.viteMetadata?.importedCss ?? [])] : [];
+          });
+          // A chunk that only carries a stylesheet is deleted later in generateBundle
+          // (its CSS stays in `css`), so asking for its .js would 404.
+          const js = lazy.filter((f) => {
+            const c = bundle[f];
+            return c?.type !== "chunk" || (c.code.trim() !== "" && !c.moduleIds.every((id) => /\.css($|\?)/.test(id)));
+          });
+          map[prefix] = [...js, ...css].map((f) => "/" + f);
+        }
+        const source =
+          "(function(){var p=location.pathname,m=" +
+          JSON.stringify(map) +
+          ";for(var k in m)if(p===k||p.indexOf(k+'/')===0)m[k].forEach(function(f){var l=document.createElement('link');" +
+          "if(/\\.css$/.test(f)){l.rel='preload';l.as='style'}else{l.rel='modulepreload'}" +
+          "l.href=f;l.crossOrigin='';document.head.appendChild(l)})})();";
+        scriptFile = this.getFileName(this.emitFile({ type: "asset", name: "route-preloads.js", source }));
+      },
+    },
+    transformIndexHtml() {
+      if (!scriptFile) throw new Error("quasar-route-preloads: the script was not emitted before index.html");
+      return [{ tag: "script", attrs: { src: "/" + scriptFile }, injectTo: "head-prepend" as const }];
+    },
+    // generateBundle above runs before Vite drops CSS-only chunks; by now the bundle
+    // is final, so every file the script will request must be in it.
+    writeBundle(_options, bundle) {
+      const missing = Object.entries(map).flatMap(([prefix, files]) =>
+        files.filter((f) => !(f.slice(1) in bundle)).map((f) => `${prefix}: ${f}`),
+      );
+      if (missing.length) throw new Error(`quasar-route-preloads: the preload script names files the build does not emit (each would 404): ${missing.join(", ")}`);
+    },
+  };
+}
+
+const INLINE_SCRIPT = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g;
+const inlineScripts = (html: string) => [...html.matchAll(INLINE_SCRIPT)].map((m) => m[1]);
+
+// The CSP pins index.html's own inline scripts by hash (httpx/security.go, and
+// TestCSPAllowsWebIndexInlineScripts checks the source file against it). A build
+// step that adds another inline script, or edits one, would be blocked in
+// production and only show up there. So the built page may hold exactly the
+// inline scripts the source page does. It only sees what the transforms before it
+// produced: keep it LAST in `plugins`.
+function pinnedInlineScripts(): Plugin {
+  let sourceScripts: string[] = [];
+  return {
+    name: "quasar-pinned-inline-scripts",
+    enforce: "post",
+    apply: "build",
+    configResolved(config) {
+      sourceScripts = inlineScripts(fs.readFileSync(path.join(config.root, "index.html"), "utf8"));
+    },
+    transformIndexHtml: {
+      order: "post",
+      handler(html) {
+        const stray = inlineScripts(html).filter((body) => !sourceScripts.includes(body));
+        if (stray.length) {
+          throw new Error(
+            `quasar-pinned-inline-scripts: the built index.html has an inline <script> that web/index.html does not (${stray[0].slice(0, 60).trim()}...). ` +
+              "The control plane's CSP only allows the two hashed ones; emit the code as an asset and load it with <script src>.",
+          );
+        }
+      },
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), preloadFonts(), operatorScripts()],
+  plugins: [react(), preloadFonts(), operatorScripts(), routePreloads(), pinnedInlineScripts()],
+  build: {
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            { name: "web", tags: ["$initial"], priority: 2 },
+            { name: "console", test: CONSOLE_SHARED, priority: 1 },
+            { name: "admin-shared", test: ADMIN_SHARED, priority: 1 },
+          ],
+        },
+      },
+    },
+  },
   server: {
     proxy: {
       "/v1": { target: controlOrigin, changeOrigin: true, ws: true },
