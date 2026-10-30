@@ -189,14 +189,20 @@ impl Device {
 }
 
 /// Whether the event node at `node` is hardware of this host: its sysfs device does not
-/// live under `/sys/devices/virtual` (where uinput makes the streamed sessions' keyboards
-/// and mice). A node whose device cannot be resolved is not taken for physical.
+/// live under `/sys/devices/virtual/input` (where uinput makes the streamed sessions'
+/// keyboards and mice; the agent makes no uhid devices, so Bluetooth LE input, which
+/// resolves under `virtual/misc/uhid`, counts). A node whose device cannot be resolved is
+/// not taken for physical.
 fn is_physical(sysfs: &Path, node: &Path) -> bool {
     let Some(name) = node.file_name() else {
         return false;
     };
-    std::fs::canonicalize(sysfs.join(name).join("device"))
-        .is_ok_and(|device| !device.components().any(|c| c.as_os_str() == "virtual"))
+    std::fs::canonicalize(sysfs.join(name).join("device")).is_ok_and(|device| {
+        let parts: Vec<_> = device.components().map(|c| c.as_os_str()).collect();
+        !parts
+            .windows(2)
+            .any(|w| w[0] == "virtual" && w[1] == "input")
+    })
 }
 
 /// How far an absolute axis moves before it counts as someone touching it: past the
@@ -370,6 +376,22 @@ mod tests {
         assert!(is_physical(&sys, Path::new("/dev/input/event3")));
         assert!(!is_physical(&sys, Path::new("/dev/input/event4")));
         assert!(!is_physical(&sys, Path::new("/dev/input/event9")));
+    }
+
+    /// #971: a Bluetooth LE keyboard or pad is a uhid device under `devices/virtual/misc`,
+    /// and is a person at the host.
+    #[test]
+    fn a_uhid_device_is_physical() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = fake_sysfs(dir.path(), &[("event4", true)]);
+        let uhid = dir
+            .path()
+            .join("devices/virtual/misc/uhid/0005:045E:0B13.0001/input/input7");
+        std::fs::create_dir_all(&uhid).unwrap();
+        std::fs::create_dir_all(sys.join("event7")).unwrap();
+        std::os::unix::fs::symlink(&uhid, sys.join("event7").join("device")).unwrap();
+        assert!(is_physical(&sys, Path::new("/dev/input/event7")));
+        assert!(!is_physical(&sys, Path::new("/dev/input/event4")), "uinput");
     }
 
     /// A device that reports on its own (sync, misc, a resting stick's noise) never
