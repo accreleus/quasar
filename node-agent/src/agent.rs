@@ -143,6 +143,8 @@ pub async fn run(cfg: Config) {
         crate::restart::exit_now(1);
     }
 
+    crate::ddc::set_state_path(cfg.console_input_state_path());
+
     // Consume a restart journal marker once per process, before probes or
     // session runtime initialization can observe the affected hardware group.
     let policy_path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
