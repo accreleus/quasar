@@ -32,7 +32,7 @@ own; the two do not move together, and that is deliberate.
 - **Sign-in, registration and password change are refused over plain HTTP (#604).** They are served on the HTTPS listener, or through a proxy named in `QUASAR_TRUSTED_PROXIES` that sends `X-Forwarded-Proto: https`; anything else gets `403 forbidden` before the password is read, the form says why, and the control plane logs `credential-route-plaintext` (bounded per source). Other signed-in calls and the agent routes are unchanged. The local `make up` stack now serves HTTPS too: sign in on the `https://` address it prints.
 
 ### Fixed
-- **A Region and Input change saved after you press Play no longer reaches that launch (#891).** The values are read before the launch is accepted, so a save made while the app is still starting applies from your next launch, as the settings page says. A time zone saved as `posixrules`, `posix/…` or `right/…` is refused: they are not time zone names.
+- **A Region and Input change saved after you press Play no longer reaches that launch (#891).** The values are read before the launch is accepted, so a save made while the app is still starting applies from your next launch, as the settings page says. A time zone of `Local`, `localtime`, `posixrules`, `posix/…` or `right/…` is now refused when you save it, as none is a time zone name; one already saved keeps working.
 
 ### Internal
 - **Region and Input: the agent's recorded values after an app swap are tested to be exactly the nine keys (#891).** No product change.

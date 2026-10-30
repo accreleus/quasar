@@ -59,6 +59,22 @@ func TestRegionInputDefaultsReadAndPatch(t *testing.T) {
 	check(env.Settings.RegionInputDefaults, want)
 	check(get(t).Settings.RegionInputDefaults, want)
 
+	// A default stored before the shape rule is left alone: a PATCH of another
+	// field does not re-validate it, and the read returns it as stored.
+	must(t, func() error {
+		_, err := pool.Exec(context.Background(), `UPDATE instance_settings SET default_timezone = 'posixrules'`)
+		return err
+	}())
+	if code, _ := patch(t, `{"default_language":"de-DE"}`); code != http.StatusOK {
+		t.Fatalf("PATCH of another field with a stored posixrules default = %d, want 200", code)
+	}
+	if got := get(t).Settings.RegionInputDefaults.Timezone; got != "posixrules" {
+		t.Errorf("stored default = %q, want it kept", got)
+	}
+	if code, _ := patch(t, `{"default_timezone":"Asia/Calcutta"}`); code != http.StatusOK {
+		t.Fatalf("PATCH = %d", code)
+	}
+
 	// Absent = unchanged; null clears only the region format.
 	if code, _ := patch(t, `{"default_region_format":null,"default_raw_mouse":false}`); code != http.StatusOK {
 		t.Fatalf("PATCH = %d", code)

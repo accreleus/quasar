@@ -25,15 +25,19 @@ const (
 
 // ValidTimezone accepts a zone the control plane's tz database knows, links
 // included, other than Local. LoadLocation reads "" as UTC, so "" is refused here.
-// The system zoneinfo directory also holds posixrules and the posix/ and right/
-// trees, which LoadLocation finds first and which are not IANA zone names.
 func ValidTimezone(tz string) bool {
-	if tz == "" || tz == "Local" || len(tz) > 64 || tz == "posixrules" ||
-		strings.HasPrefix(tz, "posix/") || strings.HasPrefix(tz, "right/") {
+	if tz == "" || len(tz) > 64 || !zoneNameShape(tz) {
 		return false
 	}
 	_, err := time.LoadLocation(tz)
 	return err == nil
+}
+
+// zoneNameShape refuses what LoadLocation finds in a system zoneinfo directory
+// but is not an IANA zone name: Local, localtime, posixrules and the posix/ and right/ trees.
+func zoneNameShape(tz string) bool {
+	return tz != "Local" && tz != "localtime" && tz != "posixrules" &&
+		!strings.HasPrefix(tz, "posix/") && !strings.HasPrefix(tz, "right/")
 }
 
 func ValidLanguage(v string) bool    { return languagePattern.MatchString(v) }
