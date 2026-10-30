@@ -811,6 +811,11 @@ export function getHostIdleApply(token: string, hostId: string, attemptId: strin
 export function cancelHostIdleApply(token: string, hostId: string, attemptId: string): Promise<IdleApplyAttempt> {
   return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply/${attemptId}/cancel`, { token, method: "POST" });
 }
+/** The explicit repair of an uncertain attempt's recovery hold (control-api.md amendment 51).
+ *  `acknowledge` says the operator knows the host's configuration was never verified. */
+export function releaseHostRecoveryHold(token: string, hostId: string, attemptId: string): Promise<{ host_status: string; attempt: IdleApplyAttempt | null }> {
+  return apiFetch(`/admin/hosts/${hostId}/idle-apply/${attemptId}/release-recovery`, { token, method: "POST", body: { acknowledge: "unverified" } });
+}
 /** Re-arm one next-session group whose transient retry budget is exhausted.
  *  A control plane that does not serve the route yet answers 404. */
 export function retryHostPolicyGroup(token: string, hostId: string, group: string): Promise<HostPolicyView> {

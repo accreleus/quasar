@@ -5,7 +5,7 @@ vi.mock("../../../../auth/context", () => ({ useAuth: () => ({ token: "admin-tok
 vi.mock("../../../../components/Toast", () => ({ useToast: () => ({ addToast: vi.fn(), removeToast: vi.fn() }) }));
 vi.mock("../../../../api/admin", () => ({
   getHostPolicy: vi.fn(), getHostIdleApply: vi.fn(),
-  approveHostIdleApply: vi.fn(), cancelHostIdleApply: vi.fn(),
+  approveHostIdleApply: vi.fn(), cancelHostIdleApply: vi.fn(), releaseHostRecoveryHold: vi.fn(),
 }));
 
 import * as api from "../../../../api/admin";
@@ -29,6 +29,32 @@ const waiting = { attempt_id: "00000000-0000-4000-8000-000000000003", group: "ha
 
 describe("idle apply policy", () => {
   beforeEach(() => { vi.clearAllMocks(); vi.mocked(api.getHostPolicy).mockResolvedValue(view() as never); });
+
+  it("releases a recovery hold only after the operator acknowledges the host is unverified", async () => {
+    const uncertain = { ...waiting, phase: "uncertain", started: true, remedy: null };
+    vi.mocked(api.getHostPolicy).mockResolvedValue(view(waiting.attempt_id) as never);
+    vi.mocked(api.getHostIdleApply).mockResolvedValue(uncertain as never);
+    vi.mocked(api.releaseHostRecoveryHold).mockResolvedValue({ host_status: "online", attempt: { ...uncertain, admission_restricted: false } } as never);
+    render(<IdleApplyPolicy hostId="host-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Release recovery hold" }));
+    expect(screen.getByText(/state is unverified/)).toBeTruthy();
+    const confirm = screen.getByRole("button", { name: "Release hold" }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    fireEvent.click(screen.getByRole("checkbox", { name: /configuration is unverified/ }));
+    fireEvent.click(confirm);
+    await waitFor(() => expect(api.releaseHostRecoveryHold).toHaveBeenCalledWith("admin-token", "host-1", waiting.attempt_id));
+    expect(await screen.findByText(/An administrator released the recovery hold/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Release recovery hold" })).toBeNull();
+    expect(screen.queryByText(/Admission remains protected/)).toBeNull();
+  });
+
+  it("offers no release for an uncertain attempt that holds nothing", async () => {
+    vi.mocked(api.getHostPolicy).mockResolvedValue(view(waiting.attempt_id) as never);
+    vi.mocked(api.getHostIdleApply).mockResolvedValue({ ...waiting, phase: "uncertain", started: true, admission_restricted: false } as never);
+    render(<IdleApplyPolicy hostId="host-1" />);
+    expect(await screen.findByText(/An administrator released the recovery hold/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Release recovery hold" })).toBeNull();
+  });
 
   it("shows an unavailable candidate through the group remedy without inventing review fields", async () => {
     const missing = view();

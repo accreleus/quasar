@@ -630,9 +630,11 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
-		// A restored ledger can hold the attempt without its restriction.
+		// A restored ledger can hold the attempt without its restriction; an
+		// administrator's release (ReleaseRecoveryHold) is never re-planted.
 		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
-			VALUES($1::uuid,'recovery',$2::uuid,'configuration_recovery') ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
+			SELECT $1::uuid,'recovery',$2::uuid,'configuration_recovery' WHERE NOT EXISTS(SELECT 1 FROM host_config_attempts
+				WHERE host_id=$1::uuid AND id=$2::uuid AND recovery_released_at IS NOT NULL) ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
 	} else if terminal && (entry.Phase != "applied" || active) {

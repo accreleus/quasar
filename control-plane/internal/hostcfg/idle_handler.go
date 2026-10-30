@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 
@@ -93,4 +94,58 @@ func (h *Handler) handleCancelIdleApply(w http.ResponseWriter, r *http.Request) 
 	default:
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not cancel idle apply")
 	}
+}
+
+// semantics: control-api.md "Releasing a recovery hold" (amendment 51, #656).
+func (h *Handler) handleReleaseRecoveryHold(w http.ResponseWriter, r *http.Request) {
+	hostID, attemptID := r.PathValue("id"), r.PathValue("attempt_id")
+	if !canonicalAttemptID.MatchString(attemptID) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid attempt ID")
+		return
+	}
+	var req struct {
+		Acknowledge string `json:"acknowledge"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil || req.Acknowledge != "unverified" {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, `acknowledge must be "unverified": the host's configuration was never verified`)
+		return
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid release request")
+		return
+	}
+	connected := false
+	if c, ok := h.dispatcher.(interface{ IsConnected(string) bool }); ok {
+		connected = c.IsConnected(hostID)
+	}
+	status, err := h.store.ReleaseRecoveryHold(r.Context(), hostID, attemptID, connected)
+	switch {
+	case errors.Is(err, ErrHostNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host not found")
+		return
+	case errors.Is(err, ErrRecoveryHoldNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no recovery hold for this attempt")
+		return
+	case errors.Is(err, ErrJournalNotReconciled):
+		httpx.WriteError(w, http.StatusConflict, "journal_reconciliation_pending", "The host's agent journal is not reconciled. Reconnect the host and wait for reconciliation to finish.")
+		return
+	case err != nil:
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not release the recovery hold")
+		return
+	}
+	if h.audit != nil {
+		if err := h.audit.Record(r.Context(), actorID(r), "host.recovery.release", "host", hostID, map[string]any{"attempt_id": attemptID, "acknowledge": req.Acknowledge}); err != nil {
+			slog.Warn("record admin activity failed", "action", "host.recovery.release", "err", err)
+		}
+	}
+	// The release committed: a failed read-back must not turn it into an error.
+	var attempt *IdleApplyAttempt
+	if view, err := h.store.GetIdleApply(r.Context(), hostID, attemptID); err == nil {
+		attempt = &view
+	} else {
+		slog.Warn("read released attempt failed", "host_id", hostID, "err", err)
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"host_status": status, "attempt": attempt})
 }

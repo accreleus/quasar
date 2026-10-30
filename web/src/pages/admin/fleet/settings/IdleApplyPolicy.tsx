@@ -2,6 +2,7 @@ import { useState } from "react";
 import * as adminApi from "../../../../api/admin";
 import { ApiError } from "../../../../api/client";
 import { Button } from "../../../../components/Button";
+import { Modal } from "../../../../components/Modal";
 import { ResourceStates } from "../../../../components/ResourceStates";
 import { useAdminAction } from "../../../../lib/resource/action";
 import { useResource } from "../../../../lib/resource/react";
@@ -125,8 +126,26 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
       onFailure: (error) => setActionError(error instanceof ApiError ? error.message : "Could not cancel idle apply."),
     },
   );
+  const [releasing, setReleasing] = useState(false);
+  const [acknowledged, setAcknowledged] = useState(false);
+  const release = useAdminAction<[string, string], { attempt: adminApi.IdleApplyAttempt | null }>(
+    (id, owner) => resource.mutate(
+      ({ token }) => adminApi.releaseHostRecoveryHold(token, owner, id),
+      (data, result) => ({ ...data, attempt: result.attempt ?? data.attempt }),
+    ),
+    {
+      success: "Recovery hold released.",
+      failure: "Could not release the recovery hold.",
+      onSuccess: () => { setActionError(null); setReleasing(false); },
+      onFailure: (error) => {
+        setReleasing(false);
+        setActionError(error instanceof ApiError ? error.message : "Could not release the recovery hold.");
+      },
+    },
+  );
   if (!hostId || (resource.data && (!group || group.scope !== "restart"))) return null;
-  const busy = approve.pending !== null || cancel.pending !== null;
+  const busy = approve.pending !== null || cancel.pending !== null || release.pending !== null;
+  const recoveryHeld = attempt?.phase === "uncertain" && attempt.admission_restricted;
 
   return <KnobPanel title="Idle apply" hint="Approve a reviewed host configuration for an idle window. Saving settings alone does not apply them.">
     <div className="cset">
@@ -137,7 +156,8 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
           <p className="hint">Saved configuration: {group.status.replaceAll("_", " ")}. {attempt ? `Approval: ${attempt.phase.replaceAll("_", " ")}.` : "No approval is active."}</p>
           {attempt && <p className="hint">Execution {attempt.started ? "started" : "has not started"}; admission {attempt.admission_restricted ? "protected" : "open"}.</p>}
           {attempt?.phase === "recovered" && <p className="form-error" role="alert">The requested configuration failed. The agent restored its last verified configuration; review the failure before retrying.</p>}
-          {attempt?.phase === "uncertain" && <p className="form-error" role="alert">Recovery could not be verified. Admission remains protected until an operator repairs this host.</p>}
+          {recoveryHeld && <p className="form-error" role="alert">Recovery could not be verified. Admission remains protected until an operator repairs this host.</p>}
+          {attempt?.phase === "uncertain" && !attempt.admission_restricted && <p className="hint">An administrator released the recovery hold. This host's configuration was never verified.</p>}
           {attempt?.remedy && <p className="hint">{attempt.remedy}</p>}
           {preview?.remedy && !waiting && <p className="hint">{preview.remedy}</p>}
           {!preview && group.remedy && !waiting && <p className="hint">{group.remedy}</p>}
@@ -147,6 +167,7 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
         </div>
         <div className="acts">
           <Button variant="ghost" disabled={busy} onClick={() => void resource.refresh()}>Refresh status</Button>
+          {recoveryHeld && <Button variant="danger" disabled={busy} onClick={() => { setAcknowledged(false); setReleasing(true); }}>Release recovery hold</Button>}
           {waiting ? <Button variant="ghost" disabled={busy || attempt?.phase === "cancel_pending"} onClick={() => { if (attempt) void cancel.run(attempt.attempt_id, hostId); }}>
             {attempt?.phase === "cancel_pending" ? "Cancellation pending" : "Cancel approval"}
           </Button> : <>
@@ -158,6 +179,25 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
           </>}
         </div>
         {displayed && reviewDetails(displayed)}
+        {releasing && attempt && <Modal
+          open
+          onClose={() => setReleasing(false)}
+          title="Release the recovery hold?"
+          footer={<>
+            <Button variant="ghost" onClick={() => setReleasing(false)}>Cancel</Button>
+            <Button variant="danger" disabled={!acknowledged || busy} onClick={() => void release.run(attempt.attempt_id, hostId)}>Release hold</Button>
+          </>}
+        >
+          <div className="note warn">
+            <strong>This host's state is unverified.</strong> The agent restarted to apply a configuration and could not
+            prove which configuration it is running now. Releasing the hold lets the host take new sessions anyway.
+          </div>
+          <p>The control plane does not repair the host. Check its readiness and media probe first, then review and approve the configuration again.</p>
+          <label className="rowflex">
+            <input type="checkbox" checked={acknowledged} onChange={(e) => setAcknowledged(e.target.checked)} />
+            <span>I understand this host's configuration is unverified.</span>
+          </label>
+        </Modal>}
       </>}
     </div>
   </KnobPanel>;
