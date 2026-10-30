@@ -24,10 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
-### Fixed
-- **Session view: common pads the browser leaves unmapped now arrive in the right layout (#831).** The 8BitDo SN30 Pro, Lite 2, Lite SE, Pro 2, Pro 3, Ultimate and Xbox One SN30 Pro, and the Logitech F310, F510 and F710 in D-input mode, are translated to the standard gamepad layout in the browser when they report the device's own button order (for example over Bluetooth). They no longer show the "controller not recognised" notice. Any other pad that is not mapped keeps the notice.
-
 ### Internal
+- **Session view: a per-platform remap table for controllers the browser does not map (#831).** A pad found in the table for your OS and browser, with the same number of buttons and axes it was captured with, is translated to the standard layout before it is sent, and no longer shows the "controller not recognised" notice. The table starts empty and gains an entry only from a real capture, so nothing changes yet: other pads keep the notice and its advice.
 - **Image cleanup test: the second attempt's journal checks no longer race the control plane (#960).** The test now answers every inventory scan as the agent does (a late inventory change that overlaps the attempt's own reconcile costs one more scan before the journal), and treats only a journal request naming the second attempt as stale (the first dispatch's own request for the first attempt can land late). It failed on most CI runs under load. No product change.
 
 ## 0.5.1 — 2026-10-30

@@ -29,7 +29,7 @@
 // (matched by pointerId, so chrome taps are never seen here).
 
 import { EVDEV, MB_MAP } from "./evdev";
-import { remapGamepad } from "./gamepadRemap";
+import { detectPadEnv, remapGamepad, type PadEnv } from "./gamepadRemap";
 import { createMouseScaler, mouseGain, NEUTRAL_MOUSE, type MouseSettings } from "./mouseScale";
 import { isSendEscCombo, isSummonCombo, sendEscComboEnabled } from "./summonCombo";
 import { pointerLockSupported } from "./support";
@@ -63,10 +63,15 @@ export function isStandardMapping(pad: { mapping: string; remapped?: boolean }):
   return pad.mapping === "standard" || pad.remapped === true;
 }
 
-function padIdentity(pad: Gamepad, buttons: number[], axes: number[]): GamepadIdentity {
+/** One pad's state as it goes on the wire, translated when the remap table knows it. */
+function readPad(pad: Gamepad, env: PadEnv) {
+  let buttons = Array.from(pad.buttons, (b) => b.value);
+  let axes = Array.from(pad.axes, (a) => Math.round(a * 1000) / 1000);
+  const mapped = pad.mapping === "standard" ? null : remapGamepad(pad.id, buttons, axes, env);
+  if (mapped) ({ buttons, axes } = mapped);
   const identity: GamepadIdentity = { index: pad.index, id: pad.id, mapping: pad.mapping };
-  if (pad.mapping !== "standard" && remapGamepad(pad.id, buttons, axes)) identity.remapped = true;
-  return identity;
+  if (mapped) identity.remapped = true;
+  return { buttons, axes, identity };
 }
 
 /** AS10-13: snapshot of input-pipeline health, sampled each telemetry poll. */
@@ -291,6 +296,7 @@ export function setupCapture({
 
   // Gamepad state for delta-only sends.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
+  const padEnv = detectPadEnv();
   // Pad ids already reported through onNonStandardGamepad (one notice each).
   const nonStandardReported = new Set<string>();
   let rafId: number;
@@ -892,10 +898,7 @@ export function setupCapture({
       const pads = navigator.getGamepads ? navigator.getGamepads() : [];
       for (const pad of pads) {
         if (!pad) continue;
-        let buttons = Array.from(pad.buttons, (b) => b.value);
-        let axes = Array.from(pad.axes, (a) => Math.round(a * 1000) / 1000);
-        const identity = padIdentity(pad, buttons, axes);
-        if (identity.remapped) ({ buttons, axes } = remapGamepad(pad.id, buttons, axes)!);
+        const { buttons, axes, identity } = readPad(pad, padEnv);
         // Standard layout only: on any other pad the indices are the device's own order.
         if (mouseSettings.nintendo && buttons.length > 3 && isStandardMapping(identity)) {
           swapButtons(buttons, 0, 1); // A (bottom) with B (right)
@@ -941,7 +944,7 @@ export function setupCapture({
     for (const p of rawPads) {
       if (!p) continue;
       gamepadCount++;
-      padIdentities.push(padIdentity(p, Array.from(p.buttons, (b) => b.value), Array.from(p.axes)));
+      padIdentities.push(readPad(p, padEnv).identity);
     }
 
     const snapshot: CaptureMetrics = {

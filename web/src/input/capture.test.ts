@@ -22,6 +22,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setupCapture, isStandardMapping, keyboardLockSupported, pointerLockSupported, rawMouseSupported } from "./capture";
 import { EVDEV, MB_MAP } from "./evdev";
+import { PADS, type PadEntry } from "./gamepadRemap";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1390,28 +1391,50 @@ describe("gamepad — Nintendo layout (control-api.md §Region and Input setting
     cap.cleanup();
   });
 
-  describe("a pad the table knows (gamepadRemap.ts)", () => {
-    // 8BitDo Pro 2: raw b1 is the bottom button, b0 the right one, b4 left, b3 top; hat on axis 9.
+  describe("a pad the remap table knows (gamepadRemap.ts)", () => {
+    // Synthetic capture: raw b1 is the bottom button, b0 the right one, b4 left, b3 top; hat on axis 5 of 6.
     const ID = "8BitDo Pro 2 (Vendor: 2dc8 Product: 6006)";
+    const ENTRY: PadEntry = {
+      vid: "2dc8", pid: "6006", platform: "win", browser: "chrome", source: "synthetic test capture",
+      buttons: 13, axes: 6, hatAxis: 5,
+      map: "a:b1,b:b0,x:b4,y:b3,leftshoulder:b6,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,leftx:a0,lefty:a1,rightx:a3,righty:a4",
+    };
     const rawPad = (pressed: number[], over: object = {}) => ({
       index: 0, id: ID, mapping: "",
-      buttons: Array.from({ length: 15 }, (_, i) => ({ value: pressed.includes(i) ? 1 : 0 })),
-      axes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 3.286], ...over,
+      buttons: Array.from({ length: 13 }, (_, i) => ({ value: pressed.includes(i) ? 1 : 0 })),
+      axes: [0, 0, 0, 0, 0, 3.286], ...over,
     });
+    const WIN_CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+    const setEnv = (platform: string, userAgent = WIN_CHROME_UA) => {
+      Object.defineProperty(navigator, "platform", { value: platform, configurable: true });
+      Object.defineProperty(navigator, "userAgent", { value: userAgent, configurable: true });
+    };
     const sentButtons = (send: ReturnType<typeof vi.fn>) => send.mock.calls.at(-1)![0].buttons as number[];
     const down = (b: number[]) => b.flatMap((v, i) => (v ? [i] : []));
-
-    it("is forwarded in the standard layout, with no notice", () => {
-      const onNonStandardGamepad = vi.fn();
-      const pad = rawPad([1, 6]);
-      Object.defineProperty(navigator, "getGamepads", { value: () => [pad], configurable: true });
+    const openWith = (pad: object, mouse?: typeof NIN, onNonStandardGamepad = vi.fn()) => {
       let poll: ((t: number) => void) | null = null;
       vi.stubGlobal("requestAnimationFrame", vi.fn((cb: (t: number) => void) => ((poll = cb), 1)));
+      Object.defineProperty(navigator, "getGamepads", { value: () => [pad], configurable: true });
       const video = makeVideo();
       const send = vi.fn();
-      const cap = setupCapture({ videoEl: video, sendInput: send, onCaptureChange: vi.fn(), channel: makeChannel(), onNonStandardGamepad });
+      const cap = setupCapture({ videoEl: video, sendInput: send, onCaptureChange: vi.fn(), channel: makeChannel(), mouse, onNonStandardGamepad });
       lockPointer(video);
-      poll!(0);
+      return { cap, send, poll: () => poll!(0), onNonStandardGamepad };
+    };
+
+    beforeEach(() => {
+      PADS.push(ENTRY);
+      setEnv("Win32");
+    });
+    afterEach(() => {
+      PADS.splice(PADS.indexOf(ENTRY), 1);
+      delete (navigator as unknown as { platform?: string }).platform;
+      delete (navigator as unknown as { userAgent?: string }).userAgent;
+    });
+
+    it("is forwarded in the standard layout, with no notice", () => {
+      const { cap, send, poll, onNonStandardGamepad } = openWith(rawPad([1, 6]));
+      poll();
       expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: expect.any(Array), axes: [0, 0, 0, 0] });
       expect(down(sentButtons(send))).toEqual([0, 4]); // raw b1 → A, raw b6 → LB
       expect(onNonStandardGamepad).not.toHaveBeenCalled();
@@ -1421,17 +1444,47 @@ describe("gamepad — Nintendo layout (control-api.md §Region and Input setting
     });
 
     it("the Nintendo swap applies after the remap", () => {
-      const { cap, send, poll } = open(rawPad([1, 4]), NIN);
+      const { cap, send, poll } = openWith(rawPad([1, 4]), NIN);
       poll();
       expect(down(sentButtons(send))).toEqual([1, 3]); // bottom → B, left → Y
       cap.cleanup();
     });
 
-    it("a table id whose raw arrays do not fit stays unmapped and keeps the notice", () => {
-      const { cap, send, poll } = open(rawPad([1], { axes: [0, 0, 0, 0] }), NIN);
+    it("another platform is not remapped: raw out, notice fires, pane marks it", () => {
+      for (const platform of ["Linux x86_64", "MacIntel"]) {
+        setEnv(platform);
+        const { cap, send, poll, onNonStandardGamepad } = openWith(rawPad([1]));
+        poll();
+        expect(down(sentButtons(send))).toEqual([1]); // untouched
+        expect(onNonStandardGamepad).toHaveBeenCalledTimes(1);
+        expect(isStandardMapping(cap.getMetrics().pads[0])).toBe(false);
+        cap.cleanup();
+        unlockPointer();
+      }
+    });
+
+    it("another browser family is not remapped", () => {
+      setEnv("Win32", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0");
+      const { cap, send, poll, onNonStandardGamepad } = openWith(rawPad([1]));
+      poll();
+      expect(down(sentButtons(send))).toEqual([1]);
+      expect(onNonStandardGamepad).toHaveBeenCalledTimes(1);
+      cap.cleanup();
+    });
+
+    it("different array lengths than the capture: not remapped, notice still fires", () => {
+      const { cap, send, poll, onNonStandardGamepad } = openWith(rawPad([1], { axes: [0, 0, 0, 0] }));
       poll();
       expect(down(sentButtons(send))).toEqual([1]); // raw, untouched
+      expect(onNonStandardGamepad).toHaveBeenCalledTimes(1);
       expect(isStandardMapping(cap.getMetrics().pads[0])).toBe(false);
+      cap.cleanup();
+    });
+
+    it("a hat reading on the wrong axis does not press the d-pad", () => {
+      const { cap, send, poll } = openWith(rawPad([], { axes: [0.05, 0, 0, 0, -1, 3.286] }));
+      poll();
+      expect(down(sentButtons(send))).toEqual([]);
       cap.cleanup();
     });
   });
