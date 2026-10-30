@@ -147,6 +147,7 @@ const CONTROL_ONLY: &[&str] = &[
     var::PUBLIC_HOST,
     var::TLS_HOSTS,
     var::TRUSTED_PROXIES,
+    var::HSTS_MAX_AGE,
     var::HTTP_PORT,
     var::TLS_PORT,
     ENROLL_SEED_IMAGE,
@@ -258,6 +259,7 @@ fn apply_fields(
                     var::PUBLIC_HOST => control.public_host = opt(value),
                     var::TLS_HOSTS => control.tls_hosts = opt(value),
                     var::TRUSTED_PROXIES => control.trusted_proxies = opt(value),
+                    var::HSTS_MAX_AGE => control.hsts_max_age = opt(value),
                     var::HTTP_PORT | var::TLS_PORT => {
                         let port = value
                             .trim()

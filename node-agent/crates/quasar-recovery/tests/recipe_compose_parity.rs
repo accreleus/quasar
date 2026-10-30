@@ -471,6 +471,7 @@ fn control_plane_at(revision: u32) -> (Inputs, ContainerSpec) {
         unknown: Default::default(),
         machine_role: quasar_recovery::recipe::ControlRole::Combined,
         trusted_proxies: None,
+        hsts_max_age: None,
         http_port: 8080,
         tls_port: 8443,
         public_host: Some("quasar.example.invalid".into()),

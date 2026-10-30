@@ -361,11 +361,13 @@ stack or manager definition that re-creates it.
   recorded in machine state at the first install and change with `quasar-recovery reconfigure`, a
   verified replacement with the same images and new inputs. The role, node name, database and
   images are fixed at install. On a combined or control-only machine it also changes the
-  control plane's inputs (the public host, TLS names, trusted proxies, ports), re-creating the
+  control plane's inputs (the public host, TLS names, trusted proxies, HSTS, ports), re-creating the
   control plane first. Naming a reverse proxy, which sign-in through a proxy on the HTTP port
   needs (#604), is one: `docker exec -it quasar-recovery quasar-recovery reconfigure --yes
-  QUASAR_TRUSTED_PROXIES=<proxy address>`. `docs/configuration.md` "Changing machine inputs:
-  `reconfigure`".
+  QUASAR_TRUSTED_PROXIES=<proxy address>`. Turning on HSTS (opt-in, off by default) is another:
+  `reconfigure --yes QUASAR_HSTS_MAX_AGE=<seconds>`; it pins the whole host name for that long, so
+  read the warning at `QUASAR_HSTS_MAX_AGE` in `docs/configuration.md` first. `docs/configuration.md`
+  "Changing machine inputs: `reconfigure`".
 - **A GPU host** is removed from the console: the host → **Remove host** drains it, then removes
   its agent and recovery actor. Any machine can be taken apart on the machine with the recovery
   image's `uninstall`, which keeps the database, machine state and homes unless `--purge`.
