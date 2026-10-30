@@ -26,10 +26,11 @@ services:
       # the host gateway, so it would trust unrelated stacks' containers as if
       # they were this deployment's edge.
       # Never widen this to a network you do not operate.
-      # It must be set: left empty, Caddy's X-Forwarded-Proto is not believed,
-      # so first-run setup, sign-in, registration and password change through
-      # Caddy are all refused (#593, #604).
-      QUASAR_TRUSTED_PROXIES: ${QUASAR_TRUSTED_PROXIES:-}
+      # Required: left empty, Caddy's X-Forwarded-Proto is not believed, so
+      # first-run setup, sign-in, registration and password change through
+      # Caddy are all refused (#593, #604). On a fresh install, create the
+      # network first with the base file alone: `up --no-start`.
+      QUASAR_TRUSTED_PROXIES: ${QUASAR_TRUSTED_PROXIES:?Set QUASAR_TRUSTED_PROXIES in deploy/.env to this compose project's bridge /16 or nobody can sign in through Caddy (docs/operations/hardened-deployment.md)}
 
   quasar-edge:
     image: caddy@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c

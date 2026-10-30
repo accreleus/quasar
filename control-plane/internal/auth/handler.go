@@ -88,7 +88,7 @@ func (h *Handler) WithLogger(log *slog.Logger) *Handler {
 // password forms.
 const plaintextMessage = "This server only accepts sign-in, registration and password changes over HTTPS. " +
 	"Open it at its https:// address. If you reach it through a reverse proxy, the operator must name that proxy in QUASAR_TRUSTED_PROXIES. " +
-	"A password or invite code sent this way crossed the network in clear: change it."
+	"A password or invite code sent this way may have crossed the network in clear: change it once you can sign in over HTTPS."
 
 // refusePlaintext answers 403 and reports true when a password-bearing route
 // arrives over a transport the #593 rule refuses (#604), before the body is read

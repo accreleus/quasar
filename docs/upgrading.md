@@ -76,9 +76,9 @@ unrepresentable here, not merely discouraged.
 
 Sign-in, registration and password change are refused over plain HTTP (#604). A browser on the
 control plane's HTTPS port, or a proxy pointed at it, needs nothing. A proxy pointed at the
-**HTTP** port (the bundled hardened Caddy overlay is one) must be named in
-`QUASAR_TRUSTED_PROXIES` and send `X-Forwarded-Proto: https`, or nobody can sign in through it
-after the update. Signed-in users keep working until their sign-in expires.
+**HTTP** port must be named in `QUASAR_TRUSTED_PROXIES` and send `X-Forwarded-Proto: https`, or
+nobody can sign in through it after the update. The bundled hardened Caddy overlay is one, and it
+now refuses to start (`compose up` names the variable) until it is set. Signed-in users keep working until their sign-in expires.
 
 - **Owned install:** `docker exec -it quasar-recovery quasar-recovery reconfigure --yes
   QUASAR_TRUSTED_PROXIES=<proxy address>` on the control plane's machine. It re-creates the

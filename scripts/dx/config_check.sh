@@ -69,7 +69,8 @@ for entry in "${CONFIG_SETS[@]}"; do
   else
     safe_err="$(printf '%s' "$err" | "$DX_DIR/redact.sh" | head -n 3 | tr '\n' ' ')"
     # "required variable X is missing a value" means THIS MACHINE has not been
-    # configured for that overlay (hardened needs QUASAR_PUBLIC_HOST, profiling
+    # configured for that overlay (hardened needs QUASAR_PUBLIC_HOST and
+    # QUASAR_TRUSTED_PROXIES, profiling
     # needs an explicit dated QUASAR_PROFILING_IMAGE). That is an operator-input
     # gap, not a broken file — WARN. A structural error is a real FAIL.
     if printf '%s' "$err" | grep -q 'required variable'; then

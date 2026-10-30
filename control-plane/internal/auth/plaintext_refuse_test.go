@@ -104,3 +104,27 @@ func TestCredentialRouteRefusalLogIsBoundedPerSource(t *testing.T) {
 		t.Fatalf("WARN lines = %d under a flood, want the bound 10", got)
 	}
 }
+
+// Through the registered routes: the password change is behind RequireAuth, so
+// a plain-HTTP call with no bearer gets 401, not the transport 403; sign-in and
+// registration get the 403 for every request of a flood, so neither charges the
+// login limiter.
+func TestCredentialRefusalThroughTheMux(t *testing.T) {
+	mux := http.NewServeMux()
+	NewHandler(nil).WithLogger(slog.New(slog.DiscardHandler)).Register(mux)
+	serve := func(path string) int {
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}")))
+		return rr.Code
+	}
+	if got := serve("/v1/me/password"); got != http.StatusUnauthorized {
+		t.Fatalf("POST /v1/me/password, no bearer, plain HTTP: %d, want 401 from RequireAuth", got)
+	}
+	for _, path := range []string{"/v1/auth/login", "/v1/auth/register"} {
+		for i := 0; i < 30; i++ {
+			if got := serve(path); got != http.StatusForbidden {
+				t.Fatalf("POST %s request %d: %d, want 403 (a 429 means the limiter was charged first)", path, i, got)
+			}
+		}
+	}
+}
