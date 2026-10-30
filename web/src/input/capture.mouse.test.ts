@@ -116,6 +116,47 @@ describe("mouse speed in setupCapture", () => {
     cap.cleanup();
   });
 
+  it("stream below the compositor: the cursor gain is compositor pixels per shown pixel", () => {
+    // 2560x1440 compositor, 1920x1080 stream shown 1:1; the host must move 4/3 per browser pixel.
+    const el = video(1920, 1920);
+    el.dataset.compositorW = "2560";
+    el.dataset.compositorH = "1440";
+    const { cap, sent } = start(el, MATCH);
+    move(3);
+    move(3);
+    move(3);
+    expect(sent).toEqual([{ dx: 4, dy: 0 }, { dx: 4, dy: 0 }, { dx: 4, dy: 0 }]);
+    cap.cleanup();
+  });
+
+  it("an ABR rung step mid-session keeps the cursor under the pointer", () => {
+    // Compositor 1920x1080 and a 1920x1080 window: gain 1, then the stream steps to 1280x720.
+    const el = video(1920, 1920);
+    el.dataset.compositorW = "1920";
+    el.dataset.compositorH = "1080";
+    const { cap, sent } = start(el, MATCH);
+    move(6);
+    Object.defineProperty(el, "videoWidth", { value: 1280, configurable: true });
+    Object.defineProperty(el, "videoHeight", { value: 720, configurable: true });
+    Object.defineProperty(el, "clientHeight", { value: 1080, configurable: true });
+    el.dispatchEvent(new Event("resize"));
+    move(6);
+    expect(sent).toEqual([{ dx: 6, dy: 0 }, { dx: 6, dy: 0 }]);
+    cap.cleanup();
+  });
+
+  it("follows a compositor-size change (a render resolution change)", async () => {
+    const el = video(1920, 1920);
+    const { cap, sent } = start(el, MATCH);
+    move(6);
+    el.dataset.compositorW = "1280";
+    el.dataset.compositorH = "720";
+    await new Promise((r) => setTimeout(r));
+    move(6);
+    expect(sent).toEqual([{ dx: 6, dy: 0 }, { dx: 4, dy: 0 }]);
+    cap.cleanup();
+  });
+
   it("follows a scaling-mode change, which keeps the box the same size", async () => {
     // 1920x1080 in a 1440x900 box: contain draws at 0.75, cover at 0.8333.
     const el = video(1920, 1440, 1080, 900);

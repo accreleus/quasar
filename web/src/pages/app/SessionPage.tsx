@@ -965,6 +965,10 @@ function SessionPageBody() {
   // Poll is authoritative; the tier string is only the pre-first-poll seed.
   const streamSize = polledStreamSize ?? parseTierSize(state?.tier);
 
+  // The size the host moves the cursor in (Match cursor, input/mouseScale.ts): the render size
+  // when one is set, else the launch size. The stream is only ever scaled below it.
+  const compositorSize = renderSize ?? streamSize;
+
   // Server owns this list; the client-side 16:9 ladder is a stand-in until the
   // first poll answers (or for a control plane older than the amendment).
   const effectiveRungs =
@@ -1012,6 +1016,8 @@ function SessionPageBody() {
           ref={videoRef}
           className="session-video"
           data-scaling-mode={scalingMode}
+          data-compositor-w={compositorSize?.w}
+          data-compositor-h={compositorSize?.h}
           muted
           playsInline
           autoPlay

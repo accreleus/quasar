@@ -53,17 +53,24 @@ export interface ShownGeometry {
   boxH: number;
   /** The session view's scaling mode (`data-scaling-mode`): contain, cover or stretch; `integer` draws as contain. */
   fit?: string;
+  /** The compositor's output size, which the host moves the cursor in. Absent means it equals the stream
+   *  (the stream is only ever scaled below it: the stream-size lever, an ABR rung, or a lowered render size). */
+  compW?: number;
+  compH?: number;
 }
 
-/** Stream pixels per shown pixel on each axis; `[1, 1]` when the geometry is not known yet. */
+/** Host pixels per shown pixel on each axis: the stream's, times compositor ÷ stream when the stream
+ *  is scaled below the compositor. `[1, 1]` when the geometry is not known yet. */
 export function streamPerShown(g: ShownGeometry): [number, number] {
   const { streamW, streamH, boxW, boxH } = g;
   if (!(streamW > 0 && streamH > 0 && boxW > 0 && boxH > 0)) return [1, 1];
+  const kx = g.compW && g.compH ? g.compW / streamW : 1;
+  const ky = g.compW && g.compH ? g.compH / streamH : 1;
   const sx = boxW / streamW;
   const sy = boxH / streamH;
-  if (g.fit === "stretch") return [1 / sx, 1 / sy];
+  if (g.fit === "stretch") return [kx / sx, ky / sy];
   const s = g.fit === "cover" ? Math.max(sx, sy) : Math.min(sx, sy);
-  return [1 / s, 1 / s];
+  return [kx / s, ky / s];
 }
 
 /** The per-axis multiplier for one mouse event. Exactly `[1, 1]` for a window equal to the stream at 1×. */

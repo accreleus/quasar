@@ -90,6 +90,26 @@ describe("mouseGain", () => {
     expect(mouseGain({ match: true, sensitivity: 0.5, raw: false, flip: false, nintendo: false }, { ...stream, boxW: 960, boxH: 540 })).toEqual([1, 1]);
   });
 
+  it("compositor equal to the stream changes nothing", () => {
+    const m = { match: true, sensitivity: 1, raw: false, flip: false, nintendo: false };
+    expect(mouseGain(m, { ...stream, boxW: 1920, boxH: 1080, compW: 1920, compH: 1080 })).toEqual([1, 1]);
+    expect(mouseGain(m, { ...stream, boxW: 960, boxH: 540, compW: 1920, compH: 1080 })).toEqual([2, 2]);
+  });
+
+  it("stream scaled below the compositor: gain is compositor pixels per shown pixel", () => {
+    // 2560x1440 compositor, 1920x1080 stream, 1920x1080 window: 4/3, not 1.
+    const m = { match: true, sensitivity: 1, raw: false, flip: false, nintendo: false };
+    const [gx, gy] = mouseGain(m, { ...stream, boxW: 1920, boxH: 1080, compW: 2560, compH: 1440 });
+    expect(gx).toBeCloseTo(2560 / 1920, 10);
+    expect(gy).toBeCloseTo(1440 / 1080, 10);
+  });
+
+  it("compositor size does not matter with matching off", () => {
+    expect(
+      mouseGain({ match: false, sensitivity: 1, raw: false, flip: false, nintendo: false }, { ...stream, boxW: 960, boxH: 540, compW: 2560, compH: 1440 }),
+    ).toEqual([1, 1]);
+  });
+
   it("does not scale before the stream or window has a size", () => {
     expect(mouseGain({ match: true, sensitivity: 1, raw: false, flip: false, nintendo: false }, { streamW: 0, streamH: 0, boxW: 960, boxH: 540 })).toEqual([1, 1]);
   });

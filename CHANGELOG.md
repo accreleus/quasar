@@ -31,6 +31,9 @@ own; the two do not move together, and that is deliberate.
 ### Changed
 - **Sign-in, registration and password change are refused over plain HTTP (#604).** They are served on the HTTPS listener, or through a proxy named in `QUASAR_TRUSTED_PROXIES` that sends `X-Forwarded-Proto: https`; anything else gets `403 forbidden` before the password is read, the form says why, and the control plane logs `credential-route-plaintext` (bounded per source). Other signed-in calls and the agent routes are unchanged. The local `make up` stack now serves HTTPS too: sign in on the `https://` address it prints.
 
+### Fixed
+- **Match cursor keeps the cursor under the pointer when the stream is scaled below the compositor (#898).** The stream-size lever, an automatic resolution step and a lowered render resolution all shrink the picture; the client now scales mouse movement by the compositor size too, so the cursor no longer lags (or runs ahead of) the pointer. A window equal to the stream changes nothing.
+
 ### Internal
 - **Image cleanup test: the second attempt's journal checks no longer race the control plane (#960).** The test now answers every inventory scan as the agent does (a late inventory change that overlaps the attempt's own reconcile costs one more scan before the journal), and treats only a journal request naming the second attempt as stale (the first dispatch's own request for the first attempt can land late). It failed on most CI runs under load. No product change.
 
