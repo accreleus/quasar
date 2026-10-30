@@ -24,10 +24,18 @@ func newTestServerV(t *testing.T, minClient, latestClient string) *httptest.Serv
 	svc := testService(t, pool)
 	mux := http.NewServeMux()
 	NewHandler(svc).WithVersionPolicy(minClient, latestClient).Register(mux)
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewTLSServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
 }
+
+// testClient trusts the certificate every httptest.NewTLSServer shares: the
+// password routes are refused over plain HTTP (#604).
+var testClient = func() *http.Client {
+	s := httptest.NewTLSServer(http.NotFoundHandler())
+	defer s.Close()
+	return s.Client()
+}()
 
 func post(t *testing.T, url string, body any, bearer string) (*http.Response, map[string]any) {
 	t.Helper()
@@ -58,7 +66,7 @@ func get(t *testing.T, url, bearer string) (*http.Response, map[string]any) {
 
 func do(t *testing.T, req *http.Request) (*http.Response, map[string]any) {
 	t.Helper()
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := testClient.Do(req)
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}

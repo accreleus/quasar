@@ -13,6 +13,9 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 NET=quasar-apitest-net
 PG=quasar-apitest-pg
 CP=quasar-apitest-cp
+# The control plane's self-signed cert, shared with the validator: sign-in is
+# refused over plain HTTP (#604), so the validator talks to the TLS port.
+TLSVOL=quasar-apitest-tls
 GO=golang:1.26
 ADMIN_EMAIL=admin@quasar.local
 # Must not contain the username or the email local-part — the control plane refuses
@@ -26,6 +29,7 @@ cleanup() {
   [ "${KEEP:-0}" = "1" ] && { echo "KEEP=1 — leaving stack up ($PG,$CP on $NET)"; return; }
   # -v so the postgres data volume does not outlive the run (#205)
   docker rm -fv "$CP" "$PG" >/dev/null 2>&1 || true
+  docker volume rm "$TLSVOL" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -33,6 +37,7 @@ trap cleanup EXIT
 echo "=== [1/4] network + postgres ==="
 docker network create "$NET" >/dev/null 2>&1 || true
 docker rm -fv "$PG" "$CP" >/dev/null 2>&1 || true
+docker volume rm "$TLSVOL" >/dev/null 2>&1 || true
 docker run -d --name "$PG" --network "$NET" \
   -e POSTGRES_USER=quasar -e POSTGRES_PASSWORD=quasar -e POSTGRES_DB=quasar \
   postgres:16 >/dev/null
@@ -48,14 +53,14 @@ echo "=== [2/4] control-plane (go run) ==="
 # Warm the module cache + start the server. go run stays in the foreground of the
 # container; we detach the container and poll /health.
 docker run -d --name "$CP" --network "$NET" \
-  -v "$REPO/control-plane":/w -w /w \
+  -v "$REPO/control-plane":/w -w /w -v "$TLSVOL":/var/lib/quasar-control/tls \
   -e DATABASE_URL="postgres://quasar:quasar@$PG:5432/quasar?sslmode=disable" \
   -e BOOTSTRAP_ADMIN_EMAIL="$ADMIN_EMAIL" \
   -e BOOTSTRAP_ADMIN_USERNAME=admin \
   -e BOOTSTRAP_ADMIN_PASSWORD="$ADMIN_PASS" \
   -e REGISTRATION_MODE=open \
   -e LISTEN_ADDR=":8080" \
-  -e QUASAR_TLS=off \
+  -e QUASAR_TLS_HOSTS="$CP" \
   "$GO" sh -c 'go run ./cmd/quasar-control' >/dev/null
 
 echo "waiting for control-plane /health (compiling)..."
@@ -72,8 +77,8 @@ fi
 echo "=== [3/4] run conformance validator ==="
 set +e
 docker run --rm --network "$NET" \
-  -v "$REPO/scripts/harness/apitest":/w -v "$REPO/protocol":/protocol -w /w \
-  -e QUASAR_URL="http://$CP:8080" \
+  -v "$REPO/scripts/harness/apitest":/w -v "$REPO/protocol":/protocol -w /w -v "$TLSVOL":/tls:ro \
+  -e QUASAR_URL="https://$CP:8443" -e SSL_CERT_FILE=/tls/cert.pem \
   -e ADMIN_EMAIL="$ADMIN_EMAIL" -e ADMIN_PASSWORD="$ADMIN_PASS" \
   -e SPEC=/protocol/openapi.yaml \
   -e RESULTS_JSON=/w/results.json \
