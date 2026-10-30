@@ -1679,7 +1679,8 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	// Before the reply, for the reason refuse counts first: a late Forget would erase
-	// failures the peer's next dials already spent (#984).
+	// failures the peer's next dials already spent (#984). The credential is proven
+	// here, so clearing the budget even if this write fails is intended.
 	h.failures.Forget(clientIP)
 	if err := conn.WriteJSON(resp); err != nil {
 		return "", time.Time{}, nil, nil, registerCaps{}, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
