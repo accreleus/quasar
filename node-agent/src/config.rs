@@ -99,6 +99,11 @@ impl Config {
         http_base_from_ws(&self.control_plane_url)
     }
 
+    /// The monitor inputs learned per console connector, next to `node_secret_path`.
+    pub fn console_input_state_path(&self) -> String {
+        format!("{}.console-input.json", self.node_secret_path)
+    }
+
     /// Managed-image state path (`image_id -> {registry_ref, version, state}`),
     /// co-located next to `node_secret_path` rather than a new env var.
     pub fn image_state_path(&self) -> String {

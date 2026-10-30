@@ -17,6 +17,7 @@ use quasar_recovery::engine::{
 };
 use quasar_recovery::journal::Phase;
 use quasar_recovery::recipe::{names, Book, Role};
+use quasar_recovery::reconfigure::ReconfigureRequest;
 use quasar_recovery::restore::{self, RestorePhase};
 use quasar_recovery::seed::Outcome;
 use quasar_recovery::socket::{
@@ -695,6 +696,70 @@ fn an_update_from_a_control_plane_without_a_healthcheck_verifies_and_a_restore_b
     let again = apply(&m.actor(), update(&nth_id(10), 81));
     assert_eq!(again.state, State::Succeeded, "{again:?}");
     assert_eq!(m.control_plane().health.as_deref(), Some("healthy"));
+}
+
+/// `QUASAR_HSTS_MAX_AGE` (#874) is a revision-4 input. A restore back to a revision-3
+/// control plane must still render the machine state revision 4 accepted: it starts, without
+/// the variable, rather than failing after the old control plane is gone (ADR 0008 Rules B, C).
+#[test]
+fn a_restore_back_to_a_revision_3_control_plane_succeeds_with_hsts_set_and_leaves_it_off() {
+    let m = Machine::install_on(podman_host(
+        |schema| if schema == OLD_SCHEMA { 3 } else { 4 },
+    ));
+    let actor = m.actor();
+    // The revision-3 control plane the machine runs refuses the input before anything moves.
+    let before = m.control_plane().id;
+    let refused = actor
+        .reconfigure(ReconfigureRequest {
+            changes: BTreeMap::from([("QUASAR_HSTS_MAX_AGE".to_string(), "86400".to_string())]),
+            dry_run: false,
+        })
+        .expect_err("revision 3");
+    assert!(
+        refused.message.contains("revision 4"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(m.control_plane().id, before, "nothing moved");
+
+    let updated = apply(&actor, update(ID, 81));
+    assert_eq!(updated.state, State::Succeeded, "{updated:?}");
+    let id = actor
+        .reconfigure(ReconfigureRequest {
+            changes: BTreeMap::from([("QUASAR_HSTS_MAX_AGE".to_string(), "86400".to_string())]),
+            dry_run: false,
+        })
+        .expect("a revision-4 control plane takes it")
+        .request_id
+        .expect("a replacement");
+    actor.wait_attempt();
+    assert_eq!(
+        actor.status_for(Some(&id)).result.unwrap().state,
+        State::Succeeded
+    );
+    assert_eq!(m.control_plane().spec.env["QUASAR_HSTS_MAX_AGE"], "86400");
+
+    let dump = updated.dump.clone().unwrap();
+    let restored = run_restore(
+        &m.actor(),
+        restore_request(&nth_id(9), Some(&dump), Some("0.80.0")),
+    );
+    assert_eq!(restored.state, State::Succeeded, "{restored:?}");
+    let back = m.control_plane();
+    assert_eq!(back.spec.image, control_image(OLD_SCHEMA));
+    assert_eq!(back.status, "running");
+    assert_eq!(back.spec.labels["io.quasar.recipe"], "3");
+    assert!(!back.spec.env.contains_key("QUASAR_HSTS_MAX_AGE"));
+    assert_eq!(m.db().schema_version, OLD_SCHEMA);
+    assert_eq!(
+        m.engine
+            .state()
+            .by_name()
+            .keys()
+            .filter(|n| n.starts_with("quasar-control-plane"))
+            .count(),
+        1
+    );
 }
 
 #[test]
