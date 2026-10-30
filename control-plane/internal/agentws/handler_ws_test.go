@@ -6,9 +6,12 @@ import (
 	"io"
 	stdlog "log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -320,5 +323,138 @@ func TestWrongNodeSecretForAKnownHostStillSpendsTheBudget(t *testing.T) {
 	}
 	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status=%v, want 429", resp)
+	}
+}
+
+// heldServer serves h through a listener whose connection blocks right after its
+// second write, the first frame after the 101 upgrade, until the test releases it.
+// While it is held the test reads the limiter: whatever a peer could do after
+// reading that frame must find the limiter already updated (#984). One connection
+// per server.
+func heldServer(t *testing.T, h *Handler) (url string, written <-chan struct{}, release func()) {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(h)
+	l := &holdAfterSecondWrite{Listener: srv.Listener, written: make(chan struct{}), resume: make(chan struct{})}
+	srv.Listener = l
+	srv.Start()
+	t.Cleanup(srv.Close)
+	var once sync.Once
+	release = func() { once.Do(func() { close(l.resume) }) }
+	t.Cleanup(release) // runs before srv.Close, so a failed test never leaves the server held
+	return "ws" + strings.TrimPrefix(srv.URL, "http"), l.written, release
+}
+
+type holdAfterSecondWrite struct {
+	net.Listener
+	written, resume chan struct{}
+}
+
+func (l *holdAfterSecondWrite) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &heldConn{Conn: c, l: l}, nil
+}
+
+type heldConn struct {
+	net.Conn
+	l      *holdAfterSecondWrite
+	writes atomic.Int32
+}
+
+func (c *heldConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if c.writes.Add(1) == 2 {
+		close(c.l.written)
+		<-c.l.resume
+	}
+	return n, err
+}
+
+func waitWritten(t *testing.T, written <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-written:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server never wrote its reply")
+	}
+}
+
+// The peer's address as the limiter keys it (an IPv4 key is the bare address).
+const loopbackKey = "127.0.0.1"
+
+// A refusal is counted before it is written: a peer that has read the 10th
+// refusal and dials again must be refused at the upgrade. The two tests above
+// catch a reversion only under load; this one catches it every time.
+func TestRefusalIsCountedBeforeItIsWritten(t *testing.T) {
+	pool := testPool(t)
+	h := NewHandler(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil, nil)
+	t.Cleanup(h.Close)
+	url, written, release := heldServer(t, h)
+	for i := 0; i < enrollmentFailureLimit-1; i++ {
+		h.failures.Failure(loopbackKey)
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{
+		"type": "register", "node_name": "never-enrolled-here", "agent_version": "test",
+		"auth": map[string]string{"node_secret": "deadbeef"},
+	}); err != nil {
+		t.Fatalf("write register: %v", err)
+	}
+	waitWritten(t, written)
+	allowed := h.failures.Allow(loopbackKey)
+	release()
+	if allowed {
+		t.Fatal("the refusal was on the wire before it was counted: a peer redialling at once gets a free attempt")
+	}
+}
+
+// A successful register clears the budget before `registered` is written. Clearing
+// it after would wipe failures the peer's next dials spent in between.
+func TestRegisterClearsTheBudgetBeforeRegisteredIsWritten(t *testing.T) {
+	pool := testPool(t)
+	h := NewHandler(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil, nil)
+	t.Cleanup(h.Close)
+	url, written, release := heldServer(t, h)
+
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{
+		"type": "register", "node_name": "budget-host", "agent_version": "test",
+		"auth": map[string]string{"enrollment_token": testEnrollmentToken},
+	}); err != nil {
+		t.Fatalf("write register: %v", err)
+	}
+	waitWritten(t, written)
+	// The failures a peer that read `registered` could spend before the server goes on.
+	for i := 0; i < enrollmentFailureLimit; i++ {
+		h.failures.Failure(loopbackKey)
+	}
+	release()
+
+	var registered RegisteredMsg
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if err := conn.ReadJSON(&registered); err != nil || registered.Type != "registered" {
+		t.Fatalf("reply=%+v err=%v, want registered", registered, err)
+	}
+	// handleConn adds the connection to the registry after every limiter call it makes.
+	deadline := time.Now().Add(5 * time.Second)
+	for !h.registry.IsConnected(registered.HostID) {
+		if time.Now().After(deadline) {
+			t.Fatal("the connection never reached the registry")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if h.failures.Allow(loopbackKey) {
+		t.Fatal("failures spent after `registered` was written were wiped by a late Forget")
 	}
 }
