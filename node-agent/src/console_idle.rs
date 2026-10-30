@@ -51,10 +51,19 @@ impl Axis {
     }
 
     /// Noise inside the zone around rest is idle, and so is a value away from rest within
-    /// a zone of where it last counted: a held or jittering deflection counts once.
+    /// a zone of where it last counted: a held or jittering deflection counts once. A
+    /// value across rest from the last count must clear twice the zone, so noise flipping
+    /// either side of rest goes quiet; a real push to the other side still counts.
     fn moved(&mut self, value: i32) -> bool {
-        let far = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs() > i64::from(self.dead);
-        if !far(value, self.rest) || !far(value, self.last) {
+        let gap = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs();
+        let side = |v: i32| (i64::from(v) - i64::from(self.rest)).signum();
+        let dead = i64::from(self.dead);
+        let need = if side(value) * side(self.last) < 0 {
+            2 * dead
+        } else {
+            dead
+        };
+        if gap(value, self.rest) <= need || gap(value, self.last) <= dead {
             return false;
         }
         self.last = value;
@@ -320,6 +329,19 @@ mod tests {
             hat.moved(-1) && !hat.moved(0) && hat.moved(1),
             "any hat step"
         );
+    }
+
+    /// #811: noise wider than the zone on both sides of rest counts once, not on every
+    /// flip; a real push to the other side still counts.
+    #[test]
+    fn two_sided_axis_noise_goes_quiet() {
+        let mut stick = Axis::new(2048, dead_zone(0, 4095, 128, 0));
+        let busy = [2248, 1848, 2248, 1848, 2248, 1848]
+            .iter()
+            .filter(|&&v| stick.moved(v))
+            .count();
+        assert_eq!(busy, 1);
+        assert!(stick.moved(1700), "a push to the other side");
     }
 
     /// An axis that bounces across its zone for longer than the quiet window lets the

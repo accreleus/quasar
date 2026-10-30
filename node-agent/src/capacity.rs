@@ -282,6 +282,10 @@ struct ClaimedDdc {
     off: Vec<String>,
     /// When input was first seen after a read that found a monitor off.
     woke_at: Option<std::time::Instant>,
+    /// The last read was one input asked for. If it still found the monitor off (a slow
+    /// panel wake) and input stopped, reading goes on at [`CLAIMED_DDC_INTERVAL`] rather
+    /// than waiting for a full quiet period.
+    after_input: bool,
     /// Why the input watch last could not run, logged once per reason.
     no_watch: Option<&'static str>,
 }
@@ -309,13 +313,17 @@ impl ClaimedDdc {
             if self.woke_at.is_none() && since_read.is_some_and(|since| idle < since) {
                 self.woke_at = Some(now - idle);
             }
-            let Some(woke) = self.woke_at else {
-                return false;
-            };
-            if now.saturating_duration_since(woke) < CLAIMED_DDC_OFF_RECHECK {
-                return false;
+            match self.woke_at {
+                Some(woke) if now.saturating_duration_since(woke) < CLAIMED_DDC_OFF_RECHECK => {
+                    return false
+                }
+                Some(_) => {}
+                None if self.after_input
+                    && since_read.is_some_and(|since| since >= CLAIMED_DDC_INTERVAL) => {}
+                None => return false,
             }
         }
+        self.after_input = idle < CONSOLE_QUIET_BEFORE_DDC;
         self.last_read = Some(now);
         // Input still going on at a read is input since it, should that read find it off.
         self.woke_at = (idle < CLAIMED_DDC_OFF_RECHECK).then_some(now);
@@ -343,6 +351,7 @@ static CLAIMED_DDC: std::sync::Mutex<ClaimedDdc> = std::sync::Mutex::new(Claimed
     last_read: None,
     off: Vec::new(),
     woke_at: None,
+    after_input: false,
     no_watch: None,
 });
 
@@ -1632,6 +1641,30 @@ mod tests {
         st.off = dp4();
         assert!(!st.due(None, back + secs(22)));
         assert_eq!(st.present(dp4()), dp4(), "unseen input may be play");
+    }
+
+    /// #811: one key after an off reading, then silence, while the panel is slow to wake:
+    /// the recheck that still finds it off is followed by a read every interval, not by
+    /// nothing until a full quiet period.
+    #[test]
+    fn one_input_and_a_slow_panel_keeps_reading() {
+        use std::time::{Duration, Instant};
+        let secs = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut st = ClaimedDdc::default();
+        assert!(st.due(Some(CONSOLE_QUIET_BEFORE_DDC), t0));
+        st.off = vec!["DP-4".to_string()];
+        let key = t0 + secs(120);
+        assert!(!st.due(Some(Duration::ZERO), key));
+        let recheck = key + secs(10);
+        assert!(st.due(Some(secs(10)), recheck), "the recheck");
+        // Still off, and no input since the key.
+        let before = recheck + CLAIMED_DDC_INTERVAL - secs(1);
+        assert!(!st.due(Some(before - key), before));
+        let next = recheck + CLAIMED_DDC_INTERVAL;
+        assert!(st.due(Some(next - key), next), "slow panel: read again");
+        st.off = Vec::new(); // the read says on
+        assert!(!st.due(Some(next + secs(60) - key), next + secs(60)));
     }
 
     #[test]

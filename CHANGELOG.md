@@ -31,6 +31,9 @@ own; the two do not move together, and that is deliberate.
 ### Changed
 - **Sign-in, registration and password change are refused over plain HTTP (#604).** They are served on the HTTPS listener, or through a proxy named in `QUASAR_TRUSTED_PROXIES` that sends `X-Forwarded-Proto: https`; anything else gets `403 forbidden` before the password is read, the form says why, and the control plane logs `credential-route-plaintext` (bounded per source). Other signed-in calls and the agent routes are unchanged. The local `make up` stack now serves HTTPS too: sign in on the `https://` address it prints.
 
+### Fixed
+- **Console: a gamepad stick's noise on both sides of rest no longer keeps the host looking busy, and one key press while the monitor wakes slowly no longer ends the look for it (#811).** On a console desktop an abandoned session on a monitor left off is stopped once the host's input has been quiet; noise flipping across a stick's resting value counted as input every time, and a single key press with a panel that took over 10 s to wake stopped the checks until 10 minutes of quiet. The checks now go on every 5 minutes after such a press until the monitor reads on.
+
 ### Internal
 - **Image cleanup test: the second attempt's journal checks no longer race the control plane (#960).** The test now answers every inventory scan as the agent does (a late inventory change that overlaps the attempt's own reconcile costs one more scan before the journal), and treats only a journal request naming the second attempt as stale (the first dispatch's own request for the first attempt can land late). It failed on most CI runs under load. No product change.
 
