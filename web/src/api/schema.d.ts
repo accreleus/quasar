@@ -13,7 +13,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Register a new account (role always 'user'; invite-gated per instance settings). */
+        /**
+         * Register a new account (role always 'user'; invite-gated per instance settings).
+         * @description Amendment 50: served only over TLS (the HTTPS listener, or a proxy named in QUASAR_TRUSTED_PROXIES that forwards X-Forwarded-Proto: https). Any other request → 403 forbidden before the body is read; the message is for the user.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -39,7 +42,7 @@ export interface paths {
                     };
                 };
                 400: components["responses"]["ValidationFailed"];
-                /** @description registration_closed — the invitation system is off (default). */
+                /** @description registration_closed — the invitation system is off (default); or forbidden — the request did not arrive over TLS (amendment 50); show the message to the user. */
                 403: {
                     headers: {
                         [name: string]: unknown;
@@ -67,7 +70,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Log in; returns the opaque bearer access_token (field is access_token, not token). */
+        /**
+         * Log in; returns the opaque bearer access_token (field is access_token, not token).
+         * @description Amendment 50: served only over TLS (the HTTPS listener, or a proxy named in QUASAR_TRUSTED_PROXIES that forwards X-Forwarded-Proto: https). Any other request → 403 forbidden before the body is read; the message is for the user.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -91,6 +97,15 @@ export interface paths {
                     };
                 };
                 401: components["responses"]["Unauthorized"];
+                /** @description forbidden — the request did not arrive over TLS (amendment 50); show the message to the user. */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
                 426: components["responses"]["ClientTooOld"];
                 429: components["responses"]["RateLimited"];
             };
@@ -184,7 +199,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Change own password (revokes all tokens; must re-authenticate). */
+        /**
+         * Change own password (revokes all tokens; must re-authenticate).
+         * @description Amendment 50: served only over TLS (the HTTPS listener, or a proxy named in QUASAR_TRUSTED_PROXIES that forwards X-Forwarded-Proto: https). Any other request with a valid bearer token → 403 forbidden before the body is read; the message is for the user. Without a valid token the bearer middleware answers 401 first.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -210,6 +228,15 @@ export interface paths {
                 };
                 400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
+                /** @description forbidden — the request did not arrive over TLS (amendment 50); show the message to the user. */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
             };
         };
         delete?: never;
@@ -5207,9 +5234,8 @@ export interface paths {
          *     FORWARDED HEADERS SOFTEN ADVICE AND NOTHING ELSE. They are trivially spoofable by any
          *     client; the worst a hostile one achieves is making an admin-gated diagnostics page tell
          *     THEM that their own certificate is not in use. No access decision on this route reads
-         *     them. Amendment 33, the one exception on any route: POST /v1/setup/claim and the dev-only
-         *     POST /v1/dev/agent-session believe X-Forwarded-Proto from a peer named in
-         *     QUASAR_TRUSTED_PROXIES, and from no other peer.
+         *     them.
+         *     Amendments 33 and 50, the one exception: POST /v1/setup/claim, the dev-only POST /v1/dev/agent-session, POST /v1/auth/login, POST /v1/auth/register and POST /v1/me/password believe X-Forwarded-Proto from a peer named in QUASAR_TRUSTED_PROXIES, and from no other peer.
          *
          *     Admin-gated by the existing RequireAuth -> RequireAdmin middleware. It reflects the Host
          *     and Origin headers, so both are LENGTH-CAPPED (256 chars) and are only ever rendered as
@@ -10064,7 +10090,7 @@ export interface components {
                 secure_context: boolean;
             };
             certificate: {
-                /** @description False under topology C, and false when QUASAR_TLS=off. Both are supported, complete configurations. */
+                /** @description False under topology C, and false when QUASAR_TLS=off. Topology C is a supported, complete configuration, and so is QUASAR_TLS=off behind a proxy named in QUASAR_TRUSTED_PROXIES; QUASAR_TLS=off with no named proxy cannot serve sign-in (amendment 50). */
                 in_use: boolean;
                 /** @description Operator-facing prose stating that the setup is supported and what to look at instead. Present only when in_use is false. */
                 not_in_use_reason?: string;

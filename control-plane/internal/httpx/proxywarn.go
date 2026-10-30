@@ -29,7 +29,7 @@ func WarnUnlistedProxy(next http.Handler, log *slog.Logger, trusted []*net.IPNet
 				if seen.Allow(key) {
 					seen.Failure(key)
 					log.Warn("forwarded-from-unlisted-peer", "peer", peer,
-						"note", "this peer sent X-Forwarded-* to the plain HTTP port but is not in QUASAR_TRUSTED_PROXIES; a later release refuses credential routes from it: if this is your reverse proxy, name its address in QUASAR_TRUSTED_PROXIES")
+						"note", "this peer sent X-Forwarded-* to the plain HTTP port but is not in QUASAR_TRUSTED_PROXIES; sign-in, registration and password change from it are refused: if this is your reverse proxy, name its address in QUASAR_TRUSTED_PROXIES")
 				}
 			}
 		}

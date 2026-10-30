@@ -38,7 +38,7 @@ On the first machine (`combined` or `control-only`), also:
 | `QUASAR_CONTROL_PLANE_IMAGE` | required | The control-plane image: a tag (pinned at install) or `repository@sha256:<digest>`. |
 | `QUASAR_PUBLIC_HOST` | unset; set it | The console's name or LAN address. The certificate names it. |
 | `QUASAR_TLS_HOSTS` | unset | More certificate names, comma-separated. |
-| `QUASAR_TRUSTED_PROXIES` | unset | Reverse proxies in front of the console. First-run setup through a proxy needs it. `/0` or a malformed entry refuses the install. |
+| `QUASAR_TRUSTED_PROXIES` | unset | Reverse proxies in front of the console. First-run setup and sign-in through a proxy on the HTTP port need it. `/0` or a malformed entry refuses the install. |
 | `QUASAR_HTTP_PORT`, `QUASAR_TLS_PORT` | `8080`, `8443` | Host ports for HTTP (agents, `/health`) and HTTPS (console). |
 | `QUASAR_POSTGRES_IMAGE` | built in | Quasar's own Postgres, by tag (pinned at install) or digest. Created once, never updated. |
 | `QUASAR_DATABASE_HOST` | unset | Use your own database instead of creating one. |
@@ -140,7 +140,7 @@ its last `.`).
 | `QUASAR_TLS_DIR` | `/var/lib/quasar-control/tls` | Where the generated certificate is kept. |
 | `QUASAR_HTTP_REDIRECT` | `auto` | Redirect browser routes from HTTP to HTTPS. |
 | `QUASAR_ALLOWED_ORIGINS` | unset | Overrides the allowed-origins list in Admin (even when empty). Unset: Admin manages it; with no list, same-origin only. `*` is rejected. |
-| `QUASAR_TRUSTED_PROXIES` | unset | Proxy IPs or CIDRs whose forwarded client address and protocol are trusted. First-run setup through a proxy needs it. |
+| `QUASAR_TRUSTED_PROXIES` | unset | Proxy IPs or CIDRs whose forwarded client address and protocol are trusted. First-run setup and sign-in through a proxy on the HTTP port need it. |
 | `LISTEN_ADDR` | `:8080` | HTTP listener. |
 | `CONTROL_PORT` | `8080` | Compose. Host port for HTTP. |
 | `QUASAR_TLS_PORT` | `8443` | Compose. Host port for HTTPS. |

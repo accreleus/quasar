@@ -89,6 +89,16 @@ describe("RegisterPage", () => {
     expect(authApi.register).not.toHaveBeenCalled();
   });
 
+  it("shows the plain-HTTP refusal as the server words it", async () => {
+    const msg = "This server only accepts sign-in, registration and password changes over HTTPS.";
+    vi.mocked(authApi.register).mockRejectedValue(new ApiError(403, "forbidden", msg));
+    renderRegister(vi.fn());
+
+    fill();
+
+    await waitFor(() => expect(screen.getByText(msg)).toBeInTheDocument());
+  });
+
   it("turns the server's error codes into sentences", async () => {
     vi.mocked(authApi.register).mockRejectedValue(new ApiError(403, "invalid_invite", "nope"));
     renderRegister(vi.fn());
