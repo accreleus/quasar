@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.5.1 — 2026-10-30
+
 ### Upgrading
 - **This release changes the database (migrations 0107 and 0108), so there is no going back below it.** Once applied, an older control plane will not start. For Quasar's own database the way back is a restore of the dump the update takes first (`docs/upgrading.md`, "The one-way migration rule"); on your own database, back up first. Fleet ▸ Releases ▸ Update Quasar waits for live sessions to end before it replaces the control plane (or tick "Update now" to end them), and automatic updates never install a release that changes the database.
 - **Then update the Steam and desktop images.** In Library ▸ Images, Sync catalog, then update Steam, KDE desktop and XFCE desktop. The new Steam image turns its idle screensaver off in a stream (#834), and the new desktop images start KDE and XFCE in the session's keyboard layout (#850); on the older images those two stay as they were.
