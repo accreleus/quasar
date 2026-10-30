@@ -359,7 +359,12 @@ jobs:
       - name: Load uinput
         run: sudo modprobe uinput && ls -l /dev/uinput
       - name: Test against the real uinput
-        run: sudo -E env "PATH=$PATH" QUASAR_REQUIRE_UINPUT=1 cargo test --workspace --lib uinput_ -- --ignored --test-threads=1
+        # No `sudo -E`: the runner's sudo stopped honouring it (#982), so cargo under root
+        # found no rustup default. Hand rustup and cargo their homes explicitly instead.
+        run: >-
+          sudo env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}"
+          "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" QUASAR_REQUIRE_UINPUT=1
+          cargo test --workspace --lib uinput_ -- --ignored --test-threads=1
 
   # RH-07 #408: the runtime's behavioural suite against each engine mode a hosted runner
   # can host. One job per mode; the assertions are the same for all of them. What a
@@ -427,10 +432,10 @@ jobs:
       fail-fast: false
       matrix:
         target: [docker-rootful, docker-rootless, podman-rootful, podman-rootless]
-        # A finding an engine fails on is recorded per target as `include: - target: …
-        # known: >- <target>:<row>=<reason>`: it still runs, reports KNOWN, and fails the
-        # job once it passes so the entry is dropped. None today: the runner's Podman 5.7
-        # passes restart, which 4.9 failed (#424).
+        # A finding an engine fails on is recorded per target as an `include` entry whose
+        # `known` value is "<target>:<case>=<finding>": the case still runs, reports KNOWN,
+        # and fails the job once it passes so the entry is dropped. None today: the
+        # runner's Podman 5.7 passes restart, which 4.9 failed (#424, #982).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
