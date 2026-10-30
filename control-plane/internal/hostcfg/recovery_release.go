@@ -3,66 +3,107 @@ package hostcfg
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
-
-	"github.com/accreleus/quasar/control-plane/internal/admission"
 )
 
-var ErrRecoveryHoldNotFound = errors.New("no recovery hold for this attempt")
-var ErrJournalNotReconciled = errors.New("host journal reconciliation is not complete")
+var ErrAttemptNotUncertain = errors.New("attempt is not uncertain")
 
-// ReleaseRecoveryHold is the explicit repair of an uncertain attempt's recovery
-// hold (agent-api.md idle operation, #656). It refuses while the journal gate is
-// not complete, so a release never races a reconciliation that could re-plant
-// or prove the hold. connected is the live websocket observation, read as in
-// admission.Store.Release. Returns the host's resulting status.
-func (s *Store) ReleaseRecoveryHold(ctx context.Context, hostID, attemptID string, connected bool) (string, error) {
+// RecoveryReleaseCmd mirrors agent-api.md `config_policy_release` on the wire.
+type RecoveryReleaseCmd struct {
+	Type                  string `json:"type"` // "config_policy_release"
+	AttemptID             string `json:"attempt_id"`
+	BootIncarnation       string `json:"boot_incarnation"`
+	ConnectionIncarnation string `json:"connection_incarnation"`
+}
+
+func NewRecoveryReleaseCmd(attemptID, boot, connection string) RecoveryReleaseCmd {
+	return RecoveryReleaseCmd{Type: "config_policy_release", AttemptID: attemptID, BootIncarnation: boot, ConnectionIncarnation: connection}
+}
+
+// RecoveryRelease is the administrator's release of an uncertain attempt as the
+// attempt view reports it (control-api.md "Releasing a recovery hold").
+type RecoveryRelease struct {
+	State       string     `json:"state"` // pending | released
+	RequestedAt *time.Time `json:"requested_at"`
+	// agent_connection | agent_upgrade | agent_report while pending; null once released.
+	WaitingFor *string `json:"waiting_for"`
+}
+
+// projectHostStatusSQL makes hosts.status follow the restriction set as
+// admission.Release does: any restriction keeps an online host draining, and a
+// draining host with none left is online only while no disconnect is recorded.
+const projectHostStatusSQL = `UPDATE hosts SET status=CASE
+	WHEN EXISTS(SELECT 1 FROM host_admission_restrictions r WHERE r.host_id=hosts.id)
+		THEN CASE WHEN status='online' THEN 'draining' ELSE status END
+	WHEN status='draining' THEN ` + releasedStatusSQL + ` ELSE status END WHERE id=$1::uuid`
+
+// RequestRecoveryRelease durably records an administrator's release of an
+// uncertain restart attempt. It lifts nothing: the hold, the group and the host
+// status move only when the agent reports the attempt `released`. first is true
+// only for the request that set the marker. A released attempt answers as done.
+func (s *Store) RequestRecoveryRelease(ctx context.Context, hostID, attemptID string) (first bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return "", err
+		return false, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	var status string
-	var live bool
-	if err := tx.QueryRow(ctx, `SELECT status, `+admission.HostIsLiveSQL+` FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status, &live); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", ErrHostNotFound
-		}
-		return "", err
-	}
-	var gate string
-	if err := tx.QueryRow(ctx, `SELECT state FROM host_journal_reconciliation WHERE host_id=$1::uuid FOR UPDATE`, hostID).Scan(&gate); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return "", err
-	}
-	var group, digest string
-	var revision int64
-	err = tx.QueryRow(ctx, `UPDATE host_config_attempts t SET recovery_released_at=now()
-		FROM host_admission_restrictions r
-		WHERE t.host_id=$1::uuid AND t.id=$2::uuid AND t.phase='uncertain'
-		AND r.host_id=t.host_id AND r.owner_kind='recovery' AND r.owner_id=t.id
-		RETURNING t.group_key,t.approved_digest,t.approved_revision`, hostID, attemptID).Scan(&group, &digest, &revision)
+	var phase string
+	err = tx.QueryRow(ctx, `SELECT phase FROM host_config_attempts
+		WHERE host_id=$1::uuid AND id=$2::uuid AND scope='restart' FOR UPDATE`, hostID, attemptID).Scan(&phase)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrRecoveryHoldNotFound
+		return false, ErrIdleAttemptNotFound
 	}
 	if err != nil {
-		return "", err
+		return false, err
 	}
-	if gate != "complete" {
-		return "", ErrJournalNotReconciled
+	switch phase {
+	case "released":
+		return false, nil
+	case "uncertain":
+	default:
+		return false, ErrAttemptNotUncertain
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind='recovery' AND owner_id=$2::uuid`, hostID, attemptID); err != nil {
-		return "", err
+	set, err := tx.Exec(ctx, `UPDATE host_config_attempts SET release_requested_at=now()
+		WHERE host_id=$1::uuid AND id=$2::uuid AND release_requested_at IS NULL`, hostID, attemptID)
+	if err != nil {
+		return false, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE host_setting_groups SET status='failed' WHERE host_id=$1::uuid AND group_key=$2
-		AND status='uncertain' AND desired_revision=$3 AND desired_digest=$4`, hostID, group, revision, digest); err != nil {
-		return "", err
+	return set.RowsAffected() == 1, tx.Commit(ctx)
+}
+
+// PendingRecoveryReleases lists the requested releases still uncertain, and only
+// once connectionID's journal is reconciled: a release is never sent before then.
+func (s *Store) PendingRecoveryReleases(ctx context.Context, hostID, connectionID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT t.id::text FROM host_config_attempts t
+		JOIN host_journal_reconciliation g ON g.host_id=t.host_id
+		WHERE t.host_id=$1::uuid AND t.scope='restart' AND t.phase='uncertain' AND t.release_requested_at IS NOT NULL
+		AND g.state='complete' AND g.connection_incarnation=$2::uuid ORDER BY t.id`, hostID, connectionID)
+	if err != nil {
+		return nil, err
 	}
-	if err := tx.QueryRow(ctx, `UPDATE hosts SET status=CASE WHEN status<>'draining' OR EXISTS(
-			SELECT 1 FROM host_admission_restrictions WHERE host_id=$1::uuid) THEN status
-		WHEN $2 THEN 'online' ELSE 'offline' END
-		WHERE id=$1::uuid RETURNING status`, hostID, connected && live).Scan(&status); err != nil {
-		return "", err
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+func (s *Store) recoveryRelease(ctx context.Context, hostID, phase string, requestedAt *time.Time) (*RecoveryRelease, error) {
+	if phase == "released" {
+		return &RecoveryRelease{State: "released", RequestedAt: requestedAt}, nil
 	}
-	return status, tx.Commit(ctx)
+	if phase != "uncertain" || requestedAt == nil {
+		return nil, nil
+	}
+	var reconciled, capable bool
+	if err := s.pool.QueryRow(ctx, `SELECT (h.status<>'offline' AND h.agent_disconnected_at IS NULL AND COALESCE(g.state='complete',false)),
+		COALESCE(h.config_policy_versions->>'recovery_release','')='1'
+		FROM hosts h LEFT JOIN host_journal_reconciliation g ON g.host_id=h.id WHERE h.id=$1::uuid`, hostID).Scan(&reconciled, &capable); err != nil {
+		return nil, err
+	}
+	waiting := "agent_report"
+	if !reconciled {
+		waiting = "agent_connection"
+	} else if !capable {
+		waiting = "agent_upgrade"
+	}
+	return &RecoveryRelease{State: "pending", RequestedAt: requestedAt, WaitingFor: &waiting}, nil
 }

@@ -796,7 +796,19 @@ export type IdleApplyPreview = components["schemas"]["HostPolicyApprovalPreview"
   approval_boot_incarnation: string;
   approval_review_id: string;
 };
-export type IdleApplyAttempt = components["schemas"]["IdleApplyAttempt"];
+type GeneratedIdleApplyAttempt = components["schemas"]["IdleApplyAttempt"];
+/** The administrator's release of an uncertain attempt (control-api.md amendment 51). */
+export type RecoveryRelease = {
+  state: "pending" | "released";
+  requested_at: string | null;
+  waiting_for: "agent_connection" | "agent_upgrade" | "agent_report" | null;
+};
+/** Widened for amendment 51 (`released`, `recovery_release`) until the pinned
+ *  openapi.yaml carries them; then the generated type alone is enough. */
+export type IdleApplyAttempt = Omit<GeneratedIdleApplyAttempt, "phase"> & {
+  phase: GeneratedIdleApplyAttempt["phase"] | "released";
+  recovery_release?: RecoveryRelease | null;
+};
 export function approveHostIdleApply(token: string, hostId: string, group: string, preview: IdleApplyPreview, expiresAt: string): Promise<IdleApplyAttempt> {
   return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply`, { token, method: "POST", body: {
     group, expected_revision: preview.revision, content_sha256: preview.content_sha256,
@@ -813,8 +825,8 @@ export function cancelHostIdleApply(token: string, hostId: string, attemptId: st
 }
 /** The explicit repair of an uncertain attempt's recovery hold (control-api.md amendment 51).
  *  `acknowledge` says the operator knows the host's configuration was never verified. */
-export function releaseHostRecoveryHold(token: string, hostId: string, attemptId: string): Promise<{ host_status: string; attempt: IdleApplyAttempt | null }> {
-  return apiFetch(`/admin/hosts/${hostId}/idle-apply/${attemptId}/release-recovery`, { token, method: "POST", body: { acknowledge: "unverified" } });
+export function releaseHostRecoveryHold(token: string, hostId: string, attemptId: string): Promise<IdleApplyAttempt> {
+  return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply/${attemptId}/release-recovery`, { token, method: "POST", body: { acknowledge: "unverified" } });
 }
 /** Re-arm one next-session group whose transient retry budget is exhausted.
  *  A control plane that does not serve the route yet answers 404. */

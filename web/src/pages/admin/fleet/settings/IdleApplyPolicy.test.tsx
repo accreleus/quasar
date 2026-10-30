@@ -30,31 +30,67 @@ const waiting = { attempt_id: "00000000-0000-4000-8000-000000000003", group: "ha
 describe("idle apply policy", () => {
   beforeEach(() => { vi.clearAllMocks(); vi.mocked(api.getHostPolicy).mockResolvedValue(view() as never); });
 
-  it("releases a recovery hold only after the operator acknowledges the host is unverified", async () => {
-    const uncertain = { ...waiting, phase: "uncertain", started: true, remedy: null };
+  const uncertain = { ...waiting, phase: "uncertain", started: true, remedy: null, recovery_release: null };
+  const pending = (waiting_for: string) => ({ ...uncertain, recovery_release: { state: "pending", requested_at: "2026-10-30T12:00:00Z", waiting_for } });
+
+  it("requests a release only after the operator acknowledges the host is unverified, and keeps the hold", async () => {
     vi.mocked(api.getHostPolicy).mockResolvedValue(view(waiting.attempt_id) as never);
     vi.mocked(api.getHostIdleApply).mockResolvedValue(uncertain as never);
-    vi.mocked(api.releaseHostRecoveryHold).mockResolvedValue({ host_status: "online", attempt: { ...uncertain, admission_restricted: false } } as never);
+    vi.mocked(api.releaseHostRecoveryHold).mockResolvedValue(pending("agent_report") as never);
     render(<IdleApplyPolicy hostId="host-1" />);
     fireEvent.click(await screen.findByRole("button", { name: "Release recovery hold" }));
     expect(screen.getByText(/state is unverified/)).toBeTruthy();
     const confirm = screen.getByRole("button", { name: "Release hold" }) as HTMLButtonElement;
     expect(confirm.disabled).toBe(true);
     fireEvent.click(screen.getByRole("checkbox", { name: /configuration is unverified/ }));
-    vi.mocked(api.getHostIdleApply).mockResolvedValue({ ...uncertain, admission_restricted: false } as never);
+    vi.mocked(api.getHostIdleApply).mockResolvedValue(pending("agent_report") as never);
     fireEvent.click(confirm);
     await waitFor(() => expect(api.releaseHostRecoveryHold).toHaveBeenCalledWith("admin-token", "host-1", waiting.attempt_id));
+    expect(await screen.findByText(/Release requested\. Waiting for the agent to confirm/)).toBeTruthy();
+    expect(screen.getByText(/Admission remains protected/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Release recovery hold" })).toBeNull();
+  });
+
+  it("says what a pending release waits for", async () => {
+    vi.mocked(api.getHostPolicy).mockResolvedValue(view(waiting.attempt_id) as never);
+    vi.mocked(api.getHostIdleApply).mockResolvedValue(pending("agent_upgrade") as never);
+    render(<IdleApplyPolicy hostId="host-1" />);
+    expect(await screen.findByText(/update the agent/)).toBeTruthy();
+  });
+
+  it("shows a released attempt as released, with no action", async () => {
+    vi.mocked(api.getHostPolicy).mockResolvedValue(view(waiting.attempt_id) as never);
+    vi.mocked(api.getHostIdleApply).mockResolvedValue({ ...uncertain, phase: "released", admission_restricted: false,
+      recovery_release: { state: "released", requested_at: "2026-10-30T12:00:00Z", waiting_for: null } } as never);
+    render(<IdleApplyPolicy hostId="host-1" />);
     expect(await screen.findByText(/An administrator released the recovery hold/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Release recovery hold" })).toBeNull();
     expect(screen.queryByText(/Admission remains protected/)).toBeNull();
   });
 
-  it("offers no release for an uncertain attempt that holds nothing", async () => {
+  it("an uncertain attempt that holds nothing offers no release and claims none", async () => {
     vi.mocked(api.getHostPolicy).mockResolvedValue(view(waiting.attempt_id) as never);
-    vi.mocked(api.getHostIdleApply).mockResolvedValue({ ...waiting, phase: "uncertain", started: true, admission_restricted: false } as never);
+    vi.mocked(api.getHostIdleApply).mockResolvedValue({ ...uncertain, admission_restricted: false } as never);
     render(<IdleApplyPolicy hostId="host-1" />);
-    expect(await screen.findByText(/An administrator released the recovery hold/)).toBeTruthy();
+    expect(await screen.findByText(/Approval: uncertain/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Release recovery hold" })).toBeNull();
+    expect(screen.queryByText(/An administrator released/)).toBeNull();
+  });
+
+  it("releases the attempt the dialog opened on, even if a refresh swaps the attempt", async () => {
+    const other = { ...uncertain, attempt_id: "00000000-0000-4000-8000-000000000009" };
+    vi.mocked(api.getHostPolicy).mockResolvedValue(view(waiting.attempt_id) as never);
+    vi.mocked(api.getHostIdleApply).mockResolvedValue(uncertain as never);
+    vi.mocked(api.releaseHostRecoveryHold).mockResolvedValue(pending("agent_report") as never);
+    render(<IdleApplyPolicy hostId="host-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Release recovery hold" }));
+    vi.mocked(api.getHostPolicy).mockResolvedValue(view(other.attempt_id) as never);
+    vi.mocked(api.getHostIdleApply).mockResolvedValue(other as never);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    await waitFor(() => expect(api.getHostIdleApply).toHaveBeenLastCalledWith("admin-token", "host-1", other.attempt_id));
+    fireEvent.click(screen.getByRole("checkbox", { name: /configuration is unverified/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Release hold" }));
+    await waitFor(() => expect(api.releaseHostRecoveryHold).toHaveBeenCalledWith("admin-token", "host-1", waiting.attempt_id));
   });
 
   it("shows an unavailable candidate through the group remedy without inventing review fields", async () => {

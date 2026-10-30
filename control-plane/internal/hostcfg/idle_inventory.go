@@ -494,7 +494,7 @@ func validateRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID string
 	seq, err := strconv.ParseInt(entry.Sequence, 10, 64)
 	allowed := map[string]bool{"accepted": true, "activating": true, "awaiting_startup": true, "verifying": true,
 		"failed": true, "recovery_verifying": true, "recovery_awaiting_startup": true, "applied": true,
-		"recovered": true, "uncertain": true}
+		"recovered": true, "uncertain": true, "released": true}
 	if err != nil || seq < 0 || strconv.FormatInt(seq, 10) != entry.Sequence ||
 		!allowed[entry.Phase] || seq == 0 && entry.Phase != "failed" ||
 		(entry.Phase == "applied" && entry.VerifiedAt == nil) ||
@@ -515,10 +515,11 @@ func validateRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID string
 		WHERE host_id=$1::uuid AND id=$2::uuid`, hostID, entry.AttemptID).
 		Scan(&group, &digest, &oldRevision, &grantBoot, &grantConnection, &phase, &oldSeq, &terminalAt)
 	if err == nil {
-		if terminalAt != nil && (seq != oldSeq || phase != entry.Phase) {
+		if terminalAt != nil && (seq != oldSeq || phase != entry.Phase) && (phase != "uncertain" || entry.Phase != "released" || seq <= oldSeq) {
 			// terminal_at is never cleared, so only an exact replay of the
 			// terminal entry passes; anything later quarantines rather than
-			// resurrect the attempt under an already released hold.
+			// resurrect the attempt under an already released hold. The one
+			// move out of a final phase is an administrator's release.
 			return false, nil
 		}
 		return group == entry.Group && digest == entry.Digest && oldRevision == revision && grantBoot == entry.GrantBoot &&
@@ -555,7 +556,7 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 	seq, _ := strconv.ParseInt(entry.Sequence, 10, 64)
 	revision, _ := strconv.ParseInt(entry.Revision, 10, 64)
 	terminal := entry.Phase == "applied" || entry.Phase == "recovered" || entry.Phase == "uncertain" ||
-		entry.Phase == "revoked_unstarted" || entry.Phase == "failed" && seq == 0
+		entry.Phase == "released" || entry.Phase == "revoked_unstarted" || entry.Phase == "failed" && seq == 0
 	upsert, err := tx.Exec(ctx, `INSERT INTO host_config_attempts
 		(id,host_id,group_key,approved_digest,approved_revision,scope,boot_incarnation,grant_connection,phase,journal_sequence,started_at,terminal_at,recovery_attempted,error_code)
 		VALUES($1::uuid,$2::uuid,$3,$4,$5,'restart',$6::uuid,$7::uuid,$8,$9,
@@ -566,7 +567,8 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			terminal_at=COALESCE(host_config_attempts.terminal_at,excluded.terminal_at),
 			recovery_attempted=host_config_attempts.recovery_attempted OR excluded.recovery_attempted,
 			error_code=COALESCE(excluded.error_code,host_config_attempts.error_code)
-		WHERE host_config_attempts.terminal_at IS NULL AND (host_config_attempts.journal_sequence IS NULL OR host_config_attempts.journal_sequence<$9::bigint)`,
+		WHERE (host_config_attempts.terminal_at IS NULL OR host_config_attempts.phase='uncertain' AND excluded.phase='released')
+			AND (host_config_attempts.journal_sequence IS NULL OR host_config_attempts.journal_sequence<$9::bigint)`,
 		entry.AttemptID, hostID, entry.Group, entry.Digest, revision, entry.GrantBoot, entry.GrantConnection, entry.Phase, seq, terminal, safeIdleErrorCode(entry.ErrorCode))
 	if err != nil {
 		return err
@@ -615,13 +617,13 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 	}
 	// Only the report that moves the row marks the group failed: a replay would
 	// overwrite a later attempt that applied the same revision.
-	if upsert.RowsAffected() > 0 && (entry.Phase == "recovered" || entry.Phase == "uncertain" || entry.Phase == "failed") {
+	if upsert.RowsAffected() > 0 && (entry.Phase == "recovered" || entry.Phase == "uncertain" || entry.Phase == "failed" || entry.Phase == "released") {
 		status := "failed"
 		if entry.Phase == "uncertain" {
 			status = "uncertain"
 		}
 		if _, err := tx.Exec(ctx, `UPDATE host_setting_groups SET status=$3 WHERE host_id=$1::uuid AND group_key=$2
-			AND desired_revision=$4 AND desired_digest=$5`, hostID, entry.Group, status, revision, entry.Digest); err != nil {
+			AND desired_revision=$4 AND desired_digest=$5 AND ($6<>'released' OR status='uncertain')`, hostID, entry.Group, status, revision, entry.Digest, entry.Phase); err != nil {
 			return err
 		}
 	}
@@ -630,17 +632,22 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
-		// A restored ledger can hold the attempt without its restriction; an
-		// administrator's release (ReleaseRecoveryHold) is never re-planted.
+		// A restored ledger can hold the attempt without its restriction.
 		if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
-			SELECT $1::uuid,'recovery',$2::uuid,'configuration_recovery' WHERE NOT EXISTS(SELECT 1 FROM host_config_attempts
-				WHERE host_id=$1::uuid AND id=$2::uuid AND recovery_released_at IS NOT NULL) ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
+			VALUES($1::uuid,'recovery',$2::uuid,'configuration_recovery') ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
 	} else if terminal && (entry.Phase != "applied" || active) {
-		// An applied entry releases its hold only with the matching verified active snapshot.
-		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
+		// An applied entry releases its hold only with the matching verified active
+		// snapshot. A recovery row exists only for an uncertain attempt; a release ends it.
+		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind IN ('idle_apply','recovery') AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
 			return err
+		}
+		if entry.Phase == "released" && upsert.RowsAffected() > 0 {
+			// A resolved disruptive hold opens new approvals under fresh review IDs.
+			if err := rotateHostReviewTokens(ctx, tx, hostID); err != nil {
+				return err
+			}
 		}
 	} else if !terminal {
 		// A restored ledger can omit both an unfinished attempt and its

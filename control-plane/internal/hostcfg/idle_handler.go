@@ -1,6 +1,7 @@
 package hostcfg
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -99,8 +100,8 @@ func (h *Handler) handleCancelIdleApply(w http.ResponseWriter, r *http.Request) 
 // semantics: control-api.md "Releasing a recovery hold" (amendment 51, #656).
 func (h *Handler) handleReleaseRecoveryHold(w http.ResponseWriter, r *http.Request) {
 	hostID, attemptID := r.PathValue("id"), r.PathValue("attempt_id")
-	if !canonicalAttemptID.MatchString(attemptID) {
-		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid attempt ID")
+	if !canonicalAttemptID.MatchString(hostID) || !canonicalAttemptID.MatchString(attemptID) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid host or attempt ID")
 		return
 	}
 	var req struct {
@@ -116,36 +117,60 @@ func (h *Handler) handleReleaseRecoveryHold(w http.ResponseWriter, r *http.Reque
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid release request")
 		return
 	}
-	connected := false
-	if c, ok := h.dispatcher.(interface{ IsConnected(string) bool }); ok {
-		connected = c.IsConnected(hostID)
-	}
-	status, err := h.store.ReleaseRecoveryHold(r.Context(), hostID, attemptID, connected)
+	first, err := h.store.RequestRecoveryRelease(r.Context(), hostID, attemptID)
 	switch {
-	case errors.Is(err, ErrHostNotFound):
-		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host not found")
+	case errors.Is(err, ErrIdleAttemptNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "idle apply attempt not found")
 		return
-	case errors.Is(err, ErrRecoveryHoldNotFound):
-		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no recovery hold for this attempt")
-		return
-	case errors.Is(err, ErrJournalNotReconciled):
-		httpx.WriteError(w, http.StatusConflict, "journal_reconciliation_pending", "The host's agent journal is not reconciled. Reconnect the host and wait for reconciliation to finish.")
+	case errors.Is(err, ErrAttemptNotUncertain):
+		httpx.WriteError(w, http.StatusConflict, "attempt_not_uncertain", "Only an uncertain restart attempt has a recovery hold to release.")
 		return
 	case err != nil:
-		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not release the recovery hold")
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not record the release")
 		return
 	}
-	if h.audit != nil {
+	if first && h.audit != nil {
 		if err := h.audit.Record(r.Context(), actorID(r), "host.recovery.release", "host", hostID, map[string]any{"attempt_id": attemptID, "acknowledge": req.Acknowledge}); err != nil {
 			slog.Warn("record admin activity failed", "action", "host.recovery.release", "err", err)
 		}
 	}
-	// The release committed: a failed read-back must not turn it into an error.
-	var attempt *IdleApplyAttempt
-	if view, err := h.store.GetIdleApply(r.Context(), hostID, attemptID); err == nil {
-		attempt = &view
-	} else {
-		slog.Warn("read released attempt failed", "host_id", hostID, "err", err)
+	// A repeated request re-sends, so it is also the operator's retry.
+	h.sendRecoveryReleases(r.Context(), hostID)
+	attempt, err := h.store.GetIdleApply(r.Context(), hostID, attemptID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load idle apply")
+		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"host_status": status, "attempt": attempt})
+	status := http.StatusAccepted
+	if attempt.Phase == "released" {
+		status = http.StatusOK
+	}
+	httpx.WriteJSON(w, status, attempt)
+}
+
+// sendRecoveryReleases sends every requested release on the host's current
+// connection once its journal is reconciled and its agent advertised
+// recovery_release; otherwise the agentws reconnect path sends them.
+func (h *Handler) sendRecoveryReleases(ctx context.Context, hostID string) {
+	target, ok := h.dispatcher.(interface {
+		PolicyIdentity(string) (string, string, bool)
+		SupportsRecoveryRelease(string) bool
+	})
+	if !ok || !target.SupportsRecoveryRelease(hostID) {
+		return
+	}
+	boot, connection, current := target.PolicyIdentity(hostID)
+	if !current {
+		return
+	}
+	ids, err := h.store.PendingRecoveryReleases(ctx, hostID, connection)
+	if err != nil {
+		slog.Warn("pending recovery releases unreadable", "host_id", hostID, "err", err)
+		return
+	}
+	for _, id := range ids {
+		if err := h.dispatcher.Send(hostID, NewRecoveryReleaseCmd(id, boot, connection)); err != nil {
+			slog.Warn("recovery release not sent; the next reconnect sends it", "host_id", hostID, "attempt_id", id, "err", err)
+		}
+	}
 }

@@ -673,6 +673,9 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 		if err := h.cfgStore.CompleteJournalReconciliation(ctx, c.hostID, c.connectionIncarnation, c.rh05RestartEntries, c.rh05Snapshots); err != nil {
 			return err
 		}
+		if err := h.sendRecoveryReleases(ctx, c); err != nil {
+			return err
+		}
 	}
 	if err := h.maybeSendInitialPolicyMap(ctx, c); err != nil {
 		return err
@@ -690,6 +693,24 @@ func sameCursor(a, b *string) bool {
 		return a == nil && b == nil
 	}
 	return *a == *b
+}
+
+// sendRecoveryReleases re-sends every release an administrator requested and the
+// agent has not yet reported, now that this connection's journal is reconciled.
+func (h *Handler) sendRecoveryReleases(ctx context.Context, c *conn) error {
+	if !c.policyRecoveryRelease {
+		return nil
+	}
+	ids, err := h.cfgStore.PendingRecoveryReleases(ctx, c.hostID, c.connectionIncarnation)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := h.registry.Send(c.hostID, hostcfg.NewRecoveryReleaseCmd(id, c.bootIncarnation, c.connectionIncarnation)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (h *Handler) restartPolicyInventory(ctx context.Context, c *conn) error {
@@ -908,6 +929,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	ac.policyTyped = policyTyped
 	ac.policyAccepted = acceptedGroups
 	ac.policyIdle = slices.Contains(acceptedGroups, "hardware")
+	ac.policyRecoveryRelease = ac.policyIdle && caps.RecoveryRelease
 	ac.bootIncarnation = h.bootIncarnation
 	ac.connectionIncarnation = connectionID
 	ac.imageCleanupV1 = cleanupRegister.Capable
@@ -1209,6 +1231,11 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				ConnectionIncarnation string  `json:"connection_incarnation"`
 			}
 			if err := json.Unmarshal(raw, &report); err != nil || report.ConnectionIncarnation != ac.connectionIncarnation {
+				continue
+			}
+			if report.Code == "release_refused" || report.Code == "stale_release_request" || report.Code == "journal_write_failed" {
+				// The release stays pending; the next reconciled connection sends it again.
+				h.log.Warn("agent did not apply a recovery release", "host_id", hostID, "code", report.Code)
 				continue
 			}
 			if report.Code == "group_execution_unavailable" && report.Group != nil && hostcfg.IsPolicyGroup(*report.Group) {
@@ -1532,6 +1559,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 type registerCaps struct {
 	TerminalHomeCleanupV1 bool
 	ParkedSessionsV1      bool
+	RecoveryRelease       bool // config_policy_versions.recovery_release (amendment 51)
 }
 
 // handleRegister performs the register handshake and returns the resolved host
@@ -1688,7 +1716,8 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	return result.HostID, result.RegisteredAt, reg.Images, identity.SourceCommit,
-		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1},
+		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1,
+			RecoveryRelease: reg.ConfigPolicyVersions["recovery_release"] == 1},
 		policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }
 
