@@ -33,6 +33,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 - **Sign-in, registration and password change are refused over plain HTTP (#604).** They are served on the HTTPS listener, or through a proxy named in `QUASAR_TRUSTED_PROXIES` that sends `X-Forwarded-Proto: https`; anything else gets `403 forbidden` before the password is read, the form says why, and the control plane logs `credential-route-plaintext` (bounded per source). Other signed-in calls and the agent routes are unchanged. The local `make up` stack now serves HTTPS too: sign in on the `https://` address it prints.
+- **The node agent image is now built with its CUDA feature (#927).** It was silently left out, so an NVIDIA host that falls back to NVENC (`QUASAR_ENCODER=nvenc`, or a codec with its Vulkan knob turned off) copied each frame through system memory. It now stays on the GPU. Vulkan is still the default and AMD and Intel hosts are unchanged. The image contract now fails a build that lacks the feature.
 
 ### Fixed
 - **Console: Bluetooth LE keyboards, mice and pads now teach the monitor input (#971).** The monitor-input learning (#966) skipped them, because they appear under the same `virtual` branch of `/sys` as a streamed session's devices; only a streamed session's own devices are now ignored. Classic Bluetooth, USB and wired devices were never affected.
