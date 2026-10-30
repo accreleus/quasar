@@ -42,7 +42,8 @@ export interface GamesPaneProps {
 function explain(e: unknown): string {
   if (e instanceof ApiError) {
     if (e.code === "home_not_provisioned") {
-      return "That app's library lives on another host. Exit and launch it from the library instead.";
+      // One wire code covers a home on another host and no home yet (Steam never started): true for both.
+      return "That app's library isn't set up on this host. Exit and launch it from the library instead; if you haven't started Steam yet, start it once first.";
     }
     if (e.code === "parent_app_disabled") return "That app has been disabled by an admin.";
     if (e.status === 403) return "You don't have access to that app.";
