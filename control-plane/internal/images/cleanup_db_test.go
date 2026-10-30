@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -594,14 +595,24 @@ func TestCleanupSecondAttemptRequiresItsOwnFreshInventoryBeforeRetiredJournal(t 
 	snapshot.ReconciledRequestID = firstReconcile.ID
 	env.cleanupWire.set(host, snapshot)
 	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	// The first dispatch's own journal request (first attempt only) can land
+	// late and is legitimate; only one naming the second attempt is stale.
+	noSecondAttemptJournal := func(what string) {
+		for {
+			select {
+			case stale := <-env.cleanupWire.journalRequests:
+				if slices.Contains(stale.AttemptIDs, second.AttemptID) {
+					t.Fatalf("%s: %+v", what, stale)
+				}
+			default:
+				return
+			}
+		}
+	}
 	// A retained complete snapshot from the first scan cannot authorize a
 	// retired-ID settlement of the second attempt.
 	env.cleanup.requestCleanupJournal(context.Background(), host)
-	select {
-	case stale := <-env.cleanupWire.journalRequests:
-		t.Fatalf("second attempt used first scan for journal: %+v", stale)
-	default:
-	}
+	noSecondAttemptJournal("second attempt used first scan for journal")
 	select {
 	case <-env.cleanupWire.cleanup:
 	case <-time.After(5 * time.Second):
@@ -613,11 +624,7 @@ func TestCleanupSecondAttemptRequiresItsOwnFreshInventoryBeforeRetiredJournal(t 
 	case <-time.After(5 * time.Second):
 		t.Fatal("second post-dispatch reconcile missing")
 	}
-	select {
-	case stale := <-env.cleanupWire.journalRequests:
-		t.Fatalf("second attempt requested journal before second scan: %+v", stale)
-	default:
-	}
+	noSecondAttemptJournal("second attempt requested journal before second scan")
 	snapshot.ReconciledRevision = 3
 	snapshot.ReconciledRequestID = secondReconcile.ID
 	snapshot.Versions[0].State = "absent"
@@ -629,6 +636,9 @@ func TestCleanupSecondAttemptRequiresItsOwnFreshInventoryBeforeRetiredJournal(t 
 	for journaled := false; !journaled; {
 		select {
 		case journal := <-env.cleanupWire.journalRequests:
+			if !slices.Contains(journal.AttemptIDs, second.AttemptID) {
+				continue
+			}
 			env.cleanup.ImageCleanupJournal(context.Background(), host, agentws.ImageCleanupJournalMsg{
 				RequestID: journal.ID, RetiredAttemptIDs: []string{second.AttemptID},
 			})
