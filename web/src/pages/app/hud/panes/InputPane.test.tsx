@@ -243,6 +243,17 @@ describe("InputPane connected controllers", () => {
     expect(notes).toHaveLength(1);
     expect(notes[0].textContent).toMatch(/XInput mode/);
   });
+
+  it("has no note under a pad the remap table translates", () => {
+    renderWithSnapshot({
+      ...EMPTY_SNAPSHOT,
+      inputMetrics: makeInputMetrics({
+        gamepadCount: 1,
+        pads: [{ index: 0, id: "8BitDo Pro 2 (Vendor: 2dc8 Product: 6006)", mapping: "", remapped: true }],
+      }),
+    });
+    expect(screen.queryByText(/doesn’t recognise this controller/)).toBeNull();
+  });
 });
 
 describe("InputPane scaling", () => {

@@ -73,7 +73,19 @@ Capture input. If keys still don't arrive, check `/dev/uinput` as for the mouse.
 
 Games see an Xbox 360 controller. Some pads (for example 8BitDo over Bluetooth)
 aren't reported in the standard layout, and the **Controller & input** pane says
-so. Switch the pad to XInput mode, or connect it by cable or USB receiver.
+so. Quasar translates the common ones (8BitDo SN30 Pro, Lite 2, Lite SE, Pro 2,
+Pro 3, Ultimate; Logitech F310, F510, F710 in D-input mode) itself. For any other
+pad, switch it to XInput mode, or connect it by cable or USB receiver.
+
+To ask for a pad to be added, open the browser console (F12) on the session page,
+press and hold one button, and run:
+
+```js
+[...navigator.getGamepads()].filter(Boolean).map(p=>({id:p.id,mapping:p.mapping,buttons:p.buttons.length,axes:p.axes.length,pressed:p.buttons.flatMap((b,i)=>b.value>0.5?[i]:[]),axisValues:p.axes.map(a=>+a.toFixed(3))}))
+```
+
+Send the `id` and the `pressed` list for each button, and `axisValues` for the
+d-pad and sticks.
 
 ## X and Y are swapped on a gamepad page inside the session
 

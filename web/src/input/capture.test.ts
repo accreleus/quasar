@@ -20,7 +20,7 @@
 //   real-browser harness concern outside unit-test scope.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { setupCapture, keyboardLockSupported, pointerLockSupported, rawMouseSupported } from "./capture";
+import { setupCapture, isStandardMapping, keyboardLockSupported, pointerLockSupported, rawMouseSupported } from "./capture";
 import { EVDEV, MB_MAP } from "./evdev";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1388,6 +1388,52 @@ describe("gamepad — Nintendo layout (control-api.md §Region and Input setting
     poll();
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ t: "gp", buttons: [1, 1] }));
     cap.cleanup();
+  });
+
+  describe("a pad the table knows (gamepadRemap.ts)", () => {
+    // 8BitDo Pro 2: raw b1 is the bottom button, b0 the right one, b4 left, b3 top; hat on axis 9.
+    const ID = "8BitDo Pro 2 (Vendor: 2dc8 Product: 6006)";
+    const rawPad = (pressed: number[], over: object = {}) => ({
+      index: 0, id: ID, mapping: "",
+      buttons: Array.from({ length: 15 }, (_, i) => ({ value: pressed.includes(i) ? 1 : 0 })),
+      axes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 3.286], ...over,
+    });
+    const sentButtons = (send: ReturnType<typeof vi.fn>) => send.mock.calls.at(-1)![0].buttons as number[];
+    const down = (b: number[]) => b.flatMap((v, i) => (v ? [i] : []));
+
+    it("is forwarded in the standard layout, with no notice", () => {
+      const onNonStandardGamepad = vi.fn();
+      const pad = rawPad([1, 6]);
+      Object.defineProperty(navigator, "getGamepads", { value: () => [pad], configurable: true });
+      let poll: ((t: number) => void) | null = null;
+      vi.stubGlobal("requestAnimationFrame", vi.fn((cb: (t: number) => void) => ((poll = cb), 1)));
+      const video = makeVideo();
+      const send = vi.fn();
+      const cap = setupCapture({ videoEl: video, sendInput: send, onCaptureChange: vi.fn(), channel: makeChannel(), onNonStandardGamepad });
+      lockPointer(video);
+      poll!(0);
+      expect(send).toHaveBeenCalledWith({ t: "gp", i: 0, buttons: expect.any(Array), axes: [0, 0, 0, 0] });
+      expect(down(sentButtons(send))).toEqual([0, 4]); // raw b1 → A, raw b6 → LB
+      expect(onNonStandardGamepad).not.toHaveBeenCalled();
+      expect(cap.getMetrics().pads).toEqual([{ index: 0, id: ID, mapping: "", remapped: true }]);
+      expect(isStandardMapping(cap.getMetrics().pads[0])).toBe(true);
+      cap.cleanup();
+    });
+
+    it("the Nintendo swap applies after the remap", () => {
+      const { cap, send, poll } = open(rawPad([1, 4]), NIN);
+      poll();
+      expect(down(sentButtons(send))).toEqual([1, 3]); // bottom → B, left → Y
+      cap.cleanup();
+    });
+
+    it("a table id whose raw arrays do not fit stays unmapped and keeps the notice", () => {
+      const { cap, send, poll } = open(rawPad([1], { axes: [0, 0, 0, 0] }), NIN);
+      poll();
+      expect(down(sentButtons(send))).toEqual([1]); // raw, untouched
+      expect(isStandardMapping(cap.getMetrics().pads[0])).toBe(false);
+      cap.cleanup();
+    });
   });
 
   it("setMouse changes the layout of a running capture and the changed state goes out", () => {

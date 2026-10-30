@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- **Session view: common pads the browser leaves unmapped now arrive in the right layout (#831).** The 8BitDo SN30 Pro, Lite 2, Lite SE, Pro 2, Pro 3, Ultimate and Xbox One SN30 Pro, and the Logitech F310, F510 and F710 in D-input mode, are translated to the standard gamepad layout in the browser when they report the device's own button order (for example over Bluetooth). They no longer show the "controller not recognised" notice. Any other pad that is not mapped keeps the notice.
+
 ## 0.5.1 — 2026-10-30
 
 ### Upgrading
