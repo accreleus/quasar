@@ -121,8 +121,9 @@ Legacy Compose only: `QUASAR_TLS=off` in `deploy/.env`. You lose gamepads,
 Escape capture and the microphone unless something in front provides HTTPS. An
 owned install always serves HTTPS; a proxy forwards to its HTTP port.
 
-With TLS off, first-run setup works only through a proxy named in
-`QUASAR_TRUSTED_PROXIES`. Without one, create the admin with `BOOTSTRAP_ADMIN_*`.
+With TLS off, first-run setup and sign-in work only through a proxy named in
+`QUASAR_TRUSTED_PROXIES` that sends `X-Forwarded-Proto: https`. Without one,
+nobody can sign in.
 
 ## Settings
 

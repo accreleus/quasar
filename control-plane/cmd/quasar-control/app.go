@@ -604,7 +604,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		WithTrustedProxies(cfg.TrustedProxies).
 		WithLogger(log)
 	if !cfg.TLSEnabled() && len(cfg.TrustedProxies) == 0 {
-		log.Warn("sign-in over plain HTTP: QUASAR_TLS=off with no QUASAR_TRUSTED_PROXIES; the next release refuses sign-in, registration and password change over plain HTTP",
+		log.Warn("sign-in is refused: QUASAR_TLS=off with no QUASAR_TRUSTED_PROXIES, and sign-in, registration and password change are refused over plain HTTP",
 			"fix", "turn QUASAR_TLS back on, or name the TLS-terminating reverse proxy in QUASAR_TRUSTED_PROXIES")
 	}
 	crudHandler := crud.NewHandler(pool, auditStore)
