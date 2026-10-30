@@ -509,6 +509,8 @@ function SessionPageBody() {
 
   // #748: a stall can fire a beat before the end-reason read lands. Hold the recovery banner
   // for a short grace so a session already ending (or ended by this page) never paints it.
+  // `failed` skips the grace (#812): it can leave the page with no input channel and no Exit, and
+  // the banner's "Back to library" is the only way out.
   const recoveryActive = recovery != null && RECOVERY_PHASES.includes(recovery.phase);
   const [recoveryGraceDone, setRecoveryGraceDone] = useState(false);
   useEffect(() => {
@@ -517,7 +519,8 @@ function SessionPageBody() {
     const t = setTimeout(() => setRecoveryGraceDone(true), RECOVERY_BANNER_GRACE_MS);
     return () => clearTimeout(t);
   }, [recoveryActive]);
-  const recoveryShown = recoveryActive && recoveryGraceDone && !gameExited && !stopping;
+  const recoveryShown =
+    recoveryActive && (recoveryGraceDone || recovery?.phase === "failed") && !gameExited && !stopping;
 
   // Release what leaving the page releases, without destroying the transport:
   // a destroy would say `bye` to a session another tab now owns.
