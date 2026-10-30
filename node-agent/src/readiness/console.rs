@@ -736,8 +736,9 @@ pub fn check_ddc(v: &ConsoleView) -> ReadinessCheck {
         return super::warn_check(
             CHECK_DDC,
             format!(
-                "console auto-start is waiting: the monitor is on but shows another input \
-                 than this host's ({input:#04x}, {known})"
+                "the monitor is on but shows another input than this host's ({input:#04x}, \
+                 {known}): console auto-start does not run, and a console session still \
+                 running there ends after the usual waits"
             ),
             format!("Switch the monitor to this host's input. {relearn}")
                 .trim_end()
@@ -1141,7 +1142,8 @@ mod tests {
         v.ddc.input_learned = true;
         let c = check_ddc(&v);
         assert_eq!(c.status, WARN);
-        assert!(c.summary.contains("waiting") && c.summary.contains("0x10"));
+        assert!(c.summary.contains("does not run") && c.summary.contains("0x10"));
+        assert!(c.summary.contains("session still running"));
         assert!(c.summary.contains("learned"));
         assert!(c.remediation.contains("off and on"));
 

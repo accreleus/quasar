@@ -266,6 +266,12 @@ pub(crate) fn display_claimed(card: &str) -> bool {
 /// does not launch into a sleeping panel. It is over a second of i2c traffic on the
 /// display link, which a running desktop feels as a hitch every poll, and while a
 /// desktop owns the display the panel's power is the desktop's business.
+///
+/// One deliberate, bounded exception: the first local input of a session reads the
+/// monitor's power and input to learn which input is this host's (`ddc::learn_input`, on its
+/// own thread): a few attempts per connector, 8 s apart, until console mode is toggled or
+/// the agent restarts, and none once the input is known. It lands at the launcher, where a
+/// hitch costs little.
 fn ddc_probe_allowed(display_claimed: bool) -> bool {
     !display_claimed
 }
@@ -383,19 +389,33 @@ fn claimed_connectors(connected: Vec<String>, displayed: Option<&str>) -> Vec<St
             None
         }
     };
-    // Local input on a displaying console is the proof that someone sees this host: the
-    // monitor's input now is the host's.
-    if let Some(connector) =
-        displayed.filter(|_| crate::console_idle::input_within(LEARN_INPUT_WITHIN))
-    {
-        crate::ddc::learn_input(connector);
-    }
-    claimed_connectors_with(
+    claimed_connectors_in(
         &CLAIMED_DDC,
         connected,
+        displayed,
         idle,
+        crate::console_idle::input_within(LEARN_INPUT_WITHIN),
+        crate::ddc::learn_input,
         crate::ddc::powered_connectors_on_known_bus,
     )
+}
+
+/// [`claimed_connectors_with`], first learning the displayed connector's monitor input when
+/// a person has used the host's own input devices: that is the proof the monitor shows this
+/// host.
+fn claimed_connectors_in(
+    state: &std::sync::Mutex<ClaimedDdc>,
+    connected: Vec<String>,
+    displayed: Option<&str>,
+    idle: Option<std::time::Duration>,
+    input_recent: bool,
+    learn: impl FnOnce(&str),
+    read: impl FnOnce(Vec<String>) -> Vec<String>,
+) -> Vec<String> {
+    if let Some(connector) = displayed.filter(|_| input_recent) {
+        learn(connector);
+    }
+    claimed_connectors_with(state, connected, idle, read)
 }
 
 fn claimed_connectors_with(
@@ -1679,6 +1699,31 @@ mod tests {
             claimed_connectors_with(&st, dp4(), Some(std::time::Duration::ZERO), never),
             Vec::<String>::new()
         );
+    }
+
+    /// The monitor's input is learned for the displayed connector, and only once a person
+    /// has used the host's own input.
+    #[test]
+    fn a_displaying_console_learns_its_input_from_local_input_only() {
+        let dp4 = || vec!["DP-4".to_string()];
+        let st = std::sync::Mutex::new(ClaimedDdc::default());
+        let quiet = Some(std::time::Duration::from_secs(60));
+        let run = |displayed: Option<&str>, input_recent: bool| {
+            let mut learned = Vec::new();
+            claimed_connectors_in(
+                &st,
+                dp4(),
+                displayed,
+                quiet,
+                input_recent,
+                |c| learned.push(c.to_string()),
+                |_| panic!("DDC read while input is recent"),
+            );
+            learned
+        };
+        assert_eq!(run(Some("DP-4"), true), dp4());
+        assert!(run(Some("DP-4"), false).is_empty(), "no one at the host");
+        assert!(run(None, true).is_empty(), "no planned connector");
     }
 
     /// The full monitor-power read (with `ddcutil detect`) never runs while a desktop owns
