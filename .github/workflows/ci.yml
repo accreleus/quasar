@@ -360,10 +360,12 @@ jobs:
         run: sudo modprobe uinput && ls -l /dev/uinput
       - name: Test against the real uinput
         # No `sudo -E`: the runner's sudo stopped honouring it (#982), so cargo under root
-        # found no rustup default. Hand rustup and cargo their homes explicitly instead.
+        # found no rustup default. Hand rustup and cargo their homes explicitly instead, and
+        # CARGO_INCREMENTAL so the Test step's binary is reused rather than rebuilt.
         run: >-
           sudo env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}"
-          "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" QUASAR_REQUIRE_UINPUT=1
+          "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
+          "CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}" QUASAR_REQUIRE_UINPUT=1
           cargo test --workspace --lib uinput_ -- --ignored --test-threads=1
 
   # RH-07 #408: the runtime's behavioural suite against each engine mode a hosted runner
