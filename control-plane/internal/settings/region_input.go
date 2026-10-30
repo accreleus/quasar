@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -24,8 +25,11 @@ const (
 
 // ValidTimezone accepts a zone the control plane's tz database knows, links
 // included, other than Local. LoadLocation reads "" as UTC, so "" is refused here.
+// The system zoneinfo directory also holds posixrules and the posix/ and right/
+// trees, which LoadLocation finds first and which are not IANA zone names.
 func ValidTimezone(tz string) bool {
-	if tz == "" || tz == "Local" || len(tz) > 64 {
+	if tz == "" || tz == "Local" || len(tz) > 64 || tz == "posixrules" ||
+		strings.HasPrefix(tz, "posix/") || strings.HasPrefix(tz, "right/") {
 		return false
 	}
 	_, err := time.LoadLocation(tz)

@@ -10,6 +10,7 @@ func TestRegionInputValueRules(t *testing.T) {
 		"Europe/London": true, "UTC": true, "Asia/Calcutta": true, "Asia/Kolkata": true,
 		"America/Argentina/Buenos_Aires": true,
 		"Local":                          false, "": false, "Mars/Olympus": false, "../etc/passwd": false, "europe/london": false,
+		"posixrules": false, "posix/Europe/London": false, "right/UTC": false,
 	} {
 		if got := ValidTimezone(tz); got != want {
 			t.Errorf("ValidTimezone(%q) = %v, want %v", tz, got, want)
