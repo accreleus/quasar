@@ -32,6 +32,8 @@ interface SegmentedControlProps<T extends string = string> {
   value: T | null;
   onChange: (value: T) => void;
   "aria-label"?: string;
+  /** Names the group by a visible label elsewhere on the page. */
+  "aria-labelledby"?: string;
   /** Disables clicks and arrow-key activation while an in-flight save owns
    *  the current value. */
   disabled?: boolean;
@@ -45,6 +47,7 @@ export function SegmentedControl<T extends string = string>({
   value,
   onChange,
   "aria-label": ariaLabel,
+  "aria-labelledby": ariaLabelledBy,
   disabled = false,
   activation = "automatic",
 }: SegmentedControlProps<T>) {
@@ -129,7 +132,7 @@ export function SegmentedControl<T extends string = string>({
   }
 
   return (
-    <div className="segmented" role="tablist" aria-orientation="horizontal" aria-label={ariaLabel}>
+    <div className="segmented" role="tablist" aria-orientation="horizontal" aria-label={ariaLabel} aria-labelledby={ariaLabelledBy}>
       {options.map((opt, i) => (
         <button
           key={opt.value}

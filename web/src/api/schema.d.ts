@@ -881,6 +881,75 @@ export interface paths {
         };
         trace?: never;
     };
+    "/v1/me/region-input": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the caller's Region and Input settings, with the install defaults (amendment 49, #845).
+         * @description See control-api.md §Region and Input settings. Self only: no admin variant. A user who has saved nothing reads every field null.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RegionInputSettings"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Update the caller's Region and Input settings (amendment 49, #845).
+         * @description Partial merge one level deep: an absent field is unchanged, null clears it, keyboard is replaced whole, defaults and parked_session_stopped are ignored. Any other key or an invalid value is 400 validation_failed and nothing is written. A change to timezone, language, region_format or keyboard stops the caller's parked session (warm Steam), never a session in use; the response says so in parked_session_stopped.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["RegionInputSettings"];
+                };
+            };
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RegionInputSettings"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+            };
+        };
+        trace?: never;
+    };
     "/v1/me/highlights": {
         parameters: {
             query?: never;
@@ -4179,12 +4248,17 @@ export interface paths {
                         /** @description First-run wizard v2 §S6e (migration 0064). The signaling origin allow-list. ABSENT = UNCHANGED; an explicitly-sent [] CLEARS the list. Those are different requests and the server distinguishes them (pointer decode), so a PATCH that only changes the registration mode can never wipe the allow-list. Each entry must be scheme + host only (http/https, no path, query, credentials or trailing slash); the server stores the NORMALIZED form, so what is saved is exactly what /v1/signal compares against. "*" IS REJECTED OUTRIGHT with 400 validation_failed - a wildcard would discard the layer entirely. A bad entry is 400 naming its position, and nothing is written. Setting this does NOT lift an environment override: when QUASAR_ALLOWED_ORIGINS is SET it wins, and GET /v1/admin/access-check reports which source is in force. */
                         allowed_origins?: string[];
                         /**
-                         * @description Platform-release amendment 1 (#104/#106, migration 0074); `beta` added by amendment 3 (#121, migration 0079). Which platform releases the admin console is shown. Absent = unchanged (pointer decode, the same rule every field on this body follows - a plain decode would read "" and silently reset the channel whenever an admin changed the registration mode). Any value outside the enum is 400 validation_failed. Takes effect immediately: the next GET /v1/admin/platform/releases reads the other channel's rows. IT DOES NOT TRIGGER DETECTION - that is a jobs-framework job, and "check now" is POST /v1/admin/jobs/{job_id}/run.
+                         * @description Platform-release amendment 1 (#104/#106, migration 0074); `beta` added by amendment 3 (#121, migration 0079); `preview` added by amendment 48 (#840, migration 0107). Which platform releases the admin console is shown. Absent = unchanged (pointer decode, the same rule every field on this body follows - a plain decode would read "" and silently reset the channel whenever an admin changed the registration mode). Any value outside the enum is 400 validation_failed. Takes effect immediately: the next GET /v1/admin/platform/releases reads the other channel's rows. IT DOES NOT TRIGGER DETECTION - that is a jobs-framework job, and "check now" is POST /v1/admin/jobs/{job_id}/run.
                          * @enum {string}
                          */
-                        release_channel?: "stable" | "beta" | "edge";
+                        release_channel?: "stable" | "beta" | "edge" | "preview";
                         /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the EDGE channel follows; default develop. Absent = unchanged. Validated as a git ref name component - non-empty, at most 255 characters, no whitespace, no "..", no leading "-", no control characters - 400 validation_failed otherwise. Validated and stored whatever the channel is, and NEVER CLEARED BY A CHANNEL SWITCH, so an operator who visits stable and comes back keeps their branch. */
                         release_edge_branch?: string;
+                        /**
+                         * @description Amendment 48 (#840, migration 0107). How often platform.release_detect runs. Absent = unchanged; explicit null = follow the channel again (daily on preview, weekly on every other channel); any other value is 400 validation_failed. Never changed by a channel switch. The job takes its period from it (locked_by instance_settings.release_check); its window stays the Jobs tab's, and on daily the window opens every day.
+                         * @enum {string|null}
+                         */
+                        release_check?: "daily" | "weekly" | null;
                         /** @description Release notifications, ADDITIVE (#123, migration 0080). Whether a newly detected platform release is POSTed to release_webhook_url. Absent = unchanged. Setting it TRUE is 400 validation_failed whenever the URL this request LEAVES BEHIND is empty - nothing stored and none supplied, or an explicit "" in the same body - because a switch that silently does nothing is worse than a refusal. Default false, so an instance that has never been configured announces nothing. */
                         release_webhook_enabled?: boolean;
                         /** @description Release notifications, ADDITIVE (#123, migration 0080). Where one release notification is POSTed. Absent = unchanged; an explicitly-sent "" CLEARS it AND SETS release_webhook_enabled false in the same write. Any other value must be an absolute https URL with no userinfo, at most 2048 characters, or 400 validation_failed - http, a credential in the URL and a relative reference are all refused. THE SERVER STILL CONTAINS THE REQUEST AT SEND TIME: delivery refuses any host that resolves to a loopback, private, link-local or multicast address, follows no redirect, and bounds the response body. THE URL IS TREATED AS A CREDENTIAL (a Slack or Discord webhook URL authenticates by being known), so it never appears in a log line, an audit record or a delivery error. */
@@ -4200,6 +4274,26 @@ export interface paths {
                         steam_warm_rewarm?: "library_open" | "next_steam_launch";
                         /** @description Amendment 39. Each heartbeat, and a park on exit, sets a parked session's deadline to now plus this many minutes. Absent = unchanged; outside 1-60 is 400 validation_failed. */
                         steam_warm_idle_minutes?: number;
+                        /** @description Amendment 49 (#845). As RegionSettings.timezone. Default UTC. Absent = unchanged. */
+                        default_timezone?: string;
+                        /** @description Amendment 49. Default en-US. Absent = unchanged. */
+                        default_language?: string;
+                        /** @description Amendment 49. null = the same as the language (the default). Absent = unchanged. */
+                        default_region_format?: string | null;
+                        default_keyboard?: components["schemas"]["KeyboardLayout"];
+                        /**
+                         * @description Amendment 49. Default auto.
+                         * @enum {string}
+                         */
+                        default_match_cursor?: "auto" | "on" | "off";
+                        /** @description Amendment 49. Default 1. */
+                        default_mouse_sensitivity?: number;
+                        /** @description Amendment 49. Default false. */
+                        default_raw_mouse?: boolean;
+                        /** @description Amendment 49. Default false. */
+                        default_flip_scroll?: boolean;
+                        /** @description Amendment 49. Default false. */
+                        default_nintendo_layout?: boolean;
                     };
                 };
             };
@@ -9344,12 +9438,17 @@ export interface components {
                 /** @description First-run wizard v2 §S6e (migration 0064). The admin-editable signaling origin allow-list, normalized (scheme + lowercased host). THIS IS THE DATABASE COLUMN, NOT NECESSARILY WHAT /v1/signal ENFORCES: QUASAR_ALLOWED_ORIGINS, when SET, overrides it outright - including when set to the empty string, which is how a hardened deployment pins the list off. That override rule is what makes the migration a behavioural no-op on upgrade for every existing deployment. GET /v1/admin/access-check reports the RESOLVED list plus which source won, so a UI can grey out a control the environment has pinned - the same shape library_discovery_interval_minutes uses. AN EMPTY LIST IS NOT "DENY ALL": /v1/signal still admits a same-origin request and a request with no Origin header at all, so a fresh instance with nothing configured works. Optional in the envelope so pre-amendment servers stay conformant. */
                 allowed_origins?: string[];
                 /**
-                 * @description Platform-release amendment 1 (#104/#106, migration 0074); `beta` added by amendment 3 (#121, migration 0079). The instance's platform- release channel: stable = tagged, noted releases; beta = those AND the prereleases among them; edge = whatever was last published from release_edge_branch, with no notes. DEFAULT stable - an instance that has never been configured is not shown prereleases or branch builds. Read per request rather than at boot, so a switch needs no restart. Optional in the envelope so pre-amendment servers stay conformant.
+                 * @description Platform-release amendment 1 (#104/#106, migration 0074); `beta` added by amendment 3 (#121, migration 0079); `preview` added by amendment 48 (#840, migration 0107). The instance's platform- release channel: stable = tagged, noted releases; beta = those AND the prereleases among them; edge = whatever was last published from release_edge_branch, with no notes; preview = every build of develop, with its commit list. DEFAULT stable - an instance that has never been configured is not shown prereleases or branch builds. Read per request rather than at boot, so a switch needs no restart. Optional in the envelope so pre-amendment servers stay conformant.
                  * @enum {string}
                  */
-                release_channel?: "stable" | "beta" | "edge";
+                release_channel?: "stable" | "beta" | "edge" | "preview";
                 /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the edge channel follows; default develop. Reported whatever the channel is (it selects nothing while the channel is stable) so a UI can render the control without a second read. Optional in the envelope so pre-amendment servers stay conformant. */
                 release_edge_branch?: string;
+                /**
+                 * @description Amendment 48 (#840, migration 0107). How often platform.release_detect runs. NULL, THE DEFAULT, FOLLOWS THE CHANNEL: daily on preview, weekly on every other channel. Optional in the envelope so pre-amendment servers stay conformant; a client reads absent as null.
+                 * @enum {string|null}
+                 */
+                release_check?: "daily" | "weekly" | null;
                 /** @description Release notifications, ADDITIVE (#123, migration 0080). Whether a detected platform release is announced to release_webhook_url. Default false. Optional in the envelope so a pre-#123 server stays conformant; a client reads absent as false. */
                 release_webhook_enabled?: boolean;
                 /** @description Release notifications, ADDITIVE (#123, migration 0080). The configured webhook URL, or "" when none is set. It is admin-only, as this whole envelope is. THE SIGNING SECRET IS NOT HERE and never will be: it is an instance_secrets row read through GET /v1/admin/secrets, which reports configured/readable and a masked hint, never a value. */
@@ -9365,6 +9464,19 @@ export interface components {
                 steam_warm_rewarm?: "library_open" | "next_steam_launch";
                 /** @description Amendment 39. Default 10. */
                 steam_warm_idle_minutes?: number;
+                /** @description Amendment 49 (#845). Default UTC. Optional in the envelope so a pre-amendment server stays conformant. */
+                default_timezone?: string;
+                /** @description Amendment 49. Default en-US. */
+                default_language?: string;
+                /** @description Amendment 49. null = the same as the language. */
+                default_region_format?: string | null;
+                default_keyboard?: components["schemas"]["KeyboardLayout"];
+                /** @enum {string} */
+                default_match_cursor?: "auto" | "on" | "off";
+                default_mouse_sensitivity?: number;
+                default_raw_mouse?: boolean;
+                default_flip_scroll?: boolean;
+                default_nintendo_layout?: boolean;
                 /** Format: uuid */
                 updated_by: string | null;
                 /** Format: date-time */
@@ -9440,10 +9552,10 @@ export interface components {
              */
             id: string;
             /**
-             * @description The channel this row is STORED on, which is not always the instance's channel: beta has no rows of its own and reads stable's, so a release listed while the instance is on beta reports `stable` here. Unchanged by amendment 3.
+             * @description The channel this row is STORED on, which is not always the instance's channel: beta has no rows of its own and reads stable's, so a release listed while the instance is on beta reports `stable` here. Unchanged by amendment 3; `preview` added by amendment 48 (#840), whose builds are rows of their own.
              * @enum {string}
              */
-            channel: "stable" | "edge";
+            channel: "stable" | "edge" | "preview";
             /** @description Stable semver without a leading "v" ("0.2.0", "0.2.0-rc.1"). NULL ON EDGE - an edge build is a commit, not a version, and a synthesized one would be rendered to an operator as if it were real. */
             version: string | null;
             /** @description Full 40-character lowercase hex. The identity on both channels. */
@@ -9461,10 +9573,12 @@ export interface components {
             notes: string;
             /** @description On edge, the GitHub compare link from the installed control plane's source_commit to this release's. Null on stable (the notes are that), and null on edge when the installed commit is unknown - there is nothing to compare from. */
             compare_url: string | null;
-            /** @description The release manifest asset verbatim. NULL ON EDGE, which publishes no asset. Amendment 14 (#353): the format-2 asset (platform-release-manifest.v2.json) when the release publishes one and this control plane reads it, else the format-1 asset; a client tells them apart by format_version. */
-            manifest: components["schemas"]["ReleaseManifest"] | components["schemas"]["ReleaseManifestV2"] | null;
+            /** @description The release manifest asset verbatim. NULL ON EDGE, which publishes no asset. Amendment 14 (#353): the format-2 asset (platform-release-manifest.v2.json) when the release publishes one and this control plane reads it, else the format-1 asset; a client tells them apart by format_version. Amendment 48 (#840): on preview, the preview manifest verbatim (version null). */
+            manifest: components["schemas"]["ReleaseManifest"] | components["schemas"]["ReleaseManifestV2"] | components["schemas"]["ReleaseManifestPreview"] | null;
             /** @description ADDITIVE, amendment 6 (#153). True when applying this release runs at least one migration on this instance - its schema_version is above the installed control plane's. THE ONE THING that decides whether a fleet apply's control-plane step drains the instance (see the apply section), so it is DERIVED AND SERVED rather than left to a client to re-derive, exactly as identity_known is: a client twin of the rule would keep naming the old policy after the rule moved. Always present. With no release to apply, read the cautious answer, true. */
             migrates: boolean;
+            /** @description ADDITIVE, amendment 48 (#840). On a preview release whose manifest carries commits, how many of its leading entries the installed control plane does not run: the entries before the one whose commit equals the installed control plane's source_commit, or all of them when none does. Null on every other release. A client shows the first new_commit_count entries of manifest.commits. DERIVED AND SERVED, like migrates. Always serialized by a server implementing amendment 48; a client reads absent as null. */
+            new_commit_count?: number | null;
             /**
              * Format: date-time
              * @description When THIS instance first saw the release. Provenance, not ordering - two instances can legitimately disagree.
@@ -9539,7 +9653,7 @@ export interface components {
              * @description The instance's channel. Everything in `available` is what it selects; another channel's releases are never mixed in. On `beta` the entries carry channel `stable`, because beta reads those rows rather than storing its own.
              * @enum {string}
              */
-            channel: "stable" | "beta" | "edge";
+            channel: "stable" | "beta" | "edge" | "preview";
             /** @description ADDITIVE (#104). The configured release repository as `owner/name` (QUASAR_PLATFORM_RELEASE_REPO, default `accreleus/quasar`), so a client can compose the GitHub links a release view needs - the release page, the commit, and the issues the notes reference - instead of hard-coding a repository the operator may have re-pointed. "" when detection is switched off, which a client reads as "render no links", never as the default. Optional in the schema so a pre-#104 server stays conformant; a client must read absent as "". */
             source_repo?: string;
             /** @description The branch the edge channel follows. Reported on BOTH channels so a UI can render the control without a second read; it selects nothing while channel is stable. */
@@ -9877,6 +9991,33 @@ export interface components {
             name: "node-agent" | "recovery-actor";
             /** @description Semver without a leading "v" - the same grammar as ReleaseManifestV2.version. Compared by SemVer precedence. */
             version: string;
+        };
+        /** @description AMENDMENT 48 (#840). The preview manifest: one document at the tag `preview` of quasar-release-manifest in the platform registry, the single layer of an OCI image manifest. Format 2 with three differences: version is null, prerelease is false, and it may carry commits. Every component was built from source_commit. Served back VERBATIM as PlatformRelease.manifest. Full semantics: control-api.md §"Platform-release preview channel". */
+        ReleaseManifestPreview: {
+            /** @enum {integer} */
+            format_version: 2;
+            /** @description A preview build is a commit, not a version. */
+            version: null;
+            /** @enum {boolean} */
+            prerelease: false;
+            /** @description 40 lowercase hex. Every component was built from it. */
+            source_commit: string;
+            /** Format: date-time */
+            built_at: string;
+            /** @description As in format 2. */
+            schema_version: number;
+            /** @description Exactly as in format 2: control-plane, node-agent, recovery-actor, in this order. */
+            components: components["schemas"]["ReleaseManifestV2Component"][];
+            /** @description Exactly as in format 2, except that no floor version is compared with version, which is null. */
+            floor: components["schemas"]["ReleaseManifestFloorEntry"][];
+            /** @description OPTIONAL. The build's first-parent history, newest first, from source_commit back to, and not including, the newest stable release tag reachable from it; cut to the newest 500. Absent is valid (new_commit_count is then null). Only a preview manifest may carry it. */
+            commits?: components["schemas"]["ReleaseManifestCommit"][];
+        };
+        ReleaseManifestCommit: {
+            /** @description 40 lowercase hex. */
+            commit: string;
+            /** @description One line: `#<number> <title>` for a pull-request merge, the commit's subject line otherwise. UNTRUSTED UPSTREAM TEXT: render as plain text, never as markdown or HTML. */
+            subject: string;
         };
         /** @description The PUBLIC metadata of a certificate. Every field here is already disclosed by any TLS handshake with this listener. THERE IS DELIBERATELY NO FIELD THAT COULD HOLD KEY MATERIAL, and adding one would be the bug this shape exists to prevent. */
         TLSCertificateInfo: {
@@ -10483,6 +10624,48 @@ export interface components {
         /** @description Per-user client presentation preferences, synced across that user's devices. One key per client surface so a new surface needs no new endpoint. Unknown top-level keys are preserved through a PATCH. */
         UIPreferences: {
             session_overlay?: components["schemas"]["SessionOverlayPreferences"];
+        };
+        KeyboardLayout: {
+            /** @description One xkeyboard-config layout name, e.g. gb. */
+            layout: string;
+            /** @description One variant of that layout, e.g. extd; empty for the basic variant. */
+            variant: string;
+        };
+        RegionSettings: {
+            /** @description An IANA zone name the control plane's tz database knows, backward-compatible links included, other than Local. Reaches the container as TZ. */
+            timezone?: string | null;
+            /** @description A language and region, e.g. de-DE. Reaches the container as LANG=de_DE.UTF-8. */
+            language?: string | null;
+            /** @description As language; reaches the container as LC_TIME, LC_NUMERIC, LC_MONETARY, LC_MEASUREMENT and LC_PAPER. null in defaults = the same as the language. */
+            region_format?: string | null;
+        };
+        InputSettings: {
+            /** @description Reaches the container as XKB_DEFAULT_LAYOUT / XKB_DEFAULT_VARIANT and the session's keymap. */
+            keyboard?: components["schemas"]["KeyboardLayout"] | null;
+            /**
+             * @description Client only. auto = on for an app of kind desktop, off for every other kind.
+             * @enum {string|null}
+             */
+            match_cursor?: "auto" | "on" | "off" | null;
+            /** @description Client only. Multiplies relative mouse movement. */
+            mouse_sensitivity?: number | null;
+            /** @description Client only. Pointer lock with unadjustedMovement where the browser has it. */
+            raw_mouse?: boolean | null;
+            /** @description Client only. Reverses the wheel direction before sending. */
+            flip_scroll?: boolean | null;
+            /** @description Client only. Swaps gamepad A with B and X with Y before sending. */
+            nintendo_layout?: boolean | null;
+        };
+        RegionInputSettings: {
+            region?: components["schemas"]["RegionSettings"];
+            input?: components["schemas"]["InputSettings"];
+            /** @description The install defaults (GET /v1/admin/settings default_*). Every field has a value except region.region_format. */
+            readonly defaults?: {
+                region?: components["schemas"]["RegionSettings"];
+                input?: components["schemas"]["InputSettings"];
+            };
+            /** @description PATCH response only: true when this change stopped the caller's parked session. */
+            readonly parked_session_stopped?: boolean;
         };
         HighlightList: {
             items: components["schemas"]["Highlight"][];
@@ -11609,9 +11792,9 @@ export interface components {
             window_days: number[];
             /** @description IANA zone name; windows are evaluated in it. Intervals are NOT: an interval is a duration in absolute time and has no opinion about the clock on the wall, so a DST transition can shift when a windowed run lands but can never lengthen an interval. */
             timezone: string;
-            /** @description True when an environment variable is authoritative over this job's interval, and, for `library.discovery`, whenever its interval is not writable here, which is always (amendment 28). The env override stays the winner (the pre-existing documented behaviour of knobs like QUASAR_LIBRARY_SCAN_INTERVAL); the API says so rather than silently accepting an edit the environment will overrule - a PATCH of interval_secs on a locked job is 409 schedule_locked (for `library.discovery`, a value equal to the reported interval_secs is accepted and not stored, and a different one is 422 below 60, otherwise 409 schedule_locked: amendment 28). */
+            /** @description True when an environment variable is authoritative over this job's interval, and, for `library.discovery`, whenever its interval is not writable here, which is always (amendment 28); likewise always for `platform.release_detect`, whose period follows instance_settings.release_check (amendment 48). The env override stays the winner (the pre-existing documented behaviour of knobs like QUASAR_LIBRARY_SCAN_INTERVAL); the API says so rather than silently accepting an edit the environment will overrule - a PATCH of interval_secs on a locked job is 409 schedule_locked (for `library.discovery`, a value equal to the reported interval_secs is accepted and not stored, and a different one is 422 below 60, otherwise 409 schedule_locked: amendment 28). */
             locked: boolean;
-            /** @description The authority that is in force: the environment variable, e.g. "QUASAR_LIBRARY_SCAN_INTERVAL", or, for `library.discovery` when that override is not set, `instance_settings.library_discovery_interval_minutes` (amendment 28). Null when not locked. */
+            /** @description The authority that is in force: the environment variable, e.g. "QUASAR_LIBRARY_SCAN_INTERVAL", or, for `library.discovery` when that override is not set, `instance_settings.library_discovery_interval_minutes` (amendment 28), and for `platform.release_detect` `instance_settings.release_check` (amendment 48). Null when not locked. */
             locked_by: string | null;
         };
         /** @description One record of one run - the shape that appears as `last_run` and as an item of the run-history page. */

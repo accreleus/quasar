@@ -80,11 +80,13 @@ beforeEach(() => {
   mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [] });
   // The head's "next check" fragment reads the detection job's schedule.
   mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
+  mocked.getSettings.mockResolvedValue({ settings: { release_check: null } } as never);
 });
 
 describe("ReleasesTab on edge", () => {
-  it("labels an older same-schema edge candidate without suggesting a new update", async () => {
-    const view = edgeView({ built_at: "2026-08-18T09:14:02Z" });
+  // A preview build is a branch build too (amendment 48): the same rule holds.
+  it.each(["edge", "preview"] as const)("labels an older same-schema %s candidate without suggesting a new update", async (channel) => {
+    const view = edgeView({ built_at: "2026-08-18T09:14:02Z", channel });
     view.targets[0] = { ...view.targets[0], eligible: false, reason: "up_to_date", preflight: PF };
     mocked.getPlatformReleases.mockResolvedValue(view);
     renderTab();
@@ -94,8 +96,8 @@ describe("ReleasesTab on edge", () => {
     expect(screen.queryByRole("button", { name: /apply update/i })).not.toBeInTheDocument();
   });
 
-  it("shows the commit and the compare link in place of a version and notes", async () => {
-    mocked.getPlatformReleases.mockResolvedValue(edgeView());
+  it.each(["edge", "preview"] as const)("shows the commit and the compare link in place of a version and notes on %s", async (channel) => {
+    mocked.getPlatformReleases.mockResolvedValue(edgeView({ channel }));
     const { container } = renderTab();
 
     // The card's title IS the commit, and so is the commit line beside it.

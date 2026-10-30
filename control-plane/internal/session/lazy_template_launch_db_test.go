@@ -8,7 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/agentws"
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type heldTemplatePreparation struct {
@@ -34,13 +37,15 @@ type lazyTemplateLaunch struct {
 	disp      *fakeDispatcher
 	coord     *Coordinator
 	store     *Store
+	pool      *pgxpool.Pool
 	hostID    string
 	sessionID string
 }
 
 // startLazyTemplateLaunch performs an operator launch whose preparation is
-// held, and returns once the coordinator is waiting on it.
-func startLazyTemplateLaunch(t *testing.T) lazyTemplateLaunch {
+// held, and returns once the coordinator is waiting on it. Given epochs, the
+// agent connection reports them (ledger or not).
+func startLazyTemplateLaunch(t *testing.T, epochs ...*scriptedHomeEpoch) lazyTemplateLaunch {
 	t.Helper()
 	pool := testDB(t)
 	s := seed(t, pool, 2)
@@ -59,7 +64,11 @@ func startLazyTemplateLaunch(t *testing.T) lazyTemplateLaunch {
 	prep := &heldTemplatePreparation{called: make(chan struct{}, 1), release: make(chan struct{})}
 	disp := newFakeDispatcher(true)
 	store := NewStore(pool)
-	coord := newTestCoordinator(t, store, disp, testLogger(), WithLazyImagePreparer(prep))
+	var d Dispatcher = disp
+	if len(epochs) > 0 {
+		d = &homeEpochDispatcher{fakeDispatcher: disp, epochs: epochs}
+	}
+	coord := newTestCoordinator(t, store, d, testLogger(), WithLazyImagePreparer(prep), WithAuditor(audit.NewStore(pool)))
 	mux := http.NewServeMux()
 	ah := auth.NewHandler(authSvc)
 	NewHandler(coord, store).Register(mux, ah.RequireAuth, ah.RequireAdmin)
@@ -87,7 +96,7 @@ func startLazyTemplateLaunch(t *testing.T) lazyTemplateLaunch {
 	if got := disp.types(); len(got) != 0 {
 		t.Fatalf("assigned before image ready: %v", got)
 	}
-	return lazyTemplateLaunch{prep: prep, disp: disp, coord: coord, store: store, hostID: s.hostID, sessionID: body.Session.ID}
+	return lazyTemplateLaunch{prep: prep, disp: disp, coord: coord, store: store, pool: pool, hostID: s.hostID, sessionID: body.Session.ID}
 }
 
 // assertNeverAssigned releases the held preparation and proves the ended
@@ -145,4 +154,33 @@ func TestLazyTemplateWaitEndsOnStop(t *testing.T) {
 	if sess.State == StateFailed {
 		t.Fatalf("user stop during preparation was recorded as failed: %+v", sess.ErrorMessage)
 	}
+}
+
+// On an agent without the home-cleanup ledger nothing answers the stop of a
+// launch still in its image wait, so the control plane ends it (#940). The row
+// must end before the preparation is released: only the cancelled wait's
+// error path may end it.
+func TestLazyTemplateWaitEndsOnStopWithoutTheLedger(t *testing.T) {
+	l := startLazyTemplateLaunch(t, &scriptedHomeEpoch{capable: false, queued: true, result: agentws.AckResult{OK: true}})
+	if _, err := l.coord.Stop(context.Background(), l.sessionID, "user"); err != nil {
+		t.Fatal(err)
+	}
+	var sess Session
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		var err error
+		sess, err = l.store.Get(context.Background(), l.sessionID)
+		must(t, err)
+		if sess.State != StateStopping || time.Now().After(deadline) {
+			break
+		}
+	}
+	if sess.State != StateStopped || deref(sess.StopReason) != "user" {
+		t.Fatalf("after the stop: state %s, stop_reason %q, want stopped / user", sess.State, deref(sess.StopReason))
+	}
+	for _, row := range sessionAuditRows(t, l.pool) {
+		if row.Action == "session.failed" && row.Target == l.sessionID {
+			t.Errorf("session.failed audited for a stop")
+		}
+	}
+	l.assertNeverAssigned(t)
 }

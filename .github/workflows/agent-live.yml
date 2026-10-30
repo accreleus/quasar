@@ -23,7 +23,21 @@ name: Agent live tests
 # The nightly run is develop's. A schedule only fires from the default branch's copy
 # of this file, so that run checks develop out by name.
 on:
+  # Into develop only: the develop -> main release pull request has the push run below.
   pull_request:
+    branches: [develop]
+    paths:
+      - 'node-agent/**'
+      - 'deploy/Dockerfile.vulkan'
+      - 'deploy/patches/**'
+      - 'deploy/pins.env'
+      - 'deploy/toolchain-hash.sh'
+      - '.github/workflows/agent-live.yml'
+      - '.github/workflows/images.yml'
+  # A landing on develop runs it too: those runs save the cargo cache every pull request
+  # restores (#919). A schedule runs main's copy of this file, so it cannot be that source.
+  push:
+    branches: [develop]
     paths:
       - 'node-agent/**'
       - 'deploy/Dockerfile.vulkan'
@@ -89,9 +103,53 @@ jobs:
             echo "::error::$IMAGE is not the GStreamer deploy/pins.env pins (GST_VERSION=$want): it links $links and loads $loads."
             exit 1
           fi
+      # The cargo registry and target dir, so a run compiles only what changed instead of
+      # all ~250 crates (2.5 min, #919). Keyed on the toolchain image (its rustc and
+      # GStreamer) and the lockfile; a lockfile change restores the newest build for the
+      # same image. Only a push to develop saves: a pull request's save is visible to that
+      # pull request alone.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-registry
+            node-agent/target
+          key: agent-live-${{ steps.image.outputs.ref }}-${{ hashFiles('node-agent/Cargo.lock') }}
+          restore-keys: agent-live-${{ steps.image.outputs.ref }}-
+      # line-tables-only debug info keeps file:line in a test's backtrace at about a third
+      # of the target dir's size, which is what keeps this cache small enough to keep.
       - name: Test
         env:
           IMAGE: ${{ steps.image.outputs.ref }}
         run: |
+          mkdir -p "$RUNNER_TEMP/cargo-registry"
           docker run --rm --ulimit core=0 -v "$PWD":/workspace -w /workspace/node-agent \
+            -v "$RUNNER_TEMP/cargo-registry":/opt/cargo/registry \
+            -e CARGO_INCREMENTAL=0 -e CARGO_PROFILE_DEV_DEBUG=line-tables-only \
             -e QUASAR_REQUIRE_LIVE_WEBRTC=1 -e XDG_RUNTIME_DIR=/tmp "$IMAGE" cargo test --workspace
+      # Keep only the compiled dependencies, as rust-cache does in ci.yml: the test and
+      # binary executables and the workspace crates are rebuilt by every run anyway, and
+      # they are most of the 2.9 GB. Inside the image, because its root owns the files.
+      # Only before a save, and only after a passing test: the save step's implicit
+      # success() is what keeps a failed run's target out of the cache.
+      - name: Prune the cache to dependencies
+        if: github.event_name == 'push' && steps.cargo.outputs.cache-hit != 'true'
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          du -sh node-agent/target 2>/dev/null || true
+          docker run --rm -v "$PWD/node-agent":/n "$IMAGE" sh -c '
+            [ -d /n/target/debug ] || exit 0
+            cd /n/target/debug && [ "$(pwd -P)" = /n/target/debug ] || exit 1
+            rm -rf incremental examples
+            find . -maxdepth 1 -type f -delete
+            find deps -maxdepth 1 -type f -perm -u+x ! -name "*.so" -delete
+            find deps .fingerprint build -maxdepth 1 -name "*quasar*" -exec rm -rf {} +'
+          du -sh "$RUNNER_TEMP/cargo-registry" node-agent/target 2>/dev/null || true
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push' && steps.cargo.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-registry
+            node-agent/target
+          key: ${{ steps.cargo.outputs.cache-primary-key }}

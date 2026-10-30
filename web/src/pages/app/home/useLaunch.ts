@@ -10,7 +10,7 @@ import * as libraryApi from "../../../api/library";
 import { ApiError } from "../../../api/client";
 import type { App, ProfilesResponse, Session } from "../../../api/types";
 import { useToast } from "../../../components/Toast";
-import { playoutOverride } from "../../../webrtc/playout";
+import { playoutOverride } from "../../../webrtc/playoutOverride";
 import {
   CLOSING_RETRY_DELAY_MS,
   MAX_CLOSING_RETRY_WAIT_MS,

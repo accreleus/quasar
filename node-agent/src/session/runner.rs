@@ -852,18 +852,22 @@ fn in_place_plan(
 const IN_PLACE_QUIT_BOUND: Duration = Duration::from_secs(94);
 const IN_PLACE_LAUNCH_BOUND: Duration = Duration::from_secs(5);
 
-/// How long a session end waits for a running Steam game to quit and its exit cloud sync to
-/// end before the container stop (#742). The #759 spike measured close + sync at 2.8–9.3 s,
-/// uploads 1–3 s. Raise neither number alone: this bound, the 10 s container stop and the
+/// How long a session end waits for a Steam game to quit and its exit cloud sync to end before
+/// the container stop (#742); a game the player already quit has only the sync left (#810). The
+/// #759 spike measured close + sync at 2.8–9.3 s, uploads 1–3 s. Raise neither number alone: this bound, the 10 s container stop and the
 /// teardown after it must fit the web's 45 s closing wait (`MAX_CLOSING_RETRY_WAIT_MS`,
-/// `web/src/pages/app/capacityRetry.ts`), and it must cover the helper's timeline for a game
+/// `web/src/pages/app/capacityRetry.ts`). A container swap (#809) also spends it inside the
+/// swap budget: 20 s compositor + this bound + 10 s stop + 45 s app ready must stay under the
+/// web's 110 s (`CLIENT_SWAP_TIMEOUT_MS`) and the control plane's 120 s
+/// (`swapUnresolvedAfter`). It must cover the helper's timeline for a game
 /// that ignores the close (`QUIT_CLOSE_GRACE` 20 s, then SIGTERM: about 21–24 s to the sync).
 const END_QUIT_BOUND: Duration = Duration::from_secs(30);
 
-/// Any session end whose Steam game still runs (#742): quit the game the in-place swap's way
-/// and wait for Steam's cloud sync, at most [`END_QUIT_BOUND`]. No helper or no running game
-/// (held, parked, the game already exited) returns at once.
-fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
+/// Any session end with a Steam game that runs, or that the player just quit (#742, #810), and a
+/// container swap away from one (#809): quit the game the in-place swap's way and wait for
+/// Steam's cloud sync, at most [`END_QUIT_BOUND`]. `when` names the caller in the log lines. No
+/// helper, or no target game (held, parked), returns at once.
+fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>, when: &str) {
     use super::launch_helper::EndQuit;
     let Some(launch) = launch else {
         return;
@@ -880,7 +884,7 @@ fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
             tracing::info!(
                 token = "session-end-cloud-synced",
                 appid,
-                "session end: Steam app {appid} quit and its cloud sync ended in {:?}",
+                "{when}: Steam app {appid} quit and its cloud sync ended in {:?}",
                 started.elapsed()
             );
             return;
@@ -894,7 +898,7 @@ fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
             tracing::info!(
                 token = "session-end-no-cloud-sync",
                 appid,
-                "session end: Steam app {appid} quit with no exit cloud sync in {:?}",
+                "{when}: Steam app {appid} quit with no exit cloud sync in {:?}",
                 started.elapsed()
             );
             return;
@@ -914,7 +918,7 @@ fn quit_game_for_end(launch: Option<&super::launch_helper::LaunchSocket>) {
     tracing::warn!(
         token = "session-end-cloud-sync-unfinished",
         appid,
-        "session end: Steam app {appid} {why}; tearing down"
+        "{when}: Steam app {appid} {why}; tearing down"
     );
 }
 
@@ -1752,8 +1756,8 @@ fn replace_audio(
 /// Session ends only: the audio pipeline reports nothing after this
 /// (`AudioPipelineGuard::stop_reporting`), so a caller must never keep the session.
 ///
-/// A Steam game still running is quit and its cloud sync waited for (#742) once the
-/// client's media and input have ended and before the container goes. The source keeps
+/// A Steam game that runs, or that the player just quit, has its cloud sync waited for (#742,
+/// #810) once the client's media and input have ended and before the container goes. The source keeps
 /// running meanwhile, so the game can draw its way out.
 pub(crate) fn stop_source(
     source: &mut AppSource,
@@ -1769,23 +1773,25 @@ pub(crate) fn stop_source(
         "video transport released ahead of the source teardown"
     );
     transports.audio_pipeline.stop_reporting();
-    quit_game_for_end(launch);
+    quit_game_for_end(launch, "session end");
     source.teardown();
 }
 
 /// [`stop_source`] for a game the player quit (#726). The source stop can take seconds, so the
-/// browser is told first (#753). It does not wait for the game's exit cloud upload, which the
-/// container stop can cut (#810). `bye` must follow the `stopping` row on this ordered lane,
+/// browser is told first (#753). `launch` is the game's helper: the exit cloud sync is waited
+/// for before the container goes (#810); `None` where the game's sync was already waited for.
+/// `bye` must follow the `stopping` row on this ordered lane,
 /// because the control plane commits that row before it relays the next frame, and the web
 /// client answers `bye` by reading the row.
 pub(crate) fn stop_for_game_exit(
     emit: &dyn Fn(SessionEvent),
     source: &mut AppSource,
     transports: &SessionTransports,
+    launch: Option<&super::launch_helper::LaunchSocket>,
 ) {
     emit(SessionEvent::StoppingWith(GAME_EXITED_DETAIL));
     emit(SessionEvent::Signaling(SignalMsg::Bye));
-    stop_source(source, transports, None);
+    stop_source(source, transports, launch);
 }
 
 /// Should an idle `running` session be reaped? `Some(reason)` to reap. Pure so the policy
@@ -2660,7 +2666,7 @@ pub fn run_blocking(
                 session_id = %session_id,
                 "the Steam game exited; ending the session"
             );
-            stop_for_game_exit(&emit, &mut current_source, &transports);
+            stop_for_game_exit(&emit, &mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
             emit(SessionEvent::Stopped {
@@ -3303,7 +3309,7 @@ pub fn run_blocking(
                         reason,
                         "in-place swap failed: {reason}; the session ends"
                     );
-                    stop_for_game_exit(&emit, &mut current_source, &transports);
+                    stop_for_game_exit(&emit, &mut current_source, &transports, None);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
                     emit(SessionEvent::Stopped {
@@ -3845,7 +3851,8 @@ fn app_container_name(session_id: &str, gen: u64) -> String {
 /// Perform one serialised source swap. Step order is load-bearing:
 ///  1. Build + start the new generation's compositor and wait for its Wayland socket. The
 ///     outgoing app is untouched, so any failure up to here is a free rollback.
-///  2. Stop the outgoing app container and WAIT for it to exit. Mandatory, not an
+///  2. Quit a running Steam game and wait, up to `END_QUIT_BOUND`, for its exit cloud sync
+///     (#809), then stop the outgoing app container and WAIT for it to exit. Mandatory, not an
 ///     optimisation: both generations bind-mount the same managed home, and a second
 ///     instance of a home-locking app (Steam) finds the first's lock, hands off and exits
 ///     0 ~1.2 s later, which an overlapping design surfaced as `app exited (0)` right
@@ -3953,6 +3960,12 @@ fn perform_swap(
             SwapFailure::rolled_back(format!("verify replacement Vulkan context identity: {e:#}"))
         })?;
     }
+
+    // A Steam game the swap leaves behind gets a session end's quit and cloud-sync wait before
+    // its container goes (#809); the switch screen covers it. The runner loop is paused for up
+    // to the bound: a stop flag or a second swap is handled when this returns. The mute below
+    // clears the exit this quit makes the helper report.
+    quit_game_for_end(res.launch(), "container swap");
 
     // Past here the outgoing game closes because we closed it, not because the player
     // quit: stop reading the helper (#726). A rollback relaunch re-arms it.

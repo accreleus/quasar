@@ -162,6 +162,7 @@ beforeEach(() => {
   mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [] });
   // The head's "next check" fragment reads the detection job's schedule.
   mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
+  mocked.getSettings.mockResolvedValue({ settings: { release_check: null } } as never);
 });
 
 describe("FleetApplyButton", () => {

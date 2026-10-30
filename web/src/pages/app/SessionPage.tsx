@@ -55,6 +55,7 @@ import {
 import { LOCK_TO_STREAM_MS, SessionLoader } from "./SessionLoader";
 import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
+import { useMouseSettings } from "./useMouseSettings";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
 import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../input/launchFullscreen";
@@ -180,6 +181,21 @@ function SessionPageBody() {
   // Ref mirror so the keyboard-lock-refused callback (wired once per runtime
   // generation) reads the live verdict, not the value captured at wiring time.
   const certTrustRef = useRef<CertTrust>("unknown");
+  const rawNoticeRef = useRef(false);
+  // Every engage result goes through here, so a capture path added later cannot miss the notice.
+  // Said once per session view: every re-capture would otherwise repeat it.
+  const noteRawUnavailable = useCallback(
+    (result: { rawUnavailable?: boolean }) => {
+      if (!result.rawUnavailable || rawNoticeRef.current) return;
+      rawNoticeRef.current = true;
+      addToast({
+        variant: "info",
+        title: "Raw mouse input isn’t available",
+        body: "This browser can’t switch off mouse acceleration, so the mouse works as it normally does.",
+      });
+    },
+    [addToast],
+  );
   useEffect(() => {
     let cancelled = false;
     void probeCertificateTrust().then((verdict) => {
@@ -375,6 +391,14 @@ function SessionPageBody() {
     takeoverRefused,
   } = runtimeSnap;
 
+  // A quick-switch to another app re-resolves "Auto" for the new app.
+  const mouse = useMouseSettings(currentApp.id);
+  const mouseRef = useRef(mouse);
+  mouseRef.current = mouse;
+  useEffect(() => {
+    runtimeRef.current?.setMouse(mouse);
+  }, [mouse]);
+
   useEffect(() => {
     if (!signalCoords.url || !signalCoords.token || !videoRef.current) return;
 
@@ -439,6 +463,7 @@ function SessionPageBody() {
       },
     });
     runtimeRef.current = rt;
+    rt.setMouse(mouseRef.current);
     // Forwards to the page's stable fan-out set so a child that registered in
     // its own effect (children mount first) is never dropped.
     const unsubscribeTelemetry = rt.registerTelemetry((snap) => {
@@ -555,6 +580,7 @@ function SessionPageBody() {
         });
         return;
       }
+      noteRawUnavailable(result);
       if (result.mode === "failed") {
         // Must not silently degrade a lock-capable browser: say what happened.
         reportBestEffortFailure("silent-debug", "session: requestPointerLock", result.error);
@@ -570,7 +596,7 @@ function SessionPageBody() {
 
     // The HUD collapses itself when capture engages (Hud.tsx): the picture is
     // the point of capturing, and a shelf over it is not.
-  }, [addToast, sessionOver, unmute]);
+  }, [addToast, sessionOver, unmute, noteRawUnavailable]);
 
   // Mic spec §3.4: enable runs from the button click and is the only path
   // that calls getUserMedia; disable detaches the sender track and stops the device.
@@ -875,9 +901,10 @@ function SessionPageBody() {
       return;
     }
     void engaging.then((result) => {
+      noteRawUnavailable(result);
       if (result.mode === "failed") setClickToPlay(true);
     });
-  }, [loaderInert, swapScreenUp, sessionOver, runtimeSnap, unmute]);
+  }, [loaderInert, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
   useEffect(() => {
     if (inputCaptured) setClickToPlay(false);
   }, [inputCaptured]);

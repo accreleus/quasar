@@ -722,15 +722,22 @@ impl LaunchSocket {
         self.mount.shared.state().reports
     }
 
-    /// The session is ending with its game running (#742): send the in-place swap's
-    /// `quit <appid>` (close request, SIGTERM and SIGKILL fallbacks, then Steam's exit cloud
+    /// The session is ending with its game running (#742), or just quit by the player (#810;
+    /// the helper then waits on the exit sync it has tailed since its watch began): send the
+    /// in-place swap's `quit <appid>` (close request, SIGTERM and SIGKILL fallbacks, then Steam's exit cloud
     /// sync) and block up to `bound` for the helper's answer, so the container stop that
     /// follows does not cut the upload. Nothing is sent when no game is running.
+    ///
+    /// No liveness signal reaches here: a helper that died after `game_exited` is waited for up
+    /// to `bound`, like a slow sync.
     pub fn quit_running_game(&self, bound: Duration) -> EndQuit {
         let appid = {
             let state = self.mount.shared.state();
             match state.target {
-                Some(appid) if state.reports.launch_state == Some(LaunchState::GameRunning) => {
+                Some(appid)
+                    if state.reports.launch_state == Some(LaunchState::GameRunning)
+                        || state.reports.game_exited() =>
+                {
                     appid
                 }
                 _ => return EndQuit::NoGame,
@@ -1957,6 +1964,38 @@ mod tests {
     }
 
     #[test]
+    fn a_game_the_player_quit_gets_a_quit_so_its_exit_sync_is_waited_for() {
+        let (s, mut helper) = running_620();
+        helper.write_all(&state_line("game_exited")).unwrap();
+        s.wait_for(|r| r.game_exited());
+        let answer = std::thread::spawn(move || {
+            let command = read_line(&mut helper);
+            helper.write_all(b"\n").unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            helper
+                .write_all(b"{\"type\":\"command_done\",\"v\":1,\"command\":\"quit\",\"appid\":620,\"ok\":true,\"cloud_synced\":true}\n")
+                .unwrap();
+            (command, helper)
+        });
+        let started = Instant::now();
+        let end = s.socket().quit_running_game(Duration::from_secs(5));
+        let (command, _helper) = answer.join().unwrap();
+        assert_eq!(command, "quit 620\n");
+        assert!(
+            matches!(
+                end,
+                EndQuit::Done {
+                    ok: true,
+                    cloud_synced: true,
+                    ..
+                }
+            ),
+            "{end:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(500), "it waited");
+    }
+
+    #[test]
     fn a_session_end_whose_sync_never_ends_stops_waiting_at_the_bound() {
         let (s, _helper) = running_620();
         let bound = Duration::from_millis(400);
@@ -1987,16 +2026,11 @@ mod tests {
         // The helper never connected; a parked Steam with no game.
         quick(&Session::open(620));
         quick(&Session::open_parked());
-        // Steam up, no game yet; and a game the player already quit.
+        // Steam up, no game yet.
         let s = Session::open(620);
         let mut helper = s.connect();
         helper.write_all(CLIENT_ONLY).unwrap();
         s.wait_for(|r| r.launch_state == Some(LaunchState::ClientOnly));
-        quick(&s);
-        for state in ["game_running", "game_exited"] {
-            helper.write_all(&state_line(state)).unwrap();
-        }
-        s.wait_for(|r| r.launch_state == Some(LaunchState::GameExited));
         quick(&s);
         // The container (and the helper in it) exited with the game last seen running.
         let (s, _helper) = running_620();

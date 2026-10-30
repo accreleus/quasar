@@ -97,6 +97,259 @@
   max-width: 360px;
 }
 
+/* ---- region: language and region format ---- */
+.os-field-wide {
+  max-width: 560px;
+}
+
+.rg-ex {
+  display: block;
+  margin-top: var(--s1);
+  font-family: var(--font-mono);
+  color: var(--text-2);
+}
+
+/* ---- region: timezone list and world map ---- */
+.tz-pick {
+  display: grid;
+  grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+  gap: var(--s4);
+  align-items: start;
+}
+
+.tz-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  min-width: 0;
+}
+
+.tz-side .search {
+  min-width: 0;
+}
+
+.tz-list {
+  list-style: none;
+  margin: 0;
+  padding: var(--s1);
+  height: 236px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-3) transparent;
+  position: relative; /* offsetParent for opening on the saved zone */
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-control);
+  background-color: color-mix(in oklch, var(--surf-inset) 76%, transparent);
+}
+
+.tz-list:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--glow-accent);
+}
+
+.tz-list[aria-busy="true"] {
+  opacity: .6;
+}
+
+.tz-opt {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-height: 44px;
+  padding: var(--s1) var(--s3);
+  border-radius: var(--r-control);
+  cursor: pointer;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.tz-opt:hover,
+.tz-opt.is-active {
+  background: var(--row-hover);
+  color: var(--text);
+}
+
+.tz-opt.is-active {
+  box-shadow: inset 0 0 0 1px var(--line-3);
+}
+
+.tz-opt[aria-selected="true"] {
+  background: var(--accent-soft);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.tz-opt .tz-t {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.tz-opt .tz-name,
+.tz-opt .tz-sub {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tz-opt .tz-sub {
+  color: var(--text-3);
+  font-size: var(--t-xs);
+}
+
+.tz-opt .tz-off {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+/* On the accent-soft selection, muted text drops under 4.5:1 in light: DESIGN.md override #12. */
+.tz-opt[aria-selected="true"] .tz-sub,
+.tz-opt[aria-selected="true"] .tz-off {
+  color: var(--text-2);
+}
+
+.tz-opt.tz-follow {
+  margin-bottom: var(--s1);
+}
+
+.tz-sep {
+  height: 1px;
+  margin: 0 var(--s2) var(--s1);
+  background: var(--line-2);
+}
+
+.tz-box {
+  position: relative;
+}
+
+/* Reads inside the list box, under the Follow row (list padding, 44px row, its margin, rule and margin). */
+.tz-empty {
+  position: absolute;
+  top: calc(var(--s1) * 3 + 44px + 1px);
+  left: var(--s1);
+  right: var(--s1);
+  padding: var(--s3);
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  pointer-events: none;
+}
+
+/* Land dots are zero-length path segments drawn round by the stroke. */
+.tz-map {
+  position: relative;
+  min-width: 0;
+  padding: var(--s3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-panel);
+  background: color-mix(in oklch, var(--surf-inset) 76%, transparent);
+}
+
+.tz-map[aria-busy="true"] {
+  opacity: .6;
+}
+
+.tz-map svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  cursor: crosshair;
+  touch-action: manipulation;
+  user-select: none; /* a double-click picks a zone, not the label text */
+}
+
+.tz-map .land {
+  fill: none;
+  stroke: var(--line-3);
+  stroke-width: 4.2;
+  stroke-linecap: round;
+  transition: stroke .12s ease;
+}
+
+.tz-map .land.is-hover {
+  stroke: var(--text-2);
+}
+
+.tz-map .land.is-sel {
+  stroke: var(--accent);
+}
+
+.tz-map .city {
+  fill: var(--text);
+}
+
+.tz-map .mk-ring {
+  fill: var(--accent-soft);
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.tz-map .mk-dot {
+  fill: var(--text);
+  stroke: var(--accent);
+  stroke-width: 3.5;
+}
+
+.tz-map .mk-lbl rect {
+  fill: var(--pop-bg);
+  stroke: var(--glass-border);
+}
+
+.tz-map .mk-lbl text {
+  fill: var(--text);
+  font: 600 22px var(--font-ui);
+}
+
+.tz-tip {
+  position: absolute;
+  pointer-events: none;
+  padding: var(--s1) var(--s2);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-control);
+  background: var(--pop-bg);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  font-size: var(--t-xs);
+  white-space: nowrap;
+  transform: translate(-50%, calc(-100% - var(--s3)));
+}
+
+.tz-tip .num {
+  margin-left: var(--s2);
+  color: var(--text-3);
+}
+
+.tz-map-cap {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s3);
+  margin-top: var(--s2);
+  color: var(--text-3);
+  font-size: var(--t-xs);
+}
+
+@media (max-width: 1100px) {
+  .tz-pick {
+    grid-template-columns: 1fr;
+  }
+
+  .tz-list {
+    height: 200px;
+  }
+}
+
+@media (max-width: 600px) {
+  .tz-map {
+    display: none;
+  }
+
+  .tz-list {
+    height: 264px;
+  }
+}
+
 /* ---- devices ---- */
 .os-group + .os-group {
   margin-top: var(--s5);

@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/semver"
@@ -72,10 +74,26 @@ type Manifest struct {
 	// Floor is nil on a format-1 manifest and exactly two entries on a format-2 one.
 	// Decoded separately (ParseManifest) so its presence is known.
 	Floor []ManifestFloor `json:"-"`
+	// Preview: `version` is null, the preview manifest (amendment 48). Version is "".
+	Preview bool `json:"-"`
+	// Commits is the preview manifest's optional commit list; never set otherwise.
+	Commits []ManifestCommit `json:"-"`
 
 	// builtAt is the parsed BuiltAt, filled by ParseManifest.
 	builtAt time.Time
 }
+
+// ManifestCommit is one entry of a preview manifest's `commits`.
+type ManifestCommit struct {
+	Commit  string `json:"commit"`
+	Subject string `json:"subject"`
+}
+
+// Preview manifest bounds (control-api.md §"Platform-release preview channel").
+const (
+	maxManifestCommits      = 500
+	maxManifestSubjectRunes = 200
+)
 
 // BuiltAtTime is the parsed `built_at`, valid only on a Manifest ParseManifest
 // returned without error.
@@ -104,18 +122,38 @@ func ParseManifestAsset(raw []byte, format int) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("the asset carries format_version %d, but its name is the format-%d asset's",
 			m.FormatVersion, format)
 	}
+	if m.Preview {
+		return Manifest{}, fmt.Errorf("the asset's version is null, which only the preview manifest may carry")
+	}
 	return m, nil
 }
 
-// ParseManifest decodes and fully validates one manifest asset of either format.
-// Unknown keys are invalid at every level: the producer refuses to publish one, so
-// accepting it here would accept a document the workflow would not emit.
+// ParsePreviewManifest parses the document at the preview tag: format 2 with
+// `version` null (amendment 48). A release asset is not a preview manifest.
+func ParsePreviewManifest(raw []byte) (Manifest, error) {
+	m, err := ParseManifest(raw)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if !m.Preview {
+		return Manifest{}, fmt.Errorf("the preview manifest carries version %q; a preview build has none", m.Version)
+	}
+	return m, nil
+}
+
+// ParseManifest decodes and fully validates one manifest asset of either format,
+// or a preview manifest (format 2 with `version` null, which apply reads as any
+// other). Unknown keys are invalid at every level: the producer refuses to publish
+// one, so accepting it here would accept a document the workflow would not emit.
 func ParseManifest(raw []byte) (Manifest, error) {
-	// `floor` is decoded on its own so its PRESENCE is known: a format-1 manifest that
-	// carries one has an unknown key, and a format-2 one without it is missing a key.
+	// `version`, `floor` and `commits` are decoded on their own so their PRESENCE is
+	// known: a format-1 manifest that carries a floor has an unknown key, a format-2
+	// one without it is missing a key, and only a null version may carry commits.
 	var doc struct {
 		Manifest
-		Floor json.RawMessage `json:"floor"`
+		Version json.RawMessage `json:"version"`
+		Floor   json.RawMessage `json:"floor"`
+		Commits json.RawMessage `json:"commits"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
@@ -127,6 +165,29 @@ func ParseManifest(raw []byte) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("manifest carries trailing content after the object")
 	}
 	m := doc.Manifest
+	m.Preview = string(doc.Version) == "null"
+	if !m.Preview && doc.Version != nil {
+		if err := json.Unmarshal(doc.Version, &m.Version); err != nil {
+			return Manifest{}, fmt.Errorf("manifest version is not a string: %w", err)
+		}
+	}
+	if m.Preview {
+		if m.FormatVersion != ManifestFormat2 {
+			return Manifest{}, fmt.Errorf("manifest version is null on format_version %d; only the format-2 preview manifest has none", m.FormatVersion)
+		}
+		if m.Prerelease {
+			return Manifest{}, fmt.Errorf("the preview manifest is marked prerelease")
+		}
+		if doc.Commits != nil {
+			commits, err := parseManifestCommits(doc.Commits)
+			if err != nil {
+				return Manifest{}, err
+			}
+			m.Commits = commits
+		}
+	} else if doc.Commits != nil {
+		return Manifest{}, fmt.Errorf("manifest carries commits, which only the preview manifest may")
+	}
 
 	var components []string
 	switch m.FormatVersion {
@@ -150,18 +211,39 @@ func ParseManifest(raw []byte) (Manifest, error) {
 			m.FormatVersion, ManifestFormat1, ManifestFormat2)
 	}
 
+	var version *semver.Full
+	if !m.Preview {
+		v, err := releaseVersion(m)
+		if err != nil {
+			return Manifest{}, err
+		}
+		version = &v
+	}
+	if err := validateIdentity(&m, components); err != nil {
+		return Manifest{}, err
+	}
+	if m.FormatVersion == ManifestFormat2 {
+		if err := validateFloor(m.Floor, version); err != nil {
+			return Manifest{}, err
+		}
+	}
+	return m, nil
+}
+
+// releaseVersion validates a release manifest's version and its prerelease flag.
+func releaseVersion(m Manifest) (semver.Full, error) {
 	if strings.TrimSpace(m.Version) == "" {
-		return Manifest{}, fmt.Errorf("manifest has no version")
+		return semver.Full{}, fmt.Errorf("manifest has no version")
 	}
 	if strings.HasPrefix(m.Version, "v") {
-		return Manifest{}, fmt.Errorf("manifest version %q carries a leading v", m.Version)
+		return semver.Full{}, fmt.Errorf("manifest version %q carries a leading v", m.Version)
 	}
 	// The version is an ORDERING key on the beta channel (#121), so an
 	// unparseable one is a rejected manifest rather than a stored row the
 	// comparator then has to invent an order for.
 	version, ok := semver.ParseFull(m.Version)
 	if !ok {
-		return Manifest{}, fmt.Errorf("manifest version %q is not semver MAJOR.MINOR.PATCH[-prerelease]", m.Version)
+		return semver.Full{}, fmt.Errorf("manifest version %q is not semver MAJOR.MINOR.PATCH[-prerelease]", m.Version)
 	}
 	// The flag and the version string are two statements of the same fact, and
 	// two rules read DIFFERENT ones: stable hides a release by the flag, while
@@ -173,51 +255,53 @@ func ParseManifest(raw []byte) (Manifest, error) {
 		if version.IsPrerelease() {
 			has = "has"
 		}
-		return Manifest{}, fmt.Errorf("manifest prerelease=%v disagrees with version %q, which %s a prerelease part",
+		return semver.Full{}, fmt.Errorf("manifest prerelease=%v disagrees with version %q, which %s a prerelease part",
 			m.Prerelease, m.Version, has)
 	}
+	return version, nil
+}
+
+// validateIdentity validates what every format and the preview manifest share,
+// and fills m.builtAt.
+func validateIdentity(m *Manifest, components []string) error {
 	if !fullCommitRe.MatchString(m.SourceCommit) {
-		return Manifest{}, fmt.Errorf("manifest source_commit %q is not 40 lowercase hex", m.SourceCommit)
+		return fmt.Errorf("manifest source_commit %q is not 40 lowercase hex", m.SourceCommit)
 	}
 	// The ADR 0002 ordering key: a non-positive one orders below every real
 	// release and offers a downgrade.
 	if m.SchemaVersion <= 0 {
-		return Manifest{}, fmt.Errorf("manifest schema_version %d is not positive", m.SchemaVersion)
+		return fmt.Errorf("manifest schema_version %d is not positive", m.SchemaVersion)
 	}
 	built, err := time.Parse(time.RFC3339, m.BuiltAt)
 	if err != nil {
-		return Manifest{}, fmt.Errorf("manifest built_at %q is not RFC3339: %w", m.BuiltAt, err)
+		return fmt.Errorf("manifest built_at %q is not RFC3339: %w", m.BuiltAt, err)
 	}
 	m.builtAt = built.UTC()
 
 	if len(m.Components) != len(components) {
-		return Manifest{}, fmt.Errorf("manifest has %d components, want exactly %d",
+		return fmt.Errorf("manifest has %d components, want exactly %d",
 			len(m.Components), len(components))
 	}
 	for i, c := range m.Components {
 		if c.Name != components[i] {
-			return Manifest{}, fmt.Errorf("manifest component %d is %q, want %q (the order is normative)",
+			return fmt.Errorf("manifest component %d is %q, want %q (the order is normative)",
 				i, c.Name, components[i])
 		}
 		if err := validateImageRef(c.Image); err != nil {
-			return Manifest{}, fmt.Errorf("manifest component %q: %w", c.Name, err)
+			return fmt.Errorf("manifest component %q: %w", c.Name, err)
 		}
 		if !digestRe.MatchString(c.Digest) {
-			return Manifest{}, fmt.Errorf("manifest component %q digest %q is not sha256:<64 hex>",
+			return fmt.Errorf("manifest component %q digest %q is not sha256:<64 hex>",
 				c.Name, c.Digest)
 		}
 	}
-	if m.FormatVersion == ManifestFormat2 {
-		if err := validateFloor(m.Floor, version); err != nil {
-			return Manifest{}, err
-		}
-	}
-	return m, nil
+	return nil
 }
 
 // validateFloor: exactly the two entries in order, each a version of the top-level
 // grammar (no leading v, no build metadata) that does not order above the release.
-func validateFloor(floor []ManifestFloor, release semver.Full) error {
+// release is nil on the preview manifest, which has no version to compare with.
+func validateFloor(floor []ManifestFloor, release *semver.Full) error {
 	if len(floor) != len(manifestFloorComponents) {
 		return fmt.Errorf("manifest floor has %d entries, want exactly %d", len(floor), len(manifestFloorComponents))
 	}
@@ -230,11 +314,53 @@ func validateFloor(floor []ManifestFloor, release semver.Full) error {
 		if !ok {
 			return fmt.Errorf("manifest floor %q version %q is not semver MAJOR.MINOR.PATCH[-prerelease]", f.Name, f.Version)
 		}
-		if semver.ComparePrecedence(v, release) > 0 {
+		if release != nil && semver.ComparePrecedence(v, *release) > 0 {
 			return fmt.Errorf("manifest floor %q version %q orders above the release's own version", f.Name, f.Version)
 		}
 	}
 	return nil
+}
+
+// unsafeSubjectRune: a control character, a line or paragraph separator (U+2028,
+// U+2029) or a bidi control (U+202E and the rest) cannot sit in a one-line subject
+// a client prints as plain text. The producer strips the same set (#886).
+func unsafeSubjectRune(r rune) bool {
+	return unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp, unicode.Bidi_Control)
+}
+
+// parseManifestCommits validates a preview manifest's `commits`: at most 500
+// entries, each exactly a full commit and a one-line subject of at most 200
+// characters with no control, separator or bidi character. Markup stays: the client renders plain text.
+func parseManifestCommits(raw json.RawMessage) ([]ManifestCommit, error) {
+	if string(raw) == "null" {
+		return nil, fmt.Errorf("manifest commits is null; leave the key out instead")
+	}
+	var entries []struct {
+		Commit  string  `json:"commit"`
+		Subject *string `json:"subject"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&entries); err != nil {
+		return nil, fmt.Errorf("manifest commits are not in the documented shape: %w", err)
+	}
+	if len(entries) > maxManifestCommits {
+		return nil, fmt.Errorf("manifest carries %d commits, at most %d", len(entries), maxManifestCommits)
+	}
+	out := make([]ManifestCommit, 0, len(entries))
+	for i, e := range entries {
+		if !fullCommitRe.MatchString(e.Commit) {
+			return nil, fmt.Errorf("manifest commits[%d].commit %q is not 40 lowercase hex", i, e.Commit)
+		}
+		if e.Subject == nil {
+			return nil, fmt.Errorf("manifest commits[%d] has no subject", i)
+		}
+		if strings.IndexFunc(*e.Subject, unsafeSubjectRune) >= 0 || utf8.RuneCountInString(*e.Subject) > maxManifestSubjectRunes {
+			return nil, fmt.Errorf("manifest commits[%d].subject is not one line of at most %d characters", i, maxManifestSubjectRunes)
+		}
+		out = append(out, ManifestCommit{Commit: e.Commit, Subject: *e.Subject})
+	}
+	return out, nil
 }
 
 // strictVersion parses MAJOR.MINOR.PATCH[-prerelease] with no leading v and no build

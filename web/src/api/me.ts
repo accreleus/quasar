@@ -36,3 +36,21 @@ export function patchUIPreferences(
     token,
   });
 }
+
+export type RegionInputWire = components["schemas"]["RegionInputSettings"];
+
+/** `GET /v1/me/region-input` — the caller's Region and Input settings and the install defaults. */
+export function getRegionInput(token: string): Promise<RegionInputWire> {
+  return apiFetch<RegionInputWire>("/me/region-input", { token });
+}
+
+/**
+ * `PATCH /v1/me/region-input` — partial, one level deep: absent is unchanged, null
+ * clears, `keyboard` is replaced whole (control-api.md §Region and Input settings).
+ */
+export function patchRegionInput(
+  token: string,
+  patch: Pick<RegionInputWire, "region" | "input">,
+): Promise<RegionInputWire> {
+  return apiFetch<RegionInputWire>("/me/region-input", { method: "PATCH", body: patch, token });
+}

@@ -193,6 +193,15 @@ func TestAClosingConnectionDoesNotReopenAHostAReconnectClaimed(t *testing.T) {
 		t.Fatalf("first enrollment: %+v", first)
 	}
 	waitUntil(t, "the first connection to be registered", func() bool { return holds(registry, hostID, old) })
+	// The connection is added to the registry before its capacity handshake runs, and the
+	// handshake reads no close until it is done. A handshake still writing the host row
+	// when the reconnect takes its lock waits on that lock, so the close below is never
+	// read and no markOffline waits (#925).
+	waitUntil(t, "the first connection's capacity to be applied", func() bool {
+		var cores *int
+		_ = pool.QueryRow(ctx, `SELECT cpu_cores FROM hosts WHERE id = $1::uuid`, hostID).Scan(&cores)
+		return cores != nil
+	})
 
 	inTx.armed.Store(true)
 	reconnected := make(chan *websocket.Conn, 1)
@@ -209,7 +218,7 @@ func TestAClosingConnectionDoesNotReopenAHostAReconnectClaimed(t *testing.T) {
 	waitUntil(t, "the closing connection's markOffline to wait on the reconnect's row lock", func() bool {
 		var waiting bool
 		_ = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND query LIKE '%agent_disconnected_at=now()%')`).Scan(&waiting)
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%agent_disconnected_at=now()%')`).Scan(&waiting)
 		return waiting
 	})
 	committed.armed.Store(true)
@@ -218,7 +227,7 @@ func TestAClosingConnectionDoesNotReopenAHostAReconnectClaimed(t *testing.T) {
 	waitUntil(t, "the closing connection's markOffline to finish", func() bool {
 		var running bool
 		_ = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-			WHERE pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%agent_disconnected_at=now()%')`).Scan(&running)
+			WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%agent_disconnected_at=now()%')`).Scan(&running)
 		return !running
 	})
 
@@ -278,7 +287,7 @@ func TestReconnectWaitingOnARotatingEnrollmentIsRefused(t *testing.T) {
 	waitUntil(t, "the reconnect's write to wait on the enrollment's row lock", func() bool {
 		var waiting bool
 		_ = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND query LIKE '%WITH old AS%')`).Scan(&waiting)
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%WITH old AS%')`).Scan(&waiting)
 		return waiting
 	})
 	close(release)

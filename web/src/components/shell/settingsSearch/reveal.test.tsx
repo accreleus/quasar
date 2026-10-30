@@ -4,7 +4,7 @@
 import { act, render } from "@testing-library/react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { revealWhenReady, useCancelRevealOnNavigation } from "./reveal";
+import { cancelReveal, revealWhenReady, useCancelRevealOnNavigation } from "./reveal";
 
 let nav!: ReturnType<typeof useNavigate>;
 let key = "";
@@ -47,6 +47,14 @@ describe("revealWhenReady", () => {
     });
     await wait(60);
     act(() => nav(-1));
+    await wait(2000);
+    expect(document.activeElement).not.toBe(target());
+  });
+
+  it("cancelReveal ends the wait", async () => {
+    mount();
+    act(() => revealWhenReady({ sel: "#target" }, key, false));
+    cancelReveal();
     await wait(2000);
     expect(document.activeElement).not.toBe(target());
   });

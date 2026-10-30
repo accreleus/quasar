@@ -328,6 +328,45 @@ describe("SessionPage — #647 straight-in capture", () => {
     expect(engageSpy).toHaveBeenCalledTimes(1);
   });
 
+  const rawToast = () => screen.queryAllByText("Raw mouse input isn’t available");
+
+  it("raw mouse refused: the straight-in capture says so once", async () => {
+    fsEl = document.documentElement;
+    engageSpy.mockImplementation(() => Promise.resolve({ mode: "pointer-lock", rawUnavailable: true }));
+    await reveal();
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+    expect(rawToast()).toHaveLength(1);
+  });
+
+  it("raw mouse refused: Click to play says so too, and the two capture paths say it once between them", async () => {
+    engageSpy.mockImplementation(() => Promise.resolve({ mode: "pointer-lock", rawUnavailable: true }));
+    await reveal();
+    expect(rawToast()).toHaveLength(0);
+    await act(async () => {
+      fireEvent.click(screen.getByText("Click to play"));
+    });
+    expect(rawToast()).toHaveLength(1);
+  });
+
+  it("raw mouse refused on both paths in one view: one notice", async () => {
+    fsEl = document.documentElement;
+    engageSpy.mockImplementation(() => Promise.resolve({ mode: "failed", rawUnavailable: true }));
+    await reveal();
+    expect(rawToast()).toHaveLength(1);
+    expect(playLayer()).not.toBeNull(); // the straight-in capture failed, so the layer offers a retry
+    engageSpy.mockImplementation(() => Promise.resolve({ mode: "pointer-lock", rawUnavailable: true }));
+    await act(async () => {
+      fireEvent.click(screen.getByText("Click to play"));
+    });
+    expect(rawToast()).toHaveLength(1);
+  });
+
+  it("raw mouse granted: no notice", async () => {
+    fsEl = document.documentElement;
+    await reveal();
+    expect(rawToast()).toHaveLength(0);
+  });
+
   it("with the setting off, never engages at the reveal, shows no layer, and passes no release hint", async () => {
     localStorage.setItem(PREFS_KEY, JSON.stringify({ scalingMode: "contain", launchImmersive: false }));
     fsEl = document.documentElement;

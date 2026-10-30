@@ -119,6 +119,9 @@ type Settings struct {
 	// cannot express a git ref name — and is never cleared by a channel switch.
 	ReleaseChannel    string `json:"release_channel"`
 	ReleaseEdgeBranch string `json:"release_edge_branch"`
+	// How often release detection runs: "daily", "weekly", or null to follow the
+	// channel (ReleaseCheckPeriod). A channel switch never changes it.
+	ReleaseCheck *string `json:"release_check"`
 
 	// Where a detected platform release is announced outside the console
 	// (migration 0080, #123). The URL is operator-supplied and https-only; the
@@ -138,6 +141,9 @@ type Settings struct {
 	SteamWarmEnabled     bool   `json:"steam_warm_enabled"`
 	SteamWarmRewarm      string `json:"steam_warm_rewarm"`
 	SteamWarmIdleMinutes int    `json:"steam_warm_idle_minutes"`
+
+	// Region and Input install defaults (amendment 49, migration 0108).
+	RegionInputDefaults
 
 	UpdatedBy *string   `json:"updated_by"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -177,9 +183,10 @@ func ValidLibraryDiscoveryIntervalMinutes(n int) bool {
 // Platform-release channel + edge branch (schema.md instance_settings,
 // migration 0074; semantics: control-api.md §Platform releases).
 const (
-	ReleaseChannelStable = "stable"
-	ReleaseChannelEdge   = "edge"
-	ReleaseChannelBeta   = "beta"
+	ReleaseChannelStable  = "stable"
+	ReleaseChannelEdge    = "edge"
+	ReleaseChannelBeta    = "beta"
+	ReleaseChannelPreview = "preview"
 
 	DefaultReleaseEdgeBranch = "develop"
 
@@ -190,7 +197,32 @@ const (
 // ValidReleaseChannel mirrors the instance_settings CHECK so the PATCH handler
 // answers 400 validation_failed instead of a database error.
 func ValidReleaseChannel(c string) bool {
-	return c == ReleaseChannelStable || c == ReleaseChannelEdge || c == ReleaseChannelBeta
+	return c == ReleaseChannelStable || c == ReleaseChannelEdge || c == ReleaseChannelBeta ||
+		c == ReleaseChannelPreview
+}
+
+// release_check values (schema.md instance_settings, migration 0107).
+const (
+	ReleaseCheckDaily  = "daily"
+	ReleaseCheckWeekly = "weekly"
+)
+
+// ReleaseCheckPeriod is platform.release_detect's period: release_check, or when
+// it is NULL the channel's default, daily on preview and weekly otherwise.
+func ReleaseCheckPeriod(check *string, channel string) time.Duration {
+	daily := channel == ReleaseChannelPreview
+	if check != nil {
+		daily = *check == ReleaseCheckDaily
+	}
+	if daily {
+		return 24 * time.Hour
+	}
+	return 7 * 24 * time.Hour
+}
+
+// ValidReleaseCheck mirrors the release_check CHECK; null is handled by the caller.
+func ValidReleaseCheck(c string) bool {
+	return c == ReleaseCheckDaily || c == ReleaseCheckWeekly
 }
 
 // The column is TEXT with no CHECK; this is the contract's bound.
@@ -292,6 +324,7 @@ func (s *Store) Get(ctx context.Context) (Settings, error) {
 			PlatformAutoApply:     false,
 			SteamWarmRewarm:       SteamWarmRewarmLibraryOpen,
 			SteamWarmIdleMinutes:  DefaultSteamWarmIdleMinutes,
+			RegionInputDefaults:   BuiltInRegionInputDefaults,
 			UpdatedAt:             time.Now().UTC(),
 		}, nil
 	}
@@ -424,6 +457,15 @@ func (s *Store) ReleaseChannel(ctx context.Context) (channel, edgeBranch string,
 	return st.ReleaseChannel, st.ReleaseEdgeBranch, nil
 }
 
+// ReleaseCheckPeriod is the detection job's period, read at every scheduling decision.
+func (s *Store) ReleaseCheckPeriod(ctx context.Context) (time.Duration, error) {
+	st, err := s.Get(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return ReleaseCheckPeriod(st.ReleaseCheck, st.ReleaseChannel), nil
+}
+
 // ReleaseWebhook is the notifier's per-pass read (#123): never cached at boot,
 // so disabling it stops delivery with no restart. A read error reports disabled
 // alongside the error, so a caller that ignores it still fails closed.
@@ -452,23 +494,26 @@ func (s *Store) PlatformAutoApply(ctx context.Context) (bool, error) {
 const settingsColumns = `registration_mode, storage_provider, library_discovery_enabled,
 	library_discovery_interval_minutes, library_discovery_appdetails_enabled,
 	mic_capture_enabled, image_update_policy, allowed_origins,
-	release_channel, release_edge_branch,
+	release_channel, release_edge_branch, release_check,
 	release_webhook_enabled, release_webhook_url, platform_auto_apply,
 	steam_preparation_enabled, steam_preparation_revision::text,
-	steam_warm_enabled, steam_warm_rewarm, steam_warm_idle_minutes, updated_by::text, updated_at`
+	steam_warm_enabled, steam_warm_rewarm, steam_warm_idle_minutes,
+	` + RegionInputDefaultsColumns + `, updated_by::text, updated_at`
 
 // scanner is the shared surface of pgx.Row and pgx.Rows.
 type scanner interface{ Scan(dest ...any) error }
 
 func scanSettings(row scanner) (Settings, error) {
 	var st Settings
-	err := row.Scan(&st.RegistrationMode, &st.StorageProvider, &st.LibraryDiscoveryEnabled,
+	dest := []any{&st.RegistrationMode, &st.StorageProvider, &st.LibraryDiscoveryEnabled,
 		&st.LibraryDiscoveryIntervalMinutes, &st.LibraryDiscoveryAppDetailsEnabled,
 		&st.MicCaptureEnabled, &st.ImageUpdatePolicy, &st.AllowedOrigins,
-		&st.ReleaseChannel, &st.ReleaseEdgeBranch,
+		&st.ReleaseChannel, &st.ReleaseEdgeBranch, &st.ReleaseCheck,
 		&st.ReleaseWebhookEnabled, &st.ReleaseWebhookURL, &st.PlatformAutoApply,
 		&st.SteamPreparationEnabled, &st.SteamPreparationRevision,
-		&st.SteamWarmEnabled, &st.SteamWarmRewarm, &st.SteamWarmIdleMinutes, &st.UpdatedBy, &st.UpdatedAt)
+		&st.SteamWarmEnabled, &st.SteamWarmRewarm, &st.SteamWarmIdleMinutes}
+	dest = append(dest, regionInputDefaultsDest(&st.RegionInputDefaults)...)
+	err := row.Scan(append(dest, &st.UpdatedBy, &st.UpdatedAt)...)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -497,11 +542,17 @@ type Patch struct {
 	ReleaseWebhookEnabled             *bool
 	// A pointer to a string, and "" is the CLEAR — unlike release_edge_branch,
 	// which is never cleared. "No webhook configured" has to be expressible.
-	ReleaseWebhookURL    *string
+	ReleaseWebhookURL *string
+	// release_check has three states, so a pointer is not enough: absent is
+	// unchanged (ReleaseCheckSet false), set with a nil ReleaseCheck is the
+	// explicit null that follows the channel again.
+	ReleaseCheckSet      bool
+	ReleaseCheck         *string
 	PlatformAutoApply    *bool
 	SteamWarmEnabled     *bool
 	SteamWarmRewarm      *string
 	SteamWarmIdleMinutes *int
+	RegionInput          RegionInputPatch
 }
 
 // ChangedKeys lists the fields this patch sets, for the audit row. Names only —
@@ -525,6 +576,7 @@ func (p Patch) ChangedKeys() []string {
 		{"release_edge_branch", p.ReleaseEdgeBranch != nil},
 		{"release_webhook_enabled", p.ReleaseWebhookEnabled != nil},
 		{"release_webhook_url", p.ReleaseWebhookURL != nil},
+		{"release_check", p.ReleaseCheckSet},
 		{"platform_auto_apply", p.PlatformAutoApply != nil},
 		{"steam_warm_enabled", p.SteamWarmEnabled != nil},
 		{"steam_warm_rewarm", p.SteamWarmRewarm != nil},
@@ -534,7 +586,7 @@ func (p Patch) ChangedKeys() []string {
 			keys = append(keys, f.name)
 		}
 	}
-	return keys
+	return append(keys, p.RegionInput.changedKeys()...)
 }
 
 // Empty reports whether the patch names no known field.
@@ -543,9 +595,10 @@ func (p Patch) Empty() bool {
 		p.LibraryDiscoveryIntervalMinutes == nil && p.LibraryDiscoveryAppDetailsEnabled == nil &&
 		p.MicCaptureEnabled == nil && p.ImageUpdatePolicy == nil && p.AllowedOrigins == nil &&
 		p.ReleaseChannel == nil && p.ReleaseEdgeBranch == nil &&
-		p.ReleaseWebhookEnabled == nil && p.ReleaseWebhookURL == nil &&
+		p.ReleaseWebhookEnabled == nil && p.ReleaseWebhookURL == nil && !p.ReleaseCheckSet &&
 		p.PlatformAutoApply == nil &&
-		p.SteamWarmEnabled == nil && p.SteamWarmRewarm == nil && p.SteamWarmIdleMinutes == nil
+		p.SteamWarmEnabled == nil && p.SteamWarmRewarm == nil && p.SteamWarmIdleMinutes == nil &&
+		p.RegionInput.empty()
 }
 
 // Apply writes every provided field in one statement inside one transaction —
@@ -590,6 +643,11 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		origins = list
 	}
 
+	ri := p.RegionInput
+	var kbLayout, kbVariant *string
+	if ri.Keyboard != nil {
+		kbLayout, kbVariant = &ri.Keyboard.Layout, &ri.Keyboard.Variant
+	}
 	st, err = scanSettings(tx.QueryRow(ctx, `
 		UPDATE instance_settings AS s SET
 		    registration_mode                    = COALESCE($1::text,    s.registration_mode),
@@ -602,12 +660,23 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		    allowed_origins                      = COALESCE($8::text[],  s.allowed_origins),
 		    release_channel                      = COALESCE($9::text,    s.release_channel),
 		    release_edge_branch                  = COALESCE($10::text,   s.release_edge_branch),
+		    release_check                        = CASE WHEN $19::boolean THEN $20::text ELSE s.release_check END,
 		    release_webhook_enabled              = COALESCE($13::boolean, s.release_webhook_enabled),
 		    release_webhook_url                  = COALESCE($14::text,    s.release_webhook_url),
 		    platform_auto_apply                  = COALESCE($15::boolean, s.platform_auto_apply),
 		    steam_warm_enabled                   = COALESCE($16::boolean, s.steam_warm_enabled),
 		    steam_warm_rewarm                    = COALESCE($17::text,    s.steam_warm_rewarm),
 		    steam_warm_idle_minutes              = COALESCE($18::int,     s.steam_warm_idle_minutes),
+		    default_timezone          = COALESCE($21::text,    s.default_timezone),
+		    default_language          = COALESCE($22::text,    s.default_language),
+		    default_region_format     = CASE WHEN $23::boolean THEN $24::text ELSE s.default_region_format END,
+		    default_keyboard_layout   = COALESCE($25::text,    s.default_keyboard_layout),
+		    default_keyboard_variant  = COALESCE($26::text,    s.default_keyboard_variant),
+		    default_match_cursor      = COALESCE($27::text,    s.default_match_cursor),
+		    default_mouse_sensitivity = COALESCE($28::float8,  s.default_mouse_sensitivity),
+		    default_raw_mouse         = COALESCE($29::boolean, s.default_raw_mouse),
+		    default_flip_scroll       = COALESCE($30::boolean, s.default_flip_scroll),
+		    default_nintendo_layout   = COALESCE($31::boolean, s.default_nintendo_layout),
 		    steam_preparation_enabled = COALESCE($12::boolean, s.steam_preparation_enabled),
  steam_preparation_revision = s.steam_preparation_revision + CASE WHEN $12::boolean IS NOT NULL AND $12::boolean IS DISTINCT FROM s.steam_preparation_enabled THEN 1 ELSE 0 END,
  updated_by                           = $11::uuid
@@ -618,7 +687,10 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		p.MicCaptureEnabled, p.ImageUpdatePolicy, origins,
 		p.ReleaseChannel, p.ReleaseEdgeBranch, updatedBy, p.SteamPreparationEnabled,
 		p.ReleaseWebhookEnabled, p.ReleaseWebhookURL, p.PlatformAutoApply,
-		p.SteamWarmEnabled, p.SteamWarmRewarm, p.SteamWarmIdleMinutes))
+		p.SteamWarmEnabled, p.SteamWarmRewarm, p.SteamWarmIdleMinutes,
+		p.ReleaseCheckSet, p.ReleaseCheck,
+		ri.Timezone, ri.Language, ri.RegionFormatSet, ri.RegionFormat, kbLayout, kbVariant,
+		ri.MatchCursor, ri.MouseSensitivity, ri.RawMouse, ri.FlipScroll, ri.NintendoLayout))
 	if err != nil {
 		return Settings{}, false, fmt.Errorf("update instance_settings: %w", err)
 	}

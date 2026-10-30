@@ -84,6 +84,10 @@ renumbered to their public issues.
 - **`main` = production.** Any merge INTO `main` requires **explicit human sign-off from the operator**. Never merge to `main` autonomously — not even a green feature branch.
 - **`develop` = persistent, unstable integration branch.** All day-to-day work targets it.
 - **Workflow:** branch off `develop` → do the work → merge **back into `develop`** with **no PR required**. Feature-branch → `develop` is self-serve; `develop` → `main` is the only sign-off gate. Default: `git checkout develop && git pull && git checkout -b <feature>`; land with `git checkout develop && git merge <feature>`. **A streaming-path change runs `make bench-check` before that merge** and closes out by publishing or updating its bench report (`make report-publish`, or `qbench sprint put` at sprint end) — see "Performance evidence (quasar-bench)" below and the landing sequence in `AGENTS.md`.
+- **CI runs on every push to `develop` (all jobs) and on pull requests into `develop` (only the
+  jobs whose area changed, `scripts/verify/ci-changed-areas.sh`).** The push run carries the
+  checks `main` requires, so the develop → main release PR needs no run of its own. A pull request
+  into `main` from any other branch gets no automatic run: dispatch CI on its branch first.
 - **Push branches to origin as you go — "no PR required" does not mean "no push".** Origin is
   how concurrent agents and other machines see in-flight work; a local-only branch is invisible
   to all of them. The 2026-08-31 develop merge is the cautionary tale: a multi-day local-only
@@ -134,8 +138,11 @@ docker run --rm -v "$PWD":/workspace -w /workspace/node-agent quasar-agent-dev:l
   skipped (it builds + vets + tests in `golang:1.24` but wires no database). To actually exercise
   them, run **`make test-db`** — the sanctioned path: it provisions a FRESH ephemeral Postgres on
   a per-worktree port (no shared-DB contamination, no port collisions between concurrent
-  sessions). `-p 1` is mandatory either way: the tests share one database and truncate in setup,
-  so package binaries must not run concurrently. **A control-plane ticket touching the DB is not
+  sessions). On ONE shared database `-p 1` is mandatory: the tests truncate in setup, so package
+  binaries must not run concurrently. CI instead runs `scripts/verify/go-test-parallel.sh`, which
+  gives each package its own database and runs several at once; a test that reads
+  `pg_stat_activity` or `pg_locks` must scope the read to `current_database()` (the script
+  refuses one that does not). **A control-plane ticket touching the DB is not
   DONE until the DB tests ran green, not just `go-check`.** (`scripts/dev/dev.sh go-test-db` still
   exists and attaches the long-lived `quasar-pg3` Postgres on the `quasar-p3-test` docker
   network; that shared database is stateful across runs, so prefer `make test-db`.)

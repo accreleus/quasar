@@ -136,7 +136,7 @@ func TestPlacementRemovalRacingLaunchExcludesNewReservation(t *testing.T) {
 	for time.Now().Before(deadline) {
 		var waiting int
 		must(t, pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE wait_event_type='Lock' AND query LIKE '%FROM app_placement%FOR SHARE%'`).Scan(&waiting))
+			WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%FROM app_placement%FOR SHARE%'`).Scan(&waiting))
 		if waiting > 0 {
 			blocked = true
 			break

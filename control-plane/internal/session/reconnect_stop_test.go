@@ -239,7 +239,7 @@ func TestHeartbeatMissingPreservesConcurrentTerminalEvidence(t *testing.T) {
 	go func() { defer close(done); coord.AgentHeartbeat(ctx, seeded.hostID, []string{}) }()
 	waitFor(t, func() bool {
 		var blocked bool
-		err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1::integer = ANY(pg_blocking_pids(pid)))`, int(tx.Conn().PgConn().PID())).Scan(&blocked)
+		err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND $1::integer = ANY(pg_blocking_pids(pid)))`, int(tx.Conn().PgConn().PID())).Scan(&blocked)
 		return err == nil && blocked
 	})
 	must(t, tx.Commit(ctx))

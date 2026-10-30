@@ -21,8 +21,8 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use quasar_launch_watch::{
-    appid_from_flags, parse_command, CloudEnd, Command, LaunchState, NeedsUser, Quit, QuitAction,
-    Report, WatchConfig, Watcher, WindowInfo, Windows, STEAM_CLIENT_APPID,
+    appid_from_flags, parse_command, CloudEnd, CloudSync, Command, LaunchState, NeedsUser, Quit,
+    QuitAction, Report, WatchConfig, Watcher, WindowInfo, Windows, STEAM_CLIENT_APPID,
 };
 use x11rb::connection::Connection;
 use x11rb::cookie::Cookie;
@@ -119,6 +119,10 @@ struct Helper {
     /// The controller notice: pinned to Steam's window, then answered, at most once a launch.
     notice: Notice,
     quit: Option<Quit>,
+    /// The watched game's cloud log, read from when the watch began, and whether this watch has
+    /// reported the game's exit. Only a quit after that exit waits on it for the exit sync (#810).
+    exit_sync: Option<(u32, CloudSync)>,
+    game_exited: bool,
     children: Vec<Child>,
     screen: Box<dyn Screen>,
     /// `steam` from `PATH`; a test points it at a stand-in.
@@ -151,6 +155,8 @@ impl Helper {
             needs_user: false,
             notice: Notice::Waiting,
             quit: None,
+            exit_sync: None,
+            game_exited: false,
             children: Vec::new(),
             screen: Box::<X11Windows>::default(),
             // The image's `steam` RPM puts it here; `PATH` only for an image without it.
@@ -180,6 +186,8 @@ impl Helper {
             watcher.answer_notice();
         }
         self.watcher = Some(watcher);
+        self.exit_sync = Some((appid, CloudSync::new(&self.log_dir, appid)));
+        self.game_exited = false;
         self.launched = launched;
         self.needs_user = false;
         self.notice = Notice::Waiting;
@@ -222,11 +230,16 @@ impl Helper {
                          its tree is signalled after the grace"
                     ),
                 }
+                // Commands run before the pass: an exit in this same tick must count as seen (#872).
+                self.poll_watcher(Instant::now(), agent);
                 self.quit = Some(Quit::new(
                     &self.proc_root,
                     &self.log_dir,
                     appid,
                     Instant::now(),
+                    self.exit_sync
+                        .take_if(|(watched, _)| self.game_exited && *watched == appid)
+                        .map(|(_, cloud)| cloud),
                 ));
             }
         }
@@ -261,17 +274,26 @@ impl Helper {
     fn pass(&mut self, now: Instant, agent: &mut Agent) {
         self.children
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
-        if let Some(watcher) = &mut self.watcher {
-            for report in watcher.poll_at(now) {
-                if matches!(report, Report::SteamNeedsUser(_)) {
-                    self.needs_user = true;
-                }
-                agent.send(report);
-            }
-        }
+        self.poll_watcher(now, agent);
         self.answer_notice(now);
         self.pin();
         self.step_quit(now, agent);
+    }
+
+    /// Poll the watcher and forward its reports, noting the ones the helper acts on.
+    fn poll_watcher(&mut self, now: Instant, agent: &mut Agent) {
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
+        for report in watcher.poll_at(now) {
+            if matches!(report, Report::SteamNeedsUser(_)) {
+                self.needs_user = true;
+            }
+            if matches!(report, Report::LaunchState(LaunchState::GameExited)) {
+                self.game_exited = true;
+            }
+            agent.send(report);
+        }
     }
 
     /// `dismiss_safe`: answer Steam's controller notice with one Return, and only when nothing
@@ -1200,6 +1222,103 @@ mod tests {
             lines,
             [r#"{"type":"launch_state","v":1,"state":"client_only"}"#]
         );
+    }
+
+    /// A helper watching 620 with an empty `/proc` and `Steam`'s logs, and a way to append to
+    /// the cloud log the way Steam does.
+    fn quitting(dir: &std::path::Path) -> (Helper, Agent, std::path::PathBuf, impl Fn(&str) + '_) {
+        let (proc, logs) = (dir.join("proc"), dir.join("logs"));
+        std::fs::create_dir_all(&proc).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        let mut helper = Helper::new(proc.clone(), logs.clone(), false);
+        helper.watch_with(620, true, Box::new(Fake(vec![])));
+        helper.screen = Box::new(Scene::default());
+        let agent = Agent::new("/nonexistent/launch.sock".into());
+        let append = move |what: &str| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(logs.join("cloud_log.txt"))
+                .unwrap();
+            writeln!(file, "[2026-10-26 12:00:00] [AppID 620] {what}").unwrap();
+        };
+        (helper, agent, proc, append)
+    }
+
+    /// The game's launch reaper, as the watcher's `/proc` scan reads it.
+    fn reaper_620(proc: &std::path::Path) {
+        let pid = proc.join("20");
+        std::fs::create_dir_all(&pid).unwrap();
+        std::fs::write(
+            pid.join("cmdline"),
+            b"/home/u/.local/share/Steam/ubuntu12_32/reaper\0SteamLaunch\0AppId=620\0--\0game\0",
+        )
+        .unwrap();
+        std::fs::write(pid.join("stat"), "20 (reaper) S 1 20 20 0 -1").unwrap();
+    }
+
+    /// #810: a `quit` after this watch saw the game exit waits on the exit sync tailed since the
+    /// watch began, whose start line was written before the command arrived.
+    #[test]
+    fn a_quit_after_the_game_exited_waits_on_the_sync_tailed_since_the_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut helper, mut agent, proc, append) = quitting(dir.path());
+        reaper_620(&proc);
+        let t = Instant::now();
+        helper.pass(t, &mut agent);
+        std::fs::remove_dir_all(proc.join("20")).unwrap();
+        helper.pass(t + PASS, &mut agent);
+        assert!(helper.game_exited, "the watch saw the exit");
+        append("Starting sync (up,AC Exit,)");
+        helper.command(Command::Quit(620), &mut agent);
+        helper.step_quit(t + Duration::from_secs(1), &mut agent);
+        assert!(
+            agent.latest[COMMAND_DONE].is_none(),
+            "the upload is awaited"
+        );
+        append("Upload complete in build list");
+        helper.step_quit(t + Duration::from_secs(2), &mut agent);
+        let line = agent.latest[COMMAND_DONE].clone().expect("quit answered");
+        assert!(line.contains("\"cloud_synced\":true"), "{line}");
+    }
+
+    /// #872: the game exits and a session end's `quit` arrives before the helper's next pass.
+    /// The command polls the watcher first, so the exit counts as seen and the sync is awaited.
+    #[test]
+    fn a_quit_in_the_same_tick_as_the_game_exit_waits_for_the_exit_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut helper, mut agent, proc, append) = quitting(dir.path());
+        reaper_620(&proc);
+        let t = Instant::now();
+        helper.pass(t, &mut agent);
+        std::fs::remove_dir_all(proc.join("20")).unwrap();
+        append("Starting sync (up,AC Exit,)");
+        assert!(!helper.game_exited, "no pass has run since the exit");
+        helper.command(Command::Quit(620), &mut agent);
+        assert!(helper.game_exited, "the quit polled the watcher");
+        helper.step_quit(Instant::now() + Duration::from_secs(1), &mut agent);
+        assert!(
+            agent.latest[COMMAND_DONE].is_none(),
+            "the upload is awaited"
+        );
+    }
+
+    /// An in-place swap's `quit` for a title that never reached a reaper (still loading, shader
+    /// replay, a sign-in wait) is answered at once, as it was before #810.
+    #[test]
+    fn a_quit_for_a_game_that_never_ran_is_answered_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut helper, mut agent, _proc, append) = quitting(dir.path());
+        let t = Instant::now();
+        helper.pass(t, &mut agent);
+        append("Starting sync (up,AC Exit,)");
+        helper.command(Command::Quit(620), &mut agent);
+        helper.step_quit(t, &mut agent);
+        let line = agent.latest[COMMAND_DONE]
+            .clone()
+            .expect("answered at once");
+        assert!(line.contains("\"cloud_sync_started\":false"), "{line}");
     }
 
     #[test]

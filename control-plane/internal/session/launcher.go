@@ -443,13 +443,20 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 			// session's outcome; only a still-assigned launch fails here.
 			if current, getErr := c.store.Get(c.ctx, sess.ID); getErr == nil && current.State == StateAssigned {
 				c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("image preparation failed: %v", err))
+			} else if getErr == nil {
+				c.endUnsentStopOnHost(sess.ID, sess.HostID)
 			}
 			return
 		}
 	}
 	// An operator may have stopped the session while preparation was pending.
 	current, err := c.store.Get(c.ctx, sess.ID)
-	if err != nil || current.State != StateAssigned {
+	if err != nil {
+		return
+	}
+	if current.State != StateAssigned {
+		// A no-op unless the row is a never-started `stopping` one (EndUnstartedStop).
+		c.endUnsentStopOnHost(sess.ID, sess.HostID)
 		return
 	}
 	c.dispatchAssignStart(sess, runtimeSpec, expected)
@@ -941,9 +948,10 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		return
 	}
 	hostID := *sess.HostID
-	app := runtimeSpec
-	if len(app) == 0 {
-		app = []byte("{}")
+	app, err := c.applyRegionInput(c.ctx, runtimeSpec, sess.UserID, sess.DeviceID)
+	if err != nil {
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("region and input values: %v", err))
+		return
 	}
 	// The resolved RUNG's ABR floor, for the agent's in-session governor. It must
 	// read the rung, not the launch profile: a chain has no single floor, and one
@@ -1022,6 +1030,13 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 		}
 		capable := epoch != nil && epoch.SupportsHomeCleanup()
 		hold, err := c.store.bindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable, expected)
+		if errors.Is(err, errSessionNotAssigned) {
+			// Whoever took the row owns its outcome and nothing reached the agent; a
+			// failure here would audit a session.failed for a clean stop.
+			c.log.Debug("dispatch abandoned: a stop owns the row", "session_id", sessionID, "err", err)
+			c.endUnsentStop(sessionID, epoch)
+			return false
+		}
 		if err != nil {
 			c.log.Error("managed home dispatch binding failed", "session_id", sessionID, "err", err)
 			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "managed home dispatch binding failed")
@@ -1058,6 +1073,38 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 	}
 	c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "assign dispatch failed: connection changed")
 	return false
+}
+
+// endUnsentStop ends a stopped launch no session command reached, when the
+// agent has no home-cleanup ledger (#940): it acks a stop for an id it never got
+// and reports nothing, so the row would keep its slot and home until the
+// connection drops. An agent with the ledger reports `stopped` itself. Only an
+// abandoned dispatch may call this: with an assign out, a start may follow it.
+func (c *Coordinator) endUnsentStop(sessionID string, epoch agentws.HomeCommandEpoch) {
+	if epoch == nil || epoch.SupportsHomeCleanup() {
+		return
+	}
+	sess, err := c.store.EndUnstartedStop(c.ctx, sessionID)
+	if errors.Is(err, ErrNotFound) {
+		return
+	}
+	if err != nil {
+		c.log.Error("end unsent stop failed", "session_id", sessionID, "err", err)
+		return
+	}
+	c.afterTerminal(sess, "control_plane")
+}
+
+func (c *Coordinator) endUnsentStopOnHost(sessionID string, hostID *string) {
+	provider, ok := c.dispatcher.(interface {
+		CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool)
+	})
+	if !ok || hostID == nil {
+		return
+	}
+	if epoch, connected := provider.CurrentHomeCommandEpoch(*hostID); connected {
+		c.endUnsentStop(sessionID, epoch)
+	}
 }
 
 // watchStartToRunning is the stuck-start watchdog (P2-06). A session still

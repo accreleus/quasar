@@ -12,31 +12,14 @@ import { lazy, Suspense, type ReactNode } from "react";
 import { Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
 import { RequireAdmin } from "./auth/RequireAdmin";
 import { RequireAuth } from "./auth/RequireAuth";
-import { LoginPage } from "./pages/LoginPage";
 import { NotFound } from "./pages/NotFound";
-import { RegisterPage } from "./pages/RegisterPage";
-import { SetupWizard } from "./pages/setup/SetupWizard";
 import { RequireClaimedInstance } from "./setup/RequireClaimedInstance";
-import { AccountLayout } from "./pages/app/account/AccountLayout";
-import {
-  AccountSection,
-  PreferencesSection,
-  UsageSection,
-} from "./pages/app/account/AccountSections";
-import { AccountOverlay } from "./pages/app/account/AccountOverlay";
-import { AccountProfile } from "./pages/app/account/AccountProfile";
-import { AccountDevices } from "./pages/app/account/AccountDevices";
-import { AccountSessions } from "./pages/app/account/AccountSessions";
-import { AccountStreaming } from "./pages/app/account/AccountStreaming";
-import { AccountAppearance } from "./pages/app/account/AccountAppearance";
 import { AppHomeNext } from "./pages/app/AppHomeNext";
-import { GamePageRoute } from "./pages/app/game/GamePage";
 import { AppLayout } from "./pages/app/AppLayout";
-import { AccountStorage } from "./pages/app/account/AccountStorage";
-import { SessionPage } from "./pages/app/SessionPage";
-import { StyleguidePage } from "./pages/StyleguidePage";
 import { RouteErrorBoundary, RouteSkeleton } from "./components/RouteBoundary";
-import { OverlayPreferencesRoute } from "./settings/OverlayPreferencesContext";
+import { OverlayPreferencesRoute, useOverlayPreferences } from "./settings/OverlayPreferencesContext";
+import { accountArea, gamePage, loginPage, sessionPage } from "./pages/lazyPages";
+import { loadSession } from "./auth/storage";
 
 // Admin area — lazy-loaded. Vite splits this into a separate chunk automatically
 // because of the dynamic import boundary. The Suspense fallback is intentionally
@@ -52,6 +35,54 @@ const Suspended = ({ children }: { children: ReactNode }) => (
     <Suspense fallback={<RouteSkeleton />}>{children}</Suspense>
   </RouteErrorBoundary>
 );
+
+// Sign-in is a signed-out visit's first paint: index.html preloads it on /login, and
+// any visit with no stored session (bound for /login) starts it here.
+if (typeof location !== "undefined" && (location.pathname.startsWith("/login") || !loadSession())) loginPage.preload();
+const LoginPage = loginPage.component("LoginPage");
+
+// The full-screen session view (WebRTC, input, HUD) and the game page load when
+// first needed; the library preloads them on hover, focus and idle (lazyPages.ts).
+// A reload or shared link straight onto one has no library to do that: index.html
+// requests the chunks (routePreloads in vite.config.ts) and App starts the import.
+if (typeof location !== "undefined") {
+  if (location.pathname.startsWith("/app/session/")) sessionPage.preload();
+  else if (location.pathname.startsWith("/app/game/")) gamePage.preload();
+}
+const SessionPage = sessionPage.component("SessionPage");
+const GamePageRoute = gamePage.component("GamePageRoute");
+
+// Routes a signed-in player never visits.
+const RegisterPage = lazyPage(() =>
+  import("./pages/RegisterPage").then((m) => ({ default: m.RegisterPage }))
+);
+// First-run setup: admin-only and once per install. What it shares with the admin
+// pages is grouped in vite.config.ts (ADMIN_SHARED), preloaded with /admin.
+const SetupWizard = lazyPage(() =>
+  import("./pages/setup/SetupWizard").then((m) => ({ default: m.SetupWizard }))
+);
+const StyleguidePage = lazyPage(() =>
+  import("./pages/StyleguidePage").then((m) => ({ default: m.StyleguidePage }))
+);
+
+// The account area loads as one chunk (pages/app/account/area.ts). A deep link
+// into it preloads that chunk from index.html (routePreloads in vite.config.ts),
+// and App starts the import as soon as it loads on an account URL.
+if (typeof location !== "undefined" && location.pathname.startsWith("/app/account")) accountArea.preload();
+const accountPage = accountArea.component;
+const account = {
+  Layout: accountPage("AccountLayout"),
+  AccountSection: accountPage("AccountSection"),
+  PreferencesSection: accountPage("PreferencesSection"),
+  UsageSection: accountPage("UsageSection"),
+  Overlay: accountPage("AccountOverlay"),
+  Profile: accountPage("AccountProfile"),
+  Devices: accountPage("AccountDevices"),
+  Sessions: accountPage("AccountSessions"),
+  Streaming: accountPage("AccountStreaming"),
+  Appearance: accountPage("AccountAppearance"),
+  Storage: accountPage("AccountStorage"),
+};
 
 // Admin pages table: each entry is a separate lazy() chunk boundary.
 const adminPages = {
@@ -152,6 +183,13 @@ const adminPages = {
   ),
 };
 
+/** A Classic-only redirect: the new design renders one page for these paths. Waits for the
+ *  saved layout, so a stale local mirror cannot redirect a new-design user. */
+function ClassicRedirect({ to }: { to: string }) {
+  const { loaded, newDesign } = useOverlayPreferences();
+  return loaded && !newDesign ? <Navigate to={to} replace /> : null;
+}
+
 /**
  * A legacy path kept alive. Substitutes the matched route params into `to`
  * (`/admin/fleet/hosts/:id/console` -> `/admin/fleet/hosts/:id/console`) and carries
@@ -181,15 +219,15 @@ export function App() {
     <RequireClaimedInstance>
     <Routes>
       <Route path="/" element={<Navigate to="/app" replace />} />
-      <Route path="/login" element={<LoginPage />} />
-      <Route path="/register" element={<RegisterPage />} />
+      <Route path="/login" element={<Suspended><LoginPage /></Suspended>} />
+      <Route path="/register" element={<Suspended><RegisterPage /></Suspended>} />
       {/* First-run wizard (Spec B W1). Unauthenticated shell — must render
           with no session, since a virgin instance has no admin to sign in
           as yet. RequireClaimedInstance (above) is what routes a virgin
           instance here from any other path; this Route makes /setup itself
           resolve once it's there, and lets an authenticated admin reach it
           directly (resume) too. */}
-      <Route path="/setup" element={<SetupWizard />} />
+      <Route path="/setup" element={<Suspended><SetupWizard /></Suspended>} />
 
       {/* User area — any authenticated user. */}
       <Route element={<RequireAuth />}>
@@ -201,7 +239,14 @@ export function App() {
               back/forward works. Same component — AppHomeNext reads the route
               to choose its view. */}
           <Route path="library" element={<AppIndexPage />} />
-          <Route path="game/:id" element={<GamePageRoute />} />
+          <Route
+            path="game/:id"
+            element={
+              <Suspended>
+                <GamePageRoute />
+              </Suspended>
+            }
+          />
           {/* Storage moved into the account area (2026-08-05). Kept as a
               redirect, not deleted — existing bookmarks and any link still in
               the wild must land on the page, not a 404. */}
@@ -213,29 +258,38 @@ export function App() {
         {/* /app/account moves OUT of AppLayout: AccountLayout supplies its own
             rail shell (mirroring the admin console), which would conflict with
             AppLayout's topbar pill nav. */}
-        <Route path="/app/account" element={<AccountLayout />}>
+        <Route path="/app/account" element={<Suspended><account.Layout /></Suspended>}>
           <Route index element={<Navigate to="/app/account/profile" replace />} />
           {/* Three section containers, each owning one head and its tab row
               (handoff §A.22). The pathless layout routes keep the URLs flat. */}
-          <Route element={<AccountSection />}>
-            <Route path="profile" element={<AccountProfile />} />
-            <Route path="devices" element={<AccountDevices />} />
+          <Route element={<Suspended><account.AccountSection /></Suspended>}>
+            <Route path="profile" element={<Suspended><account.Profile /></Suspended>} />
+            <Route path="devices" element={<Suspended><account.Devices /></Suspended>} />
           </Route>
-          <Route element={<PreferencesSection />}>
-            <Route path="overlay" element={<AccountOverlay />} />
-            <Route path="streaming" element={<AccountStreaming />} />
-            <Route path="appearance" element={<AccountAppearance />} />
+          <Route element={<Suspended><account.PreferencesSection /></Suspended>}>
+            <Route path="overlay" element={<Suspended><account.Overlay /></Suspended>} />
+            <Route path="streaming" element={<Suspended><account.Streaming /></Suspended>} />
+            <Route path="region" element={<ClassicRedirect to="/app/account/streaming" />} />
+            <Route path="input" element={<ClassicRedirect to="/app/account/streaming" />} />
+            <Route path="appearance" element={<Suspended><account.Appearance /></Suspended>} />
           </Route>
-          <Route element={<UsageSection />}>
-            <Route path="storage" element={<AccountStorage />} />
-            <Route path="sessions" element={<AccountSessions />} />
+          <Route element={<Suspended><account.UsageSection /></Suspended>}>
+            <Route path="storage" element={<Suspended><account.Storage /></Suspended>} />
+            <Route path="sessions" element={<Suspended><account.Sessions /></Suspended>} />
           </Route>
           {/* The password card merges into Profile in v3 (spec §3.3), so
               /security is a redirect, not a page. */}
-          <Route path="security" element={<Navigate to="/app/account/profile" replace />} />
+          <Route path="security" element={<ClassicRedirect to="/app/account/profile" />} />
         </Route>
         {/* Full-screen session view — outside AppLayout (no shell nav). */}
-        <Route path="/app/session/:id" element={<SessionPage />} />
+        <Route
+          path="/app/session/:id"
+          element={
+            <Suspended>
+              <SessionPage />
+            </Suspended>
+          }
+        />
 
         {/* Admin area — authenticated AND role=admin (UX gate; API enforces).
             Suspense wraps the lazy subtree; RequireAdmin is eagerly loaded.
@@ -537,7 +591,7 @@ export function App() {
       </Route>
 
       {/* Dev-only: token/component showcase */}
-      <Route path="/styleguide" element={<StyleguidePage />} />
+      <Route path="/styleguide" element={<Suspended><StyleguidePage /></Suspended>} />
 
       <Route path="*" element={<NotFound />} />
     </Routes>

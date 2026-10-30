@@ -114,6 +114,9 @@ export function revealWhenReady(t: Target, from: string, moves: boolean): void {
   timer = window.setTimeout(tick, 0);
 }
 
+/** Ends a wait still in progress, if any (the test setup calls it after every test). */
+export const cancelReveal = (): void => pending?.stop();
+
 /** Mounted where the palette is: the first location change after the reveal's own
  *  navigation (Back, a link, another choice) cancels a wait still in progress. */
 export function useCancelRevealOnNavigation(): void {

@@ -8,7 +8,7 @@ import { IconSearch } from "./icons";
 
 interface FieldProps {
   label: string;
-  hint?: string;
+  hint?: React.ReactNode;
   id?: string;
   children: React.ReactNode;
 }
@@ -54,7 +54,7 @@ export function TextField({ label, hint, id, mono, className, ...rest }: TextFie
 
 interface SelectFieldProps extends SelectHTMLAttributes<HTMLSelectElement> {
   label: string;
-  hint?: string;
+  hint?: React.ReactNode;
   children: React.ReactNode;
 }
 
@@ -121,7 +121,9 @@ export function Switch({
   const switchId = id ?? (label ? label.toLowerCase().replace(/\s+/g, "-") : undefined);
   return (
     <label className={`switch-row${disabled ? " is-disabled" : ""}`}>
-      <label className="switch">
+      {/* A span, not a nested <label>: the input must bind to the row's label so
+          the visible text names it (nested labels are invalid; it bound to this one). */}
+      <span className="switch">
         <input
           id={switchId}
           type="checkbox"
@@ -133,7 +135,7 @@ export function Switch({
         />
         <span className="track" />
         <span className="thumb" />
-      </label>
+      </span>
       {label && <span className="switch-label">{label}</span>}
     </label>
   );

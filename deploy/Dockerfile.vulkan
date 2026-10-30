@@ -109,7 +109,7 @@ ARG GST_VERSION=1.28.8
 ARG GST_PLUGINS_RS_REF=cee45224cb2d10e1523af4f256d0dd64c8b29491
 ARG GST_INTERPIPE_REF=0c454917
 ARG GST_WAYLAND_DISPLAY_REPO=https://github.com/salty2011/gst-wayland-display.git
-ARG GST_WAYLAND_DISPLAY_REF=3195719b1f6ea11088ca026dc30f76fa3f615000
+ARG GST_WAYLAND_DISPLAY_REF=e650cf7f7f038fbc6f23422190787b5086f8bdc7
 ARG RUST_VERSION=1.94.0
 ARG CARGO_C_VERSION=0.10.23
 ARG RUSTUP_VERSION=1.29.0
@@ -732,20 +732,19 @@ FROM ${TOOLCHAIN_IMAGE} AS build
 # and runs on an AMD/Intel host.
 COPY node-agent /src/node-agent
 
-# Build identity (#107): node-agent/build.rs bakes these into the binary, which
-# reports them on `register` (agent-api.md) and logs them at startup. The build
-# context carries no .git, so its `git rev-parse` fallback cannot fire here —
-# these args are the only source.
+# Build identity (#107): node-agent/build.rs bakes SOURCE_COMMIT and QUASAR_VERSION
+# into the binary, which reports them on `register` (agent-api.md) and logs them at
+# startup. The build context carries no .git, so its `git rev-parse` fallback cannot
+# fire here: these args are the only source.
 #
-# They sit HERE, not at the bottom like the runtime stage's label ARGs, because
-# a stamp has to be in the binary. BUILT_AT is wall-clock, so a rebuild of an
-# unchanged tree now recompiles the agent (~5 min) instead of hitting cache; a
-# rebuild of a NEW commit changes the source anyway and recompiled regardless.
+# BUILT_AT is deliberately NOT here (#866): it is wall-clock, so passing it to cargo
+# recompiled the agent (~4 min) on every build of an unchanged tree. The agent reads
+# its build time at run time from the QUASAR_BUILT_AT ENV set at the bottom of the
+# runtime stage, beside the org.quasar.built.at label.
 ARG SOURCE_COMMIT=unknown
-ARG BUILT_AT=unknown
 ARG QUASAR_VERSION=
 RUN cd /src/node-agent \
-    && QUASAR_SOURCE_COMMIT="${SOURCE_COMMIT}" QUASAR_BUILT_AT="${BUILT_AT}" \
+    && QUASAR_SOURCE_COMMIT="${SOURCE_COMMIT}" \
        QUASAR_VERSION="${QUASAR_VERSION}" cargo build --release \
         $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda ) \
     && install -Dm0755 target/release/quasar-node-agent /opt/agent/quasar-node-agent
@@ -1087,6 +1086,8 @@ LABEL org.quasar.image.role="runtime" \
       org.quasar.pins.base="${QUASAR_BASE_IMAGE}" \
       org.quasar.source.commit="${SOURCE_COMMIT}" \
       org.quasar.built.at="${BUILT_AT}"
+# The agent reports this as its built_at (node-agent/src/buildinfo.rs, #866).
+ENV QUASAR_BUILT_AT="${BUILT_AT}"
 
 # #152 — the probe must follow QUASAR_HEALTH_ADDR rather than hardcoding the
 # default. Two agents on one host share a network namespace, so the second needs

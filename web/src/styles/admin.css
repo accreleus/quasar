@@ -188,6 +188,11 @@
 
 /* ── Settings page (pages/admin/Settings.tsx) ─────────────── */
 .admin-settings-end { align-items: flex-end; }
+.admin-settings-select { width: 280px; max-width: 100%; }
+.admin-settings-error { margin: 0; max-width: 280px; text-align: right; }
+.admin-settings-pair { width: 180px; max-width: 100%; }
+.admin-settings-range { width: 280px; max-width: 100%; }
+.admin-settings-example { display: block; margin-top: var(--s1); font-family: var(--font-mono); color: var(--text-2); }
 .admin-settings-sep {
   border-top: 1px solid var(--line);
   padding-top: var(--s5);

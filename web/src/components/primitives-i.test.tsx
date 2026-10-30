@@ -327,6 +327,28 @@ describe("Switch", () => {
     render(<Switch checked={false} onChange={vi.fn()} label="Off" disabled />);
     expect(screen.getByRole("checkbox")).toBeDisabled();
   });
+
+  it("is named by its row text, and clicking that text toggles it", () => {
+    const onChange = vi.fn();
+    const { container } = render(<Switch checked={false} onChange={onChange} label="Flip scroll direction" />);
+    expect(screen.getByRole("checkbox", { name: "Flip scroll direction" })).toBeInTheDocument();
+    // A label inside the row's label takes the input away from the row text.
+    expect(container.querySelector("label label")).toBeNull();
+    fireEvent.click(screen.getByText("Flip scroll direction"));
+    expect(onChange).toHaveBeenCalledWith(true);
+  });
+
+  it("a bare toggle is named by its aria-label, or by a label that points at it", () => {
+    render(
+      <>
+        <Switch checked={false} onChange={vi.fn()} aria-label="Trust laptop" id="s1" />
+        <label htmlFor="s2">Enabled for users</label>
+        <Switch checked={false} onChange={vi.fn()} id="s2" />
+      </>,
+    );
+    expect(screen.getByRole("checkbox", { name: "Trust laptop" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Enabled for users" })).toBeInTheDocument();
+  });
 });
 
 /* ------------------------------------------------------------------ */

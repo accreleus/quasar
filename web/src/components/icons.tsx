@@ -363,6 +363,7 @@ export type IconName =
   | "overlay"
   | "devices"
   | "lock"
+  | "globe"
   | "collapse"
   | "sun"
   | "moon"
@@ -371,11 +372,18 @@ export type IconName =
   | "home"
   | "admin"
   | "signout"
-  | "density";
+  | "density"
+  | "input";
 
 /** Path data only — the <svg> wrapper is shared by <ShellIcon>. */
 const SHELL_GLYPHS: Record<IconName, JSX.Element> = {
   overview: <path d="M2.5 3.5h5v4h-5zM2.5 10h5v3h-5zM9.5 3.5h4v3h-4zM9.5 9h4v4h-4z" />,
+  input: (
+    <>
+      <rect x="1.5" y="4" width="13" height="8" rx="1.5" />
+      <path d="M4 6.6h.01M6.7 6.6h.01M9.3 6.6h.01M12 6.6h.01M5 9.4h6" strokeLinecap="round" />
+    </>
+  ),
   sessions: (
     <path d="M1.5 8h3l2-4.5L9 12.5l1.8-4.5h3.7" strokeLinecap="round" strokeLinejoin="round" />
   ),
@@ -460,6 +468,12 @@ const SHELL_GLYPHS: Record<IconName, JSX.Element> = {
     <>
       <rect x="3.2" y="7.3" width="9.6" height="6.2" rx="1.3" />
       <path d="M5.3 7.3V5.2a2.7 2.7 0 0 1 5.4 0v2.1" strokeLinecap="round" />
+    </>
+  ),
+  globe: (
+    <>
+      <circle cx="8" cy="8" r="6" />
+      <path d="M2 8h12M8 2c-2.2 2.4-2.2 9.6 0 12M8 2c2.2 2.4 2.2 9.6 0 12" strokeLinecap="round" />
     </>
   ),
   collapse: (

@@ -4,6 +4,7 @@
 
 import type { IconName } from "../../icons";
 import type { PaletteGroup, PaletteItem } from "../paletteSearch";
+import type { Place } from "./place";
 
 /** How to find a setting once its page is up. `text` narrows `sel` to the element
  *  with exactly that text; `up` names the row to highlight around the match. */
@@ -58,6 +59,38 @@ export const ACCOUNT_SETTINGS: readonly SettingEntry[] = [
     id: "acct-launch-fullscreen", label: "Launch in full screen", where: "Stream quality", icon: "streaming", to: `${A}/streaming`,
     keywords: "full screen fullscreen capture input mouse lock play launch immersive",
     target: { sel: "#launch-fullscreen", up: ".ac-sw" },
+  },
+  sec("region", "Region", "region", "globe", "region clock time language locale format"),
+  {
+    id: "acct-timezone", label: "Timezone", where: "Region", icon: "globe", to: `${A}/region`,
+    keywords: "time zone clock city country utc gmt offset follow my browser tz",
+    target: { sel: "#tz-label", up: ".field" },
+  },
+  sec("input", "Input", "input", "input", "keyboard mouse controller gamepad"),
+  {
+    id: "acct-match-cursor", label: "Match cursor to my window", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse cursor speed fast slow stream bigger window size scale match desktop",
+    target: { sel: "#match-cursor-l", up: ".field" },
+  },
+  {
+    id: "acct-mouse-sensitivity", label: "Mouse sensitivity", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse speed fast slow sensitivity dpi pointer cursor",
+    target: { sel: "#mouse-sensitivity", up: ".field" },
+  },
+  {
+    id: "acct-raw-mouse", label: "Raw mouse input (no acceleration)", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse acceleration raw unadjusted movement pointer lock chrome edge",
+    target: { sel: "#raw-mouse", up: ".ac-sw" },
+  },
+  {
+    id: "acct-flip-scroll", label: "Flip scroll direction", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "mouse wheel scroll reverse invert natural direction up down",
+    target: { sel: "#flip-scroll", up: ".ac-sw" },
+  },
+  {
+    id: "acct-nintendo-layout", label: "Gamepad Nintendo layout", where: "Input", icon: "input", to: `${A}/input`,
+    keywords: "controller gamepad nintendo switch pro swap a b x y buttons layout",
+    target: { sel: "#nintendo-layout", up: ".ac-sw" },
   },
   sec("overlay", "In-session overlay", "overlay", "overlay", "hud strip overlay stats"),
   {
@@ -149,6 +182,17 @@ export const ADMIN_SETTINGS: readonly SettingEntry[] = [
   adminSection("Instance", "identity access"),
   adminRow("Registration", "Instance", "sign up signup open closed invite only register"),
   adminRow("Allowed origins", "Instance", "cors origin domain url"),
+  adminSection("Region defaults", "timezone language locale format clock"),
+  adminRow("Timezone", "Region defaults", "time zone clock city utc gmt offset default users"),
+  adminRow("Language", "Region defaults", "locale default users games steam"),
+  adminRow("Region format", "Region defaults", "locale dates numbers time same as language default users"),
+  adminSection("Input defaults", "keyboard mouse scroll gamepad cursor"),
+  adminRow("Keyboard layout", "Input defaults", "keyboard variant xkb azerty qwerty dvorak default users"),
+  adminRow("Match cursor to my window", "Input defaults", "mouse pointer auto always off default users"),
+  adminRow("Mouse sensitivity", "Input defaults", "mouse speed scale default users"),
+  adminRow("Raw mouse input", "Input defaults", "mouse acceleration default users"),
+  adminRow("Flip scroll direction", "Input defaults", "scroll wheel natural reverse default users"),
+  adminRow("Gamepad Nintendo layout", "Input defaults", "controller swap a b x y default users"),
   adminSection("Libraries", "discovery scan steam"),
   adminRow("Library discovery", "Libraries", "steam scan discover installed"),
   adminRow("Scan interval", "Libraries", "minutes scan frequency how often"),
@@ -203,33 +247,7 @@ export const toItem = (e: SettingEntry): SettingItem => ({
   id: `ss-${e.id}`, label: e.label, meta: e.where, icon: e.icon, to: e.to, reveal: e.target,
 });
 
-// ── Where we are, and what the trigger promises there ───────────────────────
-
-export type Place = { kind: "account" } | { kind: "home" } | { kind: "admin"; area: string; path: string };
-
-/** The admin place needs an admin: the console index is never searched for anyone else. */
-export function placeOf(pathname: string, isAdmin: boolean): Place {
-  if (isAdmin && pathname.startsWith("/admin")) return { kind: "admin", area: pathname.split("/")[2] || "overview", path: pathname.replace(/\/+$/, "") };
-  if (pathname.startsWith("/app/account")) return { kind: "account" };
-  return { kind: "home" };
-}
-
-export function settingsTriggerLabel(kind: Place["kind"]): string {
-  if (kind === "admin") return "Search hosts, sessions, apps, users, settings…";
-  if (kind === "account") return "Search settings and games…";
-  return "Search games and settings…";
-}
-
-/** The trigger on a phone, where the full label cannot fit on one line. */
-export function settingsShortLabel(kind: Place["kind"]): string {
-  return kind === "admin" ? "Search the console\u2026" : kind === "account" ? "Search settings\u2026" : "Search games\u2026";
-}
-
-export function settingsPlaceholder(kind: Place["kind"]): string {
-  if (kind === "admin") return "Search hosts, sessions, apps, users, pages or settings";
-  if (kind === "account") return "Search settings and games";
-  return "Search games and settings";
-}
+export { placeOf, settingsPlaceholder, settingsShortLabel, settingsTriggerLabel, type Place } from "./place";
 
 // ── Arranging the palette's groups: the current place first ─────────────────
 

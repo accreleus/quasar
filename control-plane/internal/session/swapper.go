@@ -17,7 +17,7 @@ type swapper struct {
 	store       *Store
 	dispatcher  Dispatcher
 	log         *slog.Logger
-	resolveHome func(ctx context.Context, app LaunchApp, userID, hostID string) ([]byte, error) // = Coordinator.resolveHomeSpec
+	resolveSpec func(ctx context.Context, app LaunchApp, sess Session) ([]byte, error) // = Coordinator.swapSpec
 
 	mu           sync.Mutex
 	pendingSwaps map[string]string
@@ -28,8 +28,8 @@ type swapper struct {
 	swapSince map[string]time.Time
 }
 
-func newSwapper(store *Store, dispatcher Dispatcher, log *slog.Logger, resolveHome func(context.Context, LaunchApp, string, string) ([]byte, error)) *swapper {
-	return &swapper{store: store, dispatcher: dispatcher, log: log, resolveHome: resolveHome,
+func newSwapper(store *Store, dispatcher Dispatcher, log *slog.Logger, resolveSpec func(context.Context, LaunchApp, Session) ([]byte, error)) *swapper {
+	return &swapper{store: store, dispatcher: dispatcher, log: log, resolveSpec: resolveSpec,
 		pendingSwaps: make(map[string]string), swapSince: make(map[string]time.Time)}
 }
 
@@ -151,9 +151,9 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 		inPlace = err == nil && cur.ParentAppID == app.ParentAppID
 	}
 
-	// A managed-home swap target gets its home injected exactly like a launch.
+	// A swap target gets its home and region values exactly like a launch.
 	// Its durable swapping detail was set with the claim before this resolution.
-	dispatchSpec, err := s.resolveHome(ctx, app, sess.UserID, *sess.HostID)
+	dispatchSpec, err := s.resolveSpec(ctx, app, sess)
 	if err != nil {
 		if app.ManagedHome {
 			_ = s.store.ClearNewHomeHold(ctx, homeHold)

@@ -29,11 +29,13 @@ vi.mock("../../../../api/library", () => ({
   updateProfilePreferences: api.updateProfilePreferences,
 }));
 vi.mock("../../../../api/storage", () => ({ getMyStorage: api.getMyStorage }));
+vi.mock("./RegionSection", () => ({ RegionSection: () => <p>region stub</p> }));
 vi.mock("../AccountOverlay", () => ({ AccountOverlay: () => <p>overlay stub</p> }));
 vi.mock("../AccountAppearance", () => ({ AccountAppearance: () => <p>appearance stub</p> }));
 vi.mock("../AccountSessions", () => ({ AccountSessions: () => <p>sessions stub</p> }));
 vi.mock("../AccountStorage", () => ({ AccountStorage: () => <p>storage stub</p> }));
 vi.mock("../PasswordCard", () => ({ PasswordCard: () => <p>password stub</p> }));
+vi.mock("./InputSection", () => ({ InputSection: () => <p>input stub</p> }));
 
 const logout = vi.fn();
 const auth = {

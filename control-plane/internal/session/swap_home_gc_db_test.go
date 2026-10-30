@@ -242,7 +242,7 @@ func TestManagedSwapAndTombstoneSerializeBeforeTargetDispatch(t *testing.T) {
 	for {
 		var waiting int
 		must(t, pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM pg_stat_activity
-			WHERE wait_event_type='Lock' AND query LIKE '%managed_home_claims%' AND query LIKE '%FOR UPDATE%'`).Scan(&waiting))
+			WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%managed_home_claims%' AND query LIKE '%FOR UPDATE%'`).Scan(&waiting))
 		if waiting > 0 {
 			break
 		}

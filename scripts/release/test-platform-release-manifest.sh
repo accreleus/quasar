@@ -131,6 +131,55 @@ PY
 reject "$validate" "unknown top-level key: floor" "$work/v1-with-floor.json"
 reject "$validate" "must be 1 or 2" "$fixtures/valid-v2.json" --expect-format 3
 
+# ── The preview manifest (--preview, amendment 48) ───────────────────────────
+# valid-preview.json is a copy of the fixture the Go tests read (ParsePreviewManifest).
+shared_preview="$repo/testdata/release/platform-release-manifest.preview.json"
+cmp -s "$shared_preview" "$fixtures/valid-preview.json" || fail "valid-preview.json differs from $shared_preview"
+"$validate" "$shared_preview" --preview --expect-format 2 \
+  --expect-control-digest "$control_digest" --expect-agent-digest "$agent_digest" \
+  --expect-recovery-digest "$recovery_digest" >/dev/null || fail "valid preview manifest rejected"
+# A release asset stays as strict as before: no null version, no commits.
+reject "$validate" "version must be a string" "$shared_preview"
+reject "$validate" "unknown top-level key: commits" "$shared_preview"
+for flags in "--expect-version 0.4.0" "--expect-format 1"; do
+  rc=0
+  # shellcheck disable=SC2086 # two words on purpose
+  "$validate" "$shared_preview" --preview $flags >/dev/null 2>&1 || rc=$?
+  [[ $rc -eq 2 ]] || fail "--preview with $flags must be a usage error, got $rc"
+done
+preview_variant() { # preview_variant <name> <python statement over d> -> prints the path
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+exec(sys.argv[3])
+open(sys.argv[2], "w").write(json.dumps(d))' "$shared_preview" "$work/$1.json" "$2"
+  printf '%s' "$work/$1.json"
+}
+"$validate" "$(preview_variant p-no-commits 'del d["commits"]')" --preview >/dev/null \
+  || fail "a preview manifest without commits is valid"
+"$validate" "$(preview_variant p-200 'd["commits"][0]["subject"] = "é" * 200')" --preview >/dev/null \
+  || fail "a 200-character subject is valid"
+"$validate" "$(preview_variant p-500 'd["commits"] = d["commits"][:1] * 500')" --preview >/dev/null \
+  || fail "500 commits are valid"
+"$validate" "$(preview_variant p-floor-high 'd["floor"][0]["version"] = "99.0.0"')" --preview >/dev/null \
+  || fail "a preview floor has no version to order against"
+reject "$validate" "version must be null" "$(preview_variant p-version 'd["version"] = "0.4.0"')" --preview
+reject "$validate" "missing top-level key: version" "$(preview_variant p-no-version 'del d["version"]')" --preview
+reject "$validate" "prerelease must be false" "$(preview_variant p-pre 'd["prerelease"] = True')" --preview
+reject "$validate" "is format_version 2" \
+  "$(preview_variant p-f1 'd["format_version"] = 1; del d["floor"]; del d["components"][2]')" --preview
+reject "$validate" "unknown top-level key: notes" "$(preview_variant p-key 'd["notes"] = ""')" --preview
+reject "$validate" "at most 500" "$(preview_variant p-501 'd["commits"] = d["commits"][:1] * 501')" --preview
+reject "$validate" "commits must be an array" "$(preview_variant p-null 'd["commits"] = None')" --preview
+reject "$validate" "commits[1] must be exactly" "$(preview_variant p-extra 'd["commits"][1]["url"] = "x"')" --preview
+reject "$validate" "commits[0].commit" "$(preview_variant p-short 'd["commits"][0]["commit"] = "c" * 7')" --preview
+reject "$validate" "commits[0].subject" "$(preview_variant p-201 'd["commits"][0]["subject"] = "x" * 201')" --preview
+# C0 (tab, newline), DEL, C1, U+2028/9 and bidi controls: the control plane refuses the whole document for any.
+for ch in '\t' '\n' '\x7f' '\x85' '\u2028' '\u2029' '\u202e' '\u2066' '\u200e'; do
+  reject "$validate" "commits[1].subject" \
+    "$(preview_variant p-ctl "d['commits'][1]['subject'] += '$ch'")" --preview
+done
+
 # Every error is reported, not just the first: a maintainer fixing one field at a
 # time per CI run is the failure mode this avoids.
 two="$("$validate" "$fixtures/two-errors.json" 2>&1 || true)"
@@ -252,6 +301,97 @@ want_actor_floor="$(sed -n -E 's/^const FloorRecoveryActor = "([^"]*)"$/\1/p' "$
 [[ -n "$want_agent_floor" && -n "$want_actor_floor" ]] || fail "floor.go no longer has the two floor lines"
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["floor"] == [{"name": "node-agent", "version": sys.argv[2]}, {"name": "recovery-actor", "version": sys.argv[3]}], d["floor"]' \
   "$gen_default" "$want_agent_floor" "$want_actor_floor"
+
+# --preview writes the preview manifest: the shared fixture's shape plus the commit list
+# read from a history. This one has a stable tag, a prerelease tag above it, PR merges
+# (title in the body), direct commits, a side-branch commit that is not first-parent,
+# unsafe characters and a 300-character title.
+prev_repo="$work/preview-repo"
+git init -q "$prev_repo"
+pgit() { git -C "$prev_repo" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false -c tag.gpgsign=false "$@"; }
+pgit commit -q --allow-empty -m "before the release"
+pgit tag v1.0.0
+pgit commit -q --allow-empty -m "docs: direct commit on develop"
+pgit tag v1.1.0-rc.1
+# Not stable release tags (exactly vX.Y.Z): none of these may be the cut-off.
+pgit tag v1
+pgit tag v1.5
+pgit tag v1.5.0+build
+pgit tag v1.5.0.1
+pgit checkout -q -b side
+pgit commit -q --allow-empty -m "side-branch work that only a merge reaches"
+pgit checkout -q -
+pgit merge -q --no-ff side -m "Merge pull request #12 from org/side" -m "Add the thing"
+pgit commit -q --allow-empty -m "$(printf 'fix: tab\there\xe2\x80\xa8line-sep \xe2\x80\xaebidi\xe2\x80\xac end')"
+pgit checkout -q -b long
+pgit commit -q --allow-empty -m x
+pgit checkout -q -
+pgit merge -q --no-ff long -m "Merge pull request #13 from org/long" -m "$(python3 -c 'print("L" * 300)')"
+pgit checkout -q -b notitle
+pgit commit -q --allow-empty -m y
+pgit checkout -q -
+pgit merge -q --no-ff notitle -m "Merge pull request #14 from org/notitle"
+head_sha="$(pgit rev-parse HEAD)"
+gen_preview() { "$generate" "${gen_base[@]}" --source-commit "$head_sha" --repo "$prev_repo" --preview --output "$1" "${@:2}"; }
+gen_preview "$work/preview.json" >/dev/null || fail "generator failed in --preview mode"
+"$validate" "$work/preview.json" --preview --expect-format 2 \
+  --expect-control-digest "$control_digest" --expect-agent-digest "$agent_digest" \
+  --expect-recovery-digest "$recovery_digest" >/dev/null || fail "generated preview manifest failed validation"
+python3 - "$fixtures/valid-preview.json" "$work/preview.json" "$head_sha" <<'PY'
+import json
+import sys
+
+want, got = (json.load(open(p)) for p in sys.argv[1:3])
+head = sys.argv[3]
+commits = got.pop("commits")
+del want["commits"]
+want.pop("schema_version")
+want["source_commit"] = head
+assert got.pop("schema_version") == 12
+assert json.dumps(want) == json.dumps(got), f"generated preview manifest differs from the documented shape: {got}"
+# Newest first, first-parent only, the stable tag's own commit and everything before it
+# left out, the prerelease tag ignored.
+subjects = [c["subject"] for c in commits]
+assert commits[0]["commit"] == head, commits[0]
+assert subjects[:2] == ["Merge pull request #14 from org/notitle", "#13 " + "L" * 196], subjects[:2]
+assert subjects[2] == "fix: tab here line-sep bidi end", subjects[2]
+assert subjects[3] == "#12 Add the thing", subjects[3]
+assert subjects[4] == "docs: direct commit on develop", subjects[4]
+assert len(subjects) == 5, subjects
+assert all(len(c["commit"]) == 40 for c in commits)
+PY
+floor_fixture "$work/floor-high.go" 99.0.0 0.4.0-0
+gen_preview "$work/preview-floor.json" --floor-source "$work/floor-high.go" >/dev/null \
+  || fail "a preview floor was compared with a version it does not have"
+rc=0
+gen_preview "$work/preview-both.json" --version 0.4.0 >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 2 ]] || fail "generator with --preview and --version must exit 2, got $rc"
+reject "$generate" "digest" "${gen_base[@]}" --preview --control-digest sha256:abcd \
+  --output "$work/preview-bad.json"
+test ! -e "$work/preview-bad.json" || fail "generator wrote a preview manifest for a bad digest"
+
+# A history it cannot read fails; it never publishes a list that only looks complete.
+reject "$generate" "cannot read the commit list" "${gen_base[@]}" --preview \
+  --source-commit "$(printf 'f%.0s' {1..40})" --repo "$prev_repo" --output "$work/preview-nocommit.json"
+git init -q "$work/untagged-repo"
+git -C "$work/untagged-repo" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
+  commit -q --allow-empty -m one
+reject "$generate" "no stable release tag" "${gen_base[@]}" --preview \
+  --source-commit "$(git -C "$work/untagged-repo" rev-parse HEAD)" --repo "$work/untagged-repo" \
+  --output "$work/preview-untagged.json"
+git clone -q --depth 1 "file://$prev_repo" "$work/shallow-repo"
+reject "$generate" "shallow" "${gen_base[@]}" --preview --source-commit "$head_sha" \
+  --repo "$work/shallow-repo" --output "$work/preview-shallow.json"
+test ! -e "$work/preview-shallow.json" || fail "generator wrote a preview manifest from a shallow history"
+
+# A longer history is cut to the newest 500.
+tree="$(pgit rev-parse HEAD^{tree})"
+parent="$head_sha"
+for _ in $(seq 1 505); do parent="$(pgit commit-tree "$tree" -p "$parent" -m "c")"; done
+pgit update-ref refs/heads/long-history "$parent"
+gen_preview "$work/preview-long.json" --source-commit "$parent" >/dev/null || fail "generator failed on a long history"
+python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["commits"]; assert len(c) == 500 and c[0]["commit"] == sys.argv[2], len(c)' \
+  "$work/preview-long.json" "$parent"
 
 # A missing --recovery-digest is a usage error, like every other required flag.
 missing_rc=0

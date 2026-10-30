@@ -49,6 +49,7 @@ pub mod settings;
 pub mod cuda_share;
 pub mod host;
 pub mod input;
+pub(crate) mod keymap;
 pub mod ladder;
 /// The in-container Steam launch helper's socket, mount and wire (#731).
 pub mod launch_helper;

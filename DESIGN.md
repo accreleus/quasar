@@ -37,6 +37,9 @@ mock back in.
 | 7 | A tabbed account area: three rail rows, each with its own tab row. | **New design only, operator-approved from the UX lab (2026-10-16, #714):** one scrolling account page (`pages/app/account/onepage/`) with a rail row and a phone chip per section, sections editing in place, and devices grouped in use / not used in 90 days. The Classic layout switch has its own Appearance section. Classic layout keeps the tabs. | `AccountLayout` test |
 | 8 | A top-bar search that finds games and fleet objects only. | **New design only, operator-approved from the UX lab (2026-10-16, #714):** the palette also finds account settings, devices and, for admins in the console, admin pages and settings, current place first; choosing one lands on it focused and highlighted (`components/shell/settingsSearch/`). The console pages themselves are not redesigned; only the search follows the layout choice there (`useNewSearch`). Classic layout keeps the previous palette. | `settingsIndex` and `CommandPalette` tests |
 | 9 | Has no release-input hint: after capture the HUD strip shows for 4 s (`evaluateHud`) and the release combo lives only in the Input pane's Keys rows | Operator decision (#647): when capture engages, the strip carries one extra line naming the release actions that work on this device, worded by `releaseHint` in `pages/app/hud/panes/InputPane.tsx` (the same inputs as the pane's Esc row). It lasts about 5 s and fades with the strip. Type is the menu hint's size (`--t-xs`), brighter (`--text-2`); a vertical dock has no room and shows none; a top-docked strip steps down out of Chromium's top-centre Esc bubble by the error banner's offset. The refused-capture fallback is a "Click to play" primary button on `--modal-scrim`, under the HUD. No new tokens. Styles: `.hud-hint` (`hud.css`), `.session-play` (`session.css`). | review, `Hud.test.tsx` |
+| 10 | The Region and Input mock lists "Latin American" as a variant of the Spanish keyboard layout. | xkeyboard-config has no such variant (`es` has no variant for it): Latin American is its own layout, `latam`, so the keyboard pickers list "Spanish (Latin American)" as a layout of its own (`lib/region/options.ts`). | review |
+| 11 | Sets the world map caption ("Click your area on the map…") in `--text-4` at `--t-xs`: 4.3:1 on the dark map well and 2.9:1 on the light one, below the 4.5:1 body-text floor | The caption is the map's instruction, so it is muted, not faint: `--text-3` (`.tz-map-cap`). | review (axe at landing) |
+| 12 | Keeps the selected timezone row's country · zone and offset at `--text-3` on `--accent-soft`: 3.95:1 in the light theme | On the selected row they step up to `--text-2` (`.tz-opt[aria-selected="true"]`), the foreground side of the role ladder, never a grey of their own. | review (axe at landing) |
 
 *Owner to add: the unpolished v3 elements already identified. Each needs the mock
 behaviour, the replacement rule, and whether a lint rule can enforce it.*
@@ -146,6 +149,26 @@ above.
 
 `/styleguide` (public route) renders the live tokens and components. Check a change
 there as well as on the page it targets.
+
+## Region and Input settings (#844)
+
+No v3 mock covered these. The composition, with its direction approved by the owner, is
+`design_handoff_v3/screens/region-input-v3.html` (account sections, then the admin
+defaults). Rules:
+
+| Control | Rule |
+|---|---|
+| Timezone | A search field over a listbox (`role="listbox"`, 44px rows, inset well like `.input`). The first row is pinned: "Follow my browser" with the detected zone, and it is the default. The selected row is `--accent-soft` with an accent inset ring. A "Now: zone · time · offset" line sits under the field. |
+| World map | Beside the list, below it under 1100px, absent at 600px and below (phones get the list only). Inline SVG dot map on an inset well; land dots `--line-3`, the zones sharing the hovered offset `--text-2`, the selected offset `--accent`; city dots `--text`; the pick is a `--text` dot ringed in `--accent` with a `--pop-bg` label. Pointer only: the list is the accessible path. Map data is public domain (Natural Earth land, tz `zone.tab`). |
+| Language | `SelectField`; default "Follow my browser (<detected>)". Region format defaults to "Same as language (<language>)", or "Install default (<format>)" when the install sets a region format, and its hint shows a live mono example. |
+| 3-way choice | "Match cursor to my window" (Auto / Always on / Off) is the existing `SegmentedControl`, as wide as its options, with a hint that changes with the choice. |
+| Range slider | New: track `--surf-inset` with a `--line-3` border, filled in `--accent` to the value (`--fill` custom property), `--text` thumb with `--shadow-sm`, `--glow-accent` on focus, 44px hit area. Mono value readout on the right; mono end and centre ticks underneath. Sensitivity is log-scaled so 1× sits at the centre. |
+| Unavailable toggle | A `Switch` disabled with its hint saying why ("Not available in this browser"), never hidden. |
+| Rail icons | Region is a globe, Input a keyboard, drawn in the shell glyph style (16px box, 1.5 stroke, round caps). |
+| "Applies from your next launch" | Said once per section, in the section's sub-line, not under every field. The status line under the card confirms each save, and says when idle Steam was closed to pick the change up (never a session in use). |
+
+Admin defaults use the Settings page's `SettingRow`s; the admin timezone default is a
+grouped `<select>`, not the map.
 
 ## Motion and behaviour
 

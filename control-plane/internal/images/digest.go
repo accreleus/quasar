@@ -428,6 +428,9 @@ func (r *RegistryResolver) fetchToken(ctx context.Context, realm, service, scope
 		return "", fmt.Errorf("fetch registry token: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		return "", fmt.Errorf("fetch registry token: status %d: %w", resp.StatusCode, ErrRegistryDenied)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("fetch registry token: status %d", resp.StatusCode)
 	}

@@ -99,6 +99,9 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		// read SELECTS, and "check now" stays the jobs run-now action.
 		ReleaseChannel    *string `json:"release_channel"`
 		ReleaseEdgeBranch *string `json:"release_edge_branch"`
+		// "daily" | "weekly" | null; absent leaves it alone, null follows the
+		// channel again, so the raw message tells the two apart.
+		ReleaseCheck json.RawMessage `json:"release_check"`
 		// "" clears the URL; every other value must pass
 		// ValidReleaseWebhookURL (#123).
 		ReleaseWebhookEnabled *bool   `json:"release_webhook_enabled"`
@@ -112,8 +115,15 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		SteamWarmEnabled     *bool   `json:"steam_warm_enabled"`
 		SteamWarmRewarm      *string `json:"steam_warm_rewarm"`
 		SteamWarmIdleMinutes *int    `json:"steam_warm_idle_minutes"`
+		// Region and Input defaults (control-api.md §Region and Input settings).
+		regionInputRequest
 	}
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	regionInput, err := req.regionInputRequest.patch()
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
 		return
 	}
 	var steamPreparation *bool
@@ -169,8 +179,18 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ReleaseChannel != nil && !ValidReleaseChannel(*req.ReleaseChannel) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
-			"release_channel must be stable, beta, or edge")
+			"release_channel must be stable, beta, edge, or preview")
 		return
+	}
+	var releaseCheck *string
+	if len(req.ReleaseCheck) > 0 && string(req.ReleaseCheck) != "null" {
+		var v string
+		if json.Unmarshal(req.ReleaseCheck, &v) != nil || !ValidReleaseCheck(v) {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+				"release_check must be daily, weekly, or null")
+			return
+		}
+		releaseCheck = &v
 	}
 	if req.ReleaseEdgeBranch != nil && !ValidReleaseEdgeBranch(*req.ReleaseEdgeBranch) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
@@ -218,12 +238,15 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		ImageUpdatePolicy:                 req.ImageUpdatePolicy,
 		ReleaseChannel:                    req.ReleaseChannel,
 		ReleaseEdgeBranch:                 req.ReleaseEdgeBranch,
+		ReleaseCheckSet:                   len(req.ReleaseCheck) > 0,
+		ReleaseCheck:                      releaseCheck,
 		ReleaseWebhookEnabled:             req.ReleaseWebhookEnabled,
 		ReleaseWebhookURL:                 req.ReleaseWebhookURL,
 		PlatformAutoApply:                 req.PlatformAutoApply,
 		SteamWarmEnabled:                  req.SteamWarmEnabled,
 		SteamWarmRewarm:                   req.SteamWarmRewarm,
 		SteamWarmIdleMinutes:              req.SteamWarmIdleMinutes,
+		RegionInput:                       regionInput,
 	}
 	// Clearing the URL disables the webhook in the same write: "enabled, with
 	// nowhere to send" is a state no admin asked for and nothing can act on.

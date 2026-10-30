@@ -66,7 +66,7 @@ export function AccountAppearance() {
           onChange={toggle}
         />
       </div>
-      <p className="hint mt3" id="classic-layout-hint">Use the previous library, game page and account layout.</p>
+      <p className="hint mt3" id="classic-layout-hint">Use the previous library, game page and account layout. Classic layout will be removed in a later release.</p>
     </div>
   );
 }

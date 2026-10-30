@@ -215,7 +215,7 @@ for var in QUASAR_TRUSTED_PROXIES QUASAR_PUBLIC_HOST QUASAR_ALLOWED_ORIGINS \
            QUASAR_PLATFORM_RELEASE_ASSET_HOSTS QUASAR_PLATFORM_RELEASE_TOKEN \
            QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL QUASAR_PLATFORM_REGISTRY \
            QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET QUASAR_PLATFORM_WEBHOOK_HOSTS \
-           QUASAR_IMAGE_REGISTRY_HOSTS; do
+           QUASAR_IMAGE_REGISTRY_HOSTS QUASAR_HSTS_MAX_AGE; do
   # Subshell + `export`: bash 3.2 cannot write `"$var"=value cmd`, and cp_field
   # is a function, so `env VAR=… cp_field` is not available either.
   actual=$(export "$var=sentinel-$var"; \

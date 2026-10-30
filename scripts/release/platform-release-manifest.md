@@ -165,6 +165,68 @@ The `release` job of `.github/workflows/images.yml`, on a `v*` tag push:
 The generator and validator run offline, need no Docker, and are covered by
 `scripts/release/test-platform-release-manifest.sh`.
 
+## The preview manifest
+
+Every push to `develop` that builds images also publishes a **preview manifest**
+(`protocol/control-api.md` "Platform-release preview channel"): format 2 with
+`version` `null`, `prerelease` `false`, and an optional `commits` list. It is not a
+release asset. It is the one layer of an OCI image manifest at
+`ghcr.io/accreleus/quasar/quasar-release-manifest:preview`, and the control plane
+on the `preview` channel reads that tag. The shape is
+`testdata/release/platform-release-manifest.preview.json` (the Go tests read it too;
+`fixtures/manifests/valid-preview.json` is a copy).
+
+The `preview` job of `.github/workflows/images.yml` runs after `promote`:
+
+1. `generate-platform-release-manifest.sh --preview` writes it (no `--version`),
+   writes `commits` from the checkout's history (first-parent, newest first, back to
+   the newest stable release tag (`vX.Y.Z`), at most 500; `#<number> <title>` for a pull-request
+   merge, the subject line otherwise; control, line-separator and bidi characters
+   replaced, cut to 200 characters; a shallow or untagged checkout fails), and
+   `validate-platform-release-manifest.sh --preview` checks it against the three
+   build digests. Without `--preview` the validator still refuses a null version
+   and a `commits` key, so a release asset cannot carry them.
+2. Each component image is read back by digest, and its `org.quasar.source.commit`
+   label must be the run's commit: one commit for every image.
+3. `publish-preview-manifest.sh` reads the document the tag names now and refuses
+   unless its `source_commit` is an ancestor of this one's (or the same): the tag
+   only moves forward, so re-running an older run fails instead of rewinding it.
+   Then it pushes the document, moves the tag, reads the tag back and checks the
+   manifest digest and the layer bytes.
+
+A run that builds no image publishes no new preview, so the tag stays on the last
+build. On a push to `develop` the Images gate (#867) diffs against the commit the
+`preview` tag names, not against the branch's last successful run (a dispatch on
+`develop` moves no preview), and stops a run older than that commit before it
+builds. Both rules are `preview-rules.sh` (`tag` and `forward`), tested by
+`test-preview-rules.sh`; `test-publish-preview-manifest.sh` runs the push against a
+local `registry:2` (needs docker). A dispatch with `preview` ticked publishes to a test tag,
+`preview-<branch>`, never `preview`.
+
+**Once, after the first push:** the `quasar-release-manifest` package must be
+public, because installs read it anonymously. An org owner checks its visibility
+(the package's settings) and changes it to public if it is not. A private package
+reads as not published on every install. The first test publish (2026-10-27) was
+already readable anonymously, linked to this repository by the
+`org.opencontainers.image.source` annotation.
+
+**When a develop build refuses to move the preview.** Both checks fail closed on
+purpose; each case has one way out:
+
+- **develop was rewritten** (force-push): the tag names a commit that is no longer in
+  develop's history, so every later develop push stops at the gate ("was the branch
+  rewritten?"). Delete the `preview` tag in the `quasar-release-manifest` package's
+  versions. The next push to develop then reads "no preview is published yet", builds
+  every image and publishes a new `preview`.
+- **the package was deleted or cannot be read**: the gate's read fails on every develop
+  push. Dispatch Images on develop once with `preview` ticked: it recreates the package
+  under a test tag, and the next push to develop builds and publishes `preview`.
+- **an older run moved the tag** (the narrow window between the publish's read and its
+  write, or "Re-run failed jobs" on an older run whose promote moved `o2-develop`
+  back): re-run the newest develop run, or wait for the next landing; both move
+  `preview` and `o2-develop` forward again. Only the `preview` tag is refused when it
+  would go backwards; `o2-develop` is not.
+
 ## The release-time check
 
 `scripts/release/check-release-compatibility.sh` is ADR 0008's "release-time
