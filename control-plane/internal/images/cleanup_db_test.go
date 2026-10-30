@@ -623,13 +623,26 @@ func TestCleanupSecondAttemptRequiresItsOwnFreshInventoryBeforeRetiredJournal(t 
 	snapshot.Versions[0].State = "absent"
 	env.cleanupWire.set(host, snapshot)
 	env.cleanup.ImageVersionsChanged(context.Background(), host)
-	select {
-	case journal := <-env.cleanupWire.journalRequests:
-		env.cleanup.ImageCleanupJournal(context.Background(), host, agentws.ImageCleanupJournalMsg{
-			RequestID: journal.ID, RetiredAttemptIDs: []string{second.AttemptID},
-		})
-	case <-time.After(5 * time.Second):
-		t.Fatal("second scan did not request journal")
+	// The rev-2 notification above can overlap the dispatch's own reconcile; the
+	// trigger that loses that race asks for one more scan (#960). Answer every
+	// scan as the agent does until the journal request arrives.
+	for journaled := false; !journaled; {
+		select {
+		case journal := <-env.cleanupWire.journalRequests:
+			env.cleanup.ImageCleanupJournal(context.Background(), host, agentws.ImageCleanupJournalMsg{
+				RequestID: journal.ID, RetiredAttemptIDs: []string{second.AttemptID},
+			})
+			journaled = true
+		case followup := <-env.cleanupWire.inventoryRequests:
+			if snapshot.ReconciledRevision++; snapshot.ReconciledRevision > 6 {
+				t.Fatalf("follow-up scans never requested journal: %+v", followup)
+			}
+			snapshot.ReconciledRequestID = followup.ID
+			env.cleanupWire.set(host, snapshot)
+			env.cleanup.ImageVersionsChanged(context.Background(), host)
+		case <-time.After(5 * time.Second):
+			t.Fatal("second scan did not request journal")
+		}
 	}
 	var state string
 	if err := env.pool.QueryRow(context.Background(), `SELECT state FROM host_image_cleanup_attempts WHERE id=$1::uuid`, second.AttemptID).Scan(&state); err != nil {

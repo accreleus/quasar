@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Internal
+- **Image cleanup test: the second attempt's journal wait answers every scan (#960).** When a late inventory change overlaps the attempt's own reconcile, the control plane asks for one more scan before the journal; the test now answers each scan as the agent does, where it waited on the first one only and failed under CI load.
+
 ## 0.5.1 — 2026-10-30
 
 ### Upgrading
