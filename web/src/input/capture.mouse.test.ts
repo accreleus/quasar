@@ -138,7 +138,6 @@ describe("mouse speed in setupCapture", () => {
     move(6);
     Object.defineProperty(el, "videoWidth", { value: 1280, configurable: true });
     Object.defineProperty(el, "videoHeight", { value: 720, configurable: true });
-    Object.defineProperty(el, "clientHeight", { value: 1080, configurable: true });
     el.dispatchEvent(new Event("resize"));
     move(6);
     expect(sent).toEqual([{ dx: 6, dy: 0 }, { dx: 6, dy: 0 }]);

@@ -966,7 +966,8 @@ function SessionPageBody() {
   const streamSize = polledStreamSize ?? parseTierSize(state?.tier);
 
   // The size the host moves the cursor in (Match cursor, input/mouseScale.ts): the render size
-  // when one is set, else the launch size. The stream is only ever scaled below it.
+  // when one is set, else the launch size. Not externalSize: the lever and ABR move the stream, not
+  // the compositor. A console session is never streamed, so it never reaches this video element.
   const compositorSize = renderSize ?? streamSize;
 
   // Server owns this list; the client-side 16:9 ladder is a stand-in until the
