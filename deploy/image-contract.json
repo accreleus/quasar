@@ -160,6 +160,7 @@
 
       "commands": {
         "must_succeed": {
+          "readelf --dyn-syms -W /usr/local/bin/quasar-node-agent | grep -q gst_cuda_context_new": "#927: the agent is built --features cuda (ZC-02 zero-copy NVENC). The feature is absent from the binary when the build stage drops its CUDA_ENABLE ARG, and nothing else notices: the agent starts and Vulkan sessions stream either way.",
           "ldd /usr/local/bin/quasar-launch-helper | grep -q 'statically linked'": "#731: the launch helper runs inside the Steam app image, not this one, so it may need no libc from either; a dynamic build would load this image's glibc and break on another distribution.",
           "env -i /usr/local/bin/quasar-launch-helper": "#731: the helper starts, and with no -applaunch appid it exits 0, as it must for every app that is not a derived Steam tile."
         }
