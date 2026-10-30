@@ -224,6 +224,13 @@ for var in QUASAR_TRUSTED_PROXIES QUASAR_PUBLIC_HOST QUASAR_ALLOWED_ORIGINS \
     fail "base compose does not pass $var to the control plane (got: $actual) — a documented .env knob with no passthrough is silently inert"
 done
 
+# The hardened overlay proxies to the HTTP port, so with QUASAR_TRUSTED_PROXIES
+# empty nobody can sign in (#604): it must stop `compose up`, naming the variable.
+err=$(unset QUASAR_TRUSTED_PROXIES; QUASAR_PUBLIC_HOST=test.example QUASAR_TLS_DIR=/tmp/test-tls \
+  render --env-file /dev/null -f deploy/docker-compose.yml -f deploy/docker-compose.hardened.yml 2>&1 >/dev/null) && \
+  fail "hardened overlay renders with QUASAR_TRUSTED_PROXIES unset — it must refuse"
+case "$err" in *QUASAR_TRUSTED_PROXIES*) ;; *) fail "hardened overlay's refusal does not name QUASAR_TRUSTED_PROXIES: $err" ;; esac
+
 # THE REGRESSION THAT MUST NEVER RETURN: the control plane creates its TLS pair
 # under /var/lib/quasar-control and EXITS AT BOOT when that path is not
 # writable. The retired release overlay did `volumes: !reset []` to strip the
@@ -268,13 +275,13 @@ for spec in \
   "DEV:-f deploy/docker-compose.yml -f deploy/overlays/docker-compose.dev.yml" \
   "NVIDIA_DEV:-f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml -f deploy/overlays/docker-compose.dev.yml"; do
   chain="${spec%%:*}"; files="${spec#*:}"
-  # The hardened overlay `:?`-requires QUASAR_PUBLIC_HOST + QUASAR_TLS_DIR;
-  # both are harmless on the other chains.
+  # The hardened overlay `:?`-requires QUASAR_PUBLIC_HOST, QUASAR_TLS_DIR and
+  # QUASAR_TRUSTED_PROXIES; all three are harmless on the other chains.
   # shellcheck disable=SC2046,SC2086
-  built=$(QUASAR_PUBLIC_HOST=test.example QUASAR_TLS_DIR=/tmp/test-tls \
+  built=$(QUASAR_PUBLIC_HOST=test.example QUASAR_TLS_DIR=/tmp/test-tls QUASAR_TRUSTED_PROXIES=172.18.0.0/16 \
     cp_field "'yes' if svc.get('build') else 'no'" -- $files)
   # shellcheck disable=SC2046,SC2086
-  probe=$(QUASAR_PUBLIC_HOST=test.example QUASAR_TLS_DIR=/tmp/test-tls \
+  probe=$(QUASAR_PUBLIC_HOST=test.example QUASAR_TLS_DIR=/tmp/test-tls QUASAR_TRUSTED_PROXIES=172.18.0.0/16 \
     cp_field "' '.join(svc.get('healthcheck', {}).get('test', []))" -- $files)
   if [ "$built" = yes ]; then
     case "$probe" in *wget*) ;; *) fail "$chain builds the dev CP image (wget-only) but its healthcheck is: $probe" ;; esac

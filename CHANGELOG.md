@@ -24,6 +24,13 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Upgrading
+- **Sign-in now needs HTTPS: if your reverse proxy talks to the control plane's HTTP port, name it in `QUASAR_TRUSTED_PROXIES` before you update, or nobody can sign in afterwards (#604).** The proxy must also send `X-Forwarded-Proto: https`: Caddy does by default, nginx needs `proxy_set_header X-Forwarded-Proto $scheme;`. On a Compose install set it in `deploy/.env`; on an owned install run `docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_TRUSTED_PROXIES=<proxy address>`. A proxy pointed at the HTTPS port, or a browser that opens the HTTPS port directly, needs nothing. The bundled hardened Caddy overlay talks to the HTTP port, so it now requires the variable: `compose up` stops with an error naming it until it is set, and the stack you had keeps running (`docs/operations/hardened-deployment.md`). Your 0.5.1 control plane told you if this is you: it logged `credential-route-plaintext` or `forwarded-from-unlisted-peer`. Users already signed in keep working until their sign-in expires (24 h by default). `QUASAR_TLS=off` with no named proxy can no longer sign anyone in.
+- **It worked when** you can sign in through your usual address and the control plane logs no `credential-route-plaintext` line.
+
+### Changed
+- **Sign-in, registration and password change are refused over plain HTTP (#604).** They are served on the HTTPS listener, or through a proxy named in `QUASAR_TRUSTED_PROXIES` that sends `X-Forwarded-Proto: https`; anything else gets `403 forbidden` before the password is read, the form says why, and the control plane logs `credential-route-plaintext` (bounded per source). Other signed-in calls and the agent routes are unchanged. The local `make up` stack now serves HTTPS too: sign in on the `https://` address it prints.
+
 ### Internal
 - **Image cleanup test: the second attempt's journal checks no longer race the control plane (#960).** The test now answers every inventory scan as the agent does (a late inventory change that overlaps the attempt's own reconcile costs one more scan before the journal), and treats only a journal request naming the second attempt as stale (the first dispatch's own request for the first attempt can land late). It failed on most CI runs under load. No product change.
 

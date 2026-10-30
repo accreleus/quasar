@@ -199,7 +199,8 @@ if [ "$DX_HOST" = "local" ]; then
     TOKEN="$(
       set -a; . "$DX_ROOT/deploy/.env" 2>/dev/null || true; set +a
       if [ -n "${BOOTSTRAP_ADMIN_EMAIL:-}" ] && [ -n "${BOOTSTRAP_ADMIN_PASSWORD:-}" ]; then
-        curl -k -fs --max-time 10 -X POST "$LOCAL_API/v1/auth/login" \
+        # Sign-in is refused over plain HTTP (#604): the TLS port.
+        curl -k -fs --max-time 10 -X POST "https://127.0.0.1:${DX_CP_TLS_PORT}/v1/auth/login" \
           -H 'Content-Type: application/json' \
           -d "{\"email\":\"$BOOTSTRAP_ADMIN_EMAIL\",\"password\":\"$BOOTSTRAP_ADMIN_PASSWORD\"}" 2>/dev/null \
           | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token") or "")' 2>/dev/null || true

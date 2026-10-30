@@ -7,7 +7,7 @@
 # straight to scripts/harness/run-codec-validate.sh — no logic is duplicated here.
 #
 # Local: runs scripts/harness/run-codec-validate.sh directly against this worktree's
-#   instance-scoped stack (http://127.0.0.1:$DX_CP_PORT). Requires CFT +
+#   instance-scoped stack (https://127.0.0.1:$DX_CP_TLS_PORT). Requires CFT +
 #   playwright already provisioned (`qses provision`) and docker reachable on
 #   THIS machine.
 # Remote (HOST=<role-or-host>): scripts/harness/run-codec-validate.sh must run ON that
@@ -39,8 +39,8 @@ TARGET=codec-validate
 dx_require_host_scope "$TARGET"
 
 if [ "$DX_HOST" = local ]; then
-  dx_info "codec-validate: running locally against http://127.0.0.1:$DX_CP_PORT"
-  if bash "$DX_ROOT/scripts/harness/run-codec-validate.sh" --api "http://127.0.0.1:$DX_CP_PORT" "$@"; then
+  dx_info "codec-validate: running locally against https://127.0.0.1:$DX_CP_TLS_PORT"
+  if bash "$DX_ROOT/scripts/harness/run-codec-validate.sh" --api "https://127.0.0.1:$DX_CP_TLS_PORT" "$@"; then
     dx_pass codec-validate "scripts/harness/run-codec-validate.sh green"
   else
     dx_fail codec-validate "scripts/harness/run-codec-validate.sh failed — see output above"
