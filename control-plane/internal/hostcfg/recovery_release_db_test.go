@@ -271,12 +271,47 @@ func TestOnlyAnUncertainAttemptTakesARelease(t *testing.T) {
 	if _, err := store.RequestRecoveryRelease(ctx, "00000000-0000-4000-8000-0000000003fe", offer.AttemptID); !errors.Is(err, ErrIdleAttemptNotFound) {
 		t.Fatalf("another host: %v", err)
 	}
-	// Without a request nothing is pending, and a released report is refused.
+	// An uncertain attempt nobody asked to release has nothing to send.
 	if _, err := store.ObserveIdleState(ctx, hostID, offerConnection, liveReport(boot, offer, "uncertain", "2")); err != nil {
 		t.Fatal(err)
 	}
 	if ids, _ := store.PendingRecoveryReleases(ctx, hostID, offerConnection); len(ids) != 0 {
 		t.Fatalf("pending without a request: %v", ids)
+	}
+}
+
+// A database restored from before the request holds the attempt uncertain with no
+// request while the agent's journal says released. The agent writes released only on
+// the release command, so the inventory entry is taken and the host returns
+// (control-api.md "Releasing a recovery hold").
+func TestARestoredDatabaseTakesAReleasedEntryWithoutARequest(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	boot, offer := uncertainRecoveryHold(t, pool, store, hostID)
+	second := "00000000-0000-4000-8000-000000000339"
+	if err := store.BeginJournalReconciliation(ctx, hostID, second); err != nil {
+		t.Fatal(err)
+	}
+	released := JournalInventoryEntry{AttemptID: offer.AttemptID, HostID: hostID, Group: "hardware", Digest: offer.ContentSHA256,
+		Scope: "restart", Phase: "released", Sequence: "3", Revision: offer.Revision, GrantBoot: boot, GrantConnection: offerConnection,
+		ErrorCode: "candidate_verification_failed"}
+	if err := store.CompleteJournalReconciliation(ctx, hostID, second, []JournalInventoryEntry{released}, seededHardware); err != nil {
+		t.Fatal(err)
+	}
+	if gate, _ := store.JournalGate(ctx, hostID); gate != "complete" {
+		t.Fatalf("gate %s, want complete", gate)
+	}
+	if got := holdKinds(t, pool, hostID); got != "" {
+		t.Fatalf("holds %q, want none", got)
+	}
+	if got := hostStatus(t, pool, hostID); got != "online" {
+		t.Fatalf("host %s, want online", got)
+	}
+	view, err := store.GetIdleApply(ctx, hostID, offer.AttemptID)
+	if err != nil || view.Phase != "released" || view.RecoveryRelease == nil || view.RecoveryRelease.State != "released" || view.RecoveryRelease.RequestedAt != nil {
+		t.Fatalf("view: %+v %+v %v", view, view.RecoveryRelease, err)
 	}
 }
 
@@ -306,6 +341,11 @@ func TestAPendingReleaseSaysWhatItWaitsFor(t *testing.T) {
 	if got := waiting(); got != "agent_report" {
 		t.Fatalf("a capable reconciled agent: %s", got)
 	}
+	confirmPolicyGroups(t, pool, hostID, "idle_timeout_secs")
+	if got := waiting(); got != "agent_connection" {
+		t.Fatalf("a capable agent without the hardware grant is sent nothing: %s", got)
+	}
+	confirmPolicyGroups(t, pool, hostID, "hardware")
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET agent_disconnected_at=now() WHERE id=$1::uuid`, hostID); err != nil {
 		t.Fatal(err)
 	}

@@ -93,8 +93,11 @@ func (s *Store) recoveryRelease(ctx context.Context, hostID, phase string, reque
 	if phase != "uncertain" || requestedAt == nil {
 		return nil, nil
 	}
+	// A connection without the hardware restart grant is sent nothing (agentws
+	// policyRecoveryRelease), so it reads as waiting for a connection, as no agent does.
 	var reconciled, capable bool
-	if err := s.pool.QueryRow(ctx, `SELECT (h.status<>'offline' AND h.agent_disconnected_at IS NULL AND COALESCE(g.state='complete',false)),
+	if err := s.pool.QueryRow(ctx, `SELECT (h.status<>'offline' AND h.agent_disconnected_at IS NULL AND COALESCE(g.state='complete',false)
+			AND COALESCE(h.config_policy_confirmed_groups ? 'hardware',false)),
 		COALESCE(h.config_policy_versions->>'recovery_release','')='1'
 		FROM hosts h LEFT JOIN host_journal_reconciliation g ON g.host_id=h.id WHERE h.id=$1::uuid`, hostID).Scan(&reconciled, &capable); err != nil {
 		return nil, err

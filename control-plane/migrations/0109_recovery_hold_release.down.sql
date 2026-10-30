@@ -1,12 +1,14 @@
--- Refuses once any attempt is `released`: an older control plane quarantines the
--- agent journal that holds it. Roll the control-plane binary back to one embedding
--- only <= 0108 only after this down migration.
+-- Refuses once a release was requested or recorded: the agent may already hold
+-- `released`, and an older control plane quarantines an agent journal that holds it.
+-- Roll the control-plane binary back to one embedding only <= 0108 only after this
+-- down migration.
 BEGIN;
 
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM host_config_attempts WHERE phase = 'released') THEN
-        RAISE EXCEPTION '0109 down: a released attempt exists; an older control plane cannot read its agent journal';
+    IF EXISTS (SELECT 1 FROM host_config_attempts
+               WHERE phase = 'released' OR release_requested_at IS NOT NULL) THEN
+        RAISE EXCEPTION '0109 down: a recovery release was requested or recorded; an older control plane cannot read an agent journal that holds it';
     END IF;
 END $$;
 
