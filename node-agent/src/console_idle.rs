@@ -54,10 +54,19 @@ impl Axis {
     }
 
     /// Noise inside the zone around rest is idle, and so is a value away from rest within
-    /// a zone of where it last counted: a held or jittering deflection counts once.
+    /// a zone of where it last counted: a held or jittering deflection counts once. A
+    /// value across rest from the last count must clear twice the zone, so noise flipping
+    /// either side of rest goes quiet; a real push to the other side still counts.
     fn moved(&mut self, value: i32) -> bool {
-        let far = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs() > i64::from(self.dead);
-        if !far(value, self.rest) || !far(value, self.last) {
+        let gap = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs();
+        let side = |v: i32| (i64::from(v) - i64::from(self.rest)).signum();
+        let dead = i64::from(self.dead);
+        let need = if side(value) * side(self.last) < 0 {
+            2 * dead
+        } else {
+            dead
+        };
+        if gap(value, self.rest) <= need || gap(value, self.last) <= dead {
             return false;
         }
         self.last = value;
@@ -180,14 +189,20 @@ impl Device {
 }
 
 /// Whether the event node at `node` is hardware of this host: its sysfs device does not
-/// live under `/sys/devices/virtual` (where uinput makes the streamed sessions' keyboards
-/// and mice). A node whose device cannot be resolved is not taken for physical.
+/// live under `/sys/devices/virtual/input` (where uinput makes the streamed sessions'
+/// keyboards and mice; the agent makes no uhid devices, so Bluetooth LE input, which
+/// resolves under `virtual/misc/uhid`, counts). A node whose device cannot be resolved is
+/// not taken for physical.
 fn is_physical(sysfs: &Path, node: &Path) -> bool {
     let Some(name) = node.file_name() else {
         return false;
     };
-    std::fs::canonicalize(sysfs.join(name).join("device"))
-        .is_ok_and(|device| !device.components().any(|c| c.as_os_str() == "virtual"))
+    std::fs::canonicalize(sysfs.join(name).join("device")).is_ok_and(|device| {
+        let parts: Vec<_> = device.components().map(|c| c.as_os_str()).collect();
+        !parts
+            .windows(2)
+            .any(|w| w[0] == "virtual" && w[1] == "input")
+    })
 }
 
 /// How far an absolute axis moves before it counts as someone touching it: past the
@@ -363,6 +378,22 @@ mod tests {
         assert!(!is_physical(&sys, Path::new("/dev/input/event9")));
     }
 
+    /// #971: a Bluetooth LE keyboard or pad is a uhid device under `devices/virtual/misc`,
+    /// and is a person at the host.
+    #[test]
+    fn a_uhid_device_is_physical() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = fake_sysfs(dir.path(), &[("event4", true)]);
+        let uhid = dir
+            .path()
+            .join("devices/virtual/misc/uhid/0005:045E:0B13.0001/input/input7");
+        std::fs::create_dir_all(&uhid).unwrap();
+        std::fs::create_dir_all(sys.join("event7")).unwrap();
+        std::os::unix::fs::symlink(&uhid, sys.join("event7").join("device")).unwrap();
+        assert!(is_physical(&sys, Path::new("/dev/input/event7")));
+        assert!(!is_physical(&sys, Path::new("/dev/input/event4")), "uinput");
+    }
+
     /// A device that reports on its own (sync, misc, a resting stick's noise) never
     /// resets the quiet period; motion past the dead zone does.
     #[test]
@@ -410,6 +441,19 @@ mod tests {
             hat.moved(-1) && !hat.moved(0) && hat.moved(1),
             "any hat step"
         );
+    }
+
+    /// #811: noise wider than the zone on both sides of rest counts once, not on every
+    /// flip; a real push to the other side still counts.
+    #[test]
+    fn two_sided_axis_noise_goes_quiet() {
+        let mut stick = Axis::new(2048, dead_zone(0, 4095, 128, 0));
+        let busy = [2248, 1848, 2248, 1848, 2248, 1848]
+            .iter()
+            .filter(|&&v| stick.moved(v))
+            .count();
+        assert_eq!(busy, 1);
+        assert!(stick.moved(1700), "a push to the other side");
     }
 
     /// An axis that bounces across its zone for longer than the quiet window lets the
