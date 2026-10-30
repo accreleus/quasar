@@ -75,6 +75,21 @@ Games see an Xbox 360 controller. Some pads (for example 8BitDo over Bluetooth)
 aren't reported in the standard layout, and the **Controller & input** pane says
 so. Switch the pad to XInput mode, or connect it by cable or USB receiver.
 
+Quasar can translate a pad once someone has captured how their browser reports it,
+for that OS and browser. To send a capture, open the browser console (F12) on the
+session page, paste this, press a button to wake the pad, then go through every
+control slowly. After 60 seconds it copies the result; paste that into the issue.
+
+```js
+(()=>{const t0=performance.now(),prev={},out=[];const id=setInterval(()=>{for(const p of navigator.getGamepads()){if(!p)continue;const k=p.index;const s={b:p.buttons.map(b=>+b.value.toFixed(2)),a:p.axes.map(a=>+a.toFixed(3))};const o=prev[k];if(!o){out.push({id:p.id,mapping:p.mapping,buttons:p.buttons.length,axes:p.axes.length,rest:s});console.log("PAD",p.id,p.mapping,p.buttons.length,"buttons",p.axes.length,"axes","rest axes",s.a)}else{s.b.forEach((v,i)=>{if(v!==o.b[i]){out.push({t:Math.round(performance.now()-t0),btn:i,v});console.log("button",i,"=",v)}});s.a.forEach((v,i)=>{if(Math.abs(v-o.a[i])>0.2){out.push({t:Math.round(performance.now()-t0),axis:i,v});console.log("axis",i,"=",v)}})}prev[k]=s}},30);setTimeout(()=>{clearInterval(id);copy(JSON.stringify({ua:navigator.userAgent,platform:navigator.platform,events:out}));console.log("DONE: copied to clipboard",out.length,"events")},60000);console.log("Press any button to wake the pad, then go through every control slowly. Stops after 60 s and copies the result.")})()
+```
+
+For just the pad's id and what is pressed right now:
+
+```js
+[...navigator.getGamepads()].filter(Boolean).map(p=>({id:p.id,mapping:p.mapping,buttons:p.buttons.length,axes:p.axes.length,pressed:p.buttons.flatMap((b,i)=>b.value>0.5?[i]:[]),axisValues:p.axes.map(a=>+a.toFixed(3))}))
+```
+
 ## X and Y are swapped on a gamepad page inside the session
 
 A gamepad tester or web game opened in a browser **inside** the streamed desktop
