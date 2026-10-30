@@ -27,6 +27,9 @@ own; the two do not move together, and that is deliberate.
 ### Fixed
 - **Fleet ▸ Hosts ▸ Settings: an administrator can release a recovery hold (#656).** A host whose configuration restart ended `uncertain` stayed draining until its agent proved its state, and otherwise only a database edit cleared it. The Idle apply panel now offers "Release recovery hold": the confirmation says the host's state is unverified, the call (`POST /v1/admin/hosts/{id}/idle-apply/{attempt_id}/release-recovery` with `acknowledge: "unverified"`) is refused while the agent journal is still reconciling, the host's group reads `failed` so the configuration can be reviewed and approved again, and the release is audited. A journal replay on reconnect no longer puts a released hold back. Migration 0109.
 
+### Internal
+- **Image cleanup test: the second attempt's journal checks no longer race the control plane (#960).** The test now answers every inventory scan as the agent does (a late inventory change that overlaps the attempt's own reconcile costs one more scan before the journal), and treats only a journal request naming the second attempt as stale (the first dispatch's own request for the first attempt can land late). It failed on most CI runs under load. No product change.
+
 ## 0.5.1 — 2026-10-30
 
 ### Upgrading
