@@ -1180,11 +1180,20 @@ fn the_combined_and_control_only_recipes_render_their_golden_specifications() {
     .unwrap();
     check("control-plane-r4-control-only-external.json", &spec);
     assert_eq!(spec.env["QUASAR_HSTS_MAX_AGE"], "");
-    // An older revision renders none, so it refuses a value rather than ignore it.
-    assert!(matches!(
-        render(Role::ControlPlane, 3, &hsts, &cp, &control_secrets(true)),
-        Err(RenderError::Invalid(why)) if why.contains("revision 4")
-    ));
+    // An older revision ignores it, so a restore back to one renders what it always did.
+    let older = render(Role::ControlPlane, 3, &hsts, &cp, &control_secrets(true)).unwrap();
+    assert_eq!(
+        older,
+        render(
+            Role::ControlPlane,
+            3,
+            &enrolling,
+            &cp,
+            &control_secrets(true)
+        )
+        .unwrap()
+    );
+    assert!(!older.env.contains_key("QUASAR_HSTS_MAX_AGE"));
     for bad in ["", "-1", "1.5", "1d", "2147483648"] {
         let mut i = hsts.clone();
         i.control.as_mut().unwrap().hsts_max_age = Some(bad.into());

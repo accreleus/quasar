@@ -366,7 +366,7 @@ stack or manager definition that re-creates it.
   needs (#604), is one: `docker exec -it quasar-recovery quasar-recovery reconfigure --yes
   QUASAR_TRUSTED_PROXIES=<proxy address>`. Turning on HSTS (opt-in, off by default) is another:
   `reconfigure --yes QUASAR_HSTS_MAX_AGE=<seconds>`; it pins the whole host name for that long, so
-  read the warning at `QUASAR_HSTS_MAX_AGE` in `docs/configuration.md` first. `docs/configuration.md`
+  read the warning at `QUASAR_HSTS_MAX_AGE` in `docs/configuration.md` first. Restoring back to a release before HSTS was settable turns it off until the next update. `docs/configuration.md`
   "Changing machine inputs: `reconfigure`".
 - **A GPU host** is removed from the console: the host → **Remove host** drains it, then removes
   its agent and recovery actor. Any machine can be taken apart on the machine with the recovery

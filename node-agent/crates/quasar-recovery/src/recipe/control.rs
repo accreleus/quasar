@@ -124,6 +124,17 @@ pub(super) fn validate(control: &ControlInputs) -> Result<(), RenderError> {
     Ok(())
 }
 
+/// The first control-plane revision that renders `QUASAR_HSTS_MAX_AGE`.
+pub const HSTS_REVISION: u32 = 4;
+
+/// Why a value for `QUASAR_HSTS_MAX_AGE` cannot be applied to a control plane of `revision`.
+/// Asked where the operator sets it (the install, a reconfigure), never in `render`.
+pub fn hsts_needs_newer_image(revision: u32) -> String {
+    format!(
+        "QUASAR_HSTS_MAX_AGE needs a control-plane image of recipe revision {HSTS_REVISION} or later; this one is revision {revision}"
+    )
+}
+
 /// The control plane's rules for `QUASAR_HSTS_MAX_AGE` (`internal/config` `envInt32`):
 /// whole seconds, 0 to 2147483647.
 pub fn hsts_max_age(raw: &str) -> Result<u32, RenderError> {
@@ -261,7 +272,8 @@ pub(super) fn postgres_r1(
 /// release's. Revision 1 gives an override, else the install-time image, as before.
 /// Revision 3 (#543) carries the healthcheck a control plane must pass to be verified:
 /// Podman keeps none from an OCI image, so one left to the image never reports there.
-/// Revision 4 (#874) passes `QUASAR_HSTS_MAX_AGE` (empty unless the operator set it).
+/// Revision 4 (#874) passes `QUASAR_HSTS_MAX_AGE` (empty unless the operator set it); earlier
+/// revisions ignore it.
 pub(super) fn control_plane(
     revision: u32,
     inputs: &Inputs,
@@ -352,16 +364,14 @@ pub(super) fn control_plane(
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect();
-    if let Some(age) = &control.hsts_max_age {
-        // Fail closed: an older revision would render without it and HSTS would silently stay off.
-        if revision < 4 {
-            return Err(RenderError::Invalid(
-                "QUASAR_HSTS_MAX_AGE needs control-plane recipe revision 4 or later".into(),
-            ));
-        }
-        env.insert("QUASAR_HSTS_MAX_AGE".into(), hsts_max_age(age)?.to_string());
-    } else if revision >= 4 {
-        env.insert("QUASAR_HSTS_MAX_AGE".into(), String::new());
+    // An older revision ignores the input: it must render any machine state a newer one
+    // accepted, or a restore back to it fails after it has stopped everything (ADR 0008).
+    if revision >= HSTS_REVISION {
+        let age = control.hsts_max_age.as_deref().map(hsts_max_age);
+        env.insert(
+            "QUASAR_HSTS_MAX_AGE".into(),
+            age.transpose()?.map(|n| n.to_string()).unwrap_or_default(),
+        );
     }
     let reference = |i: Option<&ImageRef>| i.map(ImageRef::reference).unwrap_or_default();
     let e = &inputs.enroll;
