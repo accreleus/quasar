@@ -65,6 +65,9 @@ impl Axis {
 struct Watch {
     nodes: BTreeMap<String, Node>,
     last_input: Instant,
+    /// When a poll last saw user input. Unlike `last_input` it starts unset: a fresh
+    /// watch has seen nothing, only restarted the quiet period.
+    last_seen: Option<Instant>,
 }
 
 static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
@@ -88,6 +91,14 @@ pub(crate) fn idle_for(dir: &Path) -> Result<Duration, &'static str> {
     watch()
         .get_or_insert_with(|| Watch::new(now))
         .poll(dir, now)
+}
+
+/// Whether the last poll(s) saw user input within `window`: someone is at this host.
+pub(crate) fn input_within(window: Duration) -> bool {
+    watch()
+        .as_ref()
+        .and_then(|w| w.last_seen)
+        .is_some_and(|at| at.elapsed() <= window)
 }
 
 impl Device {
@@ -172,6 +183,7 @@ impl Watch {
         Watch {
             nodes: BTreeMap::new(),
             last_input: now,
+            last_seen: None,
         }
     }
 
@@ -208,6 +220,7 @@ impl Watch {
         });
         if input {
             self.last_input = now;
+            self.last_seen = Some(now);
         }
         if unreadable {
             return Err("an input device cannot be opened");
@@ -264,11 +277,13 @@ mod tests {
         let mut watch = Watch::new(start);
 
         assert_eq!(watch.poll(dir.path(), start), Ok(Duration::ZERO));
+        assert_eq!(watch.last_seen, None, "a fresh watch has seen no one");
         let later = start + Duration::from_secs(600);
         assert_eq!(watch.poll(dir.path(), later), Ok(Duration::from_secs(600)));
 
         keyboard.write_all(&event(EV_KEY, 30, 1)).unwrap();
         assert_eq!(watch.poll(dir.path(), later), Ok(Duration::ZERO));
+        assert_eq!(watch.last_seen, Some(later));
         let after = later + Duration::from_secs(5);
         assert_eq!(watch.poll(dir.path(), after), Ok(Duration::from_secs(5)));
     }

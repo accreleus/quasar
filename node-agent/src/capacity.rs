@@ -163,7 +163,13 @@ pub(crate) fn detect_console_capabilities() -> ConsoleCapabilities {
             reset_claimed_watch();
             crate::ddc::powered_connectors(typed_connectors)
         } else {
-            claimed_connectors(typed_connectors)
+            let displayed = crate::session::console_plan::console_output(
+                crate::readiness::console::configured_output_id().as_deref(),
+                &outputs,
+            )
+            .ok()
+            .map(|o| o.connector.clone());
+            claimed_connectors(typed_connectors, displayed.as_deref())
         },
         outputs,
         input_devices: detect_input_devices(),
@@ -270,6 +276,8 @@ fn ddc_probe_allowed(display_claimed: bool) -> bool {
 /// absent, and the control plane stops it.
 const CONSOLE_QUIET_BEFORE_DDC: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const CLAIMED_DDC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Input this recent, as of a poll, counts as someone at the host for learning its monitor input.
+const LEARN_INPUT_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 /// After a read found a monitor off, input reads again this long after it, and again at
 /// this spacing while input goes on and the monitor still reads off: someone may be
 /// switching it back on, and the control plane's grace must not end on one early look.
@@ -360,7 +368,7 @@ fn reset_claimed_watch() {
 
 /// The connected connectors of a claimed display, less those a quiet-console read found
 /// off. The input watch runs only while such a read could happen.
-fn claimed_connectors(connected: Vec<String>) -> Vec<String> {
+fn claimed_connectors(connected: Vec<String>, displayed: Option<&str>) -> Vec<String> {
     if let Some(why) = crate::ddc::known_bus_read_blocked(&connected) {
         crate::console_idle::reset();
         let mut state = lock_ddc(&CLAIMED_DDC);
@@ -375,6 +383,13 @@ fn claimed_connectors(connected: Vec<String>) -> Vec<String> {
             None
         }
     };
+    // Local input on a displaying console is the proof that someone sees this host: the
+    // monitor's input now is the host's.
+    if let Some(connector) =
+        displayed.filter(|_| crate::console_idle::input_within(LEARN_INPUT_WITHIN))
+    {
+        crate::ddc::learn_input(connector);
+    }
     claimed_connectors_with(
         &CLAIMED_DDC,
         connected,
