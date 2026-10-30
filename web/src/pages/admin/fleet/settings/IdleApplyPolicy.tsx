@@ -136,7 +136,7 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
     {
       success: "Recovery hold released.",
       failure: "Could not release the recovery hold.",
-      onSuccess: () => { setActionError(null); setReleasing(false); },
+      onSuccess: () => { setActionError(null); setReleasing(false); void resource.refresh(); },
       onFailure: (error) => {
         setReleasing(false);
         setActionError(error instanceof ApiError ? error.message : "Could not release the recovery hold.");
@@ -147,7 +147,8 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
   const busy = approve.pending !== null || cancel.pending !== null || release.pending !== null;
   const recoveryHeld = attempt?.phase === "uncertain" && attempt.admission_restricted;
 
-  return <KnobPanel title="Idle apply" hint="Approve a reviewed host configuration for an idle window. Saving settings alone does not apply them.">
+  // The dialog sits outside the card: a .card's backdrop-filter traps position: fixed.
+  return <><KnobPanel title="Idle apply" hint="Approve a reviewed host configuration for an idle window. Saving settings alone does not apply them.">
     <div className="cset">
       <ResourceStates loading={resource.loading} error={resource.errorMessage} loadingLabel="Loading idle apply status…" />
       {group && <>
@@ -179,26 +180,27 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
           </>}
         </div>
         {displayed && reviewDetails(displayed)}
-        {releasing && attempt && <Modal
-          open
-          onClose={() => setReleasing(false)}
-          title="Release the recovery hold?"
-          footer={<>
-            <Button variant="ghost" onClick={() => setReleasing(false)}>Cancel</Button>
-            <Button variant="danger" disabled={!acknowledged || busy} onClick={() => void release.run(attempt.attempt_id, hostId)}>Release hold</Button>
-          </>}
-        >
-          <div className="note warn">
-            <strong>This host's state is unverified.</strong> The agent restarted to apply a configuration and could not
-            prove which configuration it is running now. Releasing the hold lets the host take new sessions anyway.
-          </div>
-          <p>The control plane does not repair the host. Check its readiness and media probe first, then review and approve the configuration again.</p>
-          <label className="rowflex">
-            <input type="checkbox" checked={acknowledged} onChange={(e) => setAcknowledged(e.target.checked)} />
-            <span>I understand this host's configuration is unverified.</span>
-          </label>
-        </Modal>}
       </>}
     </div>
-  </KnobPanel>;
+  </KnobPanel>
+  {releasing && attempt && <Modal
+    open
+    onClose={() => setReleasing(false)}
+    title="Release the recovery hold?"
+    footer={<>
+      <Button variant="ghost" onClick={() => setReleasing(false)}>Cancel</Button>
+      <Button variant="danger" disabled={!acknowledged || busy} onClick={() => void release.run(attempt.attempt_id, hostId)}>Release hold</Button>
+    </>}
+  >
+    <div className="note warn">
+      <strong>This host's state is unverified.</strong> The agent restarted to apply a configuration and could not
+      prove which configuration it is running now. Releasing the hold lets the host take new sessions anyway.
+    </div>
+    <p>The control plane does not repair the host. Check its readiness and media probe first, then review and approve the configuration again.</p>
+    <label className="rowflex">
+      <input type="checkbox" checked={acknowledged} onChange={(e) => setAcknowledged(e.target.checked)} />
+      <span>I understand this host's configuration is unverified.</span>
+    </label>
+  </Modal>}
+  </>;
 }

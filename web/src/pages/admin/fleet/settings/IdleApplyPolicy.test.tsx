@@ -41,6 +41,7 @@ describe("idle apply policy", () => {
     const confirm = screen.getByRole("button", { name: "Release hold" }) as HTMLButtonElement;
     expect(confirm.disabled).toBe(true);
     fireEvent.click(screen.getByRole("checkbox", { name: /configuration is unverified/ }));
+    vi.mocked(api.getHostIdleApply).mockResolvedValue({ ...uncertain, admission_restricted: false } as never);
     fireEvent.click(confirm);
     await waitFor(() => expect(api.releaseHostRecoveryHold).toHaveBeenCalledWith("admin-token", "host-1", waiting.attempt_id));
     expect(await screen.findByText(/An administrator released the recovery hold/)).toBeTruthy();
