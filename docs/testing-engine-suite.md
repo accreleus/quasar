@@ -93,8 +93,8 @@ Without `QUASAR_ENGINE_SUITE_TARGETS` the binary checks only its own tables, so 
 
 ## Where each mode runs
 
-CI (`.github/workflows/ci.yml`, job `engines`, one job per mode on an Ubuntu 24.04 hosted
-runner; `scripts/verify/ci-engine-target.sh` brings each engine up):
+CI (`.github/workflows/ci.yml`, job `engines`, one job per mode on an Ubuntu 26.04 hosted
+runner (`runs-on: ubuntu-26.04`, pinned; `ci.yml` says how to move it); `scripts/verify/ci-engine-target.sh` brings each engine up):
 
 | Mode | CI | Lab |
 |---|---|---|
