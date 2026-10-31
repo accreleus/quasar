@@ -8,9 +8,10 @@
 // doesn't carry them back — so this hook keeps the last server-ACKED value
 // and treats its own state as optimistic until then.
 //
-// The render size is on no read the player has (the session row never carries it;
-// session_metrics is admin-only), so the last-acked value is kept per session in
-// sessionStorage and a reload starts from it instead of from "match the stream".
+// The render size and interface size are on no read the player has (the session row
+// never carries them; session_metrics is admin-only), so the last-acked values are kept
+// per session in sessionStorage and a reload starts from them instead of from "match the
+// stream" / 1×.
 //
 // `externalSize`/`externalResizeSupported` are owned by useSessionStatus (its
 // 5s poll also updates them); this hook is handed their raw setters and calls
@@ -22,27 +23,35 @@ import type { ToastItem } from "../../components/Toast";
 
 type Size = { w: number; h: number };
 
-const renderKey = (sessionId: string) => `quasar.session.${sessionId}.render`;
+const ackedKey = (sessionId: string, field: "render" | "uiScale") => `quasar.session.${sessionId}.${field}`;
 
-function loadAckedRender(sessionId: string | undefined): Size | null {
+/** Read a stored acked value; `parse` returns null for anything the PATCH contract would not accept. */
+function loadAcked<T>(sessionId: string | undefined, field: "render" | "uiScale", parse: (v: unknown) => T | null): T | null {
   if (!sessionId) return null;
   try {
-    const v = JSON.parse(sessionStorage.getItem(renderKey(sessionId)) ?? "null");
-    // The PATCH contract's own bounds (even, >= 16); the launch-size ceiling is unknown at mount.
-    const ok = (n: unknown) => Number.isInteger(n) && (n as number) >= 16 && (n as number) % 2 === 0;
-    return ok(v?.w) && ok(v?.h) ? { w: v.w, h: v.h } : null;
+    return parse(JSON.parse(sessionStorage.getItem(ackedKey(sessionId, field)) ?? "null"));
   } catch {
     return null; // storage blocked or unparseable: behave as if nothing was acked
   }
 }
 
-function saveAckedRender(sessionId: string, size: Size) {
+function saveAcked(sessionId: string, field: "render" | "uiScale", value: unknown) {
   try {
-    sessionStorage.setItem(renderKey(sessionId), JSON.stringify(size));
+    sessionStorage.setItem(ackedKey(sessionId, field), JSON.stringify(value));
   } catch {
-    // best-effort: without it a reload falls back to the launch size, as before
+    // best-effort: without it a reload falls back to the launch value, as before
   }
 }
+
+// The PATCH contract's own bounds (even, >= 16); the launch-size ceiling is unknown at mount.
+const parseRender = (v: unknown): Size | null => {
+  const { w, h } = (v ?? {}) as { w?: unknown; h?: unknown };
+  const ok = (n: unknown): n is number => Number.isInteger(n) && (n as number) >= 16 && (n as number) % 2 === 0;
+  return ok(w) && ok(h) ? { w, h } : null;
+};
+// ui_scale is within [1.0, 3.0] (openapi.yaml, PATCH /v1/sessions/{id}/display).
+const parseUiScale = (v: unknown): number | null =>
+  typeof v === "number" && v >= 1 && v <= 3 ? v : null;
 
 /** Settle time before a display change (render resolution / interface size)
  *  is sent. Shared timer/body across controls — two independent debounces on
@@ -77,9 +86,10 @@ export function useDisplayPatch(params: UseDisplayPatchParams): UseDisplayPatchR
   // null means "match the stream": staying null rather than eagerly copying
   // the stream size means a revert lands on default without knowing it.
   // The initial value is what a reload of this page last had acked (see module header).
-  const [initialRender] = useState(() => loadAckedRender(sessionId));
+  const [initialRender] = useState(() => loadAcked(sessionId, "render", parseRender));
+  const [initialUiScale] = useState(() => loadAcked(sessionId, "uiScale", parseUiScale) ?? 1);
   const [renderSize, setRenderSize] = useState<{ w: number; h: number } | null>(initialRender);
-  const [uiScale, setUiScale] = useState(1);
+  const [uiScale, setUiScale] = useState(initialUiScale);
   const [displayBusy, setDisplayBusy] = useState(false);
   // Distinct from displayBusy (true for any display PATCH, including render-res).
   const [streamChanging, setStreamChanging] = useState(false);
@@ -92,7 +102,7 @@ export function useDisplayPatch(params: UseDisplayPatchParams): UseDisplayPatchR
     external: { w: number; h: number } | null;
   }>({
     render: initialRender,
-    uiScale: 1,
+    uiScale: initialUiScale,
     external: null,
   });
   // One shared timer + one merged body for BOTH controls — see
@@ -144,9 +154,12 @@ export function useDisplayPatch(params: UseDisplayPatchParams): UseDisplayPatchR
       // the other field's acked value alone.
       if (body.render_width != null && body.render_height != null) {
         ackedDisplayRef.current.render = { w: body.render_width, h: body.render_height };
-        saveAckedRender(sessionId, ackedDisplayRef.current.render);
+        saveAcked(sessionId, "render", ackedDisplayRef.current.render);
       }
-      if (body.ui_scale != null) ackedDisplayRef.current.uiScale = body.ui_scale;
+      if (body.ui_scale != null) {
+        ackedDisplayRef.current.uiScale = body.ui_scale;
+        saveAcked(sessionId, "uiScale", body.ui_scale);
+      }
       if (body.stream_width != null && body.stream_height != null) {
         ackedDisplayRef.current.external = { w: body.stream_width, h: body.stream_height };
       }
