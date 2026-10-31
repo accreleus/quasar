@@ -297,6 +297,42 @@ func TestConsolePoweredOffMonitorStopsTheSessionByDefault(t *testing.T) {
 	}
 }
 
+// #966: a shared monitor that powers on to another input is reported by the agent as it
+// reports a switched-off one: the connector is still connected in `outputs` but absent from
+// `connectors`. Powering on to the other input starts nothing; switching to this host's
+// input starts the console session; switching away again stops it after the grace.
+func TestConsoleMonitorOnAnotherInputStartsNothingUntilItShowsThisHost(t *testing.T) {
+	const grace = 800 * time.Millisecond
+	h, pool, ev := selfHealHandler(t)
+	h.consoleAuto.powerOffGrace = grace
+	hostID := seedEligibleConsolePinnedHost(t, h, pool, "card0:DP-4")
+	output := `"outputs":[{"id":"card0:DP-4","card":"card0","render_node":null,"connector":"DP-4","connected":true,"active_mode":null,"modes":[]}]`
+	otherInput := `{"connectors":[],"input_devices":[],` + output + `}`
+	thisHost := `{"connectors":["DP-4"],"input_devices":[],` + output + `}`
+
+	consoleReport(t, h, hostID, otherInput)
+	consoleReport(t, h, hostID, otherInput)
+	if got := ev.count(); got != 0 {
+		t.Fatalf("launch count = %d, want 0 while the monitor shows another input", got)
+	}
+
+	consoleReport(t, h, hostID, thisHost)
+	if got := ev.count(); got != 1 {
+		t.Fatalf("launch count = %d, want 1 once the monitor shows this host", got)
+	}
+
+	stopEv := &teardownEvents{active: true}
+	h.events = stopEv
+	consoleReport(t, h, hostID, otherInput)
+	deadline := time.Now().Add(grace + 3*time.Second)
+	for len(stopEv.reasons()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if got := stopEv.reasons(); len(got) != 1 || got[0] != "console_display_disconnected" {
+		t.Fatalf("stops = %v, want one console_display_disconnected for a monitor left on another input", got)
+	}
+}
+
 // A monitor read off and then on again within the grace (the user is back) keeps the
 // session and disarms the timer.
 func TestConsolePoweredOffMonitorBackWithinTheGraceKeepsTheSession(t *testing.T) {

@@ -155,11 +155,12 @@
         "no_dt_needed": ["libcuda", "libgstcuda", "libnvidia"],
         "no_unresolved_libs": true,
         "must_start": true,
-        "_notes": "Verified 2026-07-26 on the live CUDA-built binary: readelf -d shows DT_NEEDED for glib/gst/asound/libc only. libgstcuda-1.0.so itself carries no libcuda DT_NEEDED -- it dlopens. So a --features cuda binary links and starts cleanly on a driver-less host, which is what lets ONE binary serve both vendors. must_start accepts the config-validation exit ('CONTROL_PLANE_URL is required') as success: reaching config validation proves process start and dynamic linking both succeeded."
+        "_notes": "A --features cuda binary has DT_NEEDED libgstcuda-1.0.so.0 (shipped in /opt/gst, so it resolves) and no libcuda: libgstcuda itself dlopens the driver. So it links and starts cleanly on a driver-less host, which is what lets ONE binary serve both vendors. Checked 2026-10-30 (#927): the runtime image has no readelf, so no_dt_needed passes without testing anything; the binary-has-the-feature check is in commands.must_succeed. must_start accepts the config-validation exit ('CONTROL_PLANE_URL is required') as success: reaching config validation proves process start and dynamic linking both succeeded."
       },
 
       "commands": {
         "must_succeed": {
+          "grep -aq gst_cuda_context_new /usr/local/bin/quasar-node-agent": "#927: the agent is built --features cuda (ZC-02 zero-copy NVENC), which leaves this undefined dynamic symbol in the binary. The image has no readelf. The feature is silently absent when the build stage drops its CUDA_ENABLE ARG: the agent starts and Vulkan sessions stream either way.",
           "ldd /usr/local/bin/quasar-launch-helper | grep -q 'statically linked'": "#731: the launch helper runs inside the Steam app image, not this one, so it may need no libc from either; a dynamic build would load this image's glibc and break on another distribution.",
           "env -i /usr/local/bin/quasar-launch-helper": "#731: the helper starts, and with no -applaunch appid it exits 0, as it must for every app that is not a derived Steam tile."
         }

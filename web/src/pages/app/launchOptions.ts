@@ -349,9 +349,11 @@ const REASON_COPY: Record<string, ReasonCopy> = {
   },
   codec_not_supported: {
     hard: "This browser can't decode the video format this option uses. Leave the codec on Auto, or open Quasar in a different browser.",
+    soft: "This browser can't decode the best video format here, so this starts one step lower.",
   },
   host_encoder_not_supported: {
     hard: "No host that can encode this quality is available. Pick a lower quality, or try again once a host frees up.",
+    soft: "Your host can't encode the best video format here, so this starts one step lower.",
   },
   display_refresh_unknown: {
     hard: "This option needs a high-refresh screen, and Quasar can't read your screen's refresh rate. A lower frame rate is the safe pick.",
