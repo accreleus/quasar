@@ -276,6 +276,9 @@ pub enum NestedOwnership {
     /// Make nothing: the container's `PUID` or `PGID` is 0, and the agent never hands
     /// a directory to root as the app user.
     Refused,
+    /// Make nothing: the engine could not be identified, so how it maps the app user
+    /// is unknown. A shared mount refuses the launch; a plain home's repair is skipped.
+    Unknown,
     /// Make and repair as `owner` (`None`: leave what the agent makes as its own).
     /// `root_uid` is the id an app container's root writes as, which a runtime-made
     /// mount point carries.
@@ -290,22 +293,26 @@ pub enum NestedOwnership {
 /// agent's own uid 0, and the app's root onto `verify::app_root_uid`; every other mode
 /// sees the container's `PUID`/`PGID` (`ContainerSpec::app_ids`) as they are. A
 /// non-root agent cannot hand a directory to another user, so what it makes stays its
-/// own.
+/// own and the engine is not asked. `engine` is asked only for a root agent; `None`
+/// (not identified) never reads as rootful.
 pub fn nested_mount_owner(
     spec: &super::container::ContainerSpec,
     euid: u32,
-    engine: &crate::buildinfo::EngineIdentity,
+    engine: &dyn Fn() -> Option<crate::buildinfo::EngineIdentity>,
 ) -> NestedOwnership {
-    let root_uid = super::warmup::verify::app_root_uid(engine);
-    if root_uid != 0 {
-        return NestedOwnership::Owned {
-            owner: (euid == 0).then_some((0, 0)),
-            root_uid,
-        };
-    }
     if euid != 0 {
         return NestedOwnership::Owned {
             owner: None,
+            root_uid: 0,
+        };
+    }
+    let Some(engine) = engine() else {
+        return NestedOwnership::Unknown;
+    };
+    let root_uid = super::warmup::verify::app_root_uid(&engine);
+    if root_uid != 0 {
+        return NestedOwnership::Owned {
+            owner: Some((0, 0)),
             root_uid,
         };
     }
@@ -318,6 +325,32 @@ pub fn nested_mount_owner(
     }
 }
 
+/// The engine's identity for home ownership: the first successful inspection, kept for
+/// the process (the socket is fixed at boot, so kind and mode cannot change under a
+/// running agent). A Busy refusal is asked again as the create path does; a failure is
+/// never kept, so the next launch asks again.
+pub fn known_engine() -> Option<crate::buildinfo::EngineIdentity> {
+    static KNOWN: std::sync::OnceLock<crate::buildinfo::EngineIdentity> =
+        std::sync::OnceLock::new();
+    if let Some(engine) = KNOWN.get() {
+        return Some(engine.clone());
+    }
+    let client = crate::runtime::configured().ok()?;
+    let facts = super::teardown::retry_busy(super::teardown::STOP_PAUSE, || {
+        client.inspect_engine().wait()
+    })
+    .ok()?;
+    let engine = crate::buildinfo::EngineIdentity::from_facts(&facts);
+    engine.engine.as_ref()?;
+    Some(KNOWN.get_or_init(|| engine).clone())
+}
+
+/// Whether any mount's source is under the home root, the only case the ownership of
+/// what the agent makes can matter.
+pub fn has_mount_under_root(mounts: &[String], home_root: &str) -> bool {
+    resolve_root(home_root).is_some_and(|root| !under_root(mounts, &root).is_empty())
+}
+
 /// Makes what each nested mount needs before the container exists, so the runtime
 /// never creates either as root (#1001): its source, under the source's own home
 /// (`<home>/<rel>`, e.g. the Steam home's `.local/share/Steam`), and its mount point
@@ -327,26 +360,50 @@ pub fn nested_mount_owner(
 ///
 /// Every directory made on those paths, and an existing leaf that is empty and
 /// root-owned, is owned as [`nested_mount_owner`] says. These paths are inside
-/// user-writable homes, so every step is taken relative to an open directory with
-/// `O_NOFOLLOW` (`nofollow_dir`) and ownership is set on the opened directory: a
-/// symlink anywhere on a path, present before the walk or swapped in during it, refuses
-/// and nothing is made or re-owned through it. The repair of a plain home skips it with
-/// a warning instead.
+/// user-writable homes, so every directory is opened and made relative to an open
+/// directory with `O_NOFOLLOW` (`nofollow_dir`), starting at the home root, and
+/// ownership is set on the opened directory: a symlink anywhere below the home root,
+/// present before the walk or swapped in during it, refuses and nothing is made or
+/// re-owned through it. The repair of a plain home skips it with a warning instead.
+/// With the engine unidentified ([`NestedOwnership::Unknown`]) nothing is made: a
+/// shared mount refuses the launch, and the repair is skipped.
 pub fn provision_nested_mounts(
     mounts: &[String],
     home_root: &str,
     ownership: NestedOwnership,
 ) -> std::io::Result<()> {
-    let NestedOwnership::Owned { owner, root_uid } = ownership else {
-        let has_nested = resolve_root(home_root)
-            .is_some_and(|root| !split_home_mounts(mounts, &root).1.is_empty());
-        if has_nested {
-            tracing::warn!(
-                token = "home-nested-owner-root",
-                "the app container's PUID or PGID is 0: no shared-mount directory is made for it"
-            );
+    let has_nested = || {
+        resolve_root(home_root).is_some_and(|root| !split_home_mounts(mounts, &root).1.is_empty())
+    };
+    let (owner, root_uid) = match ownership {
+        NestedOwnership::Owned { owner, root_uid } => (owner, root_uid),
+        NestedOwnership::Refused => {
+            if has_nested() {
+                tracing::warn!(
+                    token = "home-nested-owner-root",
+                    "the app container's PUID or PGID is 0: no shared-mount directory is made for it"
+                );
+            }
+            return Ok(());
         }
-        return Ok(());
+        NestedOwnership::Unknown if has_nested() => {
+            tracing::warn!(
+                token = "home-nested-engine-unknown",
+                "the container engine could not be identified: the shared mount's directories are not made"
+            );
+            return Err(std::io::Error::other(
+                "the container engine could not be identified, so the shared Steam library's owner is unknown; refusing to make its directories",
+            ));
+        }
+        NestedOwnership::Unknown => {
+            if has_mount_under_root(mounts, home_root) {
+                tracing::warn!(
+                    token = "home-steam-dir-repair-engine-unknown",
+                    "the container engine could not be identified: the Steam data dir repair is skipped"
+                );
+            }
+            return Ok(());
+        }
     };
     let mut chown = |dir: &std::fs::File, uid: u32, gid: u32| {
         std::os::unix::fs::fchown(dir, Some(uid), Some(gid))
@@ -367,7 +424,7 @@ fn provision_nested_mounts_with(
         return Ok(());
     };
     let under = under_root(mounts, &root);
-    let mut chain = |base: &Path, rel: &Path, create: bool| {
+    let mut chain = |base: &Path, rel: &Path, owner: Option<(u32, u32)>, create: bool| {
         own_chain(base, rel, owner, root_uid, create, chown)
     };
     for m in &under {
@@ -385,7 +442,7 @@ fn provision_nested_mounts_with(
             });
             if !holds_nested && m.host.is_dir() {
                 // Best effort: a plain launch is never refused for it.
-                if let Err(e) = chain(&m.host, Path::new(STEAM_DATA_DIR), false) {
+                if let Err(e) = chain(&m.host, Path::new(STEAM_DATA_DIR), owner, false) {
                     tracing::warn!(
                         token = "home-steam-dir-repair-skipped",
                         "steam data dir repair skipped for {}: {e:#}",
@@ -405,17 +462,23 @@ fn provision_nested_mounts_with(
             .and_then(|h| h.strip_suffix(rel.to_str()?))
             .map(|h| PathBuf::from(h.trim_end_matches('/')))
             .filter(|h| is_under_root(&root, h));
+        // The control plane always mounts `<home>/<rel>` (`sharedSteamMount`); any other
+        // source is not a shared mount the agent can own correctly, so it refuses.
         let result = match source_home {
-            Some(source_home) => {
-                std::fs::create_dir_all(&source_home).and_then(|()| chain(&source_home, rel, true))
-            }
-            None => match (m.host.parent(), m.host.file_name()) {
-                (Some(parent), Some(leaf)) => std::fs::create_dir_all(parent)
-                    .and_then(|()| chain(parent, Path::new(leaf), true)),
-                _ => Err(std::io::Error::other("nested mount source has no parent")),
-            },
+            // The source's home is made, unowned like any home the agent makes, by the
+            // same walk from the home root; then its `rel` chain is owned.
+            Some(source_home) => source_home
+                .strip_prefix(&root)
+                .map_err(std::io::Error::other)
+                .and_then(|above| chain(&root, above, None, true))
+                .and_then(|()| chain(&source_home, rel, owner, true)),
+            None => Err(std::io::Error::other(format!(
+                "{} is not <home>/{}",
+                m.host.display(),
+                rel.display()
+            ))),
         }
-        .and_then(|()| chain(&home.host, rel, true));
+        .and_then(|()| chain(&home.host, rel, owner, true));
         if let Err(e) = result {
             tracing::warn!(
                 token = "home-provision-nested-failed",
@@ -1158,7 +1221,7 @@ mod tests {
         {
             return; // the host default is set for this process; the unset case cannot be observed
         }
-        let rootful = crate::buildinfo::EngineIdentity::default();
+        let rootful = || Some(engine("docker", "rootful"));
         let owned = |owner| NestedOwnership::Owned { owner, root_uid: 0 };
         let mut spec = crate::session::container::ContainerSpec::default();
         assert_eq!(
@@ -1167,7 +1230,9 @@ mod tests {
             "the images' PUID/PGID default"
         );
         assert_eq!(
-            nested_mount_owner(&spec, 1000, &rootful),
+            nested_mount_owner(&spec, 1000, &|| panic!(
+                "a non-root agent never asks the engine"
+            )),
             owned(None),
             "a non-root agent cannot hand a dir to another user"
         );
@@ -1178,6 +1243,64 @@ mod tests {
             owned(Some((99, 100))),
             "a catalog PUID/PGID wins"
         );
+    }
+
+    fn engine(kind: &str, mode: &str) -> crate::buildinfo::EngineIdentity {
+        crate::buildinfo::EngineIdentity {
+            engine: Some(kind.into()),
+            engine_version: None,
+            engine_mode: Some(mode.into()),
+        }
+    }
+
+    #[test]
+    fn an_unidentified_engine_never_reads_as_rootful() {
+        let spec = crate::session::container::ContainerSpec::default();
+        assert_eq!(
+            nested_mount_owner(&spec, 0, &|| None),
+            NestedOwnership::Unknown
+        );
+    }
+
+    #[test]
+    fn with_the_engine_unknown_a_shared_mount_refuses_and_makes_nothing() {
+        let (_d, root, desktop, steam_home, mounts) = sharing_mounts();
+        let err =
+            provision_nested_mounts(&mounts, root.to_str().unwrap(), NestedOwnership::Unknown)
+                .unwrap_err();
+        assert!(err.to_string().contains("could not be identified"), "{err}");
+        assert!(
+            !desktop.join(".local").exists() && !steam_home.exists(),
+            "made a directory with the engine unknown"
+        );
+    }
+
+    #[test]
+    fn with_the_engine_unknown_a_plain_home_repair_is_skipped_and_the_launch_goes_on() {
+        let (_d, root, desktop, _steam_home, _mounts) = sharing_mounts();
+        std::fs::create_dir_all(desktop.join(".local/share/Steam")).unwrap();
+        let plain = vec![format!("{}:/home/quasar:rw", desktop.display())];
+        provision_nested_mounts(&plain, root.to_str().unwrap(), NestedOwnership::Unknown).unwrap();
+        assert!(desktop.join(".local/share/Steam").is_dir());
+    }
+
+    #[test]
+    fn a_source_that_is_not_home_slash_rel_is_refused() {
+        let (_d, root, desktop, _steam_home, _mounts) = sharing_mounts();
+        let odd = vec![
+            format!("{}:/home/quasar:rw", desktop.display()),
+            format!(
+                "{}/other:/home/quasar/.local/share/Steam:rw",
+                root.join("u/steam").display()
+            ),
+        ];
+        let (result, seen) = provision_recorded(&odd, &root, Some((1000, 1000)));
+        assert!(result.is_err(), "an unrecognised shared source must refuse");
+        assert!(
+            seen.is_empty(),
+            "owned something for an unrecognised source: {seen:?}"
+        );
+        assert!(!root.join("u/steam").exists());
     }
 
     #[test]
@@ -1191,7 +1314,7 @@ mod tests {
         spec.env.insert("PUID".into(), "1000".into());
         // keep-id maps the app user onto the agent's uid 0 and the app's root onto 1.
         assert_eq!(
-            nested_mount_owner(&spec, 0, &rootless),
+            nested_mount_owner(&spec, 0, &|| Some(rootless.clone())),
             NestedOwnership::Owned {
                 owner: Some((0, 0)),
                 root_uid: 1
@@ -1201,7 +1324,7 @@ mod tests {
 
     #[test]
     fn an_env_puid_or_pgid_of_0_makes_nothing() {
-        let rootful = crate::buildinfo::EngineIdentity::default();
+        let rootful = || Some(engine("docker", "rootful"));
         for (k, v) in [("PUID", "0"), ("PGID", "0")] {
             let mut spec = crate::session::container::ContainerSpec::default();
             spec.env.insert(k.into(), v.into());
