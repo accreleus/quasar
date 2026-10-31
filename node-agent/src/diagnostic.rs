@@ -934,6 +934,7 @@ where
         ControlMsg::Registered { .. }
         | ControlMsg::ConfigUpdate { .. }
         | ControlMsg::ConfigPolicyJournalInventoryRequest { .. }
+        | ControlMsg::ConfigPolicyRelease { .. }
         | ControlMsg::Signaling { .. }
         | ControlMsg::Error { .. }
         | ControlMsg::Unknown => {
