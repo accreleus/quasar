@@ -467,6 +467,37 @@ describe("SessionPage — an ordinary stop is not a game exit (#726)", () => {
     expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
   });
 
+  // The runtime re-seats on `failed`: with the channel open the picture still plays and Exit is on screen.
+  it("recovery failed with the input channel still open keeps the grace (#812)", async () => {
+    await streamingWithMicAndCapture();
+    refused();
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+    await advance(600);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+  });
+
+  // The trade-off: with the channel gone the banner paints before the end-reason read lands, then goes.
+  it("recovery failed, channel closed, game exit read still in flight: the banner shows, then the library (#812)", async () => {
+    const ch = await streamingWithMicAndCapture();
+    refused();
+    let land!: () => void;
+    getSession.mockImplementation(
+      () => new Promise((r) => { land = () => r({ session: makeSession({ state: "stopping", state_detail: "game exited" }) }); }),
+    );
+    await act(async () => {
+      ch.onclose?.();
+      lastOnRecovery?.(failed);
+    });
+    await advance(50);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    await act(async () => land());
+    await advance(50);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
   // The two terms of the banner condition: both are only visible once the grace has run out.
   it("a game exit keeps the recovery banner off even after the grace (#812)", async () => {
     blockNavigate = true;
