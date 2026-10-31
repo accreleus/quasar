@@ -670,7 +670,7 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 	}
 	c.policyInventoryDone.Store(true)
 	if !c.policyInventoryBlocked.Load() {
-		if err := h.cfgStore.CompleteJournalReconciliation(ctx, c.hostID, c.connectionIncarnation, c.rh05RestartEntries, c.rh05Snapshots); err != nil {
+		if err := h.completeJournal(ctx, c); err != nil {
 			return err
 		}
 	}
@@ -690,6 +690,35 @@ func sameCursor(a, b *string) bool {
 		return a == nil && b == nil
 	}
 	return *a == *b
+}
+
+// completeJournal is the only way the agentws path completes a connection's
+// journal gate, so every completion sends the releases pending on it. Which call
+// completes it depends on the delivery gate: an open one makes the inventory's
+// call return early and the legacy-map acknowledgement's call complete it.
+func (h *Handler) completeJournal(ctx context.Context, c *conn) error {
+	if err := h.cfgStore.CompleteJournalReconciliation(ctx, c.hostID, c.connectionIncarnation, c.rh05RestartEntries, c.rh05Snapshots); err != nil {
+		return err
+	}
+	return h.sendRecoveryReleases(ctx, c)
+}
+
+// sendRecoveryReleases sends every release an administrator requested and the
+// agent has not yet reported, once this connection's journal is reconciled.
+func (h *Handler) sendRecoveryReleases(ctx context.Context, c *conn) error {
+	if !c.policyRecoveryRelease {
+		return nil
+	}
+	ids, err := h.cfgStore.PendingRecoveryReleases(ctx, c.hostID, c.connectionIncarnation)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := h.registry.Send(c.hostID, hostcfg.NewRecoveryReleaseCmd(id, c.bootIncarnation, c.connectionIncarnation)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (h *Handler) restartPolicyInventory(ctx context.Context, c *conn) error {
@@ -884,7 +913,6 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
-	h.failures.Forget(clientIP)
 
 	h.log.Info("agent registered", "host_id", hostID)
 
@@ -908,6 +936,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	ac.policyTyped = policyTyped
 	ac.policyAccepted = acceptedGroups
 	ac.policyIdle = slices.Contains(acceptedGroups, "hardware")
+	ac.policyRecoveryRelease = ac.policyIdle && caps.RecoveryRelease
 	ac.bootIncarnation = h.bootIncarnation
 	ac.connectionIncarnation = connectionID
 	ac.imageCleanupV1 = cleanupRegister.Capable
@@ -1209,6 +1238,11 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				ConnectionIncarnation string  `json:"connection_incarnation"`
 			}
 			if err := json.Unmarshal(raw, &report); err != nil || report.ConnectionIncarnation != ac.connectionIncarnation {
+				continue
+			}
+			if report.Code == "release_refused" || report.Code == "stale_release_request" || report.Code == "journal_write_failed" {
+				// The release stays pending; the next reconciled connection sends it again.
+				h.log.Warn("agent did not apply a recovery release", "host_id", hostID, "code", report.Code)
 				continue
 			}
 			if report.Code == "group_execution_unavailable" && report.Group != nil && hostcfg.IsPolicyGroup(*report.Group) {
@@ -1532,6 +1566,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 type registerCaps struct {
 	TerminalHomeCleanupV1 bool
 	ParkedSessionsV1      bool
+	RecoveryRelease       bool // config_policy_versions.recovery_release (amendment 51)
 }
 
 // handleRegister performs the register handshake and returns the resolved host
@@ -1546,6 +1581,13 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		h.failures.Failure(clientIP)
 		return "", time.Time{}, nil, nil, registerCaps{}, false, nil, "", ImageCleanupRegister{}, err
 	}
+	// Counts before it replies: a peer that has read a refusal must find it counted,
+	// or one that pipelines dials probes past the budget (#984).
+	refuse := func(code, msg string, err error) (string, time.Time, []RegisterImage, *string, registerCaps, bool, []string, string, ImageCleanupRegister, error) {
+		h.failures.Failure(clientIP)
+		h.writeError(conn, code, msg)
+		return "", time.Time{}, nil, nil, registerCaps{}, false, nil, "", ImageCleanupRegister{}, err
+	}
 	conn.SetReadDeadline(time.Now().Add(registerReadTimeout))
 	raw, err := readTextMessage(conn)
 	if err != nil {
@@ -1557,33 +1599,30 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		return fail(fmt.Errorf("decode: %w", err))
 	}
 	if reg.Type != "register" {
-		h.writeError(conn, "protocol_error", "expected register as first message")
-		return fail(fmt.Errorf("unexpected first message type %q", reg.Type))
+		return refuse("protocol_error", "expected register as first message", fmt.Errorf("unexpected first message type %q", reg.Type))
 	}
 	if reg.NodeName == "" || reg.AgentVersion == "" {
-		h.writeError(conn, "protocol_error", "node_name and agent_version are required")
-		return fail(errors.New("missing required register fields"))
+		return refuse("protocol_error", "node_name and agent_version are required", errors.New("missing required register fields"))
 	}
 
 	result, err := h.resolveAuth(ctx, reg)
 	if err != nil {
+		code, msg := "auth_failed", "authentication failed"
 		switch {
 		case errors.Is(err, ErrInvalidEnrollmentToken), errors.Is(err, ErrInvalidNodeSecret):
-			h.writeError(conn, "auth_failed", "authentication failed")
+			// the generic reply above
 		case errors.Is(err, ErrHostAgentConnected):
 			// Deliberately distinct from auth_failed: the credential was fine, the
 			// REQUEST was refused. An operator re-enrolling a machine that is quietly
 			// already running needs to be told that, not sent to check their token (#96).
 			// The existing `auth_failed` code stays exactly as it was for bad credentials,
 			// so this adds a case rather than changing one.
-			h.writeError(conn, "auth_failed",
-				"a live agent is already registered under this node name; stop it before re-enrolling, "+
-					"or enroll under a different node_name. If that machine is gone, forget the host first "+
-					"with the admin API (DELETE /v1/hosts/{id}); that deletes its history and tombstones its homes.")
+			msg = "a live agent is already registered under this node name; stop it before re-enrolling, " +
+				"or enroll under a different node_name. If that machine is gone, forget the host first " +
+				"with the admin API (DELETE /v1/hosts/{id}); that deletes its history and tombstones its homes."
 		case errors.Is(err, ErrHostAlreadyEnrolled):
-			h.writeError(conn, "auth_failed",
-				"this node name is already enrolled; re-enrolling it needs an enrollment token "+
-					"minted for this node name (Admin -> Fleet -> Add host, with the name filled in)")
+			msg = "this node name is already enrolled; re-enrolling it needs an enrollment token " +
+				"minted for this node name (Admin -> Fleet -> Add host, with the name filled in)"
 		case errors.Is(err, ErrHostNotFound):
 			// Names the credential that was refused, not just the remedy: the old
 			// wording ("use enrollment_token to enroll first") is exactly what an
@@ -1603,15 +1642,14 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			// case does not need the exemption: the agent re-registers with its
 			// enrollment token on the very next attempt (#199), so a working
 			// re-enrollment costs one counted reject, not ten.
-			h.writeError(conn, "host_not_found",
-				"the node_secret presented belongs to no host enrolled on this control plane — it "+
-					"was minted by a different control plane, or this host was removed here. Enroll "+
-					"again with an enrollment token, clearing the agent's saved node secret "+
-					"(NODE_SECRET_PATH) first if it has no token configured.")
+			code, msg = "host_not_found", "the node_secret presented belongs to no host enrolled on this control plane — it "+
+				"was minted by a different control plane, or this host was removed here. Enroll "+
+				"again with an enrollment token, clearing the agent's saved node secret "+
+				"(NODE_SECRET_PATH) first if it has no token configured."
 		default:
-			h.writeError(conn, "internal_error", "registration failed")
+			code, msg = "internal_error", "registration failed"
 		}
-		return fail(err)
+		return refuse(code, msg, err)
 	}
 	// Platform-release identity (amendment 1): written AFTER auth succeeded, so
 	// a failed registration never touches a host row, and wholesale — absent
@@ -1676,6 +1714,10 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			return fail(fmt.Errorf("register policy connection: %w", err))
 		}
 	}
+	// Before the reply, for the reason refuse counts first: a late Forget would erase
+	// failures the peer's next dials already spent (#984). The credential is proven
+	// here, so clearing the budget even if this write fails is intended.
+	h.failures.Forget(clientIP)
 	if err := conn.WriteJSON(resp); err != nil {
 		return "", time.Time{}, nil, nil, registerCaps{}, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
 	}
@@ -1688,7 +1730,8 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	return result.HostID, result.RegisteredAt, reg.Images, identity.SourceCommit,
-		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1},
+		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1,
+			RecoveryRelease: reg.ConfigPolicyVersions["recovery_release"] == 1},
 		policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }
 
@@ -1770,7 +1813,7 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 				return err
 			} else if ok {
 				ac.policyInitialMapApplied.Store(true)
-				if err := h.cfgStore.CompleteJournalReconciliation(ctx, hostID, ac.connectionIncarnation, ac.rh05RestartEntries, ac.rh05Snapshots); err != nil {
+				if err := h.completeJournal(ctx, ac); err != nil {
 					return err
 				}
 				if err := h.maybeRunDeferredPolicyRefresh(ctx, ac); err != nil {
