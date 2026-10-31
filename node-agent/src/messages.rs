@@ -1241,6 +1241,13 @@ pub enum ControlMsg {
         settings: serde_json::Value,
         resolved_settings: serde_json::Value,
     },
+    /// The administrator's release of an `uncertain` restart record (agent-api.md
+    /// `config_policy_release`, amendment 51).
+    ConfigPolicyRelease {
+        attempt_id: String,
+        boot_incarnation: String,
+        connection_incarnation: String,
+    },
     ConfigPolicyJournalInventoryRequest {
         inventory_id: String,
         boot_incarnation: String,

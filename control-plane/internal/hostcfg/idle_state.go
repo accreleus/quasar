@@ -52,11 +52,11 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 	if err != nil || seq < 0 || strconv.FormatInt(seq, 10) != state.Sequence || !validPolicyDigest(state.Digest) {
 		return false, ErrApprovalSuperseded
 	}
-	terminal := state.Phase == "applied" || state.Phase == "recovered" || state.Phase == "uncertain" || state.Phase == "revoked_unstarted" || state.Phase == "failed" && seq == 0
+	terminal := state.Phase == "applied" || state.Phase == "recovered" || state.Phase == "uncertain" || state.Phase == "released" || state.Phase == "revoked_unstarted" || state.Phase == "failed" && seq == 0
 	valid := map[string]bool{"accepted": true, "activating": true, "awaiting_startup": true,
 		"verifying": true, "failed": true, "recovery_verifying": true,
 		"recovery_awaiting_startup": true, "recovered": true, "uncertain": true,
-		"applied": true, "revoked_unstarted": true}
+		"applied": true, "revoked_unstarted": true, "released": true}
 	if !valid[state.Phase] || (seq == 0 && state.Phase != "failed" && state.Phase != "revoked_unstarted") ||
 		(seq > 0 && state.Phase == "revoked_unstarted") {
 		return false, ErrApprovalSuperseded
@@ -145,8 +145,9 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 		}
 		return false, tx.Commit(ctx)
 	}
-	if terminalAt != nil {
+	if terminalAt != nil && (phase != "uncertain" || state.Phase != "released") {
 		// Includes a seq-0 failed closed by a complete journal: its hold is gone.
+		// The one move out of a final phase is an administrator's release.
 		return false, ErrApprovalSuperseded
 	}
 	if started != nil && seq == 0 {
@@ -157,7 +158,7 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 	}
 	if _, err := tx.Exec(ctx, `UPDATE host_config_attempts SET phase=$3,journal_sequence=$4,
 		started_at=CASE WHEN $4::bigint>0 THEN COALESCE(started_at,now()) ELSE started_at END,
-		terminal_at=CASE WHEN $5 THEN now() ELSE terminal_at END,
+		terminal_at=CASE WHEN $5 THEN COALESCE(terminal_at,now()) ELSE terminal_at END,
 		recovery_attempted=recovery_attempted OR $3 IN ('recovery_verifying','recovery_awaiting_startup','recovered','uncertain'),
 		error_code=CASE WHEN $6='' THEN error_code ELSE $6 END
 		WHERE host_id=$1::uuid AND id=$2::uuid`, hostID, state.AttemptID, state.Phase, seq, terminal, safeIdleErrorCode(state.ErrorCode)); err != nil {
@@ -175,13 +176,14 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 			return false, err
 		}
 	}
-	if state.Phase == "recovered" || state.Phase == "uncertain" || state.Phase == "failed" {
+	if state.Phase == "recovered" || state.Phase == "uncertain" || state.Phase == "failed" || state.Phase == "released" {
 		status := "failed"
 		if state.Phase == "uncertain" {
 			status = "uncertain"
 		}
+		// A release moves the group only off uncertain.
 		if _, err := tx.Exec(ctx, `UPDATE host_setting_groups SET status=$3 WHERE host_id=$1::uuid AND group_key=$2
-			AND desired_revision=$4 AND desired_digest=$5`, hostID, state.Group, status, revision, state.Digest); err != nil {
+			AND desired_revision=$4 AND desired_digest=$5 AND ($6<>'released' OR status='uncertain')`, hostID, state.Group, status, revision, state.Digest, state.Phase); err != nil {
 			return false, err
 		}
 	}
@@ -201,12 +203,16 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 			}
 		}
 	} else if terminal {
-		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, state.AttemptID); err != nil {
+		// A recovery row exists only for an uncertain attempt; a release ends it.
+		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind IN ('idle_apply','recovery') AND owner_id=$2::uuid`, hostID, state.AttemptID); err != nil {
 			return false, err
 		}
-		if hostStatus == "draining" {
-			if _, err := tx.Exec(ctx, `UPDATE hosts SET status=`+releasedStatusSQL+` WHERE id=$1::uuid AND NOT EXISTS
-				(SELECT 1 FROM host_admission_restrictions WHERE host_id=$1::uuid)`, hostID); err != nil {
+		if _, err := tx.Exec(ctx, projectHostStatusSQL, hostID); err != nil {
+			return false, err
+		}
+		if state.Phase == "released" {
+			// A resolved disruptive hold opens new approvals under fresh review IDs.
+			if err := rotateHostReviewTokens(ctx, tx, hostID); err != nil {
 				return false, err
 			}
 		}
