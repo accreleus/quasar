@@ -283,21 +283,27 @@ func TestAnUnreadableSourceFailsTheJobsReadAndSkipsScheduling(t *testing.T) {
 	}
 }
 
-func TestAPendingRunWithNoFinishedRunKeepsItsDate(t *testing.T) {
-	s := newSourcedJob(t, 15*time.Minute)
-	_, next := s.firstPassAndSuccessor(t)
+// A job that has never finished a run follows its period and window the moment they
+// change: its pending run is dated by the window now in force, not the one it was born under.
+func TestAPendingRunWithNoFinishedRunFollowsTheNewPeriod(t *testing.T) {
+	s := newSourcedJob(t, 7*24*time.Hour, func(d *Definition) { d.DailyOpensEveryDay = true })
+	// A one-hour window hours from now, so no run is ever due while the test runs.
+	now := time.Now().UTC()
+	open, shut := now.Add(6*time.Hour).Format("15:04"), now.Add(7*time.Hour).Format("15:04")
 	if _, err := s.store.pool.Exec(context.Background(),
-		`UPDATE job_runs SET scheduled_for = now() + interval '60 days' WHERE id = $1::uuid`, next.ID); err != nil {
+		`UPDATE jobs SET window_start = $1, window_end = $2, window_days = ARRAY[$3]::smallint[]
+		  WHERE id = 'library.discovery'`, open, shut, int(now.AddDate(0, 0, 3).Weekday())); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.store.pool.Exec(context.Background(),
-		`DELETE FROM job_runs WHERE job_id = 'library.discovery' AND state <> 'pending'`); err != nil {
-		t.Fatal(err)
-	}
-	before := s.next(t).ScheduledFor
 	s.tick(t)
-	if got := s.next(t).ScheduledFor; !got.Equal(before) || s.execs.Load() != 1 {
-		t.Fatalf("scheduled_for %v -> %v, execs %d: a pending run with no finished run to measure from moved", before, got, s.execs.Load())
+	if got := time.Until(s.next(t).ScheduledFor); got < 48*time.Hour {
+		t.Fatalf("weekly run due in %s, want it held to the window day three days out", got)
+	}
+
+	s.period.Store(int64(24 * time.Hour))
+	s.tick(t)
+	if got := time.Until(s.next(t).ScheduledFor); got > 25*time.Hour {
+		t.Fatalf("daily run due in %s with no run finished yet, want the next window", got)
 	}
 }
 
