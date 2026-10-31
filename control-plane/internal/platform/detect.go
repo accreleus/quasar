@@ -109,7 +109,9 @@ func (d *Detector) Detect(ctx context.Context) (Report, error) {
 
 	listings, err := d.source.List(ctx)
 	if err != nil {
-		return rep, err
+		// The listing is GitHub's and can be rate limited; the preview tag is the registry's,
+		// so the branch pass still runs and the failed listing is what the run reports.
+		return rep, errors.Join(err, d.detectBranch(ctx, &rep))
 	}
 	existing, err := d.store.Releases(ctx, ChannelStable)
 	if err != nil {
