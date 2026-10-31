@@ -22,6 +22,7 @@ pub const POSTGRES_IMAGE: &str = "QUASAR_POSTGRES_IMAGE";
 pub const PUBLIC_HOST: &str = "QUASAR_PUBLIC_HOST";
 pub const TLS_HOSTS: &str = "QUASAR_TLS_HOSTS";
 pub const TRUSTED_PROXIES: &str = "QUASAR_TRUSTED_PROXIES";
+pub const HSTS_MAX_AGE: &str = "QUASAR_HSTS_MAX_AGE";
 pub const HTTP_PORT: &str = "QUASAR_HTTP_PORT";
 pub const TLS_PORT: &str = "QUASAR_TLS_PORT";
 /// Optional overrides of the images Add host installs; unset, the control plane offers the
@@ -197,6 +198,7 @@ impl Bootstrap {
                 public_host: get(PUBLIC_HOST),
                 tls_hosts: get(TLS_HOSTS),
                 trusted_proxies: get(TRUSTED_PROXIES),
+                hsts_max_age: get(HSTS_MAX_AGE),
                 http_port: get(HTTP_PORT),
                 tls_port: get(TLS_PORT),
                 database_host: get(DATABASE_HOST),
@@ -457,6 +459,7 @@ impl Bootstrap {
                     recipe::ControlRole::ControlOnly
                 },
                 trusted_proxies: op.trusted_proxies.clone(),
+                hsts_max_age: op.hsts_max_age.clone(),
                 http_port,
                 tls_port,
                 public_host: op.public_host.clone().map(|h| h.trim().to_owned()),

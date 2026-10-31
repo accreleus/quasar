@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
+	"github.com/accreleus/quasar/control-plane/internal/settings"
 )
 
 // Amendment 19 (#455): a console app that does not declare
@@ -18,7 +19,8 @@ func TestConsoleLaunchRefusesAppThatCannotRunDirect(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
 	s := seed(t, pool, 8)
-	coord := newTestCoordinator(t, store, newCapturingDispatcher(), testLogger())
+	disp := newCapturingDispatcher()
+	coord := newTestCoordinator(t, store, disp, testLogger())
 	ctx := context.Background()
 
 	_, err := coord.LaunchConsoleSession(ctx, s.hostID, s.userID, s.appID, "local_only", 1920, 1080, 60)
@@ -34,8 +36,21 @@ func TestConsoleLaunchRefusesAppThatCannotRunDirect(t *testing.T) {
 	// Declared, the same app launches local_only.
 	must(t, exec(t, pool, `UPDATE apps SET runtime_spec = runtime_spec || '{"direct_display":true}'::jsonb
 		WHERE id::text = $1`, s.appID))
+	if _, _, err := store.SaveRegionInput(ctx, s.userID, func(r *RegionInput) {
+		r.Region.Timezone, r.Input.Keyboard = strp("Asia/Seoul"), &settings.Keyboard{Layout: "de", Variant: "nodeadkeys"}
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := coord.LaunchConsoleSession(ctx, s.hostID, s.userID, s.appID, "local_only", 1920, 1080, 60); err != nil {
 		t.Fatalf("console launch of a direct app: %v", err)
+	}
+	// The console assign carries the user's Region and Input values (amendment 49).
+	disp.waitFor(t, "assign")
+	disp.mu.Lock()
+	env := envOf(t, disp.assigns[0])
+	disp.mu.Unlock()
+	if env["TZ"] != "Asia/Seoul" || env["XKB_DEFAULT_LAYOUT"] != "de" || env["XKB_DEFAULT_VARIANT"] != "nodeadkeys" {
+		t.Errorf("console assign env = %v, want the saved TZ and keyboard", env)
 	}
 	// The retired topology fails closed even for a direct app.
 	if _, err := coord.LaunchConsoleSession(ctx, s.hostID, s.userID, s.appID, "dual_output", 1920, 1080, 60); err == nil {

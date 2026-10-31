@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::ErrorKind;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,9 @@ type Node = Option<Device>;
 struct Device {
     handle: EvdevHandle<File>,
     axes: HashMap<u16, Axis>,
+    /// A device on this host's own hardware, not one a program made (uinput): only its
+    /// input proves a person is at the host.
+    physical: bool,
 }
 
 /// An absolute axis: its value at open (rest), its dead zone, and the value it last
@@ -51,10 +54,19 @@ impl Axis {
     }
 
     /// Noise inside the zone around rest is idle, and so is a value away from rest within
-    /// a zone of where it last counted: a held or jittering deflection counts once.
+    /// a zone of where it last counted: a held or jittering deflection counts once. A
+    /// value across rest from the last count must clear twice the zone, so noise flipping
+    /// either side of rest goes quiet; a real push to the other side still counts.
     fn moved(&mut self, value: i32) -> bool {
-        let far = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs() > i64::from(self.dead);
-        if !far(value, self.rest) || !far(value, self.last) {
+        let gap = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs();
+        let side = |v: i32| (i64::from(v) - i64::from(self.rest)).signum();
+        let dead = i64::from(self.dead);
+        let need = if side(value) * side(self.last) < 0 {
+            2 * dead
+        } else {
+            dead
+        };
+        if gap(value, self.rest) <= need || gap(value, self.last) <= dead {
             return false;
         }
         self.last = value;
@@ -63,8 +75,14 @@ impl Axis {
 }
 
 struct Watch {
+    /// Where `class/input/<node>/device` links are resolved; `/sys/class/input`.
+    sysfs: PathBuf,
     nodes: BTreeMap<String, Node>,
     last_input: Instant,
+    /// When a poll last saw user input on a physical device. Unlike `last_input` it starts
+    /// unset: a fresh watch has seen nothing, only restarted the quiet period; and a
+    /// streamed session's virtual keyboard or mouse never sets it.
+    last_seen: Option<Instant>,
 }
 
 static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
@@ -90,8 +108,16 @@ pub(crate) fn idle_for(dir: &Path) -> Result<Duration, &'static str> {
         .poll(dir, now)
 }
 
+/// Whether the last poll(s) saw user input within `window`: someone is at this host.
+pub(crate) fn input_within(window: Duration) -> bool {
+    watch()
+        .as_ref()
+        .and_then(|w| w.last_seen)
+        .is_some_and(|at| at.elapsed() <= window)
+}
+
 impl Device {
-    fn open(path: &Path) -> std::io::Result<Node> {
+    fn open(path: &Path, sysfs: &Path) -> std::io::Result<Node> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -111,7 +137,12 @@ impl Device {
                 axes.insert(axis as u16, Axis::new(info.value, dead));
             }
         }
-        Ok(Some(Device { handle, axes }))
+        let physical = is_physical(sysfs, path);
+        Ok(Some(Device {
+            handle,
+            axes,
+            physical,
+        }))
     }
 
     /// Drains the device; `None` once it is gone, else whether it had user input.
@@ -157,6 +188,23 @@ impl Device {
     }
 }
 
+/// Whether the event node at `node` is hardware of this host: its sysfs device does not
+/// live under `/sys/devices/virtual/input` (where uinput makes the streamed sessions'
+/// keyboards and mice; the agent makes no uhid devices, so Bluetooth LE input, which
+/// resolves under `virtual/misc/uhid`, counts). A node whose device cannot be resolved is
+/// not taken for physical.
+fn is_physical(sysfs: &Path, node: &Path) -> bool {
+    let Some(name) = node.file_name() else {
+        return false;
+    };
+    std::fs::canonicalize(sysfs.join(name).join("device")).is_ok_and(|device| {
+        let parts: Vec<_> = device.components().map(|c| c.as_os_str()).collect();
+        !parts
+            .windows(2)
+            .any(|w| w[0] == "virtual" && w[1] == "input")
+    })
+}
+
 /// How far an absolute axis moves before it counts as someone touching it: past the
 /// driver's own flat and fuzz, and past 1/32 of its range, so a resting stick's noise
 /// is not play.
@@ -170,8 +218,10 @@ fn dead_zone(minimum: i32, maximum: i32, flat: i32, fuzz: i32) -> i32 {
 impl Watch {
     fn new(now: Instant) -> Self {
         Watch {
+            sysfs: PathBuf::from("/sys/class/input"),
             nodes: BTreeMap::new(),
             last_input: now,
+            last_seen: None,
         }
     }
 
@@ -188,19 +238,20 @@ impl Watch {
             if self.nodes.contains_key(&name) {
                 continue;
             }
-            match Device::open(&dir.join(&name)) {
+            match Device::open(&dir.join(&name), &self.sysfs) {
                 Ok(node) => {
                     self.nodes.insert(name, node);
                 }
                 Err(_) => unreadable = true,
             }
         }
-        let mut input = false;
+        let (mut input, mut physical) = (false, false);
         self.nodes.retain(|_, node| match node {
             None => true,
             Some(device) => match device.drain() {
                 Some(had) => {
                     input |= had;
+                    physical |= had && device.physical;
                     true
                 }
                 None => false,
@@ -208,6 +259,9 @@ impl Watch {
         });
         if input {
             self.last_input = now;
+        }
+        if physical {
+            self.last_seen = Some(now);
         }
         if unreadable {
             return Err("an input device cannot be opened");
@@ -254,6 +308,23 @@ mod tests {
     const SYN: i32 = input_linux::sys::EV_SYN;
     const MSC: i32 = input_linux::sys::EV_MSC;
 
+    /// A fake `/sys/class/input` in `dir/sys`: each node's `device` link leads to a hardware
+    /// path, or one under `devices/virtual` like a uinput device's.
+    fn fake_sysfs(dir: &Path, nodes: &[(&str, bool)]) -> PathBuf {
+        let sys = dir.join("sys");
+        for (name, virtual_device) in nodes {
+            let target = dir.join(if *virtual_device {
+                format!("devices/virtual/input/input-{name}")
+            } else {
+                format!("devices/pci0000:00/usb1/input/input-{name}")
+            });
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(sys.join(name)).unwrap();
+            std::os::unix::fs::symlink(&target, sys.join(name).join("device")).unwrap();
+        }
+        sys
+    }
+
     #[test]
     fn quiet_grows_until_a_device_has_input() {
         let dir = tempfile::tempdir().unwrap();
@@ -262,15 +333,65 @@ mod tests {
         std::fs::write(dir.path().join("mouse0"), b"").unwrap();
         let start = Instant::now();
         let mut watch = Watch::new(start);
+        watch.sysfs = fake_sysfs(dir.path(), &[("event3", false), ("event7", false)]);
 
         assert_eq!(watch.poll(dir.path(), start), Ok(Duration::ZERO));
+        assert_eq!(watch.last_seen, None, "a fresh watch has seen no one");
         let later = start + Duration::from_secs(600);
         assert_eq!(watch.poll(dir.path(), later), Ok(Duration::from_secs(600)));
 
         keyboard.write_all(&event(EV_KEY, 30, 1)).unwrap();
         assert_eq!(watch.poll(dir.path(), later), Ok(Duration::ZERO));
+        assert_eq!(watch.last_seen, Some(later));
         let after = later + Duration::from_secs(5);
         assert_eq!(watch.poll(dir.path(), after), Ok(Duration::from_secs(5)));
+    }
+
+    /// A streamed session's uinput keyboard or mouse is input for the quiet period but never
+    /// proof that a person is at the host (what the monitor-input learning needs).
+    #[test]
+    fn only_a_physical_device_is_evidence_of_a_person() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut virtual_keyboard = fifo(dir.path(), "event4");
+        let mut keyboard = fifo(dir.path(), "event3");
+        let start = Instant::now();
+        let mut watch = Watch::new(start);
+        watch.sysfs = fake_sysfs(dir.path(), &[("event3", false), ("event4", true)]);
+        let t = start + Duration::from_secs(30);
+
+        virtual_keyboard.write_all(&event(EV_KEY, 30, 1)).unwrap();
+        assert_eq!(watch.poll(dir.path(), t), Ok(Duration::ZERO));
+        assert_eq!(watch.last_seen, None, "uinput input is not a person");
+
+        keyboard.write_all(&event(EV_KEY, 30, 1)).unwrap();
+        let t2 = t + Duration::from_secs(1);
+        watch.poll(dir.path(), t2).unwrap();
+        assert_eq!(watch.last_seen, Some(t2));
+    }
+
+    #[test]
+    fn a_device_sysfs_cannot_place_is_not_physical() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = fake_sysfs(dir.path(), &[("event3", false), ("event4", true)]);
+        assert!(is_physical(&sys, Path::new("/dev/input/event3")));
+        assert!(!is_physical(&sys, Path::new("/dev/input/event4")));
+        assert!(!is_physical(&sys, Path::new("/dev/input/event9")));
+    }
+
+    /// #971: a Bluetooth LE keyboard or pad is a uhid device under `devices/virtual/misc`,
+    /// and is a person at the host.
+    #[test]
+    fn a_uhid_device_is_physical() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = fake_sysfs(dir.path(), &[("event4", true)]);
+        let uhid = dir
+            .path()
+            .join("devices/virtual/misc/uhid/0005:045E:0B13.0001/input/input7");
+        std::fs::create_dir_all(&uhid).unwrap();
+        std::fs::create_dir_all(sys.join("event7")).unwrap();
+        std::os::unix::fs::symlink(&uhid, sys.join("event7").join("device")).unwrap();
+        assert!(is_physical(&sys, Path::new("/dev/input/event7")));
+        assert!(!is_physical(&sys, Path::new("/dev/input/event4")), "uinput");
     }
 
     /// A device that reports on its own (sync, misc, a resting stick's noise) never
@@ -320,6 +441,19 @@ mod tests {
             hat.moved(-1) && !hat.moved(0) && hat.moved(1),
             "any hat step"
         );
+    }
+
+    /// #811: noise wider than the zone on both sides of rest counts once, not on every
+    /// flip; a real push to the other side still counts.
+    #[test]
+    fn two_sided_axis_noise_goes_quiet() {
+        let mut stick = Axis::new(2048, dead_zone(0, 4095, 128, 0));
+        let busy = [2248, 1848, 2248, 1848, 2248, 1848]
+            .iter()
+            .filter(|&&v| stick.moved(v))
+            .count();
+        assert_eq!(busy, 1);
+        assert!(stick.moved(1700), "a push to the other side");
     }
 
     /// An axis that bounces across its zone for longer than the quiet window lets the

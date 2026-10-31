@@ -143,6 +143,8 @@ pub async fn run(cfg: Config) {
         crate::restart::exit_now(1);
     }
 
+    crate::ddc::set_state_path(cfg.console_input_state_path());
+
     // Consume a restart journal marker once per process, before probes or
     // session runtime initialization can observe the affected hardware group.
     let policy_path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
@@ -5587,13 +5589,6 @@ fn probe_inputs(mgr: &SessionManager) -> crate::host_probe::decision::ProbeInput
     mgr.codec_stack().probe_inputs()
 }
 
-/// Turn the assign's `AppSpec` into a launchable container spec, or `None` when
-/// no image is set (a bare/compositor-only session).
-///
-/// The single point where wire-supplied mounts become agent data, so it is where
-/// [`MountPolicy`] runs. Mounts the agent itself appends later (the Wayland socket,
-/// the pulse runtime dir) are agent-authored and deliberately not re-checked.
-/// A rejection fails the assign or the swap; nothing is spawned.
 /// The env keys the control plane sets from a user's Region and Input settings
 /// (`agent-api.md` amendment 49).
 const REGION_INPUT_ENV_KEYS: [&str; 9] = [
@@ -5621,6 +5616,13 @@ fn region_env(container: Option<&ContainerSpec>) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Turn the assign's `AppSpec` into a launchable container spec, or `None` when
+/// no image is set (a bare/compositor-only session).
+///
+/// The single point where wire-supplied mounts become agent data, so it is where
+/// [`MountPolicy`] runs. Mounts the agent itself appends later (the Wayland socket,
+/// the pulse runtime dir) are agent-authored and deliberately not re-checked.
+/// A rejection fails the assign or the swap; nothing is spawned.
 fn app_to_container(app: AppSpec, mounts: &MountPolicy) -> anyhow::Result<Option<ContainerSpec>> {
     if app.image.is_empty() {
         return Ok(None);
@@ -11858,6 +11860,45 @@ mod tests {
             mgr.running["p0"].region_env,
             BTreeMap::from([("TZ".to_string(), "Asia/Tokyo".to_string())])
         );
+    }
+
+    #[test]
+    fn a_completed_swap_records_exactly_the_canonical_region_keys() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg_from_wire(SessionKind::Play, "-applaunch 620", "Europe/Berlin");
+        assert!(acked(start(&mut mgr, &warm, "p0", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("p0", SessionEvent::Running);
+        // The control plane sends all nine; the app's own keys ride along.
+        let mut env: BTreeMap<String, String> = REGION_INPUT_ENV_KEYS
+            .iter()
+            .map(|k| (k.to_string(), format!("v-{k}")))
+            .collect();
+        env.insert("KEEP".into(), "1".into());
+        let app = AppSpec {
+            image: "steam".into(),
+            env,
+            ..Default::default()
+        };
+        let ctrl = ControlMsg::SessionSwapApp {
+            id: "swap".into(),
+            session_id: "p0".into(),
+            app,
+            in_place: false,
+        };
+        assert!(acked(mgr.handle_control(
+            ctrl,
+            &warm.evt_tx,
+            &diagnostic_sender()
+        )));
+        mgr.relay("p0", SessionEvent::SwapDone);
+        let recorded = &mgr.running["p0"].region_env;
+        assert_eq!(recorded.keys().map(String::as_str).collect::<Vec<_>>(), {
+            let mut want = REGION_INPUT_ENV_KEYS.to_vec();
+            want.sort_unstable();
+            want
+        });
+        assert_eq!(recorded["TZ"], "v-TZ");
     }
 
     #[test]

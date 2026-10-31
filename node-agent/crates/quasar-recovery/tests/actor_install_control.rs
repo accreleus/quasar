@@ -921,6 +921,66 @@ fn the_control_plane_is_told_its_machine_shape_and_trusted_proxies() {
     }
 }
 
+/// `QUASAR_HSTS_MAX_AGE` is a seed input (#874): a revision-4 control plane gets it, a bad
+/// value or an older image stops the install before anything is created.
+#[test]
+fn hsts_max_age_is_a_seed_input_for_a_revision_4_control_plane() {
+    let hsts = |value: &str| {
+        let mut env = combined_env();
+        env.insert("QUASAR_HSTS_MAX_AGE".into(), value.into());
+        env
+    };
+    let at_revision_4 = |env| {
+        let mut state = control_host(env);
+        let id = "sha256:c0c0000000000000000000000000000000000000000000000000000000000000";
+        state
+            .registry
+            .insert(CONTROL_IMAGE.into(), image(id, CONTROL_IMAGE, Some("4")));
+        state
+    };
+    let (engine, dir, id) = {
+        let engine = Arc::new(FakeEngine::new(at_revision_4(hsts("31536000"))));
+        let dir = tempfile::tempdir().unwrap();
+        let id = seed(&engine, dir.path(), SEED_ID).step();
+        assert!(matches!(id, Outcome::Created { .. }), "{id:?}");
+        let actor_id = engine
+            .state()
+            .container_named(names::RECOVERY_ACTOR)
+            .unwrap()
+            .id
+            .clone();
+        (engine, dir, actor_id)
+    };
+    start(&engine, dir.path(), &id).resume().unwrap();
+    let state = engine.state();
+    let cp = state.container_named(names::CONTROL_PLANE).unwrap();
+    assert_eq!(cp.spec.env["QUASAR_HSTS_MAX_AGE"], "31536000");
+
+    for (state, value) in [
+        (at_revision_4(hsts("-1")), "-1"),
+        (at_revision_4(hsts("1d")), "1d"),
+    ] {
+        let engine = Arc::new(FakeEngine::new(state));
+        let dir = tempfile::tempdir().unwrap();
+        let refused = seed(&engine, dir.path(), SEED_ID).step();
+        assert!(
+            matches!(&refused, Outcome::Idle { why, .. } if why.contains("QUASAR_HSTS_MAX_AGE")),
+            "{value}: {refused:?}"
+        );
+    }
+
+    // The seed cannot know the image's revision; the actor refuses to install a control
+    // plane that would drop the value.
+    let (engine, dir, id) = seeded(hsts("86400"));
+    let installed = start(&engine, dir.path(), &id).resume();
+    let why = installed.expect_err("a revision-1 control plane must not install with HSTS set");
+    assert!(format!("{why:?}").contains("revision 4"), "{why:?}");
+    assert!(engine
+        .state()
+        .container_named(names::CONTROL_PLANE)
+        .is_none());
+}
+
 /// An actor put back by a revert reads machine state a newer actor wrote.
 #[test]
 fn machine_state_with_inputs_this_actor_does_not_know_still_loads() {
