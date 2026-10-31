@@ -56,6 +56,7 @@ jobs:
       web: ${{ steps.areas.outputs.web }}
       rust: ${{ steps.areas.outputs.rust }}
       site: ${{ steps.areas.outputs.site }}
+      deploy: ${{ steps.areas.outputs.deploy }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,7 +72,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          all() { printf 'go=true\nweb=true\nrust=true\nsite=true\n' | tee -a "$GITHUB_OUTPUT"; }
+          all() { printf 'go=true\nweb=true\nrust=true\nsite=true\ndeploy=true\n' | tee -a "$GITHUB_OUTPUT"; }
           if [ "$EVENT" != pull_request ]; then echo "$EVENT: every job runs"; all; exit 0; fi
           # A rename counts on both sides: moving a file out of web/ still concerns web.
           gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
@@ -79,7 +80,7 @@ jobs:
           # The files API lists at most 3000; a list that long may be cut short, so run everything.
           if [ "$(wc -l < "$RUNNER_TEMP/changed")" -ge 3000 ]; then echo "3000+ paths: every job runs"; all; exit 0; fi
           out="$(bash scripts/verify/ci-changed-areas.sh < "$RUNNER_TEMP/changed")"
-          [ "$(grep -c -E '^(go|web|rust|site)=(true|false)$' <<<"$out")" -eq 4 ] \
+          [ "$(grep -c -E '^(go|web|rust|site|deploy)=(true|false)$' <<<"$out")" -eq 5 ] \
             || { echo "::error::ci-changed-areas.sh gave an unusable answer: $out"; exit 1; }
           echo "$out" | tee -a "$GITHUB_OUTPUT"
 
@@ -192,6 +193,21 @@ jobs:
           [ "$CHANGES" = success ] || { echo "::error::the changed-areas job did not succeed"; exit 1; }
           [ "$WANTED" = true ] || { echo "no control-plane change: nothing to gather"; exit 0; }
           [ "$TESTS" = success ] || { echo "::error::a control-plane job did not pass"; exit 1; }
+
+  # The compose file set must still render to the properties the base + overlay split
+  # promises (#967). `docker compose config` parses; this checks what the files compose to.
+  compose-overlays:
+    name: compose overlays
+    needs: changes
+    if: needs.changes.outputs.deploy == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Render the compose chains
+        run: bash scripts/dev/test-compose-overlays.sh
 
   # The web suite is three jobs so the slow part, vitest (about 4 min in one job, half of
   # it jsdom start-up per file), runs in two halves beside typecheck + build. `web` is the
