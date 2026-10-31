@@ -796,19 +796,8 @@ export type IdleApplyPreview = components["schemas"]["HostPolicyApprovalPreview"
   approval_boot_incarnation: string;
   approval_review_id: string;
 };
-type GeneratedIdleApplyAttempt = components["schemas"]["IdleApplyAttempt"];
-/** The administrator's release of an uncertain attempt (control-api.md amendment 51). */
-export type RecoveryRelease = {
-  state: "pending" | "released";
-  requested_at: string | null;
-  waiting_for: "agent_connection" | "agent_upgrade" | "agent_report" | null;
-};
-/** Widened for amendment 51 (`released`, `recovery_release`) until the pinned
- *  openapi.yaml carries them; then the generated type alone is enough. */
-export type IdleApplyAttempt = Omit<GeneratedIdleApplyAttempt, "phase"> & {
-  phase: GeneratedIdleApplyAttempt["phase"] | "released";
-  recovery_release?: RecoveryRelease | null;
-};
+export type IdleApplyAttempt = components["schemas"]["IdleApplyAttempt"];
+export type RecoveryRelease = components["schemas"]["RecoveryRelease"];
 export function approveHostIdleApply(token: string, hostId: string, group: string, preview: IdleApplyPreview, expiresAt: string): Promise<IdleApplyAttempt> {
   return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply`, { token, method: "POST", body: {
     group, expected_revision: preview.revision, content_sha256: preview.content_sha256,

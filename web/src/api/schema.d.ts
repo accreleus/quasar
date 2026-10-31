@@ -6086,6 +6086,72 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/hosts/{id}/idle-apply/{attempt_id}/release-recovery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                attempt_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Release an uncertain restart attempt and its recovery hold (amendment 51).
+         * @description The explicit repair of an uncertain restart attempt. The body must acknowledge that the host's configuration is unverified. The request is recorded, audited once and sent to the agent as config_policy_release once its journal is reconciled; it lifts nothing. The recovery hold, the group's uncertain status and the host's draining status end only when the agent reports the attempt released. Every 4xx writes nothing. Normative behavior: control-api.md section "Releasing a recovery hold".
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    attempt_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["RecoveryHoldReleaseRequest"];
+                };
+            };
+            responses: {
+                /** @description Already released; nothing sent. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                /** @description Recorded; pending until the agent reports released. recovery_release.waiting_for says what it waits for. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                /** @description validation_failed: malformed host or attempt ID, or a body other than exactly {"acknowledge":"unverified"}. No write. */
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                /** @description No restart attempt with this ID on this host. No write. */
+                404: components["responses"]["NotFound"];
+                /** @description attempt_not_uncertain: the attempt is neither uncertain nor released. No write. */
+                409: components["responses"]["Conflict"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/hosts/{id}/policy/retry": {
         parameters: {
             query?: never;
@@ -9324,13 +9390,36 @@ export interface components {
             content_sha256: components["schemas"]["RH05Digest"];
             prerequisites_sha256: components["schemas"]["RH05Digest"];
             /** @enum {string} */
-            phase: "waiting" | "offered" | "accepted" | "activating" | "awaiting_startup" | "verifying" | "applied" | "failed" | "recovery_verifying" | "recovery_awaiting_startup" | "recovered" | "uncertain" | "cancel_pending" | "revoked_unstarted";
+            phase: "waiting" | "offered" | "accepted" | "activating" | "awaiting_startup" | "verifying" | "applied" | "failed" | "recovery_verifying" | "recovery_awaiting_startup" | "recovered" | "uncertain" | "released" | "cancel_pending" | "revoked_unstarted";
             /** @description True only after durable agent acceptance is proven; unknown acceptance retains the admission hold. */
             started: boolean;
             admission_restricted: boolean;
             remedy?: string | null;
             /** Format: date-time */
             next_retry_at?: string | null;
+            /** @description Amendment 51. Null unless a release was requested or the attempt is released. */
+            recovery_release?: components["schemas"]["RecoveryRelease"] | null;
+        };
+        RecoveryRelease: {
+            /** @enum {string} */
+            state: "pending" | "released";
+            /**
+             * Format: date-time
+             * @description Null only for an attempt reconciled as released without a recorded request.
+             */
+            requested_at: string | null;
+            /**
+             * @description Null once released.
+             * @enum {string|null}
+             */
+            waiting_for: "agent_connection" | "agent_upgrade" | "agent_report" | null;
+        };
+        RecoveryHoldReleaseRequest: {
+            /**
+             * @description The administrator states that the host's configuration was never verified.
+             * @enum {string}
+             */
+            acknowledge: "unverified";
         };
         IdleApplyConflict: {
             error: components["schemas"]["Error"];
