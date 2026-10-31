@@ -28,9 +28,11 @@ function loadAckedRender(sessionId: string | undefined): Size | null {
   if (!sessionId) return null;
   try {
     const v = JSON.parse(sessionStorage.getItem(renderKey(sessionId)) ?? "null");
-    return Number.isInteger(v?.w) && Number.isInteger(v?.h) && v.w > 0 && v.h > 0 ? { w: v.w, h: v.h } : null;
+    // The PATCH contract's own bounds (even, >= 16); the launch-size ceiling is unknown at mount.
+    const ok = (n: unknown) => Number.isInteger(n) && (n as number) >= 16 && (n as number) % 2 === 0;
+    return ok(v?.w) && ok(v?.h) ? { w: v.w, h: v.h } : null;
   } catch {
-    return null; // storage blocked or a corrupt value: behave as if nothing was acked
+    return null; // storage blocked or unparseable: behave as if nothing was acked
   }
 }
 
