@@ -1336,16 +1336,9 @@ impl ContainerRuntime {
         // quasar-images root-init-then-drop entrypoint and breaks images that need it.
         // Unset ⇒ inject nothing. A catalog PUID/PGID in `spec.env` was emitted above
         // and wins, so skip it here rather than duplicate `-e PUID=`.
-        for (host_var, app_var) in [("QUASAR_APP_PUID", "PUID"), ("QUASAR_APP_PGID", "PGID")] {
-            if spec.env.contains_key(app_var) {
-                continue;
-            }
-            if let Ok(val) = std::env::var(host_var) {
-                if !val.is_empty() {
-                    args.push("-e".into());
-                    args.push(format!("{app_var}={val}"));
-                }
-            }
+        for (app_var, val) in forwarded_app_ids(&spec.env) {
+            args.push("-e".into());
+            args.push(format!("{app_var}={val}"));
         }
         for m in &spec.mounts {
             args.push("-v".into());
@@ -1449,6 +1442,50 @@ pub enum AppExitStatus {
 
 fn short_id(id: &str) -> String {
     id.chars().take(12).collect()
+}
+
+/// The host's `QUASAR_APP_PUID`/`PGID` as the container's `PUID`/`PGID`, except a key the
+/// spec's own env already sets (a catalog value wins).
+fn forwarded_app_ids(spec_env: &BTreeMap<String, String>) -> Vec<(&'static str, String)> {
+    [("QUASAR_APP_PUID", "PUID"), ("QUASAR_APP_PGID", "PGID")]
+        .into_iter()
+        .filter(|(_, app_var)| !spec_env.contains_key(*app_var))
+        .filter_map(|(host_var, app_var)| {
+            let val = std::env::var(host_var).ok().filter(|v| !v.is_empty())?;
+            Some((app_var, val))
+        })
+        .collect()
+}
+
+/// `PUID`/`PGID` from a container's environment, the ids the image drops to (1000 when
+/// unset, as the images default). The one definition of the app user's ids.
+pub(crate) fn app_ids(environment: &[String]) -> (u32, u32) {
+    let id = |key: &str| {
+        environment
+            .iter()
+            .rev()
+            .find_map(|e| e.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+            .unwrap_or(1000)
+    };
+    (id("PUID"), id("PGID"))
+}
+
+impl ContainerSpec {
+    /// The app user's ids for this spec's container: `app_ids` over the environment
+    /// it is launched with.
+    pub(crate) fn app_ids(&self) -> (u32, u32) {
+        let env: Vec<String> = self
+            .env
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .chain(
+                forwarded_app_ids(&self.env)
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}={v}")),
+            )
+            .collect();
+        app_ids(&env)
+    }
 }
 
 /// The container spec mirrored from the assign's `app` object (`apps.runtime_spec`,

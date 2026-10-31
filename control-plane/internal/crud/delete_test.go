@@ -324,3 +324,23 @@ func TestDeleteHost_NotFound(t *testing.T) {
 		t.Fatalf("expected ErrNotFound, got: %v", err)
 	}
 }
+
+// #1001: a live session mounting this app's home as a shared home refuses the
+// delete, with no hold on the claim (a dispatch that was not cleanup-capable).
+func TestDeleteApp_RefusedWhileASessionSharesItsHome(t *testing.T) {
+	pool := testPool(t)
+	s := &store{pool: pool}
+	ids := seedBasic(t, pool)
+	var desktop string
+	mustExec(t, pool.QueryRow(context.Background(), `INSERT INTO apps (name, managed_home, kind, share_steam_library)
+		VALUES ('KDE', true, 'desktop', true) RETURNING id::text`).Scan(&desktop))
+	mustExec(t, pool.QueryRow(context.Background(), `INSERT INTO sessions
+		(user_id, app_id, host_id, gpu_id, state, width, height, fps, bitrate_kbps, shared_home_app_id)
+		VALUES ($1, $2, $3, $4, 'running', 1280, 720, 60, 6000, $5) RETURNING id::text`,
+		ids.userID, desktop, ids.hostID, ids.gpuID, ids.appID).Scan(new(string)))
+
+	_, err := s.deleteApp(context.Background(), ids.appID, false)
+	if !errors.Is(err, ErrAppHasActiveSessions) {
+		t.Fatalf("delete of an app whose home a live session shares = %v, want ErrAppHasActiveSessions", err)
+	}
+}

@@ -324,6 +324,15 @@ impl SessionResources {
             } else {
                 super::home::provision_home_dirs(&c.mounts, &cfg.home_root, template);
             }
+            if super::home::has_mount_under_root(&c.mounts, &cfg.home_root) {
+                // SAFETY: geteuid has no preconditions.
+                let euid = unsafe { libc::geteuid() };
+                super::home::provision_nested_mounts(
+                    &c.mounts,
+                    &cfg.home_root,
+                    super::home::nested_mount_owner(c, euid, &super::home::known_engine),
+                )?;
+            }
         }
         Ok((
             SessionResources {

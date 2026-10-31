@@ -41,6 +41,7 @@ export interface AppDraft {
   runtimePresetId: string;
   managedHome: boolean;
   containerPath: string;
+  shareSteamLibrary: boolean;
   /**
    * runtime_spec.gpu must round-trip; no control offers it. It is NOT inert: the
    * agent passes the GPU into the container only when it is true. For an app on
@@ -76,6 +77,7 @@ export function draftFromApp(app: AdminApp | null): AppDraft {
     runtimePresetId: app?.runtime_preset_id ?? "",
     managedHome: app?.managed_home ?? false,
     containerPath: app?.home_container_path || "/home/quasar",
+    shareSteamLibrary: app?.share_steam_library ?? false,
     gpu: spec.gpu,
     specExtras: spec.extras,
   };
@@ -233,6 +235,7 @@ export function patchBody(app: AdminApp, draft: AppDraft): UpdateAppRequest {
 
   if (draft.managedHome !== from.managedHome) body.managed_home = draft.managedHome;
   if (draft.containerPath !== from.containerPath) body.home_container_path = draft.containerPath;
+  if (draft.shareSteamLibrary !== from.shareSteamLibrary) body.share_steam_library = draft.shareSteamLibrary;
   if (draft.runtimePresetId !== from.runtimePresetId) {
     body.runtime_preset_id = draft.runtimePresetId || null;
   }
@@ -262,6 +265,7 @@ export function createBody(draft: AppDraft): CreateAppRequest {
     runtime_spec: specOf(draft),
     managed_home: draft.managedHome,
     home_container_path: draft.containerPath,
+    share_steam_library: draft.shareSteamLibrary,
     runtime_preset_id: draft.runtimePresetId || null,
     launchable_profile_ids: launchableToSend(draft),
   };

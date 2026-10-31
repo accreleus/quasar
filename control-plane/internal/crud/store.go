@@ -139,6 +139,9 @@ type App struct {
 	// P5-01/02: managed per-(user, app) home opt-in.
 	ManagedHome       bool   `json:"managed_home"`
 	HomeContainerPath string `json:"home_container_path"`
+	// ShareSteamLibrary (#1001): mount the user's Steam data dir into this app's
+	// sessions. Semantics: control-api.md §Storage.
+	ShareSteamLibrary bool `json:"share_steam_library"`
 	// RuntimePresetID (UI-P3): preset this app inherits container config from.
 	// Own stored column; flattening happens at launch
 	// (internal/session/runtime_preset.go), never here.
@@ -526,7 +529,7 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 	externalSource, externalID *string,
 	parentAppID, libraryProvider *string,
 	vram, slots, w, h, fps, kbps *int32, runtimeSpec json.RawMessage,
-	managedHome bool, homeContainerPath string, defaultProfileID *string, profilePolicy string,
+	managedHome bool, homeContainerPath string, shareSteamLibrary bool, defaultProfileID *string, profilePolicy string,
 	runtimePresetID *string, entitle string, launchProfileIDs []string, callerID string) (App, error) {
 	if len(runtimeSpec) == 0 {
 		runtimeSpec = json.RawMessage(`{}`)
@@ -569,10 +572,10 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 	}
 
 	cols := []string{"name", "description", "cover_url", "runtime_spec", "enabled",
-		"managed_home", "home_container_path", "default_profile_id", "profile_policy",
+		"managed_home", "home_container_path", "share_steam_library", "default_profile_id", "profile_policy",
 		"runtime_preset_id"}
 	args := []any{name, desc, coverURL, runtimeSpec, true,
-		managedHome, homeContainerPath, defaultProfileID, profilePolicy,
+		managedHome, homeContainerPath, shareSteamLibrary, defaultProfileID, profilePolicy,
 		runtimePresetID}
 	if kind != nil {
 		cols = append(cols, "kind")
@@ -671,6 +674,9 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 // propagated as a 500; the CHECK stays the enforcement.
 var ErrDerivedShape = errors.New("a derived tile carries identity only")
 
+// ErrShareSteamLibraryShape is apps_share_steam_library_ck (migration 0110).
+var ErrShareSteamLibraryShape = errors.New("share_steam_library on a derived tile or provider app")
+
 // ErrDuplicateDerivedTile: apps_parent_external_uk refused a second tile for
 // the same (provider app, source, appid) — one tile per game, fleet-wide.
 var ErrDuplicateDerivedTile = errors.New("a tile for that provider app and external id already exists")
@@ -739,6 +745,8 @@ func appConstraintError(err error) error {
 		switch pgErr.ConstraintName {
 		case "apps_derived_shape_ck":
 			return ErrDerivedShape
+		case "apps_share_steam_library_ck":
+			return ErrShareSteamLibraryShape
 		case "apps_parent_external_uk":
 			return ErrDuplicateDerivedTile
 		}
@@ -775,7 +783,7 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 	externalSource, externalID *string,
 	parentAppID **string, libraryProvider *string,
 	vram, slots, w, h, fps, kbps *int32, enabled *bool, runtimeSpec json.RawMessage,
-	managedHome *bool, homeContainerPath *string, defaultProfileID **string, profilePolicy *string,
+	managedHome *bool, homeContainerPath *string, shareSteamLibrary *bool, defaultProfileID **string, profilePolicy *string,
 	runtimePresetID **string, launchProfileIDs *[]string, callerID string) (App, error) {
 	// Checked before any SET clause is built (see ErrCoverURLOwnedByArtwork), so
 	// a patch touching cover_url and other fields is refused atomically.
@@ -930,6 +938,11 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 		args = append(args, *homeContainerPath)
 		argIdx++
 	}
+	if shareSteamLibrary != nil {
+		setClauses = append(setClauses, fmt.Sprintf("share_steam_library = $%d", argIdx))
+		args = append(args, *shareSteamLibrary)
+		argIdx++
+	}
 	if defaultProfileID != nil {
 		setClauses = append(setClauses, fmt.Sprintf("default_profile_id = $%d", argIdx))
 		args = append(args, *defaultProfileID)
@@ -967,7 +980,7 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 	          apps.parent_app_id::text, origin, library_provider,
 	          default_vram_mb, default_encode_slots,
 	          default_width, default_height, default_fps, default_bitrate_kbps,
-	          enabled, default_profile_id, profile_policy, runtime_spec, managed_home, home_container_path,
+	          enabled, default_profile_id, profile_policy, runtime_spec, managed_home, home_container_path, share_steam_library,
 	          runtime_preset_id::text, created_at, updated_at, ` + titleFactsCols
 
 	args = append(args, id)
@@ -1011,7 +1024,7 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 			&a.ParentAppID, &a.Origin, &a.LibraryProvider,
 			&a.DefaultVramMB, &a.DefaultEncodeSlots,
 			&a.DefaultWidth, &a.DefaultHeight, &a.DefaultFPS, &a.DefaultBitratekbps,
-			&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath,
+			&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath, &a.ShareSteamLibrary,
 			&a.RuntimePresetID, &a.CreatedAt, &a.UpdatedAt,
 			&a.Genres, &a.Developer, &a.Publisher, &a.ReleaseDate, &a.ControllerSupport, &a.LogoURL, &a.IconURL)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1217,7 +1230,7 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 		       library_discovery_suspended,
 		       default_vram_mb, default_encode_slots,
 		       default_width, default_height, default_fps, default_bitrate_kbps,
-		       enabled, default_profile_id, profile_policy, runtime_spec, managed_home, home_container_path,
+		       enabled, default_profile_id, profile_policy, runtime_spec, managed_home, home_container_path, share_steam_library,
 		       apps.runtime_preset_id::text,
 		       -- UI-P5 allow-list. ARRAY(...) rather than a join + array_agg so the
 		       -- display_stream joins above keep their one-row-per-app shape.
@@ -1277,7 +1290,7 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 			&a.LibraryDiscoverySuspended,
 			&a.DefaultVramMB, &a.DefaultEncodeSlots,
 			&a.DefaultWidth, &a.DefaultHeight, &a.DefaultFPS, &a.DefaultBitratekbps,
-			&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath,
+			&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath, &a.ShareSteamLibrary,
 			&a.RuntimePresetID, &a.LaunchableProfileIDs,
 			&a.DisplayWidth, &a.DisplayHeight, &a.DisplayFPS, &a.DisplayBitratekbps,
 			&a.CreatedAt, &a.UpdatedAt,
@@ -1314,7 +1327,7 @@ func (s *store) getAppFull(ctx context.Context, callerID, id string) (App, error
 		       library_discovery_suspended,
 		       default_vram_mb, default_encode_slots,
 		       default_width, default_height, default_fps, default_bitrate_kbps,
-		       enabled, default_profile_id, profile_policy, runtime_spec, managed_home, home_container_path,
+		       enabled, default_profile_id, profile_policy, runtime_spec, managed_home, home_container_path, share_steam_library,
 		       apps.runtime_preset_id::text,
 		       -- UI-P5 allow-list; see listAllApps for why ARRAY(...) and not a join.
 		       ARRAY(SELECT alp.launch_profile_id FROM app_launch_profiles alp
@@ -1349,7 +1362,7 @@ func (s *store) getAppFull(ctx context.Context, callerID, id string) (App, error
 		&a.LibraryDiscoverySuspended,
 		&a.DefaultVramMB, &a.DefaultEncodeSlots,
 		&a.DefaultWidth, &a.DefaultHeight, &a.DefaultFPS, &a.DefaultBitratekbps,
-		&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath,
+		&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath, &a.ShareSteamLibrary,
 		&a.RuntimePresetID, &a.LaunchableProfileIDs,
 		&a.DisplayWidth, &a.DisplayHeight, &a.DisplayFPS, &a.DisplayBitratekbps,
 		&a.CreatedAt, &a.UpdatedAt,
@@ -1559,11 +1572,12 @@ func (s *store) deleteApp(ctx context.Context, id string, deleteDerived bool) (s
 
 	// Also refuses on a session against a derived tile: without this,
 	// deleteDerived=true would cascade a tile out from under a running session.
+	// A session mounting this app's home as a shared home counts too.
 	var active int
 	sessionRows, err := tx.Query(ctx, `
 		SELECT s.id::text,s.state FROM sessions s
 		JOIN apps a ON a.id = s.app_id
-		WHERE (a.id::text = $1 OR a.parent_app_id::text = $1)
+		WHERE (a.id::text = $1 OR a.parent_app_id::text = $1 OR s.shared_home_app_id::text = $1)
 		ORDER BY s.id FOR UPDATE OF s
 	`, id)
 	if err != nil {

@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
+	"strings"
 
 	"github.com/accreleus/quasar/control-plane/internal/storage"
+	"github.com/jackc/pgx/v5"
 )
 
 // HomeProvider is the storage seam (P5-02): the per-(user, app) home mount at
@@ -184,4 +187,58 @@ func (c *Coordinator) resolveHomeSpec(ctx context.Context, app LaunchApp, userID
 		}
 	}
 	return injectHomeMount(spec, mount)
+}
+
+// steamDataDir is the Steam client's data dir under a home: sign-in, settings,
+// steamapps and userdata.
+const steamDataDir = ".local/share/Steam"
+
+// sharedSteamMount is the one mount string a sharing session carries for the
+// Steam home at ref: its data dir over the same dir under the session's own
+// home target. home_binding.go checks the dispatched mount against it.
+func sharedSteamMount(ref, target string) string {
+	return fmt.Sprintf("%s/%s:%s:rw", ref, steamDataDir, path.Join(target, steamDataDir))
+}
+
+// injectSharedHomeMount appends the shared Steam mount after the session's own
+// home mount, so it nests over it. EnsureHome creates the Steam home's row when
+// the user has none; the agent creates the directory.
+func (c *Coordinator) injectSharedHomeMount(ctx context.Context, spec []byte, app LaunchApp, userID, sharedAppID, hostID string) ([]byte, error) {
+	// Only the home's ref is used; the target is this app's.
+	mount, err := c.homes.EnsureHome(ctx, userID, sharedAppID, hostID, app.HomeContainerPath)
+	if errors.Is(err, storage.ErrHomeConflict) {
+		return nil, ErrHomeConflict
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ensure shared home: %w", err)
+	}
+	ref, _, _ := strings.Cut(mount, ":")
+	return injectHomeMount(spec, sharedSteamMount(ref, app.HomeContainerPath))
+}
+
+// sharedSteamApp is the Steam parent a sharing launch mounts: exactly one
+// enabled, managed-home Steam provider app the user is entitled to, as
+// warmSteamApp picks it. "" when there is none or more than one.
+func (s *Store) sharedSteamApp(ctx context.Context, userID string) (string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT a.id::text FROM apps a
+		WHERE a.enabled AND a.parent_app_id IS NULL AND a.library_provider = 'steam'
+		  AND EXISTS (SELECT 1 FROM entitlements e WHERE e.app_id = a.id
+		        AND (e.subject_type = 'all' OR (e.subject_type = 'user' AND e.subject_id = $1::uuid)))
+		LIMIT 2`, userID)
+	if err != nil {
+		return "", fmt.Errorf("read shared steam app: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return "", fmt.Errorf("read shared steam app: %w", err)
+	}
+	if len(ids) != 1 {
+		return "", nil
+	}
+	steam, err := s.GetLaunchApp(ctx, ids[0])
+	if errors.Is(err, ErrNotFound) || (err == nil && !steam.ManagedHome) {
+		return "", nil
+	}
+	return ids[0], err
 }

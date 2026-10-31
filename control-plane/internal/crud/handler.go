@@ -308,6 +308,7 @@ type adminAppResp struct {
 	RuntimeSpec        json.RawMessage `json:"runtime_spec"`
 	ManagedHome        bool            `json:"managed_home"`
 	HomeContainerPath  string          `json:"home_container_path"`
+	ShareSteamLibrary  bool            `json:"share_steam_library"`
 	// RuntimePresetID (UI-P3): the app's OWN stored preset, null = none. Not the
 	// merged effective value — that's a launch-time concern.
 	RuntimePresetID *string `json:"runtime_preset_id"`
@@ -347,6 +348,7 @@ func appToAdminResp(a App) adminAppResp {
 		RuntimeSpec:          spec,
 		ManagedHome:          a.ManagedHome,
 		HomeContainerPath:    a.HomeContainerPath,
+		ShareSteamLibrary:    a.ShareSteamLibrary,
 		RuntimePresetID:      a.RuntimePresetID,
 		LaunchableProfileIDs: allowList,
 		Origin:               a.Origin,
@@ -544,6 +546,7 @@ func (h *Handler) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		RuntimeSpec        json.RawMessage `json:"runtime_spec"`
 		ManagedHome        bool            `json:"managed_home"`
 		HomeContainerPath  string          `json:"home_container_path"`
+		ShareSteamLibrary  bool            `json:"share_steam_library"`
 		DefaultProfileID   *string         `json:"default_profile_id"`
 		ProfilePolicy      string          `json:"profile_policy"`
 		// RuntimePresetID: absent/null = no preset, the app carries everything itself.
@@ -657,7 +660,7 @@ func (h *Handler) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		parentPatch, req.LibraryProvider,
 		req.DefaultVramMB, req.DefaultEncodeSlots,
 		req.DefaultWidth, req.DefaultHeight, req.DefaultFPS, req.DefaultBitratekbps,
-		req.RuntimeSpec, req.ManagedHome, req.HomeContainerPath, req.DefaultProfileID, req.ProfilePolicy,
+		req.RuntimeSpec, req.ManagedHome, req.HomeContainerPath, req.ShareSteamLibrary, req.DefaultProfileID, req.ProfilePolicy,
 		req.RuntimePresetID, req.Entitle, allowList.ids, caller.ID)
 	if err != nil {
 		if writeAppConstraintError(w, err) {
@@ -699,6 +702,7 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		RuntimeSpec        json.RawMessage `json:"runtime_spec"`
 		ManagedHome        *bool           `json:"managed_home"`
 		HomeContainerPath  *string         `json:"home_container_path"`
+		ShareSteamLibrary  *bool           `json:"share_steam_library"`
 		DefaultProfileID   json.RawMessage `json:"default_profile_id"`
 		ProfilePolicy      *string         `json:"profile_policy"`
 		// RuntimePresetID: tri-state raw JSON like DefaultProfileID — absent =
@@ -898,7 +902,7 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		optionalUUIDArg(parentPatch, parentOK), req.LibraryProvider,
 		req.DefaultVramMB, req.DefaultEncodeSlots,
 		req.DefaultWidth, req.DefaultHeight, req.DefaultFPS, req.DefaultBitratekbps,
-		req.Enabled, req.RuntimeSpec, req.ManagedHome, req.HomeContainerPath, optionalUUIDArg(defaultProfilePatch, ok), req.ProfilePolicy,
+		req.Enabled, req.RuntimeSpec, req.ManagedHome, req.HomeContainerPath, req.ShareSteamLibrary, optionalUUIDArg(defaultProfilePatch, ok), req.ProfilePolicy,
 		optionalUUIDArg(presetPatch, presetOK), launchProfiles, caller.ID)
 	if err != nil {
 		if err == ErrNotFound {
@@ -983,13 +987,14 @@ func validExternalID(id *string) bool {
 }
 
 const (
-	errLibraryProvider   = `library_provider must be "" or "steam"`
-	errParentApp         = "parent_app_id must reference an existing app that is not itself a derived tile"
-	errParentOfAParent   = "this app already has derived tiles of its own, so it cannot be given a parent — a tile borrows its parent's runtime one level only, and a chain leaves the middle app's tiles with no home to resolve to"
-	errDerivedProvider   = "library_provider cannot be set on a derived tile — a tile borrows its parent's runtime and cannot itself be a library provider"
-	errDerivedShape      = "a derived tile carries identity only: with parent_app_id set, runtime_spec must be empty, runtime_preset_id must be null, managed_home must be false, library_provider must be empty, and external_source/external_id must both be set"
-	errDuplicateTile     = "a derived tile for that parent app and external_id already exists"
-	errProviderAppExists = "another app is already this library provider's app — edit that app, or clear its library_provider first"
+	errLibraryProvider        = `library_provider must be "" or "steam"`
+	errParentApp              = "parent_app_id must reference an existing app that is not itself a derived tile"
+	errParentOfAParent        = "this app already has derived tiles of its own, so it cannot be given a parent — a tile borrows its parent's runtime one level only, and a chain leaves the middle app's tiles with no home to resolve to"
+	errDerivedProvider        = "library_provider cannot be set on a derived tile — a tile borrows its parent's runtime and cannot itself be a library provider"
+	errDerivedShape           = "a derived tile carries identity only: with parent_app_id set, runtime_spec must be empty, runtime_preset_id must be null, managed_home must be false, library_provider must be empty, and external_source/external_id must both be set"
+	errShareSteamLibraryShape = "share_steam_library cannot be set on a derived tile or on a library provider app"
+	errDuplicateTile          = "a derived tile for that parent app and external_id already exists"
+	errProviderAppExists      = "another app is already this library provider's app — edit that app, or clear its library_provider first"
 	// Same remedy shape as provider_enabled on DELETE /v1/admin/images/{id}/install.
 	errProviderClearWhileDiscoveryOn  = "library discovery is enabled, so un-marking its only provider app would have a new one created for every user; disable library discovery in Settings first"
 	errProviderDeleteWhileDiscoveryOn = "library discovery is enabled, so deleting its only provider app would have a new one created for every user; disable library discovery in Settings first"
@@ -1069,6 +1074,9 @@ func writeAppConstraintError(w http.ResponseWriter, err error) bool {
 	switch {
 	case errors.Is(err, ErrDerivedShape):
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, errDerivedShape)
+		return true
+	case errors.Is(err, ErrShareSteamLibraryShape):
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, errShareSteamLibraryShape)
 		return true
 	case errors.Is(err, ErrDuplicateDerivedTile):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, errDuplicateTile)

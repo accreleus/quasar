@@ -308,6 +308,15 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	if afterParkedRead != nil {
 		afterParkedRead()
 	}
+	notice := ""
+	if app.ShareSteamLibrary && app.ManagedHome && !lp.parked {
+		if p.SharedHomeAppID, err = c.store.sharedSteamApp(ctx, userID); err != nil {
+			return LaunchResult{}, err
+		}
+		if p.SharedHomeAppID == "" {
+			notice = noticeSharedUnavailable
+		}
+	}
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
 	var refused *ParkedClaimRefusedError
@@ -345,6 +354,9 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	}
 	if p.claim != nil {
 		sess.AdoptSessionID = p.claim.id
+	}
+	if sess.notice == "" {
+		sess.notice = notice
 	}
 	if !lp.parked {
 		c.afterLaunchAdmitted(ctx, userID, app)
@@ -385,6 +397,9 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		if err == nil && lp.parked {
 			dispatchSpec, err = injectSteamFlags(dispatchSpec, parkedSteamFlags)
 		}
+		if err == nil && sess.SharedHomeAppID != nil {
+			dispatchSpec, err = c.injectSharedHomeMount(ctx, dispatchSpec, app, userID, *sess.SharedHomeAppID, *sess.HostID)
+		}
 		if err != nil {
 			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("home mount: %v", err))
 			return LaunchResult{}, fmt.Errorf("home mount: %w", err)
@@ -403,7 +418,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	expectedHome := expectedHomeDispatch(app)
 	go c.prepareAndDispatch(sess, dispatchSpec, app.Image(), &expectedHome)
 
-	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt}, nil
+	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt, Notice: sess.notice}, nil
 }
 
 func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, imageRef string, expected *homeDispatchExpectation) {

@@ -146,6 +146,21 @@ describe("library tile", () => {
     expect(document.querySelector(".lib-tile .blocked")?.textContent).toContain("In use");
   });
 
+  it("dims a tile whose Steam library a sharing desktop holds, and says why (#1001)", () => {
+    renderTiles([app("a1", "Portal 2")], { isBlocked: true, blockedByName: "KDE", isDimmed: true });
+
+    expect(screen.getByRole("button", { name: "Play Portal 2" })).toBeDisabled();
+    expect(document.querySelector(".lib-tile")?.getAttribute("data-dimmed")).toBe("true");
+    expect(document.querySelector(".lib-tile .blocked .chip")?.getAttribute("title")).toBe(
+      "Your Steam library is open in the desktop. Close the desktop first.",
+    );
+  });
+
+  it("does not dim an ordinary blocked tile", () => {
+    renderTiles([app("a1", "Portal 2")], { isBlocked: true, blockedByName: "Steam" });
+    expect(document.querySelector(".lib-tile")?.hasAttribute("data-dimmed")).toBe(false);
+  });
+
   it("renders the detail band as the tile's next sibling", () => {
     renderTiles([app("a1", "Portal 2")], { detail: <div className="lib-detail" /> });
     const tile = document.querySelector(".lib-tile")!;

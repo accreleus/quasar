@@ -61,6 +61,7 @@ export interface DetailBandProps {
    *  only — the server's 409 is the gate. */
   isBlocked: boolean;
   blockedByName: string | null;
+  sharedLibrary?: boolean;
   liveSessionId: string | null;
   /** This app owns the live session. Play becomes Resume: launching would 409. */
   isLive: boolean;
@@ -85,6 +86,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
     onToggleFavourite,
     isBlocked,
     blockedByName,
+    sharedLibrary,
     liveSessionId,
     isLive,
     onResume,
@@ -243,6 +245,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
           isLive={isLive}
           isBlocked={isBlocked}
           blockedByName={blockedByName}
+          sharedLibrary={sharedLibrary}
           liveSessionId={liveSessionId}
           noH264={noH264}
           waitingForSlot={waitingForSlot}

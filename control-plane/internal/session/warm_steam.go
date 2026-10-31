@@ -739,6 +739,9 @@ func markReleased(ctx context.Context, tx pgx.Tx, sessionID string) error {
 // heartbeat and ReconcilePendingHomes repeat it once no live row adopts it.
 func (c *Coordinator) failBeforeAgent(sessionID, adoptID string, hostID *string, reason string) {
 	c.failSession(sessionID, reason)
+	if err := c.store.releaseUnusedSharedClaim(context.Background(), sessionID); err != nil {
+		c.log.Warn("releasing an unused shared home claim failed", "session_id", sessionID, "err", err)
+	}
 	if adoptID == "" || hostID == nil {
 		return
 	}
