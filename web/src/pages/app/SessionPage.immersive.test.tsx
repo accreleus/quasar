@@ -496,4 +496,75 @@ describe("SessionPage — Match cursor compositor size (#898)", () => {
     await reveal();
     expect(compositor()).toEqual(["2560", "1440"]);
   });
+
+  it("a reload keeps the acked interface size, and the seed sends nothing (#995)", async () => {
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onUiScaleChange as (v: number) => void)(1.5);
+    });
+    await advance(500);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    await reveal();
+    expect(lastDrawerProps?.uiScale).toBe(1.5);
+    await advance(1_000);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(1);
+  });
+
+  it("after a reload, a render-size change keeps the stored interface size (#995)", async () => {
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onUiScaleChange as (v: number) => void)(1.5);
+    });
+    await advance(500);
+    cleanup();
+    await reveal();
+
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(2);
+    // The PATCH carried the render size only; the stored scale is untouched and still displayed.
+    expect(updateSessionDisplay).toHaveBeenLastCalledWith("t", "s1", { render_width: 1280, render_height: 720 });
+    expect(lastDrawerProps?.uiScale).toBe(1.5);
+    expect(sessionStorage.getItem("quasar.session.s1.uiScale")).toBe("1.5");
+  });
+
+  it("a failed change after a reload reverts to the stored interface size, not 1× (#995)", async () => {
+    sessionStorage.setItem("quasar.session.s1.uiScale", "1.5");
+    updateSessionDisplay.mockRejectedValue(new Error("rejected"));
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onUiScaleChange as (v: number) => void)(2);
+    });
+    await advance(500);
+    expect(lastDrawerProps?.uiScale).toBe(1.5);
+  });
+
+  it.each([
+    ["below 1", 0.5],
+    ["above 3", 3.5],
+    ["a string", "1.5"],
+    ["null", null],
+  ])("a stored interface size that is %s is ignored (#995)", async (_name, stored) => {
+    sessionStorage.setItem("quasar.session.s1.uiScale", JSON.stringify(stored));
+    await reveal();
+    expect(lastDrawerProps?.uiScale).toBe(1);
+  });
+
+  it("an interface size the host rejected is not carried over a reload (#995)", async () => {
+    updateSessionDisplay.mockRejectedValue(new Error("rejected"));
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onUiScaleChange as (v: number) => void)(1.5);
+    });
+    await advance(500);
+    expect(sessionStorage.getItem("quasar.session.s1.uiScale")).toBeNull();
+
+    cleanup();
+    await reveal();
+    expect(lastDrawerProps?.uiScale).toBe(1);
+  });
 });
