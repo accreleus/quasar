@@ -35,6 +35,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Every job (here and in the other workflows) runs on `ubuntu-26.04`, not `ubuntu-latest`:
+# the 2026-10-30 `-latest` move to 26.04 brought Podman 5.7 and a sudo that ignores `-E`
+# and broke CI until #982 (#985). To move the pin, change every `runs-on:` in
+# .github/workflows/ in ONE pull request (`grep -rn runs-on .github/workflows`), read the
+# "Runner Image" block of its "Set up job" log to confirm the image, and check what the
+# jobs lean on: the runner's GStreamer (node-agent job), Docker and Podman (engine suite),
+# sudo. The apt cache keys on the image version, so the first run on a new image is cold.
+#
 # Read-only. No job here publishes anything, so nothing may inherit a write scope —
 # including a job added later. Every third-party action below is pinned to a full
 # commit sha (the trailing comment is the version that sha was); a tag is mutable and
@@ -46,7 +54,7 @@ jobs:
   # Which areas does this pull request touch? Every area on a push or a dispatch.
   changes:
     name: changed areas
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -93,7 +101,7 @@ jobs:
     name: control-plane tests (${{ matrix.part }})
     needs: changes
     if: needs.changes.outputs.go == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Measured 2026-10: about 3 min of tests on a cold build cache. 30 fails a stall early.
     timeout-minutes: 30
     env:
@@ -180,7 +188,7 @@ jobs:
     name: control-plane (build + vet + test)
     needs: [changes, go-tests]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Gather the control-plane jobs
@@ -217,7 +225,7 @@ jobs:
     name: web (typecheck + build)
     needs: changes
     if: needs.changes.outputs.web == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
       run:
@@ -242,7 +250,7 @@ jobs:
     name: web vitest (${{ matrix.shard }}/2)
     needs: changes
     if: needs.changes.outputs.web == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -267,7 +275,7 @@ jobs:
     name: web (typecheck + build + vitest)
     needs: [changes, web-build, web-vitest]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Gather the web jobs
@@ -291,7 +299,7 @@ jobs:
     name: site (install artifacts + docs build)
     needs: changes
     if: needs.changes.outputs.site == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
       run:
@@ -319,7 +327,7 @@ jobs:
     name: node-agent (fmt + clippy + test)
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Measured 2026-10: 5 min median, under 11 min at worst with a slow apt step. 30 leaves room
     # for a cold rust-cache and fails a stall in half an hour, not the 6-hour default (#864).
     timeout-minutes: 30
@@ -340,8 +348,8 @@ jobs:
         with:
           path: ${{ runner.temp }}/apt-debs
           key: apt-debs-${{ steps.image.outputs.id }}-${{ hashFiles('.github/ci-apt/node-agent.txt', 'scripts/verify/ci-apt-install.sh') }}
-      # gstreamer-rs 0.23 sys crates need the GStreamer 1.24 dev headers;
-      # ubuntu-24.04 (ubuntu-latest) ships gst 1.24. webrtc/sdp live in -bad.
+      # The gstreamer-rs sys crates need the GStreamer dev headers; ubuntu-26.04 ships
+      # gst 1.28.2. webrtc/sdp live in -bad.
       - name: Install GStreamer dev packages
         run: bash "$GITHUB_WORKSPACE/scripts/verify/ci-apt-install.sh" "$GITHUB_WORKSPACE/.github/ci-apt/node-agent.txt" "$RUNNER_TEMP/apt-debs"
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -394,7 +402,7 @@ jobs:
     name: engine suite (build)
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Measured 2026-10: 1-3 min without a stalled apt step. 20 is headroom for a cold rust-cache (#864).
     timeout-minutes: 20
     steps:
@@ -444,7 +452,7 @@ jobs:
     name: engine suite (${{ matrix.target }})
     needs: [changes, engines-build]
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
