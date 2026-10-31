@@ -412,3 +412,29 @@ describe("SessionPage — #647 straight-in capture", () => {
     expect((lastDrawerProps?.releaseHint as string).length).toBeGreaterThan(0);
   });
 });
+
+describe("SessionPage — Match cursor compositor size (#898)", () => {
+  const compositor = () => {
+    const v = document.querySelector("video")!;
+    return [v.dataset.compositorW, v.dataset.compositorH];
+  };
+
+  it("is the launch size, moves with the render size, and ignores a stream-size change", async () => {
+    await reveal();
+    // The launch stream is 2560x1440; the router-state tier (1920x1080) is only the seed.
+    expect(compositor()).toEqual(["2560", "1440"]);
+
+    // The external stream size moves the stream, not the compositor.
+    await act(async () => {
+      (lastDrawerProps?.onStreamSizeChange as (v: { w: number; h: number }) => void)({ w: 1920, h: 1080 });
+    });
+    await advance(500);
+    expect(compositor()).toEqual(["2560", "1440"]);
+
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+    expect(compositor()).toEqual(["1280", "720"]);
+  });
+});
