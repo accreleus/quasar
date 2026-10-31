@@ -140,6 +140,53 @@ describe("stream default", () => {
     expect(select()).not.toBeDisabled();
   });
 
+  it("names what the empty choice launches: the admin's default when one is set (#814)", async () => {
+    // The device recommends Sharp; the admin's global default is Fast, which is what an empty choice launches.
+    api.getProfiles.mockResolvedValue({
+      recommended_id: "p-sharp",
+      profiles: [
+        { id: "p-fast", display_name: "Fast" },
+        { id: "p-sharp", display_name: "Sharp" },
+      ],
+    });
+    api.getProfilePreferences.mockResolvedValue({
+      default_profile_id: "p-sharp",
+      global_default_profile_id: "p-fast",
+      user_overrides_allowed: true,
+    });
+    renderPage();
+    await waitFor(() => expect(select()).not.toBeDisabled());
+    const empty = within(select()).getByRole("option", { name: /^Admin default/ });
+    expect(empty).toHaveTextContent("Admin default (Fast)");
+    expect(within(select()).queryByRole("option", { name: /Recommended/ })).toBeNull();
+
+    api.updateProfilePreferences.mockResolvedValue({ default_profile_id: null });
+    fireEvent.change(select(), { target: { value: "" } });
+    await waitFor(() => expect(status()).toHaveTextContent("Saved. Launches use the admin's default (Fast) again."));
+  });
+
+  it("calls the empty choice the recommendation when no global default is set (#814)", async () => {
+    api.getProfiles.mockResolvedValue({
+      recommended_id: "p-sharp",
+      profiles: [
+        { id: "p-fast", display_name: "Fast" },
+        { id: "p-sharp", display_name: "Sharp" },
+      ],
+    });
+    api.getProfilePreferences.mockResolvedValue({
+      default_profile_id: "p-fast",
+      global_default_profile_id: null,
+      user_overrides_allowed: true,
+    });
+    renderPage();
+    await waitFor(() => expect(select()).not.toBeDisabled());
+    expect(within(select()).getByRole("option", { name: "Recommended (Sharp)" })).toBeInTheDocument();
+
+    api.updateProfilePreferences.mockResolvedValue({ default_profile_id: null });
+    fireEvent.change(select(), { target: { value: "" } });
+    await waitFor(() => expect(status()).toHaveTextContent("Saved. Launches use the recommendation again."));
+  });
+
   it("says the admin's default, not the stored one, while overrides are off (#721)", async () => {
     api.getProfilePreferences.mockResolvedValue({
       default_profile_id: "p-sharp",
