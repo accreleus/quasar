@@ -670,10 +670,7 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 	}
 	c.policyInventoryDone.Store(true)
 	if !c.policyInventoryBlocked.Load() {
-		if err := h.cfgStore.CompleteJournalReconciliation(ctx, c.hostID, c.connectionIncarnation, c.rh05RestartEntries, c.rh05Snapshots); err != nil {
-			return err
-		}
-		if err := h.sendRecoveryReleases(ctx, c); err != nil {
+		if err := h.completeJournal(ctx, c); err != nil {
 			return err
 		}
 	}
@@ -695,8 +692,19 @@ func sameCursor(a, b *string) bool {
 	return *a == *b
 }
 
-// sendRecoveryReleases re-sends every release an administrator requested and the
-// agent has not yet reported, now that this connection's journal is reconciled.
+// completeJournal is the only way the agentws path completes a connection's
+// journal gate, so every completion sends the releases pending on it. Which call
+// completes it depends on the delivery gate: an open one makes the inventory's
+// call return early and the legacy-map acknowledgement's call complete it.
+func (h *Handler) completeJournal(ctx context.Context, c *conn) error {
+	if err := h.cfgStore.CompleteJournalReconciliation(ctx, c.hostID, c.connectionIncarnation, c.rh05RestartEntries, c.rh05Snapshots); err != nil {
+		return err
+	}
+	return h.sendRecoveryReleases(ctx, c)
+}
+
+// sendRecoveryReleases sends every release an administrator requested and the
+// agent has not yet reported, once this connection's journal is reconciled.
 func (h *Handler) sendRecoveryReleases(ctx context.Context, c *conn) error {
 	if !c.policyRecoveryRelease {
 		return nil
@@ -1805,7 +1813,7 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 				return err
 			} else if ok {
 				ac.policyInitialMapApplied.Store(true)
-				if err := h.cfgStore.CompleteJournalReconciliation(ctx, hostID, ac.connectionIncarnation, ac.rh05RestartEntries, ac.rh05Snapshots); err != nil {
+				if err := h.completeJournal(ctx, ac); err != nil {
 					return err
 				}
 				if err := h.maybeRunDeferredPolicyRefresh(ctx, ac); err != nil {

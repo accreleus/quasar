@@ -204,8 +204,8 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
   >
     <div className="note warn">
       <strong>This host's state is unverified.</strong> The agent restarted to apply a configuration and could not
-      prove which configuration it is running now. Its agent marks the attempt released; once it confirms, the host
-      takes new sessions again unless another hold remains.
+      prove which configuration it is running now. Quasar tells the host's agent to set this attempt aside. Once the
+      agent confirms, the host takes new sessions again, unless another hold remains.
     </div>
     <p>Nothing on the host is repaired. Check its readiness and media probe first, then review and approve the configuration again.</p>
     <label className="rowflex">
