@@ -324,13 +324,16 @@ impl SessionResources {
             } else {
                 super::home::provision_home_dirs(&c.mounts, &cfg.home_root, template);
             }
-            // SAFETY: geteuid has no preconditions.
-            let euid = unsafe { libc::geteuid() };
-            super::home::provision_nested_mounts(
-                &c.mounts,
-                &cfg.home_root,
-                super::home::nested_mount_owner(c, euid),
-            )?;
+            if !c.mounts.is_empty() && !cfg.home_root.trim().is_empty() {
+                // SAFETY: geteuid has no preconditions.
+                let euid = unsafe { libc::geteuid() };
+                let engine = crate::buildinfo::EngineIdentity::observe();
+                super::home::provision_nested_mounts(
+                    &c.mounts,
+                    &cfg.home_root,
+                    super::home::nested_mount_owner(c, euid, &engine),
+                )?;
+            }
         }
         Ok((
             SessionResources {

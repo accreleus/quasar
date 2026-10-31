@@ -270,12 +270,52 @@ fn split_home_mounts(mounts: &[String], root: &Path) -> (Vec<PathBuf>, Vec<PathB
 /// another session (`steamDataDir`, control-plane `internal/session/home.go`).
 const STEAM_DATA_DIR: &str = ".local/share/Steam";
 
-/// Who owns what the agent makes for a nested mount: the app user the session's
-/// container drops to, which is who the image entrypoint makes own the home. `None`
-/// when the agent is not root and cannot hand a directory to another user; what it
-/// makes is then its own.
-pub fn nested_mount_owner(spec: &super::container::ContainerSpec, euid: u32) -> Option<(u32, u32)> {
-    (euid == 0).then(|| spec.app_ids())
+/// Who owns what the agent makes for a nested mount, as the agent sees ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NestedOwnership {
+    /// Make nothing: the container's `PUID` or `PGID` is 0, and the agent never hands
+    /// a directory to root as the app user.
+    Refused,
+    /// Make and repair as `owner` (`None`: leave what the agent makes as its own).
+    /// `root_uid` is the id an app container's root writes as, which a runtime-made
+    /// mount point carries.
+    Owned {
+        owner: Option<(u32, u32)>,
+        root_uid: u32,
+    },
+}
+
+/// The app user the session's container drops to, as the agent sees it: who the image
+/// entrypoint makes own the home. Rootless Podman's keep-id maps that user onto the
+/// agent's own uid 0, and the app's root onto `verify::app_root_uid`; every other mode
+/// sees the container's `PUID`/`PGID` (`ContainerSpec::app_ids`) as they are. A
+/// non-root agent cannot hand a directory to another user, so what it makes stays its
+/// own.
+pub fn nested_mount_owner(
+    spec: &super::container::ContainerSpec,
+    euid: u32,
+    engine: &crate::buildinfo::EngineIdentity,
+) -> NestedOwnership {
+    let root_uid = super::warmup::verify::app_root_uid(engine);
+    if root_uid != 0 {
+        return NestedOwnership::Owned {
+            owner: (euid == 0).then_some((0, 0)),
+            root_uid,
+        };
+    }
+    if euid != 0 {
+        return NestedOwnership::Owned {
+            owner: None,
+            root_uid,
+        };
+    }
+    match spec.app_ids() {
+        (0, _) | (_, 0) => NestedOwnership::Refused,
+        ids => NestedOwnership::Owned {
+            owner: Some(ids),
+            root_uid,
+        },
+    }
 }
 
 /// Makes what each nested mount needs before the container exists, so the runtime
@@ -286,18 +326,32 @@ pub fn nested_mount_owner(spec: &super::container::ContainerSpec, euid: u32) -> 
 /// when it is empty and root-owned, which a runtime-made mount point is.
 ///
 /// Every directory made on those paths, and an existing leaf that is empty and
-/// root-owned, is owned by `owner` ([`nested_mount_owner`]). A symlink on a path
-/// refuses (repair skips it): these paths are inside user-writable homes, and no
-/// container holds them while the agent provisions (single-writer guard), so checking
-/// each component before `create_dir` and `lchown` cannot be raced by the user.
+/// root-owned, is owned as [`nested_mount_owner`] says. These paths are inside
+/// user-writable homes, so every step is taken relative to an open directory with
+/// `O_NOFOLLOW` (`nofollow_dir`) and ownership is set on the opened directory: a
+/// symlink anywhere on a path, present before the walk or swapped in during it, refuses
+/// and nothing is made or re-owned through it. The repair of a plain home skips it with
+/// a warning instead.
 pub fn provision_nested_mounts(
     mounts: &[String],
     home_root: &str,
-    owner: Option<(u32, u32)>,
+    ownership: NestedOwnership,
 ) -> std::io::Result<()> {
-    let mut chown =
-        |path: &Path, uid: u32, gid: u32| std::os::unix::fs::lchown(path, Some(uid), Some(gid));
-    provision_nested_mounts_with(mounts, home_root, owner, 0, &mut chown)
+    let NestedOwnership::Owned { owner, root_uid } = ownership else {
+        let has_nested = resolve_root(home_root)
+            .is_some_and(|root| !split_home_mounts(mounts, &root).1.is_empty());
+        if has_nested {
+            tracing::warn!(
+                token = "home-nested-owner-root",
+                "the app container's PUID or PGID is 0: no shared-mount directory is made for it"
+            );
+        }
+        return Ok(());
+    };
+    let mut chown = |dir: &std::fs::File, uid: u32, gid: u32| {
+        std::os::unix::fs::fchown(dir, Some(uid), Some(gid))
+    };
+    provision_nested_mounts_with(mounts, home_root, owner, root_uid, &mut chown)
 }
 
 /// [`provision_nested_mounts`] with the chown and the uid that counts as "root-owned"
@@ -307,7 +361,7 @@ fn provision_nested_mounts_with(
     home_root: &str,
     owner: Option<(u32, u32)>,
     root_uid: u32,
-    chown: &mut dyn FnMut(&Path, u32, u32) -> std::io::Result<()>,
+    chown: &mut dyn FnMut(&std::fs::File, u32, u32) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let Some(root) = resolve_root(home_root) else {
         return Ok(());
@@ -330,8 +384,10 @@ fn provision_nested_mounts_with(
                     .is_some_and(|h| std::ptr::eq(h, m))
             });
             if !holds_nested && m.host.is_dir() {
+                // Best effort: a plain launch is never refused for it.
                 if let Err(e) = chain(&m.host, Path::new(STEAM_DATA_DIR), false) {
-                    tracing::debug!(
+                    tracing::warn!(
+                        token = "home-steam-dir-repair-skipped",
                         "steam data dir repair skipped for {}: {e:#}",
                         m.host.display()
                     );
@@ -373,55 +429,81 @@ fn provision_nested_mounts_with(
     Ok(())
 }
 
-/// Walks `rel` below `base`, refusing a symlink or non-directory on the way. With
-/// `create`, a missing directory is made and owned by `owner`; without it a missing
-/// one ends the walk. The leaf, when it already exists empty and owned by `root_uid`,
-/// is handed to `owner`; content is never re-owned.
+/// Walks `rel` below `base` one entry at a time through open directories
+/// (`nofollow_dir`), refusing a symlink or non-directory on the way. With `create`, a
+/// missing directory is made and handed to `owner`; without it a missing one ends the
+/// walk. The leaf, when it already exists empty and owned by `root_uid`, is handed to
+/// `owner`; content is never re-owned.
 fn own_chain(
     base: &Path,
     rel: &Path,
     owner: Option<(u32, u32)>,
     root_uid: u32,
     create: bool,
-    chown: &mut dyn FnMut(&Path, u32, u32) -> std::io::Result<()>,
+    chown: &mut dyn FnMut(&std::fs::File, u32, u32) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    use crate::nofollow_dir::{is_empty, is_symlink_or_not_dir, mkdir_at, open_dir, open_dir_at};
     use std::os::unix::fs::MetadataExt;
-    let parts: Vec<_> = rel.components().collect();
-    let mut path = base.to_path_buf();
-    for (i, part) in parts.iter().enumerate() {
-        path.push(part);
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(std::io::Error::other(format!(
-                    "{} is a symlink",
-                    path.display()
-                )));
-            }
-            Ok(meta) if !meta.is_dir() => {
-                return Err(std::io::Error::other(format!(
-                    "{} is not a directory",
-                    path.display()
-                )));
-            }
-            Ok(meta) => {
-                let leaf = i + 1 == parts.len();
-                if let Some((uid, gid)) = owner.filter(|_| leaf && meta.uid() == root_uid) {
-                    if (meta.uid(), meta.gid()) != (uid, gid)
-                        && std::fs::read_dir(&path)?.next().is_none()
+    let names = rel
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(name) => Ok(name),
+            _ => Err(std::io::Error::other(format!(
+                "{} is not a plain relative path",
+                rel.display()
+            ))),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let refuse = |i: usize| {
+        let at: PathBuf = names[..=i].iter().collect();
+        std::io::Error::other(format!(
+            "{} is a symlink or not a directory",
+            base.join(at).display()
+        ))
+    };
+    let mut dir = open_dir(base).map_err(|e| {
+        if is_symlink_or_not_dir(&e) {
+            std::io::Error::other(format!(
+                "{} is a symlink or not a directory",
+                base.display()
+            ))
+        } else {
+            e
+        }
+    })?;
+    for (i, name) in names.iter().enumerate() {
+        let leaf = i + 1 == names.len();
+        dir = match open_dir_at(&dir, name) {
+            Ok(existing) => {
+                if let Some((uid, gid)) = owner.filter(|_| leaf) {
+                    let meta = existing.metadata()?;
+                    if meta.uid() == root_uid
+                        && (meta.uid(), meta.gid()) != (uid, gid)
+                        && is_empty(&existing)?
                     {
-                        chown(&path, uid, gid)?;
+                        chown(&existing, uid, gid)?;
                     }
                 }
+                existing
             }
+            Err(e) if is_symlink_or_not_dir(&e) => return Err(refuse(i)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
-                std::fs::create_dir(&path)?;
+                mkdir_at(&dir, name, 0o755)?;
+                let made = open_dir_at(&dir, name).map_err(|e| {
+                    if is_symlink_or_not_dir(&e) {
+                        refuse(i)
+                    } else {
+                        e
+                    }
+                })?;
                 if let Some((uid, gid)) = owner {
-                    chown(&path, uid, gid)?;
+                    chown(&made, uid, gid)?;
                 }
+                made
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
-        }
+        };
     }
     Ok(())
 }
@@ -1009,7 +1091,15 @@ mod tests {
         .expect("a nested mount must not make the homes ambiguous");
         assert_eq!(outcome.map(|o| o.reason), Some("seeded"));
         assert!(desktop.join("marker.txt").exists());
-        provision_nested_mounts(&mounts, home_root.to_str().unwrap(), None).unwrap();
+        provision_nested_mounts(
+            &mounts,
+            home_root.to_str().unwrap(),
+            NestedOwnership::Owned {
+                owner: None,
+                root_uid: 0,
+            },
+        )
+        .unwrap();
         assert!(steam_data.is_dir());
         assert!(!steam_data.join("marker.txt").exists());
 
@@ -1050,8 +1140,10 @@ mod tests {
         owner: Option<(u32, u32)>,
     ) -> (std::io::Result<()>, Vec<(PathBuf, u32, u32)>) {
         let mut seen = Vec::new();
-        let mut chown = |p: &Path, u: u32, g: u32| {
-            seen.push((p.to_path_buf(), u, g));
+        let mut chown = |dir: &std::fs::File, u: u32, g: u32| {
+            use std::os::fd::AsRawFd;
+            let at = std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
+            seen.push((at, u, g));
             Ok(())
         };
         let result =
@@ -1066,23 +1158,64 @@ mod tests {
         {
             return; // the host default is set for this process; the unset case cannot be observed
         }
+        let rootful = crate::buildinfo::EngineIdentity::default();
+        let owned = |owner| NestedOwnership::Owned { owner, root_uid: 0 };
         let mut spec = crate::session::container::ContainerSpec::default();
         assert_eq!(
-            nested_mount_owner(&spec, 0),
-            Some((1000, 1000)),
+            nested_mount_owner(&spec, 0, &rootful),
+            owned(Some((1000, 1000))),
             "the images' PUID/PGID default"
         );
         assert_eq!(
-            nested_mount_owner(&spec, 1000),
-            None,
+            nested_mount_owner(&spec, 1000, &rootful),
+            owned(None),
             "a non-root agent cannot hand a dir to another user"
         );
         spec.env.insert("PUID".into(), "99".into());
         spec.env.insert("PGID".into(), "100".into());
         assert_eq!(
-            nested_mount_owner(&spec, 0),
-            Some((99, 100)),
+            nested_mount_owner(&spec, 0, &rootful),
+            owned(Some((99, 100))),
             "a catalog PUID/PGID wins"
+        );
+    }
+
+    #[test]
+    fn rootless_podman_owns_as_the_agent_and_counts_the_apps_root_as_uid_1() {
+        let rootless = crate::buildinfo::EngineIdentity {
+            engine: Some("podman".into()),
+            engine_version: None,
+            engine_mode: Some("rootless".into()),
+        };
+        let mut spec = crate::session::container::ContainerSpec::default();
+        spec.env.insert("PUID".into(), "1000".into());
+        // keep-id maps the app user onto the agent's uid 0 and the app's root onto 1.
+        assert_eq!(
+            nested_mount_owner(&spec, 0, &rootless),
+            NestedOwnership::Owned {
+                owner: Some((0, 0)),
+                root_uid: 1
+            }
+        );
+    }
+
+    #[test]
+    fn an_env_puid_or_pgid_of_0_makes_nothing() {
+        let rootful = crate::buildinfo::EngineIdentity::default();
+        for (k, v) in [("PUID", "0"), ("PGID", "0")] {
+            let mut spec = crate::session::container::ContainerSpec::default();
+            spec.env.insert(k.into(), v.into());
+            assert_eq!(
+                nested_mount_owner(&spec, 0, &rootful),
+                NestedOwnership::Refused,
+                "{k}=0"
+            );
+        }
+        let (_d, root, desktop, steam_home, mounts) = sharing_mounts();
+        provision_nested_mounts(&mounts, root.to_str().unwrap(), NestedOwnership::Refused).unwrap();
+        assert!(
+            !desktop.join(".local").exists() && !steam_home.exists(),
+            "made a directory for a root app user"
         );
     }
 
@@ -1146,6 +1279,29 @@ mod tests {
         assert!(
             !outside.join("share").exists(),
             "created a directory through a symlink"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_middle_component_is_refused_and_nothing_is_made_outside() {
+        let (d, root, desktop, steam_home, mounts) = sharing_mounts();
+        let outside = d.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(steam_home.join(".local")).unwrap();
+        std::os::unix::fs::symlink(&outside, steam_home.join(".local/share")).unwrap();
+        let (result, seen) = provision_recorded(&mounts, &root, Some((1000, 1000)));
+        assert!(result.is_err(), "a symlinked .local/share must refuse");
+        assert!(
+            seen.iter().all(|(p, ..)| !p.starts_with(&outside)),
+            "chowned through a symlink: {seen:?}"
+        );
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "made a directory through a symlink"
+        );
+        assert!(
+            !desktop.join(".local").exists(),
+            "went on to the mount point after a refusal"
         );
     }
 
