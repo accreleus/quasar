@@ -57,6 +57,7 @@ own; the two do not move together, and that is deliberate.
 - **Region and Input: the agent's recorded values after an app swap are tested to be exactly the nine keys (#891).** No product change.
 - **The image contract's `agent_binary.no_dt_needed` assertion now actually runs (#975).** It called `readelf`, which the agent image does not have, and a missing tool read as a pass; it lists the agent's libraries with `ldd` and fails when `ldd` cannot run. `libgstcuda` is no longer on the forbidden list, because a correct `--features cuda` build links it. No product change.
 - **The compose overlay render test passes again and now runs in CI on changes under `deploy/` (#967).** Its console-overlay checks still asserted `SYS_ADMIN` and a DRM cgroup rule, which the console overlay stopped granting when the session moved into its own container (ADR 0009); they now assert the overlay grants neither, keeps the i2c rule and leaves the base evdev rule intact. The overlay was right and the test stale (not Compose v5). `deploy/overlays/README.md` described the old grant too. No product change.
+- **`docs/configuration.md` no longer calls the image catalog ref admin-editable (#818).** No route sets `instance_settings.image_catalog_ref`; the default is `stable`. The row now says so and gives the one SQL statement that moves an install to another catalog ref. No product change.
 
 ## 0.5.1 — 2026-10-30
 
