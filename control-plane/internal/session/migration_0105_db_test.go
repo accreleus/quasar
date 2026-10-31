@@ -24,10 +24,13 @@ func TestMigration0105DownRefusesALiveParkedSession(t *testing.T) {
 	}
 	defer pool.Close()
 	s := seed(t, pool, 4)
-	play, err := NewStore(pool).ScheduleAndCreate(ctx, launchParams(s))
-	if err != nil {
-		t.Fatalf("play session: %v", err)
-	}
+	// A raw insert: today's ScheduleAndCreate writes columns later than 0105.
+	var play Session
+	must(t, pool.QueryRow(ctx, `INSERT INTO sessions (user_id, app_id, host_id, gpu_id, state, width, height,
+		fps, bitrate_kbps, h264_profile, reserved_encode_slots, assigned_at)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'assigned', 1280, 720, 60, 6000,
+		        'constrained-baseline', 1, now()) RETURNING id::text`,
+		s.userID, s.appID, s.hostID, s.gpuID).Scan(&play.ID))
 	parked := insertParked(t, pool, warmUser(t, pool, "parker"), s.appID, s.hostID, s.gpuID, 1, "10 minutes")
 
 	err = m.Migrate(104)

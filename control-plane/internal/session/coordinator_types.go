@@ -92,4 +92,6 @@ type LaunchResult struct {
 	Session        Session
 	SignalingToken string
 	TokenExpiresAt time.Time
+	// Notice is the steam_library_not_shared message, "" for none.
+	Notice string
 }

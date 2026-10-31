@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   blockedFamilyIds,
+  sharedLibraryIds,
   COVER_CLASSES,
   coverClassAt,
   familyRootApp,
@@ -277,6 +278,16 @@ describe("homeAppId / blockedFamilyIds / familyRootApp (single-writer lock UX)",
     expect(blockedFamilyIds(family, "unknown").size).toBe(0);
   });
 
+  // #1001: a sharing desktop holds the whole Steam family, the Launcher included.
+  it("a live sharing desktop blocks every app of the Steam family it mounts", () => {
+    const desktop = { id: "kde", name: "KDE", parent_app_id: null };
+    const apps = [...family, desktop];
+    expect([...blockedFamilyIds(apps, "kde", "steam")].sort()).toEqual(["game-a", "game-b", "steam"]);
+    expect([...sharedLibraryIds(apps, "steam")].sort()).toEqual(["game-a", "game-b", "steam"]);
+    expect(sharedLibraryIds(apps, null).size).toBe(0);
+    expect(blockedFamilyIds(apps, "kde").size).toBe(0);
+  });
+
   it("familyRootApp resolves a derived tile's parent, and a normal app's self", () => {
     expect(familyRootApp(family, gameA)?.id).toBe("steam");
     expect(familyRootApp(family, steam)?.id).toBe("steam");
@@ -295,6 +306,20 @@ describe("presentLaunchError", () => {
   const steam = { id: "steam", name: "Steam", parent_app_id: null };
   const gameA = { id: "game-a", name: "Half-Life", parent_app_id: "steam" };
   const family = [steam, gameA];
+
+  it("names a shared Steam library conflict in either direction (amendment 53)", () => {
+    const open = presentLaunchError(family, gameA, "home_in_use", "x", "desk-1", "steam_library_open_in_desktop");
+    expect(open).toEqual({
+      variant: "danger",
+      title: "Your Steam library is open in the desktop",
+      body: "Close the desktop first.",
+      sessionId: "desk-1",
+    });
+    const desktop = { id: "kde", name: "KDE", parent_app_id: null };
+    const game = presentLaunchError([...family, desktop], desktop, "home_in_use", "x", "game-1", "steam_game_running");
+    expect(game.title).toBe("Close your Steam game first");
+    expect(game.sessionId).toBe("game-1");
+  });
 
   it("home_in_use names the family's Launcher tile and carries the session id", () => {
     const result = presentLaunchError(family, gameA, "home_in_use", "Steam is already running", "sess-1");

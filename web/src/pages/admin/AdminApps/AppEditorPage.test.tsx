@@ -214,6 +214,24 @@ describe("app editor — one save across the tabs", () => {
     });
   });
 
+  it("offers Share the user's Steam library on a managed-home desktop only, and saves it (#1001)", async () => {
+    mocked.getApp.mockResolvedValue({ app: app({ kind: "desktop" }) });
+    mocked.updateApp.mockResolvedValue({ app: app({ kind: "desktop", share_steam_library: true }) });
+    renderEditor("/admin/library/apps/app-1/runtime");
+
+    fireEvent.click(await screen.findByLabelText("Share the user's Steam library"));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() =>
+      expect(mocked.updateApp).toHaveBeenCalledWith("tok", "app-1", { share_steam_library: true }),
+    );
+  });
+
+  it("hides the Steam library switch on a game", async () => {
+    renderEditor("/admin/library/apps/app-1/runtime");
+    await screen.findByLabelText("Managed home");
+    expect(screen.queryByLabelText("Share the user's Steam library")).toBeNull();
+  });
+
   it("puts every tab back on Discard, and re-disables the save", async () => {
     renderEditor();
     fireEvent.change(await screen.findByLabelText("Display name"), { target: { value: "Nope" } });

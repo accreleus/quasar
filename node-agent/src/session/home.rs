@@ -121,13 +121,9 @@ pub fn provision_home_dirs(
     template: Option<TemplateSeeder<'_>>,
 ) {
     if let Some(root) = resolve_root(home_root) {
-        let candidates: Vec<PathBuf> = mounts
-            .iter()
-            .filter_map(|m| host_path_of(m))
-            .filter(|h| is_under_root(&root, h))
-            .collect();
+        let (candidates, nested) = split_home_mounts(mounts, &root);
         if candidates.len() > 1 {
-            for host in candidates {
+            for host in candidates.into_iter().chain(nested) {
                 if let Err(error) = std::fs::create_dir_all(&host) {
                     tracing::warn!(
                         token = "home-provision-compat-failed",
@@ -156,11 +152,7 @@ pub fn provision_home_dirs_with_result(
 
     // §3.5: collect every host path strictly under the home root BEFORE
     // creating anything, so ambiguity is decided up front.
-    let candidates: Vec<PathBuf> = mounts
-        .iter()
-        .filter_map(|m| host_path_of(m))
-        .filter(|h| is_under_root(&root, h))
-        .collect();
+    let (candidates, nested) = split_home_mounts(mounts, &root);
 
     if candidates.len() > 1 {
         return Err(std::io::Error::other("ambiguous managed-home mounts"));
@@ -217,7 +209,64 @@ pub fn provision_home_dirs_with_result(
             });
         }
     }
+    for host in &nested {
+        provision_nested_dir(&root, host)?;
+    }
     Ok(outcome)
+}
+
+/// Splits the bind mounts under `root` into managed homes and nested mounts. A
+/// nested mount's container target lies inside another under-root mount's
+/// target: the user's Steam data dir over a desktop's own home (#1001). It is
+/// created but never seeded, never counted for ambiguity and never measured.
+fn split_home_mounts(mounts: &[String], root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let under: Vec<(PathBuf, Option<PathBuf>)> = mounts
+        .iter()
+        .filter_map(|m| {
+            let host = host_path_of(m)?;
+            is_under_root(root, &host).then(|| (host, m.split(':').nth(1).map(PathBuf::from)))
+        })
+        .collect();
+    let mut homes = Vec::new();
+    let mut nested = Vec::new();
+    for (host, target) in &under {
+        let inside_another = target.as_deref().is_some_and(|t| {
+            under
+                .iter()
+                .any(|(_, other)| other.as_deref().is_some_and(|o| is_under_root(o, t)))
+        });
+        if inside_another {
+            nested.push(host.clone());
+        } else {
+            homes.push(host.clone());
+        }
+    }
+    (homes, nested)
+}
+
+/// Creates a nested mount's source and owns every directory it created by the
+/// app user, as a seeded home is, so a cold Steam home it starts is writable.
+fn provision_nested_dir(root: &Path, host: &Path) -> std::io::Result<()> {
+    let created: Vec<PathBuf> = host
+        .ancestors()
+        .take_while(|p| is_under_root(root, p) && !p.exists())
+        .map(Path::to_path_buf)
+        .collect();
+    if let Err(e) = std::fs::create_dir_all(host) {
+        tracing::warn!(
+            token = "home-provision-failed",
+            "provision home dir {}: {e:#}",
+            host.display()
+        );
+        return Err(e);
+    }
+    if let Some((uid, gid)) = crate::agent::app_uid_gid() {
+        for dir in &created {
+            std::os::unix::fs::lchown(dir, Some(uid), Some(gid))?;
+        }
+    }
+    tracing::info!("provisioned nested home dir: {}", host.display());
+    Ok(())
 }
 
 /// A cold report requires a currently empty destination; a writer racing
@@ -355,13 +404,7 @@ pub fn measure_home_dirs(mounts: &[String], home_root: &str) -> Option<u64> {
     let root = resolve_root(home_root)?;
     let deadline = Instant::now() + DU_TIMEOUT;
     let mut total: u64 = 0;
-    for mount in mounts {
-        let Some(host) = host_path_of(mount) else {
-            continue;
-        };
-        if !is_under_root(&root, &host) {
-            continue;
-        }
+    for host in split_home_mounts(mounts, &root).0 {
         if host.exists() {
             total = total.saturating_add(du(&host, deadline, DU_DEPTH_CAP));
         }
@@ -775,6 +818,64 @@ mod tests {
         assert!(
             !leaf_a.join("marker.txt").exists() && !leaf_b.join("marker.txt").exists(),
             "an ambiguous (multi-mount) match must seed nothing"
+        );
+    }
+
+    /// #1001: a sharing desktop carries its own home plus the user's Steam data
+    /// dir nested over it. The nested mount is no second home: the desktop's home
+    /// still seeds, and the Steam dir is created without a seed.
+    #[test]
+    fn a_nested_shared_steam_mount_is_not_a_second_home() {
+        let (_tpl, store) = published_store(TemplateCloneMode::Copy);
+        let seed = store.seed("steam").unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let home_root = dest.path().join("homes");
+        let desktop = home_root.join("u/kde");
+        let steam_data = home_root.join("u/steam/.local/share/Steam");
+        let mounts = vec![
+            format!("{}:/home/quasar:rw", desktop.display()),
+            format!(
+                "{}:/home/quasar/.local/share/Steam:rw",
+                steam_data.display()
+            ),
+        ];
+        let outcome = provision_home_dirs_with_result(
+            &mounts,
+            home_root.to_str().unwrap(),
+            Some(TemplateSeeder {
+                store: &store,
+                seed: &seed,
+                authorization: None,
+            }),
+            "template_unavailable",
+        )
+        .expect("a nested mount must not make the homes ambiguous");
+        assert_eq!(outcome.map(|o| o.reason), Some("seeded"));
+        assert!(desktop.join("marker.txt").exists());
+        assert!(steam_data.is_dir());
+        assert!(!steam_data.join("marker.txt").exists());
+
+        std::fs::write(steam_data.join("game.bin"), [0u8; 64]).unwrap();
+        assert_eq!(
+            measure_home_dirs(&mounts, home_root.to_str().unwrap()),
+            Some(6),
+            "the shared library is not the desktop home's usage"
+        );
+    }
+
+    #[test]
+    fn a_nested_mount_never_hides_two_real_homes() {
+        let root = Path::new("/homes");
+        let mounts = vec![
+            "/homes/u/a:/home/quasar:rw".to_string(),
+            "/homes/u/b:/home/quasar:rw".to_string(),
+            "/homes/u/steam/.local/share/Steam:/home/quasar/.local/share/Steam:rw".to_string(),
+        ];
+        let (homes, nested) = split_home_mounts(&mounts, root);
+        assert_eq!(homes.len(), 2);
+        assert_eq!(
+            nested,
+            vec![PathBuf::from("/homes/u/steam/.local/share/Steam")]
         );
     }
 
