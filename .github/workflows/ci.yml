@@ -35,6 +35,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Every job (here and in the other workflows) runs on `ubuntu-26.04`, not `ubuntu-latest`:
+# the 2026-10-30 `-latest` move to 26.04 brought Podman 5.7 and a sudo that ignores `-E`
+# and broke CI until #982 (#985). To move the pin, change every `runs-on:` in
+# .github/workflows/ in ONE pull request (`grep -rn runs-on .github/workflows`), read the
+# "Runner Image" block of its "Set up job" log to confirm the image, and check what the
+# jobs lean on: the runner's GStreamer (node-agent job), Docker and Podman (engine suite),
+# sudo. The apt cache keys on the image version, so the first run on a new image is cold.
+#
 # Read-only. No job here publishes anything, so nothing may inherit a write scope —
 # including a job added later. Every third-party action below is pinned to a full
 # commit sha (the trailing comment is the version that sha was); a tag is mutable and
@@ -46,7 +54,7 @@ jobs:
   # Which areas does this pull request touch? Every area on a push or a dispatch.
   changes:
     name: changed areas
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -56,6 +64,7 @@ jobs:
       web: ${{ steps.areas.outputs.web }}
       rust: ${{ steps.areas.outputs.rust }}
       site: ${{ steps.areas.outputs.site }}
+      deploy: ${{ steps.areas.outputs.deploy }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,7 +80,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          all() { printf 'go=true\nweb=true\nrust=true\nsite=true\n' | tee -a "$GITHUB_OUTPUT"; }
+          all() { printf 'go=true\nweb=true\nrust=true\nsite=true\ndeploy=true\n' | tee -a "$GITHUB_OUTPUT"; }
           if [ "$EVENT" != pull_request ]; then echo "$EVENT: every job runs"; all; exit 0; fi
           # A rename counts on both sides: moving a file out of web/ still concerns web.
           gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
@@ -79,7 +88,7 @@ jobs:
           # The files API lists at most 3000; a list that long may be cut short, so run everything.
           if [ "$(wc -l < "$RUNNER_TEMP/changed")" -ge 3000 ]; then echo "3000+ paths: every job runs"; all; exit 0; fi
           out="$(bash scripts/verify/ci-changed-areas.sh < "$RUNNER_TEMP/changed")"
-          [ "$(grep -c -E '^(go|web|rust|site)=(true|false)$' <<<"$out")" -eq 4 ] \
+          [ "$(grep -c -E '^(go|web|rust|site|deploy)=(true|false)$' <<<"$out")" -eq 5 ] \
             || { echo "::error::ci-changed-areas.sh gave an unusable answer: $out"; exit 1; }
           echo "$out" | tee -a "$GITHUB_OUTPUT"
 
@@ -92,7 +101,7 @@ jobs:
     name: control-plane tests (${{ matrix.part }})
     needs: changes
     if: needs.changes.outputs.go == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Measured 2026-10: about 3 min of tests on a cold build cache. 30 fails a stall early.
     timeout-minutes: 30
     env:
@@ -179,7 +188,7 @@ jobs:
     name: control-plane (build + vet + test)
     needs: [changes, go-tests]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Gather the control-plane jobs
@@ -193,6 +202,21 @@ jobs:
           [ "$WANTED" = true ] || { echo "no control-plane change: nothing to gather"; exit 0; }
           [ "$TESTS" = success ] || { echo "::error::a control-plane job did not pass"; exit 1; }
 
+  # The compose file set must still render to the properties the base + overlay split
+  # promises (#967). `docker compose config` parses; this checks what the files compose to.
+  compose-overlays:
+    name: compose overlays
+    needs: changes
+    if: needs.changes.outputs.deploy == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Render the compose chains
+        run: bash scripts/dev/test-compose-overlays.sh
+
   # The web suite is three jobs so the slow part, vitest (about 4 min in one job, half of
   # it jsdom start-up per file), runs in two halves beside typecheck + build. `web` is the
   # check main requires, so it is the one that gathers them: it fails unless both halves
@@ -201,7 +225,7 @@ jobs:
     name: web (typecheck + build)
     needs: changes
     if: needs.changes.outputs.web == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
       run:
@@ -226,7 +250,7 @@ jobs:
     name: web vitest (${{ matrix.shard }}/2)
     needs: changes
     if: needs.changes.outputs.web == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -251,7 +275,7 @@ jobs:
     name: web (typecheck + build + vitest)
     needs: [changes, web-build, web-vitest]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Gather the web jobs
@@ -275,7 +299,7 @@ jobs:
     name: site (install artifacts + docs build)
     needs: changes
     if: needs.changes.outputs.site == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
       run:
@@ -303,7 +327,7 @@ jobs:
     name: node-agent (fmt + clippy + test)
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Measured 2026-10: 5 min median, under 11 min at worst with a slow apt step. 30 leaves room
     # for a cold rust-cache and fails a stall in half an hour, not the 6-hour default (#864).
     timeout-minutes: 30
@@ -324,8 +348,8 @@ jobs:
         with:
           path: ${{ runner.temp }}/apt-debs
           key: apt-debs-${{ steps.image.outputs.id }}-${{ hashFiles('.github/ci-apt/node-agent.txt', 'scripts/verify/ci-apt-install.sh') }}
-      # gstreamer-rs 0.23 sys crates need the GStreamer 1.24 dev headers;
-      # ubuntu-24.04 (ubuntu-latest) ships gst 1.24. webrtc/sdp live in -bad.
+      # The gstreamer-rs sys crates need the GStreamer dev headers; ubuntu-26.04 ships
+      # gst 1.28.2. webrtc/sdp live in -bad.
       - name: Install GStreamer dev packages
         run: bash "$GITHUB_WORKSPACE/scripts/verify/ci-apt-install.sh" "$GITHUB_WORKSPACE/.github/ci-apt/node-agent.txt" "$RUNNER_TEMP/apt-debs"
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -339,7 +363,7 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: node-agent
           save-if: ${{ github.event_name == 'push' }}
@@ -359,7 +383,14 @@ jobs:
       - name: Load uinput
         run: sudo modprobe uinput && ls -l /dev/uinput
       - name: Test against the real uinput
-        run: sudo -E env "PATH=$PATH" QUASAR_REQUIRE_UINPUT=1 cargo test --workspace --lib uinput_ -- --ignored --test-threads=1
+        # No `sudo -E`: the runner's sudo stopped honouring it (#982), so cargo under root
+        # found no rustup default. Hand rustup and cargo their homes explicitly instead, and
+        # CARGO_INCREMENTAL so the Test step's binary is reused rather than rebuilt.
+        run: >-
+          sudo env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}"
+          "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
+          "CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}" QUASAR_REQUIRE_UINPUT=1
+          cargo test --workspace --lib uinput_ -- --ignored --test-threads=1
 
   # RH-07 #408: the runtime's behavioural suite against each engine mode a hosted runner
   # can host. One job per mode; the assertions are the same for all of them. What a
@@ -371,7 +402,7 @@ jobs:
     name: engine suite (build)
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Measured 2026-10: 1-3 min without a stalled apt step. 20 is headroom for a cold rust-cache (#864).
     timeout-minutes: 20
     steps:
@@ -395,7 +426,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: node-agent
           shared-key: engine-suite
@@ -421,22 +452,16 @@ jobs:
     name: engine suite (${{ matrix.target }})
     needs: [changes, engines-build]
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         target: [docker-rootful, docker-rootless, podman-rootful, podman-rootless]
-        # A finding Podman fails on, recorded rather than hidden: it still runs, reports
-        # KNOWN, and fails the job once it passes so the entry is dropped. restart is 4.9's
-        # alone (no restart-policy update; Quasar requires Podman 5.1, #424).
-        include:
-          - target: podman-rootful
-            known: >-
-              podman-rootful:restart=Podman 4.9 has no restart-policy update (Engine) - Quasar needs Podman 5.1 and refuses older (#424)
-          - target: podman-rootless
-            known: >-
-              podman-rootless:restart=Podman 4.9 has no restart-policy update (Engine) - Quasar needs Podman 5.1 and refuses older (#424)
+        # A finding an engine fails on is recorded per target as an `include` entry whose
+        # `known` value is "<target>:<case>=<finding>": the case still runs, reports KNOWN,
+        # and fails the job once it passes so the entry is dropped. None today: the
+        # runner's Podman 5.7 passes restart, which 4.9 failed (#424, #982).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

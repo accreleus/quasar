@@ -235,6 +235,7 @@ beforeEach(() => {
   engageSpy.mockReset();
   engageSpy.mockImplementation(() => Promise.resolve({ mode: "pointer-lock" }));
   localStorage.clear();
+  sessionStorage.clear();
   fsEl = null;
   Object.defineProperty(document, "fullscreenElement", { configurable: true, get: () => fsEl });
   document.documentElement.requestFullscreen = requestFullscreen;
@@ -410,5 +411,160 @@ describe("SessionPage — #647 straight-in capture", () => {
     await reveal();
     expect(typeof lastDrawerProps?.releaseHint).toBe("string");
     expect((lastDrawerProps?.releaseHint as string).length).toBeGreaterThan(0);
+  });
+});
+
+describe("SessionPage — Match cursor compositor size (#898)", () => {
+  const compositor = () => {
+    const v = document.querySelector("video")!;
+    return [v.dataset.compositorW, v.dataset.compositorH];
+  };
+
+  it("is the launch size, moves with the render size, and ignores a stream-size change", async () => {
+    await reveal();
+    // The launch stream is 2560x1440; the router-state tier (1920x1080) is only the seed.
+    expect(compositor()).toEqual(["2560", "1440"]);
+
+    // The external stream size moves the stream, not the compositor.
+    await act(async () => {
+      (lastDrawerProps?.onStreamSizeChange as (v: { w: number; h: number }) => void)({ w: 1920, h: 1080 });
+    });
+    await advance(500);
+    expect(compositor()).toEqual(["2560", "1440"]);
+
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+    expect(compositor()).toEqual(["1280", "720"]);
+  });
+
+  it("a reload keeps the acked render size, so the attribute is not the launch size (#972)", async () => {
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    await reveal();
+    expect(compositor()).toEqual(["1280", "720"]);
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 1280, h: 720 });
+    // Seeding is display-only: the remount sends nothing.
+    await advance(1_000);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(1);
+  });
+
+  it("after a reload, an interface-size change keeps the stored render size", async () => {
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+    cleanup();
+    await reveal();
+
+    await act(async () => {
+      (lastDrawerProps?.onUiScaleChange as (v: number) => void)(1.5);
+    });
+    await advance(500);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(2);
+    expect(compositor()).toEqual(["1280", "720"]);
+  });
+
+  it.each([
+    ["odd", { w: 1281, h: 721 }],
+    ["below 16", { w: 8, h: 8 }],
+    ["not a number", { w: "1280", h: "720" }],
+  ])("a stored render size that is %s is ignored", async (_name, stored) => {
+    sessionStorage.setItem("quasar.session.s1.render", JSON.stringify(stored));
+    await reveal();
+    expect(compositor()).toEqual(["2560", "1440"]);
+    expect(lastDrawerProps?.renderSize).toBeNull();
+  });
+
+  it("a render size the host rejected is not carried over a reload", async () => {
+    updateSessionDisplay.mockRejectedValue(new Error("rejected"));
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+
+    cleanup();
+    await reveal();
+    expect(compositor()).toEqual(["2560", "1440"]);
+  });
+
+  it("a reload keeps the acked interface size, and the seed sends nothing (#995)", async () => {
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onUiScaleChange as (v: number) => void)(1.5);
+    });
+    await advance(500);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    await reveal();
+    expect(lastDrawerProps?.uiScale).toBe(1.5);
+    await advance(1_000);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(1);
+  });
+
+  it("after a reload, a render-size change keeps the stored interface size (#995)", async () => {
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onUiScaleChange as (v: number) => void)(1.5);
+    });
+    await advance(500);
+    cleanup();
+    await reveal();
+
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(2);
+    // The PATCH carried the render size only; the stored scale is untouched and still displayed.
+    expect(updateSessionDisplay).toHaveBeenLastCalledWith("t", "s1", { render_width: 1280, render_height: 720 });
+    expect(lastDrawerProps?.uiScale).toBe(1.5);
+    expect(sessionStorage.getItem("quasar.session.s1.uiScale")).toBe("1.5");
+  });
+
+  it("a failed change after a reload reverts to the stored interface size, not 1× (#995)", async () => {
+    sessionStorage.setItem("quasar.session.s1.uiScale", "1.5");
+    updateSessionDisplay.mockRejectedValue(new Error("rejected"));
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onUiScaleChange as (v: number) => void)(2);
+    });
+    await advance(500);
+    expect(lastDrawerProps?.uiScale).toBe(1.5);
+  });
+
+  it.each([
+    ["below 1", 0.5],
+    ["above 3", 3.5],
+    ["a string", "1.5"],
+    ["null", null],
+  ])("a stored interface size that is %s is ignored (#995)", async (_name, stored) => {
+    sessionStorage.setItem("quasar.session.s1.uiScale", JSON.stringify(stored));
+    await reveal();
+    expect(lastDrawerProps?.uiScale).toBe(1);
+  });
+
+  it("an interface size the host rejected is not carried over a reload (#995)", async () => {
+    updateSessionDisplay.mockRejectedValue(new Error("rejected"));
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onUiScaleChange as (v: number) => void)(1.5);
+    });
+    await advance(500);
+    expect(sessionStorage.getItem("quasar.session.s1.uiScale")).toBeNull();
+
+    cleanup();
+    await reveal();
+    expect(lastDrawerProps?.uiScale).toBe(1);
   });
 });

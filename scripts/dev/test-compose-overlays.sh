@@ -101,19 +101,24 @@ for chain in $ALL_CHAINS; do
   esac
 done
 
-# ── 4. Console capabilities are scoped to the console overlay ────────────────
-# A stream-only deployment must not carry DRM master or the host's audio devices.
+# ── 4. The console overlay adds no capability and no DRM rule ────────────────
+# ADR 0009: the console session's own container holds the display, so the agent needs
+# neither DRM master (SYS_ADMIN) nor a DRM cgroup rule (226); its DRM read access comes
+# from the base file's /dev/dri. What the overlay does add is the i2c rule (major 89)
+# for monitor power, and the base evdev rule (13) must survive it. This used to assert
+# the opposite, from before the session moved into its own container (#967).
 caps=$(agent_field "','.join(svc.get('cap_add', []))" -- "${BASE[@]}")
-case ",$caps," in *,SYS_ADMIN,*) fail "base grants SYS_ADMIN without the console overlay" ;; esac
+case ",$caps," in *,SYS_ADMIN,*) fail "base grants SYS_ADMIN" ;; esac
 
 caps=$(agent_field "','.join(svc.get('cap_add', []))" -- "${CONSOLE[@]}")
-case ",$caps," in *,SYS_ADMIN,*) ;; *) fail "console overlay does not grant SYS_ADMIN (got: $caps)" ;; esac
+case ",$caps," in *,SYS_ADMIN,*) fail "console overlay grants SYS_ADMIN — the session container holds the display, not the agent (got: $caps)" ;; esac
 
 rules=$(agent_field "';'.join(svc.get('device_cgroup_rules', []))" -- "${BASE[@]}")
-case "$rules" in *"226:"*) fail "base carries the DRM cgroup rule without the console overlay" ;; esac
+case "$rules" in *"226:"*) fail "base carries a DRM cgroup rule" ;; esac
 
 rules=$(agent_field "';'.join(svc.get('device_cgroup_rules', []))" -- "${NVIDIA_CONSOLE[@]}")
-case "$rules" in *"226:"*) ;; *) fail "console overlay is missing the DRM cgroup rule (got: $rules)" ;; esac
+case "$rules" in *"226:"*) fail "console overlay carries a DRM cgroup rule — the agent reads DRM through /dev/dri (got: $rules)" ;; esac
+case "$rules" in *"89:"*) ;; *) fail "console overlay is missing the i2c cgroup rule (got: $rules)" ;; esac
 case "$rules" in *"13:"*) ;; *) fail "console overlay dropped the base evdev cgroup rule (got: $rules)" ;; esac
 
 # ── 5. Docker's default seccomp profile is retained everywhere ───────────────
@@ -224,6 +229,13 @@ for var in QUASAR_TRUSTED_PROXIES QUASAR_PUBLIC_HOST QUASAR_ALLOWED_ORIGINS \
     fail "base compose does not pass $var to the control plane (got: $actual) — a documented .env knob with no passthrough is silently inert"
 done
 
+# The hardened overlay proxies to the HTTP port, so with QUASAR_TRUSTED_PROXIES
+# empty nobody can sign in (#604): it must stop `compose up`, naming the variable.
+err=$(unset QUASAR_TRUSTED_PROXIES; QUASAR_PUBLIC_HOST=test.example QUASAR_TLS_DIR=/tmp/test-tls \
+  render --env-file /dev/null -f deploy/docker-compose.yml -f deploy/docker-compose.hardened.yml 2>&1 >/dev/null) && \
+  fail "hardened overlay renders with QUASAR_TRUSTED_PROXIES unset — it must refuse"
+case "$err" in *QUASAR_TRUSTED_PROXIES*) ;; *) fail "hardened overlay's refusal does not name QUASAR_TRUSTED_PROXIES: $err" ;; esac
+
 # THE REGRESSION THAT MUST NEVER RETURN: the control plane creates its TLS pair
 # under /var/lib/quasar-control and EXITS AT BOOT when that path is not
 # writable. The retired release overlay did `volumes: !reset []` to strip the
@@ -268,13 +280,13 @@ for spec in \
   "DEV:-f deploy/docker-compose.yml -f deploy/overlays/docker-compose.dev.yml" \
   "NVIDIA_DEV:-f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml -f deploy/overlays/docker-compose.dev.yml"; do
   chain="${spec%%:*}"; files="${spec#*:}"
-  # The hardened overlay `:?`-requires QUASAR_PUBLIC_HOST + QUASAR_TLS_DIR;
-  # both are harmless on the other chains.
+  # The hardened overlay `:?`-requires QUASAR_PUBLIC_HOST, QUASAR_TLS_DIR and
+  # QUASAR_TRUSTED_PROXIES; all three are harmless on the other chains.
   # shellcheck disable=SC2046,SC2086
-  built=$(QUASAR_PUBLIC_HOST=test.example QUASAR_TLS_DIR=/tmp/test-tls \
+  built=$(QUASAR_PUBLIC_HOST=test.example QUASAR_TLS_DIR=/tmp/test-tls QUASAR_TRUSTED_PROXIES=172.18.0.0/16 \
     cp_field "'yes' if svc.get('build') else 'no'" -- $files)
   # shellcheck disable=SC2046,SC2086
-  probe=$(QUASAR_PUBLIC_HOST=test.example QUASAR_TLS_DIR=/tmp/test-tls \
+  probe=$(QUASAR_PUBLIC_HOST=test.example QUASAR_TLS_DIR=/tmp/test-tls QUASAR_TRUSTED_PROXIES=172.18.0.0/16 \
     cp_field "' '.join(svc.get('healthcheck', {}).get('test', []))" -- $files)
   if [ "$built" = yes ]; then
     case "$probe" in *wget*) ;; *) fail "$chain builds the dev CP image (wget-only) but its healthcheck is: $probe" ;; esac

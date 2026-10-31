@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -67,21 +68,25 @@ func managedHomeDigest(provider, ref, target string) (string, string, error) {
 	return fmt.Sprintf("%x", sum), fmt.Sprintf("%s:%s:rw", ref, target), nil
 }
 
-func finalMount(spec []byte) (string, error) {
+// finalMounts is the last n dispatch mounts: the managed home, then the shared
+// home when the session has one (injectSharedHomeMount appends it last).
+func finalMounts(spec []byte, n int) ([]string, error) {
 	var v struct {
 		Mounts []json.RawMessage `json:"mounts"`
 	}
 	if err := json.Unmarshal(spec, &v); err != nil {
-		return "", fmt.Errorf("decode dispatch mounts: %w", err)
+		return nil, fmt.Errorf("decode dispatch mounts: %w", err)
 	}
-	if len(v.Mounts) == 0 {
-		return "", errors.New("dispatch has no managed home mount")
+	if len(v.Mounts) < n {
+		return nil, errors.New("dispatch has no managed home mount")
 	}
-	var mount string
-	if err := json.Unmarshal(v.Mounts[len(v.Mounts)-1], &mount); err != nil {
-		return "", errors.New("final dispatch mount is not a string")
+	out := make([]string, n)
+	for i, raw := range v.Mounts[len(v.Mounts)-n:] {
+		if err := json.Unmarshal(raw, &out[i]); err != nil {
+			return nil, errors.New("final dispatch mount is not a string")
+		}
 	}
-	return mount, nil
+	return out, nil
 }
 
 // BindManagedHomeDispatch persists the exact home identity before assignment
@@ -126,11 +131,11 @@ func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 	var state State
 	var oldHome *string
 	var oldDigest *string
-	var adopts *string
+	var adopts, shared *string
 	err = tx.QueryRow(ctx, `SELECT user_id::text,app_id::text,host_id::text,state,
-		managed_home_id::text,managed_home_mount_sha256,adopt_session_id::text
+		managed_home_id::text,managed_home_mount_sha256,adopt_session_id::text,shared_home_app_id::text
 		FROM sessions WHERE id=$1::uuid FOR UPDATE`, sessionID).
-		Scan(&userID, &appID, &hostID, &state, &oldHome, &oldDigest, &adopts)
+		Scan(&userID, &appID, &hostID, &state, &oldHome, &oldDigest, &adopts, &shared)
 	if err != nil {
 		return nil, fmt.Errorf("lock session for home binding: %w", err)
 	}
@@ -182,11 +187,21 @@ func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 	if err != nil {
 		return nil, err
 	}
-	injectedMount, err := finalMount(spec)
+	want := []string{expectedMount}
+	var sharedPending *string
+	if shared != nil {
+		var sharedMount string
+		sharedMount, sharedPending, err = lockSharedHomeForDispatch(ctx, tx, userID, *shared, *hostID, sessionID, target)
+		if err != nil {
+			return nil, err
+		}
+		want = append(want, sharedMount)
+	}
+	injected, err := finalMounts(spec, len(want))
 	if err != nil {
 		return nil, err
 	}
-	if injectedMount != expectedMount {
+	if !slices.Equal(injected, want) {
 		return nil, errors.New("resolved managed home mount changed before dispatch")
 	}
 	if oldHome != nil || oldDigest != nil {
@@ -204,10 +219,76 @@ func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 	if err != nil {
 		return nil, err
 	}
+	if shared != nil {
+		if err := holdSharedHome(ctx, tx, userID, *shared, sessionID, decision, sharedPending); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return decision, nil
+}
+
+// lockSharedHomeForDispatch locks the shared home's claim, then its home row,
+// after the session's own (the scheduler's order), and returns the mount the
+// dispatch must carry for it plus the claim's current holder.
+func lockSharedHomeForDispatch(ctx context.Context, tx pgx.Tx, userID, sharedApp, hostID, sessionID, target string) (string, *string, error) {
+	var claimHost, pending *string
+	var claimState string
+	err := tx.QueryRow(ctx, `SELECT host_id::text,state,pending_home_session_id::text
+		FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`,
+		userID, sharedApp).Scan(&claimHost, &claimState, &pending)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil, ErrHomeConflict
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("lock shared home claim: %w", err)
+	}
+	if claimState == "conflict" || claimHost == nil || *claimHost != hostID || (pending != nil && *pending != sessionID) {
+		return "", nil, ErrHomeConflict
+	}
+	var ref string
+	err = tx.QueryRow(ctx, `SELECT ref FROM user_homes
+		WHERE user_id=$1::uuid AND app_id=$2::uuid AND host_id=$3::uuid AND gc_after IS NULL
+		FOR SHARE`, userID, sharedApp, hostID).Scan(&ref)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil, ErrHomeConflict
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("lock shared home row: %w", err)
+	}
+	return sharedSteamMount(ref, path.Clean(target)), pending, nil
+}
+
+// holdSharedHome holds the shared claim under the same token as the session's
+// own hold, so one qualified terminal or one ClearNewHomeHold releases both.
+func holdSharedHome(ctx context.Context, tx pgx.Tx, userID, sharedApp, sessionID string, own *HomeHoldDecision, pending *string) error {
+	if own == nil {
+		if pending != nil {
+			return ErrHomeConflict
+		}
+		_, err := tx.Exec(ctx, `UPDATE managed_home_claims SET legacy_unprotected_dispatch=true
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, userID, sharedApp)
+		if err != nil {
+			return fmt.Errorf("record unsupported shared home dispatch: %w", err)
+		}
+		return nil
+	}
+	if pending != nil {
+		return nil
+	}
+	tag, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=$3::uuid,
+		pending_home_token=$4::uuid,pending_home_started_at=now()
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid AND pending_home_token IS NULL`,
+		userID, sharedApp, sessionID, own.Token)
+	if err != nil {
+		return fmt.Errorf("hold shared home dispatch: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrHomeConflict
+	}
+	return nil
 }
 
 // materializeRunningHome is called only on the first accepted agent running

@@ -543,6 +543,9 @@ pub struct ControlInputs {
     /// (`QUASAR_TRUSTED_PROXIES`), checked with the control plane's rules.
     #[serde(default)]
     pub trusted_proxies: Option<String>,
+    /// Seconds of HSTS on the HTTPS listener (`QUASAR_HSTS_MAX_AGE`); needs recipe revision 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hsts_max_age: Option<String>,
     pub database: DatabaseInputs,
     #[serde(flatten)]
     pub unknown: Unknown,
@@ -696,7 +699,8 @@ impl Book {
             // fallbacks, so the installed release's images can come between (#365).
             // Revision 3 (#543): the recipe carries the healthcheck, which Podman drops
             // from an OCI image.
-            Role::ControlPlane => Some(1..=3),
+            // Revision 4 (#874): `QUASAR_HSTS_MAX_AGE` is an input.
+            Role::ControlPlane => Some(1..=4),
             // The Postgres image carries no recipe label: its revision is this actor's own
             // (`control::POSTGRES_REVISION`).
             Role::Postgres => Some(1..=1),

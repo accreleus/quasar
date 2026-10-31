@@ -242,9 +242,21 @@ describe("createBody", () => {
       },
       managed_home: false,
       home_container_path: "/home/quasar",
+      share_steam_library: false,
       runtime_preset_id: null,
       launchable_profile_ids: [],
     });
+  });
+});
+
+describe("share_steam_library (#1001)", () => {
+  it("reads the switch, sends it only when it changed, and carries it on a create", () => {
+    const base = app({ kind: "desktop", share_steam_library: false });
+    const draft = draftFromApp(base);
+    expect(draft.shareSteamLibrary).toBe(false);
+    expect(patchBody(base, draft).share_steam_library).toBeUndefined();
+    expect(patchBody(base, { ...draft, shareSteamLibrary: true })).toEqual({ share_steam_library: true });
+    expect(createBody({ ...draftFromApp(null), shareSteamLibrary: true }).share_steam_library).toBe(true);
   });
 });
 

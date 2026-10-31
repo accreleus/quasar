@@ -121,8 +121,32 @@ Legacy Compose only: `QUASAR_TLS=off` in `deploy/.env`. You lose gamepads,
 Escape capture and the microphone unless something in front provides HTTPS. An
 owned install always serves HTTPS; a proxy forwards to its HTTP port.
 
-With TLS off, first-run setup works only through a proxy named in
-`QUASAR_TRUSTED_PROXIES`. Without one, create the admin with `BOOTSTRAP_ADMIN_*`.
+With TLS off, first-run setup and sign-in work only through a proxy named in
+`QUASAR_TRUSTED_PROXIES` that sends `X-Forwarded-Proto: https`. Without one,
+nobody can sign in.
+
+## HSTS
+
+Off by default. `QUASAR_HSTS_MAX_AGE` (seconds) makes the HTTPS listener send
+`Strict-Transport-Security: max-age=<n>`; the HTTP port never does, and no
+subdomains are named. On an owned install, on the first machine:
+
+```bash
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_HSTS_MAX_AGE=86400
+```
+
+An empty value turns it off again (a browser that already saw it keeps it until
+the max-age runs out). It needs a release whose control-plane image is recipe
+revision 4 or later; on an older one the command stops and says so.
+
+**HSTS pins the whole host name, on every port.** Once a browser trusts the
+certificate and has seen the header, any other `http://` service on that name
+(a NAS page, this control plane's own HTTP port) is forced to HTTPS until the
+max-age ends. Start with a short value such as `86400`. IP addresses are never
+pinned, and a browser that does not trust the certificate ignores the header.
+
+It worked when `curl -skI https://<console>:8443/health` shows the header and
+the same request to the HTTP port does not.
 
 ## Settings
 
@@ -132,6 +156,7 @@ Owned install (seed inputs):
 | --- | --- | --- |
 | `QUASAR_PUBLIC_HOST` | unset | The name or address of the console. The certificate claims it. |
 | `QUASAR_TLS_HOSTS` | unset | More names and IPs for the certificate, comma-separated. |
+| `QUASAR_HSTS_MAX_AGE` | unset (off) | Seconds of HSTS on the HTTPS listener. See [HSTS](#hsts). |
 | `QUASAR_TLS_PORT` | `8443` | Host port for HTTPS. Browser routes on the HTTP port redirect here. |
 | `QUASAR_HTTP_PORT` | `8080` | Host port for HTTP. |
 

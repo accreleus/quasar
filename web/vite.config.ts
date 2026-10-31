@@ -72,8 +72,10 @@ function preloadFonts(): Plugin {
 // forwarding /v1 (REST) and the signaling WebSocket to the control plane.
 //
 // Override the control-plane target with QUASAR_CONTROL_ORIGIN when it is not on
-// localhost:8080.
-const controlOrigin = process.env.QUASAR_CONTROL_ORIGIN ?? "http://localhost:8080";
+// localhost:8443; for the `make up` stack that is https://127.0.0.1:<DX_CP_TLS_PORT>
+// (`make up` prints it). It is the HTTPS listener because sign-in is refused over
+// plain HTTP (#604); `secure: false` accepts its self-signed certificate.
+const controlOrigin = process.env.QUASAR_CONTROL_ORIGIN ?? "https://localhost:8443";
 
 // The control plane serves deploy/enroll-host.sh from the SPA root as
 // /enroll-host.sh (#100), so the script a second host fetches is the one from the
@@ -287,8 +289,8 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/v1": { target: controlOrigin, changeOrigin: true, ws: true },
-      "/health": { target: controlOrigin, changeOrigin: true },
+      "/v1": { target: controlOrigin, changeOrigin: true, ws: true, secure: false },
+      "/health": { target: controlOrigin, changeOrigin: true, secure: false },
     },
   },
 });

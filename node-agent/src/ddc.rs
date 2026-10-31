@@ -13,16 +13,25 @@
 //! failing/parsing oddly all resolve to `Unknown` → treated as powered, i.e.
 //! byte-identical to the pre-DDC always-on model. Gating is purely additive.
 //!
+//! A monitor shared between machines powers on to whichever input woke it, so power alone
+//! is not "this host can be seen". The host's own input (VCP `0x60`) is
+//! `QUASAR_CONSOLE_INPUT_SOURCE` when set, else learned: read once, from the first local
+//! input while a console session displays, and kept per connector in a durable file.
+//! Until one is known power alone decides, so a dedicated monitor needs no setting.
+//!
 //! Deploy requirements: host `modprobe i2c-dev`, `ddcutil` in the agent image, and
 //! the `c 89:* rmw` device cgroup rule. `/dev/i2c-N` nodes are mknod'd here
 //! (mirrors `session::virtual_input`'s fake-udev pattern) so compose need not
 //! enumerate host-varying bus numbers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use quasar_runtime::DurableFile;
 
 /// Per-connector power reading cache TTL. #411: must exceed the console hotplug
 /// watcher's 2000ms poll interval or the cache expires every tick (was 1500ms,
@@ -46,8 +55,8 @@ const I2C_MAJOR: u32 = 89;
 enum Power {
     On,
     Off,
-    /// Powered, but showing an input other than `QUASAR_CONSOLE_INPUT_SOURCE`: off as
-    /// far as this host is concerned.
+    /// Powered, but showing an input other than this host's (configured or learned): off
+    /// as far as this host is concerned.
     OtherInput,
     /// ddcutil missing / bus unknown / read failed → treated as powered (not gated).
     Unknown,
@@ -78,6 +87,120 @@ static CONSOLE_CONFIG_SEEN: AtomicBool = AtomicBool::new(false);
 /// Whether the "no console settings yet" line has been logged (once per process).
 static CONFIG_WAIT_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// How long a failed attempt to learn a connector's input waits before the next one. Short,
+/// so a read caught while the monitor was still switching input is corrected at once.
+const LEARN_RETRY: Duration = Duration::from_secs(8);
+
+/// Attempts per connector before learning stops until console mode is toggled or the agent
+/// restarts. Each attempt reads `0xd6` and, when the monitor is on, `0x60`: over a second of
+/// i2c a desktop being played feels (#458). A monitor that answers neither would otherwise
+/// be read for as long as someone plays.
+const LEARN_ATTEMPTS: u8 = 3;
+
+/// The inputs learned so far, per connector.
+#[derive(Default)]
+struct Learned {
+    store: Option<DurableFile<BTreeMap<String, u8>>>,
+    inputs: BTreeMap<String, u8>,
+    /// When each connector's learning last ran and how many attempts it has had, so a
+    /// monitor that will not answer is not read on every poll.
+    tried: BTreeMap<String, (Instant, u8)>,
+}
+
+static LEARNED: Mutex<Learned> = Mutex::new(Learned {
+    store: None,
+    inputs: BTreeMap::new(),
+    tried: BTreeMap::new(),
+});
+
+fn learned() -> std::sync::MutexGuard<'static, Learned> {
+    LEARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Learned {
+    /// The inputs saved at `path`; an unreadable file is learned afresh, not fatal.
+    fn open(path: PathBuf) -> Self {
+        let store = DurableFile::new(path, "console-input.tmp").with_mode(0o600);
+        let loaded = store.load();
+        let corrupt = loaded.is_err();
+        let learned = Learned {
+            inputs: loaded
+                .unwrap_or_else(|err| {
+                    tracing::warn!(token = "console-input-unreadable", %err,
+                    "console: the saved monitor inputs cannot be read; learning them again");
+                    None
+                })
+                .unwrap_or_default(),
+            store: Some(store),
+            tried: BTreeMap::new(),
+        };
+        // Replace a file that does not parse, or it warns on every restart.
+        if corrupt {
+            learned.persist();
+        }
+        learned
+    }
+
+    fn persist(&self) {
+        if let Some(store) = &self.store {
+            if let Err(err) = store.store(&self.inputs) {
+                tracing::warn!(token = "console-input-persist-failed", %err,
+                    "console: the learned monitor input could not be saved; it holds until restart");
+            }
+        }
+    }
+
+    /// Keeps `value` as `connector`'s input; false when it already was.
+    fn record(&mut self, connector: &str, value: u8) -> bool {
+        let changed = self.inputs.insert(connector.to_string(), value) != Some(value);
+        if changed {
+            self.persist();
+        }
+        changed
+    }
+
+    fn forget(&mut self) {
+        if !self.inputs.is_empty() {
+            self.inputs.clear();
+            self.persist();
+        }
+        self.tried.clear();
+    }
+
+    /// The connectors still to learn: mapped to a bus, not learned, not tried lately.
+    fn due(
+        &mut self,
+        connected: &[String],
+        bus_of: impl Fn(&str) -> Option<u32>,
+        now: Instant,
+    ) -> Vec<(String, u32)> {
+        let mut out = Vec::new();
+        for conn in connected {
+            let Some(bus) = bus_of(conn) else { continue };
+            let (last, attempts) = self.tried.get(conn).copied().unzip();
+            if self.inputs.contains_key(conn)
+                || attempts.is_some_and(|n| n >= LEARN_ATTEMPTS)
+                || last.is_some_and(|at| now.duration_since(at) < LEARN_RETRY)
+            {
+                continue;
+            }
+            self.tried
+                .insert(conn.clone(), (now, attempts.unwrap_or(0) + 1));
+            out.push((conn.clone(), bus));
+        }
+        out
+    }
+}
+
+/// Where the learned inputs are kept, and what was kept. Called once per process,
+/// before the first `config_update`.
+pub(crate) fn set_state_path(path: impl Into<PathBuf>) {
+    let opened = Learned::open(path.into());
+    *learned() = opened;
+}
+
 /// `QUASAR_CONSOLE_INPUT_SOURCE`, parsed once.
 static INPUT_PIN: OnceLock<Option<u8>> = OnceLock::new();
 
@@ -95,6 +218,11 @@ static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Latch the host's console-mode state. Called from the agent's `config_update`
 /// handler; idempotent and lock-free (read on the hotplug watcher thread).
 pub(crate) fn set_console_enabled(enabled: bool) {
+    // Turning console mode off forgets the learned inputs: the way to learn again
+    // after the host is cabled to another input.
+    if !enabled {
+        learned().forget();
+    }
     CONSOLE_ENABLED.store(enabled, Ordering::Relaxed);
     CONSOLE_CONFIG_SEEN.store(true, Ordering::Relaxed);
 }
@@ -139,11 +267,21 @@ fn enabled() -> bool {
 
 /// `QUASAR_CONSOLE_INPUT_SOURCE`: the monitor input (VCP `0x60` value) this host is
 /// cabled to, for a monitor shared between machines. When set, a powered monitor
-/// showing another input counts as off. Unset: power alone decides.
+/// showing another input counts as off, and nothing is learned.
 fn input_source_pin() -> Option<u8> {
     *INPUT_PIN.get_or_init(|| {
         parse_input_source(std::env::var("QUASAR_CONSOLE_INPUT_SOURCE").ok().as_deref())
     })
+}
+
+/// The input `connector` must show to count as this host's: the setting, else the one
+/// learned. `None` until either is known: power alone decides.
+fn input_for(connector: &str) -> Option<u8> {
+    input_in(input_source_pin(), &learned(), connector)
+}
+
+fn input_in(setting: Option<u8>, learned: &Learned, connector: &str) -> Option<u8> {
+    setting.or_else(|| learned.inputs.get(connector).copied())
 }
 
 /// `"0x10"` or `"16"` → `0x10`; empty → `None`; anything else warns and is `None`.
@@ -262,7 +400,75 @@ pub(crate) fn known_bus_read_blocked(connected: &[String]) -> Option<&'static st
     None
 }
 
+/// A person is using this host's input devices while a console session displays on
+/// `connector`, so the monitor is showing this host: remember which input that is. Needs
+/// a mapped bus and no `QUASAR_CONSOLE_INPUT_SOURCE`; a connector already learned is not
+/// read again, a failed attempt waits [`LEARN_RETRY`], and after [`LEARN_ATTEMPTS`] it stops.
+/// The reads run on their own thread, off the hotplug poll.
+pub(crate) fn learn_input(connector: &str) {
+    if input_source_pin().is_some() || known_bus_read_blocked(&[connector.to_string()]).is_some() {
+        return;
+    }
+    let due = {
+        let cache = cache().lock().unwrap();
+        learned().due(
+            &[connector.to_string()],
+            |c| cache.bus_map.get(c).copied(),
+            Instant::now(),
+        )
+    };
+    if due.is_empty() {
+        return;
+    }
+    // Over a second of i2c per read: not on the 2 s hotplug poll's thread.
+    let spawned = std::thread::Builder::new()
+        .name("console-input-learn".into())
+        .spawn(move || learn_from(&LEARNED, due, read_vcp_sl));
+    if let Err(err) = spawned {
+        tracing::warn!(token = "console-input-learn-spawn-failed", %err, "console: could not start the monitor input read");
+    }
+}
+
+fn learn_from(
+    state: &Mutex<Learned>,
+    due: Vec<(String, u32)>,
+    read: impl Fn(u32, &str) -> Option<u8>,
+) {
+    for (connector, bus) in due {
+        let Some(value) = host_input(read(bus, "d6"), || read(bus, "60")) else {
+            continue;
+        };
+        let changed = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(&connector, value);
+        if changed {
+            tracing::info!(
+                token = "console-input-learned",
+                %connector,
+                input = format_args!("{value:#04x}"),
+                "console: this host's monitor input learned from local input during a console session"
+            );
+        }
+    }
+}
+
+/// The input to learn: a powered monitor's `0x60` reading. A monitor in standby may still
+/// answer with the input it last had, which proves nothing about who is looking.
+fn host_input(power_sl: Option<u8>, input: impl FnOnce() -> Option<u8>) -> Option<u8> {
+    (power_sl == Some(0x01)).then(input).flatten()
+}
+
 fn powered(connected: Vec<String>, detect: bool) -> Vec<String> {
+    powered_with(connected, detect, read_display)
+}
+
+/// [`powered`] with the per-connector read (`bus`, the input to compare) given.
+fn powered_with(
+    connected: Vec<String>,
+    detect: bool,
+    read: impl Fn(u32, Option<u8>) -> Power,
+) -> Vec<String> {
     // Before the first config_update the agent does not know whether to read the
     // monitor's power, and an unread monitor must not look on: a report made then
     // started console mode on a switched-off monitor after an agent restart.
@@ -340,7 +546,7 @@ fn powered(connected: Vec<String>, detect: bool) -> Vec<String> {
         .filter(|conn| !fresh.contains_key(*conn))
         .map(|conn| {
             let power = match bus_map.get(conn) {
-                Some(&bus) => read_display(bus, input_source_pin()),
+                Some(&bus) => read(bus, input_for(conn)),
                 None => Power::Unknown,
             };
             (conn.clone(), power)
@@ -400,22 +606,68 @@ pub struct DdcSummary {
     pub bus_mapped: bool,
     pub any_read: bool,
     pub all_off: bool,
+    /// A monitor reads on but shows another input than this host's.
+    pub other_input: bool,
+    /// This host's input (VCP `0x60`), when the setting or a learned reading gives one.
+    pub input: Option<u8>,
+    /// `input` was learned rather than set.
+    pub input_learned: bool,
 }
 
 pub(crate) fn summary() -> DdcSummary {
     let available = ddcutil_available();
+    let planned = crate::readiness::console::configured_output_id().and_then(|id| {
+        id.split_once(':')
+            .map(|(_, connector)| connector.to_string())
+    });
     let cache = cache().lock().unwrap();
+    let (other_input, input, input_learned) = input_summary(
+        planned.as_deref(),
+        &cache.power,
+        &learned().inputs,
+        input_source_pin(),
+    );
     let any_read = !cache.power.is_empty();
     DdcSummary {
         available,
         bus_mapped: !cache.bus_map.is_empty(),
         any_read,
+        other_input,
+        input,
+        input_learned,
         all_off: any_read
             && cache
                 .power
                 .values()
                 .all(|(p, _)| matches!(p, Power::Off | Power::OtherInput)),
     }
+}
+
+/// Whether a monitor shows another input, and the host's input, for the connector the
+/// console is planned on; without a pinned connector, for those that show another input.
+fn input_summary(
+    planned: Option<&str>,
+    power: &HashMap<String, (Power, Instant)>,
+    inputs: &BTreeMap<String, u8>,
+    setting: Option<u8>,
+) -> (bool, Option<u8>, bool) {
+    let other: Vec<&String> = power
+        .iter()
+        .filter(|(c, (p, _))| matches!(p, Power::OtherInput) && planned.is_none_or(|n| *c == n))
+        .map(|(c, _)| c)
+        .collect();
+    let learned_input = match planned {
+        Some(c) => inputs.get(c).copied(),
+        None => other
+            .iter()
+            .find_map(|c| inputs.get(*c).copied())
+            .or_else(|| inputs.values().next().copied()),
+    };
+    (
+        !other.is_empty(),
+        setting.or(learned_input),
+        setting.is_none() && learned_input.is_some(),
+    )
 }
 
 /// Read a fresh connector→bus map from `ddcutil detect`. Parses the paired
@@ -588,6 +840,37 @@ mod tests {
                 Some("no i2c bus is mapped for the display")
             );
         }
+        // The power read compares each connector with the input learned for it (not
+        // another's), and the setting wins: what the read is handed is what the gate uses.
+        if forced_available && enabled() && input_source_pin().is_none() {
+            set_console_enabled(true);
+            {
+                let mut cache = cache().lock().unwrap();
+                cache.bus_map.insert("DP-6".to_string(), 6);
+                cache.bus_map.insert("DP-5".to_string(), 5);
+                cache.power.remove("DP-6");
+                cache.power.remove("DP-5");
+            }
+            learned().inputs.insert("DP-6".to_string(), 0x10);
+            let seen = std::sync::Mutex::new(Vec::new());
+            let kept = powered_with(
+                vec!["DP-6".to_string(), "DP-5".to_string()],
+                false,
+                |bus, pin| {
+                    seen.lock().unwrap().push((bus, pin));
+                    if pin == Some(0x10) {
+                        Power::OtherInput
+                    } else {
+                        Power::On
+                    }
+                },
+            );
+            let mut seen = seen.into_inner().unwrap();
+            seen.sort();
+            assert_eq!(seen, vec![(5, None), (6, Some(0x10))], "{seen:?}");
+            assert_eq!(kept, vec!["DP-5".to_string()], "DP-6 shows another input");
+            learned().inputs.remove("DP-6");
+        }
         set_console_enabled(false);
         assert_eq!(
             known_bus_read_blocked(&["DP-7".to_string()]),
@@ -622,6 +905,163 @@ mod tests {
         );
         // An unreadable input keeps the monitor on, like an unreadable power state.
         assert_eq!(display_state(Some(0x01), Some(0x10), || None), Power::On);
+    }
+
+    fn learned_at(dir: &tempfile::TempDir) -> Learned {
+        Learned::open(dir.path().join("agent.console-input.json"))
+    }
+
+    /// Only a powered monitor's input is this host's: standby or an unreadable power state
+    /// reads nothing, and an unreadable input learns nothing.
+    #[test]
+    fn only_a_powered_monitors_input_is_learned() {
+        let never = || -> Option<u8> { panic!("input read without power") };
+        assert_eq!(host_input(Some(0x01), || Some(0x10)), Some(0x10));
+        assert_eq!(host_input(Some(0x04), never), None);
+        assert_eq!(host_input(None, never), None);
+        assert_eq!(host_input(Some(0x01), || None), None);
+    }
+
+    /// The learned input survives a restart, is the one a later reading is compared with,
+    /// and turning console mode off forgets it on disk too.
+    #[test]
+    fn a_learned_input_persists_gates_and_is_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = learned_at(&dir);
+        assert!(state.record("DP-4", 0x10));
+        assert!(!state.record("DP-4", 0x10), "same value is no change");
+
+        let mut again = learned_at(&dir);
+        // What the power read does with it: the other input counts as off, the setting
+        // wins over what was learned, and an unlearned connector is gated by power alone.
+        let pin = input_in(None, &again, "DP-4");
+        assert_eq!(pin, Some(0x10));
+        assert_eq!(
+            display_state(Some(0x01), pin, || Some(0x0f)),
+            Power::OtherInput
+        );
+        assert_eq!(display_state(Some(0x01), pin, || Some(0x10)), Power::On);
+        assert_eq!(input_in(Some(0x11), &again, "DP-4"), Some(0x11));
+        assert_eq!(input_in(None, &again, "HDMI-A-1"), None);
+
+        again.forget();
+        assert!(learned_at(&dir).inputs.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_state_file_is_learned_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.console-input.json"), b"{not json").unwrap();
+        assert!(learned_at(&dir).inputs.is_empty());
+    }
+
+    /// Learning reads only a mapped, not-yet-learned connector, spaced by `LEARN_RETRY`, and
+    /// after `LEARN_ATTEMPTS` nothing more is read until console mode is toggled.
+    #[test]
+    fn learning_gives_up_after_a_few_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = learned_at(&dir);
+        let bus_of = |c: &str| (c == "DP-4").then_some(5);
+        let now = Instant::now();
+        let conns = ["DP-4".to_string(), "HDMI-A-1".to_string()];
+
+        let due = state.due(&conns, bus_of, now);
+        assert_eq!(due, vec![("DP-4".to_string(), 5)], "unmapped is skipped");
+        assert!(state
+            .due(&conns, bus_of, now + LEARN_RETRY - Duration::from_secs(1))
+            .is_empty());
+        for attempt in 1..LEARN_ATTEMPTS {
+            let at = now + LEARN_RETRY * u32::from(attempt);
+            assert_eq!(state.due(&conns, bus_of, at).len(), 1, "attempt {attempt}");
+        }
+        for later in [u32::from(LEARN_ATTEMPTS), 10, 1000] {
+            let at = now + LEARN_RETRY * later;
+            assert!(
+                state.due(&conns, bus_of, at).is_empty(),
+                "no read after the cap"
+            );
+        }
+        assert!(state
+            .due(&conns, bus_of, now + Duration::from_secs(86_400))
+            .is_empty());
+
+        state.forget();
+        assert_eq!(
+            state.due(&conns, bus_of, now).len(),
+            1,
+            "a toggle starts afresh"
+        );
+        state.record("DP-4", 0x10);
+        assert!(
+            state.due(&conns, bus_of, now + LEARN_RETRY * 9).is_empty(),
+            "learned"
+        );
+    }
+
+    /// A file that does not parse is replaced, so it does not warn on every restart; the
+    /// file is private to the agent.
+    #[test]
+    fn a_corrupt_state_file_is_rewritten_once_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.console-input.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        let state = Learned::open(path.clone());
+        assert!(state.inputs.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let mut state = state;
+        state.record("DP-4", 0x10);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Readiness names the input of the connector the console is planned on, not another
+    /// monitor's.
+    #[test]
+    fn the_summary_names_the_planned_connectors_input() {
+        let now = Instant::now();
+        let power: HashMap<String, (Power, Instant)> = [
+            ("DP-3".to_string(), (Power::On, now)),
+            ("DP-4".to_string(), (Power::OtherInput, now)),
+        ]
+        .into();
+        let inputs: BTreeMap<String, u8> = [("DP-3".into(), 0x0f), ("DP-4".into(), 0x10)].into();
+        assert_eq!(
+            input_summary(Some("DP-4"), &power, &inputs, None),
+            (true, Some(0x10), true)
+        );
+        assert_eq!(
+            input_summary(Some("DP-3"), &power, &inputs, None),
+            (false, Some(0x0f), true)
+        );
+        assert_eq!(
+            input_summary(None, &power, &inputs, None),
+            (true, Some(0x10), true),
+            "auto: the connector showing another input"
+        );
+        assert_eq!(
+            input_summary(Some("DP-4"), &power, &inputs, Some(0x11)),
+            (true, Some(0x11), false),
+            "the setting wins"
+        );
+    }
+
+    /// A monitor that is on teaches its 0x60 value; one in standby teaches nothing.
+    #[test]
+    fn learning_from_a_fake_monitor() {
+        let fake = |power: u8, input: u8| {
+            move |bus: u32, code: &str| {
+                assert_eq!(bus, 5);
+                Some(if code == "d6" { power } else { input })
+            }
+        };
+        let state = Mutex::new(Learned::default());
+        let due = || vec![("DP-4".to_string(), 5u32)];
+
+        learn_from(&state, due(), fake(0x04, 0x0f));
+        assert!(state.lock().unwrap().inputs.is_empty(), "standby");
+        learn_from(&state, due(), fake(0x01, 0x10));
+        assert_eq!(state.lock().unwrap().inputs.get("DP-4"), Some(&0x10));
     }
 
     /// #411: the TTL must exceed the console hotplug watcher's poll interval, or

@@ -71,7 +71,7 @@ func newServer(t *testing.T, pool *pgxpool.Pool) (*httptest.Server, *auth.Servic
 	dh := NewHandler(store, nil)
 	dh.Register(mux, authHandler.RequireAuth)
 
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewTLSServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, authSvc
 }
@@ -90,6 +90,14 @@ func registerAndLogin(t *testing.T, svc *auth.Service, email, user, pass string)
 	}
 	return tok.Plaintext
 }
+
+// testClient trusts the certificate every httptest.NewTLSServer shares: the
+// password routes are refused over plain HTTP (#604).
+var testClient = func() *http.Client {
+	s := httptest.NewTLSServer(http.NotFoundHandler())
+	defer s.Close()
+	return s.Client()
+}()
 
 func doRequest(t *testing.T, method, url, bearer string, body any) *http.Response {
 	t.Helper()
@@ -113,7 +121,7 @@ func doRequest(t *testing.T, method, url, bearer string, body any) *http.Respons
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := testClient.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, url, err)
 	}

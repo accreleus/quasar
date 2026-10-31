@@ -9,7 +9,7 @@ import type { RegionInputWire } from "../api/me";
 import type { AppKind } from "../api/types";
 
 export interface MouseSettings {
-  /** `match_cursor` resolved for this app: scale by stream size ÷ shown size. */
+  /** `match_cursor` resolved for this app: scale by compositor size ÷ shown size. */
   match: boolean;
   /** `mouse_sensitivity`, 0.25 to 4. */
   sensitivity: number;
@@ -53,20 +53,30 @@ export interface ShownGeometry {
   boxH: number;
   /** The session view's scaling mode (`data-scaling-mode`): contain, cover or stretch; `integer` draws as contain. */
   fit?: string;
+  /** The compositor's output size, which the host moves the cursor in. Absent or not a positive finite
+   *  number means it equals the stream. It differs from the stream under the stream-size lever or an ABR
+   *  rung (stream smaller) and under a lowered render size (stream larger). */
+  compW?: number;
+  compH?: number;
 }
 
-/** Stream pixels per shown pixel on each axis; `[1, 1]` when the geometry is not known yet. */
+/** Compositor pixels per shown pixel on each axis: stream per shown, times compositor ÷ stream.
+ *  `[1, 1]` when the geometry is not known yet. */
 export function streamPerShown(g: ShownGeometry): [number, number] {
   const { streamW, streamH, boxW, boxH } = g;
   if (!(streamW > 0 && streamH > 0 && boxW > 0 && boxH > 0)) return [1, 1];
+  const { compW = 0, compH = 0 } = g;
+  const known = Number.isFinite(compW) && Number.isFinite(compH) && compW > 0 && compH > 0;
+  const kx = known ? compW / streamW : 1;
+  const ky = known ? compH / streamH : 1;
   const sx = boxW / streamW;
   const sy = boxH / streamH;
-  if (g.fit === "stretch") return [1 / sx, 1 / sy];
+  if (g.fit === "stretch") return [kx / sx, ky / sy];
   const s = g.fit === "cover" ? Math.max(sx, sy) : Math.min(sx, sy);
-  return [1 / s, 1 / s];
+  return [kx / s, ky / s];
 }
 
-/** The per-axis multiplier for one mouse event. Exactly `[1, 1]` for a window equal to the stream at 1×. */
+/** The per-axis multiplier for one mouse event. Exactly `[1, 1]` for a window equal to the compositor at 1×. */
 export function mouseGain(settings: MouseSettings, g: ShownGeometry): [number, number] {
   const [px, py] = settings.match ? streamPerShown(g) : [1, 1];
   return [px * settings.sensitivity, py * settings.sensitivity];

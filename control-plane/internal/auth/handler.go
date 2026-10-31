@@ -78,24 +78,34 @@ func (h *Handler) WithTrustedProxies(nets []*net.IPNet) *Handler {
 	return h
 }
 
-// WithLogger sets the logger for the plain-HTTP credential warning.
+// WithLogger sets the logger for the plain-HTTP credential refusal.
 func (h *Handler) WithLogger(log *slog.Logger) *Handler {
 	h.log = log
 	return h
 }
 
-// warnPlaintext logs one bounded WARN when a password-bearing route is served
-// over a transport the #593 rule would refuse. The request is served either way.
-func (h *Handler) warnPlaintext(r *http.Request, route string) {
+// plaintextMessage is shown as-is by the web client's sign-in, registration and
+// password forms.
+const plaintextMessage = "This server only accepts sign-in, registration and password changes over HTTPS. " +
+	"Open it at its https:// address. If you reach it through a reverse proxy, the operator must name that proxy in QUASAR_TRUSTED_PROXIES. " +
+	"A password or invite code sent this way may have crossed the network in clear: change it once you can sign in over HTTPS."
+
+// refusePlaintext answers 403 and reports true when a password-bearing route
+// arrives over a transport the #593 rule refuses (#604), before the body is read
+// or the rate limiter is charged. No loopback exception: production surface.
+func (h *Handler) refusePlaintext(w http.ResponseWriter, r *http.Request, route string) bool {
 	if httpx.SecureTransport(r, h.trustedProxies, false) {
-		return
+		return false
 	}
 	ip := ratelimit.ClientIP(r, h.trustedProxies)
 	if h.plaintext.Allow(ip) {
 		h.plaintext.Failure(ip)
-		h.log.Warn("credential-route-plaintext", "route", route, "remote_addr", ip,
-			"note", "a later release refuses this over plain HTTP: use the HTTPS port or name the proxy in QUASAR_TRUSTED_PROXIES")
+		h.log.Warn("credential-route-plaintext: refused over plain HTTP", "route", route, "remote_addr", ip,
+			"fix", "use the HTTPS port, or name the reverse proxy in QUASAR_TRUSTED_PROXIES and have it send X-Forwarded-Proto: https")
 	}
+	// 403, not 401: the web client ends the session on a 401 that carried a token.
+	httpx.WriteError(w, http.StatusForbidden, httpx.CodeForbidden, plaintextMessage)
+	return true
 }
 
 // WithVersionPolicy configures the native-client version handshake (P9-08):
@@ -160,7 +170,9 @@ func toBrief(u User) userBrief {
 // --- handlers ----------------------------------------------------------------
 
 func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
-	h.warnPlaintext(r, "POST /v1/auth/register")
+	if h.refusePlaintext(w, r, "POST /v1/auth/register") {
+		return
+	}
 	if !h.limiter.allow(ratelimit.ClientIP(r, h.trustedProxies)) {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited,
 			"too many attempts; try again later")
@@ -203,7 +215,9 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
-	h.warnPlaintext(r, "POST /v1/auth/login")
+	if h.refusePlaintext(w, r, "POST /v1/auth/login") {
+		return
+	}
 	if !h.limiter.allow(ratelimit.ClientIP(r, h.trustedProxies)) {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited,
 			"too many attempts; try again later")
@@ -289,7 +303,9 @@ func (h *Handler) handleMe(w http.ResponseWriter, r *http.Request) {
 //   - 401 invalid_credentials when current_password is wrong
 //   - 400 validation_failed when new_password is too short/long
 func (h *Handler) handleChangePassword(w http.ResponseWriter, r *http.Request) {
-	h.warnPlaintext(r, "POST /v1/me/password")
+	if h.refusePlaintext(w, r, "POST /v1/me/password") {
+		return
+	}
 	user, ok := UserFromContext(r.Context())
 	if !ok {
 		httpx.WriteError(w, http.StatusUnauthorized, httpx.CodeUnauthorized, "authentication required")

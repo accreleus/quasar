@@ -16,7 +16,7 @@ docker compose -f deploy/docker-compose.yml \
 
 | File | Adds | Who it is for |
 |---|---|---|
-| `docker-compose.console.yml` | DRM master (`CAP_SYS_ADMIN`), the DRM/i2c device classes, host audio | Operators running **console mode**: the GPU host drives its own monitor and speakers instead of (or alongside) streaming to a browser. Set `QUASAR_CONSOLE=1` in `deploy/.env` and `deploy/redeploy.sh` adds this file for you |
+| `docker-compose.console.yml` | `/dev/tty8` (console mode's own terminal), the i2c device rule for monitor power, host udev data. No capability: the console session's own container holds the display, the GPU and the sound device | Operators running **console mode**: the GPU host drives its own monitor and speakers instead of (or alongside) streaming to a browser. Set `QUASAR_CONSOLE=1` in `deploy/.env` and `deploy/redeploy.sh` adds this file for you |
 | `docker-compose.dev.yml` | The `build:` keys, the `web/dist` bind mount and the wget healthcheck | Anyone building the stack from a source tree. `deploy/redeploy.sh` adds it automatically, so you rarely type it. The base file is the production shape (published images, no build, no source mounts); this restores the development shape |
 | `docker-compose.local.yml` | agentless Postgres + control-plane, no GPU | Contributors doing UI/API work on a laptop (`make up`) |
 | `docker-compose.multiagent.yml` | two extra node-agents with their own identities | Multi-agent scheduling tests |

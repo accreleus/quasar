@@ -238,6 +238,21 @@ export function RuntimeTab({
             hint="Where the home appears inside the container, not where the data is stored."
           />
         )}
+        {draft.managedHome && (draft.kind === "desktop" || draft.shareSteamLibrary) && (
+          <>
+            <Switch
+              checked={draft.shareSteamLibrary}
+              onChange={(shareSteamLibrary) => onChange({ ...draft, shareSteamLibrary })}
+              label="Share the user's Steam library"
+              id="share-steam-library"
+            />
+            <span className="hint">
+              Steam inside this desktop uses the user's own Steam library: account, games and saves.
+              While it is open, the user's Steam games cannot start. Turn this on only once every
+              host runs Quasar 0.5.2 or later.
+            </span>
+          </>
+        )}
         <div className="ae-facts">
           {storageProvider && (
             <Fact label="Storage backend">{STORAGE_PROVIDER_HINT[storageProvider]}</Fact>

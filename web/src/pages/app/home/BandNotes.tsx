@@ -8,6 +8,7 @@ import { Link } from "react-router-dom";
 import type { ProfileReason } from "../../../api/types";
 import { Button } from "../../../components/Button";
 import { IconInfo } from "../../../components/icons";
+import { SHARED_LIBRARY_OPEN } from "../libraryGrid";
 import { reasonSentences } from "../launchOptions";
 import { UNEXPLAINED } from "./launchOptionRules";
 import type { WaitingReason } from "./useLaunch";
@@ -24,6 +25,8 @@ export interface BandNotesProps {
   isLive: boolean;
   isBlocked: boolean;
   blockedByName: string | null;
+  /** A sharing desktop holds this app's Steam library (#1001). */
+  sharedLibrary?: boolean;
   liveSessionId: string | null;
   /** Auto is a dead end only because this browser has no H.264; replaces the
    *  dead-end note, whose remedies do not apply. */
@@ -44,6 +47,7 @@ export function BandNotes({
   isLive,
   isBlocked,
   blockedByName,
+  sharedLibrary = false,
   liveSessionId,
   noH264,
   waitingForSlot,
@@ -96,7 +100,7 @@ export function BandNotes({
         <div className="note warn">
           <IconInfo />
           <div>
-            <b>{blockedByName}</b> is already running.{" "}
+            {sharedLibrary ? SHARED_LIBRARY_OPEN : <><b>{blockedByName}</b> is already running.</>}{" "}
             {liveSessionId ? (
               <Link to={`/app/session/${liveSessionId}`}>Go to your session</Link>
             ) : (
