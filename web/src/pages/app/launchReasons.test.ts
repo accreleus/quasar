@@ -68,6 +68,16 @@ describe("reasonSentence", () => {
     expect(soft).toMatch(/wobble|room to spare/i);
   });
 
+  it("says a risky chain missing a codec starts a step lower, not that nothing is available", () => {
+    // #870: a risky chain whose top rung's codec the host (or browser) lacks
+    // still launches, one rung down; the hard "no host" line reads as a refusal.
+    for (const code of ["host_encoder_not_supported", "codec_not_supported"]) {
+      const soft = reasonSentence(r(code), "risky");
+      expect(soft, code).not.toBe(reasonSentence(r(code), "ineligible"));
+      expect(soft, code).toMatch(/one step lower/i);
+    }
+  });
+
   it("falls back to the same wording for a code with no soft variant", () => {
     expect(reasonSentence(r("decode_height_too_low"), "risky")).toBe(
       reasonSentence(r("decode_height_too_low"), "ineligible"),
