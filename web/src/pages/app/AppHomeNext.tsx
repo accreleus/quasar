@@ -525,6 +525,7 @@ export function AppHomeNext() {
                 coverClassById={coverClassById}
                 busy={busy}
                 blockedIds={blockedIds}
+                dimmedIds={dimmedIds}
                 onOpen={(app) => (newDesign ? openGamePage(app) : detail.reveal(app, false))}
                 onPlay={(card, app) => {
                   if (card.sessionId) navigate(`/app/session/${card.sessionId}`);

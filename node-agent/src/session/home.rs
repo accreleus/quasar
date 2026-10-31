@@ -121,9 +121,9 @@ pub fn provision_home_dirs(
     template: Option<TemplateSeeder<'_>>,
 ) {
     if let Some(root) = resolve_root(home_root) {
-        let (candidates, nested) = split_home_mounts(mounts, &root);
+        let (candidates, _) = split_home_mounts(mounts, &root);
         if candidates.len() > 1 {
-            for host in candidates.into_iter().chain(nested) {
+            for host in candidates {
                 if let Err(error) = std::fs::create_dir_all(&host) {
                     tracing::warn!(
                         token = "home-provision-compat-failed",
@@ -152,7 +152,7 @@ pub fn provision_home_dirs_with_result(
 
     // §3.5: collect every host path strictly under the home root BEFORE
     // creating anything, so ambiguity is decided up front.
-    let (candidates, nested) = split_home_mounts(mounts, &root);
+    let (candidates, _) = split_home_mounts(mounts, &root);
 
     if candidates.len() > 1 {
         return Err(std::io::Error::other("ambiguous managed-home mounts"));
@@ -209,63 +209,220 @@ pub fn provision_home_dirs_with_result(
             });
         }
     }
-    for host in &nested {
-        provision_nested_dir(&root, host)?;
-    }
     Ok(outcome)
+}
+
+/// One bind mount under the home root: its host source and container target.
+struct UnderRoot {
+    host: PathBuf,
+    target: Option<PathBuf>,
+}
+
+fn under_root(mounts: &[String], root: &Path) -> Vec<UnderRoot> {
+    mounts
+        .iter()
+        .filter_map(|m| {
+            let host = host_path_of(m)?;
+            is_under_root(root, &host).then(|| UnderRoot {
+                host,
+                target: m.split(':').nth(1).map(PathBuf::from),
+            })
+        })
+        .collect()
+}
+
+/// The under-root mount whose target holds `target` most closely, if any.
+fn containing_mount<'a>(under: &'a [UnderRoot], target: &Path) -> Option<&'a UnderRoot> {
+    under
+        .iter()
+        .filter(|o| {
+            o.target
+                .as_deref()
+                .is_some_and(|t| is_under_root(t, target))
+        })
+        .max_by_key(|o| o.target.as_ref().map_or(0, |t| t.components().count()))
 }
 
 /// Splits the bind mounts under `root` into managed homes and nested mounts. A
 /// nested mount's container target lies inside another under-root mount's
 /// target: the user's Steam data dir over a desktop's own home (#1001). It is
-/// created but never seeded, never counted for ambiguity and never measured.
+/// never seeded, never counted for ambiguity and never measured; it is made by
+/// [`provision_nested_mounts`].
 fn split_home_mounts(mounts: &[String], root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let under: Vec<(PathBuf, Option<PathBuf>)> = mounts
-        .iter()
-        .filter_map(|m| {
-            let host = host_path_of(m)?;
-            is_under_root(root, &host).then(|| (host, m.split(':').nth(1).map(PathBuf::from)))
-        })
-        .collect();
+    let under = under_root(mounts, root);
     let mut homes = Vec::new();
     let mut nested = Vec::new();
-    for (host, target) in &under {
-        let inside_another = target.as_deref().is_some_and(|t| {
-            under
-                .iter()
-                .any(|(_, other)| other.as_deref().is_some_and(|o| is_under_root(o, t)))
-        });
-        if inside_another {
-            nested.push(host.clone());
+    for m in &under {
+        let inside = m
+            .target
+            .as_deref()
+            .is_some_and(|t| containing_mount(&under, t).is_some());
+        if inside {
+            nested.push(m.host.clone());
         } else {
-            homes.push(host.clone());
+            homes.push(m.host.clone());
         }
     }
     (homes, nested)
 }
 
-/// Creates a nested mount's source and owns every directory it created by the
-/// app user, as a seeded home is, so a cold Steam home it starts is writable.
-fn provision_nested_dir(root: &Path, host: &Path) -> std::io::Result<()> {
-    let created: Vec<PathBuf> = host
-        .ancestors()
-        .take_while(|p| is_under_root(root, p) && !p.exists())
-        .map(Path::to_path_buf)
-        .collect();
-    if let Err(e) = std::fs::create_dir_all(host) {
-        tracing::warn!(
-            token = "home-provision-nested-failed",
-            "provision nested home dir {}: {e:#}",
-            host.display()
-        );
-        return Err(e);
+/// The Steam data dir inside a home: the one path the control plane shares into
+/// another session (`steamDataDir`, control-plane `internal/session/home.go`).
+const STEAM_DATA_DIR: &str = ".local/share/Steam";
+
+/// Who owns what the agent makes for a nested mount: the app user the session's
+/// container drops to, which is who the image entrypoint makes own the home. `None`
+/// when the agent is not root and cannot hand a directory to another user; what it
+/// makes is then its own.
+pub fn nested_mount_owner(spec: &super::container::ContainerSpec, euid: u32) -> Option<(u32, u32)> {
+    (euid == 0).then(|| spec.app_ids())
+}
+
+/// Makes what each nested mount needs before the container exists, so the runtime
+/// never creates either as root (#1001): its source, under the source's own home
+/// (`<home>/<rel>`, e.g. the Steam home's `.local/share/Steam`), and its mount point
+/// at `<rel>` inside the home mount it nests in. `rel` is the target's path inside
+/// that home's target. It also hands every home's `.local/share/Steam` to `owner`
+/// when it is empty and root-owned, which a runtime-made mount point is.
+///
+/// Every directory made on those paths, and an existing leaf that is empty and
+/// root-owned, is owned by `owner` ([`nested_mount_owner`]). A symlink on a path
+/// refuses (repair skips it): these paths are inside user-writable homes, and no
+/// container holds them while the agent provisions (single-writer guard), so checking
+/// each component before `create_dir` and `lchown` cannot be raced by the user.
+pub fn provision_nested_mounts(
+    mounts: &[String],
+    home_root: &str,
+    owner: Option<(u32, u32)>,
+) -> std::io::Result<()> {
+    let mut chown =
+        |path: &Path, uid: u32, gid: u32| std::os::unix::fs::lchown(path, Some(uid), Some(gid));
+    provision_nested_mounts_with(mounts, home_root, owner, 0, &mut chown)
+}
+
+/// [`provision_nested_mounts`] with the chown and the uid that counts as "root-owned"
+/// injected, so tests can observe both without running as root.
+fn provision_nested_mounts_with(
+    mounts: &[String],
+    home_root: &str,
+    owner: Option<(u32, u32)>,
+    root_uid: u32,
+    chown: &mut dyn FnMut(&Path, u32, u32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let Some(root) = resolve_root(home_root) else {
+        return Ok(());
+    };
+    let under = under_root(mounts, &root);
+    let mut chain = |base: &Path, rel: &Path, create: bool| {
+        own_chain(base, rel, owner, root_uid, create, chown)
+    };
+    for m in &under {
+        let Some(home) = m
+            .target
+            .as_deref()
+            .and_then(|t| containing_mount(&under, t))
+        else {
+            // A home with a nested mount is repaired by that mount's chain below.
+            let holds_nested = under.iter().any(|n| {
+                n.target
+                    .as_deref()
+                    .and_then(|t| containing_mount(&under, t))
+                    .is_some_and(|h| std::ptr::eq(h, m))
+            });
+            if !holds_nested && m.host.is_dir() {
+                if let Err(e) = chain(&m.host, Path::new(STEAM_DATA_DIR), false) {
+                    tracing::debug!(
+                        "steam data dir repair skipped for {}: {e:#}",
+                        m.host.display()
+                    );
+                }
+            }
+            continue;
+        };
+        let target = m.target.as_deref().unwrap_or(Path::new("/"));
+        let rel = target
+            .strip_prefix(home.target.as_deref().unwrap_or(Path::new("/")))
+            .map_err(std::io::Error::other)?;
+        let source_home = m
+            .host
+            .to_str()
+            .and_then(|h| h.strip_suffix(rel.to_str()?))
+            .map(|h| PathBuf::from(h.trim_end_matches('/')))
+            .filter(|h| is_under_root(&root, h));
+        let result = match source_home {
+            Some(source_home) => {
+                std::fs::create_dir_all(&source_home).and_then(|()| chain(&source_home, rel, true))
+            }
+            None => match (m.host.parent(), m.host.file_name()) {
+                (Some(parent), Some(leaf)) => std::fs::create_dir_all(parent)
+                    .and_then(|()| chain(parent, Path::new(leaf), true)),
+                _ => Err(std::io::Error::other("nested mount source has no parent")),
+            },
+        }
+        .and_then(|()| chain(&home.host, rel, true));
+        if let Err(e) = result {
+            tracing::warn!(
+                token = "home-provision-nested-failed",
+                "provision nested mount {}: {e:#}",
+                m.host.display()
+            );
+            return Err(e);
+        }
+        tracing::info!("provisioned nested mount: {}", m.host.display());
     }
-    if let Some((uid, gid)) = crate::agent::app_uid_gid() {
-        for dir in &created {
-            std::os::unix::fs::lchown(dir, Some(uid), Some(gid))?;
+    Ok(())
+}
+
+/// Walks `rel` below `base`, refusing a symlink or non-directory on the way. With
+/// `create`, a missing directory is made and owned by `owner`; without it a missing
+/// one ends the walk. The leaf, when it already exists empty and owned by `root_uid`,
+/// is handed to `owner`; content is never re-owned.
+fn own_chain(
+    base: &Path,
+    rel: &Path,
+    owner: Option<(u32, u32)>,
+    root_uid: u32,
+    create: bool,
+    chown: &mut dyn FnMut(&Path, u32, u32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let parts: Vec<_> = rel.components().collect();
+    let mut path = base.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        path.push(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "{} is a symlink",
+                    path.display()
+                )));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(std::io::Error::other(format!(
+                    "{} is not a directory",
+                    path.display()
+                )));
+            }
+            Ok(meta) => {
+                let leaf = i + 1 == parts.len();
+                if let Some((uid, gid)) = owner.filter(|_| leaf && meta.uid() == root_uid) {
+                    if (meta.uid(), meta.gid()) != (uid, gid)
+                        && std::fs::read_dir(&path)?.next().is_none()
+                    {
+                        chown(&path, uid, gid)?;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
+                std::fs::create_dir(&path)?;
+                if let Some((uid, gid)) = owner {
+                    chown(&path, uid, gid)?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
         }
     }
-    tracing::info!("provisioned nested home dir: {}", host.display());
     Ok(())
 }
 
@@ -852,6 +1009,7 @@ mod tests {
         .expect("a nested mount must not make the homes ambiguous");
         assert_eq!(outcome.map(|o| o.reason), Some("seeded"));
         assert!(desktop.join("marker.txt").exists());
+        provision_nested_mounts(&mounts, home_root.to_str().unwrap(), None).unwrap();
         assert!(steam_data.is_dir());
         assert!(!steam_data.join("marker.txt").exists());
 
@@ -860,6 +1018,134 @@ mod tests {
             measure_home_dirs(&mounts, home_root.to_str().unwrap()),
             Some(6),
             "the shared library is not the desktop home's usage"
+        );
+    }
+
+    /// The sharing desktop's two mounts under a fresh home root.
+    fn sharing_mounts() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, Vec<String>) {
+        let dest = tempfile::tempdir().unwrap();
+        let root = dest.path().join("homes");
+        let desktop = root.join("u/kde");
+        let steam_home = root.join("u/steam");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let mounts = vec![
+            format!("{}:/home/quasar:rw", desktop.display()),
+            format!(
+                "{}/.local/share/Steam:/home/quasar/.local/share/Steam:rw",
+                steam_home.display()
+            ),
+        ];
+        (dest, root, desktop, steam_home, mounts)
+    }
+
+    fn euid() -> u32 {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() }
+    }
+
+    /// Runs the provisioning with a recording chown; the test's own uid stands for root.
+    fn provision_recorded(
+        mounts: &[String],
+        root: &Path,
+        owner: Option<(u32, u32)>,
+    ) -> (std::io::Result<()>, Vec<(PathBuf, u32, u32)>) {
+        let mut seen = Vec::new();
+        let mut chown = |p: &Path, u: u32, g: u32| {
+            seen.push((p.to_path_buf(), u, g));
+            Ok(())
+        };
+        let result =
+            provision_nested_mounts_with(mounts, root.to_str().unwrap(), owner, euid(), &mut chown);
+        (result, seen)
+    }
+
+    #[test]
+    fn nested_mount_owner_is_the_image_user_when_puid_is_unset() {
+        if std::env::var_os("QUASAR_APP_PUID").is_some()
+            || std::env::var_os("QUASAR_APP_PGID").is_some()
+        {
+            return; // the host default is set for this process; the unset case cannot be observed
+        }
+        let mut spec = crate::session::container::ContainerSpec::default();
+        assert_eq!(
+            nested_mount_owner(&spec, 0),
+            Some((1000, 1000)),
+            "the images' PUID/PGID default"
+        );
+        assert_eq!(
+            nested_mount_owner(&spec, 1000),
+            None,
+            "a non-root agent cannot hand a dir to another user"
+        );
+        spec.env.insert("PUID".into(), "99".into());
+        spec.env.insert("PGID".into(), "100".into());
+        assert_eq!(
+            nested_mount_owner(&spec, 0),
+            Some((99, 100)),
+            "a catalog PUID/PGID wins"
+        );
+    }
+
+    #[test]
+    fn every_dir_made_for_a_nested_mount_gets_the_app_users_ids() {
+        let (_d, root, desktop, steam_home, mounts) = sharing_mounts();
+        let (result, seen) = provision_recorded(&mounts, &root, Some((1000, 1000)));
+        result.unwrap();
+        let want: Vec<(PathBuf, u32, u32)> = [&steam_home, &desktop]
+            .iter()
+            .flat_map(|home| {
+                [".local", ".local/share", ".local/share/Steam"]
+                    .map(|rel| (home.join(rel), 1000, 1000))
+            })
+            .collect();
+        assert_eq!(
+            seen, want,
+            "the Steam data dir chain, then the desktop's mount point chain"
+        );
+        assert!(
+            desktop.join(".local/share/Steam").is_dir(),
+            "the mount point exists before the runtime runs"
+        );
+    }
+
+    #[test]
+    fn an_empty_root_owned_steam_dir_is_reowned_and_content_is_not() {
+        let (_d, root, desktop, steam_home, mounts) = sharing_mounts();
+        // Left by an earlier runtime as an empty root-owned mount point.
+        std::fs::create_dir_all(desktop.join(".local/share/Steam")).unwrap();
+        // A Steam library already in use: never re-owned.
+        std::fs::create_dir_all(steam_home.join(".local/share/Steam")).unwrap();
+        std::fs::write(steam_home.join(".local/share/Steam/steam.sh"), b"x").unwrap();
+        let (result, seen) = provision_recorded(&mounts, &root, Some((1000, 1000)));
+        result.unwrap();
+        assert_eq!(seen, vec![(desktop.join(".local/share/Steam"), 1000, 1000)]);
+
+        // The same repair on a launch with no shared mount (the Steam app, or the desktop
+        // with sharing turned off).
+        let plain = vec![format!("{}:/home/quasar:rw", desktop.display())];
+        let (result, seen) = provision_recorded(&plain, &root, Some((1000, 1000)));
+        result.unwrap();
+        assert_eq!(seen, vec![(desktop.join(".local/share/Steam"), 1000, 1000)]);
+    }
+
+    #[test]
+    fn a_symlink_on_a_nested_path_is_refused_and_never_followed() {
+        let (d, root, desktop, _steam_home, mounts) = sharing_mounts();
+        let outside = d.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, desktop.join(".local")).unwrap();
+        let (result, seen) = provision_recorded(&mounts, &root, Some((1000, 1000)));
+        assert!(
+            result.is_err(),
+            "a symlink on the mount point's path must refuse"
+        );
+        assert!(
+            seen.iter().all(|(p, ..)| !p.starts_with(&outside)),
+            "chowned through a symlink: {seen:?}"
+        );
+        assert!(
+            !outside.join("share").exists(),
+            "created a directory through a symlink"
         );
     }
 

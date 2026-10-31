@@ -714,9 +714,22 @@
   -webkit-backdrop-filter: blur(8px);
 }
 /* A sharing desktop holds this tile's Steam library (#1001). The mock's disabled
-   opacity (design_handoff_v3/screens/home.html, .qp-row:disabled). */
-.lib-tile[data-dimmed="true"] .cover {
+   opacity (design_handoff_v3/screens/home.html, .qp-row:disabled). DESIGN.md row 13. */
+.lib-tile[data-dimmed="true"] .cover,
+.home-feat[data-dimmed="true"] .cover {
   opacity: 0.38;
+}
+/* The hero card's In use chip, in the tile chip's corner (.lib-tile .blocked). */
+.home-feat-poster .blocked {
+  position: absolute;
+  top: var(--s3);
+  left: var(--s3);
+  z-index: 4;
+  pointer-events: none;
+}
+.home-feat-poster .blocked .chip {
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
 }
 .lib-tile .fav-marker {
   position: absolute;
