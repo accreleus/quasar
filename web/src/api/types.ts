@@ -281,13 +281,10 @@ export type HealthState =
   | "unsustainable"
   | "failed";
 
-/** Narrows `stream` and `health_state`, which OpenAPI types more loosely.
- *  `shared_home_app_id` is amendment 53's (#1001), local until schema.d.ts is
- *  regenerated at the protocol pin. */
+/** Narrows `stream` and `health_state`, which OpenAPI types more loosely. */
 export type Session = Omit<Schemas["Session"], "health_state" | "stream"> & {
   stream: StreamParams;
   health_state?: HealthState;
-  shared_home_app_id?: string | null;
 };
 
 /** `session.stream.codec` is identical whether the rung won on merit, was forced,
@@ -306,10 +303,8 @@ export type ICEServer = Schemas["ICEServer"];
 
 export type SignalingCoords = Schemas["SignalingCoords"];
 
-/** `notice` is amendment 53's steam_library_not_shared, omitted otherwise. */
 export type LaunchResponse = Omit<Schemas["LaunchResponse"], "session"> & {
   session: Session;
-  notice?: { code: string; message: string };
 };
 
 export type SessionResponse = Omit<Schemas["SessionEnvelope"], "session"> & {
@@ -318,8 +313,7 @@ export type SessionResponse = Omit<Schemas["SessionEnvelope"], "session"> & {
 
 // ── Admin types (P2-08 through P2-11) ─────────────────────────────────────────
 
-/** `share_steam_library`: amendment 53, local until the protocol pin. */
-export type AdminApp = Schemas["AdminApp"] & { share_steam_library?: boolean };
+export type AdminApp = Schemas["AdminApp"];
 
 export type AdminAppsResponse = Schemas["AdminAppsResponse"];
 

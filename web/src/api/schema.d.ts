@@ -8409,7 +8409,7 @@ export interface components {
                 id: string;
                 name: string;
             }[];
-            /** @description Amendment 40 (#602), ADDITIVE: a machine-readable cause under code. Present only on 503 no_host_available, as home_host_unavailable, when the launch is pinned to the host that holds the caller's home for this app and that host is offline or no longer enrolled. Only an admin clears it, so a client does not spend its automatic retry on it. Names no host. Open string: a client treats an unknown value as absent. */
+            /** @description Amendment 40 (#602), ADDITIVE: a machine-readable cause under code. On 503 no_host_available, home_host_unavailable: the launch is pinned to the host that holds the caller's home for this app (Amendment 53: or it is pinned to the host of the caller's Steam home for a sharing launch) and that host is offline or no longer enrolled. Only an admin clears it, so a client does not spend its automatic retry on it. Names no host. Amendment 53 (#1001), on 409 home_in_use: steam_library_open_in_desktop (the holder mounts the Steam library as a shared home) or steam_game_running (the refused launch shares the library and a Steam session holds it); absent when the holder is already stopping. Open string: a client treats an unknown value as absent. */
             reason?: string;
         };
         ErrorEnvelope: {
@@ -8790,6 +8790,8 @@ export interface components {
              * @description UI-P3, OPTIONAL. The shared runtime preset this app inherits its container configuration from. On create, absent/null = no preset = the app carries everything itself (today's behaviour). On patch it is TRI-STATE: absent = unchanged, explicit null = clear the reference, a uuid = set it. A uuid that does not resolve is 400 validation_failed at write time, never an FK error surfacing at launch. NOT a launch profile - see RuntimePreset. Note crud.decodeJSON sets DisallowUnknownFields(), so sending this to a control plane without the UI-P3 amendment is a hard 400 - deploy the control plane before the client.
              */
             runtime_preset_id?: string | null;
+            /** @description Amendment 53 (#1001). Absent = false on create, unchanged on patch. 400 validation_failed on a derived tile or a library provider app. */
+            share_steam_library?: boolean;
             /** @description UI-P5, OPTIONAL. The LAUNCH PROFILE ids a user may pick for this app. On create, absent or [] = unrestricted = today's behaviour. On patch: absent = UNCHANGED, [] = clear the allow-list (back to unrestricted), a non-empty array = replace it wholesale (it is a set, not an ordered list). EXPLICIT null IS 400 validation_failed. The contract gives null no meaning for this field - unlike default_profile_id and runtime_preset_id, where null explicitly means "clear" - and [] already says clear. Reinterpreting null would silently act on a value the caller clearly meant something by, which is exactly the defect fixed for the runtime-preset list fields. Every id must name a USER-VISIBLE launch profile (400 otherwise). A RUNG id (a stream profile) is not a launch profile and is rejected - the two id spaces look alike and differ only in table. Duplicates are deduped rather than rejected. SETTING IT WHILE profile_policy IS 'force' IS 400: that policy pins the app's launch profile, so no allow-list can ever apply. Switching an app TO 'force' CLEARS any stored list, even when the patch says nothing about it, so nothing can silently reactivate on a later switch back to 'prefer'. Note crud.decodeJSON sets DisallowUnknownFields(), so sending this to a control plane without the UI-P5 amendment is a hard 400 - deploy the control plane before the client. */
             launchable_profile_ids?: string[];
             /**
@@ -8937,6 +8939,11 @@ export interface components {
              * @enum {string}
              */
             app_launch_state?: "starting" | "client_only" | "game_running" | "game_exited";
+            /**
+             * Format: uuid
+             * @description Amendment 53 (#1001): the Steam app whose library this session mounts, null otherwise. Always serialized. While that session is live, every launch of that app's family is 409 home_in_use. A client may mark that family in use.
+             */
+            shared_home_app_id: string | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -9010,6 +9017,13 @@ export interface components {
         LaunchResponse: {
             session: components["schemas"]["Session"];
             signaling: components["schemas"]["SignalingCoords"];
+            /** @description Amendment 53 (#1001): present only when the app shares the user's Steam library and this launch runs without it (the caller has no Steam app, the Steam home is on a host this launch cannot run on, Steam may not run on this launch's host, or the Steam home needs operator review). Omitted, never empty. */
+            notice?: {
+                /** @enum {string} */
+                code: "steam_library_not_shared";
+                /** @description Display text; never branch on it. */
+                message: string;
+            };
         };
         SignalingCoords: {
             /** @description wss://<host>/v1/signal */
@@ -10426,6 +10440,8 @@ export interface components {
             managed_home: boolean;
             /** @description P5-01: container path where the home is mounted (default /home/quasar). */
             home_container_path: string;
+            /** @description Amendment 53 (#1001): this app's sessions also mount the user's Steam data dir, on the same host, holding the Steam home's single-writer lock. Refused (400) on a derived tile and on a library provider app. See control-api.md §Storage. */
+            share_steam_library: boolean;
             /**
              * Format: uuid
              * @description UI-P3: the runtime preset this app inherits its container configuration from, or null when the app carries everything itself (the pre-UI-P3 behaviour). Always serialized. This is the app's OWN stored column - the preset is NEVER flattened into runtime_spec here; the merge happens server-side at launch, so this read shape shows the operator exactly what they configured. Admin-only, like runtime_spec: a preset is container configuration, not library presentation, so it is deliberately NOT on AppListItem.
