@@ -247,8 +247,9 @@ export function RuntimeTab({
               id="share-steam-library"
             />
             <span className="hint">
-              Steam inside this desktop uses the user's own Steam sign-in, games and saves. While it
-              is open, the user's Steam games cannot start.
+              Steam inside this desktop uses the user's own Steam library: account, games and saves.
+              While it is open, the user's Steam games cannot start. Turn this on only once every
+              host runs Quasar 0.5.2 or later.
             </span>
           </>
         )}

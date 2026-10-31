@@ -25,12 +25,12 @@ func TestMigration0105DownRefusesALiveParkedSession(t *testing.T) {
 	defer pool.Close()
 	s := seed(t, pool, 4)
 	// A raw insert: today's ScheduleAndCreate writes columns later than 0105.
-	var play Session
+	var playID string
 	must(t, pool.QueryRow(ctx, `INSERT INTO sessions (user_id, app_id, host_id, gpu_id, state, width, height,
 		fps, bitrate_kbps, h264_profile, reserved_encode_slots, assigned_at)
 		VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'assigned', 1280, 720, 60, 6000,
 		        'constrained-baseline', 1, now()) RETURNING id::text`,
-		s.userID, s.appID, s.hostID, s.gpuID).Scan(&play.ID))
+		s.userID, s.appID, s.hostID, s.gpuID).Scan(&playID))
 	parked := insertParked(t, pool, warmUser(t, pool, "parker"), s.appID, s.hostID, s.gpuID, 1, "10 minutes")
 
 	err = m.Migrate(104)
@@ -52,7 +52,7 @@ func TestMigration0105DownRefusesALiveParkedSession(t *testing.T) {
 	if n != 0 {
 		t.Error("the finished parked row survived the down migration and now reads as a play")
 	}
-	must(t, pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE id = $1::uuid`, play.ID).Scan(&n))
+	must(t, pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE id = $1::uuid`, playID).Scan(&n))
 	if n != 1 {
 		t.Error("the down migration deleted a play session")
 	}
@@ -68,7 +68,7 @@ func TestMigration0105DownRefusesALiveParkedSession(t *testing.T) {
 
 	migrateTo(t, m, 105)
 	var kind string
-	must(t, pool.QueryRow(ctx, `SELECT kind FROM sessions WHERE id = $1::uuid`, play.ID).Scan(&kind))
+	must(t, pool.QueryRow(ctx, `SELECT kind FROM sessions WHERE id = $1::uuid`, playID).Scan(&kind))
 	if kind != KindPlay {
 		t.Errorf("kind = %q after up, want the play default", kind)
 	}

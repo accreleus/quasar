@@ -330,3 +330,178 @@ func TestSharingLaunchIsRefusedByALiveSteamSessionWithoutAHold(t *testing.T) {
 		t.Fatalf("sharing launch beside a Steam game = %v, want home_in_use naming the game", err)
 	}
 }
+
+// --- round 2: swaps, placement, pre-agent failure, hold-free storage guards ----
+
+func (f *warmFixture) startedLaunch(t *testing.T, appID string) string {
+	t.Helper()
+	res := f.mustLaunch(t, appID)
+	f.disp.waitFor(t, "start")
+	f.running(t, res.Session.ID)
+	return res.Session.ID
+}
+
+func TestSwapFromASharingDesktopIntoSteamIsRefused(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	desktop := seedDesktop(t, f, true)
+	must(t, exec(t, f.pool, `UPDATE apps SET default_encode_slots=2 WHERE id=$1::uuid`, desktop))
+	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	sess := f.startedLaunch(t, desktop)
+
+	for _, target := range []string{f.steam, tile} {
+		_, err := f.coord.Swap(context.Background(), sess, target)
+		var inUse *HomeInUseError
+		if !errors.As(err, &inUse) || inUse.SessionID != sess || homeInUseReason(err) != "steam_library_open_in_desktop" {
+			t.Fatalf("swap of a sharing desktop into %s = %v, want home_in_use steam_library_open_in_desktop naming itself", target, err)
+		}
+	}
+	if got := readRow(t, f.pool, sess); got.Detail == swapDetailInProgress {
+		t.Error("a refused swap left the session marked swapping")
+	}
+}
+
+func TestSwapIntoASharingDesktopRunsWithoutTheLibrary(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	desktop := seedDesktop(t, f, true)
+	game := f.runningTile(t)
+
+	if _, err := f.coord.Swap(context.Background(), game, desktop); err != nil {
+		t.Fatalf("swap into a sharing desktop: %v", err)
+	}
+	f.disp.waitFor(t, "swap")
+	f.disp.mu.Lock()
+	cmd := f.disp.swaps[len(f.disp.swaps)-1]
+	f.disp.mu.Unlock()
+	var spec struct {
+		Mounts []string `json:"mounts"`
+	}
+	if err := json.Unmarshal(cmd.App, &spec); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range spec.Mounts {
+		if strings.Contains(m, ".local/share/Steam") {
+			t.Errorf("swap target mount %q: a swap never shares", m)
+		}
+	}
+	var shared *string
+	must(t, f.pool.QueryRow(context.Background(), `SELECT shared_home_app_id::text FROM sessions WHERE id=$1::uuid`, game).Scan(&shared))
+	if shared != nil {
+		t.Errorf("shared_home_app_id = %s after a swap, want NULL", *shared)
+	}
+}
+
+func TestSharingDesktopNeverCreatesASteamHomeWhereSteamCannotRun(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	desktop := seedDesktop(t, f, true)
+	host2, _ := addHost(t, f.pool, "host-2", 8)
+	must(t, exec(t, f.pool, `DELETE FROM managed_home_claims; DELETE FROM user_homes`))
+	must(t, exec(t, f.pool, `INSERT INTO app_placement (app_id, mode) VALUES ($1::uuid, 'fixed')
+		ON CONFLICT (app_id) DO UPDATE SET mode='fixed'`, f.steam))
+	must(t, exec(t, f.pool, `INSERT INTO app_placement_hosts (app_id, host_id) VALUES ($1::uuid, $2::uuid)`, f.steam, host2))
+	provisionHome(t, f.pool, f.userID, desktop, f.hostID)
+
+	res := f.mustLaunch(t, desktop)
+	if res.Notice != noticeSharedUnavailable || res.Session.SharedHomeAppID != nil {
+		t.Fatalf("notice=%q shared=%v, want no sharing and the notice: Steam may not run on this host", res.Notice, res.Session.SharedHomeAppID)
+	}
+	var claims, homes int
+	must(t, f.pool.QueryRow(context.Background(), `SELECT
+		(SELECT count(*) FROM managed_home_claims WHERE canonical_app_id=$1::uuid),
+		(SELECT count(*) FROM user_homes WHERE app_id=$1::uuid)`, f.steam).Scan(&claims, &homes))
+	if claims != 0 || homes != 0 {
+		t.Errorf("Steam claims=%d homes=%d, want none created on a host Steam's placement excludes", claims, homes)
+	}
+}
+
+func TestFailedSharingLaunchReleasesOnlyAnUnusedSteamClaim(t *testing.T) {
+	steamClaims := func(t *testing.T, f *warmFixture) int {
+		var n int
+		must(t, f.pool.QueryRow(context.Background(), `SELECT count(*) FROM managed_home_claims
+			WHERE canonical_app_id=$1::uuid`, f.steam).Scan(&n))
+		return n
+	}
+	for _, tc := range []struct {
+		name       string
+		steamHome  bool
+		wantClaims int
+	}{{"created by this launch", false, 0}, {"over an existing Steam home", true, 1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWarmFixture(t, 8)
+			desktop := seedDesktop(t, f, true)
+			if !tc.steamHome {
+				must(t, exec(t, f.pool, `DELETE FROM managed_home_claims; DELETE FROM user_homes`))
+			}
+			// The desktop's own home mount fails after placement committed both claims.
+			must(t, exec(t, f.pool, `UPDATE apps SET home_container_path='home' WHERE id=$1::uuid`, desktop))
+			if _, err := f.launch(t, desktop); err == nil {
+				t.Fatal("launch with a relative home path succeeded")
+			}
+			var state string
+			must(t, f.pool.QueryRow(context.Background(), `SELECT state FROM sessions WHERE app_id=$1::uuid`, desktop).Scan(&state))
+			if state != string(StateFailed) {
+				t.Fatalf("session state %s, want failed before the agent", state)
+			}
+			if n := steamClaims(t, f); n != tc.wantClaims {
+				t.Errorf("Steam claims = %d, want %d", n, tc.wantClaims)
+			}
+		})
+	}
+}
+
+// insertSharingSession writes a live sharing desktop session with no hold, as a
+// dispatch that was not cleanup-capable leaves it.
+func (f *warmFixture) insertSharingSession(t *testing.T, desktop string) string {
+	t.Helper()
+	var id string
+	must(t, f.pool.QueryRow(context.Background(), `INSERT INTO sessions (user_id, app_id, host_id, gpu_id, state,
+		width, height, fps, bitrate_kbps, h264_profile, reserved_encode_slots, assigned_at, started_at, shared_home_app_id)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'running', 1280, 720, 60, 6000, 'constrained-baseline',
+		        1, now(), now(), $5::uuid) RETURNING id::text`,
+		f.userID, desktop, f.hostID, f.gpuID, f.steam).Scan(&id))
+	return id
+}
+
+func (f *warmFixture) steamHomeID(t *testing.T) string {
+	t.Helper()
+	var id string
+	must(t, f.pool.QueryRow(context.Background(), `SELECT id::text FROM user_homes WHERE app_id=$1::uuid`, f.steam).Scan(&id))
+	return id
+}
+
+func TestTombstoneRefusesASharedHomeWithoutAHold(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	f.insertSharingSession(t, seedDesktop(t, f, true))
+	_, err := storage.NewLocal(f.pool, testHomeRoot).TombstoneHome(context.Background(), f.steamHomeID(t))
+	if !errors.Is(err, storage.ErrHomeInUse) {
+		t.Fatalf("tombstone of a shared Steam home = %v, want home in use", err)
+	}
+}
+
+func TestClaimReleaseRefusesASharedHomeWithoutAHold(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	must(t, exec(t, f.pool, `INSERT INTO managed_home_claims (user_id, canonical_app_id, host_id, state, conflict_reason)
+		VALUES ($1::uuid, $2::uuid, NULL, 'conflict', 'claim_owner_missing')`, f.userID, f.steam))
+	f.insertSharingSession(t, seedDesktop(t, f, true))
+	_, err := storage.NewLocal(f.pool, testHomeRoot).ReleaseHomeClaim(context.Background(), storage.ReleaseHomeClaimReq{
+		UserID: f.userID, AppID: f.steam, ExpectedState: "conflict", ExpectedConflictReason: "claim_owner_missing"})
+	if !errors.Is(err, storage.ErrClaimInUse) {
+		t.Fatalf("release of a shared Steam claim = %v, want claim in use", err)
+	}
+}
+
+func TestGCConfirmKeepsTheClaimOfASharedHome(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	home := f.steamHomeID(t)
+	must(t, exec(t, f.pool, `UPDATE user_homes SET gc_after = now() - interval '2 days' WHERE id=$1::uuid`, home))
+	must(t, exec(t, f.pool, `INSERT INTO managed_home_claims (user_id, canonical_app_id, host_id, state, conflict_reason)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, 'conflict', 'gc_pending')`, f.userID, f.steam, f.hostID))
+	f.insertSharingSession(t, seedDesktop(t, f, true))
+	if _, err := storage.NewLocal(f.pool, testHomeRoot).GCConfirm(context.Background(), f.hostID, []string{home}); err != nil {
+		t.Fatalf("gc confirm: %v", err)
+	}
+	var n int
+	must(t, f.pool.QueryRow(context.Background(), `SELECT count(*) FROM managed_home_claims WHERE canonical_app_id=$1::uuid`, f.steam).Scan(&n))
+	if n != 1 {
+		t.Errorf("Steam claims = %d after GC confirm, want the claim kept while a session shares the home", n)
+	}
+}

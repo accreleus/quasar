@@ -1161,7 +1161,9 @@ func (s *Store) NonTerminalSessionIDsOnHost(ctx context.Context, hostID string) 
 //
 //  3. A session also holds the home it mounts as a shared home
 //     (sessions.shared_home_app_id): no two sessions ever mount one Steam data
-//     dir at once, whichever of them owns it.
+//     dir at once, whichever of them owns it. The swap exclusion never covers
+//     that hold: a sharing session swapping into the Steam family is refused,
+//     since nothing proves its old container has let go of the mount.
 //
 // It returns the conflicting SESSION ID, not a count (§2.1's 409 body carries
 // it), with its kind and whether it is stopping (homeInUse). $3 (excludeID) is
@@ -1174,7 +1176,7 @@ const liveHomeSessionSQL = `
 	JOIN apps a ON a.id = s.app_id
 	WHERE s.user_id = $1::uuid
 	  AND (COALESCE(a.parent_app_id, a.id) = $2::uuid OR s.shared_home_app_id = $2::uuid)
-	  AND ($3 = '' OR s.id != $3::uuid)
+	  AND ($3 = '' OR s.id != $3::uuid OR s.shared_home_app_id = $2::uuid)
 	  AND s.state IN ('pending','assigned','starting','running','stopping')
 	LIMIT 1`
 
