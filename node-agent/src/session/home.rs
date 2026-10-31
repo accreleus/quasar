@@ -465,13 +465,18 @@ fn provision_nested_mounts_with(
         // The control plane always mounts `<home>/<rel>` (`sharedSteamMount`); any other
         // source is not a shared mount the agent can own correctly, so it refuses.
         let result = match source_home {
-            // The source's home is made, unowned like any home the agent makes, by the
-            // same walk from the home root; then its `rel` chain is owned.
-            Some(source_home) => source_home
-                .strip_prefix(&root)
-                .map_err(std::io::Error::other)
-                .and_then(|above| chain(&root, above, None, true))
-                .and_then(|()| chain(&source_home, rel, owner, true)),
+            // The same walk from the home root: the per-user folder above the source's
+            // home stays the agent's, as above every home; the home itself and its
+            // `rel` chain are the app user's.
+            Some(source_home) => match (source_home.parent(), source_home.file_name()) {
+                (Some(parent), Some(name)) => parent
+                    .strip_prefix(&root)
+                    .map_err(std::io::Error::other)
+                    .and_then(|above| chain(&root, above, None, true))
+                    .and_then(|()| chain(parent, Path::new(name), owner, true))
+                    .and_then(|()| chain(&source_home, rel, owner, true)),
+                _ => Err(std::io::Error::other("nested mount source has no home")),
+            },
             None => Err(std::io::Error::other(format!(
                 "{} is not <home>/{}",
                 m.host.display(),
@@ -1347,16 +1352,18 @@ mod tests {
         let (_d, root, desktop, steam_home, mounts) = sharing_mounts();
         let (result, seen) = provision_recorded(&mounts, &root, Some((1000, 1000)));
         result.unwrap();
-        let want: Vec<(PathBuf, u32, u32)> = [&steam_home, &desktop]
-            .iter()
-            .flat_map(|home| {
-                [".local", ".local/share", ".local/share/Steam"]
-                    .map(|rel| (home.join(rel), 1000, 1000))
-            })
-            .collect();
+        let mut want: Vec<(PathBuf, u32, u32)> = vec![(steam_home.clone(), 1000, 1000)];
+        want.extend([&steam_home, &desktop].iter().flat_map(|home| {
+            [".local", ".local/share", ".local/share/Steam"].map(|rel| (home.join(rel), 1000, 1000))
+        }));
         assert_eq!(
             seen, want,
-            "the Steam data dir chain, then the desktop's mount point chain"
+            "the new Steam home itself, its data dir chain, then the desktop's mount point chain"
+        );
+        assert_eq!(
+            seen[0],
+            (steam_home.clone(), 1000, 1000),
+            "a new Steam home's own folder is the app user's"
         );
         assert!(
             desktop.join(".local/share/Steam").is_dir(),
