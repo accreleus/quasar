@@ -254,8 +254,8 @@ fn provision_nested_dir(root: &Path, host: &Path) -> std::io::Result<()> {
         .collect();
     if let Err(e) = std::fs::create_dir_all(host) {
         tracing::warn!(
-            token = "home-provision-failed",
-            "provision home dir {}: {e:#}",
+            token = "home-provision-nested-failed",
+            "provision nested home dir {}: {e:#}",
             host.display()
         );
         return Err(e);
