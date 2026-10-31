@@ -235,6 +235,7 @@ beforeEach(() => {
   engageSpy.mockReset();
   engageSpy.mockImplementation(() => Promise.resolve({ mode: "pointer-lock" }));
   localStorage.clear();
+  sessionStorage.clear();
   fsEl = null;
   Object.defineProperty(document, "fullscreenElement", { configurable: true, get: () => fsEl });
   document.documentElement.requestFullscreen = requestFullscreen;
@@ -436,5 +437,32 @@ describe("SessionPage — Match cursor compositor size (#898)", () => {
     });
     await advance(500);
     expect(compositor()).toEqual(["1280", "720"]);
+  });
+
+  it("a reload keeps the acked render size, so the attribute is not the launch size (#972)", async () => {
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    await reveal();
+    expect(compositor()).toEqual(["1280", "720"]);
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 1280, h: 720 });
+  });
+
+  it("a render size the host rejected is not carried over a reload", async () => {
+    updateSessionDisplay.mockRejectedValue(new Error("rejected"));
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+
+    cleanup();
+    await reveal();
+    expect(compositor()).toEqual(["2560", "1440"]);
   });
 });

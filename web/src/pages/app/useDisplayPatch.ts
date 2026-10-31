@@ -8,6 +8,10 @@
 // doesn't carry them back — so this hook keeps the last server-ACKED value
 // and treats its own state as optimistic until then.
 //
+// The render size is on no read the player has (the session row never carries it;
+// session_metrics is admin-only), so the last-acked value is kept per session in
+// sessionStorage and a reload starts from it instead of from "match the stream".
+//
 // `externalSize`/`externalResizeSupported` are owned by useSessionStatus (its
 // 5s poll also updates them); this hook is handed their raw setters and calls
 // them directly on ack/revert.
@@ -15,6 +19,28 @@ import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateA
 import { updateSessionDisplay } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ToastItem } from "../../components/Toast";
+
+type Size = { w: number; h: number };
+
+const renderKey = (sessionId: string) => `quasar.session.${sessionId}.render`;
+
+function loadAckedRender(sessionId: string | undefined): Size | null {
+  if (!sessionId) return null;
+  try {
+    const v = JSON.parse(sessionStorage.getItem(renderKey(sessionId)) ?? "null");
+    return Number.isInteger(v?.w) && Number.isInteger(v?.h) && v.w > 0 && v.h > 0 ? { w: v.w, h: v.h } : null;
+  } catch {
+    return null; // storage blocked or a corrupt value: behave as if nothing was acked
+  }
+}
+
+function saveAckedRender(sessionId: string, size: Size) {
+  try {
+    sessionStorage.setItem(renderKey(sessionId), JSON.stringify(size));
+  } catch {
+    // best-effort: without it a reload falls back to the launch size, as before
+  }
+}
 
 /** Settle time before a display change (render resolution / interface size)
  *  is sent. Shared timer/body across controls — two independent debounces on
@@ -48,7 +74,9 @@ export function useDisplayPatch(params: UseDisplayPatchParams): UseDisplayPatchR
 
   // null means "match the stream": staying null rather than eagerly copying
   // the stream size means a revert lands on default without knowing it.
-  const [renderSize, setRenderSize] = useState<{ w: number; h: number } | null>(null);
+  // The initial value is what a reload of this page last had acked (see module header).
+  const [initialRender] = useState(() => loadAckedRender(sessionId));
+  const [renderSize, setRenderSize] = useState<{ w: number; h: number } | null>(initialRender);
   const [uiScale, setUiScale] = useState(1);
   const [displayBusy, setDisplayBusy] = useState(false);
   // Distinct from displayBusy (true for any display PATCH, including render-res).
@@ -61,7 +89,7 @@ export function useDisplayPatch(params: UseDisplayPatchParams): UseDisplayPatchR
     /** Last-acked EXTERNAL (encoded) size; null = the launch size. */
     external: { w: number; h: number } | null;
   }>({
-    render: null,
+    render: initialRender,
     uiScale: 1,
     external: null,
   });
@@ -114,6 +142,7 @@ export function useDisplayPatch(params: UseDisplayPatchParams): UseDisplayPatchR
       // the other field's acked value alone.
       if (body.render_width != null && body.render_height != null) {
         ackedDisplayRef.current.render = { w: body.render_width, h: body.render_height };
+        saveAckedRender(sessionId, ackedDisplayRef.current.render);
       }
       if (body.ui_scale != null) ackedDisplayRef.current.uiScale = body.ui_scale;
       if (body.stream_width != null && body.stream_height != null) {
