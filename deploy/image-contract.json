@@ -152,10 +152,10 @@
 
       "agent_binary": {
         "path": "/usr/local/bin/quasar-node-agent",
-        "no_dt_needed": ["libcuda", "libgstcuda", "libnvidia"],
+        "no_dt_needed": ["libcuda", "libnvidia"],
         "no_unresolved_libs": true,
         "must_start": true,
-        "_notes": "A --features cuda binary has DT_NEEDED libgstcuda-1.0.so.0 (shipped in /opt/gst, so it resolves) and no libcuda: libgstcuda itself dlopens the driver. So it links and starts cleanly on a driver-less host, which is what lets ONE binary serve both vendors. Checked 2026-10-30 (#927): the runtime image has no readelf, so no_dt_needed passes without testing anything; the binary-has-the-feature check is in commands.must_succeed. must_start accepts the config-validation exit ('CONTROL_PLANE_URL is required') as success: reaching config validation proves process start and dynamic linking both succeeded."
+        "_notes": "A --features cuda binary has DT_NEEDED libgstcuda-1.0.so.0 (shipped in /opt/gst, so it resolves) and no libcuda: libgstcuda itself dlopens the driver. So it links and starts cleanly on a driver-less host, which is what lets ONE binary serve both vendors. no_dt_needed runs ldd, because the runtime image has no readelf and a missing tool read as a pass (#975); libgstcuda is deliberately not forbidden, it is the correct link of a --features cuda build. The binary-has-the-feature check is in commands.must_succeed. must_start accepts the config-validation exit ('CONTROL_PLANE_URL is required') as success: reaching config validation proves process start and dynamic linking both succeeded."
       },
 
       "commands": {
