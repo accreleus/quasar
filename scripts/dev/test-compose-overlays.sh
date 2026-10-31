@@ -101,19 +101,24 @@ for chain in $ALL_CHAINS; do
   esac
 done
 
-# ── 4. Console capabilities are scoped to the console overlay ────────────────
-# A stream-only deployment must not carry DRM master or the host's audio devices.
+# ── 4. The console overlay adds no capability and no DRM rule ────────────────
+# ADR 0009: the console session's own container holds the display, so the agent needs
+# neither DRM master (SYS_ADMIN) nor a DRM cgroup rule (226); its DRM read access comes
+# from the base file's /dev/dri. What the overlay does add is the i2c rule (major 89)
+# for monitor power, and the base evdev rule (13) must survive it. This used to assert
+# the opposite, from before the session moved into its own container (#967).
 caps=$(agent_field "','.join(svc.get('cap_add', []))" -- "${BASE[@]}")
-case ",$caps," in *,SYS_ADMIN,*) fail "base grants SYS_ADMIN without the console overlay" ;; esac
+case ",$caps," in *,SYS_ADMIN,*) fail "base grants SYS_ADMIN" ;; esac
 
 caps=$(agent_field "','.join(svc.get('cap_add', []))" -- "${CONSOLE[@]}")
-case ",$caps," in *,SYS_ADMIN,*) ;; *) fail "console overlay does not grant SYS_ADMIN (got: $caps)" ;; esac
+case ",$caps," in *,SYS_ADMIN,*) fail "console overlay grants SYS_ADMIN — the session container holds the display, not the agent (got: $caps)" ;; esac
 
 rules=$(agent_field "';'.join(svc.get('device_cgroup_rules', []))" -- "${BASE[@]}")
-case "$rules" in *"226:"*) fail "base carries the DRM cgroup rule without the console overlay" ;; esac
+case "$rules" in *"226:"*) fail "base carries a DRM cgroup rule" ;; esac
 
 rules=$(agent_field "';'.join(svc.get('device_cgroup_rules', []))" -- "${NVIDIA_CONSOLE[@]}")
-case "$rules" in *"226:"*) ;; *) fail "console overlay is missing the DRM cgroup rule (got: $rules)" ;; esac
+case "$rules" in *"226:"*) fail "console overlay carries a DRM cgroup rule — the agent reads DRM through /dev/dri (got: $rules)" ;; esac
+case "$rules" in *"89:"*) ;; *) fail "console overlay is missing the i2c cgroup rule (got: $rules)" ;; esac
 case "$rules" in *"13:"*) ;; *) fail "console overlay dropped the base evdev cgroup rule (got: $rules)" ;; esac
 
 # ── 5. Docker's default seccomp profile is retained everywhere ───────────────
