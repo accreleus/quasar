@@ -727,9 +727,9 @@ FROM ${TOOLCHAIN_IMAGE} AS build
 # lets compose exec the baked binary instead of a build artifact that is not part of the
 # image identity.
 #
-# The feature is safe in the vendor-neutral image: the CUDA symbols are dlopened, not
-# linked (`readelf -d` shows no libcuda/libgstcuda DT_NEEDED), so the same binary starts
-# and runs on an AMD/Intel host.
+# The feature is safe in the vendor-neutral image: the binary links libgstcuda-1.0.so.0
+# (DT_NEEDED, shipped in /opt/gst), and libgstcuda needs no libcuda, so the same binary
+# starts and runs on an AMD/Intel or driver-less host (#927).
 COPY node-agent /src/node-agent
 
 # Build identity (#107): node-agent/build.rs bakes SOURCE_COMMIT and QUASAR_VERSION
@@ -743,6 +743,9 @@ COPY node-agent /src/node-agent
 # runtime stage, beside the org.quasar.built.at label.
 ARG SOURCE_COMMIT=unknown
 ARG QUASAR_VERSION=
+# Re-declared per stage: a global ARG is empty here without it, and the test below
+# then silently drops --features cuda (image-contract.json asserts the symbol).
+ARG CUDA_ENABLE
 RUN cd /src/node-agent \
     && QUASAR_SOURCE_COMMIT="${SOURCE_COMMIT}" \
        QUASAR_VERSION="${QUASAR_VERSION}" cargo build --release \
