@@ -256,6 +256,7 @@ beforeEach(() => {
   // survives into the next test unless it is cleared here. The PATCH-count
   // assertions below are per-test counts and read as cumulative without this.
   vi.clearAllMocks();
+  sessionStorage.clear();
   lastOnChannel = null;
   lastOnRecovery = null;
   lastDrawerProps = null;

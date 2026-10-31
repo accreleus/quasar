@@ -235,6 +235,7 @@ beforeEach(() => {
   engageSpy.mockReset();
   engageSpy.mockImplementation(() => Promise.resolve({ mode: "pointer-lock" }));
   localStorage.clear();
+  sessionStorage.clear();
   fsEl = null;
   Object.defineProperty(document, "fullscreenElement", { configurable: true, get: () => fsEl });
   document.documentElement.requestFullscreen = requestFullscreen;
@@ -436,5 +437,63 @@ describe("SessionPage — Match cursor compositor size (#898)", () => {
     });
     await advance(500);
     expect(compositor()).toEqual(["1280", "720"]);
+  });
+
+  it("a reload keeps the acked render size, so the attribute is not the launch size (#972)", async () => {
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    await reveal();
+    expect(compositor()).toEqual(["1280", "720"]);
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 1280, h: 720 });
+    // Seeding is display-only: the remount sends nothing.
+    await advance(1_000);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(1);
+  });
+
+  it("after a reload, an interface-size change keeps the stored render size", async () => {
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+    cleanup();
+    await reveal();
+
+    await act(async () => {
+      (lastDrawerProps?.onUiScaleChange as (v: number) => void)(1.5);
+    });
+    await advance(500);
+    expect(updateSessionDisplay).toHaveBeenCalledTimes(2);
+    expect(compositor()).toEqual(["1280", "720"]);
+  });
+
+  it.each([
+    ["odd", { w: 1281, h: 721 }],
+    ["below 16", { w: 8, h: 8 }],
+    ["not a number", { w: "1280", h: "720" }],
+  ])("a stored render size that is %s is ignored", async (_name, stored) => {
+    sessionStorage.setItem("quasar.session.s1.render", JSON.stringify(stored));
+    await reveal();
+    expect(compositor()).toEqual(["2560", "1440"]);
+    expect(lastDrawerProps?.renderSize).toBeNull();
+  });
+
+  it("a render size the host rejected is not carried over a reload", async () => {
+    updateSessionDisplay.mockRejectedValue(new Error("rejected"));
+    await reveal();
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 1280, h: 720 });
+    });
+    await advance(500);
+
+    cleanup();
+    await reveal();
+    expect(compositor()).toEqual(["2560", "1440"]);
   });
 });
