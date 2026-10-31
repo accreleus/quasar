@@ -55,6 +55,7 @@ own; the two do not move together, and that is deliberate.
 - CI follows the runner image's 2026-10-30 update (#982): the engine suite no longer records Podman's `restart` row as a known failure (the runner's Podman is now 5.7, which passes it, so the jobs failed on the pass), and the real-uinput test step hands cargo its homes explicitly, because the runner's sudo no longer honours `-E`.
 - **Image cleanup test: the second attempt's journal checks no longer race the control plane (#960).** The test now answers every inventory scan as the agent does (a late inventory change that overlaps the attempt's own reconcile costs one more scan before the journal), and treats only a journal request naming the second attempt as stale (the first dispatch's own request for the first attempt can land late). It failed on most CI runs under load. No product change.
 - **Region and Input: the agent's recorded values after an app swap are tested to be exactly the nine keys (#891).** No product change.
+- **The image contract's `agent_binary.no_dt_needed` assertion now actually runs (#975).** It called `readelf`, which the agent image does not have, and a missing tool read as a pass; it lists the agent's libraries with `ldd` and fails when `ldd` cannot run. `libgstcuda` is no longer on the forbidden list, because a correct `--features cuda` build links it. No product change.
 
 ## 0.5.1 — 2026-10-30
 
