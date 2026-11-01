@@ -79,6 +79,10 @@ export function RuntimeTab({
 
   const preset = presets.find((p) => p.id === draft.runtimePresetId) ?? null;
   const presetEnvKeys = Object.keys(preset?.env ?? {});
+  // The launch ORs the preset's managed home in (control-api.md, runtime presets), so the
+  // stored false of a preset-linked app is not what runs.
+  const presetHome = !!preset?.managed_home;
+  const managedHome = draft.managedHome || presetHome;
   const overridden = draft.env.filter(([k]) => presetEnvKeys.includes(k.trim())).length;
 
   const setArgs = (args: string[]) => onChange({ ...draft, args });
@@ -219,16 +223,18 @@ export function RuntimeTab({
         desc="A persistent home directory per user, plus anything extra this app needs mounted."
       >
         <Switch
-          checked={draft.managedHome}
+          checked={managedHome}
           onChange={(managedHome) => onChange({ ...draft, managedHome })}
+          disabled={presetHome}
           label="Managed home"
           id="managed-home"
         />
         <span className="hint">
           Provisions a per-user home mounted into the container. Data lives outside the container,
           under the storage root of whichever host runs the session.
+          {presetHome && " The runtime preset provides it, so it stays on."}
         </span>
-        {draft.managedHome && (
+        {managedHome && (
           <TextField
             label="Mount path inside container"
             mono
@@ -238,7 +244,7 @@ export function RuntimeTab({
             hint="Where the home appears inside the container, not where the data is stored."
           />
         )}
-        {draft.managedHome && (draft.kind === "desktop" || draft.shareSteamLibrary) && (
+        {managedHome && (draft.kind === "desktop" || draft.shareSteamLibrary) && (
           <>
             <Switch
               checked={draft.shareSteamLibrary}
