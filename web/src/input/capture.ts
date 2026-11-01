@@ -264,6 +264,8 @@ export function setupCapture({
       boxW: videoEl.clientWidth,
       boxH: videoEl.clientHeight,
       fit: videoEl.dataset?.scalingMode,
+      compW: Number(videoEl.dataset?.compositorW),
+      compH: Number(videoEl.dataset?.compositorH),
     });
     scaler.setGain(gx, gy);
   };
@@ -276,9 +278,10 @@ export function setupCapture({
     videoEl.addEventListener("loadedmetadata", updateGain);
   }
   // The HUD's scaling mode is CSS only (object-fit): the box keeps its size, so nothing above fires.
+  // The compositor size (data-compositor-w/h, from the session page) is not a video property either.
   const modeObserver =
     videoEl instanceof Node && typeof MutationObserver === "function" ? new MutationObserver(updateGain) : null;
-  modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode"] });
+  modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode", "data-compositor-w", "data-compositor-h"] });
 
   // Gamepad state for delta-only sends.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};

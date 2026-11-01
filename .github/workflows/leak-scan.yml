@@ -41,7 +41,7 @@ permissions:
 jobs:
   scan:
     name: operator fingerprints
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       # fetch-depth 0: the scan reads tracked content through `git grep`, which
       # needs a real repository rather than an export.

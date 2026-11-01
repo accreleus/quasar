@@ -147,6 +147,7 @@ const CONTROL_ONLY: &[&str] = &[
     var::PUBLIC_HOST,
     var::TLS_HOSTS,
     var::TRUSTED_PROXIES,
+    var::HSTS_MAX_AGE,
     var::HTTP_PORT,
     var::TLS_PORT,
     ENROLL_SEED_IMAGE,
@@ -258,6 +259,7 @@ fn apply_fields(
                     var::PUBLIC_HOST => control.public_host = opt(value),
                     var::TLS_HOSTS => control.tls_hosts = opt(value),
                     var::TRUSTED_PROXIES => control.trusted_proxies = opt(value),
+                    var::HSTS_MAX_AGE => control.hsts_max_age = opt(value),
                     var::HTTP_PORT | var::TLS_PORT => {
                         let port = value
                             .trim()
@@ -448,6 +450,25 @@ impl Actor {
         }
         let (after, changed) = apply(&machine.inputs, machine.role, &req.changes)
             .map_err(|why| refuse(Reason::Invalid, format!("{why}; nothing was changed")))?;
+        if req
+            .changes
+            .get(var::HSTS_MAX_AGE)
+            .is_some_and(|v| opt(v).is_some())
+        {
+            let recorded = self.dir.load_service(Role::ControlPlane).map_err(|e| {
+                refuse(Reason::Invalid, format!("machine state is unreadable: {e}"))
+            })?;
+            if let Some(r) = recorded.filter(|r| r.recipe_revision < recipe::control::HSTS_REVISION)
+            {
+                return Err(refuse(
+                    Reason::Invalid,
+                    format!(
+                        "{}; nothing was changed",
+                        recipe::control::hsts_needs_newer_image(r.recipe_revision)
+                    ),
+                ));
+            }
+        }
         let replaced = self
             .moved_by(&machine.inputs, &after)
             .map_err(|why| refuse(Reason::Invalid, format!("{why}; nothing was changed")))?;

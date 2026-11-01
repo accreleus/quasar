@@ -77,6 +77,7 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	mux.Handle("POST /v1/admin/hosts/{id}/idle-apply", admin(http.HandlerFunc(h.handleIdleApply)))
 	mux.Handle("GET /v1/admin/hosts/{id}/idle-apply/{attempt_id}", admin(http.HandlerFunc(h.handleGetIdleApply)))
 	mux.Handle("POST /v1/admin/hosts/{id}/idle-apply/{attempt_id}/cancel", admin(http.HandlerFunc(h.handleCancelIdleApply)))
+	mux.Handle("POST /v1/admin/hosts/{id}/idle-apply/{attempt_id}/release-recovery", admin(http.HandlerFunc(h.handleReleaseRecoveryHold)))
 	mux.Handle("POST /v1/admin/hosts/{id}/policy/retry", admin(http.HandlerFunc(h.handleRetryPolicy)))
 }
 

@@ -310,6 +310,10 @@ harness_note "control_port" "$CONTROL_PORT"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/${RID}-work.XXXXXX")"
 API="http://127.0.0.1:${CONTROL_PORT}"
+# Sign-in and registration are refused over plain HTTP (#604): they go to the
+# TLS port (self-signed, hence -k). Every other call stays on the HTTP port.
+TLS_PORT=$((CONTROL_PORT + 1000))
+SIGNIN_API="https://127.0.0.1:${TLS_PORT}"
 # Minted after login (the static enrollment token is retired): one token, up to
 # 100 uses, shared by the real agent and every scripted host.
 ENROLLMENT_TOKEN=""
@@ -361,16 +365,17 @@ RUNTIME_DIR_READABLE=1
 #    assertions — same shape as run-admission.sh's http_json). ──────────────
 http_raw() { # $1 METHOD $2 /v1-relative-path $3 bearer-or-empty [$4 JSON body]
   local method="$1" path="$2" tok="$3" body="${4:-}"
-  local hdrfile
+  local hdrfile base="$API"
+  case "$path" in auth/*) base="$SIGNIN_API" ;; esac
   hdrfile="$(mktemp "$WORKDIR/hdr.XXXXXX")"
   local out status
   if [ -n "$body" ]; then
-    out=$(curl -sS --connect-timeout 5 --max-time 20 -D "$hdrfile" \
-      -w '\n__STATUS__%{http_code}' -X "$method" "$API/v1/$path" \
+    out=$(curl -ksS --connect-timeout 5 --max-time 20 -D "$hdrfile" \
+      -w '\n__STATUS__%{http_code}' -X "$method" "$base/v1/$path" \
       ${tok:+-H "Authorization: Bearer $tok"} -H 'Content-Type: application/json' -d "$body")
   else
-    out=$(curl -sS --connect-timeout 5 --max-time 20 -D "$hdrfile" \
-      -w '\n__STATUS__%{http_code}' -X "$method" "$API/v1/$path" \
+    out=$(curl -ksS --connect-timeout 5 --max-time 20 -D "$hdrfile" \
+      -w '\n__STATUS__%{http_code}' -X "$method" "$base/v1/$path" \
       ${tok:+-H "Authorization: Bearer $tok"})
   fi
   status="${out##*__STATUS__}"
@@ -954,7 +959,8 @@ fi
 ENV_FILE="$WORKDIR/env"
 cat >"$ENV_FILE" <<ENV
 CONTROL_PORT=$CONTROL_PORT
-QUASAR_TLS=off
+QUASAR_TLS_PORT=$TLS_PORT
+QUASAR_HTTP_REDIRECT=off
 QUASAR_CONTROL_IMAGE=$CONTROL_IMAGE
 QUASAR_AGENT_IMAGE=$AGENT_IMAGE
 POSTGRES_PASSWORD=${RID}-pg

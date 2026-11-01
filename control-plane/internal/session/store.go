@@ -81,6 +81,10 @@ type HomeInUseError struct {
 	// Stopping: the session is already tearing down, so the caller only has to
 	// retry in a moment (#434). It changes the message, never the code.
 	Stopping bool
+	// holderShares: the holder mounts this home as a shared home (a desktop
+	// holding the Steam library). forShared: the refused launch wanted this home
+	// as its shared home. Both change the message, never the code.
+	holderShares, forShared bool
 }
 
 func (e *HomeInUseError) Error() string {
@@ -202,6 +206,9 @@ type LaunchApp struct {
 	// SteamFamily: the effective runtime app is the Steam library provider, so
 	// this is the Steam parent app or one of its tiles (amendment 39).
 	SteamFamily bool
+	// ShareSteamLibrary is the app's own switch (migration 0110), never a
+	// parent's: a tile cannot carry it.
+	ShareSteamLibrary bool
 }
 
 // Session is the domain view of a sessions row (the fields the lifecycle and the
@@ -283,6 +290,12 @@ type Session struct {
 	AssignedAt      *time.Time
 	StartedAt       *time.Time
 	EndedAt         *time.Time
+	// SharedHomeAppID is the Steam parent whose home this session also mounts
+	// (migration 0110), nil otherwise.
+	SharedHomeAppID *string
+	// notice is the launch's steam_library_not_shared message, "" for none.
+	// Not persisted.
+	notice string
 }
 
 // IsEntitled is a hand-copy of entitledSQL (internal/crud/store.go, the
@@ -396,7 +409,8 @@ func (s *Store) GetLaunchApp(ctx context.Context, appID string) (LaunchApp, erro
 		       apps.default_profile_id, apps.profile_policy,
 		       rp.id::text, rp.image, rp.args, rp.env, rp.mounts, rp.managed_home, rp.home_container_path,
 		       rp.network,
-		       COALESCE(parent.library_provider, apps.library_provider) = 'steam'
+		       COALESCE(parent.library_provider, apps.library_provider) = 'steam',
+		       apps.share_steam_library
 		FROM apps
 		-- The effective runtime app. Self-join, LEFT so an ordinary app is unchanged.
 		LEFT JOIN apps parent ON parent.id = apps.parent_app_id
@@ -412,7 +426,7 @@ func (s *Store) GetLaunchApp(ctx context.Context, appID string) (LaunchApp, erro
 		&a.DefaultWidth, &a.DefaultHeight, &a.DefaultFPS, &a.DefaultBitrateKbps,
 		&a.ManagedHome, &a.HomeContainerPath, &a.DefaultProfileID, &a.ProfilePolicy,
 		&presetID, &presetImage, &presetArgs, &presetEnv, &presetMounts, &presetHome, &presetPath,
-		&presetNetwork, &a.SteamFamily)
+		&presetNetwork, &a.SteamFamily, &a.ShareSteamLibrary)
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.logIfDiscoverySuspended(ctx, appID)
 		return LaunchApp{}, ErrNotFound
@@ -1141,8 +1155,15 @@ func (s *Store) NonTerminalSessionIDsOnHost(ctx context.Context, hostID string) 
 //     s.app_id, or a tile and its parent are different ids, the guard never fires
 //     between them, and two Steam clients run on one steamapps tree (a mid-write
 //     death marks the install unclean and forces a full checksum re-verify).
+//
 //  2. Compares the FAMILY: both sides are homeAppIDs, so tile-vs-sibling collides
 //     as tile-vs-parent does. `s.app_id = $2` would catch only the parent.
+//
+//  3. A session also holds the home it mounts as a shared home
+//     (sessions.shared_home_app_id): no two sessions ever mount one Steam data
+//     dir at once, whichever of them owns it. The swap exclusion never covers
+//     that hold: a sharing session swapping into the Steam family is refused,
+//     since nothing proves its old container has let go of the mount.
 //
 // It returns the conflicting SESSION ID, not a count (§2.1's 409 body carries
 // it), with its kind and whether it is stopping (homeInUse). $3 (excludeID) is
@@ -1150,12 +1171,12 @@ func (s *Store) NonTerminalSessionIDsOnHost(ctx context.Context, hostID string) 
 // comparison: an unconditional `::uuid` cast would error on the empty string
 // instead of being the always-true no-op that path needs.
 const liveHomeSessionSQL = `
-	SELECT s.id::text, s.kind, s.state = 'stopping'
+	SELECT s.id::text, s.kind, s.state = 'stopping', COALESCE(a.parent_app_id, a.id) <> $2::uuid
 	FROM sessions s
 	JOIN apps a ON a.id = s.app_id
 	WHERE s.user_id = $1::uuid
-	  AND COALESCE(a.parent_app_id, a.id) = $2::uuid
-	  AND ($3 = '' OR s.id != $3::uuid)
+	  AND (COALESCE(a.parent_app_id, a.id) = $2::uuid OR s.shared_home_app_id = $2::uuid)
+	  AND ($3 = '' OR s.id != $3::uuid OR s.shared_home_app_id = $2::uuid)
 	  AND s.state IN ('pending','assigned','starting','running','stopping')
 	LIMIT 1`
 
@@ -1195,8 +1216,8 @@ func (s *Store) HasLiveUserAppSession(ctx context.Context, userID, homeAppID, ex
 // parked holder is never named (control-api.md §Warm Steam, "Claim").
 func homeInUse(ctx context.Context, q rowQuerier, userID, homeAppID, excludeID string) (*HomeInUseError, error) {
 	var id, kind string
-	var stopping bool
-	err := q.QueryRow(ctx, liveHomeSessionSQL, userID, homeAppID, excludeID).Scan(&id, &kind, &stopping)
+	var stopping, shares bool
+	err := q.QueryRow(ctx, liveHomeSessionSQL, userID, homeAppID, excludeID).Scan(&id, &kind, &stopping, &shares)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -1206,7 +1227,7 @@ func homeInUse(ctx context.Context, q rowQuerier, userID, homeAppID, excludeID s
 	if kind == KindParked {
 		return &HomeInUseError{Stopping: stopping, parkedID: id}, nil
 	}
-	return &HomeInUseError{SessionID: id, Stopping: stopping}, nil
+	return &HomeInUseError{SessionID: id, Stopping: stopping, holderShares: shares}, nil
 }
 
 // rowQuerier is the QueryRow half of a pool or a transaction.
@@ -1558,7 +1579,8 @@ const sessionCols = `id::text, user_id::text, app_id::text, host_id::text, gpu_i
 	reserved_vram_mb, reserved_encode_slots,
 	playout0_ms,
 	health_state, health_state_reason, health_state_changed_at,
-	created_at, assigned_at, started_at, ended_at`
+	created_at, assigned_at, started_at, ended_at,
+	shared_home_app_id::text`
 
 // selectSessionSQL is the column list + FROM shared by all session reads.
 const selectSessionSQL = `SELECT ` + sessionCols + ` FROM sessions`
@@ -1617,6 +1639,7 @@ func scanSessionRow(r row, extra ...any) (Session, error) {
 		&s.Playout0Ms,
 		&hs, &s.HealthReason, &s.HealthChangedAt,
 		&s.CreatedAt, &s.AssignedAt, &s.StartedAt, &s.EndedAt,
+		&s.SharedHomeAppID,
 	}
 	if err := r.Scan(append(dest, extra...)...); err != nil {
 		return Session{}, err

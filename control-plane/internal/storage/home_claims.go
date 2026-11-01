@@ -390,7 +390,8 @@ func (m *Manager) ReleaseHomeClaim(ctx context.Context, req ReleaseHomeClaimReq)
 	}
 	var live bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sessions s JOIN apps a ON a.id=s.app_id
-		WHERE s.user_id=$1::uuid AND COALESCE(a.parent_app_id,a.id)=$2::uuid
+		WHERE s.user_id=$1::uuid
+		  AND (COALESCE(a.parent_app_id,a.id)=$2::uuid OR s.shared_home_app_id=$2::uuid)
 		  AND s.state NOT IN ('stopped','failed'))`, req.UserID, canonical).Scan(&live); err != nil {
 		return ReleasedHomeClaim{}, fmt.Errorf("check live sessions: %w", err)
 	}

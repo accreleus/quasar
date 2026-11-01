@@ -143,6 +143,8 @@ pub async fn run(cfg: Config) {
         crate::restart::exit_now(1);
     }
 
+    crate::ddc::set_state_path(cfg.console_input_state_path());
+
     // Consume a restart journal marker once per process, before probes or
     // session runtime initialization can observe the affected hardware group.
     let policy_path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
@@ -1688,7 +1690,7 @@ fn register_message(
     Ok(AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1, "template_publish_permit": 1})),
         config_policy_versions: policy_available.then(||
-            serde_json::json!({"typed_settings":2,"execution_journal":1,"deployment_baseline":1,"idle_apply":1})),
+            serde_json::json!({"typed_settings":2,"execution_journal":1,"deployment_baseline":1,"idle_apply":1,"recovery_release":1})),
         config_policy_groups: policy_available.then(|| crate::policy::PolicyAgent::advertised_groups(
             &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)))),
         terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
@@ -2160,9 +2162,10 @@ async fn connect_and_run(
             anyhow::bail!("RH05 ownership echo invalid");
         }
     }
-    sessions.mgr.policy_session_ready = policy_identity.is_none()
-        && !policy.has_sticky_ownership()
-        && !policy.has_uncertain_restart();
+    sessions.mgr.policy_ready_unless_uncertain =
+        policy_identity.is_none() && !policy.has_sticky_ownership();
+    sessions.mgr.policy_session_ready =
+        sessions.mgr.policy_ready_unless_uncertain && !policy.has_uncertain_restart();
     sessions.mgr.policy_accepted_groups = policy_groups;
     sessions.mgr.policy_delivery_ack = None;
     sessions.mgr.policy_inventory_complete = false;
@@ -3171,6 +3174,9 @@ struct SessionManager {
     policy_agent: Option<crate::policy::PolicyAgent>,
     policy_accepted_groups: Option<Vec<String>>,
     policy_session_ready: bool,
+    /// `policy_session_ready` without its `uncertain` term, so a release can
+    /// lift exactly that block and no other (`config_policy_release`).
+    policy_ready_unless_uncertain: bool,
     policy_delivery_ack: Option<String>,
     policy_inventory_complete: bool,
     policy_seed_reconnect_used: bool,
@@ -3480,6 +3486,7 @@ impl SessionManager {
             policy_agent: None,
             policy_accepted_groups: None,
             policy_session_ready: true,
+            policy_ready_unless_uncertain: true,
             policy_delivery_ack: None,
             policy_inventory_complete: false,
             policy_seed_reconnect_used: false,
@@ -4637,18 +4644,17 @@ impl SessionManager {
                         match result {
                             Ok(conflict) => {
                                 self.policy_delivery_ack = settings_delivery_id;
-                                self.policy_session_ready = match &self.policy_accepted_groups {
-                                    Some(groups) => {
-                                        self.policy_inventory_complete
-                                            && policy.sticky_groups_accepted(groups)
-                                            && (!groups.is_empty() || !policy.has_seed())
-                                            && !policy.has_uncertain_restart()
-                                    }
-                                    None => {
-                                        !policy.has_sticky_ownership()
-                                            && !policy.has_uncertain_restart()
-                                    }
-                                };
+                                self.policy_ready_unless_uncertain =
+                                    match &self.policy_accepted_groups {
+                                        Some(groups) => {
+                                            self.policy_inventory_complete
+                                                && policy.sticky_groups_accepted(groups)
+                                                && (!groups.is_empty() || !policy.has_seed())
+                                        }
+                                        None => !policy.has_sticky_ownership(),
+                                    };
+                                self.policy_session_ready = self.policy_ready_unless_uncertain
+                                    && !policy.has_uncertain_restart();
                                 if let Some(group) = conflict {
                                     feature_error = Some(AgentMsg::ConfigPolicyFeatureError {
                                         code: "attempt_conflict".into(),
@@ -4661,6 +4667,7 @@ impl SessionManager {
                             }
                             Err(code) => {
                                 self.policy_session_ready = false;
+                                self.policy_ready_unless_uncertain = false;
                                 feature_error = Some(AgentMsg::ConfigPolicyFeatureError {
                                     code,
                                     group: None,
@@ -4780,6 +4787,33 @@ impl SessionManager {
                     self.notify_probe_inputs_if_changed();
                 }
                 reply
+            }
+            ControlMsg::ConfigPolicyRelease {
+                attempt_id,
+                boot_incarnation,
+                connection_incarnation,
+            } => {
+                let policy = self.policy_agent.as_mut()?;
+                let reply = policy.release(&attempt_id, &boot_incarnation, &connection_incarnation);
+                let uncertain = policy.has_uncertain_restart();
+                Some(match reply {
+                    Ok(state) => {
+                        info!(token = "policy-recovery-released", attempt_id = %attempt_id,
+                            "administrator released the uncertain restart record");
+                        self.policy_session_ready =
+                            self.policy_ready_unless_uncertain && !uncertain;
+                        state
+                    }
+                    Err(code) => {
+                        warn!(token = "policy-recovery-release-refused", attempt_id = %attempt_id, code = %code,
+                            "recovery release refused");
+                        AgentMsg::ConfigPolicyFeatureError {
+                            code,
+                            group: None,
+                            connection_incarnation,
+                        }
+                    }
+                })
             }
             ControlMsg::ConfigPolicyJournalInventoryRequest {
                 inventory_id,
@@ -5555,13 +5589,6 @@ fn probe_inputs(mgr: &SessionManager) -> crate::host_probe::decision::ProbeInput
     mgr.codec_stack().probe_inputs()
 }
 
-/// Turn the assign's `AppSpec` into a launchable container spec, or `None` when
-/// no image is set (a bare/compositor-only session).
-///
-/// The single point where wire-supplied mounts become agent data, so it is where
-/// [`MountPolicy`] runs. Mounts the agent itself appends later (the Wayland socket,
-/// the pulse runtime dir) are agent-authored and deliberately not re-checked.
-/// A rejection fails the assign or the swap; nothing is spawned.
 /// The env keys the control plane sets from a user's Region and Input settings
 /// (`agent-api.md` amendment 49).
 const REGION_INPUT_ENV_KEYS: [&str; 9] = [
@@ -5589,6 +5616,13 @@ fn region_env(container: Option<&ContainerSpec>) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Turn the assign's `AppSpec` into a launchable container spec, or `None` when
+/// no image is set (a bare/compositor-only session).
+///
+/// The single point where wire-supplied mounts become agent data, so it is where
+/// [`MountPolicy`] runs. Mounts the agent itself appends later (the Wayland socket,
+/// the pulse runtime dir) are agent-authored and deliberately not re-checked.
+/// A rejection fails the assign or the swap; nothing is spawned.
 fn app_to_container(app: AppSpec, mounts: &MountPolicy) -> anyhow::Result<Option<ContainerSpec>> {
     if app.image.is_empty() {
         return Ok(None);
@@ -10748,6 +10782,44 @@ mod tests {
         mgr.handle_control(typed_offer_msg(offer), &evt_tx, &diagnostic_sender())
     }
 
+    /// agent-api.md `config_policy_release`: the release lifts the uncertain block on
+    /// sessions, and nothing else the connection has not yet satisfied.
+    #[tokio::test]
+    async fn a_recovery_release_lifts_only_the_uncertain_session_block() {
+        use crate::policy::test_support::uncertain_agent;
+        let release = |id: &str, conn: &str| ControlMsg::ConfigPolicyRelease {
+            attempt_id: id.into(),
+            boot_incarnation: "boot".into(),
+            connection_incarnation: conn.into(),
+        };
+        for map_applied in [true, false] {
+            let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+            let dir = tempfile::tempdir().unwrap();
+            let (agent, id) = uncertain_agent(dir.path(), &mut mgr.runtime_settings);
+            mgr.policy_agent = Some(agent);
+            mgr.policy_ready_unless_uncertain = map_applied;
+            mgr.policy_session_ready = false;
+            let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+
+            let stale = mgr.handle_control(release(&id, "old-conn"), &evt_tx, &diagnostic_sender());
+            assert!(
+                matches!(&stale, Some(AgentMsg::ConfigPolicyFeatureError { code, .. }) if code == "stale_release_request"),
+                "{stale:?}"
+            );
+            assert!(!mgr.policy_session_ready);
+
+            let reply = mgr.handle_control(release(&id, "conn"), &evt_tx, &diagnostic_sender());
+            assert!(
+                matches!(&reply, Some(AgentMsg::ConfigPolicyState { phase, .. }) if phase == "released"),
+                "{reply:?}"
+            );
+            assert_eq!(
+                mgr.policy_session_ready, map_applied,
+                "map applied: {map_applied}"
+            );
+        }
+    }
+
     /// agent-api.md §RH05: a `deployment_baseline_changed` rejection is
     /// preceded on the same ordered socket by a fresh capacity baseline, so
     /// the control plane never reads the rejection against stale evidence.
@@ -11788,6 +11860,45 @@ mod tests {
             mgr.running["p0"].region_env,
             BTreeMap::from([("TZ".to_string(), "Asia/Tokyo".to_string())])
         );
+    }
+
+    #[test]
+    fn a_completed_swap_records_exactly_the_canonical_region_keys() {
+        let (mut mgr, warm) = warm_manager();
+        let cfg = steam_cfg_from_wire(SessionKind::Play, "-applaunch 620", "Europe/Berlin");
+        assert!(acked(start(&mut mgr, &warm, "p0", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("p0", SessionEvent::Running);
+        // The control plane sends all nine; the app's own keys ride along.
+        let mut env: BTreeMap<String, String> = REGION_INPUT_ENV_KEYS
+            .iter()
+            .map(|k| (k.to_string(), format!("v-{k}")))
+            .collect();
+        env.insert("KEEP".into(), "1".into());
+        let app = AppSpec {
+            image: "steam".into(),
+            env,
+            ..Default::default()
+        };
+        let ctrl = ControlMsg::SessionSwapApp {
+            id: "swap".into(),
+            session_id: "p0".into(),
+            app,
+            in_place: false,
+        };
+        assert!(acked(mgr.handle_control(
+            ctrl,
+            &warm.evt_tx,
+            &diagnostic_sender()
+        )));
+        mgr.relay("p0", SessionEvent::SwapDone);
+        let recorded = &mgr.running["p0"].region_env;
+        assert_eq!(recorded.keys().map(String::as_str).collect::<Vec<_>>(), {
+            let mut want = REGION_INPUT_ENV_KEYS.to_vec();
+            want.sort_unstable();
+            want
+        });
+        assert_eq!(recorded["TZ"], "v-TZ");
     }
 
     #[test]

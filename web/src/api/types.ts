@@ -343,6 +343,7 @@ export interface CreateAppRequest {
   runtime_spec: Record<string, unknown>;
   managed_home?: boolean;
   home_container_path?: string;
+  share_steam_library?: boolean;
   runtime_preset_id?: string | null;
   /** Absent or `[]` = unrestricted. Never send `null` — a 400, as is a non-empty
    *  list under `profile_policy: "force"`. The server enforces it independently. */
@@ -372,6 +373,7 @@ export interface UpdateAppRequest {
   runtime_spec?: Record<string, unknown>;
   managed_home?: boolean;
   home_container_path?: string;
+  share_steam_library?: boolean;
   /** Tri-state: absent = unchanged, `null` = clear, uuid = set. */
   runtime_preset_id?: string | null;
   /** Absent = unchanged, `[]` = clear, non-empty = replace wholesale. `null` is a

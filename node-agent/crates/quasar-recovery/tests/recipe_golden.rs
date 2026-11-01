@@ -890,7 +890,7 @@ fn a_revision_the_book_does_not_carry_is_recipe_unsupported() {
         (Role::NodeAgent, 5),
         (Role::RecoveryActor, 2),
         (Role::ControlPlane, 0),
-        (Role::ControlPlane, 4),
+        (Role::ControlPlane, 5),
         (Role::Postgres, 2),
     ] {
         assert_eq!(
@@ -1034,6 +1034,7 @@ pub fn combined(database: DatabaseInputs) -> Inputs {
         unknown: Default::default(),
         machine_role: quasar_recovery::recipe::ControlRole::Combined,
         trusted_proxies: None,
+        hsts_max_age: None,
         http_port: 8080,
         tls_port: 8443,
         public_host: Some("quasar.example.invalid".into()),
@@ -1162,6 +1163,54 @@ fn the_combined_and_control_only_recipes_render_their_golden_specifications() {
     )
     .unwrap();
     check("control-plane-r3-control-only-external.json", &spec);
+
+    // Revision 4 (#874): QUASAR_HSTS_MAX_AGE, empty unless the operator set it.
+    let mut hsts = enrolling.clone();
+    hsts.control.as_mut().unwrap().hsts_max_age = Some("86400".into());
+    let spec = render(Role::ControlPlane, 4, &hsts, &cp, &control_secrets(true)).unwrap();
+    check("control-plane-r4-combined-hsts.json", &spec);
+    assert_eq!(spec.env["QUASAR_HSTS_MAX_AGE"], "86400");
+    let spec = render(
+        Role::ControlPlane,
+        4,
+        &control_only,
+        &cp,
+        &control_secrets(false),
+    )
+    .unwrap();
+    check("control-plane-r4-control-only-external.json", &spec);
+    assert_eq!(spec.env["QUASAR_HSTS_MAX_AGE"], "");
+    // An older revision ignores it, so a restore back to one renders what it always did.
+    let older = render(Role::ControlPlane, 3, &hsts, &cp, &control_secrets(true)).unwrap();
+    assert_eq!(
+        older,
+        render(
+            Role::ControlPlane,
+            3,
+            &enrolling,
+            &cp,
+            &control_secrets(true)
+        )
+        .unwrap()
+    );
+    assert!(!older.env.contains_key("QUASAR_HSTS_MAX_AGE"));
+    for bad in ["", "-1", "1.5", "1d", "2147483648"] {
+        let mut i = hsts.clone();
+        i.control.as_mut().unwrap().hsts_max_age = Some(bad.into());
+        assert!(
+            matches!(
+                render(Role::ControlPlane, 4, &i, &cp, &control_secrets(true)),
+                Err(RenderError::Invalid(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    for ok in ["0", "2147483647"] {
+        let mut i = hsts.clone();
+        i.control.as_mut().unwrap().hsts_max_age = Some(ok.into());
+        let spec = render(Role::ControlPlane, 4, &i, &cp, &control_secrets(true)).unwrap();
+        assert_eq!(spec.env["QUASAR_HSTS_MAX_AGE"], ok);
+    }
 
     // Revision 1 has no fallback variables: an override, else the install-time image.
     let spec = render(

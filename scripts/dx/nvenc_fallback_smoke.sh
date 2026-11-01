@@ -9,7 +9,7 @@
 # duplicated here.
 #
 # Local: runs scripts/harness/run-nvenc-fallback-smoke.sh directly against this
-#   worktree's instance-scoped stack (http://127.0.0.1:$DX_CP_PORT).
+#   worktree's instance-scoped stack (https://127.0.0.1:$DX_CP_TLS_PORT).
 # Remote (HOST=<role-or-host>): scripts/harness/run-nvenc-fallback-smoke.sh must run ON
 #   that host (it drives a local CFT peer + `docker exec`/`docker logs`/
 #   `docker inspect` against the stack's own containers — same rule
@@ -44,8 +44,8 @@ TARGET=nvenc-fallback-smoke
 dx_require_host_scope "$TARGET"
 
 if [ "$DX_HOST" = local ]; then
-  dx_info "nvenc-fallback-smoke: running locally against http://127.0.0.1:$DX_CP_PORT"
-  if bash "$DX_ROOT/scripts/harness/run-nvenc-fallback-smoke.sh" --api "http://127.0.0.1:$DX_CP_PORT" "$@"; then
+  dx_info "nvenc-fallback-smoke: running locally against https://127.0.0.1:$DX_CP_TLS_PORT"
+  if bash "$DX_ROOT/scripts/harness/run-nvenc-fallback-smoke.sh" --api "https://127.0.0.1:$DX_CP_TLS_PORT" "$@"; then
     dx_pass nvenc-fallback-smoke "scripts/harness/run-nvenc-fallback-smoke.sh green"
   else
     dx_fail nvenc-fallback-smoke "scripts/harness/run-nvenc-fallback-smoke.sh failed — see output above"

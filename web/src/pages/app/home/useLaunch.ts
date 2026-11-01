@@ -183,13 +183,15 @@ export function useLaunch({
       };
       for (;;) {
         try {
-          const { session, signaling } = await libraryApi.launchSession(
+          const { session, signaling, notice } = await libraryApi.launchSession(
             token,
             req,
             controller.signal,
           );
           dismissWaitingToast();
           launchAbortRef.current = null;
+          // steam_library_not_shared: the desktop opened without the user's library.
+          if (notice) addToast({ variant: "info", title: notice.message });
           navigate(`/app/session/${session.id}`, {
             state: {
               signalingUrl: signaling.url,

@@ -182,7 +182,22 @@ impl Actor {
                 Role::ControlPlane,
                 &secrets,
                 CONTROL_PLANE_FILES,
-                |_, _, _| {
+                |machine, _, revision| {
+                    // The first install only: a control plane re-created after a restore to
+                    // an older release renders without the input and starts.
+                    let first = self.dir.load_service(Role::ControlPlane)?.is_none();
+                    if first
+                        && revision < control::HSTS_REVISION
+                        && machine
+                            .inputs
+                            .control
+                            .as_ref()
+                            .is_some_and(|c| c.hsts_max_age.is_some())
+                    {
+                        return Err(ResumeError::Inputs(control::hsts_needs_newer_image(
+                            revision,
+                        )));
+                    }
                     // Only before a create: a restart never holds the actor busy on Postgres.
                     if owned_db {
                         self.await_healthy(names::POSTGRES);

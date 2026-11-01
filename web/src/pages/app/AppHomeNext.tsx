@@ -37,6 +37,7 @@ import { buildRailCards } from "./homeData";
 import {
   LIVE_STATES,
   blockedFamilyIds,
+  sharedLibraryIds,
   coverClassAt,
   familyRootApp,
   filterLibraryApps,
@@ -176,7 +177,11 @@ export function AppHomeNext() {
   // Single-writer lock UX — presentation only; the server's 409 home_in_use is
   // the actual gate (CLAUDE.md invariant #6).
   const blockedIds = useMemo(
-    () => blockedFamilyIds(apps, liveSession?.app_id ?? null),
+    () => blockedFamilyIds(apps, liveSession?.app_id ?? null, liveSession?.shared_home_app_id ?? null),
+    [apps, liveSession],
+  );
+  const dimmedIds = useMemo(
+    () => sharedLibraryIds(apps, liveSession?.shared_home_app_id ?? null),
     [apps, liveSession],
   );
   const blockedByName = useMemo(
@@ -412,6 +417,7 @@ export function AppHomeNext() {
           onToggleFavourite={() => void toggleFavourite(openApp)}
           isBlocked={blockedIds.has(openApp.id)}
           blockedByName={blockedByName}
+          sharedLibrary={dimmedIds.has(openApp.id)}
           liveSessionId={liveSession?.id ?? null}
           isLive={liveSession?.app_id === openApp.id}
           onResume={() => {
@@ -431,6 +437,7 @@ export function AppHomeNext() {
       closeDetail,
       toggleFavourite,
       blockedIds,
+      dimmedIds,
       blockedByName,
       liveSession,
       navigate,
@@ -450,6 +457,7 @@ export function AppHomeNext() {
             isRunning={liveSession?.app_id === app.id}
             isBlocked={blockedIds.has(app.id)}
             blockedByName={blockedByName}
+            isDimmed={dimmedIds.has(app.id)}
             isOpen={openId === app.id}
             isBusy={busy}
             coverClass={coverClassById.get(app.id) ?? coverClassAt(0)}
@@ -467,6 +475,7 @@ export function AppHomeNext() {
     [
       liveSession,
       blockedIds,
+      dimmedIds,
       blockedByName,
       openId,
       busy,
@@ -485,6 +494,7 @@ export function AppHomeNext() {
     busy,
     liveAppId: liveSession?.app_id ?? null,
     blockedIds,
+    dimmedIds,
     blockedByName,
     coverClass: (a: App) => coverClassById.get(a.id) ?? coverClassAt(0),
     onOpen: openGamePage,
@@ -515,6 +525,7 @@ export function AppHomeNext() {
                 coverClassById={coverClassById}
                 busy={busy}
                 blockedIds={blockedIds}
+                dimmedIds={dimmedIds}
                 onOpen={(app) => (newDesign ? openGamePage(app) : detail.reveal(app, false))}
                 onPlay={(card, app) => {
                   if (card.sessionId) navigate(`/app/session/${card.sessionId}`);

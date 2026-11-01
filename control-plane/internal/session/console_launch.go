@@ -145,6 +145,12 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 		}
 	}
 
+	dispatchSpec, err = c.applyRegionInput(ctx, dispatchSpec, userID, sess.DeviceID)
+	if err != nil {
+		c.failSession(sess.ID, fmt.Sprintf("region and input values: %v", err))
+		return "", fmt.Errorf("console auto-start: region and input values: %w", err)
+	}
+
 	expectedHome := expectedHomeDispatch(app)
 	go c.dispatchAssignStartWithTopology(sess, dispatchSpec, videoTopology, &expectedHome)
 

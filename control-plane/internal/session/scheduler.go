@@ -63,6 +63,11 @@ type CreateParams struct {
 	// authorizes, and collapsing them breaks either per-tile entitlement or the
 	// single-writer guard.
 	HomeAppID string
+	// SharedHomeAppID is the Steam parent whose home this launch also mounts
+	// (a sharing desktop, #1001), "" for none. scheduleAttempt holds that home's
+	// single-writer lock and claim as well as the launch's own, and clears it
+	// when the two homes cannot be on one host (resolveSharedHome).
+	SharedHomeAppID string
 	// The effective runtime app's image ref, for the image placement filter.
 	// Empty, or any image that is not an installed catalog entry, disables it.
 	AppImage string
@@ -116,6 +121,11 @@ func (p CreateParams) homeAppID() string {
 		return p.HomeAppID
 	}
 	return p.AppID
+}
+
+// sharedParams is the shared home as a launch of its own, for the home helpers.
+func (p CreateParams) sharedParams() CreateParams {
+	return CreateParams{UserID: p.UserID, AppID: p.SharedHomeAppID, HomeAppID: p.SharedHomeAppID, ManagedHome: true}
 }
 
 // maxPlacementAttempts bounds the retry loop. A retry happens only when the
@@ -330,18 +340,22 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 			// A fixed selection that excludes the only safe home location needs
 			// the repair-required home explanation, rather than a generic empty
 			// fleet message. The final placement lock below still decides the race.
-			var selected bool
-			if err := tx.QueryRow(ctx, `SELECT mode='all_eligible' OR EXISTS (
-				SELECT 1 FROM app_placement_hosts
-				WHERE app_id=ap.app_id AND host_id=$2::uuid)
-				FROM app_placement ap WHERE app_id=$1::uuid`, p.homeAppID(), owner).Scan(&selected); err != nil {
-				return Session{}, false, fmt.Errorf("check home owner placement: %w", err)
+			selected, err := placementIncludes(ctx, tx, p.homeAppID(), owner)
+			if err != nil {
+				return Session{}, false, err
 			}
 			if !selected {
 				return Session{}, false, ErrHomeConflict
 			}
 			p.PinHostID = owner
 			p.homePinned = true
+		}
+	}
+
+	var sharedNotice string
+	if p.SharedHomeAppID != "" {
+		if sharedNotice, err = resolveSharedHome(ctx, tx, &p); err != nil {
+			return Session{}, false, err
 		}
 	}
 
@@ -398,6 +412,16 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 			return Session{}, false, fmt.Errorf("count same-home sessions: %w", err)
 		}
 		if conflict != nil {
+			return Session{}, false, conflict
+		}
+	}
+	if p.SharedHomeAppID != "" {
+		conflict, err := homeInUse(ctx, tx, p.UserID, p.SharedHomeAppID, "")
+		if err != nil {
+			return Session{}, false, fmt.Errorf("count shared-home sessions: %w", err)
+		}
+		if conflict != nil {
+			conflict.forShared = true
 			return Session{}, false, conflict
 		}
 	}
@@ -470,6 +494,15 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	if err := claimSelectedHome(ctx, tx, p, hostID, p.sameHolder()...); err != nil {
 		return Session{}, false, err
 	}
+	if p.SharedHomeAppID != "" {
+		notice, err := claimSharedHome(ctx, tx, &p, hostID)
+		if err != nil {
+			return Session{}, false, err
+		}
+		if notice != "" {
+			sharedNotice = notice
+		}
+	}
 
 	// A malformed device id is dropped, not fatal: it scopes later reads and is
 	// never an authorization input, but the ::uuid cast below would 500 on it.
@@ -496,7 +529,8 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    mic,
 		    device_id,
 		    assigned_at,
-		    kind, parked_until
+		    kind, parked_until,
+		    shared_home_app_id
 		) VALUES (
 		    $1, $2, $3, $4, 'assigned',
 		    $5, $6, $7, $8, $9,
@@ -509,7 +543,8 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    NULLIF($17, '')::uuid,
 		    now(),
 		    COALESCE(NULLIF($18, ''), 'play'),
-		    CASE WHEN $18 = 'parked' THEN now() + make_interval(mins => $19::int) END
+		    CASE WHEN $18 = 'parked' THEN now() + make_interval(mins => $19::int) END,
+		    NULLIF($20, '')::uuid
 		)
 		RETURNING `+sessionCols,
 		p.UserID, p.AppID, hostID, gpuID,
@@ -522,6 +557,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		p.Mic,
 		deviceID,
 		p.Kind, parkedMinutes,
+		p.SharedHomeAppID,
 	))
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.ConstraintName == "sessions_one_parked_per_user" {
@@ -550,6 +586,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 
 	sess.GPUIndex = &gpuIndex
+	sess.notice = sharedNotice
 	return sess, false, nil
 }
 

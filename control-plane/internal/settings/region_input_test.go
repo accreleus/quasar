@@ -5,11 +5,26 @@ import (
 	"testing"
 )
 
+// The shape rule is tested apart from LoadLocation: whether a host's zoneinfo
+// has posix/ or right/ trees varies, the refusal must not.
+func TestZoneNameShapeRefusesWhatIsNotAnIANAName(t *testing.T) {
+	for tz, want := range map[string]bool{
+		"Europe/London": true, "UTC": true, "Etc/GMT+5": true, "Asia/Kolkata": true,
+		"Local": false, "localtime": false, "posixrules": false,
+		"posix/Europe/London": false, "posix/UTC": false, "right/Europe/London": false, "right/UTC": false,
+	} {
+		if got := zoneNameShape(tz); got != want {
+			t.Errorf("zoneNameShape(%q) = %v, want %v", tz, got, want)
+		}
+	}
+}
+
 func TestRegionInputValueRules(t *testing.T) {
 	for tz, want := range map[string]bool{
 		"Europe/London": true, "UTC": true, "Asia/Calcutta": true, "Asia/Kolkata": true,
 		"America/Argentina/Buenos_Aires": true,
 		"Local":                          false, "": false, "Mars/Olympus": false, "../etc/passwd": false, "europe/london": false,
+		"posixrules": false, "localtime": false, "posix/Europe/London": false, "right/UTC": false,
 	} {
 		if got := ValidTimezone(tz); got != want {
 			t.Errorf("ValidTimezone(%q) = %v, want %v", tz, got, want)

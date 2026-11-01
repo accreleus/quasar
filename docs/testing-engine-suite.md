@@ -93,24 +93,23 @@ Without `QUASAR_ENGINE_SUITE_TARGETS` the binary checks only its own tables, so 
 
 ## Where each mode runs
 
-CI (`.github/workflows/ci.yml`, job `engines`, one job per mode on an Ubuntu 24.04 hosted
-runner; `scripts/verify/ci-engine-target.sh` brings each engine up):
+CI (`.github/workflows/ci.yml`, job `engines`, one job per mode on an Ubuntu 26.04 hosted
+runner (`runs-on: ubuntu-26.04`, pinned; `ci.yml` says how to move it); `scripts/verify/ci-engine-target.sh` brings each engine up):
 
 | Mode | CI | Lab |
 |---|---|---|
 | `docker-rootful` | yes: the runner's Docker | every GPU case, on each GPU test host |
 | `docker-rootless` | yes: Docker's rootless helpers for the runner's own release, under the runner user's systemd session | every GPU case; Fedora with SELinux enforcing |
-| `podman-rootful` | yes: Ubuntu's Podman 4.9, suite run as root | every GPU case; Fedora's Podman 5 |
-| `podman-rootless` | yes: Ubuntu's Podman 4.9 through the user's `podman.socket` | every GPU case; the must-pass Fedora Atomic VM (SELinux enforcing, read-only `/usr`) |
+| `podman-rootful` | yes: the runner's Podman (5.7 as of 2026-10-30), suite run as root | every GPU case; Fedora's Podman 5 |
+| `podman-rootless` | yes: the runner's Podman through the user's `podman.socket` | every GPU case; the must-pass Fedora Atomic VM (SELinux enforcing, read-only `/usr`) |
 
-CI's Podman jobs record one failure in `QUASAR_ENGINE_SUITE_KNOWN` (the job's `known`
-matrix value) instead of hiding it:
-
-- `restart`: Podman 4.9 cannot change a restart policy (`Engine`): its compatible API has
-  no container update, and its native update has no restart policy. Podman 5.1 is the
-  first that can, so it is Quasar's minimum (`engines.podman.minimumVersion` in the
-  engine-profile table; #424). The case stays KNOWN here because the runner's Podman is
-  below that minimum.
+CI records a finding an engine cannot pass as a `known` entry in the job's matrix
+(`QUASAR_ENGINE_SUITE_KNOWN`, `<target>:<case>=<finding>`) instead of hiding it: the case
+still runs and reports KNOWN, and the job fails once it passes so the entry is dropped.
+None today. `restart` was one until the runner's Podman moved to 5.7 (#982): Podman 4.9
+cannot change a restart policy (`Engine`), its compatible API having no container update
+and its native update no restart policy. Podman 5.1 is the first that can, so it is
+Quasar's minimum (`engines.podman.minimumVersion` in the engine-profile table; #424).
 
 What only the lab can run, in every mode, and why:
 
@@ -118,7 +117,7 @@ What only the lab can run, in every mode, and why:
 - **`dri`**: a hosted runner has no DRM node.
 - **`uinput`**: a hosted runner loads no `uinput` and has no host-preparation group rule for
   it; granting it by hand would test a different setup from the one Quasar ships.
-- **Fedora and SELinux behaviour**: the runner is Ubuntu with AppArmor and Podman 4.9. The
+- **Fedora and SELinux behaviour**: the runner is Ubuntu with AppArmor. The
   required profiles are Fedora (D5), so a green CI row is evidence for the mode, not for
   the profile.
 
@@ -172,4 +171,4 @@ map (#409). Hosts are named here by role only.
    not even be listed there. That is host policy, and the `cdi` case does not ask for it.
 8. **Record** every case line and the `RESULT` line. A `FAIL` is a finding about that engine
    mode: file it rather than retrying until it passes. A lab run sets no
-   `QUASAR_ENGINE_SUITE_KNOWN`: CI's entries describe Ubuntu's Podman, not the lab's.
+   `QUASAR_ENGINE_SUITE_KNOWN`: a CI entry, when there is one, describes the runner's engine, not the lab's.

@@ -1,11 +1,9 @@
 // Build script: link libgstcuda-1.0 only when the `cuda` feature is on (ZC-02 N-A).
 //
-// The node-agent is one source that builds for BOTH the AMD (aux-host) image (VA encode,
-// no libgstcuda) and the NVIDIA/quasar-nv image (NVENC zero-copy, libgstcuda present).
-// The full-zero-copy N-A path FFI-links libgstcuda-1.0 (gst_cuda_context_new etc.); that
-// lib + its pkg-config (`gstreamer-cuda-1.0`) exist only in the quasar-nv image, so the
-// link is gated on the `cuda` feature. Without the feature this build script is a no-op
-// and the AMD build is unchanged.
+// The universal agent image builds with the feature (#927): the full-zero-copy N-A path
+// FFI-links libgstcuda-1.0 (gst_cuda_context_new etc.), shipped in /opt/gst with its
+// pkg-config (`gstreamer-cuda-1.0`). libgstcuda needs no libcuda, so the binary still
+// starts on an AMD/Intel or driver-less host. Without the feature this script is a no-op.
 fn main() {
     stamp_build_identity();
 

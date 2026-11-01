@@ -30,6 +30,14 @@ describe("v3 shell", () => {
     expect(app).toMatch(/height:\s*100vh/);
   });
 
+  it("makes the console page box the containing block of what it holds (#1013)", () => {
+    // Else an absolutely positioned descendant (a `.sr-only` live region) is placed against `.app`,
+    // escapes `.main`'s clip, and lets the document scroll: a section jump then scrolls the whole
+    // page too and drags the topbar and rail up. The home shell scrolls the document on purpose.
+    expect(rule(".main")).toMatch(/position:\s*relative/);
+    expect(rule(".main-home")).toMatch(/position:\s*static/);
+  });
+
   it("gives the home shell a 64px sticky topbar instead", () => {
     expect(rule(".topbar.home")).toMatch(/height:\s*64px/);
     expect(rule(".topbar.home")).toMatch(/position:\s*sticky/);

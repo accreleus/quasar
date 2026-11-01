@@ -254,11 +254,14 @@ type sessionResp struct {
 	// signal, and reconciling them erases it.
 	NegotiatedCodec *string `json:"negotiated_codec"`
 	// Computed stream health with an optional reason; omitted when empty.
-	HealthState  string     `json:"health_state,omitempty"`
-	HealthReason *string    `json:"health_reason,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	StartedAt    *time.Time `json:"started_at"`
-	EndedAt      *time.Time `json:"ended_at"`
+	HealthState  string  `json:"health_state,omitempty"`
+	HealthReason *string `json:"health_reason,omitempty"`
+	// The Steam parent whose library this session also mounts; always
+	// serialized. semantics: control-api.md §Storage
+	SharedHomeAppID *string    `json:"shared_home_app_id"`
+	CreatedAt       time.Time  `json:"created_at"`
+	StartedAt       *time.Time `json:"started_at"`
+	EndedAt         *time.Time `json:"ended_at"`
 }
 
 type signalingResp struct {
@@ -359,12 +362,13 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		CodecDecision:   s.CodecDecision,
 		NegotiatedCodec: s.NegotiatedCodec,
 
-		HealthState:  string(s.HealthState),
-		HealthReason: s.HealthReason,
-		Stream:       stream,
-		CreatedAt:    s.CreatedAt,
-		StartedAt:    s.StartedAt,
-		EndedAt:      s.EndedAt,
+		HealthState:     string(s.HealthState),
+		HealthReason:    s.HealthReason,
+		SharedHomeAppID: s.SharedHomeAppID,
+		Stream:          stream,
+		CreatedAt:       s.CreatedAt,
+		StartedAt:       s.StartedAt,
+		EndedAt:         s.EndedAt,
 	}
 }
 
@@ -566,11 +570,18 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	}
 	h.recordActivity(r.Context(), user.ID, "session.launched", "session", res.Session.ID, launched)
 
-	httpx.WriteJSON(w, http.StatusCreated, map[string]any{
+	body := map[string]any{
 		"session":   h.sessionResp(res.Session),
 		"signaling": h.newSignalingResp(r, res.SignalingToken, res.TokenExpiresAt),
-	})
+	}
+	// Omitted, never empty. semantics: control-api.md §Storage
+	if res.Notice != "" {
+		body["notice"] = map[string]string{"code": noticeCodeSteamLibraryNotShared, "message": res.Notice}
+	}
+	httpx.WriteJSON(w, http.StatusCreated, body)
 }
+
+const noticeCodeSteamLibraryNotShared = "steam_library_not_shared"
 
 // handleSteamWarm is the library heartbeat. Once authenticated it always
 // answers 204 with no body; a body is ignored (control-api.md §Warm Steam).
@@ -875,6 +886,9 @@ func writeHomeInUse(w http.ResponseWriter, err error, message string) {
 	if id := conflictingSessionID(err); id != "" {
 		body["session_id"] = id
 	}
+	if reason := homeInUseReason(err); reason != "" {
+		body["reason"] = reason
+	}
 	httpx.WriteJSON(w, http.StatusConflict, map[string]any{"error": body})
 }
 
@@ -899,10 +913,31 @@ func writeNoHostAvailable(w http.ResponseWriter, err error) {
 // user only has to retry in a moment. The code and session_id are unchanged.
 func homeInUseMessage(err error, live string) string {
 	var hiu *HomeInUseError
-	if errors.As(err, &hiu) && hiu.Stopping {
+	switch {
+	case !errors.As(err, &hiu):
+	case hiu.Stopping:
 		return "your previous session backed by this app's storage is still shutting down; try again in a moment"
+	case hiu.holderShares:
+		return "Your Steam library is open in the desktop. Close the desktop first."
+	case hiu.forShared:
+		return "Close your Steam game first."
 	}
 	return live
+}
+
+// homeInUseReason names a shared-library conflict, "" for any other.
+// semantics: control-api.md §Storage
+func homeInUseReason(err error) string {
+	var hiu *HomeInUseError
+	switch {
+	case !errors.As(err, &hiu) || hiu.Stopping:
+		return ""
+	case hiu.holderShares:
+		return "steam_library_open_in_desktop"
+	case hiu.forShared:
+		return "steam_game_running"
+	}
+	return ""
 }
 
 func (h *Handler) writeHomeConflict(w http.ResponseWriter, ctx context.Context, appID string) {

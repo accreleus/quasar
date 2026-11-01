@@ -23,7 +23,7 @@ import {
   type DraftCodec,
   type LaunchDraft,
 } from "../launchOptions";
-import { LIVE_STATES, blockedFamilyIds, coverClassAt, familyRootApp } from "../libraryGrid";
+import { LIVE_STATES, blockedFamilyIds, coverClassAt, familyRootApp, sharedLibraryIds } from "../libraryGrid";
 import { useLibraryCatalog } from "../libraryCatalog";
 import { waitingPlayLabel } from "../capacityRetry";
 import { recommendation, resolutionLabel } from "../home/launchOptionRules";
@@ -67,7 +67,9 @@ export function useGamePage(app: App) {
   const liveSession = mySessions.find((s) => LIVE_STATES.includes(s.state)) ?? null;
   const liveApp = liveSession ? apps.find((a) => a.id === liveSession.app_id) ?? null : null;
   const isLive = liveSession?.app_id === app.id;
-  const isBlocked = blockedFamilyIds(apps, liveSession?.app_id ?? null).has(app.id);
+  const sharedHome = liveSession?.shared_home_app_id ?? null;
+  const isBlocked = blockedFamilyIds(apps, liveSession?.app_id ?? null, sharedHome).has(app.id);
+  const sharedLibrary = sharedLibraryIds(apps, sharedHome).has(app.id);
   const blockedByName = liveApp ? familyRootApp(apps, liveApp)?.name ?? liveApp.name : null;
 
   // ── Profiles + the remembered per-game selection ─────────────────────────
@@ -377,6 +379,7 @@ export function useGamePage(app: App) {
     isLive,
     isBlocked,
     blockedByName,
+    sharedLibrary,
     liveSessionId: liveSession?.id ?? null,
     noH264,
     waitingForSlot: launch.waitingForSlot,

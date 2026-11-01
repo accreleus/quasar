@@ -195,7 +195,8 @@ func (m *Manager) gcConfirmOne(ctx context.Context, hostID, id string) (int, err
 				      WHERE uh.user_id=c.user_id AND COALESCE(a.parent_app_id,a.id)=c.canonical_app_id)
 				  AND NOT EXISTS (
 				      SELECT 1 FROM sessions s JOIN apps a ON a.id=s.app_id
-				      WHERE s.user_id=c.user_id AND COALESCE(a.parent_app_id,a.id)=c.canonical_app_id
+				      WHERE s.user_id=c.user_id
+				        AND (COALESCE(a.parent_app_id,a.id)=c.canonical_app_id OR s.shared_home_app_id=c.canonical_app_id)
 				        AND s.state NOT IN ('stopped','failed'))
 			`, *userID, canonical, hostID)
 			if err != nil {

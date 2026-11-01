@@ -199,7 +199,7 @@ func (s *Service) certificateSection(r *http.Request, upstreamTLS, directTLS boo
 		return accessCheckCertificate{
 			InUse: false,
 			NotInUseReason: "TLS is disabled on this control plane (QUASAR_TLS=off), so it serves no certificate. " +
-				"That is a supported configuration when something in front of it terminates TLS.",
+				"That is a supported configuration when a proxy in front of it terminates TLS and is named in QUASAR_TRUSTED_PROXIES: without one, nobody can sign in.",
 		}
 	}
 	info := s.manager.Current()

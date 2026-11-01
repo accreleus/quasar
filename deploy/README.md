@@ -598,9 +598,9 @@ docker compose -f deploy/docker-compose.yml \
                -f deploy/docker-compose.hardened.yml up -d
 ```
 
-It needs `QUASAR_PUBLIC_HOST` and `QUASAR_TLS_DIR` in `deploy/.env`. The setup
-wizard cannot create the first admin through Caddy (use `BOOTSTRAP_ADMIN_*`
-instead) until `QUASAR_TRUSTED_PROXIES` is set to this compose project's own bridge network
+It needs `QUASAR_PUBLIC_HOST`, `QUASAR_TLS_DIR` and `QUASAR_TRUSTED_PROXIES` in
+`deploy/.env`; `compose up` stops until all three are set. Nobody can set up or sign
+in through Caddy without `QUASAR_TRUSTED_PROXIES` (#604). Set it to this compose project's own bridge network
 — read it off `docker network inspect deploy_default` (e.g. `172.18.0.0/16`),
 never the enclosing `172.16.0.0/12`, which would trust every other Docker stack
 on the box.

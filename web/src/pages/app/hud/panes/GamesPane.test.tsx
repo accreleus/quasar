@@ -254,7 +254,7 @@ describe("GamesPane", () => {
     expect(new Set(classLists).size).toBe(3);
   });
 
-  it("explains a cross-host target instead of surfacing the raw error code", async () => {
+  it("explains a target with no library on this host without claiming it lives elsewhere (#813)", async () => {
     swapSession.mockRejectedValue(new ApiError(409, "home_not_provisioned", "home not provisioned"));
     const onSwapRejected = vi.fn();
     render(
@@ -270,8 +270,11 @@ describe("GamesPane", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Purple App/ }));
     await waitFor(() =>
-      expect(onSwapRejected).toHaveBeenCalledWith(expect.stringMatching(/library lives on another host/i)),
+      expect(onSwapRejected).toHaveBeenCalledWith(expect.stringMatching(/isn't set up on this host/i)),
     );
+    // A user whose Steam never started has no library on any host (#750).
+    expect(onSwapRejected).toHaveBeenCalledWith(expect.stringMatching(/start it once first/i));
+    expect(onSwapRejected).not.toHaveBeenCalledWith(expect.stringMatching(/another host/i));
   });
 
   // Adaptive external resolution: the caption used to promise the resolution

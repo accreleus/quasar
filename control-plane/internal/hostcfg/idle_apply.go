@@ -39,6 +39,8 @@ type IdleApplyAttempt struct {
 	AdmissionRestricted bool       `json:"admission_restricted"`
 	Remedy              *string    `json:"remedy"`
 	NextRetryAt         *time.Time `json:"next_retry_at"`
+	// Null unless an administrator released this uncertain attempt (amendment 51).
+	RecoveryRelease *RecoveryRelease `json:"recovery_release"`
 }
 
 type ApprovalFact struct {
@@ -430,12 +432,14 @@ func (s *Store) GetIdleApply(ctx context.Context, hostID, attemptID string) (Idl
 	var errorCode *string
 	var held bool
 	var expiry time.Time
+	var releaseRequested *time.Time
 	err := s.pool.QueryRow(ctx, `SELECT a.id::text,a.group_key,a.revision,a.approved_digest,a.prerequisites_digest,
 		a.state,t.phase,t.started_at,t.error_code,a.expires_at,
-		EXISTS(SELECT 1 FROM host_admission_restrictions r WHERE r.host_id=a.host_id AND r.owner_id=a.id AND r.owner_kind IN ('idle_apply','recovery'))
+		EXISTS(SELECT 1 FROM host_admission_restrictions r WHERE r.host_id=a.host_id AND r.owner_id=a.id AND r.owner_kind IN ('idle_apply','recovery')),
+		t.release_requested_at
 		FROM host_config_approvals a LEFT JOIN host_config_attempts t ON t.id=a.id
 		WHERE a.host_id=$1::uuid AND a.id=$2::uuid`, hostID, attemptID).
-		Scan(&result.AttemptID, &result.Group, &revision, &result.ContentSHA256, &result.PrerequisitesSHA256, &state, &attemptPhase, &startedAt, &errorCode, &expiry, &held)
+		Scan(&result.AttemptID, &result.Group, &revision, &result.ContentSHA256, &result.PrerequisitesSHA256, &state, &attemptPhase, &startedAt, &errorCode, &expiry, &held, &releaseRequested)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return result, ErrIdleAttemptNotFound
 	}
@@ -447,6 +451,9 @@ func (s *Store) GetIdleApply(ctx context.Context, hostID, attemptID string) (Idl
 	result.AdmissionRestricted = held
 	if attemptPhase != nil && *attemptPhase != "offered" {
 		result.Phase = *attemptPhase
+		if result.RecoveryRelease, err = s.recoveryRelease(ctx, hostID, *attemptPhase, releaseRequested); err != nil {
+			return result, err
+		}
 		if errorCode != nil && *errorCode != "" && (*attemptPhase == "failed" || *attemptPhase == "recovered" || *attemptPhase == "uncertain") {
 			remedy := "Configuration attempt failed: " + safeIdleErrorCode(*errorCode) + ". Review host diagnostics before retrying."
 			result.Remedy = &remedy

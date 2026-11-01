@@ -171,12 +171,14 @@ export function homeAppId(app: HomeApp): string {
 }
 
 /** Every other app sharing a home with the live session's app — i.e. every tile
- *  that home would refuse with `409 home_in_use` (spec §2.2). */
+ *  that home would refuse with `409 home_in_use` (spec §2.2) — plus the family
+ *  of the home it mounts as a shared home (`shared_home_app_id`, #1001). */
 export function blockedFamilyIds<T extends HomeApp>(
   apps: readonly T[],
   liveAppId: string | null,
+  sharedHomeAppId: string | null = null,
 ): Set<string> {
-  const blocked = new Set<string>();
+  const blocked = sharedLibraryIds(apps, sharedHomeAppId);
   if (!liveAppId) return blocked;
   const liveApp = apps.find((a) => a.id === liveAppId);
   if (!liveApp) return blocked;
@@ -187,6 +189,16 @@ export function blockedFamilyIds<T extends HomeApp>(
   }
   return blocked;
 }
+
+/** The Steam family a sharing desktop holds: shown in use and dimmed. */
+export function sharedLibraryIds<T extends HomeApp>(
+  apps: readonly T[],
+  sharedHomeAppId: string | null,
+): Set<string> {
+  return new Set(sharedHomeAppId ? apps.filter((a) => homeAppId(a) === sharedHomeAppId).map((a) => a.id) : []);
+}
+
+export const SHARED_LIBRARY_OPEN = "Your Steam library is open in the desktop. Close the desktop first.";
 
 /** The family's home-owning app, used to NAME the tile in 409 copy — spec §2.2
  *  requires the user-visible name (e.g. "Steam"), never a bare parent app id. */
@@ -215,6 +227,23 @@ export function presentLaunchError<T extends HomeApp & { name: string }>(
   reason?: string,
 ): LaunchErrorPresentation {
   const rootName = familyRootApp(apps, app)?.name ?? app.name;
+  // semantics: control-api.md §Storage (amendment 53)
+  if (code === "home_in_use" && reason === "steam_library_open_in_desktop") {
+    return {
+      variant: "danger",
+      title: "Your Steam library is open in the desktop",
+      body: "Close the desktop first.",
+      sessionId,
+    };
+  }
+  if (code === "home_in_use" && reason === "steam_game_running") {
+    return {
+      variant: "danger",
+      title: "Close your Steam game first",
+      body: "This desktop shares your Steam library, and a Steam game is using it.",
+      sessionId,
+    };
+  }
   if (code === "home_in_use") {
     return {
       variant: "danger",

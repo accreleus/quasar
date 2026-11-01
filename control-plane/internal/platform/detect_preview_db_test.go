@@ -128,6 +128,29 @@ func TestDetectPreviewRecordsTheBuildOnlyOnPreview(t *testing.T) {
 	}
 }
 
+// A rate-limited stable listing fails the run, but the preview tag (the registry's, not GitHub's)
+// is still read and recorded.
+func TestDetectPreviewSurvivesAFailedStableListing(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	store := NewStore(pool)
+
+	channel := ChannelPreview
+	src := twoReleaseSource()
+	src.listErr = errors.New("list releases: api.github.com answered 403 Forbidden")
+	rep, err := NewDetector(src, store, nil).WithEdge(&fakeEdge{}, channelIs(&channel)).
+		WithPreview(&fakePreview{raw: previewDoc(t, commitC)}).Detect(ctx)
+	if err == nil || !strings.Contains(err.Error(), "403 Forbidden") {
+		t.Fatalf("err = %v, want the failed listing reported", err)
+	}
+	if rep.PreviewCommit != commitC {
+		t.Fatalf("report = %+v, want the preview build read despite the listing", rep)
+	}
+	if rows, _ := store.Releases(ctx, ChannelPreview); len(rows) != 1 {
+		t.Fatalf("preview rows = %d, want 1", len(rows))
+	}
+}
+
 func TestDetectPreviewFailures(t *testing.T) {
 	notFound := fmt.Errorf("get tag: status 404: %w", images.ErrRegistryNotFound)
 	shape := fmt.Errorf("%w: two layers", images.ErrArtifactShape)

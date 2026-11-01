@@ -501,6 +501,11 @@
 /* ---------- PAGE ---------- */
 .main {
   overflow: auto;
+  /* The box that scrolls must also contain what it holds: an absolutely
+     positioned descendant (a .sr-only live region) would otherwise sit against
+     .app, escape this clip and make the document scroll, so a section jump
+     (scrollIntoView) drags the topbar and rail with it (issue 1013). */
+  position: relative;
   padding: var(--s6) var(--page-pad) var(--s10);
   min-width: 0;
 }
@@ -509,6 +514,7 @@
    own their own gutters (hero, rails, grid). */
 .main-home {
   overflow: visible;
+  position: static;
   padding: 0;
 }
 

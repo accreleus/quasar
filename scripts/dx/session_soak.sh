@@ -285,8 +285,8 @@ dx_require_safe "$TARGET" "admin bearer token" "$SOAK_TOKEN" "$DX_RE_TOKEN" \
   "A bearer token is base64url text. Re-mint with: scripts/dx/admin_token.sh --host $DX_HOST --fresh"
 
 if [ "$DX_HOST" = local ]; then
-  dx_info "soaking against the local stack (http://127.0.0.1:$DX_CP_PORT)"
-  QSOAK_API="http://127.0.0.1:$DX_CP_PORT" \
+  dx_info "soaking against the local stack (https://127.0.0.1:$DX_CP_TLS_PORT)"
+  QSOAK_API="https://127.0.0.1:$DX_CP_TLS_PORT" \
   QSOAK_TOKEN="$SOAK_TOKEN" \
     python3 "$DRIVER" "${DRV[@]}" >>"$RAW" &
   DRIVER_PID=$!

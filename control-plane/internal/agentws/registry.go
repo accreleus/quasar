@@ -70,6 +70,7 @@ type conn struct {
 	policyTyped               bool
 	consoleReports            atomic.Int32 // capacity reports carrying console_capabilities
 	policyIdle                bool
+	policyRecoveryRelease     bool // restart executor that takes config_policy_release
 	policyAccepted            []string
 	policyAcknowledged        atomic.Bool
 	policyInitialMapApplied   atomic.Bool
@@ -139,6 +140,13 @@ func (r *Registry) PolicyIdentity(hostID string) (string, string, bool) {
 		return "", "", false
 	}
 	return c.bootIncarnation, c.connectionIncarnation, true
+}
+
+// SupportsRecoveryRelease reports whether the host's current connection takes
+// config_policy_release (agent-api.md, amendment 51).
+func (r *Registry) SupportsRecoveryRelease(hostID string) bool {
+	c, ok := r.get(hostID)
+	return ok && c.policyRecoveryRelease
 }
 
 // NudgePolicyOffers asks the host's read loop to run its next-session offer

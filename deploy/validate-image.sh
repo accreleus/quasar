@@ -383,10 +383,16 @@ while IFS="$(printf '\t')" read -r check id arg; do
       else emit PASS "$id" "not baked (injected at run time)"; fi ;;
     agent_no_dt_needed)
       p=${arg%%|*}; tok=${arg#*|}
+      # ldd, not readelf: the runtime image has no binutils, and a missing tool piped into
+      # grep reads as "not found" = pass (#975). ldd also covers libraries the agent's own
+      # libraries pull in, which stop it starting on a host without them just the same. An
+      # ldd that cannot run or prints nothing is a FAIL, never a pass.
       if [ ! -e "$p" ]; then emit FAIL "$id" "agent binary missing at $p"
-      elif readelf -d "$p" 2>/dev/null | grep -i 'NEEDED' | grep -qi "$tok"; then
-        emit FAIL "$id" "hard-links $tok — binary cannot start on a host without it"
-      else emit PASS "$id" "no $tok DT_NEEDED"; fi ;;
+      elif ! deps=$(ldd "$p" 2>&1) || [ -z "$deps" ]; then
+        emit FAIL "$id" "cannot list the agent's libraries with ldd: $(printf '%s' "$deps" | head -1)"
+      elif printf '%s\n' "$deps" | grep -qi "$tok"; then
+        emit FAIL "$id" "links $tok — binary cannot start on a host without it"
+      else emit PASS "$id" "no $tok in the agent's libraries"; fi ;;
     agent_no_unresolved)
       if [ ! -e "$arg" ]; then emit FAIL "$id" "agent binary missing at $arg"
       else

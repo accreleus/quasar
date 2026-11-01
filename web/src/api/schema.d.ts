@@ -13,7 +13,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Register a new account (role always 'user'; invite-gated per instance settings). */
+        /**
+         * Register a new account (role always 'user'; invite-gated per instance settings).
+         * @description Amendment 50: served only over TLS (the HTTPS listener, or a proxy named in QUASAR_TRUSTED_PROXIES that forwards X-Forwarded-Proto: https). Any other request → 403 forbidden before the body is read; the message is for the user.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -39,7 +42,7 @@ export interface paths {
                     };
                 };
                 400: components["responses"]["ValidationFailed"];
-                /** @description registration_closed — the invitation system is off (default). */
+                /** @description registration_closed — the invitation system is off (default); or forbidden — the request did not arrive over TLS (amendment 50); show the message to the user. */
                 403: {
                     headers: {
                         [name: string]: unknown;
@@ -67,7 +70,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Log in; returns the opaque bearer access_token (field is access_token, not token). */
+        /**
+         * Log in; returns the opaque bearer access_token (field is access_token, not token).
+         * @description Amendment 50: served only over TLS (the HTTPS listener, or a proxy named in QUASAR_TRUSTED_PROXIES that forwards X-Forwarded-Proto: https). Any other request → 403 forbidden before the body is read; the message is for the user.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -91,6 +97,15 @@ export interface paths {
                     };
                 };
                 401: components["responses"]["Unauthorized"];
+                /** @description forbidden — the request did not arrive over TLS (amendment 50); show the message to the user. */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
                 426: components["responses"]["ClientTooOld"];
                 429: components["responses"]["RateLimited"];
             };
@@ -184,7 +199,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Change own password (revokes all tokens; must re-authenticate). */
+        /**
+         * Change own password (revokes all tokens; must re-authenticate).
+         * @description Amendment 50: served only over TLS (the HTTPS listener, or a proxy named in QUASAR_TRUSTED_PROXIES that forwards X-Forwarded-Proto: https). Any other request with a valid bearer token → 403 forbidden before the body is read; the message is for the user. Without a valid token the bearer middleware answers 401 first.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -210,6 +228,15 @@ export interface paths {
                 };
                 400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
+                /** @description forbidden — the request did not arrive over TLS (amendment 50); show the message to the user. */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
             };
         };
         delete?: never;
@@ -5207,9 +5234,8 @@ export interface paths {
          *     FORWARDED HEADERS SOFTEN ADVICE AND NOTHING ELSE. They are trivially spoofable by any
          *     client; the worst a hostile one achieves is making an admin-gated diagnostics page tell
          *     THEM that their own certificate is not in use. No access decision on this route reads
-         *     them. Amendment 33, the one exception on any route: POST /v1/setup/claim and the dev-only
-         *     POST /v1/dev/agent-session believe X-Forwarded-Proto from a peer named in
-         *     QUASAR_TRUSTED_PROXIES, and from no other peer.
+         *     them.
+         *     Amendments 33 and 50, the one exception: POST /v1/setup/claim, the dev-only POST /v1/dev/agent-session, POST /v1/auth/login, POST /v1/auth/register and POST /v1/me/password believe X-Forwarded-Proto from a peer named in QUASAR_TRUSTED_PROXIES, and from no other peer.
          *
          *     Admin-gated by the existing RequireAuth -> RequireAdmin middleware. It reflects the Host
          *     and Origin headers, so both are LENGTH-CAPPED (256 chars) and are only ever rendered as
@@ -6052,6 +6078,72 @@ export interface paths {
                         "application/json": components["schemas"]["IdleApplyConflict"];
                     };
                 };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/idle-apply/{attempt_id}/release-recovery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                attempt_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Release an uncertain restart attempt and its recovery hold (amendment 51).
+         * @description The explicit repair of an uncertain restart attempt. The body must acknowledge that the host's configuration is unverified. The request is recorded, audited once and sent to the agent as config_policy_release once its journal is reconciled; it lifts nothing. The recovery hold, the group's uncertain status and the host's draining status end only when the agent reports the attempt released. Every 4xx writes nothing. Normative behavior: control-api.md section "Releasing a recovery hold".
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    attempt_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["RecoveryHoldReleaseRequest"];
+                };
+            };
+            responses: {
+                /** @description Already released; nothing sent. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                /** @description Recorded; pending until the agent reports released. recovery_release.waiting_for says what it waits for. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                /** @description validation_failed: malformed host or attempt ID, or a body other than exactly {"acknowledge":"unverified"}. No write. */
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                /** @description No restart attempt with this ID on this host. No write. */
+                404: components["responses"]["NotFound"];
+                /** @description attempt_not_uncertain: the attempt is neither uncertain nor released. No write. */
+                409: components["responses"]["Conflict"];
             };
         };
         delete?: never;
@@ -8317,7 +8409,7 @@ export interface components {
                 id: string;
                 name: string;
             }[];
-            /** @description Amendment 40 (#602), ADDITIVE: a machine-readable cause under code. Present only on 503 no_host_available, as home_host_unavailable, when the launch is pinned to the host that holds the caller's home for this app and that host is offline or no longer enrolled. Only an admin clears it, so a client does not spend its automatic retry on it. Names no host. Open string: a client treats an unknown value as absent. */
+            /** @description Amendment 40 (#602), ADDITIVE: a machine-readable cause under code. On 503 no_host_available, home_host_unavailable: the launch is pinned to the host that holds the caller's home for this app (Amendment 53: or it is pinned to the host of the caller's Steam home for a sharing launch) and that host is offline or no longer enrolled. Only an admin clears it, so a client does not spend its automatic retry on it. Names no host. Amendment 53 (#1001), on 409 home_in_use: steam_library_open_in_desktop (the holder mounts the Steam library as a shared home) or steam_game_running (the refused launch shares the library and a Steam session holds it); absent when the holder is already stopping. Open string: a client treats an unknown value as absent. */
             reason?: string;
         };
         ErrorEnvelope: {
@@ -8698,6 +8790,8 @@ export interface components {
              * @description UI-P3, OPTIONAL. The shared runtime preset this app inherits its container configuration from. On create, absent/null = no preset = the app carries everything itself (today's behaviour). On patch it is TRI-STATE: absent = unchanged, explicit null = clear the reference, a uuid = set it. A uuid that does not resolve is 400 validation_failed at write time, never an FK error surfacing at launch. NOT a launch profile - see RuntimePreset. Note crud.decodeJSON sets DisallowUnknownFields(), so sending this to a control plane without the UI-P3 amendment is a hard 400 - deploy the control plane before the client.
              */
             runtime_preset_id?: string | null;
+            /** @description Amendment 53 (#1001). Absent = false on create, unchanged on patch. 400 validation_failed on a derived tile or a library provider app. */
+            share_steam_library?: boolean;
             /** @description UI-P5, OPTIONAL. The LAUNCH PROFILE ids a user may pick for this app. On create, absent or [] = unrestricted = today's behaviour. On patch: absent = UNCHANGED, [] = clear the allow-list (back to unrestricted), a non-empty array = replace it wholesale (it is a set, not an ordered list). EXPLICIT null IS 400 validation_failed. The contract gives null no meaning for this field - unlike default_profile_id and runtime_preset_id, where null explicitly means "clear" - and [] already says clear. Reinterpreting null would silently act on a value the caller clearly meant something by, which is exactly the defect fixed for the runtime-preset list fields. Every id must name a USER-VISIBLE launch profile (400 otherwise). A RUNG id (a stream profile) is not a launch profile and is rejected - the two id spaces look alike and differ only in table. Duplicates are deduped rather than rejected. SETTING IT WHILE profile_policy IS 'force' IS 400: that policy pins the app's launch profile, so no allow-list can ever apply. Switching an app TO 'force' CLEARS any stored list, even when the patch says nothing about it, so nothing can silently reactivate on a later switch back to 'prefer'. Note crud.decodeJSON sets DisallowUnknownFields(), so sending this to a control plane without the UI-P5 amendment is a hard 400 - deploy the control plane before the client. */
             launchable_profile_ids?: string[];
             /**
@@ -8845,6 +8939,11 @@ export interface components {
              * @enum {string}
              */
             app_launch_state?: "starting" | "client_only" | "game_running" | "game_exited";
+            /**
+             * Format: uuid
+             * @description Amendment 53 (#1001): the Steam app whose library this session mounts, null otherwise. Always serialized. While that session is live, every launch of that app's family is 409 home_in_use. A client may mark that family in use.
+             */
+            shared_home_app_id: string | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -8918,6 +9017,13 @@ export interface components {
         LaunchResponse: {
             session: components["schemas"]["Session"];
             signaling: components["schemas"]["SignalingCoords"];
+            /** @description Amendment 53 (#1001): present only when the app shares the user's Steam library and this launch runs without it (the caller has no Steam app, the Steam home is on a host this launch cannot run on, Steam may not run on this launch's host, or the Steam home needs operator review). Omitted, never empty. */
+            notice?: {
+                /** @enum {string} */
+                code: "steam_library_not_shared";
+                /** @description Display text; never branch on it. */
+                message: string;
+            };
         };
         SignalingCoords: {
             /** @description wss://<host>/v1/signal */
@@ -9298,13 +9404,36 @@ export interface components {
             content_sha256: components["schemas"]["RH05Digest"];
             prerequisites_sha256: components["schemas"]["RH05Digest"];
             /** @enum {string} */
-            phase: "waiting" | "offered" | "accepted" | "activating" | "awaiting_startup" | "verifying" | "applied" | "failed" | "recovery_verifying" | "recovery_awaiting_startup" | "recovered" | "uncertain" | "cancel_pending" | "revoked_unstarted";
+            phase: "waiting" | "offered" | "accepted" | "activating" | "awaiting_startup" | "verifying" | "applied" | "failed" | "recovery_verifying" | "recovery_awaiting_startup" | "recovered" | "uncertain" | "released" | "cancel_pending" | "revoked_unstarted";
             /** @description True only after durable agent acceptance is proven; unknown acceptance retains the admission hold. */
             started: boolean;
             admission_restricted: boolean;
             remedy?: string | null;
             /** Format: date-time */
             next_retry_at?: string | null;
+            /** @description Amendment 51. Null unless a release was requested or the attempt is released. */
+            recovery_release?: components["schemas"]["RecoveryRelease"] | null;
+        };
+        RecoveryRelease: {
+            /** @enum {string} */
+            state: "pending" | "released";
+            /**
+             * Format: date-time
+             * @description Null only for an attempt reconciled as released without a recorded request.
+             */
+            requested_at: string | null;
+            /**
+             * @description Null once released.
+             * @enum {string|null}
+             */
+            waiting_for: "agent_connection" | "agent_upgrade" | "agent_report" | null;
+        };
+        RecoveryHoldReleaseRequest: {
+            /**
+             * @description The administrator states that the host's configuration was never verified.
+             * @enum {string}
+             */
+            acknowledge: "unverified";
         };
         IdleApplyConflict: {
             error: components["schemas"]["Error"];
@@ -10064,7 +10193,7 @@ export interface components {
                 secure_context: boolean;
             };
             certificate: {
-                /** @description False under topology C, and false when QUASAR_TLS=off. Both are supported, complete configurations. */
+                /** @description False under topology C, and false when QUASAR_TLS=off. Topology C is a supported, complete configuration, and so is QUASAR_TLS=off behind a proxy named in QUASAR_TRUSTED_PROXIES; QUASAR_TLS=off with no named proxy cannot serve sign-in (amendment 50). */
                 in_use: boolean;
                 /** @description Operator-facing prose stating that the setup is supported and what to look at instead. Present only when in_use is false. */
                 not_in_use_reason?: string;
@@ -10311,6 +10440,8 @@ export interface components {
             managed_home: boolean;
             /** @description P5-01: container path where the home is mounted (default /home/quasar). */
             home_container_path: string;
+            /** @description Amendment 53 (#1001): this app's sessions also mount the user's Steam data dir, on the same host, holding the Steam home's single-writer lock. Refused (400) on a derived tile and on a library provider app. See control-api.md §Storage. */
+            share_steam_library: boolean;
             /**
              * Format: uuid
              * @description UI-P3: the runtime preset this app inherits its container configuration from, or null when the app carries everything itself (the pre-UI-P3 behaviour). Always serialized. This is the app's OWN stored column - the preset is NEVER flattened into runtime_spec here; the merge happens server-side at launch, so this read shape shows the operator exactly what they configured. Admin-only, like runtime_spec: a preset is container configuration, not library presentation, so it is deliberately NOT on AppListItem.

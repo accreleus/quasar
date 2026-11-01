@@ -132,7 +132,7 @@ run_local() {
         dx_warn web "web/dist does not exist — the SPA will 404; run: cd web && npm install && npm run build"
       fi
       if dx_local_compose up -d --build --wait; then
-        dx_pass up "stack running — http://127.0.0.1:${DX_CP_PORT}/"
+        dx_pass up "stack running — sign in at https://127.0.0.1:${DX_CP_TLS_PORT}/ (self-signed; the HTTP port refuses sign-in)"
       else
         dx_fail up "compose up failed — check: make logs"
       fi
@@ -170,7 +170,7 @@ run_local() {
       dx_info "local redeploy-cp = compose build + force-recreate control-plane only (project=$QUASAR_INSTANCE)"
       if dx_local_compose up -d --build --force-recreate --no-deps --wait \
            --wait-timeout 300 control-plane; then
-        dx_pass redeploy-cp "control-plane rebuilt and healthy — http://127.0.0.1:${DX_CP_PORT}/"
+        dx_pass redeploy-cp "control-plane rebuilt and healthy — https://127.0.0.1:${DX_CP_TLS_PORT}/"
       else
         dx_fail redeploy-cp "control-plane redeploy failed — check: make logs S=control-plane"
       fi

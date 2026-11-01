@@ -219,6 +219,49 @@ func TestLaunchAndSwapCarryTheResolvedRegionValues(t *testing.T) {
 	}
 }
 
+// holdImages parks a launch between its 201 and its dispatch, until released.
+type holdImages struct{ release chan struct{} }
+
+func (h holdImages) PrepareLazyImage(ctx context.Context, _, _ string) error {
+	select {
+	case <-h.release:
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+func TestASaveAfterTheLaunchResponseWaitsForTheNextLaunch(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	ctx := context.Background()
+	restoreRegionDefaultsAtEnd(t, f.pool)
+	hold := holdImages{release: make(chan struct{})}
+	f.coord.SetLazyImagePreparer(hold)
+	if _, _, err := f.store.SaveRegionInput(ctx, f.userID, func(r *RegionInput) { r.Region.Timezone = strp("Asia/Seoul") }); err != nil {
+		t.Fatal(err)
+	}
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.appID, DeviceID: f.deviceID})
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	// The PATCH commits after the 201 and before the dispatch.
+	if _, _, err := f.store.SaveRegionInput(ctx, f.userID, func(r *RegionInput) { r.Region.Timezone = strp("Africa/Cairo") }); err != nil {
+		t.Fatal(err)
+	}
+	close(hold.release)
+	if env := envOf(t, f.disp.assignFor(t, res.Session.ID).App); env["TZ"] != "Asia/Seoul" {
+		t.Errorf("TZ = %q, want the value saved before the launch", env["TZ"])
+	}
+	f.ended(t, res.Session.ID)
+
+	next, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.appID, DeviceID: f.deviceID})
+	if err != nil {
+		t.Fatalf("next launch: %v", err)
+	}
+	if env := envOf(t, f.disp.assignFor(t, next.Session.ID).App); env["TZ"] != "Africa/Cairo" {
+		t.Errorf("next launch TZ = %q, want the saved value", env["TZ"])
+	}
+}
+
 func TestAParkedSessionIsAssignedTheRegionValues(t *testing.T) {
 	f := newWarmFixture(t, 8)
 	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = '{"timezone":"Europe/Madrid"}' WHERE id = $1::uuid`, f.deviceID))

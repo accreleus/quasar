@@ -60,6 +60,7 @@ pub struct OperatorInputs {
     pub public_host: Option<String>,
     pub tls_hosts: Option<String>,
     pub trusted_proxies: Option<String>,
+    pub hsts_max_age: Option<String>,
     pub http_port: Option<String>,
     pub tls_port: Option<String>,
     pub database_host: Option<String>,
