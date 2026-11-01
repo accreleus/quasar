@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.5.2 — 2026-11-01
+
 ### Upgrading
 - **Sign-in now needs HTTPS: if your reverse proxy talks to the control plane's HTTP port, name it in `QUASAR_TRUSTED_PROXIES` before you update, or nobody can sign in afterwards (#604).** The proxy must also send `X-Forwarded-Proto: https`: Caddy does by default, nginx needs `proxy_set_header X-Forwarded-Proto $scheme;`. On a Compose install set it in `deploy/.env`; on an owned install run `docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_TRUSTED_PROXIES=<proxy address>`. A proxy pointed at the HTTPS port, or a browser that opens the HTTPS port directly, needs nothing. The bundled hardened Caddy overlay talks to the HTTP port, so it now requires the variable: `compose up` stops with an error naming it until it is set, and the stack you had keeps running (`docs/operations/hardened-deployment.md`). Your 0.5.1 control plane told you if this is you: it logged `credential-route-plaintext` or `forwarded-from-unlisted-peer`. Users already signed in keep working until their sign-in expires (24 h by default). `QUASAR_TLS=off` with no named proxy can no longer sign anyone in.
 - **This release changes the database (migrations 0109 and 0110), so there is no going back below it.** Once applied, an older control plane will not start. For Quasar's own database the way back is a restore of the dump the update takes first (`docs/upgrading.md`, "The one-way migration rule"); on your own database, back up first. Fleet ▸ Releases ▸ Update Quasar waits for live sessions to end before it replaces the control plane (or tick "Update now" to end them), and automatic updates never install a release that changes the database.
