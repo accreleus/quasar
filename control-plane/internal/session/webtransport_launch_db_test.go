@@ -538,6 +538,10 @@ func TestTransportTokenIsRateLimitedPerSession(t *testing.T) {
 	if n := len(f.disp.transportTokenCmds()); n != statsRateBurst {
 		t.Errorf("the limited request reached the agent: %d commands, want %d", n, statsRateBurst)
 	}
+	// The bucket is the session's, not the spelling of its id in the URL.
+	if status, _ := f.transportToken(t, strings.ToUpper(id), f.userTok); status != http.StatusTooManyRequests {
+		t.Errorf("the same id uppercased: %d, want 429 (one bucket per session)", status)
+	}
 	// Per session: another session's bucket is untouched.
 	if status, _ := f.transportToken(t, otherLaunch, f.userTok); status != http.StatusCreated {
 		t.Errorf("a second session was limited by the first: %d", status)

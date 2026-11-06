@@ -712,7 +712,7 @@ func (h *Handler) handleTransportToken(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not get session")
 		return
 	}
-	if h.statsLimiter != nil && !h.statsLimiter.allow(id+"/transport-token") {
+	if h.statsLimiter != nil && !h.statsLimiter.allow(sess.ID+"/transport-token") {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited, "too many transport token requests; slow down")
 		return
 	}
