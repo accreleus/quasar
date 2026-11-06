@@ -68,7 +68,10 @@ it("runs on the adapter the run expects: decoder paths and subgroup size", () =>
   expect(device.adapterInfo.subgroupMinSize).toBe(expectedSubgroupMin);
 });
 
-describe.each(expectedPaths)("PyroWaveDecoder on the golden fixtures, %s path", (path) => {
+// The fallback path needs no optional feature, so it runs on every adapter.
+const allPaths: DecoderPath[] = [...expectedPaths, "fallback"];
+
+describe.each(allPaths)("PyroWaveDecoder on the golden fixtures, %s path", (path) => {
   const bar = manifest.decoder_bar;
 
   it.each(manifest.fixtures.map((f) => [f.name, f] as const))("%s meets the decoder bar", async (_name, f) => {
@@ -86,6 +89,27 @@ describe.each(expectedPaths)("PyroWaveDecoder on the golden fixtures, %s path", 
       expect(r.maxAbs, `${r.plane} max error`).toBeLessThanOrEqual(bar.max_abs_err);
     }
   });
+});
+
+it("a device without subgroups or shader-f16 chooses the fallback path and meets the decoder bar", async () => {
+  const adapter = (await navigator.gpu.requestAdapter())!;
+  const bare = await adapter.requestDevice();
+  expect(bare.features.has("subgroups") || bare.features.has("shader-f16")).toBe(false);
+  for (const f of manifest.fixtures) {
+    const { header, frames } = parsePwv1(await fixture(f.pwv1.file));
+    const decoder = await PyroWaveDecoder.create(bare, header, { maxPixels: header.width * header.height });
+    expect(decoder.path).toBe("fallback");
+    decoder.decode([frames[0]], null);
+    const got = planes(await decoder.readI420(), f.width, f.height);
+    const want = planes(await fixture(f.ref.file), f.width, f.height);
+    decoder.destroy();
+    for (let i = 0; i < 3; i++) {
+      const r = compare(got[i], want[i]);
+      expect(r.psnr, `${f.name} plane ${i} PSNR`).toBeGreaterThanOrEqual(manifest.decoder_bar.min_psnr_db);
+      expect(r.maxAbs, `${f.name} plane ${i} max error`).toBeLessThanOrEqual(manifest.decoder_bar.max_abs_err);
+    }
+  }
+  bare.destroy();
 });
 
 describe("hostile input", () => {
@@ -124,9 +148,9 @@ describe("hostile input", () => {
 describe("hostile input: sign bits", () => {
   // Fill the decoder's GPU payload buffer with `fill`, then decode a frame whose last block lost its
   // sign bits: none of its reads may reach what the buffer held before.
-  async function decodeOverStale(fill: number): Promise<Uint8Array> {
+  async function decodeOverStale(fill: number, forcePath?: DecoderPath): Promise<Uint8Array> {
     const { header, frames } = parsePwv1(await fixture("detail_320x192_xhi.pwv1"));
-    const decoder = await PyroWaveDecoder.create(device, header, { maxPixels: header.width * header.height });
+    const decoder = await PyroWaveDecoder.create(device, header, { maxPixels: header.width * header.height, forcePath });
     const n = blockLayout(header.width, header.height).totalBlocks;
     const stale = Array.from({ length: n }, (_, i) => {
       // ballot 0: an all-zero block with 1192 free bytes. 165 KB in all: more than the frame below,
@@ -155,8 +179,8 @@ describe("hostile input: sign bits", () => {
     return out;
   }
 
-  it("a block with its sign bits cut off decodes the same over a stale buffer of 0x00 or 0xff", async () => {
-    expect(await decodeOverStale(0x00)).toEqual(await decodeOverStale(0xff));
+  it.each([undefined, "fallback"] as const)("a block with its sign bits cut off decodes the same over a stale buffer of 0x00 or 0xff (path %s)", async (path) => {
+    expect(await decodeOverStale(0x00, path)).toEqual(await decodeOverStale(0xff, path));
   });
 });
 

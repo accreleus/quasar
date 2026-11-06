@@ -6,8 +6,10 @@ import { dequantWGSL, idwtWGSL, yuvToRgbWGSL } from "./shaders";
 
 export { PyroWaveError, type PyroWaveErrorReason } from "./bitstream";
 
-/** fast: subgroups + shader-f16. fallback: neither, or f16 alone (B06, #1055; not built yet). */
+/** fast: subgroups + shader-f16 storage. fallback (#1055): no subgroups, fp32 even with shader-f16. */
 export type DecoderPath = "fast" | "subgroups-fp32" | "fallback";
+
+const PATH_NEEDS: Record<DecoderPath, GPUFeatureName[]> = { fast: ["subgroups", "shader-f16"], "subgroups-fp32": ["subgroups"], fallback: [] };
 
 export function chooseDecoderPath(features: ReadonlySet<string>): DecoderPath {
   if (!features.has("subgroups")) return "fallback";
@@ -38,8 +40,8 @@ interface Pipelines {
   rgb: GPURenderPipeline;
 }
 
-// Compiled once per device and storage precision; a decoder per configuration reuses them.
-const pipelineCache = new WeakMap<GPUDevice, Map<boolean, Promise<Pipelines>>>();
+// Compiled once per device and path; a decoder per configuration reuses them.
+const pipelineCache = new WeakMap<GPUDevice, Map<DecoderPath, Promise<Pipelines>>>();
 // create() runs one at a time per device, so no other create() pushes or pops between its own.
 const createChain = new WeakMap<GPUDevice, Promise<unknown>>();
 // Kept per device, not per decoder: a decoder's own lost handler would keep it alive as long as the device.
@@ -53,15 +55,16 @@ async function checked(device: GPUDevice, code: string): Promise<GPUShaderModule
   return module;
 }
 
-function pipelines(device: GPUDevice, f16: boolean): Promise<Pipelines> {
-  let byPrecision = pipelineCache.get(device);
-  if (!byPrecision) pipelineCache.set(device, (byPrecision = new Map()));
-  let p = byPrecision.get(f16);
+function pipelines(device: GPUDevice, path: DecoderPath): Promise<Pipelines> {
+  let byPath = pipelineCache.get(device);
+  if (!byPath) pipelineCache.set(device, (byPath = new Map()));
+  let p = byPath.get(path);
   if (!p) {
+    const f16 = path === "fast";
     p = (async () => {
       const rgbModule = await checked(device, yuvToRgbWGSL);
       const [dq, idwt, rgb] = await Promise.all([
-        checked(device, dequantWGSL(f16)).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
+        checked(device, dequantWGSL(f16, path !== "fallback")).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
         checked(device, idwtWGSL(f16)).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
         device.createRenderPipelineAsync({
           layout: "auto",
@@ -72,9 +75,9 @@ function pipelines(device: GPUDevice, f16: boolean): Promise<Pipelines> {
       ]);
       return { dq, idwt, rgb };
     })();
-    const cache = byPrecision;
-    p.catch(() => cache.delete(f16));
-    byPrecision.set(f16, p);
+    const cache = byPath;
+    p.catch(() => cache.delete(path));
+    byPath.set(path, p);
   }
   return p;
 }
@@ -119,9 +122,7 @@ export class PyroWaveDecoder {
 
   private static async createNow(device: GPUDevice, header: PyroWaveHeader, options: DecoderOptions): Promise<PyroWaveDecoder> {
     const path = options.forcePath ?? chooseDecoderPath(device.features);
-    const needs = path === "fast" ? ["subgroups", "shader-f16"] : ["subgroups"];
-    if (path === "fallback" || !needs.every((f) => device.features.has(f)))
-      throw new PyroWaveError("no_subgroups", `the device cannot run the ${path} path; the fallback decoder is not built yet (#1055)`);
+    if (!PATH_NEEDS[path].every((f) => device.features.has(f))) throw new PyroWaveError("no_subgroups", `the device cannot run the ${path} path`);
     const f16 = path === "fast";
     const { width: w, height: h } = header;
     const tooLarge = (what: string) => new PyroWaveError("too_large", `${w}x${h}: ${what}`);
@@ -134,7 +135,7 @@ export class PyroWaveDecoder {
     const maxBytes = Math.min(limits.maxStorageBufferBindingSize, limits.maxBufferSize);
     for (const [name, bytes] of Object.entries(sizes)) if (bytes > maxBytes) throw tooLarge(`${name} needs ${bytes} bytes, the device allows ${maxBytes}`);
 
-    const pipes = await pipelines(device, f16);
+    const pipes = await pipelines(device, path);
     const owned: GPUBuffer[] = [];
     let texture: GPUTexture | undefined;
     device.pushErrorScope("out-of-memory");

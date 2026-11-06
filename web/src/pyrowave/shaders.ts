@@ -8,15 +8,16 @@ const toHi = (hi: string) =>
   hi === "f16" ? "fn to_hi(v: f32) -> f16 { return f16(clamp(v, -65504.0, 65504.0)); }" : "fn to_hi(v: f32) -> f32 { return v; }";
 
 /**
- * Dequantise every block of a frame, one 128-lane workgroup per 32x32 block. Needs `subgroups`
- * (the no-subgroup path is B06, #1055). A block whose offset is BLOCK_LOST is not written, so its
- * coefficients stay those of the last frame that had it: block concealment (amendment 55 §Loss).
+ * Dequantise every block of a frame, one 128-lane workgroup per 32x32 block. Without `subgroups`
+ * (the fallback path, #1055) the sign-bit scan runs in workgroup memory instead. A block whose
+ * offset is BLOCK_LOST is not written, so its coefficients stay those of the last frame that had
+ * it: block concealment (amendment 55 §Loss).
  */
-export function dequantWGSL(f16: boolean): string {
+export function dequantWGSL(f16: boolean, subgroups: boolean): string {
   const HI = f16 ? "f16" : "f32";
   return /* wgsl */ `
 ${f16 ? "enable f16;" : ""}
-enable subgroups;
+${subgroups ? "enable subgroups;" : ""}
 struct Band { block_offset: u32, blocks_x: u32, block_count: u32, out_base: u32,
               width: u32, height: u32, lo: u32, pad: u32 };
 struct Params { num_bands: u32, wg_stride: u32, total_blocks: u32, p1: u32, bands: array<Band, 64> };
@@ -34,7 +35,7 @@ const BLOCK_LOST = 0xfffffffeu;
 var<workgroup> sh_plane_off: array<u32, 16>;
 var<workgroup> sh_sign_off: u32;
 var<workgroup> sh_scan: array<u32, 128>;
-var<workgroup> sh_sgid: atomic<u32>;
+${subgroups ? "var<workgroup> sh_sgid: atomic<u32>;" : ""}
 
 fn rd8(b: u32) -> u32 { return (payload[b >> 2u] >> ((b & 3u) * 8u)) & 0xffu; }
 fn rd16(h: u32) -> u32 { return (payload[h >> 1u] >> ((h & 1u) * 16u)) & 0xffffu; }
@@ -54,19 +55,23 @@ fn plane_bytes(cw: u32, qb: u32) -> u32 {
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3u,
-        @builtin(subgroup_invocation_id) sgi: u32, @builtin(subgroup_size) sgs: u32) {
+        ${subgroups ? "@builtin(subgroup_invocation_id) sgi: u32, @builtin(subgroup_size) sgs: u32" : "@builtin(local_invocation_index) li: u32"}) {
   let bi = wg.y * params.wg_stride + wg.x;
   if (bi >= params.total_blocks) { return; }
   let off = offsets[bi];
   if (off == BLOCK_LOST) { return; }
   let d = params.bands[block_band[bi]];
 
-  // WGSL has no gl_SubgroupID and no fixed lane order: build upstream's linear lane index
+${
+    subgroups
+      ? `  // WGSL has no gl_SubgroupID and no fixed lane order: build upstream's linear lane index
   // (subgroup id * size + lane) from a workgroup-atomic ticket per subgroup.
   var mine = 0u;
   if (subgroupElect()) { mine = atomicAdd(&sh_sgid, 1u); }
   let sg_id = subgroupBroadcastFirst(mine);
-  let li = sg_id * sgs + sgi;
+  let li = sg_id * sgs + sgi;`
+      : ""
+  }
 
   let rel = bi - d.block_offset;
   let blk = vec2u(rel % d.blocks_x, rel / d.blocks_x);
@@ -140,14 +145,28 @@ fn main(@builtin(workgroup_id) wg: vec3u,
   }
 
   // Exclusive scan of significant counts over the block, in lane order -> sign bit offset.
-  let nsg = 128u / sgs;
+${
+  subgroups
+    ? `  let nsg = 128u / sgs;
   let si = subgroupInclusiveAdd(sig);
   if (sgi == sgs - 1u) { sh_scan[sg_id] = si; }
   workgroupBarrier();
   if (li == 0u) { for (var i = 1u; i < nsg; i++) { sh_scan[i] += sh_scan[i - 1u]; } }
   workgroupBarrier();
   var excl = si - sig;
-  if (sg_id != 0u) { excl += sh_scan[sg_id - 1u]; }
+  if (sg_id != 0u) { excl += sh_scan[sg_id - 1u]; }`
+    : `  // Upstream's scan_subgroups_fallback with one lane per subgroup: Hillis-Steele over 128 lanes.
+  sh_scan[li] = sig;
+  workgroupBarrier();
+  for (var s = 1u; s < 128u; s <<= 1u) {
+    var up = 0u;
+    if (li >= s) { up = sh_scan[li - s]; }
+    workgroupBarrier();
+    sh_scan[li] += up;
+    workgroupBarrier();
+  }
+  let excl = sh_scan[li] - sig;`
+}
 
   let so = sh_sign_off + excl;
   var sw = payload[so / 32u];

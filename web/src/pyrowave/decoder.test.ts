@@ -11,8 +11,8 @@ describe("chooseDecoderPath", () => {
     expect(chooseDecoderPath(new Set(features))).toBe(path);
   });
 
-  it("refuses a device without subgroups until the fallback decoder exists", async () => {
-    const device = { features: new Set<string>(), lost: new Promise(() => {}) } as unknown as GPUDevice;
-    await expect(PyroWaveDecoder.create(device, { width: 64, height: 64, fullRange: false }, { maxPixels: 64 * 64 })).rejects.toThrow(/#1055/);
+  it.each(["fast", "subgroups-fp32"] as const)("refuses a forced %s path on a device without subgroups", async (forcePath) => {
+    const device = { features: new Set<string>(["shader-f16"]), lost: new Promise(() => {}) } as unknown as GPUDevice;
+    await expect(PyroWaveDecoder.create(device, { width: 64, height: 64, fullRange: false }, { maxPixels: 64 * 64, forcePath })).rejects.toMatchObject({ reason: "no_subgroups" });
   });
 });
