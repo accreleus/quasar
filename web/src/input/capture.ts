@@ -29,6 +29,7 @@
 // (matched by pointerId, so chrome taps are never seen here).
 
 import { EVDEV, MB_MAP } from "./evdev";
+import { detectPadEnv, isRemapped, remapGamepad, type PadEnv } from "./gamepadRemap";
 import { createMouseScaler, mouseGain, NEUTRAL_MOUSE, type MouseSettings } from "./mouseScale";
 import { isSendEscCombo, isSummonCombo, sendEscComboEnabled } from "./summonCombo";
 import { pointerLockSupported } from "./support";
@@ -50,14 +51,33 @@ export interface GamepadIdentity {
   index: number;
   id: string;
   mapping: string;
+  /** Set when gamepadRemap.ts translates this pad into the standard layout. */
+  remapped?: boolean;
 }
 
 /** True when the browser recognised the pad and exposes it in the W3C
  *  Standard Gamepad layout. Anything else (`""` for an unrecognised pad) is the
  *  device's own HID order: buttons land on the wrong W3C indices and the d-pad
  *  is usually a hat on an axis (quasar#348). */
-export function isStandardMapping(pad: { mapping: string }): boolean {
-  return pad.mapping === "standard";
+export function isStandardMapping(pad: { mapping: string; remapped?: boolean }): boolean {
+  return pad.mapping === "standard" || pad.remapped === true;
+}
+
+/** Who the pad is, and whether the remap table translates it. Lengths only: builds no arrays. */
+function padIdentity(pad: Gamepad, env: PadEnv): GamepadIdentity {
+  const identity: GamepadIdentity = { index: pad.index, id: pad.id, mapping: pad.mapping };
+  if (pad.mapping !== "standard" && isRemapped(pad.id, pad.buttons.length, pad.axes.length, env)) identity.remapped = true;
+  return identity;
+}
+
+/** One pad's state as it goes on the wire, translated when the remap table knows it. */
+function readPad(pad: Gamepad, env: PadEnv) {
+  let buttons = Array.from(pad.buttons, (b) => b.value);
+  let axes = Array.from(pad.axes, (a) => Math.round(a * 1000) / 1000);
+  const identity = padIdentity(pad, env);
+  const mapped = identity.remapped ? remapGamepad(pad.id, buttons, axes, env) : null;
+  if (mapped) ({ buttons, axes } = mapped);
+  return { buttons, axes, identity };
 }
 
 /** AS10-13: snapshot of input-pipeline health, sampled each telemetry poll. */
@@ -285,6 +305,7 @@ export function setupCapture({
 
   // Gamepad state for delta-only sends.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
+  const padEnv = detectPadEnv();
   // Pad ids already reported through onNonStandardGamepad (one notice each).
   const nonStandardReported = new Set<string>();
   let rafId: number;
@@ -886,22 +907,23 @@ export function setupCapture({
       const pads = navigator.getGamepads ? navigator.getGamepads() : [];
       for (const pad of pads) {
         if (!pad) continue;
-        const buttons = Array.from(pad.buttons, (b) => b.value);
+        const { buttons, axes, identity } = readPad(pad, padEnv);
         // Standard layout only: on any other pad the indices are the device's own order.
-        if (mouseSettings.nintendo && buttons.length > 3 && isStandardMapping(pad)) {
+        if (mouseSettings.nintendo && buttons.length > 3 && isStandardMapping(identity)) {
           swapButtons(buttons, 0, 1); // A (bottom) with B (right)
           swapButtons(buttons, 2, 3); // X (left) with Y (top)
         }
-        const axes = Array.from(pad.axes, (a) => Math.round(a * 1000) / 1000);
         const prev = gpPrev[pad.index];
         const changed =
           !prev ||
+          buttons.length !== prev.buttons.length ||
+          axes.length !== prev.axes.length ||
           buttons.some((v, i) => v !== prev.buttons[i]) ||
           axes.some((v, i) => v !== prev.axes[i]);
         if (changed) {
-          if (!isStandardMapping(pad) && !nonStandardReported.has(pad.id)) {
+          if (!isStandardMapping(identity) && !nonStandardReported.has(pad.id)) {
             nonStandardReported.add(pad.id);
-            onNonStandardGamepad?.({ index: pad.index, id: pad.id, mapping: pad.mapping });
+            onNonStandardGamepad?.(identity);
           }
           send({ t: "gp", i: pad.index, buttons, axes });
           gpSendCount++;
@@ -933,7 +955,7 @@ export function setupCapture({
     for (const p of rawPads) {
       if (!p) continue;
       gamepadCount++;
-      padIdentities.push({ index: p.index, id: p.id, mapping: p.mapping });
+      padIdentities.push(padIdentity(p, padEnv));
     }
 
     const snapshot: CaptureMetrics = {
