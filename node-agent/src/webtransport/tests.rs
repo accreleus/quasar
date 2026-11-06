@@ -493,7 +493,11 @@ async fn a_live_agent_streams_h264_to_the_conformance_client() {
     let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is unset"));
     let hashes = var("QUASAR_WT_CERT_HASHES")
         .split(',')
-        .map(|h| base64::engine::general_purpose::STANDARD.decode(h.trim()).unwrap())
+        .map(|h| {
+            base64::engine::general_purpose::STANDARD
+                .decode(h.trim())
+                .unwrap()
+        })
         .collect();
     let session = ClientBuilder::new()
         .with_server_certificate_hashes(hashes)
@@ -510,7 +514,10 @@ async fn a_live_agent_streams_h264_to_the_conformance_client() {
     let got = frames(&session, 300, false).await;
     assert!(got[0].keyframe && nal_types(&got[0].data).contains(&5));
     for pair in got.windows(2) {
-        assert!(pair[1].capture_us >= pair[0].capture_us, "capture time rises");
+        assert!(
+            pair[1].capture_us >= pair[0].capture_us,
+            "capture time rises"
+        );
     }
     for f in &got {
         nal_types(&f.data);
@@ -528,7 +535,10 @@ async fn a_live_agent_streams_h264_to_the_conformance_client() {
         got.iter().filter(|f| f.keyframe).count(),
         got.iter().map(|f| f.data.len()).sum::<usize>()
     );
-    write_message(&mut send, &json!({"type": "bye", "reason": "client_closed"}))
-        .await
-        .unwrap();
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
 }

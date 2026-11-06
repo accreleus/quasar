@@ -398,8 +398,8 @@ impl Listener {
                         );
                     }
                     Err(error) => tracing::warn!(
-                        token = "webtransport-cert-rotation-failed",
-                        "WebTransport certificate rotation failed: {error:#}"
+                        token = "webtransport-cert-reload-failed",
+                        "WebTransport could not present its next certificate: {error:#}"
                     ),
                 }
             }
