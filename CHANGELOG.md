@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **The node agent serves H.264 video over WebTransport (#1029).** One QUIC listener per agent (`QUASAR_WT_PORT`, default 4433) with a short-lived self-signed certificate whose hashes ride every capacity report; a session the control plane assigns WebTransport accepts a client holding its single-use transport token and streams its access units as contract datagrams with the capture time. WebRTC is unchanged and stays every session's fallback. Experimental: audio, input, loss recovery and congestion control follow.
+
 ### Internal
 - **The platform image now builds the PyroWave C API (#1052).** `libpyrowave-shared`, its header and pkg-config file are built from a pinned PyroWave and Granite commit and installed into `/opt/gst`, and the image contract asserts they are there. Nothing uses it yet and a session streams exactly as before; it is the base for the Ultra-low latency (LAN) codec (#1048). This changes the toolchain pins, so the toolchain image is rebuilt once.
 - **ADRs 0012 and 0013: compatibility tools are a provider-neutral host resource, and the GE-Proton trust rules.** Records the decisions behind choosing and installing Proton for the library's Windows games (fleet-wide desired state, placement, mapping and fill-when-absent rules; github.com-only downloads verified by checksum, safe extraction, audit). Adds the glossary terms library provider, compatibility tool, tool mapping, forced mapping and recommended tool list. Docs only.
