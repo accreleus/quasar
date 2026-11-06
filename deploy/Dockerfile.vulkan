@@ -682,8 +682,9 @@ RUN find /opt/gst -name '*.a' -delete \
 # pyrowaveenc element (a later ticket) links libpyrowave-shared from /opt/gst and the runtime
 # stage's `COPY --from=build /opt/gst` carries it with no step of its own. Upstream's install
 # rules (no components) put libpyrowave-shared.so{,.1,.1.0.0}, pyrowave/pyrowave.h, the .pc, the
-# CMake config and bin/pyrowave-device-validation (why it is built) into /opt/gst; both MIT
-# licence texts go to share/licenses/ because the binary ships in a public image. Shaders ship precompiled upstream, so no shader compiler is needed;
+# CMake config and bin/pyrowave-device-validation (why it is built) into /opt/gst; the MIT
+# licence texts of PyroWave, Granite and volk (all compiled in) go to share/licenses/ because
+# the binary ships in a public image. Shaders ship precompiled upstream, so no shader compiler is needed;
 # Granite is the pinned subset checkout_granite.sh fetches (volk + vulkan-headers only).
 # checkout_granite.sh names its own Granite commit; GRANITE_REF must equal it or the build stops,
 # so the two pins cannot drift apart unnoticed. Placed after the static-archive strip: the
@@ -704,6 +705,7 @@ RUN set -eu; \
     && cmake --install build \
     && install -Dm644 LICENSE /opt/gst/share/licenses/pyrowave/LICENSE \
     && install -Dm644 Granite/LICENSE /opt/gst/share/licenses/granite/LICENSE \
+    && install -Dm644 Granite/third_party/volk/LICENSE.md /opt/gst/share/licenses/volk/LICENSE.md \
     && cd / && rm -rf /opt/pyrowave \
     && PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig pkg-config --exists pyrowave-shared \
     && echo "pyrowave-shared installed: $(PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig pkg-config --modversion pyrowave-shared)"
@@ -733,6 +735,7 @@ LABEL org.quasar.image.role="toolchain" \
       org.quasar.pins.plugins-rs="${GST_PLUGINS_RS_REF}" \
       org.quasar.pins.interpipe="${GST_INTERPIPE_REF}" \
       org.quasar.pins.pyrowave="${PYROWAVE_REF}" \
+      org.quasar.pins.granite="${GRANITE_REF}" \
       org.quasar.pins.rust="${RUST_VERSION}" \
       org.quasar.pins.cuda="${CUDA_PKG_VERSION}" \
       org.quasar.pins.base="${QUASAR_BASE_IMAGE}" \
