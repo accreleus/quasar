@@ -1,4 +1,5 @@
-//! The GStreamer audio encode branch (pulsesrc/silent fallback → Opus → RTP).
+//! The GStreamer audio encode branch (pulsesrc/silent fallback → Opus, then → RTP for
+//! WebRTC).
 //!
 //! Distinct from `super::super::audio`, which owns the per-session PulseAudio sidecar
 //! process lifecycle; this builds the in-pipeline capture/encode elements.
@@ -10,14 +11,63 @@ use gstreamer::prelude::*;
 use crate::session::audio::QUASAR_MONITOR_SOURCE_NAME;
 use crate::session::SessionConfig;
 
-/// Add + link the audio encode chain into `pipeline`, returning its tail (the send queue)
-/// for linking into webrtcbin. Shared by the single and split pipelines, so the audio path is
-/// identical in both.
+/// Add + link the WebRTC audio chain into `pipeline` (the Opus encode, then RTP), returning
+/// its tail (the send queue) for linking into webrtcbin. Shared by the single and split
+/// pipelines, so the audio path is identical in both.
 pub(super) fn add_audio_chain(
     pipeline: &gst::Pipeline,
     cfg: &SessionConfig,
     session_id: &str,
 ) -> Result<gst::Element> {
+    let (audio_src, opus_enc) = add_opus_encode(pipeline, cfg)?;
+    let rtp_opus_pay = gst::ElementFactory::make("rtpopuspay")
+        .property("pt", 111_u32)
+        .build()
+        .context("rtpopuspay not found")?;
+    let audio_rtp_caps = gst::Caps::builder("application/x-rtp")
+        .field("media", "audio")
+        .field("encoding-name", "OPUS")
+        .field("payload", 111_i32)
+        .field("clock-rate", 48_000_i32)
+        .build();
+    let audio_rtp_capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &audio_rtp_caps)
+        .build()
+        .context("capsfilter not found")?;
+    // Hands packets to `webrtcbin` on its own thread, so a stall on the send side (the
+    // wait for the peer's answer at every session start, or any later block) can never
+    // stop the capture thread and overrun the capture ring buffer (#351). Leaky, and
+    // bounded in time, so a stall costs the oldest packets rather than growing latency.
+    let audio_send_queue = gst::ElementFactory::make("queue")
+        .name("audio_send_queue")
+        .property_from_str("leaky", "downstream")
+        .property("max-size-time", 200_000_000_u64)
+        .property("max-size-buffers", 0_u32)
+        .property("max-size-bytes", 0_u32)
+        .build()
+        .context("queue not found")?;
+
+    pipeline.add_many([&rtp_opus_pay, &audio_rtp_capsfilter, &audio_send_queue])?;
+    gst::Element::link_many([
+        &opus_enc,
+        &rtp_opus_pay,
+        &audio_rtp_capsfilter,
+        &audio_send_queue,
+    ])
+    .context("failed to link audio encode chain")?;
+    if let Some(encoded) = audio_rtp_capsfilter.static_pad("src") {
+        super::audio_health::attach(&audio_src, &encoded, &audio_send_queue, session_id);
+    }
+    Ok(audio_send_queue)
+}
+
+/// Add + link the session's audio capture and Opus encode into `pipeline`: the audio half
+/// of the encoded-frame boundary, for any transport. Returns the capture source and the
+/// `opusenc`, whose src pad gives one 10 ms Opus packet per buffer (`opus/48000/2`).
+pub(super) fn add_opus_encode(
+    pipeline: &gst::Pipeline,
+    cfg: &SessionConfig,
+) -> Result<(gst::Element, gst::Element)> {
     let audio_src = if cfg.use_test_audio {
         // Pulse is optional, so keep the m-line alive without it. NEVER substitute a
         // synthetic tone for an application's audio: that makes the recovery path an
@@ -79,42 +129,12 @@ pub(super) fn add_audio_chain(
         .property_from_str("bitrate-type", "cbr")
         .build()
         .context("opusenc not found — is the GStreamer Opus plugin installed?")?;
-    let rtp_opus_pay = gst::ElementFactory::make("rtpopuspay")
-        .property("pt", 111_u32)
-        .build()
-        .context("rtpopuspay not found")?;
-    let audio_rtp_caps = gst::Caps::builder("application/x-rtp")
-        .field("media", "audio")
-        .field("encoding-name", "OPUS")
-        .field("payload", 111_i32)
-        .field("clock-rate", 48_000_i32)
-        .build();
-    let audio_rtp_capsfilter = gst::ElementFactory::make("capsfilter")
-        .property("caps", &audio_rtp_caps)
-        .build()
-        .context("capsfilter not found")?;
-    // Hands packets to `webrtcbin` on its own thread, so a stall on the send side (the
-    // wait for the peer's answer at every session start, or any later block) can never
-    // stop the capture thread and overrun the capture ring buffer (#351). Leaky, and
-    // bounded in time, so a stall costs the oldest packets rather than growing latency.
-    let audio_send_queue = gst::ElementFactory::make("queue")
-        .name("audio_send_queue")
-        .property_from_str("leaky", "downstream")
-        .property("max-size-time", 200_000_000_u64)
-        .property("max-size-buffers", 0_u32)
-        .property("max-size-bytes", 0_u32)
-        .build()
-        .context("queue not found")?;
-
     pipeline.add_many([
         &audio_src,
         &audio_convert,
         &audio_resample,
         &audio_raw_caps,
         &opus_enc,
-        &rtp_opus_pay,
-        &audio_rtp_capsfilter,
-        &audio_send_queue,
     ])?;
     gst::Element::link_many([
         &audio_src,
@@ -122,15 +142,9 @@ pub(super) fn add_audio_chain(
         &audio_resample,
         &audio_raw_caps,
         &opus_enc,
-        &rtp_opus_pay,
-        &audio_rtp_capsfilter,
-        &audio_send_queue,
     ])
     .context("failed to link audio encode chain")?;
-    if let Some(encoded) = audio_rtp_capsfilter.static_pad("src") {
-        super::audio_health::attach(&audio_src, &encoded, &audio_send_queue, session_id);
-    }
-    Ok(audio_send_queue)
+    Ok((audio_src, opus_enc))
 }
 
 /// Knob: `QUASAR_AUDIO_NO_CLOCK`. #304: sets `provide-clock=false` +
