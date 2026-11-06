@@ -19,14 +19,18 @@ name: CI
 #                          develop requires no checks, and a skipped job counts as passed
 #                          for main's. A wrong "skip" is caught by the push run after landing.
 #
+# A release integration branch (`integration/<version>`) gets the same two triggers: its
+# feature pull requests run the touched jobs, and a landing on it runs every job. The
+# branch is deleted once its release ships.
+#
 # A pull request into main from any branch but develop gets no automatic run: dispatch
 # this workflow on its branch (the runs attach to its head commit) before asking for
 # sign-off.
 on:
   push:
-    branches: [develop]
+    branches: [develop, 'integration/**']
   pull_request:
-    branches: [develop]
+    branches: [develop, 'integration/**']
   workflow_dispatch:
 
 # A newer push to a pull request cancels its older run. On develop runs queue instead: a

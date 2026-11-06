@@ -84,8 +84,8 @@ renumbered to their public issues.
 - **`main` = production.** Any merge INTO `main` requires **explicit human sign-off from the operator**. Never merge to `main` autonomously — not even a green feature branch.
 - **`develop` = persistent, unstable integration branch.** All day-to-day work targets it.
 - **Workflow:** branch off `develop` → do the work → merge **back into `develop`** with **no PR required**. Feature-branch → `develop` is self-serve; `develop` → `main` is the only sign-off gate. Default: `git checkout develop && git pull && git checkout -b <feature>`; land with `git checkout develop && git merge <feature>`. **A streaming-path change runs `make bench-check` before that merge** and closes out by publishing or updating its bench report (`make report-publish`, or `qbench sprint put` at sprint end) — see "Performance evidence (quasar-bench)" below and the landing sequence in `AGENTS.md`.
-- **CI runs on every push to `develop` (all jobs) and on pull requests into `develop` (only the
-  jobs whose area changed, `scripts/verify/ci-changed-areas.sh`).** The push run carries the
+- **CI runs on every push to `develop` or a release `integration/**` branch (all jobs) and on
+  pull requests into either (only the jobs whose area changed, `scripts/verify/ci-changed-areas.sh`).** The push run carries the
   checks `main` requires, so the develop → main release PR needs no run of its own. A pull request
   into `main` from any other branch gets no automatic run: dispatch CI on its branch first.
 - **Push branches to origin as you go — "no PR required" does not mean "no push".** Origin is
@@ -220,8 +220,12 @@ public repository deliberately, and is not in this
 repo's history — the wave-ladder facts on record are what follow. W0 (image
 consolidation, #367) and W1 (security wave, PR #374: invite-gated registration +
 device binding, migration 0020) are merged; W2 is active (console-mode ∥ Phase 9
-closure). Executed plans were archived under `docs/completed/plans/`, also non-public; going forward, plans (live and executed) are filed under
-`docs/superpowers/plans/`. **"What's active right now" lives in GitHub milestones + the
+closure). Executed plans were archived under `docs/completed/plans/`, also non-public. **Going forward there are no plan
+files:** a spec is a GitHub issue and its work is split into ticket issues (sub-issues with
+native blocked-by edges), per `docs/agents/issue-tracker.md`; decisions go in `docs/adr/`, terms
+in `CONTEXT.md`. `docs/superpowers/plans/` holds two older plans only. A release with
+long-running feature work uses an integration branch `integration/<version>` (CI runs on it);
+it merges into `develop` for pre-release and is deleted once the release ships. **"What's active right now" lives in GitHub milestones + the
 session memory `current-focus.md`, not this file.**
 
 **Standing operational defaults (knobs, not history):**
