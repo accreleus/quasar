@@ -4,6 +4,7 @@ package crud
 // the admin's public-URL override. semantics: control-api.md §WebTransport endpoint
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -63,12 +64,26 @@ func (h *Handler) handlePatchHostWebTransport(w http.ResponseWriter, r *http.Req
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host not found")
 		return
 	}
+	// public_url is required: an absent key is a 400, an explicit null clears the override.
 	var req struct {
-		PublicURL   *string `json:"public_url"`
-		Certificate *string `json:"certificate"`
+		PublicURL   json.RawMessage `json:"public_url"`
+		Certificate *string         `json:"certificate"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
+	}
+	var publicURL *string
+	if len(req.PublicURL) == 0 {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "public_url is required (null clears the override)")
+		return
+	}
+	if string(req.PublicURL) != "null" {
+		var u string
+		if json.Unmarshal(req.PublicURL, &u) != nil {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "public_url must be a string or null")
+			return
+		}
+		publicURL = &u
 	}
 	certificate := wtendpoint.CertPublic
 	if req.Certificate != nil {
@@ -78,13 +93,13 @@ func (h *Handler) handlePatchHostWebTransport(w http.ResponseWriter, r *http.Req
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, `certificate must be "public" or "agent"`)
 		return
 	}
-	if req.PublicURL != nil {
-		if err := wtendpoint.ValidatePublicURL(*req.PublicURL); err != nil {
+	if publicURL != nil {
+		if err := wtendpoint.ValidatePublicURL(*publicURL); err != nil {
 			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
 			return
 		}
 	}
-	if err := wtendpoint.SetOverride(r.Context(), h.store.pool, id, req.PublicURL, certificate); err != nil {
+	if err := wtendpoint.SetOverride(r.Context(), h.store.pool, id, publicURL, certificate); err != nil {
 		if errors.Is(err, wtendpoint.ErrHostNotFound) {
 			httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host not found")
 			return
@@ -93,8 +108,8 @@ func (h *Handler) handlePatchHostWebTransport(w http.ResponseWriter, r *http.Req
 		return
 	}
 	details := map[string]any{"public_url": nil, "certificate": certificate}
-	if req.PublicURL != nil {
-		details["public_url"] = *req.PublicURL
+	if publicURL != nil {
+		details["public_url"] = *publicURL
 	}
 	h.recordActivity(r, "host.webtransport.update", "host", id, details)
 	h.writeWebTransport(w, r, id)

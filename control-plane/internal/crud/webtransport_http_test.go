@@ -96,12 +96,15 @@ func TestHostWebTransportEndpoint(t *testing.T) {
 
 	// Validation.
 	for name, payload := range map[string]string{
-		"http":          `{"public_url":"http://play.example.com/wt"}`,
-		"user info":     `{"public_url":"https://u@play.example.com/wt"}`,
-		"fragment":      `{"public_url":"https://play.example.com/wt#x"}`,
-		"bad cert":      `{"public_url":"https://play.example.com/wt","certificate":"self"}`,
-		"unknown key":   `{"url":"https://play.example.com/wt"}`,
-		"not an object": `[]`,
+		"http":                               `{"public_url":"http://play.example.com/wt"}`,
+		"user info":                          `{"public_url":"https://u@play.example.com/wt"}`,
+		"fragment":                           `{"public_url":"https://play.example.com/wt#x"}`,
+		"bad cert":                           `{"public_url":"https://play.example.com/wt","certificate":"self"}`,
+		"unknown key":                        `{"url":"https://play.example.com/wt"}`,
+		"not an object":                      `[]`,
+		"absent public_url":                  `{}`,
+		"absent public_url with certificate": `{"certificate":"agent"}`,
+		"public_url of the wrong type":       `{"public_url":7}`,
 	} {
 		if resp, body := doBody(t, http.MethodPatch, url, adminTok, payload); resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("%s: %d %s, want 400", name, resp.StatusCode, body)

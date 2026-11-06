@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,6 +42,18 @@ func newWTFixture(t *testing.T, profileTransport string) *wtFixture {
 	_, appID, hostID := seed1080pApp(t, pool)
 	store := NewStore(pool)
 	disp := newFakeDispatcher(true)
+	// The fake signals every acked command on a buffer of 8 that nothing reads here.
+	stopDrain := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-disp.sawAssign:
+			case <-stopDrain:
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { close(stopDrain) })
 	coord := newTestCoordinator(t, store, disp, testLogger())
 	ctx := context.Background()
 
@@ -84,6 +97,16 @@ func (f *wtFixture) launch(t *testing.T, body map[string]any) (int, map[string]a
 	var out map[string]any
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	return resp.StatusCode, out
+}
+
+// launchSecond launches a second session for the same user (the quota allows it).
+func (f *wtFixture) launchSecond(t *testing.T) (int, string) {
+	t.Helper()
+	status, body := f.launch(t, map[string]any{})
+	if status != http.StatusCreated {
+		t.Fatalf("second launch: %d %v", status, body)
+	}
+	return status, body["session"].(map[string]any)["id"].(string)
 }
 
 func (f *wtFixture) waitDispatched(t *testing.T) {
@@ -442,5 +465,127 @@ func TestTransportFallbackEventRecordsTheReason(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&body)
 	if body.Session["transport_fallback_reason"] != "stream_lost" || body.Session["transport"] != "webtransport" {
 		t.Errorf("session body: %v", body.Session)
+	}
+}
+
+// A session that is stopping or already over is not reconnectable, and the answer comes before
+// any endpoint or agent check: nothing is sent to the agent and no token is minted.
+func TestTransportTokenRefusedForStoppingAndTerminalSessions(t *testing.T) {
+	for _, state := range []string{"stopping", "stopped", "failed"} {
+		t.Run(state, func(t *testing.T) {
+			f := newWTFixture(t, "webtransport")
+			_, launched := f.launch(t, map[string]any{})
+			f.waitDispatched(t)
+			id := launched["session"].(map[string]any)["id"].(string)
+			// An unusable endpoint would answer transport_unavailable if the guard came later.
+			must(t, exec(t, f.pool, `UPDATE hosts SET transports = NULL`))
+			must(t, exec(t, f.pool, `UPDATE sessions SET state = $2 WHERE id = $1::uuid`, id, state))
+
+			status, body := f.transportToken(t, id, f.userTok)
+			if status != http.StatusConflict || errCodeOf(body) != "session_not_reconnectable" {
+				t.Errorf("%s: %d %v, want 409 session_not_reconnectable", state, status, body)
+			}
+			if n := len(f.disp.transportTokenCmds()); n != 0 {
+				t.Errorf("%d session_transport_token sent for a %s session", n, state)
+			}
+			if rows := tokenRows(t, f.pool, id); len(rows["transport"]) != 1 {
+				t.Errorf("a %s session minted a token: %v", state, rows)
+			}
+		})
+	}
+}
+
+// An admin is not the owner: another user's session is a 404 and the agent hears nothing.
+func TestTransportTokenAdminCannotMintForAnotherUser(t *testing.T) {
+	f := newWTFixture(t, "webtransport")
+	_, launched := f.launch(t, map[string]any{})
+	f.waitDispatched(t)
+	id := launched["session"].(map[string]any)["id"].(string)
+
+	if _, err := f.authSvc.Register(context.Background(), "wtadmin@test.local", "wtadmin", "quasar-fixture-pw-06"); err != nil {
+		t.Fatal(err)
+	}
+	must(t, exec(t, f.pool, `UPDATE users SET role = 'admin' WHERE email = 'wtadmin@test.local'`))
+	adminTok := loginTok(t, f.authSvc, "wtadmin@test.local", "quasar-fixture-pw-06")
+
+	status, body := f.transportToken(t, id, adminTok)
+	if status != http.StatusNotFound || body["transport_options"] != nil {
+		t.Errorf("admin on another user's session: %d %v, want 404", status, body)
+	}
+	if n := len(f.disp.transportTokenCmds()); n != 0 {
+		t.Errorf("%d session_transport_token sent on an admin's request", n)
+	}
+	if rows := tokenRows(t, f.pool, id); len(rows["transport"]) != 1 {
+		t.Errorf("an admin's request minted a token: %v", rows)
+	}
+}
+
+func TestTransportTokenIsRateLimitedPerSession(t *testing.T) {
+	f := newWTFixture(t, "webtransport")
+	_, launched := f.launch(t, map[string]any{})
+	f.waitDispatched(t)
+	id := launched["session"].(map[string]any)["id"].(string)
+	_, otherLaunch := f.launchSecond(t)
+
+	for i := 0; i < statsRateBurst; i++ {
+		if status, _ := f.transportToken(t, id, f.userTok); status != http.StatusCreated {
+			t.Fatalf("request %d within the burst: %d, want 201", i+1, status)
+		}
+	}
+	if status, body := f.transportToken(t, id, f.userTok); status != http.StatusTooManyRequests || errCodeOf(body) != "rate_limited" {
+		t.Errorf("request past the burst: %d %v, want 429 rate_limited", status, body)
+	}
+	if n := len(f.disp.transportTokenCmds()); n != statsRateBurst {
+		t.Errorf("the limited request reached the agent: %d commands, want %d", n, statsRateBurst)
+	}
+	// Per session: another session's bucket is untouched.
+	if status, _ := f.transportToken(t, otherLaunch, f.userTok); status != http.StatusCreated {
+		t.Errorf("a second session was limited by the first: %d", status)
+	}
+}
+
+// Two mints at once are independent tokens, each acked with its own hash.
+func TestTransportTokenConcurrentMintsAreIndependent(t *testing.T) {
+	f := newWTFixture(t, "webtransport")
+	_, launched := f.launch(t, map[string]any{})
+	f.waitDispatched(t)
+	id := launched["session"].(map[string]any)["id"].(string)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	tokens := make([]string, 2)
+	statuses := make([]int, 2)
+	for i := range tokens {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			status, body := f.transportToken(t, id, f.userTok)
+			statuses[i] = status
+			if status == http.StatusCreated {
+				tokens[i] = body["transport_options"].(map[string]any)["webtransport"].(map[string]any)["token"].(string)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if statuses[0] != http.StatusCreated || statuses[1] != http.StatusCreated {
+		t.Fatalf("statuses %v, want both 201", statuses)
+	}
+	if tokens[0] == tokens[1] {
+		t.Fatal("two concurrent mints returned the same token")
+	}
+	acked := map[string]bool{}
+	for _, c := range f.disp.transportTokenCmds() {
+		acked[c.WTTokenHash] = true
+	}
+	for _, tok := range tokens {
+		if !acked[hashToken(tok)] {
+			t.Errorf("token %.8s was handed out without its hash reaching the agent", tok)
+		}
+	}
+	if rows := tokenRows(t, f.pool, id); len(rows["transport"]) != 3 {
+		t.Errorf("transport rows = %v, want the launch's and both mints", rows["transport"])
 	}
 }

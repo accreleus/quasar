@@ -39,7 +39,7 @@ func webTransportReport(cap CapacityMsg) *wtendpoint.Reported {
 	}
 	for _, a := range wt.Addresses {
 		ip := net.ParseIP(a)
-		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || len(r.Addresses) == maxWTAddresses {
+		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() || ip.Equal(net.IPv4bcast) || ip.IsLinkLocalUnicast() || len(r.Addresses) == maxWTAddresses {
 			continue
 		}
 		r.Addresses = append(r.Addresses, ip.String())

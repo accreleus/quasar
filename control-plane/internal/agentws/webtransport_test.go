@@ -69,7 +69,7 @@ func TestWebTransportReportKeepsOnlyUsableAddressesAndCertificates(t *testing.T)
 		many = append(many, "192.0.2."+string(rune('0'+i%10))+"0")
 	}
 	addrs := mustJSON(t, append([]string{
-		"evil.example.com/x?", "127.0.0.1", "::1", "0.0.0.0", "169.254.1.1", "fe80::1", "not an ip", "", "https://x",
+		"evil.example.com/x?", "224.0.0.1", "ff02::1", "255.255.255.255", "127.0.0.1", "::1", "0.0.0.0", "169.254.1.1", "fe80::1", "not an ip", "", "https://x",
 	}, many...))
 	certs := `[{"sha256":"` + b64('a') + `","not_after":"2026-11-19T00:00:00Z"},
 		{"sha256":"short","not_after":"2026-11-19T00:00:00Z"},

@@ -712,10 +712,15 @@ func (h *Handler) handleTransportToken(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not get session")
 		return
 	}
+	if h.statsLimiter != nil && !h.statsLimiter.allow(id+"/transport-token") {
+		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited, "too many transport token requests; slow down")
+		return
+	}
 	notReconnectable := func() {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeSessionNotReconnectable, "session is not reconnectable")
 	}
-	if sess.State.IsTerminal() {
+	// Stopping too, before any agent or endpoint check: the stream is being ended.
+	if sess.State.IsTerminal() || sess.State == StateStopping {
 		notReconnectable()
 		return
 	}
