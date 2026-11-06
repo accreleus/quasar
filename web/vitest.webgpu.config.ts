@@ -7,7 +7,7 @@ import { playwright } from "@vitest/browser-playwright";
 // GPU through Vulkan instead (the container needs the GPU's device nodes and Vulkan driver).
 const gpuArgs =
   process.env.PYROWAVE_GPU === "native"
-    ? ["--use-vulkan=native", "--ignore-gpu-blocklist", "--enable-webgpu-developer-features"]
+    ? ["--use-vulkan=native", "--use-angle=vulkan", "--ignore-gpu-blocklist", "--enable-webgpu-developer-features"]
     : ["--use-vulkan=swiftshader", "--use-webgpu-adapter=swiftshader", "--enable-unsafe-swiftshader"];
 
 export default defineConfig({
