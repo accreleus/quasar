@@ -34,16 +34,29 @@ export interface PyroWaveHeader {
   fullRange: boolean;
 }
 
+/**
+ * The picture fields of a BitstreamSequenceHeader (the PWV1Header's, or a SOF's): what amendment 55
+ * carries is 4:2:0, sRGB primaries and transfer, BT.709 matrix, centre siting, even width and height.
+ */
+function pictureFields(w0: number, w1: number): PyroWaveHeader {
+  const bad = (why: string) => new PyroWaveError("bad_frame", why);
+  const width = (w0 & 0x3fff) + 1;
+  const height = ((w0 >>> 14) & 0x3fff) + 1;
+  if ((w1 >>> 26) & 1) throw bad("only 4:2:0 chroma is supported");
+  if ((w1 >>> 27) & 1) throw bad("only sRGB/BT.709 primaries are supported, not BT.2020");
+  if ((w1 >>> 28) & 1) throw bad("only the sRGB transfer is supported, not PQ");
+  if ((w1 >>> 29) & 1) throw bad("only the BT.709 matrix is supported");
+  if ((w1 >>> 31) & 1) throw bad("only centre chroma siting is supported");
+  if ((width | height) & 1) throw bad(`${width}x${height}: 4:2:0 needs an even width and height`);
+  return { width, height, fullRange: ((w1 >>> 30) & 1) === 0 };
+}
+
 /** Reads a 24-byte PWV1Header: `hello_ack.video.description_b64`, or the start of a .pwv1 file. */
 export function parsePwv1Header(bytes: Uint8Array): PyroWaveHeader {
   if (bytes.byteLength < 24) throw new Error("not a PWV1 header: too short");
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (dv.getUint32(0, true) !== 0x3156_5750 || bytes[21] !== 1) throw new Error("not a PWV1 header (magic or header_version)");
-  const w0 = dv.getUint32(4, true);
-  const w1 = dv.getUint32(8, true);
-  if ((w1 >>> 26) & 1) throw new Error("PyroWave: only 4:2:0 chroma is supported");
-  if ((w1 >>> 29) & 1) throw new Error("PyroWave: only the BT.709 matrix is supported");
-  return { width: (w0 & 0x3fff) + 1, height: ((w0 >>> 14) & 0x3fff) + 1, fullRange: ((w1 >>> 30) & 1) === 0 };
+  return pictureFields(dv.getUint32(4, true), dv.getUint32(8, true));
 }
 
 /** Splits upstream's PWV1 disk format (the golden fixtures) into its header and frames. */
@@ -190,9 +203,10 @@ function blockBytesBeforeSigns(dv: DataView, o: number, pw: number): number {
  * One frame's GPU upload. `packets` are buffers of whole packets (a datagram's packets, a
  * reassembled oversized block, or a whole library frame); a SOF among them is checked against
  * the configuration and skipped. `covered[i]` is nonzero when a received datagram covers block
- * index i (amendment 55 §Coverage); null means every index is covered. A block that arrived and
- * holds what its own header claims is received; a covered index without one is zero; anything
- * else, a short block included, is lost.
+ * index i (amendment 55 §Coverage); null means every index is covered. An oversized block's own
+ * index stays 0 until every part has arrived: a received part's range covers only the indices
+ * after it. A block that arrived and holds what its own header claims is received; a covered
+ * index without one is zero; anything else, a short block included, is lost.
  */
 export function buildUpload(layout: BlockLayout, packets: readonly Uint8Array[], covered: Uint8Array | null): Upload {
   const n = layout.totalBlocks;
@@ -211,8 +225,7 @@ export function buildUpload(layout: BlockLayout, packets: readonly Uint8Array[],
         if (o + 8 > p.byteLength) throw bad("a truncated start-of-frame header");
         const w1 = dv.getUint32(o + 4, true);
         if ((w1 >>> 24) & 3) throw bad("an unknown extended packet");
-        const w = (w0 & 0x3fff) + 1;
-        const h = ((w0 >>> 14) & 0x3fff) + 1;
+        const { width: w, height: h } = pictureFields(w0, w1);
         if (w !== layout.width || h !== layout.height) throw bad(`the frame is ${w}x${h}, the configuration ${layout.width}x${layout.height}`);
         o += 8;
         continue;

@@ -4,7 +4,7 @@
 // SwiftShader); a real-GPU run sets them, so a missing feature fails instead of narrowing the run.
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import manifest from "../../../testdata/pyrowave/manifest.json";
-import { parsePwv1 } from "./bitstream";
+import { blockLayout, parsePwv1 } from "./bitstream";
 import { PyroWaveDecoder, PyroWaveError, pyroWaveDeviceFeatures, type DecoderPath } from "./decoder";
 
 const expectedPaths = String(import.meta.env.VITE_PYROWAVE_PATHS ?? "subgroups-fp32").split(",") as DecoderPath[];
@@ -233,12 +233,9 @@ describe("YCbCr to RGB", () => {
     return [r, g, b].map((v) => Math.round(Math.min(Math.max(v, 0), 1) * 255));
   }
 
-  it("draws BT.709 limited-range RGB into the texture", async () => {
-    const f = manifest.fixtures.find((x) => x.name === "detail_200x114_hi")!;
-    const { decoder, frame } = await decoderFor(f.pwv1.file);
-    decoder.decode([frame], null);
+  async function worstRgbError(decoder: PyroWaveDecoder): Promise<number> {
     const yuv = await decoder.readI420();
-    const { width: w, height: h } = f;
+    const { width: w, height: h } = decoder.header;
     const bpr = Math.ceil((w * 4) / 256) * 256;
     const rb = device.createBuffer({ size: bpr * h, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const enc = device.createCommandEncoder();
@@ -247,14 +244,40 @@ describe("YCbCr to RGB", () => {
     await rb.mapAsync(GPUMapMode.READ);
     const rgba = new Uint8Array(rb.getMappedRange().slice(0));
     rb.destroy();
-    decoder.destroy();
     let worst = 0;
     for (let y = 0; y < h; y++)
       for (let x = 0; x < w; x++) {
         const want = expectedRgb(yuv, w, h, x, y);
         for (let c = 0; c < 3; c++) worst = Math.max(worst, Math.abs(rgba[y * bpr + 4 * x + c] - want[c]));
       }
+    return worst;
+  }
+
+  it("draws BT.709 limited-range RGB into the texture", async () => {
+    const { decoder, frame } = await decoderFor("detail_200x114_hi.pwv1");
+    decoder.decode([frame], null);
+    const worst = await worstRgbError(decoder);
     console.log(`pyrowave-rgb max error ${worst}`);
+    decoder.destroy();
+    expect(worst).toBeLessThanOrEqual(2);
+  });
+
+  it("samples chroma only inside the picture at the right edge", async () => {
+    // 200 px wide: chroma is 100 columns, its plane 112. One hand-built level-1 Cb high-pass block
+    // over chroma columns 96-111 makes column 100 (padding) differ sharply from column 99.
+    const header = { width: 200, height: 114, fullRange: false };
+    const band = blockLayout(200, 114).bands.find((b) => b.level === 1 && b.comp === 1 && b.band === 1)!;
+    const block = new Uint8Array(28);
+    const dv = new DataView(block.buffer);
+    dv.setUint32(0, (7 << 16) | (1 << 2), true); // 7 words; ballot: 8x8 block (bx 2, by 0) = coefficient columns 48-55
+    dv.setUint32(4, ((band.blockOffset + 1) << 8) | 0x38, true); // the band's second block; quant code 0x38
+    dv.setUint16(8, 0x5555, true); // cw: one plane per 4x2 subblock (a zero cw is an all-zero 8x8 block)
+    block[10] = 6 << 4; // qb 0, scale 6
+    block.fill(0xff, 11, 19); // one plane per 4x2 subblock: every magnitude 1; sign bits (19-26) 0
+    const decoder = await PyroWaveDecoder.create(device, header);
+    expect(decoder.decode([block], null).received).toBe(1);
+    const worst = await worstRgbError(decoder);
+    decoder.destroy();
     expect(worst).toBeLessThanOrEqual(2);
   });
 });

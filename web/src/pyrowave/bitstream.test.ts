@@ -40,14 +40,29 @@ describe("parsePwv1Header", () => {
     expect(() => parsePwv1Header(new Uint8Array(10))).toThrow(/PWV1/);
   });
 
-  it("refuses 4:4:4 and BT.2020, which amendment 55 does not carry", () => {
+  // Bits of the header's second word: 26 chroma_resolution, 27 color_primaries, 28 transfer_function,
+  // 29 ycbcr_transform, 31 chroma_siting.
+  it.each([
+    [26, /4:2:0/],
+    [27, /BT.2020/],
+    [28, /PQ/],
+    [29, /BT.709 matrix/],
+    [31, /centre chroma siting/],
+  ])("refuses bit %i, which amendment 55 does not carry", (bit, message) => {
     const h = fixture("flat_200x114_lo.pwv1").slice(0, 24);
     const dv = new DataView(h.buffer);
-    const w1 = dv.getUint32(8, true);
-    dv.setUint32(8, w1 | (1 << 26), true);
-    expect(() => parsePwv1Header(h)).toThrow(/4:2:0/);
-    dv.setUint32(8, w1 | (1 << 29), true);
-    expect(() => parsePwv1Header(h)).toThrow(/BT.709/);
+    dv.setUint32(8, dv.getUint32(8, true) | (1 << bit), true);
+    expect(() => parsePwv1Header(h)).toThrow(message);
+  });
+
+  it.each([
+    [201, 114],
+    [200, 115],
+  ])("refuses an odd size, %ix%i", (w, hh) => {
+    const h = fixture("flat_200x114_lo.pwv1").slice(0, 24);
+    const dv = new DataView(h.buffer);
+    dv.setUint32(4, (dv.getUint32(4, true) & ~0x0fff_ffff) | ((hh - 1) << 14) | (w - 1), true);
+    expect(() => parsePwv1Header(h)).toThrow(/even/);
   });
 });
 
@@ -161,6 +176,27 @@ describe("buildUpload", () => {
     expect(buildUpload(layout, [frame], null).received).toBe(68);
     dv.setUint32(0, (dv.getUint32(0, true) & ~0x3fff) | 255, true); // width 256
     expect(() => buildUpload(layout, [frame], null)).toThrow(/256x114/);
+  });
+
+  it.each([
+    [26, /4:2:0/],
+    [31, /centre chroma siting/],
+  ])("refuses a start-of-frame header with bit %i set, whatever the configuration said", (bit, message) => {
+    const frame = parsePwv1(fixture("detail_200x114_hi.pwv1")).frames[0].slice();
+    const dv = new DataView(frame.buffer);
+    dv.setUint32(4, dv.getUint32(4, true) | (1 << bit), true);
+    expect(() => buildUpload(layout, [frame], null)).toThrow(message);
+  });
+
+  it("an oversized block with a part missing is lost, while the indices its received part covers are zero", () => {
+    // Block 5 was sent in two parts carrying the range [5, 9); part 1 never arrived. The receiver
+    // marks 6..8 covered (part 0 arrived) and leaves 5 uncovered (amendment 55 §Coverage).
+    const covered = new Uint8Array(72).fill(1);
+    covered[5] = 0;
+    const up = buildUpload(layout, [], covered);
+    expect(up.offsets[5]).toBe(BLOCK_LOST);
+    expect([6, 7, 8].map((i) => up.offsets[i])).toEqual([BLOCK_ZERO, BLOCK_ZERO, BLOCK_ZERO]);
+    expect([up.received, up.zero, up.lost]).toEqual([0, 71, 1]);
   });
 
   it("refuses a coverage map of the wrong size", () => {

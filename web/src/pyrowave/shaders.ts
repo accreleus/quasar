@@ -298,7 +298,7 @@ struct P { aw: u32, w: u32, h: u32, limited: u32, off_cb: u32, off_cr: u32, cstr
 // x, y: the fragment position, at pixel centres. Upstream samples the half-size plane at the
 // same UV, so chroma texel i sits between luma pixels 2i and 2i + 1.
 fn chroma(off: u32, x: f32, y: f32) -> f32 {
-  let cw = i32(p.cstride);
+  let cw = i32((p.w + 1u) / 2u); // the picture's chroma, not the plane's padded stride
   let ch = i32((p.h + 1u) / 2u);
   let fx = x * 0.5 - 0.5;
   let fy = y * 0.5 - 0.5;
