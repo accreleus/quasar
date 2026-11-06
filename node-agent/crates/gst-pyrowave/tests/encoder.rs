@@ -137,10 +137,12 @@ fn every_fixture_meets_the_encoder_bar_with_the_configured_sof_colour() {
             ("transfer_function", 28),
             ("ycbcr_transform", 29),
             ("ycbcr_range", 30),
+            ("chroma_siting", 31),
         ] {
             assert_eq!(field(bit), sof[key].as_u64().unwrap(), "{name}: SOF {key}");
         }
         assert_eq!(field(30), 1, "{name}: limited range");
+        assert_eq!(field(31), 0, "{name}: centre chroma siting");
 
         let decoded = Decoder::new(device.clone(), w as u32, h as u32)
             .unwrap()
@@ -175,9 +177,9 @@ fn full_range_input_says_full_range_in_the_sof() {
     let out = encode(&caps, 20_000, &[src]);
     let frame = out[0].map_readable().unwrap();
     assert_eq!(
-        (sof_words(&frame).1 >> 27) & 0xF,
+        sof_words(&frame).1 >> 27,
         0,
-        "sRGB, sRGB, BT.709, FULL"
+        "sRGB, sRGB, BT.709, FULL, centre siting"
     );
 }
 

@@ -38,17 +38,18 @@ gst::plugin_define!(
 );
 
 /// Writes the SOF's usability fields for Quasar's configuration (codec-pyrowave.md
-/// §hello_ack `color_space`): sRGB primaries and transfer, BT.709 matrix, and the range.
-/// The library's CPU path writes FULL whatever the picture is (#1056), so the element
-/// always overwrites them. `frame` starts with the SOF.
+/// §hello_ack `color_space`, erratum quasar-protocol#29): sRGB primaries and transfer,
+/// BT.709 matrix, the range, and centre chroma siting. At the pin the library writes FULL
+/// range whatever the picture is and siting from its input, and the browser decoder refuses
+/// a left-sited SOF, so the element always overwrites them. `frame` starts with the SOF.
 pub fn write_sof_colour(frame: &mut [u8], full_range: bool) -> Result<(), String> {
     let word = |i: usize| u32::from_le_bytes(frame[i..i + 4].try_into().unwrap());
     if frame.len() < 8 || word(0) >> 31 == 0 || (word(4) >> 24) & 3 != 0 {
         return Err("the frame does not start with a start-of-frame header".into());
     }
-    // Bits 27..30 of the second word: color_primaries, transfer_function,
-    // ycbcr_transform, ycbcr_range (bitstream.md BitstreamSequenceHeader).
-    let w1 = (word(4) & !(0xF << 27)) | (u32::from(!full_range) << 30);
+    // Bits 27..31 of the second word: color_primaries, transfer_function, ycbcr_transform,
+    // ycbcr_range, chroma_siting (bitstream.md BitstreamSequenceHeader). All zero but range.
+    let w1 = (word(4) & !(0x1F << 27)) | (u32::from(!full_range) << 30);
     frame[4..8].copy_from_slice(&w1.to_le_bytes());
     Ok(())
 }
@@ -96,10 +97,11 @@ mod tests {
         write_sof_colour(&mut f, false).unwrap();
         assert_eq!(
             f[4..8],
-            (1234u32 | 1 << 26 | 1 << 30 | 1 << 31).to_le_bytes()
+            (1234u32 | 1 << 26 | 1 << 30).to_le_bytes(),
+            "LIMITED, CENTER"
         );
         write_sof_colour(&mut f, true).unwrap();
-        assert_eq!(f[4..8], (1234u32 | 1 << 26 | 1 << 31).to_le_bytes());
+        assert_eq!(f[4..8], (1234u32 | 1 << 26).to_le_bytes(), "FULL, CENTER");
         assert_eq!(f[0..4], (1u32 << 31 | 5).to_le_bytes());
     }
 
