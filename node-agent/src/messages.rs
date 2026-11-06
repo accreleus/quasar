@@ -143,6 +143,9 @@ pub enum AgentMsg {
         /// the in-place swap.
         #[serde(skip_serializing_if = "Option::is_none")]
         parked_sessions_v1: Option<bool>,
+        /// Amendment 56: the agent applies `session_assign.compat_tools`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compat_tools_v1: Option<bool>,
     },
     ConfigPolicyState {
         attempt_id: String,
@@ -1123,6 +1126,10 @@ pub enum ControlMsg {
         resources: Option<ResourceSpec>,
         #[serde(default)]
         video_topology: VideoTopology,
+        /// Amendment 56: the compatibility-tool mapping of a Steam-family session. Sent only to
+        /// an agent that advertised `compat_tools_v1`.
+        #[serde(default)]
+        compat_tools: Option<crate::compat_tools::CompatTools>,
     },
     /// Bring the session pipeline up (P1-6).
     SessionStart {
@@ -2110,6 +2117,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Enrollment {
@@ -2145,6 +2153,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -2187,6 +2196,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -2226,6 +2236,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -2593,6 +2604,30 @@ mod tests {
         assert!(!obj.contains_key("audio_sinks"));
         assert_eq!(json["connectors"], serde_json::json!(["DP-4"]));
         assert_eq!(json["input_devices"][0]["path"], "/dev/input/event4");
+    }
+
+    /// Amendment 56: `compat_tools` as the control plane marshals it (`agentws.CompatToolsSpec`)
+    /// parses, and an assign without it reads as none.
+    #[test]
+    fn compat_tools_parse_from_the_control_planes_bytes() {
+        let assign = |extra: &str| {
+            let raw = format!(
+                r#"{{"type":"session_assign","id":"c1","session_id":"p1","gpu_index":0,"app":{{}},
+                "stream":{{"width":1920,"height":1080,"fps":60,"bitrate_kbps":15000,"h264_profile":"constrained-baseline"}}{extra}}}"#
+            );
+            match serde_json::from_str(&raw).unwrap() {
+                ControlMsg::SessionAssign { compat_tools, .. } => compat_tools,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(assign(""), None);
+        let tools = assign(
+            r#","compat_tools":{"mount":[],"entries":[{"appid":"0","name":"proton_10","forced":false},{"appid":"1145360","name":"proton_hotfix","forced":true}]}"#,
+        )
+        .unwrap();
+        assert!(tools.mount.is_empty());
+        assert_eq!(tools.entries.len(), 2);
+        assert!(tools.entries[1].forced);
     }
 
     /// Amendment 39: `kind`, `adopt_session_id`, `in_place` and the new stop reasons parse;

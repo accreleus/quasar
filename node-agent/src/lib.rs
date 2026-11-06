@@ -10,6 +10,7 @@ pub mod artifact;
 /// Build stamps + install-mode discovery: what this agent is and how it got here.
 pub mod buildinfo;
 pub mod capacity;
+pub mod compat_tools;
 pub mod config;
 pub(crate) mod console_idle;
 mod container_ownership;
