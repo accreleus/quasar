@@ -10,6 +10,11 @@ use web_transport_quinn::{ClientBuilder, SessionError, WebTransportError};
 
 use super::*;
 
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+const HOUR: Duration = Duration::from_secs(3600);
+
 const SESSION: &str = "0d6c1f0e-4f39-4c55-9b1a-5d2f6b8c7a10";
 const TOKEN: &str = "first-transport-token";
 
@@ -902,6 +907,88 @@ fn an_ipv6_64_is_one_source_and_ipv4_counts_per_address() {
         gate.take(ip("2001:db8:0:1::9")).is_some(),
         "the /64's slot came back"
     );
+}
+
+/// Walks the listener through a certificate's life on a fake clock, rotating as the
+/// real loop would, with a browser-like client pinned to different hashes at each step.
+#[tokio::test]
+async fn rotation_overlaps_hashes_keeps_live_connections_and_refuses_stale_pins() {
+    let agent = agent().await;
+    let h1 = agent.hash.clone();
+    let expires: SystemTime = {
+        let first = &agent.listener.endpoint().certificates[0];
+        OffsetDateTime::parse(&first.not_after, &Rfc3339)
+            .unwrap()
+            .into()
+    };
+    let mut presented = agent
+        .listener
+        .certs()
+        .presented(SystemTime::now())
+        .sha256
+        .clone();
+    let hash_of = |sha: &str| {
+        base64::engine::general_purpose::STANDARD
+            .decode(sha)
+            .unwrap()
+    };
+    let pin = |hashes: Vec<Vec<u8>>| {
+        let url = agent.url.clone();
+        async move {
+            let client = ClientBuilder::new()
+                .with_server_certificate_hashes(hashes)
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), client.connect(url))
+                .await
+                .expect("the handshake ends")
+        }
+    };
+
+    let (live, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(frames(&live, 3, false).await.len(), 3);
+
+    // 48 h left: both certificates reported, the old one still presented.
+    agent
+        .listener
+        .rotate_at(expires - 48 * HOUR, &mut presented);
+    let reported = agent.listener.certs().report(expires - 48 * HOUR);
+    assert_eq!(reported.len(), 2);
+    assert_eq!(hash_of(&reported[0].sha256), h1, "current first");
+    let h2 = hash_of(&reported[1].sha256);
+    assert!(pin(vec![h1.clone(), h2.clone()]).await.is_ok());
+    assert!(pin(vec![h2.clone()]).await.is_err(), "not presented yet");
+
+    // 12 h left: new connections get the next certificate; either hash connects.
+    agent
+        .listener
+        .rotate_at(expires - 12 * HOUR, &mut presented);
+    assert_eq!(hash_of(&presented), h2);
+    assert!(pin(vec![h1.clone(), h2.clone()]).await.is_ok());
+    assert!(pin(vec![h2.clone()]).await.is_ok());
+    assert!(
+        pin(vec![h1.clone()]).await.is_err(),
+        "the old pin alone is stale"
+    );
+    assert_eq!(
+        frames(&live, 3, false).await.len(),
+        3,
+        "the live session kept its certificate"
+    );
+
+    // Expired: the old hash is no longer reported or accepted, the live session goes on.
+    agent
+        .listener
+        .rotate_at(expires + Duration::from_secs(1), &mut presented);
+    let reported = agent
+        .listener
+        .certs()
+        .report(expires + Duration::from_secs(1));
+    assert_eq!(reported.len(), 1);
+    assert_eq!(hash_of(&reported[0].sha256), h2);
+    assert!(pin(vec![h1]).await.is_err());
+    assert!(pin(vec![h2]).await.is_ok());
+    assert_eq!(frames(&live, 3, false).await.len(), 3);
 }
 
 #[tokio::test]

@@ -503,30 +503,35 @@ impl Listener {
         let mut presented = self.certs().presented(SystemTime::now()).sha256.clone();
         loop {
             tokio::time::sleep(ROTATION_CHECK).await;
-            let now = SystemTime::now();
-            let mut certs = self.certs();
-            if let Err(error) = certs.tick(now) {
-                tracing::warn!(
-                    token = "webtransport-cert-rotation-failed",
-                    "WebTransport certificate rotation failed: {error:#}"
-                );
-            }
-            let cert = certs.presented(now);
-            if cert.sha256 != presented {
-                match server_config(cert) {
-                    Ok(config) => {
-                        self.quic.set_server_config(Some(config));
-                        presented = cert.sha256.clone();
-                        tracing::info!(
-                            token = "webtransport-cert-rotated",
-                            "WebTransport presents its next certificate"
-                        );
-                    }
-                    Err(error) => tracing::warn!(
-                        token = "webtransport-cert-reload-failed",
-                        "WebTransport could not present its next certificate: {error:#}"
-                    ),
+            self.rotate_at(SystemTime::now(), &mut presented);
+        }
+    }
+
+    /// One rotation pass at `now`; `presented` is the hash new connections get. The clock
+    /// is a parameter so a test can walk a certificate's whole life.
+    fn rotate_at(&self, now: SystemTime, presented: &mut String) {
+        let mut certs = self.certs();
+        if let Err(error) = certs.tick(now) {
+            tracing::warn!(
+                token = "webtransport-cert-rotation-failed",
+                "WebTransport certificate rotation failed: {error:#}"
+            );
+        }
+        let cert = certs.presented(now);
+        if cert.sha256 != *presented {
+            match server_config(cert) {
+                Ok(config) => {
+                    self.quic.set_server_config(Some(config));
+                    *presented = cert.sha256.clone();
+                    tracing::info!(
+                        token = "webtransport-cert-rotated",
+                        "WebTransport presents its next certificate"
+                    );
                 }
+                Err(error) => tracing::warn!(
+                    token = "webtransport-cert-reload-failed",
+                    "WebTransport could not present its next certificate: {error:#}"
+                ),
             }
         }
     }
