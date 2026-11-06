@@ -17,6 +17,7 @@
  * | # | Condition                                    | Severity | Onset            | CTA             |
  * |---|----------------------------------------------|----------|------------------|-----------------|
  * | 1 | any readiness check `status: "fail"`          | critical | readiness report | Open host       |
+ * |   | …an advisory one only (`isAdvisoryCheck`)     | warning  | readiness report | Open host       |
  * | 2 | `capacity_detection != "ok"`                  | critical | none             | Open host       |
  * | 3 | `status == "offline"`                         | critical | last heartbeat   | Open host       |
  * | 4 | sessions with a non-healthy `health_state`    | warning  | session start    | Open session(s) |
@@ -37,6 +38,7 @@
  */
 
 import { bytesFromMb } from "../format/bytes";
+import { isAdvisoryCheck } from "../readiness/groups";
 import { elapsedWords, relativeTime } from "../format/relativeTime";
 
 // ── Inputs (structural, not the generated API types) ─────────────────────────
@@ -134,7 +136,11 @@ export const LOW_STORAGE_PCT = LOW_STORAGE_FRACTION * 100;
 export function needsAttention(host: AttentionHost): boolean {
   if (host.status === "offline") return true;
   if (host.capacity_detection !== "ok") return true;
-  return (host.readiness ?? []).some((check) => check.status === "fail");
+  return (host.readiness ?? []).some((check) => isFault(check));
+}
+
+function isFault(check: ReadinessLike): boolean {
+  return check.status === "fail" && !isAdvisoryCheck(check.id ?? "");
 }
 
 /** The API's health vocabulary has no literal "degraded" value — it names the
@@ -196,21 +202,26 @@ function instant(at: string | null | undefined): string | null {
 
 function readinessFindings(host: AlertHost): Finding[] {
   const failed = (host.readiness ?? []).filter((c) => c.status === "fail");
-  if (!failed.length) return [];
-  return [
-    {
-      id: `host:${host.id}:readiness`,
-      severity: "critical",
-      title:
-        failed.length === 1
-          ? `${host.node_name} failed a readiness check`
-          : `${host.node_name} failed ${failed.length} readiness checks`,
-      body: failed.map((c) => c.summary).join(" · "),
-      since: instant(host.readiness_reported_at),
-      cta: "Open host",
-      to: hostRoute(host),
-    },
-  ];
+  const faults = failed.filter(isFault);
+  const advisory = failed.filter((c) => !isFault(c));
+  const finding = (checks: typeof failed, id: string, severity: AlertSeverity): Finding[] =>
+    checks.length
+      ? [
+          {
+            id: `host:${host.id}:${id}`,
+            severity,
+            title:
+              checks.length === 1
+                ? `${host.node_name} failed a readiness check`
+                : `${host.node_name} failed ${checks.length} readiness checks`,
+            body: checks.map((c) => c.summary).join(" · "),
+            since: instant(host.readiness_reported_at),
+            cta: "Open host",
+            to: hostRoute(host),
+          },
+        ]
+      : [];
+  return [...finding(faults, "readiness", "critical"), ...finding(advisory, "readiness-advisory", "warning")];
 }
 
 function capacityFindings(host: AlertHost): Finding[] {

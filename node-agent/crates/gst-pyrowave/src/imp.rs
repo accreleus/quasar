@@ -181,17 +181,11 @@ impl VideoEncoderImpl for PyroWaveEnc {
         &self,
         input: &gst_video::VideoCodecState<'static, gst_video::video_codec_state::Readable>,
     ) -> Result<(), gst::LoggableError> {
-        let info = input.info().clone();
+        let caps = input
+            .caps()
+            .ok_or_else(|| gst::loggable_error!(CAT, "input state without caps"))?;
+        let info = crate::check_input(caps).map_err(|e| gst::loggable_error!(CAT, "{e}"))?;
         let (w, h) = (info.width(), info.height());
-        if w % 2 != 0 || h % 2 != 0 {
-            return Err(gst::loggable_error!(
-                CAT,
-                "4:2:0 needs an even size, got {w}x{h}"
-            ));
-        }
-        if info.colorimetry().matrix() != gst_video::VideoColorMatrix::Bt709 {
-            return Err(gst::loggable_error!(CAT, "PyroWave input must be BT.709"));
-        }
         let mut guard = self.state.lock().unwrap();
         let state = guard
             .as_mut()
@@ -226,7 +220,8 @@ impl VideoEncoderImpl for PyroWaveEnc {
             return Err(gst::FlowError::NotNegotiated);
         };
         let fps = info.fps();
-        let budget = crate::frame_budget(kbps, fps.numer(), fps.denom());
+        let raw = info.width() as usize * info.height() as usize * 3 / 2;
+        let budget = crate::frame_budget(kbps, fps.numer(), fps.denom(), raw);
         let full_range = info.colorimetry().range() == gst_video::VideoColorRange::Range0_255;
 
         let input = frame.input_buffer().ok_or(gst::FlowError::Error)?;

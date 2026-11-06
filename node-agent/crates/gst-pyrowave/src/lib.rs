@@ -55,14 +55,40 @@ pub fn write_sof_colour(frame: &mut [u8], full_range: bool) -> Result<(), String
 }
 
 /// The per-frame byte budget for `kbps` at `fps_n/fps_d` (codec-pyrowave.md §Rate: the
-/// target over fps). A variable or unknown rate budgets at 60 fps.
-pub fn frame_budget(kbps: u32, fps_n: i32, fps_d: i32) -> usize {
+/// target over fps), never above `raw_bytes`, the uncompressed frame. A variable or
+/// unknown rate budgets at 60 fps.
+pub fn frame_budget(kbps: u32, fps_n: i32, fps_d: i32, raw_bytes: usize) -> usize {
     let (n, d) = if fps_n > 0 && fps_d > 0 {
-        (fps_n as u64, fps_d as u64)
+        (fps_n as u128, fps_d as u128)
     } else {
         (60, 1)
     };
-    (u64::from(kbps) * 1000 * d / (8 * n)).max(1) as usize
+    let budget = u128::from(kbps) * 1000 * d / (8 * n);
+    budget.clamp(1, raw_bytes.max(1) as u128) as usize
+}
+
+/// What `set_format` refuses beyond the pad template: an odd size (4:2:0), a matrix other
+/// than BT.709, and a `chroma-site` field other than centre (`jpeg`/`none`), since the SOF
+/// always says centre (codec-pyrowave.md, erratum quasar-protocol#29). Reads the caps
+/// field, not `VideoInfo`: an unset site reads as MPEG-2 there at 720p and above.
+pub fn check_input(caps: &gst::CapsRef) -> Result<gstreamer_video::VideoInfo, String> {
+    let info = gstreamer_video::VideoInfo::from_caps(caps).map_err(|e| e.to_string())?;
+    let (w, h) = (info.width(), info.height());
+    if w % 2 != 0 || h % 2 != 0 {
+        return Err(format!("4:2:0 needs an even size, got {w}x{h}"));
+    }
+    if info.colorimetry().matrix() != gstreamer_video::VideoColorMatrix::Bt709 {
+        return Err("PyroWave input must be BT.709".into());
+    }
+    let site = caps
+        .structure(0)
+        .and_then(|s| s.get::<&str>("chroma-site").ok());
+    if let Some(site) = site.filter(|s| !matches!(*s, "jpeg" | "none")) {
+        return Err(format!(
+            "PyroWave input must be centre-sited, got chroma-site {site}"
+        ));
+    }
+    Ok(info)
 }
 
 /// PSNR in dB of two 8-bit planes; infinite when identical.
@@ -117,11 +143,50 @@ mod tests {
 
     #[test]
     fn the_budget_is_the_target_over_the_frame_rate() {
-        assert_eq!(frame_budget(200_000, 60, 1), 416_666);
-        assert_eq!(frame_budget(200_000, 30, 1), 833_333);
-        assert_eq!(frame_budget(200_000, 60000, 1001), 417_083);
-        assert_eq!(frame_budget(200_000, 0, 1), 416_666);
-        assert_eq!(frame_budget(0, 60, 1), 1);
+        const RAW_4K: usize = 3840 * 2160 * 3 / 2;
+        assert_eq!(frame_budget(200_000, 60, 1, RAW_4K), 416_666);
+        assert_eq!(frame_budget(200_000, 30, 1, RAW_4K), 833_333);
+        assert_eq!(frame_budget(200_000, 60000, 1001, RAW_4K), 417_083);
+        assert_eq!(frame_budget(200_000, 0, 1, RAW_4K), 416_666);
+        assert_eq!(frame_budget(0, 60, 1, RAW_4K), 1);
+    }
+
+    #[test]
+    fn the_budget_never_exceeds_the_raw_frame_and_never_overflows() {
+        let raw = 1920 * 1080 * 3 / 2;
+        // 1/100 fps at the property's maximum: 125 GB a frame before the clamp.
+        assert_eq!(frame_budget(10_000_000, 1, 100, raw), raw);
+        assert_eq!(frame_budget(10_000_000, 1, i32::MAX, raw), raw);
+        assert_eq!(frame_budget(u32::MAX, 1, i32::MAX, usize::MAX), usize::MAX);
+    }
+
+    fn check(caps: &str) -> Result<gstreamer_video::VideoInfo, String> {
+        gst::init().unwrap();
+        check_input(&caps.parse::<gst::Caps>().unwrap())
+    }
+
+    #[test]
+    fn odd_sizes_other_matrices_and_off_centre_siting_are_refused() {
+        let base = "video/x-raw,format=I420,framerate=60/1,colorimetry=bt709";
+        assert!(check(&format!("{base},width=320,height=192")).is_ok());
+        // No chroma-site field: VideoInfo would call this MPEG-2 from 720p up.
+        for (w, h) in [(1280, 720), (1920, 1080), (3840, 2160)] {
+            assert!(
+                check(&format!("{base},width={w},height={h}")).is_ok(),
+                "{w}x{h}"
+            );
+        }
+        for site in ["jpeg", "none"] {
+            let caps = format!("{base},width=320,height=192,chroma-site={site}");
+            assert!(check(&caps).is_ok(), "{site}");
+        }
+        assert!(check(&format!("{base},width=321,height=192")).is_err());
+        assert!(check(&format!("{base},width=320,height=191")).is_err());
+        for site in ["mpeg2", "cosited", "dv"] {
+            let caps = format!("{base},width=1920,height=1080,chroma-site={site}");
+            assert!(check(&caps).is_err(), "{site}");
+        }
+        assert!(check("video/x-raw,format=I420,width=320,height=192,colorimetry=bt601").is_err());
     }
 
     #[test]

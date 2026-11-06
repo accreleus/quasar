@@ -4,10 +4,15 @@
 use std::ffi::{c_int, c_void, CStr};
 use std::path::Path;
 use std::ptr::{self, NonNull};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use ash::vk;
 
 const SONAME: &CStr = c"libpyrowave-shared.so.1";
+/// The pin's API version. The structs below mirror pyrowave.h by hand, so a library with
+/// any other major.minor (a minor may append fields) is refused, not trusted.
 const API_MAJOR: u32 = 1;
+const API_MINOR: u32 = 0;
 const CHROMA_420: c_int = 0;
 const FORMAT_NV12: c_int = 0;
 const FORMAT_YUV420P: c_int = 1;
@@ -86,7 +91,12 @@ fn load() -> Result<Api, String> {
     unsafe {
         let lib = libc::dlopen(SONAME.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
         if lib.is_null() {
-            let why = CStr::from_ptr(libc::dlerror()).to_string_lossy();
+            let why = libc::dlerror();
+            let why = if why.is_null() {
+                "no reason given".into()
+            } else {
+                CStr::from_ptr(why).to_string_lossy()
+            };
             return Err(format!("cannot load libpyrowave-shared.so.1: {why}"));
         }
         macro_rules! sym {
@@ -118,9 +128,10 @@ fn load() -> Result<Api, String> {
         };
         let (mut major, mut minor, mut patch) = (0, 0, 0);
         (api.get_api_version)(&mut major, &mut minor, &mut patch);
-        if major != API_MAJOR {
+        if (major, minor) != (API_MAJOR, API_MINOR) {
             return Err(format!(
-                "libpyrowave-shared API {major}.{minor}.{patch}, this element speaks {API_MAJOR}.x"
+                "libpyrowave-shared API {major}.{minor}.{patch}, this element speaks \
+                 {API_MAJOR}.{API_MINOR}"
             ));
         }
         Ok(api)
@@ -128,6 +139,8 @@ fn load() -> Result<Api, String> {
 }
 
 fn api() -> Result<&'static Api, String> {
+    // A load failure is kept for the life of the process: the library ships in the image,
+    // so it cannot appear later.
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(load).as_ref().map_err(Clone::clone)
 }
@@ -137,13 +150,22 @@ pub fn available() -> Result<(), String> {
     api().map(|_| ())
 }
 
+const OUT_OF_HOST_MEMORY: &str = "ERROR_OUT_OF_HOST_MEMORY";
+const OUT_OF_DEVICE_MEMORY: &str = "ERROR_OUT_OF_DEVICE_MEMORY";
+
+/// An error this module produced is a resource shortage (host or device memory), not a
+/// missing capability: the probe calls it indeterminate.
+pub fn is_resource_error(message: &str) -> bool {
+    message.contains(OUT_OF_HOST_MEMORY) || message.contains(OUT_OF_DEVICE_MEMORY)
+}
+
 fn check(what: &str, result: c_int) -> Result<(), String> {
     // pyrowave_result: negative is an error, 1 is TIMEOUT.
     let name = match result {
         -1 => "ERROR_GENERIC",
         -2 => "ERROR_INVALID_ARGUMENT",
-        -3 => "ERROR_OUT_OF_HOST_MEMORY",
-        -4 => "ERROR_OUT_OF_DEVICE_MEMORY",
+        -3 => OUT_OF_HOST_MEMORY,
+        -4 => OUT_OF_DEVICE_MEMORY,
         -5 => "ERROR_NO_VULKAN (no Vulkan device with the features PyroWave needs)",
         -6 => "ERROR_NOT_IMPLEMENTED",
         _ => "",
@@ -155,41 +177,45 @@ fn check(what: &str, result: c_int) -> Result<(), String> {
     }
 }
 
+/// Granite, inside the library, keeps process-wide state: device creation and teardown
+/// are serialized across every element and probe in the process.
+static DEVICE_LOCK: Mutex<()> = Mutex::new(());
+
 /// A PyroWave Vulkan device: PyroWave's own VkDevice on the chosen GPU.
 pub struct Device(NonNull<c_void>);
 
-// SAFETY: the device is only reached through an Encoder/Decoder, each used under its
-// owner's lock; device calls themselves are made once, at create and destroy.
+// SAFETY: create and destroy run under DEVICE_LOCK; between them the handle is only
+// passed to encoder/decoder creation, each of which its owner serializes. Nothing more
+// is shown about the library's thread safety.
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
 impl Device {
-    /// The GPU behind `render_node` (`/dev/dri/renderD*` or a by-path link to one), or the
+    /// The GPU behind `render_node` (`/dev/dri/renderD*` or a link to one), or the
     /// library's default device when `None`.
     pub fn open(render_node: Option<&Path>) -> Result<Arc<Device>, String> {
         let api = api()?;
+        let _lock = DEVICE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut raw = ptr::null_mut();
         match render_node {
             None => check("pyrowave_create_default_device", unsafe {
                 (api.create_default_device)(&mut raw)
             })?,
             Some(node) => {
-                let (vid, pid) = pci_ids(node)?;
-                // shortcut: matches by PCI vendor/device id, so two identical GPUs on one
-                // host both open the first; match VkPhysicalDeviceIDProperties::deviceUUID
-                // (via VK_EXT_physical_device_drm) when such a host exists.
+                let uuid = device_uuid(render_minor(node)?)
+                    .map_err(|e| format!("{}: {e}", node.display()))?;
                 check("pyrowave_create_device_by_compat", unsafe {
                     (api.create_device_by_compat)(
-                        vid,
-                        pid,
-                        ptr::null(),
+                        0,
+                        0,
+                        uuid.as_ptr().cast(),
                         ptr::null(),
                         ptr::null(),
                         VK_QUEUE_GLOBAL_PRIORITY_MEDIUM,
                         &mut raw,
                     )
                 })
-                .map_err(|e| format!("{e} for {} ({vid:04x}:{pid:04x})", node.display()))?
+                .map_err(|e| format!("{e} for {}", node.display()))?
             }
         }
         NonNull::new(raw)
@@ -201,26 +227,72 @@ impl Device {
 impl Drop for Device {
     fn drop(&mut self) {
         if let Ok(api) = api() {
+            let _lock = DEVICE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             unsafe { (api.device_destroy)(self.0.as_ptr()) }
         }
     }
 }
 
-/// PCI vendor and device id of a DRM node, from sysfs.
-fn pci_ids(node: &Path) -> Result<(u32, u32), String> {
-    let real = std::fs::canonicalize(node).map_err(|e| format!("{}: {e}", node.display()))?;
-    let name = real
-        .file_name()
-        .ok_or_else(|| format!("{} names no DRM node", node.display()))?;
-    let dir = Path::new("/sys/class/drm").join(name).join("device");
-    let read = |f: &str| -> Result<u32, String> {
-        let path = dir.join(f);
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        u32::from_str_radix(text.trim().trim_start_matches("0x"), 16)
-            .map_err(|e| format!("{}: {e}", path.display()))
-    };
-    Ok((read("vendor")?, read("device")?))
+/// The DRM minor of a render node (a link is followed).
+fn render_minor(node: &Path) -> Result<u32, String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::metadata(node).map_err(|e| format!("{}: {e}", node.display()))?;
+    if !meta.file_type().is_char_device() {
+        return Err(format!("{} is not a device node", node.display()));
+    }
+    Ok(libc::minor(meta.rdev()))
+}
+
+/// The one `deviceUUID` among `devices` (render minor, UUID) whose render node is `minor`.
+fn pick_uuid(devices: &[(Option<u32>, [u8; 16])], minor: u32) -> Result<[u8; 16], String> {
+    let mut found = devices.iter().filter(|(m, _)| *m == Some(minor));
+    match (found.next(), found.next()) {
+        (Some((_, uuid)), None) => Ok(*uuid),
+        (None, _) => Err(format!("no Vulkan device has render minor {minor}")),
+        (Some(_), Some(_)) => Err(format!("two Vulkan devices claim render minor {minor}")),
+    }
+}
+
+/// `VkPhysicalDeviceIDProperties::deviceUUID` of the Vulkan device on render minor `minor`,
+/// matched through `VK_EXT_physical_device_drm`. Instance-level calls only: never
+/// `ash::Device::load` (the #267 loader race, `.claude/rules/gstreamer-gotchas.md`).
+fn device_uuid(minor: u32) -> Result<[u8; 16], String> {
+    let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("Vulkan loader: {e}"))?;
+    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+    let instance = unsafe {
+        entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app),
+            None,
+        )
+    }
+    .map_err(|e| format!("vkCreateInstance: {e}"))?;
+    let devices = unsafe { instance.enumerate_physical_devices() }
+        .map_err(|e| format!("vkEnumeratePhysicalDevices: {e}"));
+    let devices = devices.map(|list| {
+        list.into_iter()
+            .map(|pd| unsafe {
+                let has_drm = instance
+                    .enumerate_device_extension_properties(pd)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|e| {
+                        e.extension_name_as_c_str() == Ok(ash::ext::physical_device_drm::NAME)
+                    });
+                let mut id = vk::PhysicalDeviceIDProperties::default();
+                let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+                let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+                if has_drm {
+                    props = props.push_next(&mut drm);
+                }
+                instance.get_physical_device_properties2(pd, &mut props);
+                let render =
+                    (has_drm && drm.has_render == vk::TRUE).then_some(drm.render_minor as u32);
+                (render, id.device_uuid)
+            })
+            .collect::<Vec<_>>()
+    });
+    unsafe { instance.destroy_instance(None) };
+    pick_uuid(&devices?, minor)
 }
 
 /// An 8-bit 4:2:0 picture in CPU memory.
@@ -448,5 +520,40 @@ impl Drop for Decoder {
         if let Ok(api) = api() {
             unsafe { (api.decoder_destroy)(self.raw.as_ptr()) }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_render_node_picks_exactly_one_device_uuid() {
+        let a = [1u8; 16];
+        let b = [2u8; 16];
+        // Two identical GPUs: same PCI ids, different render minors and UUIDs.
+        let devices = [(Some(128), a), (Some(129), b), (None, [3u8; 16])];
+        assert_eq!(pick_uuid(&devices, 129), Ok(b));
+        assert_eq!(pick_uuid(&devices, 128), Ok(a));
+        assert!(pick_uuid(&devices, 130).is_err(), "no such node");
+        assert!(
+            pick_uuid(&[(Some(128), a), (Some(128), b)], 128).is_err(),
+            "ambiguous"
+        );
+    }
+
+    #[test]
+    fn the_render_minor_comes_from_the_device_number() {
+        // /dev/null is char device 1:3 on Linux.
+        assert_eq!(render_minor(Path::new("/dev/null")), Ok(3));
+        assert!(render_minor(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn only_memory_shortages_are_resource_errors() {
+        assert!(is_resource_error(&check("x", -4).unwrap_err()));
+        assert!(is_resource_error(&check("x", -3).unwrap_err()));
+        assert!(!is_resource_error(&check("x", -5).unwrap_err()));
+        assert!(check("x", 1).is_ok(), "TIMEOUT is not an error");
     }
 }

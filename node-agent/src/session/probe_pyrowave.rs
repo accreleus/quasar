@@ -37,6 +37,16 @@ fn test_picture(w: usize, h: usize) -> Vec<u8> {
     pic
 }
 
+/// A resource shortage says nothing about the GPU's capability: indeterminate, so the
+/// last definitive result stands (agent-api.md amendment 11). Anything else is `definite`.
+fn classify(message: String, definite: fn(String) -> ProbeVerdict) -> ProbeVerdict {
+    if gstpyrowave::ffi::is_resource_error(&message) {
+        ProbeVerdict::Indeterminate(message)
+    } else {
+        definite(message)
+    }
+}
+
 pub fn run(request: &MediaProbeRequest) -> ProbeVerdict {
     let (w, h, fps) = (request.width, request.height, request.fps);
     if request.frames == 0 || w <= 0 || h <= 0 || w % 2 != 0 || h % 2 != 0 || fps <= 0 {
@@ -58,9 +68,11 @@ pub fn run(request: &MediaProbeRequest) -> ProbeVerdict {
         return ProbeVerdict::Unsupported("pyrowaveenc is not in this image".into());
     }
     // The element opens its own device; this one is the reference decoder's.
-    let device = match gstpyrowave::ffi::Device::open(Some(Path::new(&node))) {
+    let decoder = gstpyrowave::ffi::Device::open(Some(Path::new(&node)))
+        .and_then(|device| gstpyrowave::ffi::Decoder::new(device, w as u32, h as u32));
+    let mut decoder = match decoder {
         Ok(d) => d,
-        Err(e) => return ProbeVerdict::Unsupported(format!("{node}: {e}")),
+        Err(e) => return classify(format!("{node}: {e}"), ProbeVerdict::Unsupported),
     };
     tracing::info!(
         "pyrowave probe: gpu={} {w}x{h}@{fps} render_node={node}, want {} frames within {:?}",
@@ -68,17 +80,14 @@ pub fn run(request: &MediaProbeRequest) -> ProbeVerdict {
         request.frames,
         request.budget
     );
-    match encode_and_check(request, &node, &device) {
-        Ok(verdict) | Err(verdict) => verdict,
-    }
+    encode_and_check(request, &node, &mut decoder)
 }
 
 fn encode_and_check(
     request: &MediaProbeRequest,
     node: &str,
-    device: &std::sync::Arc<gstpyrowave::ffi::Device>,
-) -> Result<ProbeVerdict, ProbeVerdict> {
-    let (w, h) = (request.width as usize, request.height as usize);
+    decoder: &mut gstpyrowave::ffi::Decoder,
+) -> ProbeVerdict {
     let caps = gst::Caps::builder("video/x-raw")
         .field("format", "I420")
         .field("width", request.width)
@@ -86,23 +95,27 @@ fn encode_and_check(
         .field("framerate", gst::Fraction::new(request.fps, 1))
         .field("colorimetry", "bt709")
         .build();
-    let fail = |e: &dyn std::fmt::Display| ProbeVerdict::Fail(format!("{node}: {e}"));
     let src = gst_app::AppSrc::builder()
         .caps(&caps)
         .format(gst::Format::Time)
         .build();
-    let enc = gst::ElementFactory::make("pyrowaveenc")
+    let enc = match gst::ElementFactory::make("pyrowaveenc")
         .property("device", node)
         .property("bitrate", PROBE_KBPS)
         .build()
-        .map_err(|e| fail(&e))?;
+    {
+        Ok(enc) => enc,
+        Err(e) => return ProbeVerdict::Fail(format!("{node}: {e}")),
+    };
     let sink = gst_app::AppSink::builder().sync(false).build();
     let pipeline = gst::Pipeline::new();
-    pipeline
+    if let Err(e) = pipeline
         .add_many([src.upcast_ref(), &enc, sink.upcast_ref()])
         .and_then(|_| gst::Element::link_many([src.upcast_ref(), &enc, sink.upcast_ref()]))
-        .map_err(|e| fail(&e))?;
-    let bus_error = |pipeline: &gst::Pipeline| {
+    {
+        return ProbeVerdict::Fail(format!("{node}: {e}"));
+    }
+    let bus_error = || {
         pipeline
             .bus()
             .and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error]))
@@ -111,19 +124,59 @@ fn encode_and_check(
                 _ => None,
             })
     };
-    let stop = |pipeline: &gst::Pipeline| {
-        let _ = pipeline.set_state(gst::State::Null);
+    // READY→PAUSED opens the element's device: a refusal there is the GPU or image having
+    // no PyroWave encoder, a hardware fact like a codec probe's READY failure.
+    let started = pipeline.set_state(gst::State::Playing).is_ok();
+    let outcome = if started {
+        push_and_read_back(request, &src, &sink, decoder)
+    } else {
+        Err(String::new())
     };
-    // READY→PAUSED opens the device and loads the library: a refusal there is the GPU or
-    // image having no PyroWave encoder, a hardware fact like a codec probe's READY failure.
-    if pipeline.set_state(gst::State::Playing).is_err() {
-        let why = bus_error(&pipeline).unwrap_or_else(|| "no error message".into());
-        stop(&pipeline);
-        return Err(ProbeVerdict::Unsupported(format!(
-            "{node}: pyrowaveenc did not start: {why}"
-        )));
+    let error = bus_error();
+    // Every path below has stopped the pipeline.
+    let _ = pipeline.set_state(gst::State::Null);
+    if !started {
+        let why = error.unwrap_or_else(|| "no error message".into());
+        return classify(
+            format!("{node}: pyrowaveenc did not start: {why}"),
+            ProbeVerdict::Unsupported,
+        );
     }
+    if let Some(e) = error {
+        return classify(format!("{node}: encode failed: {e}"), ProbeVerdict::Fail);
+    }
+    let (frames, worst, worst_plane) = match outcome {
+        Ok(read) => read,
+        Err(e) => return classify(format!("{node}: {e}"), ProbeVerdict::Fail),
+    };
+    if frames < request.frames {
+        // A deadline passed (a device lost mid-probe shows this way too): inconclusive.
+        return ProbeVerdict::Indeterminate(format!(
+            "{node}: pyrowaveenc produced {frames} of {} frames within {:?}",
+            request.frames, request.budget
+        ));
+    }
+    if worst < MIN_PSNR_DB {
+        return ProbeVerdict::Fail(format!(
+            "{node}: PyroWave frames decode, but the picture is wrong: {worst_plane} plane \
+             {worst:.1} dB, under {MIN_PSNR_DB} dB"
+        ));
+    }
+    ProbeVerdict::Pass(format!(
+        "encoded {frames} frames with pyrowaveenc on {node} at {PROBE_KBPS} kbit/s; the \
+         reference decoder read every one back (worst plane {worst_plane} {worst:.1} dB)"
+    ))
+}
 
+/// Push the test picture `request.frames` times and decode what comes out within the
+/// budget: frames read back, the worst plane PSNR and its plane.
+fn push_and_read_back(
+    request: &MediaProbeRequest,
+    src: &gst_app::AppSrc,
+    sink: &gst_app::AppSink,
+    decoder: &mut gstpyrowave::ffi::Decoder,
+) -> Result<(u64, f64, &'static str), String> {
+    let (w, h) = (request.width as usize, request.height as usize);
     let picture = test_picture(w, h);
     let frame_ns = 1_000_000_000 / request.fps as u64;
     for i in 0..request.frames {
@@ -138,15 +191,8 @@ fn encode_and_check(
     let _ = src.end_of_stream();
 
     let deadline = Instant::now() + request.budget;
-    let mut decoder =
-        gstpyrowave::ffi::Decoder::new(device.clone(), w as u32, h as u32).map_err(|e| {
-            stop(&pipeline);
-            ProbeVerdict::Unsupported(format!("{node}: reference decoder: {e}"))
-        })?;
     let (ysz, csz) = (w * h, w * h / 4);
-    let mut frames = 0;
-    let mut worst = f64::INFINITY;
-    let mut worst_plane = "";
+    let (mut frames, mut worst, mut worst_plane) = (0, f64::INFINITY, "");
     while frames < request.frames {
         let left = deadline.saturating_duration_since(Instant::now());
         let Some(sample) =
@@ -154,12 +200,11 @@ fn encode_and_check(
         else {
             break;
         };
-        let Some(buffer) = sample.buffer() else { break };
-        let map = buffer.map_readable().map_err(|e| fail(&e))?;
-        let decoded = decoder.decode_i420(&map).map_err(|e| {
-            stop(&pipeline);
-            fail(&format!("frame {frames} does not decode: {e}"))
-        })?;
+        let buffer = sample.buffer().ok_or("a sample with no buffer")?;
+        let map = buffer.map_readable().map_err(|e| e.to_string())?;
+        let decoded = decoder
+            .decode_i420(&map)
+            .map_err(|e| format!("frame {frames} does not decode: {e}"))?;
         for (range, plane) in [
             (0..ysz, "y"),
             (ysz..ysz + csz, "cb"),
@@ -172,27 +217,7 @@ fn encode_and_check(
         }
         frames += 1;
     }
-    let error = bus_error(&pipeline);
-    stop(&pipeline);
-    if let Some(e) = error {
-        return Err(fail(&format!("encode failed after {frames} frames: {e}")));
-    }
-    if frames < request.frames {
-        return Err(fail(&format!(
-            "pyrowaveenc produced {frames} of {} frames within {:?}",
-            request.frames, request.budget
-        )));
-    }
-    if worst < MIN_PSNR_DB {
-        return Err(ProbeVerdict::Fail(format!(
-            "{node}: PyroWave frames decode, but the picture is wrong: {worst_plane} plane \
-             {worst:.1} dB, under {MIN_PSNR_DB} dB"
-        )));
-    }
-    Ok(ProbeVerdict::Pass(format!(
-        "encoded {frames} frames with pyrowaveenc on {node} at {PROBE_KBPS} kbit/s; the \
-         reference decoder read every one back (worst plane {worst_plane} {worst:.1} dB)"
-    )))
+    Ok((frames, worst, worst_plane))
 }
 
 #[cfg(test)]
@@ -204,6 +229,25 @@ mod tests {
         let pic = test_picture(64, 32);
         assert_eq!(pic.len(), 64 * 32 * 3 / 2);
         assert!(pic.iter().all(|&v| (16..=240).contains(&v)));
+    }
+
+    #[test]
+    fn a_memory_shortage_is_indeterminate_and_anything_else_definite() {
+        let oom =
+            "/dev/dri/renderD128: pyrowave_encoder_create failed: -4 ERROR_OUT_OF_DEVICE_MEMORY";
+        assert!(matches!(
+            classify(oom.into(), ProbeVerdict::Unsupported),
+            ProbeVerdict::Indeterminate(_)
+        ));
+        let novk = "pyrowave_create_device_by_compat failed: -5 ERROR_NO_VULKAN";
+        assert!(matches!(
+            classify(novk.into(), ProbeVerdict::Unsupported),
+            ProbeVerdict::Unsupported(_)
+        ));
+        assert!(matches!(
+            classify("x".into(), ProbeVerdict::Fail),
+            ProbeVerdict::Fail(_)
+        ));
     }
 
     #[test]
