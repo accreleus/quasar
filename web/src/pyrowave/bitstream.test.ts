@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { BLOCK_LOST, BLOCK_ZERO, blockLayout, buildUpload, parsePwv1, parsePwv1Header } from "./bitstream";
+import { BLOCK_LOST, BLOCK_ZERO, PyroWaveError, blockLayout, buildUpload, parsePwv1, parsePwv1Header } from "./bitstream";
 
 const fixture = (name: string) => new Uint8Array(readFileSync(resolve(__dirname, "../../../testdata/pyrowave", name)));
 
-// A block packet: header words (payload_words, ballot, block_index) then filler words.
-function block(index: number, payloadWords: number, ballot = 1, fill = 0xa0): Uint8Array {
+// A block packet: header words (payload_words, ballot, block_index) then filler words. Ballot 0
+// (no 8x8 block set) needs nothing past the header, so any payload_words >= 2 is consistent.
+function block(index: number, payloadWords: number, ballot = 0, fill = 0xa0): Uint8Array {
   const b = new Uint8Array(Math.max(payloadWords, 2) * 4).fill(fill);
   const dv = new DataView(b.buffer);
   dv.setUint32(0, (payloadWords << 16) | ballot, true);
@@ -84,8 +85,8 @@ describe("buildUpload", () => {
   it("points each received block at its words, marks covered gaps zero and uncovered indices lost", () => {
     const covered = new Uint8Array(72);
     covered.fill(1, 0, 10); // a datagram covering [0, 10) arrived; nothing else did
-    const b3 = block(3, 4, 1, 0x33);
-    const b7 = block(7, 2, 1, 0x77);
+    const b3 = block(3, 4, 0, 0x33);
+    const b7 = block(7, 2, 0, 0x77);
     const up = buildUpload(layout, [concat(sof(), b3, b7)], covered);
 
     expect(up.offsets[3]).not.toBe(BLOCK_ZERO);
@@ -108,7 +109,7 @@ describe("buildUpload", () => {
   });
 
   it("keeps the first copy of a block sent twice", () => {
-    const up = buildUpload(layout, [block(4, 3, 1, 0x01), block(4, 3, 1, 0x02)], null);
+    const up = buildUpload(layout, [block(4, 3, 0, 0x01), block(4, 3, 0, 0x02)], null);
     expect(new Uint8Array(up.payload.buffer, up.offsets[4] * 4 + 8, 1)[0]).toBe(0x01);
     expect(up.received).toBe(1);
   });
@@ -125,6 +126,41 @@ describe("buildUpload", () => {
     ["a buffer that is not whole words", [new Uint8Array(6)]],
   ])("refuses %s", (_name, packets) => {
     expect(() => buildUpload(layout, packets, null)).toThrow();
+  });
+
+  it("a block shorter than its own header claims is lost, even where covered; the next block is received", () => {
+    const short = block(2, 2, 0xffff); // 16 code words announced, none present
+    const planes = block(3, 4, 1, 0xff); // one 8x8 block, cw 0xffff, 15 base planes: ~155 bytes, has 16
+    const up = buildUpload(layout, [concat(short, planes, block(4, 2))], new Uint8Array(72).fill(1));
+    expect(up.offsets[2]).toBe(BLOCK_LOST);
+    expect(up.offsets[3]).toBe(BLOCK_LOST);
+    expect(up.offsets[4]).not.toBe(BLOCK_LOST);
+    expect(up.offsets[4]).not.toBe(BLOCK_ZERO);
+    expect([up.received, up.zero, up.lost]).toEqual([1, 69, 2]);
+  });
+
+  it("accepts a block that holds exactly what its header claims", () => {
+    // ballot 1 -> one cw + one qb byte; cw 0x0001 (sub 0 has 1 extra plane), qb 0: 8 + 3 + 1 bytes.
+    const b = block(5, 3, 1, 0);
+    new DataView(b.buffer).setUint16(8, 1, true);
+    expect(buildUpload(layout, [b], null).offsets[5]).not.toBe(BLOCK_LOST);
+    new DataView(b.buffer).setUint16(8, 0xffff, true); // now 8 + 3 + 24 bytes: too short
+    expect(buildUpload(layout, [b], null).offsets[5]).toBe(BLOCK_LOST);
+  });
+
+  it("sizes the payload from the accepted blocks, not from what arrived", () => {
+    const dup = Array.from({ length: 1000 }, () => block(3, 100));
+    expect(buildUpload(layout, dup, null).payload.length).toBeLessThanOrEqual(100 + 4);
+  });
+
+  it("refuses a start-of-frame header whose size differs from the configuration", () => {
+    const frame = parsePwv1(fixture("detail_200x114_hi.pwv1")).frames[0].slice();
+    expect(() => buildUpload(blockLayout(320, 192), [frame], null)).toThrow(PyroWaveError);
+    const dv = new DataView(frame.buffer);
+    dv.setUint32(0, (dv.getUint32(0, true) & ~0x3fff) | 199, true); // width 200 -> 200 still
+    expect(buildUpload(layout, [frame], null).received).toBe(68);
+    dv.setUint32(0, (dv.getUint32(0, true) & ~0x3fff) | 255, true); // width 256
+    expect(() => buildUpload(layout, [frame], null)).toThrow(/256x114/);
   });
 
   it("refuses a coverage map of the wrong size", () => {

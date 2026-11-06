@@ -159,12 +159,12 @@ test-uinput: ## Node-agent virtual input against this host's real /dev/uinput (r
 test-web: ## Web SPA: install, typecheck, unit tests, production build
 	@bash $(DX)/common.sh require-local test-web
 	@bash scripts/verify.sh web
-
+# Same image and digest as CI's web-webgpu job; its version must match web/package.json's pinned `playwright`.
 # The image's version must match web/package.json's pinned `playwright` (and CI's web-webgpu job).
 test-webgpu: ## Web WebGPU tests (the PyroWave decoder vs the golden fixtures) in headless Chromium
 	@bash $(DX)/common.sh require-local test-webgpu
 	docker run --rm --user "$$(id -u):$$(id -g)" -e HOME=/tmp/h -v "$(CURDIR)":/w -w /w/web \
-	  mcr.microsoft.com/playwright:v1.56.0-noble sh -c 'npm ci --no-audit --no-fund && npx vitest run --config vitest.webgpu.config.ts'
+	  mcr.microsoft.com/playwright:v1.56.0-noble@sha256:35246d87a7c88ea9b771c65d33171b2611b02a8253b4b12ce6f94376c55f99f2 sh -c 'npm ci --no-audit --no-fund && npx vitest run --config vitest.webgpu.config.ts'
 
 test-db: ## Control-plane DB tests against a FRESH ephemeral Postgres (-p 1)
 	@bash $(DX)/testdb.sh

@@ -3,6 +3,10 @@
 // Precision follows upstream's PYROWAVE_PRECISION=1: fp32 maths, fp16 storage for levels 0-1
 // when the device has shader-f16.
 
+// A hostile block can dequantise past f16's range: clamp so it stores no Inf (and no NaN later).
+const toHi = (hi: string) =>
+  hi === "f16" ? "fn to_hi(v: f32) -> f16 { return f16(clamp(v, -65504.0, 65504.0)); }" : "fn to_hi(v: f32) -> f32 { return v; }";
+
 /**
  * Dequantise every block of a frame, one 128-lane workgroup per 32x32 block. Needs `subgroups`
  * (the no-subgroup path is B06, #1055). A block whose offset is BLOCK_LOST is not written, so its
@@ -22,9 +26,8 @@ struct Params { num_bands: u32, wg_stride: u32, total_blocks: u32, p1: u32, band
 @group(0) @binding(3) var<storage, read_write> coef_hi: array<${HI}>;
 @group(0) @binding(4) var<storage, read_write> coef_lo: array<f32>;
 @group(0) @binding(5) var<storage, read> block_band: array<u32>;
+${toHi(HI)}
 
-// Lanes 0-15 are all in subgroup 0 only when the subgroup is at least 16 wide.
-override SG_AT_LEAST_16: bool = false;
 const BLOCK_ZERO = 0xffffffffu;
 const BLOCK_LOST = 0xfffffffeu;
 
@@ -88,22 +91,19 @@ fn main(@builtin(workgroup_id) wg: vec3u,
     let lco = countOneBits(extractBits(ballot, 0u, li));
     cost = plane_bytes(rd16(off * 2u + 4u + lco), rd8(off * 4u + 8u + nset * 2u + lco) & 0xfu);
   }
-  var incl: u32;
-  if (SG_AT_LEAST_16) {
-    incl = subgroupInclusiveAdd(cost);
-  } else {
-    if (li < 16u) { sh_scan[li] = cost; }
+  // shortcut: a subgroupInclusiveAdd scan is possible when lanes 0-15 share a subgroup (size >= 16);
+  // B12's bench decides whether it comes back, with real-GPU tests to cover it.
+  if (li < 16u) { sh_scan[li] = cost; }
+  workgroupBarrier();
+  for (var s = 1u; s < 16u; s <<= 1u) {
+    var up = 0u;
+    if (li < 16u && li >= s) { up = sh_scan[li - s]; }
     workgroupBarrier();
-    for (var s = 1u; s < 16u; s <<= 1u) {
-      var up = 0u;
-      if (li < 16u && li >= s) { up = sh_scan[li - s]; }
-      workgroupBarrier();
-      if (li < 16u) { sh_scan[li] += up; }
-      workgroupBarrier();
-    }
-    incl = sh_scan[min(li, 15u)];
+    if (li < 16u) { sh_scan[li] += up; }
     workgroupBarrier();
   }
+  let incl = sh_scan[min(li, 15u)];
+  workgroupBarrier();
   if (li < 16u) {
     sh_plane_off[li] = base + incl - cost;
     if (li == 15u) { sh_sign_off = 8u * (base + incl); }
@@ -166,7 +166,7 @@ fn main(@builtin(workgroup_id) wg: vec3u,
     let p = coord + vec2u(b >> 1u, b & 1u);
     if (p.x < d.width && p.y < d.height) {
       let idx = d.out_base + p.y * d.width + p.x;
-      if (d.lo != 0u) { coef_lo[idx] = v[b]; } else { coef_hi[idx] = ${HI}(v[b]); }
+      if (d.lo != 0u) { coef_lo[idx] = v[b]; } else { coef_hi[idx] = to_hi(v[b]); }
     }
   }
 }`;
@@ -188,6 +188,7 @@ struct C { in_base: vec4u, bw: u32, bh: u32, out_base: u32, mode: u32 };
 @group(0) @binding(1) var<storage, read_write> coef_hi: array<${HI}>;
 @group(0) @binding(2) var<storage, read_write> coef_lo: array<f32>;
 @group(0) @binding(3) var<storage, read_write> planes: array<f32>;
+${toHi(HI)}
 
 const ALPHA = -1.586134342059924;
 const BETA = -0.052980118572961;
@@ -276,7 +277,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
       } else if (out_kind == 1u) {
         coef_lo[o] = v;
       } else {
-        coef_hi[o] = ${HI}(v);
+        coef_hi[o] = to_hi(v);
       }
     }
   }

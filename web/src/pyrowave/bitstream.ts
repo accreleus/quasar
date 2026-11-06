@@ -9,6 +9,24 @@ export const BLOCK_ZERO = 0xffff_ffff;
 /** offsets[] marker: no received datagram covers the index; the decoder conceals it. */
 export const BLOCK_LOST = 0xffff_fffe;
 
+export type PyroWaveErrorReason =
+  | "bad_frame" // malformed input: drop the frame
+  | "too_large" // the configuration does not fit this device or the negotiated resolution
+  | "no_subgroups" // the device lacks what the decoder path needs (fallback: #1055)
+  | "gpu_error" // WebGPU reported a validation or out-of-memory error
+  | "device_lost" // rebuild the device and the decoder
+  | "destroyed";
+
+export class PyroWaveError extends Error {
+  constructor(
+    readonly reason: PyroWaveErrorReason,
+    message: string,
+  ) {
+    super(`PyroWave: ${message}`);
+    this.name = "PyroWaveError";
+  }
+}
+
 export interface PyroWaveHeader {
   width: number;
   height: number;
@@ -59,6 +77,8 @@ export interface Band {
 }
 
 export interface BlockLayout {
+  width: number;
+  height: number;
   /** Aligned picture size: a multiple of 32, at least 128. */
   aw: number;
   ah: number;
@@ -113,6 +133,8 @@ export function blockLayout(width: number, height: number): BlockLayout {
   const planeY = aw * ah;
   const planeC = (aw >> 1) * (ah >> 1);
   return {
+    width,
+    height,
     aw,
     ah,
     bands,
@@ -129,6 +151,7 @@ export function blockLayout(width: number, height: number): BlockLayout {
 export interface Upload {
   /** Per block index: the block's first word in `payload`, BLOCK_ZERO or BLOCK_LOST. */
   offsets: Uint32Array<ArrayBuffer>;
+  /** The accepted blocks only: at most one per index, so at most N * 4095 words plus padding. */
   payload: Uint32Array<ArrayBuffer>;
   received: number;
   zero: number;
@@ -138,49 +161,85 @@ export interface Upload {
 // The dequant shader reads the sign bits a word past a block's end.
 const PAYLOAD_PAD_WORDS = 2;
 
+const popcount16 = (v: number) => {
+  let n = 0;
+  for (; v; v &= v - 1) n++;
+  return n;
+};
+
+/**
+ * The bytes a block's own header says it needs before its sign bits: the 8-byte header, a u16
+ * code word and a byte of plane count and scale per set ballot bit, then the magnitude planes.
+ * Infinity when the block is too short to hold its own code words.
+ */
+function blockBytesBeforeSigns(dv: DataView, o: number, pw: number): number {
+  const ballot = dv.getUint16(o, true);
+  const nset = popcount16(ballot);
+  let need = 8 + 3 * nset;
+  if (need > pw * 4) return Infinity;
+  for (let i = 0; i < nset; i++) {
+    const cw = dv.getUint16(o + 8 + 2 * i, true);
+    const qb = dv.getUint8(o + 8 + 2 * nset + i) & 0xf;
+    // Per 4x2 subblock: qb planes plus the 2-bit extra count in cw.
+    for (let sub = 0; sub < 8; sub++) need += qb + ((cw >>> (2 * sub)) & 3);
+  }
+  return need;
+}
+
 /**
  * One frame's GPU upload. `packets` are buffers of whole packets (a datagram's packets, a
- * reassembled oversized block, or a whole library frame); a SOF among them is skipped.
- * `covered[i]` is nonzero when a received datagram covers block index i (amendment 55
- * §Coverage); null means every index is covered. A block that arrived is received whatever the
- * map says; a covered index without a block is zero; anything else is lost.
+ * reassembled oversized block, or a whole library frame); a SOF among them is checked against
+ * the configuration and skipped. `covered[i]` is nonzero when a received datagram covers block
+ * index i (amendment 55 §Coverage); null means every index is covered. A block that arrived and
+ * holds what its own header claims is received; a covered index without one is zero; anything
+ * else, a short block included, is lost.
  */
 export function buildUpload(layout: BlockLayout, packets: readonly Uint8Array[], covered: Uint8Array | null): Upload {
   const n = layout.totalBlocks;
-  if (covered && covered.length !== n) throw new Error(`PyroWave: coverage has ${covered.length} entries, the frame ${n}`);
+  const bad = (why: string) => new PyroWaveError("bad_frame", why);
+  if (covered && covered.length !== n) throw bad(`coverage has ${covered.length} entries, the frame ${n}`);
   const offsets = new Uint32Array(n).fill(BLOCK_LOST);
+  const short = new Uint8Array(n); // dropped, so lost even where covered
+  const accepted: { dv: DataView; o: number; pw: number }[] = [];
   let words = PAYLOAD_PAD_WORDS;
-  for (const p of packets) words += p.byteLength >> 2;
-  // shortcut: one copy per frame after it is complete; B08 can write blocks as datagrams arrive (amendment 55 §Receiving).
-  const payload = new Uint32Array(words);
-  let w = 0;
-  let received = 0;
   for (const p of packets) {
-    if (p.byteLength & 3) throw new Error("PyroWave: a packet buffer is not whole words");
+    if (p.byteLength & 3) throw bad("a packet buffer is not whole words");
     const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
     for (let o = 0; o < p.byteLength; ) {
       const w0 = dv.getUint32(o, true);
       if (w0 >>> 31) {
-        o += 8; // SOF: the configuration comes from hello_ack
+        if (o + 8 > p.byteLength) throw bad("a truncated start-of-frame header");
+        const w1 = dv.getUint32(o + 4, true);
+        if ((w1 >>> 24) & 3) throw bad("an unknown extended packet");
+        const w = (w0 & 0x3fff) + 1;
+        const h = ((w0 >>> 14) & 0x3fff) + 1;
+        if (w !== layout.width || h !== layout.height) throw bad(`the frame is ${w}x${h}, the configuration ${layout.width}x${layout.height}`);
+        o += 8;
         continue;
       }
       const pw = (w0 >>> 16) & 0xfff;
-      if (pw < 2 || o + pw * 4 > p.byteLength) throw new Error(`PyroWave: bad block at byte ${o}`);
+      if (pw < 2 || o + pw * 4 > p.byteLength) throw bad(`a bad block at byte ${o}`);
       const index = dv.getUint32(o + 4, true) >>> 8;
-      if (index >= n) throw new Error(`PyroWave: block index ${index} outside [0, ${n})`);
+      if (index >= n) throw bad(`block index ${index} outside [0, ${n})`);
       if (offsets[index] === BLOCK_LOST) {
-        offsets[index] = w;
-        for (let i = 0; i < pw; i++) payload[w++] = dv.getUint32(o + 4 * i, true);
-        received++;
+        if (blockBytesBeforeSigns(dv, o, pw) > pw * 4) short[index] = 1;
+        else {
+          offsets[index] = words - PAYLOAD_PAD_WORDS;
+          accepted.push({ dv, o, pw });
+          words += pw;
+        }
       }
       o += pw * 4;
     }
   }
+  const payload = new Uint32Array(words);
+  let w = 0;
+  for (const { dv, o, pw } of accepted) for (let i = 0; i < pw; i++) payload[w++] = dv.getUint32(o + 4 * i, true);
   let zero = 0;
   for (let i = 0; i < n; i++)
-    if (offsets[i] === BLOCK_LOST && (!covered || covered[i])) {
+    if (offsets[i] === BLOCK_LOST && !short[i] && (!covered || covered[i])) {
       offsets[i] = BLOCK_ZERO;
       zero++;
     }
-  return { offsets, payload, received, zero, lost: n - received - zero };
+  return { offsets, payload, received: accepted.length, zero, lost: n - accepted.length - zero };
 }

@@ -1,9 +1,14 @@
 // Runs in headless Chromium on WebGPU (vitest.webgpu.config.ts, `make test-webgpu`), not jsdom.
 // Decodes every golden fixture (testdata/pyrowave) and holds it to the manifest's decoder_bar.
-import { beforeAll, describe, expect, it } from "vitest";
+// VITE_PYROWAVE_PATHS / VITE_PYROWAVE_SUBGROUP_MIN state what the adapter must offer (defaults:
+// SwiftShader); a real-GPU run sets them, so a missing feature fails instead of narrowing the run.
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import manifest from "../../../testdata/pyrowave/manifest.json";
 import { parsePwv1 } from "./bitstream";
-import { PyroWaveDecoder, pyroWaveDeviceFeatures } from "./decoder";
+import { PyroWaveDecoder, PyroWaveError, pyroWaveDeviceFeatures, type DecoderPath } from "./decoder";
+
+const expectedPaths = String(import.meta.env.VITE_PYROWAVE_PATHS ?? "subgroups-fp32").split(",") as DecoderPath[];
+const expectedSubgroupMin = Number(import.meta.env.VITE_PYROWAVE_SUBGROUP_MIN ?? 4);
 
 const urls: Record<string, string> = import.meta.glob("../../../testdata/pyrowave/*", { query: "?url", import: "default", eager: true });
 async function fixture(file: string): Promise<Uint8Array> {
@@ -36,16 +41,39 @@ beforeAll(async () => {
   device = await adapter.requestDevice({ requiredFeatures: pyroWaveDeviceFeatures(adapter) });
 });
 
-async function decoderFor(file: string) {
+// A WebGPU error is silent unless captured: every test must leave none.
+beforeEach(() => device.pushErrorScope("validation"));
+afterEach(async () => {
+  expect((await device.popErrorScope())?.message ?? null).toBeNull();
+});
+
+async function decoderFor(file: string, forcePath?: DecoderPath) {
   const { header, frames } = parsePwv1(await fixture(file));
-  return { decoder: await PyroWaveDecoder.create(device, header), frame: frames[0], header };
+  return { decoder: await PyroWaveDecoder.create(device, header, { forcePath }), frame: frames[0], header };
 }
 
-describe("PyroWaveDecoder on the golden fixtures", () => {
+async function rejection(p: Promise<unknown>): Promise<PyroWaveError> {
+  const e = await p.then(
+    () => null,
+    (err: unknown) => err,
+  );
+  expect(e).toBeInstanceOf(PyroWaveError);
+  return e as PyroWaveError;
+}
+
+it("runs on the adapter the run expects: decoder paths and subgroup size", () => {
+  const offered = (["fast", "subgroups-fp32"] as const).filter((p) => device.features.has("subgroups") && (p !== "fast" || device.features.has("shader-f16")));
+  console.log(`pyrowave-adapter ${device.adapterInfo.vendor}/${device.adapterInfo.architecture} paths=${offered.join(",")} subgroup=${device.adapterInfo.subgroupMinSize}-${device.adapterInfo.subgroupMaxSize}`);
+  expect(offered).toEqual(expectedPaths);
+  expect(device.adapterInfo.subgroupMinSize).toBe(expectedSubgroupMin);
+});
+
+describe.each(expectedPaths)("PyroWaveDecoder on the golden fixtures, %s path", (path) => {
   const bar = manifest.decoder_bar;
 
   it.each(manifest.fixtures.map((f) => [f.name, f] as const))("%s meets the decoder bar", async (_name, f) => {
-    const { decoder, frame } = await decoderFor(f.pwv1.file);
+    const { decoder, frame } = await decoderFor(f.pwv1.file, path);
+    expect(decoder.path).toBe(path);
     const stats = decoder.decode([frame], null);
     const got = planes(await decoder.readI420(), f.width, f.height);
     const want = planes(await fixture(f.ref.file), f.width, f.height);
@@ -57,6 +85,70 @@ describe("PyroWaveDecoder on the golden fixtures", () => {
       expect(r.psnr, `${r.plane} PSNR`).toBeGreaterThanOrEqual(bar.min_psnr_db);
       expect(r.maxAbs, `${r.plane} max error`).toBeLessThanOrEqual(bar.max_abs_err);
     }
+  });
+});
+
+describe("hostile input", () => {
+  it.each([16384, 8192])("a %i-pixel square header is refused before anything is allocated", async (size) => {
+    const e = await rejection(PyroWaveDecoder.create(device, { width: size, height: size, fullRange: false }));
+    expect(e.reason).toBe("too_large");
+  });
+
+  it("a header larger than the negotiated resolution is refused", async () => {
+    const e = await rejection(PyroWaveDecoder.create(device, { width: 1920, height: 1080, fullRange: false }, { maxPixels: 1280 * 720 }));
+    expect(e.reason).toBe("too_large");
+  });
+
+  it.each([0x00, 0xff])("a block shorter than its header claims is concealed, whatever follows it (tail byte %i)", async (fill) => {
+    const name = "detail_320x192_hi";
+    const { decoder, frame } = await decoderFor(`${name}.pwv1`);
+    decoder.decode([frame], null);
+    const clean = await decoder.readI420();
+
+    // Swap the 40th block for one announcing all 16 8x8 blocks with 8 bytes of room for them.
+    const dv = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+    let o = 8;
+    for (let i = 0; i < 40; i++) o += ((dv.getUint32(o, true) >>> 16) & 0xfff) * 4;
+    const end = o + ((dv.getUint32(o, true) >>> 16) & 0xfff) * 4;
+    const bad = new Uint8Array(16).fill(fill);
+    const bdv = new DataView(bad.buffer);
+    bdv.setUint32(0, (4 << 16) | 0xffff, true);
+    bdv.setUint32(4, dv.getUint32(o + 4, true), true); // same block index and quant code
+    const stats = decoder.decode([frame.subarray(0, o), bad, frame.subarray(end)], null);
+    expect(stats.lost).toBe(1);
+    expect(await decoder.readI420()).toEqual(clean); // concealed from the clean frame; nothing else moved
+    decoder.destroy();
+  });
+});
+
+describe("lifecycle", () => {
+  it("a destroyed decoder refuses to decode", async () => {
+    const { decoder, frame } = await decoderFor("flat_200x114_lo.pwv1");
+    decoder.destroy();
+    expect(() => decoder.decode([frame], null)).toThrow(expect.objectContaining({ reason: "destroyed" }));
+  });
+
+  it("a lost device makes decode and readback fail with device_lost", async () => {
+    const adapter = (await navigator.gpu.requestAdapter())!; // an adapter makes one device
+    const own = await adapter.requestDevice({ requiredFeatures: pyroWaveDeviceFeatures(adapter) });
+    const { header, frames } = parsePwv1(await fixture("flat_200x114_lo.pwv1"));
+    const decoder = await PyroWaveDecoder.create(own, header);
+    decoder.decode([frames[0]], null);
+    own.destroy();
+    await own.lost;
+    expect(() => decoder.decode([frames[0]], null)).toThrow(expect.objectContaining({ reason: "device_lost" }));
+    expect((await rejection(decoder.readI420())).reason).toBe("device_lost");
+  });
+
+  it("a readback whose map fails rejects", async () => {
+    const adapter = (await navigator.gpu.requestAdapter())!;
+    const own = await adapter.requestDevice({ requiredFeatures: pyroWaveDeviceFeatures(adapter) });
+    const { header, frames } = parsePwv1(await fixture("flat_200x114_lo.pwv1"));
+    const decoder = await PyroWaveDecoder.create(own, header);
+    decoder.decode([frames[0]], null);
+    const read = decoder.readI420();
+    own.destroy(); // before the map resolves, and before the lost promise flips the flag
+    await expect(read).rejects.toThrow();
   });
 });
 

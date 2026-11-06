@@ -1,8 +1,10 @@
 // The PyroWave decoder (protocol/codec-pyrowave.md): one frame's blocks in, an RGBA texture out,
 // on the caller's WebGPU device. Load it with import(), never statically: it is only for a
 // session that streams PyroWave.
-import { LEVELS, blockLayout, buildUpload, type BlockLayout, type PyroWaveHeader, type Upload } from "./bitstream";
+import { LEVELS, PyroWaveError, blockLayout, buildUpload, type BlockLayout, type PyroWaveHeader, type Upload } from "./bitstream";
 import { dequantWGSL, idwtWGSL, yuvToRgbWGSL } from "./shaders";
+
+export { PyroWaveError, type PyroWaveErrorReason } from "./bitstream";
 
 /** fast: subgroups + shader-f16. fallback: neither, or f16 alone (B06, #1055; not built yet). */
 export type DecoderPath = "fast" | "subgroups-fp32" | "fallback";
@@ -17,118 +19,180 @@ export function pyroWaveDeviceFeatures(adapter: GPUAdapter): GPUFeatureName[] {
   return (["subgroups", "shader-f16"] as const).filter((f) => adapter.features.has(f));
 }
 
+export interface DecoderOptions {
+  /** The negotiated launch resolution's pixel count: a header asking for more is refused. */
+  maxPixels?: number;
+  /** Tests: run a path the device supports other than the one it would choose. */
+  forcePath?: DecoderPath;
+}
+
 export type DecodeStats = Pick<Upload, "received" | "zero" | "lost">;
 
 const MAX_BANDS = 64;
 
+interface Pipelines {
+  dq: GPUComputePipeline;
+  idwt: GPUComputePipeline;
+  rgb: GPURenderPipeline;
+}
+
+// Compiled once per device and storage precision; a decoder per configuration reuses them.
+const pipelineCache = new WeakMap<GPUDevice, Map<boolean, Promise<Pipelines>>>();
+
 async function checked(device: GPUDevice, code: string): Promise<GPUShaderModule> {
   const module = device.createShaderModule({ code });
   const errors = (await module.getCompilationInfo()).messages.filter((m) => m.type === "error");
-  if (errors.length) throw new Error("PyroWave WGSL: " + errors.map((e) => `${e.lineNum}:${e.linePos} ${e.message}`).join("; "));
+  if (errors.length) throw new PyroWaveError("gpu_error", "WGSL: " + errors.map((e) => `${e.lineNum}:${e.linePos} ${e.message}`).join("; "));
   return module;
 }
 
-export class PyroWaveDecoder {
-  /** The decoded picture, rgba8unorm, header.width x header.height, rewritten by each decode(). */
-  readonly texture: GPUTexture;
+function pipelines(device: GPUDevice, f16: boolean): Promise<Pipelines> {
+  let byPrecision = pipelineCache.get(device);
+  if (!byPrecision) pipelineCache.set(device, (byPrecision = new Map()));
+  let p = byPrecision.get(f16);
+  if (!p) {
+    p = (async () => {
+      const rgbModule = await checked(device, yuvToRgbWGSL);
+      const [dq, idwt, rgb] = await Promise.all([
+        checked(device, dequantWGSL(f16)).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
+        checked(device, idwtWGSL(f16)).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
+        device.createRenderPipelineAsync({
+          layout: "auto",
+          vertex: { module: rgbModule, entryPoint: "vs" },
+          fragment: { module: rgbModule, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
+          primitive: { topology: "triangle-list" },
+        }),
+      ]);
+      return { dq, idwt, rgb };
+    })();
+    const cache = byPrecision;
+    p.catch(() => cache.delete(f16));
+    byPrecision.set(f16, p);
+  }
+  return p;
+}
 
+export class PyroWaveDecoder {
   private payload: GPUBuffer | null = null;
   private dqBindGroup: GPUBindGroup | null = null;
+  private lost = false;
+  private destroyed = false;
 
   private constructor(
     private readonly device: GPUDevice,
     readonly header: PyroWaveHeader,
     readonly path: DecoderPath,
+    /** The decoded picture, rgba8unorm, header.width x header.height, rewritten by each decode(). */
+    readonly texture: GPUTexture,
     private readonly layout: BlockLayout,
-    private readonly dq: { pipe: GPUComputePipeline; params: GPUBuffer; blockBand: GPUBuffer; offsets: GPUBuffer; coefHi: GPUBuffer; coefLo: GPUBuffer; wgStride: number },
-    private readonly idwt: { pipe: GPUComputePipeline; bindGroup: GPUBindGroup; wx: number; wy: number; wz: number }[],
-    private readonly rgb: { pipe: GPURenderPipeline; bindGroup: GPUBindGroup },
+    private readonly pipes: Pipelines,
+    private readonly dq: { params: GPUBuffer; blockBand: GPUBuffer; offsets: GPUBuffer; coefHi: GPUBuffer; coefLo: GPUBuffer; wgStride: number },
+    private readonly idwt: { bindGroup: GPUBindGroup; wx: number; wy: number; wz: number }[],
+    private readonly rgbBindGroup: GPUBindGroup,
     private readonly planes: GPUBuffer,
     private readonly owned: GPUBuffer[],
   ) {
-    this.texture = device.createTexture({
-      size: [header.width, header.height],
-      format: "rgba8unorm",
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
-    });
+    void device.lost.then(() => (this.lost = true));
   }
 
   /**
    * One decoder per configuration (`config_id`): concealment reuses the coefficients of earlier
    * frames decoded by this instance, and a new instance starts from zero (amendment 55 §Loss).
    */
-  static async create(device: GPUDevice, header: PyroWaveHeader): Promise<PyroWaveDecoder> {
-    const path = chooseDecoderPath(device.features);
-    if (path === "fallback") throw new Error("PyroWave: this device has no subgroups; the fallback decoder is not built yet (#1055)");
+  static async create(device: GPUDevice, header: PyroWaveHeader, options: DecoderOptions = {}): Promise<PyroWaveDecoder> {
+    const path = options.forcePath ?? chooseDecoderPath(device.features);
+    const needs = path === "fast" ? ["subgroups", "shader-f16"] : ["subgroups"];
+    if (path === "fallback" || !needs.every((f) => device.features.has(f)))
+      throw new PyroWaveError("no_subgroups", `the device cannot run the ${path} path; the fallback decoder is not built yet (#1055)`);
     const f16 = path === "fast";
-    const layout = blockLayout(header.width, header.height);
-    if (layout.bands.length > MAX_BANDS) throw new Error("PyroWave: too many bands");
-    const { STORAGE, COPY_SRC, COPY_DST, UNIFORM } = GPUBufferUsage;
+    const { width: w, height: h } = header;
+    const tooLarge = (what: string) => new PyroWaveError("too_large", `${w}x${h}: ${what}`);
+    if (options.maxPixels !== undefined && w * h > options.maxPixels) throw tooLarge(`more than the negotiated ${options.maxPixels} pixels`);
+    const limits = device.limits;
+    if (Math.max(w, h) > limits.maxTextureDimension2D) throw tooLarge(`over the device's ${limits.maxTextureDimension2D}-pixel texture limit`);
+    const layout = blockLayout(w, h);
+    if (layout.bands.length > MAX_BANDS) throw tooLarge("too many bands");
+    const sizes = { coefHi: layout.hiWords * (f16 ? 2 : 4), coefLo: layout.loWords * 4, planes: layout.planeWords * 4, offsets: layout.totalBlocks * 4 };
+    const maxBytes = Math.min(limits.maxStorageBufferBindingSize, limits.maxBufferSize);
+    for (const [name, bytes] of Object.entries(sizes)) if (bytes > maxBytes) throw tooLarge(`${name} needs ${bytes} bytes, the device allows ${maxBytes}`);
+
+    const pipes = await pipelines(device, f16);
     const owned: GPUBuffer[] = [];
-    const buffer = (size: number, usage: number, data?: Uint32Array<ArrayBuffer>) => {
-      const b = device.createBuffer({ size: Math.max(4, Math.ceil(size / 4) * 4), usage });
-      if (data) device.queue.writeBuffer(b, 0, data);
-      owned.push(b);
-      return b;
-    };
-    const coefHi = buffer(layout.hiWords * (f16 ? 2 : 4), STORAGE);
-    const coefLo = buffer(layout.loWords * 4, STORAGE);
-    const planes = buffer(layout.planeWords * 4, STORAGE | COPY_SRC);
-    const offsets = buffer(layout.totalBlocks * 4, STORAGE | COPY_DST);
-
-    const wgStride = Math.min(layout.totalBlocks, 65535);
-    const params = new Uint32Array(4 + MAX_BANDS * 8);
-    params.set([layout.bands.length, wgStride, layout.totalBlocks]);
-    const bandOf = new Uint32Array(layout.totalBlocks);
-    layout.bands.forEach((b, i) => {
-      bandOf.fill(i, b.blockOffset, b.blockOffset + b.blockCount);
-      params.set([b.blockOffset, b.blocksX, b.blockCount, b.off, b.width, b.height, b.lo ? 1 : 0, 0], 4 + 8 * i);
-    });
-    const sgMin = device.adapterInfo.subgroupMinSize ?? 0;
-    const dqPipe = await device.createComputePipelineAsync({
-      layout: "auto",
-      compute: { module: await checked(device, dequantWGSL(f16)), entryPoint: "main", constants: { SG_AT_LEAST_16: sgMin >= 16 ? 1 : 0 } },
-    });
-    const dq = { pipe: dqPipe, params: buffer(params.byteLength, UNIFORM | COPY_DST, params), blockBand: buffer(bandOf.byteLength, STORAGE | COPY_DST, bandOf), offsets, coefHi, coefLo, wgStride };
-
-    // One dispatch per level with z = component: Dawn puts a barrier between dispatches (B00:
-    // 13 dispatches -> 5 took the 1080p iDWT from 114 to 47 us on the RTX 5090).
-    const idwtPipe = await device.createComputePipelineAsync({ layout: "auto", compute: { module: await checked(device, idwtWGSL(f16)), entryPoint: "main" } });
-    const idwt = [];
-    for (let l = LEVELS - 1; l >= 0; l--) {
-      const bw = layout.aw >> (l + 1);
-      const bh = layout.ah >> (l + 1);
-      const comps = l === 0 ? [0] : [0, 1, 2];
-      const u = new Uint32Array(3 * 8);
-      for (const c of comps) {
-        const final = l === 0 || (c !== 0 && l === 1); // 4:2:0 chroma ends at level 1
-        const outKind = final ? 2 : l - 1 >= 2 ? 1 : 0;
-        const b = layout.base[c][l];
-        u.set([b[0].off, b[1].off, b[2].off, b[3].off, bw, bh, final ? layout.planeOff[c] : layout.base[c][l - 1][0].off, (l >= 2 ? 1 : 0) | (outKind << 1)], 8 * c);
-      }
-      const bindGroup = device.createBindGroup({
-        layout: idwtPipe.getBindGroupLayout(0),
-        entries: [buffer(u.byteLength, UNIFORM | COPY_DST, u), coefHi, coefLo, planes].map((b, binding) => ({ binding, resource: { buffer: b } })),
+    let texture: GPUTexture | undefined;
+    device.pushErrorScope("out-of-memory");
+    device.pushErrorScope("validation");
+    let scopes = 2;
+    try {
+      const { STORAGE, COPY_SRC, COPY_DST, UNIFORM } = GPUBufferUsage;
+      const buffer = (size: number, usage: number, data?: Uint32Array<ArrayBuffer>) => {
+        const b = device.createBuffer({ size: Math.max(4, Math.ceil(size / 4) * 4), usage });
+        owned.push(b);
+        if (data) device.queue.writeBuffer(b, 0, data);
+        return b;
+      };
+      const coefHi = buffer(sizes.coefHi, STORAGE);
+      const coefLo = buffer(sizes.coefLo, STORAGE);
+      const planes = buffer(sizes.planes, STORAGE | COPY_SRC);
+      const offsets = buffer(sizes.offsets, STORAGE | COPY_DST);
+      texture = device.createTexture({
+        size: [w, h],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
       });
-      idwt.push({ pipe: idwtPipe, bindGroup, wx: Math.ceil(bw / 16), wy: Math.ceil(bh / 16), wz: comps.length });
-    }
 
-    const rgbModule = await checked(device, yuvToRgbWGSL);
-    const rgbPipe = await device.createRenderPipelineAsync({
-      layout: "auto",
-      vertex: { module: rgbModule, entryPoint: "vs" },
-      fragment: { module: rgbModule, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
-      primitive: { topology: "triangle-list" },
-    });
-    const rgbParams = new Uint32Array([layout.aw, header.width, header.height, header.fullRange ? 0 : 1, layout.planeOff[1], layout.planeOff[2], layout.planeStride[1], 0]);
-    const rgb = {
-      pipe: rgbPipe,
-      bindGroup: device.createBindGroup({
-        layout: rgbPipe.getBindGroupLayout(0),
+      const wgStride = Math.min(layout.totalBlocks, 65535);
+      const params = new Uint32Array(4 + MAX_BANDS * 8);
+      params.set([layout.bands.length, wgStride, layout.totalBlocks]);
+      const bandOf = new Uint32Array(layout.totalBlocks);
+      layout.bands.forEach((b, i) => {
+        bandOf.fill(i, b.blockOffset, b.blockOffset + b.blockCount);
+        params.set([b.blockOffset, b.blocksX, b.blockCount, b.off, b.width, b.height, b.lo ? 1 : 0, 0], 4 + 8 * i);
+      });
+      const dq = { params: buffer(params.byteLength, UNIFORM | COPY_DST, params), blockBand: buffer(bandOf.byteLength, STORAGE | COPY_DST, bandOf), offsets, coefHi, coefLo, wgStride };
+
+      // One dispatch per level with z = component: Dawn puts a barrier between dispatches (B00:
+      // 13 dispatches -> 5 took the 1080p iDWT from 114 to 47 us on the RTX 5090).
+      const idwt = [];
+      for (let l = LEVELS - 1; l >= 0; l--) {
+        const bw = layout.aw >> (l + 1);
+        const bh = layout.ah >> (l + 1);
+        const comps = l === 0 ? [0] : [0, 1, 2];
+        const u = new Uint32Array(3 * 8);
+        for (const c of comps) {
+          const final = l === 0 || (c !== 0 && l === 1); // 4:2:0 chroma ends at level 1
+          const outKind = final ? 2 : l - 1 >= 2 ? 1 : 0;
+          const b = layout.base[c][l];
+          u.set([b[0].off, b[1].off, b[2].off, b[3].off, bw, bh, final ? layout.planeOff[c] : layout.base[c][l - 1][0].off, (l >= 2 ? 1 : 0) | (outKind << 1)], 8 * c);
+        }
+        const bindGroup = device.createBindGroup({
+          layout: pipes.idwt.getBindGroupLayout(0),
+          entries: [buffer(u.byteLength, UNIFORM | COPY_DST, u), coefHi, coefLo, planes].map((b, binding) => ({ binding, resource: { buffer: b } })),
+        });
+        idwt.push({ bindGroup, wx: Math.ceil(bw / 16), wy: Math.ceil(bh / 16), wz: comps.length });
+      }
+
+      const rgbParams = new Uint32Array([layout.aw, w, h, header.fullRange ? 0 : 1, layout.planeOff[1], layout.planeOff[2], layout.planeStride[1], 0]);
+      const rgbBindGroup = device.createBindGroup({
+        layout: pipes.rgb.getBindGroupLayout(0),
         entries: [buffer(rgbParams.byteLength, UNIFORM | COPY_DST, rgbParams), planes].map((b, binding) => ({ binding, resource: { buffer: b } })),
-      }),
-    };
-    return new PyroWaveDecoder(device, header, path, layout, dq, idwt, rgb, planes, owned);
+      });
+      scopes = 0;
+      const validation = await device.popErrorScope();
+      const oom = await device.popErrorScope();
+      const error = validation ?? oom;
+      if (error) throw new PyroWaveError("gpu_error", error.message);
+      return new PyroWaveDecoder(device, header, path, texture, layout, pipes, dq, idwt, rgbBindGroup, planes, owned);
+    } catch (e) {
+      while (scopes-- > 0) void device.popErrorScope();
+      for (const b of owned) b.destroy();
+      texture?.destroy();
+      throw e;
+    }
+  }
+
+  private usable(): void {
+    if (this.destroyed) throw new PyroWaveError("destroyed", "the decoder was destroyed");
+    if (this.lost) throw new PyroWaveError("device_lost", "the WebGPU device was lost");
   }
 
   /**
@@ -136,13 +200,17 @@ export class PyroWaveDecoder {
    * block index keeps the coefficients of the last frame this decoder had it in.
    */
   decode(packets: readonly Uint8Array[], covered: Uint8Array | null): DecodeStats {
+    this.usable();
     const d = this.device;
     const up = buildUpload(this.layout, packets, covered);
-    if (!this.payload || this.payload.size < up.payload.byteLength) {
+    const bytes = up.payload.byteLength;
+    if (bytes > Math.min(d.limits.maxStorageBufferBindingSize, d.limits.maxBufferSize)) throw new PyroWaveError("too_large", `a ${bytes}-byte frame`);
+    // Grow with headroom; shrink again once frames are far smaller, so one burst is not kept.
+    if (!this.payload || this.payload.size < bytes || this.payload.size > 4 * bytes + 65536) {
       this.payload?.destroy();
-      this.payload = d.createBuffer({ size: Math.ceil((up.payload.byteLength * 1.25) / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      this.payload = d.createBuffer({ size: Math.ceil((bytes * 1.25) / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
       this.dqBindGroup = d.createBindGroup({
-        layout: this.dq.pipe.getBindGroupLayout(0),
+        layout: this.pipes.dq.getBindGroupLayout(0),
         entries: [this.dq.params, this.dq.offsets, this.payload, this.dq.coefHi, this.dq.coefLo, this.dq.blockBand].map((b, binding) => ({ binding, resource: { buffer: b } })),
       });
     }
@@ -151,18 +219,18 @@ export class PyroWaveDecoder {
 
     const enc = d.createCommandEncoder();
     const pass = enc.beginComputePass();
-    pass.setPipeline(this.dq.pipe);
+    pass.setPipeline(this.pipes.dq);
     pass.setBindGroup(0, this.dqBindGroup);
     pass.dispatchWorkgroups(this.dq.wgStride, Math.ceil(this.layout.totalBlocks / this.dq.wgStride));
+    pass.setPipeline(this.pipes.idwt);
     for (const s of this.idwt) {
-      pass.setPipeline(s.pipe);
       pass.setBindGroup(0, s.bindGroup);
       pass.dispatchWorkgroups(s.wx, s.wy, s.wz);
     }
     pass.end();
     const draw = enc.beginRenderPass({ colorAttachments: [{ view: this.texture.createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }] });
-    draw.setPipeline(this.rgb.pipe);
-    draw.setBindGroup(0, this.rgb.bindGroup);
+    draw.setPipeline(this.pipes.rgb);
+    draw.setBindGroup(0, this.rgbBindGroup);
     draw.draw(3);
     draw.end();
     d.queue.submit([enc.finish()]);
@@ -171,14 +239,19 @@ export class PyroWaveDecoder {
 
   /** The last decode's Y, Cb, Cr planes as 8-bit I420, for tests and diagnostics (a GPU readback). */
   async readI420(): Promise<Uint8Array> {
+    this.usable();
     const d = this.device;
     const rb = d.createBuffer({ size: this.planes.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    const enc = d.createCommandEncoder();
-    enc.copyBufferToBuffer(this.planes, 0, rb, 0, this.planes.size);
-    d.queue.submit([enc.finish()]);
-    await rb.mapAsync(GPUMapMode.READ);
-    const f = new Float32Array(rb.getMappedRange().slice(0));
-    rb.destroy();
+    let f: Float32Array;
+    try {
+      const enc = d.createCommandEncoder();
+      enc.copyBufferToBuffer(this.planes, 0, rb, 0, this.planes.size);
+      d.queue.submit([enc.finish()]);
+      await rb.mapAsync(GPUMapMode.READ);
+      f = new Float32Array(rb.getMappedRange().slice(0));
+    } finally {
+      rb.destroy();
+    }
     const { width: w, height: h } = this.header;
     const out = new Uint8Array(w * h + 2 * (w >> 1) * (h >> 1));
     let o = 0;
@@ -193,6 +266,8 @@ export class PyroWaveDecoder {
   }
 
   destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
     for (const b of this.owned) b.destroy();
     this.payload?.destroy();
     this.texture.destroy();
