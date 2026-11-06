@@ -84,8 +84,8 @@ renumbered to their public issues.
 - **`main` = production.** Any merge INTO `main` requires **explicit human sign-off from the operator**. Never merge to `main` autonomously — not even a green feature branch.
 - **`develop` = persistent, unstable integration branch.** All day-to-day work targets it.
 - **Workflow:** branch off `develop` → do the work → merge **back into `develop`** with **no PR required**. Feature-branch → `develop` is self-serve; `develop` → `main` is the only sign-off gate. Default: `git checkout develop && git pull && git checkout -b <feature>`; land with `git checkout develop && git merge <feature>`. **A streaming-path change runs `make bench-check` before that merge** and closes out by publishing or updating its bench report (`make report-publish`, or `qbench sprint put` at sprint end) — see "Performance evidence (quasar-bench)" below and the landing sequence in `AGENTS.md`.
-- **CI runs on every push to `develop` (all jobs) and on pull requests into `develop` (only the
-  jobs whose area changed, `scripts/verify/ci-changed-areas.sh`).** The push run carries the
+- **CI runs on every push to `develop` or a release `integration/**` branch (all jobs) and on
+  pull requests into either (only the jobs whose area changed, `scripts/verify/ci-changed-areas.sh`).** The push run carries the
   checks `main` requires, so the develop → main release PR needs no run of its own. A pull request
   into `main` from any other branch gets no automatic run: dispatch CI on its branch first.
 - **Push branches to origin as you go — "no PR required" does not mean "no push".** Origin is
