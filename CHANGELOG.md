@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Internal
+- **ADRs 0012 and 0013: compatibility tools are a provider-neutral host resource, and the GE-Proton trust rules.** Records the decisions behind choosing and installing Proton for the library's Windows games (fleet-wide desired state, placement, mapping and fill-when-absent rules; github.com-only downloads verified by checksum, safe extraction, audit). Adds the glossary terms library provider, compatibility tool, tool mapping, forced mapping and recommended tool list. Docs only.
 - **ADR 0011: PyroWave is a LAN-only, WebTransport-only codec decoded in WebGPU.** Records why the Ultra-low latency (LAN) codec never rides WebRTC or the internet and is never chosen automatically over it, and adds the glossary terms Ultra-low latency (LAN), PyroWave and block concealment. Docs only.
 - **ADR 0010: WebTransport is transport #2, and media may connect to the agent.** Records the second transport and rewords `CLAUDE.md` invariant 6: the API and control never go to the node agent, but the media transport may, with a short-lived token the control plane mints. Adds the glossary terms transport, transport fallback, WebTransport endpoint, edge proxy and presenter. Docs only.
 - **CI also runs on release integration branches (`integration/<version>`).** Pull requests into one run the jobs their change touches, and a landing on one runs every job, exactly as for `develop`. `CLAUDE.md` now says specs and tickets live as GitHub issues rather than plan files. No product change.
