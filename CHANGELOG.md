@@ -27,6 +27,7 @@ own; the two do not move together, and that is deliberate.
 ### Internal
 - **CI also runs on release integration branches (`integration/<version>`).** Pull requests into one run the jobs their change touches, and a landing on one runs every job, exactly as for `develop`. `CLAUDE.md` now says specs and tickets live as GitHub issues rather than plan files. No product change.
 - **The 0.6 contract amendments 54 (WebTransport) and 55 (PyroWave) are pinned; nothing is implemented yet (#1026, #1050).** The `protocol` submodule moves to the merged contracts, the four new routes are listed as pending in the OpenAPI drift test, `schema.d.ts` is regenerated, and the trace allow-lists learn `transport.fallback` (browser) and `codec.switched` (agent). The only behaviour change: the trace endpoint now stores a `transport.fallback` event, which no client sends yet. No migration (0111 and 0112 come with the implementation).
+- **The domain glossary is now `GLOSSARY.md` (was `CONTEXT.md`), matching the updated domain-modeling and setup skills.** Renamed with `git mv`; every reference in the docs, `CLAUDE.md` and code comments follows (the generated API types follow with the next protocol pin). No product change.
 
 ## 0.5.2 — 2026-11-01
 
