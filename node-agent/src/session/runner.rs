@@ -1461,10 +1461,11 @@ impl Negotiation {
     }
 }
 
-/// The session's WebRTC transports. Each is replaced, under the running encoder, when a
-/// peer other than the one it negotiated with answers on it (#535).
+/// The session's WebRTC transports: the WebRTC implementation of the transport slot
+/// (`pipeline::Transport`). Each is replaced, under the running encoder, when a peer
+/// other than the one it negotiated with answers on it (#535).
 pub(crate) struct SessionTransports {
-    slot: Arc<pipeline::TransportSlot>,
+    slot: Arc<pipeline::WebRtcSlot>,
     pub(crate) video: pipeline::VideoTransport,
     pub(crate) audio_webrtc: Option<gst::Element>,
     pub(crate) audio_pipeline: AudioPipelineGuard,
@@ -1476,9 +1477,26 @@ pub(crate) struct SessionTransports {
     budget: [ReplacementBudget; 2],
 }
 
+impl pipeline::Transport for SessionTransports {
+    fn attach(session: pipeline::EncodedSession) -> anyhow::Result<Self> {
+        let slot = pipeline::WebRtcSlot::new(session)?;
+        // Audio first: `attach_video` takes the encode pipeline to READY.
+        let (audio_webrtc, audio_pipeline) = slot.build_audio()?;
+        let video = slot.attach_video(false, None)?;
+        Ok(Self::new(slot, video, audio_webrtc, audio_pipeline))
+    }
+
+    fn release(&self) {
+        self.video.release();
+        if let Some(audio) = &self.audio_webrtc {
+            let _ = audio.set_state(gst::State::Null);
+        }
+    }
+}
+
 impl SessionTransports {
-    pub(crate) fn new(
-        slot: pipeline::TransportSlot,
+    fn new(
+        slot: pipeline::WebRtcSlot,
         video: pipeline::VideoTransport,
         audio_webrtc: Option<gst::Element>,
         audio_pipeline: Option<gst::Pipeline>,
@@ -1694,7 +1712,7 @@ fn abandon_takeover(out_tx: &pipeline::OutTx, pc: PcId) {
 /// waiting at most [`AUDIO_REPLACE_BOUND`]: both wait on the sound server, and the runner
 /// must stay free to serve a stop (#613). Past the bound the new peer gets no audio.
 fn replace_audio(
-    slot: &Arc<pipeline::TransportSlot>,
+    slot: &Arc<pipeline::WebRtcSlot>,
     old: AudioPipelineGuard,
 ) -> (Option<gst::Element>, AudioPipelineGuard) {
     // What the old capture posts on its way down is no fault, and a session end can no
@@ -1764,10 +1782,7 @@ pub(crate) fn stop_source(
     transports: &SessionTransports,
     launch: Option<&super::launch_helper::LaunchSocket>,
 ) {
-    transports.video.release();
-    if let Some(audio) = &transports.audio_webrtc {
-        let _ = audio.set_state(gst::State::Null);
-    }
+    pipeline::Transport::release(transports);
     tracing::info!(
         token = "session-transport-released",
         "video transport released ahead of the source teardown"
@@ -2381,7 +2396,7 @@ pub fn run_blocking(
     // GStreamer callbacks (ABR retarget, ICE/connection state) use the bounded diagnostic
     // lane; lifecycle/signaling stays on evt_tx.
     stage("encode-build");
-    let built = match pipeline::build_encode_pipeline(
+    let built = match pipeline::build_encode_pipeline::<SessionTransports>(
         &cfg,
         sig_tx.clone(),
         res.devices.clone(),
@@ -2414,11 +2429,8 @@ pub fn run_blocking(
     };
     let pipeline::EncodePipeline {
         pipeline: encode_pipe,
-        video,
         transport,
         interpipesrc,
-        audio_webrtc,
-        audio_pipeline: audio_pipeline_raw,
         resolution_lever,
     } = built;
     // The scale stage and the IDR that must follow a change are paired inside the lever.
@@ -2440,9 +2452,9 @@ pub fn run_blocking(
              down every session on the host. Opt out with QUASAR_NVENC_DEFER_TEARDOWN=0"
         );
     }
-    // #408: the audio pipeline is in its Drop-to-NULL guard from here, so every early
-    // encode-setup failure return below is covered.
-    let mut transports = SessionTransports::new(transport, video, audio_webrtc, audio_pipeline_raw);
+    // Bound after the lease so it drops first: on every return below, the audio pipeline
+    // goes to NULL (#408) before the lease drains parked NVENC pipelines (#489).
+    let mut transports = transport;
     // Same clock + base as the source pipeline(s) so interpipesrc's pass-through PTS land
     // in this pipeline's running-time (#68).
     encode_pipe.set_start_time(None::<gst::ClockTime>);

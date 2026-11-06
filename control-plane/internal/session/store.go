@@ -293,6 +293,15 @@ type Session struct {
 	// SharedHomeAppID is the Steam parent whose home this session also mounts
 	// (migration 0110), nil otherwise.
 	SharedHomeAppID *string
+	// Transport is webrtc | webtransport (migration 0111): what the stream plan chose at
+	// launch. TransportReason says why a wanted WebTransport was not chosen;
+	// TransportFallbackReason is the client's last reported fallback. semantics: control-api.md §Transport
+	Transport               string
+	TransportReason         *string
+	TransportFallbackReason *string
+	// wt is the first transport token, for the assign dispatch and the 201. Not persisted:
+	// only its hash is, in session_tokens.
+	wt *transportGrant
 	// notice is the launch's steam_library_not_shared message, "" for none.
 	// Not persisted.
 	notice string
@@ -1310,6 +1319,11 @@ type DeviceProbe struct {
 	// H264Refused is a boolean false in capabilities.codecs.h264, the one value
 	// that refuses H.264 (control-api.md §Codec resolution, amendment 35).
 	H264Refused bool
+	// WebTransport is capabilities.webtransport.available AND .datagrams.
+	WebTransport bool
+	// WebCodecs is capabilities.webcodecs: catalog codec spelling (h264|hevc|av1) plus
+	// opus_decode, true only where the client proved isConfigSupported.
+	WebCodecs map[string]bool
 }
 
 // parseDeviceProbe projects user_devices.capabilities onto DeviceProbe. Missing,
@@ -1342,6 +1356,9 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 			// any, so a non-boolean h264 accepts H.264 instead of losing the whole probe.
 			H264 any `json:"h264"`
 		} `json:"codecs"`
+		// any, so a wrong shape loses only this key, not the whole probe.
+		WebTransport any `json:"webtransport"`
+		WebCodecs    any `json:"webcodecs"`
 	}
 	if err := json.Unmarshal(rawCaps, &caps); err != nil {
 		// Malformed JSON: an absent probe, not an error worth propagating.
@@ -1389,6 +1406,15 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 	p.HEVC = caps.Codecs.HEVC
 	p.AV1 = caps.Codecs.AV1
 	p.H264Refused = caps.Codecs.H264 == false
+	if wt, ok := caps.WebTransport.(map[string]any); ok {
+		p.WebTransport = wt["available"] == true && wt["datagrams"] == true
+	}
+	if wc, ok := caps.WebCodecs.(map[string]any); ok {
+		p.WebCodecs = make(map[string]bool, len(wc))
+		for k, v := range wc {
+			p.WebCodecs[k] = v == true
+		}
+	}
 	return p
 }
 
@@ -1580,7 +1606,8 @@ const sessionCols = `id::text, user_id::text, app_id::text, host_id::text, gpu_i
 	playout0_ms,
 	health_state, health_state_reason, health_state_changed_at,
 	created_at, assigned_at, started_at, ended_at,
-	shared_home_app_id::text`
+	shared_home_app_id::text,
+	transport, transport_reason, transport_fallback_reason`
 
 // selectSessionSQL is the column list + FROM shared by all session reads.
 const selectSessionSQL = `SELECT ` + sessionCols + ` FROM sessions`
@@ -1640,6 +1667,7 @@ func scanSessionRow(r row, extra ...any) (Session, error) {
 		&hs, &s.HealthReason, &s.HealthChangedAt,
 		&s.CreatedAt, &s.AssignedAt, &s.StartedAt, &s.EndedAt,
 		&s.SharedHomeAppID,
+		&s.Transport, &s.TransportReason, &s.TransportFallbackReason,
 	}
 	if err := r.Scan(append(dest, extra...)...); err != nil {
 		return Session{}, err

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/profile"
+	"github.com/accreleus/quasar/control-plane/internal/wtendpoint"
 )
 
 // StreamInputs is every fact the post-placement decision reads, gathered once.
@@ -78,9 +79,33 @@ type StreamInputs struct {
 	// agent reports it now. Empty is unknown, which caps against every row.
 	GPUDriverIdentity string
 
+	// Transport is the transport choice's inputs; the profile's own setting rides on Chain.
+	Transport TransportInputs
+
 	// Now is the clock the staleness check reads, so a test can pin it.
 	Now time.Time
 }
+
+// TransportInputs are the facts planTransport reads beyond the chain and the probe.
+type TransportInputs struct {
+	// Requested is POST /v1/sessions `transport`: "", "webrtc" or "webtransport".
+	Requested string
+	// Endpoint is the placed host's resolved WebTransport endpoint, nil when it has no usable one.
+	Endpoint *wtendpoint.Endpoint
+}
+
+// Transport values (sessions.transport) and the profile's three settings. The reasons are
+// sessions.transport_reason.
+const (
+	transportWebRTC       = "webrtc"
+	transportWebTransport = "webtransport"
+	transportOptIn        = "webtransport_opt_in"
+
+	reasonProfileDisallows     = "profile_disallows"
+	reasonHostNoEndpoint       = "host_no_endpoint"
+	reasonDeviceNoWebTransport = "device_no_webtransport"
+	reasonDeviceNoWebCodecs    = "device_no_webcodecs"
+)
 
 // certIdentity is the encode path a cert row must describe to be applicable to this
 // launch. Assembled from two reads that fail independently, either of which can be
@@ -142,6 +167,10 @@ type StreamPlan struct {
 
 	// Rung is the resolved rung itself, for callers that need more than the ids.
 	Rung profile.Profile
+
+	// Endpoint is the WebTransport endpoint the session was planned onto, set only when
+	// Update.Transport is webtransport.
+	Endpoint *wtendpoint.Endpoint
 }
 
 // planStream resolves the rung a placed session starts at, applies the cert cap,
@@ -192,6 +221,11 @@ func planStream(in StreamInputs) (StreamPlan, error) {
 		codec = wireCodecH264
 	}
 
+	transport, transportReason := in.planTransport(rung.Codec)
+	if transport == transportWebTransport {
+		plan.Endpoint = in.Transport.Endpoint
+	}
+
 	plan.ChainID, plan.RungID, plan.Rung = chain.ID, rung.ID, rung
 	plan.Decision = decision
 	plan.RungBitrateKbps = pick(in.Override.BitrateKbps, rung.NominalBitrateKbps)
@@ -211,8 +245,44 @@ func planStream(in StreamInputs) (StreamPlan, error) {
 		// The decision rides on THIS write because it describes the values this
 		// write persists; splitting them lets record and row disagree on a failure.
 		CodecDecision: marshalCodecDecision(decision),
+
+		Transport:       transport,
+		TransportReason: transportReason,
 	}
 	return plan, nil
+}
+
+// planTransport decides the session's transport after the codec is known and never changes
+// it. WebTransport is chosen only when the profile and the request want it and the host and the
+// device can do it; the reason names the first check that failed.
+// semantics: control-api.md §POST /v1/sessions — transport
+func (in StreamInputs) planTransport(codec profile.Codec) (transport, reason string) {
+	req := in.Transport.Requested
+	if in.Params.parked {
+		return transportWebRTC, ""
+	}
+	wanted := false
+	switch in.Chain.Transport {
+	case transportWebTransport:
+		wanted = req != transportWebRTC
+	case transportOptIn:
+		wanted = req == transportWebTransport
+	default: // webrtc, or a chain that never set one
+		if req == transportWebTransport {
+			return transportWebRTC, reasonProfileDisallows
+		}
+	}
+	switch {
+	case !wanted:
+		return transportWebRTC, ""
+	case in.Transport.Endpoint == nil:
+		return transportWebRTC, reasonHostNoEndpoint
+	case in.Probe == nil || !in.Probe.WebTransport:
+		return transportWebRTC, reasonDeviceNoWebTransport
+	case !in.Probe.WebCodecs[string(codec)] || !in.Probe.WebCodecs["opus_decode"]:
+		return transportWebRTC, reasonDeviceNoWebCodecs
+	}
+	return transportWebTransport, ""
 }
 
 // capEligible reports whether the certification cap may run at all.
@@ -346,6 +416,12 @@ func (p StreamPlan) applyTo(sess *Session) {
 	sess.ProfileID = &chainID
 	sess.StreamProfileID = &rungID
 	sess.CodecDecision = p.Update.CodecDecision
+	sess.Transport = p.Update.Transport
+	sess.TransportReason = nil
+	if p.Update.TransportReason != "" {
+		reason := p.Update.TransportReason
+		sess.TransportReason = &reason
+	}
 }
 
 // dispatchDims is the size a rung is actually dispatched at: its own

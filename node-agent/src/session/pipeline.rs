@@ -33,17 +33,15 @@ mod caps;
 pub(crate) use caps::vulkan_image_transport;
 use caps::{caps_profile, raw_video_caps};
 mod codec_chain;
-use codec_chain::{build_bitstream_chain, BitstreamChain};
-mod rtp_ext;
-use rtp_ext::{attach_abs_capture_time_probe, attach_abs_capture_time_verification_probe};
+use codec_chain::{build_bitstream_chain, build_video_payloader, BitstreamChain};
 mod audio_branch;
 mod audio_health;
+mod rtp_ext;
 use audio_branch::add_audio_chain;
 mod mic_branch;
 mod probes;
 use probes::{
-    attach_bitstream_capture, attach_encode_probes, attach_encoder_pts_trace,
-    attach_rtp_marker_trace, attach_rtp_ts_trace, attach_stage_probes,
+    attach_bitstream_capture, attach_encode_probes, attach_encoder_pts_trace, attach_queue_probes,
     attach_vulkan_parent_meta_probe,
 };
 mod encoders;
@@ -95,7 +93,9 @@ use webrtc::{
     connect_state_logging, enable_video_fec, enable_video_rtx, make_webrtcbin,
 };
 mod transport;
-pub use transport::{TransportSlot, VideoTransport};
+pub use transport::{EncodedSession, Transport};
+mod webrtc_transport;
+pub use webrtc_transport::{VideoTransport, WebRtcSlot};
 
 /// Outbound signaling messages produced by GStreamer callback threads, drained
 /// by whatever transport is driving this session (WS server / control relay).
@@ -418,8 +418,8 @@ pub fn build_session_pipeline(
     let BitstreamChain {
         encoder_capsfilter: h264_capsfilter,
         parser,
-        payloader: pay,
     } = build_bitstream_chain(codec, effective_profile)?;
+    let pay = build_video_payloader(codec)?;
 
     // The caps webrtcbin advertises the video m-line from. Static, so the offer can be
     // generated before the first frame flows.
@@ -647,19 +647,13 @@ pub(crate) fn build_scale_stage_for_test(cfg: &SessionConfig) -> Result<ScaleSta
 
 /// Everything [`build_encode_pipeline`] hands back to the runner. A struct rather than a
 /// tuple: a positional `.6`/`.7` at the call site is how two handles get swapped silently.
-pub struct EncodePipeline {
+pub struct EncodePipeline<T> {
     /// The persistent encode pipeline. PLAYING for the whole session, across every swap.
     pub pipeline: gst::Pipeline,
-    /// The video transport (inbound SDP/ICE, the `"input"` DataChannel).
-    pub video: VideoTransport,
-    /// Rebuilds either transport for a new peer.
-    pub transport: TransportSlot,
+    /// The session's transport, attached at the encoded-frame boundary.
+    pub transport: T,
     /// The `interpipesrc` whose `listen-to` the runner re-points on a swap.
     pub interpipesrc: gst::Element,
-    /// The audio `webrtcbin` (its own pipeline — #304).
-    pub audio_webrtc: Option<gst::Element>,
-    /// The audio pipeline (created READY here, driven by the runner).
-    pub audio_pipeline: Option<gst::Pipeline>,
     /// The encode-side resolution lever, metrics echo and IDR pairing already wired.
     /// Behind an `Arc` because the ABR ladder holds it too.
     pub resolution_lever: Arc<abr_glue::EncodeResolutionLever>,
@@ -687,13 +681,13 @@ pub fn external_resize_supported(cfg: &SessionConfig) -> bool {
 }
 
 /// Build the persistent ENCODE pipeline: `interpipesrc` (listening to
-/// `initial_sink_name`) → encoder → parser → payloader → webrtcbin, plus the audio chain
-/// and the "input" DataChannel.
+/// `initial_sink_name`) → encoder → parser, then attach transport `T` at the parser's src
+/// pad (the encoded-frame boundary), which builds what follows it, audio included.
 ///
-/// This pipeline stays PLAYING for the whole session, across every swap, so the WebRTC
+/// This pipeline stays PLAYING for the whole session, across every swap, so the
 /// transport never renegotiates. The runner re-points `interpipesrc.listen-to` on a swap.
 #[allow(clippy::too_many_arguments)]
-pub fn build_encode_pipeline(
+pub fn build_encode_pipeline<T: Transport>(
     cfg: &SessionConfig,
     out_tx: OutTx,
     devices: Option<Arc<VirtualDevices>>,
@@ -704,7 +698,7 @@ pub fn build_encode_pipeline(
     trace_tx: TraceTx,
     session_id: String,
     encoder_factory: &str,
-) -> Result<EncodePipeline> {
+) -> Result<EncodePipeline<T>> {
     // `cfg.encoder` is already the effective encoder (the runner ran
     // `resolve_effective_encoder` first), so every arm below keys on it, and
     // `encoder_factory` is the exact element name that resolution found.
@@ -761,58 +755,17 @@ pub fn build_encode_pipeline(
     let BitstreamChain {
         encoder_capsfilter: h264_capsfilter,
         parser,
-        payloader: pay,
     } = build_bitstream_chain(codec, effective_profile)?;
-    // TWCC must be declared HERE, in the capsfilter, never via `add-extension` on the
-    // payloader. webrtcbin builds its offer from these caps, the payloader's
-    // auto-header-extension instantiates the matching `rtphdrexttwcc` writer from the
-    // negotiated caps, and webrtcbin's rtpsession learns the id the same way, so the
-    // extmap id in the SDP and on the wire cannot diverge. Bolting the extension on
-    // out-of-band (webrtcsink's approach) breaks here because this graph pins fully-fixed
-    // caps between payloader and webrtcbin: the extension writes header bytes the offer
-    // never declared and Chrome drops every packet. `rtcp-fb-transport-cc` puts
-    // `a=rtcp-fb:96 transport-cc` in the offer; without it the browser never sends the
-    // TWCC feedback rtpgccbwe consumes.
-    //
-    // abs-capture-time is always on, ABR or not: declaring it in the caps makes webrtcbin
-    // emit `a=extmap:6 <URI>` (same mechanism as TWCC extmap-5), and the pad probe below
-    // on `pay`'s src pad writes the per-packet NTP bytes.
-    let mut rtp_caps_builder = gst::Caps::builder("application/x-rtp")
-        .field("media", "video")
-        .field("encoding-name", codec.rtp_encoding_name())
-        .field("payload", 96_i32)
-        .field("clock-rate", 90_000_i32)
-        .field(
-            format!("extmap-{ABS_CAPTURE_TIME_EXT_ID}"),
-            ABS_CAPTURE_TIME_URI,
-        );
-    if cfg.abr_config().is_some() {
-        rtp_caps_builder = rtp_caps_builder
-            .field(format!("extmap-{TWCC_EXT_ID}"), RTP_TWCC_URI)
-            .field("rtcp-fb-transport-cc", true);
-    }
-    let rtp_caps = rtp_caps_builder.build();
-    let rtp_capsfilter = gst::ElementFactory::make("capsfilter")
-        .property("caps", &rtp_caps)
-        .build()
-        .context("capsfilter not found")?;
 
-    pipeline.add_many([
-        &interpipesrc,
-        &queue,
-        &encoder,
-        &h264_capsfilter,
-        &parser,
-        &pay,
-        &rtp_capsfilter,
-    ])?;
+    pipeline.add_many([&interpipesrc, &queue, &encoder, &h264_capsfilter, &parser])?;
     if !gpu_convert.is_empty() {
         pipeline.add_many(gpu_convert.iter())?;
     }
-    // Link interpipesrc → queue → [GPU convert stage →] encoder → … → rtp.
+    // Link interpipesrc → queue → [GPU convert stage →] encoder → parser: the encode
+    // chain ends at the encoded-frame boundary; the transport takes it from there.
     let mut chain: Vec<&gst::Element> = vec![&interpipesrc, &queue];
     chain.extend(gpu_convert.iter());
-    chain.extend_from_slice(&[&encoder, &h264_capsfilter, &parser, &pay, &rtp_capsfilter]);
+    chain.extend_from_slice(&[&encoder, &h264_capsfilter, &parser]);
     gst::Element::link_many(chain).context("failed to link encode chain")?;
 
     // Time each frame across the encoder + count frames/bytes. Pad probes on existing
@@ -826,7 +779,7 @@ pub fn build_encode_pipeline(
         .unwrap_or(false);
     if !diag_no_obs {
         attach_encode_probes(&encoder, session_metrics.clone(), cfg.latency_probe);
-        attach_stage_probes(&queue, &pay, session_metrics.clone());
+        attach_queue_probes(&queue, session_metrics.clone());
     }
 
     // G1 buffer-reuse gate: on the Vulkan-image path, verify the compositor's
@@ -843,37 +796,6 @@ pub fn build_encode_pipeline(
         .unwrap_or(false)
     {
         attach_encoder_pts_trace(&encoder);
-    }
-
-    // Write the abs-capture-time one-byte-header extension (8-byte NTP-64) per RTP
-    // packet. Probing `pay`'s src pad means the buffer is already an RTP packet, so the
-    // extension can be appended before the capsfilter. The transport stamps it again at
-    // its egress seam (`TransportSlot::attach_video`).
-    let capture_times = attach_abs_capture_time_probe(&pay);
-    if !diag_no_obs {
-        attach_abs_capture_time_verification_probe(&rtp_capsfilter);
-    }
-
-    // Diagnostic: per-AU RTP marker-layout trace on the live wire. The synthetic
-    // videotestsrc path cannot reproduce rtph264pay's marker logic, so a vulkan-vs-VA
-    // marker-bit difference is only decidable on real content. Knob:
-    // QUASAR_TRACE_RTP_MARKER.
-    if std::env::var("QUASAR_TRACE_RTP_MARKER")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
-    {
-        attach_rtp_marker_trace(&pay);
-    }
-
-    // Diagnostic: per-AU RTP timestamp-continuity + seq-contiguity trace, the two
-    // surviving libwebrtc PacketBuffer frame-completion keys. Flags dup-TS-across-AU (the
-    // every-other-frame merge suspect), non-1500 TS deltas, and seq gaps. Knob:
-    // QUASAR_TRACE_RTP_TS.
-    if std::env::var("QUASAR_TRACE_RTP_TS")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
-    {
-        attach_rtp_ts_trace(&pay);
     }
 
     // Capture the raw encoded bitstream to a file, to decode offline (content vs
@@ -895,34 +817,25 @@ pub fn build_encode_pipeline(
     // needs it at arm time. One `Arc`, two owners: the runner's manual PATCH path and the
     // ladder's `on_window` closure.
     let resolution_lever = resolution_lever_with_echo(scale, encoder.clone(), &session_metrics);
-    let transport = TransportSlot {
+    let transport = T::attach(EncodedSession {
         cfg: cfg.clone(),
         pipeline: pipeline.clone(),
-        tail: rtp_capsfilter
-            .static_pad("src")
-            .context("rtp capsfilter has no src pad")?,
+        video: parser.static_pad("src").context("parser has no src pad")?,
         encoder,
+        lever: resolution_lever.clone(),
+        metrics: session_metrics,
         out_tx,
         devices,
         input_state,
-        metrics: session_metrics,
         trace_tx,
         session_id,
-        capture_times,
-        lever: resolution_lever.clone(),
         observe: !diag_no_obs,
-    };
-    // Audio first: `attach_video` takes the encode pipeline to READY.
-    let (audio_webrtc, audio_pipeline) = transport.build_audio()?;
-    let video = transport.attach_video(false, None)?;
+    })?;
 
     Ok(EncodePipeline {
         pipeline,
-        video,
         transport,
         interpipesrc,
-        audio_webrtc,
-        audio_pipeline,
         resolution_lever,
     })
 }

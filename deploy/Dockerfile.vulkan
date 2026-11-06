@@ -110,6 +110,8 @@ ARG GST_PLUGINS_RS_REF=cee45224cb2d10e1523af4f256d0dd64c8b29491
 ARG GST_INTERPIPE_REF=0c454917
 ARG GST_WAYLAND_DISPLAY_REPO=https://github.com/salty2011/gst-wayland-display.git
 ARG GST_WAYLAND_DISPLAY_REF=e650cf7f7f038fbc6f23422190787b5086f8bdc7
+ARG PYROWAVE_REF=7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b
+ARG GRANITE_REF=53090429539bf3404250d18fe58db971f0907c04
 ARG RUST_VERSION=1.94.0
 ARG CARGO_C_VERSION=0.10.23
 ARG RUSTUP_VERSION=1.29.0
@@ -676,6 +678,38 @@ RUN find /opt/gst -name '*.a' -delete \
     && ! find /opt/gst -name '*.a' | grep -q . \
     && echo "static archives stripped from /opt/gst: $(du -sh /opt/gst | cut -f1) remaining"
 
+# PyroWave C API (#1052, spec #1048). Built here, beside the GStreamer plugins, so the
+# pyrowaveenc element (a later ticket) links libpyrowave-shared from /opt/gst and the runtime
+# stage's `COPY --from=build /opt/gst` carries it with no step of its own. Upstream's install
+# rules (no components) put libpyrowave-shared.so{,.1,.1.0.0}, pyrowave/pyrowave.h, the .pc, the
+# CMake config and bin/pyrowave-device-validation (why it is built) into /opt/gst; the MIT
+# licence texts of PyroWave, Granite and volk (all compiled in) go to share/licenses/ because
+# the binary ships in a public image. Shaders ship precompiled upstream, so no shader compiler is needed;
+# Granite is the pinned subset checkout_granite.sh fetches (volk + vulkan-headers only).
+# checkout_granite.sh names its own Granite commit; GRANITE_REF must equal it or the build stops,
+# so the two pins cannot drift apart unnoticed. Placed after the static-archive strip: the
+# library is a .so, and nothing else here depends on this layer.
+ARG PYROWAVE_REF
+ARG GRANITE_REF
+RUN set -eu; \
+    git clone https://github.com/Themaister/pyrowave.git /opt/pyrowave \
+    && cd /opt/pyrowave \
+    && git checkout ${PYROWAVE_REF} \
+    && bash checkout_granite.sh \
+    && [ "$(git -C Granite rev-parse HEAD)" = "${GRANITE_REF}" ] \
+    && cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/gst \
+        -DCMAKE_INSTALL_LIBDIR=lib64 \
+    && cmake --build build --target pyrowave-shared pyrowave-device-validation \
+    && cmake --install build \
+    && install -Dm644 LICENSE /opt/gst/share/licenses/pyrowave/LICENSE \
+    && install -Dm644 Granite/LICENSE /opt/gst/share/licenses/granite/LICENSE \
+    && install -Dm644 Granite/third_party/volk/LICENSE.md /opt/gst/share/licenses/volk/LICENSE.md \
+    && cd / && rm -rf /opt/pyrowave \
+    && PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig pkg-config --exists pyrowave-shared \
+    && echo "pyrowave-shared installed: $(PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig pkg-config --modversion pyrowave-shared)"
+
 # The gst-wayland-display patch set, carried as the AUTHORED RECORD and the upstream
 # submission source. Nothing in this build applies them — since 2026-07-26 the gwd delta
 # is the fork's `develop` branch (GST_WAYLAND_DISPLAY_REF above), one commit per former
@@ -700,6 +734,8 @@ LABEL org.quasar.image.role="toolchain" \
       org.quasar.pins.gst="${GST_VERSION}" \
       org.quasar.pins.plugins-rs="${GST_PLUGINS_RS_REF}" \
       org.quasar.pins.interpipe="${GST_INTERPIPE_REF}" \
+      org.quasar.pins.pyrowave="${PYROWAVE_REF}" \
+      org.quasar.pins.granite="${GRANITE_REF}" \
       org.quasar.pins.rust="${RUST_VERSION}" \
       org.quasar.pins.cuda="${CUDA_PKG_VERSION}" \
       org.quasar.pins.base="${QUASAR_BASE_IMAGE}" \

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"regexp"
 
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
@@ -27,6 +28,7 @@ var browserEventTypes = map[string]bool{
 	"client.freeze_detected":    true,
 	"client.visibility_changed": true,
 	"webrtc.state_changed":      true,
+	"transport.fallback":        true, // amendment 54; its reason also lands on sessions.transport_fallback_reason
 	// Bench mode (`?bench=1`) per-second marker-decode window. Additive only;
 	// payload stays free-form and never becomes a persisted stats key (schema.md).
 	"bench.window": true,
@@ -111,6 +113,7 @@ func (h *Handler) handlePostTraceEvents(w http.ResponseWriter, r *http.Request) 
 		if err := h.store.Telemetry().AppendEvents(r.Context(), id, telemetry.SourceBrowser, batch); err != nil {
 			slog.Warn("insert browser trace events batch failed", "session_id", id, "err", err)
 		}
+		h.recordTransportFallback(r.Context(), id, batch)
 		if h.coord != nil {
 			for _, e := range batch {
 				if e.Type == "client.visibility_changed" {
@@ -130,6 +133,32 @@ func (h *Handler) handlePostTraceEvents(w http.ResponseWriter, r *http.Request) 
 	}
 
 	httpx.WriteJSON(w, http.StatusAccepted, nil)
+}
+
+// fallbackReasonRE is the transport.fallback reason shape (control-api.md §Transport fallback).
+var fallbackReasonRE = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
+
+// recordTransportFallback stores the latest well-formed transport.fallback reason in the batch
+// on the session. Observability only: a malformed reason is dropped and nothing reads it back.
+func (h *Handler) recordTransportFallback(ctx context.Context, sessionID string, batch []telemetry.EventInput) {
+	reason := ""
+	for _, e := range batch {
+		if e.Type != "transport.fallback" {
+			continue
+		}
+		var p struct {
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal(e.Payload, &p) == nil && fallbackReasonRE.MatchString(p.Reason) {
+			reason = p.Reason
+		}
+	}
+	if reason == "" {
+		return
+	}
+	if err := h.store.SetTransportFallbackReason(ctx, sessionID, reason); err != nil {
+		slog.Warn("record transport fallback reason failed", "session_id", sessionID, "err", err)
+	}
 }
 
 // ST-05 — clock-alignment ingest (control-api.md §B; contract-amendment.md §A.2),

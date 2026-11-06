@@ -251,7 +251,10 @@ var allowedUnimplemented = map[string]struct{}{
 // server serves them (the spec carries no x-unimplemented marker for these).
 // Remove each entry in the change that registers the route; a registered entry
 // fails the test so none outlives its handler.
-var pendingImplementation = map[string]string{}
+var pendingImplementation = map[string]string{
+	// Amendment 55 (PyroWave), accreleus/quasar#1050 contract; migration 0112 and handler land with its implementation.
+	"PATCH /v1/sessions/{}/pyrowave": "#1050",
+}
 
 // unimplementedOperation reports whether an OpenAPI operation carries
 // `x-unimplemented: true` — a documented shape the server does not yet serve.

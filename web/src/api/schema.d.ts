@@ -3290,6 +3290,69 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/sessions/{id}/transport-token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint a fresh WebTransport token for the same live session (amendment 54).
+         * @description Amendment 54 (accreleus/quasar#1026). Mirrors POST /v1/sessions/{id}/signaling-token: owner only, states assigned/starting/running, independent single-use tokens. The endpoint URL and certificate hashes are resolved again at mint time. The 201 is sent only after the agent acked the token's hash (agent-api.md session_transport_token).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Independent single-use transport token created. */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["TransportEnvelope"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                404: components["responses"]["NotFound"];
+                /** @description session_not_reconnectable (terminal or stopping), or transport_unavailable (the session's transport is webrtc, or its host's WebTransport endpoint is no longer usable; use signaling-token instead). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description agent_not_connected — the agent is reconnecting or did not ack within 5 s. RETRYABLE. */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/sessions/{id}/swap": {
         parameters: {
             query?: never;
@@ -3479,6 +3542,76 @@ export interface paths {
                 };
                 404: components["responses"]["NotFound"];
                 /** @description session_not_running - the session's top-level state is not running - or display_update_rejected - the agent rejected the update, or no ack arrived within the control plane's command timeout - or (session-display-stream, approved 2026-08-16, AWAITING SIGN-OFF) external_resize_unsupported - the assigned host's encoder cannot live-resize the stream, only returned when the request includes stream_width/stream_height. The session is left untouched in every case. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        trace?: never;
+    };
+    "/v1/sessions/{id}/pyrowave": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Turn Ultra-low latency (LAN), i.e. PyroWave, on or off in a running session (owner or admin) (amendment 55).
+         * @description Amendment 55 (accreleus/quasar#1050). A best-effort relay to the assigned host's agent (agent-api.md session_pyrowave), like PATCH /v1/sessions/{id}/display: no session-state transition, and a rejection is a no-op (the session keeps its codec). The 202 is sent once the agent acked; its body carries the updated session.pyrowave.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["SessionPyroWaveUpdate"];
+                };
+            };
+            responses: {
+                /** @description Applied. Body is the current session. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            session: components["schemas"]["Session"];
+                        };
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                /** @description Caller is neither owner nor admin. */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                404: components["responses"]["NotFound"];
+                /** @description session_not_running - the session's state is not running - or pyrowave_unavailable - session.pyrowave.allowed is false (active true only; the message carries the reason) - or pyrowave_rejected - the agent refused (not_on_webtransport, client_no_decoder, rtt_too_high, encoder_error) or did not ack within the command timeout. The session is left untouched in every case. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -6348,6 +6481,79 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/hosts/{id}/webtransport": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        /** Read a host's WebTransport endpoint, its override and the resolved endpoint (amendment 54). */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostWebTransport"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Set or clear a host's public WebTransport URL (edge proxy) (amendment 54). Audited as host.webtransport.update. */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["HostWebTransportWrite"];
+                };
+            };
+            responses: {
+                /** @description New state. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostWebTransport"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        trace?: never;
+    };
     "/v1/admin/hosts/{id}/console-config": {
         parameters: {
             query?: never;
@@ -8340,6 +8546,31 @@ export interface components {
          */
         Codec: "h264" | "h265" | "av1";
         /**
+         * @description A host or GPU codec set entry (agent-api.md capacity.codecs, capacity.gpus[].codecs): the wire Codec vocabulary plus, since amendment 55 (accreleus/quasar#1050), pyrowave, listed after a passing PyroWave codec probe. pyrowave is never a session's stream.codec and never a rung's codec.
+         * @enum {string}
+         */
+        HostCodec: "h264" | "h265" | "av1" | "pyrowave";
+        /** @description Amendment 55 (accreleus/quasar#1050): a session's Ultra-low latency (LAN) / PyroWave record. allowed and reason are the stream plan's grant, written once at launch; wanted, active, used and switch_reason follow the agent's codec.switched trace events and the toggle's acks. Observability and UI state: nothing decides on it. */
+        SessionPyroWave: {
+            allowed: boolean;
+            /** @description Why not allowed: profile_disallows, not_webtransport, host_no_pyrowave, device_no_webgpu (an open string); null when allowed. */
+            reason: string | null;
+            /** @description The user wants PyroWave now. Cleared by a step-down for rtt_too_high, congestion, client_decode_error or encoder_error. */
+            wanted: boolean;
+            /** @description The media client is receiving PyroWave now. */
+            active: boolean;
+            /** @description The media client received PyroWave at some point in this session. */
+            used: boolean;
+            /** @description The PyroWave target bitrate granted: min(height_default * fps / 60, pyrowave_kbps ?? 1000000); null when not allowed. */
+            target_kbps: number | null;
+            /** @description The reason of the latest switch on or off (launch, user, reconnect, rtt_too_high, client_no_decoder, congestion, client_decode_error, encoder_error, webrtc; an open string); null before the first. */
+            switch_reason: string | null;
+        };
+        SessionPyroWaveUpdate: {
+            /** @description Amendment 55: true turns Ultra-low latency (LAN) on, false turns it off. */
+            active: boolean;
+        };
+        /**
          * @description The CATALOG codec vocabulary used by stream profiles (rungs). Note 'hevc', not the wire 'h265' - the rename is bridged in exactly one place server-side and never on this surface.
          * @enum {string}
          */
@@ -8384,10 +8615,10 @@ export interface components {
         /** @description UI-P4: a non-fatal advisory returned on an admin profile write. A warning NEVER fails the request - it reports a configuration that is legal but almost certainly not what the operator meant. */
         WriteWarning: {
             /**
-             * @description h264_floor_not_last - every rung after the H.264 rung is unreachable, because H.264 passes every clamp. floor_not_least_demanding - the H.264 rung has a higher min_offer_bandwidth_kbps or min_decode_height than a rung above it, or requires a hardware encoder while a rung above it does not; a floor harder to satisfy than the rung above it is a misconfiguration.
+             * @description h264_floor_not_last - every rung after the H.264 rung is unreachable, because H.264 passes every clamp. floor_not_least_demanding - the H.264 rung has a higher min_offer_bandwidth_kbps or min_decode_height than a rung above it, or requires a hardware encoder while a rung above it does not; a floor harder to satisfy than the rung above it is a misconfiguration. pyrowave_needs_webtransport (amendment 55) - pyrowave_allowed is true on a launch profile whose transport is webrtc, so PyroWave can never be offered.
              * @enum {string}
              */
-            code: "h264_floor_not_last" | "floor_not_least_demanding";
+            code: "h264_floor_not_last" | "floor_not_least_demanding" | "pyrowave_needs_webtransport";
             message: string;
         };
         /** @enum {string} */
@@ -8944,6 +9175,14 @@ export interface components {
              * @description Amendment 53 (#1001): the Steam app whose library this session mounts, null otherwise. Always serialized. While that session is live, every launch of that app's family is 409 home_in_use. A client may mark that family in use.
              */
             shared_home_app_id: string | null;
+            /** @description Amendment 54: the transport the stream plan chose. Always serialized by a server implementing the amendment; absent from an older one, read as webrtc. */
+            transport?: components["schemas"]["Transport"];
+            /** @description Amendment 54: why a wanted WebTransport was not chosen (profile_disallows, host_no_endpoint, device_no_webtransport, device_no_webcodecs; an open string), else null. Absent from an older server. */
+            transport_reason?: string | null;
+            /** @description Amendment 54: the reason in the latest transport.fallback trace event the client posted, else null. Observability only. Absent from an older server. */
+            transport_fallback_reason?: string | null;
+            /** @description Amendment 55: the session's Ultra-low latency (LAN) / PyroWave record. Always serialized by a server implementing the amendment; null for every earlier session; absent from an older server. */
+            pyrowave?: components["schemas"]["SessionPyroWave"] | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -9003,6 +9242,9 @@ export interface components {
             client_type?: "browser" | "native";
             /** @description Microphone capture request (2026-08-02). Absent ⇒ false. Granted only when instance setting mic_capture_enabled is on; an ungranted request is not an error — the session stream body reports the granted state. */
             mic?: boolean;
+            transport?: components["schemas"]["TransportPreference"];
+            /** @description Amendment 55: the user's remembered Ultra-low latency (LAN) choice on this device. Absent = false. A wish, never an error: Session.pyrowave says whether it was allowed and why not. */
+            pyrowave?: boolean;
             /** @description Admin/debug/back-compat override; beats profile_id field-by-field. */
             stream?: {
                 width?: number;
@@ -9017,6 +9259,7 @@ export interface components {
         LaunchResponse: {
             session: components["schemas"]["Session"];
             signaling: components["schemas"]["SignalingCoords"];
+            transport_options?: components["schemas"]["TransportOptions"];
             /** @description Amendment 53 (#1001): present only when the app shares the user's Steam library and this launch runs without it (the caller has no Steam app, the Steam home is on a host this launch cannot run on, Steam may not run on this launch's host, or the Steam home needs operator review). Omitted, never empty. */
             notice?: {
                 /** @enum {string} */
@@ -9043,6 +9286,91 @@ export interface components {
             username?: string;
             /** @description TURN credential. Present for turn:/turns: entries. Readable by every authenticated user who launches a session, which is inherent to browser TURN — deployments should issue ephemeral, time-limited credentials rather than a shared static password. */
             credential?: string;
+        };
+        /**
+         * @description Amendment 54 (accreleus/quasar#1026): the client's transport preference on POST /v1/sessions. Absent means the launch profile decides. Honoured only as the profile's transport allows (control-api.md §Transport); WebRTC is always the floor.
+         * @enum {string}
+         */
+        TransportPreference: "webrtc" | "webtransport";
+        /**
+         * @description Amendment 54: the transport the stream plan chose for a session.
+         * @enum {string}
+         */
+        Transport: "webrtc" | "webtransport";
+        /**
+         * @description Amendment 54: whether a launch profile's sessions may use WebTransport. webrtc = never; webtransport_opt_in = only when the launch request asks for it; webtransport = unless the launch request asks for webrtc.
+         * @enum {string}
+         */
+        LaunchProfileTransport: "webrtc" | "webtransport_opt_in" | "webtransport";
+        /** @description Amendment 54 (accreleus/quasar#1026): the coordinates for the session's WebTransport transport. On the POST /v1/sessions 201 it is present only when session.transport is webtransport (omitted otherwise, never null), beside the signaling block that is the client's fallback. It is also the body of POST /v1/sessions/{id}/transport-token (TransportEnvelope), freshly resolved and minted. */
+        TransportOptions: {
+            webtransport: components["schemas"]["WebTransportCoords"];
+        };
+        WebTransportCoords: {
+            /** @description Opaque https URL; pass to new WebTransport(url) unchanged. The agent's listener (direct) or an admin-set public URL (edge). */
+            url: string;
+            /** @description Transport token: single-use, 60 s, plaintext in this response only, presented in the WebTransport hello (transport-webtransport.md), never in the URL. Never accepted by /v1/signal. */
+            token: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** @description serverCertificateHashes for a direct endpoint: the agent's unexpired self-signed certificates (current and, during a rotation, next). Empty for an edge endpoint or a publicly trusted certificate. */
+            cert_hashes: components["schemas"]["CertHash"][];
+        };
+        CertHash: {
+            /** @enum {string} */
+            algorithm: "sha-256";
+            /** @description Base64 SHA-256 of the certificate's DER encoding. */
+            value: string;
+        };
+        TransportEnvelope: {
+            transport_options: components["schemas"]["TransportOptions"];
+        };
+        WebTransportCertificate: {
+            /** @description Base64 SHA-256 of the DER certificate. */
+            sha256: string;
+            /** Format: date-time */
+            not_before: string;
+            /** Format: date-time */
+            not_after: string;
+        };
+        /** @description Amendment 54: a host's WebTransport endpoint as reported, its admin override, and the endpoint the control plane resolves from them. */
+        HostWebTransport: {
+            /** @description The agent's capacity.transports and capacity.webtransport; null until it reports webtransport. */
+            reported: {
+                transports: components["schemas"]["Transport"][];
+                port: number;
+                addresses: string[];
+                certificates: components["schemas"]["WebTransportCertificate"][];
+            } | null;
+            override: components["schemas"]["HostWebTransportOverride"] | null;
+            /** @description The resolved endpoint; null when not usable. */
+            endpoint: {
+                url: string;
+                /** @enum {string} */
+                mode: "direct" | "edge";
+                cert_hashes: components["schemas"]["CertHash"][];
+            } | null;
+            usable: boolean;
+            /** @description Why the endpoint is not usable: not_reported, host_offline, no_address or certificate_expired (an open string); null when usable. */
+            reason: string | null;
+        };
+        HostWebTransportOverride: {
+            /** @description Absolute https URL with a host, no user info, no fragment. */
+            public_url: string;
+            /**
+             * @description public: the URL presents a publicly trusted certificate (edge proxy), no hashes sent. agent: it presents the agent's own, hashes sent.
+             * @enum {string}
+             */
+            certificate: "public" | "agent";
+        };
+        HostWebTransportWrite: {
+            /** @description Absolute https URL, or null to clear the override. */
+            public_url: string | null;
+            /**
+             * @description Default public.
+             * @enum {string}
+             */
+            certificate?: "public" | "agent";
         };
         SignalingEnvelope: {
             signaling: components["schemas"]["SignalingCoords"];
@@ -9242,7 +9570,7 @@ export interface components {
             effective?: {
                 [key: string]: string;
             } | null;
-            codecs?: components["schemas"]["Codec"][] | null;
+            codecs?: components["schemas"]["HostCodec"][] | null;
             pending_restart?: boolean;
             restart_triggered?: boolean;
         };
@@ -10543,7 +10871,7 @@ export interface components {
             active_sessions: number;
             render_node: string | null;
             /** @description Amendment 12 (#296), additive. ALWAYS SERIALIZED. The wire codecs this GPU can encode (agent-api.md capacity.gpus[].codecs, schema.md gpus.codecs), as the launch path reads them: the GPU's own reported set, or - for a GPU whose agent reports no per-GPU set - its host's codecs (inheritance). Null when neither this GPU nor its host has ever reported a codec set (a pre-multi-codec agent), which the launch path treats as h264-only; like HostSettingsResponse.codecs it is deliberately NOT normalised to ["h264"] here, because "never reported" and "reported h264 only" need different operator advice. HostSettingsResponse.codecs keeps serving the host union. */
-            codecs: components["schemas"]["Codec"][] | null;
+            codecs: components["schemas"]["HostCodec"][] | null;
         };
         GPUsResponse: {
             items: components["schemas"]["GPUAvailability"][];
@@ -10650,6 +10978,12 @@ export interface components {
             visibility: "user" | "debug" | "internal";
             sort_order: number;
             rungs: components["schemas"]["LaunchProfileRung"][];
+            /** @description Amendment 54. Always serialized by a server implementing the amendment; absent from an older one, read as webrtc. */
+            transport?: components["schemas"]["LaunchProfileTransport"];
+            /** @description Amendment 55: whether this profile's users may turn on Ultra-low latency (LAN) (PyroWave) on a WebTransport session. Always serialized by a server implementing the amendment; absent from an older one, read as false. */
+            pyrowave_allowed?: boolean;
+            /** @description Amendment 55: the MAXIMUM PyroWave bitrate, kbit/s - a cap, not a fixed target. A session's target is min(height_default * fps / 60, pyrowave_kbps ?? 1000000), height_default 200000 / 300000 / 400000 for an encoded stream height at launch up to 1080 / up to 1440 / above. null = no cap below 1000000. */
+            pyrowave_kbps?: number | null;
             used_by?: components["schemas"]["LaunchProfileUsedBy"];
             warnings?: components["schemas"]["WriteWarning"][];
         };
@@ -10662,6 +10996,12 @@ export interface components {
             /** @enum {string} */
             visibility?: "user" | "debug" | "internal";
             sort_order?: number;
+            /** @description Amendment 54. Absent on POST = webrtc; absent on PATCH = unchanged. */
+            transport?: components["schemas"]["LaunchProfileTransport"];
+            /** @description Amendment 55. Absent on POST = false; absent on PATCH = unchanged. True with transport webrtc draws the warning pyrowave_needs_webtransport. */
+            pyrowave_allowed?: boolean;
+            /** @description Amendment 55: the maximum PyroWave bitrate (a cap). Absent on POST = null (no cap below 1000000); absent on PATCH = unchanged; out of range = 400 validation_failed. */
+            pyrowave_kbps?: number | null;
             /** @description ORDERED stream-profile ids, best first. ORDER IS PREFERENCE. A stream profile may appear at most once (a duplicate is 400 validation_failed). An id that does not resolve is 400 validation_failed at write time, never an FK error surfacing at launch. */
             rungs: string[];
         };

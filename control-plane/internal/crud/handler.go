@@ -135,6 +135,9 @@ func (h *Handler) Register(mux httpx.Router, requireAuth, requireAdmin func(http
 	mux.Handle("PUT /v1/admin/hosts/{id}/readiness-overrides/{check_id}", admin(http.HandlerFunc(h.handleSetReadinessOverride)))
 	mux.Handle("DELETE /v1/admin/hosts/{id}/readiness-overrides/{check_id}", admin(http.HandlerFunc(h.handleClearReadinessOverride)))
 
+	mux.Handle("GET /v1/admin/hosts/{id}/webtransport", admin(http.HandlerFunc(h.handleGetHostWebTransport)))
+	mux.Handle("PATCH /v1/admin/hosts/{id}/webtransport", admin(http.HandlerFunc(h.handlePatchHostWebTransport)))
+
 	// Runtime presets (UI-P3). The admin UI's disabled Delete on an in-use preset
 	// is UX only; the 409 from DELETE is the enforcement (presets.go).
 	mux.Handle("GET /v1/admin/runtime-presets", admin(http.HandlerFunc(h.handleListRuntimePresets)))

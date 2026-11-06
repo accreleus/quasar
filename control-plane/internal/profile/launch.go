@@ -28,6 +28,9 @@ type LaunchProfile struct {
 	Description string
 	Visibility  Visibility
 	SortOrder   int32
+	// Transport is webrtc | webtransport_opt_in | webtransport; empty reads as webrtc.
+	// semantics: control-api.md §The launch profile's transport
+	Transport string
 	// Rungs are the stream profiles this launch profile walks, best first.
 	Rungs []Profile
 }

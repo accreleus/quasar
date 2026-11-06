@@ -29,6 +29,9 @@ var (
 // succeed. FOR SHARE on the session row serialises against Store.transition's
 // FOR UPDATE, so a stop cannot commit between the state read and the consume.
 //
+// Only kind = 'signaling' rows are redeemable here: a transport token (schema.md session_tokens
+// kind) is a different credential and answers ErrTokenInvalid exactly like an unknown one.
+//
 // Lock order is session row, then token row: app, host and user deletion lock
 // `sessions` and cascade into `session_tokens`, and the reverse order here
 // would deadlock against them. So the token is first read unlocked, only to
@@ -47,7 +50,7 @@ func (s *Store) ConsumeSignalingToken(ctx context.Context, plaintext string) (Se
 	var hostID *string
 	var expired, consumed bool
 	var sessionID string
-	err = tx.QueryRow(ctx, `SELECT session_id::text FROM session_tokens WHERE token_hash = $1`, hash).Scan(&sessionID)
+	err = tx.QueryRow(ctx, `SELECT session_id::text FROM session_tokens WHERE token_hash = $1 AND kind = 'signaling'`, hash).Scan(&sessionID)
 	if err == nil {
 		err = tx.QueryRow(ctx, `SELECT state, host_id::text FROM sessions WHERE id = $1::uuid FOR SHARE`, sessionID).
 			Scan(&state, &hostID)
@@ -55,7 +58,7 @@ func (s *Store) ConsumeSignalingToken(ctx context.Context, plaintext string) (Se
 	if err == nil {
 		err = tx.QueryRow(ctx, `
 			SELECT expires_at < now(), consumed_at IS NOT NULL
-			FROM session_tokens WHERE token_hash = $1 FOR UPDATE
+			FROM session_tokens WHERE token_hash = $1 AND kind = 'signaling' FOR UPDATE
 		`, hash).Scan(&expired, &consumed)
 	}
 	// No row at any step: an unknown token, or one deleted with its session.
@@ -80,7 +83,7 @@ func (s *Store) ConsumeSignalingToken(ctx context.Context, plaintext string) (Se
 
 	_, err = tx.Exec(ctx, `
 		UPDATE session_tokens SET consumed_at = now()
-		WHERE token_hash = $1
+		WHERE token_hash = $1 AND kind = 'signaling'
 	`, hash)
 	if err != nil {
 		return Session{}, fmt.Errorf("consume token: %w", err)
@@ -107,8 +110,8 @@ func (s *Store) MintSignalingToken(ctx context.Context, sessionID string) (signa
 		return signalingToken{}, err
 	}
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO session_tokens (session_id, token_hash, expires_at)
-		SELECT id, $2, $3 FROM sessions
+		INSERT INTO session_tokens (session_id, token_hash, expires_at, kind)
+		SELECT id, $2, $3, 'signaling' FROM sessions
 		WHERE id = $1::uuid AND state IN ('assigned', 'starting', 'running')
 	`, sessionID, token.Hash, token.ExpiresAt)
 	if err != nil {
@@ -118,4 +121,44 @@ func (s *Store) MintSignalingToken(ctx context.Context, sessionID string) (signa
 		return signalingToken{}, ErrSessionTerminal
 	}
 	return token, nil
+}
+
+// MintTransportToken creates a WebTransport token (kind 'transport') for a live session. The
+// agent, not this table, enforces its single use, so consumed_at stays NULL. Ownership is
+// checked by the caller.
+func (s *Store) MintTransportToken(ctx context.Context, sessionID string) (transportGrant, error) {
+	if !isValidUUID(sessionID) {
+		return transportGrant{}, ErrSessionTerminal
+	}
+	token, err := newSignalingToken(time.Now())
+	if err != nil {
+		return transportGrant{}, err
+	}
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO session_tokens (session_id, token_hash, expires_at, kind)
+		SELECT id, $2, $3, 'transport' FROM sessions
+		WHERE id = $1::uuid AND state IN ('assigned', 'starting', 'running')
+	`, sessionID, token.Hash, token.ExpiresAt)
+	if err != nil {
+		return transportGrant{}, fmt.Errorf("insert transport token: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return transportGrant{}, ErrSessionTerminal
+	}
+	return token, nil
+}
+
+// SetTransportFallbackReason records why the client last fell back from WebTransport. Terminal
+// sessions keep the reason they ended with.
+func (s *Store) SetTransportFallbackReason(ctx context.Context, sessionID, reason string) error {
+	if !isValidUUID(sessionID) {
+		return nil
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE sessions SET transport_fallback_reason = $2
+		WHERE id = $1::uuid AND state NOT IN ('stopped', 'failed')
+	`, sessionID, reason); err != nil {
+		return fmt.Errorf("set transport fallback reason: %w", err)
+	}
+	return nil
 }

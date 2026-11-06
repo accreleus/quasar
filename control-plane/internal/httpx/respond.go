@@ -56,6 +56,8 @@ const (
 	CodeCaptureKindUnsupported   = "capture_kind_unsupported"   // 422
 	CodeCaptureUnsupported       = "capture_unsupported"        // 501
 	CodeAgentNotConnected        = "agent_not_connected"        // 503
+	CodeSessionNotReconnectable  = "session_not_reconnectable"  // 409
+	CodeTransportUnavailable     = "transport_unavailable"      // 409
 	CodeJobDisabled              = "job_disabled"               // 409
 	CodeJobAlreadyRunning        = "job_already_running"        // 409
 	CodeJobUnmanaged             = "job_unmanaged"              // 409

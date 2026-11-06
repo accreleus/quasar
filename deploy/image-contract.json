@@ -82,6 +82,12 @@
           "/usr/local/bin/quasar-node-agent-entrypoint",
           "/usr/local/bin/quasar-launch-helper",
           "/etc/ld.so.conf.d/gst-vulkan.conf",
+          "/opt/gst/lib64/libpyrowave-shared.so.1",
+          "/opt/gst/include/pyrowave/pyrowave.h",
+          "/opt/gst/lib64/pkgconfig/pyrowave-shared.pc",
+          "/opt/gst/share/licenses/pyrowave/LICENSE",
+          "/opt/gst/share/licenses/granite/LICENSE",
+          "/opt/gst/share/licenses/volk/LICENSE.md",
           "/etc/pipewire/quasar-session.conf",
           "/etc/pipewire/quasar-session-pulse.conf",
           "/etc/wireplumber/wireplumber.conf.d/quasar-session.conf",
@@ -89,6 +95,7 @@
         ],
         "_required_notes": {
           "quasar-session.conf": "The per-session audio sidecar's configs (deploy/audio/, #392). The agent starts `pipewire -c /etc/pipewire/quasar-session.conf`; with any of these four missing the sidecar never opens its socket and every session is mute.",
+          "libpyrowave-shared.so.1": "#1052 (spec #1048): the PyroWave C API, built from the PYROWAVE_REF/GRANITE_REF pins in the toolchain stage and installed into /opt/gst with its header and pkg-config file, so the pyrowaveenc element can link it. A pin bump that drops any of the three, or an install prefix that moves them out of /opt/gst, fails here instead of at the first element build. Both MIT licence texts (PyroWave and the Granite code linked into it) must ship with the binary in this public image (review of #1090).",
           "libgstnvcodec.so": "Present in EVERY image on this lineage -- the whole point of the single build graph. On a non-NVIDIA host it loads, warns once about libcuda.so.1, and registers 0 features (asserted below). Its ABSENCE means the builder was run with CUDA_ENABLE=0, which produces an image that cannot serve an NVIDIA host and must not be shipped."
         },
         "forbidden": [
@@ -162,6 +169,9 @@
         "must_succeed": {
           "grep -aq gst_cuda_context_new /usr/local/bin/quasar-node-agent": "#927: the agent is built --features cuda (ZC-02 zero-copy NVENC), which leaves this undefined dynamic symbol in the binary. The image has no readelf. The feature is silently absent when the build stage drops its CUDA_ENABLE ARG: the agent starts and Vulkan sessions stream either way.",
           "ldd /usr/local/bin/quasar-launch-helper | grep -q 'statically linked'": "#731: the launch helper runs inside the Steam app image, not this one, so it may need no libc from either; a dynamic build would load this image's glibc and break on another distribution.",
+          "test -f /opt/gst/lib64/libpyrowave-shared.so.1 && ! ldd /opt/gst/lib64/libpyrowave-shared.so.1 | grep -q 'not found'": "#1052: every library libpyrowave-shared needs resolves in this image (it links libstdc++ and libgcc_s dynamically and loads the Vulkan loader itself at run time).",
+          "grep -aq pyrowave_get_api_version /opt/gst/lib64/libpyrowave-shared.so.1": "#1052: the library exports the C API (a symbol, because the image has no nm), so an empty or wrong-target build cannot pass on the file's presence alone.",
+          "grep -q '^Name: pyrowave-shared' /opt/gst/lib64/pkgconfig/pyrowave-shared.pc": "#1052: the pkg-config entry names the library the way the pyrowaveenc build will ask for it.",
           "env -i /usr/local/bin/quasar-launch-helper": "#731: the helper starts, and with no -applaunch appid it exits 0, as it must for every app that is not a derived Steam tile."
         }
       },
@@ -204,7 +214,7 @@
         "forbidden": []
       },
       "paths": {
-        "required": ["/opt/cargo", "/opt/rustup", "/opt/gst/lib64/gstreamer-1.0"],
+        "required": ["/opt/cargo", "/opt/rustup", "/opt/gst/lib64/gstreamer-1.0", "/opt/gst/lib64/pkgconfig/pyrowave-shared.pc"],
         "forbidden": []
       },
       "gst_elements": {

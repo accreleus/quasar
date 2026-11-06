@@ -1725,6 +1725,20 @@
       "why": "What the encode branch agreed, re-stated on EVERY (re)negotiation: launch, rung_step, scale_rebuild, encoder_restart, source_swap. Exists because effective_media stops being true after the first scale-stage rebuild, and on Vulkan every rung step is an encoder restart. `profile` is the live value \u2014 a 2026-08-22 gst-launch probe negotiating main-444 read as a driver regression while production pinned main all along."
     },
     {
+      "type": "codec.switched",
+      "source": "agent",
+      "lane": "reliable",
+      "payload_keys": [
+        "from",
+        "to",
+        "reason",
+        "config_id",
+        "target_kbps"
+      ],
+      "clock": "host_wall",
+      "why": "The codec sent to the session's media client changed between PyroWave and the standard codec (amendment 55), or a wanted PyroWave was not started at a hello. NOT IMPLEMENTED YET: the contract is pinned (codec-pyrowave.md) and nothing emits this."
+    },
+    {
       "type": "sdp.answer_applied",
       "source": "agent",
       "lane": "reliable",
