@@ -195,8 +195,9 @@ plan chooses it once, at launch, after the codec. _Avoid_: "protocol" and "conne
 type" for this meaning.
 
 **Transport fallback** — a session on WebTransport moving to WebRTC on its own because
-the WebTransport connect failed, was refused, or the stream died. It never re-encodes or
-renegotiates the codec, and the session's details say that it happened and why. _Avoid_:
+the WebTransport connect failed, was refused, or the stream died. It keeps the session's standard codec
+(a PyroWave session switches to it, since PyroWave runs only on WebTransport), and the session's
+details say that it happened and why. _Avoid_:
 "downgrade" (that is a rung or codec step).
 
 **WebTransport endpoint** — the one opaque URL through which a browser reaches a host's
@@ -211,7 +212,7 @@ cannot connect, planned, is a different thing).
 
 **Presenter** — the client-side component that draws decoded frames to the screen and owns
 the scaling modes and the present-cadence readout; on WebTransport it is a WebGPU
-renderer Quasar owns, in place of the browser's `<video>` element. _Avoid_: "renderer",
+canvas Quasar owns, in place of the browser's `<video>` element. _Avoid_: "renderer",
 "player".
 
 ## Stream health

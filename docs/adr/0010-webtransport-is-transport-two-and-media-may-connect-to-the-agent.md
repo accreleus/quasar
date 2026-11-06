@@ -28,8 +28,9 @@ sigma p95 and freezes, on a clean link and every netem shape.
 Invariant 6 said the node agent is never contacted directly by a client. That is no longer true of
 **media**, and it was already only half true: WebRTC media flows browser to agent over ICE today.
 The invariant now says: **the API and all control go to the control plane and never to the agent;
-the media transport may connect to the agent, or an edge in front of it, with a short-lived token
-the control plane mints.** The control plane still decides everything: whether a session uses
+the media transport (its media, input and its own control stream, as
+`protocol/transport-webtransport.md` defines them) may connect to the agent, or an edge in front of
+it, with a short-lived token the control plane mints.** The control plane still decides everything: whether a session uses
 WebTransport at all (the stream plan), which host and endpoint, and who may connect. The agent
 authorizes nothing on its own; it redeems a single-use transport token it was handed as a hash.
 Admin and role enforcement are untouched.
