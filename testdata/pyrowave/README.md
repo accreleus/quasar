@@ -25,7 +25,8 @@ make test-go                                      # hashes, pin and bitstream fr
 `gen.sh` compiles `pyrowave_fixtures.c` against the image's `libpyrowave-shared`, encodes
 with the CPU-input path at a fixed per-frame byte budget, writes the bitstream and the
 library's decode, and `manifest.py` hashes everything. Pictures are drawn with integer
-maths only, so the sources are identical on every machine.
+maths only, so the sources are identical on every machine. They are synthetic, drawn by
+`pyrowave_fixtures.c`; no third-party image content is in this directory.
 
 ## Files
 
@@ -41,7 +42,8 @@ shapes, a gradient) and `flat` (a neutral field, a ramp, a flat patch: nearly ev
 is zero). Sizes: `320x192` (a multiple of 32) and `200x114` (not: edge blocks, and an odd
 chroma height of 57). Rates are the per-frame byte budget handed to the codec's exact rate
 control, in bytes per pixel: `detail` at `lo` 0.2, `hi` 0.8 and `xhi` 1.5 (the one with blocks
-over a 1200-byte datagram, for the oversized-block split); `flat` at `lo` 0.1 and `hi` 0.8
+larger than the ~1111 bytes of PyroWave payload a 1200-byte datagram holds under amendment 55,
+for the oversized-block split; the largest is 1180 bytes, so none needs more than two parts); `flat` at `lo` 0.1 and `hi` 0.8
 (`hi` is far above what it needs, so that stream is complete and well under budget). 4:2:0,
 authored as BT.709 limited range. Total about 1.1 MB.
 
