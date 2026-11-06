@@ -18,10 +18,11 @@ describe("chooseDecoderPath", () => {
     [4, 4, "fast"],
     [128, 128, "fast"],
     [undefined, undefined, "fast"], // not reported: trusted
-    [32, 64, "fallback"], // RDNA: wave32 or wave64
-    [8, 32, "fallback"],
-    [256, 256, "fallback"],
+    [32, 64, "fast"], // RDNA: wave32 or wave64
+    [8, 32, "fast"], // Intel
+    [32, 256, "fallback"],
     [48, 48, "fallback"],
+    [16, 48, "fallback"],
     [0, 0, "fallback"],
   ] as const)("subgroups %s-%s -> %s", (subgroupMinSize, subgroupMaxSize, path) => {
     expect(chooseDecoderPath(new Set(["subgroups", "shader-f16"]), { subgroupMinSize, subgroupMaxSize })).toBe(path);

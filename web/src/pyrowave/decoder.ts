@@ -12,14 +12,14 @@ export type DecoderPath = "fast" | "subgroups-fp32" | "fallback";
 const PATH_NEEDS: Record<DecoderPath, GPUFeatureName[]> = { fast: ["subgroups", "shader-f16"], "subgroups-fp32": ["subgroups"], fallback: [] };
 
 /**
- * The subgroup paths assume every subgroup of a 128-lane workgroup has one size that divides 128
- * (the dequantise shader's lane index and its scan). Sizes the browser does not report are trusted.
+ * The subgroup paths need the subgroup size to divide the 128-lane workgroup (the dequantise
+ * shader's lane index and its scan). Sizes the browser does not report are trusted.
  */
 export function chooseDecoderPath(features: ReadonlySet<string>, info?: Pick<GPUAdapterInfo, "subgroupMinSize" | "subgroupMaxSize">): DecoderPath {
   if (!features.has("subgroups")) return "fallback";
-  const min = info?.subgroupMinSize;
-  const max = info?.subgroupMaxSize;
-  if (min !== undefined && max !== undefined && (min !== max || !(max > 0 && max <= 128 && 128 % max === 0))) return "fallback";
+  // A range (RDNA 32-64) is fine: the shader reads subgroup_size at run time, so any size that divides 128 works.
+  const divides128 = (n: number | undefined) => n === undefined || (n > 0 && n <= 128 && 128 % n === 0);
+  if (!divides128(info?.subgroupMinSize) || !divides128(info?.subgroupMaxSize)) return "fallback";
   return features.has("shader-f16") ? "fast" : "subgroups-fp32";
 }
 
