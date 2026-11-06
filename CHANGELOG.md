@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+- The node agent's encode chain now ends at the encoded-frame boundary (the parser's output), and the RTP payloader, its header extensions and `webrtcbin` sit behind a transport trait with WebRTC as its only implementation. Sessions stream exactly as before; this prepares the WebTransport path (#1028).
+
 ## 0.5.2 — 2026-11-01
 
 ### Upgrading
