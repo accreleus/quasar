@@ -27,7 +27,8 @@ place a tool could live.
 - **GE-Proton is fleet-wide desired state.** Enabling a release makes it desired on every host; each
   agent converges and reports its own install state, and a host offline during the install catches
   up on reconnect. There is no per-host tool selection. Installs use the existing host-scoped jobs
-  framework (modelled on the template warm-up job), so the agent API's wire shapes do not change.
+  framework (modelled on the template warm-up job), so no new agent message shape is needed; the
+  agent API gains normative text only for the narrow download-and-run exception in ADR 0013.
 - **Placement treats "tool not installed here" as an ineligibility reason.** This is required, not
   tidy: C00 showed Steam does not validate a mapping, and a mapping to an absent tool silently
   launches the Windows executable with no tool at all. A launch no host can serve because the tool
