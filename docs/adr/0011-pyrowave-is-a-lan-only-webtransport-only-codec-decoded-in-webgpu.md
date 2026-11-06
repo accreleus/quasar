@@ -16,30 +16,37 @@ H.264, HEVC and AV1 trade latency for compression: frames depend on earlier fram
 looks ahead, and the browser's decoder adds its own queue. A user on the same LAN as the host has
 bandwidth to spare and wants the least delay between the game drawing a frame and seeing it.
 PyroWave has no inter-frame state, so a lost packet costs only the blocks it carried (*block
-concealment*) and never a freeze or a keyframe wait. The B00 spike (#1049) measured at most 0.23 ms
-encode at 4K on the RTX 5090 and a WGSL decoder that matches the C reference within one code value
+concealment*) and never a freeze or a keyframe wait. As measured in the B00 spike (#1049): at most 0.23 ms
+encode at 4K on the RTX 5090, and a WGSL decoder that matches the C reference within one code value
 on every feature path, at native speed on that GPU.
 
-The price is bitrate: about 200 Mbit/s at 1080p, 300 at 1440p, 400 at 4K. That decides the shape
+The price is bitrate: about 200 Mbit/s at 1080p, 300 at 1440p, 400 at 4K (the contract's defaults,
+from #1049). That decides the shape
 of the decision:
 
 - **Never over WebRTC.** No browser decodes PyroWave natively and WebRTC has no payload or
   congestion response for 200 Mbit/s of independent blocks. The browser must decode it itself, so
   it needs a transport that hands the page raw datagrams.
-- **Never over the internet.** The rate rules out a WAN. The agent measures the session's own QUIC
-  round trip and starts PyroWave, or accepts a switch on to it, only under a small bound (5 ms
-  today, a guess until benched); past that the session streams a standard codec over WebTransport
-  and says why. If the congestion estimate falls below a floor, the agent switches the connection back to the
-  standard codec the same way. The device probe's bandwidth and RTT are not inputs: they measure the client to
-  control-plane path.
+- **Never over the internet.** The rate rules out a WAN. The contract's gate is `max_rtt_ms` (5 ms,
+  amendment 55 §Link, a guess until benched): the agent starts PyroWave on a connection, or accepts
+  a switch on to it, only while the session's own QUIC round trip is at or under it; past that the
+  session streams a standard codec over WebTransport and says why. If the congestion estimate falls
+  below a floor, the agent switches the connection back to the standard codec the same way. The
+  device probe's bandwidth and RTT are not inputs: they measure the client to control-plane path.
+- **The control plane grants; the agent applies.** The control plane grants PyroWave, at launch or
+  through the user's toggle, after checking the profile, the transport, the host's GPU codec set
+  and the device's WebGPU. The agent only applies a grant, subject to its own round-trip check, and
+  may move a session off PyroWave (congestion, a client decode error, a fallback to WebRTC). It
+  never grants itself PyroWave, and a switch off for loss or congestion is not undone by the agent.
 - **Never automatic over the internet, and not automatic at all in 0.6.** The user turns it on, on
   a profile an admin allowed; it is off everywhere until an admin enables it. Automatic selection, with no
   toggle, is planned for 0.6.1 (otherwise 0.7) only for a qualifying LAN: a round trip under about
-  2 ms, at least 1.5 times its bitrate free, and a bench-proven latency win. A fast-looking link
+  2 ms (a different figure from `max_rtt_ms`: the automatic-selection criterion, not the gate
+  every PyroWave session passes), at least 1.5 times its bitrate free, and a bench-proven latency win. A fast-looking link
   alone never switches it on; a session that fails the LAN test always gets a standard codec.
 - **Only when proven.** The hosts need a passing PyroWave codec probe, the browser needs WebGPU,
   and the headline claim has a gate: at least 15 ms median glass-to-glass win over WebRTC with
-  H.264 on the NVIDIA lab host. Failing the A00 carriage test (about 250 Mbit/s with under 1% loss
+  H.264 on the NVIDIA lab host. Failing the A00 carriage test (#1025: about 250 Mbit/s with under 1% loss
   on the lab LAN) removes PyroWave from 0.6 and WebTransport ships without it.
 
 ## What the decision commits us to
