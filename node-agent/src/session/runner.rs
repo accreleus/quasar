@@ -2429,7 +2429,7 @@ pub fn run_blocking(
     };
     let pipeline::EncodePipeline {
         pipeline: encode_pipe,
-        transport: mut transports,
+        transport,
         interpipesrc,
         resolution_lever,
     } = built;
@@ -2452,6 +2452,9 @@ pub fn run_blocking(
              down every session on the host. Opt out with QUASAR_NVENC_DEFER_TEARDOWN=0"
         );
     }
+    // Bound after the lease so it drops first: on every return below, the audio pipeline
+    // goes to NULL (#408) before the lease drains parked NVENC pipelines (#489).
+    let mut transports = transport;
     // Same clock + base as the source pipeline(s) so interpipesrc's pass-through PTS land
     // in this pipeline's running-time (#68).
     encode_pipe.set_start_time(None::<gst::ClockTime>);
