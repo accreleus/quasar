@@ -1,0 +1,193 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>A00 WebTransport throughput</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 1.5rem; max-width: 70rem; }
+  table { border-collapse: collapse; margin: 1rem 0; }
+  th, td { border: 1px solid #bbb; padding: .3rem .6rem; text-align: right; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  tr.bad td { background: #fdd; } tr.ok td { background: #dfd; }
+  #status { font-weight: 600; } pre { background: #f4f4f4; padding: .6rem; max-height: 14rem; overflow: auto; }
+  code { background: #eee; padding: 0 .2rem; }
+</style>
+<h1>A00: WebTransport receive throughput</h1>
+<p>Query: <code>?url=https://HOST:4433/wt&amp;hash=BASE64_OR_HEX_SHA256</code> &middot; optional
+  <code>rates=50,100,200,300,400</code> <code>carriages=datagram,stream</code> <code>secs=10</code>
+  <code>where=auto|worker|main|both</code> <code>hwm=1024</code> <code>size=1150</code> <code>auto=1</code></p>
+<p id="status">idle</p>
+<button id="go">Run matrix</button>
+<table id="tbl"><thead><tr>
+  <th>receiver</th><th>carriage</th><th>target Mbit/s</th><th>sender achieved</th><th>received Mbit/s</th>
+  <th>loss %</th><th>reorder</th><th>max gap ms</th><th>main long-task ms</th><th>recv busy ms</th><th>sender CPU %core</th><th>note</th>
+</tr></thead><tbody></tbody></table>
+<pre id="result">{}</pre>
+
+<script>
+// ---- Receiver: self-contained so the same source runs on the main thread and in a Worker. ----
+async function receive(cfg) {
+  const now = () => performance.now();
+  const out = { rate: cfg.rate, carriage: cfg.carriage, ok: false, hwm: cfg.hwm };
+  let wt;
+  try {
+    wt = new WebTransport(cfg.url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: new Uint8Array(cfg.hash).buffer }] });
+    await wt.ready;
+  } catch (e) { out.error = 'connect: ' + e; return out; }
+
+  let n = 0, bytes = 0, first = 0, last = 0, maxGap = 0, reorder = 0, maxSeq = -1, proc = 0, complete = 0, aborted = 0;
+  let stop = false;
+  const note = (t, seq) => { // arrival bookkeeping shared by both carriages
+    if (!first) first = t; else if (t - last > maxGap) maxGap = t - last;
+    last = t;
+    if (seq < maxSeq) reorder++; else maxSeq = seq;
+  };
+
+  let rx;
+  if (cfg.carriage === 'datagram') {
+    try { wt.datagrams.incomingHighWaterMark = cfg.hwm; } catch (e) { out.hwmErr = '' + e; }
+    const r = wt.datagrams.readable.getReader();
+    rx = (async () => {
+      for (;;) {
+        let v; try { v = await r.read(); } catch (e) { break; }
+        if (v.done) break;
+        const t = now(), d = v.value;
+        if (d.length >= 5 && d[0] === 0xA0) {
+          n++; bytes += d.length;
+          note(t, (d[1] | d[2] << 8 | d[3] << 16 | d[4] << 24) >>> 0);
+        }
+        proc += now() - t;
+      }
+    })();
+    out._cancel = () => r.cancel().catch(() => {});
+  } else {
+    const sr = wt.incomingUnidirectionalStreams.getReader();
+    const kids = [];
+    const kid = async (s) => {
+      const r = s.getReader(); let got = 0, hdr = new Uint8Array(12), hl = 0, seq = 0, len = 0;
+      for (;;) {
+        let v; try { v = await r.read(); } catch (e) { aborted++; return; }
+        if (v.done) break;
+        const t = now(), c = v.value; got += c.length; bytes += c.length;
+        if (hl < 12) { const k = Math.min(12 - hl, c.length); hdr.set(c.subarray(0, k), hl); hl += k;
+          if (hl === 12) { const dv = new DataView(hdr.buffer); seq = dv.getUint32(0, true); len = dv.getUint32(4, true); } }
+        proc += now() - t;
+      }
+      const t = now();
+      if (hl === 12 && got === len) { complete++; n++; note(t, seq); } else aborted++;
+      proc += now() - t;
+    };
+    rx = (async () => {
+      for (;;) {
+        let v; try { v = await sr.read(); } catch (e) { break; }
+        if (v.done) break;
+        kids.push(kid(v.value));
+      }
+      await Promise.allSettled(kids);
+    })();
+    out._cancel = () => sr.cancel().catch(() => {});
+  }
+
+  // control stream: one JSON line out, one JSON summary line back
+  let sum = null;
+  const t0 = now();
+  try {
+    const bs = await wt.createBidirectionalStream();
+    const w = bs.writable.getWriter();
+    await w.write(new TextEncoder().encode(JSON.stringify({ rate: cfg.rate, carriage: cfg.carriage, duration: cfg.secs, size: cfg.size }) + '\n'));
+    const rd = bs.readable.getReader(), dec = new TextDecoder(); let buf = '';
+    const deadline = setTimeout(() => rd.cancel().catch(() => {}), (cfg.secs + 20) * 1000);
+    while (!buf.includes('\n')) { const v = await rd.read(); if (v.done) break; buf += dec.decode(v.value, { stream: true }); }
+    clearTimeout(deadline);
+    sum = JSON.parse(buf.split('\n')[0]);
+  } catch (e) { out.error = 'control: ' + e; }
+  await new Promise(r => setTimeout(r, 500)); // tail grace
+  stop = true;
+  await out._cancel(); delete out._cancel;
+  try { wt.close(); } catch (e) {}
+  await Promise.race([rx, new Promise(r => setTimeout(r, 2000))]);
+
+  const dur = (last - first) / 1000;
+  out.sender = sum;
+  out.received_packets = n; out.received_bytes = bytes;
+  out.recv_mbps = dur > 0 ? bytes * 8 / dur / 1e6 : 0;
+  if (sum && sum.packets) {
+    out.loss_pct = 100 * Math.max(0, sum.packets - n) / sum.packets;
+    if (cfg.carriage === 'stream') { out.byte_loss_pct = sum.bytes ? 100 * Math.max(0, sum.bytes - bytes) / sum.bytes : 0; out.frames_complete = complete; out.frames_aborted = aborted; }
+  }
+  out.reorder = reorder; out.max_gap_ms = maxGap; out.recv_busy_ms = proc; out.wall_s = (now() - t0) / 1000;
+  out.ok = !out.error;
+  return out;
+}
+
+// ---- Page driver ----
+const q = new URLSearchParams(location.search);
+const num = (k, d) => q.has(k) ? +q.get(k) : d;
+const cfgBase = {
+  url: q.get('url'), secs: num('secs', 10), size: num('size', 1150), hwm: num('hwm', 1024),
+};
+const rates = (q.get('rates') || '50,100,200,300,400').split(',').map(Number);
+const carriages = (q.get('carriages') || 'datagram,stream').split(',');
+const where = q.get('where') || 'auto';
+const $ = id => document.getElementById(id);
+const report = { page: 'a00-wt-throughput', ua: navigator.userAgent, started: new Date().toISOString(), done: false,
+  support: { main: typeof WebTransport !== 'undefined', worker: null }, secs: cfgBase.secs, size: cfgBase.size, hwm: cfgBase.hwm, rows: [] };
+const publish = () => { $('result').textContent = JSON.stringify(report); document.title = report.done ? 'A00-DONE' : 'A00-RUNNING ' + report.rows.length; };
+
+function parseHash(s) {
+  s = (s || '').trim();
+  if (/^[0-9a-fA-F]{64}$/.test(s)) return Array.from(s.match(/../g), h => parseInt(h, 16));
+  const b = atob(s.replace(/-/g, '+').replace(/_/g, '/')); return Array.from(b, c => c.charCodeAt(0));
+}
+
+let longMs = 0;
+try { new PerformanceObserver(l => { for (const e of l.getEntries()) longMs += e.duration; }).observe({ entryTypes: ['longtask'] }); } catch (e) { report.longtask = 'unsupported'; }
+
+let worker = null;
+async function probeWorker() {
+  try {
+    const src = `${receive.toString()}\nonmessage=async e=>{ if(e.data.probe){postMessage({probe:typeof WebTransport});return;} postMessage(await receive(e.data)); }`;
+    worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    const r = await new Promise((res, rej) => { worker.onmessage = e => res(e.data); worker.onerror = e => rej(e.message || 'worker error'); worker.postMessage({ probe: 1 }); setTimeout(() => rej('probe timeout'), 5000); });
+    report.support.worker = r.probe !== 'undefined';
+  } catch (e) { report.support.worker = false; report.workerErr = '' + e; worker = null; }
+  return report.support.worker;
+}
+const inWorker = cfg => new Promise((res, rej) => { worker.onmessage = e => res(e.data); worker.onerror = e => rej(e.message || 'worker error'); worker.postMessage(cfg); });
+
+function addRow(r) {
+  const tr = document.createElement('tr');
+  const s = r.sender || {};
+  const f = (x, d = 1) => x == null ? '-' : (+x).toFixed(d);
+  const ok = r.ok && r.loss_pct < 1 && r.recv_mbps >= r.rate * 0.97;
+  tr.className = r.ok ? (ok ? 'ok' : 'bad') : 'bad';
+  const cells = [r.receiver, r.carriage, r.rate, f(s.achieved_mbps), f(r.recv_mbps), f(r.loss_pct, 2), r.reorder, f(r.max_gap_ms), f(r.main_long_ms, 0), f(r.recv_busy_ms, 0), f(s.cpu_pct_of_core ?? s.cpu_pct_of_one_core, 0), r.error || (r.carriage === 'stream' && r.frames_aborted ? r.frames_aborted + ' frames incomplete' : '')];
+  for (const c of cells) { const td = document.createElement('td'); td.textContent = c; tr.append(td); }
+  document.querySelector('#tbl tbody').append(tr);
+}
+
+async function runMatrix() {
+  $('go').disabled = true;
+  if (!cfgBase.url || !q.get('hash')) { $('status').textContent = 'need ?url= and ?hash='; return; }
+  const cfg0 = { ...cfgBase, hash: parseHash(q.get('hash')) };
+  await probeWorker();
+  const modes = where === 'both' ? ['worker', 'main'] : [where === 'auto' ? (report.support.worker ? 'worker' : 'main') : where];
+  report.modes = modes;
+  for (const mode of modes) {
+    if (mode === 'worker' && !worker) { report.rows.push({ receiver: 'worker', ok: false, error: 'WebTransport not available in Worker' }); continue; }
+    for (const rate of rates) for (const carriage of carriages) {
+      $('status').textContent = `running ${mode} ${carriage} ${rate} Mbit/s (${report.rows.length + 1} of ${rates.length * carriages.length * modes.length})`;
+      longMs = 0; const t = performance.now();
+      const cfg = { ...cfg0, rate, carriage };
+      let r;
+      try { r = mode === 'worker' ? await inWorker(cfg) : await receive(cfg); } catch (e) { r = { rate, carriage, ok: false, error: '' + e }; }
+      r.receiver = mode; r.main_long_ms = longMs; r.run_wall_s = (performance.now() - t) / 1000;
+      report.rows.push(r); addRow(r); publish();
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+  report.done = true; report.finished = new Date().toISOString(); publish();
+  $('status').textContent = 'done';
+}
+$('go').onclick = runMatrix;
+publish();
+if (q.get('auto') === '1') runMatrix();
+</script>
