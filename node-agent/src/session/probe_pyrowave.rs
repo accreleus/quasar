@@ -190,21 +190,12 @@ fn push_and_read_back(
     }
     let _ = src.end_of_stream();
 
-    let deadline = Instant::now() + request.budget;
     let (ysz, csz) = (w * h, w * h / 4);
-    let (mut frames, mut worst, mut worst_plane) = (0, f64::INFINITY, "");
-    while frames < request.frames {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let Some(sample) =
-            sink.try_pull_sample(gst::ClockTime::from_nseconds(left.as_nanos() as u64))
-        else {
-            break;
-        };
-        let buffer = sample.buffer().ok_or("a sample with no buffer")?;
-        let map = buffer.map_readable().map_err(|e| e.to_string())?;
+    let (mut worst, mut worst_plane) = (f64::INFINITY, "");
+    let frames = read_back(sink, request.frames, request.budget, |index, map| {
         let decoded = decoder
-            .decode_i420(&map)
-            .map_err(|e| format!("frame {frames} does not decode: {e}"))?;
+            .decode_i420(map)
+            .map_err(|e| format!("frame {index} does not decode: {e}"))?;
         for (range, plane) in [
             (0..ysz, "y"),
             (ysz..ysz + csz, "cb"),
@@ -215,9 +206,41 @@ fn push_and_read_back(
                 (worst, worst_plane) = (db, plane);
             }
         }
+        Ok(())
+    })?;
+    Ok((frames, worst, worst_plane))
+}
+
+/// Pull up to `want` samples within `budget`, handing each to `each`. Returns how many
+/// arrived before the deadline. An EOS before `want` is an error: the encoder dropped
+/// frames, which says something about it, unlike a deadline (`try_pull_sample` returns
+/// `None` for both).
+fn read_back(
+    sink: &gst_app::AppSink,
+    want: u64,
+    budget: std::time::Duration,
+    mut each: impl FnMut(u64, &[u8]) -> Result<(), String>,
+) -> Result<u64, String> {
+    let deadline = Instant::now() + budget;
+    let mut frames = 0;
+    while frames < want {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Some(sample) =
+            sink.try_pull_sample(gst::ClockTime::from_nseconds(left.as_nanos() as u64))
+        else {
+            if sink.is_eos() {
+                return Err(format!(
+                    "the encoder produced {frames} of {want} frames before end of stream"
+                ));
+            }
+            break;
+        };
+        let buffer = sample.buffer().ok_or("a sample with no buffer")?;
+        let map = buffer.map_readable().map_err(|e| e.to_string())?;
+        each(frames, &map)?;
         frames += 1;
     }
-    Ok((frames, worst, worst_plane))
+    Ok(frames)
 }
 
 #[cfg(test)]
@@ -231,12 +254,52 @@ mod tests {
         assert!(pic.iter().all(|&v| (16..=240).contains(&v)));
     }
 
+    /// `appsrc ! appsink` standing in for the encoder: `pushed` frames, then EOS.
+    fn read_back_of(pushed: u64, want: u64) -> Result<u64, String> {
+        gst::init().unwrap();
+        let src = gst_app::AppSrc::builder()
+            .caps(&gst::Caps::new_empty_simple("video/x-pyrowave"))
+            .format(gst::Format::Time)
+            .build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        let pipeline = gst::Pipeline::new();
+        pipeline
+            .add_many([src.upcast_ref::<gst::Element>(), sink.upcast_ref()])
+            .unwrap();
+        src.link(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        for _ in 0..pushed {
+            src.push_buffer(gst::Buffer::from_slice([0u8; 8])).unwrap();
+        }
+        src.end_of_stream().unwrap();
+        let mut seen = 0;
+        let read = read_back(&sink, want, std::time::Duration::from_secs(5), |_, _| {
+            seen += 1;
+            Ok(())
+        });
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert_eq!(read.as_ref().map_or(seen, |&n| n), seen);
+        read
+    }
+
+    #[test]
+    fn an_end_of_stream_before_every_frame_is_a_definite_shortfall() {
+        assert_eq!(read_back_of(3, 3), Ok(3));
+        let short = read_back_of(3, 5).unwrap_err();
+        assert!(
+            short.contains("3 of 5 frames before end of stream"),
+            "{short}"
+        );
+    }
+
     #[test]
     fn a_memory_shortage_is_indeterminate_and_anything_else_definite() {
-        let oom =
-            "/dev/dri/renderD128: pyrowave_encoder_create failed: -4 ERROR_OUT_OF_DEVICE_MEMORY";
+        let oom = format!(
+            "/dev/dri/renderD128: pyrowave_encoder_create failed: -4 ERROR_OUT_OF_DEVICE_MEMORY {}",
+            gstpyrowave::ffi::RESOURCE_TAG
+        );
         assert!(matches!(
-            classify(oom.into(), ProbeVerdict::Unsupported),
+            classify(oom, ProbeVerdict::Unsupported),
             ProbeVerdict::Indeterminate(_)
         ));
         let novk = "pyrowave_create_device_by_compat failed: -5 ERROR_NO_VULKAN";

@@ -100,6 +100,7 @@ export function baseCheckId(id: string): string {
 /** A PyroWave codec probe: no session uses PyroWave yet (#1048), so its `fail` is a
  *  warning, never a host fault. Keyed on the id because the check carries no codec field. */
 export function isAdvisoryCheck(id: string): boolean {
+  // shortcut: drop when PyroWave sessions ship (#1048).
   return /_gpu\d+_pyrowave$/.test(id);
 }
 

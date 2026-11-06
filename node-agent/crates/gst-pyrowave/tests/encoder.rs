@@ -183,6 +183,48 @@ fn full_range_input_says_full_range_in_the_sof() {
     );
 }
 
+/// Caps reach `set_format` only after `start()` has opened the device, so this needs one.
+#[test]
+fn a_left_sited_input_fails_negotiation_and_says_why() {
+    if device().is_none() {
+        return;
+    }
+    let src = std::fs::read(fixtures().join("detail_320x192.src.yuv")).unwrap();
+    let caps = "video/x-raw,format=I420,width=320,height=192,framerate=60/1,\
+                colorimetry=bt709,chroma-site=mpeg2";
+    let mut desc = format!("appsrc name=src format=time caps=\"{caps}\" ! pyrowaveenc ");
+    if let Some(node) = device_node() {
+        desc += &format!("device={node} ");
+    }
+    desc += "! fakesink";
+    let pipeline = gst::parse::launch(&desc)
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+    let appsrc = pipeline
+        .by_name("src")
+        .unwrap()
+        .downcast::<gst_app::AppSrc>()
+        .unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let _ = appsrc.push_buffer(gst::Buffer::from_slice(src));
+    let msg = pipeline
+        .bus()
+        .unwrap()
+        .timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Error])
+        .expect("an error on the bus");
+    pipeline.set_state(gst::State::Null).unwrap();
+    let gst::MessageView::Error(err) = msg.view() else {
+        unreachable!()
+    };
+    let text = format!("{} {:?}", err.error(), err.debug());
+    assert!(err.error().matches(gst::CoreError::Negotiation), "{text}");
+    assert!(
+        text.contains("must be centre-sited, got chroma-site mpeg2"),
+        "{text}"
+    );
+}
+
 #[test]
 fn nv12_input_encodes_like_i420() {
     let Some(device) = device() else { return };

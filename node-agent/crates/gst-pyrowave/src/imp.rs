@@ -123,7 +123,9 @@ impl ElementImpl for PyroWaveEnc {
     fn pad_templates() -> &'static [gst::PadTemplate] {
         static TEMPLATES: LazyLock<Vec<gst::PadTemplate>> = LazyLock::new(|| {
             // BT.709 only, limited or full range: PyroWave has no BT.601 matrix
-            // (codec-pyrowave.md §hello_ack), so upstream converts to this.
+            // (codec-pyrowave.md §hello_ack), so upstream converts to this. No chroma-site
+            // here: a template naming it refuses every upstream that leaves it unset;
+            // set_format refuses a non-centre one instead.
             let sink = gst::Caps::from_str(
                 "video/x-raw, format=(string){ I420, NV12 }, \
                  width=(int)[ 2, 16384 ], height=(int)[ 2, 16384 ], \
@@ -184,7 +186,11 @@ impl VideoEncoderImpl for PyroWaveEnc {
         let caps = input
             .caps()
             .ok_or_else(|| gst::loggable_error!(CAT, "input state without caps"))?;
-        let info = crate::check_input(caps).map_err(|e| gst::loggable_error!(CAT, "{e}"))?;
+        let info = crate::check_input(caps).map_err(|e| {
+            // On the bus too: a LoggableError alone reaches only the debug log.
+            gst::element_imp_error!(self, gst::CoreError::Negotiation, ["{e}"]);
+            gst::loggable_error!(CAT, "{e}")
+        })?;
         let (w, h) = (info.width(), info.height());
         let mut guard = self.state.lock().unwrap();
         let state = guard
