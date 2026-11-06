@@ -37,6 +37,9 @@ export interface PadEntry extends PadEnv {
   map: string;
   /** Raw axis that carries a HID hat switch; required when `map` uses `h0.M`. */
   hatAxis?: number;
+  /** A d-pad carried on two ordinary axes of -1/0/+1 (Linux Chrome's view of a hat): `x` left(-1)/right(+1),
+   *  `y` up(-1)/down(+1). One d-pad form per entry: this, `hatAxis` with `h0.M`, or `dpup:bN` buttons. */
+  dpadAxes?: { x: number; y: number };
   /** Resting value of a trigger axis (default -1: rest -1, full +1). */
   triggerRest?: number;
 }
@@ -48,6 +51,7 @@ type Src = { kind: "b" | "a" | "h"; idx: number; hat?: number };
 interface Layout {
   buttons: Array<Src | undefined>; // by W3C button index
   axes: Array<number | undefined>; // W3C axis → raw axis
+  dpadAxes?: PadEntry["dpadAxes"];
 }
 
 /** Chrome: "… (Vendor: 2dc8 Product: 6006)"; Firefox: "2dc8-6006-…". */
@@ -71,6 +75,7 @@ export function detectPadEnv(
 export function parseEntry(e: PadEntry): Layout {
   const buttons: Layout["buttons"] = [];
   const axes: Layout["axes"] = [];
+  const dpadForms = new Set<string>(e.dpadAxes ? ["axes"] : []);
   for (const part of e.map.split(",")) {
     const [key, spec] = part.split(":");
     const m = /^([bah])(\d+)(?:\.(\d+))?$/.exec(spec ?? "");
@@ -80,11 +85,17 @@ export function parseEntry(e: PadEntry): Layout {
     const limit = kind === "b" ? e.buttons : e.axes;
     if (kind === "h" && e.hatAxis === undefined) throw new Error(`gamepadRemap: ${e.vid}:${e.pid} uses a hat but has no hatAxis`);
     if (kind !== "h" && idx >= limit) throw new Error(`gamepadRemap: ${e.vid}:${e.pid} ${part} is outside its capture`);
+    if (key.startsWith("dp")) dpadForms.add(kind);
     if (key in AXIS_KEYS) axes[AXIS_KEYS[key]] = idx;
     else if (key in BUTTON_KEYS) buttons[BUTTON_KEYS[key]] = kind === "h" ? { kind, idx: e.hatAxis!, hat: Number(m[3]) } : { kind, idx };
   }
   if (e.hatAxis !== undefined && e.hatAxis >= e.axes) throw new Error(`gamepadRemap: ${e.vid}:${e.pid} hatAxis is outside its capture`);
-  return { buttons, axes };
+  if (dpadForms.size > 1) throw new Error(`gamepadRemap: ${e.vid}:${e.pid} mixes d-pad forms`);
+  const d = e.dpadAxes;
+  if (d && (d.x === d.y || [d.x, d.y].some((i) => !Number.isInteger(i) || i < 0 || i >= e.axes))) {
+    throw new Error(`gamepadRemap: ${e.vid}:${e.pid} dpadAxes is outside its capture`);
+  }
+  return { buttons, axes, dpadAxes: d };
 }
 
 const layouts = new WeakMap<PadEntry, Layout>();
@@ -97,6 +108,11 @@ export function hatDirection(v: number): number {
   const k = Math.round((v + 1) * 3.5);
   if (k < 0 || k > 7 || Math.abs(v + 1 - (k * 2) / 7) > HAT_TOLERANCE) return 0;
   return [1, 3, 2, 6, 4, 12, 8, 9][k];
+}
+
+/** One axis of a two-axis d-pad: exactly -1 or +1 within HAT_TOLERANCE, else 0. */
+export function axisStep(v: number): number {
+  return Math.abs(v - 1) <= HAT_TOLERANCE ? 1 : Math.abs(v + 1) <= HAT_TOLERANCE ? -1 : 0;
 }
 
 export interface Remapped {
@@ -129,6 +145,14 @@ export function remapGamepad(
     if (s.kind === "a") return Math.min(1, Math.max(0, (rawAxes[s.idx] - rest) / (1 - rest)));
     return hatDirection(rawAxes[s.idx]) & (s.hat ?? 0) ? 1 : 0;
   });
+  if (l.dpadAxes) {
+    const x = axisStep(rawAxes[l.dpadAxes.x]);
+    const y = axisStep(rawAxes[l.dpadAxes.y]);
+    buttons[12] = y < 0 ? 1 : 0;
+    buttons[13] = y > 0 ? 1 : 0;
+    buttons[14] = x < 0 ? 1 : 0;
+    buttons[15] = x > 0 ? 1 : 0;
+  }
   const axes = [0, 1, 2, 3].map((i) => (l!.axes[i] === undefined ? 0 : rawAxes[l!.axes[i]!]));
   return { buttons, axes };
 }

@@ -27,7 +27,7 @@ own; the two do not move together, and that is deliberate.
 ### Internal
 - **CI also runs on release integration branches (`integration/<version>`).** Pull requests into one run the jobs their change touches, and a landing on one runs every job, exactly as for `develop`. `CLAUDE.md` now says specs and tickets live as GitHub issues rather than plan files. No product change.
 - **The domain glossary is now `GLOSSARY.md` (was `CONTEXT.md`), matching the updated domain-modeling and setup skills.** Renamed with `git mv`; every reference in the docs, `CLAUDE.md` and code comments follows (the generated API types follow with the next protocol pin). No product change.
-- **Session view: a per-platform remap table for controllers the browser does not map (#831).** A pad found in the table for your OS and browser, with the same number of buttons and axes it was captured with, is translated to the standard layout before it is sent, and no longer shows the "controller not recognised" notice. The table starts empty and gains an entry only from a real capture, so nothing changes yet: other pads keep the notice and its advice.
+- **Session view: a per-platform remap table for controllers the browser does not map (#831).** A pad found in the table for your OS and browser, with the same number of buttons and axes it was captured with, is translated to the standard layout before it is sent, and no longer shows the "controller not recognised" notice. The table starts empty and gains an entry only from a real capture, so nothing changes yet (an entry can write a D-pad as buttons, as one hat axis, or as a pair of -1/0/+1 axes, which is how Linux Chrome shows a hat): other pads keep the notice and its advice.
 
 ## 0.5.2 — 2026-11-01
 

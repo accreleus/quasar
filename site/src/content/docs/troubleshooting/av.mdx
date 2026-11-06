@@ -84,6 +84,13 @@ control slowly. After 60 seconds it copies the result; paste that into the issue
 (()=>{const t0=performance.now(),prev={},out=[];const id=setInterval(()=>{for(const p of navigator.getGamepads()){if(!p)continue;const k=p.index;const s={b:p.buttons.map(b=>+b.value.toFixed(2)),a:p.axes.map(a=>+a.toFixed(3))};const o=prev[k];if(!o){out.push({id:p.id,mapping:p.mapping,buttons:p.buttons.length,axes:p.axes.length,rest:s});console.log("PAD",p.id,p.mapping,p.buttons.length,"buttons",p.axes.length,"axes","rest axes",s.a)}else{s.b.forEach((v,i)=>{if(v!==o.b[i]){out.push({t:Math.round(performance.now()-t0),btn:i,v});console.log("button",i,"=",v)}});s.a.forEach((v,i)=>{if(Math.abs(v-o.a[i])>0.2){out.push({t:Math.round(performance.now()-t0),axis:i,v});console.log("axis",i,"=",v)}})}prev[k]=s}},30);setTimeout(()=>{clearInterval(id);copy(JSON.stringify({ua:navigator.userAgent,platform:navigator.platform,events:out}));console.log("DONE: copied to clipboard",out.length,"events")},60000);console.log("Press any button to wake the pad, then go through every control slowly. Stops after 60 s and copies the result.")})()
 ```
 
+How the D-pad shows up in the capture decides how the entry is written. Buttons
+12 to 15 changing: `dpup:b12,…`. One axis stepping through eight values: `hatAxis`
+and `dpup:h0.1,…`. Two axes that each only ever read -1, 0 or +1 (a hat on Linux
+Chrome, typically axes 6 and 7): `dpadAxes: { x: 6, y: 7 }`, with no `dpup`…`dpright`
+in the map. Negative on `x` is left, negative on `y` is up. An entry uses one of
+these.
+
 For just the pad's id and what is pressed right now:
 
 ```js

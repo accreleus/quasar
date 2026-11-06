@@ -16,7 +16,13 @@ const DPAD_BUTTONS: PadEntry = {
   buttons: 16, axes: 4,
   map: "a:b0,b:b1,dpup:b12,dpdown:b13,dpleft:b14,dpright:b15,leftx:a0,lefty:a1,rightx:a2,righty:a3",
 };
-const TABLE = [HAT, FIREFOX, DPAD_BUTTONS];
+// Linux Chrome's view of a hat: two ordinary axes, each -1 / 0 / +1.
+const DPAD_AXES: PadEntry = {
+  vid: "1234", pid: "0002", platform: "linux", browser: "chrome", source: "synthetic",
+  buttons: 15, axes: 8, dpadAxes: { x: 6, y: 7 },
+  map: "a:b1,b:b0,leftx:a0,lefty:a1,rightx:a2,righty:a3",
+};
+const TABLE = [HAT, FIREFOX, DPAD_BUTTONS, DPAD_AXES];
 const WIN_CHROME = { platform: "win", browser: "chrome" } as const;
 const NEUTRAL = 3.286;
 
@@ -152,6 +158,27 @@ describe("remapGamepad: translation", () => {
     expect(down(run(DPAD_BUTTONS, [0, 1]))).toEqual([0, 1]);
   });
 
+  it("d-pad on an axis pair: all four directions by sign, diagonals, neutral", () => {
+    const pad = (x: number, y: number) => down(run(DPAD_AXES, [], { 6: x, 7: y }));
+    expect(pad(0, -1)).toEqual([12]);
+    expect(pad(0, 1)).toEqual([13]);
+    expect(pad(-1, 0)).toEqual([14]);
+    expect(pad(1, 0)).toEqual([15]);
+    expect(pad(-1, -1)).toEqual([12, 14]);
+    expect(pad(1, -1)).toEqual([12, 15]);
+    expect(pad(-1, 1)).toEqual([13, 14]);
+    expect(pad(1, 1)).toEqual([13, 15]);
+    expect(pad(0, 0)).toEqual([]);
+  });
+
+  it("d-pad on an axis pair: anything but exactly ±1 is neutral, other axes are no press", () => {
+    const pad = (x: number, y: number) => down(run(DPAD_AXES, [], { 6: x, 7: y }));
+    for (const v of [0.01, -0.01, 0.05, -0.05, 0.5, -0.5, 0.9, -0.9, 3.286]) expect(pad(v, v), String(v)).toEqual([]);
+    expect(pad(0.99, -0.985)).toEqual([12, 15]); // within ±0.02 of a step
+    expect(pad(1.03, -1.03)).toEqual([]);
+    expect(down(run(DPAD_AXES, [], { 0: -1, 1: -1, 2: 1, 3: 1 }))).toEqual([]); // sticks are not the d-pad
+  });
+
   it("trigger axis: default rest -1, or the entry's own rest", () => {
     expect(run(HAT, [], { 2: -1 })!.buttons[6]).toBe(0);
     expect(run(HAT, [], { 2: 0 })!.buttons[6]).toBe(0.5);
@@ -168,6 +195,21 @@ describe("parseEntry", () => {
     expect(() => parseEntry({ ...HAT, map: "a:b13" })).toThrow(/outside its capture/);
     expect(() => parseEntry({ ...HAT, map: "leftx:a6" })).toThrow(/outside its capture/);
     expect(() => parseEntry({ ...HAT, map: "a:x1" })).toThrow(/bad entry/);
+  });
+});
+
+describe("parseEntry: one d-pad form per entry", () => {
+  it("accepts dpadAxes alone, rejects it beside hat or button d-pad keys", () => {
+    expect(() => parseEntry(DPAD_AXES)).not.toThrow();
+    expect(() => parseEntry({ ...DPAD_AXES, map: DPAD_AXES.map + ",dpup:b12" })).toThrow(/mixes d-pad forms/);
+    expect(() => parseEntry({ ...HAT, dpadAxes: { x: 0, y: 1 } })).toThrow(/mixes d-pad forms/);
+    expect(() => parseEntry({ ...DPAD_BUTTONS, dpadAxes: { x: 0, y: 1 } })).toThrow(/mixes d-pad forms/);
+    expect(() => parseEntry({ ...HAT, map: HAT.map + ",dpleft:b3" })).toThrow(/mixes d-pad forms/);
+  });
+  it("rejects dpadAxes outside the capture, equal, or not an integer", () => {
+    for (const d of [{ x: 6, y: 8 }, { x: -1, y: 7 }, { x: 6, y: 6 }, { x: 6.5, y: 7 }]) {
+      expect(() => parseEntry({ ...DPAD_AXES, dpadAxes: d }), JSON.stringify(d)).toThrow(/dpadAxes is outside/);
+    }
   });
 });
 
