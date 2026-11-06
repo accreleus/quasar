@@ -23,9 +23,11 @@ pub struct EncodedSession {
     pub(crate) cfg: SessionConfig,
     /// The encode pipeline, still NULL. A transport adds its video elements here.
     pub(crate) pipeline: gst::Pipeline,
-    /// The parser's src pad: one access unit per buffer in `cfg.stream.codec`, PTS in the
-    /// running time shared with the source (#68), `DELTA_UNIT` unset on a keyframe.
-    /// Capture time is the wall clock as a unit leaves here.
+    /// The parser's src pad: encoded video in `cfg.stream.codec`, in the `stream-format`
+    /// and `alignment` the transport asks for downstream (`alignment=au`: one access unit
+    /// per buffer). PTS in the running time shared with the source (#68), though a unit
+    /// may have none (openh264's second); `DELTA_UNIT` unset on a keyframe. Capture time
+    /// is the wall clock as a unit leaves here.
     pub(crate) video: gst::Pad,
     /// The video encoder: `resize::force_idr` on it is the keyframe request, and the ABR
     /// writes its bitrate live.

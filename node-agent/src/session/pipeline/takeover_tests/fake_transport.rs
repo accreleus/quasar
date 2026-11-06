@@ -27,7 +27,9 @@ impl Transport for FakeTransport {
         sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if let Some(buffer) = info.buffer() {
                 let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
-                seen.lock().unwrap().push((buffer.pts(), keyframe));
+                seen.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((buffer.pts(), keyframe));
             }
             gst::PadProbeReturn::Ok
         });
@@ -128,10 +130,13 @@ fn a_second_transport_takes_access_units_without_rtp_or_webrtc() {
         let units = transport.units.lock().unwrap();
         assert!(units[0].1, "the first access unit is a keyframe");
         assert!(units[1..].iter().any(|u| !u.1), "later units are deltas");
-        let pts: Vec<_> = units
-            .iter()
-            .map(|u| u.0.expect("a PTS on every unit"))
-            .collect();
+        assert!(units[0].0.is_some(), "the keyframe has a PTS");
+        // openh264's second unit carries none; the rest do.
+        let pts: Vec<_> = units.iter().filter_map(|u| u.0).collect();
+        assert!(
+            pts.len() + 1 >= units.len(),
+            "units without a PTS: {units:?}"
+        );
         assert!(pts.windows(2).all(|w| w[0] < w[1]), "PTS rises: {pts:?}");
     }
 
