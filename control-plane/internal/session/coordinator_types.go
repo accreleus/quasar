@@ -1,7 +1,11 @@
 // coordinator_types.go — shared parameter/result types for the Coordinator lifecycle.
 package session
 
-import "time"
+import (
+	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/wtendpoint"
+)
 
 // StreamOverride carries optional per-launch stream parameters; nil fields fall
 // back to the app's defaults. The handler validates H264Profile against the
@@ -58,6 +62,9 @@ type LaunchParams struct {
 	// the instance setting to resolve what is dispatched and persisted
 	// (Session.Mic). A request against a disabled instance proceeds with no mic.
 	Mic bool
+	// Transport is the client's preference ("", "webrtc" or "webtransport"); the stream plan
+	// decides (control-api.md §Transport).
+	Transport string
 	// parked is the library heartbeat's warm start (control-api.md §Warm Steam):
 	// no signaling token, Steam -silent, kind parked, and never an eviction.
 	parked bool
@@ -94,4 +101,15 @@ type LaunchResult struct {
 	TokenExpiresAt time.Time
 	// Notice is the steam_library_not_shared message, "" for none.
 	Notice string
+	// Transport carries the WebTransport options when the session's transport is
+	// WebTransport, nil otherwise.
+	Transport *TransportOptions
+}
+
+// TransportOptions is launch response `transport_options.webtransport`.
+type TransportOptions struct {
+	URL        string
+	Token      string
+	ExpiresAt  time.Time
+	CertHashes []wtendpoint.Hash
 }

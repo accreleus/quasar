@@ -615,6 +615,10 @@ type SessionStreamUpdate struct {
 	// CodecDecision (UI-P6) rides on this write, not a second UPDATE, so the two
 	// can never disagree if one fails. Empty leaves the column unchanged.
 	CodecDecision json.RawMessage
+	// Transport and TransportReason ride on this write for the same reason. Empty Transport
+	// leaves both columns unchanged.
+	Transport       string
+	TransportReason string
 }
 
 // UpdateSessionStream applies a SessionStreamUpdate, called once post-schedule
@@ -645,11 +649,14 @@ func (s *Store) UpdateSessionStream(ctx context.Context, sessionID string, u Ses
 		    playout0_ms       = COALESCE($8, playout0_ms),
 		    profile_id        = COALESCE($9, profile_id),
 		    stream_profile_id = COALESCE($10, stream_profile_id),
-		    codec_decision    = COALESCE($11, codec_decision)
+		    codec_decision    = COALESCE($11, codec_decision),
+		    transport_reason  = CASE WHEN $12::text IS NULL THEN transport_reason ELSE $13 END,
+		    transport         = COALESCE($12, transport)
 		WHERE id::text = $1
 	`, sessionID, u.Width, u.Height, u.FPS, u.BitrateKbps,
 		nilIfEmpty(u.H264Profile), nilIfEmpty(u.Codec), playoutArg,
-		nilIfEmpty(u.ProfileID), nilIfEmpty(u.StreamProfileID), decisionArg)
+		nilIfEmpty(u.ProfileID), nilIfEmpty(u.StreamProfileID), decisionArg,
+		nilIfEmpty(u.Transport), nilIfEmpty(u.TransportReason))
 	if err != nil {
 		return fmt.Errorf("update session stream: %w", err)
 	}

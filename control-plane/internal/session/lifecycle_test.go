@@ -417,6 +417,21 @@ type fakeDispatcher struct {
 	// same, and it is the ONLY way to reach it — the default fake never errors.
 	ackSendErr error
 	sawAssign  chan struct{}
+	// transportTokens records each session_transport_token, in order.
+	transportTokens []agentws.SessionTransportTokenCmd
+}
+
+// setAck changes the ack every later command gets.
+func (f *fakeDispatcher) setAck(ok bool, sendErr error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ackOK, f.ackSendErr = ok, sendErr
+}
+
+func (f *fakeDispatcher) transportTokenCmds() []agentws.SessionTransportTokenCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]agentws.SessionTransportTokenCmd(nil), f.transportTokens...)
 }
 
 func newFakeDispatcher(ackOK bool) *fakeDispatcher {
@@ -458,6 +473,9 @@ func (f *fakeDispatcher) SendWithAck(_ context.Context, _ string, _ string, v an
 		f.lastAssign = &assign
 	case agentws.SessionStartCmd:
 		f.sent = append(f.sent, "start")
+	case agentws.SessionTransportTokenCmd:
+		f.sent = append(f.sent, "transport_token")
+		f.transportTokens = append(f.transportTokens, c)
 	case agentws.SessionStopCmd:
 		f.sent = append(f.sent, "stop")
 	case agentws.SessionSwapAppCmd:

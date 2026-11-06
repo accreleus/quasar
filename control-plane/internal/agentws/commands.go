@@ -2,6 +2,7 @@ package agentws
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/preparation"
 )
@@ -37,6 +38,22 @@ type SessionAssignCmd struct {
 	// parked_sessions_v1, which always gets Kind.
 	Kind           string `json:"kind,omitempty"`
 	AdoptSessionID string `json:"adopt_session_id,omitempty"`
+	// Amendment 54: sent only for a WebTransport session ("webtransport"), with the first
+	// transport token's hash and expiry. Omitted ⇒ webrtc.
+	Transport        string     `json:"transport,omitempty"`
+	WTTokenHash      string     `json:"wt_token_hash,omitempty"`
+	WTTokenExpiresAt *time.Time `json:"wt_token_expires_at,omitempty"`
+}
+
+// SessionTransportTokenCmd delivers the hash of a transport token minted after the assign
+// (agent-api.md `session_transport_token`). The control plane hands the token to the client only
+// after ack{ok:true}.
+type SessionTransportTokenCmd struct {
+	Type             string    `json:"type"` // "session_transport_token"
+	ID               string    `json:"id"`
+	SessionID        string    `json:"session_id"`
+	WTTokenHash      string    `json:"wt_token_hash"`
+	WTTokenExpiresAt time.Time `json:"wt_token_expires_at"`
 }
 
 // StreamSpec is the per-session pipeline parameterization (P1-5 StreamParams).

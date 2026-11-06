@@ -18,6 +18,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/ice"
 	"github.com/accreleus/quasar/control-plane/internal/profile"
+	"github.com/accreleus/quasar/control-plane/internal/wtendpoint"
 )
 
 // Handler serves the session endpoints: launch and lifecycle.
@@ -91,6 +92,7 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	mux.Handle("GET /v1/sessions", requireAuth(http.HandlerFunc(h.handleList)))
 	mux.Handle("GET /v1/sessions/{id}", requireAuth(http.HandlerFunc(h.handleGet)))
 	mux.Handle("POST /v1/sessions/{id}/signaling-token", requireAuth(http.HandlerFunc(h.handleSignalingToken)))
+	mux.Handle("POST /v1/sessions/{id}/transport-token", requireAuth(http.HandlerFunc(h.handleTransportToken)))
 	mux.Handle("DELETE /v1/sessions/{id}", requireAuth(http.HandlerFunc(h.handleStop)))
 	mux.Handle("POST /v1/sessions/{id}/swap", requireAuth(http.HandlerFunc(h.handleSwap)))
 	// Live render resolution / UI scale: a relay to the host agent. No state
@@ -258,10 +260,14 @@ type sessionResp struct {
 	HealthReason *string `json:"health_reason,omitempty"`
 	// The Steam parent whose library this session also mounts; always
 	// serialized. semantics: control-api.md §Storage
-	SharedHomeAppID *string    `json:"shared_home_app_id"`
-	CreatedAt       time.Time  `json:"created_at"`
-	StartedAt       *time.Time `json:"started_at"`
-	EndedAt         *time.Time `json:"ended_at"`
+	SharedHomeAppID *string `json:"shared_home_app_id"`
+	// Always serialized. semantics: control-api.md §Transport — WebRTC and WebTransport
+	Transport               string     `json:"transport"`
+	TransportReason         *string    `json:"transport_reason"`
+	TransportFallbackReason *string    `json:"transport_fallback_reason"`
+	CreatedAt               time.Time  `json:"created_at"`
+	StartedAt               *time.Time `json:"started_at"`
+	EndedAt                 *time.Time `json:"ended_at"`
 }
 
 type signalingResp struct {
@@ -365,10 +371,14 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		HealthState:     string(s.HealthState),
 		HealthReason:    s.HealthReason,
 		SharedHomeAppID: s.SharedHomeAppID,
-		Stream:          stream,
-		CreatedAt:       s.CreatedAt,
-		StartedAt:       s.StartedAt,
-		EndedAt:         s.EndedAt,
+		Transport:       s.Transport,
+		TransportReason: s.TransportReason,
+
+		TransportFallbackReason: s.TransportFallbackReason,
+		Stream:                  stream,
+		CreatedAt:               s.CreatedAt,
+		StartedAt:               s.StartedAt,
+		EndedAt:                 s.EndedAt,
 	}
 }
 
@@ -401,8 +411,10 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		ClientType *string `json:"client_type"` // "native" | "browser"; absent ⇒ browser
 		// The launch REQUEST, absent ⇒ false. A plain bool, not a pointer: there
 		// is nothing to distinguish an absent value from an explicit false.
-		Mic    bool `json:"mic"`
-		Stream *struct {
+		Mic bool `json:"mic"`
+		// "webrtc" | "webtransport"; absent ⇒ the profile decides.
+		Transport *string `json:"transport"`
+		Stream    *struct {
 			Width       *int32  `json:"width"`
 			Height      *int32  `json:"height"`
 			FPS         *int32  `json:"fps"`
@@ -416,6 +428,12 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AppID == "" {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "app_id is required")
+		return
+	}
+
+	if t := req.Transport; t != nil && *t != transportWebRTC && *t != transportWebTransport {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+			"transport must be one of: webrtc, webtransport")
 		return
 	}
 
@@ -460,6 +478,9 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	// about the client, and is stamped on the session row for later reads.
 	lp.DeviceID, _ = auth.TokenDeviceIDFromContext(r.Context())
 	lp.Mic = req.Mic
+	if req.Transport != nil {
+		lp.Transport = *req.Transport
+	}
 
 	res, err := h.coord.LaunchByProfile(r.Context(), user.ID, lp)
 	switch {
@@ -574,6 +595,9 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		"session":   h.sessionResp(res.Session),
 		"signaling": h.newSignalingResp(r, res.SignalingToken, res.TokenExpiresAt),
 	}
+	if res.Transport != nil {
+		body["transport_options"] = map[string]any{"webtransport": toWebTransportResp(res.Transport)}
+	}
 	// Omitted, never empty. semantics: control-api.md §Storage
 	if res.Notice != "" {
 		body["notice"] = map[string]string{"code": noticeCodeSteamLibraryNotShared, "message": res.Notice}
@@ -657,6 +681,73 @@ func (h *Handler) handleSignalingToken(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{
 		"signaling": h.newSignalingResp(r, token.Plaintext, token.ExpiresAt),
 	})
+}
+
+type webTransportResp struct {
+	URL       string    `json:"url"`
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+	// Always serialized: [] on an edge endpoint.
+	CertHashes []wtendpoint.Hash `json:"cert_hashes"`
+}
+
+func toWebTransportResp(o *TransportOptions) webTransportResp {
+	hashes := o.CertHashes
+	if hashes == nil {
+		hashes = []wtendpoint.Hash{}
+	}
+	return webTransportResp{URL: o.URL, Token: o.Token, ExpiresAt: o.ExpiresAt, CertHashes: hashes}
+}
+
+func (h *Handler) handleTransportToken(w http.ResponseWriter, r *http.Request) {
+	user, _ := auth.UserFromContext(r.Context())
+	id := r.PathValue("id")
+	sess, err := h.store.Get(r.Context(), id)
+	// Owner only, never admin: a token attaches to the live stream and input (#496).
+	if errors.Is(err, ErrNotFound) || (err == nil && (sess.UserID != user.ID || parkedHidden(user, sess, false))) {
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
+		return
+	}
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not get session")
+		return
+	}
+	notReconnectable := func() {
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeSessionNotReconnectable, "session is not reconnectable")
+	}
+	if sess.State.IsTerminal() {
+		notReconnectable()
+		return
+	}
+	// A WebRTC session has no endpoint to reconnect to; the client uses the signaling token.
+	if sess.Transport != transportWebTransport {
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeTransportUnavailable,
+			"this session does not use WebTransport; use the signaling token")
+		return
+	}
+	// Retryable, as for the signaling token: the agent still holds the session while it reconnects.
+	if sess.HostID != nil && !h.coord.AgentConnected(*sess.HostID) {
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeAgentNotConnected,
+			"the host agent is reconnecting; retry shortly")
+		return
+	}
+	opts, err := h.coord.MintReconnectTransport(r.Context(), sess)
+	switch {
+	case errors.Is(err, ErrSessionTerminal):
+		notReconnectable()
+	case errors.Is(err, ErrTransportUnavailable):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeTransportUnavailable,
+			"the host has no usable WebTransport endpoint; use the signaling token")
+	case errors.Is(err, ErrAgentNoAck):
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeAgentNotConnected,
+			"the host agent did not acknowledge the token; retry shortly")
+	case err != nil:
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not mint transport token")
+	default:
+		httpx.WriteJSON(w, http.StatusCreated, map[string]any{
+			"transport_options": map[string]any{"webtransport": toWebTransportResp(opts)},
+		})
+	}
 }
 
 func (h *Handler) handleList(w http.ResponseWriter, r *http.Request) {

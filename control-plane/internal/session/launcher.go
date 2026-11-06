@@ -10,6 +10,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/profile"
 	"github.com/accreleus/quasar/control-plane/internal/tier"
+	"github.com/accreleus/quasar/control-plane/internal/wtendpoint"
 )
 
 // LaunchByProfile resolves the selected launch profile (or the legacy tier) to
@@ -370,13 +371,22 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	// Post-placement: rung resolution, cert cap, re-resolve, one write. Placement
 	// picks the GPU, not the rung, so the rung resolves here, where the GPU is
 	// known. A claim resolved it on the parked session's GPU before placement.
+	placed := claimStream
 	if p.claim != nil {
 		c.persistPlacedStream(ctx, &sess, claimStream)
-	} else if err := c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {
+	} else if placed, err = c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {
 		// The codec constraint pre-empts both codec refusals; this stays the
 		// backstop. Fail the session, releasing its reservation, rather than
 		// dispatching a doomed assignment.
 		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("rung resolution failed: %v", err))
+		return LaunchResult{}, err
+	}
+
+	// A WebTransport session gets its first transport token now: the transport is only known
+	// after placement, and the assign below carries the token's hash.
+	transport, err := c.mintLaunchTransport(ctx, &sess, placed)
+	if err != nil {
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("transport token: %v", err))
 		return LaunchResult{}, err
 	}
 
@@ -418,7 +428,24 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	expectedHome := expectedHomeDispatch(app)
 	go c.prepareAndDispatch(sess, dispatchSpec, app.Image(), &expectedHome)
 
-	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt, Notice: sess.notice}, nil
+	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt, Notice: sess.notice, Transport: transport}, nil
+}
+
+// mintLaunchTransport mints the first transport token when the plan chose WebTransport, sets it
+// on sess for the assign dispatch and returns the options for the 201. Nil for a WebRTC session,
+// including one whose plan write failed: sess then still holds the inserted webrtc values.
+func (c *Coordinator) mintLaunchTransport(ctx context.Context, sess *Session, ps placedStream) (*TransportOptions, error) {
+	if sess.Transport != transportWebTransport || ps.plan == nil || ps.plan.Endpoint == nil {
+		return nil, nil
+	}
+	grant, err := c.store.MintTransportToken(ctx, sess.ID)
+	if err != nil {
+		return nil, err
+	}
+	sess.wt = &grant
+	return &TransportOptions{
+		URL: ps.plan.Endpoint.URL, Token: grant.Plaintext, ExpiresAt: grant.ExpiresAt, CertHashes: ps.plan.Endpoint.CertHashes,
+	}, nil
 }
 
 func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, imageRef string, expected *homeDispatchExpectation) {
@@ -512,13 +539,13 @@ func (c *Coordinator) applyPostPlacement(
 	ov StreamOverride,
 	env ProbeEnvelope,
 	source string,
-) error {
+) (placedStream, error) {
 	ps, err := c.planPostPlacement(ctx, sess, launchProfile, lp, ov, env, source)
 	if err != nil {
-		return err
+		return placedStream{}, err
 	}
 	c.persistPlacedStream(ctx, sess, ps)
-	return nil
+	return ps, nil
 }
 
 // planPostPlacement is applyPostPlacement's decision with no write: the rung
@@ -674,6 +701,16 @@ func (c *Coordinator) gatherStreamInputs(
 		Chain:       chain,
 		CertMaxAge:  CertStaleness,
 		Now:         time.Now(),
+		Transport:   TransportInputs{Requested: lp.Transport},
+	}
+	// Only a profile that can want WebTransport pays for the endpoint read.
+	if sess.HostID != nil && (chain.Transport == transportWebTransport || chain.Transport == transportOptIn) {
+		if host, err := wtendpoint.Load(ctx, c.store.pool, *sess.HostID); err != nil {
+			c.log.Warn("transport: host endpoint load failed, planning WebRTC",
+				"host_id", *sess.HostID, "err", err)
+		} else {
+			in.Transport.Endpoint = wtendpoint.Resolve(host, in.Now).Endpoint
+		}
 	}
 
 	// Placed-host encoder capability. A missing host is an h264-only host; an
@@ -1016,6 +1053,10 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		VideoTopology:  videoTopology,
 		Kind:           sess.Kind,
 		AdoptSessionID: sess.AdoptSessionID,
+	}
+	if sess.wt != nil {
+		exp := sess.wt.ExpiresAt
+		assign.Transport, assign.WTTokenHash, assign.WTTokenExpiresAt = transportWebTransport, sess.wt.Hash, &exp
 	}
 	if !c.sendHomeBoundAssign(hostID, sess.ID, runtimeSpec, assign, expected) {
 		return

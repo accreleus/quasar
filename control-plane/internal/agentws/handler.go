@@ -1853,6 +1853,9 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 	if err := h.store.upsertHostCodecPixelRates(ctx, hostID, cap.CodecThroughput); err != nil {
 		h.log.Warn("host codec throughput upsert failed", "host_id", hostID, "err", err)
 	}
+	if err := h.store.upsertHostWebTransport(ctx, hostID, webTransportReport(cap)); err != nil {
+		h.log.Warn("host webtransport upsert failed", "host_id", hostID, "err", err)
+	}
 	readinessErr := h.store.upsertHostReadiness(ctx, hostID, cap.Readiness)
 	if readinessErr != nil {
 		h.log.Warn("host readiness upsert failed", "host_id", hostID, "err", readinessErr)
