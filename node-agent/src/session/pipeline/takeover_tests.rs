@@ -3211,6 +3211,28 @@ fn browser_host() {
     });
 }
 
+/// #1028: the WebRTC transport attaches the RTP stage probe to the payloader it builds
+/// after the encoded-frame boundary. Without it `rtp_fps` and `rtp_bitrate_kbps` read 0.
+#[test]
+fn the_webrtc_transport_counts_what_its_payloader_sends() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("rtp-out");
+    // The payloader runs ahead of the tail's gate, so it sends with no peer attached.
+    let start = Instant::now();
+    host.metrics.drain_window(start);
+    std::thread::sleep(Duration::from_secs(2));
+    let window = host.metrics.drain_window(Instant::now());
+    assert!(
+        window.rtp_fps > 10.0 && window.rtp_bitrate_kbps > 0.0,
+        "rtp_fps {} rtp_bitrate_kbps {} over a 30 fps stream",
+        window.rtp_fps,
+        window.rtp_bitrate_kbps
+    );
+}
+
 /// What the host hands `webrtcbin` per transport, and whether it is given back.
 mod aux_senders;
 
