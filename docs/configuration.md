@@ -1437,13 +1437,13 @@ supported install: an operator installs with the seed ("Seed" below), which keep
 ## Seed (`quasar-recovery seed`, RH-06)
 
 The one container an operator or an external manager starts for Quasar on a machine
-(`CONTEXT.md` "Seed", ADR 0007). It makes sure the machine's recovery actor exists and does
+(`GLOSSARY.md` "Seed", ADR 0007). It makes sure the machine's recovery actor exists and does
 nothing else: on a first install it creates the actor from its own image; afterwards it
 re-creates one only if none exists, from the last verified recovery-actor image recorded in
 `seed.json`; otherwise it does nothing. It never stops, replaces or removes anything, never
 writes machine state and never talks to the control plane, so restarting, redeploying,
 updating or removing it never restarts or removes Quasar. It installs any of the three
-machine shapes (`CONTEXT.md` "Combined host"): a **GPU host** (below), a **combined host** or
+machine shapes (`GLOSSARY.md` "Combined host"): a **GPU host** (below), a **combined host** or
 a **control-only host** ("Combined and control-only machines" below). It is the
 `quasar-recovery` image run with the `seed` command, by tag or digest (the seed resolves its own
 tag to its registry digest; an image with none is refused). The images it installs may be tags too:
@@ -1867,7 +1867,7 @@ and that decision belongs to the host, not the control plane.
 ## Recovery actor (`quasar-recovery`, RH-06)
 
 The Quasar-owned container that creates this machine's platform services through the
-Engine API (`CONTEXT.md` "Recovery actor"; `docs/rh06/2026-09-24-architecture.md`). It
+Engine API (`GLOSSARY.md` "Recovery actor"; `docs/rh06/2026-09-24-architecture.md`). It
 installs a GPU host, a combined host or a control-only host (the Seed section above). The
 seed creates it (above); it can still be
 started by hand, as below. Image: `quasar-recovery` (`deploy/Dockerfile.recovery`,
