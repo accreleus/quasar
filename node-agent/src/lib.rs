@@ -21,7 +21,7 @@ pub mod crash_report;
 pub mod cuda_runtime;
 pub mod ddc;
 /// Diagnostic registration (#256): what a host withholds while its startup cleanup is
-/// unresolved, and when it resumes. See `CONTEXT.md` "Diagnostic registration".
+/// unresolved, and when it resumes. See `GLOSSARY.md` "Diagnostic registration".
 pub mod diagnostic;
 mod encoder_compatibility;
 pub mod enrollment;

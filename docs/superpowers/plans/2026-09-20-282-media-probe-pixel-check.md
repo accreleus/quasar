@@ -1,7 +1,7 @@
 # #282 — the media probe verifies pixels, not frame counts
 
 Written before any code, per the ticket's own risk note: *"The tolerance is the whole
-design."* Read with `CONTEXT.md` "Host readiness", `docs/adr/0005-only-evidence-gates-a-launch.md`
+design."* Read with `GLOSSARY.md` "Host readiness", `docs/adr/0005-only-evidence-gates-a-launch.md`
 and the `readiness` paragraph of `protocol/agent-api.md` (frozen; nothing here changes it).
 
 Companion: #281, which removes the known cause of #272. This ticket makes the next member of

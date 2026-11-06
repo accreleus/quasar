@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Write the platform release manifest — the machine-readable half of a stable
 # platform release, published beside the human-readable notes so the two cannot
-# disagree (CONTEXT.md, "Release manifest").
+# disagree (GLOSSARY.md, "Release manifest").
 #
 # Writes format 2 only (platform-release-manifest.v2.json, protocol/control-api.md
 # "Release manifest format 2"), never format 1.

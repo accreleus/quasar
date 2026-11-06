@@ -13,7 +13,7 @@ first ("design it twice") and are kept in full under [`designs/`](designs/):
    engine facade; templates carried by images, interpreted by the actor.
 
 This document compares them, recommends a hybrid, and records the owner's architecture decisions (A1–A3).
-Vocabulary is `CONTEXT.md`'s (Platform service, Service owner, External manager, Seed,
+Vocabulary is `GLOSSARY.md`'s (Platform service, Service owner, External manager, Seed,
 Recovery actor, Replacement, Attempt, Fleet run, Preflight, Admission restriction, Host
 identity, Enrollment) and the architecture terms module, interface, depth, seam, adapter,
 leverage, locality. **[F]** marks a fact about current code; everything else is proposal.

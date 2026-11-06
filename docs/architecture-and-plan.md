@@ -181,7 +181,7 @@ split has existed since Phase 1 — it is packaging, not re-architecture, when r
 ## Platform releases and self-update (2026-09-05)
 
 Quasar updates itself. A **platform release** is a matched control-plane + node-agent
-image set from one commit (`CONTEXT.md` "Platform releases"). The control plane detects
+image set from one commit (`GLOSSARY.md` "Platform releases"). The control plane detects
 releases (stable = GitHub Releases + a release manifest; edge = a branch tag's digest and
 the identity labels on the image), decides what is offered with a pure function ordered
 by **schema version** — the database migration the release embeds — and applies through

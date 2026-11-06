@@ -476,7 +476,7 @@ pub fn homes_mapping(check: ReadinessCheck, view: &RuntimeView) -> ReadinessChec
     warned
 }
 
-/// How far one engine profile is backed by evidence (CONTEXT.md "Engine profile").
+/// How far one engine profile is backed by evidence (GLOSSARY.md "Engine profile").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileStatus {
     Supported,
