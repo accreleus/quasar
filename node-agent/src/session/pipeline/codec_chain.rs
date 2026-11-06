@@ -1,6 +1,6 @@
-//! Codec-dispatched bitstream chain: the encoder-output capsfilter → parser → RTP
-//! payloader triplet. This module owns everything from the encoder src caps up to,
-//! but not including, the RTP caps — those stay in the builders (they differ between
+//! Codec-dispatched bitstream chain: the encoder-output capsfilter → parser pair, which
+//! ends the encode chain at the encoded-frame boundary, plus the WebRTC transport's RTP
+//! payloader for the same codec. The RTP caps stay in the builders (they differ between
 //! the demo and encode paths), taking their encoding-name from
 //! [`Codec::rtp_encoding_name`].
 //!
@@ -17,9 +17,8 @@ use gstreamer::prelude::*;
 
 use crate::session::Codec;
 
-/// The encoder-output capsfilter, bitstream parser, and RTP payloader for a codec.
-/// The caller adds all three to the pipeline and links them between the encoder and
-/// the RTP capsfilter.
+/// The encoder-output capsfilter and bitstream parser for a codec. The caller adds both
+/// to the pipeline after the encoder; the parser's src pad is the encoded-frame boundary.
 pub(super) struct BitstreamChain {
     /// `video/x-{codec}[,profile=…]`. Drives the hardware encoder's output profile
     /// (VA/NVENC/Vulkan expose no `profile` property, so downstream caps select it)
@@ -27,8 +26,6 @@ pub(super) struct BitstreamChain {
     /// bitstream.
     pub encoder_capsfilter: gst::Element,
     pub parser: gst::Element,
-    /// Configured for low-latency WebRTC.
-    pub payloader: gst::Element,
 }
 
 /// Build the [`BitstreamChain`] for `codec`. `profile` is the caps `profile` string
@@ -51,6 +48,14 @@ pub(super) fn build_bitstream_chain(codec: Codec, profile: Option<&str>) -> Resu
         .build()
         .with_context(|| format!("{} not found", codec.parser_element()))?;
 
+    Ok(BitstreamChain {
+        encoder_capsfilter,
+        parser,
+    })
+}
+
+/// The RTP payloader for `codec`, configured for low-latency WebRTC.
+pub(super) fn build_video_payloader(codec: Codec) -> Result<gst::Element> {
     // h264/h265 want `config-interval=-1` (parameter sets in-band with every IDR).
     // rtpav1pay is RtpBasePay2-based and exposes neither that nor aggregate-mode, so
     // every set below is guarded on the property existing.
@@ -79,12 +84,7 @@ pub(super) fn build_bitstream_chain(codec: Codec, profile: Option<&str>) -> Resu
         "zero-latency"
     };
     set_prop_from_str(&payloader, "aggregate-mode", aggregate_mode);
-
-    Ok(BitstreamChain {
-        encoder_capsfilter,
-        parser,
-        payloader,
-    })
+    Ok(payloader)
 }
 
 fn set_prop_u32(el: &gst::Element, name: &str, v: u32) {

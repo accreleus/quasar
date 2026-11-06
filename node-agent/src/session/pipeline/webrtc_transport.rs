@@ -1,7 +1,9 @@
-//! The transport slot of the media path (`compositor -> encode -> [transport slot]`): the
-//! WebRTC transports as units that are built once at launch and replaced under the
-//! running encode chain when a different peer attaches (#535). The encoder element is
-//! kept; a replacement sends it no event, and writes to it only what
+//! The WebRTC implementation of the transport slot (`super::transport`). After the
+//! encoded-frame boundary it owns the RTP payloader, the RTP caps and their header
+//! extensions (TWCC, abs-capture-time), and the `webrtcbin` transports, which are built
+//! once at launch and replaced under the running encode chain when a different peer
+//! attaches (#535). The payloader is the session's and outlives every replacement. The
+//! encoder element is kept; a replacement sends it no event, and writes to it only what
 //! `abr_glue::reset_to_launch` logs.
 //!
 //! `webrtcbin` cannot serve a second peer on a transport a first one negotiated: it
@@ -18,14 +20,23 @@ use gstreamer::prelude::*;
 
 use super::abr_glue::{self, EncodeResolutionLever};
 use super::audio_branch::add_audio_chain;
+use super::codec_chain::build_video_payloader;
 use super::mic_branch::add_mic_branch;
-use super::rtp_ext::{attach_abs_capture_time_egress_probe, AbsCaptureTimeExtension};
+use super::probes::{attach_rtp_marker_trace, attach_rtp_out_probe, attach_rtp_ts_trace};
+use super::rtp_ext::{
+    attach_abs_capture_time_egress_probe, attach_abs_capture_time_probe,
+    attach_abs_capture_time_verification_probe, AbsCaptureTimeExtension,
+};
+use super::transport::EncodedSession;
 use super::webrtc::{
     connect_data_channel_open, connect_ice_candidate, connect_negotiation_needed,
     connect_state_logging, enable_video_fec, enable_video_rtx, make_webrtcbin,
     set_audio_receive_latency, spawn_fec_controller, warn_on_fingerprint_mismatch,
 };
-use super::{audio_disabled, audio_health, input_data_channel_init, resize, OutTx, TraceTx};
+use super::{
+    audio_disabled, audio_health, input_data_channel_init, resize, OutTx, TraceTx,
+    ABS_CAPTURE_TIME_EXT_ID, ABS_CAPTURE_TIME_URI, RTP_TWCC_URI, TWCC_EXT_ID,
+};
 use crate::session::input::{InputSink, InputState};
 use crate::session::metrics::SessionMetrics;
 use crate::session::signaling::PcId;
@@ -46,24 +57,24 @@ pub struct VideoTransport {
     gate: Arc<Mutex<Option<gst::PadProbeId>>>,
 }
 
-/// What it takes to put a transport on the encode chain's tail, kept for the session so
-/// it can be done again.
-pub struct TransportSlot {
-    pub(super) cfg: SessionConfig,
-    pub(super) pipeline: gst::Pipeline,
-    /// The RTP capsfilter's src pad: the last pad of the encode chain.
-    pub(super) tail: gst::Pad,
-    pub(super) encoder: gst::Element,
-    pub(super) out_tx: OutTx,
-    pub(super) devices: Option<Arc<VirtualDevices>>,
-    pub(super) input_state: Arc<InputState>,
-    pub(super) metrics: Arc<SessionMetrics>,
-    pub(super) trace_tx: TraceTx,
-    pub(super) session_id: String,
-    pub(super) capture_times: AbsCaptureTimeExtension,
-    pub(super) lever: Arc<EncodeResolutionLever>,
+/// What it takes to put a transport on the RTP tail, kept for the session so it can be
+/// done again.
+pub struct WebRtcSlot {
+    cfg: SessionConfig,
+    pipeline: gst::Pipeline,
+    /// The RTP capsfilter's src pad, where each `webrtcbin` transport is linked.
+    tail: gst::Pad,
+    encoder: gst::Element,
+    out_tx: OutTx,
+    devices: Option<Arc<VirtualDevices>>,
+    input_state: Arc<InputState>,
+    metrics: Arc<SessionMetrics>,
+    trace_tx: TraceTx,
+    session_id: String,
+    capture_times: AbsCaptureTimeExtension,
+    lever: Arc<EncodeResolutionLever>,
     /// `QUASAR_DIAG_NO_OBS` unset.
-    pub(super) observe: bool,
+    observe: bool,
 }
 
 /// Give a `webrtcbin` sink pad the MediaStream id this PC always uses. Left unset,
@@ -205,13 +216,116 @@ impl VideoTransport {
     }
 }
 
-impl TransportSlot {
+impl WebRtcSlot {
+    /// Payload the session's encoded video: parser → payloader → RTP caps, in the encode
+    /// pipeline, with the RTP probes. Transports go on the RTP caps' src pad.
+    pub(crate) fn new(session: EncodedSession) -> Result<Self> {
+        let EncodedSession {
+            cfg,
+            pipeline,
+            video,
+            encoder,
+            lever,
+            metrics,
+            out_tx,
+            devices,
+            input_state,
+            trace_tx,
+            session_id,
+            observe,
+        } = session;
+        let codec = cfg.stream.codec;
+        let pay = build_video_payloader(codec)?;
+        // TWCC must be declared HERE, in the capsfilter, never via `add-extension` on the
+        // payloader. webrtcbin builds its offer from these caps, the payloader's
+        // auto-header-extension instantiates the matching `rtphdrexttwcc` writer from the
+        // negotiated caps, and webrtcbin's rtpsession learns the id the same way, so the
+        // extmap id in the SDP and on the wire cannot diverge. Bolting the extension on
+        // out-of-band (webrtcsink's approach) breaks here because this graph pins
+        // fully-fixed caps between payloader and webrtcbin: the extension writes header
+        // bytes the offer never declared and Chrome drops every packet.
+        // `rtcp-fb-transport-cc` puts `a=rtcp-fb:96 transport-cc` in the offer; without it
+        // the browser never sends the TWCC feedback rtpgccbwe consumes.
+        //
+        // abs-capture-time is always on, ABR or not: declaring it in the caps makes
+        // webrtcbin emit `a=extmap:6 <URI>` (same mechanism as TWCC extmap-5), and the
+        // extension registered on `pay` below records the per-AU NTP time.
+        let mut rtp_caps_builder = gst::Caps::builder("application/x-rtp")
+            .field("media", "video")
+            .field("encoding-name", codec.rtp_encoding_name())
+            .field("payload", 96_i32)
+            .field("clock-rate", 90_000_i32)
+            .field(
+                format!("extmap-{ABS_CAPTURE_TIME_EXT_ID}"),
+                ABS_CAPTURE_TIME_URI,
+            );
+        if cfg.abr_config().is_some() {
+            rtp_caps_builder = rtp_caps_builder
+                .field(format!("extmap-{TWCC_EXT_ID}"), RTP_TWCC_URI)
+                .field("rtcp-fb-transport-cc", true);
+        }
+        let rtp_capsfilter = gst::ElementFactory::make("capsfilter")
+            .property("caps", rtp_caps_builder.build())
+            .build()
+            .context("capsfilter not found")?;
+        pipeline.add_many([&pay, &rtp_capsfilter])?;
+        let pay_sink = pay
+            .static_pad("sink")
+            .context("payloader has no sink pad")?;
+        video
+            .link(&pay_sink)
+            .context("failed to link the encoded video into the payloader")?;
+        pay.link(&rtp_capsfilter)
+            .context("failed to link the payloader into the RTP caps")?;
+
+        if observe {
+            attach_rtp_out_probe(&pay, metrics.clone());
+        }
+        // Registering the extension records each AU's capture instant; the transport
+        // stamps it at its egress seam (`attach_video`).
+        let capture_times = attach_abs_capture_time_probe(&pay);
+        if observe {
+            attach_abs_capture_time_verification_probe(&rtp_capsfilter);
+        }
+        // Diagnostic: per-AU RTP marker-layout trace on the live wire. The synthetic
+        // videotestsrc path cannot reproduce rtph264pay's marker logic, so a vulkan-vs-VA
+        // marker-bit difference is only decidable on real content. Knob:
+        // QUASAR_TRACE_RTP_MARKER.
+        if env_flag("QUASAR_TRACE_RTP_MARKER") {
+            attach_rtp_marker_trace(&pay);
+        }
+        // Diagnostic: per-AU RTP timestamp-continuity + seq-contiguity trace, the two
+        // surviving libwebrtc PacketBuffer frame-completion keys. Flags dup-TS-across-AU
+        // (the every-other-frame merge suspect), non-1500 TS deltas, and seq gaps. Knob:
+        // QUASAR_TRACE_RTP_TS.
+        if env_flag("QUASAR_TRACE_RTP_TS") {
+            attach_rtp_ts_trace(&pay);
+        }
+        Ok(Self {
+            cfg,
+            pipeline,
+            tail: rtp_capsfilter
+                .static_pad("src")
+                .context("rtp capsfilter has no src pad")?,
+            encoder,
+            out_tx,
+            devices,
+            input_state,
+            metrics,
+            trace_tx,
+            session_id,
+            capture_times,
+            lever,
+            observe,
+        })
+    }
+
     /// Build a video transport on the tail. `replacement` is false for the session's
     /// first one, built while the pipeline is still NULL.
     ///
     /// `gate` is the probe already holding RTP back at the tail during a replacement.
     /// Either way the transport keeps one until its peer connects.
-    pub(super) fn attach_video(
+    pub(crate) fn attach_video(
         &self,
         replacement: bool,
         gate: Option<gst::PadProbeId>,
@@ -496,4 +610,11 @@ impl TransportSlot {
             .context("audio pipeline failed to reach READY")?;
         Ok((Some(audio_webrtc), Some(audio_pipe)))
     }
+}
+
+/// A diagnostic knob that is on unless unset, empty or `0`.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
 }

@@ -153,7 +153,7 @@ impl Host {
             Arc::new(AtomicU64::new(0)),
         );
         let metrics = Arc::new(SessionMetrics::new("smooth", cfg.stream.fps as u32));
-        let enc = build_encode_pipeline(
+        let enc = build_encode_pipeline::<SessionTransports>(
             &cfg,
             sig_tx.clone(),
             None,
@@ -183,14 +183,10 @@ impl Host {
             .expect("encode PLAYING");
         let EncodePipeline {
             pipeline,
-            video,
-            transport,
-            audio_webrtc,
-            audio_pipeline,
+            transport: transports,
             interpipesrc,
             resolution_lever: lever,
         } = enc;
-        let transports = SessionTransports::new(transport, video, audio_webrtc, audio_pipeline);
         transports.audio_pipeline.play();
         let bus = pipeline.bus().expect("encode bus");
         let encoder = pipeline
@@ -1930,7 +1926,7 @@ fn a_takeover_does_not_hold_the_runner_on_an_audio_pipeline_that_will_not_stop()
         "the old audio pipeline was not held through the stop"
     );
     let builds = || {
-        let all = super::transport::AUDIO_BUILDS.lock().unwrap();
+        let all = super::webrtc_transport::AUDIO_BUILDS.lock().unwrap();
         all.iter().filter(|id| *id == "takeover-audio-held").count()
     };
     let built_before_release = builds();
@@ -2175,14 +2171,14 @@ struct AttachPause;
 
 impl AttachPause {
     fn of(ms: u64) -> AttachPause {
-        super::transport::ATTACH_PAUSE_MS.store(ms, Ordering::Relaxed);
+        super::webrtc_transport::ATTACH_PAUSE_MS.store(ms, Ordering::Relaxed);
         AttachPause
     }
 }
 
 impl Drop for AttachPause {
     fn drop(&mut self) {
-        super::transport::ATTACH_PAUSE_MS.store(0, Ordering::Relaxed);
+        super::webrtc_transport::ATTACH_PAUSE_MS.store(0, Ordering::Relaxed);
     }
 }
 
