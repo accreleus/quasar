@@ -24,9 +24,13 @@ normative contract text. Tool structure is ADR 0012.
 - **Two ways in.** The **recommended tool list** ships with each Quasar release and carries the
   **SHA-512** per release, so the recommended path fetches no checksum at all. For an **arbitrary
   tag** an admin types, the **control plane** fetches the release's `<asset>.sha512sum` once
-  (size-capped), checks that the file name inside it equals the asset, and records the SHA-512 in
+  (size-capped, under the same HTTPS, redirect-allowlist and hop rules as the tarball), checks that
+  the file name inside it equals the asset, and records the SHA-512 in
   the fleet's desired state. Every agent then verifies its tarball against that recorded value, so
-  every host installs identical bytes and no host fetches or trusts a checksum itself.
+  every host installs identical bytes and no host fetches or trusts a checksum itself. A tarball
+  that does not match the pinned SHA-512 fails that host's install: no retry from another source,
+  no re-fetch of the checksum, and the failure shows in Fleet ▸ Jobs with the expected and actual
+  digests.
 - **The digest is SHA-512.** GE-Proton publishes `<asset>.sha512sum` in GNU format, so the pin is
   SHA-512, not SHA-256 as the spec first said (C00). Asset naming changed with GE-Proton 11: take
   `<tag>-x86_64.tar.gz`, falling back to `<tag>.tar.gz` for older tags.
