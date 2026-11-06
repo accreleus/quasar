@@ -27,6 +27,7 @@ var browserEventTypes = map[string]bool{
 	"client.freeze_detected":    true,
 	"client.visibility_changed": true,
 	"webrtc.state_changed":      true,
+	"transport.fallback":        true, // amendment 54: pinned, not yet served
 	// Bench mode (`?bench=1`) per-second marker-decode window. Additive only;
 	// payload stays free-form and never becomes a persisted stats key (schema.md).
 	"bench.window": true,
