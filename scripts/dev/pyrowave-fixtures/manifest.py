@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Write manifest.json for the PyroWave golden fixtures (#1053). Stdlib only; runs in the image.
 
-usage: manifest.py DIR PYROWAVE_REF GRANITE_REF   (DIR holds what pyrowave_fixtures wrote)
+usage: manifest.py DIR PYROWAVE_REF GRANITE_REF IMAGE_TAG IMAGE_ID   (DIR holds what pyrowave_fixtures wrote; GCC_VERSION in the environment)
 
 The manifest holds no timestamp, so regenerating the same bytes gives the same manifest.
 """
 import hashlib, json, math, os, struct, sys
 
-d, pyrowave_ref, granite_ref = sys.argv[1:4]
+d, pyrowave_ref, granite_ref, image_tag, image_id = sys.argv[1:6]
 HDR = 28  # PWV1Header (24) + the u32 size of the one frame
 HI_ROOM = 1111  # packet room of a 1200-byte datagram after the 25+12-byte headers (codec-pyrowave.md §Packing)
 
@@ -86,6 +86,12 @@ for n in names:
         },
     })
 
+# The encoder bar: decode an encoder's own output and compare it with the SOURCE. Floor = this
+# fixture's recorded PSNR minus 1 dB, with the recorded value capped at 60 dB (8-bit rounding makes
+# more than that meaningless, and a near-lossless stream would otherwise demand an identical decode).
+for f in fixtures:
+    f["encoder_bar"] = {"min_psnr_db": {p: round(min(v, 60.0) - 1.0, 2) for p, v in f["psnr_ref_vs_src_db"].items()}}
+
 # Equivalent rate at 60 fps for orientation only (the budget is per frame).
 for f in fixtures:
     f["budget_mbit_s_at_60fps"] = round(f["budget_bytes"] * 8 * 60 / 1e6, 1)
@@ -103,12 +109,18 @@ manifest = {
     },
     "picture_format": {
         "layout": "I420: Y (w*h bytes), Cb ((w/2)*(h/2)), Cr ((w/2)*(h/2)), 8-bit, planar, no header, no padding",
-        "colour": "YCbCr authored as BT.709 limited range (Y 16-235, C 16-240); the codec itself is range-agnostic",
+        "colour": "YCbCr authored as BT.709 limited range (Y 16-235, C 16-240); every SOF says sRGB primaries, sRGB transfer, BT.709, LIMITED range, centre siting (the generator sets the range bit the library leaves at FULL); the codec itself is range-agnostic",
     },
+    "generator": {"image": image_tag, "image_id": image_id, "gcc": os.environ["GCC_VERSION"], "command": "scripts/dev/pyrowave-fixtures/gen.sh"},
+    "decoder_bar": {
+        "min_psnr_db": 45, "max_abs_err": 1,
+        "applies_to": "decoding the SAME .pwv1 and comparing with its .ref.yuv (every plane); the spike's bar for the WGSL decoder",
+    },
+    "encoder_bar": "per fixture, fixtures[].encoder_bar.min_psnr_db: decode an encoder's OWN output for the .src.yuv at the same budget and compare with the SOURCE; never compare its bytes with the .pwv1",
     "reference_decode": "pyrowave_decoder_decode_cpu_buffer_synchronous, rounded to 8 bits by the library. The decode is NOT bit-exact across devices (bitstream.md): compare by PSNR/max error, never by hash, except to detect a changed fixture.",
     "psnr_note": "PSNR of the reference decode against the source picture, per plane, 8-bit, 99.0 = identical.",
     "encoder_device": dev,
-    "encoder_note": "The encoder runs in Vulkan compute and needs a real GPU (subgroup-size control of wave16/32/64; lavapipe offers only 8). The files here are pinned as generated on this device; see README.md for whether other GPUs reproduce them.",
+    "encoder_note": "The encoder runs in Vulkan compute and needs a real GPU (subgroup-size control of wave16/32/64; lavapipe offers only 8). The files are canonical (alignment bytes zeroed, SOF range set), not raw encoder output, and are pinned as generated on this device; another GPU encodes different bytes, so verify by the decode bars, not by hash. See README.md.",
     "pictures": pictures,
     "fixtures": fixtures,
 }

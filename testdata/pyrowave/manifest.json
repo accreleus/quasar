@@ -13,8 +13,20 @@
   },
   "picture_format": {
     "layout": "I420: Y (w*h bytes), Cb ((w/2)*(h/2)), Cr ((w/2)*(h/2)), 8-bit, planar, no header, no padding",
-    "colour": "YCbCr authored as BT.709 limited range (Y 16-235, C 16-240); the codec itself is range-agnostic"
+    "colour": "YCbCr authored as BT.709 limited range (Y 16-235, C 16-240); every SOF says sRGB primaries, sRGB transfer, BT.709, LIMITED range, centre siting (the generator sets the range bit the library leaves at FULL); the codec itself is range-agnostic"
   },
+  "generator": {
+    "image": "quasar-dev:20261106-1532",
+    "image_id": "sha256:edee72920be933b7cfa2e5c8a8d7086c0169f087461a2580bea6ea1018e92ec3",
+    "gcc": "gcc (GCC) 15.3.1 20260722 (Red Hat 15.3.1-1)",
+    "command": "scripts/dev/pyrowave-fixtures/gen.sh"
+  },
+  "decoder_bar": {
+    "min_psnr_db": 45,
+    "max_abs_err": 1,
+    "applies_to": "decoding the SAME .pwv1 and comparing with its .ref.yuv (every plane); the spike's bar for the WGSL decoder"
+  },
+  "encoder_bar": "per fixture, fixtures[].encoder_bar.min_psnr_db: decode an encoder's OWN output for the .src.yuv at the same budget and compare with the SOURCE; never compare its bytes with the .pwv1",
   "reference_decode": "pyrowave_decoder_decode_cpu_buffer_synchronous, rounded to 8 bits by the library. The decode is NOT bit-exact across devices (bitstream.md): compare by PSNR/max error, never by hash, except to detect a changed fixture.",
   "psnr_note": "PSNR of the reference decode against the source picture, per plane, 8-bit, 99.0 = identical.",
   "encoder_device": {
@@ -25,7 +37,7 @@
     "driver_name": "NVIDIA",
     "driver_info": "615.78.08"
   },
-  "encoder_note": "The encoder runs in Vulkan compute and needs a real GPU (subgroup-size control of wave16/32/64; lavapipe offers only 8). The files here are pinned as generated on this device; see README.md for whether other GPUs reproduce them.",
+  "encoder_note": "The encoder runs in Vulkan compute and needs a real GPU (subgroup-size control of wave16/32/64; lavapipe offers only 8). The files are canonical (alignment bytes zeroed, SOF range set), not raw encoder output, and are pinned as generated on this device; another GPU encodes different bytes, so verify by the decode bars, not by hash. See README.md.",
   "pictures": {
     "detail_200x114": {
       "picture": "detail",
@@ -84,7 +96,7 @@
         "color_primaries": 0,
         "transfer_function": 0,
         "ycbcr_transform": 0,
-        "ycbcr_range": 0,
+        "ycbcr_range": 1,
         "chroma_siting": 0
       },
       "blocks": 68,
@@ -93,7 +105,7 @@
       "pwv1": {
         "file": "detail_200x114_hi.pwv1",
         "bytes": 18224,
-        "sha256": "47950b795a5f65c23e4e84d60b7b5dbc23fc12d9c5c92f343c806015dc11efc8"
+        "sha256": "037a4a45733ae42280a4b23359ac99b6314b6b4a9a06499d0cdbf4ed6084df8b"
       },
       "ref": {
         "file": "detail_200x114_hi.ref.yuv",
@@ -105,6 +117,13 @@
         "y": 42.31,
         "cb": 50.17,
         "cr": 50.21
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 41.31,
+          "cb": 49.17,
+          "cr": 49.21
+        }
       },
       "budget_mbit_s_at_60fps": 8.8
     },
@@ -123,7 +142,7 @@
         "color_primaries": 0,
         "transfer_function": 0,
         "ycbcr_transform": 0,
-        "ycbcr_range": 0,
+        "ycbcr_range": 1,
         "chroma_siting": 0
       },
       "blocks": 52,
@@ -132,7 +151,7 @@
       "pwv1": {
         "file": "detail_200x114_lo.pwv1",
         "bytes": 4556,
-        "sha256": "1467b788dbc9ceb559dc59a30519b3c045c2310e4871b0eff44b035d5c7d90da"
+        "sha256": "cdc2cf843c1e6eecc0ace1f45c7031abbcfbf67b843620778338e193bd8eba84"
       },
       "ref": {
         "file": "detail_200x114_lo.ref.yuv",
@@ -144,6 +163,13 @@
         "y": 23.43,
         "cb": 28.28,
         "cr": 28.21
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 22.43,
+          "cb": 27.28,
+          "cr": 27.21
+        }
       },
       "budget_mbit_s_at_60fps": 2.2
     },
@@ -162,7 +188,7 @@
         "color_primaries": 0,
         "transfer_function": 0,
         "ycbcr_transform": 0,
-        "ycbcr_range": 0,
+        "ycbcr_range": 1,
         "chroma_siting": 0
       },
       "blocks": 70,
@@ -171,7 +197,7 @@
       "pwv1": {
         "file": "detail_200x114_xhi.pwv1",
         "bytes": 30912,
-        "sha256": "df3510d84f9e09a9bb5c4223f2ffb41a3712909b94a8d997309066d5106a1df4"
+        "sha256": "4d5db907767c469f9f461a1803aea2e3173e732666653fff43b8e35e3a62c1a3"
       },
       "ref": {
         "file": "detail_200x114_xhi.ref.yuv",
@@ -183,6 +209,13 @@
         "y": 62.87,
         "cb": 77.24,
         "cr": 77.91
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 59.0,
+          "cb": 59.0,
+          "cr": 59.0
+        }
       },
       "budget_mbit_s_at_60fps": 16.4
     },
@@ -201,7 +234,7 @@
         "color_primaries": 0,
         "transfer_function": 0,
         "ycbcr_transform": 0,
-        "ycbcr_range": 0,
+        "ycbcr_range": 1,
         "chroma_siting": 0
       },
       "blocks": 137,
@@ -210,7 +243,7 @@
       "pwv1": {
         "file": "detail_320x192_hi.pwv1",
         "bytes": 49160,
-        "sha256": "5a3e3c4909b25ecf2cb86b38883272450eb72d020443d49d0614521fa740a8be"
+        "sha256": "8c452b9d677abd5ca180aab64280c2ec9fce135ac52a8f1a2892d0b783f21ece"
       },
       "ref": {
         "file": "detail_320x192_hi.ref.yuv",
@@ -222,6 +255,13 @@
         "y": 48.95,
         "cb": 59.11,
         "cr": 59.65
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 47.95,
+          "cb": 58.11,
+          "cr": 58.65
+        }
       },
       "budget_mbit_s_at_60fps": 23.6
     },
@@ -240,7 +280,7 @@
         "color_primaries": 0,
         "transfer_function": 0,
         "ycbcr_transform": 0,
-        "ycbcr_range": 0,
+        "ycbcr_range": 1,
         "chroma_siting": 0
       },
       "blocks": 97,
@@ -249,7 +289,7 @@
       "pwv1": {
         "file": "detail_320x192_lo.pwv1",
         "bytes": 12280,
-        "sha256": "034ea90d1f7a23afc4ea89f2b33761d3c49b8d192b00b9ad2929759efa2545a6"
+        "sha256": "33b995a81a58b3741e374ea72f14dcb6f84bc7fff7122e351065c39db0ca9ee5"
       },
       "ref": {
         "file": "detail_320x192_lo.ref.yuv",
@@ -261,6 +301,13 @@
         "y": 26.45,
         "cb": 29.24,
         "cr": 31.41
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 25.45,
+          "cb": 28.24,
+          "cr": 30.41
+        }
       },
       "budget_mbit_s_at_60fps": 5.9
     },
@@ -279,7 +326,7 @@
         "color_primaries": 0,
         "transfer_function": 0,
         "ycbcr_transform": 0,
-        "ycbcr_range": 0,
+        "ycbcr_range": 1,
         "chroma_siting": 0
       },
       "blocks": 138,
@@ -288,7 +335,7 @@
       "pwv1": {
         "file": "detail_320x192_xhi.pwv1",
         "bytes": 66016,
-        "sha256": "0e3fa4fbd189c736bc5e020ca5fabf42574b595f3101e5a29f9269b5dbc69cc8"
+        "sha256": "3ca434daf2c213b0ecaae69271cc762a213890d7c7e19a3a10efea0aba1024ea"
       },
       "ref": {
         "file": "detail_320x192_xhi.ref.yuv",
@@ -300,6 +347,13 @@
         "y": 83.46,
         "cb": 79.2,
         "cr": 82.21
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 59.0,
+          "cb": 59.0,
+          "cr": 59.0
+        }
       },
       "budget_mbit_s_at_60fps": 44.2
     },
@@ -318,7 +372,7 @@
         "color_primaries": 0,
         "transfer_function": 0,
         "ycbcr_transform": 0,
-        "ycbcr_range": 0,
+        "ycbcr_range": 1,
         "chroma_siting": 0
       },
       "blocks": 57,
@@ -327,7 +381,7 @@
       "pwv1": {
         "file": "flat_200x114_hi.pwv1",
         "bytes": 7828,
-        "sha256": "12283829231ba07e78f2e4c694e081b3c025bd3d362daabe818eb69d8b3fe3a2"
+        "sha256": "945ab7b0894e70262e0e6113ca0ce94493ef03f7a436f4df95d1ce9fd2e55edc"
       },
       "ref": {
         "file": "flat_200x114_hi.ref.yuv",
@@ -339,6 +393,13 @@
         "y": 88.7,
         "cb": 99.0,
         "cr": 99.0
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 59.0,
+          "cb": 59.0,
+          "cr": 59.0
+        }
       },
       "budget_mbit_s_at_60fps": 8.8
     },
@@ -357,7 +418,7 @@
         "color_primaries": 0,
         "transfer_function": 0,
         "ycbcr_transform": 0,
-        "ycbcr_range": 0,
+        "ycbcr_range": 1,
         "chroma_siting": 0
       },
       "blocks": 44,
@@ -366,7 +427,7 @@
       "pwv1": {
         "file": "flat_200x114_lo.pwv1",
         "bytes": 2292,
-        "sha256": "0a21467bc04b50871635f3b26ce5c08810a9d5685ccbbd05f8c9b694e4e0887d"
+        "sha256": "15ecb6779532dc34dbdac5897b924e849a002a6ddd90d1dc956189741254da08"
       },
       "ref": {
         "file": "flat_200x114_lo.ref.yuv",
@@ -378,6 +439,13 @@
         "y": 45.81,
         "cb": 49.01,
         "cr": 47.27
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 44.81,
+          "cb": 48.01,
+          "cr": 46.27
+        }
       },
       "budget_mbit_s_at_60fps": 1.1
     },
@@ -396,7 +464,7 @@
         "color_primaries": 0,
         "transfer_function": 0,
         "ycbcr_transform": 0,
-        "ycbcr_range": 0,
+        "ycbcr_range": 1,
         "chroma_siting": 0
       },
       "blocks": 93,
@@ -405,7 +473,7 @@
       "pwv1": {
         "file": "flat_320x192_hi.pwv1",
         "bytes": 11812,
-        "sha256": "401a1fbf2932340e2a5b230a47494e3f5446e9fa5b1db528cd038620b82374bc"
+        "sha256": "4ec8804b13d70c73eec813621163776bd0de22dc92e857775391db6bf25ac944"
       },
       "ref": {
         "file": "flat_320x192_hi.ref.yuv",
@@ -417,6 +485,13 @@
         "y": 89.03,
         "cb": 99.0,
         "cr": 89.99
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 59.0,
+          "cb": 59.0,
+          "cr": 59.0
+        }
       },
       "budget_mbit_s_at_60fps": 23.6
     },
@@ -435,7 +510,7 @@
         "color_primaries": 0,
         "transfer_function": 0,
         "ycbcr_transform": 0,
-        "ycbcr_range": 0,
+        "ycbcr_range": 1,
         "chroma_siting": 0
       },
       "blocks": 73,
@@ -444,7 +519,7 @@
       "pwv1": {
         "file": "flat_320x192_lo.pwv1",
         "bytes": 6156,
-        "sha256": "9b58970d7b87fd7874a274cac80da5b8113b0ff3b00a2bb3dda755895cf64ade"
+        "sha256": "3077b97d58a085ed78a8ea7bb21a3f4daa6cd59b3526e99f5e32fcbf2a25e0ac"
       },
       "ref": {
         "file": "flat_320x192_lo.ref.yuv",
@@ -456,6 +531,13 @@
         "y": 56.67,
         "cb": 59.69,
         "cr": 59.9
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 55.67,
+          "cb": 58.69,
+          "cr": 58.9
+        }
       },
       "budget_mbit_s_at_60fps": 2.9
     }

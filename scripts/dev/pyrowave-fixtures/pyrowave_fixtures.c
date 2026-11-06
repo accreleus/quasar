@@ -189,6 +189,9 @@ static void encode_decode(const char *dir, pyrowave_device dev, const Pic *pic, 
 	if (out_packets != 1 || pk.offset != 0 || pk.size < 16 || pk.size > cap) { fprintf(stderr, "%s %s: bad packetization\n", pname, rate); exit(1); }
 	uint8_t *frame = bits + pk.offset;
 	canonicalize(frame, pk.size, pname);
+	// The CPU-input path leaves the SOF range at FULL, but the pictures are BT.709 limited range
+	// (Quasar's configuration, codec-pyrowave.md). The range bit is usability information only.
+	{ uint32_t s1; memcpy(&s1, frame + 4, 4); s1 |= 1u << 30; memcpy(frame + 4, &s1, 4); }
 
 	// PWV1Header (bitstream.md "Raw disk format"): the frame's own SOF with the reserved
 	// fields (sequence, extended, total_blocks, code) cleared, then rate 60/1, 8-bit, version 1.

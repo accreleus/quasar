@@ -14,25 +14,31 @@
 #                                                                  or "--device /dev/dri/renderD128"
 #   NVIDIA_VOLUME  docker volume the node agent provisioned the NVIDIA userspace into (an NVIDIA host
 #             with CDI: its ICD and libraries are not in the image). Adds what deploy/validate-image.sh sets.
-#   IMAGE     the toolchain image       (default: quasar-dev:latest; build it with `dev.sh image`
-#                                        on a tree whose Dockerfile.vulkan carries the pins)
+#   IMAGE     the toolchain image       (default: the tag the committed fixtures were made with;
+#                                        any image whose pins match Dockerfile.vulkan will do)
 #
 # --check regenerates into a temp directory and fails if any file differs from the committed ones
-# (the manifest is compared without its encoder_device record, so a GPU that reproduces every byte
+# (the manifest is compared without its encoder_device and generator records, so a GPU that reproduces every byte
 # passes). Without it the files in testdata/pyrowave/ are replaced.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../../.." && pwd)"
 out="${OUT:-$repo/testdata/pyrowave}"
 DOCKER="${DOCKER:-docker}"
-IMAGE="${IMAGE:-quasar-dev:latest}"
+IMAGE="${IMAGE:-quasar-dev:20261106-1532}"  # the tag the committed fixtures came from; the pin labels below guard a rebuilt one
 check=0; [ "${1:-}" = "--check" ] && check=1
 
 pin() { sed -n "s/^ARG $1=\\([0-9a-f]\\{40\\}\\)\$/\\1/p" "$repo/deploy/Dockerfile.vulkan"; }
 pyrowave_ref="$(pin PYROWAVE_REF)"; granite_ref="$(pin GRANITE_REF)"
 [ -n "$pyrowave_ref" ] && [ -n "$granite_ref" ] || { echo "no PYROWAVE_REF/GRANITE_REF in deploy/Dockerfile.vulkan" >&2; exit 1; }
-have="$($DOCKER image inspect "$IMAGE" --format '{{index .Config.Labels "org.quasar.pins.pyrowave"}}' 2>/dev/null || true)"
-[ "$have" = "$pyrowave_ref" ] || { echo "$IMAGE carries PyroWave '${have:-none}', Dockerfile.vulkan pins $pyrowave_ref: rebuild the image" >&2; exit 1; }
+label() { $DOCKER image inspect "$IMAGE" --format "{{index .Config.Labels \"org.quasar.pins.$1\"}}" 2>/dev/null || true; }
+for p in pyrowave:"$pyrowave_ref" granite:"$granite_ref"; do
+  have="$(label "${p%%:*}")"
+  # The toolchain image has no granite label; its build already stops on a Granite other than GRANITE_REF.
+  [ -z "$have" ] && [ "${p%%:*}" = granite ] && { echo "note: $IMAGE has no org.quasar.pins.granite label; the pyrowave pin fixes it" >&2; continue; }
+  [ "$have" = "${p#*:}" ] || { echo "$IMAGE carries ${p%%:*} '${have:-none}', Dockerfile.vulkan pins ${p#*:}: use another image or rebuild" >&2; exit 1; }
+done
+image_id="$($DOCKER image inspect "$IMAGE" --format '{{.Id}}')"
 
 gpu_args=(${GPU_ARGS:-})
 if [ -n "${NVIDIA_VOLUME:-}" ]; then
@@ -48,16 +54,17 @@ tar -C "$here" -cf - pyrowave_fixtures.c manifest.py | $DOCKER run --rm -i "${gp
   set -eu
   mkdir /tmp/src /tmp/out; tar -C /tmp/src -xf -
   export PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig LD_LIBRARY_PATH=/opt/gst/lib64:${LD_LIBRARY_PATH:-}
+  export GCC_VERSION="$(gcc --version | head -1)"
   gcc -O2 -Wall -o /tmp/pwfix /tmp/src/pyrowave_fixtures.c $(pkg-config --cflags --libs pyrowave-shared) -lvulkan >&2
   /tmp/pwfix /tmp/out >&2
-  python3 -I /tmp/src/manifest.py /tmp/out '"$pyrowave_ref $granite_ref"' >&2
+  python3 -I /tmp/src/manifest.py /tmp/out '"$pyrowave_ref $granite_ref $IMAGE $image_id"' >&2
   rm /tmp/out/device.json /tmp/out/budgets.tsv
   tar -C /tmp/out -cf - .' | tar --no-same-owner -C "$tmp" -xf -
 [ -s "$tmp/manifest.json" ] || { echo "the generator produced nothing" >&2; exit 1; }
 
 if [ "$check" = 1 ]; then
   diff -r --exclude=manifest.json --exclude=README.md "$out" "$tmp"
-  diff <(jq 'del(.encoder_device)' "$out/manifest.json") <(jq 'del(.encoder_device)' "$tmp/manifest.json")
+  diff <(jq 'del(.encoder_device, .generator)' "$out/manifest.json") <(jq 'del(.encoder_device, .generator)' "$tmp/manifest.json")
   echo "pyrowave fixtures: reproduced byte for byte ($(find "$tmp" -type f | wc -l) files)"
 else
   mkdir -p "$out"; find "$out" -type f ! -name README.md -delete; cp "$tmp"/* "$out"/

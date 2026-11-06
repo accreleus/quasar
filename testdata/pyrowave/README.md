@@ -53,23 +53,32 @@ at a 1200-byte datagram.
 
 ## Reproducibility
 
-The encoder leaves the alignment bytes at the end of a block (and the unused high bits of the
-last sign byte) uninitialised, so two raw runs differ in a few of those bytes and nowhere else;
-the decoder ignores them. The generator zeroes them (`canonicalize()`, which also asserts that
-every block's computed size rounds up to its `payload_words`). With that, repeated runs on the
-generating GPU are byte-identical, bitstreams and reference decodes (three runs on the RTX 5090).
-**Another GPU does not reproduce them**: the same generator on the AMD iGPU (RADV) gave different
-bitstreams for every fixture (the bitstream is decodable, not specified byte for byte, and the
-encoder's float maths differs), with frame sizes within 0.4%, and reference decodes that agree
-with the NVIDIA ones at 54 to 93 dB (max error up to 22 code values on `detail_320x192_lo`, 1 to 11
-on most). So the files are pinned as generated on the device recorded in `manifest.json`, and
-`gen.sh --check` passes only on that GPU class.
+**These files are canonical, not raw encoder output.** The encoder leaves the alignment bytes at
+the end of a block (and the unused high bits of the last sign byte) uninitialised, so two raw runs
+differ in a few of those bytes and nowhere else; the decoder ignores them. The generator zeroes
+them (`canonicalize()`, which also asserts that every block's computed size rounds up to its
+`payload_words`) and sets the SOF's range bit to LIMITED (the library's CPU path leaves FULL;
+the pictures are BT.709 limited range). A test re-derives both properties from the bytes.
 
-## Using them
+**`gen.sh --check` reproduces the files byte for byte only on the generating GPU class** (the
+device is named in `manifest.json`): three runs there are identical, bitstreams and decodes.
+Another GPU encodes different bytes (the AMD iGPU gave different bitstreams for every fixture,
+frame sizes within 0.4%), because the bitstream is decodable, not specified byte for byte. A
+reviewer on other hardware verifies by the decode bars below, not by hash. The
+`control-plane/internal/pyrowavefixtures` test needs no GPU: it checks the files against the
+manifest (hashes, recomputed PSNR, framing, block indices, canonical padding, the pin).
 
-- **Decoder tests:** feed the `.pwv1` frame to the decoder, compare with `.ref.yuv` by PSNR or
-  max error. The decode is **not bit-exact** across devices (`bitstream.md`), so use the
-  spike's bar (PSNR ≥ 45 dB and max error ≤ 1 against the reference); never compare hashes.
-- **Encoder tests:** the bitstream is the library's output on one device, not a normative
-  stream. Compare by decoding and by PSNR against the source, not by bytes, unless the
-  test runs on the generating GPU class (`encoder_device` in the manifest).
+## Bars
+
+- **`decoder_bar`** (`min_psnr_db` 45, `max_abs_err` 1): decode the SAME `.pwv1` and compare the
+  result with its `.ref.yuv`, every plane. This is the bar the spike's WGSL decoder met (63.9 to
+  65.5 dB, max error 1). The decode is not bit-exact across devices, so never compare hashes.
+- **`encoder_bar`** (per fixture, `min_psnr_db` per plane): for B07's `pyrowaveenc`. Encode the
+  `.src.yuv` at the fixture's `budget_bytes`, decode that output, and compare it with the SOURCE;
+  the floor is the fixture's recorded PSNR minus 1 dB (the recorded value capped at 60 dB: more
+  than that is 8-bit rounding, and a near-lossless stream would otherwise demand an identical
+  decode). **Never compare an encoder's bytes with a `.pwv1`**: the files are canonical and pinned
+  to one GPU class, an encoder's output is neither.
+- Decodes of two different GPUs' encodes of one picture differ by up to 22 code values (the AMD
+  iGPU against the RTX 5090, worst fixture, `detail_320x192_lo`). That compares two different
+  bitstreams; it is not the decoder bar, which applies to one bitstream.
