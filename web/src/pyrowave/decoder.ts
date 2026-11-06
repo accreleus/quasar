@@ -11,8 +11,15 @@ export type DecoderPath = "fast" | "subgroups-fp32" | "fallback";
 
 const PATH_NEEDS: Record<DecoderPath, GPUFeatureName[]> = { fast: ["subgroups", "shader-f16"], "subgroups-fp32": ["subgroups"], fallback: [] };
 
-export function chooseDecoderPath(features: ReadonlySet<string>): DecoderPath {
+/**
+ * The subgroup paths assume every subgroup of a 128-lane workgroup has one size that divides 128
+ * (the dequantise shader's lane index and its scan). Sizes the browser does not report are trusted.
+ */
+export function chooseDecoderPath(features: ReadonlySet<string>, info?: Pick<GPUAdapterInfo, "subgroupMinSize" | "subgroupMaxSize">): DecoderPath {
   if (!features.has("subgroups")) return "fallback";
+  const min = info?.subgroupMinSize;
+  const max = info?.subgroupMaxSize;
+  if (min !== undefined && max !== undefined && (min !== max || !(max > 0 && max <= 128 && 128 % max === 0))) return "fallback";
   return features.has("shader-f16") ? "fast" : "subgroups-fp32";
 }
 
@@ -62,18 +69,24 @@ function pipelines(device: GPUDevice, path: DecoderPath): Promise<Pipelines> {
   if (!p) {
     const f16 = path === "fast";
     p = (async () => {
-      const rgbModule = await checked(device, yuvToRgbWGSL);
-      const [dq, idwt, rgb] = await Promise.all([
-        checked(device, dequantWGSL(f16, path !== "fallback")).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
-        checked(device, idwtWGSL(f16)).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
-        device.createRenderPipelineAsync({
-          layout: "auto",
-          vertex: { module: rgbModule, entryPoint: "vs" },
-          fragment: { module: rgbModule, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
-          primitive: { topology: "triangle-list" },
-        }),
-      ]);
-      return { dq, idwt, rgb };
+      try {
+        const rgbModule = await checked(device, yuvToRgbWGSL);
+        const [dq, idwt, rgb] = await Promise.all([
+          checked(device, dequantWGSL(f16, path !== "fallback")).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
+          checked(device, idwtWGSL(f16)).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
+          device.createRenderPipelineAsync({
+            layout: "auto",
+            vertex: { module: rgbModule, entryPoint: "vs" },
+            fragment: { module: rgbModule, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
+            primitive: { topology: "triangle-list" },
+          }),
+        ]);
+        return { dq, idwt, rgb };
+      } catch (e) {
+        // A GPUPipelineError (e.g. limits below what the auto layout needs) is a DOMException.
+        if (e instanceof PyroWaveError) throw e;
+        throw new PyroWaveError("gpu_error", `pipeline: ${e instanceof Error ? e.message : String(e)}`);
+      }
     })();
     const cache = byPath;
     p.catch(() => cache.delete(path));
@@ -121,8 +134,10 @@ export class PyroWaveDecoder {
   }
 
   private static async createNow(device: GPUDevice, header: PyroWaveHeader, options: DecoderOptions): Promise<PyroWaveDecoder> {
-    const path = options.forcePath ?? chooseDecoderPath(device.features);
-    if (!PATH_NEEDS[path].every((f) => device.features.has(f))) throw new PyroWaveError("no_subgroups", `the device cannot run the ${path} path`);
+    const path = options.forcePath ?? chooseDecoderPath(device.features, device.adapterInfo as GPUAdapterInfo | undefined);
+    if (!Object.hasOwn(PATH_NEEDS, path)) throw new PyroWaveError("unsupported", `unknown decoder path ${String(path)}`);
+    const missing = PATH_NEEDS[path].find((f) => !device.features.has(f));
+    if (missing) throw new PyroWaveError("unsupported", `the ${path} path needs ${missing}, which the device lacks`);
     const f16 = path === "fast";
     const { width: w, height: h } = header;
     const tooLarge = (what: string) => new PyroWaveError("too_large", `${w}x${h}: ${what}`);
