@@ -153,7 +153,7 @@ impl Host {
             Arc::new(AtomicU64::new(0)),
         );
         let metrics = Arc::new(SessionMetrics::new("smooth", cfg.stream.fps as u32));
-        let enc = build_encode_pipeline(
+        let enc = build_encode_pipeline::<SessionTransports>(
             &cfg,
             sig_tx.clone(),
             None,
@@ -183,14 +183,10 @@ impl Host {
             .expect("encode PLAYING");
         let EncodePipeline {
             pipeline,
-            video,
-            transport,
-            audio_webrtc,
-            audio_pipeline,
+            transport: transports,
             interpipesrc,
             resolution_lever: lever,
         } = enc;
-        let transports = SessionTransports::new(transport, video, audio_webrtc, audio_pipeline);
         transports.audio_pipeline.play();
         let bus = pipeline.bus().expect("encode bus");
         let encoder = pipeline
@@ -1930,7 +1926,7 @@ fn a_takeover_does_not_hold_the_runner_on_an_audio_pipeline_that_will_not_stop()
         "the old audio pipeline was not held through the stop"
     );
     let builds = || {
-        let all = super::transport::AUDIO_BUILDS.lock().unwrap();
+        let all = super::webrtc_transport::AUDIO_BUILDS.lock().unwrap();
         all.iter().filter(|id| *id == "takeover-audio-held").count()
     };
     let built_before_release = builds();
@@ -2175,14 +2171,14 @@ struct AttachPause;
 
 impl AttachPause {
     fn of(ms: u64) -> AttachPause {
-        super::transport::ATTACH_PAUSE_MS.store(ms, Ordering::Relaxed);
+        super::webrtc_transport::ATTACH_PAUSE_MS.store(ms, Ordering::Relaxed);
         AttachPause
     }
 }
 
 impl Drop for AttachPause {
     fn drop(&mut self) {
-        super::transport::ATTACH_PAUSE_MS.store(0, Ordering::Relaxed);
+        super::webrtc_transport::ATTACH_PAUSE_MS.store(0, Ordering::Relaxed);
     }
 }
 
@@ -3215,8 +3211,33 @@ fn browser_host() {
     });
 }
 
+/// #1028: the WebRTC transport attaches the RTP stage probe to the payloader it builds
+/// after the encoded-frame boundary. Without it `rtp_fps` and `rtp_bitrate_kbps` read 0.
+#[test]
+fn the_webrtc_transport_counts_what_its_payloader_sends() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let host = Host::start("rtp-out");
+    // The payloader runs ahead of the tail's gate, so it sends with no peer attached.
+    let start = Instant::now();
+    host.metrics.drain_window(start);
+    std::thread::sleep(Duration::from_secs(2));
+    let window = host.metrics.drain_window(Instant::now());
+    assert!(
+        window.rtp_fps > 10.0 && window.rtp_bitrate_kbps > 0.0,
+        "rtp_fps {} rtp_bitrate_kbps {} over a 30 fps stream",
+        window.rtp_fps,
+        window.rtp_bitrate_kbps
+    );
+}
+
 /// What the host hands `webrtcbin` per transport, and whether it is given back.
 mod aux_senders;
 
 /// Amendment 39 (#759): parked, held, adopted and in-place-swapped runtimes.
 mod warm_steam;
+
+/// The transport seam (#1028) with a transport that is not WebRTC.
+mod fake_transport;
