@@ -23,11 +23,12 @@
 import { useCallback, useEffect, useState } from "react";
 import type { RefObject } from "react";
 import type { App } from "../../../api/types";
+import { Chip } from "../../../components/Chip";
 import { IconChevronLeft, IconChevronRight, IconPlayGlyph } from "../../../components/icons";
 import { artFor, artSrcSet, sizedArt } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
 import type { RailCard } from "../homeData";
-import { coverClassAt } from "../libraryGrid";
+import { SHARED_LIBRARY_OPEN, coverClassAt } from "../libraryGrid";
 
 /** Whether the caller has asked for no animation. Rail scrolling honours it
  *  the same way the page's own transitions do. */
@@ -48,6 +49,8 @@ export interface FeaturedRailProps {
   coverClassById: ReadonlyMap<string, string>;
   busy: boolean;
   blockedIds: ReadonlySet<string>;
+  /** sharedLibraryIds: cards a sharing desktop holds (#1001; DESIGN.md row 13). */
+  dimmedIds?: ReadonlySet<string>;
   onOpen: (app: App) => void;
   onPlay: (card: RailCard, app: App) => void;
 }
@@ -59,6 +62,7 @@ export function FeaturedRail({
   coverClassById,
   busy,
   blockedIds,
+  dimmedIds,
   onOpen,
   onPlay,
 }: FeaturedRailProps) {
@@ -121,6 +125,7 @@ export function FeaturedRail({
                  lazy like the grid tiles. */
               priority={i === 0}
               disabled={busy || (blockedIds.has(app.id) && !card.sessionId)}
+              dimmed={!card.sessionId && !!dimmedIds?.has(app.id)}
               isTabStop={card.appId === tabStopId}
               onFocus={() => setActiveId(card.appId)}
               onOpen={() => onOpen(app)}
@@ -160,6 +165,8 @@ interface FeaturedCardProps {
   coverClass: string;
   priority: boolean;
   disabled: boolean;
+  /** In use by a desktop sharing the Steam library: the In use chip and a dimmed cover. */
+  dimmed: boolean;
   /** The rail's one tab stop (roving tabindex — see FeaturedRail). */
   isTabStop: boolean;
   onFocus: () => void;
@@ -178,6 +185,7 @@ function FeaturedCard({
   coverClass,
   priority,
   disabled,
+  dimmed,
   isTabStop,
   onFocus,
   onOpen,
@@ -187,7 +195,7 @@ function FeaturedCard({
   const art = artFailed ? null : artFor(app, "tile");
   const playLabel = card.sessionId ? `Resume ${app.name}` : `Play ${app.name}`;
   return (
-    <article className="home-feat" data-variant={card.reason}>
+    <article className="home-feat" data-variant={card.reason} data-dimmed={dimmed ? "true" : undefined}>
       <div className="home-feat-poster">
         <span className={`cover ${coverClass}`} aria-hidden>
           <span className="glyph">{appGlyph(app.name)}</span>
@@ -204,6 +212,13 @@ function FeaturedCard({
             />
           )}
         </span>
+        {dimmed && (
+          <span className="blocked">
+            <Chip variant="warning" title={SHARED_LIBRARY_OPEN}>
+              In use
+            </Chip>
+          </span>
+        )}
         <button
           type="button"
           className="home-feat-play"

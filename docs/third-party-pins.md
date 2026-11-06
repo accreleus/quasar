@@ -285,9 +285,9 @@ which was deliberately not carried over to the public repository):
 - **`CUDA_ENABLE` now defaults to `1` and is no longer a per-target choice.** The `build` stage
   is always CUDA-instantiated, so ONE `/opt/gst` and ONE agent binary serve both vendors. This
   is safe on non-NVIDIA hosts: without `libcuda.so.1` the nvcodec plugin loads, warns once and
-  registers **zero** features, and the `--features cuda` agent binary carries no
-  `libcuda`/`libgstcuda` `DT_NEEDED` (they are dlopened) so it starts clean on a driver-less
-  host. `CUDA_ENABLE=0` is a diagnostic-only escape hatch; `deploy/validate-image.sh` rejects
+  registers **zero** features, and the `--features cuda` agent binary links only
+  `libgstcuda-1.0.so.0` (shipped in `/opt/gst`, which needs no `libcuda`), never `libcuda`
+  itself, so it starts clean on a driver-less host (#927). `CUDA_ENABLE=0` is a diagnostic-only escape hatch; `deploy/validate-image.sh` rejects
   the resulting image for the `runtime`/`nv` roles.
 - **`nv` is now `FROM runtime`, not a sibling `FROM quasar-base`.** It previously carried a
   hand-copied duplicate of `runtime`'s package list, the two drifted, and the shipped nv image

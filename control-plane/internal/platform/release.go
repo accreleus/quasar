@@ -194,7 +194,7 @@ type Target struct {
 	NodeName *string `json:"node_name"`
 	Eligible bool    `json:"eligible"`
 	Reason   *string `json:"reason"`
-	// Preflight: CONTEXT.md. Answered beside Eligible so the card can name the fix.
+	// Preflight: GLOSSARY.md. Answered beside Eligible so the card can name the fix.
 	Preflight Preflight `json:"preflight"`
 }
 

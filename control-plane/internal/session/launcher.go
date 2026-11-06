@@ -308,6 +308,15 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	if afterParkedRead != nil {
 		afterParkedRead()
 	}
+	notice := ""
+	if app.ShareSteamLibrary && app.ManagedHome && !lp.parked {
+		if p.SharedHomeAppID, err = c.store.sharedSteamApp(ctx, userID); err != nil {
+			return LaunchResult{}, err
+		}
+		if p.SharedHomeAppID == "" {
+			notice = noticeSharedUnavailable
+		}
+	}
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
 	var refused *ParkedClaimRefusedError
@@ -345,6 +354,9 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	}
 	if p.claim != nil {
 		sess.AdoptSessionID = p.claim.id
+	}
+	if sess.notice == "" {
+		sess.notice = notice
 	}
 	if !lp.parked {
 		c.afterLaunchAdmitted(ctx, userID, app)
@@ -385,17 +397,28 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		if err == nil && lp.parked {
 			dispatchSpec, err = injectSteamFlags(dispatchSpec, parkedSteamFlags)
 		}
+		if err == nil && sess.SharedHomeAppID != nil {
+			dispatchSpec, err = c.injectSharedHomeMount(ctx, dispatchSpec, app, userID, *sess.SharedHomeAppID, *sess.HostID)
+		}
 		if err != nil {
 			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("home mount: %v", err))
 			return LaunchResult{}, fmt.Errorf("home mount: %w", err)
 		}
 	}
 
+	// The Region and Input values are read here, before the 201, so a PATCH
+	// that commits after it waits for the next launch (control-api.md §Region and Input settings).
+	dispatchSpec, err = c.applyRegionInput(ctx, dispatchSpec, userID, sess.DeviceID)
+	if err != nil {
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("region and input values: %v", err))
+		return LaunchResult{}, fmt.Errorf("region and input values: %w", err)
+	}
+
 	// Async, so the HTTP response returns immediately with the assigned session.
 	expectedHome := expectedHomeDispatch(app)
 	go c.prepareAndDispatch(sess, dispatchSpec, app.Image(), &expectedHome)
 
-	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt}, nil
+	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt, Notice: sess.notice}, nil
 }
 
 func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, imageRef string, expected *homeDispatchExpectation) {
@@ -459,7 +482,7 @@ func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, image
 		c.endUnsentStopOnHost(sess.ID, sess.HostID)
 		return
 	}
-	c.dispatchAssignStart(sess, runtimeSpec, expected)
+	c.dispatchAssignStartWithTopology(sess, runtimeSpec, "stream_only", expected)
 }
 
 // placedStream is the post-placement decision for one GPU before it is
@@ -938,21 +961,25 @@ func (c *Coordinator) logNoHostRejection(userID, appID string, err error) {
 // dispatchAssignStart performs the two-step agent handshake: assign, then start.
 // Either step failing (reject, timeout, agent not connected) fails the session
 // and releases its reservation. starting→running then arrives via AgentState.
+// It resolves the Region and Input values now: for a session no user launch
+// is waiting on (a parked one, a certification cell).
 func (c *Coordinator) dispatchAssignStart(sess Session, runtimeSpec []byte, expected *homeDispatchExpectation) {
+	runtimeSpec, err := c.applyRegionInput(c.ctx, runtimeSpec, sess.UserID, sess.DeviceID)
+	if err != nil {
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("region and input values: %v", err))
+		return
+	}
 	c.dispatchAssignStartWithTopology(sess, runtimeSpec, "stream_only", expected)
 }
 
+// dispatchAssignStartWithTopology sends runtimeSpec as given: the caller has
+// already applied the Region and Input values.
 func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec []byte, videoTopology string, expected *homeDispatchExpectation) {
 	if sess.HostID == nil || sess.GPUIndex == nil {
 		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, "session missing host/gpu placement")
 		return
 	}
 	hostID := *sess.HostID
-	app, err := c.applyRegionInput(c.ctx, runtimeSpec, sess.UserID, sess.DeviceID)
-	if err != nil {
-		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("region and input values: %v", err))
-		return
-	}
 	// The resolved RUNG's ABR floor, for the agent's in-session governor. It must
 	// read the rung, not the launch profile: a chain has no single floor, and one
 	// that fell through to a lower rung has a lower floor. No rung resolved ⇒ 0,
@@ -975,7 +1002,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		ID:        newCmdID(),
 		SessionID: sess.ID,
 		GPUIndex:  *sess.GPUIndex,
-		App:       app,
+		App:       runtimeSpec,
 		Stream: agentws.StreamSpec{
 			Width: sess.Width, Height: sess.Height, FPS: sess.FPS,
 			BitrateKbps: sess.BitrateKbps, H264Profile: sess.H264Profile,
@@ -990,7 +1017,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		Kind:           sess.Kind,
 		AdoptSessionID: sess.AdoptSessionID,
 	}
-	if !c.sendHomeBoundAssign(hostID, sess.ID, app, assign, expected) {
+	if !c.sendHomeBoundAssign(hostID, sess.ID, runtimeSpec, assign, expected) {
 		return
 	}
 

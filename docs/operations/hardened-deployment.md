@@ -14,8 +14,18 @@ root for the tenant container. Allowlisted paths are read-only unless the entry 
 host ignore a manifest's `no_new_privileges: false` and `systempaths_unconfined: true` (the shipped
 Steam and KDE images need both, so it is not the default).
 
-Set `QUASAR_PUBLIC_HOST`, `QUASAR_TLS_DIR` (containing `fullchain.pem` and `privkey.pem`), strong
-database/enrollment/bootstrap secrets, and a short `AUTH_TOKEN_TTL`. Start the stack with:
+Set `QUASAR_PUBLIC_HOST`, `QUASAR_TLS_DIR` (containing `fullchain.pem` and `privkey.pem`),
+`QUASAR_TRUSTED_PROXIES` (below), strong database/enrollment/bootstrap secrets, and a short
+`AUTH_TOKEN_TTL`. On a fresh install the project's network does not exist yet, so create it with
+the base file alone and read its subnet off it (`deploy` is the project name when you run from the
+repository root):
+
+```sh
+docker compose -f deploy/docker-compose.yml up --no-start
+docker network inspect deploy_default -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+```
+
+Put that subnet in `deploy/.env` as `QUASAR_TRUSTED_PROXIES`, then start the stack with:
 
 ```sh
 docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.hardened.yml up -d
@@ -26,18 +36,18 @@ signaling to the configured HTTPS origin, and adds HSTS. The application itself 
 frame-denial, content-type, referrer, permissions, and opener policies. Quasar ignores forwarding
 headers for security/rate-limit identity unless the explicit trusted-proxy policy is configured.
 
-That policy is `QUASAR_TRUSTED_PROXIES` (#438), and this overlay is the one deployment that needs
-it. Every public request now arrives from the `quasar-edge` container, so with the variable unset
+That policy is `QUASAR_TRUSTED_PROXIES` (#438), and this overlay requires it: `compose up` stops
+with an error until it is set. Every public request arrives from the `quasar-edge` container, so with the variable unset
 the login, signaling, agent-enrollment and first-run setup-claim rate limiters all key on that one
 address and every client shares a single failure budget. The sharp end is `POST /v1/setup/claim`:
 an unauthenticated attacker can burn the shared budget with bad tokens and keep the legitimate
 operator from ever creating the first admin. Set it to the **/16 this compose project's own bridge
 allocates** — read it off `docker network inspect <project>_default`, e.g. `172.18.0.0/16` — and each
 client is limited on the address Caddy actually saw. Do not use the enclosing `172.16.0.0/12`: it
-spans every Docker bridge on the box, including the default bridge and the host gateway. Leaving it unset is safe but coarse — the
-header is never read, so nobody can spoof a limiter key. Unset, the control plane does not believe
-Caddy's `X-Forwarded-Proto` either, so the first-run claim through Caddy is refused: set it, or
-provision the admin with the bootstrap secrets. Never name a network you do not operate.
+spans every Docker bridge on the box, including the default bridge and the host gateway. Unset,
+the control plane would not believe Caddy's `X-Forwarded-Proto`, so first-run setup, sign-in,
+registration and password change through Caddy would all be refused (#593, #604); the bootstrap
+secrets would create an admin who cannot sign in either. Never name a network you do not operate.
 `deploy/Caddyfile.hardened` overwrites `X-Forwarded-For` with the address Caddy saw and strips any
 inbound `X-Real-IP`, so a client-supplied chain cannot survive the edge. Full semantics:
 `docs/configuration.md`.

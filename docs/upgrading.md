@@ -72,6 +72,23 @@ unrepresentable here, not merely discouraged.
 
 ---
 
+## A reverse proxy on the HTTP port: name it before you update
+
+Sign-in, registration and password change are refused over plain HTTP (#604). A browser on the
+control plane's HTTPS port, or a proxy pointed at it, needs nothing. A proxy pointed at the
+**HTTP** port must be named in `QUASAR_TRUSTED_PROXIES` and send `X-Forwarded-Proto: https`, or
+nobody can sign in through it after the update. The bundled hardened Caddy overlay is one, and it
+now refuses to start (`compose up` names the variable) until it is set. Signed-in users keep working until their sign-in expires.
+
+- **Owned install:** `docker exec -it quasar-recovery quasar-recovery reconfigure --yes
+  QUASAR_TRUSTED_PROXIES=<proxy address>` on the control plane's machine. It re-creates the
+  control plane; live sessions keep streaming.
+- **Compose or source install:** set it in `deploy/.env` and recreate the control plane.
+- **Who needs it:** a control plane on 0.5.1 that logged `credential-route-plaintext` or
+  `forwarded-from-unlisted-peer`. Rules: `docs/configuration.md` `QUASAR_TRUSTED_PROXIES`.
+- **It worked when** you can sign in through your usual address and the control plane logs no
+  `credential-route-plaintext` line.
+
 ## How an owned install is updated
 
 Every machine runs one recovery actor. It is the only thing that creates or replaces that
@@ -343,11 +360,14 @@ stack or manager definition that re-creates it.
 - **Install-time settings** (home root, template root, release trust, app-container defaults) are
   recorded in machine state at the first install and change with `quasar-recovery reconfigure`, a
   verified replacement with the same images and new inputs. The role, node name, database and
-  images are fixed at install. This release re-creates only the node agent for a reconfigure, so
-  on a combined or control-only machine a change that moves the control plane's container (the
-  public host, TLS names, trusted proxies, ports, the allowlist, and the home root on a combined
-  host) is refused; the signature settings, which no container renders, still change.
-  `docs/configuration.md` "Changing machine inputs: `reconfigure`".
+  images are fixed at install. On a combined or control-only machine it also changes the
+  control plane's inputs (the public host, TLS names, trusted proxies, HSTS, ports), re-creating the
+  control plane first. Naming a reverse proxy, which sign-in through a proxy on the HTTP port
+  needs (#604), is one: `docker exec -it quasar-recovery quasar-recovery reconfigure --yes
+  QUASAR_TRUSTED_PROXIES=<proxy address>`. Turning on HSTS (opt-in, off by default) is another:
+  `reconfigure --yes QUASAR_HSTS_MAX_AGE=<seconds>`; it pins the whole host name for that long, so
+  read the warning at `QUASAR_HSTS_MAX_AGE` in `docs/configuration.md` first. Restoring back to a release before HSTS was settable turns it off until the next update. `docs/configuration.md`
+  "Changing machine inputs: `reconfigure`".
 - **A GPU host** is removed from the console: the host → **Remove host** drains it, then removes
   its agent and recovery actor. Any machine can be taken apart on the machine with the recovery
   image's `uninstall`, which keeps the database, machine state and homes unless `--purge`.

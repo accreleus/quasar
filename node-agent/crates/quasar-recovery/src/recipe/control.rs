@@ -89,6 +89,9 @@ pub(super) fn validate(control: &ControlInputs) -> Result<(), RenderError> {
     if let Some(proxies) = &control.trusted_proxies {
         trusted_proxies(proxies)?;
     }
+    if let Some(age) = &control.hsts_max_age {
+        hsts_max_age(age)?;
+    }
     if let Some(hosts) = &control.tls_hosts {
         for host in hosts.split(',').map(str::trim).filter(|h| !h.is_empty()) {
             host_like("a TLS host", host)?;
@@ -119,6 +122,32 @@ pub(super) fn validate(control: &ControlInputs) -> Result<(), RenderError> {
         }
     }
     Ok(())
+}
+
+/// The first control-plane revision that renders `QUASAR_HSTS_MAX_AGE`.
+pub const HSTS_REVISION: u32 = 4;
+
+/// Why a value for `QUASAR_HSTS_MAX_AGE` cannot be applied to a control plane of `revision`.
+/// Asked where the operator sets it (the install, a reconfigure), never in `render`.
+pub fn hsts_needs_newer_image(revision: u32) -> String {
+    format!(
+        "QUASAR_HSTS_MAX_AGE needs a control-plane image of recipe revision {HSTS_REVISION} or later; this one is revision {revision}"
+    )
+}
+
+/// The control plane's rules for `QUASAR_HSTS_MAX_AGE` (`internal/config` `envInt32`):
+/// whole seconds, 0 to 2147483647.
+pub fn hsts_max_age(raw: &str) -> Result<u32, RenderError> {
+    raw.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|n| *n <= i32::MAX as u32)
+        .ok_or_else(|| {
+            RenderError::Invalid(format!(
+                "QUASAR_HSTS_MAX_AGE {raw:?} must be a whole number of seconds, 0 to {}",
+                i32::MAX
+            ))
+        })
 }
 
 /// The control plane's rules for `QUASAR_TRUSTED_PROXIES` (`internal/config` `envCIDRs`):
@@ -243,6 +272,8 @@ pub(super) fn postgres_r1(
 /// release's. Revision 1 gives an override, else the install-time image, as before.
 /// Revision 3 (#543) carries the healthcheck a control plane must pass to be verified:
 /// Podman keeps none from an OCI image, so one left to the image never reports there.
+/// Revision 4 (#874) passes `QUASAR_HSTS_MAX_AGE` (empty unless the operator set it); earlier
+/// revisions ignore it.
 pub(super) fn control_plane(
     revision: u32,
     inputs: &Inputs,
@@ -333,6 +364,15 @@ pub(super) fn control_plane(
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect();
+    // An older revision ignores the input: it must render any machine state a newer one
+    // accepted, or a restore back to it fails after it has stopped everything (ADR 0008).
+    if revision >= HSTS_REVISION {
+        let age = control.hsts_max_age.as_deref().map(hsts_max_age);
+        env.insert(
+            "QUASAR_HSTS_MAX_AGE".into(),
+            age.transpose()?.map(|n| n.to_string()).unwrap_or_default(),
+        );
+    }
     let reference = |i: Option<&ImageRef>| i.map(ImageRef::reference).unwrap_or_default();
     let e = &inputs.enroll;
     if revision >= 2 {

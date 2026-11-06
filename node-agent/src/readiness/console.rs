@@ -52,6 +52,11 @@ pub(crate) fn set_config(output_id: Option<String>, input_devices: serde_json::V
     }
 }
 
+/// The `output_id` of the host's console config, as last latched.
+pub(crate) fn configured_output_id() -> Option<String> {
+    config().output_id
+}
+
 fn config() -> LatchedConfig {
     CONFIG
         .read()
@@ -712,17 +717,44 @@ pub fn check_ddc(v: &ConsoleView) -> ReadinessCheck {
         );
     }
     if d.all_off {
+        let Some(input) = d.input.filter(|_| d.other_input) else {
+            return super::warn_check(
+                CHECK_DDC,
+                "every mapped monitor reads DDC power off/standby".into(),
+                "Turn the monitor on and switch it to this host's input.".into(),
+            );
+        };
+        let (known, relearn) = if d.input_learned {
+            (
+                "learned from local input during a console session",
+                "If the host was cabled to another input, turn console mode off and on again \
+                 to learn it afresh, or set QUASAR_CONSOLE_INPUT_SOURCE.",
+            )
+        } else {
+            ("QUASAR_CONSOLE_INPUT_SOURCE", "")
+        };
         return super::warn_check(
             CHECK_DDC,
-            "every mapped monitor reads DDC power off/standby, or is showing another \
-             input than QUASAR_CONSOLE_INPUT_SOURCE"
-                .into(),
-            "Turn the monitor on and switch it to this host's input.".into(),
+            format!(
+                "the monitor is on but shows another input than this host's ({input:#04x}, \
+                 {known}): console auto-start does not run, and a console session still \
+                 running there ends after the usual waits"
+            ),
+            format!("Switch the monitor to this host's input. {relearn}")
+                .trim_end()
+                .to_string(),
         );
     }
     super::pass(
         CHECK_DDC,
-        "read at least one connected monitor's DDC power state".into(),
+        match d.input {
+            Some(input) => format!(
+                "read at least one connected monitor's DDC power state; this host's input is \
+                 {input:#04x}{}",
+                if d.input_learned { " (learned)" } else { "" }
+            ),
+            None => "read at least one connected monitor's DDC power state".into(),
+        },
     )
 }
 
@@ -768,6 +800,7 @@ mod tests {
                 bus_mapped: true,
                 any_read: true,
                 all_off: false,
+                ..Default::default()
             },
             i2c_nodes: true,
         }
@@ -1096,6 +1129,31 @@ mod tests {
         ] {
             assert_eq!(UdevView::from_env(value), view, "{value:?}");
         }
+    }
+
+    /// A shared monitor showing another input says why auto-start waits, and how to
+    /// relearn a host that moved to another input; a known input is shown when it passes.
+    #[test]
+    fn ddc_names_the_other_input_that_holds_auto_start() {
+        let mut v = on();
+        v.ddc.all_off = true;
+        v.ddc.other_input = true;
+        v.ddc.input = Some(0x10);
+        v.ddc.input_learned = true;
+        let c = check_ddc(&v);
+        assert_eq!(c.status, WARN);
+        assert!(c.summary.contains("does not run") && c.summary.contains("0x10"));
+        assert!(c.summary.contains("session still running"));
+        assert!(c.summary.contains("learned"));
+        assert!(c.remediation.contains("off and on"));
+
+        v.ddc.input_learned = false;
+        let c = check_ddc(&v);
+        assert!(c.summary.contains("QUASAR_CONSOLE_INPUT_SOURCE"));
+
+        v.ddc.all_off = false;
+        v.ddc.other_input = false;
+        assert!(check_ddc(&v).summary.contains("0x10"));
     }
 
     #[test]

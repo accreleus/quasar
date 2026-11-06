@@ -1,4 +1,4 @@
-//! Agent-side client for this host's recovery actor (`CONTEXT.md`).
+//! Agent-side client for this host's recovery actor (`GLOSSARY.md`).
 //!
 //! The agent relays and does not author: `release_apply` is validated, acked on
 //! acceptance, POSTed to the actor's agent socket, and every `release_state`

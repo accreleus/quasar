@@ -175,6 +175,21 @@ func (d *warmDispatcher) stopsFor(sessionID string) int {
 	return n
 }
 
+// waitStop polls until a session_stop for sessionID was sent, and returns its
+// reason. The send follows the row's state change, so a read at the change races it.
+func (d *warmDispatcher) waitStop(t *testing.T, sessionID string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.stopsFor(sessionID) > 0 {
+			return d.stopReason(sessionID)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("no session_stop for session %s", sessionID)
+	return ""
+}
+
 func (d *warmDispatcher) stopReason(sessionID string) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()

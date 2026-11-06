@@ -7,10 +7,10 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 areas="$repo/scripts/verify/ci-changed-areas.sh"
 fail() { echo "ci-changed-areas test: $*" >&2; exit 1; }
 
-decide() { # decide <paths...> -> "go,web,rust,site" subset
+decide() { # decide <paths...> -> "go,web,rust,site,deploy" subset
   local out
   out="$(printf '%s\n' "$@" | bash "$areas")"
-  for a in go web rust site; do grep -q "^$a=true" <<<"$out" && printf '%s,' "$a"; done
+  for a in go web rust site deploy; do grep -q "^$a=true" <<<"$out" && printf '%s,' "$a"; done
   return 0
 }
 expect() { # expect <want> <paths...>
@@ -38,14 +38,15 @@ expect web,rust docs/configuration.md
 expect go,rust control-plane/internal/buildinfo/recipe.go
 expect go,rust node-agent/crates/quasar-recovery/src/journal.rs
 expect go,web,rust,site testdata/enroll-host/pins.json
-expect go,web,rust,site deploy/enroll-host.sh
-expect go,web,rust,site .github/workflows/ci.yml
-expect go,web,rust,site scripts/verify/ci-apt-install.sh
-expect go,web,rust,site .gitmodules
+expect go,web,rust,site,deploy deploy/enroll-host.sh
+expect go,web,rust,site,deploy .github/workflows/ci.yml
+expect go,web,rust,site,deploy scripts/verify/ci-apt-install.sh
+expect go,web,rust,site,deploy .gitmodules
+expect deploy scripts/dev/test-compose-overlays.sh
 expect go,web web/src/App.tsx control-plane/a.go CHANGELOG.md
 bash "$areas" --all </dev/null 2>/dev/null && fail "an unknown flag must be refused"
 
-# All four, well-formed: ci.yml reads each line, so a short answer must not read as "skip".
+# All five, well-formed: ci.yml reads each line, so a short answer must not read as "skip".
 out="$(printf '%s\n' docs/a.md | bash "$areas")"
-[ "$(grep -c -E '^(go|web|rust|site)=(true|false)$' <<<"$out")" -eq 4 ] || fail "malformed output: $out"
+[ "$(grep -c -E '^(go|web|rust|site|deploy)=(true|false)$' <<<"$out")" -eq 5 ] || fail "malformed output: $out"
 echo "ci-changed-areas test: ok"

@@ -16,6 +16,19 @@ import { ToastProvider } from "../../components/Toast";
 import { ThemeProvider } from "../../settings/ThemeContext";
 import { RecoveryController } from "../../webrtc/recovery";
 
+// A test that needs the page to stay put after a game exit (#812) turns navigation off.
+let blockNavigate = false;
+vi.mock("react-router-dom", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react-router-dom")>();
+  return {
+    ...actual,
+    useNavigate: () => {
+      const navigate = actual.useNavigate();
+      return blockNavigate ? () => {} : navigate;
+    },
+  };
+});
+
 const getSession = vi.fn();
 vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
@@ -259,6 +272,7 @@ beforeEach(() => {
   telemetryListener = null;
   constructed = 0;
   hud = {};
+  blockNavigate = false;
   track.stopped = false;
   getUserMedia.mockImplementation(() => new Promise<MediaStream>((r) => (grantMic = r)));
   vi.stubGlobal("navigator", { ...navigator, mediaDevices: { getUserMedia } });
@@ -436,6 +450,76 @@ describe("SessionPage — an ordinary stop is not a game exit (#726)", () => {
     await advance(600);
     expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
     expect(screen.queryByTestId("library")).toBeNull();
+  });
+
+  // #812: with the input channel gone the page has no Exit, so "Back to library" must not wait
+  // out the 500 ms grace the other recovery banners get.
+  it("recovery failed and the input channel closed: Back to library shows with no gap (#812)", async () => {
+    const ch = await streamingWithMicAndCapture();
+    refused();
+    await act(async () => {
+      ch.onclose?.();
+      lastOnRecovery?.(failed);
+    });
+    await advance(50);
+    expect(screen.queryByTestId("hud")).toBeNull();
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Back to library" })).not.toBeNull();
+  });
+
+  // The runtime re-seats on `failed`: with the channel open the picture still plays and Exit is on screen.
+  it("recovery failed with the input channel still open keeps the grace (#812)", async () => {
+    await streamingWithMicAndCapture();
+    refused();
+    await act(async () => lastOnRecovery?.(failed));
+    await advance(100);
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+    await advance(600);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+  });
+
+  // The trade-off: with the channel gone the banner paints before the end-reason read lands, then goes.
+  it("recovery failed, channel closed, game exit read still in flight: the banner shows, then the library (#812)", async () => {
+    const ch = await streamingWithMicAndCapture();
+    refused();
+    let land!: () => void;
+    getSession.mockImplementation(
+      () => new Promise((r) => { land = () => r({ session: makeSession({ state: "stopping", state_detail: "game exited" }) }); }),
+    );
+    await act(async () => {
+      ch.onclose?.();
+      lastOnRecovery?.(failed);
+    });
+    await advance(50);
+    expect(screen.getByText("Connection recovery stopped")).not.toBeNull();
+    await act(async () => land());
+    await advance(50);
+    expect(screen.getByTestId("library")).not.toBeNull();
+    expect(screen.queryByText("Connection recovery stopped")).toBeNull();
+  });
+
+  // The two terms of the banner condition: both are only visible once the grace has run out.
+  it("a game exit keeps the recovery banner off even after the grace (#812)", async () => {
+    blockNavigate = true;
+    await streamingWithMicAndCapture();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "reconnecting", message: "Reconnecting (1/3)…" }));
+    await advance(600);
+    expect(screen.getByText("Recovering connection")).not.toBeNull();
+    currentSession = makeSession({ state: "stopping", state_detail: "game exited" });
+    await act(async () => lastTransport?.onHostBye?.());
+    await advance(50);
+    expect(screen.queryByText("Recovering connection")).toBeNull();
+  });
+
+  it("an explicit stop keeps the recovery banner off even after the grace (#812)", async () => {
+    stopSession.mockReturnValue(new Promise(() => {}));
+    await streamingWithMicAndCapture();
+    await act(async () => lastOnRecovery?.({ ...failed, phase: "reconnecting", message: "Reconnecting (1/3)…" }));
+    await advance(600);
+    expect(screen.getByText("Recovering connection")).not.toBeNull();
+    await act(async () => (hud.onStop as () => void)());
+    await advance(50);
+    expect(screen.queryByText("Recovering connection")).toBeNull();
   });
 
   it("a bye from a session that still reads running leaves the page as it is (#753)", async () => {

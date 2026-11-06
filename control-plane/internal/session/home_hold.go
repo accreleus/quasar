@@ -187,16 +187,17 @@ func setHomeDispatchHold(ctx context.Context, tx pgx.Tx, userID, appID, sessionI
 
 // ClearNewHomeHold is only for a newly created hold whose command is proved
 // to have had no home side effect. The token CAS cannot clear an older hold
-// reused by a later same-session swap.
+// reused by a later same-session swap. It clears every claim held under the
+// token: a sharing session's shared claim carries its own home's (holdSharedHome).
 func (s *Store) ClearNewHomeHold(ctx context.Context, hold *HomeHoldDecision) error {
 	if hold == nil || !hold.Created {
 		return nil
 	}
 	_, err := s.pool.Exec(ctx, `UPDATE managed_home_claims SET
 		pending_home_session_id=NULL,pending_home_token=NULL,pending_home_started_at=NULL
-		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid
-		  AND pending_home_session_id=$3::uuid AND pending_home_token=$4::uuid`,
-		hold.UserID, hold.AppID, hold.SessionID, hold.Token)
+		WHERE user_id=$1::uuid
+		  AND pending_home_session_id=$2::uuid AND pending_home_token=$3::uuid`,
+		hold.UserID, hold.SessionID, hold.Token)
 	if err != nil {
 		return fmt.Errorf("release unstarted home operation: %w", err)
 	}

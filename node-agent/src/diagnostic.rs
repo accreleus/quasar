@@ -1,4 +1,4 @@
-//! Diagnostic registration (#256; CONTEXT.md "Diagnostic registration"): what the agent
+//! Diagnostic registration (#256; GLOSSARY.md "Diagnostic registration"): what the agent
 //! withholds while its startup cleanup is unresolved, and when it resumes. The decision
 //! is pure; `agent::run` owns the effects.
 
@@ -934,6 +934,7 @@ where
         ControlMsg::Registered { .. }
         | ControlMsg::ConfigUpdate { .. }
         | ControlMsg::ConfigPolicyJournalInventoryRequest { .. }
+        | ControlMsg::ConfigPolicyRelease { .. }
         | ControlMsg::Signaling { .. }
         | ControlMsg::Error { .. }
         | ControlMsg::Unknown => {

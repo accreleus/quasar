@@ -460,6 +460,7 @@ const COMPOSE_ONLY_KNOBS: &[&str] = &[
     "QUASAR_PLATFORM_WEBHOOK_HOSTS",
     "QUASAR_PLATFORM_REGISTRY",
     "QUASAR_IMAGE_REGISTRY_HOSTS",
+    // This test renders revision 1; revision 4 renders it (recipe_golden).
     "QUASAR_HSTS_MAX_AGE",
 ];
 
@@ -471,6 +472,7 @@ fn control_plane_at(revision: u32) -> (Inputs, ContainerSpec) {
         unknown: Default::default(),
         machine_role: quasar_recovery::recipe::ControlRole::Combined,
         trusted_proxies: None,
+        hsts_max_age: None,
         http_port: 8080,
         tls_port: 8443,
         public_host: Some("quasar.example.invalid".into()),

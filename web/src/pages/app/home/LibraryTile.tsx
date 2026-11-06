@@ -27,6 +27,7 @@ import { IconHeart, IconPlayGlyph } from "../../../components/icons";
 import { artFor, artSrcSet, sizedArt } from "../../../lib/appArtwork";
 import { appGlyph } from "../../../lib/appGlyph";
 import { TileHeart } from "./TileHeart";
+import { SHARED_LIBRARY_OPEN } from "../libraryGrid";
 import { gamePage, sessionPage } from "../../lazyPages";
 
 /** The `.lib-tile` box a surface button belongs to. The surface button is
@@ -44,6 +45,9 @@ export interface LibraryTileProps {
   isBlocked: boolean;
   /** Launcher tile name to show while blocked; null when nothing is blocked. */
   blockedByName: string | null;
+  /** A sharing desktop holds this tile's Steam library (#1001): blocked, and the
+   *  art dimmed. */
+  isDimmed?: boolean;
   isOpen: boolean;
   isBusy: boolean;
   coverClass: string;
@@ -68,6 +72,7 @@ export function LibraryTile({
   isRunning,
   isBlocked,
   blockedByName,
+  isDimmed = false,
   isOpen,
   isBusy,
   coverClass,
@@ -91,6 +96,7 @@ export function LibraryTile({
       <div
         className={onFavourite ? "lib-tile tile-titled" : "lib-tile"}
         data-open={isOpen ? "true" : undefined}
+        data-dimmed={isDimmed ? "true" : undefined}
         data-title={onFavourite ? app.name : undefined}
       >
         {/* The fallback is always rendered and the cover sits on top of it —
@@ -129,7 +135,12 @@ export function LibraryTile({
             is running. Presentation only; never both with `.running`. */}
         {isBlocked && (
           <span className="blocked">
-            <Chip variant="warning" title={`${blockedByName} is already running`}>In use</Chip>
+            <Chip
+              variant="warning"
+              title={isDimmed ? SHARED_LIBRARY_OPEN : `${blockedByName} is already running`}
+            >
+              In use
+            </Chip>
           </span>
         )}
         {onFavourite && <TileHeart name={app.name} on={!!app.favourite} onToggle={onFavourite} />}

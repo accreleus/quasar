@@ -46,7 +46,7 @@ pub struct SocketPlan {
 }
 
 /// What the operator gave this start. Read only on a clean machine: once machine state
-/// exists it wins and these are ignored (`CONTEXT.md` "Machine inputs"). The variables are
+/// exists it wins and these are ignored (`GLOSSARY.md` "Machine inputs"). The variables are
 /// `crate::bootstrap`'s. Its `Debug` never shows the enrollment string or the password.
 #[derive(Clone, Default)]
 pub struct OperatorInputs {
@@ -60,6 +60,7 @@ pub struct OperatorInputs {
     pub public_host: Option<String>,
     pub tls_hosts: Option<String>,
     pub trusted_proxies: Option<String>,
+    pub hsts_max_age: Option<String>,
     pub http_port: Option<String>,
     pub tls_port: Option<String>,
     pub database_host: Option<String>,

@@ -204,6 +204,18 @@ describe("LoginPage", () => {
     await waitFor(() => expect(screen.getByText("too many attempts, try later")).toBeInTheDocument());
   });
 
+  it("shows the plain-HTTP refusal as the server words it, not as a wrong password", async () => {
+    const msg = "This server only accepts sign-in, registration and password changes over HTTPS.";
+    const login = vi.fn().mockRejectedValue(new ApiError(403, "forbidden", msg));
+    renderLogin(login);
+
+    fill("a@b.co", "hunter2");
+    fireEvent.click(submitButton());
+
+    await waitFor(() => expect(screen.getByText(msg)).toBeInTheDocument());
+    expect(screen.queryByText("Email or password is incorrect.")).not.toBeInTheDocument();
+  });
+
   it("names a transport failure as one", async () => {
     const login = vi.fn().mockRejectedValue(new TypeError("network down"));
     renderLogin(login);

@@ -59,7 +59,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-API="${API:-http://localhost:${CONTROL_PORT:-8080}}"
+# Sign-in is refused over plain HTTP (#604), so the default is the HTTPS
+# listener; its cert is self-signed, hence -k on every curl.
+API="${API:-https://localhost:${QUASAR_TLS_PORT:-8443}}"
 ADMIN_EMAIL="${BOOTSTRAP_ADMIN_EMAIL:?}"
 ADMIN_PASS="${BOOTSTRAP_ADMIN_PASSWORD:?}"
 
@@ -97,7 +99,7 @@ say "preflight"
 [ -f "$CHROME" ] || die "Chrome-for-Testing not found at $CHROME. Run: qses provision"
 [ -d "$PW_DIR/node_modules" ] || die "Playwright node_modules not at $PW_DIR. Run: cd $PW_DIR && npm install playwright-core@1.60.0"
 [ -f "$RUNNER" ] || die "Playwright runner not found at $RUNNER"
-curl -fs "$API/health" >/dev/null 2>&1 || die "Control-plane not healthy at $API — is the stack up? (try: qstack up)"
+curl -kfs "$API/health" >/dev/null 2>&1 || die "Control-plane not healthy at $API — is the stack up? (try: qstack up)"
 pass "all prerequisites present"
 
 # ── Network shaping ───────────────────────────────────────────────────────────
@@ -167,7 +169,7 @@ cleanup() {
   say "cleanup"
   tc_cleanup
   if [ -n "$SID" ] && [ -n "$ADMIN_TOK" ]; then
-    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    HTTP_CODE=$(curl -ks -o /dev/null -w '%{http_code}' -X DELETE \
       "$API/v1/sessions/$SID" -H "Authorization: Bearer $ADMIN_TOK")
     if [ "$HTTP_CODE" = "202" ] || [ "$HTTP_CODE" = "200" ] || \
        [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "404" ]; then
@@ -181,7 +183,7 @@ trap cleanup EXIT
 
 # ── 0. Login ─────────────────────────────────────────────────────────────────
 say "0. login"
-ADMIN_TOK=$(curl -fs -X POST "$API/v1/auth/login" \
+ADMIN_TOK=$(curl -kfs -X POST "$API/v1/auth/login" \
   -H 'Content-Type: application/json' \
   -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASS\"}" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])") \
@@ -190,10 +192,10 @@ pass "admin token obtained"
 
 TEST_EMAIL="st-harness@quasar.local"
 TEST_PASS="STHarness123!"
-curl -fs -X POST "$API/v1/auth/register" -H 'Content-Type: application/json' \
+curl -kfs -X POST "$API/v1/auth/register" -H 'Content-Type: application/json' \
   -d "{\"email\":\"$TEST_EMAIL\",\"username\":\"stharness\",\"password\":\"$TEST_PASS\"}" \
   >/dev/null 2>&1 || true
-USER_TOK=$(curl -fs -X POST "$API/v1/auth/login" \
+USER_TOK=$(curl -kfs -X POST "$API/v1/auth/login" \
   -H 'Content-Type: application/json' \
   -d "{\"email\":\"$TEST_EMAIL\",\"password\":\"$TEST_PASS\"}" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])") \
@@ -202,7 +204,7 @@ pass "user token obtained"
 
 # ── 1. Resolve app ────────────────────────────────────────────────────────────
 say "1. resolve app"
-APPS_JSON=$(curl -fs "$API/v1/admin/apps" -H "Authorization: Bearer $ADMIN_TOK")
+APPS_JSON=$(curl -kfs "$API/v1/admin/apps" -H "Authorization: Bearer $ADMIN_TOK")
 
 # Build candidate list: explicit arg first, then "NV Stress: Colour Ripple",
 # then "Quasar Bench: Colour Ripple" (both may be seeded; use first enabled match).
@@ -243,7 +245,7 @@ pass "resolved: $RESOLVED_NAME ($APP_ID)"
 
 # ── 2. Launch session ─────────────────────────────────────────────────────────
 say "2. launch session"
-LAUNCH=$(curl -fs -X POST "$API/v1/sessions" \
+LAUNCH=$(curl -kfs -X POST "$API/v1/sessions" \
   -H "Authorization: Bearer $USER_TOK" \
   -H 'Content-Type: application/json' \
   -d "{\"app_id\":\"$APP_ID\"}") || die "launch failed"
@@ -258,7 +260,7 @@ say "3. wait for state=running"
 STATE=""
 for _ in $(seq 1 30); do
   sleep 2
-  STATE=$(curl -fs "$API/v1/sessions/$SID" \
+  STATE=$(curl -kfs "$API/v1/sessions/$SID" \
     -H "Authorization: Bearer $USER_TOK" \
     | python3 -c "import sys,json; print(json.load(sys.stdin)['session']['state'])")
   [ "$STATE" = "running" ] && break
@@ -266,7 +268,7 @@ for _ in $(seq 1 30); do
   echo "  state=$STATE..."
 done
 [ "$STATE" = "running" ] || die "session did not reach running (state=$STATE) — cannot proceed"
-HOST_ID=$(curl -fs "$API/v1/sessions/$SID" \
+HOST_ID=$(curl -kfs "$API/v1/sessions/$SID" \
   -H "Authorization: Bearer $USER_TOK" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['session']['host_id'])")
 pass "session running (host: $HOST_ID)"
@@ -358,7 +360,7 @@ sleep 3
 
 # ── 7. Pull diagnostic bundle ─────────────────────────────────────────────────
 say "7. pull diagnostic-bundle"
-BUNDLE_JSON=$(curl -fs \
+BUNDLE_JSON=$(curl -kfs \
   "$API/v1/admin/sessions/$SID/diagnostic-bundle?window=${BUNDLE_WINDOW_MINS}m" \
   -H "Authorization: Bearer $ADMIN_TOK" 2>/dev/null || echo '{}')
 
@@ -577,7 +579,7 @@ fi
 
 # ── 9. Collect agent metrics for the report ───────────────────────────────────
 say "9. collect agent metrics"
-AGENT_METRICS_JSON=$(curl -fs \
+AGENT_METRICS_JSON=$(curl -kfs \
   "$API/v1/admin/sessions/$SID/metrics?source=agent&limit=15" \
   -H "Authorization: Bearer $ADMIN_TOK" 2>/dev/null || echo '{"items":[]}')
 

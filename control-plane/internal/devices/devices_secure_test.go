@@ -250,7 +250,7 @@ func TestRevokeStopsSessionsOnDetachedContext(t *testing.T) {
 	authHandler := auth.NewHandler(authSvc)
 	authHandler.Register(mux)
 	NewHandler(NewStore(pool), stopper).Register(mux, authHandler.RequireAuth)
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewTLSServer(mux)
 	t.Cleanup(srv.Close)
 
 	mustRegister(t, authSvc, "stop@x.io", "stopuser", "quasar-fixture-pw-09")

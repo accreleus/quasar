@@ -14,6 +14,8 @@ export interface ShelfTiles {
   liveAppId: string | null;
   blockedIds: Set<string>;
   blockedByName: string | null;
+  /** sharedLibraryIds: tiles a sharing desktop holds (#1001). */
+  dimmedIds?: Set<string>;
   coverClass: (app: App) => string;
   onOpen: (app: App) => void;
   onPlay: (app: App) => void;
@@ -53,6 +55,7 @@ function Shelf({
             isRunning={tile.liveAppId === app.id}
             isBlocked={tile.blockedIds.has(app.id)}
             blockedByName={tile.blockedByName}
+            isDimmed={tile.dimmedIds?.has(app.id)}
             isOpen={false}
             isBusy={tile.busy}
             coverClass={tile.coverClass(app)}

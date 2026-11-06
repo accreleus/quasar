@@ -474,7 +474,7 @@ func TestAParkEndedBeforeAdoptionKeepsTheHoldOnTheHeldRuntime(t *testing.T) {
 	k := ""
 	must(t, f.pool.QueryRow(ctx, `SELECT id::text FROM sessions WHERE kind = 'parked'`).Scan(&k))
 	waitState(t, f, k, "failed")
-	if f.disp.stopReason(play) == "" {
+	if f.disp.waitStop(t, play) == "" {
 		t.Error("the held runtime was not released")
 	}
 	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})

@@ -109,7 +109,29 @@ struct Machine {
 
 impl Machine {
     fn install(env: BTreeMap<String, String>) -> Machine {
-        let engine = Arc::new(FakeEngine::new(host(env)));
+        Machine::install_on(host(env))
+    }
+
+    /// A machine whose control-plane image declares recipe revision `recipe`.
+    fn install_at(env: BTreeMap<String, String>, recipe: &str) -> Machine {
+        let mut state = host(env);
+        let schema = SCHEMA.to_string();
+        state.registry.insert(
+            CONTROL_IMAGE.into(),
+            image(
+                CONTROL_IMAGE,
+                0x1d50,
+                &[
+                    ("org.quasar.recipe", recipe),
+                    ("org.quasar.schema.version", &schema),
+                ],
+            ),
+        );
+        Machine::install_on(state)
+    }
+
+    fn install_on(state: FakeState) -> Machine {
+        let engine = Arc::new(FakeEngine::new(state));
         let dir = tempfile::tempdir().unwrap();
         let created = seed(&engine, dir.path(), SEED_ID).step();
         assert!(matches!(created, Outcome::Created { .. }), "{created:?}");
@@ -366,6 +388,54 @@ fn a_combined_hosts_public_host_and_ports_replace_the_control_plane_then_its_age
     assert!(m.named("quasar-node-agent.kept").is_none());
     assert_eq!(m.running_control_planes(), vec![names::CONTROL_PLANE]);
     m.never_a_migration("ports");
+}
+
+#[test]
+fn hsts_max_age_reaches_the_control_plane_of_a_revision_4_image_and_bad_values_are_refused() {
+    let m = Machine::install_at(combined_env(), "4");
+    let actor = m.actor();
+    assert_eq!(env(&m.control_plane(), "QUASAR_HSTS_MAX_AGE"), "");
+    let agent = m.agent().id;
+    for bad in ["-1", "1.5", "1y", "2147483648"] {
+        let refused = actor
+            .reconfigure(changes(&[("QUASAR_HSTS_MAX_AGE", bad)]))
+            .expect_err(bad);
+        assert_eq!(refused.reason, Reason::Invalid, "{bad}");
+        assert!(
+            refused.message.contains("QUASAR_HSTS_MAX_AGE"),
+            "{bad}: {}",
+            refused.message
+        );
+    }
+    assert_eq!(
+        env(&m.control_plane(), "QUASAR_HSTS_MAX_AGE"),
+        "",
+        "nothing changed"
+    );
+    let (_, result) = run(&actor, changes(&[("QUASAR_HSTS_MAX_AGE", "86400")]));
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    assert_eq!(env(&m.control_plane(), "QUASAR_HSTS_MAX_AGE"), "86400");
+    assert_eq!(m.inputs()["control"]["hsts_max_age"], "86400");
+    assert_eq!(m.agent().id, agent, "the agent renders none of it");
+    let (_, result) = run(&actor, changes(&[("QUASAR_HSTS_MAX_AGE", "")]));
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    assert_eq!(env(&m.control_plane(), "QUASAR_HSTS_MAX_AGE"), "");
+}
+
+/// A revision-2 image renders no `QUASAR_HSTS_MAX_AGE`: setting it would look applied and do nothing.
+#[test]
+fn hsts_max_age_is_refused_on_a_control_plane_image_older_than_revision_4() {
+    let m = Machine::install(combined_env());
+    let refused = m
+        .actor()
+        .reconfigure(changes(&[("QUASAR_HSTS_MAX_AGE", "86400")]))
+        .expect_err("revision 2");
+    assert_eq!(refused.reason, Reason::Invalid);
+    assert!(
+        refused.message.contains("revision 4"),
+        "{}",
+        refused.message
+    );
 }
 
 #[test]

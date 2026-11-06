@@ -509,6 +509,8 @@ function SessionPageBody() {
 
   // #748: a stall can fire a beat before the end-reason read lands. Hold the recovery banner
   // for a short grace so a session already ending (or ended by this page) never paints it.
+  // `failed` with the input channel gone skips the grace (#812): the page has no Exit then, and the
+  // banner's "Back to library" is the only way out. With the channel open the runtime may still re-seat.
   const recoveryActive = recovery != null && RECOVERY_PHASES.includes(recovery.phase);
   const [recoveryGraceDone, setRecoveryGraceDone] = useState(false);
   useEffect(() => {
@@ -517,7 +519,8 @@ function SessionPageBody() {
     const t = setTimeout(() => setRecoveryGraceDone(true), RECOVERY_BANNER_GRACE_MS);
     return () => clearTimeout(t);
   }, [recoveryActive]);
-  const recoveryShown = recoveryActive && recoveryGraceDone && !gameExited && !stopping;
+  const recoveryShown =
+    recoveryActive && (recoveryGraceDone || (recovery?.phase === "failed" && !channelOpen)) && !gameExited && !stopping;
 
   // Release what leaving the page releases, without destroying the transport:
   // a destroy would say `bye` to a session another tab now owns.
@@ -965,6 +968,11 @@ function SessionPageBody() {
   // Poll is authoritative; the tier string is only the pre-first-poll seed.
   const streamSize = polledStreamSize ?? parseTierSize(state?.tier);
 
+  // The size the host moves the cursor in (Match cursor, input/mouseScale.ts): the render size
+  // when one is set, else the launch size. Not externalSize: the lever and ABR move the stream, not
+  // the compositor. A console session is never streamed, so it never reaches this video element.
+  const compositorSize = renderSize ?? streamSize;
+
   // Server owns this list; the client-side 16:9 ladder is a stand-in until the
   // first poll answers (or for a control plane older than the amendment).
   const effectiveRungs =
@@ -1012,6 +1020,8 @@ function SessionPageBody() {
           ref={videoRef}
           className="session-video"
           data-scaling-mode={scalingMode}
+          data-compositor-w={compositorSize?.w}
+          data-compositor-h={compositorSize?.h}
           muted
           playsInline
           autoPlay

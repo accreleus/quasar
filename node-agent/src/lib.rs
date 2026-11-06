@@ -21,7 +21,7 @@ pub mod crash_report;
 pub mod cuda_runtime;
 pub mod ddc;
 /// Diagnostic registration (#256): what a host withholds while its startup cleanup is
-/// unresolved, and when it resumes. See `CONTEXT.md` "Diagnostic registration".
+/// unresolved, and when it resumes. See `GLOSSARY.md` "Diagnostic registration".
 pub mod diagnostic;
 mod encoder_compatibility;
 pub mod enrollment;
@@ -43,9 +43,10 @@ pub mod jobs;
 pub mod logging;
 pub mod memstat;
 pub mod messages;
-pub mod nvidia_volume;
 /// Shared owner-marked runtime-dir entry mechanics (udev export, media probe
 /// dir): see the module doc.
+mod nofollow_dir;
+pub mod nvidia_volume;
 mod owned_entry;
 pub mod policy;
 pub mod policy_catalog;

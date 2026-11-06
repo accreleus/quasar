@@ -41,7 +41,8 @@ set -a; . "$ROOT/deploy/.env"; set +a
 # QUASAR_TLS=auto (the default) 308-redirects every plain-HTTP path except /health
 # and the agent routes, and curl without -L follows no redirect — so the default
 # must be the HTTPS listener. That cert is self-signed, hence -k on every curl
-# below (harmless when QUASAR_TLS=off drops back to plain HTTP).
+# below (harmless when QUASAR_TLS=off drops back to plain HTTP, where only a
+# QUASAR_ADMIN_TOKEN works: sign-in is refused over plain HTTP, #604).
 if [ "${QUASAR_TLS:-auto}" = "off" ]; then
   API="${API:-http://localhost:${CONTROL_PORT:-8080}}"
 else
@@ -62,6 +63,9 @@ die()    { echo "FATAL: $*" >&2; exit 1; }
 # BOOTSTRAP_ADMIN login — stacks running dev-agent auth carry no such creds.
 say "login as admin"
 ADMIN_TOK="${QUASAR_ADMIN_TOKEN:-}"
+if [ -z "$ADMIN_TOK" ] && [ "${API%%://*}" = http ]; then
+  die "sign-in is refused over plain HTTP ($API, #604): pass QUASAR_ADMIN_TOKEN (scripts/dx/admin_token.sh), or set API to an https:// address"
+fi
 [ -n "$ADMIN_TOK" ] || ADMIN_TOK=$(curl -fsk -X POST "$API/v1/auth/login" \
   -H 'Content-Type: application/json' \
   -d "{\"email\":\"${BOOTSTRAP_ADMIN_EMAIL:?}\",\"password\":\"${BOOTSTRAP_ADMIN_PASSWORD:?}\"}" \

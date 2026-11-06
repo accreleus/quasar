@@ -314,10 +314,6 @@ func (d *Dispatcher) materializeTarget(ctx context.Context, j Job, hostID string
 		return
 	}
 	if realign {
-		// A job that has never finished a run has nothing to measure from; the pending run keeps its date.
-		if !hadRun {
-			return
-		}
 		if err := d.store.Reschedule(ctx, open.ID, when); err != nil {
 			d.log.Warn("job: could not realign pending run", "job_id", j.ID, "run_id", open.ID, "err", err)
 		}

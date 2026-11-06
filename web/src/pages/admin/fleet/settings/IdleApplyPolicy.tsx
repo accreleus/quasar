@@ -2,10 +2,17 @@ import { useState } from "react";
 import * as adminApi from "../../../../api/admin";
 import { ApiError } from "../../../../api/client";
 import { Button } from "../../../../components/Button";
+import { Modal } from "../../../../components/Modal";
 import { ResourceStates } from "../../../../components/ResourceStates";
 import { useAdminAction } from "../../../../lib/resource/action";
 import { useResource } from "../../../../lib/resource/react";
 import { KnobPanel } from "./KnobPanel";
+
+const WAITING_FOR: Record<adminApi.RecoveryRelease["waiting_for"] & string, string> = {
+  agent_connection: "It is sent when the host's agent reconnects and its journal is reconciled.",
+  agent_upgrade: "This host's node agent cannot take it: update the agent, and it is sent when the agent reconnects.",
+  agent_report: "Waiting for the agent to confirm.",
+};
 
 type IdleData = { policy: adminApi.HostPolicyView | null; attempt: adminApi.IdleApplyAttempt | null };
 type Reviewed = {
@@ -125,10 +132,32 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
       onFailure: (error) => setActionError(error instanceof ApiError ? error.message : "Could not cancel idle apply."),
     },
   );
+  // The attempt the operator read the warning for, never whatever a poll swapped in.
+  const [releasing, setReleasing] = useState<string | null>(null);
+  const [acknowledged, setAcknowledged] = useState(false);
+  const release = useAdminAction<[string, string], adminApi.IdleApplyAttempt>(
+    (id, owner) => resource.mutate(
+      ({ token }) => adminApi.releaseHostRecoveryHold(token, owner, id),
+      (data, result) => ({ ...data, attempt: result }),
+    ),
+    {
+      success: (result) => result.phase === "released" ? "Recovery hold released."
+        : "Release requested. The host stays held until its agent confirms.",
+      failure: "Could not request the release.",
+      onSuccess: () => { setActionError(null); setReleasing(null); void resource.refresh(); },
+      onFailure: (error) => {
+        setReleasing(null);
+        setActionError(error instanceof ApiError ? error.message : "Could not request the release.");
+      },
+    },
+  );
   if (!hostId || (resource.data && (!group || group.scope !== "restart"))) return null;
-  const busy = approve.pending !== null || cancel.pending !== null;
+  const busy = approve.pending !== null || cancel.pending !== null || release.pending !== null;
+  const pendingRelease = attempt?.phase === "uncertain" ? attempt.recovery_release ?? null : null;
+  const recoveryHeld = attempt?.phase === "uncertain" && attempt.admission_restricted;
 
-  return <KnobPanel title="Idle apply" hint="Approve a reviewed host configuration for an idle window. Saving settings alone does not apply them.">
+  // The dialog sits outside the card: a .card's backdrop-filter traps position: fixed.
+  return <><KnobPanel title="Idle apply" hint="Approve a reviewed host configuration for an idle window. Saving settings alone does not apply them.">
     <div className="cset">
       <ResourceStates loading={resource.loading} error={resource.errorMessage} loadingLabel="Loading idle apply status…" />
       {group && <>
@@ -137,7 +166,9 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
           <p className="hint">Saved configuration: {group.status.replaceAll("_", " ")}. {attempt ? `Approval: ${attempt.phase.replaceAll("_", " ")}.` : "No approval is active."}</p>
           {attempt && <p className="hint">Execution {attempt.started ? "started" : "has not started"}; admission {attempt.admission_restricted ? "protected" : "open"}.</p>}
           {attempt?.phase === "recovered" && <p className="form-error" role="alert">The requested configuration failed. The agent restored its last verified configuration; review the failure before retrying.</p>}
-          {attempt?.phase === "uncertain" && <p className="form-error" role="alert">Recovery could not be verified. Admission remains protected until an operator repairs this host.</p>}
+          {recoveryHeld && <p className="form-error" role="alert">Recovery could not be verified. Admission remains protected until an operator repairs this host.</p>}
+          {pendingRelease && <p className="hint">Release requested. {WAITING_FOR[pendingRelease.waiting_for ?? "agent_report"]}</p>}
+          {attempt?.phase === "released" && <p className="hint">An administrator released the recovery hold. This host's configuration was never verified.</p>}
           {attempt?.remedy && <p className="hint">{attempt.remedy}</p>}
           {preview?.remedy && !waiting && <p className="hint">{preview.remedy}</p>}
           {!preview && group.remedy && !waiting && <p className="hint">{group.remedy}</p>}
@@ -147,6 +178,7 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
         </div>
         <div className="acts">
           <Button variant="ghost" disabled={busy} onClick={() => void resource.refresh()}>Refresh status</Button>
+          {recoveryHeld && !pendingRelease && attempt && <Button variant="danger" disabled={busy} onClick={() => { setAcknowledged(false); setReleasing(attempt.attempt_id); }}>Release recovery hold</Button>}
           {waiting ? <Button variant="ghost" disabled={busy || attempt?.phase === "cancel_pending"} onClick={() => { if (attempt) void cancel.run(attempt.attempt_id, hostId); }}>
             {attempt?.phase === "cancel_pending" ? "Cancellation pending" : "Cancel approval"}
           </Button> : <>
@@ -160,5 +192,26 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
         {displayed && reviewDetails(displayed)}
       </>}
     </div>
-  </KnobPanel>;
+  </KnobPanel>
+  {releasing && <Modal
+    open
+    onClose={() => setReleasing(null)}
+    title="Release the recovery hold?"
+    footer={<>
+      <Button variant="ghost" onClick={() => setReleasing(null)}>Cancel</Button>
+      <Button variant="danger" disabled={!acknowledged || busy} onClick={() => void release.run(releasing, hostId)}>Release hold</Button>
+    </>}
+  >
+    <div className="note warn">
+      <strong>This host's state is unverified.</strong> The agent restarted to apply a configuration and could not
+      prove which configuration it is running now. Quasar tells the host's agent to set this attempt aside. Once the
+      agent confirms, the host takes new sessions again, unless another hold remains.
+    </div>
+    <p>Nothing on the host is repaired. Check its readiness and media probe first, then review and approve the configuration again.</p>
+    <label className="rowflex">
+      <input type="checkbox" checked={acknowledged} onChange={(e) => setAcknowledged(e.target.checked)} />
+      <span>I understand this host's configuration is unverified.</span>
+    </label>
+  </Modal>}
+  </>;
 }

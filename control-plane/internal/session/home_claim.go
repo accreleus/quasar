@@ -19,7 +19,7 @@ func homeClaimOwner(ctx context.Context, tx pgx.Tx, p CreateParams, sameSession 
 	if err != nil || holder == "" || (len(sameSession) > 0 && holder == sameSession[0]) {
 		return owner, err
 	}
-	return "", homeHoldRefusal(ctx, tx, holder, owner)
+	return "", homeHoldRefusal(ctx, tx, holder, owner, p.homeAppID())
 }
 
 // homeClaimLocation is homeClaimOwner without the pending-home hold: the
@@ -109,24 +109,25 @@ type homeHoldSettlingError struct{ holder string }
 func (e *homeHoldSettlingError) Error() string { return ErrHomeConflict.Error() }
 func (e *homeHoldSettlingError) Unwrap() error { return ErrHomeConflict }
 
-func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) error {
+func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost, claimApp string) error {
 	var state State
 	var host *string
 	var connected, recent bool
 	var kind string
-	var released bool
+	var released, shares bool
 	// A hold on a runtime that a row adopts answers as that row while it lives.
 	// Once it ended unadopted the runtime is being released, timed from its end.
 	err := tx.QueryRow(ctx, `SELECT s.id::text, s.state, s.host_id::text,
 		COALESCE(h.status IN ('online','draining'), false),
 		COALESCE(a.ended_at, k.ended_at, k.updated_at) > now() - ($2::int * interval '1 second'), s.kind,
-		COALESCE(k.stop_reason = $3, false) OR a.id IS NOT NULL
+		COALESCE(k.stop_reason = $3, false) OR a.id IS NOT NULL,
+		COALESCE(s.shared_home_app_id = $4::uuid, false)
 		FROM sessions k
 		LEFT JOIN sessions a ON a.adopt_session_id = k.id
 		JOIN sessions s ON s.id = CASE WHEN a.state NOT IN ('stopped','failed') THEN a.id ELSE k.id END
 		LEFT JOIN hosts h ON h.id=s.host_id
-		WHERE k.id=$1::uuid`, holder, int(homeHoldSettleWindow/time.Second), stopReasonRuntimeReleased).
-		Scan(&holder, &state, &host, &connected, &recent, &kind, &released)
+		WHERE k.id=$1::uuid`, holder, int(homeHoldSettleWindow/time.Second), stopReasonRuntimeReleased, claimApp).
+		Scan(&holder, &state, &host, &connected, &recent, &kind, &released, &shares)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrHomeConflict
 	}
@@ -138,7 +139,7 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) e
 		if kind == KindParked { // never named (control-api.md §Warm Steam)
 			return &HomeInUseError{Stopping: state == StateStopping, parkedID: holder}
 		}
-		return &HomeInUseError{SessionID: holder, Stopping: state == StateStopping}
+		return &HomeInUseError{SessionID: holder, Stopping: state == StateStopping, holderShares: shares}
 	case host != nil && *host == claimHost && connected && recent && released:
 		// A released held runtime: Steam is shutting down (control-api.md §Warm
 		// Steam, "Park on exit"), so the launch path answers 503, never a conflict.
@@ -151,13 +152,14 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost string) e
 }
 
 // awaitHomeHoldRelease polls, outside any transaction, until holder no longer
-// holds the claim (true) or until passes (false).
+// holds any of the user's claims (true) or until passes (false). A sharing
+// session holds two, and one qualified terminal clears both together.
 func (s *Store) awaitHomeHoldRelease(ctx context.Context, p CreateParams, holder string, until time.Time) bool {
 	for {
 		var held bool
 		err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM managed_home_claims
-			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid AND pending_home_session_id=$3::uuid)`,
-			p.UserID, p.homeAppID(), holder).Scan(&held)
+			WHERE user_id=$1::uuid AND pending_home_session_id=$2::uuid)`,
+			p.UserID, holder).Scan(&held)
 		if err != nil {
 			return false
 		}
@@ -214,7 +216,7 @@ func claimSelectedHome(ctx context.Context, tx pgx.Tx, p CreateParams, hostID st
 		return ErrHomeConflict
 	}
 	if pendingSession != nil && (len(sameSession) == 0 || *pendingSession != sameSession[0]) {
-		return homeHoldRefusal(ctx, tx, *pendingSession, hostID)
+		return homeHoldRefusal(ctx, tx, *pendingSession, hostID, p.homeAppID())
 	}
 	// Lock every recorded location after the candidate was selected. Tombstone
 	// and GC writers then serialize with this decision; a stale unlocked hint
@@ -252,6 +254,140 @@ func claimSelectedHome(ctx context.Context, tx pgx.Tx, p CreateParams, hostID st
 		return ErrHomeConflict
 	}
 	return nil
+}
+
+// Notices for a sharing launch that runs without its shared home
+// (control-api.md §Storage, steam_library_not_shared).
+const (
+	noticeSharedOtherHost   = "Your Steam library is on another host"
+	noticeSharedUnavailable = "Your Steam library could not be shared with this desktop"
+)
+
+// resolveSharedHome runs under the user lock, after the launch's own home has
+// set any pin. The shared home must be on the launch's host: a launch with no
+// host yet is pinned to it, and one that cannot get there drops the shared
+// home and returns the notice. A shared home with no location yet is claimed
+// on the placed host by claimSharedHome.
+func resolveSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams) (string, error) {
+	owner, _, err := homeClaimLocation(ctx, tx, p.sharedParams())
+	if errors.Is(err, ErrHomeConflict) {
+		p.SharedHomeAppID = ""
+		return noticeSharedUnavailable, nil
+	}
+	if err != nil || owner == "" || p.PinHostID == owner {
+		return "", err
+	}
+	if p.PinHostID == "" {
+		selected, err := placementIncludes(ctx, tx, p.homeAppID(), owner)
+		if err != nil {
+			return "", err
+		}
+		if selected {
+			p.PinHostID, p.homePinned = owner, true
+			return "", nil
+		}
+	}
+	p.SharedHomeAppID = ""
+	return noticeSharedOtherHost, nil
+}
+
+// claimSharedHome claims the shared home on hostID after the launch's own
+// claim, in the same transaction and lock order (own claim, own homes, shared
+// claim, shared homes; schema.md 0090, amendment 53). A hold still in use or settling refuses the launch as
+// it would a launch of that home; a home needing operator review is dropped,
+// with the notice, inside a savepoint so nothing it wrote survives.
+func claimSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams, hostID string) (string, error) {
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("begin shared home claim: %w", err)
+	}
+	defer sp.Rollback(ctx) //nolint:errcheck
+	// A first Steam claim goes only where Steam itself may run, or the next
+	// Steam launch meets a home its placement excludes: home_conflict.
+	owner, _, err := homeClaimLocation(ctx, sp, p.sharedParams())
+	if err == nil && owner == "" {
+		selected, err := placementSelectedForHost(ctx, sp, p.SharedHomeAppID, hostID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("check shared home placement: %w", err)
+		}
+		if !selected {
+			p.SharedHomeAppID = ""
+			return noticeSharedUnavailable, nil
+		}
+	}
+	err = claimSelectedHome(ctx, sp, p.sharedParams(), hostID)
+	var settling *homeHoldSettlingError
+	var inUse *HomeInUseError
+	switch {
+	case errors.As(err, &settling):
+		return "", err
+	case errors.As(err, &inUse):
+		inUse.forShared = true
+		return "", inUse
+	case errors.Is(err, ErrHomeConflict):
+		if err := sp.Rollback(ctx); err != nil {
+			return "", fmt.Errorf("roll back shared home claim: %w", err)
+		}
+		p.SharedHomeAppID = ""
+		return noticeSharedUnavailable, nil
+	case err != nil:
+		return "", err
+	}
+	if err := sp.Commit(ctx); err != nil {
+		return "", fmt.Errorf("release shared home claim savepoint: %w", err)
+	}
+	return "", nil
+}
+
+// releaseUnusedSharedClaim deletes the shared-home claim of a session that
+// failed before the agent when nothing stands behind it: no home row in the
+// family, no hold and no live session using it. Kept, such a claim would pin
+// the user's Steam to this host with no data there. Under the user lock, as
+// placement takes claims.
+func (s *Store) releaseUnusedSharedClaim(ctx context.Context, sessionID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin shared claim release: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var userID string
+	var shared *string
+	err = tx.QueryRow(ctx, `SELECT user_id::text, shared_home_app_id::text FROM sessions
+		WHERE id=$1::uuid AND state IN ('stopped','failed')`, sessionID).Scan(&userID, &shared)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && shared == nil) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read failed session: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2::text))`, lockNamespaceUser, userID); err != nil {
+		return fmt.Errorf("lock shared claim user: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM managed_home_claims c
+		WHERE c.user_id=$1::uuid AND c.canonical_app_id=$2::uuid
+		  AND c.state='reserved' AND c.pending_home_token IS NULL
+		  AND NOT EXISTS (SELECT 1 FROM user_homes uh JOIN apps a ON a.id=uh.app_id
+		        WHERE uh.user_id=c.user_id AND COALESCE(a.parent_app_id,a.id)=c.canonical_app_id)
+		  AND NOT EXISTS (SELECT 1 FROM sessions s JOIN apps a ON a.id=s.app_id
+		        WHERE s.user_id=c.user_id AND s.state NOT IN ('stopped','failed')
+		          AND (COALESCE(a.parent_app_id,a.id)=c.canonical_app_id OR s.shared_home_app_id=c.canonical_app_id))`,
+		userID, *shared); err != nil {
+		return fmt.Errorf("release unused shared claim: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// placementIncludes is the unlocked placement read: whether appID's placement
+// selects hostID. The reservation's placementSelectedForHost decides the race.
+func placementIncludes(ctx context.Context, tx pgx.Tx, appID, hostID string) (bool, error) {
+	var selected bool
+	if err := tx.QueryRow(ctx, `SELECT mode='all_eligible' OR EXISTS (
+		SELECT 1 FROM app_placement_hosts
+		WHERE app_id=ap.app_id AND host_id=$2::uuid)
+		FROM app_placement ap WHERE app_id=$1::uuid`, appID, hostID).Scan(&selected); err != nil {
+		return false, fmt.Errorf("check home owner placement: %w", err)
+	}
+	return selected, nil
 }
 
 func hasHomeHost(hosts map[string]struct{}, id string) bool {

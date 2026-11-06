@@ -56,10 +56,11 @@ services:
       DATABASE_URL: >-
         postgres://${POSTGRES_USER:-quasar}:${POSTGRES_PASSWORD:-quasar-local-dev}@postgres:5432/quasar?sslmode=disable
       LISTEN_ADDR: ":8080"
-      # TLS defaults OFF here (the production stack defaults to auto/self-signed).
-      # http://localhost is already a secure browser context, so Keyboard Lock and
-      # the Gamepad API work without a cert warning on every fresh worktree.
-      QUASAR_TLS: ${QUASAR_TLS:-off}
+      # TLS is on (self-signed) because sign-in, registration and password change
+      # are refused over plain HTTP (#604): sign in on the DX_CP_TLS_PORT https://
+      # URL `make up` prints. The redirect stays off so the DX verbs' bearer calls
+      # keep using the HTTP port.
+      QUASAR_TLS: ${QUASAR_TLS:-auto}
       QUASAR_HTTP_REDIRECT: ${QUASAR_HTTP_REDIRECT:-off}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       AUTH_TOKEN_TTL: ${AUTH_TOKEN_TTL:-24h}

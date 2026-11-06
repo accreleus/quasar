@@ -471,6 +471,7 @@ fn postgres_starts_healthy_with_a_root_only_password_file() {
             unknown: Default::default(),
             machine_role: ControlRole::ControlOnly,
             trusted_proxies: None,
+            hsts_max_age: None,
             http_port: 8080,
             tls_port: 8443,
             public_host: None,

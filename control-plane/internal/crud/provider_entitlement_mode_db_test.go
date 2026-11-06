@@ -630,7 +630,7 @@ func TestFailedAllowListWriteKeepsTheStoredMode(t *testing.T) {
 	missingProfile := "00000000-0000-0000-0000-000000000490"
 	s := &store{pool: pool}
 	if _, err := s.createApp(ctx, "Steam", "", nil, &kind, nil, nil, nil, &provider,
-		nil, nil, nil, nil, nil, nil, nil, false, "", nil, "", nil, "", []string{missingProfile}, ""); err == nil {
+		nil, nil, nil, nil, nil, nil, nil, false, "", false, nil, "", nil, "", []string{missingProfile}, ""); err == nil {
 		t.Fatal("createApp with a launch profile that does not exist: want an error")
 	}
 	if n := countSteamApps(t, ctx, pool); n != 0 {

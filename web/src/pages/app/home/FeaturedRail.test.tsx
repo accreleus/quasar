@@ -151,6 +151,20 @@ describe("FeaturedRail", () => {
     expect(screen.getByRole("button", { name: "Play Hades" })).toBeDisabled();
   });
 
+  it("marks a card a sharing desktop holds In use and dims it, but never the live one (#1001)", () => {
+    renderRail({ blockedIds: new Set(["a1", "a2"]), dimmedIds: new Set(["a1", "a2"]) });
+    const cards = Array.from(document.querySelectorAll<HTMLElement>(".home-feat"));
+    const hades = cards.find((c) => c.textContent?.includes("Hades"))!;
+    const portal = cards.find((c) => c.textContent?.includes("Portal 2"))!;
+    expect(hades.getAttribute("data-dimmed")).toBe("true");
+    expect(hades.querySelector(".blocked .chip")?.getAttribute("title")).toBe(
+      "Your Steam library is open in the desktop. Close the desktop first.",
+    );
+    expect(screen.getByRole("button", { name: "Play Hades" })).toBeDisabled();
+    expect(portal.hasAttribute("data-dimmed")).toBe(false);
+    expect(portal.querySelector(".blocked")).toBeNull();
+  });
+
   it("hides both chevrons when there is nothing to scroll to", () => {
     renderRail();
     expect(screen.queryByRole("button", { name: /scroll featured/i })).toBeNull();

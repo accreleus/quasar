@@ -33,6 +33,7 @@ const ACTION_VERBS: Record<string, string> = {
   "console.config.update": "updated console settings on",
   "host.delete": "forgot",
   "host.drain": "drained",
+  "host.recovery.release": "released the recovery hold on",
   "host.restart": "restarted the agent on",
   "host.settings.update": "updated settings on",
   "host.uncordon": "resumed scheduling on",

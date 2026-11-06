@@ -152,6 +152,8 @@ function StreamSection() {
   const hadFocus = useRef(false);
   const prefs = res.data;
   const recommended = `Recommended (${prefs?.recommendedName ?? "for this device"})`;
+  // What the empty choice launches (#814): the admin's global default when one is set, else the recommendation.
+  const emptyLabel = prefs?.adminDefaultName ? `Admin default (${prefs.adminDefaultName})` : recommended;
   // With overrides off the stored default is not what a launch starts (#721): say the admin's default.
   const current =
     prefs?.defaultId && prefs.overridesAllowed
@@ -170,7 +172,8 @@ function StreamSection() {
         (d, r) => ({ ...d, defaultId: r.default_profile_id ?? "" }),
       );
       const name = prefs?.profiles.find((p) => p.id === id)?.name;
-      setStatus({ ok: true, text: name ? `Saved. Your next launch asks for ${name}.` : "Saved. Launches use the recommendation again." });
+      const again = prefs?.adminDefaultName ? `the admin's default (${prefs.adminDefaultName})` : "the recommendation";
+      setStatus({ ok: true, text: name ? `Saved. Your next launch asks for ${name}.` : `Saved. Launches use ${again} again.` });
     } catch (e) {
       setStatus({ ok: false, text: e instanceof ApiError ? e.message : "Could not save the stream default." });
     } finally {
@@ -193,7 +196,7 @@ function StreamSection() {
           disabled={!prefs || !prefs.overridesAllowed || picked !== null}
           onChange={(e) => void save(e.target.value)}
         >
-          <option value="">{recommended}</option>
+          <option value="">{emptyLabel}</option>
           {(prefs?.profiles ?? []).map((p) => (
             <option key={p.id} value={p.id}>{p.name}</option>
           ))}

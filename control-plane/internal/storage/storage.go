@@ -821,7 +821,8 @@ func (m *Manager) TombstoneHome(ctx context.Context, id string) (TombstonedHome,
 // deletes the backing store), so the join must go through apps with
 // COALESCE(parent_app_id, id): a derived-tile session has no home row of its
 // own, and joining on s.app_id once let an admin tombstone a live Steam
-// library mid-write. Any family member's session counts — they all mount it.
+// library mid-write. Any family member's session counts — they all mount it —
+// and so does a session mounting it as a shared home (shared_home_app_id).
 func (m *Manager) hasLiveSessionForHomeTx(ctx context.Context, tx pgx.Tx, homeID string) (bool, error) {
 	var n int
 	err := tx.QueryRow(ctx, `
@@ -829,7 +830,8 @@ func (m *Manager) hasLiveSessionForHomeTx(ctx context.Context, tx pgx.Tx, homeID
 		FROM sessions s
 		JOIN apps a ON a.id = s.app_id
 		JOIN user_homes uh ON uh.user_id = s.user_id
-		                  AND uh.app_id  = COALESCE(a.parent_app_id, a.id)
+		                  AND (uh.app_id = COALESCE(a.parent_app_id, a.id)
+		                       OR uh.app_id = s.shared_home_app_id)
 		WHERE uh.id::text = $1
 		  AND s.state NOT IN ('stopped','failed')
 	`, homeID).Scan(&n)

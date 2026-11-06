@@ -3,7 +3,7 @@
 #
 #   gh api .../pulls/N/files --jq '.[].filename' | scripts/verify/ci-changed-areas.sh
 #
-# Reads changed paths on stdin and prints `go=`, `web=`, `rust=` and `site=` as
+# Reads changed paths on stdin and prints `go=`, `web=`, `rust=`, `site=` and `deploy=` as
 # true/false. ci.yml runs a test job on a pull request into develop only when its area
 # says true. A push to develop runs every job regardless, so a miss here is caught on
 # develop, never shipped.
@@ -19,6 +19,7 @@
 #   rust  node-agent/**  testdata/**  deploy/**  docs/session-trace/**  docs/configuration.md
 #         control-plane/internal/buildinfo/recipe.go  (rust + the engine suite)
 #   site  site/**  protocol  testdata/**  deploy/**
+#   deploy deploy/**  scripts/dev/test-compose-overlays.sh  (the compose render test, #967)
 #   all   .github/**  scripts/verify/ci-*  .gitmodules
 #   none  everything else: docs, CHANGELOG, scripts outside CI, design files
 #
@@ -27,11 +28,13 @@ set -euo pipefail
 
 [ $# -eq 0 ] || { echo "usage: ci-changed-areas.sh < changed-paths" >&2; exit 2; }
 
-go=false web=false rust=false site=false
+go=false web=false rust=false site=false deploy=false
 while IFS= read -r p; do
   case "$p" in
-    .github/*|scripts/verify/ci-*|.gitmodules) go=true web=true rust=true site=true ;;
-    testdata/*|deploy/*) go=true web=true rust=true site=true ;;
+    .github/*|scripts/verify/ci-*|.gitmodules) go=true web=true rust=true site=true deploy=true ;;
+    deploy/*) go=true web=true rust=true site=true deploy=true ;;
+    testdata/*) go=true web=true rust=true site=true ;;
+    scripts/dev/test-compose-overlays.sh) deploy=true ;;
     scripts/verify/go-test-parallel.sh) go=true ;;
     docs/session-trace/*) go=true web=true rust=true ;;
     docs/configuration.md) web=true rust=true ;;
@@ -46,4 +49,4 @@ while IFS= read -r p; do
     site/*) site=true ;;
   esac
 done
-printf 'go=%s\nweb=%s\nrust=%s\nsite=%s\n' "$go" "$web" "$rust" "$site"
+printf 'go=%s\nweb=%s\nrust=%s\nsite=%s\ndeploy=%s\n' "$go" "$web" "$rust" "$site" "$deploy"

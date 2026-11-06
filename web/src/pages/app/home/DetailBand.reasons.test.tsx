@@ -186,6 +186,24 @@ describe("a risky selection says what makes it risky", () => {
     expect(document.querySelector(".lib-why")?.textContent).toMatch(/Adjust/);
   });
 
+  it("says a chain missing the host's codec starts a step lower (#870)", async () => {
+    // After #862 the launch steps down past a top rung the host cannot encode,
+    // so the note must not read as the refusal the hard wording gives.
+    const wire = { code: "host_encoder_not_supported", message: "no host can encode this codec" };
+    mocked.getProfiles.mockResolvedValue({
+      recommended_id: "1080p60",
+      confidence: "low",
+      notes: [],
+      profiles: [
+        launchProfile("1080p60", [rung("1080p60-av1", "av1", 1920, 1080, 60, 1, 8000, "risky", [wire])], "risky", [wire]),
+      ],
+    } as never);
+    await openBand();
+    const why = document.querySelector(".lib-why")?.textContent ?? "";
+    expect(why).toMatch(/starts one step lower/i);
+    expect(why).not.toMatch(/no host that can encode/i);
+  });
+
   it("labels the risky row in the cascade panel with the same reason", async () => {
     await openBand();
     fireEvent.click(screen.getByRole("button", { name: /Adjust/ }));

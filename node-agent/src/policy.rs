@@ -855,6 +855,62 @@ impl PolicyAgent {
         Ok(BootOutcome::Recovery(id.into()))
     }
 
+    /// The administrator's release of an `uncertain` restart record (agent-api.md
+    /// `config_policy_release`). The record moves to the final phase `released` and
+    /// is written before it is reported; a released record is idempotent. Nothing
+    /// is activated: the running configuration stays what it was, still unverified.
+    pub fn release(
+        &mut self,
+        attempt_id: &str,
+        boot: &str,
+        connection: &str,
+    ) -> Result<AgentMsg, String> {
+        if boot != self.boot_incarnation || connection != self.connection_incarnation {
+            return Err("stale_release_request".into());
+        }
+        let phase = match self.journal.records.get(attempt_id) {
+            Some(record) if record.scope == "restart" => record.phase.clone(),
+            _ => return Err("release_refused".into()),
+        };
+        match phase.as_str() {
+            "released" => {}
+            "uncertain" => {
+                let record = self.journal.records.get_mut(attempt_id).unwrap();
+                record.phase = "released".into();
+                record.sequence += 1;
+                if self.persist().is_err() {
+                    // Not reported. Either answer is safe: if the write held, the next
+                    // boot reports `released` at a higher sequence than `uncertain`.
+                    let record = self.journal.records.get_mut(attempt_id).unwrap();
+                    record.phase = "uncertain".into();
+                    record.sequence -= 1;
+                    return Err("journal_write_failed".into());
+                }
+            }
+            _ => return Err("release_refused".into()),
+        }
+        let record = &self.journal.records[attempt_id];
+        Ok(AgentMsg::ConfigPolicyState {
+            attempt_id: attempt_id.to_string(),
+            host_id: if record.host_id.is_empty() {
+                self.host_id.clone()
+            } else {
+                record.host_id.clone()
+            },
+            group: record.group.clone(),
+            revision: record.revision.clone(),
+            content_sha256: record.digest.clone(),
+            scope: record.scope.clone(),
+            grant_boot_incarnation: record.boot_incarnation.clone(),
+            grant_connection_incarnation: record.connection_incarnation.clone(),
+            journal_sequence: record.sequence.to_string(),
+            phase: record.phase.clone(),
+            active_scope: None,
+            evidence: None,
+            error: record.error.clone(),
+        })
+    }
+
     fn persist(&self) -> std::io::Result<()> {
         persist_journal(&self.path, &self.journal)?;
         #[cfg(test)]
@@ -941,6 +997,7 @@ impl PolicyAgent {
                     "recovery_verifying" => "recovery_verifying",
                     "recovery_awaiting_startup" => "recovery_awaiting_startup",
                     "recovered" => "recovered",
+                    "released" => "released",
                     _ => "uncertain",
                 },
                 record.sequence,
@@ -1602,6 +1659,42 @@ pub(crate) mod test_support {
             settings,
             resolved_settings,
         }
+    }
+
+    /// An agent on `dir` whose journal holds one `uncertain` hardware restart
+    /// record, as a boot that could not verify its recovery leaves it.
+    pub(crate) fn uncertain_agent(
+        dir: &std::path::Path,
+        runtime: &mut RuntimeSettings,
+    ) -> (PolicyAgent, String) {
+        let id = "00000000-0000-4000-8000-000000000656";
+        let mut journal = Journal::default();
+        journal.records.insert(
+            id.into(),
+            Record {
+                host_id: "host".into(),
+                group: "hardware".into(),
+                scope: "restart".into(),
+                revision: "2".into(),
+                digest: "a".repeat(64),
+                phase: "uncertain".into(),
+                sequence: 7,
+                resolved_idle_timeout_secs: None,
+                resolved_settings: json!({"encoder":"openh264","render_node":"software","cuda_device":0}),
+                boot_incarnation: "boot".into(),
+                connection_incarnation: "conn".into(),
+                settings: Value::Null,
+                known_good: None,
+                error: Some("candidate_verification_failed".into()),
+                verified_at: None,
+                verified_process_id: None,
+            },
+        );
+        let path = dir.join("policy.json");
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let agent =
+            PolicyAgent::open(path, "host".into(), "boot".into(), "conn".into(), runtime).unwrap();
+        (agent, id.into())
     }
 
     pub(crate) fn explicit(
@@ -3085,5 +3178,163 @@ mod tests {
             phase_of(&agent.accept(changed, &mut restarted)),
             ("failed", Some("revision_conflict"))
         );
+    }
+
+    /// A restart offer that reaches the open-attempt check: everything before it
+    /// (identity, group, expiry, revision, idleness) passes.
+    fn fresh_restart_offer(id: &str) -> Offer {
+        Offer {
+            attempt_id: id.into(),
+            host_id: "host".into(),
+            boot_incarnation: "boot".into(),
+            connection_incarnation: "conn".into(),
+            group: "hardware".into(),
+            revision: "3".into(),
+            content_sha256: "b".repeat(64),
+            scope: "restart".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            prerequisites_sha256: "c".repeat(64),
+            prerequisites: vec![],
+            settings: json!({}),
+            resolved_settings: json!({}),
+        }
+    }
+
+    #[test]
+    fn a_release_writes_released_before_reporting_it_and_unblocks_new_offers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = RuntimeSettings::baseline_with(&|_| None);
+        let (mut agent, id) = test_support::uncertain_agent(dir.path(), &mut runtime);
+        let path = dir.path().join("policy.json");
+        let next = fresh_restart_offer("00000000-0000-4000-8000-000000000657");
+        assert_eq!(
+            phase_of(&agent.accept_restart(next.clone(), &runtime, true, None)).1,
+            Some("attempt_conflict"),
+            "an uncertain record refuses every new restart offer"
+        );
+        assert!(agent.has_uncertain_restart());
+
+        let reply = agent.release(&id, "boot", "conn").unwrap();
+        let AgentMsg::ConfigPolicyState {
+            phase,
+            journal_sequence,
+            scope,
+            error,
+            ..
+        } = &reply
+        else {
+            panic!("expected config_policy_state, got {reply:?}");
+        };
+        assert_eq!(
+            (phase.as_str(), journal_sequence.as_str(), scope.as_str()),
+            ("released", "8", "restart")
+        );
+        assert_eq!(error.as_deref(), Some("candidate_verification_failed"));
+        let disk = Journal::load(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            (disk.records[&id].phase.as_str(), disk.records[&id].sequence),
+            ("released", 8)
+        );
+
+        assert!(!agent.has_uncertain_restart());
+        assert!(!agent.has_open_restart());
+        assert_ne!(
+            phase_of(&agent.accept_restart(next, &runtime, true, None)).1,
+            Some("attempt_conflict"),
+            "a released record blocks no new offer"
+        );
+        assert!(matches!(
+            PolicyAgent::bootstrap(&path),
+            Ok(BootOutcome::None)
+        ));
+        let AgentMsg::ConfigPolicyJournalInventoryPage { entries, .. } =
+            agent.inventory_page("inv", "boot", "conn", None).unwrap()
+        else {
+            panic!("expected an inventory page");
+        };
+        let entry = entries
+            .iter()
+            .find(|e| e["attempt_id"] == id.as_str())
+            .unwrap();
+        assert_eq!(
+            (entry["phase"].as_str(), entry["journal_sequence"].as_str()),
+            (Some("released"), Some("8"))
+        );
+    }
+
+    #[test]
+    fn a_repeated_release_is_answered_without_a_second_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = RuntimeSettings::baseline_with(&|_| None);
+        let (mut agent, id) = test_support::uncertain_agent(dir.path(), &mut runtime);
+        let path = dir.path().join("policy.json");
+        let first = format!("{:?}", agent.release(&id, "boot", "conn").unwrap());
+        let written = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::remove_file(&path).unwrap();
+        let second = format!("{:?}", agent.release(&id, "boot", "conn").unwrap());
+        assert_eq!(first, second);
+        assert!(
+            !path.exists(),
+            "the repeat wrote the journal again (first at {written:?})"
+        );
+    }
+
+    #[test]
+    fn a_release_is_refused_for_anything_but_an_uncertain_restart_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = RuntimeSettings::baseline_with(&|_| None);
+        let (mut agent, id) = test_support::uncertain_agent(dir.path(), &mut runtime);
+        assert_eq!(
+            agent.release(&id, "boot", "old-conn").unwrap_err(),
+            "stale_release_request"
+        );
+        assert_eq!(
+            agent.release(&id, "old-boot", "conn").unwrap_err(),
+            "stale_release_request"
+        );
+        assert_eq!(
+            agent
+                .release("00000000-0000-4000-8000-0000000006ff", "boot", "conn")
+                .unwrap_err(),
+            "release_refused"
+        );
+        for phase in [
+            "accepted",
+            "awaiting_startup",
+            "recovery_verifying",
+            "applied",
+            "recovered",
+            "failed",
+        ] {
+            agent.journal.records.get_mut(&id).unwrap().phase = phase.into();
+            assert_eq!(
+                agent.release(&id, "boot", "conn").unwrap_err(),
+                "release_refused",
+                "{phase}"
+            );
+        }
+        let mut next_session = record("gop", "1", "uncertain", 3, json!({"gop":60}));
+        next_session.scope = "next_session".into();
+        agent.journal.records.insert("ns".into(), next_session);
+        assert_eq!(
+            agent.release("ns", "boot", "conn").unwrap_err(),
+            "release_refused"
+        );
+    }
+
+    #[test]
+    fn a_release_whose_write_fails_stays_uncertain_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = RuntimeSettings::baseline_with(&|_| None);
+        let (mut agent, id) = test_support::uncertain_agent(dir.path(), &mut runtime);
+        agent
+            .crash_after_writes
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            agent.release(&id, "boot", "conn").unwrap_err(),
+            "journal_write_failed"
+        );
+        assert!(agent.has_uncertain_restart());
+        assert_eq!(agent.journal.records[&id].sequence, 7);
     }
 }

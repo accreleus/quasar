@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path};
 
+use crate::session::container::app_ids;
 use bollard::{
     errors::Error,
     exec::{CreateExecOptions, StartExecOptions, StartExecResults},
@@ -338,19 +339,6 @@ fn expected_user(intent: &ApplicationIntent) -> Option<&String> {
         (Some(_), None) => Some(&ROOT),
         (_, image) => image,
     }
-}
-
-/// `PUID`/`PGID` from the request's environment, the ids the image drops to (1000 when
-/// unset, as the images default).
-fn app_ids(environment: &[String]) -> (u32, u32) {
-    let id = |key: &str| {
-        environment
-            .iter()
-            .rev()
-            .find_map(|e| e.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
-            .unwrap_or(1000)
-    };
-    (id("PUID"), id("PGID"))
 }
 
 /// The agent→image contract naming gids the image adds to the app user (#428).
