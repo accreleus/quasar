@@ -211,7 +211,7 @@ not run one. _Avoid_: "relay" (a Quasar-run server that carries media for peers 
 cannot connect, planned, is a different thing).
 
 **Presenter** — the client-side component that draws decoded frames to the screen and owns
-the scaling modes and the present-cadence readout; on WebTransport it is a WebGPU
+the scaling modes and the present-cadence readout (**Present cadence**, under Stream health); on WebTransport it is a WebGPU
 canvas Quasar owns, in place of the browser's `<video>` element. _Avoid_: "renderer",
 "player".
 
