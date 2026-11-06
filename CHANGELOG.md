@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **The platform image now builds the PyroWave C API (#1052).** `libpyrowave-shared`, its header and pkg-config file are built from a pinned PyroWave and Granite commit and installed into `/opt/gst`, and the image contract asserts they are there. Nothing uses it yet and a session streams exactly as before; it is the base for the Ultra-low latency (LAN) codec (#1048). This changes the toolchain pins, so the toolchain image is rebuilt once.
+
 ## 0.5.2 — 2026-11-01
 
 ### Upgrading
