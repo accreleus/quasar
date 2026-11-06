@@ -186,6 +186,35 @@ boot-only, behind the persistent owner lease. _Avoid_: "orphan" (the old CLI
 sweep's word; it suggested anything unclaimed was ours to delete), and "adoption"
 — nothing here resumes or observes a prior session.
 
+## Transports
+
+**Transport** — how a session's media reaches the client: the implementation of the
+transport slot between the encoded frame and the client. Two exist: `webrtc` (the
+default and the guaranteed floor) and `webtransport` (experimental, opt-in). The stream
+plan chooses it once, at launch, after the codec. _Avoid_: "protocol" and "connection
+type" for this meaning.
+
+**Transport fallback** — a session on WebTransport moving to WebRTC on its own because
+the WebTransport connect failed, was refused, or the stream died. It keeps the session's standard codec
+(a PyroWave session switches to it, since PyroWave runs only on WebTransport), and the session's
+details say that it happened and why. _Avoid_:
+"downgrade" (that is a rung or codec step).
+
+**WebTransport endpoint** — the one opaque URL through which a browser reaches a host's
+WebTransport listener: **direct** (the agent's own listener, certificate pinned by hash)
+or **edge** (an admin-set public URL through an edge proxy, publicly trusted
+certificate). Only a host with a working endpoint is offered WebTransport.
+
+**Edge proxy** — an operator's own reverse proxy (for example Caddy) sitting in front of
+the node agent's listener and terminating the browser's public certificate. Quasar does
+not run one. _Avoid_: "relay" (a Quasar-run server that carries media for peers that
+cannot connect, planned, is a different thing).
+
+**Presenter** — the client-side component that draws decoded frames to the screen and owns
+the scaling modes and the present-cadence readout (**Present cadence**, under Stream health); on WebTransport it is a WebGPU
+canvas Quasar owns, in place of the browser's `<video>` element. _Avoid_: "renderer",
+"player".
+
 ## Stream health
 
 **Verdict** — the single stream-health judgement, as a value: the state (a
