@@ -13,8 +13,9 @@ normative contract text. Tool structure is ADR 0012.
 
 ## The rules
 
-- **Source: github.com release assets of the GE-Proton project only, over HTTPS.** A download from
-  anywhere else, including a redirect that leaves github.com, is refused.
+- **Source: github.com release assets of the GE-Proton project only, over HTTPS.** The download URL
+  must be a github.com release asset of that project; redirects are followed only to GitHub's own
+  release-asset host, and the checksum is what proves the bytes. Any other source is refused.
 - **Two ways in, two ways to verify.** The **recommended tool list** ships with each Quasar
   release and carries a pinned digest per release, so the recommended path does not depend on
   fetching a checksum at all. An **arbitrary tag** an admin types is accepted only after the

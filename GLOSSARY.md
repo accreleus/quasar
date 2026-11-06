@@ -396,8 +396,8 @@ own way. _Avoid_: "store", "launcher" for this meaning.
 
 **Compatibility tool** — a build that runs a Windows game on a Linux host: today a Proton,
 Valve's own or GE-Proton. A host resource with an identity (kind, family, version or tag), a
-source and a per-host install state; it knows nothing of any provider. A tool is named by the
-name Steam uses for it, which for GE-Proton is not the release tag. _Avoid_: "Proton version"
+source and a per-host install state; it knows nothing of any provider. A tool is named by the key
+in its own `compatibilitytool.vdf` (the name Steam stores), which for GE-Proton is not the release tag. _Avoid_: "Proton version"
 for the general concept, "runner".
 
 **Tool mapping** — the admin's choice of compatibility tool for one game (keyed by its Steam
