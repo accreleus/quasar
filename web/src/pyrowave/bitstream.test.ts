@@ -35,9 +35,20 @@ describe("parsePwv1Header", () => {
     });
   });
 
-  it("refuses a buffer that is not a v1 PWV1 header", () => {
+  const reasonOf = (f: () => unknown) => {
+    try {
+      f();
+    } catch (e) {
+      expect(e).toBeInstanceOf(PyroWaveError);
+      return (e as PyroWaveError).reason;
+    }
+    throw new Error("did not throw");
+  };
+
+  it("refuses a buffer that is not a v1 PWV1 header as a bad frame", () => {
     expect(() => parsePwv1Header(new Uint8Array(24))).toThrow(/PWV1/);
-    expect(() => parsePwv1Header(new Uint8Array(10))).toThrow(/PWV1/);
+    expect(reasonOf(() => parsePwv1Header(new Uint8Array(24)))).toBe("bad_frame");
+    expect(reasonOf(() => parsePwv1Header(new Uint8Array(10)))).toBe("bad_frame");
   });
 
   // Bits of the header's second word: 26 chroma_resolution, 27 color_primaries, 28 transfer_function,
@@ -53,6 +64,7 @@ describe("parsePwv1Header", () => {
     const dv = new DataView(h.buffer);
     dv.setUint32(8, dv.getUint32(8, true) | (1 << bit), true);
     expect(() => parsePwv1Header(h)).toThrow(message);
+    expect(reasonOf(() => parsePwv1Header(h))).toBe("unsupported");
   });
 
   it.each([
@@ -63,6 +75,7 @@ describe("parsePwv1Header", () => {
     const dv = new DataView(h.buffer);
     dv.setUint32(4, (dv.getUint32(4, true) & ~0x0fff_ffff) | ((hh - 1) << 14) | (w - 1), true);
     expect(() => parsePwv1Header(h)).toThrow(/even/);
+    expect(reasonOf(() => parsePwv1Header(h))).toBe("unsupported");
   });
 });
 
@@ -163,9 +176,23 @@ describe("buildUpload", () => {
     expect(buildUpload(layout, [b], null).offsets[5]).toBe(BLOCK_LOST);
   });
 
+  it("a block whose sign bits were cut off is lost; the same block with them is received", () => {
+    // One 8x8 block, cw 0x5555 (one plane per 4x2 subblock), qb 0, every plane 0xff: 64 nonzero
+    // magnitudes, so 8 + 3 + 8 bytes before the signs and 8 bytes of signs: 27 bytes, 7 words.
+    const b = (pw: number) => {
+      const x = block(6, pw, 1, 0);
+      new DataView(x.buffer).setUint16(8, 0x5555, true);
+      x.fill(0xff, 11, 19);
+      return x;
+    };
+    expect(buildUpload(layout, [b(7)], null).offsets[6]).not.toBe(BLOCK_LOST);
+    expect(buildUpload(layout, [b(6)], null).offsets[6]).toBe(BLOCK_LOST); // 24 bytes: 5 sign bytes
+    expect(buildUpload(layout, [b(5)], null).offsets[6]).toBe(BLOCK_LOST); // planes fit, no signs
+  });
+
   it("sizes the payload from the accepted blocks, not from what arrived", () => {
     const dup = Array.from({ length: 1000 }, () => block(3, 100));
-    expect(buildUpload(layout, dup, null).payload.length).toBeLessThanOrEqual(100 + 4);
+    expect(buildUpload(layout, dup, null).payload.length).toBeLessThanOrEqual(100 + 34);
   });
 
   it("refuses a start-of-frame header whose size differs from the configuration", () => {
@@ -186,6 +213,7 @@ describe("buildUpload", () => {
     const dv = new DataView(frame.buffer);
     dv.setUint32(4, dv.getUint32(4, true) | (1 << bit), true);
     expect(() => buildUpload(layout, [frame], null)).toThrow(message);
+    expect(() => buildUpload(layout, [frame], null)).toThrow(expect.objectContaining({ reason: "bad_frame" }));
   });
 
   it("an oversized block with a part missing is lost, while the indices its received part covers are zero", () => {

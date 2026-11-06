@@ -11,6 +11,7 @@ export const BLOCK_LOST = 0xffff_fffe;
 
 export type PyroWaveErrorReason =
   | "bad_frame" // malformed input: drop the frame
+  | "unsupported" // a configuration this decoder does not carry: use another codec
   | "too_large" // the configuration does not fit this device or the negotiated resolution
   | "no_subgroups" // the device lacks what the decoder path needs (fallback: #1055)
   | "gpu_error" // WebGPU reported a validation or out-of-memory error
@@ -35,11 +36,12 @@ export interface PyroWaveHeader {
 }
 
 /**
- * The picture fields of a BitstreamSequenceHeader (the PWV1Header's, or a SOF's): what amendment 55
- * carries is 4:2:0, sRGB primaries and transfer, BT.709 matrix, centre siting, even width and height.
+ * The picture fields of a BitstreamSequenceHeader (the PWV1Header's, or a SOF's). Supported: 4:2:0,
+ * sRGB primaries and transfer, the BT.709 matrix (amendment 55), even width and height, and centre
+ * chroma siting, which amendment 55 does not name yet (erratum item 4, quasar-protocol#29).
  */
 function pictureFields(w0: number, w1: number): PyroWaveHeader {
-  const bad = (why: string) => new PyroWaveError("bad_frame", why);
+  const bad = (why: string) => new PyroWaveError("unsupported", why);
   const width = (w0 & 0x3fff) + 1;
   const height = ((w0 >>> 14) & 0x3fff) + 1;
   if ((w1 >>> 26) & 1) throw bad("only 4:2:0 chroma is supported");
@@ -53,9 +55,9 @@ function pictureFields(w0: number, w1: number): PyroWaveHeader {
 
 /** Reads a 24-byte PWV1Header: `hello_ack.video.description_b64`, or the start of a .pwv1 file. */
 export function parsePwv1Header(bytes: Uint8Array): PyroWaveHeader {
-  if (bytes.byteLength < 24) throw new Error("not a PWV1 header: too short");
+  if (bytes.byteLength < 24) throw new PyroWaveError("bad_frame", "not a PWV1 header: too short");
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (dv.getUint32(0, true) !== 0x3156_5750 || bytes[21] !== 1) throw new Error("not a PWV1 header (magic or header_version)");
+  if (dv.getUint32(0, true) !== 0x3156_5750 || bytes[21] !== 1) throw new PyroWaveError("bad_frame", "not a PWV1 header (magic or header_version)");
   return pictureFields(dv.getUint32(4, true), dv.getUint32(8, true));
 }
 
@@ -66,7 +68,7 @@ export function parsePwv1(file: Uint8Array): { header: PyroWaveHeader; frames: U
   const frames: Uint8Array[] = [];
   for (let o = 24; o + 4 <= file.byteLength; ) {
     const n = dv.getUint32(o, true);
-    if (o + 4 + n > file.byteLength) throw new Error("PWV1: truncated frame");
+    if (o + 4 + n > file.byteLength) throw new PyroWaveError("bad_frame", "PWV1: truncated frame");
     frames.push(file.subarray(o + 4, o + 4 + n));
     o += 4 + n;
   }
@@ -171,32 +173,43 @@ export interface Upload {
   lost: number;
 }
 
-// The dequant shader reads the sign bits a word past a block's end.
-const PAYLOAD_PAD_WORDS = 2;
+// A lane reads the word holding its first sign bit and the next. A block whose signs were cut off
+// is refused (blockBytes), but should one get through, its reads reach at most 1024 sign bits (32
+// words) plus one word past its planes: 34 zero words keep them out of whatever the GPU buffer held.
+const PAYLOAD_PAD_WORDS = 34;
 
-const popcount16 = (v: number) => {
+const popcount = (v: number) => {
   let n = 0;
   for (; v; v &= v - 1) n++;
   return n;
 };
 
 /**
- * The bytes a block's own header says it needs before its sign bits: the 8-byte header, a u16
- * code word and a byte of plane count and scale per set ballot bit, then the magnitude planes.
- * Infinity when the block is too short to hold its own code words.
+ * The bytes a block needs, by its own header (bitstream.md "Decoding 8x8 blocks"): 8 bytes of
+ * header; per set ballot bit a u16 code word and a byte of plane count and scale; per 4x2 subblock
+ * its magnitude planes; then one sign bit per nonzero magnitude, as the dequant shader reads them
+ * (an 8x8 block whose code word is 0 is all zero, so it has no signs). Infinity when the planes
+ * themselves overrun the block.
  */
-function blockBytesBeforeSigns(dv: DataView, o: number, pw: number): number {
-  const ballot = dv.getUint16(o, true);
-  const nset = popcount16(ballot);
-  let need = 8 + 3 * nset;
-  if (need > pw * 4) return Infinity;
+function blockBytes(dv: DataView, o: number, pw: number): number {
+  const size = pw * 4;
+  const nset = popcount(dv.getUint16(o, true));
+  let at = 8 + 3 * nset;
+  if (at > size) return Infinity;
+  let signs = 0;
   for (let i = 0; i < nset; i++) {
     const cw = dv.getUint16(o + 8 + 2 * i, true);
     const qb = dv.getUint8(o + 8 + 2 * nset + i) & 0xf;
-    // Per 4x2 subblock: qb planes plus the 2-bit extra count in cw.
-    for (let sub = 0; sub < 8; sub++) need += qb + ((cw >>> (2 * sub)) & 3);
+    for (let sub = 0; sub < 8; sub++) {
+      const planes = qb + ((cw >>> (2 * sub)) & 3);
+      if (at + planes > size) return Infinity;
+      let any = 0; // bit b set: coefficient b of the subblock is nonzero
+      for (let q = 0; q < planes; q++) any |= dv.getUint8(o + at + q);
+      if (cw !== 0) signs += popcount(any);
+      at += planes;
+    }
   }
-  return need;
+  return at + Math.ceil(signs / 8);
 }
 
 /**
@@ -225,7 +238,12 @@ export function buildUpload(layout: BlockLayout, packets: readonly Uint8Array[],
         if (o + 8 > p.byteLength) throw bad("a truncated start-of-frame header");
         const w1 = dv.getUint32(o + 4, true);
         if ((w1 >>> 24) & 3) throw bad("an unknown extended packet");
-        const { width: w, height: h } = pictureFields(w0, w1);
+        let w: number, h: number;
+        try {
+          ({ width: w, height: h } = pictureFields(w0, w1));
+        } catch (e) {
+          throw bad(`a start-of-frame header the configuration does not match: ${(e as Error).message}`);
+        }
         if (w !== layout.width || h !== layout.height) throw bad(`the frame is ${w}x${h}, the configuration ${layout.width}x${layout.height}`);
         o += 8;
         continue;
@@ -235,7 +253,7 @@ export function buildUpload(layout: BlockLayout, packets: readonly Uint8Array[],
       const index = dv.getUint32(o + 4, true) >>> 8;
       if (index >= n) throw bad(`block index ${index} outside [0, ${n})`);
       if (offsets[index] === BLOCK_LOST) {
-        if (blockBytesBeforeSigns(dv, o, pw) > pw * 4) short[index] = 1;
+        if (blockBytes(dv, o, pw) > pw * 4) short[index] = 1;
         else {
           offsets[index] = words - PAYLOAD_PAD_WORDS;
           accepted.push({ dv, o, pw });

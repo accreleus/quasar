@@ -21,9 +21,11 @@ export function pyroWaveDeviceFeatures(adapter: GPUAdapter): GPUFeatureName[] {
 
 export interface DecoderOptions {
   /** The negotiated launch resolution's pixel count: a header asking for more is refused. */
-  maxPixels?: number;
+  maxPixels: number;
   /** Tests: run a path the device supports other than the one it would choose. */
   forcePath?: DecoderPath;
+  /** Tests: make one GPU call inside create() invalid. */
+  faultForTest?: boolean;
 }
 
 export type DecodeStats = Pick<Upload, "received" | "zero" | "lost">;
@@ -38,6 +40,11 @@ interface Pipelines {
 
 // Compiled once per device and storage precision; a decoder per configuration reuses them.
 const pipelineCache = new WeakMap<GPUDevice, Map<boolean, Promise<Pipelines>>>();
+// create() runs one at a time per device, so no other create() pushes or pops between its own.
+const createChain = new WeakMap<GPUDevice, Promise<unknown>>();
+// Kept per device, not per decoder: a decoder's own lost handler would keep it alive as long as the device.
+const lostDevices = new WeakSet<GPUDevice>();
+const watchedDevices = new WeakSet<GPUDevice>();
 
 async function checked(device: GPUDevice, code: string): Promise<GPUShaderModule> {
   const module = device.createShaderModule({ code });
@@ -75,8 +82,8 @@ function pipelines(device: GPUDevice, f16: boolean): Promise<Pipelines> {
 export class PyroWaveDecoder {
   private payload: GPUBuffer | null = null;
   private dqBindGroup: GPUBindGroup | null = null;
-  private lost = false;
   private destroyed = false;
+  private gpuError: string | null = null;
 
   private constructor(
     private readonly device: GPUDevice,
@@ -91,15 +98,26 @@ export class PyroWaveDecoder {
     private readonly rgbBindGroup: GPUBindGroup,
     private readonly planes: GPUBuffer,
     private readonly owned: GPUBuffer[],
-  ) {
-    void device.lost.then(() => (this.lost = true));
-  }
+  ) {}
 
   /**
    * One decoder per configuration (`config_id`): concealment reuses the coefficients of earlier
    * frames decoded by this instance, and a new instance starts from zero (amendment 55 §Loss).
    */
-  static async create(device: GPUDevice, header: PyroWaveHeader, options: DecoderOptions = {}): Promise<PyroWaveDecoder> {
+  static create(device: GPUDevice, header: PyroWaveHeader, options: DecoderOptions): Promise<PyroWaveDecoder> {
+    if (!watchedDevices.has(device)) {
+      watchedDevices.add(device);
+      void device.lost.then(() => lostDevices.add(device));
+    }
+    const run = (createChain.get(device) ?? Promise.resolve()).then(() => PyroWaveDecoder.createNow(device, header, options));
+    createChain.set(
+      device,
+      run.catch(() => undefined),
+    );
+    return run;
+  }
+
+  private static async createNow(device: GPUDevice, header: PyroWaveHeader, options: DecoderOptions): Promise<PyroWaveDecoder> {
     const path = options.forcePath ?? chooseDecoderPath(device.features);
     const needs = path === "fast" ? ["subgroups", "shader-f16"] : ["subgroups"];
     if (path === "fallback" || !needs.every((f) => device.features.has(f)))
@@ -107,7 +125,7 @@ export class PyroWaveDecoder {
     const f16 = path === "fast";
     const { width: w, height: h } = header;
     const tooLarge = (what: string) => new PyroWaveError("too_large", `${w}x${h}: ${what}`);
-    if (options.maxPixels !== undefined && w * h > options.maxPixels) throw tooLarge(`more than the negotiated ${options.maxPixels} pixels`);
+    if (!(w * h <= options.maxPixels)) throw tooLarge(`more than the negotiated ${options.maxPixels} pixels`);
     const limits = device.limits;
     if (Math.max(w, h) > limits.maxTextureDimension2D) throw tooLarge(`over the device's ${limits.maxTextureDimension2D}-pixel texture limit`);
     const layout = blockLayout(w, h);
@@ -176,9 +194,10 @@ export class PyroWaveDecoder {
         layout: pipes.rgb.getBindGroupLayout(0),
         entries: [buffer(rgbParams.byteLength, UNIFORM | COPY_DST, rgbParams), planes].map((b, binding) => ({ binding, resource: { buffer: b } })),
       });
+      if (options.faultForTest) device.createBuffer({ size: 6, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.MAP_READ });
       scopes = 0;
-      const validation = await device.popErrorScope();
-      const oom = await device.popErrorScope();
+      // Both pops issued back to back, before any await.
+      const [validation, oom] = await Promise.all([device.popErrorScope(), device.popErrorScope()]);
       const error = validation ?? oom;
       if (error) throw new PyroWaveError("gpu_error", error.message);
       return new PyroWaveDecoder(device, header, path, texture, layout, pipes, dq, idwt, rgbBindGroup, planes, owned);
@@ -192,48 +211,59 @@ export class PyroWaveDecoder {
 
   private usable(): void {
     if (this.destroyed) throw new PyroWaveError("destroyed", "the decoder was destroyed");
-    if (this.lost) throw new PyroWaveError("device_lost", "the WebGPU device was lost");
+    if (lostDevices.has(this.device)) throw new PyroWaveError("device_lost", "the WebGPU device was lost");
+    if (this.gpuError) throw new PyroWaveError("gpu_error", `an earlier decode failed: ${this.gpuError}`);
   }
 
   /**
    * Decodes one frame into `texture`. `packets` and `covered` are as for buildUpload: a lost
-   * block index keeps the coefficients of the last frame this decoder had it in.
+   * block index keeps the coefficients of the last frame this decoder had it in. A WebGPU error in
+   * this decode is reported asynchronously, so the next decode() throws gpu_error: waiting for it
+   * here would put the GPU's completion on every frame's path.
    */
   decode(packets: readonly Uint8Array[], covered: Uint8Array | null): DecodeStats {
     this.usable();
     const d = this.device;
     const up = buildUpload(this.layout, packets, covered);
     const bytes = up.payload.byteLength;
-    if (bytes > Math.min(d.limits.maxStorageBufferBindingSize, d.limits.maxBufferSize)) throw new PyroWaveError("too_large", `a ${bytes}-byte frame`);
-    // Grow with headroom; shrink again once frames are far smaller, so one burst is not kept.
-    if (!this.payload || this.payload.size < bytes || this.payload.size > 4 * bytes + 65536) {
-      this.payload?.destroy();
-      this.payload = d.createBuffer({ size: Math.ceil((bytes * 1.25) / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-      this.dqBindGroup = d.createBindGroup({
-        layout: this.pipes.dq.getBindGroupLayout(0),
-        entries: [this.dq.params, this.dq.offsets, this.payload, this.dq.coefHi, this.dq.coefLo, this.dq.blockBand].map((b, binding) => ({ binding, resource: { buffer: b } })),
+    const limit = Math.min(d.limits.maxStorageBufferBindingSize, d.limits.maxBufferSize) & ~3;
+    if (bytes > limit) throw new PyroWaveError("too_large", `a ${bytes}-byte frame`);
+    d.pushErrorScope("validation");
+    try {
+      // Grow with headroom; shrink again once frames are far smaller, so one burst is not kept.
+      if (!this.payload || this.payload.size < bytes || this.payload.size > 4 * bytes + 65536) {
+        this.payload?.destroy();
+        this.payload = d.createBuffer({ size: Math.min(limit, Math.ceil((bytes * 1.25) / 4) * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        this.dqBindGroup = d.createBindGroup({
+          layout: this.pipes.dq.getBindGroupLayout(0),
+          entries: [this.dq.params, this.dq.offsets, this.payload, this.dq.coefHi, this.dq.coefLo, this.dq.blockBand].map((b, binding) => ({ binding, resource: { buffer: b } })),
+        });
+      }
+      d.queue.writeBuffer(this.dq.offsets, 0, up.offsets);
+      d.queue.writeBuffer(this.payload, 0, up.payload);
+
+      const enc = d.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(this.pipes.dq);
+      pass.setBindGroup(0, this.dqBindGroup);
+      pass.dispatchWorkgroups(this.dq.wgStride, Math.ceil(this.layout.totalBlocks / this.dq.wgStride));
+      pass.setPipeline(this.pipes.idwt);
+      for (const s of this.idwt) {
+        pass.setBindGroup(0, s.bindGroup);
+        pass.dispatchWorkgroups(s.wx, s.wy, s.wz);
+      }
+      pass.end();
+      const draw = enc.beginRenderPass({ colorAttachments: [{ view: this.texture.createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }] });
+      draw.setPipeline(this.pipes.rgb);
+      draw.setBindGroup(0, this.rgbBindGroup);
+      draw.draw(3);
+      draw.end();
+      d.queue.submit([enc.finish()]);
+    } finally {
+      void d.popErrorScope().then((e) => {
+        if (e) this.gpuError ??= e.message;
       });
     }
-    d.queue.writeBuffer(this.dq.offsets, 0, up.offsets);
-    d.queue.writeBuffer(this.payload, 0, up.payload);
-
-    const enc = d.createCommandEncoder();
-    const pass = enc.beginComputePass();
-    pass.setPipeline(this.pipes.dq);
-    pass.setBindGroup(0, this.dqBindGroup);
-    pass.dispatchWorkgroups(this.dq.wgStride, Math.ceil(this.layout.totalBlocks / this.dq.wgStride));
-    pass.setPipeline(this.pipes.idwt);
-    for (const s of this.idwt) {
-      pass.setBindGroup(0, s.bindGroup);
-      pass.dispatchWorkgroups(s.wx, s.wy, s.wz);
-    }
-    pass.end();
-    const draw = enc.beginRenderPass({ colorAttachments: [{ view: this.texture.createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }] });
-    draw.setPipeline(this.pipes.rgb);
-    draw.setBindGroup(0, this.rgbBindGroup);
-    draw.draw(3);
-    draw.end();
-    d.queue.submit([enc.finish()]);
     return { received: up.received, zero: up.zero, lost: up.lost };
   }
 

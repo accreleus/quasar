@@ -12,7 +12,7 @@ describe("chooseDecoderPath", () => {
   });
 
   it("refuses a device without subgroups until the fallback decoder exists", async () => {
-    const device = { features: new Set<string>() } as unknown as GPUDevice;
-    await expect(PyroWaveDecoder.create(device, { width: 64, height: 64, fullRange: false })).rejects.toThrow(/#1055/);
+    const device = { features: new Set<string>(), lost: new Promise(() => {}) } as unknown as GPUDevice;
+    await expect(PyroWaveDecoder.create(device, { width: 64, height: 64, fullRange: false }, { maxPixels: 64 * 64 })).rejects.toThrow(/#1055/);
   });
 });

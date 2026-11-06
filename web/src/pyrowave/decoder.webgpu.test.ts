@@ -49,7 +49,7 @@ afterEach(async () => {
 
 async function decoderFor(file: string, forcePath?: DecoderPath) {
   const { header, frames } = parsePwv1(await fixture(file));
-  return { decoder: await PyroWaveDecoder.create(device, header, { forcePath }), frame: frames[0], header };
+  return { decoder: await PyroWaveDecoder.create(device, header, { forcePath, maxPixels: header.width * header.height }), frame: frames[0], header };
 }
 
 async function rejection(p: Promise<unknown>): Promise<PyroWaveError> {
@@ -90,7 +90,7 @@ describe.each(expectedPaths)("PyroWaveDecoder on the golden fixtures, %s path", 
 
 describe("hostile input", () => {
   it.each([16384, 8192])("a %i-pixel square header is refused before anything is allocated", async (size) => {
-    const e = await rejection(PyroWaveDecoder.create(device, { width: size, height: size, fullRange: false }));
+    const e = await rejection(PyroWaveDecoder.create(device, { width: size, height: size, fullRange: false }, { maxPixels: size * size }));
     expect(e.reason).toBe("too_large");
   });
 
@@ -121,7 +121,56 @@ describe("hostile input", () => {
   });
 });
 
+describe("hostile input: sign bits", () => {
+  // Fill the decoder's GPU payload buffer with `fill`, then decode a frame whose last block lost its
+  // sign bits: none of its reads may reach what the buffer held before.
+  async function decodeOverStale(fill: number): Promise<Uint8Array> {
+    const { header, frames } = parsePwv1(await fixture("detail_320x192_xhi.pwv1"));
+    const decoder = await PyroWaveDecoder.create(device, header, { maxPixels: header.width * header.height });
+    const n = blockLayout(header.width, header.height).totalBlocks;
+    const stale = Array.from({ length: n }, (_, i) => {
+      // ballot 0: an all-zero block with 1192 free bytes. 165 KB in all: more than the frame below,
+      // small enough that decode() keeps the buffer rather than shrinking it.
+      const b = new Uint8Array(300 * 4).fill(fill);
+      new DataView(b.buffer).setUint32(0, 300 << 16, true);
+      new DataView(b.buffer).setUint32(4, i << 8, true);
+      return b;
+    });
+    decoder.decode(stale, null);
+
+    const frame = frames[0].slice();
+    const dv = new DataView(frame.buffer);
+    let o = 8;
+    let last = 8;
+    while (o < frame.byteLength) {
+      last = o;
+      o += ((dv.getUint32(o, true) >>> 16) & 0xfff) * 4;
+    }
+    const pw = (dv.getUint32(last, true) >>> 16) & 0xfff;
+    dv.setUint32(last, (dv.getUint32(last, true) & ~(0xfff << 16)) | ((pw - 16) << 16), true); // drop its last 64 bytes
+    const stats = decoder.decode([frame.subarray(0, last + (pw - 16) * 4)], null);
+    expect(stats.lost).toBe(1);
+    const out = await decoder.readI420();
+    decoder.destroy();
+    return out;
+  }
+
+  it("a block with its sign bits cut off decodes the same over a stale buffer of 0x00 or 0xff", async () => {
+    expect(await decodeOverStale(0x00)).toEqual(await decodeOverStale(0xff));
+  });
+});
+
 describe("lifecycle", () => {
+  it.each([0, 1])("two concurrent creates on one device: only the faulted one (#%i) fails", async (faulted) => {
+    const { header } = parsePwv1(await fixture("flat_200x114_lo.pwv1"));
+    const opts = (i: number) => ({ maxPixels: header.width * header.height, faultForTest: i === faulted });
+    const results = await Promise.allSettled([PyroWaveDecoder.create(device, header, opts(0)), PyroWaveDecoder.create(device, header, opts(1))]);
+    expect(results.map((r) => r.status)).toEqual(faulted === 0 ? ["rejected", "fulfilled"] : ["fulfilled", "rejected"]);
+    const failed = results[faulted] as PromiseRejectedResult;
+    expect(failed.reason).toMatchObject({ reason: "gpu_error" });
+    for (const r of results) if (r.status === "fulfilled") r.value.destroy();
+  });
+
   it("a destroyed decoder refuses to decode", async () => {
     const { decoder, frame } = await decoderFor("flat_200x114_lo.pwv1");
     decoder.destroy();
@@ -132,7 +181,7 @@ describe("lifecycle", () => {
     const adapter = (await navigator.gpu.requestAdapter())!; // an adapter makes one device
     const own = await adapter.requestDevice({ requiredFeatures: pyroWaveDeviceFeatures(adapter) });
     const { header, frames } = parsePwv1(await fixture("flat_200x114_lo.pwv1"));
-    const decoder = await PyroWaveDecoder.create(own, header);
+    const decoder = await PyroWaveDecoder.create(own, header, { maxPixels: header.width * header.height });
     decoder.decode([frames[0]], null);
     own.destroy();
     await own.lost;
@@ -144,7 +193,7 @@ describe("lifecycle", () => {
     const adapter = (await navigator.gpu.requestAdapter())!;
     const own = await adapter.requestDevice({ requiredFeatures: pyroWaveDeviceFeatures(adapter) });
     const { header, frames } = parsePwv1(await fixture("flat_200x114_lo.pwv1"));
-    const decoder = await PyroWaveDecoder.create(own, header);
+    const decoder = await PyroWaveDecoder.create(own, header, { maxPixels: header.width * header.height });
     decoder.decode([frames[0]], null);
     const read = decoder.readI420();
     own.destroy(); // before the map resolves, and before the lost promise flips the flag
@@ -274,7 +323,7 @@ describe("YCbCr to RGB", () => {
     dv.setUint16(8, 0x5555, true); // cw: one plane per 4x2 subblock (a zero cw is an all-zero 8x8 block)
     block[10] = 6 << 4; // qb 0, scale 6
     block.fill(0xff, 11, 19); // one plane per 4x2 subblock: every magnitude 1; sign bits (19-26) 0
-    const decoder = await PyroWaveDecoder.create(device, header);
+    const decoder = await PyroWaveDecoder.create(device, header, { maxPixels: header.width * header.height });
     expect(decoder.decode([block], null).received).toBe(1);
     const worst = await worstRgbError(decoder);
     decoder.destroy();
