@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -245,6 +246,48 @@ func TestAgentTakenOverErrorClosesWith4410(t *testing.T) {
 	var ce *websocket.CloseError
 	if !errors.As(err, &ce) || ce.Code != wsCloseTakenOver {
 		t.Fatalf("after the error: %v, want close %d", err, wsCloseTakenOver)
+	}
+}
+
+// A taken_over error that lands while the attach-time flush is still writing
+// buffered frames must close with 4410 too: the flush never reaches the pump.
+// The buffered frames are large enough that the flush stays blocked in a write
+// until the client reads on, so the error is queued behind it deterministically.
+func TestTakenOverErrorDuringTheAttachFlushClosesWith4410(t *testing.T) {
+	pool := testDB(t)
+	srv, relay, _ := newTestServerWithRelay(t, pool)
+	sess, token := seedAssignedSession(t, pool)
+
+	big := `{"type":"ice","pc":"video","candidate":"` + strings.Repeat("x", 64<<10) + `"}`
+	for i := 0; i < 255; i++ {
+		if err := relay.Deliver(sess.ID, []byte(big)); err != nil {
+			t.Fatalf("buffer frame %d: %v", i, err)
+		}
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(signalURL(srv, token), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// The first buffered frame arrives only after Register, with the rest of the flush pending.
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatalf("read first buffered frame: %v", err)
+	}
+	if err := relay.Deliver(sess.ID, []byte(`{"type":"error","code":"taken_over","message":"taken over by a webtransport client"}`)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			continue
+		}
+		var ce *websocket.CloseError
+		if !errors.As(err, &ce) || ce.Code != wsCloseTakenOver {
+			t.Fatalf("socket ended with %v, want close %d", err, wsCloseTakenOver)
+		}
+		return
 	}
 }
 
