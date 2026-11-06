@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>B00 — PyroWave WGSL decode prototype</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; background: #111; color: #ddd; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  table { border-collapse: collapse; margin: 8px 0 16px; }
+  td, th { border: 1px solid #444; padding: 3px 8px; text-align: right; }
+  th { background: #222; }
+  td:first-child, th:first-child { text-align: left; }
+  .ok { color: #7d7; } .bad { color: #f77; }
+  pre { background: #1b1b1b; padding: 8px; white-space: pre-wrap; }
+  canvas { width: 960px; max-width: 100%; border: 1px solid #444; display: block; }
+  fieldset { border: 1px solid #444; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1>PyroWave v1 → WebGPU (WGSL) decode prototype — spike B00 (#1049)</h1>
+<div id="env"></div>
+<fieldset>
+  <label>Repetitions per timed pass <input id="reps" type="number" value="200" min="1" style="width:5em"></label>
+  <button id="run">Run all fixtures × all paths</button>
+  &nbsp;|&nbsp; Own file: <input id="file" type="file" accept=".pwv1"> reference (optional) <input id="ref" type="file" accept=".y4m">
+  <button id="runfile">Run file</button>
+</fieldset>
+<div id="status">loading…</div>
+<table id="corr"><thead><tr><th>fixture</th><th>path</th><th>blocks recv/total</th><th>PSNR Y</th><th>PSNR Cb</th><th>PSNR Cr</th><th>max |Δ| Y</th><th>verdict</th><th>CPU parse+upload ms (first call)</th></tr></thead><tbody></tbody></table>
+<table id="timing"><thead></thead><tbody></tbody></table>
+<canvas id="cv"></canvas>
+<pre id="log"></pre>
+
+<script src="decoder.js"></script>
+<script src="fixtures/1080p_200.js"></script>
+<script src="fixtures/1440p_200.js"></script>
+<script src="fixtures/2160p_300.js"></script>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const log = (s) => { $('log').textContent += s + '\n'; };
+const result = { env: {}, correctness: [], timing: [], errors: [] };
+window.B00_RESULT = result;
+
+const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+async function gunzip(u8) {
+  const r = new Blob([u8]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(r).arrayBuffer());
+}
+
+let adapter;
+const devices = {};
+
+async function decoderFor(sg, f16) {
+  const key = `${sg}${f16}`;
+  if (!devices[key]) {
+    // An adapter can create one device, so each path gets its own adapter.
+    const a = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    devices[key] = await PyroWave.PyroWaveDecoder.create(a, { subgroups: sg, f16 });
+  }
+  return devices[key];
+}
+
+function paths() {
+  const sg = adapter.features.has('subgroups'), f16 = adapter.features.has('shader-f16');
+  const p = [[sg, f16]];
+  if (sg && f16) p.push([true, false], [false, true]);
+  if (sg || f16) p.push([false, false]);
+  return p;
+}
+
+async function runOne(name, pwv1, refY4m, sg, f16, reps, show) {
+  const dec = await decoderFor(sg, f16);
+  const { hdr, frames } = PyroWave.parsePWV1(pwv1);
+  await dec.setup(hdr);
+  const cpuMs = dec.upload(frames[0]);
+  dec.decode(null);
+  const out = await dec.readPlanes();
+  const row = { fixture: name, path: dec.path, w: hdr.width, h: hdr.height,
+    received: dec.packet.received, total: dec.packet.totalBlocks, cpuParseUploadMs: +cpuMs.toFixed(3) };
+  if (refY4m) {
+    const ref = PyroWave.parseY4MFirstFrame(refY4m);
+    row.psnr = out.map((p, i) => +PyroWave.psnr(p, ref.planes[i]).toFixed(2));
+    let mx = 0; for (let i = 0; i < out[0].length; i++) mx = Math.max(mx, Math.abs(out[0][i] - ref.planes[0][i]));
+    row.maxAbsY = mx;
+    row.pass = row.psnr.every((v) => v >= 45);
+  }
+  result.correctness.push(row);
+  const tr = document.createElement('tr');
+  const f = (v) => v === undefined ? '–' : (v === Infinity ? '∞' : v);
+  tr.innerHTML = `<td>${name}</td><td>${row.path}</td><td>${row.received}/${row.total}</td><td>${f(row.psnr?.[0])}</td>` +
+    `<td>${f(row.psnr?.[1])}</td><td>${f(row.psnr?.[2])}</td><td>${f(row.maxAbsY)}</td>` +
+    `<td class="${row.pass === false ? 'bad' : 'ok'}">${row.pass === undefined ? 'no reference' : row.pass ? 'match' : 'MISMATCH'}</td>` +
+    `<td>${row.cpuParseUploadMs}</td>`;
+  $('corr').tBodies[0].appendChild(tr);
+
+  // Cap each timed pass at ~50 ms so a slow GPU never trips the driver watchdog.
+  const probe = await dec.time(1);
+  if (probe) reps = Math.max(3, Math.min(reps, Math.floor(50000 / Math.max(1, probe['decode (dequant + idwt)']))));
+  let t = await dec.time(reps);
+  if (!t) t = { 'decode (dequant + idwt), wall clock': await dec.timeWall(reps) };
+  result.timing.push({ fixture: name, path: dec.path, reps, us: t });
+  addTiming(name, `${dec.path} ×${reps}`, t);
+
+  if (show) await showImage(dec);
+  if (dec.errors.length) { result.errors.push(...dec.errors); log('GPU errors: ' + dec.errors.join('\n')); dec.errors.length = 0; }
+}
+
+async function showImage(dec) {
+  const img = await dec.renderImageData();
+  const cv = $('cv'); cv.width = img.width; cv.height = img.height;
+  cv.getContext('2d').putImageData(img, 0, 0);
+}
+
+function addTiming(name, path, t) {
+  const tb = $('timing');
+  if (!tb.tHead.rows.length) {
+    tb.tHead.innerHTML = `<tr><th>fixture</th><th>path</th>${Object.keys(t).map((k) => `<th>${k} µs</th>`).join('')}</tr>`;
+  }
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${name}</td><td>${path}</td>${Object.values(t).map((v) => `<td>${v.toFixed(1)}</td>`).join('')}`;
+  tb.tBodies[0].appendChild(tr);
+}
+
+async function runAll() {
+  $('run').disabled = true;
+  const reps = +$('reps').value;
+  const names = Object.keys(window.B00_FIXTURES || {});
+  for (const [sg, f16] of paths()) {
+    for (const n of names) {
+      $('status').textContent = `running ${n} (subgroups=${sg}, f16=${f16})…`;
+      const fx = B00_FIXTURES[n];
+      try {
+        await runOne(n, b64(fx.pwv1), await gunzip(b64(fx.refY4mGz)), sg, f16, reps, false);
+      } catch (e) { result.errors.push(String(e)); log(`${n}: ${e.stack || e}`); }
+    }
+  }
+  // Show the best path's 1080p output.
+  try {
+    const [sg, f16] = paths()[0], fx = B00_FIXTURES[names[0]];
+    const dec = await decoderFor(sg, f16);
+    const { hdr, frames } = PyroWave.parsePWV1(b64(fx.pwv1));
+    await dec.setup(hdr); dec.upload(frames[0]);
+    dec.decode(null);
+    await showImage(dec);
+  } catch (e) { result.errors.push(String(e)); log(String(e.stack || e)); }
+  $('status').textContent = 'done' + (result.errors.length ? ` with ${result.errors.length} error(s)` : '');
+  result.done = true;
+  $('run').disabled = false;
+}
+
+async function main() {
+  if (!navigator.gpu) { $('status').textContent = 'WebGPU not available'; result.errors.push('no navigator.gpu'); result.done = true; return; }
+  adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) { $('status').textContent = 'no WebGPU adapter'; result.errors.push('no adapter'); result.done = true; return; }
+  const i = adapter.info || {};
+  result.env = { userAgent: navigator.userAgent, vendor: i.vendor, architecture: i.architecture, description: i.description,
+    subgroupMinSize: i.subgroupMinSize, subgroupMaxSize: i.subgroupMaxSize,
+    subgroups: adapter.features.has('subgroups'), shaderF16: adapter.features.has('shader-f16'),
+    timestampQuery: adapter.features.has('timestamp-query') };
+  const e = result.env;
+  $('env').innerHTML = `Adapter: <b>${e.vendor || '?'} ${e.architecture || ''} ${e.description || ''}</b> · ` +
+    `subgroups: <b>${e.subgroups}</b> (size ${e.subgroupMinSize ?? '?'}–${e.subgroupMaxSize ?? '?'}) · shader-f16: <b>${e.shaderF16}</b> · ` +
+    `timestamp-query: <b>${e.timestampQuery}</b><br><small>${e.userAgent}</small>`;
+  const q = new URLSearchParams(location.search);
+  if (q.get('reps')) $('reps').value = q.get('reps');
+  $('run').onclick = runAll;
+  $('runfile').onclick = async () => {
+    const f = $('file').files[0]; if (!f) return;
+    const r = $('ref').files[0];
+    const [sg, f16] = paths()[0];
+    try { await runOne(f.name, new Uint8Array(await f.arrayBuffer()), r ? new Uint8Array(await r.arrayBuffer()) : null, sg, f16, +$('reps').value, true); }
+    catch (err) { log(String(err.stack || err)); }
+  };
+  await runAll();
+}
+main();
+</script>
+</body>
+</html>

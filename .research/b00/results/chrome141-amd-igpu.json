@@ -1,0 +1,403 @@
+{
+  "env": {
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/141.0.7390.37 Safari/537.36",
+    "vendor": "amd",
+    "architecture": "rdna-2",
+    "description": "AMD Ryzen 9 9950X3D 16-Core Processor (RADV RAPHAEL_MENDOCINO)",
+    "subgroupMinSize": 32,
+    "subgroupMaxSize": 64,
+    "subgroups": true,
+    "shaderF16": true,
+    "timestampQuery": true
+  },
+  "correctness": [
+    {
+      "fixture": "1080p_200",
+      "path": "fast (subgroups + shader-f16)",
+      "w": 1920,
+      "h": 1080,
+      "received": 1877,
+      "total": 1877,
+      "cpuParseUploadMs": 4.2,
+      "psnr": [
+        64.6,
+        64.84,
+        65.4
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "1440p_200",
+      "path": "fast (subgroups + shader-f16)",
+      "w": 2560,
+      "h": 1440,
+      "received": 2192,
+      "total": 2192,
+      "cpuParseUploadMs": 1.4,
+      "psnr": [
+        64.1,
+        64.25,
+        65.44
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "2160p_300",
+      "path": "fast (subgroups + shader-f16)",
+      "w": 3840,
+      "h": 2160,
+      "received": 3650,
+      "total": 3650,
+      "cpuParseUploadMs": 3.7,
+      "psnr": [
+        63.94,
+        64.51,
+        65.34
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "1080p_200",
+      "path": "subgroups, fp32 storage",
+      "w": 1920,
+      "h": 1080,
+      "received": 1877,
+      "total": 1877,
+      "cpuParseUploadMs": 1.1,
+      "psnr": [
+        64.64,
+        64.94,
+        65.51
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "1440p_200",
+      "path": "subgroups, fp32 storage",
+      "w": 2560,
+      "h": 1440,
+      "received": 2192,
+      "total": 2192,
+      "cpuParseUploadMs": 1.5,
+      "psnr": [
+        64.16,
+        64.29,
+        65.53
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "2160p_300",
+      "path": "subgroups, fp32 storage",
+      "w": 3840,
+      "h": 2160,
+      "received": 3650,
+      "total": 3650,
+      "cpuParseUploadMs": 2.4,
+      "psnr": [
+        64.01,
+        64.6,
+        65.43
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "1080p_200",
+      "path": "shared-memory scans, fp16 storage",
+      "w": 1920,
+      "h": 1080,
+      "received": 1877,
+      "total": 1877,
+      "cpuParseUploadMs": 0.2,
+      "psnr": [
+        64.6,
+        64.84,
+        65.4
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "1440p_200",
+      "path": "shared-memory scans, fp16 storage",
+      "w": 2560,
+      "h": 1440,
+      "received": 2192,
+      "total": 2192,
+      "cpuParseUploadMs": 0.2,
+      "psnr": [
+        64.1,
+        64.25,
+        65.44
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "2160p_300",
+      "path": "shared-memory scans, fp16 storage",
+      "w": 3840,
+      "h": 2160,
+      "received": 3650,
+      "total": 3650,
+      "cpuParseUploadMs": 0.4,
+      "psnr": [
+        63.94,
+        64.51,
+        65.34
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "1080p_200",
+      "path": "fallback (shared-memory scans, fp32)",
+      "w": 1920,
+      "h": 1080,
+      "received": 1877,
+      "total": 1877,
+      "cpuParseUploadMs": 0.2,
+      "psnr": [
+        64.64,
+        64.94,
+        65.51
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "1440p_200",
+      "path": "fallback (shared-memory scans, fp32)",
+      "w": 2560,
+      "h": 1440,
+      "received": 2192,
+      "total": 2192,
+      "cpuParseUploadMs": 0.2,
+      "psnr": [
+        64.16,
+        64.29,
+        65.53
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    },
+    {
+      "fixture": "2160p_300",
+      "path": "fallback (shared-memory scans, fp32)",
+      "w": 3840,
+      "h": 2160,
+      "received": 3650,
+      "total": 3650,
+      "cpuParseUploadMs": 0.4,
+      "psnr": [
+        64.01,
+        64.6,
+        65.43
+      ],
+      "maxAbsY": 1,
+      "pass": true
+    }
+  ],
+  "timing": [
+    {
+      "fixture": "1080p_200",
+      "path": "fast (subgroups + shader-f16)",
+      "reps": 6,
+      "us": {
+        "dequant": 573.02,
+        "idwt L4": 63.473333333333336,
+        "idwt L3": 204.47333333333333,
+        "idwt L2": 665.7533333333333,
+        "idwt L1": 2436.1533333333336,
+        "idwt L0": 3273.74,
+        "idwt (all levels)": 6629.406666666667,
+        "decode (dequant + idwt)": 7213.52,
+        "yuv2rgb (render pass)": 592.96
+      }
+    },
+    {
+      "fixture": "1440p_200",
+      "path": "fast (subgroups + shader-f16)",
+      "reps": 3,
+      "us": {
+        "dequant": 877.6133333333333,
+        "idwt L4": 87.94666666666667,
+        "idwt L3": 308.3466666666667,
+        "idwt L2": 1198.44,
+        "idwt L1": 4472.8533333333335,
+        "idwt L0": 5914.84,
+        "idwt (all levels)": 11899.226666666666,
+        "decode (dequant + idwt)": 12766.826666666666,
+        "yuv2rgb (render pass)": 1180.08
+      }
+    },
+    {
+      "fixture": "2160p_300",
+      "path": "fast (subgroups + shader-f16)",
+      "reps": 3,
+      "us": {
+        "dequant": 2089.1066666666666,
+        "idwt L4": 203.49333333333334,
+        "idwt L3": 666.8666666666667,
+        "idwt L2": 2593.4133333333334,
+        "idwt L1": 9858.733333333334,
+        "idwt L0": 13090.906666666666,
+        "idwt (all levels)": 26415.986666666668,
+        "decode (dequant + idwt)": 28315.173333333332,
+        "yuv2rgb (render pass)": 2728.3466666666664
+      }
+    },
+    {
+      "fixture": "1080p_200",
+      "path": "subgroups, fp32 storage",
+      "reps": 6,
+      "us": {
+        "dequant": 624.3066666666666,
+        "idwt L4": 63.373333333333335,
+        "idwt L3": 203.22666666666666,
+        "idwt L2": 663.6733333333334,
+        "idwt L1": 2618.54,
+        "idwt L0": 3415.98,
+        "idwt (all levels)": 6974.966666666667,
+        "decode (dequant + idwt)": 7635.38,
+        "yuv2rgb (render pass)": 592.68
+      }
+    },
+    {
+      "fixture": "1440p_200",
+      "path": "subgroups, fp32 storage",
+      "reps": 3,
+      "us": {
+        "dequant": 1033.0266666666666,
+        "idwt L4": 87.41333333333333,
+        "idwt L3": 304.94666666666666,
+        "idwt L2": 1190.64,
+        "idwt L1": 4654.493333333333,
+        "idwt L0": 6167.8533333333335,
+        "idwt (all levels)": 12398.12,
+        "decode (dequant + idwt)": 13507.36,
+        "yuv2rgb (render pass)": 1178.6133333333332
+      }
+    },
+    {
+      "fixture": "2160p_300",
+      "path": "subgroups, fp32 storage",
+      "reps": 3,
+      "us": {
+        "dequant": 2527.8433333333337,
+        "idwt L4": 206.46666666666667,
+        "idwt L3": 675.3066666666666,
+        "idwt L2": 2657.9733333333334,
+        "idwt L1": 10324.12,
+        "idwt L0": 13650.746666666666,
+        "idwt (all levels)": 27370.72,
+        "decode (dequant + idwt)": 29640.426666666666,
+        "yuv2rgb (render pass)": 2663.3466666666664
+      }
+    },
+    {
+      "fixture": "1080p_200",
+      "path": "shared-memory scans, fp16 storage",
+      "reps": 6,
+      "us": {
+        "dequant": 1333.06,
+        "idwt L4": 63.626666666666665,
+        "idwt L3": 203.72,
+        "idwt L2": 664.6066666666667,
+        "idwt L1": 2440.0266666666666,
+        "idwt L0": 3292.4733333333334,
+        "idwt (all levels)": 6675.486666666667,
+        "decode (dequant + idwt)": 7999.986666666667,
+        "yuv2rgb (render pass)": 591.3933333333333
+      }
+    },
+    {
+      "fixture": "1440p_200",
+      "path": "shared-memory scans, fp16 storage",
+      "reps": 3,
+      "us": {
+        "dequant": 1823.1333333333332,
+        "idwt L4": 88.61333333333333,
+        "idwt L3": 305.6933333333333,
+        "idwt L2": 1197.04,
+        "idwt L1": 4461.693333333333,
+        "idwt L0": 5879.44,
+        "idwt (all levels)": 11940.4,
+        "decode (dequant + idwt)": 13714.56,
+        "yuv2rgb (render pass)": 1171.2266666666667
+      }
+    },
+    {
+      "fixture": "2160p_300",
+      "path": "shared-memory scans, fp16 storage",
+      "reps": 3,
+      "us": {
+        "dequant": 3507.2666666666664,
+        "idwt L4": 206.36,
+        "idwt L3": 662.5466666666666,
+        "idwt L2": 2575.8266666666664,
+        "idwt L1": 9796.453333333335,
+        "idwt L0": 13025.6,
+        "idwt (all levels)": 26307,
+        "decode (dequant + idwt)": 29821.68,
+        "yuv2rgb (render pass)": 2704.76
+      }
+    },
+    {
+      "fixture": "1080p_200",
+      "path": "fallback (shared-memory scans, fp32)",
+      "reps": 5,
+      "us": {
+        "dequant": 1331.96,
+        "idwt L4": 64.296,
+        "idwt L3": 203.784,
+        "idwt L2": 668.272,
+        "idwt L1": 2641.464,
+        "idwt L0": 3428.96,
+        "idwt (all levels)": 7001.672,
+        "decode (dequant + idwt)": 8327.528,
+        "yuv2rgb (render pass)": 596.56
+      }
+    },
+    {
+      "fixture": "1440p_200",
+      "path": "fallback (shared-memory scans, fp32)",
+      "reps": 3,
+      "us": {
+        "dequant": 1822.8266666666668,
+        "idwt L4": 87.98666666666666,
+        "idwt L3": 309.08,
+        "idwt L2": 1202.76,
+        "idwt L1": 4687.546666666667,
+        "idwt L0": 6159.506666666667,
+        "idwt (all levels)": 12477.16,
+        "decode (dequant + idwt)": 14232.84,
+        "yuv2rgb (render pass)": 1169.8133333333333
+      }
+    },
+    {
+      "fixture": "2160p_300",
+      "path": "fallback (shared-memory scans, fp32)",
+      "reps": 3,
+      "us": {
+        "dequant": 3511.6933333333336,
+        "idwt L4": 201.90666666666667,
+        "idwt L3": 659.3066666666666,
+        "idwt L2": 2571.8266666666664,
+        "idwt L1": 10252.853333333334,
+        "idwt L0": 13662.92,
+        "idwt (all levels)": 27440.106666666667,
+        "decode (dequant + idwt)": 31104.61333333333,
+        "yuv2rgb (render pass)": 2699.1466666666665
+      }
+    }
+  ],
+  "errors": [],
+  "done": true
+}
