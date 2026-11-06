@@ -1481,6 +1481,25 @@ describe("gamepad — Nintendo layout (control-api.md §Region and Input setting
       cap.cleanup();
     });
 
+    it("a pad the browser maps as standard is never remapped, even when id and counts match an entry", () => {
+      const { cap, send, poll, onNonStandardGamepad } = openWith(rawPad([1, 6], { mapping: "standard" }));
+      poll();
+      expect(sentButtons(send)).toEqual(Array.from({ length: 13 }, (_, i) => ([1, 6].includes(i) ? 1 : 0))); // raw, 13 long
+      expect(onNonStandardGamepad).not.toHaveBeenCalled();
+      expect(cap.getMetrics().pads).toEqual([{ index: 0, id: ID, mapping: "standard" }]);
+      cap.cleanup();
+    });
+
+    it("a pad whose array lengths change between frames is resent even if every value matches", () => {
+      const pad = rawPad([]);
+      const { cap, send, poll } = openWith(pad);
+      poll();
+      pad.axes = pad.axes.slice(0, 5);
+      poll();
+      expect(send).toHaveBeenCalledTimes(2);
+      cap.cleanup();
+    });
+
     it("a hat reading on the wrong axis does not press the d-pad", () => {
       const { cap, send, poll } = openWith(rawPad([], { axes: [0.05, 0, 0, 0, -1, 3.286] }));
       poll();

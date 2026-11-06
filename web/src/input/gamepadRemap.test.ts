@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { detectPadEnv, hatDirection, PADS, parseEntry, parsePadId, remapGamepad, type PadEntry } from "./gamepadRemap";
+import { detectPadEnv, hatDirection, isRemapped, PADS, parseEntry, parsePadId, remapGamepad, type PadEntry } from "./gamepadRemap";
 
 // Synthetic entries: they pin the mechanism, not any real pad. A real entry comes from a capture.
 const HAT: PadEntry = {
@@ -210,6 +210,45 @@ describe("parseEntry: one d-pad form per entry", () => {
     for (const d of [{ x: 6, y: 8 }, { x: -1, y: 7 }, { x: 6, y: 6 }, { x: 6.5, y: 7 }]) {
       expect(() => parseEntry({ ...DPAD_AXES, dpadAxes: d }), JSON.stringify(d)).toThrow(/dpadAxes is outside/);
     }
+  });
+});
+
+describe("parseEntry: the map is checked", () => {
+  const bad = (over: Partial<PadEntry>, re: RegExp) => expect(() => parseEntry({ ...DPAD_AXES, ...over }), re.source).toThrow(re);
+  it("refuses a key that is not a W3C control, including inherited object keys", () => {
+    bad({ map: "foo:b1" }, /unknown key/);
+    bad({ map: "constructor:b1" }, /unknown key/);
+  });
+  it("refuses a stick on a button or hat", () => bad({ map: "leftx:b1" }, /a stick is an axis/));
+  it("refuses a d-pad key on an axis (the #1103 trap)", () => {
+    bad({ dpadAxes: undefined, map: "dpup:a7" }, /not an axis/);
+    bad({ dpadAxes: undefined, map: "dpright:a6" }, /not an axis/);
+  });
+  it("refuses a hat direction that is not 1, 2, 4 or 8, or a missing one", () => {
+    bad({ dpadAxes: undefined, hatAxis: 7, map: "dpup:h0.3" }, /bad hat direction/);
+    bad({ dpadAxes: undefined, hatAxis: 7, map: "dpup:h0" }, /bad hat direction/);
+    bad({ map: "a:b1.2" }, /bad hat direction/);
+  });
+  it("refuses a triggerRest that is not a finite number below 1", () => {
+    for (const v of [1, 2, NaN, Infinity]) bad({ triggerRest: v }, /triggerRest/);
+    expect(() => parseEntry({ ...DPAD_AXES, triggerRest: 0 })).not.toThrow();
+  });
+  it("counts a hatAxis as a d-pad form even with no h0.M key", () => bad({ hatAxis: 7 }, /mixes d-pad forms/));
+});
+
+describe("the empty table and isRemapped", () => {
+  it("returns null without looking at the pad when the table is empty", () => {
+    const r = raw(DPAD_AXES);
+    expect(remapGamepad(chrome("1234", "0002"), r.buttons, r.axes, { platform: "linux", browser: "chrome" }, [])).toBeNull();
+    expect(isRemapped(chrome("1234", "0002"), r.buttons.length, r.axes.length, { platform: "linux", browser: "chrome" }, [])).toBe(false);
+  });
+  it("isRemapped agrees with remapGamepad on lengths, platform and id", () => {
+    const env = { platform: "linux", browser: "chrome" } as const;
+    const id = chrome("1234", "0002");
+    expect(isRemapped(id, 15, 8, env, TABLE)).toBe(true);
+    expect(isRemapped(id, 14, 8, env, TABLE)).toBe(false);
+    expect(isRemapped(id, 15, 8, { platform: "mac", browser: "chrome" }, TABLE)).toBe(false);
+    expect(isRemapped(chrome("9999", "0002"), 15, 8, env, TABLE)).toBe(false);
   });
 });
 

@@ -91,6 +91,9 @@ Chrome, typically axes 6 and 7): `dpadAxes: { x: 6, y: 7 }`, with no `dpup`…`d
 in the map. Negative on `x` is left, negative on `y` is up. An entry uses one of
 these.
 
+Some Linux Chrome pads report a trigger axis as 0 until it first moves, and one
+`triggerRest` cannot say that. Move both triggers once before you start the capture.
+
 For just the pad's id and what is pressed right now:
 
 ```js

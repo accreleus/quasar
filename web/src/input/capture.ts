@@ -29,7 +29,7 @@
 // (matched by pointerId, so chrome taps are never seen here).
 
 import { EVDEV, MB_MAP } from "./evdev";
-import { detectPadEnv, remapGamepad, type PadEnv } from "./gamepadRemap";
+import { detectPadEnv, isRemapped, remapGamepad, type PadEnv } from "./gamepadRemap";
 import { createMouseScaler, mouseGain, NEUTRAL_MOUSE, type MouseSettings } from "./mouseScale";
 import { isSendEscCombo, isSummonCombo, sendEscComboEnabled } from "./summonCombo";
 import { pointerLockSupported } from "./support";
@@ -63,14 +63,20 @@ export function isStandardMapping(pad: { mapping: string; remapped?: boolean }):
   return pad.mapping === "standard" || pad.remapped === true;
 }
 
+/** Who the pad is, and whether the remap table translates it. Lengths only: builds no arrays. */
+function padIdentity(pad: Gamepad, env: PadEnv): GamepadIdentity {
+  const identity: GamepadIdentity = { index: pad.index, id: pad.id, mapping: pad.mapping };
+  if (pad.mapping !== "standard" && isRemapped(pad.id, pad.buttons.length, pad.axes.length, env)) identity.remapped = true;
+  return identity;
+}
+
 /** One pad's state as it goes on the wire, translated when the remap table knows it. */
 function readPad(pad: Gamepad, env: PadEnv) {
   let buttons = Array.from(pad.buttons, (b) => b.value);
   let axes = Array.from(pad.axes, (a) => Math.round(a * 1000) / 1000);
-  const mapped = pad.mapping === "standard" ? null : remapGamepad(pad.id, buttons, axes, env);
+  const identity = padIdentity(pad, env);
+  const mapped = identity.remapped ? remapGamepad(pad.id, buttons, axes, env) : null;
   if (mapped) ({ buttons, axes } = mapped);
-  const identity: GamepadIdentity = { index: pad.index, id: pad.id, mapping: pad.mapping };
-  if (mapped) identity.remapped = true;
   return { buttons, axes, identity };
 }
 
@@ -910,6 +916,8 @@ export function setupCapture({
         const prev = gpPrev[pad.index];
         const changed =
           !prev ||
+          buttons.length !== prev.buttons.length ||
+          axes.length !== prev.axes.length ||
           buttons.some((v, i) => v !== prev.buttons[i]) ||
           axes.some((v, i) => v !== prev.axes[i]);
         if (changed) {
@@ -947,7 +955,7 @@ export function setupCapture({
     for (const p of rawPads) {
       if (!p) continue;
       gamepadCount++;
-      padIdentities.push(readPad(p, padEnv).identity);
+      padIdentities.push(padIdentity(p, padEnv));
     }
 
     const snapshot: CaptureMetrics = {
