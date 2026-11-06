@@ -72,4 +72,39 @@ describe("PyroWaveDecoder.create", () => {
     await expect(create()).rejects.toMatchObject({ reason: "gpu_error" });
     expect(calls).toBeGreaterThan(first);
   });
+
+  describe("a device lost while the pipelines build is device_lost, not gpu_error", () => {
+    const lostInfo = { reason: "unknown", message: "GPU process gone" };
+    const building = (lost: Promise<unknown>, onBuild: () => never) =>
+      fake({
+        lost,
+        createShaderModule: () => ({ getCompilationInfo: async () => ({ messages: [] }) }),
+        createComputePipelineAsync: async () => onBuild(),
+        createRenderPipelineAsync: async () => ({}),
+      });
+    const fail = () => {
+      throw new DOMException("device lost", "OperationError");
+    };
+
+    it("lost before the build", async () => {
+      const device = building(Promise.resolve(lostInfo), fail);
+      await expect(PyroWaveDecoder.create(device, header, { maxPixels: 64 * 64 })).rejects.toMatchObject({ reason: "device_lost" });
+    });
+
+    it("lost as the build fails, device.lost settling a task later", async () => {
+      let markLost!: (v: unknown) => void;
+      const device = building(new Promise((r) => (markLost = r)), () => {
+        setTimeout(() => markLost(lostInfo), 0);
+        return fail();
+      });
+      await expect(PyroWaveDecoder.create(device, header, { maxPixels: 64 * 64 })).rejects.toMatchObject({ reason: "device_lost" });
+    });
+
+    it("a rejection that is itself a GPUDeviceLostInfo", async () => {
+      const device = building(new Promise(() => {}), () => {
+        throw lostInfo;
+      });
+      await expect(PyroWaveDecoder.create(device, header, { maxPixels: 64 * 64 })).rejects.toMatchObject({ reason: "device_lost" });
+    });
+  });
 });

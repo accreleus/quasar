@@ -62,6 +62,14 @@ async function checked(device: GPUDevice, code: string): Promise<GPUShaderModule
   return module;
 }
 
+// Error path only. device.lost settles a task after the loss, so give it one before deciding.
+async function lostBy(device: GPUDevice, e: unknown): Promise<boolean> {
+  const info = e as Partial<GPUDeviceLostInfo> | null;
+  if (!(e instanceof PyroWaveError) && (info?.reason === "destroyed" || info?.reason === "unknown")) return true;
+  const settled = await Promise.race([device.lost.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), 0))]);
+  return settled || lostDevices.has(device);
+}
+
 function pipelines(device: GPUDevice, path: DecoderPath): Promise<Pipelines> {
   let byPath = pipelineCache.get(device);
   if (!byPath) pipelineCache.set(device, (byPath = new Map()));
@@ -83,6 +91,7 @@ function pipelines(device: GPUDevice, path: DecoderPath): Promise<Pipelines> {
         ]);
         return { dq, idwt, rgb };
       } catch (e) {
+        if (await lostBy(device, e)) throw new PyroWaveError("device_lost", "the WebGPU device was lost while the decoder was built");
         // A GPUPipelineError (e.g. limits below what the auto layout needs) is a DOMException.
         if (e instanceof PyroWaveError) throw e;
         throw new PyroWaveError("gpu_error", `pipeline: ${e instanceof Error ? e.message : String(e)}`);

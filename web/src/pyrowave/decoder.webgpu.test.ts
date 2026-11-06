@@ -178,7 +178,17 @@ describe.each(allPaths)("hostile blocks, %s path", (path) => {
     });
     const stats = decoder.decode(packets, null);
     expect(stats.lost).toBe(0);
-    await decoder.readI420();
+    expect((await decoder.readI420()).length).toBe(clean.length);
+    // readI420 clamps, which would hide a NaN: read the float planes themselves.
+    const planesBuf = (decoder as unknown as { planes: GPUBuffer }).planes;
+    const rb = device.createBuffer({ size: planesBuf.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(planesBuf, 0, rb, 0, planesBuf.size);
+    device.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const floats = new Float32Array(rb.getMappedRange().slice(0));
+    rb.destroy();
+    expect(floats.every(Number.isFinite)).toBe(true);
     decoder.decode([frame], null); // every block received again: all coefficients rewritten
     expect(await decoder.readI420()).toEqual(clean);
     decoder.destroy();
@@ -219,7 +229,7 @@ describe("hostile input: sign bits", () => {
     return out;
   }
 
-  it.each([undefined, "fallback"] as const)("a block with its sign bits cut off decodes the same over a stale buffer of 0x00 or 0xff (path %s)", async (path) => {
+  it.each(allPaths)("a block with its sign bits cut off decodes the same over a stale buffer of 0x00 or 0xff (%s path)", async (path) => {
     expect(await decodeOverStale(0x00, path)).toEqual(await decodeOverStale(0xff, path));
   });
 });
