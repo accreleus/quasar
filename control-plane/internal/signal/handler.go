@@ -395,6 +395,12 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 				closedNoFrame("browser-write-failed", err)
 				return
 			}
+			// A WebTransport client took the session over: relay the agent's error, then tell
+			// this socket it lost, exactly as for a later signaling attach. semantics: agent-api.md §Signaling relay
+			if isTakenOverError(frame) {
+				takenOver()
+				return
+			}
 		case res := <-browserIn:
 			if res.err != nil {
 				reason := "client-hung-up"
@@ -464,6 +470,15 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 			return
 		}
 	}
+}
+
+// isTakenOverError reports whether an agent frame is {"type":"error","code":"taken_over"}.
+func isTakenOverError(frame []byte) bool {
+	var f struct {
+		Type string `json:"type"`
+		Code string `json:"code"`
+	}
+	return json.Unmarshal(frame, &f) == nil && f.Type == "error" && f.Code == "taken_over"
 }
 
 // displaced reports, without blocking, whether a later attach has taken this

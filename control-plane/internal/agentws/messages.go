@@ -185,6 +185,12 @@ type CapacityMsg struct {
 	// scheduling columns (readinessgate.Recompute), and those are what the
 	// candidate query reads.
 	Readiness json.RawMessage `json:"readiness"`
+	// Transports and WebTransport (agent-api.md capacity.transports, amendment 54): replaced
+	// wholesale on every report. Absent means the agent serves no WebTransport now.
+	// WebTransport stays raw: a malformed block must cost the endpoint, never the whole report
+	// (see webTransportReport).
+	Transports   []string        `json:"transports"`
+	WebTransport json.RawMessage `json:"webtransport"`
 }
 
 // ReadinessCheck is a validation view of one readiness check, never the storage

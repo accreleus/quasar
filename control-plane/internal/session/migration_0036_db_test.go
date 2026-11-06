@@ -142,6 +142,13 @@ func newMigrator(t *testing.T, url string) *migrate.Migrate {
 	return m
 }
 
+// addColumnsTheStoreReadsSince36 adds, without migrating on, the launch_profiles columns the
+// current store selects. Migrating up would rewrite the seeded data these tests compare.
+func addColumnsTheStoreReadsSince36(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	must(t, exec(t, pool, `ALTER TABLE launch_profiles ADD COLUMN transport TEXT NOT NULL DEFAULT 'webrtc'`))
+}
+
 func migrateTo(t *testing.T, m *migrate.Migrate, version uint) {
 	t.Helper()
 	if err := m.Migrate(version); err != nil && err != migrate.ErrNoChange {
@@ -355,6 +362,7 @@ func TestMigration0036FanOutRule(t *testing.T) {
 	defer pool.Close()
 	seedProdShaped(t, pool)
 	migrateTo(t, m, version36)
+	addColumnsTheStoreReadsSince36(t, pool)
 
 	store := NewStore(pool)
 	ctx := context.Background()
@@ -587,6 +595,7 @@ func TestMigration0036BehaviourNeutrality(t *testing.T) {
 
 	// --- apply 0036 ----------------------------------------------------------
 	migrateTo(t, m, version36)
+	addColumnsTheStoreReadsSince36(t, pool)
 
 	// --- AFTER: the real post-0036 store + resolver. --------------------------
 	after := map[string]effective{}
