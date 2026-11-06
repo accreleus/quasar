@@ -220,8 +220,12 @@ public repository deliberately, and is not in this
 repo's history — the wave-ladder facts on record are what follow. W0 (image
 consolidation, #367) and W1 (security wave, PR #374: invite-gated registration +
 device binding, migration 0020) are merged; W2 is active (console-mode ∥ Phase 9
-closure). Executed plans were archived under `docs/completed/plans/`, also non-public; going forward, plans (live and executed) are filed under
-`docs/superpowers/plans/`. **"What's active right now" lives in GitHub milestones + the
+closure). Executed plans were archived under `docs/completed/plans/`, also non-public. **Going forward there are no plan
+files:** a spec is a GitHub issue and its work is split into ticket issues (sub-issues with
+native blocked-by edges), per `docs/agents/issue-tracker.md`; decisions go in `docs/adr/`, terms
+in `CONTEXT.md`. `docs/superpowers/plans/` holds two older plans only. A release with
+long-running feature work uses an integration branch `integration/<version>` (CI runs on it);
+it merges into `develop` for pre-release and is deleted once the release ships. **"What's active right now" lives in GitHub milestones + the
 session memory `current-focus.md`, not this file.**
 
 **Standing operational defaults (knobs, not history):**

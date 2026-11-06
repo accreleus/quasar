@@ -23,9 +23,10 @@ name: Agent live tests
 # The nightly run is develop's. A schedule only fires from the default branch's copy
 # of this file, so that run checks develop out by name.
 on:
-  # Into develop only: the develop -> main release pull request has the push run below.
+  # Into develop or a release integration branch (`integration/<version>`) only: the
+  # develop -> main release pull request has the push run below.
   pull_request:
-    branches: [develop]
+    branches: [develop, 'integration/**']
     paths:
       - 'node-agent/**'
       - 'deploy/Dockerfile.vulkan'
@@ -37,7 +38,7 @@ on:
   # A landing on develop runs it too: those runs save the cargo cache every pull request
   # restores (#919). A schedule runs main's copy of this file, so it cannot be that source.
   push:
-    branches: [develop]
+    branches: [develop, 'integration/**']
     paths:
       - 'node-agent/**'
       - 'deploy/Dockerfile.vulkan'
