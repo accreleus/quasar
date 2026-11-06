@@ -794,10 +794,8 @@ async fn a_64_kib_session_id_is_refused_and_logged_bounded() {
     );
 }
 
-/// A WebTransport client whose every stream gets 8 bytes of credit: it completes the
-/// handshake (it reads what that needs, so credit flows) but never reads its control
-/// stream, so a refusal of more than 8 bytes can never be written to it.
-fn stalling_client() -> web_transport_quinn::Client {
+/// A WebTransport client on a QUIC transport the test shapes.
+fn client_with(shape: impl FnOnce(&mut quinn::TransportConfig)) -> web_transport_quinn::Client {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -808,13 +806,21 @@ fn stalling_client() -> web_transport_quinn::Client {
     tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
     let mut transport = quinn::TransportConfig::default();
-    transport
-        .stream_receive_window(8u32.into())
-        .keep_alive_interval(Some(Duration::from_millis(500)));
+    shape(&mut transport);
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     config.transport_config(Arc::new(transport));
     let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     web_transport_quinn::Client::new(endpoint, config)
+}
+
+/// Every stream gets 8 bytes of credit: the handshake completes (the client reads what
+/// that needs, so credit flows) but it never reads its control stream, so a refusal of
+/// more than 8 bytes can never be written to it.
+fn stalling_client() -> web_transport_quinn::Client {
+    client_with(|t| {
+        t.stream_receive_window(8u32.into())
+            .keep_alive_interval(Some(Duration::from_millis(500)));
+    })
 }
 
 #[tokio::test]
@@ -830,6 +836,16 @@ async fn a_peer_that_grants_no_credit_gives_its_slot_back_by_the_hello_deadline(
     let hello =
         json!({"type": "hello", "wt_proto": 1, "token": "not-the-token", "session_id": SESSION});
     write_message(&mut send, &hello).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let while_stalled = ClientBuilder::new()
+        .with_server_certificate_hashes(vec![agent.hash.clone()])
+        .unwrap()
+        .connect(agent.url.clone())
+        .await;
+    assert!(
+        while_stalled.is_err(),
+        "a refused peer stalling its refusal still holds its source's slot"
+    );
     assert_eq!(
         close_code(&stalled).await,
         Some(CLOSE_AUTH),
@@ -839,6 +855,24 @@ async fn a_peer_that_grants_no_credit_gives_its_slot_back_by_the_hello_deadline(
     // Its source's one slot is free again.
     let (_session, _send, _recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(ack["type"], "hello_ack");
+}
+
+#[tokio::test]
+async fn a_peer_without_usable_datagrams_is_closed_4400_and_keeps_its_token() {
+    let agent = agent().await;
+    let session = client_with(|t| {
+        t.datagram_receive_buffer_size(None);
+    })
+    .connect(agent.url.clone())
+    .await
+    .unwrap();
+    // The agent reads this client's datagram limit as 0.
+    let (mut send, _recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN, "session_id": SESSION});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(close_code(&session).await, Some(CLOSE_PROTOCOL));
+    let (_session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack", "the token was not spent");
 }
 
 #[test]

@@ -212,10 +212,10 @@ impl Media {
             }
             config.config_id = old.config_id.wrapping_add(1);
         }
-        let changed = st.config.is_some();
         let config = Arc::new(config);
         st.config = Some(config.clone());
-        // The encoder normally restarts on a keyframe; never send a delta across a change.
+        // Never send a delta across a change. The encoder normally restarts on a keyframe,
+        // and the rung step forces one; `on_unit` asks only if a delta comes first.
         st.want_key = true;
         let sent = st
             .client
@@ -225,10 +225,6 @@ impl Media {
             (Some(Err(mpsc::error::TrySendError::Full(_))), Some(client)) => client.resync = true,
             (Some(Err(mpsc::error::TrySendError::Closed(_))), _) => st.client = None,
             _ => {}
-        }
-        drop(st);
-        if changed {
-            self.keyframe();
         }
     }
 
@@ -242,6 +238,9 @@ impl Media {
             (pts.nseconds() as u128 * 90_000 / 1_000_000_000) as u32
         });
         st.last_ts = ts_90khz;
+        if keyframe {
+            st.pending_key = false;
+        }
         let due = st.pending_key
             && st
                 .last_forced
@@ -255,6 +254,10 @@ impl Media {
             return;
         };
         if st.want_key && !keyframe {
+            // Only an attached client waiting on a keyframe asks for one, so the WebRTC
+            // stream gets no IDR of ours at a caps change nobody here needs.
+            drop(st);
+            self.keyframe();
             return;
         }
         if st.client.as_ref().is_some_and(|c| c.resync) {
@@ -554,8 +557,12 @@ mod tests {
         std::thread::sleep(KEYFRAME_SPACING);
         let before = forced.load(std::sync::atomic::Ordering::SeqCst);
         media.on_caps(&caps(960), "s");
-        assert_eq!(forced.load(std::sync::atomic::Ordering::SeqCst), before + 1);
         media.on_unit(&buffer(false));
+        assert_eq!(
+            forced.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "a delta under the new configuration asks for the keyframe"
+        );
         media.on_unit(&buffer(true));
         media.on_unit(&buffer(false));
         assert_eq!(
@@ -637,5 +644,29 @@ mod tests {
             media.on_unit(&buffer(false));
         }
         assert!(changed.elapsed() < KEYFRAME_SPACING + Duration::from_millis(60));
+    }
+
+    #[test]
+    fn a_caps_change_with_no_client_forces_no_keyframe_and_a_keyframe_clears_a_pending_one() {
+        let (media, _encoder, forced) = counted();
+        let count = || forced.load(std::sync::atomic::Ordering::SeqCst);
+        media.on_caps(&caps(1280), "s");
+        media.on_caps(&caps(960), "s");
+        media.on_unit(&buffer(false));
+        media.on_unit(&buffer(false));
+        assert_eq!(count(), 0, "nothing of ours reaches the WebRTC stream");
+
+        let _client = media.attach().unwrap();
+        assert_eq!(count(), 1, "the attach asks once");
+        media.keyframe();
+        assert!(media.lock().pending_key, "coalesced");
+        media.on_unit(&buffer(true));
+        assert!(
+            !media.lock().pending_key,
+            "the keyframe that went by satisfies it"
+        );
+        std::thread::sleep(KEYFRAME_SPACING);
+        media.on_unit(&buffer(false));
+        assert_eq!(count(), 1, "no stale request after the keyframe");
     }
 }

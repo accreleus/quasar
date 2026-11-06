@@ -305,7 +305,8 @@ struct Gate {
 }
 
 /// The per-source key: an IPv4 address, or an IPv6 address's /64, which one host
-/// usually holds whole.
+/// usually holds whole. On a SLAAC LAN every client shares one /64, and `fe80::/64`
+/// merges link-local peers across interfaces (`QUASAR_WT_UNAUTH_PER_SOURCE`).
 fn source(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
@@ -741,7 +742,8 @@ async fn authenticate(
                 .map(|c| (media, c))
                 .ok_or(Refusal::SessionEnded)
         });
-    drop(slot);
+    // The slot is held until `hello_ack` is written: a refused peer stalling the
+    // refusal counts against the caps until the deadline, like any unauthenticated one.
     let (media, client) = match verdict {
         Ok(attached) => attached,
         Err(refusal) => {
@@ -772,6 +774,7 @@ async fn authenticate(
         session.close(CLOSE_PROTOCOL, b"control stream stalled");
         return;
     }
+    drop(slot);
     stream(session, send, recv, &media, client).await;
 }
 
