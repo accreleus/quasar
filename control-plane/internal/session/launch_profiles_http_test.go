@@ -211,6 +211,8 @@ func TestLaunchProfileWriteValidation(t *testing.T) {
 		{"unknown rung id", map[string]any{"id": "x", "display_name": "x", "rungs": []string{"1080p60-h264", "nope"}}},
 		{"duplicate rung", map[string]any{"id": "x", "display_name": "x", "rungs": []string{"1080p60-h264", "1080p60-h264"}}},
 		{"bad visibility", map[string]any{"id": "x", "display_name": "x", "visibility": "public", "rungs": []string{"1080p60-h264"}}},
+		{"bad transport", map[string]any{"id": "x", "display_name": "x", "transport": "quic", "rungs": []string{"1080p60-h264"}}},
+		{"null-ish transport", map[string]any{"id": "x", "display_name": "x", "transport": "", "rungs": []string{"1080p60-h264"}}},
 		// A LEGACY (pre-0036, codec IS NULL) stream_profiles row still EXISTS —
 		// the expand migration keeps it so a code-level revert finds its data — and
 		// GetStreamProfile does not filter to rungs, so it resolves happily. Listing
@@ -421,4 +423,66 @@ func hasWarning(b launchProfileBody, code string) bool {
 		}
 	}
 	return false
+}
+
+// TestLaunchProfileTransport: the profile's transport defaults to webrtc, round-trips through
+// create, patch (absent leaves it) and the read, and any other value is a 400 on both writes.
+func TestLaunchProfileTransport(t *testing.T) {
+	pool := testDB(t)
+	base, adminTok, _ := newProfileAdminServer(t, pool)
+
+	transportOf := func(resp *http.Response) string {
+		t.Helper()
+		var b struct {
+			Transport string `json:"transport"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&b); err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return b.Transport
+	}
+
+	resp := doJSON(t, "POST", base+"/v1/admin/launch-profiles", adminTok,
+		map[string]any{"id": "wt-default", "display_name": "d", "rungs": []string{"1080p60-h264"}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d", resp.StatusCode)
+	}
+	if got := transportOf(resp); got != "webrtc" {
+		t.Errorf("default transport = %q, want webrtc", got)
+	}
+
+	resp = doJSON(t, "POST", base+"/v1/admin/launch-profiles", adminTok,
+		map[string]any{"id": "wt-opt", "display_name": "o", "transport": "webtransport_opt_in", "rungs": []string{"1080p60-h264"}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create opt-in: %d", resp.StatusCode)
+	}
+	if got := transportOf(resp); got != "webtransport_opt_in" {
+		t.Errorf("created transport = %q", got)
+	}
+
+	// A patch that does not mention transport leaves it.
+	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"display_name": "renamed"})
+	if got := transportOf(resp); got != "webtransport_opt_in" {
+		t.Errorf("transport after an unrelated patch = %q, want unchanged", got)
+	}
+	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "webtransport"})
+	if got := transportOf(resp); got != "webtransport" {
+		t.Errorf("transport after patch = %q", got)
+	}
+	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "udp"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad transport on patch: %d, want 400", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	// The list and the single read carry it, and the stored value is what launch reads.
+	resp = doJSON(t, "GET", base+"/v1/admin/launch-profiles/wt-opt", adminTok, nil)
+	if got := transportOf(resp); got != "webtransport" {
+		t.Errorf("read transport = %q", got)
+	}
+	lp, err := NewStore(pool).GetLaunchProfile(context.Background(), "wt-opt")
+	if err != nil || lp.Transport != "webtransport" {
+		t.Errorf("store transport = %q (%v)", lp.Transport, err)
+	}
 }

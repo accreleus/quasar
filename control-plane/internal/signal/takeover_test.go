@@ -215,3 +215,47 @@ func TestDisplacedSocketForwardsNothingItHadAlreadyRead(t *testing.T) {
 		srv.Close()
 	}
 }
+
+// A WebTransport client taking the session over reaches this socket as an agent error frame
+// (agent-api.md §Signaling relay): the browser gets it, then the same 4410 as a later attach.
+func TestAgentTakenOverErrorClosesWith4410(t *testing.T) {
+	pool := testDB(t)
+	srv, relay, _ := newTestServerWithRelay(t, pool)
+	sess, token := seedAssignedSession(t, pool)
+
+	conn, _, err := websocket.DefaultDialer.Dial(signalURL(srv, token), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := relay.Deliver(sess.ID, []byte(`{"type":"ice","pc":"video","candidate":"registration probe"}`)); err != nil {
+		t.Fatal(err)
+	}
+	readBrowserFrame(t, conn)
+
+	taken := `{"type":"error","code":"taken_over","message":"taken over by a webtransport client"}`
+	if err := relay.Deliver(sess.ID, []byte(taken)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readBrowserFrame(t, conn); got != taken {
+		t.Errorf("relayed frame = %q, want the agent's error verbatim", got)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err = conn.ReadMessage()
+	var ce *websocket.CloseError
+	if !errors.As(err, &ce) || ce.Code != wsCloseTakenOver {
+		t.Fatalf("after the error: %v, want close %d", err, wsCloseTakenOver)
+	}
+}
+
+// Any other agent error leaves the socket open.
+func TestOtherAgentErrorsDoNotClose(t *testing.T) {
+	for _, f := range []string{
+		`{"type":"error","code":"other","message":"x"}`, `{"type":"ice"}`, `not json`,
+		`{"type":"offer","code":"taken_over"}`,
+	} {
+		if isTakenOverError([]byte(f)) {
+			t.Errorf("isTakenOverError(%s) = true", f)
+		}
+	}
+}

@@ -42,6 +42,7 @@ type launchProfileJSON struct {
 	Description string                  `json:"description"`
 	Visibility  string                  `json:"visibility"`
 	SortOrder   int32                   `json:"sort_order"`
+	Transport   string                  `json:"transport"`
 	Rungs       []launchProfileRungJSON `json:"rungs"`
 	UsedBy      *LaunchProfileUsedBy    `json:"used_by,omitempty"`
 	Warnings    []writeWarning          `json:"warnings"`
@@ -54,6 +55,7 @@ func toLaunchProfileJSON(lp profile.LaunchProfile) launchProfileJSON {
 		Description: lp.Description,
 		Visibility:  string(lp.Visibility),
 		SortOrder:   lp.SortOrder,
+		Transport:   lp.Transport,
 		Rungs:       make([]launchProfileRungJSON, 0, len(lp.Rungs)),
 		Warnings:    []writeWarning{},
 	}
@@ -165,6 +167,7 @@ type launchProfileReq struct {
 	Description *string   `json:"description"`
 	Visibility  *string   `json:"visibility"`
 	SortOrder   *int32    `json:"sort_order"`
+	Transport   *string   `json:"transport"`
 	Rungs       *[]string `json:"rungs"`
 }
 
@@ -189,6 +192,10 @@ func (h *Handler) handleAdminCreateLaunchProfile(w http.ResponseWriter, r *http.
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "visibility must be user, debug, or internal")
 		return
 	}
+	if req.Transport != nil && !validLaunchProfileTransport(*req.Transport) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, errTransportValue)
+		return
+	}
 
 	rungs, err := h.resolveRungWrite(r, *req.Rungs)
 	if err != nil {
@@ -203,6 +210,7 @@ func (h *Handler) handleAdminCreateLaunchProfile(w http.ResponseWriter, r *http.
 		Description: req.Description,
 		Visibility:  req.Visibility,
 		SortOrder:   req.SortOrder,
+		Transport:   req.Transport,
 		Rungs:       rungIDs(rungs),
 	})
 	if errors.Is(err, ErrLaunchProfileExists) {
@@ -232,11 +240,16 @@ func (h *Handler) handleAdminPatchLaunchProfile(w http.ResponseWriter, r *http.R
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "visibility must be user, debug, or internal")
 		return
 	}
+	if req.Transport != nil && !validLaunchProfileTransport(*req.Transport) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, errTransportValue)
+		return
+	}
 
 	write := LaunchProfileWrite{
 		Description: req.Description,
 		Visibility:  req.Visibility,
 		SortOrder:   req.SortOrder,
+		Transport:   req.Transport,
 	}
 	if req.DisplayName != nil {
 		name := strings.TrimSpace(*req.DisplayName)
@@ -379,4 +392,10 @@ func validProfileVisibility(v string) bool {
 		return true
 	}
 	return false
+}
+
+const errTransportValue = "transport must be webrtc, webtransport_opt_in, or webtransport"
+
+func validLaunchProfileTransport(v string) bool {
+	return v == transportWebRTC || v == transportOptIn || v == transportWebTransport
 }

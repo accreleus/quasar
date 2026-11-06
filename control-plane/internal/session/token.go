@@ -28,10 +28,20 @@ func newSignalingToken(now time.Time) (signalingToken, error) {
 		return signalingToken{}, fmt.Errorf("generate signaling token: %w", err)
 	}
 	plain := hex.EncodeToString(b)
-	h := sha256.Sum256([]byte(plain))
 	return signalingToken{
 		Plaintext: plain,
-		Hash:      hex.EncodeToString(h[:]),
+		Hash:      hashToken(plain),
 		ExpiresAt: now.Add(SignalingTokenTTL),
 	}, nil
 }
+
+// hashToken is the stored form of a token: lowercase hex SHA-256 of its UTF-8 bytes, the same
+// value the agent is sent as wt_token_hash.
+func hashToken(plaintext string) string {
+	h := sha256.Sum256([]byte(plaintext))
+	return hex.EncodeToString(h[:])
+}
+
+// transportGrant is a freshly minted WebTransport token: same shape and TTL as the signaling
+// token (transport-webtransport.md §Authentication and tokens), stored with kind 'transport'.
+type transportGrant = signalingToken
