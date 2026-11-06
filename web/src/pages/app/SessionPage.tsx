@@ -17,7 +17,7 @@ import "../../styles/session.css";
 import "../../styles/hud.css";
 import { getSession, mintSignalingToken, stopSession } from "../../api/library";
 import { ApiError } from "../../api/client";
-import type { ICEServer } from "../../api/types";
+import type { ICEServer, WebTransportCoords } from "../../api/types";
 import { useAuth } from "../../auth/context";
 import {
   keyboardLockSupported,
@@ -30,6 +30,7 @@ import {
   type SessionRuntime,
   type SessionRuntimeSnapshot,
 } from "./sessionRuntime";
+import { createWebTransportRuntime } from "./webTransportRuntime";
 import { MicCapture, MicCaptureError, withUntrustedCertContext } from "../../webrtc/mic";
 import { probeCertificateTrust, type CertTrust } from "../../lib/certTrust";
 import { useToast } from "../../components/Toast";
@@ -118,6 +119,8 @@ interface SessionState {
   micGranted?: boolean;
   /** ?playout= override from the App page URL, carried through navigation. */
   playoutOverride?: number | null;
+  /** Amendment 54: present when the stream plan chose WebTransport. */
+  webtransport?: WebTransportCoords;
 }
 
 // Keyed on the id so a route change between two sessions (a toast's "Go to
@@ -138,6 +141,9 @@ function SessionPageBody() {
   useDarkLock();
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  // WebTransport draws here; the <video> stays mounted and empty.
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const webtransport = state?.webtransport;
   const containerRef = useRef<HTMLDivElement>(null);
   // The HUD owns whether it is open and on which section; this page only asks
   // it to open (summon chord, stage click, touch button) and to collapse.
@@ -402,7 +408,19 @@ function SessionPageBody() {
   useEffect(() => {
     if (!signalCoords.url || !signalCoords.token || !videoRef.current) return;
 
-    const rt = createSessionRuntime({
+    // A replacement re-seat is WebRTC's recovery; it never comes back here as WebTransport.
+    const rt = webtransport && canvasRef.current && !signalCoords.replacement
+      ? createWebTransportRuntime({
+          sessionId: sessionId ?? "",
+          authToken: authToken ?? "",
+          coords: webtransport,
+          canvas: canvasRef.current,
+          callbacks: {
+            onDisconnectSuspected: () => void pollEndReason(),
+            onSessionTakenOver: () => noteFailure(takenOverFailure()),
+          },
+        })
+      : createSessionRuntime({
       sessionId: sessionId ?? "",
       authToken: authToken ?? "",
       signaling: signalCoords,
@@ -1025,7 +1043,9 @@ function SessionPageBody() {
           muted
           playsInline
           autoPlay
+          hidden={webtransport !== undefined}
         />
+        {webtransport && <canvas ref={canvasRef} className="session-video" />}
       </div>
 
       {/* The launch/status line stays bottom-anchored and click-through. */}
@@ -1203,6 +1223,7 @@ function SessionPageBody() {
             appName={appTitle}
             tier={state?.tier}
             resolvedCodec={state?.resolvedCodec}
+            transport={webtransport ? "webtransport" : "webrtc"}
             sessionId={sessionId}
             inputCaptured={inputCaptured}
             onGrab={handleGrab}

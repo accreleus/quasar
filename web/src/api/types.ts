@@ -303,6 +303,9 @@ export type ICEServer = Schemas["ICEServer"];
 
 export type SignalingCoords = Schemas["SignalingCoords"];
 
+/** `transport_options.webtransport` (amendment 54). */
+export type WebTransportCoords = Schemas["WebTransportCoords"];
+
 export type LaunchResponse = Omit<Schemas["LaunchResponse"], "session"> & {
   session: Session;
 };
