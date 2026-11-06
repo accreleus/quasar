@@ -9,35 +9,6 @@ export interface Presenter {
   destroy(): void;
 }
 
-// The slice of WebGPU used here. TypeScript's DOM lib has no WebGPU types yet.
-interface Gpu {
-  requestAdapter(): Promise<{ requestDevice(): Promise<GpuDevice> } | null>;
-  getPreferredCanvasFormat(): string;
-}
-interface GpuDevice {
-  queue: { submit(buffers: unknown[]): void };
-  createShaderModule(d: { code: string }): unknown;
-  createRenderPipeline(d: unknown): { getBindGroupLayout(i: number): unknown };
-  createSampler(d: unknown): unknown;
-  importExternalTexture(d: { source: VideoFrame }): unknown;
-  createBindGroup(d: unknown): unknown;
-  createCommandEncoder(): {
-    beginRenderPass(d: unknown): {
-      setPipeline(p: unknown): void;
-      setBindGroup(i: number, g: unknown): void;
-      setViewport(x: number, y: number, w: number, h: number, min: number, max: number): void;
-      draw(n: number): void;
-      end(): void;
-    };
-    finish(): unknown;
-  };
-  destroy(): void;
-}
-interface GpuCanvasContext {
-  configure(d: { device: GpuDevice; format: string; alphaMode: string }): void;
-  getCurrentTexture(): { createView(): unknown };
-}
-
 const SHADER = /* wgsl */ `
 @group(0) @binding(0) var s: sampler;
 @group(0) @binding(1) var t: texture_external;
@@ -68,11 +39,11 @@ export function containRect(
 
 /** Null when the browser has no WebGPU adapter. */
 export async function createWebGpuPresenter(canvas: HTMLCanvasElement): Promise<Presenter | null> {
-  const gpu = (navigator as Navigator & { gpu?: Gpu }).gpu;
+  const gpu = navigator.gpu as GPU | undefined;
   const adapter = await gpu?.requestAdapter();
   if (!gpu || !adapter) return null;
   const device = await adapter.requestDevice();
-  const context = canvas.getContext("webgpu") as unknown as GpuCanvasContext | null;
+  const context = canvas.getContext("webgpu");
   if (!context) return null;
   const format = gpu.getPreferredCanvasFormat();
   // Transparent outside the picture: the canvas's CSS background is the letterbox.
