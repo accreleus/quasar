@@ -1,0 +1,24 @@
+import { defineConfig } from "vitest/config";
+import { playwright } from "@vitest/browser-playwright";
+
+// WebGPU tests (*.webgpu.test.ts) in headless Chromium on SwiftShader, which exposes `subgroups`
+// but not `shader-f16`. Run with `make test-webgpu`: the browser comes from the Playwright image
+// whose version matches the pinned `playwright` devDependency.
+export default defineConfig({
+  // The golden fixtures live in testdata/ at the repo root.
+  server: { fs: { allow: [".."] } },
+  test: {
+    include: ["src/**/*.webgpu.test.ts"],
+    testTimeout: 60_000,
+    browser: {
+      enabled: true,
+      headless: true,
+      provider: playwright({
+        launchOptions: {
+          args: ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-vulkan=swiftshader", "--use-webgpu-adapter=swiftshader", "--disable-vulkan-surface", "--enable-unsafe-swiftshader"],
+        },
+      }),
+      instances: [{ browser: "chromium" }],
+    },
+  },
+});
