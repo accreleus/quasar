@@ -775,6 +775,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gst-plugin-pyrowave"
+version = "0.1.0"
+dependencies = [
+ "glib",
+ "gstreamer",
+ "gstreamer-app",
+ "gstreamer-video",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "gstreamer"
 version = "0.25.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1691,6 +1703,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "glib",
+ "gst-plugin-pyrowave",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-rtp",

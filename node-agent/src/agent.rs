@@ -1396,6 +1396,8 @@ fn gpu_excluded_codecs(gpu: &crate::messages::GpuCapacity) -> BTreeSet<Codec> {
 struct CodecLayers {
     plan: fn(EncoderChoice, &str) -> BTreeSet<Codec>,
     excluded: fn(&crate::messages::GpuCapacity) -> BTreeSet<Codec>,
+    /// `pyrowaveenc` is registered: every GPU gets a PyroWave codec probe.
+    pyrowave: fn() -> bool,
 }
 
 impl Default for CodecLayers {
@@ -1403,6 +1405,7 @@ impl Default for CodecLayers {
         CodecLayers {
             plan: registry_codec_plan,
             excluded: gpu_excluded_codecs,
+            pyrowave: || gstreamer::ElementFactory::find("pyrowaveenc").is_some(),
         }
     }
 }
@@ -1427,6 +1430,10 @@ impl CodecStack<'_> {
         (self.layers.plan)(self.settings.encoder, gpu_render_node_for_plan(gpu))
     }
 
+    fn pyrowave(&self) -> bool {
+        self.registry && (self.layers.pyrowave)()
+    }
+
     /// What decides whether a host probe's earlier result still applies.
     fn probe_inputs(&self) -> crate::host_probe::decision::ProbeInputs {
         let mut inputs = self.identity();
@@ -1436,8 +1443,11 @@ impl CodecStack<'_> {
             .gpus
             .iter()
             .filter_map(|g| {
-                let targets =
+                let mut targets =
                     crate::gpu_codecs::probeable_codecs(&self.plan(g), &(self.layers.excluded)(g));
+                if self.pyrowave() {
+                    targets.insert(crate::host_probe::ProbeCodec::PyroWave);
+                }
                 (!targets.is_empty()).then_some((g.index, targets))
             })
             .collect();
@@ -1488,9 +1498,24 @@ fn gpu_codec_sets(
     stack: &CodecStack<'_>,
     report: &crate::readiness::report::ReadinessReport,
     evidence: &crate::host_probe::outcome::CodecEvidence,
-) -> Vec<(i32, BTreeSet<Codec>)> {
+) -> GpuCodecSets {
     let identity = stack.identity();
-    stack
+    let pyrowave = stack
+        .gpus
+        .iter()
+        .filter(|gpu| {
+            gpu.encode_slots_total > 0
+                && stack.pyrowave()
+                && evidence.proven(
+                    report,
+                    gpu.index,
+                    crate::host_probe::ProbeCodec::PyroWave,
+                    identity.evidence_stamp(gpu.index).as_ref(),
+                )
+        })
+        .map(|gpu| gpu.index)
+        .collect();
+    let sets = stack
         .gpus
         .iter()
         .map(|gpu| {
@@ -1507,7 +1532,16 @@ fn gpu_codec_sets(
             );
             (gpu.index, set)
         })
-        .collect()
+        .collect();
+    GpuCodecSets { sets, pyrowave }
+}
+
+/// Per-GPU session-codec sets, and the GPUs whose PyroWave probe passed under the current
+/// stack. PyroWave is a wire codec only (codec-pyrowave.md §Wire vocabulary), so it never
+/// enters `sets`, which the assign belt reads.
+struct GpuCodecSets {
+    sets: Vec<(i32, BTreeSet<Codec>)>,
+    pyrowave: BTreeSet<i32>,
 }
 
 /// A `session_assign` the codec belt refuses: the log line and the ack error, decided
@@ -1556,10 +1590,13 @@ fn assign_codec_refusal(
 /// The host union (`capacity.codecs`, #301, agent-api.md amendment 12) as wire strings,
 /// from already-computed per-GPU sets: H.264 plus every codec any usable GPU's set
 /// carries. Always non-empty.
-fn host_codecs_from_sets(sets: &[(i32, BTreeSet<Codec>)]) -> Vec<String> {
-    crate::gpu_codecs::host_codec_set(sets.iter().map(|(_, s)| s))
+fn host_codecs_from_sets(sets: &GpuCodecSets) -> Vec<String> {
+    crate::gpu_codecs::host_codec_set(sets.sets.iter().map(|(_, s)| s))
         .into_iter()
         .map(|c| c.as_str().to_string())
+        .chain(
+            (!sets.pyrowave.is_empty()).then(|| crate::session::probe_media::PYROWAVE.to_string()),
+        )
         .collect()
 }
 
@@ -1572,12 +1609,19 @@ fn host_codecs_from_sets(sets: &[(i32, BTreeSet<Codec>)]) -> Vec<String> {
 /// go by the host set". Omission is left to the case this stack never actually
 /// produces — a GPU present in inventory but absent from `sets` — rather than
 /// collapsed into the zero-slot case.
-fn apply_gpu_codecs(gpus: &mut [crate::messages::GpuCapacity], sets: &[(i32, BTreeSet<Codec>)]) {
+fn apply_gpu_codecs(gpus: &mut [crate::messages::GpuCapacity], sets: &GpuCodecSets) {
     for gpu in gpus.iter_mut() {
+        let pyrowave = sets.pyrowave.contains(&gpu.index);
         gpu.codecs = sets
+            .sets
             .iter()
             .find(|(index, _)| *index == gpu.index)
-            .map(|(_, set)| set.iter().map(|c| c.as_str().to_string()).collect());
+            .map(|(_, set)| {
+                set.iter()
+                    .map(|c| c.as_str().to_string())
+                    .chain(pyrowave.then(|| crate::session::probe_media::PYROWAVE.to_string()))
+                    .collect()
+            });
     }
 }
 
@@ -3633,7 +3677,7 @@ impl SessionManager {
     /// Per-GPU codec sets for the current stack (#301/#302) — the one computation
     /// `advertised_codecs` (the host union) and `apply_gpu_codecs` (the per-GPU wire
     /// field) both derive from.
-    fn gpu_codec_sets(&self) -> Vec<(i32, BTreeSet<Codec>)> {
+    fn gpu_codec_sets(&self) -> GpuCodecSets {
         gpu_codec_sets(&self.codec_stack(), &self.readiness, &self.codec_evidence)
     }
 
@@ -3984,7 +4028,7 @@ impl SessionManager {
                     &session_id,
                     gpu_index,
                     cfg.stream.codec,
-                    &self.gpu_codec_sets(),
+                    &self.gpu_codec_sets().sets,
                 ) {
                     // guarded by assign_refusal_logs_the_codec_not_in_gpu_set_token
                     warn!(token = "assign-codec-not-in-gpu-set", "{}", refusal.log);
@@ -8553,6 +8597,7 @@ mod tests {
         mgr.codec_layers = CodecLayers {
             plan,
             excluded: exclude_none,
+            pyrowave: || false,
         };
         mgr.host_codec_report = Some(HostCodecReport {
             codecs: vec!["h264".into(), "h265".into(), "av1".into()],
@@ -8717,10 +8762,13 @@ mod tests {
             gpu(1, "amd", Some("/dev/dri/renderD129")),
         ];
         gpus[1].encode_slots_total = 0;
-        let sets = vec![
-            (0, BTreeSet::from([Codec::H264, Codec::H265])),
-            (1, BTreeSet::new()),
-        ];
+        let sets = GpuCodecSets {
+            sets: vec![
+                (0, BTreeSet::from([Codec::H264, Codec::H265])),
+                (1, BTreeSet::new()),
+            ],
+            pyrowave: BTreeSet::new(),
+        };
         apply_gpu_codecs(&mut gpus, &sets);
         assert_eq!(
             gpus[0].codecs,
@@ -8754,7 +8802,7 @@ mod tests {
         );
         prove(&mut mgr, 0, ProbeCodec::H265);
         prove(&mut mgr, 1, ProbeCodec::Av1);
-        let sets = mgr.gpu_codec_sets();
+        let sets = mgr.gpu_codec_sets().sets;
         let gpu0 = sets.iter().find(|(i, _)| *i == 0).unwrap();
         let gpu1 = sets.iter().find(|(i, _)| *i == 1).unwrap();
         assert_eq!(gpu0.1, BTreeSet::from([Codec::H264, Codec::H265]));
@@ -8764,6 +8812,48 @@ mod tests {
             wire(&["h264", "h265", "av1"]),
             "the host union is the per-GPU sets' union"
         );
+    }
+
+    /// #1056: with `pyrowaveenc` registered every GPU gets a PyroWave codec probe, and a
+    /// pass puts `pyrowave` on that GPU's wire set and the host union, never in the
+    /// session-codec sets the assign belt reads.
+    #[test]
+    fn a_pyrowave_pass_is_a_wire_codec_of_that_gpu_only() {
+        use crate::host_probe::ProbeCodec;
+        let gpus = || {
+            vec![
+                gpu(0, "nvidia", Some("/dev/dri/renderD128")),
+                gpu(1, "amd", Some("/dev/dri/renderD129")),
+            ]
+        };
+        let mut mgr = codec_mgr(gpus(), |_, _| BTreeSet::from([Codec::H264]));
+        prove(&mut mgr, 0, ProbeCodec::PyroWave);
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264"]),
+            "no pyrowaveenc in the registry: a held pass advertises nothing"
+        );
+        assert!(probe_inputs(&mgr).codecs.is_empty());
+
+        mgr.codec_layers.pyrowave = || true;
+        let targets = probe_inputs(&mgr).codecs;
+        for index in [0, 1] {
+            assert_eq!(
+                targets.get(&index),
+                Some(&BTreeSet::from([ProbeCodec::PyroWave]))
+            );
+        }
+        prove(&mut mgr, 0, ProbeCodec::PyroWave);
+        let sets = mgr.gpu_codec_sets();
+        let mut reported = gpus();
+        apply_gpu_codecs(&mut reported, &sets);
+        assert_eq!(reported[0].codecs, wire(&["h264", "pyrowave"]));
+        assert_eq!(reported[1].codecs, wire(&["h264"]));
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264", "pyrowave"]));
+        assert!(sets
+            .sets
+            .iter()
+            .all(|(_, set)| set == &BTreeSet::from([Codec::H264])));
     }
 
     fn session_assign_msg_codec(session_id: &str, gpu_index: i32, codec: &str) -> ControlMsg {
@@ -8841,7 +8931,7 @@ mod tests {
             vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
             plan_all,
         );
-        let expected = assign_codec_refusal("s1", 0, Codec::H265, &mgr.gpu_codec_sets())
+        let expected = assign_codec_refusal("s1", 0, Codec::H265, &mgr.gpu_codec_sets().sets)
             .expect("GPU 0 has proven nothing yet");
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         match mgr.handle_control(
@@ -10685,6 +10775,7 @@ mod tests {
                 _ => BTreeSet::new(),
             },
             excluded: exclude_none,
+            pyrowave: || false,
         };
         let with_codecs = probe_inputs(&mgr);
         assert_eq!(
