@@ -11,9 +11,8 @@ export const BLOCK_LOST = 0xffff_fffe;
 
 export type PyroWaveErrorReason =
   | "bad_frame" // malformed input: drop the frame
-  | "unsupported" // a configuration this decoder does not carry: use another codec
+  | "unsupported" // a configuration or forced decoder path this decoder or device cannot carry
   | "too_large" // the configuration does not fit this device or the negotiated resolution
-  | "no_subgroups" // the device lacks what the decoder path needs (fallback: #1055)
   | "gpu_error" // WebGPU reported a validation or out-of-memory error
   | "device_lost" // rebuild the device and the decoder
   | "destroyed";
