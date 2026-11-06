@@ -124,6 +124,10 @@ impl Drop for Agent {
 }
 
 async fn agent() -> Agent {
+    agent_with(Limits::default()).await
+}
+
+async fn agent_with(limits: Limits) -> Agent {
     gst::init().unwrap();
     assert!(
         gst::ElementFactory::find("openh264enc").is_some(),
@@ -151,7 +155,7 @@ async fn agent() -> Agent {
     assert!(tap.is_some(), "an assigned session takes the tap");
     pipeline.set_state(gst::State::Playing).unwrap();
 
-    let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), registry)
+    let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), registry, limits)
         .await
         .unwrap();
     tokio::spawn(listener.clone().serve());
@@ -363,14 +367,13 @@ async fn before_hello_the_agent_reads_one_stream_and_waits_five_seconds() {
     // Half a length prefix: the control stream is then the first the agent sees.
     let oversized = 65_537u32.to_le_bytes();
     control.write_all(&oversized[..2]).await.unwrap();
-    let (mut second, mut second_recv) = session.open_bi().await.unwrap();
-    second.write_all(b"not the control stream").await.unwrap();
+    // The CONNECT stream and the control stream are the two bidirectional streams the
+    // agent allows: a third cannot be opened at all.
     assert!(
-        tokio::time::timeout(Duration::from_secs(5), second_recv.read(&mut [0; 8]))
+        tokio::time::timeout(Duration::from_secs(1), session.open_bi())
             .await
-            .unwrap()
             .is_err(),
-        "a second stream is refused"
+        "no second stream beside the control stream"
     );
     let sent = Instant::now();
     control.write_all(&oversized[2..]).await.unwrap();
@@ -435,7 +438,11 @@ async fn the_newest_client_takes_over_and_an_ended_session_says_so() {
 
 #[tokio::test]
 async fn past_64_unauthenticated_connections_new_sessions_are_refused() {
-    let agent = agent().await;
+    let agent = agent_with(Limits {
+        per_source: 0,
+        ..Limits::default()
+    })
+    .await;
     let mut held = Vec::new();
     for _ in 0..MAX_UNAUTHENTICATED {
         held.push(agent.connect().await);
@@ -541,4 +548,248 @@ async fn a_live_agent_streams_h264_to_the_conformance_client() {
     )
     .await
     .unwrap();
+}
+
+/// A QUIC peer that completes the handshake and then sends nothing: no HTTP/3 settings,
+/// no CONNECT. It takes any certificate.
+#[derive(Debug)]
+struct AnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &rustls_pki_types::CertificateDer<'_>,
+        _: &[rustls_pki_types::CertificateDer<'_>],
+        _: &rustls_pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn raw_endpoint() -> quinn::Endpoint {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    endpoint
+}
+
+/// Open `n` raw QUIC connections at once; the ones the agent let through.
+async fn raw_connections(
+    agent: &Agent,
+    endpoint: &quinn::Endpoint,
+    n: usize,
+) -> Vec<quinn::Connection> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], agent.url.port().unwrap()));
+    let attempts =
+        (0..n).map(|_| async move { endpoint.connect(addr, "quasar-node-agent").unwrap().await });
+    futures_util::future::join_all(attempts)
+        .await
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect()
+}
+
+#[tokio::test]
+async fn peers_that_never_send_connect_hold_a_slot_until_the_deadline_and_never_pass_the_cap() {
+    let agent = agent_with(Limits {
+        per_source: 0,
+        ..Limits::default()
+    })
+    .await;
+    let endpoint = raw_endpoint();
+    let started = Instant::now();
+    let held = raw_connections(&agent, &endpoint, 200).await;
+    assert!(
+        started.elapsed() < HELLO_DEADLINE,
+        "the burst must fit inside one deadline for the count to mean anything"
+    );
+    assert_eq!(
+        held.len(),
+        MAX_UNAUTHENTICATED,
+        "exactly the cap got through"
+    );
+    assert!(
+        ClientBuilder::new()
+            .with_server_certificate_hashes(vec![agent.hash.clone()])
+            .unwrap()
+            .connect(agent.url.clone())
+            .await
+            .is_err(),
+        "a browser is refused while silent peers hold every slot"
+    );
+    for conn in &held {
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(10), conn.closed()).await,
+            Ok(quinn::ConnectionError::ApplicationClosed(_))
+        ));
+    }
+    let closed_after = started.elapsed();
+    assert!(
+        closed_after >= Duration::from_millis(4500) && closed_after < Duration::from_secs(8),
+        "closed at the hello deadline, after {closed_after:?}"
+    );
+    let (_session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack", "the slots came back");
+}
+
+#[tokio::test]
+async fn one_source_holds_at_most_its_share_of_the_slots() {
+    let agent = agent_with(Limits {
+        unauthenticated: MAX_UNAUTHENTICATED,
+        per_source: 4,
+    })
+    .await;
+    let endpoint = raw_endpoint();
+    let held = raw_connections(&agent, &endpoint, 6).await;
+    assert_eq!(held.len(), 4);
+}
+
+#[tokio::test]
+async fn streams_before_the_control_stream_are_stopped_and_the_hello_still_lands() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    for i in 0..20 {
+        let mut uni = tokio::time::timeout(Duration::from_secs(5), session.open_uni())
+            .await
+            .unwrap_or_else(|_| panic!("stream {i} was never given credit: refused streams leak"))
+            .unwrap();
+        let _ = uni.write_all(&[0u8; 4096]).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), uni.stopped())
+                .await
+                .is_ok_and(|stopped| matches!(stopped, Ok(Some(_)))),
+            "stream {i} got STOP_SENDING"
+        );
+    }
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN, "session_id": SESSION});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(read_message(&mut recv).await.unwrap()["type"], "hello_ack");
+}
+
+#[test]
+fn two_hellos_racing_one_token_redeem_it_once() {
+    for _ in 0..200 {
+        let registry = Arc::new(Registry::default());
+        registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
+        assert!(registry.set_media(SESSION, ready_media()));
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let (registry, start) = (registry.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    registry
+                        .redeem(&hello_for(SESSION, TOKEN, 1), SystemTime::now())
+                        .is_ok()
+                })
+            })
+            .collect();
+        let won = racers
+            .into_iter()
+            .map(|r| r.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(won, 1);
+    }
+}
+
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_64_kib_session_id_is_refused_and_logged_bounded() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let huge = format!("\"\n{}", "x".repeat(65_000));
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN, "session_id": huge});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(
+        read_message(&mut recv).await.unwrap()["code"],
+        "session_not_ready"
+    );
+
+    // The refusal's own log call, captured on this thread (a scoped subscriber does not
+    // reach tasks other tests' subscribers race with).
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(captured.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        log_refusal(&huge, "session_not_ready");
+    });
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(logs.lines().count(), 1, "one line: {logs}");
+    assert!(logs.len() < 400, "a {} byte log line", logs.len());
+    assert!(
+        logs.contains("\\\"\\n") && logs.contains(&"x".repeat(62)),
+        "escaped and cut: {logs}"
+    );
+    assert!(
+        !logs.contains(&"x".repeat(63)),
+        "cut at 64 characters: {logs}"
+    );
 }

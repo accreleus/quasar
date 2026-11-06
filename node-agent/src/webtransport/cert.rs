@@ -82,15 +82,27 @@ impl CertSet {
     }
 
     /// Ages the set to `now`: drops what expired, makes the next certificate once the
-    /// newest has 72 h or less. True when the reported list changed.
+    /// newest has 72 h or less. True when the reported list changed. On `Err` the set is
+    /// as it was, so it is never empty once made.
     pub(crate) fn tick(&mut self, now: SystemTime) -> Result<bool> {
+        self.tick_with(now, Cert::make)
+    }
+
+    fn tick_with(
+        &mut self,
+        now: SystemTime,
+        make: impl FnOnce(SystemTime) -> Result<Cert>,
+    ) -> Result<bool> {
+        let newest_live = self.certs.iter().rev().find(|c| c.not_after > now);
+        let next = if newest_live.is_none_or(|c| c.left(now) <= MAKE_NEXT) {
+            Some(make(now)?)
+        } else {
+            None
+        };
         let before = self.certs.len();
         self.certs.retain(|c| c.not_after > now);
-        let mut changed = self.certs.len() != before;
-        if self.certs.last().is_none_or(|c| c.left(now) <= MAKE_NEXT) {
-            self.certs.push(Cert::make(now)?);
-            changed = true;
-        }
+        let changed = self.certs.len() != before || next.is_some();
+        self.certs.extend(next);
         Ok(changed)
     }
 
@@ -102,10 +114,15 @@ impl CertSet {
         }
     }
 
-    /// `capacity.webtransport.certificates`: the presented one first.
+    /// `capacity.webtransport.certificates`: the presented one first, none expired.
     pub(crate) fn report(&self, now: SystemTime) -> Vec<CertReport> {
         let first = self.presented(now).sha256.clone();
-        let mut out: Vec<CertReport> = self.certs.iter().map(Cert::report).collect();
+        let mut out: Vec<CertReport> = self
+            .certs
+            .iter()
+            .filter(|c| c.not_after > now)
+            .map(Cert::report)
+            .collect();
         out.sort_by_key(|c| c.sha256 != first);
         out
     }
@@ -163,5 +180,28 @@ mod tests {
         let report = set.report(expires);
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].sha256, next);
+    }
+
+    #[test]
+    fn a_failed_rotation_keeps_the_set_and_expired_certificates_are_not_reported() {
+        let t0 = SystemTime::now();
+        let mut set = CertSet::new(t0).unwrap();
+        let first = set.presented(t0).sha256.clone();
+        let expired = set.certs[0].not_after + HOUR;
+        let failed = set.tick_with(expired, |_| anyhow::bail!("no entropy"));
+        assert!(failed.is_err());
+        assert_eq!(set.certs.len(), 1, "the old set is kept");
+        assert_eq!(
+            set.presented(expired).sha256,
+            first,
+            "presented() still has one"
+        );
+        assert!(
+            set.report(expired).is_empty(),
+            "an expired certificate is not reported"
+        );
+        assert!(set.tick(expired).unwrap());
+        assert_eq!(set.report(expired).len(), 1);
+        assert_ne!(set.report(expired)[0].sha256, first);
     }
 }

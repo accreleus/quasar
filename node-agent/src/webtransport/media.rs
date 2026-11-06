@@ -3,7 +3,7 @@
 //! (`protocol/transport-webtransport.md` §Video).
 
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use gstreamer as gst;
@@ -17,6 +17,8 @@ const CHANNEL_VIDEO: u8 = 0x01;
 const FLAG_KEYFRAME: u8 = 1;
 /// Units queued for a client before it is resynced with a keyframe.
 const CLIENT_QUEUE: usize = 32;
+/// Forced keyframes closer together than this are coalesced into the last one.
+const KEYFRAME_SPACING: Duration = Duration::from_millis(150);
 
 /// The decoder configuration a `hello_ack` names.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,14 +55,15 @@ pub(crate) enum Out {
 pub(crate) enum Gone {
     TakenOver,
     SessionEnded,
-    /// It missed a configuration, so it cannot decode what follows.
-    Lagged,
 }
 
 struct Client {
     id: u64,
     tx: mpsc::Sender<Out>,
     gone: Arc<OnceLock<Gone>>,
+    /// Its queue was full at a configuration change: the configuration goes ahead of
+    /// the next keyframe instead.
+    resync: bool,
 }
 
 #[derive(Default)]
@@ -68,11 +71,15 @@ struct State {
     config: Option<Arc<VideoConfig>>,
     client: Option<Client>,
     next_client: u64,
-    /// Skip delta units until a keyframe: a client joined, or its queue overflowed.
+    /// Skip delta units until a keyframe: a client joined, its queue overflowed, or the
+    /// configuration changed.
     want_key: bool,
     frame_seq: u16,
     last_ts: u32,
     warned_format: bool,
+    /// Set by `end`: no client attaches after it.
+    ended: bool,
+    last_forced: Option<Instant>,
 }
 
 /// The tap's side of a session: fed by the GStreamer streaming thread, read by the
@@ -113,6 +120,9 @@ impl Media {
         let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
         let gone = Arc::new(OnceLock::new());
         let mut st = self.lock();
+        if st.ended {
+            return None;
+        }
         let config = st.config.clone()?;
         st.next_client += 1;
         let id = st.next_client;
@@ -120,6 +130,7 @@ impl Media {
             id,
             tx,
             gone: gone.clone(),
+            resync: false,
         }) {
             let _ = old.gone.set(Gone::TakenOver);
         }
@@ -142,16 +153,35 @@ impl Media {
     }
 
     pub(crate) fn end(&self) {
-        if let Some(old) = self.lock().client.take() {
+        let mut st = self.lock();
+        st.ended = true;
+        if let Some(old) = st.client.take() {
             let _ = old.gone.set(Gone::SessionEnded);
         }
     }
 
-    /// The keyframe request: the same forced IDR PLI takes.
+    /// The keyframe request: the force-key-unit event PLI sends. A client drives this,
+    /// so requests inside `KEYFRAME_SPACING` of the last are dropped and it logs at debug.
     pub(crate) fn keyframe(&self) {
-        if let Some(encoder) = self.encoder.upgrade() {
-            crate::session::pipeline::force_idr(&encoder);
+        {
+            let mut st = self.lock();
+            let now = Instant::now();
+            if st
+                .last_forced
+                .is_some_and(|at| now.duration_since(at) < KEYFRAME_SPACING)
+            {
+                return;
+            }
+            st.last_forced = Some(now);
         }
+        let Some(pad) = self.encoder.upgrade().and_then(|e| e.static_pad("src")) else {
+            return;
+        };
+        let accepted = pad.send_event(crate::session::pipeline::force_key_unit_event());
+        tracing::debug!(
+            accepted,
+            "WebTransport keyframe request sent to the encoder"
+        );
     }
 
     pub(super) fn on_caps(&self, caps: &gst::CapsRef, session_id: &str) {
@@ -177,13 +207,23 @@ impl Media {
             }
             config.config_id = old.config_id.wrapping_add(1);
         }
+        let changed = st.config.is_some();
         let config = Arc::new(config);
         st.config = Some(config.clone());
-        if let Some(client) = &st.client {
-            if client.tx.try_send(Out::Config(config)).is_err() {
-                let _ = client.gone.set(Gone::Lagged);
-                st.client = None;
-            }
+        // The encoder normally restarts on a keyframe; never send a delta across a change.
+        st.want_key = true;
+        let sent = st
+            .client
+            .as_ref()
+            .map(|c| c.tx.try_send(Out::Config(config)));
+        match (sent, st.client.as_mut()) {
+            (Some(Err(mpsc::error::TrySendError::Full(_))), Some(client)) => client.resync = true,
+            (Some(Err(mpsc::error::TrySendError::Closed(_))), _) => st.client = None,
+            _ => {}
+        }
+        drop(st);
+        if changed {
+            self.keyframe();
         }
     }
 
@@ -202,6 +242,29 @@ impl Media {
         };
         if st.want_key && !keyframe {
             return;
+        }
+        if st.client.as_ref().is_some_and(|c| c.resync) {
+            let sent = st
+                .client
+                .as_ref()
+                .map(|c| c.tx.try_send(Out::Config(config.clone())));
+            match sent {
+                Some(Ok(())) => {
+                    if let Some(client) = st.client.as_mut() {
+                        client.resync = false;
+                    }
+                }
+                Some(Err(mpsc::error::TrySendError::Full(_))) => {
+                    st.want_key = true;
+                    drop(st);
+                    self.keyframe();
+                    return;
+                }
+                _ => {
+                    st.client = None;
+                    return;
+                }
+            }
         }
         st.want_key = false;
         let Ok(map) = buffer.map_readable() else {
@@ -409,5 +472,132 @@ mod tests {
             .field("stream-format", "byte-stream")
             .build();
         assert!(video_config(&byte_stream).is_none());
+    }
+
+    fn caps(width: i32) -> gst::Caps {
+        gst::Caps::builder("video/x-h264")
+            .field("stream-format", "avc")
+            .field("width", width)
+            .field("height", 720)
+            .field("framerate", gst::Fraction::new(60, 1))
+            .field(
+                "codec_data",
+                gst::Buffer::from_slice(vec![1u8, 0x42, 0xc0, 0x1f, 0xff, 0xe1, 0, 0]),
+            )
+            .build()
+    }
+
+    fn buffer(keyframe: bool) -> gst::Buffer {
+        let mut b = gst::Buffer::from_slice(vec![0u8, 0, 0, 1, if keyframe { 0x65 } else { 0x41 }]);
+        if !keyframe {
+            b.get_mut().unwrap().set_flags(gst::BufferFlags::DELTA_UNIT);
+        }
+        b
+    }
+
+    /// Media over a stand-in encoder whose src pad counts the keyframe requests it gets.
+    fn counted() -> (
+        Arc<Media>,
+        gst::Element,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        gst::init().unwrap();
+        let encoder = gst::ElementFactory::make("identity").build().unwrap();
+        let forced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = forced.clone();
+        encoder.static_pad("src").unwrap().add_probe(
+            gst::PadProbeType::EVENT_UPSTREAM,
+            move |_, _| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            },
+        );
+        // An element in NULL has inactive pads, which refuse every event.
+        encoder.set_state(gst::State::Paused).unwrap();
+        (Media::new(&encoder), encoder, forced)
+    }
+
+    fn units(rx: &mut mpsc::Receiver<Out>) -> Vec<(bool, u8)> {
+        let mut out = Vec::new();
+        while let Ok(o) = rx.try_recv() {
+            out.push(match o {
+                Out::Unit(u) => (u.keyframe, u.config_id),
+                Out::Config(c) => (false, 100 + c.config_id),
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn a_new_configuration_forces_a_keyframe_and_no_delta_crosses_it() {
+        let (media, _encoder, forced) = counted();
+        media.on_caps(&caps(1280), "s");
+        let mut client = media.attach().unwrap();
+        media.on_unit(&buffer(true));
+        media.on_unit(&buffer(false));
+        assert_eq!(units(&mut client.rx), [(true, 0), (false, 0)]);
+
+        std::thread::sleep(KEYFRAME_SPACING);
+        let before = forced.load(std::sync::atomic::Ordering::SeqCst);
+        media.on_caps(&caps(960), "s");
+        assert_eq!(forced.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+        media.on_unit(&buffer(false));
+        media.on_unit(&buffer(true));
+        media.on_unit(&buffer(false));
+        assert_eq!(
+            units(&mut client.rx),
+            [(false, 101), (true, 1), (false, 1)],
+            "the hello_ack, then the keyframe; the delta in between is skipped"
+        );
+    }
+
+    #[test]
+    fn a_full_queue_at_a_configuration_change_resyncs_instead_of_dropping_the_client() {
+        let (media, _encoder, _) = counted();
+        media.on_caps(&caps(1280), "s");
+        let mut client = media.attach().unwrap();
+        media.on_unit(&buffer(true));
+        for _ in 1..CLIENT_QUEUE {
+            media.on_unit(&buffer(false));
+        }
+        media.on_caps(&caps(960), "s");
+        assert_eq!(
+            units(&mut client.rx).len(),
+            CLIENT_QUEUE,
+            "the configuration did not fit"
+        );
+        media.on_unit(&buffer(false));
+        media.on_unit(&buffer(true));
+        assert_eq!(
+            units(&mut client.rx),
+            [(false, 101), (true, 1)],
+            "the configuration goes ahead of the next keyframe"
+        );
+        assert!(client.gone.get().is_none(), "the client is still attached");
+    }
+
+    #[test]
+    fn keyframe_requests_closer_than_the_spacing_are_one() {
+        let (media, _encoder, forced) = counted();
+        for _ in 0..10 {
+            media.keyframe();
+        }
+        assert_eq!(forced.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::thread::sleep(KEYFRAME_SPACING);
+        media.keyframe();
+        assert_eq!(forced.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn no_client_attaches_after_the_session_ended() {
+        let (media, _encoder, _) = counted();
+        media.on_caps(&caps(1280), "s");
+        let first = media.attach().unwrap();
+        media.end();
+        assert_eq!(first.gone.get(), Some(&Gone::SessionEnded));
+        assert!(
+            media.attach().is_none(),
+            "a hello racing the end gets nothing"
+        );
     }
 }

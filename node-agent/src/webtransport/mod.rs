@@ -23,7 +23,7 @@ use gstreamer as gst;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::oneshot;
 use tokio::time::{timeout_at, Instant};
 use web_transport_quinn::{quinn, RecvStream, Request, SendStream, Session};
 
@@ -36,6 +36,12 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_CONTROL_MESSAGE: usize = 65_536;
 /// Unauthenticated connections held at once (§Before `hello`).
 const MAX_UNAUTHENTICATED: usize = 64;
+/// Of those, from one source address; `QUASAR_WT_UNAUTH_PER_SOURCE` overrides it.
+const DEFAULT_PER_SOURCE: usize = 4;
+/// Below this the 1200-byte datagram budget cannot be met (§Channels, "Datagram size").
+const MIN_DATAGRAM: usize = 1100;
+/// The longest prefix of a client-supplied id that reaches a log line.
+const LOGGED_ID: usize = 64;
 const TOKEN_SKEW: Duration = Duration::from_secs(15);
 const TOKEN_TTL: Duration = Duration::from_secs(60);
 const ROTATION_CHECK: Duration = Duration::from_secs(600);
@@ -118,6 +124,18 @@ fn token_hash(token: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+fn fixed_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && std::hint::black_box(a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y))) == 0
+}
+
+/// A client-supplied id, cut to `LOGGED_ID` characters for a log line.
+fn shown(id: &str) -> &str {
+    id.char_indices()
+        .nth(LOGGED_ID)
+        .map_or(id, |(at, _)| &id[..at])
 }
 
 /// `wt_token_expires_at`, RFC 3339.
@@ -213,7 +231,11 @@ impl Registry {
         }
         entry.tokens.retain(|t| now <= t.expires_at + TOKEN_SKEW);
         let hash = token_hash(&hello.token);
-        let Some(index) = entry.tokens.iter().position(|t| t.hash == hash) else {
+        let Some(index) = entry
+            .tokens
+            .iter()
+            .position(|t| fixed_time_eq(t.hash.as_bytes(), hash.as_bytes()))
+        else {
             return Err(Refusal::AuthFailed);
         };
         let Some(media) = entry.media.clone().filter(|m| m.ready()) else {
@@ -257,12 +279,72 @@ impl Drop for Tap {
     }
 }
 
+/// How many unauthenticated connections the listener holds, in all and per source
+/// address (0: no per-source cap, for an edge proxy that every client shares).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    pub(crate) unauthenticated: usize,
+    pub(crate) per_source: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            unauthenticated: MAX_UNAUTHENTICATED,
+            per_source: DEFAULT_PER_SOURCE,
+        }
+    }
+}
+
+/// The unauthenticated connections held now, by source address.
+struct Gate {
+    limits: Limits,
+    held: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// One unauthenticated connection's place in the gate, given back on drop.
+struct Slot {
+    gate: Arc<Gate>,
+    ip: IpAddr,
+}
+
+impl Gate {
+    fn take(self: &Arc<Self>, ip: IpAddr) -> Option<Slot> {
+        let ip = ip.to_canonical();
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = held.get(&ip).copied().unwrap_or(0);
+        if held.values().sum::<usize>() >= self.limits.unauthenticated
+            || (self.limits.per_source > 0 && mine >= self.limits.per_source)
+        {
+            return None;
+        }
+        held.insert(ip, mine + 1);
+        Some(Slot {
+            gate: self.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut held = self.gate.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = held.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// The running listener.
 pub struct Listener {
     registry: Arc<Registry>,
     certs: Mutex<CertSet>,
     quic: quinn::Endpoint,
     port: u16,
+    limits: Limits,
 }
 
 static LISTENER: OnceLock<Arc<Listener>> = OnceLock::new();
@@ -292,8 +374,19 @@ pub async fn start_from_env() {
             }
         },
     };
-    let bound = match Listener::bind(SocketAddr::from(([0u16; 8], port)), Arc::default()).await {
-        Err(_) => Listener::bind(SocketAddr::from(([0u8; 4], port)), Arc::default()).await,
+    let mut limits = Limits::default();
+    if let Ok(v) = std::env::var("QUASAR_WT_UNAUTH_PER_SOURCE") {
+        match v.trim().parse() {
+            Ok(n) => limits.per_source = n,
+            Err(_) => tracing::warn!(
+                token = "webtransport-per-source-invalid",
+                "QUASAR_WT_UNAUTH_PER_SOURCE={v} is not a count; using {DEFAULT_PER_SOURCE}"
+            ),
+        }
+    }
+    let any6 = SocketAddr::from(([0u16; 8], port));
+    let bound = match Listener::bind(any6, Arc::default(), limits).await {
+        Err(_) => Listener::bind(SocketAddr::from(([0u8; 4], port)), Arc::default(), limits).await,
         ok => ok,
     };
     match bound {
@@ -337,11 +430,29 @@ fn server_config(cert: &Cert) -> Result<quinn::ServerConfig> {
         )?;
     tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(crypto)))
+    // Bounds on what one peer can make the agent hold. Two bidirectional streams are the
+    // CONNECT stream and the control stream; HTTP/3 needs three unidirectional ones.
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .max_concurrent_bidi_streams(2u32.into())
+        .max_concurrent_uni_streams(8u32.into())
+        .stream_receive_window(65_536u32.into())
+        .receive_window((1u32 << 20).into())
+        .max_idle_timeout(Some(Duration::from_secs(10).try_into()?))
+        .datagram_receive_buffer_size(Some(65_536));
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    config
+        .transport_config(Arc::new(transport))
+        .max_incoming(4 * MAX_UNAUTHENTICATED);
+    Ok(config)
 }
 
 impl Listener {
-    pub(crate) async fn bind(addr: SocketAddr, registry: Arc<Registry>) -> Result<Arc<Self>> {
+    pub(crate) async fn bind(
+        addr: SocketAddr,
+        registry: Arc<Registry>,
+        limits: Limits,
+    ) -> Result<Arc<Self>> {
         let certs = CertSet::new(SystemTime::now())?;
         let config = server_config(certs.presented(SystemTime::now()))?;
         let quic = quinn::Endpoint::server(config, addr).context("bind the QUIC listener")?;
@@ -351,6 +462,7 @@ impl Listener {
             certs: Mutex::new(certs),
             quic,
             port,
+            limits,
         }))
     }
 
@@ -406,19 +518,24 @@ impl Listener {
         }
     }
 
+    /// Accept at the QUIC layer: a source address is validated with a Retry before it
+    /// may hold a slot, and the slot is taken before the handshake, so nothing a peer
+    /// does before `hello` escapes the limits or the hello deadline.
     pub(crate) async fn serve(self: Arc<Self>) {
-        let mut server = web_transport_quinn::Server::new(self.quic.clone());
-        let unauthenticated = Arc::new(Semaphore::new(MAX_UNAUTHENTICATED));
-        while let Some(request) = server.accept().await {
-            match unauthenticated.clone().try_acquire_owned() {
-                Ok(permit) => {
-                    tokio::spawn(connection(request, self.registry.clone(), permit));
+        let gate = Arc::new(Gate {
+            limits: self.limits,
+            held: Mutex::default(),
+        });
+        while let Some(incoming) = self.quic.accept().await {
+            if !incoming.remote_address_validated() {
+                let _ = incoming.retry();
+                continue;
+            }
+            match gate.take(incoming.remote_address().ip()) {
+                Some(slot) => {
+                    tokio::spawn(connection(incoming, self.registry.clone(), slot));
                 }
-                Err(_) => {
-                    tokio::spawn(
-                        request.reject(web_transport_quinn::http::StatusCode::TOO_MANY_REQUESTS),
-                    );
-                }
+                None => incoming.refuse(),
             }
         }
     }
@@ -499,15 +616,23 @@ fn hello_ack(config: &media::VideoConfig) -> Value {
     })
 }
 
-/// Refuse every stream past the control stream, before and after `hello_ack`.
-async fn refuse_streams(session: Session) {
+/// Hand over the first bidirectional stream as the control stream and refuse every
+/// other stream, from the moment the session exists.
+async fn streams(session: Session, control: oneshot::Sender<(SendStream, RecvStream)>) {
+    let mut control = Some(control);
     loop {
         tokio::select! {
             bi = session.accept_bi() => match bi {
-                Ok((mut send, mut recv)) => {
-                    let _ = send.reset(0);
-                    let _ = recv.stop(0);
-                }
+                Ok(pair) => match control.take() {
+                    Some(tx) => {
+                        let _ = tx.send(pair);
+                    }
+                    None => {
+                        let (mut send, mut recv) = pair;
+                        let _ = send.reset(0);
+                        let _ = recv.stop(0);
+                    }
+                },
                 Err(_) => return,
             },
             uni = session.accept_uni() => match uni {
@@ -526,36 +651,55 @@ async fn drop_datagrams(session: Session) {
     while session.read_datagram().await.is_ok() {}
 }
 
-async fn connection(request: Request, registry: Arc<Registry>, permit: OwnedSemaphorePermit) {
-    let Ok(session) = request.ok().await else {
+/// One connection, from QUIC accept. The 5 s hello deadline runs from here, over the
+/// QUIC and HTTP/3 handshakes as well as the `hello` itself.
+async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Slot) {
+    let deadline = Instant::now() + HELLO_DEADLINE;
+    let Ok(Ok(conn)) = timeout_at(deadline, incoming).await else {
         return;
     };
-    let deadline = Instant::now() + HELLO_DEADLINE;
-    let datagrams = tokio::spawn(drop_datagrams(session.clone()));
-    let control = match timeout_at(deadline, session.accept_bi()).await {
-        Ok(Ok(control)) => Some(control),
-        Ok(Err(_)) => None,
+    let session = async { Request::accept(conn.clone()).await.ok()?.ok().await.ok() };
+    let session = match timeout_at(deadline, session).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return,
         Err(_) => {
-            session.close(CLOSE_PROTOCOL, b"no hello in 5 s");
-            None
+            let code = web_transport_quinn::proto::error_to_http3(CLOSE_PROTOCOL);
+            conn.close(
+                quinn::VarInt::from_u64(code).unwrap_or_default(),
+                b"no hello in 5 s",
+            );
+            return;
         }
     };
-    if let Some((send, mut recv)) = control {
-        let others = tokio::spawn(refuse_streams(session.clone()));
-        match timeout_at(deadline, read_message(&mut recv)).await {
-            Err(_) => session.close(CLOSE_PROTOCOL, b"no hello in 5 s"),
-            Ok(Err(Violation::Gone)) => {}
-            Ok(Err(Violation::Protocol(why))) => session.close(CLOSE_PROTOCOL, why.as_bytes()),
-            Ok(Ok(message)) => match serde_json::from_value::<Hello>(message) {
-                Ok(hello) if hello.kind == "hello" => {
-                    authenticate(&session, send, recv, &registry, hello, permit).await;
-                }
-                _ => session.close(CLOSE_PROTOCOL, b"the first message is not a hello"),
-            },
-        }
-        others.abort();
+    let (control_tx, control_rx) = oneshot::channel();
+    let others = tokio::spawn(streams(session.clone(), control_tx));
+    let datagrams = tokio::spawn(drop_datagrams(session.clone()));
+    let hello = async {
+        let (send, mut recv) = control_rx.await.map_err(|_| Violation::Gone)?;
+        let message = read_message(&mut recv).await?;
+        Ok::<_, Violation>((send, recv, message))
+    };
+    match timeout_at(deadline, hello).await {
+        Err(_) => session.close(CLOSE_PROTOCOL, b"no hello in 5 s"),
+        Ok(Err(Violation::Gone)) => {}
+        Ok(Err(Violation::Protocol(why))) => session.close(CLOSE_PROTOCOL, why.as_bytes()),
+        Ok(Ok((send, recv, message))) => match serde_json::from_value::<Hello>(message) {
+            Ok(hello) if hello.kind == "hello" => {
+                authenticate(&session, send, recv, &registry, hello, slot).await;
+            }
+            _ => session.close(CLOSE_PROTOCOL, b"the first message is not a hello"),
+        },
     }
+    others.abort();
     datagrams.abort();
+}
+
+fn log_refusal(session_id: &str, code: &str) {
+    tracing::debug!(
+        token = "webtransport-hello-refused",
+        session_id = ?shown(session_id),
+        "WebTransport hello refused: {code}"
+    );
 }
 
 async fn authenticate(
@@ -564,28 +708,39 @@ async fn authenticate(
     recv: RecvStream,
     registry: &Registry,
     hello: Hello,
-    permit: OwnedSemaphorePermit,
+    slot: Slot,
 ) {
-    let media = match registry.redeem(&hello, SystemTime::now()) {
-        Ok(media) => media,
+    // Checked before the token is spent: a peer that cannot take 1200-byte-budget
+    // datagrams (or none) could never be sent video.
+    if session.max_datagram_size() < MIN_DATAGRAM {
+        log_refusal(&hello.session_id, "datagrams_too_small");
+        session.close(CLOSE_PROTOCOL, b"datagrams unsupported or too small");
+        return;
+    }
+    let refused = |refusal: Refusal| (refusal.code(), &hello.session_id);
+    let (media, client) = match registry.redeem(&hello, SystemTime::now()) {
+        Ok(media) => match media.attach() {
+            Some(client) => (media, client),
+            // `end` ran between the redeem and here.
+            None => {
+                let ((code, close), id) = refused(Refusal::SessionEnded);
+                log_refusal(id, code);
+                let _ = write_message(&mut send, &json!({"type": "error", "code": code})).await;
+                let _ = send.finish();
+                session.close(close, code.as_bytes());
+                return;
+            }
+        },
         Err(refusal) => {
-            let (code, close) = refusal.code();
-            tracing::info!(
-                token = "webtransport-hello-refused",
-                session_id = %hello.session_id,
-                "WebTransport hello refused: {code}"
-            );
+            let ((code, close), id) = refused(refusal);
+            log_refusal(id, code);
             let _ = write_message(&mut send, &json!({"type": "error", "code": code})).await;
             let _ = send.finish();
             session.close(close, code.as_bytes());
             return;
         }
     };
-    drop(permit);
-    let Some(client) = media.attach() else {
-        session.close(CLOSE_NORMAL, b"internal");
-        return;
-    };
+    drop(slot);
     tracing::info!(
         token = "webtransport-client-connected",
         session_id = %hello.session_id,
@@ -621,15 +776,26 @@ async fn stream(
         }
     });
     let mut pkt_seq = 0u32;
+    let mut warned_oversized = false;
     let close = loop {
         tokio::select! {
             out = client.rx.recv() => match out {
                 Some(Out::Unit(unit)) => {
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);
-                    let sent = media::packetize(&unit, max, &mut pkt_seq)
-                        .into_iter()
-                        .try_for_each(|d| session.send_datagram(d));
-                    if sent.is_err() {
+                    let datagrams = media::packetize(&unit, max, &mut pkt_seq);
+                    if datagrams.is_empty() && !warned_oversized {
+                        warned_oversized = true;
+                        tracing::warn!(
+                            token = "webtransport-unit-too-large",
+                            "a {} byte access unit needs more than 65535 fragments; dropped, \
+                             and a keyframe requested",
+                            unit.data.len()
+                        );
+                    }
+                    if datagrams.is_empty() {
+                        media.keyframe();
+                    }
+                    if datagrams.into_iter().try_for_each(|d| session.send_datagram(d)).is_err() {
                         break None;
                     }
                 }
@@ -640,7 +806,6 @@ async fn stream(
                 }
                 None => break Some(match client.gone.get() {
                     Some(Gone::TakenOver) => (json!({"type": "bye", "reason": "taken_over"}), CLOSE_TAKEN_OVER),
-                    Some(Gone::Lagged) => (json!({"type": "error", "code": "internal"}), CLOSE_NORMAL),
                     _ => (json!({"type": "bye", "reason": "session_ended"}), CLOSE_ENDED),
                 }),
             },
