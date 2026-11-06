@@ -680,9 +680,10 @@ RUN find /opt/gst -name '*.a' -delete \
 
 # PyroWave C API (#1052, spec #1048). Built here, beside the GStreamer plugins, so the
 # pyrowaveenc element (a later ticket) links libpyrowave-shared from /opt/gst and the runtime
-# stage's `COPY --from=build /opt/gst` carries it with no step of its own. Installs
-# lib64/libpyrowave-shared.so.1, the pyrowave/pyrowave.h header and lib64/pkgconfig/
-# pyrowave-shared.pc. Shaders ship precompiled upstream, so no shader compiler is needed;
+# stage's `COPY --from=build /opt/gst` carries it with no step of its own. Upstream's install
+# rules (no components) put libpyrowave-shared.so{,.1,.1.0.0}, pyrowave/pyrowave.h, the .pc, the
+# CMake config and bin/pyrowave-device-validation (why it is built) into /opt/gst; both MIT
+# licence texts go to share/licenses/ because the binary ships in a public image. Shaders ship precompiled upstream, so no shader compiler is needed;
 # Granite is the pinned subset checkout_granite.sh fetches (volk + vulkan-headers only).
 # checkout_granite.sh names its own Granite commit; GRANITE_REF must equal it or the build stops,
 # so the two pins cannot drift apart unnoticed. Placed after the static-archive strip: the
@@ -701,6 +702,8 @@ RUN set -eu; \
         -DCMAKE_INSTALL_LIBDIR=lib64 \
     && cmake --build build --target pyrowave-shared pyrowave-device-validation \
     && cmake --install build \
+    && install -Dm644 LICENSE /opt/gst/share/licenses/pyrowave/LICENSE \
+    && install -Dm644 Granite/LICENSE /opt/gst/share/licenses/granite/LICENSE \
     && cd / && rm -rf /opt/pyrowave \
     && PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig pkg-config --exists pyrowave-shared \
     && echo "pyrowave-shared installed: $(PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig pkg-config --modversion pyrowave-shared)"

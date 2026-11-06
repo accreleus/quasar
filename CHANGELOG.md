@@ -24,10 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
-### Added
-- **The platform image now builds the PyroWave C API (#1052).** `libpyrowave-shared`, its header and pkg-config file are built from a pinned PyroWave and Granite commit and installed into `/opt/gst`, and the image contract asserts they are there. Nothing uses it yet and a session streams exactly as before; it is the base for the Ultra-low latency (LAN) codec (#1048). This changes the toolchain pins, so the toolchain image is rebuilt once.
-
 ### Internal
+- **The platform image now builds the PyroWave C API (#1052).** `libpyrowave-shared`, its header and pkg-config file are built from a pinned PyroWave and Granite commit and installed into `/opt/gst`, and the image contract asserts they are there. Nothing uses it yet and a session streams exactly as before; it is the base for the Ultra-low latency (LAN) codec (#1048). This changes the toolchain pins, so the toolchain image is rebuilt once.
 - **CI also runs on release integration branches (`integration/<version>`).** Pull requests into one run the jobs their change touches, and a landing on one runs every job, exactly as for `develop`. `CLAUDE.md` now says specs and tickets live as GitHub issues rather than plan files. No product change.
 
 ## 0.5.2 — 2026-11-01

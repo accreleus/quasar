@@ -85,6 +85,8 @@
           "/opt/gst/lib64/libpyrowave-shared.so.1",
           "/opt/gst/include/pyrowave/pyrowave.h",
           "/opt/gst/lib64/pkgconfig/pyrowave-shared.pc",
+          "/opt/gst/share/licenses/pyrowave/LICENSE",
+          "/opt/gst/share/licenses/granite/LICENSE",
           "/etc/pipewire/quasar-session.conf",
           "/etc/pipewire/quasar-session-pulse.conf",
           "/etc/wireplumber/wireplumber.conf.d/quasar-session.conf",
@@ -92,7 +94,7 @@
         ],
         "_required_notes": {
           "quasar-session.conf": "The per-session audio sidecar's configs (deploy/audio/, #392). The agent starts `pipewire -c /etc/pipewire/quasar-session.conf`; with any of these four missing the sidecar never opens its socket and every session is mute.",
-          "libpyrowave-shared.so.1": "#1052 (spec #1048): the PyroWave C API, built from the PYROWAVE_REF/GRANITE_REF pins in the toolchain stage and installed into /opt/gst with its header and pkg-config file, so the pyrowaveenc element can link it. A pin bump that drops any of the three, or an install prefix that moves them out of /opt/gst, fails here instead of at the first element build.",
+          "libpyrowave-shared.so.1": "#1052 (spec #1048): the PyroWave C API, built from the PYROWAVE_REF/GRANITE_REF pins in the toolchain stage and installed into /opt/gst with its header and pkg-config file, so the pyrowaveenc element can link it. A pin bump that drops any of the three, or an install prefix that moves them out of /opt/gst, fails here instead of at the first element build. Both MIT licence texts (PyroWave and the Granite code linked into it) must ship with the binary in this public image (review of #1090).",
           "libgstnvcodec.so": "Present in EVERY image on this lineage -- the whole point of the single build graph. On a non-NVIDIA host it loads, warns once about libcuda.so.1, and registers 0 features (asserted below). Its ABSENCE means the builder was run with CUDA_ENABLE=0, which produces an image that cannot serve an NVIDIA host and must not be shipped."
         },
         "forbidden": [
