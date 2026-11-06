@@ -27,7 +27,8 @@ pub struct EncodedSession {
     /// and `alignment` the transport asks for downstream (`alignment=au`: one access unit
     /// per buffer). PTS in the running time shared with the source (#68), though a unit
     /// may have none (openh264's second); `DELTA_UNIT` unset on a keyframe. Capture time
-    /// is the wall clock as a unit leaves here.
+    /// is the wall clock as a unit leaves here. A configuration change (an external resize,
+    /// an encoder restart) arrives as a new CAPS event on this pad, ahead of its keyframe.
     pub(crate) video: gst::Pad,
     /// The video encoder: `resize::force_idr` on it is the keyframe request, and the ABR
     /// writes its bitrate live.
@@ -48,7 +49,8 @@ pub struct EncodedSession {
 
 /// One implementation of the transport slot. Audio is the transport's own: it builds the
 /// capture and Opus encode (`audio_branch::add_opus_encode`) in a pipeline of its own
-/// (#304), so the stream audio follows its client.
+/// (#304), so the stream audio follows its client. The audio watchdog
+/// (`audio_health::attach`) is on the WebRTC tail only: a second transport adds its own.
 pub trait Transport: Sized {
     /// Take the session at the encoded-frame boundary and build what follows it. Leaves
     /// the encode pipeline READY; the runner takes it to PLAYING.
