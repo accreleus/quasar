@@ -47,6 +47,15 @@ fn classify(message: String, definite: fn(String) -> ProbeVerdict) -> ProbeVerdi
     }
 }
 
+/// The verdict for an error the element posted once running: `set_format`'s refusals
+/// (encoder creation included) and encode errors, as the bus carries them.
+fn encode_failed(node: &str, bus_text: &str) -> ProbeVerdict {
+    classify(
+        format!("{node}: encode failed: {bus_text}"),
+        ProbeVerdict::Fail,
+    )
+}
+
 pub fn run(request: &MediaProbeRequest) -> ProbeVerdict {
     let (w, h, fps) = (request.width, request.height, request.fps);
     if request.frames == 0 || w <= 0 || h <= 0 || w % 2 != 0 || h % 2 != 0 || fps <= 0 {
@@ -143,7 +152,7 @@ fn encode_and_check(
         );
     }
     if let Some(e) = error {
-        return classify(format!("{node}: encode failed: {e}"), ProbeVerdict::Fail);
+        return encode_failed(node, &e);
     }
     let (frames, worst, worst_plane) = match outcome {
         Ok(read) => read,
@@ -309,6 +318,28 @@ mod tests {
         ));
         assert!(matches!(
             classify("x".into(), ProbeVerdict::Fail),
+            ProbeVerdict::Fail(_)
+        ));
+    }
+
+    /// The bus text `set_format` posts for a failed `pyrowave_encoder_create`, as
+    /// `bus_error` formats it (message, then debug).
+    #[test]
+    fn an_encoder_create_out_of_memory_on_the_bus_is_indeterminate_and_a_refusal_fails() {
+        let oom = format!(
+            "PyroWave encoder: pyrowave_encoder_create failed: -4 ERROR_OUT_OF_DEVICE_MEMORY {} \
+             (Some(\"imp.rs(213): set_format (): /GstPipeline:pipeline0/GstPyroWaveEnc:pyrowaveenc0\"))",
+            gstpyrowave::ffi::RESOURCE_TAG
+        );
+        assert!(matches!(
+            encode_failed("/dev/dri/renderD129", &oom),
+            ProbeVerdict::Indeterminate(_)
+        ));
+        let refused =
+            "PyroWave encoder: pyrowave_encoder_create failed: -2 ERROR_INVALID_ARGUMENT \
+                       (Some(\"imp.rs(213): set_format ()\"))";
+        assert!(matches!(
+            encode_failed("/dev/dri/renderD129", refused),
             ProbeVerdict::Fail(_)
         ));
     }

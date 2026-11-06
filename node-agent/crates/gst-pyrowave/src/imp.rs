@@ -160,6 +160,19 @@ impl ElementImpl for PyroWaveEnc {
     }
 }
 
+impl PyroWaveEnc {
+    /// A `set_format` refusal, on the bus as well: a LoggableError alone reaches only the
+    /// debug log, and the bus would then carry only upstream's "not-negotiated".
+    fn refuse(
+        &self,
+        domain: impl gst::MessageErrorDomain,
+        reason: &dyn std::fmt::Display,
+    ) -> gst::LoggableError {
+        self.post_error_message(gst::error_msg!(domain, ["{reason}"]));
+        gst::loggable_error!(CAT, "{reason}")
+    }
+}
+
 impl VideoEncoderImpl for PyroWaveEnc {
     fn start(&self) -> Result<(), gst::ErrorMessage> {
         let node = self.settings.lock().unwrap().device.clone();
@@ -183,22 +196,21 @@ impl VideoEncoderImpl for PyroWaveEnc {
         &self,
         input: &gst_video::VideoCodecState<'static, gst_video::video_codec_state::Readable>,
     ) -> Result<(), gst::LoggableError> {
+        let negotiation = |e: &dyn std::fmt::Display| self.refuse(gst::CoreError::Negotiation, e);
         let caps = input
             .caps()
-            .ok_or_else(|| gst::loggable_error!(CAT, "input state without caps"))?;
-        let info = crate::check_input(caps).map_err(|e| {
-            // On the bus too: a LoggableError alone reaches only the debug log.
-            gst::element_imp_error!(self, gst::CoreError::Negotiation, ["{e}"]);
-            gst::loggable_error!(CAT, "{e}")
-        })?;
+            .ok_or_else(|| negotiation(&"input state without caps"))?;
+        let info = crate::check_input(caps).map_err(|e| negotiation(&e))?;
         let (w, h) = (info.width(), info.height());
         let mut guard = self.state.lock().unwrap();
         let state = guard
             .as_mut()
-            .ok_or_else(|| gst::loggable_error!(CAT, "caps before start"))?;
+            .ok_or_else(|| negotiation(&"caps before start"))?;
         state.encoder = None;
+        // The ffi text carries ffi::RESOURCE_TAG on a memory shortage, so the probe can
+        // tell an out-of-memory here (device memory at 4K) from a refusal.
         let encoder = Encoder::new(state.device.clone(), w, h)
-            .map_err(|e| gst::loggable_error!(CAT, "{e}"))?;
+            .map_err(|e| self.refuse(gst::LibraryError::Init, &format!("PyroWave encoder: {e}")))?;
         state.encoder = Some(encoder);
         state.info = Some(info);
         drop(guard);
@@ -209,9 +221,9 @@ impl VideoEncoderImpl for PyroWaveEnc {
         let obj = self.obj();
         let output = obj
             .set_output_state(caps, Some(input))
-            .map_err(|_| gst::loggable_error!(CAT, "cannot set the output state"))?;
+            .map_err(|_| negotiation(&"cannot set the output state"))?;
         obj.negotiate(output)
-            .map_err(|_| gst::loggable_error!(CAT, "cannot negotiate"))?;
+            .map_err(|_| negotiation(&"cannot negotiate"))?;
         Ok(())
     }
 
