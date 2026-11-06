@@ -196,11 +196,12 @@ what is in the payload, and whether a missing row means anything — were only i
 <!-- GENERATED from docs/session-trace/metrics.json by scripts/dx/gen_trace_docs.py.
      Do not edit between these markers; edit the manifest and run `make docs-trace`. -->
 
-*18 agent-source event types. `lane` is load-bearing: a **reliable** row is ordered, never coalesced and never dropped, so its absence is a defect; a **diagnostic** row rides the bounded droppable lane, so its absence is not evidence the event did not happen.*
+*19 agent-source event types. `lane` is load-bearing: a **reliable** row is ordered, never coalesced and never dropped, so its absence is a defect; a **diagnostic** row rides the bounded droppable lane, so its absence is not evidence the event did not happen.*
 
 | type | lane | payload keys | clock | meaning / the trap it avoids |
 |---|---|---|---|---|
 | `caps.negotiated` | reliable | `trigger`, `encoder_factory`, `codec`, `profile`, `level`, `encoder_sink_caps`, `encoder_src_caps`, `payloader_src_caps`, `size` | `host_wall` | What the encode branch agreed, re-stated on EVERY (re)negotiation: launch, rung_step, scale_rebuild, encoder_restart, source_swap. Exists because effective_media stops being true after the first scale-stage rebuild, and on Vulkan every rung step is an encoder restart. `profile` is the live value — a 2026-08-22 gst-launch probe negotiating main-444 read as a driver regression while production pinned main all along. |
+| `codec.switched` | reliable | `from`, `to`, `reason`, `config_id`, `target_kbps` | `host_wall` | The codec sent to the session's media client changed between PyroWave and the standard codec (amendment 55), or a wanted PyroWave was not started at a hello. NOT IMPLEMENTED YET: the contract is pinned (codec-pyrowave.md) and nothing emits this. |
 | `diag.burst_stats` | reliable | `capture_id`, `kind`, `encoding`, `content_type`, `json`, `bytes`, `duration_ms`, `error` | `host_wall` | As diag.pipeline_dot: bitstream burst statistics for one armed capture. |
 | `diag.encoder_props` | reliable | `capture_id`, `kind`, `encoding`, `content_type`, `json`, `bytes`, `duration_ms`, `error` | `host_wall` | As diag.pipeline_dot: live encoder property + scale-stage readback for one armed capture. |
 | `diag.pipeline_dot` | reliable | `capture_id`, `kind`, `encoding`, `content_type`, `data`, `json`, `bytes`, `compressed_bytes`, `original_bytes`, `truncated`, `duration_ms`, `error` | `host_wall` | The single result of an admin-armed session_capture. Persisted synchronously and EXEMPT from the rolling prune: this row is the answer to a question a human asked thirty seconds ago and is polling for by capture_id. |
@@ -273,6 +274,7 @@ the agent, and share no manifest with it.
 | `client.freeze_detected` | `getStats` `freezeCount` advances for this receiver | `gap_ms` (float, **optional** — the window's `present_interval_max_ms`; **omitted** when the window produced no cadence, which is what a long freeze looks like. It was formerly `1000 / freezeCount`, a number derived from the counter and from no clock at all), `is_hidden` (bool, optional — the false-positive guard) |
 | `client.visibility_changed` | tab/window visibility flips (pairs with the `client.is_hidden` sample key) | `hidden` (bool) |
 | `webrtc.state_changed` | a client-side `RTCPeerConnection` ICE/connection state transition | `kind` (string: `"ice"` \| `"connection"`), `from` (string), `to` (string) |
+| `transport.fallback` | *(amendment 54; pinned, not yet emitted)* the client falls back from WebTransport to WebRTC | `from` (`"webtransport"`), `to` (`"webrtc"`), `reason` (string, `^[a-z0-9_]{1,64}$`, e.g. `connect_timeout`) |
 
 > The two `webrtc.state_changed` sources are distinguished by the row's `source` column
 > (agent = host webrtcbin; browser = client `RTCPeerConnection`). A bundle reader can place
