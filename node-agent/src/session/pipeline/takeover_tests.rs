@@ -3216,3 +3216,6 @@ mod aux_senders;
 
 /// Amendment 39 (#759): parked, held, adopted and in-place-swapped runtimes.
 mod warm_steam;
+
+/// The transport seam (#1028) with a transport that is not WebRTC.
+mod fake_transport;
