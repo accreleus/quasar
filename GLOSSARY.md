@@ -388,6 +388,29 @@ signature" and "manifest verification" (nothing is verified), "manifest digest"
 on its own when the ref/commit/URL are also meant (the digest is one field of
 the record).
 
+## Compatibility tools
+
+**Library provider** — a source of games a host can launch (Steam today; Heroic or a
+Lutris-style launcher later) that discovers its own library and binds a compatibility tool its
+own way. _Avoid_: "store", "launcher" for this meaning.
+
+**Compatibility tool** — a build that runs a Windows game on a Linux host: today a Proton,
+Valve's own or GE-Proton. A host resource with an identity (kind, family, version or tag), a
+source and a per-host install state; it knows nothing of any provider. A tool is named by the
+name Steam uses for it, which for GE-Proton is not the release tag. _Avoid_: "Proton version"
+for the general concept, "runner".
+
+**Tool mapping** — the admin's choice of compatibility tool for one game (keyed by its Steam
+appid, applying to every user's tile of it) or, as the **fleet default**, for every Windows game
+without one. It fills only where the user has chosen nothing in Steam. _Avoid_: "override".
+
+**Forced mapping** — a tool mapping marked so the admin's choice wins over a tool the user
+picked inside Steam. _Avoid_: "locked".
+
+**Recommended tool list** — the GE-Proton releases shipped with each Quasar release, each
+with its pinned digest, so choosing one needs no checksum fetch. _Avoid_: "allowlist" (an
+admin can add any other release tag, verified against its published checksum).
+
 ## Host management (RH05 proposal)
 
 **Setting source** — how a supported host setting is chosen: Automatic,
