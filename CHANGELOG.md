@@ -24,8 +24,10 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
-### Changed
-- The node agent's encode chain now ends at the encoded-frame boundary (the parser's output), and the RTP payloader, its header extensions and `webrtcbin` sit behind a transport trait with WebRTC as its only implementation. Sessions stream exactly as before; this prepares the WebTransport path (#1028).
+### Internal
+- **CI also runs on release integration branches (`integration/<version>`).** Pull requests into one run the jobs their change touches, and a landing on one runs every job, exactly as for `develop`. `CLAUDE.md` now says specs and tickets live as GitHub issues rather than plan files. No product change.
+- **The domain glossary is now `GLOSSARY.md` (was `CONTEXT.md`), matching the updated domain-modeling and setup skills.** Renamed with `git mv`; every reference in the docs, `CLAUDE.md` and code comments follows (the generated API types follow with the next protocol pin). No product change.
+- **The node agent's encode chain now ends at the encoded-frame boundary (the parser's output); the RTP payloader, its header extensions and `webrtcbin` sit behind a transport trait with WebRTC as its only implementation (#1028).** This prepares the WebTransport path. No product change: sessions stream exactly as before.
 
 ## 0.5.2 — 2026-11-01
 

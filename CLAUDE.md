@@ -71,7 +71,7 @@ renumbered to their public issues.
   baseline (`web/src/styles/design-lint.baseline.json`) only ever goes down.**
 - `deploy/`       compose now, k8s manifests later. **Build images with `deploy/build-images.sh`, never a hand-typed `docker build`** — it forces an explicit `--target` (a bare build takes the LAST stage regardless of `-t`), rejects a `--build-arg` for an undeclared ARG (Docker ignores those silently), and validates every artifact against `deploy/image-contract.json` before promoting `:latest`. The contract is the durable form of every image defect that reached production; **never relax an assertion to make a build green.** **`deploy/` is the OPERATOR front door: it holds only what someone installing Quasar needs.** Contributor tooling lives under `scripts/` — `dev/` (the dev container wrapper and dev seeders), `verify/` (verify stages + the devtools image), `harness/` (acceptance harnesses, `lib/`, `checks/`, the `apitest` module, `peer-driver.mjs`), `release/` (release-evidence gates), `dx/` (the Makefile's orchestration) — and non-operator compose overlays live in `deploy/overlays/`. Don't add a new development script to `deploy/`.
 - **Third-party pins** — nothing is vendored as source: gst-wayland-display/inputtino/gst-interpipe/GStreamer are built from pins in `deploy/Dockerfile.vulkan` (the single image lineage: dev/runtime targets on the `quasar-base` family) plus patches in `deploy/patches/`. Pins + flip instructions live in **`docs/third-party-pins.md`** — current: gst-wayland-display fork `6638e07` (upstream base `43d4c25`, upstream `stable` `016b4fc` merged), gst-interpipe `0c454917` (gow fork) + two vendored caps-leak patches, GStreamer `1.28.8` + vendored patches. **A pin bump on either fork is gated on a live exercise, not a green build** — see "Fork-bump verification policy" in `docs/third-party-pins.md`.
-- `CONTEXT.md`    the domain glossary (chain, rung, cert cap, stream plan, device probe, envelope, host probe, readiness check, entitlement, home, derived tile). Read it before naming things; add a term when work resolves one, rather than coining a synonym.
+- `GLOSSARY.md`    the domain glossary (chain, rung, cert cap, stream plan, device probe, envelope, host probe, readiness check, entitlement, home, derived tile). Read it before naming things; add a term when work resolves one, rather than coining a synonym.
 - `docs/`         design docs (config knobs: `docs/configuration.md` — every env var, default, accepted values). The scoped backlog of still-open review findings (all low/subjective or a future spike — none are bugs) and the executed TD-01/TD-02 refactor plans lived at `docs/tech-debt/REVIEW-REMAINING.md` and `docs/completed/tech-debt/`; both were deliberately not carried over to the public repository. **The finding numbers this bullet used to list were review-finding IDs from the pre-move tracker, not issues on this repo** — several of them collide with unrelated public issues, so they have been removed rather than left to mislead.
 
 ## Conventions
@@ -84,8 +84,8 @@ renumbered to their public issues.
 - **`main` = production.** Any merge INTO `main` requires **explicit human sign-off from the operator**. Never merge to `main` autonomously — not even a green feature branch.
 - **`develop` = persistent, unstable integration branch.** All day-to-day work targets it.
 - **Workflow:** branch off `develop` → do the work → merge **back into `develop`** with **no PR required**. Feature-branch → `develop` is self-serve; `develop` → `main` is the only sign-off gate. Default: `git checkout develop && git pull && git checkout -b <feature>`; land with `git checkout develop && git merge <feature>`. **A streaming-path change runs `make bench-check` before that merge** and closes out by publishing or updating its bench report (`make report-publish`, or `qbench sprint put` at sprint end) — see "Performance evidence (quasar-bench)" below and the landing sequence in `AGENTS.md`.
-- **CI runs on every push to `develop` (all jobs) and on pull requests into `develop` (only the
-  jobs whose area changed, `scripts/verify/ci-changed-areas.sh`).** The push run carries the
+- **CI runs on every push to `develop` or a release `integration/**` branch (all jobs) and on
+  pull requests into either (only the jobs whose area changed, `scripts/verify/ci-changed-areas.sh`).** The push run carries the
   checks `main` requires, so the develop → main release PR needs no run of its own. A pull request
   into `main` from any other branch gets no automatic run: dispatch CI on its branch first.
 - **Push branches to origin as you go — "no PR required" does not mean "no push".** Origin is
@@ -220,8 +220,12 @@ public repository deliberately, and is not in this
 repo's history — the wave-ladder facts on record are what follow. W0 (image
 consolidation, #367) and W1 (security wave, PR #374: invite-gated registration +
 device binding, migration 0020) are merged; W2 is active (console-mode ∥ Phase 9
-closure). Executed plans were archived under `docs/completed/plans/`, also non-public; going forward, plans (live and executed) are filed under
-`docs/superpowers/plans/`. **"What's active right now" lives in GitHub milestones + the
+closure). Executed plans were archived under `docs/completed/plans/`, also non-public. **Going forward there are no plan
+files:** a spec is a GitHub issue and its work is split into ticket issues (sub-issues with
+native blocked-by edges), per `docs/agents/issue-tracker.md`; decisions go in `docs/adr/`, terms
+in `GLOSSARY.md`. `docs/superpowers/plans/` holds two older plans only. A release with
+long-running feature work uses an integration branch `integration/<version>` (CI runs on it);
+it merges into `develop` for pre-release and is deleted once the release ships. **"What's active right now" lives in GitHub milestones + the
 session memory `current-focus.md`, not this file.**
 
 **Standing operational defaults (knobs, not history):**
@@ -420,4 +424,4 @@ Default five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `
 
 ### Domain docs
 
-Single-context: `CONTEXT.md` at the root + `docs/adr/`, created lazily by `domain-modeling`; `docs/architecture-and-plan.md` and `protocol/` remain the architecture and contract sources. See `docs/agents/domain.md`.
+Single-context: `GLOSSARY.md` at the root + `docs/adr/`, created lazily by `domain-modeling`; `docs/architecture-and-plan.md` and `protocol/` remain the architecture and contract sources. See `docs/agents/domain.md`.

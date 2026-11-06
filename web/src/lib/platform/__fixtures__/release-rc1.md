@@ -130,7 +130,7 @@
   pushes the tag that publishes it (#109). Contract: quasar-protocol amendments 1 and 2
   (register identity fields, `/v1/admin/platform/*`, `release_apply`/`release_state`,
   migrations 0074 and 0075). **Existing installs must add the updater once** — see
-  `docs/upgrading.md` "The updater". Glossary: `CONTEXT.md` "Platform releases";
+  `docs/upgrading.md` "The updater". Glossary: `GLOSSARY.md` "Platform releases";
   decisions: ADR 0001 (pinned-digest trust), ADR 0002.
 
 - **Pushing a `vX.Y.Z` tag on `main` publishes a platform release (#104, #108).** The

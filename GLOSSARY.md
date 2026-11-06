@@ -1,4 +1,4 @@
-# CONTEXT
+# Glossary
 
 The domain glossary for Quasar. One entry per term the code and the docs both
 lean on. Use these words exactly; the "avoid" notes are there because the

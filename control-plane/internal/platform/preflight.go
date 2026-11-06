@@ -9,7 +9,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
 )
 
-// Preflight (CONTEXT.md). semantics: control-api.md §"Self-update hardening"
+// Preflight (GLOSSARY.md). semantics: control-api.md §"Self-update hardening"
 //
 // PlanPreflight is pure: the collectors (preflight_collect.go, the agent's
 // readiness report) gather facts, this decides. `unknown` never blocks — a fleet

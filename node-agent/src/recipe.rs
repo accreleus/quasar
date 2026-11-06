@@ -1,4 +1,4 @@
-//! The recipe revision this node-agent image needs (ADR 0008, `CONTEXT.md` "Recipe").
+//! The recipe revision this node-agent image needs (ADR 0008, `GLOSSARY.md` "Recipe").
 //!
 //! A recovery actor creates this agent's container from a recipe compiled into the actor,
 //! and refuses a revision it does not carry. `deploy/build-images.sh` stamps this constant
