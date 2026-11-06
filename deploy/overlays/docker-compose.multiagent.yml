@@ -15,6 +15,8 @@
 #     9591/9592 rather than 9092/9093: the 909x range is crowded — Prometheus
 #     is 9090, its Pushgateway 9091, Kafka 9092, Alertmanager 9093 — and these
 #     bind on a host-networked namespace.)
+#   - QUASAR_WT_PORT (the WebTransport listener's UDP port, default 4433, shared
+#     the same way: an agent that loses the bind serves WebRTC only)
 #
 # Usage:
 #   docker compose -f deploy/docker-compose.yml \
@@ -43,6 +45,7 @@ services:
       XDG_RUNTIME_DIR: /run/quasar-agent-1
       GST_REGISTRY: /var/lib/quasar-agent-1/.cache/gstreamer-1.0/registry.bin
       QUASAR_HEALTH_ADDR: 127.0.0.1:9591
+      QUASAR_WT_PORT: "4434"
     volumes:
       - /run/quasar-agent-1:/run/quasar-agent-1
       - quasar-agent-1-data:/var/lib/quasar-agent-1
@@ -60,6 +63,7 @@ services:
       XDG_RUNTIME_DIR: /run/quasar-agent-2
       GST_REGISTRY: /var/lib/quasar-agent-2/.cache/gstreamer-1.0/registry.bin
       QUASAR_HEALTH_ADDR: 127.0.0.1:9592
+      QUASAR_WT_PORT: "4435"
     volumes:
       - /run/quasar-agent-2:/run/quasar-agent-2
       - quasar-agent-2-data:/var/lib/quasar-agent-2

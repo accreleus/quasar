@@ -56,6 +56,7 @@ pub mod release;
 pub mod restart;
 pub mod session;
 pub mod vram;
+pub mod webtransport;
 
 pub mod runtime;
 pub mod runtime_dir_label;

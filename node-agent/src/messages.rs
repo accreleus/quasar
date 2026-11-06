@@ -215,6 +215,9 @@ pub enum AgentMsg {
         readiness: Option<Vec<ReadinessCheck>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source_preparation: Option<serde_json::Value>,
+        /// Amendment 54: `transports` and `webtransport`, replaced wholesale on every report.
+        #[serde(flatten)]
+        transports: crate::webtransport::Transports,
     },
     Heartbeat {
         running_sessions: Vec<String>,
@@ -1123,6 +1126,21 @@ pub enum ControlMsg {
         resources: Option<ResourceSpec>,
         #[serde(default)]
         video_topology: VideoTopology,
+        /// Amendment 54: `"webtransport"`, or `"webrtc"`/absent.
+        #[serde(default)]
+        transport: Option<String>,
+        /// With `"webtransport"`: the first transport token, hashed, and its expiry.
+        #[serde(default)]
+        wt_token_hash: Option<String>,
+        #[serde(default)]
+        wt_token_expires_at: Option<String>,
+    },
+    /// Amendment 54: a further transport token for a WebTransport session.
+    SessionTransportToken {
+        id: String,
+        session_id: String,
+        wt_token_hash: String,
+        wt_token_expires_at: String,
     },
     /// Bring the session pipeline up (P1-6).
     SessionStart {
@@ -1644,6 +1662,7 @@ mod tests {
     #[test]
     fn capacity_json_omits_absent_additive_fields() {
         let msg = AgentMsg::Capacity {
+            transports: crate::webtransport::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
             config_policy_legacy_map_applied_id: None,
@@ -1695,6 +1714,7 @@ mod tests {
     #[test]
     fn capacity_json_includes_present_additive_fields() {
         let msg = AgentMsg::Capacity {
+            transports: crate::webtransport::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
             config_policy_legacy_map_applied_id: None,
