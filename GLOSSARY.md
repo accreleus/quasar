@@ -453,6 +453,22 @@ _Avoid_: "downloaded" when additional preparation is required.
 **Home template** — an authorized prepared app home from which a new empty user
 home can be initialized. Existing user homes are preserved. _Avoid_: "backup".
 
+## Ultra-low latency (LAN)
+
+**Ultra-low latency (LAN)** — the user-facing name of the PyroWave stream: a switch a user
+turns on, only on a profile an admin allowed, in a browser with WebGPU and on a WebTransport
+session whose QUIC round trip the agent measures as local. Otherwise the session streams its standard
+codec and says why. _Avoid_: "PyroWave mode" in the UI, "LAN mode".
+
+**PyroWave** — the intra-only wavelet codec behind Ultra-low latency (LAN): encoded on the
+host GPU in Vulkan compute, decoded in the browser in WebGPU, carried only on WebTransport.
+It is a wire codec (`pyrowave`) beside `h264`, `h265` and `av1`, never a rung of a chain and
+never chosen automatically over the internet.
+
+**Block concealment** — how a PyroWave stream absorbs loss: a lost 32x32 block is filled
+from the same block of the last frame that had it, so loss is a brief local smear, never a
+freeze or a keyframe wait. A block the encoder never sent is zero, not lost.
+
 ## Host readiness
 
 **Host fact** — something observed about a host, carried with where the
