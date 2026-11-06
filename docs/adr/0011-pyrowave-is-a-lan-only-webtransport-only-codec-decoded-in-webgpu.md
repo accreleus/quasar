@@ -29,8 +29,8 @@ of the decision:
 - **Never over the internet.** The rate rules out a WAN. The agent measures the session's own QUIC
   round trip and starts PyroWave, or accepts a switch on to it, only under a small bound (5 ms
   today, a guess until benched); past that the session streams a standard codec over WebTransport
-  and says why. If the congestion estimate falls below a floor the stream plan steps back down the
-  same way. The device probe's bandwidth and RTT are not inputs: they measure the client to
+  and says why. If the congestion estimate falls below a floor, the agent switches the connection back to the
+  standard codec the same way. The device probe's bandwidth and RTT are not inputs: they measure the client to
   control-plane path.
 - **Never automatic over the internet, and not automatic at all in 0.6.** The user turns it on, on
   a profile an admin allowed; it is off everywhere until an admin enables it. Automatic selection, with no

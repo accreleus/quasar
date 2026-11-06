@@ -428,7 +428,7 @@ home can be initialized. Existing user homes are preserved. _Avoid_: "backup".
 
 **Ultra-low latency (LAN)** — the user-facing name of the PyroWave stream: a switch a user
 turns on, only on a profile an admin allowed, in a browser with WebGPU and on a WebTransport
-session over a link the host measures as local. Otherwise the session streams its standard
+session whose QUIC round trip the agent measures as local. Otherwise the session streams its standard
 codec and says why. _Avoid_: "PyroWave mode" in the UI, "LAN mode".
 
 **PyroWave** — the intra-only wavelet codec behind Ultra-low latency (LAN): encoded on the
