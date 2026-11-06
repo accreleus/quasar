@@ -40,6 +40,8 @@ const MAX_UNAUTHENTICATED: usize = 64;
 const DEFAULT_PER_SOURCE: usize = 4;
 /// Below this the 1200-byte datagram budget cannot be met (§Channels, "Datagram size").
 const MIN_DATAGRAM: usize = 1100;
+/// How long an authenticated client may hold up one write on its control stream.
+const CONTROL_WRITE: Duration = Duration::from_secs(2);
 /// The longest prefix of a client-supplied id that reaches a log line.
 const LOGGED_ID: usize = 64;
 const TOKEN_SKEW: Duration = Duration::from_secs(15);
@@ -302,6 +304,15 @@ struct Gate {
     held: Mutex<HashMap<IpAddr, usize>>,
 }
 
+/// The per-source key: an IPv4 address, or an IPv6 address's /64, which one host
+/// usually holds whole.
+fn source(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+        v4 => v4,
+    }
+}
+
 /// One unauthenticated connection's place in the gate, given back on drop.
 struct Slot {
     gate: Arc<Gate>,
@@ -310,7 +321,7 @@ struct Slot {
 
 impl Gate {
     fn take(self: &Arc<Self>, ip: IpAddr) -> Option<Slot> {
-        let ip = ip.to_canonical();
+        let ip = source(ip);
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         let mine = held.get(&ip).copied().unwrap_or(0);
         if held.values().sum::<usize>() >= self.limits.unauthenticated
@@ -439,6 +450,7 @@ fn server_config(cert: &Cert) -> Result<quinn::ServerConfig> {
         .stream_receive_window(65_536u32.into())
         .receive_window((1u32 << 20).into())
         .max_idle_timeout(Some(Duration::from_secs(10).try_into()?))
+        .keep_alive_interval(Some(Duration::from_secs(3)))
         .datagram_receive_buffer_size(Some(65_536));
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config
@@ -685,7 +697,7 @@ async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Sl
         Ok(Err(Violation::Protocol(why))) => session.close(CLOSE_PROTOCOL, why.as_bytes()),
         Ok(Ok((send, recv, message))) => match serde_json::from_value::<Hello>(message) {
             Ok(hello) if hello.kind == "hello" => {
-                authenticate(&session, send, recv, &registry, hello, slot).await;
+                authenticate(&session, send, recv, &registry, hello, slot, deadline).await;
             }
             _ => session.close(CLOSE_PROTOCOL, b"the first message is not a hello"),
         },
@@ -702,6 +714,8 @@ fn log_refusal(session_id: &str, code: &str) {
     );
 }
 
+/// Every write here is bounded by `deadline`, the hello deadline: a peer that grants no
+/// stream credit must not hold a slot, or an attachment, past it.
 async fn authenticate(
     session: &Session,
     mut send: SendStream,
@@ -709,6 +723,7 @@ async fn authenticate(
     registry: &Registry,
     hello: Hello,
     slot: Slot,
+    deadline: Instant,
 ) {
     // Checked before the token is spent: a peer that cannot take 1200-byte-budget
     // datagrams (or none) could never be sent video.
@@ -717,41 +732,44 @@ async fn authenticate(
         session.close(CLOSE_PROTOCOL, b"datagrams unsupported or too small");
         return;
     }
-    let refused = |refusal: Refusal| (refusal.code(), &hello.session_id);
-    let (media, client) = match registry.redeem(&hello, SystemTime::now()) {
-        Ok(media) => match media.attach() {
-            Some(client) => (media, client),
-            // `end` ran between the redeem and here.
-            None => {
-                let ((code, close), id) = refused(Refusal::SessionEnded);
-                log_refusal(id, code);
-                let _ = write_message(&mut send, &json!({"type": "error", "code": code})).await;
-                let _ = send.finish();
-                session.close(close, code.as_bytes());
-                return;
-            }
-        },
+    let verdict = registry
+        .redeem(&hello, SystemTime::now())
+        // `end` may run between the redeem and the attach.
+        .and_then(|media| {
+            media
+                .attach()
+                .map(|c| (media, c))
+                .ok_or(Refusal::SessionEnded)
+        });
+    drop(slot);
+    let (media, client) = match verdict {
+        Ok(attached) => attached,
         Err(refusal) => {
-            let ((code, close), id) = refused(refusal);
-            log_refusal(id, code);
-            let _ = write_message(&mut send, &json!({"type": "error", "code": code})).await;
+            let (code, close) = refusal.code();
+            log_refusal(&hello.session_id, code);
+            let error = json!({"type": "error", "code": code});
+            let _ = timeout_at(deadline, write_message(&mut send, &error)).await;
             let _ = send.finish();
             session.close(close, code.as_bytes());
             return;
         }
     };
-    drop(slot);
     tracing::info!(
         token = "webtransport-client-connected",
         session_id = %hello.session_id,
         "WebTransport client connected from {}",
         session.remote_address()
     );
-    if write_message(&mut send, &hello_ack(&client.config))
-        .await
-        .is_err()
-    {
+    if !matches!(
+        timeout_at(
+            deadline,
+            write_message(&mut send, &hello_ack(&client.config))
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         media.detach(client.id);
+        session.close(CLOSE_PROTOCOL, b"control stream stalled");
         return;
     }
     stream(session, send, recv, &media, client).await;
@@ -800,7 +818,9 @@ async fn stream(
                     }
                 }
                 Some(Out::Config(config)) => {
-                    if write_message(&mut send, &hello_ack(&config)).await.is_err() {
+                    let ack = hello_ack(&config);
+                    let write = write_message(&mut send, &ack);
+                    if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
                         break None;
                     }
                 }
@@ -826,7 +846,7 @@ async fn stream(
     reader.abort();
     media.detach(client.id);
     if let Some((message, code)) = close {
-        let _ = write_message(&mut send, &message).await;
+        let _ = tokio::time::timeout(CONTROL_WRITE, write_message(&mut send, &message)).await;
         let _ = send.finish();
         session.close(code, b"");
     } else {

@@ -793,3 +793,129 @@ async fn a_64_kib_session_id_is_refused_and_logged_bounded() {
         "cut at 64 characters: {logs}"
     );
 }
+
+/// A WebTransport client whose every stream gets 8 bytes of credit: it completes the
+/// handshake (it reads what that needs, so credit flows) but never reads its control
+/// stream, so a refusal of more than 8 bytes can never be written to it.
+fn stalling_client() -> web_transport_quinn::Client {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .stream_receive_window(8u32.into())
+        .keep_alive_interval(Some(Duration::from_millis(500)));
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(Arc::new(transport));
+    let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    web_transport_quinn::Client::new(endpoint, config)
+}
+
+#[tokio::test]
+async fn a_peer_that_grants_no_credit_gives_its_slot_back_by_the_hello_deadline() {
+    let agent = agent_with(Limits {
+        unauthenticated: MAX_UNAUTHENTICATED,
+        per_source: 1,
+    })
+    .await;
+    let stalled = stalling_client().connect(agent.url.clone()).await.unwrap();
+    let opened = Instant::now();
+    let (mut send, _recv) = stalled.open_bi().await.unwrap();
+    let hello =
+        json!({"type": "hello", "wt_proto": 1, "token": "not-the-token", "session_id": SESSION});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(
+        close_code(&stalled).await,
+        Some(CLOSE_AUTH),
+        "closed once the refusal write gave up"
+    );
+    assert!(opened.elapsed() < HELLO_DEADLINE + Duration::from_secs(2));
+    // Its source's one slot is free again.
+    let (_session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+}
+
+#[test]
+fn an_ipv6_64_is_one_source_and_ipv4_counts_per_address() {
+    let gate = Arc::new(Gate {
+        limits: Limits {
+            unauthenticated: MAX_UNAUTHENTICATED,
+            per_source: 1,
+        },
+        held: Mutex::default(),
+    });
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    let first = gate.take(ip("2001:db8:0:1::1")).unwrap();
+    assert!(
+        gate.take(ip("2001:db8:0:1:ffff::2")).is_none(),
+        "the same /64"
+    );
+    let _other_net = gate.take(ip("2001:db8:0:2::1")).unwrap();
+    let _v4 = gate.take(ip("192.0.2.1")).unwrap();
+    assert!(
+        gate.take(ip("::ffff:192.0.2.1")).is_none(),
+        "v4-mapped is that address"
+    );
+    let _next_v4 = gate.take(ip("192.0.2.2")).unwrap();
+    drop(first);
+    assert!(
+        gate.take(ip("2001:db8:0:1::9")).is_some(),
+        "the /64's slot came back"
+    );
+}
+
+#[tokio::test]
+async fn a_bidi_stream_opened_after_the_control_stream_closed_is_reset() {
+    // The agent's stream handling (`streams`), with the test holding the control stream:
+    // closed both ways, it gives the peer credit for another bidirectional stream.
+    let now = SystemTime::now();
+    let certs = CertSet::new(now).unwrap();
+    let config = server_config(certs.presented(now)).unwrap();
+    let hash = base64::engine::general_purpose::STANDARD
+        .decode(&certs.presented(now).sha256)
+        .unwrap();
+    let quic = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let url: url::Url = format!("https://127.0.0.1:{}/wt", quic.local_addr().unwrap().port())
+        .parse()
+        .unwrap();
+    let server = tokio::spawn(async move {
+        let conn = quic.accept().await.unwrap().await.unwrap();
+        let session = Request::accept(conn).await.unwrap().ok().await.unwrap();
+        let (control_tx, control_rx) = oneshot::channel();
+        tokio::spawn(streams(session.clone(), control_tx));
+        let (mut send, mut recv) = control_rx.await.unwrap();
+        recv.read_to_end(64).await.unwrap();
+        send.finish().unwrap();
+        (session, quic)
+    });
+    let client = ClientBuilder::new()
+        .with_server_certificate_hashes(vec![hash])
+        .unwrap()
+        .connect(url)
+        .await
+        .unwrap();
+    let (mut send, mut recv) = client.open_bi().await.unwrap();
+    send.write_all(b"hello").await.unwrap();
+    send.finish().unwrap();
+    recv.read_to_end(64).await.unwrap();
+    let _held = server.await.unwrap();
+
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), client.open_bi())
+        .await
+        .expect("credit came back with the closed control stream")
+        .unwrap();
+    let _ = send.write_all(b"a second control stream").await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), recv.read(&mut [0; 8]))
+            .await
+            .unwrap()
+            .is_err(),
+        "the new stream is reset"
+    );
+}

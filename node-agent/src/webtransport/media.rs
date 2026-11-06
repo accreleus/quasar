@@ -80,6 +80,8 @@ struct State {
     /// Set by `end`: no client attaches after it.
     ended: bool,
     last_forced: Option<Instant>,
+    /// A request was coalesced into the last: the next unit past the spacing sends it.
+    pending_key: bool,
 }
 
 /// The tap's side of a session: fed by the GStreamer streaming thread, read by the
@@ -161,7 +163,8 @@ impl Media {
     }
 
     /// The keyframe request: the force-key-unit event PLI sends. A client drives this,
-    /// so requests inside `KEYFRAME_SPACING` of the last are dropped and it logs at debug.
+    /// so a request inside `KEYFRAME_SPACING` of the last waits for the next unit past
+    /// it (`on_unit`), and it logs at debug.
     pub(crate) fn keyframe(&self) {
         {
             let mut st = self.lock();
@@ -170,9 +173,11 @@ impl Media {
                 .last_forced
                 .is_some_and(|at| now.duration_since(at) < KEYFRAME_SPACING)
             {
+                st.pending_key = true;
                 return;
             }
             st.last_forced = Some(now);
+            st.pending_key = false;
         }
         let Some(pad) = self.encoder.upgrade().and_then(|e| e.static_pad("src")) else {
             return;
@@ -237,6 +242,15 @@ impl Media {
             (pts.nseconds() as u128 * 90_000 / 1_000_000_000) as u32
         });
         st.last_ts = ts_90khz;
+        let due = st.pending_key
+            && st
+                .last_forced
+                .is_none_or(|at| at.elapsed() >= KEYFRAME_SPACING);
+        if due {
+            drop(st);
+            self.keyframe();
+            st = self.lock();
+        }
         let (Some(config), Some(_)) = (st.config.clone(), st.client.as_ref()) else {
             return;
         };
@@ -599,5 +613,29 @@ mod tests {
             media.attach().is_none(),
             "a hello racing the end gets nothing"
         );
+    }
+
+    #[test]
+    fn a_keyframe_request_coalesced_into_a_pli_is_sent_once_the_spacing_passes() {
+        let (media, _encoder, forced) = counted();
+        media.on_caps(&caps(1280), "s");
+        let _client = media.attach().unwrap();
+        let count = || forced.load(std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(KEYFRAME_SPACING);
+        media.keyframe(); // the PLI
+        let after_pli = count();
+        std::thread::sleep(Duration::from_millis(50));
+        let changed = Instant::now();
+        media.on_caps(&caps(960), "s");
+        assert_eq!(count(), after_pli, "coalesced into the PLI's keyframe");
+        while count() == after_pli {
+            assert!(
+                changed.elapsed() < Duration::from_millis(400),
+                "the coalesced request was never sent: the stream would stall on want_key"
+            );
+            std::thread::sleep(Duration::from_millis(16));
+            media.on_unit(&buffer(false));
+        }
+        assert!(changed.elapsed() < KEYFRAME_SPACING + Duration::from_millis(60));
     }
 }
