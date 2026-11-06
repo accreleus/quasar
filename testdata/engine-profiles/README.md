@@ -1,6 +1,6 @@
 # Engine profiles (RH-07, #406)
 
-`profiles.json` is the published table of engine profiles (CONTEXT.md "Engine profile"): for
+`profiles.json` is the published table of engine profiles (GLOSSARY.md "Engine profile"): for
 each platform, container engine and engine mode, whether Quasar calls it **supported**,
 **experimental** or **unsupported**, in one sentence why, and for an unsupported one the
 profiles to use instead. Decisions D4 and D5 in `docs/rh07/2026-09-28-decisions.md` set the

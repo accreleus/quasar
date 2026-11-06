@@ -78,7 +78,7 @@ fn built_at_from(raw: Option<String>) -> Option<String> {
         .filter(|v| !v.is_empty() && v != "unknown")
 }
 
-/// How this host got its platform images (`CONTEXT.md` "Install mode").
+/// How this host got its platform images (`GLOSSARY.md` "Install mode").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallMode {
     /// Running a published image: the reference names a registry host, or is

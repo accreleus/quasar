@@ -1,4 +1,4 @@
-//! Machine state (architecture §5.4, `CONTEXT.md` "Machine state"): what the recovery
+//! Machine state (architecture §5.4, `GLOSSARY.md` "Machine state"): what the recovery
 //! actor keeps on its machine and nowhere else, in the `quasar-machine` volume.
 //!
 //! ```text

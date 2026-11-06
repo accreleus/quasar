@@ -1,4 +1,4 @@
-//! Whether a console session is displaying (CONTEXT.md "Displaying"): its container is
+//! Whether a console session is displaying (GLOSSARY.md "Displaying"): its container is
 //! alive, its desktop holds DRM master on the console card, and a framebuffer is on the
 //! connector's primary plane. A still desktop is displaying; there is no frame counter.
 //! The container's exit ends the session before any reading, so the facts here are the
