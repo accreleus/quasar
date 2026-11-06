@@ -62,7 +62,7 @@ impl Default for MediaProbeRequest {
 }
 
 impl MediaProbeRequest {
-    /// The codec probe for `codec` on `gpu` (GLOSSARY.md "Codec probe").
+    /// The codec probe for `codec` on `gpu` (CONTEXT.md "Codec probe").
     pub fn codec_probe(gpu: i32, codec: Codec) -> Self {
         MediaProbeRequest {
             gpu,
