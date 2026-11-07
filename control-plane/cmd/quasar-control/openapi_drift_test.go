@@ -253,9 +253,7 @@ var allowedUnimplemented = map[string]struct{}{
 // fails the test so none outlives its handler.
 var pendingImplementation = map[string]string{
 	// Amendment 56 (compatibility tools), accreleus/quasar#1066 contract; migration 0113 and handlers land with its implementation tickets.
-	"GET /v1/admin/compat-tools":                      "#1066",
 	"POST /v1/admin/compat-tools":                     "#1066",
-	"PUT /v1/admin/compat-tools/default":              "#1066",
 	"GET /v1/admin/compat-tools/mappings":             "#1066",
 	"PUT /v1/admin/compat-tools/mappings/steam/{}":    "#1066",
 	"DELETE /v1/admin/compat-tools/mappings/steam/{}": "#1066",
