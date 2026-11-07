@@ -4,8 +4,8 @@
 
 /** What the runtime needs of a presenter; a test supplies a fake. */
 export interface Presenter {
-  /** Draws `frame` and closes it. */
-  present(frame: VideoFrame): void;
+  /** Draws `frame` and closes it; false when nothing was drawn. */
+  present(frame: VideoFrame): boolean;
   destroy(): void;
 }
 
@@ -38,14 +38,31 @@ export function containRect(
   return { x: Math.floor((cw - w) / 2), y: Math.floor((ch - h) / 2), w, h };
 }
 
-/** Null when the browser has no WebGPU adapter. */
-export async function createWebGpuPresenter(canvas: HTMLCanvasElement): Promise<Presenter | null> {
+/**
+ * Null when the browser has no WebGPU adapter. `onFatal` is called once when the device
+ * is lost or reports an error nobody caught; the presenter draws nothing after that.
+ */
+export async function createWebGpuPresenter(
+  canvas: HTMLCanvasElement,
+  onFatal: (message: string) => void,
+): Promise<Presenter | null> {
   const gpu = navigator.gpu as GPU | undefined;
   const adapter = await gpu?.requestAdapter();
   if (!gpu || !adapter) return null;
   const device = await adapter.requestDevice();
   const context = canvas.getContext("webgpu");
   if (!context) return null;
+
+  let failed = false;
+  let destroyed = false;
+  const fail = (message: string) => {
+    if (failed || destroyed) return;
+    failed = true;
+    onFatal(message);
+  };
+  void device.lost.then((info) => fail(`the GPU device was lost (${info.reason}): ${info.message}`));
+  device.addEventListener("uncapturederror", (e) => fail(`WebGPU error: ${(e as GPUUncapturedErrorEvent).error.message}`));
+
   const format = gpu.getPreferredCanvasFormat();
   // Transparent outside the picture: the canvas's CSS background is the letterbox.
   context.configure({ device, format, alphaMode: "premultiplied" });
@@ -71,38 +88,39 @@ export async function createWebGpuPresenter(canvas: HTMLCanvasElement): Promise<
   });
   resize.observe(canvas);
 
+  /** The frame as something the bind group takes, and the pipeline that samples it. */
+  const source = (frame: VideoFrame): [GPURenderPipeline, GPUExternalTexture | GPUTextureView] => {
+    if (!copy) {
+      try {
+        return [external, device.importExternalTexture({ source: frame })];
+      } catch (err) {
+        console.warn("presenter: importExternalTexture failed; copying each frame instead", err);
+        copy = { pipeline: makePipeline("texture_2d<f32>"), target: null };
+      }
+    }
+    const [w, h] = [frame.displayWidth, frame.displayHeight];
+    if (!copy.target || copy.target.width !== w || copy.target.height !== h) {
+      copy.target?.destroy();
+      copy.target = device.createTexture({
+        size: [w, h],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+    }
+    device.queue.copyExternalImageToTexture({ source: frame }, { texture: copy.target }, [w, h]);
+    return [copy.pipeline, copy.target.createView()];
+  };
+
   return {
     present(frame) {
       try {
-        let pipeline = external;
-        let texture: GPUExternalTexture | GPUTextureView | null = null;
-        if (!copy) {
-          try {
-            texture = device.importExternalTexture({ source: frame });
-          } catch (err) {
-            console.warn("presenter: importExternalTexture failed; copying each frame instead", err);
-            copy = { pipeline: makePipeline("texture_2d<f32>"), target: null };
-          }
-        }
-        if (copy) {
-          const [w, h] = [frame.displayWidth, frame.displayHeight];
-          if (!copy.target || copy.target.width !== w || copy.target.height !== h) {
-            copy.target?.destroy();
-            copy.target = device.createTexture({
-              size: [w, h],
-              format: "rgba8unorm",
-              usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-            });
-          }
-          device.queue.copyExternalImageToTexture({ source: frame }, { texture: copy.target }, [w, h]);
-          pipeline = copy.pipeline;
-          texture = copy.target.createView();
-        }
+        if (failed || destroyed) return false;
+        const [pipeline, texture] = source(frame);
         const bindGroup = device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: sampler },
-            { binding: 1, resource: texture as GPUExternalTexture | GPUTextureView },
+            { binding: 1, resource: texture },
           ],
         });
         const encoder = device.createCommandEncoder();
@@ -123,12 +141,17 @@ export async function createWebGpuPresenter(canvas: HTMLCanvasElement): Promise<
         pass.draw(3);
         pass.end();
         device.queue.submit([encoder.finish()]);
+        return true;
+      } catch (err) {
+        fail(`the presenter could not draw: ${err instanceof Error ? err.message : String(err)}`);
+        return false;
       } finally {
         // Submitted work keeps what it imported; the frame goes back to the decoder now.
         frame.close();
       }
     },
     destroy() {
+      destroyed = true;
       resize.disconnect();
       device.destroy();
     },

@@ -3,13 +3,20 @@ import type { AccessUnit, KeyframeReason, VideoConfig } from "./transport";
 
 /** How long a unit waits for the `hello_ack` of its `config_id` (§Hello ack). */
 export const HOLD_MS = 1_000;
+/** Frames queued in the decoder before deltas are skipped to the next keyframe: about
+ *  50 ms at 60 fps, past which catching up costs more latency than one keyframe does. */
+export const MAX_DECODE_QUEUE = 3;
+/** Decoder failures in a row, with no frame decoded between them, before giving up. */
+export const MAX_DECODER_RESTARTS = 3;
+
+export type DecodeFailure = "decoder_unsupported" | "decode_error";
 
 export interface DecodeStageOptions {
   /** Each decoded frame; the callee owns it and must close it. */
   onFrame(frame: VideoFrame): void;
   requestKeyframe(reason: KeyframeReason): void;
-  /** The browser cannot decode this configuration. */
-  onUnsupported(config: VideoConfig): void;
+  /** Terminal: the browser cannot decode this configuration, or the decoder keeps failing. */
+  onFatal(reason: DecodeFailure, config: VideoConfig): void;
   /** Test seam; the browser's VideoDecoder otherwise. */
   createDecoder?: (init: VideoDecoderInit) => VideoDecoder;
   isConfigSupported?: (config: VideoDecoderConfig) => Promise<VideoDecoderSupport>;
@@ -31,14 +38,14 @@ export class DecodeStage {
   private decoder: VideoDecoder | null = null;
   private current: VideoConfig | null = null;
   private held: { unit: AccessUnit; at: number }[] = [];
+  /** Deltas are useless until a keyframe: after a (re)configure, a decoder restart or a skip. */
   private needKey = true;
   private askedKey = false;
-  private closed = false;
+  /** Set once the stage can do nothing more: closed, or a fatal error reported. */
+  private stopped = false;
   /** Bumped per configure, so a late support check cannot apply an old config. */
   private generation = 0;
-  private unsupported = false;
-  /** The decoder holds `current`'s configuration. */
-  private configured = false;
+  private restarts = 0;
   private readonly now: () => number;
 
   constructor(private readonly opts: DecodeStageOptions) {
@@ -46,17 +53,17 @@ export class DecodeStage {
   }
 
   config(config: VideoConfig): void {
-    if (this.closed) return;
+    if (this.stopped) return;
     // A re-sent hello_ack for the live configuration (the agent's resync) changes nothing.
     if (this.current?.configId === config.configId) return;
     this.current = config;
-    this.unsupported = false;
-    this.configured = false;
-    this.needKey = true;
-    this.askedKey = false;
+    // Null until configure() finishes: units for this config wait in `held` meanwhile.
+    const decoder = this.decoder?.state === "closed" ? null : this.decoder;
+    this.decoder = null;
+    this.wantKey();
     const generation = ++this.generation;
-    void this.configure(config, generation).then(() => {
-      if (generation !== this.generation || this.closed) return;
+    void this.configure(config, generation, decoder).then(() => {
+      if (generation !== this.generation || this.stopped) return;
       const waiting = this.held;
       this.held = [];
       for (const h of waiting) {
@@ -67,15 +74,16 @@ export class DecodeStage {
   }
 
   unit(unit: AccessUnit): void {
-    if (this.closed || this.unsupported) return;
+    if (this.stopped) return;
     const cur = this.current;
     if (cur && unit.configId !== cur.configId && !serialAfter(unit.configId, cur.configId, 8)) {
       return; // older than the current configuration
     }
-    if (!cur || unit.configId !== cur.configId || !this.configured || !this.decoder) {
+    if (!cur || unit.configId !== cur.configId || !this.decoder) {
       this.hold(unit);
       return;
     }
+    if (!unit.keyframe && !this.needKey && this.decoder.decodeQueueSize > MAX_DECODE_QUEUE) this.wantKey("late");
     if (this.needKey && !unit.keyframe) {
       if (!this.askedKey) this.opts.requestKeyframe("startup");
       this.askedKey = true;
@@ -84,23 +92,31 @@ export class DecodeStage {
     this.needKey = false;
     try {
       // The capture time rides as the chunk timestamp, so each VideoFrame carries it out.
-      this.decoder.decode(
-        new EncodedVideoChunk({
-          type: unit.keyframe ? "key" : "delta",
-          timestamp: unit.captureUs,
-          data: unit.data,
-        }),
-      );
+      // Transferred, not copied again: the unit's buffer is the decoder's from here.
+      const init = {
+        type: unit.keyframe ? "key" : "delta",
+        timestamp: unit.captureUs,
+        data: unit.data,
+        transfer: [unit.data.buffer],
+      };
+      this.decoder.decode(new EncodedVideoChunk(init as EncodedVideoChunkInit));
     } catch {
-      this.recover();
+      this.restart();
     }
   }
 
   close(): void {
-    this.closed = true;
+    this.stopped = true;
     this.held = [];
     if (this.decoder && this.decoder.state !== "closed") this.decoder.close();
     this.decoder = null;
+  }
+
+  /** Skip to the next keyframe; with a `reason`, ask the agent for it now. */
+  private wantKey(reason?: KeyframeReason): void {
+    this.needKey = true;
+    this.askedKey = reason !== undefined;
+    if (reason) this.opts.requestKeyframe(reason);
   }
 
   private hold(unit: AccessUnit): void {
@@ -112,7 +128,13 @@ export class DecodeStage {
     this.held.push({ unit, at });
   }
 
-  private async configure(config: VideoConfig, generation: number): Promise<void> {
+  private fatal(reason: DecodeFailure, config: VideoConfig): void {
+    this.close();
+    this.opts.onFatal(reason, config);
+  }
+
+  /** Puts `config` on `decoder` (or a new one) and publishes it as `this.decoder`. */
+  private async configure(config: VideoConfig, generation: number, decoder: VideoDecoder | null): Promise<void> {
     const decoderConfig: VideoDecoderConfig = {
       codec: config.codec === "h264" ? avcCodecString(config.description) : config.codec,
       description: config.description,
@@ -123,36 +145,51 @@ export class DecodeStage {
     };
     const check = this.opts.isConfigSupported ?? ((c) => VideoDecoder.isConfigSupported(c));
     const support = await check(decoderConfig).catch(() => ({ supported: false }));
-    if (generation !== this.generation || this.closed) return;
-    if (!support.supported) {
-      this.unsupported = true;
-      this.held = [];
-      this.opts.onUnsupported(config);
+    if (generation !== this.generation || this.stopped) {
+      if (decoder && decoder !== this.decoder && decoder.state !== "closed") decoder.close();
       return;
     }
-    if (!this.decoder || this.decoder.state === "closed") this.decoder = this.makeDecoder();
-    this.decoder.configure(decoderConfig);
-    this.configured = true;
+    if (!support.supported) {
+      decoder?.close();
+      this.fatal("decoder_unsupported", config);
+      return;
+    }
+    try {
+      const d = decoder ?? this.makeDecoder();
+      d.configure(decoderConfig);
+      this.decoder = d;
+    } catch {
+      // isConfigSupported passed and configure() still refused: no keyframe will fix that.
+      this.fatal("decoder_unsupported", config);
+    }
   }
 
   private makeDecoder(): VideoDecoder {
     const init: VideoDecoderInit = {
       output: (frame) => {
-        if (this.closed) frame.close();
-        else this.opts.onFrame(frame);
+        if (this.stopped) {
+          frame.close();
+          return;
+        }
+        this.restarts = 0;
+        this.opts.onFrame(frame);
       },
-      error: () => this.recover(),
+      error: () => this.restart(),
     };
     return this.opts.createDecoder ? this.opts.createDecoder(init) : new VideoDecoder(init);
   }
 
-  /** A decode error closes the decoder: make a new one under the same configuration
-   *  and resume at a keyframe. */
-  private recover(): void {
-    if (this.closed || !this.current) return;
+  /** A decode error closes the decoder: make a new one under the same configuration and
+   *  resume at a keyframe, at most {@link MAX_DECODER_RESTARTS} times in a row. */
+  private restart(): void {
+    const config = this.current;
+    if (this.stopped || !config) return;
+    if (++this.restarts > MAX_DECODER_RESTARTS) {
+      this.fatal("decode_error", config);
+      return;
+    }
     if (this.decoder && this.decoder.state !== "closed") this.decoder.close();
     this.decoder = null;
-    const config = this.current;
     this.current = null;
     this.config(config);
     this.opts.requestKeyframe("decode_error");

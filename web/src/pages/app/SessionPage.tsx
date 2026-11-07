@@ -418,6 +418,8 @@ function SessionPageBody() {
           callbacks: {
             onDisconnectSuspected: () => void pollEndReason(),
             onSessionTakenOver: () => noteFailure(takenOverFailure()),
+            // A poll verdict about the session's end outranks this one (settleFailure).
+            onTransportFailed: (detail) => noteFailure(unreachableFailure(detail)),
           },
         })
       : createSessionRuntime({
