@@ -20,6 +20,11 @@ const MIN_FRAGMENT_PAYLOAD = 1_000;
 const MAX_LATE_FRAMES = 256;
 /** Late fragments in a row after which a keyframe restarts the stream instead of being dropped. */
 const LATE_RUN_RESYNC = 32;
+/** While waiting for a keyframe, one request per wait, again after this long without it. */
+export const KEY_REASK_MS = 1_000;
+/** How long a first NACK is remembered for its round-trip sample. */
+const ASK_MEMORY_MS = 2_000;
+const MAX_ASKS_REMEMBERED = 4_096;
 /** §NACK: at most 32 ranges per message. */
 const MAX_NACK_RANGES = 32;
 
@@ -73,11 +78,10 @@ const gap = (at: number): Pending => ({
  * of its missing fragments, its repeat NACK goes unanswered for another round trip, or no
  * fragment of it arrives for {@link MAX_PENDING_AGE_MS}. A late frame is dropped; if it was
  * not `discardable`, every frame is dropped until the next keyframe, and one is asked for.
- * The round trip is measured from each first NACK to its retransmission.
- *
- * shortcut: deadlines are checked when a datagram or a `nack_miss` arrives, not on a timer;
- * the agent sends frames at the session's rate, so one always comes. A timer would be
- * needed for a source that can go quiet.
+ * The round trip is measured from each first NACK to its retransmission, even one that
+ * arrives after its frame was given up, and a longer sample is taken at once: an estimate
+ * too short turns every loss into a keyframe. Deadlines are checked on every datagram, every
+ * `nack_miss` and every {@link FrameAssembler.tick}.
  */
 export class FrameAssembler {
   private pending = new Map<number, Pending>();
@@ -90,7 +94,11 @@ export class FrameAssembler {
   private waitingForKey = true;
   private lateRun = 0;
   private needKey = false;
+  /** When this keyframe wait last asked for one; null when not waiting or not asked. */
+  private keyAskedAt: number | null = null;
   private srtt: number | null = null;
+  /** First NACK time per `frameSeq * 65536 + fragIndex`, in time order. */
+  private asked = new Map<number, number>();
 
   constructor(private readonly now: () => number = () => performance.now()) {}
 
@@ -102,6 +110,7 @@ export class FrameAssembler {
   push(f: VideoFragment): Reassembled {
     const at = this.now();
     this.expire(at);
+    if (f.retransmit) this.sample(f.frameSeq * 65_536 + f.fragIndex, at);
 
     if (this.lastDone !== null && !serialAfter(f.frameSeq, this.lastDone, 16)) {
       const behind = (this.lastDone - f.frameSeq + 65_536) % 65_536;
@@ -150,11 +159,6 @@ export class FrameAssembler {
       return this.step(at);
     }
     if (p.parts[f.fragIndex]) return this.step(at);
-    // Karn: a fragment asked for twice gives no round trip, it is unknown which ask it answers.
-    if (f.retransmit && p.asks[f.fragIndex] === 1) {
-      const sample = at - p.askedAt[f.fragIndex];
-      this.srtt = this.srtt === null ? sample : (7 * this.srtt + sample) / 8;
-    }
     p.parts[f.fragIndex] = f.payload;
     p.at = at;
     p.have += 1;
@@ -186,18 +190,44 @@ export class FrameAssembler {
     return this.step(this.now());
   }
 
+  /** The deadlines with no datagram: called on a timer, so release never waits for one. */
+  tick(): Reassembled {
+    const at = this.now();
+    this.expire(at);
+    return this.step(at);
+  }
+
   private step(at: number): Reassembled {
     const nacks = this.recover(at);
     const units: AccessUnit[] = [];
     this.drain(units);
-    const needKeyframe = this.needKey && this.waitingForKey;
+    let needKeyframe = false;
+    if (!this.waitingForKey) this.keyAskedAt = null;
+    else if (this.keyAskedAt === null ? this.needKey : at - this.keyAskedAt >= KEY_REASK_MS) {
+      needKeyframe = true;
+      this.keyAskedAt = at;
+    }
     this.needKey = false;
     return { units, nacks, needKeyframe };
+  }
+
+  /** A retransmission's round trip, from the first NACK for it. A repeat makes it longer
+   *  than the true one, which only delays the next repeat. */
+  private sample(key: number, at: number): void {
+    const first = this.asked.get(key);
+    if (first === undefined) return;
+    this.asked.delete(key);
+    const rtt = at - first;
+    this.srtt = this.srtt === null || rtt > this.srtt ? rtt : (7 * this.srtt + rtt) / 8;
   }
 
   /** The NACKs now due, and late marks for repeats that went unanswered. */
   private recover(at: number): Nack[] {
     const wait = this.rttMs + RTT_SLACK_MS;
+    for (const [k, t] of this.asked) {
+      if (at - t <= ASK_MEMORY_MS && this.asked.size <= MAX_ASKS_REMEMBERED) break;
+      this.asked.delete(k);
+    }
     const nacks: Nack[] = [];
     for (const [seq, p] of this.pending) {
       // Waiting for a keyframe, a delta is dropped whatever happens to it.
@@ -211,6 +241,7 @@ export class FrameAssembler {
         if (!due) continue;
         if (p.asks[i] >= 2) p.late = true;
         else if (addRange(frags, i)) {
+          if (p.asks[i] === 0) this.asked.set(seq * 65_536 + i, at);
           p.asks[i] += 1;
           p.askedAt[i] = at;
         }

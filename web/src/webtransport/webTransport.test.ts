@@ -226,6 +226,23 @@ describe("WebTransportMedia keyframe requests", () => {
   });
 });
 
+describe("WebTransportMedia loss recovery", () => {
+  it("repeats a NACK and gives the frame up on its timer when no datagram follows", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent);
+    await t.connect(NO_SINK);
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, pkt));
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(2000, 1) }, pkt).slice(1));
+    await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(1));
+    // Nothing more arrives: a still picture. The repeat and the lateness come off the timer.
+    await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(2));
+    await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "late" }]));
+    t.close();
+  });
+});
+
 // ── The runtime, end to end against the fake agent ─────────────────────────
 
 describe("createWebTransportRuntime", () => {

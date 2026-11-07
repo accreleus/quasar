@@ -30,6 +30,8 @@ const ANSWER_TIMEOUT_MS = 10_000;
 const CLOSE_CODE_WAIT_MS = 1_000;
 /** The agent forces at most one IDR per 150 ms (quasar-protocol#29, item 8); asking faster is noise. */
 export const KEYFRAME_SPACING_MS = 150;
+/** How often loss-recovery deadlines are checked when no datagram arrives. */
+export const RECOVERY_TICK_MS = 50;
 /** The control plane is asked for a fresh token at most this often. */
 export const REMINT_MIN_INTERVAL_MS = 10_000;
 /** A token held this long (TTL 60 s, control-api.md) is replaced after a failed attempt. Measured
@@ -318,9 +320,19 @@ export class WebTransportMedia implements MediaTransport {
         wt.close({ closeCode: 4400, reason: err instanceof Error ? err.message.slice(0, 100) : "" });
       }
     })();
+    // Release and lateness must not wait for the next datagram: a still picture may send none.
+    const tick = setInterval(() => {
+      if (live.on) this.recovered(assembler.tick(), sink);
+    }, RECOVERY_TICK_MS);
     void wt.closed.then(
-      (info) => sink.end({ code: info.closeCode ?? null, reason: info.reason ?? "" }),
-      (err: unknown) => sink.end({ code: null, reason: err instanceof Error ? err.message : "" }),
+      (info) => {
+        clearInterval(tick);
+        sink.end({ code: info.closeCode ?? null, reason: info.reason ?? "" });
+      },
+      (err: unknown) => {
+        clearInterval(tick);
+        sink.end({ code: null, reason: err instanceof Error ? err.message : "" });
+      },
     );
     return { kind: "ack" };
   }

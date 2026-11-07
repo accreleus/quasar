@@ -727,6 +727,21 @@ fn retransmit_window(session: &Session) -> Duration {
     retransmit::WINDOW.max(quinn::Connection::rtt(session) * 2)
 }
 
+/// Send `nack` answers; false when the connection is gone. A resend the path's maximum
+/// datagram size has shrunk below is dropped and counted: the client gives that frame up.
+fn resend(session: &Session, datagrams: Vec<bytes::Bytes>, too_large: &mut u64) -> bool {
+    for d in datagrams {
+        match session.send_datagram(d) {
+            Ok(()) => {}
+            Err(web_transport_quinn::SessionError::SendDatagramError(
+                quinn::SendDatagramError::TooLarge,
+            )) => *too_large += 1,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// Hand over the first bidirectional stream as the control stream and refuse every
 /// other stream, from the moment the session exists.
 async fn streams(session: Session, control: oneshot::Sender<(SendStream, RecvStream)>) {
@@ -934,6 +949,8 @@ async fn stream(
     });
     let mut pkt_seq = 0u32;
     let mut sent = retransmit::Retransmit::default();
+    let mut nack_budget = retransmit::NackBudget::new(std::time::Instant::now());
+    let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
@@ -976,6 +993,7 @@ async fn stream(
             message = control_rx.recv() => match message {
                 Some(Ok(message)) => match message.get("type").and_then(Value::as_str) {
                     Some("keyframe_request") => media.keyframe(),
+                    Some("nack") if !nack_budget.take(std::time::Instant::now()) => nacks_capped += 1,
                     Some("nack") => {
                         let answer = nack_of(&message).map(|(frame_seq, ranges)| {
                             let window = retransmit_window(session);
@@ -983,7 +1001,7 @@ async fn stream(
                             (frame_seq, sent.answer(frame_seq, &ranges, &mut pkt_seq, now, window))
                         });
                         if let Some((frame_seq, answer)) = answer {
-                            if answer.resend.into_iter().try_for_each(|d| session.send_datagram(d)).is_err() {
+                            if !resend(session, answer.resend, &mut resends_too_large) {
                                 break QUIET;
                             }
                             if !answer.missed.is_empty() {
@@ -1005,6 +1023,14 @@ async fn stream(
     };
     reader.abort();
     media.detach(client.id);
+    if nacks_capped + resends_too_large > 0 {
+        tracing::debug!(
+            token = "webtransport-nack-dropped",
+            nacks_capped,
+            resends_too_large,
+            "WebTransport left nacks unanswered or resends unsent"
+        );
+    }
     if let Some(message) = message {
         let _ = tokio::time::timeout(CONTROL_WRITE, write_message(&mut send, &message)).await;
         let _ = send.finish();

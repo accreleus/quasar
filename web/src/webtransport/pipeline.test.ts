@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ControlDecoder, ControlProtocolError, encodeControl, parseVideoDatagram, serialAfter } from "./framing";
-import { FrameAssembler, INITIAL_RTT_MS, MAX_PENDING, MAX_PENDING_AGE_MS, RTT_SLACK_MS } from "./reassembly";
+import { FrameAssembler, INITIAL_RTT_MS, KEY_REASK_MS, MAX_PENDING, MAX_PENDING_AGE_MS, RTT_SLACK_MS } from "./reassembly";
 import {
   BACKLOG_MS,
   DecodeStage,
@@ -127,6 +127,91 @@ describe("FrameAssembler", () => {
     expect(a.push(unitOf(7, false)[0]).units).toEqual([]); // deltas wait for the keyframe
     expect(seqs(a.push(unitOf(8, true)[0]))).toEqual([8]);
     expect(seqs(a.push(unitOf(9, false)[0]))).toEqual([9]);
+  });
+
+  it("repeats a NACK at the measured round trip plus the slack, not the initial guess", () => {
+    let t = 0;
+    const a = new FrameAssembler(() => t);
+    a.push(unitOf(1, true)[0]);
+    const two = unitOf(2, false, 2000);
+    a.push(two[1]);
+    t = 20;
+    a.push({ ...two[0], retransmit: true });
+    expect(a.rttMs).toBe(20);
+    const three = unitOf(3, false, 2000);
+    t = 100;
+    expect(a.push(three[1]).nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]);
+    t = 100 + 20 + RTT_SLACK_MS - 1;
+    expect(a.tick().nacks).toEqual([]);
+    t += 1;
+    expect(a.tick().nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]);
+  });
+
+  it("follows a round trip that rises from 2 to 150 ms, sampling a resend that lands after its frame was given up", () => {
+    let t = 0;
+    const a = new FrameAssembler(() => t);
+    a.push(unitOf(1, true)[0]);
+    const two = unitOf(2, false, 2000);
+    a.push(two[1]);
+    t = 2;
+    expect(seqs(a.push({ ...two[0], retransmit: true }))).toEqual([2]);
+    expect(a.rttMs).toBe(2);
+
+    // The path slows to 150 ms: the first loss after it cannot be saved.
+    const three = unitOf(3, false, 2000);
+    t = 10;
+    a.push(three[1]);
+    t = 22;
+    expect(a.push(unitOf(4, false)[0]).nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]);
+    t = 34;
+    expect(a.push(unitOf(5, false)[0]).needKeyframe).toBe(true);
+    t = 160; // its resend, after the frame was given up, still measures the path
+    a.push({ ...three[0], retransmit: true });
+    expect(a.rttMs).toBe(150);
+
+    // The next loss waits for its resend instead of going late.
+    t = 170;
+    expect(seqs(a.push(unitOf(6, true)[0]))).toEqual([6]);
+    const seven = unitOf(7, false, 2000);
+    a.push(seven[1]);
+    t = 319;
+    expect(a.push(unitOf(8, false)[0])).toEqual(NONE);
+    t = 320;
+    expect(a.push({ ...seven[0], retransmit: true })).toEqual({ ...NONE, units: [expect.objectContaining({ frameSeq: 7 }), expect.objectContaining({ frameSeq: 8 })] });
+
+    // And repeats and lateness keep to it when the resend never comes.
+    const nine = unitOf(9, false, 2000);
+    t = 400;
+    a.push(nine[1]);
+    t = 400 + 150 + RTT_SLACK_MS - 1;
+    expect(a.tick().nacks).toEqual([]);
+    t += 1;
+    expect(a.tick().nacks).toEqual([{ frameSeq: 9, frags: [[0, 0]] }]);
+    t += 150 + RTT_SLACK_MS - 1;
+    expect(a.tick().needKeyframe).toBe(false);
+    t += 1;
+    expect(a.tick().needKeyframe).toBe(true);
+  });
+
+  it(`asks for a keyframe once per wait, and again only after ${KEY_REASK_MS} ms without one`, () => {
+    let t = 0;
+    const a = new FrameAssembler(() => t);
+    a.push(unitOf(1, true)[0]);
+    a.push(unitOf(2, false, 2000)[0]);
+    a.push(unitOf(3, false)[0]);
+    expect(a.miss(2, [[1, 1]]).needKeyframe).toBe(true);
+    a.push(unitOf(4, false, 2000)[0]);
+    t = MAX_PENDING_AGE_MS + 1;
+    expect(a.push(unitOf(5, false)[0]).needKeyframe).toBe(false); // frame 4 expired in the same wait
+    t = KEY_REASK_MS - 1;
+    expect(a.tick().needKeyframe).toBe(false);
+    t = KEY_REASK_MS;
+    expect(a.tick().needKeyframe).toBe(true);
+    t += 1;
+    expect(seqs(a.push(unitOf(6, true)[0]))).toEqual([6]);
+    a.push(unitOf(7, false, 2000)[0]);
+    a.push(unitOf(8, false)[0]);
+    expect(a.miss(7, [[1, 1]]).needKeyframe).toBe(true); // a new wait asks at once
   });
 
   it("gives a frame up at once on a nack_miss for a fragment it lacks", () => {

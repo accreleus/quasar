@@ -17,6 +17,38 @@ const MAX_RESENDS: u8 = 2;
 const MAX_RANGES: usize = 32;
 const FLAG_RETRANSMIT: u8 = 4;
 
+/// `nack`s a client may send in a burst, and per second after it. A frame takes one
+/// `nack` and one repeat; 120 fps with every frame lossy is 240 a second.
+const NACK_BURST: f64 = 100.0;
+const NACK_RATE: f64 = 500.0;
+
+/// Bounds the `nack`s a connection gets answered: each costs a parse, a lookup and up to
+/// a frame of resends, so a flooding client is capped. One past the cap goes unanswered.
+pub(crate) struct NackBudget {
+    tokens: f64,
+    at: Instant,
+}
+
+impl NackBudget {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            tokens: NACK_BURST,
+            at: now,
+        }
+    }
+
+    pub(crate) fn take(&mut self, now: Instant) -> bool {
+        let refill = now.saturating_duration_since(self.at).as_secs_f64() * NACK_RATE;
+        self.tokens = (self.tokens + refill).min(NACK_BURST);
+        self.at = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
 struct Held {
     at: Instant,
     frame_seq: u16,
@@ -192,6 +224,18 @@ mod tests {
                 .missed,
             [[0, 0]]
         );
+    }
+
+    #[test]
+    fn the_nack_budget_caps_a_burst_and_refills_at_its_rate() {
+        let now = Instant::now();
+        let mut budget = NackBudget::new(now);
+        let burst = (0..1000).take_while(|_| budget.take(now)).count();
+        assert_eq!(burst, NACK_BURST as usize);
+        assert!(!budget.take(now));
+        let later = now + Duration::from_millis(100);
+        let refilled = (0..1000).take_while(|_| budget.take(later)).count();
+        assert_eq!(refilled, (NACK_RATE / 10.0) as usize);
     }
 
     #[test]
