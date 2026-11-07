@@ -28,10 +28,32 @@ fn hello_for(session_id: &str, token: &str, wt_proto: u32) -> Hello {
     }
 }
 
+/// An input seam that records what reaches it.
+fn recorded() -> (
+    Input,
+    Arc<Mutex<Vec<String>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (seen, lifted) = (events.clone(), released.clone());
+    let input = Input {
+        event: Arc::new(move |json| seen.lock().unwrap().push(json.to_string())),
+        release_all: Arc::new(move || {
+            lifted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }),
+    };
+    (input, events, released)
+}
+
+pub(super) fn no_input() -> Input {
+    recorded().0
+}
+
 fn ready_media() -> Arc<Media> {
     gst::init().unwrap();
     let encoder = gst::ElementFactory::make("identity").build().unwrap();
-    let media = Media::new(&encoder);
+    let media = Media::new(&encoder, no_input());
     let caps = gst::Caps::builder("video/x-h264")
         .field("stream-format", "avc")
         .field("width", 64)
@@ -120,6 +142,10 @@ struct Agent {
     hash: Vec<u8>,
     pipeline: gst::Pipeline,
     tap: Option<Tap>,
+    /// Every input event the agent's devices were given, as JSON text.
+    input: Arc<Mutex<Vec<String>>>,
+    /// How many times a departing client's inputs were lifted.
+    released: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for Agent {
@@ -152,11 +178,13 @@ async fn agent_with(limits: Limits) -> Agent {
     .unwrap();
     let parse = pipeline.by_name("parse").unwrap();
     let encoder = pipeline.by_name("enc").unwrap();
+    let (input, events, released) = recorded();
     let tap = Tap::attach(
         &registry,
         &parse.static_pad("src").unwrap(),
         &encoder,
         SESSION,
+        input,
     );
     assert!(tap.is_some(), "an assigned session takes the tap");
     pipeline.set_state(gst::State::Playing).unwrap();
@@ -185,6 +213,8 @@ async fn agent_with(limits: Limits) -> Agent {
         hash,
         pipeline,
         tap,
+        input: events,
+        released,
     }
 }
 
@@ -242,7 +272,11 @@ pub(super) async fn hold_close() -> CloseDone {
 
 /// The close code the browser's `WebTransport.closed` would resolve with.
 async fn close_code(session: &Session) -> Option<u32> {
-    match tokio::time::timeout(Duration::from_secs(10), session.closed()).await {
+    close_code_within(session, Duration::from_secs(10)).await
+}
+
+async fn close_code_within(session: &Session, within: Duration) -> Option<u32> {
+    match tokio::time::timeout(within, session.closed()).await {
         Ok(SessionError::WebTransportError(WebTransportError::Closed(code, _))) => Some(code),
         other => panic!("not a WebTransport close: {other:?}"),
     }
@@ -441,6 +475,120 @@ async fn before_hello_the_agent_reads_one_stream_and_waits_five_seconds() {
         .unwrap();
     assert_eq!(close_code(&session).await, Some(CLOSE_PROTOCOL), "no hello");
     assert!(opened.elapsed() >= Duration::from_millis(4900));
+}
+
+/// Waits for the agent's devices to have been given `n` events.
+async fn input_events(agent: &Agent, n: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let seen = agent.input.lock().unwrap().clone();
+        if seen.len() >= n || Instant::now() > deadline {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn input_arrives_by_datagram_and_control_stream_only_after_hello_ack() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    // Before `hello_ack` every datagram is dropped.
+    session
+        .send_datagram(Bytes::from_static(
+            b"\x03{\"t\":\"k\",\"code\":1,\"pressed\":true}",
+        ))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN,
+                       "session_id": SESSION, "client": "browser", "fec": []});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(read_message(&mut recv).await.unwrap()["type"], "hello_ack");
+
+    // The input.md JSON arrives byte for byte, from a datagram and from the control stream.
+    let motion = r#"{"t":"mm","dx":4,"dy":-2,"seq":17,"tc":123456.7}"#;
+    session
+        .send_datagram(Bytes::from([&[0x03u8][..], motion.as_bytes()].concat()))
+        .unwrap();
+    // Another channel's id, and one nobody knows, are dropped.
+    session
+        .send_datagram(Bytes::from_static(
+            b"\x01{\"t\":\"k\",\"code\":2,\"pressed\":true}",
+        ))
+        .unwrap();
+    session
+        .send_datagram(Bytes::from_static(
+            b"\x7f{\"t\":\"k\",\"code\":3,\"pressed\":true}",
+        ))
+        .unwrap();
+    let key = json!({"t": "k", "code": 30, "pressed": false});
+    write_message(&mut send, &json!({"type": "input", "event": key}))
+        .await
+        .unwrap();
+    let seen = input_events(&agent, 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let seen_all = agent.input.lock().unwrap().clone();
+    assert_eq!(seen_all.len(), 2, "only the two events: {seen_all:?}");
+    assert!(seen.contains(&motion.to_string()), "{seen:?}");
+    assert!(
+        seen_all
+            .iter()
+            .any(|e| serde_json::from_str::<Value>(e).unwrap() == key),
+        "{seen_all:?}"
+    );
+
+    // Ping is answered at once with the ping's fields and the agent's clocks.
+    let wall = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        * 1000.0;
+    write_message(
+        &mut send,
+        &json!({"type": "ping", "id": 17, "tc": 123456.7}),
+    )
+    .await
+    .unwrap();
+    let pong = read_message(&mut recv).await.unwrap();
+    assert_eq!(
+        (&pong["type"], &pong["id"], &pong["tc"]),
+        (&json!("pong"), &json!(17), &json!(123456.7))
+    );
+    assert!(pong["ts"].as_f64().unwrap() >= 0.0);
+    assert!(
+        (pong["tw"].as_f64().unwrap() - wall).abs() < 5_000.0,
+        "tw is Unix ms: {pong}"
+    );
+
+    // A departing client's held inputs are lifted.
+    assert_eq!(agent.released.load(std::sync::atomic::Ordering::SeqCst), 0);
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while agent.released.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "release_all never ran");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_client_silent_on_the_control_stream_for_10_s_is_gone_and_its_inputs_lifted() {
+    let agent = agent().await;
+    let (session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    let silent = Instant::now();
+    close_code_within(&session, Duration::from_secs(14)).await;
+    assert!(
+        silent.elapsed() >= Duration::from_millis(9_900),
+        "{:?}",
+        silent.elapsed()
+    );
+    assert_eq!(agent.released.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

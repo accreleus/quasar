@@ -88,6 +88,7 @@ struct State {
 /// connection task of the one client attached.
 pub(crate) struct Media {
     state: Mutex<State>,
+    input: super::Input,
     encoder: glib::WeakRef<gst::Element>,
 }
 
@@ -100,11 +101,16 @@ pub(crate) struct Attached {
 }
 
 impl Media {
-    pub(crate) fn new(encoder: &gst::Element) -> Arc<Self> {
+    pub(crate) fn new(encoder: &gst::Element, input: super::Input) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
+            input,
             encoder: encoder.downgrade(),
         })
+    }
+
+    pub(crate) fn input(&self) -> &super::Input {
+        &self.input
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -466,6 +472,7 @@ mod tests {
         let avcc = [1u8, 0x42, 0xc0, 0x1f, 0xff, 0xe1, 0, 0];
         let media = Arc::new(Media {
             state: Mutex::default(),
+            input: crate::webtransport::tests::no_input(),
             encoder: glib::WeakRef::new(),
         });
         media.on_caps(&caps(1280, &avcc), "s");
@@ -531,7 +538,11 @@ mod tests {
         );
         // An element in NULL has inactive pads, which refuse every event.
         encoder.set_state(gst::State::Paused).unwrap();
-        (Media::new(&encoder), encoder, forced)
+        (
+            Media::new(&encoder, crate::webtransport::tests::no_input()),
+            encoder,
+            forced,
+        )
     }
 
     fn units(rx: &mut mpsc::Receiver<Out>) -> Vec<(bool, u8)> {
