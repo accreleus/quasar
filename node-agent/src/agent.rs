@@ -5174,6 +5174,10 @@ impl SessionManager {
         out
     }
 
+    /// The single entry point by which a session reuses a runtime (#1133's adopt, restream and
+    /// rebuild included): its compatibility tools are claimed atomically with the removal check
+    /// (`compat_tools::claim_for_adopt`), so a runtime is never reused on a removed tool.
+    ///
     /// Amendment 39 `adopt_session_id`: hand `from`'s held or parked runtime to
     /// `session_id`, or say why it is built fresh. A runtime held here that is not adopted
     /// is released, and the fresh build waits for it: the two share a managed home.
@@ -5206,13 +5210,19 @@ impl SessionManager {
             Some("it encodes another stream, or a smaller one")
         } else if h.region_env != region_env(cfg.container.as_ref()) {
             Some("its container was started with other Region and Input values")
-        } else if !crate::compat_tools::all_installed(&h.compat_tools) {
-            // A removal may delete a tree under a parked runtime's bind mount; never hand that
-            // runtime, and so a deleted tool, to Steam.
-            Some("a compatibility tool it mounts is no longer installed")
         } else if cfg.kind != Some(SessionKind::Parked) && !h.metrics.launch_helper_connected() {
             // A runtime whose helper never connected cannot start the game.
             Some("its launch helper never connected")
+        } else if !crate::compat_tools::claim_for_adopt(
+            from,
+            session_id,
+            &h.compat_tools,
+            cfg.kind == Some(SessionKind::Parked),
+        ) {
+            // Last, so nothing after it can decline: the claim moved the hold to `session_id`. A
+            // removal may delete a tree under a parked runtime's bind mount; never hand that
+            // runtime, and so a deleted tool, to Steam.
+            Some("a compatibility tool it mounts is no longer installed")
         } else {
             None
         };
@@ -5231,6 +5241,8 @@ impl SessionManager {
                 .then_some("its runner is gone"),
         };
         if let Some(why) = refused {
+            // A claim that went through before a gone runner holds nothing any more.
+            crate::compat_tools::release(session_id);
             info!(
                 token = "runtime-adopt-declined",
                 "session {session_id}: not adopting the runtime of {from} ({why}); it is torn \
@@ -5250,7 +5262,6 @@ impl SessionManager {
         let Some(mut h) = self.running.remove(from) else {
             return Adoption::Fresh { after: None };
         };
-        crate::compat_tools::adopt(from, session_id, cfg.kind == Some(SessionKind::Parked));
         h.metrics.drain_window(Instant::now());
         h.held = None;
         h.swapping = false;

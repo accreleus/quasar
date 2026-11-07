@@ -150,10 +150,11 @@ pub fn retain_holds(live: &dyn Fn(&str) -> bool) {
     }
 }
 
-pub fn adopt(from: &str, to: &str, parked: bool) {
-    if let Some(s) = store() {
-        s.adopt(from, to, parked);
-    }
+/// For `SessionManager::adopt_runtime` only, the one place a runtime is reused: true when every
+/// tool in `tools` is still Installed and present, in which case the hold moves from `from` to
+/// `to` (no longer parked unless `to` is) in the same critical section a removal takes.
+pub fn claim_for_adopt(from: &str, to: &str, tools: &[String], parked: bool) -> bool {
+    tools.is_empty() || store().is_some_and(|s| s.claim_for_adopt(from, to, tools, parked))
 }
 
 pub fn release(session_id: &str) {

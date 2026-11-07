@@ -63,6 +63,9 @@ pub struct ToolStore {
     trace: Mutex<Vec<&'static str>>,
     #[cfg(test)]
     fail_at: Mutex<Option<&'static str>>,
+    /// Holds `claim_for_adopt` between its check and its hold move (two waits).
+    #[cfg(test)]
+    adopt_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 /// How deep a tree walk goes. Extraction allows 32 components (`extract::MAX_COMPONENTS`), so a
@@ -300,6 +303,8 @@ impl ToolStore {
             trace: Mutex::new(Vec::new()),
             #[cfg(test)]
             fail_at: Mutex::new(None),
+            #[cfg(test)]
+            adopt_gate: Mutex::new(None),
         };
         store
             .recover()
@@ -548,13 +553,33 @@ impl ToolStore {
         out
     }
 
-    /// A play session that adopts a parked runtime keeps its mounts, no longer parked.
-    pub fn adopt(&self, from: &str, to: &str, parked: bool) {
-        let mut m = lock(&self.mounted);
-        if let Some((names, _)) = m.remove(from) {
-            m.insert(to.to_owned(), (names, parked));
+    /// Claims `tools` for `to`, which adopts `from`'s runtime: under the `mounted` lock a removal
+    /// takes, every tool must still be Installed and present, and the hold moves to `to` (parked
+    /// only if `to` is) before the lock is released. A removal therefore either marked a tool
+    /// Removing first, and the claim fails, or sees `to`'s hold and defers `in_use`. The only
+    /// caller is `SessionManager::adopt_runtime`, the single entry point for reusing a runtime.
+    pub fn claim_for_adopt(&self, from: &str, to: &str, tools: &[String], parked: bool) -> bool {
+        let mut held = lock(&self.mounted);
+        if !self.all_installed(tools) {
+            return false;
+        }
+        self.gate();
+        held.remove(from);
+        held.insert(to.to_owned(), (tools.to_vec(), parked));
+        true
+    }
+
+    #[cfg(test)]
+    fn gate(&self) {
+        let gate = lock(&self.adopt_gate).clone();
+        if let Some(b) = gate {
+            b.wait();
+            b.wait();
         }
     }
+
+    #[cfg(not(test))]
+    fn gate(&self) {}
 
     pub fn release(&self, session_id: &str) {
         lock(&self.mounted).remove(session_id);
@@ -1624,7 +1649,7 @@ mod tests {
             JobOutcome::Deferred("in_use".into())
         );
         rig.store.release("play");
-        rig.store.adopt("parked", "adopted", false);
+        assert!(rig.store.claim_for_adopt("parked", "adopted", &want, false));
         assert_eq!(
             rig.run(vec![], remove()).0,
             JobOutcome::Deferred("in_use".into()),
@@ -2067,5 +2092,45 @@ mod tests {
             "reinstalled by desired state"
         );
         assert_eq!(healed.installed().len(), 1);
+    }
+
+    /// Round 4: a removal racing an adopt never leaves an adopted runtime on a removed tool. The
+    /// gate parks the claim between its check and its hold move while a removal runs.
+    #[test]
+    fn a_removal_racing_an_adopt_never_removes_the_adopted_tool() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        let want = vec![NAME.to_string()];
+        assert_eq!(rig.store.mountable("parked", &want, true), want);
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        *lock(&rig.store.adopt_gate) = Some(gate.clone());
+        let store = rig.store.clone();
+        let claim = std::thread::spawn({
+            let want = want.clone();
+            move || store.claim_for_adopt("parked", "play", &want, false)
+        });
+        gate.wait(); // the claim has checked and not yet moved the hold
+        let (runner, _) = rig.runner(Fake {
+            body: vec![],
+            route: Box::new(|_| None),
+            calls: AtomicUsize::new(0),
+        });
+        let removal = std::thread::spawn(move || runner.run(&remove(), &AbortFlag::new()));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        gate.wait();
+        let claimed = claim.join().unwrap();
+        let removed = removal.join().unwrap();
+        *lock(&rig.store.adopt_gate) = None;
+        assert!(claimed, "the tool was Installed when the claim checked");
+        assert_eq!(
+            removed,
+            JobOutcome::Deferred("in_use".into()),
+            "the removal waited for the adopted runtime"
+        );
+        assert!(
+            rig.store.all_installed(&want),
+            "the adopted runtime's tool is still there"
+        );
     }
 }
