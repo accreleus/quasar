@@ -932,7 +932,6 @@ const NODE_AGENT_ENV: &[(&str, &str)] = &[
     ("QUASAR_FEC_ARM_WINDOWS", ""),
     ("QUASAR_FEC_DISARM_WINDOWS", ""),
     ("QUASAR_FEC_MAX_FLAPS", ""),
-    ("QUASAR_RTP_MTU", ""),
     ("QUASAR_INTRA_REFRESH", "0"),
     ("QUASAR_INTRA_REFRESH_PERIOD", "0"),
     ("QUASAR_VULKAN_H264", ""),

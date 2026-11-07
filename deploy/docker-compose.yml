@@ -422,8 +422,6 @@ services:
       QUASAR_FEC_ARM_WINDOWS: ${QUASAR_FEC_ARM_WINDOWS:-}
       QUASAR_FEC_DISARM_WINDOWS: ${QUASAR_FEC_DISARM_WINDOWS:-}
       QUASAR_FEC_MAX_FLAPS: ${QUASAR_FEC_MAX_FLAPS:-}
-      # Largest RTP packet sent over WebRTC (900-1436); empty = the agent default, 1200.
-      QUASAR_RTP_MTU: ${QUASAR_RTP_MTU:-}
       # #227 A2: rolling intra refresh — Vulkan encoder only (needs the vendored
       # vkh264enc-intra-refresh.patch that the runtime image's gst carries; a stock
       # gst-plugins-bad build has no intra-refresh property and no-ops with a warning).
