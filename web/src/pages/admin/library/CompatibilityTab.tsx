@@ -185,7 +185,7 @@ export function CompatibilityTab() {
                               variant="ghost"
                               size="sm"
                               aria-label={`Remove ${t.display_name}`}
-              aria-describedby={state === "installing" ? `compat-state-${t.id}` : undefined}
+                              aria-describedby={state === "installing" ? `compat-state-${t.id}` : undefined}
                               disabled={state === "installing" || removing.has(t.id)}
                               onClick={() => void remove(t)}
                             >

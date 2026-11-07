@@ -347,6 +347,29 @@ describe("CompatibilityTab Add tool picker", () => {
     await waitFor(() => expect(list).toHaveBeenCalled());
   });
 
+  it("recovers from a stale list: on compat_tool_exists it finds the pinned row by tag and enables it", async () => {
+    vi.mocked(adminApi.addCompatTool).mockRejectedValue(new ApiError(409, "compat_tool_exists", "a tool with this tag exists"));
+    list.mockResolvedValue(
+      catalogue([...VALVE, IN_USE, tool({ id: "t-106", display_name: "GE-Proton10-6", enabled: false })]),
+    );
+    vi.mocked(adminApi.setCompatToolEnabled).mockResolvedValue(tool({ id: "t-106", display_name: "GE-Proton10-6" }));
+    const dialog = await openPicker([NEW]);
+    fireEvent.click(dialog.getByRole("button", { name: "Install" }));
+    await waitFor(() => expect(adminApi.setCompatToolEnabled).toHaveBeenCalledWith("test-token", "t-106", true));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.queryByText("Could not install GE-Proton10-6")).toBeNull();
+  });
+
+  it("says the tool was added but not enabled when the enable fails after the pin", async () => {
+    vi.mocked(adminApi.addCompatTool).mockResolvedValue(tool({ id: "t-106", display_name: "GE-Proton10-6", enabled: false }));
+    vi.mocked(adminApi.setCompatToolEnabled).mockRejectedValue(new ApiError(409, "compat_tool_limit", "8 tools are already enabled"));
+    const dialog = await openPicker([NEW]);
+    fireEvent.click(dialog.getByRole("button", { name: "Install" }));
+    expect(await screen.findByText("GE-Proton10-6 was added but not enabled")).toBeTruthy();
+    expect(screen.getByText("8 tools are already enabled")).toBeTruthy();
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+
   it("only enables a release that already has a row", async () => {
     vi.mocked(adminApi.setCompatToolEnabled).mockResolvedValue(tool({ id: "t-930", display_name: "GE-Proton9-30" }));
     const dialog = await openPicker([REC_OFF]);

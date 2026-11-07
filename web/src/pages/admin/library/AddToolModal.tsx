@@ -4,6 +4,7 @@
 
 import * as adminApi from "../../../api/admin";
 import type { CompatToolAvailable } from "../../../api/admin";
+import { ApiError } from "../../../api/client";
 import { useAuth } from "../../../auth/context";
 import { Button } from "../../../components/Button";
 import { Chip } from "../../../components/Chip";
@@ -23,6 +24,9 @@ interface Props {
   onInstalled: () => void;
 }
 
+/** The pin took but the enable did not: the tool is in the catalogue, disabled. */
+class AddedNotEnabled extends Error {}
+
 function released(iso: string | null): string | null {
   return iso ? new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : null;
 }
@@ -36,18 +40,35 @@ export function AddToolModal({ sizeByToolId, onClose, onInstalled }: Props) {
 
   // A release with no catalogue row is pinned first (POST), then enabled (PATCH);
   // one with a row is only enabled. The enable is what installs on every host.
+  // A stale list can POST a tag that has since been pinned (409 compat_tool_exists,
+  // e.g. a retry after an enable failed): look the row up by tag and enable it.
   const install = useAdminAction(
     async (a: CompatToolAvailable) => {
       if (!token) throw new Error("not signed in");
-      const id = a.tool_id ?? (await adminApi.addCompatTool(token, a.tag)).id;
-      await adminApi.setCompatToolEnabled(token, id, true);
+      let id = a.tool_id;
+      if (id === null) {
+        try {
+          id = (await adminApi.addCompatTool(token, a.tag)).id;
+        } catch (e) {
+          if (!(e instanceof ApiError && e.code === "compat_tool_exists")) throw e;
+          const row = (await adminApi.listCompatTools(token)).items.find((t) => t.tag === a.tag);
+          if (!row) throw e;
+          id = row.id;
+        }
+      }
+      try {
+        await adminApi.setCompatToolEnabled(token, id, true);
+      } catch (e) {
+        if (a.tool_id === null) throw new AddedNotEnabled(e instanceof Error ? e.message : "");
+        throw e;
+      }
     },
     {
       success: (_r, a) => `Installing ${a.display_name} on every host`,
-      failure: (e, a) => ({
-        title: `Could not install ${a.display_name}`,
-        body: e instanceof Error ? e.message : undefined,
-      }),
+      failure: (e, a) =>
+        e instanceof AddedNotEnabled
+          ? { title: `${a.display_name} was added but not enabled`, body: e.message || undefined }
+          : { title: `Could not install ${a.display_name}`, body: e instanceof Error ? e.message : undefined },
       onSuccess: onInstalled,
       onFailure: () => list.refresh(),
     },
