@@ -226,7 +226,7 @@ impl Shrink {
 
 /// The sequence numbers a generic NACK's FCI names: (PID, BLP) pairs.
 pub(super) fn nack_seqs(fci: &[u8]) -> impl Iterator<Item = u16> + '_ {
-    fci.chunks_exact(4).flat_map(|c| {
+    fci.as_chunks::<4>().0.iter().flat_map(|c| {
         let pid = u16::from_be_bytes([c[0], c[1]]);
         let blp = u16::from_be_bytes([c[2], c[3]]);
         std::iter::once(pid).chain(
