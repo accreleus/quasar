@@ -3699,6 +3699,9 @@ rc_of 0 "release:preview-rules" -- bash "$ROOT/scripts/release/test-preview-rule
 # The nightly toolchain refresh builds only a tag the registry says is absent; a registry failure is an error (#1092).
 rc_of 0 "release:toolchain-missing" -- bash "$ROOT/scripts/release/test-toolchain-missing.sh"
 
+# A rebuilt base reaches the preview images: same digest skips, anything absent rebuilds, a registry error fails (#1092).
+rc_of 0 "release:base-changed" -- bash "$ROOT/scripts/release/test-base-changed.sh"
+
 # The detached release signature: the shell producer must write what the
 # shell verifier accepts, and refuse a tampered manifest or a wrong key.
 rc_of 0 "release:signature-contract" -- bash "$ROOT/scripts/release/test-platform-release-signature.sh"
