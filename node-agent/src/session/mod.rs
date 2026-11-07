@@ -1144,9 +1144,9 @@ fn fec_percentage_from(var: &str, raw: Option<&str>) -> u32 {
 /// mobile tunnel) carries every packet with room for SRTP, UDP and IPv6 (#1131).
 pub const DEFAULT_RTP_MTU: u32 = 1200;
 /// `QUASAR_RTP_MTU` bounds. 1436 fills a 1500-byte IPv6 path after SRTP's largest tag
-/// (16), UDP (8) and IPv6 (40). 576 is a floor, not a path size: below it per-packet
-/// overhead dominates the payload.
-pub(crate) const RTP_MTU_RANGE: std::ops::RangeInclusive<u32> = 576..=1436;
+/// (16), UDP (8) and IPv6 (40). 900 is a packet-rate floor, not a path size (#1134 shrinks
+/// no lower): its payload is 852 bytes, 1.6x the packets of the old 1400-byte default.
+pub(crate) const RTP_MTU_RANGE: std::ops::RangeInclusive<u32> = 900..=1436;
 
 fn env_rtp_mtu(var: &str) -> u32 {
     rtp_mtu_from(var, std::env::var(var).ok().as_deref())
@@ -1471,9 +1471,10 @@ mod tests {
             (None, DEFAULT_RTP_MTU),
             (Some(""), DEFAULT_RTP_MTU),
             (Some("1000"), 1000),
-            (Some("576"), 576),
+            (Some("900"), 900),
             (Some("1436"), 1436),
-            (Some("575"), DEFAULT_RTP_MTU),
+            (Some("899"), DEFAULT_RTP_MTU),
+            (Some("576"), DEFAULT_RTP_MTU),
             (Some("1437"), DEFAULT_RTP_MTU),
             (Some("1400 "), DEFAULT_RTP_MTU),
             (Some("junk"), DEFAULT_RTP_MTU),

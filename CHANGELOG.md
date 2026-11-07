@@ -25,7 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
-- **Video now plays over VPN, mobile and IPv6 tunnels with a 1280-byte MTU (#1131).** The agent's RTP packets were up to about 1430 bytes before SRTP, UDP and IP, so such a path dropped every full-size video packet: black video with sound. RTP packets are now at most 1200 bytes, header extensions and FEC included; `QUASAR_RTP_MTU` changes the limit (`576`-`1436`).
+- **Video now plays over VPN, mobile and IPv6 tunnels with a 1280-byte MTU (#1131).** The agent's RTP packets were up to about 1430 bytes before SRTP, UDP and IP, so such a path dropped every full-size video packet: black video with sound. RTP packets are now at most 1200 bytes, header extensions and FEC included; `QUASAR_RTP_MTU` changes the limit (`900`-`1436`).
 
 ### Security
 - **An agent can no longer put signaling into another host's session (#1116).** The control plane relays an agent's `signaling` frame to the browser only when the session id is placed on the sending host, and drops (and logs, rate-limited) any other, including a non-canonical spelling (upper case, no hyphens) of a session that is placed there. A placement lookup that fails (a database blip) drops that frame, never the session, and the agent's read loop waits at most 2 s per session id per 2 s.
