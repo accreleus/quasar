@@ -22,8 +22,13 @@ import {
 const WT_PROTO = 1;
 /** `session_not_ready`: retry the same token after this long (§Hello). */
 const NOT_READY_RETRY_MS = 250;
-/** How long connect keeps retrying an agent that is not ready or gives no answer. */
+/** How long connect keeps retrying an agent that says it is not ready. */
 export const CONNECT_DEADLINE_MS = 60_000;
+/** How long connect waits for the WebTransport handshake. A host that completed it is reachable,
+ *  so attempts after that (not ready, or an answer Chrome dropped) are not bounded by this: they
+ *  run to {@link CONNECT_DEADLINE_MS}. Well under the loader's give-up time, so the page can fall
+ *  back to WebRTC (control-api.md §Transport fallback) while the launch is still waiting. */
+export const HANDSHAKE_DEADLINE_MS = 10_000;
 /** One attempt's wait for its answer; the agent closes a connection with no `hello` at 5 s. */
 const ANSWER_TIMEOUT_MS = 10_000;
 /** How long a connection that failed without an answer gets to report its close code. */
@@ -232,7 +237,13 @@ export class WebTransportMedia implements MediaTransport {
     };
 
     try {
-      await wt.ready;
+      // A blocked UDP port can leave the handshake pending for the browser's own, longer, timeout.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const ready = await Promise.race([
+        wt.ready.then(() => true),
+        new Promise<boolean>((r) => void (timer = setTimeout(() => r(false), HANDSHAKE_DEADLINE_MS))),
+      ]).finally(() => clearTimeout(timer));
+      if (!ready) return abandon(refused(this.closed ? "closed" : "connect_timeout"));
     } catch {
       // The handshake or the certificate failed (another try meets the same), or close() ended it.
       return abandon(refused(this.closed ? "closed" : "connect_failed"));
