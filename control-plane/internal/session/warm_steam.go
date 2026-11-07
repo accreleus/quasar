@@ -573,8 +573,8 @@ type querier interface {
 }
 
 func stopParkedIn(ctx context.Context, q querier, reason string, f parkedFilter) ([]parkedStop, error) {
-	rows, err := q.Query(ctx, `UPDATE sessions SET state = 'stopping', state_detail = 'stop requested',
-		    stop_reason = COALESCE(stop_reason, $1), launch_progress = NULL
+	// The CTE locks the rows in id order, so two writers stopping overlapping sets cannot deadlock.
+	rows, err := q.Query(ctx, `WITH t AS (SELECT id FROM sessions
 		WHERE kind = 'parked' AND state IN ('pending','assigned','starting','running')
 		  AND ($2::uuid IS NULL OR id = $2::uuid)
 		  AND ($3::uuid IS NULL OR host_id = $3::uuid)
@@ -588,7 +588,11 @@ func stopParkedIn(ctx context.Context, q querier, reason string, f parkedFilter)
 		          AND u.max_concurrent_sessions > 0
 		          AND EXISTS (SELECT 1 FROM entitlements e WHERE e.app_id = a.id
 		                AND (e.subject_type = 'all' OR (e.subject_type = 'user' AND e.subject_id = sessions.user_id)))))
-		RETURNING id::text, COALESCE(host_id::text, ''), user_id::text`,
+		ORDER BY id FOR UPDATE)
+		UPDATE sessions SET state = 'stopping', state_detail = 'stop requested',
+		    stop_reason = COALESCE(stop_reason, $1), launch_progress = NULL
+		FROM t WHERE sessions.id = t.id
+		RETURNING sessions.id::text, COALESCE(sessions.host_id::text, ''), sessions.user_id::text`,
 		reason, orNil(f.ID), orNil(f.HostID), orNil(f.UserID), orNil(f.ExceptApp), f.Expired, f.Unqualified)
 	if err != nil {
 		return nil, fmt.Errorf("stop parked sessions: %w", err)
@@ -641,15 +645,34 @@ func (c *Coordinator) ExpireParked(ctx context.Context) (int, error) {
 	return c.stopParked(ctx, StopReasonParkedExpired, parkedFilter{Expired: w.Enabled})
 }
 
-// SupersedeParked stops every live parked session inside tx and returns the dispatch to run after
-// the commit; no warm-start suppression, so the next heartbeat re-parks on the new mapping.
-// semantics: control-api.md §Compatibility tools, "Hot Loading".
+// SupersedeParked makes sure no Steam that predates an effective mapping change survives it, inside
+// tx: it clears park_on_end on the live play sessions, stops every live parked session, then clears
+// park_on_end again. A park made from a play session that ends, and a play that claims a parked
+// session, are each caught by the statement that starts after they commit. The returned func sends
+// the stops after the commit; there is no warm-start suppression, so the next heartbeat re-parks on
+// the new mapping. semantics: control-api.md §Compatibility tools, "Hot Loading".
 func (c *Coordinator) SupersedeParked(ctx context.Context, tx pgx.Tx) (func(), error) {
+	if err := noParkOnEnd(ctx, tx); err != nil {
+		return nil, err
+	}
 	stops, err := stopParkedIn(ctx, tx, StopReasonParkedSuperseded, parkedFilter{})
 	if err != nil {
 		return nil, err
 	}
+	if err := noParkOnEnd(ctx, tx); err != nil {
+		return nil, err
+	}
 	return func() { c.sendParkedStops(stops, StopReasonParkedSuperseded) }, nil
+}
+
+// noParkOnEnd locks the live play sessions in id order and stops endHeldPlay from parking them.
+func noParkOnEnd(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, `WITH t AS (SELECT id FROM sessions
+		WHERE kind = 'play' AND park_on_end AND state NOT IN ('stopped','failed') ORDER BY id FOR UPDATE)
+		UPDATE sessions SET park_on_end = false FROM t WHERE sessions.id = t.id`); err != nil {
+		return fmt.Errorf("clear park on end: %w", err)
+	}
+	return nil
 }
 
 // StopParkedOnHost stops a host's parked sessions as a drain or an apply
@@ -818,8 +841,9 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 	var cur State
 	var kind string
 	var host *string
-	if err := tx.QueryRow(ctx, `SELECT state, kind, host_id::text FROM sessions WHERE id = $1::uuid FOR UPDATE`,
-		sessionID).Scan(&cur, &kind, &host); err != nil {
+	var parkOnEnd bool
+	if err := tx.QueryRow(ctx, `SELECT state, kind, host_id::text, park_on_end FROM sessions WHERE id = $1::uuid FOR UPDATE`,
+		sessionID).Scan(&cur, &kind, &host, &parkOnEnd); err != nil {
 		return nil, nil, fmt.Errorf("lock held session: %w", err)
 	}
 	if host == nil || *host != hostID {
@@ -840,9 +864,9 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 	if err != nil {
 		return nil, nil, err
 	}
-	// A stopping row was stopped by the control plane: never parked. The agent
-	// sends no stopping before a held stop (agent-api.md §session_state).
-	if !(w.Enabled && hostParks && cur == StateRunning && kind == KindPlay) {
+	// A stopping row was stopped by the control plane: never parked. The agent sends no stopping
+	// before a held stop (agent-api.md §session_state). park_on_end is cleared by SupersedeParked.
+	if !(w.Enabled && hostParks && cur == StateRunning && kind == KindPlay && parkOnEnd) {
 		if err := releaseHeld(ctx, tx, sessionID); err != nil {
 			return nil, nil, err
 		}
