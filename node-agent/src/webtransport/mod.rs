@@ -46,7 +46,7 @@ const CONTROL_WRITE: Duration = Duration::from_secs(2);
 const LOGGED_ID: usize = 64;
 const TOKEN_SKEW: Duration = Duration::from_secs(15);
 const TOKEN_TTL: Duration = Duration::from_secs(60);
-const ROTATION_CHECK: Duration = Duration::from_secs(600);
+const ROTATION_CHECK: Duration = Duration::from_secs(60);
 const DEFAULT_PORT: u16 = 4433;
 
 const CLOSE_NORMAL: u32 = 0;
@@ -354,6 +354,7 @@ impl Drop for Slot {
 pub struct Listener {
     registry: Arc<Registry>,
     certs: Mutex<CertSet>,
+    served: Arc<Served>,
     quic: quinn::Endpoint,
     port: u16,
     limits: Limits,
@@ -431,15 +432,53 @@ pub fn capacity() -> Transports {
     }
 }
 
-fn server_config(cert: &Cert) -> Result<quinn::ServerConfig> {
+/// The certificate new handshakes get. One `quinn::ServerConfig` serves for the listener's
+/// life and only this changes, so the Retry token key never does: a token issued just
+/// before a swap still redeems after it.
+#[derive(Debug)]
+struct Served(std::sync::RwLock<(String, Arc<rustls::sign::CertifiedKey>)>);
+
+impl Served {
+    fn load(cert: &Cert) -> Result<(String, Arc<rustls::sign::CertifiedKey>)> {
+        let key = rustls::crypto::ring::default_provider()
+            .key_provider
+            .load_private_key(rustls_pki_types::PrivateKeyDer::Pkcs8(
+                cert.key_der.clone().into(),
+            ))?;
+        let certified = rustls::sign::CertifiedKey::new(vec![cert.der.clone().into()], key);
+        Ok((cert.sha256.clone(), Arc::new(certified)))
+    }
+
+    fn new(cert: &Cert) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self(std::sync::RwLock::new(Self::load(cert)?))))
+    }
+
+    /// Serve `cert` to new handshakes. On `Err` the previous certificate stays.
+    fn set(&self, cert: &Cert) -> Result<()> {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Self::load(cert)?;
+        Ok(())
+    }
+
+    fn hash(&self) -> String {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).0.clone()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for Served {
+    fn resolve(
+        &self,
+        _: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.read().unwrap_or_else(|e| e.into_inner()).1.clone())
+    }
+}
+
+fn server_config(served: Arc<Served>) -> Result<quinn::ServerConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
-        .with_single_cert(
-            vec![cert.der.clone().into()],
-            rustls_pki_types::PrivateKeyDer::Pkcs8(cert.key_der.clone().into()),
-        )?;
+        .with_cert_resolver(served);
     tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     // Bounds on what one peer can make the agent hold. Two bidirectional streams are the
@@ -467,12 +506,14 @@ impl Listener {
         limits: Limits,
     ) -> Result<Arc<Self>> {
         let certs = CertSet::new(SystemTime::now())?;
-        let config = server_config(certs.presented(SystemTime::now()))?;
+        let served = Served::new(certs.presented(SystemTime::now()))?;
+        let config = server_config(served.clone())?;
         let quic = quinn::Endpoint::server(config, addr).context("bind the QUIC listener")?;
         let port = quic.local_addr()?.port();
         Ok(Arc::new(Self {
             registry,
             certs: Mutex::new(certs),
+            served,
             quic,
             port,
             limits,
@@ -488,11 +529,18 @@ impl Listener {
     }
 
     pub(crate) fn endpoint(&self) -> Endpoint {
+        self.endpoint_at(SystemTime::now())
+    }
+
+    /// Ages the certificates first: `rotate`'s sleep is monotonic, so after a suspend it
+    /// can lag the wall clock, and a report must never name an expired certificate.
+    fn endpoint_at(&self, now: SystemTime) -> Endpoint {
+        self.rotate_at(now);
         Endpoint {
             port: self.port,
             addresses: addresses(),
             protos: vec![WT_PROTO],
-            certificates: self.certs().report(SystemTime::now()),
+            certificates: self.certs().report(now, &self.served.hash()),
         }
     }
 
@@ -500,34 +548,33 @@ impl Listener {
     /// due. The 15 s capacity refresh carries a changed list to the control plane, well
     /// inside the 48 h between reporting a certificate and presenting it.
     async fn rotate(self: Arc<Self>) {
-        let mut presented = self.certs().presented(SystemTime::now()).sha256.clone();
         loop {
             tokio::time::sleep(ROTATION_CHECK).await;
-            self.rotate_at(SystemTime::now(), &mut presented);
+            self.rotate_at(SystemTime::now());
         }
     }
 
-    /// One rotation pass at `now`; `presented` is the hash new connections get. The clock
-    /// is a parameter so a test can walk a certificate's whole life.
-    fn rotate_at(&self, now: SystemTime, presented: &mut String) {
+    /// One rotation pass at `now`. The clock is a parameter so a test can walk a
+    /// certificate's whole life.
+    fn rotate_at(&self, now: SystemTime) {
+        self.rotate_with(now, Cert::make);
+    }
+
+    fn rotate_with(&self, now: SystemTime, make: impl FnOnce(SystemTime) -> Result<Cert>) {
         let mut certs = self.certs();
-        if let Err(error) = certs.tick(now) {
+        if let Err(error) = certs.tick_with(now, make) {
             tracing::warn!(
                 token = "webtransport-cert-rotation-failed",
                 "WebTransport certificate rotation failed: {error:#}"
             );
         }
         let cert = certs.presented(now);
-        if cert.sha256 != *presented {
-            match server_config(cert) {
-                Ok(config) => {
-                    self.quic.set_server_config(Some(config));
-                    *presented = cert.sha256.clone();
-                    tracing::info!(
-                        token = "webtransport-cert-rotated",
-                        "WebTransport presents its next certificate"
-                    );
-                }
+        if cert.sha256 != self.served.hash() {
+            match self.served.set(cert) {
+                Ok(()) => tracing::info!(
+                    token = "webtransport-cert-rotated",
+                    "WebTransport presents its next certificate"
+                ),
                 Err(error) => tracing::warn!(
                     token = "webtransport-cert-reload-failed",
                     "WebTransport could not present its next certificate: {error:#}"

@@ -909,65 +909,63 @@ fn an_ipv6_64_is_one_source_and_ipv4_counts_per_address() {
     );
 }
 
-/// Walks the listener through a certificate's life on a fake clock, rotating as the
-/// real loop would, with a browser-like client pinned to different hashes at each step.
+fn hash_of(sha: &str) -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .decode(sha)
+        .unwrap()
+}
+
+impl Agent {
+    /// A handshake pinned to `hashes`, as a browser's `serverCertificateHashes` does it.
+    /// The quinn client checks the hash only, never the validity dates; the 14-day and
+    /// P-256 rules are tested in `cert.rs`.
+    async fn pin(&self, hashes: Vec<Vec<u8>>) -> Result<Session, impl std::fmt::Debug> {
+        let client = ClientBuilder::new()
+            .with_server_certificate_hashes(hashes)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client.connect(self.url.clone()))
+            .await
+            .expect("the handshake ends")
+    }
+
+    fn expires(&self) -> SystemTime {
+        let first = &self.listener.endpoint().certificates[0];
+        OffsetDateTime::parse(&first.not_after, &Rfc3339)
+            .unwrap()
+            .into()
+    }
+}
+
+/// Walks the listener through a certificate's life on a fake clock, with a client pinned
+/// to different hashes at each step.
 #[tokio::test]
 async fn rotation_overlaps_hashes_keeps_live_connections_and_refuses_stale_pins() {
     let agent = agent().await;
     let h1 = agent.hash.clone();
-    let expires: SystemTime = {
-        let first = &agent.listener.endpoint().certificates[0];
-        OffsetDateTime::parse(&first.not_after, &Rfc3339)
-            .unwrap()
-            .into()
-    };
-    let mut presented = agent
-        .listener
-        .certs()
-        .presented(SystemTime::now())
-        .sha256
-        .clone();
-    let hash_of = |sha: &str| {
-        base64::engine::general_purpose::STANDARD
-            .decode(sha)
-            .unwrap()
-    };
-    let pin = |hashes: Vec<Vec<u8>>| {
-        let url = agent.url.clone();
-        async move {
-            let client = ClientBuilder::new()
-                .with_server_certificate_hashes(hashes)
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), client.connect(url))
-                .await
-                .expect("the handshake ends")
-        }
-    };
+    let expires = agent.expires();
 
     let (live, _send, _recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(ack["type"], "hello_ack");
     assert_eq!(frames(&live, 3, false).await.len(), 3);
 
     // 48 h left: both certificates reported, the old one still presented.
-    agent
-        .listener
-        .rotate_at(expires - 48 * HOUR, &mut presented);
-    let reported = agent.listener.certs().report(expires - 48 * HOUR);
+    let reported = agent.listener.endpoint_at(expires - 48 * HOUR).certificates;
     assert_eq!(reported.len(), 2);
     assert_eq!(hash_of(&reported[0].sha256), h1, "current first");
     let h2 = hash_of(&reported[1].sha256);
-    assert!(pin(vec![h1.clone(), h2.clone()]).await.is_ok());
-    assert!(pin(vec![h2.clone()]).await.is_err(), "not presented yet");
+    assert!(agent.pin(vec![h1.clone(), h2.clone()]).await.is_ok());
+    assert!(
+        agent.pin(vec![h2.clone()]).await.is_err(),
+        "not presented yet"
+    );
 
     // 12 h left: new connections get the next certificate; either hash connects.
-    agent
-        .listener
-        .rotate_at(expires - 12 * HOUR, &mut presented);
-    assert_eq!(hash_of(&presented), h2);
-    assert!(pin(vec![h1.clone(), h2.clone()]).await.is_ok());
-    assert!(pin(vec![h2.clone()]).await.is_ok());
+    let reported = agent.listener.endpoint_at(expires - 12 * HOUR).certificates;
+    assert_eq!(hash_of(&reported[0].sha256), h2, "presented first");
+    assert!(agent.pin(vec![h1.clone(), h2.clone()]).await.is_ok());
+    assert!(agent.pin(vec![h2.clone()]).await.is_ok());
     assert!(
-        pin(vec![h1.clone()]).await.is_err(),
+        agent.pin(vec![h1.clone()]).await.is_err(),
         "the old pin alone is stale"
     );
     assert_eq!(
@@ -977,18 +975,101 @@ async fn rotation_overlaps_hashes_keeps_live_connections_and_refuses_stale_pins(
     );
 
     // Expired: the old hash is no longer reported or accepted, the live session goes on.
-    agent
-        .listener
-        .rotate_at(expires + Duration::from_secs(1), &mut presented);
     let reported = agent
         .listener
-        .certs()
-        .report(expires + Duration::from_secs(1));
+        .endpoint_at(expires + Duration::from_secs(1))
+        .certificates;
     assert_eq!(reported.len(), 1);
     assert_eq!(hash_of(&reported[0].sha256), h2);
-    assert!(pin(vec![h1]).await.is_err());
-    assert!(pin(vec![h2]).await.is_ok());
+    assert!(agent.pin(vec![h1]).await.is_err());
+    assert!(agent.pin(vec![h2]).await.is_ok());
     assert_eq!(frames(&live, 3, false).await.len(), 3);
+}
+
+/// A suspend outlasts `rotate`'s monotonic sleep: the next report, with every certificate
+/// expired on the wall clock, must already carry a fresh one that is also being served.
+#[tokio::test]
+async fn a_report_after_every_certificate_expired_names_a_fresh_served_one() {
+    let agent = agent().await;
+    let expires = agent.expires();
+    let both = agent.listener.endpoint_at(expires - 48 * HOUR).certificates;
+    let old: Vec<Vec<u8>> = both.iter().map(|c| hash_of(&c.sha256)).collect();
+
+    let resumed = expires + 30 * 24 * HOUR;
+    let reported = agent.listener.endpoint_at(resumed).certificates;
+    assert_eq!(reported.len(), 1);
+    let fresh = hash_of(&reported[0].sha256);
+    assert!(!old.contains(&fresh));
+    assert!(agent.pin(vec![fresh]).await.is_ok());
+    assert!(agent.pin(old).await.is_err());
+}
+
+/// A next certificate that cannot be loaded leaves the old one served, and first.
+#[tokio::test]
+async fn a_failed_swap_keeps_serving_and_listing_the_old_certificate_first() {
+    let agent = agent().await;
+    let h1 = agent.hash.clone();
+    let expires = agent.expires();
+    let broken = |now| {
+        let mut cert = Cert::make(now)?;
+        cert.key_der = vec![0; 8];
+        Ok(cert)
+    };
+
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(captured.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        agent.listener.rotate_with(expires - 48 * HOUR, broken);
+        agent.listener.rotate_at(expires - 12 * HOUR);
+    });
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("webtransport-cert-reload-failed"), "{logs}");
+
+    let reported = agent.listener.endpoint_at(expires - 12 * HOUR).certificates;
+    assert_eq!(reported.len(), 2);
+    assert_eq!(hash_of(&reported[0].sha256), h1, "the served one first");
+    assert!(agent.pin(vec![h1]).await.is_ok());
+}
+
+/// A Retry token issued before a swap redeems after it (the swap never replaces the
+/// quinn config, whose token key would change with it).
+#[tokio::test]
+async fn a_retry_token_issued_before_a_swap_redeems_after_it() {
+    let now = SystemTime::now();
+    let (old, next) = (Cert::make(now).unwrap(), Cert::make(now).unwrap());
+    let served = Served::new(&old).unwrap();
+    let quic = quinn::Endpoint::server(
+        server_config(served.clone()).unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let url: url::Url = format!("https://127.0.0.1:{}/wt", quic.local_addr().unwrap().port())
+        .parse()
+        .unwrap();
+    let pinned = hash_of(&next.sha256);
+    let client = tokio::spawn(async move {
+        ClientBuilder::new()
+            .with_server_certificate_hashes(vec![pinned])
+            .unwrap()
+            .connect(url)
+            .await
+            .is_ok()
+    });
+
+    let first = quic.accept().await.unwrap();
+    assert!(!first.remote_address_validated());
+    first.retry().unwrap();
+    served.set(&next).unwrap();
+    let second = quic.accept().await.unwrap();
+    assert!(second.remote_address_validated(), "the token redeemed");
+    let conn = second.await.unwrap();
+    Request::accept(conn).await.unwrap().ok().await.unwrap();
+    assert!(client.await.unwrap(), "and the next certificate was served");
 }
 
 #[tokio::test]
@@ -997,7 +1078,7 @@ async fn a_bidi_stream_opened_after_the_control_stream_closed_is_reset() {
     // closed both ways, it gives the peer credit for another bidirectional stream.
     let now = SystemTime::now();
     let certs = CertSet::new(now).unwrap();
-    let config = server_config(certs.presented(now)).unwrap();
+    let config = server_config(Served::new(certs.presented(now)).unwrap()).unwrap();
     let hash = base64::engine::general_purpose::STANDARD
         .decode(&certs.presented(now).sha256)
         .unwrap();
