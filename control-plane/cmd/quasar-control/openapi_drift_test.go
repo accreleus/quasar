@@ -265,6 +265,8 @@ var pendingImplementation = map[string]string{
 	"DELETE /v1/admin/compat-tools/{}":                "#1066",
 	"POST /v1/admin/compat-tools/{}/force-remove":     "#1066",
 	"GET /v1/admin/hosts/{}/compat-tools":             "#1066",
+	// Amendment 57 (available tools), accreleus/quasar#1067 contract; the handler lands with C08.
+	"GET /v1/admin/compat-tools/available": "#1072",
 }
 
 // unimplementedOperation reports whether an OpenAPI operation carries

@@ -5967,6 +5967,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/compat-tools/available": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * GE-Proton releases available to install - the shipped recommended list plus the latest on github.com (amendment 57).
+         * @description Amendment 57 (accreleus/quasar#1067). Read-only, not audited. The recommended list this release ships, then the 5 newest GE-Proton releases fetched from api.github.com/repos/GloriousEggroll/proton-ge-custom/releases?per_page=10 under trust rule T2 (https 443, no credential, no redirect, direct, connect-time address check, Accept-Encoding identity, a 1 MiB cap on decoded bytes, a 10 s deadline), each with its live catalogue state including pin_conflict and name_conflict. Pins nothing: install with POST /v1/admin/compat-tools then PATCH /v1/admin/compat-tools/{id}. The GitHub outcome is cached in memory per process (success 1 h, failure 5 min or until a valid GitHub reset, at most 1 h); the single-flight fetch runs under its own context, so an aborting caller only stops waiting and is never cached as a failure. At most one upstream request per window. An upstream failure is 200 with github_latest.available false and a reason, never a 5xx. control-api.md §Compatibility tools, Available tools.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The available tools. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CompatToolAvailableList"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/compat-tools/default": {
         parameters: {
             query?: never;
@@ -9094,6 +9135,47 @@ export interface components {
             items: components["schemas"]["CompatTool"][];
             /** Format: uuid */
             default_tool_id: string | null;
+        };
+        /** @description Amendment 57 (accreleus/quasar#1067): one GE-Proton release an admin can install. control-api.md §Available tools. */
+        CompatToolAvailable: {
+            tag: string;
+            /** @enum {string} */
+            source: "recommended" | "github_latest";
+            /** @description The catalogue row's display_name, else the tag. GitHub release names are never passed through. */
+            display_name: string;
+            /**
+             * Format: date-time
+             * @description GitHub's published_at when the served GitHub list holds the tag and it is RFC 3339, else null.
+             */
+            published_at: string | null;
+            /**
+             * Format: uuid
+             * @description The catalogue row with this tag, read live; null when none (install with POST /v1/admin/compat-tools).
+             */
+            tool_id: string | null;
+            /** @description The row's enabled; false when tool_id is null. */
+            enabled: boolean;
+            /** @description The row's pin_conflict; false when tool_id is null. When true the enable is 409 compat_tool_pin_conflict. */
+            pin_conflict: boolean;
+            /** @description The row's name_conflict; false when tool_id is null. When true the exit is disable, then enable. */
+            name_conflict: boolean;
+            /** @description The row's per-host install counts; null when tool_id is null. */
+            hosts: components["schemas"]["CompatToolHostCounts"] | null;
+        };
+        CompatToolAvailableList: {
+            /** @description Recommended entries (newest tag first), then up to 5 GitHub entries not on the recommended list (published_at descending, null last, then tag descending); each tag once. */
+            items: components["schemas"]["CompatToolAvailable"][];
+            github_latest: {
+                /** @description false when the GitHub fetch failed; items then holds only the recommended entries. */
+                available: boolean;
+                /** @description Open string for clients; null when available. The control plane emits exactly one of unreachable, rate_limited, upstream_error, response_invalid, never a raw error (detail goes to its log). */
+                reason: string | null;
+                /**
+                 * Format: date-time
+                 * @description When the served GitHub list was fetched; null when not available.
+                 */
+                fetched_at: string | null;
+            };
         };
         CompatToolAdd: {
             tag: string;
