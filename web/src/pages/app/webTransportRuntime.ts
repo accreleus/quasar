@@ -1,15 +1,18 @@
 // The session runtime for a WebTransport session (#1031, video only):
 // transport -> DecodeStage -> presenter, behind the same SessionRuntime surface
-// the page drives for WebRTC. Input, audio and the mic are not carried yet
-// (#1032, #1033): those methods are inert.
+// the page drives for WebRTC, with input capture on the transport's input paths.
+// Audio and the mic are not carried yet (#1033): those methods are inert.
 
 import { mintTransportToken } from "../../api/library";
 import type { WebTransportCoords } from "../../api/types";
+import { setupCapture } from "../../input/capture";
+import { NEUTRAL_MOUSE, type MouseSettings } from "../../input/mouseScale";
 import { median, percentile } from "../../lib/stats";
 import { EMPTY_SNAPSHOT, type TelemetrySnapshot } from "../../webrtc/telemetry";
 import { DecodeStage, type DecodeFailure, type DecodeStageOptions } from "../../webtransport/decodeStage";
 import { createWebGpuPresenter, type Presenter } from "../../webtransport/presenter";
 import { TransportError, type MediaTransport } from "../../webtransport/transport";
+import { webTransportInputSender } from "../../webtransport/inputSender";
 import { WebTransportMedia } from "../../webtransport/webTransportMedia";
 import {
   IDLE_SNAPSHOT,
@@ -50,6 +53,7 @@ export interface WebTransportRuntimeDeps {
   createTransport(opts: { sessionId: string; coords: WebTransportCoords; mintToken(): Promise<WebTransportCoords> }): MediaTransport;
   createPresenter(canvas: HTMLCanvasElement, onFatal: (message: string) => void): Promise<Presenter | null>;
   decoder?: Pick<DecodeStageOptions, "createDecoder" | "isConfigSupported">;
+  setupCapture: typeof setupCapture;
 }
 
 export interface WebTransportRuntimeConfig {
@@ -57,7 +61,8 @@ export interface WebTransportRuntimeConfig {
   authToken: string;
   coords: WebTransportCoords;
   canvas: HTMLCanvasElement;
-  callbacks: Pick<SessionRuntimeCallbacks, "onDisconnectSuspected" | "onSessionTakenOver"> & {
+  callbacks: Pick<SessionRuntimeCallbacks, "onDisconnectSuspected" | "onSessionTakenOver"> &
+    Partial<Pick<SessionRuntimeCallbacks, "onSummonOverlay" | "onKeyboardLockRefused" | "onNonStandardGamepad">> & {
     /** Terminal: WebTransport cannot go on. `detail` is human copy for the failure card. */
     onTransportFailed(detail: string): void;
   };
@@ -67,6 +72,7 @@ export interface WebTransportRuntimeConfig {
 const productionDeps: WebTransportRuntimeDeps = {
   createTransport: (o) => new WebTransportMedia(o),
   createPresenter: createWebGpuPresenter,
+  setupCapture,
 };
 
 export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): SessionRuntime {
@@ -85,6 +91,11 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let presenter: Presenter | null = null;
   let stage: DecodeStage | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
+  let capture: ReturnType<typeof setupCapture> | null = null;
+  let inputSender: ReturnType<typeof webTransportInputSender> | null = null;
+  let captured = false;
+  let mouse: MouseSettings = NEUTRAL_MOUSE;
+  let rttMs: number | null = null;
   let negotiatedCodec: string | null = null;
   const startedAt = performance.now();
 
@@ -105,6 +116,12 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (timer !== null) clearInterval(timer);
     timer = null;
     document.removeEventListener("visibilitychange", onVisible);
+    // Releases held keys through the transport, so it goes first.
+    capture?.cleanup();
+    capture = null;
+    inputSender?.dispose();
+    inputSender = null;
+    captured = false;
     transport?.close();
     stage?.close();
     presenter?.destroy();
@@ -119,7 +136,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     const detail = transportFailureDetail(code);
     // Before the reveal the loader shows the page's failure card; after it, `recovery`
     // `failed` puts the reason on the session's existing recovery banner.
-    set({ status: detail, channelOpen: false, recovery: { phase: "failed", attempt: 0, maxAttempts: 0, message: detail }, ...patch });
+    set({ status: detail, channelOpen: false, inputCaptured: false, pointerLocked: false, recovery: { phase: "failed", attempt: 0, maxAttempts: 0, message: detail }, ...patch });
     cfg.callbacks.onTransportFailed(detail);
   };
 
@@ -133,6 +150,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     const snap: TelemetrySnapshot = {
       ...EMPTY_SNAPSHOT,
       fps: framesInWindow * (1000 / TELEMETRY_MS),
+      rttMs,
       // Frames are presented as they decode: there is no playout buffer on this path yet.
       playoutTargetMs: 0,
       g2gMs,
@@ -152,7 +170,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (failed || destroyed) return;
     failed = true;
     stop();
-    set({ status: "taken over", channelOpen: false });
+    set({ status: "taken over", channelOpen: false, inputCaptured: false, pointerLocked: false });
     cfg.callbacks.onSessionTakenOver();
   };
 
@@ -190,7 +208,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       ...deps.decoder,
       onFrame: (frame) => {
         // shortcut: assumes the agent's and this machine's clocks agree (true with the
-        // browser on the host); the ping/pong offset arrives with #1032 and #1035.
+        // browser on the host); the pong's clock offset is #1035.
         const sample = Date.now() - frame.timestamp / 1000;
         if (!p.present(frame)) return;
         framesTotal += 1;
@@ -211,11 +229,17 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       await t.connect({
         config: (c) => {
           negotiatedCodec = CODEC_MIME[c.codec] ?? c.codec;
+          // capture.ts scales the mouse by the stream size, which a canvas does not know.
+          cfg.canvas.dataset.streamW = String(c.width);
+          cfg.canvas.dataset.streamH = String(c.height);
           s.config(c);
         },
         unit: (u) => {
           bytesTotal += u.data.length;
           s.unit(u);
+        },
+        rtt: (ms) => {
+          rttMs = ms;
         },
         end: (e) => {
           if (destroyed || failed) return;
@@ -242,6 +266,21 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (destroyed || failed) return;
     // hello_ack: the control stream is up, and it is what carries input on this transport.
     set({ wsOpen: true, pcConnected: true, channelOpen: true, iceState: "connected" });
+    const sender = (inputSender = webTransportInputSender(t.input));
+    capture = deps.setupCapture({
+      videoEl: cfg.canvas,
+      sendInput: sender.send,
+      channel: sender,
+      onCaptureChange: ({ captured: isCaptured, pointerLocked }) => {
+        captured = isCaptured;
+        set({ inputCaptured: isCaptured, pointerLocked });
+      },
+      isFullscreen: () => document.fullscreenElement != null,
+      onSummonOverlay: () => cfg.callbacks.onSummonOverlay?.(),
+      onKeyboardLockRefused: (error) => cfg.callbacks.onKeyboardLockRefused?.(error),
+      onNonStandardGamepad: (pad) => cfg.callbacks.onNonStandardGamepad?.(pad),
+      mouse,
+    });
     timer = setInterval(tick, TELEMETRY_MS);
     document.addEventListener("visibilitychange", onVisible);
   }
@@ -264,11 +303,14 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       listeners.clear();
       telemetrySubs.clear();
     },
-    engage: () => null,
-    release() {},
-    syncKeyboardLock() {},
-    setMouse() {},
-    isCaptured: () => false,
+    engage: () => capture?.engage() ?? null,
+    release: () => capture?.release(),
+    syncKeyboardLock: () => capture?.syncKeyboardLock(),
+    setMouse(settings) {
+      mouse = settings;
+      capture?.setMouse(settings);
+    },
+    isCaptured: () => captured,
     cancelRecovery() {},
     hasMicSlot: () => false,
     attachMicTrack: () => Promise.resolve(),
