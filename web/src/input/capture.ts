@@ -34,8 +34,7 @@ import { createMouseScaler, mouseGain, NEUTRAL_MOUSE, type MouseSettings } from 
 import { isSendEscCombo, isSummonCombo, sendEscComboEnabled } from "./summonCombo";
 import { pointerLockSupported } from "./support";
 
-// InputMsg matches the JSON shapes in protocol/input.md.
-type InputMsg = Record<string, unknown>;
+import type { InputMsg } from "./inputSender";
 
 /** Whether per-`mm` send-side instrumentation is enabled (`?itrace=1`). */
 const INPUT_TRACE =
@@ -130,7 +129,8 @@ export interface EngageResult {
 }
 
 export interface CaptureOptions {
-  videoEl: HTMLVideoElement;
+  /** The WebTransport path draws on a canvas, whose stream size is `data-stream-w/h`. */
+  videoEl: HTMLVideoElement | HTMLCanvasElement;
   /** Caller-built send fn; wire format is not inspected here (protocol/input.md). */
   sendInput: (msg: InputMsg) => void;
   /** Both booleans, every transition: `captured` drives the session chrome,
@@ -138,7 +138,7 @@ export interface CaptureOptions {
   onCaptureChange: (state: CaptureState) => void;
   /** Read only for bufferedAmount backpressure detection (AS10-13); never
    *  written from capture.ts. */
-  channel?: RTCDataChannel;
+  channel?: { readonly bufferedAmount: number };
   /** Live fullscreen state, read on every keyboard-lock re-evaluation (the API
    *  only grants Escape capture in fullscreen). Absent → Keyboard Lock never
    *  engaged. */
@@ -279,8 +279,8 @@ export function setupCapture({
   let mouseSettings = mouse;
   const updateGain = () => {
     const [gx, gy] = mouseGain(mouseSettings, {
-      streamW: videoEl.videoWidth,
-      streamH: videoEl.videoHeight,
+      streamW: "videoWidth" in videoEl ? videoEl.videoWidth : Number(videoEl.dataset?.streamW),
+      streamH: "videoHeight" in videoEl ? videoEl.videoHeight : Number(videoEl.dataset?.streamH),
       boxW: videoEl.clientWidth,
       boxH: videoEl.clientHeight,
       fit: videoEl.dataset?.scalingMode,
@@ -301,7 +301,7 @@ export function setupCapture({
   // The compositor size (data-compositor-w/h, from the session page) is not a video property either.
   const modeObserver =
     videoEl instanceof Node && typeof MutationObserver === "function" ? new MutationObserver(updateGain) : null;
-  modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode", "data-compositor-w", "data-compositor-h"] });
+  modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode", "data-compositor-w", "data-compositor-h", "data-stream-w", "data-stream-h"] });
 
   // Gamepad state for delta-only sends.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};

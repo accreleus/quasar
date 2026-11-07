@@ -1544,6 +1544,12 @@ impl pipeline::Transport for SessionTransports {
                     &session.video,
                     &session.encoder,
                     &session.session_id,
+                    crate::webtransport::Input::devices(
+                        session.devices.clone(),
+                        session.input_state.clone(),
+                        session.cfg.stream.width,
+                        session.cfg.stream.height,
+                    ),
                 )
             });
         let slot = pipeline::WebRtcSlot::new(session)?;
