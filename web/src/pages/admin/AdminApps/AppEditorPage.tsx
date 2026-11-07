@@ -13,6 +13,7 @@ import { ApiError } from "../../../api/client";
 import type {
   AdminApp,
   CatalogImage,
+  CompatTool,
   Entitlement,
   InstanceSettings,
   LaunchProfile,
@@ -47,6 +48,7 @@ import {
   type DraftErrors,
 } from "./editor/appDraft";
 import { activeEditorTab, editorSubtitle, editorTabs, imagePresence } from "./editor/editorTabs";
+import { choiceOf, normalise, sameChoice, type CompatChoice } from "./editor/compatTool";
 import { parseSpec } from "./runtimeSpec";
 
 const TAB_LABEL: Record<string, string> = {
@@ -140,6 +142,30 @@ export function AppEditorPage() {
     [parentId],
   );
 
+  // A discovered Steam game's tool is keyed by its appid, not by the tile.
+  const steamAppid = parentId && app?.external_source === "steam" ? (app.external_id ?? null) : null;
+  const compatRes = useResource<{ tools: CompatTool[]; saved: CompatChoice } | null>(
+    {
+      label: "compatibility tools",
+      fetch: async (ctx) => {
+        if (!steamAppid) return null;
+        const [tools, maps] = await Promise.all([
+          adminApi.listCompatTools(ctx.token),
+          adminApi.listCompatToolMappings(ctx.token),
+        ]);
+        return {
+          tools: tools.items,
+          saved: choiceOf(maps.items.find((m) => m.external_id === steamAppid)),
+        };
+      },
+    },
+    [steamAppid],
+  );
+  const [compatEdit, setCompatEdit] = useState<CompatChoice | null>(null);
+  const compatSaved = compatRes.data?.saved ?? null;
+  const compatChoice = compatEdit ?? compatSaved ?? normalise({ toolId: "", forced: false });
+  const compatDirty = !!compatSaved && !sameChoice(compatChoice, compatSaved);
+
   const [draft, setDraft] = useState<AppDraft>(() => draftFromApp(null));
   const [baseline, setBaseline] = useState<AdminApp | null>(null);
   const [errors, setErrors] = useState<DraftErrors>({});
@@ -154,6 +180,7 @@ export function AppEditorPage() {
     setDraft(draftFromApp(app ?? null));
     setErrors({});
     setPlacementDraft(null);
+    setCompatEdit(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadedId]);
 
@@ -175,16 +202,32 @@ export function AppEditorPage() {
     suppressed: (unpublished.data ?? []).length,
   });
   const active = activeEditorTab(tabs, tab);
-  const dirty = isDirty(baseline, draft);
+  const appDirty = isDirty(baseline, draft);
+  const dirty = appDirty || compatDirty;
 
   const save = useAdminAction(
     async () => {
       if (baseline) {
-        const body = patchBody(baseline, draft);
-        const { app: updated } = await adminApi.updateApp(token!, baseline.id, body);
-        appRes.setData(() => updated);
-        setBaseline(updated);
-        setDraft(draftFromApp(updated));
+        let updated = baseline;
+        if (appDirty) {
+          updated = (await adminApi.updateApp(token!, baseline.id, patchBody(baseline, draft))).app;
+          appRes.setData(() => updated);
+          setBaseline(updated);
+          setDraft(draftFromApp(updated));
+        }
+        if (compatDirty && steamAppid) {
+          const next = normalise(compatChoice);
+          if (next.toolId) {
+            await adminApi.setCompatToolMapping(token!, steamAppid, {
+              tool_id: next.toolId,
+              forced: next.forced,
+            });
+          } else {
+            await adminApi.clearCompatToolMapping(token!, steamAppid);
+          }
+          compatRes.setData((cur) => (cur ? { ...cur, saved: next } : cur));
+          setCompatEdit(null);
+        }
         return updated;
       }
       const { app: created } = await adminApi.createApp(token!, createBody(draft));
@@ -245,6 +288,7 @@ export function AppEditorPage() {
               disabled={!dirty || save.pending != null}
               onClick={() => {
                 setDraft(draftFromApp(baseline));
+                setCompatEdit(null);
                 setErrors({});
               }}
             >
@@ -328,6 +372,16 @@ export function AppEditorPage() {
                 parent={parent.data ?? null}
                 presets={presets.data ?? []}
                 storageProvider={settings.data?.storage_provider ?? null}
+                compat={
+                  steamAppid
+                    ? {
+                        tools: compatRes.data?.tools ?? null,
+                        choice: compatChoice,
+                        onChange: setCompatEdit,
+                        error: compatRes.errorMessage,
+                      }
+                    : null
+                }
               />
             )}
             {active === "placement" && app && (
