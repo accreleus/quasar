@@ -355,6 +355,8 @@ pub struct Listener {
     registry: Arc<Registry>,
     certs: Mutex<CertSet>,
     served: Arc<Served>,
+    /// The certificate a failed swap last warned about.
+    reload_failed: Mutex<Option<String>>,
     quic: quinn::Endpoint,
     port: u16,
     limits: Limits,
@@ -440,12 +442,12 @@ struct Served(std::sync::RwLock<(String, Arc<rustls::sign::CertifiedKey>)>);
 
 impl Served {
     fn load(cert: &Cert) -> Result<(String, Arc<rustls::sign::CertifiedKey>)> {
-        let key = rustls::crypto::ring::default_provider()
-            .key_provider
-            .load_private_key(rustls_pki_types::PrivateKeyDer::Pkcs8(
-                cert.key_der.clone().into(),
-            ))?;
-        let certified = rustls::sign::CertifiedKey::new(vec![cert.der.clone().into()], key);
+        // `from_der` refuses a key that does not belong to the certificate.
+        let certified = rustls::sign::CertifiedKey::from_der(
+            vec![cert.der.clone().into()],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(cert.key_der.clone().into()),
+            &rustls::crypto::ring::default_provider(),
+        )?;
         Ok((cert.sha256.clone(), Arc::new(certified)))
     }
 
@@ -473,13 +475,22 @@ impl rustls::server::ResolvesServerCert for Served {
     }
 }
 
-fn server_config(served: Arc<Served>) -> Result<quinn::ServerConfig> {
+fn tls_config(served: Arc<Served>) -> Result<rustls::ServerConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
         .with_cert_resolver(served);
     tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+    // No resumption: it would skip the certificate, so a client could resume on the
+    // certificate of a handshake from before a swap.
+    tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    tls.send_tls13_tickets = 0;
+    Ok(tls)
+}
+
+fn server_config(served: Arc<Served>) -> Result<quinn::ServerConfig> {
+    let tls = tls_config(served)?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     // Bounds on what one peer can make the agent hold. Two bidirectional streams are the
     // CONNECT stream and the control stream; HTTP/3 needs three unidirectional ones.
@@ -514,6 +525,7 @@ impl Listener {
             registry,
             certs: Mutex::new(certs),
             served,
+            reload_failed: Mutex::default(),
             quic,
             port,
             limits,
@@ -570,15 +582,24 @@ impl Listener {
         }
         let cert = certs.presented(now);
         if cert.sha256 != self.served.hash() {
+            let mut failed = self.reload_failed.lock().unwrap_or_else(|e| e.into_inner());
             match self.served.set(cert) {
-                Ok(()) => tracing::info!(
-                    token = "webtransport-cert-rotated",
-                    "WebTransport presents its next certificate"
-                ),
-                Err(error) => tracing::warn!(
-                    token = "webtransport-cert-reload-failed",
-                    "WebTransport could not present its next certificate: {error:#}"
-                ),
+                Ok(()) => {
+                    *failed = None;
+                    tracing::info!(
+                        token = "webtransport-cert-rotated",
+                        "WebTransport presents its next certificate"
+                    );
+                }
+                // Every capacity report and rotation tick retries; say it once per certificate.
+                Err(error) if failed.as_deref() != Some(&cert.sha256) => {
+                    *failed = Some(cert.sha256.clone());
+                    tracing::warn!(
+                        token = "webtransport-cert-reload-failed",
+                        "WebTransport could not present its next certificate: {error:#}"
+                    );
+                }
+                Err(_) => {}
             }
         }
     }

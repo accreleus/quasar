@@ -1026,14 +1026,41 @@ async fn a_failed_swap_keeps_serving_and_listing_the_old_certificate_first() {
         tracing::callsite::rebuild_interest_cache();
         agent.listener.rotate_with(expires - 48 * HOUR, broken);
         agent.listener.rotate_at(expires - 12 * HOUR);
+        agent.listener.rotate_at(expires - 11 * HOUR);
     });
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-    assert!(logs.contains("webtransport-cert-reload-failed"), "{logs}");
+    assert_eq!(
+        logs.matches("webtransport-cert-reload-failed").count(),
+        1,
+        "warned once for the one certificate: {logs}"
+    );
 
     let reported = agent.listener.endpoint_at(expires - 12 * HOUR).certificates;
     assert_eq!(reported.len(), 2);
     assert_eq!(hash_of(&reported[0].sha256), h1, "the served one first");
     assert!(agent.pin(vec![h1]).await.is_ok());
+}
+
+/// A valid key from another certificate is refused like any other failed swap.
+#[tokio::test]
+async fn a_key_that_does_not_belong_to_the_certificate_is_refused() {
+    let now = SystemTime::now();
+    let (old, other) = (Cert::make(now).unwrap(), Cert::make(now).unwrap());
+    let mut mismatched = Cert::make(now).unwrap();
+    mismatched.key_der = other.key_der.clone();
+    assert!(Served::new(&mismatched).is_err());
+    let served = Served::new(&old).unwrap();
+    assert!(served.set(&mismatched).is_err());
+    assert_eq!(served.hash(), old.sha256, "the old certificate stays");
+}
+
+/// Resumption would skip the certificate check, so the listener offers none.
+#[test]
+fn the_tls_config_offers_no_session_resumption() {
+    let cert = Cert::make(SystemTime::now()).unwrap();
+    let tls = tls_config(Served::new(&cert).unwrap()).unwrap();
+    assert!(!tls.session_storage.can_cache());
+    assert_eq!(tls.send_tls13_tickets, 0);
 }
 
 /// A Retry token issued before a swap redeems after it (the swap never replaces the
