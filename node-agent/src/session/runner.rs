@@ -801,6 +801,11 @@ pub struct SwapRequest {
     pub in_place: bool,
 }
 
+/// Test hook: how long a restream stands still before it starts, so a test can stop the
+/// session while one is in flight.
+#[cfg(test)]
+pub(crate) static RESTREAM_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+
 /// A `session_assign` that adopts this runner's runtime (amendment 39, `adopt_session_id`).
 /// The agent has already checked that it may, and re-labels the runtime's reports.
 #[derive(Debug, Clone)]
@@ -813,9 +818,10 @@ pub struct AdoptRequest {
     pub container: Option<super::container::ContainerSpec>,
     pub idle_timeout: Duration,
     pub app_boot_timeout: Option<Duration>,
-    /// Amendment 59: the adopting session's stream, when its bitrate, fps or size differs.
-    /// The runner moves the runtime to it and answers [`SessionEvent::Restreamed`] before
-    /// anything else of the adoption; the agent re-labels only on `Ok`.
+    /// Amendment 59: the adopting session's stream, when its bitrate or fps differs (its
+    /// size moves by the display update that follows the adoption). The runner moves the
+    /// runtime to it and answers [`SessionEvent::Restreamed`] before anything else of the
+    /// adoption; the agent re-labels only on `Ok`.
     pub restream: Option<super::StreamParams>,
 }
 
@@ -2734,12 +2740,17 @@ pub fn run_blocking(
             let restreamed = req.restream.is_some();
             if let Some(to) = &req.restream {
                 let began = Instant::now();
+                #[cfg(test)]
+                {
+                    let pause = RESTREAM_PAUSE_MS.load(Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(pause));
+                }
                 match transports.restream(to) {
                     Ok(()) => {
+                        // Size and fps stay as built: a swap builds its compositor, and
+                        // the interpipe caps, from them. The lever and the display update
+                        // move what is encoded.
                         cfg.stream.bitrate_kbps = to.bitrate_kbps;
-                        cfg.stream.fps = to.fps;
-                        cfg.stream.width = to.width;
-                        cfg.stream.height = to.height;
                         let elapsed = began.elapsed();
                         tracing::info!(
                             token = "runtime-adopt-restreamed",
@@ -2751,6 +2762,11 @@ pub fn run_blocking(
                             to.bitrate_kbps
                         );
                         emit(SessionEvent::Restreamed(Ok(elapsed)));
+                        // The agent gave up meanwhile (its deadline): no game is launched
+                        // into a home that is being torn down.
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
                     }
                     Err((step, e)) => {
                         emit(SessionEvent::Restreamed(Err((step, format!("{e:#}")))));

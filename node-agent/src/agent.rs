@@ -2507,7 +2507,11 @@ async fn connect_and_run(
             mgr.policy_seed_reconnect_used = true;
             return Err(PolicySeedReconnect.into());
         }
+        let restream_due = mgr.next_restream_deadline();
         tokio::select! {
+            _ = restream_timer(restream_due) => {
+                mgr.expire_restreams(Instant::now(), evt_tx, diagnostic_tx);
+            }
             _ = readiness_timer.tick(), if !readiness_busy => {
                 readiness_busy = true;
                 let sender = readiness_tx.clone();
@@ -2804,6 +2808,12 @@ async fn connect_and_run(
                     }
                     other => other,
                 };
+                if matches!(
+                    &event,
+                    SessionEvent::Stopped { .. } | SessionEvent::Failed(_) | SessionEvent::AppFailed { .. }
+                ) {
+                    mgr.runtime_ended_mid_restream(&session_id, evt_tx, diagnostic_tx);
+                }
                 let terminal = matches!(
                     &event,
                     SessionEvent::Stopped { .. }
@@ -3473,6 +3483,24 @@ struct Restreaming {
     session_id: String,
     assignment: PendingAssignment,
     deadline: Instant,
+}
+
+/// Tear a runtime down as a declined one: its reports from here are the release, under its
+/// own id.
+fn decline(h: &mut RunningHandle) {
+    h.stop.store(true, Ordering::Relaxed);
+    h.held = Some(Held {
+        since: h.held.map_or_else(Instant::now, |held| held.since),
+        released: true,
+    });
+}
+
+/// Fires at the earliest restream deadline; never with none in flight.
+async fn restream_timer(due: Option<Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Amendment 59's one deadline for (a)–(c). Provisional: to be measured on the lab
@@ -4416,6 +4444,7 @@ impl SessionManager {
                 if let Some(listener) = crate::webtransport::listener() {
                     listener.registry().end(&session_id);
                 }
+                self.stop_mid_restream(&session_id, evt_tx, diagnostic_tx);
                 let adopted_away = self.adopted_by_another(&session_id);
                 if let Some(ledger) = self.home_cleanup.as_mut() {
                     if let Some(terminal) = ledger.state(&session_id) {
@@ -5332,20 +5361,15 @@ impl SessionManager {
         evt_tx: &mpsc::Sender<(String, SessionEvent)>,
         diagnostic_tx: &DiagnosticEventTx,
     ) {
-        // `None`: its deadline already passed and the session was built fresh.
+        // `None`: its deadline timer already fired and the session was built fresh. The
+        // first of the answer and the timer decides: a runner that answered `Ok` has
+        // already launched the game.
         let Some(r) = self
             .running
             .get_mut(runtime_id)
             .and_then(|h| h.restreaming.take())
         else {
             return;
-        };
-        let result = match result {
-            Ok(took) if Instant::now() > r.deadline => Err((
-                "deadline",
-                format!("finished after {} ms", took.as_millis()),
-            )),
-            other => other,
         };
         match result {
             Ok(took) => {
@@ -5383,11 +5407,7 @@ impl SessionManager {
             r.session_id
         );
         if let Some(h) = self.running.get_mut(runtime_id) {
-            h.stop.store(true, Ordering::Relaxed);
-            h.held = Some(Held {
-                since: h.held.map_or_else(Instant::now, |held| held.since),
-                released: true,
-            });
+            decline(h);
         }
         let session_id = r.session_id;
         self.pending.insert(session_id.clone(), r.assignment);
@@ -5397,6 +5417,83 @@ impl SessionManager {
             session_id,
         };
         let _ = self.handle_control(start, evt_tx, diagnostic_tx);
+    }
+
+    /// The earliest restream deadline, for the event loop's timer.
+    fn next_restream_deadline(&self) -> Option<Instant> {
+        self.running
+            .values()
+            .filter_map(|h| h.restreaming.as_ref().map(|r| r.deadline))
+            .min()
+    }
+
+    /// While a restream is in flight its play session lives only here: the runtime that
+    /// carries it, by the play id.
+    fn restreaming_for(&self, play_id: &str) -> Option<String> {
+        self.running
+            .iter()
+            .find(|(_, h)| {
+                h.restreaming
+                    .as_ref()
+                    .is_some_and(|r| r.session_id == play_id)
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// A `session_stop` during a restream. For the play id: the runtime is declined (its
+    /// proof under its own id) and the play session ends; the stop path then reports it,
+    /// retired with the ledger, here without one. For the runtime's own id: the failure
+    /// branch, so the play session builds fresh.
+    fn stop_mid_restream(
+        &mut self,
+        session_id: &str,
+        evt_tx: &mpsc::Sender<(String, SessionEvent)>,
+        diagnostic_tx: &DiagnosticEventTx,
+    ) {
+        if let Some(runtime) = self.restreaming_for(session_id) {
+            if let Some(h) = self.running.get_mut(&runtime) {
+                h.restreaming = None;
+                decline(h);
+            }
+            info!(
+                token = "runtime-adopt-restream-stopped",
+                "session {session_id}: stopped while the runtime of {runtime} was moving to its \
+                 stream; the runtime is torn down"
+            );
+            if self.home_cleanup.is_none() {
+                self.home_cleanup_reports.push(qualified_home_terminal(
+                    session_id,
+                    crate::home_cleanup::TerminalKind::Stopped,
+                ));
+            }
+            return;
+        }
+        if let Some(r) = self
+            .running
+            .get_mut(session_id)
+            .and_then(|h| h.restreaming.take())
+        {
+            let why = "its own id was stopped";
+            self.restream_failed(session_id, r, "stopped", why, evt_tx, diagnostic_tx);
+        }
+    }
+
+    /// The runtime's runner ended (failed or stopped) while a restream was in flight: the
+    /// failure branch, so the play session builds fresh instead of staying assigned.
+    fn runtime_ended_mid_restream(
+        &mut self,
+        runtime_id: &str,
+        evt_tx: &mpsc::Sender<(String, SessionEvent)>,
+        diagnostic_tx: &DiagnosticEventTx,
+    ) {
+        if let Some(r) = self
+            .running
+            .get_mut(runtime_id)
+            .and_then(|h| h.restreaming.take())
+        {
+            let why = "the runtime ended";
+            self.restream_failed(runtime_id, r, "runtime", why, evt_tx, diagnostic_tx);
+        }
     }
 
     /// Restreams past their deadline take the failure branch (amendment 59, step `deadline`).
@@ -5409,7 +5506,7 @@ impl SessionManager {
         let late: Vec<String> = self
             .running
             .iter()
-            .filter(|(_, h)| h.restreaming.as_ref().is_some_and(|r| now > r.deadline))
+            .filter(|(_, h)| h.restreaming.as_ref().is_some_and(|r| now >= r.deadline))
             .map(|(id, _)| id.clone())
             .collect();
         for id in late {
@@ -11729,6 +11826,98 @@ mod tests {
             &diagnostic_sender(),
         );
         assert_eq!(mgr.label("k1"), "k1", "a late success re-labels nothing");
+    }
+
+    fn stop(mgr: &mut SessionManager, warm: &Warm, id: &str) -> Option<AgentMsg> {
+        mgr.handle_control(
+            ControlMsg::SessionStop {
+                id: format!("stop-{id}"),
+                session_id: id.into(),
+                reason: "user_requested".into(),
+            },
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        )
+    }
+
+    /// The play id was handed to nothing: no handle, no pending start, no label onto it.
+    fn assert_play_not_adopted(mgr: &SessionManager) {
+        assert_eq!(
+            mgr.label("k1"),
+            "k1",
+            "the runtime was re-labelled onto the play id"
+        );
+        assert!(!mgr.pending.contains_key("p1"));
+        assert!(mgr.running["k1"].restreaming.is_none());
+        assert!(
+            !mgr.running["k1"].live(),
+            "its end is a declined runtime's, under k1"
+        );
+    }
+
+    // Amendment 59: during a restream the play id is still a session of that runtime.
+    #[test]
+    fn a_stop_for_the_play_id_mid_restream_ends_it_and_declines_the_runtime() {
+        let (mut mgr, warm) = warm_manager();
+        restream_claim(&mut mgr, &warm);
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        assert!(acked(stop(&mut mgr, &warm, "p1")));
+        assert_play_not_adopted(&mgr);
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
+        let reported = mgr.home_cleanup_reports.iter().any(|m| {
+            matches!(m, AgentMsg::SessionState { session_id, state, .. }
+                if session_id == "p1" && state == "stopped")
+        });
+        assert!(
+            reported,
+            "p1's stop is reported: {:?}",
+            mgr.home_cleanup_reports
+        );
+        // The runner's late answer re-labels nothing, and nothing is built.
+        mgr.restreamed(
+            "k1",
+            Ok(Duration::from_millis(10)),
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert_play_not_adopted(&mgr);
+        assert!(warm.started.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_runtime_that_ends_mid_restream_builds_the_play_session_fresh() {
+        let (mut mgr, warm) = warm_manager();
+        restream_claim(&mut mgr, &warm);
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        mgr.runtime_ended_mid_restream("k1", &warm.evt_tx, &diagnostic_sender());
+        assert_play_not_adopted(&mgr);
+        assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p1");
+    }
+
+    #[test]
+    fn a_stop_for_the_runtimes_own_id_mid_restream_builds_the_play_session_fresh() {
+        let (mut mgr, warm) = warm_manager();
+        restream_claim(&mut mgr, &warm);
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        assert!(acked(stop(&mut mgr, &warm, "k1")));
+        assert_play_not_adopted(&mgr);
+        assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p1");
+    }
+
+    // The event loop's timer: the failure branch is decided at the deadline itself, not
+    // on the next heartbeat.
+    #[tokio::test(start_paused = true)]
+    async fn the_restream_timer_fires_at_its_deadline() {
+        let begun = tokio::time::Instant::now();
+        restream_timer(Some(begun.into_std() + ADOPT_RESTREAM_DEADLINE)).await;
+        let waited = begun.elapsed();
+        assert!(
+            waited >= ADOPT_RESTREAM_DEADLINE
+                && waited < ADOPT_RESTREAM_DEADLINE + Duration::from_millis(5),
+            "fired after {waited:?}"
+        );
+        let never = tokio::time::timeout(Duration::from_secs(3600), restream_timer(None)).await;
+        assert!(never.is_err(), "no restream in flight, no timer");
     }
 
     // (c) is not in this build: another codec takes the failure branch at once.

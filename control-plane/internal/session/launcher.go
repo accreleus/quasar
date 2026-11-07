@@ -299,7 +299,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		claimStream, err = c.claimCandidate(ctx, &p, parked, launchProfile, lp, ov, env, source)
 		if errors.Is(err, ErrCodecUnsupportedByHost) {
 			// The parked GPU cannot encode the launch's codec: a failed check 4.
-			c.supersedeParkedHolder(ctx, userID, parked.ID, causeCodecUnsupported)
+			cause := c.store.codecGatedCause(ctx, p, parked, c.hostParks(parked.HostID), c.hostRestreams(parked.HostID))
+			c.supersedeParkedHolder(ctx, userID, parked.ID, cause)
 			return LaunchResult{}, &ParkedClaimRefusedError{HolderID: parked.ID}
 		}
 		if err != nil {

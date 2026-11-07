@@ -98,7 +98,11 @@ func TestDecideClaim(t *testing.T) {
 		{"expired before host", at(func(k *parkedFacts) { k.InDeadline, k.HostUp = false, false }), park, claimSupersede, causeExpired, ""},
 		{"host down", at(func(k *parkedFacts) { k.HostUp = false }), park, claimSupersede, causeHostUnavailable, ""},
 		{"check 1 has no cause", at(func(k *parkedFacts) { k.Family = false }), park, claimSupersede, "", ""},
-		{"claimed by a racing launch", at(func(k *parkedFacts) { k.State = StateStopped }), park, claimLost, "", ""},
+		{"claimed by a racing launch", at(func(k *parkedFacts) { k.State, k.Claimed = StateStopped, true }), park, claimLost, "", ""},
+		{"stopped by expiry or eviction", at(func(k *parkedFacts) { k.State = StateStopped }), park, claimSupersede, causeNotRunning, ""},
+		{"codec gated", at(func(k *parkedFacts) { k.CodecGated = true }), park, claimSupersede, causeCodecUnsupported, ""},
+		{"codec gated after fps", at(func(k *parkedFacts) { k.CodecGated = true }), with(func(s *claimStream) { s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
+		{"codec gated after expiry", at(func(k *parkedFacts) { k.CodecGated, k.InDeadline = true, false }), park, claimSupersede, causeExpired, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -585,22 +585,22 @@ func readStream(t *testing.T, pool *pgxpool.Pool, id string) streamRow {
 	return r
 }
 
-// A launch on a smaller rung (its own size and bitrate) over a 1440p park
-// adopts on an adopt_restream_v1 host, and the play row holds the launch's
-// stream; a park on exit then keeps the built 1440p size (amendment 59).
-func TestClaimAdoptsAcrossStreamSettingsWithRestream(t *testing.T) {
+// The ratchet (amendment 59): a smaller, slower claim adopts the park; its park on
+// exit keeps the size and fps the runtime was built with (from the adopted row), with
+// the play's bitrate; and a third launch at the park's own size and fps adopts that.
+func TestClaimAdoptsAcrossStreamSettingsAndTheReparkKeepsTheBuiltSize(t *testing.T) {
 	f := newWarmFixture(t, 4)
 	ctx := context.Background()
 	f.disp.setRestream(true)
 	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
 	k := f.park(t)
-	launch := readStream(t, f.pool, k) // what this launch resolves to
-	must(t, exec(t, f.pool, `UPDATE sessions SET width = 2560, height = 1440, bitrate_kbps = bitrate_kbps + 5000
-		WHERE id = $1::uuid`, k))
+	built := readStream(t, f.pool, k)
+	half := func(v int32) *int32 { h := v / 2; return &h }
 
-	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true})
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true,
+		IsAdmin: true, Override: StreamOverride{Width: half(built.Width), Height: half(built.Height), FPS: half(built.FPS)}})
 	if err != nil {
-		t.Fatalf("claim launch: %v", err)
+		t.Fatalf("smaller claim: %v", err)
 	}
 	play := res.Session.ID
 	if got := readRow(t, f.pool, k); got.Detail != "claimed" || f.disp.stopReason(k) != "" {
@@ -609,21 +609,57 @@ func TestClaimAdoptsAcrossStreamSettingsWithRestream(t *testing.T) {
 	if a := f.disp.assignFor(t, play); a.AdoptSessionID != k {
 		t.Fatalf("assign adopts %q, want %s", a.AdoptSessionID, k)
 	}
-	if got := readStream(t, f.pool, play); got != launch {
-		t.Errorf("play stream %+v, want the launch's %+v", got, launch)
+	small := readStream(t, f.pool, play)
+	if small.Width != built.Width/2 || small.Height != built.Height/2 || small.FPS != built.FPS/2 {
+		t.Fatalf("play stream %+v, want half of %+v", small, built)
 	}
 
 	f.disp.waitFor(t, "start")
+	// The agent's first report adopts: the hold moves to the play session.
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: play, State: "starting"})
 	f.running(t, play)
 	f.coord.AgentState(ctx, f.hostID, heldStop(play))
 	again := f.parkedID(t)
 	if again == "" {
 		t.Fatal("no park on exit")
 	}
-	got := readStream(t, f.pool, again)
-	if got.Width != 2560 || got.Height != 1440 || got.FPS != launch.FPS || got.BitrateKbps != launch.BitrateKbps {
-		t.Errorf("re-parked stream %+v, want 2560x1440 at the play session's fps %d and bitrate %d",
-			got, launch.FPS, launch.BitrateKbps)
+	if got := readStream(t, f.pool, again); got.Width != built.Width || got.Height != built.Height ||
+		got.FPS != built.FPS || got.BitrateKbps != small.BitrateKbps {
+		t.Fatalf("re-parked stream %+v, want %dx%d@%d at the play's bitrate %d",
+			got, built.Width, built.Height, built.FPS, small.BitrateKbps)
+	}
+
+	f.disp.waitFor(t, "start")
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: again, State: "starting"})
+	f.running(t, again)
+	res, err = f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("third launch, at the park's own size: %v", err)
+	}
+	if a := f.disp.assignFor(t, res.Session.ID); a.AdoptSessionID != again {
+		t.Fatalf("third launch adopts %q, want the re-park %s", a.AdoptSessionID, again)
+	}
+	if got := readStream(t, f.pool, res.Session.ID); got.Width != built.Width || got.FPS != built.FPS {
+		t.Errorf("third launch stream %+v, want the built %dx%d@%d", got, built.Width, built.Height, built.FPS)
+	}
+}
+
+// Only a parked row a racing launch claimed reads as a lost claim (409 home_in_use);
+// one stopped by expiry or eviction in the window is a Steam restart (503).
+func TestAParkStoppedByExpiryInTheWindowIsASteamRestartNotHomeInUse(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	k := f.park(t)
+	afterParkedRead = func() {
+		must(t, exec(t, f.pool, `UPDATE sessions SET state = 'stopped', state_detail = 'stop requested',
+			stop_reason = $2, ended_at = now() WHERE id = $1::uuid`, k, StopReasonParkedExpired))
+	}
+	t.Cleanup(func() { afterParkedRead = nil })
+	_, err := f.coord.LaunchByProfile(context.Background(), f.userID,
+		LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	var refused *ParkedClaimRefusedError
+	var inUse *HomeInUseError
+	if !errors.As(err, &refused) || refused.Warming || errors.As(err, &inUse) {
+		t.Fatalf("err = %v, want the retryable refused claim (steam_restarting), never home_in_use", err)
 	}
 }
 

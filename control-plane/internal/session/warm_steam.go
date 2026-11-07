@@ -339,9 +339,12 @@ type claimStream struct {
 type parkedFacts struct {
 	Family     bool // check 1: the caller's, the launched app's home app, kind parked
 	State      State
+	Claimed    bool // state_detail "claimed": a racing launch adopted it
 	InDeadline bool
 	HostUp     bool // check 3, parked_sessions_v1 included
 	Restream   bool // adopt_restream_v1 on that connection
+	// CodecGated: that GPU cannot encode the launch's codec (part of check 4).
+	CodecGated bool
 	Stream     claimStream
 }
 
@@ -363,10 +366,10 @@ type claimVerdict struct {
 
 // decideClaim is claim checks 1–4 (control-api.md §Warm Steam "Claim").
 func decideClaim(k parkedFacts, launch claimStream) claimVerdict {
-	if k.State.IsTerminal() {
+	if k.State.IsTerminal() && k.Claimed {
 		return claimVerdict{Outcome: claimLost}
 	}
-	cause4, restream := claimCheck4(k.Stream, launch, k.Restream)
+	cause4, restream := claimCheck4(k.Stream, launch, k.Restream, k.CodecGated)
 	warmingState := k.State == StatePending || k.State == StateAssigned || k.State == StateStarting
 	switch {
 	case !k.Family:
@@ -389,7 +392,7 @@ func decideClaim(k parkedFacts, launch claimStream) claimVerdict {
 // claimCheck4 compares the launch's stream with the parked one. Without
 // adopt_restream_v1 only the size may be smaller; with it codec, H.264 profile,
 // bitrate and a lower fps follow the launch too (amendment 59).
-func claimCheck4(parked, launch claimStream, restream bool) (cause string, changed []string) {
+func claimCheck4(parked, launch claimStream, restream, codecGated bool) (cause string, changed []string) {
 	switch {
 	case launch.Mic != parked.Mic:
 		return causeMicDiffers, nil
@@ -397,6 +400,8 @@ func claimCheck4(parked, launch claimStream, restream bool) (cause string, chang
 		return causeSizeLarger, nil
 	case launch.FPS > parked.FPS:
 		return causeFPSHigher, nil
+	case codecGated:
+		return causeCodecUnsupported, nil
 	}
 	for _, d := range []struct {
 		name string
@@ -429,20 +434,7 @@ var errClaimLost = fmt.Errorf("parked session already claimed: %w", ErrCapacityE
 // adopts, and the expiry job stops whatever is left within 60 s.
 func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked, error) {
 	k := claimedParked{id: p.claim.id}
-	var f parkedFacts
-	err := tx.QueryRow(ctx, `
-		SELECT k.host_id::text, g.index, k.state, k.parked_until > now(),
-		       k.user_id = $2::uuid AND k.app_id = $3::uuid AND k.kind = 'parked',
-		       h.status = 'online' AND h.agent_disconnected_at IS NULL
-		       AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = h.id),
-		       k.codec, k.width, k.height, k.fps, k.bitrate_kbps, k.h264_profile, k.mic
-		FROM sessions k JOIN gpus g ON g.id = k.gpu_id JOIN hosts h ON h.id = k.host_id
-		WHERE k.id = $1::uuid
-		FOR UPDATE OF k`,
-		k.id, p.UserID, p.homeAppID()).
-		Scan(&k.hostID, &k.gpuIndex, &f.State, &f.InDeadline, &f.Family, &f.HostUp,
-			&f.Stream.Codec, &f.Stream.Width, &f.Stream.Height, &f.Stream.FPS, &f.Stream.BitrateKbps,
-			&f.Stream.H264Profile, &f.Stream.Mic)
+	f, err := readParkedFacts(ctx, tx, &k, p, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, &ParkedClaimRefusedError{HolderID: k.id}
 	}
@@ -451,8 +443,7 @@ func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked
 	}
 	f.HostUp = f.HostUp && p.claim.hostParks
 	f.Restream = p.claim.restream
-	v := decideClaim(f, claimStream{Codec: codecOrH264(p.Codec), Width: p.Width, Height: p.Height, FPS: p.FPS,
-		BitrateKbps: p.BitrateKbps, H264Profile: p.H264Profile, Mic: p.Mic})
+	v := decideClaim(f, launchClaimStream(p))
 	switch v.Outcome {
 	case claimLost:
 		return nil, errClaimLost
@@ -467,6 +458,49 @@ func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked
 	}
 	k.restream = v.Restream
 	return &k, nil
+}
+
+// readParkedFacts reads what claim checks 1–4 compare, locking the row for a claim.
+// k gets the row's host and GPU index.
+func readParkedFacts(ctx context.Context, q rowQuerier, k *claimedParked, p CreateParams, lock bool) (parkedFacts, error) {
+	var f parkedFacts
+	sql := `
+		SELECT k.host_id::text, g.index, k.state, COALESCE(k.state_detail, '') = $4, k.parked_until > now(),
+		       k.user_id = $2::uuid AND k.app_id = $3::uuid AND k.kind = 'parked',
+		       h.status = 'online' AND h.agent_disconnected_at IS NULL
+		       AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = h.id),
+		       k.codec, k.width, k.height, k.fps, k.bitrate_kbps, k.h264_profile, k.mic
+		FROM sessions k JOIN gpus g ON g.id = k.gpu_id JOIN hosts h ON h.id = k.host_id
+		WHERE k.id = $1::uuid`
+	if lock {
+		sql += ` FOR UPDATE OF k`
+	}
+	err := q.QueryRow(ctx, sql, k.id, p.UserID, p.homeAppID(), claimedDetail).
+		Scan(&k.hostID, &k.gpuIndex, &f.State, &f.Claimed, &f.InDeadline, &f.Family, &f.HostUp,
+			&f.Stream.Codec, &f.Stream.Width, &f.Stream.Height, &f.Stream.FPS, &f.Stream.BitrateKbps,
+			&f.Stream.H264Profile, &f.Stream.Mic)
+	return f, err
+}
+
+func launchClaimStream(p CreateParams) claimStream {
+	return claimStream{Codec: codecOrH264(p.Codec), Width: p.Width, Height: p.Height, FPS: p.FPS,
+		BitrateKbps: p.BitrateKbps, H264Profile: p.H264Profile, Mic: p.Mic}
+}
+
+// codecGatedCause is the cause a launch whose codec the parked GPU cannot encode
+// supersedes with: the first failing check in contract order, which may come
+// before check 4's codec gate. Unlocked: it only names the log line.
+func (s *Store) codecGatedCause(ctx context.Context, p CreateParams, k parkedRef, hostParks, restream bool) string {
+	ref := claimedParked{id: k.ID}
+	f, err := readParkedFacts(ctx, s.pool, &ref, p, false)
+	if err != nil {
+		return causeCodecUnsupported
+	}
+	f.HostUp, f.Restream, f.CodecGated = f.HostUp && hostParks, restream, true
+	if v := decideClaim(f, launchClaimStream(p)); v.Cause != "" {
+		return v.Cause
+	}
+	return causeCodecUnsupported
 }
 
 // claimLostAnswer answers a launch whose claim a racing launch won: home_in_use
