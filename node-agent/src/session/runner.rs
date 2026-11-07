@@ -2762,6 +2762,9 @@ pub fn run_blocking(
                             to.bitrate_kbps
                         );
                         emit(SessionEvent::Restreamed(Ok(elapsed)));
+                        // A new video transport: the old viewer's is gone, and this one's
+                        // peer leaving is the session's peer leaving.
+                        stale_transport = false;
                         // The agent gave up meanwhile (its deadline): no game is launched
                         // into a home that is being torn down.
                         if stop.load(Ordering::Relaxed) {
