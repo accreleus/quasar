@@ -53,7 +53,7 @@ export function getOrCreateDeviceKey(): string {
  * says no, so a changed verdict (plugin installed) is posted at once, not tomorrow (#688).
  * It holds the zone and language too: launches read them from the record (amendment 49).
  */
-const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v2";
+const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v3";
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function deviceProbeIsFresh(userId: string, h264: boolean, now: number = Date.now()): boolean {
@@ -190,6 +190,37 @@ export function probeH264Decodable(): Promise<boolean> {
     }
   })();
   return h264Probe;
+}
+
+/** Amendment 54's `webtransport` probe key. */
+export function probeWebTransport(): { available: boolean; datagrams: boolean } {
+  const available = typeof WebTransport === "function";
+  return { available, datagrams: available && "datagrams" in WebTransport.prototype };
+}
+
+/** Amendment 54's `webcodecs` key, for the configurations the WebTransport path uses.
+ *  HEVC, AV1 and the encoder side come with #1036 and #1043. */
+export async function probeWebCodecs(): Promise<{ h264: boolean; opus_decode: boolean }> {
+  const supported = async (check: () => Promise<{ supported?: boolean }> | undefined) => {
+    try {
+      return (await check())?.supported === true;
+    } catch {
+      return false;
+    }
+  };
+  const [h264, opus] = await Promise.all([
+    supported(() =>
+      typeof VideoDecoder === "function"
+        ? VideoDecoder.isConfigSupported({ codec: "avc1.42e01f", codedWidth: 1920, codedHeight: 1080 })
+        : undefined,
+    ),
+    supported(() =>
+      typeof AudioDecoder === "function"
+        ? AudioDecoder.isConfigSupported({ codec: "opus", sampleRate: 48000, numberOfChannels: 2 })
+        : undefined,
+    ),
+  ]);
+  return { h264, opus_decode: opus };
 }
 
 /**
@@ -531,6 +562,9 @@ export interface DeviceCapabilities {
   /** Best-effort, not a real throughput test. */
   bandwidth_kbps: number | null;
   rtt_ms: number | null;
+  /** Amendment 54. */
+  webtransport?: { available: boolean; datagrams: boolean };
+  webcodecs?: { h264: boolean; opus_decode: boolean };
   /** Amendment 49: the browser's zone and language, read at launch. */
   timezone?: string;
   language?: string;
@@ -628,12 +662,13 @@ export interface NativeCapabilities extends Omit<DeviceCapabilities, "client_typ
 
 /** All measurements are best-effort; null values are valid (JSONB column). */
 export async function probeCapabilities(): Promise<DeviceCapabilities> {
-  const [h264Decodable, rttMs, bandwidthKbps, display, codecsDetail] = await Promise.all([
+  const [h264Decodable, rttMs, bandwidthKbps, display, codecsDetail, webcodecs] = await Promise.all([
     probeH264Decodable(),
     probeRttMs(),
     probeBandwidthKbps(),
     probeDisplay(),
     probeCodecsDetail(),
+    probeWebCodecs(),
   ]);
 
   return {
@@ -650,6 +685,8 @@ export async function probeCapabilities(): Promise<DeviceCapabilities> {
     profiles:          {}, // populated by the AS10-10 playback harness
     bandwidth_kbps:    bandwidthKbps,
     rtt_ms:            rttMs,
+    webtransport:      probeWebTransport(),
+    webcodecs,
     ...probeRegion(),
   };
 }

@@ -262,6 +262,15 @@ describe("readiness groups (#102)", () => {
     expect(groups.find((g) => g.key === "other")).toBeUndefined();
   });
 
+  it("folds the PyroWave codec probe under the media probe in the gpu group, never Other", () => {
+    const { groups } = groupChecks([c("media_probe_gpu0"), c("media_probe_gpu0_pyrowave", "fail")]);
+    expect(groups.find((g) => g.key === "gpu")?.checks.map((x) => x.id)).toEqual([
+      "media_probe_gpu0_pyrowave",
+      "media_probe_gpu0",
+    ]);
+    expect(groups.find((g) => g.key === "other")).toBeUndefined();
+  });
+
   it("places input_probe in the input group", () => {
     const { groups } = groupChecks([c("input_probe"), c("uinput")]);
     const input = groups.find((g) => g.key === "input");
@@ -282,6 +291,7 @@ describe("readiness groups (#102)", () => {
     expect(baseCheckId("application_gpu_probe_gpu1")).toBe("application_gpu_probe");
     expect(baseCheckId("media_probe_gpu0_h265")).toBe("media_probe");
     expect(baseCheckId("media_probe_gpu3_av1")).toBe("media_probe");
+    expect(baseCheckId("media_probe_gpu1_pyrowave")).toBe("media_probe");
     expect(baseCheckId("media_probe_gpu0_vp9")).toBe("media_probe_gpu0_vp9");
     expect(baseCheckId("render_node")).toBe("render_node");
     expect(baseCheckId("input_probe")).toBe("input_probe");

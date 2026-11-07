@@ -59,6 +59,9 @@ impl ProbeKind {
 pub enum ProbeCodec {
     H265,
     Av1,
+    /// Not a session codec (codec-pyrowave.md §Wire vocabulary): a pass only adds
+    /// `pyrowave` to the GPU's wire codec set.
+    PyroWave,
 }
 
 impl ProbeCodec {
@@ -78,16 +81,13 @@ impl ProbeCodec {
             .and_then(Self::above_floor)
     }
 
-    pub fn codec(self) -> crate::session::Codec {
-        match self {
-            ProbeCodec::H265 => crate::session::Codec::H265,
-            ProbeCodec::Av1 => crate::session::Codec::Av1,
-        }
-    }
-
-    /// Wire vocabulary, as in `sessions.codec` and the check id.
+    /// Wire vocabulary, as in `capacity.gpus[].codecs` and the check id.
     pub fn as_str(self) -> &'static str {
-        self.codec().as_str()
+        match self {
+            ProbeCodec::H265 => crate::session::Codec::H265.as_str(),
+            ProbeCodec::Av1 => crate::session::Codec::Av1.as_str(),
+            ProbeCodec::PyroWave => crate::session::probe_media::PYROWAVE,
+        }
     }
 }
 
@@ -191,6 +191,10 @@ mod tests {
         assert_eq!(
             ProbeTarget::codec(2, ProbeCodec::Av1).check_id(),
             "media_probe_gpu2_av1"
+        );
+        assert_eq!(
+            ProbeTarget::codec(0, ProbeCodec::PyroWave).check_id(),
+            "media_probe_gpu0_pyrowave"
         );
     }
 
