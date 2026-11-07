@@ -34,6 +34,7 @@ import { ImageCleanupModal } from "./library/ImageCleanupModal";
 import { CapacityCard } from "./fleet/hostDetail/CapacityCard";
 import { FloorNote } from "./fleet/hostDetail/FloorNote";
 import { ServicesCard } from "./fleet/hostDetail/ServicesCard";
+import { WebTransportCard } from "./fleet/hostDetail/WebTransportCard";
 import { ApplyConfirmModal } from "./fleet/ApplyControls";
 import { hostFloorState } from "./fleet/hostFloor";
 import { SessionsCard } from "./fleet/hostDetail/SessionsCard";
@@ -410,6 +411,8 @@ export function HostDetail() {
           }}
         />
       )}
+
+      <WebTransportCard hostId={host.id} now={now} />
 
       <CapacityCard host={host} gpus={gpus} now={now} />
 

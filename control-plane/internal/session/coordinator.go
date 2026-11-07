@@ -233,6 +233,7 @@ func (c *Coordinator) stop(ctx context.Context, sessionID string, only rowGuard,
 	if err != nil {
 		return Session{}, err
 	}
+	sessionID = sess.ID // canonical spelling: stopRequested is keyed on it (#1100)
 	if sess.State.IsTerminal() {
 		return sess, nil
 	}

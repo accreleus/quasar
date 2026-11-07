@@ -933,6 +933,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	ac := newConn(hostID, conn)
 	ac.terminalHomeCleanupV1 = caps.TerminalHomeCleanupV1
 	ac.parkedSessionsV1 = caps.ParkedSessionsV1
+	ac.compatToolsV1 = caps.CompatToolsV1
 	ac.policyTyped = policyTyped
 	ac.policyAccepted = acceptedGroups
 	ac.policyIdle = slices.Contains(acceptedGroups, "hardware")
@@ -1068,6 +1069,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	}
 	reads := make(chan readResult, 1)
 	reading := false
+	owners := newSignalingOwners(h.store, h.log, hostID)
 	for {
 		// A lost initial map or acknowledgement must not leave an apparently
 		// connected host gated forever. Renegotiate after a bounded wait; the
@@ -1550,11 +1552,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				h.log.Warn("decode signaling envelope failed", "err", err)
 				continue
 			}
-			if err := h.relay.Deliver(env.SessionID, env.Msg); err != nil {
-				h.log.Error("reliable signaling relay failed", "host_id", hostID, "session_id", env.SessionID, "err", err)
-				msgType, _ := peekType(env.Msg)
-				h.events.AgentSignalingFailure(bg, hostID, env.SessionID, msgType == "bye", err.Error())
-			}
+			h.relayAgentSignaling(bg, owners, hostID, env)
 		default:
 			h.log.Warn("unknown agent message", "type", msgType, "host_id", hostID)
 		}
@@ -1566,6 +1564,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 type registerCaps struct {
 	TerminalHomeCleanupV1 bool
 	ParkedSessionsV1      bool
+	CompatToolsV1         bool
 	RecoveryRelease       bool // config_policy_versions.recovery_release (amendment 51)
 }
 
@@ -1730,7 +1729,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	return result.HostID, result.RegisteredAt, reg.Images, identity.SourceCommit,
-		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1,
+		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1, CompatToolsV1: reg.CompatToolsV1,
 			RecoveryRelease: reg.ConfigPolicyVersions["recovery_release"] == 1},
 		policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }
@@ -2445,4 +2444,17 @@ func (h *Handler) resolveAuth(ctx context.Context, reg RegisterMsg) (registerRes
 			tryReconnect.NodeSecret)
 	}
 	return registerResult{}, errors.New("auth must contain enrollment_token or node_secret")
+}
+
+// relayAgentSignaling relays an agent's signaling frame to the session's browser, only for a
+// session placed on hostID (#1116).
+func (h *Handler) relayAgentSignaling(ctx context.Context, owners *signalingOwners, hostID string, env SignalingEnvelope) {
+	if !owners.allows(ctx, env.SessionID) {
+		return
+	}
+	if err := h.relay.Deliver(env.SessionID, env.Msg); err != nil {
+		h.log.Error("reliable signaling relay failed", "host_id", hostID, "session_id", env.SessionID, "err", err)
+		msgType, _ := peekType(env.Msg)
+		h.events.AgentSignalingFailure(ctx, hostID, env.SessionID, msgType == "bye", err.Error())
+	}
 }

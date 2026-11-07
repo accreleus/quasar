@@ -46,7 +46,7 @@ const CONTROL_WRITE: Duration = Duration::from_secs(2);
 const LOGGED_ID: usize = 64;
 const TOKEN_SKEW: Duration = Duration::from_secs(15);
 const TOKEN_TTL: Duration = Duration::from_secs(60);
-const ROTATION_CHECK: Duration = Duration::from_secs(600);
+const ROTATION_CHECK: Duration = Duration::from_secs(60);
 const DEFAULT_PORT: u16 = 4433;
 
 const CLOSE_NORMAL: u32 = 0;
@@ -354,6 +354,9 @@ impl Drop for Slot {
 pub struct Listener {
     registry: Arc<Registry>,
     certs: Mutex<CertSet>,
+    served: Arc<Served>,
+    /// The certificate a failed swap last warned about.
+    reload_failed: Mutex<Option<String>>,
     quic: quinn::Endpoint,
     port: u16,
     limits: Limits,
@@ -431,16 +434,63 @@ pub fn capacity() -> Transports {
     }
 }
 
-fn server_config(cert: &Cert) -> Result<quinn::ServerConfig> {
+/// The certificate new handshakes get. One `quinn::ServerConfig` serves for the listener's
+/// life and only this changes, so the Retry token key never does: a token issued just
+/// before a swap still redeems after it.
+#[derive(Debug)]
+struct Served(std::sync::RwLock<(String, Arc<rustls::sign::CertifiedKey>)>);
+
+impl Served {
+    fn load(cert: &Cert) -> Result<(String, Arc<rustls::sign::CertifiedKey>)> {
+        // `from_der` refuses a key that does not belong to the certificate.
+        let certified = rustls::sign::CertifiedKey::from_der(
+            vec![cert.der.clone().into()],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(cert.key_der.clone().into()),
+            &rustls::crypto::ring::default_provider(),
+        )?;
+        Ok((cert.sha256.clone(), Arc::new(certified)))
+    }
+
+    fn new(cert: &Cert) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self(std::sync::RwLock::new(Self::load(cert)?))))
+    }
+
+    /// Serve `cert` to new handshakes. On `Err` the previous certificate stays.
+    fn set(&self, cert: &Cert) -> Result<()> {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Self::load(cert)?;
+        Ok(())
+    }
+
+    fn hash(&self) -> String {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).0.clone()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for Served {
+    fn resolve(
+        &self,
+        _: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.read().unwrap_or_else(|e| e.into_inner()).1.clone())
+    }
+}
+
+fn tls_config(served: Arc<Served>) -> Result<rustls::ServerConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
-        .with_single_cert(
-            vec![cert.der.clone().into()],
-            rustls_pki_types::PrivateKeyDer::Pkcs8(cert.key_der.clone().into()),
-        )?;
+        .with_cert_resolver(served);
     tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+    // No resumption: it would skip the certificate, so a client could resume on the
+    // certificate of a handshake from before a swap.
+    tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    tls.send_tls13_tickets = 0;
+    Ok(tls)
+}
+
+fn server_config(served: Arc<Served>) -> Result<quinn::ServerConfig> {
+    let tls = tls_config(served)?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     // Bounds on what one peer can make the agent hold. Two bidirectional streams are the
     // CONNECT stream and the control stream; HTTP/3 needs three unidirectional ones.
@@ -467,12 +517,15 @@ impl Listener {
         limits: Limits,
     ) -> Result<Arc<Self>> {
         let certs = CertSet::new(SystemTime::now())?;
-        let config = server_config(certs.presented(SystemTime::now()))?;
+        let served = Served::new(certs.presented(SystemTime::now()))?;
+        let config = server_config(served.clone())?;
         let quic = quinn::Endpoint::server(config, addr).context("bind the QUIC listener")?;
         let port = quic.local_addr()?.port();
         Ok(Arc::new(Self {
             registry,
             certs: Mutex::new(certs),
+            served,
+            reload_failed: Mutex::default(),
             quic,
             port,
             limits,
@@ -488,11 +541,18 @@ impl Listener {
     }
 
     pub(crate) fn endpoint(&self) -> Endpoint {
+        self.endpoint_at(SystemTime::now())
+    }
+
+    /// Ages the certificates first: `rotate`'s sleep is monotonic, so after a suspend it
+    /// can lag the wall clock, and a report must never name an expired certificate.
+    fn endpoint_at(&self, now: SystemTime) -> Endpoint {
+        self.rotate_at(now);
         Endpoint {
             port: self.port,
             addresses: addresses(),
             protos: vec![WT_PROTO],
-            certificates: self.certs().report(SystemTime::now()),
+            certificates: self.certs().report(now, &self.served.hash()),
         }
     }
 
@@ -500,33 +560,46 @@ impl Listener {
     /// due. The 15 s capacity refresh carries a changed list to the control plane, well
     /// inside the 48 h between reporting a certificate and presenting it.
     async fn rotate(self: Arc<Self>) {
-        let mut presented = self.certs().presented(SystemTime::now()).sha256.clone();
         loop {
             tokio::time::sleep(ROTATION_CHECK).await;
-            let now = SystemTime::now();
-            let mut certs = self.certs();
-            if let Err(error) = certs.tick(now) {
-                tracing::warn!(
-                    token = "webtransport-cert-rotation-failed",
-                    "WebTransport certificate rotation failed: {error:#}"
-                );
-            }
-            let cert = certs.presented(now);
-            if cert.sha256 != presented {
-                match server_config(cert) {
-                    Ok(config) => {
-                        self.quic.set_server_config(Some(config));
-                        presented = cert.sha256.clone();
-                        tracing::info!(
-                            token = "webtransport-cert-rotated",
-                            "WebTransport presents its next certificate"
-                        );
-                    }
-                    Err(error) => tracing::warn!(
+            self.rotate_at(SystemTime::now());
+        }
+    }
+
+    /// One rotation pass at `now`. The clock is a parameter so a test can walk a
+    /// certificate's whole life.
+    fn rotate_at(&self, now: SystemTime) {
+        self.rotate_with(now, Cert::make);
+    }
+
+    fn rotate_with(&self, now: SystemTime, make: impl FnOnce(SystemTime) -> Result<Cert>) {
+        let mut certs = self.certs();
+        if let Err(error) = certs.tick_with(now, make) {
+            tracing::warn!(
+                token = "webtransport-cert-rotation-failed",
+                "WebTransport certificate rotation failed: {error:#}"
+            );
+        }
+        let cert = certs.presented(now);
+        if cert.sha256 != self.served.hash() {
+            let mut failed = self.reload_failed.lock().unwrap_or_else(|e| e.into_inner());
+            match self.served.set(cert) {
+                Ok(()) => {
+                    *failed = None;
+                    tracing::info!(
+                        token = "webtransport-cert-rotated",
+                        "WebTransport presents its next certificate"
+                    );
+                }
+                // Every capacity report and rotation tick retries; say it once per certificate.
+                Err(error) if failed.as_deref() != Some(&cert.sha256) => {
+                    *failed = Some(cert.sha256.clone());
+                    tracing::warn!(
                         token = "webtransport-cert-reload-failed",
                         "WebTransport could not present its next certificate: {error:#}"
-                    ),
+                    );
                 }
+                Err(_) => {}
             }
         }
     }
@@ -693,18 +766,51 @@ async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Sl
         Ok::<_, Violation>((send, recv, message))
     };
     match timeout_at(deadline, hello).await {
-        Err(_) => session.close(CLOSE_PROTOCOL, b"no hello in 5 s"),
+        Err(_) => close_session(&session, CLOSE_PROTOCOL, b"no hello in 5 s").await,
         Ok(Err(Violation::Gone)) => {}
-        Ok(Err(Violation::Protocol(why))) => session.close(CLOSE_PROTOCOL, why.as_bytes()),
+        Ok(Err(Violation::Protocol(why))) => {
+            close_session(&session, CLOSE_PROTOCOL, why.as_bytes()).await
+        }
         Ok(Ok((send, recv, message))) => match serde_json::from_value::<Hello>(message) {
             Ok(hello) if hello.kind == "hello" => {
                 authenticate(&session, send, recv, &registry, hello, slot, deadline).await;
             }
-            _ => session.close(CLOSE_PROTOCOL, b"the first message is not a hello"),
+            _ => {
+                close_session(
+                    &session,
+                    CLOSE_PROTOCOL,
+                    b"the first message is not a hello",
+                )
+                .await
+            }
         },
     }
     others.abort();
     datagrams.abort();
+}
+
+/// Close the session and hold it until the close has run. A `Session` owns the peer's
+/// HTTP/3 control and QPACK streams, and dropping the last handle stops them
+/// (STOP_SENDING): Chrome treats that as a fatal connection error and never reads the
+/// close capsule. Bounded by `CONTROL_WRITE`; the library force-closes after ~3 RTT, so
+/// past an RTT of ~0.7 s that bound fires first: the connection is then closed at the
+/// QUIC level with the session's code, before the handles drop, so no frame follows it.
+async fn close_session(session: &Session, code: u32, reason: &[u8]) {
+    session.close(code, reason);
+    // Test seam: a test holds the close here, after the capsule is out, to probe while its slot is held.
+    #[cfg(test)]
+    let _done = tests::hold_close().await;
+    if tokio::time::timeout(CONTROL_WRITE, session.closed())
+        .await
+        .is_err()
+    {
+        let code = web_transport_quinn::proto::error_to_http3(code);
+        quinn::Connection::close(
+            session,
+            quinn::VarInt::from_u64(code).unwrap_or_default(),
+            reason,
+        );
+    }
 }
 
 fn log_refusal(session_id: &str, code: &str) {
@@ -730,7 +836,12 @@ async fn authenticate(
     // datagrams (or none) could never be sent video.
     if session.max_datagram_size() < MIN_DATAGRAM {
         log_refusal(&hello.session_id, "datagrams_too_small");
-        session.close(CLOSE_PROTOCOL, b"datagrams unsupported or too small");
+        close_session(
+            session,
+            CLOSE_PROTOCOL,
+            b"datagrams unsupported or too small",
+        )
+        .await;
         return;
     }
     let verdict = registry
@@ -742,8 +853,8 @@ async fn authenticate(
                 .map(|c| (media, c))
                 .ok_or(Refusal::SessionEnded)
         });
-    // The slot is held until `hello_ack` is written: a refused peer stalling the
-    // refusal counts against the caps until the deadline, like any unauthenticated one.
+    // The slot is held until `hello_ack` is written, or on a refusal until the close has
+    // run: a peer stalling either counts against the caps like any unauthenticated one.
     let (media, client) = match verdict {
         Ok(attached) => attached,
         Err(refusal) => {
@@ -752,7 +863,7 @@ async fn authenticate(
             let error = json!({"type": "error", "code": code});
             let _ = timeout_at(deadline, write_message(&mut send, &error)).await;
             let _ = send.finish();
-            session.close(close, code.as_bytes());
+            close_session(session, close, code.as_bytes()).await;
             return;
         }
     };
@@ -771,7 +882,7 @@ async fn authenticate(
         Ok(Ok(()))
     ) {
         media.detach(client.id);
-        session.close(CLOSE_PROTOCOL, b"control stream stalled");
+        close_session(session, CLOSE_PROTOCOL, b"control stream stalled").await;
         return;
     }
     drop(slot);
@@ -798,7 +909,9 @@ async fn stream(
     });
     let mut pkt_seq = 0u32;
     let mut warned_oversized = false;
-    let close = loop {
+    // What ends the stream: an optional last message, the close code and its reason.
+    const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
+    let (message, code, why) = loop {
         tokio::select! {
             out = client.rx.recv() => match out {
                 Some(Out::Unit(unit)) => {
@@ -817,42 +930,37 @@ async fn stream(
                         media.keyframe();
                     }
                     if datagrams.into_iter().try_for_each(|d| session.send_datagram(d)).is_err() {
-                        break None;
+                        break QUIET;
                     }
                 }
                 Some(Out::Config(config)) => {
                     let ack = hello_ack(&config);
                     let write = write_message(&mut send, &ack);
                     if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
-                        break None;
+                        break QUIET;
                     }
                 }
-                None => break Some(match client.gone.get() {
-                    Some(Gone::TakenOver) => (json!({"type": "bye", "reason": "taken_over"}), CLOSE_TAKEN_OVER),
-                    _ => (json!({"type": "bye", "reason": "session_ended"}), CLOSE_ENDED),
-                }),
+                None => break match client.gone.get() {
+                    Some(Gone::TakenOver) => (Some(json!({"type": "bye", "reason": "taken_over"})), CLOSE_TAKEN_OVER, ""),
+                    _ => (Some(json!({"type": "bye", "reason": "session_ended"})), CLOSE_ENDED, ""),
+                },
             },
             message = control_rx.recv() => match message {
                 Some(Ok(message)) => match message.get("type").and_then(Value::as_str) {
                     Some("keyframe_request") => media.keyframe(),
-                    Some("bye") => break None,
+                    Some("bye") => break QUIET,
                     _ => {}
                 },
-                Some(Err(Violation::Protocol(why))) => {
-                    session.close(CLOSE_PROTOCOL, why.as_bytes());
-                    break None;
-                }
-                Some(Err(Violation::Gone)) | None => break None,
+                Some(Err(Violation::Protocol(why))) => break (None, CLOSE_PROTOCOL, why),
+                Some(Err(Violation::Gone)) | None => break QUIET,
             },
         }
     };
     reader.abort();
     media.detach(client.id);
-    if let Some((message, code)) = close {
+    if let Some(message) = message {
         let _ = tokio::time::timeout(CONTROL_WRITE, write_message(&mut send, &message)).await;
         let _ = send.finish();
-        session.close(code, b"");
-    } else {
-        session.close(CLOSE_NORMAL, b"");
     }
+    close_session(session, code, why.as_bytes()).await;
 }

@@ -34,7 +34,7 @@ pub struct CertReport {
 }
 
 impl Cert {
-    fn make(now: SystemTime) -> Result<Self> {
+    pub(crate) fn make(now: SystemTime) -> Result<Self> {
         // X.509 keeps whole seconds; truncate so the report matches the certificate.
         let now = SystemTime::UNIX_EPOCH
             + Duration::from_secs(now.duration_since(SystemTime::UNIX_EPOCH)?.as_secs());
@@ -84,11 +84,14 @@ impl CertSet {
     /// Ages the set to `now`: drops what expired, makes the next certificate once the
     /// newest has 72 h or less. True when the reported list changed. On `Err` the set is
     /// as it was, so it is never empty once made.
+    // shortcut: `now` is trusted to move forward; a clock stepped forward and back keeps the
+    // certificate made at the forward time, valid up to 14 days past the true time. Upgrade
+    // if the agent must survive a bad clock.
     pub(crate) fn tick(&mut self, now: SystemTime) -> Result<bool> {
         self.tick_with(now, Cert::make)
     }
 
-    fn tick_with(
+    pub(crate) fn tick_with(
         &mut self,
         now: SystemTime,
         make: impl FnOnce(SystemTime) -> Result<Cert>,
@@ -114,9 +117,9 @@ impl CertSet {
         }
     }
 
-    /// `capacity.webtransport.certificates`: the presented one first, none expired.
-    pub(crate) fn report(&self, now: SystemTime) -> Vec<CertReport> {
-        let first = self.presented(now).sha256.clone();
+    /// `capacity.webtransport.certificates`: `first` (the hash actually being served)
+    /// first, none expired.
+    pub(crate) fn report(&self, now: SystemTime, first: &str) -> Vec<CertReport> {
         let mut out: Vec<CertReport> = self
             .certs
             .iter()
@@ -159,14 +162,14 @@ mod tests {
 
         let quiet = expires - MAKE_NEXT - HOUR;
         assert!(!set.tick(quiet).unwrap());
-        assert_eq!(set.report(quiet).len(), 1);
+        assert_eq!(set.report(quiet, &set.presented(quiet).sha256).len(), 1);
 
         let overlap = expires - MAKE_NEXT;
         assert!(
             set.tick(overlap).unwrap(),
             "the next certificate is reported"
         );
-        let report = set.report(overlap);
+        let report = set.report(overlap, &set.presented(overlap).sha256);
         assert_eq!(report.len(), 2);
         assert_eq!(report[0].sha256, first, "the old one is still presented");
         let next = report[1].sha256.clone();
@@ -174,10 +177,14 @@ mod tests {
         let switch = expires - PRESENT_NEXT;
         assert!(!set.tick(switch).unwrap());
         assert_eq!(set.presented(switch).sha256, next);
-        assert_eq!(set.report(switch)[0].sha256, next, "presented first");
+        assert_eq!(
+            set.report(switch, &set.presented(switch).sha256)[0].sha256,
+            next,
+            "presented first"
+        );
 
         assert!(set.tick(expires).unwrap(), "the expired one is dropped");
-        let report = set.report(expires);
+        let report = set.report(expires, &set.presented(expires).sha256);
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].sha256, next);
     }
@@ -197,11 +204,15 @@ mod tests {
             "presented() still has one"
         );
         assert!(
-            set.report(expired).is_empty(),
+            set.report(expired, &set.presented(expired).sha256)
+                .is_empty(),
             "an expired certificate is not reported"
         );
         assert!(set.tick(expired).unwrap());
-        assert_eq!(set.report(expired).len(), 1);
-        assert_ne!(set.report(expired)[0].sha256, first);
+        assert_eq!(set.report(expired, &set.presented(expired).sha256).len(), 1);
+        assert_ne!(
+            set.report(expired, &set.presented(expired).sha256)[0].sha256,
+            first
+        );
     }
 }

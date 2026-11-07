@@ -403,6 +403,9 @@ type fakeDispatcher struct {
 	// lastCapture records the most recent session_capture (session-capture) so a
 	// test can assert the minted capture_id and the clamped budget/params.
 	lastCapture *agentws.SessionCaptureCmd
+	// lastSwap and lastStop record the most recent acked swap and stop commands.
+	lastSwap *agentws.SessionSwapAppCmd
+	lastStop *agentws.SessionStopCmd
 	// noAck records commands sent WITHOUT an ack. AgentHeartbeat's reverse
 	// reconcile must use Send, never SendWithAck: it runs inside the agent WS
 	// read loop, and that same loop is what would have to read the ack (#128).
@@ -478,8 +481,12 @@ func (f *fakeDispatcher) SendWithAck(_ context.Context, _ string, _ string, v an
 		f.transportTokens = append(f.transportTokens, c)
 	case agentws.SessionStopCmd:
 		f.sent = append(f.sent, "stop")
+		stop := c
+		f.lastStop = &stop
 	case agentws.SessionSwapAppCmd:
 		f.sent = append(f.sent, "swap")
+		swap := c
+		f.lastSwap = &swap
 	case agentws.SessionDisplayUpdateCmd:
 		f.sent = append(f.sent, "display")
 		display := c
