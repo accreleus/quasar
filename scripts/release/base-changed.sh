@@ -26,7 +26,9 @@ want="${base##*@}"
 
 if ! got="$(docker buildx imagetools inspect --format '{{index .Image.Config.Labels "org.quasar.pins.base"}}' "$agent" 2>&1)"; then
   case "$got" in
-    *"manifest unknown"* | *"name unknown"* | *"no such manifest"* | *"not found"*)
+    # No docker at all is not a missing image (a shell says `docker: not found`).
+    *"command not found"* | *"docker: not found"*) echo "::error::cannot run docker: ${got//$'\n'/ }" >&2; exit 1 ;;
+    *"manifest unknown"* | *"name unknown"* | *"no such manifest"* | *": not found"*)
       say true "the preview's agent image $agent is not in the registry" ;;
     *) echo "::error::could not read the preview's agent image $agent; the registry said: ${got//$'\n'/ }" >&2; exit 1 ;;
   esac

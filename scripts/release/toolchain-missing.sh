@@ -11,7 +11,7 @@
 #
 # A registry that cannot be read is an ERROR (exit 1), never "missing": a hiccup must not
 # read as "absent" and cost a 40-minute build. Only the registry's own "manifest unknown"
-# / "name unknown" / "not found" counts as missing.
+# / "name unknown" / "<ref>: not found" counts as missing.
 set -euo pipefail
 : "${REGISTRY_NS:?REGISTRY_NS is required}"
 
@@ -30,7 +30,9 @@ image="$REGISTRY_NS/quasar-gst-toolchain:$tag"
 build=false
 if ! said="$(docker manifest inspect "$image" 2>&1 >/dev/null)"; then
   case "$said" in
-    *"manifest unknown"* | *"name unknown"* | *"no such manifest"* | *"not found"*) build=true ;;
+    # No docker at all is not a missing tag (a shell says `docker: not found`).
+    *"command not found"* | *"docker: not found"*) echo "::error::cannot run docker: ${said//$'\n'/ }" >&2; exit 1 ;;
+    *"manifest unknown"* | *"name unknown"* | *"no such manifest"* | *": not found"*) build=true ;;
     *) echo "::error::could not tell whether $image is published; the registry said: ${said//$'\n'/ }" >&2; exit 1 ;;
   esac
 fi

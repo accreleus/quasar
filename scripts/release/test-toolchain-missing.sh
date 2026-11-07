@@ -20,6 +20,8 @@ case "$1 $2" in
       present) echo '{}' ;;
       unknown) echo "manifest unknown" >&2; exit 1 ;;
       name-unknown) echo "name unknown: repository name not known to registry" >&2; exit 1 ;;
+      nodocker) echo "bash: docker: command not found" >&2; exit 127 ;;
+      shnodocker) echo "sh: 1: docker: not found" >&2; exit 127 ;;
       denied) echo "denied: requested access to the resource is denied" >&2; exit 1 ;;
       timeout) echo "Get https://ghcr.io/v2/: net/http: TLS handshake timeout" >&2; exit 1 ;;
     esac ;;
@@ -38,7 +40,7 @@ for m in unknown name-unknown; do
   out="$(run FAKE_MANIFEST=$m)" || fail "$m: $out"
   grep -qx 'build=true' <<<"$out" || fail "$m must build: $out"
 done
-for m in denied timeout; do
+for m in denied timeout nodocker shnodocker; do
   rc=0; out="$(run FAKE_MANIFEST=$m)" || rc=$?
   [ "$rc" -ne 0 ] || fail "$m must be an error, got: $out"
   grep -q '^build=' <<<"$out" && fail "$m printed a build decision: $out"

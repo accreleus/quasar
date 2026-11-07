@@ -9,14 +9,22 @@ name: Toolchain refresh
 # and closes the gap.
 #
 # WHAT IT CANNOT DO, by construction: it has no promote or preview job, no registry write
-# beyond the toolchain tag, and no agent or app image. The preview tag still moves only on a
+# beyond the toolchain tag and its build cache (`quasar-gst-toolchain-cache:buildcache`),
+# and no agent or app image. The preview tag still moves only on a
 # push to develop (images.yml).
 #
 # A SCHEDULE RUNS THE DEFAULT BRANCH'S COPY OF THIS FILE (main), at main's commit, which is
 # not develop. So the workflow only fires once it is on main, and every job checks out
 # `develop` by name: the pins, patches and Dockerfile it hashes and builds are develop's, the
 # same ones agent-live's nightly checks out. A manual dispatch does the same, whatever ref it
-# is started on.
+# is started on. So the YAML here is main's and the scripts it calls (scripts/release/
+# toolchain-missing.sh, toolchain-tag-check.sh) are develop's: keep their output keys
+# (`image`, `base_ref`, `build`) and arguments stable, or the two drift apart.
+#
+# ONE COMMIT: `check` records the develop commit it hashed and `build` checks out that
+# commit, then recomputes the tag and fails if it differs. The tag is content-addressed and
+# never rebuilt, so a develop landing between the two jobs must not put the new tree's
+# image under the old tag.
 #
 # "Build only when missing": scripts/release/toolchain-missing.sh. A registry that cannot be
 # read fails the run; it never reads as "missing, so build" (a 40-minute cost).
@@ -46,8 +54,10 @@ jobs:
       build: ${{ steps.missing.outputs.build }}
       image: ${{ steps.missing.outputs.image }}
       base_ref: ${{ steps.missing.outputs.base_ref }}
+      commit: ${{ steps.checkout.outputs.commit }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
         with:
           ref: develop
           persist-credentials: false
@@ -72,8 +82,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         id: checkout
         with:
-          ref: develop
+          ref: ${{ needs.check.outputs.commit }}
           persist-credentials: false
+      - name: The checkout still hashes to the tag `check` decided on
+        env:
+          IMAGE: ${{ needs.check.outputs.image }}
+          BASE_REF: ${{ needs.check.outputs.base_ref }}
+        run: bash scripts/release/toolchain-tag-check.sh "$IMAGE" "$BASE_REF"
       - name: Stamp the build time
         id: stamp
         run: echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"

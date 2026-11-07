@@ -518,6 +518,9 @@ jobs:
       #   any landing, so "the toolchain is not published" no longer says the base moved;
       #   scripts/release/base-changed.sh compares this run's base digest with the
       #   `org.quasar.pins.base` label of the preview's node-agent image.
+      #   A BRANCH DISPATCH has no preview to compare, so after a base rebuild (once the
+      #   Toolchain refresh has published the toolchain) it skips as "nothing changed":
+      #   dispatch with `force` to build the new base into a branch.
       #   Skipping works by `if:` on the toolchain and build-* jobs: their dependants (the
       #   validate-* jobs, preflight, promote, release, preview) are skipped with them, so
       #   nothing is validated or promoted either.
