@@ -7,6 +7,7 @@ import type {
   AdminAppsResponse,
   CompatToolList,
   CompatToolMapping,
+  HostCompatTools,
   CompatToolMappingWrite,
   AdminApp,
   AppPlacement,
@@ -659,6 +660,10 @@ export function listHosts(token: string, cursor?: string): Promise<HostsResponse
 
 export function getHost(token: string, id: string): Promise<{ host: Host }> {
   return apiFetch<{ host: Host }>(`/hosts/${id}`, { token });
+}
+
+export function getHostCompatTools(token: string, id: string, signal?: AbortSignal): Promise<HostCompatTools> {
+  return apiFetch<HostCompatTools>(`/admin/hosts/${encodeURIComponent(id)}/compat-tools`, { token, signal });
 }
 
 export function getHostWebTransport(token: string, id: string, signal?: AbortSignal): Promise<HostWebTransport> {
