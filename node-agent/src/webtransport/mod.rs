@@ -766,18 +766,36 @@ async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Sl
         Ok::<_, Violation>((send, recv, message))
     };
     match timeout_at(deadline, hello).await {
-        Err(_) => session.close(CLOSE_PROTOCOL, b"no hello in 5 s"),
+        Err(_) => close_session(&session, CLOSE_PROTOCOL, b"no hello in 5 s").await,
         Ok(Err(Violation::Gone)) => {}
-        Ok(Err(Violation::Protocol(why))) => session.close(CLOSE_PROTOCOL, why.as_bytes()),
+        Ok(Err(Violation::Protocol(why))) => {
+            close_session(&session, CLOSE_PROTOCOL, why.as_bytes()).await
+        }
         Ok(Ok((send, recv, message))) => match serde_json::from_value::<Hello>(message) {
             Ok(hello) if hello.kind == "hello" => {
                 authenticate(&session, send, recv, &registry, hello, slot, deadline).await;
             }
-            _ => session.close(CLOSE_PROTOCOL, b"the first message is not a hello"),
+            _ => {
+                close_session(
+                    &session,
+                    CLOSE_PROTOCOL,
+                    b"the first message is not a hello",
+                )
+                .await
+            }
         },
     }
     others.abort();
     datagrams.abort();
+}
+
+/// Close the session and hold it until the close has run. A `Session` owns the peer's
+/// HTTP/3 control and QPACK streams, and dropping the last handle stops them
+/// (STOP_SENDING): Chrome treats that as a fatal connection error and never reads the
+/// close capsule. Bounded by `CONTROL_WRITE`; the library force-closes after ~3 RTT.
+async fn close_session(session: &Session, code: u32, reason: &[u8]) {
+    session.close(code, reason);
+    let _ = tokio::time::timeout(CONTROL_WRITE, session.closed()).await;
 }
 
 fn log_refusal(session_id: &str, code: &str) {
@@ -803,7 +821,12 @@ async fn authenticate(
     // datagrams (or none) could never be sent video.
     if session.max_datagram_size() < MIN_DATAGRAM {
         log_refusal(&hello.session_id, "datagrams_too_small");
-        session.close(CLOSE_PROTOCOL, b"datagrams unsupported or too small");
+        close_session(
+            session,
+            CLOSE_PROTOCOL,
+            b"datagrams unsupported or too small",
+        )
+        .await;
         return;
     }
     let verdict = registry
@@ -825,7 +848,8 @@ async fn authenticate(
             let error = json!({"type": "error", "code": code});
             let _ = timeout_at(deadline, write_message(&mut send, &error)).await;
             let _ = send.finish();
-            session.close(close, code.as_bytes());
+            drop(slot);
+            close_session(session, close, code.as_bytes()).await;
             return;
         }
     };
@@ -844,7 +868,7 @@ async fn authenticate(
         Ok(Ok(()))
     ) {
         media.detach(client.id);
-        session.close(CLOSE_PROTOCOL, b"control stream stalled");
+        close_session(session, CLOSE_PROTOCOL, b"control stream stalled").await;
         return;
     }
     drop(slot);
@@ -924,8 +948,8 @@ async fn stream(
     if let Some((message, code)) = close {
         let _ = tokio::time::timeout(CONTROL_WRITE, write_message(&mut send, &message)).await;
         let _ = send.finish();
-        session.close(code, b"");
+        close_session(session, code, b"").await;
     } else {
-        session.close(CLOSE_NORMAL, b"");
+        close_session(session, CLOSE_NORMAL, b"").await;
     }
 }

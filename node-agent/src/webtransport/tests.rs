@@ -606,6 +606,10 @@ impl rustls::client::danger::ServerCertVerifier for AnyCert {
 }
 
 fn raw_endpoint() -> quinn::Endpoint {
+    raw_endpoint_with(|_| {})
+}
+
+fn raw_endpoint_with(shape: impl FnOnce(&mut quinn::TransportConfig)) -> quinn::Endpoint {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -616,7 +620,11 @@ fn raw_endpoint() -> quinn::Endpoint {
     tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    let mut transport = quinn::TransportConfig::default();
+    shape(&mut transport);
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(Arc::new(transport));
+    endpoint.set_default_client_config(config);
     endpoint
 }
 
@@ -1147,4 +1155,210 @@ async fn a_bidi_stream_opened_after_the_control_stream_closed_is_reset() {
             .is_err(),
         "the new stream is reset"
     );
+}
+
+/// A client that opens the HTTP/3 streams Chrome opens (control, QPACK encoder and
+/// decoder) and keeps them, so it sees a STOP_SENDING on any of them. The library
+/// client hides its control stream.
+struct Chrome {
+    conn: quinn::Connection,
+    h3: Vec<quinn::SendStream>,
+    connect: quinn::RecvStream,
+    _connect_send: quinn::SendStream,
+    session_id: web_transport_quinn::proto::VarInt,
+    stream: Option<(quinn::SendStream, quinn::RecvStream)>,
+}
+
+impl Chrome {
+    async fn connect(agent: &Agent, shape: impl FnOnce(&mut quinn::TransportConfig)) -> Self {
+        use web_transport_quinn::proto::{
+            ConnectRequest, ConnectResponse, Settings, StreamUni, VarInt,
+        };
+        let endpoint = raw_endpoint_with(shape);
+        let addr = SocketAddr::from(([127, 0, 0, 1], agent.url.port().unwrap()));
+        let conn = endpoint
+            .connect(addr, "quasar-node-agent")
+            .unwrap()
+            .await
+            .unwrap();
+        let mut h3 = Vec::new();
+        let mut control = conn.open_uni().await.unwrap();
+        let mut settings = Settings::default();
+        settings.enable_webtransport(1);
+        settings.write(&mut control).await.unwrap();
+        h3.push(control);
+        for kind in [StreamUni::QPACK_ENCODER, StreamUni::QPACK_DECODER] {
+            let mut qpack = conn.open_uni().await.unwrap();
+            let mut header = Vec::new();
+            kind.encode(&mut header);
+            qpack.write_all(&header).await.unwrap();
+            h3.push(qpack);
+        }
+        let (mut connect_send, mut connect) = conn.open_bi().await.unwrap();
+        ConnectRequest::new(agent.url.clone())
+            .write(&mut connect_send)
+            .await
+            .unwrap();
+        ConnectResponse::read(&mut connect).await.unwrap();
+        let session_id = VarInt::from_u64(u64::from(connect_send.id())).unwrap();
+        Self {
+            conn,
+            h3,
+            connect,
+            _connect_send: connect_send,
+            session_id,
+            stream: None,
+        }
+    }
+
+    /// Open the WebTransport control stream and send `hello`.
+    async fn hello(&mut self, wt_proto: u32, token: &str, session_id: &str) {
+        use web_transport_quinn::proto::Frame;
+        let (mut send, recv) = self.conn.open_bi().await.unwrap();
+        let mut header = Vec::new();
+        Frame::WEBTRANSPORT.encode(&mut header);
+        self.session_id.encode(&mut header);
+        let hello = json!({"type": "hello", "wt_proto": wt_proto, "token": token,
+                           "session_id": session_id, "client": "browser", "fec": []});
+        let body = serde_json::to_vec(&hello).unwrap();
+        header.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        header.extend_from_slice(&body);
+        send.write_all(&header).await.unwrap();
+        self.stream = Some((send, recv));
+    }
+
+    /// The next control message, or `None` if the stream ended without one.
+    async fn message(&mut self) -> Option<Value> {
+        let (_, recv) = self.stream.as_mut().unwrap();
+        let read = async {
+            let mut len = [0u8; 4];
+            recv.read_exact(&mut len).await.ok()?;
+            let mut body = vec![0; u32::from_le_bytes(len) as usize];
+            recv.read_exact(&mut body).await.ok()?;
+            serde_json::from_slice(&body).ok()
+        };
+        tokio::time::timeout(Duration::from_secs(10), read)
+            .await
+            .expect("no control message in 10 s")
+    }
+
+    /// The code of the CLOSE_WEBTRANSPORT_SESSION capsule, the way the browser reads it.
+    async fn close_code(&mut self) -> u32 {
+        use web_transport_quinn::proto::{Capsule, Http3CapsuleReader};
+        let mut reader = Http3CapsuleReader::new(&mut self.connect);
+        let read = async {
+            loop {
+                match reader.read().await {
+                    Ok(Some(Capsule::CloseWebTransportSession { code, .. })) => return Some(code),
+                    Ok(Some(_)) => {}
+                    _ => return None,
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), read)
+            .await
+            .expect("no close capsule in 10 s")
+            .expect("the CONNECT stream ended without a close capsule")
+    }
+
+    /// Chrome closes the connection on a STOP_SENDING for an HTTP/3 control or QPACK
+    /// stream; none may arrive, before or after the connection closes.
+    async fn assert_h3_streams_untouched(&self) {
+        use futures_util::FutureExt;
+        for (n, stream) in self.h3.iter().enumerate() {
+            assert!(
+                stream.stopped().now_or_never().is_none(),
+                "the agent stopped HTTP/3 stream {n} before the close reached the client"
+            );
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.conn.closed()).await;
+        for (n, stream) in self.h3.iter().enumerate() {
+            assert!(
+                !matches!(stream.stopped().await, Ok(Some(_))),
+                "the agent stopped HTTP/3 stream {n}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_hello_is_read_and_closed_without_stopping_chromes_h3_streams() {
+    let agent = agent().await;
+    // (wt_proto, token, session id, error code, the close code that follows)
+    let cases = [
+        (1, TOKEN, "not-a-session", "session_not_ready", CLOSE_NORMAL),
+        (1, "wrong-token", SESSION, "auth_failed", CLOSE_AUTH),
+        (0, TOKEN, SESSION, "unsupported_version", CLOSE_NORMAL),
+    ];
+    for (proto, token, session, error, close) in cases {
+        let mut chrome = Chrome::connect(&agent, |_| {}).await;
+        chrome.hello(proto, token, session).await;
+        let reply = chrome
+            .message()
+            .await
+            .unwrap_or_else(|| panic!("{error}: no error message"));
+        assert_eq!(reply, json!({"type": "error", "code": error}));
+        assert_eq!(chrome.close_code().await, close, "{error}");
+        chrome.assert_h3_streams_untouched().await;
+    }
+
+    // A client that cannot take datagrams is closed 4400 with no message, and keeps its token.
+    let mut chrome = Chrome::connect(&agent, |t| {
+        t.datagram_receive_buffer_size(None);
+    })
+    .await;
+    chrome.hello(1, TOKEN, SESSION).await;
+    assert_eq!(chrome.close_code().await, CLOSE_PROTOCOL);
+    chrome.assert_h3_streams_untouched().await;
+    let (_session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack", "the token was not spent");
+}
+
+#[tokio::test]
+async fn bye_and_takeover_close_without_stopping_chromes_h3_streams() {
+    let agent = agent().await;
+    let registry = agent.listener.registry();
+
+    // The client says bye.
+    let mut leaving = Chrome::connect(&agent, |_| {}).await;
+    leaving.hello(1, TOKEN, SESSION).await;
+    assert_eq!(leaving.message().await.unwrap()["type"], "hello_ack");
+    let (send, _) = leaving.stream.as_mut().unwrap();
+    write_message_raw(send, &json!({"type": "bye"})).await;
+    assert_eq!(leaving.close_code().await, CLOSE_NORMAL);
+    leaving.assert_h3_streams_untouched().await;
+
+    // A newer client displaces it, then the session ends.
+    let expires = SystemTime::now() + TOKEN_TTL;
+    for token in ["first", "second"] {
+        assert!(registry.add_token(SESSION, &token_hash(token), expires));
+    }
+    let mut first = Chrome::connect(&agent, |_| {}).await;
+    first.hello(1, "first", SESSION).await;
+    assert_eq!(first.message().await.unwrap()["type"], "hello_ack");
+    let mut second = Chrome::connect(&agent, |_| {}).await;
+    second.hello(1, "second", SESSION).await;
+    assert_eq!(second.message().await.unwrap()["type"], "hello_ack");
+    assert_eq!(
+        first.message().await.unwrap(),
+        json!({"type": "bye", "reason": "taken_over"})
+    );
+    assert_eq!(first.close_code().await, CLOSE_TAKEN_OVER);
+    first.assert_h3_streams_untouched().await;
+
+    registry.end(SESSION);
+    assert_eq!(
+        second.message().await.unwrap(),
+        json!({"type": "bye", "reason": "session_ended"})
+    );
+    assert_eq!(second.close_code().await, CLOSE_ENDED);
+    second.assert_h3_streams_untouched().await;
+}
+
+async fn write_message_raw(send: &mut quinn::SendStream, message: &Value) {
+    let body = serde_json::to_vec(message).unwrap();
+    send.write_all(&(body.len() as u32).to_le_bytes())
+        .await
+        .unwrap();
+    send.write_all(&body).await.unwrap();
 }
