@@ -567,13 +567,16 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		// prevention; never shorten it to make this header smaller), so a relaunch
 		// right after a peer's DELETE bounces here for the ~15 s that teardown
 		// takes. Retry-After lets a polling client wait rather than error (#494).
-		retryAfter := capacityExhaustedRetryAfterSeconds
+		retryAfter, reason := capacityExhaustedRetryAfterSeconds, ""
 		var claim *ParkedClaimRefusedError
 		if errors.As(err, &claim) {
 			retryAfter = parkedClaimRetryAfterSeconds
+			if !claim.Warming {
+				reason = httpx.ReasonSteamRestarting
+			}
 		}
 		w.Header().Set("Retry-After", retryAfter)
-		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted,
+		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted, reason,
 			refusalMessage(err, "all capacity is in use; try again shortly",
 				"no free GPU can encode %s; try again shortly"))
 		return
@@ -800,7 +803,7 @@ func (h *Handler) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if user.Role == auth.RoleAdmin {
-		h.recordActivity(r.Context(), user.ID, "session.stop", "session", id, map[string]any{"already_terminal": wasTerminal})
+		h.recordActivity(r.Context(), user.ID, "session.stop", "session", sess.ID, map[string]any{"already_terminal": wasTerminal})
 	}
 
 	// 202 Accepted while teardown proceeds; 200 if it was already terminal

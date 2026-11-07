@@ -419,7 +419,7 @@ pub fn build_session_pipeline(
         encoder_capsfilter: h264_capsfilter,
         parser,
     } = build_bitstream_chain(codec, effective_profile)?;
-    let pay = build_video_payloader(codec)?;
+    let pay = build_video_payloader(codec, cfg.rtp_mtu)?;
 
     // The caps webrtcbin advertises the video m-line from. Static, so the offer can be
     // generated before the first frame flows.

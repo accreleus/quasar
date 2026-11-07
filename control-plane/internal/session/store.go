@@ -302,6 +302,8 @@ type Session struct {
 	// wt is the first transport token, for the assign dispatch and the 201. Not persisted:
 	// only its hash is, in session_tokens.
 	wt *transportGrant
+	// restream: what a claim's play stream changes on the adopted runtime.
+	restream []string
 	// notice is the launch's steam_library_not_shared message, "" for none.
 	// Not persisted.
 	notice string
