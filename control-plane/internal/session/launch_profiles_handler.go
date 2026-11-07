@@ -171,14 +171,14 @@ func (h *Handler) handleAdminGetLaunchProfile(w http.ResponseWriter, r *http.Req
 // an absent field falls to the schema default on create, unchanged on patch,
 // never a zero value clobbering a column.
 type launchProfileReq struct {
-	ID           *string `json:"id"`
-	DisplayName  *string `json:"display_name"`
-	Description  *string `json:"description"`
-	Visibility   *string `json:"visibility"`
-	SortOrder    *int32  `json:"sort_order"`
-	Transport    *string `json:"transport"`
-	PyroWaveMode *string `json:"pyrowave_mode"`
-	// Raw so that null (no cap) differs from absent (unchanged on PATCH).
+	ID          *string `json:"id"`
+	DisplayName *string `json:"display_name"`
+	Description *string `json:"description"`
+	Visibility  *string `json:"visibility"`
+	SortOrder   *int32  `json:"sort_order"`
+	Transport   *string `json:"transport"`
+	// Raw, so that null is told from absent: a null mode is refused, a null kbps is no cap.
+	PyroWaveMode json.RawMessage `json:"pyrowave_mode"`
 	PyroWaveKbps json.RawMessage `json:"pyrowave_kbps"`
 	Rungs        *[]string       `json:"rungs"`
 }
@@ -186,11 +186,12 @@ type launchProfileReq struct {
 // pyrowaveWrite validates the request's PyroWave fields into w; the message on a refusal.
 // semantics: control-api.md §The launch profile's pyrowave_mode and pyrowave_kbps
 func (req launchProfileReq) pyrowaveWrite(w *LaunchProfileWrite) string {
-	if m := req.PyroWaveMode; m != nil {
-		if *m != pyrowaveOff && *m != pyrowaveAllow && *m != pyrowavePrefer {
+	if req.PyroWaveMode != nil {
+		var m string
+		if json.Unmarshal(req.PyroWaveMode, &m) != nil || (m != pyrowaveOff && m != pyrowaveAllow && m != pyrowavePrefer) {
 			return "pyrowave_mode must be off, allow, or prefer"
 		}
-		w.PyroWaveMode = m
+		w.PyroWaveMode = &m
 	}
 	if req.PyroWaveKbps == nil {
 		return ""
