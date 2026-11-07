@@ -382,6 +382,16 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	// known. A claim resolved it on the parked session's GPU before placement.
 	placed := claimStream
 	if p.claim != nil {
+		// Planned as holding a PyroWave slot the INSERT found taken: plan it again as busy.
+		// PyroWave moves no standard-stream field claim check 4 compared.
+		if ps := claimStream.plan; ps != nil && ps.Update.KeepPyroWaveSlot && !sess.PyroWaveSlot {
+			if again, err := c.planPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err == nil {
+				claimStream, placed = again, again
+			} else {
+				c.log.Warn("pyrowave: re-planning a claim without a slot failed, keeping its plan",
+					"session_id", sess.ID, "err", err)
+			}
+		}
 		c.persistPlacedStream(ctx, &sess, claimStream)
 	} else if placed, err = c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {
 		// The codec constraint pre-empts both codec refusals; this stays the
@@ -633,6 +643,8 @@ func (c *Coordinator) claimCandidate(ctx context.Context, p *CreateParams, k par
 		ID: k.ID, UserID: p.UserID, AppID: p.AppID, HostID: &k.HostID, GPUIndex: &k.GPUIndex,
 		Width: p.Width, Height: p.Height, FPS: p.FPS, BitrateKbps: p.BitrateKbps,
 		H264Profile: p.H264Profile, Codec: wireCodecH264, Playout0Ms: p.Playout0Ms,
+		// A claim plans like any launch: as holding the slot its INSERT will try to take.
+		PyroWaveSlot: p.PyroWaveCandidate,
 	}
 	if lp.DeviceID != "" {
 		prov.DeviceID = &lp.DeviceID

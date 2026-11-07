@@ -1587,8 +1587,9 @@ func (s *Store) UpdateSessionCodec(ctx context.Context, id, codec string) error 
 }
 
 // ApplyPyroWaveSwitch records an agent codec.switched on the session's PyroWave record:
-// active, used, switch_reason, and wanted cleared by a step-down. Observability only, on a
-// non-terminal session that has a record. semantics: control-api.md §The session's pyrowave
+// active, used, switch_reason, and wanted cleared by a step-down. A step-down also gives back
+// the session's PyroWave slot: it never switches on again, so the GPU's slot would sit idle.
+// semantics: control-api.md §The session's pyrowave, §The PyroWave ceiling
 func (s *Store) ApplyPyroWaveSwitch(ctx context.Context, id string, active bool, reason string) error {
 	if !isValidUUID(id) {
 		return nil
@@ -1600,7 +1601,9 @@ func (s *Store) ApplyPyroWaveSwitch(ctx context.Context, id string, active bool,
 		        'used', COALESCE((pyrowave->>'used')::bool, false) OR $2::bool,
 		        'switch_reason', $3::text,
 		        'wanted', COALESCE((pyrowave->>'wanted')::bool, false)
-		                  AND $3::text NOT IN ('rtt_too_high', 'congestion', 'client_decode_error', 'encoder_error'))
+		                  AND $3::text NOT IN ('rtt_too_high', 'congestion', 'client_decode_error', 'encoder_error')),
+		    pyrowave_slot = pyrowave_slot
+		                  AND $3::text NOT IN ('rtt_too_high', 'congestion', 'client_decode_error', 'encoder_error')
 		WHERE id = $1::uuid AND pyrowave IS NOT NULL AND state NOT IN ('stopped', 'failed')
 	`, id, active, reason)
 	if err != nil {
