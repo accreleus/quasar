@@ -394,6 +394,34 @@ async fn a_browser_like_client_gets_h264_access_units_after_its_token() {
     assert_eq!(close_code(&reused).await, Some(CLOSE_AUTH));
 }
 
+/// The job `agent-live.yml` runs under `webtransport::`: one session from hello to a clean
+/// close, asserting outcomes only (what a browser would see), not the listener's internals.
+#[tokio::test]
+async fn a_session_runs_from_hello_through_decodable_frames_to_a_clean_close() {
+    let agent = agent().await;
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+
+    let got = frames(&session, 60, false).await;
+    assert!(got[0].keyframe, "the client starts at a keyframe");
+    for f in &got {
+        let types = nal_types(&f.data);
+        assert_eq!(
+            f.keyframe,
+            types.contains(&5),
+            "keyframe flag matches the bitstream"
+        );
+    }
+
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(close_code(&session).await, Some(CLOSE_NORMAL));
+}
+
 #[tokio::test]
 async fn before_hello_the_agent_reads_one_stream_and_waits_five_seconds() {
     let agent = agent().await;
