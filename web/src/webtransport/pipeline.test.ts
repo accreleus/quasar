@@ -147,50 +147,67 @@ describe("FrameAssembler", () => {
     expect(a.tick().nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]);
   });
 
-  it("follows a round trip that rises from 2 to 150 ms, sampling a resend that lands after its frame was given up", () => {
-    let t = 0;
-    const a = new FrameAssembler(() => t);
+  /** An assembler whose estimate is `rtt` ms (one loss, resent after `rtt`), at frame 3. */
+  function measured(rtt: number) {
+    const clock = { t: 0 };
+    const a = new FrameAssembler(() => clock.t);
     a.push(unitOf(1, true)[0]);
     const two = unitOf(2, false, 2000);
     a.push(two[1]);
-    t = 2;
-    expect(seqs(a.push({ ...two[0], retransmit: true }))).toEqual([2]);
+    clock.t = rtt;
+    a.push({ ...two[0], retransmit: true });
+    return { a, clock };
+  }
+
+  it("converges on a round trip that rises from 2 to 150 ms, at most doubling per sample", () => {
+    const { a, clock } = measured(2);
     expect(a.rttMs).toBe(2);
+    let seq = 3;
+    const late: boolean[] = [];
+    for (let i = 0; i < 12; i++) {
+      const lossy = unitOf(seq++, false, 2000);
+      const start = clock.t;
+      const before = a.rttMs;
+      a.push(lossy[1]);
+      let wentLate = false;
+      while (clock.t < start + 150) {
+        clock.t += 1;
+        if (a.tick().needKeyframe) wentLate = true;
+      }
+      const r = a.push({ ...lossy[0], retransmit: true }); // its first resend, 150 ms after the NACK
+      late.push(wentLate);
+      expect(a.rttMs).toBeLessThanOrEqual(2 * before);
+      if (wentLate) a.push(unitOf(seq++, true)[0]);
+      else expect(r.units.map((u) => u.frameSeq)).toEqual([lossy[0].frameSeq]);
+      clock.t += 20;
+    }
+    // The first losses after the rise go late while the estimate doubles; then none do.
+    expect(late[0]).toBe(true);
+    expect(late.indexOf(false)).toBeLessThanOrEqual(7);
+    expect(late.slice(late.indexOf(false))).not.toContain(true);
+  });
 
-    // The path slows to 150 ms: the first loss after it cannot be saved.
-    const three = unitOf(3, false, 2000);
-    t = 10;
-    a.push(three[1]);
-    t = 22;
-    expect(a.push(unitOf(4, false)[0]).nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]);
-    t = 34;
-    expect(a.push(unitOf(5, false)[0]).needKeyframe).toBe(true);
-    t = 160; // its resend, after the frame was given up, still measures the path
-    a.push({ ...three[0], retransmit: true });
-    expect(a.rttMs).toBe(150);
+  it("does not double the estimate when, in a burst, the first resend is lost and the repeat's arrives", () => {
+    const { a, clock } = measured(20);
+    const lossy = unitOf(3, false, 2000);
+    clock.t = 100;
+    a.push(lossy[1]);
+    clock.t = 100 + 20 + RTT_SLACK_MS;
+    expect(a.tick().nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]); // the repeat
+    clock.t += 20; // the first resend was lost; the repeat's arrives one round trip later
+    expect(seqs(a.push({ ...lossy[0], retransmit: true }))).toEqual([3]);
+    expect(a.rttMs).toBe(20);
+  });
 
-    // The next loss waits for its resend instead of going late.
-    t = 170;
-    expect(seqs(a.push(unitOf(6, true)[0]))).toEqual([6]);
-    const seven = unitOf(7, false, 2000);
-    a.push(seven[1]);
-    t = 319;
-    expect(a.push(unitOf(8, false)[0])).toEqual(NONE);
-    t = 320;
-    expect(a.push({ ...seven[0], retransmit: true })).toEqual({ ...NONE, units: [expect.objectContaining({ frameSeq: 7 }), expect.objectContaining({ frameSeq: 8 })] });
-
-    // And repeats and lateness keep to it when the resend never comes.
-    const nine = unitOf(9, false, 2000);
-    t = 400;
-    a.push(nine[1]);
-    t = 400 + 150 + RTT_SLACK_MS - 1;
-    expect(a.tick().nacks).toEqual([]);
-    t += 1;
-    expect(a.tick().nacks).toEqual([{ frameSeq: 9, frags: [[0, 0]] }]);
-    t += 150 + RTT_SLACK_MS - 1;
-    expect(a.tick().needKeyframe).toBe(false);
-    t += 1;
-    expect(a.tick().needKeyframe).toBe(true);
+  it("moves the estimate by at most 2x on a single 2 s outlier, and starts no higher than the age limit", () => {
+    const { a, clock } = measured(20);
+    const lossy = unitOf(3, false, 2000);
+    clock.t = 100;
+    a.push(lossy[1]);
+    clock.t = 2_100;
+    a.push({ ...lossy[0], retransmit: true });
+    expect(a.rttMs).toBe(40);
+    expect(measured(2_000).a.rttMs).toBe(MAX_PENDING_AGE_MS);
   });
 
   it(`asks for a keyframe once per wait, and again only after ${KEY_REASK_MS} ms without one`, () => {

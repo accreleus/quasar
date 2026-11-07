@@ -22,7 +22,7 @@ const MAX_LATE_FRAMES = 256;
 const LATE_RUN_RESYNC = 32;
 /** While waiting for a keyframe, one request per wait, again after this long without it. */
 export const KEY_REASK_MS = 1_000;
-/** How long a first NACK is remembered for its round-trip sample. */
+/** How long a NACK is remembered for its round-trip sample. */
 const ASK_MEMORY_MS = 2_000;
 const MAX_ASKS_REMEMBERED = 4_096;
 /** §NACK: at most 32 ranges per message. */
@@ -78,9 +78,10 @@ const gap = (at: number): Pending => ({
  * of its missing fragments, its repeat NACK goes unanswered for another round trip, or no
  * fragment of it arrives for {@link MAX_PENDING_AGE_MS}. A late frame is dropped; if it was
  * not `discardable`, every frame is dropped until the next keyframe, and one is asked for.
- * The round trip is measured from each first NACK to its retransmission, even one that
- * arrives after its frame was given up, and a longer sample is taken at once: an estimate
- * too short turns every loss into a keyframe. Deadlines are checked on every datagram, every
+ * The round trip is measured from a fragment's latest NACK to its retransmission, even one
+ * that arrives after its frame was given up. A longer sample at most doubles the estimate
+ * and a shorter one is averaged in at 1/8, so one outlier, or a resend answering a repeat
+ * whose first resend was lost, cannot run it away. Deadlines are checked on every datagram, every
  * `nack_miss` and every {@link FrameAssembler.tick}.
  */
 export class FrameAssembler {
@@ -97,7 +98,7 @@ export class FrameAssembler {
   /** When this keyframe wait last asked for one; null when not waiting or not asked. */
   private keyAskedAt: number | null = null;
   private srtt: number | null = null;
-  /** First NACK time per `frameSeq * 65536 + fragIndex`, in time order. */
+  /** Latest NACK time per `frameSeq * 65536 + fragIndex`, in time order. */
   private asked = new Map<number, number>();
 
   constructor(private readonly now: () => number = () => performance.now()) {}
@@ -211,14 +212,16 @@ export class FrameAssembler {
     return { units, nacks, needKeyframe };
   }
 
-  /** A retransmission's round trip, from the first NACK for it. A repeat makes it longer
-   *  than the true one, which only delays the next repeat. */
+  /** A retransmission's round trip, from the latest NACK for it. After a repeat, a resend
+   *  answering the first NACK reads short, and is only averaged in. */
   private sample(key: number, at: number): void {
-    const first = this.asked.get(key);
-    if (first === undefined) return;
+    const asked = this.asked.get(key);
+    if (asked === undefined) return;
     this.asked.delete(key);
-    const rtt = at - first;
-    this.srtt = this.srtt === null || rtt > this.srtt ? rtt : (7 * this.srtt + rtt) / 8;
+    const rtt = Math.max(1, at - asked);
+    if (this.srtt === null) this.srtt = Math.min(rtt, MAX_PENDING_AGE_MS);
+    else if (rtt > this.srtt) this.srtt = Math.min(rtt, 2 * this.srtt);
+    else this.srtt = (7 * this.srtt + rtt) / 8;
   }
 
   /** The NACKs now due, and late marks for repeats that went unanswered. */
@@ -241,7 +244,9 @@ export class FrameAssembler {
         if (!due) continue;
         if (p.asks[i] >= 2) p.late = true;
         else if (addRange(frags, i)) {
-          if (p.asks[i] === 0) this.asked.set(seq * 65_536 + i, at);
+          // Re-inserted, so the map stays in time order for the prune above.
+          this.asked.delete(seq * 65_536 + i);
+          this.asked.set(seq * 65_536 + i, at);
           p.asks[i] += 1;
           p.askedAt[i] = at;
         }

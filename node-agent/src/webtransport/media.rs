@@ -281,10 +281,12 @@ impl Media {
                 }
             }
         }
-        st.want_key = false;
         let Ok(map) = buffer.map_readable() else {
+            // The client never gets this unit: the next one it is sent must not need it.
+            st.want_key = true;
             return;
         };
+        st.want_key = false;
         // Only a unit the client is sent takes a number: a skipped one would read as a
         // loss to NACK (§Loss recovery). A unit the full queue refuses gives it back.
         let frame_seq = st.frame_seq;

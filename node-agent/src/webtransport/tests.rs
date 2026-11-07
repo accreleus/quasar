@@ -453,6 +453,38 @@ async fn a_nacked_fragment_is_resent_one_past_the_window_is_a_miss_and_late_gets
 }
 
 #[tokio::test]
+async fn a_client_flooding_nacks_gets_only_its_budget_answered() {
+    let agent = agent().await;
+    let (_session, mut send, mut recv, _) = agent.hello(TOKEN).await;
+    // A frame the agent never held: every answered nack is one nack_miss.
+    let nack = json!({"type": "nack", "frame_seq": 40_000, "frags": [[0, 0]]});
+    const SENT: usize = 1000;
+    let started = std::time::Instant::now();
+    let write = async {
+        for _ in 0..SENT {
+            write_message(&mut send, &nack).await.unwrap();
+        }
+    };
+    let read = async {
+        let mut misses = 0;
+        while let Ok(Ok(m)) =
+            tokio::time::timeout(Duration::from_millis(500), read_message(&mut recv)).await
+        {
+            misses += usize::from(m["type"] == "nack_miss");
+        }
+        misses
+    };
+    let ((), misses) = tokio::join!(write, read);
+    // 100 at once, then 500 a second while the flood lasted.
+    let budget = 100 + (started.elapsed().as_secs_f64() * 500.0).ceil() as usize;
+    assert!(misses >= 100, "the burst is answered ({misses})");
+    assert!(
+        misses <= budget.min(SENT - 1),
+        "{misses} answered of {SENT}, budget {budget}"
+    );
+}
+
+#[tokio::test]
 async fn before_hello_the_agent_reads_one_stream_and_waits_five_seconds() {
     let agent = agent().await;
 
