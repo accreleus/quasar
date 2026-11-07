@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ControlDecoder, ControlProtocolError, encodeControl, parseVideoDatagram, serialAfter } from "./framing";
-import { FrameAssembler, MAX_PENDING, MAX_PENDING_AGE_MS } from "./reassembly";
+import { FrameAssembler, INITIAL_RTT_MS, MAX_PENDING, MAX_PENDING_AGE_MS, RTT_SLACK_MS } from "./reassembly";
 import {
   BACKLOG_MS,
   DecodeStage,
@@ -65,60 +65,117 @@ describe("framing", () => {
 // ── Reassembly ──────────────────────────────────────────────────────────────
 
 describe("FrameAssembler", () => {
+  const seqs = (r: { units: { frameSeq: number }[] }) => r.units.map((u) => u.frameSeq);
+  const NONE = { units: [], nacks: [], needKeyframe: false };
+
   it("rebuilds a unit from fragments in any order", () => {
     const data = bytes(3000, 3);
     const f = frags({ configId: 0, frameSeq: 9, keyframe: true, data });
     expect(f).toHaveLength(3);
     const a = new FrameAssembler(() => 0);
-    expect(a.push(f[2]).unit).toBeNull();
-    expect(a.push(f[0]).unit).toBeNull();
-    const { unit } = a.push(f[1]);
-    expect(unit?.frameSeq).toBe(9);
-    expect(Array.from(unit!.data)).toEqual(Array.from(data));
+    expect(a.push(f[2]).units).toEqual([]);
+    expect(a.push(f[0]).units).toEqual([]);
+    const { units } = a.push(f[1]);
+    expect(seqs({ units })).toEqual([9]);
+    expect(Array.from(units[0].data)).toEqual(Array.from(data));
   });
 
   it("carries on across the frame_seq wrap", () => {
     const a = new FrameAssembler(() => 0);
-    const done = [0xfffe, 0xffff, 0, 1].map((seq, i) => a.push(unitOf(seq, i === 0)[0]).unit?.frameSeq);
+    const done = [0xfffe, 0xffff, 0, 1].flatMap((seq, i) => seqs(a.push(unitOf(seq, i === 0)[0])));
     expect(done).toEqual([0xfffe, 0xffff, 0, 1]);
   });
 
-  it("asks for a keyframe once a referenced frame is lost, and drops deltas until it comes", () => {
-    const a = new FrameAssembler(() => 0);
-    expect(a.push(unitOf(1, true)[0]).unit?.frameSeq).toBe(1);
-    const lost = unitOf(2, false, 2000); // two fragments; only the first arrives
-    expect(a.push(lost[0]).unit).toBeNull();
-    expect(a.push(unitOf(3, false)[0])).toEqual({ unit: null, needKeyframe: true });
-    expect(a.push(unitOf(4, false)[0]).unit).toBeNull();
-    expect(a.push(lost[1]).unit).toBeNull(); // late: older than a completed frame
-    expect(a.push(unitOf(5, true)[0]).unit?.frameSeq).toBe(5);
-    expect(a.push(unitOf(6, false)[0]).unit?.frameSeq).toBe(6);
+  it("NACKs a missing fragment, holds later frames behind it, and releases them in order on the retransmission", () => {
+    let t = 0;
+    const a = new FrameAssembler(() => t);
+    expect(seqs(a.push(unitOf(1, true)[0]))).toEqual([1]);
+    const two = unitOf(2, false, 3000); // three fragments; the middle one is lost
+    a.push(two[0]);
+    expect(a.push(two[2])).toEqual({ ...NONE, nacks: [{ frameSeq: 2, frags: [[1, 1]] }] });
+    expect(a.push(unitOf(3, false)[0])).toEqual(NONE); // whole, but after the hole; asked once already
+    t = 20;
+    expect(seqs(a.push({ ...two[1], retransmit: true }))).toEqual([2, 3]);
+    expect(a.rttMs).toBe(20);
   });
 
-  it("loses a discardable frame without a keyframe", () => {
+  it("NACKs fragment 0 of a frame lost whole, then the rest once its count is known", () => {
+    const a = new FrameAssembler(() => 0);
+    a.push(unitOf(1, true)[0]);
+    const two = unitOf(2, false, 2500);
+    expect(a.push(unitOf(3, false)[0]).nacks).toEqual([{ frameSeq: 2, frags: [[0, 0]] }]);
+    const r = a.push({ ...two[0], retransmit: true });
+    expect(r.nacks).toEqual([{ frameSeq: 2, frags: [[1, 2]] }]);
+    a.push({ ...two[1], retransmit: true });
+    expect(seqs(a.push({ ...two[2], retransmit: true }))).toEqual([2, 3]);
+  });
+
+  it("repeats an unanswered NACK once after a round trip, then gives the frame up as late", () => {
+    let t = 0;
+    const a = new FrameAssembler(() => t);
+    a.push(unitOf(1, true)[0]);
+    const lost = unitOf(2, false, 2000); // two fragments; only the first arrives
+    a.push(lost[0]);
+    expect(a.push(unitOf(3, false)[0]).nacks).toEqual([{ frameSeq: 2, frags: [[1, 1]] }]);
+    t = INITIAL_RTT_MS + RTT_SLACK_MS - 1;
+    expect(a.push(unitOf(4, false)[0])).toEqual(NONE);
+    t += 1;
+    expect(a.push(unitOf(5, false)[0])).toEqual({ ...NONE, nacks: [{ frameSeq: 2, frags: [[1, 1]] }] });
+    t += INITIAL_RTT_MS + RTT_SLACK_MS;
+    expect(a.push(unitOf(6, false)[0])).toEqual({ ...NONE, needKeyframe: true });
+    expect(a.push(lost[1]).units).toEqual([]); // late: older than the frame given up
+    expect(a.push(unitOf(7, false)[0]).units).toEqual([]); // deltas wait for the keyframe
+    expect(seqs(a.push(unitOf(8, true)[0]))).toEqual([8]);
+    expect(seqs(a.push(unitOf(9, false)[0]))).toEqual([9]);
+  });
+
+  it("gives a frame up at once on a nack_miss for a fragment it lacks", () => {
+    const a = new FrameAssembler(() => 0);
+    a.push(unitOf(1, true)[0]);
+    const lost = unitOf(2, false, 2000);
+    a.push(lost[0]);
+    a.push(unitOf(3, false)[0]);
+    expect(a.miss(2, [[0, 0]])).toEqual(NONE); // fragment 0 arrived: not late
+    expect(a.miss(2, [[1, 1]])).toEqual({ ...NONE, needKeyframe: true });
+  });
+
+  it("loses a discardable frame without a keyframe, and releases the frames after it", () => {
     const a = new FrameAssembler(() => 0);
     a.push(unitOf(1, true)[0]);
     a.push(unitOf(2, false, 2000, { discardable: true })[0]);
-    expect(a.push(unitOf(3, false)[0]).unit?.frameSeq).toBe(3);
+    expect(seqs(a.push(unitOf(3, false)[0]))).toEqual([]);
+    expect(a.miss(2, [[1, 1]])).toEqual({ ...NONE, units: [expect.objectContaining({ frameSeq: 3 })] });
   });
 
-  it(`holds at most ${MAX_PENDING} incomplete frames, dropping the oldest as lost`, () => {
+  it("keeps a delta that completes behind a keyframe still arriving after a late frame", () => {
+    const a = new FrameAssembler(() => 0);
+    a.push(unitOf(1, true)[0]);
+    a.push(unitOf(2, false, 2000)[0]);
+    a.push(unitOf(3, false)[0]);
+    expect(a.miss(2, [[1, 1]]).needKeyframe).toBe(true);
+    const key = unitOf(4, true, 2000);
+    expect(a.push(key[0]).units).toEqual([]);
+    expect(a.push(unitOf(5, false)[0]).nacks).toEqual([{ frameSeq: 4, frags: [[1, 1]] }]);
+    expect(seqs(a.push(key[1]))).toEqual([4, 5]);
+  });
+
+  it(`holds at most ${MAX_PENDING} frames, dropping the oldest as lost`, () => {
     const a = new FrameAssembler(() => 0);
     a.push(unitOf(0, true)[0]);
     const halves = Array.from({ length: MAX_PENDING + 1 }, (_, i) => unitOf(1 + i, false, 2000));
     const verdicts = halves.map((h) => a.push(h[0]));
     expect(verdicts.slice(0, MAX_PENDING).every((v) => !v.needKeyframe)).toBe(true);
     expect(verdicts[MAX_PENDING].needKeyframe).toBe(true);
-    expect(a.push(halves[0][1]).unit).toBeNull(); // the oldest is gone: its second half completes nothing
+    expect(a.push(halves[0][1]).units).toEqual([]); // the oldest is gone: its second half completes nothing
   });
 
   it("refuses a frag_count no unit within the byte budget needs, without holding it", () => {
     const a = new FrameAssembler(() => 0);
     const [first] = unitOf(1, true, 2000);
     // Not discardable: the frame it claims is lost, so a keyframe is asked for.
-    expect(a.push({ ...first, fragCount: 60_000 })).toEqual({ unit: null, needKeyframe: true });
+    expect(a.push({ ...first, fragCount: 60_000 })).toEqual({ ...NONE, needKeyframe: true });
     // Held, the forgery's count would disagree with the real frame 1 and drop it.
-    expect(a.push(unitOf(1, true)[0]).unit?.frameSeq).toBe(1);
+    expect(seqs(a.push(unitOf(1, true)[0]))).toEqual([1]);
   });
 
   it("drops a frame whose fragments disagree on its header", () => {
@@ -126,44 +183,44 @@ describe("FrameAssembler", () => {
     a.push(unitOf(1, true)[0]);
     const [p0, p1] = unitOf(2, false, 2000);
     a.push(p0);
-    expect(a.push({ ...p1, ts90k: p1.ts90k + 1 })).toEqual({ unit: null, needKeyframe: true });
-    expect(a.push(p1).unit).toBeNull(); // nothing of frame 2 is left to complete
+    expect(a.push({ ...p1, ts90k: p1.ts90k + 1 })).toEqual({ ...NONE, needKeyframe: true });
+    expect(a.push(p1).units).toEqual([]); // nothing of frame 2 is left to complete
   });
 
-  it(`loses an incomplete frame after ${MAX_PENDING_AGE_MS} ms`, () => {
+  it(`gives up an incomplete frame after ${MAX_PENDING_AGE_MS} ms with no fragment`, () => {
     let t = 0;
     const a = new FrameAssembler(() => t);
     a.push(unitOf(1, true)[0]);
     const [p0, p1] = unitOf(2, false, 2000);
     a.push(p0);
     t = MAX_PENDING_AGE_MS + 1;
-    expect(a.push(p1)).toEqual({ unit: null, needKeyframe: true }); // frame 2 expired; this half starts it anew
+    expect(a.push(p1)).toEqual({ ...NONE, needKeyframe: true }); // frame 2 expired; this half starts it anew
   });
 
   it("keeps a large frame whose fragments keep arriving, however long it takes", () => {
     let t = 0;
     const a = new FrameAssembler(() => t);
     const f = unitOf(1, true, 3000); // three fragments, 400 ms apart
-    expect(a.push(f[0]).unit).toBeNull();
+    expect(a.push(f[0]).units).toEqual([]);
     t = 400;
-    expect(a.push(f[1]).unit).toBeNull();
+    expect(a.push(f[1]).units).toEqual([]);
     t = 800;
-    expect(a.push(f[2]).unit?.frameSeq).toBe(1);
+    expect(seqs(a.push(f[2]))).toEqual([1]);
   });
 
   it("resyncs on a frame_seq jump instead of dropping everything as late", () => {
     const a = new FrameAssembler(() => 0);
     a.push(unitOf(10, true)[0]);
     // 40000 is 25546 behind 10 in serial arithmetic: no fragment is that late.
-    expect(a.push(unitOf(40_000, true)[0]).unit?.frameSeq).toBe(40_000);
-    expect(a.push(unitOf(40_001, false)[0]).unit?.frameSeq).toBe(40_001);
+    expect(seqs(a.push(unitOf(40_000, true)[0]))).toEqual([40_000]);
+    expect(seqs(a.push(unitOf(40_001, false)[0]))).toEqual([40_001]);
   });
 
   it("resyncs on a keyframe after a long run of late fragments", () => {
     const a = new FrameAssembler(() => 0);
     a.push(unitOf(100, true)[0]);
-    for (let i = 0; i < 40; i++) expect(a.push(unitOf(90, false)[0]).unit).toBeNull();
-    expect(a.push(unitOf(95, true)[0]).unit?.frameSeq).toBe(95);
+    for (let i = 0; i < 40; i++) expect(a.push(unitOf(90, false)[0]).units).toEqual([]);
+    expect(seqs(a.push(unitOf(95, true)[0]))).toEqual([95]);
   });
 });
 

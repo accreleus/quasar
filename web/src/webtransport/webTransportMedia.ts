@@ -1,6 +1,6 @@
 // MediaTransport over WebTransport: protocol/transport-webtransport.md, wt_proto 1,
-// video only. Input, ping/pong, audio, NACK and feedback are later tickets (#1032,
-// #1033, #1039, #1040).
+// video only. Input, ping/pong, audio and feedback are later tickets (#1032,
+// #1033, #1040).
 
 import {
   base64Bytes,
@@ -10,7 +10,7 @@ import {
   parseVideoDatagram,
 } from "./framing";
 import type { WebTransportCoords } from "../api/types";
-import { FrameAssembler } from "./reassembly";
+import { FrameAssembler, type Reassembled } from "./reassembly";
 import {
   TransportError,
   type KeyframeReason,
@@ -271,7 +271,8 @@ export class WebTransportMedia implements MediaTransport {
     };
 
     // Datagrams can overtake the hello_ack; the decode stage holds them by config_id.
-    void this.readDatagrams(wt, sink, live).catch(() => {});
+    const assembler = new FrameAssembler(this.now);
+    void this.readDatagrams(wt, sink, live, assembler).catch(() => {});
     let first: Record<string, unknown> | null;
     try {
       first = await Promise.race([next(), after(ANSWER_TIMEOUT_MS, null)]);
@@ -308,6 +309,9 @@ export class WebTransportMedia implements MediaTransport {
         for (let m = await next(); m && live.on; m = await next()) {
           // Unknown types are ignored (§Channels). bye is followed by the close.
           if (m.type === "hello_ack") sink.config(videoConfigFrom(m));
+          else if (m.type === "nack_miss" && typeof m.frame_seq === "number" && Array.isArray(m.frags)) {
+            this.recovered(assembler.miss(m.frame_seq, m.frags as [number, number][]), sink);
+          }
         }
       } catch (err) {
         // A malformed stream, or a re-sent hello_ack this page cannot use: the connection is over.
@@ -321,17 +325,26 @@ export class WebTransportMedia implements MediaTransport {
     return { kind: "ack" };
   }
 
-  private async readDatagrams(wt: WebTransport, sink: MediaSink, live: { on: boolean }): Promise<void> {
+  private async readDatagrams(
+    wt: WebTransport,
+    sink: MediaSink,
+    live: { on: boolean },
+    assembler: FrameAssembler,
+  ): Promise<void> {
     const reader = wt.datagrams.readable.getReader();
-    const assembler = new FrameAssembler(this.now);
     for (;;) {
       const { value, done } = await reader.read();
       if (done || !live.on) return;
       const frag = parseVideoDatagram(value as Uint8Array);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
-      const { unit, needKeyframe } = assembler.push(frag);
-      if (needKeyframe) this.requestKeyframe("loss");
-      if (unit) sink.unit(unit);
+      this.recovered(assembler.push(frag), sink);
     }
+  }
+
+  /** §Loss recovery: NACKs out, a keyframe asked for a late frame, whole units to the sink. */
+  private recovered({ units, nacks, needKeyframe }: Reassembled, sink: MediaSink): void {
+    for (const n of nacks) this.send({ type: "nack", frame_seq: n.frameSeq, frags: n.frags });
+    if (needKeyframe) this.requestKeyframe("late");
+    for (const u of units) sink.unit(u);
   }
 }

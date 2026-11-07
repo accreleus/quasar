@@ -394,6 +394,64 @@ async fn a_browser_like_client_gets_h264_access_units_after_its_token() {
     assert_eq!(close_code(&reused).await, Some(CLOSE_AUTH));
 }
 
+/// The next video datagram, as (frame_seq, frag_index, frag_count, datagram).
+async fn datagram(session: &Session) -> (u16, u16, u16, Bytes) {
+    let d = tokio::time::timeout(Duration::from_secs(10), session.read_datagram())
+        .await
+        .expect("video stalled")
+        .unwrap();
+    let at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]);
+    (at(7), at(9), at(11), d)
+}
+
+#[tokio::test]
+async fn a_nacked_fragment_is_resent_one_past_the_window_is_a_miss_and_late_gets_a_keyframe() {
+    let agent = agent().await;
+    let (session, mut send, mut recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["retransmit_window_ms"], 250);
+
+    let (frame_seq, _, _, original) = datagram(&session).await;
+    let index = u16::from_le_bytes([original[9], original[10]]);
+    let nack = json!({"type": "nack", "frame_seq": frame_seq, "frags": [[index, index]]});
+    write_message(&mut send, &nack).await.unwrap();
+    let mut resent = None;
+    for _ in 0..1000 {
+        let (_, _, _, d) = datagram(&session).await;
+        if d[5] & 4 != 0 {
+            resent = Some(d);
+            break;
+        }
+    }
+    let resent = resent.expect("no retransmission within 1000 datagrams");
+    assert_eq!(resent[6..], original[6..], "same header and payload");
+    assert_eq!(resent[5], original[5] | 4, "flags plus retransmit");
+    let seq = |d: &Bytes| u32::from_le_bytes(d[1..5].try_into().unwrap());
+    let ahead = seq(&resent).wrapping_sub(seq(&original));
+    assert!(ahead > 0 && ahead < 1 << 31, "a new pkt_seq");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    write_message(&mut send, &nack).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), read_message(&mut recv))
+            .await
+            .expect("no nack_miss")
+            .unwrap(),
+        json!({"type": "nack_miss", "frame_seq": frame_seq, "frags": [[index, index]]}),
+        "past the 250 ms window the agent no longer holds it"
+    );
+
+    write_message(
+        &mut send,
+        &json!({"type": "keyframe_request", "reason": "late"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        frames(&session, 15, false).await.iter().any(|f| f.keyframe),
+        "a late frame's keyframe request is answered"
+    );
+}
+
 #[tokio::test]
 async fn before_hello_the_agent_reads_one_stream_and_waits_five_seconds() {
     let agent = agent().await;

@@ -4,11 +4,12 @@
 //! then gets the session's video as datagrams.
 //!
 //! Not here yet, each a later ticket: audio, microphone and input datagrams, ping and
-//! pong, NACK and its retransmit buffer, FEC, receiver feedback and congestion control,
-//! and takeover across transports (a new client replaces the last one; nothing bounds it).
+//! pong, FEC, receiver feedback and congestion control, and takeover across transports
+//! (a new client replaces the last one; nothing bounds it).
 
 mod cert;
 mod media;
+mod retransmit;
 #[cfg(test)]
 mod tests;
 
@@ -699,7 +700,31 @@ fn hello_ack(config: &media::VideoConfig) -> Value {
         "audio": null,
         "mic": null,
         "fec": null,
+        "retransmit_window_ms": retransmit::WINDOW.as_millis() as u64,
     })
+}
+
+/// A `nack`'s `frame_seq` and its first 32 `frags` ranges; `None` when malformed.
+fn nack_of(message: &Value) -> Option<(u16, Vec<[u16; 2]>)> {
+    let frame_seq = u16::try_from(message.get("frame_seq")?.as_u64()?).ok()?;
+    let ranges = message
+        .get("frags")?
+        .as_array()?
+        .iter()
+        .take(32)
+        .filter_map(|r| {
+            let r = r.as_array()?;
+            let at = |i: usize| u16::try_from(r.get(i)?.as_u64()?).ok();
+            Some([at(0)?, at(1)?])
+        })
+        .collect();
+    Some((frame_seq, ranges))
+}
+
+/// How long sent video is held for a `nack`: [`retransmit::WINDOW`], or twice the
+/// smoothed RTT when that is longer (§Loss recovery).
+fn retransmit_window(session: &Session) -> Duration {
+    retransmit::WINDOW.max(quinn::Connection::rtt(session) * 2)
 }
 
 /// Hand over the first bidirectional stream as the control stream and refuse every
@@ -908,6 +933,7 @@ async fn stream(
         }
     });
     let mut pkt_seq = 0u32;
+    let mut sent = retransmit::Retransmit::default();
     let mut warned_oversized = false;
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
@@ -929,6 +955,8 @@ async fn stream(
                     if datagrams.is_empty() {
                         media.keyframe();
                     }
+                    let now = std::time::Instant::now();
+                    sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
                     if datagrams.into_iter().try_for_each(|d| session.send_datagram(d)).is_err() {
                         break QUIET;
                     }
@@ -948,6 +976,25 @@ async fn stream(
             message = control_rx.recv() => match message {
                 Some(Ok(message)) => match message.get("type").and_then(Value::as_str) {
                     Some("keyframe_request") => media.keyframe(),
+                    Some("nack") => {
+                        let answer = nack_of(&message).map(|(frame_seq, ranges)| {
+                            let window = retransmit_window(session);
+                            let now = std::time::Instant::now();
+                            (frame_seq, sent.answer(frame_seq, &ranges, &mut pkt_seq, now, window))
+                        });
+                        if let Some((frame_seq, answer)) = answer {
+                            if answer.resend.into_iter().try_for_each(|d| session.send_datagram(d)).is_err() {
+                                break QUIET;
+                            }
+                            if !answer.missed.is_empty() {
+                                let miss = json!({"type": "nack_miss", "frame_seq": frame_seq, "frags": answer.missed});
+                                let write = write_message(&mut send, &miss);
+                                if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
+                                    break QUIET;
+                                }
+                            }
+                        }
+                    }
                     Some("bye") => break QUIET,
                     _ => {}
                 },
