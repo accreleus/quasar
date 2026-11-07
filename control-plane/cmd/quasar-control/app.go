@@ -17,6 +17,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
+	"github.com/accreleus/quasar/control-plane/internal/compat"
 	"github.com/accreleus/quasar/control-plane/internal/config"
 	"github.com/accreleus/quasar/control-plane/internal/console"
 	"github.com/accreleus/quasar/control-plane/internal/crud"
@@ -82,6 +83,7 @@ type Services struct {
 	cfgHandler      *hostcfg.Handler
 	settingsHandler *settings.Handler
 	invitesHandler  *invites.Handler
+	compatHandler   *compat.Handler
 	enrollHandler   *hostenroll.Handler
 	consoleHandler  *console.Handler
 	platformHandler *platform.Handler
@@ -652,6 +654,13 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	settingsHandler := settings.NewHandler(settingsStore, auditStore)
 	settingsHandler.OnAllowedOriginsChanged = originResolver.Invalidate
 	invitesHandler := invites.NewHandler(invites.NewStore(pool), cfg.PublicBaseURL, auditStore)
+	compatStore := compat.NewStore(pool)
+	compatCtx, compatCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := compatStore.Reconcile(compatCtx); err != nil {
+		log.Error("compat tools: reconciling the catalogue failed", "err", err)
+	}
+	compatCancel()
+	compatHandler := compat.NewHandler(compatStore, auditStore)
 	enrollHandler := hostenroll.NewHandler(hostenroll.NewStore(pool), auditStore)
 	consoleHandler := console.NewHandler(consoleStore, agentRegistry, auditStore)
 	auditHandler := audit.NewHandler(auditStore)
@@ -1390,6 +1399,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		cfgHandler:       cfgHandler,
 		settingsHandler:  settingsHandler,
 		invitesHandler:   invitesHandler,
+		compatHandler:    compatHandler,
 		enrollHandler:    enrollHandler,
 		consoleHandler:   consoleHandler,
 		platformHandler:  platformHandler,
@@ -1438,6 +1448,7 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	}
 	s.settingsHandler.Register(mux, admin)
 	s.invitesHandler.Register(mux, admin)
+	s.compatHandler.Register(mux, admin)
 	s.enrollHandler.Register(mux, admin)
 	s.consoleHandler.Register(mux, admin)
 	s.platformHandler.Register(mux, admin)

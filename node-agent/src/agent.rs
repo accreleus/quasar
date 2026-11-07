@@ -1697,6 +1697,9 @@ fn register_message(
             &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)))),
         terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
         parked_sessions_v1: crate::session::launch_helper::installed().then_some(true),
+        // shortcut: advertised unconditionally, with no tools directory or install runner yet, so no
+        // GE tool is mounted; C07/C08 (#1071) must gate it on a usable tools directory.
+        compat_tools_v1: Some(true),
         node_name: cfg.node_name.clone(),
         agent_version: crate::buildinfo::version().to_string(),
         auth: choose_auth(cfg, prefer_enrollment_token)?,
@@ -3859,13 +3862,14 @@ impl SessionManager {
                 gpu_index,
                 kind,
                 adopt_session_id,
-                app,
+                mut app,
                 stream,
                 resources,
                 video_topology,
                 transport,
                 wt_token_hash,
                 wt_token_expires_at,
+                compat_tools,
             } => {
                 if kind == Some(SessionKind::Unknown) {
                     warn!(
@@ -3934,6 +3938,7 @@ impl SessionManager {
                 if let Some(handle) = &self.probe_handle {
                     handle.launch_arrived(gpu_index);
                 }
+                crate::compat_tools::apply_assign(&mut app.env, compat_tools.as_ref());
                 let container = match app_to_container(app, &self.mount_policy()) {
                     Ok(c) => c,
                     Err(error) => {
