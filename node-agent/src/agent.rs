@@ -1697,9 +1697,8 @@ fn register_message(
             &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)))),
         terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
         parked_sessions_v1: crate::session::launch_helper::installed().then_some(true),
-        // shortcut: advertised unconditionally, with no tools directory or install runner yet, so no
-        // GE tool is mounted; C07/C08 (#1071) must gate it on a usable tools directory.
-        compat_tools_v1: Some(true),
+        // The runner, `capacity.compat_tools` and the mounts all need the usable tools directory.
+        compat_tools_v1: crate::compat_tools::supported().then_some(true),
         node_name: cfg.node_name.clone(),
         agent_version: crate::buildinfo::version().to_string(),
         auth: choose_auth(cfg, prefer_enrollment_token)?,
@@ -1975,6 +1974,7 @@ fn diagnostic_observe() -> (AgentMsg, Vec<crate::messages::ReadinessCheck>) {
     (
         AgentMsg::Capacity {
             transports: crate::webtransport::capacity(),
+            compat_tools: crate::compat_tools::capacity(),
             source_preparation: None,
             deployment_settings: None,
             config_policy_accepted_groups: None,
@@ -2302,6 +2302,7 @@ async fn connect_and_run(
     apply_gpu_codecs(&mut cap.gpus, &first_gpu_codec_sets);
     let capacity_msg = AgentMsg::Capacity {
         transports: crate::webtransport::capacity(),
+        compat_tools: crate::compat_tools::capacity(),
         source_preparation: None,
         deployment_settings: Some(sessions.mgr.deployment_baseline.deployment_map()),
         config_policy_accepted_groups: sessions.mgr.policy_accepted_groups.clone(),
@@ -2475,6 +2476,9 @@ async fn connect_and_run(
             registry.register(std::sync::Arc::new(
                 crate::session::gc::HomeGcJobRunner::new(cp.clone(), live_refs.clone()),
             ));
+            if let Some(runner) = crate::compat_tools::runner() {
+                registry.register(Arc::new(runner));
+            }
             crate::jobs::spawn_job_poller(cp, std::sync::Arc::new(registry))
         }
         None => {
@@ -2701,6 +2705,7 @@ async fn connect_and_run(
                             apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                             let capacity_msg = AgentMsg::Capacity {
             transports: crate::webtransport::capacity(),
+            compat_tools: crate::compat_tools::capacity(),
             deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
             config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
             config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
@@ -2760,6 +2765,7 @@ async fn connect_and_run(
                     apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                     let capacity_msg = AgentMsg::Capacity {
             transports: crate::webtransport::capacity(),
+            compat_tools: crate::compat_tools::capacity(),
             deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
             config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
             config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
@@ -2777,6 +2783,10 @@ async fn connect_and_run(
                     };
                     send(&mut tx, &capacity_msg).await?;
                 }
+            }
+            _ = crate::compat_tools::changed().notified() => {
+                info!("compat tools changed; re-sending capacity");
+                send_fresh_capacity(&mut tx, &mut *mgr).await?;
             }
             changed = recv_or_disabled(&mut console_access_rx) => {
                 if changed.is_none() {
@@ -3938,9 +3948,13 @@ impl SessionManager {
                 if let Some(handle) = &self.probe_handle {
                     handle.launch_arrived(gpu_index);
                 }
-                crate::compat_tools::apply_assign(&mut app.env, compat_tools.as_ref());
+                let compat_mounts =
+                    crate::compat_tools::apply_assign(&mut app.env, compat_tools.as_ref());
                 let container = match app_to_container(app, &self.mount_policy()) {
-                    Ok(c) => c,
+                    Ok(c) => c.map(|mut c| {
+                        c.compat_tools = compat_mounts;
+                        c
+                    }),
                     Err(error) => {
                         warn!(
                             token = "session-assign-rejected",
@@ -4136,6 +4150,14 @@ impl SessionManager {
                     ));
                     let home_refs = Self::home_refs_of(&cfg);
                     self.add_live_refs(&home_refs);
+                    crate::compat_tools::hold(
+                        &session_id,
+                        cfg.container
+                            .as_ref()
+                            .map(|c| c.compat_tools.clone())
+                            .unwrap_or_default(),
+                        kind == Some(SessionKind::Parked),
+                    );
                     let video_topology = cfg.video_topology;
                     let codec = cfg.stream.codec;
                     // Snapshotted before `cfg` moves into the runner thread, because the
@@ -5087,6 +5109,7 @@ impl SessionManager {
             );
             if let Some(mut h) = self.running.remove(&sid) {
                 self.remove_live_refs(&h.home_refs);
+                crate::compat_tools::release(&sid);
                 if let Some(t) = h.thread.take() {
                     let _ = t.join();
                 }
@@ -5215,6 +5238,7 @@ impl SessionManager {
         let Some(mut h) = self.running.remove(from) else {
             return Adoption::Fresh { after: None };
         };
+        crate::compat_tools::adopt(from, session_id, cfg.kind == Some(SessionKind::Parked));
         h.metrics.drain_window(Instant::now());
         h.held = None;
         h.swapping = false;
@@ -5395,6 +5419,7 @@ impl SessionManager {
         if let Some(h) = self.running.remove(session_id) {
             self.labels.remove(&h.runtime_id);
             self.remove_live_refs(&h.home_refs);
+            crate::compat_tools::release(session_id);
             self.health.set_sessions(self.running.len());
             self.note_session_count();
             // The teardown-side RSS sample, plus the `QUASAR_MALLOC_TRIM` discriminator:
@@ -5701,6 +5726,7 @@ fn app_to_container(app: AppSpec, mounts: &MountPolicy) -> anyhow::Result<Option
         systempaths_unconfined: app.systempaths_unconfined,
         require_local_image: false,
         direct_display: app.direct_display,
+        compat_tools: Vec::new(),
     }))
 }
 
@@ -6414,6 +6440,7 @@ where
     apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
     let msg = AgentMsg::Capacity {
         transports: crate::webtransport::capacity(),
+        compat_tools: crate::compat_tools::capacity(),
         source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
         deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
         config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
@@ -8559,6 +8586,7 @@ mod tests {
         );
         let json = serde_json::to_value(AgentMsg::Capacity {
             transports: crate::webtransport::capacity(),
+            compat_tools: crate::compat_tools::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
             config_policy_legacy_map_applied_id: None,

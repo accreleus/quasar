@@ -221,6 +221,10 @@ pub enum AgentMsg {
         /// Amendment 54: `transports` and `webtransport`, replaced wholesale on every report.
         #[serde(flatten)]
         transports: crate::webtransport::Transports,
+        /// Amendment 56: the tools in the install record and the free space; only when
+        /// `compat_tools_v1` was advertised.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compat_tools: Option<serde_json::Value>,
     },
     Heartbeat {
         running_sessions: Vec<String>,
@@ -1669,6 +1673,7 @@ mod tests {
     #[test]
     fn capacity_json_omits_absent_additive_fields() {
         let msg = AgentMsg::Capacity {
+            compat_tools: None,
             transports: crate::webtransport::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
@@ -1721,6 +1726,7 @@ mod tests {
     #[test]
     fn capacity_json_includes_present_additive_fields() {
         let msg = AgentMsg::Capacity {
+            compat_tools: None,
             transports: crate::webtransport::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
