@@ -10,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/outbound"
 )
 
 // DefaultMaxImageBytes caps a single fetched or uploaded image. Box art and
@@ -215,47 +217,6 @@ func unwrapBlocked(err error) error {
 	return err
 }
 
-// isPublicIP reports whether ip is a globally routable unicast address.
-//
-// Deny-by-category, not by a list of "bad" addresses: the interesting targets
-// on a self-hosted box are the container network (172.16/12), the host
-// (127.0.0.1), the LAN (192.168/16, 10/8) and the cloud metadata service
-// (169.254.169.254), and all four fall out of these rules. IPv6 mapped-v4 is
-// unwrapped first so ::ffff:127.0.0.1 cannot slip past the v4 rules.
-func isPublicIP(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	if v4 := ip.To4(); v4 != nil {
-		ip = v4
-	}
-	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsPrivate() {
-		return false
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		switch {
-		case ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127: // 100.64/10 CGNAT
-			return false
-		case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0: // 192.0.0/24 IETF protocol assignments
-			return false
-		case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2: // TEST-NET-1
-			return false
-		case ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19): // benchmarking
-			return false
-		case ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100: // TEST-NET-2
-			return false
-		case ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113: // TEST-NET-3
-			return false
-		case ip4[0] >= 240: // reserved / broadcast
-			return false
-		}
-		return true
-	}
-	// IPv6: unique-local (fc00::/7) is the v6 analogue of RFC1918.
-	if len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc {
-		return false
-	}
-	return true
-}
+// isPublicIP reports whether ip is a globally routable unicast address; the
+// rule lives in outbound so every guarded fetch agrees on it.
+func isPublicIP(ip net.IP) bool { return !outbound.DisallowedIP(ip) }
