@@ -6,6 +6,7 @@ package session
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -59,9 +60,12 @@ func TestMigration0114UpAndDown(t *testing.T) {
 	must(t, exec(t, pool, `UPDATE launch_profiles SET pyrowave_mode = 'prefer', pyrowave_kbps = 300000`))
 
 	must(t, exec(t, pool, `UPDATE sessions SET pyrowave = '{"allowed": true}' WHERE id = $1::uuid`, sessionID))
-	if err := m.Migrate(113); err == nil {
-		t.Fatal("the down ran under a live session granted PyroWave")
+	if err := m.Migrate(113); err == nil || !strings.Contains(err.Error(), "granted PyroWave is still live") {
+		t.Fatalf("down under a live session granted PyroWave: err = %v, want the refusal", err)
 	}
+	// A failed migration keeps its lock on this instance: a fresh one forces the version.
+	_, _ = m.Close()
+	m = newMigrator(t, url)
 	must(t, m.Force(114))
 	must(t, exec(t, pool, `UPDATE sessions SET state = 'stopped', ended_at = now() WHERE id = $1::uuid`, sessionID))
 	migrateTo(t, m, 113)
