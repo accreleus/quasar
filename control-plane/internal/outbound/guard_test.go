@@ -32,28 +32,30 @@ func TestGuardedDialRefusesNonPublicIP(t *testing.T) {
 func TestDisallowedIP(t *testing.T) {
 	disallowed := []string{"127.0.0.1", "::1", "10.1.2.3", "172.16.0.1", "192.168.9.9", "169.254.0.1", "224.0.0.1", "0.0.0.0",
 		"100.64.0.1", "100.127.255.254", // CGNAT
-		"64:ff9b::a00:1", "64:ff9b:1::1", // NAT64
+		"64:ff9b:1::1", // NAT64 local-use
 		"192.0.0.9", "198.18.0.1", "198.19.255.255", "240.0.0.1", "255.255.255.255",
 		"192.0.2.1", "198.51.100.1", "203.0.113.1", "2001:db8::1", "3fff::1",
 		"2002:c000:204::1", "2001::1", // 6to4, Teredo
 		"fc00::1", "fe80::1", "ff02::1", "::", "100::1",
+		"fec0::1", "4000::1", "::ffff:0:a00:1", "5f00::1", // outside 2000::/3, incl. SIIT 10.0.0.1
+		"64:ff9b::a00:1", "64:ff9b::7f00:1", "64:ff9b::6440:1", // DNS64 of 10.0.0.1, 127.0.0.1, 100.64.0.1
 		"::ffff:10.1.2.3", "::ffff:100.64.0.1", "::ffff:127.0.0.1", // IPv4-mapped
 	}
 	for _, s := range disallowed {
-		if !disallowedIP(net.ParseIP(s)) {
-			t.Errorf("disallowedIP(%s) = false, want true", s)
+		if !DisallowedIP(net.ParseIP(s)) {
+			t.Errorf("DisallowedIP(%s) = false, want true", s)
 		}
 	}
-	for _, s := range []string{"8.8.8.8", "1.1.1.1", "140.82.112.3", "100.63.255.255", "100.128.0.1", "2606:4700::1111", "::ffff:8.8.8.8"} {
-		if disallowedIP(net.ParseIP(s)) {
-			t.Errorf("disallowedIP(%s) = true, want false", s)
+	for _, s := range []string{"8.8.8.8", "1.1.1.1", "140.82.112.3", "100.63.255.255", "100.128.0.1", "2606:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808", "2001:4860:4860::8888"} {
+		if DisallowedIP(net.ParseIP(s)) {
+			t.Errorf("DisallowedIP(%s) = true, want false", s)
 		}
 	}
 }
 
 func TestDisallowedIPRefusesNil(t *testing.T) {
-	if !disallowedIP(nil) {
-		t.Error("disallowedIP(nil) = false, want true")
+	if !DisallowedIP(nil) {
+		t.Error("DisallowedIP(nil) = false, want true")
 	}
 }
 
