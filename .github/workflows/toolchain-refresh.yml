@@ -1,0 +1,108 @@
+name: Toolchain refresh
+
+# Publishes quasar-gst-toolchain:<hash> when its tag is missing, and nothing else (#1092).
+#
+# The tag hashes the base image's digest (deploy/toolchain-hash.sh), and the Images workflow
+# publishes the toolchain only on a push to develop. So when quasar-base:latest is rebuilt in
+# quasar-images, no image exists under the new tag until the next landing, and the nightly live
+# job (agent-live.yml) fails until then (#1088: six red nights). This runs ahead of that job
+# and closes the gap.
+#
+# WHAT IT CANNOT DO, by construction: it has no promote or preview job, no registry write
+# beyond the toolchain tag, and no agent or app image. The preview tag still moves only on a
+# push to develop (images.yml).
+#
+# A SCHEDULE RUNS THE DEFAULT BRANCH'S COPY OF THIS FILE (main), at main's commit, which is
+# not develop. So the workflow only fires once it is on main, and every job checks out
+# `develop` by name: the pins, patches and Dockerfile it hashes and builds are develop's, the
+# same ones agent-live's nightly checks out. A manual dispatch does the same, whatever ref it
+# is started on.
+#
+# "Build only when missing": scripts/release/toolchain-missing.sh. A registry that cannot be
+# read fails the run; it never reads as "missing, so build" (a 40-minute cost).
+on:
+  schedule:
+    - cron: '17 1 * * *'   # three hours ahead of agent-live's 04:23, for a cold build
+  workflow_dispatch:
+
+# Never cancelled: a half-done 40-minute build helps no one. A second run waits and then finds the tag.
+concurrency:
+  group: toolchain-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY_NS: ghcr.io/${{ github.repository }}
+
+jobs:
+  check:
+    name: is the toolchain for develop's pins published?
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.missing.outputs.build }}
+      image: ${{ steps.missing.outputs.image }}
+      base_ref: ${{ steps.missing.outputs.base_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: develop
+          persist-credentials: false
+      # No registry login: the base and toolchain packages are public, as in agent-live.
+      - name: Work out the tag and whether it is published
+        id: missing
+        run: |
+          set -euo pipefail
+          bash deploy/toolchain-hash.sh --explain
+          bash scripts/release/toolchain-missing.sh | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: build and publish the toolchain
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        with:
+          ref: develop
+          persist-credentials: false
+      - name: Stamp the build time
+        id: stamp
+        run: echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Keep in step with images.yml's toolchain job: same target, same build args, same cache.
+      - name: Build and publish the toolchain
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile.vulkan
+          target: toolchain
+          push: true
+          tags: ${{ needs.check.outputs.image }}
+          provenance: false
+          sbom: false
+          build-args: |
+            QUASAR_BASE_IMAGE=${{ needs.check.outputs.base_ref }}
+            SOURCE_COMMIT=${{ steps.checkout.outputs.commit }}
+            BUILT_AT=${{ steps.stamp.outputs.built_at }}
+          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain-cache:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain-cache:buildcache,mode=max
