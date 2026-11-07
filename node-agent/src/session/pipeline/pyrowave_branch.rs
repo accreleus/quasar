@@ -8,7 +8,8 @@
 //!   fails the merge and clears its metas, an empty one intersects them away, and two pads add
 //!   a buffer to the minimum), so a branch cannot leave the encoder's negotiation untouched.
 //! - At most one compositor frame is held for PyroWave: the probe admits none while one is
-//!   between it and the end of its download (the 2-slot ring when HEVC is on).
+//!   anywhere in the PyroWave pipeline, up to the encoder's output (the 2-slot ring when HEVC
+//!   is on), and a client's detach flushes what that pipeline holds.
 //! - Download, convert and `pyrowaveenc` run in a pipeline of their own, started off the
 //!   encode thread with the encode pipeline's GPU contexts; its errors switch PyroWave off.
 //!
@@ -16,7 +17,7 @@
 //! Vulkan input is #1104.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer as gst;
@@ -83,6 +84,9 @@ pub(crate) struct Encoder {
     pub(crate) pipeline: gst::Pipeline,
     pad: gst::Pad,
     probe: Option<gst::PadProbeId>,
+    /// Set under its lock with the stop; the start thread reads it under the same lock, so a
+    /// start cannot land after the stop.
+    stopped: Arc<Mutex<bool>>,
 }
 
 impl Drop for Encoder {
@@ -90,6 +94,8 @@ impl Drop for Encoder {
         if let Some(probe) = self.probe.take() {
             self.pad.remove_probe(probe);
         }
+        let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        *stopped = true;
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
@@ -181,21 +187,15 @@ fn start_with(
     pipeline.add_many(chain.iter().copied())?;
     gst::Element::link_many(chain.iter().copied())?;
 
-    // The compositor frame is released once its download is done (or, in system memory,
-    // once converted): the next one may be admitted.
+    // The next frame is admitted once this one is encoded: until then it, or its copy, is
+    // still in this pipeline, and admitting another would leave it waiting in appsrc on a
+    // compositor buffer. A frame that never comes out goes stale (IN_FLIGHT_STALE).
     let in_flight = Arc::new(InFlight::default());
-    let released = download.as_ref().unwrap_or(&convert);
     let cleared = in_flight.clone();
-    released
-        .static_pad("src")
-        .context("no src pad to release frames at")?
-        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            cleared.clear();
-            gst::PadProbeReturn::Ok
-        });
     enc.static_pad("src")
         .context("the encoder has no src pad")?
         .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            cleared.clear();
             if let Some(buffer) = info.buffer() {
                 on_frame(buffer);
             }
@@ -219,6 +219,9 @@ fn start_with(
 
     let starting = Arc::new(AtomicBool::new(false));
     let started = Arc::new(AtomicBool::new(false));
+    let was_open = AtomicBool::new(false);
+    let stopped = Arc::new(Mutex::new(false));
+    let start_stopped = stopped.clone();
     let weak = pipeline.downgrade();
     let weak_src: glib::WeakRef<gst_app::AppSrc> = src.downgrade();
     // Runs on the encode pipeline's streaming thread: never blocks, never drops, never fails.
@@ -226,11 +229,15 @@ fn start_with(
         .pad
         .add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
             if !open() {
+                if was_open.swap(false, Ordering::AcqRel) && started.load(Ordering::Acquire) {
+                    flush_off_thread(&weak_src, &in_flight);
+                }
                 return gst::PadProbeReturn::Ok;
             }
+            was_open.store(true, Ordering::Release);
             if !started.load(Ordering::Acquire) {
                 if !starting.swap(true, Ordering::AcqRel) {
-                    start_off_thread(pad, &weak, &started, &on_error);
+                    start_off_thread(pad, &weak, &started, &start_stopped, &on_error);
                 }
                 return gst::PadProbeReturn::Ok;
             }
@@ -256,7 +263,24 @@ fn start_with(
         pipeline,
         pad: feed.pad,
         probe: Some(probe),
+        stopped,
     })
+}
+
+/// The client left: flush what the PyroWave pipeline holds, so a wedged one does not keep a
+/// compositor frame until the session ends. Off the encode thread: a flush-stop takes the
+/// stream locks downstream.
+fn flush_off_thread(weak_src: &glib::WeakRef<gst_app::AppSrc>, in_flight: &Arc<InFlight>) {
+    let (weak_src, in_flight) = (weak_src.clone(), in_flight.clone());
+    let _ = std::thread::Builder::new()
+        .name("quasar-pw-flush".into())
+        .spawn(move || {
+            if let Some(src) = weak_src.upgrade() {
+                src.send_event(gst::event::FlushStart::new());
+                src.send_event(gst::event::FlushStop::new(true));
+            }
+            in_flight.clear();
+        });
 }
 
 /// Start the PyroWave pipeline on a thread of its own: a state change and a device open must
@@ -265,12 +289,13 @@ fn start_off_thread(
     pad: &gst::Pad,
     weak: &glib::WeakRef<gst::Pipeline>,
     started: &Arc<AtomicBool>,
+    stopped: &Arc<Mutex<bool>>,
     on_error: &OnError,
 ) {
     let (Some(pipeline), encode) = (weak.upgrade(), pipeline_of(pad)) else {
         return;
     };
-    let (started, on_error) = (started.clone(), on_error.clone());
+    let (started, stopped, on_error) = (started.clone(), stopped.clone(), on_error.clone());
     let fail = on_error.clone();
     let spawned = std::thread::Builder::new()
         .name("quasar-pw-start".into())
@@ -279,6 +304,10 @@ fn start_off_thread(
             // use that device, not make its own.
             for context in encode.map(|e| e.contexts()).unwrap_or_default() {
                 pipeline.set_context(&context);
+            }
+            let stopped = stopped.lock().unwrap_or_else(|e| e.into_inner());
+            if *stopped {
+                return;
             }
             match pipeline.set_state(gst::State::Playing) {
                 Ok(_) => started.store(true, Ordering::Release),
@@ -294,7 +323,6 @@ fn start_off_thread(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -477,39 +505,44 @@ mod tests {
         main.set_state(gst::State::Null).unwrap();
     }
 
-    /// The ring: never two frames held for PyroWave. A slow download (40 ms a frame at 60 fps)
-    /// makes the probe admit no second frame while one is held.
-    #[test]
-    fn one_frame_at_most_is_held_until_its_download_is_done() {
+    /// The ring: how many frames were held for PyroWave at once, with a 40 ms stage (60 fps
+    /// input) at the download or at the encoder. Returns (worst, encoded, admitted, standard).
+    fn held_at_once(slow_encoder: bool) -> (usize, usize, usize, usize) {
         let standard = Arc::new(AtomicUsize::new(0));
         let (main, feed) = encode_pipeline(&[&counting_sink(&standard)]);
         let queue_src = feed.pad.clone();
-        let (admitted, left, worst) = (
+        let (admitted, encoded, worst) = (
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
         );
-        let slow = gst::ElementFactory::make("identity")
-            .property("sleep-time", 40_000u32)
-            .build()
-            .unwrap();
+        let identity = |sleep_us: u32| {
+            gst::ElementFactory::make("identity")
+                .property("sleep-time", sleep_us)
+                .build()
+                .unwrap()
+        };
+        let (download, enc) = if slow_encoder {
+            (None, identity(40_000))
+        } else {
+            (Some(identity(40_000)), identity(0))
+        };
         // Added before `start_with`'s own probe on this pad, so a frame is counted out before
         // the next can be admitted.
-        let l = left.clone();
-        slow.static_pad("src")
+        let e = encoded.clone();
+        enc.static_pad("src")
             .unwrap()
             .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-                l.fetch_add(1, Ordering::SeqCst);
+                e.fetch_add(1, Ordering::SeqCst);
                 gst::PadProbeReturn::Ok
             });
-        let stand_in = gst::ElementFactory::make("identity").build().unwrap();
-        let side = start_with(feed, Some(slow), &stand_in, || true, |_| {}, |_| {}).unwrap();
+        let side = start_with(feed, download, &enc, || true, |_| {}, |_| {}).unwrap();
         // After the feed's probe: a frame it admitted is referenced by the PyroWave pipeline
-        // too (it sleeps 40 ms in the download, so it is still held here).
-        let (a, l, w) = (admitted.clone(), left.clone(), worst.clone());
+        // too (a 40 ms stage is ahead of it, so it is still held here).
+        let (a, e, w) = (admitted.clone(), encoded.clone(), worst.clone());
         queue_src.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if info.buffer().is_some_and(|b| !b.is_writable()) {
-                let held = a.fetch_add(1, Ordering::SeqCst) + 1 - l.load(Ordering::SeqCst);
+                let held = a.fetch_add(1, Ordering::SeqCst) + 1 - e.load(Ordering::SeqCst);
                 w.fetch_max(held, Ordering::SeqCst);
             }
             gst::PadProbeReturn::Ok
@@ -518,19 +551,124 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1500));
         drop(side);
         main.set_state(gst::State::Null).unwrap();
+        let load = |n: &Arc<AtomicUsize>| n.load(Ordering::SeqCst);
+        (
+            load(&worst),
+            load(&encoded),
+            load(&admitted),
+            load(&standard),
+        )
+    }
+
+    #[test]
+    fn one_frame_at_most_is_held_behind_a_slow_download() {
+        let (worst, encoded, admitted, standard) = held_at_once(false);
+        assert!(encoded >= 5, "frames went through");
+        assert_eq!(worst, 1, "two frames were held at once");
         assert!(
-            left.load(Ordering::SeqCst) >= 5,
-            "frames went through the download"
+            standard > admitted + 10,
+            "the standard stream ran at its own rate"
         );
-        assert_eq!(
-            worst.load(Ordering::SeqCst),
-            1,
-            "two frames were held at once"
-        );
+    }
+
+    /// Seat A round 2: a slow encoder must not leave a second frame waiting in appsrc.
+    #[test]
+    fn one_frame_at_most_is_held_behind_a_slow_encoder() {
+        let (worst, encoded, admitted, standard) = held_at_once(true);
+        assert!(encoded >= 5, "frames went through");
+        assert_eq!(worst, 1, "two frames were held at once");
         assert!(
-            standard.load(Ordering::SeqCst) > admitted.load(Ordering::SeqCst) + 10,
-            "the standard stream ran at its own rate; PyroWave admitted fewer"
+            standard > admitted + 10,
+            "the standard stream ran at its own rate"
         );
+    }
+
+    /// Frame memory that says when it is freed.
+    struct Tracked(Vec<u8>, Arc<AtomicBool>);
+
+    impl AsRef<[u8]> for Tracked {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Seat A round 2: a wedged PyroWave pipeline (here every push out of its appsrc blocks)
+    /// gives the frame it holds back when the client leaves.
+    #[test]
+    fn a_client_leaving_flushes_the_frame_a_wedged_pyrowave_pipeline_holds() {
+        gst::init().unwrap();
+        let main = gst::Pipeline::new();
+        let src = gst_app::AppSrc::builder()
+            .caps(&raw())
+            .is_live(true)
+            .format(gst::Format::Time)
+            .build();
+        let queue = gst::ElementFactory::make("queue").build().unwrap();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .property("async", false)
+            .build()
+            .unwrap();
+        main.add_many([src.upcast_ref(), &queue, &sink]).unwrap();
+        gst::Element::link_many([src.upcast_ref(), &queue, &sink]).unwrap();
+        let feed = feed_at(queue.static_pad("src").unwrap(), &raw()).unwrap();
+        let open = Arc::new(AtomicBool::new(true));
+        let gate = open.clone();
+        let enc = gst::ElementFactory::make("identity").build().unwrap();
+        let side = start_with(
+            feed,
+            None,
+            &enc,
+            move || gate.load(Ordering::SeqCst),
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        let side_src = side
+            .pipeline
+            .children()
+            .into_iter()
+            .find(|e| e.is::<gst_app::AppSrc>())
+            .unwrap();
+        side_src.static_pad("src").unwrap().add_probe(
+            gst::PadProbeType::BLOCK | gst::PadProbeType::BUFFER,
+            |_, _| gst::PadProbeReturn::Ok,
+        );
+        main.set_state(gst::State::Playing).unwrap();
+        let push = |i: u64, freed: &Arc<AtomicBool>| {
+            let mut b =
+                gst::Buffer::from_slice(Tracked(vec![16u8; 64 * 48 * 3 / 2], freed.clone()));
+            b.get_mut()
+                .unwrap()
+                .set_pts(gst::ClockTime::from_mseconds(16 * i));
+            src.push_buffer(b).unwrap();
+        };
+        let ignored = Arc::new(AtomicBool::new(false));
+        push(0, &ignored); // starts the PyroWave pipeline
+        wait_until("the PyroWave pipeline started", || {
+            side.pipeline.current_state() == gst::State::Playing
+        });
+        let held = Arc::new(AtomicBool::new(false));
+        push(1, &held);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !held.load(Ordering::SeqCst),
+            "the wedged pipeline holds the frame"
+        );
+
+        open.store(false, Ordering::SeqCst);
+        push(2, &ignored);
+        wait_until("the held frame was given back", || {
+            held.load(Ordering::SeqCst)
+        });
+        drop(side);
+        main.set_state(gst::State::Null).unwrap();
     }
 
     /// The feed changes nothing the standard branch negotiates: the encode pipeline has the
