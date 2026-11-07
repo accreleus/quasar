@@ -79,6 +79,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     const snap: TelemetrySnapshot = {
       ...EMPTY_SNAPSHOT,
       fps: framesInWindow * (1000 / TELEMETRY_MS),
+      // Frames are presented as they decode: there is no playout buffer on this path yet.
+      playoutTargetMs: 0,
       g2gMs,
       g2g95Ms: percentile(g2g, 95),
       negotiatedCodec: "video/H264",

@@ -24,7 +24,12 @@ const WT_PROTO = 1;
 const NOT_READY_RETRY_MS = 250;
 /** Mint a new token this long before the old one expires, so a retry never presents a dead one. */
 const TOKEN_MARGIN_MS = 5_000;
-
+/** How long connect keeps retrying an agent that is not ready or gives no answer. */
+export const CONNECT_DEADLINE_MS = 60_000;
+/** A connection that failed, or ended before its answer could be read: retried like
+ *  `session_not_ready`. The agent's refusal can race its own teardown, which Chrome sees
+ *  as a fatal HTTP/3 error before the `error` message reaches the page. */
+const NO_ANSWER = "no_answer";
 
 export interface WebTransportMediaOptions {
   sessionId: string;
@@ -87,14 +92,16 @@ export class WebTransportMedia implements MediaTransport {
 
   async connect(sink: MediaSink): Promise<void> {
     let reminted = false;
+    const deadline = this.now() + CONNECT_DEADLINE_MS;
     for (;;) {
       if (this.closed) throw new TransportError("closed");
+      if (this.now() >= deadline) throw new TransportError("connect_timeout");
       if (Date.parse(this.coords.expires_at) - this.now() < TOKEN_MARGIN_MS) {
         this.coords = await this.mint();
       }
       const refused = await this.attempt(sink);
       if (refused === null) return;
-      if (refused === "session_not_ready") {
+      if (refused === "session_not_ready" || refused === NO_ANSWER) {
         await this.sleep(NOT_READY_RETRY_MS);
         continue;
       }
@@ -142,31 +149,35 @@ export class WebTransportMedia implements MediaTransport {
     }));
     const options: WebTransportOptions = hashes.length ? { serverCertificateHashes: hashes } : {};
     let wt: WebTransport;
+    let stream: WebTransportBidirectionalStream;
     try {
       wt = this.opts.createWebTransport
         ? this.opts.createWebTransport(this.coords.url, options)
         : new WebTransport(this.coords.url, options);
+      // Read once connected; a refused or failed connect must not leave it unhandled.
+      wt.closed.catch(() => {});
       await wt.ready;
+      this.wt = wt;
+      if (this.closed) {
+        wt.close();
+        throw new TransportError("closed");
+      }
+      stream = await wt.createBidirectionalStream();
+      this.writer = stream.writable.getWriter();
+      await this.writer.write(
+        encodeControl({
+          type: "hello",
+          wt_proto: WT_PROTO,
+          token: this.coords.token,
+          session_id: this.opts.sessionId,
+          client: "browser",
+        }),
+      );
     } catch (err) {
-      throw new TransportError("connect_failed", err instanceof Error ? err.message : undefined);
+      if (err instanceof TransportError) throw err;
+      this.writer = null;
+      return NO_ANSWER;
     }
-    this.wt = wt;
-    if (this.closed) {
-      wt.close();
-      throw new TransportError("closed");
-    }
-    const stream = await wt.createBidirectionalStream();
-    const writer = stream.writable.getWriter();
-    this.writer = writer;
-    await writer.write(
-      encodeControl({
-        type: "hello",
-        wt_proto: WT_PROTO,
-        token: this.coords.token,
-        session_id: this.opts.sessionId,
-        client: "browser",
-      }),
-    );
 
     const reader = stream.readable.getReader();
     const control = new ControlDecoder();
@@ -186,14 +197,18 @@ export class WebTransportMedia implements MediaTransport {
     try {
       first = await next();
     } catch (err) {
-      wt.close({ closeCode: 4400, reason: "malformed control stream" });
-      throw new TransportError("internal", err instanceof Error ? err.message : undefined);
+      void datagrams.catch(() => {});
+      this.writer = null;
+      if (!(err instanceof ControlProtocolError)) return NO_ANSWER;
+      wt.close({ closeCode: 4400, reason: err.message });
+      throw new TransportError("internal", err.message);
     }
     if (first?.type !== "hello_ack") {
       void datagrams.catch(() => {});
       this.writer = null;
       wt.close();
-      return typeof first?.code === "string" ? first.code : "internal";
+      if (first === null) return NO_ANSWER;
+      return typeof first.code === "string" ? first.code : "internal";
     }
     if (first.wt_proto !== WT_PROTO) {
       this.send({ type: "bye", reason: "client_closed" });

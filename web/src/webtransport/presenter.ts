@@ -9,9 +9,10 @@ export interface Presenter {
   destroy(): void;
 }
 
-const SHADER = /* wgsl */ `
+/** `texture_external` for the zero-copy import; `texture_2d<f32>` for the copy fallback. */
+const shader = (texture: string) => /* wgsl */ `
 @group(0) @binding(0) var s: sampler;
-@group(0) @binding(1) var t: texture_external;
+@group(0) @binding(1) var t: ${texture};
 struct V { @builtin(position) p: vec4f, @location(0) uv: vec2f };
 @vertex fn vs(@builtin(vertex_index) i: u32) -> V {
   let xy = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
@@ -48,13 +49,19 @@ export async function createWebGpuPresenter(canvas: HTMLCanvasElement): Promise<
   const format = gpu.getPreferredCanvasFormat();
   // Transparent outside the picture: the canvas's CSS background is the letterbox.
   context.configure({ device, format, alphaMode: "premultiplied" });
-  const module = device.createShaderModule({ code: SHADER });
-  const pipeline = device.createRenderPipeline({
-    layout: "auto",
-    vertex: { module, entryPoint: "vs" },
-    fragment: { module, entryPoint: "fs", targets: [{ format }] },
-    primitive: { topology: "triangle-list" },
-  });
+  const makePipeline = (texture: string) => {
+    const module = device.createShaderModule({ code: shader(texture) });
+    return device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs" },
+      fragment: { module, entryPoint: "fs", targets: [{ format }] },
+      primitive: { topology: "triangle-list" },
+    });
+  };
+  const external = makePipeline("texture_external");
+  // Set once an import fails (seen on Chrome's software adapter, SwiftShader): from then on
+  // each frame is copied into `copy.target`. The zero-copy import stays the normal path.
+  let copy: { pipeline: GPURenderPipeline; target: GPUTexture | null } | null = null;
   const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
 
   const resize = new ResizeObserver(([entry]) => {
@@ -67,11 +74,35 @@ export async function createWebGpuPresenter(canvas: HTMLCanvasElement): Promise<
   return {
     present(frame) {
       try {
+        let pipeline = external;
+        let texture: GPUExternalTexture | GPUTextureView | null = null;
+        if (!copy) {
+          try {
+            texture = device.importExternalTexture({ source: frame });
+          } catch (err) {
+            console.warn("presenter: importExternalTexture failed; copying each frame instead", err);
+            copy = { pipeline: makePipeline("texture_2d<f32>"), target: null };
+          }
+        }
+        if (copy) {
+          const [w, h] = [frame.displayWidth, frame.displayHeight];
+          if (!copy.target || copy.target.width !== w || copy.target.height !== h) {
+            copy.target?.destroy();
+            copy.target = device.createTexture({
+              size: [w, h],
+              format: "rgba8unorm",
+              usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+          }
+          device.queue.copyExternalImageToTexture({ source: frame }, { texture: copy.target }, [w, h]);
+          pipeline = copy.pipeline;
+          texture = copy.target.createView();
+        }
         const bindGroup = device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: sampler },
-            { binding: 1, resource: device.importExternalTexture({ source: frame }) },
+            { binding: 1, resource: texture as GPUExternalTexture | GPUTextureView },
           ],
         });
         const encoder = device.createCommandEncoder();

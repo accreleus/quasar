@@ -8,8 +8,8 @@ import {
 } from "./framing";
 import { FrameAssembler } from "./reassembly";
 import { DecodeStage, HOLD_MS, avcCodecString } from "./decodeStage";
-import { containRect, type Presenter } from "./presenter";
-import { WebTransportMedia } from "./webTransportMedia";
+import { containRect, createWebGpuPresenter, type Presenter } from "./presenter";
+import { CONNECT_DEADLINE_MS, WebTransportMedia } from "./webTransportMedia";
 import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
 import type { WebTransportCoords } from "../api/types";
 
@@ -122,7 +122,11 @@ class FakeAgent {
 
   private onHello(): void {
     const script = this.replies[Math.min(this.hellos++, this.replies.length - 1)] ?? [];
-    for (const m of script) this.control(m);
+    for (const m of script) {
+      // The agent's refusal racing its own teardown: the page reads an error, not the answer.
+      if ((m as { type?: string }).type === "teardown") this.ctl?.error(new Error("Connection lost"));
+      else this.control(m);
+    }
   }
 
   control(m: object): void {
@@ -357,6 +361,45 @@ describe("DecodeStage", () => {
   });
 });
 
+describe("createWebGpuPresenter", () => {
+  it("falls back to copying each frame once an import fails, and closes every frame", async () => {
+    const calls: string[] = [];
+    const pass = { setPipeline() {}, setBindGroup() {}, setViewport() {}, draw() {}, end() {} };
+    const device = {
+      queue: { submit: () => calls.push("submit"), copyExternalImageToTexture: () => calls.push("copy") },
+      createShaderModule: () => ({}),
+      createRenderPipeline: () => ({ getBindGroupLayout: () => ({}) }),
+      createSampler: () => ({}),
+      importExternalTexture: () => {
+        calls.push("import");
+        throw new Error("Failed to import texture from video");
+      },
+      createTexture: (d: { size: number[] }) => ({ width: d.size[0], height: d.size[1], createView: () => ({}), destroy() {} }),
+      createBindGroup: () => ({}),
+      createCommandEncoder: () => ({ beginRenderPass: () => pass, finish: () => ({}) }),
+      destroy() {},
+    };
+    vi.stubGlobal("navigator", {
+      gpu: { requestAdapter: async () => ({ requestDevice: async () => device }), getPreferredCanvasFormat: () => "bgra8unorm" },
+    });
+    vi.stubGlobal("GPUTextureUsage", { TEXTURE_BINDING: 4, COPY_DST: 2, RENDER_ATTACHMENT: 16 });
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const canvas = {
+      width: 1600,
+      height: 1000,
+      getContext: () => ({ configure() {}, getCurrentTexture: () => ({ createView: () => ({}) }) }),
+    } as unknown as HTMLCanvasElement;
+    const p = (await createWebGpuPresenter(canvas))!;
+    const frame = () => ({ displayWidth: 1920, displayHeight: 1080, closed: false, close() { this.closed = true; } });
+    const [a, b] = [frame(), frame()];
+    p.present(a as unknown as VideoFrame);
+    p.present(b as unknown as VideoFrame);
+    expect(calls).toEqual(["import", "copy", "submit", "copy", "submit"]);
+    expect(a.closed && b.closed).toBe(true);
+  });
+});
+
 describe("containRect", () => {
   it("letterboxes and pillarboxes", () => {
     expect(containRect(1920, 1200, 1920, 1080)).toEqual({ x: 0, y: 60, w: 1920, h: 1080 });
@@ -387,6 +430,37 @@ describe("WebTransportMedia", () => {
     expect(agent.sent("hello").map((h) => h.token)).toEqual(["tok-1", "tok-1", "tok-2"]);
     expect(mint).toHaveBeenCalledTimes(1);
     expect(configs).toEqual([0]);
+  });
+
+  it("retries a connection torn down before its answer could be read", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[{ type: "teardown" }], [helloAck(0, avcC())]];
+    const t = new WebTransportMedia({
+      sessionId: "s1",
+      coords: COORDS,
+      mintToken: async () => COORDS,
+      createWebTransport: agent.create,
+      sleep: async () => {},
+    });
+    await t.connect({ config: () => {}, unit: () => {}, end: () => {} });
+    expect(agent.sent("hello").map((h) => h.token)).toEqual(["tok-1", "tok-1"]);
+  });
+
+  it("stops retrying at the connect deadline", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[{ type: "error", code: "session_not_ready" }]];
+    let now = Date.now();
+    const t = new WebTransportMedia({
+      sessionId: "s1",
+      coords: { ...COORDS, expires_at: new Date(now + 10 * CONNECT_DEADLINE_MS).toISOString() },
+      mintToken: async () => COORDS,
+      createWebTransport: agent.create,
+      sleep: async (ms) => void (now += ms * 40),
+      now: () => now,
+    });
+    await expect(t.connect({ config: () => {}, unit: () => {}, end: () => {} })).rejects.toMatchObject({
+      code: "connect_timeout",
+    });
   });
 
   it("gives up after a second auth_failed", async () => {
