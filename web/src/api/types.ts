@@ -485,6 +485,12 @@ export type RuntimePresetEnvelope = Schemas["RuntimePresetEnvelope"];
 
 export type RuntimePresetsResponse = Schemas["RuntimePresetsResponse"];
 
+// ── Compatibility tools (amendment 56) ────────────────────────────────────────
+export type CompatTool = Schemas["CompatTool"];
+export type CompatToolList = Schemas["CompatToolList"];
+export type CompatToolMapping = Schemas["CompatToolMapping"];
+export type CompatToolMappingWrite = Schemas["CompatToolMappingWrite"];
+
 /** Only `name` is required; an absent field takes the server default on create
  *  and is unchanged on patch. Never send a zero-value to mean "unset". */
 export type RuntimePresetWrite = Schemas["RuntimePresetWrite"];
