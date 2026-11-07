@@ -65,6 +65,9 @@ type LaunchParams struct {
 	// Transport is the client's preference ("", "webrtc" or "webtransport"); the stream plan
 	// decides (control-api.md §Transport).
 	Transport string
+	// PyroWave is POST /v1/sessions `pyrowave: true`: the user picked Ultra-low latency
+	// (PyroWave). A wish; the stream plan decides (amendment 58).
+	PyroWave bool
 	// parked is the library heartbeat's warm start (control-api.md §Warm Steam):
 	// no signaling token, Steam -silent, kind parked, and never an eviction.
 	parked bool

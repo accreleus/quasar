@@ -32,7 +32,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const NO_SINK: MediaSink = { config: () => {}, unit: () => {}, end: () => {} };
+const NO_SINK: MediaSink = { config: () => {}, unit: () => {}, pyrowave: () => {}, end: () => {} };
 
 function transport(agent: FakeAgent, extra: Partial<ConstructorParameters<typeof WebTransportMedia>[0]> = {}) {
   return new WebTransportMedia({
@@ -177,7 +177,7 @@ describe("WebTransportMedia close during connect", () => {
       agent.hold = stage;
       const t = transport(agent);
       const sinkCalls: string[] = [];
-      const connecting = t.connect({ config: () => sinkCalls.push("config"), unit: () => {}, end: () => {} });
+      const connecting = t.connect({ ...NO_SINK, config: () => sinkCalls.push("config") });
       await vi.waitFor(() => expect(agent.reached).toBe(stage));
       t.close();
       expect(agent.last.closes.length).toBeGreaterThan(0); // at once, not when the agent next answers
@@ -197,7 +197,7 @@ describe("WebTransportMedia close as the answer lands", () => {
     agent.hold = "answer";
     const t = transport(agent);
     const sinkCalls: string[] = [];
-    const connecting = t.connect({ config: () => sinkCalls.push("config"), unit: () => {}, end: () => {} });
+    const connecting = t.connect({ ...NO_SINK, config: () => sinkCalls.push("config") });
     await vi.waitFor(() => expect(agent.reached).toBe("answer"));
     agent.release(); // the hello_ack is queued on the stream...
     t.close(); // ...and the page closes before the attempt reads it
@@ -431,6 +431,7 @@ describe("createWebTransportRuntime", () => {
         return new Promise((_, reject) => (refuse = reject));
       },
       requestKeyframe: () => {},
+      codecFallback: () => {},
       close: () => {},
     };
     const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };

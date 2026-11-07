@@ -6,6 +6,10 @@
 export interface Presenter {
   /** Draws `frame` and closes it; false when nothing was drawn. */
   present(frame: VideoFrame): boolean;
+  /** The device a PyroWave decoder shares, so its output is drawn with no copy. */
+  readonly device?: GPUDevice;
+  /** Draws a texture of `device` (the PyroWave decoder's rgba8unorm output). */
+  presentTexture?(texture: GPUTexture): boolean;
   destroy(): void;
 }
 
@@ -45,11 +49,15 @@ export function containRect(
 export async function createWebGpuPresenter(
   canvas: HTMLCanvasElement,
   onFatal: (message: string) => void,
+  opts: { pyrowave?: boolean } = {},
 ): Promise<Presenter | null> {
   const gpu = navigator.gpu as GPU | undefined;
   const adapter = await gpu?.requestAdapter();
   if (!gpu || !adapter) return null;
-  const device = await adapter.requestDevice();
+  // The PyroWave decoder's fast path wants these (pyroWaveDeviceFeatures in pyrowave/decoder.ts,
+  // not imported: the decoder loads only for a PyroWave session).
+  const requiredFeatures = opts.pyrowave ? (["subgroups", "shader-f16"] as const).filter((f) => adapter.features.has(f)) : [];
+  const device = await adapter.requestDevice({ requiredFeatures });
   const context = canvas.getContext("webgpu");
   if (!context) return null;
 
@@ -111,36 +119,53 @@ export async function createWebGpuPresenter(
     return [copy.pipeline, copy.target.createView()];
   };
 
+  const draw = (pipeline: GPURenderPipeline, texture: GPUExternalTexture | GPUTextureView, fw: number, fh: number) => {
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: sampler },
+        { binding: 1, resource: texture },
+      ],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: context.getCurrentTexture().createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: "clear",
+          storeOp: "store",
+        },
+      ],
+    });
+    const r = containRect(canvas.width, canvas.height, fw, fh);
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.setViewport(r.x, r.y, r.w, r.h, 0, 1);
+    pass.draw(3);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  };
+  let texturePipeline: GPURenderPipeline | null = null;
+
   return {
+    device,
+    presentTexture(texture) {
+      try {
+        if (failed || destroyed) return false;
+        texturePipeline ??= makePipeline("texture_2d<f32>");
+        draw(texturePipeline, texture.createView(), texture.width, texture.height);
+        return true;
+      } catch (err) {
+        fail(`the presenter could not draw: ${err instanceof Error ? err.message : String(err)}`);
+        return false;
+      }
+    },
     present(frame) {
       try {
         if (failed || destroyed) return false;
         const [pipeline, texture] = source(frame);
-        const bindGroup = device.createBindGroup({
-          layout: pipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: sampler },
-            { binding: 1, resource: texture },
-          ],
-        });
-        const encoder = device.createCommandEncoder();
-        const pass = encoder.beginRenderPass({
-          colorAttachments: [
-            {
-              view: context.getCurrentTexture().createView(),
-              clearValue: { r: 0, g: 0, b: 0, a: 0 },
-              loadOp: "clear",
-              storeOp: "store",
-            },
-          ],
-        });
-        const r = containRect(canvas.width, canvas.height, frame.displayWidth, frame.displayHeight);
-        pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bindGroup);
-        pass.setViewport(r.x, r.y, r.w, r.h, 0, 1);
-        pass.draw(3);
-        pass.end();
-        device.queue.submit([encoder.finish()]);
+        draw(pipeline, texture, frame.displayWidth, frame.displayHeight);
         return true;
       } catch (err) {
         fail(`the presenter could not draw: ${err instanceof Error ? err.message : String(err)}`);
