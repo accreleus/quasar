@@ -140,6 +140,24 @@ describe("CompatToolsCard", () => {
       expect(get).toHaveBeenCalledTimes(2);
     });
 
+    it("retries a first load that fails transiently, and shows the rows once it succeeds", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const get = vi.mocked(adminApi.getHostCompatTools);
+      get.mockRejectedValueOnce(new ApiError(500, "internal", "boom"));
+      get.mockResolvedValue({ supported: true, free_bytes: null, reported_at: null, tools: [entry({})] });
+      render(
+        <AuthContext.Provider value={auth}>
+          <MemoryRouter>
+            <CompatToolsCard hostId="h1" />
+          </MemoryRouter>
+        </AuthContext.Provider>,
+      );
+      expect(await screen.findByText("boom")).toBeTruthy();
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(await screen.findByText("GE-Proton10-4")).toBeTruthy();
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
     it("keeps polling through a transient failure", async () => {
       const get = await firstLoadThenFail(new ApiError(500, "internal", "boom"));
       expect(screen.getByRole("alert").textContent).toBe("boom");

@@ -5,7 +5,7 @@
  * Authorization is server-enforced (`admin(...)` on the route); this card is UX only.
  */
 
-import { useRef } from "react";
+import { useEffect } from "react";
 import { Link } from "react-router-dom";
 import * as adminApi from "../../../../api/admin";
 import { ApiError } from "../../../../api/client";
@@ -20,26 +20,17 @@ import { toolChip, toolNote, usedBytes } from "../hostCompat";
 const POLL_MS = 5_000;
 
 export function CompatToolsCard({ hostId }: { hostId: string }) {
-  // The resource core re-arms a numeric poll after any failure, so a 403 or 404 (access gone,
-  // host deleted) stops it here: the fetch notes the refusal and the cadence function reads it.
-  const refused = useRef(false);
   const res = useResource<HostCompatTools>(
-    {
-      label: "compatibility tools",
-      pollMs: () => (refused.current ? null : POLL_MS),
-      fetch: async (ctx) => {
-        try {
-          const data = await adminApi.getHostCompatTools(ctx.token, hostId, ctx.signal);
-          refused.current = false;
-          return data;
-        } catch (e) {
-          refused.current = e instanceof ApiError && (e.status === 403 || e.status === 404);
-          throw e;
-        }
-      },
-    },
+    { label: "compatibility tools", pollMs: POLL_MS, fetch: (ctx) => adminApi.getHostCompatTools(ctx.token, hostId, ctx.signal) },
     [hostId],
   );
+  // The poll re-arms after any failure, so a refusal that will not clear (access gone, host
+  // deleted) pauses it; a transient failure, on the first load too, keeps its retry.
+  const gone = res.error instanceof ApiError && (res.error.status === 403 || res.error.status === 404);
+  const { pause } = res;
+  useEffect(() => {
+    if (gone) pause();
+  }, [gone, pause]);
   const data = res.data;
 
   if (!data) {
