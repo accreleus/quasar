@@ -92,8 +92,9 @@ struct Client {
     tx: mpsc::Sender<Out>,
     gone: Arc<OnceLock<Gone>>,
     /// Its queue was full at a configuration change: the configuration goes ahead of
-    /// the next keyframe instead.
+    /// the next keyframe instead, with `resync_reason`, the switch's `codec_switch_reason`.
     resync: bool,
+    resync_reason: Option<&'static str>,
     /// It is being sent PyroWave, and none of the standard codec's units.
     pyrowave: Option<Arc<VideoConfig>>,
 }
@@ -102,7 +103,8 @@ struct Client {
 struct State {
     /// The standard codec's configuration.
     config: Option<Arc<VideoConfig>>,
-    /// Every configuration takes the next id, whichever codec it is for.
+    /// Every configuration takes the next id, whichever codec it is for: one sequence, so a
+    /// client never sees two configurations under one `config_id` across a codec switch.
     next_id: u8,
     pyro: Option<Pyro>,
     client: Option<Client>,
@@ -286,6 +288,7 @@ impl Media {
             tx,
             gone: gone.clone(),
             resync: false,
+            resync_reason: None,
             pyrowave,
         }) {
             let _ = old.gone.set(Gone::TakenOver);
@@ -345,7 +348,10 @@ impl Media {
             .try_send(Out::Config(config.clone(), Some(reason)))
         {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => client.resync = true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                client.resync = true;
+                client.resync_reason = Some(reason);
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => st.client = None,
         }
         drop(st);
@@ -481,11 +487,12 @@ impl Media {
             let sent = st
                 .client
                 .as_ref()
-                .map(|c| c.tx.try_send(Out::Config(config.clone(), None)));
+                .map(|c| c.tx.try_send(Out::Config(config.clone(), c.resync_reason)));
             match sent {
                 Some(Ok(())) => {
                     if let Some(client) = st.client.as_mut() {
                         client.resync = false;
+                        client.resync_reason = None;
                     }
                 }
                 Some(Err(mpsc::error::TrySendError::Full(_))) => {
@@ -1143,5 +1150,26 @@ mod tests {
             assert_eq!(u16::from_le_bytes([d[11], d[12]]), 4);
         }
         assert_eq!(&d[1][HEADER..HEADER + 3], &[1, 0, 2], "kind 1, part 0 of 2");
+    }
+
+    #[test]
+    fn a_switch_whose_hello_ack_found_the_queue_full_resends_it_with_its_reason() {
+        let (media, _encoder, _) = granted();
+        let mut client = media.attach(true, LAN).unwrap();
+        for _ in 0..CLIENT_QUEUE {
+            media.on_pyrowave_frame(&pyro_frame());
+        }
+        media.switch_off(Some(client.id), "client_decode_error");
+        assert_eq!(
+            sent(&mut client.rx).len(),
+            CLIENT_QUEUE,
+            "the hello_ack did not fit"
+        );
+        media.on_unit(&buffer(true));
+        assert_eq!(
+            sent(&mut client.rx),
+            ["config 2 h264 client_decode_error", "unit 2 std key"],
+            "the resync carries codec_switch_reason"
+        );
     }
 }
