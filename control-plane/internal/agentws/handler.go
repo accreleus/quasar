@@ -71,17 +71,20 @@ type Handler struct {
 	bootIncarnation     string
 	preparation         *preparation.Store
 	OnPreparationReport func(string)
-	store               *agentStore
-	log                 *slog.Logger
-	registry            *Registry
-	events              Events
-	relay               *RelayBus
-	cfgStore            *hostcfg.Store
-	consoleStore        *console.Store
-	consoleAuto         *consoleAutoState
-	failures            *ratelimit.FailureLimiter
-	diagnostics         *diagnosticQueue
-	vram                *vramQueue
+	// OnCompatTools runs after a compat_tools_v1 connection's first capacity report and after
+	// any report that changed the host's installed set (the converger's materialize triggers).
+	OnCompatTools func(ctx context.Context, hostID string)
+	store         *agentStore
+	log           *slog.Logger
+	registry      *Registry
+	events        Events
+	relay         *RelayBus
+	cfgStore      *hostcfg.Store
+	consoleStore  *console.Store
+	consoleAuto   *consoleAutoState
+	failures      *ratelimit.FailureLimiter
+	diagnostics   *diagnosticQueue
+	vram          *vramQueue
 	// Image-management P2 callback surface (images.go). Never nil — NewHandler
 	// installs a no-op — so dispatch needs no guard.
 	imageEvents   ImageEvents
@@ -933,6 +936,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	ac := newConn(hostID, conn)
 	ac.terminalHomeCleanupV1 = caps.TerminalHomeCleanupV1
 	ac.parkedSessionsV1 = caps.ParkedSessionsV1
+	ac.adoptRestreamV1 = caps.AdoptRestreamV1
 	ac.compatToolsV1 = caps.CompatToolsV1
 	ac.policyTyped = policyTyped
 	ac.policyAccepted = acceptedGroups
@@ -1564,6 +1568,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 type registerCaps struct {
 	TerminalHomeCleanupV1 bool
 	ParkedSessionsV1      bool
+	AdoptRestreamV1       bool
 	CompatToolsV1         bool
 	RecoveryRelease       bool // config_policy_versions.recovery_release (amendment 51)
 }
@@ -1730,6 +1735,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 	}
 	return result.HostID, result.RegisteredAt, reg.Images, identity.SourceCommit,
 		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1, CompatToolsV1: reg.CompatToolsV1,
+			AdoptRestreamV1: reg.AdoptRestreamV1,
 			RecoveryRelease: reg.ConfigPolicyVersions["recovery_release"] == 1},
 		policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }
@@ -1851,6 +1857,15 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 	// nothing — a failure costs a tier decision, never a launch.
 	if err := h.store.upsertHostCodecPixelRates(ctx, hostID, cap.CodecThroughput); err != nil {
 		h.log.Warn("host codec throughput upsert failed", "host_id", hostID, "err", err)
+	}
+	if ac.compatToolsV1 {
+		changed, err := h.store.upsertHostCompatTools(ctx, hostID, cap.CompatTools)
+		if err != nil {
+			h.log.Warn("host compat tools upsert failed", "host_id", hostID, "err", err)
+		}
+		if first := ac.compatReports.Add(1) == 1; (first || changed) && h.OnCompatTools != nil {
+			go h.OnCompatTools(context.WithoutCancel(ctx), hostID)
+		}
 	}
 	if err := h.store.upsertHostWebTransport(ctx, hostID, webTransportReport(cap)); err != nil {
 		h.log.Warn("host webtransport upsert failed", "host_id", hostID, "err", err)

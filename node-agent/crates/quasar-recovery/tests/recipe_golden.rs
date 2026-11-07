@@ -351,6 +351,49 @@ fn node_agent_revision_4_renders_its_golden_specification_per_vendor() {
     }
 }
 
+/// Revision 5 is revision 4 plus the compatibility-tools root (#1071), bound at the same path
+/// beside the template root.
+#[test]
+fn node_agent_revision_5_adds_only_the_compat_tools_root() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    for (vendor, file) in [
+        (Some(GpuVendor::Nvidia), "node-agent-r5-nvidia.json"),
+        (Some(GpuVendor::Amd), "node-agent-r5-amd.json"),
+    ] {
+        let r5 = render(
+            Role::NodeAgent,
+            5,
+            &inputs(vendor),
+            &image,
+            &agent_secrets(),
+        )
+        .unwrap();
+        check(file, &r5);
+        let mut r4 = render(
+            Role::NodeAgent,
+            4,
+            &inputs(vendor),
+            &image,
+            &agent_secrets(),
+        )
+        .unwrap();
+        r4.labels = r5.labels.clone();
+        r4.env.insert(
+            "QUASAR_COMPAT_TOOLS_ROOT".into(),
+            "/var/lib/quasar/compat-tools".into(),
+        );
+        r4.binds.push(r5.binds.last().unwrap().clone());
+        assert_eq!(r4, r5, "{file}");
+        assert_eq!(
+            r5.binds.last().unwrap().to_engine(),
+            "/var/lib/quasar/compat-tools:/var/lib/quasar/compat-tools"
+        );
+    }
+    let mut under = inputs(Some(GpuVendor::Amd));
+    under.template_root = "/srv/quasar/homes/templates".into();
+    assert!(render(Role::NodeAgent, 5, &under, &image, &agent_secrets()).is_err());
+}
+
 /// ADR 0009: from revision 4 the console session's container, not the agent, holds
 /// the screen, the input and the sound device. Console mode gives the agent only what it
 /// launches and watches a console desktop with: logind's state to name a display holder,
@@ -887,7 +930,7 @@ fn a_revision_the_book_does_not_carry_is_recipe_unsupported() {
     let image = ImageRef::parse(AGENT_IMAGE).unwrap();
     for (role, revision) in [
         (Role::NodeAgent, 0),
-        (Role::NodeAgent, 5),
+        (Role::NodeAgent, 6),
         (Role::RecoveryActor, 2),
         (Role::ControlPlane, 0),
         (Role::ControlPlane, 5),

@@ -143,6 +143,9 @@ pub enum AgentMsg {
         /// the in-place swap.
         #[serde(skip_serializing_if = "Option::is_none")]
         parked_sessions_v1: Option<bool>,
+        /// Amendment 59: an adoption moves the runtime to the new stream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        adopt_restream_v1: Option<bool>,
         /// Amendment 56: the agent applies `session_assign.compat_tools`.
         #[serde(skip_serializing_if = "Option::is_none")]
         compat_tools_v1: Option<bool>,
@@ -221,6 +224,10 @@ pub enum AgentMsg {
         /// Amendment 54: `transports` and `webtransport`, replaced wholesale on every report.
         #[serde(flatten)]
         transports: crate::webtransport::Transports,
+        /// Amendment 56: the tools in the install record and the free space; only when
+        /// `compat_tools_v1` was advertised.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compat_tools: Option<Box<serde_json::Value>>,
     },
     Heartbeat {
         running_sessions: Vec<String>,
@@ -1669,6 +1676,7 @@ mod tests {
     #[test]
     fn capacity_json_omits_absent_additive_fields() {
         let msg = AgentMsg::Capacity {
+            compat_tools: None,
             transports: crate::webtransport::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
@@ -1721,6 +1729,7 @@ mod tests {
     #[test]
     fn capacity_json_includes_present_additive_fields() {
         let msg = AgentMsg::Capacity {
+            compat_tools: None,
             transports: crate::webtransport::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
@@ -2137,6 +2146,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
             compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
@@ -2173,6 +2183,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
             compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
@@ -2216,6 +2227,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
             compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
@@ -2256,6 +2268,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
             compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),

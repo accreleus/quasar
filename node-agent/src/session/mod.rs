@@ -196,7 +196,7 @@ impl Codec {
 
 /// Per-session stream parameters. Mirrors the `stream` object of `session_assign`
 /// (`protocol/agent-api.md`); env/flags supply them on the standalone path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamParams {
     pub width: i32,
     pub height: i32,

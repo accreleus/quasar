@@ -142,6 +142,34 @@ pub(crate) fn finish_encode(pipeline: &gst::Pipeline, defer: bool) {
     );
 }
 
+/// Whether another session holds an encode lease, so a rebuild may not destroy this
+/// session's NVENC encoder (#489). `false` with deferral off.
+pub(crate) fn others_encoding(defer: bool) -> bool {
+    defer
+        && registry()
+            .lock()
+            .expect("nvenc defer registry poisoned")
+            .live
+            > 1
+}
+
+/// Amendment 59 (c): destroy a live session's encode pipeline now, for a rebuild, when
+/// no other session holds an encode lease. `false` (nothing touched) while another does:
+/// destroying it then is the #489 use-after-free. Holds the registry lock across the
+/// destroy, so no other session opens an encoder meanwhile.
+pub(crate) fn destroy_if_alone(pipeline: &gst::Pipeline, defer: bool) -> bool {
+    if !defer {
+        let _ = pipeline.set_state(gst::State::Null);
+        return true;
+    }
+    let reg = registry().lock().expect("nvenc defer registry poisoned");
+    if reg.live > 1 {
+        return false;
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    true
+}
+
 /// Pointer identity of two `GstPipeline`s (a `gst::Pipeline` is a refcounted
 /// handle, so `clone()` gives another handle to the same C object).
 fn same_object(a: &gst::Pipeline, b: &gst::Pipeline) -> bool {
@@ -223,5 +251,26 @@ mod tests {
         );
         drop(b);
         assert!(registry().lock().unwrap().parked.is_empty());
+    }
+
+    // Amendment 59 (c): a rebuild destroys the old encoder only when no other session is
+    // encoding; otherwise it takes `nvenc_drain` and touches nothing.
+    #[test]
+    fn a_rebuild_destroys_the_encoder_only_when_alone() {
+        let _guard = serialize();
+        let p = pipeline("defer-test-rebuild");
+        p.set_state(gst::State::Ready).unwrap();
+        let ours = EncodeLease::acquire(true);
+        let other = EncodeLease::acquire(true);
+        assert!(!destroy_if_alone(&p, true));
+        assert_eq!(
+            p.current_state(),
+            gst::State::Ready,
+            "untouched beside a live encoder"
+        );
+        drop(other);
+        assert!(destroy_if_alone(&p, true));
+        assert_eq!(p.current_state(), gst::State::Null);
+        drop(ours);
     }
 }

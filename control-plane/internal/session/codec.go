@@ -65,3 +65,11 @@ func deviceAccepts(wire string, dp *DeviceProbe) bool {
 	}
 	return false
 }
+
+// codecOrH264 reads an unset wire codec as the h264 floor.
+func codecOrH264(c string) string {
+	if c == "" {
+		return wireCodecH264
+	}
+	return c
+}
