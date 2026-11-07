@@ -1429,6 +1429,11 @@ async fn a_refused_peer_keeps_its_slot_until_its_close_has_run() {
     chrome.hello(1, "wrong-token", SESSION).await;
     assert_eq!(chrome.message().await.unwrap()["code"], "auth_failed");
     assert_eq!(chrome.close_code().await, CLOSE_AUTH);
+    // `hold_close` takes the armed hold when `close_session` reaches it, before the capsule is read.
+    assert!(
+        CLOSE_HOLD.with(|h| h.borrow().is_none()),
+        "close hold not reached"
+    );
     // The capsule is in and the close is held: the agent still holds the source's slot.
     let while_closing = ClientBuilder::new()
         .with_server_certificate_hashes(vec![agent.hash.clone()])
@@ -1446,7 +1451,11 @@ async fn a_refused_peer_keeps_its_slot_until_its_close_has_run() {
         );
     }
     release.send(()).unwrap();
-    done.await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), done).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => panic!("the held close was dropped without running"),
+        Err(_) => panic!("the held close did not finish within 5 s of its release"),
+    }
     chrome.assert_h3_streams_untouched(false).await;
     let (_session, _send, _recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(
