@@ -237,7 +237,7 @@ impl WebRtcSlot {
             observe,
         } = session;
         let codec = cfg.stream.codec;
-        let pay = build_video_payloader(codec)?;
+        let pay = build_video_payloader(codec, cfg.rtp_mtu)?;
         // TWCC must be declared HERE, in the capsfilter, never via `add-extension` on the
         // payloader. webrtcbin builds its offer from these caps, the payloader's
         // auto-header-extension instantiates the matching `rtphdrexttwcc` writer from the

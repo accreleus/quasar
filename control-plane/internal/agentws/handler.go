@@ -934,6 +934,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	ac.terminalHomeCleanupV1 = caps.TerminalHomeCleanupV1
 	ac.parkedSessionsV1 = caps.ParkedSessionsV1
 	ac.adoptRestreamV1 = caps.AdoptRestreamV1
+	ac.compatToolsV1 = caps.CompatToolsV1
 	ac.policyTyped = policyTyped
 	ac.policyAccepted = acceptedGroups
 	ac.policyIdle = slices.Contains(acceptedGroups, "hardware")
@@ -1565,6 +1566,7 @@ type registerCaps struct {
 	TerminalHomeCleanupV1 bool
 	ParkedSessionsV1      bool
 	AdoptRestreamV1       bool
+	CompatToolsV1         bool
 	RecoveryRelease       bool // config_policy_versions.recovery_release (amendment 51)
 }
 
@@ -1729,7 +1731,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	return result.HostID, result.RegisteredAt, reg.Images, identity.SourceCommit,
-		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1,
+		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1, CompatToolsV1: reg.CompatToolsV1,
 			AdoptRestreamV1: reg.AdoptRestreamV1,
 			RecoveryRelease: reg.ConfigPolicyVersions["recovery_release"] == 1},
 		policyTyped, acceptedGroups, connectionID, cleanupRegister, nil

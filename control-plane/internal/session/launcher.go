@@ -1067,6 +1067,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		Kind:           sess.Kind,
 		AdoptSessionID: sess.AdoptSessionID,
 	}
+	assign.CompatTools = c.compatToolsFor(sess.AppID)
 	if sess.wt != nil {
 		exp := sess.wt.ExpiresAt
 		assign.Transport, assign.WTTokenHash, assign.WTTokenExpiresAt = transportWebTransport, sess.wt.Hash, &exp
@@ -1109,6 +1110,7 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 				"assign dispatch failed: the agent connection cannot take a parked session or an adoption")
 			return false
 		}
+		wire = c.fitCompatTools(wire, epoch)
 		capable := epoch != nil && epoch.SupportsHomeCleanup()
 		hold, err := c.store.bindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable, expected)
 		if errors.Is(err, errSessionNotAssigned) {
