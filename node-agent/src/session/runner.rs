@@ -311,6 +311,9 @@ fn assert_vulkan_encoder_device(
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Starting,
+    /// Amendment 59: an adoption's restream finished (how long it took), or failed at a
+    /// step. For the agent only; nothing goes out for it.
+    Restreamed(Result<Duration, (&'static str, String)>),
     HomeSeed(super::home::HomeSeedOutcome),
     /// Fine-grained launch progress while the top-level state remains starting.
     Progress(&'static str),
@@ -810,6 +813,10 @@ pub struct AdoptRequest {
     pub container: Option<super::container::ContainerSpec>,
     pub idle_timeout: Duration,
     pub app_boot_timeout: Option<Duration>,
+    /// Amendment 59: the adopting session's stream, when its bitrate, fps or size differs.
+    /// The runner moves the runtime to it and answers [`SessionEvent::Restreamed`] before
+    /// anything else of the adoption; the agent re-labels only on `Ok`.
+    pub restream: Option<super::StreamParams>,
 }
 
 /// `to` runs in `from`'s container with only `STEAM_STARTUP_FLAGS` changed (amendment 39).
@@ -1557,6 +1564,26 @@ impl SessionTransports {
     /// replaces that PC's transport instead, and the new transport offers: `Ok(Some(pc))`.
     /// `Err` only when the video transport could not be replaced, which leaves the
     /// session nothing to stream on.
+    /// Amendment 59 (a)–(b) on an adopted runtime: the video PC gets a new transport
+    /// starting from `to`, recorded as a replacement so a late answer from the old viewer
+    /// is told apart. On `Err`, the step that failed.
+    pub(crate) fn restream(
+        &mut self,
+        to: &super::StreamParams,
+    ) -> Result<(), (&'static str, anyhow::Error)> {
+        let i = PcId::Video as usize;
+        if let Some(gone) = self.negotiation[i].replaced() {
+            let displaced = &mut self.displaced[i];
+            displaced.push(gone);
+            if displaced.len() > DISPLACED_REMEMBERED {
+                displaced.remove(0);
+            }
+        }
+        self.slot.restream(&mut self.video, to)?;
+        self.unanswered[i] = true;
+        Ok(())
+    }
+
     pub(crate) fn inbound(
         &mut self,
         mut msg: SignalMsg,
@@ -2704,6 +2731,36 @@ pub fn run_blocking(
         }
 
         while let Ok(req) = adopt_rx.try_recv() {
+            let restreamed = req.restream.is_some();
+            if let Some(to) = &req.restream {
+                let began = Instant::now();
+                match transports.restream(to) {
+                    Ok(()) => {
+                        cfg.stream.bitrate_kbps = to.bitrate_kbps;
+                        cfg.stream.fps = to.fps;
+                        cfg.stream.width = to.width;
+                        cfg.stream.height = to.height;
+                        let elapsed = began.elapsed();
+                        tracing::info!(
+                            token = "runtime-adopt-restreamed",
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            "adopted runtime moved to {}x{}@{} at {} kbit/s",
+                            to.width,
+                            to.height,
+                            to.fps,
+                            to.bitrate_kbps
+                        );
+                        emit(SessionEvent::Restreamed(Ok(elapsed)));
+                    }
+                    Err((step, e)) => {
+                        emit(SessionEvent::Restreamed(Err((step, format!("{e:#}")))));
+                        // Torn down as a declined runtime: the stop path's terminal report
+                        // goes out under the adopted id (the agent has not re-labelled).
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
             let now = Instant::now();
             held_since = None;
             if in_place.take().is_some() {
@@ -2781,6 +2838,10 @@ pub fn run_blocking(
             // negotiated with the ended session's viewer is replaced on the answer (#535).
             for pc in [PcId::Video, PcId::Audio] {
                 if pc == PcId::Audio && transports.audio_webrtc.is_none() {
+                    continue;
+                }
+                // A restream's new video transport offers on its own.
+                if pc == PcId::Video && restreamed {
                     continue;
                 }
                 let restart = SignalMsg::RestartIce { pc: Some(pc) };

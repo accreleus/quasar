@@ -1697,6 +1697,7 @@ fn register_message(
             &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)))),
         terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
         parked_sessions_v1: crate::session::launch_helper::installed().then_some(true),
+        adopt_restream_v1: crate::session::launch_helper::installed().then_some(true),
         node_name: cfg.node_name.clone(),
         agent_version: crate::buildinfo::version().to_string(),
         auth: choose_auth(cfg, prefer_enrollment_token)?,
@@ -2566,6 +2567,7 @@ async fn connect_and_run(
                 for reaped in mgr.reconcile(Instant::now(), RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL) {
                     send(&mut tx, &reaped).await?;
                 }
+                mgr.expire_restreams(Instant::now(), evt_tx, diagnostic_tx);
                 let running = mgr.running_ids();
                 let running_count = running.len();
                 let hb = AgentMsg::Heartbeat {
@@ -2795,6 +2797,13 @@ async fn connect_and_run(
                     continue;
                 };
                 let session_id = mgr.label(&session_id);
+                let event = match event {
+                    SessionEvent::Restreamed(result) => {
+                        mgr.restreamed(&session_id, result, evt_tx, diagnostic_tx);
+                        continue;
+                    }
+                    other => other,
+                };
                 let terminal = matches!(
                     &event,
                     SessionEvent::Stopped { .. }
@@ -3418,6 +3427,10 @@ struct RunningHandle {
     swapping: bool,
     /// What the runtime encodes, for an adoption's match check.
     stream: StreamParams,
+    /// The size and fps it was built with: an adoption may not ask for more (amendment 59).
+    built: (i32, i32, i32),
+    /// An adoption waiting on the runner's restream; the runtime keeps its own id meanwhile.
+    restreaming: Option<Restreaming>,
     /// The Region and Input keys its container was started with (amendment 49), for the
     /// same check, and those of a swap the runner has not yet completed.
     region_env: BTreeMap<String, String>,
@@ -3432,17 +3445,68 @@ impl RunningHandle {
         self.held.is_none()
     }
 
-    /// Whether `stream` may run on this runtime (amendment 39 `adopt_session_id`): the same
-    /// codec, fps, bitrate, H.264 profile and mic, and no larger than its launch size.
-    fn encodes(&self, stream: &StreamParams) -> bool {
-        let have = &self.stream;
-        have.codec == stream.codec
-            && have.fps == stream.fps
-            && have.bitrate_kbps == stream.bitrate_kbps
-            && have.h264_profile == stream.h264_profile
-            && have.mic == stream.mic
-            && stream.width <= have.width
-            && stream.height <= have.height
+    /// Whether `stream` may run on this runtime (amendment 59): the same mic, and no larger
+    /// or faster than it was built. Bitrate and fps follow the stream by a restream.
+    fn fits(&self, stream: &StreamParams) -> bool {
+        let (w, h, fps) = self.built;
+        self.stream.mic == stream.mic
+            && stream.width <= w
+            && stream.height <= h
+            && stream.fps <= fps
+    }
+
+    /// The encoder rebuild of amendment 59 (c) is not in this build: a new codec or H.264
+    /// profile takes the failure branch (a fresh build).
+    fn needs_encoder(&self, stream: &StreamParams) -> bool {
+        self.stream.codec != stream.codec || self.stream.h264_profile != stream.h264_profile
+    }
+
+    /// Whether adopting `stream` needs the runner's restream, (a)–(b).
+    fn needs_restream(&self, stream: &StreamParams) -> bool {
+        self.stream.bitrate_kbps != stream.bitrate_kbps || self.stream.fps != stream.fps
+    }
+}
+
+/// An adoption whose restream the runner is running (amendment 59). On failure the
+/// assignment is started again, and finds the runtime declined.
+struct Restreaming {
+    session_id: String,
+    assignment: PendingAssignment,
+    deadline: Instant,
+}
+
+/// Amendment 59's one deadline for (a)–(c). Provisional: to be measured on the lab
+/// (accreleus/quasar#1133).
+const ADOPT_RESTREAM_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The decline that is amendment 59's failure branch at step `encoder`.
+const NEEDS_ENCODER: &str = "it encodes another codec or H.264 profile";
+
+/// Why `h` may not be adopted by an assign for `gpu_index` with `cfg`, `None` when it may.
+fn adopt_declined(h: &RunningHandle, gpu_index: i32, cfg: &SessionConfig) -> Option<&'static str> {
+    let adoptable = !h.stop.load(Ordering::Relaxed)
+        && h.restreaming.is_none()
+        && match h.held {
+            Some(held) => !held.released,
+            None => h.kind == Some(SessionKind::Parked) && h.reached_running,
+        };
+    if !adoptable {
+        Some("it is neither held nor a running parked session")
+    } else if h.gpu_index != gpu_index {
+        Some("it is on another GPU")
+    } else if h.video_topology != VideoTopology::StreamOnly {
+        Some("it is not a streamed session")
+    } else if !h.fits(&cfg.stream) {
+        Some("it was built smaller or slower, or with another mic")
+    } else if h.needs_encoder(&cfg.stream) {
+        Some(NEEDS_ENCODER)
+    } else if h.region_env != region_env(cfg.container.as_ref()) {
+        Some("its container was started with other Region and Input values")
+    } else if cfg.kind != Some(SessionKind::Parked) && !h.metrics.launch_helper_connected() {
+        // A runtime whose helper never connected cannot start the game.
+        Some("its launch helper never connected")
+    } else {
+        None
     }
 }
 
@@ -4086,6 +4150,9 @@ impl SessionManager {
                 self.note_session_count();
                 Some(ack(id, true, None))
             }
+            ControlMsg::SessionStart { id, session_id } if self.begin_restream(&session_id) => {
+                Some(ack(id, true, None))
+            }
             ControlMsg::SessionStart { id, session_id } => match self.pending.remove(&session_id) {
                 Some(PendingAssignment {
                     mut cfg,
@@ -4113,6 +4180,7 @@ impl SessionManager {
                     let exited = Arc::new(AtomicBool::new(false));
                     let exited_flag = exited.clone();
                     let runtime_stream = cfg.stream.clone();
+                    let built = (cfg.stream.width, cfg.stream.height, cfg.stream.fps);
                     let runtime_region_env = region_env(cfg.container.as_ref());
                     let kind = cfg.kind;
                     let (sig_in_tx, sig_in_rx) = std::sync::mpsc::channel::<SignalMsg>();
@@ -4293,6 +4361,8 @@ impl SessionManager {
                             region_env: runtime_region_env,
                             swap_region_env: None,
                             exited,
+                            built,
+                            restreaming: None,
                         },
                     );
                     self.health.set_sessions(self.running.len());
@@ -5155,32 +5225,21 @@ impl SessionManager {
             );
             return Adoption::Fresh { after: None };
         };
-        let adoptable = !h.stop.load(Ordering::Relaxed)
-            && match h.held {
-                Some(held) => !held.released,
-                None => h.kind == Some(SessionKind::Parked) && h.reached_running,
-            };
-        let declined = if !adoptable {
-            Some("it is neither held nor a running parked session")
-        } else if h.gpu_index != gpu_index {
-            Some("it is on another GPU")
-        } else if h.video_topology != VideoTopology::StreamOnly {
-            Some("it is not a streamed session")
-        } else if !h.encodes(&cfg.stream) {
-            Some("it encodes another stream, or a smaller one")
-        } else if h.region_env != region_env(cfg.container.as_ref()) {
-            Some("its container was started with other Region and Input values")
-        } else if cfg.kind != Some(SessionKind::Parked) && !h.metrics.launch_helper_connected() {
-            // A runtime whose helper never connected cannot start the game.
-            Some("its launch helper never connected")
-        } else {
-            None
-        };
+        let declined = adopt_declined(h, gpu_index, cfg);
+        if declined == Some(NEEDS_ENCODER) {
+            warn!(
+                token = "adopt-restream-no-encoder-rebuild",
+                step = "encoder",
+                "adopt_restream_failed: session {session_id}: this agent cannot rebuild the \
+                 encoder for another codec or H.264 profile yet; building fresh"
+            );
+        }
         let request = AdoptRequest {
             kind: cfg.kind,
             container: cfg.container.clone(),
             idle_timeout: cfg.idle_timeout,
             app_boot_timeout: cfg.app_boot_timeout,
+            restream: None,
         };
         let refused = match declined {
             Some(why) => Some(why),
@@ -5207,10 +5266,168 @@ impl SessionManager {
                 after: Some(h.exited.clone()),
             };
         }
+        self.finish_adopt(session_id, from, cfg)
+    }
+
+    /// Amendment 59: start an adoption that needs the runner's restream. The runtime keeps
+    /// its own id until [`Self::restreamed`]. `false` leaves `session_start` to today's path,
+    /// which adopts without a restream or declines.
+    fn begin_restream(&mut self, session_id: &str) -> bool {
+        let Some(pa) = self.pending.get(session_id) else {
+            return false;
+        };
+        let Some(from) = pa.adopt.clone() else {
+            return false;
+        };
+        let Some(h) = self.running.get(&from) else {
+            return false;
+        };
+        if adopt_declined(h, pa.gpu_index, &pa.cfg).is_some() || !h.needs_restream(&pa.cfg.stream) {
+            return false;
+        }
+        let Some(pa) = self.pending.remove(session_id) else {
+            return false;
+        };
+        self.abort_any_warmup();
+        if let Some(handle) = &self.probe_handle {
+            handle.launch_arrived(pa.gpu_index);
+        }
+        let request = AdoptRequest {
+            kind: pa.cfg.kind,
+            container: pa.cfg.container.clone(),
+            idle_timeout: pa.cfg.idle_timeout,
+            app_boot_timeout: pa.cfg.app_boot_timeout,
+            restream: Some(pa.cfg.stream.clone()),
+        };
+        let Some(h) = self.running.get_mut(&from) else {
+            self.pending.insert(session_id.to_string(), pa);
+            return false;
+        };
+        if h.adopt.send(request).is_err() {
+            self.pending.insert(session_id.to_string(), pa);
+            return false;
+        }
+        info!(
+            token = "runtime-adopt-restreaming",
+            "session {session_id}: adopting the runtime of {from}; moving it to {}x{}@{} at {}              kbit/s first",
+            pa.cfg.stream.width,
+            pa.cfg.stream.height,
+            pa.cfg.stream.fps,
+            pa.cfg.stream.bitrate_kbps
+        );
+        h.restreaming = Some(Restreaming {
+            session_id: session_id.to_string(),
+            assignment: pa,
+            deadline: Instant::now() + ADOPT_RESTREAM_DEADLINE,
+        });
+        true
+    }
+
+    /// The runner's answer to [`Self::begin_restream`]: re-label on success in time,
+    /// otherwise decline the runtime and build the session fresh.
+    fn restreamed(
+        &mut self,
+        runtime_id: &str,
+        result: Result<Duration, (&'static str, String)>,
+        evt_tx: &mpsc::Sender<(String, SessionEvent)>,
+        diagnostic_tx: &DiagnosticEventTx,
+    ) {
+        // `None`: its deadline already passed and the session was built fresh.
+        let Some(r) = self
+            .running
+            .get_mut(runtime_id)
+            .and_then(|h| h.restreaming.take())
+        else {
+            return;
+        };
+        let result = match result {
+            Ok(took) if Instant::now() > r.deadline => Err((
+                "deadline",
+                format!("finished after {} ms", took.as_millis()),
+            )),
+            other => other,
+        };
+        match result {
+            Ok(took) => {
+                info!(
+                    token = "runtime-adopt-restream-done",
+                    elapsed_ms = took.as_millis() as u64,
+                    "session {}: the runtime of {runtime_id} moved to the new stream",
+                    r.session_id
+                );
+                let cfg = r.assignment.cfg.clone();
+                self.finish_adopt(&r.session_id, runtime_id, &cfg);
+            }
+            Err((step, why)) => {
+                self.restream_failed(runtime_id, r, step, &why, evt_tx, diagnostic_tx)
+            }
+        }
+    }
+
+    /// Amendment 59's failure branch: the runtime is torn down as a declined runtime (its
+    /// terminal report under its own id), and the session is started again, fresh.
+    fn restream_failed(
+        &mut self,
+        runtime_id: &str,
+        r: Restreaming,
+        step: &'static str,
+        why: &str,
+        evt_tx: &mpsc::Sender<(String, SessionEvent)>,
+        diagnostic_tx: &DiagnosticEventTx,
+    ) {
+        warn!(
+            token = "adopt-restream-failed",
+            step,
+            "adopt_restream_failed: session {}: moving the runtime of {runtime_id} to the new \
+             stream failed at {step}: {why}; it is torn down and the session is built fresh",
+            r.session_id
+        );
+        if let Some(h) = self.running.get_mut(runtime_id) {
+            h.stop.store(true, Ordering::Relaxed);
+            h.held = Some(Held {
+                since: h.held.map_or_else(Instant::now, |held| held.since),
+                released: true,
+            });
+        }
+        let session_id = r.session_id;
+        self.pending.insert(session_id.clone(), r.assignment);
+        // The control plane's own `session_start` was acked; this one answers nobody.
+        let start = ControlMsg::SessionStart {
+            id: format!("restream-fallback-{session_id}"),
+            session_id,
+        };
+        let _ = self.handle_control(start, evt_tx, diagnostic_tx);
+    }
+
+    /// Restreams past their deadline take the failure branch (amendment 59, step `deadline`).
+    fn expire_restreams(
+        &mut self,
+        now: Instant,
+        evt_tx: &mpsc::Sender<(String, SessionEvent)>,
+        diagnostic_tx: &DiagnosticEventTx,
+    ) {
+        let late: Vec<String> = self
+            .running
+            .iter()
+            .filter(|(_, h)| h.restreaming.as_ref().is_some_and(|r| now > r.deadline))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in late {
+            if let Some(r) = self.running.get_mut(&id).and_then(|h| h.restreaming.take()) {
+                let why = format!("not done within {} s", ADOPT_RESTREAM_DEADLINE.as_secs());
+                self.restream_failed(&id, r, "deadline", &why, evt_tx, diagnostic_tx);
+            }
+        }
+    }
+
+    /// Re-label `from`'s runtime as `session_id`: the adoption proper, once nothing is left
+    /// that could make it decline.
+    fn finish_adopt(&mut self, session_id: &str, from: &str, cfg: &SessionConfig) -> Adoption {
         let Some(mut h) = self.running.remove(from) else {
             return Adoption::Fresh { after: None };
         };
         h.metrics.drain_window(Instant::now());
+        h.stream = cfg.stream.clone();
         h.held = None;
         h.swapping = false;
         h.kind = cfg.kind;
@@ -5525,6 +5742,8 @@ impl SessionManager {
                 ("running", Some("app booting".to_string()), None)
             }
             SessionEvent::HomeSeed(_) => ("starting", None, None),
+            // Never relayed: the event loop hands it to `restreamed` first.
+            SessionEvent::Restreamed(_) => ("starting", None, None),
             SessionEvent::Progress(detail) => ("starting", Some(detail.to_string()), None),
             SessionEvent::Running => {
                 self.reached_running(session_id);
@@ -9179,6 +9398,8 @@ mod tests {
                 stream: StreamParams::default(),
                 region_env: BTreeMap::new(),
                 swap_region_env: None,
+                built: (1920, 1080, 60),
+                restreaming: None,
                 exited: Arc::new(AtomicBool::new(false)),
             },
             stop,
@@ -9240,6 +9461,8 @@ mod tests {
                 stream: StreamParams::default(),
                 region_env: BTreeMap::new(),
                 swap_region_env: None,
+                built: (1920, 1080, 60),
+                restreaming: None,
                 exited: Arc::new(AtomicBool::new(false)),
             },
             display_rx,
@@ -10339,6 +10562,8 @@ mod tests {
                 stream: StreamParams::default(),
                 region_env: BTreeMap::new(),
                 swap_region_env: None,
+                built: (1920, 1080, 60),
+                restreaming: None,
                 exited: Arc::new(AtomicBool::new(false)),
             },
             capture_rx,
@@ -11368,45 +11593,38 @@ mod tests {
     }
 
     #[test]
-    fn an_adoption_checks_the_stream_the_runtime_encodes() {
+    fn an_adoption_checks_the_stream_against_what_the_runtime_was_built_with() {
         let (mut mgr, warm) = warm_manager();
         parked(&mut mgr, &warm, "k1", (1920, 1080));
         let h = &mgr.running["k1"];
         let base = h.stream.clone();
-        assert!(h.encodes(&base));
-        let smaller = StreamParams {
-            width: 1280,
-            height: 720,
-            ..base.clone()
+        let with = |f: &dyn Fn(&mut StreamParams)| {
+            let mut s = base.clone();
+            f(&mut s);
+            s
         };
-        assert!(h.encodes(&smaller));
-        for other in [
-            StreamParams {
-                codec: crate::session::Codec::H265,
-                ..base.clone()
-            },
-            StreamParams {
-                fps: 30,
-                ..base.clone()
-            },
-            StreamParams {
-                h264_profile: "high".into(),
-                ..base.clone()
-            },
-            StreamParams {
-                mic: true,
-                ..base.clone()
-            },
-            StreamParams {
-                bitrate_kbps: base.bitrate_kbps / 2,
-                ..base.clone()
-            },
-            StreamParams {
-                width: 2560,
-                ..base.clone()
-            },
+        assert!(h.fits(&base) && !h.needs_restream(&base) && !h.needs_encoder(&base));
+        let smaller = with(&|s| (s.width, s.height) = (1280, 720));
+        assert!(h.fits(&smaller) && !h.needs_restream(&smaller));
+        // Amendment 59: bitrate and a lower fps follow the stream by a restream.
+        for restream in [with(&|s| s.bitrate_kbps /= 2), with(&|s| s.fps = 30)] {
+            assert!(
+                h.fits(&restream) && h.needs_restream(&restream),
+                "{restream:?}"
+            );
+        }
+        for encoder in [
+            with(&|s| s.codec = crate::session::Codec::H265),
+            with(&|s| s.h264_profile = "high".into()),
         ] {
-            assert!(!h.encodes(&other), "{other:?}");
+            assert!(h.fits(&encoder) && h.needs_encoder(&encoder), "{encoder:?}");
+        }
+        for other in [
+            with(&|s| s.mic = !s.mic),
+            with(&|s| s.width = 2560),
+            with(&|s| s.fps = 120),
+        ] {
+            assert!(!h.fits(&other), "{other:?}");
         }
         // Another GPU is no adoption either.
         let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
@@ -11431,6 +11649,99 @@ mod tests {
         )));
         assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
         assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p1");
+    }
+
+    /// A claim on another rung: half the bitrate at the park's 1080p.
+    fn restream_claim(mgr: &mut SessionManager, warm: &Warm) -> StreamParams {
+        parked(mgr, warm, "k1", (1920, 1080));
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        cfg.stream.bitrate_kbps = mgr.running["k1"].stream.bitrate_kbps / 2;
+        let want = cfg.stream.clone();
+        assert!(acked(start(mgr, warm, "p1", cfg, Some("k1"))));
+        want
+    }
+
+    // Amendment 59: the runtime keeps its own id until the runner has moved it.
+    #[test]
+    fn a_restream_relabels_only_once_the_runner_has_moved_the_runtime() {
+        let (mut mgr, warm) = warm_manager();
+        let want = restream_claim(&mut mgr, &warm);
+        let (runner, req) = warm.adopted.recv_timeout(WAIT).unwrap();
+        assert_eq!(runner, "k1");
+        assert_eq!(req.restream.as_ref(), Some(&want));
+        assert_eq!(mgr.label("k1"), "k1", "no report under the play id yet");
+        assert!(mgr.running.contains_key("k1") && !mgr.running.contains_key("p1"));
+
+        mgr.restreamed(
+            "k1",
+            Ok(Duration::from_millis(40)),
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert_eq!(mgr.label("k1"), "p1");
+        assert_eq!(mgr.running["p1"].stream, want);
+        assert!(warm.started.try_recv().is_err(), "nothing was built");
+    }
+
+    #[test]
+    fn a_failed_restream_tears_the_runtime_down_and_builds_fresh() {
+        let (mut mgr, warm) = warm_manager();
+        restream_claim(&mut mgr, &warm);
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        let exited = mgr.running["k1"].exited.clone();
+        mgr.restreamed(
+            "k1",
+            Err(("transport", "no webrtcbin".into())),
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
+        assert!(!mgr.running["k1"].live(), "its end is a declined runtime's");
+        assert_eq!(mgr.label("k1"), "k1");
+        assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p1");
+        assert!(
+            exited.load(Ordering::Relaxed),
+            "built once the old runtime was gone"
+        );
+    }
+
+    #[test]
+    fn a_restream_past_its_deadline_builds_fresh_and_a_late_answer_is_ignored() {
+        let (mut mgr, warm) = warm_manager();
+        restream_claim(&mut mgr, &warm);
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        mgr.expire_restreams(Instant::now(), &warm.evt_tx, &diagnostic_sender());
+        assert!(
+            !mgr.running["k1"].stop.load(Ordering::Relaxed),
+            "not yet due"
+        );
+        mgr.expire_restreams(
+            Instant::now() + ADOPT_RESTREAM_DEADLINE + Duration::from_millis(1),
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
+        assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p1");
+        mgr.restreamed(
+            "k1",
+            Ok(Duration::from_secs(6)),
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert_eq!(mgr.label("k1"), "k1", "a late success re-labels nothing");
+    }
+
+    // (c) is not in this build: another codec takes the failure branch at once.
+    #[test]
+    fn another_codec_is_built_fresh() {
+        let (mut mgr, warm) = warm_manager();
+        parked(&mut mgr, &warm, "k1", (1920, 1080));
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        cfg.stream.codec = crate::session::Codec::H265;
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
+        assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p1");
+        assert!(warm.adopted.try_recv().is_err());
     }
 
     #[test]

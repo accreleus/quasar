@@ -22,9 +22,10 @@ import (
 
 // warmDispatcher records every command and answers parked_sessions_v1.
 type warmDispatcher struct {
-	mu      sync.Mutex
-	parks   bool
-	noEpoch bool // the agent's socket is gone: no command epoch to send on
+	mu       sync.Mutex
+	parks    bool
+	restream bool // adopt_restream_v1
+	noEpoch  bool // the agent's socket is gone: no command epoch to send on
 	// reject answers one command kind: "assign" or "start" refused, or
 	// "assign-ack" queued with its ack lost.
 	reject  string
@@ -42,6 +43,18 @@ func (d *warmDispatcher) SupportsParkedSessions(string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.parks
+}
+
+func (d *warmDispatcher) SupportsAdoptRestream(string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.parks && d.restream
+}
+
+func (d *warmDispatcher) setRestream(v bool) {
+	d.mu.Lock()
+	d.restream = v
+	d.mu.Unlock()
 }
 
 func (d *warmDispatcher) setParks(v bool) {
@@ -544,6 +557,90 @@ func TestTwoConcurrentClaimsAdoptOnce(t *testing.T) {
 		WHERE kind = 'play' AND state = 'assigned'`).Scan(&adopted))
 	if adopted != 1 || readRow(t, f.pool, k).Detail != "claimed" {
 		t.Fatalf("play sessions = %d, parked = %+v; want one play and the parked row claimed", adopted, readRow(t, f.pool, k))
+	}
+	// The loser is told the winner holds the home, never a Steam restart (amendment 59).
+	loser := errs[0]
+	if loser == nil {
+		loser = errs[1]
+	}
+	var inUse *HomeInUseError
+	if !errors.As(loser, &inUse) || inUse.SessionID == "" {
+		t.Errorf("loser err = %v, want home_in_use naming the winner", loser)
+	}
+	if f.disp.stopReason(k) != "" {
+		t.Error("the loser stopped the claimed session")
+	}
+}
+
+type streamRow struct {
+	Codec, H264Profile              string
+	Width, Height, FPS, BitrateKbps int32
+}
+
+func readStream(t *testing.T, pool *pgxpool.Pool, id string) streamRow {
+	t.Helper()
+	var r streamRow
+	must(t, pool.QueryRow(context.Background(), `SELECT codec, h264_profile, width, height, fps, bitrate_kbps
+		FROM sessions WHERE id = $1::uuid`, id).Scan(&r.Codec, &r.H264Profile, &r.Width, &r.Height, &r.FPS, &r.BitrateKbps))
+	return r
+}
+
+// A launch on a smaller rung (its own size and bitrate) over a 1440p park
+// adopts on an adopt_restream_v1 host, and the play row holds the launch's
+// stream; a park on exit then keeps the built 1440p size (amendment 59).
+func TestClaimAdoptsAcrossStreamSettingsWithRestream(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.disp.setRestream(true)
+	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	k := f.park(t)
+	launch := readStream(t, f.pool, k) // what this launch resolves to
+	must(t, exec(t, f.pool, `UPDATE sessions SET width = 2560, height = 1440, bitrate_kbps = bitrate_kbps + 5000
+		WHERE id = $1::uuid`, k))
+
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("claim launch: %v", err)
+	}
+	play := res.Session.ID
+	if got := readRow(t, f.pool, k); got.Detail != "claimed" || f.disp.stopReason(k) != "" {
+		t.Fatalf("parked row %+v stop=%q, want claimed and not stopped", got, f.disp.stopReason(k))
+	}
+	if a := f.disp.assignFor(t, play); a.AdoptSessionID != k {
+		t.Fatalf("assign adopts %q, want %s", a.AdoptSessionID, k)
+	}
+	if got := readStream(t, f.pool, play); got != launch {
+		t.Errorf("play stream %+v, want the launch's %+v", got, launch)
+	}
+
+	f.disp.waitFor(t, "start")
+	f.running(t, play)
+	f.coord.AgentState(ctx, f.hostID, heldStop(play))
+	again := f.parkedID(t)
+	if again == "" {
+		t.Fatal("no park on exit")
+	}
+	got := readStream(t, f.pool, again)
+	if got.Width != 2560 || got.Height != 1440 || got.FPS != launch.FPS || got.BitrateKbps != launch.BitrateKbps {
+		t.Errorf("re-parked stream %+v, want 2560x1440 at the play session's fps %d and bitrate %d",
+			got, launch.FPS, launch.BitrateKbps)
+	}
+}
+
+// Without adopt_restream_v1 the same launch supersedes, and a park on exit
+// copies the play row's stream as before.
+func TestClaimWithoutRestreamSupersedesOnBitrate(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	k := f.park(t)
+	must(t, exec(t, f.pool, `UPDATE sessions SET bitrate_kbps = bitrate_kbps + 5000 WHERE id = $1::uuid`, k))
+	_, err := f.coord.LaunchByProfile(context.Background(), f.userID,
+		LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	var refused *ParkedClaimRefusedError
+	if !errors.As(err, &refused) || refused.Cause != causeStreamDiffers {
+		t.Fatalf("err = %v, want a refused claim with cause stream_differs", err)
+	}
+	if r := f.disp.stopReason(k); r != StopReasonParkedSuperseded {
+		t.Errorf("session_stop reason = %q, want parked_superseded", r)
 	}
 }
 

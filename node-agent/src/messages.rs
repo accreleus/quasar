@@ -143,6 +143,9 @@ pub enum AgentMsg {
         /// the in-place swap.
         #[serde(skip_serializing_if = "Option::is_none")]
         parked_sessions_v1: Option<bool>,
+        /// Amendment 59: an adoption moves the runtime to the new stream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        adopt_restream_v1: Option<bool>,
     },
     ConfigPolicyState {
         attempt_id: String,
@@ -2130,6 +2133,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Enrollment {
@@ -2165,6 +2169,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -2207,6 +2212,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -2246,6 +2252,7 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {

@@ -26,6 +26,7 @@ type RegisterMsg struct {
 	SourcePolicyVersions  map[string]int  `json:"source_policy_versions,omitempty"`
 	TerminalHomeCleanupV1 bool            `json:"terminal_home_cleanup_v1,omitempty"`
 	ParkedSessionsV1      bool            `json:"parked_sessions_v1,omitempty"`
+	AdoptRestreamV1       bool            `json:"adopt_restream_v1,omitempty"` // amendment 59
 	ConfigPolicyVersions  map[string]int  `json:"config_policy_versions,omitempty"`
 	ConfigPolicyGroups    []string        `json:"config_policy_groups"`
 	Type                  string          `json:"type"`

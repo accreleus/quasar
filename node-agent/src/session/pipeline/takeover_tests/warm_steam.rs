@@ -210,6 +210,7 @@ fn adopt_as(session: &mut Session, flags: &str, kind: Option<SessionKind>) -> us
             container: Some(app(flags)),
             idle_timeout: Duration::from_secs(60),
             app_boot_timeout: Some(Duration::from_secs(300)),
+            restream: None,
         })
         .unwrap();
     at

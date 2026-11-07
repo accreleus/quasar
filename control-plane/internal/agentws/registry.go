@@ -67,6 +67,7 @@ type conn struct {
 	hostID                    string
 	terminalHomeCleanupV1     bool
 	parkedSessionsV1          bool
+	adoptRestreamV1           bool
 	policyTyped               bool
 	consoleReports            atomic.Int32 // capacity reports carrying console_capabilities
 	policyIdle                bool
@@ -343,6 +344,13 @@ func (e *homeCommandEpoch) SupportsParkedSessions() bool { return e.conn.parkedS
 func (r *Registry) SupportsParkedSessions(hostID string) bool {
 	c, ok := r.get(hostID)
 	return ok && c.parkedSessionsV1
+}
+
+// SupportsAdoptRestream reports adopt_restream_v1 (amendment 59) beside
+// parked_sessions_v1 for the host's current connection.
+func (r *Registry) SupportsAdoptRestream(hostID string) bool {
+	c, ok := r.get(hostID)
+	return ok && c.parkedSessionsV1 && c.adoptRestreamV1
 }
 
 func (r *Registry) CurrentHomeCommandEpoch(hostID string) (HomeCommandEpoch, bool) {

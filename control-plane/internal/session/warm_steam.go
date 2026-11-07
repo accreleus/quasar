@@ -52,6 +52,8 @@ type ParkedClaimRefusedError struct {
 	HolderID string
 	// Warming: the parked session is not yet running and is left to finish.
 	Warming bool
+	// Cause is the failed check of a superseded claim, for the log.
+	Cause string
 }
 
 func (e *ParkedClaimRefusedError) Error() string {
@@ -96,6 +98,12 @@ func dispatcherParks(d Dispatcher, hostID string, epoch agentws.HomeCommandEpoch
 
 func (c *Coordinator) hostParks(hostID string) bool {
 	return dispatcherParks(c.dispatcher, hostID, nil)
+}
+
+// hostRestreams is adopt_restream_v1 on the host's current connection (amendment 59).
+func (c *Coordinator) hostRestreams(hostID string) bool {
+	r, ok := c.dispatcher.(interface{ SupportsAdoptRestream(string) bool })
+	return ok && r.SupportsAdoptRestream(hostID)
 }
 
 func (c *Coordinator) epochParks(hostID string, epoch agentws.HomeCommandEpoch) bool {
@@ -299,48 +307,179 @@ type claimedParked struct {
 	id       string
 	hostID   string
 	gpuIndex int32
+	// restream names what the play stream changes on the adopted runtime
+	// (amendment 59), for the "claim adopted" log.
+	restream []string
 }
 
-// claimParked locks the parked row and runs claim checks 1–4; on success it
-// moves the row to stopped "claimed", releasing its reservation, so check 5 is
-// the pinned placement that follows in the same transaction. The checks do not
-// read steam_warm_enabled: with the switch off a claim still adopts, and the
-// expiry job stops whatever is left within 60 s.
+// Claim causes, logged with a superseded claim and never served
+// (control-api.md §Warm Steam "Claim", amendment 59).
+const (
+	causeNotRunning       = "not_running"
+	causeExpired          = "expired"
+	causeHostUnavailable  = "host_unavailable"
+	causeMicDiffers       = "mic_differs"
+	causeSizeLarger       = "size_larger"
+	causeFPSHigher        = "fps_higher"
+	causeCodecUnsupported = "codec_unsupported"
+	causeStreamDiffers    = "stream_differs"
+	causeNoRoom           = "no_room"
+)
+
+// claimStream is the part of a stream that claim check 4 compares. Codec is
+// never "": callers normalise the h264 default.
+type claimStream struct {
+	Codec                           string
+	Width, Height, FPS, BitrateKbps int32
+	H264Profile                     string
+	Mic                             bool
+}
+
+// parkedFacts is what a claim reads under the parked row's lock.
+type parkedFacts struct {
+	Family     bool // check 1: the caller's, the launched app's home app, kind parked
+	State      State
+	InDeadline bool
+	HostUp     bool // check 3, parked_sessions_v1 included
+	Restream   bool // adopt_restream_v1 on that connection
+	Stream     claimStream
+}
+
+type claimOutcome int
+
+const (
+	claimAdopt claimOutcome = iota
+	claimWarming
+	claimSupersede
+	// claimLost: a racing launch claimed it first (the row is already terminal).
+	claimLost
+)
+
+type claimVerdict struct {
+	Outcome  claimOutcome
+	Cause    string   // claimSupersede: the first failing check; "" for check 1
+	Restream []string // claimAdopt: what differs from the parked stream
+}
+
+// decideClaim is claim checks 1–4 (control-api.md §Warm Steam "Claim").
+func decideClaim(k parkedFacts, launch claimStream) claimVerdict {
+	if k.State.IsTerminal() {
+		return claimVerdict{Outcome: claimLost}
+	}
+	cause4, restream := claimCheck4(k.Stream, launch, k.Restream)
+	warmingState := k.State == StatePending || k.State == StateAssigned || k.State == StateStarting
+	switch {
+	case !k.Family:
+		return claimVerdict{Outcome: claimSupersede}
+	case k.InDeadline && k.HostUp && cause4 == "" && warmingState:
+		// Only check 2 failing on a session still warming leaves it to finish.
+		return claimVerdict{Outcome: claimWarming}
+	case k.State != StateRunning:
+		return claimVerdict{Outcome: claimSupersede, Cause: causeNotRunning}
+	case !k.InDeadline:
+		return claimVerdict{Outcome: claimSupersede, Cause: causeExpired}
+	case !k.HostUp:
+		return claimVerdict{Outcome: claimSupersede, Cause: causeHostUnavailable}
+	case cause4 != "":
+		return claimVerdict{Outcome: claimSupersede, Cause: cause4}
+	}
+	return claimVerdict{Outcome: claimAdopt, Restream: restream}
+}
+
+// claimCheck4 compares the launch's stream with the parked one. Without
+// adopt_restream_v1 only the size may be smaller; with it codec, H.264 profile,
+// bitrate and a lower fps follow the launch too (amendment 59).
+func claimCheck4(parked, launch claimStream, restream bool) (cause string, changed []string) {
+	switch {
+	case launch.Mic != parked.Mic:
+		return causeMicDiffers, nil
+	case launch.Width > parked.Width || launch.Height > parked.Height:
+		return causeSizeLarger, nil
+	case launch.FPS > parked.FPS:
+		return causeFPSHigher, nil
+	}
+	for _, d := range []struct {
+		name string
+		diff bool
+	}{
+		{"size", launch.Width != parked.Width || launch.Height != parked.Height},
+		{"fps", launch.FPS != parked.FPS},
+		{"bitrate", launch.BitrateKbps != parked.BitrateKbps},
+		{"codec", launch.Codec != parked.Codec},
+		{"h264_profile", launch.H264Profile != parked.H264Profile},
+	} {
+		if d.diff {
+			changed = append(changed, d.name)
+		}
+	}
+	if !restream && len(changed) > 0 && (len(changed) > 1 || changed[0] != "size") {
+		return causeStreamDiffers, nil
+	}
+	return "", changed
+}
+
+// errClaimLost: the parked session was claimed by a racing launch. Not a
+// supersede; the launch is answered by the home guard (claimLostAnswer).
+var errClaimLost = fmt.Errorf("parked session already claimed: %w", ErrCapacityExhausted)
+
+// claimParked locks the parked row and runs claim checks 1–4 (decideClaim); on
+// success it moves the row to stopped "claimed", releasing its reservation, so
+// check 5 is the pinned placement that follows in the same transaction. The
+// checks do not read steam_warm_enabled: with the switch off a claim still
+// adopts, and the expiry job stops whatever is left within 60 s.
 func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked, error) {
 	k := claimedParked{id: p.claim.id}
-	var state State
-	var others, inDeadline bool
+	var f parkedFacts
 	err := tx.QueryRow(ctx, `
 		SELECT k.host_id::text, g.index, k.state, k.parked_until > now(),
-		       k.user_id = $2::uuid AND k.app_id = $3::uuid AND k.kind = 'parked'
-		       AND h.status = 'online' AND h.agent_disconnected_at IS NULL
-		       AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = h.id)
-		       AND k.codec = COALESCE(NULLIF($4, ''), 'h264') AND k.fps = $5 AND k.bitrate_kbps = $6
-		       AND k.h264_profile = $7 AND k.mic = $8 AND k.width >= $9 AND k.height >= $10
+		       k.user_id = $2::uuid AND k.app_id = $3::uuid AND k.kind = 'parked',
+		       h.status = 'online' AND h.agent_disconnected_at IS NULL
+		       AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = h.id),
+		       k.codec, k.width, k.height, k.fps, k.bitrate_kbps, k.h264_profile, k.mic
 		FROM sessions k JOIN gpus g ON g.id = k.gpu_id JOIN hosts h ON h.id = k.host_id
 		WHERE k.id = $1::uuid
 		FOR UPDATE OF k`,
-		k.id, p.UserID, p.homeAppID(), p.Codec, p.FPS, p.BitrateKbps, p.H264Profile, p.Mic, p.Width, p.Height).
-		Scan(&k.hostID, &k.gpuIndex, &state, &inDeadline, &others)
+		k.id, p.UserID, p.homeAppID()).
+		Scan(&k.hostID, &k.gpuIndex, &f.State, &f.InDeadline, &f.Family, &f.HostUp,
+			&f.Stream.Codec, &f.Stream.Width, &f.Stream.Height, &f.Stream.FPS, &f.Stream.BitrateKbps,
+			&f.Stream.H264Profile, &f.Stream.Mic)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, &ParkedClaimRefusedError{HolderID: k.id}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("lock parked session: %w", err)
 	}
-	others = others && p.claim.hostParks
-	// Only check 2 failing on a session still warming leaves it to finish.
-	if others && inDeadline && (state == StatePending || state == StateAssigned || state == StateStarting) {
+	f.HostUp = f.HostUp && p.claim.hostParks
+	f.Restream = p.claim.restream
+	v := decideClaim(f, claimStream{Codec: codecOrH264(p.Codec), Width: p.Width, Height: p.Height, FPS: p.FPS,
+		BitrateKbps: p.BitrateKbps, H264Profile: p.H264Profile, Mic: p.Mic})
+	switch v.Outcome {
+	case claimLost:
+		return nil, errClaimLost
+	case claimWarming:
 		return nil, &ParkedClaimRefusedError{HolderID: k.id, Warming: true}
-	}
-	if !(others && inDeadline && state == StateRunning) {
-		return nil, &ParkedClaimRefusedError{HolderID: k.id}
+	case claimSupersede:
+		return nil, &ParkedClaimRefusedError{HolderID: k.id, Cause: v.Cause}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE sessions SET state = 'stopped', state_detail = $2,
 		ended_at = now(), launch_progress = NULL WHERE id = $1::uuid`, k.id, claimedDetail); err != nil {
 		return nil, fmt.Errorf("claim parked session: %w", err)
 	}
+	k.restream = v.Restream
 	return &k, nil
+}
+
+// claimLostAnswer answers a launch whose claim a racing launch won: home_in_use
+// naming the winner while it holds the home, never steam_restarting.
+func claimLostAnswer(ctx context.Context, tx pgx.Tx, p CreateParams) error {
+	conflict, err := homeInUse(ctx, tx, p.UserID, p.homeAppID(), "")
+	if err != nil {
+		return fmt.Errorf("count same-home sessions: %w", err)
+	}
+	if conflict != nil && conflict.SessionID != "" {
+		return conflict
+	}
+	return errClaimLost
 }
 
 // adoptedByLive reports whether a non-terminal row adopts id's runtime. Until
@@ -553,7 +692,7 @@ func (c *Coordinator) endHeldRuntime(ctx context.Context, hostID string, m agent
 	if m.Detail != "" {
 		detail = &m.Detail
 	}
-	ended, parked, err := c.store.endHeldPlay(ctx, hostID, m.SessionID, detail, c.hostParks(hostID))
+	ended, parked, err := c.store.endHeldPlay(ctx, hostID, m.SessionID, detail, c.hostParks(hostID), c.hostRestreams(hostID))
 	if errors.Is(err, ErrNotFound) {
 		c.log.Warn("ignoring session state from non-owner host", "session_id", m.SessionID)
 		return
@@ -597,8 +736,10 @@ func (c *Coordinator) dispatchParked(k Session) {
 // transaction: a parked row for the Steam parent on the same GPU, taking the
 // ended session's reservation and home binding (the hold follows at its first
 // report, adoptRuntime). ended is nil when the row was already terminal;
-// parked is nil for a release.
-func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detail *string, hostParks bool) (ended, parked *Session, err error) {
+// parked is nil for a release. With restream (adopt_restream_v1) the parked
+// row keeps the size and fps of the row the ended session adopted, the size
+// the runtime was built with (amendment 59).
+func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detail *string, hostParks, restream bool) (ended, parked *Session, err error) {
 	if !isValidUUID(sessionID) {
 		return nil, nil, ErrNotFound
 	}
@@ -667,13 +808,15 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 		    profile_id, stream_profile_id, playout0_ms, reserved_encode_slots,
 		    mic, device_id, assigned_at, kind, parked_until)
 		SELECT p.user_id, root.id, p.host_id, p.gpu_id, 'assigned',
-		       p.width, p.height, p.fps, p.bitrate_kbps, p.h264_profile, p.codec,
+		       COALESCE(src.width, p.width), COALESCE(src.height, p.height), COALESCE(src.fps, p.fps),
+		       p.bitrate_kbps, p.h264_profile, p.codec,
 		       p.profile_id, p.stream_profile_id, p.playout0_ms, p.reserved_encode_slots,
 		       p.mic, p.device_id, now(), 'parked', now() + make_interval(mins => $2::int)
 		FROM sessions p
 		JOIN apps a ON a.id = p.app_id
 		JOIN apps root ON root.id = COALESCE(a.parent_app_id, a.id)
 		JOIN hosts h ON h.id = p.host_id
+		LEFT JOIN sessions src ON src.id = p.adopt_session_id AND $3::boolean
 		WHERE p.id = $1::uuid
 		  AND root.enabled AND root.library_provider = 'steam'
 		  AND EXISTS (SELECT 1 FROM entitlements e WHERE e.app_id = root.id
@@ -683,7 +826,7 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 		        AND o.state NOT IN ('stopped','failed'))
 		  AND h.status = 'online' AND h.agent_disconnected_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = h.id)
-		RETURNING `+sessionCols, sessionID, w.IdleMinutes))
+		RETURNING `+sessionCols, sessionID, w.IdleMinutes, restream))
 	if err == nil {
 		err = adoptRuntime(ctx, sp, sessionID, k.ID)
 	}

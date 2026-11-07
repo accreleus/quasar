@@ -1,6 +1,7 @@
 package session
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
@@ -58,5 +59,53 @@ func TestValidLaunchProgress(t *testing.T) {
 		if _, ok := validLaunchProgress([]byte(raw)); ok != want {
 			t.Errorf("validLaunchProgress(%s) = %v, want %v", raw, ok, want)
 		}
+	}
+}
+
+func TestDecideClaim(t *testing.T) {
+	park := claimStream{Codec: "av1", Width: 2560, Height: 1440, FPS: 60, BitrateKbps: 7000, H264Profile: "main", Mic: true}
+	with := func(f func(*claimStream)) claimStream { s := park; f(&s); return s }
+	p1080 := with(func(s *claimStream) { s.Width, s.Height, s.BitrateKbps = 1920, 1080, 5000 })
+	running := parkedFacts{Family: true, State: StateRunning, InDeadline: true, HostUp: true, Restream: true, Stream: park}
+	old := running
+	old.Restream = false
+	at := func(f func(*parkedFacts)) parkedFacts { k := running; f(&k); return k }
+
+	cases := []struct {
+		name     string
+		k        parkedFacts
+		launch   claimStream
+		outcome  claimOutcome
+		cause    string
+		restream string
+	}{
+		{"same settings", running, park, claimAdopt, "", ""},
+		{"same settings, old agent", old, park, claimAdopt, "", ""},
+		{"resolution only", running, with(func(s *claimStream) { s.Width, s.Height = 1920, 1080 }), claimAdopt, "", "size"},
+		{"resolution only, old agent", old, with(func(s *claimStream) { s.Width, s.Height = 1920, 1080 }), claimAdopt, "", "size"},
+		{"1080p rung over a 1440p park", running, p1080, claimAdopt, "", "size,bitrate"},
+		{"1080p rung, old agent", old, p1080, claimSupersede, causeStreamDiffers, ""},
+		{"fps lower", running, with(func(s *claimStream) { s.FPS = 30 }), claimAdopt, "", "fps"},
+		{"fps lower, old agent", old, with(func(s *claimStream) { s.FPS = 30 }), claimSupersede, causeStreamDiffers, ""},
+		{"fps higher", running, with(func(s *claimStream) { s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
+		{"size larger", running, with(func(s *claimStream) { s.Width, s.Height = 3840, 2160 }), claimSupersede, causeSizeLarger, ""},
+		{"codec", running, with(func(s *claimStream) { s.Codec, s.H264Profile = "h264", "constrained-baseline" }), claimAdopt, "", "codec,h264_profile"},
+		{"codec, old agent", old, with(func(s *claimStream) { s.Codec = "h264" }), claimSupersede, causeStreamDiffers, ""},
+		{"mic first", running, with(func(s *claimStream) { s.Mic, s.Width = false, 3840 }), claimSupersede, causeMicDiffers, ""},
+		{"warming waits", at(func(k *parkedFacts) { k.State = StateStarting }), park, claimWarming, "", ""},
+		{"warming with a check-4 failure", at(func(k *parkedFacts) { k.State = StateStarting }), with(func(s *claimStream) { s.FPS = 120 }), claimSupersede, causeNotRunning, ""},
+		{"stopping", at(func(k *parkedFacts) { k.State = StateStopping }), park, claimSupersede, causeNotRunning, ""},
+		{"expired before host", at(func(k *parkedFacts) { k.InDeadline, k.HostUp = false, false }), park, claimSupersede, causeExpired, ""},
+		{"host down", at(func(k *parkedFacts) { k.HostUp = false }), park, claimSupersede, causeHostUnavailable, ""},
+		{"check 1 has no cause", at(func(k *parkedFacts) { k.Family = false }), park, claimSupersede, "", ""},
+		{"claimed by a racing launch", at(func(k *parkedFacts) { k.State = StateStopped }), park, claimLost, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := decideClaim(tc.k, tc.launch)
+			if v.Outcome != tc.outcome || v.Cause != tc.cause || strings.Join(v.Restream, ",") != tc.restream {
+				t.Errorf("decideClaim = %+v, want outcome %d cause %q restream %q", v, tc.outcome, tc.cause, tc.restream)
+			}
+		})
 	}
 }
