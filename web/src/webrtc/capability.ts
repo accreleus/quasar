@@ -52,8 +52,10 @@ export function getOrCreateDeviceKey(): string {
  * H.264 verdict it posted: the server refuses H.264 rungs for a device whose record
  * says no, so a changed verdict (plugin installed) is posted at once, not tomorrow (#688).
  * It holds the zone and language too: launches read them from the record (amendment 49).
+ * v4 (amendment 54): a record posted before the WebCodecs and WebGPU keys existed makes the
+ * planner say `device_no_webcodecs`, so every stamp under v3 forces one post.
  */
-const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v3";
+const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v4";
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function deviceProbeIsFresh(userId: string, h264: boolean, now: number = Date.now()): boolean {
@@ -198,9 +200,17 @@ export function probeWebTransport(): { available: boolean; datagrams: boolean } 
   return { available, datagrams: available && "datagrams" in WebTransport.prototype };
 }
 
-/** Amendment 54's `webcodecs` key, for the configurations the WebTransport path uses.
- *  HEVC, AV1 and the encoder side come with #1036 and #1043. */
-export async function probeWebCodecs(): Promise<{ h264: boolean; opus_decode: boolean }> {
+export interface WebCodecsProbe {
+  h264: boolean;
+  hevc: boolean;
+  av1: boolean;
+  opus_decode: boolean;
+  opus_encode: boolean;
+}
+
+/** Amendment 54's `webcodecs` key: `true` only when `isConfigSupported` proved the
+ *  configuration the WebTransport path would use. */
+export async function probeWebCodecs(): Promise<WebCodecsProbe> {
   const supported = async (check: () => Promise<{ supported?: boolean }> | undefined) => {
     try {
       return (await check())?.supported === true;
@@ -208,19 +218,30 @@ export async function probeWebCodecs(): Promise<{ h264: boolean; opus_decode: bo
       return false;
     }
   };
-  const [h264, opus] = await Promise.all([
-    supported(() =>
-      typeof VideoDecoder === "function"
-        ? VideoDecoder.isConfigSupported({ codec: "avc1.42e01f", codedWidth: 1920, codedHeight: 1080 })
-        : undefined,
-    ),
-    supported(() =>
-      typeof AudioDecoder === "function"
-        ? AudioDecoder.isConfigSupported({ codec: "opus", sampleRate: 48000, numberOfChannels: 2 })
-        : undefined,
-    ),
+  const video = (codec: string) => () =>
+    typeof VideoDecoder === "function"
+      ? VideoDecoder.isConfigSupported({ codec, codedWidth: 1920, codedHeight: 1080 })
+      : undefined;
+  const opus = { codec: "opus", sampleRate: 48000, numberOfChannels: 2 };
+  const [h264, hevc, av1, opus_decode, opus_encode] = await Promise.all([
+    supported(video("avc1.42e01f")),
+    supported(video("hvc1.1.6.L93.B0")),
+    supported(video("av01.0.08M.08")),
+    supported(() => (typeof AudioDecoder === "function" ? AudioDecoder.isConfigSupported(opus) : undefined)),
+    supported(() => (typeof AudioEncoder === "function" ? AudioEncoder.isConfigSupported(opus) : undefined)),
   ]);
-  return { h264, opus_decode: opus };
+  return { h264, hevc, av1, opus_decode, opus_encode };
+}
+
+/** Amendment 54's `webgpu` key. Decides nothing for WebTransport; PyroWave reads `available`. */
+export async function probeWebGpu(): Promise<{ available: boolean; features: string[] }> {
+  try {
+    const adapter = await (navigator.gpu as GPU | undefined)?.requestAdapter();
+    if (!adapter) return { available: false, features: [] };
+    return { available: true, features: ["subgroups", "shader-f16"].filter((f) => adapter.features.has(f)) };
+  } catch {
+    return { available: false, features: [] };
+  }
 }
 
 /**
@@ -564,7 +585,8 @@ export interface DeviceCapabilities {
   rtt_ms: number | null;
   /** Amendment 54. */
   webtransport?: { available: boolean; datagrams: boolean };
-  webcodecs?: { h264: boolean; opus_decode: boolean };
+  webcodecs?: WebCodecsProbe;
+  webgpu?: { available: boolean; features: string[] };
   /** Amendment 49: the browser's zone and language, read at launch. */
   timezone?: string;
   language?: string;
@@ -662,13 +684,14 @@ export interface NativeCapabilities extends Omit<DeviceCapabilities, "client_typ
 
 /** All measurements are best-effort; null values are valid (JSONB column). */
 export async function probeCapabilities(): Promise<DeviceCapabilities> {
-  const [h264Decodable, rttMs, bandwidthKbps, display, codecsDetail, webcodecs] = await Promise.all([
+  const [h264Decodable, rttMs, bandwidthKbps, display, codecsDetail, webcodecs, webgpu] = await Promise.all([
     probeH264Decodable(),
     probeRttMs(),
     probeBandwidthKbps(),
     probeDisplay(),
     probeCodecsDetail(),
     probeWebCodecs(),
+    probeWebGpu(),
   ]);
 
   return {
@@ -687,6 +710,7 @@ export async function probeCapabilities(): Promise<DeviceCapabilities> {
     rtt_ms:            rttMs,
     webtransport:      probeWebTransport(),
     webcodecs,
+    webgpu,
     ...probeRegion(),
   };
 }

@@ -56,6 +56,8 @@ interface SessionLoaderProps {
   /** #482: video PeerConnection's live ICE state; `failed`/`disconnected` (or running-but-
    *  not-connected) turns the stall copy from a scheduling story into a transport one. */
   iceState?: TransportState | null;
+  /** The session's transport; WebTransport has no signaling socket or ICE to read. */
+  transport?: "webrtc" | "webtransport";
   /** Control-plane `state` / `app_launch_state` for this session. */
   sessionState?: string;
   appLaunchState?: string;
@@ -80,6 +82,7 @@ export function SessionLoader({
   hostAssigned = false,
   sessionRunning = false,
   iceState = null,
+  transport = "webrtc",
   sessionState,
   appLaunchState,
   shaderPercent = null,
@@ -200,6 +203,7 @@ export function SessionLoader({
           hostAssigned,
           sessionRunning,
           iceState,
+          transport,
           phaseElapsedMs: now - phaseStartRef.current,
           transportElapsedMs:
             transportStartRef.current === null ? 0 : now - transportStartRef.current,

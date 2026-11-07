@@ -8,8 +8,9 @@ import type { WebTransportCoords } from "../../api/types";
 import { median, percentile } from "../../lib/stats";
 import { EMPTY_SNAPSHOT, type TelemetrySnapshot } from "../../webrtc/telemetry";
 import { DecodeStage, type DecodeFailure, type DecodeStageOptions } from "../../webtransport/decodeStage";
+import { fallbackReason } from "../../webtransport/fallback";
 import { createWebGpuPresenter, type Presenter } from "../../webtransport/presenter";
-import { TransportError, type MediaTransport } from "../../webtransport/transport";
+import { TransportError, type MediaTransport, type TransportEnd } from "../../webtransport/transport";
 import { WebTransportMedia } from "../../webtransport/webTransportMedia";
 import {
   IDLE_SNAPSHOT,
@@ -26,24 +27,10 @@ const TELEMETRY_MS = 1_000;
 const G2G_WINDOW = 600;
 /** The mime form telemetry's negotiatedCodec uses, from the hello_ack's wire codec. */
 const CODEC_MIME: Record<string, string> = { h264: "video/H264", h265: "video/H265", av1: "video/AV1" };
-const RELAUNCH = "Launch again without ?transport=webtransport to stream over WebRTC.";
-
-/** Why WebTransport could not go on, as one sentence for the page's failure card. */
+/** The failure card's sentence for a failure that stops the view. Every other failure falls back
+ *  to WebRTC (fallbackReason) and never reaches the card. */
 export function transportFailureDetail(code: string): string {
-  const why: Record<string, string> = {
-    auth_failed: "The host refused this device's WebTransport token.",
-    session_ended: "The session ended.",
-    unsupported_version: "The host speaks a different WebTransport version.",
-    takeover_rate_limited: "This session changed device too often; try again in a minute.",
-    connect_failed: "The browser could not open a WebTransport connection to the host.",
-    connect_timeout: "The host did not start streaming over WebTransport within a minute.",
-    stream_lost: "The WebTransport connection to the host was lost.",
-    decoder_unsupported: "This browser cannot decode the stream over WebTransport.",
-    decode_error: "The stream kept failing to decode.",
-    no_webgpu: "WebTransport needs WebGPU, which this browser does not offer.",
-    gpu_failed: "The browser's GPU stopped drawing the stream.",
-  };
-  return `${why[code] ?? "The WebTransport connection failed."} ${RELAUNCH}`;
+  return code === "session_ended" ? "The session ended." : "The WebTransport connection failed.";
 }
 
 export interface WebTransportRuntimeDeps {
@@ -58,8 +45,12 @@ export interface WebTransportRuntimeConfig {
   coords: WebTransportCoords;
   canvas: HTMLCanvasElement;
   callbacks: Pick<SessionRuntimeCallbacks, "onDisconnectSuspected" | "onSessionTakenOver"> & {
-    /** Terminal: WebTransport cannot go on. `detail` is human copy for the failure card. */
+    /** Terminal and not a fallback: the session ended or WebTransport cannot be used. `detail` is
+     *  human copy for the failure card. */
     onTransportFailed(detail: string): void;
+    /** WebTransport has been closed and the page should carry on over WebRTC.
+     *  `reason` is the `transport.fallback` reason (control-api.md §Transport fallback). */
+    onFallback(reason: string): void;
   };
   deps?: Partial<WebTransportRuntimeDeps>;
 }
@@ -79,6 +70,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   const telemetrySubs = new Set<(snap: TelemetrySnapshot) => void>();
   let destroyed = false;
   let started = false;
+  /** The one reconnect a lost stream gets before the view falls back. */
+  let reconnected = false;
   /** Set by the first terminal failure; nothing runs after it. */
   let failed = false;
   let transport: MediaTransport | null = null;
@@ -110,16 +103,21 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     presenter?.destroy();
   };
 
-  // shortcut: a terminal WebTransport failure ends this view with its reason; falling back
-  // to WebRTC on its own is #1036, upgrade there.
-  const fail = (code: string, patch: Partial<SessionRuntimeSnapshot> = {}) => {
+  // A failure the contract falls back on hands the session to WebRTC; the rest end this view.
+  const fail = (code: string) => {
     if (failed || destroyed) return;
     failed = true;
     stop();
+    const reason = fallbackReason(code);
+    if (reason) {
+      set({ status: "falling back to WebRTC…", channelOpen: false });
+      cfg.callbacks.onFallback(reason);
+      return;
+    }
     const detail = transportFailureDetail(code);
     // Before the reveal the loader shows the page's failure card; after it, `recovery`
     // `failed` puts the reason on the session's existing recovery banner.
-    set({ status: detail, channelOpen: false, recovery: { phase: "failed", attempt: 0, maxAttempts: 0, message: detail }, ...patch });
+    set({ status: detail, channelOpen: false, recovery: { phase: "failed", attempt: 0, maxAttempts: 0, message: detail } });
     cfg.callbacks.onTransportFailed(detail);
   };
 
@@ -175,17 +173,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       return;
     }
     if (!p) {
-      fail("no_webgpu", { clientUnsupported: true });
+      fail("no_webgpu");
       return;
     }
     presenter = p;
-    const t = deps.createTransport({
-      sessionId: cfg.sessionId,
-      coords: cfg.coords,
-      mintToken: () =>
-        mintTransportToken(cfg.authToken, cfg.sessionId).then((r) => r.transport_options.webtransport),
-    });
-    transport = t;
     const s = new DecodeStage({
       ...deps.decoder,
       onFrame: (frame) => {
@@ -201,32 +192,28 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         }
         if (!snapshot.firstFrame) set({ firstFrame: true, status: "streaming over WebTransport" });
       },
-      requestKeyframe: (reason) => t.requestKeyframe(reason),
-      // decoder_unsupported has its own banner (clientUnsupported); the recovery one would repeat it.
-      onFatal: (reason: DecodeFailure) =>
-        fail(reason, reason === "decoder_unsupported" ? { clientUnsupported: true, recovery: null } : {}),
+      requestKeyframe: (reason) => transport?.requestKeyframe(reason),
+      onFatal: (reason: DecodeFailure) => fail(reason),
     });
     stage = s;
+    await connectTransport(cfg.coords);
+  }
+
+  /** Opens a transport with `coords` and returns once it is up, or the view has failed. */
+  async function connectTransport(coords: WebTransportCoords): Promise<void> {
+    const t = deps.createTransport({ sessionId: cfg.sessionId, coords, mintToken: mintCoords });
+    transport = t;
     try {
       await t.connect({
         config: (c) => {
           negotiatedCodec = CODEC_MIME[c.codec] ?? c.codec;
-          s.config(c);
+          stage?.config(c);
         },
         unit: (u) => {
           bytesTotal += u.data.length;
-          s.unit(u);
+          stage?.unit(u);
         },
-        end: (e) => {
-          if (destroyed || failed) return;
-          if (e.code === CLOSE_TAKEN_OVER) {
-            takenOver();
-            return;
-          }
-          // The page asks the control plane why; its verdict outranks this one.
-          cfg.callbacks.onDisconnectSuspected();
-          fail(e.code === CLOSE_ENDED ? "session_ended" : "stream_lost");
-        },
+        end: (e) => onEnd(t, e),
       });
     } catch (err) {
       if (destroyed || failed) return;
@@ -242,8 +229,37 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (destroyed || failed) return;
     // hello_ack: the control stream is up, and it is what carries input on this transport.
     set({ wsOpen: true, pcConnected: true, channelOpen: true, iceState: "connected" });
-    timer = setInterval(tick, TELEMETRY_MS);
-    document.addEventListener("visibilitychange", onVisible);
+    if (timer === null) {
+      timer = setInterval(tick, TELEMETRY_MS);
+      document.addEventListener("visibilitychange", onVisible);
+    }
+  }
+
+  const mintCoords = async () =>
+    (await mintTransportToken(cfg.authToken, cfg.sessionId)).transport_options.webtransport;
+
+  /** One connection lost after it was up: a fresh transport token gets one try, then WebRTC. */
+  function onEnd(t: MediaTransport, e: TransportEnd): void {
+    if (destroyed || failed || t !== transport) return;
+    if (e.code === CLOSE_TAKEN_OVER) {
+      takenOver();
+      return;
+    }
+    // The page asks the control plane why; its verdict outranks this one.
+    cfg.callbacks.onDisconnectSuspected();
+    if (e.code === CLOSE_ENDED) {
+      fail("session_ended");
+      return;
+    }
+    if (reconnected) {
+      fail("stream_lost");
+      return;
+    }
+    reconnected = true;
+    transport = null; // the closed one's own `end` is then not this view's
+    t.close();
+    set({ status: "reconnecting over WebTransport…", channelOpen: false });
+    mintCoords().then(connectTransport, () => fail("auth_failed"));
   }
 
   return {

@@ -144,6 +144,8 @@ export interface StallInputs {
    * has not (so the transport clock has not started).
    */
   transportElapsedMs: number;
+  /** WebTransport has no signaling socket or ICE: its "not connected" is its own verdict. */
+  transport?: "webrtc" | "webtransport";
   /** Caller/test seam — overrides the per-phase budget (not the transport one). */
   stallMs?: number;
 }
@@ -161,6 +163,12 @@ const signalingVerdict: StallVerdict = {
   message: "The browser could not open the session’s signaling connection to Quasar. Check the public address, reverse proxy WebSocket support, and allowed browser origins in instance settings. Media negotiation has not started, so this does not establish a UDP, STUN or TURN problem.",
 };
 
+const webTransportVerdict: StallVerdict = {
+  kind: "transport",
+  title: "WebTransport has not connected",
+  message: "The host is ready, but this browser has not opened its WebTransport connection yet. The browser tries for a few seconds, then carries on over WebRTC by itself. If this stays, UDP to the host may be blocked.",
+};
+
 const transportVerdict: StallVerdict = { kind: "transport", ...TRANSPORT_STALL_COPY };
 
 const phaseVerdict = (phase: LaunchPhase): StallVerdict => ({
@@ -176,7 +184,10 @@ export function resolveStall(input: StallInputs): StallVerdict | null {
   const { phase, hostAssigned, sessionRunning, iceState, phaseElapsedMs, transportElapsedMs } = input;
 
   // A running app is not evidence that signaling or media negotiation began.
-  if (input.wsOpen === false && (iceState === null || iceState === "new") && (sessionRunning || phase === "stream") && (
+  if (input.transport === "webtransport" && input.wsOpen === false && sessionRunning && transportElapsedMs >= TRANSPORT_STALL_MS) {
+    return webTransportVerdict;
+  }
+  if (input.transport !== "webtransport" && input.wsOpen === false && (iceState === null || iceState === "new") && (sessionRunning || phase === "stream") && (
     (sessionRunning && transportElapsedMs >= TRANSPORT_STALL_MS) ||
     phaseElapsedMs >= (input.stallMs ?? PHASE_STALL_MS[phase])
   )) return signalingVerdict;

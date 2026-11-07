@@ -31,6 +31,7 @@ import {
   type SessionRuntimeSnapshot,
 } from "./sessionRuntime";
 import { createWebTransportRuntime } from "./webTransportRuntime";
+import { TraceEventEmitter } from "../../webrtc/traceEvents";
 import { MicCapture, MicCaptureError, withUntrustedCertContext } from "../../webrtc/mic";
 import { probeCertificateTrust, type CertTrust } from "../../lib/certTrust";
 import { useToast } from "../../components/Toast";
@@ -143,7 +144,9 @@ function SessionPageBody() {
   const videoRef = useRef<HTMLVideoElement>(null);
   // WebTransport draws here; the <video> stays mounted and empty.
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const webtransport = state?.webtransport;
+  // Set when WebTransport gave up and the session carries on over WebRTC.
+  const [fallbackReason, setFallbackReason] = useState<string | null>(null);
+  const webtransport = fallbackReason ? undefined : state?.webtransport;
   const containerRef = useRef<HTMLDivElement>(null);
   // The HUD owns whether it is open and on which section; this page only asks
   // it to open (summon chord, stage click, touch button) and to collapse.
@@ -405,6 +408,21 @@ function SessionPageBody() {
     runtimeRef.current?.setMouse(mouse);
   }, [mouse]);
 
+  // The runtime has already closed WebTransport (control-api.md §Transport fallback, "Close first").
+  // The launch's signaling token may have expired, so a fresh one is minted.
+  const fallBackToWebRtc = async (reason: string) => {
+    new TraceEventEmitter(sessionId ?? "", authToken ?? "").emitTransportFallback(reason);
+    try {
+      const { signaling } = await mintSignalingToken(authToken ?? "", sessionId ?? "");
+      if (!signaling?.url || !signaling?.token) throw new Error("no signaling coordinates");
+      setFallbackReason(reason);
+      setSignalCoords({ url: signaling.url, token: signaling.token, replacement: true, iceServers: signaling.ice_servers ?? [] });
+    } catch (err) {
+      noteFailure(unreachableFailure(err instanceof ApiError ? err.message : undefined));
+      void pollEndReason();
+    }
+  };
+
   useEffect(() => {
     if (!signalCoords.url || !signalCoords.token || !videoRef.current) return;
 
@@ -420,6 +438,7 @@ function SessionPageBody() {
             onSessionTakenOver: () => noteFailure(takenOverFailure()),
             // A poll verdict about the session's end outranks this one (settleFailure).
             onTransportFailed: (detail) => noteFailure(unreachableFailure(detail)),
+            onFallback: (reason) => void fallBackToWebRtc(reason),
           },
         })
       : createSessionRuntime({
@@ -1182,6 +1201,7 @@ function SessionPageBody() {
           hostAssigned={hostAssigned}
           sessionRunning={sessionRunning}
           iceState={iceState}
+          transport={webtransport ? "webtransport" : "webrtc"}
           takeoverRefused={takeoverRefused}
           // handleStop tears the session down server-side so "Back to
           // library" from a dead launch never orphans a session. Not for a
@@ -1226,6 +1246,7 @@ function SessionPageBody() {
             tier={state?.tier}
             resolvedCodec={state?.resolvedCodec}
             transport={webtransport ? "webtransport" : "webrtc"}
+            transportFallbackReason={fallbackReason}
             sessionId={sessionId}
             inputCaptured={inputCaptured}
             onGrab={handleGrab}
