@@ -18,17 +18,25 @@ use crate::nofollow_dir::{mkdir_at, open_dir_at};
 pub const MAX_UNPACKED: u64 = 4 << 30;
 pub const MAX_ENTRIES: u64 = 200_000;
 
+/// Components and bytes in one entry path or link target. A deeper path would only cost file
+/// descriptors and stack in every later walk of the tree; GE-Proton's deepest is far shallower.
+pub const MAX_COMPONENTS: usize = 32;
+pub const MAX_PATH: usize = 4096;
+
 /// The T5 caps. Only tests pass anything but [`Limits::CONTRACT`].
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub entries: u64,
     pub bytes: u64,
+    /// Bytes written between two calls of the extraction's check (free space, abort).
+    pub check_every: u64,
 }
 
 impl Limits {
     pub const CONTRACT: Limits = Limits {
         entries: MAX_ENTRIES,
         bytes: MAX_UNPACKED,
+        check_every: SPACE_CHECK_EVERY,
     };
 }
 const MAX_VDF: u64 = 64 << 10;
@@ -55,9 +63,15 @@ fn io_fail(what: &str, e: io::Error) -> Fail {
     Fail::new("io_error", format!("{what}: {e}"))
 }
 
-/// The components of an archive path: relative, no NUL, no empty, `.` or `..` component. One
-/// trailing `/` (a directory entry) is allowed.
+/// The components of an archive path: relative, no NUL, no empty, `.` or `..` component, at most
+/// [`MAX_COMPONENTS`] of them and [`MAX_PATH`] bytes. One trailing `/` (a directory) is allowed.
 fn components(path: &[u8]) -> Result<Vec<&[u8]>, Fail> {
+    if path.len() > MAX_PATH {
+        return Err(unsafe_archive(format!(
+            "an entry path of {} bytes",
+            path.len()
+        )));
+    }
     let shown = String::from_utf8_lossy(path);
     if path.is_empty() || path[0] == b'/' || path.contains(&0) {
         return Err(unsafe_archive(format!(
@@ -66,6 +80,12 @@ fn components(path: &[u8]) -> Result<Vec<&[u8]>, Fail> {
     }
     let trimmed = path.strip_suffix(b"/").unwrap_or(path);
     let comps: Vec<&[u8]> = trimmed.split(|&c| c == b'/').collect();
+    if comps.len() > MAX_COMPONENTS {
+        return Err(unsafe_archive(format!(
+            "an entry path of {} components",
+            comps.len()
+        )));
+    }
     if comps
         .iter()
         .any(|c| c.is_empty() || *c == b"." || *c == b"..")
@@ -188,12 +208,13 @@ fn resolve_beneath_once(dir: &File, rel: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Extracts the gzip tar `archive` into `staging` under T5. `space_ok` is asked every 64 MiB
-/// written whether free space is still above the reserve (T7).
+/// Extracts the gzip tar `archive` into `staging` under T5. `check` (free space against the
+/// reserve, T7, and the run's abort) runs every `limits.check_every` bytes written; its error stops
+/// the extraction.
 pub fn extract(
     archive: impl Read,
     staging: &File,
-    space_ok: &mut dyn FnMut() -> bool,
+    check: &mut dyn FnMut() -> Result<(), Fail>,
     limits: Limits,
 ) -> Result<Extracted, Fail> {
     let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
@@ -276,14 +297,9 @@ pub fn extract(
                     )));
                 }
                 out.write_all(&buf[..n]).map_err(|e| io_fail("write", e))?;
-                if since_check >= SPACE_CHECK_EVERY {
+                if since_check >= limits.check_every {
                     since_check = 0;
-                    if !space_ok() {
-                        return Err(Fail::new(
-                            "io_error",
-                            "free space fell below the disk reserve while extracting",
-                        ));
-                    }
+                    check()?;
                 }
             }
         } else if kind.is_symlink() {
@@ -291,7 +307,11 @@ pub fn extract(
                 .link_name_bytes()
                 .map(|t| t.into_owned())
                 .unwrap_or_default();
-            if target.is_empty() || target[0] == b'/' || target.contains(&0) {
+            if target.is_empty()
+                || target.len() > MAX_PATH
+                || target[0] == b'/'
+                || target.contains(&0)
+            {
                 return Err(unsafe_archive(format!(
                     "symlink {:?} has an absolute or empty target",
                     String::from_utf8_lossy(&path)
@@ -319,13 +339,23 @@ pub fn extract(
     let topfd = open_dir_at(staging, os(&top)).map_err(|e| io_fail("open top", e))?;
     for link in &links {
         if let Err(e) = resolve_beneath(&topfd, link) {
-            return Err(unsafe_archive(format!(
-                "symlink {:?} escapes, loops or dangles: {e}",
-                String::from_utf8_lossy(link)
-            )));
+            return Err(link_verdict(link, e));
         }
     }
     Ok(Extracted { top, bytes })
+}
+
+/// A failed link resolution: an escape, a loop or a missing target is the archive's fault
+/// (`unsafe_archive`); anything else (openat2 missing or filtered, EAGAIN past its retries, out
+/// of memory) is this host's, and must not hold the release back as if its bytes were bad.
+fn link_verdict(link: &[u8], e: io::Error) -> Fail {
+    let shown = String::from_utf8_lossy(link);
+    match e.raw_os_error() {
+        Some(libc::EXDEV | libc::ELOOP | libc::ENOENT | libc::ENOTDIR) => {
+            unsafe_archive(format!("symlink {shown:?} escapes, loops or dangles: {e}"))
+        }
+        _ => Fail::new("io_error", format!("resolving symlink {shown:?}: {e}")),
+    }
 }
 
 /// Reads `compatibilitytool.vdf` from the open top-level directory and returns the one tool name
@@ -555,6 +585,21 @@ mod tests {
     }
 
     #[test]
+    fn only_a_resolution_verdict_is_the_archives_fault() {
+        for errno in [libc::EXDEV, libc::ELOOP, libc::ENOENT, libc::ENOTDIR] {
+            let f = link_verdict(b"l", io::Error::from_raw_os_error(errno));
+            assert_eq!(f.reason, "unsafe_archive", "errno {errno}");
+        }
+        for errno in [libc::ENOSYS, libc::EPERM, libc::EAGAIN, libc::ENOMEM] {
+            let f = link_verdict(b"l", io::Error::from_raw_os_error(errno));
+            assert_eq!(
+                f.reason, "io_error",
+                "errno {errno}: an environment fault, not the bytes"
+            );
+        }
+    }
+
+    #[test]
     fn eagain_is_retried_and_then_given_up() {
         let mut n = 0;
         let flaky = retry_eagain(|| {
@@ -590,5 +635,13 @@ mod tests {
             assert!(components(p).is_err(), "{:?}", String::from_utf8_lossy(p));
         }
         assert_eq!(components(b"top/dir/").unwrap(), vec![&b"top"[..], b"dir"]);
+        let deep = vec!["d"; MAX_COMPONENTS + 1].join("/");
+        assert!(components(deep.as_bytes()).is_err(), "too many components");
+        assert!(components(vec!["d"; MAX_COMPONENTS].join("/").as_bytes()).is_ok());
+        let long = vec!["x".repeat(250); 17].join("/");
+        assert!(
+            long.len() > MAX_PATH && components(long.as_bytes()).is_err(),
+            "too long"
+        );
     }
 }

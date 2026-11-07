@@ -131,9 +131,10 @@ pub fn runner() -> Option<install::ConvergeRunner> {
     ))
 }
 
-pub fn hold(session_id: &str, names: Vec<String>, parked: bool) {
+/// Drops the mount holds of sessions that are neither pending nor running any more.
+pub fn retain_holds(live: &dyn Fn(&str) -> bool) {
     if let Some(s) = store() {
-        s.hold(session_id, names, parked);
+        s.retain(live);
     }
 }
 
@@ -241,11 +242,19 @@ pub fn parse(v: &Value) -> Option<CompatTools> {
 /// What an assign does to the app's env, and the tools to mount. With none sent (or one that cannot
 /// be read) any `QUASAR_COMPAT_TOOLS` and tools path the app's own env carried are removed, so the
 /// wrapper never sees a stale value.
-pub fn apply_assign(env: &mut BTreeMap<String, String>, sent: Option<&Value>) -> Vec<String> {
+/// The tools returned are held for `session_id` until it ends (removal waits for them).
+pub fn apply_assign(
+    env: &mut BTreeMap<String, String>,
+    sent: Option<&Value>,
+    session_id: &str,
+    parked: bool,
+) -> Vec<String> {
     match sent.and_then(parse) {
         Some(tools) => {
             let wanted: Vec<String> = tools.mount.iter().take(MAX_MOUNTS).cloned().collect();
-            let mounted = store().map(|s| s.mountable(&wanted)).unwrap_or_default();
+            let mounted = store()
+                .map(|s| s.mountable(session_id, &wanted, parked))
+                .unwrap_or_default();
             apply(env, &tools, &mounted);
             mounted
         }
@@ -369,7 +378,7 @@ mod tests {
     #[test]
     fn nothing_sent_strips_what_the_apps_own_env_carried() {
         let mut env = seeded();
-        apply_assign(&mut env, None);
+        apply_assign(&mut env, None, "s", false);
         assert_eq!(env, BTreeMap::from([("KEEP".to_string(), "1".to_string())]));
     }
 
@@ -377,7 +386,7 @@ mod tests {
     fn a_value_of_the_wrong_shape_is_dropped_and_strips_too() {
         for bad in [json!({"forced": "yes"}), json!("x"), json!(7), json!([1])] {
             let mut env = seeded();
-            apply_assign(&mut env, Some(&bad));
+            apply_assign(&mut env, Some(&bad), "s", false);
             assert!(!env.contains_key(ENV_ENTRIES), "{bad}");
             assert_eq!(env["KEEP"], "1");
         }

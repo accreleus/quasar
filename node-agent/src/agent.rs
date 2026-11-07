@@ -3544,6 +3544,9 @@ impl SessionManager {
     /// `running`, so the two views can never disagree about host busyness.
     fn note_session_count(&self) {
         crate::restart::note_sessions(self.pending.len() + self.running.len());
+        crate::compat_tools::retain_holds(&|sid| {
+            self.pending.contains_key(sid) || self.running.contains_key(sid)
+        });
         if let Some(a) = &self.warmup_activity {
             a.set_live(self.running.len(), Instant::now());
         }
@@ -3821,6 +3824,7 @@ impl SessionManager {
     ) {
         let dropped = self.pending.len();
         self.pending.clear();
+        crate::compat_tools::retain_holds(&|sid| self.running.contains_key(sid));
         self.gpu_inventory = gpu_inventory;
         self.vram_targets = vram_targets;
         // The cache indexes by position over the inventory, so it must be
@@ -3948,8 +3952,12 @@ impl SessionManager {
                 if let Some(handle) = &self.probe_handle {
                     handle.launch_arrived(gpu_index);
                 }
-                let compat_mounts =
-                    crate::compat_tools::apply_assign(&mut app.env, compat_tools.as_ref());
+                let compat_mounts = crate::compat_tools::apply_assign(
+                    &mut app.env,
+                    compat_tools.as_ref(),
+                    &session_id,
+                    kind == Some(SessionKind::Parked),
+                );
                 let container = match app_to_container(app, &self.mount_policy()) {
                     Ok(c) => c.map(|mut c| {
                         c.compat_tools = compat_mounts;
@@ -4150,14 +4158,6 @@ impl SessionManager {
                     ));
                     let home_refs = Self::home_refs_of(&cfg);
                     self.add_live_refs(&home_refs);
-                    crate::compat_tools::hold(
-                        &session_id,
-                        cfg.container
-                            .as_ref()
-                            .map(|c| c.compat_tools.clone())
-                            .unwrap_or_default(),
-                        kind == Some(SessionKind::Parked),
-                    );
                     let video_topology = cfg.video_topology;
                     let codec = cfg.stream.codec;
                     // Snapshotted before `cfg` moves into the runner thread, because the
