@@ -358,7 +358,9 @@ func TestALaunchMappedToAnUnusableToolFailsBeforeTheAgent(t *testing.T) {
 	f := compatFixture(t, true)
 	name := installGE(t, f)
 	must(t, exec(t, f.pool, `UPDATE apps SET external_source = 'steam', external_id = '1145360' WHERE id = $1::uuid`, f.steam))
-	t.Cleanup(func() { _, _ = f.pool.Exec(context.Background(), `UPDATE apps SET external_source = '', external_id = '' WHERE id = $1::uuid`, f.steam) })
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `UPDATE apps SET external_source = '', external_id = '' WHERE id = $1::uuid`, f.steam)
+	})
 	must(t, exec(t, f.pool, `DELETE FROM compat_tool_mappings`))
 	must(t, exec(t, f.pool, `INSERT INTO compat_tool_mappings (provider, external_id, tool_id)
 		SELECT 'steam', '1145360', id FROM compat_tools WHERE steam_name = $1`, name))
