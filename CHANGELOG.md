@@ -36,6 +36,7 @@ own; the two do not move together, and that is deliberate.
 - **CI also runs on release integration branches (`integration/<version>`).** Pull requests into one run the jobs their change touches, and a landing on one runs every job, exactly as for `develop`. `CLAUDE.md` now says specs and tickets live as GitHub issues rather than plan files. No product change.
 - **The domain glossary is now `GLOSSARY.md` (was `CONTEXT.md`), matching the updated domain-modeling and setup skills.** Renamed with `git mv`; every reference in the docs, `CLAUDE.md` and code comments follows (the generated API types follow with the next protocol pin). No product change.
 - **CI builds the control image's `web-builder` stage on pull requests that touch `web/`, `testdata/` or `deploy/`, so a web test that imports a fixture the Dockerfile does not copy fails on the pull request (#1119).** The check is `docker build --target web-builder` with no tag and no push; it is part of the `web` gate.
+- **The image-cleanup scan tests no longer fail intermittently (#1098).** `TestCleanupReadyHistoryWriterQueuesFollowupDuringScan` and `TestCleanupSecondAttemptRequiresItsOwnFreshInventoryBeforeRetiredJournal` assumed a fixed number of follow-up scans, but the managed-identity worker's retry and the test's own notifications race for the same scan and the loser asks for another. Both now answer follow-ups until the service is quiet; no production change.
 
 ## 0.5.2 — 2026-11-01
 
