@@ -322,6 +322,7 @@ const (
 	causeSizeLarger       = "size_larger"
 	causeFPSHigher        = "fps_higher"
 	causeCodecUnsupported = "codec_unsupported"
+	causeTransportDiffers = "transport_differs"
 	causeStreamDiffers    = "stream_differs"
 	causeNoRoom           = "no_room"
 )
@@ -330,6 +331,7 @@ const (
 // never "": callers normalise the h264 default.
 type claimStream struct {
 	Codec                           string
+	Transport                       string // webrtc | webtransport
 	Width, Height, FPS, BitrateKbps int32
 	H264Profile                     string
 	Mic                             bool
@@ -402,6 +404,9 @@ func claimCheck4(parked, launch claimStream, restream, codecGated bool) (cause s
 		return causeFPSHigher, nil
 	case codecGated:
 		return causeCodecUnsupported, nil
+	// No restream moves a runtime between transports (#1161).
+	case launch.Transport != parked.Transport:
+		return causeTransportDiffers, nil
 	}
 	for _, d := range []struct {
 		name string
@@ -469,7 +474,7 @@ func readParkedFacts(ctx context.Context, q rowQuerier, k *claimedParked, p Crea
 		       k.user_id = $2::uuid AND k.app_id = $3::uuid AND k.kind = 'parked',
 		       h.status = 'online' AND h.agent_disconnected_at IS NULL
 		       AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = h.id),
-		       k.codec, k.width, k.height, k.fps, k.bitrate_kbps, k.h264_profile, k.mic
+		       k.codec, k.width, k.height, k.fps, k.bitrate_kbps, k.h264_profile, k.mic, k.transport
 		FROM sessions k JOIN gpus g ON g.id = k.gpu_id JOIN hosts h ON h.id = k.host_id
 		WHERE k.id = $1::uuid`
 	if lock {
@@ -478,13 +483,17 @@ func readParkedFacts(ctx context.Context, q rowQuerier, k *claimedParked, p Crea
 	err := q.QueryRow(ctx, sql, k.id, p.UserID, p.homeAppID(), claimedDetail).
 		Scan(&k.hostID, &k.gpuIndex, &f.State, &f.Claimed, &f.InDeadline, &f.Family, &f.HostUp,
 			&f.Stream.Codec, &f.Stream.Width, &f.Stream.Height, &f.Stream.FPS, &f.Stream.BitrateKbps,
-			&f.Stream.H264Profile, &f.Stream.Mic)
+			&f.Stream.H264Profile, &f.Stream.Mic, &f.Stream.Transport)
 	return f, err
 }
 
 func launchClaimStream(p CreateParams) claimStream {
-	return claimStream{Codec: codecOrH264(p.Codec), Width: p.Width, Height: p.Height, FPS: p.FPS,
+	s := claimStream{Codec: codecOrH264(p.Codec), Width: p.Width, Height: p.Height, FPS: p.FPS,
 		BitrateKbps: p.BitrateKbps, H264Profile: p.H264Profile, Mic: p.Mic}
+	if p.claim != nil {
+		s.Transport = p.claim.transport
+	}
+	return s
 }
 
 // codecGatedCause is the cause a launch whose codec the parked GPU cannot encode
