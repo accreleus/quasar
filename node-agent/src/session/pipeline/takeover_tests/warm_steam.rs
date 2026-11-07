@@ -1097,25 +1097,25 @@ fn ten_encoder_rebuilds_on_one_runtime_each_stream() {
     if std::env::var_os("QUASAR_REBUILD_RSS_CHILD").is_none() {
         // This process may already hold the container-ownership lease; the child needs its own.
         let state = tempfile::tempdir().unwrap();
+        let name = "session::pipeline::takeover_tests::warm_steam::ten_encoder_rebuilds_on_one_runtime_each_stream";
         let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "session::pipeline::takeover_tests::warm_steam::ten_encoder_rebuilds_on_one_runtime_each_stream",
-                "--nocapture",
-            ])
+            .args(["--exact", name, "--nocapture"])
             .env("QUASAR_REBUILD_RSS_CHILD", "1")
             .env("NODE_SECRET_PATH", state.path().join("secret"))
             .output()
             .unwrap();
-        eprint!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        eprint!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
         assert!(
             out.status.success(),
             "the rebuild series failed: {}",
             out.status
+        );
+        // `--exact` on a stale name runs nothing and exits 0.
+        assert!(
+            stdout.contains(&format!("test {name} ... "))
+                && stdout.contains("test result: ok. 1 passed;"),
+            "the child did not run {name}"
         );
         return;
     }
