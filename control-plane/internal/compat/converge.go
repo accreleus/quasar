@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -501,12 +502,54 @@ func (c *Converger) Closed(ctx context.Context, run jobs.Run) {
 			WHERE action IN ('compat_tool.enable', 'compat_tool.disable') AND target_id = $1
 			ORDER BY created_at DESC LIMIT 1`, toolID).Scan(&actor)
 	}
-	// shortcut: a tag's Steam name is never bound here, so name_conflict is never marked; every
-	// recommended entry ships its name. Bind it with add-by-tag (C08, #1072).
+	if action == "install" && run.State == jobs.StateSucceeded && p["expected_name"] == nil && toolID != "" {
+		c.bindName(ctx, run, toolID, tag, sha, name)
+	}
 	audit.TryRecord(ctx, c.auditor, actor, "compat_tool."+action, "host", run.HostID, map[string]any{
 		"tag": tag, "sha512": sha, "host_id": run.HostID, "name": name, "state": string(run.State),
 		"reason": s["reason"], "run_id": run.ID,
 	})
+}
+
+// steamNameRe is T6's grammar; a GE name must also start GE-Proton and carry no reserved prefix.
+var steamNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+func validGEName(n string) bool {
+	l := strings.ToLower(n)
+	return steamNameRe.MatchString(n) && strings.HasPrefix(n, "GE-Proton") && !strings.HasPrefix(l, "proton_") &&
+		!strings.HasPrefix(l, "steamlinuxruntime") && !strings.HasPrefix(l, "legacysteamruntime")
+}
+
+// bindName binds a tag's Steam name at its first succeeded install, in the statement that checks
+// it is still unbound (control-api.md §Install job, "A reported name that conflicts"). A name that
+// fails T6 or that another row holds marks the tool name_conflict, which takes it out of desired
+// state with nothing retried. A later host reporting another name needs nothing here: its row no
+// longer matches the bound name, so its first difference removes it by its own name, and its next
+// install carries expected_name and fails name_mismatch.
+func (c *Converger) bindName(ctx context.Context, run jobs.Run, toolID, tag, sha, name string) {
+	if validGEName(name) {
+		bound, err := c.pool.Exec(ctx, `UPDATE compat_tools SET steam_name = $2, display_name = $2
+			WHERE id = $1::uuid AND steam_name IS NULL
+			  AND NOT EXISTS (SELECT 1 FROM compat_tools WHERE steam_name = $2)`, toolID, name)
+		if err != nil {
+			c.log.Warn("compat tools: binding a Steam name failed", "tool_id", toolID, "err", err)
+			return
+		}
+		if bound.RowsAffected() == 1 {
+			return
+		}
+	}
+	ct, err := c.pool.Exec(ctx, `UPDATE compat_tools SET name_conflict = true
+		WHERE id = $1::uuid AND steam_name IS NULL AND NOT name_conflict`, toolID)
+	if err != nil {
+		c.log.Warn("compat tools: marking a name conflict failed", "tool_id", toolID, "err", err)
+		return
+	}
+	if ct.RowsAffected() == 1 {
+		audit.TryRecord(ctx, c.auditor, "", "compat_tool.name_conflict", "compat_tool", toolID, map[string]any{
+			"tag": tag, "sha512": sha, "name": name, "host_id": run.HostID, "run_id": run.ID})
+		c.All(ctx, true)
+	}
 }
 
 // HostCard is GET /v1/admin/hosts/{id}/compat-tools.

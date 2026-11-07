@@ -655,6 +655,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	settingsHandler.OnAllowedOriginsChanged = originResolver.Invalidate
 	invitesHandler := invites.NewHandler(invites.NewStore(pool), cfg.PublicBaseURL, auditStore)
 	compatStore := compat.NewStore(pool)
+	compatStore.Auditor = auditStore
 	compatCtx, compatCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := compatStore.Reconcile(compatCtx); err != nil {
 		log.Error("compat tools: reconciling the catalogue failed", "err", err)
@@ -664,7 +665,12 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// compat_tools_v1 host; runs are filled with the host's first difference when it claims one.
 	compatConv := compat.NewConverger(pool, jobStore, auditStore, log)
 	compatConv.Supported = agentRegistry.SupportsCompatTools
-	compatHandler := compat.NewHandler(compatStore, auditStore, compatConv)
+	compatGitHub, err := compat.NewGitHub(log)
+	if err != nil {
+		janitorStop()
+		return nil, fmt.Errorf("compat tools github client: %w", err)
+	}
+	compatHandler := compat.NewHandler(compatStore, auditStore, compatConv, compatGitHub)
 	enrollHandler := hostenroll.NewHandler(hostenroll.NewStore(pool), auditStore)
 	consoleHandler := console.NewHandler(consoleStore, agentRegistry, auditStore)
 	auditHandler := audit.NewHandler(auditStore)
