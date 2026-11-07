@@ -472,6 +472,42 @@ async fn the_newest_client_takes_over_and_an_ended_session_says_so() {
     assert_eq!(close_code(&late).await, Some(CLOSE_ENDED));
 }
 
+/// What the session's idle reap reads (#1179): a client counts from its `hello_ack` while it
+/// streams, across a takeover, and stops counting once it leaves.
+#[tokio::test]
+async fn the_tap_counts_a_streaming_client_until_it_leaves() {
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    assert!(!tap.attached(), "no client has said hello");
+
+    let (first, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    frames(&first, 1, true).await;
+    assert!(tap.attached());
+
+    let expires = SystemTime::now() + TOKEN_TTL;
+    assert!(agent
+        .listener
+        .registry()
+        .add_token(SESSION, &token_hash("reconnect"), expires));
+    let (second, mut send, _recv2, _) = agent.hello("reconnect").await;
+    assert_eq!(close_code(&first).await, Some(CLOSE_TAKEN_OVER));
+    frames(&second, 1, true).await;
+    assert!(tap.attached(), "the client that took over counts");
+
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tap.attached() {
+        assert!(Instant::now() < deadline, "a client that left still counts");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn past_64_unauthenticated_connections_new_sessions_are_refused() {
     let agent = agent_with(Limits {
