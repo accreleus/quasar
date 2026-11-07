@@ -161,6 +161,24 @@ describe("PyroWaveReceiver", () => {
       expect(upload(f).offsets[5]).toBe(BLOCK_LOST);
     });
 
+    // N2: an invalid part 0 marks no coverage, so the zeros after its block read lost.
+    it("a part 0 naming another block covers nothing", () => {
+      const gap = synthetic([
+        [2, 10],
+        [5, 250],
+        [9, 10],
+      ]);
+      const all = fragments(1, gap, 12 + 400);
+      expect(range(all[1])).toEqual([5, 9]);
+      const bad = new Uint8Array(all[1].payload);
+      new DataView(bad.buffer).setUint32(12 + 4, 7 << 8, true); // the block header's index
+      const r = new PyroWaveReceiver(3, N, FRAME_MS);
+      feed(r, [all[0], { ...all[1], payload: bad }, all[4]]);
+      const up = upload(r.due(FRAME_MS) as PyroWaveFrame);
+      for (const i of [5, 6, 7, 8]) expect(up.offsets[i]).toBe(BLOCK_LOST);
+      expect(up.offsets[9]).not.toBe(BLOCK_LOST);
+    });
+
     it("block 0 oversized leaves datagram 0 with the SOF alone and an empty range", () => {
       const f0 = synthetic([[0, 250]]);
       const fr = fragments(1, f0, 12 + 400);

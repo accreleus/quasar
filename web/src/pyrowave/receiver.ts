@@ -161,12 +161,12 @@ export class PyroWaveReceiver {
       o.bad = true;
       return;
     }
-    // The block's own index stays lost until every part arrived; any part covers the rest.
-    p.covered.fill(1, first + 1, end);
     if (partIndex === 0 && (body.byteLength < 8 || new DataView(body.buffer, body.byteOffset, 8).getUint32(4, true) >>> 8 !== first)) {
       o.bad = true;
       return;
     }
+    // The block's own index stays lost until every part arrived; any valid part covers the rest.
+    p.covered.fill(1, first + 1, end);
     if (o.parts[partIndex]) return;
     o.parts[partIndex] = body;
     o.have += 1;
