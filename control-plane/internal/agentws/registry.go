@@ -67,6 +67,7 @@ type conn struct {
 	hostID                    string
 	terminalHomeCleanupV1     bool
 	parkedSessionsV1          bool
+	compatToolsV1             bool
 	policyTyped               bool
 	consoleReports            atomic.Int32 // capacity reports carrying console_capabilities
 	policyIdle                bool
@@ -337,6 +338,9 @@ func (e *homeCommandEpoch) SupportsHomeCleanup() bool { return e.conn.terminalHo
 
 // SupportsParkedSessions is this exact connection's parked_sessions_v1.
 func (e *homeCommandEpoch) SupportsParkedSessions() bool { return e.conn.parkedSessionsV1 }
+
+// SupportsCompatTools is this exact connection's compat_tools_v1.
+func (e *homeCommandEpoch) SupportsCompatTools() bool { return e.conn.compatToolsV1 }
 
 // SupportsParkedSessions reports parked_sessions_v1 for the host's current
 // connection; a disconnected host has none.

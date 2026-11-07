@@ -24,6 +24,7 @@ import (
 type warmDispatcher struct {
 	mu      sync.Mutex
 	parks   bool
+	compat  bool // answers compat_tools_v1
 	noEpoch bool // the agent's socket is gone: no command epoch to send on
 	// reject answers one command kind: "assign" or "start" refused, or
 	// "assign-ack" queued with its ack lost.
@@ -96,6 +97,7 @@ type warmEpoch struct{ d *warmDispatcher }
 
 func (warmEpoch) SupportsHomeCleanup() bool      { return true }
 func (e warmEpoch) SupportsParkedSessions() bool { return e.d.SupportsParkedSessions("") }
+func (e warmEpoch) SupportsCompatTools() bool    { return e.d.compat }
 func (e warmEpoch) Send(v any) (bool, error)     { e.d.record(v); return true, nil }
 func (e warmEpoch) SendWithAck(_ context.Context, _ string, v any) (agentws.AckResult, bool, error) {
 	e.d.record(v)

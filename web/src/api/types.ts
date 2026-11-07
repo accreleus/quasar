@@ -252,6 +252,9 @@ export type LaunchProfile = Schemas["LaunchProfile"];
 /** `rungs` order IS preference; the server assigns `position`. Must contain at
  *  least one h264 rung (400 otherwise); h264 not last is a warning only. */
 export type LaunchProfileWrite = Schemas["LaunchProfileWrite"];
+export type LaunchProfileTransport = Schemas["LaunchProfileTransport"];
+export type HostWebTransport = Schemas["HostWebTransport"];
+export type HostWebTransportWrite = Schemas["HostWebTransportWrite"];
 
 export type AdminLaunchProfilesResponse = Schemas["AdminLaunchProfilesResponse"];
 

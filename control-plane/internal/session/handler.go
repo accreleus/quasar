@@ -800,7 +800,7 @@ func (h *Handler) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if user.Role == auth.RoleAdmin {
-		h.recordActivity(r.Context(), user.ID, "session.stop", "session", id, map[string]any{"already_terminal": wasTerminal})
+		h.recordActivity(r.Context(), user.ID, "session.stop", "session", sess.ID, map[string]any{"already_terminal": wasTerminal})
 	}
 
 	// 202 Accepted while teardown proceeds; 200 if it was already terminal

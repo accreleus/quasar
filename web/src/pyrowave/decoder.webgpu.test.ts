@@ -5,7 +5,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import manifest from "../../../testdata/pyrowave/manifest.json";
 import { blockLayout, parsePwv1 } from "./bitstream";
-import { PyroWaveDecoder, PyroWaveError, pyroWaveDeviceFeatures, type DecoderPath } from "./decoder";
+import { PyroWaveDecoder, PyroWaveError, chooseDecoderPath, pyroWaveDeviceFeatures, type DecoderPath } from "./decoder";
 
 const expectedPaths = String(import.meta.env.VITE_PYROWAVE_PATHS ?? "subgroups-fp32").split(",") as DecoderPath[];
 const expectedSubgroupMin = Number(import.meta.env.VITE_PYROWAVE_SUBGROUP_MIN ?? 4);
@@ -63,12 +63,15 @@ async function rejection(p: Promise<unknown>): Promise<PyroWaveError> {
 
 it("runs on the adapter the run expects: decoder paths and subgroup size", () => {
   const offered = (["fast", "subgroups-fp32"] as const).filter((p) => device.features.has("subgroups") && (p !== "fast" || device.features.has("shader-f16")));
-  console.log(`pyrowave-adapter ${device.adapterInfo.vendor}/${device.adapterInfo.architecture} paths=${offered.join(",")} subgroup=${device.adapterInfo.subgroupMinSize}-${device.adapterInfo.subgroupMaxSize}`);
+  console.log(`pyrowave-adapter ${device.adapterInfo.vendor}/${device.adapterInfo.architecture} paths=${offered.join(",")} chosen=${chooseDecoderPath(device.features, device.adapterInfo)} subgroup=${device.adapterInfo.subgroupMinSize}-${device.adapterInfo.subgroupMaxSize}`);
   expect(offered).toEqual(expectedPaths);
   expect(device.adapterInfo.subgroupMinSize).toBe(expectedSubgroupMin);
 });
 
-describe.each(expectedPaths)("PyroWaveDecoder on the golden fixtures, %s path", (path) => {
+// The fallback path needs no optional feature, so it runs on every adapter.
+const allPaths: DecoderPath[] = [...expectedPaths, "fallback"];
+
+describe.each(allPaths)("PyroWaveDecoder on the golden fixtures, %s path", (path) => {
   const bar = manifest.decoder_bar;
 
   it.each(manifest.fixtures.map((f) => [f.name, f] as const))("%s meets the decoder bar", async (_name, f) => {
@@ -88,6 +91,29 @@ describe.each(expectedPaths)("PyroWaveDecoder on the golden fixtures, %s path", 
   });
 });
 
+it("a device without subgroups or shader-f16 chooses the fallback path and meets the decoder bar", async () => {
+  const adapter = (await navigator.gpu.requestAdapter())!;
+  const bare = await adapter.requestDevice();
+  expect(bare.features.has("subgroups") || bare.features.has("shader-f16")).toBe(false);
+  bare.pushErrorScope("validation");
+  for (const f of manifest.fixtures) {
+    const { header, frames } = parsePwv1(await fixture(f.pwv1.file));
+    const decoder = await PyroWaveDecoder.create(bare, header, { maxPixels: header.width * header.height });
+    expect(decoder.path).toBe("fallback");
+    decoder.decode([frames[0]], null);
+    const got = planes(await decoder.readI420(), f.width, f.height);
+    const want = planes(await fixture(f.ref.file), f.width, f.height);
+    decoder.destroy();
+    for (let i = 0; i < 3; i++) {
+      const r = compare(got[i], want[i]);
+      expect(r.psnr, `${f.name} plane ${i} PSNR`).toBeGreaterThanOrEqual(manifest.decoder_bar.min_psnr_db);
+      expect(r.maxAbs, `${f.name} plane ${i} max error`).toBeLessThanOrEqual(manifest.decoder_bar.max_abs_err);
+    }
+  }
+  expect((await bare.popErrorScope())?.message ?? null).toBeNull();
+  bare.destroy();
+});
+
 describe("hostile input", () => {
   it.each([16384, 8192])("a %i-pixel square header is refused before anything is allocated", async (size) => {
     const e = await rejection(PyroWaveDecoder.create(device, { width: size, height: size, fullRange: false }, { maxPixels: size * size }));
@@ -98,25 +124,73 @@ describe("hostile input", () => {
     const e = await rejection(PyroWaveDecoder.create(device, { width: 1920, height: 1080, fullRange: false }, { maxPixels: 1280 * 720 }));
     expect(e.reason).toBe("too_large");
   });
+});
 
-  it.each([0x00, 0xff])("a block shorter than its header claims is concealed, whatever follows it (tail byte %i)", async (fill) => {
-    const name = "detail_320x192_hi";
-    const { decoder, frame } = await decoderFor(`${name}.pwv1`);
+describe.each(allPaths)("hostile blocks, %s path", (path) => {
+  // detail_320x192_hi with its 40th block replaced by `bad`; the clean decode for comparison.
+  async function swap40(bad: (orig: DataView, at: number) => Uint8Array) {
+    const { decoder, frame } = await decoderFor("detail_320x192_hi.pwv1", path);
     decoder.decode([frame], null);
     const clean = await decoder.readI420();
-
-    // Swap the 40th block for one announcing all 16 8x8 blocks with 8 bytes of room for them.
     const dv = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
     let o = 8;
     for (let i = 0; i < 40; i++) o += ((dv.getUint32(o, true) >>> 16) & 0xfff) * 4;
     const end = o + ((dv.getUint32(o, true) >>> 16) & 0xfff) * 4;
-    const bad = new Uint8Array(16).fill(fill);
-    const bdv = new DataView(bad.buffer);
-    bdv.setUint32(0, (4 << 16) | 0xffff, true);
-    bdv.setUint32(4, dv.getUint32(o + 4, true), true); // same block index and quant code
-    const stats = decoder.decode([frame.subarray(0, o), bad, frame.subarray(end)], null);
+    return { decoder, frame, clean, packets: [frame.subarray(0, o), bad(dv, o), frame.subarray(end)] };
+  }
+
+  it.each([0x00, 0xff])("a block shorter than its header claims is concealed, whatever follows it (tail byte %i)", async (fill) => {
+    // A block announcing all 16 8x8 blocks with 8 bytes of room for them.
+    const { decoder, clean, packets } = await swap40((dv, o) => {
+      const bad = new Uint8Array(16).fill(fill);
+      const bdv = new DataView(bad.buffer);
+      bdv.setUint32(0, (4 << 16) | 0xffff, true);
+      bdv.setUint32(4, dv.getUint32(o + 4, true), true); // same block index and quant code
+      return bad;
+    });
+    const stats = decoder.decode(packets, null);
     expect(stats.lost).toBe(1);
     expect(await decoder.readI420()).toEqual(clean); // concealed from the clean frame; nothing else moved
+    decoder.destroy();
+  });
+
+  it("a block of payload_words 0 drops the frame, and the decoder carries on", async () => {
+    const { decoder, frame, clean, packets } = await swap40((dv, o) => {
+      const bad = new Uint8Array(8);
+      new DataView(bad.buffer).setUint32(4, dv.getUint32(o + 4, true), true);
+      return bad;
+    });
+    expect(() => decoder.decode(packets, null)).toThrow(expect.objectContaining({ reason: "bad_frame" }));
+    decoder.decode([frame], null);
+    expect(await decoder.readI420()).toEqual(clean);
+    decoder.destroy();
+  });
+
+  it("a block of the maximum payload_words, every plane and sign set, decodes and leaves nothing behind", async () => {
+    // 4095 words; ballot 0xffff, code words 0xffff, qb 15: 18 planes per 4x2 subblock, 1024 signs.
+    const { decoder, frame, clean, packets } = await swap40((dv, o) => {
+      const big = new Uint8Array(4095 * 4).fill(0xff);
+      const bdv = new DataView(big.buffer);
+      bdv.setUint32(0, (4095 << 16) | 0xffff, true);
+      bdv.setUint32(4, dv.getUint32(o + 4, true), true);
+      big.fill(0x0f, 8 + 32, 8 + 48); // qb 15, scale 0
+      return big;
+    });
+    const stats = decoder.decode(packets, null);
+    expect(stats.lost).toBe(0);
+    expect((await decoder.readI420()).length).toBe(clean.length);
+    // readI420 clamps, which would hide a NaN: read the float planes themselves.
+    const planesBuf = (decoder as unknown as { planes: GPUBuffer }).planes;
+    const rb = device.createBuffer({ size: planesBuf.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(planesBuf, 0, rb, 0, planesBuf.size);
+    device.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const floats = new Float32Array(rb.getMappedRange().slice(0));
+    rb.destroy();
+    expect(floats.every(Number.isFinite)).toBe(true);
+    decoder.decode([frame], null); // every block received again: all coefficients rewritten
+    expect(await decoder.readI420()).toEqual(clean);
     decoder.destroy();
   });
 });
@@ -124,9 +198,9 @@ describe("hostile input", () => {
 describe("hostile input: sign bits", () => {
   // Fill the decoder's GPU payload buffer with `fill`, then decode a frame whose last block lost its
   // sign bits: none of its reads may reach what the buffer held before.
-  async function decodeOverStale(fill: number): Promise<Uint8Array> {
+  async function decodeOverStale(fill: number, forcePath?: DecoderPath): Promise<Uint8Array> {
     const { header, frames } = parsePwv1(await fixture("detail_320x192_xhi.pwv1"));
-    const decoder = await PyroWaveDecoder.create(device, header, { maxPixels: header.width * header.height });
+    const decoder = await PyroWaveDecoder.create(device, header, { maxPixels: header.width * header.height, forcePath });
     const n = blockLayout(header.width, header.height).totalBlocks;
     const stale = Array.from({ length: n }, (_, i) => {
       // ballot 0: an all-zero block with 1192 free bytes. 165 KB in all: more than the frame below,
@@ -155,8 +229,8 @@ describe("hostile input: sign bits", () => {
     return out;
   }
 
-  it("a block with its sign bits cut off decodes the same over a stale buffer of 0x00 or 0xff", async () => {
-    expect(await decodeOverStale(0x00)).toEqual(await decodeOverStale(0xff));
+  it.each(allPaths)("a block with its sign bits cut off decodes the same over a stale buffer of 0x00 or 0xff (%s path)", async (path) => {
+    expect(await decodeOverStale(0x00, path)).toEqual(await decodeOverStale(0xff, path));
   });
 });
 
@@ -201,12 +275,12 @@ describe("lifecycle", () => {
   });
 });
 
-describe("block concealment", () => {
+describe.each(allPaths)("block concealment, %s path", (path) => {
   const f = manifest.fixtures.find((x) => x.name === "detail_320x192_hi")!;
   const n = 138; // block indices of a 320x192 frame
 
   it("a frame whose every block is lost shows the last frame again", async () => {
-    const { decoder, frame } = await decoderFor(f.pwv1.file);
+    const { decoder, frame } = await decoderFor(f.pwv1.file, path);
     decoder.decode([frame], null);
     const before = await decoder.readI420();
     const stats = decoder.decode([], new Uint8Array(n));
@@ -216,7 +290,7 @@ describe("block concealment", () => {
   });
 
   it("a covered index with no block is zero, never the last frame's", async () => {
-    const { decoder, frame } = await decoderFor(f.pwv1.file);
+    const { decoder, frame } = await decoderFor(f.pwv1.file, path);
     decoder.decode([frame], null);
     decoder.decode([], new Uint8Array(n).fill(1));
     expect(new Set(await decoder.readI420())).toEqual(new Set([128])); // all-zero coefficients: mid grey
@@ -224,7 +298,7 @@ describe("block concealment", () => {
   });
 
   it("a new decoder (a new config_id) conceals a lost block as zero", async () => {
-    const { decoder } = await decoderFor(f.pwv1.file);
+    const { decoder } = await decoderFor(f.pwv1.file, path);
     decoder.decode([], new Uint8Array(n));
     expect(new Set(await decoder.readI420())).toEqual(new Set([128]));
     decoder.destroy();
@@ -233,7 +307,7 @@ describe("block concealment", () => {
   it("only the lost block is concealed: the received ones decode as sent", async () => {
     // Decode detail, then flat with block 0 lost: block 0 is level 4 Y LL (the DC of luma).
     const flat = parsePwv1(await fixture("flat_320x192_hi.pwv1")).frames[0];
-    const lossy = await decoderFor(f.pwv1.file);
+    const lossy = await decoderFor(f.pwv1.file, path);
     lossy.decoder.decode([lossy.frame], null);
     const covered = new Uint8Array(n).fill(1);
     covered[0] = 0;
@@ -245,7 +319,7 @@ describe("block concealment", () => {
     expect(lossy.decoder.decode(withoutBlock0, covered).lost).toBe(1);
     const [y, cb, cr] = planes(await lossy.decoder.readI420(), 320, 192);
 
-    const clean = await decoderFor("flat_320x192_hi.pwv1");
+    const clean = await decoderFor("flat_320x192_hi.pwv1", path);
     clean.decoder.decode([flat], null);
     const [cleanY, cleanCb, cleanCr] = planes(await clean.decoder.readI420(), 320, 192);
     expect(y).not.toEqual(cleanY); // luma DC came from the detail frame

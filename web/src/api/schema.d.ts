@@ -3554,76 +3554,6 @@ export interface paths {
         };
         trace?: never;
     };
-    "/v1/sessions/{id}/pyrowave": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["PathId"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        /**
-         * Turn Ultra-low latency (LAN), i.e. PyroWave, on or off in a running session (owner or admin) (amendment 55).
-         * @description Amendment 55 (accreleus/quasar#1050). A best-effort relay to the assigned host's agent (agent-api.md session_pyrowave), like PATCH /v1/sessions/{id}/display: no session-state transition, and a rejection is a no-op (the session keeps its codec). The 202 is sent once the agent acked; its body carries the updated session.pyrowave.
-         */
-        patch: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    id: components["parameters"]["PathId"];
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["SessionPyroWaveUpdate"];
-                };
-            };
-            responses: {
-                /** @description Applied. Body is the current session. */
-                202: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            session: components["schemas"]["Session"];
-                        };
-                    };
-                };
-                400: components["responses"]["ValidationFailed"];
-                401: components["responses"]["Unauthorized"];
-                /** @description Caller is neither owner nor admin. */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorEnvelope"];
-                    };
-                };
-                404: components["responses"]["NotFound"];
-                /** @description session_not_running - the session's state is not running - or pyrowave_unavailable - session.pyrowave.allowed is false (active true only; the message carries the reason) - or pyrowave_rejected - the agent refused (not_on_webtransport, client_no_decoder, rtt_too_high, encoder_error) or did not ack within the command timeout. The session is left untouched in every case. */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorEnvelope"];
-                    };
-                };
-            };
-        };
-        trace?: never;
-    };
     "/v1/sessions/{id}/verdict": {
         parameters: {
             query?: {
@@ -4436,6 +4366,8 @@ export interface paths {
                         steam_warm_idle_minutes?: number;
                         /** @description Amendment 56 (accreleus/quasar#1066). How many GE compatibility tools may be enabled at once. Default 8. Absent = unchanged; outside 1-32 is 400 validation_failed. */
                         compat_tools_max_enabled?: number;
+                        /** @description Amendment 58 (accreleus/quasar#1059). How many sessions on one GPU may hold a PyroWave slot at once (control-api.md §The PyroWave ceiling). Default 1. Absent = unchanged; outside 1-4 is 400 validation_failed. Lowering it ends no session. */
+                        pyrowave_max_per_gpu?: number;
                         /** @description Amendment 56. Free GiB a tool install must leave on a host beyond the asset and the 4 GiB unpacked cap (trust rule T7). Default 10. Absent = unchanged. */
                         compat_tools_disk_reserve_gib?: number;
                         /** @description Amendment 49 (#845). As RegionSettings.timezone. Default UTC. Absent = unchanged. */
@@ -5961,6 +5893,47 @@ export interface paths {
                 };
             };
         };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/compat-tools/available": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * GE-Proton releases available to install - the shipped recommended list plus the latest on github.com (amendment 57).
+         * @description Amendment 57 (accreleus/quasar#1067). Read-only, not audited. The recommended list this release ships, then the 5 newest GE-Proton releases fetched from api.github.com/repos/GloriousEggroll/proton-ge-custom/releases?per_page=10 under trust rule T2 (https 443, no credential, no redirect, direct, connect-time address check, Accept-Encoding identity, a 1 MiB cap on decoded bytes, a 10 s deadline), each with its live catalogue state including pin_conflict and name_conflict. Pins nothing: install with POST /v1/admin/compat-tools then PATCH /v1/admin/compat-tools/{id}. The GitHub outcome is cached in memory per process (success 1 h, failure 5 min or until a valid GitHub reset, at most 1 h); the single-flight fetch runs under its own context, so an aborting caller only stops waiting and is never cached as a failure. At most one upstream request per window. An upstream failure is 200 with github_latest.available false and a reason, never a 5xx. control-api.md §Compatibility tools, Available tools.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The available tools. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CompatToolAvailableList"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -9095,6 +9068,47 @@ export interface components {
             /** Format: uuid */
             default_tool_id: string | null;
         };
+        /** @description Amendment 57 (accreleus/quasar#1067): one GE-Proton release an admin can install. control-api.md §Available tools. */
+        CompatToolAvailable: {
+            tag: string;
+            /** @enum {string} */
+            source: "recommended" | "github_latest";
+            /** @description The catalogue row's display_name, else the tag. GitHub release names are never passed through. */
+            display_name: string;
+            /**
+             * Format: date-time
+             * @description GitHub's published_at when the served GitHub list holds the tag and it is RFC 3339, else null.
+             */
+            published_at: string | null;
+            /**
+             * Format: uuid
+             * @description The catalogue row with this tag, read live; null when none (install with POST /v1/admin/compat-tools).
+             */
+            tool_id: string | null;
+            /** @description The row's enabled; false when tool_id is null. */
+            enabled: boolean;
+            /** @description The row's pin_conflict; false when tool_id is null. When true the enable is 409 compat_tool_pin_conflict. */
+            pin_conflict: boolean;
+            /** @description The row's name_conflict; false when tool_id is null. When true the exit is disable, then enable. */
+            name_conflict: boolean;
+            /** @description The row's per-host install counts; null when tool_id is null. */
+            hosts: components["schemas"]["CompatToolHostCounts"] | null;
+        };
+        CompatToolAvailableList: {
+            /** @description Recommended entries (newest tag first), then up to 5 GitHub entries not on the recommended list (published_at descending, null last, then tag descending); each tag once. */
+            items: components["schemas"]["CompatToolAvailable"][];
+            github_latest: {
+                /** @description false when the GitHub fetch failed; items then holds only the recommended entries. */
+                available: boolean;
+                /** @description Open string for clients; null when available. The control plane emits exactly one of unreachable, rate_limited, upstream_error, response_invalid, never a raw error (detail goes to its log). */
+                reason: string | null;
+                /**
+                 * Format: date-time
+                 * @description When the served GitHub list was fetched; null when not available.
+                 */
+                fetched_at: string | null;
+            };
+        };
         CompatToolAdd: {
             tag: string;
         };
@@ -9154,25 +9168,28 @@ export interface components {
          * @enum {string}
          */
         HostCodec: "h264" | "h265" | "av1" | "pyrowave";
-        /** @description Amendment 55 (accreleus/quasar#1050): a session's Ultra-low latency (LAN) / PyroWave record. allowed and reason are the stream plan's grant, written once at launch; wanted, active, used and switch_reason follow the agent's codec.switched trace events and the toggle's acks. Observability and UI state: nothing decides on it. */
+        /** @description Amendment 55 (accreleus/quasar#1050), revised by amendment 58 (accreleus/quasar#1059): a session's Ultra-low latency (PyroWave) record. allowed, reason, choice and auto_reason are the stream plan's launch-time decision, written once; wanted, active, used and switch_reason follow the agent's codec.switched trace events. Observability and UI state (the Launch options Codec note): nothing decides on it. */
         SessionPyroWave: {
             allowed: boolean;
-            /** @description Why not allowed: profile_disallows, not_webtransport, host_no_pyrowave, device_no_webgpu (an open string); null when allowed. */
+            /** @description Why not allowed: profile_disallows, host_no_pyrowave, device_no_webgpu, gpu_pyrowave_busy (amendment 58: the GPU's PyroWave slots, instance setting pyrowave_max_per_gpu, were all held), not_webtransport (an open string); null when allowed. */
             reason: string | null;
-            /** @description The user wants PyroWave now. Cleared by a step-down for rtt_too_high, congestion, client_decode_error or encoder_error. */
+            /** @description The session wants PyroWave now: the stream plan's launch decision (the user picked it, or Auto picked it on a prefer profile). Cleared by a step-down for rtt_too_high, congestion, client_decode_error or encoder_error. */
             wanted: boolean;
+            /**
+             * @description Amendment 58: why PyroWave was wanted at launch - explicit (the user picked it in Launch options) or auto (Auto, on a prefer profile); null when not wanted, including an explicit pick the plan refused (reason says why). The plan's record; the client keeps its own record of the user's pick. Always serialized by a server implementing amendment 58.
+             * @enum {string|null}
+             */
+            choice?: "explicit" | "auto" | null;
+            /** @description Amendment 58: on an Auto launch of an eligible session on a prefer profile that Auto did not pick, why: no_measurement, rtt_too_high, link_too_slow (an open string); otherwise null. Always serialized by a server implementing amendment 58. */
+            auto_reason?: string | null;
             /** @description The media client is receiving PyroWave now. */
             active: boolean;
             /** @description The media client received PyroWave at some point in this session. */
             used: boolean;
-            /** @description The PyroWave target bitrate granted: min(height_default * fps / 60, pyrowave_kbps ?? 1000000); null when not allowed. */
+            /** @description The PyroWave target bitrate granted: min(floor(height_default * fps / 60), pyrowave_kbps ?? 1000000) (codec-pyrowave.md §Rate); null when not allowed. */
             target_kbps: number | null;
-            /** @description The reason of the latest switch on or off (launch, user, reconnect, rtt_too_high, client_no_decoder, congestion, client_decode_error, encoder_error, webrtc; an open string); null before the first. */
+            /** @description The reason of the latest switch on or off (launch, reconnect, rtt_too_high, client_no_decoder, congestion, client_decode_error, encoder_error, webrtc; an open string); null before the first. */
             switch_reason: string | null;
-        };
-        SessionPyroWaveUpdate: {
-            /** @description Amendment 55: true turns Ultra-low latency (LAN) on, false turns it off. */
-            active: boolean;
         };
         /**
          * @description The CATALOG codec vocabulary used by stream profiles (rungs). Note 'hevc', not the wire 'h265' - the rename is bridged in exactly one place server-side and never on this surface.
@@ -9219,7 +9236,7 @@ export interface components {
         /** @description UI-P4: a non-fatal advisory returned on an admin profile write. A warning NEVER fails the request - it reports a configuration that is legal but almost certainly not what the operator meant. */
         WriteWarning: {
             /**
-             * @description h264_floor_not_last - every rung after the H.264 rung is unreachable, because H.264 passes every clamp. floor_not_least_demanding - the H.264 rung has a higher min_offer_bandwidth_kbps or min_decode_height than a rung above it, or requires a hardware encoder while a rung above it does not; a floor harder to satisfy than the rung above it is a misconfiguration. pyrowave_needs_webtransport (amendment 55) - pyrowave_allowed is true on a launch profile whose transport is webrtc, so PyroWave can never be offered.
+             * @description h264_floor_not_last - every rung after the H.264 rung is unreachable, because H.264 passes every clamp. floor_not_least_demanding - the H.264 rung has a higher min_offer_bandwidth_kbps or min_decode_height than a rung above it, or requires a hardware encoder while a rung above it does not; a floor harder to satisfy than the rung above it is a misconfiguration. pyrowave_needs_webtransport (amendments 55, 58) - pyrowave_mode is allow or prefer on a launch profile whose transport is webrtc, so PyroWave can never be offered.
              * @enum {string}
              */
             code: "h264_floor_not_last" | "floor_not_least_demanding" | "pyrowave_needs_webtransport";
@@ -9785,7 +9802,7 @@ export interface components {
             transport_reason?: string | null;
             /** @description Amendment 54: the reason in the latest transport.fallback trace event the client posted, else null. Observability only. Absent from an older server. */
             transport_fallback_reason?: string | null;
-            /** @description Amendment 55: the session's Ultra-low latency (LAN) / PyroWave record. Always serialized by a server implementing the amendment; null for every earlier session; absent from an older server. */
+            /** @description Amendments 55 and 58: the session's Ultra-low latency (PyroWave) record. Always serialized by a server implementing the amendment; null for every earlier session; absent from an older server. */
             pyrowave?: components["schemas"]["SessionPyroWave"] | null;
             /** Format: date-time */
             created_at: string;
@@ -9847,7 +9864,7 @@ export interface components {
             /** @description Microphone capture request (2026-08-02). Absent ⇒ false. Granted only when instance setting mic_capture_enabled is on; an ungranted request is not an error — the session stream body reports the granted state. */
             mic?: boolean;
             transport?: components["schemas"]["TransportPreference"];
-            /** @description Amendment 55: the user's remembered Ultra-low latency (LAN) choice on this device. Absent = false. A wish, never an error: Session.pyrowave says whether it was allowed and why not. */
+            /** @description Amendments 55 and 58: true when the user picked Ultra-low latency (PyroWave) in the Launch options Codec list (the client then sends no stream.codec). Absent = false. A wish, never an error: Session.pyrowave says whether it was allowed and why not. On a prefer profile an Auto launch (no stream.codec, no pyrowave true) may also get PyroWave (control-api.md §Ultra-low latency (PyroWave)). */
             pyrowave?: boolean;
             /** @description Admin/debug/back-compat override; beats profile_id field-by-field. */
             stream?: {
@@ -9892,7 +9909,7 @@ export interface components {
             credential?: string;
         };
         /**
-         * @description Amendment 54 (accreleus/quasar#1026): the client's transport preference on POST /v1/sessions. Absent means the launch profile decides. Honoured only as the profile's transport allows (control-api.md §Transport); WebRTC is always the floor.
+         * @description Amendment 54 (accreleus/quasar#1026): the client's transport preference on POST /v1/sessions. Absent means the launch profile decides. Honoured only as the profile's transport allows (control-api.md §Transport); WebRTC is always the floor. Amendment 58: a developer and test switch only (the web client's ?transport= URL parameter); no player UI offers a transport choice, and a session that wants PyroWave wants WebTransport whatever this says.
          * @enum {string}
          */
         TransportPreference: "webrtc" | "webtransport";
@@ -9902,10 +9919,27 @@ export interface components {
          */
         Transport: "webrtc" | "webtransport";
         /**
-         * @description Amendment 54: whether a launch profile's sessions may use WebTransport. webrtc = never; webtransport_opt_in = only when the launch request asks for it; webtransport = unless the launch request asks for webrtc.
+         * @description Amendment 54: whether a launch profile's sessions may use WebTransport. webrtc = never; webtransport_opt_in = only when the launch request asks for it (the developer URL switch) or, amendment 58, the stream plan wants PyroWave; webtransport = unless the launch request asks for webrtc (or, amendment 58, the plan wants PyroWave).
          * @enum {string}
          */
         LaunchProfileTransport: "webrtc" | "webtransport_opt_in" | "webtransport";
+        /**
+         * @description Amendment 58 (accreleus/quasar#1059): a launch profile's Ultra-low latency (PyroWave) setting. off = never; allow = only when the user picks it in the Launch options Codec list; prefer = as allow, and an Auto launch gets it when the launch-time Auto rule holds (device probe shows WebGPU; within the 10-minute network-figure window, probe rtt_ms <= 5 and probe bandwidth_kbps >= the PyroWave target; the figures are unauthenticated hints; control-api.md §Ultra-low latency (PyroWave)). Either way subject to the per-GPU ceiling pyrowave_max_per_gpu.
+         * @enum {string}
+         */
+        LaunchProfilePyroWaveMode: "off" | "allow" | "prefer";
+        /** @description Amendment 58 (accreleus/quasar#1059): what the Launch options Codec list needs to show the Ultra-low latency (PyroWave) entry enabled, or disabled with its reason. Advisory, like the rest of GET /v1/me/profiles: the launch decides, and Session.pyrowave records it. */
+        LaunchProfilePyroWave: {
+            mode: components["schemas"]["LaunchProfilePyroWaveMode"];
+            /** @description The entry is enabled: mode is allow or prefer, the profile's transport is not webrtc, a GPU in the caller's candidate union lists pyrowave, and the fresh probe shows WebGPU and WebTransport with datagrams. */
+            available: boolean;
+            /** @description Why not available, first failing: profile_disallows, host_no_pyrowave, device_no_webgpu, device_no_webtransport (an open string); null when available. */
+            reason: string | null;
+            /** @description An Auto launch would pick PyroWave by the Auto rule, with the top rung's height and fps for the target. False unless mode is prefer and available is true. */
+            auto: boolean;
+            /** @description When mode is prefer, available is true and auto is false: no_measurement, rtt_too_high or link_too_slow (an open string); otherwise null. */
+            auto_reason: string | null;
+        };
         /** @description Amendment 54 (accreleus/quasar#1026): the coordinates for the session's WebTransport transport. On the POST /v1/sessions 201 it is present only when session.transport is webtransport (omitted otherwise, never null), beside the signaling block that is the client's fallback. It is also the body of POST /v1/sessions/{id}/transport-token (TransportEnvelope), freshly resolved and minted. */
         TransportOptions: {
             webtransport: components["schemas"]["WebTransportCoords"];
@@ -10529,6 +10563,8 @@ export interface components {
                 compat_tools_max_enabled?: number;
                 /** @description Amendment 56. Default 10. */
                 compat_tools_disk_reserve_gib?: number;
+                /** @description Amendment 58 (accreleus/quasar#1059). The per-GPU PyroWave ceiling. Default 1. Optional in the envelope so a pre-amendment server stays conformant. */
+                pyrowave_max_per_gpu?: number;
                 /** @description Amendment 49 (#845). Default UTC. Optional in the envelope so a pre-amendment server stays conformant. */
                 default_timezone?: string;
                 /** @description Amendment 49. Default en-US. */
@@ -11588,9 +11624,9 @@ export interface components {
             rungs: components["schemas"]["LaunchProfileRung"][];
             /** @description Amendment 54. Always serialized by a server implementing the amendment; absent from an older one, read as webrtc. */
             transport?: components["schemas"]["LaunchProfileTransport"];
-            /** @description Amendment 55: whether this profile's users may turn on Ultra-low latency (LAN) (PyroWave) on a WebTransport session. Always serialized by a server implementing the amendment; absent from an older one, read as false. */
-            pyrowave_allowed?: boolean;
-            /** @description Amendment 55: the MAXIMUM PyroWave bitrate, kbit/s - a cap, not a fixed target. A session's target is min(height_default * fps / 60, pyrowave_kbps ?? 1000000), height_default 200000 / 300000 / 400000 for an encoded stream height at launch up to 1080 / up to 1440 / above. null = no cap below 1000000. */
+            /** @description Amendment 58 (amendment 55's pyrowave_allowed is deleted): Ultra-low latency (PyroWave) for this profile. Always serialized by a server implementing the amendment; absent from an older one, read as off. */
+            pyrowave_mode?: components["schemas"]["LaunchProfilePyroWaveMode"];
+            /** @description Amendment 55: the MAXIMUM PyroWave bitrate, kbit/s - a cap, not a fixed target. A session's target is min(floor(height_default * fps / 60), pyrowave_kbps ?? 1000000) (codec-pyrowave.md §Rate), height_default 200000 / 300000 / 400000 for an encoded stream height at launch up to 1080 / up to 1440 / above. null = no cap below 1000000. */
             pyrowave_kbps?: number | null;
             used_by?: components["schemas"]["LaunchProfileUsedBy"];
             warnings?: components["schemas"]["WriteWarning"][];
@@ -11606,9 +11642,9 @@ export interface components {
             sort_order?: number;
             /** @description Amendment 54. Absent on POST = webrtc; absent on PATCH = unchanged. */
             transport?: components["schemas"]["LaunchProfileTransport"];
-            /** @description Amendment 55. Absent on POST = false; absent on PATCH = unchanged. True with transport webrtc draws the warning pyrowave_needs_webtransport. */
-            pyrowave_allowed?: boolean;
-            /** @description Amendment 55: the maximum PyroWave bitrate (a cap). Absent on POST = null (no cap below 1000000); absent on PATCH = unchanged; out of range = 400 validation_failed. */
+            /** @description Amendment 58. Absent on POST = off; absent on PATCH = unchanged; any other value = 400 validation_failed. allow or prefer with transport webrtc draws the warning pyrowave_needs_webtransport. Amendment 55's pyrowave_allowed is deleted: sent, it is an unknown key, 400 validation_failed like any other on this decoder. */
+            pyrowave_mode?: components["schemas"]["LaunchProfilePyroWaveMode"];
+            /** @description Amendment 55: the maximum PyroWave bitrate (a cap; the console's Maximum bitrate, blank = automatic by resolution). Absent on POST = null (no cap below 1000000); absent on PATCH = unchanged; out of range = 400 validation_failed. */
             pyrowave_kbps?: number | null;
             /** @description ORDERED stream-profile ids, best first. ORDER IS PREFERENCE. A stream profile may appear at most once (a duplicate is 400 validation_failed). An id that does not resolve is 400 validation_failed at write time, never an FK error surfacing at launch. */
             rungs: string[];
@@ -11644,6 +11680,8 @@ export interface components {
             eligibility: "eligible" | "risky" | "ineligible";
             reasons: components["schemas"]["ProfileReason"][];
             rungs: components["schemas"]["ProfileEvaluation"][];
+            /** @description Amendment 58: the Launch options Ultra-low latency (PyroWave) entry for this profile. Always serialized by a server implementing the amendment; absent from an older one, read as mode off, not available. */
+            pyrowave?: components["schemas"]["LaunchProfilePyroWave"];
         };
         /** @description GET /v1/me/profiles response: eligibility + recommendation. BREAKING (UI-P4) - `profiles[]` now holds LAUNCH PROFILES, which have no single top-level resolution. A consumer reading profiles[].width breaks; quasar-client (ffi_control.rs, ffi.rs) hand-projects width/height/fps off this shape and needs a re-pin, deliberately deferred to its own work. */
         ProfilesResponse: {

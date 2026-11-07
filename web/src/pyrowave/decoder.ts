@@ -6,11 +6,20 @@ import { dequantWGSL, idwtWGSL, yuvToRgbWGSL } from "./shaders";
 
 export { PyroWaveError, type PyroWaveErrorReason } from "./bitstream";
 
-/** fast: subgroups + shader-f16. fallback: neither, or f16 alone (B06, #1055; not built yet). */
+/** fast: subgroups + shader-f16 storage. fallback (#1055): no subgroups, fp32 even with shader-f16. */
 export type DecoderPath = "fast" | "subgroups-fp32" | "fallback";
 
-export function chooseDecoderPath(features: ReadonlySet<string>): DecoderPath {
+const PATH_NEEDS: Record<DecoderPath, GPUFeatureName[]> = { fast: ["subgroups", "shader-f16"], "subgroups-fp32": ["subgroups"], fallback: [] };
+
+/**
+ * The subgroup paths need the subgroup size to divide the 128-lane workgroup (the dequantise
+ * shader's lane index and its scan). Sizes the browser does not report are trusted.
+ */
+export function chooseDecoderPath(features: ReadonlySet<string>, info?: Pick<GPUAdapterInfo, "subgroupMinSize" | "subgroupMaxSize">): DecoderPath {
   if (!features.has("subgroups")) return "fallback";
+  // A range (RDNA 32-64) is fine: the shader reads subgroup_size at run time, so any size that divides 128 works.
+  const divides128 = (n: number | undefined) => n === undefined || (n > 0 && n <= 128 && 128 % n === 0);
+  if (!divides128(info?.subgroupMinSize) || !divides128(info?.subgroupMaxSize)) return "fallback";
   return features.has("shader-f16") ? "fast" : "subgroups-fp32";
 }
 
@@ -38,8 +47,8 @@ interface Pipelines {
   rgb: GPURenderPipeline;
 }
 
-// Compiled once per device and storage precision; a decoder per configuration reuses them.
-const pipelineCache = new WeakMap<GPUDevice, Map<boolean, Promise<Pipelines>>>();
+// Compiled once per device and path; a decoder per configuration reuses them.
+const pipelineCache = new WeakMap<GPUDevice, Map<DecoderPath, Promise<Pipelines>>>();
 // create() runs one at a time per device, so no other create() pushes or pops between its own.
 const createChain = new WeakMap<GPUDevice, Promise<unknown>>();
 // Kept per device, not per decoder: a decoder's own lost handler would keep it alive as long as the device.
@@ -53,28 +62,44 @@ async function checked(device: GPUDevice, code: string): Promise<GPUShaderModule
   return module;
 }
 
-function pipelines(device: GPUDevice, f16: boolean): Promise<Pipelines> {
-  let byPrecision = pipelineCache.get(device);
-  if (!byPrecision) pipelineCache.set(device, (byPrecision = new Map()));
-  let p = byPrecision.get(f16);
+// Error path only. device.lost settles a task after the loss, so give it one before deciding.
+async function lostBy(device: GPUDevice, e: unknown): Promise<boolean> {
+  const info = e as Partial<GPUDeviceLostInfo> | null;
+  if (!(e instanceof PyroWaveError) && (info?.reason === "destroyed" || info?.reason === "unknown")) return true;
+  const settled = await Promise.race([device.lost.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), 0))]);
+  return settled || lostDevices.has(device);
+}
+
+function pipelines(device: GPUDevice, path: DecoderPath): Promise<Pipelines> {
+  let byPath = pipelineCache.get(device);
+  if (!byPath) pipelineCache.set(device, (byPath = new Map()));
+  let p = byPath.get(path);
   if (!p) {
+    const f16 = path === "fast";
     p = (async () => {
-      const rgbModule = await checked(device, yuvToRgbWGSL);
-      const [dq, idwt, rgb] = await Promise.all([
-        checked(device, dequantWGSL(f16)).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
-        checked(device, idwtWGSL(f16)).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
-        device.createRenderPipelineAsync({
-          layout: "auto",
-          vertex: { module: rgbModule, entryPoint: "vs" },
-          fragment: { module: rgbModule, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
-          primitive: { topology: "triangle-list" },
-        }),
-      ]);
-      return { dq, idwt, rgb };
+      try {
+        const rgbModule = await checked(device, yuvToRgbWGSL);
+        const [dq, idwt, rgb] = await Promise.all([
+          checked(device, dequantWGSL(f16, path !== "fallback")).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
+          checked(device, idwtWGSL(f16)).then((module) => device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } })),
+          device.createRenderPipelineAsync({
+            layout: "auto",
+            vertex: { module: rgbModule, entryPoint: "vs" },
+            fragment: { module: rgbModule, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
+            primitive: { topology: "triangle-list" },
+          }),
+        ]);
+        return { dq, idwt, rgb };
+      } catch (e) {
+        if (await lostBy(device, e)) throw new PyroWaveError("device_lost", "the WebGPU device was lost while the decoder was built");
+        // A GPUPipelineError (e.g. limits below what the auto layout needs) is a DOMException.
+        if (e instanceof PyroWaveError) throw e;
+        throw new PyroWaveError("gpu_error", `pipeline: ${e instanceof Error ? e.message : String(e)}`);
+      }
     })();
-    const cache = byPrecision;
-    p.catch(() => cache.delete(f16));
-    byPrecision.set(f16, p);
+    const cache = byPath;
+    p.catch(() => cache.delete(path));
+    byPath.set(path, p);
   }
   return p;
 }
@@ -118,10 +143,10 @@ export class PyroWaveDecoder {
   }
 
   private static async createNow(device: GPUDevice, header: PyroWaveHeader, options: DecoderOptions): Promise<PyroWaveDecoder> {
-    const path = options.forcePath ?? chooseDecoderPath(device.features);
-    const needs = path === "fast" ? ["subgroups", "shader-f16"] : ["subgroups"];
-    if (path === "fallback" || !needs.every((f) => device.features.has(f)))
-      throw new PyroWaveError("no_subgroups", `the device cannot run the ${path} path; the fallback decoder is not built yet (#1055)`);
+    const path = options.forcePath ?? chooseDecoderPath(device.features, device.adapterInfo as GPUAdapterInfo | undefined);
+    if (!Object.hasOwn(PATH_NEEDS, path)) throw new PyroWaveError("unsupported", `unknown decoder path ${String(path)}`);
+    const missing = PATH_NEEDS[path].find((f) => !device.features.has(f));
+    if (missing) throw new PyroWaveError("unsupported", `the ${path} path needs ${missing}, which the device lacks`);
     const f16 = path === "fast";
     const { width: w, height: h } = header;
     const tooLarge = (what: string) => new PyroWaveError("too_large", `${w}x${h}: ${what}`);
@@ -134,7 +159,7 @@ export class PyroWaveDecoder {
     const maxBytes = Math.min(limits.maxStorageBufferBindingSize, limits.maxBufferSize);
     for (const [name, bytes] of Object.entries(sizes)) if (bytes > maxBytes) throw tooLarge(`${name} needs ${bytes} bytes, the device allows ${maxBytes}`);
 
-    const pipes = await pipelines(device, f16);
+    const pipes = await pipelines(device, path);
     const owned: GPUBuffer[] = [];
     let texture: GPUTexture | undefined;
     device.pushErrorScope("out-of-memory");

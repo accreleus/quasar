@@ -4554,6 +4554,7 @@ pub(crate) mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            compat_tools_v1: None,
             node_name: "n".to_string(),
             agent_version: "v".to_string(),
             auth: crate::messages::Auth::Enrollment {

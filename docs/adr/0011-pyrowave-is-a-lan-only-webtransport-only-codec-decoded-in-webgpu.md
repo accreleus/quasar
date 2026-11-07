@@ -78,3 +78,50 @@ of the decision:
   work exists to remove stays.
 - **Choosing it automatically in 0.6.** A false positive puts a 200 Mbit/s stream on a link that
   cannot hold it, so selection waits for bench evidence.
+
+## Amendment (2026-11-07, amendment 58, #1059): chosen at launch, `prefer` lets Auto pick it
+
+Decided with the owner on 2026-11-07, recorded on #1059 and in `protocol/codec-pyrowave.md`. The
+bounds this ADR sets stand except where this section supersedes them: WebTransport only, never
+over the internet, the agent's round-trip gate, and "the control plane grants; the agent applies".
+Superseded, by line of the text above:
+
+- **Line 8** ("Ultra-low latency (LAN) switch"): the name is **Ultra-low latency (PyroWave)**, a
+  Codec entry in Launch options plus a profile setting (Off / Allow / Prefer), not a switch.
+- **Line 32** ("or accepts a switch on to it"): the agent no longer accepts a mid-session switch;
+  that is withdrawn to 0.6.1. It starts PyroWave only at the session's launch.
+- **Lines 34-35** (the probe's bandwidth and RTT "are not inputs"): they are now the inputs to the
+  Auto rule below, as hints only.
+- **Lines 36-37** (a grant "through the user's toggle"): there is no toggle. A grant is made at
+  launch, from the Launch options Codec list or the Auto rule.
+- **Lines 41-46** ("not automatic at all in 0.6", and the 0.6.1 plan: about 2 ms round trip, 1.5
+  times the bitrate free, a bench-proven win): automatic selection ships in 0.6, at launch, under
+  the rule below, gated by the Auto rule and the per-GPU ceiling. **The "about 2 ms" and 1.5 times
+  figures are void**; the rule uses `max_rtt_ms` (5 ms) and the target bitrate. The "bench-proven
+  latency win" is no longer a condition of shipping Auto: the bench (B12, #1061) measures the win
+  and does not gate it.
+- **Lines 79-80** (rejected: "Choosing it automatically in 0.6"): no longer rejected, in the
+  launch-time form only.
+
+What the contract now says:
+
+- **A profile's `pyrowave_mode` is `off`, `allow` or `prefer`**, replacing `pyrowave_allowed`.
+  `off` (the default) never gives PyroWave. `allow` gives it only to a user who picks it in the
+  Launch options Codec list. `prefer` also lets a launch whose codec is **Auto** get it.
+- **The Auto rule** applies only with `prefer` and an Auto codec, on a session that is otherwise
+  eligible (profile, transport, the GPU's codec set). It qualifies the session when the device
+  shows WebGPU, the launching device's probe has `rtt_ms` at or under `max_rtt_ms` (5) and
+  `bandwidth_kbps` at or over the session's PyroWave target, and the probe was measured within the
+  10-minute network-figure window. No usable measurement means a standard codec.
+- **The figures are unauthenticated hints** that only decide "wanted"; they grant nothing, and a
+  client that lies gains only what picking PyroWave explicitly already gives. They also measure
+  client to control plane, not client to host. The limits are still enforced by the agent's QUIC
+  round-trip gate and its 1 s step-down on the rate estimate, which the QUIC congestion state
+  caps, and by the per-GPU ceiling.
+- **A per-GPU ceiling, `pyrowave_max_per_gpu`** (default 1, 1-4), bounds the sessions holding a
+  PyroWave slot on one GPU (`sessions.pyrowave_slot`). A session refused a slot, explicit pick or
+  Auto, launches on its standard codec with reason `gpu_pyrowave_busy`; the launch never fails.
+- **Mid-session switching is withdrawn from 0.6 and moves to 0.6.1**
+  (`PATCH /v1/sessions/{id}/pyrowave` and `session_pyrowave` are gone).
+- **There is no user transport choice.** PyroWave implies WebTransport; the transport follows the
+  stream plan.

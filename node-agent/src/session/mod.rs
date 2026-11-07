@@ -491,6 +491,9 @@ pub struct SessionConfig {
     /// `Auto` negotiates `ulp-red` at 0% up front and ramps `fec-percentage` on the
     /// agent-local loss signal ([`fec::FecController`]).
     pub fec_mode: fec::FecMode,
+    /// Largest RTP packet the host sends, RTP header included, before SRTP/UDP/IP.
+    /// Knob: `QUASAR_RTP_MTU`.
+    pub rtp_mtu: u32,
     /// The host's console-mode config, snapshotted from the agent's latched
     /// `config_update.console_config`. A `local_only` session needs it enabled; a streamed
     /// session never reads it.
@@ -528,6 +531,9 @@ pub struct SessionConfig {
     /// `session_assign.kind` (amendment 39); `None` from a control plane that predates it,
     /// whose sessions are never held or parked.
     pub kind: Option<crate::messages::SessionKind>,
+    /// `session_assign.transport` is `"webtransport"` (amendment 54): the encode chain
+    /// also feeds the agent's WebTransport listener. WebRTC stays available as fallback.
+    pub webtransport: bool,
 }
 
 /// Default `XDG_RUNTIME_DIR` for the Wayland socket. Matches the deploy run scripts.
@@ -595,6 +601,7 @@ impl SessionConfig {
             abr_governor: abr::AbrGovernorSettings::from_env(),
             fec_percentage: env_fec_percentage("QUASAR_FEC_PERCENTAGE"),
             fec_mode: resolve_fec_mode(env_fec_percentage("QUASAR_FEC_PERCENTAGE")),
+            rtp_mtu: env_rtp_mtu("QUASAR_RTP_MTU"),
             console_config: None,
             video_topology: crate::messages::VideoTopology::StreamOnly,
             // env-direct: from_env has no settings overlay. The assign path snapshots
@@ -609,6 +616,7 @@ impl SessionConfig {
             image_id: None,
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
             kind: None,
+            webtransport: false,
         }
     }
 
@@ -845,6 +853,7 @@ impl SessionConfig {
             // env-direct, not a RuntimeSettings/hostcfg knob.
             fec_percentage: env_fec_percentage("QUASAR_FEC_PERCENTAGE"),
             fec_mode: resolve_fec_mode(env_fec_percentage("QUASAR_FEC_PERCENTAGE")),
+            rtp_mtu: env_rtp_mtu("QUASAR_RTP_MTU"),
             console_config: None,
             video_topology: crate::messages::VideoTopology::StreamOnly,
             // Snapshot so provision + measurement use the value this session was
@@ -860,6 +869,7 @@ impl SessionConfig {
             image_id: None,
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
             kind: None,
+            webtransport: false,
         }
     }
 
@@ -1131,6 +1141,39 @@ fn fec_percentage_from(var: &str, raw: Option<&str>) -> u32 {
                     "{var}={s:?} is not a valid percentage (0-100) — FEC disabled (0)"
                 );
                 0
+            }
+        },
+    }
+}
+
+/// Default `QUASAR_RTP_MTU`: libwebrtc's own packet cap, so a 1280-MTU IPv6 path (VPN,
+/// mobile tunnel) carries every packet with room for SRTP, UDP and IPv6 (#1131).
+pub const DEFAULT_RTP_MTU: u32 = 1200;
+/// `QUASAR_RTP_MTU` bounds. 1436 fills a 1500-byte IPv6 path after SRTP's largest tag
+/// (16), UDP (8) and IPv6 (40). 900 is a packet-rate floor, not a path size (#1134 shrinks
+/// no lower): its payload is 852 bytes, 1.6x the packets of the old 1400-byte default.
+pub(crate) const RTP_MTU_RANGE: std::ops::RangeInclusive<u32> = 900..=1436;
+
+fn env_rtp_mtu(var: &str) -> u32 {
+    rtp_mtu_from(var, std::env::var(var).ok().as_deref())
+}
+
+/// Pure core of [`env_rtp_mtu`]: unset/empty ⇒ default; unparseable or out of range ⇒
+/// warn and default.
+fn rtp_mtu_from(var: &str, raw: Option<&str>) -> u32 {
+    match raw {
+        None | Some("") => DEFAULT_RTP_MTU,
+        Some(s) => match s.parse::<u32>() {
+            Ok(n) if RTP_MTU_RANGE.contains(&n) => n,
+            _ => {
+                tracing::warn!(
+                    token = "knob-invalid-rtp-mtu",
+                    "{var}={s:?} is not a valid RTP packet size ({}-{} bytes) — \
+                     falling back to the default ({DEFAULT_RTP_MTU})",
+                    RTP_MTU_RANGE.start(),
+                    RTP_MTU_RANGE.end()
+                );
+                DEFAULT_RTP_MTU
             }
         },
     }
@@ -1425,6 +1468,25 @@ mod tests {
             "junk QUASAR_CODEC is ignored, not fatal, and does not disturb the assignment"
         );
         assert!(!cfg.codec_env_override);
+    }
+
+    #[test]
+    fn rtp_mtu_env_parsing() {
+        const VAR: &str = "QUASAR_RTP_MTU";
+        for (raw, want) in [
+            (None, DEFAULT_RTP_MTU),
+            (Some(""), DEFAULT_RTP_MTU),
+            (Some("1000"), 1000),
+            (Some("900"), 900),
+            (Some("1436"), 1436),
+            (Some("899"), DEFAULT_RTP_MTU),
+            (Some("576"), DEFAULT_RTP_MTU),
+            (Some("1437"), DEFAULT_RTP_MTU),
+            (Some("1400 "), DEFAULT_RTP_MTU),
+            (Some("junk"), DEFAULT_RTP_MTU),
+        ] {
+            assert_eq!(rtp_mtu_from(VAR, raw), want, "{VAR}={raw:?}");
+        }
     }
 
     #[test]

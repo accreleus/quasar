@@ -43,6 +43,21 @@ type SessionAssignCmd struct {
 	Transport        string     `json:"transport,omitempty"`
 	WTTokenHash      string     `json:"wt_token_hash,omitempty"`
 	WTTokenExpiresAt *time.Time `json:"wt_token_expires_at,omitempty"`
+	// Amendment 56: sent only on a connection that advertised compat_tools_v1.
+	CompatTools *CompatToolsSpec `json:"compat_tools,omitempty"`
+}
+
+// CompatToolsSpec is the tools to mount and the effective compatibility-tool mapping for a
+// Steam-family session (agent-api.md §session_assign). Mount marshals as [], never null.
+type CompatToolsSpec struct {
+	Mount   []string          `json:"mount"`
+	Entries []CompatToolEntry `json:"entries"`
+}
+
+type CompatToolEntry struct {
+	AppID  string `json:"appid"`
+	Name   string `json:"name"`
+	Forced bool   `json:"forced"`
 }
 
 // SessionTransportTokenCmd delivers the hash of a transport token minted after the assign
