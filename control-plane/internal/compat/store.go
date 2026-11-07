@@ -4,18 +4,27 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 )
 
 var (
 	ErrNotFound = errors.New("compat tool not found")
 	// ErrNotUsable: the tool is disabled or marked (control-api.md §Usable).
 	ErrNotUsable = errors.New("compat tool is not usable")
+	// ErrLimit, ErrPinConflict: an enable refused (PATCH /v1/admin/compat-tools/{id}).
+	ErrLimit       = errors.New("compat tool limit reached")
+	ErrPinConflict = errors.New("compat tool pin conflict")
 	// ErrMappingsFull: the table holds MaxMappings and the appid is not one of them.
 	ErrMappingsFull = errors.New("compat tool mappings are full")
+	// ErrExists: a tool with this tag (or this pin) exists (POST /v1/admin/compat-tools).
+	ErrExists = errors.New("compat tool exists")
 )
 
 // MaxMappings is the contract's cap on per-game mappings (control-api.md §Compatibility tools).
@@ -24,7 +33,35 @@ const MaxMappings = 1000
 // mappingCapLock serializes the writers that can add a row, so the cap holds under concurrency.
 const mappingCapLock = 0x71_636d // "qcm"
 
-type Store struct{ pool *pgxpool.Pool }
+// InUseError refuses a disable while a mapping or the default names the tool.
+type InUseError struct {
+	Mappings  int
+	IsDefault bool
+}
+
+func (e *InUseError) Error() string {
+	return fmt.Sprintf("%d per-game mapping(s) name the tool; fleet default: %v", e.Mappings, e.IsDefault)
+}
+
+// ParkedSuperseder moves every live parked session to stopping inside tx and returns the dispatch
+// to run once tx commits. semantics: control-api.md §Compatibility tools, "Hot Loading".
+type ParkedSuperseder func(ctx context.Context, tx pgx.Tx) (afterCommit func(), err error)
+
+type Store struct {
+	pool *pgxpool.Pool
+	// Auditor records the reconcile's pin_conflict marks (actor null); nil records nothing.
+	Auditor audit.Recorder
+	// Superseder runs in the transaction of every write that changes the effective mapping; nil does nothing.
+	Superseder ParkedSuperseder
+}
+
+// supersede runs the superseder in tx, after the mapping rows are written (lock order: sessions last).
+func (s *Store) supersede(ctx context.Context, tx pgx.Tx) (func(), error) {
+	if s.Superseder == nil {
+		return func() {}, nil
+	}
+	return s.Superseder(ctx, tx)
+}
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
@@ -64,7 +101,8 @@ type HostCount struct {
 }
 
 // Reconcile inserts the code-owned rows and sets recommended from the shipped list. It never
-// deletes a row or changes enabled. A tag row with another pin cannot exist until add-by-tag does.
+// deletes a row or changes enabled. A tag row pinned to another SHA-512 than the shipped entry is
+// never re-pinned: it is marked pin_conflict, and the mark clears when the shipped pin matches again.
 func (s *Store) Reconcile(ctx context.Context) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -80,21 +118,97 @@ func (s *Store) Reconcile(ctx context.Context) error {
 		}
 	}
 	tags := make([]string, 0, len(recommended))
+	type held struct{ id, tag, sha, name, shipped string }
+	var helds []held
 	for _, r := range recommended {
 		tags = append(tags, r.Tag)
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO compat_tools (family, source, tag, steam_name, display_name, recommended,
-			                          asset_name, asset_size_bytes, asset_sha512)
-			VALUES ('ge', 'recommended', $1, $2, $2, true, $3, $4, $5)
-			ON CONFLICT (tag) DO NOTHING`, r.Tag, r.SteamName, r.Asset, r.SizeBytes, r.SHA512); err != nil {
+		// No arbiter: a row holding this entry's tag, Steam name or pin skips it rather than
+		// aborting the boot. Only a row holding the name or the pin under another tag is a fault.
+		var inserted bool
+		err := tx.QueryRow(ctx, `
+			WITH ins AS (
+				INSERT INTO compat_tools (family, source, tag, steam_name, display_name, recommended,
+				                          asset_name, asset_size_bytes, asset_sha512)
+				VALUES ('ge', 'recommended', $1, $2, $2, true, $3, $4, $5)
+				ON CONFLICT DO NOTHING RETURNING id)
+			SELECT EXISTS (SELECT 1 FROM ins) OR EXISTS (SELECT 1 FROM compat_tools WHERE tag = $1)`,
+			r.Tag, r.SteamName, r.Asset, r.SizeBytes, r.SHA512).Scan(&inserted)
+		if err != nil {
 			return fmt.Errorf("compat reconcile %s: %w", r.Tag, err)
+		}
+		if inserted {
+			continue
+		}
+		h := held{name: r.SteamName, shipped: r.Tag}
+		err = tx.QueryRow(ctx, `UPDATE compat_tools SET name_conflict = true
+			WHERE steam_name = $1 AND NOT name_conflict RETURNING id::text, COALESCE(tag, ''), COALESCE(asset_sha512, '')`,
+			r.SteamName).Scan(&h.id, &h.tag, &h.sha)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			slog.Warn("compat tools: a recommended entry is held by another row and was not inserted",
+				"tag", r.Tag, "steam_name", r.SteamName)
+		case err != nil:
+			return fmt.Errorf("compat reconcile %s holder: %w", r.Tag, err)
+		default:
+			slog.Warn("compat tools: another row holds a recommended entry's Steam name; marked name_conflict",
+				"tag", r.Tag, "steam_name", r.SteamName, "holder_tag", h.tag)
+			helds = append(helds, h)
 		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE compat_tools SET recommended = (tag = ANY($1::text[]))
 		WHERE family = 'ge' AND recommended IS DISTINCT FROM (tag = ANY($1::text[]))`, tags); err != nil {
 		return fmt.Errorf("compat reconcile recommended: %w", err)
 	}
-	return tx.Commit(ctx)
+	type marked struct{ id, tag, sha, shipped string }
+	var marks []marked
+	for _, r := range recommended {
+		var m marked
+		err := tx.QueryRow(ctx, `UPDATE compat_tools SET pin_conflict = (asset_sha512 <> $2)
+			WHERE tag = $1 AND pin_conflict IS DISTINCT FROM (asset_sha512 <> $2)
+			RETURNING id::text, asset_sha512, pin_conflict`, r.Tag, r.SHA512).Scan(&m.id, &m.sha, new(bool))
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+		case err != nil:
+			return fmt.Errorf("compat reconcile pin %s: %w", r.Tag, err)
+		case m.sha != r.SHA512:
+			m.tag, m.shipped = r.Tag, r.SHA512
+			marks = append(marks, m)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	for _, m := range marks {
+		audit.TryRecord(ctx, s.Auditor, "", "compat_tool.pin_conflict", "compat_tool", m.id,
+			map[string]any{"tag": m.tag, "sha512": m.sha, "shipped_sha512": m.shipped})
+	}
+	for _, h := range helds {
+		audit.TryRecord(ctx, s.Auditor, "", "compat_tool.name_conflict", "compat_tool", h.id,
+			map[string]any{"tag": h.tag, "sha512": h.sha, "name": h.name, "shipped_tag": h.shipped})
+	}
+	return nil
+}
+
+// HasTag reports whether a catalogue row holds tag, so add-by-tag refuses before reading github.com.
+func (s *Store) HasTag(ctx context.Context, tag string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM compat_tools WHERE tag = $1)`, tag).Scan(&ok)
+	return ok, err
+}
+
+// Add stores a verified tag pin, disabled, with source "tag" and no Steam name yet: the name is
+// bound from the first verified install (Converger.Closed).
+func (s *Store) Add(ctx context.Context, p Pin, actorID string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO compat_tools (family, source, tag, display_name, asset_name, asset_size_bytes, asset_sha512, created_by)
+		VALUES ('ge', 'tag', $1, $1, $2, $3, $4, NULLIF($5, '')::uuid)
+		RETURNING id::text`, p.Tag, p.AssetName, p.SizeBytes, p.SHA512, actorID).Scan(&id)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return "", ErrExists
+	}
+	return id, err
 }
 
 // List returns the catalogue and the fleet default's id: Valve builds first, then GE newest tag first.
@@ -131,7 +245,7 @@ func (s *Store) List(ctx context.Context) ([]Tool, *string, error) {
 		if t.Family == "ge" && assetName != nil && size != nil && sha != nil && t.Tag != nil {
 			t.Asset = &Asset{Name: *assetName, SizeBytes: *size, SHA512: *sha,
 				URL: "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/" + *t.Tag + "/" + *assetName}
-			t.Hosts = &HostCount{} // nothing installs yet, so no host has a state to count
+			t.Hosts = &HostCount{} // filled by Converger.counts
 		}
 		t.IsDefault = def != nil && *def == t.ID
 		out = append(out, t)
@@ -172,7 +286,97 @@ func (s *Store) SetDefault(ctx context.Context, toolID *string) (prev *string, e
 		`UPDATE instance_settings SET compat_tool_default_id = $1::uuid WHERE id = true`, toolID); err != nil {
 		return nil, err
 	}
-	return prev, tx.Commit(ctx)
+	after := func() {}
+	if (prev == nil) != (toolID == nil) || (prev != nil && *prev != *toolID) {
+		if after, err = s.supersede(ctx, tx); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	after()
+	return prev, nil
+}
+
+// Toggled is what an accepted enable or disable changed, for its audit row.
+type Toggled struct {
+	Changed     bool
+	Tag, SHA512 *string
+	HostIDs     []string
+}
+
+// SetEnabled is PATCH /v1/admin/compat-tools/{id}. It locks instance_settings FOR UPDATE, then the
+// tool row (control-api.md §Usable, "Lock order"); an enable counts the enabled GE tools under that
+// lock. A disable clears name_conflict (§Every state has an exit). A repeat is a no-op.
+func (s *Store) SetEnabled(ctx context.Context, id string, enabled bool) (Toggled, error) {
+	var out Toggled
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `INSERT INTO instance_settings (id) VALUES (true) ON CONFLICT DO NOTHING`); err != nil {
+		return out, err
+	}
+	var max int
+	var def *string
+	if err := tx.QueryRow(ctx, `SELECT compat_tools_max_enabled, compat_tool_default_id::text FROM instance_settings
+		WHERE id = true FOR UPDATE`).Scan(&max, &def); err != nil {
+		return out, fmt.Errorf("lock instance settings: %w", err)
+	}
+	var family string
+	var cur, pin bool
+	err = tx.QueryRow(ctx, `SELECT family, enabled, pin_conflict, tag, asset_sha512 FROM compat_tools
+		WHERE id = $1::uuid FOR UPDATE`, id).Scan(&family, &cur, &pin, &out.Tag, &out.SHA512)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return out, ErrNotFound
+	}
+	if err != nil {
+		return out, err
+	}
+	if cur == enabled {
+		return out, tx.Commit(ctx)
+	}
+	if enabled {
+		if pin {
+			return out, ErrPinConflict
+		}
+		if family == "ge" {
+			var n int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM compat_tools WHERE family = 'ge' AND enabled`).Scan(&n); err != nil {
+				return out, err
+			}
+			if n >= max {
+				return out, ErrLimit
+			}
+		}
+	} else {
+		inUse := &InUseError{IsDefault: def != nil && *def == id}
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM compat_tool_mappings WHERE tool_id = $1::uuid`, id).Scan(&inUse.Mappings); err != nil {
+			return out, err
+		}
+		if inUse.Mappings > 0 || inUse.IsDefault {
+			return out, inUse
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE compat_tools SET enabled = $2,
+		first_enabled_at = CASE WHEN $2 THEN COALESCE(first_enabled_at, now()) ELSE first_enabled_at END,
+		name_conflict = name_conflict AND $2
+		WHERE id = $1::uuid`, id, enabled); err != nil {
+		return out, err
+	}
+	if family == "ge" {
+		rows, err := tx.Query(ctx, `SELECT id::text FROM hosts ORDER BY id LIMIT 101`)
+		if err != nil {
+			return out, err
+		}
+		if out.HostIDs, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+			return out, err
+		}
+	}
+	out.Changed = true
+	return out, tx.Commit(ctx)
 }
 
 // Entry is one mapping sent to the agent: appid "0" is the fleet default.
@@ -183,30 +387,52 @@ type Entry struct {
 }
 
 // Entries is the fleet default as appid 0, then every per-game mapping, filtered by the usable
-// predicate. A GE tool is never usable here: no host holds one yet (mount is always empty).
-func (s *Store) Entries(ctx context.Context) ([]Entry, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT '0', t.steam_name, false
-		FROM instance_settings i JOIN compat_tools t ON t.id = i.compat_tool_default_id
-		WHERE i.id = true AND t.family = 'valve' AND t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict
-		UNION ALL
-		SELECT m.external_id, t.steam_name, m.forced
-		FROM compat_tool_mappings m JOIN compat_tools t ON t.id = m.tool_id
-		WHERE m.provider = 'steam' AND t.family = 'valve' AND t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict
-		ORDER BY 1`)
+// predicate on hostID, and the mount: the GE tools usable there (the host holds the tool's
+// SHA-512 under its bound Steam name). The caller drops both for a connection without
+// compat_tools_v1.
+func (s *Store) Entries(ctx context.Context, hostID string) ([]Entry, []string, error) {
+	mount, err := s.mountable(ctx, hostID)
 	if err != nil {
-		return nil, fmt.Errorf("read compat entries: %w", err)
+		return nil, nil, err
+	}
+	rows, err := s.pool.Query(ctx, `
+		WITH usable AS (
+			SELECT t.id, t.steam_name FROM compat_tools t
+			WHERE t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict
+			  AND (t.family = 'valve' OR t.steam_name = ANY($1::text[])))
+		SELECT '0', u.steam_name, false
+		FROM instance_settings i JOIN usable u ON u.id = i.compat_tool_default_id
+		WHERE i.id = true
+		UNION ALL
+		SELECT m.external_id, u.steam_name, m.forced
+		FROM compat_tool_mappings m JOIN usable u ON u.id = m.tool_id
+		WHERE m.provider = 'steam'
+		ORDER BY 1`, mount)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read compat entries: %w", err)
 	}
 	defer rows.Close()
 	var out []Entry
 	for rows.Next() {
 		var e Entry
 		if err := rows.Scan(&e.AppID, &e.Name, &e.Forced); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	return out, mount, rows.Err()
+}
+
+func (s *Store) mountable(ctx context.Context, hostID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT t.steam_name FROM compat_tools t
+		JOIN host_compat_tools h ON h.host_id = $1::uuid AND h.sha512 = t.asset_sha512 AND h.name = t.steam_name
+		WHERE t.family = 'ge' AND t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict
+		ORDER BY t.created_at DESC, t.tag DESC LIMIT 32`, hostID)
+	if err != nil {
+		return nil, fmt.Errorf("read mountable compat tools: %w", err)
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 // Mapping is the CompatToolMapping read shape.
@@ -304,10 +530,18 @@ func (s *Store) SetMapping(ctx context.Context, appID, toolID string, forced boo
 		Scan(&m.Provider, &m.ExternalID, &m.ToolID, &m.Forced, &m.UpdatedAt); err != nil {
 		return
 	}
-	err = tx.QueryRow(ctx, `SELECT COALESCE(array_agg(id::text ORDER BY id), '{}') FROM apps
-		WHERE external_source = 'steam' AND external_id = $1`, appID).Scan(&m.AppIDs)
-	if err == nil {
-		err = tx.Commit(ctx)
+	if err = tx.QueryRow(ctx, `SELECT COALESCE(array_agg(id::text ORDER BY id), '{}') FROM apps
+		WHERE external_source = 'steam' AND external_id = $1`, appID).Scan(&m.AppIDs); err != nil {
+		return
+	}
+	after := func() {}
+	if prev == nil || prev.ToolID != m.ToolID || prev.Forced != m.Forced {
+		if after, err = s.supersede(ctx, tx); err != nil {
+			return
+		}
+	}
+	if err = tx.Commit(ctx); err == nil {
+		after()
 	}
 	return
 }
@@ -322,9 +556,14 @@ func refOf(id string, tag, sha *string) ToolRef {
 
 // ClearMapping removes the Steam game's mapping and returns it (nil when none existed).
 func (s *Store) ClearMapping(ctx context.Context, appID string) (prev *Mapping, prevTool ToolRef, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, ToolRef{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
 	var p Mapping
 	var tag, sha *string
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		WITH d AS (DELETE FROM compat_tool_mappings WHERE provider = 'steam' AND external_id = $1
 		           RETURNING tool_id, forced)
 		SELECT d.tool_id::text, d.forced, t.tag, t.asset_sha512 FROM d JOIN compat_tools t ON t.id = d.tool_id`, appID).
@@ -335,5 +574,13 @@ func (s *Store) ClearMapping(ctx context.Context, appID string) (prev *Mapping, 
 	if err != nil {
 		return nil, ToolRef{}, err
 	}
+	after, err := s.supersede(ctx, tx)
+	if err != nil {
+		return nil, ToolRef{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, ToolRef{}, err
+	}
+	after()
 	return &p, refOf(p.ToolID, tag, sha), nil
 }

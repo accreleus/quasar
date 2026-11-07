@@ -299,7 +299,7 @@ type Session struct {
 	Transport               string
 	TransportReason         *string
 	TransportFallbackReason *string
-	// PyroWave is sessions.pyrowave (migration 0114), nil before the stream plan wrote it;
+	// PyroWave is sessions.pyrowave (migration 0115), nil before the stream plan wrote it;
 	// PyroWaveSlot is sessions.pyrowave_slot, the scheduler's reservation.
 	PyroWave     *PyroWaveRecord
 	PyroWaveSlot bool

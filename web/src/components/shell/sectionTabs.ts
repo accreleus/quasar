@@ -30,6 +30,7 @@ export const LIBRARY_TABS: SectionTab[] = [
   { id: "presets", label: "Runtime presets", to: "/admin/library/presets" },
   { id: "images", label: "Images", to: "/admin/library/images" },
   { id: "sources", label: "Sources", to: "/admin/library/sources" },
+  { id: "compatibility", label: "Compatibility", to: "/admin/library/compatibility" },
 ];
 
 export const STREAMING_TABS: SectionTab[] = [

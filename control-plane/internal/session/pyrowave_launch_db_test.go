@@ -1,6 +1,6 @@
 package session
 
-// Ultra-low latency (PyroWave) at launch, end to end against the 0114 schema (amendment 58):
+// Ultra-low latency (PyroWave) at launch, end to end against the 0115 schema (amendment 58):
 // the plan's grant reaches the agent and the session, the per-GPU ceiling refuses the next
 // launch without failing it, and the agent's codec.switched moves the session's record.
 

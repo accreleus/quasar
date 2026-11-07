@@ -1742,9 +1742,8 @@ fn register_message(
         terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
         parked_sessions_v1: crate::session::launch_helper::installed().then_some(true),
         adopt_restream_v1: crate::session::launch_helper::installed().then_some(true),
-        // shortcut: advertised unconditionally, with no tools directory or install runner yet, so no
-        // GE tool is mounted; C07/C08 (#1071) must gate it on a usable tools directory.
-        compat_tools_v1: Some(true),
+        // The runner, `capacity.compat_tools` and the mounts all need the usable tools directory.
+        compat_tools_v1: crate::compat_tools::supported().then_some(true),
         node_name: cfg.node_name.clone(),
         agent_version: crate::buildinfo::version().to_string(),
         auth: choose_auth(cfg, prefer_enrollment_token)?,
@@ -2020,6 +2019,7 @@ fn diagnostic_observe() -> (AgentMsg, Vec<crate::messages::ReadinessCheck>) {
     (
         AgentMsg::Capacity {
             transports: crate::webtransport::capacity(),
+            compat_tools: crate::compat_tools::capacity(),
             source_preparation: None,
             deployment_settings: None,
             config_policy_accepted_groups: None,
@@ -2347,6 +2347,7 @@ async fn connect_and_run(
     apply_gpu_codecs(&mut cap.gpus, &first_gpu_codec_sets);
     let capacity_msg = AgentMsg::Capacity {
         transports: crate::webtransport::capacity(),
+        compat_tools: crate::compat_tools::capacity(),
         source_preparation: None,
         deployment_settings: Some(sessions.mgr.deployment_baseline.deployment_map()),
         config_policy_accepted_groups: sessions.mgr.policy_accepted_groups.clone(),
@@ -2520,6 +2521,9 @@ async fn connect_and_run(
             registry.register(std::sync::Arc::new(
                 crate::session::gc::HomeGcJobRunner::new(cp.clone(), live_refs.clone()),
             ));
+            if let Some(runner) = crate::compat_tools::runner() {
+                registry.register(Arc::new(runner));
+            }
             crate::jobs::spawn_job_poller(cp, std::sync::Arc::new(registry))
         }
         None => {
@@ -2751,6 +2755,7 @@ async fn connect_and_run(
                             apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                             let capacity_msg = AgentMsg::Capacity {
             transports: crate::webtransport::capacity(),
+            compat_tools: crate::compat_tools::capacity(),
             deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
             config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
             config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
@@ -2810,6 +2815,7 @@ async fn connect_and_run(
                     apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                     let capacity_msg = AgentMsg::Capacity {
             transports: crate::webtransport::capacity(),
+            compat_tools: crate::compat_tools::capacity(),
             deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
             config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
             config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
@@ -2827,6 +2833,10 @@ async fn connect_and_run(
                     };
                     send(&mut tx, &capacity_msg).await?;
                 }
+            }
+            _ = crate::compat_tools::changed().notified() => {
+                info!("compat tools changed; re-sending capacity");
+                send_fresh_capacity(&mut tx, &mut *mgr).await?;
             }
             changed = recv_or_disabled(&mut console_access_rx) => {
                 if changed.is_none() {
@@ -3228,6 +3238,8 @@ impl HostSessions {
 type HomeSourceRetire = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 struct SessionManager {
+    /// This manager's owner id on compatibility-tool mount holds (`compat_tools`).
+    hold_owner: u64,
     /// Assigned but not yet started. Aged out by the heartbeat sweep — see
     /// [`PENDING_ASSIGNMENT_TTL`].
     pending: HashMap<String, PendingAssignment>,
@@ -3493,6 +3505,8 @@ struct RunningHandle {
     /// same check, and those of a swap the runner has not yet completed.
     region_env: BTreeMap<String, String>,
     swap_region_env: Option<BTreeMap<String, String>>,
+    /// The compatibility tools its container bind-mounts, for an adoption's check.
+    compat_tools: Vec<String>,
     /// Set once the runner thread has returned, for a fresh build that must wait for it.
     exited: Arc<AtomicBool>,
 }
@@ -3591,6 +3605,46 @@ fn adopt_declined(h: &RunningHandle, gpu_index: i32, cfg: &SessionConfig) -> Opt
     }
 }
 
+const TOOL_NOT_INSTALLED: &str = "a compatibility tool it mounts is no longer installed";
+
+/// The gate every reuse of a runtime passes (`adopt_runtime` and `begin_restream`, #1133's
+/// adopt, restream and rebuild), right before the runner is sent the adoption: it claims the
+/// runtime's compatibility tools for `session_id` atomically with the removal check
+/// (`compat_tools::claim_for_adopt`). `false`: a tool is gone or being removed, so decline and
+/// build fresh; a removal may delete a tree under a parked runtime's bind mount, and that runtime
+/// must never reach Steam. Pair every claim whose reuse does not complete with
+/// [`unclaim_runtime`].
+fn claim_runtime(
+    owner: u64,
+    from: &str,
+    session_id: &str,
+    h: &RunningHandle,
+    cfg: &SessionConfig,
+) -> bool {
+    crate::compat_tools::claim_for_adopt(
+        from,
+        session_id,
+        &h.compat_tools,
+        cfg.kind == Some(SessionKind::Parked),
+        owner,
+    )
+}
+
+/// Undoes a [`claim_runtime`] whose reuse did not complete: `session_id` holds exactly what its
+/// assign gave it again, for its fresh build. A session's hold is otherwise made once, at assign,
+/// and released only when it ends.
+fn unclaim_runtime(owner: u64, session_id: &str, cfg: &SessionConfig) {
+    crate::compat_tools::rehold(
+        session_id,
+        cfg.container
+            .as_ref()
+            .map(|c| c.compat_tools.clone())
+            .unwrap_or_default(),
+        cfg.kind == Some(SessionKind::Parked),
+        owner,
+    );
+}
+
 impl SessionManager {
     fn restart_idle(&self) -> bool {
         if !self.policy_session_ready
@@ -3629,6 +3683,7 @@ impl SessionManager {
         seed_nvidia_lib32(&mut runtime_settings, &nvidia_lib32_probed);
         let deployment_baseline = runtime_settings.clone();
         SessionManager {
+            hold_owner: crate::compat_tools::new_hold_owner(),
             pending: HashMap::new(),
             failed_rebuilds: Default::default(),
             running: HashMap::new(),
@@ -3677,6 +3732,13 @@ impl SessionManager {
     /// `running`, so the two views can never disagree about host busyness.
     fn note_session_count(&self) {
         crate::restart::note_sessions(self.pending.len() + self.running.len());
+        // Every session that may still mount its tools keeps its hold: a play id whose restream
+        // is in flight is in neither map until `finish_adopt`, yet holds the claimed tools.
+        crate::compat_tools::retain_holds(self.hold_owner, &|sid| {
+            self.pending.contains_key(sid)
+                || self.running.contains_key(sid)
+                || self.restreaming_for(sid).is_some()
+        });
         if let Some(a) = &self.warmup_activity {
             a.set_live(self.running.len(), Instant::now());
         }
@@ -3956,6 +4018,7 @@ impl SessionManager {
     ) {
         let dropped = self.pending.len();
         self.pending.clear();
+        crate::compat_tools::retain_holds(self.hold_owner, &|sid| self.running.contains_key(sid));
         self.failed_rebuilds.clear();
         // As a pending start is dropped: the control plane may have reaped the play id, so
         // a restream in flight relabels nothing and builds nothing. The runtime, already
@@ -4099,9 +4162,18 @@ impl SessionManager {
                 if let Some(handle) = &self.probe_handle {
                     handle.launch_arrived(gpu_index);
                 }
-                crate::compat_tools::apply_assign(&mut app.env, compat_tools.as_ref());
+                let compat_mounts = crate::compat_tools::apply_assign(
+                    &mut app.env,
+                    compat_tools.as_ref(),
+                    &session_id,
+                    kind == Some(SessionKind::Parked),
+                    self.hold_owner,
+                );
                 let container = match app_to_container(app, &self.mount_policy()) {
-                    Ok(c) => c,
+                    Ok(c) => c.map(|mut c| {
+                        c.compat_tools = compat_mounts;
+                        c
+                    }),
                     Err(error) => {
                         warn!(
                             token = "session-assign-rejected",
@@ -4285,6 +4357,11 @@ impl SessionManager {
                     let runtime_stream = cfg.stream.clone();
                     let built = (cfg.stream.width, cfg.stream.height, cfg.stream.fps);
                     let runtime_region_env = region_env(cfg.container.as_ref());
+                    let runtime_compat_tools = cfg
+                        .container
+                        .as_ref()
+                        .map(|c| c.compat_tools.clone())
+                        .unwrap_or_default();
                     let kind = cfg.kind;
                     let (sig_in_tx, sig_in_rx) = std::sync::mpsc::channel::<SignalMsg>();
                     let (swap_tx, swap_rx) = std::sync::mpsc::channel::<SwapRequest>();
@@ -4463,6 +4540,7 @@ impl SessionManager {
                             stream: runtime_stream,
                             region_env: runtime_region_env,
                             swap_region_env: None,
+                            compat_tools: runtime_compat_tools,
                             exited,
                             built,
                             restreaming: None,
@@ -5256,6 +5334,7 @@ impl SessionManager {
             );
             if let Some(mut h) = self.running.remove(&sid) {
                 self.remove_live_refs(&h.home_refs);
+                crate::compat_tools::release(&sid);
                 if let Some(t) = h.thread.take() {
                     let _ = t.join();
                 }
@@ -5312,6 +5391,8 @@ impl SessionManager {
         out
     }
 
+    /// Reuses a runtime through [`claim_runtime`], the gate every reuse passes.
+    ///
     /// Amendment 39 `adopt_session_id`: hand `from`'s held or parked runtime to
     /// `session_id`, or say why it is built fresh. A runtime held here that is not adopted
     /// is released, and the fresh build waits for it: the two share a managed home.
@@ -5345,6 +5426,10 @@ impl SessionManager {
             );
             declined = Some(REBUILD_FAILED_BEFORE);
         }
+        // Last, so nothing after it can decline: the claim moved the hold to `session_id`.
+        if declined.is_none() && !claim_runtime(self.hold_owner, from, session_id, h, cfg) {
+            declined = Some(TOOL_NOT_INSTALLED);
+        }
         let request = AdoptRequest {
             kind: cfg.kind,
             container: cfg.container.clone(),
@@ -5361,6 +5446,13 @@ impl SessionManager {
                 .then_some("its runner is gone"),
         };
         if let Some(why) = refused {
+            // A session's hold is made once, at assign, and released only when it ends: a
+            // decline leaves it for the fresh build. Only a claim that moved the runtime's
+            // tools onto this session before its runner turned out gone is undone, back to
+            // exactly the hold the assign gave it.
+            if declined.is_none() {
+                unclaim_runtime(self.hold_owner, session_id, cfg);
+            }
             info!(
                 token = "runtime-adopt-declined",
                 "session {session_id}: not adopting the runtime of {from} ({why}); it is torn \
@@ -5419,7 +5511,13 @@ impl SessionManager {
             self.pending.insert(session_id.to_string(), pa);
             return false;
         };
+        // A refused claim leaves `session_start` to `adopt_runtime`, which declines on it.
+        if !claim_runtime(self.hold_owner, &from, session_id, h, &pa.cfg) {
+            self.pending.insert(session_id.to_string(), pa);
+            return false;
+        }
         if h.adopt.send(request).is_err() {
+            unclaim_runtime(self.hold_owner, session_id, &pa.cfg);
             self.pending.insert(session_id.to_string(), pa);
             return false;
         }
@@ -5507,6 +5605,7 @@ impl SessionManager {
             decline(h);
         }
         let session_id = r.session_id;
+        unclaim_runtime(self.hold_owner, &session_id, &r.assignment.cfg);
         self.pending.insert(session_id.clone(), r.assignment);
         // The control plane's own `session_start` was acked; this one answers nobody.
         let start = ControlMsg::SessionStart {
@@ -5552,6 +5651,8 @@ impl SessionManager {
                 h.restreaming = None;
                 decline(h);
             }
+            // The play session ends here: its hold (claimed from the runtime) goes with it.
+            crate::compat_tools::release(session_id);
             info!(
                 token = "runtime-adopt-restream-stopped",
                 "session {session_id}: stopped while the runtime of {runtime} was moving to its \
@@ -5804,6 +5905,7 @@ impl SessionManager {
         if let Some(h) = self.running.remove(session_id) {
             self.labels.remove(&h.runtime_id);
             self.remove_live_refs(&h.home_refs);
+            crate::compat_tools::release(session_id);
             self.health.set_sessions(self.running.len());
             self.note_session_count();
             // The teardown-side RSS sample, plus the `QUASAR_MALLOC_TRIM` discriminator:
@@ -6112,6 +6214,7 @@ fn app_to_container(app: AppSpec, mounts: &MountPolicy) -> anyhow::Result<Option
         systempaths_unconfined: app.systempaths_unconfined,
         require_local_image: false,
         direct_display: app.direct_display,
+        compat_tools: Vec::new(),
     }))
 }
 
@@ -6825,6 +6928,7 @@ where
     apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
     let msg = AgentMsg::Capacity {
         transports: crate::webtransport::capacity(),
+        compat_tools: crate::compat_tools::capacity(),
         source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
         deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
         config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
@@ -8970,6 +9074,7 @@ mod tests {
         );
         let json = serde_json::to_value(AgentMsg::Capacity {
             transports: crate::webtransport::capacity(),
+            compat_tools: crate::compat_tools::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
             config_policy_legacy_map_applied_id: None,
@@ -9641,6 +9746,7 @@ mod tests {
                 stream: StreamParams::default(),
                 region_env: BTreeMap::new(),
                 swap_region_env: None,
+                compat_tools: Vec::new(),
                 built: (1920, 1080, 60),
                 restreaming: None,
                 exited: Arc::new(AtomicBool::new(false)),
@@ -9704,6 +9810,7 @@ mod tests {
                 stream: StreamParams::default(),
                 region_env: BTreeMap::new(),
                 swap_region_env: None,
+                compat_tools: Vec::new(),
                 built: (1920, 1080, 60),
                 restreaming: None,
                 exited: Arc::new(AtomicBool::new(false)),
@@ -10805,6 +10912,7 @@ mod tests {
                 stream: StreamParams::default(),
                 region_env: BTreeMap::new(),
                 swap_region_env: None,
+                compat_tools: Vec::new(),
                 built: (1920, 1080, 60),
                 restreaming: None,
                 exited: Arc::new(AtomicBool::new(false)),
@@ -12520,6 +12628,212 @@ mod tests {
             warm.adopted.recv_timeout(WAIT).unwrap().1.kind,
             Some(SessionKind::Parked)
         );
+    }
+
+    /// The process's one tools store for agent tests, with one installed tool per test that needs
+    /// a real hold (each test removes only its own).
+    fn test_tools_store() -> &'static Arc<crate::compat_tools::install::ToolStore> {
+        crate::compat_tools::test_store(|| {
+            let root = tempfile::tempdir().unwrap().keep();
+            let tools: Vec<serde_json::Value> = ["GE-Proton9-99", "GE-Proton9-98"]
+                .iter()
+                .map(|t| {
+                    std::fs::create_dir_all(root.join("tools").join(t)).unwrap();
+                    serde_json::json!({"name": t, "tag": t, "sha512": "c".repeat(128),
+                        "bytes": 1, "state": "installed"})
+                })
+                .collect();
+            let record = serde_json::json!({ "tools": tools });
+            std::fs::write(root.join("record.json"), record.to_string()).unwrap();
+            crate::compat_tools::install::ToolStore::open(&root, &[], false).unwrap()
+        })
+    }
+
+    /// A `compat_tools.converge` removal of `tool` from [`test_tools_store`].
+    fn remove_test_tool(tool: &str) -> crate::jobs::JobOutcome {
+        use crate::jobs::JobRunner as _;
+        struct NoSource;
+        impl crate::compat_tools::fetch::Source for NoSource {
+            fn get(
+                &self,
+                _: &str,
+            ) -> Result<crate::compat_tools::fetch::Hop, crate::compat_tools::fetch::HopError>
+            {
+                Err(crate::compat_tools::fetch::HopError::Other(
+                    "no network in tests".into(),
+                ))
+            }
+        }
+        crate::compat_tools::install::ConvergeRunner::new(
+            test_tools_store().clone(),
+            Arc::new(NoSource),
+            Arc::new(|| {}),
+        )
+        .run(
+            &serde_json::json!({"action": "remove", "tool_id": null, "name": tool,
+                "sha512": "c".repeat(128)}),
+            &crate::jobs::AbortFlag::new(),
+        )
+    }
+
+    /// A play session whose claim restreams a parked runtime keeps the claimed hold while the
+    /// restream is in flight, whatever recounts the sessions meanwhile, and runs with it after.
+    #[test]
+    fn a_restreaming_claim_keeps_its_tool_hold_through_a_session_recount() {
+        const TOOL: &str = "GE-Proton9-98";
+        test_tools_store();
+        let (mut mgr, warm) = warm_manager();
+        let hold = |mgr: &SessionManager, sid: &str, parked: bool| {
+            let mut env = BTreeMap::new();
+            let sent = serde_json::json!({"mount": [TOOL], "entries": []});
+            crate::compat_tools::apply_assign(&mut env, Some(&sent), sid, parked, mgr.hold_owner)
+        };
+        // Ids no other test uses: holds live in the process's one store, released by session id.
+        let mut cfg = steam_cfg(SessionKind::Parked, "-silent", (1920, 1080));
+        cfg.container.as_mut().unwrap().compat_tools = hold(&mgr, "k1073", true);
+        assert!(acked(start(&mut mgr, &warm, "k1073", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("k1073", SessionEvent::Running);
+        mgr.running["k1073"].metrics.set_launch_helper_connected();
+        let mut play = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        play.container.as_mut().unwrap().compat_tools = hold(&mgr, "p1073", false);
+        play.stream.bitrate_kbps = mgr.running["k1073"].stream.bitrate_kbps / 2;
+        assert!(acked(start(&mut mgr, &warm, "p1073", play, Some("k1073"))));
+        assert!(
+            warm.adopted
+                .recv_timeout(WAIT)
+                .unwrap()
+                .1
+                .restream
+                .is_some(),
+            "restreaming"
+        );
+        mgr.note_session_count();
+        mgr.restreamed(
+            "k1073",
+            Ok(Duration::from_millis(40)),
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(mgr.running.contains_key("p1073"), "adopted");
+        assert_eq!(
+            remove_test_tool(TOOL),
+            crate::jobs::JobOutcome::Deferred("in_use".into()),
+            "the adopted play session runs with its tool held"
+        );
+        crate::compat_tools::release("p1073");
+        assert!(matches!(
+            remove_test_tool(TOOL),
+            crate::jobs::JobOutcome::Succeeded(_)
+        ));
+    }
+
+    /// A session's tool hold is made at assign and survives a decline of any kind into the fresh
+    /// build: with a real tools store, a removal of that tool defers `in_use`.
+    #[test]
+    fn a_declined_adoption_keeps_the_sessions_own_tool_hold() {
+        const TOOL: &str = "GE-Proton9-99";
+        test_tools_store();
+        let remove = || remove_test_tool(TOOL);
+
+        // Ids no other test uses: holds live in the process's one store, released by session id.
+        let (mut mgr, warm) = warm_manager();
+        assert!(acked(start(
+            &mut mgr,
+            &warm,
+            "k1071",
+            steam_cfg(SessionKind::Parked, "-silent", (1920, 1080)),
+            None
+        )));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("k1071", SessionEvent::Running);
+        // The play claim's assign holds its tool, as `session_assign` does.
+        let mut env = BTreeMap::new();
+        let mounted = crate::compat_tools::apply_assign(
+            &mut env,
+            Some(&serde_json::json!({"mount": [TOOL], "entries": []})),
+            "p1071",
+            false,
+            mgr.hold_owner,
+        );
+        assert_eq!(mounted, vec![TOOL.to_string()]);
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        cfg.container.as_mut().unwrap().compat_tools = mounted;
+        // Declined (its launch helper never connected), so built fresh.
+        assert!(acked(start(&mut mgr, &warm, "p1071", cfg, Some("k1071"))));
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap().0,
+            "p1071",
+            "built fresh"
+        );
+        assert_eq!(
+            remove(),
+            crate::jobs::JobOutcome::Deferred("in_use".into()),
+            "the fresh build mounts its tool held"
+        );
+        crate::compat_tools::release("p1071");
+        assert!(matches!(remove(), crate::jobs::JobOutcome::Succeeded(_)));
+    }
+
+    /// The restream path (a claim on other stream settings) passes the same gate: a parked
+    /// runtime whose tool is no longer Installed is declined before the runner is sent anything,
+    /// and the claim builds fresh.
+    #[test]
+    fn a_restream_claim_on_a_runtime_whose_compat_tool_is_gone_builds_fresh() {
+        let (mut mgr, warm) = warm_manager();
+        let mut cfg = steam_cfg(SessionKind::Parked, "-silent", (1920, 1080));
+        cfg.container.as_mut().unwrap().compat_tools = vec!["GE-Proton11-12-x86_64".into()];
+        assert!(acked(start(&mut mgr, &warm, "k1072", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("k1072", SessionEvent::Running);
+        mgr.running["k1072"].metrics.set_launch_helper_connected();
+        // Half the bitrate at the park's 1080p: a restream, not a plain adoption.
+        let mut play = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        play.stream.bitrate_kbps = mgr.running["k1072"].stream.bitrate_kbps / 2;
+        assert!(mgr.running["k1072"].needs_restream(&play.stream));
+        // No tools store in tests: nothing is Installed, as after the tool's removal.
+        assert!(acked(start(&mut mgr, &warm, "p1072", play, Some("k1072"))));
+        assert!(
+            warm.adopted
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "the runner was sent nothing"
+        );
+        assert!(
+            mgr.running["k1072"].stop.load(Ordering::Relaxed),
+            "declined"
+        );
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap().0,
+            "p1072",
+            "built fresh"
+        );
+    }
+
+    /// A runtime whose container mounts a compatibility tool that is no longer Installed (gone,
+    /// or Removing) is never adopted: the claim builds fresh, through the ordinary decline.
+    #[test]
+    fn a_runtime_whose_compat_tool_is_gone_is_not_adopted() {
+        let tool = |cfg: &mut SessionConfig| {
+            cfg.container.as_mut().unwrap().compat_tools = vec!["GE-Proton11-12-x86_64".into()];
+        };
+        let (mut mgr, warm) = warm_manager();
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        tool(&mut cfg);
+        assert!(acked(start(&mut mgr, &warm, "p0", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("p0", SessionEvent::Running);
+        mgr.on_event("p0", SessionEvent::Held);
+        // No tools store in tests: nothing is Installed, as after the tool's removal.
+        let cfg = steam_cfg(SessionKind::Parked, "-silent", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "k2", cfg, Some("p0"))));
+        assert!(mgr.running["p0"].stop.load(Ordering::Relaxed), "torn down");
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap().0,
+            "k2",
+            "built fresh"
+        );
+        assert!(warm.adopted.try_recv().is_err());
     }
 
     /// A Steam config whose app is what the control plane sends (amendment 49): its

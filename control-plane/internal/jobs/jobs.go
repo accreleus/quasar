@@ -221,6 +221,9 @@ type Definition struct {
 	ValidateParams func(context.Context, string, json.RawMessage) error
 	// OnTerminal runs after an applied outcome/reaper close and deferred retry creation.
 	OnTerminal func(context.Context, Run)
+	// FillParams, for an agent-plane job, replaces a run's params as its host claims it, so a
+	// deferred retry runs on current state; nil closes the run skipped (`no_difference`).
+	FillParams func(ctx context.Context, hostID string) (any, error)
 }
 
 // ParamsResolver builds the params blob for a manual run of one job on one

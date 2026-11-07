@@ -1084,7 +1084,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		Kind:           sess.Kind,
 		AdoptSessionID: sess.AdoptSessionID,
 	}
-	assign.CompatTools = c.compatToolsFor(sess.AppID)
+	assign.CompatTools = c.compatToolsFor(sess.AppID, hostID)
 	if sess.wt != nil {
 		exp := sess.wt.ExpiresAt
 		assign.Transport, assign.WTTokenHash, assign.WTTokenExpiresAt = transportWebTransport, sess.wt.Hash, &exp

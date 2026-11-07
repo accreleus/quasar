@@ -1,4 +1,4 @@
--- 0114 — Ultra-low latency (PyroWave), amendments 55 and 58 (#1050, #1059).
+-- 0115 — Ultra-low latency (PyroWave), amendments 55 and 58 (#1050, #1059).
 -- Additive: defaulted or nullable columns and three CHECKs; no data change. Semantics: schema.md.
 BEGIN;
 
