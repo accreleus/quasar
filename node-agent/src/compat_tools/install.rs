@@ -718,6 +718,12 @@ mod tests {
         Link(&'a [u8], &'a [u8]),
         Hard(&'a [u8], &'a [u8]),
         Fifo(&'a [u8]),
+        Char(&'a [u8]),
+        Block(&'a [u8]),
+        /// A GNU sparse file (`S`) with an empty sparse map.
+        Sparse(&'a [u8]),
+        /// A pax extended header (`x`) for the next entry, with these records.
+        Pax(&'a [(&'a str, &'a str)]),
         /// A header that claims `size` bytes but carries none.
         Claims(&'a [u8], u64),
         Global,
@@ -738,6 +744,29 @@ mod tests {
                 E::Link(p, t) => (p, tar::EntryType::Symlink, t, b"", 0o777),
                 E::Hard(p, t) => (p, tar::EntryType::Link, t, b"", 0o644),
                 E::Fifo(p) => (p, tar::EntryType::Fifo, b"", b"", 0o644),
+                E::Char(p) => (p, tar::EntryType::Char, b"", b"", 0o666),
+                E::Block(p) => (p, tar::EntryType::Block, b"", b"", 0o660),
+                E::Sparse(p) => (p, tar::EntryType::GNUSparse, b"", b"", 0o644),
+                E::Pax(records) => {
+                    let mut data = Vec::new();
+                    for (k, v) in *records {
+                        // A record is "<len> <key>=<value>\n", <len> counting itself.
+                        let body = format!(" {k}={v}\n");
+                        let mut len = body.len() + 1;
+                        while format!("{len}{body}").len() != len {
+                            len += 1;
+                        }
+                        data.extend(format!("{len}{body}").into_bytes());
+                    }
+                    let g = h.as_gnu_mut().unwrap();
+                    g.name[..13].copy_from_slice(b"PaxHeaders/x0");
+                    h.set_entry_type(tar::EntryType::XHeader);
+                    h.set_size(data.len() as u64);
+                    h.set_mode(0o644);
+                    h.set_cksum();
+                    b.append(&h, &data[..]).unwrap();
+                    continue;
+                }
                 E::Claims(p, n) => {
                     let g = h.as_gnu_mut().unwrap();
                     g.name[..p.len()].copy_from_slice(p);
@@ -1151,6 +1180,12 @@ mod tests {
                 vec![E::Dir(b"t/"), f(b"t/a"), E::Hard(b"t/b", b"t/a")],
             ),
             ("fifo", vec![E::Dir(b"t/"), E::Fifo(b"t/p")]),
+            ("char device", vec![E::Dir(b"t/"), E::Char(b"t/null")]),
+            ("block device", vec![E::Dir(b"t/"), E::Block(b"t/sda")]),
+            (
+                "GNU sparse file",
+                vec![E::Dir(b"t/"), E::Sparse(b"t/holes")],
+            ),
             (
                 "absolute symlink",
                 vec![E::Dir(b"t/"), E::Link(b"t/l", b"/etc/passwd")],
@@ -1188,6 +1223,48 @@ mod tests {
         for (what, entries) in cases {
             assert_eq!(refused_archive(&entries), "unsafe_archive", "{what}");
         }
+    }
+
+    /// T5: owner, group and extended attributes are the agent's whatever the archive says, and a
+    /// mode never carries setuid, setgid or sticky: pax records that try to set them change nothing.
+    #[test]
+    fn pax_records_cannot_set_mode_ownership_or_xattrs() {
+        let v = vdf(NAME, "");
+        let rig = Rig::new();
+        let body = tgz(&[
+            E::Dir(b"t/"),
+            E::File(b"t/compatibilitytool.vdf", &v, 0o644),
+            E::Pax(&[
+                ("uid", "0"),
+                ("gid", "0"),
+                ("uname", "root"),
+                ("gname", "root"),
+                ("mode", "6755"),
+                ("SCHILY.xattr.security.capability", "x"),
+                ("SCHILY.xattr.user.quasar", "x"),
+            ]),
+            E::File(b"t/suid", b"#!/bin/sh\n", 0o7755),
+        ]);
+        let out = rig.run(body.clone(), install(&body)).0;
+        assert!(matches!(out, JobOutcome::Succeeded(_)), "{out:?}");
+        let file = rig.store.tools_dir().join(NAME).join("suid");
+        let meta = std::fs::symlink_metadata(&file).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            meta.mode() & 0o7777,
+            0o555,
+            "setuid, setgid and sticky cleared"
+        );
+        // SAFETY: getuid and getgid cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        assert_eq!((meta.uid(), meta.gid()), (uid, gid), "owned by the agent");
+        let c = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and a null buffer of size 0 (a size query).
+        let xattrs = unsafe { libc::llistxattr(c.as_ptr(), std::ptr::null_mut(), 0) };
+        assert!(
+            xattrs <= 0,
+            "no extended attribute was set ({xattrs} bytes of names)"
+        );
     }
 
     #[test]
