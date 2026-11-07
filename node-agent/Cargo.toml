@@ -110,6 +110,12 @@ base64 = "0.23"
 # the volume's manifest. Pure Rust, no C toolchain.
 sha2 = "0.11"
 time = { version = "0.3", features = ["parsing", "formatting"] }
+# #1029: the WebTransport listener (transport-webtransport.md), over quinn. The
+# ring backend, like rustls above, so no aws-lc-rs build. rcgen makes its short-lived
+# self-signed certificate (ring backend, no default features).
+web-transport-quinn = { version = "0.13", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+bytes = "1"
 
 [features]
 # ZC-02 N-A (full zero-copy NVENC): FFI-links libgstcuda-1.0 to create one GstCudaContext
@@ -139,6 +145,8 @@ tokio = { version = "1", features = ["test-util"] }
 # A test peer's own DTLS certificate (`takeover_tests`): GStreamer generates one per
 # process and exposes no key, and the dev image has no `openssl` binary.
 rcgen = "0.14"
+# The WebTransport conformance client's URL (`webtransport::tests`).
+url = "2"
 
 [[bench]]
 name = "encode_metrics"

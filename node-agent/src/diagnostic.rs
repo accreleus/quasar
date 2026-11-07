@@ -821,6 +821,7 @@ where
         | ControlMsg::SessionSwapApp { id, .. }
         | ControlMsg::SessionDisplayUpdate { id, .. }
         | ControlMsg::SessionCapture { id, .. }
+        | ControlMsg::SessionTransportToken { id, .. }
         | ControlMsg::ReleaseApply { id, .. }
         | ControlMsg::HostRemove { id, .. }
         | ControlMsg::ImageInventoryReconcile { id, .. }

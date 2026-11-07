@@ -202,6 +202,8 @@ pub async fn run(cfg: Config) {
         }
     }
 
+    crate::webtransport::start_from_env().await;
+
     // #407: run the preflight and tell the recovery actor before anything else. A
     // failed preflight leaves `/health` not-ready with the detail text as its reason;
     // the actor's own verification of this agent (if it is mid-replacement) already
@@ -1969,6 +1971,7 @@ fn diagnostic_observe() -> (AgentMsg, Vec<crate::messages::ReadinessCheck>) {
     .collect();
     (
         AgentMsg::Capacity {
+            transports: crate::webtransport::capacity(),
             source_preparation: None,
             deployment_settings: None,
             config_policy_accepted_groups: None,
@@ -2295,6 +2298,7 @@ async fn connect_and_run(
     let first_codecs = Some(host_codecs_from_sets(&first_gpu_codec_sets));
     apply_gpu_codecs(&mut cap.gpus, &first_gpu_codec_sets);
     let capacity_msg = AgentMsg::Capacity {
+        transports: crate::webtransport::capacity(),
         source_preparation: None,
         deployment_settings: Some(sessions.mgr.deployment_baseline.deployment_map()),
         config_policy_accepted_groups: sessions.mgr.policy_accepted_groups.clone(),
@@ -2693,6 +2697,7 @@ async fn connect_and_run(
                             let gpu_sets = mgr.gpu_codec_sets();
                             apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                             let capacity_msg = AgentMsg::Capacity {
+            transports: crate::webtransport::capacity(),
             deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
             config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
             config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
@@ -2751,6 +2756,7 @@ async fn connect_and_run(
                     let gpu_sets = mgr.gpu_codec_sets();
                     apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                     let capacity_msg = AgentMsg::Capacity {
+            transports: crate::webtransport::capacity(),
             deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
             config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
             config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
@@ -3857,6 +3863,9 @@ impl SessionManager {
                 stream,
                 resources,
                 video_topology,
+                transport,
+                wt_token_hash,
+                wt_token_expires_at,
             } => {
                 if kind == Some(SessionKind::Unknown) {
                     warn!(
@@ -4047,6 +4056,23 @@ impl SessionManager {
                 } else {
                     None
                 };
+                if transport.as_deref() == Some("webtransport") {
+                    let expires = wt_token_expires_at
+                        .as_deref()
+                        .and_then(crate::webtransport::parse_expiry);
+                    match (crate::webtransport::listener(), wt_token_hash, expires) {
+                        (Some(listener), Some(hash), Some(expires)) => {
+                            listener.registry().assign(&session_id, &hash, expires);
+                            cfg.webtransport = true;
+                        }
+                        // The session is sound; its client falls back to WebRTC (agent-api.md).
+                        _ => warn!(
+                            token = "webtransport-assign-unserved",
+                            "session {session_id}: assigned WebTransport, which this agent \
+                             cannot serve now; its client falls back to WebRTC"
+                        ),
+                    }
+                }
                 self.pending.insert(
                     session_id,
                     PendingAssignment {
@@ -4289,11 +4315,37 @@ impl SessionManager {
                     ))
                 }
             },
+            ControlMsg::SessionTransportToken {
+                id,
+                session_id,
+                wt_token_hash,
+                wt_token_expires_at,
+            } => {
+                let held = match (
+                    crate::webtransport::listener(),
+                    crate::webtransport::parse_expiry(&wt_token_expires_at),
+                ) {
+                    (Some(listener), Some(expires)) => {
+                        listener
+                            .registry()
+                            .add_token(&session_id, &wt_token_hash, expires)
+                    }
+                    _ => false,
+                };
+                Some(ack(
+                    id,
+                    held,
+                    (!held).then(|| "no WebTransport session held".to_string()),
+                ))
+            }
             ControlMsg::SessionStop {
                 id,
                 session_id,
                 reason,
             } => {
+                if let Some(listener) = crate::webtransport::listener() {
+                    listener.registry().end(&session_id);
+                }
                 let adopted_away = self.adopted_by_another(&session_id);
                 if let Some(ledger) = self.home_cleanup.as_mut() {
                     if let Some(terminal) = ledger.state(&session_id) {
@@ -5057,6 +5109,9 @@ impl SessionManager {
             .collect();
         if !stale.is_empty() {
             for sid in &stale {
+                if let Some(listener) = crate::webtransport::listener() {
+                    listener.registry().end(sid);
+                }
                 if let Some(ledger) = self.home_cleanup.as_mut() {
                     if ledger
                         .retire(sid, crate::home_cleanup::TerminalKind::Failed)
@@ -6353,6 +6408,7 @@ where
     let gpu_sets = mgr.gpu_codec_sets();
     apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
     let msg = AgentMsg::Capacity {
+        transports: crate::webtransport::capacity(),
         source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
         deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
         config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
@@ -8497,6 +8553,7 @@ mod tests {
              explicit clear, not 'nothing to say'"
         );
         let json = serde_json::to_value(AgentMsg::Capacity {
+            transports: crate::webtransport::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
             config_policy_legacy_map_applied_id: None,

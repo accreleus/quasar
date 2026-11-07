@@ -527,6 +527,9 @@ pub struct SessionConfig {
     /// `session_assign.kind` (amendment 39); `None` from a control plane that predates it,
     /// whose sessions are never held or parked.
     pub kind: Option<crate::messages::SessionKind>,
+    /// `session_assign.transport` is `"webtransport"` (amendment 54): the encode chain
+    /// also feeds the agent's WebTransport listener. WebRTC stays available as fallback.
+    pub webtransport: bool,
 }
 
 /// Default `XDG_RUNTIME_DIR` for the Wayland socket. Matches the deploy run scripts.
@@ -608,6 +611,7 @@ impl SessionConfig {
             image_id: None,
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
             kind: None,
+            webtransport: false,
         }
     }
 
@@ -859,6 +863,7 @@ impl SessionConfig {
             image_id: None,
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
             kind: None,
+            webtransport: false,
         }
     }
 
