@@ -48,7 +48,7 @@ import {
   type DraftErrors,
 } from "./editor/appDraft";
 import { activeEditorTab, editorSubtitle, editorTabs, imagePresence } from "./editor/editorTabs";
-import { choiceOf, normalise, sameChoice, type CompatChoice } from "./editor/compatTool";
+import { NO_TOOL, choiceOf, normalise, sameChoice, type CompatChoice } from "./editor/compatTool";
 import { parseSpec } from "./runtimeSpec";
 
 const TAB_LABEL: Record<string, string> = {
@@ -163,7 +163,7 @@ export function AppEditorPage() {
   );
   const [compatEdit, setCompatEdit] = useState<CompatChoice | null>(null);
   const compatSaved = compatRes.data?.saved ?? null;
-  const compatChoice = compatEdit ?? compatSaved ?? normalise({ toolId: "", forced: false });
+  const compatChoice = compatEdit ?? compatSaved ?? NO_TOOL;
   const compatDirty = !!compatSaved && !sameChoice(compatChoice, compatSaved);
 
   const [draft, setDraft] = useState<AppDraft>(() => draftFromApp(null));
@@ -377,6 +377,7 @@ export function AppEditorPage() {
                     ? {
                         tools: compatRes.data?.tools ?? null,
                         choice: compatChoice,
+                        savedToolId: compatSaved?.toolId ?? "",
                         onChange: setCompatEdit,
                         error: compatRes.errorMessage,
                       }

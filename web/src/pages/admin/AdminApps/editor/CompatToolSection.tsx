@@ -9,16 +9,19 @@ import { toolGroups, type CompatChoice } from "./compatTool";
 export function CompatToolSection({
   tools,
   choice,
+  savedToolId,
   onChange,
   error,
 }: {
   /** Null while the catalogue is loading or failed to load. */
   tools: CompatTool[] | null;
   choice: CompatChoice;
+  /** The tool the server holds, kept in the list while it is not usable. */
+  savedToolId: string;
   onChange: (c: CompatChoice) => void;
   error: string | null;
 }) {
-  const { installed, valve } = toolGroups(tools ?? [], choice.toolId);
+  const { installed, valve } = toolGroups(tools ?? [], savedToolId);
   return (
     <Section
       title="Compatibility tool"
@@ -49,7 +52,7 @@ export function CompatToolSection({
             </optgroup>
           )}
           {valve.length > 0 && (
-            <optgroup label="Valve's builds">
+            <optgroup label="Valve’s builds">
               {valve.map((t) => (
                 <option key={t.id} value={t.id}>
                   {t.display_name}
@@ -63,12 +66,13 @@ export function CompatToolSection({
             type="checkbox"
             checked={choice.forced && !!choice.toolId}
             disabled={!choice.toolId}
+            aria-describedby="compat-tool-hint"
             onChange={(e) => onChange({ ...choice, forced: e.target.checked })}
           />{" "}
           Force
         </label>
       </div>
-      <span className="field-hint">
+      <span className="field-hint" id="compat-tool-hint">
         Choices: Steam&rsquo;s default, the installed tools, then Valve&rsquo;s
         builds. Force overrides the player&rsquo;s own pick in Steam. Without
         it, the tool is set only when the player hasn&rsquo;t picked one.

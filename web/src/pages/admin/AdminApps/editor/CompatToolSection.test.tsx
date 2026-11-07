@@ -132,7 +132,7 @@ describe("game compatibility tool", () => {
       "[Installed tools]",
       "GE-Proton10-4",
       "GE-Proton9-20",
-      "[Valve's builds]",
+      "[Valve’s builds]",
       "Proton Experimental",
       "Proton 10.0",
     ]);
@@ -222,6 +222,31 @@ describe("game compatibility tool", () => {
     await screen.findByText("That tool is not usable.");
     expect(sel.value).toBe("ge-9");
     expect((save() as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("keeps the saved tool listed after it turns unusable and another is picked", async () => {
+    mocked.listCompatTools.mockResolvedValue({
+      items: [
+        ...CATALOGUE.filter((t) => t.id !== "ge-10"),
+        tool("ge-10", "ge", "GE-Proton10-4", { pin_conflict: true }),
+      ],
+      default_tool_id: null,
+    });
+    mocked.listCompatToolMappings.mockResolvedValue({ items: [mapping()] });
+    renderEditor();
+    const sel = await select();
+    await waitFor(() => expect(sel.value).toBe("ge-10"));
+    fireEvent.change(sel, { target: { value: "ge-9" } });
+    expect(Array.from(sel.options).map((o) => o.value)).toContain("ge-10");
+  });
+
+  it("describes the disabled Force checkbox by the hint", async () => {
+    renderEditor();
+    await select();
+    const hint = document.getElementById(
+      force().getAttribute("aria-describedby")!,
+    );
+    expect(hint?.textContent).toMatch(/Force overrides/);
   });
 
   it("says so, and offers no choice, when the catalogue cannot be read", async () => {
