@@ -3893,7 +3893,9 @@ impl SessionManager {
     /// connection (readiness, codec report, source policy, warm-up handles) is
     /// assigned immediately after this and is not cleared here.
     ///
-    /// `running` is deliberately NOT touched. Surviving those is the whole point.
+    /// Running sessions survive it; that is the whole point. The one exception is a
+    /// restream in flight (amendment 59): its play id may be gone, so its runtime is
+    /// declined.
     fn begin_connection(
         &mut self,
         gpu_inventory: Vec<crate::messages::GpuCapacity>,
