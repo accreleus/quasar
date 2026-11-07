@@ -320,7 +320,7 @@ export class FrameAssembler {
   }
 
   private dropBefore(seq: number): void {
-    for (const [k, p] of this.pending) if (serialAfter(seq, k, 16)) this.lose(k, true);
+    for (const k of this.pending.keys()) if (serialAfter(seq, k, 16)) this.lose(k, true);
     for (const [k, u] of this.ready) {
       if (serialAfter(seq, k, 16)) {
         this.ready.delete(k);
