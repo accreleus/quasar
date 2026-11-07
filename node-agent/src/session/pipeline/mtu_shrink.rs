@@ -30,7 +30,8 @@ const MIN_NACKED_LARGE: u32 = 10;
 const LARGE_LOSS_MIN: f64 = 0.25;
 /// Small packets' loss as a share of the large packets' loss, at most.
 const SMALL_LOSS_MAX_OF_LARGE: f64 = 0.2;
-/// Sequence numbers remembered per SSRC. A NACK for an older one is not counted.
+/// Sequence numbers remembered per SSRC: ~0.5 s at 80 Mbps. A later NACK is not counted,
+/// which errs toward not shrinking.
 const HISTORY: usize = 4096;
 /// SSRCs tracked: the media stream and its RTX stream, with room to spare.
 const MAX_STREAMS: usize = 4;
@@ -39,7 +40,9 @@ const RTCP_RTPFB: u32 = 205;
 const RTPFB_GENERIC_NACK: u32 = 1;
 
 /// What one stream sent and had NACKed in one window. "Large" is a packet a step would
-/// shrink: bigger than the step below the current size.
+/// shrink: bigger than the step below the current size. "Small" is under the floor, so no
+/// hop we could shrink to drops it. Sizes between count as neither: under a raised cap a
+/// low hop drops them too, and counted as small they would veto the shrink.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct Window {
     pub sent_large: u32,
@@ -87,6 +90,10 @@ impl Decision {
 
     fn large(&self, size: usize) -> bool {
         size > self.rtp_mtu.saturating_sub(STEP) as usize
+    }
+
+    fn small(size: usize) -> bool {
+        size < *RTP_MTU_RANGE.start() as usize
     }
 
     /// The size to step down to, or `None`.
@@ -173,7 +180,7 @@ impl Shrink {
         };
         if large {
             stream.window.sent_large += 1;
-        } else {
+        } else if Decision::small(size) {
             stream.window.sent_small += 1;
         }
         step
@@ -190,9 +197,10 @@ impl Shrink {
                 continue;
             }
             sent.nacked = true;
-            if self.decision.large(usize::from(sent.size)) {
+            let size = usize::from(sent.size);
+            if self.decision.large(size) {
                 stream.window.nacked_large += 1;
-            } else {
+            } else if Decision::small(size) {
                 stream.window.nacked_small += 1;
             }
         }
@@ -492,6 +500,51 @@ mod tests {
         // A window that late closes and is the first of a run: no step yet.
         assert_eq!(s.sent(MEDIA, 80, 300, t0 + WINDOW), None);
         assert!(s.streams.iter().all(|st| st.window.sent_large == 0));
+    }
+
+    /// Frames as a payloader cuts them: five full fragments, then a tail of any size.
+    /// A hop drops every packet over `hop` bytes; `None` is 30% loss on every size.
+    fn first_step(cap: u32, hop: Option<usize>) -> Option<u32> {
+        const MEDIA: u32 = 1;
+        let t0 = Instant::now();
+        let mut s = Shrink::new(cap);
+        let full = cap as usize - 20;
+        let mut seq = 0u16;
+        for frame in 0..240u64 {
+            let now = t0 + Duration::from_millis(frame * 1000 / 60);
+            let tail = 100 + (frame as usize * 37) % (full - 100);
+            for size in [full, full, full, full, full, tail] {
+                if let Some(step) = s.sent(MEDIA, seq, size, now) {
+                    return Some(step.to);
+                }
+                let lost = match hop {
+                    Some(hop) => size > hop,
+                    None => u64::from(seq).wrapping_mul(2_654_435_761) % 100 < 30,
+                };
+                if lost {
+                    s.nacked(MEDIA, [seq]);
+                }
+                seq = seq.wrapping_add(1);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_hop_anywhere_under_the_cap_shrinks_and_loss_on_every_size_does_not() {
+        let table = [
+            ("default, hop just under it", 1200, Some(1100), Some(1100)),
+            ("default, hop a step lower", 1200, Some(1000), Some(1100)),
+            ("default, no hop", 1200, Some(1300), None),
+            ("default, every size lossy", 1200, None, None),
+            ("raised to 1400, a 1280 hop", 1400, Some(1280), Some(1300)),
+            ("raised to 1400, a 1000 hop", 1400, Some(1000), Some(1300)),
+            ("raised to 1436, a 1000 hop", 1436, Some(1000), Some(1336)),
+            ("raised to 1436, every size lossy", 1436, None, None),
+        ];
+        for (what, cap, hop, want) in table {
+            assert_eq!(first_step(cap, hop), want, "{what}");
+        }
     }
 
     #[test]
