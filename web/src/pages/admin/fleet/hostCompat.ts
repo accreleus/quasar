@@ -24,6 +24,9 @@ export function toolChip(t: HostTool): { variant?: ChipVariant; label: string; d
       return { variant: "warning", label: "Unsupported" };
     case "waiting":
       return t.reason === "insufficient_disk" ? { variant: "warning", label: "Not started" } : { label: "Waiting" };
+    default:
+      // `state` is an open string on a newer control plane; show it rather than crash the page.
+      return { label: String((t as { state: string }).state) };
   }
 }
 
@@ -46,7 +49,6 @@ const REASON: Record<string, string> = {
 
 /** The line under the state chip; null when there is nothing to say. */
 export function toolNote(t: HostTool, freeBytes: number | null): string | null {
-  if (t.state === "unsupported") return "This host's agent does not offer compatibility tools. Update it from Fleet ▸ Releases.";
   if (t.state === "waiting" && t.reason === "insufficient_disk") {
     return `Not enough free disk to start.${freeBytes != null ? ` ${bytes(freeBytes)} free.` : ""}`;
   }

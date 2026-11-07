@@ -5,11 +5,14 @@
  * Authorization is server-enforced (`admin(...)` on the route); this card is UX only.
  */
 
+import { useRef } from "react";
 import { Link } from "react-router-dom";
 import * as adminApi from "../../../../api/admin";
+import { ApiError } from "../../../../api/client";
 import type { HostCompatTools } from "../../../../api/types";
 import { Chip } from "../../../../components/Chip";
 import { bytes } from "../../../../lib/format/bytes";
+import { ResourceStates } from "../../../../components/ResourceStates";
 import { useResource } from "../../../../lib/resource/react";
 import { toolChip, toolNote, usedBytes } from "../hostCompat";
 
@@ -17,8 +20,24 @@ import { toolChip, toolNote, usedBytes } from "../hostCompat";
 const POLL_MS = 5_000;
 
 export function CompatToolsCard({ hostId }: { hostId: string }) {
+  // The resource core re-arms a numeric poll after any failure, so a 403 or 404 (access gone,
+  // host deleted) stops it here: the fetch notes the refusal and the cadence function reads it.
+  const refused = useRef(false);
   const res = useResource<HostCompatTools>(
-    { label: "compatibility tools", pollMs: POLL_MS, fetch: (ctx) => adminApi.getHostCompatTools(ctx.token, hostId, ctx.signal) },
+    {
+      label: "compatibility tools",
+      pollMs: () => (refused.current ? null : POLL_MS),
+      fetch: async (ctx) => {
+        try {
+          const data = await adminApi.getHostCompatTools(ctx.token, hostId, ctx.signal);
+          refused.current = false;
+          return data;
+        } catch (e) {
+          refused.current = e instanceof ApiError && (e.status === 403 || e.status === 404);
+          throw e;
+        }
+      },
+    },
     [hostId],
   );
   const data = res.data;
@@ -54,6 +73,17 @@ export function CompatToolsCard({ hostId }: { hostId: string }) {
         )}
       </div>
 
+      {res.errorMessage && (
+        <div className="host-services-note">
+          <ResourceStates loading={false} error={res.errorMessage} />
+        </div>
+      )}
+      {!data.supported && (
+        <div className="host-services-note">
+          <p className="note">This host's agent does not offer compatibility tools. Update it from Fleet ▸ Releases.</p>
+        </div>
+      )}
+
       <div className="table-wrap">
         <table className="qtable">
           <thead>
@@ -66,18 +96,14 @@ export function CompatToolsCard({ hostId }: { hostId: string }) {
           <tbody>
             {data.tools.length === 0 && (
               <tr className="qtable-empty-row">
-                <td colSpan={3}>
-                  {data.supported
-                    ? "No tools installed on this host."
-                    : "This host's agent does not offer compatibility tools. Update it from Fleet ▸ Releases."}
-                </td>
+                <td colSpan={3}>No tools installed on this host.</td>
               </tr>
             )}
-            {data.tools.map((t) => {
+            {data.tools.map((t, i) => {
               const chip = toolChip(t);
               const note = toolNote(t, data.free_bytes);
               return (
-                <tr key={`${t.tool_id ?? "unlisted"}-${t.tag}`}>
+                <tr key={`${t.tool_id ?? "unlisted"}-${t.tag}-${i}`}>
                   <td>
                     <div className="stack">
                       <span className="primary">{t.tag}</span>
@@ -95,7 +121,13 @@ export function CompatToolsCard({ hostId }: { hostId: string }) {
                           {t.state === "failed" && t.run_id && (
                             <>
                               {" "}
-                              <Link className="cap-link" to="/admin/fleet/jobs">See the job</Link>
+                              <Link
+                                className="cap-link"
+                                to="/admin/fleet/jobs"
+                                aria-label={`See the Compatibility tools job for ${t.tag}`}
+                              >
+                                See the job
+                              </Link>
                             </>
                           )}
                         </span>

@@ -1,10 +1,11 @@
 /** Host detail "Compatibility tools" card (#1077, mock #1067): one row per state the contract defines. */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AuthContext } from "../../../../auth/context";
 import type { AuthContextValue } from "../../../../auth/context";
+import { ApiError } from "../../../../api/client";
 import type { HostCompatTools } from "../../../../api/types";
 import { CompatToolsCard } from "./CompatToolsCard";
 
@@ -44,7 +45,10 @@ function show(tools: Entry[], over: Partial<HostCompatTools> = {}) {
 }
 
 beforeEach(() => vi.clearAllMocks());
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("CompatToolsCard", () => {
   it("shows an installed tool with its disk and the total used", async () => {
@@ -65,7 +69,7 @@ describe("CompatToolsCard", () => {
     show([entry({ state: "failed", bytes: null, reason: "checksum_mismatch", run_id: "r1" })]);
     expect(await screen.findByText("Failed")).toBeTruthy();
     expect(screen.getByText(/did not match its checksum/)).toBeTruthy();
-    expect(screen.getByRole("link", { name: "See the job" }).getAttribute("href")).toBe("/admin/fleet/jobs");
+    expect(screen.getByRole("link", { name: "See the Compatibility tools job for GE-Proton10-4" }).getAttribute("href")).toBe("/admin/fleet/jobs");
   });
 
   it("reads an install deferred for disk as not started, with the free space", async () => {
@@ -86,10 +90,62 @@ describe("CompatToolsCard", () => {
     expect(screen.getByText("Installs when this host is ready.")).toBeTruthy();
   });
 
-  it("reads every tool as unsupported when the agent offers none", async () => {
-    show([entry({ state: "unsupported", bytes: null })], { supported: false, free_bytes: null });
-    expect(await screen.findByText("Unsupported")).toBeTruthy();
-    expect(screen.getByText(/does not offer compatibility tools/)).toBeTruthy();
+  it("says once, for the card, that the agent offers no tools, and reads every tool as unsupported", async () => {
+    show(
+      [entry({ state: "unsupported", bytes: null }), entry({ tool_id: "t2", tag: "GE-Proton9-27", steam_name: "GE-Proton9-27", state: "unsupported", bytes: null })],
+      { supported: false, free_bytes: null },
+    );
+    expect(await screen.findAllByText("Unsupported")).toHaveLength(2);
+    expect(screen.getAllByText(/does not offer compatibility tools/)).toHaveLength(1);
+  });
+
+  it("gives each failed row's job link its own name", async () => {
+    show([
+      entry({ state: "failed", bytes: null, reason: "io_error", run_id: "r1" }),
+      entry({ tool_id: "t2", tag: "GE-Proton9-27", steam_name: "GE-Proton9-27", state: "failed", bytes: null, reason: "io_error", run_id: "r2" }),
+    ]);
+    expect(await screen.findByRole("link", { name: "See the Compatibility tools job for GE-Proton10-4" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "See the Compatibility tools job for GE-Proton9-27" })).toBeTruthy();
+  });
+
+  it("shows a state it does not know as its own word instead of crashing the page", async () => {
+    show([entry({ state: "pausing" as Entry["state"], bytes: null })]);
+    expect(await screen.findByText("pausing")).toBeTruthy();
+  });
+
+  describe("a poll that fails after the first load", () => {
+    async function firstLoadThenFail(err: Error) {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const get = vi.mocked(adminApi.getHostCompatTools);
+      get.mockResolvedValueOnce({ supported: true, free_bytes: null, reported_at: null, tools: [entry({})] });
+      get.mockRejectedValue(err);
+      render(
+        <AuthContext.Provider value={auth}>
+          <MemoryRouter>
+            <CompatToolsCard hostId="h1" />
+          </MemoryRouter>
+        </AuthContext.Provider>,
+      );
+      await screen.findByText("GE-Proton10-4");
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      return get;
+    }
+
+    it("shows the error above the rows it keeps, and stops polling when access is gone", async () => {
+      const get = await firstLoadThenFail(new ApiError(404, "not_found", "host not found"));
+      expect(screen.getByRole("alert").textContent).toBe("host not found");
+      expect(screen.getByText("GE-Proton10-4")).toBeTruthy();
+      expect(get).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(30_000));
+      expect(get).toHaveBeenCalledTimes(2);
+    });
+
+    it("keeps polling through a transient failure", async () => {
+      const get = await firstLoadThenFail(new ApiError(500, "internal", "boom"));
+      expect(screen.getByRole("alert").textContent).toBe("boom");
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(get).toHaveBeenCalledTimes(3);
+    });
   });
 
   it("says so when the agent offers no compatibility tools", async () => {
