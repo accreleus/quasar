@@ -70,6 +70,7 @@ type conn struct {
 	compatToolsV1             bool
 	policyTyped               bool
 	consoleReports            atomic.Int32 // capacity reports carrying console_capabilities
+	compatReports             atomic.Int32 // capacity reports on a compat_tools_v1 connection
 	policyIdle                bool
 	policyRecoveryRelease     bool // restart executor that takes config_policy_release
 	policyAccepted            []string

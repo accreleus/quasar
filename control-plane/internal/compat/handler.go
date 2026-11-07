@@ -6,34 +6,47 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 )
 
-// codeToolDisabled is control-api.md §Compatibility tools, PUT /default.
-const codeToolDisabled = "compat_tool_disabled"
+// Error codes: control-api.md §Compatibility tools.
+const (
+	codeToolDisabled    = "compat_tool_disabled"
+	codeToolInUse       = "compat_tool_in_use"
+	codeToolLimit       = "compat_tool_limit"
+	codeToolPinConflict = "compat_tool_pin_conflict"
+)
 
 var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 type Handler struct {
 	store   *Store
 	auditor audit.Recorder
+	conv    *Converger
 }
 
-func NewHandler(store *Store, auditor audit.Recorder) *Handler {
-	return &Handler{store: store, auditor: auditor}
+// NewHandler: conv may be nil (no install job wired), and then no host has an install state.
+func NewHandler(store *Store, auditor audit.Recorder, conv *Converger) *Handler {
+	return &Handler{store: store, auditor: auditor, conv: conv}
 }
 
 // Register wires the admin routes. admin must compose RequireAuth → RequireAdmin.
 func (h *Handler) Register(mux httpx.Router, admin func(http.Handler) http.Handler) {
 	mux.Handle("GET /v1/admin/compat-tools", admin(http.HandlerFunc(h.handleList)))
 	mux.Handle("PUT /v1/admin/compat-tools/default", admin(http.HandlerFunc(h.handleSetDefault)))
+	mux.Handle("PATCH /v1/admin/compat-tools/{id}", admin(http.HandlerFunc(h.handlePatch)))
+	mux.Handle("GET /v1/admin/hosts/{id}/compat-tools", admin(http.HandlerFunc(h.handleHostCard)))
 }
 
 func (h *Handler) handleList(w http.ResponseWriter, r *http.Request) {
 	items, def, err := h.store.List(r.Context())
+	if err == nil && h.conv != nil {
+		err = h.conv.counts(r.Context(), items)
+	}
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not list compatibility tools")
 		return
@@ -78,4 +91,95 @@ func (h *Handler) handleSetDefault(w http.ResponseWriter, r *http.Request) {
 	audit.TryRecord(r.Context(), h.auditor, user.ID, "compat_tool.default.set", "instance", "",
 		map[string]any{"tool_id": toolID, "previous_tool_id": prev})
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"default_tool_id": toolID})
+}
+
+func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, httpx.CodeUnauthorized, "authentication required")
+		return
+	}
+	id := r.PathValue("id")
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil || req.Enabled == nil || dec.Decode(&json.RawMessage{}) != io.EOF {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "body must be {\"enabled\": bool}")
+		return
+	}
+	if !uuidRe.MatchString(id) {
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
+		return
+	}
+	res, err := h.store.SetEnabled(r.Context(), id, *req.Enabled)
+	var inUse *InUseError
+	switch {
+	case errors.Is(err, ErrNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
+		return
+	case errors.As(err, &inUse):
+		httpx.WriteError(w, http.StatusConflict, codeToolInUse, inUse.Error())
+		return
+	case errors.Is(err, ErrLimit):
+		httpx.WriteError(w, http.StatusConflict, codeToolLimit, "the most GE tools allowed are already enabled")
+		return
+	case errors.Is(err, ErrPinConflict):
+		httpx.WriteError(w, http.StatusConflict, codeToolPinConflict, "two pins disagree for this tag")
+		return
+	case err != nil:
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not change the compatibility tool")
+		return
+	}
+	if res.Changed {
+		action := "compat_tool.disable"
+		if *req.Enabled {
+			action = "compat_tool.enable"
+		}
+		details := map[string]any{"tag": res.Tag, "sha512": res.SHA512, "host_ids": res.HostIDs}
+		if len(res.HostIDs) > 100 {
+			details["host_ids"], details["host_ids_truncated"] = res.HostIDs[:100], true
+		}
+		audit.TryRecord(r.Context(), h.auditor, user.ID, action, "compat_tool", id, details)
+		if h.conv != nil {
+			h.conv.All(r.Context(), true)
+		}
+	}
+	items, _, err := h.store.List(r.Context())
+	if err == nil && h.conv != nil {
+		err = h.conv.counts(r.Context(), items)
+	}
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read the compatibility tool")
+		return
+	}
+	for _, it := range items {
+		if it.ID == id {
+			httpx.WriteJSON(w, http.StatusOK, it)
+			return
+		}
+	}
+	httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
+}
+
+func (h *Handler) handleHostCard(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !uuidRe.MatchString(id) {
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such host")
+		return
+	}
+	conv := h.conv
+	if conv == nil {
+		conv = &Converger{pool: h.store.pool, now: time.Now}
+	}
+	card, err := conv.HostCard(r.Context(), id)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such host")
+	case err != nil:
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read the host's compatibility tools")
+	default:
+		httpx.WriteJSON(w, http.StatusOK, card)
+	}
 }

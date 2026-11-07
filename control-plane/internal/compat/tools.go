@@ -22,7 +22,8 @@ type recommendedTool struct {
 	SizeBytes                     int64
 }
 
-// recommended is the shipped list. Installing one is not built yet: the rows are listed, disabled.
+// recommended is the shipped list. Each entry passed the agent's install checks offline before it
+// was listed (node-agent compat_tools::install::tests::a_release_passes_the_install_checks).
 var recommended = []recommendedTool{
 	{
 		Tag: "GE-Proton11-12", Asset: "GE-Proton11-12-x86_64.tar.gz", SteamName: "GE-Proton11-12-x86_64",

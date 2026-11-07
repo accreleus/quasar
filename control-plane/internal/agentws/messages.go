@@ -192,6 +192,9 @@ type CapacityMsg struct {
 	// (see webTransportReport).
 	Transports   []string        `json:"transports"`
 	WebTransport json.RawMessage `json:"webtransport"`
+	// CompatTools (amendment 56): the tools in the agent's install record and its free space,
+	// kept if absent. Read only from a connection that advertised compat_tools_v1.
+	CompatTools json.RawMessage `json:"compat_tools"`
 }
 
 // ReadinessCheck is a validation view of one readiness check, never the storage
