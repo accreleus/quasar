@@ -41,13 +41,16 @@ func (c *Coordinator) compatToolsFor(appID, hostID string) *agentws.CompatToolsS
 }
 
 // fitCompatTools keeps compat_tools only on a connection that advertised compat_tools_v1 and
-// records the mounted names on the session.
+// records the mounted names on the session, unless it adopts a runtime that already has its own.
 func (c *Coordinator) fitCompatTools(a agentws.SessionAssignCmd, epoch agentws.HomeCommandEpoch) agentws.SessionAssignCmd {
 	if a.CompatTools == nil {
 		return a
 	}
 	if e, ok := epoch.(interface{ SupportsCompatTools() bool }); !ok || !e.SupportsCompatTools() {
 		a.CompatTools = nil
+		return a
+	}
+	if a.AdoptSessionID != "" {
 		return a
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, compatReadTimeout)

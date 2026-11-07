@@ -102,6 +102,9 @@ func TestDecideClaim(t *testing.T) {
 		{"stopped by expiry or eviction", at(func(k *parkedFacts) { k.State = StateStopped }), park, claimSupersede, causeNotRunning, ""},
 		{"codec gated", at(func(k *parkedFacts) { k.CodecGated = true }), park, claimSupersede, causeCodecUnsupported, ""},
 		{"codec gated after fps", at(func(k *parkedFacts) { k.CodecGated = true }), with(func(s *claimStream) { s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
+		{"compat tool missing", at(func(k *parkedFacts) { k.ToolMissing = true }), park, claimSupersede, causeCompatTool, ""},
+		{"compat tool missing after fps", at(func(k *parkedFacts) { k.ToolMissing = true }), with(func(s *claimStream) { s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
+		{"compat tool missing on a warming session", at(func(k *parkedFacts) { k.State, k.ToolMissing = StateStarting, true }), park, claimSupersede, causeNotRunning, ""},
 		{"codec gated after expiry", at(func(k *parkedFacts) { k.CodecGated, k.InDeadline = true, false }), park, claimSupersede, causeExpired, ""},
 	}
 	for _, tc := range cases {
