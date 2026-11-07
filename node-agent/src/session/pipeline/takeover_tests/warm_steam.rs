@@ -85,6 +85,18 @@ impl FakeHelper {
         }
     }
 
+    /// Every command the runner has sent so far, without waiting for one.
+    fn sent(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            match self.reader.read_line(&mut line) {
+                Ok(n) if n > 0 => lines.push(line.trim_end().to_string()),
+                _ => return lines,
+            }
+        }
+    }
+
     fn say(&self, line: &str) {
         self.writer
             .lock()
@@ -210,6 +222,7 @@ fn adopt_as(session: &mut Session, flags: &str, kind: Option<SessionKind>) -> us
             container: Some(app(flags)),
             idle_timeout: Duration::from_secs(60),
             app_boot_timeout: Some(Duration::from_secs(300)),
+            restream: None,
         })
         .unwrap();
     at
@@ -895,4 +908,124 @@ fn a_relaunch_after_set_app_spec_launches_the_app_the_container_now_runs() {
     let mut bare = AppSource::new(&cfg, "set-app-spec", &sink, &sink, &res, None).expect("bare");
     bare.set_app_spec(app("-applaunch 730"));
     assert!(bare.launch_spec().is_none());
+}
+
+// Amendment 59: a restream whose session the agent gave up on while it ran (its deadline,
+// a stop) launches no game into the home being torn down.
+#[test]
+fn a_restream_whose_session_stops_meanwhile_launches_no_game() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (runtime, mut session) = steam_session(
+        "restream-stopped",
+        SessionKind::Parked,
+        "-silent",
+        Duration::from_secs(60),
+    );
+    session.mute = true;
+    let mut nobody = Peer::new();
+    assert!(session.pump(&mut nobody, Duration::from_secs(10), |s, _| {
+        s.log.iter().any(|e| matches!(e, SessionEvent::Running))
+    }));
+    let mut helper = FakeHelper::connect(runtime.path(), &session.id);
+    session.mute = false;
+    crate::session::runner::RESTREAM_PAUSE_MS.store(400, Ordering::Relaxed);
+    let mut stream = super::host_cfg(false).stream;
+    stream.bitrate_kbps /= 2;
+    let at = session.log.len();
+    session
+        .adopt
+        .send(AdoptRequest {
+            kind: Some(SessionKind::Play),
+            container: Some(app("-applaunch 730")),
+            idle_timeout: Duration::from_secs(60),
+            app_boot_timeout: Some(Duration::from_secs(300)),
+            restream: Some(stream),
+        })
+        .unwrap();
+    session.pump(&mut nobody, Duration::from_millis(150), |_, _| false);
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.pump(&mut nobody, Duration::from_secs(20), |s, _| {
+        s.ended.is_some()
+    });
+    crate::session::runner::RESTREAM_PAUSE_MS.store(0, Ordering::Relaxed);
+    assert!(ended, "the runner never ended");
+    session.thread.take().unwrap().join().unwrap();
+    assert!(
+        session
+            .log
+            .iter()
+            .skip(at)
+            .any(|e| matches!(e, SessionEvent::Restreamed(Ok(_)))),
+        "the restream finished: {:?}",
+        &session.log[at..]
+    );
+    assert!(
+        !session
+            .log
+            .iter()
+            .skip(at)
+            .any(|e| matches!(e, SessionEvent::Starting)),
+        "the adoption went on after the stop"
+    );
+    let sent = helper.sent();
+    assert!(
+        !sent.iter().any(|c| c.starts_with("launch")),
+        "a game was launched: {sent:?}"
+    );
+}
+
+// A held runtime's transport served a viewer who left. A restream gives the adopting
+// session a new one, so when that viewer leaves the session ends (its game quits), rather
+// than being read as the old viewer's association dying.
+#[test]
+fn a_restreamed_adoptions_viewer_leaving_ends_the_session() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut a, mut helper) = running_620("restream-leave");
+    helper.launch_state("game_exited");
+    assert!(session.pump(&mut a, Duration::from_secs(5), |s, _| {
+        s.log.iter().any(|e| matches!(e, SessionEvent::Held))
+    }));
+    drop(a);
+    let mut stream = super::host_cfg(false).stream;
+    stream.bitrate_kbps /= 2;
+    adopt_restreamed(&mut session, stream);
+    let mut b = Peer::new();
+    assert_eq!(helper.command(&mut session, &mut b), "launch 730");
+    assert!(session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p)));
+    helper.launch_state("game_running");
+    close_as_a_browser(&mut session, &mut b);
+    assert_eq!(
+        helper.command(&mut session, &mut b),
+        "quit 730",
+        "the viewer leaving was read as the old viewer's transport closing"
+    );
+    helper.launch_state("game_exited");
+    helper.say(
+        r#"{"type":"command_done","v":1,"command":"quit","appid":730,"ok":true,"cloud_synced":true}"#,
+    );
+    let ended = session.pump(&mut b, Duration::from_secs(20), |s, _| s.ended.is_some());
+    assert!(ended, "the session never ended after its viewer left");
+    session.thread.take().unwrap().join().unwrap();
+}
+
+/// Hand the runtime to a play session whose stream differs from it (amendment 59).
+fn adopt_restreamed(session: &mut Session, stream: crate::session::StreamParams) -> usize {
+    let at = session.log.len();
+    session
+        .adopt
+        .send(AdoptRequest {
+            kind: Some(SessionKind::Play),
+            container: Some(app("-applaunch 730")),
+            idle_timeout: Duration::from_secs(60),
+            app_boot_timeout: Some(Duration::from_secs(300)),
+            restream: Some(stream),
+        })
+        .unwrap();
+    at
 }

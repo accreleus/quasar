@@ -22,10 +22,11 @@ import (
 
 // warmDispatcher records every command and answers parked_sessions_v1.
 type warmDispatcher struct {
-	mu      sync.Mutex
-	parks   bool
-	compat  bool // answers compat_tools_v1
-	noEpoch bool // the agent's socket is gone: no command epoch to send on
+	mu       sync.Mutex
+	parks    bool
+	compat   bool // answers compat_tools_v1
+	restream bool // adopt_restream_v1
+	noEpoch  bool // the agent's socket is gone: no command epoch to send on
 	// reject answers one command kind: "assign" or "start" refused, or
 	// "assign-ack" queued with its ack lost.
 	reject  string
@@ -43,6 +44,18 @@ func (d *warmDispatcher) SupportsParkedSessions(string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.parks
+}
+
+func (d *warmDispatcher) SupportsAdoptRestream(string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.parks && d.restream
+}
+
+func (d *warmDispatcher) setRestream(v bool) {
+	d.mu.Lock()
+	d.restream = v
+	d.mu.Unlock()
 }
 
 func (d *warmDispatcher) setParks(v bool) {
@@ -546,6 +559,167 @@ func TestTwoConcurrentClaimsAdoptOnce(t *testing.T) {
 		WHERE kind = 'play' AND state = 'assigned'`).Scan(&adopted))
 	if adopted != 1 || readRow(t, f.pool, k).Detail != "claimed" {
 		t.Fatalf("play sessions = %d, parked = %+v; want one play and the parked row claimed", adopted, readRow(t, f.pool, k))
+	}
+	// The loser is told the winner holds the home, never a Steam restart (amendment 59).
+	loser := errs[0]
+	if loser == nil {
+		loser = errs[1]
+	}
+	var inUse *HomeInUseError
+	if !errors.As(loser, &inUse) || inUse.SessionID == "" {
+		t.Errorf("loser err = %v, want home_in_use naming the winner", loser)
+	}
+	if f.disp.stopReason(k) != "" {
+		t.Error("the loser stopped the claimed session")
+	}
+}
+
+type streamRow struct {
+	Codec, H264Profile              string
+	Width, Height, FPS, BitrateKbps int32
+}
+
+func readStream(t *testing.T, pool *pgxpool.Pool, id string) streamRow {
+	t.Helper()
+	var r streamRow
+	must(t, pool.QueryRow(context.Background(), `SELECT codec, h264_profile, width, height, fps, bitrate_kbps
+		FROM sessions WHERE id = $1::uuid`, id).Scan(&r.Codec, &r.H264Profile, &r.Width, &r.Height, &r.FPS, &r.BitrateKbps))
+	return r
+}
+
+// The ratchet (amendment 59): a smaller, slower claim adopts the park; its park on
+// exit keeps the size and fps the runtime was built with (from the adopted row), with
+// the play's bitrate; and a third launch at the park's own size and fps adopts that.
+func TestClaimAdoptsAcrossStreamSettingsAndTheReparkKeepsTheBuiltSize(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.disp.setRestream(true)
+	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	k := f.park(t)
+	built := readStream(t, f.pool, k)
+	half := func(v int32) *int32 { h := v / 2; return &h }
+
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true,
+		IsAdmin: true, Override: StreamOverride{Width: half(built.Width), Height: half(built.Height), FPS: half(built.FPS)}})
+	if err != nil {
+		t.Fatalf("smaller claim: %v", err)
+	}
+	play := res.Session.ID
+	if got := readRow(t, f.pool, k); got.Detail != "claimed" || f.disp.stopReason(k) != "" {
+		t.Fatalf("parked row %+v stop=%q, want claimed and not stopped", got, f.disp.stopReason(k))
+	}
+	if a := f.disp.assignFor(t, play); a.AdoptSessionID != k {
+		t.Fatalf("assign adopts %q, want %s", a.AdoptSessionID, k)
+	}
+	small := readStream(t, f.pool, play)
+	if small.Width != built.Width/2 || small.Height != built.Height/2 || small.FPS != built.FPS/2 {
+		t.Fatalf("play stream %+v, want half of %+v", small, built)
+	}
+
+	f.disp.waitFor(t, "start")
+	// The agent's first report adopts: the hold moves to the play session.
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: play, State: "starting"})
+	f.running(t, play)
+	f.coord.AgentState(ctx, f.hostID, heldStop(play))
+	again := f.parkedID(t)
+	if again == "" {
+		t.Fatal("no park on exit")
+	}
+	if got := readStream(t, f.pool, again); got.Width != built.Width || got.Height != built.Height ||
+		got.FPS != built.FPS || got.BitrateKbps != small.BitrateKbps {
+		t.Fatalf("re-parked stream %+v, want %dx%d@%d at the play's bitrate %d",
+			got, built.Width, built.Height, built.FPS, small.BitrateKbps)
+	}
+
+	f.disp.waitFor(t, "start")
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: again, State: "starting"})
+	f.running(t, again)
+	res, err = f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("third launch, at the park's own size: %v", err)
+	}
+	if a := f.disp.assignFor(t, res.Session.ID); a.AdoptSessionID != again {
+		t.Fatalf("third launch adopts %q, want the re-park %s", a.AdoptSessionID, again)
+	}
+	if got := readStream(t, f.pool, res.Session.ID); got.Width != built.Width || got.FPS != built.FPS {
+		t.Errorf("third launch stream %+v, want the built %dx%d@%d", got, built.Width, built.Height, built.FPS)
+	}
+}
+
+// A declined claim (the parked runtime's proof arrives while the play is live, as
+// when the agent builds fresh) adopted nothing: its park on exit takes the play's
+// own size, not the parked row's (amendment 59).
+func TestADeclinedClaimsReparkTakesThePlaysOwnSize(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.disp.setRestream(true)
+	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	k := f.park(t)
+	built := readStream(t, f.pool, k)
+	half := func(v int32) *int32 { h := v / 2; return &h }
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true,
+		IsAdmin: true, Override: StreamOverride{Width: half(built.Width), Height: half(built.Height)}})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	play := res.Session.ID
+	f.disp.waitFor(t, "start")
+	// The agent declined: the parked runtime's proof, then the fresh build's reports.
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	var adopts *string
+	must(t, f.pool.QueryRow(ctx, `SELECT adopt_session_id::text FROM sessions WHERE id = $1::uuid`, play).Scan(&adopts))
+	if adopts != nil {
+		t.Fatalf("declined play row still adopts %s", *adopts)
+	}
+	if got := f.holder(t); got != play {
+		t.Fatalf("hold = %q, want passed to the live play %s", got, play)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: play, State: "starting"})
+	f.running(t, play)
+	f.coord.AgentState(ctx, f.hostID, heldStop(play))
+	again := f.parkedID(t)
+	if again == "" {
+		t.Fatal("no park on exit")
+	}
+	small := readStream(t, f.pool, play)
+	if got := readStream(t, f.pool, again); got.Width != small.Width || got.Height != small.Height || got.FPS != small.FPS {
+		t.Fatalf("re-park stream %+v, want the play's own %dx%d@%d", got, small.Width, small.Height, small.FPS)
+	}
+}
+
+// Only a parked row a racing launch claimed reads as a lost claim (409 home_in_use);
+// one stopped by expiry or eviction in the window is a Steam restart (503).
+func TestAParkStoppedByExpiryInTheWindowIsASteamRestartNotHomeInUse(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	k := f.park(t)
+	afterParkedRead = func() {
+		must(t, exec(t, f.pool, `UPDATE sessions SET state = 'stopped', state_detail = 'stop requested',
+			stop_reason = $2, ended_at = now() WHERE id = $1::uuid`, k, StopReasonParkedExpired))
+	}
+	t.Cleanup(func() { afterParkedRead = nil })
+	_, err := f.coord.LaunchByProfile(context.Background(), f.userID,
+		LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	var refused *ParkedClaimRefusedError
+	var inUse *HomeInUseError
+	if !errors.As(err, &refused) || refused.Warming || errors.As(err, &inUse) {
+		t.Fatalf("err = %v, want the retryable refused claim (steam_restarting), never home_in_use", err)
+	}
+}
+
+// Without adopt_restream_v1 the same launch supersedes, and a park on exit
+// copies the play row's stream as before.
+func TestClaimWithoutRestreamSupersedesOnBitrate(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	k := f.park(t)
+	must(t, exec(t, f.pool, `UPDATE sessions SET bitrate_kbps = bitrate_kbps + 5000 WHERE id = $1::uuid`, k))
+	_, err := f.coord.LaunchByProfile(context.Background(), f.userID,
+		LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	var refused *ParkedClaimRefusedError
+	if !errors.As(err, &refused) || refused.Cause != causeStreamDiffers {
+		t.Fatalf("err = %v, want a refused claim with cause stream_differs", err)
+	}
+	if r := f.disp.stopReason(k); r != StopReasonParkedSuperseded {
+		t.Errorf("session_stop reason = %q, want parked_superseded", r)
 	}
 }
 

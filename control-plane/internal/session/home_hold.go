@@ -53,6 +53,13 @@ func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID s
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return 0, fmt.Errorf("lock adopting session: %w", err)
 	}
+	// Its runtime ended while that row was live: the agent declined the adoption and
+	// builds fresh, so the row adopts nothing (a park on exit then takes its own size).
+	if adopter != nil {
+		if _, err := tx.Exec(ctx, `UPDATE sessions SET adopt_session_id = NULL WHERE id = $1::uuid`, *adopter); err != nil {
+			return 0, fmt.Errorf("clear declined adoption: %w", err)
+		}
+	}
 	rows, err := tx.Query(ctx, `SELECT user_id::text,canonical_app_id::text
 		FROM managed_home_claims WHERE pending_home_session_id=$1::uuid
 		ORDER BY user_id,canonical_app_id FOR UPDATE`, sessionID)
