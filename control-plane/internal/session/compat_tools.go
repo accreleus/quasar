@@ -25,14 +25,17 @@ func (c *Coordinator) compatToolsFor(appID, hostID string) *agentws.CompatToolsS
 	if err != nil || !app.SteamFamily {
 		return nil
 	}
-	// shortcut: read after placement, without the share locks of control-api.md §Usable. A disable
-	// racing this read can still mount a tool once; move into the scheduling transaction with
-	// force-remove (C10, #1074).
+	// Advisory: the spec that goes on the wire is read again under the tool rows' share locks
+	// by fitCompatTools, once the connection is known to take it.
 	entries, mount, err := compat.NewStore(c.store.pool).Entries(ctx, hostID)
 	if err != nil {
 		c.log.Warn("compat tools: reading the mapping failed; the session gets Steam's default", "app_id", appID, "err", err)
 		return nil
 	}
+	return compatSpec(entries, mount)
+}
+
+func compatSpec(entries []compat.Entry, mount []string) *agentws.CompatToolsSpec {
 	spec := &agentws.CompatToolsSpec{Mount: append([]string{}, mount...), Entries: make([]agentws.CompatToolEntry, 0, len(entries))}
 	for _, e := range entries {
 		spec.Entries = append(spec.Entries, agentws.CompatToolEntry{AppID: e.AppID, Name: e.Name, Forced: e.Forced})
@@ -40,9 +43,11 @@ func (c *Coordinator) compatToolsFor(appID, hostID string) *agentws.CompatToolsS
 	return spec
 }
 
-// fitCompatTools keeps compat_tools only on a connection that advertised compat_tools_v1 and
-// records the mounted names on the session.
-func (c *Coordinator) fitCompatTools(a agentws.SessionAssignCmd, epoch agentws.HomeCommandEpoch) agentws.SessionAssignCmd {
+// fitCompatTools keeps compat_tools only on a connection that advertised compat_tools_v1, re-reads
+// it under the tool rows' share locks and records the mounted names on the session in the same
+// transaction (compat.Store.Assign). Fail-open: a failed read sends nothing, records nothing, and
+// the session gets Steam's own default.
+func (c *Coordinator) fitCompatTools(a agentws.SessionAssignCmd, epoch agentws.HomeCommandEpoch, hostID string) agentws.SessionAssignCmd {
 	if a.CompatTools == nil {
 		return a
 	}
@@ -52,9 +57,12 @@ func (c *Coordinator) fitCompatTools(a agentws.SessionAssignCmd, epoch agentws.H
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, compatReadTimeout)
 	defer cancel()
-	if _, err := c.store.pool.Exec(ctx, `UPDATE sessions SET compat_tool_names = $2::text[] WHERE id = $1::uuid`,
-		a.SessionID, a.CompatTools.Mount); err != nil {
-		c.log.Warn("compat tools: recording the mounted names failed", "session_id", a.SessionID, "err", err)
+	entries, mount, err := compat.NewStore(c.store.pool).Assign(ctx, a.SessionID, hostID)
+	if err != nil {
+		c.log.Warn("compat tools: reading the mapping under lock failed; the session gets Steam's default", "session_id", a.SessionID, "err", err)
+		a.CompatTools = nil
+		return a
 	}
+	a.CompatTools = compatSpec(entries, mount)
 	return a
 }

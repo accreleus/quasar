@@ -253,8 +253,6 @@ var allowedUnimplemented = map[string]struct{}{
 // fails the test so none outlives its handler.
 var pendingImplementation = map[string]string{
 	// Amendment 56 (compatibility tools), accreleus/quasar#1066 contract; migration 0113 and handlers land with its implementation tickets.
-	"DELETE /v1/admin/compat-tools/{}":            "#1066",
-	"POST /v1/admin/compat-tools/{}/force-remove": "#1066",
 }
 
 // unimplementedOperation reports whether an OpenAPI operation carries

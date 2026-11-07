@@ -1110,7 +1110,7 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 				"assign dispatch failed: the agent connection cannot take a parked session or an adoption")
 			return false
 		}
-		wire = c.fitCompatTools(wire, epoch)
+		wire = c.fitCompatTools(wire, epoch, hostID)
 		capable := epoch != nil && epoch.SupportsHomeCleanup()
 		hold, err := c.store.bindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable, expected)
 		if errors.Is(err, errSessionNotAssigned) {
