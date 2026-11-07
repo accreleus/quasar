@@ -30,6 +30,7 @@ func NewActorClient(socketPath string) *ActorClient {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	return &ActorClient{
 		socket: socketPath,
+		// Exception to internal/outbound: dials only the local recovery-actor unix socket.
 		http: &http.Client{
 			// A submit answers after admission, which may fetch a signature.
 			Timeout: 60 * time.Second,
