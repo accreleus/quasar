@@ -652,12 +652,8 @@ fn only_the_attached_clients_input_reaches_the_devices() {
     // The old tab's late input, its neutral pad state included, reaches nothing.
     media.input_event(old.id, &neutral, true);
     media.input_event(old.id, &key(31, true), false);
-    assert_eq!(
-        events.lock().unwrap().len(),
-        1,
-        "{:?}",
-        events.lock().unwrap()
-    );
+    let delivered = events.lock().unwrap().clone();
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
     media.input_event(new.id, &key(32, true), false);
     assert_eq!(events.lock().unwrap().len(), 2);
 
