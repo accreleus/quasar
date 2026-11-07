@@ -113,6 +113,7 @@ type harness struct {
 	id    map[string]string // steam_name -> id
 	conv  *Converger
 	disp  *jobs.Dispatcher
+	gh    *fakeGitHub // serves 404 until a test sets gh.serve
 	// supported is each host's compat_tools_v1, as the agent registry would answer.
 	mu        sync.Mutex
 	supported map[string]bool
@@ -157,14 +158,15 @@ func newHarness(t *testing.T) *harness {
 	}
 	disp := jobs.New(jobStore, reg, jobs.DefaultConfig(), quiet)
 	conv.Disp = disp
-	NewHandler(NewStore(pool), audit.NewStore(pool), conv).Register(mux, func(next http.Handler) http.Handler {
+	fake, gh := newFakeGitHub(t, func(_ string, w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	NewHandler(NewStore(pool), audit.NewStore(pool), conv, gh).Register(mux, func(next http.Handler) http.Handler {
 		return ah.RequireAuth(ah.RequireAdmin(next))
 	})
 	jobs.NewAgentHandler(jobStore, disp, nodeSecrets{pool}, quiet).Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	h := &harness{t: t, pool: pool, srv: srv, admin: login("cadmin", "admin"), user: login("cuser", "user"),
-		id: map[string]string{}, conv: conv, disp: disp, supported: map[string]bool{}}
+		id: map[string]string{}, conv: conv, disp: disp, gh: fake, supported: map[string]bool{}}
 	conv.Supported = func(host string) bool {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -205,6 +207,8 @@ func TestAdminRoutesAreAdminOnly(t *testing.T) {
 	h := newHarness(t)
 	for _, c := range []struct{ method, path, body string }{
 		{"GET", "/v1/admin/compat-tools", ""},
+		{"POST", "/v1/admin/compat-tools", `{"tag":"GE-Proton11-13"}`},
+		{"GET", "/v1/admin/compat-tools/available", ""},
 		{"PUT", "/v1/admin/compat-tools/default", `{"tool_id":null}`},
 		{"GET", "/v1/admin/compat-tools/mappings", ""},
 		{"PUT", "/v1/admin/compat-tools/mappings/steam/1145360", `{"tool_id":"00000000-0000-4000-8000-000000000000"}`},

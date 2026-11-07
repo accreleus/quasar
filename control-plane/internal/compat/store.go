@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 )
 
 var (
@@ -19,6 +23,8 @@ var (
 	ErrPinConflict = errors.New("compat tool pin conflict")
 	// ErrMappingsFull: the table holds MaxMappings and the appid is not one of them.
 	ErrMappingsFull = errors.New("compat tool mappings are full")
+	// ErrExists: a tool with this tag (or this pin) exists (POST /v1/admin/compat-tools).
+	ErrExists = errors.New("compat tool exists")
 )
 
 // MaxMappings is the contract's cap on per-game mappings (control-api.md §Compatibility tools).
@@ -37,7 +43,11 @@ func (e *InUseError) Error() string {
 	return fmt.Sprintf("%d per-game mapping(s) name the tool; fleet default: %v", e.Mappings, e.IsDefault)
 }
 
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool *pgxpool.Pool
+	// Auditor records the reconcile's pin_conflict marks (actor null); nil records nothing.
+	Auditor audit.Recorder
+}
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
@@ -77,7 +87,8 @@ type HostCount struct {
 }
 
 // Reconcile inserts the code-owned rows and sets recommended from the shipped list. It never
-// deletes a row or changes enabled. A tag row with another pin cannot exist until add-by-tag does.
+// deletes a row or changes enabled. A tag row pinned to another SHA-512 than the shipped entry is
+// never re-pinned: it is marked pin_conflict, and the mark clears when the shipped pin matches again.
 func (s *Store) Reconcile(ctx context.Context) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -93,21 +104,97 @@ func (s *Store) Reconcile(ctx context.Context) error {
 		}
 	}
 	tags := make([]string, 0, len(recommended))
+	type held struct{ id, tag, sha, name, shipped string }
+	var helds []held
 	for _, r := range recommended {
 		tags = append(tags, r.Tag)
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO compat_tools (family, source, tag, steam_name, display_name, recommended,
-			                          asset_name, asset_size_bytes, asset_sha512)
-			VALUES ('ge', 'recommended', $1, $2, $2, true, $3, $4, $5)
-			ON CONFLICT (tag) DO NOTHING`, r.Tag, r.SteamName, r.Asset, r.SizeBytes, r.SHA512); err != nil {
+		// No arbiter: a row holding this entry's tag, Steam name or pin skips it rather than
+		// aborting the boot. Only a row holding the name or the pin under another tag is a fault.
+		var inserted bool
+		err := tx.QueryRow(ctx, `
+			WITH ins AS (
+				INSERT INTO compat_tools (family, source, tag, steam_name, display_name, recommended,
+				                          asset_name, asset_size_bytes, asset_sha512)
+				VALUES ('ge', 'recommended', $1, $2, $2, true, $3, $4, $5)
+				ON CONFLICT DO NOTHING RETURNING id)
+			SELECT EXISTS (SELECT 1 FROM ins) OR EXISTS (SELECT 1 FROM compat_tools WHERE tag = $1)`,
+			r.Tag, r.SteamName, r.Asset, r.SizeBytes, r.SHA512).Scan(&inserted)
+		if err != nil {
 			return fmt.Errorf("compat reconcile %s: %w", r.Tag, err)
+		}
+		if inserted {
+			continue
+		}
+		h := held{name: r.SteamName, shipped: r.Tag}
+		err = tx.QueryRow(ctx, `UPDATE compat_tools SET name_conflict = true
+			WHERE steam_name = $1 AND NOT name_conflict RETURNING id::text, COALESCE(tag, ''), COALESCE(asset_sha512, '')`,
+			r.SteamName).Scan(&h.id, &h.tag, &h.sha)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			slog.Warn("compat tools: a recommended entry is held by another row and was not inserted",
+				"tag", r.Tag, "steam_name", r.SteamName)
+		case err != nil:
+			return fmt.Errorf("compat reconcile %s holder: %w", r.Tag, err)
+		default:
+			slog.Warn("compat tools: another row holds a recommended entry's Steam name; marked name_conflict",
+				"tag", r.Tag, "steam_name", r.SteamName, "holder_tag", h.tag)
+			helds = append(helds, h)
 		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE compat_tools SET recommended = (tag = ANY($1::text[]))
 		WHERE family = 'ge' AND recommended IS DISTINCT FROM (tag = ANY($1::text[]))`, tags); err != nil {
 		return fmt.Errorf("compat reconcile recommended: %w", err)
 	}
-	return tx.Commit(ctx)
+	type marked struct{ id, tag, sha, shipped string }
+	var marks []marked
+	for _, r := range recommended {
+		var m marked
+		err := tx.QueryRow(ctx, `UPDATE compat_tools SET pin_conflict = (asset_sha512 <> $2)
+			WHERE tag = $1 AND pin_conflict IS DISTINCT FROM (asset_sha512 <> $2)
+			RETURNING id::text, asset_sha512, pin_conflict`, r.Tag, r.SHA512).Scan(&m.id, &m.sha, new(bool))
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+		case err != nil:
+			return fmt.Errorf("compat reconcile pin %s: %w", r.Tag, err)
+		case m.sha != r.SHA512:
+			m.tag, m.shipped = r.Tag, r.SHA512
+			marks = append(marks, m)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	for _, m := range marks {
+		audit.TryRecord(ctx, s.Auditor, "", "compat_tool.pin_conflict", "compat_tool", m.id,
+			map[string]any{"tag": m.tag, "sha512": m.sha, "shipped_sha512": m.shipped})
+	}
+	for _, h := range helds {
+		audit.TryRecord(ctx, s.Auditor, "", "compat_tool.name_conflict", "compat_tool", h.id,
+			map[string]any{"tag": h.tag, "sha512": h.sha, "name": h.name, "shipped_tag": h.shipped})
+	}
+	return nil
+}
+
+// HasTag reports whether a catalogue row holds tag, so add-by-tag refuses before reading github.com.
+func (s *Store) HasTag(ctx context.Context, tag string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM compat_tools WHERE tag = $1)`, tag).Scan(&ok)
+	return ok, err
+}
+
+// Add stores a verified tag pin, disabled, with source "tag" and no Steam name yet: the name is
+// bound from the first verified install (Converger.Closed).
+func (s *Store) Add(ctx context.Context, p Pin, actorID string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO compat_tools (family, source, tag, display_name, asset_name, asset_size_bytes, asset_sha512, created_by)
+		VALUES ('ge', 'tag', $1, $1, $2, $3, $4, NULLIF($5, '')::uuid)
+		RETURNING id::text`, p.Tag, p.AssetName, p.SizeBytes, p.SHA512, actorID).Scan(&id)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return "", ErrExists
+	}
+	return id, err
 }
 
 // List returns the catalogue and the fleet default's id: Valve builds first, then GE newest tag first.

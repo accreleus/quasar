@@ -501,12 +501,52 @@ func (c *Converger) Closed(ctx context.Context, run jobs.Run) {
 			WHERE action IN ('compat_tool.enable', 'compat_tool.disable') AND target_id = $1
 			ORDER BY created_at DESC LIMIT 1`, toolID).Scan(&actor)
 	}
-	// shortcut: a tag's Steam name is never bound here, so name_conflict is never marked; every
-	// recommended entry ships its name. Bind it with add-by-tag (C08, #1072).
+	if action == "install" && run.State == jobs.StateSucceeded && p["expected_name"] == nil && toolID != "" {
+		c.bindName(ctx, run, toolID, tag, sha, name)
+	}
 	audit.TryRecord(ctx, c.auditor, actor, "compat_tool."+action, "host", run.HostID, map[string]any{
 		"tag": tag, "sha512": sha, "host_id": run.HostID, "name": name, "state": string(run.State),
 		"reason": s["reason"], "run_id": run.ID,
 	})
+}
+
+// bindName binds a tag's Steam name at its first succeeded install, in the statement that checks
+// it is still unbound (control-api.md §Install job, "A reported name that conflicts"). A row only
+// ever binds its own asset stem (`<tag>-x86_64`, or `<tag>` for a plain asset): that is the name
+// GE-Proton's compatibilitytool.vdf registers, as every entry of the shipped list in tools.go has
+// (TestShippedNamesAreTheirAssetStems), so a tag row can never take another tag's name. Any other
+// name, or one another row holds, marks the tool name_conflict, which takes it out of desired state
+// with nothing retried.
+//
+// shortcut: a host whose succeeded install reports a name other than the bound one is not marked
+// with a name_mismatch hold here; its first difference removes it by its own name, and the next
+// install carries expected_name and fails name_mismatch at the agent. Identical bytes always carry
+// the same vdf, so only a misbehaving agent reaches this.
+func (c *Converger) bindName(ctx context.Context, run jobs.Run, toolID, tag, sha, name string) {
+	bound, err := c.pool.Exec(ctx, `UPDATE compat_tools SET steam_name = $2, display_name = $2
+		WHERE id = $1::uuid AND steam_name IS NULL AND $2 = left(asset_name, -length('.tar.gz'))
+		  AND NOT EXISTS (SELECT 1 FROM compat_tools WHERE steam_name = $2)`, toolID, name)
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.As(err, &pgErr) && pgErr.Code == "23505":
+		// Another row bound the name after our NOT EXISTS read it: held, so a conflict.
+	case err != nil:
+		c.log.Warn("compat tools: binding a Steam name failed", "tool_id", toolID, "err", err)
+		return
+	case bound.RowsAffected() == 1:
+		return
+	}
+	ct, err := c.pool.Exec(ctx, `UPDATE compat_tools SET name_conflict = true
+		WHERE id = $1::uuid AND steam_name IS NULL AND NOT name_conflict`, toolID)
+	if err != nil {
+		c.log.Warn("compat tools: marking a name conflict failed", "tool_id", toolID, "err", err)
+		return
+	}
+	if ct.RowsAffected() == 1 {
+		audit.TryRecord(ctx, c.auditor, "", "compat_tool.name_conflict", "compat_tool", toolID, map[string]any{
+			"tag": tag, "sha512": sha, "name": name, "host_id": run.HostID, "run_id": run.ID})
+		c.All(ctx, true)
+	}
 }
 
 // HostCard is GET /v1/admin/hosts/{id}/compat-tools.
