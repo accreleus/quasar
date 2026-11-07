@@ -762,23 +762,9 @@ pub fn build_encode_pipeline<T: Transport>(
     if !gpu_convert.is_empty() {
         pipeline.add_many(gpu_convert.iter())?;
     }
-    // A PyroWave grant tees the raw frames, at the launch stream size, ahead of the scale
-    // stage. Ungranted sessions get no tee: their graph is unchanged.
-    let tee = (cfg.webtransport && cfg.pyrowave.is_some())
-        .then(|| {
-            gst::ElementFactory::make("tee")
-                .name("pyrowave-tee")
-                .property("allow-not-linked", true)
-                .build()
-        })
-        .transpose()?;
-    if let Some(tee) = &tee {
-        pipeline.add(tee)?;
-    }
-    // Link interpipesrc → queue → [tee →] [GPU convert stage →] encoder → parser: the encode
+    // Link interpipesrc → queue → [GPU convert stage →] encoder → parser: the encode
     // chain ends at the encoded-frame boundary; the transport takes it from there.
     let mut chain: Vec<&gst::Element> = vec![&interpipesrc, &queue];
-    chain.extend(tee.as_ref());
     chain.extend(gpu_convert.iter());
     chain.extend_from_slice(&[&encoder, &h264_capsfilter, &parser]);
     gst::Element::link_many(chain).context("failed to link encode chain")?;
@@ -832,16 +818,20 @@ pub fn build_encode_pipeline<T: Transport>(
     // needs it at arm time. One `Arc`, two owners: the runner's manual PATCH path and the
     // ladder's `on_window` closure.
     let resolution_lever = resolution_lever_with_echo(scale, encoder.clone(), &session_metrics);
-    let pyrowave_feed = tee.and_then(|tee| {
-        pyrowave_branch::add_feed(&pipeline, &tee, &raw_caps)
-            .map_err(|e| {
-                tracing::warn!(
-                    token = "pyrowave-feed-unavailable",
-                    "no PyroWave for this session on this encode path: {e:#}"
-                )
-            })
-            .ok()
-    });
+    // A PyroWave grant takes the raw frames, at the launch stream size, off the queue ahead
+    // of the scale stage, by a probe: the encode graph is the same with or without it.
+    let pyrowave_feed = (cfg.webtransport && cfg.pyrowave.is_some())
+        .then_some(())
+        .and_then(|()| {
+            pyrowave_branch::feed_at(queue.static_pad("src")?, &raw_caps)
+                .map_err(|e| {
+                    tracing::warn!(
+                        token = "pyrowave-feed-unavailable",
+                        "no PyroWave for this session on this encode path: {e:#}"
+                    )
+                })
+                .ok()
+        });
     let transport = T::attach(EncodedSession {
         cfg: cfg.clone(),
         pipeline: pipeline.clone(),

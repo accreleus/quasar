@@ -258,8 +258,8 @@ impl Registry {
 pub(crate) struct Tap {
     registry: Arc<Registry>,
     session_id: String,
-    /// The PyroWave pipeline and the feed's appsink, of a granted session.
-    pyrowave: Option<(gst::Pipeline, gstreamer_app::AppSink)>,
+    /// The PyroWave encoder of a granted session; dropped after the session is ended here.
+    pyrowave: Option<crate::session::pipeline::pyrowave_branch::Encoder>,
 }
 
 impl Tap {
@@ -299,30 +299,25 @@ fn pyrowave_branch(
     grant: PyroWaveGrant,
     feed: Option<crate::session::pipeline::pyrowave_branch::Feed>,
     media: &Arc<Media>,
-) -> Option<(gst::Pipeline, gstreamer_app::AppSink)> {
-    use gstreamer::prelude::*;
+) -> Option<crate::session::pipeline::pyrowave_branch::Encoder> {
     let size = (cfg.stream.width, cfg.stream.height, cfg.stream.fps);
     let Some(feed) = feed else {
         media.grant_pyrowave(grant, size, false);
         return None;
     };
     media.grant_pyrowave(grant, size, true);
-    let gate = Arc::downgrade(media);
-    feed.queue
-        .static_pad("src")?
-        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            match gate.upgrade().is_some_and(|m| m.pyrowave_active()) {
-                true => gst::PadProbeReturn::Ok,
-                false => gst::PadProbeReturn::Drop,
-            }
-        });
-    let (frames, errors) = (Arc::downgrade(media), Arc::downgrade(media));
+    let (gate, frames, errors) = (
+        Arc::downgrade(media),
+        Arc::downgrade(media),
+        Arc::downgrade(media),
+    );
     // Rate: the encoder budgets `bitrate` / fps per frame; B09 (#1058) drives it live from
     // the clamp of codec-pyrowave.md §Rate.
     let started = crate::session::pipeline::pyrowave_branch::start_encoder(
         cfg,
-        &feed,
+        feed,
         grant.target_kbps,
+        move || gate.upgrade().is_some_and(|m| m.pyrowave_active()),
         move |buffer| {
             if let Some(media) = frames.upgrade() {
                 media.on_pyrowave_frame(buffer);
@@ -339,7 +334,7 @@ fn pyrowave_branch(
         },
     );
     match started {
-        Ok((pipeline, _encoder)) => Some((pipeline, feed.sink)),
+        Ok(encoder) => Some(encoder),
         Err(error) => {
             tracing::warn!(
                 token = "pyrowave-encoder-start-failed",
@@ -354,11 +349,7 @@ fn pyrowave_branch(
 impl Drop for Tap {
     fn drop(&mut self) {
         self.registry.end(&self.session_id);
-        if let Some((pipeline, feed)) = self.pyrowave.take() {
-            use gstreamer::prelude::*;
-            feed.set_callbacks(gstreamer_app::AppSinkCallbacks::builder().build());
-            let _ = pipeline.set_state(gst::State::Null);
-        }
+        self.pyrowave.take();
     }
 }
 
