@@ -294,6 +294,13 @@ impl ToolStore {
             .unwrap_or_default()
             .as_nanos();
         let away = format!("removing-{name}-{nanos}");
+        // Moving a directory to another parent rewrites its `..`, which needs write on the
+        // (read-only) directory itself unless the agent runs as root.
+        let top = open_dir_at(&tools, OsStr::new(name))?;
+        // SAFETY: `top` is an open descriptor.
+        if unsafe { libc::fchmod(top.as_raw_fd(), 0o755) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         rename_noreplace(&tools, name.as_bytes(), &staging, away.as_bytes())?;
         delete_tree(&staging_path.join(away))
     }
