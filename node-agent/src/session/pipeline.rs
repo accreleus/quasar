@@ -39,6 +39,7 @@ mod audio_health;
 mod rtp_ext;
 use audio_branch::add_audio_chain;
 mod mic_branch;
+mod mtu_shrink;
 mod probes;
 use probes::{
     attach_bitstream_capture, attach_encode_probes, attach_encoder_pts_trace, attach_queue_probes,
