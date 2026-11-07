@@ -6,10 +6,13 @@ package compat
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
+	"github.com/accreleus/quasar/control-plane/internal/jobs"
 	"github.com/accreleus/quasar/control-plane/internal/migrate"
 	"github.com/accreleus/quasar/control-plane/migrations"
 )
@@ -37,7 +41,9 @@ func testDB(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("connect: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		UPDATE instance_settings SET compat_tool_default_id = NULL;
+		UPDATE instance_settings SET compat_tool_default_id = NULL, compat_tools_max_enabled = 8;
+		DELETE FROM job_runs WHERE job_id = 'compat_tools.converge';
+		DELETE FROM host_compat_tools; DELETE FROM hosts WHERE node_name LIKE 'compat-%';
 		DELETE FROM compat_tool_mappings; DELETE FROM compat_tools;
 		DELETE FROM admin_activity; DELETE FROM auth_tokens; DELETE FROM users`); err != nil {
 		pool.Close()
@@ -105,6 +111,12 @@ type harness struct {
 	admin string // bearer
 	user  string
 	id    map[string]string // steam_name -> id
+	conv  *Converger
+	disp  *jobs.Dispatcher
+	gh    *fakeGitHub // serves 404 until a test sets gh.serve
+	// supported is each host's compat_tools_v1, as the agent registry would answer.
+	mu        sync.Mutex
+	supported map[string]bool
 }
 
 func newHarness(t *testing.T) *harness {
@@ -134,12 +146,32 @@ func newHarness(t *testing.T) *harness {
 	}
 	ah := auth.NewHandler(svc)
 	mux := http.NewServeMux()
-	NewHandler(NewStore(pool), audit.NewStore(pool)).Register(mux, func(next http.Handler) http.Handler {
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	jobStore := jobs.NewStore(pool)
+	conv := NewConverger(pool, jobStore, audit.NewStore(pool), quiet)
+	reg := jobs.NewRegistry()
+	reg.MustRegister(jobs.Definition{ID: JobID, Name: "Compatibility tools", Plane: jobs.PlaneAgent,
+		Scope: jobs.ScopeHost, Managed: true, Default: jobs.Schedule{Kind: jobs.KindEvent},
+		FillParams: conv.Params, OnTerminal: conv.Closed})
+	if _, err := reg.Sync(ctx, jobStore, "UTC", 50, quiet); err != nil {
+		t.Fatal(err)
+	}
+	disp := jobs.New(jobStore, reg, jobs.DefaultConfig(), quiet)
+	conv.Disp = disp
+	fake, gh := newFakeGitHub(t, func(_ string, w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	NewHandler(NewStore(pool), audit.NewStore(pool), conv, gh).Register(mux, func(next http.Handler) http.Handler {
 		return ah.RequireAuth(ah.RequireAdmin(next))
 	})
+	jobs.NewAgentHandler(jobStore, disp, nodeSecrets{pool}, quiet).Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	h := &harness{t: t, pool: pool, srv: srv, admin: login("cadmin", "admin"), user: login("cuser", "user"), id: map[string]string{}}
+	h := &harness{t: t, pool: pool, srv: srv, admin: login("cadmin", "admin"), user: login("cuser", "user"),
+		id: map[string]string{}, conv: conv, disp: disp, gh: fake, supported: map[string]bool{}}
+	conv.Supported = func(host string) bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.supported[host]
+	}
 	rows, err := pool.Query(ctx, `SELECT steam_name, id::text FROM compat_tools`)
 	if err != nil {
 		t.Fatal(err)
@@ -175,6 +207,8 @@ func TestAdminRoutesAreAdminOnly(t *testing.T) {
 	h := newHarness(t)
 	for _, c := range []struct{ method, path, body string }{
 		{"GET", "/v1/admin/compat-tools", ""},
+		{"POST", "/v1/admin/compat-tools", `{"tag":"GE-Proton11-13"}`},
+		{"GET", "/v1/admin/compat-tools/available", ""},
 		{"PUT", "/v1/admin/compat-tools/default", `{"tool_id":null}`},
 		{"GET", "/v1/admin/compat-tools/mappings", ""},
 		{"PUT", "/v1/admin/compat-tools/mappings/steam/1145360", `{"tool_id":"00000000-0000-4000-8000-000000000000"}`},
@@ -287,7 +321,7 @@ func TestEntriesAreTheDefaultThenEveryUsableMapping(t *testing.T) {
 		}
 	}
 	must(h.pool.Exec(ctx, `INSERT INTO instance_settings (id) VALUES (true) ON CONFLICT DO NOTHING`))
-	if got, err := s.Entries(ctx); err != nil || len(got) != 0 {
+	if got, _, err := s.Entries(ctx, zeroHost); err != nil || len(got) != 0 {
 		t.Fatalf("no default and no mappings: %v %v, want none", got, err)
 	}
 	must(h.pool.Exec(ctx, `UPDATE instance_settings SET compat_tool_default_id = $1::uuid`, h.id["proton_10"]))
@@ -296,7 +330,7 @@ func TestEntriesAreTheDefaultThenEveryUsableMapping(t *testing.T) {
 		h.id["proton_hotfix"], h.id["proton_experimental"], h.id["proton_9"]))
 	must(h.pool.Exec(ctx, `UPDATE compat_tools SET enabled = false WHERE steam_name = 'proton_9'`))
 
-	got, err := s.Entries(ctx)
+	got, _, err := s.Entries(ctx, zeroHost)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +386,7 @@ func TestMappingSetForcedClearAndAudit(t *testing.T) {
 	}
 
 	// The game reaches the session as a forced entry for its appid.
-	got, err := NewStore(h.pool).Entries(ctx)
+	got, _, err := NewStore(h.pool).Entries(ctx, zeroHost)
 	if err != nil || len(got) != 1 || got[0] != (Entry{"1145360", "proton_9", true}) {
 		t.Fatalf("entries = %+v %v, want the forced mapping", got, err)
 	}
@@ -363,7 +397,7 @@ func TestMappingSetForcedClearAndAudit(t *testing.T) {
 	if code, _ = h.do("DELETE", path, h.admin, ""); code != http.StatusNoContent {
 		t.Fatalf("clear again: %d, want 204 also when none existed", code)
 	}
-	if got, err = NewStore(h.pool).Entries(ctx); err != nil || len(got) != 0 {
+	if got, _, err = NewStore(h.pool).Entries(ctx, zeroHost); err != nil || len(got) != 0 {
 		t.Fatalf("entries after clear = %+v %v, want none", got, err)
 	}
 
@@ -411,7 +445,7 @@ func TestMappingWinsOverTheDefaultAndIsKeyedByAppID(t *testing.T) {
 	}
 
 	// The default stays in force for every game, and a game's own mapping is its own entry.
-	got, err := NewStore(h.pool).Entries(ctx)
+	got, _, err := NewStore(h.pool).Entries(ctx, zeroHost)
 	want := []Entry{{"0", "proton_10", false}, {"1145360", "proton_hotfix", false}, {"480", "proton_hotfix", false}}
 	if err != nil || len(got) != len(want) {
 		t.Fatalf("entries = %+v %v, want %+v", got, err, want)
@@ -423,7 +457,7 @@ func TestMappingWinsOverTheDefaultAndIsKeyedByAppID(t *testing.T) {
 	}
 	// Clearing the game's mapping returns it to the default.
 	h.do("DELETE", "/v1/admin/compat-tools/mappings/steam/1145360", h.admin, "")
-	got, _ = NewStore(h.pool).Entries(ctx)
+	got, _, _ = NewStore(h.pool).Entries(ctx, zeroHost)
 	if len(got) != 2 || got[0].AppID != "0" || got[1].AppID != "480" {
 		t.Errorf("entries after clear = %+v, want the default and 480 only", got)
 	}

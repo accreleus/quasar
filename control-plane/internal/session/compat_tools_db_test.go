@@ -110,7 +110,7 @@ func TestAdminMappingReachesTheLaunchForcedOrNot(t *testing.T) {
 		t.Helper()
 		_, _, _, _, err := compat.NewStore(f.pool).SetMapping(ctx, "480", hotfix, forced, admin)
 		must(t, err)
-		spec := f.coord.compatToolsFor(f.steam)
+		spec := f.coord.compatToolsFor(f.steam, f.hostID)
 		for _, e := range spec.Entries {
 			if e.AppID == "480" {
 				return e
@@ -129,10 +129,10 @@ func TestAdminMappingReachesTheLaunchForcedOrNot(t *testing.T) {
 
 func TestCompatToolsOnlyForTheSteamFamily(t *testing.T) {
 	f := compatFixture(t, true)
-	if got := f.coord.compatToolsFor(f.appID); got != nil {
+	if got := f.coord.compatToolsFor(f.appID, f.hostID); got != nil {
 		t.Errorf("a non-Steam app got compat_tools %+v", got)
 	}
-	if got := f.coord.compatToolsFor(f.steam); got == nil {
+	if got := f.coord.compatToolsFor(f.steam, f.hostID); got == nil {
 		t.Error("the Steam parent got no compat_tools")
 	}
 }
@@ -162,7 +162,7 @@ func TestASlowMappingReadFailsOpenWithoutBlocking(t *testing.T) {
 	lockedFor(t, f, `LOCK TABLE compat_tool_mappings IN ACCESS EXCLUSIVE MODE`)
 
 	start := time.Now()
-	got := f.coord.compatToolsFor(f.steam)
+	got := f.coord.compatToolsFor(f.steam, f.hostID)
 	if got != nil {
 		t.Errorf("compat_tools = %+v after a read that timed out, want none", got)
 	}
