@@ -203,7 +203,7 @@ func TestCompatToolMissingIsAReasonedNoHostAvailable(t *testing.T) {
 		usable bool
 		want   string
 	}{
-		{true, "still being installed"},
+		{true, "no host can run the compatibility tool"},
 		{false, "disabled or marked"},
 	} {
 		rec := httptest.NewRecorder()
@@ -240,5 +240,35 @@ func TestTileLaunchWaitsForTheToolOnItsHomeHost(t *testing.T) {
 	hostHasTool(t, pool, s.hostID, true)
 	if _, err := coord.Launch(ctx, s.userID, hades, StreamOverride{}); err != nil {
 		t.Fatalf("launch after the install: %v", err)
+	}
+}
+
+// The home host being offline outranks the missing tool: only an admin brings it back, and the
+// user is told that, not to wait for an install.
+func TestOfflineHomeHostWithoutTheToolStaysHomeHostUnavailable(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 8)
+	parent := seedSteamApp(t, pool, `{"image":"steam:1"}`)
+	hades := seedTile(t, pool, parent, "Hades", "1145360")
+	provisionHome(t, pool, s.userID, parent, s.hostID)
+	seedGETool(t, pool)
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `UPDATE compat_tool_mappings SET external_id = '1145360' WHERE external_id = $1`, compatGameID)
+	must(t, err)
+	_, err = pool.Exec(ctx, `UPDATE hosts SET status = 'offline' WHERE id = $1::uuid`, s.hostID)
+	must(t, err)
+
+	coord := newTestCoordinator(t, store, newCapturingDispatcher(), testLogger(), WithHomeProvider(storage.NewLocal(pool, testHomeRoot)))
+	_, err = coord.Launch(ctx, s.userID, hades, StreamOverride{})
+	var home *HomeHostOfflineRejection
+	var ct *CompatToolRejection
+	if !errors.As(err, &home) || errors.As(err, &ct) {
+		t.Fatalf("got %v, want HomeHostOfflineRejection and no CompatToolRejection", err)
+	}
+	rec := httptest.NewRecorder()
+	writeNoHostAvailable(rec, err)
+	if !strings.Contains(rec.Body.String(), `"reason":"home_host_unavailable"`) {
+		t.Fatalf("body %s", rec.Body.String())
 	}
 }
