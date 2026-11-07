@@ -351,19 +351,24 @@ func TestALaunchWhoseMappedToolWasDisabledAfterPlacementIsRefused(t *testing.T) 
 	}
 }
 
-// Through the real launch: the game maps to a GE tool that is not usable by the time the assign is
-// built. The session fails before the agent is told anything; it never runs without the tool.
+// Through the dispatch: the launch was placed while the game's mapped GE tool was usable, then the
+// tool was disabled before the assign was built. The session fails before the agent is told
+// anything; it never runs without the tool.
 func TestALaunchMappedToAnUnusableToolFailsBeforeTheAgent(t *testing.T) {
 	f := compatFixture(t, true)
 	name := installGE(t, f)
-	must(t, exec(t, f.pool, `UPDATE compat_tools SET enabled = false WHERE steam_name = $1`, name))
-	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	must(t, exec(t, f.pool, `UPDATE apps SET external_source = 'steam', external_id = '1145360' WHERE id = $1::uuid`, f.steam))
+	t.Cleanup(func() { _, _ = f.pool.Exec(context.Background(), `UPDATE apps SET external_source = '', external_id = '' WHERE id = $1::uuid`, f.steam) })
 	must(t, exec(t, f.pool, `DELETE FROM compat_tool_mappings`))
 	must(t, exec(t, f.pool, `INSERT INTO compat_tool_mappings (provider, external_id, tool_id)
 		SELECT 'steam', '1145360', id FROM compat_tools WHERE steam_name = $1`, name))
-
-	res, err := f.coord.LaunchByProfile(context.Background(), f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID})
-	must(t, err)
+	p := compatLaunch(f.seedIDs, "1145360")
+	p.AppID = f.steam
+	sess, err := f.store.ScheduleAndCreate(context.Background(), p)
+	must(t, err) // placed: the host holds the tool
+	must(t, exec(t, f.pool, `UPDATE compat_tools SET enabled = false WHERE steam_name = $1`, name))
+	f.coord.dispatchAssignStart(sess, []byte(`{}`), nil)
+	res := LaunchResult{Session: sess}
 	deadline := time.Now().Add(5 * time.Second)
 	var row rowState
 	for time.Now().Before(deadline) {
