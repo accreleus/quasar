@@ -304,10 +304,13 @@ func TestFiveRedirectsAreFollowedAndASixthIsRefused(t *testing.T) {
 
 func TestUpstreamFailuresAreRetryableAndStoreNothing(t *testing.T) {
 	for name, serve := range map[string]func(string, http.ResponseWriter, *http.Request){
-		"5xx":          func(_ string, w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) },
-		"429":          func(_ string, w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTooManyRequests) },
-		"403 limit":    func(_ string, w http.ResponseWriter, _ *http.Request) { w.Header().Set("X-RateLimit-Remaining", "0"); w.WriteHeader(403) },
-		"not JSON":     func(_ string, w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "<html>") },
+		"5xx": func(_ string, w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) },
+		"429": func(_ string, w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTooManyRequests) },
+		"403 limit": func(_ string, w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			w.WriteHeader(403)
+		},
+		"not JSON": func(_ string, w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "<html>") },
 		"checksum 5xx": func(h string, w http.ResponseWriter, r *http.Request) {
 			if h == "release-assets.githubusercontent.com" {
 				w.WriteHeader(http.StatusServiceUnavailable)
@@ -489,10 +492,13 @@ func TestEachFailureHasOneReason(t *testing.T) {
 		serve  func(w http.ResponseWriter)
 		reason string
 	}{
-		"429":            {func(w http.ResponseWriter) { w.WriteHeader(429) }, "rate_limited"},
-		"403 exhausted":  {func(w http.ResponseWriter) { w.Header().Set("X-RateLimit-Remaining", "0"); w.WriteHeader(403) }, "rate_limited"},
-		"403 other":      {func(w http.ResponseWriter) { w.WriteHeader(403) }, "upstream_error"},
-		"302":            {func(w http.ResponseWriter) { w.Header().Set("Location", "https://api.github.com/x"); w.WriteHeader(302) }, "upstream_error"},
+		"429":           {func(w http.ResponseWriter) { w.WriteHeader(429) }, "rate_limited"},
+		"403 exhausted": {func(w http.ResponseWriter) { w.Header().Set("X-RateLimit-Remaining", "0"); w.WriteHeader(403) }, "rate_limited"},
+		"403 other":     {func(w http.ResponseWriter) { w.WriteHeader(403) }, "upstream_error"},
+		"302": {func(w http.ResponseWriter) {
+			w.Header().Set("Location", "https://api.github.com/x")
+			w.WriteHeader(302)
+		}, "upstream_error"},
 		"over 1 MiB":     {func(w http.ResponseWriter) { io.WriteString(w, big) }, "response_invalid"},
 		"gzip bomb":      {func(w http.ResponseWriter) { w.Header().Set("Content-Encoding", "gzip"); w.Write(gz.Bytes()) }, "response_invalid"},
 		"brotli":         {func(w http.ResponseWriter) { w.Header().Set("Content-Encoding", "br"); io.WriteString(w, "[]") }, "response_invalid"},

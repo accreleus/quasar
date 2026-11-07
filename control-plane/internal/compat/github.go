@@ -204,9 +204,9 @@ func (g *GitHub) Resolve(ctx context.Context, tag string) (Pin, error) {
 	}
 	name, size, hasSum, found := rel.pick()
 	switch {
-	case !found:
-		return Pin{}, unverifiable("asset_not_found", "no %s-x86_64.tar.gz or %s.tar.gz", tag, tag)
-	case size < 1 || size > maxAssetBytes:
+	case !found || size < 1:
+		return Pin{}, unverifiable("asset_not_found", "no usable %s-x86_64.tar.gz or %s.tar.gz", tag, tag)
+	case size > maxAssetBytes:
 		return Pin{}, unverifiable("asset_too_large", "%s is %d bytes", name, size)
 	case !hasSum:
 		return Pin{}, unverifiable("checksum_missing", "the release lists no checksum file for %s", name)

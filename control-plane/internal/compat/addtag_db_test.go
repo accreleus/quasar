@@ -14,6 +14,12 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 )
 
+// errOf is the error envelope's code and message.
+func errOf(out map[string]any) (code, msg any) {
+	e, _ := out["error"].(map[string]any)
+	return e["code"], e["message"]
+}
+
 func (h *harness) addTag() string {
 	h.t.Helper()
 	h.gh.serve = release(addTag, goodAssets(), addSHA+"  "+addAsset+"\n")
@@ -57,7 +63,7 @@ func TestAddByTagPinsTheReleaseChecksumDisabledAndAudits(t *testing.T) {
 
 	before := len(h.gh.reqs)
 	for _, tag := range []string{addTag, recommended[0].Tag} {
-		if code, out := h.do("POST", "/v1/admin/compat-tools", h.admin, `{"tag":"`+tag+`"}`); code != http.StatusConflict || out["code"] != "compat_tool_exists" {
+		if code, out := h.do("POST", "/v1/admin/compat-tools", h.admin, `{"tag":"`+tag+`"}`); code != http.StatusConflict || func() bool { c, _ := errOf(out); return c != "compat_tool_exists" }() {
 			t.Errorf("re-add %s: %d %v", tag, code, out)
 		}
 	}
@@ -97,7 +103,7 @@ func TestAddByTagRefusalsStoreNothing(t *testing.T) {
 			h.gh.serve = func(string, http.ResponseWriter, *http.Request) { t.Errorf("%s: github.com was read", c.name) }
 		}
 		code, out := h.do("POST", "/v1/admin/compat-tools", h.admin, c.body)
-		if code != c.status || out["code"] != c.code || (c.msg != "" && out["message"] != c.msg) {
+		if gotCode, gotMsg := errOf(out); code != c.status || gotCode != c.code || (c.msg != "" && gotMsg != c.msg) {
 			t.Errorf("%s: %d %v, want %d %s %s", c.name, code, out, c.status, c.code, c.msg)
 		}
 	}
