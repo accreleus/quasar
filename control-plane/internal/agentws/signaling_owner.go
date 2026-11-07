@@ -17,8 +17,11 @@ const (
 	foreignTTL = 5 * time.Second
 	// ownerLogEvery spaces each per-connection drop and lookup-error log.
 	ownerLogEvery = 10 * time.Second
-	// ownerLookupTimeout bounds each of the two lookup attempts; the read loop waits on them.
+	// ownerLookupTimeout bounds the one lookup per id; the read loop waits on it.
 	ownerLookupTimeout = 2 * time.Second
+	// unknownTTL is how long an id whose lookup failed is dropped without another lookup, so a
+	// burst during a DB outage blocks the read loop once per window, not once per frame.
+	unknownTTL = 2 * time.Second
 )
 
 // sessionPlacedOn reports whether sessions.host_id of sessionID is hostID.
@@ -58,6 +61,7 @@ type signalingOwners struct {
 	hostID  string
 	owned   map[string]struct{}
 	foreign map[string]time.Time
+	unknown map[string]time.Time
 	drops   throttledLog
 	errs    throttledLog
 	now     func() time.Time // test seam
@@ -67,50 +71,56 @@ func newSignalingOwners(store *agentStore, log *slog.Logger, hostID string) *sig
 	return &signalingOwners{
 		lookup: func(ctx context.Context, sid string) (bool, error) { return store.sessionPlacedOn(ctx, sid, hostID) },
 		log:    log, hostID: hostID,
-		owned: map[string]struct{}{}, foreign: map[string]time.Time{}, now: time.Now,
+		owned: map[string]struct{}{}, foreign: map[string]time.Time{}, unknown: map[string]time.Time{}, now: time.Now,
 	}
 }
 
 // allows reports whether the frame may be relayed. It answers true only for a canonically
 // spelled id placed on this host: the relay keys its buffers on the raw string, and a ::uuid cast
-// accepts other spellings of an owned id. A non-nil error means the lookup failed twice and the
-// frame was not judged; the caller must report it, not drop it silently.
-func (o *signalingOwners) allows(ctx context.Context, sessionID string) (bool, error) {
+// accepts other spellings of an owned id. A failed lookup drops the frame and never fails the
+// session: a transient DB error loses a frame, and the read loop waits at most one lookup
+// timeout per id per unknownTTL.
+func (o *signalingOwners) allows(ctx context.Context, sessionID string) bool {
 	now := o.now()
 	if !canonicalPolicyUUID(sessionID) {
 		o.drops.emit(now, o.log, slog.LevelWarn, "agent signaling for a malformed or non-canonical session id; frame dropped",
 			"token", "agent-signaling-foreign-session", "host_id", o.hostID)
-		return false, nil
+		return false
 	}
 	if _, ok := o.owned[sessionID]; ok {
-		return true, nil
+		return true
 	}
 	if until, ok := o.foreign[sessionID]; ok && now.Before(until) {
 		o.dropForeign(now)
-		return false, nil
+		return false
+	}
+	if until, ok := o.unknown[sessionID]; ok && now.Before(until) {
+		o.errs.count++
+		return false
 	}
 	ok, err := o.query(ctx, sessionID)
 	if err != nil {
-		ok, err = o.query(ctx, sessionID)
-	}
-	if err != nil {
-		o.errs.emit(now, o.log, slog.LevelError, "agent signaling placement lookup failed; session reported failed",
+		if len(o.unknown) >= ownerCacheMax {
+			clear(o.unknown)
+		}
+		o.unknown[sessionID] = now.Add(unknownTTL)
+		o.errs.emit(now, o.log, slog.LevelError, "agent signaling placement lookup failed; frame dropped",
 			"host_id", o.hostID, "err", err)
-		return false, err
+		return false
 	}
 	if ok {
 		if len(o.owned) >= ownerCacheMax {
 			clear(o.owned)
 		}
 		o.owned[sessionID] = struct{}{}
-		return true, nil
+		return true
 	}
 	if len(o.foreign) >= ownerCacheMax {
 		clear(o.foreign)
 	}
 	o.foreign[sessionID] = now.Add(foreignTTL)
 	o.dropForeign(now)
-	return false, nil
+	return false
 }
 
 func (o *signalingOwners) query(ctx context.Context, sessionID string) (bool, error) {

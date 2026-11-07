@@ -158,8 +158,8 @@ func TestSignalingOwnersCacheHitAndRefusalWindow(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	o, calls, clock := countingOwners(true, nil, log)
 	for i := 0; i < 3; i++ {
-		if ok, err := o.allows(context.Background(), canonicalSession); !ok || err != nil {
-			t.Fatalf("owned session: %v, %v", ok, err)
+		if !o.allows(context.Background(), canonicalSession) {
+			t.Fatal("owned session refused")
 		}
 	}
 	if *calls != 1 {
@@ -183,8 +183,8 @@ func TestSignalingOwnersCacheHitAndRefusalWindow(t *testing.T) {
 func TestSignalingOwnersRefuseNonCanonicalIDsWithoutALookup(t *testing.T) {
 	o, calls, _ := countingOwners(true, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	for _, id := range []string{"", "not-a-uuid", strings.ToUpper(canonicalSession), strings.ReplaceAll(canonicalSession, "-", "")} {
-		if ok, err := o.allows(context.Background(), id); ok || err != nil {
-			t.Fatalf("%q: allowed=%v err=%v", id, ok, err)
+		if o.allows(context.Background(), id) {
+			t.Fatalf("%q was allowed", id)
 		}
 	}
 	if *calls != 0 {
@@ -195,39 +195,50 @@ func TestSignalingOwnersRefuseNonCanonicalIDsWithoutALookup(t *testing.T) {
 type failureEvents struct {
 	noopEvents
 	mu       sync.Mutex
-	failures []string // session id + "|bye" flag
+	failures int
 }
 
-func (e *failureEvents) AgentSignalingFailure(_ context.Context, _, sessionID string, bye bool, _ string) {
+func (e *failureEvents) AgentSignalingFailure(context.Context, string, string, bool, string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.failures = append(e.failures, sessionID+map[bool]string{true: "|bye", false: ""}[bye])
+	e.failures++
 }
 
-// A lookup that fails twice must fail the session through the same path as a relay that cannot
-// deliver, never stall it silently; the log line is throttled and the frame is not relayed.
-func TestSignalingLookupFailureFailsTheSessionAndThrottlesTheLog(t *testing.T) {
+// A transient DB error loses a frame and never fails the session. A burst during the outage costs
+// one lookup (the read loop blocks once per window, not once per frame), the next window looks up
+// again, and the log is throttled.
+func TestSignalingLookupFailureDropsTheBurstWithOneLookup(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, nil))
 	ev := &failureEvents{}
 	h := NewHandler(nil, log, nil, ev, nil, nil, nil)
 	t.Cleanup(h.Close)
-	o, calls, _ := countingOwners(false, errors.New("db down"), log)
-	ch := make(chan []byte, 4)
+	o, calls, clock := countingOwners(false, errors.New("db down"), log)
+	ch := make(chan []byte, 64)
 	h.relay.Register(canonicalSession, ch)
+	send := func(n int) {
+		for i := 0; i < n; i++ {
+			h.relayAgentSignaling(context.Background(), o, "host", SignalingEnvelope{SessionID: canonicalSession, Msg: []byte(`{"type":"bye"}`)})
+		}
+	}
 
-	for _, msg := range []string{`{"type":"offer"}`, `{"type":"bye"}`, `{"type":"ice"}`} {
-		h.relayAgentSignaling(context.Background(), o, "host", SignalingEnvelope{SessionID: canonicalSession, Msg: []byte(msg)})
+	const burst = 50
+	send(burst)
+	if *calls != 1 {
+		t.Fatalf("a burst of %d frames during a failing lookup cost %d lookups, want 1", burst, *calls)
 	}
-	if *calls != 6 {
-		t.Fatalf("lookups = %d, want 2 attempts per frame", *calls)
-	}
-	want := []string{canonicalSession, canonicalSession + "|bye", canonicalSession}
-	if len(ev.failures) != 3 || ev.failures[0] != want[0] || ev.failures[1] != want[1] || ev.failures[2] != want[2] {
-		t.Fatalf("AgentSignalingFailure calls = %v, want %v", ev.failures, want)
+	if ev.failures != 0 {
+		t.Fatalf("a lookup error failed the session %d times", ev.failures)
 	}
 	silent(t, ch)
+	*clock = clock.Add(unknownTTL + time.Second)
+	send(1)
+	if *calls != 2 {
+		t.Fatalf("lookups after the window = %d, want 2", *calls)
+	}
+	*clock = clock.Add(unknownTTL + time.Second)
+	send(burst)
 	if n := strings.Count(buf.String(), "placement lookup failed"); n != 1 {
-		t.Fatalf("lookup error logged %d times for 3 failures, want 1", n)
+		t.Fatalf("lookup error logged %d times in under %s, want 1", n, ownerLogEvery)
 	}
 }

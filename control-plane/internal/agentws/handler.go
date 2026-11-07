@@ -2445,20 +2445,14 @@ func (h *Handler) resolveAuth(ctx context.Context, reg RegisterMsg) (registerRes
 }
 
 // relayAgentSignaling relays an agent's signaling frame to the session's browser, only for a
-// session placed on hostID (#1116). A placement lookup that cannot be answered fails the session
-// like a relay that cannot deliver, so signaling never stalls without a trace.
+// session placed on hostID (#1116).
 func (h *Handler) relayAgentSignaling(ctx context.Context, owners *signalingOwners, hostID string, env SignalingEnvelope) {
-	bye := func() bool { t, _ := peekType(env.Msg); return t == "bye" }
-	ok, err := owners.allows(ctx, env.SessionID)
-	if err != nil {
-		h.events.AgentSignalingFailure(ctx, hostID, env.SessionID, bye(), err.Error())
-		return
-	}
-	if !ok {
+	if !owners.allows(ctx, env.SessionID) {
 		return
 	}
 	if err := h.relay.Deliver(env.SessionID, env.Msg); err != nil {
 		h.log.Error("reliable signaling relay failed", "host_id", hostID, "session_id", env.SessionID, "err", err)
-		h.events.AgentSignalingFailure(ctx, hostID, env.SessionID, bye(), err.Error())
+		msgType, _ := peekType(env.Msg)
+		h.events.AgentSignalingFailure(ctx, hostID, env.SessionID, msgType == "bye", err.Error())
 	}
 }
