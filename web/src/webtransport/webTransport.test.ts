@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CONNECT_DEADLINE_MS,
-  UNREACHABLE_DEADLINE_MS,
+  HANDSHAKE_DEADLINE_MS,
   KEYFRAME_SPACING_MS,
   REMINT_MIN_INTERVAL_MS,
   TOKEN_REFRESH_AGE_MS,
@@ -502,26 +502,21 @@ describe("WebTransportMedia unreachable agent", () => {
     const agent = new FakeAgent();
     agent.hold = "ready";
     const result = transport(agent).connect(NO_SINK).catch((e: TransportError) => e);
-    await vi.advanceTimersByTimeAsync(UNREACHABLE_DEADLINE_MS + 1);
+    await vi.advanceTimersByTimeAsync(HANDSHAKE_DEADLINE_MS + 1);
     expect(await result).toMatchObject({ code: "connect_timeout" });
-    expect(UNREACHABLE_DEADLINE_MS).toBeLessThan(CONNECT_DEADLINE_MS);
+    expect(HANDSHAKE_DEADLINE_MS).toBeLessThan(CONNECT_DEADLINE_MS);
     expect(agent.conns[0].closes).toHaveLength(1);
   });
 
-  it("gives up on attempts that get no answer, but keeps waiting on an agent that is not ready", async () => {
-    const quiet = new FakeAgent();
-    quiet.replies = [[{ type: "teardown" }]];
+  it("keeps retrying a host that completed the handshake, up to the connect deadline", async () => {
+    // Not ready, or an answer Chrome dropped: both are a reachable host, so neither counts toward
+    // the handshake bound.
+    const agent = new FakeAgent();
+    agent.replies = [[{ type: "teardown" }]];
     let now = 0;
     const clock = { sleep: async (ms: number) => void (now += ms * 40), now: () => now };
-    await expect(transport(quiet, clock).connect(NO_SINK)).rejects.toMatchObject({ code: "connect_timeout" });
-    expect(now).toBeGreaterThanOrEqual(UNREACHABLE_DEADLINE_MS);
-    expect(now).toBeLessThan(CONNECT_DEADLINE_MS);
-
-    const notReady = new FakeAgent();
-    notReady.replies = [[{ type: "error", code: "session_not_ready" }], [{ type: "error", code: "session_not_ready" }], [helloAck(0, avcC())]];
-    now = 0;
-    await transport(notReady, { ...clock, sleep: async (ms) => void (now += ms * 20) }).connect(NO_SINK);
-    expect(now).toBeGreaterThanOrEqual(UNREACHABLE_DEADLINE_MS / 2);
+    await expect(transport(agent, clock).connect(NO_SINK)).rejects.toMatchObject({ code: "connect_timeout" });
+    expect(now).toBeGreaterThanOrEqual(CONNECT_DEADLINE_MS);
   });
 });
 
@@ -572,7 +567,7 @@ describe("createWebTransportRuntime fallback", () => {
     const { agent, callbacks, rt } = setup();
     agent.hold = "ready";
     rt.start();
-    await vi.advanceTimersByTimeAsync(UNREACHABLE_DEADLINE_MS + 1);
+    await vi.advanceTimersByTimeAsync(HANDSHAKE_DEADLINE_MS + 1);
     expect(callbacks.onFallback).toHaveBeenCalledWith("connect_timeout");
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
@@ -618,13 +613,75 @@ describe("createWebTransportRuntime fallback", () => {
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
-  it("mid-session loss with a refused re-mint falls back at once", async () => {
+  it("a reconnect that cannot be made reports stream_lost, whatever refused it", async () => {
     const { agent, callbacks, rt } = setup();
     vi.mocked(mintTransportToken).mockRejectedValue(new Error("409"));
     rt.start();
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     agent.last.closeWith(4400);
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("auth_failed"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+
+    const refused = setup();
+    refused.rt.start();
+    await vi.waitFor(() => expect(refused.rt.getSnapshot().channelOpen).toBe(true));
+    refused.agent.replies = [[{ type: "error", code: "takeover_rate_limited" }]];
+    refused.agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(refused.callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    expect(refused.callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens no connection from a reconnect whose mint was in flight when the view was destroyed", async () => {
+    const { agent, callbacks, rt } = setup();
+    let release!: () => void;
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    vi.mocked(mintTransportToken).mockReturnValue(
+      new Promise((r) => (release = () => r({ transport_options: { webtransport: { ...COORDS, token: "tok-2" } } } as never))),
+    );
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    rt.destroy();
+    release();
+    await flush();
+    expect(agent.conns).toHaveLength(1);
+    expect(callbacks.onFallback).not.toHaveBeenCalled();
+  });
+
+  it("opens no connection from a reconnect whose mint was in flight when the view failed", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    let fatal!: (m: string) => void;
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
+    const rt = createWebTransportRuntime({
+      sessionId: "s1",
+      authToken: "auth",
+      coords: COORDS,
+      canvas: {} as HTMLCanvasElement,
+      callbacks,
+      deps: {
+        createTransport: (o) => new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {} }),
+        createPresenter: async (_c, onFatal) => ((fatal = onFatal), { present: () => true, destroy: () => {} }),
+        decoder: {
+          createDecoder: (init) => new FakeDecoder(init) as unknown as VideoDecoder,
+          isConfigSupported: async (c) => ({ supported: true, config: c }),
+        },
+      },
+    });
+    let release!: () => void;
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    vi.mocked(mintTransportToken).mockReturnValue(
+      new Promise((r) => (release = () => r({ transport_options: { webtransport: COORDS } } as never))),
+    );
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    fatal("the GPU device was lost");
+    expect(callbacks.onFallback).toHaveBeenCalledWith("internal");
+    release();
+    await flush();
+    expect(agent.conns).toHaveLength(1);
+    expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
   it("closes WebTransport before it asks the page to fall back", async () => {

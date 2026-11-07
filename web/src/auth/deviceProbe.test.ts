@@ -4,13 +4,15 @@ import { markDeviceProbePosted } from "../webrtc/capability";
 import { ensureDeviceProbe, ensureDeviceProbeForLaunch, LAUNCH_PROBE_WAIT_MS } from "./deviceProbe";
 
 vi.mock("../api/auth", () => ({ postDevice: vi.fn() }));
+let capabilities: () => Promise<unknown> = async () => ({ codecs: { h264: true } });
 vi.mock("../webrtc/capability", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../webrtc/capability")>()),
   probeH264Decodable: async () => true,
-  probeCapabilities: async () => ({ codecs: { h264: true } }),
+  probeCapabilities: () => capabilities(),
 }));
 
 beforeEach(() => {
+  capabilities = async () => ({ codecs: { h264: true } });
   localStorage.clear();
   vi.mocked(authApi.postDevice).mockReset().mockResolvedValue({} as never);
 });
@@ -25,6 +27,17 @@ describe("ensureDeviceProbe", () => {
     localStorage.setItem(key.replace("_v4", "_v3"), stamp);
     await ensureDeviceProbe("tok", "u1");
     expect(authApi.postDevice).toHaveBeenCalledTimes(1);
+    await ensureDeviceProbe("tok", "u1");
+    expect(authApi.postDevice).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets a hung probe go, so the next launch is not held by it", async () => {
+    vi.useFakeTimers();
+    capabilities = () => new Promise(() => {});
+    const first = ensureDeviceProbe("tok", "u1").catch((e: Error) => e);
+    await vi.advanceTimersByTimeAsync(20_001);
+    expect(await first).toMatchObject({ message: "device probe timed out" });
+    capabilities = async () => ({ codecs: { h264: true } });
     await ensureDeviceProbe("tok", "u1");
     expect(authApi.postDevice).toHaveBeenCalledTimes(1);
   });

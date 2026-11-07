@@ -24,3 +24,22 @@ export function fallbackReason(code: string): string | null {
   if (code === "no_webgpu") return "decoder_unsupported";
   return FALLBACK_REASONS.has(code) ? code : "internal";
 }
+
+const REMEMBER_PREFIX = "quasar.wt-fallback.";
+
+/** Keeps a session on WebRTC across a reload of this tab, so each reload does not retry WebTransport. */
+export function rememberFallback(sessionId: string, reason: string): void {
+  try {
+    sessionStorage.setItem(REMEMBER_PREFIX + sessionId, reason);
+  } catch {
+    /* Storage blocked: a reload retries WebTransport, which falls back again. */
+  }
+}
+
+export function rememberedFallback(sessionId: string | undefined): string | null {
+  try {
+    return sessionId ? sessionStorage.getItem(REMEMBER_PREFIX + sessionId) : null;
+  } catch {
+    return null;
+  }
+}

@@ -385,3 +385,26 @@ describe("probeWebCodecs and probeWebGpu (amendment 54)", () => {
     expect(await probeWebGpu()).toEqual({ available: false, features: [] });
   });
 });
+
+describe("probeCapabilities on a link or browser where a step hangs", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("resolves within the bounds, with the hung steps unknown", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", () => new Promise(() => {}));
+    vi.stubGlobal("requestAnimationFrame", () => 0); // a background tab never draws a frame
+    vi.stubGlobal("navigator", { ...navigator, gpu: { requestAdapter: () => new Promise(() => {}) } });
+    vi.stubGlobal("VideoDecoder", Object.assign(function () {}, { isConfigSupported: () => new Promise(() => {}) }));
+    const done = vi.fn();
+    const result = probeCapabilities().then((c) => (done(), c));
+    await vi.advanceTimersByTimeAsync(9_500);
+    expect(done).toHaveBeenCalled();
+    const caps = await result;
+    expect(caps.rtt_ms).toBeNull();
+    expect(caps.bandwidth_kbps).toBeNull();
+    expect(caps.webcodecs).toBeUndefined();
+    expect(caps.webgpu).toBeUndefined();
+    expect(caps.display.refresh_hz).toBeUndefined();
+    expect(caps.display.width).toBe(screen.width);
+  });
+});

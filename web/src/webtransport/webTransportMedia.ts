@@ -24,10 +24,11 @@ const WT_PROTO = 1;
 const NOT_READY_RETRY_MS = 250;
 /** How long connect keeps retrying an agent that says it is not ready. */
 export const CONNECT_DEADLINE_MS = 60_000;
-/** How long connect waits on an agent that has said nothing: a handshake that never finishes, or
- *  attempts that end with no answer. Well under the loader's give-up time, so the page can fall
+/** How long connect waits for the WebTransport handshake. A host that completed it is reachable,
+ *  so attempts after that (not ready, or an answer Chrome dropped) are not bounded by this: they
+ *  run to {@link CONNECT_DEADLINE_MS}. Well under the loader's give-up time, so the page can fall
  *  back to WebRTC (control-api.md §Transport fallback) while the launch is still waiting. */
-export const UNREACHABLE_DEADLINE_MS = 10_000;
+export const HANDSHAKE_DEADLINE_MS = 10_000;
 /** One attempt's wait for its answer; the agent closes a connection with no `hello` at 5 s. */
 const ANSWER_TIMEOUT_MS = 10_000;
 /** How long a connection that failed without an answer gets to report its close code. */
@@ -51,7 +52,7 @@ const CLOSE_REFUSALS: Record<number, string> = {
 /** How one attempt ended. `retry`: the agent is not ready, or the connection failed with no
  *  code, which is how the agent's refusal can arrive (its teardown races the `error`
  *  message, and Chrome may fail the connection before the page reads it). */
-type Answer = { kind: "ack" } | { kind: "retry"; heard: boolean } | { kind: "refused"; code: string };
+type Answer = { kind: "ack" } | { kind: "retry" } | { kind: "refused"; code: string };
 
 export interface WebTransportMediaOptions {
   sessionId: string;
@@ -127,8 +128,6 @@ export class WebTransportMedia implements MediaTransport {
 
   async connect(sink: MediaSink): Promise<void> {
     const deadline = this.now() + CONNECT_DEADLINE_MS;
-    /** The last time the agent answered, or the start. */
-    let heardAt = this.now();
     let reminted = false;
     for (;;) {
       if (this.closed) throw new TransportError("closed");
@@ -136,8 +135,6 @@ export class WebTransportMedia implements MediaTransport {
       const answer = await this.attempt(sink);
       if (answer.kind === "ack") return;
       if (answer.kind === "retry") {
-        if (answer.heard) heardAt = this.now();
-        else if (this.now() - heardAt >= UNREACHABLE_DEADLINE_MS) throw new TransportError("connect_timeout");
         await this.sleep(NOT_READY_RETRY_MS);
         if (this.now() - this.tokenAt >= TOKEN_REFRESH_AGE_MS) await this.remint();
         continue;
@@ -236,12 +233,16 @@ export class WebTransportMedia implements MediaTransport {
     /** The answer a connection that ended without a message gave, read off its close code. */
     const fromClose = async (): Promise<Answer> => {
       const code = await Promise.race([closeCode, after(CLOSE_CODE_WAIT_MS, null)]);
-      return abandon(code === null || code === 0 ? { kind: "retry", heard: false } : refused(CLOSE_REFUSALS[code] ?? "internal"));
+      return abandon(code === null || code === 0 ? { kind: "retry" } : refused(CLOSE_REFUSALS[code] ?? "internal"));
     };
 
     try {
       // A blocked UDP port can leave the handshake pending for the browser's own, longer, timeout.
-      const ready = await Promise.race([wt.ready.then(() => true), after(UNREACHABLE_DEADLINE_MS, false)]);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const ready = await Promise.race([
+        wt.ready.then(() => true),
+        new Promise<boolean>((r) => void (timer = setTimeout(() => r(false), HANDSHAKE_DEADLINE_MS))),
+      ]).finally(() => clearTimeout(timer));
       if (!ready) return abandon(refused(this.closed ? "closed" : "connect_timeout"));
     } catch {
       // The handshake or the certificate failed (another try meets the same), or close() ended it.
@@ -293,7 +294,7 @@ export class WebTransportMedia implements MediaTransport {
     if (first === null) return fromClose();
     if (first.type === "error") {
       const code = typeof first.code === "string" ? first.code : "internal";
-      return abandon(code === "session_not_ready" ? { kind: "retry", heard: true } : refused(code));
+      return abandon(code === "session_not_ready" ? { kind: "retry" } : refused(code));
     }
     if (first.type !== "hello_ack") return abandon(refused("internal"), { closeCode: 4400, reason: "expected hello_ack" });
     if (first.wt_proto !== WT_PROTO) {

@@ -30,6 +30,26 @@ function randomUuidV4(): string {
     .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
 }
 
+/** Per-step bounds for {@link probeCapabilities}: a step that hangs (a stalled link, a background
+ *  tab that never draws a frame, a GPU adapter that never answers) is reported unknown, so the
+ *  record is still posted and stamped instead of re-probed at every launch. */
+const PROBE_BOUND_MS = { rtt: 4_000, bandwidth: 8_000, display: 2_000, codecs: 2_000 } as const;
+
+/** `p`'s value, or `fallback` once `ms` has passed. Never rejects. */
+export function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    p.catch(() => fallback),
+    new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(fallback), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/** Cancels a probe's request after `ms`; absent where the browser lacks `AbortSignal.timeout`. */
+const abortAfter = (ms: number): AbortSignal | undefined =>
+  typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(ms) : undefined;
+
 /** Returns the stable device key, creating and persisting it if absent. */
 export function getOrCreateDeviceKey(): string {
   let key = localStorage.getItem(DEVICE_KEY_STORAGE_KEY);
@@ -272,11 +292,11 @@ function probeMaxDecodeHeight(): number {
  */
 async function probeRttMs(): Promise<number | null> {
   try {
-    await fetch("/health", { method: "HEAD", cache: "no-store" }); // warm the connection
+    await fetch("/health", { method: "HEAD", cache: "no-store", signal: abortAfter(PROBE_BOUND_MS.rtt) }); // warm the connection
     let best = Infinity;
     for (let i = 0; i < 3; i++) {
       const t0 = performance.now();
-      const res = await fetch("/health", { method: "HEAD", cache: "no-store" });
+      const res = await fetch("/health", { method: "HEAD", cache: "no-store", signal: abortAfter(PROBE_BOUND_MS.rtt) });
       const t1 = performance.now();
       if (!res.ok && res.status !== 404) return null;
       best = Math.min(best, t1 - t0);
@@ -368,7 +388,7 @@ async function probeBandwidthKbps(): Promise<number | null> {
     const target = scripts.find((s) => s.includes("/assets/")) ?? scripts[0];
     const url = `${target}${target.includes("?") ? "&" : "?"}probe=${Date.now()}`;
 
-    const res = await fetch(url, { cache: "no-store" });
+    const res = await fetch(url, { cache: "no-store", signal: abortAfter(PROBE_BOUND_MS.bandwidth) });
     await res.arrayBuffer(); // drain the body so responseEnd is stamped
     if (!res.ok) return null;
 
@@ -471,12 +491,12 @@ function probePlatform(): string {
   return navigator.platform || "unknown";
 }
 
+function displayGeometry(): DisplayInfo {
+  return { width: screen.width, height: screen.height, device_pixel_ratio: window.devicePixelRatio || 1 };
+}
+
 async function probeDisplay(): Promise<DisplayInfo> {
-  const info: DisplayInfo = {
-    width: screen.width,
-    height: screen.height,
-    device_pixel_ratio: window.devicePixelRatio || 1,
-  };
+  const info = displayGeometry();
   const hz = displayRefreshToReport(await sampleRefreshHz(), probeBrowser().name);
   if (hz != null) info.refresh_hz = hz;
   return info;
@@ -686,12 +706,13 @@ export interface NativeCapabilities extends Omit<DeviceCapabilities, "client_typ
 export async function probeCapabilities(): Promise<DeviceCapabilities> {
   const [h264Decodable, rttMs, bandwidthKbps, display, codecsDetail, webcodecs, webgpu] = await Promise.all([
     probeH264Decodable(),
-    probeRttMs(),
-    probeBandwidthKbps(),
-    probeDisplay(),
-    probeCodecsDetail(),
-    probeWebCodecs(),
-    probeWebGpu(),
+    withTimeout(probeRttMs(), PROBE_BOUND_MS.rtt + 1_000, null),
+    withTimeout(probeBandwidthKbps(), PROBE_BOUND_MS.bandwidth + 1_000, null),
+    // requestAnimationFrame never fires in a background tab: geometry without a refresh rate then.
+    withTimeout(probeDisplay(), PROBE_BOUND_MS.display, displayGeometry()),
+    withTimeout(probeCodecsDetail(), PROBE_BOUND_MS.codecs, {} as CodecsDetail),
+    withTimeout<WebCodecsProbe | undefined>(probeWebCodecs(), PROBE_BOUND_MS.codecs, undefined),
+    withTimeout<{ available: boolean; features: string[] } | undefined>(probeWebGpu(), PROBE_BOUND_MS.codecs, undefined),
   ]);
 
   return {

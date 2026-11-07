@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fallbackReason } from "./fallback";
+import { fallbackReason, rememberedFallback, rememberFallback } from "./fallback";
 
 describe("fallbackReason", () => {
   it.each([
@@ -22,5 +22,16 @@ describe("fallbackReason", () => {
     expect(fallbackReason("no_webgpu")).toBe("decoder_unsupported");
     expect(fallbackReason("gpu_failed")).toBe("internal");
     expect(fallbackReason("bad_request")).toBe("internal");
+  });
+});
+
+describe("rememberFallback", () => {
+  it("keeps the reason per session id for this tab", () => {
+    sessionStorage.clear();
+    expect(rememberedFallback("s1")).toBeNull();
+    rememberFallback("s1", "connect_timeout");
+    expect(rememberedFallback("s1")).toBe("connect_timeout");
+    expect(rememberedFallback("s2")).toBeNull();
+    expect(rememberedFallback(undefined)).toBeNull();
   });
 });

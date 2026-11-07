@@ -68,6 +68,8 @@ interface SessionLoaderProps {
   pcConnected?: boolean;
   firstFrame?: boolean;
   inputOpen?: boolean;
+  /** A line for the status slot under the title, in place of the boot line (e.g. "Switching to WebRTC…"). */
+  notice?: string;
   /** The host refused this page's takeover: its copy replaces any stall, at once. */
   takeoverRefused?: TakeoverRefusal | null;
 }
@@ -91,6 +93,7 @@ export function SessionLoader({
   firstFrame = false,
   inputOpen = false,
   takeoverRefused = null,
+  notice,
 }: SessionLoaderProps) {
   const bootLine = useBootLine(appLaunchState === "starting", shaderPercent);
   const { step, word, verb } = derivePhase({
@@ -178,6 +181,14 @@ export function SessionLoader({
   // "keep waiting" and the session becoming running.
   if (waitAgainRef.current !== waitAgain) {
     waitAgainRef.current = waitAgain;
+    transportStartRef.current = sessionRunning ? Date.now() : null;
+  }
+  // A switch of transport (WebTransport falling back to WebRTC) starts both clocks over: the new
+  // transport has not had its own budget yet, and the old one's elapsed time is not its failure.
+  const transportRef = useRef(transport);
+  if (transportRef.current !== transport) {
+    transportRef.current = transport;
+    phaseStartRef.current = Date.now();
     transportStartRef.current = sessionRunning ? Date.now() : null;
   }
   if (sessionRunning && transportStartRef.current === null) transportStartRef.current = Date.now();
@@ -302,7 +313,7 @@ export function SessionLoader({
               <span className={changing ? "sl-stage changing" : "sl-stage"}>{visible.word}</span>
             </h1>
             {/* Always in the layout so the title does not jump when the line appears. */}
-            <p className="sl-shaders" aria-live="off" aria-hidden={bootLine.decorative || undefined}>{bootLine.text}</p>
+            <p className="sl-shaders" aria-live={notice ? "polite" : "off"} aria-hidden={(!notice && bootLine.decorative) || undefined}>{notice ?? bootLine.text}</p>
             <div className="sl-status-foot">
               <GlyphRail step={visible.step} />
             </div>

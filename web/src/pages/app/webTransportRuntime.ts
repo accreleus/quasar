@@ -196,20 +196,25 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       onFatal: (reason: DecodeFailure) => fail(reason),
     });
     stage = s;
-    await connectTransport(cfg.coords);
+    await connectTransport(cfg.coords, false);
   }
 
-  /** Opens a transport with `coords` and returns once it is up, or the view has failed. */
-  async function connectTransport(coords: WebTransportCoords): Promise<void> {
+  /** Opens a transport with `coords` and returns once it is up, or the view has failed.
+   *  A `reconnecting` one that fails reports `stream_lost`: the stream was up before. */
+  async function connectTransport(coords: WebTransportCoords, reconnecting: boolean): Promise<void> {
+    // A mint that was in flight when the view ended must not open a connection.
+    if (destroyed || failed) return;
     const t = deps.createTransport({ sessionId: cfg.sessionId, coords, mintToken: mintCoords });
     transport = t;
     try {
       await t.connect({
         config: (c) => {
+          if (destroyed || failed || t !== transport) return;
           negotiatedCodec = CODEC_MIME[c.codec] ?? c.codec;
           stage?.config(c);
         },
         unit: (u) => {
+          if (destroyed || failed || t !== transport) return;
           bytesTotal += u.data.length;
           stage?.unit(u);
         },
@@ -222,7 +227,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         takenOver();
       } else if (code !== "closed") {
         if (code === "session_ended") cfg.callbacks.onDisconnectSuspected();
-        fail(code);
+        fail(reconnecting && code !== "session_ended" ? "stream_lost" : code);
       }
       return;
     }
@@ -259,7 +264,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     transport = null; // the closed one's own `end` is then not this view's
     t.close();
     set({ status: "reconnecting over WebTransport…", channelOpen: false });
-    mintCoords().then(connectTransport, () => fail("auth_failed"));
+    mintCoords().then((c) => connectTransport(c, true), () => fail("stream_lost"));
   }
 
   return {

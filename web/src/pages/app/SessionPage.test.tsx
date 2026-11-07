@@ -1385,4 +1385,34 @@ describe("SessionPage — WebTransport falls back to WebRTC (A11)", () => {
     expect(lastTransport).toBeNull();
     expect((lastDrawerProps as Record<string, unknown>).transportFallbackReason).toBeNull();
   });
+
+  it("keeps the status line on \"Switching to WebRTC…\" until the new signaling is minted, and remembers the fallback", async () => {
+    let release!: (v: unknown) => void;
+    mintSignalingToken.mockReturnValue(new Promise((r) => (release = r)));
+    renderPage({ webtransport: wt });
+    await act(async () => {
+      lastWtCallbacks!.onFallback("connect_timeout");
+    });
+    expect(screen.getAllByText("Switching to WebRTC…").length).toBeGreaterThan(0);
+    expect(sessionStorage.getItem("quasar.wt-fallback.s1")).toBe("connect_timeout");
+    await act(async () => {
+      release({ signaling: { url: "wss://fresh", token: "fresh" } });
+    });
+    expect(lastTransport).not.toBeNull();
+  });
+
+  it("goes straight to WebRTC on a reload after a fallback: no WebTransport, no second report, a fresh token", async () => {
+    sessionStorage.setItem("quasar.wt-fallback.s1", "connect_timeout");
+    renderPage({ webtransport: wt });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(lastWtCallbacks).toBeNull();
+    expect(emitTransportFallback).not.toHaveBeenCalled();
+    expect(mintSignalingToken).toHaveBeenCalledWith("t", "s1");
+    expect(lastTransport).not.toBeNull();
+    const hud = lastDrawerProps as Record<string, unknown>;
+    expect(hud.transport).toBe("webrtc");
+    expect(hud.transportFallbackReason).toBe("connect_timeout");
+  });
 });
