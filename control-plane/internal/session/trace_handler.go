@@ -61,6 +61,10 @@ func (h *Handler) handlePostTraceEvents(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Canonical spelling (#1100): the path id may differ in case from the row's, and
+	// every limiter and in-memory counter below must share one key per session.
+	id = sess.ID
+
 	if h.statsLimiter != nil && !h.statsLimiter.allow(id+"/trace") {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited,
 			"too many trace event posts; slow down")
@@ -192,6 +196,7 @@ func (h *Handler) handlePostTraceClock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	id = sess.ID // canonical spelling (#1100)
 	if h.statsLimiter != nil && !h.statsLimiter.allow(id+"/trace/clock") {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited,
 			"too many clock posts; slow down")
