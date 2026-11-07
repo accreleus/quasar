@@ -7,7 +7,7 @@
 
 import { useState } from "react";
 import * as adminApi from "../../../api/admin";
-import type { LaunchProfile, ProfilePolicyResponse, StreamProfile } from "../../../api/types";
+import type { LaunchProfile, LaunchProfileTransport, ProfilePolicyResponse, StreamProfile } from "../../../api/types";
 import { ApiError } from "../../../api/client";
 import { useAuth } from "../../../auth/context";
 import { ActionsMenu, type ActionsMenuItem, type ActionsMenuSeparator } from "../../../components/ActionsMenu";
@@ -24,6 +24,9 @@ import { isLaunchProfileInUse } from "./launchProfileHelpers";
 import { LaunchProfileDrawer } from "./LaunchProfileDrawer";
 import { moveRung, RungEditor } from "./RungEditor";
 import { useSectionHead } from "../../../components/shell/sectionHead";
+import { SettingRow } from "../settings/SettingRow";
+
+const KNOWN_TRANSPORTS: string[] = ["webrtc", "webtransport", "webtransport_opt_in"];
 
 const DEFAULT_POLICY: ProfilePolicyResponse = { global_default_profile_id: null, user_overrides_allowed: true };
 
@@ -178,6 +181,7 @@ function LaunchProfileCard({
   const { addToast } = useToast();
   const [busy, setBusy] = useState(false);
 
+  const transport: string = profile.transport ?? "webrtc";
   const rungs = profile.rungs.map((r) => r.stream_profile);
   const availableToAdd = streamProfiles.filter((sp) => !rungs.some((r) => r.id === sp.id));
   const appCount = profile.used_by?.apps.length ?? 0;
@@ -199,13 +203,15 @@ function LaunchProfileCard({
     },
   ];
 
-  const persist = async (nextRungIds: string[]) => {
+  const persist = async (nextRungIds: string[], transport?: LaunchProfileTransport) => {
     setBusy(true);
     try {
+      // `transport` absent = unchanged (control-api.md), so a rung edit never touches it.
       const saved = await adminApi.updateLaunchProfile(token, profile.id, {
         display_name: profile.display_name,
         description: profile.description,
         rungs: nextRungIds,
+        ...(transport && { transport }),
       });
       onChanged(saved);
       for (const w of saved.warnings ?? []) {
@@ -249,6 +255,28 @@ function LaunchProfileCard({
             void persist([...rungs.map((r) => r.id), profileId]);
           }}
         />
+        <div className="eyebrow lp-group">Delivery</div>
+        <SettingRow
+          label="Transport"
+          hint="WebRTC is the default and the fallback. WebTransport is experimental: if it can’t connect, the session starts on WebRTC."
+        >
+          <select
+            className="select"
+            aria-label={`Transport for ${profile.display_name}`}
+            value={transport}
+            // A value this UI does not know (a newer server) is shown as itself and left alone.
+            disabled={busy || !KNOWN_TRANSPORTS.includes(transport)}
+            onChange={(e) => void persist(rungs.map((r) => r.id), e.target.value as LaunchProfileTransport)}
+          >
+            <option value="webrtc">WebRTC</option>
+            <option value="webtransport">WebTransport (experimental)</option>
+            {/* Set through the API for the developer URL switch; kept visible so it is never silently overwritten. */}
+            {transport === "webtransport_opt_in" && (
+              <option value="webtransport_opt_in">WebTransport on request (developer)</option>
+            )}
+            {!KNOWN_TRANSPORTS.includes(transport) && <option value={transport}>{transport}</option>}
+          </select>
+        </SettingRow>
       </div>
     </div>
   );

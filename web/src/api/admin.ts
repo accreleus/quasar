@@ -33,6 +33,8 @@ import type {
   AdminLaunchProfilesResponse,
   LaunchProfile,
   LaunchProfileWrite,
+  HostWebTransport,
+  HostWebTransportWrite,
   DiagnosticBundle,
   SecretResponse,
   SecretsResponse,
@@ -626,6 +628,18 @@ export function listHosts(token: string, cursor?: string): Promise<HostsResponse
 
 export function getHost(token: string, id: string): Promise<{ host: Host }> {
   return apiFetch<{ host: Host }>(`/hosts/${id}`, { token });
+}
+
+export function getHostWebTransport(token: string, id: string, signal?: AbortSignal): Promise<HostWebTransport> {
+  return apiFetch<HostWebTransport>(`/admin/hosts/${id}/webtransport`, { token, signal });
+}
+
+export function setHostWebTransport(
+  token: string,
+  id: string,
+  body: HostWebTransportWrite,
+): Promise<HostWebTransport> {
+  return apiFetch<HostWebTransport>(`/admin/hosts/${id}/webtransport`, { method: "PATCH", body, token });
 }
 
 export function getHostGPUs(token: string, hostId: string): Promise<GPUsResponse> {

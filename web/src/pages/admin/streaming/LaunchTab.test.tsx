@@ -357,4 +357,66 @@ describe("LaunchTab", () => {
       rungs: ["h264", "av1-new"],
     });
   });
+
+  it("saves the Delivery transport as soon as it changes, with the rungs untouched", async () => {
+    mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ transport: "webtransport" }));
+    renderPage();
+    await act(async () => {});
+
+    const select = screen.getByRole("combobox", { name: "Transport for Balanced" });
+    expect(select).toHaveValue("webrtc"); // an absent field reads as webrtc
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "webtransport" } });
+    });
+
+    expect(mocked.updateLaunchProfile).toHaveBeenCalledWith("tok", "lp1", {
+      display_name: "Balanced",
+      description: "",
+      rungs: ["sp1"],
+      transport: "webtransport",
+    });
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webtransport");
+  });
+
+  it("keeps a developer opt-in profile visible, and a rung edit leaves its transport alone", async () => {
+    mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ transport: "webtransport_opt_in" })] });
+    mocked.listStreamProfiles.mockResolvedValue({
+      items: [streamProfile(), streamProfile({ id: "av1-new", codec: "av1", display_name: "AV1 new" })],
+    });
+    mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ transport: "webtransport_opt_in" }));
+    renderPage();
+    await act(async () => {});
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webtransport_opt_in");
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("combobox", { name: "Add a stream profile" }), { target: { value: "av1-new" } });
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "Add" }).click();
+    });
+    expect(mocked.updateLaunchProfile).toHaveBeenCalledTimes(1);
+    expect(mocked.updateLaunchProfile.mock.calls[0][2]).not.toHaveProperty("transport");
+  });
+
+  it("shows a transport it does not know as itself and disabled, not as WebRTC", async () => {
+    mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ transport: "quic" as never })] });
+    renderPage();
+    await act(async () => {});
+    const select = screen.getByRole("combobox", { name: "Transport for Balanced" });
+    expect(select).toHaveValue("quic");
+    expect(select).toBeDisabled();
+    expect(within(select).getByRole("option", { name: "quic" })).toBeInTheDocument();
+  });
+
+  it("puts the select back and toasts when the transport save fails", async () => {
+    mocked.updateLaunchProfile.mockRejectedValue(new ApiError(500, "internal", "disk full"));
+    renderPage();
+    await act(async () => {});
+    const select = screen.getByRole("combobox", { name: "Transport for Balanced" });
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "webtransport" } });
+    });
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webrtc");
+    expect(await screen.findByText("disk full")).toBeInTheDocument();
+  });
 });
