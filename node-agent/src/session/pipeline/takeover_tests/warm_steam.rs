@@ -1209,10 +1209,11 @@ fn a_rebuild_with_a_smaller_size_builds_at_the_built_size_and_streams() {
     end(session, &mut b);
 }
 
-// A caps failure on the new encoder is the hardware's answer: `encoder`, deterministic,
-// one terminal report, and nothing of the adoption after it.
+// A caps failure on the new encoder answers `encoder`, one terminal report, and nothing of
+// the adoption after it. It arrives as a `not-negotiated` flow, which a Vulkan encoder's
+// failed device-memory allocation also produces, so it is not remembered (amendment 59).
 #[test]
-fn a_rebuild_whose_caps_fail_answers_a_deterministic_encoder_failure() {
+fn a_rebuild_whose_caps_fail_answers_an_encoder_failure_that_is_not_remembered() {
     if !live_webrtc_available() {
         return;
     }
@@ -1233,7 +1234,7 @@ fn a_rebuild_whose_caps_fail_answers_a_deterministic_encoder_failure() {
     let failure = failure.expect("the rebuild answered");
     assert_eq!(
         (failure.step, failure.deterministic),
-        ("encoder", true),
+        ("encoder", false),
         "{failure:?}"
     );
     assert_eq!(terminals(&session.log, at), 1, "{:?}", &session.log[at..]);
