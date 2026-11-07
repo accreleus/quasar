@@ -84,6 +84,10 @@ struct State {
     pending_key: bool,
 }
 
+/// The Gamepad API exposes at most four slots; a `gp` for a higher `i` is dropped, so a client
+/// cannot grow the per-pad table.
+const MAX_PADS: u64 = 4;
+
 /// The client whose input the devices take: none (`0`) or its id, and the buttons of its last
 /// reliable `gp` per pad, since a datagram `gp` carries axes only.
 #[derive(Default)]
@@ -138,6 +142,9 @@ impl Media {
         };
         if event.get("t").and_then(|t| t.as_str()) == Some("gp") {
             let pad = event.get("i").and_then(|i| i.as_u64()).unwrap_or(0);
+            if pad >= MAX_PADS {
+                return;
+            }
             if datagram {
                 let Some(buttons) = typing.pads.get(&pad) else {
                     return;
@@ -150,6 +157,11 @@ impl Media {
             }
         }
         (self.input.event)(&event.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remembered_pads(&self) -> usize {
+        self.typing.lock().unwrap().pads.len()
     }
 
     /// Lift everything the devices hold and forget the pads. Called with `typing` locked.
@@ -185,7 +197,7 @@ impl Media {
             gone: gone.clone(),
             resync: false,
         });
-        if let Some(old) = &displaced {
+        if let Some(old) = displaced {
             let _ = old.gone.set(Gone::TakenOver);
         }
         st.want_key = true;
@@ -194,10 +206,12 @@ impl Media {
             // The new client's input starts from nothing held: what its predecessor held is
             // lifted now, before the new client can send, and its late input is dropped.
             let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
-            typing.client = id;
-            if displaced.is_some() {
+            // A predecessor that has not finished leaving (`detach` clears the client, then
+            // takes this lock) still owns the devices: whatever it holds is lifted either way.
+            if typing.client != 0 {
                 self.release(&mut typing);
             }
+            typing.client = id;
         }
         self.keyframe();
         Some(Attached {
@@ -218,6 +232,8 @@ impl Media {
                 st.client = None;
             }
         }
+        #[cfg(test)]
+        crate::webtransport::tests::detach_gap();
         let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
         if typing.client == id {
             typing.client = 0;

@@ -308,6 +308,45 @@ describe("the ping clock", () => {
     expect(made[0].terminated).toBe(true);
   });
 
+  it("falls back to a page timer when the Worker's script fails to load, and stops it with the ticker", () => {
+    vi.useFakeTimers();
+    const made: { onerror: (() => void) | null; terminated: boolean }[] = [];
+    vi.stubGlobal(
+      "Worker",
+      class {
+        onerror: (() => void) | null = null;
+        onmessage = null;
+        terminated = false;
+        constructor() {
+          made.push(this);
+        }
+        postMessage() {}
+        terminate() {
+          this.terminated = true;
+        }
+      },
+    );
+    const ticks: number[] = [];
+    const stop = workerTicker(1000, () => ticks.push(1));
+    vi.advanceTimersByTime(3000);
+    expect(ticks).toHaveLength(0); // the Worker is loading
+    made[0].onerror?.(); // 404, wrong MIME type or policy
+    expect(made[0].terminated).toBe(true);
+    vi.advanceTimersByTime(2500);
+    expect(ticks).toHaveLength(2);
+    stop();
+    vi.advanceTimersByTime(5000);
+    expect(ticks).toHaveLength(2);
+
+    // A failure after the ticker was stopped starts nothing.
+    made.length = 0;
+    const stopped = workerTicker(1000, () => ticks.push(1));
+    stopped();
+    made[0].onerror?.();
+    vi.advanceTimersByTime(5000);
+    expect(ticks).toHaveLength(2);
+  });
+
   it("falls back to a page timer when the page may not start a Worker", () => {
     vi.useFakeTimers();
     vi.stubGlobal("Worker", class {

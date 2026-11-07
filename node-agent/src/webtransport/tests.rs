@@ -245,6 +245,18 @@ impl Agent {
 }
 
 thread_local! {
+    /// Run once by `Media::detach` between clearing the client and taking the input lock.
+    static DETACH_GAP: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// `Media::detach`'s seam: the moment a test can attach a successor into the gap.
+pub(super) fn detach_gap() {
+    if let Some(run) = DETACH_GAP.with(|g| g.borrow_mut().take()) {
+        run();
+    }
+}
+
+thread_local! {
     /// Armed by a test on its own thread. The tests run on current-thread runtimes, so the
     /// next `close_session` there is the one it means: it holds until `release`.
     static CLOSE_HOLD: RefCell<Option<(oneshot::Receiver<()>, oneshot::Sender<()>)>> =
@@ -668,6 +680,54 @@ fn only_the_attached_clients_input_reaches_the_devices() {
     assert_eq!(released.load(SeqCst), 2);
     media.input_event(new.id, &key(33, true), false);
     assert_eq!(events.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn a_client_attaching_while_its_predecessor_is_still_leaving_starts_from_clean_devices() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::Ordering::SeqCst;
+    let (input, events, released) = recorded();
+    let media = ready_media_with(input);
+    let key =
+        |code: u32, pressed: bool| json!({"t": "k", "code": code, "pressed": pressed}).to_string();
+
+    let a = media.attach().unwrap();
+    media.input_event(a.id, &key(30, true), false);
+
+    // B attaches after A's detach cleared the client and before it took the input lock.
+    let b: Rc<RefCell<Option<media::Attached>>> = Rc::default();
+    let (m, slot) = (media.clone(), b.clone());
+    DETACH_GAP.with(|g| *g.borrow_mut() = Some(Box::new(move || *slot.borrow_mut() = m.attach())));
+    media.detach(a.id);
+    let b = b.borrow_mut().take().expect("B attached in the gap");
+    assert_eq!(
+        released.load(SeqCst),
+        1,
+        "A's held key was lifted when B attached"
+    );
+
+    // A's late detach step lifts nothing of B's.
+    media.input_event(b.id, &key(32, true), false);
+    assert_eq!(events.lock().unwrap().len(), 2);
+    media.detach(b.id);
+    assert_eq!(released.load(SeqCst), 2);
+}
+
+#[test]
+fn a_gamepad_slot_beyond_the_api_limit_is_dropped() {
+    let (input, events, _) = recorded();
+    let media = ready_media_with(input);
+    let id = media.attach().unwrap().id;
+    let gp = |i: u32| json!({"t": "gp", "i": i, "buttons": [0], "axes": [0.0]}).to_string();
+    for i in [4, 1000, u32::MAX] {
+        media.input_event(id, &gp(i), false);
+        media.input_event(id, &gp(i), true);
+    }
+    assert!(events.lock().unwrap().is_empty());
+    media.input_event(id, &gp(3), false);
+    assert_eq!(events.lock().unwrap().len(), 1);
+    assert_eq!(media.remembered_pads(), 1, "one pad remembered");
 }
 
 #[tokio::test]
