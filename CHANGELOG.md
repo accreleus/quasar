@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **`QUASAR_RTP_MTU` can now be set on an owned install (#1168).** The recovery recipe did not carry it, so `reconfigure` refused it; it is now an agent variable and passes through Compose too.
 - **Video now plays over VPN, mobile and IPv6 tunnels with a 1280-byte MTU (#1131).** The agent's RTP packets were up to about 1430 bytes before SRTP, UDP and IP, so such a path dropped every full-size video packet: black video with sound. RTP packets are now at most 1200 bytes, header extensions and FEC included; `QUASAR_RTP_MTU` changes the limit (`900`-`1436`).
 
 ### Security
