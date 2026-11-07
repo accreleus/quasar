@@ -11,7 +11,14 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		// scripts and MUST be recomputed when either script's text changes, or the
 		// browser CSP-blocks it silently. TestSecurityHeaders checks only that the
 		// directive is present, never that the hashes are current.
-		h.Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-JyTIELzOXtUuYYDzvKo5xumSZoFM9u+g1oWa3B+7nGo=' 'sha256-EcGgvKpbPwFbv8Ad/fJ8ZDUJx//FEfHU+grt4Hmvxjs='; connect-src 'self' ws: wss:; media-src 'self' blob:")
+		//
+		// connect-src allows https: because a WebTransport session dials the agent, a
+		// different origin (ADR 0010): its own listener or the admin's public URL, either
+		// of which can change after the page loaded (#1147). WebTransport is governed by
+		// connect-src, so without https: Chrome refuses every such session. An injected
+		// script gains no capability it lacked: ws:/wss: already reached any host. And
+		// script-src stays pinned to 'self' and two hashes, so injection itself is the bar.
+		h.Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-JyTIELzOXtUuYYDzvKo5xumSZoFM9u+g1oWa3B+7nGo=' 'sha256-EcGgvKpbPwFbv8Ad/fJ8ZDUJx//FEfHU+grt4Hmvxjs='; connect-src 'self' ws: wss: https:; media-src 'self' blob:")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")

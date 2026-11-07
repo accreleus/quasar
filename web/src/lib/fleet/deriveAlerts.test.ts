@@ -186,4 +186,17 @@ describe("needsAttention", () => {
       needsAttention({ ...host, readiness: [...host.readiness, { id: "media_probe_gpu1", status: "fail", summary: "no" }] }),
     ).toBe(true);
   });
+
+  // #1056: no session uses PyroWave yet, so a failed PyroWave probe is a warning, not a fault.
+  it("is false for a failed PyroWave codec probe, which raises a warning instead of a critical", () => {
+    const pyrowave = { id: "media_probe_gpu0_pyrowave", status: "fail", summary: "GPU 0 cannot encode pyrowave" };
+    const host = { ...online, storage: [], readiness: [pyrowave] };
+    expect(needsAttention(host)).toBe(false);
+    expect(deriveAlerts([host], [], NOW)).toEqual([
+      expect.objectContaining({ severity: "warning", body: "GPU 0 cannot encode pyrowave" }),
+    ]);
+    const both = { ...host, readiness: [pyrowave, { id: "media_probe_gpu0", status: "fail", summary: "no" }] };
+    expect(needsAttention(both)).toBe(true);
+    expect(deriveAlerts([both], [], NOW).map((a) => a.severity)).toEqual(["critical", "warning"]);
+  });
 });

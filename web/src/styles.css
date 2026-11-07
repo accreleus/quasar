@@ -99,6 +99,10 @@ textarea:focus-visible,
   -webkit-user-select: none;
   user-select: none;
 }
+/* A WebTransport session draws on a canvas of the same class; its <video> stays mounted. */
+.session-video[hidden] {
+  display: none;
+}
 .session-video[data-scaling-mode="cover"] {
   object-fit: cover;
 }
