@@ -2808,12 +2808,6 @@ async fn connect_and_run(
                     }
                     other => other,
                 };
-                if matches!(
-                    &event,
-                    SessionEvent::Stopped { .. } | SessionEvent::Failed(_) | SessionEvent::AppFailed { .. }
-                ) {
-                    mgr.runtime_ended_mid_restream(&session_id, evt_tx, diagnostic_tx);
-                }
                 let terminal = matches!(
                     &event,
                     SessionEvent::Stopped { .. }
@@ -2822,6 +2816,10 @@ async fn connect_and_run(
                 );
                 // A held runtime's end is its release, not a session failure.
                 let live = mgr.running.get(&session_id).is_none_or(|h| h.live());
+                // After `live`: a lost device mid-restream still counts toward the GPU fault.
+                if terminal {
+                    mgr.runtime_ended_mid_restream(&session_id, evt_tx, diagnostic_tx);
+                }
                 // Classify for the GPU-global detector BEFORE `relay` consumes the event. A
                 // pre-session device-open failure is GPU-global at once; a DEVICE_LOST only
                 // once ≥2 land in the window.
@@ -3900,6 +3898,20 @@ impl SessionManager {
     ) {
         let dropped = self.pending.len();
         self.pending.clear();
+        // As a pending start is dropped: the control plane may have reaped the play id, so
+        // a restream in flight relabels nothing and builds nothing. The runtime, already
+        // handed the adoption, is torn down as a declined one, its proof under its own id.
+        for (id, h) in self.running.iter_mut() {
+            if let Some(r) = h.restreaming.take() {
+                info!(
+                    token = "runtime-adopt-restream-reconnect",
+                    "session {}: reconnected while the runtime of {id} was moving to its \
+                     stream; the runtime is torn down and nothing is built",
+                    r.session_id
+                );
+                decline(h);
+            }
+        }
         self.gpu_inventory = gpu_inventory;
         self.vram_targets = vram_targets;
         // The cache indexes by position over the inventory, so it must be
@@ -11882,6 +11894,24 @@ mod tests {
         );
         assert_play_not_adopted(&mgr);
         assert!(warm.started.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_reconnect_mid_restream_relabels_nothing_and_builds_nothing() {
+        let (mut mgr, warm) = warm_manager();
+        restream_claim(&mut mgr, &warm);
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        mgr.begin_connection(Vec::new(), Vec::new());
+        assert_play_not_adopted(&mgr);
+        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
+        mgr.restreamed(
+            "k1",
+            Ok(Duration::from_millis(10)),
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert_play_not_adopted(&mgr);
+        assert!(warm.started.try_recv().is_err(), "nothing was built");
     }
 
     #[test]

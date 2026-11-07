@@ -644,6 +644,47 @@ func TestClaimAdoptsAcrossStreamSettingsAndTheReparkKeepsTheBuiltSize(t *testing
 	}
 }
 
+// A declined claim (the parked runtime's proof arrives while the play is live, as
+// when the agent builds fresh) adopted nothing: its park on exit takes the play's
+// own size, not the parked row's (amendment 59).
+func TestADeclinedClaimsReparkTakesThePlaysOwnSize(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.disp.setRestream(true)
+	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	k := f.park(t)
+	built := readStream(t, f.pool, k)
+	half := func(v int32) *int32 { h := v / 2; return &h }
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true,
+		IsAdmin: true, Override: StreamOverride{Width: half(built.Width), Height: half(built.Height)}})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	play := res.Session.ID
+	f.disp.waitFor(t, "start")
+	// The agent declined: the parked runtime's proof, then the fresh build's reports.
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	var adopts *string
+	must(t, f.pool.QueryRow(ctx, `SELECT adopt_session_id::text FROM sessions WHERE id = $1::uuid`, play).Scan(&adopts))
+	if adopts != nil {
+		t.Fatalf("declined play row still adopts %s", *adopts)
+	}
+	if got := f.holder(t); got != play {
+		t.Fatalf("hold = %q, want passed to the live play %s", got, play)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: play, State: "starting"})
+	f.running(t, play)
+	f.coord.AgentState(ctx, f.hostID, heldStop(play))
+	again := f.parkedID(t)
+	if again == "" {
+		t.Fatal("no park on exit")
+	}
+	small := readStream(t, f.pool, play)
+	if got := readStream(t, f.pool, again); got.Width != small.Width || got.Height != small.Height || got.FPS != small.FPS {
+		t.Fatalf("re-park stream %+v, want the play's own %dx%d@%d", got, small.Width, small.Height, small.FPS)
+	}
+}
+
 // Only a parked row a racing launch claimed reads as a lost claim (409 home_in_use);
 // one stopped by expiry or eviction in the window is a Steam restart (503).
 func TestAParkStoppedByExpiryInTheWindowIsASteamRestartNotHomeInUse(t *testing.T) {
