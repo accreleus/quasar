@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/compat"
@@ -104,5 +105,80 @@ func TestCompatToolsOnlyForTheSteamFamily(t *testing.T) {
 	}
 	if got := f.coord.compatToolsFor(f.steam); got == nil {
 		t.Error("the Steam parent got no compat_tools")
+	}
+}
+
+// lockedFor holds an exclusive lock from another connection until the test ends.
+func lockedFor(t *testing.T, f *warmFixture, sql string) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := f.pool.Begin(ctx)
+	must(t, err)
+	if _, err := tx.Exec(ctx, sql); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(ctx) })
+}
+
+func shortCompatTimeout(t *testing.T) {
+	t.Helper()
+	old := compatReadTimeout
+	compatReadTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { compatReadTimeout = old })
+}
+
+func TestASlowMappingReadFailsOpenWithoutBlocking(t *testing.T) {
+	f := compatFixture(t, true)
+	shortCompatTimeout(t)
+	lockedFor(t, f, `LOCK TABLE compat_tool_mappings IN ACCESS EXCLUSIVE MODE`)
+
+	start := time.Now()
+	got := f.coord.compatToolsFor(f.steam)
+	if got != nil {
+		t.Errorf("compat_tools = %+v after a read that timed out, want none", got)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("the read blocked for %v, want it cut at the timeout", d)
+	}
+}
+
+type compatEpoch struct{ agentws.HomeCommandEpoch }
+
+func (compatEpoch) SupportsCompatTools() bool { return true }
+
+func TestASlowRecordWriteDoesNotBlockTheAssign(t *testing.T) {
+	f := compatFixture(t, true)
+	_, id := parkedAssign(t, f)
+	shortCompatTimeout(t)
+	lockedFor(t, f, `SELECT 1 FROM sessions WHERE id = '`+id+`'::uuid FOR UPDATE`)
+
+	in := agentws.SessionAssignCmd{SessionID: id, CompatTools: &agentws.CompatToolsSpec{Mount: []string{}}}
+	start := time.Now()
+	out := f.coord.fitCompatTools(in, compatEpoch{})
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("the record write blocked for %v, want it cut at the timeout", d)
+	}
+	if out.CompatTools == nil {
+		t.Error("the assign lost compat_tools because the record write was slow")
+	}
+}
+
+// A failing compat read leaves the launch going through, with no compat_tools.
+func TestAFailingCompatReadLeavesTheLaunchGoingThrough(t *testing.T) {
+	f := compatFixture(t, true)
+	must(t, exec(t, f.pool, `ALTER TABLE compat_tool_mappings RENAME TO compat_tool_mappings_gone`))
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `ALTER TABLE compat_tool_mappings_gone RENAME TO compat_tool_mappings`)
+	})
+
+	a, id := parkedAssign(t, f)
+	if a.CompatTools != nil {
+		t.Errorf("compat_tools = %+v although the read failed", a.CompatTools)
+	}
+	f.disp.waitFor(t, "start")
+	var state string
+	must(t, f.pool.QueryRow(context.Background(), `SELECT state FROM sessions WHERE id = $1::uuid`, id).Scan(&state))
+	if state == "failed" || state == "stopped" {
+		t.Errorf("the session is %s, want the launch to go on", state)
 	}
 }

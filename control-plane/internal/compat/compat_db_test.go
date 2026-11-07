@@ -209,7 +209,7 @@ func TestSetDefaultAuditsAndClears(t *testing.T) {
 		}
 	}
 
-	// Setting the same value again is a no-op and writes no audit row.
+	// Setting the same value again is audited too: every accepted write is.
 	h.do("PUT", "/v1/admin/compat-tools/default", h.admin, `{"tool_id":"`+ten+`"}`)
 	code, _ = h.do("PUT", "/v1/admin/compat-tools/default", h.admin, `{"tool_id":null}`)
 	if code != http.StatusOK {
@@ -229,9 +229,9 @@ func TestSetDefaultAuditsAndClears(t *testing.T) {
 		}
 		got = append(got, action+"/"+target+" "+string(raw))
 	}
-	if len(got) != 2 || !strings.HasPrefix(got[0], "compat_tool.default.set/instance") ||
-		!strings.Contains(got[0], ten) || !strings.Contains(got[1], `"tool_id": null`) || !strings.Contains(got[1], ten) {
-		t.Errorf("audit rows = %q, want a set then a clear, each naming the tool", got)
+	if len(got) != 3 || !strings.HasPrefix(got[0], "compat_tool.default.set/instance") ||
+		!strings.Contains(got[0], ten) || !strings.Contains(got[1], ten) || !strings.Contains(got[2], `"tool_id": null`) || !strings.Contains(got[2], ten) {
+		t.Errorf("audit rows = %q, want a set, the same set again and a clear, each naming the tool", got)
 	}
 }
 
@@ -252,6 +252,9 @@ func TestSetDefaultRefusals(t *testing.T) {
 		"a missing key":            {`{}`, http.StatusBadRequest},
 		"an unknown key":           {`{"tool_id":null,"x":1}`, http.StatusBadRequest},
 		"not json":                 {`nope`, http.StatusBadRequest},
+		"trailing garbage":         {`{"tool_id":null} x`, http.StatusBadRequest},
+		"a stray closing brace":    {`{"tool_id":null}}`, http.StatusBadRequest},
+		"a second body":            {`{"tool_id":null}{"tool_id":null}`, http.StatusBadRequest},
 	} {
 		code, body := h.do("PUT", "/v1/admin/compat-tools/default", h.admin, c.body)
 		if code != c.code {

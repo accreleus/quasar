@@ -1,9 +1,16 @@
 package session
 
 import (
+	"context"
+	"time"
+
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/compat"
 )
+
+// compatReadTimeout bounds each launch-path compat query; slowness fails open like an error.
+// A var so a test can shorten it.
+var compatReadTimeout = 2 * time.Second
 
 // compatToolsFor is the session_assign.compat_tools of a Steam-family session, nil for any other
 // app. Fail-open: a failed read sends nothing and the session gets Steam's own default.
@@ -12,11 +19,16 @@ func (c *Coordinator) compatToolsFor(appID string) *agentws.CompatToolsSpec {
 	if c.store == nil || c.store.pool == nil {
 		return nil
 	}
-	app, err := c.store.GetLaunchApp(c.ctx, appID)
+	ctx, cancel := context.WithTimeout(c.ctx, compatReadTimeout)
+	defer cancel()
+	app, err := c.store.GetLaunchApp(ctx, appID)
 	if err != nil || !app.SteamFamily {
 		return nil
 	}
-	entries, err := compat.NewStore(c.store.pool).Entries(c.ctx)
+	// shortcut: read after placement, without the share locks of control-api.md §Usable. Harmless
+	// while only Valve builds exist; move into the scheduling transaction when disable and
+	// force-remove land (C10, #1074).
+	entries, err := compat.NewStore(c.store.pool).Entries(ctx)
 	if err != nil {
 		c.log.Warn("compat tools: reading the mapping failed; the session gets Steam's default", "app_id", appID, "err", err)
 		return nil
@@ -38,7 +50,9 @@ func (c *Coordinator) fitCompatTools(a agentws.SessionAssignCmd, epoch agentws.H
 		a.CompatTools = nil
 		return a
 	}
-	if _, err := c.store.pool.Exec(c.ctx, `UPDATE sessions SET compat_tool_names = $2::text[] WHERE id = $1::uuid`,
+	ctx, cancel := context.WithTimeout(c.ctx, compatReadTimeout)
+	defer cancel()
+	if _, err := c.store.pool.Exec(ctx, `UPDATE sessions SET compat_tool_names = $2::text[] WHERE id = $1::uuid`,
 		a.SessionID, a.CompatTools.Mount); err != nil {
 		c.log.Warn("compat tools: recording the mounted names failed", "session_id", a.SessionID, "err", err)
 	}

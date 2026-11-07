@@ -3,6 +3,7 @@ package compat
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"regexp"
 
@@ -52,7 +53,8 @@ func (h *Handler) handleSetDefault(w http.ResponseWriter, r *http.Request) {
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil || len(req.ToolID) == 0 {
+	// A second Decode must hit EOF: nothing may follow the body.
+	if err := dec.Decode(&req); err != nil || len(req.ToolID) == 0 || dec.Decode(&json.RawMessage{}) != io.EOF {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "body must be {\"tool_id\": <uuid>|null}")
 		return
 	}
@@ -73,11 +75,7 @@ func (h *Handler) handleSetDefault(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not set the default compatibility tool")
 		return
 	}
-	if !sameID(prev, toolID) {
-		audit.TryRecord(r.Context(), h.auditor, user.ID, "compat_tool.default.set", "instance", "",
-			map[string]any{"tool_id": toolID, "previous_tool_id": prev})
-	}
+	audit.TryRecord(r.Context(), h.auditor, user.ID, "compat_tool.default.set", "instance", "",
+		map[string]any{"tool_id": toolID, "previous_tool_id": prev})
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"default_tool_id": toolID})
 }
-
-func sameID(a, b *string) bool { return (a == nil) == (b == nil) && (a == nil || *a == *b) }

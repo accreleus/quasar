@@ -1140,7 +1140,7 @@ pub enum ControlMsg {
         /// Amendment 56: the compatibility-tool mapping of a Steam-family session. Sent only to
         /// an agent that advertised `compat_tools_v1`.
         #[serde(default)]
-        compat_tools: Option<crate::compat_tools::CompatTools>,
+        compat_tools: Option<serde_json::Value>,
     },
     /// Amendment 54: a further transport token for a WebTransport session.
     SessionTransportToken {
@@ -2641,13 +2641,19 @@ mod tests {
             }
         };
         assert_eq!(assign(""), None);
-        let tools = assign(
-            r#","compat_tools":{"mount":[],"entries":[{"appid":"0","name":"proton_10","forced":false},{"appid":"1145360","name":"proton_hotfix","forced":true}]}"#,
+        let tools = crate::compat_tools::parse(
+            &assign(
+                r#","compat_tools":{"mount":[],"entries":[{"appid":"0","name":"proton_10","forced":false},{"appid":"1145360","name":"proton_hotfix","forced":true}]}"#,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert!(tools.mount.is_empty());
         assert_eq!(tools.entries.len(), 2);
         assert!(tools.entries[1].forced);
+        // A value of the wrong shape drops only itself: the assign still parses.
+        assert!(assign(r#","compat_tools":{"forced":"yes"}"#).is_some());
+        assert!(assign(r#","compat_tools":"x""#).is_some());
     }
 
     /// Amendment 39: `kind`, `adopt_session_id`, `in_place` and the new stop reasons parse;
