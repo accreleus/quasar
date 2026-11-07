@@ -206,6 +206,9 @@ func TestAdminRoutesAreAdminOnly(t *testing.T) {
 	for _, c := range []struct{ method, path, body string }{
 		{"GET", "/v1/admin/compat-tools", ""},
 		{"PUT", "/v1/admin/compat-tools/default", `{"tool_id":null}`},
+		{"GET", "/v1/admin/compat-tools/mappings", ""},
+		{"PUT", "/v1/admin/compat-tools/mappings/steam/1145360", `{"tool_id":"00000000-0000-4000-8000-000000000000"}`},
+		{"DELETE", "/v1/admin/compat-tools/mappings/steam/1145360", ""},
 	} {
 		if code, _ := h.do(c.method, c.path, "", c.body); code != http.StatusUnauthorized {
 			t.Errorf("%s %s with no token: %d, want 401", c.method, c.path, code)
@@ -335,5 +338,178 @@ func TestEntriesAreTheDefaultThenEveryUsableMapping(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("entry %d = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+func (h *harness) mappingAudit() []string {
+	h.t.Helper()
+	rows, err := h.pool.Query(context.Background(),
+		`SELECT action || ' ' || target_type || ' ' || target_id || ' ' || details::text FROM admin_activity ORDER BY id`)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var l string
+		if err := rows.Scan(&l); err != nil {
+			h.t.Fatal(err)
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
+func TestMappingSetForcedClearAndAudit(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	const path = "/v1/admin/compat-tools/mappings/steam/1145360"
+	hotfix, nine := h.id["proton_hotfix"], h.id["proton_9"]
+
+	// Unforced by default: forced is absent from the body.
+	code, m := h.do("PUT", path, h.admin, `{"tool_id":"`+hotfix+`"}`)
+	if code != http.StatusOK || m["forced"] != false || m["tool_id"] != hotfix || m["external_id"] != "1145360" || m["provider"] != "steam" {
+		t.Fatalf("set: %d %v", code, m)
+	}
+	// A second PUT replaces it, never accumulates, and carries the flag.
+	if code, m = h.do("PUT", path, h.admin, `{"tool_id":"`+nine+`","forced":true}`); code != http.StatusOK || m["forced"] != true || m["tool_id"] != nine {
+		t.Fatalf("replace: %d %v", code, m)
+	}
+	code, body := h.do("GET", "/v1/admin/compat-tools/mappings", h.admin, "")
+	items, _ := body["items"].([]any)
+	if code != http.StatusOK || len(items) != 1 || items[0].(map[string]any)["tool_id"] != nine {
+		t.Fatalf("list: %d %v, want the one replaced mapping", code, body)
+	}
+
+	// The game reaches the session as a forced entry for its appid.
+	got, _, err := NewStore(h.pool).Entries(ctx, zeroHost)
+	if err != nil || len(got) != 1 || got[0] != (Entry{"1145360", "proton_9", true}) {
+		t.Fatalf("entries = %+v %v, want the forced mapping", got, err)
+	}
+
+	if code, _ = h.do("DELETE", path, h.admin, ""); code != http.StatusNoContent {
+		t.Fatalf("clear: %d", code)
+	}
+	if code, _ = h.do("DELETE", path, h.admin, ""); code != http.StatusNoContent {
+		t.Fatalf("clear again: %d, want 204 also when none existed", code)
+	}
+	if got, _, err = NewStore(h.pool).Entries(ctx, zeroHost); err != nil || len(got) != 0 {
+		t.Fatalf("entries after clear = %+v %v, want none", got, err)
+	}
+
+	a := h.mappingAudit()
+	if len(a) != 3 ||
+		!strings.HasPrefix(a[0], "compat_tool.mapping.set compat_tool_mapping steam:1145360 ") || !strings.Contains(a[0], hotfix) ||
+		!strings.Contains(a[1], `"previous_tool_id": "`+hotfix+`"`) || !strings.Contains(a[1], `"forced": true`) ||
+		!strings.HasPrefix(a[2], "compat_tool.mapping.clear compat_tool_mapping steam:1145360 ") || !strings.Contains(a[2], `"previous_forced": true`) {
+		t.Errorf("audit = %q, want set, replace (with the previous values) and one clear (the second clear changed nothing)", a)
+	}
+}
+
+func TestMappingWinsOverTheDefaultAndIsKeyedByAppID(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if code, b := h.do("PUT", "/v1/admin/compat-tools/default", h.admin, `{"tool_id":"`+h.id["proton_10"]+`"}`); code != 200 {
+		t.Fatalf("default: %d %v", code, b)
+	}
+	t.Cleanup(func() { _, _ = h.pool.Exec(ctx, `DELETE FROM apps WHERE name = 'tile'`) })
+	// Two tiles of one game, and a mapping set before any tile exists for another.
+	for i := 0; i < 2; i++ {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO apps (name, external_source, external_id) VALUES ('tile', 'steam', '1145360')`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"1145360", "480"} {
+		if code, b := h.do("PUT", "/v1/admin/compat-tools/mappings/steam/"+id, h.admin, `{"tool_id":"`+h.id["proton_hotfix"]+`"}`); code != 200 {
+			t.Fatalf("map %s: %d %v", id, code, b)
+		}
+	}
+	var n int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM compat_tool_mappings`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("%d mapping rows (err %v), want one per appid however many tiles the game has", n, err)
+	}
+	_, body := h.do("GET", "/v1/admin/compat-tools/mappings", h.admin, "")
+	items := body["items"].([]any)
+	if len(items) != 2 || items[0].(map[string]any)["external_id"] != "480" || items[1].(map[string]any)["external_id"] != "1145360" {
+		t.Fatalf("list = %v, want appids 480 then 1145360 (numeric order)", items)
+	}
+	if ids := items[1].(map[string]any)["app_ids"].([]any); len(ids) != 2 {
+		t.Errorf("app_ids of 1145360 = %v, want both tiles", ids)
+	}
+	if ids := items[0].(map[string]any)["app_ids"].([]any); len(ids) != 0 {
+		t.Errorf("app_ids of 480 = %v, want none: a mapping can precede discovery", ids)
+	}
+
+	// The default stays in force for every game, and a game's own mapping is its own entry.
+	got, _, err := NewStore(h.pool).Entries(ctx, zeroHost)
+	want := []Entry{{"0", "proton_10", false}, {"1145360", "proton_hotfix", false}, {"480", "proton_hotfix", false}}
+	if err != nil || len(got) != len(want) {
+		t.Fatalf("entries = %+v %v, want %+v", got, err, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	// Clearing the game's mapping returns it to the default.
+	h.do("DELETE", "/v1/admin/compat-tools/mappings/steam/1145360", h.admin, "")
+	got, _, _ = NewStore(h.pool).Entries(ctx, zeroHost)
+	if len(got) != 2 || got[0].AppID != "0" || got[1].AppID != "480" {
+		t.Errorf("entries after clear = %+v, want the default and 480 only", got)
+	}
+}
+
+func TestMappingRefusals(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	ok := h.id["proton_10"]
+	if _, err := h.pool.Exec(ctx, `UPDATE compat_tools SET enabled = false WHERE steam_name = 'proton_9'`); err != nil {
+		t.Fatal(err)
+	}
+	const path = "/v1/admin/compat-tools/mappings/steam/"
+	for name, c := range map[string]struct {
+		path, body string
+		code       int
+	}{
+		"appid 0 is the default's slot": {path + "0", `{"tool_id":"` + ok + `"}`, 400},
+		"a leading zero":                {path + "007", `{"tool_id":"` + ok + `"}`, 400},
+		"eleven digits":                 {path + "12345678901", `{"tool_id":"` + ok + `"}`, 400},
+		"not a number":                  {path + "abc", `{"tool_id":"` + ok + `"}`, 400},
+		"no tool_id":                    {path + "1", `{"forced":true}`, 400},
+		"null tool_id":                  {path + "1", `{"tool_id":null}`, 400},
+		"forced not a bool":             {path + "1", `{"tool_id":"` + ok + `","forced":"yes"}`, 400},
+		"forced null":                   {path + "1", `{"tool_id":"` + ok + `","forced":null}`, 400},
+		"an unknown key":                {path + "1", `{"tool_id":"` + ok + `","x":1}`, 400},
+		"a malformed id":                {path + "1", `{"tool_id":"proton_10"}`, 400},
+		"trailing garbage":              {path + "1", `{"tool_id":"` + ok + `"} x`, 400},
+		"an unknown tool":               {path + "1", `{"tool_id":"00000000-0000-4000-8000-000000000000"}`, 404},
+		"a disabled tool":               {path + "1", `{"tool_id":"` + h.id["proton_9"] + `"}`, 409},
+		"a GE tool nobody enabled":      {path + "1", `{"tool_id":"` + h.id["GE-Proton11-12-x86_64"] + `"}`, 409},
+	} {
+		if code, b := h.do("PUT", c.path, h.admin, c.body); code != c.code {
+			t.Errorf("%s: %d %v, want %d", name, code, b, c.code)
+		}
+	}
+	if code, _ := h.do("DELETE", path+"0", h.admin, ""); code != 400 {
+		t.Errorf("DELETE appid 0: %d, want 400", code)
+	}
+	if code, b := h.do("PUT", path+"1", h.admin, `{"tool_id":"`+h.id["proton_9"]+`"}`); code != 409 ||
+		!strings.Contains(jsonOf(b), "compat_tool_disabled") {
+		t.Errorf("disabled tool: %d %v, want 409 compat_tool_disabled", code, b)
+	}
+
+	// Full table: a new appid is refused, an existing one is still replaced.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO compat_tool_mappings (provider, external_id, tool_id)
+		SELECT 'steam', g::text, $1::uuid FROM generate_series(1, $2::int) g`, ok, MaxMappings); err != nil {
+		t.Fatal(err)
+	}
+	if code, b := h.do("PUT", path+"5000", h.admin, `{"tool_id":"`+ok+`"}`); code != 409 || !strings.Contains(jsonOf(b), `"code":"conflict"`) {
+		t.Errorf("a new appid in a full table: %d %v, want 409 conflict", code, b)
+	}
+	if code, b := h.do("PUT", path+"7", h.admin, `{"tool_id":"`+ok+`","forced":true}`); code != 200 {
+		t.Errorf("replacing in a full table: %d %v, want 200", code, b)
+	}
+	if a := h.mappingAudit(); len(a) != 1 {
+		t.Errorf("audit rows = %q, want only the accepted replace", a)
 	}
 }

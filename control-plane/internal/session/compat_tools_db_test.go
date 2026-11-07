@@ -98,6 +98,35 @@ func TestAssignLeavesOutADisabledTool(t *testing.T) {
 	}
 }
 
+// A mapping set through the admin store reaches the launch as the game's appid entry, forced or
+// not, whichever Steam-family app is launched: it is keyed by appid, not by a tile row.
+func TestAdminMappingReachesTheLaunchForcedOrNot(t *testing.T) {
+	f := compatFixture(t, true)
+	ctx := context.Background()
+	var admin, hotfix string
+	must(t, f.pool.QueryRow(ctx, `SELECT id::text FROM users LIMIT 1`).Scan(&admin))
+	must(t, f.pool.QueryRow(ctx, `SELECT id::text FROM compat_tools WHERE steam_name = 'proton_hotfix'`).Scan(&hotfix))
+	entry := func(forced bool) agentws.CompatToolEntry {
+		t.Helper()
+		_, _, _, _, err := compat.NewStore(f.pool).SetMapping(ctx, "480", hotfix, forced, admin)
+		must(t, err)
+		spec := f.coord.compatToolsFor(f.steam, f.hostID)
+		for _, e := range spec.Entries {
+			if e.AppID == "480" {
+				return e
+			}
+		}
+		t.Fatalf("no entry for appid 480 in %+v", spec.Entries)
+		return agentws.CompatToolEntry{}
+	}
+	if e := entry(false); e.Name != "proton_hotfix" || e.Forced {
+		t.Errorf("unforced mapping sent as %+v", e)
+	}
+	if e := entry(true); e.Name != "proton_hotfix" || !e.Forced {
+		t.Errorf("forced mapping sent as %+v", e)
+	}
+}
+
 func TestCompatToolsOnlyForTheSteamFamily(t *testing.T) {
 	f := compatFixture(t, true)
 	if got := f.coord.compatToolsFor(f.appID, f.hostID); got != nil {
