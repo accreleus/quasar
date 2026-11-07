@@ -116,3 +116,16 @@ func TestValidatePublicURL(t *testing.T) {
 		}
 	}
 }
+
+// The text is shown to an admin under the Public URL field, so it names the fix, not the JSON field.
+func TestValidatePublicURLMessagesAreForAdmins(t *testing.T) {
+	for u, want := range map[string]string{
+		"play.example.com":                "Use a full https:// address with a host name, like https://play.example.com",
+		"https://u:p@play.example.com/wt": "Remove any user name, password or #fragment from the address.",
+		"":                                "Use an address of 1 to 2048 characters.",
+	} {
+		if err := ValidatePublicURL(u); err == nil || err.Error() != want {
+			t.Errorf("ValidatePublicURL(%q) = %v, want %q", u, err, want)
+		}
+	}
+}

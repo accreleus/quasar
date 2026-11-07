@@ -124,14 +124,14 @@ func Resolve(h Host, now time.Time) Resolution {
 // ValidatePublicURL is the PATCH rule: absolute https with a host, no user info, no fragment.
 func ValidatePublicURL(s string) error {
 	if len(s) == 0 || len(s) > maxURLLen {
-		return errors.New("public_url must be 1-2048 characters")
+		return errors.New("Use an address of 1 to 2048 characters.")
 	}
 	u, err := url.Parse(s)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" {
-		return errors.New("public_url must be an absolute https URL with a host")
+		return errors.New("Use a full https:// address with a host name, like https://play.example.com")
 	}
 	if u.User != nil || u.Fragment != "" || u.Opaque != "" {
-		return errors.New("public_url must have no user info and no fragment")
+		return errors.New("Remove any user name, password or #fragment from the address.")
 	}
 	return nil
 }
