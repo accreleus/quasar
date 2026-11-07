@@ -431,6 +431,7 @@ describe("createWebTransportRuntime", () => {
         return new Promise((_, reject) => (refuse = reject));
       },
       requestKeyframe: () => {},
+      sendMic: () => false,
       close: () => {},
     };
     const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };

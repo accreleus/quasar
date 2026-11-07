@@ -3,10 +3,11 @@
 //! session's client authenticates with a single-use token the control plane minted and
 //! then gets the session's video as datagrams.
 //!
-//! Not here yet, each a later ticket: audio, microphone and input datagrams, ping and
+//! Not here yet, each a later ticket: input datagrams, ping and
 //! pong, NACK and its retransmit buffer, FEC, receiver feedback and congestion control,
 //! and takeover across transports (a new client replaces the last one; nothing bounds it).
 
+mod audio;
 mod cert;
 mod media;
 #[cfg(test)]
@@ -27,6 +28,7 @@ use tokio::sync::oneshot;
 use tokio::time::{timeout_at, Instant};
 use web_transport_quinn::{quinn, RecvStream, Request, SendStream, Session};
 
+pub(crate) use audio::Audio;
 pub use cert::CertReport;
 use cert::{Cert, CertSet};
 use media::{Attached, Gone, Media, Out};
@@ -253,6 +255,7 @@ impl Registry {
 pub(crate) struct Tap {
     registry: Arc<Registry>,
     session_id: String,
+    audio: Arc<Audio>,
 }
 
 impl Tap {
@@ -262,8 +265,10 @@ impl Tap {
         video: &gst::Pad,
         encoder: &gst::Element,
         session_id: &str,
+        audio: audio::Plan,
     ) -> Option<Self> {
-        let media = Media::new(encoder);
+        let audio = Audio::new(audio);
+        let media = Media::new(encoder, audio.clone());
         if !registry.set_media(session_id, media.clone()) {
             return None;
         }
@@ -271,7 +276,18 @@ impl Tap {
         Some(Self {
             registry: registry.clone(),
             session_id: session_id.to_string(),
+            audio,
         })
+    }
+
+    /// The session's audio, for the audio pipeline to tap at its Opus encoder.
+    pub(crate) fn audio(&self) -> Arc<Audio> {
+        self.audio.clone()
+    }
+
+    /// What the runner offers this session's client.
+    pub(crate) fn plan(cfg: &crate::session::SessionConfig) -> audio::Plan {
+        audio::Plan::for_session(cfg)
     }
 }
 
@@ -684,7 +700,8 @@ enum Violation {
     Protocol(&'static str),
 }
 
-fn hello_ack(config: &media::VideoConfig) -> Value {
+fn hello_ack(config: &media::VideoConfig, audio: &Audio) -> Value {
+    let (stream_audio, mic) = audio.describe();
     json!({
         "type": "hello_ack",
         "wt_proto": WT_PROTO,
@@ -696,8 +713,8 @@ fn hello_ack(config: &media::VideoConfig) -> Value {
             "height": config.height,
             "fps": config.fps,
         },
-        "audio": null,
-        "mic": null,
+        "audio": stream_audio,
+        "mic": mic,
         "fec": null,
     })
 }
@@ -731,10 +748,17 @@ async fn streams(session: Session, control: oneshot::Sender<(SendStream, RecvStr
     }
 }
 
-/// Input (`0x03`) and microphone (`0x05`) are later tickets: every datagram is dropped,
-/// which is also the rule before `hello_ack`.
-async fn drop_datagrams(session: Session) {
-    while session.read_datagram().await.is_ok() {}
+/// Before `hello_ack` every datagram is dropped (§Before `hello`); after it, the
+/// microphone (`0x05`) goes to the session's mic sink. Input (`0x03`) is a later ticket.
+async fn datagrams(session: Session, authed: Arc<OnceLock<(Arc<Media>, u64)>>) {
+    while let Ok(datagram) = session.read_datagram().await {
+        let Some((media, client)) = authed.get() else {
+            continue;
+        };
+        if let Some((&audio::CHANNEL_MIC, body)) = datagram.split_first() {
+            media.audio().mic_packet(*client, body);
+        }
+    }
 }
 
 /// One connection, from QUIC accept. The 5 s hello deadline runs from here, over the
@@ -759,7 +783,8 @@ async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Sl
     };
     let (control_tx, control_rx) = oneshot::channel();
     let others = tokio::spawn(streams(session.clone(), control_tx));
-    let datagrams = tokio::spawn(drop_datagrams(session.clone()));
+    let authed = Arc::new(OnceLock::new());
+    let datagrams = tokio::spawn(datagrams(session.clone(), authed.clone()));
     let hello = async {
         let (send, mut recv) = control_rx.await.map_err(|_| Violation::Gone)?;
         let message = read_message(&mut recv).await?;
@@ -773,7 +798,10 @@ async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Sl
         }
         Ok(Ok((send, recv, message))) => match serde_json::from_value::<Hello>(message) {
             Ok(hello) if hello.kind == "hello" => {
-                authenticate(&session, send, recv, &registry, hello, slot, deadline).await;
+                authenticate(
+                    &session, send, recv, &registry, hello, slot, deadline, &authed,
+                )
+                .await;
             }
             _ => {
                 close_session(
@@ -823,6 +851,7 @@ fn log_refusal(session_id: &str, code: &str) {
 
 /// Every write here is bounded by `deadline`, the hello deadline: a peer that grants no
 /// stream credit must not hold a slot, or an attachment, past it.
+#[allow(clippy::too_many_arguments)]
 async fn authenticate(
     session: &Session,
     mut send: SendStream,
@@ -831,6 +860,7 @@ async fn authenticate(
     hello: Hello,
     slot: Slot,
     deadline: Instant,
+    authed: &OnceLock<(Arc<Media>, u64)>,
 ) {
     // Checked before the token is spent: a peer that cannot take 1200-byte-budget
     // datagrams (or none) could never be sent video.
@@ -876,7 +906,7 @@ async fn authenticate(
     if !matches!(
         timeout_at(
             deadline,
-            write_message(&mut send, &hello_ack(&client.config))
+            write_message(&mut send, &hello_ack(&client.config, media.audio()))
         )
         .await,
         Ok(Ok(()))
@@ -886,6 +916,7 @@ async fn authenticate(
         return;
     }
     drop(slot);
+    let _ = authed.set((media.clone(), client.id));
     stream(session, send, recv, &media, client).await;
 }
 
@@ -909,10 +940,24 @@ async fn stream(
     });
     let mut pkt_seq = 0u32;
     let mut warned_oversized = false;
+    // Nothing is sent before `hello_ack`: what queued up behind it is stale.
+    while client.audio.try_recv().is_ok() {}
+    let mut audio_open = true;
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
     let (message, code, why) = loop {
         tokio::select! {
+            packet = client.audio.recv(), if audio_open => match packet {
+                Some(packet) => {
+                    let seq = pkt_seq;
+                    pkt_seq = pkt_seq.wrapping_add(1);
+                    if session.send_datagram(audio::datagram(&packet, seq)).is_err() {
+                        break QUIET;
+                    }
+                }
+                // Displaced or ended: the video queue says which, next.
+                None => audio_open = false,
+            },
             out = client.rx.recv() => match out {
                 Some(Out::Unit(unit)) => {
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);
@@ -934,7 +979,7 @@ async fn stream(
                     }
                 }
                 Some(Out::Config(config)) => {
-                    let ack = hello_ack(&config);
+                    let ack = hello_ack(&config, media.audio());
                     let write = write_message(&mut send, &ack);
                     if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
                         break QUIET;

@@ -34,11 +34,11 @@ pub(crate) use caps::vulkan_image_transport;
 use caps::{caps_profile, raw_video_caps};
 mod codec_chain;
 use codec_chain::{build_bitstream_chain, build_video_payloader, BitstreamChain};
-mod audio_branch;
+pub(crate) mod audio_branch;
 mod audio_health;
 mod rtp_ext;
 use audio_branch::add_audio_chain;
-mod mic_branch;
+pub(crate) mod mic_branch;
 mod probes;
 use probes::{
     attach_bitstream_capture, attach_encode_probes, attach_encoder_pts_trace, attach_queue_probes,

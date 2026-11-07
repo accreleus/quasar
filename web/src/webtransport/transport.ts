@@ -4,6 +4,8 @@
 // (protocol/transport-webtransport.md) is the first implementation here; WebRTC
 // still decodes inside the browser's <video> and does not go through this seam.
 
+import type { AudioPacket } from "./framing";
+
 /** A `hello_ack.video` (§Hello ack), the decoder configuration a `config_id` names. */
 export interface VideoConfig {
   configId: number;
@@ -15,6 +17,19 @@ export interface VideoConfig {
   height: number;
   fps: number;
   colorSpace?: VideoColorSpaceInit;
+}
+
+/** A `hello_ack.audio` or `.mic` (§Hello ack): 10 ms Opus packets. */
+export interface AudioConfig {
+  channels: number;
+  sampleRate: number;
+  ptimeMs: number;
+}
+
+/** What the session carries besides video; null for what it lacks (no audio, no mic grant). */
+export interface AudioStreams {
+  audio: AudioConfig | null;
+  mic: AudioConfig | null;
 }
 
 /** One access unit, whole, in the form `EncodedVideoChunk` takes (§Video). */
@@ -40,6 +55,10 @@ export interface TransportEnd {
 export interface MediaSink {
   /** Every `hello_ack`, the first included, in control-stream order. */
   config(config: VideoConfig): void;
+  /** The first `hello_ack`'s audio and microphone, before any datagram is read. */
+  streams?(streams: AudioStreams): void;
+  /** One Opus packet from the agent, as it arrived: lost and reordered ones are the sink's to handle. */
+  audio?(packet: AudioPacket): void;
   /** Reassembled units, in completion order. */
   unit(unit: AccessUnit): void;
   /** Called once, after connect resolved, when the transport is gone. */
@@ -50,6 +69,8 @@ export interface MediaTransport {
   /** Resolves at the first `hello_ack`; rejects with a {@link TransportError}. */
   connect(sink: MediaSink): Promise<void>;
   requestKeyframe(reason: KeyframeReason): void;
+  /** Sends one `0x05` microphone datagram; false when it was not sent (not connected, too large). */
+  sendMic(datagram: Uint8Array): boolean;
   /** Says `bye` when connected; idempotent. */
   close(): void;
 }

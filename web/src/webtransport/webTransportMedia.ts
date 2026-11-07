@@ -1,18 +1,22 @@
 // MediaTransport over WebTransport: protocol/transport-webtransport.md, wt_proto 1,
-// video only. Input, ping/pong, audio, NACK and feedback are later tickets (#1032,
-// #1033, #1039, #1040).
+// video, audio and the microphone. Input, ping/pong, NACK and feedback are later tickets
+// (#1032, #1039, #1040).
 
 import {
   base64Bytes,
+  CHANNEL_AUDIO,
   ControlDecoder,
   ControlProtocolError,
   encodeControl,
+  parseAudioDatagram,
   parseVideoDatagram,
 } from "./framing";
 import type { WebTransportCoords } from "../api/types";
 import { FrameAssembler } from "./reassembly";
 import {
   TransportError,
+  type AudioConfig,
+  type AudioStreams,
   type KeyframeReason,
   type MediaSink,
   type MediaTransport,
@@ -35,6 +39,9 @@ export const REMINT_MIN_INTERVAL_MS = 10_000;
 /** A token held this long (TTL 60 s, control-api.md) is replaced after a failed attempt. Measured
  *  on this page's monotonic clock from its arrival, never against the server's `expires_at`. */
 export const TOKEN_REFRESH_AGE_MS = 45_000;
+
+/** A datagram carries at least this much on any path (§Channels, "Datagram size"). */
+const MAX_DATAGRAM = 1148;
 
 /** WebTransport close codes during connect (§Bye and error), as the refusal they stand for. */
 const CLOSE_REFUSALS: Record<number, string> = {
@@ -94,12 +101,25 @@ export function videoConfigFrom(ack: Record<string, unknown>): VideoConfig {
   };
 }
 
+const audioConfigFrom = (a: unknown): AudioConfig | null => {
+  const o = a as Record<string, unknown> | null | undefined;
+  if (!o || o.codec !== "opus" || typeof o.channels !== "number" || typeof o.sample_rate !== "number") return null;
+  return { channels: o.channels, sampleRate: o.sample_rate, ptimeMs: typeof o.ptime_ms === "number" ? o.ptime_ms : 10 };
+};
+
+/** `hello_ack.audio` and `.mic`; null for a stream the host does not carry or one this client cannot use. */
+export const audioStreamsFrom = (ack: Record<string, unknown>): AudioStreams => ({
+  audio: audioConfigFrom(ack.audio),
+  mic: audioConfigFrom(ack.mic),
+});
+
 const refused = (code: string): Answer => ({ kind: "refused", code });
 const after = <T>(ms: number, value: T) => new Promise<T>((r) => setTimeout(() => r(value), ms));
 
 export class WebTransportMedia implements MediaTransport {
   private wt: WebTransport | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private closed = false;
   /** Closes the attempt in flight; null once one has connected or ended. */
   private abortAttempt: (() => void) | null = null;
@@ -159,6 +179,13 @@ export class WebTransportMedia implements MediaTransport {
       this.pendingKey = null;
       if (r) this.requestKeyframe(r);
     }, wait);
+  }
+
+  sendMic(datagram: Uint8Array): boolean {
+    const cap = Math.min(this.wt?.datagrams.maxDatagramSize ?? MAX_DATAGRAM, MAX_DATAGRAM);
+    if (!this.datagramWriter || datagram.length > cap) return false;
+    void this.datagramWriter.write(datagram).catch(() => {});
+    return true;
   }
 
   close(): void {
@@ -302,6 +329,8 @@ export class WebTransportMedia implements MediaTransport {
     this.wt = wt;
     this.writer = writer;
     this.connected = true;
+    this.datagramWriter = wt.datagrams.writable.getWriter();
+    sink.streams?.(audioStreamsFrom(first));
     sink.config(config);
     void (async () => {
       try {
@@ -327,6 +356,11 @@ export class WebTransportMedia implements MediaTransport {
     for (;;) {
       const { value, done } = await reader.read();
       if (done || !live.on) return;
+      if ((value as Uint8Array)[0] === CHANNEL_AUDIO) {
+        const packet = parseAudioDatagram(value as Uint8Array);
+        if (packet) sink.audio?.(packet);
+        continue;
+      }
       const frag = parseVideoDatagram(value as Uint8Array);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
       const { unit, needKeyframe } = assembler.push(frag);
