@@ -567,7 +567,7 @@ impl ToolStore {
     /// takes, every tool must still be Installed and present, and the hold moves to `to` (parked
     /// only if `to` is) before the lock is released. A removal therefore either marked a tool
     /// Removing first, and the claim fails, or sees `to`'s hold and defers `in_use`. The only
-    /// caller is `SessionManager::adopt_runtime`, the single entry point for reusing a runtime.
+    /// caller is the agent's `claim_runtime`, the gate every reuse of a runtime passes.
     pub fn claim_for_adopt(
         &self,
         from: &str,

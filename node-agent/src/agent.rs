@@ -3732,8 +3732,12 @@ impl SessionManager {
     /// `running`, so the two views can never disagree about host busyness.
     fn note_session_count(&self) {
         crate::restart::note_sessions(self.pending.len() + self.running.len());
+        // Every session that may still mount its tools keeps its hold: a play id whose restream
+        // is in flight is in neither map until `finish_adopt`, yet holds the claimed tools.
         crate::compat_tools::retain_holds(self.hold_owner, &|sid| {
-            self.pending.contains_key(sid) || self.running.contains_key(sid)
+            self.pending.contains_key(sid)
+                || self.running.contains_key(sid)
+                || self.restreaming_for(sid).is_some()
         });
         if let Some(a) = &self.warmup_activity {
             a.set_live(self.running.len(), Instant::now());
@@ -12624,21 +12628,28 @@ mod tests {
         );
     }
 
-    /// A session's tool hold is made at assign and survives a decline of any kind into the fresh
-    /// build: with a real tools store, a removal of that tool defers `in_use`.
-    #[test]
-    fn a_declined_adoption_keeps_the_sessions_own_tool_hold() {
-        use crate::jobs::JobRunner as _;
-        const TOOL: &str = "GE-Proton9-99";
-        let sha = "c".repeat(128);
-        let store = crate::compat_tools::test_store(|| {
+    /// The process's one tools store for agent tests, with one installed tool per test that needs
+    /// a real hold (each test removes only its own).
+    fn test_tools_store() -> &'static Arc<crate::compat_tools::install::ToolStore> {
+        crate::compat_tools::test_store(|| {
             let root = tempfile::tempdir().unwrap().keep();
-            std::fs::create_dir_all(root.join("tools").join(TOOL)).unwrap();
-            let record = serde_json::json!({"tools": [{"name": TOOL, "tag": "GE-Proton9-99",
-                "sha512": "c".repeat(128), "bytes": 1, "state": "installed"}]});
+            let tools: Vec<serde_json::Value> = ["GE-Proton9-99", "GE-Proton9-98"]
+                .iter()
+                .map(|t| {
+                    std::fs::create_dir_all(root.join("tools").join(t)).unwrap();
+                    serde_json::json!({"name": t, "tag": t, "sha512": "c".repeat(128),
+                        "bytes": 1, "state": "installed"})
+                })
+                .collect();
+            let record = serde_json::json!({ "tools": tools });
             std::fs::write(root.join("record.json"), record.to_string()).unwrap();
             crate::compat_tools::install::ToolStore::open(&root, &[], false).unwrap()
-        });
+        })
+    }
+
+    /// A `compat_tools.converge` removal of `tool` from [`test_tools_store`].
+    fn remove_test_tool(tool: &str) -> crate::jobs::JobOutcome {
+        use crate::jobs::JobRunner as _;
         struct NoSource;
         impl crate::compat_tools::fetch::Source for NoSource {
             fn get(
@@ -12651,17 +12662,77 @@ mod tests {
                 ))
             }
         }
-        let remove = || {
-            crate::compat_tools::install::ConvergeRunner::new(
-                store.clone(),
-                Arc::new(NoSource),
-                Arc::new(|| {}),
-            )
-            .run(
-                &serde_json::json!({"action": "remove", "tool_id": null, "name": TOOL, "sha512": sha}),
-                &crate::jobs::AbortFlag::new(),
-            )
+        crate::compat_tools::install::ConvergeRunner::new(
+            test_tools_store().clone(),
+            Arc::new(NoSource),
+            Arc::new(|| {}),
+        )
+        .run(
+            &serde_json::json!({"action": "remove", "tool_id": null, "name": tool,
+                "sha512": "c".repeat(128)}),
+            &crate::jobs::AbortFlag::new(),
+        )
+    }
+
+    /// A play session whose claim restreams a parked runtime keeps the claimed hold while the
+    /// restream is in flight, whatever recounts the sessions meanwhile, and runs with it after.
+    #[test]
+    fn a_restreaming_claim_keeps_its_tool_hold_through_a_session_recount() {
+        const TOOL: &str = "GE-Proton9-98";
+        test_tools_store();
+        let (mut mgr, warm) = warm_manager();
+        let hold = |mgr: &SessionManager, sid: &str, parked: bool| {
+            let mut env = BTreeMap::new();
+            let sent = serde_json::json!({"mount": [TOOL], "entries": []});
+            crate::compat_tools::apply_assign(&mut env, Some(&sent), sid, parked, mgr.hold_owner)
         };
+        // Ids no other test uses: holds live in the process's one store, released by session id.
+        let mut cfg = steam_cfg(SessionKind::Parked, "-silent", (1920, 1080));
+        cfg.container.as_mut().unwrap().compat_tools = hold(&mgr, "k1073", true);
+        assert!(acked(start(&mut mgr, &warm, "k1073", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("k1073", SessionEvent::Running);
+        mgr.running["k1073"].metrics.set_launch_helper_connected();
+        let mut play = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        play.container.as_mut().unwrap().compat_tools = hold(&mgr, "p1073", false);
+        play.stream.bitrate_kbps = mgr.running["k1073"].stream.bitrate_kbps / 2;
+        assert!(acked(start(&mut mgr, &warm, "p1073", play, Some("k1073"))));
+        assert!(
+            warm.adopted
+                .recv_timeout(WAIT)
+                .unwrap()
+                .1
+                .restream
+                .is_some(),
+            "restreaming"
+        );
+        mgr.note_session_count();
+        mgr.restreamed(
+            "k1073",
+            Ok(Duration::from_millis(40)),
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(mgr.running.contains_key("p1073"), "adopted");
+        assert_eq!(
+            remove_test_tool(TOOL),
+            crate::jobs::JobOutcome::Deferred("in_use".into()),
+            "the adopted play session runs with its tool held"
+        );
+        crate::compat_tools::release("p1073");
+        assert!(matches!(
+            remove_test_tool(TOOL),
+            crate::jobs::JobOutcome::Succeeded(_)
+        ));
+    }
+
+    /// A session's tool hold is made at assign and survives a decline of any kind into the fresh
+    /// build: with a real tools store, a removal of that tool defers `in_use`.
+    #[test]
+    fn a_declined_adoption_keeps_the_sessions_own_tool_hold() {
+        const TOOL: &str = "GE-Proton9-99";
+        test_tools_store();
+        let remove = || remove_test_tool(TOOL);
 
         // Ids no other test uses: holds live in the process's one store, released by session id.
         let (mut mgr, warm) = warm_manager();

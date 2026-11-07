@@ -173,7 +173,7 @@ pub fn retain_holds(owner: u64, live: &dyn Fn(&str) -> bool) {
     }
 }
 
-/// For `SessionManager::adopt_runtime` only, the one place a runtime is reused: true when every
+/// For the agent's `claim_runtime` only, the gate every reuse of a runtime passes: true when every
 /// tool in `tools` is still Installed and present, in which case the hold moves from `from` to
 /// `to` (no longer parked unless `to` is) in the same critical section a removal takes.
 pub fn claim_for_adopt(from: &str, to: &str, tools: &[String], parked: bool, owner: u64) -> bool {
