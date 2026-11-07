@@ -92,6 +92,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let stage: DecodeStage | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let capture: ReturnType<typeof setupCapture> | null = null;
+  let inputSender: ReturnType<typeof webTransportInputSender> | null = null;
   let captured = false;
   let mouse: MouseSettings = NEUTRAL_MOUSE;
   let rttMs: number | null = null;
@@ -118,6 +119,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     // Releases held keys through the transport, so it goes first.
     capture?.cleanup();
     capture = null;
+    inputSender?.dispose();
+    inputSender = null;
     captured = false;
     transport?.close();
     stage?.close();
@@ -263,7 +266,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (destroyed || failed) return;
     // hello_ack: the control stream is up, and it is what carries input on this transport.
     set({ wsOpen: true, pcConnected: true, channelOpen: true, iceState: "connected" });
-    const sender = webTransportInputSender(t.input);
+    const sender = (inputSender = webTransportInputSender(t.input));
     capture = deps.setupCapture({
       videoEl: cfg.canvas,
       sendInput: sender.send,

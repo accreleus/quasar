@@ -10,6 +10,7 @@ import { webTransportInputSender, type InputWire } from "./inputSender";
 import type { Presenter } from "./presenter";
 import type { MediaSink } from "./transport";
 import { avcC, COORDS, FakeAgent, FakeDecoder, flush, helloAck } from "./testSupport";
+import { workerTicker } from "./pingTicker";
 import { WebTransportMedia } from "./webTransportMedia";
 
 afterEach(() => {
@@ -98,16 +99,80 @@ describe("the WebTransport input sender", () => {
     expect(log.map((l) => l.json)).toEqual(sent);
   });
 
-  it("sends a gamepad state reliably when a button changes and as a datagram when only an axis does", () => {
+  it("sends a gamepad state reliably when any button value changes and as a datagram only when a stick does", () => {
     const { log, sender } = recordingWire();
     const pad = (buttons: number[], axes: number[]): InputMsg => ({ t: "gp", i: 0, buttons, axes });
     sender.send(pad([0, 0, 0], [0, 0])); // first state of a pad
     sender.send(pad([0, 0, 0], [0.4, 0])); // stick
-    sender.send(pad([0, 0.3, 0], [0.4, 0.1])); // analog value below the press threshold
-    sender.send(pad([0, 1, 0], [0.4, 0.1])); // press
+    sender.send(pad([0, 1, 0], [0.4, 0])); // press
     sender.send(pad([0, 1, 0], [0.9, 0.1])); // stick, button still held
     sender.send(pad([0, 0, 0], [0.9, 0.1])); // release
-    expect(log.map((l) => l.path)).toEqual(["reliable", "datagram", "datagram", "reliable", "datagram", "reliable"]);
+    expect(log.map((l) => l.path)).toEqual(["reliable", "datagram", "reliable", "datagram", "reliable"]);
+    sender.dispose();
+  });
+
+  it("sends an analog trigger moving from 0.2 to 0.3 reliably, below any press threshold", () => {
+    const { log, sender } = recordingWire();
+    const trigger = (value: number): InputMsg => ({ t: "gp", i: 0, buttons: [0, 0, 0, 0, 0, 0, value, 0], axes: [0, 0, 0, 0] });
+    sender.send(trigger(0.2));
+    sender.send(trigger(0.3));
+    sender.send({ ...trigger(0.3), axes: [0.5, 0, 0, 0] }); // only the stick moved
+    expect(log.map((l) => l.path)).toEqual(["reliable", "reliable", "datagram"]);
+    sender.dispose();
+  });
+
+  describe("a state last sent as a datagram is sent again reliably", () => {
+    beforeEach(() => vi.useFakeTimers());
+
+    it("repeats a pad's latest full state 100 ms after its last datagram gp", () => {
+      const { log, sender } = recordingWire();
+      const pad = (axes: number[]): InputMsg => ({ t: "gp", i: 2, buttons: [0, 0], axes });
+      sender.send(pad([0, 0]));
+      sender.send(pad([0.8, 0]));
+      vi.advanceTimersByTime(60);
+      sender.send(pad([0, 0])); // the stick returns to rest: the state a lost datagram would strand
+      vi.advanceTimersByTime(99);
+      expect(log.map((l) => l.path)).toEqual(["reliable", "datagram", "datagram"]);
+      vi.advanceTimersByTime(1);
+      expect(log.slice(3)).toEqual([{ path: "reliable", json: JSON.stringify(pad([0, 0])) }]);
+      vi.advanceTimersByTime(1000);
+      expect(log).toHaveLength(4);
+      sender.dispose();
+    });
+
+    it("repeats the latest absolute position, and not a relative move or a scroll", () => {
+      const { log, sender } = recordingWire();
+      sender.send({ t: "ma", x: 0.1, y: 0.1 });
+      sender.send({ t: "ma", x: 0.7, y: 0.2 });
+      sender.send({ t: "mm", dx: 1, dy: 1 });
+      sender.send({ t: "ms", dx: 0, dy: 120 });
+      vi.advanceTimersByTime(100);
+      expect(log.map((l) => `${l.path}:${l.json}`).slice(4)).toEqual(['reliable:{"t":"ma","x":0.7,"y":0.2}']);
+      vi.advanceTimersByTime(1000);
+      expect(log).toHaveLength(5);
+      sender.dispose();
+    });
+
+    it("sends nothing later when a reliable message already carried the newest state", () => {
+      const { log, sender } = recordingWire();
+      sender.send({ t: "gp", i: 0, buttons: [0], axes: [0] });
+      sender.send({ t: "gp", i: 0, buttons: [0], axes: [0.5] });
+      sender.send({ t: "gp", i: 0, buttons: [1], axes: [0.5] }); // a press: full state, reliable
+      sender.send({ t: "ma", x: 0.3, y: 0.3 });
+      sender.send({ t: "mb", button: 272, pressed: true }); // repeats the position at once
+      const sent = log.length;
+      vi.advanceTimersByTime(1000);
+      expect(log).toHaveLength(sent);
+      sender.dispose();
+    });
+
+    it("forgets what was waiting when disposed", () => {
+      const { log, sender } = recordingWire();
+      sender.send({ t: "ma", x: 0.3, y: 0.3 });
+      sender.dispose();
+      vi.advanceTimersByTime(1000);
+      expect(log.map((l) => l.path)).toEqual(["datagram"]);
+    });
   });
 
   it("falls back to the control stream when the datagram does not fit", () => {
@@ -188,6 +253,74 @@ describe("WebTransportMedia input and ping", () => {
     agent.last.control({ type: "ping", id: 4, ts: 998880.0, tw: 1762400003001.2 });
     await vi.waitFor(() => expect(agent.sent("pong")).toEqual([{ type: "pong", id: 4, ts: 998880.0, tw: 1762400003001.2, tc: 777 }]));
     t.close();
+  });
+});
+
+describe("the ping clock", () => {
+  it("is driven by a Worker, and a tick pings from the main thread", async () => {
+    const made: FakeWorker[] = [];
+    class FakeWorker {
+      onmessage: (() => void) | null = null;
+      posted: unknown[] = [];
+      terminated = false;
+      constructor(
+        readonly url: URL,
+        readonly options: WorkerOptions,
+      ) {
+        made.push(this);
+      }
+      postMessage(v: unknown) {
+        this.posted.push(v);
+      }
+      terminate() {
+        this.terminated = true;
+      }
+    }
+    vi.stubGlobal("Worker", FakeWorker);
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    let clock = 0;
+    const t = new WebTransportMedia({
+      sessionId: "s1",
+      coords: COORDS,
+      mintToken: async () => COORDS,
+      createWebTransport: agent.create,
+      sleep: async () => {},
+      now: () => clock,
+    });
+    await t.connect({ config: () => {}, unit: () => {}, end: () => {} });
+    await flush();
+    expect(made).toHaveLength(1);
+    expect(made[0].url.pathname).toMatch(/pingWorker/);
+    expect(made[0].options).toEqual({ type: "module" });
+    expect(made[0].posted).toEqual([1000]);
+    expect(agent.sent("ping")).toHaveLength(1); // the first, at connect
+
+    // The page's own timers are throttled; the Worker's message is what pings.
+    clock = 1000;
+    made[0].onmessage?.();
+    clock = 2000;
+    made[0].onmessage?.();
+    await flush();
+    expect(agent.sent("ping").map((p) => p.tc)).toEqual([0, 1000, 2000]);
+
+    t.close();
+    expect(made[0].terminated).toBe(true);
+  });
+
+  it("falls back to a page timer when the page may not start a Worker", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("Worker", class {
+      constructor() {
+        throw new DOMException("blocked", "SecurityError");
+      }
+    });
+    const ticks: number[] = [];
+    const stop = workerTicker(1000, () => ticks.push(1));
+    vi.advanceTimersByTime(2500);
+    stop();
+    vi.advanceTimersByTime(5000);
+    expect(ticks).toHaveLength(2);
   });
 });
 

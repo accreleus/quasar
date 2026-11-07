@@ -51,9 +51,13 @@ pub(super) fn no_input() -> Input {
 }
 
 fn ready_media() -> Arc<Media> {
+    ready_media_with(no_input())
+}
+
+fn ready_media_with(input: Input) -> Arc<Media> {
     gst::init().unwrap();
     let encoder = gst::ElementFactory::make("identity").build().unwrap();
-    let media = Media::new(&encoder, no_input());
+    let media = Media::new(&encoder, input);
     let caps = gst::Caps::builder("video/x-h264")
         .field("stream-format", "avc")
         .field("width", 64)
@@ -627,6 +631,116 @@ async fn a_datagram_gamepad_state_moves_axes_and_never_changes_buttons() {
         ],
         "the stale datagram moved the stick and left the button held"
     );
+}
+
+#[test]
+fn only_the_attached_clients_input_reaches_the_devices() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (input, events, released) = recorded();
+    let media = ready_media_with(input);
+    let key =
+        |code: u32, pressed: bool| json!({"t": "k", "code": code, "pressed": pressed}).to_string();
+    let neutral = json!({"t": "gp", "i": 0, "buttons": [0, 0], "axes": [0.0, 0.0]}).to_string();
+
+    let old = media.attach().unwrap();
+    media.input_event(old.id, &key(30, true), false);
+    assert_eq!(events.lock().unwrap().len(), 1);
+
+    // A takeover lifts what the old client held as the new one attaches, before it can send.
+    let new = media.attach().unwrap();
+    assert_eq!(released.load(SeqCst), 1);
+    // The old tab's late input, its neutral pad state included, reaches nothing.
+    media.input_event(old.id, &neutral, true);
+    media.input_event(old.id, &key(31, true), false);
+    assert_eq!(
+        events.lock().unwrap().len(),
+        1,
+        "{:?}",
+        events.lock().unwrap()
+    );
+    media.input_event(new.id, &key(32, true), false);
+    assert_eq!(events.lock().unwrap().len(), 2);
+
+    // The old client's cleanup does not lift the new client's key.
+    media.detach(old.id);
+    assert_eq!(released.load(SeqCst), 1);
+    media.input_event(new.id, &key(32, false), false);
+    assert_eq!(events.lock().unwrap().len(), 3);
+
+    // The attached client leaving does, and nothing it sends after that is taken.
+    media.detach(new.id);
+    assert_eq!(released.load(SeqCst), 2);
+    media.input_event(new.id, &key(33, true), false);
+    assert_eq!(events.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_takeover_lifts_the_old_clients_keys_once_and_keeps_the_new_clients() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let registry = agent.listener.registry();
+    let key =
+        |code: u32| json!({"type": "input", "event": {"t": "k", "code": code, "pressed": true}});
+
+    let (first, mut first_send, _first_recv, _) = agent.hello(TOKEN).await;
+    write_message(&mut first_send, &key(30)).await.unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1);
+
+    assert!(registry.add_token(
+        SESSION,
+        &token_hash("reconnect"),
+        SystemTime::now() + TOKEN_TTL
+    ));
+    let (_second, mut second_send, _second_recv, ack) = agent.hello("reconnect").await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(
+        agent.released.load(SeqCst),
+        1,
+        "lifted before the new client's ack"
+    );
+
+    // The old tab, still connected for a moment, sends more; the new client presses a key.
+    let late = Bytes::from_static(b"\x03{\"t\":\"k\",\"code\":31,\"pressed\":true}");
+    let _ = first.send_datagram(late);
+    let _ = write_message(&mut first_send, &key(31)).await;
+    write_message(&mut second_send, &key(32)).await.unwrap();
+    assert_eq!(input_events(&agent, 2).await.len(), 2);
+    assert_eq!(close_code(&first).await, Some(CLOSE_TAKEN_OVER));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let seen: Vec<Value> = agent
+        .input
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect();
+    assert_eq!(
+        seen.iter()
+            .map(|e| e["code"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [30, 32],
+        "{seen:?}"
+    );
+    assert_eq!(
+        agent.released.load(SeqCst),
+        1,
+        "the old client's cleanup left the new client's key alone"
+    );
+
+    write_message(
+        &mut second_send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while agent.released.load(SeqCst) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the new client's keys were never lifted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]

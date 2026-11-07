@@ -10,6 +10,7 @@ import {
 } from "./framing";
 import type { WebTransportCoords } from "../api/types";
 import type { InputWire } from "./inputSender";
+import { workerTicker, type Ticker } from "./pingTicker";
 import { FrameAssembler } from "./reassembly";
 import {
   TransportError,
@@ -64,6 +65,8 @@ export interface WebTransportMediaOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Monotonic milliseconds. */
   now?: () => number;
+  /** The ping's clock; a Worker's by default, so a hidden tab keeps pinging. */
+  ticker?: Ticker;
 }
 
 /** `hello_ack.video` into a {@link VideoConfig}; throws on a shape it cannot use. */
@@ -106,7 +109,7 @@ export class WebTransportMedia implements MediaTransport {
   private wt: WebTransport | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
-  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private stopTicker: (() => void) | null = null;
   private pingId = 0;
   private closed = false;
   /** Closes the attempt in flight; null once one has connected or ended. */
@@ -208,8 +211,8 @@ export class WebTransportMedia implements MediaTransport {
   }
 
   private stopPings(): void {
-    if (this.pingTimer !== null) clearInterval(this.pingTimer);
-    this.pingTimer = null;
+    this.stopTicker?.();
+    this.stopTicker = null;
   }
 
   private send(message: object): void {
@@ -331,7 +334,7 @@ export class WebTransportMedia implements MediaTransport {
     sink.config(config);
     const ping = () => this.send({ type: "ping", id: ++this.pingId, tc: this.now() });
     ping();
-    this.pingTimer = setInterval(ping, PING_MS);
+    this.stopTicker = (this.opts.ticker ?? workerTicker)(PING_MS, ping);
     void (async () => {
       try {
         for (let m = await next(); m && live.on; m = await next()) {

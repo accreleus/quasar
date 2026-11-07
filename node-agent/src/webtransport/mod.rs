@@ -790,12 +790,14 @@ async fn streams(session: Session, control: oneshot::Sender<(SendStream, RecvStr
 
 /// Before `hello_ack` every datagram is dropped (§Before `hello`); after it, input
 /// (`0x03`) goes to the session's devices. Microphone (`0x05`) is a later ticket.
-async fn datagrams(session: Session, authed: Arc<OnceLock<Arc<Media>>>) {
+async fn datagrams(session: Session, authed: Arc<OnceLock<(Arc<Media>, u64)>>) {
     while let Ok(datagram) = session.read_datagram().await {
-        let Some(media) = authed.get() else { continue };
+        let Some((media, client)) = authed.get() else {
+            continue;
+        };
         if let Some((&CHANNEL_INPUT, body)) = datagram.split_first() {
             if let Ok(json) = std::str::from_utf8(body) {
-                media.input_event(json, true);
+                media.input_event(*client, json, true);
             }
         }
     }
@@ -900,7 +902,7 @@ async fn authenticate(
     hello: Hello,
     slot: Slot,
     deadline: Instant,
-    authed: &OnceLock<Arc<Media>>,
+    authed: &OnceLock<(Arc<Media>, u64)>,
 ) {
     // Checked before the token is spent: a peer that cannot take 1200-byte-budget
     // datagrams (or none) could never be sent video.
@@ -956,7 +958,7 @@ async fn authenticate(
         return;
     }
     drop(slot);
-    let _ = authed.set(media.clone());
+    let _ = authed.set((media.clone(), client.id));
     stream(session, send, recv, &media, client).await;
 }
 
@@ -1031,7 +1033,7 @@ async fn stream(
                         Some("keyframe_request") => media.keyframe(),
                         Some("input") => {
                             if let Some(event) = message.get("event") {
-                                media.input_event(&event.to_string(), false);
+                                media.input_event(client.id, &event.to_string(), false);
                             }
                         }
                         Some("ping") => {
@@ -1052,7 +1054,6 @@ async fn stream(
     };
     reader.abort();
     media.detach(client.id);
-    media.release_all();
     if let Some(message) = message {
         let _ = tokio::time::timeout(CONTROL_WRITE, write_message(&mut send, &message)).await;
         let _ = send.finish();

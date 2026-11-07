@@ -84,13 +84,22 @@ struct State {
     pending_key: bool,
 }
 
+/// The client whose input the devices take: none (`0`) or its id, and the buttons of its last
+/// reliable `gp` per pad, since a datagram `gp` carries axes only.
+#[derive(Default)]
+struct Typing {
+    client: u64,
+    pads: std::collections::HashMap<u64, serde_json::Value>,
+}
+
 /// The tap's side of a session: fed by the GStreamer streaming thread, read by the
 /// connection task of the one client attached.
 pub(crate) struct Media {
     state: Mutex<State>,
     input: super::Input,
-    /// The buttons of the last reliable `gp` per pad: a datagram `gp` carries axes only.
-    pads: Mutex<std::collections::HashMap<u64, serde_json::Value>>,
+    /// Whose input reaches the devices. Held across the injection, so a client that stopped
+    /// being the attached one cannot slip an event in behind the release that ended it.
+    typing: Mutex<Typing>,
     encoder: glib::WeakRef<gst::Element>,
 }
 
@@ -107,16 +116,20 @@ impl Media {
         Arc::new(Self {
             state: Mutex::default(),
             input,
-            pads: Mutex::default(),
+            typing: Mutex::default(),
             encoder: encoder.downgrade(),
         })
     }
 
-    /// One client `input.md` event to the devices. A datagram can arrive after a
-    /// reliable event that followed it, so a datagram `gp` takes its buttons from the
-    /// last reliable one and never changes them; one for a pad with none is dropped.
-    /// Everything else passes through as sent.
-    pub(crate) fn input_event(&self, json: &str, datagram: bool) {
+    /// One `input.md` event from `client` to the devices; dropped unless it is the attached one.
+    /// A datagram can arrive after a reliable event that followed it, so a datagram `gp` takes
+    /// its buttons from the last reliable one and never changes them; one for a pad with none
+    /// is dropped. Everything else passes through as sent.
+    pub(crate) fn input_event(&self, client: u64, json: &str, datagram: bool) {
+        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        if typing.client != client {
+            return;
+        }
         if !json.contains("\"gp\"") {
             return (self.input.event)(json);
         }
@@ -125,21 +138,23 @@ impl Media {
         };
         if event.get("t").and_then(|t| t.as_str()) == Some("gp") {
             let pad = event.get("i").and_then(|i| i.as_u64()).unwrap_or(0);
-            let mut pads = self.pads.lock().unwrap_or_else(|e| e.into_inner());
             if datagram {
-                let Some(buttons) = pads.get(&pad) else {
+                let Some(buttons) = typing.pads.get(&pad) else {
                     return;
                 };
                 event["buttons"] = buttons.clone();
             } else {
-                pads.insert(pad, event.get("buttons").cloned().unwrap_or_default());
+                typing
+                    .pads
+                    .insert(pad, event.get("buttons").cloned().unwrap_or_default());
             }
         }
         (self.input.event)(&event.to_string());
     }
 
-    pub(crate) fn release_all(&self) {
-        self.pads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    /// Lift everything the devices hold and forget the pads. Called with `typing` locked.
+    fn release(&self, typing: &mut Typing) {
+        typing.pads.clear();
         (self.input.release_all)();
     }
 
@@ -164,16 +179,26 @@ impl Media {
         let config = st.config.clone()?;
         st.next_client += 1;
         let id = st.next_client;
-        if let Some(old) = st.client.replace(Client {
+        let displaced = st.client.replace(Client {
             id,
             tx,
             gone: gone.clone(),
             resync: false,
-        }) {
+        });
+        if let Some(old) = &displaced {
             let _ = old.gone.set(Gone::TakenOver);
         }
         st.want_key = true;
         drop(st);
+        {
+            // The new client's input starts from nothing held: what its predecessor held is
+            // lifted now, before the new client can send, and its late input is dropped.
+            let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+            typing.client = id;
+            if displaced.is_some() {
+                self.release(&mut typing);
+            }
+        }
         self.keyframe();
         Some(Attached {
             id,
@@ -183,10 +208,20 @@ impl Media {
         })
     }
 
+    /// The client is gone. If it is still the one the devices take input from, what it held is
+    /// lifted; a displaced client's was lifted when its successor attached, and the successor's
+    /// keys are not its to release.
     pub(crate) fn detach(&self, id: u64) {
-        let mut st = self.lock();
-        if st.client.as_ref().is_some_and(|c| c.id == id) {
-            st.client = None;
+        {
+            let mut st = self.lock();
+            if st.client.as_ref().is_some_and(|c| c.id == id) {
+                st.client = None;
+            }
+        }
+        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        if typing.client == id {
+            typing.client = 0;
+            self.release(&mut typing);
         }
     }
 
@@ -503,7 +538,7 @@ mod tests {
         let media = Arc::new(Media {
             state: Mutex::default(),
             input: crate::webtransport::tests::no_input(),
-            pads: Mutex::default(),
+            typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
         });
         media.on_caps(&caps(1280, &avcc), "s");
