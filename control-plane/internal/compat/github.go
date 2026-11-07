@@ -41,7 +41,11 @@ const (
 	maxListBytes  = 1 << 20        // amendment 57; also bounds a release's metadata
 	maxRedirects  = 5              // T2
 	githubTimeout = 10 * time.Second
-	latestKeep    = 5
+	// resolveTimeout bounds add-by-tag's whole sequence: metadata plus up to six checksum hops.
+	resolveTimeout = 15 * time.Second
+	// notFoundFor keeps repeated adds of a missing tag off GitHub's 60-an-hour anonymous budget.
+	notFoundFor = 5 * time.Minute
+	latestKeep  = 5
 )
 
 var (
@@ -87,6 +91,19 @@ type GitHub struct {
 	mu       sync.Mutex
 	cached   *latestOutcome
 	inflight chan struct{}
+	notFound map[string]time.Time // tag -> until
+	// limitedUntil is api.github.com's rate-limit window, shared by Resolve and Latest: both
+	// spend the same anonymous budget.
+	limitedUntil time.Time
+}
+
+func (g *GitHub) noteRateLimit(h http.Header) {
+	until := rateLimitWindow(h, g.now())
+	g.mu.Lock()
+	if until.After(g.limitedUntil) {
+		g.limitedUntil = until
+	}
+	g.mu.Unlock()
 }
 
 // NewGitHub builds the client: https only, the four GitHub hosts, no redirect followed by the
@@ -174,6 +191,18 @@ func readDecoded(resp *http.Response, limit int64) ([]byte, error) {
 // Resolve is add-by-tag's T1–T4: the release's metadata, the picked asset, then its checksum file,
 // fetched once and checked, and nothing else trusted.
 func (g *GitHub) Resolve(ctx context.Context, tag string) (Pin, error) {
+	ctx, cancel := context.WithTimeout(ctx, resolveTimeout)
+	defer cancel()
+	g.mu.Lock()
+	now := g.now()
+	missing, limited := now.Before(g.notFound[tag]), now.Before(g.limitedUntil)
+	g.mu.Unlock()
+	switch {
+	case missing:
+		return Pin{}, unverifiable("release_not_found", "no release %s (answered 404 within %v)", tag, notFoundFor)
+	case limited:
+		return Pin{}, ErrUpstream
+	}
 	resp, err := g.get(ctx, apiReleases+"/tags/"+tag)
 	if err != nil {
 		g.log.Warn("compat tools: reading a release failed", "tag", tag, "err", err)
@@ -183,7 +212,21 @@ func (g *GitHub) Resolve(ctx context.Context, tag string) (Pin, error) {
 	switch {
 	case resp.StatusCode == http.StatusOK:
 	case resp.StatusCode == http.StatusNotFound:
+		g.mu.Lock()
+		if g.notFound == nil {
+			g.notFound = map[string]time.Time{}
+		}
+		for t, until := range g.notFound {
+			if !now.Before(until) {
+				delete(g.notFound, t)
+			}
+		}
+		g.notFound[tag] = now.Add(notFoundFor)
+		g.mu.Unlock()
 		return Pin{}, unverifiable("release_not_found", "no release %s", tag)
+	case rateLimited(resp):
+		g.noteRateLimit(resp.Header)
+		return Pin{}, ErrUpstream
 	case outbound.IsRedirect(resp.StatusCode):
 		return Pin{}, unverifiable(reasonRedirectRefused, "release metadata answered %d; no redirect is followed there", resp.StatusCode)
 	default:
@@ -201,6 +244,9 @@ func (g *GitHub) Resolve(ctx context.Context, tag string) (Pin, error) {
 	}
 	if rel.TagName != tag {
 		return Pin{}, unverifiable("release_not_found", "github answered for %q", rel.TagName)
+	}
+	if rel.Draft || rel.Prerelease { // the available list never offers one either
+		return Pin{}, unverifiable("release_not_found", "%s is a draft or prerelease", tag)
 	}
 	name, size, hasSum, found := rel.pick()
 	switch {
@@ -280,6 +326,9 @@ func redirectAllowed(raw, tag string) error {
 			return errors.New("Location holds a control character, space, backslash or fragment")
 		}
 	}
+	if _, err := url.Parse(raw); err != nil {
+		return fmt.Errorf("Location does not parse: %w", err)
+	}
 	rest, ok := strings.CutPrefix(raw, "https://")
 	if !ok {
 		return errors.New("Location is not an absolute https URL")
@@ -320,9 +369,6 @@ func redirectAllowed(raw, tag string) error {
 	}
 	if !strings.HasPrefix(path, releasePath+tag+"/") {
 		return errors.New("Location path is outside the run's release")
-	}
-	if _, err := url.Parse(raw); err != nil {
-		return fmt.Errorf("Location does not parse: %w", err)
 	}
 	return nil
 }
@@ -388,12 +434,19 @@ func (g *GitHub) fetchLatestOnce(ctx context.Context) *latestOutcome {
 		return &latestOutcome{reason: reason, validUntil: until}
 	}
 	failWindow := now.Add(5 * time.Minute)
+	g.mu.Lock()
+	limited := g.limitedUntil
+	g.mu.Unlock()
+	if now.Before(limited) {
+		return fail("rate_limited", limited, "until", limited)
+	}
 	resp, err := g.get(ctx, apiReleases+"?per_page=10")
 	if err != nil {
 		return fail("unreachable", failWindow, "err", err)
 	}
 	defer resp.Body.Close()
 	if rateLimited(resp) {
+		g.noteRateLimit(resp.Header)
 		return fail("rate_limited", rateLimitWindow(resp.Header, now), "status", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {

@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -511,33 +510,31 @@ func (c *Converger) Closed(ctx context.Context, run jobs.Run) {
 	})
 }
 
-// steamNameRe is T6's grammar; a GE name must also start GE-Proton and carry no reserved prefix.
-var steamNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-
-func validGEName(n string) bool {
-	l := strings.ToLower(n)
-	return steamNameRe.MatchString(n) && strings.HasPrefix(n, "GE-Proton") && !strings.HasPrefix(l, "proton_") &&
-		!strings.HasPrefix(l, "steamlinuxruntime") && !strings.HasPrefix(l, "legacysteamruntime")
-}
-
 // bindName binds a tag's Steam name at its first succeeded install, in the statement that checks
-// it is still unbound (control-api.md §Install job, "A reported name that conflicts"). A name that
-// fails T6 or that another row holds marks the tool name_conflict, which takes it out of desired
-// state with nothing retried. A later host reporting another name needs nothing here: its row no
-// longer matches the bound name, so its first difference removes it by its own name, and its next
-// install carries expected_name and fails name_mismatch.
+// it is still unbound (control-api.md §Install job, "A reported name that conflicts"). A row only
+// ever binds its own asset stem (`<tag>-x86_64`, or `<tag>` for a plain asset): that is the name
+// GE-Proton's compatibilitytool.vdf registers, as every entry of the shipped list in tools.go has
+// (TestShippedNamesAreTheirAssetStems), so a tag row can never take another tag's name. Any other
+// name, or one another row holds, marks the tool name_conflict, which takes it out of desired state
+// with nothing retried.
+//
+// shortcut: a host whose succeeded install reports a name other than the bound one is not marked
+// with a name_mismatch hold here; its first difference removes it by its own name, and the next
+// install carries expected_name and fails name_mismatch at the agent. Identical bytes always carry
+// the same vdf, so only a misbehaving agent reaches this.
 func (c *Converger) bindName(ctx context.Context, run jobs.Run, toolID, tag, sha, name string) {
-	if validGEName(name) {
-		bound, err := c.pool.Exec(ctx, `UPDATE compat_tools SET steam_name = $2, display_name = $2
-			WHERE id = $1::uuid AND steam_name IS NULL
-			  AND NOT EXISTS (SELECT 1 FROM compat_tools WHERE steam_name = $2)`, toolID, name)
-		if err != nil {
-			c.log.Warn("compat tools: binding a Steam name failed", "tool_id", toolID, "err", err)
-			return
-		}
-		if bound.RowsAffected() == 1 {
-			return
-		}
+	bound, err := c.pool.Exec(ctx, `UPDATE compat_tools SET steam_name = $2, display_name = $2
+		WHERE id = $1::uuid AND steam_name IS NULL AND $2 = left(asset_name, -length('.tar.gz'))
+		  AND NOT EXISTS (SELECT 1 FROM compat_tools WHERE steam_name = $2)`, toolID, name)
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.As(err, &pgErr) && pgErr.Code == "23505":
+		// Another row bound the name after our NOT EXISTS read it: held, so a conflict.
+	case err != nil:
+		c.log.Warn("compat tools: binding a Steam name failed", "tool_id", toolID, "err", err)
+		return
+	case bound.RowsAffected() == 1:
+		return
 	}
 	ct, err := c.pool.Exec(ctx, `UPDATE compat_tools SET name_conflict = true
 		WHERE id = $1::uuid AND steam_name IS NULL AND NOT name_conflict`, toolID)

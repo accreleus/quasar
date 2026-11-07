@@ -199,6 +199,7 @@ func TestAChecksumFileThatDoesNotMatchTheAssetIsRefused(t *testing.T) {
 		"empty":               "",
 		"over 4 KiB":          addSHA + "  " + addAsset + strings.Repeat(" ", 5000),
 		"trailing blank line": addSHA + "  " + addAsset + "\n\n",
+		"CRLF":                addSHA + "  " + addAsset + "\r\n",
 	} {
 		if sum == "" {
 			sum = "\n"
@@ -225,6 +226,99 @@ func TestATagNotFoundIsRefused(t *testing.T) {
 	_, g = newFakeGitHub(t, release(addTag, map[string]int64{addAsset: maxAssetBytes + 1, addSum: 1}, addSHA+"  "+addAsset))
 	if _, err := g.Resolve(context.Background(), addTag); reasonOf(t, err) != "asset_too_large" {
 		t.Errorf("too large: %v", err)
+	}
+}
+
+func TestAPrereleaseOrDraftIsRefused(t *testing.T) {
+	for _, field := range []string{"prerelease", "draft"} {
+		inner := release(addTag, goodAssets(), addSHA+"  "+addAsset)
+		f, g := newFakeGitHub(t, func(host string, w http.ResponseWriter, r *http.Request) {
+			if host == "api.github.com" {
+				io.WriteString(w, strings.Replace(releaseJSON(addTag, goodAssets()), `"`+field+`":false`, `"`+field+`":true`, 1))
+				return
+			}
+			inner(host, w, r)
+		})
+		if _, err := g.Resolve(context.Background(), addTag); reasonOf(t, err) != "release_not_found" || f.hit("github.com") != 0 {
+			t.Errorf("%s: %v after %d checksum requests", field, err, f.hit("github.com"))
+		}
+	}
+}
+
+func TestAMissingTagIsRememberedForFiveMinutes(t *testing.T) {
+	f, g := newFakeGitHub(t, release("GE-Proton1-1", goodAssets(), ""))
+	c := &clock{t: time.Date(2026, 11, 7, 1, 0, 0, 0, time.UTC)}
+	g.now = c.now
+	for i := 0; i < 3; i++ {
+		if _, err := g.Resolve(context.Background(), addTag); reasonOf(t, err) != "release_not_found" {
+			t.Fatalf("try %d: %v", i, err)
+		}
+		c.add(time.Minute)
+	}
+	if n := f.hit("api.github.com"); n != 1 {
+		t.Errorf("%d requests for a missing tag within 5 minutes, want 1", n)
+	}
+	c.add(2 * time.Minute)
+	g.Resolve(context.Background(), addTag)
+	if n := f.hit("api.github.com"); n != 2 {
+		t.Errorf("%d requests after 5 minutes, want 2", n)
+	}
+}
+
+func TestResolveAndTheListShareOneRateLimitWindow(t *testing.T) {
+	var limited atomic.Bool
+	limited.Store(true)
+	inner := release(addTag, goodAssets(), addSHA+"  "+addAsset)
+	f, g := newFakeGitHub(t, func(host string, w http.ResponseWriter, r *http.Request) {
+		if host == "api.github.com" && limited.Load() {
+			w.Header().Set("Retry-After", "1800")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if host == "api.github.com" && r.URL.Path == "/repos/"+project+"/releases" {
+			io.WriteString(w, listJSON(ok("GE-Proton11-20", "")))
+			return
+		}
+		inner(host, w, r)
+	})
+	c := &clock{t: time.Date(2026, 11, 7, 1, 0, 0, 0, time.UTC)}
+	g.now = c.now
+	if _, err := g.Resolve(context.Background(), addTag); !errors.Is(err, ErrUpstream) {
+		t.Fatalf("rate-limited add: %v", err)
+	}
+	limited.Store(false)
+	c.add(10 * time.Minute)
+	if _, err := g.Resolve(context.Background(), addTag); !errors.Is(err, ErrUpstream) {
+		t.Errorf("add inside the window: %v", err)
+	}
+	out, _ := g.Latest(context.Background())
+	if out.reason != "rate_limited" || f.hit("api.github.com") != 1 {
+		t.Errorf("list inside an add's window: %q after %d requests, want rate_limited and no request", out.reason, f.hit("api.github.com"))
+	}
+	c.add(21 * time.Minute)
+	if _, err := g.Resolve(context.Background(), addTag); err != nil {
+		t.Errorf("add after the window: %v", err)
+	}
+
+	// And the other way: a rate-limited list holds adds back.
+	f2, g2, c2 := latestGitHub(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "1200")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	g2.Latest(context.Background())
+	c2.add(time.Minute)
+	if _, err := g2.Resolve(context.Background(), addTag); !errors.Is(err, ErrUpstream) || f2.hit("api.github.com") != 1 {
+		t.Errorf("add inside the list's window: %v after %d requests", err, f2.hit("api.github.com"))
+	}
+}
+
+// A tag row binds only its own asset stem (Converger.bindName), which is the name every shipped
+// GE-Proton entry registers.
+func TestShippedNamesAreTheirAssetStems(t *testing.T) {
+	for _, r := range recommended {
+		if r.SteamName != strings.TrimSuffix(r.Asset, ".tar.gz") || !strings.HasPrefix(r.Asset, r.Tag) {
+			t.Errorf("%s: steam_name %s, asset %s", r.Tag, r.SteamName, r.Asset)
+		}
 	}
 }
 

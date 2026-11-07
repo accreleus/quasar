@@ -10,8 +10,12 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/audit"
+	"github.com/accreleus/quasar/control-plane/internal/jobs"
 )
 
 // errOf is the error envelope's code and message.
@@ -90,7 +94,7 @@ func TestAddByTagRefusalsStoreNothing(t *testing.T) {
 	}{
 		{"missing checksum", `{"tag":"` + addTag + `"}`, release(addTag, map[string]int64{addAsset: 5}, ""), 422, "compat_tool_unverifiable", "checksum_missing"},
 		{"checksum names another file", `{"tag":"` + addTag + `"}`, release(addTag, goodAssets(), addSHA+"  other.tar.gz"), 422, "compat_tool_unverifiable", "checksum_malformed"},
-		{"tag not found", `{"tag":"` + addTag + `"}`, release("GE-Proton1-1", goodAssets(), ""), 422, "compat_tool_unverifiable", "release_not_found"},
+		{"tag not found", `{"tag":"GE-Proton11-99"}`, release("GE-Proton1-1", goodAssets(), ""), 422, "compat_tool_unverifiable", "release_not_found"},
 		{"non-github redirect", `{"tag":"` + addTag + `"}`, redirect, 422, "compat_tool_unverifiable", reasonRedirectRefused},
 		{"github down", `{"tag":"` + addTag + `"}`, func(_ string, w http.ResponseWriter, _ *http.Request) { w.WriteHeader(502) }, 503, "upstream_unavailable", ""},
 		{"tag outside the grammar", `{"tag":"GE-Proton11-13; rm"}`, nil, 400, "validation_failed", ""},
@@ -152,7 +156,9 @@ func TestATagInstallsWithItsPinAndBindsItsSteamName(t *testing.T) {
 }
 
 func TestAFirstReportedNameThatCannotBeBoundMarksANameConflict(t *testing.T) {
-	for _, name := range []string{"proton_9", "Proton-GE", recommended[0].SteamName} {
+	// Only the row's own asset stem binds: a bare tag for an x86_64 asset, another tag's name
+	// (here the shipped entry's) and names T6 refuses all conflict.
+	for _, name := range []string{"proton_9", "Proton-GE", recommended[0].SteamName, addTag, "GE-Proton11-13-x86_64-custom"} {
 		h := newHarness(t)
 		a := h.host("a", true)
 		id := h.addTag()
@@ -176,6 +182,86 @@ func TestAFirstReportedNameThatCannotBeBoundMarksANameConflict(t *testing.T) {
 		if st := toolState(h.card(a), id); st["state"] != "failed" || st["reason"] != "name_conflict" {
 			t.Errorf("%s: host state %v, want failed with name_conflict", name, st)
 		}
+	}
+}
+
+func TestReconcileCompletesWhenAnotherRowHoldsAShippedName(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	r := recommended[0]
+	// A tag row bound to the shipped entry's name before that entry was ever inserted, and a GE
+	// row wrongly marked recommended that the rest of the reconcile must still correct.
+	var holder string
+	if err := pool.QueryRow(ctx, `INSERT INTO compat_tools (family, source, tag, steam_name, display_name, asset_name, asset_size_bytes, asset_sha512)
+		VALUES ('ge', 'tag', 'GE-Proton11-13', $1, $1, 'GE-Proton11-13-x86_64.tar.gz', 5, $2) RETURNING id::text`,
+		r.SteamName, strings.Repeat("cd", 64)).Scan(&holder); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO compat_tools (family, source, tag, display_name, recommended, asset_name, asset_size_bytes, asset_sha512)
+		VALUES ('ge', 'tag', 'GE-Proton10-1', 'GE-Proton10-1', true, 'GE-Proton10-1.tar.gz', 5, $1)`, strings.Repeat("ef", 64)); err != nil {
+		t.Fatal(err)
+	}
+	s := NewStore(pool)
+	s.Auditor = audit.NewStore(pool)
+	for i := 0; i < 2; i++ {
+		if err := s.Reconcile(ctx); err != nil {
+			t.Fatalf("reconcile %d: %v; one entry must never stop the boot reconcile", i, err)
+		}
+	}
+	if n := countRows(t, pool, `SELECT count(*) FROM compat_tools WHERE family = 'valve'`); n != len(valveTools) {
+		t.Errorf("%d valve rows, want %d", n, len(valveTools))
+	}
+	if n := countRows(t, pool, `SELECT count(*) FROM compat_tools WHERE tag = 'GE-Proton10-1' AND recommended`); n != 0 {
+		t.Error("the reconcile stopped before correcting recommended")
+	}
+	if n := countRows(t, pool, `SELECT count(*) FROM compat_tools WHERE id = $1::uuid AND name_conflict`, holder); n != 1 {
+		t.Error("the holder of the shipped name is not marked name_conflict")
+	}
+	if n := countRows(t, pool, `SELECT count(*) FROM admin_activity WHERE action = 'compat_tool.name_conflict'
+		AND target_id = $1 AND actor_user_id IS NULL AND details->>'shipped_tag' = $2`, holder, r.Tag); n != 1 {
+		t.Errorf("%d system name_conflict audit rows for the holder, want 1 (a second boot adds none)", n)
+	}
+}
+
+func countRows(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), sql, args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestTwoRowsRacingForOneNameLeaveOneMarked(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	id := h.addTag()
+	name := addTag + "-x86_64"
+	// Another transaction takes the name after bindName's NOT EXISTS has read it: the UPDATE waits
+	// on the uncommitted row and then fails the unique index.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO compat_tools (family, source, tag, steam_name, display_name, asset_name, asset_size_bytes, asset_sha512)
+		VALUES ('ge', 'tag', 'GE-Proton11-14', $1, $1, 'GE-Proton11-14-x86_64.tar.gz', 5, $2)`, name, strings.Repeat("cd", 64)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		h.conv.bindName(ctx, jobs.Run{ID: "00000000-0000-4000-8000-000000000001", HostID: zeroHost}, id, addTag, addSHA, name)
+		close(done)
+	}()
+	time.Sleep(300 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	var conflict bool
+	var steam *string
+	if err := h.pool.QueryRow(ctx, `SELECT name_conflict, steam_name FROM compat_tools WHERE id = $1::uuid`, id).Scan(&conflict, &steam); err != nil ||
+		!conflict || steam != nil {
+		t.Errorf("after losing the race: name_conflict %v steam_name %v (%v), want marked and unbound", conflict, steam, err)
 	}
 }
 
