@@ -642,7 +642,8 @@ func (c *Coordinator) claimCandidate(ctx context.Context, p *CreateParams, k par
 	ps.applyTo(&prov)
 	p.Width, p.Height, p.FPS, p.BitrateKbps = prov.Width, prov.Height, prov.FPS, prov.BitrateKbps
 	p.Codec, p.Playout0Ms = prov.Codec, prov.Playout0Ms
-	p.claim = &parkedClaim{id: k.ID, hostParks: c.hostParks(k.HostID), restream: c.hostRestreams(k.HostID)}
+	p.claim = &parkedClaim{id: k.ID, hostParks: c.hostParks(k.HostID), restream: c.hostRestreams(k.HostID),
+		transport: transportOrWebRTC(prov.Transport)}
 	return ps, nil
 }
 
