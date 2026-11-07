@@ -259,7 +259,7 @@ func TestTakenOverErrorDuringTheAttachFlushClosesWith4410(t *testing.T) {
 	sess, token := seedAssignedSession(t, pool)
 
 	big := `{"type":"ice","pc":"video","candidate":"` + strings.Repeat("x", 64<<10) + `"}`
-	for i := 0; i < 255; i++ {
+	for i := 0; i < 254; i++ {
 		if err := relay.Deliver(sess.ID, []byte(big)); err != nil {
 			t.Fatalf("buffer frame %d: %v", i, err)
 		}
@@ -278,9 +278,16 @@ func TestTakenOverErrorDuringTheAttachFlushClosesWith4410(t *testing.T) {
 	if err := relay.Deliver(sess.ID, []byte(`{"type":"error","code":"taken_over","message":"taken over by a webtransport client"}`)); err != nil {
 		t.Fatal(err)
 	}
+	// Queued behind the error: it must not reach the browser.
+	if err := relay.Deliver(sess.ID, []byte(`{"type":"ice","pc":"video","candidate":"behind the error"}`)); err != nil {
+		t.Fatal(err)
+	}
 	for {
-		_, _, err := conn.ReadMessage()
+		_, frame, err := conn.ReadMessage()
 		if err == nil {
+			if strings.Contains(string(frame), "behind the error") {
+				t.Fatalf("a frame queued behind taken_over reached the browser")
+			}
 			continue
 		}
 		var ce *websocket.CloseError

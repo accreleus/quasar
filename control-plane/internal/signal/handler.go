@@ -326,19 +326,21 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 	}
 
 	// drainAgentFrames writes every frame the bus has already handed us and
-	// returns once the queue is momentarily empty. It reports whether one of
-	// them was a taken_over error: the caller owns the close, because the pump
-	// is not the only place such a frame can be written.
-	drainAgentFrames := func() (taken bool, err error) {
+	// returns once the queue is momentarily empty. It stops right after a
+	// taken_over error, as the pump does, and reports it: the caller owns the
+	// close, because the pump is not the only place such a frame can be written.
+	drainAgentFrames := func() (bool, error) {
 		for {
 			select {
 			case frame := <-fromAgent:
 				if err := writeToBrowser(frame); err != nil {
-					return taken, err
+					return false, err
 				}
-				taken = taken || isTakenOverError(frame)
+				if isTakenOverError(frame) {
+					return true, nil
+				}
 			default:
-				return taken, nil
+				return false, nil
 			}
 		}
 	}
