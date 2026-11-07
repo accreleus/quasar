@@ -621,7 +621,11 @@ mod tests {
         media.on_caps(&caps(960), "s");
         media.on_unit(&buffer(false)); // under the new configuration, before its keyframe
         media.on_unit(&buffer(true));
-        assert_eq!(seqs(&mut client.rx), [0, 1, 2], "no gap for a unit never sent");
+        assert_eq!(
+            seqs(&mut client.rx),
+            [0, 1, 2],
+            "no gap for a unit never sent"
+        );
 
         for _ in 0..=CLIENT_QUEUE {
             media.on_unit(&buffer(false)); // the last one finds the queue full
@@ -631,7 +635,11 @@ mod tests {
         assert_eq!(got.len(), CLIENT_QUEUE, "the queue held its fill");
         assert_eq!(got.last(), Some(&(2 + CLIENT_QUEUE as u16)));
         media.on_unit(&buffer(true));
-        assert_eq!(seqs(&mut client.rx), [3 + CLIENT_QUEUE as u16], "the refused unit gave its number back");
+        assert_eq!(
+            seqs(&mut client.rx),
+            [3 + CLIENT_QUEUE as u16],
+            "the refused unit gave its number back"
+        );
     }
 
     #[test]
