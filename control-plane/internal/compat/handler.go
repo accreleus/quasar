@@ -52,6 +52,8 @@ func (h *Handler) Register(mux httpx.Router, admin func(http.Handler) http.Handl
 	mux.Handle("GET /v1/admin/compat-tools/available", admin(http.HandlerFunc(h.handleAvailable)))
 	mux.Handle("PUT /v1/admin/compat-tools/default", admin(http.HandlerFunc(h.handleSetDefault)))
 	mux.Handle("PATCH /v1/admin/compat-tools/{id}", admin(http.HandlerFunc(h.handlePatch)))
+	mux.Handle("DELETE /v1/admin/compat-tools/{id}", admin(http.HandlerFunc(h.handleDelete)))
+	mux.Handle("POST /v1/admin/compat-tools/{id}/force-remove", admin(http.HandlerFunc(h.handleForceRemove)))
 	mux.Handle("GET /v1/admin/hosts/{id}/compat-tools", admin(http.HandlerFunc(h.handleHostCard)))
 	mux.Handle("GET /v1/admin/compat-tools/mappings", admin(http.HandlerFunc(h.handleListMappings)))
 	mux.Handle("PUT /v1/admin/compat-tools/mappings/steam/{external_id}", admin(http.HandlerFunc(h.handleSetMapping)))
@@ -251,6 +253,99 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.writeTool(w, r, id, http.StatusOK)
+}
+
+func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, httpx.CodeUnauthorized, "authentication required")
+		return
+	}
+	id := r.PathValue("id")
+	if !uuidRe.MatchString(id) {
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
+		return
+	}
+	tag, sha, err := h.store.Delete(r.Context(), id)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
+	case errors.Is(err, ErrNotDeletable):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "this tool cannot be deleted; disable it instead")
+	case err != nil:
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not delete the compatibility tool")
+	default:
+		audit.TryRecord(r.Context(), h.auditor, user.ID, "compat_tool.delete", "compat_tool", id,
+			map[string]any{"tag": tag, "sha512": sha, "host_ids": []string{}})
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (h *Handler) handleForceRemove(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, httpx.CodeUnauthorized, "authentication required")
+		return
+	}
+	id := r.PathValue("id")
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&struct{}{}); err != nil || dec.Decode(&json.RawMessage{}) != io.EOF {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "body must be {}")
+		return
+	}
+	if !uuidRe.MatchString(id) {
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
+		return
+	}
+	res, err := h.store.ForceRemove(r.Context(), id)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
+		return
+	case errors.Is(err, ErrValve):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Quasar installs no Valve build; there is nothing to remove")
+		return
+	case err != nil:
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not force-remove the compatibility tool")
+		return
+	}
+	details := map[string]any{"tag": res.Tag, "sha512": res.SHA512, "mappings_cleared": res.MappingsCleared,
+		"default_cleared": res.DefaultCleared, "sessions_stopped": res.SessionsStopped}
+	// Two id lists must fit the 4096-byte details bound together, so each is cut at auditIDs.
+	capIDs(details, "host_ids", res.HostIDs)
+	capIDs(details, "stopped_session_ids", res.StoppedIDs)
+	audit.TryRecord(r.Context(), h.auditor, user.ID, "compat_tool.force_remove", "compat_tool", id, details)
+	if h.conv != nil {
+		h.conv.All(r.Context(), true)
+	}
+	items, _, err := h.listCounted(r.Context())
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not read the compatibility tool")
+		return
+	}
+	for _, it := range items {
+		if it.ID == id {
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"tool": it, "mappings_cleared": res.MappingsCleared,
+				"default_cleared": res.DefaultCleared, "sessions_stopped": res.SessionsStopped})
+			return
+		}
+	}
+	httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
+}
+
+// auditIDs is the most ids of one list a force-remove audit row carries (two lists share 4096 bytes).
+const auditIDs = 40
+
+// capIDs sets details[key] to ids, cut at auditIDs with key+"_truncated" past that.
+func capIDs(details map[string]any, key string, ids []string) {
+	if ids == nil {
+		ids = []string{}
+	}
+	if len(ids) > auditIDs {
+		ids, details[key+"_truncated"] = ids[:auditIDs], true
+	}
+	details[key] = ids
 }
 
 // listCounted is the catalogue with each GE tool's per-host counts.

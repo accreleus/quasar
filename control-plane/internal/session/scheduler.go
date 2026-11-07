@@ -89,6 +89,9 @@ type CreateParams struct {
 	// in the candidate query only: never a filter, never in the re-check, the
 	// totals probe or a diagnostic. Empty renders nothing.
 	CodecPreference []string
+	// CompatGameID is the Steam appid of the game this launch names ("" for none). A per-game GE
+	// compat-tool mapping on it restricts placement to hosts where the tool is usable.
+	CompatGameID string
 	// Kind is KindParked for a warm Steam (amendment 39); "" is a play.
 	Kind string
 	// claim adopts the caller's parked session (control-api.md §Warm Steam,
@@ -659,6 +662,9 @@ func classifyRejectPlain(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 	}
 	if !totalsFit {
 		rej := noHostRejection(ctx, tx, cand.p.AppImage)
+		if compatRej := compatToolRejection(ctx, tx, cand, rej); compatRej != nil {
+			return compatRej
+		}
 		if cand.p.homePinned {
 			// Only a host that is gone or offline: a draining one is connected and
 			// comes back by itself, so it keeps the generic text.
@@ -726,6 +732,46 @@ func (e *NoHostRejection) Error() string {
 }
 
 func (e *NoHostRejection) Unwrap() error { return e.err }
+
+// CompatToolRejection marks a no_host_available refusal whose sole cause is the launched game's
+// per-game GE tool: no online host can run it yet. Tool is the tag; Usable is false when the tool
+// is disabled or marked, so no host will ever have it. It names no host.
+type CompatToolRejection struct {
+	err    error
+	Tool   string
+	Usable bool
+}
+
+func (e *CompatToolRejection) Error() string {
+	return fmt.Sprintf("%v (compat tool %s, usable=%t)", e.err, e.Tool, e.Usable)
+}
+
+func (e *CompatToolRejection) Unwrap() error { return e.err }
+
+// compatToolRejection returns the compat_tool_missing refusal when the compat gate is the only
+// reason the totals probe failed (the same probe without it fits), nil otherwise, and nil on a query
+// failure so the generic refusal stands.
+func compatToolRejection(ctx context.Context, tx pgx.Tx, cand candidacy, rej error) error {
+	if cand.p.CompatGameID == "" {
+		return nil
+	}
+	gameID := cand.p.CompatGameID
+	cand.p.CompatGameID = ""
+	sql, args := cand.totalsQuery()
+	var fits bool
+	if tx.QueryRow(ctx, sql, args...).Scan(&fits) != nil || !fits {
+		return nil
+	}
+	r := &CompatToolRejection{err: rej}
+	if tx.QueryRow(ctx, `
+		SELECT t.tag, t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict
+		FROM compat_tool_mappings m JOIN compat_tools t ON t.id = m.tool_id
+		WHERE m.provider = 'steam' AND m.external_id = $1 AND t.family = 'ge'`,
+		gameID).Scan(&r.Tool, &r.Usable) != nil {
+		return nil
+	}
+	return r
+}
 
 // HomeHostOfflineRejection marks a no_host_available refusal whose cause is that
 // the user's managed home is claimed by a host that is offline or gone (a host that

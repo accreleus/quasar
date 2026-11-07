@@ -6,7 +6,9 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -183,12 +185,79 @@ func TestASlowRecordWriteDoesNotBlockTheAssign(t *testing.T) {
 
 	in := agentws.SessionAssignCmd{SessionID: id, CompatTools: &agentws.CompatToolsSpec{Mount: []string{}}}
 	start := time.Now()
-	out := f.coord.fitCompatTools(in, compatEpoch{})
+	out, _ := f.coord.fitCompatTools(in, compatEpoch{}, f.hostID)
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("the record write blocked for %v, want it cut at the timeout", d)
 	}
-	if out.CompatTools == nil {
-		t.Error("the assign lost compat_tools because the record write was slow")
+	if out.CompatTools != nil {
+		t.Errorf("compat_tools = %+v after a record that timed out, want none: nothing is mounted unrecorded", out.CompatTools)
+	}
+}
+
+// installGE enables the shipped GE tool and installs it on f's host; it returns the tool's Steam name.
+func installGE(t *testing.T, f *warmFixture) string {
+	t.Helper()
+	var name, tag, sha string
+	must(t, f.pool.QueryRow(context.Background(), `SELECT steam_name, tag, asset_sha512 FROM compat_tools WHERE family = 'ge' LIMIT 1`).
+		Scan(&name, &tag, &sha))
+	must(t, exec(t, f.pool, `UPDATE compat_tools SET enabled = true, first_enabled_at = now() WHERE steam_name = '`+name+`'`))
+	must(t, exec(t, f.pool, `DELETE FROM host_compat_tools`))
+	must(t, exec(t, f.pool, `INSERT INTO host_compat_tools (host_id, name, tag, sha512, bytes) VALUES ('`+f.hostID+`'::uuid, '`+name+`', '`+tag+`', '`+sha+`', 5)`))
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `DELETE FROM host_compat_tools; UPDATE compat_tools SET enabled = false WHERE family = 'ge'`)
+	})
+	return name
+}
+
+func recordedNames(t *testing.T, f *warmFixture, id string) []string {
+	t.Helper()
+	var names []string
+	must(t, f.pool.QueryRow(context.Background(), `SELECT compat_tool_names FROM sessions WHERE id = $1::uuid`, id).Scan(&names))
+	return names
+}
+
+// The mount is decided and recorded in one transaction that holds the tool rows' share locks
+// (control-api.md §Usable): a force-remove that locked the row first leaves the tool out, and one
+// that comes after finds the name recorded.
+func TestAForceRemoveLockedFirstLeavesTheToolOutOfTheMount(t *testing.T) {
+	f := compatFixture(t, true)
+	name := installGE(t, f)
+	_, id := parkedAssign(t, f)
+	if got := recordedNames(t, f, id); len(got) != 1 || got[0] != name {
+		t.Fatalf("recorded names = %v, want [%s] on an installed, enabled tool", got, name)
+	}
+	spec := f.coord.compatToolsFor(f.steam, f.hostID) // the advisory read still sees the tool
+	if spec == nil || len(spec.Mount) != 1 {
+		t.Fatalf("advisory spec = %+v, want the tool mounted", spec)
+	}
+
+	ctx := context.Background()
+	tx, err := f.pool.Begin(ctx)
+	must(t, err)
+	defer tx.Rollback(ctx) //nolint:errcheck
+	_, err = tx.Exec(ctx, `SELECT 1 FROM compat_tools WHERE steam_name = $1 FOR UPDATE`, name)
+	must(t, err)
+
+	done := make(chan agentws.SessionAssignCmd, 1)
+	go func() {
+		out, _ := f.coord.fitCompatTools(agentws.SessionAssignCmd{SessionID: id, CompatTools: spec}, compatEpoch{}, f.hostID)
+		done <- out
+	}()
+	select {
+	case <-done:
+		t.Fatal("the launch read the mount without waiting for the row lock held by the disable")
+	case <-time.After(300 * time.Millisecond):
+	}
+	_, err = tx.Exec(ctx, `UPDATE compat_tools SET enabled = false WHERE steam_name = $1`, name)
+	must(t, err)
+	must(t, tx.Commit(ctx))
+
+	out := <-done
+	if out.CompatTools == nil || len(out.CompatTools.Mount) != 0 {
+		t.Errorf("mount = %+v, want the force-removed tool left out", out.CompatTools)
+	}
+	if got := recordedNames(t, f, id); len(got) != 0 {
+		t.Errorf("recorded names = %v, want none: the tool was never mounted", got)
 	}
 }
 
@@ -209,5 +278,117 @@ func TestAFailingCompatReadLeavesTheLaunchGoingThrough(t *testing.T) {
 	must(t, f.pool.QueryRow(context.Background(), `SELECT state FROM sessions WHERE id = $1::uuid`, id).Scan(&state))
 	if state == "failed" || state == "stopped" {
 		t.Errorf("the session is %s, want the launch to go on", state)
+	}
+}
+
+// An adoption keeps what the parked Steam mounted when it started: the claim copies the names, and
+// the fit neither re-reads nor overwrites them (control-api.md §Warm Steam, claim).
+func TestAnAdoptionKeepsTheParkedSessionsMountedNames(t *testing.T) {
+	f := newSupersedeFixture(t)
+	ctx := context.Background()
+	must(t, exec(t, f.pool, `UPDATE sessions SET compat_tool_names = ARRAY['GE-Proton9-1'] WHERE id = $1::uuid`, f.parkedA))
+	tx, err := f.pool.Begin(ctx)
+	must(t, err)
+	must(t, adoptRuntime(ctx, tx, f.parkedA, f.play))
+	must(t, tx.Commit(ctx))
+
+	spec := f.coord.compatToolsFor(f.steam, f.hostID)
+	out, err := f.coord.fitCompatTools(agentws.SessionAssignCmd{SessionID: f.play, AdoptSessionID: f.parkedA, CompatTools: spec}, compatEpoch{}, f.hostID)
+	must(t, err)
+	if out.CompatTools == nil {
+		t.Error("the adopting assign lost compat_tools")
+	}
+	if got := recordedNames(t, f.warmFixture, f.play); len(got) != 1 || got[0] != "GE-Proton9-1" {
+		t.Errorf("adopting session names = %v, want the parked session's [GE-Proton9-1], though that tool is not mounted by a fresh read", got)
+	}
+}
+
+// The other order: the launch has recorded the tool, so force-remove's stop step finds the session.
+func TestAForceRemoveAfterTheLaunchRecordedStopsThatSession(t *testing.T) {
+	f := newSupersedeFixture(t)
+	ctx := context.Background()
+	name := installGE(t, f.warmFixture)
+	spec := f.coord.compatToolsFor(f.steam, f.hostID)
+	_, err := f.coord.fitCompatTools(agentws.SessionAssignCmd{SessionID: f.play, CompatTools: spec}, compatEpoch{}, f.hostID)
+	must(t, err)
+	if got := recordedNames(t, f.warmFixture, f.play); len(got) != 1 || got[0] != name {
+		t.Fatalf("recorded names = %v, want [%s]", got, name)
+	}
+	var geID string
+	must(t, f.pool.QueryRow(ctx, `SELECT id::text FROM compat_tools WHERE steam_name = $1`, name).Scan(&geID))
+	var stopped []string
+	f.cs.Stopper = func(_ context.Context, id string) error { stopped = append(stopped, id); return nil }
+	res, err := f.cs.ForceRemove(ctx, geID)
+	must(t, err)
+	if len(stopped) != 1 || stopped[0] != f.play || len(res.StoppedIDs) != 1 || res.StoppedIDs[0] != f.play {
+		t.Errorf("stopped %v, result %v, want exactly the launch that recorded the tool (%s)", stopped, res.StoppedIDs, f.play)
+	}
+}
+
+// The game's mapped GE tool is disabled between placement and the assign: the launch is refused
+// (control-api.md §Placement: never placed for a tool it will not be given), not started without it.
+func TestALaunchWhoseMappedToolWasDisabledAfterPlacementIsRefused(t *testing.T) {
+	f := newSupersedeFixture(t)
+	name := installGE(t, f.warmFixture)
+	must(t, exec(t, f.pool, `UPDATE apps SET external_source = 'steam', external_id = '1145360' WHERE id = (SELECT app_id FROM sessions WHERE id = $1::uuid)`, f.play))
+	must(t, exec(t, f.pool, `DELETE FROM compat_tool_mappings`))
+	must(t, exec(t, f.pool, `INSERT INTO compat_tool_mappings (provider, external_id, tool_id)
+		SELECT 'steam', '1145360', id FROM compat_tools WHERE steam_name = $1`, name))
+	spec := f.coord.compatToolsFor(f.steam, f.hostID)
+	if spec == nil || len(spec.Mount) != 1 {
+		t.Fatalf("advisory spec = %+v, want the tool mounted (it was usable at placement)", spec)
+	}
+	// Disabled after placement; a mapping may name a disabled tool only by this race.
+	must(t, exec(t, f.pool, `UPDATE compat_tools SET enabled = false WHERE steam_name = $1`, name))
+
+	in := agentws.SessionAssignCmd{SessionID: f.play, CompatTools: spec}
+	var missing *compat.ToolMissingError
+	if _, err := f.coord.fitCompatTools(in, compatEpoch{}, f.hostID); !errors.As(err, &missing) {
+		t.Fatalf("fit = %v, want a ToolMissingError", err)
+	}
+	if got := recordedNames(t, f.warmFixture, f.play); len(got) != 0 {
+		t.Errorf("recorded names = %v for a refused launch", got)
+	}
+}
+
+// Through the dispatch: the launch was placed while the game's mapped GE tool was usable, then the
+// tool was disabled before the assign was built. The session fails before the agent is told
+// anything; it never runs without the tool.
+func TestALaunchMappedToAnUnusableToolFailsBeforeTheAgent(t *testing.T) {
+	f := compatFixture(t, true)
+	name := installGE(t, f)
+	must(t, exec(t, f.pool, `UPDATE apps SET external_source = 'steam', external_id = '1145360' WHERE id = $1::uuid`, f.steam))
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `UPDATE apps SET external_source = '', external_id = '' WHERE id = $1::uuid`, f.steam)
+	})
+	must(t, exec(t, f.pool, `DELETE FROM compat_tool_mappings`))
+	must(t, exec(t, f.pool, `INSERT INTO compat_tool_mappings (provider, external_id, tool_id)
+		SELECT 'steam', '1145360', id FROM compat_tools WHERE steam_name = $1`, name))
+	p := compatLaunch(f.seedIDs, "1145360")
+	p.AppID = f.steam
+	sess, err := f.store.ScheduleAndCreate(context.Background(), p)
+	must(t, err) // placed: the host holds the tool
+	must(t, exec(t, f.pool, `UPDATE compat_tools SET enabled = false WHERE steam_name = $1`, name))
+	f.coord.dispatchAssignStart(sess, []byte(`{}`), nil)
+	res := LaunchResult{Session: sess}
+	deadline := time.Now().Add(5 * time.Second)
+	var row rowState
+	for time.Now().Before(deadline) {
+		if row = readRow(t, f.pool, res.Session.ID); row.State == "failed" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var msg *string
+	must(t, f.pool.QueryRow(context.Background(), `SELECT error_message FROM sessions WHERE id = $1::uuid`, res.Session.ID).Scan(&msg))
+	if row.State != "failed" || msg == nil || !strings.Contains(*msg, "compat_tool_missing") {
+		t.Fatalf("session = %+v, error %v, want failed with compat_tool_missing", row, msg)
+	}
+	f.disp.mu.Lock()
+	defer f.disp.mu.Unlock()
+	for _, a := range f.disp.assigns {
+		if a.SessionID == res.Session.ID {
+			t.Error("the agent was sent an assign for a launch whose tool is missing")
+		}
 	}
 }
