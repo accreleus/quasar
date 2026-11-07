@@ -78,3 +78,20 @@ of the decision:
   work exists to remove stays.
 - **Choosing it automatically in 0.6.** A false positive puts a 200 Mbit/s stream on a link that
   cannot hold it, so selection waits for bench evidence.
+
+## Amendment (2026-11-07, amendment 58, #1059): chosen at launch, `prefer` lets Auto pick it
+
+Decided with the owner on 2026-11-07, recorded on #1059 and in `protocol/codec-pyrowave.md`. This
+replaces "not automatic at all in 0.6" above; every other bound in this ADR stands (WebTransport
+only, LAN only, the agent's round-trip gate, the control plane grants and the agent applies).
+
+- **A profile's `pyrowave_mode` is `off`, `allow` or `prefer`**, replacing `pyrowave_allowed`.
+  `allow` gives PyroWave only to a user who picks it in the Launch options Codec list. `prefer`
+  also lets a launch whose codec is Auto get it, **at launch**, when the control plane's Auto rule
+  holds. A link that does not qualify always gets a standard codec.
+- **Mid-session switching is withdrawn from 0.6 and moves to 0.6.1**
+  (`PATCH /v1/sessions/{id}/pyrowave` and `session_pyrowave` are gone).
+- **There is no user transport choice.** PyroWave implies WebTransport; the transport follows the
+  stream plan.
+- **A per-GPU ceiling, `pyrowave_max_per_gpu`**, bounds PyroWave sessions on one GPU
+  (`sessions.pyrowave_slot`).
