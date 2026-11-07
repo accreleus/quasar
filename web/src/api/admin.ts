@@ -1274,3 +1274,40 @@ export function listJobRuns(
   const qs = params.toString();
   return apiFetch<JobRunsResponse>(`/admin/jobs/${jobId}/runs${qs ? `?${qs}` : ""}`, { token });
 }
+
+// Compatibility tools (amendments 56 and 57, control-api.md §Compatibility tools).
+export type CompatTool = components["schemas"]["CompatTool"];
+export type CompatToolList = components["schemas"]["CompatToolList"];
+export type CompatToolAvailable = components["schemas"]["CompatToolAvailable"];
+export type CompatToolAvailableList = components["schemas"]["CompatToolAvailableList"];
+
+export function listCompatTools(token: string, signal?: AbortSignal): Promise<CompatToolList> {
+  return apiFetch<CompatToolList>("/admin/compat-tools", { token, signal });
+}
+
+export function listAvailableCompatTools(token: string, signal?: AbortSignal): Promise<CompatToolAvailableList> {
+  return apiFetch<CompatToolAvailableList>("/admin/compat-tools/available", { token, signal });
+}
+
+/** Pins a GE-Proton release by tag, disabled; nothing installs until enabled. */
+export function addCompatTool(token: string, tag: string): Promise<CompatTool> {
+  return apiFetch<CompatTool>("/admin/compat-tools", { method: "POST", body: { tag }, token });
+}
+
+/** Enable = install on every host; disable = remove from every host (409 compat_tool_in_use while games use it). */
+export function setCompatToolEnabled(token: string, id: string, enabled: boolean): Promise<CompatTool> {
+  return apiFetch<CompatTool>(`/admin/compat-tools/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: { enabled },
+    token,
+  });
+}
+
+/** `null` = Steam's own default. */
+export function setCompatToolDefault(token: string, toolId: string | null): Promise<{ default_tool_id: string | null }> {
+  return apiFetch<{ default_tool_id: string | null }>("/admin/compat-tools/default", {
+    method: "PUT",
+    body: { tool_id: toolId },
+    token,
+  });
+}
