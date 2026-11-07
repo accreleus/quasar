@@ -181,6 +181,7 @@ func (c *Coordinator) ArmCapture(ctx context.Context, sessionID string, req Capt
 	if err != nil {
 		return CaptureAccepted{}, err
 	}
+	sessionID = sess.ID // canonical spelling (#1100)
 	if sess.State != StateRunning || sess.HostID == nil {
 		return CaptureAccepted{}, ErrCaptureNotRunning
 	}

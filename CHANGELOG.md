@@ -26,6 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Security
 - **An agent can no longer put signaling into another host's session (#1116).** The control plane relays an agent's `signaling` frame to the browser only when the session id is placed on the sending host, and drops (and logs, rate-limited) any other, including a non-canonical spelling (upper case, no hyphens) of a session that is placed there. A placement lookup that fails (a database blip) drops that frame, never the session, and the agent's read loop waits at most 2 s per session id per 2 s.
+- **A session's rate limits and in-memory counters no longer reset when its id is spelled in another case (#1100).** The stats, trace-event, trace-clock and verdict limiters, the telemetry ingest counters, and the stop, swap, capture and display state now key on the session row's canonical id, so an owner can't multiply a limit by changing the case of the id in the URL.
 
 ### Internal
 - **CI also runs on release integration branches (`integration/<version>`).** Pull requests into one run the jobs their change touches, and a landing on one runs every job, exactly as for `develop`. `CLAUDE.md` now says specs and tickets live as GitHub issues rather than plan files. No product change.
