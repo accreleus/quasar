@@ -208,12 +208,16 @@ fn no_step_through(tag: &str, lose: fn(usize, u8, u64) -> bool) {
     let (nacks, dropped) = (nacks.load(Ordering::Relaxed), path.load(Ordering::Relaxed));
     let large = large.load(Ordering::Relaxed);
     eprintln!("{tag}: {dropped} dropped, {large} sent over 1100 bytes, {nacks} NACKed");
+    assert_eq!(
+        pay.property::<u32>("mtu"),
+        payloader_mtu(1200),
+        "{tag}: shrunk"
+    );
     // Twice a window's minimum of large packets every second: the decision had its say.
     assert!(
         nacks > 200 && large > 8 * 40,
         "{tag}: too little to decide on ({nacks} NACKed, {large} large packets)"
     );
-    assert_eq!(pay.property::<u32>("mtu"), payloader_mtu(1200), "{tag}");
 }
 
 fn spread(n: u64) -> u64 {
