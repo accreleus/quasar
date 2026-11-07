@@ -71,17 +71,20 @@ type Handler struct {
 	bootIncarnation     string
 	preparation         *preparation.Store
 	OnPreparationReport func(string)
-	store               *agentStore
-	log                 *slog.Logger
-	registry            *Registry
-	events              Events
-	relay               *RelayBus
-	cfgStore            *hostcfg.Store
-	consoleStore        *console.Store
-	consoleAuto         *consoleAutoState
-	failures            *ratelimit.FailureLimiter
-	diagnostics         *diagnosticQueue
-	vram                *vramQueue
+	// OnCompatTools runs after a compat_tools_v1 connection's first capacity report and after
+	// any report that changed the host's installed set (the converger's materialize triggers).
+	OnCompatTools func(ctx context.Context, hostID string)
+	store         *agentStore
+	log           *slog.Logger
+	registry      *Registry
+	events        Events
+	relay         *RelayBus
+	cfgStore      *hostcfg.Store
+	consoleStore  *console.Store
+	consoleAuto   *consoleAutoState
+	failures      *ratelimit.FailureLimiter
+	diagnostics   *diagnosticQueue
+	vram          *vramQueue
 	// Image-management P2 callback surface (images.go). Never nil — NewHandler
 	// installs a no-op — so dispatch needs no guard.
 	imageEvents   ImageEvents
@@ -1854,6 +1857,15 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 	// nothing — a failure costs a tier decision, never a launch.
 	if err := h.store.upsertHostCodecPixelRates(ctx, hostID, cap.CodecThroughput); err != nil {
 		h.log.Warn("host codec throughput upsert failed", "host_id", hostID, "err", err)
+	}
+	if ac.compatToolsV1 {
+		changed, err := h.store.upsertHostCompatTools(ctx, hostID, cap.CompatTools)
+		if err != nil {
+			h.log.Warn("host compat tools upsert failed", "host_id", hostID, "err", err)
+		}
+		if first := ac.compatReports.Add(1) == 1; (first || changed) && h.OnCompatTools != nil {
+			go h.OnCompatTools(context.WithoutCancel(ctx), hostID)
+		}
 	}
 	if err := h.store.upsertHostWebTransport(ctx, hostID, webTransportReport(cap)); err != nil {
 		h.log.Warn("host webtransport upsert failed", "host_id", hostID, "err", err)

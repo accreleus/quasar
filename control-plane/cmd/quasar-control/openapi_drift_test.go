@@ -254,10 +254,8 @@ var allowedUnimplemented = map[string]struct{}{
 var pendingImplementation = map[string]string{
 	// Amendment 56 (compatibility tools), accreleus/quasar#1066 contract; migration 0113 and handlers land with its implementation tickets.
 	"POST /v1/admin/compat-tools":                 "#1066",
-	"PATCH /v1/admin/compat-tools/{}":             "#1066",
 	"DELETE /v1/admin/compat-tools/{}":            "#1066",
 	"POST /v1/admin/compat-tools/{}/force-remove": "#1066",
-	"GET /v1/admin/hosts/{}/compat-tools":         "#1066",
 	// Amendment 57 (available tools), accreleus/quasar#1067 contract; the handler lands with C08.
 	"GET /v1/admin/compat-tools/available": "#1072",
 }

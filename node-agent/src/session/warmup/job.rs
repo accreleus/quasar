@@ -352,7 +352,9 @@ impl WarmupJobRunner {
                     if stale { "stale_policy" } else { "host_busy" },
                     reason,
                 ),
-                JobOutcome::Failed(reason) => policy.status("failed", "preparation_failed", reason),
+                JobOutcome::Failed(reason) | JobOutcome::FailedWith(_, reason) => {
+                    policy.status("failed", "preparation_failed", reason)
+                }
                 JobOutcome::Skipped(reason) => {
                     policy.status("deferred", "storage_unavailable", reason)
                 }

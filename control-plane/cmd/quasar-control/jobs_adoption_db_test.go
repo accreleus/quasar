@@ -97,6 +97,7 @@ var wantedManagedJobIDs = []string{
 var wantedAgentJobIDs = []string{
 	"template.warmup",
 	"home.gc",
+	"compat_tools.converge",
 }
 
 var wantedUnmanagedJobIDs = []string{

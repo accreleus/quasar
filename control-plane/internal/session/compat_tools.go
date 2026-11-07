@@ -15,7 +15,7 @@ var compatReadTimeout = 2 * time.Second
 // compatToolsFor is the session_assign.compat_tools of a Steam-family session, nil for any other
 // app. Fail-open: a failed read sends nothing and the session gets Steam's own default.
 // semantics: control-api.md §Compatibility tools, "What the session receives".
-func (c *Coordinator) compatToolsFor(appID string) *agentws.CompatToolsSpec {
+func (c *Coordinator) compatToolsFor(appID, hostID string) *agentws.CompatToolsSpec {
 	if c.store == nil || c.store.pool == nil {
 		return nil
 	}
@@ -25,15 +25,15 @@ func (c *Coordinator) compatToolsFor(appID string) *agentws.CompatToolsSpec {
 	if err != nil || !app.SteamFamily {
 		return nil
 	}
-	// shortcut: read after placement, without the share locks of control-api.md §Usable. Harmless
-	// while only Valve builds exist; move into the scheduling transaction when disable and
-	// force-remove land (C10, #1074).
-	entries, err := compat.NewStore(c.store.pool).Entries(ctx)
+	// shortcut: read after placement, without the share locks of control-api.md §Usable. A disable
+	// racing this read can still mount a tool once; move into the scheduling transaction with
+	// force-remove (C10, #1074).
+	entries, mount, err := compat.NewStore(c.store.pool).Entries(ctx, hostID)
 	if err != nil {
 		c.log.Warn("compat tools: reading the mapping failed; the session gets Steam's default", "app_id", appID, "err", err)
 		return nil
 	}
-	spec := &agentws.CompatToolsSpec{Mount: []string{}, Entries: make([]agentws.CompatToolEntry, 0, len(entries))}
+	spec := &agentws.CompatToolsSpec{Mount: append([]string{}, mount...), Entries: make([]agentws.CompatToolEntry, 0, len(entries))}
 	for _, e := range entries {
 		spec.Entries = append(spec.Entries, agentws.CompatToolEntry{AppID: e.AppID, Name: e.Name, Forced: e.Forced})
 	}
