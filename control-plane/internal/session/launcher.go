@@ -385,12 +385,13 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// Planned as holding a PyroWave slot the INSERT found taken: plan it again as busy.
 		// PyroWave moves no standard-stream field claim check 4 compared.
 		if ps := claimStream.plan; ps != nil && ps.Update.KeepPyroWaveSlot && !sess.PyroWaveSlot {
-			if again, err := c.planPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err == nil {
-				claimStream, placed = again, again
-			} else {
-				c.log.Warn("pyrowave: re-planning a claim without a slot failed, keeping its plan",
+			again, err := c.planPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source)
+			if err != nil {
+				c.log.Warn("pyrowave: re-planning a claim without a slot failed, planning it busy on WebRTC",
 					"session_id", sess.ID, "err", err)
 			}
+			claimStream = claimWithoutSlot(claimStream, again, err)
+			placed = claimStream
 		}
 		c.persistPlacedStream(ctx, &sess, claimStream)
 	} else if placed, err = c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {

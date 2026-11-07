@@ -194,3 +194,19 @@ func marshalPyroWave(r PyroWaveRecord) []byte {
 	b, _ := json.Marshal(r)
 	return b
 }
+
+// claimWithoutSlot is a claim's plan once its INSERT found the PyroWave slot taken: the
+// re-plan, or, when that failed, the first plan made busy on WebRTC. Never a grant without
+// a slot.
+func claimWithoutSlot(first, again placedStream, err error) placedStream {
+	if err == nil {
+		return again
+	}
+	plan := *first.plan
+	busy := reasonGPUPyroWaveBusy
+	plan.PyroWave = PyroWaveRecord{Reason: &busy}
+	plan.Update.PyroWave = marshalPyroWave(plan.PyroWave)
+	plan.Update.KeepPyroWaveSlot = false
+	plan.Update.Transport, plan.Update.TransportReason, plan.Endpoint = transportWebRTC, "", nil
+	return placedStream{plan: &plan}
+}

@@ -5,6 +5,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
@@ -236,4 +237,29 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// Seat A round 2: a claim whose re-plan without the slot fails is never granted PyroWave.
+func TestAClaimWhoseReplanFailsIsBusyOnWebRTC(t *testing.T) {
+	first, err := planStream(pwInputs("allow", "webtransport_opt_in", true))
+	if err != nil || !first.Update.KeepPyroWaveSlot || first.Update.Transport != "webtransport" {
+		t.Fatalf("first plan: %+v (%v)", first.Update, err)
+	}
+	firstStream := placedStream{plan: &first}
+	again := placedStream{plan: &StreamPlan{}}
+	if got := claimWithoutSlot(firstStream, again, nil); got.plan != again.plan {
+		t.Error("a re-plan that worked is used as it is")
+	}
+	got := claimWithoutSlot(firstStream, placedStream{}, errors.New("db down")).plan
+	if got.PyroWave.Allowed || got.PyroWave.grant() != nil || got.PyroWave.Reason == nil ||
+		*got.PyroWave.Reason != "gpu_pyrowave_busy" || got.Update.KeepPyroWaveSlot ||
+		got.Update.Transport != "webrtc" || got.Endpoint != nil {
+		t.Errorf("failed re-plan: transport %q keep %v record %+v", got.Update.Transport, got.Update.KeepPyroWaveSlot, got.PyroWave)
+	}
+	if string(got.Update.PyroWave) != mustJSON(t, got.PyroWave) {
+		t.Errorf("the write carries %s", got.Update.PyroWave)
+	}
+	if !first.Update.KeepPyroWaveSlot || first.Update.Transport != "webtransport" {
+		t.Error("the first plan was changed in place")
+	}
 }
