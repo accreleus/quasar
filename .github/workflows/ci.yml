@@ -275,9 +275,33 @@ jobs:
       - name: Unit tests
         run: npm test -- run --shard=${{ matrix.shard }}/2
 
+  # WebGPU tests in headless Chromium on SwiftShader (web/vitest.webgpu.config.ts, `make test-webgpu`).
+  # The image's version must match web/package.json's pinned `playwright`, and the Makefile's
+  # test-webgpu carries the same digest. Dependabot does not update container images: bump all
+  # three together by hand.
+  web-webgpu:
+    name: web WebGPU (headless Chromium)
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    container:
+      image: mcr.microsoft.com/playwright:v1.56.0-noble@sha256:35246d87a7c88ea9b771c65d33171b2611b02a8253b4b12ce6f94376c55f99f2
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install
+        run: npm ci
+      - name: WebGPU tests
+        run: npx vitest run --config vitest.webgpu.config.ts
+
   web:
     name: web (typecheck + build + vitest)
-    needs: [changes, web-build, web-vitest]
+    needs: [changes, web-build, web-vitest, web-webgpu]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 5
@@ -288,11 +312,12 @@ jobs:
           CHANGES: ${{ needs.changes.result }}
           BUILD: ${{ needs.web-build.result }}
           VITEST: ${{ needs.web-vitest.result }}
+          WEBGPU: ${{ needs.web-webgpu.result }}
         run: |
-          echo "changes=$CHANGES web=$WANTED build=$BUILD vitest=$VITEST"
+          echo "changes=$CHANGES web=$WANTED build=$BUILD vitest=$VITEST webgpu=$WEBGPU"
           [ "$CHANGES" = success ] || { echo "::error::the changed-areas job did not succeed"; exit 1; }
           [ "$WANTED" = true ] || { echo "no web change: nothing to gather"; exit 0; }
-          [ "$BUILD" = success ] && [ "$VITEST" = success ] || { echo "::error::a web job did not pass"; exit 1; }
+          [ "$BUILD" = success ] && [ "$VITEST" = success ] && [ "$WEBGPU" = success ] || { echo "::error::a web job did not pass"; exit 1; }
 
   # site/ generates the operator-facing install artifacts: the quick-start
   # compose file, .env and one-paste script. Its tests are the only thing

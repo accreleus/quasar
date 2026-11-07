@@ -1475,15 +1475,29 @@ pub(crate) struct SessionTransports {
     displaced: [Vec<String>; 2],
     negotiation: [Negotiation; 2],
     budget: [ReplacementBudget; 2],
+    /// The session's WebTransport client, beside its WebRTC fallback (amendment 54).
+    _webtransport: Option<crate::webtransport::Tap>,
 }
 
 impl pipeline::Transport for SessionTransports {
     fn attach(session: pipeline::EncodedSession) -> anyhow::Result<Self> {
+        let webtransport = crate::webtransport::listener()
+            .filter(|_| session.cfg.webtransport)
+            .and_then(|l| {
+                crate::webtransport::Tap::attach(
+                    l.registry(),
+                    &session.video,
+                    &session.encoder,
+                    &session.session_id,
+                )
+            });
         let slot = pipeline::WebRtcSlot::new(session)?;
         // Audio first: `attach_video` takes the encode pipeline to READY.
         let (audio_webrtc, audio_pipeline) = slot.build_audio()?;
         let video = slot.attach_video(false, None)?;
-        Ok(Self::new(slot, video, audio_webrtc, audio_pipeline))
+        let mut transports = Self::new(slot, video, audio_webrtc, audio_pipeline);
+        transports._webtransport = webtransport;
+        Ok(transports)
     }
 
     fn release(&self) {
@@ -1514,6 +1528,7 @@ impl SessionTransports {
                 ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
                 ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
             ],
+            _webtransport: None,
         }
     }
 

@@ -38,6 +38,7 @@ fn runtime_checks(client: &RuntimeClient) -> Vec<ReadinessCheck> {
 
 fn capacity_template() -> AgentMsg {
     AgentMsg::Capacity {
+        transports: crate::webtransport::capacity(),
         deployment_settings: None,
         config_policy_accepted_groups: None,
         config_policy_legacy_map_applied_id: None,
