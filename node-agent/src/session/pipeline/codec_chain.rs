@@ -113,7 +113,7 @@ pub(super) fn set_rtp_mtu(payloader: &gst::Element, rtp_mtu: u32) {
 
 /// The `rtp_mtu` a payloader is set to: [`set_rtp_mtu`]'s inverse. `None` when it has no
 /// `mtu` property.
-pub(super) fn rtp_mtu_of(payloader: &gst::Element) -> Option<u32> {
+pub(crate) fn rtp_mtu_of(payloader: &gst::Element) -> Option<u32> {
     payloader.find_property("mtu")?;
     Some(payloader.property::<u32>("mtu") + RTP_SEND_OVERHEAD)
 }

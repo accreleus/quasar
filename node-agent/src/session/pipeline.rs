@@ -33,6 +33,7 @@ mod caps;
 pub(crate) use caps::vulkan_image_transport;
 use caps::{caps_profile, raw_video_caps};
 mod codec_chain;
+pub(crate) use codec_chain::rtp_mtu_of;
 use codec_chain::{build_bitstream_chain, build_video_payloader, BitstreamChain};
 mod audio_branch;
 mod audio_health;
