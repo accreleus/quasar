@@ -38,14 +38,18 @@ const MTU_LOST_NACKS: u8 = 3;
 /// desktop or a 24 fps stream sends few small packets.
 const MIN_SENT_LARGE: u32 = 20;
 const MIN_SENT_SMALL: u32 = 10;
-const MIN_NACKED_LARGE: u32 = 10;
-/// Share of the large packets lost to the path. Low because Chrome clears its whole NACK
-/// list when it would pass 1000 packets and asks for a keyframe instead, so at high
-/// bitrates few lost packets live to a third NACK. The small-loss ratio and
-/// [`MTU_LOST_NACKS`] are what keep a lossy path from passing.
-const LARGE_LOSS_MIN: f64 = 0.10;
-/// Small packets' loss as a share of the large packets' loss, at most.
-const SMALL_LOSS_MAX_OF_LARGE: f64 = 0.2;
+/// A path MTU under ours drops almost every large packet and no small one. A token bucket
+/// a few packets deep drops large packets more often than small ones, but passes many of
+/// them and drops some small ones too: it must not shrink (4 Mbit/s with a 4 KB bucket
+/// stepped twice on the lab). Shares of first transmissions, i.e. of packets NACKed at all.
+const LARGE_NACKED_MIN: f64 = 0.80;
+const SMALL_NACKED_MAX: f64 = 0.05;
+/// Large packets lost to the path ([`MTU_LOST_NACKS`]), at least this many and this share.
+/// The share is low because Chrome clears its whole NACK list when it would pass 1000
+/// packets and asks for a keyframe instead, so at high bitrates few lost packets live to a
+/// third NACK; it is what keeps a keyframe burst whose RTX gets by from passing.
+const MIN_LOST_LARGE: u32 = 10;
+const LARGE_LOST_MIN: f64 = 0.10;
 /// Sequence numbers remembered per SSRC: ~0.5 s at 80 Mbps. A later NACK is not counted,
 /// which errs toward not shrinking.
 const HISTORY: usize = 4096;
@@ -58,7 +62,8 @@ const MAX_STREAMS: usize = 4;
 const RTCP_RTPFB: u32 = 205;
 const RTPFB_GENERIC_NACK: u32 = 1;
 
-/// What one stream sent and had NACKed in one window. "Large" is a packet a step would
+/// What one stream sent, had NACKed (at least once) and lost to the path ([`MTU_LOST_NACKS`])
+/// in one window. "Large" is a packet a step would
 /// shrink: bigger than the step below the current size. "Small" is under the floor, so no
 /// hop we could shrink to drops it. Sizes between count as neither: under a raised cap a
 /// low hop drops them too, and counted as small they would veto the shrink.
@@ -68,20 +73,22 @@ pub(super) struct Window {
     pub sent_small: u32,
     pub nacked_large: u32,
     pub nacked_small: u32,
+    pub lost_large: u32,
 }
 
 impl Window {
-    /// Whether the loss falls on the large packets; `None` when too few were sent to say.
+    /// Whether the loss is a path MTU's: nearly every large packet, no small one, and the
+    /// retransmissions too. `None` when too few were sent to say.
     fn size_correlated(&self) -> Option<bool> {
         if self.sent_large < MIN_SENT_LARGE || self.sent_small < MIN_SENT_SMALL {
             return None;
         }
-        let large = f64::from(self.nacked_large) / f64::from(self.sent_large);
-        let small = f64::from(self.nacked_small) / f64::from(self.sent_small);
+        let share = |n: u32, of: u32| f64::from(n) / f64::from(of);
         Some(
-            self.nacked_large >= MIN_NACKED_LARGE
-                && large >= LARGE_LOSS_MIN
-                && small <= large * SMALL_LOSS_MAX_OF_LARGE,
+            share(self.nacked_large, self.sent_large) >= LARGE_NACKED_MIN
+                && share(self.nacked_small, self.sent_small) <= SMALL_NACKED_MAX
+                && self.lost_large >= MIN_LOST_LARGE
+                && share(self.lost_large, self.sent_large) >= LARGE_LOST_MIN,
         )
     }
 }
@@ -216,7 +223,8 @@ impl Shrink {
         step
     }
 
-    /// The peer NACKed `seqs` of `ssrc`. A packet counts once, at its [`MTU_LOST_NACKS`]th.
+    /// The peer NACKed `seqs` of `ssrc`. A packet counts as NACKed at its first NACK and as
+    /// lost to the path at its [`MTU_LOST_NACKS`]th, once each.
     pub(super) fn nacked(&mut self, ssrc: u32, seqs: impl IntoIterator<Item = u16>) {
         let Some(stream) = self.streams.iter_mut().find(|s| s.ssrc == ssrc) else {
             return;
@@ -227,14 +235,14 @@ impl Shrink {
                 continue;
             }
             sent.nacks += 1;
-            if sent.nacks < MTU_LOST_NACKS {
-                continue;
-            }
+            let (first, lost) = (sent.nacks == 1, sent.nacks == MTU_LOST_NACKS);
             let size = usize::from(sent.size);
+            let w = &mut stream.window;
             if self.decision.large(size) {
-                stream.window.nacked_large += 1;
+                w.nacked_large += u32::from(first);
+                w.lost_large += u32::from(lost);
             } else if Decision::small(size) {
-                stream.window.nacked_small += 1;
+                w.nacked_small += u32::from(first);
             }
         }
     }
@@ -389,6 +397,7 @@ fn take_step(
         from = step.from,
         to = step.to,
         nacked_large = w.nacked_large,
+        lost_large = w.lost_large,
         sent_large = w.sent_large,
         nacked_small = w.nacked_small,
         sent_small = w.sent_small,
@@ -406,12 +415,24 @@ fn take_step(
 mod tests {
     use super::*;
 
+    /// A window whose NACKed large packets were all lost to the path, as at a path MTU.
     fn w(sent_large: u32, nacked_large: u32, sent_small: u32, nacked_small: u32) -> Window {
+        wl(
+            sent_large,
+            nacked_large,
+            nacked_large,
+            sent_small,
+            nacked_small,
+        )
+    }
+
+    fn wl(sent_large: u32, nacked: u32, lost: u32, sent_small: u32, nacked_small: u32) -> Window {
         Window {
             sent_large,
             sent_small,
-            nacked_large,
+            nacked_large: nacked,
             nacked_small,
+            lost_large: lost,
         }
     }
 
@@ -419,40 +440,46 @@ mod tests {
     fn a_window_is_size_correlated_only_when_large_packets_carry_the_loss() {
         let table = [
             ("clean", w(200, 0, 60, 0), Some(false)),
-            ("every large packet lost", w(200, 200, 60, 0), Some(true)),
-            ("a tenth lost to the path", w(200, 20, 60, 0), Some(true)),
-            ("just under a tenth", w(200, 19, 60, 0), Some(false)),
             (
-                "~50 Mbps: Chrome's 1000-packet list cap leaves 12% to a third NACK",
-                w(4000, 480, 600, 0),
+                "a path MTU: every large packet lost",
+                w(200, 200, 60, 0),
                 Some(true),
             ),
             (
-                "a deeper hop also takes some small ones",
-                w(200, 180, 60, 9),
+                "80% of large packets NACKed",
+                w(200, 160, 60, 0),
+                Some(true),
+            ),
+            ("just under 80%", w(200, 159, 60, 0), Some(false)),
+            (
+                "~50 Mbps: 92% NACKed, Chrome's 1000-packet list cap leaves 12% to a third NACK",
+                wl(4000, 3680, 480, 600, 0),
                 Some(true),
             ),
             (
-                "uniform 30%, cubed by three NACKs",
-                w(400, 11, 100, 3),
+                "a third NACK on just under a tenth",
+                wl(200, 200, 19, 60, 0),
                 Some(false),
             ),
             (
-                "uniform 60%, cubed by three NACKs",
-                w(400, 86, 100, 22),
+                "a keyframe burst: 90% NACKed, the RTX gets by",
+                wl(200, 180, 0, 60, 0),
                 Some(false),
             ),
-            ("uniform 80%", w(200, 160, 60, 48), Some(false)),
             (
-                "small loss at a fifth of large loss",
-                w(200, 100, 60, 6),
-                Some(true),
-            ),
-            (
-                "small loss just over a fifth",
-                w(200, 100, 60, 7),
+                "shallow bucket: 50% of large, 10% of small",
+                wl(200, 100, 25, 60, 6),
                 Some(false),
             ),
+            (
+                "shallow bucket: 85% of large, 10% of small",
+                wl(200, 170, 120, 60, 6),
+                Some(false),
+            ),
+            ("small loss at 5%", w(200, 200, 60, 3), Some(true)),
+            ("small loss just over 5%", w(200, 200, 60, 4), Some(false)),
+            ("uniform 30%", w(200, 60, 60, 18), Some(false)),
+            ("uniform 90%", w(200, 180, 60, 54), Some(false)),
             ("too few large packets sent", w(19, 19, 60, 0), None),
             ("too few small packets sent", w(200, 200, 9, 0), None),
             (
@@ -460,7 +487,11 @@ mod tests {
                 w(200, 200, 10, 0),
                 Some(true),
             ),
-            ("enough sent, too few lost", w(30, 9, 60, 0), Some(false)),
+            (
+                "enough sent, too few lost",
+                wl(30, 30, 9, 60, 0),
+                Some(false),
+            ),
         ];
         for (what, window, want) in table {
             assert_eq!(window.size_correlated(), want, "{what}: {window:?}");
@@ -575,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn a_packet_counts_once_at_its_third_nack_against_its_own_stream() {
+    fn a_packet_counts_as_nacked_once_and_as_lost_at_its_third_nack_against_its_own_stream() {
         const MEDIA: u32 = 0xaaaa;
         const RTX: u32 = 0xbbbb;
         let t0 = Instant::now();
@@ -588,10 +619,10 @@ mod tests {
         assert!(s.sent(RTX, 0, 1180, t0).is_none());
         let media = |s: &Shrink| s.streams.iter().find(|st| st.ssrc == MEDIA).unwrap().window;
         let large: Vec<u16> = (0..40).map(|i| i * 2).collect();
-        // A second NACK can mean only a late RTX.
+        // NACKed once each; a second NACK can mean only a late RTX, so nothing is lost yet.
         s.nacked(MEDIA, large.iter().copied());
         s.nacked(MEDIA, large.iter().copied());
-        assert_eq!(media(&s), w(40, 0, 40, 0));
+        assert_eq!(media(&s), wl(40, 40, 0, 40, 0));
         // The third counts, a fourth does not count again, and nor do seqs never sent or
         // the RTX stream.
         s.nacked(MEDIA, large.iter().copied());
@@ -616,6 +647,10 @@ mod tests {
         /// overflowing a queue or a policer. Each lost one is NACKed twice, the second
         /// racing its RTX.
         Burst(u64),
+        /// A token bucket only a few packets deep (`tbf` 4 Mbit/s, 4 KB): every
+        /// transmission, RTX included, is lost at the first percentage when it is a full
+        /// fragment and at the second otherwise.
+        Shaper(u64, u64),
     }
 
     /// Frames as a payloader cuts them at `fps`, five full fragments and a tail of any size,
@@ -626,8 +661,12 @@ mod tests {
         let mut s = Shrink::new(cap);
         let full = cap as usize - 20;
         let mut seq = 0u16;
+        // splitmix64: each transmission of each packet an independent draw.
         let hash = |seq: u16, attempt: u64| {
-            (u64::from(seq) * 4 + attempt).wrapping_mul(2_654_435_761) % 100
+            let mut z = (u64::from(seq) << 2 | attempt).wrapping_add(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (z ^ (z >> 31)) % 100
         };
         for frame in 0..fps * 6 {
             let now = t0 + Duration::from_millis(frame * 1000 / fps);
@@ -642,6 +681,10 @@ mod tests {
                     Path::Lossy(pct) => (0..4).take_while(|&a| hash(seq, a) < pct).count(),
                     Path::Burst(pct) if size == full && hash(seq, 0) < pct => 2,
                     Path::Burst(_) => 0,
+                    Path::Shaper(large, small) => {
+                        let pct = if size == full { large } else { small };
+                        (0..4).take_while(|&a| hash(seq, a) < pct).count()
+                    }
                 };
                 for _ in 0..nacks {
                     s.nacked(MEDIA, [seq]);
@@ -715,6 +758,48 @@ mod tests {
                 Hop(1100),
                 24,
                 Some(1100),
+            ),
+            (
+                "shallow bucket: 30% of large, 10% of small",
+                1200,
+                Shaper(30, 10),
+                60,
+                None,
+            ),
+            (
+                "shallow bucket: 40% of large, 10% of small",
+                1200,
+                Shaper(40, 10),
+                60,
+                None,
+            ),
+            (
+                "shallow bucket: 50% of large, 10% of small",
+                1200,
+                Shaper(50, 10),
+                60,
+                None,
+            ),
+            (
+                "shallow bucket: 60% of large, 10% of small",
+                1200,
+                Shaper(60, 10),
+                60,
+                None,
+            ),
+            (
+                "shallow bucket: 85% of large, 10% of small",
+                1200,
+                Shaper(85, 10),
+                60,
+                None,
+            ),
+            (
+                "shallow bucket at 1400: 50% of large, 10% of small",
+                1400,
+                Shaper(50, 10),
+                60,
+                None,
             ),
         ];
         for (what, cap, path, fps, want) in table {
