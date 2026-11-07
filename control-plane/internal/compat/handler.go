@@ -276,7 +276,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not delete the compatibility tool")
 	default:
 		audit.TryRecord(r.Context(), h.auditor, user.ID, "compat_tool.delete", "compat_tool", id,
-			map[string]any{"tag": tag, "sha512": sha})
+			map[string]any{"tag": tag, "sha512": sha, "host_ids": []string{}})
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -311,10 +311,10 @@ func (h *Handler) handleForceRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	details := map[string]any{"tag": res.Tag, "sha512": res.SHA512, "mappings_cleared": res.MappingsCleared,
-		"default_cleared": res.DefaultCleared, "sessions_stopped": res.SessionsStopped, "host_ids": res.HostIDs}
-	if len(res.HostIDs) > 100 {
-		details["host_ids"], details["host_ids_truncated"] = res.HostIDs[:100], true
-	}
+		"default_cleared": res.DefaultCleared, "sessions_stopped": res.SessionsStopped}
+	// Two id lists must fit the 4096-byte details bound together, so each is cut at auditIDs.
+	capIDs(details, "host_ids", res.HostIDs)
+	capIDs(details, "stopped_session_ids", res.StoppedIDs)
 	audit.TryRecord(r.Context(), h.auditor, user.ID, "compat_tool.force_remove", "compat_tool", id, details)
 	if h.conv != nil {
 		h.conv.All(r.Context(), true)
@@ -332,6 +332,20 @@ func (h *Handler) handleForceRemove(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
+}
+
+// auditIDs is the most ids of one list a force-remove audit row carries (two lists share 4096 bytes).
+const auditIDs = 40
+
+// capIDs sets details[key] to ids, cut at auditIDs with key+"_truncated" past that.
+func capIDs(details map[string]any, key string, ids []string) {
+	if ids == nil {
+		ids = []string{}
+	}
+	if len(ids) > auditIDs {
+		ids, details[key+"_truncated"] = ids[:auditIDs], true
+	}
+	details[key] = ids
 }
 
 // listCounted is the catalogue with each GE tool's per-host counts.

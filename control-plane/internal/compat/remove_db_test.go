@@ -4,8 +4,11 @@ package compat
 // database (make test-db). Semantics: control-api.md §Compatibility tools.
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -77,8 +80,9 @@ func TestForceRemoveClearsMappingsAndDefaultStopsHoldersAndAudits(t *testing.T) 
 		t.Error("the fleet default still names the tool")
 	}
 	if n := h.count(`SELECT count(*) FROM admin_activity WHERE action = 'compat_tool.force_remove' AND target_id = $1
-		AND (details->>'mappings_cleared')::int = 2 AND (details->>'sessions_stopped')::int = 1 AND details->>'default_cleared' = 'true'`, id); n != 1 {
-		t.Errorf("%d force_remove audit rows with the counts, want 1", n)
+		AND (details->>'mappings_cleared')::int = 2 AND (details->>'sessions_stopped')::int = 1 AND details->>'default_cleared' = 'true'
+		AND details->'stopped_session_ids' = to_jsonb(ARRAY[$2::text]) AND jsonb_typeof(details->'host_ids') = 'array'`, id, holder); n != 1 {
+		t.Errorf("%d force_remove audit rows with the counts, the stopped session ids and a host list, want 1", n)
 	}
 
 	// The host is told to remove the tool without waiting for anything.
@@ -163,7 +167,8 @@ func TestDeleteRemovesANeverEnabledTagRowOnly(t *testing.T) {
 	if n := h.count(`SELECT count(*) FROM compat_tools WHERE id = $1::uuid`, tagID); n != 0 {
 		t.Error("the row is still there")
 	}
-	if n := h.count(`SELECT count(*) FROM admin_activity WHERE action = 'compat_tool.delete' AND target_id = $1 AND details->>'tag' = $2`, tagID, addTag); n != 1 {
+	if n := h.count(`SELECT count(*) FROM admin_activity WHERE action = 'compat_tool.delete' AND target_id = $1 AND details->>'tag' = $2
+		AND details->'host_ids' = '[]'::jsonb`, tagID, addTag); n != 1 {
 		t.Errorf("%d delete audit rows, want 1", n)
 	}
 	// A row that was ever enabled goes through disable, never delete.
@@ -277,5 +282,47 @@ func TestDisablingAnInstalledToolRemovesItFromEveryHost(t *testing.T) {
 	}
 	if n := h.count(`SELECT count(*) FROM admin_activity WHERE action = 'compat_tool.remove' AND details->>'state' = 'succeeded'`); n != 2 {
 		t.Errorf("%d removal audit rows, want one per host", n)
+	}
+}
+
+// Two id lists of a big force-remove must still fit the audit row's 4096-byte bound, or the row is
+// lost; each list is cut and says so.
+func TestAForceRemoveOfManySessionsStillWritesItsAuditRow(t *testing.T) {
+	h := newHarness(t)
+	id, _, name := h.ge()
+	for i := 0; i < 120; i++ {
+		h.host(fmt.Sprintf("m%d", i), true)
+		h.session("running", time.Now().Add(-time.Minute), name)
+	}
+	if code, out := h.forceRemove(id, h.admin); code != http.StatusOK || out["sessions_stopped"] != 120.0 {
+		t.Fatalf("force-remove: %d %v", code, out)
+	}
+	if n := h.count(`SELECT count(*) FROM admin_activity WHERE action = 'compat_tool.force_remove' AND target_id = $1
+		AND jsonb_array_length(details->'stopped_session_ids') <= 100 AND details->>'stopped_session_ids_truncated' = 'true'
+		AND details->>'host_ids_truncated' = 'true'`, id); n != 1 {
+		t.Errorf("%d force_remove audit rows for 120 sessions and 120 hosts, want 1 (truncated)", n)
+	}
+}
+
+func TestAForceRemoveWaitingOverTenMinutesWarnsEveryPass(t *testing.T) {
+	h := newHarness(t)
+	id, _, name := h.ge()
+	holder := h.session("running", time.Now().Add(-time.Hour), name)
+	h.stopErr = errors.New("agent unreachable")
+	h.forceRemove(id, h.admin)
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	_ = h.store.StopHolders(context.Background())
+	if strings.Contains(buf.String(), "has waited") {
+		t.Fatalf("warned before the force-remove was 10 minutes old: %s", buf.String())
+	}
+	h.exec(`UPDATE compat_tools SET force_remove_pending_at = now() - interval '11 minutes' WHERE id = $1::uuid`, id)
+	_ = h.store.StopHolders(context.Background())
+	_ = h.store.StopHolders(context.Background())
+	if got := strings.Count(buf.String(), "has waited"); got != 2 || !strings.Contains(buf.String(), holder) || !strings.Contains(buf.String(), "holders=1") {
+		t.Errorf("warnings = %d, want one per pass naming the tool, the holder count and the oldest holder %s:\n%s", got, holder, buf.String())
 	}
 }

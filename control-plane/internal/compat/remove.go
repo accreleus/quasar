@@ -77,6 +77,7 @@ type Removed struct {
 	MappingsCleared int
 	DefaultCleared  bool
 	SessionsStopped int
+	StoppedIDs      []string // the sessions the first pass stopped
 	HostIDs         []string
 }
 
@@ -141,30 +142,31 @@ func (s *Store) ForceRemove(ctx context.Context, id string) (Removed, error) {
 		return out, err
 	}
 	after()
-	if out.SessionsStopped, err = s.stopTool(ctx, id); err != nil {
+	if out.StoppedIDs, err = s.stopTool(ctx, id); err != nil {
 		slog.Warn("compat tools: force-remove stop step incomplete; it is retried", "tool_id", id, "err", err)
 	}
+	out.SessionsStopped = len(out.StoppedIDs)
 	return out, nil
 }
 
 // stopTool ends the live sessions that mounted the tool before its mark, then clears the mark once
-// none remain. A session already stopping is waited on, not stopped again.
-func (s *Store) stopTool(ctx context.Context, id string) (int, error) {
+// none remain. A session already stopping is waited on, not stopped again. It returns the ids it stopped.
+func (s *Store) stopTool(ctx context.Context, id string) ([]string, error) {
 	if s.Stopper == nil {
-		return 0, errors.New("no session stopper wired")
+		return nil, errors.New("no session stopper wired")
 	}
 	rows, err := s.pool.Query(ctx, `SELECT s.id::text, s.state FROM sessions s
 		JOIN compat_tools t ON t.id = $1::uuid AND t.force_remove_pending_at IS NOT NULL
 		WHERE `+liveHolder+` AND s.created_at <= t.force_remove_pending_at`, id)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	type held struct{ id, state string }
 	live, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (h held, err error) { return h, r.Scan(&h.id, &h.state) })
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	var stopped int
+	var stopped []string
 	var errs error
 	for _, h := range live {
 		if h.state == "stopping" {
@@ -174,7 +176,7 @@ func (s *Store) stopTool(ctx context.Context, id string) (int, error) {
 			errs = errors.Join(errs, fmt.Errorf("stop session %s: %w", h.id, err))
 			continue
 		}
-		stopped++
+		stopped = append(stopped, h.id)
 	}
 	if errs != nil {
 		return stopped, errs
@@ -185,23 +187,48 @@ func (s *Store) stopTool(ctx context.Context, id string) (int, error) {
 	return stopped, err
 }
 
-// StopHolders re-runs the stop step for every tool with a force-remove pending.
+// stuckAfter is how long a force-remove may stay pending before the stop loop warns about it.
+const stuckAfter = 10 * time.Minute
+
+// StopHolders re-runs the stop step for every tool with a force-remove pending, and warns about
+// one that has been pending longer than stuckAfter.
 func (s *Store) StopHolders(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, `SELECT id::text FROM compat_tools WHERE force_remove_pending_at IS NOT NULL`)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, now() - force_remove_pending_at > $1::interval
+		FROM compat_tools WHERE force_remove_pending_at IS NOT NULL`, stuckAfter.String())
 	if err != nil {
 		return err
 	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	type pending struct {
+		id      string
+		overdue bool
+	}
+	tools, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (p pending, err error) { return p, r.Scan(&p.id, &p.overdue) })
 	if err != nil {
 		return err
 	}
 	var errs error
-	for _, id := range ids {
-		if _, err := s.stopTool(ctx, id); err != nil {
+	for _, t := range tools {
+		if _, err := s.stopTool(ctx, t.id); err != nil {
 			errs = errors.Join(errs, err)
+		}
+		if t.overdue {
+			s.warnStuck(ctx, t.id)
 		}
 	}
 	return errs
+}
+
+// warnStuck logs the holders a force-remove still waits on, so an unbounded retry is not silent.
+func (s *Store) warnStuck(ctx context.Context, id string) {
+	var n int
+	var oldest *string
+	if err := s.pool.QueryRow(ctx, `SELECT count(*), (array_agg(s.id::text ORDER BY s.created_at))[1]
+		FROM sessions s JOIN compat_tools t ON t.id = $1::uuid
+		WHERE `+liveHolder+` AND s.created_at <= t.force_remove_pending_at`, id).Scan(&n, &oldest); err != nil || n == 0 {
+		return
+	}
+	slog.Warn("compat tools: a force-remove has waited over "+stuckAfter.String()+" for sessions to end",
+		"tool_id", id, "holders", n, "oldest_holder", *oldest)
 }
 
 // RunStopLoop retries the stop step at startup and every interval until ctx ends, so a crash

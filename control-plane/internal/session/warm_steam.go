@@ -526,12 +526,13 @@ func (s *Store) adoptedByLive(ctx context.Context, id string) bool {
 }
 
 // adoptRuntime records that row `to` adopts the runtime of `from` and copies
-// its managed-home binding, in the caller's transaction. The hold stays on
+// its managed-home binding and mounted compat tools, in the caller's transaction. The hold stays on
 // `from` until `to`'s first agent report (transition) or `from`'s cleanup
 // proof (clearQualifiedHomeHolds): an assign alone adopts nothing.
 func adoptRuntime(ctx context.Context, tx pgx.Tx, from, to string) error {
 	if _, err := tx.Exec(ctx, `UPDATE sessions t SET adopt_session_id = f.id,
-		    managed_home_id = f.managed_home_id, managed_home_mount_sha256 = f.managed_home_mount_sha256
+		    managed_home_id = f.managed_home_id, managed_home_mount_sha256 = f.managed_home_mount_sha256,
+		    compat_tool_names = f.compat_tool_names
 		FROM sessions f WHERE f.id = $1::uuid AND t.id = $2::uuid`, from, to); err != nil {
 		return fmt.Errorf("record adoption: %w", err)
 	}

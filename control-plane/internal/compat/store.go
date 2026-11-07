@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -26,6 +27,14 @@ var (
 	// ErrExists: a tool with this tag (or this pin) exists (POST /v1/admin/compat-tools).
 	ErrExists = errors.New("compat tool exists")
 )
+
+// ToolMissingError: the launch's per-game mapped GE tool is not usable on its host any more
+// (control-api.md §Placement: never placed for a tool it will not be given).
+type ToolMissingError struct{ Tag string }
+
+func (e *ToolMissingError) Error() string {
+	return "compat tool " + e.Tag + " is not installed and enabled on the placed host"
+}
 
 // MaxMappings is the contract's cap on per-game mappings (control-api.md §Compatibility tools).
 const MaxMappings = 1000
@@ -416,6 +425,20 @@ func (s *Store) Assign(ctx context.Context, sessionID, hostID string) ([]Entry, 
 	}
 	if mount == nil {
 		mount = []string{}
+	}
+	var tag string
+	var name *string
+	err = tx.QueryRow(ctx, `SELECT t.tag, t.steam_name FROM sessions s
+		JOIN apps a ON a.id = s.app_id AND a.external_source = 'steam'
+		JOIN compat_tool_mappings m ON m.provider = 'steam' AND m.external_id = a.external_id
+		JOIN compat_tools t ON t.id = m.tool_id AND t.family = 'ge'
+		WHERE s.id = $1::uuid`, sessionID).Scan(&tag, &name)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+	case err != nil:
+		return nil, nil, fmt.Errorf("read the launch's mapped tool: %w", err)
+	case name == nil || !slices.Contains(mount, *name):
+		return nil, nil, &ToolMissingError{Tag: tag}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE sessions SET compat_tool_names = $2::text[] WHERE id = $1::uuid`, sessionID, mount); err != nil {
 		return nil, nil, fmt.Errorf("record mounted compat tools: %w", err)
