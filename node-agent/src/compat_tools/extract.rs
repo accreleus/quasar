@@ -426,10 +426,9 @@ fn block(toks: &[Tok], i: &mut usize, nested: bool) -> Result<Vec<(String, Node)
     }
 }
 
-fn only<'a>(
-    pairs: &'a [(String, Node)],
-    key: Option<&str>,
-) -> Result<(&'a str, &'a [(String, Node)]), String> {
+type Pairs = [(String, Node)];
+
+fn only<'a>(pairs: &'a Pairs, key: Option<&str>) -> Result<(&'a str, &'a Pairs), String> {
     match pairs {
         [(k, Node::Block(inner))] if key.is_none_or(|want| k == want) => Ok((k, inner)),
         _ => Err(format!(

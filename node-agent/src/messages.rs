@@ -224,7 +224,7 @@ pub enum AgentMsg {
         /// Amendment 56: the tools in the install record and the free space; only when
         /// `compat_tools_v1` was advertised.
         #[serde(skip_serializing_if = "Option::is_none")]
-        compat_tools: Option<serde_json::Value>,
+        compat_tools: Option<Box<serde_json::Value>>,
     },
     Heartbeat {
         running_sessions: Vec<String>,

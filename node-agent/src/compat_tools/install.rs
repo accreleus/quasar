@@ -692,6 +692,9 @@ mod tests {
     const TAG: &str = "GE-Proton11-12";
     const NAME: &str = "GE-Proton11-12-x86_64";
     const ASSET_URL: &str = "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton11-12/GE-Proton11-12-x86_64.tar.gz";
+    /// A fake source's answer for a URL: `None` serves the default route.
+    type Route = Box<dyn Fn(&str) -> Option<Result<(u16, Option<String>), String>> + Send + Sync>;
+
     const CDN: &str =
         "https://release-assets.githubusercontent.com/github-production-release-asset/1?sig=x";
 
@@ -777,7 +780,7 @@ mod tests {
     /// Serves `ASSET_URL` -> redirect -> `CDN` -> 200 `body`, unless `route` says otherwise.
     struct Fake {
         body: Vec<u8>,
-        route: Box<dyn Fn(&str) -> Option<Result<(u16, Option<String>), String>> + Send + Sync>,
+        route: Route,
         calls: AtomicUsize,
     }
 
@@ -850,7 +853,7 @@ mod tests {
             &self,
             body: Vec<u8>,
             params: Value,
-            route: Box<dyn Fn(&str) -> Option<Result<(u16, Option<String>), String>> + Send + Sync>,
+            route: Route,
         ) -> (JobOutcome, Arc<Fake>) {
             let (r, fake) = self.runner(Fake {
                 body,
@@ -983,10 +986,7 @@ mod tests {
     #[test]
     fn redirects_outside_the_allowlist_are_refused() {
         let body = good_tool();
-        let cases: Vec<(
-            &str,
-            Box<dyn Fn(&str) -> Option<Result<(u16, Option<String>), String>> + Send + Sync>,
-        )> = vec![
+        let cases: Vec<(&str, Route)> = vec![
             (
                 "another host",
                 Box::new(|u: &str| {
@@ -1008,7 +1008,7 @@ mod tests {
             ),
             (
                 "no Location",
-                Box::new(|u: &str| (u == ASSET_URL).then(|| Ok((302, None)))),
+                Box::new(|u: &str| (u == ASSET_URL).then_some(Ok((302, None)))),
             ),
             (
                 "a loop",
@@ -1033,9 +1033,7 @@ mod tests {
 
     #[test]
     fn five_redirects_are_followed_and_a_sixth_is_refused() {
-        let hops = |n: usize| -> Box<
-            dyn Fn(&str) -> Option<Result<(u16, Option<String>), String>> + Send + Sync,
-        > {
+        let hops = |n: usize| -> Route {
             Box::new(move |u: &str| {
                 let i: usize = u.rsplit_once("hop=").map_or(0, |(_, i)| i.parse().unwrap());
                 (u == ASSET_URL || u.contains("hop=")).then(|| {

@@ -107,14 +107,16 @@ pub fn changed() -> &'static tokio::sync::Notify {
 }
 
 /// `capacity.compat_tools`, `None` when unsupported.
-pub fn capacity() -> Option<Value> {
+pub fn capacity() -> Option<Box<Value>> {
     let s = store()?;
     let tools: Vec<Value> = s
         .installed()
         .into_iter()
         .map(|e| json!({ "name": e.name, "tag": e.tag, "sha512": e.sha512, "bytes": e.bytes }))
         .collect();
-    Some(json!({ "free_bytes": s.free_bytes(), "tools": tools }))
+    Some(Box::new(
+        json!({ "free_bytes": s.free_bytes(), "tools": tools }),
+    ))
 }
 
 /// The `compat_tools.converge` runner over the real github.com source.
