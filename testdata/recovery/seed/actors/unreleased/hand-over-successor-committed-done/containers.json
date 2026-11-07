@@ -7,7 +7,7 @@
       "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
       "io.quasar.platform-service": "node-agent",
       "io.quasar.recipe": "1",
-      "io.quasar.spec": "sha256:269472eb9511255f73a377eed8a24492b84d52643ba99df753841247662444db"
+      "io.quasar.spec": "sha256:c1a58cf7f1129ff82d1e3f26e138f4667b16fb370172db5005a9b45375fb6263"
     },
     "name": "quasar-node-agent",
     "status": "running"

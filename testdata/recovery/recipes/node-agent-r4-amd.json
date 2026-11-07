@@ -64,7 +64,6 @@
     "QUASAR_QUEUE_BUFFERS": "3",
     "QUASAR_RECOVERY_SOCKET": "/run/quasar-recovery/agent.sock",
     "QUASAR_RENDER_NODE": "/dev/dri/renderD129",
-    "QUASAR_RTP_MTU": "",
     "QUASAR_SLICES": "8",
     "QUASAR_TARGET_USAGE": "6",
     "QUASAR_TEMPLATE_ALLOW_CROSSFS": "",
@@ -88,7 +87,7 @@
     "io.quasar.installation": "5f0c1e0e-0c5a-4d1b-9a2f-3e4d5c6b7a89",
     "io.quasar.platform-service": "node-agent",
     "io.quasar.recipe": "4",
-    "io.quasar.spec": "sha256:2a7f03efc335b8dfaa8c4a961677b3f582e28359f2d75557815496103094a678"
+    "io.quasar.spec": "sha256:4e34b1ff2c0d73b08495b10bfbc753780e47fa7334c9e150d0a8a063184c8f31"
   },
   "network_mode": "host",
   "binds": [
