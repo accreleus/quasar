@@ -797,6 +797,9 @@ async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Sl
 /// QUIC level with the session's code, before the handles drop, so no frame follows it.
 async fn close_session(session: &Session, code: u32, reason: &[u8]) {
     session.close(code, reason);
+    // Test seam: a test holds the close here, after the capsule is out, to probe while its slot is held.
+    #[cfg(test)]
+    let _done = tests::hold_close().await;
     if tokio::time::timeout(CONTROL_WRITE, session.closed())
         .await
         .is_err()

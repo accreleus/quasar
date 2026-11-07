@@ -2,6 +2,7 @@
 //! certificate by hash, a control stream, datagrams) and checks what arrives against
 //! `protocol/transport-webtransport.md`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
@@ -206,6 +207,36 @@ impl Agent {
         write_message(&mut send, &hello).await.unwrap();
         let reply = read_message(&mut recv).await.unwrap();
         (session, send, recv, reply)
+    }
+}
+
+thread_local! {
+    /// Armed by a test on its own thread. The tests run on current-thread runtimes, so the
+    /// next `close_session` there is the one it means: it holds until `release`.
+    static CLOSE_HOLD: RefCell<Option<(oneshot::Receiver<()>, oneshot::Sender<()>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Sent to the test when the held close has run, by dropping it.
+pub(super) struct CloseDone(Option<oneshot::Sender<()>>);
+
+impl Drop for CloseDone {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            let _ = done.send(());
+        }
+    }
+}
+
+/// `close_session`'s seam: waits for the test's release when a hold is armed on this thread.
+pub(super) async fn hold_close() -> CloseDone {
+    let armed = CLOSE_HOLD.with(|h| h.borrow_mut().take());
+    match armed {
+        Some((release, done)) => {
+            let _ = release.await;
+            CloseDone(Some(done))
+        }
+        None => CloseDone(None),
     }
 }
 
@@ -1384,16 +1415,21 @@ async fn write_message_raw(send: &mut quinn::SendStream, message: &Value) {
 
 #[tokio::test]
 async fn a_refused_peer_keeps_its_slot_until_its_close_has_run() {
+    use futures_util::FutureExt;
     let agent = agent_with(Limits {
         unauthenticated: MAX_UNAUTHENTICATED,
         per_source: 1,
     })
     .await;
+    // The refused connection's close holds after its capsule is out, until released.
+    let (release, held) = oneshot::channel();
+    let (done_tx, done) = oneshot::channel();
+    CLOSE_HOLD.with(|h| *h.borrow_mut() = Some((held, done_tx)));
     let mut chrome = Chrome::connect(&agent, |_| {}).await;
     chrome.hello(1, "wrong-token", SESSION).await;
     assert_eq!(chrome.message().await.unwrap()["code"], "auth_failed");
     assert_eq!(chrome.close_code().await, CLOSE_AUTH);
-    // The capsule is in; the client has not closed, so the agent is still in `close_session`.
+    // The capsule is in and the close is held: the agent still holds the source's slot.
     let while_closing = ClientBuilder::new()
         .with_server_certificate_hashes(vec![agent.hash.clone()])
         .unwrap()
@@ -1403,19 +1439,20 @@ async fn a_refused_peer_keeps_its_slot_until_its_close_has_run() {
         while_closing.is_err(),
         "a refused connection still holds its source's slot while its close runs"
     );
-    chrome.assert_h3_streams_untouched(false).await;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let (_session, _send, _recv, ack) =
-            match tokio::time::timeout(Duration::from_secs(5), agent.hello(TOKEN)).await {
-                Ok(reply) => reply,
-                Err(_) => panic!("the slot never came back"),
-            };
-        if ack["type"] == "hello_ack" || Instant::now() > deadline {
-            assert_eq!(ack["type"], "hello_ack");
-            break;
-        }
+    for (n, stream) in chrome.h3.iter().enumerate() {
+        assert!(
+            stream.stopped().now_or_never().is_none(),
+            "the agent stopped HTTP/3 stream {n} while the close was held"
+        );
     }
+    release.send(()).unwrap();
+    done.await.unwrap();
+    chrome.assert_h3_streams_untouched(false).await;
+    let (_session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(
+        ack["type"], "hello_ack",
+        "the slot came back once the close ran"
+    );
 }
 
 #[tokio::test]
