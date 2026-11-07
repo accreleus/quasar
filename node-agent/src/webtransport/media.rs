@@ -222,6 +222,10 @@ impl Media {
         })
     }
 
+    pub(crate) fn attached(&self) -> bool {
+        self.lock().client.is_some()
+    }
+
     /// The client is gone. If it is still the one the devices take input from, what it held is
     /// lifted; a displaced client's was lifted when its successor attached, and the successor's
     /// keys are not its to release.
