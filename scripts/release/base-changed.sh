@@ -11,6 +11,9 @@
 # this is the check that is left: the agent image's `org.quasar.pins.base` label names the
 # base it was built FROM.
 #
+# Assumes a single-platform node-agent image (images.yml builds it with `provenance: false`);
+# a multi-platform index has no one `.Image` to read, the inspect errors, and that fails closed.
+#
 # Prints rebuild=true|false and why=<reason>. Rebuild is the safe answer whenever the
 # comparison cannot be made because something is ABSENT (no image, no label, a label or
 # a base that is not a digest). A registry that cannot be read is an ERROR (exit 1):
