@@ -10,6 +10,7 @@
 mod audio;
 mod cert;
 mod media;
+mod mic_jitter;
 #[cfg(test)]
 mod tests;
 

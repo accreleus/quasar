@@ -13,6 +13,8 @@ const VIDEO_SAMPLES = 120;
 export const MIN_TARGET_MS = 40;
 /** A video latency this long is a stall, not a delay to match. */
 export const MAX_TARGET_MS = 150;
+/** Audio packets behind the jitter estimate: two seconds at 10 ms. */
+const JITTER_SAMPLES = 200;
 /** Used until a video frame has been presented. */
 const DEFAULT_TARGET_MS = 50;
 
@@ -24,15 +26,37 @@ const median = (xs: number[]): number => {
 export class AudioSync {
   private readonly floors: { bucket: number; min: number }[] = [];
   private readonly video: number[] = [];
+  /** How far past the floor recent packets arrived. */
+  private readonly excess: number[] = [];
 
   /** An audio packet arrived at `arrivalMs`: updates the delay floor (arrival − capture). */
   noteAudio(captureUs: number, arrivalMs: number): void {
     const owd = arrivalMs - captureUs / 1000;
+    const before = this.floor();
     const bucket = Math.floor(arrivalMs / BUCKET_MS);
     const last = this.floors[this.floors.length - 1];
     if (last?.bucket === bucket) last.min = Math.min(last.min, owd);
     else this.floors.push({ bucket, min: owd });
     while (this.floors.length > 0 && this.floors[0].bucket <= bucket - BUCKETS) this.floors.shift();
+    this.excess.push(Math.max(0, owd - (before ?? owd)));
+    if (this.excess.length > JITTER_SAMPLES) this.excess.shift();
+  }
+
+  /** Forget the delay floor and what was measured against it. After a step in the path's delay
+   *  (a handover, a reroute) the old floor is wrong for up to its whole window; the next
+   *  packets fix a new one. */
+  reset(): void {
+    this.floors.length = 0;
+    this.video.length = 0;
+    this.excess.length = 0;
+  }
+
+  /** The 95th percentile of how late recent packets ran past the floor: what the playout delay
+   *  must cover for them to arrive in time. */
+  jitterMs(): number {
+    if (this.excess.length < 20) return 0;
+    const s = [...this.excess].sort((a, b) => a - b);
+    return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))];
   }
 
   /** A video frame captured at `captureUs` was presented at `presentMs`. */
@@ -55,10 +79,11 @@ export class AudioSync {
   }
 
   /** D: how long after capture audio plays. `minMs`: the output device's own latency plus
-   *  what it needs to be posted to the audio thread in time. */
+   *  what it needs to be posted to the audio thread in time; the jitter the path shows is
+   *  added to it, so a link that bunches packets gets a deeper buffer. */
   targetDelayMs(minMs = 0): number {
     const wanted = this.videoLatencyMs() ?? DEFAULT_TARGET_MS;
-    return Math.min(MAX_TARGET_MS, Math.max(wanted, MIN_TARGET_MS, minMs));
+    return Math.min(MAX_TARGET_MS, Math.max(wanted, MIN_TARGET_MS, minMs + this.jitterMs()));
   }
 
   /** When (on the `now` clock) the packet captured at `captureUs` should reach the speaker;

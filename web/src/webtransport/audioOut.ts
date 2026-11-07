@@ -5,12 +5,18 @@
 
 import type { AudioPacket } from "./framing";
 import { AudioSync } from "./audioSync";
+import { serialAfter } from "./framing";
 import type { AudioConfig } from "./transport";
 
 /** Decoder errors in a row, with no audio decoded between, before giving up on audio. */
 const MAX_DECODER_RESTARTS = 3;
 /** Posting a chunk to the audio thread and rendering it takes about this long. */
 const POST_MARGIN_MS = 15;
+/** Chunks in a row that were due before they could be posted: the path's delay has stepped
+ *  (a handover, a reroute) and the delay floor measured before it is stale. 20 is 200 ms. */
+export const LATE_RUN_RESET = 20;
+/** The ramp after a concealed gap, so the first real chunk does not click in (2.5 ms). */
+const FADE_IN_FRAMES = 120;
 
 export interface AudioOutStats {
   targetDelayMs: number;
@@ -20,6 +26,12 @@ export interface AudioOutStats {
   underrunMs: number;
   dropped: number;
   decoded: number;
+  /** Packets dropped for a sequence number already seen or behind one played. */
+  stale: number;
+  /** Gaps filled with a concealed chunk. */
+  concealed: number;
+  /** Chunks not posted because their time had passed. */
+  late: number;
 }
 
 /** The slice of AudioContext this uses; a test supplies a fake. */
@@ -30,6 +42,8 @@ export interface ContextLike {
   readonly outputLatency?: number;
   readonly baseLatency?: number;
   getOutputTimestamp(): { contextTime?: number; performanceTime?: number };
+  /** Called when the context's `state` changes. */
+  onstatechange: (() => void) | null;
   resume(): Promise<void>;
   close(): Promise<void>;
   /** Builds the worklet node, already connected to the output through a gain. */
@@ -61,6 +75,12 @@ export function browserContext(): ContextLike {
       return ctx.baseLatency;
     },
     getOutputTimestamp: () => ctx.getOutputTimestamp(),
+    get onstatechange() {
+      return ctx.onstatechange as (() => void) | null;
+    },
+    set onstatechange(fn) {
+      ctx.onstatechange = fn;
+    },
     resume: () => ctx.resume(),
     close: () => ctx.close(),
     async addOutput() {
@@ -85,6 +105,16 @@ export class AudioOut {
   private closed = false;
   private restarts = 0;
   private decoded = 0;
+  private stale = 0;
+  private concealed = 0;
+  private late = 0;
+  /** The last packet taken, by `packet_seq`; null before the first and after a pause. */
+  private lastSeq: number | null = null;
+  /** Capture times of the packets in the decoder, in order: one Opus packet in, one chunk out. */
+  private inFlight: { captureUs: number; fadeIn: boolean }[] = [];
+  /** The last chunk decoded, kept to fade out of when a packet is lost. */
+  private lastPlanes: Float32Array[] | null = null;
+  private lateRun = 0;
   private worklet = { underrunFrames: 0, dropped: 0 };
   private readonly sync: AudioSync;
   private readonly now: () => number;
@@ -122,6 +152,14 @@ export class AudioOut {
       this.worklet = e.data;
     };
     out.setGain(this.held ? 0 : 1);
+    // A context made without a user gesture starts suspended; the browser lets it resume on the
+    // gesture the page is already inside (release), and again whenever it suspends under us.
+    ctx.onstatechange = () => {
+      if (!this.held && !this.closed && ctx.state !== "running" && ctx.state !== "closed") {
+        void ctx.resume().catch(() => {});
+      }
+    };
+    if (!this.held) void ctx.resume().catch(() => {});
     this.makeDecoder();
   }
 
@@ -145,17 +183,54 @@ export class AudioOut {
 
   /** The packet as it arrived. Audio is realtime: nothing is held for a late or lost one. */
   packet(p: AudioPacket): void {
+    const gap = this.sequence(p.packetSeq);
+    if (gap === null) {
+      this.stale += 1;
+      return;
+    }
     this.sync.noteAudio(p.captureUs, this.now());
     const decoder = this.decoder;
     // A suspended context's clock is not moving: what it was given now would play stale later.
-    if (!decoder || decoder.state !== "configured" || this.ctx?.state !== "running") return;
+    if (!decoder || decoder.state !== "configured" || this.ctx?.state !== "running") {
+      this.lastPlanes = null;
+      return;
+    }
+    if (gap > 0) this.conceal(p.captureUs - (this.config?.ptimeMs ?? 10) * 1000);
     try {
-      decoder.decode(
-        new EncodedAudioChunk({ type: "key", timestamp: p.captureUs, data: p.opus }),
-      );
+      // The chunk after a gap fades in, whichever chunks are still in the decoder before it.
+      this.inFlight.push({ captureUs: p.captureUs, fadeIn: gap > 0 });
+      decoder.decode(new EncodedAudioChunk({ type: "key", timestamp: p.captureUs, data: p.opus }));
     } catch {
       this.restart();
     }
+  }
+
+  /** Takes `seq` into the order: the packets lost before it (0 for the next in line), or null
+   *  for one already seen, or behind one played. */
+  private sequence(seq: number): number | null {
+    if (this.lastSeq !== null) {
+      if (!serialAfter(seq, this.lastSeq, 16)) return null;
+      const gap = (seq - this.lastSeq - 1 + 0x10000) % 0x10000;
+      // Seconds of loss are a pause or a restarted stream, not packets to make up.
+      this.lastSeq = seq;
+      return gap > 100 ? 0 : gap;
+    }
+    this.lastSeq = seq;
+    return 0;
+  }
+
+  /** One 10 ms chunk in place of the lost packet: the last chunk fading to silence. WebCodecs'
+   *  Opus decoder takes no lost-packet input (no PLC), so this is the concealment. */
+  private conceal(captureUs: number): void {
+    const last = this.lastPlanes;
+    if (!last) return;
+    const planes = last.map((plane) => {
+      const faded = plane.slice();
+      for (let i = 0; i < faded.length; i++) faded[i] *= 1 - (i + 1) / faded.length;
+      return faded;
+    });
+    this.concealed += 1;
+    this.schedule(captureUs, planes);
   }
 
   stats(): AudioOutStats {
@@ -167,6 +242,9 @@ export class AudioOut {
       underrunMs: (this.worklet.underrunFrames / rate) * 1000,
       dropped: this.worklet.dropped,
       decoded: this.decoded,
+      stale: this.stale,
+      concealed: this.concealed,
+      late: this.late,
     };
   }
 
@@ -203,6 +281,9 @@ export class AudioOut {
 
   private restart(): void {
     if (this.closed) return;
+    // Whatever the old decoder held is gone: its capture times must not label the new one's chunks.
+    this.inFlight = [];
+    this.lastPlanes = null;
     if (this.decoder && this.decoder.state !== "closed") this.decoder.close();
     this.decoder = null;
     if (++this.restarts > MAX_DECODER_RESTARTS) {
@@ -212,30 +293,58 @@ export class AudioOut {
     this.makeDecoder();
   }
 
-  /** One decoded chunk: scheduled at the render frame its capture time maps to. */
+  /** One decoded chunk, scheduled from its own packet's capture time: the decoder is one packet
+   *  in, one chunk out, so the capture times queue up in step with it. A lost packet moves
+   *  none of its neighbours' times. */
   private play(data: AudioData): void {
-    const ctx = this.ctx;
-    const out = this.out;
     try {
-      if (this.closed || !ctx || !out) return;
+      if (this.closed || !this.ctx || !this.out) return;
       this.restarts = 0;
       this.decoded += 1;
-      const playAt = this.sync.playAtMs(data.timestamp, this.minDelayMs());
-      if (playAt === null) return;
-      // The output timeline: where the speaker is now, and the wall time that was.
-      const ts = ctx.getOutputTimestamp();
-      const contextTime = ts.contextTime || ctx.currentTime;
-      const performanceTime = ts.performanceTime || this.now();
-      const start = Math.round((contextTime + (playAt - performanceTime) / 1000) * ctx.sampleRate);
+      const sent = this.inFlight.shift();
+      const captureUs = sent?.captureUs ?? data.timestamp;
       const planes: Float32Array[] = [];
       for (let c = 0; c < data.numberOfChannels; c++) {
         const plane = new Float32Array(data.numberOfFrames);
         data.copyTo(plane, { planeIndex: c, format: "f32-planar" });
         planes.push(plane);
       }
-      out.port.postMessage({ start, planes }, planes.map((p) => p.buffer));
+      this.lastPlanes = planes.map((p) => p.slice());
+      if (sent?.fadeIn) {
+        for (const plane of planes) {
+          for (let i = 0; i < Math.min(FADE_IN_FRAMES, plane.length); i++) plane[i] *= i / FADE_IN_FRAMES;
+        }
+      }
+      this.schedule(captureUs, planes);
     } finally {
       data.close();
     }
+  }
+
+  /** Post `planes` for the render frame `captureUs` maps to. A chunk whose time has passed is not
+   *  posted; a run of them means the delay floor is stale, and it is measured again. */
+  private schedule(captureUs: number, planes: Float32Array[]): void {
+    const ctx = this.ctx;
+    const out = this.out;
+    if (!ctx || !out) return;
+    const playAt = this.sync.playAtMs(captureUs, this.minDelayMs());
+    if (playAt === null) return;
+    const now = this.now();
+    const outputLatencyMs = (ctx.outputLatency || ctx.baseLatency || 0) * 1000;
+    if (playAt - now < outputLatencyMs) {
+      this.late += 1;
+      if (++this.lateRun >= LATE_RUN_RESET) {
+        this.lateRun = 0;
+        this.sync.reset();
+      }
+      return;
+    }
+    this.lateRun = 0;
+    // The output timeline: where the speaker is now, and the wall time that was.
+    const ts = ctx.getOutputTimestamp();
+    const contextTime = ts.contextTime || ctx.currentTime;
+    const performanceTime = ts.performanceTime || now;
+    const start = Math.round((contextTime + (playAt - performanceTime) / 1000) * ctx.sampleRate);
+    out.port.postMessage({ start, planes }, planes.map((p) => p.buffer));
   }
 }

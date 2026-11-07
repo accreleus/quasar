@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
 import { MicCaptureError } from "../webrtc/mic";
-import { AudioOut, type ContextLike } from "./audioOut";
+import { AudioOut, LATE_RUN_RESET, type ContextLike } from "./audioOut";
 import { AudioRing, SLACK_FRAMES } from "./audioRing";
 import { AudioSync, MAX_TARGET_MS, MIN_TARGET_MS } from "./audioSync";
 import { CHANNEL_AUDIO, encodeMicDatagram, parseAudioDatagram } from "./framing";
@@ -31,6 +31,7 @@ function audioDatagram(packetSeq: number, ts48k: number, captureUs: number, opus
 }
 
 beforeEach(() => {
+  nextSeq = 0;
   vi.stubGlobal("EncodedVideoChunk", FakeChunk);
   vi.stubGlobal("EncodedAudioChunk", FakeChunk);
 });
@@ -92,6 +93,28 @@ describe("AudioSync", () => {
     expect(s.avOffsetMs(70)).toBeCloseTo(65, 0);
     for (let i = 0; i < 200; i++) s.noteVideo(1_000_000, 1_000 + 100 + 4_000);
     expect(s.targetDelayMs()).toBe(MAX_TARGET_MS);
+  });
+
+  it("adds the jitter the path shows to the playout delay, so a bunching link gets a deeper buffer", () => {
+    const s = new AudioSync();
+    for (let i = 0; i < 100; i++) s.noteAudio(1_000_000 + i * 10_000, 1_000 + i * 10 + 100);
+    expect(s.jitterMs()).toBe(0);
+    expect(s.targetDelayMs(25)).toBe(50); // the default until video has set one
+    // A mobile link: one packet in five held back 60 ms and delivered with the next.
+    for (let i = 100; i < 300; i++) s.noteAudio(1_000_000 + i * 10_000, 1_000 + i * 10 + 100 + (i % 5 === 0 ? 60 : 0));
+    expect(s.jitterMs()).toBe(60);
+    expect(s.targetDelayMs(25)).toBe(85);
+  });
+
+  it("forgets the floor and everything measured against it on reset", () => {
+    const s = new AudioSync();
+    s.noteAudio(1_000_000, 1_100);
+    s.noteVideo(1_000_000, 1_180);
+    s.reset();
+    expect(s.playAtMs(1_000_000)).toBeNull();
+    expect(s.videoLatencyMs()).toBeNull();
+    s.noteAudio(2_000_000, 2_400);
+    expect(s.playAtMs(2_000_000)).toBe(2_000 + 400 + 50);
   });
 
   it("has no time to play at until an audio packet has fixed the floor", () => {
@@ -227,6 +250,7 @@ function setupAudioOut(opts: { running?: boolean; supported?: boolean } = {}) {
     outputLatency: 0.01,
     baseLatency: 0.005,
     getOutputTimestamp: () => ({ contextTime: 10, performanceTime: 1_000 }),
+    onstatechange: null,
     resume: vi.fn(async () => {
       ctx.state = "running";
     }),
@@ -252,7 +276,9 @@ function setupAudioOut(opts: { running?: boolean; supported?: boolean } = {}) {
 }
 
 const STEREO = { channels: 2, sampleRate: 48_000, ptimeMs: 10 };
-const packet = (captureUs: number, packetSeq = 0) => ({ packetSeq, ts48k: 0, captureUs, opus: Uint8Array.from([0xf4, 1, 2]) });
+let nextSeq = 0;
+/** The next packet in `packet_seq` order unless a number is given. */
+const packet = (captureUs: number, packetSeq = nextSeq++) => ({ packetSeq, ts48k: 0, captureUs, opus: Uint8Array.from([0xf4, 1, 2]) });
 
 describe("AudioOut", () => {
   it("configures WebCodecs Opus from the hello_ack and decodes each packet under its capture time", async () => {
@@ -287,6 +313,7 @@ describe("AudioOut", () => {
       at(5_000 + i * 16 + 100 + 90); // frames shown 90 ms past the floor
       out.noteVideo(5_000_000 + i * 16_000);
     }
+    at(5_100);
     decoders[0].emit(5_000_000);
     expect(posted[0].start).toBe(Math.round((10 + (5_000 + 100 + 90 - 1_000) / 1_000) * 48_000));
     expect(out.stats().avOffsetMs).toBeCloseTo(0, 0);
@@ -340,6 +367,133 @@ describe("AudioOut", () => {
     await out.start(STEREO);
     out.packet(packet(5_000_000));
     expect(createContext).not.toHaveBeenCalled();
+  });
+
+  it("schedules each chunk from its own packet's capture time, so a lost packet moves no other", async () => {
+    const { out, decoders, posted, at } = setupAudioOut();
+    await out.start(STEREO);
+    const frameAt = (captureUs: number) => Math.round((10 + (captureUs / 1000 + 100 + 50 - 1_000) / 1_000) * 48_000);
+    // Packets 0, 1 and 3 (2 was lost). The decoder stamps its output from the first input's
+    // timestamp plus the frames it has decoded, which is the same for every chunk after a loss.
+    for (const [capture, seq] of [[5_000_000, 0], [5_010_000, 1], [5_030_000, 3]]) {
+      at(capture / 1000 + 100); // each arrives 100 ms after its capture
+      out.packet(packet(capture, seq));
+    }
+    at(5_100);
+    for (const ts of [5_000_000, 5_010_000, 5_020_000]) decoders[0].emit(ts);
+    const real = posted.filter((p) => p.planes[0][300] === 1);
+    expect(real.map((p) => p.start)).toEqual([frameAt(5_000_000), frameAt(5_010_000), frameAt(5_030_000)]);
+  });
+
+  it("plays one concealed 10 ms chunk for a lost packet: the last chunk fading to silence, then a fade in", async () => {
+    const { out, decoders, posted, at } = setupAudioOut();
+    await out.start(STEREO);
+    const frameAt = (captureUs: number) => Math.round((10 + (captureUs / 1000 + 150 - 1_000) / 1_000) * 48_000);
+    at(5_100);
+    out.packet(packet(5_000_000, 10));
+    decoders[0].emit(5_000_000);
+    at(5_140);
+    out.packet(packet(5_040_000, 14)); // 11, 12 and 13 were lost
+    expect(out.stats().concealed).toBe(1);
+    decoders[0].emit(5_040_000);
+    expect(posted).toHaveLength(3);
+    const [before, hole, after] = posted;
+    // The concealment sits where the packet before the next one would have been.
+    expect(hole.start).toBe(frameAt(5_030_000));
+    expect(hole.planes[0][0]).toBeCloseTo(1, 1);
+    expect(hole.planes[0][479]).toBe(0);
+    expect(hole.planes[0][240]).toBeCloseTo(0.5, 1);
+    // The chunk after the gap does not start at full level.
+    expect(before.planes[0][0]).toBe(1);
+    expect(after.planes[0][0]).toBe(0);
+    expect(after.planes[0][119]).toBeGreaterThan(0.9);
+    expect(after.planes[0][300]).toBe(1);
+  });
+
+  it("drops a duplicate, a late arrival and a reordered packet by packet_seq, in 16-bit serial order", async () => {
+    const { out, decoders } = setupAudioOut();
+    await out.start(STEREO);
+    for (const seq of [65_534, 65_535, 0, 1, 1, 65_535, 3, 2]) out.packet(packet(5_000_000 + 1_000 * ((seq + 2) % 65_536), seq));
+    // 65534, 65535, 0, 1 and 3 are taken; the repeat of 1, the old 65535 and the late 2 are not.
+    expect(decoders[0].chunks).toHaveLength(5);
+    expect(out.stats().stale).toBe(3);
+  });
+
+  it("makes up no packets for a pause of seconds", async () => {
+    const { out, decoders } = setupAudioOut();
+    await out.start(STEREO);
+    out.packet(packet(5_000_000, 0));
+    decoders[0].emit(5_000_000);
+    out.packet(packet(9_000_000, 400));
+    expect(out.stats().concealed).toBe(0);
+  });
+
+  it("measures the delay floor again after a run of chunks that were due before they could be posted", async () => {
+    const { out, decoders, posted, at } = setupAudioOut();
+    await out.start(STEREO);
+    at(5_100);
+    out.packet(packet(5_000_000)); // arrives 100 ms after capture: the floor
+    decoders[0].emit(5_000_000);
+    expect(posted).toHaveLength(1);
+    // The path steps to 400 ms (a handover): every packet is now late against the old floor.
+    for (let i = 1; i <= LATE_RUN_RESET; i++) {
+      const capture = 5_000_000 + i * 10_000;
+      at(5_000 + i * 10 + 400);
+      out.packet(packet(capture));
+      decoders[0].emit(capture);
+    }
+    expect(out.stats().late).toBe(LATE_RUN_RESET);
+    expect(posted).toHaveLength(1);
+    // The next packet fixes the new floor, and is played.
+    const capture = 5_000_000 + (LATE_RUN_RESET + 1) * 10_000;
+    at(5_000 + (LATE_RUN_RESET + 1) * 10 + 400);
+    out.packet(packet(capture));
+    decoders[0].emit(capture);
+    expect(posted).toHaveLength(2);
+    expect(out.stats().late).toBe(LATE_RUN_RESET);
+  });
+
+  it("does not reset the floor for a few late chunks, and covers a link that keeps bunching with a deeper delay", async () => {
+    const { out, decoders, posted, at } = setupAudioOut();
+    await out.start(STEREO);
+    at(5_100);
+    out.packet(packet(5_000_000));
+    decoders[0].emit(5_000_000);
+    for (let i = 1; i <= 3 * LATE_RUN_RESET; i++) {
+      const capture = 5_000_000 + i * 10_000;
+      // One in five 120 ms late, the rest on the floor.
+      at(5_000 + i * 10 + 100 + (i % 5 === 0 ? 120 : 0));
+      out.packet(packet(capture));
+      decoders[0].emit(capture);
+    }
+    // Three are late before the jitter estimate has 20 packets behind it; after that the delay
+    // covers the 120 ms the link adds, and nothing is dropped.
+    expect(out.stats().late).toBe(3);
+    expect(posted).toHaveLength(1 + 3 * LATE_RUN_RESET - 3);
+    expect(out.stats().targetDelayMs).toBeGreaterThanOrEqual(120);
+  });
+
+  it("resumes a context it finds suspended while playing, and not while held", async () => {
+    const { out, ctx } = setupAudioOut({ running: false });
+    await out.start(STEREO);
+    expect(ctx.resume).not.toHaveBeenCalled(); // held: not asked to make sound
+    ctx.onstatechange?.();
+    expect(ctx.resume).not.toHaveBeenCalled();
+    out.release();
+    expect(ctx.resume).toHaveBeenCalledTimes(1);
+    ctx.state = "suspended";
+    ctx.onstatechange?.();
+    expect(ctx.resume).toHaveBeenCalledTimes(2);
+    ctx.state = "running";
+    ctx.onstatechange?.();
+    expect(ctx.resume).toHaveBeenCalledTimes(2);
+  });
+
+  it("resumes when it starts if the page already released the sound", async () => {
+    const { out, ctx } = setupAudioOut({ running: false });
+    out.release();
+    await out.start(STEREO);
+    expect(ctx.resume).toHaveBeenCalled();
   });
 
   it("closes its decoder and context", async () => {

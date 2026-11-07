@@ -492,6 +492,7 @@ async fn a_session_with_audio_and_a_microphone_sends_opus_and_takes_the_micropho
         audio: true,
         mic: true,
         pulse_server: None,
+        jitter_ms: 40,
     };
     let mut agent = agent_with_plan(Limits::default(), plan).await;
     tap_session_audio(&mut agent);

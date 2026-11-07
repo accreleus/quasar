@@ -15,6 +15,7 @@ use gstreamer::prelude::*;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use super::mic_jitter::{Jitter, Out};
 use crate::session::pipeline::mic_branch;
 use crate::session::SessionConfig;
 
@@ -37,6 +38,8 @@ pub(crate) struct Plan {
     pub(crate) audio: bool,
     pub(crate) mic: bool,
     pub(crate) pulse_server: Option<String>,
+    /// The microphone's jitter buffer depth: `QUASAR_MIC_JITTER_MS`.
+    pub(crate) jitter_ms: u32,
 }
 
 impl Plan {
@@ -47,6 +50,7 @@ impl Plan {
             audio,
             mic: audio && cfg.mic_enabled(),
             pulse_server: cfg.pulse_server.clone(),
+            jitter_ms: cfg.mic_jitter_ms,
         }
     }
 }
@@ -78,13 +82,6 @@ fn wall_us() -> u64 {
         .map_or(0, |d| d.as_micros() as u64)
 }
 
-/// Packets lost between `last` and `seq` in serial-number arithmetic; `None` when `seq` is
-/// not after `last` (a duplicate, or late behind a packet already taken).
-fn missing(last: u16, seq: u16) -> Option<u16> {
-    let d = seq.wrapping_sub(last);
-    (d != 0 && d < 0x8000).then(|| d - 1)
-}
-
 #[derive(Default)]
 struct State {
     /// The attached client's id (`Media`'s) and its queue.
@@ -103,7 +100,9 @@ pub(crate) struct Audio {
 
 impl Audio {
     pub(crate) fn new(plan: Plan) -> Arc<Self> {
-        let mic = plan.mic.then(|| Mic::new(plan.pulse_server.clone()));
+        let mic = plan
+            .mic
+            .then(|| Mic::new(plan.pulse_server.clone(), plan.jitter_ms));
         Arc::new(Self {
             plan,
             state: Mutex::default(),
@@ -137,7 +136,7 @@ impl Audio {
         let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
         self.lock().client = Some((client, tx));
         if let Some(mic) = &self.mic {
-            mic.start();
+            mic.attach();
         }
         rx
     }
@@ -237,30 +236,46 @@ enum MicState {
     Running {
         pipeline: gst::Pipeline,
         src: gstreamer_app::AppSrc,
-        last_seq: Option<u16>,
+        decoder: gst::Element,
     },
     Stopped,
 }
+
+/// One 10 ms packet, which is also the pacer's tick.
+const MIC_TICK: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The microphone sink of one session, built when its first client connects.
 struct Mic {
     pulse_server: Option<String>,
     state: Mutex<MicState>,
+    jitter: Mutex<Jitter>,
     /// Decoded buffers that reached the sink.
     delivered: Arc<AtomicU64>,
 }
 
 impl Mic {
-    fn new(pulse_server: Option<String>) -> Arc<Self> {
+    fn new(pulse_server: Option<String>, jitter_ms: u32) -> Arc<Self> {
         Arc::new(Self {
             pulse_server,
             state: Mutex::new(MicState::Idle),
+            jitter: Mutex::new(Jitter::new(jitter_ms)),
             delivered: Arc::default(),
         })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MicState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn jitter(&self) -> std::sync::MutexGuard<'_, Jitter> {
+        self.jitter.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A client attached. Its numbering starts where it likes, so nothing of the last
+    /// client's stays in the buffer; the sink is built the first time.
+    fn attach(self: &Arc<Self>) {
+        self.jitter().reset();
+        self.start();
     }
 
     /// Build the sink on a thread of its own: the sound server can take long to answer,
@@ -286,7 +301,7 @@ impl Mic {
         }
     }
 
-    fn build(&self) {
+    fn build(self: &Arc<Self>) {
         let built =
             mic_branch::build_stream_mic(self.pulse_server.as_deref()).and_then(|(p, src)| {
                 let delivered = self.delivered.clone();
@@ -299,20 +314,35 @@ impl Mic {
                         gst::PadProbeReturn::Ok
                     });
                 }
+                let decoder = p
+                    .iterate_recurse()
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .find(|e| e.factory().is_some_and(|f| f.name() == "opusdec"))
+                    .ok_or_else(|| anyhow::anyhow!("no opusdec in the microphone chain"))?;
                 p.set_state(gst::State::Playing)?;
-                Ok((p, src))
+                Ok((p, src, decoder))
             });
         let mut st = self.lock();
         match (built, &*st) {
-            (Ok((pipeline, src)), MicState::Starting) => {
+            (Ok((pipeline, src, decoder)), MicState::Starting) => {
                 mic_branch::verify_stream_mic(&pipeline);
                 *st = MicState::Running {
                     pipeline,
                     src,
-                    last_seq: None,
+                    decoder,
                 };
+                drop(st);
+                let mic = self.clone();
+                let log_span = tracing::Span::current();
+                let _ = std::thread::Builder::new()
+                    .name("quasar-mic-pace".into())
+                    .spawn(move || {
+                        let _log_span = log_span.enter();
+                        mic.pace();
+                    });
             }
-            (Ok((pipeline, _)), _) => {
+            (Ok((pipeline, _, _)), _) => {
                 drop(st);
                 let _ = pipeline.set_state(gst::State::Null);
             }
@@ -326,10 +356,39 @@ impl Mic {
         }
     }
 
-    /// §Microphone: `u16 packet_seq, u32 ts_48khz, Opus`. Datagrams reorder, so a packet
-    /// behind the last one taken is dropped (an Opus decoder cannot take them out of order).
-    /// shortcut: no concealment of a lost packet, a 10 ms hole; upgrade with a GAP event
-    /// to opusdec's PLC if voice chat over lossy links needs it.
+    /// Every 10 ms the jitter buffer gives one packet to the decoder, or tells it one is lost.
+    /// Pushing at an even rate is what keeps a sink with no clock of its own from crackling.
+    fn pace(&self) {
+        let mut at = std::time::Instant::now();
+        loop {
+            at += MIC_TICK;
+            std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+            let out = self.jitter().tick(std::time::Instant::now());
+            let (src, decoder) = match &*self.lock() {
+                MicState::Running { src, decoder, .. } => (src.clone(), decoder.clone()),
+                _ => return,
+            };
+            match out {
+                Out::Packet(opus) => {
+                    let _ = src.push_buffer(gst::Buffer::from_slice(opus));
+                }
+                // Opus conceals a lost packet when the decoder is told 10 ms are missing. Sent
+                // into the decoder's own sink pad, so it is ordered with the buffers.
+                Out::Lost => {
+                    let gap =
+                        gst::event::Gap::builder(src.current_running_time().unwrap_or_default())
+                            .duration(gst::ClockTime::from_mseconds(10))
+                            .build();
+                    if let Some(pad) = decoder.static_pad("sink") {
+                        pad.send_event(gap);
+                    }
+                }
+                Out::Wait => {}
+            }
+        }
+    }
+
+    /// §Microphone: `u16 packet_seq, u32 ts_48khz, Opus`. The jitter buffer orders them.
     fn push(&self, body: &[u8]) {
         let Some(opus) = body.get(MIC_HEADER - 1..) else {
             return;
@@ -337,27 +396,12 @@ impl Mic {
         if opus.is_empty() || opus.len() > MAX_OPUS_PACKET {
             return;
         }
-        let seq = u16::from_le_bytes([body[0], body[1]]);
-        let mut st = self.lock();
-        let MicState::Running { src, last_seq, .. } = &mut *st else {
+        if !matches!(*self.lock(), MicState::Running { .. }) {
             return;
-        };
-        let gap = match *last_seq {
-            None => false,
-            Some(last) => match missing(last, seq) {
-                None => return,
-                Some(n) => n > 0,
-            },
-        };
-        *last_seq = Some(seq);
-        let mut buffer = gst::Buffer::from_slice(opus.to_vec());
-        if gap {
-            buffer
-                .get_mut()
-                .expect("a new buffer")
-                .set_flags(gst::BufferFlags::DISCONT);
         }
-        let _ = src.push_buffer(buffer);
+        let seq = u16::from_le_bytes([body[0], body[1]]);
+        self.jitter()
+            .push(seq, Bytes::copy_from_slice(opus), std::time::Instant::now());
     }
 
     fn stop(&self) {
@@ -373,7 +417,6 @@ impl Mic {
     }
 }
 
-/// `n` real 10 ms Opus packets, from the encoder settings the session audio uses.
 #[cfg(test)]
 pub(crate) fn test_opus_packets(n: usize) -> Vec<Vec<u8>> {
     gst::init().unwrap();
@@ -485,6 +528,7 @@ mod tests {
             audio: true,
             mic: true,
             pulse_server: None,
+            jitter_ms: 40,
         })
         .describe();
         assert_eq!(both.0["channels"], 2);
@@ -495,15 +539,6 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_is_counted_in_serial_arithmetic() {
-        assert_eq!(missing(5, 6), Some(0));
-        assert_eq!(missing(5, 9), Some(3));
-        assert_eq!(missing(0xffff, 1), Some(1), "wraps");
-        assert_eq!(missing(5, 5), None, "a duplicate");
-        assert_eq!(missing(5, 3), None, "late");
-    }
-
-    #[test]
     fn mic_packets_from_the_attached_client_are_decoded_into_the_sink() {
         let packets = test_opus_packets(30);
         assert!(packets.len() >= 20, "{} packets", packets.len());
@@ -511,17 +546,11 @@ mod tests {
             audio: true,
             mic: true,
             pulse_server: None,
+            jitter_ms: 40,
         });
         let _rx = audio.attach(7);
         let mic = audio.mic.clone().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !matches!(*mic.lock(), MicState::Running { .. }) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the mic sink never started"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        wait_running(&mic);
         // Not the attached client; a bare header; an empty packet; a packet behind: none count.
         audio.mic_packet(8, &mic_body(0, &packets[0]));
         audio.mic_packet(7, &[1, 0, 0]);
@@ -543,5 +572,83 @@ mod tests {
         }
         audio.end();
         assert!(matches!(*mic.lock(), MicState::Stopped));
+    }
+
+    fn wait_running(mic: &Mic) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(*mic.lock(), MicState::Running { .. }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the mic sink never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Send packets `from..from + n` of `packets` (cycled) as `client`, 10 ms apart.
+    fn send(audio: &Audio, client: u64, packets: &[Vec<u8>], from: u16, n: u16) {
+        for i in 0..n {
+            audio.mic_packet(
+                client,
+                &mic_body(from + i, &packets[usize::from(i) % packets.len()]),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn wait_delivered(audio: &Audio, at_least: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while audio.mic_delivered() < at_least {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {at_least} decoded buffers reached the sink",
+                audio.mic_delivered()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_client_that_takes_over_numbers_from_zero_and_is_heard_from_its_first_packet() {
+        let packets = test_opus_packets(30);
+        let audio = Audio::new(Plan {
+            audio: true,
+            mic: true,
+            pulse_server: None,
+            jitter_ms: 40,
+        });
+        let _a = audio.attach(7);
+        wait_running(audio.mic.as_ref().unwrap());
+        send(&audio, 7, &packets, 1_000, 25);
+        wait_delivered(&audio, 20);
+        let before = audio.mic_delivered();
+        // A reload, or a second device: a new client counting from 0, straight away.
+        let _b = audio.attach(8);
+        send(&audio, 8, &packets, 0, 12);
+        wait_delivered(&audio, before + 11);
+        // The first client is no longer the one heard.
+        let after = audio.mic_delivered();
+        send(&audio, 7, &packets, 1_025, 5);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(audio.mic_delivered(), after);
+    }
+
+    #[test]
+    fn a_lost_microphone_packet_is_concealed_not_skipped() {
+        let packets = test_opus_packets(30);
+        let audio = Audio::new(Plan {
+            audio: true,
+            mic: true,
+            pulse_server: None,
+            jitter_ms: 40,
+        });
+        let _rx = audio.attach(7);
+        wait_running(audio.mic.as_ref().unwrap());
+        for seq in (0u16..12).filter(|s| *s != 5) {
+            audio.mic_packet(7, &mic_body(seq, &packets[usize::from(seq)]));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // 11 packets arrived; the decoder was told about the 12th and concealed it.
+        wait_delivered(&audio, 12);
     }
 }
