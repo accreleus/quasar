@@ -97,12 +97,13 @@ type CreateParams struct {
 	claim *parkedClaim
 }
 
-// parkedClaim names the parked session a launch tries to adopt. hostParks is
-// the in-memory parked_sessions_v1 answer for its host, read before the
-// transaction.
+// parkedClaim names the parked session a launch tries to adopt. hostParks and
+// restream are the in-memory parked_sessions_v1 and adopt_restream_v1 answers
+// for its host, read before the transaction.
 type parkedClaim struct {
 	id        string
 	hostParks bool
+	restream  bool
 }
 
 // sameHolder is the session whose home hold a launch may pass: the parked
@@ -389,7 +390,9 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 	var claimed *claimedParked
 	if p.claim != nil {
-		if claimed, err = claimParked(ctx, tx, p); err != nil {
+		if claimed, err = claimParked(ctx, tx, p); errors.Is(err, errClaimLost) {
+			return Session{}, false, claimLostAnswer(ctx, tx, p)
+		} else if err != nil {
 			return Session{}, false, err
 		}
 		// The adopted runtime is already on that GPU, so its memory is not new.
@@ -440,7 +443,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	err = tx.QueryRow(ctx, candidateSQL, candidateArgs...).Scan(&gpuID, &hostID, &gpuIndex)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if claimed != nil {
-			return Session{}, false, &ParkedClaimRefusedError{HolderID: p.claim.id} // check 5
+			return Session{}, false, &ParkedClaimRefusedError{HolderID: p.claim.id, Cause: causeNoRoom} // check 5
 		}
 		return Session{}, false, classifyReject(ctx, tx, cand)
 	}
@@ -587,6 +590,9 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 
 	sess.GPUIndex = &gpuIndex
 	sess.notice = sharedNotice
+	if claimed != nil {
+		sess.restream = claimed.restream
+	}
 	return sess, false, nil
 }
 

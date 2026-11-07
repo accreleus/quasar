@@ -1009,6 +1009,21 @@ pub(super) fn reset_to_launch(
     );
 }
 
+/// Write `kbps` to the encoder live, with its CPB, for an adoption's new stream
+/// (amendment 59). `false` when this encoder cannot take it live.
+pub(super) fn write_bitrate_live(
+    encoder: &gst::Element,
+    cfg: &SessionConfig,
+    kbps: u32,
+    fps: i32,
+) -> bool {
+    if !encoder_abr_writable(encoder, cfg.encoder) {
+        return false;
+    }
+    write_encoder_bitrate(encoder, cfg.encoder, kbps, fps.max(1) as u32);
+    true
+}
+
 /// What [`reset_to_launch`] writes, and its account of it.
 fn write_launch_point(
     encoder: &gst::Element,
