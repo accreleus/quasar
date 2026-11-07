@@ -2198,6 +2198,229 @@ fn start_first_source<F: Fn(SessionEvent)>(
     Some((source, vulkan_contexts))
 }
 
+/// Clock, GPU contexts, then READY (with the Vulkan device check) and PLAYING for an encode
+/// pipeline: the session's first, or an adoption's rebuild (amendment 59). On `Err`, the
+/// reason, already logged; the caller tears down.
+fn start_encode_pipeline(
+    pipe: &gst::Pipeline,
+    cfg: &SessionConfig,
+    shared_clock: &gst::Clock,
+    shared_base: gst::ClockTime,
+    vulkan_contexts: Option<&VulkanContextBridge>,
+    cuda_ctx: Option<&gst::Context>,
+    va_ctx: Option<&gst::Context>,
+) -> Result<(), String> {
+    // Same clock + base as the source pipeline(s) so interpipesrc's pass-through PTS land
+    // in this pipeline's running-time (#68).
+    pipe.set_start_time(None::<gst::ClockTime>);
+    pipe.use_clock(Some(shared_clock));
+    pipe.set_base_time(shared_base);
+    // The VulkanImage crosses an interpipe boundary between two GstPipelines: install the
+    // producer-owned contexts explicitly before READY rather than relying on the timing of
+    // interpipe's forwarded context query, then verify what the encoder resolved.
+    let expected_vulkan_device =
+        vulkan_contexts.map(|contexts| install_vulkan_context_bridge(contexts, pipe));
+    // Inject the SAME shared CUDA context before PLAYING so cudaconvert + the NVENC encoder
+    // adopt it rather than making a new one, keeping the interpipe's CUDAMemory surfaces
+    // valid. set_context at READY is in time: elements bind it at READY->PAUSED.
+    if let Some(ctx) = cuda_ctx {
+        pipe.set_context(ctx);
+    }
+    // Same for the shared VA display, so the encoder reuses the compositor's NV12 surfaces
+    // instead of importing.
+    if let Some(ctx) = va_ctx {
+        pipe.set_context(ctx);
+        // set_context lands too late for device-pinned vapostproc/vah264enc: they bind a
+        // display on NULL->READY before the stored context is read ("Can't replace VA
+        // display while operating"). A sync handler answers their NEED_CONTEXT in time.
+        super::va_share::install_need_context_handler(pipe, ctx);
+    }
+    if let Some(expected) = expected_vulkan_device {
+        // A pre-session device-open/verify failure carrying a device-lost signature means
+        // the fresh Vulkan device is unusable before any session owns it: a GPU-global
+        // `device_open_failed`, which the agent escalates to a drain+restart. A plain
+        // build error stays per-session; `build_failure_reason` picks.
+        stage("encode-ready");
+        if let Err(e) = pipe.set_state(gst::State::Ready) {
+            let reason = vulkan_fault::build_failure_reason(
+                "encode set READY for Vulkan device verification",
+                &e.to_string(),
+            );
+            tracing::error!(
+                token = "runner-vulkan-ready-failed",
+                reason = %reason,
+                "encode pipeline READY transition (Vulkan device verification) failed"
+            );
+            return Err(reason);
+        }
+        if let Err(e) = assert_vulkan_encoder_device(pipe, expected) {
+            let reason = vulkan_fault::build_failure_reason(
+                "verify Vulkan context identity",
+                &format!("{e:#}"),
+            );
+            tracing::error!(
+                token = "runner-vulkan-identity-failed",
+                reason = %reason,
+                "verify Vulkan context identity failed"
+            );
+            return Err(reason);
+        }
+    }
+    stage("encode-play");
+    if let Err(e) = pipe.set_state(gst::State::Playing) {
+        tracing::error!(
+            token = "runner-encode-playing-failed",
+            error = %e,
+            "encode pipeline PLAYING transition failed"
+        );
+        return Err(format!("encode set PLAYING: {e}"));
+    }
+    // VK-05: the encode pipeline just reached PLAYING — rearm vulkanh264enc's
+    // rate-control/bitrate now (gst 1.28.4 drops a pre-PLAYING rate-control set,
+    // silently falling back to CQP; see pipeline::rearm_vulkan_rc).
+    if pipeline::vulkan_image_transport(cfg) {
+        if let Some(enc) = pipe.by_name(pipeline::VULKAN_ENCODER_NAME) {
+            pipeline::rearm_vulkan_rc(&enc, cfg.stream.bitrate_kbps);
+        } else {
+            tracing::warn!(
+                token = "vulkan-encoder-rearm-not-found",
+                "VK-05: could not find the Vulkan encoder ({}) in the encode pipeline to \
+                 rearm rate-control post-PLAYING — encoder may be stuck at CQP",
+                pipeline::VULKAN_ENCODER_NAME
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The rebuilds amendment 59 (c) refuses before anything is touched.
+fn rebuild_refused(
+    current: super::EncoderChoice,
+    next: super::EncoderChoice,
+    webtransport_tap: bool,
+) -> Option<(&'static str, String)> {
+    // What the compositor emits is fixed by the encoder family it was built for.
+    if next != current {
+        return Some((
+            "encoder_family",
+            format!("{current:?} would encode on {next:?}"),
+        ));
+    }
+    // A tap's end clears the session's WebTransport tokens for good (`Registry::end`), so a
+    // rebuild would leave that client nothing to reconnect with. Parked runtimes never have
+    // one (always `webrtc`).
+    webtransport_tap.then(|| {
+        (
+            "transport",
+            "a WebTransport session's encoder is not rebuilt warm".to_string(),
+        )
+    })
+}
+
+/// Amendment 59 (c): the encode pipeline rebuilt for `to`'s codec or H.264 profile on a
+/// warm runtime. The source (compositor, app container, Steam) is not touched: the new
+/// pipeline listens to the same interpipe sink. The old encoder is at NULL before the new
+/// one is built. On `Err`, the step (`encoder_family` and `nvenc_drain` touch nothing) and
+/// why; the caller takes the failure branch.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_encode(
+    cfg: &SessionConfig,
+    to: &super::StreamParams,
+    old_pipe: &gst::Pipeline,
+    old_transports: &SessionTransports,
+    sink: &str,
+    defer: bool,
+    stop: &AtomicBool,
+    sig_tx: pipeline::OutTx,
+    res: &SessionResources,
+    metrics: &Arc<SessionMetrics>,
+    contexts: (
+        Option<&VulkanContextBridge>,
+        Option<&gst::Context>,
+        Option<&gst::Context>,
+    ),
+    diagnostic_tx: &DiagnosticEventTx,
+    session_id: &str,
+    clock: (&gst::Clock, gst::ClockTime),
+) -> Result<
+    (
+        SessionConfig,
+        pipeline::EncodePipeline<SessionTransports>,
+        gst::Bus,
+    ),
+    (&'static str, String),
+> {
+    let (vulkan_contexts, cuda_ctx, va_ctx) = contexts;
+    let mut next = cfg.clone();
+    next.stream = to.clone();
+    next.encoder = cfg.configured_encoder;
+    let resolved = pipeline::resolve_effective_encoder(&mut next)
+        .map_err(|e| ("encoder", format!("{e:#}")))?;
+    if let Some(refused) = rebuild_refused(
+        cfg.encoder,
+        next.encoder,
+        old_transports._webtransport.is_some(),
+    ) {
+        return Err(refused);
+    }
+    if !super::nvenc_defer::destroy_if_alone(old_pipe, defer) {
+        return Err(("nvenc_drain", "another encoder is live on this host".into()));
+    }
+    pipeline::Transport::release(old_transports);
+    old_transports.audio_pipeline.finish();
+    // The old ABR loop's hooks hold the old encoder.
+    metrics.clear_hooks();
+    if stop.load(Ordering::Relaxed) {
+        return Err((
+            "deadline",
+            "stopped before the new encoder was built".into(),
+        ));
+    }
+    pipeline::preload_encoder_plugins(&[&resolved.factory]);
+    let built = pipeline::build_encode_pipeline::<SessionTransports>(
+        &next,
+        sig_tx,
+        res.devices.clone(),
+        res.input_state.clone(),
+        sink,
+        metrics.clone(),
+        va_ctx,
+        diagnostic_tx.clone(),
+        session_id.to_string(),
+        &resolved.factory,
+    )
+    .map_err(|e| ("encoder", format!("{e:#}")))?;
+    let started = start_encode_pipeline(
+        &built.pipeline,
+        &next,
+        clock.0,
+        clock.1,
+        vulkan_contexts,
+        cuda_ctx,
+        va_ctx,
+    );
+    let bus = built.pipeline.bus();
+    let fail = |why: String| {
+        built.transport.audio_pipeline.finish();
+        super::nvenc_defer::finish_encode(&built.pipeline, defer);
+        Err(("encoder", why))
+    };
+    if let Err(why) = started {
+        return fail(why);
+    }
+    if stop.load(Ordering::Relaxed) {
+        built.transport.audio_pipeline.finish();
+        super::nvenc_defer::finish_encode(&built.pipeline, defer);
+        return Err(("deadline", "stopped while the new encoder started".into()));
+    }
+    let Some(bus) = bus else {
+        return fail("the new encode pipeline has no bus".into());
+    };
+    built.transport.audio_pipeline.play();
+    metrics.set_external_resize_supported(built.resolution_lever.stage().supported);
+    Ok((next, built, bus))
+}
+
 /// One line per step of a launch, so the last one before a crash says how far the runner
 /// thread had got. The compositor logs from its own thread, and without these the runner
 /// is silent from the assignment to the encoder's line (#267).
@@ -2476,10 +2699,10 @@ pub fn run_blocking(
         }
     };
     let pipeline::EncodePipeline {
-        pipeline: encode_pipe,
+        pipeline: mut encode_pipe,
         transport,
-        interpipesrc,
-        resolution_lever,
+        mut interpipesrc,
+        mut resolution_lever,
     } = built;
     // The scale stage and the IDR that must follow a change are paired inside the lever.
     // Publish the capability BEFORE the first window can drain, so
@@ -2503,77 +2726,16 @@ pub fn run_blocking(
     // Bound after the lease so it drops first: on every return below, the audio pipeline
     // goes to NULL (#408) before the lease drains parked NVENC pipelines (#489).
     let mut transports = transport;
-    // Same clock + base as the source pipeline(s) so interpipesrc's pass-through PTS land
-    // in this pipeline's running-time (#68).
-    encode_pipe.set_start_time(None::<gst::ClockTime>);
-    encode_pipe.use_clock(Some(&shared_clock));
-    encode_pipe.set_base_time(shared_base);
-    // The VulkanImage crosses an interpipe boundary between two GstPipelines: install the
-    // producer-owned contexts explicitly before READY rather than relying on the timing of
-    // interpipe's forwarded context query, then verify what the encoder resolved.
-    let expected_vulkan_device = vulkan_contexts
-        .as_ref()
-        .map(|contexts| install_vulkan_context_bridge(contexts, &encode_pipe));
-    // Inject the SAME shared CUDA context before PLAYING so cudaconvert + the NVENC encoder
-    // adopt it rather than making a new one, keeping the interpipe's CUDAMemory surfaces
-    // valid. set_context at READY is in time: elements bind it at READY->PAUSED.
-    if let Some(ctx) = cuda_ctx.as_ref() {
-        encode_pipe.set_context(ctx);
-    }
-    // Same for the shared VA display, so the encoder reuses the compositor's NV12 surfaces
-    // instead of importing.
-    if let Some(ctx) = va_ctx.as_ref() {
-        encode_pipe.set_context(ctx);
-        // set_context lands too late for device-pinned vapostproc/vah264enc: they bind a
-        // display on NULL->READY before the stored context is read ("Can't replace VA
-        // display while operating"). A sync handler answers their NEED_CONTEXT in time.
-        super::va_share::install_need_context_handler(&encode_pipe, ctx);
-    }
-    if let Some(expected) = expected_vulkan_device {
-        // A pre-session device-open/verify failure carrying a device-lost signature means
-        // the fresh Vulkan device is unusable before any session owns it: a GPU-global
-        // `device_open_failed`, which the agent escalates to a drain+restart. A plain
-        // build error stays per-session; `build_failure_reason` picks.
-        stage("encode-ready");
-        if let Err(e) = encode_pipe.set_state(gst::State::Ready) {
-            let reason = vulkan_fault::build_failure_reason(
-                "encode set READY for Vulkan device verification",
-                &e.to_string(),
-            );
-            tracing::error!(
-                token = "runner-vulkan-ready-failed",
-                reason = %reason,
-                "encode pipeline READY transition (Vulkan device verification) failed"
-            );
-            emit(SessionEvent::Failed(reason));
-            stop_source(&mut current_source, &transports, res.launch());
-            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-            return;
-        }
-        if let Err(e) = assert_vulkan_encoder_device(&encode_pipe, expected) {
-            let reason = vulkan_fault::build_failure_reason(
-                "verify Vulkan context identity",
-                &format!("{e:#}"),
-            );
-            tracing::error!(
-                token = "runner-vulkan-identity-failed",
-                reason = %reason,
-                "verify Vulkan context identity failed"
-            );
-            emit(SessionEvent::Failed(reason));
-            stop_source(&mut current_source, &transports, res.launch());
-            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-            return;
-        }
-    }
-    stage("encode-play");
-    if let Err(e) = encode_pipe.set_state(gst::State::Playing) {
-        tracing::error!(
-            token = "runner-encode-playing-failed",
-            error = %e,
-            "encode pipeline PLAYING transition failed"
-        );
-        emit(SessionEvent::Failed(format!("encode set PLAYING: {e}")));
+    if let Err(reason) = start_encode_pipeline(
+        &encode_pipe,
+        &cfg,
+        &shared_clock,
+        shared_base,
+        vulkan_contexts.as_ref(),
+        cuda_ctx.as_ref(),
+        va_ctx.as_ref(),
+    ) {
+        emit(SessionEvent::Failed(reason));
         stop_source(&mut current_source, &transports, res.launch());
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         return;
@@ -2581,25 +2743,10 @@ pub fn run_blocking(
     emit(SessionEvent::Progress(
         "media pipeline ready; negotiating transport",
     ));
-    // VK-05: the encode pipeline just reached PLAYING — rearm vulkanh264enc's
-    // rate-control/bitrate now (gst 1.28.4 drops a pre-PLAYING rate-control set,
-    // silently falling back to CQP; see pipeline::rearm_vulkan_rc).
-    if pipeline::vulkan_image_transport(&cfg) {
-        if let Some(enc) = encode_pipe.by_name(pipeline::VULKAN_ENCODER_NAME) {
-            pipeline::rearm_vulkan_rc(&enc, cfg.stream.bitrate_kbps);
-        } else {
-            tracing::warn!(
-                token = "vulkan-encoder-rearm-not-found",
-                "VK-05: could not find the Vulkan encoder ({}) in the encode pipeline to \
-                 rearm rate-control post-PLAYING — encoder may be stuck at CQP",
-                pipeline::VULKAN_ENCODER_NAME
-            );
-        }
-    }
     // Teardown is the idempotent `audio_pipeline.finish()`, the one mechanism no exit
     // path can skip.
     transports.audio_pipeline.play();
-    let Some(encode_bus) = encode_pipe.bus() else {
+    let Some(mut encode_bus) = encode_pipe.bus() else {
         tracing::error!(
             token = "runner-encode-bus-missing",
             "encode pipeline has no bus"
@@ -2614,10 +2761,10 @@ pub fn run_blocking(
     let mut running = false;
     let mut effective_media_sent = false;
     // On-demand observation, idle until a `session_capture` lands. The encoder handle is
-    // resolved once: the encode pipeline is never structurally touched after build (the
-    // no-renegotiation constraint), so it stays valid for the session.
+    // resolved here and again after an adoption's encoder rebuild (amendment 59), the one
+    // time the encode pipeline is replaced.
     let mut capture = Capture::new();
-    let capture_encoder = encode_pipe
+    let mut capture_encoder = encode_pipe
         .by_name(pipeline::VIDEO_ENCODER_NAME)
         .or_else(|| encode_pipe.by_name(pipeline::VULKAN_ENCODER_NAME));
     let mut running_since: Option<Instant> = None;
@@ -2738,6 +2885,9 @@ pub fn run_blocking(
 
         while let Ok(req) = adopt_rx.try_recv() {
             let restreamed = req.restream.is_some();
+            let rebuilt = req.restream.as_ref().is_some_and(|to| {
+                to.codec != cfg.stream.codec || to.h264_profile != cfg.stream.h264_profile
+            });
             if let Some(to) = &req.restream {
                 let began = Instant::now();
                 #[cfg(test)]
@@ -2745,7 +2895,43 @@ pub fn run_blocking(
                     let pause = RESTREAM_PAUSE_MS.load(Ordering::Relaxed);
                     std::thread::sleep(Duration::from_millis(pause));
                 }
-                match transports.restream(to) {
+                let rebuild =
+                    to.codec != cfg.stream.codec || to.h264_profile != cfg.stream.h264_profile;
+                let moved = if rebuild {
+                    let sink = interpipesrc.property::<String>("listen-to");
+                    rebuild_encode(
+                        &cfg,
+                        to,
+                        &encode_pipe,
+                        &transports,
+                        &sink,
+                        defer_encode_teardown,
+                        &stop,
+                        sig_tx.clone(),
+                        &res,
+                        &session_metrics,
+                        (vulkan_contexts.as_ref(), cuda_ctx.as_ref(), va_ctx.as_ref()),
+                        &diagnostic_tx,
+                        &session_id,
+                        (&shared_clock, shared_base),
+                    )
+                    .map(|(next, built, bus)| {
+                        cfg = next;
+                        encode_pipe = built.pipeline;
+                        transports = built.transport;
+                        interpipesrc = built.interpipesrc;
+                        resolution_lever = built.resolution_lever;
+                        encode_bus = bus;
+                        capture_encoder = encode_pipe
+                            .by_name(pipeline::VIDEO_ENCODER_NAME)
+                            .or_else(|| encode_pipe.by_name(pipeline::VULKAN_ENCODER_NAME));
+                    })
+                } else {
+                    transports
+                        .restream(to)
+                        .map_err(|(step, e)| (step, format!("{e:#}")))
+                };
+                match moved {
                     Ok(()) => {
                         // Size and fps stay as built: a swap builds its compositor, and
                         // the interpipe caps, from them. The lever and the display update
@@ -2755,7 +2941,9 @@ pub fn run_blocking(
                         tracing::info!(
                             token = "runtime-adopt-restreamed",
                             elapsed_ms = elapsed.as_millis() as u64,
-                            "adopted runtime moved to {}x{}@{} at {} kbit/s",
+                            rebuild,
+                            "adopted runtime moved to {:?} {}x{}@{} at {} kbit/s",
+                            to.codec,
                             to.width,
                             to.height,
                             to.fps,
@@ -2771,8 +2959,8 @@ pub fn run_blocking(
                             break;
                         }
                     }
-                    Err((step, e)) => {
-                        emit(SessionEvent::Restreamed(Err((step, format!("{e:#}")))));
+                    Err((step, why)) => {
+                        emit(SessionEvent::Restreamed(Err((step, why))));
                         // Torn down as a declined runtime: the stop path's terminal report
                         // goes out under the adopted id (the agent has not re-labelled).
                         stop.store(true, Ordering::Relaxed);
@@ -2859,8 +3047,9 @@ pub fn run_blocking(
                 if pc == PcId::Audio && transports.audio_webrtc.is_none() {
                     continue;
                 }
-                // A restream's new video transport offers on its own.
-                if pc == PcId::Video && restreamed {
+                // A restream's new video transport, and a rebuild's new transports, offer
+                // on their own.
+                if restreamed && (pc == PcId::Video || rebuilt) {
                     continue;
                 }
                 let restart = SignalMsg::RestartIce { pc: Some(pc) };
@@ -4310,6 +4499,21 @@ mod tests {
     };
     use gstreamer::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Amendment 59 (c): what a rebuild refuses before it touches the old encoder.
+    #[test]
+    fn a_rebuild_refuses_another_encoder_family_and_a_webtransport_tap() {
+        use crate::session::EncoderChoice::{Nvenc, Vulkan};
+        assert_eq!(super::rebuild_refused(Vulkan, Vulkan, false), None);
+        assert_eq!(
+            super::rebuild_refused(Vulkan, Nvenc, false).map(|r| r.0),
+            Some("encoder_family")
+        );
+        assert_eq!(
+            super::rebuild_refused(Vulkan, Vulkan, true).map(|r| r.0),
+            Some("transport")
+        );
+    }
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 

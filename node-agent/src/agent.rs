@@ -3187,6 +3187,9 @@ struct SessionManager {
     /// Assigned but not yet started. Aged out by the heartbeat sweep — see
     /// [`PENDING_ASSIGNMENT_TTL`].
     pending: HashMap<String, PendingAssignment>,
+    /// (GPU, codec, H.264 profile) whose encoder rebuild failed deterministically on this
+    /// connection epoch: a later adoption needing it builds fresh at once (amendment 59).
+    failed_rebuilds: std::collections::HashSet<RebuildKey>,
     /// Keyed by the session id the control plane addresses, held runtimes included.
     running: HashMap<String, RunningHandle>,
     /// Amendment 39: a runner reports under its runtime's first session id
@@ -3466,8 +3469,7 @@ impl RunningHandle {
             && stream.fps <= fps
     }
 
-    /// The encoder rebuild of amendment 59 (c) is not in this build: a new codec or H.264
-    /// profile takes the failure branch (a fresh build).
+    /// Whether adopting `stream` needs the encoder rebuilt, amendment 59 (c).
     fn needs_encoder(&self, stream: &StreamParams) -> bool {
         self.stream.codec != stream.codec || self.stream.h264_profile != stream.h264_profile
     }
@@ -3482,6 +3484,8 @@ impl RunningHandle {
 /// assignment is started again, and finds the runtime declined.
 struct Restreaming {
     session_id: String,
+    /// `Some` when it rebuilds the encoder, (c): the key a deterministic failure records.
+    rebuild: Option<RebuildKey>,
     assignment: PendingAssignment,
     deadline: Instant,
 }
@@ -3508,8 +3512,14 @@ async fn restream_timer(due: Option<Instant>) {
 /// (accreleus/quasar#1133).
 const ADOPT_RESTREAM_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The decline that is amendment 59's failure branch at step `encoder`.
-const NEEDS_ENCODER: &str = "it encodes another codec or H.264 profile";
+/// The decline of an adoption whose encoder rebuild already failed on this epoch.
+const REBUILD_FAILED_BEFORE: &str = "its encoder rebuild for this codec failed before";
+
+type RebuildKey = (i32, crate::session::Codec, String);
+
+fn rebuild_key(gpu_index: i32, stream: &StreamParams) -> RebuildKey {
+    (gpu_index, stream.codec, stream.h264_profile.clone())
+}
 
 /// Why `h` may not be adopted by an assign for `gpu_index` with `cfg`, `None` when it may.
 fn adopt_declined(h: &RunningHandle, gpu_index: i32, cfg: &SessionConfig) -> Option<&'static str> {
@@ -3527,8 +3537,6 @@ fn adopt_declined(h: &RunningHandle, gpu_index: i32, cfg: &SessionConfig) -> Opt
         Some("it is not a streamed session")
     } else if !h.fits(&cfg.stream) {
         Some("it was built smaller or slower, or with another mic")
-    } else if h.needs_encoder(&cfg.stream) {
-        Some(NEEDS_ENCODER)
     } else if h.region_env != region_env(cfg.container.as_ref()) {
         Some("its container was started with other Region and Input values")
     } else if cfg.kind != Some(SessionKind::Parked) && !h.metrics.launch_helper_connected() {
@@ -3578,6 +3586,7 @@ impl SessionManager {
         let deployment_baseline = runtime_settings.clone();
         SessionManager {
             pending: HashMap::new(),
+            failed_rebuilds: Default::default(),
             running: HashMap::new(),
             labels: HashMap::new(),
             runtime_settings,
@@ -3903,6 +3912,7 @@ impl SessionManager {
     ) {
         let dropped = self.pending.len();
         self.pending.clear();
+        self.failed_rebuilds.clear();
         // As a pending start is dropped: the control plane may have reaped the play id, so
         // a restream in flight relabels nothing and builds nothing. The runtime, already
         // handed the adoption, is torn down as a declined one, its proof under its own id.
@@ -5273,14 +5283,21 @@ impl SessionManager {
             );
             return Adoption::Fresh { after: None };
         };
-        let declined = adopt_declined(h, gpu_index, cfg);
-        if declined == Some(NEEDS_ENCODER) {
+        let mut declined = adopt_declined(h, gpu_index, cfg);
+        if declined.is_none()
+            && h.needs_encoder(&cfg.stream)
+            && self
+                .failed_rebuilds
+                .contains(&rebuild_key(gpu_index, &cfg.stream))
+        {
             warn!(
-                token = "adopt-restream-no-encoder-rebuild",
+                token = "adopt-restream-rebuild-skipped",
                 step = "encoder",
-                "adopt_restream_failed: session {session_id}: this agent cannot rebuild the \
-                 encoder for another codec or H.264 profile yet; building fresh"
+                "adopt_restream_failed: session {session_id}: the encoder rebuild for {:?} \
+                 failed before on this GPU; building fresh",
+                cfg.stream.codec
             );
+            declined = Some(REBUILD_FAILED_BEFORE);
         }
         let request = AdoptRequest {
             kind: cfg.kind,
@@ -5330,7 +5347,12 @@ impl SessionManager {
         let Some(h) = self.running.get(&from) else {
             return false;
         };
-        if adopt_declined(h, pa.gpu_index, &pa.cfg).is_some() || !h.needs_restream(&pa.cfg.stream) {
+        let rebuild = h.needs_encoder(&pa.cfg.stream);
+        let key = rebuild_key(pa.gpu_index, &pa.cfg.stream);
+        if adopt_declined(h, pa.gpu_index, &pa.cfg).is_some()
+            || !(rebuild || h.needs_restream(&pa.cfg.stream))
+            || (rebuild && self.failed_rebuilds.contains(&key))
+        {
             return false;
         }
         let Some(pa) = self.pending.remove(session_id) else {
@@ -5365,6 +5387,7 @@ impl SessionManager {
         );
         h.restreaming = Some(Restreaming {
             session_id: session_id.to_string(),
+            rebuild: rebuild.then_some(key),
             assignment: pa,
             deadline: Instant::now() + ADOPT_RESTREAM_DEADLINE,
         });
@@ -5425,6 +5448,13 @@ impl SessionManager {
              stream failed at {step}: {why}; it is torn down and the session is built fresh",
             r.session_id
         );
+        // Only an element, caps or encoder-creation failure is the hardware's answer; a
+        // deadline or a busy NVENC depends on load.
+        if step == "encoder" {
+            if let Some(key) = r.rebuild.clone() {
+                self.failed_rebuilds.insert(key);
+            }
+        }
         if let Some(h) = self.running.get_mut(runtime_id) {
             decline(h);
         }
@@ -11957,17 +11987,71 @@ mod tests {
         assert!(never.is_err(), "no restream in flight, no timer");
     }
 
-    // (c) is not in this build: another codec takes the failure branch at once.
-    #[test]
-    fn another_codec_is_built_fresh() {
-        let (mut mgr, warm) = warm_manager();
-        parked(&mut mgr, &warm, "k1", (1920, 1080));
+    /// A claim at the park's size and bitrate, in HEVC: needs the encoder rebuilt, (c).
+    fn rebuild_claim(mgr: &mut SessionManager, warm: &Warm, park: &str, play: &str) {
+        parked(mgr, warm, park, (1920, 1080));
         let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
         cfg.stream.codec = crate::session::Codec::H265;
-        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
-        assert!(mgr.running["k1"].stop.load(Ordering::Relaxed));
+        assert!(acked(start(mgr, warm, play, cfg, Some(park))));
+    }
+
+    #[test]
+    fn another_codec_asks_the_runner_for_a_rebuild() {
+        let (mut mgr, warm) = warm_manager();
+        rebuild_claim(&mut mgr, &warm, "k1", "p1");
+        let (runner, req) = warm.adopted.recv_timeout(WAIT).unwrap();
+        assert_eq!(runner, "k1");
+        assert_eq!(
+            req.restream.map(|s| s.codec),
+            Some(crate::session::Codec::H265)
+        );
+        assert_eq!(mgr.label("k1"), "k1", "no report under the play id yet");
+        assert!(warm.started.try_recv().is_err(), "nothing was built");
+    }
+
+    // An element, caps or encoder-creation failure is the hardware's answer: the next
+    // adoption needing the same rebuild builds fresh at once, until the epoch ends.
+    #[test]
+    fn a_failed_encoder_rebuild_is_remembered_for_the_epoch() {
+        let (mut mgr, warm) = warm_manager();
+        rebuild_claim(&mut mgr, &warm, "k1", "p1");
+        warm.adopted.recv_timeout(WAIT).unwrap();
+        mgr.restreamed(
+            "k1",
+            Err(("encoder", "vulkanh265enc refused caps".into())),
+            &warm.evt_tx,
+            &diagnostic_sender(),
+        );
         assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p1");
-        assert!(warm.adopted.try_recv().is_err());
+
+        rebuild_claim(&mut mgr, &warm, "k2", "p2");
+        assert!(
+            warm.adopted.try_recv().is_err(),
+            "the rebuild is not tried again"
+        );
+        assert!(mgr.running["k2"].stop.load(Ordering::Relaxed));
+        assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p2");
+
+        mgr.begin_connection(Vec::new(), Vec::new());
+        assert!(mgr.failed_rebuilds.is_empty(), "a new epoch tries again");
+    }
+
+    // A busy NVENC or a missed deadline depends on load: never remembered.
+    #[test]
+    fn a_load_dependent_rebuild_failure_is_not_remembered() {
+        for step in ["nvenc_drain", "deadline", "encoder_family"] {
+            let (mut mgr, warm) = warm_manager();
+            rebuild_claim(&mut mgr, &warm, "k1", "p1");
+            warm.adopted.recv_timeout(WAIT).unwrap();
+            mgr.restreamed(
+                "k1",
+                Err((step, "x".into())),
+                &warm.evt_tx,
+                &diagnostic_sender(),
+            );
+            assert_eq!(warm.started.recv_timeout(WAIT).unwrap().0, "p1");
+            assert!(mgr.failed_rebuilds.is_empty(), "{step} recorded");
+        }
     }
 
     #[test]
