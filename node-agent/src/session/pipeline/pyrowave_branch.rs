@@ -12,6 +12,9 @@
 //!   is on), and a client's detach flushes what that pipeline holds.
 //! - Download, convert and `pyrowaveenc` run in a pipeline of their own, started off the
 //!   encode thread with the encode pipeline's GPU contexts; its errors switch PyroWave off.
+//!   `vulkandownload` adopts only the instance through `set_context` and asks its neighbours
+//!   for the device, so the appsrc answers that query with the encode pipeline's device, and
+//!   the download's resolved device is checked against it before any frame is copied.
 //!
 //! shortcut: frames cross the CPU (download + convert) before a CPU-input encoder; zero-copy
 //! Vulkan input is #1104.
@@ -87,12 +90,17 @@ pub(crate) struct Encoder {
     /// Set under its lock with the stop; the start thread reads it under the same lock, so a
     /// start cannot land after the stop.
     stopped: Arc<Mutex<bool>>,
+    /// The appsrc pad answering context queries, and its probe.
+    context_probe: (gst::Pad, Option<gst::PadProbeId>),
 }
 
 impl Drop for Encoder {
     fn drop(&mut self) {
         if let Some(probe) = self.probe.take() {
             self.pad.remove_probe(probe);
+        }
+        if let Some(probe) = self.context_probe.1.take() {
+            self.context_probe.0.remove_probe(probe);
         }
         let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
         *stopped = true;
@@ -217,6 +225,30 @@ fn start_with(
             gst::BusSyncReply::Drop
         });
 
+    // The encode pipeline's GPU contexts, copied when the pipeline starts: what the appsrc
+    // answers a context query with (`vulkandownload` takes its device only from a query).
+    let contexts: Arc<Mutex<Vec<gst::Context>>> = Arc::default();
+    let shared = contexts.clone();
+    let context_pad = src.static_pad("src").context("appsrc has no src pad")?;
+    let context_probe = context_pad
+        .add_probe(gst::PadProbeType::QUERY_UPSTREAM, move |_, info| {
+            let Some(gst::PadProbeData::Query(q)) = info.data.as_mut() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let gst::QueryViewMut::Context(q) = q.view_mut() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+            match shared.iter().find(|c| c.context_type() == q.context_type()) {
+                Some(context) => {
+                    q.set_context(context);
+                    gst::PadProbeReturn::Handled
+                }
+                None => gst::PadProbeReturn::Ok,
+            }
+        })
+        .context("could not answer context queries")?;
+    let download = download.map(|d| d.downgrade());
     let starting = Arc::new(AtomicBool::new(false));
     let started = Arc::new(AtomicBool::new(false));
     let was_open = AtomicBool::new(false);
@@ -237,7 +269,15 @@ fn start_with(
             was_open.store(true, Ordering::Release);
             if !started.load(Ordering::Acquire) {
                 if !starting.swap(true, Ordering::AcqRel) {
-                    start_off_thread(pad, &weak, &started, &start_stopped, &on_error);
+                    let start = Start {
+                        pipeline: weak.clone(),
+                        download: download.clone(),
+                        contexts: contexts.clone(),
+                        started: started.clone(),
+                        stopped: start_stopped.clone(),
+                        on_error: on_error.clone(),
+                    };
+                    start_off_thread(pad, start);
                 }
                 return gst::PadProbeReturn::Ok;
             }
@@ -264,6 +304,7 @@ fn start_with(
         pad: feed.pad,
         probe: Some(probe),
         stopped,
+        context_probe: (context_pad, Some(context_probe)),
     })
 }
 
@@ -283,35 +324,102 @@ fn flush_off_thread(weak_src: &glib::WeakRef<gst_app::AppSrc>, in_flight: &Arc<I
         });
 }
 
+const VULKAN_DEVICE: &str = "gst.vulkan.device";
+
+/// The `GstVulkanDevice` a device context holds: one owns one VkDevice, so equal pointers
+/// mean one device (as `runner::assert_vulkan_encoder_device` checks the encoder).
+fn vulkan_device(context: &gst::Context) -> Option<usize> {
+    context
+        .structure()
+        .get::<glib::Object>(VULKAN_DEVICE)
+        .ok()
+        .map(|o| o.as_ptr() as usize)
+}
+
+/// A `vulkandownload` must copy with the encode pipeline's device: anything else copies a
+/// VkImage another device owns. Checked after READY→PAUSED, when it has resolved its device.
+fn check_download_device(download: &gst::Element, contexts: &[gst::Context]) -> Result<(), String> {
+    let expected = contexts
+        .iter()
+        .find(|c| c.context_type() == VULKAN_DEVICE)
+        .and_then(vulkan_device);
+    let vulkan = download
+        .factory()
+        .is_some_and(|f| f.name() == "vulkandownload");
+    let Some(expected) = expected else {
+        return match vulkan {
+            true => Err("no shared Vulkan device to download with".into()),
+            false => Ok(()),
+        };
+    };
+    let mut query = gst::query::Context::new(VULKAN_DEVICE);
+    let pad = download
+        .static_pad("src")
+        .ok_or("the download has no src pad")?;
+    let actual = (pad.query(&mut query))
+        .then(|| query.context_owned())
+        .flatten()
+        .as_ref()
+        .and_then(vulkan_device);
+    match actual {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(format!(
+            "the download resolved GstVulkanDevice {actual:#x}, the encode pipeline's is {expected:#x}"
+        )),
+        None => Err("the download did not answer its device".into()),
+    }
+}
+
+/// What the start thread needs.
+struct Start {
+    pipeline: glib::WeakRef<gst::Pipeline>,
+    download: Option<glib::WeakRef<gst::Element>>,
+    contexts: Arc<Mutex<Vec<gst::Context>>>,
+    started: Arc<AtomicBool>,
+    stopped: Arc<Mutex<bool>>,
+    on_error: OnError,
+}
+
 /// Start the PyroWave pipeline on a thread of its own: a state change and a device open must
-/// not hold the encode thread.
-fn start_off_thread(
-    pad: &gst::Pad,
-    weak: &glib::WeakRef<gst::Pipeline>,
-    started: &Arc<AtomicBool>,
-    stopped: &Arc<Mutex<bool>>,
-    on_error: &OnError,
-) {
-    let (Some(pipeline), encode) = (weak.upgrade(), pipeline_of(pad)) else {
+/// not hold the encode thread. PAUSED first, so the download's device is checked before any
+/// frame reaches it.
+fn start_off_thread(pad: &gst::Pad, start: Start) {
+    let (Some(pipeline), encode) = (start.pipeline.upgrade(), pipeline_of(pad)) else {
         return;
     };
-    let (started, stopped, on_error) = (started.clone(), stopped.clone(), on_error.clone());
-    let fail = on_error.clone();
+    let fail = start.on_error.clone();
     let spawned = std::thread::Builder::new()
         .name("quasar-pw-start".into())
         .spawn(move || {
-            // The encode pipeline's GPU contexts are set on it before READY; a download must
-            // use that device, not make its own.
-            for context in encode.map(|e| e.contexts()).unwrap_or_default() {
-                pipeline.set_context(&context);
+            let copied = encode.map(|e| e.contexts()).unwrap_or_default();
+            for context in &copied {
+                pipeline.set_context(context);
             }
-            let stopped = stopped.lock().unwrap_or_else(|e| e.into_inner());
+            *start.contexts.lock().unwrap_or_else(|e| e.into_inner()) = copied.clone();
+            let stopped = start.stopped.lock().unwrap_or_else(|e| e.into_inner());
             if *stopped {
                 return;
             }
-            match pipeline.set_state(gst::State::Playing) {
-                Ok(_) => started.store(true, Ordering::Release),
-                Err(e) => on_error(format!("the PyroWave pipeline did not start: {e}")),
+            let checked = pipeline
+                .set_state(gst::State::Paused)
+                .map_err(|e| format!("the PyroWave pipeline did not start: {e}"))
+                .and_then(
+                    |_| match start.download.as_ref().and_then(|d| d.upgrade()) {
+                        Some(download) => check_download_device(&download, &copied),
+                        None => Ok(()),
+                    },
+                )
+                .and_then(|()| {
+                    pipeline
+                        .set_state(gst::State::Playing)
+                        .map_err(|e| format!("the PyroWave pipeline did not start: {e}"))
+                });
+            match checked {
+                Ok(_) => start.started.store(true, Ordering::Release),
+                Err(e) => {
+                    let _ = pipeline.set_state(gst::State::Null);
+                    (start.on_error)(e);
+                }
             }
         });
     if let Err(e) = spawned {
@@ -731,5 +839,129 @@ mod tests {
         drop(side);
         assert_eq!((without.1, &without.2), (1, &vec![3]));
         assert_eq!(with, without, "the feed changed the encode pipeline");
+    }
+
+    /// A stand-in device context: what matters is the object it carries.
+    fn device_context(device: &gst::Bin) -> gst::Context {
+        let mut context = gst::Context::new(VULKAN_DEVICE, true);
+        context
+            .get_mut()
+            .unwrap()
+            .structure_mut()
+            .set(VULKAN_DEVICE, device);
+        context
+    }
+
+    /// Starts a PyroWave pipeline off an encode pipeline that holds `shared` as its device
+    /// context, with `download` in the download's place. Returns it once started or failed.
+    fn start_with_device(
+        shared: &gst::Context,
+        download: &gst::Element,
+    ) -> (gst::Pipeline, Encoder, Arc<Mutex<Option<String>>>) {
+        let n = Arc::new(AtomicUsize::new(0));
+        let (main, feed) = encode_pipeline(&[&counting_sink(&n)]);
+        main.set_context(shared);
+        let failed: Arc<Mutex<Option<String>>> = Arc::default();
+        let f = failed.clone();
+        let side = start_with(
+            feed,
+            Some(download.clone()),
+            &gst::ElementFactory::make("identity").build().unwrap(),
+            || true,
+            |_| {},
+            move |e| *f.lock().unwrap() = Some(e),
+        )
+        .unwrap();
+        main.set_state(gst::State::Playing).unwrap();
+        wait_until("started or refused", || {
+            side.pipeline.current_state() == gst::State::Playing || failed.lock().unwrap().is_some()
+        });
+        (main, side, failed)
+    }
+
+    /// Seat B's MUST: the download asks its neighbours for the device; the appsrc answers with
+    /// the encode pipeline's, and nothing else would.
+    #[test]
+    fn the_appsrc_answers_the_downloads_device_query_with_the_shared_device() {
+        gst::init().unwrap();
+        let device = gst::Bin::new();
+        let shared = device_context(&device);
+        let download = gst::ElementFactory::make("identity").build().unwrap();
+        let (main, mut side, failed) = start_with_device(&shared, &download);
+        assert_eq!(
+            *failed.lock().unwrap(),
+            None,
+            "the shared device passed the check"
+        );
+
+        let ask = || {
+            let mut q = gst::query::Context::new(VULKAN_DEVICE);
+            download
+                .static_pad("sink")
+                .unwrap()
+                .peer_query(&mut q)
+                .then(|| q.context_owned())
+                .flatten()
+                .as_ref()
+                .and_then(vulkan_device)
+        };
+        assert_eq!(
+            ask(),
+            Some(device.as_ptr() as usize),
+            "the shared GstVulkanDevice"
+        );
+        let (pad, probe) = (
+            side.context_probe.0.clone(),
+            side.context_probe.1.take().unwrap(),
+        );
+        pad.remove_probe(probe);
+        assert_eq!(ask(), None, "with the probe removed, nobody answers");
+        drop(side);
+        main.set_state(gst::State::Null).unwrap();
+    }
+
+    /// A download that resolved another device is refused before any frame reaches it.
+    #[test]
+    fn a_download_on_another_device_is_refused_before_any_frame() {
+        gst::init().unwrap();
+        let (ours, theirs) = (gst::Bin::new(), gst::Bin::new());
+        let shared = device_context(&ours);
+        let other = device_context(&theirs);
+        let download = gst::ElementFactory::make("identity").build().unwrap();
+        let frames = Arc::new(AtomicUsize::new(0));
+        let seen = frames.clone();
+        let src = download.static_pad("src").unwrap();
+        src.add_probe(gst::PadProbeType::QUERY_UPSTREAM, move |_, info| {
+            let Some(gst::PadProbeData::Query(q)) = info.data.as_mut() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            match q.view_mut() {
+                gst::QueryViewMut::Context(q) if q.context_type() == VULKAN_DEVICE => {
+                    q.set_context(&other);
+                    gst::PadProbeReturn::Handled
+                }
+                _ => gst::PadProbeReturn::Ok,
+            }
+        });
+        src.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            gst::PadProbeReturn::Ok
+        });
+        let (main, side, failed) = start_with_device(&shared, &download);
+        std::thread::sleep(Duration::from_millis(300));
+        let why = failed.lock().unwrap().clone();
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("GstVulkanDevice")),
+            "refused: {why:?}"
+        );
+        assert_ne!(side.pipeline.current_state(), gst::State::Playing);
+        assert_eq!(
+            frames.load(Ordering::SeqCst),
+            0,
+            "no frame reached the download"
+        );
+        drop(side);
+        main.set_state(gst::State::Null).unwrap();
     }
 }
