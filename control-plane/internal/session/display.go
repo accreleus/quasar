@@ -95,7 +95,6 @@ func (c *Coordinator) UpdateDisplay(ctx context.Context, sessionID string, upd D
 	if err != nil {
 		return Session{}, err
 	}
-	sessionID = sess.ID // canonical spelling: c.display is keyed on it (#1100)
 	// State first: the bounds come off the session's stream size.
 	if sess.State != StateRunning || sess.HostID == nil {
 		return Session{}, ErrDisplayNotRunning
