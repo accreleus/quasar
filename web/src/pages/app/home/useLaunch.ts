@@ -11,6 +11,7 @@ import { ApiError } from "../../../api/client";
 import type { App, ProfilesResponse, Session } from "../../../api/types";
 import { useToast } from "../../../components/Toast";
 import { playoutOverride } from "../../../webrtc/playoutOverride";
+import { transportPreference } from "../../../webtransport/transportSwitch";
 import {
   CLOSING_RETRY_DELAY_MS,
   MAX_CLOSING_RETRY_WAIT_MS,
@@ -155,6 +156,8 @@ export function useLaunch({
       const req: libraryApi.LaunchRequest = { app_id: app.id, mic: true };
       if (profileId) req.profile_id = profileId;
       if (streamCodec) req.stream = { codec: streamCodec };
+      const transport = transportPreference();
+      if (transport) req.transport = transport;
 
       // #494: abort an in-flight POST /v1/sessions (or a pending retry wait) if
       // the page navigates away mid-launch. One controller per launchApp call;
@@ -183,7 +186,7 @@ export function useLaunch({
       };
       for (;;) {
         try {
-          const { session, signaling, notice } = await libraryApi.launchSession(
+          const { session, signaling, notice, transport_options } = await libraryApi.launchSession(
             token,
             req,
             controller.signal,
@@ -206,6 +209,8 @@ export function useLaunch({
               resolvedCodec: session.stream.codec,
               micGranted: session.stream.mic === true,
               playoutOverride: playoutOverride(),
+              // Present only when the stream plan chose WebTransport.
+              webtransport: transport_options?.webtransport,
             },
           });
           return;

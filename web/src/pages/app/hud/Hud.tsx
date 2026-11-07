@@ -43,6 +43,8 @@ export interface HudProps {
   appName: string;
   tier?: string;
   resolvedCodec?: string;
+  /** The session's transport: webrtc | webtransport. */
+  transport?: string;
   sessionId?: string;
 
   inputCaptured: boolean;
@@ -406,6 +408,7 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             register={props.register}
             tier={props.tier}
             resolvedCodec={props.resolvedCodec}
+            transport={props.transport}
             sessionId={props.sessionId}
             startedAt={props.startedAt}
           />

@@ -108,7 +108,7 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 		// A console launch never claims: it is direct-display, a parked session
 		// stream_only. Stop the parked holder; its terminal report re-runs auto-start.
 		if inUse.parkedID != "" {
-			c.supersedeParkedHolder(ctx, userID, inUse.parkedID)
+			c.supersedeParkedHolder(ctx, userID, inUse.parkedID, "")
 		}
 		return "", fmt.Errorf("console auto-start: schedule: %w (a warm-Steam runtime is stopping)", ErrConsoleHomeSettling)
 	}

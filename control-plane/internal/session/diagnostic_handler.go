@@ -240,6 +240,7 @@ func (h *Handler) handleDiagnosticBundle(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	id = sess.ID // canonical spelling: the ingest counters are keyed on it (#1100)
 
 	fromMs, toMs := resolveWindow(r)
 	raw, err := h.store.Telemetry().Window(r.Context(), id,
