@@ -258,3 +258,39 @@ func TestConcurrentMappingWritersDoNotDeadlock(t *testing.T) {
 		t.Errorf("concurrent writer failed: %v", err)
 	}
 }
+
+// A claim that commits after the first clear and before the parked stop leaves a new play on the
+// old Steam; only the second clear catches it.
+func TestAClaimCommittingDuringTheMappingWriteEndsWithParkOnEndClear(t *testing.T) {
+	f, cs, hotfix := wiredCompat(t)
+	ctx := context.Background()
+	k := f.park(t)
+	var admin string
+	must(t, f.pool.QueryRow(ctx, `SELECT id::text FROM users LIMIT 1`).Scan(&admin))
+
+	var claimed string
+	betweenParkOnEndClears = func() {
+		betweenParkOnEndClears = nil
+		res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+		if err != nil {
+			t.Errorf("claim inside the write: %v", err)
+			return
+		}
+		claimed = res.Session.ID
+	}
+	t.Cleanup(func() { betweenParkOnEndClears = nil })
+
+	_, _, _, _, err := cs.SetMapping(ctx, "480", hotfix, false, admin)
+	must(t, err)
+	if claimed == "" {
+		t.Fatal("the claim did not run")
+	}
+	if a := f.disp.assignFor(t, claimed); a.AdoptSessionID != k {
+		t.Fatalf("the play adopted %q, want the parked session %s", a.AdoptSessionID, k)
+	}
+	var parkOnEnd bool
+	must(t, f.pool.QueryRow(ctx, `SELECT park_on_end FROM sessions WHERE id = $1::uuid`, claimed).Scan(&parkOnEnd))
+	if parkOnEnd {
+		t.Error("the play that claimed the old Steam during the write can still park it when its game exits")
+	}
+}

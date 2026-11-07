@@ -1,6 +1,6 @@
 package session
 
-// migration_0115_db_test.go — sessions.park_on_end: additive, every existing row stays parkable,
+// migration_0114_db_test.go — sessions.park_on_end: additive, every existing row stays parkable,
 // down drops it. Runs in a scratch database: it migrates down.
 
 import (
@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestMigration0115UpAndDown(t *testing.T) {
+func TestMigration0114UpAndDown(t *testing.T) {
 	url := scratchDB(t)
 	m := newMigrator(t, url)
 	migrateTo(t, m, 113)
@@ -27,7 +27,7 @@ func TestMigration0115UpAndDown(t *testing.T) {
 	must(t, pool.QueryRow(ctx, `INSERT INTO hosts (node_name, status) VALUES ('m','online') RETURNING id::text`).Scan(&hostID))
 	sessionID := insertSessionRow(t, pool, userID, appID, &hostID, "running")
 
-	migrateTo(t, m, 115)
+	migrateTo(t, m, 114)
 	var parkable bool
 	must(t, pool.QueryRow(ctx, `SELECT park_on_end FROM sessions WHERE id = $1::uuid`, sessionID).Scan(&parkable))
 	if !parkable {

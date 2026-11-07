@@ -645,6 +645,9 @@ func (c *Coordinator) ExpireParked(ctx context.Context) (int, error) {
 	return c.stopParked(ctx, StopReasonParkedExpired, parkedFilter{Expired: w.Enabled})
 }
 
+// betweenParkOnEndClears is a test seam: it runs after the first clear, before the parked stop, where a claim can still commit.
+var betweenParkOnEndClears func()
+
 // SupersedeParked makes sure no Steam that predates an effective mapping change survives it, inside
 // tx: it clears park_on_end on the live play sessions, stops every live parked session, then clears
 // park_on_end again. A park made from a play session that ends, and a play that claims a parked
@@ -654,6 +657,9 @@ func (c *Coordinator) ExpireParked(ctx context.Context) (int, error) {
 func (c *Coordinator) SupersedeParked(ctx context.Context, tx pgx.Tx) (func(), error) {
 	if err := noParkOnEnd(ctx, tx); err != nil {
 		return nil, err
+	}
+	if betweenParkOnEndClears != nil {
+		betweenParkOnEndClears()
 	}
 	stops, err := stopParkedIn(ctx, tx, StopReasonParkedSuperseded, parkedFilter{})
 	if err != nil {
