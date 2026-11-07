@@ -58,13 +58,25 @@ func (f *fakeCleanupWire) SendImageInventoryReconcile(_ string, c agentws.ImageI
 		return sendErr
 	}
 	if f.inventoryRequests != nil {
-		f.inventoryRequests <- c
+		// Non-blocking: the service sends under its lock, and production's enqueue never
+		// blocks (cleanup.go). A full fake queue fails the test by name, not by a hang.
+		select {
+		case f.inventoryRequests <- c:
+		default:
+			panic("fake inventory reconcile queue full: raise its capacity or read it")
+		}
 	}
 	return nil
 }
 func (f *fakeCleanupWire) SendImageCleanupJournalRequest(_ string, c agentws.ImageCleanupJournalRequestCmd) error {
 	if f.journalRequests != nil {
-		f.journalRequests <- c
+		// Non-blocking: the service sends under its lock, and production's enqueue never
+		// blocks (cleanup.go). A full fake queue fails the test by name, not by a hang.
+		select {
+		case f.journalRequests <- c:
+		default:
+			panic("fake cleanup journal request queue full: raise its capacity or read it")
+		}
 	}
 	return nil
 }
