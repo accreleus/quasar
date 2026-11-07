@@ -249,6 +249,9 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// it is an installed catalog entry.
 		AppImage: app.Image(),
 	}
+	if app.IsDerived() && app.ExternalSource == "steam" {
+		p.CompatGameID = app.ExternalID
+	}
 	if p.RequireCodec, err = codecConstraint(launchProfile, ov); err != nil {
 		return LaunchResult{}, err
 	}

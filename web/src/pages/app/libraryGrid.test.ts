@@ -389,6 +389,19 @@ describe("presentLaunchError", () => {
     );
   });
 
+  it("no_host_available with reason compat_tool_missing shows the server's message, not the generic line (#1073)", () => {
+    const message = "no host can run the compatibility tool GE-Proton9-1 this game needs yet";
+    const result = presentLaunchError(family, gameA, "no_host_available", message, undefined, "compat_tool_missing");
+    expect(result.variant).toBe("info");
+    expect(result.title).toBe("This game's compatibility tool isn't ready");
+    expect(result.body).toBe(message);
+  });
+
+  it("compat_tool_missing without a message still says something", () => {
+    const result = presentLaunchError(family, gameA, "no_host_available", "", undefined, "compat_tool_missing");
+    expect(result.body).not.toBe("");
+  });
+
   it("no_host_available with a reason it does not know keeps the plain copy (#602)", () => {
     const result = presentLaunchError(family, gameA, "no_host_available", "raw message", undefined, "something_new");
     expect(result.title).toBe("Launch failed");

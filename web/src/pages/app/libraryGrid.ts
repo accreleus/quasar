@@ -5,7 +5,7 @@
 // count is responsive — tiles sharing a row share one offsetTop regardless of count.
 
 import type { AppKind, SessionState } from "../../api/types";
-import { HOME_HOST_UNAVAILABLE } from "./capacityRetry";
+import { COMPAT_TOOL_MISSING, HOME_HOST_UNAVAILABLE } from "./capacityRetry";
 
 /** Whether a session state counts as "active / live". Lives here (not a .tsx page)
  *  so homeData's DOM-free rail logic can import it too. */
@@ -282,6 +282,14 @@ export function presentLaunchError<T extends HomeApp & { name: string }>(
       variant: "info",
       title: "Your saves are on an offline host",
       body: "The host that holds your saves for this game is offline or no longer in the fleet. Ask your admin to bring it back, then try again.",
+    };
+  }
+  // Not retried (capacityRetry.ts); the server's message names the tool. semantics: control-api.md §Compatibility tools
+  if (code === "no_host_available" && reason === COMPAT_TOOL_MISSING) {
+    return {
+      variant: "info",
+      title: "This game's compatibility tool isn't ready",
+      body: message || "No host can run the compatibility tool this game needs yet. Try again shortly, or ask your admin.",
     };
   }
   // Reached only once the client's own no_host_available retry budget
