@@ -142,8 +142,29 @@ fn create_file(dir: &File, name: &[u8], exec: bool) -> Result<File, Fail> {
     Ok(f)
 }
 
-/// `openat2(dir, rel, O_PATH, RESOLVE_BENEATH)`: follows `rel`'s links without leaving `dir`.
+/// How often an `EAGAIN` from `openat2` is retried before it counts as a refusal.
+const EAGAIN_RETRIES: usize = 64;
+
+/// Runs `f` again while it fails `EAGAIN`, up to [`EAGAIN_RETRIES`] times.
+fn retry_eagain(mut f: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match f() {
+            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && tries < EAGAIN_RETRIES => {
+                tries += 1
+            }
+            other => return other,
+        }
+    }
+}
+
+/// `openat2(dir, rel, O_PATH, RESOLVE_BENEATH)`: follows `rel`'s links without leaving `dir`. The
+/// kernel answers `EAGAIN` when any rename on the system races a `..` step, so that is retried.
 pub(crate) fn resolve_beneath(dir: &File, rel: &[u8]) -> io::Result<()> {
+    retry_eagain(|| resolve_beneath_once(dir, rel))
+}
+
+fn resolve_beneath_once(dir: &File, rel: &[u8]) -> io::Result<()> {
     let c = CString::new(rel).map_err(io::Error::other)?;
     // SAFETY: zeroed is a valid open_how (no flags, no resolve bits).
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
@@ -531,6 +552,28 @@ mod tests {
             assert!(parse_vdf_name(b.as_bytes()).is_err(), "{b}");
         }
         assert!(parse_vdf_name(&[0xff, 0xfe]).is_err());
+    }
+
+    #[test]
+    fn eagain_is_retried_and_then_given_up() {
+        let mut n = 0;
+        let flaky = retry_eagain(|| {
+            n += 1;
+            if n < 3 {
+                Err(io::Error::from_raw_os_error(libc::EAGAIN))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(flaky.is_ok() && n == 3);
+        let always = retry_eagain(|| Err(io::Error::from_raw_os_error(libc::EAGAIN)));
+        assert_eq!(always.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
+        let mut calls = 0;
+        let other = retry_eagain(|| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EXDEV))
+        });
+        assert!(other.is_err() && calls == 1, "an escape is never retried");
     }
 
     #[test]
