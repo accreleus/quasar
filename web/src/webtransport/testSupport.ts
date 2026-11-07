@@ -91,6 +91,8 @@ export class FakeAgent {
   received: Record<string, unknown>[] = [];
   /** What the agent answers each hello with, in order; the last repeats. */
   replies: Step[][] = [];
+  /** Every datagram the page sent (the microphone), in order. */
+  datagramsSent: Uint8Array[] = [];
   /** `ready` rejects: the handshake or the certificate failed. */
   refuseHandshake = false;
   /** Park the client at one await of its connect until `release()`; `answer` means no reply. */
@@ -173,7 +175,11 @@ export class FakeAgent {
     const wt = {
       ready,
       closed,
-      datagrams: { readable: new ReadableStream<Uint8Array>({ start: (c) => void (dgram = c) }) },
+      datagrams: {
+        readable: new ReadableStream<Uint8Array>({ start: (c) => void (dgram = c) }),
+        writable: new WritableStream<Uint8Array>({ write: (chunk) => void agent.datagramsSent.push(chunk) }),
+        maxDatagramSize: 1200,
+      },
       async createBidirectionalStream() {
         await agent.parked("stream");
         return {

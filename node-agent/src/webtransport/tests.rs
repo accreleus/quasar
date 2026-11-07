@@ -31,7 +31,7 @@ fn hello_for(session_id: &str, token: &str, wt_proto: u32) -> Hello {
 fn ready_media() -> Arc<Media> {
     gst::init().unwrap();
     let encoder = gst::ElementFactory::make("identity").build().unwrap();
-    let media = Media::new(&encoder);
+    let media = Media::new(&encoder, Audio::new(audio::Plan::default()));
     let caps = gst::Caps::builder("video/x-h264")
         .field("stream-format", "avc")
         .field("width", 64)
@@ -120,12 +120,17 @@ struct Agent {
     hash: Vec<u8>,
     pipeline: gst::Pipeline,
     tap: Option<Tap>,
+    /// The session's audio pipeline, when the test gave it one.
+    audio_pipeline: Option<gst::Pipeline>,
 }
 
 impl Drop for Agent {
     fn drop(&mut self) {
         self.tap.take();
         let _ = self.pipeline.set_state(gst::State::Null);
+        if let Some(audio) = &self.audio_pipeline {
+            let _ = audio.set_state(gst::State::Null);
+        }
     }
 }
 
@@ -134,6 +139,10 @@ async fn agent() -> Agent {
 }
 
 async fn agent_with(limits: Limits) -> Agent {
+    agent_with_plan(limits, audio::Plan::default()).await
+}
+
+async fn agent_with_plan(limits: Limits, plan: audio::Plan) -> Agent {
     gst::init().unwrap();
     assert!(
         gst::ElementFactory::find("openh264enc").is_some(),
@@ -157,6 +166,7 @@ async fn agent_with(limits: Limits) -> Agent {
         &parse.static_pad("src").unwrap(),
         &encoder,
         SESSION,
+        plan,
     );
     assert!(tap.is_some(), "an assigned session takes the tap");
     pipeline.set_state(gst::State::Playing).unwrap();
@@ -185,7 +195,43 @@ async fn agent_with(limits: Limits) -> Agent {
         hash,
         pipeline,
         tap,
+        audio_pipeline: None,
     }
+}
+
+/// An audio pipeline made the way the session's is (`add_opus_encode`, on silence), tapped
+/// at its Opus encoder for the agent's one session.
+fn tap_session_audio(agent: &mut Agent) {
+    use crate::session::settings::RuntimeSettings;
+    use crate::session::StreamParams;
+    let stream = StreamParams {
+        width: 640,
+        height: 360,
+        fps: 30,
+        bitrate_kbps: 4000,
+        h264_profile: "constrained-baseline".to_string(),
+        codec: crate::session::Codec::H264,
+        abr_floor_kbps: 0,
+        mic: true,
+    };
+    let mut cfg = crate::session::SessionConfig::for_assignment_with(
+        &RuntimeSettings::baseline_with(&|_| None),
+        stream,
+        None,
+    );
+    cfg.use_test_audio = true;
+    let pipeline = gst::Pipeline::new();
+    let (_, opus) = crate::session::pipeline::audio_branch::add_opus_encode(&pipeline, &cfg)
+        .expect("the session's Opus encode builds");
+    let sink = gst::ElementFactory::make("fakesink")
+        .property("sync", false)
+        .build()
+        .unwrap();
+    pipeline.add(&sink).unwrap();
+    opus.link(&sink).unwrap();
+    agent.tap.as_ref().unwrap().audio().tap(&opus);
+    pipeline.set_state(gst::State::Playing).unwrap();
+    agent.audio_pipeline = Some(pipeline);
 }
 
 impl Agent {
@@ -392,6 +438,150 @@ async fn a_browser_like_client_gets_h264_access_units_after_its_token() {
     let (reused, _send, _recv, reply) = agent.hello(TOKEN).await;
     assert_eq!(reply["code"], "auth_failed", "a token is single use");
     assert_eq!(close_code(&reused).await, Some(CLOSE_AUTH));
+}
+
+/// An audio datagram as a client parses it (§Audio).
+#[derive(Debug)]
+struct AudioPacket {
+    pkt_seq: u32,
+    packet_seq: u16,
+    ts_48khz: u32,
+    capture_us: u64,
+    opus: Vec<u8>,
+}
+
+/// Every datagram from `session` for `span`, in arrival order: audio parsed, and the video
+/// ones counted. Asserts that one `pkt_seq` counts both channels without a gap.
+async fn audio_for(session: &Session, span: Duration) -> (Vec<AudioPacket>, usize) {
+    let (mut audio, mut video) = (Vec::new(), 0);
+    let mut last: Option<u32> = None;
+    let until = Instant::now() + span;
+    while let Ok(Ok(d)) = tokio::time::timeout_at(until, session.read_datagram()).await {
+        assert!(
+            d.len() <= media::MAX_DATAGRAM,
+            "a {} byte datagram",
+            d.len()
+        );
+        let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+        if let Some(last) = last {
+            assert_eq!(
+                pkt_seq,
+                last.wrapping_add(1),
+                "one pkt_seq for video and audio"
+            );
+        }
+        last = Some(pkt_seq);
+        match d[0] {
+            0x01 => video += 1,
+            0x02 => audio.push(AudioPacket {
+                pkt_seq,
+                packet_seq: u16::from_le_bytes([d[5], d[6]]),
+                ts_48khz: u32::from_le_bytes(d[7..11].try_into().unwrap()),
+                capture_us: u64::from_le_bytes(d[11..19].try_into().unwrap()),
+                opus: d[audio::AUDIO_HEADER..].to_vec(),
+            }),
+            other => panic!("channel {other:#x} is not sent to a client"),
+        }
+    }
+    (audio, video)
+}
+
+#[tokio::test]
+async fn a_session_with_audio_and_a_microphone_sends_opus_and_takes_the_microphone() {
+    let plan = audio::Plan {
+        audio: true,
+        mic: true,
+        pulse_server: None,
+        jitter_ms: 40,
+    };
+    let mut agent = agent_with_plan(Limits::default(), plan).await;
+    tap_session_audio(&mut agent);
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(
+        ack["audio"],
+        json!({"codec": "opus", "channels": 2, "sample_rate": 48000, "ptime_ms": 10})
+    );
+    assert_eq!(
+        ack["mic"],
+        json!({"codec": "opus", "channels": 1, "sample_rate": 48000, "ptime_ms": 10})
+    );
+
+    let started = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    let (got, video) = audio_for(&session, Duration::from_millis(1500)).await;
+    assert!(video > 10, "video still flows beside audio ({video})");
+    assert!(got.len() >= 80, "10 ms packets over 1.5 s: {}", got.len());
+    for pair in got.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        assert_eq!(
+            b.packet_seq,
+            a.packet_seq.wrapping_add(1),
+            "none lost on a clean path"
+        );
+        assert_eq!(b.ts_48khz.wrapping_sub(a.ts_48khz), 480, "10 ms at 48 kHz");
+        assert!(b.pkt_seq != a.pkt_seq);
+        assert!(b.capture_us > a.capture_us, "capture time rises");
+    }
+    // Packets leave the encoder in bursts; capture time follows the audio's own clock.
+    for pair in got.windows(2) {
+        let step = pair[1].capture_us - pair[0].capture_us;
+        assert!(
+            step.abs_diff(10_000) < 3_000,
+            "capture time steps by 10 ms, not by arrival: {step} µs"
+        );
+    }
+    for p in &got {
+        assert!(
+            p.capture_us.abs_diff(started) < 10_000_000,
+            "capture_us is wall-clock µs"
+        );
+        // TOC byte: CELT-only, fullband, one 10 ms frame (RFC 6716 §3.1): low-delay, 10 ms.
+        assert_eq!(p.opus[0] >> 3, 30, "the session's low-delay 10 ms Opus");
+    }
+
+    // The microphone: real 10 ms Opus packets in §Microphone framing reach the sink decoded.
+    let packets = audio::test_opus_packets(30);
+    let audio_hub = agent.tap.as_ref().unwrap().audio();
+    for (i, opus) in packets.iter().enumerate() {
+        let mut d = vec![0x05];
+        d.extend_from_slice(&(i as u16).to_le_bytes());
+        d.extend_from_slice(&(i as u32 * 480).to_le_bytes());
+        d.extend_from_slice(opus);
+        session.send_datagram(Bytes::from(d)).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while audio_hub.mic_delivered() < 20 {
+        assert!(
+            Instant::now() < deadline,
+            "{} decoded microphone buffers reached the sink",
+            audio_hub.mic_delivered()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_session_without_audio_or_a_microphone_says_so_and_ignores_both() {
+    let agent = agent().await;
+    let (session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(
+        (ack["audio"].clone(), ack["mic"].clone()),
+        (Value::Null, Value::Null)
+    );
+    session
+        .send_datagram(Bytes::from_static(&[0x05, 0, 0, 0, 0, 0, 0, 1, 2, 3]))
+        .unwrap();
+    // Video alone, so the one-channel `frames` check holds.
+    assert_eq!(frames(&session, 5, true).await.len(), 5);
 }
 
 #[tokio::test]

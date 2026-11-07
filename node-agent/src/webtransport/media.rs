@@ -10,6 +10,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use tokio::sync::mpsc;
 
+use super::audio::{self, Audio};
+
 pub(crate) const HEADER: usize = 25;
 /// The most a datagram may carry at the 1200-byte UDP budget (§Channels, "Datagram size").
 pub(crate) const MAX_DATAGRAM: usize = 1148;
@@ -88,6 +90,7 @@ struct State {
 /// connection task of the one client attached.
 pub(crate) struct Media {
     state: Mutex<State>,
+    audio: Arc<Audio>,
     encoder: glib::WeakRef<gst::Element>,
 }
 
@@ -96,19 +99,25 @@ pub(crate) struct Attached {
     pub(crate) id: u64,
     pub(crate) config: Arc<VideoConfig>,
     pub(crate) rx: mpsc::Receiver<Out>,
+    pub(crate) audio: mpsc::Receiver<audio::Packet>,
     pub(crate) gone: Arc<OnceLock<Gone>>,
 }
 
 impl Media {
-    pub(crate) fn new(encoder: &gst::Element) -> Arc<Self> {
+    pub(crate) fn new(encoder: &gst::Element, audio: Arc<Audio>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
+            audio,
             encoder: encoder.downgrade(),
         })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn audio(&self) -> &Arc<Audio> {
+        &self.audio
     }
 
     /// A configuration exists, so a `hello_ack` can be sent.
@@ -138,11 +147,13 @@ impl Media {
         }
         st.want_key = true;
         drop(st);
+        let audio = self.audio.attach(id);
         self.keyframe();
         Some(Attached {
             id,
             config,
             rx,
+            audio,
             gone,
         })
     }
@@ -152,6 +163,8 @@ impl Media {
         if st.client.as_ref().is_some_and(|c| c.id == id) {
             st.client = None;
         }
+        drop(st);
+        self.audio.detach(id);
     }
 
     pub(crate) fn end(&self) {
@@ -160,6 +173,8 @@ impl Media {
         if let Some(old) = st.client.take() {
             let _ = old.gone.set(Gone::SessionEnded);
         }
+        drop(st);
+        self.audio.end();
     }
 
     /// The keyframe request: the force-key-unit event PLI sends. A client drives this,
@@ -466,6 +481,7 @@ mod tests {
         let avcc = [1u8, 0x42, 0xc0, 0x1f, 0xff, 0xe1, 0, 0];
         let media = Arc::new(Media {
             state: Mutex::default(),
+            audio: Audio::new(audio::Plan::default()),
             encoder: glib::WeakRef::new(),
         });
         media.on_caps(&caps(1280, &avcc), "s");
@@ -531,7 +547,11 @@ mod tests {
         );
         // An element in NULL has inactive pads, which refuse every event.
         encoder.set_state(gst::State::Paused).unwrap();
-        (Media::new(&encoder), encoder, forced)
+        (
+            Media::new(&encoder, Audio::new(audio::Plan::default())),
+            encoder,
+            forced,
+        )
     }
 
     fn units(rx: &mut mpsc::Receiver<Out>) -> Vec<(bool, u8)> {
