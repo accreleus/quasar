@@ -86,14 +86,20 @@ bounds this ADR sets stand except where this section supersedes them: WebTranspo
 over the internet, the agent's round-trip gate, and "the control plane grants; the agent applies".
 Superseded, by line of the text above:
 
+- **Line 8** ("Ultra-low latency (LAN) switch"): the name is **Ultra-low latency (PyroWave)**, a
+  Codec entry in Launch options plus a profile setting (Off / Allow / Prefer), not a switch.
+- **Line 32** ("or accepts a switch on to it"): the agent no longer accepts a mid-session switch;
+  that is withdrawn to 0.6.1. It starts PyroWave only at the session's launch.
 - **Lines 34-35** (the probe's bandwidth and RTT "are not inputs"): they are now the inputs to the
   Auto rule below, as hints only.
 - **Lines 36-37** (a grant "through the user's toggle"): there is no toggle. A grant is made at
   launch, from the Launch options Codec list or the Auto rule.
 - **Lines 41-46** ("not automatic at all in 0.6", and the 0.6.1 plan: about 2 ms round trip, 1.5
   times the bitrate free, a bench-proven win): automatic selection ships in 0.6, at launch, under
-  the rule below. **The "about 2 ms" and 1.5 times figures are void**; the rule uses `max_rtt_ms`
-  (5 ms) and the target bitrate.
+  the rule below, gated by the Auto rule and the per-GPU ceiling. **The "about 2 ms" and 1.5 times
+  figures are void**; the rule uses `max_rtt_ms` (5 ms) and the target bitrate. The "bench-proven
+  latency win" is no longer a condition of shipping Auto: the bench (B12, #1061) measures the win
+  and does not gate it.
 - **Lines 79-80** (rejected: "Choosing it automatically in 0.6"): no longer rejected, in the
   launch-time form only.
 
