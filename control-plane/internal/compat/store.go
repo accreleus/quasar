@@ -14,7 +14,15 @@ var (
 	ErrNotFound = errors.New("compat tool not found")
 	// ErrNotUsable: the tool is disabled or marked (control-api.md §Usable).
 	ErrNotUsable = errors.New("compat tool is not usable")
+	// ErrMappingsFull: the table holds MaxMappings and the appid is not one of them.
+	ErrMappingsFull = errors.New("compat tool mappings are full")
 )
+
+// MaxMappings is the contract's cap on per-game mappings (control-api.md §Compatibility tools).
+const MaxMappings = 1000
+
+// mappingCapLock serializes the writers that can add a row, so the cap holds under concurrency.
+const mappingCapLock = 0x71_636d // "qcm"
 
 type Store struct{ pool *pgxpool.Pool }
 
@@ -199,4 +207,133 @@ func (s *Store) Entries(ctx context.Context) ([]Entry, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// Mapping is the CompatToolMapping read shape.
+type Mapping struct {
+	Provider   string    `json:"provider"`
+	ExternalID string    `json:"external_id"`
+	ToolID     string    `json:"tool_id"`
+	Forced     bool      `json:"forced"`
+	AppIDs     []string  `json:"app_ids"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// ToolRef names a tool in an audit row; Tag and SHA512 are set for a GE tool only.
+type ToolRef struct{ ID, Tag, SHA512 string }
+
+// Mappings lists the per-game mappings by provider, then appid numerically. app_ids are the apps
+// that are this game (the derived tiles); a mapping can precede discovery, so it may be empty.
+func (s *Store) Mappings(ctx context.Context) ([]Mapping, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT m.provider, m.external_id, m.tool_id::text, m.forced, m.updated_at,
+		       COALESCE((SELECT array_agg(a.id::text ORDER BY a.id) FROM apps a
+		                 WHERE a.external_source = m.provider AND a.external_id = m.external_id), '{}')
+		FROM compat_tool_mappings m
+		ORDER BY m.provider, m.external_id::bigint`)
+	if err != nil {
+		return nil, fmt.Errorf("list compat mappings: %w", err)
+	}
+	defer rows.Close()
+	out := []Mapping{}
+	for rows.Next() {
+		var m Mapping
+		if err := rows.Scan(&m.Provider, &m.ExternalID, &m.ToolID, &m.Forced, &m.UpdatedAt, &m.AppIDs); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// SetMapping replaces the Steam game's mapping and returns it with the one it replaced (nil if none).
+// It takes FOR SHARE on the tool row first and checks usable after the lock (control-api.md §Usable).
+func (s *Store) SetMapping(ctx context.Context, appID, toolID string, forced bool, actorID string) (m Mapping, prev *Mapping, tool, prevTool ToolRef, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var usable bool
+	var tag, sha *string
+	err = tx.QueryRow(ctx, `SELECT enabled AND NOT name_conflict AND NOT pin_conflict, tag, asset_sha512
+		FROM compat_tools WHERE id = $1::uuid FOR SHARE`, toolID).Scan(&usable, &tag, &sha)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = ErrNotFound
+		return
+	}
+	if err != nil {
+		return
+	}
+	if !usable {
+		err = ErrNotUsable
+		return
+	}
+	tool = refOf(toolID, tag, sha)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, mappingCapLock); err != nil {
+		return
+	}
+	var p Mapping
+	switch e := tx.QueryRow(ctx, `SELECT tool_id::text, forced FROM compat_tool_mappings
+		WHERE provider = 'steam' AND external_id = $1 FOR UPDATE`, appID).Scan(&p.ToolID, &p.Forced); {
+	case errors.Is(e, pgx.ErrNoRows):
+		var n int
+		if err = tx.QueryRow(ctx, `SELECT count(*) FROM compat_tool_mappings`).Scan(&n); err != nil {
+			return
+		}
+		if n >= MaxMappings {
+			err = ErrMappingsFull
+			return
+		}
+	case e != nil:
+		err = e
+		return
+	default:
+		prev = &p
+		if err = tx.QueryRow(ctx, `SELECT tag, asset_sha512 FROM compat_tools WHERE id = $1::uuid`, p.ToolID).Scan(&tag, &sha); err != nil {
+			return
+		}
+		prevTool = refOf(p.ToolID, tag, sha)
+	}
+	if err = tx.QueryRow(ctx, `
+		INSERT INTO compat_tool_mappings (provider, external_id, tool_id, forced, updated_by)
+		VALUES ('steam', $1, $2::uuid, $3, $4::uuid)
+		ON CONFLICT (provider, external_id) DO UPDATE
+		   SET tool_id = EXCLUDED.tool_id, forced = EXCLUDED.forced, updated_by = EXCLUDED.updated_by, updated_at = now()
+		RETURNING provider, external_id, tool_id::text, forced, updated_at`, appID, toolID, forced, actorID).
+		Scan(&m.Provider, &m.ExternalID, &m.ToolID, &m.Forced, &m.UpdatedAt); err != nil {
+		return
+	}
+	err = tx.QueryRow(ctx, `SELECT COALESCE(array_agg(id::text ORDER BY id), '{}') FROM apps
+		WHERE external_source = 'steam' AND external_id = $1`, appID).Scan(&m.AppIDs)
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+	return
+}
+
+func refOf(id string, tag, sha *string) ToolRef {
+	r := ToolRef{ID: id}
+	if tag != nil && sha != nil {
+		r.Tag, r.SHA512 = *tag, *sha
+	}
+	return r
+}
+
+// ClearMapping removes the Steam game's mapping and returns it (nil when none existed).
+func (s *Store) ClearMapping(ctx context.Context, appID string) (prev *Mapping, prevTool ToolRef, err error) {
+	var p Mapping
+	var tag, sha *string
+	err = s.pool.QueryRow(ctx, `
+		WITH d AS (DELETE FROM compat_tool_mappings WHERE provider = 'steam' AND external_id = $1
+		           RETURNING tool_id, forced)
+		SELECT d.tool_id::text, d.forced, t.tag, t.asset_sha512 FROM d JOIN compat_tools t ON t.id = d.tool_id`, appID).
+		Scan(&p.ToolID, &p.Forced, &tag, &sha)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ToolRef{}, nil
+	}
+	if err != nil {
+		return nil, ToolRef{}, err
+	}
+	return &p, refOf(p.ToolID, tag, sha), nil
 }
