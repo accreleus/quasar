@@ -399,6 +399,10 @@ fn take_step(
     let Some(payloader) = payloader.upgrade() else {
         return;
     };
+    // A retiring transport's watcher may be behind a newer one's: never raise the size.
+    if rtp_mtu_of(&payloader).is_some_and(|now| step.to >= now) {
+        return;
+    }
     set_rtp_mtu(&payloader, step.to);
     let w = &step.window;
     tracing::warn!(
@@ -542,6 +546,20 @@ mod tests {
                 "after a step, {what}: {window:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_stale_step_never_raises_the_packet_size() {
+        gst::init().unwrap();
+        let pay = gst::ElementFactory::make("rtph264pay").build().unwrap();
+        set_rtp_mtu(&pay, 1000);
+        let stale = Step {
+            from: 1200,
+            to: 1100,
+            window: Window::default(),
+        };
+        take_step(&stale, &pay.downgrade(), &glib::WeakRef::new(), "stale");
+        assert_eq!(rtp_mtu_of(&pay), Some(1000));
     }
 
     #[test]
