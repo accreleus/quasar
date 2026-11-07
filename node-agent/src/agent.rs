@@ -12721,7 +12721,9 @@ mod tests {
         // No tools store in tests: nothing is Installed, as after the tool's removal.
         assert!(acked(start(&mut mgr, &warm, "p1072", play, Some("k1072"))));
         assert!(
-            warm.adopted.try_recv().is_err(),
+            warm.adopted
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
             "the runner was sent nothing"
         );
         assert!(
