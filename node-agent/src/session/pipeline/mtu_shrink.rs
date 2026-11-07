@@ -23,6 +23,9 @@ const WINDOW: Duration = Duration::from_secs(1);
 const WINDOWS_IN_A_ROW: u32 = 2;
 /// The least time between two steps: the keyframe after a step lands well inside it.
 const COOLDOWN: Duration = Duration::from_secs(3);
+/// How long windows with too few packets may hold a run open. Longer, and a run would
+/// join loss from moments of motion minutes apart on an idle desktop.
+const HOLD: Duration = Duration::from_secs(3);
 /// NACKs that make a packet lost to the path. Chrome (`NackRequester`) NACKs a gap at
 /// once, then again each time an RTT has passed since the last NACK, until the packet or
 /// its RTX arrives. The RTX is itself about an RTT away, so a second NACK races the first
@@ -93,6 +96,8 @@ fn next_step(rtp_mtu: u32) -> Option<u32> {
 pub(super) struct Decision {
     rtp_mtu: u32,
     in_a_row: u32,
+    /// When the last window with enough packets to say closed.
+    last_counted: Option<Instant>,
     last_step: Option<Instant>,
 }
 
@@ -101,6 +106,7 @@ impl Decision {
         Decision {
             rtp_mtu,
             in_a_row: 0,
+            last_counted: None,
             last_step: None,
         }
     }
@@ -115,11 +121,18 @@ impl Decision {
 
     /// The size to step down to, or `None`.
     pub(super) fn on_window(&mut self, w: &Window, now: Instant) -> Option<u32> {
+        if self
+            .last_counted
+            .is_some_and(|t| now.duration_since(t) > HOLD)
+        {
+            self.in_a_row = 0;
+        }
         self.in_a_row = match w.size_correlated() {
             Some(true) => self.in_a_row + 1,
             Some(false) => 0,
             None => return None,
         };
+        self.last_counted = Some(now);
         if self.in_a_row < WINDOWS_IN_A_ROW
             || self
                 .last_step
@@ -323,7 +336,8 @@ pub(super) fn attach(
                 let ssrc = v[4].get::<u32>().ok()?;
                 let fci = v[5].get::<Option<gst::Buffer>>().ok()??;
                 let fci = fci.map_readable().ok()?;
-                nacks.lock().unwrap().nacked(ssrc, nack_seqs(&fci));
+                let seqs: Vec<u16> = nack_seqs(&fci).collect();
+                nacks.lock().unwrap().nacked(ssrc, seqs);
                 None
             });
         });
@@ -493,6 +507,26 @@ mod tests {
             ("lossy, to the floor", lossy, 12, Some(900)),
             ("at the floor", lossy, 15, None),
             ("still at the floor", lossy, 20, None),
+        ];
+        let mut d = Decision::new(1200);
+        for (what, window, sec, want) in table {
+            assert_eq!(d.on_window(window, at(*sec)), *want, "{what} (t={sec}s)");
+        }
+    }
+
+    #[test]
+    fn a_run_held_by_thin_windows_lapses_after_a_few_seconds() {
+        let lossy = w(200, 200, 60, 0);
+        let thin = w(4, 4, 4, 0);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let table: &[(&str, Window, u64, Option<u32>)] = &[
+            ("lossy during motion", lossy, 1, None),
+            ("idle", thin, 2, None),
+            ("idle", thin, 300, None),
+            ("idle, ten minutes on", thin, 600, None),
+            ("lossy again, minutes after the first", lossy, 601, None),
+            ("lossy, the second in a row", lossy, 602, Some(1100)),
         ];
         let mut d = Decision::new(1200);
         for (what, window, sec, want) in table {
