@@ -83,6 +83,7 @@ pub(super) fn add_audio_chain(
         .property("pt", 111_u32)
         .build()
         .context("rtpopuspay not found")?;
+    super::codec_chain::set_rtp_mtu(&rtp_opus_pay, cfg.rtp_mtu);
     let audio_rtp_caps = gst::Caps::builder("application/x-rtp")
         .field("media", "audio")
         .field("encoding-name", "OPUS")
@@ -164,6 +165,25 @@ mod tests {
         let mut cfg = SessionConfig::for_assignment_with(&settings, stream, None);
         cfg.use_test_audio = true;
         cfg
+    }
+
+    #[test]
+    fn the_opus_payloader_gets_the_rtp_mtu_budget() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let mut cfg = test_audio_cfg();
+        cfg.rtp_mtu = 1000;
+        add_audio_chain(&pipeline, &cfg, "test").expect("audio chain builds");
+        let pay = pipeline
+            .iterate_elements()
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| e.factory().is_some_and(|f| f.name() == "rtpopuspay"))
+            .expect("rtpopuspay in the chain");
+        assert_eq!(
+            pay.property::<u32>("mtu"),
+            super::super::codec_chain::payloader_mtu(1000)
+        );
     }
 
     #[test]
