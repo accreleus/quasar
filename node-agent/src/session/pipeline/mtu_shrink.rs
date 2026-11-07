@@ -40,10 +40,14 @@ const MIN_SENT_LARGE: u32 = 20;
 const MIN_SENT_SMALL: u32 = 10;
 /// A path MTU under ours drops almost every large packet and no small one. A token bucket
 /// a few packets deep drops large packets more often than small ones, but passes many of
-/// them and drops some small ones too: it must not shrink (4 Mbit/s with a 4 KB bucket
-/// stepped twice on the lab). Shares of first transmissions, i.e. of packets NACKed at all.
+/// them: it must not shrink (4 Mbit/s with a 4 KB bucket stepped twice on the lab). Shares
+/// of first transmissions, i.e. of packets NACKed at all. Small loss is bounded relative
+/// to large loss, so a path MTU on a link that also loses some packets still shrinks.
 const LARGE_NACKED_MIN: f64 = 0.80;
-const SMALL_NACKED_MAX: f64 = 0.05;
+const SMALL_NACKED_MAX_OF_LARGE: f64 = 0.25;
+/// Every step after the first also needs near-zero small loss, the clean shape of a path
+/// MTU, so a shaper that passes the bars above costs at most one step.
+const SMALL_NACKED_MAX_AFTER_A_STEP: f64 = 0.05;
 /// Large packets lost to the path ([`MTU_LOST_NACKS`]), at least this many and this share.
 /// The share is low because Chrome clears its whole NACK list when it would pass 1000
 /// packets and asks for a keyframe instead, so at high bitrates few lost packets live to a
@@ -77,16 +81,22 @@ pub(super) struct Window {
 }
 
 impl Window {
-    /// Whether the loss is a path MTU's: nearly every large packet, no small one, and the
-    /// retransmissions too. `None` when too few were sent to say.
-    fn size_correlated(&self) -> Option<bool> {
+    /// Whether the loss is a path MTU's: nearly every large packet, few small ones, and the
+    /// retransmissions too; none at all of the small ones `after_a_step`. `None` when too
+    /// few were sent to say.
+    fn size_correlated(&self, after_a_step: bool) -> Option<bool> {
         if self.sent_large < MIN_SENT_LARGE || self.sent_small < MIN_SENT_SMALL {
             return None;
         }
         let share = |n: u32, of: u32| f64::from(n) / f64::from(of);
+        let (large, small) = (
+            share(self.nacked_large, self.sent_large),
+            share(self.nacked_small, self.sent_small),
+        );
         Some(
-            share(self.nacked_large, self.sent_large) >= LARGE_NACKED_MIN
-                && share(self.nacked_small, self.sent_small) <= SMALL_NACKED_MAX
+            large >= LARGE_NACKED_MIN
+                && small <= large * SMALL_NACKED_MAX_OF_LARGE
+                && (!after_a_step || small <= SMALL_NACKED_MAX_AFTER_A_STEP)
                 && self.lost_large >= MIN_LOST_LARGE
                 && share(self.lost_large, self.sent_large) >= LARGE_LOST_MIN,
         )
@@ -134,7 +144,7 @@ impl Decision {
         {
             self.in_a_row = 0;
         }
-        self.in_a_row = match w.size_correlated() {
+        self.in_a_row = match w.size_correlated(self.last_step.is_some()) {
             Some(true) => self.in_a_row + 1,
             Some(false) => 0,
             None => return None,
@@ -472,12 +482,25 @@ mod tests {
                 Some(false),
             ),
             (
-                "shallow bucket: 85% of large, 10% of small",
+                "shallow bucket: 85% of large, 10% of small (once, before any step)",
                 wl(200, 170, 120, 60, 6),
+                Some(true),
+            ),
+            (
+                "a path MTU on a link losing 20% of everything",
+                w(200, 200, 60, 12),
+                Some(true),
+            ),
+            (
+                "small loss at a quarter of large loss",
+                w(200, 200, 60, 15),
+                Some(true),
+            ),
+            (
+                "small loss over a quarter of large loss",
+                w(200, 200, 60, 16),
                 Some(false),
             ),
-            ("small loss at 5%", w(200, 200, 60, 3), Some(true)),
-            ("small loss just over 5%", w(200, 200, 60, 4), Some(false)),
             ("uniform 30%", w(200, 60, 60, 18), Some(false)),
             ("uniform 90%", w(200, 180, 60, 54), Some(false)),
             ("too few large packets sent", w(19, 19, 60, 0), None),
@@ -494,7 +517,30 @@ mod tests {
             ),
         ];
         for (what, window, want) in table {
-            assert_eq!(window.size_correlated(), want, "{what}: {window:?}");
+            assert_eq!(window.size_correlated(false), want, "{what}: {window:?}");
+        }
+        // After a step, only the clean shape: small loss at most 5%.
+        let after = [
+            ("a path MTU, no small loss", w(200, 200, 60, 0), Some(true)),
+            ("small loss at 5%", w(200, 200, 60, 3), Some(true)),
+            ("small loss just over 5%", w(200, 200, 60, 4), Some(false)),
+            (
+                "a path MTU on a link losing 20% of everything",
+                w(200, 200, 60, 12),
+                Some(false),
+            ),
+            (
+                "shallow bucket: 85% of large, 10% of small",
+                wl(200, 170, 120, 60, 6),
+                Some(false),
+            ),
+        ];
+        for (what, window, want) in after {
+            assert_eq!(
+                window.size_correlated(true),
+                want,
+                "after a step, {what}: {window:?}"
+            );
         }
     }
 
@@ -651,15 +697,18 @@ mod tests {
         /// transmission, RTX included, is lost at the first percentage when it is a full
         /// fragment and at the second otherwise.
         Shaper(u64, u64),
+        /// A hop, on a link that also loses this percentage of every transmission.
+        HopAnd(usize, u64),
     }
 
-    /// Frames as a payloader cuts them at `fps`, five full fragments and a tail of any size,
-    /// for six seconds, NACKed as Chrome would through `path`. -> the first step taken.
-    fn first_step(cap: u32, path: Path, fps: u64) -> Option<u32> {
+    /// Frames as a payloader cuts them at `fps`, five full fragments and a tail of any size
+    /// at the size of the moment, for `secs` seconds, NACKed as Chrome would through `path`.
+    /// -> every step taken.
+    fn steps(cap: u32, path: Path, fps: u64, secs: u64) -> Vec<u32> {
         const MEDIA: u32 = 1;
         let t0 = Instant::now();
         let mut s = Shrink::new(cap);
-        let full = cap as usize - 20;
+        let mut taken = Vec::new();
         let mut seq = 0u16;
         // splitmix64: each transmission of each packet an independent draw.
         let hash = |seq: u16, attempt: u64| {
@@ -668,22 +717,24 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
             (z ^ (z >> 31)) % 100
         };
-        for frame in 0..fps * 6 {
+        let lossy = |seq: u16, pct: u64| (0..4).take_while(|&a| hash(seq, a) < pct).count();
+        for frame in 0..fps * secs {
             let now = t0 + Duration::from_millis(frame * 1000 / fps);
+            let full = s.decision.rtp_mtu as usize - 20;
             let tail = 100 + (frame as usize * 37) % (full - 100);
             for size in [full, full, full, full, full, tail] {
                 if let Some(step) = s.sent(MEDIA, seq, size, now) {
-                    return Some(step.to);
+                    taken.push(step.to);
                 }
                 let nacks = match path {
                     Path::Hop(hop) if size > hop => 4,
                     Path::Hop(_) => 0,
-                    Path::Lossy(pct) => (0..4).take_while(|&a| hash(seq, a) < pct).count(),
+                    Path::HopAnd(hop, _) if size > hop => 4,
+                    Path::HopAnd(_, pct) | Path::Lossy(pct) => lossy(seq, pct),
                     Path::Burst(pct) if size == full && hash(seq, 0) < pct => 2,
                     Path::Burst(_) => 0,
                     Path::Shaper(large, small) => {
-                        let pct = if size == full { large } else { small };
-                        (0..4).take_while(|&a| hash(seq, a) < pct).count()
+                        lossy(seq, if size == full { large } else { small })
                     }
                 };
                 for _ in 0..nacks {
@@ -692,7 +743,36 @@ mod tests {
                 seq = seq.wrapping_add(1);
             }
         }
-        None
+        taken
+    }
+
+    fn first_step(cap: u32, path: Path, fps: u64) -> Option<u32> {
+        steps(cap, path, fps, 6).first().copied()
+    }
+
+    #[test]
+    fn a_shaper_costs_at_most_one_step_and_a_clean_deep_hop_steps_to_fit() {
+        use Path::*;
+        assert_eq!(
+            steps(1200, Shaper(85, 10), 60, 30),
+            [1100],
+            "a severe shaper"
+        );
+        assert_eq!(
+            steps(1200, Shaper(50, 10), 60, 30),
+            Vec::<u32>::new(),
+            "the lab's shallow bucket"
+        );
+        assert_eq!(
+            steps(1436, Hop(1000), 60, 30),
+            [1336, 1236, 1136, 1036, 936],
+            "a clean hop four steps under a raised cap"
+        );
+        assert_eq!(
+            steps(1200, HopAnd(1000, 20), 60, 30),
+            [1100],
+            "a deep hop on a lossy link"
+        );
     }
 
     #[test]
@@ -788,11 +868,11 @@ mod tests {
                 None,
             ),
             (
-                "shallow bucket: 85% of large, 10% of small",
+                "a hop just under the cap on a link losing 20% of everything",
                 1200,
-                Shaper(85, 10),
+                HopAnd(1100, 20),
                 60,
-                None,
+                Some(1100),
             ),
             (
                 "shallow bucket at 1400: 50% of large, 10% of small",
