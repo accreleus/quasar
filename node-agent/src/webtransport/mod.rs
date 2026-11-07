@@ -766,18 +766,48 @@ async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Sl
         Ok::<_, Violation>((send, recv, message))
     };
     match timeout_at(deadline, hello).await {
-        Err(_) => session.close(CLOSE_PROTOCOL, b"no hello in 5 s"),
+        Err(_) => close_session(&session, CLOSE_PROTOCOL, b"no hello in 5 s").await,
         Ok(Err(Violation::Gone)) => {}
-        Ok(Err(Violation::Protocol(why))) => session.close(CLOSE_PROTOCOL, why.as_bytes()),
+        Ok(Err(Violation::Protocol(why))) => {
+            close_session(&session, CLOSE_PROTOCOL, why.as_bytes()).await
+        }
         Ok(Ok((send, recv, message))) => match serde_json::from_value::<Hello>(message) {
             Ok(hello) if hello.kind == "hello" => {
                 authenticate(&session, send, recv, &registry, hello, slot, deadline).await;
             }
-            _ => session.close(CLOSE_PROTOCOL, b"the first message is not a hello"),
+            _ => {
+                close_session(
+                    &session,
+                    CLOSE_PROTOCOL,
+                    b"the first message is not a hello",
+                )
+                .await
+            }
         },
     }
     others.abort();
     datagrams.abort();
+}
+
+/// Close the session and hold it until the close has run. A `Session` owns the peer's
+/// HTTP/3 control and QPACK streams, and dropping the last handle stops them
+/// (STOP_SENDING): Chrome treats that as a fatal connection error and never reads the
+/// close capsule. Bounded by `CONTROL_WRITE`; the library force-closes after ~3 RTT, so
+/// past an RTT of ~0.7 s that bound fires first: the connection is then closed at the
+/// QUIC level with the session's code, before the handles drop, so no frame follows it.
+async fn close_session(session: &Session, code: u32, reason: &[u8]) {
+    session.close(code, reason);
+    if tokio::time::timeout(CONTROL_WRITE, session.closed())
+        .await
+        .is_err()
+    {
+        let code = web_transport_quinn::proto::error_to_http3(code);
+        quinn::Connection::close(
+            session,
+            quinn::VarInt::from_u64(code).unwrap_or_default(),
+            reason,
+        );
+    }
 }
 
 fn log_refusal(session_id: &str, code: &str) {
@@ -803,7 +833,12 @@ async fn authenticate(
     // datagrams (or none) could never be sent video.
     if session.max_datagram_size() < MIN_DATAGRAM {
         log_refusal(&hello.session_id, "datagrams_too_small");
-        session.close(CLOSE_PROTOCOL, b"datagrams unsupported or too small");
+        close_session(
+            session,
+            CLOSE_PROTOCOL,
+            b"datagrams unsupported or too small",
+        )
+        .await;
         return;
     }
     let verdict = registry
@@ -815,8 +850,8 @@ async fn authenticate(
                 .map(|c| (media, c))
                 .ok_or(Refusal::SessionEnded)
         });
-    // The slot is held until `hello_ack` is written: a refused peer stalling the
-    // refusal counts against the caps until the deadline, like any unauthenticated one.
+    // The slot is held until `hello_ack` is written, or on a refusal until the close has
+    // run: a peer stalling either counts against the caps like any unauthenticated one.
     let (media, client) = match verdict {
         Ok(attached) => attached,
         Err(refusal) => {
@@ -825,7 +860,7 @@ async fn authenticate(
             let error = json!({"type": "error", "code": code});
             let _ = timeout_at(deadline, write_message(&mut send, &error)).await;
             let _ = send.finish();
-            session.close(close, code.as_bytes());
+            close_session(session, close, code.as_bytes()).await;
             return;
         }
     };
@@ -844,7 +879,7 @@ async fn authenticate(
         Ok(Ok(()))
     ) {
         media.detach(client.id);
-        session.close(CLOSE_PROTOCOL, b"control stream stalled");
+        close_session(session, CLOSE_PROTOCOL, b"control stream stalled").await;
         return;
     }
     drop(slot);
@@ -871,7 +906,9 @@ async fn stream(
     });
     let mut pkt_seq = 0u32;
     let mut warned_oversized = false;
-    let close = loop {
+    // What ends the stream: an optional last message, the close code and its reason.
+    const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
+    let (message, code, why) = loop {
         tokio::select! {
             out = client.rx.recv() => match out {
                 Some(Out::Unit(unit)) => {
@@ -890,42 +927,37 @@ async fn stream(
                         media.keyframe();
                     }
                     if datagrams.into_iter().try_for_each(|d| session.send_datagram(d)).is_err() {
-                        break None;
+                        break QUIET;
                     }
                 }
                 Some(Out::Config(config)) => {
                     let ack = hello_ack(&config);
                     let write = write_message(&mut send, &ack);
                     if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
-                        break None;
+                        break QUIET;
                     }
                 }
-                None => break Some(match client.gone.get() {
-                    Some(Gone::TakenOver) => (json!({"type": "bye", "reason": "taken_over"}), CLOSE_TAKEN_OVER),
-                    _ => (json!({"type": "bye", "reason": "session_ended"}), CLOSE_ENDED),
-                }),
+                None => break match client.gone.get() {
+                    Some(Gone::TakenOver) => (Some(json!({"type": "bye", "reason": "taken_over"})), CLOSE_TAKEN_OVER, ""),
+                    _ => (Some(json!({"type": "bye", "reason": "session_ended"})), CLOSE_ENDED, ""),
+                },
             },
             message = control_rx.recv() => match message {
                 Some(Ok(message)) => match message.get("type").and_then(Value::as_str) {
                     Some("keyframe_request") => media.keyframe(),
-                    Some("bye") => break None,
+                    Some("bye") => break QUIET,
                     _ => {}
                 },
-                Some(Err(Violation::Protocol(why))) => {
-                    session.close(CLOSE_PROTOCOL, why.as_bytes());
-                    break None;
-                }
-                Some(Err(Violation::Gone)) | None => break None,
+                Some(Err(Violation::Protocol(why))) => break (None, CLOSE_PROTOCOL, why),
+                Some(Err(Violation::Gone)) | None => break QUIET,
             },
         }
     };
     reader.abort();
     media.detach(client.id);
-    if let Some((message, code)) = close {
+    if let Some(message) = message {
         let _ = tokio::time::timeout(CONTROL_WRITE, write_message(&mut send, &message)).await;
         let _ = send.finish();
-        session.close(code, b"");
-    } else {
-        session.close(CLOSE_NORMAL, b"");
     }
+    close_session(session, code, why.as_bytes()).await;
 }
