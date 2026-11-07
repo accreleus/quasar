@@ -715,11 +715,6 @@
 }
 .diag-extra .diag-table td[colspan="2"] { text-align: left; }
 
-/* A row the read flags (a codec mismatch, a transport that fell back). Scoped to the
-   tables and placed after their cell rules: a bare `.diag-warn` loses to `td:last-child`. */
-.diag-grid td.diag-warn,
-.diag-extra .diag-table td.diag-warn { color: var(--warning-text); }
-
 /* The Advanced disclosure inside the stats pane: input-pipeline and cadence
    instrumentation that "mostly don't provide value" to a player reading it
    live (operator request 2026-08-05). Rows enter the DOM only when open. */
