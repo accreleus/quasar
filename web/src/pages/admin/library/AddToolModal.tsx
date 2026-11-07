@@ -12,7 +12,7 @@ import { ResourceStates } from "../../../components/ResourceStates";
 import { bytes } from "../../../lib/format/bytes";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
-import { GITHUB_UNAVAILABLE, hostTotal, pickerState } from "./compatDerived";
+import { GITHUB_UNAVAILABLE, pickerState } from "./compatDerived";
 
 interface Props {
   /** Size per tool id, from the catalogue the page already holds: the available
@@ -56,7 +56,6 @@ export function AddToolModal({ sizeByToolId, onClose, onInstalled }: Props) {
   const data = list.data;
   const recommended = data?.items.filter((a) => a.source === "recommended") ?? [];
   const latest = data?.items.filter((a) => a.source === "github_latest") ?? [];
-  const hostsLabel = (a: CompatToolAvailable) => (a.hosts ? `${hostTotal(a.hosts)} hosts` : null);
 
   function row(a: CompatToolAvailable) {
     const state = pickerState(a);
@@ -84,7 +83,9 @@ export function AddToolModal({ sizeByToolId, onClose, onInstalled }: Props) {
         ) : state.kind === "installing" ? (
           <Chip variant="info" dot>installing</Chip>
         ) : state.kind === "failed" ? (
-          <Chip variant="danger" title={hostsLabel(a) ?? undefined}>install failed</Chip>
+          <Chip variant="danger">install failed</Chip>
+        ) : state.kind === "waiting" ? (
+          <Chip>waiting for hosts</Chip>
         ) : (
           <Chip variant="danger">{state.kind === "pin_conflict" ? "pin conflict" : "name conflict"}</Chip>
         )}

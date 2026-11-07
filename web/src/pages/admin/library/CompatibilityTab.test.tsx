@@ -162,8 +162,65 @@ describe("CompatibilityTab states", () => {
   });
 });
 
+describe("CompatibilityTab hosts that are not installing", () => {
+  const row = async (name: string) =>
+    (await screen.findByText(name, { selector: ".primary" })).closest("tr") as HTMLElement;
+  const removeBtn = (r: HTMLElement, name: string) =>
+    within(r).getByRole("button", { name: `Remove ${name}` }) as HTMLButtonElement;
+
+  it.each([
+    ["an offline host", { installed: 2, waiting: 1 }, "2 / 3", "1 waiting"],
+    ["an unsupported host", { installed: 2, unsupported: 1 }, "2 / 3", "1 unsupported"],
+    ["a failed host", { installed: 2, failed: 1 }, "2 / 3", "1 failed"],
+  ])("%s among installed ones reads installed, can be removed and can be the default", async (_n, c, count, note) => {
+    const t = tool({ id: "t-x", display_name: "GE-Proton9-1", hosts: counts(c) });
+    list.mockResolvedValue(catalogue([...VALVE, t]));
+    renderTab();
+    const r = await row("GE-Proton9-1");
+    expect(within(r).getByText(count)).toBeTruthy();
+    expect(within(r).getByText(new RegExp(note))).toBeTruthy();
+    expect(within(r).queryByText("Installing")).toBeNull();
+    expect(within(r).queryByText("Failed")).toBeNull();
+    expect(removeBtn(r, "GE-Proton9-1").disabled).toBe(false);
+    const select = (await screen.findByLabelText("Default tool")) as HTMLSelectElement;
+    expect(Array.from(select.options).map((o) => o.text)).toContain("GE-Proton9-1");
+  });
+
+  it("a tool no host holds reads Failed or Waiting, still removable", async () => {
+    list.mockResolvedValue(
+      catalogue([
+        ...VALVE,
+        tool({ id: "t-f", display_name: "GE-Proton9-2", hosts: counts({ installed: 0, failed: 3 }) }),
+        tool({ id: "t-w", display_name: "GE-Proton9-3", hosts: counts({ installed: 0, waiting: 3 }) }),
+      ]),
+    );
+    renderTab();
+    const f = await row("GE-Proton9-2");
+    expect(within(f).getByText("Failed")).toBeTruthy();
+    expect(removeBtn(f, "GE-Proton9-2").disabled).toBe(false);
+    const w = await row("GE-Proton9-3");
+    expect(within(w).getByText("Waiting")).toBeTruthy();
+    expect(removeBtn(w, "GE-Proton9-3").disabled).toBe(false);
+  });
+
+  it("a tool in conflict is not offered as a default", async () => {
+    list.mockResolvedValue(catalogue([...VALVE, tool({ id: "t-c", display_name: "GE-Proton9-4", pin_conflict: true })]));
+    renderTab();
+    const select = (await screen.findByLabelText("Default tool")) as HTMLSelectElement;
+    expect(Array.from(select.options).map((o) => o.text)).not.toContain("GE-Proton9-4");
+  });
+
+  it("a disabled Remove points at the chip that says why", async () => {
+    renderTab();
+    const r = await row("GE-Proton9-27");
+    const btn = removeBtn(r, "GE-Proton9-27");
+    expect(btn.disabled).toBe(true);
+    expect(document.getElementById(btn.getAttribute("aria-describedby")!)?.textContent).toContain("Installing");
+  });
+});
+
 describe("CompatibilityTab default tool", () => {
-  it("orders the select Steam's default, installed tools, Valve's builds; leaves out a tool still installing", async () => {
+  it("orders the select Steam's default, installed tools, Valve's builds; every enabled tool without a conflict is usable", async () => {
     renderTab();
     const select = (await screen.findByLabelText("Default tool")) as HTMLSelectElement;
     expect(select.value).toBe("");
@@ -174,7 +231,7 @@ describe("CompatibilityTab default tool", () => {
     );
     expect(groups).toEqual([
       "Steam's default",
-      ["Installed tools", ["GE-Proton10-4", "GE-Proton9-20"]],
+      ["Installed tools", ["GE-Proton10-4", "GE-Proton9-27", "GE-Proton9-20"]],
       ["Valve's builds", ["Proton Experimental", "Proton 10.0"]],
     ]);
   });
@@ -200,19 +257,32 @@ describe("CompatibilityTab Remove", () => {
     await waitFor(() => expect(adminApi.setCompatToolEnabled).toHaveBeenCalledWith("test-token", "t-920", false));
   });
 
-  it("shows a refusal as a form-error row under the table row, not a toast", async () => {
-    vi.mocked(adminApi.setCompatToolEnabled).mockRejectedValue(
-      new ApiError(409, "compat_tool_in_use", "6 games use GE-Proton10-4."),
-    );
+  // The real shape from the control plane: counts in the message, not game names.
+  const inUse = () =>
+    new ApiError(409, "compat_tool_in_use", "6 per-game mapping(s) name the tool; fleet default: false");
+
+  it("shows a refusal as a form-error row under the table row, built from the row's own counts", async () => {
+    vi.mocked(adminApi.setCompatToolEnabled).mockRejectedValue(inUse());
     renderTab();
     const row = (await screen.findByText("GE-Proton10-4", { selector: ".primary" })).closest("tr")!;
     fireEvent.click(within(row).getByRole("button", { name: "Remove GE-Proton10-4" }));
-    const err = await screen.findByText(/Not removed: 6 games use GE-Proton10-4\. Change their tool first\./);
+    const err = await screen.findByText("Not removed: 6 games use this tool. Change their tool first.");
     expect(err.className).toContain("form-error");
     expect(err.closest("tr")?.className).toBe("exp-row");
     expect(row.nextElementSibling).toBe(err.closest("tr"));
-    // Still there, and Remove is usable again.
+    expect(screen.queryByText(/per-game mapping/)).toBeNull();
     expect((within(row).getByRole("button", { name: "Remove GE-Proton10-4" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it.each([
+    ["only the default holds it", { mappings: 0, is_default: true }, "Not removed: It's the default tool. Pick another default first."],
+    ["both", { mappings: 1, is_default: true }, "Not removed: 1 game uses this tool. Change their tool first. It's the default tool. Pick another default first."],
+  ])("refusal copy when %s", async (_n, over, text) => {
+    list.mockResolvedValue(catalogue([...VALVE, { ...IN_USE, ...over }], over.is_default ? "t-104" : null));
+    vi.mocked(adminApi.setCompatToolEnabled).mockRejectedValue(inUse());
+    renderTab();
+    fireEvent.click(await screen.findByRole("button", { name: "Remove GE-Proton10-4" }));
+    expect(await screen.findByText(text)).toBeTruthy();
   });
 });
 

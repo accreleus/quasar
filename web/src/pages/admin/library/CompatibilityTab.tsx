@@ -19,7 +19,15 @@ import { bytes } from "../../../lib/format/bytes";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
 import { AddToolModal } from "./AddToolModal";
-import { hostTotal, installedTools, installState, selectableInstalled, valveBuilds } from "./compatDerived";
+import {
+  hostNotes,
+  hostTotal,
+  installedTools,
+  installState,
+  refusalCopy,
+  selectableInstalled,
+  valveBuilds,
+} from "./compatDerived";
 import "../../../styles/admin/editor.css";
 import "../../../styles/admin/fleet.css";
 
@@ -65,13 +73,17 @@ export function CompatibilityTab() {
     setRefused(({ [tool.id]: _drop, ...rest }) => rest);
     setRemoving((s) => new Set(s).add(tool.id));
     try {
-      await adminApi.setCompatToolEnabled(token, tool.id, false);
+      // mutate, not a bare call: the poll is suspended for the write (a GET that
+      // started before it must not stomp the refresh below).
+      await res.mutate((ctx) => adminApi.setCompatToolEnabled(ctx.token, tool.id, false));
       addToast({ variant: "success", title: `${tool.display_name} will be removed from every host` });
       res.refresh();
     } catch (e: unknown) {
-      const msg = e instanceof ApiError ? e.message : "Could not reach the control plane.";
       const inUse = e instanceof ApiError && e.code === "compat_tool_in_use";
-      setRefused((r) => ({ ...r, [tool.id]: `Not removed: ${msg}${inUse ? " Change their tool first." : ""}` }));
+      const msg = inUse
+        ? refusalCopy(tool, e.message)
+        : `Not removed: ${e instanceof ApiError ? e.message : "Could not reach the control plane."}`;
+      setRefused((r) => ({ ...r, [tool.id]: msg }));
     } finally {
       setRemoving((s) => {
         const next = new Set(s);
@@ -157,10 +169,15 @@ export function CompatibilityTab() {
                             </div>
                           </td>
                           <td>
-                            {state === "installing" && <Chip variant="info" dot>Installing</Chip>}
-                            {state === "failed" && <Chip variant="danger">Failed</Chip>}{" "}
+                            <span id={`compat-state-${t.id}`}>
+                              {state === "installing" && <Chip variant="info" dot>Installing</Chip>}
+                              {state === "failed" && <Chip variant="danger">Failed</Chip>}
+                              {state === "waiting" && <Chip>Waiting</Chip>}
+                            </span>{" "}
                             <span className="num">{t.hosts?.installed ?? 0} / {total}</span>{" "}
-                            {state === "installed" && <span className="sub">hosts</span>}
+                            <span className="sub">
+                              {["hosts", ...(t.hosts ? hostNotes(t.hosts) : [])].join(" · ")}
+                            </span>
                           </td>
                           <td className="num">{t.mappings}</td>
                           <td className="right">
@@ -168,6 +185,7 @@ export function CompatibilityTab() {
                               variant="ghost"
                               size="sm"
                               aria-label={`Remove ${t.display_name}`}
+              aria-describedby={state === "installing" ? `compat-state-${t.id}` : undefined}
                               disabled={state === "installing" || removing.has(t.id)}
                               onClick={() => void remove(t)}
                             >
