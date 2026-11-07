@@ -5,6 +5,9 @@ import { ApiError, apiFetch } from "./client";
 import type { components } from "./schema";
 import type {
   AdminAppsResponse,
+  CompatToolList,
+  CompatToolMapping,
+  CompatToolMappingWrite,
   AdminApp,
   AppPlacement,
   AppPlacementPatch,
@@ -492,6 +495,34 @@ export function listUnpublishedLibraryItems(
   appId: string,
 ): Promise<LibraryUnpublishedResponse> {
   return apiFetch<LibraryUnpublishedResponse>(`/admin/apps/${appId}/library/unpublished`, { token });
+}
+
+// ── Compatibility tools (amendment 56) ────────────────────────────────────────
+
+export function listCompatTools(token: string, signal?: AbortSignal): Promise<CompatToolList> {
+  return apiFetch<CompatToolList>("/admin/compat-tools", { token, signal });
+}
+
+export function listCompatToolMappings(token: string): Promise<{ items: CompatToolMapping[] }> {
+  return apiFetch<{ items: CompatToolMapping[] }>("/admin/compat-tools/mappings", { token });
+}
+
+export function setCompatToolMapping(
+  token: string,
+  externalId: string,
+  req: CompatToolMappingWrite,
+): Promise<CompatToolMapping> {
+  return apiFetch<CompatToolMapping>(
+    `/admin/compat-tools/mappings/steam/${encodeURIComponent(externalId)}`,
+    { method: "PUT", body: req, token },
+  );
+}
+
+export function clearCompatToolMapping(token: string, externalId: string): Promise<void> {
+  return apiFetch<void>(`/admin/compat-tools/mappings/steam/${encodeURIComponent(externalId)}`, {
+    method: "DELETE",
+    token,
+  });
 }
 
 // ── Runtime presets (UI-P3) ───────────────────────────────────────────────────
@@ -1277,13 +1308,8 @@ export function listJobRuns(
 
 // Compatibility tools (amendments 56 and 57, control-api.md §Compatibility tools).
 export type CompatTool = components["schemas"]["CompatTool"];
-export type CompatToolList = components["schemas"]["CompatToolList"];
 export type CompatToolAvailable = components["schemas"]["CompatToolAvailable"];
 export type CompatToolAvailableList = components["schemas"]["CompatToolAvailableList"];
-
-export function listCompatTools(token: string, signal?: AbortSignal): Promise<CompatToolList> {
-  return apiFetch<CompatToolList>("/admin/compat-tools", { token, signal });
-}
 
 export function listAvailableCompatTools(token: string, signal?: AbortSignal): Promise<CompatToolAvailableList> {
   return apiFetch<CompatToolAvailableList>("/admin/compat-tools/available", { token, signal });

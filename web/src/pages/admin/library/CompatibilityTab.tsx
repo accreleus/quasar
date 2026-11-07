@@ -7,6 +7,7 @@ import { Fragment, useMemo, useState } from "react";
 import * as adminApi from "../../../api/admin";
 import type { CompatTool } from "../../../api/admin";
 import { ApiError } from "../../../api/client";
+import type { CompatToolList } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { Button } from "../../../components/Button";
 import { Chip } from "../../../components/Chip";
@@ -41,7 +42,7 @@ export function CompatibilityTab() {
   const [removing, setRemoving] = useState<ReadonlySet<string>>(new Set());
   const [refused, setRefused] = useState<Record<string, string>>({});
 
-  const res = useResource<adminApi.CompatToolList>({
+  const res = useResource<CompatToolList>({
     label: "compatibility tools",
     pollMs: POLL_MS,
     fetch: (ctx) => adminApi.listCompatTools(ctx.token, ctx.signal),

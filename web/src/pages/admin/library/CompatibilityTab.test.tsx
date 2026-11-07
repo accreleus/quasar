@@ -14,7 +14,8 @@ import { AuthContext } from "../../../auth/context";
 import type { AuthContextValue } from "../../../auth/context";
 import { ToastProvider } from "../../../components/Toast";
 import { ApiError } from "../../../api/client";
-import type { CompatTool, CompatToolAvailable, CompatToolAvailableList, CompatToolList } from "../../../api/admin";
+import type { CompatTool, CompatToolAvailable, CompatToolAvailableList } from "../../../api/admin";
+import type { CompatToolList } from "../../../api/types";
 
 vi.mock("../../../api/admin", () => ({
   listCompatTools: vi.fn(),
