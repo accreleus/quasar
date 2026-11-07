@@ -59,9 +59,3 @@ export function toolNote(t: HostTool, freeBytes: number | null): string | null {
 export function usedBytes(tools: HostTool[]): number {
   return tools.reduce((sum, t) => sum + (t.state === "installed" ? (t.bytes ?? 0) : 0), 0);
 }
-
-/** The first column: a catalogue-less installed tool has no Steam name until
- *  the host reports one, so the tag stands in. */
-export function toolName(t: HostTool): string {
-  return t.steam_name ?? t.tag;
-}

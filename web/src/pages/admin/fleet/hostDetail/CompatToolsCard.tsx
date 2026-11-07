@@ -11,7 +11,7 @@ import type { HostCompatTools } from "../../../../api/types";
 import { Chip } from "../../../../components/Chip";
 import { bytes } from "../../../../lib/format/bytes";
 import { useResource } from "../../../../lib/resource/react";
-import { toolChip, toolName, toolNote, usedBytes } from "../hostCompat";
+import { toolChip, toolNote, usedBytes } from "../hostCompat";
 
 /** An install changes under the admin's eyes; a chained, visibility-aware poll. */
 const POLL_MS = 5_000;
@@ -39,7 +39,7 @@ export function CompatToolsCard({ hostId }: { hostId: string }) {
   const used = usedBytes(data.tools);
 
   return (
-    <div className="card host-services host-compat">
+    <div className="card host-services">
       <div className="panel-head">
         <div>
           <span className="panel-title">Compatibility tools</span>
@@ -80,8 +80,8 @@ export function CompatToolsCard({ hostId }: { hostId: string }) {
                 <tr key={`${t.tool_id ?? "unlisted"}-${t.tag}`}>
                   <td>
                     <div className="stack">
-                      <span className="primary">{toolName(t)}</span>
-                      {t.steam_name && t.steam_name !== t.tag && <span className="sub">{t.tag}</span>}
+                      <span className="primary">{t.tag}</span>
+                      {t.steam_name && t.steam_name !== t.tag && <span className="sub">{t.steam_name}</span>}
                     </div>
                   </td>
                   <td>
@@ -90,7 +90,7 @@ export function CompatToolsCard({ hostId }: { hostId: string }) {
                         <Chip variant={chip.variant} dot={chip.dot}>{chip.label}</Chip>
                       </span>
                       {note && (
-                        <span className="sub host-compat-note">
+                        <span className="sub">
                           {note}
                           {t.state === "failed" && t.run_id && (
                             <>

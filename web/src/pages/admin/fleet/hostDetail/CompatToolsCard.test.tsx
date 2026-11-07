@@ -74,14 +74,22 @@ describe("CompatToolsCard", () => {
     expect(screen.getByText(/1.1 GB free/)).toBeTruthy();
   });
 
-  it("shows a removal, an offline wait and an unsupported agent", async () => {
+  it("shows a removal and a wait for the host, naming the tag first and the Steam name beneath", async () => {
     show([
       entry({ state: "removing", bytes: null }),
-      entry({ tool_id: "t2", tag: "GE-Proton9-27", steam_name: null, state: "waiting", bytes: null }),
+      entry({ tool_id: "t2", tag: "GE-Proton11-12", steam_name: "GE-Proton11-12-x86_64", state: "waiting", bytes: null }),
     ]);
     expect(await screen.findByText("Removing")).toBeTruthy();
-    expect(screen.getByText("GE-Proton9-27")).toBeTruthy();
+    expect(screen.getByText("GE-Proton11-12")).toBeTruthy();
+    expect(screen.getByText("GE-Proton11-12-x86_64")).toBeTruthy();
     expect(screen.getByText("Waiting")).toBeTruthy();
+    expect(screen.getByText("Installs when this host is ready.")).toBeTruthy();
+  });
+
+  it("reads every tool as unsupported when the agent offers none", async () => {
+    show([entry({ state: "unsupported", bytes: null })], { supported: false, free_bytes: null });
+    expect(await screen.findByText("Unsupported")).toBeTruthy();
+    expect(screen.getByText(/does not offer compatibility tools/)).toBeTruthy();
   });
 
   it("says so when the agent offers no compatibility tools", async () => {
