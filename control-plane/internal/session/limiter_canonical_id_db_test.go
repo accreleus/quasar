@@ -7,25 +7,30 @@ import (
 	"testing"
 )
 
-// #1100: isValidUUID accepts both hex cases and the store casts ::uuid, so one
-// session is reachable under many spellings. Every per-session limiter must
-// share one bucket across them. Each case drains the burst with the lower-case
-// id, then expects the upper-case spelling to be limited too.
-func TestSessionLimitersIgnoreIDCasing(t *testing.T) {
-	statsBody := map[string]any{"samples": []map[string]any{
-		{"ts_unix_ms": nowMs(), "metrics": map[string]any{"fps": 60}},
-	}}
-	for _, tc := range []struct {
-		name, method, path string
-		body               any
-	}{
-		{"stats", http.MethodPost, "/stats", statsBody},
+type limiterRoute struct {
+	name, method, path string
+	body               any
+}
+
+func limiterRoutes() []limiterRoute {
+	return []limiterRoute{
+		{"stats", http.MethodPost, "/stats", map[string]any{"samples": []map[string]any{
+			{"ts_unix_ms": nowMs(), "metrics": map[string]any{"fps": 60}},
+		}}},
 		{"trace events", http.MethodPost, "/trace/events", map[string]any{"events": []map[string]any{
 			{"ts_unix_ms": nowMs(), "type": "tab_hidden", "payload": map[string]any{}},
 		}}},
 		{"trace clock", http.MethodPost, "/trace/clock", map[string]any{"client_offset_ms": 1.0, "uncertainty_ms": 1.0}},
 		{"verdict", http.MethodGet, "/verdict", nil},
-	} {
+	}
+}
+
+// #1100: isValidUUID accepts both hex cases and the store casts ::uuid, so one
+// session is reachable under many spellings. Every per-session limiter must
+// share one bucket across them. Each case drains the burst with the lower-case
+// id, then expects the upper-case spelling to be limited too.
+func TestSessionLimitersIgnoreIDCasing(t *testing.T) {
+	for _, tc := range limiterRoutes() {
 		t.Run(tc.name, func(t *testing.T) {
 			sid, ownerTok, _, _, srvURL, _ := verdictSession(t)
 			upper := strings.ToUpper(sid)
@@ -72,5 +77,29 @@ func TestStopRecordsCanonicalSessionID(t *testing.T) {
 	}
 	if !coord.stopInGrace(sess.ID) {
 		t.Errorf("no stop record under the canonical id %s", sess.ID)
+	}
+}
+
+// A spelling the store refuses (no hyphens) is a 404 that touches no bucket: the
+// canonical spelling is still unlimited afterwards.
+func TestSessionLimitersLeaveBucketAloneOnRefusedSpelling(t *testing.T) {
+	for _, tc := range limiterRoutes() {
+		t.Run(tc.name, func(t *testing.T) {
+			sid, ownerTok, _, _, srvURL, _ := verdictSession(t)
+			bare := strings.ReplaceAll(sid, "-", "")
+			call := func(id string) int {
+				resp := doJSON(t, tc.method, srvURL+"/v1/sessions/"+id+tc.path, ownerTok, tc.body)
+				resp.Body.Close()
+				return resp.StatusCode
+			}
+			for i := 0; i < statsRateBurst+2; i++ {
+				if got := call(bare); got != http.StatusNotFound {
+					t.Fatalf("request %d with no hyphens: %d, want 404", i+1, got)
+				}
+			}
+			if got := call(sid); got == http.StatusTooManyRequests || got >= 400 {
+				t.Errorf("canonical spelling after the refused ones: %d, want it served", got)
+			}
+		})
 	}
 }

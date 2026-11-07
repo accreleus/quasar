@@ -250,10 +250,11 @@ func captureRespFrom(e telemetry.Event) map[string]any {
 // the middleware, so the 403 precedes the lookup and no non-admin learns whether
 // the session exists.
 func (h *Handler) handleArmCapture(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if _, ok := h.adminSessionOr404(w, r, id); !ok {
+	sess, ok := h.adminSessionOr404(w, r, r.PathValue("id"))
+	if !ok {
 		return
 	}
+	id := sess.ID
 	var req struct {
 		Kind   string `json:"kind"`
 		Params *struct {
