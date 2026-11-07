@@ -577,6 +577,59 @@ async fn input_arrives_by_datagram_and_control_stream_only_after_hello_ack() {
 }
 
 #[tokio::test]
+async fn a_datagram_gamepad_state_moves_axes_and_never_changes_buttons() {
+    let agent = agent().await;
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    let gp = |i: u32, buttons: [u8; 2], axes: [f64; 2]| json!({"t": "gp", "i": i, "buttons": buttons, "axes": axes});
+    let datagram =
+        |event: &Value| Bytes::from([&[CHANNEL_INPUT][..], event.to_string().as_bytes()].concat());
+
+    // A reliable press, then a stale datagram from before it: old buttons, new stick.
+    write_message(
+        &mut send,
+        &json!({"type": "input", "event": gp(0, [1, 0], [0.0, 0.0])}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1);
+    session
+        .send_datagram(datagram(&gp(0, [0, 0], [0.5, -0.5])))
+        .unwrap();
+    // A pad no reliable state has established yet has no buttons to keep: dropped.
+    session
+        .send_datagram(datagram(&gp(1, [1, 1], [0.9, 0.9])))
+        .unwrap();
+    assert_eq!(input_events(&agent, 2).await.len(), 2);
+    // The release is a reliable event and does change them.
+    write_message(
+        &mut send,
+        &json!({"type": "input", "event": gp(0, [0, 0], [0.5, -0.5])}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(input_events(&agent, 3).await.len(), 3);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let seen: Vec<Value> = agent
+        .input
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            gp(0, [1, 0], [0.0, 0.0]),
+            gp(0, [1, 0], [0.5, -0.5]),
+            gp(0, [0, 0], [0.5, -0.5])
+        ],
+        "the stale datagram moved the stick and left the button held"
+    );
+}
+
+#[tokio::test]
 async fn a_client_silent_on_the_control_stream_for_10_s_is_gone_and_its_inputs_lifted() {
     let agent = agent().await;
     let (session, _send, _recv, ack) = agent.hello(TOKEN).await;

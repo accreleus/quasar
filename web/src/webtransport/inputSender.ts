@@ -21,6 +21,8 @@ const encoder = new TextEncoder();
 export function webTransportInputSender(wire: InputWire): InputSender {
   /** The last pressed-set sent per pad: a `gp` that changes it is a press or release. */
   const pads = new Map<number, boolean[]>();
+  /** The latest `ma`, when it went as a datagram and no reliable message has repeated it since. */
+  let pendingAbs: { x: unknown; y: unknown } | null = null;
   const scratch = new Uint8Array(1200);
   scratch[0] = CHANNEL_INPUT;
 
@@ -48,8 +50,19 @@ export function webTransportInputSender(wire: InputWire): InputSender {
         const json = JSON.stringify(msg);
         const { read, written } = encoder.encodeInto(json, scratch.subarray(1));
         // read < json.length: it overran the scratch; the wire decides the real limit.
-        if (read === json.length && wire.datagram(scratch.slice(0, 1 + written))) return;
+        if (read === json.length && wire.datagram(scratch.slice(0, 1 + written))) {
+          if (msg.t === "ma") pendingAbs = { x: msg.x, y: msg.y };
+          return;
+        }
       }
+      // A click must land where the pointer was, and a datagram `ma` can lose or trail the reliable
+      // `mb`: the position goes first on the same ordered stream. Relative motion has no position to
+      // repeat, so a late `mm` just shifts the cursor slightly; accepted.
+      if (msg.t === "mb" && pendingAbs) {
+        wire.reliable({ t: "ma", x: pendingAbs.x, y: pendingAbs.y });
+        pendingAbs = null;
+      }
+      if (msg.t === "ma") pendingAbs = null;
       wire.reliable(msg);
     },
     // shortcut: the browser exposes no queue depth for datagrams; upgrade if backpressure needs it.

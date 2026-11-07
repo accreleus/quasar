@@ -89,6 +89,8 @@ struct State {
 pub(crate) struct Media {
     state: Mutex<State>,
     input: super::Input,
+    /// The buttons of the last reliable `gp` per pad: a datagram `gp` carries axes only.
+    pads: Mutex<std::collections::HashMap<u64, serde_json::Value>>,
     encoder: glib::WeakRef<gst::Element>,
 }
 
@@ -105,12 +107,40 @@ impl Media {
         Arc::new(Self {
             state: Mutex::default(),
             input,
+            pads: Mutex::default(),
             encoder: encoder.downgrade(),
         })
     }
 
-    pub(crate) fn input(&self) -> &super::Input {
-        &self.input
+    /// One client `input.md` event to the devices. A datagram can arrive after a
+    /// reliable event that followed it, so a datagram `gp` takes its buttons from the
+    /// last reliable one and never changes them; one for a pad with none is dropped.
+    /// Everything else passes through as sent.
+    pub(crate) fn input_event(&self, json: &str, datagram: bool) {
+        if !json.contains("\"gp\"") {
+            return (self.input.event)(json);
+        }
+        let Ok(mut event) = serde_json::from_str::<serde_json::Value>(json) else {
+            return (self.input.event)(json);
+        };
+        if event.get("t").and_then(|t| t.as_str()) == Some("gp") {
+            let pad = event.get("i").and_then(|i| i.as_u64()).unwrap_or(0);
+            let mut pads = self.pads.lock().unwrap_or_else(|e| e.into_inner());
+            if datagram {
+                let Some(buttons) = pads.get(&pad) else {
+                    return;
+                };
+                event["buttons"] = buttons.clone();
+            } else {
+                pads.insert(pad, event.get("buttons").cloned().unwrap_or_default());
+            }
+        }
+        (self.input.event)(&event.to_string());
+    }
+
+    pub(crate) fn release_all(&self) {
+        self.pads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        (self.input.release_all)();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -473,6 +503,7 @@ mod tests {
         let media = Arc::new(Media {
             state: Mutex::default(),
             input: crate::webtransport::tests::no_input(),
+            pads: Mutex::default(),
             encoder: glib::WeakRef::new(),
         });
         media.on_caps(&caps(1280, &avcc), "s");

@@ -795,7 +795,7 @@ async fn datagrams(session: Session, authed: Arc<OnceLock<Arc<Media>>>) {
         let Some(media) = authed.get() else { continue };
         if let Some((&CHANNEL_INPUT, body)) = datagram.split_first() {
             if let Ok(json) = std::str::from_utf8(body) {
-                (media.input().event)(json);
+                media.input_event(json, true);
             }
         }
     }
@@ -1031,7 +1031,7 @@ async fn stream(
                         Some("keyframe_request") => media.keyframe(),
                         Some("input") => {
                             if let Some(event) = message.get("event") {
-                                (media.input().event)(&event.to_string());
+                                media.input_event(&event.to_string(), false);
                             }
                         }
                         Some("ping") => {
@@ -1052,7 +1052,7 @@ async fn stream(
     };
     reader.abort();
     media.detach(client.id);
-    (media.input().release_all)();
+    media.release_all();
     if let Some(message) = message {
         let _ = tokio::time::timeout(CONTROL_WRITE, write_message(&mut send, &message)).await;
         let _ = send.finish();

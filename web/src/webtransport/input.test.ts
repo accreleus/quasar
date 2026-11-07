@@ -48,7 +48,38 @@ describe("the WebTransport input sender", () => {
       { t: "mb", button: 272, pressed: true },
     ];
     msgs.forEach((m) => sender.send(m));
-    expect(log.map((l) => l.path)).toEqual(["datagram", "datagram", "datagram", "reliable", "reliable", "reliable"]);
+    // The reliable `ma` before the click is the position repeat.
+    expect(log.map((l) => l.path)).toEqual(["datagram", "datagram", "datagram", "reliable", "reliable", "reliable", "reliable"]);
+  });
+
+  it("repeats the latest absolute position reliably, in order, before a click", () => {
+    const { log, sender } = recordingWire();
+    const at = (x: number, y: number): InputMsg => ({ t: "ma", x, y });
+    sender.send(at(0.1, 0.1));
+    sender.send(at(0.4, 0.6));
+    sender.send({ t: "mb", button: 272, pressed: true });
+    sender.send({ t: "mb", button: 272, pressed: false }); // already repeated: no second copy
+    sender.send({ t: "k", code: 30, pressed: true }); // a key is not a click
+    sender.send(at(0.5, 0.5));
+    sender.send({ t: "mb", button: 273, pressed: true });
+    expect(log.map((l) => `${l.path}:${l.json}`)).toEqual([
+      'datagram:{"t":"ma","x":0.1,"y":0.1}',
+      'datagram:{"t":"ma","x":0.4,"y":0.6}',
+      'reliable:{"t":"ma","x":0.4,"y":0.6}',
+      'reliable:{"t":"mb","button":272,"pressed":true}',
+      'reliable:{"t":"mb","button":272,"pressed":false}',
+      'reliable:{"t":"k","code":30,"pressed":true}',
+      'datagram:{"t":"ma","x":0.5,"y":0.5}',
+      'reliable:{"t":"ma","x":0.5,"y":0.5}',
+      'reliable:{"t":"mb","button":273,"pressed":true}',
+    ]);
+  });
+
+  it("sends a click with no pointer position first when none was sent by datagram", () => {
+    const { log, sender } = recordingWire();
+    sender.send({ t: "mm", dx: 1, dy: 1 });
+    sender.send({ t: "mb", button: 272, pressed: true });
+    expect(log.map((l) => l.json)).toEqual(['{"t":"mm","dx":1,"dy":1}', '{"t":"mb","button":272,"pressed":true}']);
   });
 
   it("carries the same JSON the DataChannel carries, byte for byte", () => {
