@@ -458,6 +458,7 @@ async fn run_agent() {
     memstat::log_startup();
     label_runtime_dir();
     quasar_node_agent::session::launch_helper::install();
+    quasar_node_agent::compat_tools::init();
 
     agent::run(cfg).await;
 }

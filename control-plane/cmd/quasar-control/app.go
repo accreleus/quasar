@@ -655,12 +655,23 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	settingsHandler.OnAllowedOriginsChanged = originResolver.Invalidate
 	invitesHandler := invites.NewHandler(invites.NewStore(pool), cfg.PublicBaseURL, auditStore)
 	compatStore := compat.NewStore(pool)
+	compatStore.Auditor = auditStore
+	compatStore.Superseder = coordinator.SupersedeParked
 	compatCtx, compatCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := compatStore.Reconcile(compatCtx); err != nil {
 		log.Error("compat tools: reconciling the catalogue failed", "err", err)
 	}
 	compatCancel()
-	compatHandler := compat.NewHandler(compatStore, auditStore)
+	// The compat_tools.converge job (amendment 56): desired state is every enabled GE tool on every
+	// compat_tools_v1 host; runs are filled with the host's first difference when it claims one.
+	compatConv := compat.NewConverger(pool, jobStore, auditStore, log)
+	compatConv.Supported = agentRegistry.SupportsCompatTools
+	compatGitHub, err := compat.NewGitHub(log)
+	if err != nil {
+		janitorStop()
+		return nil, fmt.Errorf("compat tools github client: %w", err)
+	}
+	compatHandler := compat.NewHandler(compatStore, auditStore, compatConv, compatGitHub)
 	enrollHandler := hostenroll.NewHandler(hostenroll.NewStore(pool), auditStore)
 	consoleHandler := console.NewHandler(consoleStore, agentRegistry, auditStore)
 	auditHandler := audit.NewHandler(auditStore)
@@ -868,6 +879,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	preparationStore := preparation.New(pool)
 	agentHandler.SetPreparation(preparationStore)
 	agentHandler.OnPreparationReport = imagesEnsurer.ReconcilePreparation
+	agentHandler.OnCompatTools = func(ctx context.Context, hostID string) { compatConv.Host(ctx, hostID, false) }
 	agentHandler.SetImageEvents(imagesEnsurer)
 	agentHandler.SetImageCleanupEvents(imagesCleanup)
 
@@ -1006,6 +1018,17 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 				imagesEnsurer.ReconcilePreparation(run.HostID)
 			}
 		},
+	})
+	jobRegistry.MustRegister(jobs.Definition{
+		ID:          compat.JobID,
+		Name:        "Compatibility tools",
+		Description: "Installs every enabled GE-Proton release on each host and removes the others, one action per run, under the trust rules (control-api.md §Compatibility tools). Disabling this job stops installs and removals and changes nothing on disk.",
+		Plane:       jobs.PlaneAgent,
+		Scope:       jobs.ScopeHost,
+		Managed:     true,
+		Default:     jobs.Schedule{Kind: jobs.KindEvent},
+		FillParams:  compatConv.Params,
+		OnTerminal:  compatConv.Closed,
 	})
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          homeGCJobID,
@@ -1371,6 +1394,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		return nil, fmt.Errorf("jobs registry sync: %w", syncErr)
 	}
 	jobsDispatcher = jobs.New(jobStore, jobRegistry, jobsCfg, log)
+	compatConv.Disp = jobsDispatcher
 	jobsDispatcher.Start(janitorCtx)
 	// The #488 warm-up's event trigger: the one place the control plane learns an
 	// image reached `ready`. Wired after the dispatcher exists; until then, and when

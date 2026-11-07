@@ -304,6 +304,9 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
     if let Some(swept) = crate::agent::post_application_retirement(
         retirement.is_ok(),
         || {
+            // Every session container of the previous process is retired, so no bind mount
+            // keeps a quarantined compatibility tool alive any more.
+            crate::compat_tools::sweep_quarantine();
             // Boot-only retirement, after acquiring the persistent owner lease.
             // Routine recovery never stops an active audio sibling.
             if let Err(error) = client.retire_audio_sidecars().wait() {

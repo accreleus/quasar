@@ -372,6 +372,8 @@ services:
       QUASAR_HOME_TEMPLATES:
       QUASAR_TEMPLATE_WARMUP:
       QUASAR_TEMPLATE_ROOT: ${QUASAR_TEMPLATE_ROOT:-}
+      # The compatibility-tools root, bind-mounted below; empty = /var/lib/quasar/compat-tools.
+      QUASAR_COMPAT_TOOLS_ROOT: ${QUASAR_COMPAT_TOOLS_ROOT:-}
       QUASAR_TEMPLATE_CLONE_MODE: ${QUASAR_TEMPLATE_CLONE_MODE:-}
       QUASAR_TEMPLATE_ALLOW_CROSSFS: ${QUASAR_TEMPLATE_ALLOW_CROSSFS:-}
       QUASAR_TEMPLATE_SETTLE_SECS: ${QUASAR_TEMPLATE_SETTLE_SECS:-}
@@ -598,6 +600,10 @@ services:
       # warm-up builds (cross-filesystem guard), which is the intended, loud
       # failure rather than a silent overlay write.
       - ${QUASAR_TEMPLATE_ROOT:-/var/lib/quasar/templates}:${QUASAR_TEMPLATE_ROOT:-/var/lib/quasar/templates}
+      # Compatibility-tools root (#1071): the agent installs GE-Proton here and binds each
+      # tool read-only into Steam sessions, so it is self-mapped like the roots above and
+      # must not sit under QUASAR_HOME_ROOT.
+      - ${QUASAR_COMPAT_TOOLS_ROOT:-/var/lib/quasar/compat-tools}:${QUASAR_COMPAT_TOOLS_ROOT:-/var/lib/quasar/compat-tools}
       # First-run readiness (S1): the HOST's os-release, read-only, used only to
       # pick distro-aware remediation wording ("dnf install …" vs "pacman -S …").
       # The container's own /etc/os-release describes the IMAGE, not the box, so
