@@ -64,6 +64,7 @@ pub mod probe_encoder;
 /// `media-probe`: the media host probe's child half (compositor source + production
 /// encode chain).
 pub mod probe_media;
+pub mod probe_pyrowave;
 /// Adaptive external resolution rung ladder. Mirror of the control plane's
 /// `internal/profile/rungs.go`; advertised to the guest compositor and checked
 /// against `session_display_update.stream_*`.

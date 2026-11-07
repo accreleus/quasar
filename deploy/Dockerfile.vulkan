@@ -782,11 +782,15 @@ ARG QUASAR_VERSION=
 # Re-declared per stage: a global ARG is empty here without it, and the test below
 # then silently drops --features cuda (image-contract.json asserts the symbol).
 ARG CUDA_ENABLE
+# The pyrowaveenc plugin (#1056) builds in the same invocation, so the two share one
+# feature resolution and one compile of the gstreamer-rs crates.
 RUN cd /src/node-agent \
     && QUASAR_SOURCE_COMMIT="${SOURCE_COMMIT}" \
        QUASAR_VERSION="${QUASAR_VERSION}" cargo build --release \
-        $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda ) \
-    && install -Dm0755 target/release/quasar-node-agent /opt/agent/quasar-node-agent
+        -p quasar-node-agent -p gst-plugin-pyrowave \
+        $( [ "$CUDA_ENABLE" = "1" ] && echo --features quasar-node-agent/cuda ) \
+    && install -Dm0755 target/release/quasar-node-agent /opt/agent/quasar-node-agent \
+    && install -Dm0755 target/release/libgstpyrowave.so /opt/agent/libgstpyrowave.so
 
 # ══ Launch helper (#731) ══════════════════════════════════════════════════════
 # The in-container Steam launch helper runs inside the Steam app image, whatever its
@@ -1051,6 +1055,7 @@ RUN printf '%s\n' \
 # list short and cheap: a COPY, a gst-inspect sweep, an rm. Anything expensive that
 # does not read the binary belongs above the line.
 COPY --from=build /opt/agent/quasar-node-agent /usr/local/bin/quasar-node-agent
+COPY --from=build /opt/agent/libgstpyrowave.so /opt/gst/lib64/gstreamer-1.0/libgstpyrowave.so
 COPY --from=launch-helper /out/quasar-launch-helper /usr/local/bin/quasar-launch-helper
 
 # Build-time verification: device-FREE elements only. vulkanh264enc and vah264enc are registered
@@ -1073,6 +1078,7 @@ RUN gst-inspect-1.0 waylanddisplaysrc \
     && gst-inspect-1.0 pulsesrc \
     && gst-inspect-1.0 audiotestsrc \
     && gst-inspect-1.0 coloreffects \
+    && gst-inspect-1.0 pyrowaveenc \
     && pipewire --version \
     && wireplumber --version \
     && ldd /usr/local/bin/quasar-node-agent | (! grep "not found")
@@ -1286,6 +1292,7 @@ RUN rm -rf /root/.cache/gstreamer-1.0 /home/quasar/.cache/gstreamer-1.0
 # `build`, so `profiling`'s release-binary assertion (`! readelf -S /opt/agent/quasar-node-agent
 # | grep -q .debug_line`) is unaffected.
 COPY --from=build /opt/agent/quasar-node-agent /opt/agent/quasar-node-agent
+COPY --from=build /opt/agent/libgstpyrowave.so /opt/gst/lib64/gstreamer-1.0/libgstpyrowave.so
 
 WORKDIR /workspace
 CMD ["bash"]
