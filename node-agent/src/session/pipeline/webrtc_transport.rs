@@ -545,6 +545,16 @@ impl WebRtcSlot {
         video: &mut VideoTransport,
         to: &crate::session::StreamParams,
     ) -> std::result::Result<(), (&'static str, anyhow::Error)> {
+        self.move_launch_point(to)?;
+        self.replace_video(video).map_err(|e| ("transport", e))
+    }
+
+    /// [`Self::restream`] without the new transport: `to`'s bitrate and fps written live,
+    /// and its bitrate, fps and size the launch point a later transport starts from.
+    pub fn move_launch_point(
+        &self,
+        to: &crate::session::StreamParams,
+    ) -> std::result::Result<(), (&'static str, anyhow::Error)> {
         let mut cfg = self.cfg.lock().unwrap().clone();
         if to.fps != cfg.stream.fps {
             self.lever.set_fps(to.fps).map_err(|e| ("fps", e))?;
@@ -563,7 +573,7 @@ impl WebRtcSlot {
         cfg.stream.width = to.width;
         cfg.stream.height = to.height;
         *self.cfg.lock().unwrap() = cfg;
-        self.replace_video(video).map_err(|e| ("transport", e))
+        Ok(())
     }
 
     /// Build the audio PC: its own pipeline and `webrtcbin`, left READY. `(None, None)`

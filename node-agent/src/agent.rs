@@ -36,7 +36,7 @@ use crate::session::metrics::SessionMetrics;
 use crate::session::mount_policy::MountPolicy;
 use crate::session::runner::{
     run_blocking, validate_display_update, AdoptRequest, DiagnosticEventTx, DisplayUpdateRequest,
-    SessionEvent, SwapRequest,
+    RestreamFailure, SessionEvent, SwapRequest,
 };
 use crate::session::signaling::SignalMsg;
 use crate::session::vulkan_fault::{self, GpuGlobalFaultDetector};
@@ -5399,7 +5399,7 @@ impl SessionManager {
     fn restreamed(
         &mut self,
         runtime_id: &str,
-        result: Result<Duration, (&'static str, String)>,
+        result: Result<Duration, RestreamFailure>,
         evt_tx: &mpsc::Sender<(String, SessionEvent)>,
         diagnostic_tx: &DiagnosticEventTx,
     ) {
@@ -5424,9 +5424,7 @@ impl SessionManager {
                 let cfg = r.assignment.cfg.clone();
                 self.finish_adopt(&r.session_id, runtime_id, &cfg);
             }
-            Err((step, why)) => {
-                self.restream_failed(runtime_id, r, step, &why, evt_tx, diagnostic_tx)
-            }
+            Err(failure) => self.restream_failed(runtime_id, r, failure, evt_tx, diagnostic_tx),
         }
     }
 
@@ -5436,11 +5434,15 @@ impl SessionManager {
         &mut self,
         runtime_id: &str,
         r: Restreaming,
-        step: &'static str,
-        why: &str,
+        failure: RestreamFailure,
         evt_tx: &mpsc::Sender<(String, SessionEvent)>,
         diagnostic_tx: &DiagnosticEventTx,
     ) {
+        let RestreamFailure {
+            step,
+            why,
+            deterministic,
+        } = failure;
         warn!(
             token = "adopt-restream-failed",
             step,
@@ -5448,9 +5450,9 @@ impl SessionManager {
              stream failed at {step}: {why}; it is torn down and the session is built fresh",
             r.session_id
         );
-        // Only an element, caps or encoder-creation failure is the hardware's answer; a
-        // deadline or a busy NVENC depends on load.
-        if step == "encoder" {
+        // Only an element, caps or encoder refusal is the hardware's answer to this codec;
+        // a start failure, a lost device, a deadline or a busy NVENC is not.
+        if deterministic {
             if let Some(key) = r.rebuild.clone() {
                 self.failed_rebuilds.insert(key);
             }
@@ -5523,7 +5525,8 @@ impl SessionManager {
             .and_then(|h| h.restreaming.take())
         {
             let why = "its own id was stopped";
-            self.restream_failed(session_id, r, "stopped", why, evt_tx, diagnostic_tx);
+            let failure = RestreamFailure::new("stopped", why);
+            self.restream_failed(session_id, r, failure, evt_tx, diagnostic_tx);
         }
     }
 
@@ -5541,7 +5544,8 @@ impl SessionManager {
             .and_then(|h| h.restreaming.take())
         {
             let why = "the runtime ended";
-            self.restream_failed(runtime_id, r, "runtime", why, evt_tx, diagnostic_tx);
+            let failure = RestreamFailure::new("runtime", why);
+            self.restream_failed(runtime_id, r, failure, evt_tx, diagnostic_tx);
         }
     }
 
@@ -5561,7 +5565,8 @@ impl SessionManager {
         for id in late {
             if let Some(r) = self.running.get_mut(&id).and_then(|h| h.restreaming.take()) {
                 let why = format!("not done within {} s", ADOPT_RESTREAM_DEADLINE.as_secs());
-                self.restream_failed(&id, r, "deadline", &why, evt_tx, diagnostic_tx);
+                let failure = RestreamFailure::new("deadline", why);
+                self.restream_failed(&id, r, failure, evt_tx, diagnostic_tx);
             }
         }
     }
@@ -11837,7 +11842,7 @@ mod tests {
         let exited = mgr.running["k1"].exited.clone();
         mgr.restreamed(
             "k1",
-            Err(("transport", "no webrtcbin".into())),
+            Err(RestreamFailure::new("transport", "no webrtcbin")),
             &warm.evt_tx,
             &diagnostic_sender(),
         );
@@ -12018,7 +12023,11 @@ mod tests {
         warm.adopted.recv_timeout(WAIT).unwrap();
         mgr.restreamed(
             "k1",
-            Err(("encoder", "vulkanh265enc refused caps".into())),
+            Err(RestreamFailure {
+                step: "encoder",
+                why: "vulkanh265enc refused caps".into(),
+                deterministic: true,
+            }),
             &warm.evt_tx,
             &diagnostic_sender(),
         );
@@ -12039,13 +12048,14 @@ mod tests {
     // A busy NVENC or a missed deadline depends on load: never remembered.
     #[test]
     fn a_load_dependent_rebuild_failure_is_not_remembered() {
-        for step in ["nvenc_drain", "deadline", "encoder_family"] {
+        // "encoder" here is a start failure or a lost device: not deterministic.
+        for step in ["nvenc_drain", "deadline", "encoder_family", "encoder"] {
             let (mut mgr, warm) = warm_manager();
             rebuild_claim(&mut mgr, &warm, "k1", "p1");
             warm.adopted.recv_timeout(WAIT).unwrap();
             mgr.restreamed(
                 "k1",
-                Err((step, "x".into())),
+                Err(RestreamFailure::new(step, "x")),
                 &warm.evt_tx,
                 &diagnostic_sender(),
             );

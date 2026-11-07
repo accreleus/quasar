@@ -1031,6 +1031,18 @@ fn other_profile(n: usize) -> crate::session::StreamParams {
     stream
 }
 
+/// The runner's answer to a restream, once it reached the log: the helper's `launch`
+/// can arrive before the event does.
+fn await_restreamed(session: &mut Session, peer: &mut Peer, from: usize) -> Option<Duration> {
+    session.pump(peer, Duration::from_secs(5), |s, _| {
+        s.log
+            .iter()
+            .skip(from)
+            .any(|e| matches!(e, SessionEvent::Restreamed(_)))
+    });
+    restreamed_ok(&session.log, from)
+}
+
 fn restreamed_ok(log: &[SessionEvent], from: usize) -> Option<Duration> {
     log.iter().skip(from).find_map(|e| match e {
         SessionEvent::Restreamed(Ok(took)) => Some(*took),
@@ -1062,7 +1074,7 @@ fn a_claim_with_another_h264_profile_rebuilds_the_encoder_and_streams_on_it() {
     let adopted_at = adopt_restreamed(&mut session, other_profile(0));
     let mut b = Peer::new();
     assert_eq!(helper.command(&mut session, &mut b), "launch 730");
-    let took = restreamed_ok(&session.log, adopted_at).expect("the rebuild answered Ok");
+    let took = await_restreamed(&mut session, &mut b, adopted_at).expect("the rebuild answered Ok");
     eprintln!("encoder rebuild took {} ms", took.as_millis());
     assert!(
         session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p)),
@@ -1090,9 +1102,18 @@ fn ten_encoder_rebuilds_on_one_runtime_each_stream() {
     assert!(session.pump(&mut viewer, Duration::from_secs(20), |_, p| streaming(p)));
     let mut helper = FakeHelper::connect(runtime.path(), &session.id);
     let mut took = Vec::new();
-    // A leaked encode pipeline keeps its streaming threads; the count is the leak proxy.
+    // A leaked encode pipeline keeps its streaming threads, its fds and its memory.
     let threads = || std::fs::read_dir("/proc/self/task").map_or(0, |d| d.count());
+    let fds = || std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
+    let rss_mib = || {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .map_or(0, |pages| pages * 4096 / (1 << 20))
+    };
     let mut counts = Vec::new();
+    let mut open = Vec::new();
+    let mut rss = Vec::new();
     for n in 0..10 {
         helper.launch_state("game_running");
         helper.launch_state("game_exited");
@@ -1110,20 +1131,225 @@ fn ten_encoder_rebuilds_on_one_runtime_each_stream() {
         let adopted_at = adopt_restreamed(&mut session, other_profile(n));
         viewer = Peer::new();
         assert_eq!(helper.command(&mut session, &mut viewer), "launch 730");
-        took.push(restreamed_ok(&session.log, adopted_at).expect("flip answered Ok"));
+        took.push(
+            await_restreamed(&mut session, &mut viewer, adopted_at)
+                .unwrap_or_else(|| panic!("flip {n}: {:?}", &session.log[adopted_at..])),
+        );
         assert!(
             session.pump(&mut viewer, Duration::from_secs(20), |_, p| streaming(p)),
             "flip {n}: the new viewer never streamed"
         );
         counts.push(threads());
+        open.push(fds());
+        rss.push(rss_mib());
     }
     let ms: Vec<u128> = took.iter().map(Duration::as_millis).collect();
-    eprintln!("encoder rebuild times (ms): {ms:?}; process threads after each: {counts:?}");
+    eprintln!(
+        "encoder rebuild times (ms): {ms:?}; after each: threads {counts:?}, fds {open:?}, \
+         RSS MiB {rss:?}"
+    );
     // The first flips settle thread pools; past that the count must not climb per flip.
     let (early, late) = (counts[2], counts[9]);
     assert!(
         late <= early + 4,
         "threads climb across rebuilds (a pipeline leaks): {counts:?}"
     );
+    assert!(
+        open[9] <= open[2] + 8,
+        "fds climb across rebuilds: {open:?}"
+    );
+    assert!(rss[9] <= rss[2] + 48, "RSS climbs across rebuilds: {rss:?}");
     end(session, &mut viewer);
+}
+
+/// A parked runtime, its helper connected, nobody watching yet.
+fn parked_runtime(tag: &str) -> (tempfile::TempDir, Session, FakeHelper) {
+    let (runtime, mut session) =
+        steam_session(tag, SessionKind::Parked, "-silent", Duration::from_secs(60));
+    session.mute = true;
+    let mut nobody = Peer::new();
+    assert!(session.pump(&mut nobody, Duration::from_secs(10), |s, _| {
+        s.log.iter().any(|e| matches!(e, SessionEvent::Running))
+    }));
+    let helper = FakeHelper::connect(runtime.path(), &session.id);
+    session.mute = false;
+    (runtime, session, helper)
+}
+
+fn terminals(log: &[SessionEvent], from: usize) -> usize {
+    log.iter()
+        .skip(from)
+        .filter(|e| matches!(e, SessionEvent::Stopped { .. } | SessionEvent::Failed(_)))
+        .count()
+}
+
+// A codec change with a smaller size: the new encoder is built at the size the compositor
+// was built with (its caps are fixed), and the claim still streams.
+#[test]
+fn a_rebuild_with_a_smaller_size_builds_at_the_built_size_and_streams() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut helper) = parked_runtime("rebuild-smaller");
+    let mut to = other_profile(0);
+    (to.width, to.height) = (160, 120);
+    let at = adopt_restreamed(&mut session, to);
+    let mut b = Peer::new();
+    assert_eq!(helper.command(&mut session, &mut b), "launch 730");
+    assert!(
+        restreamed_ok(&session.log, at).is_some(),
+        "{:?}",
+        &session.log[at..]
+    );
+    assert!(
+        session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p)),
+        "the smaller claim never streamed on the rebuilt encoder"
+    );
+    end(session, &mut b);
+}
+
+// A caps failure on the new encoder is the hardware's answer: `encoder`, deterministic,
+// one terminal report, and nothing of the adoption after it.
+#[test]
+fn a_rebuild_whose_caps_fail_answers_a_deterministic_encoder_failure() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut helper) = parked_runtime("rebuild-caps");
+    crate::session::runner::REBUILD_BREAK_CAPS.store(true, Ordering::Relaxed);
+    let at = adopt_restreamed(&mut session, other_profile(0));
+    let mut nobody = Peer::new();
+    let ended = session.pump(&mut nobody, Duration::from_secs(20), |s, _| {
+        s.ended.is_some()
+    });
+    crate::session::runner::REBUILD_BREAK_CAPS.store(false, Ordering::Relaxed);
+    assert!(ended, "the runner never ended: {:?}", &session.log[at..]);
+    let failure = session.log.iter().skip(at).find_map(|e| match e {
+        SessionEvent::Restreamed(Err(f)) => Some(f.clone()),
+        _ => None,
+    });
+    let failure = failure.expect("the rebuild answered");
+    assert_eq!(
+        (failure.step, failure.deterministic),
+        ("encoder", true),
+        "{failure:?}"
+    );
+    assert_eq!(terminals(&session.log, at), 1, "{:?}", &session.log[at..]);
+    assert!(!session
+        .log
+        .iter()
+        .skip(at)
+        .any(|e| matches!(e, SessionEvent::Starting)));
+    assert!(!helper.sent().iter().any(|c| c.starts_with("launch")));
+    session.thread.take().unwrap().join().unwrap();
+}
+
+// The agent's deadline (a stop) landing mid-rebuild, with the old encoder gone and the new
+// one not built: `deadline`, one terminal report, no game launched.
+#[test]
+fn a_deadline_mid_rebuild_ends_the_runtime_once_and_launches_nothing() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut helper) = parked_runtime("rebuild-deadline");
+    crate::session::runner::REBUILD_PAUSE_MS.store(400, Ordering::Relaxed);
+    let at = adopt_restreamed(&mut session, other_profile(0));
+    let mut nobody = Peer::new();
+    session.pump(&mut nobody, Duration::from_millis(150), |_, _| false);
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.pump(&mut nobody, Duration::from_secs(20), |s, _| {
+        s.ended.is_some()
+    });
+    crate::session::runner::REBUILD_PAUSE_MS.store(0, Ordering::Relaxed);
+    assert!(ended, "the runner never ended");
+    assert!(
+        session.log.iter().skip(at).any(|e| matches!(
+            e,
+            SessionEvent::Restreamed(Err(f)) if f.step == "deadline" && !f.deterministic
+        )),
+        "{:?}",
+        &session.log[at..]
+    );
+    assert_eq!(terminals(&session.log, at), 1, "{:?}", &session.log[at..]);
+    assert!(!helper.sent().iter().any(|c| c.starts_with("launch")));
+    session.thread.take().unwrap().join().unwrap();
+}
+
+// A stop before the rebuild starts: nothing of the adoption runs.
+#[test]
+fn a_stop_before_a_rebuild_starts_launches_nothing() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (_runtime, mut session, mut helper) = parked_runtime("rebuild-stopped");
+    crate::session::runner::RESTREAM_PAUSE_MS.store(400, Ordering::Relaxed);
+    let at = adopt_restreamed(&mut session, other_profile(0));
+    let mut nobody = Peer::new();
+    session.pump(&mut nobody, Duration::from_millis(150), |_, _| false);
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.pump(&mut nobody, Duration::from_secs(20), |s, _| {
+        s.ended.is_some()
+    });
+    crate::session::runner::RESTREAM_PAUSE_MS.store(0, Ordering::Relaxed);
+    assert!(ended, "the runner never ended");
+    assert_eq!(terminals(&session.log, at), 1, "{:?}", &session.log[at..]);
+    assert!(!session
+        .log
+        .iter()
+        .skip(at)
+        .any(|e| matches!(e, SessionEvent::Starting)));
+    assert!(!helper.sent().iter().any(|c| c.starts_with("launch")));
+    session.thread.take().unwrap().join().unwrap();
+}
+
+// The old viewer's late answer after a rebuild is stale: the new transports inherited its
+// displaced ufrag, so it costs no replacement and the new viewer keeps streaming.
+#[test]
+fn the_old_viewers_late_answer_after_a_rebuild_is_stale() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (runtime, mut session) = steam_session(
+        "rebuild-stale",
+        SessionKind::Play,
+        "-applaunch 620",
+        Duration::from_secs(60),
+    );
+    let mut a = Peer::new();
+    assert!(session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p)));
+    let old_answer = session.answers[0]
+        .clone()
+        .expect("the first viewer answered");
+    let mut helper = FakeHelper::connect(runtime.path(), &session.id);
+    helper.launch_state("game_running");
+    helper.launch_state("game_exited");
+    assert!(session.pump(&mut a, Duration::from_secs(5), |s, _| {
+        s.log.iter().any(|e| matches!(e, SessionEvent::Held))
+    }));
+    drop(a);
+    let at = adopt_restreamed(&mut session, other_profile(0));
+    let mut b = Peer::new();
+    assert_eq!(helper.command(&mut session, &mut b), "launch 730");
+    assert!(await_restreamed(&mut session, &mut b, at).is_some());
+    assert!(session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p)));
+    let offers = session.offers;
+    session
+        .to_host
+        .send(SignalMsg::Answer {
+            sdp: old_answer,
+            pc: Some(crate::session::signaling::PcId::Video),
+        })
+        .unwrap();
+    session.pump(&mut b, Duration::from_secs(2), |_, _| false);
+    assert_eq!(session.offers, offers, "the stale answer cost a transport");
+    assert!(
+        session.pump(&mut b, Duration::from_secs(5), |_, p| streaming(p)),
+        "the new viewer stopped streaming"
+    );
+    end(session, &mut b);
 }

@@ -313,7 +313,7 @@ pub enum SessionEvent {
     Starting,
     /// Amendment 59: an adoption's restream finished (how long it took), or failed at a
     /// step. For the agent only; nothing goes out for it.
-    Restreamed(Result<Duration, (&'static str, String)>),
+    Restreamed(Result<Duration, RestreamFailure>),
     HomeSeed(super::home::HomeSeedOutcome),
     /// Fine-grained launch progress while the top-level state remains starting.
     Progress(&'static str),
@@ -801,6 +801,48 @@ pub struct SwapRequest {
     pub in_place: bool,
 }
 
+/// Why an adoption's restream failed (amendment 59): the logged step and why, and whether
+/// it is the hardware's own answer (an element, caps or encoder refusal), which the agent
+/// remembers for the connection epoch. A start failure, a lost device or a load-dependent
+/// step never is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestreamFailure {
+    pub step: &'static str,
+    pub why: String,
+    pub deterministic: bool,
+}
+
+impl RestreamFailure {
+    pub(crate) fn new(step: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            step,
+            why: why.into(),
+            deterministic: false,
+        }
+    }
+
+    fn hardware(step: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            deterministic: true,
+            ..Self::new(step, why)
+        }
+    }
+}
+
+/// How long a rebuilt encoder has to put out its first buffer; the agent's deadline
+/// (agent.rs `ADOPT_RESTREAM_DEADLINE`) usually stops it sooner.
+const REBUILD_OUTPUT_WAIT: Duration = Duration::from_secs(5);
+
+/// Test hook: a rebuild's new encoder is given caps nothing can meet, as a caps
+/// negotiation failure would.
+#[cfg(test)]
+pub(crate) static REBUILD_BREAK_CAPS: AtomicBool = AtomicBool::new(false);
+
+/// Test hook: how long a rebuild stands still with the old encoder gone and the new one
+/// not built, so a test can land the agent's deadline there.
+#[cfg(test)]
+pub(crate) static REBUILD_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Test hook: how long a restream stands still before it starts, so a test can stop the
 /// session while one is in flight.
 #[cfg(test)]
@@ -818,8 +860,8 @@ pub struct AdoptRequest {
     pub container: Option<super::container::ContainerSpec>,
     pub idle_timeout: Duration,
     pub app_boot_timeout: Option<Duration>,
-    /// Amendment 59: the adopting session's stream, when its bitrate or fps differs (its
-    /// size moves by the display update that follows the adoption). The runner moves the
+    /// Amendment 59: the adopting session's stream, when its codec, H.264 profile, bitrate
+    /// or fps differs (its size moves by the display update that follows the adoption). The runner moves the
     /// runtime to it and answers [`SessionEvent::Restreamed`] before anything else of the
     /// adoption; the agent re-labels only on `Ok`.
     pub restream: Option<super::StreamParams>,
@@ -1573,6 +1615,36 @@ impl SessionTransports {
     /// Amendment 59 (a)–(b) on an adopted runtime: the video PC gets a new transport
     /// starting from `to`, recorded as a replacement so a late answer from the old viewer
     /// is told apart. On `Err`, the step that failed.
+    /// Amendment 59: make `to` the launch point of the live video transport, without
+    /// replacing it (a rebuild's transports are new already).
+    pub(crate) fn move_launch_point(
+        &self,
+        to: &super::StreamParams,
+    ) -> Result<(), (&'static str, anyhow::Error)> {
+        self.slot.move_launch_point(to)
+    }
+
+    /// A rebuild's new transports take over the old ones' displaced peers, replacement
+    /// budget and negotiation: a late answer or ICE from the old viewer is then stale,
+    /// never applied to the new `webrtcbin`.
+    pub(crate) fn inherit(&mut self, old: &mut SessionTransports) {
+        for i in [PcId::Video as usize, PcId::Audio as usize] {
+            if let Some(gone) = old.negotiation[i].replaced() {
+                old.displaced[i].push(gone);
+            }
+            let displaced = &mut old.displaced[i];
+            while displaced.len() > DISPLACED_REMEMBERED {
+                displaced.remove(0);
+            }
+            self.displaced[i] = std::mem::take(displaced);
+            self.budget[i] = std::mem::replace(
+                &mut old.budget[i],
+                ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
+            );
+        }
+        self.unanswered = [true, self.audio_webrtc.is_some()];
+    }
+
     pub(crate) fn restream(
         &mut self,
         to: &super::StreamParams,
@@ -2319,9 +2391,12 @@ fn rebuild_refused(
 
 /// Amendment 59 (c): the encode pipeline rebuilt for `to`'s codec or H.264 profile on a
 /// warm runtime. The source (compositor, app container, Steam) is not touched: the new
-/// pipeline listens to the same interpipe sink. The old encoder is at NULL before the new
-/// one is built. On `Err`, the step (`encoder_family` and `nvenc_drain` touch nothing) and
-/// why; the caller takes the failure branch.
+/// pipeline listens to the same interpipe sink, at the size and fps it was built with
+/// (`cfg`, which the runner keeps at them); fps then moves by the lever and size by the
+/// display update. The old encoder is at NULL, its transports released first, before the
+/// new one is built. `Ok` only once the new encoder has put out a buffer. On `Err`
+/// (`encoder_family`, `transport` and `nvenc_drain` touch nothing) the caller takes the
+/// failure branch.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_encode(
     cfg: &SessionConfig,
@@ -2348,32 +2423,42 @@ fn rebuild_encode(
         pipeline::EncodePipeline<SessionTransports>,
         gst::Bus,
     ),
-    (&'static str, String),
+    RestreamFailure,
 > {
     let (vulkan_contexts, cuda_ctx, va_ctx) = contexts;
     let mut next = cfg.clone();
-    next.stream = to.clone();
+    next.stream.codec = to.codec;
+    next.stream.h264_profile = to.h264_profile.clone();
+    next.stream.bitrate_kbps = to.bitrate_kbps;
     next.encoder = cfg.configured_encoder;
     let resolved = pipeline::resolve_effective_encoder(&mut next)
-        .map_err(|e| ("encoder", format!("{e:#}")))?;
-    if let Some(refused) = rebuild_refused(
+        .map_err(|e| RestreamFailure::hardware("encoder", format!("{e:#}")))?;
+    if let Some((step, why)) = rebuild_refused(
         cfg.encoder,
         next.encoder,
         old_transports._webtransport.is_some(),
     ) {
-        return Err(refused);
+        return Err(RestreamFailure::new(step, why));
     }
-    if !super::nvenc_defer::destroy_if_alone(old_pipe, defer) {
-        return Err(("nvenc_drain", "another encoder is live on this host".into()));
+    let drain = || RestreamFailure::new("nvenc_drain", "another encoder is live on this host");
+    if super::nvenc_defer::others_encoding(defer) {
+        return Err(drain());
     }
     pipeline::Transport::release(old_transports);
+    if !super::nvenc_defer::destroy_if_alone(old_pipe, defer) {
+        return Err(drain());
+    }
     old_transports.audio_pipeline.finish();
     // The old ABR loop's hooks hold the old encoder.
     metrics.clear_hooks();
+    #[cfg(test)]
+    std::thread::sleep(Duration::from_millis(
+        REBUILD_PAUSE_MS.load(Ordering::Relaxed),
+    ));
     if stop.load(Ordering::Relaxed) {
-        return Err((
+        return Err(RestreamFailure::new(
             "deadline",
-            "stopped before the new encoder was built".into(),
+            "stopped before the new encoder was built",
         ));
     }
     pipeline::preload_encoder_plugins(&[&resolved.factory]);
@@ -2389,8 +2474,54 @@ fn rebuild_encode(
         session_id.to_string(),
         &resolved.factory,
     )
-    .map_err(|e| ("encoder", format!("{e:#}")))?;
-    let started = start_encode_pipeline(
+    .map_err(|e| RestreamFailure::hardware("encoder", format!("{e:#}")))?;
+    // Every way out after this tears the new pipeline down as the old one went.
+    let discard = |failure: RestreamFailure| {
+        pipeline::Transport::release(&built.transport);
+        built.transport.audio_pipeline.finish();
+        if !super::nvenc_defer::destroy_if_alone(&built.pipeline, defer) {
+            // Beside another live encoder: parked, so two slots are held until the drain.
+            super::nvenc_defer::finish_encode(&built.pipeline, defer);
+        }
+        Err(failure)
+    };
+    let encoder = built
+        .pipeline
+        .by_name(pipeline::VIDEO_ENCODER_NAME)
+        .or_else(|| built.pipeline.by_name(pipeline::VULKAN_ENCODER_NAME));
+    let Some(encoder) = encoder else {
+        return discard(RestreamFailure::hardware(
+            "encoder",
+            "no encoder in the new pipeline",
+        ));
+    };
+    #[cfg(test)]
+    if REBUILD_BREAK_CAPS.load(Ordering::Relaxed) {
+        if let Some(filter) = encoder
+            .static_pad("src")
+            .and_then(|p| p.peer())
+            .and_then(|p| p.parent_element())
+        {
+            filter.set_property("caps", gst::Caps::builder("video/x-nothing").build());
+        }
+    }
+    let Some(bus) = built.pipeline.bus() else {
+        return discard(RestreamFailure::new(
+            "encoder",
+            "the new encode pipeline has no bus",
+        ));
+    };
+    let output = Arc::new(AtomicBool::new(false));
+    if let Some(pad) = encoder.static_pad("src") {
+        let seen = output.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            seen.store(true, Ordering::Relaxed);
+            gst::PadProbeReturn::Remove
+        });
+    }
+    // A start failure (PLAYING refused, a lost device) is not the hardware's answer to
+    // this codec, and its `build_failure_reason` text is kept for the fresh build's log.
+    if let Err(why) = start_encode_pipeline(
         &built.pipeline,
         &next,
         clock.0,
@@ -2398,27 +2529,52 @@ fn rebuild_encode(
         vulkan_contexts,
         cuda_ctx,
         va_ctx,
-    );
-    let bus = built.pipeline.bus();
-    let fail = |why: String| {
-        built.transport.audio_pipeline.finish();
-        super::nvenc_defer::finish_encode(&built.pipeline, defer);
-        Err(("encoder", why))
-    };
-    if let Err(why) = started {
-        return fail(why);
+    ) {
+        return discard(RestreamFailure::new("encoder", why));
     }
-    if stop.load(Ordering::Relaxed) {
-        built.transport.audio_pipeline.finish();
-        super::nvenc_defer::finish_encode(&built.pipeline, defer);
-        return Err(("deadline", "stopped while the new encoder started".into()));
+    if let Err(failure) = first_output(&output, &bus, stop, REBUILD_OUTPUT_WAIT) {
+        return discard(failure);
     }
-    let Some(bus) = bus else {
-        return fail("the new encode pipeline has no bus".into());
-    };
+    if let Err((step, e)) = built.transport.move_launch_point(to) {
+        return discard(RestreamFailure::new(step, format!("{e:#}")));
+    }
     built.transport.audio_pipeline.play();
     metrics.set_external_resize_supported(built.resolution_lever.stage().supported);
     Ok((next, built, bus))
+}
+
+/// Wait for a new encoder's first buffer (live sources reach PLAYING before any caps).
+/// A bus error first is the encoder's own failure (`encoder`; deterministic unless the
+/// device was lost); a stop or `wait` passing is `deadline`.
+fn first_output(
+    output: &AtomicBool,
+    bus: &gst::Bus,
+    stop: &AtomicBool,
+    wait: Duration,
+) -> Result<(), RestreamFailure> {
+    let until = Instant::now() + wait;
+    while !output.load(Ordering::Relaxed) {
+        if let Some(msg) = bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(10),
+            &[gst::MessageType::Error],
+        ) {
+            if let gst::MessageView::Error(err) = msg.view() {
+                let why = format!("{} ({:?})", err.error(), err.debug());
+                return Err(if vulkan_fault::reason_is_device_lost(&why) {
+                    RestreamFailure::new("encoder", why)
+                } else {
+                    RestreamFailure::hardware("encoder", why)
+                });
+            }
+        }
+        if stop.load(Ordering::Relaxed) || Instant::now() >= until {
+            return Err(RestreamFailure::new(
+                "deadline",
+                "the new encoder put out nothing in time",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One line per step of a launch, so the last one before a crash says how far the runner
@@ -2831,7 +2987,7 @@ pub fn run_blocking(
     // an ICE restart without keeping the SDP itself around.
     let mut last_ice_ufrag: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    loop {
+    'tick: loop {
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
             stop_source(&mut current_source, &transports, res.launch());
@@ -2918,7 +3074,9 @@ pub fn run_blocking(
                     .map(|(next, built, bus)| {
                         cfg = next;
                         encode_pipe = built.pipeline;
-                        transports = built.transport;
+                        let mut fresh = built.transport;
+                        fresh.inherit(&mut transports);
+                        transports = fresh;
                         interpipesrc = built.interpipesrc;
                         resolution_lever = built.resolution_lever;
                         encode_bus = bus;
@@ -2929,7 +3087,7 @@ pub fn run_blocking(
                 } else {
                     transports
                         .restream(to)
-                        .map_err(|(step, e)| (step, format!("{e:#}")))
+                        .map_err(|(step, e)| RestreamFailure::new(step, format!("{e:#}")))
                 };
                 match moved {
                     Ok(()) => {
@@ -2937,6 +3095,8 @@ pub fn run_blocking(
                         // the interpipe caps, from them. The lever and the display update
                         // move what is encoded.
                         cfg.stream.bitrate_kbps = to.bitrate_kbps;
+                        cfg.stream.codec = to.codec;
+                        cfg.stream.h264_profile = to.h264_profile.clone();
                         let elapsed = began.elapsed();
                         tracing::info!(
                             token = "runtime-adopt-restreamed",
@@ -2956,15 +3116,16 @@ pub fn run_blocking(
                         // The agent gave up meanwhile (its deadline): no game is launched
                         // into a home that is being torn down.
                         if stop.load(Ordering::Relaxed) {
-                            break;
+                            continue 'tick;
                         }
                     }
-                    Err((step, why)) => {
-                        emit(SessionEvent::Restreamed(Err((step, why))));
+                    Err(failure) => {
+                        emit(SessionEvent::Restreamed(Err(failure)));
                         // Torn down as a declined runtime: the stop path's terminal report
                         // goes out under the adopted id (the agent has not re-labelled).
+                        // Nothing else of this tick runs against the released pipeline.
                         stop.store(true, Ordering::Relaxed);
-                        break;
+                        continue 'tick;
                     }
                 }
             }

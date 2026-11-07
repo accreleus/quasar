@@ -142,6 +142,17 @@ pub(crate) fn finish_encode(pipeline: &gst::Pipeline, defer: bool) {
     );
 }
 
+/// Whether another session holds an encode lease, so a rebuild may not destroy this
+/// session's NVENC encoder (#489). `false` with deferral off.
+pub(crate) fn others_encoding(defer: bool) -> bool {
+    defer
+        && registry()
+            .lock()
+            .expect("nvenc defer registry poisoned")
+            .live
+            > 1
+}
+
 /// Amendment 59 (c): destroy a live session's encode pipeline now, for a rebuild, when
 /// no other session holds an encode lease. `false` (nothing touched) while another does:
 /// destroying it then is the #489 use-after-free. Holds the registry lock across the
