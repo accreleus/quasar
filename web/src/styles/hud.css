@@ -685,6 +685,8 @@
   padding: var(--s1) 0;
   color: var(--text-2);
 }
+/* A row the read flags: a codec mismatch, a transport that fell back. */
+.diag-warn { color: var(--warning-text); }
 .diag-grid td:first-child { color: var(--text-4); }
 .diag-grid td:last-child {
   text-align: right;

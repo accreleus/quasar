@@ -7,7 +7,7 @@
 
 import { useState } from "react";
 import * as adminApi from "../../../api/admin";
-import type { LaunchProfile, ProfilePolicyResponse, StreamProfile } from "../../../api/types";
+import type { LaunchProfile, LaunchProfileTransport, ProfilePolicyResponse, StreamProfile } from "../../../api/types";
 import { ApiError } from "../../../api/client";
 import { useAuth } from "../../../auth/context";
 import { ActionsMenu, type ActionsMenuItem, type ActionsMenuSeparator } from "../../../components/ActionsMenu";
@@ -24,6 +24,7 @@ import { isLaunchProfileInUse } from "./launchProfileHelpers";
 import { LaunchProfileDrawer } from "./LaunchProfileDrawer";
 import { moveRung, RungEditor } from "./RungEditor";
 import { useSectionHead } from "../../../components/shell/sectionHead";
+import { SettingRow } from "../settings/SettingRow";
 
 const DEFAULT_POLICY: ProfilePolicyResponse = { global_default_profile_id: null, user_overrides_allowed: true };
 
@@ -199,13 +200,15 @@ function LaunchProfileCard({
     },
   ];
 
-  const persist = async (nextRungIds: string[]) => {
+  const persist = async (nextRungIds: string[], transport?: LaunchProfileTransport) => {
     setBusy(true);
     try {
+      // `transport` absent = unchanged (control-api.md), so a rung edit never touches it.
       const saved = await adminApi.updateLaunchProfile(token, profile.id, {
         display_name: profile.display_name,
         description: profile.description,
         rungs: nextRungIds,
+        ...(transport && { transport }),
       });
       onChanged(saved);
       for (const w of saved.warnings ?? []) {
@@ -249,6 +252,26 @@ function LaunchProfileCard({
             void persist([...rungs.map((r) => r.id), profileId]);
           }}
         />
+        <div className="eyebrow lp-group">Delivery</div>
+        <SettingRow
+          label="Transport"
+          hint="WebRTC is the default and the fallback. WebTransport is experimental: if it can’t connect, the session starts on WebRTC."
+        >
+          <select
+            className="select"
+            aria-label={`Transport for ${profile.display_name}`}
+            value={profile.transport ?? "webrtc"}
+            disabled={busy}
+            onChange={(e) => void persist(rungs.map((r) => r.id), e.target.value as LaunchProfileTransport)}
+          >
+            <option value="webrtc">WebRTC</option>
+            <option value="webtransport">WebTransport (experimental)</option>
+            {/* Set through the API for the developer URL switch; kept visible so it is never silently overwritten. */}
+            {profile.transport === "webtransport_opt_in" && (
+              <option value="webtransport_opt_in">WebTransport on request (developer)</option>
+            )}
+          </select>
+        </SettingRow>
       </div>
     </div>
   );

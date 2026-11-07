@@ -252,6 +252,28 @@
   padding: var(--s4) var(--card-pad);
 }
 
+/* "WebTransport" card (mock #1037): the Services card shell, the fact table, a URL field. */
+.host-detail-page .host-webtransport .stack {
+  align-items: flex-end;
+}
+
+.host-detail-page .host-webtransport-warn {
+  color: var(--warning-text);
+}
+
+.host-detail-page .host-webtransport-url {
+  border-top: 1px solid var(--line);
+}
+
+.host-detail-page .host-webtransport-url-row {
+  margin-top: var(--s2);
+}
+
+.host-detail-page .host-webtransport-url-row .input {
+  flex: 1;
+  min-width: 0;
+}
+
 .host-detail-page .host-services-desc {
   white-space: normal;
   max-width: 34ch;

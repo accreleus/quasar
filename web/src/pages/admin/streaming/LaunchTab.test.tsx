@@ -357,4 +357,31 @@ describe("LaunchTab", () => {
       rungs: ["h264", "av1-new"],
     });
   });
+
+  it("saves the Delivery transport as soon as it changes, with the rungs untouched", async () => {
+    mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ transport: "webtransport" }));
+    renderPage();
+    await act(async () => {});
+
+    const select = screen.getByRole("combobox", { name: "Transport for Balanced" });
+    expect(select).toHaveValue("webrtc"); // an absent field reads as webrtc
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "webtransport" } });
+    });
+
+    expect(mocked.updateLaunchProfile).toHaveBeenCalledWith("tok", "lp1", {
+      display_name: "Balanced",
+      description: "",
+      rungs: ["sp1"],
+      transport: "webtransport",
+    });
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webtransport");
+  });
+
+  it("keeps a developer opt-in profile visible and leaves it alone on a rung edit", async () => {
+    mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ transport: "webtransport_opt_in" })] });
+    renderPage();
+    await act(async () => {});
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webtransport_opt_in");
+  });
 });
