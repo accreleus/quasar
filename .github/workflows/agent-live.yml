@@ -23,9 +23,10 @@ name: Agent live tests
 # The nightly run is develop's. A schedule only fires from the default branch's copy
 # of this file, so that run checks develop out by name.
 on:
-  # Into develop only: the develop -> main release pull request has the push run below.
+  # Into develop or a release integration branch (`integration/<version>`) only: the
+  # develop -> main release pull request has the push run below.
   pull_request:
-    branches: [develop]
+    branches: [develop, 'integration/**']
     paths:
       - 'node-agent/**'
       - 'deploy/Dockerfile.vulkan'
@@ -37,7 +38,7 @@ on:
   # A landing on develop runs it too: those runs save the cargo cache every pull request
   # restores (#919). A schedule runs main's copy of this file, so it cannot be that source.
   push:
-    branches: [develop]
+    branches: [develop, 'integration/**']
     paths:
       - 'node-agent/**'
       - 'deploy/Dockerfile.vulkan'
@@ -106,7 +107,7 @@ jobs:
       # The cargo registry and target dir, so a run compiles only what changed instead of
       # all ~250 crates (2.5 min, #919). Keyed on the toolchain image (its rustc and
       # GStreamer) and the lockfile; a lockfile change restores the newest build for the
-      # same image. Only a push to develop saves: a pull request's save is visible to that
+      # same image. Only a push (to develop or an integration branch) saves: a pull request's save is visible to that
       # pull request alone.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo

@@ -2,7 +2,7 @@
 //! the recovery actor and keyed by a **recipe revision**. Pure: no engine, no files.
 //!
 //! A service's versioned specification is recipe revision + machine inputs + image digest
-//! (`CONTEXT.md` "Machine inputs"). An image can only select among the shapes this module
+//! (`GLOSSARY.md` "Machine inputs"). An image can only select among the shapes this module
 //! carries; it can never widen what host access its own container gets.
 //!
 //! The node-agent recipe carries what `deploy/docker-compose.yml` and
@@ -568,7 +568,7 @@ impl ControlRole {
     }
 }
 
-/// Whose database the control plane uses (`CONTEXT.md` "Machine inputs": database mode).
+/// Whose database the control plane uses (`GLOSSARY.md` "Machine inputs": database mode).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum DatabaseInputs {
@@ -1071,6 +1071,7 @@ pub const AGENT_VARIABLES: &[&str] = &[
     "QUASAR_NV_LIB32_PATH",
     "QUASAR_QUEUE_BUFFERS",
     "QUASAR_REQUIRE_HW_RENDER",
+    "QUASAR_RTP_MTU",
     "QUASAR_SLICES",
     "QUASAR_STEAM_REVEAL_CAP_SECS",
     "QUASAR_SWAP_APP_READY_TIMEOUT_MS",

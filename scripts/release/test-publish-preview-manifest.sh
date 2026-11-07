@@ -39,6 +39,9 @@ cur() { bash "$publish" --current "$ref" --plain-http; }
 
 digest="$(pub "$work/a.json")" || fail "first publish failed"
 [[ "$(cur)" == "$a" ]] || fail "--current after publishing A: $(cur)"
+want="$(python3 -c 'import json,sys; c=[x for x in json.load(open(sys.argv[1]))["components"] if x["name"]=="node-agent"][0]; print(c["image"]+"@"+c["digest"])' "$work/a.json")"
+[[ "$(bash "$publish" --current "$ref" --component node-agent --plain-http)" == "$want" ]] || fail "--component node-agent: want $want"
+bash "$publish" --current "$ref" --component nope --plain-http >/dev/null 2>&1 && fail "an unknown --component must fail"
 curl -fsS -H 'Accept: application/vnd.oci.image.manifest.v1+json' -o "$work/m.json" "$api/manifests/preview"
 [[ "sha256:$(sha256sum "$work/m.json" | cut -d' ' -f1)" == "$digest" ]] || fail "printed digest is not the tag's"
 python3 - "$work/m.json" <<'PY' || fail "artifact shape"

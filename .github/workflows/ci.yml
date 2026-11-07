@@ -19,14 +19,18 @@ name: CI
 #                          develop requires no checks, and a skipped job counts as passed
 #                          for main's. A wrong "skip" is caught by the push run after landing.
 #
+# A release integration branch (`integration/<version>`) gets the same two triggers: its
+# feature pull requests run the touched jobs, and a landing on it runs every job. The
+# branch is deleted once its release ships.
+#
 # A pull request into main from any branch but develop gets no automatic run: dispatch
 # this workflow on its branch (the runs attach to its head commit) before asking for
 # sign-off.
 on:
   push:
-    branches: [develop]
+    branches: [develop, 'integration/**']
   pull_request:
-    branches: [develop]
+    branches: [develop, 'integration/**']
   workflow_dispatch:
 
 # A newer push to a pull request cancels its older run. On develop runs queue instead: a
@@ -271,9 +275,30 @@ jobs:
       - name: Unit tests
         run: npm test -- run --shard=${{ matrix.shard }}/2
 
+  # The control image's web stage, built alone (#1119). deploy/Dockerfile.control.prod copies
+  # only what that stage names, so a test that imports a fixture from outside web/ (testdata/)
+  # with no matching COPY passes `web-build` here and fails only in the Images workflow (#1117).
+  # The image contract checks a finished image, so nothing else sees a broken stage.
+  #
+  # A check, not an image build: no tag, no push, no registry login, and the image is never
+  # assembled. deploy/build-images.sh cannot build one stage (control is a single unnamed stage,
+  # and it validates and promotes :latest), so this calls docker build directly, read-only.
+  web-stage:
+    name: web image stage (control-plane web-builder)
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the web-builder stage
+        run: docker build --progress=plain --target web-builder -f deploy/Dockerfile.control.prod .
+
   web:
     name: web (typecheck + build + vitest)
-    needs: [changes, web-build, web-vitest]
+    needs: [changes, web-build, web-vitest, web-stage]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 5
@@ -284,11 +309,12 @@ jobs:
           CHANGES: ${{ needs.changes.result }}
           BUILD: ${{ needs.web-build.result }}
           VITEST: ${{ needs.web-vitest.result }}
+          STAGE: ${{ needs.web-stage.result }}
         run: |
-          echo "changes=$CHANGES web=$WANTED build=$BUILD vitest=$VITEST"
+          echo "changes=$CHANGES web=$WANTED build=$BUILD vitest=$VITEST stage=$STAGE"
           [ "$CHANGES" = success ] || { echo "::error::the changed-areas job did not succeed"; exit 1; }
           [ "$WANTED" = true ] || { echo "no web change: nothing to gather"; exit 0; }
-          [ "$BUILD" = success ] && [ "$VITEST" = success ] || { echo "::error::a web job did not pass"; exit 1; }
+          [ "$BUILD" = success ] && [ "$VITEST" = success ] && [ "$STAGE" = success ] || { echo "::error::a web job did not pass"; exit 1; }
 
   # site/ generates the operator-facing install artifacts: the quick-start
   # compose file, .env and one-paste script. Its tests are the only thing

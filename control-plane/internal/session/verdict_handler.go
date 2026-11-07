@@ -110,6 +110,7 @@ func (h *Handler) handleSessionVerdict(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusForbidden, httpx.CodeForbidden, "not your session")
 		return
 	}
+	id = sess.ID // canonical spelling (#1100)
 	if h.statsLimiter != nil && !h.statsLimiter.allow(id+"/verdict") {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited,
 			"too many verdict reads; slow down")

@@ -147,7 +147,7 @@ update ends that host's sessions until RH-04" all still hold.
   apply by hand).
 - The seed's version is reported in the console; its behaviour must stay tiny and frozen.
 - Vocabulary consequence: "external manager" now means "hosts the seed", not "owns the
-  services". `CONTEXT.md` is updated to match.
+  services". `GLOSSARY.md` is updated to match.
 
 ---
 
@@ -610,7 +610,7 @@ this section wins.
 
 | Entry | Outcome |
 |---|---|
-| **D17** | **Cut.** Replaced by: before a migrating control-plane update the recovery actor takes a `pg_dump` into a volume and keeps the last three. No secrets in it, no download, no passphrase, no backup directory. The "Recovery bundle" term is withdrawn from `CONTEXT.md`. |
+| **D17** | **Cut.** Replaced by: before a migrating control-plane update the recovery actor takes a `pg_dump` into a volume and keeps the last three. No secrets in it, no download, no passphrase, no backup directory. The "Recovery bundle" term is withdrawn from `GLOSSARY.md`. |
 | **D7** | **Simplified.** Automatic pre-migration dump kept. Restore is **one operator command** (the seed image run with `restore`) that the failure message prints; no automatic restore path. Invariant unchanged: an older control plane never runs against a newer schema. |
 | **D4** | **Kept, simplified.** The same `restore` command, pointed at a `pg_dump` file, before the fresh install's first boot. |
 | **D1 / D14** | **Postgres replacement cut from RH-06.** Quasar creates its Postgres at install, pinned, and does not update it in RH-06: no Postgres component in the release manifest, no drain procedure, no ride-through follow-up. A later ticket adds updates if ever needed. D14's unattended table loses its Postgres row. |

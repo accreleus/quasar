@@ -967,7 +967,7 @@ and owner sign-off on the text.
 - **ADR 0007 (new)**: the seed interface v1 (§3.2) is frozen, with the owner's sign-off.
 - **ADR 0004 amendment**: restore = restart the kept container, and the control-plane rule is
   widened to "or schema unchanged".
-- `CONTEXT.md`: **Updater** is retired in favour of **Recovery actor** (the existing
+- `GLOSSARY.md`: **Updater** is retired in favour of **Recovery actor** (the existing
   "Deployment ownership" block). **Recipe** and **Machine inputs** are added as terms. **Preflight**
   loses "stack directory and overlays".
 
@@ -1055,7 +1055,7 @@ apply).
 ## 12. Slice order (vertical tracer bullets)
 
 0. **Contract ticket** (Tier 3, blocks slices 4–9 wherever they touch frozen text): the
-   amendment text for §9, ADR 0007 (seed v1), the ADR 0004 amendment, and CONTEXT.md.
+   amendment text for §9, ADR 0007 (seed v1), the ADR 0004 amendment, and GLOSSARY.md.
    **D16 design ticket** runs in parallel (mockups for the inventory, add-host tabs, "must
    update", backup confirmation, developer apply).
 1. **Engine-API executor behind the unchanged wire (GPU host, agent only).** Rename
