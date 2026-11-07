@@ -247,6 +247,8 @@ export class FakeDecoder {
   refuseConfigure = false;
   /** Decoded frames wait for `emit()`: a decoder that has not caught up. */
   holdOutput = false;
+  /** `decodeQueueSize` follows the frames waiting, as a real decoder's does; off, a test sets it. */
+  queueFollowsWaiting = false;
   private waiting: FakeChunk[] = [];
   constructor(readonly init: VideoDecoderInit) {}
   configure(c: VideoDecoderConfig) {
@@ -256,11 +258,15 @@ export class FakeDecoder {
   }
   decode(chunk: FakeChunk) {
     this.chunks.push(chunk);
-    if (this.holdOutput) this.waiting.push(chunk);
+    if (this.holdOutput) {
+      this.waiting.push(chunk);
+      if (this.queueFollowsWaiting) this.decodeQueueSize = this.waiting.length;
+    }
     else this.init.output(fakeFrame(chunk.timestamp) as unknown as VideoFrame);
   }
   emit() {
     for (const c of this.waiting.splice(0)) this.init.output(fakeFrame(c.timestamp) as unknown as VideoFrame);
+    if (this.queueFollowsWaiting) this.decodeQueueSize = 0;
   }
   /** The decoder failing the way WebCodecs reports it: error callback, then closed. */
   fail() {

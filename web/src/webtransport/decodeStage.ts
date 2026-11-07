@@ -7,6 +7,8 @@ export const HOLD_MS = 1_000;
 export const MAX_DECODE_QUEUE = 3;
 /** How long a backlog must last before deltas skip to a keyframe. */
 export const BACKLOG_MS = 50;
+/** The decoder queue never grows past this, whatever the skip above is doing. */
+export const MAX_DECODE_QUEUE_HARD = 15;
 /** Decoder failures in a row, with no frame decoded between them, before giving up. */
 export const MAX_DECODER_RESTARTS = 3;
 
@@ -88,6 +90,12 @@ export class DecodeStage {
     }
     if (!cur || unit.configId !== cur.configId || !this.decoder) {
       this.hold(unit);
+      return;
+    }
+    // A decoder that never catches up would queue without bound while the skip waits to re-arm:
+    // at the cap every unit is dropped, a keyframe too, and another keyframe asked for (throttled).
+    if (this.decoder.decodeQueueSize >= MAX_DECODE_QUEUE_HARD) {
+      if (unit.keyframe || !this.needKey) this.wantKey("late");
       return;
     }
     // A burst of jank drains on its own; only a decoder behind for over BACKLOG_MS is not keeping

@@ -1,7 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ControlDecoder, ControlProtocolError, encodeControl, parseVideoDatagram, serialAfter } from "./framing";
 import { FrameAssembler, MAX_PENDING, MAX_PENDING_AGE_MS } from "./reassembly";
-import { BACKLOG_MS, DecodeStage, HOLD_MS, MAX_DECODE_QUEUE, MAX_DECODER_RESTARTS, avcCodecString } from "./decodeStage";
+import {
+  BACKLOG_MS,
+  DecodeStage,
+  HOLD_MS,
+  MAX_DECODE_QUEUE,
+  MAX_DECODE_QUEUE_HARD,
+  MAX_DECODER_RESTARTS,
+  avcCodecString,
+} from "./decodeStage";
 import { containRect, createWebGpuPresenter } from "./presenter";
 import { avcC, bytes, FakeChunk, FakeDecoder, fakeFrame, flush, packetize, type FakeFrame, type UnitSpec } from "./testSupport";
 
@@ -290,6 +298,24 @@ describe("DecodeStage", () => {
     t = 200 + BACKLOG_MS + 20;
     s.unit(unit(0, 8, false)); // the same backlog, still going: now it skips
     expect(keyframes).toEqual(["late", "late"]);
+  });
+
+  it(`never queues more than ${MAX_DECODE_QUEUE_HARD} frames in a decoder that never outputs`, async () => {
+    const { s, decoders, keyframes } = stage(); // the clock stands still: only the hard cap can act
+    s.config(config(0));
+    await flush();
+    const d = decoders[0];
+    d.holdOutput = true;
+    d.queueFollowsWaiting = true;
+    let most = 0;
+    for (let i = 0; i < 300; i++) {
+      s.unit(unit(0, i, i % 30 === 0)); // a keyframe every 30 units
+      most = Math.max(most, d.decodeQueueSize);
+    }
+    expect(most).toBe(MAX_DECODE_QUEUE_HARD);
+    expect(d.chunks.length).toBe(MAX_DECODE_QUEUE_HARD);
+    expect(keyframes.every((k) => k === "late")).toBe(true);
+    expect(keyframes.length).toBeGreaterThan(0);
   });
 
   it("re-creates a failed decoder and resumes at a keyframe", async () => {
