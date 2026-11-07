@@ -147,12 +147,30 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     for (const fn of telemetrySubs) fn(snap);
   };
 
+  /** A takeover is the page's own verdict, not a transport failure. */
+  const takenOver = () => {
+    if (failed || destroyed) return;
+    failed = true;
+    stop();
+    set({ status: "taken over", channelOpen: false });
+    cfg.callbacks.onSessionTakenOver();
+  };
+
   async function run(): Promise<void> {
-    const p = await deps.createPresenter(cfg.canvas, (message) => {
-      console.warn("presenter:", message);
+    let p: Presenter | null;
+    try {
+      p = await deps.createPresenter(cfg.canvas, (message) => {
+        console.warn("presenter:", message);
+        fail("gpu_failed");
+      });
+    } catch (err) {
+      // requestAdapter, requestDevice or configure refused.
+      console.warn("presenter:", err);
       fail("gpu_failed");
-    });
-    if (destroyed) {
+      return;
+    }
+    // Destroyed, or the device failed while the presenter was being made: no transport then.
+    if (destroyed || failed) {
       p?.destroy();
       return;
     }
@@ -184,8 +202,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         if (!snapshot.firstFrame) set({ firstFrame: true, status: "streaming over WebTransport" });
       },
       requestKeyframe: (reason) => t.requestKeyframe(reason),
+      // decoder_unsupported has its own banner (clientUnsupported); the recovery one would repeat it.
       onFatal: (reason: DecodeFailure) =>
-        fail(reason, reason === "decoder_unsupported" ? { clientUnsupported: true } : {}),
+        fail(reason, reason === "decoder_unsupported" ? { clientUnsupported: true, recovery: null } : {}),
     });
     stage = s;
     try {
@@ -201,10 +220,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         end: (e) => {
           if (destroyed || failed) return;
           if (e.code === CLOSE_TAKEN_OVER) {
-            failed = true;
-            stop();
-            set({ status: "taken over", channelOpen: false });
-            cfg.callbacks.onSessionTakenOver();
+            takenOver();
             return;
           }
           // The page asks the control plane why; its verdict outranks this one.
@@ -213,11 +229,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         },
       });
     } catch (err) {
+      if (destroyed || failed) return;
       const code = err instanceof TransportError ? err.code : "internal";
       if (code === "taken_over") {
-        failed = true;
-        stop();
-        cfg.callbacks.onSessionTakenOver();
+        takenOver();
       } else if (code !== "closed") {
         if (code === "session_ended") cfg.callbacks.onDisconnectSuspected();
         fail(code);

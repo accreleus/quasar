@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ControlDecoder, ControlProtocolError, encodeControl, parseVideoDatagram, serialAfter } from "./framing";
 import { FrameAssembler, MAX_PENDING, MAX_PENDING_AGE_MS } from "./reassembly";
-import { DecodeStage, HOLD_MS, MAX_DECODE_QUEUE, MAX_DECODER_RESTARTS, avcCodecString } from "./decodeStage";
+import { BACKLOG_MS, DecodeStage, HOLD_MS, MAX_DECODE_QUEUE, MAX_DECODER_RESTARTS, avcCodecString } from "./decodeStage";
 import { containRect, createWebGpuPresenter } from "./presenter";
 import { avcC, bytes, FakeChunk, FakeDecoder, fakeFrame, flush, packetize, type FakeFrame, type UnitSpec } from "./testSupport";
 
@@ -107,7 +107,8 @@ describe("FrameAssembler", () => {
   it("refuses a frag_count no unit within the byte budget needs, without holding it", () => {
     const a = new FrameAssembler(() => 0);
     const [first] = unitOf(1, true, 2000);
-    expect(a.push({ ...first, fragCount: 60_000 })).toEqual({ unit: null, needKeyframe: false });
+    // Not discardable: the frame it claims is lost, so a keyframe is asked for.
+    expect(a.push({ ...first, fragCount: 60_000 })).toEqual({ unit: null, needKeyframe: true });
     // Held, the forgery's count would disagree with the real frame 1 and drop it.
     expect(a.push(unitOf(1, true)[0]).unit?.frameSeq).toBe(1);
   });
@@ -129,6 +130,17 @@ describe("FrameAssembler", () => {
     a.push(p0);
     t = MAX_PENDING_AGE_MS + 1;
     expect(a.push(p1)).toEqual({ unit: null, needKeyframe: true }); // frame 2 expired; this half starts it anew
+  });
+
+  it("keeps a large frame whose fragments keep arriving, however long it takes", () => {
+    let t = 0;
+    const a = new FrameAssembler(() => t);
+    const f = unitOf(1, true, 3000); // three fragments, 400 ms apart
+    expect(a.push(f[0]).unit).toBeNull();
+    t = 400;
+    expect(a.push(f[1]).unit).toBeNull();
+    t = 800;
+    expect(a.push(f[2]).unit?.frameSeq).toBe(1);
   });
 
   it("resyncs on a frame_seq jump instead of dropping everything as late", () => {
@@ -235,20 +247,49 @@ describe("DecodeStage", () => {
     expect(keyframes).toEqual([]);
   });
 
-  it(`skips deltas to the next keyframe once ${MAX_DECODE_QUEUE} frames wait in the decoder`, async () => {
-    const { s, decoders, keyframes } = stage();
+  it("does not skip after a short burst of decoder backlog", async () => {
+    let t = 0;
+    const { s, decoders, keyframes } = stage({ now: () => t });
     s.config(config(0));
     await flush();
     s.unit(unit(0, 1, true));
-    decoders[0].decodeQueueSize = MAX_DECODE_QUEUE + 1;
+    decoders[0].decodeQueueSize = MAX_DECODE_QUEUE + 3;
     s.unit(unit(0, 2, false));
+    t = BACKLOG_MS - 10;
     s.unit(unit(0, 3, false));
-    expect(decoders[0].chunks.map((c) => c.type)).toEqual(["key"]);
+    decoders[0].decodeQueueSize = 0; // drained by itself
+    t = BACKLOG_MS * 3;
+    s.unit(unit(0, 4, false));
+    expect(decoders[0].chunks.map((c) => c.type)).toEqual(["key", "delta", "delta", "delta"]);
+    expect(keyframes).toEqual([]);
+  });
+
+  it(`skips to a keyframe after ${BACKLOG_MS} ms of backlog, once until that keyframe decodes`, async () => {
+    let t = 0;
+    const { s, decoders, keyframes } = stage({ now: () => t });
+    s.config(config(0));
+    await flush();
+    s.unit(unit(0, 1, true));
+    const d = decoders[0];
+    d.holdOutput = true;
+    d.decodeQueueSize = MAX_DECODE_QUEUE + 1;
+    s.unit(unit(0, 2, false)); // backlog starts
+    t = BACKLOG_MS + 1;
+    s.unit(unit(0, 3, false)); // sustained: skip
+    s.unit(unit(0, 4, false));
+    expect(d.chunks.map((c) => c.type)).toEqual(["key", "delta"]);
     expect(keyframes).toEqual(["late"]);
-    decoders[0].decodeQueueSize = 0;
-    s.unit(unit(0, 4, true));
-    s.unit(unit(0, 5, false));
-    expect(decoders[0].chunks.map((c) => c.type)).toEqual(["key", "key", "delta"]);
+    s.unit(unit(0, 5, true)); // the keyframe it asked for, still in the queue
+    t = 200;
+    s.unit(unit(0, 6, false)); // backlog again from here
+    t = 200 + BACKLOG_MS + 10;
+    s.unit(unit(0, 7, false)); // sustained, but that keyframe has not decoded: no second skip
+    expect(keyframes).toEqual(["late"]);
+    expect(d.chunks.map((c) => c.type)).toEqual(["key", "delta", "key", "delta", "delta"]);
+    d.emit(); // the keyframe decodes: armed again
+    t = 200 + BACKLOG_MS + 20;
+    s.unit(unit(0, 8, false)); // the same backlog, still going: now it skips
+    expect(keyframes).toEqual(["late", "late"]);
   });
 
   it("re-creates a failed decoder and resumes at a keyframe", async () => {
@@ -262,6 +303,7 @@ describe("DecodeStage", () => {
     expect(decoders[1].configs).toHaveLength(1);
     expect(keyframes).toEqual(["decode_error"]);
     s.unit(unit(0, 2, false)); // a delta cannot start the new decoder
+    expect(keyframes).toEqual(["decode_error"]); // and asks for no second keyframe
     s.unit(unit(0, 3, true));
     expect(decoders[1].chunks.map((c) => c.type)).toEqual(["key"]);
     expect(frames).toHaveLength(2);

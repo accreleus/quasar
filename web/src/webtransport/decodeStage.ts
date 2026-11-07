@@ -3,9 +3,10 @@ import type { AccessUnit, KeyframeReason, VideoConfig } from "./transport";
 
 /** How long a unit waits for the `hello_ack` of its `config_id` (§Hello ack). */
 export const HOLD_MS = 1_000;
-/** Frames queued in the decoder before deltas are skipped to the next keyframe: about
- *  50 ms at 60 fps, past which catching up costs more latency than one keyframe does. */
+/** Frames queued in the decoder, about 50 ms at 60 fps, that count as a backlog. */
 export const MAX_DECODE_QUEUE = 3;
+/** How long a backlog must last before deltas skip to a keyframe. */
+export const BACKLOG_MS = 50;
 /** Decoder failures in a row, with no frame decoded between them, before giving up. */
 export const MAX_DECODER_RESTARTS = 3;
 
@@ -46,6 +47,12 @@ export class DecodeStage {
   /** Bumped per configure, so a late support check cannot apply an old config. */
   private generation = 0;
   private restarts = 0;
+  /** When the decoder queue went over {@link MAX_DECODE_QUEUE}; null while it is not. */
+  private backlogSince: number | null = null;
+  /** Cleared by a skip, set again once the keyframe it asked for has decoded. */
+  private skipArmed = true;
+  /** Capture time of that keyframe: its frame re-arms the skip. */
+  private rearmAt: number | null = null;
   private readonly now: () => number;
 
   constructor(private readonly opts: DecodeStageOptions) {
@@ -83,7 +90,23 @@ export class DecodeStage {
       this.hold(unit);
       return;
     }
-    if (!unit.keyframe && !this.needKey && this.decoder.decodeQueueSize > MAX_DECODE_QUEUE) this.wantKey("late");
+    // A burst of jank drains on its own; only a decoder behind for over BACKLOG_MS is not keeping
+    // pace, and then one keyframe costs less latency than draining. Once per keyframe decoded,
+    // so a slow decoder is not left on keyframes alone.
+    if (this.decoder.decodeQueueSize <= MAX_DECODE_QUEUE) this.backlogSince = null;
+    else this.backlogSince ??= this.now();
+    if (
+      !unit.keyframe &&
+      !this.needKey &&
+      this.skipArmed &&
+      this.backlogSince !== null &&
+      this.now() - this.backlogSince > BACKLOG_MS
+    ) {
+      this.skipArmed = false;
+      this.backlogSince = null;
+      this.wantKey("late");
+    }
+    if (unit.keyframe && !this.skipArmed) this.rearmAt ??= unit.captureUs;
     if (this.needKey && !unit.keyframe) {
       if (!this.askedKey) this.opts.requestKeyframe("startup");
       this.askedKey = true;
@@ -172,6 +195,10 @@ export class DecodeStage {
           return;
         }
         this.restarts = 0;
+        if (this.rearmAt !== null && frame.timestamp >= this.rearmAt) {
+          this.skipArmed = true;
+          this.rearmAt = null;
+        }
         this.opts.onFrame(frame);
       },
       error: () => this.restart(),
@@ -192,6 +219,8 @@ export class DecodeStage {
     this.decoder = null;
     this.current = null;
     this.config(config);
+    // This request is the new decoder's keyframe: no "startup" one on top of it.
+    this.askedKey = true;
     this.opts.requestKeyframe("decode_error");
   }
 }

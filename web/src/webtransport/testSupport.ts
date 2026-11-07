@@ -93,7 +93,31 @@ export class FakeAgent {
   replies: Step[][] = [];
   /** `ready` rejects: the handshake or the certificate failed. */
   refuseHandshake = false;
+  /** Park the client at one await of its connect until `release()`; `answer` means no reply. */
+  hold: "ready" | "stream" | "write" | "answer" | null = null;
+  /** Off: datagrams already in flight still arrive after close(), the case a stale attempt must ignore. */
+  closeEndsDatagrams = true;
+  /** The await the client is parked at, once it gets there. */
+  reached: string | null = null;
+  private gate: { promise: Promise<void>; open: () => void } | null = null;
+  /** The reply held back by `hold = "answer"`, sent by `release()`. */
+  private heldReply: (() => void) | null = null;
   private hellos = 0;
+
+  private parked(stage: "ready" | "stream" | "write"): Promise<void> {
+    if (this.hold !== stage) return Promise.resolve();
+    this.reached = stage;
+    let open!: () => void;
+    const promise = new Promise<void>((r) => (open = r));
+    this.gate = { promise, open };
+    return promise;
+  }
+
+  release(): void {
+    this.gate?.open();
+    this.heldReply?.();
+    this.heldReply = null;
+  }
 
   create = (url: string, options: WebTransportOptions): WebTransport => {
     void url;
@@ -107,7 +131,13 @@ export class FakeAgent {
       options,
       closes: [],
       datagrams: (ds) => ds.forEach((d) => dgram?.enqueue(d)),
-      control: (m) => ctl?.enqueue(encodeControl(m)),
+      control: (m) => {
+        try {
+          ctl?.enqueue(encodeControl(m));
+        } catch {
+          /* the stream was closed: the message is lost, as on a closed connection */
+        }
+      },
       closeWith: (code) => {
         settle.resolve({ closeCode: code, reason: "" });
         try {
@@ -119,6 +149,11 @@ export class FakeAgent {
     };
     this.conns.push(conn);
     const onHello = () => {
+      if (this.hold === "answer" && !this.heldReply) {
+        this.reached = "answer";
+        this.heldReply = onHello;
+        return;
+      }
       const script = this.replies[Math.min(this.hellos++, this.replies.length - 1)] ?? [];
       for (const step of script) {
         if (step.type === "teardown") {
@@ -128,15 +163,24 @@ export class FakeAgent {
         else conn.control(step);
       }
     };
+    let rejectReady: (e: Error) => void = () => {};
+    const ready = this.refuseHandshake
+      ? Promise.reject(new Error("Opening handshake failed."))
+      : new Promise<void>((resolve, reject) => {
+          rejectReady = reject;
+          void this.parked("ready").then(resolve);
+        });
     const wt = {
-      ready: this.refuseHandshake ? Promise.reject(new Error("Opening handshake failed.")) : Promise.resolve(),
+      ready,
       closed,
       datagrams: { readable: new ReadableStream<Uint8Array>({ start: (c) => void (dgram = c) }) },
       async createBidirectionalStream() {
+        await agent.parked("stream");
         return {
           readable: new ReadableStream<Uint8Array>({ start: (c) => void (ctl = c) }),
           writable: new WritableStream<Uint8Array>({
-            write(chunk) {
+            async write(chunk) {
+              await agent.parked("write");
               for (const m of decoder.push(chunk)) {
                 agent.received.push(m);
                 if (m.type === "hello") onHello();
@@ -145,9 +189,18 @@ export class FakeAgent {
           }),
         };
       },
+      // As a browser does: closing ends the handshake and the connection's streams.
       close(info?: WebTransportCloseInfo) {
         conn.closes.push(info);
+        rejectReady(new Error("closed"));
         settle.resolve(info ?? { closeCode: 0, reason: "" });
+        for (const c of agent.closeEndsDatagrams ? [ctl, dgram] : [ctl]) {
+          try {
+            c?.close();
+          } catch {
+            /* already closed */
+          }
+        }
       },
     };
     return wt as unknown as WebTransport;
@@ -192,6 +245,9 @@ export class FakeDecoder {
   chunks: FakeChunk[] = [];
   /** configure() throws, as a browser does for a configuration it cannot take. */
   refuseConfigure = false;
+  /** Decoded frames wait for `emit()`: a decoder that has not caught up. */
+  holdOutput = false;
+  private waiting: FakeChunk[] = [];
   constructor(readonly init: VideoDecoderInit) {}
   configure(c: VideoDecoderConfig) {
     if (this.refuseConfigure) throw new DOMException("Unsupported configuration", "NotSupportedError");
@@ -200,7 +256,11 @@ export class FakeDecoder {
   }
   decode(chunk: FakeChunk) {
     this.chunks.push(chunk);
-    this.init.output(fakeFrame(chunk.timestamp) as unknown as VideoFrame);
+    if (this.holdOutput) this.waiting.push(chunk);
+    else this.init.output(fakeFrame(chunk.timestamp) as unknown as VideoFrame);
+  }
+  emit() {
+    for (const c of this.waiting.splice(0)) this.init.output(fakeFrame(c.timestamp) as unknown as VideoFrame);
   }
   /** The decoder failing the way WebCodecs reports it: error callback, then closed. */
   fail() {

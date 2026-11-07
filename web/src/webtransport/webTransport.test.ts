@@ -7,7 +7,7 @@ import {
   WebTransportMedia,
 } from "./webTransportMedia";
 import type { Presenter } from "./presenter";
-import type { MediaSink } from "./transport";
+import { TransportError, type MediaSink, type MediaTransport } from "./transport";
 import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
 import {
   avcC,
@@ -127,6 +127,7 @@ describe("WebTransportMedia connect", () => {
   it("closes the connection on every early return, and a stale one never feeds the sink", async () => {
     const agent = new FakeAgent();
     agent.replies = [[{ type: "error", code: "session_not_ready" }], [{ type: "teardown" }], [helloAck(0, avcC())]];
+    agent.closeEndsDatagrams = false;
     const units: number[] = [];
     await transport(agent).connect({ ...NO_SINK, unit: (u) => units.push(u.frameSeq) });
     expect(agent.conns.map((c) => c.closes.length > 0)).toEqual([true, true, false]);
@@ -164,6 +165,45 @@ describe("WebTransportMedia connect", () => {
     expect(tokens.slice(0, tokens.indexOf("tok-m1")).every((tok) => tok === "tok-1")).toBe(true);
     expect(mint).toHaveBeenCalledTimes(1);
     expect(REMINT_MIN_INTERVAL_MS).toBeGreaterThan(2_000);
+  });
+});
+
+describe("WebTransportMedia close during connect", () => {
+  it.each(["ready", "stream", "write", "answer"] as const)(
+    "closes the connection when closed while connect awaits %s, and never resolves with it",
+    async (stage) => {
+      const agent = new FakeAgent();
+      agent.replies = [[helloAck(0, avcC())]];
+      agent.hold = stage;
+      const t = transport(agent);
+      const sinkCalls: string[] = [];
+      const connecting = t.connect({ config: () => sinkCalls.push("config"), unit: () => {}, end: () => {} });
+      await vi.waitFor(() => expect(agent.reached).toBe(stage));
+      t.close();
+      expect(agent.last.closes.length).toBeGreaterThan(0); // at once, not when the agent next answers
+      agent.release();
+      await expect(connecting).rejects.toMatchObject({ code: "closed" });
+      expect(agent.conns).toHaveLength(1);
+      expect(agent.last.closes.length).toBeGreaterThan(0);
+      expect(sinkCalls).toEqual([]);
+    },
+  );
+});
+
+describe("WebTransportMedia close as the answer lands", () => {
+  it("does not publish a connection whose hello_ack arrives with close()", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    agent.hold = "answer";
+    const t = transport(agent);
+    const sinkCalls: string[] = [];
+    const connecting = t.connect({ config: () => sinkCalls.push("config"), unit: () => {}, end: () => {} });
+    await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+    agent.release(); // the hello_ack is queued on the stream...
+    t.close(); // ...and the page closes before the attempt reads it
+    await expect(connecting).rejects.toMatchObject({ code: "closed" });
+    expect(sinkCalls).toEqual([]);
+    expect(agent.last.closes.length).toBeGreaterThan(0);
   });
 });
 
@@ -334,6 +374,112 @@ describe("createWebTransportRuntime", () => {
     presenterFatal()("the GPU device was lost");
     expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1);
     expect(callbacks.onTransportFailed.mock.calls[0][0]).toMatch(/GPU/);
+  });
+
+  it("reports a presenter that cannot be made, and builds no transport", async () => {
+    const agent = new FakeAgent();
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const createTransport = vi.fn();
+    const rt = createWebTransportRuntime({
+      sessionId: "s1",
+      authToken: "auth",
+      coords: COORDS,
+      canvas: {} as HTMLCanvasElement,
+      callbacks,
+      deps: { createTransport, createPresenter: () => Promise.reject(new Error("requestDevice failed")) },
+    });
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1));
+    expect(callbacks.onTransportFailed.mock.calls[0][0]).toMatch(/GPU/);
+    expect(createTransport).not.toHaveBeenCalled();
+    expect(agent.conns).toHaveLength(0);
+  });
+
+  it("does not connect when the presenter fails while it is being made", async () => {
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const createTransport = vi.fn();
+    const destroy = vi.fn();
+    const rt = createWebTransportRuntime({
+      sessionId: "s1",
+      authToken: "auth",
+      coords: COORDS,
+      canvas: {} as HTMLCanvasElement,
+      callbacks,
+      deps: {
+        createTransport,
+        createPresenter: async (_c, onFatal) => {
+          onFatal("the GPU device was lost");
+          return { present: () => false, destroy };
+        },
+      },
+    });
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1));
+    await flush();
+    expect(createTransport).not.toHaveBeenCalled();
+    expect(destroy).toHaveBeenCalled();
+  });
+
+  it("calls the page back for nothing once destroyed", async () => {
+    let refuse!: (e: unknown) => void;
+    let sink!: MediaSink;
+    const fake: MediaTransport = {
+      connect: (s) => {
+        sink = s;
+        return new Promise((_, reject) => (refuse = reject));
+      },
+      requestKeyframe: () => {},
+      close: () => {},
+    };
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
+    const presenter: Presenter = { present: () => true, destroy: () => {} };
+    const make = () =>
+      createWebTransportRuntime({
+        sessionId: "s1",
+        authToken: "auth",
+        coords: COORDS,
+        canvas: {} as HTMLCanvasElement,
+        callbacks,
+        deps: { createTransport: () => fake, createPresenter: async () => presenter },
+      });
+    for (const code of ["taken_over", "session_ended", "auth_failed"]) {
+      const rt = make();
+      rt.start();
+      await vi.waitFor(() => expect(refuse).toBeDefined());
+      rt.destroy();
+      refuse(new TransportError(code));
+      sink.end({ code: 4410, reason: "" });
+      sink.end({ code: 4404, reason: "" });
+      await flush();
+      refuse = undefined as never;
+    }
+    expect(callbacks.onSessionTakenOver).not.toHaveBeenCalled();
+    expect(callbacks.onDisconnectSuspected).not.toHaveBeenCalled();
+    expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
+  });
+
+  it("shows only the unsupported banner when the browser cannot decode the stream", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
+    const presenter: Presenter = { present: () => true, destroy: () => {} };
+    const rt = createWebTransportRuntime({
+      sessionId: "s1",
+      authToken: "auth",
+      coords: COORDS,
+      canvas: {} as HTMLCanvasElement,
+      callbacks,
+      deps: {
+        createTransport: (o) => new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {} }),
+        createPresenter: async () => presenter,
+        decoder: { isConfigSupported: async (c) => ({ supported: false, config: c }) },
+      },
+    });
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1));
+    expect(rt.getSnapshot()).toMatchObject({ clientUnsupported: true, recovery: null });
   });
 
   it("asks for one keyframe when the tab becomes visible again", async () => {

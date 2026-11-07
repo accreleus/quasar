@@ -7,7 +7,8 @@ export const MAX_PENDING = 64;
 export const MAX_UNIT_BYTES = 4 * 1024 * 1024;
 /** Bytes held across every incomplete frame. */
 export const MAX_PENDING_BYTES = 8 * 1024 * 1024;
-/** An incomplete frame older than this is lost: with no NACK yet nothing will complete it. */
+/** An incomplete frame with no fragment for this long is lost: with no NACK yet nothing will
+ *  complete it. Counted from its latest fragment, so a large keyframe still arriving is kept. */
 export const MAX_PENDING_AGE_MS = 500;
 /** Smallest payload a non-final fragment can carry at the 1200-byte budget (§Channels, about 1123). */
 const MIN_FRAGMENT_PAYLOAD = 1_000;
@@ -68,7 +69,7 @@ export class FrameAssembler {
     // A count no unit within the byte budget needs: refused before anything is held.
     const payload = f.fragIndex < f.fragCount - 1 ? f.payload.length : MIN_FRAGMENT_PAYLOAD;
     if (f.fragCount > Math.ceil(MAX_UNIT_BYTES / Math.max(payload, MIN_FRAGMENT_PAYLOAD))) {
-      return this.verdict(null, lost);
+      return this.verdict(null, lost || !f.discardable);
     }
 
     let p = this.pending.get(f.frameSeq);
@@ -82,6 +83,7 @@ export class FrameAssembler {
     }
     if (p.parts[f.fragIndex]) return this.verdict(null, lost);
     p.parts[f.fragIndex] = f.payload;
+    p.at = at;
     p.have += 1;
     p.bytes += f.payload.length;
     this.pendingBytes += f.payload.length;

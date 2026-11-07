@@ -101,6 +101,8 @@ export class WebTransportMedia implements MediaTransport {
   private wt: WebTransport | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private closed = false;
+  /** Closes the attempt in flight; null once one has connected or ended. */
+  private abortAttempt: (() => void) | null = null;
   private connected = false;
   private coords: WebTransportCoords;
   /** When the current token arrived, on the monotonic clock. */
@@ -163,6 +165,8 @@ export class WebTransportMedia implements MediaTransport {
     if (this.closed) return;
     this.closed = true;
     if (this.keyTimer !== null) clearTimeout(this.keyTimer);
+    // An attempt still connecting is closed here; it sees `closed` at its next await.
+    this.abortAttempt?.();
     if (this.connected) this.send({ type: "bye", reason: "client_closed" });
     // The bye is queued on the stream ahead of the close.
     void this.writer?.ready.then(() => this.wt?.close({ closeCode: 0, reason: "" }), () => {});
@@ -216,8 +220,11 @@ export class WebTransportMedia implements MediaTransport {
       } catch {
         /* already closed */
       }
+      if (this.abortAttempt === abort) this.abortAttempt = null;
       return answer;
     };
+    const abort = () => void abandon(refused("closed"));
+    this.abortAttempt = abort;
     /** The answer a connection that ended without a message gave, read off its close code. */
     const fromClose = async (): Promise<Answer> => {
       const code = await Promise.race([closeCode, after(CLOSE_CODE_WAIT_MS, null)]);
@@ -227,8 +234,8 @@ export class WebTransportMedia implements MediaTransport {
     try {
       await wt.ready;
     } catch {
-      // The handshake or the certificate failed: another try meets the same.
-      return abandon(refused("connect_failed"));
+      // The handshake or the certificate failed (another try meets the same), or close() ended it.
+      return abandon(refused(this.closed ? "closed" : "connect_failed"));
     }
     if (this.closed) return abandon(refused("closed"));
 
@@ -250,6 +257,7 @@ export class WebTransportMedia implements MediaTransport {
     } catch {
       return fromClose();
     }
+    if (this.closed) return abandon(refused("closed"));
 
     const control = new ControlDecoder();
     const queue: Record<string, unknown>[] = [];
@@ -271,6 +279,7 @@ export class WebTransportMedia implements MediaTransport {
       if (err instanceof ControlProtocolError) return abandon(refused("internal"), { closeCode: 4400, reason: err.message });
       return fromClose();
     }
+    if (this.closed) return abandon(refused("closed"));
     if (first === null) return fromClose();
     if (first.type === "error") {
       const code = typeof first.code === "string" ? first.code : "internal";
@@ -288,6 +297,8 @@ export class WebTransportMedia implements MediaTransport {
       return abandon(refused("internal"), { closeCode: 4400, reason: "malformed hello_ack" });
     }
 
+    if (this.closed) return abandon(refused("closed"));
+    this.abortAttempt = null;
     this.wt = wt;
     this.writer = writer;
     this.connected = true;
