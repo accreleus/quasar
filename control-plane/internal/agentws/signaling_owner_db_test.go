@@ -1,11 +1,14 @@
 package agentws
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -115,58 +118,116 @@ func TestAgentSignalingForAnotherHostsSessionIsNotRelayed(t *testing.T) {
 	}
 }
 
-// The coordinator inserts the placed row, then sends session_assign, so the owner's first frames
-// can arrive after its connection was long established and after a foreign frame for the same
-// id was refused. Placement is read per frame, not snapshotted at connect.
-func TestSignalingFromTheOwnerAfterAnEarlierRefusalFlows(t *testing.T) {
+// A ::uuid cast accepts upper case, no hyphens and misplaced hyphens, so each spelling of an
+// owned id passes the placement query. The relay keys its buffers on the raw string, and Forget
+// evicts only the canonical one, so none may reach it.
+func TestNonCanonicalSpellingsOfAnOwnedSessionAreRefused(t *testing.T) {
 	f := newSignalingFixture(t)
-	wsA, hostA := f.connect(t, "sig-late-a")
-	wsB, hostB := f.connect(t, "sig-late-b")
-	sessA := f.seedSession(t, hostA)
-	chB := make(chan []byte, 8)
-	// B's session id exists only after a frame for it was refused to A.
-	sessB := f.seedSession(t, hostB)
-	f.h.relay.Register(sessB, chB)
-	signal(t, wsA, sessB, "forged")
-	signal(t, wsA, sessA, "marker")
-	silent(t, chB)
-
-	signal(t, wsB, sessB, "first-offer")
-	if got, ok := recv(chB); !ok || !strings.Contains(got, "first-offer") {
-		t.Fatalf("owner's first frame after the refusal = %q, %v", got, ok)
+	wsA, hostA := f.connect(t, "sig-spell-a")
+	sess := f.seedSession(t, hostA)
+	ch := make(chan []byte, 8)
+	f.h.relay.Register(sess, ch)
+	moved := []byte(sess)
+	moved[7], moved[8] = moved[8], moved[7]
+	for _, spelling := range []string{strings.ToUpper(sess), strings.ReplaceAll(sess, "-", ""), string(moved)} {
+		signal(t, wsA, spelling, "variant")
+	}
+	signal(t, wsA, sess, "canonical")
+	if got, ok := recv(ch); !ok || !strings.Contains(got, "canonical") {
+		t.Fatalf("canonical frame = %q, %v", got, ok)
+	}
+	silent(t, ch)
+	f.h.relay.mu.Lock()
+	defer f.h.relay.mu.Unlock()
+	if len(f.h.relay.pending) != 0 || len(f.h.relay.browsers) != 1 {
+		t.Fatalf("a variant spelling reached the relay: pending=%d browsers=%d", len(f.h.relay.pending), len(f.h.relay.browsers))
 	}
 }
 
-func TestSignalingOwnersRefusalExpiresAndOwnerIsCached(t *testing.T) {
-	f := newSignalingFixture(t)
-	_, hostA := f.connect(t, "sig-ttl-a")
-	_, hostB := f.connect(t, "sig-ttl-b")
-	sess := f.seedSession(t, hostB)
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	clock := time.Now()
-	o := newSignalingOwners(f.h.store, log, hostA)
-	o.now = func() time.Time { return clock }
-	ctx := context.Background()
+const canonicalSession = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 
-	if o.allows(ctx, sess) {
-		t.Fatal("a foreign session was allowed")
+func countingOwners(placed bool, err error, log *slog.Logger) (*signalingOwners, *int, *time.Time) {
+	calls, clock := 0, time.Now()
+	o := newSignalingOwners(nil, log, "host")
+	o.lookup = func(context.Context, string) (bool, error) { calls++; return placed, err }
+	o.now = func() time.Time { return clock }
+	return o, &calls, &clock
+}
+
+func TestSignalingOwnersCacheHitAndRefusalWindow(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	o, calls, clock := countingOwners(true, nil, log)
+	for i := 0; i < 3; i++ {
+		if ok, err := o.allows(context.Background(), canonicalSession); !ok || err != nil {
+			t.Fatalf("owned session: %v, %v", ok, err)
+		}
 	}
-	// Placement cannot change, so the refusal stands inside the window without a query.
-	if _, err := f.pool.Exec(ctx, `UPDATE sessions SET host_id=$1::uuid WHERE id=$2::uuid`, hostA, sess); err != nil {
-		t.Fatal(err)
+	if *calls != 1 {
+		t.Fatalf("an owned session cost %d lookups, want 1", *calls)
 	}
-	if o.allows(ctx, sess) {
-		t.Fatal("a refusal was not remembered inside its window")
+
+	o, calls, clock = countingOwners(false, nil, log)
+	o.allows(context.Background(), canonicalSession)
+	o.allows(context.Background(), canonicalSession)
+	if *calls != 1 {
+		t.Fatalf("a refusal cost %d lookups inside its window, want 1", *calls)
 	}
-	clock = clock.Add(foreignTTL + time.Second)
-	if !o.allows(ctx, sess) {
-		t.Fatal("a refusal outlived its window")
+	*clock = clock.Add(foreignTTL + time.Second)
+	o.allows(context.Background(), canonicalSession)
+	if *calls != 2 {
+		t.Fatalf("a refusal outlived its window: %d lookups", *calls)
 	}
-	f.pool.Exec(ctx, `DELETE FROM sessions WHERE id=$1::uuid`, sess)
-	if !o.allows(ctx, sess) {
-		t.Fatal("an owned session was not cached")
+}
+
+// A non-canonical id is refused before any lookup: the placement query would accept it.
+func TestSignalingOwnersRefuseNonCanonicalIDsWithoutALookup(t *testing.T) {
+	o, calls, _ := countingOwners(true, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for _, id := range []string{"", "not-a-uuid", strings.ToUpper(canonicalSession), strings.ReplaceAll(canonicalSession, "-", "")} {
+		if ok, err := o.allows(context.Background(), id); ok || err != nil {
+			t.Fatalf("%q: allowed=%v err=%v", id, ok, err)
+		}
 	}
-	if o.allows(ctx, "not-a-uuid") {
-		t.Fatal("a malformed id was allowed")
+	if *calls != 0 {
+		t.Fatalf("%d lookups for ids that cannot be canonical", *calls)
+	}
+}
+
+type failureEvents struct {
+	noopEvents
+	mu       sync.Mutex
+	failures []string // session id + "|bye" flag
+}
+
+func (e *failureEvents) AgentSignalingFailure(_ context.Context, _, sessionID string, bye bool, _ string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.failures = append(e.failures, sessionID+map[bool]string{true: "|bye", false: ""}[bye])
+}
+
+// A lookup that fails twice must fail the session through the same path as a relay that cannot
+// deliver, never stall it silently; the log line is throttled and the frame is not relayed.
+func TestSignalingLookupFailureFailsTheSessionAndThrottlesTheLog(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	ev := &failureEvents{}
+	h := NewHandler(nil, log, nil, ev, nil, nil, nil)
+	t.Cleanup(h.Close)
+	o, calls, _ := countingOwners(false, errors.New("db down"), log)
+	ch := make(chan []byte, 4)
+	h.relay.Register(canonicalSession, ch)
+
+	for _, msg := range []string{`{"type":"offer"}`, `{"type":"bye"}`, `{"type":"ice"}`} {
+		h.relayAgentSignaling(context.Background(), o, "host", SignalingEnvelope{SessionID: canonicalSession, Msg: []byte(msg)})
+	}
+	if *calls != 6 {
+		t.Fatalf("lookups = %d, want 2 attempts per frame", *calls)
+	}
+	want := []string{canonicalSession, canonicalSession + "|bye", canonicalSession}
+	if len(ev.failures) != 3 || ev.failures[0] != want[0] || ev.failures[1] != want[1] || ev.failures[2] != want[2] {
+		t.Fatalf("AgentSignalingFailure calls = %v, want %v", ev.failures, want)
+	}
+	silent(t, ch)
+	if n := strings.Count(buf.String(), "placement lookup failed"); n != 1 {
+		t.Fatalf("lookup error logged %d times for 3 failures, want 1", n)
 	}
 }
