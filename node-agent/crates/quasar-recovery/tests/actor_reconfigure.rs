@@ -625,6 +625,20 @@ fn agent_variables_from_the_seed_reach_the_agent_and_a_reconfigure_moves_only_th
 }
 
 #[test]
+fn the_rtp_mtu_is_an_agent_variable_a_reconfigure_sets() {
+    let m = Machine::install(combined_env());
+    assert!(
+        env(&m.agent(), "QUASAR_RTP_MTU").is_empty(),
+        "unset by default: the agent uses 1200"
+    );
+    let actor = m.actor();
+    let (_, result) = run(&actor, changes(&[("QUASAR_RTP_MTU", "1400")]));
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    assert_eq!(env(&m.agent(), "QUASAR_RTP_MTU"), "1400");
+    m.never_a_migration("agent variables");
+}
+
+#[test]
 fn a_setting_the_install_owns_or_a_misspelt_one_is_not_an_agent_variable() {
     let m = Machine::install(combined_env());
     let actor = m.actor();

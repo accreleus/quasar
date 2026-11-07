@@ -9,7 +9,7 @@ not build past those points.
 
 Conventions. **[F]** is a fact about today's code, with `path:line`. **[P]** is a proposal in this
 design. Architecture words follow the codebase-design vocabulary: module, interface,
-implementation, depth, seam, adapter, leverage, locality. Domain words follow `CONTEXT.md`.
+implementation, depth, seam, adapter, leverage, locality. Domain words follow `GLOSSARY.md`.
 Hosts are named by role only.
 
 ---
@@ -896,7 +896,7 @@ control-only "no agent on this machine" coverage.
 
 ---
 
-## Appendix: proposed `CONTEXT.md` additions
+## Appendix: proposed `GLOSSARY.md` additions
 
 - **Service specification**: the fully rendered, secret-free description of how one platform
   service runs on one machine. It is stored as numbered spec revisions. *Avoid* "compose

@@ -65,6 +65,7 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	if err != nil {
 		return Session{}, err
 	}
+	sessionID = sess.ID // canonical spelling: pendingSwaps and swapSince are keyed on it (#1100)
 	// Swappable: top-level running, no swap already in progress.
 	if sess.State != StateRunning {
 		return Session{}, ErrSessionNotSwappable

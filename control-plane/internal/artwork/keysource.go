@@ -6,9 +6,9 @@ import (
 	"crypto/subtle"
 	"errors"
 	"log/slog"
-	"net/http"
 	"sync"
 
+	"github.com/accreleus/quasar/control-plane/internal/outbound"
 	"github.com/accreleus/quasar/control-plane/internal/secrets"
 )
 
@@ -37,7 +37,7 @@ type SecretProviderSource struct {
 	// someone typing a key into the admin UI.
 	disabled bool
 	baseURL  string
-	http     *http.Client
+	http     outbound.Doer
 	log      *slog.Logger
 
 	mu     sync.Mutex

@@ -344,7 +344,7 @@ pub fn build_bitstream_chain_for_probe(
     cfg: &SessionConfig,
 ) -> Result<(gst::Element, gst::Element)> {
     let profile = resolve_codec_profile(cfg, codec)?;
-    let chain = build_bitstream_chain(codec, profile)?;
+    let chain = build_bitstream_chain(codec, profile, cfg.rtp_mtu)?;
     Ok((chain.encoder_capsfilter, chain.parser))
 }
 
@@ -419,7 +419,7 @@ pub fn build_session_pipeline(
         encoder_capsfilter: h264_capsfilter,
         parser,
         payloader: pay,
-    } = build_bitstream_chain(codec, effective_profile)?;
+    } = build_bitstream_chain(codec, effective_profile, cfg.rtp_mtu)?;
 
     // The caps webrtcbin advertises the video m-line from. Static, so the offer can be
     // generated before the first frame flows.
@@ -762,7 +762,7 @@ pub fn build_encode_pipeline(
         encoder_capsfilter: h264_capsfilter,
         parser,
         payloader: pay,
-    } = build_bitstream_chain(codec, effective_profile)?;
+    } = build_bitstream_chain(codec, effective_profile, cfg.rtp_mtu)?;
     // TWCC must be declared HERE, in the capsfilter, never via `add-extension` on the
     // payloader. webrtcbin builds its offer from these caps, the payloader's
     // auto-header-extension instantiates the matching `rtphdrexttwcc` writer from the

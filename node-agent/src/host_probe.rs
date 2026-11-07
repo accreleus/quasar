@@ -1,5 +1,5 @@
 //! Host probes (spec #252): bounded, disposable jobs that exercise a real path and
-//! report the result as a retained readiness check. Glossary: `CONTEXT.md` "Host readiness".
+//! report the result as a retained readiness check. Glossary: `GLOSSARY.md` "Host readiness".
 
 pub mod app_gpu;
 pub mod audio;
@@ -93,7 +93,7 @@ impl ProbeCodec {
 
 /// One probe run: a kind, the GPU index it exercises when the kind is per GPU, and for a
 /// codec probe the codec. A codec probe is the media probe run on one GPU for one codec
-/// above the floor (CONTEXT.md "Codec probe").
+/// above the floor (GLOSSARY.md "Codec probe").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProbeTarget {
     pub kind: ProbeKind,

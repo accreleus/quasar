@@ -100,7 +100,7 @@ and the other checks that become "skipped, and why"), #405 (`engine_restart_on_b
 
 ## Copy
 
-- Terms follow `CONTEXT.md` "Engines and privilege": container engine, engine mode
+- Terms follow `GLOSSARY.md` "Engines and privilege": container engine, engine mode
   (rootful, rootless), engine profile, Quasar user (shown to operators as "the quasar
   account"), host preparation, least privilege.
 - A rootful engine says plainly that its socket is equivalent to root (D17), in the
