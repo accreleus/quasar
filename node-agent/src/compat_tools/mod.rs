@@ -131,6 +131,18 @@ pub fn runner() -> Option<install::ConvergeRunner> {
     ))
 }
 
+/// Deletes what start-up recovery quarantined; only after the boot's application retirement.
+pub fn sweep_quarantine() {
+    if let Some(s) = store() {
+        s.sweep_quarantine();
+    }
+}
+
+/// Whether every tool in `names` is still Installed here (an empty list always is).
+pub fn all_installed(names: &[String]) -> bool {
+    names.is_empty() || store().is_some_and(|s| s.all_installed(names))
+}
+
 /// Drops the mount holds of sessions that are neither pending nor running any more.
 pub fn retain_holds(live: &dyn Fn(&str) -> bool) {
     if let Some(s) = store() {

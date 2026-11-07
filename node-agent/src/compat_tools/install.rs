@@ -322,28 +322,35 @@ impl ToolStore {
     /// Each leftover and each record entry is handled on its own: one that cannot be finished or
     /// cleaned is quarantined and reported, and the rest carry on. Only an unreadable record fails.
     fn recover(&self) -> io::Result<()> {
-        for dir in ["staging", "quarantine"] {
-            let Ok(entries) = std::fs::read_dir(self.root.join(dir)) else {
-                continue;
-            };
-            for leftover in entries.flatten() {
-                let path = leftover.path();
-                match delete_tree(&path) {
-                    Ok(()) => info!(
-                        token = "compat-tools-staging-cleaned",
-                        "compat tools: removed the leftover {}",
-                        path.display()
-                    ),
-                    Err(e) if dir == "staging" => self.quarantine(&path, &e),
-                    Err(e) => warn!(
-                        token = "compat-tools-quarantine-kept",
-                        "compat tools: could not delete the quarantined {}: {e}",
-                        path.display()
-                    ),
-                }
+        // A staged tree was never visible, so no container can mount it: delete it now.
+        for leftover in std::fs::read_dir(self.root.join("staging"))?.flatten() {
+            let path = leftover.path();
+            match delete_tree(&path) {
+                Ok(()) => info!(
+                    token = "compat-tools-staging-cleaned",
+                    "compat tools: removed the leftover {}",
+                    path.display()
+                ),
+                Err(e) => self.quarantine(&path, &e),
             }
         }
-        let mut rec = self.record_file().load()?.unwrap_or_default();
+        let mut rec = match self.record_file().load() {
+            Ok(r) => r.unwrap_or_default(),
+            // Heal: set the record aside and start empty; the sweep below quarantines every tool
+            // it no longer lists, and the control plane reinstalls by desired state.
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let aside = self.root.join(format!("record.json.corrupt-{}", nanos()));
+                let moved = std::fs::rename(self.root.join("record.json"), &aside);
+                warn!(
+                    token = "compat-tools-record-corrupt",
+                    "compat tools: the install record does not parse ({e}); set aside as {} ({}), starting empty",
+                    aside.display(),
+                    moved.map_or_else(|e| format!("not moved: {e}"), |()| "moved".into())
+                );
+                Record::default()
+            }
+            Err(e) => return Err(e),
+        };
         let tools = self.tools_dir();
         let mut kept = Vec::new();
         for mut e in std::mem::take(&mut rec.tools) {
@@ -379,10 +386,56 @@ impl ToolStore {
                 ),
             }
         }
+        // tools/ holds exactly what the record lists: anything else would make every reinstall
+        // of that name fail name_conflict.
+        for entry in std::fs::read_dir(&tools)?.flatten() {
+            let name = entry.file_name();
+            if !kept.iter().any(|e| OsStr::new(&e.name) == name) {
+                self.quarantine(
+                    &entry.path(),
+                    &io::Error::other("not in the install record"),
+                );
+            }
+        }
         rec.tools = kept;
         self.save(&rec)?;
         *lock(&self.record) = rec;
         Ok(())
+    }
+
+    /// Deletes everything in `quarantine/`. Only after the boot's application retirement: a
+    /// container of the previous process may still bind-mount a tree moved there at open, and
+    /// moving it kept that mount alive where deleting it would not.
+    pub fn sweep_quarantine(&self) {
+        let Ok(entries) = std::fs::read_dir(self.root.join("quarantine")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match delete_tree(&path) {
+                Ok(()) => info!(
+                    token = "compat-tools-quarantine-deleted",
+                    "compat tools: deleted the quarantined {}",
+                    path.display()
+                ),
+                Err(e) => warn!(
+                    token = "compat-tools-quarantine-kept",
+                    "compat tools: could not delete the quarantined {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    /// Whether every one of `names` is still Installed and present: a runtime holding any other is
+    /// never adopted.
+    pub fn all_installed(&self, names: &[String]) -> bool {
+        let installed = self.installed();
+        let tools = self.tools_dir();
+        names.iter().all(|n| {
+            installed.iter().any(|e| &e.name == n)
+                && std::fs::symlink_metadata(tools.join(n)).is_ok_and(|m| m.is_dir())
+        })
     }
 
     /// Moves `path` out of the way into `quarantine/` (same filesystem) and reports it; a tree
@@ -393,8 +446,14 @@ impl ToolStore {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // A read-only directory cannot move to another parent (its `..` changes) unless the
+        // agent runs as root, as in move_out_and_delete.
+        if let Ok(d) = crate::nofollow_dir::open_dir(path) {
+            // SAFETY: `d` is an open descriptor.
+            unsafe { libc::fchmod(d.as_raw_fd(), 0o755) };
+        }
         let moved = mkdir_if_missing(&to)
-            .and_then(|()| std::fs::rename(path, to.join(format!("{name}-{}", nanos()))));
+            .and_then(|()| std::fs::rename(path, to.join(format!("{}-{name}", nanos()))));
         warn!(
             token = "compat-tools-quarantined",
             "compat tools: quarantined {} ({why}); moved aside: {}",
@@ -1902,5 +1961,111 @@ mod tests {
             !dir.path().join("t/b").exists(),
             "nothing after the stop is written"
         );
+    }
+
+    /// Round 3, item 1 (store half): only an Installed, present tool counts for an adoption.
+    #[test]
+    fn only_an_installed_tool_lets_a_runtime_be_adopted() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        let want = [NAME.to_string()];
+        assert!(rig.store.all_installed(&want) && rig.store.all_installed(&[]));
+        let mut rec = lock(&rig.store.record).clone();
+        rec.tools[0].state = EntryState::Removing;
+        *lock(&rig.store.record) = rec;
+        assert!(!rig.store.all_installed(&want), "Removing");
+        let mut rec = lock(&rig.store.record).clone();
+        rec.tools[0].state = EntryState::Installed;
+        *lock(&rig.store.record) = rec;
+        assert!(matches!(
+            rig.run(vec![], remove()).0,
+            JobOutcome::Succeeded(_)
+        ));
+        assert!(!rig.store.all_installed(&want), "gone");
+    }
+
+    /// Round 3, item 2: a directory in tools/ the record does not list, read-only like a tool,
+    /// is quarantined at start, so the next install of that name is not name_conflict.
+    #[test]
+    fn an_unlisted_tool_directory_is_quarantined_at_start() {
+        let rig = Rig::new();
+        let stray = rig.store.tools_dir().join(NAME);
+        std::fs::create_dir_all(stray.join("files")).unwrap();
+        std::fs::set_permissions(&stray, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let again = Arc::new(rig.reopen());
+        assert!(
+            rig.tools().is_empty(),
+            "tools/ holds exactly what the record lists"
+        );
+        assert_eq!(
+            std::fs::read_dir(rig.dir.path().join("quarantine"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let body = good_tool();
+        let r = ConvergeRunner::new(
+            again,
+            Arc::new(Fake {
+                body: body.clone(),
+                route: Box::new(|_| None),
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(|| {}),
+        );
+        assert!(matches!(
+            r.run(&install(&body), &AbortFlag::new()),
+            JobOutcome::Succeeded(_)
+        ));
+    }
+
+    /// Round 3, item 3: a corrupt record is set aside, the store starts empty, every tool it no
+    /// longer lists is quarantined (kept until the boot's retirement sweep), and a reinstall works.
+    #[test]
+    fn a_corrupt_record_heals_itself() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        std::fs::write(rig.dir.path().join("record.json"), b"{not json").unwrap();
+        let healed = Arc::new(rig.reopen());
+        assert!(healed.installed().is_empty());
+        assert!(rig.tools().is_empty());
+        let aside: Vec<String> = std::fs::read_dir(rig.dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("record.json.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the corrupt record is kept aside");
+        let quarantine = rig.dir.path().join("quarantine");
+        assert_eq!(
+            std::fs::read_dir(&quarantine).unwrap().count(),
+            1,
+            "not deleted at open"
+        );
+        healed.sweep_quarantine();
+        assert_eq!(
+            std::fs::read_dir(&quarantine).unwrap().count(),
+            0,
+            "deleted after retirement"
+        );
+        let r = ConvergeRunner::new(
+            healed.clone(),
+            Arc::new(Fake {
+                body: body.clone(),
+                route: Box::new(|_| None),
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(|| {}),
+        );
+        let out = r.run(&install(&body), &AbortFlag::new());
+        let JobOutcome::Succeeded(s) = &out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(
+            s["already_installed"], false,
+            "reinstalled by desired state"
+        );
+        assert_eq!(healed.installed().len(), 1);
     }
 }

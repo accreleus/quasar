@@ -3435,6 +3435,8 @@ struct RunningHandle {
     /// same check, and those of a swap the runner has not yet completed.
     region_env: BTreeMap<String, String>,
     swap_region_env: Option<BTreeMap<String, String>>,
+    /// The compatibility tools its container bind-mounts, for an adoption's check.
+    compat_tools: Vec<String>,
     /// Set once the runner thread has returned, for a fresh build that must wait for it.
     exited: Arc<AtomicBool>,
 }
@@ -4141,6 +4143,11 @@ impl SessionManager {
                     let exited_flag = exited.clone();
                     let runtime_stream = cfg.stream.clone();
                     let runtime_region_env = region_env(cfg.container.as_ref());
+                    let runtime_compat_tools = cfg
+                        .container
+                        .as_ref()
+                        .map(|c| c.compat_tools.clone())
+                        .unwrap_or_default();
                     let kind = cfg.kind;
                     let (sig_in_tx, sig_in_rx) = std::sync::mpsc::channel::<SignalMsg>();
                     let (swap_tx, swap_rx) = std::sync::mpsc::channel::<SwapRequest>();
@@ -4319,6 +4326,7 @@ impl SessionManager {
                             stream: runtime_stream,
                             region_env: runtime_region_env,
                             swap_region_env: None,
+                            compat_tools: runtime_compat_tools,
                             exited,
                         },
                     );
@@ -5198,6 +5206,10 @@ impl SessionManager {
             Some("it encodes another stream, or a smaller one")
         } else if h.region_env != region_env(cfg.container.as_ref()) {
             Some("its container was started with other Region and Input values")
+        } else if !crate::compat_tools::all_installed(&h.compat_tools) {
+            // A removal may delete a tree under a parked runtime's bind mount; never hand that
+            // runtime, and so a deleted tool, to Steam.
+            Some("a compatibility tool it mounts is no longer installed")
         } else if cfg.kind != Some(SessionKind::Parked) && !h.metrics.launch_helper_connected() {
             // A runtime whose helper never connected cannot start the game.
             Some("its launch helper never connected")
@@ -9212,6 +9224,7 @@ mod tests {
                 stream: StreamParams::default(),
                 region_env: BTreeMap::new(),
                 swap_region_env: None,
+                compat_tools: Vec::new(),
                 exited: Arc::new(AtomicBool::new(false)),
             },
             stop,
@@ -9273,6 +9286,7 @@ mod tests {
                 stream: StreamParams::default(),
                 region_env: BTreeMap::new(),
                 swap_region_env: None,
+                compat_tools: Vec::new(),
                 exited: Arc::new(AtomicBool::new(false)),
             },
             display_rx,
@@ -10372,6 +10386,7 @@ mod tests {
                 stream: StreamParams::default(),
                 region_env: BTreeMap::new(),
                 swap_region_env: None,
+                compat_tools: Vec::new(),
                 exited: Arc::new(AtomicBool::new(false)),
             },
             capture_rx,
@@ -11829,6 +11844,32 @@ mod tests {
             warm.adopted.recv_timeout(WAIT).unwrap().1.kind,
             Some(SessionKind::Parked)
         );
+    }
+
+    /// A runtime whose container mounts a compatibility tool that is no longer Installed (gone,
+    /// or Removing) is never adopted: the claim builds fresh, through the ordinary decline.
+    #[test]
+    fn a_runtime_whose_compat_tool_is_gone_is_not_adopted() {
+        let tool = |cfg: &mut SessionConfig| {
+            cfg.container.as_mut().unwrap().compat_tools = vec!["GE-Proton11-12-x86_64".into()];
+        };
+        let (mut mgr, warm) = warm_manager();
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080));
+        tool(&mut cfg);
+        assert!(acked(start(&mut mgr, &warm, "p0", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("p0", SessionEvent::Running);
+        mgr.on_event("p0", SessionEvent::Held);
+        // No tools store in tests: nothing is Installed, as after the tool's removal.
+        let cfg = steam_cfg(SessionKind::Parked, "-silent", (1920, 1080));
+        assert!(acked(start(&mut mgr, &warm, "k2", cfg, Some("p0"))));
+        assert!(mgr.running["p0"].stop.load(Ordering::Relaxed), "torn down");
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap().0,
+            "k2",
+            "built fresh"
+        );
+        assert!(warm.adopted.try_recv().is_err());
     }
 
     /// A Steam config whose app is what the control plane sends (amendment 49): its
