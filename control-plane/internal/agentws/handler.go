@@ -1068,6 +1068,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	}
 	reads := make(chan readResult, 1)
 	reading := false
+	owners := newSignalingOwners(h.store, h.log, hostID)
 	for {
 		// A lost initial map or acknowledgement must not leave an apparently
 		// connected host gated forever. Renegotiate after a bounded wait; the
@@ -1548,6 +1549,10 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			var env SignalingEnvelope
 			if err := json.Unmarshal(raw, &env); err != nil {
 				h.log.Warn("decode signaling envelope failed", "err", err)
+				continue
+			}
+			// Agent-supplied id: relay only for a session placed on this host (#1116).
+			if !owners.allows(bg, env.SessionID) {
 				continue
 			}
 			if err := h.relay.Deliver(env.SessionID, env.Msg); err != nil {
