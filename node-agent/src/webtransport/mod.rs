@@ -9,6 +9,7 @@
 
 mod cert;
 mod media;
+mod pyrowave;
 #[cfg(test)]
 mod tests;
 
@@ -29,6 +30,7 @@ use web_transport_quinn::{quinn, RecvStream, Request, SendStream, Session};
 
 pub use cert::CertReport;
 use cert::{Cert, CertSet};
+pub use media::PyroWaveGrant;
 use media::{Attached, Gone, Media, Out};
 
 const WT_PROTO: u32 = 1;
@@ -119,6 +121,9 @@ struct Hello {
     wt_proto: u32,
     token: String,
     session_id: String,
+    /// Amendment 55: this connection can decode PyroWave.
+    #[serde(default)]
+    pyrowave: bool,
 }
 
 fn token_hash(token: &str) -> String {
@@ -253,31 +258,107 @@ impl Registry {
 pub(crate) struct Tap {
     registry: Arc<Registry>,
     session_id: String,
+    /// The PyroWave pipeline and the feed's appsink, of a granted session.
+    pyrowave: Option<(gst::Pipeline, gstreamer_app::AppSink)>,
 }
 
 impl Tap {
     /// `None` when no listener runs or the session was not assigned WebTransport.
+    /// `pyrowave`: the session's config, its grant and the feed off the encode pipeline.
     pub(crate) fn attach(
         registry: &Arc<Registry>,
         video: &gst::Pad,
         encoder: &gst::Element,
         session_id: &str,
+        trace: Option<crate::session::pipeline::TraceTx>,
+        pyrowave: Option<(
+            &crate::session::SessionConfig,
+            PyroWaveGrant,
+            Option<crate::session::pipeline::pyrowave_branch::Feed>,
+        )>,
     ) -> Option<Self> {
-        let media = Media::new(encoder);
+        let media = Media::new(encoder, trace.map(|tx| (tx, session_id.to_string())));
         if !registry.set_media(session_id, media.clone()) {
             return None;
         }
         media::tap(video, &media, session_id);
+        let pyrowave =
+            pyrowave.and_then(|(cfg, grant, feed)| pyrowave_branch(cfg, grant, feed, &media));
         Some(Self {
             registry: registry.clone(),
             session_id: session_id.to_string(),
+            pyrowave,
         })
+    }
+}
+
+/// Start the PyroWave encode of a granted session, gated on a PyroWave client. With no feed
+/// or encoder the grant still stands, unusable, so a `hello` reads `encoder_error`.
+fn pyrowave_branch(
+    cfg: &crate::session::SessionConfig,
+    grant: PyroWaveGrant,
+    feed: Option<crate::session::pipeline::pyrowave_branch::Feed>,
+    media: &Arc<Media>,
+) -> Option<(gst::Pipeline, gstreamer_app::AppSink)> {
+    use gstreamer::prelude::*;
+    let size = (cfg.stream.width, cfg.stream.height, cfg.stream.fps);
+    let Some(feed) = feed else {
+        media.grant_pyrowave(grant, size, false);
+        return None;
+    };
+    media.grant_pyrowave(grant, size, true);
+    let gate = Arc::downgrade(media);
+    feed.queue
+        .static_pad("src")?
+        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            match gate.upgrade().is_some_and(|m| m.pyrowave_active()) {
+                true => gst::PadProbeReturn::Ok,
+                false => gst::PadProbeReturn::Drop,
+            }
+        });
+    let (frames, errors) = (Arc::downgrade(media), Arc::downgrade(media));
+    // Rate: the encoder budgets `bitrate` / fps per frame; B09 (#1058) drives it live from
+    // the clamp of codec-pyrowave.md §Rate.
+    let started = crate::session::pipeline::pyrowave_branch::start_encoder(
+        cfg,
+        &feed,
+        grant.target_kbps,
+        move |buffer| {
+            if let Some(media) = frames.upgrade() {
+                media.on_pyrowave_frame(buffer);
+            }
+        },
+        move |error| {
+            tracing::warn!(
+                token = "pyrowave-encoder-failed",
+                "PyroWave encoder failed: {error}"
+            );
+            if let Some(media) = errors.upgrade() {
+                media.switch_off(None, "encoder_error");
+            }
+        },
+    );
+    match started {
+        Ok((pipeline, _encoder)) => Some((pipeline, feed.sink)),
+        Err(error) => {
+            tracing::warn!(
+                token = "pyrowave-encoder-start-failed",
+                "PyroWave encoder did not start: {error:#}"
+            );
+            media.switch_off(None, "encoder_error");
+            None
+        }
     }
 }
 
 impl Drop for Tap {
     fn drop(&mut self) {
         self.registry.end(&self.session_id);
+        if let Some((pipeline, feed)) = self.pyrowave.take() {
+            use gstreamer::prelude::*;
+            feed.set_callbacks(gstreamer_app::AppSinkCallbacks::builder().build());
+            let _ = pipeline.set_state(gst::State::Null);
+        }
     }
 }
 
@@ -684,8 +765,8 @@ enum Violation {
     Protocol(&'static str),
 }
 
-fn hello_ack(config: &media::VideoConfig) -> Value {
-    json!({
+fn hello_ack(config: &media::VideoConfig, switch_reason: Option<&str>) -> Value {
+    let mut ack = json!({
         "type": "hello_ack",
         "wt_proto": WT_PROTO,
         "config_id": config.config_id,
@@ -699,7 +780,18 @@ fn hello_ack(config: &media::VideoConfig) -> Value {
         "audio": null,
         "mic": null,
         "fec": null,
-    })
+    });
+    // codec-pyrowave.md §`hello_ack`: required for PyroWave, and always BT.709.
+    if config.codec == "pyrowave" {
+        ack["video"]["color_space"] = json!({
+            "primaries": "bt709", "transfer": "bt709", "matrix": "bt709",
+            "full_range": config.full_range,
+        });
+    }
+    if let Some(reason) = switch_reason {
+        ack["codec_switch_reason"] = json!(reason);
+    }
+    ack
 }
 
 /// Hand over the first bidirectional stream as the control stream and refuse every
@@ -849,7 +941,7 @@ async fn authenticate(
         // `end` may run between the redeem and the attach.
         .and_then(|media| {
             media
-                .attach()
+                .attach(hello.pyrowave, session.rtt())
                 .map(|c| (media, c))
                 .ok_or(Refusal::SessionEnded)
         });
@@ -876,7 +968,7 @@ async fn authenticate(
     if !matches!(
         timeout_at(
             deadline,
-            write_message(&mut send, &hello_ack(&client.config))
+            write_message(&mut send, &hello_ack(&client.config, client.reason))
         )
         .await,
         Ok(Ok(()))
@@ -909,32 +1001,42 @@ async fn stream(
     });
     let mut pkt_seq = 0u32;
     let mut warned_oversized = false;
+    // The configuration the client was last sent: a PyroWave unit packs for its size.
+    let mut current = client.config.clone();
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
     let (message, code, why) = loop {
         tokio::select! {
             out = client.rx.recv() => match out {
+                Some(Out::Unit(unit)) if unit.config_id != current.config_id => {}
                 Some(Out::Unit(unit)) => {
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);
-                    let datagrams = media::packetize(&unit, max, &mut pkt_seq);
-                    if datagrams.is_empty() && !warned_oversized {
-                        warned_oversized = true;
-                        tracing::warn!(
-                            token = "webtransport-unit-too-large",
-                            "a {} byte access unit needs more than 65535 fragments; dropped, \
-                             and a keyframe requested",
-                            unit.data.len()
-                        );
-                    }
-                    if datagrams.is_empty() {
-                        media.keyframe();
-                    }
+                    let Some(datagrams) = media::packetize(&unit, &current, max, &mut pkt_seq) else {
+                        if !warned_oversized {
+                            warned_oversized = true;
+                            tracing::warn!(
+                                token = "webtransport-unit-too-large",
+                                "a {} byte {} frame cannot be sent (over 65535 fragments, or a \
+                                 PyroWave frame the packing refuses); dropped",
+                                unit.data.len(),
+                                current.codec
+                            );
+                        }
+                        // A PyroWave frame needs no keyframe: the next one repairs everything.
+                        if !unit.pyrowave {
+                            media.keyframe();
+                        }
+                        continue;
+                    };
+                    // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
+                    // §Rate's SHOULD pace over half a frame interval is B09 (#1058).
                     if datagrams.into_iter().try_for_each(|d| session.send_datagram(d)).is_err() {
                         break QUIET;
                     }
                 }
-                Some(Out::Config(config)) => {
-                    let ack = hello_ack(&config);
+                Some(Out::Config(config, reason)) => {
+                    current = config.clone();
+                    let ack = hello_ack(&config, reason);
                     let write = write_message(&mut send, &ack);
                     if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
                         break QUIET;
@@ -947,7 +1049,9 @@ async fn stream(
             },
             message = control_rx.recv() => match message {
                 Some(Ok(message)) => match message.get("type").and_then(Value::as_str) {
-                    Some("keyframe_request") => media.keyframe(),
+                    // codec-pyrowave.md §Loss: no keyframe request for a PyroWave frame.
+                    Some("keyframe_request") if current.codec != "pyrowave" => media.keyframe(),
+                    Some("codec_fallback") => media.switch_off(Some(client.id), "client_decode_error"),
                     Some("bye") => break QUIET,
                     _ => {}
                 },

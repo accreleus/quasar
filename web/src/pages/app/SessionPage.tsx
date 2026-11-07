@@ -121,6 +121,8 @@ interface SessionState {
   playoutOverride?: number | null;
   /** Amendment 54: present when the stream plan chose WebTransport. */
   webtransport?: WebTransportCoords;
+  /** Amendment 58: the session wants PyroWave, so its WebTransport client offers it. */
+  pyrowave?: boolean;
 }
 
 // Keyed on the id so a route change between two sessions (a toast's "Go to
@@ -415,6 +417,7 @@ function SessionPageBody() {
           authToken: authToken ?? "",
           coords: webtransport,
           canvas: canvasRef.current,
+          pyrowave: state?.pyrowave === true,
           callbacks: {
             onDisconnectSuspected: () => void pollEndReason(),
             onSessionTakenOver: () => noteFailure(takenOverFailure()),

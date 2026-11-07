@@ -19,6 +19,9 @@ const (
 	wireCodecH264 = "h264"
 	wireCodecH265 = "h265"
 	wireCodecAV1  = "av1"
+	// wireCodecPyroWave appears only in host and GPU codec sets: never a rung's codec, never
+	// sessions.codec (codec-pyrowave.md §Wire vocabulary). No catalog codec maps to it.
+	wireCodecPyroWave = "pyrowave"
 )
 
 // catalogToWire maps a catalog profile.Codec to its wire string; ok=false for an

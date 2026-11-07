@@ -71,6 +71,8 @@ export interface LaunchRequest {
   };
   /** Amendment 54: the client's transport preference; absent lets the profile decide. */
   transport?: "webrtc" | "webtransport";
+  /** Amendment 58: the user picked Ultra-low latency (PyroWave). A wish: `session.pyrowave` says what the plan decided. */
+  pyrowave?: boolean;
 }
 
 /** Pass `appId` for the already-filtered launch menu; never filter client-side,

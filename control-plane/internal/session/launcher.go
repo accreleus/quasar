@@ -248,6 +248,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// The effective runtime app's image; engages the placement filter only when
 		// it is an installed catalog entry.
 		AppImage: app.Image(),
+		// A PyroWave slot is taken under the scheduler's locks (§The PyroWave ceiling).
+		PyroWaveCandidate: pyrowaveCandidate(launchProfile, lp),
 	}
 	if p.RequireCodec, err = codecConstraint(launchProfile, ov); err != nil {
 		return LaunchResult{}, err
@@ -715,6 +717,8 @@ func (c *Coordinator) gatherStreamInputs(
 		CertMaxAge:  CertStaleness,
 		Now:         time.Now(),
 		Transport:   TransportInputs{Requested: lp.Transport},
+
+		HoldsPyroWaveSlot: sess.PyroWaveSlot,
 	}
 	// Only a profile that can want WebTransport pays for the endpoint read.
 	if sess.HostID != nil && (chain.Transport == transportWebTransport || chain.Transport == transportOptIn) {
@@ -1071,6 +1075,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 	if sess.wt != nil {
 		exp := sess.wt.ExpiresAt
 		assign.Transport, assign.WTTokenHash, assign.WTTokenExpiresAt = transportWebTransport, sess.wt.Hash, &exp
+		assign.PyroWave = sess.PyroWave.grant()
 	}
 	if !c.sendHomeBoundAssign(hostID, sess.ID, runtimeSpec, assign, expected) {
 		return

@@ -45,6 +45,8 @@ pub struct EncodedSession {
     pub(crate) session_id: String,
     /// `QUASAR_DIAG_NO_OBS` unset.
     pub(crate) observe: bool,
+    /// The PyroWave feed of a granted WebTransport session, off a tee before the encoder.
+    pub(crate) pyrowave_feed: Option<super::pyrowave_branch::Feed>,
 }
 
 /// One implementation of the transport slot. Audio is the transport's own: it builds the

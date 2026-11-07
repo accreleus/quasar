@@ -55,7 +55,7 @@ type AppRef struct {
 // sort_order. userFacingOnly filters to visibility='user' (GET /v1/me/profiles
 // and the launch path); debug/internal chains are never offered there.
 func (s *Store) ListLaunchProfiles(ctx context.Context, userFacingOnly bool) ([]profile.LaunchProfile, error) {
-	q := `SELECT id, display_name, description, visibility, sort_order, transport FROM launch_profiles`
+	q := `SELECT id, display_name, description, visibility, sort_order, transport, pyrowave_mode, pyrowave_kbps FROM launch_profiles`
 	if userFacingOnly {
 		q += ` WHERE visibility = 'user'`
 	}
@@ -72,7 +72,7 @@ func (s *Store) ListLaunchProfiles(ctx context.Context, userFacingOnly bool) ([]
 	for rows.Next() {
 		var lp profile.LaunchProfile
 		var vis string
-		if err := rows.Scan(&lp.ID, &lp.DisplayName, &lp.Description, &vis, &lp.SortOrder, &lp.Transport); err != nil {
+		if err := rows.Scan(&lp.ID, &lp.DisplayName, &lp.Description, &vis, &lp.SortOrder, &lp.Transport, &lp.PyroWaveMode, &lp.PyroWaveKbps); err != nil {
 			return nil, fmt.Errorf("scan launch profile: %w", err)
 		}
 		lp.Visibility = profile.Visibility(vis)
@@ -158,9 +158,9 @@ func (s *Store) GetLaunchProfile(ctx context.Context, id string) (profile.Launch
 	var lp profile.LaunchProfile
 	var vis string
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, display_name, description, visibility, sort_order, transport
+		SELECT id, display_name, description, visibility, sort_order, transport, pyrowave_mode, pyrowave_kbps
 		FROM launch_profiles WHERE id = $1
-	`, id).Scan(&lp.ID, &lp.DisplayName, &lp.Description, &vis, &lp.SortOrder, &lp.Transport)
+	`, id).Scan(&lp.ID, &lp.DisplayName, &lp.Description, &vis, &lp.SortOrder, &lp.Transport, &lp.PyroWaveMode, &lp.PyroWaveKbps)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return profile.LaunchProfile{}, ErrLaunchProfileUnknown
 	}
@@ -232,7 +232,7 @@ func (s *Store) LaunchProfileUsedByFor(ctx context.Context, id string) (LaunchPr
 // debug/internal chain losing its floor is just as broken.
 func (s *Store) LaunchProfilesContainingRung(ctx context.Context, rungID string) ([]profile.LaunchProfile, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT lp.id, lp.display_name, lp.description, lp.visibility, lp.sort_order, lp.transport
+		SELECT lp.id, lp.display_name, lp.description, lp.visibility, lp.sort_order, lp.transport, lp.pyrowave_mode, lp.pyrowave_kbps
 		FROM launch_profiles lp
 		WHERE EXISTS (
 		    SELECT 1 FROM launch_profile_rungs r
@@ -250,7 +250,7 @@ func (s *Store) LaunchProfilesContainingRung(ctx context.Context, rungID string)
 	for rows.Next() {
 		var lp profile.LaunchProfile
 		var vis string
-		if err := rows.Scan(&lp.ID, &lp.DisplayName, &lp.Description, &vis, &lp.SortOrder, &lp.Transport); err != nil {
+		if err := rows.Scan(&lp.ID, &lp.DisplayName, &lp.Description, &vis, &lp.SortOrder, &lp.Transport, &lp.PyroWaveMode, &lp.PyroWaveKbps); err != nil {
 			return nil, fmt.Errorf("scan launch profile containing rung: %w", err)
 		}
 		lp.Visibility = profile.Visibility(vis)
@@ -283,7 +283,11 @@ type LaunchProfileWrite struct {
 	Visibility  *string
 	SortOrder   *int32
 	Transport   *string
-	Rungs       []string
+	// PyroWaveKbps is written only when PyroWaveKbpsSet; nil then stores NULL.
+	PyroWaveMode    *string
+	PyroWaveKbps    *int32
+	PyroWaveKbpsSet bool
+	Rungs           []string
 }
 
 // CreateLaunchProfile inserts a launch profile and its ordered rungs in one
@@ -314,6 +318,12 @@ func (s *Store) CreateLaunchProfile(ctx context.Context, w LaunchProfileWrite) (
 	}
 	if w.Transport != nil {
 		add("transport", *w.Transport)
+	}
+	if w.PyroWaveMode != nil {
+		add("pyrowave_mode", *w.PyroWaveMode)
+	}
+	if w.PyroWaveKbpsSet {
+		add("pyrowave_kbps", w.PyroWaveKbps)
 	}
 	ph := make([]string, len(args))
 	for i := range args {
@@ -374,6 +384,12 @@ func (s *Store) UpdateLaunchProfile(ctx context.Context, id string, w LaunchProf
 	}
 	if w.Transport != nil {
 		add("transport", *w.Transport)
+	}
+	if w.PyroWaveMode != nil {
+		add("pyrowave_mode", *w.PyroWaveMode)
+	}
+	if w.PyroWaveKbpsSet {
+		add("pyrowave_kbps", w.PyroWaveKbps)
 	}
 	if len(set) > 0 {
 		args = append(args, id)

@@ -25,13 +25,14 @@ fn hello_for(session_id: &str, token: &str, wt_proto: u32) -> Hello {
         wt_proto,
         token: token.into(),
         session_id: session_id.into(),
+        pyrowave: false,
     }
 }
 
 fn ready_media() -> Arc<Media> {
     gst::init().unwrap();
     let encoder = gst::ElementFactory::make("identity").build().unwrap();
-    let media = Media::new(&encoder);
+    let media = Media::new(&encoder, None);
     let caps = gst::Caps::builder("video/x-h264")
         .field("stream-format", "avc")
         .field("width", 64)
@@ -157,6 +158,8 @@ async fn agent_with(limits: Limits) -> Agent {
         &parse.static_pad("src").unwrap(),
         &encoder,
         SESSION,
+        None,
+        None,
     );
     assert!(tap.is_some(), "an assigned session takes the tap");
     pipeline.set_state(gst::State::Playing).unwrap();
@@ -1503,4 +1506,128 @@ async fn a_stalled_control_stream_is_closed_without_stopping_chromes_h3_streams(
         "{closed:?}"
     );
     chrome.assert_h3_streams_untouched(false).await;
+}
+
+/// The PyroWave datagrams of `n` frames, each frame rejoined from its datagrams' packets
+/// (every part of an oversized block in order) after checking the header and coverage rules
+/// of codec-pyrowave.md §Video datagrams. Fails on any non-PyroWave datagram.
+async fn pyrowave_frames(session: &Session, n: usize, config_id: u8, blocks: u32) -> Vec<Vec<u8>> {
+    let mut parts: HashMap<u16, BTreeMap<u16, Bytes>> = HashMap::new();
+    let mut done = Vec::new();
+    while done.len() < n {
+        let d = tokio::time::timeout(Duration::from_secs(10), session.read_datagram())
+            .await
+            .expect("video stalled")
+            .unwrap();
+        assert!(d.len() <= media::MAX_DATAGRAM);
+        assert_eq!(
+            (d[0], d[5], d[6]),
+            (0x01, 3, config_id),
+            "a PyroWave datagram: keyframe + discardable"
+        );
+        let frame_seq = u16::from_le_bytes([d[7], d[8]]);
+        let count = u16::from_le_bytes([d[11], d[12]]);
+        let frags = parts.entry(frame_seq).or_default();
+        frags.insert(u16::from_le_bytes([d[9], d[10]]), d.slice(media::HEADER..));
+        if frags.len() < count as usize {
+            continue;
+        }
+        let mut frame = Vec::new();
+        let mut next = 0u32;
+        for p in parts.remove(&frame_seq).unwrap().into_values() {
+            let le = |at: usize| u32::from_le_bytes(p[at..at + 4].try_into().unwrap());
+            let (first, end) = (le(4), le(8));
+            match p[0] {
+                0 => {
+                    assert_eq!(first, next, "ranges are contiguous");
+                    next = end;
+                }
+                1 if p[1] == 0 => {
+                    assert_eq!(first, next);
+                    next = end;
+                }
+                1 => assert_eq!(end, next, "a later part repeats its block's range"),
+                kind => panic!("kind {kind}"),
+            }
+            frame.extend_from_slice(&p[pyrowave::HEADER..]);
+        }
+        assert_eq!(next, blocks, "the ranges partition [0, N)");
+        done.push(frame);
+    }
+    done
+}
+
+#[tokio::test]
+async fn a_pyrowave_client_gets_frames_that_rejoin_byte_for_byte_and_can_fall_back() {
+    let agent = agent().await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    media.grant_pyrowave(
+        PyroWaveGrant {
+            wanted: true,
+            target_kbps: 200_000,
+            floor_kbps: 100_000,
+            // The 5 ms gate is `media`'s unit tests'; a loaded test host's loopback can exceed it.
+            max_rtt_ms: 1_000,
+        },
+        (320, 192, 60),
+        true,
+    );
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/pyrowave/detail_320x192_xhi.pwv1"
+    ))
+    .unwrap();
+    let golden = &raw[28..];
+
+    let session = agent.connect().await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN, "session_id": SESSION,
+                       "client": "browser", "pyrowave": true});
+    write_message(&mut send, &hello).await.unwrap();
+    let ack = read_message(&mut recv).await.unwrap();
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(ack["video"]["codec"], "pyrowave");
+    assert_eq!(ack["codec_switch_reason"], "launch");
+    assert_eq!(
+        ack["video"]["color_space"],
+        json!({"primaries": "bt709", "transfer": "bt709", "matrix": "bt709", "full_range": false})
+    );
+    let description = base64::engine::general_purpose::STANDARD
+        .decode(ack["video"]["description_b64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(description, raw[..24], "the fixture's own PWV1Header");
+    let config_id = ack["config_id"].as_u64().unwrap() as u8;
+
+    // The stand-in encoder's H.264 keeps flowing; none of it reaches this client.
+    for _ in 0..3 {
+        media.on_pyrowave_frame(&gst::Buffer::from_slice(golden.to_vec()));
+    }
+    let got = pyrowave_frames(&session, 3, config_id, pyrowave::block_count(320, 192)).await;
+    assert!(
+        got.iter().all(|f| f == golden),
+        "packed and rejoined, byte for byte"
+    );
+
+    write_message(
+        &mut send,
+        &json!({"type": "codec_fallback", "reason": "decode_error"}),
+    )
+    .await
+    .unwrap();
+    let back = read_message(&mut recv).await.unwrap();
+    assert_eq!(back["type"], "hello_ack");
+    assert_eq!(back["video"]["codec"], "h264");
+    assert_eq!(back["codec_switch_reason"], "client_decode_error");
+    let h264 = back["config_id"].as_u64().unwrap() as u8;
+    assert_eq!(h264, config_id.wrapping_add(1));
+    let first = frames(&session, 1, false).await.remove(0);
+    assert_eq!(
+        (first.config_id, first.keyframe),
+        (h264, true),
+        "a keyframe first"
+    );
+    assert_eq!(nal_types(&first.data).last(), Some(&5));
 }

@@ -4,17 +4,21 @@
 // (protocol/transport-webtransport.md) is the first implementation here; WebRTC
 // still decodes inside the browser's <video> and does not go through this seam.
 
+import type { PyroWaveFrame } from "../pyrowave/receiver";
+
 /** A `hello_ack.video` (§Hello ack), the decoder configuration a `config_id` names. */
 export interface VideoConfig {
   configId: number;
-  /** Wire vocabulary: h264 | h265 | av1. */
+  /** Wire vocabulary: h264 | h265 | av1 | pyrowave. */
   codec: string;
-  /** avcC / hvcC / av1C. */
+  /** avcC / hvcC / av1C, or PyroWave's PWV1Header. */
   description: Uint8Array;
   width: number;
   height: number;
   fps: number;
   colorSpace?: VideoColorSpaceInit;
+  /** `hello_ack.codec_switch_reason` (codec-pyrowave.md §Switching codec). */
+  switchReason?: string;
 }
 
 /** One access unit, whole, in the form `EncodedVideoChunk` takes (§Video). */
@@ -42,6 +46,8 @@ export interface MediaSink {
   config(config: VideoConfig): void;
   /** Reassembled units, in completion order. */
   unit(unit: AccessUnit): void;
+  /** PyroWave frames, complete or at their deadline, in frame_seq order. */
+  pyrowave(frame: PyroWaveFrame): void;
   /** Called once, after connect resolved, when the transport is gone. */
   end(end: TransportEnd): void;
 }
@@ -50,6 +56,8 @@ export interface MediaTransport {
   /** Resolves at the first `hello_ack`; rejects with a {@link TransportError}. */
   connect(sink: MediaSink): Promise<void>;
   requestKeyframe(reason: KeyframeReason): void;
+  /** `codec_fallback`: this client cannot go on decoding PyroWave (codec-pyrowave.md). */
+  codecFallback(reason: string): void;
   /** Says `bye` when connected; idempotent. */
   close(): void;
 }
