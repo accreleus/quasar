@@ -1,9 +1,10 @@
 //! #1131: no RTP packet the host sends is larger than `QUASAR_RTP_MTU`, measured where
-//! `srtpenc` takes it, after every header extension, RTX and RED/ULPFEC.
+//! `srtpenc` takes it, after every header extension, RTX and RED/ULPFEC, and a live change
+//! of it takes effect.
 
 use super::*;
 use crate::session::fec::FecMode;
-use crate::session::pipeline::codec_chain::payloader_mtu;
+use crate::session::pipeline::codec_chain::{payloader_mtu, set_rtp_mtu};
 
 /// The largest RTP packet, per payload type, reaching the video transport's `srtpenc`.
 fn largest_before_srtp(host: &Host) -> Arc<Mutex<std::collections::BTreeMap<u8, usize>>> {
@@ -103,10 +104,10 @@ fn no_rtp_packet_is_larger_than_the_rtp_mtu() {
                 "the munged answer's payload types no longer match the offer"
             );
         }
-        let largest = largest_before_srtp(&host);
+        let seen = largest_before_srtp(&host);
         keyframes_through(&mut host, &mut peer);
 
-        let largest = largest.lock().unwrap().clone();
+        let largest = seen.lock().unwrap().clone();
         eprintln!("MTU fec={fec} rtp_mtu={rtp_mtu} largest per PT: {largest:?}");
         let max = largest.values().copied().max().unwrap_or(0);
         assert!(
@@ -124,5 +125,18 @@ fn no_rtp_packet_is_larger_than_the_rtp_mtu() {
             max >= payloader_mtu(rtp_mtu) as usize,
             "fec={fec}: no full-size packet seen (largest {max}): {largest:?}"
         );
+
+        // #1134 shrinks the packets of a live session through the same setter.
+        if !fec {
+            set_rtp_mtu(&pay, 900);
+            seen.lock().unwrap().clear();
+            keyframes_through(&mut host, &mut peer);
+            let largest = seen.lock().unwrap().clone();
+            let max = largest.values().copied().max().unwrap_or(0);
+            assert!(
+                (payloader_mtu(900) as usize..=900).contains(&max),
+                "after a live change to 900 the largest packet is {max}: {largest:?}"
+            );
+        }
     }
 }

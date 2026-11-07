@@ -81,9 +81,9 @@ pub(super) fn add_audio_chain(
         .context("opusenc not found — is the GStreamer Opus plugin installed?")?;
     let rtp_opus_pay = gst::ElementFactory::make("rtpopuspay")
         .property("pt", 111_u32)
-        .property("mtu", super::codec_chain::payloader_mtu(cfg.rtp_mtu))
         .build()
         .context("rtpopuspay not found")?;
+    super::codec_chain::set_rtp_mtu(&rtp_opus_pay, cfg.rtp_mtu);
     let audio_rtp_caps = gst::Caps::builder("application/x-rtp")
         .field("media", "audio")
         .field("encoding-name", "OPUS")

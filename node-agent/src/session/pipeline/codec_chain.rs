@@ -34,7 +34,7 @@ pub(super) struct BitstreamChain {
 /// Build the [`BitstreamChain`] for `codec`. `profile` is the caps `profile` string
 /// (from [`super::caps::caps_profile`]) — `Some` for h264/h265, `None` for av1
 /// (no profile caps field).
-/// `rtp_mtu` is the session's `QUASAR_RTP_MTU`; the payloader gets [`payloader_mtu`] of it.
+/// `rtp_mtu` is the session's `QUASAR_RTP_MTU` ([`set_rtp_mtu`]).
 pub(super) fn build_bitstream_chain(
     codec: Codec,
     profile: Option<&str>,
@@ -72,7 +72,7 @@ pub(super) fn build_bitstream_chain(
     // pt=96 for every codec: one codec per session, send-only, so the PT-96 gates and
     // the TWCC/abs-capture-time extmap recipe carry over unchanged.
     set_prop_u32(&payloader, "pt", 96);
-    set_prop_u32(&payloader, "mtu", payloader_mtu(rtp_mtu));
+    set_rtp_mtu(&payloader, rtp_mtu);
     set_prop_i32(&payloader, "config-interval", -1);
     // H.265 must NOT aggregate: `zero-latency` wraps VPS/SPS/PPS in an H.265
     // Aggregation Packet (NAL 48) that shipping Chrome's depacketizer mishandles, so
@@ -103,6 +103,12 @@ const RTP_SEND_OVERHEAD: u32 = 48;
 /// The payloader `mtu` that keeps every packet on the wire within `rtp_mtu` (#1131).
 pub(super) fn payloader_mtu(rtp_mtu: u32) -> u32 {
     rtp_mtu - RTP_SEND_OVERHEAD
+}
+
+/// The one place a payloader's `mtu` is set, at build time and live: the payloaders read
+/// it per buffer, so a change applies from the next packet.
+pub(super) fn set_rtp_mtu(payloader: &gst::Element, rtp_mtu: u32) {
+    set_prop_u32(payloader, "mtu", payloader_mtu(rtp_mtu));
 }
 
 fn set_prop_u32(el: &gst::Element, name: &str, v: u32) {
