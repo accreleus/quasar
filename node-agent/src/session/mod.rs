@@ -1143,9 +1143,10 @@ fn fec_percentage_from(var: &str, raw: Option<&str>) -> u32 {
 /// Default `QUASAR_RTP_MTU`: libwebrtc's own packet cap, so a 1280-MTU IPv6 path (VPN,
 /// mobile tunnel) carries every packet with room for SRTP, UDP and IPv6 (#1131).
 pub const DEFAULT_RTP_MTU: u32 = 1200;
-/// `QUASAR_RTP_MTU` bounds: 576 is the IPv4 minimum datagram; 1452 fills a 1500-byte
-/// IPv6 link after the 48 bytes of UDP + IPv6.
-const RTP_MTU_RANGE: std::ops::RangeInclusive<u32> = 576..=1452;
+/// `QUASAR_RTP_MTU` bounds. 1436 fills a 1500-byte IPv6 path after SRTP's largest tag
+/// (16), UDP (8) and IPv6 (40). 576 is a floor, not a path size: below it per-packet
+/// overhead dominates the payload.
+pub(crate) const RTP_MTU_RANGE: std::ops::RangeInclusive<u32> = 576..=1436;
 
 fn env_rtp_mtu(var: &str) -> u32 {
     rtp_mtu_from(var, std::env::var(var).ok().as_deref())
@@ -1471,9 +1472,9 @@ mod tests {
             (Some(""), DEFAULT_RTP_MTU),
             (Some("1000"), 1000),
             (Some("576"), 576),
-            (Some("1452"), 1452),
+            (Some("1436"), 1436),
             (Some("575"), DEFAULT_RTP_MTU),
-            (Some("1453"), DEFAULT_RTP_MTU),
+            (Some("1437"), DEFAULT_RTP_MTU),
             (Some("1400 "), DEFAULT_RTP_MTU),
             (Some("junk"), DEFAULT_RTP_MTU),
         ] {

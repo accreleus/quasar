@@ -101,8 +101,11 @@ pub(super) fn build_bitstream_chain(
 const RTP_SEND_OVERHEAD: u32 = 48;
 
 /// The payloader `mtu` that keeps every packet on the wire within `rtp_mtu` (#1131).
+/// `rtp_mtu` is clamped to `QUASAR_RTP_MTU`'s range, so a computed value (#1134) can
+/// never underflow or exceed a 1500-byte path.
 pub(super) fn payloader_mtu(rtp_mtu: u32) -> u32 {
-    rtp_mtu - RTP_SEND_OVERHEAD
+    let range = crate::session::RTP_MTU_RANGE;
+    rtp_mtu.clamp(*range.start(), *range.end()) - RTP_SEND_OVERHEAD
 }
 
 /// The one place a payloader's `mtu` is set, at build time and live: the payloaders read
@@ -132,6 +135,14 @@ fn set_prop_from_str(el: &gst::Element, name: &str, v: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_payloader_mtu_is_clamped_to_the_knobs_range() {
+        assert_eq!(payloader_mtu(1200), 1152);
+        assert_eq!(payloader_mtu(10), 576 - RTP_SEND_OVERHEAD);
+        assert_eq!(payloader_mtu(0), 576 - RTP_SEND_OVERHEAD);
+        assert_eq!(payloader_mtu(9000), 1436 - RTP_SEND_OVERHEAD);
+    }
 
     #[test]
     fn every_video_payloader_gets_the_rtp_mtu_budget() {
