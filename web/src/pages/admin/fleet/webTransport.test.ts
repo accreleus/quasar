@@ -55,12 +55,45 @@ describe("certificateFact", () => {
   });
 });
 
+describe("certificateFact: which certificate, and bad data", () => {
+  it("picks the earliest unexpired certificate whatever the report order", () => {
+    const f = certificateFact(wt({}, [cert(12 * 24 * H, "later"), cert(5 * 24 * H, "sooner")]), NOW);
+    expect(f.headline).toBe("Expires in 5 days");
+    expect(f.fingerprint).toBe("sooner");
+  });
+
+  it("skips an expired certificate in the list", () => {
+    expect(certificateFact(wt({}, [cert(-H, "gone"), cert(9 * 24 * H, "live")]), NOW)).toMatchObject({
+      headline: "Expires in 9 days",
+      fingerprint: "live",
+      warn: false,
+    });
+  });
+
+  it("says the expiry is unknown for an unparseable date, with no Invalid Date anywhere", () => {
+    const bad = { ...cert(H), not_after: "soon" };
+    const f = certificateFact(wt({}, [bad]), NOW);
+    expect(f).toMatchObject({ headline: "Expiry unknown", warn: false });
+    expect(JSON.stringify(f)).not.toContain("Invalid");
+  });
+
+  it("does not claim a failed renewal for a host that is offline", () => {
+    const offline = wt({ usable: false, reason: "host_offline" }, [cert(3 * H)]);
+    expect(certificateFact(offline, NOW)).toMatchObject({ warn: false, headline: "Expires in 3h" });
+    expect(certificateFact(offline, NOW).sub).not.toContain("renewal");
+    expect(certificateFact(wt({ usable: false, reason: "host_offline" }, [cert(-H)]), NOW)).toMatchObject({
+      headline: "Expired",
+      warn: false,
+    });
+  });
+});
+
 describe("webTransportMode", () => {
-  it("follows the resolved endpoint, else the override", () => {
+  it("is edge only for a public-certificate override", () => {
     expect(webTransportMode(wt())).toBe("direct");
     expect(webTransportMode(wt({ override: { public_url: "https://x.example/", certificate: "public" } }))).toBe("edge");
-    expect(
-      webTransportMode(wt({ endpoint: { url: "https://x:4433/", mode: "direct", cert_hashes: [] } })),
-    ).toBe("direct");
+    expect(webTransportMode(wt({ override: { public_url: "https://x.example/", certificate: "agent" } }))).toBe("direct");
+    // The resolved endpoint does not decide it: an edge endpoint without an override is not edge.
+    expect(webTransportMode(wt({ endpoint: { url: "https://x:4433/", mode: "edge", cert_hashes: [] } }))).toBe("direct");
   });
 });

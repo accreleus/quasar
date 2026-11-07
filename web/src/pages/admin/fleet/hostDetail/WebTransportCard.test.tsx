@@ -116,4 +116,59 @@ describe("WebTransportCard", () => {
     });
     expect(screen.getByRole("alert")).toHaveTextContent("Use a full https:// address.");
   });
+
+  it("an offline host with a nearly expired certificate shows the offline note, not a renewal warning", async () => {
+    const wt = body({ usable: false, endpoint: null, reason: "host_offline" });
+    wt.reported!.certificates = [cert(3 * 3_600_000)];
+    await show(wt);
+    expect(screen.getByText(/The host is offline/)).toBeInTheDocument();
+    expect(screen.queryByText(/renewal failed/i)).toBeNull();
+    expect(screen.queryByText(/automatic renewal failed/)).toBeNull();
+  });
+
+  it("an agent-certificate override with no resolved endpoint is a direct host with its own expiry", async () => {
+    await show(
+      body({
+        override: { public_url: "https://play.example.com/wt", certificate: "agent" },
+        endpoint: null,
+        usable: false,
+        reason: "certificate_expired",
+      }),
+    );
+    expect(screen.getByRole("textbox")).toHaveValue("https://play.example.com/wt");
+    expect(screen.getByText("Direct")).toBeInTheDocument();
+    expect(screen.getByText("Expires in 9 days")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear" })).toBeEnabled();
+  });
+
+  it("a poll that arrives while a URL is being typed does not overwrite the draft", async () => {
+    vi.useFakeTimers();
+    try {
+      await show(body());
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "https://typing.example.com/" } });
+      mocked.getHostWebTransport.mockResolvedValue(
+        body({ override: { public_url: "https://other.example.com/", certificate: "public" } }),
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_500);
+      });
+      expect(mocked.getHostWebTransport.mock.calls.length).toBeGreaterThan(1);
+      expect(screen.getByRole("textbox")).toHaveValue("https://typing.example.com/");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("limits the URL field's length", async () => {
+    await show(body());
+    expect(screen.getByRole("textbox")).toHaveAttribute("maxlength", "2048");
+  });
+
+  it("shows an unparseable expiry as unknown", async () => {
+    const wt = body();
+    wt.reported!.certificates = [{ ...cert(1), not_after: "tomorrow-ish" }];
+    await show(wt);
+    expect(screen.getByText("Expiry unknown")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("Invalid");
+  });
 });

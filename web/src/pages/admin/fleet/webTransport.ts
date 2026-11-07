@@ -25,39 +25,46 @@ export interface CertificateFact {
   fingerprint: string | null;
 }
 
+/** Edge only for a public URL on a publicly trusted certificate, which is how the control
+ *  plane resolves it (`wtendpoint.Resolve`); an `agent` override is a direct endpoint. */
 export function webTransportMode(wt: HostWebTransport): WebTransportMode {
-  return wt.endpoint?.mode ?? (wt.override ? "edge" : "direct");
+  return wt.override?.certificate === "public" ? "edge" : "direct";
 }
 
-/** The agent reports every certificate it may present, current first, and two only
- *  during a rotation. A current certificate under 24 h from expiry with no successor
- *  reported means the agent's renewal did not happen. */
+const UNKNOWN_EXPIRY: CertificateFact = { headline: "Expiry unknown", sub: "", warn: false, fingerprint: null };
+
+/** The agent reports every certificate it may present, and two only during a rotation. The
+ *  current one is the earliest that has not expired. Under 24 h from expiry with no successor
+ *  reported means the agent's renewal did not happen; a host that is offline reports nothing
+ *  new, so its last report proves nothing. */
 export function certificateFact(wt: HostWebTransport, now: number): CertificateFact {
   if (wt.override?.certificate === "public") {
     return { headline: "Managed by your proxy", sub: "Quasar does not see its expiry", warn: false, fingerprint: null };
   }
-  const certs = wt.reported?.certificates ?? [];
-  const current = certs[0];
-  if (!current) {
+  const certs = (wt.reported?.certificates ?? []).map((c) => ({ ...c, end: Date.parse(c.not_after) }));
+  if (certs.length === 0) {
     return { headline: "Supplied by you", sub: "Quasar does not see its expiry", warn: false, fingerprint: null };
   }
-  const left = Date.parse(current.not_after) - now;
-  const on = new Date(current.not_after).toLocaleString("en", {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  const fingerprint = current.sha256;
-  if (left <= 0) {
-    return { headline: "Expired", sub: `${on} · automatic renewal failed`, warn: true, expired: true, fingerprint };
+  const dated = certs.filter((c) => Number.isFinite(c.end));
+  if (dated.length === 0) return { ...UNKNOWN_EXPIRY, fingerprint: certs[0].sha256 };
+  const live = dated.filter((c) => c.end > now).sort((x, y) => x.end - y.end);
+  const failed = wt.reason !== "host_offline";
+  if (live.length === 0) {
+    const last = dated.reduce((x, y) => (y.end > x.end ? y : x));
+    const on = clock(last.end);
+    return { headline: "Expired", sub: failed ? `${on} · automatic renewal failed` : on, warn: failed, expired: true, fingerprint: last.sha256 };
   }
-  const headline = `Expires ${relativeTimeFuture(current.not_after, now)}`;
-  if (left < RENEWAL_DEADLINE_MS && certs.length < 2) {
-    return { headline, sub: `${on} · automatic renewal failed`, warn: true, fingerprint };
+  const current = live[0];
+  const on = clock(current.end);
+  const headline = `Expires ${relativeTimeFuture(current.end, now)}`;
+  if (current.end - now < RENEWAL_DEADLINE_MS && live.length < 2) {
+    return { headline, sub: failed ? `${on} · automatic renewal failed` : on, warn: failed, fingerprint: current.sha256 };
   }
-  return { headline, sub: `${on} · replaced automatically before it expires`, warn: false, fingerprint };
+  return { headline, sub: `${on} · replaced automatically before it expires`, warn: false, fingerprint: current.sha256 };
+}
+
+function clock(ms: number): string {
+  return new Date(ms).toLocaleString("en", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 /** The reasons `usable: false` carries (an open string). */

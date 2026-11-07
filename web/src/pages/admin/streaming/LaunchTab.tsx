@@ -26,6 +26,8 @@ import { moveRung, RungEditor } from "./RungEditor";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { SettingRow } from "../settings/SettingRow";
 
+const KNOWN_TRANSPORTS: string[] = ["webrtc", "webtransport", "webtransport_opt_in"];
+
 const DEFAULT_POLICY: ProfilePolicyResponse = { global_default_profile_id: null, user_overrides_allowed: true };
 
 // ── Defaults card (mock's "Default profile" + "Let users choose a profile") ─
@@ -179,6 +181,7 @@ function LaunchProfileCard({
   const { addToast } = useToast();
   const [busy, setBusy] = useState(false);
 
+  const transport: string = profile.transport ?? "webrtc";
   const rungs = profile.rungs.map((r) => r.stream_profile);
   const availableToAdd = streamProfiles.filter((sp) => !rungs.some((r) => r.id === sp.id));
   const appCount = profile.used_by?.apps.length ?? 0;
@@ -260,16 +263,18 @@ function LaunchProfileCard({
           <select
             className="select"
             aria-label={`Transport for ${profile.display_name}`}
-            value={profile.transport ?? "webrtc"}
-            disabled={busy}
+            value={transport}
+            // A value this UI does not know (a newer server) is shown as itself and left alone.
+            disabled={busy || !KNOWN_TRANSPORTS.includes(transport)}
             onChange={(e) => void persist(rungs.map((r) => r.id), e.target.value as LaunchProfileTransport)}
           >
             <option value="webrtc">WebRTC</option>
             <option value="webtransport">WebTransport (experimental)</option>
             {/* Set through the API for the developer URL switch; kept visible so it is never silently overwritten. */}
-            {profile.transport === "webtransport_opt_in" && (
+            {transport === "webtransport_opt_in" && (
               <option value="webtransport_opt_in">WebTransport on request (developer)</option>
             )}
+            {!KNOWN_TRANSPORTS.includes(transport) && <option value={transport}>{transport}</option>}
           </select>
         </SettingRow>
       </div>

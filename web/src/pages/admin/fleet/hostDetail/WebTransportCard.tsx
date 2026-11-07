@@ -173,6 +173,7 @@ export function WebTransportCard({ hostId, now }: { hostId: string; now: number 
               className="input mono"
               value={value}
               placeholder="https://play.example.com/webtransport/host"
+              maxLength={2048}
               disabled={saving}
               aria-invalid={error ? true : undefined}
               onChange={(e) => {
@@ -220,7 +221,7 @@ function Fact({
       <td className="fact-key">{label}</td>
       <td className="right">
         <div className="stack">
-          <span className={["primary", mono ? "mono" : "", warn ? "host-webtransport-warn" : ""].filter(Boolean).join(" ")}>
+          <span className={["primary", mono ? "mono" : "", warn ? "tone-warning" : ""].filter(Boolean).join(" ")}>
             {value}
           </span>
           {sub && <span className="sub">{sub}</span>}

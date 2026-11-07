@@ -257,8 +257,9 @@
   align-items: flex-end;
 }
 
-.host-detail-page .host-webtransport-warn {
-  color: var(--warning-text);
+/* A server message can be one unbroken URL. */
+.host-detail-page .host-webtransport .apps-field-err {
+  overflow-wrap: anywhere;
 }
 
 .host-detail-page .host-webtransport-url {
