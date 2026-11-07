@@ -311,17 +311,36 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 		return conn.WriteMessage(websocket.TextMessage, frame)
 	}
 
+	// #415: a later attach owns this session's signaling — this connection is
+	// deaf to agent frames and must tear down now.
+	// #526: close with a code the client can act on; 1000 looked like an
+	// ordinary hang-up, so the displaced tab re-minted and displaced the
+	// displacer, ping-pong forever. Last attach wins and the loser is told it
+	// lost. A client's own reconnect also lands here, harmlessly: its old
+	// transport is already torn down, so only a still-live socket — a
+	// different tab — observes this frame.
+	takenOver := func() {
+		h.log.Info("signaling WS taken over by a later attach",
+			"token", "signal-taken-over", "session_id", sess.ID)
+		wsClose(wsCloseTakenOver, "session attached from another client", "taken-over")
+	}
+
 	// drainAgentFrames writes every frame the bus has already handed us and
-	// returns once the queue is momentarily empty.
-	drainAgentFrames := func() error {
+	// returns once the queue is momentarily empty. It stops right after a
+	// taken_over error, as the pump does, and reports it: the caller owns the
+	// close, because the pump is not the only place such a frame can be written.
+	drainAgentFrames := func() (bool, error) {
 		for {
 			select {
 			case frame := <-fromAgent:
 				if err := writeToBrowser(frame); err != nil {
-					return err
+					return false, err
+				}
+				if isTakenOverError(frame) {
+					return true, nil
 				}
 			default:
-				return nil
+				return false, nil
 			}
 		}
 	}
@@ -331,8 +350,15 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 	// the browser's first frame arrived?" a fact rather than Go's uniform
 	// select choice between two ready cases — precisely the coin-flip #505 is
 	// about.
-	if err := drainAgentFrames(); err != nil {
+	taken, err := drainAgentFrames()
+	if err != nil {
 		closedNoFrame("buffered-write-failed", err)
+		return
+	}
+	// A takeover that lands while the flush is still draining never reaches the
+	// pump, which would otherwise leave this socket open.
+	if taken {
+		takenOver()
 		return
 	}
 
@@ -371,20 +397,6 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 			}
 		}
 	}()
-
-	// #415: a later attach owns this session's signaling — this connection is
-	// deaf to agent frames and must tear down now.
-	// #526: close with a code the client can act on; 1000 looked like an
-	// ordinary hang-up, so the displaced tab re-minted and displaced the
-	// displacer, ping-pong forever. Last attach wins and the loser is told it
-	// lost. A client's own reconnect also lands here, harmlessly: its old
-	// transport is already torn down, so only a still-live socket — a
-	// different tab — observes this frame.
-	takenOver := func() {
-		h.log.Info("signaling WS taken over by a later attach",
-			"token", "signal-taken-over", "session_id", sess.ID)
-		wsClose(wsCloseTakenOver, "session attached from another client", "taken-over")
-	}
 
 	// --- 4. Pump: agent→browser and browser→agent ---
 	for {
@@ -456,7 +468,7 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 			// will never deliver another agent frame, so a socket that stayed
 			// open would be deaf until its own transport died. Drain first —
 			// the agent's `bye` is typically the last frame in flight.
-			if err := drainAgentFrames(); err != nil {
+			if _, err := drainAgentFrames(); err != nil {
 				closedNoFrame("browser-write-failed", err)
 				return
 			}
