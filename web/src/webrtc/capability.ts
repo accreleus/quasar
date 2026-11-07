@@ -95,11 +95,16 @@ export function deviceProbeIsFresh(userId: string, h264: boolean, now: number = 
   }
 }
 
-export function markDeviceProbePosted(userId: string, h264: boolean, now: number = Date.now()): void {
+/** An incomplete probe (a WebCodecs or WebGPU step timed out) is fresh for this long only. */
+export const INCOMPLETE_PROBE_RETRY_MS = 5 * 60 * 1000;
+
+/** `retryAfterMs` shortens the stamp's life: the record is posted, but read as stale after that. */
+export function markDeviceProbePosted(userId: string, h264: boolean, now: number = Date.now(), retryAfterMs?: number): void {
+  const at = retryAfterMs === undefined ? now : now - DEVICE_POST_TTL_MS + retryAfterMs;
   try {
     localStorage.setItem(
       DEVICE_POST_STORAGE_KEY,
-      JSON.stringify({ user: userId, at: now, h264, region: regionStamp() }),
+      JSON.stringify({ user: userId, at, h264, region: regionStamp() }),
     );
   } catch {
     /* Storage full or blocked: the only cost is posting again next load. */

@@ -6,6 +6,7 @@ import * as authApi from "../api/auth";
 import {
   deviceProbeIsFresh,
   getOrCreateDeviceKey,
+  INCOMPLETE_PROBE_RETRY_MS,
   markDeviceProbePosted,
   probeCapabilities,
   probeH264Decodable,
@@ -37,7 +38,10 @@ export function ensureDeviceProbe(token: string, userId: string): Promise<void> 
       if (deviceProbeIsFresh(userId, await probeH264Decodable())) return;
       const caps = await probeCapabilities();
       await authApi.postDevice(token, getOrCreateDeviceKey(), caps);
-      markDeviceProbePosted(userId, caps.codecs.h264);
+      // A step that timed out leaves its key out, which the planner reads as "cannot":
+      // post what there is, but ask again soon rather than pin WebRTC for a day.
+      const incomplete = caps.webcodecs === undefined || caps.webgpu === undefined;
+      markDeviceProbePosted(userId, caps.codecs.h264, Date.now(), incomplete ? INCOMPLETE_PROBE_RETRY_MS : undefined);
     })(),
   ).finally(() => {
     inFlight = null;

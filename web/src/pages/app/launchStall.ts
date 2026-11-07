@@ -166,7 +166,7 @@ const signalingVerdict: StallVerdict = {
 const webTransportVerdict: StallVerdict = {
   kind: "transport",
   title: "WebTransport has not connected",
-  message: "The host is ready, but this browser has not opened its WebTransport connection yet. If it cannot connect, the browser carries on over WebRTC by itself. If this stays, UDP to the host may be blocked.",
+  message: "The host is ready, but this browser has not finished opening its WebTransport connection. If it cannot connect, the browser carries on over WebRTC by itself.",
 };
 
 const transportVerdict: StallVerdict = { kind: "transport", ...TRANSPORT_STALL_COPY };
