@@ -182,9 +182,11 @@ describe("FrameAssembler", () => {
       clock.t += 20;
     }
     // The first losses after the rise go late while the estimate doubles; then none do.
+    const settled = late.indexOf(false);
     expect(late[0]).toBe(true);
-    expect(late.indexOf(false)).toBeLessThanOrEqual(7);
-    expect(late.slice(late.indexOf(false))).not.toContain(true);
+    expect(settled).toBeGreaterThan(0);
+    expect(settled).toBeLessThanOrEqual(7);
+    expect(late.slice(settled)).not.toContain(true);
   });
 
   it("does not double the estimate when, in a burst, the first resend is lost and the repeat's arrives", () => {
