@@ -564,7 +564,16 @@ func orNil(v string) any {
 // stopParkedWhere moves the matching live parked rows to `stopping` with
 // reason, in one statement.
 func (s *Store) stopParkedWhere(ctx context.Context, reason string, f parkedFilter) ([]parkedStop, error) {
-	rows, err := s.pool.Query(ctx, `UPDATE sessions SET state = 'stopping', state_detail = 'stop requested',
+	return stopParkedIn(ctx, s.pool, reason, f)
+}
+
+// querier is the Query half of a pool or a transaction.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func stopParkedIn(ctx context.Context, q querier, reason string, f parkedFilter) ([]parkedStop, error) {
+	rows, err := q.Query(ctx, `UPDATE sessions SET state = 'stopping', state_detail = 'stop requested',
 		    stop_reason = COALESCE(stop_reason, $1), launch_progress = NULL
 		WHERE kind = 'parked' AND state IN ('pending','assigned','starting','running')
 		  AND ($2::uuid IS NULL OR id = $2::uuid)
@@ -630,6 +639,17 @@ func (c *Coordinator) ExpireParked(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	return c.stopParked(ctx, StopReasonParkedExpired, parkedFilter{Expired: w.Enabled})
+}
+
+// SupersedeParked stops every live parked session inside tx and returns the dispatch to run after
+// the commit; no warm-start suppression, so the next heartbeat re-parks on the new mapping.
+// semantics: control-api.md §Compatibility tools, "Hot Loading".
+func (c *Coordinator) SupersedeParked(ctx context.Context, tx pgx.Tx) (func(), error) {
+	stops, err := stopParkedIn(ctx, tx, StopReasonParkedSuperseded, parkedFilter{})
+	if err != nil {
+		return nil, err
+	}
+	return func() { c.sendParkedStops(stops, StopReasonParkedSuperseded) }, nil
 }
 
 // StopParkedOnHost stops a host's parked sessions as a drain or an apply
