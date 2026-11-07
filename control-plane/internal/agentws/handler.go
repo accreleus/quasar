@@ -1068,6 +1068,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	}
 	reads := make(chan readResult, 1)
 	reading := false
+	owners := newSignalingOwners(h.store, h.log, hostID)
 	for {
 		// A lost initial map or acknowledgement must not leave an apparently
 		// connected host gated forever. Renegotiate after a bounded wait; the
@@ -1550,11 +1551,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				h.log.Warn("decode signaling envelope failed", "err", err)
 				continue
 			}
-			if err := h.relay.Deliver(env.SessionID, env.Msg); err != nil {
-				h.log.Error("reliable signaling relay failed", "host_id", hostID, "session_id", env.SessionID, "err", err)
-				msgType, _ := peekType(env.Msg)
-				h.events.AgentSignalingFailure(bg, hostID, env.SessionID, msgType == "bye", err.Error())
-			}
+			h.relayAgentSignaling(bg, owners, hostID, env)
 		default:
 			h.log.Warn("unknown agent message", "type", msgType, "host_id", hostID)
 		}
@@ -2445,4 +2442,17 @@ func (h *Handler) resolveAuth(ctx context.Context, reg RegisterMsg) (registerRes
 			tryReconnect.NodeSecret)
 	}
 	return registerResult{}, errors.New("auth must contain enrollment_token or node_secret")
+}
+
+// relayAgentSignaling relays an agent's signaling frame to the session's browser, only for a
+// session placed on hostID (#1116).
+func (h *Handler) relayAgentSignaling(ctx context.Context, owners *signalingOwners, hostID string, env SignalingEnvelope) {
+	if !owners.allows(ctx, env.SessionID) {
+		return
+	}
+	if err := h.relay.Deliver(env.SessionID, env.Msg); err != nil {
+		h.log.Error("reliable signaling relay failed", "host_id", hostID, "session_id", env.SessionID, "err", err)
+		msgType, _ := peekType(env.Msg)
+		h.events.AgentSignalingFailure(ctx, hostID, env.SessionID, msgType == "bye", err.Error())
+	}
 }
