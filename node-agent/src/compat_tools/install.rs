@@ -581,6 +581,15 @@ impl ToolStore {
     #[cfg(not(test))]
     fn gate(&self) {}
 
+    pub fn rehold(&self, session_id: &str, names: Vec<String>, parked: bool) {
+        let mut held = lock(&self.mounted);
+        if names.is_empty() {
+            held.remove(session_id);
+        } else {
+            held.insert(session_id.to_owned(), (names, parked));
+        }
+    }
+
     pub fn release(&self, session_id: &str) {
         lock(&self.mounted).remove(session_id);
     }

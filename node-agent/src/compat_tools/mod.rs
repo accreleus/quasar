@@ -143,6 +143,23 @@ pub fn all_installed(names: &[String]) -> bool {
     names.is_empty() || store().is_some_and(|s| s.all_installed(names))
 }
 
+/// Sets `session_id`'s hold back to `names` (the assign's mounts), dropping it when there are none.
+pub fn rehold(session_id: &str, names: Vec<String>, parked: bool) {
+    if let Some(s) = store() {
+        s.rehold(session_id, names, parked);
+    }
+}
+
+/// A tools store for tests that need the process's one store (agent-level tests); the first
+/// call sets it.
+#[cfg(test)]
+pub fn test_store(make: impl FnOnce() -> ToolStore) -> &'static Arc<ToolStore> {
+    STORE
+        .get_or_init(|| Some(Arc::new(make())))
+        .as_ref()
+        .expect("the test store")
+}
+
 /// Drops the mount holds of sessions that are neither pending nor running any more.
 pub fn retain_holds(live: &dyn Fn(&str) -> bool) {
     if let Some(s) = store() {

@@ -5241,8 +5241,20 @@ impl SessionManager {
                 .then_some("its runner is gone"),
         };
         if let Some(why) = refused {
-            // A claim that went through before a gone runner holds nothing any more.
-            crate::compat_tools::release(session_id);
+            // A session's hold is made once, at assign, and released only when it ends: a
+            // decline leaves it for the fresh build. Only a claim that moved the runtime's
+            // tools onto this session before its runner turned out gone is undone, back to
+            // exactly the hold the assign gave it.
+            if declined.is_none() {
+                crate::compat_tools::rehold(
+                    session_id,
+                    cfg.container
+                        .as_ref()
+                        .map(|c| c.compat_tools.clone())
+                        .unwrap_or_default(),
+                    cfg.kind == Some(SessionKind::Parked),
+                );
+            }
             info!(
                 token = "runtime-adopt-declined",
                 "session {session_id}: not adopting the runtime of {from} ({why}); it is torn \
@@ -11855,6 +11867,82 @@ mod tests {
             warm.adopted.recv_timeout(WAIT).unwrap().1.kind,
             Some(SessionKind::Parked)
         );
+    }
+
+    /// A session's tool hold is made at assign and survives a decline of any kind into the fresh
+    /// build: with a real tools store, a removal of that tool defers `in_use`.
+    #[test]
+    fn a_declined_adoption_keeps_the_sessions_own_tool_hold() {
+        use crate::jobs::JobRunner as _;
+        const TOOL: &str = "GE-Proton9-99";
+        let sha = "c".repeat(128);
+        let store = crate::compat_tools::test_store(|| {
+            let root = tempfile::tempdir().unwrap().keep();
+            std::fs::create_dir_all(root.join("tools").join(TOOL)).unwrap();
+            let record = serde_json::json!({"tools": [{"name": TOOL, "tag": "GE-Proton9-99",
+                "sha512": "c".repeat(128), "bytes": 1, "state": "installed"}]});
+            std::fs::write(root.join("record.json"), record.to_string()).unwrap();
+            crate::compat_tools::install::ToolStore::open(&root, &[], false).unwrap()
+        });
+        struct NoSource;
+        impl crate::compat_tools::fetch::Source for NoSource {
+            fn get(
+                &self,
+                _: &str,
+            ) -> Result<crate::compat_tools::fetch::Hop, crate::compat_tools::fetch::HopError>
+            {
+                Err(crate::compat_tools::fetch::HopError::Other(
+                    "no network in tests".into(),
+                ))
+            }
+        }
+        let remove = || {
+            crate::compat_tools::install::ConvergeRunner::new(
+                store.clone(),
+                Arc::new(NoSource),
+                Arc::new(|| {}),
+            )
+            .run(
+                &serde_json::json!({"action": "remove", "tool_id": null, "name": TOOL, "sha512": sha}),
+                &crate::jobs::AbortFlag::new(),
+            )
+        };
+
+        let (mut mgr, warm) = warm_manager();
+        assert!(acked(start(
+            &mut mgr,
+            &warm,
+            "k1",
+            steam_cfg(SessionKind::Parked, "-silent", (1920, 1080)),
+            None
+        )));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("k1", SessionEvent::Running);
+        // The play claim's assign holds its tool, as `session_assign` does.
+        let mut env = BTreeMap::new();
+        let mounted = crate::compat_tools::apply_assign(
+            &mut env,
+            Some(&serde_json::json!({"mount": [TOOL], "entries": []})),
+            "p1",
+            false,
+        );
+        assert_eq!(mounted, vec![TOOL.to_string()]);
+        let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        cfg.container.as_mut().unwrap().compat_tools = mounted;
+        // Declined (its launch helper never connected), so built fresh.
+        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+        assert_eq!(
+            warm.started.recv_timeout(WAIT).unwrap().0,
+            "p1",
+            "built fresh"
+        );
+        assert_eq!(
+            remove(),
+            crate::jobs::JobOutcome::Deferred("in_use".into()),
+            "the fresh build mounts its tool held"
+        );
+        crate::compat_tools::release("p1");
+        assert!(matches!(remove(), crate::jobs::JobOutcome::Succeeded(_)));
     }
 
     /// A runtime whose container mounts a compatibility tool that is no longer Installed (gone,
