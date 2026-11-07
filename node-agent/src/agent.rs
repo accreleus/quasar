@@ -3177,6 +3177,8 @@ impl HostSessions {
 type HomeSourceRetire = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 struct SessionManager {
+    /// This manager's owner id on compatibility-tool mount holds (`compat_tools`).
+    hold_owner: u64,
     /// Assigned but not yet started. Aged out by the heartbeat sweep — see
     /// [`PENDING_ASSIGNMENT_TTL`].
     pending: HashMap<String, PendingAssignment>,
@@ -3499,6 +3501,7 @@ impl SessionManager {
         seed_nvidia_lib32(&mut runtime_settings, &nvidia_lib32_probed);
         let deployment_baseline = runtime_settings.clone();
         SessionManager {
+            hold_owner: crate::compat_tools::new_hold_owner(),
             pending: HashMap::new(),
             running: HashMap::new(),
             labels: HashMap::new(),
@@ -3546,7 +3549,7 @@ impl SessionManager {
     /// `running`, so the two views can never disagree about host busyness.
     fn note_session_count(&self) {
         crate::restart::note_sessions(self.pending.len() + self.running.len());
-        crate::compat_tools::retain_holds(&|sid| {
+        crate::compat_tools::retain_holds(self.hold_owner, &|sid| {
             self.pending.contains_key(sid) || self.running.contains_key(sid)
         });
         if let Some(a) = &self.warmup_activity {
@@ -3826,7 +3829,7 @@ impl SessionManager {
     ) {
         let dropped = self.pending.len();
         self.pending.clear();
-        crate::compat_tools::retain_holds(&|sid| self.running.contains_key(sid));
+        crate::compat_tools::retain_holds(self.hold_owner, &|sid| self.running.contains_key(sid));
         self.gpu_inventory = gpu_inventory;
         self.vram_targets = vram_targets;
         // The cache indexes by position over the inventory, so it must be
@@ -3959,6 +3962,7 @@ impl SessionManager {
                     compat_tools.as_ref(),
                     &session_id,
                     kind == Some(SessionKind::Parked),
+                    self.hold_owner,
                 );
                 let container = match app_to_container(app, &self.mount_policy()) {
                     Ok(c) => c.map(|mut c| {
@@ -5218,6 +5222,7 @@ impl SessionManager {
             session_id,
             &h.compat_tools,
             cfg.kind == Some(SessionKind::Parked),
+            self.hold_owner,
         ) {
             // Last, so nothing after it can decline: the claim moved the hold to `session_id`. A
             // removal may delete a tree under a parked runtime's bind mount; never hand that
@@ -5253,6 +5258,7 @@ impl SessionManager {
                         .map(|c| c.compat_tools.clone())
                         .unwrap_or_default(),
                     cfg.kind == Some(SessionKind::Parked),
+                    self.hold_owner,
                 );
             }
             info!(
@@ -11908,32 +11914,34 @@ mod tests {
             )
         };
 
+        // Ids no other test uses: holds live in the process's one store, released by session id.
         let (mut mgr, warm) = warm_manager();
         assert!(acked(start(
             &mut mgr,
             &warm,
-            "k1",
+            "k1071",
             steam_cfg(SessionKind::Parked, "-silent", (1920, 1080)),
             None
         )));
         warm.started.recv_timeout(WAIT).unwrap();
-        mgr.on_event("k1", SessionEvent::Running);
+        mgr.on_event("k1071", SessionEvent::Running);
         // The play claim's assign holds its tool, as `session_assign` does.
         let mut env = BTreeMap::new();
         let mounted = crate::compat_tools::apply_assign(
             &mut env,
             Some(&serde_json::json!({"mount": [TOOL], "entries": []})),
-            "p1",
+            "p1071",
             false,
+            mgr.hold_owner,
         );
         assert_eq!(mounted, vec![TOOL.to_string()]);
         let mut cfg = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
         cfg.container.as_mut().unwrap().compat_tools = mounted;
         // Declined (its launch helper never connected), so built fresh.
-        assert!(acked(start(&mut mgr, &warm, "p1", cfg, Some("k1"))));
+        assert!(acked(start(&mut mgr, &warm, "p1071", cfg, Some("k1071"))));
         assert_eq!(
             warm.started.recv_timeout(WAIT).unwrap().0,
-            "p1",
+            "p1071",
             "built fresh"
         );
         assert_eq!(
@@ -11941,7 +11949,7 @@ mod tests {
             crate::jobs::JobOutcome::Deferred("in_use".into()),
             "the fresh build mounts its tool held"
         );
-        crate::compat_tools::release("p1");
+        crate::compat_tools::release("p1071");
         assert!(matches!(remove(), crate::jobs::JobOutcome::Succeeded(_)));
     }
 

@@ -144,10 +144,16 @@ pub fn all_installed(names: &[String]) -> bool {
 }
 
 /// Sets `session_id`'s hold back to `names` (the assign's mounts), dropping it when there are none.
-pub fn rehold(session_id: &str, names: Vec<String>, parked: bool) {
+pub fn rehold(session_id: &str, names: Vec<String>, parked: bool, owner: u64) {
     if let Some(s) = store() {
-        s.rehold(session_id, names, parked);
+        s.rehold(session_id, names, parked, owner);
     }
+}
+
+/// A fresh owner id for one session manager's holds.
+pub fn new_hold_owner() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A tools store for tests that need the process's one store (agent-level tests); the first
@@ -161,17 +167,17 @@ pub fn test_store(make: impl FnOnce() -> ToolStore) -> &'static Arc<ToolStore> {
 }
 
 /// Drops the mount holds of sessions that are neither pending nor running any more.
-pub fn retain_holds(live: &dyn Fn(&str) -> bool) {
+pub fn retain_holds(owner: u64, live: &dyn Fn(&str) -> bool) {
     if let Some(s) = store() {
-        s.retain(live);
+        s.retain(owner, live);
     }
 }
 
 /// For `SessionManager::adopt_runtime` only, the one place a runtime is reused: true when every
 /// tool in `tools` is still Installed and present, in which case the hold moves from `from` to
 /// `to` (no longer parked unless `to` is) in the same critical section a removal takes.
-pub fn claim_for_adopt(from: &str, to: &str, tools: &[String], parked: bool) -> bool {
-    tools.is_empty() || store().is_some_and(|s| s.claim_for_adopt(from, to, tools, parked))
+pub fn claim_for_adopt(from: &str, to: &str, tools: &[String], parked: bool, owner: u64) -> bool {
+    tools.is_empty() || store().is_some_and(|s| s.claim_for_adopt(from, to, tools, parked, owner))
 }
 
 pub fn release(session_id: &str) {
@@ -278,12 +284,13 @@ pub fn apply_assign(
     sent: Option<&Value>,
     session_id: &str,
     parked: bool,
+    owner: u64,
 ) -> Vec<String> {
     match sent.and_then(parse) {
         Some(tools) => {
             let wanted: Vec<String> = tools.mount.iter().take(MAX_MOUNTS).cloned().collect();
             let mounted = store()
-                .map(|s| s.mountable(session_id, &wanted, parked))
+                .map(|s| s.mountable(session_id, &wanted, parked, owner))
                 .unwrap_or_default();
             apply(env, &tools, &mounted);
             mounted
@@ -408,7 +415,7 @@ mod tests {
     #[test]
     fn nothing_sent_strips_what_the_apps_own_env_carried() {
         let mut env = seeded();
-        apply_assign(&mut env, None, "s", false);
+        apply_assign(&mut env, None, "s", false, 0);
         assert_eq!(env, BTreeMap::from([("KEEP".to_string(), "1".to_string())]));
     }
 
@@ -416,7 +423,7 @@ mod tests {
     fn a_value_of_the_wrong_shape_is_dropped_and_strips_too() {
         for bad in [json!({"forced": "yes"}), json!("x"), json!(7), json!([1])] {
             let mut env = seeded();
-            apply_assign(&mut env, Some(&bad), "s", false);
+            apply_assign(&mut env, Some(&bad), "s", false, 0);
             assert!(!env.contains_key(ENV_ENTRIES), "{bad}");
             assert_eq!(env["KEEP"], "1");
         }

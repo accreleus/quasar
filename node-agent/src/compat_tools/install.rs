@@ -55,10 +55,11 @@ struct Record {
 pub struct ToolStore {
     root: PathBuf,
     record: Mutex<Record>,
-    /// session id -> (mounted names, parked). A parked session never holds a removal back. Lock
+    /// session id -> (mounted names, parked, owner). A parked session never holds a removal back;
+    /// `owner` is the session manager that made the hold, whose sweep alone may drop it. Lock
     /// order: `mounted`, then `record`; removal marks a tool Removing under `mounted`, so a mount
     /// decision and a removal never interleave.
-    mounted: Mutex<HashMap<String, (Vec<String>, bool)>>,
+    mounted: Mutex<HashMap<String, Hold>>,
     #[cfg(test)]
     trace: Mutex<Vec<&'static str>>,
     #[cfg(test)]
@@ -67,6 +68,9 @@ pub struct ToolStore {
     #[cfg(test)]
     adopt_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
+
+/// A session's mount hold: the names, whether it is parked, and the manager that made it.
+type Hold = (Vec<String>, bool, u64);
 
 /// How deep a tree walk goes. Extraction allows 32 components (`extract::MAX_COMPONENTS`), so a
 /// tree this agent wrote never reaches it; a deeper one is refused, never recursed into.
@@ -528,7 +532,13 @@ impl ToolStore {
     /// Removing is not) and present (agent-api.md §session_assign, "The mounts"). Others are
     /// skipped and logged. The session holds what it got from here on, decided under the lock a
     /// removal takes, so a removal can never start between this answer and the mount.
-    pub fn mountable(&self, session_id: &str, wanted: &[String], parked: bool) -> Vec<String> {
+    pub fn mountable(
+        &self,
+        session_id: &str,
+        wanted: &[String],
+        parked: bool,
+        owner: u64,
+    ) -> Vec<String> {
         let mut held = lock(&self.mounted);
         let installed = self.installed();
         let tools = self.tools_dir();
@@ -548,7 +558,7 @@ impl ToolStore {
             }
         }
         if !out.is_empty() {
-            held.insert(session_id.to_owned(), (out.clone(), parked));
+            held.insert(session_id.to_owned(), (out.clone(), parked, owner));
         }
         out
     }
@@ -558,14 +568,21 @@ impl ToolStore {
     /// only if `to` is) before the lock is released. A removal therefore either marked a tool
     /// Removing first, and the claim fails, or sees `to`'s hold and defers `in_use`. The only
     /// caller is `SessionManager::adopt_runtime`, the single entry point for reusing a runtime.
-    pub fn claim_for_adopt(&self, from: &str, to: &str, tools: &[String], parked: bool) -> bool {
+    pub fn claim_for_adopt(
+        &self,
+        from: &str,
+        to: &str,
+        tools: &[String],
+        parked: bool,
+        owner: u64,
+    ) -> bool {
         let mut held = lock(&self.mounted);
         if !self.all_installed(tools) {
             return false;
         }
         self.gate();
         held.remove(from);
-        held.insert(to.to_owned(), (tools.to_vec(), parked));
+        held.insert(to.to_owned(), (tools.to_vec(), parked, owner));
         true
     }
 
@@ -581,12 +598,12 @@ impl ToolStore {
     #[cfg(not(test))]
     fn gate(&self) {}
 
-    pub fn rehold(&self, session_id: &str, names: Vec<String>, parked: bool) {
+    pub fn rehold(&self, session_id: &str, names: Vec<String>, parked: bool, owner: u64) {
         let mut held = lock(&self.mounted);
         if names.is_empty() {
             held.remove(session_id);
         } else {
-            held.insert(session_id.to_owned(), (names, parked));
+            held.insert(session_id.to_owned(), (names, parked, owner));
         }
     }
 
@@ -594,14 +611,15 @@ impl ToolStore {
         lock(&self.mounted).remove(session_id);
     }
 
-    /// Drops the hold of every session `live` no longer names (an assign refused or expired).
-    pub fn retain(&self, live: &dyn Fn(&str) -> bool) {
-        lock(&self.mounted).retain(|sid, _| live(sid));
+    /// Drops every hold `owner` made for a session `live` no longer names (an assign refused or
+    /// expired); another manager's holds are not its to judge.
+    pub fn retain(&self, owner: u64, live: &dyn Fn(&str) -> bool) {
+        lock(&self.mounted).retain(|sid, h| h.2 != owner || live(sid));
     }
 
-    fn in_use(held: &HashMap<String, (Vec<String>, bool)>, name: &str) -> bool {
+    fn in_use(held: &HashMap<String, Hold>, name: &str) -> bool {
         held.values()
-            .any(|(names, parked)| !parked && names.iter().any(|n| n == name))
+            .any(|(names, parked, _)| !parked && names.iter().any(|n| n == name))
     }
 
     fn set_entry(&self, entry: Option<RecordEntry>, drop_name: &str) -> io::Result<()> {
@@ -1277,7 +1295,7 @@ mod tests {
         let again = rig.reopen();
         assert_eq!(again.installed(), rig.store.installed());
         assert_eq!(
-            again.mountable("s", &[NAME.to_string(), "GE-Proton9-1".into()], false),
+            again.mountable("s", &[NAME.to_string(), "GE-Proton9-1".into()], false, 0),
             vec![NAME.to_string()]
         );
     }
@@ -1651,14 +1669,16 @@ mod tests {
         let body = good_tool();
         rig.run(body.clone(), install(&body));
         let want = [NAME.to_string()];
-        assert_eq!(rig.store.mountable("parked", &want, true), want.to_vec());
-        assert_eq!(rig.store.mountable("play", &want, false), want.to_vec());
+        assert_eq!(rig.store.mountable("parked", &want, true, 0), want.to_vec());
+        assert_eq!(rig.store.mountable("play", &want, false, 0), want.to_vec());
         assert_eq!(
             rig.run(vec![], remove()).0,
             JobOutcome::Deferred("in_use".into())
         );
         rig.store.release("play");
-        assert!(rig.store.claim_for_adopt("parked", "adopted", &want, false));
+        assert!(rig
+            .store
+            .claim_for_adopt("parked", "adopted", &want, false, 0));
         assert_eq!(
             rig.run(vec![], remove()).0,
             JobOutcome::Deferred("in_use".into()),
@@ -1838,18 +1858,18 @@ mod tests {
         let body = good_tool();
         rig.run(body.clone(), install(&body));
         let want = [NAME.to_string()];
-        assert_eq!(rig.store.mountable("s1", &want, false), want.to_vec());
+        assert_eq!(rig.store.mountable("s1", &want, false, 0), want.to_vec());
         assert_eq!(
             rig.run(vec![], remove()).0,
             JobOutcome::Deferred("in_use".into())
         );
         // The assign was refused: the agent's session bookkeeping drops its hold.
-        rig.store.retain(&|sid| sid != "s1");
+        rig.store.retain(0, &|sid| sid != "s1");
         let mut rec = lock(&rig.store.record).clone();
         rec.tools[0].state = EntryState::Removing;
         *lock(&rig.store.record) = rec;
         assert!(
-            rig.store.mountable("s2", &want, false).is_empty(),
+            rig.store.mountable("s2", &want, false, 0).is_empty(),
             "Removing is not mountable"
         );
         assert!(
@@ -2111,13 +2131,13 @@ mod tests {
         let body = good_tool();
         rig.run(body.clone(), install(&body));
         let want = vec![NAME.to_string()];
-        assert_eq!(rig.store.mountable("parked", &want, true), want);
+        assert_eq!(rig.store.mountable("parked", &want, true, 0), want);
         let gate = Arc::new(std::sync::Barrier::new(2));
         *lock(&rig.store.adopt_gate) = Some(gate.clone());
         let store = rig.store.clone();
         let claim = std::thread::spawn({
             let want = want.clone();
-            move || store.claim_for_adopt("parked", "play", &want, false)
+            move || store.claim_for_adopt("parked", "play", &want, false, 0)
         });
         gate.wait(); // the claim has checked and not yet moved the hold
         let (runner, _) = rig.runner(Fake {
