@@ -1612,9 +1612,6 @@ impl SessionTransports {
     /// replaces that PC's transport instead, and the new transport offers: `Ok(Some(pc))`.
     /// `Err` only when the video transport could not be replaced, which leaves the
     /// session nothing to stream on.
-    /// Amendment 59 (a)–(b) on an adopted runtime: the video PC gets a new transport
-    /// starting from `to`, recorded as a replacement so a late answer from the old viewer
-    /// is told apart. On `Err`, the step that failed.
     /// Amendment 59: make `to` the launch point of the live video transport, without
     /// replacing it (a rebuild's transports are new already).
     pub(crate) fn move_launch_point(
@@ -1645,6 +1642,9 @@ impl SessionTransports {
         self.unanswered = [true, self.audio_webrtc.is_some()];
     }
 
+    /// Amendment 59 (a)–(b) on an adopted runtime: the video PC gets a new transport
+    /// starting from `to`, recorded as a replacement so a late answer from the old viewer
+    /// is told apart. On `Err`, the step that failed.
     pub(crate) fn restream(
         &mut self,
         to: &super::StreamParams,
@@ -2543,6 +2543,22 @@ fn rebuild_encode(
     Ok((next, built, bus))
 }
 
+/// Whether a rebuilt encoder's bus error is the hardware's answer to this codec, which the
+/// agent remembers (amendment 59). Only a caps refusal, a format the encoder will not take
+/// or a missing element; out of memory, a session limit, a source or interpipe error and a
+/// lost device are load or state, never remembered.
+fn rebuild_error_is_deterministic(error: &gst::glib::Error, debug: &str) -> bool {
+    if vulkan_fault::is_device_lost(&format!("{error} {debug}")) {
+        return false;
+    }
+    error.matches(gst::CoreError::Negotiation)
+        || error.matches(gst::StreamError::Format)
+        || error.matches(gst::CoreError::MissingPlugin)
+        // A caps refusal downstream stops the source's streaming task with this flow
+        // return; the task posts the error.
+        || (error.matches(gst::StreamError::Failed) && debug.contains("reason not-negotiated"))
+}
+
 /// Wait for a new encoder's first buffer (live sources reach PLAYING before any caps).
 /// A bus error first is the encoder's own failure (`encoder`; deterministic unless the
 /// device was lost); a stop or `wait` passing is `deadline`.
@@ -2559,11 +2575,12 @@ fn first_output(
             &[gst::MessageType::Error],
         ) {
             if let gst::MessageView::Error(err) = msg.view() {
-                let why = format!("{} ({:?})", err.error(), err.debug());
-                return Err(if vulkan_fault::reason_is_device_lost(&why) {
-                    RestreamFailure::new("encoder", why)
-                } else {
+                let debug = err.debug().map(|d| d.to_string()).unwrap_or_default();
+                let why = format!("{} ({debug})", err.error());
+                return Err(if rebuild_error_is_deterministic(&err.error(), &debug) {
                     RestreamFailure::hardware("encoder", why)
+                } else {
+                    RestreamFailure::new("encoder", why)
                 });
             }
         }
@@ -3051,9 +3068,7 @@ pub fn run_blocking(
                     let pause = RESTREAM_PAUSE_MS.load(Ordering::Relaxed);
                     std::thread::sleep(Duration::from_millis(pause));
                 }
-                let rebuild =
-                    to.codec != cfg.stream.codec || to.h264_profile != cfg.stream.h264_profile;
-                let moved = if rebuild {
+                let moved = if rebuilt {
                     let sink = interpipesrc.property::<String>("listen-to");
                     rebuild_encode(
                         &cfg,
@@ -3101,7 +3116,7 @@ pub fn run_blocking(
                         tracing::info!(
                             token = "runtime-adopt-restreamed",
                             elapsed_ms = elapsed.as_millis() as u64,
-                            rebuild,
+                            rebuild = rebuilt,
                             "adopted runtime moved to {:?} {}x{}@{} at {} kbit/s",
                             to.codec,
                             to.width,
@@ -4660,6 +4675,87 @@ mod tests {
     };
     use gstreamer::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Amendment 59: only a caps refusal, a refused format or a missing element is
+    // remembered; load, state and a lost device never are.
+    #[test]
+    fn a_rebuild_error_is_deterministic_only_for_caps_format_or_a_missing_element() {
+        gstreamer::init().unwrap();
+        let e =
+            |err: gst::glib::Error, debug: &str| super::rebuild_error_is_deterministic(&err, debug);
+        let stream = |c: gst::StreamError| gst::glib::Error::new(c, "x");
+        let resource = |c: gst::ResourceError| gst::glib::Error::new(c, "x");
+        for (name, got, want) in [
+            (
+                "not negotiated",
+                e(gst::glib::Error::new(gst::CoreError::Negotiation, "x"), ""),
+                true,
+            ),
+            (
+                "format refused",
+                e(
+                    stream(gst::StreamError::Format),
+                    "Video profile format not supported",
+                ),
+                true,
+            ),
+            (
+                "missing element",
+                e(
+                    gst::glib::Error::new(gst::CoreError::MissingPlugin, "x"),
+                    "",
+                ),
+                true,
+            ),
+            (
+                "caps refusal via the source task",
+                e(
+                    stream(gst::StreamError::Failed),
+                    "streaming stopped, reason not-negotiated (-4)",
+                ),
+                true,
+            ),
+            (
+                "interpipe or source error",
+                e(
+                    stream(gst::StreamError::Failed),
+                    "streaming stopped, reason error (-5)",
+                ),
+                false,
+            ),
+            (
+                "out of memory",
+                e(
+                    resource(gst::ResourceError::NoSpaceLeft),
+                    "NV_ENC_ERR_OUT_OF_MEMORY",
+                ),
+                false,
+            ),
+            (
+                "session limit",
+                e(
+                    resource(gst::ResourceError::Busy),
+                    "NV_ENC_ERR_OUT_OF_MEMORY: OpenEncodeSessionEx",
+                ),
+                false,
+            ),
+            (
+                "encoder start failure",
+                e(gst::glib::Error::new(gst::LibraryError::Init, "x"), ""),
+                false,
+            ),
+            (
+                "device lost",
+                e(
+                    gst::glib::Error::new(gst::CoreError::Negotiation, "x"),
+                    "VK_ERROR_DEVICE_LOST",
+                ),
+                false,
+            ),
+        ] {
+            assert_eq!(got, want, "{name}");
+        }
+    }
 
     // Amendment 59 (c): what a rebuild refuses before it touches the old encoder.
     #[test]
