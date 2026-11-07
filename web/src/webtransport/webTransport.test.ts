@@ -226,6 +226,23 @@ describe("WebTransportMedia keyframe requests", () => {
   });
 });
 
+describe("WebTransportMedia loss recovery", () => {
+  it("repeats a NACK and gives the frame up on its timer when no datagram follows", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent);
+    await t.connect(NO_SINK);
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, pkt));
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(2000, 1) }, pkt).slice(1));
+    await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(1));
+    // Nothing more arrives: a still picture. The repeat and the lateness come off the timer.
+    await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(2));
+    await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "late" }]));
+    t.close();
+  });
+});
+
 // ── The runtime, end to end against the fake agent ─────────────────────────
 
 describe("createWebTransportRuntime", () => {
@@ -311,16 +328,29 @@ describe("createWebTransportRuntime", () => {
     expect(decoders[0].chunks[1].type).toBe("key");
   });
 
-  it("asks for a keyframe on loss", async () => {
+  it("NACKs a lost fragment, presents the frame on its retransmission, and asks for a keyframe on nack_miss", async () => {
     const { agent, presented, rt } = setup();
     rt.start();
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     const pkt = { n: 0 };
     agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, pkt));
-    agent.last.datagrams(packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(3000, 1) }, pkt).slice(1));
+    const one = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(3000, 1) }, pkt);
+    agent.last.datagrams(one.slice(1));
     agent.last.datagrams(packetize({ configId: 0, frameSeq: 2, keyframe: false, data: bytes(10, 2) }, pkt));
-    await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "loss" }]));
+    await vi.waitFor(() => expect(agent.sent("nack")).toEqual([{ type: "nack", frame_seq: 1, frags: [[0, 0]] }]));
     expect(presented).toHaveLength(1);
+    const resent = one[0].slice();
+    resent[5] |= 4;
+    agent.last.datagrams([resent]);
+    await vi.waitFor(() => expect(presented).toHaveLength(3));
+
+    const four = packetize({ configId: 0, frameSeq: 3, keyframe: false, data: bytes(2000, 3) }, pkt);
+    agent.last.datagrams(four.slice(0, 1));
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 4, keyframe: false, data: bytes(10, 4) }, pkt));
+    await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(2));
+    agent.last.control({ type: "nack_miss", frame_seq: 3, frags: [[1, 1]] });
+    await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "late" }]));
+    expect(presented).toHaveLength(3);
   });
 
   it("treats close 4410 as a takeover", async () => {
