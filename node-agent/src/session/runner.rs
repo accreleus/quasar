@@ -2546,7 +2546,9 @@ fn rebuild_encode(
 /// Whether a rebuilt encoder's bus error is the hardware's answer to this codec, which the
 /// agent remembers (amendment 59). Only a caps refusal, a format the encoder will not take
 /// or a missing element; out of memory, a session limit, a source or interpipe error and a
-/// lost device are load or state, never remembered.
+/// lost device are load or state, never remembered. A streaming task stopped with
+/// `not-negotiated` is not remembered either: Vulkan encoders return that flow when their
+/// per-frame output buffer cannot be allocated in device memory, which is load.
 fn rebuild_error_is_deterministic(error: &gst::glib::Error, debug: &str) -> bool {
     if vulkan_fault::is_device_lost(&format!("{error} {debug}")) {
         return false;
@@ -2554,9 +2556,6 @@ fn rebuild_error_is_deterministic(error: &gst::glib::Error, debug: &str) -> bool
     error.matches(gst::CoreError::Negotiation)
         || error.matches(gst::StreamError::Format)
         || error.matches(gst::CoreError::MissingPlugin)
-        // A caps refusal downstream stops the source's streaming task with this flow
-        // return; the task posts the error.
-        || (error.matches(gst::StreamError::Failed) && debug.contains("reason not-negotiated"))
 }
 
 /// Wait for a new encoder's first buffer (live sources reach PLAYING before any caps).
@@ -4708,12 +4707,13 @@ mod tests {
                 true,
             ),
             (
-                "caps refusal via the source task",
+                // Also what a Vulkan encoder's failed device-memory allocation looks like.
+                "not-negotiated flow via the source task",
                 e(
                     stream(gst::StreamError::Failed),
                     "streaming stopped, reason not-negotiated (-4)",
                 ),
-                true,
+                false,
             ),
             (
                 "interpipe or source error",
