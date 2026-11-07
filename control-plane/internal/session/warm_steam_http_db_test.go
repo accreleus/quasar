@@ -157,6 +157,9 @@ func TestRefusedClaimAnswersCapacityWithRetryAfter2(t *testing.T) {
 	if got := resp.Header.Get("Retry-After"); got != "2" {
 		t.Errorf("Retry-After = %q, want 2", got)
 	}
+	if errObj["reason"] != "steam_restarting" {
+		t.Errorf("reason = %v, want steam_restarting", errObj["reason"])
+	}
 	if _, named := errObj["session_id"]; named {
 		t.Error("the refusal names a session")
 	}
@@ -171,6 +174,9 @@ func TestRefusedClaimAnswersCapacityWithRetryAfter2(t *testing.T) {
 		resp.Header.Get("Retry-After") != "2" {
 		t.Fatalf("retry while stopping = %d %v Retry-After=%q, want 503 capacity_exhausted with 2",
 			resp.StatusCode, errObj, resp.Header.Get("Retry-After"))
+	}
+	if errObj["reason"] != "steam_restarting" {
+		t.Errorf("retry reason = %v, want steam_restarting", errObj["reason"])
 	}
 
 	// Once the parked session has stopped with its cleanup proof, the launch runs cold.
@@ -243,6 +249,9 @@ func TestWarmSteamWaitsAnswer503WithRetryAfter2(t *testing.T) {
 		w.disp.waitFor(t, "start")
 		resp, body := launch(w)
 		want503(t, resp, body)
+		if errObj, _ := body["error"].(map[string]any); errObj["reason"] != nil {
+			t.Errorf("warming reason = %v, want none: Steam is starting, not restarting", errObj["reason"])
+		}
 		if got := readRow(t, w.pool, k); got.State != "assigned" || w.disp.stopReason(k) != "" {
 			t.Errorf("parked row %+v stop=%q, want left to finish warming", got, w.disp.stopReason(k))
 		}

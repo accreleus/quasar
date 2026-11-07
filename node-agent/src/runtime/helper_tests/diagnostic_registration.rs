@@ -39,6 +39,7 @@ fn runtime_checks(client: &RuntimeClient) -> Vec<ReadinessCheck> {
 fn capacity_template() -> AgentMsg {
     AgentMsg::Capacity {
         transports: crate::webtransport::capacity(),
+        compat_tools: None,
         deployment_settings: None,
         config_policy_accepted_groups: None,
         config_policy_legacy_map_applied_id: None,
@@ -68,6 +69,7 @@ fn register() -> AgentMsg {
         config_policy_groups: None,
         terminal_home_cleanup_v1: None,
         parked_sessions_v1: None,
+        adopt_restream_v1: None,
         compat_tools_v1: None,
         node_name: "fixture".into(),
         agent_version: "test".into(),

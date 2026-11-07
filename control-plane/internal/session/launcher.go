@@ -299,7 +299,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		claimStream, err = c.claimCandidate(ctx, &p, parked, launchProfile, lp, ov, env, source)
 		if errors.Is(err, ErrCodecUnsupportedByHost) {
 			// The parked GPU cannot encode the launch's codec: a failed check 4.
-			c.supersedeParkedHolder(ctx, userID, parked.ID)
+			cause := c.store.codecGatedCause(ctx, p, parked, c.hostParks(parked.HostID), c.hostRestreams(parked.HostID))
+			c.supersedeParkedHolder(ctx, userID, parked.ID, cause)
 			return LaunchResult{}, &ParkedClaimRefusedError{HolderID: parked.ID}
 		}
 		if err != nil {
@@ -329,19 +330,22 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		holder := inUse.releasedID
 		if inUse.parkedID != "" {
 			holder = inUse.parkedID
-			c.supersedeParkedHolder(ctx, userID, inUse.parkedID)
+			c.supersedeParkedHolder(ctx, userID, inUse.parkedID, "")
 		}
 		err = &ParkedClaimRefusedError{HolderID: holder}
 	case p.claim != nil && errors.As(err, &refused) && refused.Warming:
 		// Left to finish warming; the client's retry claims it once running.
+	case p.claim != nil && errors.Is(err, errClaimLost):
+		// A racing launch claimed it: nothing to stop.
 	case p.claim != nil && errors.Is(err, ErrCapacityExhausted):
 		// The parked session stops and the client's retry launches cold. This
 		// includes a claim that ran out of placement retries under contention,
 		// which is rare enough not to tell apart.
-		c.supersedeParkedHolder(ctx, userID, p.claim.id)
 		if !errors.As(err, &refused) {
-			err = &ParkedClaimRefusedError{HolderID: p.claim.id}
+			refused = &ParkedClaimRefusedError{HolderID: p.claim.id, Cause: causeNoRoom}
+			err = refused
 		}
+		c.supersedeParkedHolder(ctx, userID, p.claim.id, refused.Cause)
 	case !lp.parked && errors.Is(err, ErrCapacityExhausted):
 		c.evictParkedFor(ctx, p)
 	}
@@ -355,6 +359,9 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	}
 	if p.claim != nil {
 		sess.AdoptSessionID = p.claim.id
+		if len(sess.restream) > 0 {
+			c.log.Info("warm steam: claim adopted", "session_id", sess.ID, "adopts", p.claim.id, "restream", sess.restream)
+		}
 	}
 	if sess.notice == "" {
 		sess.notice = notice
@@ -635,16 +642,22 @@ func (c *Coordinator) claimCandidate(ctx context.Context, p *CreateParams, k par
 	ps.applyTo(&prov)
 	p.Width, p.Height, p.FPS, p.BitrateKbps = prov.Width, prov.Height, prov.FPS, prov.BitrateKbps
 	p.Codec, p.Playout0Ms = prov.Codec, prov.Playout0Ms
-	p.claim = &parkedClaim{id: k.ID, hostParks: c.hostParks(k.HostID)}
+	p.claim = &parkedClaim{id: k.ID, hostParks: c.hostParks(k.HostID), restream: c.hostRestreams(k.HostID)}
 	return ps, nil
 }
 
 // supersedeParkedHolder stops the caller's parked session that a launch inside
 // its family could not adopt or must not wait behind. No suppression: the
-// launch is inside the family.
-func (c *Coordinator) supersedeParkedHolder(ctx context.Context, userID, parkedID string) {
-	if _, err := c.stopParked(ctx, StopReasonParkedSuperseded, parkedFilter{UserID: userID, ID: parkedID}); err != nil {
+// launch is inside the family. cause is the failed claim check, "" when the
+// launch did not try to claim it.
+func (c *Coordinator) supersedeParkedHolder(ctx context.Context, userID, parkedID, cause string) {
+	stopped, err := c.stopParked(ctx, StopReasonParkedSuperseded, parkedFilter{UserID: userID, ID: parkedID})
+	if err != nil {
 		c.log.Warn("warm steam: stopping an unclaimable parked session failed", "session_id", parkedID, "err", err)
+		return
+	}
+	if stopped > 0 && cause != "" {
+		c.log.Info("warm steam: claim superseded", "session_id", parkedID, "cause", cause)
 	}
 }
 
@@ -1054,7 +1067,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		Kind:           sess.Kind,
 		AdoptSessionID: sess.AdoptSessionID,
 	}
-	assign.CompatTools = c.compatToolsFor(sess.AppID)
+	assign.CompatTools = c.compatToolsFor(sess.AppID, hostID)
 	if sess.wt != nil {
 		exp := sess.wt.ExpiresAt
 		assign.Transport, assign.WTTokenHash, assign.WTTokenExpiresAt = transportWebTransport, sess.wt.Hash, &exp

@@ -151,6 +151,13 @@ func (h *AgentHandler) handlePending(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		params := run.Params
+		if fill := h.disp.fillParams(run.JobID); fill != nil {
+			filled, ok := h.fill(r.Context(), fill, run, hostID)
+			if !ok {
+				continue
+			}
+			params = filled
+		}
 		if len(params) == 0 {
 			params = json.RawMessage(`{}`)
 		}
@@ -169,6 +176,28 @@ func (h *AgentHandler) handlePending(w http.ResponseWriter, r *http.Request) {
 			"attempt", run.Attempt, "plane", "agent")
 	}
 	httpx.WriteJSON(w, http.StatusOK, pendingResponse{Runs: out})
+}
+
+// fill runs the job's FillParams for a claimed run and stores what it returns; a run with
+// nothing to do, or whose params cannot be built, is closed skipped and not handed out.
+func (h *AgentHandler) fill(ctx context.Context, fill func(context.Context, string) (any, error), run Run, hostID string) (json.RawMessage, bool) {
+	p, err := fill(ctx, hostID)
+	var raw json.RawMessage
+	if err == nil && p != nil {
+		raw, err = h.store.SetRunParams(ctx, run.ID, p)
+	}
+	if err == nil && p != nil {
+		return raw, true
+	}
+	reason, errText := "no_difference", ""
+	if err != nil {
+		reason, errText = "params_unavailable", err.Error()
+		h.log.Warn("job: could not fill run params", "job_id", run.JobID, "run_id", run.ID, "err", err)
+	}
+	if _, rerr := h.disp.Report(ctx, run.ID, StateSkipped, Summary{"reason": reason}, errText); rerr != nil {
+		h.log.Warn("job: could not close a run with no params", "run_id", run.ID, "err", rerr)
+	}
+	return nil, false
 }
 
 // reportRequest is the POST /v1/agent/jobs/report body (design §3.6, verbatim).

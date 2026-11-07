@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-use super::abr_glue::{self, EncodeResolutionLever};
+use super::abr_glue::{self, EncodeResolutionLever, ResolutionLever};
 use super::audio_branch::add_audio_chain;
 use super::codec_chain::build_video_payloader;
 use super::mic_branch::add_mic_branch;
@@ -60,7 +60,9 @@ pub struct VideoTransport {
 /// What it takes to put a transport on the RTP tail, kept for the session so it can be
 /// done again.
 pub struct WebRtcSlot {
-    cfg: SessionConfig,
+    /// Its stream is the launch point a new transport's ABR starts from; an adoption moves
+    /// it (amendment 59, [`Self::restream`]).
+    cfg: Mutex<SessionConfig>,
     pipeline: gst::Pipeline,
     /// The RTP capsfilter's src pad, where each `webrtcbin` transport is linked.
     tail: gst::Pad,
@@ -305,7 +307,7 @@ impl WebRtcSlot {
             attach_rtp_ts_trace(&pay);
         }
         Ok(Self {
-            cfg,
+            cfg: Mutex::new(cfg),
             pipeline,
             tail: rtp_capsfilter
                 .static_pad("src")
@@ -334,7 +336,7 @@ impl WebRtcSlot {
         replacement: bool,
         gate: Option<gst::PadProbeId>,
     ) -> Result<VideoTransport> {
-        let cfg = &self.cfg;
+        let cfg = &self.cfg.lock().unwrap().clone();
         let gate = Arc::new(Mutex::new(gate.or_else(|| self.hold_rtp())));
         let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
         // Signals webrtcbin emits while it builds its send session: connect them first.
@@ -538,11 +540,51 @@ impl WebRtcSlot {
                 ),
             }
         }
-        abr_glue::reset_to_launch(&self.encoder, &self.cfg, &self.lever, &self.metrics);
+        let cfg = self.cfg.lock().unwrap().clone();
+        abr_glue::reset_to_launch(&self.encoder, &cfg, &self.lever, &self.metrics);
         *video = self.attach_video(true, gate)?;
         // The pipeline handed its latency to the first transport on the way to PLAYING;
         // one added later has to be told.
         let _ = self.pipeline.recalculate_latency();
+        Ok(())
+    }
+
+    /// Amendment 59 (a)–(b): make `to`'s bitrate, fps and size the launch point, then give
+    /// the video PC a new transport, whose ABR starts from there and which offers at once.
+    /// On `Err`, the step that failed (`fps`, `bitrate` or `transport`).
+    pub fn restream(
+        &self,
+        video: &mut VideoTransport,
+        to: &crate::session::StreamParams,
+    ) -> std::result::Result<(), (&'static str, anyhow::Error)> {
+        self.move_launch_point(to)?;
+        self.replace_video(video).map_err(|e| ("transport", e))
+    }
+
+    /// [`Self::restream`] without the new transport: `to`'s bitrate and fps written live,
+    /// and its bitrate, fps and size the launch point a later transport starts from.
+    pub fn move_launch_point(
+        &self,
+        to: &crate::session::StreamParams,
+    ) -> std::result::Result<(), (&'static str, anyhow::Error)> {
+        let mut cfg = self.cfg.lock().unwrap().clone();
+        if to.fps != cfg.stream.fps {
+            self.lever.set_fps(to.fps).map_err(|e| ("fps", e))?;
+        }
+        // The CPB is sized kbps / fps, so a new fps rewrites it too.
+        let rate_moves = to.bitrate_kbps != cfg.stream.bitrate_kbps || to.fps != cfg.stream.fps;
+        if rate_moves && !abr_glue::write_bitrate_live(&self.encoder, &cfg, to.bitrate_kbps, to.fps)
+        {
+            return Err((
+                "bitrate",
+                anyhow::anyhow!("the encoder's bitrate is not writable live"),
+            ));
+        }
+        cfg.stream.bitrate_kbps = to.bitrate_kbps;
+        cfg.stream.fps = to.fps;
+        cfg.stream.width = to.width;
+        cfg.stream.height = to.height;
+        *self.cfg.lock().unwrap() = cfg;
         Ok(())
     }
 
@@ -555,7 +597,7 @@ impl WebRtcSlot {
     pub fn build_audio(&self) -> Result<(Option<gst::Element>, Option<gst::Pipeline>)> {
         #[cfg(test)]
         AUDIO_BUILDS.lock().unwrap().push(self.session_id.clone());
-        let cfg = &self.cfg;
+        let cfg = &self.cfg.lock().unwrap().clone();
         if audio_disabled() {
             tracing::info!(
                 "stream audio disabled by runtime or session topology — video-only offer"
