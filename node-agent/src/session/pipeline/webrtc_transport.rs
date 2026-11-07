@@ -64,7 +64,8 @@ pub struct WebRtcSlot {
     pipeline: gst::Pipeline,
     /// The RTP capsfilter's src pad, where each `webrtcbin` transport is linked.
     tail: gst::Pad,
-    /// Outlives every transport, so a size [`super::mtu_shrink`] stepped down to does too.
+    /// Outlives every transport, so a size [`super::mtu_shrink`] stepped down to does too: a
+    /// viewer reconnecting over the same path would black out again at the configured size.
     payloader: gst::Element,
     encoder: gst::Element,
     out_tx: OutTx,

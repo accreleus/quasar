@@ -2,8 +2,10 @@
 //!
 //! The signal is the peer's generic NACKs (RFC 4585): each names a sequence number, and
 //! the size every packet left at is recorded where `rtpbin` hands it to the transport.
-//! Loss on the packets a step would shrink, with little loss below them, is a path MTU
-//! under ours. Loss on every size is not, and never shrinks. Steps only go down.
+//! A packet counts as lost to the path only once its retransmissions are lost too
+//! ([`MTU_LOST_NACKS`]). Such loss on the packets a step would shrink, with little below
+//! them, is a path MTU under ours. Loss on every size is not, and never shrinks. Steps
+//! only go down.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,18 +23,32 @@ const WINDOW: Duration = Duration::from_secs(1);
 const WINDOWS_IN_A_ROW: u32 = 2;
 /// The least time between two steps: the keyframe after a step lands well inside it.
 const COOLDOWN: Duration = Duration::from_secs(3);
-/// Packets of each class a window needs before it says anything.
-const MIN_SENT: u32 = 20;
+/// NACKs that make a packet lost to the path. Chrome (`NackRequester`) NACKs a gap at
+/// once, then again each time an RTT has passed since the last NACK, until the packet or
+/// its RTX arrives. The RTX is itself about an RTT away, so a second NACK races the first
+/// RTX and can mean only a late one; a third means two RTX in a row missed. An MTU drop
+/// kills every RTX (the same size plus 2 bytes), so each lost large packet gets there
+/// within about 2 RTT; a keyframe burst overflowing a queue or policer lets its RTX by.
+const MTU_LOST_NACKS: u8 = 3;
+/// Packets of each class a window needs before it says anything. A window short of
+/// either holds the run of size-correlated windows rather than breaking it: a static
+/// desktop or a 24 fps stream sends few small packets.
+const MIN_SENT_LARGE: u32 = 20;
+const MIN_SENT_SMALL: u32 = 10;
 const MIN_NACKED_LARGE: u32 = 10;
-/// Share of the large packets NACKed. Low because Chrome stops NACKing past 1000
-/// missing packets and asks for a keyframe instead, so a path dropping every large
-/// packet can show well under half of them NACKed.
-const LARGE_LOSS_MIN: f64 = 0.25;
+/// Share of the large packets lost to the path. Low because Chrome clears its whole NACK
+/// list when it would pass 1000 packets and asks for a keyframe instead, so at high
+/// bitrates few lost packets live to a third NACK. The small-loss ratio and
+/// [`MTU_LOST_NACKS`] are what keep a lossy path from passing.
+const LARGE_LOSS_MIN: f64 = 0.10;
 /// Small packets' loss as a share of the large packets' loss, at most.
 const SMALL_LOSS_MAX_OF_LARGE: f64 = 0.2;
 /// Sequence numbers remembered per SSRC: ~0.5 s at 80 Mbps. A later NACK is not counted,
 /// which errs toward not shrinking.
 const HISTORY: usize = 4096;
+/// Sequence numbers read from one NACK packet. Its FCI can name ~276k, all walked under
+/// the lock the send path takes.
+const MAX_NACKED_PER_PACKET: usize = 1024;
 /// SSRCs tracked: the media stream and its RTX stream, with room to spare.
 const MAX_STREAMS: usize = 4;
 
@@ -52,17 +68,18 @@ pub(super) struct Window {
 }
 
 impl Window {
-    /// Loss concentrated on the large packets.
-    fn size_correlated(&self) -> bool {
-        if self.sent_large < MIN_SENT
-            || self.sent_small < MIN_SENT
-            || self.nacked_large < MIN_NACKED_LARGE
-        {
-            return false;
+    /// Whether the loss falls on the large packets; `None` when too few were sent to say.
+    fn size_correlated(&self) -> Option<bool> {
+        if self.sent_large < MIN_SENT_LARGE || self.sent_small < MIN_SENT_SMALL {
+            return None;
         }
         let large = f64::from(self.nacked_large) / f64::from(self.sent_large);
         let small = f64::from(self.nacked_small) / f64::from(self.sent_small);
-        large >= LARGE_LOSS_MIN && small <= large * SMALL_LOSS_MAX_OF_LARGE
+        Some(
+            self.nacked_large >= MIN_NACKED_LARGE
+                && large >= LARGE_LOSS_MIN
+                && small <= large * SMALL_LOSS_MAX_OF_LARGE,
+        )
     }
 }
 
@@ -98,10 +115,10 @@ impl Decision {
 
     /// The size to step down to, or `None`.
     pub(super) fn on_window(&mut self, w: &Window, now: Instant) -> Option<u32> {
-        self.in_a_row = if w.size_correlated() {
-            self.in_a_row + 1
-        } else {
-            0
+        self.in_a_row = match w.size_correlated() {
+            Some(true) => self.in_a_row + 1,
+            Some(false) => 0,
+            None => return None,
         };
         if self.in_a_row < WINDOWS_IN_A_ROW
             || self
@@ -123,7 +140,7 @@ struct Sent {
     seq: u16,
     /// 0: nothing recorded in this slot.
     size: u16,
-    nacked: bool,
+    nacks: u8,
 }
 
 struct Stream {
@@ -176,7 +193,7 @@ impl Shrink {
         stream.sent[usize::from(seq) % HISTORY] = Sent {
             seq,
             size: size.clamp(1, usize::from(u16::MAX)) as u16,
-            nacked: false,
+            nacks: 0,
         };
         if large {
             stream.window.sent_large += 1;
@@ -186,17 +203,20 @@ impl Shrink {
         step
     }
 
-    /// The peer NACKed `seqs` of `ssrc`. A packet counts once however often it is NACKed.
+    /// The peer NACKed `seqs` of `ssrc`. A packet counts once, at its [`MTU_LOST_NACKS`]th.
     pub(super) fn nacked(&mut self, ssrc: u32, seqs: impl IntoIterator<Item = u16>) {
         let Some(stream) = self.streams.iter_mut().find(|s| s.ssrc == ssrc) else {
             return;
         };
         for seq in seqs {
             let sent = &mut stream.sent[usize::from(seq) % HISTORY];
-            if sent.size == 0 || sent.seq != seq || sent.nacked {
+            if sent.size == 0 || sent.seq != seq || sent.nacks >= MTU_LOST_NACKS {
                 continue;
             }
-            sent.nacked = true;
+            sent.nacks += 1;
+            if sent.nacks < MTU_LOST_NACKS {
+                continue;
+            }
             let size = usize::from(sent.size);
             if self.decision.large(size) {
                 stream.window.nacked_large += 1;
@@ -212,12 +232,13 @@ impl Shrink {
             return None;
         }
         self.window_start = Some(now);
-        // The stream the peer NACKs is the media one; RTX is never NACKed.
+        // The stream the peer NACKs is the media one; RTX is never NACKed. With no NACKs,
+        // the one that sent the most.
         let window = self
             .streams
             .iter()
             .map(|s| s.window)
-            .max_by_key(|w| w.nacked_large + w.nacked_small)
+            .max_by_key(|w| (w.nacked_large + w.nacked_small, w.sent_large + w.sent_small))
             .unwrap_or_default();
         for s in &mut self.streams {
             s.window = Window::default();
@@ -232,17 +253,22 @@ impl Shrink {
     }
 }
 
-/// The sequence numbers a generic NACK's FCI names: (PID, BLP) pairs.
+/// The sequence numbers a generic NACK's FCI names, (PID, BLP) pairs, at most
+/// [`MAX_NACKED_PER_PACKET`].
 pub(super) fn nack_seqs(fci: &[u8]) -> impl Iterator<Item = u16> + '_ {
-    fci.as_chunks::<4>().0.iter().flat_map(|c| {
-        let pid = u16::from_be_bytes([c[0], c[1]]);
-        let blp = u16::from_be_bytes([c[2], c[3]]);
-        std::iter::once(pid).chain(
-            (0..16u16)
-                .filter(move |i| blp & (1 << i) != 0)
-                .map(move |i| pid.wrapping_add(i + 1)),
-        )
-    })
+    fci.as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|c| {
+            let pid = u16::from_be_bytes([c[0], c[1]]);
+            let blp = u16::from_be_bytes([c[2], c[3]]);
+            std::iter::once(pid).chain(
+                (0..16u16)
+                    .filter(move |i| blp & (1 << i) != 0)
+                    .map(move |i| pid.wrapping_add(i + 1)),
+            )
+        })
+        .take(MAX_NACKED_PER_PACKET)
 }
 
 /// Watch `webrtc`'s send session and shrink `payloader` on size-correlated loss. Call
@@ -378,26 +404,49 @@ mod tests {
     #[test]
     fn a_window_is_size_correlated_only_when_large_packets_carry_the_loss() {
         let table = [
-            ("clean", w(200, 0, 60, 0), false),
-            ("every large packet lost", w(200, 200, 60, 0), true),
-            ("a quarter of them NACKed", w(200, 50, 60, 0), true),
-            ("just under a quarter", w(200, 49, 60, 0), false),
+            ("clean", w(200, 0, 60, 0), Some(false)),
+            ("every large packet lost", w(200, 200, 60, 0), Some(true)),
+            ("a tenth lost to the path", w(200, 20, 60, 0), Some(true)),
+            ("just under a tenth", w(200, 19, 60, 0), Some(false)),
+            (
+                "~50 Mbps: Chrome's 1000-packet list cap leaves 12% to a third NACK",
+                w(4000, 480, 600, 0),
+                Some(true),
+            ),
             (
                 "a deeper hop also takes some small ones",
                 w(200, 180, 60, 9),
-                true,
+                Some(true),
             ),
-            ("uniform 30%", w(200, 60, 60, 18), false),
-            ("uniform 80%", w(200, 160, 60, 48), false),
+            (
+                "uniform 30%, cubed by three NACKs",
+                w(400, 11, 100, 3),
+                Some(false),
+            ),
+            (
+                "uniform 60%, cubed by three NACKs",
+                w(400, 86, 100, 22),
+                Some(false),
+            ),
+            ("uniform 80%", w(200, 160, 60, 48), Some(false)),
             (
                 "small loss at a fifth of large loss",
                 w(200, 100, 60, 6),
-                true,
+                Some(true),
             ),
-            ("small loss just over a fifth", w(200, 100, 60, 7), false),
-            ("too few large packets sent", w(19, 19, 60, 0), false),
-            ("too few small packets sent", w(200, 200, 19, 0), false),
-            ("too few NACKs", w(30, 9, 60, 0), false),
+            (
+                "small loss just over a fifth",
+                w(200, 100, 60, 7),
+                Some(false),
+            ),
+            ("too few large packets sent", w(19, 19, 60, 0), None),
+            ("too few small packets sent", w(200, 200, 9, 0), None),
+            (
+                "ten small packets are enough",
+                w(200, 200, 10, 0),
+                Some(true),
+            ),
+            ("enough sent, too few lost", w(30, 9, 60, 0), Some(false)),
         ];
         for (what, window, want) in table {
             assert_eq!(window.size_correlated(), want, "{what}: {window:?}");
@@ -424,7 +473,8 @@ mod tests {
     fn the_decision_wants_two_windows_in_a_row_and_a_cooldown_between_steps() {
         let lossy = w(200, 200, 60, 0);
         let uniform = w(200, 60, 60, 18);
-        let clean = Window::default();
+        let clean = w(200, 0, 60, 0);
+        let thin = w(200, 200, 4, 0);
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
         // (window, second it closes, the step wanted)
@@ -432,14 +482,15 @@ mod tests {
             ("one lossy window is not enough", lossy, 1, None),
             ("a clean one resets the run", clean, 2, None),
             ("lossy again", lossy, 3, None),
-            ("two in a row step", lossy, 4, Some(1100)),
-            ("inside the cooldown, first", lossy, 5, None),
-            ("inside the cooldown, second", lossy, 6, None),
-            ("cooldown over", lossy, 7, Some(1000)),
-            ("uniform loss never counts", uniform, 8, None),
-            ("uniform loss never counts, again", uniform, 9, None),
-            ("lossy", lossy, 10, None),
-            ("lossy, to the floor", lossy, 11, Some(900)),
+            ("too few packets to say", thin, 4, None),
+            ("a thin window between holds the run", lossy, 5, Some(1100)),
+            ("inside the cooldown, first", lossy, 6, None),
+            ("inside the cooldown, second", lossy, 7, None),
+            ("cooldown over", lossy, 8, Some(1000)),
+            ("uniform loss never counts", uniform, 9, None),
+            ("uniform loss never counts, again", uniform, 10, None),
+            ("lossy", lossy, 11, None),
+            ("lossy, to the floor", lossy, 12, Some(900)),
             ("at the floor", lossy, 15, None),
             ("still at the floor", lossy, 20, None),
         ];
@@ -478,7 +529,19 @@ mod tests {
     }
 
     #[test]
-    fn the_send_history_counts_each_nack_once_against_its_own_stream() {
+    fn one_nack_packet_names_at_most_a_thousand_or_so() {
+        // 4096 full pairs name 69632 sequence numbers.
+        let fci: Vec<u8> = (0..4096u16)
+            .flat_map(|i| {
+                let [a, b] = i.wrapping_mul(17).to_be_bytes();
+                [a, b, 0xff, 0xff]
+            })
+            .collect();
+        assert_eq!(nack_seqs(&fci).count(), MAX_NACKED_PER_PACKET);
+    }
+
+    #[test]
+    fn a_packet_counts_once_at_its_third_nack_against_its_own_stream() {
         const MEDIA: u32 = 0xaaaa;
         const RTX: u32 = 0xbbbb;
         let t0 = Instant::now();
@@ -489,39 +552,64 @@ mod tests {
             assert!(s.sent(MEDIA, seq * 2 + 1, 300, now).is_none());
         }
         assert!(s.sent(RTX, 0, 1180, t0).is_none());
-        // Every large packet, twice over, plus seqs never sent and the RTX stream.
+        let media = |s: &Shrink| s.streams.iter().find(|st| st.ssrc == MEDIA).unwrap().window;
         let large: Vec<u16> = (0..40).map(|i| i * 2).collect();
+        // A second NACK can mean only a late RTX.
         s.nacked(MEDIA, large.iter().copied());
         s.nacked(MEDIA, large.iter().copied());
-        s.nacked(MEDIA, [1000, 2000]);
-        s.nacked(RTX, [0]);
-        let media = s.streams.iter().find(|st| st.ssrc == MEDIA).unwrap();
-        assert_eq!(media.window, w(40, 40, 40, 0));
+        assert_eq!(media(&s), w(40, 0, 40, 0));
+        // The third counts, a fourth does not count again, and nor do seqs never sent or
+        // the RTX stream.
+        s.nacked(MEDIA, large.iter().copied());
+        s.nacked(MEDIA, large.iter().copied());
+        for _ in 0..3 {
+            s.nacked(MEDIA, [1000, 2000]);
+            s.nacked(RTX, [0]);
+        }
+        assert_eq!(media(&s), w(40, 40, 40, 0));
         // A window that late closes and is the first of a run: no step yet.
         assert_eq!(s.sent(MEDIA, 80, 300, t0 + WINDOW), None);
         assert!(s.streams.iter().all(|st| st.window.sent_large == 0));
     }
 
-    /// Frames as a payloader cuts them: five full fragments, then a tail of any size.
-    /// A hop drops every packet over `hop` bytes; `None` is 30% loss on every size.
-    fn first_step(cap: u32, hop: Option<usize>) -> Option<u32> {
+    #[derive(Clone, Copy)]
+    enum Path {
+        /// Every packet over this many bytes is dropped, its RTX (2 bytes more) too.
+        Hop(usize),
+        /// This percentage of every transmission, any size, RTX included.
+        Lossy(u64),
+        /// This percentage of the large packets' first transmission, and no RTX: a burst
+        /// overflowing a queue or a policer. Each lost one is NACKed twice, the second
+        /// racing its RTX.
+        Burst(u64),
+    }
+
+    /// Frames as a payloader cuts them at `fps`, five full fragments and a tail of any size,
+    /// for six seconds, NACKed as Chrome would through `path`. -> the first step taken.
+    fn first_step(cap: u32, path: Path, fps: u64) -> Option<u32> {
         const MEDIA: u32 = 1;
         let t0 = Instant::now();
         let mut s = Shrink::new(cap);
         let full = cap as usize - 20;
         let mut seq = 0u16;
-        for frame in 0..240u64 {
-            let now = t0 + Duration::from_millis(frame * 1000 / 60);
+        let hash = |seq: u16, attempt: u64| {
+            (u64::from(seq) * 4 + attempt).wrapping_mul(2_654_435_761) % 100
+        };
+        for frame in 0..fps * 6 {
+            let now = t0 + Duration::from_millis(frame * 1000 / fps);
             let tail = 100 + (frame as usize * 37) % (full - 100);
             for size in [full, full, full, full, full, tail] {
                 if let Some(step) = s.sent(MEDIA, seq, size, now) {
                     return Some(step.to);
                 }
-                let lost = match hop {
-                    Some(hop) => size > hop,
-                    None => u64::from(seq).wrapping_mul(2_654_435_761) % 100 < 30,
+                let nacks = match path {
+                    Path::Hop(hop) if size > hop => 4,
+                    Path::Hop(_) => 0,
+                    Path::Lossy(pct) => (0..4).take_while(|&a| hash(seq, a) < pct).count(),
+                    Path::Burst(pct) if size == full && hash(seq, 0) < pct => 2,
+                    Path::Burst(_) => 0,
                 };
-                if lost {
+                for _ in 0..nacks {
                     s.nacked(MEDIA, [seq]);
                 }
                 seq = seq.wrapping_add(1);
@@ -531,19 +619,72 @@ mod tests {
     }
 
     #[test]
-    fn a_hop_anywhere_under_the_cap_shrinks_and_loss_on_every_size_does_not() {
+    fn a_hop_anywhere_under_the_cap_shrinks_and_other_loss_does_not() {
+        use Path::*;
         let table = [
-            ("default, hop just under it", 1200, Some(1100), Some(1100)),
-            ("default, hop a step lower", 1200, Some(1000), Some(1100)),
-            ("default, no hop", 1200, Some(1300), None),
-            ("default, every size lossy", 1200, None, None),
-            ("raised to 1400, a 1280 hop", 1400, Some(1280), Some(1300)),
-            ("raised to 1400, a 1000 hop", 1400, Some(1000), Some(1300)),
-            ("raised to 1436, a 1000 hop", 1436, Some(1000), Some(1336)),
-            ("raised to 1436, every size lossy", 1436, None, None),
+            (
+                "default, hop just under it",
+                1200,
+                Hop(1100),
+                60,
+                Some(1100),
+            ),
+            ("default, hop a step lower", 1200, Hop(1000), 60, Some(1100)),
+            ("default, no hop", 1200, Hop(1300), 60, None),
+            ("default, 30% of every size", 1200, Lossy(30), 60, None),
+            ("default, 60% of every size", 1200, Lossy(60), 60, None),
+            (
+                "raised to 1400, a 1280 hop",
+                1400,
+                Hop(1280),
+                60,
+                Some(1300),
+            ),
+            (
+                "raised to 1400, a 1000 hop",
+                1400,
+                Hop(1000),
+                60,
+                Some(1300),
+            ),
+            (
+                "raised to 1436, a 1000 hop",
+                1436,
+                Hop(1000),
+                60,
+                Some(1336),
+            ),
+            (
+                "raised to 1436, 30% of every size",
+                1436,
+                Lossy(30),
+                60,
+                None,
+            ),
+            (
+                "bursts lose 40% of large, RTX gets by",
+                1200,
+                Burst(40),
+                60,
+                None,
+            ),
+            (
+                "bursts lose 90% of large, RTX gets by",
+                1200,
+                Burst(90),
+                60,
+                None,
+            ),
+            (
+                "24 fps, hop just under the cap",
+                1200,
+                Hop(1100),
+                24,
+                Some(1100),
+            ),
         ];
-        for (what, cap, hop, want) in table {
-            assert_eq!(first_step(cap, hop), want, "{what}");
+        for (what, cap, path, fps, want) in table {
+            assert_eq!(first_step(cap, path, fps), want, "{what}");
         }
     }
 
@@ -562,7 +703,9 @@ mod tests {
                         steps.push(step);
                     }
                     if size > 1100 {
-                        s.nacked(MEDIA, [seq]);
+                        for _ in 0..MTU_LOST_NACKS {
+                            s.nacked(MEDIA, [seq]);
+                        }
                     }
                     seq = seq.wrapping_add(1);
                 }
@@ -570,9 +713,11 @@ mod tests {
         }
         assert_eq!(steps.len(), 1, "{steps:?}");
         assert_eq!((steps[0].from, steps[0].to), (1200, 1100));
-        // A late NACK for a packet sent before the step counts for nothing now.
+        // Late NACKs for a packet sent before the step count for nothing now.
         let before = s.streams[0].window;
-        s.nacked(MEDIA, [0, 1]);
+        for _ in 0..MTU_LOST_NACKS {
+            s.nacked(MEDIA, [0, 1]);
+        }
         assert_eq!(s.streams[0].window, before);
     }
 }

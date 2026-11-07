@@ -1,5 +1,6 @@
-//! #1134: a hop that drops full-size packets shrinks the session's packets live, and a
-//! path that loses packets of every size does not.
+//! #1134: a hop that drops full-size packets shrinks the session's packets live; a path
+//! that loses packets of every size, or loses large packets in bursts and lets their
+//! retransmissions by, does not.
 
 use super::*;
 use crate::session::pipeline::codec_chain::payloader_mtu;
@@ -7,9 +8,9 @@ use crate::session::pipeline::mtu_shrink::nack_seqs;
 use crate::session::pipeline::resize::force_idr;
 
 /// The path between host and peer: what reaches the video transport's `srtpenc` is
-/// dropped when `lose(size, n)` says so, `n` counting every packet. -> how many were
-/// dropped, and how many over 1100 bytes were sent.
-fn lossy_path(host: &Host, lose: fn(usize, u64) -> bool) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+/// dropped when `lose(size, payload type, n)` says so, `n` counting every packet. -> how
+/// many were dropped, and how many over 1100 bytes were sent.
+fn lossy_path(host: &Host, lose: fn(usize, u8, u64) -> bool) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
     let webrtc = host.transports.video.webrtc.clone();
     let webrtc = webrtc.downcast::<gst::Bin>().expect("webrtcbin is a bin");
     let srtpenc = webrtc
@@ -26,11 +27,16 @@ fn lossy_path(host: &Host, lose: fn(usize, u64) -> bool) -> (Arc<AtomicU64>, Arc
     let (dropped, large) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     let (count, large_count, seen) = (dropped.clone(), large.clone(), AtomicU64::new(0));
     pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-        let size = info.buffer().map_or(0, |b| b.size());
+        let Some(buffer) = info.buffer() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let size = buffer.size();
+        let pt = gstreamer_rtp::RTPBuffer::from_buffer_readable(buffer)
+            .map_or(0, |rtp| rtp.payload_type());
         if size > 1100 {
             large_count.fetch_add(1, Ordering::Relaxed);
         }
-        if lose(size, seen.fetch_add(1, Ordering::Relaxed)) {
+        if lose(size, pt, seen.fetch_add(1, Ordering::Relaxed)) {
             count.fetch_add(1, Ordering::Relaxed);
             return gst::PadProbeReturn::Drop;
         }
@@ -62,7 +68,10 @@ fn nacks(host: &Host) -> Arc<AtomicU64> {
     nacks
 }
 
-/// A peer whose video jitter buffer NACKs what it misses, as a browser's does.
+/// A peer whose video jitter buffer NACKs what it misses as Chrome does on a LAN: again
+/// every 20 ms (its process tick, once an RTT has passed) until the packet arrives. Left
+/// to its defaults, the peer's session merges repeated requests for a packet and sends
+/// them with its next regular RTCP, seconds apart.
 fn nacking_peer() -> Peer {
     let peer = Peer::new();
     peer.video.webrtc.connect("on-new-transceiver", false, |v| {
@@ -71,6 +80,26 @@ fn nacking_peer() -> Peer {
             .set_property("do-nack", true);
         None
     });
+    let rtpbin = peer
+        .video
+        .webrtc
+        .downcast_ref::<gst::Bin>()
+        .and_then(|b| b.by_name("rtpbin"))
+        .expect("the peer's rtpbin");
+    rtpbin.connect("new-jitterbuffer", false, |v| {
+        v[1].get::<gst::Element>()
+            .ok()?
+            .set_property("rtx-retry-timeout", 20i32);
+        None
+    });
+    rtpbin
+        .downcast_ref::<gst::Bin>()
+        .expect("rtpbin is a bin")
+        .connect_element_added(|_, element| {
+            if element.factory().is_some_and(|f| f.name() == "rtpsession") {
+                element.set_property("rtcp-min-interval", 20_000_000u64);
+            }
+        });
     peer
 }
 
@@ -116,7 +145,7 @@ fn a_hop_that_drops_full_size_packets_shrinks_them_and_video_comes_back() {
     let _serial = serial();
     let (mut host, mut peer, pay) = streaming_host("shrink-hop");
     let nacks = nacks(&host);
-    let (hop, _) = lossy_path(&host, |size, _| size > 1100);
+    let (hop, _) = lossy_path(&host, |size, _, _| size > 1100);
 
     let start = Instant::now();
     let mut next = start;
@@ -166,17 +195,11 @@ fn a_hop_that_drops_full_size_packets_shrinks_them_and_video_comes_back() {
     assert_eq!(pay.property::<u32>("mtu"), payloader_mtu(1100));
 }
 
-#[test]
-fn a_path_that_loses_every_size_does_not_shrink() {
-    if !live_webrtc_available() {
-        return;
-    }
-    let _serial = serial();
-    let (mut host, mut peer, pay) = streaming_host("shrink-uniform");
+/// Eight seconds through `lose`, keyframes all along, and no step.
+fn no_step_through(tag: &str, lose: fn(usize, u8, u64) -> bool) {
+    let (mut host, mut peer, pay) = streaming_host(tag);
     let nacks = nacks(&host);
-    // 30% of every size, spread by a multiplicative hash.
-    let (path, large) = lossy_path(&host, |_, n| n.wrapping_mul(2_654_435_761) % 100 < 30);
-
+    let (path, large) = lossy_path(&host, lose);
     let mut next = Instant::now();
     pump(&mut host, &mut peer, Duration::from_secs(8), |h, _| {
         keyframe_storm(&h.encoder, &mut next);
@@ -184,11 +207,38 @@ fn a_path_that_loses_every_size_does_not_shrink() {
     });
     let (nacks, dropped) = (nacks.load(Ordering::Relaxed), path.load(Ordering::Relaxed));
     let large = large.load(Ordering::Relaxed);
-    eprintln!("uniform loss: {dropped} dropped, {large} sent over 1100 bytes, {nacks} NACKed");
+    eprintln!("{tag}: {dropped} dropped, {large} sent over 1100 bytes, {nacks} NACKed");
     // Twice a window's minimum of large packets every second: the decision had its say.
     assert!(
         nacks > 200 && large > 8 * 40,
-        "too little to decide on ({nacks} NACKed, {large} large packets): the test proves nothing"
+        "{tag}: too little to decide on ({nacks} NACKed, {large} large packets)"
     );
-    assert_eq!(pay.property::<u32>("mtu"), payloader_mtu(1200));
+    assert_eq!(pay.property::<u32>("mtu"), payloader_mtu(1200), "{tag}");
+}
+
+fn spread(n: u64) -> u64 {
+    n.wrapping_mul(2_654_435_761) % 100
+}
+
+#[test]
+fn a_path_that_loses_every_size_does_not_shrink() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    no_step_through("shrink-uniform", |_, _, n| spread(n) < 30);
+}
+
+/// A shallow queue or a policer: the keyframe is the only large traffic, and it loses 40%
+/// of its packets while the small ones, spread over time, lose none. Their retransmissions
+/// arrive later and get by (payload type 96 is the media; RTX has its own).
+#[test]
+fn keyframe_bursts_that_lose_large_packets_but_not_their_retransmissions_do_not_shrink() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    no_step_through("shrink-burst", |size, pt, n| {
+        pt == 96 && size > 1100 && spread(n) < 40
+    });
 }
