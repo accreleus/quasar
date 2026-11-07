@@ -34,7 +34,12 @@ pub(super) struct BitstreamChain {
 /// Build the [`BitstreamChain`] for `codec`. `profile` is the caps `profile` string
 /// (from [`super::caps::caps_profile`]) — `Some` for h264/h265, `None` for av1
 /// (no profile caps field).
-pub(super) fn build_bitstream_chain(codec: Codec, profile: Option<&str>) -> Result<BitstreamChain> {
+/// `rtp_mtu` is the session's `QUASAR_RTP_MTU`; the payloader gets [`payloader_mtu`] of it.
+pub(super) fn build_bitstream_chain(
+    codec: Codec,
+    profile: Option<&str>,
+    rtp_mtu: u32,
+) -> Result<BitstreamChain> {
     // Pin the media type and, for h264/h265, the profile, so the encoder emits exactly
     // what the SDP advertises (the T8 constraint).
     let mut caps_builder = gst::Caps::builder(codec.caps_name());
@@ -67,6 +72,7 @@ pub(super) fn build_bitstream_chain(codec: Codec, profile: Option<&str>) -> Resu
     // pt=96 for every codec: one codec per session, send-only, so the PT-96 gates and
     // the TWCC/abs-capture-time extmap recipe carry over unchanged.
     set_prop_u32(&payloader, "pt", 96);
+    set_prop_u32(&payloader, "mtu", payloader_mtu(rtp_mtu));
     set_prop_i32(&payloader, "config-interval", -1);
     // H.265 must NOT aggregate: `zero-latency` wraps VPS/SPS/PPS in an H.265
     // Aggregation Packet (NAL 48) that shipping Chrome's depacketizer mishandles, so
@@ -87,6 +93,18 @@ pub(super) fn build_bitstream_chain(codec: Codec, profile: Option<&str>) -> Resu
     })
 }
 
+/// Bytes the send path adds to a packet after the payloader's `mtu`, which counts no
+/// header extension. Measured at `srtpenc` with a 1100-byte payloader `mtu`: +28 without
+/// FEC (abs-capture-time, written by the payloader and again at egress, plus TWCC), +39
+/// with RED/ULPFEC. The rest covers RTX's 2-byte sequence number and ULPFEC's long mask
+/// (4). Guarded by `takeover_tests::rtp_mtu::no_rtp_packet_is_larger_than_the_rtp_mtu`.
+const RTP_SEND_OVERHEAD: u32 = 48;
+
+/// The payloader `mtu` that keeps every packet on the wire within `rtp_mtu` (#1131).
+pub(super) fn payloader_mtu(rtp_mtu: u32) -> u32 {
+    rtp_mtu - RTP_SEND_OVERHEAD
+}
+
 fn set_prop_u32(el: &gst::Element, name: &str, v: u32) {
     if el.find_property(name).is_some() {
         el.set_property(name, v);
@@ -102,5 +120,29 @@ fn set_prop_i32(el: &gst::Element, name: &str, v: i32) {
 fn set_prop_from_str(el: &gst::Element, name: &str, v: &str) {
     if el.find_property(name).is_some() {
         el.set_property_from_str(name, v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_video_payloader_gets_the_rtp_mtu_budget() {
+        gst::init().unwrap();
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            if gst::ElementFactory::find(codec.rtp_payloader()).is_none() {
+                // rtpav1pay ships in gst-plugins-rs (`rsrtp`).
+                eprintln!("skipping {}: not in this GStreamer", codec.rtp_payloader());
+                continue;
+            }
+            let chain = build_bitstream_chain(codec, None, 1000).expect("chain");
+            assert_eq!(
+                chain.payloader.property::<u32>("mtu"),
+                payloader_mtu(1000),
+                "{}",
+                codec.rtp_payloader()
+            );
+        }
     }
 }

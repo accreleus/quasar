@@ -3220,3 +3220,6 @@ mod aux_senders;
 
 /// Amendment 39 (#759): parked, held, adopted and in-place-swapped runtimes.
 mod warm_steam;
+
+/// #1131: every RTP packet fits `QUASAR_RTP_MTU`.
+mod rtp_mtu;
