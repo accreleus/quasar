@@ -43,10 +43,24 @@ func (e *InUseError) Error() string {
 	return fmt.Sprintf("%d per-game mapping(s) name the tool; fleet default: %v", e.Mappings, e.IsDefault)
 }
 
+// ParkedSuperseder moves every live parked session to stopping inside tx and returns the dispatch
+// to run once tx commits. semantics: control-api.md §Compatibility tools, "Hot Loading".
+type ParkedSuperseder func(ctx context.Context, tx pgx.Tx) (afterCommit func(), err error)
+
 type Store struct {
 	pool *pgxpool.Pool
 	// Auditor records the reconcile's pin_conflict marks (actor null); nil records nothing.
 	Auditor audit.Recorder
+	// Superseder runs in the transaction of every write that changes the effective mapping; nil does nothing.
+	Superseder ParkedSuperseder
+}
+
+// supersede runs the superseder in tx, after the mapping rows are written (lock order: sessions last).
+func (s *Store) supersede(ctx context.Context, tx pgx.Tx) (func(), error) {
+	if s.Superseder == nil {
+		return func() {}, nil
+	}
+	return s.Superseder(ctx, tx)
 }
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
@@ -272,7 +286,17 @@ func (s *Store) SetDefault(ctx context.Context, toolID *string) (prev *string, e
 		`UPDATE instance_settings SET compat_tool_default_id = $1::uuid WHERE id = true`, toolID); err != nil {
 		return nil, err
 	}
-	return prev, tx.Commit(ctx)
+	after := func() {}
+	if (prev == nil) != (toolID == nil) || (prev != nil && *prev != *toolID) {
+		if after, err = s.supersede(ctx, tx); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	after()
+	return prev, nil
 }
 
 // Toggled is what an accepted enable or disable changed, for its audit row.
@@ -506,10 +530,18 @@ func (s *Store) SetMapping(ctx context.Context, appID, toolID string, forced boo
 		Scan(&m.Provider, &m.ExternalID, &m.ToolID, &m.Forced, &m.UpdatedAt); err != nil {
 		return
 	}
-	err = tx.QueryRow(ctx, `SELECT COALESCE(array_agg(id::text ORDER BY id), '{}') FROM apps
-		WHERE external_source = 'steam' AND external_id = $1`, appID).Scan(&m.AppIDs)
-	if err == nil {
-		err = tx.Commit(ctx)
+	if err = tx.QueryRow(ctx, `SELECT COALESCE(array_agg(id::text ORDER BY id), '{}') FROM apps
+		WHERE external_source = 'steam' AND external_id = $1`, appID).Scan(&m.AppIDs); err != nil {
+		return
+	}
+	after := func() {}
+	if prev == nil || prev.ToolID != m.ToolID || prev.Forced != m.Forced {
+		if after, err = s.supersede(ctx, tx); err != nil {
+			return
+		}
+	}
+	if err = tx.Commit(ctx); err == nil {
+		after()
 	}
 	return
 }
@@ -524,9 +556,14 @@ func refOf(id string, tag, sha *string) ToolRef {
 
 // ClearMapping removes the Steam game's mapping and returns it (nil when none existed).
 func (s *Store) ClearMapping(ctx context.Context, appID string) (prev *Mapping, prevTool ToolRef, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, ToolRef{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
 	var p Mapping
 	var tag, sha *string
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		WITH d AS (DELETE FROM compat_tool_mappings WHERE provider = 'steam' AND external_id = $1
 		           RETURNING tool_id, forced)
 		SELECT d.tool_id::text, d.forced, t.tag, t.asset_sha512 FROM d JOIN compat_tools t ON t.id = d.tool_id`, appID).
@@ -537,5 +574,13 @@ func (s *Store) ClearMapping(ctx context.Context, appID string) (prev *Mapping, 
 	if err != nil {
 		return nil, ToolRef{}, err
 	}
+	after, err := s.supersede(ctx, tx)
+	if err != nil {
+		return nil, ToolRef{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, ToolRef{}, err
+	}
+	after()
 	return &p, refOf(p.ToolID, tag, sha), nil
 }
