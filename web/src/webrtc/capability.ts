@@ -53,7 +53,7 @@ export function getOrCreateDeviceKey(): string {
  * says no, so a changed verdict (plugin installed) is posted at once, not tomorrow (#688).
  * It holds the zone and language too: launches read them from the record (amendment 49).
  */
-const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v3";
+const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v4";
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function deviceProbeIsFresh(userId: string, h264: boolean, now: number = Date.now()): boolean {
@@ -198,9 +198,19 @@ export function probeWebTransport(): { available: boolean; datagrams: boolean } 
   return { available, datagrams: available && "datagrams" in WebTransport.prototype };
 }
 
-/** Amendment 54's `webcodecs` key, for the configurations the WebTransport path uses.
- *  HEVC, AV1 and the encoder side come with #1036 and #1043. */
-export async function probeWebCodecs(): Promise<{ h264: boolean; opus_decode: boolean }> {
+/** The decoder strings the WebTransport path configures with (`decodeStage.ts`): what the agent's
+ *  descriptions yield for a Main-profile stream, at the top level each can carry. */
+const WEBCODECS_PROBES = {
+  h264: ["avc1.42e01f", [[1920, 1080]]],
+  hevc: ["hvc1.1.6.L153.B0", [[1920, 1080], [3840, 2160]]],
+  av1: ["av01.0.12M.08", [[1920, 1080], [3840, 2160]]],
+} as const;
+
+/** Amendment 54's `webcodecs` key, in the catalog codec spelling: `true` only when
+ *  `isConfigSupported` passes for every size the planner can pick for that codec, so a device
+ *  that decodes 1080p but not 4K stays on WebRTC for HEVC and AV1. Any throw or absent API is
+ *  `false`. The encoder side comes with #1036. */
+export async function probeWebCodecs(): Promise<{ h264: boolean; hevc: boolean; av1: boolean; opus_decode: boolean }> {
   const supported = async (check: () => Promise<{ supported?: boolean }> | undefined) => {
     try {
       return (await check())?.supported === true;
@@ -208,19 +218,30 @@ export async function probeWebCodecs(): Promise<{ h264: boolean; opus_decode: bo
       return false;
     }
   };
-  const [h264, opus] = await Promise.all([
-    supported(() =>
-      typeof VideoDecoder === "function"
-        ? VideoDecoder.isConfigSupported({ codec: "avc1.42e01f", codedWidth: 1920, codedHeight: 1080 })
-        : undefined,
-    ),
+  const video = async (codec: keyof typeof WEBCODECS_PROBES) => {
+    const [string, sizes] = WEBCODECS_PROBES[codec];
+    const each = await Promise.all(
+      sizes.map(([codedWidth, codedHeight]) =>
+        supported(() =>
+          typeof VideoDecoder === "function"
+            ? VideoDecoder.isConfigSupported({ codec: string, codedWidth, codedHeight })
+            : undefined,
+        ),
+      ),
+    );
+    return each.every(Boolean);
+  };
+  const [h264, hevc, av1, opus] = await Promise.all([
+    video("h264"),
+    video("hevc"),
+    video("av1"),
     supported(() =>
       typeof AudioDecoder === "function"
         ? AudioDecoder.isConfigSupported({ codec: "opus", sampleRate: 48000, numberOfChannels: 2 })
         : undefined,
     ),
   ]);
-  return { h264, opus_decode: opus };
+  return { h264, hevc, av1, opus_decode: opus };
 }
 
 /**
@@ -564,7 +585,7 @@ export interface DeviceCapabilities {
   rtt_ms: number | null;
   /** Amendment 54. */
   webtransport?: { available: boolean; datagrams: boolean };
-  webcodecs?: { h264: boolean; opus_decode: boolean };
+  webcodecs?: { h264: boolean; hevc: boolean; av1: boolean; opus_decode: boolean };
   /** Amendment 49: the browser's zone and language, read at launch. */
   timezone?: string;
   language?: string;

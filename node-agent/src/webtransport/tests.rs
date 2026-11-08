@@ -220,6 +220,205 @@ pub(super) mod streams {
         tu
     }
 
+    /// MSB-first bit writer with Exp-Golomb, for parameter sets a real parser accepts.
+    #[derive(Default)]
+    struct Bits {
+        bytes: Vec<u8>,
+        used: u8,
+    }
+
+    impl Bits {
+        fn u(&mut self, bits: u32, value: u64) -> &mut Self {
+            for i in (0..bits).rev() {
+                if self.used == 0 {
+                    self.bytes.push(0);
+                }
+                let last = self.bytes.len() - 1;
+                self.bytes[last] |= (((value >> i) & 1) as u8) << (7 - self.used);
+                self.used = (self.used + 1) % 8;
+            }
+            self
+        }
+
+        fn ue(&mut self, value: u64) -> &mut Self {
+            let v = value + 1;
+            let len = 64 - v.leading_zeros();
+            self.u(len - 1, 0).u(len, v)
+        }
+
+        fn se(&mut self, value: i64) -> &mut Self {
+            self.ue(if value > 0 {
+                value as u64 * 2 - 1
+            } else {
+                value.unsigned_abs() * 2
+            })
+        }
+
+        /// rbsp_trailing_bits, then emulation prevention, behind the 2-byte NAL header.
+        fn nal(&mut self, kind: u8) -> Vec<u8> {
+            self.u(1, 1);
+            while self.used != 0 {
+                self.u(1, 0);
+            }
+            let mut nal = vec![kind << 1, 1];
+            let mut zeros = 0;
+            for &b in &self.bytes {
+                if zeros >= 2 && b <= 3 {
+                    nal.push(3);
+                    zeros = 0;
+                }
+                zeros = if b == 0 { zeros + 1 } else { 0 };
+                nal.push(b);
+            }
+            nal
+        }
+    }
+
+    fn profile_tier_level(b: &mut Bits) {
+        // Main, compat bit 1 and 2, progressive, frame-only, level 93 (3.1).
+        b.u(2, 0)
+            .u(1, 0)
+            .u(5, 1)
+            .u(32, 0x6000_0000)
+            .u(1, 1)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 1);
+        b.u(32, 0).u(12, 0).u(8, 93);
+    }
+
+    /// An H.265 Annex-B access unit a real `h265parse` accepts: 64x64 Main, VPS, SPS, PPS, then
+    /// (`irap`) an IDR_W_RADL slice or a TRAIL_R slice with POC `poc`. The slice data is junk.
+    pub(in crate::webtransport) fn hevc_byte_stream(irap: bool, poc: u8) -> Vec<u8> {
+        let mut vps = Bits::default();
+        vps.u(4, 0)
+            .u(1, 1)
+            .u(1, 1)
+            .u(6, 0)
+            .u(3, 0)
+            .u(1, 1)
+            .u(16, 0xffff);
+        profile_tier_level(&mut vps);
+        vps.u(1, 1).ue(0).ue(0).ue(0).u(6, 0).ue(0).u(1, 0).u(1, 0);
+        let mut sps = Bits::default();
+        sps.u(4, 0).u(3, 0).u(1, 1);
+        profile_tier_level(&mut sps);
+        sps.ue(0).ue(1).ue(64).ue(64).u(1, 0).ue(0).ue(0).ue(4);
+        sps.u(1, 1).ue(0).ue(0).ue(0);
+        sps.ue(0).ue(3).ue(0).ue(3).ue(0).ue(0);
+        sps.u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0);
+        let mut pps = Bits::default();
+        pps.ue(0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(3, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .ue(0)
+            .ue(0)
+            .se(0);
+        pps.u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .se(0)
+            .se(0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0);
+        pps.u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, 0);
+        let mut slice = Bits::default();
+        slice.u(1, 1);
+        if irap {
+            slice.u(1, 0);
+        }
+        slice.ue(0).ue(if irap { 2 } else { 1 });
+        if !irap {
+            // POC lsb, an explicit short-term set of one picture back, then P-slice fields.
+            slice
+                .u(8, poc as u64)
+                .u(1, 0)
+                .ue(1)
+                .ue(0)
+                .ue(0)
+                .u(1, 1)
+                .u(1, 0)
+                .ue(0);
+        }
+        slice.se(0);
+        let mut au = Vec::new();
+        let nals: Vec<Vec<u8>> = if irap {
+            vec![vps.nal(32), sps.nal(33), pps.nal(34), slice.nal(19)]
+        } else {
+            vec![slice.nal(1)]
+        };
+        for (i, mut nal) in nals.into_iter().enumerate() {
+            if i + 1 == if irap { 4 } else { 1 } {
+                nal.extend(std::iter::repeat_n(0x55, 40));
+            }
+            au.extend_from_slice(&[0, 0, 0, 1]);
+            au.extend(nal);
+        }
+        au
+    }
+
+    /// An AV1 temporal unit a real `av1parse` accepts: a 64x64 still-picture (reduced header)
+    /// sequence header, then one lossless key frame OBU whose tile data is junk.
+    pub(in crate::webtransport) fn av1_key_tu() -> Vec<u8> {
+        let mut seq = Bits::default();
+        seq.u(3, 0)
+            .u(1, 1)
+            .u(1, 1)
+            .u(5, 8)
+            .u(4, 7)
+            .u(4, 7)
+            .u(8, 63)
+            .u(8, 63);
+        seq.u(1, 0).u(1, 0).u(1, 0); // 128x128 superblocks, filter intra, intra edge
+        seq.u(1, 0).u(1, 0).u(1, 0); // superres, cdef, restoration
+        seq.u(1, 0).u(1, 0).u(1, 0).u(1, 0).u(2, 0).u(1, 0); // color config
+        seq.u(1, 0); // film grain params
+        seq.u(1, 1);
+        while seq.used != 0 {
+            seq.u(1, 0);
+        }
+        let mut frame = Bits::default();
+        frame.u(1, 0).u(1, 0).u(1, 0).u(1, 1); // cdf update, screen content, render size, uniform tiles
+        frame.u(8, 0).u(3, 0).u(1, 0).u(1, 0).u(1, 0); // base_q_idx 0, delta q, qmatrix, segmentation, tx set
+        let mut obu_frame = frame.bytes.clone();
+        obu_frame.extend(std::iter::repeat_n(0x55, 40));
+        let mut tu = obu(2, 0);
+        tu.extend(wrap(1, &seq.bytes));
+        tu.extend(wrap(6, &obu_frame));
+        tu
+    }
+
+    fn wrap(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut o = obu(kind, 0);
+        o.pop();
+        o.push(payload.len() as u8);
+        o.extend_from_slice(payload);
+        o
+    }
+
     /// The OBU types of a temporal unit, panicking on one without a size field.
     pub(in crate::webtransport) fn obu_types(tu: &[u8]) -> Vec<u8> {
         let mut types = Vec::new();

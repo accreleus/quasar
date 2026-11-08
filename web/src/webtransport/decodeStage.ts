@@ -45,9 +45,10 @@ export function hevcCodecString(hvcC: Uint8Array): string {
   return `hvc1.${space}${hvcC[1] & 0x1f}.${(reversed >>> 0).toString(16).toUpperCase()}.${tier}${hvcC[12]}${constraints.join("")}`;
 }
 
-/** `av01.<profile>.<level><tier>.<depth>` from an av1C record; a Main-profile 8-bit 4.0 stream when the agent sent none. */
+/** `av01.<profile>.<level><tier>.<depth>` from an av1C record. av1parse gives the agent none, so
+ *  the usual case is the string `probeWebCodecs` vets: Main 8-bit, level 5.0 (4K60). */
 export function av1CodecString(av1C: Uint8Array): string {
-  if (av1C.length < 4) return "av01.0.08M.08";
+  if (av1C.length < 4) return "av01.0.12M.08";
   const profile = av1C[1] >> 5;
   const level = (av1C[1] & 0x1f).toString().padStart(2, "0");
   const tier = av1C[2] & 0x80 ? "H" : "M";

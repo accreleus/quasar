@@ -1049,4 +1049,122 @@ mod tests {
             "the delta before the first keyframe is skipped"
         );
     }
+    /// Starts `description` (an appsrc named `src` into a parser named `parse`, behind the
+    /// payloader the session's pipeline has) with a tap on the parser's src pad, and pushes
+    /// `first` until the parser has put out caps. `None` where the image lacks an element.
+    fn through_real_parser(
+        description: &str,
+        first: &[u8],
+    ) -> Option<(Attached, gstreamer_app::AppSrc, gst::Pipeline)> {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(description)
+            .map_err(|e| eprintln!("skipping: {e}"))
+            .ok()?
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let parse = pipeline.by_name("parse").unwrap();
+        let media = Media::new(&parse, crate::webtransport::tests::no_input());
+        tap(&parse.static_pad("src").unwrap(), &media, "s");
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let src = pipeline
+            .by_name("src")
+            .unwrap()
+            .downcast::<gstreamer_app::AppSrc>()
+            .unwrap();
+        push(&src, first, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !media.ready() {
+            assert!(Instant::now() < deadline, "no caps came out of the parser");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Some((media.attach().unwrap(), src, pipeline))
+    }
+
+    /// No flags: the parser decides which units are deltas.
+    fn push(src: &gstreamer_app::AppSrc, au: &[u8], n: u64) {
+        let mut b = gst::Buffer::from_slice(au.to_vec());
+        b.get_mut()
+            .unwrap()
+            .set_pts(gst::ClockTime::from_mseconds(33 * n));
+        src.push_buffer(b).unwrap();
+    }
+
+    #[test]
+    fn a_real_h265parse_hands_the_tap_hvc1_with_four_byte_lengths_and_irap_keyframes() {
+        let key = streams::hevc_byte_stream(true, 0);
+        let Some((mut client, src, pipeline)) = through_real_parser(
+            "appsrc name=src format=time caps=video/x-h265,stream-format=byte-stream,alignment=au \
+             ! h265parse name=parse ! rtph265pay pt=96 ! fakesink sync=false",
+            &key,
+        ) else {
+            return;
+        };
+        // The client attached after the first unit: it waits for the next keyframe.
+        push(&src, &streams::hevc_byte_stream(false, 1), 1);
+        push(&src, &key, 2);
+        push(&src, &streams::hevc_byte_stream(false, 3), 3);
+        let config = client.config.clone();
+        assert_eq!(
+            (config.codec, config.width, config.height),
+            ("h265", 64, 64)
+        );
+        assert_eq!(config.description[0], 1, "an hvcC record");
+        assert_eq!(config.description[21] & 3, 3, "4-byte NAL lengths");
+        assert_eq!(config.description[12], 93, "the SPS level reaches the hvcC");
+
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.len() < 2 && Instant::now() < deadline {
+            match client.rx.try_recv() {
+                Ok(Out::Unit(u)) => seen.push(u),
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "the keyframe and the trail unit that followed it"
+        );
+        assert!(seen[0].keyframe && !seen[1].keyframe);
+        let types = streams::hevc_types(&seen[0].data);
+        assert!(types.contains(&19), "the IDR slice: {types:?}");
+        assert!(
+            streams::hevc_types(&seen[1].data).contains(&1),
+            "the trail slice"
+        );
+    }
+    #[test]
+    fn a_real_av1parse_hands_the_tap_obu_temporal_units_and_sequence_header_keyframes() {
+        let key = streams::av1_key_tu();
+        let Some((mut client, src, pipeline)) = through_real_parser(
+            "appsrc name=src format=time caps=video/x-av1,stream-format=obu-stream,alignment=tu,parsed=true \
+             ! av1parse name=parse ! video/x-av1,parsed=true,stream-format=obu-stream,alignment=tu \
+             ! fakesink sync=false",
+            &key,
+        ) else {
+            return;
+        };
+        let config = client.config.clone();
+        assert_eq!((config.codec, config.width, config.height), ("av1", 64, 64));
+        assert!(
+            config.description.is_empty() || config.description[0] == 0x81,
+            "av1parse gives no av1C or a real one: {:02x?}",
+            config.description
+        );
+        push(&src, &key, 1);
+        let mut unit = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while unit.is_none() && Instant::now() < deadline {
+            match client.rx.try_recv() {
+                Ok(Out::Unit(u)) => unit = Some(u),
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+        let unit = unit.expect("a unit after the client attached");
+        assert!(unit.keyframe);
+        let types = streams::obu_types(&unit.data);
+        assert!(types.contains(&1) && !types.contains(&2), "{types:?}");
+    }
 }

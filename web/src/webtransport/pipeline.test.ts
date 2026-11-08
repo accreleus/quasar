@@ -388,12 +388,12 @@ describe("DecodeStage", () => {
     expect(codecString({ codec: "h265", description: hvcC(0x01, 0x60000000, 0xb0, 93) })).toBe("hvc1.1.6.L93.B0");
   });
 
-  it("names the AV1 codec from the av1C, or a Main 8-bit default without one", () => {
+  it("names the AV1 codec from the av1C, or the vetted Main 8-bit level 5.0 string without one", () => {
     expect(av1CodecString(Uint8Array.of(0x81, 0x08, 0x0c, 0))).toBe("av01.0.08M.08");
     expect(av1CodecString(Uint8Array.of(0x81, 0x4d, 0x6c, 0))).toBe("av01.2.13M.12");
     expect(av1CodecString(Uint8Array.of(0x81, 0x11, 0x4c, 0))).toBe("av01.0.17M.10");
     expect(av1CodecString(Uint8Array.of(0x81, 0x11, 0x8c, 0))).toBe("av01.0.17H.08");
-    expect(codecString({ codec: "av1", description: new Uint8Array(0) })).toBe("av01.0.08M.08");
+    expect(codecString({ codec: "av1", description: new Uint8Array(0) })).toBe("av01.0.12M.08");
     expect(codecString({ codec: "h264", description: avcC(0x34) })).toBe("avc1.42e034");
     expect(codecString({ codec: "vp9", description: new Uint8Array(0) })).toBe("vp9");
   });
@@ -409,7 +409,7 @@ describe("DecodeStage", () => {
     const av1 = stage();
     av1.s.config({ ...config(0), codec: "av1", description: new Uint8Array(0) });
     await flush();
-    expect(av1.decoders[0].configs[0]).toMatchObject({ codec: "av01.0.08M.08" });
+    expect(av1.decoders[0].configs[0]).toMatchObject({ codec: "av01.0.12M.08" });
     expect("description" in av1.decoders[0].configs[0]).toBe(false);
     av1.s.unit(unit(0, 1, true));
     expect(av1.decoders[0].chunks).toHaveLength(1);
