@@ -759,6 +759,7 @@ describe("createWebTransportRuntime fallback", () => {
     const fake: MediaTransport = {
       connect: async (s) => void (sink = s),
       requestKeyframe: () => {},
+      sendMic: () => false,
       input: { reliable: () => {}, datagram: () => false },
       close: () => void order.push("close"),
     };
