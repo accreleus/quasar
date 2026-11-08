@@ -310,6 +310,7 @@ pub(crate) struct Tap {
 impl Tap {
     /// `None` when no listener runs or the session was not assigned WebTransport.
     /// `pyrowave`: the session's config, its grant and the feed off the encode pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attach(
         registry: &Arc<Registry>,
         video: &gst::Pad,
@@ -1103,7 +1104,10 @@ async fn authenticate(
     if !matches!(
         timeout_at(
             deadline,
-            write_message(&mut send, &hello_ack(&client.config, media.audio(), client.reason))
+            write_message(
+                &mut send,
+                &hello_ack(&client.config, media.audio(), client.reason)
+            )
         )
         .await,
         Ok(Ok(()))
