@@ -5,7 +5,8 @@
 //! image ships Vulkan-Loader 1.4.345 (`deploy/pins.env` VULKAN_LOADER_REF), which locks that
 //! walk. On a GPU host, in the image:
 //! `QUASAR_REQUIRE_PYROWAVE=1 <test binary> --ignored --nocapture`; a crash is the failure.
-//! `QUASAR_RACE_SECS` sets the length (default 60).
+//! `QUASAR_RACE_SECS` sets the length (default 60). Only the runtime image carries the pinned
+//! loader: the dev and devtools images keep Fedora's 1.4.341, so it crashes there by design.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;

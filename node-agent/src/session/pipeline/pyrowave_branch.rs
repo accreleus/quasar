@@ -185,8 +185,9 @@ impl Drop for Encoder {
         }
         let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
         *stopped = true;
-        self.handoff.release();
         let _ = self.pipeline.set_state(gst::State::Null);
+        // Only once stopped: an encode in flight may still read the held frame.
+        self.handoff.release();
     }
 }
 
@@ -410,13 +411,13 @@ fn start_with(
         });
     let on_error: OnError = Arc::new(on_error);
     let bus_error = on_error.clone();
-    let bus_release = handoff.clone();
     pipeline
         .bus()
         .context("a pipeline has a bus")?
         .set_sync_handler(move |_, msg| {
+            // The held frame is not released here: the encode thread's wait times out and stops
+            // this pipeline first (this is its streaming thread, which cannot stop it).
             if let gst::MessageView::Error(err) = msg.view() {
-                bus_release.release();
                 bus_error(format!(
                     "{}: {}",
                     err.error(),
@@ -473,7 +474,7 @@ fn start_with(
         .add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
             if !open() || gave_up.load(Ordering::Acquire) {
                 if was_open.swap(false, Ordering::AcqRel) && started.load(Ordering::Acquire) {
-                    flush_off_thread(&weak_src, &in_flight, &held);
+                    flush_off_thread(&weak_src, &in_flight);
                 }
                 return gst::PadProbeReturn::Ok;
             }
@@ -533,6 +534,10 @@ fn start_with(
                 if held.wait(max) {
                     first_released.store(true, Ordering::Release);
                 } else if !gave_up.swap(true, Ordering::AcqRel) {
+                    // Stopped before the frame goes on: NULL waits out the encode still on it.
+                    if let Some(p) = weak.upgrade() {
+                        let _ = p.set_state(gst::State::Null);
+                    }
                     held_error(format!(
                         "PyroWave held a frame over {max:?}; the standard stream goes on"
                     ));
@@ -554,12 +559,7 @@ fn start_with(
 /// The client left: flush what the PyroWave pipeline holds, so a wedged one does not keep a
 /// compositor frame until the session ends. Off the encode thread: a flush-stop takes the
 /// stream locks downstream.
-fn flush_off_thread(
-    weak_src: &glib::WeakRef<gst_app::AppSrc>,
-    in_flight: &Arc<InFlight>,
-    handoff: &Arc<Handoff>,
-) {
-    handoff.release();
+fn flush_off_thread(weak_src: &glib::WeakRef<gst_app::AppSrc>, in_flight: &Arc<InFlight>) {
     let (weak_src, in_flight) = (weak_src.clone(), in_flight.clone());
     let _ = std::thread::Builder::new()
         .name("quasar-pw-flush".into())
@@ -817,6 +817,92 @@ mod tests {
         source.set_state(gst::State::Null).unwrap();
         let s = caps.structure(0).unwrap();
         assert_eq!(s.get::<&str>("colorimetry").ok(), Some("bt709"), "{caps}");
+    }
+
+    /// A frame PyroWave overholds goes to the standard encoder only once PyroWave has been
+    /// stopped (its encode of that frame finished), not at the timeout; the stream goes on.
+    #[test]
+    fn an_overheld_frame_goes_on_only_after_pyrowave_has_stopped() {
+        gst::init().unwrap();
+        let caps = gst::Caps::builder("video/x-raw")
+            .features(["memory:VulkanImage"])
+            .field("format", "NV12")
+            .field("width", 64)
+            .field("height", 48)
+            .field("framerate", gst::Fraction::new(60, 1))
+            .field("colorimetry", "bt709")
+            .build();
+        let main = gst::Pipeline::new();
+        let src = gst_app::AppSrc::builder()
+            .caps(&caps)
+            .format(gst::Format::Time)
+            .build();
+        let queue = gst::ElementFactory::make("queue").build().unwrap();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .unwrap();
+        main.add_many([src.upcast_ref(), &queue, &sink]).unwrap();
+        gst::Element::link_many([src.upcast_ref(), &queue, &sink]).unwrap();
+        let arrivals = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let seen = arrivals.clone();
+        sink.static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                seen.lock().unwrap().push(Instant::now());
+                gst::PadProbeReturn::Ok
+            });
+        let feed = feed_at(queue.static_pad("src").unwrap(), &caps).unwrap();
+        // The PyroWave stand-in turns slow (500 ms a frame) after its first frame.
+        let enc = gst::ElementFactory::make("identity").build().unwrap();
+        let slow = enc.clone();
+        let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let errs = errors.clone();
+        let side = start_with(
+            feed,
+            None,
+            &enc,
+            || true,
+            move |_| slow.set_property("sleep-time", 500_000u32),
+            move |e| errs.lock().unwrap().push(e),
+        )
+        .unwrap();
+        main.set_state(gst::State::Playing).unwrap();
+        for i in 0..20u64 {
+            let mut buf = gst::Buffer::with_size(64 * 48 * 3 / 2).unwrap();
+            buf.get_mut()
+                .unwrap()
+                .set_pts(gst::ClockTime::from_mseconds(i * 50));
+            src.push_buffer(buf).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        wait_until("every frame on the standard side", || {
+            arrivals.lock().unwrap().len() == 20
+        });
+        let state = side.pipeline.current_state();
+        drop(side);
+        main.set_state(gst::State::Null).unwrap();
+        let errors = errors.lock().unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("held a frame"), "{}", errors[0]);
+        assert_eq!(state, gst::State::Null, "PyroWave stopped");
+        let arrivals = arrivals.lock().unwrap();
+        let gaps: Vec<Duration> = arrivals.windows(2).map(|w| w[1] - w[0]).collect();
+        let longest = *gaps.iter().max().unwrap();
+        assert!(
+            longest >= Duration::from_millis(450),
+            "the overheld frame went on at {longest:?}, before PyroWave finished it"
+        );
+        // After the give-up the standard stream runs at the push pace, with no waits.
+        let after = gaps
+            .iter()
+            .skip_while(|g| **g < Duration::from_millis(450))
+            .skip(1);
+        assert!(after.clone().count() > 5);
+        assert!(
+            after.clone().all(|g| *g < Duration::from_millis(200)),
+            "{gaps:?}"
+        );
     }
 
     #[test]
