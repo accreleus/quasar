@@ -61,6 +61,42 @@ impl InFlight {
     }
 }
 
+/// The most the encode thread waits for PyroWave to release a frame. Over it PyroWave is
+/// switched off: a GPU that slow is not one to stream PyroWave from.
+const HANDOFF_MAX: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The ordered hand-off of a Vulkan frame between PyroWave and the standard encoder, which
+/// read the same image and each move its layout (#1104 review). The encode thread holds the
+/// frame until PyroWave releases it, after PyroWave's GPU work is waited and the image is back
+/// in its tracked layout, so the two never touch the image at once.
+#[derive(Default)]
+struct Handoff {
+    held: Mutex<bool>,
+    released: std::sync::Condvar,
+}
+
+impl Handoff {
+    fn hold(&self) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    fn release(&self) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.released.notify_all();
+    }
+
+    /// Wait for the release; false when it did not come within `max` (the hold is dropped).
+    fn wait(&self, max: std::time::Duration) -> bool {
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut held, result) = self
+            .released
+            .wait_timeout_while(held, max, |h| *h)
+            .unwrap_or_else(|e| e.into_inner());
+        *held = false;
+        !result.timed_out()
+    }
+}
+
 /// How often the encode summary is logged.
 const STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -132,6 +168,7 @@ pub(crate) struct Encoder {
     stopped: Arc<Mutex<bool>>,
     /// The appsrc pad answering context queries, and its probe.
     context_probe: (gst::Pad, Option<gst::PadProbeId>),
+    handoff: Arc<Handoff>,
 }
 
 impl Drop for Encoder {
@@ -144,6 +181,7 @@ impl Drop for Encoder {
         }
         let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
         *stopped = true;
+        self.handoff.release();
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
@@ -190,6 +228,29 @@ fn source_colorimetry(pad: &gst::Pad) -> Option<String> {
         return None;
     }
     q.context()?.structure().get::<String>("colorimetry").ok()
+}
+
+/// Fill the colorimetry of caps events leaving `pad` (the encode pipeline's interpipesrc) from
+/// the source it listens to: its own caps cannot carry it (an interpipesrc with fixed caps
+/// refuses the source's), and the standard encoder writes it into its VUI (H.265).
+pub(crate) fn tag_caps_with_source_colorimetry(pad: &gst::Pad) {
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |pad, info| {
+        let Some(gst::PadProbeData::Event(event)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let gst::EventView::Caps(c) = event.view() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let caps = c.caps_owned();
+        if caps.structure(0).is_none_or(|s| s.has_field("colorimetry")) {
+            return gst::PadProbeReturn::Ok;
+        }
+        if let Some(colorimetry) = source_colorimetry(pad) {
+            let tagged = with_colorimetry(caps, Some(colorimetry));
+            info.data = Some(gst::PadProbeData::Event(gst::event::Caps::new(&tagged)));
+        }
+        gst::PadProbeReturn::Ok
+    });
 }
 
 /// `caps` with the source's colorimetry, when it said one.
@@ -309,6 +370,17 @@ fn start_with(
     // compositor buffer. A frame that never comes out goes stale (IN_FLIGHT_STALE).
     let in_flight = Arc::new(InFlight::default());
     let cleared = in_flight.clone();
+    let handoff = Arc::new(Handoff::default());
+    // The frame has left its Vulkan image once the download has copied it out (CPU path) or
+    // the encoder has output it (zero copy): either way the standard encoder may read it now.
+    if let Some(pad) = download.as_ref().and_then(|d| d.static_pad("src")) {
+        let released = handoff.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            released.release();
+            gst::PadProbeReturn::Ok
+        });
+    }
+    let encoded = handoff.clone();
     enc.static_pad("src")
         .context("the encoder has no src pad")?
         .add_probe(gst::PadProbeType::BUFFER, {
@@ -317,6 +389,7 @@ fn start_with(
                 times: Vec::new(),
             });
             move |_, info| {
+                encoded.release();
                 let admitted = cleared.take();
                 if admitted > 0 {
                     let now = gst::get_timestamp().nseconds();
@@ -333,11 +406,13 @@ fn start_with(
         });
     let on_error: OnError = Arc::new(on_error);
     let bus_error = on_error.clone();
+    let bus_release = handoff.clone();
     pipeline
         .bus()
         .context("a pipeline has a bus")?
         .set_sync_handler(move |_, msg| {
             if let gst::MessageView::Error(err) = msg.view() {
+                bus_release.release();
                 bus_error(format!(
                     "{}: {}",
                     err.error(),
@@ -372,11 +447,17 @@ fn start_with(
         .context("could not answer context queries")?;
     let download = download.map(|d| d.downgrade());
     let weak_enc = enc.downgrade();
-    // The frames' caps with the source's colorimetry, decided by the start thread.
+    // The frames' caps with the source's colorimetry, decided once by the start thread. Safe to
+    // keep: the interpipesrc's caps are fixed for the encode pipeline's life (no
+    // renegotiation), a swap's compositor is built from the same request, and an adoption
+    // that re-streams builds a new encode pipeline, and with it a new PyroWave branch.
     let sample_caps: Arc<Mutex<Option<gst::Caps>>> = Arc::default();
     let starting = Arc::new(AtomicBool::new(false));
     let started = Arc::new(AtomicBool::new(false));
     let was_open = AtomicBool::new(false);
+    let gave_up = AtomicBool::new(false);
+    let held = handoff.clone();
+    let held_error = on_error.clone();
     let stopped = Arc::new(Mutex::new(false));
     let start_stopped = stopped.clone();
     let weak = pipeline.downgrade();
@@ -385,9 +466,9 @@ fn start_with(
     let probe = feed
         .pad
         .add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
-            if !open() {
+            if !open() || gave_up.load(Ordering::Acquire) {
                 if was_open.swap(false, Ordering::AcqRel) && started.load(Ordering::Acquire) {
-                    flush_off_thread(&weak_src, &in_flight);
+                    flush_off_thread(&weak_src, &in_flight, &held);
                 }
                 return gst::PadProbeReturn::Ok;
             }
@@ -425,9 +506,24 @@ fn start_with(
             if let Some(caps) = &caps {
                 sample = sample.caps(caps);
             }
+            let vulkan = caps
+                .as_ref()
+                .and_then(|c| c.features(0))
+                .is_some_and(|f| f.contains("memory:VulkanImage"));
+            if vulkan {
+                held.hold();
+            }
             // A push the PyroWave pipeline refuses (stopped, failed) is its own business.
             if src.push_sample(&sample.build()).is_err() {
                 in_flight.clear();
+                held.release();
+                return gst::PadProbeReturn::Ok;
+            }
+            // The standard encoder reads this image next: not before PyroWave is done with it.
+            if vulkan && !held.wait(HANDOFF_MAX) && !gave_up.swap(true, Ordering::AcqRel) {
+                held_error(format!(
+                    "PyroWave held a frame over {HANDOFF_MAX:?}; the standard stream goes on"
+                ));
             }
             gst::PadProbeReturn::Ok
         })
@@ -438,13 +534,19 @@ fn start_with(
         probe: Some(probe),
         stopped,
         context_probe: (context_pad, Some(context_probe)),
+        handoff,
     })
 }
 
 /// The client left: flush what the PyroWave pipeline holds, so a wedged one does not keep a
 /// compositor frame until the session ends. Off the encode thread: a flush-stop takes the
 /// stream locks downstream.
-fn flush_off_thread(weak_src: &glib::WeakRef<gst_app::AppSrc>, in_flight: &Arc<InFlight>) {
+fn flush_off_thread(
+    weak_src: &glib::WeakRef<gst_app::AppSrc>,
+    in_flight: &Arc<InFlight>,
+    handoff: &Arc<Handoff>,
+) {
+    handoff.release();
     let (weak_src, in_flight) = (weak_src.clone(), in_flight.clone());
     let _ = std::thread::Builder::new()
         .name("quasar-pw-flush".into())
@@ -652,6 +754,80 @@ mod tests {
             Some("cudadownload")
         );
         assert!(download_for(&caps(Some("memory:DMABuf"))).is_err());
+    }
+
+    /// The interpipe shape: the encode side's source has fixed, untagged caps (as an
+    /// interpipesrc with `caps` set) and its context queries reach the source pipeline.
+    #[test]
+    fn the_encoder_input_carries_the_colorimetry_the_source_negotiated() {
+        gst::init().unwrap();
+        let source = gst::parse::launch(
+            "videotestsrc is-live=true ! capsfilter name=tail \
+             caps=video/x-raw,format=NV12,width=64,height=48,colorimetry=bt709 ! fakesink",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let tail = source.by_name("tail").unwrap().static_pad("src").unwrap();
+        answer_colorimetry_queries(&tail);
+        source.set_state(gst::State::Playing).unwrap();
+        wait_until("source negotiated", || tail.current_caps().is_some());
+
+        let encode = gst::Pipeline::new();
+        let src = gst_app::AppSrc::builder()
+            .caps(&raw())
+            .format(gst::Format::Time)
+            .build();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        encode.add_many([src.upcast_ref(), &sink]).unwrap();
+        src.link(&sink).unwrap();
+        let src_pad = src.static_pad("src").unwrap();
+        src_pad.add_probe(gst::PadProbeType::QUERY_UPSTREAM, move |_, info| {
+            let Some(gst::PadProbeData::Query(q)) = info.data.as_mut() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            match tail.query(q) {
+                true => gst::PadProbeReturn::Handled,
+                false => gst::PadProbeReturn::Ok,
+            }
+        });
+        tag_caps_with_source_colorimetry(&src_pad);
+        encode.set_state(gst::State::Playing).unwrap();
+        src.push_buffer(gst::Buffer::with_size(64 * 48 * 3 / 2).unwrap())
+            .unwrap();
+        let sink_pad = sink.static_pad("sink").unwrap();
+        wait_until("encode side negotiated", || {
+            sink_pad.current_caps().is_some()
+        });
+        let caps = sink_pad.current_caps().unwrap();
+        encode.set_state(gst::State::Null).unwrap();
+        source.set_state(gst::State::Null).unwrap();
+        let s = caps.structure(0).unwrap();
+        assert_eq!(s.get::<&str>("colorimetry").ok(), Some("bt709"), "{caps}");
+    }
+
+    #[test]
+    fn the_encode_thread_waits_for_pyrowave_to_release_the_frame() {
+        let h = Arc::new(Handoff::default());
+        h.hold();
+        assert!(
+            !h.wait(Duration::from_millis(20)),
+            "no release: it gives up"
+        );
+        h.hold();
+        let releaser = h.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            releaser.release();
+        });
+        let start = Instant::now();
+        assert!(h.wait(Duration::from_secs(5)), "released");
+        assert!(
+            start.elapsed() >= Duration::from_millis(25),
+            "it waited for the release"
+        );
+        t.join().unwrap();
+        assert!(h.wait(Duration::from_millis(1)), "nothing held: no wait");
     }
 
     #[test]

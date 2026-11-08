@@ -730,6 +730,13 @@ pub fn build_encode_pipeline<T: Transport>(
         .property("caps", &raw_caps)
         .build()
         .context("interpipesrc not found — is gst-interpipe installed in the image?")?;
+    // A PyroWave grant asks the compositor for BT.709; the encoder input says so too, read
+    // from the source actually listened to (an adopted compositor may say BT.601).
+    if cfg.webtransport && cfg.pyrowave.is_some() {
+        if let Some(pad) = interpipesrc.static_pad("src") {
+            pyrowave_branch::tag_caps_with_source_colorimetry(&pad);
+        }
+    }
     // A short leaky queue decouples the interpipe pull from the encoder thread and drops
     // stale frames across a switch rather than building latency.
     let queue = gst::ElementFactory::make("queue")

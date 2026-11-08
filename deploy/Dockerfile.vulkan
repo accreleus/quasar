@@ -689,14 +689,21 @@ RUN find /opt/gst -name '*.a' -delete \
 # checkout_granite.sh names its own Granite commit; GRANITE_REF must equal it or the build stops,
 # so the two pins cannot drift apart unnoticed. Placed after the static-archive strip: the
 # library is a .so, and nothing else here depends on this layer.
+# deploy/patches/pyrowave/volk-no-get-device-queue2.patch keeps Granite's volk from looking up
+# vkGetDeviceQueue2: on this image's Vulkan-Loader (before 1.4.345) that one lookup races another
+# thread's vkCreateInstance (#267), and PyroWave builds its device table on a device the
+# compositor shares (#1104). The grep after it fails the build if the lookup comes back.
 ARG PYROWAVE_REF
 ARG GRANITE_REF
+COPY deploy/patches/pyrowave/volk-no-get-device-queue2.patch /tmp/
 RUN set -eu; \
     git clone https://github.com/Themaister/pyrowave.git /opt/pyrowave \
     && cd /opt/pyrowave \
     && git checkout ${PYROWAVE_REF} \
     && bash checkout_granite.sh \
     && [ "$(git -C Granite rev-parse HEAD)" = "${GRANITE_REF}" ] \
+    && git -C Granite/third_party/volk apply /tmp/volk-no-get-device-queue2.patch \
+    && ! grep -q 'load(context, "vkGetDeviceQueue2")' Granite/third_party/volk/volk.c \
     && cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/gst \

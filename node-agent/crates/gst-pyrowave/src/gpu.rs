@@ -460,10 +460,9 @@ impl Shared {
     /// `SHADER_READ_ONLY_OPTIMAL` and back in their tracked layouts, submit it on the queue
     /// under its lock, and wait for it.
     ///
-    /// shortcut: the layout round trip races any other reader of the same image (the
-    /// session's standard encoder reads it at the same time); harmless while encode-src
-    /// images are uncompressed (LINEAR on AMD; NVIDIA ignores layouts). Upgrade to an
-    /// ordered hand-off from the standard encoder if a driver compresses them.
+    /// The layout round trip needs no other reader on the image meanwhile: the caller holds
+    /// the frame back from everything else until this returns (the session's hand-off,
+    /// `pyrowave_branch::Handoff`).
     pub(crate) fn submit(
         &self,
         planes: &[Plane],
