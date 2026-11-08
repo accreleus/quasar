@@ -35,6 +35,8 @@ const LOG: usize = 1 << 14;
 // behind it.
 const GROUP_US: u64 = 5_000;
 const BURST_US: u64 = 5_000;
+/// No group grows past this much arrival time (libwebrtc `kMaxBurstDuration`).
+const MAX_BURST_US: u64 = 100_000;
 
 // Trendline and adaptive threshold (libwebrtc `TrendlineEstimator`).
 const WINDOW: usize = 20;
@@ -154,7 +156,9 @@ struct Slot {
 pub(crate) struct SendLog {
     start: Instant,
     slots: Vec<Slot>,
-    last_sent: Option<Instant>,
+    /// The first send since the last feedback: the silence clock starts here, not at the
+    /// feedback, or a frame after a still screen would be judged before its answer can come.
+    unanswered_since: Option<Instant>,
 }
 
 impl SendLog {
@@ -162,7 +166,7 @@ impl SendLog {
         Self {
             start,
             slots: vec![Slot::default(); LOG],
-            last_sent: None,
+            unanswered_since: None,
         }
     }
 
@@ -180,7 +184,7 @@ impl SendLog {
             resend,
             status: Status::Unreported,
         };
-        self.last_sent = Some(at);
+        self.unanswered_since.get_or_insert(at);
     }
 
     fn slot(&mut self, seq: u32) -> Option<&mut Slot> {
@@ -208,6 +212,7 @@ pub(crate) enum Usage {
 struct Group {
     first_send: u64,
     last_send: u64,
+    first_arrival: u64,
     last_arrival: u64,
 }
 
@@ -225,6 +230,7 @@ impl InterArrival {
             self.current = Some(Group {
                 first_send: send,
                 last_send: send,
+                first_arrival: arrival,
                 last_arrival: arrival,
             });
             return None;
@@ -236,7 +242,8 @@ impl InterArrival {
         // Arrived back to back behind the group, sooner than it was sent: queued behind it.
         let in_arrival_burst = arrival >= cur.last_arrival
             && arrival - cur.last_arrival < BURST_US
-            && (arrival - cur.last_arrival) < send.saturating_sub(cur.last_send);
+            && (arrival - cur.last_arrival) < send.saturating_sub(cur.last_send)
+            && arrival.saturating_sub(cur.first_arrival) < MAX_BURST_US;
         if in_send_burst || in_arrival_burst {
             cur.last_send = cur.last_send.max(send);
             cur.last_arrival = cur.last_arrival.max(arrival);
@@ -256,6 +263,7 @@ impl InterArrival {
         self.current = Some(Group {
             first_send: send,
             last_send: send,
+            first_arrival: arrival,
             last_arrival: arrival,
         });
         out
@@ -447,6 +455,7 @@ impl Estimator {
     ) -> Option<f64> {
         self.last_feedback = Some(now);
         self.last_decay = None;
+        log.unanswered_since = None;
         let m = self.measure(fb, log, now);
         let dt = now
             .saturating_duration_since(self.last_update)
@@ -516,16 +525,17 @@ impl Estimator {
     }
 
     /// Called on the agent's own clock between messages. Media sent and no feedback for
-    /// longer than the client's interval allows is congestion, and decays the estimate.
+    /// longer than the client's interval allows, counted from the first send it has not
+    /// answered, is congestion, and decays the estimate.
     /// A client that never sent feedback is not judged (§Feedback lets it omit it).
     pub(crate) fn on_tick(&mut self, now: Instant, log: &SendLog, rtt: Duration) -> Option<f64> {
-        let fb_at = self.last_feedback?;
+        self.last_feedback?;
+        let sent = log.unanswered_since?;
         let timeout = SILENCE_MIN.max(FEEDBACK_INTERVAL * 2 + rtt);
-        let silent = now.saturating_duration_since(fb_at) > timeout;
-        if !silent || log.last_sent.is_none_or(|s| s <= fb_at) {
+        if now.saturating_duration_since(sent) <= timeout {
             return None;
         }
-        let from = self.last_decay.unwrap_or(fb_at + timeout);
+        let from = self.last_decay.unwrap_or(sent + timeout);
         let steps = now.saturating_duration_since(from).as_secs_f64() / SILENCE_STEP.as_secs_f64();
         let factor = SILENCE_DECAY.powf(steps);
         self.delay_kbps *= factor;

@@ -683,6 +683,10 @@ struct Plan {
     launch_floor_kbps: u32,
     trace_tx: TraceTx,
     session_id: String,
+    /// What a takeover from another loop writes back ([`take_over`]).
+    launch_cfg: Arc<SessionConfig>,
+    abr_cfg: abr::AbrConfig,
+    lever: Option<Arc<EncodeResolutionLever>>,
 }
 
 /// Build one transport's governor loop on `encoder`; `None` when the encoder takes no live
@@ -815,6 +819,9 @@ fn arm(
         launch_floor_kbps,
         trace_tx: trace_tx_for_ladder,
         session_id: session_id_for_ladder,
+        launch_cfg: Arc::new(cfg.clone()),
+        abr_cfg,
+        lever,
     };
     Some((abr_loop, plan))
 }
@@ -825,7 +832,11 @@ fn arm(
 /// transport that starts last drives the encoder.
 fn start(abr_loop: &Arc<AbrLoop>, plan: &Plan, estimate: Box<dyn Fn() -> f64 + Send + Sync>) {
     if let Some(m) = abr_loop.metrics.upgrade() {
+        let previous = m.abr_owner();
         m.claim_abr(abr_loop.id);
+        if previous != 0 && previous != abr_loop.id {
+            take_over(abr_loop, plan, &m);
+        }
     }
     let Plan {
         mode,
@@ -840,6 +851,7 @@ fn start(abr_loop: &Arc<AbrLoop>, plan: &Plan, estimate: Box<dyn Fn() -> f64 + S
         launch_floor_kbps,
         trace_tx: trace_tx_for_ladder,
         session_id: session_id_for_ladder,
+        ..
     } = plan.clone();
     // Stall rescue: an estimator may notify only on CHANGE (`rtpgccbwe` does), and GCC pins its estimate under
     // sustained loss and at max-bitrate, so a notification-only governor strands
@@ -1159,6 +1171,29 @@ pub(crate) fn feedback_abr(
     })
 }
 
+/// Another transport's loop owned the encoder and left its bitrate, bias and rungs on it,
+/// while this loop's governor sits at the ceiling, inside its deadband: it would never
+/// write them back. Start both at launch.
+fn take_over(abr_loop: &AbrLoop, plan: &Plan, metrics: &SessionMetrics) {
+    *abr_loop.governor.lock().unwrap() =
+        abr::Governor::new(plan.abr_cfg, std::time::Instant::now());
+    abr_loop
+        .fps
+        .store(plan.abr_cfg.fps, std::sync::atomic::Ordering::Relaxed);
+    metrics.set_abr_setpoint(plan.abr_cfg.ceiling_kbps);
+    let written = write_launch_point(
+        &abr_loop.encoder,
+        &plan.launch_cfg,
+        plan.lever.as_deref(),
+        metrics,
+    );
+    tracing::info!(
+        token = "abr-encoder-taken-over",
+        "{} took the encoder over from another transport's ABR; written: {written}",
+        abr_loop.source
+    );
+}
+
 /// Put the encoder back at its launch operating point for a transport that replaces
 /// another (#535). [`enable_abr`] starts the new transport's governor at the ceiling and
 /// its ladder at rung 0; without this the encoder keeps the last peer's degraded bitrate,
@@ -1176,7 +1211,7 @@ pub(super) fn reset_to_launch(
     metrics: &SessionMetrics,
 ) {
     metrics.clear_hooks();
-    let written = write_launch_point(encoder, cfg, lever, metrics);
+    let written = write_launch_point(encoder, cfg, Some(lever), metrics);
     tracing::info!(
         token = "transport-replaced-encoder-kept",
         "encoder {} kept across the transport replacement; written: {written}",
@@ -1203,7 +1238,7 @@ pub(super) fn write_bitrate_live(
 fn write_launch_point(
     encoder: &gst::Element,
     cfg: &SessionConfig,
-    lever: &EncodeResolutionLever,
+    lever: Option<&EncodeResolutionLever>,
     metrics: &SessionMetrics,
 ) -> String {
     if cfg.abr_mode == AbrMode::Off || !encoder_abr_writable(encoder, cfg.encoder) {
@@ -1218,7 +1253,7 @@ fn write_launch_point(
     metrics.set_ladder_bias(0);
     metrics.set_abr_floor(0);
     let (mut fps_moved, mut size) = (false, "not written (no scale stage)");
-    if lever.stage().supported {
+    if let Some(lever) = lever.filter(|l| l.stage().supported) {
         // `Err` is a stage with no fps rung.
         fps_moved = lever.set_fps(cfg.stream.fps).unwrap_or(false);
         metrics.set_ladder_fps(0);
@@ -1627,6 +1662,45 @@ mod tests {
             Some(1111.0),
             "a new client on the first transport took it back"
         );
+    }
+
+    /// A takeover across transports: loop A drove the encoder down, then B claims it. B's
+    /// governor starts at the ceiling, inside its deadband, so B must write launch itself.
+    #[test]
+    fn a_loop_taking_the_encoder_over_puts_it_back_at_launch() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let mut cfg = cfg_with_floors(0, Some(500));
+        cfg.abr_governor.min_interval_ms = 1;
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let rate = || {
+            feedback_abr(
+                &encoder,
+                &cfg,
+                metrics.clone(),
+                trace.clone(),
+                "s".into(),
+                None,
+            )
+            .unwrap()
+        };
+        let bitrate = || encoder.property::<u32>("bitrate") / 1000;
+        let (a, b) = (rate(), rate());
+        (a.start)();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        (a.observe)(2000.0);
+        let driven = bitrate();
+        assert!(
+            driven < 11_500,
+            "loop A drove the encoder down ({driven} kbit/s)"
+        );
+        (b.start)();
+        assert_eq!(bitrate(), 11_500, "back at launch under its new owner");
+        (b.observe)(11_500.0);
+        assert_eq!(bitrate(), 11_500);
     }
 
     // ---- ResolutionLever ----

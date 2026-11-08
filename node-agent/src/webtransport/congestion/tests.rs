@@ -346,15 +346,44 @@ fn feedback_silence_while_media_is_sent_decays_the_estimate() {
     }
     assert_eq!(
         fed_abr.first().map(|&(step, _)| step),
-        Some(6),
-        "past 500 ms: {fed_abr:?}"
+        Some(7),
+        "500 ms past the first unanswered send (step 1): {fed_abr:?}"
     );
     let e = s.est.estimate_kbps();
-    // 2.5 s past the 500 ms timeout: 0.8 every 500 ms.
-    let decayed = fed * 0.8f64.powi(5);
+    // Step 30 is 2.4 s past that timeout: 0.8 every 500 ms.
+    let decayed = fed * 0.8f64.powf(4.8);
     assert!(
         (e - decayed).abs() < 0.05 * fed,
         "3 s of silence: {fed:.0} → {e:.0}"
+    );
+}
+
+#[test]
+fn a_frame_after_a_still_screen_is_not_judged_before_its_feedback_can_return() {
+    let mut s = Sim::new(50_000.0);
+    s.send_kbps = Some(6000.0);
+    s.run(2.0);
+    // 5 s of a still screen: nothing sent, so nothing to answer.
+    let still = s.t;
+    for step in 1..=50u64 {
+        let at = s.start + Duration::from_micros(still + step * 100_000);
+        assert_eq!(s.est.on_tick(at, &s.log, RTT), None);
+    }
+    s.t = still + 5_000_000;
+    s.frame();
+    let sent = s.t;
+    for (after_ms, answered) in [(30, false), (60, true), (100, false), (700, false)] {
+        s.t = sent + after_ms * 1000;
+        if answered {
+            s.feedback();
+        }
+        let at = s.start + Duration::from_micros(s.t);
+        s.est.on_tick(at, &s.log, RTT);
+    }
+    assert_eq!(
+        s.est.estimate_kbps(),
+        CEILING,
+        "the frame was answered in 60 ms"
     );
 }
 
