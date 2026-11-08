@@ -38,6 +38,15 @@ describe("FeedbackRecorder", () => {
     expect(r.take(150)).toMatchObject({ seq: 2, first_pkt_seq: 2, count: 2, lost: 1, interval_ms: 100 });
   });
 
+  it("holds back the newest 5 ms, so a datagram reordered by less is no loss", () => {
+    const r = new FeedbackRecorder(0);
+    r.record(dgram(1), 10);
+    r.record(dgram(3), 12);
+    expect(r.take(15.5)).toMatchObject({ first_pkt_seq: 1, count: 1, lost: 0 });
+    r.record(dgram(2), 16);
+    expect(r.take(25)).toMatchObject({ first_pkt_seq: 2, count: 2, lost: 0 });
+  });
+
   it("wraps pkt_seq and ignores channels without one", () => {
     const r = new FeedbackRecorder(0);
     r.record(dgram(0xffff_ffff), 1);

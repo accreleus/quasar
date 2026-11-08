@@ -1,10 +1,19 @@
 //! Receiver feedback into an available-rate estimate
-//! (`protocol/transport-webtransport.md` §Feedback). The estimate goes to the session's
-//! ABR exactly as `rtpgccbwe`'s does on WebRTC; this module is the estimator only.
+//! (`protocol/transport-webtransport.md` §Feedback), built from the parts of Google
+//! Congestion Control (draft-ietf-rmcat-gcc-02) that `rtpgccbwe` runs on WebRTC, with
+//! libwebrtc's constants:
 //!
-//! A delay- and loss-based estimator after GCC (draft-ietf-rmcat-gcc): queueing delay is
-//! the one-way delay above its 10 s minimum; overuse cuts the estimate to 0.85 × the
-//! measured receive rate, moderate loss scales it down, a clear path grows it 8 % a second.
+//! - **Delay.** Datagrams are grouped by send burst; each group's inter-group delay
+//!   variation feeds a trendline (the slope of the smoothed accumulated delay over 20
+//!   groups) compared with an adaptive threshold. Only differences on one clock are used,
+//!   so a clock offset cancels and drift is a slope far under the threshold; a route step
+//!   or a standing queue is a level, not a slope.
+//! - **AIMD** on that signal: overuse cuts to 0.85 × the receive rate; normal grows 8 % a
+//!   second, never past 1.5 × the receive rate.
+//! - **Loss.** Over 10 % scales by (1 − loss/2); under 2 % lets it grow.
+//! - The estimate is the least of the two, of 1.5 × QUIC's own cwnd/RTT once QUIC has
+//!   seen congestion, and of the ceiling.
+//! - Feedback that stops while media is being sent decays it.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -14,31 +23,66 @@ use serde_json::Value;
 
 /// §Feedback: `count` is at most 8192; arrivals are in 50 µs units, `0xFFFF` not received.
 const MAX_COUNT: usize = 8192;
-const UNIT_US: i64 = 50;
+const UNIT_US: u64 = 50;
 const NOT_RECEIVED: u16 = 0xFFFF;
+/// The client's cadence (§Feedback).
+const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Send records kept, by `pkt_seq`. At 1148-byte datagrams that is about 18 MB of
-/// history, over a second at 100 Mbit/s; feedback arrives within 50 ms plus a round trip.
+/// Send records kept, by `pkt_seq`: over a second at 100 Mbit/s.
 const LOG: usize = 1 << 14;
 
-/// The receive rate is measured over this much of the client's arrival clock, and loss
-/// over this much of the agent's.
-const RATE_WINDOW_US: u64 = 500_000;
-const LOSS_WINDOW: Duration = Duration::from_millis(500);
-/// A rate measured over less than this is noise.
-const MIN_RATE_SPAN_US: u64 = 100_000;
-/// The base delay is the minimum over this many one-second buckets.
-const BASE_BUCKETS: usize = 10;
+// Packet groups (libwebrtc `InterArrival`): one send burst, plus what arrived in a burst
+// behind it.
+const GROUP_US: u64 = 5_000;
+const BURST_US: u64 = 5_000;
 
-/// Queueing delay above which the path is overused, and below which it is clear.
-const OVERUSE_US: i64 = 20_000;
-const CLEAR_US: i64 = 8_000;
-/// Loss fractions: above `HIGH` is overuse, between `LOW` and `HIGH` scales the estimate.
-const LOSS_LOW: f64 = 0.02;
-const LOSS_HIGH: f64 = 0.10;
-/// GCC's β (the share of the receive rate kept on overuse) and η (growth per second).
+// Trendline and adaptive threshold (libwebrtc `TrendlineEstimator`).
+const WINDOW: usize = 20;
+const SMOOTHING: f64 = 0.9;
+const GAIN: f64 = 4.0;
+const MIN_DELTAS: f64 = 60.0;
+const OVERUSE_TIME_MS: f64 = 10.0;
+const K_UP: f64 = 0.0087;
+const K_DOWN: f64 = 0.039;
+const MAX_ADAPT_OFFSET_MS: f64 = 15.0;
+const MAX_ADAPT_STEP_MS: f64 = 100.0;
+const THRESHOLD_INIT_MS: f64 = 12.5;
+const THRESHOLD_MIN_MS: f64 = 6.0;
+const THRESHOLD_MAX_MS: f64 = 600.0;
+
+// AIMD (libwebrtc `AimdRateControl`).
 const BETA: f64 = 0.85;
 const GROWTH_PER_S: f64 = 1.08;
+const RECV_CAP: f64 = 1.5;
+const RECV_CAP_ADD_KBPS: f64 = 10.0;
+const REDUCE_MIN: Duration = Duration::from_millis(10);
+const REDUCE_MAX: Duration = Duration::from_millis(200);
+
+// Loss (libwebrtc `SendSideBandwidthEstimation`).
+const LOSS_LOW: f64 = 0.02;
+const LOSS_HIGH: f64 = 0.10;
+const LOSS_DECREASE_GAP: Duration = Duration::from_millis(300);
+const LOSS_WINDOW: Duration = Duration::from_millis(500);
+/// Fewer datagrams than this in the window decide nothing about loss.
+const LOSS_MIN_SAMPLES: i64 = 20;
+const MAX_LOSS_ENTRIES: usize = 64;
+
+/// The receive rate is measured over this much of the client's arrival clock.
+const RATE_WINDOW_US: u64 = 500_000;
+/// A rate measured over less than this is noise; the last good one stands in.
+const MIN_RATE_SPAN_US: u64 = 100_000;
+const MAX_ARRIVALS: usize = 1 << 14;
+
+/// QUIC's own estimate bounds ours with this headroom. An exact cap would deadlock: once
+/// the ABR sends under cwnd/RTT, QUIC is application-limited and its window stops growing.
+const QUIC_CAP: f64 = 1.5;
+
+/// Feedback silence while media is sent: past max(this, 2 intervals + RTT), the estimate
+/// decays by `SILENCE_DECAY` every `SILENCE_STEP`.
+const SILENCE_MIN: Duration = Duration::from_millis(500);
+const SILENCE_DECAY: f64 = 0.8;
+const SILENCE_STEP: Duration = Duration::from_millis(500);
+
 /// No estimate below this: a floor the governor's own floor always sits above.
 const MIN_KBPS: f64 = 150.0;
 /// The ABR is fed at most this often, about as often as `rtpgccbwe` notifies.
@@ -52,101 +96,339 @@ pub(crate) struct Feedback {
     pub(crate) arrivals: Vec<u16>,
 }
 
-/// `None` for a message the agent cannot use: a field missing or out of range, or
-/// `arrivals_b64` not exactly `count` u16 values.
-pub(crate) fn feedback_of(message: &Value) -> Option<Feedback> {
-    let first_pkt_seq = u32::try_from(message.get("first_pkt_seq")?.as_u64()?).ok()?;
-    let count = usize::try_from(message.get("count")?.as_u64()?).ok()?;
-    let ref_us = message.get("ref_us")?.as_u64()?;
-    if count == 0 || count > MAX_COUNT {
-        return None;
+/// The message, or which field is out of contract (§Feedback).
+pub(crate) fn feedback_of(message: &Value) -> Result<Feedback, &'static str> {
+    let uint = |name: &'static str| message.get(name).and_then(Value::as_u64).ok_or(name);
+    uint("seq")?;
+    let first_pkt_seq = u32::try_from(uint("first_pkt_seq")?).map_err(|_| "first_pkt_seq")?;
+    let count = uint("count")?;
+    if count == 0 || count > MAX_COUNT as u64 {
+        return Err("count");
     }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(message.get("arrivals_b64")?.as_str()?)
-        .ok()?;
-    if bytes.len() != count * 2 {
-        return None;
+    let ref_us = uint("ref_us")?;
+    // The latest arrival a message can name must not overflow the clock.
+    ref_us
+        .checked_add(u64::from(NOT_RECEIVED - 1) * UNIT_US)
+        .ok_or("ref_us")?;
+    uint("recv_kbps")?;
+    if uint("lost")? > count {
+        return Err("lost");
     }
-    let arrivals = bytes
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    uint("interval_ms")?;
+    let bytes = message
+        .get("arrivals_b64")
+        .and_then(Value::as_str)
+        .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+        .filter(|b| b.len() as u64 == count * 2)
+        .ok_or("arrivals_b64")?;
+    let arrivals = (0..count as usize)
+        .map(|i| u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]))
         .collect();
-    Some(Feedback {
+    Ok(Feedback {
         first_pkt_seq,
         ref_us,
         arrivals,
     })
 }
 
-/// When, and how big, each recent agent → client datagram was sent, by its `pkt_seq`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Status {
+    #[default]
+    Unreported,
+    Lost,
+    Received,
+}
+
+/// `bytes == 0` is an empty slot.
+#[derive(Debug, Clone, Copy, Default)]
+struct Slot {
+    seq: u32,
+    sent_us: u64,
+    bytes: u16,
+    resend: bool,
+    status: Status,
+}
+
+/// When, and how big, each recent agent → client datagram was sent, by its `pkt_seq`, and
+/// what feedback has said of it: each is counted once, whatever is reported again.
 pub(crate) struct SendLog {
     start: Instant,
-    /// (`pkt_seq`, µs after `start`, bytes); `bytes == 0` is an empty slot.
-    slots: Vec<(u32, u64, u16)>,
+    slots: Vec<Slot>,
+    last_sent: Option<Instant>,
 }
 
 impl SendLog {
     pub(crate) fn new(start: Instant) -> Self {
         Self {
             start,
-            slots: vec![(0, 0, 0); LOG],
+            slots: vec![Slot::default(); LOG],
+            last_sent: None,
         }
     }
 
-    /// Any channel's datagram: `pkt_seq` is bytes 1..5 of every one (§Channels).
-    pub(crate) fn record(&mut self, datagram: &[u8], at: Instant) {
+    /// Any channel's datagram: `pkt_seq` is bytes 1..5 of every one (§Channels). A
+    /// `resend` (a NACK answer) counts toward loss, not toward the receive rate.
+    pub(crate) fn record(&mut self, datagram: &[u8], at: Instant, resend: bool) {
         let Some(seq) = datagram.get(1..5) else {
             return;
         };
-        let seq = u32::from_le_bytes(seq.try_into().unwrap());
-        let us = at.saturating_duration_since(self.start).as_micros() as u64;
-        let bytes = datagram.len().min(u16::MAX as usize) as u16;
-        self.slots[seq as usize % LOG] = (seq, us, bytes);
+        let seq = u32::from_le_bytes([seq[0], seq[1], seq[2], seq[3]]);
+        self.slots[seq as usize % LOG] = Slot {
+            seq,
+            sent_us: at.saturating_duration_since(self.start).as_micros() as u64,
+            bytes: datagram.len().min(u16::MAX as usize) as u16,
+            resend,
+            status: Status::Unreported,
+        };
+        self.last_sent = Some(at);
     }
 
-    fn get(&self, seq: u32) -> Option<(u64, u16)> {
-        match self.slots[seq as usize % LOG] {
-            (s, us, bytes) if s == seq && bytes > 0 => Some((us, bytes)),
-            _ => None,
+    fn slot(&mut self, seq: u32) -> Option<&mut Slot> {
+        Some(&mut self.slots[seq as usize % LOG]).filter(|s| s.seq == seq && s.bytes > 0)
+    }
+}
+
+/// What QUIC knows of the path, read from the connection when feedback arrives.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QuicPath {
+    pub(crate) rtt: Duration,
+    pub(crate) cwnd_bytes: u64,
+    pub(crate) congestion_events: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Usage {
+    Normal,
+    Overusing,
+    Underusing,
+}
+
+/// One send burst: µs on the agent's clock and on the client's.
+#[derive(Debug, Clone, Copy)]
+struct Group {
+    first_send: u64,
+    last_send: u64,
+    last_arrival: u64,
+}
+
+/// Groups datagrams by send burst and yields each completed group's deltas from the one
+/// before it: (send Δ ms, arrival Δ ms, the group's arrival ms).
+#[derive(Default)]
+struct InterArrival {
+    current: Option<Group>,
+    previous: Option<Group>,
+}
+
+impl InterArrival {
+    fn push(&mut self, send: u64, arrival: u64) -> Option<(f64, f64, f64)> {
+        let Some(cur) = self.current.as_mut() else {
+            self.current = Some(Group {
+                first_send: send,
+                last_send: send,
+                last_arrival: arrival,
+            });
+            return None;
+        };
+        if send < cur.first_send {
+            return None; // older than the burst being built: reordered
+        }
+        let in_send_burst = send - cur.first_send <= GROUP_US;
+        // Arrived back to back behind the group, sooner than it was sent: queued behind it.
+        let in_arrival_burst = arrival >= cur.last_arrival
+            && arrival - cur.last_arrival < BURST_US
+            && (arrival - cur.last_arrival) < send.saturating_sub(cur.last_send);
+        if in_send_burst || in_arrival_burst {
+            cur.last_send = cur.last_send.max(send);
+            cur.last_arrival = cur.last_arrival.max(arrival);
+            return None;
+        }
+        let done = *cur;
+        let out = self.previous.and_then(|prev| {
+            (done.last_arrival >= prev.last_arrival).then(|| {
+                (
+                    (done.last_send - prev.last_send) as f64 / 1000.0,
+                    (done.last_arrival - prev.last_arrival) as f64 / 1000.0,
+                    done.last_arrival as f64 / 1000.0,
+                )
+            })
+        });
+        self.previous = Some(done);
+        self.current = Some(Group {
+            first_send: send,
+            last_send: send,
+            last_arrival: arrival,
+        });
+        out
+    }
+}
+
+/// The delay-gradient detector: trendline over smoothed accumulated delay, and the
+/// adaptive threshold it is compared with.
+struct Trendline {
+    history: VecDeque<(f64, f64)>,
+    first_arrival_ms: Option<f64>,
+    accumulated_ms: f64,
+    smoothed_ms: f64,
+    deltas: u32,
+    prev_trend: f64,
+    threshold_ms: f64,
+    last_threshold_ms: Option<f64>,
+    overuse_ms: Option<f64>,
+    overuse_count: u32,
+    usage: Usage,
+}
+
+impl Default for Trendline {
+    fn default() -> Self {
+        Self {
+            history: VecDeque::with_capacity(WINDOW + 1),
+            first_arrival_ms: None,
+            accumulated_ms: 0.0,
+            smoothed_ms: 0.0,
+            deltas: 0,
+            prev_trend: 0.0,
+            threshold_ms: THRESHOLD_INIT_MS,
+            last_threshold_ms: None,
+            overuse_ms: None,
+            overuse_count: 0,
+            usage: Usage::Normal,
         }
     }
+}
+
+impl Trendline {
+    fn update(&mut self, send_delta_ms: f64, arrival_delta_ms: f64, arrival_ms: f64) {
+        self.deltas = (self.deltas + 1).min(1000);
+        let first = *self.first_arrival_ms.get_or_insert(arrival_ms);
+        self.accumulated_ms += arrival_delta_ms - send_delta_ms;
+        self.smoothed_ms = SMOOTHING * self.smoothed_ms + (1.0 - SMOOTHING) * self.accumulated_ms;
+        self.history
+            .push_back((arrival_ms - first, self.smoothed_ms));
+        if self.history.len() > WINDOW {
+            self.history.pop_front();
+        }
+        let trend = if self.history.len() == WINDOW {
+            slope(&self.history).unwrap_or(self.prev_trend)
+        } else {
+            self.prev_trend
+        };
+        self.detect(trend, send_delta_ms, arrival_ms);
+    }
+
+    fn detect(&mut self, trend: f64, send_delta_ms: f64, now_ms: f64) {
+        if self.deltas < 2 {
+            self.usage = Usage::Normal;
+            return;
+        }
+        let modified = (self.deltas as f64).min(MIN_DELTAS) * trend * GAIN;
+        if modified > self.threshold_ms {
+            let over = match self.overuse_ms {
+                None => send_delta_ms / 2.0,
+                Some(t) => t + send_delta_ms,
+            };
+            self.overuse_ms = Some(over);
+            self.overuse_count += 1;
+            if over > OVERUSE_TIME_MS && self.overuse_count > 1 && trend >= self.prev_trend {
+                self.overuse_ms = Some(0.0);
+                self.overuse_count = 0;
+                self.usage = Usage::Overusing;
+            }
+        } else if modified < -self.threshold_ms {
+            self.overuse_ms = None;
+            self.overuse_count = 0;
+            self.usage = Usage::Underusing;
+        } else {
+            self.overuse_ms = None;
+            self.overuse_count = 0;
+            self.usage = Usage::Normal;
+        }
+        self.prev_trend = trend;
+        self.adapt_threshold(modified, now_ms);
+    }
+
+    fn adapt_threshold(&mut self, modified: f64, now_ms: f64) {
+        let last = *self.last_threshold_ms.get_or_insert(now_ms);
+        self.last_threshold_ms = Some(now_ms);
+        if modified.abs() > self.threshold_ms + MAX_ADAPT_OFFSET_MS {
+            return;
+        }
+        let k = if modified.abs() < self.threshold_ms {
+            K_DOWN
+        } else {
+            K_UP
+        };
+        let step = (now_ms - last).clamp(0.0, MAX_ADAPT_STEP_MS);
+        self.threshold_ms = (self.threshold_ms + k * (modified.abs() - self.threshold_ms) * step)
+            .clamp(THRESHOLD_MIN_MS, THRESHOLD_MAX_MS);
+    }
+}
+
+/// Least-squares slope of `y` over `x`.
+fn slope(points: &VecDeque<(f64, f64)>) -> Option<f64> {
+    let n = points.len() as f64;
+    let (sx, sy) = points
+        .iter()
+        .fold((0.0, 0.0), |(a, b), &(x, y)| (a + x, b + y));
+    let (mx, my) = (sx / n, sy / n);
+    let (num, den) = points.iter().fold((0.0, 0.0), |(num, den), &(x, y)| {
+        (num + (x - mx) * (y - my), den + (x - mx) * (x - mx))
+    });
+    (den != 0.0).then(|| num / den)
 }
 
 /// The rate estimate one client's feedback drives, in kbit/s.
 pub(crate) struct Estimator {
-    estimate_kbps: f64,
     ceiling_kbps: f64,
-    /// Received datagrams: (client arrival µs, bytes), oldest first.
+    delay_kbps: f64,
+    loss_kbps: f64,
+    estimate_kbps: f64,
+    inter_arrival: InterArrival,
+    trendline: Trendline,
+    /// Received datagrams that are not resends: (client arrival µs, bytes).
     arrivals: VecDeque<(u64, u32)>,
-    /// Per message: (agent instant, reported, lost).
-    losses: VecDeque<(Instant, u32, u32)>,
-    /// Per one-second bucket of the agent's clock: (bucket start, minimum one-way delay).
-    base: VecDeque<(Instant, i64)>,
+    newest_arrival: u64,
+    last_rate_kbps: Option<f64>,
+    /// Per message: (agent instant, received, lost); a late arrival after a loss is a
+    /// correction (+1, −1).
+    losses: VecDeque<(Instant, i64, i64)>,
     last_update: Instant,
     last_decrease: Option<Instant>,
+    last_loss_decrease: Option<Instant>,
     last_report: Option<Instant>,
+    last_feedback: Option<Instant>,
+    last_decay: Option<Instant>,
+    quic_cap_kbps: Option<f64>,
 }
 
-/// What one message measured, for the log and the tests.
+/// What one message measured, for the tests.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Measured {
-    pub(crate) queue_us: Option<i64>,
+    pub(crate) usage: Usage,
     pub(crate) rate_kbps: Option<f64>,
-    pub(crate) loss: f64,
+    pub(crate) loss: Option<f64>,
 }
 
 impl Estimator {
     /// Starts at the ceiling, as `rtpgccbwe` is seeded: it only walks down on evidence.
     pub(crate) fn new(ceiling_kbps: f64, now: Instant) -> Self {
         Self {
-            estimate_kbps: ceiling_kbps,
             ceiling_kbps,
+            delay_kbps: ceiling_kbps,
+            loss_kbps: ceiling_kbps,
+            estimate_kbps: ceiling_kbps,
+            inter_arrival: InterArrival::default(),
+            trendline: Trendline::default(),
             arrivals: VecDeque::new(),
+            newest_arrival: 0,
+            last_rate_kbps: None,
             losses: VecDeque::new(),
-            base: VecDeque::new(),
             last_update: now,
             last_decrease: None,
+            last_loss_decrease: None,
             last_report: None,
+            last_feedback: None,
+            last_decay: None,
+            quic_cap_kbps: None,
         }
     }
 
@@ -155,47 +437,113 @@ impl Estimator {
         self.estimate_kbps
     }
 
-    /// Take one message; `Some(estimate)` when it is time to feed the ABR
-    /// ([`REPORT_EVERY`]). `rtt` spaces two cuts: the first one's effect is not visible
-    /// to the client before a round trip.
+    /// Take one message; `Some(estimate)` when it is time to feed the ABR.
     pub(crate) fn on_feedback(
         &mut self,
         fb: &Feedback,
-        log: &SendLog,
+        log: &mut SendLog,
         now: Instant,
-        rtt: Duration,
+        path: QuicPath,
     ) -> Option<f64> {
+        self.last_feedback = Some(now);
+        self.last_decay = None;
         let m = self.measure(fb, log, now);
         let dt = now
             .saturating_duration_since(self.last_update)
             .as_secs_f64()
             .min(1.0);
         self.last_update = now;
-        let queue = m.queue_us.unwrap_or(0);
-        if queue > OVERUSE_US || m.loss > LOSS_HIGH {
-            let spaced = self
-                .last_decrease
-                .is_none_or(|at| now.saturating_duration_since(at) > rtt + REPORT_EVERY * 2);
-            if let (true, Some(rate)) = (spaced, m.rate_kbps) {
-                if BETA * rate < self.estimate_kbps {
-                    tracing::debug!(
-                        token = "webtransport-cc-overuse",
-                        queue_us = queue,
-                        loss = m.loss,
-                        "WebTransport path overused: estimate {:.0} → {:.0} kbps (receive rate {rate:.0})",
-                        self.estimate_kbps,
-                        BETA * rate
-                    );
-                    self.estimate_kbps = BETA * rate;
-                }
-                self.last_decrease = Some(now);
-            }
-        } else if m.loss > LOSS_LOW {
-            self.estimate_kbps *= (1.0 - 0.5 * m.loss).powf(dt);
-        } else if queue < CLEAR_US {
-            self.estimate_kbps *= GROWTH_PER_S.powf(dt);
+        if let Some(r) = m.rate_kbps {
+            self.last_rate_kbps = Some(r);
         }
-        self.estimate_kbps = self.estimate_kbps.clamp(MIN_KBPS, self.ceiling_kbps);
+
+        match m.usage {
+            Usage::Overusing => {
+                let reduce_every = path.rtt.clamp(REDUCE_MIN, REDUCE_MAX);
+                if self
+                    .last_decrease
+                    .is_none_or(|at| now.saturating_duration_since(at) >= reduce_every)
+                {
+                    // Sparse arrivals give no rate: the last one, else the estimate, still cuts.
+                    let base = m.rate_kbps.or(self.last_rate_kbps);
+                    let cut = BETA * base.unwrap_or(self.estimate_kbps);
+                    if cut < self.delay_kbps {
+                        tracing::debug!(
+                            token = "webtransport-cc-overuse",
+                            "WebTransport path overused: delay estimate {:.0} → {cut:.0} kbps",
+                            self.delay_kbps
+                        );
+                        self.delay_kbps = cut;
+                    }
+                    self.last_decrease = Some(now);
+                }
+            }
+            Usage::Underusing => {}
+            Usage::Normal => {
+                let mut grown = self.delay_kbps * GROWTH_PER_S.powf(dt);
+                if let Some(cap) = m.rate_kbps.map(|r| RECV_CAP * r + RECV_CAP_ADD_KBPS) {
+                    if grown > cap {
+                        grown = self.delay_kbps.max(cap);
+                    }
+                }
+                self.delay_kbps = grown;
+            }
+        }
+
+        match m.loss {
+            Some(loss) if loss > LOSS_HIGH => {
+                let gap = LOSS_DECREASE_GAP + path.rtt;
+                if self
+                    .last_loss_decrease
+                    .is_none_or(|at| now.saturating_duration_since(at) >= gap)
+                {
+                    self.loss_kbps = self.estimate_kbps * (1.0 - 0.5 * loss);
+                    self.last_loss_decrease = Some(now);
+                    // These losses are spent; the next decision reads new ones.
+                    self.losses.clear();
+                }
+            }
+            Some(loss) if loss >= LOSS_LOW => {}
+            _ => self.loss_kbps *= GROWTH_PER_S.powf(dt),
+        }
+
+        self.quic_cap_kbps = (path.congestion_events > 0).then(|| {
+            let rtt_ms = path.rtt.as_secs_f64().max(0.001) * 1000.0;
+            QUIC_CAP * path.cwnd_bytes as f64 * 8.0 / rtt_ms
+        });
+        self.settle();
+        self.due(now)
+    }
+
+    /// Called on the agent's own clock between messages. Media sent and no feedback for
+    /// longer than the client's interval allows is congestion, and decays the estimate.
+    /// A client that never sent feedback is not judged (§Feedback lets it omit it).
+    pub(crate) fn on_tick(&mut self, now: Instant, log: &SendLog, rtt: Duration) -> Option<f64> {
+        let fb_at = self.last_feedback?;
+        let timeout = SILENCE_MIN.max(FEEDBACK_INTERVAL * 2 + rtt);
+        let silent = now.saturating_duration_since(fb_at) > timeout;
+        if !silent || log.last_sent.is_none_or(|s| s <= fb_at) {
+            return None;
+        }
+        let from = self.last_decay.unwrap_or(fb_at + timeout);
+        let steps = now.saturating_duration_since(from).as_secs_f64() / SILENCE_STEP.as_secs_f64();
+        let factor = SILENCE_DECAY.powf(steps);
+        self.delay_kbps *= factor;
+        self.loss_kbps *= factor;
+        self.last_decay = Some(now);
+        self.settle();
+        self.due(now)
+    }
+
+    fn settle(&mut self) {
+        let clamp = |k: f64| k.clamp(MIN_KBPS, self.ceiling_kbps);
+        self.delay_kbps = clamp(self.delay_kbps);
+        self.loss_kbps = clamp(self.loss_kbps);
+        let quic = self.quic_cap_kbps.unwrap_or(f64::MAX);
+        self.estimate_kbps = clamp(self.delay_kbps.min(self.loss_kbps).min(quic));
+    }
+
+    fn due(&mut self, now: Instant) -> Option<f64> {
         let due = self
             .last_report
             .is_none_or(|at| now.saturating_duration_since(at) >= REPORT_EVERY);
@@ -205,60 +553,72 @@ impl Estimator {
         })
     }
 
-    /// The message's queueing delay (its least-delayed datagram, so one late datagram is
-    /// not a queue), and the windowed receive rate and loss.
-    pub(crate) fn measure(&mut self, fb: &Feedback, log: &SendLog, now: Instant) -> Measured {
-        let (mut lost, mut reported) = (0u32, 0u32);
-        let mut delays = Vec::new();
+    /// Count each datagram the message reports for the first time, feed the delay detector
+    /// in `pkt_seq` (send) order, and read the windowed receive rate and loss.
+    pub(crate) fn measure(&mut self, fb: &Feedback, log: &mut SendLog, now: Instant) -> Measured {
+        let (mut received, mut lost) = (0i64, 0i64);
         for (i, &arrival) in fb.arrivals.iter().enumerate() {
             let seq = fb.first_pkt_seq.wrapping_add(i as u32);
-            let Some((sent_us, bytes)) = log.get(seq) else {
+            let Some(slot) = log.slot(seq) else {
                 continue;
             };
-            reported += 1;
-            if arrival == NOT_RECEIVED {
-                lost += 1;
-                continue;
-            }
-            let at_us = fb.ref_us + arrival as u64 * UNIT_US as u64;
-            delays.push(at_us as i64 - sent_us as i64);
-            self.arrivals.push_back((at_us, bytes as u32));
-        }
-
-        if let Some(&min) = delays.iter().min() {
-            match self.base.back_mut() {
-                Some((start, low))
-                    if now.saturating_duration_since(*start) < Duration::from_secs(1) =>
-                {
-                    *low = (*low).min(min)
+            let at_us = (arrival != NOT_RECEIVED)
+                .then(|| fb.ref_us.checked_add(u64::from(arrival) * UNIT_US))
+                .flatten();
+            match (slot.status, at_us) {
+                (Status::Received, _) | (Status::Lost, None) => continue,
+                (Status::Unreported, None) => {
+                    slot.status = Status::Lost;
+                    lost += 1;
+                    continue;
                 }
-                _ => {
-                    self.base.push_back((now, min));
-                    if self.base.len() > BASE_BUCKETS {
-                        self.base.pop_front();
+                (Status::Lost, Some(_)) => {
+                    // Late: the loss is undone, but it is no delay sample.
+                    slot.status = Status::Received;
+                    lost -= 1;
+                    received += 1;
+                }
+                (Status::Unreported, Some(at)) => {
+                    slot.status = Status::Received;
+                    received += 1;
+                    if let Some((send_d, arrival_d, arrival_ms)) =
+                        self.inter_arrival.push(slot.sent_us, at)
+                    {
+                        self.trendline.update(send_d, arrival_d, arrival_ms);
                     }
                 }
             }
+            if let (false, Some(at)) = (slot.resend, at_us) {
+                self.arrivals.push_back((at, u32::from(slot.bytes)));
+                self.newest_arrival = self.newest_arrival.max(at);
+                if self.arrivals.len() > MAX_ARRIVALS {
+                    self.arrivals.pop_front();
+                }
+            }
         }
-        let base = self.base.iter().map(|&(_, d)| d).min();
-        let queue_us = delays.iter().min().zip(base).map(|(d, b)| d - b);
 
-        // Arrivals come in order of `pkt_seq`, not of time; trim by the newest seen.
-        let newest = self.arrivals.iter().map(|&(t, _)| t).max().unwrap_or(0);
-        self.arrivals.retain(|&(t, _)| t + RATE_WINDOW_US >= newest);
-        let oldest = self
+        let newest = self.newest_arrival;
+        self.arrivals
+            .retain(|&(t, _)| t.saturating_add(RATE_WINDOW_US) >= newest);
+        // N datagrams span N − 1 gaps: the oldest one's bytes arrived before the span began.
+        let (oldest, first_bytes) = self
             .arrivals
             .iter()
-            .map(|&(t, _)| t)
-            .min()
-            .unwrap_or(newest);
+            .min_by_key(|&&(t, _)| t)
+            .copied()
+            .unwrap_or((newest, 0));
         let span = newest - oldest;
         let rate_kbps = (span >= MIN_RATE_SPAN_US).then(|| {
-            let bits: u64 = self.arrivals.iter().map(|&(_, b)| b as u64 * 8).sum();
-            bits as f64 * 1000.0 / span as f64
+            let bytes: u64 = self.arrivals.iter().map(|&(_, b)| u64::from(b)).sum();
+            (bytes - u64::from(first_bytes)) as f64 * 8.0 * 1000.0 / span as f64
         });
 
-        self.losses.push_back((now, reported, lost));
+        if received != 0 || lost != 0 {
+            self.losses.push_back((now, received, lost));
+            if self.losses.len() > MAX_LOSS_ENTRIES {
+                self.losses.pop_front();
+            }
+        }
         while self
             .losses
             .front()
@@ -269,11 +629,12 @@ impl Estimator {
         let (r, l) = self
             .losses
             .iter()
-            .fold((0u32, 0u32), |(r, l), &(_, a, b)| (r + a, l + b));
-        let loss = if r == 0 { 0.0 } else { l as f64 / r as f64 };
+            .fold((0i64, 0i64), |(r, l), &(_, a, b)| (r + a, l + b));
+        let (r, l) = (r.max(0), l.max(0));
+        let loss = (r + l >= LOSS_MIN_SAMPLES).then(|| l as f64 / (r + l) as f64);
 
         Measured {
-            queue_us,
+            usage: self.trendline.usage,
             rate_kbps,
             loss,
         }
@@ -281,262 +642,4 @@ impl Estimator {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A one-hop path for the estimator: datagrams sent at a constant rate into a
-    /// bottleneck of `cap_kbps` with a drop-tail queue of `queue_bytes`, reported by a
-    /// client as the contract says. Time is simulated.
-    struct Path {
-        start: Instant,
-        log: SendLog,
-        est: Estimator,
-        seq: u32,
-        /// The simulated clock, µs after `start`.
-        clock: u64,
-        /// When the bottleneck is next free, µs.
-        free_at: u64,
-        /// (seq, arrival µs, or `None` dropped) not yet reported.
-        pending: Vec<(u32, Option<u64>)>,
-        first: u32,
-        cap_kbps: f64,
-        queue_bytes: u64,
-        reported: Vec<f64>,
-    }
-
-    const SIZE: usize = 1148;
-
-    impl Path {
-        fn new(ceiling: f64, cap_kbps: f64, queue_bytes: u64) -> Self {
-            Self::starting_at(ceiling, cap_kbps, queue_bytes, 0)
-        }
-
-        fn starting_at(ceiling: f64, cap_kbps: f64, queue_bytes: u64, seq: u32) -> Self {
-            let start = Instant::now();
-            Self {
-                start,
-                log: SendLog::new(start),
-                est: Estimator::new(ceiling, start),
-                seq,
-                clock: 0,
-                free_at: 0,
-                pending: Vec::new(),
-                first: seq,
-                cap_kbps,
-                queue_bytes,
-                reported: Vec::new(),
-            }
-        }
-
-        /// Send at `send_kbps` for `secs`, with feedback every 50 ms.
-        fn run(&mut self, send_kbps: f64, secs: f64) {
-            let gap_us = SIZE as f64 * 8.0 * 1000.0 / send_kbps;
-            let mut t = self.clock;
-            let end = t + (secs * 1e6) as u64;
-            let mut next_feedback = t + 50_000;
-            let service_us = SIZE as f64 * 8.0 * 1000.0 / self.cap_kbps;
-            let one_way = 10_000u64;
-            while t < end {
-                let mut d = vec![0u8; SIZE];
-                d[1..5].copy_from_slice(&self.seq.to_le_bytes());
-                self.log.record(&d, self.start + Duration::from_micros(t));
-                let backlog = self.free_at.saturating_sub(t) as f64 / service_us * SIZE as f64;
-                let arrival = (backlog as u64 + SIZE as u64 <= self.queue_bytes).then(|| {
-                    self.free_at = self.free_at.max(t) + service_us as u64;
-                    self.free_at + one_way
-                });
-                self.pending.push((self.seq, arrival));
-                self.seq = self.seq.wrapping_add(1);
-                t += gap_us as u64;
-                if t >= next_feedback {
-                    self.feedback(next_feedback);
-                    next_feedback += 50_000;
-                }
-            }
-            self.clock = t;
-        }
-
-        /// What arrived by `at_us` (client clock = agent clock + 1 s, any offset works).
-        fn feedback(&mut self, at_us: u64) {
-            let arrived = self
-                .pending
-                .iter()
-                .rposition(|&(_, a)| a.is_some_and(|a| a <= at_us));
-            let Some(last) = arrived else { return };
-            let batch: Vec<_> = self.pending.drain(..=last).collect();
-            let offset = 1_000_000u64;
-            let ref_us = batch.iter().filter_map(|&(_, a)| a).min().unwrap() + offset;
-            let arrivals = batch
-                .iter()
-                .map(|&(_, a)| match a {
-                    Some(a) if a <= at_us => ((a + offset - ref_us) / 50) as u16,
-                    _ => NOT_RECEIVED,
-                })
-                .collect();
-            let fb = Feedback {
-                first_pkt_seq: self.first,
-                ref_us,
-                arrivals,
-            };
-            self.first = self.first.wrapping_add(batch.len() as u32);
-            let now = self.start + Duration::from_micros(at_us);
-            if let Some(k) = self
-                .est
-                .on_feedback(&fb, &self.log, now, Duration::from_millis(20))
-            {
-                self.reported.push(k);
-            }
-        }
-    }
-
-    #[test]
-    fn a_path_with_room_keeps_the_estimate_at_the_ceiling() {
-        let mut p = Path::new(8000.0, 20_000.0, 64 * 1024);
-        p.run(6000.0, 5.0);
-        assert_eq!(p.est.estimate_kbps(), 8000.0);
-        assert!(!p.reported.is_empty());
-    }
-
-    #[test]
-    fn a_rate_cap_cuts_the_estimate_to_below_the_cap() {
-        let mut p = Path::new(8000.0, 3000.0, 256 * 1024);
-        p.run(6000.0, 3.0);
-        let est = p.est.estimate_kbps();
-        assert!(
-            est < 3000.0 && est > 2000.0,
-            "β × the 3000 kbps receive rate, got {est:.0}"
-        );
-    }
-
-    #[test]
-    fn a_shallow_queue_that_only_drops_is_read_from_the_loss() {
-        // A two-datagram queue: no delay to see, only loss.
-        let mut p = Path::new(8000.0, 3000.0, 2 * SIZE as u64);
-        p.run(6000.0, 3.0);
-        let est = p.est.estimate_kbps();
-        assert!(est < 3000.0, "loss over 10% cuts to β × rate, got {est:.0}");
-    }
-
-    #[test]
-    fn the_estimate_recovers_when_the_cap_lifts() {
-        let mut p = Path::new(8000.0, 3000.0, 256 * 1024);
-        p.run(6000.0, 3.0);
-        let low = p.est.estimate_kbps();
-        p.cap_kbps = 50_000.0;
-        // Sending under the estimate, as the encoder would at the lowered setpoint. The
-        // queue built under the cap drains first, then the estimate grows 8 % a second.
-        p.run(2000.0, 8.0);
-        assert!(
-            p.est.estimate_kbps() > low * 1.2,
-            "{low:.0} → {:.0}",
-            p.est.estimate_kbps()
-        );
-    }
-
-    #[test]
-    fn moderate_loss_scales_the_estimate_down_gradually() {
-        let start = Instant::now();
-        let mut log = SendLog::new(start);
-        let mut est = Estimator::new(8000.0, start);
-        // 20 datagrams per message, one lost: 5 % loss, no queue.
-        for m in 0..20u32 {
-            let mut arrivals = Vec::new();
-            for i in 0..20u32 {
-                let seq = m * 20 + i;
-                let mut d = vec![0u8; SIZE];
-                d[1..5].copy_from_slice(&seq.to_le_bytes());
-                let sent =
-                    Duration::from_millis(m as u64 * 50) + Duration::from_micros(i as u64 * 2500);
-                log.record(&d, start + sent);
-                arrivals.push(if i == 7 {
-                    NOT_RECEIVED
-                } else {
-                    (i * 50) as u16
-                });
-            }
-            let fb = Feedback {
-                first_pkt_seq: m * 20,
-                ref_us: 5_000_000 + m as u64 * 50_000,
-                arrivals,
-            };
-            est.on_feedback(
-                &fb,
-                &log,
-                start + Duration::from_millis((m as u64 + 1) * 50),
-                Duration::from_millis(20),
-            );
-        }
-        let e = est.estimate_kbps();
-        // (1 − 0.5 × 0.05) a second, for one second.
-        assert!(e < 7900.0 && e > 7700.0, "got {e:.0}");
-    }
-
-    #[test]
-    fn sequence_numbers_wrap() {
-        let mut p = Path::starting_at(8000.0, 3000.0, 256 * 1024, u32::MAX - 100);
-        p.run(6000.0, 3.0);
-        assert!(p.est.estimate_kbps() < 3000.0);
-    }
-
-    #[test]
-    fn datagrams_the_agent_never_logged_count_for_nothing() {
-        let start = Instant::now();
-        let log = SendLog::new(start);
-        let mut est = Estimator::new(8000.0, start);
-        let fb = Feedback {
-            first_pkt_seq: 0,
-            ref_us: 0,
-            arrivals: vec![NOT_RECEIVED; 100],
-        };
-        let m = est.measure(&fb, &log, start);
-        assert_eq!(m.loss, 0.0);
-        assert_eq!(m.queue_us, None);
-    }
-
-    #[test]
-    fn the_abr_is_fed_at_most_every_100_ms() {
-        let start = Instant::now();
-        let log = SendLog::new(start);
-        let mut est = Estimator::new(8000.0, start);
-        let fb = Feedback {
-            first_pkt_seq: 0,
-            ref_us: 0,
-            arrivals: vec![0],
-        };
-        let rtt = Duration::from_millis(20);
-        let fed: Vec<bool> = (0..6)
-            .map(|i| {
-                est.on_feedback(&fb, &log, start + Duration::from_millis(i * 50), rtt)
-                    .is_some()
-            })
-            .collect();
-        assert_eq!(fed, [true, false, true, false, true, false]);
-    }
-
-    #[test]
-    fn a_message_out_of_contract_is_refused() {
-        let b64 = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![0u8; n]);
-        let ok = serde_json::json!({"type": "feedback", "seq": 1, "first_pkt_seq": 7, "count": 2,
-            "ref_us": 9, "arrivals_b64": b64(4), "recv_kbps": 1, "lost": 0, "interval_ms": 50});
-        assert_eq!(
-            feedback_of(&ok),
-            Some(Feedback {
-                first_pkt_seq: 7,
-                ref_us: 9,
-                arrivals: vec![0, 0]
-            })
-        );
-        for (field, value) in [
-            ("count", serde_json::json!(3)),
-            ("count", serde_json::json!(0)),
-            ("count", serde_json::json!(8193)),
-            ("first_pkt_seq", serde_json::json!(1u64 << 32)),
-            ("arrivals_b64", serde_json::json!("not base64!")),
-            ("ref_us", serde_json::json!(-1)),
-        ] {
-            let mut bad = ok.clone();
-            bad[field] = value.clone();
-            assert_eq!(feedback_of(&bad), None, "{field} = {value}");
-        }
-    }
-}
+mod tests;

@@ -290,10 +290,11 @@ describe("the ping clock", () => {
     });
     await t.connect({ config: () => {}, unit: () => {}, end: () => {} });
     await flush();
-    expect(made).toHaveLength(1);
+    // One for the ping, one for receiver feedback (feedback.ts).
+    expect(made).toHaveLength(2);
     expect(made[0].url.pathname).toMatch(/pingWorker/);
     expect(made[0].options).toEqual({ type: "module" });
-    expect(made[0].posted).toEqual([1000]);
+    expect(made.map((w) => w.posted)).toEqual([[1000], [50]]);
     expect(agent.sent("ping")).toHaveLength(1); // the first, at connect
 
     // The page's own timers are throttled; the Worker's message is what pings.
@@ -305,7 +306,7 @@ describe("the ping clock", () => {
     expect(agent.sent("ping").map((p) => p.tc)).toEqual([0, 1000, 2000]);
 
     t.close();
-    expect(made[0].terminated).toBe(true);
+    expect(made.map((w) => w.terminated)).toEqual([true, true]);
   });
 
   it("falls back to a page timer when the Worker's script fails to load, and stops it with the ticker", () => {

@@ -100,7 +100,71 @@ impl Input {
 pub(crate) struct Rate {
     /// The estimate never goes above this: the ABR's ceiling.
     pub(crate) ceiling_kbps: f64,
+    /// A client's first estimate: its loop takes the encoder over (one writer per encoder).
+    pub(crate) start: Box<dyn Fn() + Send + Sync>,
     pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
+}
+
+/// One client's congestion control: its feedback and the agent's silence clock into an
+/// estimate, and the estimate into the session's ABR.
+struct Control<'a> {
+    rate: &'a Rate,
+    estimator: congestion::Estimator,
+    started: bool,
+    refused: u64,
+}
+
+impl<'a> Control<'a> {
+    fn new(rate: &'a Rate) -> Self {
+        Self {
+            rate,
+            estimator: congestion::Estimator::new(rate.ceiling_kbps, std::time::Instant::now()),
+            started: false,
+            refused: 0,
+        }
+    }
+
+    fn feedback(&mut self, message: &Value, log: &mut congestion::SendLog, session: &Session) {
+        let fb = match congestion::feedback_of(message) {
+            Ok(fb) => fb,
+            Err(field) => {
+                if self.refused == 0 {
+                    tracing::warn!(
+                        token = "webtransport-feedback-invalid",
+                        field,
+                        "WebTransport feedback out of contract, ignored (§Feedback); later ones \
+                         are counted, not logged"
+                    );
+                }
+                self.refused += 1;
+                return;
+            }
+        };
+        let path = quinn::Connection::stats(session).path;
+        let path = congestion::QuicPath {
+            rtt: path.rtt,
+            cwnd_bytes: path.cwnd,
+            congestion_events: path.congestion_events,
+        };
+        let now = std::time::Instant::now();
+        if let Some(kbps) = self.estimator.on_feedback(&fb, log, now, path) {
+            self.feed(kbps);
+        }
+    }
+
+    fn tick(&mut self, log: &congestion::SendLog, session: &Session) {
+        let rtt = quinn::Connection::rtt(session);
+        if let Some(kbps) = self.estimator.on_tick(std::time::Instant::now(), log, rtt) {
+            self.feed(kbps);
+        }
+    }
+
+    fn feed(&mut self, kbps: f64) {
+        if !std::mem::replace(&mut self.started, true) {
+            (self.rate.start)();
+        }
+        (self.rate.observe)(kbps);
+    }
 }
 
 /// `capacity.transports` and `capacity.webtransport` (`agent-api.md`, amendment 54).
@@ -809,7 +873,7 @@ fn resend(
     too_large: &mut u64,
 ) -> bool {
     for d in datagrams {
-        log.record(&d, std::time::Instant::now());
+        log.record(&d, std::time::Instant::now(), true);
         match session.send_datagram(d) {
             Ok(()) => {}
             Err(web_transport_quinn::SessionError::SendDatagramError(
@@ -1048,14 +1112,19 @@ async fn stream(
     let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
     let mut log = congestion::SendLog::new(std::time::Instant::now());
-    let mut estimator = media
-        .rate()
-        .map(|r| congestion::Estimator::new(r.ceiling_kbps, std::time::Instant::now()));
+    let mut control = media.rate().map(Control::new);
+    let mut control_tick = tokio::time::interval(congestion::REPORT_EVERY);
+    control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
     let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
     let (message, code, why) = loop {
         tokio::select! {
+            _ = control_tick.tick(), if control.is_some() => {
+                if let Some(control) = control.as_mut() {
+                    control.tick(&log, session);
+                }
+            }
             () = &mut idle => {
                 tracing::info!(
                     token = "webtransport-client-idle",
@@ -1082,7 +1151,7 @@ async fn stream(
                     let now = std::time::Instant::now();
                     sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
                     let sent = datagrams.into_iter().try_for_each(|d| {
-                        log.record(&d, now);
+                        log.record(&d, now, false);
                         session.send_datagram(d)
                     });
                     if sent.is_err() {
@@ -1127,11 +1196,8 @@ async fn stream(
                             }
                         }
                         Some("feedback") => {
-                            let fed = estimator.as_mut().zip(congestion::feedback_of(&message)).and_then(|(est, fb)| {
-                                est.on_feedback(&fb, &log, std::time::Instant::now(), quinn::Connection::rtt(session))
-                            });
-                            if let (Some(kbps), Some(rate)) = (fed, media.rate()) {
-                                (rate.observe)(kbps);
+                            if let Some(control) = control.as_mut() {
+                                control.feedback(&message, &mut log, session);
                             }
                         }
                         Some("input") => {
@@ -1163,6 +1229,13 @@ async fn stream(
             nacks_capped,
             resends_too_large,
             "WebTransport left nacks unanswered or resends unsent"
+        );
+    }
+    if let Some(refused) = control.as_ref().map(|c| c.refused).filter(|&n| n > 0) {
+        tracing::debug!(
+            token = "webtransport-feedback-refused",
+            refused,
+            "WebTransport feedback messages ignored as out of contract"
         );
     }
     if let Some(message) = message {

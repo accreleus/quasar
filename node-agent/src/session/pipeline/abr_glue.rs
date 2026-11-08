@@ -57,9 +57,21 @@ struct AbrLoop {
     bwe_warned: std::sync::atomic::AtomicBool,
     /// The estimator feeding [`AbrLoop::observe`], for the log.
     source: &'static str,
+    /// Unique per loop: only the loop `SessionMetrics::abr_owner` names writes the
+    /// encoder, so a takeover across transports leaves one writer.
+    id: u64,
 }
 
+/// `AbrLoop::id`s; 0 is "no owner".
+static NEXT_LOOP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl AbrLoop {
+    fn owns_encoder(&self) -> bool {
+        self.metrics
+            .upgrade()
+            .is_some_and(|m| m.abr_owner() == self.id)
+    }
+
     fn fps(&self) -> u32 {
         self.fps.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -74,7 +86,7 @@ impl AbrLoop {
     fn retune_for_fps(&self, fps: u32) {
         self.fps
             .store(fps.max(1), std::sync::atomic::Ordering::Relaxed);
-        if self.mode == AbrMode::Off {
+        if self.mode == AbrMode::Off || !self.owns_encoder() {
             return;
         }
         let kbps = self.governor.lock().unwrap().setpoint_kbps();
@@ -93,7 +105,7 @@ impl AbrLoop {
     /// picture's bitrate while the ladder has already restored the bigger one. No-op in
     /// `Off` mode.
     fn set_floor(&self, floor_kbps: u32) -> u32 {
-        if self.mode == AbrMode::Off {
+        if self.mode == AbrMode::Off || !self.owns_encoder() {
             return floor_kbps;
         }
         let (old, raised, now) = {
@@ -157,6 +169,9 @@ impl AbrLoop {
     /// Feed one estimate (kbps) through the governor; apply any retarget to the encoder
     /// and publish it. `from_notify` marks real-feedback observations vs tick re-observes.
     fn observe(&self, est_kbps: f64, from_notify: bool) {
+        if !self.owns_encoder() {
+            return;
+        }
         if from_notify
             && !self
                 .first_estimate
@@ -784,6 +799,7 @@ fn arm(
         bwe: Mutex::new(None),
         bwe_warned: std::sync::atomic::AtomicBool::new(false),
         source,
+        id: NEXT_LOOP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
 
     let plan = Plan {
@@ -804,10 +820,13 @@ fn arm(
 }
 
 /// Register the loop's per-window hooks: the stall-rescue tick, which re-observes
-/// `estimate()`, and in Smooth mode the adaptation hint and the ladder. The hooks are
-/// single-registration on `SessionMetrics`, so the transport that starts last drives the
-/// encoder.
+/// `estimate()`, and in Smooth mode the adaptation hint and the ladder; and make this loop
+/// the encoder's one writer. Hooks and owner are both single on `SessionMetrics`, so the
+/// transport that starts last drives the encoder.
 fn start(abr_loop: &Arc<AbrLoop>, plan: &Plan, estimate: Box<dyn Fn() -> f64 + Send + Sync>) {
+    if let Some(m) = abr_loop.metrics.upgrade() {
+        m.claim_abr(abr_loop.id);
+    }
     let Plan {
         mode,
         choice,
@@ -1088,8 +1107,9 @@ fn start(abr_loop: &Arc<AbrLoop>, plan: &Plan, estimate: Box<dyn Fn() -> f64 + S
 
 /// The ABR a WebTransport client's receiver feedback drives
 /// (`protocol/transport-webtransport.md` §Feedback): a loop of its own on the session's
-/// encoder, beside the WebRTC fallback's, started by the first estimate. The governor and
-/// ladder are the same code either way. `None` when the encoder takes no live writes.
+/// encoder, beside the WebRTC fallback's, started by each client's first estimate. The
+/// governor and ladder are the same code either way. `None` when the encoder takes no live
+/// writes.
 pub(crate) fn feedback_abr(
     encoder: &gst::Element,
     cfg: &SessionConfig,
@@ -1110,33 +1130,31 @@ pub(crate) fn feedback_abr(
     )?;
     let ceiling_kbps = plan.ceiling_kbps as f64;
     let latest = Arc::new(std::sync::atomic::AtomicU64::new(ceiling_kbps.to_bits()));
-    let started = std::sync::atomic::AtomicBool::new(false);
     let mode = cfg.abr_mode;
+    let observe_loop = abr_loop.clone();
+    let observed = latest.clone();
     Some(crate::webtransport::Rate {
         ceiling_kbps,
+        // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
+        // since owns it until then) and registers new hooks.
+        start: Box::new(move || {
+            let latest = latest.clone();
+            start(
+                &abr_loop,
+                &plan,
+                Box::new(move || f64::from_bits(latest.load(std::sync::atomic::Ordering::Relaxed))),
+            );
+            tracing::info!(
+                "AS-03 ABR armed (mode={}): WebTransport receiver feedback → encoder, \
+                 bounds [{}, {}] kbps",
+                mode.as_str(),
+                plan.launch_floor_kbps,
+                plan.ceiling_kbps
+            );
+        }),
         observe: Box::new(move |kbps| {
-            latest.store(kbps.to_bits(), std::sync::atomic::Ordering::Relaxed);
-            // shortcut: started once per session; a WebRTC peer that starts its loop later
-            // keeps the hooks even if WebTransport resumes. Re-arm here if #1165 ever
-            // returns a session from WebRTC to WebTransport.
-            if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                let latest = latest.clone();
-                start(
-                    &abr_loop,
-                    &plan,
-                    Box::new(move || {
-                        f64::from_bits(latest.load(std::sync::atomic::Ordering::Relaxed))
-                    }),
-                );
-                tracing::info!(
-                    "AS-03 ABR armed (mode={}): WebTransport receiver feedback → encoder, \
-                     bounds [{}, {}] kbps",
-                    mode.as_str(),
-                    plan.launch_floor_kbps,
-                    plan.ceiling_kbps
-                );
-            }
-            abr_loop.observe(kbps, true);
+            observed.store(kbps.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            observe_loop.observe(kbps, true);
         }),
     })
 }
@@ -1563,6 +1581,52 @@ mod tests {
             ..ff
         };
         assert!(ff.floor_for(1280 * 720, true) < 1400);
+    }
+
+    // ---- one writer per encoder (#1040) ----
+
+    /// Two transports' loops on one encoder, as after a takeover across transports: only
+    /// the one that started last writes, until another starts.
+    #[test]
+    fn of_two_loops_on_one_encoder_only_the_last_started_writes() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let cfg = cfg_with_floors(0, None);
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let rate = || {
+            feedback_abr(
+                &encoder,
+                &cfg,
+                metrics.clone(),
+                trace.clone(),
+                "s".into(),
+                None,
+            )
+            .unwrap()
+        };
+        let estimate = || {
+            metrics
+                .drain_window(std::time::Instant::now())
+                .gcc_estimate_kbps
+        };
+        let (first, second) = (rate(), rate());
+        (first.start)();
+        (second.start)();
+        (first.observe)(1234.0);
+        assert_eq!(estimate(), None, "the loop started first no longer writes");
+        (second.observe)(2345.0);
+        assert_eq!(estimate(), Some(2345.0));
+        (first.start)();
+        (second.observe)(3456.0);
+        (first.observe)(1111.0);
+        assert_eq!(
+            estimate(),
+            Some(1111.0),
+            "a new client on the first transport took it back"
+        );
     }
 
     // ---- ResolutionLever ----

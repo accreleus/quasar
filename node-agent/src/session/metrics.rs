@@ -336,6 +336,9 @@ pub struct SessionMetrics {
     /// window's label. Registered only in `Smooth` mode; dies with this struct.
     #[allow(clippy::type_complexity)]
     on_window: Mutex<Option<Box<dyn Fn(AdaptationState, Option<f64>) + Send + Sync>>>,
+    /// The ABR loop that writes this session's encoder (`abr_glue::AbrLoop::id`), 0 for
+    /// none: one writer per encoder, the transport that started last.
+    abr_owner: AtomicU64,
     /// Drain bookkeeping: the counter snapshot + instant of the last drain.
     last: Mutex<DrainSnapshot>,
 }
@@ -458,6 +461,7 @@ impl SessionMetrics {
             stage: Mutex::new(StagePending::default()),
             on_drain: Mutex::new(None),
             on_window: Mutex::new(None),
+            abr_owner: AtomicU64::new(0),
             last: Mutex::new(DrainSnapshot {
                 at: now,
                 frames_out: 0,
@@ -793,6 +797,15 @@ impl SessionMetrics {
     pub fn set_gcc_estimate(&self, kbps: f64) {
         self.gcc_estimate_kbps_bits
             .store(kbps.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Make ABR loop `id` the one writer of this session's encoder.
+    pub fn claim_abr(&self, id: u64) {
+        self.abr_owner.store(id, Ordering::Relaxed);
+    }
+
+    pub fn abr_owner(&self) -> u64 {
+        self.abr_owner.load(Ordering::Relaxed)
     }
 
     /// AS-03: register the per-drain hook (see the `on_drain` field doc). Last

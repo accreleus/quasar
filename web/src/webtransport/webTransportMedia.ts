@@ -32,8 +32,8 @@ const ANSWER_TIMEOUT_MS = 10_000;
 const CLOSE_CODE_WAIT_MS = 1_000;
 /** The agent forces at most one IDR per 150 ms (quasar-protocol#29, item 8); asking faster is noise. */
 export const KEYFRAME_SPACING_MS = 150;
-/** How often loss-recovery deadlines are checked when no datagram arrives, and feedback sent. */
-export const RECOVERY_TICK_MS = FEEDBACK_MS;
+/** How often loss-recovery deadlines are checked when no datagram arrives. */
+export const RECOVERY_TICK_MS = 50;
 /** The control plane is asked for a fresh token at most this often. */
 export const REMINT_MIN_INTERVAL_MS = 10_000;
 /** A token held this long (TTL 60 s, control-api.md) is replaced after a failed attempt. Measured
@@ -112,7 +112,7 @@ export class WebTransportMedia implements MediaTransport {
   private wt: WebTransport | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
-  private stopTicker: (() => void) | null = null;
+  private stopTickers: (() => void)[] = [];
   private pingId = 0;
   private closed = false;
   /** Closes the attempt in flight; null once one has connected or ended. */
@@ -213,9 +213,9 @@ export class WebTransportMedia implements MediaTransport {
     return true;
   }
 
+  /** Stops the ping and feedback tickers. */
   private stopPings(): void {
-    this.stopTicker?.();
-    this.stopTicker = null;
+    for (const stop of this.stopTickers.splice(0)) stop();
   }
 
   private send(message: object): void {
@@ -339,7 +339,14 @@ export class WebTransportMedia implements MediaTransport {
     sink.config(config);
     const ping = () => this.send({ type: "ping", id: ++this.pingId, tc: this.now() });
     ping();
-    this.stopTicker = (this.opts.ticker ?? workerTicker)(PING_MS, ping);
+    const ticker = this.opts.ticker ?? workerTicker;
+    // On the Worker clock too: the agent reads feedback that stops while it sends media as
+    // congestion, so a hidden tab must keep reporting.
+    const report = () => {
+      const message = live.on ? feedback.take(this.now()) : null;
+      if (message) this.send(message);
+    };
+    this.stopTickers.push(ticker(PING_MS, ping), ticker(FEEDBACK_MS, report));
     void (async () => {
       try {
         for (let m = await next(); m && live.on; m = await next()) {
@@ -359,10 +366,7 @@ export class WebTransportMedia implements MediaTransport {
     })();
     // Release and lateness must not wait for the next datagram: a still picture may send none.
     const tick = setInterval(() => {
-      if (!live.on) return;
-      this.recovered(assembler.tick(), sink);
-      const report = feedback.take(this.now());
-      if (report) this.send(report);
+      if (live.on) this.recovered(assembler.tick(), sink);
     }, RECOVERY_TICK_MS);
     void wt.closed.then(
       (info) => {

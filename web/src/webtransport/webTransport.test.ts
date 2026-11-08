@@ -257,6 +257,21 @@ describe("WebTransportMedia receiver feedback", () => {
     expect(typeof fb.arrivals_b64).toBe("string");
     t.close();
   });
+
+  it("reports on the transport's ticker, the Worker clock a hidden tab keeps running", async () => {
+    const periods: number[] = [];
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent, {
+      ticker: (ms) => {
+        periods.push(ms);
+        return () => {};
+      },
+    });
+    await t.connect(NO_SINK);
+    expect(periods).toEqual([1000, 50]);
+    t.close();
+  });
 });
 
 // ── The runtime, end to end against the fake agent ─────────────────────────

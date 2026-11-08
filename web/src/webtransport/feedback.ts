@@ -4,8 +4,11 @@
 /** §Feedback: every 50 ms while datagrams arrive. */
 export const FEEDBACK_MS = 50;
 const MAX_COUNT = 8192;
+const MAX_HELD = 4 * MAX_COUNT;
 /** Arrival offsets are in 50 µs units; this one means not received (yet). */
 const NOT_RECEIVED = 0xffff;
+/** A datagram is reported only once it is this old: one reordered by less is not a loss. */
+export const HOLD_BACK_MS = 5;
 /** Channels whose datagrams carry `pkt_seq` (§Channels): video, audio, FEC. */
 const COUNTED = new Set([0x01, 0x02, 0x04]);
 
@@ -31,7 +34,6 @@ export interface FeedbackMessage {
 export class FeedbackRecorder {
   /** The first `pkt_seq` not reported yet. */
   private next: number | null = null;
-  private highest = 0;
   private readonly arrivals = new Map<number, number>();
   private bytes = 0;
   private seq = 0;
@@ -42,20 +44,28 @@ export class FeedbackRecorder {
   record(datagram: Uint8Array, at: number): void {
     if (datagram.length < 5 || !COUNTED.has(datagram[0])) return;
     const pktSeq = new DataView(datagram.buffer, datagram.byteOffset, datagram.byteLength).getUint32(1, true);
-    if (this.next === null) this.next = this.highest = pktSeq;
+    if (this.next === null) this.next = pktSeq;
     else if (after(this.next, pktSeq)) return; // already reported as lost
-    if (after(pktSeq, this.highest)) this.highest = pktSeq;
+    // A bound on what a stalled reader holds: past it, the oldest go first.
+    if (this.arrivals.size >= MAX_HELD) this.arrivals.delete(this.arrivals.keys().next().value!);
     this.arrivals.set(pktSeq, at);
     this.bytes += datagram.length;
   }
 
-  /** The message for everything up to the highest `pkt_seq` seen; null when nothing arrived. */
+  /** The message for everything up to the newest `pkt_seq` that arrived at least
+   *  {@link HOLD_BACK_MS} ago; null when there is none. */
   take(now: number): FeedbackMessage | null {
     const first = this.next;
-    if (first === null || this.arrivals.size === 0) return null;
-    const count = Math.min(((this.highest - first) >>> 0) + 1, MAX_COUNT);
+    if (first === null) return null;
+    let last: number | null = null;
+    for (const [s, at] of this.arrivals) {
+      if (at <= now - HOLD_BACK_MS && (last === null || after(s, last))) last = s;
+    }
+    if (last === null) return null;
+    const count = Math.min(((last - first) >>> 0) + 1, MAX_COUNT);
     let ref = Infinity;
     for (let i = 0; i < count; i++) ref = Math.min(ref, this.arrivals.get((first + i) >>> 0) ?? Infinity);
+    if (ref === Infinity) ref = now; // nothing in range arrived: every entry is 0xFFFF
     const out = new Uint8Array(count * 2);
     const view = new DataView(out.buffer);
     let lost = 0;
