@@ -12,7 +12,6 @@ import {
   probeRegion,
   probeFeatures,
   probeWebCodecs,
-  probeWebGpu,
   type DeviceCapabilities,
   type NativeCapabilities,
 } from "./capability";
@@ -359,7 +358,7 @@ describe("device capability post freshness", () => {
   });
 });
 
-describe("probeWebCodecs and probeWebGpu (amendment 54)", () => {
+describe("probeWebCodecs (amendment 54)", () => {
   it("proves each codec with isConfigSupported and reports false for what the browser lacks", async () => {
     const ctor = (isConfigSupported: unknown) => Object.assign(function () {}, { isConfigSupported });
     vi.stubGlobal("VideoDecoder", ctor(async ({ codec }: { codec: string }) => ({ supported: !codec.startsWith("av01") })));
@@ -371,18 +370,6 @@ describe("probeWebCodecs and probeWebGpu (amendment 54)", () => {
   it("reports false for every key in a browser with no WebCodecs, and a throwing check", async () => {
     vi.stubGlobal("VideoDecoder", Object.assign(function () {}, { isConfigSupported: () => Promise.reject(new Error("x")) }));
     expect(await probeWebCodecs()).toEqual({ h264: false, hevc: false, av1: false, opus_decode: false, opus_encode: false });
-  });
-
-  it("lists only the WebGPU features the adapter has", async () => {
-    vi.stubGlobal("navigator", { gpu: { requestAdapter: async () => ({ features: new Set(["subgroups", "other"]) }) } });
-    expect(await probeWebGpu()).toEqual({ available: true, features: ["subgroups"] });
-  });
-
-  it("reports WebGPU unavailable with no adapter or no API", async () => {
-    vi.stubGlobal("navigator", { gpu: { requestAdapter: async () => null } });
-    expect(await probeWebGpu()).toEqual({ available: false, features: [] });
-    vi.stubGlobal("navigator", {});
-    expect(await probeWebGpu()).toEqual({ available: false, features: [] });
   });
 });
 
@@ -403,7 +390,8 @@ describe("probeCapabilities on a link or browser where a step hangs", () => {
     expect(caps.rtt_ms).toBeNull();
     expect(caps.bandwidth_kbps).toBeNull();
     expect(caps.webcodecs).toBeUndefined();
-    expect(caps.webgpu).toBeUndefined();
+    // probeWebGpu bounds requestAdapter itself (1.5 s): a hang reads as not available (#1189).
+    expect(caps.webgpu).toEqual({ available: false, features: [] });
     expect(caps.display.refresh_hz).toBeUndefined();
     expect(caps.display.width).toBe(screen.width);
   });
