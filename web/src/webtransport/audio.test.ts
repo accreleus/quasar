@@ -12,7 +12,7 @@ import { MicOut } from "./micOut";
 import type { Presenter } from "./presenter";
 import { avcC, COORDS, FakeAgent, FakeChunk, FakeDecoder, flush, helloAck } from "./testSupport";
 import { WebTransportMedia } from "./webTransportMedia";
-import type { AudioStreams, MediaSink } from "./transport";
+import type { AudioStreams } from "./transport";
 
 const OPUS = { codec: "opus", channels: 2, sample_rate: 48000, ptime_ms: 10 };
 const MIC = { codec: "opus", channels: 1, sample_rate: 48000, ptime_ms: 10 };
@@ -642,6 +642,7 @@ describe("WebTransportMedia audio", () => {
         streams: (s) => (order.push("streams"), streams.push(s)),
         config: () => order.push("config"),
         unit: () => {},
+        pyrowave: () => {},
         end: () => {},
       });
       expect(streams).toEqual([want]);
@@ -657,6 +658,7 @@ describe("WebTransportMedia audio", () => {
       audio: (p) => got.push(p.packetSeq),
       config: () => {},
       unit: () => {},
+      pyrowave: () => {},
       end: () => {},
     });
     agent.last.datagrams([
@@ -674,7 +676,7 @@ describe("WebTransportMedia audio", () => {
     agent.replies = [[withAudio()]];
     const t = make(agent);
     expect(t.sendMic(new Uint8Array(10))).toBe(false); // not connected
-    await t.connect({ config: () => {}, unit: () => {}, end: () => {} } as MediaSink);
+    await t.connect({ config: () => {}, unit: () => {}, pyrowave: () => {}, end: () => {} });
     expect(t.sendMic(encodeMicDatagram(0, 0, Uint8Array.from([1, 2])))).toBe(true);
     expect(t.sendMic(new Uint8Array(1_149))).toBe(false);
     await vi.waitFor(() => expect(agent.datagramsSent).toHaveLength(1));
@@ -710,7 +712,7 @@ describe("createWebTransportRuntime audio and microphone", () => {
       authToken: "auth",
       coords: COORDS,
       canvas: { dataset: {} } as unknown as HTMLCanvasElement,
-      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() },
+      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() },
       deps: {
         createTransport: (o) =>
           new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {}, ticker: () => () => {} } as ConstructorParameters<typeof WebTransportMedia>[0]),
