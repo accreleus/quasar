@@ -2,6 +2,7 @@
 //! encoded-frame boundary, and their packetizing into `0x01` datagrams
 //! (`protocol/transport-webtransport.md` §Video).
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,7 +26,7 @@ const KEYFRAME_SPACING: Duration = Duration::from_millis(150);
 pub(crate) struct VideoConfig {
     pub(crate) config_id: u8,
     pub(crate) codec: &'static str,
-    /// `avcC`.
+    /// `avcC`, `hvcC` or `av1C`; empty for AV1 when the parser gave none.
     pub(crate) description: Vec<u8>,
     pub(crate) width: i32,
     pub(crate) height: i32,
@@ -320,7 +321,8 @@ impl Media {
     }
 
     fn on_unit(&self, buffer: &gst::BufferRef) {
-        let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+        let flagged = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+        let mut keyframe = flagged;
         let mut st = self.lock();
         // openh264's second unit carries no PTS: it keeps the one before.
         let ts_90khz = buffer.pts().map_or(st.last_ts, |pts| {
@@ -342,6 +344,16 @@ impl Media {
         let (Some(config), Some(_)) = (st.config.clone(), st.client.as_ref()) else {
             return;
         };
+        let Ok(map) = buffer.map_readable() else {
+            // The client never gets this unit: the next one it is sent must not need it.
+            st.want_key = true;
+            return;
+        };
+        let Some((data, key)) = wire_unit(config.codec, &map, flagged) else {
+            st.want_key = true;
+            return;
+        };
+        keyframe = key;
         if st.want_key && !keyframe {
             // Only an attached client waiting on a keyframe asks for one, so the WebRTC
             // stream gets no IDR of ours at a caps change nobody here needs.
@@ -372,18 +384,13 @@ impl Media {
                 }
             }
         }
-        let Ok(map) = buffer.map_readable() else {
-            // The client never gets this unit: the next one it is sent must not need it.
-            st.want_key = true;
-            return;
-        };
         st.want_key = false;
         // Only a unit the client is sent takes a number: a skipped one would read as a
         // loss to NACK (§Loss recovery). A unit the full queue refuses gives it back.
         let frame_seq = st.frame_seq;
         st.frame_seq = frame_seq.wrapping_add(1);
         let unit = Unit {
-            data: Bytes::copy_from_slice(&map),
+            data: Bytes::copy_from_slice(&data),
             keyframe,
             config_id: config.config_id,
             frame_seq,
@@ -427,23 +434,31 @@ pub(crate) fn tap(video: &gst::Pad, media: &Arc<Media>, session_id: &str) {
     );
 }
 
-/// H.264 in `stream-format=avc` with 4-byte lengths: the units are then already the
-/// payload `EncodedVideoChunk` takes. Other codecs are later tickets.
+/// The caps whose units are already the payload `EncodedVideoChunk` takes: H.264 `avc` and
+/// H.265 `hvc1`/`hev1` with 4-byte lengths, and AV1 `obu-stream` temporal units.
 fn video_config(caps: &gst::CapsRef) -> Option<VideoConfig> {
     let s = caps.structure(0)?;
-    if s.name() != "video/x-h264" || s.get::<&str>("stream-format").ok()? != "avc" {
-        return None;
-    }
-    let description = s
-        .get::<gst::Buffer>("codec_data")
-        .ok()?
-        .map_readable()
-        .ok()?
-        .to_vec();
-    // lengthSizeMinusOne in the avcC's fifth byte.
-    if description.get(4).map(|b| b & 0x03) != Some(3) {
-        return None;
-    }
+    let codec_data = || {
+        let buffer = s.get::<gst::Buffer>("codec_data").ok()?;
+        let map = buffer.map_readable().ok()?;
+        Some(map.to_vec())
+    };
+    let (codec, description) = match (s.name().as_str(), s.get::<&str>("stream-format").ok()?) {
+        ("video/x-h264", "avc") => {
+            let d = codec_data()?;
+            // lengthSizeMinusOne in the avcC's fifth byte.
+            (d.get(4).map(|b| b & 0x03) == Some(3)).then_some(("h264", d))?
+        }
+        ("video/x-h265", "hvc1" | "hev1") => {
+            let d = codec_data()?;
+            // lengthSizeMinusOne in the hvcC's 22nd byte.
+            (d.get(21).map(|b| b & 0x03) == Some(3)).then_some(("h265", d))?
+        }
+        ("video/x-av1", "obu-stream") if s.get::<&str>("alignment").ok() == Some("tu") => {
+            ("av1", codec_data().unwrap_or_default())
+        }
+        _ => return None,
+    };
     let fps = s
         .get::<gst::Fraction>("framerate")
         .ok()
@@ -451,12 +466,80 @@ fn video_config(caps: &gst::CapsRef) -> Option<VideoConfig> {
         .map_or(0, |f| (f.numer() + f.denom() / 2) / f.denom());
     Some(VideoConfig {
         config_id: 0,
-        codec: "h264",
+        codec,
         description,
         width: s.get("width").ok()?,
         height: s.get("height").ok()?,
         fps,
     })
+}
+
+/// The `0x01` payload for one parser buffer and whether it is a keyframe. A unit is a
+/// keyframe only if the parser said so and the bitstream agrees: a decoder started on
+/// anything else fails ("a key frame is required"). H.264 trusts the parser. `None`: not a
+/// unit the contract can carry.
+fn wire_unit<'a>(codec: &str, data: &'a [u8], flagged: bool) -> Option<(Cow<'a, [u8]>, bool)> {
+    match codec {
+        // IRAP NAL types, BLA_W_LP through RSV_IRAP_VCL23.
+        "h265" => Some((
+            data.into(),
+            flagged && hevc_nal_types(data).any(|t| (16..=23).contains(&t)),
+        )),
+        "av1" => {
+            let (payload, sequence_header) = av1_unit(data)?;
+            Some((payload.into(), flagged && sequence_header))
+        }
+        _ => Some((data.into(), flagged)),
+    }
+}
+
+/// The type of each NAL in a 4-byte length-prefixed H.265 access unit, up to the first that
+/// does not fit.
+fn hevc_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        let len = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let nal = rest
+            .get(4..4usize.checked_add(len)?)
+            .filter(|n| !n.is_empty())?;
+        rest = &rest[4 + len..];
+        Some((nal[0] >> 1) & 0x3f)
+    })
+}
+
+/// A temporal unit without its temporal delimiters (the contract carries none), and whether
+/// it holds a sequence header. `None` for an OBU without a size field or one past the end.
+fn av1_unit(data: &[u8]) -> Option<(Vec<u8>, bool)> {
+    let (mut out, mut sequence_header, mut at) = (Vec::with_capacity(data.len()), false, 0);
+    while at < data.len() {
+        let start = at;
+        let header = data[at];
+        if header & 0x02 == 0 {
+            return None;
+        }
+        at += 1 + usize::from(header & 0x04 != 0);
+        let mut size = 0usize;
+        for i in 0..8 {
+            let byte = *data.get(at)?;
+            at += 1;
+            size |= usize::from(byte & 0x7f) << (7 * i);
+            if byte & 0x80 == 0 {
+                break;
+            }
+            if i == 7 {
+                return None;
+            }
+        }
+        at = at.checked_add(size).filter(|&end| end <= data.len())?;
+        match (header >> 3) & 0x0f {
+            2 => {}
+            kind => {
+                sequence_header |= kind == 1;
+                out.extend_from_slice(&data[start..at]);
+            }
+        }
+    }
+    (!out.is_empty()).then_some((out, sequence_header))
 }
 
 /// Split `unit` into `0x01` datagrams of at most `max` bytes, numbered from `*pkt_seq`.
@@ -812,5 +895,158 @@ mod tests {
         std::thread::sleep(KEYFRAME_SPACING);
         media.on_unit(&buffer(false));
         assert_eq!(count(), 1, "no stale request after the keyframe");
+    }
+    use crate::webtransport::tests::streams;
+
+    #[test]
+    fn h265_and_av1_caps_give_their_description_and_other_formats_are_refused() {
+        gst::init().unwrap();
+        let hevc = video_config(&streams::hevc_caps(640)).expect("hvc1 with an hvcC");
+        assert_eq!(
+            (hevc.codec, hevc.description.len(), hevc.fps),
+            ("h265", 23, 30)
+        );
+        let av1 = video_config(&streams::av1_caps(640)).expect("obu-stream temporal units");
+        assert_eq!(
+            (av1.codec, av1.description.as_slice()),
+            ("av1", &[0x81, 0x08, 0x0c, 0][..])
+        );
+
+        let with = |name: &str, field: &str, value: &str| {
+            let mut c = if name == "video/x-h265" {
+                streams::hevc_caps(640)
+            } else {
+                streams::av1_caps(640)
+            };
+            c.make_mut().structure_mut(0).unwrap().set(field, value);
+            c
+        };
+        assert!(video_config(&with("video/x-h265", "stream-format", "byte-stream")).is_none());
+        assert!(video_config(&with("video/x-av1", "stream-format", "annexb")).is_none());
+        assert!(video_config(&with("video/x-av1", "alignment", "obu")).is_none());
+        let mut short = streams::hevc_caps(640);
+        short.make_mut().structure_mut(0).unwrap().set(
+            "codec_data",
+            gst::Buffer::from_slice(vec![
+                1u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 93, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+            ]),
+        );
+        assert!(
+            video_config(&short).is_none(),
+            "2-byte NAL lengths cannot be sent as is"
+        );
+        let mut no_description = streams::av1_caps(640);
+        no_description
+            .make_mut()
+            .structure_mut(0)
+            .unwrap()
+            .remove_field("codec_data");
+        assert!(
+            video_config(&no_description).is_some_and(|c| c.description.is_empty()),
+            "av1C is optional for AV1"
+        );
+    }
+
+    #[test]
+    fn an_h265_unit_is_a_keyframe_only_with_an_irap_slice_the_parser_flagged() {
+        for (irap, name) in [
+            (16, "BLA_W_LP"),
+            (19, "IDR_W_RADL"),
+            (20, "IDR_N_LP"),
+            (21, "CRA"),
+            (23, "RSV_IRAP_VCL23"),
+        ] {
+            let au = streams::hevc_au(Some(irap), 50);
+            let (data, key) = wire_unit("h265", &au, true).unwrap();
+            assert!(key, "{name} starts a decoder");
+            assert_eq!(&*data, &au[..], "the payload goes out as it is");
+            assert!(
+                !wire_unit("h265", &au, false).unwrap().1,
+                "{name} the parser called a delta"
+            );
+        }
+        let trail = streams::hevc_au(None, 50);
+        assert!(
+            !wire_unit("h265", &trail, true).unwrap().1,
+            "TRAIL_R flagged as a keyframe is a delta"
+        );
+        // Parameter sets alone are not a random access point.
+        let mut ps = streams::hevc_au(Some(19), 50);
+        ps.truncate(ps.len() - 52 - 4);
+        assert!(
+            !wire_unit("h265", &ps, true).unwrap().1,
+            "VPS, SPS and PPS without a slice"
+        );
+        // A length past the end ends the scan instead of reading on.
+        let mut cut = streams::hevc_au(Some(19), 50);
+        cut.truncate(cut.len() - 1);
+        assert!(!wire_unit("h265", &cut, true).unwrap().1);
+    }
+
+    #[test]
+    fn an_av1_unit_loses_its_temporal_delimiter_and_is_a_keyframe_with_a_sequence_header() {
+        let key = streams::av1_tu(true, 50);
+        let (data, is_key) = wire_unit("av1", &key, true).unwrap();
+        assert!(is_key);
+        assert_eq!(streams::obu_types(&data), [1, 6], "the delimiter is gone");
+        assert!(
+            !wire_unit("av1", &key, false).unwrap().1,
+            "the parser called it a delta"
+        );
+
+        let delta = streams::av1_tu(false, 50);
+        let (data, is_key) = wire_unit("av1", &delta, true).unwrap();
+        assert!(
+            !is_key,
+            "a frame without a sequence header cannot start a decoder"
+        );
+        assert_eq!(streams::obu_types(&data), [6]);
+
+        assert!(
+            wire_unit("av1", &[0x10, 0x00], true).is_none(),
+            "no size field"
+        );
+        assert!(
+            wire_unit("av1", &[0x32, 0x09, 0x55], true).is_none(),
+            "an OBU past the end"
+        );
+        assert!(
+            wire_unit("av1", &[0x12, 0x00], true).is_none(),
+            "a delimiter alone is no unit"
+        );
+        let extended = [0x12u8, 0x00, 0x0e, 0x00, 0x01, 0x55];
+        assert_eq!(
+            av1_unit(&extended),
+            Some((vec![0x0e, 0x00, 0x01, 0x55], true)),
+            "an extension byte moves the size field"
+        );
+    }
+
+    #[test]
+    fn h265_units_reach_a_client_under_the_configuration_with_their_flags() {
+        gst::init().unwrap();
+        let media = Arc::new(Media {
+            state: Mutex::default(),
+            input: crate::webtransport::tests::no_input(),
+            typing: Mutex::default(),
+            encoder: glib::WeakRef::new(),
+        });
+        media.on_caps(&streams::hevc_caps(640), "s");
+        let mut client = media.attach().unwrap();
+        let unit = |au: Vec<u8>, key: bool| {
+            let mut b = gst::Buffer::from_slice(au);
+            if !key {
+                b.get_mut().unwrap().set_flags(gst::BufferFlags::DELTA_UNIT);
+            }
+            b
+        };
+        media.on_unit(&unit(streams::hevc_au(None, 20), false));
+        media.on_unit(&unit(streams::hevc_au(Some(19), 20), true));
+        media.on_unit(&unit(streams::hevc_au(None, 20), false));
+        assert_eq!(
+            units(&mut client.rx),
+            [(true, 0), (false, 0)],
+            "the delta before the first keyframe is skipped"
+        );
     }
 }

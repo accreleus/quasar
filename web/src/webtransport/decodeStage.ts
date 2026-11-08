@@ -32,6 +32,43 @@ export function avcCodecString(avcC: Uint8Array): string {
   return `avc1.${hex(avcC[1])}${hex(avcC[2])}${hex(avcC[3])}`;
 }
 
+/** `hvc1.<profile>.<compat, bit-reversed>.<tier><level>[.<constraints>]` from an hvcC record (ISO 14496-15 Annex E). */
+export function hevcCodecString(hvcC: Uint8Array): string {
+  const space = ["", "A", "B", "C"][hvcC[1] >> 6];
+  const compat = new DataView(hvcC.buffer, hvcC.byteOffset).getUint32(2);
+  let reversed = 0;
+  for (let i = 0; i < 32; i++) reversed |= ((compat >>> i) & 1) << (31 - i);
+  let end = 12;
+  while (end > 6 && hvcC[end - 1] === 0) end--;
+  const constraints = Array.from(hvcC.subarray(6, end), (b) => "." + b.toString(16).toUpperCase());
+  const tier = hvcC[1] & 0x20 ? "H" : "L";
+  return `hvc1.${space}${hvcC[1] & 0x1f}.${(reversed >>> 0).toString(16).toUpperCase()}.${tier}${hvcC[12]}${constraints.join("")}`;
+}
+
+/** `av01.<profile>.<level><tier>.<depth>` from an av1C record; a Main-profile 8-bit 4.0 stream when the agent sent none. */
+export function av1CodecString(av1C: Uint8Array): string {
+  if (av1C.length < 4) return "av01.0.08M.08";
+  const profile = av1C[1] >> 5;
+  const level = (av1C[1] & 0x1f).toString().padStart(2, "0");
+  const tier = av1C[2] & 0x80 ? "H" : "M";
+  const depth = av1C[2] & 0x40 ? (av1C[2] & 0x20 ? "12" : "10") : "08";
+  return `av01.${profile}.${level}${tier}.${depth}`;
+}
+
+/** The WebCodecs codec string for a `hello_ack` configuration, from its description. */
+export function codecString(config: Pick<VideoConfig, "codec" | "description">): string {
+  switch (config.codec) {
+    case "h264":
+      return avcCodecString(config.description);
+    case "h265":
+      return hevcCodecString(config.description);
+    case "av1":
+      return av1CodecString(config.description);
+    default:
+      return config.codec;
+  }
+}
+
 /**
  * Units into WebCodecs, under the configuration their `config_id` names. A unit
  * for a `config_id` not seen yet is held until its `hello_ack` (datagrams can
@@ -167,8 +204,9 @@ export class DecodeStage {
   /** Puts `config` on `decoder` (or a new one) and publishes it as `this.decoder`. */
   private async configure(config: VideoConfig, generation: number, decoder: VideoDecoder | null): Promise<void> {
     const decoderConfig: VideoDecoderConfig = {
-      codec: config.codec === "h264" ? avcCodecString(config.description) : config.codec,
-      description: config.description,
+      codec: codecString(config),
+      // av1C is optional for AV1 (the sequence header rides in-band).
+      ...(config.description.length > 0 ? { description: config.description } : {}),
       codedWidth: config.width,
       codedHeight: config.height,
       optimizeForLatency: true,
