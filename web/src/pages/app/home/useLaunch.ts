@@ -5,7 +5,7 @@
 // components — the page composes, this owns the launch.
 
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import * as libraryApi from "../../../api/library";
 import { ApiError } from "../../../api/client";
 import type { App, ProfilesResponse, Session } from "../../../api/types";
@@ -13,7 +13,7 @@ import { AuthContext } from "../../../auth/context";
 import { ensureDeviceProbeForLaunch } from "../../../auth/deviceProbe";
 import { useToast } from "../../../components/Toast";
 import { playoutOverride } from "../../../webrtc/playoutOverride";
-import { pyrowavePreference, transportPreference } from "../../../webtransport/transportSwitch";
+import { pyrowavePreference, rememberUrlSwitches, transportPreference } from "../../../webtransport/transportSwitch";
 import {
   CLOSING_RETRY_DELAY_MS,
   MAX_CLOSING_RETRY_WAIT_MS,
@@ -109,8 +109,10 @@ export function useLaunch({
   revealDetail,
 }: UseLaunchOptions): UseLaunch {
   const navigate = useNavigate();
+  const { search } = useLocation();
   const { addToast, removeToast } = useToast();
   const userId = useContext(AuthContext)?.user?.id;
+  useEffect(() => rememberUrlSwitches(search), [search]);
   const [launching, setLaunching] = useState(false);
   const [waitingForSlot, setWaitingForSlot] = useState(false);
   const [waitingReason, setWaitingReason] = useState<WaitingReason | null>(null);
