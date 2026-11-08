@@ -718,7 +718,7 @@ everything else looks healthy: the session is `running`, a host owns it, the GPU
 is idle and the agent is online. About two minutes later the node agent logs:
 
 ```
-WARN quasar_node_agent::session::runner: reaping idle session: idle: WebRTC transport never established
+WARN quasar_node_agent::session::runner: reaping idle session: idle: transport never established
 ```
 
 The launch screen names this itself: once the session is running and the media

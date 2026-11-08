@@ -1334,6 +1334,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		refreshPreflight()
 		rep, err := releaseDetector.Detect(ctx)
 		if err != nil {
+			// A failed pass notifies nobody and starts nothing (#1003). A build it
+			// did record (the branch half needs no listing) is stored, and it waits
+			// for the next pass that SUCCEEDS for both. That is deliberate: the
+			// listing is what says which release is newest, so a partial view must
+			// never drive a notification or an unattended apply.
 			return jobs.Outcome{}, err
 		}
 		summary := rep.Summary()

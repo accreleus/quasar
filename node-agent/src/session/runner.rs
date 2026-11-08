@@ -1552,6 +1552,7 @@ impl pipeline::Transport for SessionTransports {
                         session.cfg.stream.width,
                         session.cfg.stream.height,
                     ),
+                    crate::webtransport::Tap::plan(&session.cfg),
                     session
                         .cfg
                         .pyrowave
@@ -1559,6 +1560,9 @@ impl pipeline::Transport for SessionTransports {
                 )
             });
         let slot = pipeline::WebRtcSlot::new(session)?;
+        if let Some(tap) = &webtransport {
+            slot.tap_audio_for_stream(tap.audio());
+        }
         // Audio first: `attach_video` takes the encode pipeline to READY.
         let (audio_webrtc, audio_pipeline) = slot.build_audio()?;
         let video = slot.attach_video(false, None)?;
@@ -1967,10 +1971,10 @@ fn idle_reap_reason(
         if booting {
             return None;
         }
-        return (running_for >= window).then_some("idle: WebRTC transport never established");
+        return (running_for >= window).then_some("idle: transport never established");
     }
     match unhealthy_for {
-        Some(d) if d >= window => Some("idle: WebRTC transport lost"),
+        Some(d) if d >= window => Some("idle: transport lost"),
         _ => None,
     }
 }
@@ -2394,6 +2398,27 @@ fn start_encode_pipeline(
     Ok(())
 }
 
+/// The rebuilt encoder's config: `to`'s codec, profile and bitrate, at the packet size the
+/// old payloader was shrunk to (#1134), which `cfg` does not record.
+fn rebuild_config(
+    cfg: &SessionConfig,
+    to: &super::StreamParams,
+    old_pipe: &gst::Pipeline,
+) -> SessionConfig {
+    let mut next = cfg.clone();
+    next.stream.codec = to.codec;
+    next.stream.h264_profile = to.h264_profile.clone();
+    next.stream.bitrate_kbps = to.bitrate_kbps;
+    next.encoder = cfg.configured_encoder;
+    if let Some(shrunk) = old_pipe
+        .by_name(pipeline::VIDEO_PAYLOADER_NAME)
+        .and_then(|pay| pipeline::rtp_mtu_of(&pay))
+    {
+        next.rtp_mtu = next.rtp_mtu.min(shrunk);
+    }
+    next
+}
+
 /// The rebuilds amendment 59 (c) refuses before anything is touched.
 fn rebuild_refused(
     current: super::EncoderChoice,
@@ -2455,11 +2480,7 @@ fn rebuild_encode(
     RestreamFailure,
 > {
     let (vulkan_contexts, cuda_ctx, va_ctx) = contexts;
-    let mut next = cfg.clone();
-    next.stream.codec = to.codec;
-    next.stream.h264_profile = to.h264_profile.clone();
-    next.stream.bitrate_kbps = to.bitrate_kbps;
-    next.encoder = cfg.configured_encoder;
+    let mut next = rebuild_config(cfg, to, old_pipe);
     let resolved = pipeline::resolve_effective_encoder(&mut next)
         .map_err(|e| RestreamFailure::hardware("encoder", format!("{e:#}")))?;
     if let Some((step, why)) = rebuild_refused(
@@ -4306,7 +4327,7 @@ pub const REASON_APP_EXITED_EARLY: &str = "app_exited_early";
 /// #484 reason code: the app container is alive but never presented a frame within
 /// `QUASAR_APP_BOOT_TIMEOUT_SECS`. Same `AppFailed` shape as
 /// [`REASON_APP_EXITED_EARLY`]; this case used to surface as a mute
-/// `idle: WebRTC transport never established` reap.
+/// `idle: transport never established` reap.
 pub const REASON_APP_NEVER_PRESENTED: &str = "app_never_presented";
 
 /// The terminal event for a `fail`-policy app-container exit.
@@ -4791,6 +4812,47 @@ mod tests {
         ] {
             assert_eq!(got, want, "{name}");
         }
+    }
+
+    // #1134: a packet size the old payloader was shrunk to survives a codec rebuild.
+    #[test]
+    fn a_rebuild_keeps_the_packet_size_the_old_payloader_was_shrunk_to() {
+        gst::init().unwrap();
+        let settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        let stream = crate::session::StreamParams {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_kbps: 8000,
+            h264_profile: "constrained-baseline".into(),
+            codec: crate::session::Codec::H264,
+            abr_floor_kbps: 0,
+            mic: false,
+        };
+        let mut cfg = crate::session::SessionConfig::for_assignment_with(&settings, stream, None);
+        cfg.rtp_mtu = 1200;
+        let to = crate::session::StreamParams {
+            codec: crate::session::Codec::H265,
+            h264_profile: "main".into(),
+            ..cfg.stream.clone()
+        };
+        let old = gst::Pipeline::new();
+        assert_eq!(
+            super::rebuild_config(&cfg, &to, &old).rtp_mtu,
+            1200,
+            "no payloader: the configured size"
+        );
+        let pay = gst::ElementFactory::make("rtph264pay")
+            .name(pipeline::VIDEO_PAYLOADER_NAME)
+            .build()
+            .unwrap();
+        old.add(&pay).unwrap();
+        // Shrunk twice, 1200 to 1000, as the old transport's watcher would have.
+        let overhead = pipeline::rtp_mtu_of(&pay).unwrap() - pay.property::<u32>("mtu");
+        pay.set_property("mtu", 1000 - overhead);
+        let next = super::rebuild_config(&cfg, &to, &old);
+        assert_eq!(next.rtp_mtu, 1000);
+        assert_eq!(next.stream.codec, crate::session::Codec::H265);
     }
 
     // Amendment 59 (c): what a rebuild refuses before it touches the old encoder.
@@ -5827,7 +5889,7 @@ mod tests {
 
     // ── #484 app-boot visibility ──────────────────────────────────────────────
     // A cold app boot is 30–50 s, and charging it against the never-connected idle budget
-    // killed real sessions at 120 s with `idle: WebRTC transport never established`.
+    // killed real sessions at 120 s with `idle: transport never established`.
 
     #[test]
     fn booting_defers_the_never_connected_reap_at_every_age() {

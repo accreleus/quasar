@@ -75,7 +75,7 @@ function setup(opts: { offer?: boolean; warm?: boolean } = {}) {
     coords: COORDS,
     canvas: document.createElement("canvas"),
     pyrowave: opts.offer ?? true,
-    callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() },
+    callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() },
     deps: {
       createTransport: (o) =>
         new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {}, now: () => clock.now }),

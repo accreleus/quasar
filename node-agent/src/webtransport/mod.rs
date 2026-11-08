@@ -3,12 +3,13 @@
 //! session's client authenticates with a single-use token the control plane minted and
 //! then gets the session's video as datagrams.
 //!
-//! Not here yet, each a later ticket: audio, microphone, FEC, receiver feedback and
-//! congestion control, and takeover across transports (a new client replaces the last
-//! one; nothing bounds it).
+//! Not here yet, each a later ticket: FEC, receiver feedback and congestion control, and
+//! takeover across transports (a new client replaces the last one; nothing bounds it).
 
+mod audio;
 mod cert;
 mod media;
+mod mic_jitter;
 mod pyrowave;
 mod retransmit;
 #[cfg(test)]
@@ -30,6 +31,7 @@ use tokio::sync::oneshot;
 use tokio::time::{timeout_at, Instant};
 use web_transport_quinn::{quinn, RecvStream, Request, SendStream, Session};
 
+pub(crate) use audio::Audio;
 pub use cert::CertReport;
 use cert::{Cert, CertSet};
 pub use media::PyroWaveGrant;
@@ -306,6 +308,7 @@ pub(crate) struct Tap {
 impl Tap {
     /// `None` when no listener runs or the session was not assigned WebTransport.
     /// `pyrowave`: the session's config, its grant and the feed off the encode pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attach(
         registry: &Arc<Registry>,
         video: &gst::Pad,
@@ -313,13 +316,19 @@ impl Tap {
         session_id: &str,
         trace: Option<crate::session::pipeline::TraceTx>,
         input: Input,
+        audio: audio::Plan,
         pyrowave: Option<(
             &crate::session::SessionConfig,
             PyroWaveGrant,
             Option<crate::session::pipeline::pyrowave_branch::Feed>,
         )>,
     ) -> Option<Self> {
-        let media = Media::new(encoder, input, trace.map(|tx| (tx, session_id.to_string())));
+        let media = Media::new(
+            encoder,
+            input,
+            Audio::new(audio),
+            trace.map(|tx| (tx, session_id.to_string())),
+        );
         if !registry.set_media(session_id, media.clone()) {
             return None;
         }
@@ -332,6 +341,16 @@ impl Tap {
             pyrowave,
             media,
         })
+    }
+
+    /// The session's audio, for the audio pipeline to tap at its Opus encoder.
+    pub(crate) fn audio(&self) -> Arc<Audio> {
+        self.media.audio().clone()
+    }
+
+    /// What the runner offers this session's client.
+    pub(crate) fn plan(cfg: &crate::session::SessionConfig) -> audio::Plan {
+        audio::Plan::for_session(cfg)
     }
 
     /// A client is attached and being sent video: the session's idle reap counts it.
@@ -821,7 +840,8 @@ fn pong(ping: &Value) -> Value {
     })
 }
 
-fn hello_ack(config: &media::VideoConfig, switch_reason: Option<&str>) -> Value {
+fn hello_ack(config: &media::VideoConfig, audio: &Audio, switch_reason: Option<&str>) -> Value {
+    let (stream_audio, mic) = audio.describe();
     let mut ack = json!({
         "type": "hello_ack",
         "wt_proto": WT_PROTO,
@@ -833,8 +853,8 @@ fn hello_ack(config: &media::VideoConfig, switch_reason: Option<&str>) -> Value 
             "height": config.height,
             "fps": config.fps,
         },
-        "audio": null,
-        "mic": null,
+        "audio": stream_audio,
+        "mic": mic,
         "fec": null,
         "retransmit_window_ms": retransmit::WINDOW.as_millis() as u64,
     });
@@ -919,16 +939,20 @@ async fn streams(session: Session, control: oneshot::Sender<(SendStream, RecvStr
 }
 
 /// Before `hello_ack` every datagram is dropped (§Before `hello`); after it, input
-/// (`0x03`) goes to the session's devices. Microphone (`0x05`) is a later ticket.
+/// (`0x03`) goes to the session's devices and the microphone (`0x05`) to its mic sink.
 async fn datagrams(session: Session, authed: Arc<OnceLock<(Arc<Media>, u64)>>) {
     while let Ok(datagram) = session.read_datagram().await {
         let Some((media, client)) = authed.get() else {
             continue;
         };
-        if let Some((&CHANNEL_INPUT, body)) = datagram.split_first() {
-            if let Ok(json) = std::str::from_utf8(body) {
-                media.input_event(*client, json, true);
+        match datagram.split_first() {
+            Some((&CHANNEL_INPUT, body)) => {
+                if let Ok(json) = std::str::from_utf8(body) {
+                    media.input_event(*client, json, true);
+                }
             }
+            Some((&audio::CHANNEL_MIC, body)) => media.audio().mic_packet(*client, body),
+            _ => {}
         }
     }
 }
@@ -1078,7 +1102,10 @@ async fn authenticate(
     if !matches!(
         timeout_at(
             deadline,
-            write_message(&mut send, &hello_ack(&client.config, client.reason))
+            write_message(
+                &mut send,
+                &hello_ack(&client.config, media.audio(), client.reason)
+            )
         )
         .await,
         Ok(Ok(()))
@@ -1116,6 +1143,9 @@ async fn stream(
     let mut nack_budget = retransmit::NackBudget::new(std::time::Instant::now());
     let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
+    // Nothing is sent before `hello_ack`: what queued up behind it is stale.
+    while client.audio.try_recv().is_ok() {}
+    let mut audio_open = true;
     // The configuration the client was last sent: a PyroWave unit packs for its size.
     let mut current = client.config.clone();
     // What ends the stream: an optional last message, the close code and its reason.
@@ -1123,6 +1153,17 @@ async fn stream(
     let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
     let (message, code, why) = loop {
         tokio::select! {
+            packet = client.audio.recv(), if audio_open => match packet {
+                Some(packet) => {
+                    let seq = pkt_seq;
+                    pkt_seq = pkt_seq.wrapping_add(1);
+                    if session.send_datagram(audio::datagram(&packet, seq)).is_err() {
+                        break QUIET;
+                    }
+                }
+                // Displaced or ended: the video queue says which, next.
+                None => audio_open = false,
+            },
             () = &mut idle => {
                 tracing::info!(
                     token = "webtransport-client-idle",
@@ -1170,7 +1211,7 @@ async fn stream(
                         pyrowave_frames.forget();
                     }
                     current = config.clone();
-                    let ack = hello_ack(&config, reason);
+                    let ack = hello_ack(&config, media.audio(), reason);
                     let write = write_message(&mut send, &ack);
                     if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
                         break QUIET;
@@ -1178,6 +1219,11 @@ async fn stream(
                 }
                 None => break match client.gone.get() {
                     Some(Gone::TakenOver) => (Some(json!({"type": "bye", "reason": "taken_over"})), CLOSE_TAKEN_OVER, ""),
+                    Some(Gone::Unusable) => (
+                        Some(json!({"type": "error", "code": "internal", "message": "the encoder sent no usable keyframe"})),
+                        CLOSE_NORMAL,
+                        "",
+                    ),
                     _ => (Some(json!({"type": "bye", "reason": "session_ended"})), CLOSE_ENDED, ""),
                 },
             },
