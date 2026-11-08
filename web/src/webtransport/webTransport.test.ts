@@ -461,6 +461,7 @@ describe("createWebTransportRuntime", () => {
         return new Promise((_, reject) => (refuse = reject));
       },
       requestKeyframe: () => {},
+      sendMic: () => false,
       input: { reliable: () => {}, datagram: () => false },
       close: () => {},
     };

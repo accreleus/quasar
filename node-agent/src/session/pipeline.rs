@@ -35,11 +35,11 @@ use caps::{caps_profile, raw_video_caps};
 mod codec_chain;
 pub(crate) use codec_chain::rtp_mtu_of;
 use codec_chain::{build_bitstream_chain, build_video_payloader, BitstreamChain};
-mod audio_branch;
+pub(crate) mod audio_branch;
 mod audio_health;
 mod rtp_ext;
 use audio_branch::add_audio_chain;
-mod mic_branch;
+pub(crate) mod mic_branch;
 mod mtu_shrink;
 mod probes;
 use probes::{

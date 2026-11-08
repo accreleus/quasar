@@ -11,6 +11,9 @@ use gstreamer::prelude::*;
 use crate::session::audio::QUASAR_MONITOR_SOURCE_NAME;
 use crate::session::SessionConfig;
 
+/// The Opus encoder's element name: a transport taps its src pad, the encoded-frame boundary.
+pub(crate) const OPUS_ENC_NAME: &str = "quasar-opus-enc";
+
 /// Add + link the WebRTC audio chain into `pipeline` (the Opus encode, then RTP), returning
 /// its tail (the send queue) for linking into webrtcbin. Shared by the single and split
 /// pipelines, so the audio path is identical in both.
@@ -65,7 +68,7 @@ pub(super) fn add_audio_chain(
 /// Add + link the session's audio capture and Opus encode into `pipeline`: the audio half
 /// of the encoded-frame boundary, for any transport. Returns the capture source and the
 /// `opusenc`, whose src pad gives one 10 ms Opus packet per buffer (`opus/48000/2`).
-pub(super) fn add_opus_encode(
+pub(crate) fn add_opus_encode(
     pipeline: &gst::Pipeline,
     cfg: &SessionConfig,
 ) -> Result<(gst::Element, gst::Element)> {
@@ -125,6 +128,7 @@ pub(super) fn add_opus_encode(
     // keeps the bitrate envelope flat for the congestion controller. Enum-typed properties
     // MUST use `property_from_str` (.claude/rules/gstreamer-gotchas.md).
     let opus_enc = gst::ElementFactory::make("opusenc")
+        .name(OPUS_ENC_NAME)
         .property_from_str("frame-size", "10")
         .property_from_str("audio-type", "restricted-lowdelay")
         .property_from_str("bitrate-type", "cbr")
